@@ -1,0 +1,7 @@
+# Python 3.12+ Required
+polars
+pandas
+pykrx
+python-dotenv
+requests
+beautifulsoup4
