@@ -6,6 +6,9 @@ __pycache__/
 # agent
 .agent/
 
+# data
+data/processed
+
 # C extensions
 *.so
 
