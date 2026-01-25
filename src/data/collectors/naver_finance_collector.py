@@ -7,8 +7,12 @@ import polars as pl
 from bs4 import BeautifulSoup
 from typing import Dict, List, Optional
 import time
+import warnings
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
 logger = logging.getLogger("data.collectors.naver_finance")
+# XML 파싱 경고 무시 (내장 html.parser 사용 시 발생)
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 class NaverFinanceCollector:
     """
@@ -18,9 +22,11 @@ class NaverFinanceCollector:
     1. 업종별 리스트 페이지(sise_group.naver?type=upjong)에서 모든 업종의 고유 번호와 이름을 추출.
     2. 각 업종 상세 페이지(sise_group_detail.naver?type=upjong)에 접속하여 소속 종목 코드를 추출.
     3. Ticker -> Sector 매핑 테이블을 반환.
+    4. 지수(KOSPI, KOSDAQ) 과거 이력 대량 수집 (Chart Data API 활용).
     """
     
     BASE_URL = "https://finance.naver.com"
+    CHART_URL = "https://fchart.stock.naver.com/sise.nhn"
     # 'upjong' 파라미터가 있어야 정상적인 업종 리스트가 출력됨
     INDUSTRY_LIST_URL = f"{BASE_URL}/sise/sise_group.naver?type=upjong"
     
@@ -78,6 +84,84 @@ class NaverFinanceCollector:
         
         logger.info(f"Sector mapping completed. Total {len(df)} stocks in {time.time() - start_time:.2f}s")
         self._cache_df = df
+        return df
+
+    async def collect_index_data(self, symbol_name: str = "KOSPI", count: int = 3000) -> pl.DataFrame:
+        """
+        네이버 금융 차트 데이터를 통해 특정 지수의 과거 이력을 수집합니다.
+        
+        Args:
+            symbol_name: "KOSPI" 또는 "KOSDAQ"
+            count: 수집할 데이터 개수 (최근 기준)
+            
+        Returns:
+            pl.DataFrame: [date, ticker, open, high, low, close, volume]
+        """
+        # 네이버 내부 심볼 매핑
+        symbol_map = {"KOSPI": "KOSPI", "KOSDAQ": "KOSDAQ"}
+        target_symbol = symbol_map.get(symbol_name.upper(), "KOSPI")
+        
+        params = {
+            "symbol": target_symbol,
+            "timeframe": "day",
+            "count": str(count),
+            "requestType": "0"
+        }
+        
+        logger.info(f"Fetching index history for {target_symbol} (count={count})...")
+        
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector, headers=self.headers) as session:
+            try:
+                async with session.get(self.CHART_URL, params=params) as response:
+                    if response.status != 200:
+                        logger.error(f"Naver chart API returned status {response.status}")
+                        return pl.DataFrame()
+                    xml_text = await response.text()
+                    
+                return await asyncio.to_thread(self._parse_index_xml, xml_text, symbol_name)
+            except Exception as e:
+                logger.error(f"Error fetching index history: {e}")
+                return pl.DataFrame()
+
+    def _parse_index_xml(self, xml_text: str, symbol_name: str) -> pl.DataFrame:
+        """네이버 지수 XML 파싱"""
+        data = []
+        try:
+            # 'xml' 파서 대신 기본 'html.parser' 사용 (의존성 최소화)
+            soup = BeautifulSoup(xml_text, 'html.parser')
+            items = soup.find_all("item")
+            
+            for item in items:
+                # data="날짜|시가|고가|저가|종가|거래량"
+                vals = item.get("data").split("|")
+                if len(vals) < 6: continue
+                
+                data.append({
+                    "date": vals[0], # YYYYMMDD
+                    "ticker": symbol_name.upper(),
+                    "open": float(vals[1]),
+                    "high": float(vals[2]),
+                    "low": float(vals[3]),
+                    "close": float(vals[4]),
+                    "volume": float(vals[5])
+                })
+        except Exception as e:
+            logger.error(f"Error parsing index XML: {e}")
+            
+        if not data:
+            return pl.DataFrame()
+            
+        df = pl.DataFrame(data)
+        # 타입 변환
+        df = df.with_columns([
+            pl.col("date").str.strptime(pl.Datetime, "%Y%m%d"),
+            pl.col("open").cast(pl.Float64),
+            pl.col("high").cast(pl.Float64),
+            pl.col("low").cast(pl.Float64),
+            pl.col("close").cast(pl.Float64),
+            pl.col("volume").cast(pl.Float64),
+        ])
         return df
 
     async def _fetch_industry_list(self, session: aiohttp.ClientSession) -> List[Dict]:
