@@ -10,8 +10,13 @@ class FeatureStore:
         self.base_path = base_path
         self.base_path.mkdir(parents=True, exist_ok=True)
         
-    def save_features(self, df: pl.DataFrame, partition_cols: list[str] = ["year", "date"]):
-        # date 컬럼을 Date 타입으로 변환 (시간 정보 제거 및 깔끔한 파티셔닝)
+    def save_features(self, df: pl.DataFrame | pl.LazyFrame, partition_cols: list[str] = ["year"]):
+        # LazyFrame인 경우 파티셔닝 전처리를 위해 일부 collect가 필요할 수 있으나, 
+        # 가급적 전체를 collect하여 저장하는 것이 안전 (write_parquet는 DataFrame 필요)
+        if isinstance(df, pl.LazyFrame):
+            df = df.collect()
+
+        # date 컬럼을 Date 타입으로 변환
         if "date" in df.columns:
             if df["date"].dtype == pl.Datetime:
                 df = df.with_columns(pl.col("date").cast(pl.Date))
@@ -22,38 +27,38 @@ class FeatureStore:
         if "year" not in df.columns and "date" in df.columns:
             df = df.with_columns(pl.col("date").dt.year().cast(pl.Utf8).alias("year"))
 
+        # 과도한 파티셔닝 방지: ["year"]만 기본값으로 사용
         df.write_parquet(
             self.base_path,
             partition_by=partition_cols,
-            compression="snappy"
+            compression="snappy",
+            use_pyarrow=True # 속도 및 호환성 향상
         )
         
     def get_existing_dates(self) -> list[str]:
-        """이미 저장된 파티션 날짜 목록 반환 (YYYYMMDD 형식)"""
-        import urllib.parse
-        import re
+        """이미 저장된 데이터의 날짜 목록 (I/O 비용 절감을 위해 scan_parquet 활용)"""
+        try:
+            return (
+                pl.scan_parquet(self.base_path / "**" / "*.parquet")
+                .select("date")
+                .unique()
+                .collect()
+                .get_column("date")
+                .dt.strftime("%Y%m%d")
+                .to_list()
+            )
+        except:
+            return []
         
-        existing_dates = []
-        # base_path 하위의 모든 date= 폴더 탐색
-        for p in self.base_path.glob("**/date=*"):
-            if p.is_dir():
-                # 인코딩된 폴더명 디코딩 (예: %20 -> 공백)
-                date_val = urllib.parse.unquote(p.name.split("=")[-1])
-                # 숫자만 추출 (예: 2026-01-02 -> 20260102)
-                clean_date = re.sub(r"[^0-9]", "", date_val)[:8]
-                if len(clean_date) == 8:
-                    existing_dates.append(clean_date)
-        return list(set(existing_dates))
-        
-    def load_features(self, start_date: str = None, end_date: str = None) -> pl.DataFrame:
-        """파티셔닝된 피처 로드 (Lazy 추천)"""
+    def load_features(self, start_date: str = None, end_date: str = None) -> pl.LazyFrame:
+        """파티셔닝된 피처 로드 (LazyFrame 반환)"""
         if start_date and end_date:
             start_year = int(start_date[:4])
             end_year = int(end_date[:4])
             
             paths = []
             for y in range(start_year, end_year + 1):
-                year_path = self.base_path / f"year={y}" / "**" / "*.parquet"
+                year_path = self.base_path / f"year={y}" / "*.parquet"
                 paths.append(str(year_path))
             scan_path = paths
         else:
@@ -63,46 +68,19 @@ class FeatureStore:
             q = pl.scan_parquet(scan_path)
             
             if start_date:
-                dt_start = datetime.strptime(start_date, "%Y%m%d")
+                dt_start = datetime.strptime(start_date, "%Y%m%d").date()
                 q = q.filter(pl.col("date") >= dt_start)
             if end_date:
-                dt_end = datetime.strptime(end_date, "%Y%m%d")
+                dt_end = datetime.strptime(end_date, "%Y%m%d").date()
                 q = q.filter(pl.col("date") <= dt_end)
                 
-            return q.collect()
+            return q
         except Exception:
-            # 스키마 불일치(Schema Mismatch) 대비 Safe Mode: Diagonal Concat
-            import glob
-            
-            all_files = []
-            if isinstance(scan_path, list):
-                for p in scan_path:
-                    # glob은 문자열 경로를 받으므로 변환
-                    all_files.extend(glob.glob(p, recursive=True))
-            else:
-                all_files = glob.glob(str(scan_path), recursive=True)
-            
-            if not all_files:
-                return pl.DataFrame()
-            
-            dfs = []
-            for f in all_files:
-                try:
-                    df = pl.read_parquet(f)
-                    dfs.append(df)
-                except:
-                    continue
-            
-            if not dfs:
-                return pl.DataFrame()
-                
-            # how="diagonal"은 서로 다른 컬럼을 null로 채우며 합침
-            full_df = pl.concat(dfs, how="diagonal")
-            
-            # 필터링 적용
+            # 스키마 불일치 대비 Safe Mode는 유지하되 LazyFrame으로 반환 시도
+            # (실제 운영 환경에서는 스키마 통일이 권장됨)
+            q = pl.scan_parquet(self.base_path / "**" / "*.parquet", allow_ragged_schema=True)
             if start_date:
-                full_df = full_df.filter(pl.col("date") >= datetime.strptime(start_date, "%Y%m%d"))
+                q = q.filter(pl.col("date") >= datetime.strptime(start_date, "%Y%m%d").date())
             if end_date:
-                full_df = full_df.filter(pl.col("date") <= datetime.strptime(end_date, "%Y%m%d"))
-                
-            return full_df
+                q = q.filter(pl.col("date") <= datetime.strptime(end_date, "%Y%m%d").date())
+            return q
