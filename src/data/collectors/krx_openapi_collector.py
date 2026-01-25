@@ -346,7 +346,10 @@ class KRXOpenAPICollector:
         for col in ["open", "high", "low", "close", "volume", "trading_value", 
                    "market_cap", "shares_outstanding", "fluc_rate"]:
             if col in df.columns:
-                casts.append(pl.col(col).cast(pl.Float64))
+                # '-' 값이 들어있는 경우 '0'으로 치환 후 캐스팅
+                casts.append(
+                    pl.col(col).cast(pl.Utf8).str.replace("-", "0").cast(pl.Float64)
+                )
         
         # 날짜 필드
         if "date" in df.columns and df["date"].dtype != pl.Datetime:

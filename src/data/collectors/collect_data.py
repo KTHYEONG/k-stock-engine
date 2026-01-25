@@ -64,12 +64,23 @@ async def main():
 
     if not dates:
         logger.info("No new dates to collect. All dates in the range already exist.")
+        # 지수 데이터는 날짜 범위와 상관없이 한 번 최신화해주는 것이 좋음
+        indices_df = await collector.sync_all_indices(count=3000)
+        if not indices_df.is_empty():
+            store.save_features(indices_df)
+            logger.info("[OK] Indices synced successfully.")
         return
         
     logger.info("=" * 50)
     logger.info(f"[START] Data Collection Started: {dates[0]} ~ {dates[-1]}")
     logger.info(f"[INFO] Total Target Days: {len(dates)}")
     logger.info("=" * 50)
+
+    # 시작 전 지수 데이터 일괄 싱크 (MA120 등 과거 데이터를 위해 충분히 수집)
+    indices_df = await collector.sync_all_indices(count=3000)
+    if not indices_df.is_empty():
+        store.save_features(indices_df)
+        logger.info("[OK] Pre-sync: Indices updated.")
         
     pbar = tqdm(dates, desc="Overall Progress", unit="day")
     
