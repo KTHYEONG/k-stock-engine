@@ -21,68 +21,61 @@ class FundProcessor(BaseProcessor):
         self._fund_df = None
         self.store = FeatureStore()
 
-    def _load_financials(self) -> pl.DataFrame:
+    def _load_financials(self) -> pl.LazyFrame:
         if self._fund_df is None:
             if not self.financials_path.exists():
                 logger.error(f"Financials not found at {self.financials_path}")
-                return pl.DataFrame()
+                return pl.LazyFrame()
             
-            self._fund_df = pl.read_parquet(self.financials_path)
+            self._fund_df = pl.scan_parquet(self.financials_path)
             
-            # disclosure_date 컬럼이 없으면 대체 컬럼 찾기
-            if "disclosure_date" not in self._fund_df.columns:
-                if "date" in self._fund_df.columns:
+            # disclosure_date 컬럼 처리 (Lazy)
+            cols = self._fund_df.collect_schema().names()
+            if "disclosure_date" not in cols:
+                if "date" in cols:
                      self._fund_df = self._fund_df.with_columns(pl.col("date").alias("disclosure_date"))
-                elif "year" in self._fund_df.columns:
-                     # year만 있는 경우 연말(1231)을 기준으로 날짜 생성
+                elif "year" in cols:
                      self._fund_df = self._fund_df.with_columns(
                         (pl.col("year").cast(pl.Utf8) + "1231").alias("disclosure_date")
                      )
 
-            if "disclosure_date" in self._fund_df.columns:
-                # date format: YYYYMMDD string -> Datetime
-                self._fund_df = self._fund_df.with_columns(
-                    pl.col("disclosure_date").cast(pl.Utf8).str.strptime(pl.Datetime, "%Y%m%d")
-                )
+            self._fund_df = self._fund_df.with_columns(
+                pl.col("disclosure_date").cast(pl.Utf8).str.strptime(pl.Date, "%Y%m%d", strict=False)
+            )
         return self._fund_df
 
-    def _load_indices(self, start_date, end_date) -> pl.DataFrame:
-        """KOSPI, KOSDAQ 지수 로드 및 MA120 계산"""
-        idx_df = self.store.load_features(start_date=start_date, end_date=end_date)
+    def _load_indices(self, start_date: pl.Expr, end_date: pl.Expr) -> pl.LazyFrame:
+        """KOSPI, KOSDAQ 지수 로드 및 MA120 계산 (Lazy)"""
+        # FeatureStore.load_features가 이제 LazyFrame을 반환함
+        idx_df = self.store.load_features() 
+        
         # Filter only indices
         idx_df = idx_df.filter(pl.col("ticker").is_in(["KOSPI", "KOSDAQ"]))
-        
-        if idx_df.is_empty():
-            return pl.DataFrame()
             
-        # MA120 계산
+        # MA120 및 Relative Basis 계산 (Lazy)
         idx_df = idx_df.sort(["ticker", "date"]).with_columns([
             pl.col("close").rolling_mean(window_size=120).over("ticker").alias("idx_ma120")
-        ])
-        
-        # relative_basis = close / ma120
-        idx_df = idx_df.with_columns([
+        ]).with_columns([
             (pl.col("close") / pl.col("idx_ma120")).alias("idx_relative_basis")
         ])
         
         return idx_df.select(["date", "ticker", "idx_relative_basis"])
 
-    def process(self, df: pl.DataFrame) -> pl.DataFrame:
-        # Pre-check: Ensure date is Datetime
-        if df["date"].dtype == pl.Utf8:
-            df = df.with_columns(pl.col("date").str.strptime(pl.Datetime, "%Y%m%d"))
+    def process(self, df: pl.LazyFrame) -> pl.LazyFrame:
+        # Pre-check: Ensure date is Date (Lazy friendly cast)
+        df = df.with_columns(pl.col("date").cast(pl.Date))
 
         # 1. PiT Financial Merge
         fund_data = self._load_financials()
-        if not fund_data.is_empty():
-            df = df.sort("date")
-            fund_data = fund_data.sort("disclosure_date")
-            df = df.join_asof(
-                fund_data,
-                left_on="date",
-                right_on="disclosure_date",
-                by="ticker"
-            )
+        
+        df = df.sort("date")
+        fund_data = fund_data.sort("disclosure_date")
+        df = df.join_asof(
+            fund_data,
+            left_on="date",
+            right_on="disclosure_date",
+            by="ticker"
+        )
 
         # 2. Fundamental Metrics (Inverse Ratios)
         df = df.with_columns([
@@ -95,29 +88,25 @@ class FundProcessor(BaseProcessor):
         ])
 
         # 3. Relative Trend (Benchmark Match)
-        start_date = df["date"].min().strftime("%Y%m%d")
-        end_date = df["date"].max().strftime("%Y%m%d")
-        idx_df = self._load_indices(start_date, end_date)
+        # 지수 데이터 로드 (Lazy)
+        idx_df = self._load_indices(None, None)
         
-        if not idx_df.is_empty():
-            # Stock MA120 (already in TechProcessor as disparity_120d, but let's recalculate if not present)
-            if "disparity_120d" not in df.columns:
-                df = df.sort(["ticker", "date"]).with_columns([
-                    (pl.col("close") / pl.col("close").rolling_mean(window_size=120).over("ticker")).alias("disparity_120d")
-                ])
-            
-            # Join benchmark index based on market
-            # market: KOSPI, KOSDAQ
-            df = df.join(
-                idx_df,
-                left_on=["date", "market"],
-                right_on=["date", "ticker"],
-                how="left"
-            )
-            
-            # Relative Trend = Stock Basis / Index Basis
-            df = df.with_columns([
-                (pl.col("disparity_120d") / pl.col("idx_relative_basis")).alias("relative_trend_score")
-            ]).drop("idx_relative_basis")
+        # Stock MA120
+        df = df.sort(["ticker", "date"]).with_columns([
+            (pl.col("close") / pl.col("close").rolling_mean(window_size=120).over("ticker")).alias("disparity_120d")
+        ])
+        
+        # Join benchmark index based on market
+        df = df.join(
+            idx_df,
+            left_on=["date", "market"],
+            right_on=["date", "ticker"],
+            how="left"
+        )
+        
+        # Relative Trend = Stock Basis / Index Basis
+        df = df.with_columns([
+            (pl.col("disparity_120d") / pl.col("idx_relative_basis")).alias("relative_trend_score")
+        ]).drop("idx_relative_basis")
 
         return df
