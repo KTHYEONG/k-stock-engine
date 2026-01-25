@@ -2,6 +2,7 @@ import polars as pl
 from pathlib import Path
 from datetime import datetime
 from config.base import PROCESSED_DATA_DIR
+import uuid
 import logging
 
 logger = logging.getLogger("data.feature_store")

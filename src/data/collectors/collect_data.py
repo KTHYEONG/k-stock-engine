@@ -86,6 +86,11 @@ async def main():
     sem = asyncio.Semaphore(5)  # 동시 실행할 날짜 수 (API 한도 및 부하 고려)
     
     async def process_date(d):
+        # 주말(토, 일)은 수집 대상에서 제외하여 불필요한 API 호출 방지
+        dt = datetime.strptime(d, "%Y%m%d")
+        if dt.weekday() >= 5:
+            return
+
         async with sem:
             start_time = time.time()
             try:
