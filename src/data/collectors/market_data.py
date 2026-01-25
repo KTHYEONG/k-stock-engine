@@ -78,9 +78,9 @@ class MarketDataCollector:
              return pl.DataFrame()
 
         try:
-            # 1. 시세 데이터 수집 (KRX OpenAPI - Sync)
+            # 1. 시세 데이터 수집 (KRX OpenAPI - Async)
             krx_start = time.time()
-            pl_df = self.openapi_collector.collect_stock_daily_trade(date_str, market="ALL")
+            pl_df = await self.openapi_collector.collect_stock_daily_trade(date_str, market="ALL")
             krx_end = time.time()
             
             if pl_df.is_empty():
@@ -155,7 +155,7 @@ class MarketDataCollector:
                 try:
                     inv_start = time.time()
                     logger.info(f"Collecting investor net buy data for {date_str}...")
-                    investor_df = self.investor_collector.collect_daily_investor_net_buy(date_str)
+                    investor_df = await self.investor_collector.collect_daily_investor_net_buy(date_str)
                     
                     if not investor_df.is_empty():
                         # date 컬럼 삭제 (이미 pl_df에 어울리는 date가 있음)
@@ -209,12 +209,12 @@ class MarketDataCollector:
         
         return combined_df
 
-    def collect_market_indices(self, date_str: str) -> pl.DataFrame:
-        """KOSPI/KOSDAQ 지수 데이터 수집 및 표준화"""
+    async def collect_market_indices(self, date_str: str) -> pl.DataFrame:
+        """KOSPI/KOSDAQ 지수 데이터 수집 및 표준화 (Async)"""
         if not self.openapi_collector:
             return pl.DataFrame()
         try:
-            df = self.openapi_collector.collect_market_indices(date_str)
+            df = await self.openapi_collector.collect_market_indices(date_str)
             if df.is_empty(): return df
             mapping = {
                 "BAS_DD": "date", "INDEX_TYPE": "ticker",
