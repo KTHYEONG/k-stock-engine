@@ -1,63 +1,133 @@
 import polars as pl
 from pathlib import Path
 import sys
+import numpy as np
 
 # 프로젝트 루트 경로 계산
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
-# 데이터 저장 경로 설정
-file_path = PROJECT_ROOT / "data" / "processed" / "features" / "year=2024"
+from src.data.feature_store import FeatureStore
 
-print(f"Checking data at: {file_path}")
-
-if not file_path.exists():
-    print(f"Error: Path not found! {file_path}")
-else:
+def main():
+    store = FeatureStore()
+    
+    # 1. Load Data (Recent sample for speed, or full year if needed)
+    # 2024년 데이터로 검증
+    year = "2024"
+    print(f"Loading data for verification (Year: {year})...")
+    
     try:
-        # 방법 1: 스키마 이슈를 피하기 위해 가장 최근에 생성된 파티션 파일 하나만 읽기
-        all_parquet_files = sorted(list(file_path.rglob("*.parquet")))
+        ldf = store.load_features(start_date=f"{year}0101", end_date=f"{year}1231")
         
-        if not all_parquet_files:
-            print("No parquet files found in the directory.")
+        # Check if data exists (Lazy)
+        peek_df = ldf.limit(1).collect()
+        if peek_df.is_empty():
+            print(f"❌ No data found for {year}.")
+            return
+            
+        row_count = ldf.select(pl.len()).collect()[0, 0]
+        print(f"✅ Loaded {row_count} rows.")
+        
+        # Schema for existence check
+        schema_cols = ldf.collect_schema().names()
+
+        # 2. Define Expected Feature Groups
+        feature_groups = {
+            "Technical": [
+                "log_return_5d", "volatility_60d", "disparity_60d", "disparity_120d",
+                "volume_ratio_20d", "intraday_vol", "amihud_20d"
+            ],
+            "Flow": [
+                "net_purchase_total", "np_mkt_cap", "np_vol", "z_flow"
+            ],
+            "Fundamental": [
+                "bp_ratio", "ep_ratio", "roe", "debt_ratio", 
+                "capital_erosion_rate", "relative_trend_score"
+            ],
+            "Target": [
+                "target_return_5d", "target_rank"
+            ]
+        }
+
+        # 3. Validation Loop
+        all_passed = True
+        
+        for group, features in feature_groups.items():
+            print(f"\n[{group} Features Check]")
+            
+            missing = [f for f in features if f not in schema_cols]
+            if missing:
+                print(f"⚠️  Missing Columns: {missing}")
+                all_passed = False
+            
+            existing = [f for f in features if f in schema_cols]
+            if not existing:
+                continue
+                
+            # Calculate Stats (Null, Inf, Mean, Std) - Lazy Aggregation
+            stats_exprs = []
+            for f in existing:
+                stats_exprs.extend([
+                    pl.col(f).null_count().alias(f"{f}_null"),
+                    pl.col(f).mean().alias(f"{f}_mean"),
+                    pl.col(f).std().alias(f"{f}_std")
+                ])
+                
+            stats = ldf.select(stats_exprs).collect()
+            
+            # Print Formatted Stats
+            print(f"{'Feature':<20} | {'Null %':<10} | {'Mean':<10} | {'Std':<10}")
+            print("-" * 60)
+            
+            for f in existing:
+                null_cnt = stats[f"{f}_null"][0]
+                mean_val = stats[f"{f}_mean"][0]
+                std_val = stats[f"{f}_std"][0]
+                
+                # Handle None values elegantly
+                mean_val = mean_val if mean_val is not None else float('nan')
+                std_val = std_val if std_val is not None else float('nan')
+                
+                null_pct = (null_cnt / row_count) * 100
+                
+                print(f"{f:<20} | {null_pct:>9.2f}% | {mean_val:>10.4f} | {std_val:>10.4f}")
+                
+                # Check for anomalies
+                if null_pct > 20:
+                    print(f"   ⚠️  High Null Rate: {f} ({null_pct:.1f}%)")
+                
+                # Check for infinite values (using strict logic if possible, or just checking min/max manually later)
+                
+        # 4. Target Distribution Check
+        if "target_rank" in schema_cols:
+            print("\n[Target Distribution Check]")
+            target_stats = ldf.select([
+                pl.col("target_rank").min().alias("min"),
+                pl.col("target_rank").max().alias("max"),
+                pl.col("target_rank").mean().alias("mean")
+            ]).collect()
+            
+            min_val = target_stats['min'][0]
+            max_val = target_stats['max'][0]
+            mean_val = target_stats['mean'][0]
+            
+            print(f"Target Rank (0~1): Min={min_val:.4f}, Max={max_val:.4f}, Mean={mean_val:.4f}")
+            
+            if min_val is not None and max_val is not None:
+                if not (0 <= min_val <= 0.1) or not (0.9 <= max_val <= 1.0):
+                    print("⚠️  Target Rank scaling looks suspicious (should be roughly 0 to 1).")
+                
+        print("\n[Verification Summary]")
+        if all_passed:
+            print("✅ All expected feature groups exist.")
         else:
-            target_file = all_parquet_files[-1] # 가장 최신 파일
-            print(f"Reading sample file: {target_file.relative_to(PROJECT_ROOT)}")
-            
-            df = pl.read_parquet(target_file)
-
-            # 피처 엔지니어링으로 추가된 피처 목록 정의
-            engineered_features = {
-                "Technical": ["log_return_1d", "log_return_5d", "log_return_20d", "log_return_60d", "log_return_120d", 
-                             "volatility_20d", "volatility_60d", "disparity_5d", "disparity_20d", "disparity_60d", 
-                             "disparity_120d", "volume_ratio_5d", "volume_ratio_20d", "volume_ratio_60d", 
-                             "intraday_vol", "amihud_20d"],
-                "Flow/Supply": ["net_purchase_total", "np_mkt_cap", "np_vol", "np_cum_60d", "z_flow"],
-                "Fundamental": ["bp_ratio", "ep_ratio", "sp_ratio", "op_ratio", "roe", "debt_ratio", "relative_trend_score"],
-                "Universe/Filter": ["avg_trading_value_5d", "sector_count", "vol_rank", "vol_percentile"],
-                "Target": ["target_return_5d", "target_rank"]
-            }
-
-            print(f"\n[Engineered Features Check]")
-            
-            all_added = []
-            for category, features in engineered_features.items():
-                found = [f for f in features if f in df.columns]
-                all_added.extend(found)
-                print(f"- {category}: {len(found)}/{len(features)} found")
-                if found:
-                    print(f"  > {found}")
-
-            # 추가된 피처들만 따로 보기 (데이터 샘플)
-            print(f"\n[Sample Data: Only Engineered Features]")
-            # 상위 5개 행에 대해 추가된 컬럼들만 출력
-            if all_added:
-                # 출력 편의를 위해 ticker와 date를 포함시켜 출력
-                display_cols = ["date", "ticker"] + all_added[:10] # 너무 많으면 잘릴 수 있으니 10개만 우선 확인
-                print(df.select(display_cols).head())
-            else:
-                print("No engineered features found in the current file.")
+            print("⚠️  Some features are missing or problematic.")
 
     except Exception as e:
-        print(f"\nFailed to read data: {e}")
-        print("\nTip: 만약 전체 데이터를 읽고 싶다면, 모든 날짜에 대해 feature_engineer.py를 실행하여 스키마를 통일시켜야 합니다.")
+        print(f"❌ Validation failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
