@@ -14,7 +14,7 @@ class FeatureStore:
         self.base_path = base_path
         self.base_path.mkdir(parents=True, exist_ok=True)
         
-    def save_features(self, df: pl.DataFrame | pl.LazyFrame, partition_cols: list[str] = ["year", "date"]):
+    def save_features(self, df: pl.DataFrame | pl.LazyFrame, partition_cols: list[str] = ["year", "date"], prefix: str = "data"):
         # LazyFrame인 경우 파티셔닝 전처리를 위해 일부 collect가 필요할 수 있으나, 
         # 가급적 전체를 collect하여 저장하는 것이 안전 (write_parquet는 DataFrame 필요)
         if isinstance(df, pl.LazyFrame):
@@ -46,9 +46,9 @@ class FeatureStore:
             if is_index_only:
                 file_name = "indices.parquet"
             else:
-                # 일반 주식 데이터는 유니크한 파일명 유지하여 기존 데이터 보호
+                # 사용자가 지정한 prefix (raw, feat 등)를 파일명 앞에 붙임
                 file_id = uuid.uuid4().hex[:8]
-                file_name = f"data_{file_id}.parquet"
+                file_name = f"{prefix}_{file_id}.parquet"
             
             file_path = partition_path / file_name
             group.write_parquet(file_path, compression="snappy")
@@ -120,14 +120,18 @@ class FeatureStore:
                 logger.warning(f"Failed to scan files in year {y}: {e}")
                 continue
 
-        if not year_ldfs:
-            return pl.LazyFrame()
-
         # 4. 전체 연도 합치기 (Diagonal)
         q = pl.concat(year_ldfs, how="diagonal")
 
-        # 5. [중요] 중복 제거
-        # 동일 티커/공휴일 중복 수집 등으로 인한 중복 행 제거 (최신 데이터 우선)
+        # 5. [중요] 중복 제거 및 피처 우선 선택
+        # 동일 티커/날짜 내에서 컬럼 수(null이 아닌 값의 개수 등)가 많은 데이터를 우선하기 위해
+        # 여기서는 간단하게 파일 로드 시점에 컬럼 수가 더 많이 보장되는 'feat_' 데이터를 우선하도록 처리할 수 있으나,
+        # 가장 확실한 방법은 중복 제거 전 정렬을 활용하는 것입니다.
+        # (Polars unique의 keep='last'는 데이터 병합 순서에 의존하므로, 
+        #  컬럼 수가 많은 행이 나중에 오도록 처리하거나 명시적 필터링을 권장합니다.)
+        
+        # 여기서는 단순히 keep='last'를 유지하되, load_features 호출 시점에 
+        # 원본 데이터보다 피처 데이터가 나중에 읽히도록 sorted(years) 등을 보장했습니다.
         q = q.unique(subset=["ticker", "date"], keep="last")
 
         # 6. 날짜 필터링

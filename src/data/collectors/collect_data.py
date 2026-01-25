@@ -23,7 +23,7 @@ from src.utils.logger import setup_logger
 async def main():
     parser = argparse.ArgumentParser(description="Collect Daily Market Data")
     parser.add_argument("--date", type=str, help="Target date (YYYYMMDD).", default=None)
-    parser.add_argument("--start", type=str, help="Start date (YYYYMMDD) for batch collection.", default="20160104")
+    parser.add_argument("--start", type=str, help="Start date (YYYYMMDD) for batch collection.", default="20160101")
     parser.add_argument("--end", type=str, help="End date (YYYYMMDD) for batch collection.", default="20251231")
     
     args = parser.parse_args()
@@ -113,8 +113,8 @@ async def main():
                     # 파생 지표 계산
                     combined_df = collector.calculate_derived_metrics(combined_df)
                     
-                    # 저장 (년도별/일별 파티셔닝)
-                    store.save_features(combined_df, partition_cols=["year", "date"])
+                    # 저장 (년도별/일별 파티셔닝) - 원본 데이터임을 명시
+                    store.save_features(combined_df, partition_cols=["year", "date"], prefix="raw")
                     
                     elapsed = time.time() - start_time
                     tqdm.write(f"[OK] [{d}] Collected {len(combined_df)} records ({elapsed:.2f}s)")
