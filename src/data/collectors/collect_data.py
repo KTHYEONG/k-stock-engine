@@ -78,7 +78,7 @@ async def main():
         pbar.set_postfix_str(f"Processing {d}")
         
         try:
-            # 개별 날짜 수집
+            # 1. 개별 종목 데이터 수집
             df = await collector.collect_daily_data(d)
             
             if not df.is_empty():
@@ -89,10 +89,16 @@ async def main():
                 store.save_features(df, partition_cols=["year", "date"])
                 
                 elapsed = time.time() - start_time
-                # tqdm 전용 출력 (진행바가 깨지지 않음)
                 tqdm.write(f"[OK] [{d}] Collected {len(df)} stocks ({elapsed:.2f}s)")
             else:
-                tqdm.write(f"[WARN] [{d}] No data (Holiday or API Error)")
+                tqdm.write(f"[WARN] [{d}] No stock data")
+
+            # 2. 시장 지수 데이터 수집 (Relative Trend용)
+            idx_df = collector.collect_market_indices(d)
+            if not idx_df.is_empty():
+                store.save_features(idx_df, partition_cols=["year", "date"])
+                tqdm.write(f"[OK] [{d}] Collected market indices (KOSPI/KOSDAQ)")
+
         except Exception as e:
             tqdm.write(f"[FAIL] [{d}] Failed: {e}")
             

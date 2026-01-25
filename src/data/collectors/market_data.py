@@ -179,10 +179,29 @@ class MarketDataCollector:
 
             logger.info(f"Total collection time for {date_str}: {time.time() - overall_start:.2f}s")
             return pl_df
-
-                
         except Exception as e:
             logger.error(f"KRX OpenAPI failed: {e}")
+            return pl.DataFrame()
+
+    def collect_market_indices(self, date_str: str) -> pl.DataFrame:
+        """KOSPI/KOSDAQ 지수 데이터 수집 및 표준화"""
+        if not self.openapi_collector:
+            return pl.DataFrame()
+        try:
+            df = self.openapi_collector.collect_market_indices(date_str)
+            if df.is_empty(): return df
+            mapping = {
+                "BAS_DD": "date", "INDEX_TYPE": "ticker",
+                "CLSPRC_IDX": "close", "OPNPRC_IDX": "open",
+                "HGPRC_IDX": "high", "LWPRC_IDX": "low",
+                "ACC_TRDVOL": "volume", "ACC_TRDVAL": "trading_value"
+            }
+            current_mapping = {k: v for k, v in mapping.items() if k in df.columns}
+            df = df.rename(current_mapping)
+            df = self.openapi_collector._cast_types(df)
+            return df
+        except Exception as e:
+            logger.error(f"Failed to collect market indices: {e}")
             return pl.DataFrame()
             
     def _calculate_financial_metrics(self, df: pl.DataFrame) -> pl.DataFrame:
