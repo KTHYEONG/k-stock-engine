@@ -1,6 +1,7 @@
 import os
 import polars as pl
 import logging
+import asyncio
 from datetime import datetime
 logger = logging.getLogger("data.collectors.market")
 
@@ -182,6 +183,31 @@ class MarketDataCollector:
         except Exception as e:
             logger.error(f"KRX OpenAPI failed: {e}")
             return pl.DataFrame()
+
+    async def sync_all_indices(self, count: int = 3000) -> pl.DataFrame:
+        """네이버 금융을 통해 KOSPI/KOSDAQ 지수 데이터를 일괄 수집 및 갱신"""
+        if not self.naver_collector:
+            logger.error("Naver collector not initialized.")
+            return pl.DataFrame()
+            
+        logger.info(f"Syncing all indices (last {count} days)...")
+        
+        # 병렬 수집
+        kospi_task = self.naver_collector.collect_index_data("KOSPI", count=count)
+        kosdaq_task = self.naver_collector.collect_index_data("KOSDAQ", count=count)
+        
+        results = await asyncio.gather(kospi_task, kosdaq_task)
+        
+        df_list = [df for df in results if not df.is_empty()]
+        if not df_list:
+            return pl.DataFrame()
+            
+        combined_df = pl.concat(df_list)
+        
+        # 누락된 컬럼 placeholder 채우기 (기존 스키마 유지)
+        combined_df = self._fill_placeholders(combined_df)
+        
+        return combined_df
 
     def collect_market_indices(self, date_str: str) -> pl.DataFrame:
         """KOSPI/KOSDAQ 지수 데이터 수집 및 표준화"""
