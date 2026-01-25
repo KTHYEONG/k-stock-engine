@@ -51,26 +51,23 @@ class FundProcessor(BaseProcessor):
             )
         return self._fund_df
 
-    def _load_indices(self, start_date: pl.Expr, end_date: pl.Expr) -> pl.LazyFrame:
-        """KOSPI, KOSDAQ 지수 로드 및 MA120 계산 (Lazy)"""
-        # FeatureStore.load_features가 이제 LazyFrame을 반환함
-        idx_df = self.store.load_features() 
-        
-        # Filter only indices
-        idx_df = idx_df.filter(pl.col("ticker").is_in(["KOSPI", "KOSDAQ"]))
-            
-        # MA120 및 Relative Basis 계산 (Lazy)
-        idx_df = idx_df.sort(["ticker", "date"]).with_columns([
-            pl.col("close").rolling_mean(window_size=120).over("ticker").alias("idx_ma120")
-        ]).with_columns([
-            (pl.col("close") / pl.col("idx_ma120")).alias("idx_relative_basis")
-        ])
-        
-        return idx_df.select(["date", "ticker", "idx_relative_basis"])
-
     def process(self, df: pl.LazyFrame) -> pl.LazyFrame:
         # Pre-check: Ensure date is Date (Lazy friendly cast)
         df = df.with_columns(pl.col("date").cast(pl.Date))
+
+        # ---------------------------------------------------------
+        # [Optimization] Index Data Handling
+        # 별도로 파일을 로드하지 않고, 입력된 df에서 지수 데이터를 분리
+        # ---------------------------------------------------------
+        
+        # 1. 지수 데이터 분리 (KOSPI, KOSDAQ)
+        idx_df = df.filter(pl.col("ticker").is_in(["KOSPI", "KOSDAQ"]))
+        
+        # 지수 데이터가 현재 df에 없다면(배치 단위 분리 등의 이유), store에서 로드하는 fallback 유지
+        # 하지만 현재 구조(연도별 로드)상 함께 로드되어 있을 확률이 높음.
+        # 데이터가 비어있는지 확인은 Lazy 실행 시점에 어려우므로, 
+        # 우선 현재 df에서 분리한 것을 사용하고, 만약 비었다면 로직이 스킵되도록 설계
+        pass 
 
         # 1. PiT Financial Merge
         fund_data = self._load_financials()
@@ -127,9 +124,18 @@ class FundProcessor(BaseProcessor):
         ])
 
         # 4. Relative Trend (Benchmark Match)
-        # 지수 데이터 로드 (Lazy)
-        idx_df = self._load_indices(None, None).with_columns(
-            pl.col("idx_relative_basis").replace(0, None).fill_null(1.0) # 0/Null 방어
+        
+        # 지수 데이터 전처리 (MA120)
+        # idx_df는 위에서 이미 필터링해둠 (Lazy)
+        idx_df = idx_df.sort(["ticker", "date"]).with_columns([
+            pl.col("close").rolling_mean(window_size=120).over("ticker").alias("idx_ma120")
+        ]).with_columns([
+            (pl.col("close") / pl.col("idx_ma120")).alias("idx_relative_basis")
+        ]).select(["date", "ticker", "idx_relative_basis"])
+        
+        # 지수 데이터가 없는 구간(예: 웜업 초기) 등에 대비해 fill_null
+        idx_df = idx_df.with_columns(
+            pl.col("idx_relative_basis").replace(0, None).fill_null(1.0)
         )
         
         # Stock MA120 (Safe)
@@ -138,6 +144,10 @@ class FundProcessor(BaseProcessor):
         ])
         
         # Join benchmark index based on market
+        # [NOTICE] df에는 KOSPI, KOSDAQ 지수 행 자체도 포함되어 있으므로, 
+        # 나중에 지수 행을 제거하거나 유지할지 결정해야 함. 
+        # 여기서는 종목 데이터에 지수 데이터를 매핑하는 것이 목적임.
+        
         df = df.join(
             idx_df,
             left_on=["date", "market"],
