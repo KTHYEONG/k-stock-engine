@@ -8,6 +8,7 @@ import polars as pl
 from datetime import datetime
 from typing import Optional
 import time
+import asyncio
 
 logger = logging.getLogger("data.collectors.krx_openapi")
 
@@ -49,6 +50,8 @@ class KRXOpenAPICollector:
         }
         
         
+        self._lock = asyncio.Lock()
+        
         # Rate limiting & Usage tracking
         self.last_request_time = 0
         self.min_request_interval = 0.2  # 초당 최대 5회 요청
@@ -61,39 +64,36 @@ class KRXOpenAPICollector:
         
         logger.info(f"KRX OpenAPI Collector initialized. Daily limit: {self.daily_limit}")
         
-    def _rate_limit(self):
-        """API 요청 속도 및 일일 한도 제한 체크"""
-        if self.request_count >= self.daily_limit:
-            logger.error(f"Daily API limit ({self.daily_limit}) reached! Stopping.")
-            raise RuntimeError(f"KRX API daily limit of {self.daily_limit} reached.")
+    async def _rate_limit(self):
+        """API 요청 속도 및 일일 한도 제한 체크 (Async Safe)"""
+        async with self._lock:
+            if self.request_count >= self.daily_limit:
+                logger.error(f"Daily API limit ({self.daily_limit}) reached! Stopping.")
+                raise RuntimeError(f"KRX API daily limit of {self.daily_limit} reached.")
 
-        elapsed = time.time() - self.last_request_time
-        if elapsed < self.min_request_interval:
-            time.sleep(self.min_request_interval - elapsed)
-        
-        self.last_request_time = time.time()
-        self.request_count += 1
-        
-        if self.request_count % 100 == 0:
-            logger.info(f"API Usage: {self.request_count}/{self.daily_limit} calls made today.")
-    
-    def _make_request(self, endpoint: str, params: dict) -> dict:
-        """API 요청 실행
-        
-        Args:
-            endpoint: API 엔드포인트 경로
-            params: 요청 파라미터
+            elapsed = time.time() - self.last_request_time
+            if elapsed < self.min_request_interval:
+                await asyncio.sleep(self.min_request_interval - elapsed)
             
-        Returns:
-            dict: JSON 응답
-        """
-        self._rate_limit()
+            self.last_request_time = time.time()
+            self.request_count += 1
+            
+            if self.request_count % 100 == 0:
+                logger.info(f"API Usage: {self.request_count}/{self.daily_limit} calls made today.")
+    
+    async def _make_request(self, endpoint: str, params: dict) -> dict:
+        """API 요청 실행 (Async)"""
+        await self._rate_limit()
         
         url = f"{self.BASE_URL}/{endpoint}"
         
         try:
-            # Session 사용으로 3Way Handshake 오버헤드 제거
-            response = self.session.get(url, params=params, timeout=30)
+            # requests는 blocking이므로 thread에서 실행하여 루프 점유 방지
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None, 
+                lambda: self.session.get(url, params=params, timeout=30)
+            )
             
             if response.status_code == 200:
                 return response.json()
@@ -108,9 +108,9 @@ class KRXOpenAPICollector:
             logger.error(f"Request failed: {e}")
             raise
         
-    def collect_stock_daily_trade(self, date_str: str, market: str = "ALL") -> pl.DataFrame:
+    async def collect_stock_daily_trade(self, date_str: str, market: str = "ALL") -> pl.DataFrame:
         """
-        주식 일별 거래 데이터를 수집
+        주식 일별 거래 데이터를 수집 (Async)
         
         Args:
             date_str: "YYYYMMDD" 형식
@@ -122,7 +122,7 @@ class KRXOpenAPICollector:
         logger.info(f"Collecting stock daily trade for {date_str}, market={market}")
         
         try:
-            trade_df = self._collect_trade_data(date_str, market)
+            trade_df = await self._collect_trade_data(date_str, market)
             
             if trade_df.is_empty():
                 return pl.DataFrame()
@@ -135,8 +135,8 @@ class KRXOpenAPICollector:
             return pl.DataFrame()
 
     
-    def _collect_trade_data(self, date_str: str, market: str) -> pl.DataFrame:
-        """KRX OpenAPI로 거래 데이터 수집 (내부 메서드)"""
+    async def _collect_trade_data(self, date_str: str, market: str) -> pl.DataFrame:
+        """KRX OpenAPI로 거래 데이터 수집 (내부 메서드, Async)"""
         try:
             records = []
             params = {"basDd": date_str}
@@ -145,7 +145,7 @@ class KRXOpenAPICollector:
             if market in ["KOSPI", "ALL"]:
                 try:
                     logger.info(f"Fetching KOSPI data for {date_str}...")
-                    kospi_data = self._make_request(self.ENDPOINTS["KOSPI_STOCK"], params)
+                    kospi_data = await self._make_request(self.ENDPOINTS["KOSPI_STOCK"], params)
                     kospi_records = kospi_data.get("OutBlock_1", [])
                     
                     for rec in kospi_records:
@@ -159,7 +159,7 @@ class KRXOpenAPICollector:
             if market in ["KOSDAQ", "ALL"]:
                 try:
                     logger.info(f"Fetching KOSDAQ data for {date_str}...")
-                    kosdaq_data = self._make_request(self.ENDPOINTS["KOSDAQ_STOCK"], params)
+                    kosdaq_data = await self._make_request(self.ENDPOINTS["KOSDAQ_STOCK"], params)
                     kosdaq_records = kosdaq_data.get("OutBlock_1", [])
                     
                     for rec in kosdaq_records:
@@ -202,9 +202,9 @@ class KRXOpenAPICollector:
             logger.error(f"Trade data collection failed: {e}")
             return pl.DataFrame()
 
-    def collect_stock_base_info(self, date_str: str, market: str = "ALL") -> pl.DataFrame:
+    async def collect_stock_base_info(self, date_str: str, market: str = "ALL") -> pl.DataFrame:
         """
-        주식 기본정보 수집 (종목명, 업종, 상장일 등)
+        주식 기본정보 수집 (종목명, 업종, 상장일 등) (Async)
         
         Args:
             date_str: "YYYYMMDD" 형식
@@ -220,7 +220,7 @@ class KRXOpenAPICollector:
             params = {"basDd": date_str}
             
             if market in ["KOSPI", "ALL"]:
-                kospi_data = self._make_request(self.ENDPOINTS["KOSPI_INFO"], params)
+                kospi_data = await self._make_request(self.ENDPOINTS["KOSPI_INFO"], params)
                 kospi_records = kospi_data.get("OutBlock_1", [])
                 for rec in kospi_records:
                     rec["MARKET"] = "KOSPI"
@@ -228,7 +228,7 @@ class KRXOpenAPICollector:
                 records.extend(kospi_records)
             
             if market in ["KOSDAQ", "ALL"]:
-                kosdaq_data = self._make_request(self.ENDPOINTS["KOSDAQ_INFO"], params)
+                kosdaq_data = await self._make_request(self.ENDPOINTS["KOSDAQ_INFO"], params)
                 kosdaq_records = kosdaq_data.get("OutBlock_1", [])
                 for rec in kosdaq_records:
                     rec["MARKET"] = "KOSDAQ"
@@ -254,9 +254,9 @@ class KRXOpenAPICollector:
             logger.error(f"Failed to collect stock base info: {e}")
             return pl.DataFrame()
     
-    def collect_market_indices(self, date_str: str) -> pl.DataFrame:
+    async def collect_market_indices(self, date_str: str) -> pl.DataFrame:
         """
-        시장 지수 데이터 수집 (KOSPI, KOSDAQ 지수)
+        시장 지수 데이터 수집 (KOSPI, KOSDAQ 지수) (Async)
         
         Args:
             date_str: "YYYYMMDD" 형식
@@ -271,14 +271,14 @@ class KRXOpenAPICollector:
             params = {"basDd": date_str}
             
             # KOSPI 지수
-            kospi_idx = self._make_request(self.ENDPOINTS["KOSPI_INDEX"], params)
+            kospi_idx = await self._make_request(self.ENDPOINTS["KOSPI_INDEX"], params)
             kospi_records = kospi_idx.get("OutBlock_1", [])
             for rec in kospi_records:
                 rec["INDEX_TYPE"] = "KOSPI"
             records.extend(kospi_records)
             
             # KOSDAQ 지수
-            kosdaq_idx = self._make_request(self.ENDPOINTS["KOSDAQ_INDEX"], params)
+            kosdaq_idx = await self._make_request(self.ENDPOINTS["KOSDAQ_INDEX"], params)
             kosdaq_records = kosdaq_idx.get("OutBlock_1", [])
             for rec in kosdaq_records:
                 rec["INDEX_TYPE"] = "KOSDAQ"
