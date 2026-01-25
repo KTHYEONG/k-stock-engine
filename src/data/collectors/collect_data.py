@@ -2,6 +2,7 @@ import argparse
 import logging
 import sys
 import asyncio
+import polars as pl
 from datetime import datetime, timedelta
 from pathlib import Path
 from tqdm import tqdm
@@ -92,23 +93,30 @@ async def main():
             # 1. 개별 종목 데이터 수집
             df = await collector.collect_daily_data(d)
             
-            if not df.is_empty():
-                # 파생 지표 계산
-                df = collector.calculate_derived_metrics(df)
-                
-                # 저장 (년도별/일별 파티셔닝)
-                store.save_features(df, partition_cols=["year", "date"])
-                
-                elapsed = time.time() - start_time
-                tqdm.write(f"[OK] [{d}] Collected {len(df)} stocks ({elapsed:.2f}s)")
-            else:
-                tqdm.write(f"[WARN] [{d}] No stock data")
-
             # 2. 시장 지수 데이터 수집 (Relative Trend용)
             idx_df = collector.collect_market_indices(d)
-            if not idx_df.is_empty():
-                store.save_features(idx_df, partition_cols=["year", "date"])
-                tqdm.write(f"[OK] [{d}] Collected market indices (KOSPI/KOSDAQ)")
+            
+            # 두 데이터 합치기 (Overwrite 방지)
+            combined_df = pl.DataFrame()
+            if not df.is_empty() and not idx_df.is_empty():
+                # 컬럼이 다를 수 있으므로 diagonal 결합
+                combined_df = pl.concat([df, idx_df], how="diagonal")
+            elif not df.is_empty():
+                combined_df = df
+            elif not idx_df.is_empty():
+                combined_df = idx_df
+
+            if not combined_df.is_empty():
+                # 파생 지표 계산
+                combined_df = collector.calculate_derived_metrics(combined_df)
+                
+                # 저장 (년도별/일별 파티셔닝)
+                store.save_features(combined_df, partition_cols=["year", "date"])
+                
+                elapsed = time.time() - start_time
+                tqdm.write(f"[OK] [{d}] Collected {len(combined_df)} records (Stocks+Indices) ({elapsed:.2f}s)")
+            else:
+                tqdm.write(f"[WARN] [{d}] No data collected")
 
         except Exception as e:
             tqdm.write(f"[FAIL] [{d}] Failed: {e}")
