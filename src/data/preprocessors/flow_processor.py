@@ -11,16 +11,16 @@ class FlowProcessor(BaseProcessor):
     3. Z_flow: Z-Score of 60-day cumulative Net Purchase
     """
     
-    def process(self, df: pl.DataFrame) -> pl.DataFrame:
-        # Pre-check: Ensure required columns exist
-        # Connector names: foreign_net_buy, institution_net_buy
-        # Existing: market_cap, trading_value
-        
+    def process(self, df: pl.LazyFrame) -> pl.LazyFrame:
+        # Pre-check: Ensure required columns exist (Lazy friendly)
+        cols = df.collect_schema().names()
         required_cols = ["foreign_net_buy", "institution_net_buy", "market_cap", "trading_value"]
+        
         for col in required_cols:
-            if col not in df.columns:
-                # Filling with 0 to avoid breaking the pipeline if some days have no investor data
-                df = df.with_columns(pl.lit(0.0).alias(col)) if col in ["foreign_net_buy", "institution_net_buy"] else df
+            if col not in cols:
+                # Filling with 0 to avoid breaking the pipeline
+                if col in ["foreign_net_buy", "institution_net_buy"]:
+                    df = df.with_columns(pl.lit(0.0).alias(col))
 
         # 1. Total Net Purchase
         df = df.with_columns([
