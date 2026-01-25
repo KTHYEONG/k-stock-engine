@@ -33,19 +33,23 @@ class FeatureStore:
         if "year" not in df.columns and "date" in df.columns:
             df = df.with_columns(pl.col("date").dt.year().cast(pl.Utf8).alias("year"))
 
-        # [CRITICAL FIX] 덮어쓰기 방지를 위해 개별 날짜별로 유니크한 파일명으로 저장
-        import uuid
-        
-        # 데이터에 포함된 날짜별로 그룹화하여 저장
+        # [CRITICAL FIX] 덮어쓰기 방지 및 중복 방지 전략
         for (year, date), group in df.group_by(["year", "date"]):
             date_str = date.strftime("%Y-%m-%d") if hasattr(date, "strftime") else str(date)
             partition_path = self.base_path / f"year={year}" / f"date={date_str}"
             partition_path.mkdir(parents=True, exist_ok=True)
             
-            # 유니크한 파일명 생성 (예: data_a1b2c3d4.parquet)
-            file_id = uuid.uuid4().hex[:8]
-            file_path = partition_path / f"data_{file_id}.parquet"
+            # 지수 데이터(KOSPI, KOSDAQ)만 있는 경우 고정 파일명을 사용하여 중복 생성 방지
+            is_index_only = group["ticker"].is_in(["KOSPI", "KOSDAQ"]).all()
             
+            if is_index_only:
+                file_name = "indices.parquet"
+            else:
+                # 일반 주식 데이터는 유니크한 파일명 유지하여 기존 데이터 보호
+                file_id = uuid.uuid4().hex[:8]
+                file_name = f"data_{file_id}.parquet"
+            
+            file_path = partition_path / file_name
             group.write_parquet(file_path, compression="snappy")
         
     def get_existing_dates(self) -> list[str]:
