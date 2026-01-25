@@ -29,15 +29,22 @@ class FundProcessor(BaseProcessor):
             
             self._fund_df = pl.scan_parquet(self.financials_path)
             
-            # disclosure_date 컬럼 처리 (Lazy)
+            # capital -> capital_stock 매핑
             cols = self._fund_df.collect_schema().names()
+            if "capital" in cols:
+                self._fund_df = self._fund_df.with_columns(pl.col("capital").alias("capital_stock"))
+            elif "capital_stock" not in cols:
+                # 자본금이 없으면 자본잠식률 계산 불가 -> 임시 0 처리
+                self._fund_df = self._fund_df.with_columns(pl.lit(None).cast(pl.Float64).alias("capital_stock"))
+
+            # disclosure_date 컬럼 처리 (Lazy)
             if "disclosure_date" not in cols:
                 if "date" in cols:
-                     self._fund_df = self._fund_df.with_columns(pl.col("date").alias("disclosure_date"))
+                    self._fund_df = self._fund_df.with_columns(pl.col("date").alias("disclosure_date"))
                 elif "year" in cols:
-                     self._fund_df = self._fund_df.with_columns(
+                    self._fund_df = self._fund_df.with_columns(
                         (pl.col("year").cast(pl.Utf8) + "1231").alias("disclosure_date")
-                     )
+                    )
 
             self._fund_df = self._fund_df.with_columns(
                 pl.col("disclosure_date").cast(pl.Utf8).str.strptime(pl.Date, "%Y%m%d", strict=False)
@@ -68,6 +75,15 @@ class FundProcessor(BaseProcessor):
         # 1. PiT Financial Merge
         fund_data = self._load_financials()
         
+        # 중복 컬럼 방지: 조인 전 fund_data에서 불필요한 year 제거
+        # 이미 df에 year가 있으므로 financials의 year는 필요 없음
+        fund_data = fund_data.drop("year") if "year" in fund_data.collect_schema().names() else fund_data
+        
+        # 반복 실행 시 기존에 생성된 _right 컬럼이 있다면 제거 (충돌 방지)
+        cols_to_drop = [c for c in df.collect_schema().names() if c.endswith("_right")]
+        if cols_to_drop:
+            df = df.drop(cols_to_drop)
+
         df = df.sort("date")
         fund_data = fund_data.sort("disclosure_date")
         df = df.join_asof(
@@ -77,7 +93,28 @@ class FundProcessor(BaseProcessor):
             by="ticker"
         )
 
-        # 2. Fundamental Metrics (Inverse Ratios)
+        # 2. Market/Market Cap Column Normalization (Schema Consistency)
+        schema_cols = df.collect_schema().names()
+        
+        # market 컬럼 정규화 (MARKET -> market)
+        if "market" not in schema_cols:
+            if "MARKET" in schema_cols:
+                df = df.rename({"MARKET": "market"})
+            else:
+                # 최악의 경우 종목코드로 판단 (임시: 6자리면 KOSPI/KOSDAQ 가능성 높음)
+                # 여기서는 안전하게 'KOSPI'로 기본값 부여 (지수 매칭용)
+                df = df.with_columns(pl.lit("KOSPI").alias("market"))
+        
+        # market_cap 컬럼 정규화
+        if "market_cap" not in schema_cols:
+            if "MKTCAP" in schema_cols:
+                df = df.with_columns(pl.col("MKTCAP").alias("market_cap"))
+            elif "MarCap" in schema_cols:
+                df = df.with_columns(pl.col("MarCap").alias("market_cap"))
+            else:
+                df = df.with_columns(pl.col("close").alias("market_cap"))
+
+        # 3. Fundamental Metrics (Inverse Ratios)
         df = df.with_columns([
             (pl.col("total_equity") / pl.col("market_cap").replace(0, None)).alias("bp_ratio"),
             (pl.col("net_income") / pl.col("market_cap").replace(0, None)).alias("ep_ratio"),
@@ -89,7 +126,7 @@ class FundProcessor(BaseProcessor):
             ((pl.col("capital_stock") - pl.col("total_equity")) / pl.col("capital_stock").replace(0, None)).fill_null(0).alias("capital_erosion_rate")
         ])
 
-        # 3. Relative Trend (Benchmark Match)
+        # 4. Relative Trend (Benchmark Match)
         # 지수 데이터 로드 (Lazy)
         idx_df = self._load_indices(None, None).with_columns(
             pl.col("idx_relative_basis").replace(0, None).fill_null(1.0) # 0/Null 방어
