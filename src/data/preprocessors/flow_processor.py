@@ -18,9 +18,14 @@ class FlowProcessor(BaseProcessor):
         
         for col in required_cols:
             if col not in cols:
-                # Filling with 0 to avoid breaking the pipeline
                 if col in ["foreign_net_buy", "institution_net_buy"]:
                     df = df.with_columns(pl.lit(0.0).alias(col))
+                elif col == "market_cap":
+                    # market_cap이 없으면 close를 임시로 사용 (0 방지)
+                    df = df.with_columns(pl.col("close").alias("market_cap"))
+                elif col == "trading_value":
+                    # 거래대금이 없으면 가격 * 거래량으로 계산
+                    df = df.with_columns((pl.col("close") * pl.col("volume")).alias("trading_value"))
 
         # 1. Total Net Purchase
         df = df.with_columns([
