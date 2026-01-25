@@ -10,7 +10,7 @@ sys.path.append(str(PROJECT_ROOT))
 from src.data.feature_store import FeatureStore
 from config.base import DATA_DIR
 
-def check_readiness(start_date: str = "20230101", end_date: str = "20230131"):
+def check_readiness(start_date: str = "20160101", end_date: str = "20251231"):
     """
     피처 엔지니어링 수행 전, 필수 데이터(시세, 재무, 지수)가 모두 준비되었는지 확인
     """
@@ -23,18 +23,24 @@ def check_readiness(start_date: str = "20230101", end_date: str = "20230131"):
     # 1. 시세 데이터 (Market Data) 확인
     print("1. Checking Market Data (Price/Volume)...")
     try:
-        df = store.load_features(start_date=start_date, end_date=end_date)
-        if df.is_empty():
+        ldf = store.load_features(start_date=start_date, end_date=end_date)
+        
+        # 데이터 존재 여부와 스키마 확인을 위해 1줄만 로드 (메모리 절약)
+        peek_df = ldf.limit(1).collect()
+        
+        if peek_df.is_empty():
             print("   ❌ No stock data found for this period.")
             all_passed = False
         else:
-            stock_count = df.select("ticker").n_unique()
-            row_count = len(df)
+            # 전체 개수는 Lazy 연산으로 수행 (Metadata 활용 또는 최적화된 스캔)
+            row_count = ldf.select(pl.len()).collect()[0, 0]
+            stock_count = ldf.select(pl.col("ticker").n_unique()).collect()[0, 0]
+            
             print(f"   ✅ Found {row_count} rows ({stock_count} unique stocks).")
             
             # 필수 컬럼 체크
             required_cols = ["open", "high", "low", "close", "volume", "market_cap"]
-            missing = [c for c in required_cols if c not in df.columns]
+            missing = [c for c in required_cols if c not in peek_df.columns]
             if missing:
                 print(f"   ❌ Missing core columns: {missing}")
                 all_passed = False
@@ -48,18 +54,25 @@ def check_readiness(start_date: str = "20230101", end_date: str = "20230131"):
     print("\n2. Checking Index Data (KOSPI/KOSDAQ)...")
     try:
         # 지수 데이터는 120일 이동평균 계산을 위해 과거 데이터가 있는지 확인해야 함
-        # start_date 기준 1년 전부터 조회
         past_start = (datetime.strptime(start_date, "%Y%m%d").replace(year=int(start_date[:4])-1)).strftime("%Y%m%d")
         
-        idx_df = store.load_features(start_date=past_start, end_date=end_date)
-        idx_df = idx_df.filter(pl.col("ticker").is_in(["KOSPI", "KOSDAQ"]))
+        idx_ldf = store.load_features(start_date=past_start, end_date=end_date)
+        idx_ldf = idx_ldf.filter(pl.col("ticker").is_in(["KOSPI", "KOSDAQ"]))
         
-        if idx_df.is_empty():
+        # 그룹별 카운트 계산 (데이터 로드 없이 집계)
+        counts_df = idx_ldf.group_by("ticker").len().collect()
+        
+        if counts_df.is_empty():
             print("   ❌ No index data found.")
             all_passed = False
         else:
-            kospi_cnt = len(idx_df.filter(pl.col("ticker") == "KOSPI"))
-            kosdaq_cnt = len(idx_df.filter(pl.col("ticker") == "KOSDAQ"))
+            kospi_row = counts_df.filter(pl.col("ticker") == "KOSPI")
+            kosdaq_row = counts_df.filter(pl.col("ticker") == "KOSDAQ")
+            
+            # .len() 집계 결과의 컬럼명은 'len'입니다.
+            kospi_cnt = kospi_row["len"][0] if not kospi_row.is_empty() else 0
+            kosdaq_cnt = kosdaq_row["len"][0] if not kosdaq_row.is_empty() else 0
+            
             print(f"   ✅ Found index history: KOSPI({kospi_cnt}), KOSDAQ({kosdaq_cnt})")
             
             if kospi_cnt < 200 or kosdaq_cnt < 200:
