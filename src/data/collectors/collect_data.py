@@ -83,43 +83,47 @@ async def main():
         store.save_features(indices_df)
         logger.info("[OK] Pre-sync: Indices updated.")
         
-    pbar = tqdm(dates, desc="Overall Progress", unit="day")
+    sem = asyncio.Semaphore(5)  # 동시 실행할 날짜 수 (API 한도 및 부하 고려)
     
-    for d in pbar:
-        start_time = time.time()
-        pbar.set_postfix_str(f"Processing {d}")
-        
-        try:
-            # 1. 개별 종목 데이터 수집
-            df = await collector.collect_daily_data(d)
-            
-            # 2. 시장 지수 데이터 수집 (Relative Trend용)
-            idx_df = collector.collect_market_indices(d)
-            
-            # 두 데이터 합치기 (Overwrite 방지)
-            combined_df = pl.DataFrame()
-            if not df.is_empty() and not idx_df.is_empty():
-                # 컬럼이 다를 수 있으므로 diagonal 결합
-                combined_df = pl.concat([df, idx_df], how="diagonal")
-            elif not df.is_empty():
-                combined_df = df
-            elif not idx_df.is_empty():
-                combined_df = idx_df
-
-            if not combined_df.is_empty():
-                # 파생 지표 계산
-                combined_df = collector.calculate_derived_metrics(combined_df)
+    async def process_date(d):
+        async with sem:
+            start_time = time.time()
+            try:
+                # 1. 개별 종목 데이터 수집
+                df = await collector.collect_daily_data(d)
                 
-                # 저장 (년도별/일별 파티셔닝)
-                store.save_features(combined_df, partition_cols=["year", "date"])
+                # 2. 시장 지수 데이터 수집 (Relative Trend용)
+                idx_df = await collector.collect_market_indices(d)
                 
-                elapsed = time.time() - start_time
-                tqdm.write(f"[OK] [{d}] Collected {len(combined_df)} records (Stocks+Indices) ({elapsed:.2f}s)")
-            else:
-                tqdm.write(f"[WARN] [{d}] No data collected")
+                # 두 데이터 합치기
+                combined_df = pl.DataFrame()
+                if not df.is_empty() and not idx_df.is_empty():
+                    combined_df = pl.concat([df, idx_df], how="diagonal")
+                elif not df.is_empty():
+                    combined_df = df
+                elif not idx_df.is_empty():
+                    combined_df = idx_df
 
-        except Exception as e:
-            tqdm.write(f"[FAIL] [{d}] Failed: {e}")
+                if not combined_df.is_empty():
+                    # 파생 지표 계산
+                    combined_df = collector.calculate_derived_metrics(combined_df)
+                    
+                    # 저장 (년도별/일별 파티셔닝)
+                    store.save_features(combined_df, partition_cols=["year", "date"])
+                    
+                    elapsed = time.time() - start_time
+                    tqdm.write(f"[OK] [{d}] Collected {len(combined_df)} records ({elapsed:.2f}s)")
+                else:
+                    tqdm.write(f"[WARN] [{d}] No data collected")
+
+            except Exception as e:
+                tqdm.write(f"[FAIL] [{d}] Failed: {e}")
+
+    # 병렬 실행 (tqdm으로 진행도 표시)
+    tasks = [process_date(d) for d in dates]
+    
+    for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Overall Progress", unit="day"):
+        await f
             
     logger.info("=" * 50)
     logger.info("[END] All tasks completed!")
