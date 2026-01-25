@@ -71,27 +71,13 @@ class FeatureStore:
             return []
         
     def load_features(self, start_date: str = None, end_date: str = None) -> pl.LazyFrame:
-        """파티셔닝된 피처 로드 (LazyFrame 반환)"""
-        if start_date and end_date:
-            start_year = int(start_date[:4])
-            end_year = int(end_date[:4])
-            
-            paths = []
-            for y in range(start_year, end_year + 1):
-                year_path = self.base_path / f"year={y}" / "**" / "*.parquet"
-                paths.append(str(year_path))
-            scan_path = paths
-        else:
-            scan_path = self.base_path / "**" / "*.parquet"
-
-    def load_features(self, start_date: str = None, end_date: str = None) -> pl.LazyFrame:
-        """파티셔닝된 피처 로드 (Plan Explosion 방지 최적화)"""
+        """파티셔닝된 피처 로드 (스키마 불일치 대응 최적화)"""
+        # 1. 대상 연도 결정
         if start_date and end_date:
             start_year = int(start_date[:4])
             end_year = int(end_date[:4])
             years = list(range(start_year, end_year + 1))
         else:
-            # 존재함 폴더 기반으로 연도 추출
             import re
             years = []
             for p in self.base_path.glob("year=*"):
@@ -100,68 +86,51 @@ class FeatureStore:
                     years.append(int(match.group(1)))
         
         year_ldfs = []
-        for y in years:
+        import glob
+        for y in sorted(years):
             year_path = self.base_path / f"year={y}"
             if not year_path.exists():
                 continue
             
-            # 연도 내의 모든 parquet 파일을 하나의 scan으로 시도 (성능 최적화)
-            # 하위 폴더(date=...)가 있는 경우를 위해 Recursive Glob 사용
+            # 2. 연도 내 파일 수집
+            # 주식 데이터(data_*)와 지수 데이터(indices.parquet)가 섞여 있어 스키마가 다를 수 있음
+            files = glob.glob(str(year_path / "**" / "*.parquet"), recursive=True)
+            if not files:
+                continue
+            
+            # 3. 개별 파일 스캔 후 대각선 병합 (Ragged Schema 대응)
+            # Polars 1.1x+ 에서는 scan_parquet(files)가 스키마가 다르면 에러를 낼 확률이 높음
+            # 개별 스캔 후 concat(how="diagonal")이 가장 안전함
             try:
-                # Polars는 리스트 형식의 경로를 지원함 (가장 효율적)
-                import glob
-                files = glob.glob(str(year_path / "**" / "*.parquet"), recursive=True)
-                if not files:
-                    continue
+                # 개별 파일별로 LazyFrame 생성
+                file_ldfs = [pl.scan_parquet(f) for f in files]
+                yldf = pl.concat(file_ldfs, how="diagonal")
                 
-                # 연도별로 하나의 유닛으로 묶음
-                # 스키마가 다르면 여기서 에러가 발생하거나, 추후 collect 시 발생할 수 있음
-                # collect 시 발생하면 이 try-except가 잡지 못하므로, 안전하게 diagonal concat을 기본으로 쓰거나
-                # 여기서는 명시적으로 allow_missing_columns=True 같은 옵션이 없어서
-                # Ragged Schema가 의심되면 무조건 Diagonal Concat을 써야 함.
-                
-                # 현재 에러는 scan 시점이 아니라 파이프라인 구성 시점에 검증하다 터지는 것.
-                # 따라서 여기서는 Fast Scan 대신 Diagonal Concat을 기본으로 사용하는 것이 가장 안전함.
-                # 성능 차이가 크지 않다면 안정성을 택함.
-                
-                # 하지만 성능 최적화를 위해 일단 시도하고, 실패하면 fallback
-                yldf = pl.scan_parquet(files)
-                
-                # 로드 직후 불필요한 중복 컬럼(_right) 제거하여 플랜 경량화
-                curr_cols = yldf.collect_schema().names()
-                cols_to_drop = [c for c in curr_cols if c.endswith("_right")]
-                if cols_to_drop:
-                    yldf = yldf.drop(cols_to_drop)
+                # 불필요한 중복 컬럼(_right) 제거 (Join 흔적 등)
+                try:
+                    curr_cols = yldf.collect_schema().names()
+                    cols_to_drop = [c for c in curr_cols if c.endswith("_right")]
+                    if cols_to_drop:
+                        yldf = yldf.drop(cols_to_drop)
+                except:
+                    pass
                     
                 year_ldfs.append(yldf)
             except Exception as e:
-                # logger.warning(f"Year {y} fast scan failed (Schema Mismatch?), falling back to diagonal: {e}")
-                # 스키마가 다른 파일들이 섞여 있는 경우 개별 스캔 후 합침
-                files = glob.glob(str(year_path / "**" / "*.parquet"), recursive=True)
-                if files:
-                    yldf = pl.concat([pl.scan_parquet(f) for f in files], how="diagonal")
-                    # 여기서도 _right 제거 (스키마 수집은 비용이 들지만 필요함)
-                    try:
-                         # concat된 LazyFrame은 즉시 스키마 확인이 어려울 수 있으니 try 감쌈
-                        curr_cols = yldf.collect_schema().names()
-                        cols_to_drop = [c for c in curr_cols if c.endswith("_right")]
-                        if cols_to_drop:
-                            yldf = yldf.drop(cols_to_drop)
-                    except:
-                        pass
-                    year_ldfs.append(yldf)
+                logger.warning(f"Failed to scan files in year {y}: {e}")
+                continue
 
         if not year_ldfs:
             return pl.LazyFrame()
 
-        # 연도별로 묶인 단위들을 합침 (전체 파일 개수보다 훨씬 적은 유닛)
+        # 4. 전체 연도 합치기 (Diagonal)
         q = pl.concat(year_ldfs, how="diagonal")
 
-        # [CRITICAL FIX] 중복 데이터 제거 (로드 시점에 ticker, date 기준으로 최신/유일 데이터 보장)
-        # scan 시점에는 unique를 쓸 수 없으므로, collect 직전에 적용되도록 필터링 구조에 추가
+        # 5. [중요] 중복 제거
+        # 동일 티커/공휴일 중복 수집 등으로 인한 중복 행 제거 (최신 데이터 우선)
         q = q.unique(subset=["ticker", "date"], keep="last")
 
-        # 필터링 적용
+        # 6. 날짜 필터링
         if start_date:
             dt_start = datetime.strptime(start_date, "%Y%m%d").date()
             q = q.filter(pl.col("date") >= dt_start)
