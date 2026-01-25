@@ -94,20 +94,13 @@ async def main():
         async with sem:
             start_time = time.time()
             try:
-                # 1. 개별 종목 데이터 수집
+                # 1. 개별 종목 데이터 수집 (API 호출 2회: KOSPI, KOSDAQ)
                 df = await collector.collect_daily_data(d)
                 
-                # 2. 시장 지수 데이터 수집 (Relative Trend용)
-                idx_df = await collector.collect_market_indices(d)
-                
-                # 두 데이터 합치기
-                combined_df = pl.DataFrame()
-                if not df.is_empty() and not idx_df.is_empty():
-                    combined_df = pl.concat([df, idx_df], how="diagonal")
-                elif not df.is_empty():
-                    combined_df = df
-                elif not idx_df.is_empty():
-                    combined_df = idx_df
+                # 2. 시장 지수 데이터 수집 (생략)
+                # 이미 loop 밖에서 sync_all_indices()를 통해 일괄 수집/저장되어 있음.
+                # 피처 엔지니어링 단계에서 자동으로 병합되므로 여기서 중복 수집할 필요 없음.
+                combined_df = df
 
                 if not combined_df.is_empty():
                     # 파생 지표 계산
