@@ -77,8 +77,10 @@ class FeatureEngineer:
                     logger.debug(f"Queueing {processor.__class__.__name__}...")
                     ldf = processor.process(ldf)
                 
-                # 3. Filter back to target year
-                ldf = ldf.filter(pl.col("date").dt.year() == year)
+                # 3. Filter back to target range (Exactly follow user input)
+                dt_start = datetime.strptime(start_date, "%Y%m%d").date()
+                dt_end = datetime.strptime(end_date, "%Y%m%d").date()
+                ldf = ldf.filter((pl.col("date") >= dt_start) & (pl.col("date") <= dt_end))
                     
                 # 4. Collect
                 logger.info(f"Executing pipeline for year {year}...")
@@ -93,7 +95,7 @@ class FeatureEngineer:
                     # 테스트 모드일 경우 첫 번째 연도만 보여주고 중단 가능 (선택 사항)
                     break 
                 else:
-                    self.store.save_features(df, partition_cols=["year", "date"])
+                    self.store.save_features(df, partition_cols=["year", "date"], prefix="feat")
                     logger.info(f"Year {year} processing completed. Shape: {df.shape}")
 
         except Exception as e:
