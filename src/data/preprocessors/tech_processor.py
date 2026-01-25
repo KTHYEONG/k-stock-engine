@@ -69,6 +69,12 @@ class TechProcessor(BaseProcessor):
         ])
         
         # 6. Amihud Illiquidity (보정된 유동성 지표)
+        # trading_value가 없으면 계산해서 생성 (Close * Volume)
+        if "trading_value" not in df.collect_schema().names():
+             df = df.with_columns(
+                 (pl.col("close") * pl.col("volume")).alias("trading_value")
+             )
+             
         # 1e6을 곱하여 수치 가독성 확보 및 0/inf 방어
         abs_ret = pl.col("log_return_1d").abs()
         amihud_daily = (abs_ret / pl.col("trading_value").replace(0, None)).fill_null(0) * 1e6
