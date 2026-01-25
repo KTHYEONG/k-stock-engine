@@ -84,16 +84,20 @@ class FundProcessor(BaseProcessor):
             (pl.col("revenue") / pl.col("market_cap").replace(0, None)).alias("sp_ratio"),
             (pl.col("operating_income") / pl.col("market_cap").replace(0, None)).alias("op_ratio"),
             (pl.col("net_income") / pl.col("total_equity").replace(0, None)).alias("roe"),
-            (pl.col("total_liabilities") / pl.col("total_equity").replace(0, None)).alias("debt_ratio")
+            (pl.col("total_liabilities") / pl.col("total_equity").replace(0, None)).alias("debt_ratio"),
+            # 자본잠식률: (자본금 - 자본총계) / 자본금
+            ((pl.col("capital_stock") - pl.col("total_equity")) / pl.col("capital_stock").replace(0, None)).fill_null(0).alias("capital_erosion_rate")
         ])
 
         # 3. Relative Trend (Benchmark Match)
         # 지수 데이터 로드 (Lazy)
-        idx_df = self._load_indices(None, None)
+        idx_df = self._load_indices(None, None).with_columns(
+            pl.col("idx_relative_basis").replace(0, None).fill_null(1.0) # 0/Null 방어
+        )
         
-        # Stock MA120
+        # Stock MA120 (Safe)
         df = df.sort(["ticker", "date"]).with_columns([
-            (pl.col("close") / pl.col("close").rolling_mean(window_size=120).over("ticker")).alias("disparity_120d")
+            (pl.col("close") / pl.col("close").rolling_mean(window_size=120).over("ticker").replace(0, None)).fill_null(1.0).alias("disparity_120d")
         ])
         
         # Join benchmark index based on market
@@ -106,7 +110,7 @@ class FundProcessor(BaseProcessor):
         
         # Relative Trend = Stock Basis / Index Basis
         df = df.with_columns([
-            (pl.col("disparity_120d") / pl.col("idx_relative_basis")).alias("relative_trend_score")
+            (pl.col("disparity_120d") / pl.col("idx_relative_basis").replace(0, None)).fill_null(1.0).alias("relative_trend_score")
         ]).drop("idx_relative_basis")
 
         return df

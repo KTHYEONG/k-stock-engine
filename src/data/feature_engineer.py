@@ -49,19 +49,21 @@ class FeatureEngineer:
                 year_str = str(year)
                 logger.info(f"Processing Year: {year_str}")
                 
-                # 1. Load Data (LazyFrame)
-                ldf = self.store.load_features(start_date=f"{year}0101", end_date=f"{year}1231")
+                # 1. Load Data with Warm-up (Load from 6 months prior to current year)
+                # 120일 지표 계산을 위해 약 6개월(180일)의 과거 데이터가 필요함
+                warmup_start = f"{year-1}0601"
+                ldf = self.store.load_features(start_date=warmup_start, end_date=f"{year}1231")
                 
                 # 2. Apply Processors (Lazily)
                 for processor in self.processors:
                     logger.debug(f"Queueing {processor.__class__.__name__}...")
                     ldf = processor.process(ldf)
-                    
-                # 3. Collect & Save (Actual execution point)
-                logger.info(f"Executing pipeline for year {year}...")
                 
-                # save_features 내부에 collect()가 포함되어 있으나, 
-                # 여기서 명시적으로 collect하여 메모리 모니터링 가능하도록 함
+                # 3. Filter back to the target year (Warm-up 데이터는 저장하지 않음)
+                ldf = ldf.filter(pl.col("date").dt.year() == year)
+                    
+                # 4. Collect & Save (Actual execution point)
+                logger.info(f"Executing pipeline for year {year} (with Look-back)...")
                 df = ldf.collect()
                 
                 if df.is_empty():
