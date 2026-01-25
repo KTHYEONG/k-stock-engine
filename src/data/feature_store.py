@@ -2,6 +2,9 @@ import polars as pl
 from pathlib import Path
 from datetime import datetime
 from config.base import PROCESSED_DATA_DIR
+import logging
+
+logger = logging.getLogger("data.feature_store")
 
 class FeatureStore:
     """Parquet 기반 피처 스토리지 관리 클래스"""
@@ -36,10 +39,14 @@ class FeatureStore:
         )
         
     def get_existing_dates(self) -> list[str]:
-        """이미 저장된 데이터의 날짜 목록 (I/O 비용 절감을 위해 scan_parquet 활용)"""
         try:
+            import glob
+            all_files = glob.glob(str(self.base_path / "**" / "*.parquet"), recursive=True)
+            if not all_files:
+                return []
+            
             return (
-                pl.scan_parquet(self.base_path / "**" / "*.parquet")
+                pl.concat([pl.scan_parquet(f) for f in all_files], how="diagonal")
                 .select("date")
                 .unique()
                 .collect()
@@ -58,14 +65,27 @@ class FeatureStore:
             
             paths = []
             for y in range(start_year, end_year + 1):
-                year_path = self.base_path / f"year={y}" / "*.parquet"
+                year_path = self.base_path / f"year={y}" / "**" / "*.parquet"
                 paths.append(str(year_path))
             scan_path = paths
         else:
             scan_path = self.base_path / "**" / "*.parquet"
 
         try:
-            q = pl.scan_parquet(scan_path)
+            import glob
+            all_files = []
+            if isinstance(scan_path, list):
+                for p in scan_path:
+                    all_files.extend(glob.glob(p, recursive=True))
+            else:
+                all_files = glob.glob(str(scan_path), recursive=True)
+            
+            if not all_files:
+                return pl.LazyFrame()
+            
+            # Diagonal concat of LazyFrames handles varying schemas across files
+            # compatible with older polars versions
+            q = pl.concat([pl.scan_parquet(f) for f in all_files], how="diagonal")
             
             if start_date:
                 dt_start = datetime.strptime(start_date, "%Y%m%d").date()
@@ -75,12 +95,6 @@ class FeatureStore:
                 q = q.filter(pl.col("date") <= dt_end)
                 
             return q
-        except Exception:
-            # 스키마 불일치 대비 Safe Mode는 유지하되 LazyFrame으로 반환 시도
-            # (실제 운영 환경에서는 스키마 통일이 권장됨)
-            q = pl.scan_parquet(self.base_path / "**" / "*.parquet", allow_ragged_schema=True)
-            if start_date:
-                q = q.filter(pl.col("date") >= datetime.strptime(start_date, "%Y%m%d").date())
-            if end_date:
-                q = q.filter(pl.col("date") <= datetime.strptime(end_date, "%Y%m%d").date())
-            return q
+        except Exception as e:
+            logger.error(f"Error loading features: {e}")
+            return pl.LazyFrame()
