@@ -83,7 +83,7 @@ async def main():
         store.save_features(indices_df)
         logger.info("[OK] Pre-sync: Indices updated.")
         
-    sem = asyncio.Semaphore(5)  # 동시 실행할 날짜 수 (API 한도 및 부하 고려)
+    sem = asyncio.Semaphore(3)  # 동시 실행할 날짜 수 (API 한도 고려하여 5 -> 3으로 하향)
     
     async def process_date(d):
         # 주말(토, 일)은 수집 대상에서 제외하여 불필요한 API 호출 방지

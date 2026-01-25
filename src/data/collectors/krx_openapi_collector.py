@@ -81,32 +81,40 @@ class KRXOpenAPICollector:
             if self.request_count % 100 == 0:
                 logger.info(f"API Usage: {self.request_count}/{self.daily_limit} calls made today.")
     
-    async def _make_request(self, endpoint: str, params: dict) -> dict:
-        """API 요청 실행 (Async)"""
-        await self._rate_limit()
-        
-        url = f"{self.BASE_URL}/{endpoint}"
-        
-        try:
-            # requests는 blocking이므로 thread에서 실행하여 루프 점유 방지
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                None, 
-                lambda: self.session.get(url, params=params, timeout=30)
-            )
+    async def _make_request(self, endpoint: str, params: dict, retry_count: int = 3) -> dict:
+        """API 요청 실행 (Async + Retry for 429)"""
+        for i in range(retry_count):
+            await self._rate_limit()
+            url = f"{self.BASE_URL}/{endpoint}"
             
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 401:
-                raise Exception("401 Unauthorized: Invalid API key")
-            elif response.status_code == 404:
-                raise Exception(f"404 Not Found: Endpoint {endpoint} does not exist")
-            else:
-                raise Exception(f"HTTP {response.status_code}: {response.text}")
+            try:
+                loop = asyncio.get_event_loop()
+                response = await loop.run_in_executor(
+                    None, 
+                    lambda: self.session.get(url, params=params, timeout=30)
+                )
                 
-        except requests.RequestException as e:
-            logger.error(f"Request failed: {e}")
-            raise
+                if response.status_code == 200:
+                    return response.json()
+                elif response.status_code == 429:
+                    # Too Many Requests - 지수 함수적 대기 후 재시도
+                    wait_time = (i + 1) * 2 
+                    logger.warning(f"HTTP 429 detected. Waiting {wait_time}s and retrying ({i+1}/{retry_count})...")
+                    await asyncio.sleep(wait_time)
+                    continue
+                elif response.status_code == 401:
+                    raise Exception("401 Unauthorized: Invalid API key")
+                else:
+                    raise Exception(f"HTTP {response.status_code}: {response.text}")
+                    
+            except requests.RequestException as e:
+                if i < retry_count - 1:
+                    await asyncio.sleep(1)
+                    continue
+                logger.error(f"Request failed after {retry_count} retries: {e}")
+                raise
+        
+        raise Exception(f"Failed to get response after {retry_count} retries (Last status: 429)")
         
     async def collect_stock_daily_trade(self, date_str: str, market: str = "ALL") -> pl.DataFrame:
         """
