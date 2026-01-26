@@ -70,7 +70,7 @@ class FeatureStore:
             logger.warning(f"Failed to scan existing dates from folder structure: {e}")
             return []
         
-    def load_features(self, start_date: str = None, end_date: str = None) -> pl.LazyFrame:
+    def load_features(self, start_date: str = None, end_date: str = None, file_pattern: str = "*.parquet") -> pl.LazyFrame:
         """파티셔닝된 피처 로드 (스키마 불일치 대응 최적화)"""
         # 1. 대상 연도 결정
         if start_date and end_date:
@@ -93,8 +93,8 @@ class FeatureStore:
                 continue
             
             # 2. 연도 내 파일 수집
-            # 주식 데이터(data_*)와 지수 데이터(indices.parquet)가 섞여 있어 스키마가 다를 수 있음
-            files = glob.glob(str(year_path / "**" / "*.parquet"), recursive=True)
+            # 사용자가 지정한 패턴(file_pattern)에 맞는 파일만 수집 (예: feat_*.parquet)
+            files = glob.glob(str(year_path / "**" / file_pattern), recursive=True)
             if not files:
                 continue
             

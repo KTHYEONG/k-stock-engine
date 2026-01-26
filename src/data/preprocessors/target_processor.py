@@ -24,7 +24,9 @@ class TargetProcessor(BaseProcessor):
         # 2. 크로스섹션(날짜별) 순위 변환 (Percentile)
         # YetiRank는 '순위'를 학습하는 모델이므로 정규화된 순위가 label로 적합
         df = df.with_columns([
-            ((pl.col(f"target_return_{self.horizon}d").rank("average") - 1) / (pl.col("ticker").count().over("date") - 1).replace(0, None))
+            ((pl.col(f"target_return_{self.horizon}d").rank("average") - 1) / 
+             (pl.col("ticker").count() - 1).replace(0, None))
+            .over("date")
             .alias("target_rank")
         ])
         
