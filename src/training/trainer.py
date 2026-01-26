@@ -71,6 +71,7 @@ class YetiRankTrainer:
             "eval_metric": "NDCG:top=20",
             "task_type": self.task_type,
             "devices": "0" if self.task_type == "GPU" else None,
+            "bootstrap_type": "Bernoulli", # subsample 사용을 위해 필수
             "verbose": 100
         }
         final_params = {**static_params, **best_params}
