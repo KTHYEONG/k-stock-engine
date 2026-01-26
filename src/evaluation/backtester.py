@@ -138,7 +138,7 @@ class YetiRankBacktester:
 
     def calculate_metrics(self, df: pl.DataFrame) -> Dict[str, Any]:
         rets = df["net_return"].to_numpy()
-        cum_rets = (1 + rets).cumprod()
+        cum_rets = (1 + rets).cumprod() # numpy 배열이므로 여기는 유지 (rets는 to_numpy() 결과임)
         
         # CAGR (연평균 수익률)
         days = len(df)
@@ -192,7 +192,7 @@ class YetiRankBacktester:
         # Plot Cumulative Return
         plt.figure(figsize=(12, 6))
         dates = perf_df["date"].to_list()
-        cum_rets = ((1 + perf_df["net_return"]).cumprod() - 1) * 100
+        cum_rets = ((1 + perf_df["net_return"]).cum_prod() - 1) * 100
         
         plt.plot(dates, cum_rets, label=f"YetiRank Top-{top_k} (Net)", color="navy", lw=2)
         plt.title(f"Cumulative Return Simulation (Top-{top_k})", fontsize=14)
