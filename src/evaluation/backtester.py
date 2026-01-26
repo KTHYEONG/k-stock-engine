@@ -46,13 +46,17 @@ class YetiRankBacktester:
         model.load_model(str(model_path))
         return model
 
-    def run_backtest(self, top_k: int = 20, fee: float = 0.002, rebalance_period: int = 5, exit_threshold_ratio: float = 3.0, save_plot: bool = False):
+    def generate_predictions(self):
         """
-        [Enhanced] 백테스팅 엔진 (ATR Stop-Loss + Market Timing + Grid Search Support)
+        모델 예측값 + 기술적 지표 미리 생성
         """
-        # 1. 데이터 로드 (2024~2025)
-        # Grid Search 시 데이터 로드 반복을 피하기 위해 캐싱하면 좋으나, 여기서는 안전하게 매번 로드 (속도 최적화 가능)
+        logger.info("⚡ Generating Model Predictions & Indicators for caching...")
+        
+        # 1. 데이터 로드
         if not hasattr(self, "_cached_full_df"):
+             # load_full_data 시 close, open 등 raw price가 포함되어야 지표 계산 가능
+             # loader가 feature만 리턴한다면 raw 컬럼도 유지하도록 확인 필요.
+             # 여기선 loader가 전체 컬럼을 로드한다고 가정.
              self._cached_full_df = self.loader.load_full_data(end_date=self.end_date, sample_ratio=1.0)
              self._cached_feature_names = self.loader.get_feature_names(self._cached_full_df)
         
@@ -65,11 +69,12 @@ class YetiRankBacktester:
             (pl.col("date") <= pl.lit(self.end_date).str.to_date("%Y%m%d"))
         ).sort("date")
         
-        if test_df.is_empty(): return {}
+        if test_df.is_empty():
+            logger.warning("⚠️ No data found for prediction.")
+            self._cached_predictions = pl.DataFrame()
+            return
 
-        # 2. 모델 예측 (연도별)
-        # 예측 결과도 캐싱 가능하지만 파라미터에 따라 달라지지 않으므로 재사용 가능
-        # 여기서는 로직 단순화를 위해 매번 수행하되, 실전에서는 분리 권장
+        # 2. 예측 및 지표 생성
         predictions = []
         years = test_df.select(pl.col("date").dt.year()).unique().to_series().to_list()
         
@@ -78,90 +83,199 @@ class YetiRankBacktester:
             if year_data.is_empty(): continue
             try:
                 model = self.load_model(year)
+                # Feature만 선택하여 추론
                 X = year_data.select(feature_names).to_pandas()
                 scores = model.predict(X)
-                predictions.append(year_data.with_columns(pl.Series("pred_score", scores)))
-            except: pass
+                
+                # 예측 결과 DF 생성
+                # 지표 계산을 위해 'close' 컬럼이 필수. (loader 데이터에 있다고 가정)
+                # 만약 없다면 features 중 가격 대용 변수를 찾아야 함.
+                cols_to_keep = ["date", "ticker", "log_return_1d", "volatility_20d"]
+                if "close" in year_data.columns: cols_to_keep.append("close")
+                
+                pred_df = year_data.select(cols_to_keep).with_columns(pl.Series("pred_score", scores))
+                
+                # [INDICATORS] Polars 표현식으로 보조지표 계산
+                # 1. RSI (14) - Wilder's Smoothing 대신 Simple RSI로 근사 (속도 위주)
+                # 2. SMA (20, 60)
+                
+                # Close가 있다면 사용, 없다면 수익률로 가상 인덱스 생성
+                price_col = pl.col("close") if "close" in pred_df.columns else (1 + pl.col("log_return_1d")).cumprod().over("ticker")
+                
+                pred_df = pred_df.with_columns([
+                    pl.col("log_return_1d").shift(-1).over("ticker").alias("next_day_ret"),
+                    
+                    # SMA
+                    price_col.rolling_mean(20).over("ticker").fill_null(price_col).alias("sma_20"),
+                    price_col.rolling_mean(60).over("ticker").fill_null(price_col).alias("sma_60"),
+                    
+                    # RSI Calculation (Simplified)
+                    # u = up moves, d = down moves
+                ])
+                
+                # RSI 계산 (별도 단계로 분리하여 가독성 확보)
+                # change = price_col.diff()
+                # gain = change.clip(lower_bound=0)
+                # loss = -change.clip(upper_bound=0)
+                # avg_gain = gain.rolling_mean(14)
+                # avg_loss = loss.rolling_mean(14)
+                # rs = avg_gain / (avg_loss + 1e-9)
+                # rsi = 100 - (100 / (1 + rs))
+                
+                # Polars 복합 표현식
+                # 2. Bollinger Band (20, 2)
+                # bb_mean = rolling_mean(20)
+                # bb_std = rolling_std(20)
+                # bb_upper = mean + 2*std
+                # bb_pos = (price - mean) / (2*std) -> 정규화된 위치 (0: mean, 1: upper, -1: lower)
+                
+                # 3. Volume Ratio (vs 20MA)
+                # Volume data가 있다고 가정. 없다면 1.0 처리
+                vol_col = pl.col("volume") if "volume" in pred_df.columns else pl.lit(1.0)
+                
+                pred_df = pred_df.with_columns(
+                    price_col.diff().over("ticker").alias("diff")
+                ).with_columns([
+                    # RSI components
+                    pl.col("diff").clip(lower_bound=0).rolling_mean(14).over("ticker").alias("avg_gain"),
+                    (-pl.col("diff").clip(upper_bound=0)).rolling_mean(14).over("ticker").alias("avg_loss"),
+                    
+                    # BB components
+                    price_col.rolling_mean(20).over("ticker").alias("bb_mean"),
+                    price_col.rolling_std(20).over("ticker").alias("bb_std"),
+                    
+                    # Volume MA
+                    vol_col.rolling_mean(20).over("ticker").alias("vol_ma_20")
+                ]).with_columns([
+                    # RSI
+                    (100 - (100 / (1 + (pl.col("avg_gain") / (pl.col("avg_loss") + 1e-9))))).fill_null(50).alias("rsi_14"),
+                    
+                    # BB Position (Upper Band Cross check)
+                    # (Price - Mean) / (2 * Std) -> >1.0 means upper band crossed
+                    ((price_col - pl.col("bb_mean")) / (2 * pl.col("bb_std") + 1e-9)).alias("bb_position"),
+                    
+                    # Volume Ratio
+                    (vol_col / (pl.col("vol_ma_20") + 1e-9)).alias("vol_ratio")
+                    
+                ]).drop(["diff", "avg_gain", "avg_loss", "bb_mean", "bb_std", "vol_ma_20"]) # 임시 컬럼 제거
+                
+                predictions.append(pred_df)
+                
+            except Exception as e:
+                logger.error(f"Prediction failed for year {year}: {e}")
 
-        if not predictions: return {}
-        combined_df = pl.concat(predictions).sort(["date", "pred_score"], descending=[False, True])
-        
-        # Next Day Return 생성
-        combined_df = combined_df.with_columns(pl.col("log_return_1d").shift(-1).over("ticker").alias("next_day_ret"))
+        if not predictions:
+            self._cached_predictions = pl.DataFrame()
+        else:
+            self._cached_predictions = pl.concat(predictions).sort(["date", "pred_score"], descending=[False, True])
+            
+        logger.info(f"✅ Predictions & Indicators cached! Rows: {len(self._cached_predictions)}")
 
-        # [NEW] Market Timing Signal (KOSPI MA Filter)
-        # 데이터 내에 KOSPI('ticker'=='KOSPI')가 있다고 가정하거나, 별도 로드
-        # 여기서는 간편하게 '종목들의 상승 비율'이 30% 미만이면 하락장으로 간주하는 "Internal Breadth" 사용
-        # (실제 KOSPI 지수 사용이 정확하나 데이터 구조상 복잡성 회피)
-        
+    def run_backtest(self, top_k: int = 20, fee: float = 0.002, rebalance_period: int = 5, 
+                     stop_loss_k: float = 2.5, market_timing_threshold: float = 0.3,
+                     filter_candidates_ratio: float = 2.0,
+                     use_rsi_filter: bool = False, rsi_max: float = 80,
+                     use_ma_filter: bool = False,
+                     use_bollinger_filter: bool = False, bb_position_max: float = 1.0,
+                     use_volume_filter: bool = False, min_volume_ratio: float = 0.5,
+                     save_plot: bool = False):
+        """
+        [Enhanced] 백테스팅 엔진 (Hybrid Filtering)
+        """
+        # 캐싱된 예측값이 없으면 생성
+        if not hasattr(self, "_cached_predictions"):
+            self.generate_predictions()
+            
+        combined_df = self._cached_predictions
+        if combined_df.is_empty(): return {}
+
         # 3. 시뮬레이션
         portfolio_results = []
         dates = combined_df["date"].unique().sort()
-        current_holdings = {} # {ticker: buy_price} for ATR calc (여기선 단순화하여 ticker list만 관리하고 ATR은 당일 기준 사용)
+        current_holdings = [] 
         current_tickers = []
-        
-        # [NEW] ATR 계산 (미리 변동성 준비)
-        # volatility_20d는 이미 피처에 있음 (log return std) -> ATR 대용으로 사용 가능
-        # ATR Trailing Stop: Price * (1 - Volatility * K)
         
         for idx, date in enumerate(dates[:-1]):
             day_df = combined_df.filter(pl.col("date") == date)
             
             # --- Market Timing Check ---
-            # 오늘 상승 종목 비율 계산
             up_ratio = (day_df.filter(pl.col("log_return_1d") > 0).height / day_df.height) if day_df.height > 0 else 0.5
-            market_condition = 1.0 if up_ratio > 0.3 else 0.5 # 하락장이면 비중 50%
+            market_condition = 1.0 if up_ratio > market_timing_threshold else 0.5 
             
-            # --- Rebalancing or Maintenance ---
             is_rebal_day = (idx % rebalance_period == 0)
             daily_turnover = 0.0
             
             if is_rebal_day:
-                # Top-K 교체
-                candidates = day_df.head(top_k)["ticker"].to_list()
+                # [Hybrid 2-Stage Selection]
+                # 1. Ranking Pool Expansion: 상위 N배수 후보 추출
+                pool_size = int(top_k * filter_candidates_ratio)
+                candidates_pool = day_df.head(pool_size)
                 
-                # 교체 비용 계산
+                # 2. Techincail Filtering (코인 전략)
+                # RSI Filter
+                if use_rsi_filter:
+                    candidates_pool = candidates_pool.filter(pl.col("rsi_14") < rsi_max)
+                    
+                # MA Filter
+                if use_ma_filter and "sma_60" in candidates_pool.columns:
+                    # 정배열 (지수 > 60일선)
+                    p_col = "close" if "close" in candidates_pool.columns else "sma_20"
+                    candidates_pool = candidates_pool.filter(pl.col(p_col) > pl.col("sma_60"))
+                    
+                # Bollinger Filter (과열 방지)
+                if use_bollinger_filter:
+                    # 상단 밴드 돌파 시 매수 보류 (단기 고점 위험)
+                    candidates_pool = candidates_pool.filter(pl.col("bb_position") < bb_position_max)
+                    
+                # Volume Filter (소외주 방지)
+                if use_volume_filter:
+                    candidates_pool = candidates_pool.filter(pl.col("vol_ratio") > min_volume_ratio)
+
+                # 3. Final Top-K Selection (Ranking 순)
+                final_candidates = candidates_pool.head(top_k)["ticker"].to_list()
+                
+                # 교체 비용 등 계산
                 if current_tickers:
                     old_set = set(current_tickers)
-                    new_set = set(candidates)
+                    new_set = set(final_candidates)
                     stay = len(old_set & new_set)
-                    daily_turnover = (len(old_set) - stay) / len(old_set)
+                    # 분모 0 방지
+                    denom = len(old_set) if len(old_set) > 0 else 1
+                    daily_turnover = (len(old_set) - stay) / denom
                 else:
-                    daily_turnover = 1.0 # 첫 진입
+                    daily_turnover = 1.0
                     
-                current_tickers = candidates
+                current_tickers = final_candidates
             
             else:
-                # [ATR Stop-Loss Logic]
-                # 보유 종목 중 변동성이 너무 커서 하락한 놈(손절) 퇴출
-                # 여기서는 간략히: 당일 수익률 < -2 * Volatility_20d 인 경우 손절 처리
-                # (일별 데이터만 있으므로 장중 대응 불가 -> 종가 기준 퇴출 시뮬레이션)
+                # ATR Stop Loss Logic
                 survivors = []
                 for t in current_tickers:
                     row = day_df.filter(pl.col("ticker")==t)
-                    if row.is_empty(): # 데이터 없으면 유지 (불가항력)
+                    if row.is_empty(): 
                         survivors.append(t)
                         continue
-                        
+                    
                     ret = row["log_return_1d"][0]
                     vol = row["volatility_20d"][0] if row["volatility_20d"][0] is not None else 0.02
                     
-                    # Stop Condition: -2.5 * Volatility (약 -3~5% 변동)
-                    if ret < (-2.5 * vol):
-                         # 손절 발생 -> 현금화 (Survivors에 포함 X)
+                    # [Exit] 차트가 망가졌는지 확인 (코인 스타일 즉시 청산)
+                    # 여기서는 간단히 ATR 손절만 적용 (복잡도 관리)
+                    if ret < (-stop_loss_k * vol):
                          continue
                     else:
                         survivors.append(t)
                 
-                # 빈자리 채우기 (Replenish)
+                # Replenish
                 needed = len(current_tickers) - len(survivors)
                 if needed > 0:
-                    # Survivors 제외 상위 랭커로 충원
                     replacements = day_df.filter(~pl.col("ticker").is_in(survivors)).head(needed)["ticker"].to_list()
                     current_tickers = survivors + replacements
                     daily_turnover = needed / top_k
                 else:
                     current_tickers = survivors
+            
+            # --- Calculate Return (Previous code) ---
 
             # --- Calculate Return ---
             holding_df = day_df.filter(pl.col("ticker").is_in(current_tickers))
