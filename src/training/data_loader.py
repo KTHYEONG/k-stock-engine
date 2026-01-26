@@ -65,8 +65,9 @@ class YetiRankDataLoader:
         # 3. Create Group ID (Query ID for Ranking)
         # 날짜(date)를 정수형 ID로 변환하여 Query ID로 사용
         # 예: 2016-01-04 -> 0, 2016-01-05 -> 1 ...
-        dates = df["date"].unique().sort()
-        date_map = {d: i for i, d in enumerate(dates)}
+        df = df.with_columns(
+            pl.col("date").rank("dense").alias("group_id")
+        )
         
         # 4. GPU 제약 사항 대응 (YetiRank GPU는 그룹당 최대 1023개 종목만 지원)
         # 종목 수가 1023개를 초과하는 날짜가 있을 경우 초과분 절삭
