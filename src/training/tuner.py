@@ -71,13 +71,27 @@ class YetiRankTuner:
         
         score = 0.0
         try:
-            scores = model.get_best_score()
-            valid_key = next((k for k in scores.keys() if "learn" not in k.lower()), None)
-            if valid_key:
-                metric_key = next((m for m in scores[valid_key].keys() if "NDCG" in m), None)
-                if metric_key:
-                    score = float(scores[valid_key][metric_key])
-        except:
+            # 1. get_best_score 우선 확인
+            best_scores = model.get_best_score()
+            if best_scores:
+                valid_key = next((k for k in best_scores.keys() if "learn" not in k.lower()), None)
+                if valid_key:
+                     metric_key = next((m for m in best_scores[valid_key].keys() if "NDCG" in m), None)
+                     if metric_key:
+                         score = float(best_scores[valid_key][metric_key])
+
+            # 2. 실패시 get_evals_result 확인 (가장 확실한 방법)
+            if score == 0.0:
+                evals = model.get_evals_result()
+                valid_key = next((k for k in evals.keys() if "learn" not in k.lower()), None)
+                if valid_key:
+                    metric_key = next((m for m in evals[valid_key].keys() if "NDCG" in m), None)
+                    if metric_key:
+                        history = evals[valid_key][metric_key]
+                        if history:
+                            score = float(max(history))
+        except Exception as e:
+            # 로깅은 최소화 (로그 파일에만 남게끔 debug 레벨 추천하나 여기선 pass)
             pass
 
         # 진행률 표시 강화: [01/30] 형식 추가
