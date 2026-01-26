@@ -42,9 +42,12 @@ class YetiRankBacktester:
         model.load_model(str(model_path))
         return model
 
-    def run_backtest(self, top_k: int = 20, fee: float = 0.002):
-        """전체 테스트 구간에 대한 백테스팅 실행"""
-        logger.info(f"🚀 Starting Backtest: {self.start_date} ~ {self.end_date} (Top-{top_k})")
+    def run_backtest(self, top_k: int = 20, fee: float = 0.002, rebalance_period: int = 5):
+        """
+        전체 테스트 구간에 대한 백테스팅 실행
+        rebalance_period: 모델 예측 주기(5일)에 맞춰 리밸런싱 주기 설정 (기본값: 5일)
+        """
+        logger.info(f"🚀 Starting Backtest: {self.start_date} ~ {self.end_date} (Top-{top_k}, Period-{rebalance_period}d)")
         
         # 1. 데이터 로드 (2024~2025)
         full_df = self.loader.load_full_data(end_date=self.end_date, sample_ratio=1.0)
@@ -87,10 +90,8 @@ class YetiRankBacktester:
             return
             
         # [MODIFIED] 데이터 정렬 안정성 강화
-        # 1. 먼저 ticker와 date 기준으로 정렬하여 시계열 순서를 완벽히 보장
         combined_df = pl.concat(predictions).sort(["ticker", "date"])
         
-        # 2. Shift를 통해 내일 수익률 가져오기 (컬럼 존재 여부 체크)
         if "log_return_1d" not in combined_df.columns:
             logger.error("CRITICAL: 'log_return_1d' column missing in data used for backtest.")
             return
@@ -99,50 +100,52 @@ class YetiRankBacktester:
             pl.col("log_return_1d").shift(-1).over("ticker").alias("next_day_ret")
         )
         
-        # 3. 백테스팅 로직을 위해 다시 날짜/점수 순으로 정렬
+        # 날짜/점수 순 정렬 (랭킹용)
         combined_df = combined_df.sort(["date", "pred_score"], descending=[False, True])
         
-        # 3. 일별 포트폴리오 수익률 시뮬레이션
-        # target_return_5d는 ln(Close_t+5 / Close_t) 임을 유의
-        # 백테스팅의 단순화를 위해 매일 상위 20개를 사고 '5일 뒤 매도'하는 것이 아니라,
-        # '매일 상위 20개를 리밸런싱하며 1일치 수익률을 추적'하는 방식으로 구현 (현실적)
-        # 1일 수익률: exp(log_return_1d) - 1
-        
+        # 3. 포트폴리오 수익률 시뮬레이션 (주기적 리밸런싱 적용)
         portfolio_results = []
         dates = combined_df["date"].unique().sort()
         
-        prev_top_tickers = set()
+        current_holdings = [] # 현재 보유 종목
         
-        # 마지막 날은 다음 날 수익률을 모르므로 제외
-        for date in dates[:-1]:
+        # 마지막 날은 수익률 데이터가 없으므로 제외
+        for idx, date in enumerate(dates[:-1]):
             day_df = combined_df.filter(pl.col("date") == date)
-            # 예측 점수 상위 K개 선정
-            top_k_stocks = day_df.head(top_k)
             
-            # [DEBUG] 첫 번째 날짜에 대해 상위 종목 점수 확인
-            if date == dates[0]:
-                avg_score = top_k_stocks["pred_score"].mean()
-                logger.info(f"Check Top-K sorting (First Day): Avg Score = {avg_score:.4f} (Should be close to max score)")
-                logger.info(f"Top 3 Scores: {top_k_stocks['pred_score'].head(3).to_list()}")
+            # 리밸런싱 주기 체크
+            is_rebalancing_day = (idx % rebalance_period == 0)
             
-            # T일에 선정된 종목의 T+1일 수익률(next_day_ret) 평균 계산
-            avg_daily_ret_val = top_k_stocks["next_day_ret"].drop_nulls().mean()
-            
-            if avg_daily_ret_val is None:
-                logger.warning(f"⚠️ No valid return data for {date}. Skipping...")
-                continue
+            if is_rebalancing_day:
+                # Top-K 종목 선정 및 포트폴리오 교체
+                top_k_stocks = day_df.head(top_k)
+                new_holdings = top_k_stocks["ticker"].to_list()
                 
-            avg_daily_ret = np.exp(avg_daily_ret_val) - 1
-            
-            # Turnover 계산 (종목 교체 비율)
-            curr_top_tickers = set(top_k_stocks["ticker"].to_list())
-            if prev_top_tickers:
-                moved_out = len(prev_top_tickers - curr_top_tickers)
-                turnover = moved_out / top_k
+                # Turnover 계산
+                if current_holdings:
+                    old_set = set(current_holdings)
+                    new_set = set(new_holdings)
+                    stay_count = len(old_set & new_set)
+                    turnover = (len(old_set) - stay_count) / len(old_set) if len(old_set) > 0 else 1.0
+                else:
+                    turnover = 1.0
+                
+                current_holdings = new_holdings
             else:
-                turnover = 1.0 # 첫날
+                # 포트폴리오 유지
+                turnover = 0.0
             
-            # 거래비용 반영 (교체 발생 시에만 부과)
+            # 보유 종목의 익일 수익률 계산 (리밸런싱 여부와 무관하게 보유 종목은 가격 변동함)
+            holding_df = day_df.filter(pl.col("ticker").is_in(current_holdings))
+            
+            if holding_df.is_empty():
+                avg_daily_ret_val = 0.0
+            else:
+                avg_daily_ret_val = holding_df["next_day_ret"].mean()
+                
+            avg_daily_ret = np.exp(avg_daily_ret_val) - 1 if avg_daily_ret_val is not None else 0.0
+            
+            # 거래비용 반영 (Turnover 발생 시에만)
             net_ret = avg_daily_ret - (turnover * fee)
             
             portfolio_results.append({
@@ -151,7 +154,6 @@ class YetiRankBacktester:
                 "net_return": net_ret,
                 "turnover": turnover
             })
-            prev_top_tickers = curr_top_tickers
 
         perf_df = pl.DataFrame(portfolio_results)
         
