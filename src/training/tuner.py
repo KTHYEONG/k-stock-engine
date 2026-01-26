@@ -18,8 +18,9 @@ class YetiRankTuner:
         self.loader = data_loader
         self.target_year = target_year
         self.n_trials = n_trials
+        self.task_type = self._get_task_type()
         
-        # Load Data once
+        logger.info(f"Using device: {self.task_type} for training/tuning.")
         full_df = self.loader.load_full_data()
         self.feature_names = self.loader.get_feature_names(full_df)
         
@@ -32,6 +33,16 @@ class YetiRankTuner:
         self.train_pool = self.loader.create_pool(self.train_df, self.feature_names)
         self.valid_pool = self.loader.create_pool(self.valid_df, self.feature_names)
 
+    def _get_task_type(self) -> str:
+        """GPU 사용 가능 여부 확인"""
+        try:
+            from catboost.utils import get_gpu_device_count
+            if get_gpu_device_count() > 0:
+                return "GPU"
+        except:
+            pass
+        return "CPU"
+
     def objective(self, trial: optuna.Trial) -> float:
         # 1. Hyperparameter Search Space (Financial Data Optimized)
         params = {
@@ -40,7 +51,8 @@ class YetiRankTuner:
             "iterations": 2000,
             "od_type": "Iter",
             "od_wait": 50,  # Early Stopping Patience
-            "task_type": "CPU", # GPU 사용 시 "GPU"로 변경
+            "task_type": self.task_type,
+            "devices": "0" if self.task_type == "GPU" else None,
             "verbose": False,
             "allow_writing_files": False,
             
