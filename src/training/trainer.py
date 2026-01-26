@@ -34,6 +34,17 @@ class YetiRankTrainer:
         self.results = [] # Evaluation results
         self.output_dir = PROJECT_ROOT / "models" / "yetirank"
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.task_type = self._get_task_type()
+        
+    def _get_task_type(self) -> str:
+        """GPU 사용 가능 여부 확인"""
+        try:
+            from catboost.utils import get_gpu_device_count
+            if get_gpu_device_count() > 0:
+                return "GPU"
+        except:
+            pass
+        return "CPU"
         
     def train_and_evaluate(self, test_years: List[int] = [2024, 2025], n_trials: int = 30, sample_ratio: float = 1.0):
         # 1. Load Full Data
@@ -58,7 +69,8 @@ class YetiRankTrainer:
         static_params = {
             "loss_function": "YetiRank",
             "eval_metric": "NDCG:top=20",
-            "task_type": "CPU", # GPU 사용 시 변경
+            "task_type": self.task_type,
+            "devices": "0" if self.task_type == "GPU" else None,
             "verbose": 100
         }
         final_params = {**static_params, **best_params}
