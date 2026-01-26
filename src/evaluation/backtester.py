@@ -88,6 +88,12 @@ class YetiRankBacktester:
             
         combined_df = pl.concat(predictions).sort(["date", "pred_score"], descending=[False, True])
         
+        # [FIX] 타임라인 정정: T일 예측 후 T+1일 수익률을 얻어야 함.
+        # 기존 log_return_1d는 '오늘'의 수익률이므로, 이를 위로 1칸 밀어(shift -1) '내일'의 수익률로 사용.
+        combined_df = combined_df.with_columns(
+            pl.col("log_return_1d").shift(-1).over("ticker").alias("next_day_ret")
+        )
+        
         # 3. 일별 포트폴리오 수익률 시뮬레이션
         # target_return_5d는 ln(Close_t+5 / Close_t) 임을 유의
         # 백테스팅의 단순화를 위해 매일 상위 20개를 사고 '5일 뒤 매도'하는 것이 아니라,
@@ -99,15 +105,22 @@ class YetiRankBacktester:
         
         prev_top_tickers = set()
         
-        for date in dates:
+        # 마지막 날은 다음 날 수익률을 모르므로 제외
+        for date in dates[:-1]:
             day_df = combined_df.filter(pl.col("date") == date)
             # 예측 점수 상위 K개 선정
             top_k_stocks = day_df.head(top_k)
             
-            # 1일 수익률 계산 (T+1 가격 변화)
-            # 주의: 모델이 학습한 것은 t 시점 피처로 t+5 수익률을 맞추는 것이므로,
-            # 매수 시점은 t일 종가, 매도 시점은 t+1일 종가로 가정하여 1일 수익률 추적
-            avg_daily_ret = top_k_stocks["log_return_1d"].exp().mean() - 1
+            # [DEBUG] 첫 번째 날짜에 대해 상위 종목 점수 확인
+            if date == dates[0]:
+                avg_score = top_k_stocks["pred_score"].mean()
+                logger.info(f"Check Top-K sorting (First Day): Avg Score = {avg_score:.4f} (Should be close to max score)")
+                logger.info(f"Top 3 Scores: {top_k_stocks['pred_score'].head(3).to_list()}")
+            
+            # T일에 선정된 종목의 T+1일 수익률(next_day_ret) 평균 계산
+            avg_daily_ret = top_k_stocks["next_day_ret"].exp().mean() - 1
+            
+            if avg_daily_ret is None: continue # 데이터 부족 시 건너뜜
             
             # Turnover 계산 (종목 교체 비율)
             curr_top_tickers = set(top_k_stocks["ticker"].to_list())
