@@ -24,10 +24,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("collect_financial")
 
-async def collect_all_financials():
+async def collect_all_financials(start_year: int = 2014, end_year: int = 2025):
     """
-    2015~2025 전 종목 재무 데이터를 증분 수집하여 Parquet으로 저장.
-    OpenDART API의 일일 한도(20,000회)를 고려하여 이미 수집된 항목은 건너뛰며 진행합니다.
+    지정된 범위의 전 종목 재무 데이터를 증분 수집하여 Parquet으로 저장.
     """
     collector = OpenDartCollector()
     
@@ -58,19 +57,43 @@ async def collect_all_financials():
         existing_df = pl.DataFrame()
         existing_keys = set()
     
-    # 3. 수집 대상 기간 설정 (2015 ~ 2025)
-    # 2016년 초 백테스트 시 2015년 실적이 필요하므로 2015년부터 수집합니다.
-    years = [str(y) for y in range(2014, 2026)]
+    # 3. 수집 대상 기간 설정
+    years = [str(y) for y in range(start_year, end_year + 1)]
     report_codes = ["11013", "11012", "11014", "11011"]
     
     new_data = []
     daily_call_limit = 19800 # 안전을 위해 20,000회보다 조금 적게 설정
     call_count = 0
     
-    logger.info(f"Starting incremental collection for {len(tickers)} stocks across {len(years)} years...")
+    logger.info(f"Starting incremental collection for {len(tickers)} stocks across years {start_year}~{end_year}...")
+
+    # [Optimization] 동시 요청 제한 (OpenDART 서버 부하 고려)
+    sem = asyncio.Semaphore(3)  # 3개의 배치를 동시에 처리 (안전)
+    
+    async def process_batch(chunk, year, code):
+        """단일 배치 비동기 처리를 위한 래퍼"""
+        nonlocal call_count
+        async with sem:
+            # 일일 한도 체크
+            if call_count >= daily_call_limit:
+                return None
+            
+            # API 호출
+            loop = asyncio.get_event_loop()
+            try:
+                # 동기 함수를 비동기로 실행
+                df = await loop.run_in_executor(
+                    None, 
+                    lambda: collector.collect_financial_stat_batch(chunk, year, code)
+                )
+                call_count += 1
+                return df
+            except Exception as e:
+                logger.debug(f"Batch failed: {e}")
+                return None
 
     try:
-        # 연도 -> 보고서 -> 종목 순으로 순회 (가장 과거부터 채움)
+        # 연도 -> 보고서 -> 종목 순으로 순회
         for year in years:
             for rpt_code in report_codes:
                 logger.info(f"Processing Period: Year {year}, Report Code {rpt_code}")
@@ -79,38 +102,24 @@ async def collect_all_financials():
                 target_tickers = [t for t in tickers if (t, year, rpt_code) not in existing_keys]
                 
                 if not target_tickers:
-                    logger.info(f"All data for {year}-{rpt_code} already exists. Skipping.")
                     continue
                 
-                # 배치 처리 (50개씩 묶음, 최대 100개 가능하나 안정성 고려 50)
-                batch_size = 50
-                total_target = len(target_tickers)
+                # 배치 처리
+                batch_size = 80
+                ticker_chunks = [target_tickers[i:i + batch_size] for i in range(0, len(target_tickers), batch_size)]
                 
-                # chunking
-                ticker_chunks = [target_tickers[i:i + batch_size] for i in range(0, total_target, batch_size)]
+                # 비동기 태스크 생성
+                tasks = [process_batch(chunk, year, rpt_code) for chunk in ticker_chunks]
                 
-                for chunk in tqdm(ticker_chunks, desc=f"Batch Crawl {year}-{rpt_code}"):
-                    try:
-                        # 배치 호출
-                        df = collector.collect_financial_stat_batch(chunk, year, rpt_code)
-                        
-                        if not df.empty:
-                            new_data.append(df)
-                        
-                        call_count += 1
-                        
-                        # 초당 약 5회 요청 수준으로 지연
-                        time.sleep(0.2)
-                        
-                        # 일일 한도 체크
-                        if call_count >= daily_call_limit:
-                            raise StopIteration("Daily OpenDART API Limit reached.")
-                            
-                    except Exception as e:
-                        if isinstance(e, StopIteration): raise e
-                        logger.debug(f"Failed for batch ({year}-{rpt_code}): {e}")
-                        continue
-                        
+                # 실행 및 결과 수집 (tqdm 연동)
+                for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc=f"Async Batch {year}-{rpt_code}"):
+                    result_df = await f
+                    if result_df is not None and not result_df.empty:
+                        new_data.append(result_df)
+                    
+                    if call_count >= daily_call_limit:
+                        raise StopIteration("Daily OpenDART API Limit reached.")
+
     except StopIteration as si:
         logger.warning(str(si))
     except Exception as e:
@@ -124,19 +133,23 @@ async def collect_all_financials():
         
         # 기존 데이터와 결합
         if not existing_df.is_empty():
-            # 컬럼 타입 일치 확인 (필요 시 캐스팅)
             final_df = pl.concat([existing_df, pl_new]).unique(subset=["ticker", "year", "reprt_code"])
         else:
             final_df = pl_new
             
-        # Parquet 파일로 덮어쓰기 (내부적으로는 증분 업데이트된 상태)
         final_df.write_parquet(save_path)
-        logger.info(f"Update Successful! Total records in DB: {len(final_df)} (Added {len(pl_new)} new records).")
+        logger.info(f"Update Successful! Total records: {len(final_df)} (Added {len(pl_new)}).")
     else:
         logger.info("No new records were added in this run.")
 
 if __name__ == "__main__":
-    # Windows 상에서 asyncio 루프 정책 설정 (호환성)
+    import argparse
+    parser = argparse.ArgumentParser(description="Collect Financial Data from OpenDART")
+    parser.add_argument("--start", type=int, default=2014, help="Start year (YYYY)")
+    parser.add_argument("--end", type=int, default=2025, help="End year (YYYY)")
+    
+    args = parser.parse_args()
+
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(collect_all_financials())
+    asyncio.run(collect_all_financials(start_year=args.start, end_year=args.end))
