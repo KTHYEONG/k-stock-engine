@@ -94,9 +94,10 @@ class YetiRankDataLoader:
 
     def create_pool(self, df: pl.DataFrame, feature_names: List[str]) -> Pool:
         """Polars DataFrame을 CatBoost Pool로 변환"""
-        # CatBoost는 Pandas/Numpy/Polars 지원하지만, 명시적 컬럼 지정 권장
+        # [CRITICAL] CatBoost Ranking은 동일 group_id가 연속해서 나타나야 함 (정렬 필수)
+        df = df.sort("group_id")
         
-        # 피처 데이터 추출 (Numpy 변환 없이 Polars 그대로 전달 가능)
+        # 피처 데이터 추출
         X = df.select(feature_names).to_pandas() 
         y = df["target_rank"].to_pandas()
         groups = df["group_id"].to_pandas()
