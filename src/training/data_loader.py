@@ -30,7 +30,7 @@ class YetiRankDataLoader:
         # 모델 학습에 사용할 피처 정의 (타겟 및 메타데이터 제외)
         self.exclude_cols = [
             # ID & Time
-            "ticker", "date", "year", 
+            "ticker", "date", "year", "name", "disclosure_date",
             # Raw Price (스케일 이슈)
             "open", "high", "low", "close", "trading_volume", "trading_value", "market_cap",
             # Intermediate / Raw Financials
@@ -78,7 +78,19 @@ class YetiRankDataLoader:
 
     def get_feature_names(self, df: pl.DataFrame) -> List[str]:
         """학습에 사용할 피처 이름 목록 추출"""
-        return [c for c in df.columns if c not in self.exclude_cols and c != "group_id"]
+        # 1. 명시적 제외 목록 필터링
+        base_features = [c for c in df.columns if c not in self.exclude_cols and c != "group_id"]
+        
+        # 2. 데이터 타입 기반 방어적 필터링 (숫자형이거나 지정된 카테고리 컬럼만 포함)
+        final_features = []
+        for col in base_features:
+            dtype = df.schema[col]
+            if dtype.is_numeric() or col == "sector":
+                final_features.append(col)
+            else:
+                logger.debug(f"Excluding non-numeric feature: {col} ({dtype})")
+                
+        return final_features
 
     def create_pool(self, df: pl.DataFrame, feature_names: List[str]) -> Pool:
         """Polars DataFrame을 CatBoost Pool로 변환"""
