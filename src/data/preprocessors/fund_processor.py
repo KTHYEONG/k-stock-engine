@@ -49,6 +49,10 @@ class FundProcessor(BaseProcessor):
             self._fund_df = self._fund_df.with_columns(
                 pl.col("disclosure_date").cast(pl.Utf8).str.strptime(pl.Date, "%Y%m%d", strict=False)
             )
+
+            # [FIX] Ticker Standardization (6 digits string)
+            self._fund_df = self._fund_df.with_columns(pl.col("ticker").cast(pl.Utf8).str.slice(-6))
+
         return self._fund_df
 
     def process(self, df: pl.LazyFrame) -> pl.LazyFrame:

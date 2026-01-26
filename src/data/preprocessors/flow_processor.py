@@ -27,7 +27,12 @@ class FlowProcessor(BaseProcessor):
                     # 거래대금이 없으면 가격 * 거래량으로 계산
                     df = df.with_columns((pl.col("close") * pl.col("volume")).alias("trading_value"))
 
-        # 1. Total Net Purchase
+        # 1. Total Net Purchase (Ensure nulls are filled to prevent propagation)
+        df = df.with_columns([
+            pl.col("foreign_net_buy").fill_null(0).alias("foreign_net_buy"),
+            pl.col("institution_net_buy").fill_null(0).alias("institution_net_buy")
+        ])
+
         df = df.with_columns([
             (pl.col("foreign_net_buy") + pl.col("institution_net_buy")).alias("net_purchase_total")
         ])
@@ -55,7 +60,7 @@ class FlowProcessor(BaseProcessor):
         # Z = (x - mean) / std
         df = df.with_columns([
             ((pl.col("np_cum_60d") - pl.col("np_cum_60d").rolling_mean(window_size=120).over("ticker")) / 
-             pl.col("np_cum_60d").rolling_std(window_size=120).over("ticker").replace(0, None))
+             pl.col("np_cum_60d").rolling_std(window_size=120).over("ticker").replace(0, None).fill_null(1.0))
             .alias("z_flow")
         ])
 
