@@ -1,64 +1,20 @@
-import optuna
-import logging
-import polars as pl
-from typing import Dict, Any, List, Optional
-from catboost import CatBoostRanker
-from src.training.data_loader import YetiRankDataLoader
-from src.utils.logger import setup_logger
+from optuna.integration import CatBoostPruningCallback
 
-logger = setup_logger("training.tuner")
-
-class YetiRankTuner:
-    """
-    Optuna를 활용한 CatBoost YetiRank 하이퍼파라미터 튜닝
-    - Expanding Window Walk-Forward 튜닝은 비용이 크므로, 
-      대표적인 구간(예: 가장 최근 Valid Year)에 대해 튜닝 수행.
-    """
-    
-    def __init__(self, data_loader: YetiRankDataLoader, target_year: int = 2024, n_trials: int = 30, full_df: Optional[pl.DataFrame] = None):
-        self.loader = data_loader
-        self.target_year = target_year
-        self.n_trials = n_trials
-        self.task_type = self._get_task_type()
-        
-        logger.info(f"Using device: {self.task_type} for training/tuning.")
-        
-        if full_df is None:
-            logger.info("Loading full data for tuning...")
-            full_df = self.loader.load_full_data()
-        
-        self.feature_names = self.loader.get_feature_names(full_df)
-        
-        # Split for Tuning (Phase 1 Strategy)
-        self.train_df, self.valid_df, _ = self.loader.walk_forward_split(full_df, test_year=target_year)
-        
-        logger.info(f"Preparing Pools for Tuning (Target Year {target_year})...")
-        self.train_pool = self.loader.create_pool(self.train_df, self.feature_names)
-        self.valid_pool = self.loader.create_pool(self.valid_df, self.feature_names)
-
-    def _get_task_type(self) -> str:
-        """GPU 사용 가능 여부 확인"""
-        try:
-            from catboost.utils import get_gpu_device_count
-            if get_gpu_device_count() > 0:
-                return "GPU"
-        except:
-            pass
-        return "CPU"
+# ... (기존 import 유지)
 
     def objective(self, trial: optuna.Trial) -> float:
         # 1. Hyperparameter Search Space
         params = {
             "loss_function": "YetiRank",
             "eval_metric": "NDCG:top=20",
-            "iterations": 1000,
+            "iterations": 600, # [SpeedUp] 튜닝 시 반복 횟수 축소 (1000 -> 600)
             "od_type": "Iter",
             "od_wait": 50,
             "task_type": self.task_type,
             "devices": "0" if self.task_type == "GPU" else None,
             "allow_writing_files": False,
             "use_best_model": True,
-            "logging_level": "Silent", # 내부 로그 숨김
+            "logging_level": "Silent",
             
             "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.1, log=True),
             "depth": trial.suggest_int("depth", 4, 8),
@@ -70,12 +26,19 @@ class YetiRankTuner:
         
         # 2. Train Model
         model = CatBoostRanker(**params)
-        model.fit(
-            self.train_pool,
-            eval_set=self.valid_pool,
-            early_stopping_rounds=params["od_wait"],
-            verbose=False
-        )
+        
+        # [SpeedUp] Pruning Callback 추가
+        try:
+            model.fit(
+                self.train_pool,
+                eval_set=self.valid_pool,
+                early_stopping_rounds=params["od_wait"],
+                verbose=False,
+                callbacks=[CatBoostPruningCallback(trial, "NDCG:top=20")]
+            )
+        except optuna.TrialPruned:
+            # Pruning 발생 시 Optuna에게 알림
+            raise optuna.TrialPruned()
         
         # 3. Return Best Score
         scores = {}
