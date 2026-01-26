@@ -68,10 +68,11 @@ class YetiRankDataLoader:
         dates = df["date"].unique().sort()
         date_map = {d: i for i, d in enumerate(dates)}
         
-        # map_dict는 python dict이므로 replace 등을 사용하여 매핑하거나 join 사용
-        # Polars 효율성을 위해 join 사용
-        date_df = pl.DataFrame({"date": dates, "group_id": range(len(dates))}, schema={"date": pl.Date, "group_id": pl.UInt32})
-        df = df.join(date_df, on="date", how="left")
+        # 4. GPU 제약 사항 대응 (YetiRank GPU는 그룹당 최대 1023개 종목만 지원)
+        # 종목 수가 1023개를 초과하는 날짜가 있을 경우 초과분 절삭
+        df = df.with_columns(
+            pl.int_range(0, pl.len()).over("group_id").alias("_row_idx")
+        ).filter(pl.col("_row_idx") < 1023).drop("_row_idx")
         
         logger.info(f"Data loaded successfully. Shape: {df.shape}, Groups: {df['group_id'].n_unique()}")
         return df
