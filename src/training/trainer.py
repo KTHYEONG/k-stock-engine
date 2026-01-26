@@ -72,8 +72,6 @@ class YetiRankTrainer:
             "task_type": self.task_type,
             "devices": "0" if self.task_type == "GPU" else None,
             "bootstrap_type": "Bernoulli", # subsample 사용을 위해 필수
-            "logging_level": "Silent", # 학습 상세 로그 숨기기
-            "verbose": False
         }
         final_params = {**static_params, **best_params}
         
