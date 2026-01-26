@@ -5,7 +5,7 @@ from typing import Dict, Any, List, Optional
 from catboost import CatBoostRanker
 from src.training.data_loader import YetiRankDataLoader
 from src.utils.logger import setup_logger
-from optuna.integration import CatBoostPruningCallback
+# from optuna.integration import CatBoostPruningCallback
 
 logger = setup_logger("training.tuner")
 
@@ -71,17 +71,12 @@ class YetiRankTuner:
         
         # 2. Train Model
         model = CatBoostRanker(**params)
-        
-        try:
-            model.fit(
-                self.train_pool,
-                eval_set=self.valid_pool,
-                early_stopping_rounds=params["od_wait"],
-                verbose=False,
-                callbacks=[CatBoostPruningCallback(trial, "NDCG:top=20")]
-            )
-        except optuna.TrialPruned:
-            raise optuna.TrialPruned()
+        model.fit(
+            self.train_pool,
+            eval_set=self.valid_pool,
+            early_stopping_rounds=params["od_wait"],
+            verbose=False
+        )
         
         # 3. Return Best Score
         scores = {}
