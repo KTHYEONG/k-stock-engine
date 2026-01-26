@@ -55,7 +55,7 @@ class YetiRankTrainer:
         # 2023년(가장 최근의 온전한 검증 데이터)을 기준으로 최적의 파라미터를 찾음
         logger.info(">>> Starting Phase 1: Hyperparameter Tuning (Target: Valid 2023)")
         # 튜닝 타겟 연도를 2024로 설정하면, 내부적으로 2016~2022 Train, 2023 Valid로 분할됨.
-        tuner = YetiRankTuner(self.loader, target_year=2024, n_trials=n_trials)
+        tuner = YetiRankTuner(self.loader, target_year=2024, n_trials=n_trials, full_df=full_df)
         best_params = tuner.run_tuning()
         
         # Save Best Params
