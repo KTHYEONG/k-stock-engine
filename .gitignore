@@ -9,6 +9,9 @@ __pycache__/
 # data
 data/processed
 
+# catboost
+catboost_info/
+
 # models
 models/yetirank
 
