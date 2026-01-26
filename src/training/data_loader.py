@@ -84,15 +84,31 @@ class YetiRankDataLoader:
         if dropped_rows > 0:
             logger.info(f"Dropped {dropped_rows} rows with null targets.")
             
-        # 3. Create Group ID (Query ID for Ranking)
-        # 날짜(date)를 정수형 ID로 변환하여 Query ID로 사용
-        # 예: 2016-01-04 -> 0, 2016-01-05 -> 1 ...
+        # 3. Create Group ID & Re-calculate Target Rank
+        # [FIX] 백테스트 수익률 역전 현상 방지를 위해 Target Rank를 직접 재계산
+        # 수익률(target_return_5d)이 높을수록 높은 점수(Rank)를 부여해야 함.
+        # 여기서는 0~1 사이의 실수형 점수(Relevance Score)로 변환하여 정밀도 향상
+        
+        df = df.with_columns([
+            pl.col("date").rank("dense").alias("group_id"),
+            
+            # 그룹별로 수익률 기반 랭크 생성 (오름차순 랭크 -> 수익률 높을수록 큰 값)
+            # rank("ordinal") 사용 시 동점자 없이 1, 2, 3... 순위 매김
+            pl.col("target_return_5d")
+              .rank("ordinal")
+              .over("date")
+              .alias("raw_rank"),
+              
+            # 그룹별 종목 수 계산
+            pl.count().over("date").alias("group_count")
+        ])
+        
+        # 0.0 ~ 1.0 범위로 정규화 (1.0 = 해당 날짜 1등, 0.0 = 꼴찌)
         df = df.with_columns(
-            pl.col("date").rank("dense").alias("group_id")
-        )
+            (pl.col("raw_rank") / pl.col("group_count")).alias("target_rank")
+        ).drop(["raw_rank", "group_count"])
         
         # 4. GPU 제약 사항 대응 (YetiRank GPU는 그룹당 최대 1023개 종목만 지원)
-        # 종목 수가 1023개를 초과하는 날짜가 있을 경우 초과분 절삭
         df = df.with_columns(
             pl.int_range(0, pl.len()).over("group_id").alias("_row_idx")
         ).filter(pl.col("_row_idx") < 1023).drop("_row_idx")
