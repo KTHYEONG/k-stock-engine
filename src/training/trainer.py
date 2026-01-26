@@ -72,23 +72,18 @@ class YetiRankTrainer:
             "task_type": self.task_type,
             "devices": "0" if self.task_type == "GPU" else None,
             "bootstrap_type": "Bernoulli", # subsample 사용을 위해 필수
-            "verbose": 100
+            "logging_level": "Silent", # 학습 상세 로그 숨기기
+            "verbose": False
         }
         final_params = {**static_params, **best_params}
         
         for year in test_years:
-            logger.info(f"--- Processing Target Year: {year} ---")
+            logger.info(f"--- Training Target Year: {year} ---")
             
             # Split Data (Expanding Window)
             train_df, valid_df, test_df = self.loader.walk_forward_split(full_df, test_year=year)
             
             # Create Pools
-            # 학습 시에는 Train + Valid를 모두 합쳐서 학습 데이터로 쓰는 것이 일반적일 수 있으나,
-            # Early Stopping을 위해 Valid를 분리 유지하거나, 
-            # 충분히 튜닝되었다면 전체를 합치고 튜닝된 횟수(Iterations)만큼 학습하기도 함.
-            # 여기서는 안전하게 튜닝 때와 동일한 구조(Train/Valid)로 학습하며 Early Stopping 적용.
-            # (단, Train 데이터는 Expanding Window에 따라 매년 늘어남)
-            
             train_pool = self.loader.create_pool(train_df, feature_names)
             valid_pool = self.loader.create_pool(valid_df, feature_names)
             test_pool = self.loader.create_pool(test_df, feature_names)
@@ -98,7 +93,8 @@ class YetiRankTrainer:
             model.fit(
                 train_pool,
                 eval_set=valid_pool,
-                early_stopping_rounds=50
+                early_stopping_rounds=50,
+                verbose=False
             )
             
             # Save Model
@@ -107,16 +103,9 @@ class YetiRankTrainer:
             self.models[year] = model
             
             # Evaluate on Test Set
-            # CatBoost의 score 메서드나 predict 메서드 활용
-            # 랭킹 모델의 predict는 '점수'를 반환함. 이 점수로 NDCG 계산 필요.
-            # 하지만 CatBoost는 eval_set에 대한 메트릭을 자동으로 계산해줌.
-            # 여기서는 직접 eval_set=test_pool로 평가 점수를 얻거나, 예측값을 뽑아서 별도 분석.
-            
-            # 간단한 성능 지표 로깅 (Model internal metric)
-            metrics = model.eval_metrics(test_pool, ["NDCG:top=20", "PFound", "AverageGain:top=20"])
-            # 마지막 round의 점수
+            metrics = model.eval_metrics(test_pool, ["NDCG:top=20"])
             final_ndcg = metrics["NDCG:top=20"][-1]
-            logger.info(f"Year {year} Test NDCG@20: {final_ndcg:.4f}")
+            logger.info(f"Year {year} Training Completed. Test NDCG@20: {final_ndcg:.4f} (Best Iter: {model.get_best_iteration()})")
             
             # Feature Importance
             fi_df = pd.DataFrame({
