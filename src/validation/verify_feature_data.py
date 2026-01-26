@@ -14,11 +14,12 @@ def main():
     
     # 1. Load Data (Recent sample for speed, or full year if needed)
     # 2024년 데이터로 검증
-    year = "2024"
+    year = "2025"
     print(f"Loading data for verification (Year: {year})...")
     
     try:
-        ldf = store.load_features(start_date=f"{year}0101", end_date=f"{year}1231")
+        # feat_*.parquet 패턴을 사용하여 피처 엔지니어링 결과물만 로드
+        ldf = store.load_features(start_date=f"{year}0101", end_date=f"{year}1231", file_pattern="feat_*.parquet")
         
         # Check if data exists (Lazy)
         peek_df = ldf.limit(1).collect()
