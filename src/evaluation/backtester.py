@@ -118,9 +118,13 @@ class YetiRankBacktester:
                 logger.info(f"Top 3 Scores: {top_k_stocks['pred_score'].head(3).to_list()}")
             
             # T일에 선정된 종목의 T+1일 수익률(next_day_ret) 평균 계산
-            avg_daily_ret = top_k_stocks["next_day_ret"].exp().mean() - 1
+            avg_daily_ret_val = top_k_stocks["next_day_ret"].drop_nulls().mean()
             
-            if avg_daily_ret is None: continue # 데이터 부족 시 건너뜜
+            if avg_daily_ret_val is None:
+                logger.warning(f"⚠️ No valid return data for {date}. Skipping...")
+                continue
+                
+            avg_daily_ret = np.exp(avg_daily_ret_val) - 1
             
             # Turnover 계산 (종목 교체 비율)
             curr_top_tickers = set(top_k_stocks["ticker"].to_list())
