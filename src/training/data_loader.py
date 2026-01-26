@@ -113,6 +113,11 @@ class YetiRankDataLoader:
             pl.int_range(0, pl.len()).over("group_id").alias("_row_idx")
         ).filter(pl.col("_row_idx") < 1023).drop("_row_idx")
         
+        # [DEBUG] Target Rank 검증 로그
+        debug_corr = df.select(pl.corr("target_rank", "target_return_5d")).item()
+        logger.info(f"Target Rank Check - Correlation with Return: {debug_corr:.4f} (Must be positive and high)")
+        logger.info(f"Sample Data:\n{df.select(['date', 'target_return_5d', 'target_rank']).head(5)}")
+
         logger.info(f"Data loaded successfully. Shape: {df.shape}, Groups: {df['group_id'].n_unique()}")
         return df
 
