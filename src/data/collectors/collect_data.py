@@ -23,7 +23,7 @@ from src.utils.logger import setup_logger
 async def main():
     parser = argparse.ArgumentParser(description="Collect Daily Market Data")
     parser.add_argument("--date", type=str, help="Target date (YYYYMMDD).", default=None)
-    parser.add_argument("--start", type=str, help="Start date (YYYYMMDD) for batch collection.", default="20160101")
+    parser.add_argument("--start", type=str, help="Start date (YYYYMMDD) for batch collection.", default="20150701")
     parser.add_argument("--end", type=str, help="End date (YYYYMMDD) for batch collection.", default="20251231")
     
     args = parser.parse_args()
