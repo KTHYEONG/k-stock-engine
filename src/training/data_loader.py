@@ -39,8 +39,8 @@ class YetiRankDataLoader:
             "open", "high", "low", "close", "trading_volume", "trading_value", "market_cap",
             # Intermediate / Raw Financials
             "net_purchase_total", "operating_income", "net_income", "total_assets", "total_equity", "revenue",
-            # Targets (Leakage 방지)
-            "target_return_5d", "target_rank"
+            # Targets & Leakage (수익률 지표는 피처에서 완전히 제외)
+            "target_return_5d", "target_rank", "log_return_1d", "log_return_5d", "log_return_20d"
         ]
         
         self.feature_config_path = PROJECT_ROOT / "data" / "model_features" / "features_v1.yaml"
