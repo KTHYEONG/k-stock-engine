@@ -16,6 +16,7 @@ from src.data.preprocessors.flow_processor import FlowProcessor
 from src.data.preprocessors.fund_processor import FundProcessor
 from src.data.preprocessors.universe_filter import UniverseFilter
 from src.data.preprocessors.target_processor import TargetProcessor
+from src.data.preprocessors.cross_processor import CrossSectionalProcessor
 
 logger = setup_logger("feature_engineer")
 
@@ -34,6 +35,7 @@ class FeatureEngineer:
             FundProcessor(),  # FundProcessor 먼저 실행 (market_cap 확보)
             FlowProcessor(),
             UniverseFilter(),
+            CrossSectionalProcessor(),  # 횡단면 연산은 베이스 피처 생성 후 마지막에 수행
             TargetProcessor(horizon=5),
         ]
         
