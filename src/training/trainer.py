@@ -46,7 +46,7 @@ class YetiRankTrainer:
             pass
         return "CPU"
         
-    def train_and_evaluate(self, test_years: List[int] = [2024, 2025], n_trials: int = 30, sample_ratio: float = 1.0):
+    def train_and_evaluate(self, test_years: List[int] = [2024, 2025], n_trials: int = 100, sample_ratio: float = 1.0):
         # 1. Load Full Data
         full_df = self.loader.load_full_data(sample_ratio=sample_ratio)
         feature_names = self.loader.get_feature_names(full_df)
