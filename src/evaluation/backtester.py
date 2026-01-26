@@ -42,12 +42,13 @@ class YetiRankBacktester:
         model.load_model(str(model_path))
         return model
 
-    def run_backtest(self, top_k: int = 20, fee: float = 0.002, rebalance_period: int = 5):
+    def run_backtest(self, top_k: int = 20, fee: float = 0.002, rebalance_period: int = 5, exit_threshold_ratio: float = 5.0):
         """
         전체 테스트 구간에 대한 백테스팅 실행
         rebalance_period: 모델 예측 주기(5일)에 맞춰 리밸런싱 주기 설정 (기본값: 5일)
+        exit_threshold_ratio: 조기 청산 임계값 비율 (Top_K * ratio 순위 밖으로 밀리면 즉시 교체)
         """
-        logger.info(f"🚀 Starting Backtest: {self.start_date} ~ {self.end_date} (Top-{top_k}, Period-{rebalance_period}d)")
+        logger.info(f"🚀 Starting Backtest: {self.start_date} ~ {self.end_date} (Top-{top_k}, Period-{rebalance_period}d, ExitThreshold-{exit_threshold_ratio}x)")
         
         # 1. 데이터 로드 (2024~2025)
         full_df = self.loader.load_full_data(end_date=self.end_date, sample_ratio=1.0)
@@ -103,11 +104,12 @@ class YetiRankBacktester:
         # 날짜/점수 순 정렬 (랭킹용)
         combined_df = combined_df.sort(["date", "pred_score"], descending=[False, True])
         
-        # 3. 포트폴리오 수익률 시뮬레이션 (주기적 리밸런싱 적용)
+        # 3. 포트폴리오 수익률 시뮬레이션 (주기적 리밸런싱 + 조기 청산)
         portfolio_results = []
         dates = combined_df["date"].unique().sort()
         
         current_holdings = [] # 현재 보유 종목
+        exit_rank_threshold = int(top_k * exit_threshold_ratio) # 예: 20 * 5 = 100위
         
         # 마지막 날은 수익률 데이터가 없으므로 제외
         for idx, date in enumerate(dates[:-1]):
@@ -115,9 +117,10 @@ class YetiRankBacktester:
             
             # 리밸런싱 주기 체크
             is_rebalancing_day = (idx % rebalance_period == 0)
+            daily_turnover = 0.0
             
             if is_rebalancing_day:
-                # Top-K 종목 선정 및 포트폴리오 교체
+                # [Regular Rebalancing] Top-K 종목 선정 및 포트폴리오 전면 교체
                 top_k_stocks = day_df.head(top_k)
                 new_holdings = top_k_stocks["ticker"].to_list()
                 
@@ -126,16 +129,60 @@ class YetiRankBacktester:
                     old_set = set(current_holdings)
                     new_set = set(new_holdings)
                     stay_count = len(old_set & new_set)
-                    turnover = (len(old_set) - stay_count) / len(old_set) if len(old_set) > 0 else 1.0
+                    daily_turnover = (len(old_set) - stay_count) / len(old_set) if len(old_set) > 0 else 1.0
                 else:
-                    turnover = 1.0
+                    daily_turnover = 1.0
                 
                 current_holdings = new_holdings
+                
             else:
-                # 포트폴리오 유지
-                turnover = 0.0
+                # [Early Exit Logic] 리밸런싱 날이 아닐 때, 랭킹 급락 종목 방어
+                if current_holdings:
+                    # 1. 현재 보유 종목들의 오늘자 랭킹 확인
+                    # day_df는 이미 pred_score 내림차순 정렬 상태 -> row index가 곧 랭킹(0-based)
+                    # Ticker 별 랭킹 매핑
+                    # 최적화를 위해 상위 (Threshold + α) 까지만 검색하거나 전체를 map으로 변환
+                    
+                    # 전체 종목에 랭킹 부여
+                    day_df_w_rank = day_df.with_columns(
+                        pl.int_range(0, pl.len()).alias("daily_rank")
+                    )
+                    
+                    # 현재 보유 종목의 상태 조회
+                    holdings_status = day_df_w_rank.filter(pl.col("ticker").is_in(current_holdings))
+                    
+                    # 2. 퇴출 대상 산출 (랭킹 > Threshold)
+                    # 주의: 데이터 누락 등으로 holdings_status에 없을 수도 있음 (보수적 유지)
+                    survivors = holdings_status.filter(pl.col("daily_rank") <= exit_rank_threshold)["ticker"].to_list()
+                    
+                    # 데이터 누락된 종목은 일단 유지 (survivors에 포함되지 않았으므로 아래 로직에서 탈락 처리될 수 있음 -> 누락된건 매도 불가하므로 유지해야함)
+                    # holdings_status에 없는 종목(거래정지 등)은 current_holdings에 있었으나 오늘 데이터에 없는 경우임.
+                    # 안전을 위해 '오늘 데이터에 있고 + 랭킹 안에 든' 놈들만 survivors로 취급하면, 데이터 없는 놈은 강제 매도됨(가상).
+                    # 현실적으로 데이터 없으면 매도 못하므로, missing_tickers는 current_holdings에서 유지시켜야 함.
+                    
+                    current_set = set(current_holdings)
+                    found_set = set(holdings_status["ticker"].to_list())
+                    missing_tickers = list(current_set - found_set) # 데이터 없는 종목들
+                    
+                    final_survivors = survivors + missing_tickers
+                    
+                    # 3. 빈 자리 채우기 (Replenish)
+                    needed_count = len(current_holdings) - len(final_survivors)
+                    
+                    if needed_count > 0:
+                        # 탈락한 종목 수만큼 교체 발생
+                        # 당일 Top 종목 중, 이미 보유(생존)한 것 제외하고 상위 N개 선택
+                        candidates = day_df.filter(~pl.col("ticker").is_in(final_survivors)).head(needed_count)
+                        new_recruits = candidates["ticker"].to_list()
+                        
+                        # 포트폴리오 갱신
+                        current_holdings = final_survivors + new_recruits
+                        
+                        # Turnover 발생 (교체된 비율)
+                        # 여기서는 전체 포트폴리오 크기(top_k) 대비 교체된 종목 수
+                        daily_turnover = needed_count / top_k
             
-            # 보유 종목의 익일 수익률 계산 (리밸런싱 여부와 무관하게 보유 종목은 가격 변동함)
+            # 보유 종목의 익일 수익률 계산
             holding_df = day_df.filter(pl.col("ticker").is_in(current_holdings))
             
             if holding_df.is_empty():
@@ -145,14 +192,14 @@ class YetiRankBacktester:
                 
             avg_daily_ret = np.exp(avg_daily_ret_val) - 1 if avg_daily_ret_val is not None else 0.0
             
-            # 거래비용 반영 (Turnover 발생 시에만)
-            net_ret = avg_daily_ret - (turnover * fee)
+            # 거래비용 반영
+            net_ret = avg_daily_ret - (daily_turnover * fee)
             
             portfolio_results.append({
                 "date": date,
                 "raw_return": avg_daily_ret,
                 "net_return": net_ret,
-                "turnover": turnover
+                "turnover": daily_turnover
             })
 
         perf_df = pl.DataFrame(portfolio_results)
