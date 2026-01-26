@@ -7,7 +7,7 @@ __pycache__/
 .agent/
 
 # data
-data/processed
+data/
 
 # catboost
 catboost_info/
