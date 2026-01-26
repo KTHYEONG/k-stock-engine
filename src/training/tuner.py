@@ -74,9 +74,30 @@ class YetiRankTuner:
             verbose=False
         )
         
-        # 3. Return Best Score (NDCG is maximized, but Optuna minimizes by default? 
-        # No, Optuna maximizes if direction="maximize". We will set direction="maximize" later)
-        best_score = model.get_best_score()["validation"]["NDCG:top=20"]
+        # 3. Return Best Score
+        scores = model.get_best_score()
+        
+        # Validation Key 찾기 (validation, validation_0, test 등)
+        valid_key = next((k for k in scores.keys() if "validation" in k or "test" in k), None)
+        
+        if valid_key is None:
+            # Fallback: 키가 없으면 로그 출력 후 0 반환 (Tuning 실패 처리)
+            logger.error(f"Validation key not found in scores. Available keys: {list(scores.keys())}")
+            return 0.0
+            
+        # Metric Key 찾기 (정확한 이름 매칭 또는 부분 매칭)
+        # 예: "NDCG:top=20" 또는 "NDCG:top=20;type=Base"
+        metric_key = "NDCG:top=20"
+        if metric_key not in scores[valid_key]:
+            # 유사한 키 검색
+            found_metrics = [k for k in scores[valid_key].keys() if "NDCG" in k]
+            if found_metrics:
+                metric_key = found_metrics[0]
+            else:
+                 logger.error(f"Metric '{metric_key}' not found in validation scores. Available: {list(scores[valid_key].keys())}")
+                 return 0.0
+
+        best_score = scores[valid_key][metric_key]
         return best_score
 
     def run_tuning(self) -> Dict[str, Any]:
