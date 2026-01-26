@@ -9,6 +9,9 @@ __pycache__/
 # data
 data/processed
 
+# models
+models/yetirank
+
 # C extensions
 *.so
 
