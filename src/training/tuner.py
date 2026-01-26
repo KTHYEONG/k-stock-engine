@@ -61,7 +61,7 @@ class YetiRankTuner:
             "depth": trial.suggest_int("depth", 4, 8),
             "l2_leaf_reg": trial.suggest_int("l2_leaf_reg", 1, 30),
             "random_strength": trial.suggest_float("random_strength", 1e-9, 10.0, log=True),
-            "bagging_temperature": trial.suggest_float("bagging_temperature", 0.0, 1.0),
+            "bootstrap_type": "Bernoulli",
             "subsample": trial.suggest_float("subsample", 0.6, 1.0)
         }
         
