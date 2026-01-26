@@ -48,33 +48,87 @@ class YetiRankBacktester:
 
     def generate_predictions(self):
         """
-        모델 예측값 + 기술적 지표 미리 생성
+        모델 예측값 + 기술적 지표 생성 (데이터 연속성 보장 버전)
         """
-        logger.info("⚡ Generating Model Predictions & Indicators for caching...")
+        logger.info("⚡ Generating Model Predictions & Indicators (Full Continuity)...")
         
-        # 1. 데이터 로드
         if not hasattr(self, "_cached_full_df"):
-             # load_full_data 시 close, open 등 raw price가 포함되어야 지표 계산 가능
-             # loader가 feature만 리턴한다면 raw 컬럼도 유지하도록 확인 필요.
-             # 여기선 loader가 전체 컬럼을 로드한다고 가정.
              self._cached_full_df = self.loader.load_full_data(end_date=self.end_date, sample_ratio=1.0)
              self._cached_feature_names = self.loader.get_feature_names(self._cached_full_df)
         
         full_df = self._cached_full_df
         feature_names = self._cached_feature_names
-        
-        # 테스트 구간 필터링
+
+        # --- [1단계] 전체 데이터에 대해 기술 지표 선계산 (단절 방지) ---
+        price_col = pl.col("close") if "close" in full_df.columns else (1 + pl.col("log_return_1d")).cumprod().over("ticker")
+        vol_col = pl.col("volume") if "volume" in full_df.columns else pl.col("trading_volume") if "trading_volume" in full_df.columns else pl.lit(1.0)
+        high_col = pl.col("high") if "high" in full_df.columns else price_col
+        low_col = pl.col("low") if "low" in full_df.columns else price_col
+
+        indicator_df = full_df.with_columns(
+            price_col.diff().over("ticker").alias("diff"),
+            price_col.shift(1).over("ticker").alias("prev_close"),
+            high_col.shift(1).over("ticker").alias("prev_high"),
+            low_col.shift(1).over("ticker").alias("prev_low"),
+            price_col.alias("_price"), # 원본 Close 보존
+            vol_col.alias("_vol")
+        ).with_columns([
+            pl.col("diff").clip(lower_bound=0).alias("gain"),
+            (-pl.col("diff").clip(upper_bound=0)).alias("loss"),
+            ((high_col + low_col + price_col) / 3).alias("tp")
+        ]).with_columns([
+            (pl.col("tp") * pl.col("_vol")).alias("mf")
+        ]).with_columns([
+            pl.when(pl.col("tp") > pl.col("tp").shift(1).over("ticker")).then(pl.col("mf")).otherwise(0).alias("pos_mf"),
+            pl.when(pl.col("tp") < pl.col("tp").shift(1).over("ticker")).then(pl.col("mf")).otherwise(0).alias("neg_mf"),
+            pl.max_horizontal([high_col - low_col, (high_col - pl.col("prev_close")).abs(), (low_col - pl.col("prev_close")).abs()]).alias("tr"),
+            pl.when((high_col - pl.col("prev_high")) > (pl.col("prev_low") - low_col)).then((high_col - pl.col("prev_high")).clip(lower_bound=0)).otherwise(0).alias("p_dm"),
+            pl.when((pl.col("prev_low") - low_col) > (high_col - pl.col("prev_high"))).then((pl.col("prev_low") - low_col).clip(lower_bound=0)).otherwise(0).alias("n_dm")
+        ]).with_columns([
+            pl.col("gain").rolling_mean(14).over("ticker").alias("avg_gain"),
+            pl.col("loss").rolling_mean(14).over("ticker").alias("avg_loss"),
+            pl.col("pos_mf").rolling_sum(14).over("ticker").alias("pmf_14"),
+            pl.col("neg_mf").rolling_sum(14).over("ticker").alias("nmf_14"),
+            pl.col("tr").rolling_mean(14).over("ticker").alias("atr_14"),
+            pl.col("p_dm").rolling_mean(14).over("ticker").alias("pdm_14"),
+            pl.col("n_dm").rolling_mean(14).over("ticker").alias("ndm_14"),
+            ((high_col.rolling_max(9).over("ticker") + low_col.rolling_min(9).over("ticker")) / 2).alias("tenkan"),
+            ((high_col.rolling_max(26).over("ticker") + low_col.rolling_min(26).over("ticker")) / 2).alias("kijun"),
+            ((high_col.rolling_max(52).over("ticker") + low_col.rolling_min(52).over("ticker")) / 2).alias("senkou_b_raw"),
+            pl.col("_price").rolling_mean(20).over("ticker").alias("sma_20_raw"),
+            pl.col("_price").rolling_mean(60).over("ticker").alias("sma_60_raw"),
+            pl.col("_price").rolling_std(20).over("ticker").alias("bb_std"),
+            pl.col("_vol").rolling_mean(20).over("ticker").alias("vol_ma_20")
+        ]).with_columns([
+            (100 - (100 / (1 + (pl.col("avg_gain") / (pl.col("avg_loss") + 1e-9))))).alias("rsi_raw"),
+            (100 - (100 / (1 + (pl.col("pmf_14") / (pl.col("nmf_14") + 1e-9))))).alias("mfi_raw"),
+            (100 * pl.col("pdm_14") / (pl.col("atr_14") + 1e-9)).alias("p_di"),
+            (100 * pl.col("ndm_14") / (pl.col("atr_14") + 1e-9)).alias("n_di"),
+            ((pl.col("sma_20_raw") + pl.col("kijun")) / 2).alias("senkou_a_raw"),
+            ((pl.col("_price") - pl.col("sma_20_raw")) / (2 * pl.col("bb_std") + 1e-9)).alias("bb_pos_raw")
+        ]).with_columns([
+            (100 * (pl.col("p_di") - pl.col("n_di")).abs() / (pl.col("p_di") + pl.col("n_di") + 1e-9)).alias("dx")
+        ]).with_columns([
+            pl.col("dx").rolling_mean(14).over("ticker").alias("adx_raw"),
+            pl.max_horizontal([pl.col("senkou_a_raw"), pl.col("senkou_b_raw")]).alias("cloud_top_raw")
+        ]).with_columns([
+            # [SHIFT APPLY] 내일의 의사결정에 쓰일 오늘의 지표
+            pl.col("rsi_raw").shift(1).over("ticker").fill_null(50).alias("rsi_14"),
+            pl.col("mfi_raw").shift(1).over("ticker").fill_null(50).alias("mfi_14"),
+            pl.col("adx_raw").shift(1).over("ticker").fill_null(0).alias("adx_14"),
+            (pl.col("_price") > pl.col("cloud_top_raw").shift(1).over("ticker")).alias("ichimoku_ok"),
+            pl.col("bb_pos_raw").shift(1).over("ticker").fill_null(0).alias("bb_position"),
+            (pl.col("_vol") / (pl.col("vol_ma_20").shift(1).over("ticker") + 1e-9)).alias("vol_ratio"),
+            pl.col("sma_20_raw").shift(1).over("ticker").alias("sma_20"),
+            pl.col("sma_60_raw").shift(1).over("ticker").alias("sma_60"),
+        ]).select(["date", "ticker", "rsi_14", "mfi_14", "adx_14", "ichimoku_ok", "bb_position", "vol_ratio", "sma_20", "sma_60"])
+
+        # --- [2단계] 모델 예측 및 지표 병합 ---
         test_df = full_df.filter(
             (pl.col("date") >= pl.lit(self.start_date).str.to_date("%Y%m%d")) & 
             (pl.col("date") <= pl.lit(self.end_date).str.to_date("%Y%m%d"))
         ).sort("date")
         
-        if test_df.is_empty():
-            logger.warning("⚠️ No data found for prediction.")
-            self._cached_predictions = pl.DataFrame()
-            return
-
-        # 2. 예측 및 지표 생성
         predictions = []
         years = test_df.select(pl.col("date").dt.year()).unique().to_series().to_list()
         
@@ -83,82 +137,20 @@ class YetiRankBacktester:
             if year_data.is_empty(): continue
             try:
                 model = self.load_model(year)
-                # Feature만 선택하여 추론
                 X = year_data.select(feature_names).to_pandas()
                 scores = model.predict(X)
                 
-                # 예측 결과 DF 생성
-                # 지표 계산을 위해 'close' 컬럼이 필수. (loader 데이터에 있다고 가정)
-                # 만약 없다면 features 중 가격 대용 변수를 찾아야 함.
                 cols_to_keep = ["date", "ticker", "log_return_1d", "volatility_20d"]
-                if "close" in year_data.columns: cols_to_keep.append("close")
+                for col in ["close", "open", "high", "low", "volume", "trading_volume"]:
+                    if col in year_data.columns: cols_to_keep.append(col)
                 
-                pred_df = year_data.select(cols_to_keep).with_columns(pl.Series("pred_score", scores))
+                pred_df = year_data.select(list(set(cols_to_keep))).with_columns(pl.Series("pred_score", scores))
                 
-                # [INDICATORS] Polars 표현식으로 보조지표 계산
-                # 1. RSI (14) - Wilder's Smoothing 대신 Simple RSI로 근사 (속도 위주)
-                # 2. SMA (20, 60)
-                
-                # Close가 있다면 사용, 없다면 수익률로 가상 인덱스 생성
-                price_col = pl.col("close") if "close" in pred_df.columns else (1 + pl.col("log_return_1d")).cumprod().over("ticker")
-                
-                pred_df = pred_df.with_columns([
-                    pl.col("log_return_1d").shift(-1).over("ticker").alias("next_day_ret"),
-                    
-                    # SMA
-                    price_col.rolling_mean(20).over("ticker").fill_null(price_col).alias("sma_20"),
-                    price_col.rolling_mean(60).over("ticker").fill_null(price_col).alias("sma_60"),
-                    
-                    # RSI Calculation (Simplified)
-                    # u = up moves, d = down moves
-                ])
-                
-                # RSI 계산 (별도 단계로 분리하여 가독성 확보)
-                # change = price_col.diff()
-                # gain = change.clip(lower_bound=0)
-                # loss = -change.clip(upper_bound=0)
-                # avg_gain = gain.rolling_mean(14)
-                # avg_loss = loss.rolling_mean(14)
-                # rs = avg_gain / (avg_loss + 1e-9)
-                # rsi = 100 - (100 / (1 + rs))
-                
-                # Polars 복합 표현식
-                # 2. Bollinger Band (20, 2)
-                # bb_mean = rolling_mean(20)
-                # bb_std = rolling_std(20)
-                # bb_upper = mean + 2*std
-                # bb_pos = (price - mean) / (2*std) -> 정규화된 위치 (0: mean, 1: upper, -1: lower)
-                
-                # 3. Volume Ratio (vs 20MA)
-                # Volume data가 있다고 가정. 없다면 1.0 처리
-                vol_col = pl.col("volume") if "volume" in pred_df.columns else pl.lit(1.0)
-                
+                # 지표 병합
+                pred_df = pred_df.join(indicator_df, on=["date", "ticker"], how="left")
                 pred_df = pred_df.with_columns(
-                    price_col.diff().over("ticker").alias("diff")
-                ).with_columns([
-                    # RSI components
-                    pl.col("diff").clip(lower_bound=0).rolling_mean(14).over("ticker").alias("avg_gain"),
-                    (-pl.col("diff").clip(upper_bound=0)).rolling_mean(14).over("ticker").alias("avg_loss"),
-                    
-                    # BB components
-                    price_col.rolling_mean(20).over("ticker").alias("bb_mean"),
-                    price_col.rolling_std(20).over("ticker").alias("bb_std"),
-                    
-                    # Volume MA
-                    vol_col.rolling_mean(20).over("ticker").alias("vol_ma_20")
-                ]).with_columns([
-                    # RSI
-                    (100 - (100 / (1 + (pl.col("avg_gain") / (pl.col("avg_loss") + 1e-9))))).fill_null(50).alias("rsi_14"),
-                    
-                    # BB Position (Upper Band Cross check)
-                    # (Price - Mean) / (2 * Std) -> >1.0 means upper band crossed
-                    ((price_col - pl.col("bb_mean")) / (2 * pl.col("bb_std") + 1e-9)).alias("bb_position"),
-                    
-                    # Volume Ratio
-                    (vol_col / (pl.col("vol_ma_20") + 1e-9)).alias("vol_ratio")
-                    
-                ]).drop(["diff", "avg_gain", "avg_loss", "bb_mean", "bb_std", "vol_ma_20"]) # 임시 컬럼 제거
-                
+                    pl.col("log_return_1d").shift(-1).over("ticker").alias("next_day_ret")
+                )
                 predictions.append(pred_df)
                 
             except Exception as e:
@@ -170,17 +162,20 @@ class YetiRankBacktester:
             self._cached_predictions = pl.concat(predictions).sort(["date", "pred_score"], descending=[False, True])
             
         logger.info(f"✅ Predictions & Indicators cached! Rows: {len(self._cached_predictions)}")
-
     def run_backtest(self, top_k: int = 20, fee: float = 0.002, rebalance_period: int = 5, 
-                     stop_loss_k: float = 2.5, market_timing_threshold: float = 0.3,
                      filter_candidates_ratio: float = 2.0,
+                     stop_loss_k: float = 2.5, take_profit_k: float = 8.0, max_hold_days: int = 20,
+                     market_timing_threshold: float = 0.3,
                      use_rsi_filter: bool = False, rsi_max: float = 80,
+                     use_mfi_filter: bool = False, mfi_max: float = 80,
+                     use_adx_filter: bool = False, adx_min: float = 20,
+                     use_ichimoku_filter: bool = False,
                      use_ma_filter: bool = False,
                      use_bollinger_filter: bool = False, bb_position_max: float = 1.0,
                      use_volume_filter: bool = False, min_volume_ratio: float = 0.5,
                      save_plot: bool = False):
         """
-        [Enhanced] 백테스팅 엔진 (Hybrid Filtering)
+        [Enhanced] 백테스팅 엔진 (Hybrid Filtering + Profit Taking + Time-based Exit)
         """
         # 캐싱된 예측값이 없으면 생성
         if not hasattr(self, "_cached_predictions"):
@@ -189,11 +184,62 @@ class YetiRankBacktester:
         combined_df = self._cached_predictions
         if combined_df.is_empty(): return {}
 
+        # [OPTIMIZATION] 루프 진입 전 필터 조건 미리 계산 (Vectorization)
+        # 1. RSI Pass
+        if use_rsi_filter:
+            combined_df = combined_df.with_columns((pl.col("rsi_14") < rsi_max).alias("is_rsi_ok"))
+        else:
+            combined_df = combined_df.with_columns(pl.lit(True).alias("is_rsi_ok"))
+            
+        # 2. MFI Pass
+        if use_mfi_filter:
+            combined_df = combined_df.with_columns((pl.col("mfi_14") < mfi_max).alias("is_mfi_ok"))
+        else:
+            combined_df = combined_df.with_columns(pl.lit(True).alias("is_mfi_ok"))
+            
+        # 3. ADX Pass
+        if use_adx_filter:
+            combined_df = combined_df.with_columns((pl.col("adx_14") > adx_min).alias("is_adx_ok"))
+        else:
+            combined_df = combined_df.with_columns(pl.lit(True).alias("is_adx_ok"))
+            
+        # 4. Ichimoku Pass
+        if use_ichimoku_filter:
+            combined_df = combined_df.with_columns(pl.col("ichimoku_ok").alias("is_ichimoku_ok"))
+        else:
+            combined_df = combined_df.with_columns(pl.lit(True).alias("is_ichimoku_ok"))
+            
+        # 5. MA Pass
+        if use_ma_filter and "sma_60" in combined_df.columns:
+            p_col = "close" if "close" in combined_df.columns else "sma_20"
+            combined_df = combined_df.with_columns((pl.col(p_col) > pl.col("sma_60")).alias("is_ma_ok"))
+        else:
+            combined_df = combined_df.with_columns(pl.lit(True).alias("is_ma_ok"))
+            
+        # 6. Bollinger Pass
+        if use_bollinger_filter:
+            combined_df = combined_df.with_columns((pl.col("bb_position") < bb_position_max).alias("is_bb_ok"))
+        else:
+            combined_df = combined_df.with_columns(pl.lit(True).alias("is_bb_ok"))
+            
+        # 7. Volume Pass
+        if use_volume_filter:
+            combined_df = combined_df.with_columns((pl.col("vol_ratio") > min_volume_ratio).alias("is_vol_ok"))
+        else:
+            combined_df = combined_df.with_columns(pl.lit(True).alias("is_vol_ok"))
+            
+        # 최종 합격 여부 (AND 조건)
+        combined_df = combined_df.with_columns(
+            (pl.col("is_rsi_ok") & pl.col("is_mfi_ok") & pl.col("is_adx_ok") & 
+             pl.col("is_ichimoku_ok") & pl.col("is_ma_ok") & pl.col("is_bb_ok") & pl.col("is_vol_ok")).alias("is_buyable")
+        )
+
         # 3. 시뮬레이션
         portfolio_results = []
         dates = combined_df["date"].unique().sort()
-        current_holdings = [] 
-        current_tickers = []
+        
+        # [REFACTORED] current_holdings: {ticker: {"entry_price": float, "hold_days": int}}
+        current_holdings = {} 
         
         for idx, date in enumerate(dates[:-1]):
             day_df = combined_df.filter(pl.col("date") == date)
@@ -207,78 +253,113 @@ class YetiRankBacktester:
             
             if is_rebal_day:
                 # [Hybrid 2-Stage Selection]
-                # 1. Ranking Pool Expansion: 상위 N배수 후보 추출
                 pool_size = int(top_k * filter_candidates_ratio)
                 candidates_pool = day_df.head(pool_size)
                 
-                # 2. Techincail Filtering (코인 전략)
-                # RSI Filter
-                if use_rsi_filter:
-                    candidates_pool = candidates_pool.filter(pl.col("rsi_14") < rsi_max)
-                    
-                # MA Filter
-                if use_ma_filter and "sma_60" in candidates_pool.columns:
-                    # 정배열 (지수 > 60일선)
-                    p_col = "close" if "close" in candidates_pool.columns else "sma_20"
-                    candidates_pool = candidates_pool.filter(pl.col(p_col) > pl.col("sma_60"))
-                    
-                # Bollinger Filter (과열 방지)
-                if use_bollinger_filter:
-                    # 상단 밴드 돌파 시 매수 보류 (단기 고점 위험)
-                    candidates_pool = candidates_pool.filter(pl.col("bb_position") < bb_position_max)
-                    
-                # Volume Filter (소외주 방지)
-                if use_volume_filter:
-                    candidates_pool = candidates_pool.filter(pl.col("vol_ratio") > min_volume_ratio)
+                # --- Filtering (Pre-calculated Boolean Mask 사용) ---
+                filtered_pool = candidates_pool.filter(pl.col("is_buyable"))
 
-                # 3. Final Top-K Selection (Ranking 순)
-                final_candidates = candidates_pool.head(top_k)["ticker"].to_list()
+                # 최종 선정
+                final_candidates = filtered_pool.head(top_k)["ticker"].to_list()
                 
-                # 교체 비용 등 계산
-                if current_tickers:
-                    old_set = set(current_tickers)
-                    new_set = set(final_candidates)
-                    stay = len(old_set & new_set)
-                    # 분모 0 방지
-                    denom = len(old_set) if len(old_set) > 0 else 1
-                    daily_turnover = (len(old_set) - stay) / denom
-                else:
-                    daily_turnover = 1.0
-                    
-                current_tickers = final_candidates
+                # --- Turnover & Holdings Update ---
+                old_tickers = list(current_holdings.keys())
+                new_tickers = final_candidates
+                
+                # 교체 비용용 turnover
+                stay = len(set(old_tickers) & set(new_tickers))
+                daily_turnover = (len(old_tickers) - stay) / (len(old_tickers) if len(old_tickers) > 0 else 1)
+                
+                # [Performance] Price Map 생성 (루프 내 필터링 제거)
+                # close가 없으면 sma_20 등을 대용으로 사용
+                price_col_name = "close" if "close" in day_df.columns else "sma_20"
+                price_map = dict(zip(day_df["ticker"].to_list(), day_df[price_col_name].to_list()))
+                
+                # Update Holdings: 새로 들어온 놈들은 entry_price 기록
+                new_holdings = {}
+                for t in new_tickers:
+                    if t in current_holdings:
+                        # 유지 종목: 기존 정보 승계
+                        new_holdings[t] = current_holdings[t]
+                        new_holdings[t]["hold_days"] += 1
+                    else:
+                        # 신규 진입: Map에서 조회 (O(1))
+                        entry_p = price_map.get(t, 1.0)
+                        new_holdings[t] = {"entry_price": entry_p, "hold_days": 1}
+                
+                current_holdings = new_holdings
             
             else:
-                # ATR Stop Loss Logic
-                survivors = []
-                for t in current_tickers:
-                    row = day_df.filter(pl.col("ticker")==t)
-                    if row.is_empty(): 
-                        survivors.append(t)
+                # [Performance] Price Map 생성
+                price_col_name = "close" if "close" in day_df.columns else "sma_20"
+                price_map = dict(zip(day_df["ticker"].to_list(), day_df[price_col_name].to_list()))
+                
+                # --- [Exit Strategy Loop] ---
+                survivors = {}
+                for t, info in current_holdings.items():
+                    # 데이터 존재 여부 확인 (Map에 있는지)
+                    if t not in price_map:
+                        # 데이터 없으면 일단 유지 (상장폐지 등 특수 상황 제외)
+                        survivors[t] = info
                         continue
+                        
+                    # 지표 추출 - 여기는 어쩔 수 없이 row 접근 필요하지만, 최소화
+                    # 수익률/변동성은 별도 맵으로 만들거나 row filter 사용
+                    # (정확성을 위해 여기는 filter 유지하되, 리스크 관리 발동 시에만)
                     
-                    ret = row["log_return_1d"][0]
-                    vol = row["volatility_20d"][0] if row["volatility_20d"][0] is not None else 0.02
+                    # [Optimization] Return/Vol Map도 생성
+                    # (매일 생성하는 비용 vs 루프 비용 비교 -> 루프가 훨씬 비쌈)
+                    # 위에서 한꺼번에 만드는게 나음
+                    pass 
+                
+                # Re-do optimzed loop
+                # 지표 맵 생성
+                ret_map = dict(zip(day_df["ticker"].to_list(), day_df["log_return_1d"].to_list()))
+                vol_map = dict(zip(day_df["ticker"].to_list(), day_df["volatility_20d"].to_list()))
+                
+                for t, info in current_holdings.items():
+                    if t not in price_map:
+                        survivors[t] = info
+                        continue
+                        
+                    curr_p = price_map[t]
+                    ret = ret_map.get(t, 0.0)
+                    vol = vol_map.get(t, 0.02); vol = vol if vol is not None else 0.02
                     
-                    # [Exit] 차트가 망가졌는지 확인 (코인 스타일 즉시 청산)
-                    # 여기서는 간단히 ATR 손절만 적용 (복잡도 관리)
+                    # 1. Stop Loss
                     if ret < (-stop_loss_k * vol):
                          continue
-                    else:
-                        survivors.append(t)
+                         
+                    # 2. Take Profit
+                    if (curr_p - info["entry_price"]) / (info["entry_price"] + 1e-9) > (take_profit_k * vol):
+                        continue
+                        
+                    # 3. Time-based Exit
+                    if info["hold_days"] > max_hold_days:
+                        continue
+                        
+                    # All pass: Keep
+                    info["hold_days"] += 1
+                    survivors[t] = info
                 
-                # Replenish
-                needed = len(current_tickers) - len(survivors)
+                # 빈자리 충원
+                needed = top_k - len(survivors)
                 if needed > 0:
-                    replacements = day_df.filter(~pl.col("ticker").is_in(survivors)).head(needed)["ticker"].to_list()
-                    current_tickers = survivors + replacements
+                    replacements = day_df.filter(~pl.col("ticker").is_in(list(survivors.keys()))).head(needed)
+                    # 여기도 Map 사용
+                    rep_tickers = replacements["ticker"].to_list()
+                    for t in rep_tickers:
+                        entry_p = price_map.get(t, 1.0)
+                        survivors[t] = {"entry_price": entry_p, "hold_days": 1}
+                        
                     daily_turnover = needed / top_k
-                else:
-                    current_tickers = survivors
+                
+                current_holdings = survivors
             
             # --- Calculate Return (Previous code) ---
 
             # --- Calculate Return ---
-            holding_df = day_df.filter(pl.col("ticker").is_in(current_tickers))
+            holding_df = day_df.filter(pl.col("ticker").is_in(list(current_holdings.keys())))
             if holding_df.is_empty():
                 raw_ret = 0.0
             else:
@@ -293,6 +374,10 @@ class YetiRankBacktester:
             net_ret = final_daily_ret - (daily_turnover * fee * market_condition) # 거래한 만큼만 비용
             
             portfolio_results.append({"date": date, "net_return": net_ret, "turnover": daily_turnover})
+
+        if not portfolio_results:
+            logger.warning("⚠️ No portfolio results generated.")
+            return {}
 
         perf_df = pl.DataFrame(portfolio_results)
         metrics = self.calculate_metrics(perf_df)
@@ -322,6 +407,10 @@ class YetiRankBacktester:
             for p in p_options:
                 metrics = self.run_backtest(top_k=k, rebalance_period=p, fee=0.002, save_plot=False)
                 
+                if not metrics or 'CAGR' not in metrics:
+                    print(f"{k:<6} | {p:<6} | {'N/A':>7} | {'N/A':>7} | {'N/A':>8} | {'N/A'}")
+                    continue
+
                 # 문자열 퍼센트 제거 및 실수 변환
                 cagr = float(metrics['CAGR'].replace('%',''))
                 mdd = float(metrics['MDD'].replace('%',''))
@@ -348,13 +437,20 @@ class YetiRankBacktester:
         self.run_backtest(top_k=best_params[0], rebalance_period=best_params[1], save_plot=True)
 
     def calculate_metrics(self, df: pl.DataFrame) -> Dict[str, Any]:
+        if df.is_empty():
+            return {
+                "Total Return": "0.00%", "CAGR": "0.00%", "Sharpe Ratio": "0.0000",
+                "Sortino Ratio": "0.0000", "MDD": "0.00%", "Win Rate": "0.00%",
+                "P/L Ratio": "0.0000", "Avg Turnover": "0.00%"
+            }
+
         rets = df["net_return"].to_numpy()
-        cum_rets = (1 + rets).cumprod() # numpy 배열이므로 여기는 유지 (rets는 to_numpy() 결과임)
+        cum_rets = (1 + rets).cumprod() 
         
         # CAGR (연평균 수익률)
         days = len(df)
-        total_ret = cum_rets[-1] - 1
-        cagr = (1 + total_ret) ** (252 / days) - 1
+        total_ret = cum_rets[-1] - 1 if len(cum_rets) > 0 else 0
+        cagr = (1 + total_ret) ** (252 / days) - 1 if days > 0 else 0
         
         # Volatility (연화)
         vol = np.std(rets) * np.sqrt(252)
