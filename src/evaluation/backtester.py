@@ -86,13 +86,21 @@ class YetiRankBacktester:
         if not predictions:
             return
             
-        combined_df = pl.concat(predictions).sort(["date", "pred_score"], descending=[False, True])
+        # [MODIFIED] 데이터 정렬 안정성 강화
+        # 1. 먼저 ticker와 date 기준으로 정렬하여 시계열 순서를 완벽히 보장
+        combined_df = pl.concat(predictions).sort(["ticker", "date"])
         
-        # [FIX] 타임라인 정정: T일 예측 후 T+1일 수익률을 얻어야 함.
-        # 기존 log_return_1d는 '오늘'의 수익률이므로, 이를 위로 1칸 밀어(shift -1) '내일'의 수익률로 사용.
+        # 2. Shift를 통해 내일 수익률 가져오기 (컬럼 존재 여부 체크)
+        if "log_return_1d" not in combined_df.columns:
+            logger.error("CRITICAL: 'log_return_1d' column missing in data used for backtest.")
+            return
+
         combined_df = combined_df.with_columns(
             pl.col("log_return_1d").shift(-1).over("ticker").alias("next_day_ret")
         )
+        
+        # 3. 백테스팅 로직을 위해 다시 날짜/점수 순으로 정렬
+        combined_df = combined_df.sort(["date", "pred_score"], descending=[False, True])
         
         # 3. 일별 포트폴리오 수익률 시뮬레이션
         # target_return_5d는 ln(Close_t+5 / Close_t) 임을 유의
