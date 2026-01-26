@@ -114,7 +114,7 @@ class YetiRankTrainer:
             # Feature Importance
             fi_df = pd.DataFrame({
                 "feature": feature_names,
-                "importance": model.get_feature_importance()
+                "importance": model.get_feature_importance(data=train_pool)
             }).sort_values(by="importance", ascending=False)
             
             fi_path = self.output_dir / f"feature_importance_{year}.csv"
