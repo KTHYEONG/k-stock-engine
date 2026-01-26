@@ -1,6 +1,8 @@
 import optuna
 import logging
 import polars as pl
+import sys
+import os
 from typing import Dict, Any, List, Optional
 from catboost import CatBoostRanker
 from src.training.data_loader import YetiRankDataLoader
@@ -18,7 +20,6 @@ class YetiRankTuner:
         logger.info(f"🚀 Using device: {self.task_type} for training/tuning.")
         
         if full_df is None:
-            logger.info("📂 Loading full data for tuning...")
             full_df = self.loader.load_full_data()
         
         self.feature_names = self.loader.get_feature_names(full_df)
@@ -58,31 +59,30 @@ class YetiRankTuner:
         }
         
         model = CatBoostRanker(**params)
-        model.fit(self.train_pool, eval_set=self.valid_pool, early_stopping_rounds=50, verbose=False)
         
-        # [Robust Score Extraction]
+        # [Suppression] 불필요한 GPU 경고 로그 차단
+        with open(os.devnull, 'w') as fnull:
+            old_stderr = sys.stderr
+            sys.stderr = fnull
+            try:
+                model.fit(self.train_pool, eval_set=self.valid_pool, early_stopping_rounds=50, verbose=False)
+            finally:
+                sys.stderr = old_stderr
+        
         score = 0.0
         try:
-            # 1. Trial Best Score (가장 정확)
             scores = model.get_best_score()
             valid_key = next((k for k in scores.keys() if "learn" not in k.lower()), None)
             if valid_key:
                 metric_key = next((m for m in scores[valid_key].keys() if "NDCG" in m), None)
                 if metric_key:
                     score = float(scores[valid_key][metric_key])
-            
-            # 2. Backup: get_evals_result (1번 실패 시)
-            if score == 0.0:
-                evals = model.get_evals_result()
-                valid_key = next((k for k in evals.keys() if "learn" not in k.lower()), None)
-                if valid_key:
-                    metric_key = next((m for m in evals[valid_key].keys() if "NDCG" in m), None)
-                    if metric_key:
-                        score = float(max(evals[valid_key][metric_key]))
-        except Exception as e:
-            logger.warning(f"⚠️ Score extraction error: {e}")
+        except:
+            pass
 
-        logger.info(f"📊 Trial {trial.number:02d} | NDCG@20: {score:.4f} | LR: {params['learning_rate']:.4f}, Depth: {params['depth']}")
+        # 진행률 표시 강화: [01/30] 형식 추가
+        progress = f"[{trial.number + 1:02d}/{self.n_trials}]"
+        logger.info(f"📊 {progress} NDCG@20: {score:.4f} | LR: {params['learning_rate']:.4f}, Depth: {params['depth']}")
         return score
 
     def run_tuning(self) -> Dict[str, Any]:
