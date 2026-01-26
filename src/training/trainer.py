@@ -78,7 +78,7 @@ class YetiRankTrainer:
         final_params = {**static_params, **best_params}
         
         for year in test_years:
-            logger.info(f"--- Training Target Year: {year} ---")
+            logger.info(f"⏳ Training Target Year: {year}...")
             
             # Split Data (Expanding Window)
             train_df, valid_df, test_df = self.loader.walk_forward_split(full_df, test_year=year)
@@ -102,17 +102,16 @@ class YetiRankTrainer:
             model.save_model(str(model_path))
             self.models[year] = model
             
-            # Evaluate on Test Set
+            # Evaluate on Test Set (Robust Key Detection)
             metrics = model.eval_metrics(test_pool, ["NDCG:top=20"])
-            
-            # Metric Key 찾기 (GPU 환경 등에 따라 이름이 달라질 수 있음)
             metric_key = next((m for m in metrics.keys() if "NDCG" in m), None)
+            
             if metric_key:
                 final_ndcg = metrics[metric_key][-1]
-                logger.info(f"Year {year} Training Completed. Test NDCG@20: {final_ndcg:.4f} (Best Iter: {model.get_best_iteration()})")
+                logger.info(f"✅ Year {year} Completed. Test NDCG@20: {final_ndcg:.4f} (Best Iter: {model.get_best_iteration()})")
             else:
                 final_ndcg = 0.0
-                logger.warning(f"Year {year} Training Completed but NDCG metric key not found in {list(metrics.keys())}")
+                logger.warning(f"⚠️ Year {year} NDCG key not found in {list(metrics.keys())}")
             
             # Feature Importance
             fi_df = pd.DataFrame({
@@ -131,8 +130,11 @@ class YetiRankTrainer:
             
         # 4. Final Summary
         summary_df = pd.DataFrame(self.results)
-        print("\n=== Walk-Forward Evaluation Summary ===")
+        print("\n" + "="*40)
+        print("🏆 Walk-Forward Evaluation Summary")
+        print("="*40)
         print(summary_df)
+        print("="*40 + "\n")
         summary_df.to_csv(self.output_dir / "evaluation_summary.csv", index=False)
         
         return summary_df
