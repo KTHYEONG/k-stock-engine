@@ -147,13 +147,13 @@ class YetiRankDataLoader:
         y = df["target_rank"].to_pandas()
         groups = df["group_id"].to_pandas()
         
-        # Sector가 있다면 cat_features로 지정 필요 (현재는 일단 수치형 위주로 가정)
-        # 만약 sector 컬럼이 피처에 포함된다면 index를 찾아야 함
+        # 카테고리 피처 자동 감지 (실제 문자열인 것만)
         cat_features = []
-        if "sector" in feature_names:
-            cat_features = ["sector"]
-            # Ensure sector is string/category for CatBoost
-            X["sector"] = X["sector"].astype(str)
+        for col in feature_names:
+            if df.schema[col] == pl.Utf8 or col == "sector":
+                cat_features.append(col)
+                # CatBoost 요구사항: 카테고리 피처는 반드시 문자열이어야 함
+                X[col] = X[col].astype(str)
 
         return Pool(
             data=X,
