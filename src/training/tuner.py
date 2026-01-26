@@ -51,14 +51,14 @@ class YetiRankTuner:
         params = {
             "loss_function": "YetiRank",
             "eval_metric": "NDCG:top=20",
-            "iterations": 1000, # 튜닝 시에는 속도를 위해 약간 줄임
+            "iterations": 1000,
             "od_type": "Iter",
             "od_wait": 50,
             "task_type": self.task_type,
             "devices": "0" if self.task_type == "GPU" else None,
-            "verbose": False,
             "allow_writing_files": False,
-            "use_best_model": True, # 검증 점수 추적 활성화
+            "use_best_model": True,
+            "logging_level": "Silent", # 내부 로그 숨김
             
             "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.1, log=True),
             "depth": trial.suggest_int("depth", 4, 8),
@@ -77,45 +77,35 @@ class YetiRankTuner:
             verbose=False
         )
         
-        # 3. Return Best Score (안전한 점수 추출)
-        # 우선순위: model.best_score_ -> model.get_best_score() -> model.get_evals_result()
+        # 3. Return Best Score
         scores = {}
         if hasattr(model, "best_score_") and model.best_score_:
             scores = model.best_score_
         else:
             scores = model.get_best_score()
             
-        if not scores:
-            eval_result = model.get_evals_result()
-            # evals_result에서 마지막 값이거나 가장 좋은 값을 추출 시도
-            valid_key = next((k for k in eval_result.keys() if "validation" in k or "test" in k), None)
+        score = 0.0
+        if scores:
+            valid_key = next((k for k in scores.keys() if "validation" in k or "test" in k), None)
             if valid_key:
-                metric_key = next((m for m in eval_result[valid_key].keys() if "NDCG" in m), None)
+                metric_key = next((m for m in scores[valid_key].keys() if "NDCG" in m), None)
                 if metric_key:
-                    return float(max(eval_result[valid_key][metric_key]))
-        
-        # Validation Key 찾기
-        valid_key = next((k for k in scores.keys() if "validation" in k or "test" in k), None)
-        if valid_key is None:
-            logger.error(f"Score extraction failed. Available keys in scores: {list(scores.keys())}")
-            return 0.0
-            
-        metric_key = next((m for m in scores[valid_key].keys() if "NDCG" in m), "NDCG:top=20")
-        if metric_key not in scores[valid_key]:
-             return 0.0
+                    score = float(scores[valid_key][metric_key])
 
-        return float(scores[valid_key][metric_key])
+        # Trial 결과 요약 출력
+        logger.info(f"Trial {trial.number:02d} | NDCG@20: {score:.4f} | LR: {params['learning_rate']:.4f}, Depth: {params['depth']}")
+        return score
 
     def run_tuning(self) -> Dict[str, Any]:
-        logger.info(f"Starting Hyperparameter Tuning ({self.n_trials} trials)...")
+        logger.info(f"Hyperparameter Tuning Start ({self.n_trials} trials)...")
+        
+        # Optuna 기본 로그 끄기
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
         
         study = optuna.create_study(direction="maximize")
         study.optimize(self.objective, n_trials=self.n_trials)
         
-        logger.info("Tuning Completed.")
-        logger.info(f"Best Score (NDCG@20): {study.best_value:.4f}")
-        logger.info(f"Best Params: {study.best_params}")
-        
+        logger.info(f"Tuning Completed. Best NDCG: {study.best_value:.4f}")
         return study.best_params
 
 if __name__ == "__main__":
