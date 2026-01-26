@@ -77,8 +77,7 @@ class TechProcessor(BaseProcessor):
              
         # 1e6을 곱하여 수치 가독성 확보 및 0/inf 방어
         abs_ret = pl.col("log_return_1d").abs()
-        amihud_daily = (abs_ret / pl.col("trading_value").replace(0, None)).fill_null(0) * 1e6
-        
+        amihud_daily = ((abs_ret / pl.col("trading_value")).fill_nan(0).fill_null(0).replace(float('inf'), 0)) * 1e6
         df = df.with_columns([
             amihud_daily.rolling_mean(window_size=20).over("ticker").alias("amihud_20d")
         ])
