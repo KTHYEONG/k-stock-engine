@@ -84,8 +84,21 @@ class YetiRankDataLoader:
         if dropped_rows > 0:
             logger.info(f"Dropped {dropped_rows} rows with null targets.")
             
+        # [CRITICAL] Look-ahead Bias 방지: 모든 Feature를 1일 뒤로 미룸 (Shift 1)
+        # 즉, T일의 예측에는 T-1일까지의 데이터만 사용하도록 강제함.
+        # 타겟(target_return_5d) 제외한 모든 기술적/수급 지표 Shift
+        
+        # 1. 사용할 피처 목록 미리 확보 (메타데이터 제외)
+        shift_cols = [c for c in df.columns if c not in self.exclude_cols and c not in ["ticker", "date", "year", "group_id"]]
+        
+        logger.info(f"Applying lag(1) to {len(shift_cols)} features to prevent leakage...")
+        df = df.with_columns([
+            pl.col(c).shift(1).over("ticker") for c in shift_cols
+        ])
+        
         # 3. Create Group ID & Re-calculate Target Rank
         # [FIX] 백테스트 수익률 역전 현상 방지를 위해 Target Rank를 직접 재계산
+        df = df.drop_nulls(subset=shift_cols) # Shift로 생긴 첫 행 결측 제거
         # 수익률(target_return_5d)이 높을수록 높은 점수(Rank)를 부여해야 함.
         # 여기서는 0~1 사이의 실수형 점수(Relevance Score)로 변환하여 정밀도 향상
         
