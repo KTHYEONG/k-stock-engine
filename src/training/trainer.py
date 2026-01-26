@@ -129,6 +129,20 @@ class YetiRankTrainer:
         return summary_df
 
 if __name__ == "__main__":
-    trainer = YetiRankTrainer(start_date="20160401")
-    # n_trials=1, sample_ratio=0.1 for quick test
-    trainer.train_and_evaluate(test_years=[2024], n_trials=1, sample_ratio=0.1) 
+    import argparse
+    parser = argparse.ArgumentParser(description="YetiRank Model Trainer")
+    parser.add_argument("--trials", type=int, default=30, help="Number of hyperparameter tuning trials")
+    parser.add_argument("--sample", type=float, default=1.0, help="Data sampling ratio (0.1 ~ 1.0)")
+    parser.add_argument("--years", type=str, default="2024,2025", help="Comma separated test years")
+    parser.add_argument("--start", type=str, default="20160401", help="Start date (YYYYMMDD)")
+    
+    args = parser.parse_args()
+    
+    test_years = [int(y.strip()) for y in args.years.split(",")]
+    
+    trainer = YetiRankTrainer(start_date=args.start)
+    trainer.train_and_evaluate(
+        test_years=test_years, 
+        n_trials=args.trials, 
+        sample_ratio=args.sample
+    ) 
