@@ -3,6 +3,10 @@ from pathlib import Path
 import sys
 import numpy as np
 import logging
+try:
+    import yaml
+except ImportError:
+    yaml = None 
 from typing import Tuple, List, Optional
 from catboost import Pool
 
@@ -38,6 +42,24 @@ class YetiRankDataLoader:
             # Targets (Leakage 방지)
             "target_return_5d", "target_rank"
         ]
+        
+        self.feature_config_path = PROJECT_ROOT / "data" / "model_features" / "features_v1.yaml"
+        
+    def _load_feature_config(self) -> Optional[List[str]]:
+        """YAML 설정 파일에서 사용할 피처 리스트 로드 (Whitelist)"""
+        if yaml is None:
+            return None
+            
+        if not self.feature_config_path.exists():
+            return None
+            
+        try:
+            with open(self.feature_config_path, "r", encoding="utf-8") as f:
+                config = yaml.safe_load(f)
+                return config.get("features", [])
+        except Exception as e:
+            logger.error(f"Error loading feature config: {e}")
+            return None
         
     def load_full_data(self, end_date: str = "20251231", sample_ratio: float = 1.0) -> pl.DataFrame:
         """전체 데이터를 로드하고 전처리 (메모리 로드)"""
@@ -80,7 +102,28 @@ class YetiRankDataLoader:
 
     def get_feature_names(self, df: pl.DataFrame) -> List[str]:
         """학습에 사용할 피처 이름 목록 추출"""
-        # 1. 명시적 제외 목록 필터링
+        
+        # 0. YAML Config 우선 적용 (Whitelist)
+        selected_features = self._load_feature_config()
+        if selected_features:
+            logger.info(f"Using {len(selected_features)} features from config: {self.feature_config_path.name}")
+            
+            # 유효성 검사: 데이터프레임에 없는 피처는 제외
+            valid_features = []
+            missing_features = []
+            
+            for col in selected_features:
+                if col in df.columns:
+                    valid_features.append(col)
+                else:
+                    missing_features.append(col)
+            
+            if missing_features:
+                logger.warning(f"⚠️ Missing features in data: {missing_features}")
+                
+            return valid_features
+
+        # 1. 명시적 제외 목록 필터링 (Blacklist - Fallback)
         base_features = [c for c in df.columns if c not in self.exclude_cols and c != "group_id"]
         
         # 2. 데이터 타입 기반 방어적 필터링 (숫자형이거나 지정된 카테고리 컬럼만 포함)
