@@ -89,9 +89,9 @@ class YetiRankBacktester:
             pl.col("loss").rolling_mean(14).over("ticker").alias("avg_loss"),
             pl.col("pos_mf").rolling_sum(14).over("ticker").alias("pmf_14"),
             pl.col("neg_mf").rolling_sum(14).over("ticker").alias("nmf_14"),
-            pl.col("tr").rolling_mean(14).over("ticker").alias("atr_14"),
-            pl.col("p_dm").rolling_mean(14).over("ticker").alias("pdm_14"),
-            pl.col("n_dm").rolling_mean(14).over("ticker").alias("ndm_14"),
+            pl.col("tr").rolling_mean(14).over("ticker").fill_null(0).alias("atr_14"),
+            pl.col("p_dm").rolling_mean(14).over("ticker").fill_null(0).alias("pdm_14"),
+            pl.col("n_dm").rolling_mean(14).over("ticker").fill_null(0).alias("ndm_14"),
             ((high_col.rolling_max(9).over("ticker") + low_col.rolling_min(9).over("ticker")) / 2).alias("tenkan"),
             ((high_col.rolling_max(26).over("ticker") + low_col.rolling_min(26).over("ticker")) / 2).alias("kijun"),
             ((high_col.rolling_max(52).over("ticker") + low_col.rolling_min(52).over("ticker")) / 2).alias("senkou_b_raw"),
@@ -109,7 +109,7 @@ class YetiRankBacktester:
         ]).with_columns([
             (100 * (pl.col("p_di") - pl.col("n_di")).abs() / (pl.col("p_di") + pl.col("n_di") + 1e-9)).alias("dx")
         ]).with_columns([
-            pl.col("dx").rolling_mean(14).over("ticker").alias("adx_raw"),
+            pl.col("dx").rolling_mean(14).over("ticker").fill_null(0).alias("adx_raw"),
             pl.max_horizontal([pl.col("senkou_a_raw"), pl.col("senkou_b_raw")]).alias("cloud_top_raw")
         ]).with_columns([
             # [SHIFT APPLY] 내일의 의사결정에 쓰일 오늘의 지표
