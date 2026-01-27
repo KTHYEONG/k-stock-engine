@@ -1,3 +1,4 @@
+
 import optuna
 import logging
 from pathlib import Path
@@ -21,125 +22,154 @@ logging.getLogger("training.data_loader").setLevel(logging.WARNING)
 
 class YetiRankOptimizer:
     """
-    Optuna를 이용한 전략 하이퍼파라미터 최적화 도구
-    UNIFIED_CONFIG를 기반으로 최적의 하이퍼파라미터 탐색
+    Optuna를 이용한 전략 하이퍼파라미터 최적화 도구.
+    Dynamic Search Space를 지원하여 다양한 전략 모드(ACTIVE, SWING, TREND)를 탐색.
     """
     
-    def __init__(self, start_date: str = "20240101", end_date: str = "20251231"):
-        self.search_space = GET_SEARCH_SPACE()
-        self.backtester = YetiRankBacktester(start_date=start_date, end_date=end_date)
-        # 최적화 시작 전 모델 예측값 미리 캐싱 (속도 향상 핵심)
+    def __init__(self, start_date: str = "20240101", end_date: str = "20241231", 
+                 mode: str = 'UNIFIED', market_type: str = 'stock_spot'):
+        self.mode = mode
+        self.market_type = market_type
+        self.search_space_config = GET_SEARCH_SPACE(mode=mode, market_type=market_type)
+        
+        # [MODIFIED] User 요청에 따라 기본적으로 2023년 모델 사용
+        target_model_year = 2023
+        self.backtester = YetiRankBacktester(start_date=start_date, end_date=end_date, model_year=target_model_year)
+        
+        # 최적화 시작 전 모델 예측값 미리 캐싱
         self.backtester.generate_predictions()
         
+    def check_indicators(self):
+        """계산된 지표들의 건강 상태(결측치, 범위 등)를 점검"""
+        logger.info("🔍 Checking Indicator Health...")
+        df = self.backtester._cached_predictions
+        
+        if df.is_empty():
+            logger.error("❌ No data found in cached predictions.")
+            return
+            
+        indicator_cols = [
+            "rsi_14", "mfi_14", "natr_14", "macd_hist", "cci", 
+            "cmf", "obv", "stoch_rsi", "bb_position", "supertrend_direction"
+        ]
+        
+        print("\n" + "="*60)
+        print(f"{'Indicator':<25} | {'Nulls':<8} | {'Min':<10} | {'Max':<10}")
+        print("-" * 60)
+        
+        for col in indicator_cols:
+            if col not in df.columns:
+                print(f"{col:<25} | {'MISSING':<8}")
+                continue
+                
+            null_count = df[col].null_count()
+            null_pct = (null_count / len(df)) * 100
+            
+            # Remove nulls for min/max calculation
+            valid_data = df[col].drop_nulls()
+            if len(valid_data) > 0:
+                v_min = valid_data.min()
+                v_max = valid_data.max()
+                print(f"{col:<25} | {null_pct:>6.1f}% | {v_min:>10.2f} | {v_max:>10.2f}")
+            else:
+                print(f"{col:<25} | {null_pct:>6.1f}% | {'ALL NULL':<10} | {'ALL NULL':<10}")
+                
+        print("="*60 + "\n")
+        
     def objective(self, trial):
-        """Optuna 목적 함수: UNIFIED 서치 스페이스 탐색"""
+        """Optuna 목적 함수: Config에서 정의된 동적 서치 스페이스 탐색"""
         
-        # 1. 탐색 범위(Search Space) - config에서 가져옴
-        s = self.search_space
-        
-        top_k = trial.suggest_int("top_k", **s['TOP_K'])
-        rebalance_period = trial.suggest_int("rebalance_period", **s['REBALANCE_PERIOD'])
-        filter_candidates_ratio = trial.suggest_float("filter_candidates_ratio", **s['FILTER_CANDIDATES_RATIO'])
-        
-        stop_loss_k = trial.suggest_float("stop_loss_k", **s['STOP_LOSS_K'])
-        take_profit_k = trial.suggest_float("take_profit_k", **s['TAKE_PROFIT_K'])
-        max_hold_days = trial.suggest_int("max_hold_days", **s['MAX_HOLD_DAYS'])
-        
-        market_timing_threshold = trial.suggest_float("market_timing_threshold", **s['MARKET_TIMING_THRESHOLD'])
-        
-        # --- [EXCLUSIVE SELECTION LOGIC] ---
-        # 지표 중복으로 인한 과최적화 방지 및 탐색 효율성 극대화
-        
-        # 1. Momentum Category (과열/침체)
-        momentum_choice = trial.suggest_categorical("momentum_filter", ["None", "RSI", "MFI"])
-        use_rsi_filter = (momentum_choice == "RSI")
-        use_mfi_filter = (momentum_choice == "MFI")
-        
-        rsi_max = 80
-        if use_rsi_filter:
-            rsi_max = trial.suggest_int("rsi_max", **s['RSI_MAX'])
-        mfi_max = 80
-        if use_mfi_filter:
-            mfi_max = trial.suggest_int("mfi_max", **s['MFI_MAX'])
+        params = {}
+        # Dynamic parameter suggestion based on config type
+        for param_name, config in self.search_space_config.items():
+            # Skip non-parameter entries if any
+            if not isinstance(config, dict):
+                continue
             
-        # 2. Trend Category (추세 강도 및 방향)
-        trend_choice = trial.suggest_categorical("trend_filter", ["None", "MA", "ADX", "Ichimoku"])
-        use_ma_filter = (trend_choice == "MA")
-        use_adx_filter = (trend_choice == "ADX")
-        use_ichimoku_filter = (trend_choice == "Ichimoku")
-        
-        adx_min = 20
-        if use_adx_filter:
-            adx_min = trial.suggest_int("adx_min", **s['ADX_MIN'])
+            p_type = config.get('type')
             
-        # 3. Volatility Category (가격 위치)
-        volat_choice = trial.suggest_categorical("volatility_filter", ["None", "Bollinger"])
-        use_bollinger_filter = (volat_choice == "Bollinger")
-        
-        bb_position_max = 1.0
-        if use_bollinger_filter:
-            bb_position_max = trial.suggest_float("bb_position_max", **s['BB_POSITION_MAX'])
-            
-        # 4. Volume Category (수급)
-        volume_choice = trial.suggest_categorical("volume_filter", ["None", "Volume"])
-        use_volume_filter = (volume_choice == "Volume")
-        
-        min_volume_ratio = 0.5
-        if use_volume_filter:
-            min_volume_ratio = trial.suggest_float("min_volume_ratio", **s['MIN_VOLUME_RATIO'])
-        
+            if p_type == 'int':
+                # Handle log scale if present
+                log = config.get('log', False)
+                step = config.get('step', 1) if not log else None 
+                params[param_name] = trial.suggest_int(param_name, config['low'], config['high'], step=step, log=log)
+                
+            elif p_type == 'float':
+                log = config.get('log', False)
+                step = config.get('step', None) 
+                params[param_name] = trial.suggest_float(param_name, config['low'], config['high'], step=step, log=log)
+                
+            elif p_type == 'categorical':
+                params[param_name] = trial.suggest_categorical(param_name, config['choices'])
+                
+            # Legacy format support (if any key missing 'type')
+            elif 'low' in config and 'high' in config:
+                 # Guess type based on value
+                 if isinstance(config['low'], int):
+                     params[param_name] = trial.suggest_int(param_name, config['low'], config['high'], step=config.get('step', 1))
+                 else:
+                     params[param_name] = trial.suggest_float(param_name, config['low'], config['high'], step=config.get('step'))
+
+        # 매개변수 이름을 Backtester의 인자명으로 매핑 (필요시)
+        # 현재 optimization_config.py의 키와 backtester.py의 인자가 거의 일치하도록 설계됨.
+        # 소문자로 변환하여 전달 (Config는 대문자 키 사용)
+        final_params = {k.lower(): v for k, v in params.items()}
+
         try:
             # 2. 백테스트 실행
-            metrics = self.backtester.run_backtest(
-                top_k=top_k, 
-                rebalance_period=rebalance_period,
-                filter_candidates_ratio=filter_candidates_ratio,
-                stop_loss_k=stop_loss_k,
-                take_profit_k=take_profit_k,
-                max_hold_days=max_hold_days,
-                market_timing_threshold=market_timing_threshold,
-                use_rsi_filter=use_rsi_filter, rsi_max=rsi_max,
-                use_mfi_filter=use_mfi_filter, mfi_max=mfi_max,
-                use_adx_filter=use_adx_filter, adx_min=adx_min,
-                use_ichimoku_filter=use_ichimoku_filter,
-                use_bollinger_filter=use_bollinger_filter, bb_position_max=bb_position_max,
-                use_volume_filter=use_volume_filter, min_volume_ratio=min_volume_ratio,
-                use_ma_filter=use_ma_filter,
-                fee=0.002,
-                save_plot=False
-            )
+            metrics = self.backtester.run_backtest(fee=0.002, **final_params)
             
             if not metrics:
                 return -100.0
             
-            # 3. 스코어 계산 (Advanced Robust Scoring)
+            # 3. 스코어 계산 (Stability & Robustness Focused)
             cagr = float(metrics["CAGR"].replace("%", ""))
             mdd = abs(float(metrics["MDD"].replace("%", "")))
             sharpe = float(metrics["Sharpe Ratio"])
             win_rate = float(metrics["Win Rate"].replace("%", ""))
+            total_ret = float(metrics["Total Return"].replace("%", ""))
+            total_trades = float(metrics.get("Total Trades", "0").replace("회", ""))
             turnover = float(metrics["Avg Turnover"].replace("%", ""))
             
-            # [Advanced Robust Scoring V2]
-            # 1. CAGR 가중치 상향: 실질 수익 중심
-            # 2. MDD 페널티 현실화: 너무 높으면 수익 기회를 놓침
+            # [Core Objective]: Stability-Adjusted Return
+            # 단순히 많이 버는 것보다 '안정적으로' 버는 것에 집중
             
-            score = (cagr * 2.0) + (sharpe * 10.0) - (mdd * 8.0) + (win_rate * 0.1)
+            # 1. Base Score: Sharpe Ratio를 기반으로 함
+            # Sharpe가 높을수록 안정적 우상향을 의미함
+            score = sharpe * 100.0
             
-            # [Trade-off Penalty] 잦은 매매 제재 (회전율 10% 초과 시)
-            if turnover > 10.0:
-                score -= (turnover - 10.0) * 5.0
+            # 2. Add Profitability context (Logged to prevent outlier dominance)
+            if total_ret > 0:
+                score += np.log1p(total_ret) * 10.0
+            else:
+                score += total_ret # 음수면 그대로 감점
+            
+            # 3. Hard Penalties for Fragility (부러지기 쉬운 전략 제거)
+            # MDD 20% 초과는 실전에서 견디기 힘듦
+            if mdd > 20.0:
+                score -= (mdd - 20.0) * 5.0
+            
+            # 4. Win Rate Floor
+            # 승률 25% 미만은 사실상 운에 맡기는 매매
+            if win_rate < 25.0:
+                score -= (25.0 - win_rate) * 10.0
                 
-            if cagr < 0:
-                score = -200.0 + cagr - (mdd * 2) # 원금 손실 전략은 강력 감점
-                
-            # 최적화 과정 분석용 데이터 기록
+            # 5. Trading Frequency Targeting (Sweet Spot: 150 ~ 250 trades/year)
+            # 너무 적으면(100회 미만) 통계적 유의성 부족 및 기회 손실 -> 강한 감점
+            if total_trades < 100:
+                score -= 100.0 + (100 - total_trades) # 부족한 만큼 감점
+            
+            # 너무 많으면(300회 초과) 과도한 수수료 및 슬리피지 우려 -> 완만한 감점
+            elif total_trades > 300:
+                 score -= (total_trades - 300) * 0.2
+
+            # Result Reporting
             trial.set_user_attr("cagr", cagr)
             trial.set_user_attr("mdd", mdd)
             trial.set_user_attr("sharpe", sharpe)
             trial.set_user_attr("turnover", turnover)
-            trial.set_user_attr("win_rate", float(metrics["Win Rate"].replace("%", "")))
-            trial.set_user_attr("sortino", float(metrics["Sortino Ratio"]))
-            trial.set_user_attr("pl_ratio", float(metrics["P/L Ratio"]))
+            trial.set_user_attr("win_rate", win_rate)
+            trial.set_user_attr("trades", total_trades)
             
             return score
             
@@ -149,31 +179,19 @@ class YetiRankOptimizer:
 
     def run_optimization(self, n_trials: int = 50, study_name: Optional[str] = None, resume: bool = False, n_jobs: int = 1):
         if study_name is None:
-            study_name = "yetirank_unified_opt"
+            study_name = f"yetirank_{self.mode.lower()}_opt"
             
-        logger.info(f"🚀 Starting Optuna Optimization | Trials: {n_trials} | Resume: {resume} | Jobs: {n_jobs}")
+        logger.info(f"🚀 Starting Optimization [{self.mode}] | Trials: {n_trials} | Resume: {resume} | Jobs: {n_jobs}")
         
-        # DB 저장소 설정
-        db_path = PROJECT_ROOT / "results" / "optimization.db"
+        db_path = PROJECT_ROOT / "results" / f"optimization_{self.mode.lower()}.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # [RESET] 새로 시작 옵션이면 기존 DB 삭제
         if not resume and db_path.exists():
-            logger.warning(f"⚠️ Deleting existing study DB: {db_path}")
             try:
                 db_path.unlink()
-            except PermissionError:
-                logger.error("❌ Cannot delete DB file. It might be in use.")
+                logger.warning(f"⚠️ Dleted existing DB: {db_path}")
+            except: pass
 
-        # [PERFORMANCE] SQLite WAL 모드 활성화 (병목 해소)
-        import sqlite3
-        try:
-            with sqlite3.connect(str(db_path)) as conn:
-                conn.execute("PRAGMA journal_mode=WAL;")
-                conn.execute("PRAGMA synchronous=NORMAL;") 
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to enable WAL mode: {e}")
-                
         storage_name = f"sqlite:///{db_path}"
         
         study = optuna.create_study(
@@ -182,63 +200,50 @@ class YetiRankOptimizer:
             load_if_exists=True,
             direction="maximize"
         )
-        # Multiprocessing: n_jobs > 1
+        
         study.optimize(self.objective, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=True)
         
         logger.info("✅ Optimization Complete!")
         
-        # 결과 요약
+        # Result Summary
         best_trial = study.best_trial
         print("\n" + "="*50)
-        print("🏆 BEST STRATEGY PARAMETERS (UNIFIED)")
+        print(f"🏆 BEST STRATEGY PARAMETERS ({self.mode})")
         print("="*50)
         for key, value in best_trial.params.items():
-            print(f"- {key:<20}: {value}")
+            print(f"- {key:<25}: {value}")
         print("-" * 50)
-        print(f"- Best Score         : {best_trial.value:.4f}")
-        print(f"- Result CAGR        : {best_trial.user_attrs.get('cagr', 0.0):.2f}%")
-        print(f"- Result MDD         : -{best_trial.user_attrs.get('mdd', 0.0):.2f}%")
+        
+        attrs = best_trial.user_attrs
+        print(f"- Score              : {best_trial.value:.4f}")
+        print(f"- CAGR               : {attrs.get('cagr', 0.0):.2f}%")
+        print(f"- MDD                : -{attrs.get('mdd', 0.0):.2f}%")
+        print(f"- Sharpe             : {attrs.get('sharpe', 0.0):.4f}")
         print("="*50 + "\n")
         
-        # 최적 파라미터로 최종 백테스트 수행 및 리포트 저장
-        print("📊 Running final backtest with best parameters...")
+        # Final Backtest with Best Params
+        print("📊 Running final backtest...")
+        best_params = {k.lower(): v for k, v in best_trial.params.items()}
         
-        # [MAPPING] Categorical parameters를 Backtester가 이해하는 Boolean flags로 변환
-        p = best_trial.params
-        final_params = {k: v for k, v in p.items() if not k.endswith('_filter')}
-        
-        # Momentum
-        m_choice = p.get('momentum_filter', 'None')
-        final_params['use_rsi_filter'] = (m_choice == 'RSI')
-        final_params['use_mfi_filter'] = (m_choice == 'MFI')
-        
-        # Trend
-        t_choice = p.get('trend_filter', 'None')
-        final_params['use_ma_filter'] = (t_choice == 'MA')
-        final_params['use_adx_filter'] = (t_choice == 'ADX')
-        final_params['use_ichimoku_filter'] = (t_choice == 'Ichimoku')
-        
-        # Volatility
-        v_choice = p.get('volatility_filter', 'None')
-        final_params['use_bollinger_filter'] = (v_choice == 'Bollinger')
-        
-        # Volume
-        vol_choice = p.get('volume_filter', 'None')
-        final_params['use_volume_filter'] = (vol_choice == 'Volume')
-        
-        self.backtester.run_backtest(
-            **final_params,
-            save_plot=True
-        )
+        self.backtester.run_backtest(save_plot=True, **best_params)
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="YetiRank Strategy Optimizer")
     parser.add_argument("--trials", type=int, default=300, help="Number of trials")
-    parser.add_argument("--resume", action="store_true", help="Resume existing study (don't delete DB)")
-    parser.add_argument("--n_jobs", type=int, default=2, help="Number of parallel jobs (default: 2)")
+    parser.add_argument("--resume", action="store_true", help="Resume existing study")
+    parser.add_argument("--n_jobs", type=int, default=4, help="Parallel jobs")
+    parser.add_argument("--mode", type=str, default="UNIFIED", choices=["UNIFIED", "ACTIVE", "SWING", "TREND"], help="Optimization Mode")
+    parser.add_argument("--check", action="store_true", help="Check indicator health and exit")
+    parser.add_argument("--start", type=str, default="20210101", help="Start Date (YYYYMMDD)")
+    parser.add_argument("--end", type=str, default="20241231", help="End Date (YYYYMMDD)")
     
     args = parser.parse_args()
     
-    optimizer = YetiRankOptimizer()
+    optimizer = YetiRankOptimizer(mode=args.mode, start_date=args.start, end_date=args.end)
+    
+    if args.check:
+        optimizer.check_indicators()
+        sys.exit(0)
+        
     optimizer.run_optimization(n_trials=args.trials, resume=args.resume, n_jobs=args.n_jobs)
