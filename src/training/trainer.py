@@ -121,22 +121,73 @@ class YetiRankTrainer:
             fi_path = self.output_dir / f"feature_importance_{year}.csv"
             fi_df.to_csv(fi_path, index=False)
             
+            # [New] Advanced Quality Evaluation
+            preds = model.predict(test_pool)
+            quality_metrics = self._evaluate_prediction_quality(year, test_df, preds, feature_names)
+
             self.results.append({
                 "year": year,
                 "ndcg_20": final_ndcg,
+                "rank_ic": quality_metrics["rank_ic"],
+                "ic_ir": quality_metrics["ic_ir"],
                 "best_iteration": model.get_best_iteration()
             })
             
         # 4. Final Summary
         summary_df = pd.DataFrame(self.results)
-        print("\n" + "="*40)
+        print("\n" + "="*60)
         print("🏆 Walk-Forward Evaluation Summary")
-        print("="*40)
+        print("="*60)
         print(summary_df)
-        print("="*40 + "\n")
+        print("="*60 + "\n")
         summary_df.to_csv(self.output_dir / "evaluation_summary.csv", index=False)
         
         return summary_df
+
+    def _evaluate_prediction_quality(self, year: int, df: pl.DataFrame, preds: np.ndarray, feature_names: List[str]):
+        """모델의 예측 품질을 다각도로 분석 (Rank IC, Decile Analysis)"""
+        
+        # 분석을 위한 데이터프레임 구성
+        eval_df = df.select(["date", "ticker", "target_rank", "target_return_5d"]).with_columns([
+            pl.Series("pred_score", preds)
+        ]).to_pandas()
+        
+        # 1. Rank IC (Information Coefficient) 계산
+        # 날짜별로 (예측 점수, 실제 랭킹) 간의 스피어만 상관계수 계산
+        ric_list = []
+        for date, group in eval_df.groupby("date"):
+            if len(group) < 10: continue
+            corr, _ = spearmanr(group["pred_score"], group["target_rank"])
+            ric_list.append(corr)
+        
+        avg_rank_ic = np.mean(ric_list)
+        ic_ir = avg_rank_ic / np.std(ric_list) if np.std(ric_list) > 0 else 0
+        
+        # 2. Decile Analysis (분위수 분석)
+        # 예측 점수 기준 10개 그룹으로 분할
+        eval_df["decile"] = eval_df.groupby("date")["pred_score"].transform(
+            lambda x: pd.qcut(x, 10, labels=False, duplicates='drop')
+        )
+        
+        # 그룹별 실제 수익률(5d) 평균 계산 (10이 가장 높은 순위 그룹이 되도록 역전)
+        decile_ret = eval_df.groupby("decile")["target_return_5d"].mean()
+        
+        # 시각화 데이터 생성
+        plt.figure(figsize=(10, 6))
+        decile_ret.plot(kind='bar', color='skyblue')
+        plt.title(f"Decile Analysis ({year}) - Mean 5D Return by Score Group")
+        plt.xlabel("Decile (0=Lowest, 9=Highest Prediction)")
+        plt.ylabel("Avg 5D Log Return")
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        plt.savefig(self.output_dir / f"decile_analysis_{year}.png")
+        plt.close()
+        
+        logger.info(f"📊 [{year} Quality] Rank IC: {avg_rank_ic:.4f} | IC IR: {ic_ir:.4f}")
+        
+        return {
+            "rank_ic": avg_rank_ic,
+            "ic_ir": ic_ir
+        }
 
 if __name__ == "__main__":
     import argparse
