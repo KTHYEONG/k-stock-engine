@@ -68,13 +68,18 @@ class YetiRankTrainer:
         # 3. Walk-Forward Training & Testing (Phase 2)
         logger.info(f">>> Starting Phase 2: Walk-Forward Training {test_years}")
         
-        # 고정 파라미터 (손실 함수 등)
+        # 고정 파라미터 (한정된 데이터셋 최적화: 꼼꼼한 학습 전략)
         static_params = {
             "loss_function": "YetiRank",
             "eval_metric": "NDCG:top=20",
             "task_type": self.task_type,
             "devices": "0" if self.task_type == "GPU" else None,
-            "bootstrap_type": "Bernoulli", # subsample 사용을 위해 필수
+            "bootstrap_type": "Bernoulli",
+            "iterations": 3000,           # 데이터가 적으므로 더 많이 반복해서 패턴 탐색
+            "early_stopping_rounds": 150, # 인내심 상향
+            "learning_rate": 0.03,        # 느리지만 정교하게 학습
+            "l2_leaf_reg": 5.0,           # 과적합 방지를 위한 규제 강화
+            "subsample": 0.7,             # 데이터의 무작위성을 부여하여 일반화 성능 향상
         }
         final_params = {**static_params, **best_params}
         
@@ -94,7 +99,6 @@ class YetiRankTrainer:
             model.fit(
                 train_pool,
                 eval_set=valid_pool,
-                early_stopping_rounds=50,
                 verbose=False
             )
             
@@ -149,6 +153,13 @@ class YetiRankTrainer:
     def _evaluate_prediction_quality(self, year: int, df: pl.DataFrame, preds: np.ndarray, feature_names: List[str]):
         """모델의 예측 품질을 다각도로 분석 (Rank IC, Decile Analysis)"""
         
+        # [BUG FIX] CatBoost Pool 생성 시와 동일하게 데이터를 정렬하여 예측값과 행을 맞춤
+        # date와 ticker로 정렬하여 순서 보장
+        if "group_id" in df.columns:
+            df = df.sort(["group_id", "ticker"])
+        else:
+            df = df.sort(["date", "ticker"])
+            
         # 분석을 위한 데이터프레임 구성
         eval_df = df.select(["date", "ticker", "target_rank", "target_return_5d"]).with_columns([
             pl.Series("pred_score", preds)
@@ -194,7 +205,7 @@ class YetiRankTrainer:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="YetiRank Model Trainer")
-    parser.add_argument("--trials", type=int, default=30, help="Number of hyperparameter tuning trials")
+    parser.add_argument("--trials", type=int, default=100, help="Number of hyperparameter tuning trials")
     parser.add_argument("--sample", type=float, default=1.0, help="Data sampling ratio (0.1 ~ 1.0)")
     parser.add_argument("--years", type=str, default="2024,2025", help="Comma separated test years")
     parser.add_argument("--start", type=str, default="20160401", help="Start date (YYYYMMDD)")
