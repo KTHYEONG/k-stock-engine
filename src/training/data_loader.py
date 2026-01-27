@@ -174,7 +174,8 @@ class YetiRankDataLoader:
     def create_pool(self, df: pl.DataFrame, feature_names: List[str]) -> Pool:
         """Polars DataFrame을 CatBoost Pool로 변환"""
         # [CRITICAL] CatBoost Ranking은 동일 group_id가 연속해서 나타나야 함 (정렬 필수)
-        df = df.sort("group_id")
+        # 또한 일관성을 위해 ticker 순으로 2차 정렬을 수행하여 순서 어긋남 방지
+        df = df.sort(["group_id", "ticker"])
         
         # 피처 데이터 추출
         X = df.select(feature_names).to_pandas() 
