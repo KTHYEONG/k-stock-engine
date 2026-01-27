@@ -48,11 +48,28 @@ def apply_quality_filter(df: pl.DataFrame) -> pl.DataFrame:
         logger.warning("Columns for Capital Erosion check not found. Skipped.")
         erosion_mask = pl.lit(True)
         
+    # 3. [Korean Market Special] Momentum Rescue Logic (재무 불량주 구제)
+    # 한국장 특성상 재무가 나빠도(자본잠식, 적자) 강력한 모멘텀/테마로 오르는 종목이 많음.
+    # 따라서 "재무 탈락"이더라도 "모멘텀 최상위"라면 살려줌.
+    
+    rescue_mask = pl.lit(False)
+    
+    # 구조 요청 1: 강력한 상대 추세 (relative_trend_score > 0.8)
+    if "relative_trend_score" in df.columns:
+        rescue_mask = rescue_mask | (pl.col("relative_trend_score") > 0.8)
+        
+    # 구조 요청 2: 폭발적인 거래량 (volume_ratio >= 3.0)
+    if "volume_ratio_20d" in df.columns:
+        rescue_mask = rescue_mask | (pl.col("volume_ratio_20d") >= 3.0)
+    
+    # 재무 필터를 통과했거나(AND) 혹은 구조대(Rescue)가 왔거나(OR)
+    final_mask = (pbr_mask & erosion_mask) | rescue_mask
+        
     # Apply Filters
-    df_filtered = df.filter(pbr_mask & erosion_mask)
+    df_filtered = df.filter(final_mask)
     
     filtered_count = initial_count - len(df_filtered)
     if filtered_count > 0:
-        logger.info(f"Quality Filter dropped {filtered_count} stocks.")
+        logger.info(f"Quality Filter dropped {filtered_count} stocks. (Rescued high momentum stocks)")
         
     return df_filtered
