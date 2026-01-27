@@ -7,6 +7,8 @@ import polars as pl
 from catboost import CatBoostRanker
 import matplotlib.pyplot as plt
 import pandas as pd
+import numpy as np
+from scipy.stats import spearmanr
 
 # 프로젝트 루트 경로 추가
 PROJECT_ROOT = Path(__file__).parent.parent.parent
