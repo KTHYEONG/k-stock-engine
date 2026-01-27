@@ -9,7 +9,7 @@ def apply_liquidity_filter(df: pl.DataFrame) -> pl.DataFrame:
     유동성 필터 (Liquidity Cut)
     
     1. 시가총액 Check:
-       - Market Cap < MIN_MARKET_CAP (예: 100억 ~ 1000억) 제외
+       - Market Cap < MIN_MARKET_CAP (500억 미만 제외)
        
     2. 거래회전율 (Turnover Ratio) Check:
        - Turnover > 50% 제외 (투기 과열)
