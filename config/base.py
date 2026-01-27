@@ -14,9 +14,9 @@ KRX_OPENAPI_KEY = os.getenv("KRX_OPENAPI_KEY", None)
 USE_KRX_OPENAPI = os.getenv("USE_KRX_OPENAPI", "True").lower() in ("true", "1", "yes")
 
 # Layer 1: Universe Filter Settings
-MIN_MARKET_CAP = 10_000_000_000  # 100억 (10B KRW)
+MIN_MARKET_CAP = 50_000_000_000  # 500억 (50B KRW) - 너무 작은 초소형주 제외
 MIN_TRADING_VALUE = 1_000_000_000  # 10억 (1B KRW) - 일 거래대금 최소값
-MAX_TURNOVER_RATIO = 0.5         # 50%
+MAX_TURNOVER_RATIO = 3.0         # 300% - 급등주/테마주 포용을 위해 대폭 완화
 PB_HARD_CUT = 0.1
 PB_WARNING_THRESHOLD = 0.3
 CAPITAL_EROSION_WARNING = 30     # 30%
