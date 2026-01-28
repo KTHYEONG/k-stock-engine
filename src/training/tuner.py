@@ -41,22 +41,27 @@ class YetiRankTuner:
     def objective(self, trial: optuna.Trial) -> float:
         params = {
             "loss_function": "YetiRank",
-            "eval_metric": "NDCG:top=20",
-            "iterations": 600,
+            "eval_metric": "NDCG:top=50",
+            "iterations": 2000,
             "od_type": "Iter",
-            "od_wait": 50,
+            "od_wait": 100,
             "task_type": self.task_type,
             "devices": "0" if self.task_type == "GPU" else None,
             "allow_writing_files": False,
             "use_best_model": True,
             "logging_level": "Silent",
             "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.1, log=True),
-            "depth": trial.suggest_int("depth", 4, 8),
+            "depth": trial.suggest_int("depth", 4, 10),
             "l2_leaf_reg": trial.suggest_int("l2_leaf_reg", 1, 30),
             "random_strength": trial.suggest_float("random_strength", 1e-9, 10.0, log=True),
             "bootstrap_type": "Bernoulli",
-            "subsample": trial.suggest_float("subsample", 0.6, 1.0)
+            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 1, 100)
         }
+        
+        # [FIX] colsample_bylevel (rsm) is not supported on GPU for YetiRank
+        if self.task_type == "CPU":
+            params["colsample_bylevel"] = trial.suggest_float("colsample_bylevel", 0.5, 1.0)
         
         model = CatBoostRanker(**params)
         
