@@ -15,6 +15,7 @@ from src.evaluation.backtester import YetiRankBacktester
 from src.evaluation.walk_forward import StockWalkForwardAnalyzer
 from src.evaluation.monte_carlo import StockMonteCarloSimulator
 from src.utils.logger import setup_logger
+import numpy as np
 
 logger = setup_logger("evaluation.verifier")
 
@@ -26,11 +27,13 @@ class YetiRankVerifier:
     - Monte Carlo Simulation
     """
     
-    def __init__(self, mode: str = "UNIFIED", start_date: str = "20240101", end_date: str = "20251231", model_year: Optional[int] = 2023):
+    def __init__(self, mode: str = "UNIFIED", start_date: str = "20250101", end_date: str = "20251231", 
+                 model_year: Optional[int] = None, sizing_mode: str = 'EQUAL'):
         self.mode = mode
         self.start_date = start_date
         self.end_date = end_date
         self.model_year = model_year
+        self.sizing_mode = sizing_mode
         self.backtester = YetiRankBacktester(start_date=start_date, end_date=end_date, model_year=model_year)
         
     def load_best_params(self) -> Dict[str, Any]:
@@ -67,7 +70,7 @@ class YetiRankVerifier:
 
         # Prepare Params (lowercase keys for backtester)
         run_params = {k.lower(): v for k, v in best_params.items()}
-        print(f"\n🔎 Testing with Best Parameters:")
+        print(f"\n🔎 Testing with Best Parameters (Sizing: {self.sizing_mode}):")
         print(run_params)
         
         # 2. Run Backtest
@@ -75,6 +78,7 @@ class YetiRankVerifier:
         metrics, daily_df, trade_records = self.backtester.run_backtest(
             save_plot=False, 
             return_details=True, 
+            sizing_mode=self.sizing_mode,
             **run_params
         )
         
@@ -103,22 +107,65 @@ class YetiRankVerifier:
         else:
             print("⚠️ Not enough data for WFA.")
 
-        # 4. Monte Carlo Simulation (Robustness)
+        # 4. Monte Carlo Simulation (Unified Portfolio-Based)
         print(f"\n🎲 Running Monte Carlo Simulation ({n_mc_sims} runs)...")
-        if trade_records:
-            mc = StockMonteCarloSimulator(trade_records)
-            mc_res = mc.run(n_simulations=n_mc_sims)
+        
+        if not daily_df.is_empty():
+            # [MODIFIED] 전체 타임라인 재조합 (0% 포함, 현실적/보수적 분석)
+            daily_rets = daily_df["net_return"].to_numpy()
             
-            print(f"{'='*50}")
-            print(f"MONTE CARLO SIMULATION RESULT (95% Confidence)")
-            print(f"{'='*50}")
-            print(f"Probability of Profit : {mc_res['prob_profit']:.2f}%")
-            print(f"Expected Return       : {mc_res['mean_return_pct']:.2f}% (Median: {mc_res['median_return_pct']:.2f}%)")
-            print(f"Worst Case MDD (5%)   : {mc_res['worst_case_mdd']:.2f}%")
-            print(f"Return Range (95%)    : {mc_res['lower_bound_95']:.2f}% ~ {mc_res['upper_bound_95']:.2f}%")
-            print("="*50)
+            if len(daily_rets) < 10:
+                print("⚠️ Not enough daily data points for Monte Carlo.")
+            else:
+                final_cum_rets = []
+                sim_mdds = []
+                ruin_count = 0
+                
+                # Vectorized Simulation Loop (Efficient)
+                for _ in range(n_mc_sims):
+                    # 1. Resample Daily Returns (Bootstrap)
+                    sim_daily = np.random.choice(daily_rets, size=len(daily_rets), replace=True)
+                    
+                    # 2. Compound Returns
+                    equity_curve = np.cumprod(1 + sim_daily)
+                    
+                    # 3. Final Return
+                    total_ret_pct = (equity_curve[-1] - 1) * 100
+                    final_cum_rets.append(total_ret_pct)
+                    
+                    # 4. MDD Calculation
+                    peak = np.maximum.accumulate(equity_curve)
+                    dd = (equity_curve - peak) / np.maximum(peak, 1e-6) * 100
+                    min_dd = np.min(dd)
+                    sim_mdds.append(min_dd)
+                    
+                    if min_dd <= -50.0: ruin_count += 1
+
+                # Statistics
+                final_cum_rets = np.array(final_cum_rets)
+                sim_mdds = np.array(sim_mdds)
+                
+                prob_profit = np.mean(final_cum_rets > 0) * 100
+                mean_ret = np.mean(final_cum_rets)
+                median_ret = np.median(final_cum_rets)
+                ruin_prob = (ruin_count / n_mc_sims) * 100
+                worst_mdd_5pct = np.percentile(sim_mdds, 5) # 하위 5% MDD (보수적)
+                
+                lower_95 = np.percentile(final_cum_rets, 2.5)
+                upper_95 = np.percentile(final_cum_rets, 97.5)
+
+                print(f"{'='*50}")
+                print(f"MONTE CARLO SIMULATION RESULT (95% Confidence)")
+                print(f"Mode: Full Timeline (Includes 0% returns)")
+                print(f"{'='*50}")
+                print(f"Ruining Prob (>50% DD) : {ruin_prob:.2f}%")
+                print(f"Probability of Profit : {prob_profit:.2f}%")
+                print(f"Expected Return       : {mean_ret:.2f}% (Median: {median_ret:.2f}%)")
+                print(f"Worst Case MDD (5%)   : {worst_mdd_5pct:.2f}%")
+                print(f"Return Range (95%)    : {lower_95:.2f}% ~ {upper_95:.2f}%")
+                print("="*50)
         else:
-            print("⚠️ No trades generated. Skipping Monte Carlo.")
+            print("⚠️ No data available for Monte Carlo.")
 
 if __name__ == "__main__":
     import argparse
@@ -127,9 +174,10 @@ if __name__ == "__main__":
     parser.add_argument("--start", type=str, default="20250101", help="Start Date")
     parser.add_argument("--end", type=str, default="20251231", help="End Date")
     parser.add_argument("--splits", type=int, default=5, help="WFA Splits")
-    parser.add_argument("--model_year", type=int, default=2023, help="Fixed model year to use")
+    parser.add_argument("--model_year", type=int, default=2025, help="Fixed model year to use")
+    parser.add_argument("--sizing", type=str, default="CONFIDENCE", choices=["EQUAL", "CONFIDENCE", "RISK", "HYBRID"], help="Position Sizing Mode")
     
     args = parser.parse_args()
     
-    verifier = YetiRankVerifier(mode=args.mode, start_date=args.start, end_date=args.end, model_year=args.model_year)
+    verifier = YetiRankVerifier(mode=args.mode, start_date=args.start, end_date=args.end, model_year=args.model_year, sizing_mode=args.sizing)
     verifier.run_verification(n_wfa_splits=args.splits)
