@@ -71,7 +71,7 @@ class YetiRankTrainer:
         # 고정 파라미터 (한정된 데이터셋 최적화: 꼼꼼한 학습 전략)
         static_params = {
             "loss_function": "YetiRank",
-            "eval_metric": "NDCG:top=20",
+            "eval_metric": "NDCG:top=50",
             "task_type": self.task_type,
             "devices": "0" if self.task_type == "GPU" else None,
             "bootstrap_type": "Bernoulli",
@@ -80,7 +80,12 @@ class YetiRankTrainer:
             "learning_rate": 0.03,        # 느리지만 정교하게 학습
             "l2_leaf_reg": 5.0,           # 과적합 방지를 위한 규제 강화
             "subsample": 0.7,             # 데이터의 무작위성을 부여하여 일반화 성능 향상
+            "min_data_in_leaf": 50,       # 리프 노드 최소 데이터 수 (노이즈 방어)
         }
+        
+        # [FIX] colsample_bylevel (rsm) is not supported on GPU for YetiRank
+        if self.task_type == "CPU":
+            static_params["colsample_bylevel"] = 0.8
         final_params = {**static_params, **best_params}
         
         for year in test_years:
@@ -88,6 +93,21 @@ class YetiRankTrainer:
             
             # Split Data (Expanding Window)
             train_df, valid_df, test_df = self.loader.walk_forward_split(full_df, test_year=year)
+            
+            # [NEW] Apply Time-Decay Sample Weighting (Recency Bias)
+            # 최근 데이터일수록 가중치를 높여(0.5 ~ 1.0) 시장 변화(Regime Shift)에 적응
+            max_date = train_df["date"].max()
+            min_date = train_df["date"].min()
+            
+            if max_date > min_date:
+                # Polars Date Difference -> Normalize -> Rescale
+                train_df = train_df.with_columns(
+                    (
+                        0.5 + 0.5 * (pl.col("date") - pl.lit(min_date)).dt.total_days() / 
+                        (pl.lit(max_date) - pl.lit(min_date)).dt.total_days()
+                    ).cast(pl.Float32).alias("sample_weight")
+                )
+                logger.info(f"⚖️ Applied Time-Decay Weights: 0.5 ~ 1.0 (Train Size: {len(train_df)})")
             
             # Create Pools
             train_pool = self.loader.create_pool(train_df, feature_names)
@@ -99,6 +119,7 @@ class YetiRankTrainer:
             model.fit(
                 train_pool,
                 eval_set=valid_pool,
+                use_best_model=True,
                 verbose=False
             )
             
@@ -108,12 +129,12 @@ class YetiRankTrainer:
             self.models[year] = model
             
             # Evaluate on Test Set (Robust Key Detection)
-            metrics = model.eval_metrics(test_pool, ["NDCG:top=20"])
+            metrics = model.eval_metrics(test_pool, ["NDCG:top=50"])
             metric_key = next((m for m in metrics.keys() if "NDCG" in m), None)
             
             if metric_key:
                 final_ndcg = metrics[metric_key][-1]
-                logger.info(f"✅ Year {year} Completed. Test NDCG@20: {final_ndcg:.4f} (Best Iter: {model.get_best_iteration()})")
+                logger.info(f"✅ Year {year} Completed. Test NDCG@50: {final_ndcg:.4f} (Best Iter: {model.get_best_iteration()})")
             else:
                 final_ndcg = 0.0
                 logger.warning(f"⚠️ Year {year} NDCG key not found in {list(metrics.keys())}")
@@ -133,7 +154,7 @@ class YetiRankTrainer:
 
             self.results.append({
                 "year": year,
-                "ndcg_20": final_ndcg,
+                "ndcg_50": final_ndcg,
                 "rank_ic": quality_metrics["rank_ic"],
                 "ic_ir": quality_metrics["ic_ir"],
                 "best_iteration": model.get_best_iteration()
@@ -151,49 +172,53 @@ class YetiRankTrainer:
         return summary_df
 
     def _evaluate_prediction_quality(self, year: int, df: pl.DataFrame, preds: np.ndarray, feature_names: List[str]):
-        """모델의 예측 품질을 다각도로 분석 (Rank IC, Decile Analysis)"""
+        """모델의 예측 품질을 다각도로 분석 (Rank IC, Decile Analysis) - Polars 기반 고속 연산"""
         
-        # [BUG FIX] CatBoost Pool 생성 시와 동일하게 데이터를 정렬하여 예측값과 행을 맞춤
-        # date와 ticker로 정렬하여 순서 보장
-        if "group_id" in df.columns:
-            df = df.sort(["group_id", "ticker"])
-        else:
-            df = df.sort(["date", "ticker"])
-            
-        # 분석을 위한 데이터프레임 구성
-        eval_df = df.select(["date", "ticker", "target_rank", "target_return_5d"]).with_columns([
+        # 순서 보장을 위한 정렬 (create_pool과 동일 로직) 및 예측값 결합
+        eval_df = df.sort(["group_id", "ticker"]).with_columns(
             pl.Series("pred_score", preds)
-        ]).to_pandas()
-        
-        # 1. Rank IC (Information Coefficient) 계산
-        # 날짜별로 (예측 점수, 실제 랭킹) 간의 스피어만 상관계수 계산
-        ric_list = []
-        for date, group in eval_df.groupby("date"):
-            if len(group) < 10: continue
-            corr, _ = spearmanr(group["pred_score"], group["target_rank"])
-            ric_list.append(corr)
-        
-        avg_rank_ic = np.mean(ric_list)
-        ic_ir = avg_rank_ic / np.std(ric_list) if np.std(ric_list) > 0 else 0
-        
-        # 2. Decile Analysis (분위수 분석)
-        # 예측 점수 기준 10개 그룹으로 분할
-        eval_df["decile"] = eval_df.groupby("date")["pred_score"].transform(
-            lambda x: pd.qcut(x, 10, labels=False, duplicates='drop')
         )
         
-        # 그룹별 실제 수익률(5d) 평균 계산 (10이 가장 높은 순위 그룹이 되도록 역전)
-        decile_ret = eval_df.groupby("decile")["target_return_5d"].mean()
+        # 1. Rank IC (Information Coefficient) - Polars Vectorized
+        # 날짜별 Spearman Correlation 계산
+        ic_results = (
+            eval_df
+            .group_by("date")
+            .agg(
+                pl.corr("pred_score", "target_rank", method="spearman").alias("rank_ic")
+            )
+            .drop_nulls()
+        )
         
-        # 시각화 데이터 생성
-        plt.figure(figsize=(10, 6))
-        decile_ret.plot(kind='bar', color='skyblue')
-        plt.title(f"Decile Analysis ({year}) - Mean 5D Return by Score Group")
-        plt.xlabel("Decile (0=Lowest, 9=Highest Prediction)")
-        plt.ylabel("Avg 5D Log Return")
-        plt.grid(axis='y', linestyle='--', alpha=0.7)
-        plt.savefig(self.output_dir / f"decile_analysis_{year}.png")
-        plt.close()
+        avg_rank_ic = ic_results["rank_ic"].mean() or 0.0
+        ic_ir = avg_rank_ic / ic_results["rank_ic"].std() if ic_results["rank_ic"].std() > 0 else 0
+        
+        # 2. Decile Analysis (분위수 분석) - Polars 기반
+        # 분위수 계산 (0~9) - 예측 점수가 높을수록 높은 분위수 할당
+        decile_stats = (
+            eval_df
+            .with_columns(
+                (pl.col("pred_score").rank("ordinal").over("date") / pl.len().over("date") * 9.99)
+                .cast(pl.Int32).alias("decile")
+            )
+            .group_by("decile")
+            .agg(pl.col("target_return_5d").mean().alias("avg_ret"))
+            .sort("decile")
+        )
+        
+        # 시각화 (Matplotlib는 데이터 양이 적은 집계 결과만 사용하므로 Pandas 변환)
+        plot_df = decile_stats.to_pandas()
+        try:
+            plt.figure(figsize=(10, 6))
+            plt.bar(plot_df["decile"], plot_df["avg_ret"], color='skyblue')
+            plt.title(f"Decile Analysis ({year}) - Mean 5D Return by Score Group")
+            plt.xlabel("Decile (0=Lowest, 9=Highest Prediction)")
+            plt.ylabel("Avg 5D Log Return")
+            plt.grid(axis='y', linestyle='--', alpha=0.7)
+            plt.savefig(self.output_dir / f"decile_analysis_{year}.png")
+            plt.close()
+        except Exception as e:
+            logger.warning(f"Failed to save decile plot: {e}")
         
         logger.info(f"📊 [{year} Quality] Rank IC: {avg_rank_ic:.4f} | IC IR: {ic_ir:.4f}")
         
@@ -208,7 +233,7 @@ if __name__ == "__main__":
     parser.add_argument("--trials", type=int, default=100, help="Number of hyperparameter tuning trials")
     parser.add_argument("--sample", type=float, default=1.0, help="Data sampling ratio (0.1 ~ 1.0)")
     parser.add_argument("--years", type=str, default="2024,2025", help="Comma separated test years")
-    parser.add_argument("--start", type=str, default="20160401", help="Start date (YYYYMMDD)")
+    parser.add_argument("--start", type=str, default="20200101", help="Start date (YYYYMMDD) - Recent Regime Focus")
     
     args = parser.parse_args()
     
