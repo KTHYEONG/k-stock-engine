@@ -34,21 +34,23 @@ class FeatureStore:
         if "year" not in df.columns and "date" in df.columns:
             df = df.with_columns(pl.col("date").dt.year().cast(pl.Utf8).alias("year"))
 
-        # [CRITICAL FIX] 덮어쓰기 방지 및 중복 방지 전략
+        # [CRITICAL UPDATE] 연도별 폴더 밑에 일별 파일 직접 저장 (폴더 깊이 축소)
+        # 구조: base_path / year=2024 / 2024-01-28_data.parquet
         for (year, date), group in df.group_by(["year", "date"]):
             date_str = date.strftime("%Y-%m-%d") if hasattr(date, "strftime") else str(date)
-            partition_path = self.base_path / f"year={year}" / f"date={date_str}"
+            
+            # 파티션 경로: 연도까지만 폴더 생성
+            partition_path = self.base_path / f"year={year}"
             partition_path.mkdir(parents=True, exist_ok=True)
             
-            # 지수 데이터(KOSPI, KOSDAQ)만 있는 경우 고정 파일명을 사용하여 중복 생성 방지
-            is_index_only = group["ticker"].is_in(["KOSPI", "KOSDAQ"]).all()
-            
-            if is_index_only:
-                file_name = "indices.parquet"
+            # 파일명: 날짜_식별자.parquet
+            if group["ticker"].is_in(["KOSPI", "KOSDAQ"]).all():
+                 # 지수 데이터의 경우
+                file_name = f"{date_str}_indices.parquet"
             else:
-                # 사용자가 지정한 prefix (raw, feat 등)를 파일명 앞에 붙임
-                file_id = uuid.uuid4().hex[:8]
-                file_name = f"{prefix}_{file_id}.parquet"
+                # 일반 데이터 (UUID 제거하고 날짜 기반으로 명확하게 저장)
+                # 재실행 시 덮어쓰기가 가능하도록 고정된 이름 사용 권장
+                file_name = f"{date_str}_{prefix}.parquet"
             
             file_path = partition_path / file_name
             group.write_parquet(file_path, compression="snappy")
@@ -56,14 +58,16 @@ class FeatureStore:
     def get_existing_dates(self) -> list[str]:
         """폴더 구조를 기반으로 이미 수집된 날짜 목록을 빠르게 반환"""
         try:
-            # Recursive glob으로 모든 date= 파티션 폴더를 찾음
-            # 이 방식은 파일을 열지 않으므로 매우 빠름
+            # Recursive glob으로 모든 연도 폴더 내의 parquet 파일을 찾음
+            # 구조: year=2024/2024-01-28_etf.parquet
             existing_dates = []
-            for date_path in self.base_path.glob("year=*/date=*"):
-                # "date=2021-04-09" 형식에서 날짜 문자열 추출
-                date_str = date_path.name.split("=")[-1].replace("-", "")
-                if len(date_str) == 8:
-                    existing_dates.append(date_str)
+            for file_path in self.base_path.glob("year=*/*.parquet"):
+                # 파일명에서 날짜 추출 (예: 2024-01-28_data.parquet -> 20240128)
+                filename = file_path.name
+                # 앞의 10자리(YYYY-MM-DD) 추출
+                if len(filename) >= 10 and filename[4] == '-' and filename[7] == '-':
+                     date_str = filename[:10].replace("-", "")
+                     existing_dates.append(date_str)
             
             return sorted(list(set(existing_dates)))
         except Exception as e:
