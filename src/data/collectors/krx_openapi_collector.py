@@ -353,7 +353,18 @@ class KRXOpenAPICollector:
                 return pl.DataFrame()
             
             df = pd.DataFrame(records)
+            
+            # 컬럼명 매핑 (지수 데이터도 표준화)
+            column_mapping = {
+                "BAS_DD": "date",
+                "INDEX_TYPE": "ticker"
+            }
+            df = df.rename(columns=column_mapping)
+            
             pl_df = pl.from_pandas(df)
+            
+            # 타입 캐스팅 (date 변환 및 숫자형 변환 적용)
+            pl_df = self._cast_types(pl_df)
             
             logger.info(f"Collected {len(pl_df)} index records")
             return pl_df
