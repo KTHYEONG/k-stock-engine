@@ -1,5 +1,6 @@
 
 import polars as pl
+import pandas as pd
 import logging
 import asyncio
 from typing import Dict, List, Optional
@@ -49,76 +50,111 @@ class ETFManager:
     
     def __init__(self):
         self.collector = KRXOpenAPICollector()
+        # 데이터 저장소 초기화 (data/etf, data/index)
+        from src.data.feature_store import FeatureStore
+        self.etf_store = FeatureStore(base_path=Path("./data/etf_daily"))
+        self.index_store = FeatureStore(base_path=Path("./data/market_index"))
         
     async def collect_daily_data(self, date_str: str) -> Dict[str, pl.DataFrame]:
         """
-        특정 일자의 Target ETF 및 지수 데이터를 수집합니다.
+        특정 일자의 전체 ETF 및 지수 데이터를 수집합니다.
         
         Args:
             date_str: "YYYYMMDD"
             
         Returns:
             Dict containing:
-            - 'etf': Target ETF Dataframe
+            - 'etf': Full ETF Dataframe
             - 'index': Market Index Dataframe
         """
-        logger.info(f"Starting ETF & Index collection for {date_str}...")
-        
-        # 1. ETF 데이터 수집 (전체 수집 후 필터링)
+        # 1. ETF 데이터 수집 (전체 수집)
         full_etf_df = await self.collector.collect_etf_daily_trade(date_str)
         
-        target_etf_df = pl.DataFrame()
-        if not full_etf_df.is_empty():
-            # 타겟 티커 리스트 추출
-            target_tickers = []
-            for mkt in self.TARGET_ETFS.values():
-                target_tickers.extend(mkt.keys())
-            
-            # 필터링
-            target_etf_df = full_etf_df.filter(pl.col("ticker").is_in(target_tickers))
-            logger.info(f"Filtered {len(target_etf_df)} target ETFs from {len(full_etf_df)} total ETFs.")
-            
         # 2. 지수 데이터 수집 (KOSPI/KOSDAQ)
-        # collect_market_indices는 KOSPI, KOSDAQ 전체 지수 목록을 가져옴.
         index_df = await self.collector.collect_market_indices(date_str)
         
-        # [TODO] KOSPI 200, KOSDAQ 150 지수만 남기고 싶다면 여기서 필터링 로직 추가
-        # 현재는 전체 지수 데이터를 반환하여 저장하도록 함.
-        
         return {
-            "etf": target_etf_df,
+            "etf": full_etf_df,
             "index": index_df
         }
 
-    async def fetch_history(self, start_date: str, end_date: str) -> Dict[str, pl.DataFrame]:
+    async def fetch_history(self, start_date: str, end_date: str):
         """
-        기간별 데이터 수집 (유틸리티)
+        기간별 데이터 수집 및 저장 (Parquet)
         """
+        from tqdm import tqdm
+        
         # 날짜 생성
         dates = pd.date_range(start_date, end_date, freq='B') # Business days
         date_strs = [d.strftime("%Y%m%d") for d in dates]
         
-        all_etfs = []
-        all_indices = []
+        # 이미 수집된 날짜 스캔 (중복 방지)
+        collected_dates = self.etf_store.get_existing_dates()
+        target_dates = [d for d in date_strs if d not in collected_dates]
         
-        total = len(date_strs)
-        for i, date_str in enumerate(date_strs):
-            logger.info(f"[{i+1}/{total}] Fetching {date_str}...")
-            data = await self.collect_daily_data(date_str)
-            
-            if not data["etf"].is_empty():
-                all_etfs.append(data["etf"])
-            
-            if not data["index"].is_empty():
-                all_indices.append(data["index"])
-                
-            # API Rate Limit 준수를 위한 짧은 대기 (Collector 내부적으로 처리하지만 안전장치)
-            await asyncio.sleep(0.1)
-            
-        return {
-            "etf": pl.concat(all_etfs) if all_etfs else pl.DataFrame(),
-            "index": pl.concat(all_indices) if all_indices else pl.DataFrame()
-        }
+        logger.info(f"Total: {len(date_strs)} days | Collected: {len(collected_dates)} days | Target: {len(target_dates)} days")
+        
+        if not target_dates:
+            logger.info("All dates in range are already collected.")
+            return
+
+    async def fetch_history(self, start_date: str, end_date: str):
+        """
+        기간별 데이터 수집 및 저장 (Parquet) - 비동기 병렬 처리 적용 (속도 향상)
+        """
+        from tqdm import tqdm
+        
+        # 날짜 생성
+        dates = pd.date_range(start_date, end_date, freq='B') # Business days
+        date_strs = [d.strftime("%Y%m%d") for d in dates]
+        
+        # 이미 수집된 날짜 스캔 (중복 방지)
+        collected_dates = self.etf_store.get_existing_dates()
+        target_dates = [d for d in date_strs if d not in collected_dates]
+        
+        logger.info(f"Target: {len(target_dates)} days (Total: {len(date_strs)} / Collected: {len(collected_dates)})")
+        
+        if not target_dates:
+            logger.info("All dates already collected.")
+            return
+
+        # 동시 실행 제한 (API 안정성 고려: 3)
+        sem = asyncio.Semaphore(3)
+        pbar = tqdm(total=len(target_dates), desc="Fetching ETF History")
+        
+        async def process_date(date_str):
+            async with sem:
+                try:
+                    data = await self.collect_daily_data(date_str)
+                    
+                    # [개장 여부 확인] 
+                    if data["etf"].is_empty() or data["etf"]["close"].sum() == 0:
+                        pbar.update(1)
+                        return
+                    
+                    # ETF 저장
+                    self.etf_store.save_features(data["etf"])
+                        
+                    # Index 저장
+                    if not data["index"].is_empty():
+                        self.index_store.save_features(data["index"])
+                    
+                    pbar.update(1)
+                    
+                    # 429 에러 방지를 위한 미세 딜레이
+                    await asyncio.sleep(0.1) 
+                    
+                except Exception as e:
+                    # 에러 발생 시 로그만 남기고 진행 (전체 중단 방지)
+                    pbar.write(f"[Error] {date_str}: {e}")
+                    pbar.update(1)
+
+        # 병렬 태스크 실행
+        tasks = [process_date(d) for d in target_dates]
+        await asyncio.gather(*tasks)
+        
+        pbar.close()
+        logger.info("History fetch completed.")
 
 if __name__ == "__main__":
     import argparse
@@ -136,15 +172,15 @@ if __name__ == "__main__":
         
         if args.start and args.end:
             logger.info(f"Fetching history: {args.start} ~ {args.end}")
-            result = await manager.fetch_history(args.start, args.end)
+            await manager.fetch_history(args.start, args.end)
         else:
             logger.info(f"Fetching single date: {args.date}")
             result = await manager.collect_daily_data(args.date)
         
-        print("\n=== ETF Data ===")
-        print(result["etf"])
-        
-        print("\n=== Index Data ===")
-        print(result["index"])
+            print("\n=== ETF Data ===")
+            print(result["etf"])
+            
+            print("\n=== Index Data ===")
+            print(result["index"])
 
     asyncio.run(test_run())
