@@ -7,7 +7,7 @@ __pycache__/
 .agent/
 
 # data
-data/
+/data/
 
 # result
 results/
