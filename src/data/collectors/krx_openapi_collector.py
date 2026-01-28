@@ -32,6 +32,7 @@ class KRXOpenAPICollector:
         "BOND_INDEX": "idx/bon_dd_trd",
         "KOSPI_INFO": "sto/stk_isu_base_info",
         "KOSDAQ_INFO": "sto/ksq_isu_base_info",
+        "ETF_TRADE": "etp/etf_bydd_trd",
     }
     
     def __init__(self, api_key: Optional[str] = None):
@@ -208,6 +209,61 @@ class KRXOpenAPICollector:
             
         except Exception as e:
             logger.error(f"Trade data collection failed: {e}")
+            return pl.DataFrame()
+
+    async def collect_etf_daily_trade(self, date_str: str) -> pl.DataFrame:
+        """
+        ETF 일별 매매 데이터 수집 (Async)
+        ENDPOINT: etp/etf_bydd_trd
+        
+        Args:
+            date_str: "YYYYMMDD" 형식
+            
+        Returns:
+            pl.DataFrame: ETF 거래 데이터
+        """
+        logger.info(f"Collecting ETF daily trade for {date_str}")
+        
+        try:
+            params = {"basDd": date_str}
+            
+            # ETF 데이터 수집
+            etf_data = await self._make_request(self.ENDPOINTS["ETF_TRADE"], params)
+            records = etf_data.get("OutBlock_1", [])
+            
+            if not records:
+                logger.warning(f"No ETF trade data for {date_str}")
+                return pl.DataFrame()
+            
+            # Pandas로 변환
+            df = pd.DataFrame(records)
+            
+            # 컬럼 매핑 (ETF API 응답 -> 표준명)
+            # API 응답 필드는 주식과 유사하나 확인 필요. 통상적으로 ISU_CD, ISU_NM, TDD_CLSPRC 등 사용.
+            # ETF API 필드 추정: ISU_CD, ISU_NM, TDD_CLSPRC, ACC_TRDVOL, NAV, etc.
+            # 여기서는 주식과 공통된 필드 위주로 매핑하고 ETF 특화 필드(NAV 등)는 필요시 추가.
+            column_mapping = self._get_stock_trade_column_mapping()
+            # ETF 특화 컬럼 추가 매핑이 필요할 수 있음 (예: NAV -> nav)
+            # 현재는 기본 가격 정보 위주로 매핑.
+            
+            df = df.rename(columns=column_mapping)
+            
+            # Date 컬럼 추가
+            if "date" not in df.columns:
+                date_obj = datetime.strptime(date_str, "%Y%m%d")
+                df["date"] = date_obj
+            
+            # Polars로 변환
+            pl_df = pl.from_pandas(df)
+            
+            # 타입 캐스팅
+            pl_df = self._cast_types(pl_df)
+            
+            logger.info(f"Collected {len(pl_df)} ETFs for {date_str}")
+            return pl_df
+            
+        except Exception as e:
+            logger.error(f"Failed to collect ETF data for {date_str}: {e}")
             return pl.DataFrame()
 
     async def collect_stock_base_info(self, date_str: str, market: str = "ALL") -> pl.DataFrame:
