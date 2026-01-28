@@ -84,52 +84,46 @@ class YetiRankDataLoader:
         if dropped_rows > 0:
             logger.info(f"Dropped {dropped_rows} rows with null targets.")
             
-        # [CRITICAL] Look-ahead Bias 방지: 모든 Feature를 1일 뒤로 미룸 (Shift 1)
-        # 즉, T일의 예측에는 T-1일까지의 데이터만 사용하도록 강제함.
-        # 타겟(target_return_5d) 제외한 모든 기술적/수급 지표 Shift
+        # [CRITICAL UPDATE] 학습 데이터 퀄리티 강화 및 YetiRank 최적화
         
-        # 1. 사용할 피처 목록 미리 확보 (메타데이터 제외)
-        shift_cols = [c for c in df.columns if c not in self.exclude_cols and c not in ["ticker", "date", "year", "group_id"]]
+        # 1. Trading Value 생성 (만약 없다면) 및 Top 1000 필터링
+        # - 잡주(동전주)의 노이즈 제거
+        # - YetiRank GPU 제한(1023) 자동 준수
+        if "trading_value" not in df.columns:
+            if "close" in df.columns and "trading_volume" in df.columns:
+                df = df.with_columns((pl.col("close") * pl.col("trading_volume")).alias("trading_value"))
+            else:
+                df = df.with_columns(pl.lit(1.0).alias("trading_value")) # 거래대금 없으면 필터링 스킵
+
+        logger.info("Filtering Top 1000 stocks daily by Trading Value (High Quality Data Focus)...")
+        df = df.sort(["date", "trading_value"], descending=[False, True]) \
+               .with_columns(pl.int_range(0, pl.len()).over("date").alias("_daily_rank")) \
+               .filter(pl.col("_daily_rank") < 1000) \
+               .drop("_daily_rank")
+
+        # 2. Shift(1) 제거
+        # - 사유: T일 지표(RSI, MACD)로 T+5일 수익(Future)을 예측하는 것이므로, 
+        #   같은 날짜 행에 두는 것이 논리적으로 맞음. (X_t -> Y_t+5)
+        #   Shift를 하면 어제 지표(X_t-1)로 미래를 예측하게 되어 정보 지연 발생.
         
-        logger.info(f"Applying lag(1) to {len(shift_cols)} features to prevent leakage...")
-        df = df.with_columns([
-            pl.col(c).shift(1).over("ticker") for c in shift_cols
-        ])
-        
-        # 3. Create Group ID & Re-calculate Target Rank
-        # [FIX] 백테스트 수익률 역전 현상 방지를 위해 Target Rank를 직접 재계산
-        df = df.drop_nulls(subset=shift_cols) # Shift로 생긴 첫 행 결측 제거
-        # 수익률(target_return_5d)이 높을수록 높은 점수(Rank)를 부여해야 함.
-        # 여기서는 0~1 사이의 실수형 점수(Relevance Score)로 변환하여 정밀도 향상
+        # 3. Target Rank Decile 변환 (0~9 정수)
+        # - YetiRank는 명확한 등급 차이(Integer Relevance)가 있을 때 학습 안정성이 높음.
+        # - 실수(0.0~1.0)보다 Decile(0~9)이 구분이 확실함.
+        logger.info("Generatinng Decile Ranks (0~9) for YetiRank optimization...")
         
         df = df.with_columns([
             pl.col("date").rank("dense").alias("group_id"),
             
-            # 그룹별로 수익률 기반 랭크 생성 (오름차순 랭크 -> 수익률 높을수록 큰 값)
-            # rank("ordinal") 사용 시 동점자 없이 1, 2, 3... 순위 매김
-            pl.col("target_return_5d")
-              .rank("ordinal")
-              .over("date")
-              .alias("raw_rank"),
-              
-            # 그룹별 종목 수 계산
-            pl.count().over("date").alias("group_count")
+            # Decile Rank Calculation: (Ordinal Rank / Total Count) * 10 -> int
+            (pl.col("target_return_5d")
+             .rank("ordinal")
+             .over("date") / pl.len().over("date") * 9.99).cast(pl.Int32).alias("target_rank")
         ])
-        
-        # 0.0 ~ 1.0 범위로 정규화 (1.0 = 해당 날짜 1등, 0.0 = 꼴찌)
-        df = df.with_columns(
-            (pl.col("raw_rank") / pl.col("group_count")).alias("target_rank")
-        ).drop(["raw_rank", "group_count"])
-        
-        # 4. GPU 제약 사항 대응 (YetiRank GPU는 그룹당 최대 1023개 종목만 지원)
-        df = df.with_columns(
-            pl.int_range(0, pl.len()).over("group_id").alias("_row_idx")
-        ).filter(pl.col("_row_idx") < 1023).drop("_row_idx")
         
         # [DEBUG] Target Rank 검증 로그
         debug_corr = df.select(pl.corr("target_rank", "target_return_5d")).item()
         logger.info(f"Target Rank Check - Correlation with Return: {debug_corr:.4f} (Must be positive and high)")
-        logger.info(f"Sample Data:\n{df.select(['date', 'target_return_5d', 'target_rank']).head(5)}")
+        logger.info(f"Sample Data:\n{df.select(['date', 'target_return_5d', 'target_rank', 'trading_value']).head(5)}")
 
         logger.info(f"Data loaded successfully. Shape: {df.shape}, Groups: {df['group_id'].n_unique()}")
         return df
@@ -190,10 +184,16 @@ class YetiRankDataLoader:
                 # CatBoost 요구사항: 카테고리 피처는 반드시 문자열이어야 함
                 X[col] = X[col].astype(str)
 
+        # Check for weights
+        weights = None
+        if "sample_weight" in df.columns:
+            weights = df["sample_weight"].to_pandas()
+
         return Pool(
             data=X,
             label=y,
             group_id=groups,
+            weight=weights,
             cat_features=cat_features,
             feature_names=feature_names
         )
