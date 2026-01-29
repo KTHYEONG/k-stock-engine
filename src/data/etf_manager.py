@@ -30,17 +30,19 @@ class ETFManager:
     KOSPI 200, KOSDAQ 150 관련 ETF 및 지수 데이터를 수집합니다.
     """
     
-    # Target Universe Definitions
+    # Target Universe Definitions (User defined mapping - Step 219)
     TARGET_ETFS = {
         "KOSPI": {
-            "069500": "KODEX 200",               # 1X
-            "252670": "KODEX 200선물레버리지",      # 2X
-            "252710": "KODEX 200선물인버스2X"     # -2X
+            "069500": "KODEX 200",
+            "122630": "KODEX 레버리지",
+            "114800": "KODEX 인버스",
+            "252670": "KODEX 200선물인버스2X"
         },
         "KOSDAQ": {
-            "229200": "KODEX 코스닥150",          # 1X
-            "233740": "KODEX 코스닥150레버리지",    # 2X
-            "250780": "TIGER 코스닥150선물인버스"   # -1X
+            "229200": "KODEX 코스닥 150",
+            "233740": "KODEX 코스닥 150 레버리지",
+            "251340": "KODEX 코스닥 150선물인버스",
+            "252710": "TIGER 코스닥 150선물인버스2X"
         }
     }
     
@@ -49,23 +51,22 @@ class ETFManager:
     # 통상 KOSPI 200은 "102800" 등의 코드를 가질 수 있음.
     
     def __init__(self):
-        self.collector = KRXOpenAPICollector()
+        self._collector = None
         # 데이터 저장소 초기화 (data/etf, data/index)
         from src.data.feature_store import FeatureStore
         self.etf_store = FeatureStore(base_path=Path("./data/etf_daily"))
         self.index_store = FeatureStore(base_path=Path("./data/market_index"))
+
+    @property
+    def collector(self):
+        if self._collector is None:
+            from src.data.collectors.krx_openapi_collector import KRXOpenAPICollector
+            self._collector = KRXOpenAPICollector()
+        return self._collector
         
     async def collect_daily_data(self, date_str: str) -> Dict[str, pl.DataFrame]:
         """
         특정 일자의 전체 ETF 및 지수 데이터를 수집합니다.
-        
-        Args:
-            date_str: "YYYYMMDD"
-            
-        Returns:
-            Dict containing:
-            - 'etf': Full ETF Dataframe
-            - 'index': Market Index Dataframe
         """
         # 1. ETF 데이터 수집 (전체 수집)
         full_etf_df = await self.collector.collect_etf_daily_trade(date_str)
