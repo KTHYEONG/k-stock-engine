@@ -29,7 +29,7 @@ class YetiRankBacktester:
     - Confidence-based Softmax Allocation
     """
     
-    def __init__(self, start_date: str = "20240101", end_date: str = "20251231", model_year: Optional[int] = None):
+    def __init__(self, start_date: str = "20240101", end_date: str = "20251231", model_id: Optional[Union[int, str]] = None):
         self.loader = YetiRankDataLoader(start_date="20160401") 
         self.model_dir = PROJECT_ROOT / "models" / "yetirank"
         self.output_dir = PROJECT_ROOT / "results" / "backtest"
@@ -37,21 +37,26 @@ class YetiRankBacktester:
         
         self.start_date = start_date
         self.end_date = end_date
-        self.model_year = model_year 
+        self.model_id = model_id 
         
         self._cached_predictions = pl.DataFrame()
         self._date_indexed_rows = {}
         self._market_regime = {} 
         self._market_vol_map = {} 
 
-    def load_model(self, year: int) -> CatBoostRanker:
-        model_path = self.model_dir / f"yetirank_{year}.cbm"
+    def load_model(self, model_id: Union[int, str]) -> CatBoostRanker:
+        model_path = self.model_dir / f"yetirank_{model_id}.cbm"
         if not model_path.exists():
-            available_models = sorted(list(self.model_dir.glob("yetirank_*.cbm")))
-            if not available_models:
-                raise FileNotFoundError(f"No models found in {self.model_dir}")
-            model_path = available_models[-1]
-            logger.warning(f"Model for {year} not found. Using {model_path.name} instead.")
+            latest_path = self.model_dir / "yetirank_latest.cbm"
+            if latest_path.exists():
+                logger.warning(f"Model for {model_id} not found. Using {latest_path.name} instead.")
+                model_path = latest_path
+            else:
+                available_models = sorted(list(self.model_dir.glob("yetirank_*.cbm")))
+                if not available_models:
+                    raise FileNotFoundError(f"No models found in {self.model_dir}")
+                model_path = available_models[-1]
+                logger.warning(f"Model for {model_id} not found. Using {model_path.name} instead.")
         
         model = CatBoostRanker()
         model.load_model(str(model_path))
@@ -152,24 +157,29 @@ class YetiRankBacktester:
             (pl.col("date") <= pl.lit(self.end_date).str.to_date("%Y%m%d"))
         ).sort("date")
         
+        if "period" not in test_df.columns:
+            test_df = test_df.with_columns(
+                pl.format("{}Q{}", pl.col("date").dt.year(), pl.col("date").dt.quarter()).alias("period")
+            )
+            
         predictions = []
-        unique_years = sorted(test_df.select(pl.col("date").dt.year()).unique().to_series().to_list())
+        unique_periods = sorted(test_df.select("period").unique().to_series().to_list())
         
-        for year in unique_years:
-            year_data = test_df.filter(pl.col("date").dt.year() == year)
-            if year_data.is_empty(): continue
+        for period in unique_periods:
+            period_data = test_df.filter(pl.col("period") == period)
+            if period_data.is_empty(): continue
             try:
-                target_model_year = self.model_year if self.model_year is not None else year
-                model = self.load_model(target_model_year)
-                X = year_data.select(feature_names).to_pandas()
+                target_model_id = self.model_id if self.model_id is not None else period
+                model = self.load_model(target_model_id)
+                X = period_data.select(feature_names).to_pandas()
                 scores = model.predict(X)
                 
-                pred_df = year_data.select([
+                pred_df = period_data.select([
                     "date", "ticker", "open", "high", "low", "close", "atr_14", "next_open", "next_high", "next_low", "next_close", "daily_ret", "sector"
                 ]).with_columns(pl.Series("pred_score", scores))
                 predictions.append(pred_df)
             except Exception as e:
-                logger.error(f"Prediction failed for year {year}: {e}")
+                logger.error(f"Prediction failed for period {period}: {e}")
 
         pred_all = pl.concat(predictions).sort(["date", "pred_score"], descending=[False, True])
         self._cached_predictions = pred_all
@@ -350,16 +360,25 @@ class YetiRankBacktester:
 
 if __name__ == "__main__":
     import argparse
+    from datetime import datetime
+    import dateutil.relativedelta
+    
+    now = datetime.now()
+    one_year_ago = now - dateutil.relativedelta.relativedelta(years=1)
+    
+    default_start = one_year_ago.strftime("%Y%m%d")
+    default_end = now.strftime("%Y%m%d")
+
     parser = argparse.ArgumentParser(description="YetiRank Backtester Implementation")
-    parser.add_argument("--year", type=int, default=2025, help="Year to backtest (default: 2025)")
+    parser.add_argument("--start", type=str, default=default_start, help=f"Start date (default: {default_start})")
+    parser.add_argument("--end", type=str, default=default_end, help=f"End date (default: {default_end})")
+    parser.add_argument("--model_id", type=str, default=None, help="Force specific model ID (e.g. 2025Q1 or latest)")
     parser.add_argument("--top_k", type=int, default=20, help="Number of top stocks to hold (default: 20)")
     args = parser.parse_args()
 
-    # 입력된 연도에 맞춰 시작/종료일 및 모델 연도 설정
-    test_year: int = args.year
     bt = YetiRankBacktester(
-        start_date=f"{test_year}0102",
-        end_date=f"{test_year}1231",
-        model_year=test_year
+        start_date=args.start,
+        end_date=args.end,
+        model_id=args.model_id
     )
     bt.run_backtest(top_k=args.top_k)
