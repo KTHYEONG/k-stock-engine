@@ -2,9 +2,9 @@ from pathlib import Path
 import sys
 import json
 import logging
-import time
+import shutil
 from datetime import datetime, timezone
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Union
 import polars as pl
 from catboost import CatBoostRanker
 import matplotlib.pyplot as plt
@@ -53,7 +53,7 @@ class YetiRankTrainer:
         
     def train_and_evaluate(
         self,
-        test_years: List[int] = [2024, 2025],
+        test_periods: List[str] = ["2024Q1", "2024Q2"],
         n_trials: int = 180,
         sample_ratio: float = 1.0,
         run_diagnostics: bool = True,
@@ -66,12 +66,13 @@ class YetiRankTrainer:
         tuner_min_trials_per_seed: int = 50,
     ):
         # Ensure deterministic chronological workflow and clear run state.
-        if not test_years:
-            raise ValueError("test_years must not be empty.")
-        test_years = sorted({int(y) for y in test_years})
+        if not test_periods:
+            raise ValueError("test_periods must not be empty.")
+        test_periods = sorted({str(y) for y in test_periods})
         self.models = {}
         self.results = []
 
+        import time
         t0_total = time.perf_counter()
         # 1. Load Full Data
         t0 = time.perf_counter()
@@ -94,9 +95,9 @@ class YetiRankTrainer:
             phase2_embargo_days = min_required_embargo
         
         # 2. Hyperparameter Tuning (Phase 1)
-        # Always tune against the earliest test year to avoid temporal leakage.
-        tuning_target_year = min(test_years)
-        logger.info(f">>> Starting Phase 1: Hyperparameter Tuning (Target: Valid {tuning_target_year-1})")
+        # Always tune against the earliest test period to avoid temporal leakage.
+        tuning_target_year = test_periods[0]
+        logger.info(f">>> Starting Phase 1: Hyperparameter Tuning (Target: Valid before {tuning_target_year})")
         
         logger.info(
             f"   AWFO Tuning: {'ON' if awfo_tuning else 'OFF'} "
@@ -142,7 +143,7 @@ class YetiRankTrainer:
             logger.info(f"🧾 Saved tuning metadata: {self.output_dir / 'tuning_meta.json'}")
             
         # 3. Walk-Forward Training & Testing (Phase 2)
-        logger.info(f">>> Starting Phase 2: Walk-Forward Training {test_years}")
+        logger.info(f">>> Starting Phase 2: Walk-Forward Training {test_periods}")
         logger.info(f"   Phase 2 embargo_days: {phase2_embargo_days}")
         
         # 고정 파라미터 (13개 핵심 피처 최적화 세팅)
@@ -168,14 +169,16 @@ class YetiRankTrainer:
             static_params["colsample_bylevel"] = 0.8
         final_params = {**static_params, **best_params}
         
-        for year in test_years:
-            logger.info(f"⏳ Training Target Year: {year}...")
+        latest_model_path = None
+        
+        for period in test_periods:
+            logger.info(f"⏳ Training Target Period: {period}...")
             t0_year = time.perf_counter()
             
             # Split Data (Expanding Window)
             train_df, valid_df, test_df = self.loader.walk_forward_split(
                 full_df,
-                test_year=year,
+                test_year=period,
                 embargo_days=phase2_embargo_days,
             )
             
@@ -202,15 +205,19 @@ class YetiRankTrainer:
             )
             
             # Save Model
-            model_path = self.output_dir / f"yetirank_{year}.cbm"
+            model_path = self.output_dir / f"yetirank_{period}.cbm"
             model.save_model(str(model_path))
-            self.models[year] = model
+            self.models[period] = model
+            latest_model_path = model_path
             
-            # [CRITICAL FIX] 2026년과 같이 정답(Test) 데이터가 없는 경우 평가 스킵
+            # [CRITICAL UPDATE] Save latest copy for live trading bot
+            shutil.copy2(model_path, self.output_dir / "yetirank_latest.cbm")
+            
+            # [CRITICAL FIX] 2026Q1과 같이 정답(Test) 데이터가 없는 경우 평가 스킵
             if test_df.is_empty():
-                logger.info(f"✅ Year {year} Model saved without evaluation (No test data yet).")
+                logger.info(f"✅ Period {period} Model saved without evaluation (No test data yet).")
                 self.results.append({
-                    "year": year,
+                    "period": period,
                     "ndcg_50": 0.0,
                     "rank_ic": 0.0,
                     "ic_ir": 0.0,
@@ -224,10 +231,10 @@ class YetiRankTrainer:
             
             if metric_key:
                 final_ndcg = metrics[metric_key][-1]
-                logger.info(f"✅ Year {year} Completed. Test NDCG@20: {final_ndcg:.4f} (Best Iter: {model.get_best_iteration()})")
+                logger.info(f"✅ Period {period} Completed. Test NDCG@20: {final_ndcg:.4f} (Best Iter: {model.get_best_iteration()})")
             else:
                 final_ndcg = 0.0
-                logger.warning(f"⚠️ Year {year} NDCG key not found in {list(metrics.keys())}")
+                logger.warning(f"⚠️ Period {period} NDCG key not found in {list(metrics.keys())}")
             
             quality_metrics = {"rank_ic": 0.0, "ic_ir": 0.0}
             if run_diagnostics:
@@ -237,23 +244,23 @@ class YetiRankTrainer:
                     "importance": model.get_feature_importance(data=train_pool)
                 }).sort_values(by="importance", ascending=False)
                 
-                fi_path = self.output_dir / f"feature_importance_{year}.csv"
+                fi_path = self.output_dir / f"feature_importance_{period}.csv"
                 fi_df.to_csv(fi_path, index=False)
                 
                 # [New] Advanced Quality Evaluation
                 preds = model.predict(test_pool)
-                quality_metrics = self._evaluate_prediction_quality(year, test_df, preds, feature_names)
+                quality_metrics = self._evaluate_prediction_quality(period, test_df, preds, feature_names)
             else:
                 logger.info("⏩ Diagnostics disabled: skipping feature importance and decile/IC analysis.")
 
             self.results.append({
-                "year": year,
+                "period": period,
                 "ndcg_20": final_ndcg,
                 "rank_ic": quality_metrics["rank_ic"],
                 "ic_ir": quality_metrics["ic_ir"],
                 "best_iteration": model.get_best_iteration()
             })
-            logger.info(f"⏱️ Year {year} total elapsed: {time.perf_counter() - t0_year:.2f}s")
+            logger.info(f"⏱️ Period {period} total elapsed: {time.perf_counter() - t0_year:.2f}s")
             
         # 4. Final Summary
         summary_df = pd.DataFrame(self.results)
@@ -266,8 +273,8 @@ class YetiRankTrainer:
         awfo_profile = {
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "start_date": self.start_date,
-            "test_years": [int(y) for y in test_years],
-            "tuning_target_year": int(tuning_target_year),
+            "test_periods": test_periods,
+            "tuning_target_year": tuning_target_year,
             "awfo_tuning": bool(awfo_tuning),
             "awfo_folds": int(awfo_folds),
             "awfo_embargo_days": int(awfo_embargo_days),
@@ -275,7 +282,7 @@ class YetiRankTrainer:
             "phase2_embargo_days": int(phase2_embargo_days),
             "n_trials": int(n_trials),
             "sample_ratio": float(sample_ratio),
-            "model_files": [f"yetirank_{int(y)}.cbm" for y in test_years],
+            "model_files": [f"yetirank_{p}.cbm" for p in test_periods],
             "best_params_file": "best_params.json",
             "summary_file": "evaluation_summary.csv",
         }
@@ -286,7 +293,7 @@ class YetiRankTrainer:
         
         return summary_df
 
-    def _evaluate_prediction_quality(self, year: int, df: pl.DataFrame, preds: np.ndarray, feature_names: List[str]):
+    def _evaluate_prediction_quality(self, period: str, df: pl.DataFrame, preds: np.ndarray, feature_names: List[str]):
         """모델의 예측 품질을 다각도로 분석 (Rank IC, Decile Analysis) - Polars 기반 고속 연산"""
         
         # 순서 보장을 위한 정렬 (create_pool과 동일 로직) 및 예측값 결합
@@ -326,16 +333,16 @@ class YetiRankTrainer:
         try:
             plt.figure(figsize=(10, 6))
             plt.bar(plot_df["decile"], plot_df["avg_ret"], color='skyblue')
-            plt.title(f"Decile Analysis ({year}) - Mean 5D Return by Score Group")
+            plt.title(f"Decile Analysis ({period}) - Mean 5D Return by Score Group")
             plt.xlabel("Decile (0=Lowest, 9=Highest Prediction)")
             plt.ylabel("Avg 5D Log Return")
             plt.grid(axis='y', linestyle='--', alpha=0.7)
-            plt.savefig(self.output_dir / f"decile_analysis_{year}.png")
+            plt.savefig(self.output_dir / f"decile_analysis_{period}.png")
             plt.close()
         except Exception as e:
             logger.warning(f"Failed to save decile plot: {e}")
         
-        logger.info(f"📊 [{year} Quality] Rank IC: {avg_rank_ic:.4f} | IC IR: {ic_ir:.4f}")
+        logger.info(f"📊 [{period} Quality] Rank IC: {avg_rank_ic:.4f} | IC IR: {ic_ir:.4f}")
         
         return {
             "rank_ic": avg_rank_ic,
@@ -344,10 +351,16 @@ class YetiRankTrainer:
 
 if __name__ == "__main__":
     import argparse
+    from datetime import datetime
+    
+    # 현재 날짜 기준 동적 기본값 계산
+    now = datetime.now()
+    curr_period = f"{now.year}Q{(now.month-1)//3 + 1}"
+    
     parser = argparse.ArgumentParser(description="YetiRank Model Trainer")
     parser.add_argument("--trials", type=int, default=180, help="Number of hyperparameter tuning trials")
     parser.add_argument("--sample", type=float, default=1.0, help="Data sampling ratio (0.1 ~ 1.0)")
-    parser.add_argument("--years", type=str, default="2024,2025", help="Comma separated test years")
+    parser.add_argument("--periods", type=str, default=curr_period, help=f"Comma separated test periods (default: {curr_period})")
     parser.add_argument("--start", type=str, default="20180101", help="Start date (YYYYMMDD) - Practical 6~8y window default")
     parser.add_argument("--skip_diagnostics", action="store_true", help="Skip feature importance and decile/IC diagnostics for faster runtime")
     parser.add_argument("--phase2_embargo_days", type=int, default=6, help="Embargo days for Phase 2 walk-forward split")
@@ -360,11 +373,11 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    test_years = [int(y.strip()) for y in args.years.split(",")]
+    test_periods = [p.strip() for p in args.periods.split(",")]
     
     trainer = YetiRankTrainer(start_date=args.start)
     trainer.train_and_evaluate(
-        test_years=test_years, 
+        test_periods=test_periods, 
         n_trials=args.trials, 
         sample_ratio=args.sample,
         run_diagnostics=not args.skip_diagnostics,
