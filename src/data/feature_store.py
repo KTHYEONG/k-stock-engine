@@ -36,7 +36,7 @@ class FeatureStore:
         if "year" not in df.columns and "date" in df.columns:
             df = df.with_columns(pl.col("date").dt.year().cast(pl.Utf8).alias("year"))
 
-        # [CRITICAL UPDATE] 연도별 폴더 밑에 일별 파일 직접 저장 (폴더 깊이 축소)
+        # [RESTORE] 연도별 폴더 밑에 일별 파일 직접 저장 (사용자 요청 구조)
         # 구조: base_path / year=2024 / 2024-01-28_data.parquet
         for (year, date), group in df.group_by(["year", "date"]):
             date_str = date.strftime("%Y-%m-%d") if hasattr(date, "strftime") else str(date)
@@ -45,31 +45,26 @@ class FeatureStore:
             partition_path = self.base_path / f"year={year}"
             partition_path.mkdir(parents=True, exist_ok=True)
             
-            # 파일명: 날짜_식별자.parquet
+            # 파일명 결정: 날짜_접두사.parquet
             if group["ticker"].is_in(["KOSPI", "KOSDAQ"]).all():
-                 # 지수 데이터의 경우
                 file_name = f"{date_str}_indices.parquet"
             else:
-                # 일반 데이터 (UUID 제거하고 날짜 기반으로 명확하게 저장)
-                # 재실행 시 덮어쓰기가 가능하도록 고정된 이름 사용 권장
                 file_name = f"{date_str}_{prefix}.parquet"
             
             file_path = partition_path / file_name
             group.write_parquet(file_path, compression="snappy")
         
     def get_existing_dates(self) -> list[str]:
-        """폴더 구조를 기반으로 이미 수집된 날짜 목록을 빠르게 반환"""
+        """폴더 구조(year=YYYY/*.parquet)를 기반으로 수집된 날짜 목록 반환"""
         try:
-            # Recursive glob으로 모든 연도 폴더 내의 parquet 파일을 찾음
-            # 구조: year=2024/2024-01-28_etf.parquet
             existing_dates = []
+            # year=YYYY 폴더 내의 모든 parquet 파일을 검색
             for file_path in self.base_path.glob("year=*/*.parquet"):
-                # 파일명에서 날짜 추출 (예: 2024-01-28_data.parquet -> 20240128)
+                # 파일명(2024-01-28_raw.parquet)에서 날짜 부분 추출
                 filename = file_path.name
-                # 앞의 10자리(YYYY-MM-DD) 추출
                 if len(filename) >= 10 and filename[4] == '-' and filename[7] == '-':
-                     date_str = filename[:10].replace("-", "")
-                     existing_dates.append(date_str)
+                    date_str = filename[:10].replace("-", "")
+                    existing_dates.append(date_str)
             
             return sorted(list(set(existing_dates)))
         except Exception as e:

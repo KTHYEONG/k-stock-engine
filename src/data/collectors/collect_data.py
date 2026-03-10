@@ -78,10 +78,13 @@ async def main():
     logger.info("=" * 50)
 
     # 시작 전 지수 데이터 일괄 싱크 (MA120 등 과거 데이터를 위해 충분히 수집)
-    indices_df = await collector.sync_all_indices(count=3000)
-    if not indices_df.is_empty():
-        store.save_features(indices_df)
-        logger.info("[OK] Pre-sync: Indices updated.")
+    try:
+        indices_df = await collector.sync_all_indices(count=3000)
+        if not indices_df.is_empty():
+            store.save_features(indices_df)
+            logger.info("[OK] Pre-sync: Indices updated.")
+    except Exception as e:
+        logger.warning(f"[WARN] Pre-sync failed (skipping): {e}")
         
     sem = asyncio.Semaphore(3)  # 동시 실행할 날짜 수 (API 한도 고려하여 5 -> 3으로 하향)
     
