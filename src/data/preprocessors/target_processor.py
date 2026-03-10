@@ -5,8 +5,8 @@ class TargetProcessor(BaseProcessor):
     """
     타겟(Label) 생성 전처리기
     
-    Target: 
-    1. future_return_5d: ln(Close_t+5 / Close_t)
+    Target:
+    1. future_return_5d: ln(Open_t+1+h / Open_t+1)  (T signal -> T+1 open execution)
     2. target_rank: Percentile rank of future_return_5d in cross-section
     """
     
@@ -15,20 +15,21 @@ class TargetProcessor(BaseProcessor):
 
     def process(self, df: pl.LazyFrame) -> pl.LazyFrame:
         # 1. 미래 수익률 및 위험 조정 수익률 계산
-        # 단순히 많이 오르는 것보다, 변동성 대비 안정적으로 오르는 종목을 상위로 둡니다.
-        # volatility_20d는 TechProcessor에서 이미 계산되었다고 가정합니다.
-        
+        # [CRITICAL UPDATE] 백테스트와 동일한 실전 수익률 타겟 설정
+        # Signal(T) -> Entry(T+1 Open) -> Exit(T+5 Close) 
+        # 타겟 = ln(Close_t+5 / Open_t+1)
+        schema_cols = df.collect_schema().names()
+        if "open" not in schema_cols or "close" not in schema_cols:
+            raise ValueError(
+                "TargetProcessor requires 'open' and 'close' columns. "
+                "Regenerate source data with valid OHLC fields."
+            )
+
+        # T+5일 종가 / T+1일 시가 (5거래일 보유 수익률)
         df = df.sort(["ticker", "date"]).with_columns([
-            (pl.col("close").shift(-self.horizon).over("ticker") / pl.col("close").replace(0, None))
+            (pl.col("close").shift(-self.horizon).over("ticker") / pl.col("open").shift(-1).over("ticker").replace(0, None))
             .log()
-            .alias(f"raw_target_return")
-        ])
-        
-        # [MODIFIED] 소액 국내 투자자 맞춤형 타겟 (수익률 - 0.5 * 변동성)
-        # 변동성에 너무 민감하게 반응하여 수익 기회를 놓치는 것을 방지하되,
-        # 최소한의 리스크 관리(극심한 변동성 제거)는 유지합니다.
-        df = df.with_columns([
-            (pl.col("raw_target_return") - (0.5 * pl.col("volatility_20d").fill_null(0.0))).alias(f"target_return_{self.horizon}d")
+            .alias(f"target_return_{self.horizon}d")
         ])
         
         # 2. 크로스섹션(날짜별) 순위 변환 (Percentile)
@@ -38,8 +39,5 @@ class TargetProcessor(BaseProcessor):
             .over("date")
             .alias("target_rank")
         ])
-        
-        # 중간 계산 컬럼 제거
-        df = df.drop("raw_target_return")
         
         return df
