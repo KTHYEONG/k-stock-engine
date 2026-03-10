@@ -290,12 +290,36 @@ class YetiRankDataLoader:
             Train: Start ~ Valid Year - 1 (e.g., 2016 ~ 2022)
         """
         
-        # 형변환 안전장치
+        # 형변환 안전장치 및 분기(Period) 컬럼 추가
         if "year" not in df.columns:
              df = df.with_columns(pl.col("date").dt.year().cast(pl.Utf8).alias("year"))
+        if "period" not in df.columns:
+             df = df.with_columns(
+                 pl.format("{}Q{}", pl.col("date").dt.year(), pl.col("date").dt.quarter()).alias("period")
+             )
              
-        test_y = str(test_year)
-        valid_y = str(test_year - 1)
+        # 기존 test_year int 지원을 유지하되 test_year가 string YYYYQx 패턴이면 분기 모드로 동작
+        is_quarter = isinstance(test_year, str) and "Q" in test_year
+        
+        if is_quarter:
+            test_period = test_year
+            # Valid: Test 직전 4개 분기 (1년)
+            year_num, q_num = int(test_period[:4]), int(test_period[-1])
+            valid_end_period = f"{year_num if q_num > 1 else year_num - 1}Q{q_num - 1 if q_num > 1 else 4}"
+            valid_start_year = int(valid_end_period[:4]) - 1
+            valid_start_period = f"{valid_start_year}Q{valid_end_period[-1]}"
+            
+            test_df_base = df.filter(pl.col("period") == test_period)
+            valid_df_base = df.filter(
+                (pl.col("period") >= valid_start_period) & (pl.col("period") <= valid_end_period)
+            )
+            test_y = test_period
+            valid_y = f"{valid_start_period} ~ {valid_end_period}"
+        else:
+            test_y = str(test_year)
+            valid_y = str(test_year - 1)
+            test_df_base = df.filter(pl.col("year") == test_y)
+            valid_df_base = df.filter(pl.col("year") == valid_y)
         embargo_days = int(max(0, embargo_days))
         
         # Base sets
@@ -347,11 +371,20 @@ class YetiRankDataLoader:
 
         # Filter Sets with embargo-aware date bounds
         train_df = df.filter(pl.col("date") <= train_end_date)
-        valid_df = df.filter(
-            (pl.col("year") == valid_y)
-            & (pl.col("date") >= valid_start_date)
-            & (pl.col("date") <= valid_end_date)
-        )
+        
+        if is_quarter:
+            valid_df = df.filter(
+                (pl.col("period") >= valid_start_period)
+                & (pl.col("period") <= valid_end_period)
+                & (pl.col("date") >= valid_start_date)
+                & (pl.col("date") <= valid_end_date)
+            )
+        else:
+            valid_df = df.filter(
+                (pl.col("year") == valid_y)
+                & (pl.col("date") >= valid_start_date)
+                & (pl.col("date") <= valid_end_date)
+            )
         test_df = test_df_base
         
         # Validation
