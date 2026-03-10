@@ -37,13 +37,25 @@ class FundProcessor(BaseProcessor):
                 # 자본금이 없으면 자본잠식률 계산 불가 -> 임시 0 처리
                 self._fund_df = self._fund_df.with_columns(pl.lit(None).cast(pl.Float64).alias("capital_stock"))
 
-            # disclosure_date 컬럼 처리 (Lazy)
+            # disclosure_date 컬럼 처리 (Lazy) - [CRITICAL FIX] Look-ahead Bias 완벽 제거
             if "disclosure_date" not in cols:
-                if "date" in cols:
+                # reprt_code가 있는 DART 데이터의 경우 법정 공시 기한을 적용
+                if "reprt_code" in cols and "year" in cols:
+                    # 11013(1분기): 5월 15일, 11012(반기): 8월 14일, 11014(3분기): 11월 14일, 11011(사업): 다음해 3월 31일
+                    self._fund_df = self._fund_df.with_columns(
+                        pl.when(pl.col("reprt_code") == "11013").then(pl.col("year").cast(pl.Utf8) + pl.lit("0515"))
+                        .when(pl.col("reprt_code") == "11012").then(pl.col("year").cast(pl.Utf8) + pl.lit("0814"))
+                        .when(pl.col("reprt_code") == "11014").then(pl.col("year").cast(pl.Utf8) + pl.lit("1114"))
+                        .when(pl.col("reprt_code") == "11011").then((pl.col("year").cast(pl.Int32) + 1).cast(pl.Utf8) + pl.lit("0331"))
+                        .otherwise((pl.col("year").cast(pl.Int32) + 1).cast(pl.Utf8) + pl.lit("0331")) # 기본은 보수적으로 다음해 3/31
+                        .alias("disclosure_date")
+                    )
+                elif "date" in cols:
                     self._fund_df = self._fund_df.with_columns(pl.col("date").alias("disclosure_date"))
                 elif "year" in cols:
+                    # reprt_code가 없는 연간 데이터일 경우 무조건 이듬해 3월 31일로 밀어서 미래 참조 방지
                     self._fund_df = self._fund_df.with_columns(
-                        (pl.col("year").cast(pl.Utf8) + "1231").alias("disclosure_date")
+                        ((pl.col("year").cast(pl.Int32) + 1).cast(pl.Utf8) + pl.lit("0331")).alias("disclosure_date")
                     )
 
             self._fund_df = self._fund_df.with_columns(
