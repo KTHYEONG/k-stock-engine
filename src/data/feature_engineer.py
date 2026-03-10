@@ -17,6 +17,7 @@ from src.data.preprocessors.fund_processor import FundProcessor
 from src.data.preprocessors.universe_filter import UniverseFilter
 from src.data.preprocessors.target_processor import TargetProcessor
 from src.data.preprocessors.cross_processor import CrossSectionalProcessor
+from src.data.preprocessors.macro_processor import MacroProcessor
 
 logger = setup_logger("feature_engineer")
 
@@ -31,6 +32,7 @@ class FeatureEngineer:
         
         # 등록된 프로세서들 (순서 중요)
         self.processors = [
+            MacroProcessor(), # MacroData(VIX) 먼저 수집 및 Join
             TechProcessor(),
             FundProcessor(),  # FundProcessor 먼저 실행 (market_cap 확보)
             FlowProcessor(),
@@ -49,7 +51,7 @@ class FeatureEngineer:
         print("="*50)
         
         # 주요 컬럼 및 최근 추가된 피처 위주로 샘플 출력
-        cols_to_show = ["ticker", "date", "close"] + [c for c in df.columns if any(x in c for x in ["log_return", "disparity", "np_", "target"])]
+        cols_to_show = ["ticker", "date", "close", "vix_zscore_20d"] + [c for c in df.columns if any(x in c for x in ["log_return", "disparity", "np_", "target"])]
         # 존재하는 컬럼만 필터링
         cols_to_show = [c for c in cols_to_show if c in df.columns][:15] 
         
