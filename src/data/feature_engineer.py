@@ -118,10 +118,13 @@ class FeatureEngineer:
 if __name__ == "__main__":
     import argparse
     from datetime import timedelta
+    # --date 인자가 없으면 기본 종료일은 어제 날짜(YYYYMMDD)로 설정
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+    
     parser = argparse.ArgumentParser(description="Feature Engineering Orchestrator")
     parser.add_argument("--date", type=str, help="특정 날짜 하루만 수행 (YYYYMMDD)")
     parser.add_argument("--start", type=str, default="20160101", help="시작 날짜 (YYYYMMDD)")
-    parser.add_argument("--end", type=str, default="20251231", help="종료 날짜 (YYYYMMDD)")
+    parser.add_argument("--end", type=str, default=yesterday, help="종료 날짜 (YYYYMMDD, 기본값: 어제)")
     parser.add_argument("--test", action="store_true", help="저장하지 않고 결과 미리보기")
     
     args = parser.parse_args()
