@@ -5,40 +5,30 @@ logger = logging.getLogger("filters.volatility")
 
 def apply_volatility_filter(df: pl.DataFrame) -> pl.DataFrame:
     """
-    변동성 및 상태 필터 (Volatility & Status Cut)
+    최상위 퀀트 투자자 기준 거래 정지 및 상태 필터
     
-    1. 거래 정지 점검 (Trading Halt Proxy):
-       - Volume == 0 인 종목 제외
-       
-    2. (Optional) 관리종목/환기종목 Flag:
-       - 데이터에 'is_managed' 등의 플래그가 있다면 제외
-    
-    Expected Columns:
-        - volume (int)
+    1. Zero Volume Check:
+       - 최근 5거래일 내 거래량이 0인 날이 하루라도 있으면 제외 (min_vol_5d > 0)
     """
     initial_count = len(df)
     
-    # 1. Trading Halt Check (Volume = 0)
-    if "volume" in df.columns:
-        # 거래량이 0이 아니고 Null이 아닌 것만 남김
-        vol_mask = (pl.col("volume").is_not_null()) & (pl.col("volume") > 0)
+    # 1. Zero Volume Check (Halt proxy)
+    # TechProcessor에서 계산된 min_vol_5d 사용
+    if "min_vol_5d" in df.columns:
+        vol_mask = (pl.col("min_vol_5d").fill_null(0) > 0)
     else:
-        logger.warning("Column 'volume' not found. Volatility filter skipped Halt check.")
-        vol_mask = pl.lit(True)
-        
-    # 2. Admin Issue Check (Optional)
-    # 데이터셋에 'admin_issue'(관리종목여부)가 있다고 가정
-    if "admin_issue" in df.columns:
-        # 1/True/Risk라면 제외
-        issue_mask = (pl.col("admin_issue").fill_null(0) == 0)
-    else:
-        issue_mask = pl.lit(True)
+        # min_vol_5d가 없으면 당일 거래량이라도 체크
+        if "volume" in df.columns:
+             vol_mask = (pl.col("volume").fill_null(0) > 0)
+        else:
+            logger.warning("Volume info not found. Skipped.")
+            vol_mask = pl.lit(True)
         
     # Apply Filters
-    df_filtered = df.filter(vol_mask & issue_mask)
+    df_filtered = df.filter(vol_mask)
     
     filtered_count = initial_count - len(df_filtered)
     if filtered_count > 0:
-        logger.info(f"Volatility Filter dropped {filtered_count} stocks.")
+        logger.info(f"Volatility/Halt Filter dropped {filtered_count} stocks.")
         
     return df_filtered

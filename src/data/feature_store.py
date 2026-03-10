@@ -5,6 +5,8 @@ from config.base import PROCESSED_DATA_DIR
 import uuid
 import logging
 
+from typing import Union
+
 logger = logging.getLogger("data.feature_store")
 
 class FeatureStore:
@@ -14,7 +16,7 @@ class FeatureStore:
         self.base_path = base_path
         self.base_path.mkdir(parents=True, exist_ok=True)
         
-    def save_features(self, df: pl.DataFrame | pl.LazyFrame, partition_cols: list[str] = ["year", "date"], prefix: str = "data"):
+    def save_features(self, df: Union[pl.DataFrame, pl.LazyFrame], partition_cols: list[str] = ["year", "date"], prefix: str = "data"):
         # LazyFrame인 경우 파티셔닝 전처리를 위해 일부 collect가 필요할 수 있으나, 
         # 가급적 전체를 collect하여 저장하는 것이 안전 (write_parquet는 DataFrame 필요)
         if isinstance(df, pl.LazyFrame):

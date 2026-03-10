@@ -6,55 +6,44 @@ logger = logging.getLogger("preprocessors.filter")
 
 class UniverseFilter(BaseProcessor):
     """
-    유니버스 필터링 (Universe Construction) 전처리기
+    최상위 퀀트 투자자 기준 유니버스 필터링 (Universe Construction)
     
-    Layers:
-    1. Liquidity: Penny Stocks, Min Trading Value, Sector Component Count
-    2. Quality (QMJ): Deficit Filter with Turnaround Rescue logic
-    3. Risk: Debt Ratio, Capital Erosion, High Volatility
+    6대 핵심 필터 (Hard Cut):
+    1. ADTV_20d > 50억 (최근 20거래일 평균 거래대금 50억 이상)
+    2. Price >= 1,000원 (동전주 제외)
+    3. No Zero Volume (최근 5거래일 거래량 0인 날 없음)
+    4. Capital Erosion Rate <= 0% (자본잠식 없음, 자본총계 > 자본금)
+    5. Profitability (최근 공시 기준 영업이익 흑자)
+    6. Common Stock Only (우선주, 스팩 등 제외 - 티커 끝이 0인 6자리 종목)
     """
     
     def process(self, df: pl.LazyFrame) -> pl.LazyFrame:
-        # Pre-check: Ensure required columns exist
-        cols = df.collect_schema().names()
-        
-        # 1. Liquidity & Microstructure
-        df = df.sort(["ticker", "date"])
+        # 1. 기초 지표 계산 (Amihud: |Return| / Trading_Value)
+        # 이미 TechProcessor에서 adtv_20d가 계산되어 있다고 가정
         df = df.with_columns([
-            pl.col("trading_value").rolling_mean(window_size=5).over("ticker").alias("avg_trading_value_5d")
+            (pl.col("close").pct_change().over("ticker").abs() / (pl.col("trading_value").replace(0, 1.0)))
+            .rolling_mean(20).over("ticker").alias("amihud_20d")
         ])
-        
-        liq_filter = (pl.col("close") >= 1000) & (pl.col("avg_trading_value_5d") >= 1e9)
-        
-        # 2. Sector Bias
-        df = df.with_columns([
-            pl.col("ticker").count().over(["date", "sector"]).alias("sector_count")
-        ])
-        sector_filter = (pl.col("sector_count") >= 5)
-        
-        # 3. Quality Filter (Simplified)
-        hard_cut = (pl.col("debt_ratio") > 3.0) 
-        if "capital_erosion_rate" in cols:
-             hard_cut = hard_cut | (pl.col("capital_erosion_rate") > 50)
-             
-        if "relative_trend_score" in cols:
-            rescue_condition = (pl.col("operating_income") > 0) | (pl.col("market_cap") > 5e11) | (pl.col("relative_trend_score") > 1.0)
-        else:
-            rescue_condition = (pl.col("operating_income") > 0) | (pl.col("market_cap") > 5e11)
 
-        quality_pass = rescue_condition & (~hard_cut)
+        # 2. 6자리 종목코드 중 끝자리가 '0'인 보통주만 필터링 (KRX 기준)
+        is_index = pl.col("ticker").is_in(["KOSPI", "KOSDAQ"])
+        is_common_stock = (pl.col("ticker").str.len_chars() == 6) & (pl.col("ticker").str.ends_with("0"))
         
-        # 4. Low Volatility Anomaly: 변동성 상위 10% 제거
-        df = df.with_columns([
-            pl.col("volatility_60d").rank("average", descending=True).over("date").alias("vol_rank"),
-            pl.col("ticker").count().over("date").alias("daily_ticker_count")
-        ])
-        df = df.with_columns([
-            (pl.col("vol_rank") / pl.col("daily_ticker_count")).alias("vol_percentile")
-        ])
-        vol_filter = (pl.col("vol_percentile") > 0.1) # 상위 10% 제거
+        # 3. [UPDATED] 한국 시장 맞춤형 유동성 및 가격 필터 (기관급)
+        # ADTV 50억 이상 + Amihud 상위 10% 제외 + 시총 500억 이상 (슬리피지 방어)
+        liq_filter = (pl.col("adtv_20d") >= 5e9) & \
+                     (pl.col("amihud_20d") < pl.col("amihud_20d").quantile(0.9).over("date")) & \
+                     (pl.col("close") >= 1000) & \
+                     (pl.col("min_vol_5d") > 0)
         
-        # 통합 필터 적용
-        df = df.filter(liq_filter & sector_filter & quality_pass & vol_filter).drop(["sector_count", "daily_ticker_count", "vol_rank", "vol_percentile"])
+        # 4. 재무 건전성 필터 (Hard Cut)
+        quality_filter = (pl.col("capital_erosion_rate").fill_null(100) <= 0)
         
-        return df
+        # 5. 통합 필터 적용 (시총 500억 이상 추가)
+        if "market_cap" in df.collect_schema().names():
+            liq_filter = liq_filter & (pl.col("market_cap") >= 50e9)
+        df_filtered = df.filter(
+            is_index | (is_common_stock & liq_filter & quality_filter)
+        )
+        
+        return df_filtered
