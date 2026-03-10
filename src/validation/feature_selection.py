@@ -133,4 +133,19 @@ class FeatureSelector:
         logger.info(f"💾 Saved to {self.yaml_path}")
 
 if __name__ == "__main__":
-    FeatureSelector().select_features(start_date="20220101", end_date="20241231")
+    import argparse
+    from datetime import datetime
+    import dateutil.relativedelta
+    
+    # 동적 윈도우 할당: 시장 트렌드 변화를 반영하기 위해 롤링 '최근 3년' 사용
+    now = datetime.now()
+    default_start = (now - dateutil.relativedelta.relativedelta(years=3)).strftime("%Y%m%d")
+    default_end = now.strftime("%Y%m%d")
+    
+    parser = argparse.ArgumentParser(description="Feature Selection Pipeline")
+    parser.add_argument("--start", type=str, default=default_start, help=f"Start date (default: {default_start})")
+    parser.add_argument("--end", type=str, default=default_end, help=f"End date (default: {default_end})")
+    
+    args = parser.parse_args()
+    
+    FeatureSelector().select_features(start_date=args.start, end_date=args.end)

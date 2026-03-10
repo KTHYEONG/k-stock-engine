@@ -15,7 +15,7 @@ class YetiRankTuner:
     def __init__(
         self,
         data_loader: YetiRankDataLoader,
-        target_year: int = 2024,
+        target_year: str = "2024",
         n_trials: int = 30,
         full_df: Optional[pl.DataFrame] = None,
         use_awfo: bool = True,
@@ -50,8 +50,12 @@ class YetiRankTuner:
         
         self.feature_names = self.loader.get_feature_names(full_df)
 
-        # AWFO tuning set: all history strictly before target test year.
-        tune_df = full_df.filter(pl.col("year") < str(target_year))
+        is_quarter = isinstance(target_year, str) and "Q" in target_year
+        if is_quarter:
+            tune_df = full_df.filter(pl.col("period") < target_year)
+        else:
+            tune_df = full_df.filter(pl.col("year") < str(target_year))
+            
         if self.use_awfo and not tune_df.is_empty():
             split_defs = self.loader.build_anchored_splits(
                 tune_df,
@@ -397,7 +401,7 @@ class YetiRankTuner:
 
         label = "AWFO-Robust NDCG" if self.use_awfo else "NDCG"
         self.last_tuning_meta = {
-            "target_year": int(self.target_year),
+            "target_year": str(self.target_year),
             "use_awfo": bool(self.use_awfo),
             "awfo_folds": int(self.awfo_folds) if self.use_awfo else 0,
             "awfo_embargo_days": int(self.awfo_embargo_days) if self.use_awfo else 0,
