@@ -187,7 +187,7 @@ class YetiRankTrainer:
                 train_df,
                 min_weight=0.5,
                 max_weight=1.0,
-                context=f"phase2-{year}",
+                context=f"phase2-{period}",
             )
             
             # Create Pools
@@ -353,14 +353,26 @@ if __name__ == "__main__":
     import argparse
     from datetime import datetime
     
-    # 현재 날짜 기준 동적 기본값 계산
+    # 현재 날짜 기준 동적 기본값 계산 (최근 8개 분기 기본 학습으로 백테스트 라이브러리 구축)
     now = datetime.now()
-    curr_period = f"{now.year}Q{(now.month-1)//3 + 1}"
+    year, month = now.year, now.month
+    
+    default_periods = []
+    for i in range(8): # 최근 2년(8분기) 분량
+        q = (month - 1) // 3 + 1
+        default_periods.append(f"{year}Q{q}")
+        month -= 3
+        if month <= 0:
+            month += 12
+            year -= 1
+    
+    # 정렬 (과거 -> 현재)
+    default_periods = ",".join(sorted(default_periods))
     
     parser = argparse.ArgumentParser(description="YetiRank Model Trainer")
     parser.add_argument("--trials", type=int, default=180, help="Number of hyperparameter tuning trials")
     parser.add_argument("--sample", type=float, default=1.0, help="Data sampling ratio (0.1 ~ 1.0)")
-    parser.add_argument("--periods", type=str, default=curr_period, help=f"Comma separated test periods (default: {curr_period})")
+    parser.add_argument("--periods", type=str, default=default_periods, help=f"Comma separated test periods (default: {default_periods})")
     parser.add_argument("--start", type=str, default="20180101", help="Start date (YYYYMMDD) - Practical 6~8y window default")
     parser.add_argument("--skip_diagnostics", action="store_true", help="Skip feature importance and decile/IC diagnostics for faster runtime")
     parser.add_argument("--phase2_embargo_days", type=int, default=6, help="Embargo days for Phase 2 walk-forward split")
