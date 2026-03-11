@@ -195,6 +195,14 @@ class YetiRankDataLoader:
         logger.info(f"Target Rank Check - Correlation with Return: {debug_corr:.4f} (Must be positive and high)")
         logger.info(f"Sample Data:\n{df.select(['date', 'target_return_5d', 'target_rank', 'trading_value']).head(5)}")
 
+        # Ensure year/period for tuner and walk_forward_split (quarter mode)
+        if "year" not in df.columns:
+            df = df.with_columns(pl.col("date").dt.year().cast(pl.Utf8).alias("year"))
+        if "period" not in df.columns:
+            df = df.with_columns(
+                pl.format("{}Q{}", pl.col("date").dt.year(), pl.col("date").dt.quarter()).alias("period")
+            )
+
         logger.info(f"Data loaded successfully. Shape: {df.shape}, Groups: {df['group_id'].n_unique()}")
         return df
 
@@ -321,10 +329,6 @@ class YetiRankDataLoader:
             test_df_base = df.filter(pl.col("year") == test_y)
             valid_df_base = df.filter(pl.col("year") == valid_y)
         embargo_days = int(max(0, embargo_days))
-        
-        # Base sets
-        test_df_base = df.filter(pl.col("year") == test_y)
-        valid_df_base = df.filter(pl.col("year") == valid_y)
 
         if valid_df_base.is_empty():
             raise ValueError(f"Valid set is empty (Year {valid_y}). Cannot tune hyperparameters.")
@@ -399,7 +403,14 @@ class YetiRankDataLoader:
 
         logger.info(f"Split for Test Year {test_year}:")
         logger.info(f" - Embargo: {embargo_days} trading days")
-        logger.info(f" - Train: ~ {int(valid_y)-1} ({len(train_df)} rows, end={train_end_date})")
+        
+        if is_quarter:
+            # valid_y is a string like "2024Q4 ~ 2025Q4"
+            train_label = f"pre-{valid_start_period}"
+        else:
+            train_label = f"~ {int(valid_y)-1}"
+
+        logger.info(f" - Train: {train_label} ({len(train_df)} rows, end={train_end_date})")
         logger.info(f" - Valid: {valid_y} ({len(valid_df)} rows, end={valid_end_date})")
         logger.info(f" - Test : {test_y} ({len(test_df)} rows)")
         
