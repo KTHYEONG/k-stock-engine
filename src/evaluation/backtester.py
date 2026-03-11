@@ -45,18 +45,35 @@ class YetiRankBacktester:
         self._market_vol_map = {} 
 
     def load_model(self, model_id: Union[int, str]) -> CatBoostRanker:
+        """
+        [Bulletproof] 시점별 모델 로드 (Look-ahead Bias 방지)
+        - exact matching 우선
+        - 없으면 해당 시점 '이전'의 가장 최신 모델 검색
+        """
         model_path = self.model_dir / f"yetirank_{model_id}.cbm"
+        
         if not model_path.exists():
-            latest_path = self.model_dir / "yetirank_latest.cbm"
-            if latest_path.exists():
-                logger.warning(f"Model for {model_id} not found. Using {latest_path.name} instead.")
-                model_path = latest_path
-            else:
-                available_models = sorted(list(self.model_dir.glob("yetirank_*.cbm")))
-                if not available_models:
+            # 사용 가능한 모든 모델 리스트업
+            available_models = sorted([f.name for f in self.model_dir.glob("yetirank_*Q*.cbm")])
+            
+            if not available_models:
+                latest_path = self.model_dir / "yetirank_latest.cbm"
+                if latest_path.exists():
+                    logger.warning(f"No period models found. Using {latest_path.name} (Potential Bias).")
+                    model_path = latest_path
+                else:
                     raise FileNotFoundError(f"No models found in {self.model_dir}")
-                model_path = available_models[-1]
-                logger.warning(f"Model for {model_id} not found. Using {model_path.name} instead.")
+            else:
+                # model_id (e.g., 2025Q1) 보다 작거나 같은 모델 중 가장 큰 것 찾기
+                target = f"yetirank_{model_id}.cbm"
+                past_models = [m for m in available_models if m <= target]
+                
+                if past_models:
+                    model_path = self.model_dir / past_models[-1]
+                    logger.info(f"Exact model {target} not found. Using nearest past model: {model_path.name}")
+                else:
+                    model_path = self.model_dir / available_models[0]
+                    logger.warning(f"No past models for {model_id}. Using earliest available: {model_path.name}")
         
         model = CatBoostRanker()
         model.load_model(str(model_path))
