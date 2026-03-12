@@ -12,10 +12,11 @@ class MarketDataCollector:
     Naver Finance를 통해 섹터(업종) 정보를 보완합니다.
     """
     
-    def __init__(self, use_openapi: bool = True):
+    def __init__(self, use_openapi: bool = True, low_spec: bool = False):
         """
         Args:
             use_openapi: True면 KRX OpenAPI 사용 (환경변수 KRX_OPENAPI_KEY 필요)
+            low_spec: True면 메모리 최적화를 위해 병렬 처리 최소화
         """
         self.openapi_collector = None
         self.naver_collector = None
@@ -36,7 +37,7 @@ class MarketDataCollector:
         # Naver Collector 초기화 (섹터 정보 수집용)
         try:
             from .naver_finance_collector import NaverFinanceCollector
-            self.naver_collector = NaverFinanceCollector(concurrency=10)
+            self.naver_collector = NaverFinanceCollector(concurrency=1 if low_spec else 10)
         except Exception as e:
             logger.warning(f"Failed to initialize NaverFinanceCollector: {e}")
 
