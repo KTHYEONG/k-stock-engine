@@ -25,6 +25,7 @@ async def main():
     parser.add_argument("--date", type=str, help="Target date (YYYYMMDD).", default=None)
     parser.add_argument("--start", type=str, help="Start date (YYYYMMDD) for batch collection.", default="20150701")
     parser.add_argument("--end", type=str, help="End date (YYYYMMDD) for batch collection.", default="20251231")
+    parser.add_argument("--low-spec", action="store_true", help="Run in serial mode (concurrency=1) for low-spec cloud environments to save memory.")
     
     args = parser.parse_args()
     
@@ -35,7 +36,7 @@ async def main():
     import logging
     logging.getLogger("data.collectors").setLevel(logging.WARNING)
     
-    collector = MarketDataCollector()
+    collector = MarketDataCollector(low_spec=args.low_spec)
     store = FeatureStore()
     
     dates = []
@@ -86,7 +87,11 @@ async def main():
     except Exception as e:
         logger.warning(f"[WARN] Pre-sync failed (skipping): {e}")
         
-    sem = asyncio.Semaphore(3)  # 동시 실행할 날짜 수 (API 한도 고려하여 5 -> 3으로 하향)
+    # 동시 실행할 날짜 수 (저사양은 1로 제한, 기본은 3)
+    concurrency_limit = 1 if args.low_spec else 3
+    if args.low_spec:
+        logger.info("[MODE] LOW-SPEC enabled: Running dates sequentially to save memory.")
+    sem = asyncio.Semaphore(concurrency_limit)
     
     async def process_date(d):
         # 주말(토, 일)은 수집 대상에서 제외하여 불필요한 API 호출 방지
