@@ -1,369 +1,253 @@
-
-import asyncio
-import logging
 import argparse
-from datetime import datetime
-import polars as pl
-from pathlib import Path
-import sys
+import asyncio
 import json
-import numpy as np
-import optuna
+import logging
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
 
-# 프로젝트 루트 경로 추가
+import numpy as np
+import polars as pl
+
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-logging.basicConfig(level=logging.INFO, format='%(message)s')
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("run_static_opt")
 logging.getLogger("optuna").setLevel(logging.ERROR)
 logging.getLogger("etf").setLevel(logging.WARNING)
 
 from src.data.etf_manager import ETFManager
-from src.etf.optimizer import ETFOptimizer
 from src.etf.backtester import ETFBacktester
+from src.etf.monte_carlo import ETFMonteCarloSimulator
+from src.etf.optimizer import ETFOptimizer
 
-async def load_all_data(start_date: datetime, end_date: datetime):
-    manager = ETFManager()
-    try:
-        etf_df = pl.scan_parquet(str(manager.etf_store.base_path / "**/*.parquet")).collect()
-        index_df = pl.scan_parquet(str(manager.index_store.base_path / "**/*.parquet")).collect()
-        
-        etf_df = etf_df.filter((pl.col("date") >= start_date) & (pl.col("date") <= end_date))
-        index_df = index_df.filter((pl.col("date") >= start_date) & (pl.col("date") <= end_date))
-        return etf_df, index_df
-    except Exception as e:
-        logger.error(f"❌ 데이터 로드 실패: {e}")
-        return None, None
 
-def analyze_parameter_sensitivity(study, top_n=30):
-    """
-    Optuna Search Result Sensitivity Analysis
-    - Check if Top N params are clustered (Stable) or scattered (Random Peak).
-    """
-    print("\n" + "="*70)
-    print(f"🔬 PARAMETER SENSITIVITY ANALYSIS (Top {top_n} Trials)")
-    print("="*70)
-    
-    # 1. Get Completed Trials
-    trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
-    
-    # 2. Sort by Value (Score) Descending
-    trials.sort(key=lambda t: t.value, reverse=True)
-    top_trials = trials[:top_n]
-    
-    if len(top_trials) < 5:
-        print("⚠️ Not enough trials for sensitivity analysis.")
-        return
-
-    # 3. Collect Params
-    param_keys = top_trials[0].params.keys()
-    stats = {}
-    
-    for key in param_keys:
-        values = [t.params[key] for t in top_trials]
-        
-        # Check type (Numerical vs Categorical)
-        if isinstance(values[0], (int, float)):
-            mean_val = np.mean(values)
-            std_val = np.std(values)
-            min_val = np.min(values)
-            max_val = np.max(values)
-            best_val = top_trials[0].params[key]
-            
-            # Z-Score of Best Param (How far from the Top N mean?)
-            z_score = abs(best_val - mean_val) / (std_val + 1e-9)
-            
-            stats[key] = {
-                "type": "num",
-                "mean": mean_val,
-                "std": std_val,
-                "range": f"[{min_val} ~ {max_val}]",
-                "best": best_val,
-                "z_score": z_score
-            }
-        else:
-            # Categorical: Find most frequent
-            from collections import Counter
-            counts = Counter(values)
-            most_common = counts.most_common(1)[0]
-            best_val = top_trials[0].params[key]
-            
-            stats[key] = {
-                "type": "cat",
-                "top_choice": f"{most_common[0]} ({most_common[1]}/{top_n})",
-                "best": best_val,
-                "stability": "HIGH" if most_common[0] == best_val else "LOW"
-            }
-
-    # 4. Print Report
-    print(f"{'Param':<20} | {'Best':<10} | {'Top-N Mean':<10} | {'StdDev':<8} | {'Range / Stability'}")
-    print("-" * 80)
-    
-    for key, s in stats.items():
-        if s['type'] == 'num':
-            # Highlight if Best is far from Mean (Z-Score > 2.0)
-            warning = "⚠️" if s['z_score'] > 2.0 else ""
-            print(f"{key:<20} | {s['best']:<10.4g} | {s['mean']:<10.4g} | {s['std']:<8.4f} | {s['range']:<15} {warning}")
-        else:
-            warning = "⚠️" if s['stability'] == "LOW" else ""
-            print(f"{key:<20} | {s['best']:<10} | {'-':<10} | {'-':<8} | {s['top_choice']:<15} {warning}")
-            
-    print("-" * 80)
-    print("💡 Interpretation:")
-    print("  - StdDev Low & Z-Score Low: Stable Parameter (Safe)")
-    print("  - ⚠️ Marked: Best param is an outlier compared to other top performers (Possible Overfitting)")
-    print("="*70)
-
-def analyze_market_regime_performance(daily_returns: list, index_df: pl.DataFrame):
-    """
-    Market Regime (Bull/Bear) Performance Analysis
-    """
-    if not daily_returns or not isinstance(daily_returns, list):
-        return
-
-    # 1. Align Dates (Tail Alignment assumption)
-    n_days = len(daily_returns)
-    
-    # Calculate SMA on full index_df first to ensure validity
-    full_idx = index_df.clone()
-    
-    # Clean Close Price if needed
-    if "close" not in full_idx.columns:
-         if "CLSPRC_IDX" in full_idx.columns:
-             full_idx = full_idx.with_columns(
-                pl.col("CLSPRC_IDX").cast(pl.Utf8).str.replace(",", "").cast(pl.Float64, strict=False).alias("close")
-            )
-         else:
-             print("⚠️ Cannot find close price column for Regime Analysis.")
-             return
-             
-    # Calculate SMA 200
-    full_idx = full_idx.sort("date").with_columns(
-        pl.col("close").rolling_mean(200).alias("sma200")
-    )
-    
-    # Slice to match daily_returns length (Tail)
-    if full_idx.height < n_days:
-        print("⚠️ Not enough index data for regime analysis.")
-        return
-        
-    analysis_df = full_idx.tail(n_days)
-    
-    # Add strategy returns
-    analysis_df = analysis_df.with_columns(
-        pl.Series(name="strat_ret", values=daily_returns)
-    )
-    
-    # 2. Define Regimes
-    # Bull: Close > SMA200
-    # Bear: Close <= SMA200
-    analysis_df = analysis_df.with_columns(
-        pl.when(pl.col("close") > pl.col("sma200")).then(pl.lit("Bull"))
-          .otherwise(pl.lit("Bear")).alias("regime")
-    )
-    
-    # 3. GroupBy Analysis
-    print("\n" + "="*70)
-    print("🐻🐮 MARKET REGIME STRESS TEST (Based on SMA 200)")
-    print("="*70)
-    print(f"{'Regime':<10} | {'Days':<6} | {'Return':<8} | {'WinRate':<8} | {'MDD':<8}")
-    print("-" * 60)
-    
-    regimes = ["Bull", "Bear"]
-    
-    for r in regimes:
-        sub_df = analysis_df.filter(pl.col("regime") == r)
-        if sub_df.height == 0:
-            print(f"{r:<10} | {'0':<6} | {'-':<8} | {'-':<8} | {'-':<8}")
+def _parse_seed_list(seed_arg: str) -> List[int]:
+    seeds = []
+    for raw in str(seed_arg).split(","):
+        s = raw.strip()
+        if not s:
             continue
-            
-        # Calc Stats
-        rets = sub_df["strat_ret"].to_numpy()
-        cum_ret = np.prod(1 + rets) - 1
-        
-        # Simple WinRate
-        wins = np.sum(rets > 0)
-        win_rate = (wins / len(rets)) * 100 if len(rets) > 0 else 0
-        
-        # MDD (In-Regime MDD)
-        cum_equity = np.cumprod(1 + rets)
-        running_max = np.maximum.accumulate(cum_equity)
-        dd = (cum_equity - running_max) / running_max
-        max_dd = np.min(dd)
-        
-        print(f"{r:<10} | {len(rets):<6} | {cum_ret*100:>7.2f}% | {win_rate:>7.1f}% | {max_dd*100:>7.2f}%")
-        
-    print("-" * 60)
-    print("💡 Check if the strategy survives in Bear markets (MDD not too deep).")
-    print("="*70)
+        try:
+            seeds.append(int(s))
+        except ValueError:
+            continue
+    return seeds or [13]
 
-def run_static_optimization(etf_df: pl.DataFrame, index_df: pl.DataFrame, args):
-    """
-    Static Optimization: Train (Start ~ End-1) -> Test (End)
-    """
-    s_date = datetime.strptime(args.start, "%Y-%m-%d")
-    e_date = datetime.strptime(args.end, "%Y-%m-%d") # This is 2025-12-31 generally
-    
-    # Split Date: 2025-01-01
-    # Train End = 2024-12-31
-    test_year = e_date.year
-    train_end_date = datetime(test_year - 1, 12, 31)
-    test_start_date = datetime(test_year, 1, 1)
-    
-    # 1. Split Data
-    train_index = index_df.filter(pl.col("date") <= train_end_date)
-    train_etf = etf_df.filter(pl.col("date") <= train_end_date)
-    
-    test_index = index_df.filter(pl.col("date") >= test_start_date)
-    test_etf = etf_df.filter(pl.col("date") >= test_start_date)
-    
-    market = args.market
-    
-    print("\n" + "="*70)
-    print(f"🏋️ STATIC OPTIMIZATION START")
-    print(f" Target Market: {market}")
-    print(f" Train Period : {s_date.date()} ~ {train_end_date.date()} ({train_index.height} rows)")
-    print(f" Test Period  : {test_start_date.date()} ~ {e_date.date()} ({test_index.height} rows)")
-    print("="*70)
-    
-    # 2. Optimization (Train)
-    print(f"\nrunning optimization ({args.trials} trials)...")
-    optimizer = ETFOptimizer(train_index, train_etf, target_market=market, target_leverage="HYBRID")
-    best_params = optimizer.run_optimization(n_trials=args.trials)
-    
-    # Save Params
-    param_path = PROJECT_ROOT / "results" / "static_opt" / f"best_params_{market}_static.json"
-    param_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(param_path, "w") as f:
-        json.dump(best_params, f, indent=4)
-        
-    print(f"✅ Best Params Saved: {param_path}")
-    print(f"Best Params: {json.dumps(best_params, indent=2)}")
 
-    # 2.1 Parameter Sensitivity Analysis
-    # try:
-    #     analyze_parameter_sensitivity(optimizer.study, top_n=30)
-    # except Exception as e:
-    #     print(f"⚠️ Sensitivity Analysis Failed: {e}")
-    
-    # 3. Backtest (In-Sample)
-    print("\n[In-Sample Performance (2017-2024)]")
-    bt_train = ETFBacktester(train_index, train_etf)
-    train_res_list = bt_train.run(best_params, target_market=market)
-    train_res = next((r for r in train_res_list if r['market'] == f"{market}_HYBRID"), None)
-    
-    if train_res:
-         print(f" Return: {train_res['total_return']*100:.2f}%")
-         print(f" CAGR  : {train_res['cagr']*100:.2f}%")
-         print(f" MDD   : {train_res['mdd']*100:.2f}%")
-         print(f" Trades: {train_res['trades']}")
-         print(f" WinRt : {train_res['win_rate']:.1f}%")
+async def load_all_data(start_date: datetime, end_date: datetime) -> Tuple[pl.DataFrame, pl.DataFrame]:
+    manager = ETFManager()
+    etf_df = pl.scan_parquet(str(manager.etf_store.base_path / "**/*.parquet")).collect()
+    index_df = pl.scan_parquet(str(manager.index_store.base_path / "**/*.parquet")).collect()
+    etf_df = etf_df.filter((pl.col("date") >= start_date) & (pl.col("date") <= end_date))
+    index_df = index_df.filter((pl.col("date") >= start_date) & (pl.col("date") <= end_date))
+    return etf_df, index_df
 
-         # --- Monte Carlo Simulation ---
-         if train_res.get('trade_list') and len(train_res['trade_list']) > 5:
-             from src.etf.monte_carlo import ETFMonteCarloSimulator
-             print("\n🎲 Monte Carlo Analysis (10,000 Runs)")
-             mc = ETFMonteCarloSimulator(train_res['trade_list'])
-             mc_res = mc.run(n_simulations=10000)
-             
-             if mc_res['is_valid']:
-                 print(f" Prob. Profit : {mc_res['prob_profit']:.1f}% (Chance of making money)")
-                 print(f" Median Return: {mc_res['median_return_pct']:.1f}% (Most likely outcome)")
-                 print(f" Worst MDD    : -{mc_res['worst_case_mdd']:.1f}% (95% Confidence Risk)")
-                 print(f" Return Range : {mc_res['lower_bound_95']:.1f}% ~ {mc_res['upper_bound_95']:.1f}%")
-             else:
-                 print(" (Not enough trades for simulation)")
-    
-    # 4. Backtest (Out-of-Sample)
-    print("\n[Out-of-Sample Performance (2025)]")
-    test_res = None
-    if test_index.height > 0:
-        bt_test = ETFBacktester(test_index, test_etf)
-        test_res_list = bt_test.run(best_params, target_market=market)
-        test_res = next((r for r in test_res_list if r['market'] == f"{market}_HYBRID"), None)
-        
-        if test_res:
-             print(f" Return: {test_res['total_return']*100:.2f}%")
-             print(f" MDD   : {test_res['mdd']*100:.2f}%")
-             print(f" Trades: {test_res['trades']}")
-             print(f" WinRt : {test_res['win_rate']:.1f}%")
-        else:
-             print("Detailed results not available (maybe no trades)")
+
+def _equity_summary(daily_returns: List[float]) -> Dict[str, float]:
+    arr = np.asarray(daily_returns, dtype=float)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    if arr.size == 0:
+        return {
+            "days": 0.0,
+            "total_return_pct": 0.0,
+            "cagr_pct": 0.0,
+            "sharpe": 0.0,
+            "mdd_pct": 0.0,
+            "calmar": 0.0,
+        }
+    equity = np.cumprod(1.0 + arr)
+    total = float(equity[-1] - 1.0)
+    years = max(1.0 / 252.0, arr.size / 252.0)
+    cagr = float((1.0 + total) ** (1.0 / years) - 1.0)
+    ann_mean = float(np.mean(arr) * 252.0)
+    ann_vol = float(np.std(arr) * np.sqrt(252.0))
+    sharpe = ann_mean / ann_vol if ann_vol > 0 else 0.0
+    peak = np.maximum.accumulate(equity)
+    dd = (equity - peak) / np.maximum(peak, 1e-12)
+    mdd = float(np.min(dd))
+    calmar = cagr / abs(mdd) if abs(mdd) > 0 else 0.0
+    return {
+        "days": float(arr.size),
+        "total_return_pct": total * 100.0,
+        "cagr_pct": cagr * 100.0,
+        "sharpe": float(sharpe),
+        "mdd_pct": mdd * 100.0,
+        "calmar": float(calmar),
+    }
+
+
+def _run_awfo_verification(
+    etf_df: pl.DataFrame,
+    index_df: pl.DataFrame,
+    market: str,
+    best_params: Dict[str, Any],
+    awfo_plan: List[Dict[str, Any]],
+) -> None:
+    rows = []
+    all_daily = []
+    all_trades = []
+    for fold in awfo_plan:
+        val_s = fold["val_start"]
+        val_e = fold["val_end"]
+        year = int(fold["eval_year"])
+        val_etf = etf_df.filter((pl.col("date") >= val_s) & (pl.col("date") <= val_e))
+        val_idx = index_df.filter((pl.col("date") >= val_s) & (pl.col("date") <= val_e))
+        bt = ETFBacktester(val_idx, val_etf)
+        res_list = bt.run(best_params, target_market=market)
+        key = f"{market}_HYBRID"
+        res = next((r for r in res_list if r.get("market") == key), None)
+        if not res:
+            continue
+        daily = res.get("daily_returns", [])
+        trades = res.get("trade_list", [])
+        all_daily.extend(daily)
+        all_trades.extend(trades)
+        rows.append(
+            {
+                "Year": year,
+                "Train Period": f"{fold['train_start'].date()} ~ {fold['train_end'].date()}",
+                "Period": f"{val_s.date()} ~ {val_e.date()}",
+                "Return (%)": round(float(res.get("total_return", 0.0)) * 100.0, 2),
+                "MDD (%)": round(float(res.get("mdd", 0.0)) * 100.0, 2),
+                "Trades": int(res.get("trades", 0)),
+                "Win Rate (%)": round(float(res.get("win_rate", 0.0)), 2),
+            }
+        )
+
+    if not rows:
+        print("No AWFO OOS results were produced.")
+        return
+
+    df = pl.DataFrame(rows)
+    print("\n" + "=" * 80)
+    print("ETF AWFO OOS RESULT (Year-by-Year)")
+    print("=" * 80)
+    print(df.to_pandas().to_string(index=False))
+
+    eq = _equity_summary(all_daily)
+    ret_arr = np.asarray(df["Return (%)"].to_list(), dtype=float)
+    print("\n" + "=" * 80)
+    print("ETF AWFO OOS AGGREGATED SUMMARY")
+    print("=" * 80)
+    print(f"Years evaluated      : {df.height}")
+    print(f"Mean yearly return   : {float(np.mean(ret_arr)):.2f}%")
+    print(f"Median yearly return : {float(np.median(ret_arr)):.2f}%")
+    print(f"Positive ratio       : {float(np.mean(ret_arr > 0) * 100.0):.0f}%")
+    print(f"Combined return      : {eq['total_return_pct']:.2f}%")
+    print(f"Combined CAGR        : {eq['cagr_pct']:.2f}%")
+    print(f"Combined Sharpe      : {eq['sharpe']:.4f}")
+    print(f"Combined MDD         : {eq['mdd_pct']:.2f}%")
+    print(f"Combined Calmar      : {eq['calmar']:.4f}")
+
+    print("\nMonte Carlo (10,000 runs)")
+    mc = ETFMonteCarloSimulator(all_trades)
+    mc_res = mc.run(n_simulations=10000)
+    if mc_res.get("is_valid", False):
+        print(f"Probability of Profit : {mc_res['prob_profit']:.2f}%")
+        print(f"Expected Return       : {mc_res['mean_return_pct']:.2f}% (Median: {mc_res['median_return_pct']:.2f}%)")
+        print(f"Worst Case MDD (5%)   : -{mc_res['worst_case_mdd']:.2f}%")
+        print(f"Return Range (95%)    : {mc_res['lower_bound_95']:.2f}% ~ {mc_res['upper_bound_95']:.2f}%")
     else:
-        print("No test data available.")
+        print("Not enough trade samples for Monte Carlo.")
 
-    # 5. Yearly Breakdown (Critical for Regime Check)
-    print("\n" + "="*70)
-    print("📅 YEARLY BREAKDOWN (Regime Check)")
-    print("="*70)
-    print(f"{'Year':<6} | {'Return':<10} | {'MDD':<10} | {'Trades':<8} | {'WinRate':<8} | {'Regime'}")
-    print("-" * 75)
-    
-    # 2017 ~ 2025
-    start_y = s_date.year
-    end_y = e_date.year
-    
-    total_etf = pl.concat([train_etf, test_etf]) if test_etf.height > 0 else train_etf
-    total_idx = pl.concat([train_index, test_index]) if test_index.height > 0 else train_index
-    
-    for y in range(start_y, end_y + 1):
-        y_s = datetime(y, 1, 1)
-        y_e = datetime(y, 12, 31)
-        
-        # Filter (Use strict date filter)
-        sub_etf = total_etf.filter((pl.col("date") >= y_s) & (pl.col("date") <= y_e))
-        sub_idx = total_idx.filter((pl.col("date") >= y_s) & (pl.col("date") <= y_e))
-        
-        if sub_etf.is_empty(): continue
-        
-        bt_year = ETFBacktester(sub_idx, sub_etf)
-        y_res_list = bt_year.run(best_params, target_market=market)
-        y_res = next((r for r in y_res_list if r['market'] == f"{market}_HYBRID"), None)
-        
-        if y_res:
-            ret = y_res['total_return'] * 100
-            mdd = y_res['mdd'] * 100
-            trd = y_res['trades']
-            win = y_res['win_rate']
-            
-            # Simple Regime Annotation
-            regime = ""
-            if y in [2018, 2022]: regime = "📉 Bear"
-            elif y in [2021]: regime = "🦀 Chop"
-            elif y in [2017, 2020, 2024, 2025]: regime = "🚀 Bull"
-            else: regime = "Normal"
-            
-            print(f"{y:<6} | {ret:>8.2f}% | {mdd:>8.2f}% | {trd:<8} | {win:>6.1f}% | {regime}")
 
-    print("="*70)
+def run_static_optimization(etf_df: pl.DataFrame, index_df: pl.DataFrame, args) -> None:
+    market = args.market.upper()
 
-    # 6. Regime Stress Test
-    # Collect all daily returns from Train + Test
-    full_daily_returns = []
-    if train_res and 'daily_returns' in train_res:
-         full_daily_returns.extend(train_res['daily_returns'])
-    if test_res and 'daily_returns' in test_res:
-         full_daily_returns.extend(test_res['daily_returns'])
-         
-    # if full_daily_returns:
-    #    analyze_market_regime_performance(full_daily_returns, total_idx)
+    print("\n" + "=" * 80)
+    print(f"ETF OPTIMIZATION START | Market={market} | AWFO={bool(args.awfo)}")
+    print("=" * 80)
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--market", type=str, default="KOSPI")
+    optimizer = ETFOptimizer(
+        index_df=index_df,
+        etf_df=etf_df,
+        target_market=market,
+        target_leverage="HYBRID",
+        awfo=bool(args.awfo),
+        awfo_start_year=args.awfo_start_year,
+        awfo_end_year=args.awfo_end_year,
+        awfo_train_years=args.awfo_train_years,
+    )
+    best_params = optimizer.run_optimization(
+        n_trials=args.trials,
+        seeds=_parse_seed_list(args.opt_seeds),
+        min_trials_per_seed=args.opt_min_trials_per_seed,
+        n_jobs=args.opt_jobs,
+    )
+
+    out_dir = PROJECT_ROOT / "results" / "etf"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    mode = "awfo" if args.awfo else "single"
+    param_path = out_dir / f"best_params_{market.lower()}_{mode}.json"
+    with open(param_path, "w", encoding="utf-8") as f:
+        json.dump(best_params, f, indent=2, ensure_ascii=False)
+    print(f"Best params saved: {param_path}")
+
+    if getattr(optimizer, "last_optimization_meta", None):
+        meta_path = out_dir / f"opt_meta_{market.lower()}_{mode}.json"
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(optimizer.last_optimization_meta, f, indent=2, ensure_ascii=False)
+        print(f"Optimization meta saved: {meta_path}")
+
+    print("\nBest Params:")
+    print(json.dumps(best_params, indent=2, ensure_ascii=False))
+
+    if args.awfo:
+        _run_awfo_verification(
+            etf_df=etf_df,
+            index_df=index_df,
+            market=market,
+            best_params=best_params,
+            awfo_plan=optimizer.awfo_plan,
+        )
+        return
+
+    backtester = ETFBacktester(index_df, etf_df)
+    res_list = backtester.run(best_params, target_market=market)
+    res = next((r for r in res_list if r.get("market") == f"{market}_HYBRID"), None)
+    if not res:
+        print("No single-period backtest results.")
+        return
+
+    print("\n" + "=" * 80)
+    print("SINGLE-PERIOD BACKTEST RESULT")
+    print("=" * 80)
+    print(f"Total Return : {float(res.get('total_return', 0.0)) * 100.0:.2f}%")
+    print(f"CAGR         : {float(res.get('cagr', 0.0)) * 100.0:.2f}%")
+    print(f"Sharpe       : {(_equity_summary(res.get('daily_returns', [])).get('sharpe', 0.0)):.4f}")
+    print(f"MDD          : {float(res.get('mdd', 0.0)) * 100.0:.2f}%")
+    print(f"Trades       : {int(res.get('trades', 0))}")
+    print(f"Win Rate     : {float(res.get('win_rate', 0.0)):.2f}%")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="ETF static optimization / AWFO optimization")
+    parser.add_argument("--market", type=str, choices=["KOSPI", "KOSDAQ"], default="KOSPI")
     parser.add_argument("--trials", type=int, default=1500)
+    parser.add_argument("--opt_seeds", type=str, default="13,37,73", help="Comma-separated Optuna seeds")
+    parser.add_argument("--opt_min_trials_per_seed", type=int, default=40)
+    parser.add_argument("--opt_jobs", type=int, default=1)
     parser.add_argument("--start", type=str, default="2017-01-01")
     parser.add_argument("--end", type=str, default="2025-12-31")
+
+    parser.add_argument("--awfo", action="store_true", help="Enable AWFO-style multi-year robust optimization")
+    parser.add_argument("--awfo_start_year", type=int, default=None, help="AWFO anchor start year. Default=data min year")
+    parser.add_argument("--awfo_end_year", type=int, default=None, help="AWFO end year. Default=data max year")
+    parser.add_argument("--awfo_train_years", type=int, default=3, help="Minimum train years before first OOS year")
+
     args = parser.parse_args()
-    
     s_date = datetime.strptime(args.start, "%Y-%m-%d")
     e_date = datetime.strptime(args.end, "%Y-%m-%d")
-    
-    etf, idx = asyncio.run(load_all_data(s_date, e_date))
-    if etf is not None:
-        run_static_optimization(etf, idx, args)
+    etf_df, index_df = asyncio.run(load_all_data(s_date, e_date))
+    if etf_df is None or etf_df.is_empty() or index_df is None or index_df.is_empty():
+        print("Failed to load ETF/index data.")
+        return
+    run_static_optimization(etf_df, index_df, args)
+
 
 if __name__ == "__main__":
     main()
