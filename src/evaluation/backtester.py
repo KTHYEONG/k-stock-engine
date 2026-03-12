@@ -47,9 +47,20 @@ class YetiRankBacktester:
     def load_model(self, model_id: Union[int, str]) -> CatBoostRanker:
         """
         [Bulletproof] 시점별 모델 로드 (Look-ahead Bias 방지)
+        - model_id가 'latest'이면 최신 모델 즉시 로드
         - exact matching 우선
         - 없으면 해당 시점 '이전'의 가장 최신 모델 검색
         """
+        if model_id == "latest":
+            latest_path = self.model_dir / "yetirank_latest.cbm"
+            if latest_path.exists():
+                model = CatBoostRanker()
+                model.load_model(str(latest_path))
+                logger.info(f"Using explicitly requested latest model: {latest_path.name}")
+                return model
+            else:
+                logger.warning(f"Requested 'latest' model not found at {latest_path}. Falling back to period search.")
+
         model_path = self.model_dir / f"yetirank_{model_id}.cbm"
         
         if not model_path.exists():
@@ -186,6 +197,7 @@ class YetiRankBacktester:
             period_data = test_df.filter(pl.col("period") == period)
             if period_data.is_empty(): continue
             try:
+                # model_id가 명시되어 있으면(예: 'latest' 또는 특정 분기), 개별 분기 루프에 관계없이 해당 모델 고정 사용
                 target_model_id = self.model_id if self.model_id is not None else period
                 model = self.load_model(target_model_id)
                 X = period_data.select(feature_names).to_pandas()
