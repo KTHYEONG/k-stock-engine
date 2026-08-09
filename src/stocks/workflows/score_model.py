@@ -6,6 +6,7 @@ import polars as pl
 from src.core.instruments import AssetKind
 from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.research.artifacts import ModelArtifactRegistry, PredictionRequest
+from src.stocks.research.datasets import research_eligible_frame
 from src.stocks.research.features import build_features, phase1_allowlist
 from src.stocks.workflows.contracts import ScoringRequest
 
@@ -24,7 +25,7 @@ def score_model(
         decision_time=request.decision_time,
     )
     loaded = registry.load(request.artifact_id, prediction)
-    feature_frame = build_features(snapshot.frame, phase1_allowlist())
+    feature_frame = build_features(research_eligible_frame(snapshot.frame), phase1_allowlist())
     scored = loaded.model.predict(feature_frame)
     if scored.is_empty():
         raise ValueError("no rows scored")
