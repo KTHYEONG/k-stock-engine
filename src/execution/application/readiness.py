@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from src.execution.domain.order import TradeIntent
+from src.execution.domain.intents import TradeIntent
 
 
 class LiveExecutionNotReadyError(RuntimeError):
@@ -68,10 +68,10 @@ class SubmissionGate:
             )
         if request.mode == "live" and not self._readiness.complete:
             raise LiveExecutionNotReadyError(
-                    "live submission disabled: readiness gate not satisfied "
-                    f"(reconciliation={self._readiness.broker_reconciliation}, "
-                    f"transitions={self._readiness.order_state_transitions}, "
-                    f"paper_acceptance={self._readiness.paper_acceptance}, "
-                    f"idempotency={self._readiness.idempotency_verified})"
-                )
+                "live submission disabled: readiness gate not satisfied "
+                f"(reconciliation={self._readiness.broker_reconciliation}, "
+                f"transitions={self._readiness.order_state_transitions}, "
+                f"paper_acceptance={self._readiness.paper_acceptance}, "
+                f"idempotency={self._readiness.idempotency_verified})"
+            )
         self._processed_keys.add(request.intent.idempotency_key)
