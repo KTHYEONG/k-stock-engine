@@ -9,9 +9,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from hashlib import sha256
 
 from src.core.instruments import AssetKind
+
+
+class DatasetCertification(StrEnum):
+    """Explicit dataset certification tier.
+
+    ``PROVISIONAL`` data may support research diagnostics only; ``RESEARCH``
+    supports research and paper workflows; ``PRODUCTION`` is the only tier that
+    may feed promoted artifacts or live trading. Certification is never
+    inferred from a filename or a source provider.
+    """
+
+    PROVISIONAL = "provisional"
+    RESEARCH = "research"
+    PRODUCTION = "production"
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,12 +51,35 @@ class DatasetManifest:
     time_end: datetime
     generated_time: datetime
     row_count: int
+    certification: DatasetCertification = DatasetCertification.PROVISIONAL
+    calendar_hash: str = ""
+    corporate_action_hash: str = ""
+    cost_source_hash: str = ""
 
     def __post_init__(self) -> None:
         if self.asset_kind not in (AssetKind.STOCK, AssetKind.ETF):
             raise ValueError(f"asset_kind must be STOCK or ETF, got {self.asset_kind}")
         if self.row_count < 0:
             raise ValueError("row_count must be non-negative")
+
+
+def validate_production_manifest(manifest: DatasetManifest) -> None:
+    """Fail closed unless the manifest is production-certified and complete.
+
+    Production requires explicit calendar, corporate-action, and cost-source
+    coverage hashes in addition to the certification tier. A missing hash is
+    treated as missing coverage, never as an implicit acceptable default.
+    """
+    if manifest.certification is not DatasetCertification.PRODUCTION:
+        raise ValueError(
+            f"production requires PRODUCTION certification, got {manifest.certification.value}"
+        )
+    if not manifest.calendar_hash:
+        raise ValueError("production manifest must carry a calendar_hash")
+    if not manifest.corporate_action_hash:
+        raise ValueError("production manifest must carry a corporate_action_hash")
+    if not manifest.cost_source_hash:
+        raise ValueError("production manifest must carry a cost_source_hash")
 
 
 def schema_hash(columns: list[str]) -> str:
@@ -62,6 +100,10 @@ def make_manifest(
     universe_policy_version: str,
     row_count: int,
     generated_time: datetime | None = None,
+    certification: DatasetCertification = DatasetCertification.PROVISIONAL,
+    calendar_hash: str = "",
+    corporate_action_hash: str = "",
+    cost_source_hash: str = "",
 ) -> DatasetManifest:
     """Build a manifest from a concrete column list (hashing the schema).
 
@@ -84,6 +126,10 @@ def make_manifest(
         time_end=time_end,
         generated_time=generated_time or datetime.now(UTC),
         row_count=row_count,
+        certification=certification,
+        calendar_hash=calendar_hash,
+        corporate_action_hash=corporate_action_hash,
+        cost_source_hash=cost_source_hash,
     )
 
 
