@@ -7,7 +7,7 @@ from datetime import datetime
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
-from src.data.feature_store import FeatureStore
+from src.legacy.stock_yetirank_v1.data.feature_store import FeatureStore
 from config.base import DATA_DIR
 
 def check_readiness(start_date: str = "20160101", end_date: str = "20251231"):

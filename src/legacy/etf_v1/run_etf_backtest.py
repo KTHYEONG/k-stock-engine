@@ -16,8 +16,8 @@ sys.path.append(str(PROJECT_ROOT))
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("run_backtest")
 
-from src.data.etf_manager import ETFManager
-from src.etf.backtester import ETFBacktester
+from src.legacy.etf_v1.etf_manager import ETFManager
+from src.legacy.etf_v1.backtester import ETFBacktester
 
 async def load_data(start_date: datetime, end_date: datetime):
     """

@@ -2,9 +2,9 @@ import polars as pl
 import logging
 from typing import Dict, Any
 
-from src.filters.quality import apply_quality_filter
-from src.filters.liquidity import apply_liquidity_filter
-from src.filters.volatility import apply_volatility_filter
+from src.legacy.stock_yetirank_v1.filters.quality import apply_quality_filter
+from src.legacy.stock_yetirank_v1.filters.liquidity import apply_liquidity_filter
+from src.legacy.stock_yetirank_v1.filters.volatility import apply_volatility_filter
 
 logger = logging.getLogger("filters.pipeline")
 

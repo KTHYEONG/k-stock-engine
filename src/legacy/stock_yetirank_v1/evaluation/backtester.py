@@ -12,8 +12,8 @@ import matplotlib.pyplot as plt
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
-from src.training.data_loader import YetiRankDataLoader
-from src.utils.logger import setup_logger
+from src.legacy.stock_yetirank_v1.training.data_loader import YetiRankDataLoader
+from src.legacy.stock_yetirank_v1.utils.logger import setup_logger
 
 # Mute verbose info logs from data_loader
 logging.getLogger("training.data_loader").setLevel(logging.WARNING)
