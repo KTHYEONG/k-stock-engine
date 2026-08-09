@@ -4,7 +4,7 @@ from __future__ import annotations
 import polars as pl
 import pytest
 
-from src.stocks.ml.splits import PurgedWalkForward
+from src.stocks.research.folds import PurgedWalkForward
 from tests.fixtures.stocks.helpers import stock_instrument_df
 
 

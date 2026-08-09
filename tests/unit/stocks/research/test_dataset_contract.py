@@ -3,12 +3,12 @@ from __future__ import annotations
 
 from datetime import datetime, UTC
 
-import polars as pl
 import pytest
 
 from src.core.instruments import AssetKind
 from src.core.time import TemporalViolationError
-from src.stocks.ml.dataset import make_manifest, schema_hash, validate_dataset_manifest
+from src.core.datasets import make_manifest, schema_hash, validate_dataset_manifest
+from src.stocks.research.datasets import validate_stock_rows_available
 from tests.fixtures.stocks.helpers import stock_instrument_df, stock_manifest
 
 
@@ -45,7 +45,7 @@ class TestDatasetContract:
         decision_time = datetime(2024, 1, 5, 8, 0, tzinfo=UTC)
         assert df["date"].max() > decision_time
         with pytest.raises(TemporalViolationError):
-            validate_row_availability(df, decision_time)
+            validate_stock_rows_available(df, decision_time)
 
     def test_valid_stock_row_keeps_schema_and_universe_fingerprints(self) -> None:
         df = stock_instrument_df(n_sessions=5, n_tickers=2)
@@ -58,18 +58,11 @@ class TestDatasetContract:
             label_horizon_sessions=5,
             time_start=datetime(2024, 1, 1, tzinfo=UTC),
             time_end=datetime(2024, 1, 5, tzinfo=UTC),
+            provider_version="fixture",
+            universe_policy_version="v1",
             row_count=df.height,
         )
         assert manifest.schema_hash == schema_hash(columns)
         assert manifest.asset_kind is AssetKind.STOCK
         assert manifest.universe_policy_hash  # non-empty fingerprint
         assert manifest.feature_set_hash  # non-empty fingerprint
-
-
-def validate_row_availability(df: pl.DataFrame, decision_time: datetime) -> None:
-    """Contract check: no row may become available after decision time."""
-    late = df.filter(pl.col("date") > decision_time)
-    if not late.is_empty():
-        raise TemporalViolationError(
-            f"{late.height} rows available after decision_time {decision_time.isoformat()}"
-        )

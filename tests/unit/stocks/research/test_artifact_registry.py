@@ -6,12 +6,12 @@ from datetime import datetime, UTC
 import pytest
 
 from src.core.instruments import AssetKind
-from src.stocks.ml.artifacts import (
+from src.stocks.research.artifacts import (
     ModelArtifactRegistry,
     PredictionRequest,
 )
-from src.stocks.ml.dataset import schema_hash
-from src.stocks.ml.models import DeterministicBaseline, ModelManifest
+from src.stocks.research.datasets import schema_hash
+from src.stocks.research.models import DeterministicBaseline, ModelManifest
 
 FEATURES = ["session_index", "instrument_id", "feature_momentum_5d", "date"]
 

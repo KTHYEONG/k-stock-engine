@@ -7,19 +7,23 @@ from datetime import datetime, timedelta, UTC
 import pytest
 
 from src.core.instruments import AssetKind
-from src.execution.application.run_cycle import run_cycle
-from src.execution.application.submission_gate import (
+from src.execution.adapters.in_memory_state_store import InMemoryStateStore
+from src.execution.adapters.paper_broker import ConstantPriceProvider, PaperBroker
+from src.execution.application.readiness import (
     LiveExecutionNotReadyError,
     ReadinessEvidence,
     SubmissionGate,
     SubmissionRequest,
 )
-from src.execution.domain.order import OrderSide, OrderState, TradeIntent
-from src.execution.infrastructure.paper import InMemoryStateStore, PaperBroker
+from src.execution.application.submit_intents import ExecutionContext, submit_intents
+from src.execution.domain.intents import TradeIntent
+from src.execution.domain.orders import OrderState
+from src.execution.settings import DEFAULT_EXECUTION
 
 
 def make_intent(suffix: str = "a") -> TradeIntent:
-    decision = datetime(2024, 6, 1, 8, 50, tzinfo=UTC)
+    # 10:00 KST == 01:00 UTC, safely inside the KRX_DAILY session
+    decision = datetime(2024, 6, 3, 1, 0, tzinfo=UTC)
     return TradeIntent(
         intent_id=f"intent-{suffix}",
         asset_kind=AssetKind.STOCK,
@@ -30,6 +34,18 @@ def make_intent(suffix: str = "a") -> TradeIntent:
         strategy_id="stock_alpha_v1",
         reason="score-rank-policy",
         idempotency_key=f"stock_alpha_v1:005930:{decision.date().isoformat()}",
+    )
+
+
+def paper_context(
+    *, gate: SubmissionGate | None = None, store: InMemoryStateStore | None = None
+) -> ExecutionContext:
+    return ExecutionContext(
+        settings=DEFAULT_EXECUTION,
+        gate=gate or SubmissionGate(ReadinessEvidence()),
+        broker=PaperBroker(),
+        state_store=store or InMemoryStateStore(),
+        price_provider=ConstantPriceProvider(5_000.0),
     )
 
 
@@ -62,36 +78,32 @@ class TestSubmissionGate:
             gate.authorize(SubmissionRequest(intent=make_intent("bad"), mode="nope"))
 
 
-class TestRunCycle:
-    def test_run_cycle_emits_intents_in_paper_mode(self) -> None:
-        gate = SubmissionGate(ReadinessEvidence())
-        broker = PaperBroker()
+class TestSubmitIntents:
+    def test_submit_intents_fills_in_paper_mode(self) -> None:
         store = InMemoryStateStore()
-        intents = [make_intent("x"), make_intent("y")]
-        # unique idempotency keys required for the second intent
-        intents[1] = replace(
-            intents[0], intent_id="intent-y", idempotency_key="key-y"
-        )
-        records = run_cycle(intents, submission_gate=gate, broker=broker, state_store=store)
+        gate = SubmissionGate(ReadinessEvidence())
+        context = paper_context(gate=gate, store=store)
+        intents = [make_intent("x"), replace(make_intent("y"), intent_id="intent-y", idempotency_key="key-y")]
+        records = submit_intents(intents, context)
         assert len(records) == 2
         assert all(r.state is OrderState.FILLED for r in records)
-        assert all(r.side is OrderSide.BUY for r in records)
 
-    def test_run_cycle_rejects_duplicate_intent(self) -> None:
-        gate = SubmissionGate()
-        broker = PaperBroker()
+    def test_order_quantity_is_value_over_price_not_raw_value(self) -> None:
+        context = paper_context()
+        intent = make_intent("q")
+        records = submit_intents([intent], context)
+        assert records[0].submitted_quantity == 1_000_000.0 / 5_000.0
+
+    def test_submit_intents_rejects_duplicate_intent(self) -> None:
         store = InMemoryStateStore()
+        context = paper_context(store=store)
         intent = make_intent()
-        run_cycle([intent], submission_gate=gate, broker=broker, state_store=store)
+        submit_intents([intent], context)
         with pytest.raises(ValueError, match="duplicate"):
-            run_cycle([intent], submission_gate=gate, broker=broker, state_store=store)
+            submit_intents([intent], context)
 
-    def test_live_broker_not_enabled_in_run_cycle(self) -> None:
-        # run_cycle hard-codes paper mode; no live path exists yet
-        from src.execution.application.run_cycle import make_default_cycle
-
-        gate, broker, store = make_default_cycle()
-        assert isinstance(broker, PaperBroker)
+    def test_paper_is_the_only_default_mode(self) -> None:
+        assert DEFAULT_EXECUTION.default_mode == "paper"
 
     def test_validator_rejects_negative_value(self) -> None:
         # fail-closed: a non-positive target value cannot even be constructed
