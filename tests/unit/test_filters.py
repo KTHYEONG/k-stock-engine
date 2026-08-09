@@ -17,69 +17,57 @@ class TestLayer1Filters(unittest.TestCase):
     def setUp(self):
         # Dummy Data 생성
         self.df = pl.DataFrame({
-            "ticker": ["A001", "A002", "A003", "A004", "A005"],
+            "ticker": ["000010", "000020", "000030", "000040", "000050"],
             "date": ["2026-01-01"] * 5,
             
             # Quality Cols
-            "pbr": [1.2, 0.05, 0.0, None, 0.5],  # 002(Low PBR), 003(Zero), 004(Null) -> Should fail
-            "capital_erosion_rate": [10.0, 20.0, 0.0, 0.0, 60.0], # 005(Erosion > 50) -> Should fail
+            "capital_erosion_rate": [0.0, 20.0, 0.0, 0.0, 60.0],
+            "operating_income": [1.0, 1.0, -1.0, 1.0, 1.0],
             
             # Liquidity Cols
-            "market_cap": [200e9, 200e9, 200e9, 200e9, 5e9], # 005(Low Cap < 100억) -> Should fail
-            "turnover_ratio": [0.1, 0.1, 0.6, 0.1, 0.1], # 003(High Turnover > 0.5) -> Should fail
-            "trading_value": [50e9, 50e9, 50e9, 50e9, 50e9],
+            "adtv_20d": [50e9, 50e9, 50e9, 50e9, 1e9],
+            "close": [1000.0, 1000.0, 1000.0, 1000.0, 1000.0],
             
             # Volatility Cols
-            "volume": [1000, 1000, 1000, 0, 1000], # 004(Volume=0) -> Should fail
+            "min_vol_5d": [1000, 1000, 1000, 0, 1000],
         })
         
     def test_quality_filter(self):
         filtered = apply_quality_filter(self.df)
         tickers = filtered["ticker"].to_list()
         
-        # A002(PBR 0.05 < 0.1): Fail
-        # A003(PBR 0.0): Fail
-        # A004(PBR Null): Fail
-        # A005(Erosion 60): Fail
-        # Expected: Only A001
-        self.assertIn("A001", tickers)
-        self.assertNotIn("A002", tickers)
-        self.assertNotIn("A003", tickers)
-        self.assertNotIn("A005", tickers)
+        # A002(자본잠식률 > 0), A003(영업손실), A005(자본잠식률 > 0): Fail
+        # A004는 재무 건전성 필터를 통과한다.
+        assert tickers == ["000010", "000040"]
         
     def test_liquidity_filter(self):
         filtered = apply_liquidity_filter(self.df)
         tickers = filtered["ticker"].to_list()
         
-        # A003(Turnover 0.6 > 0.5): Fail
-        # A005(Cap 50억 < 100억): Fail
-        # Expected: A001, A002, A004
-        self.assertIn("A001", tickers)
-        self.assertIn("A002", tickers)
-        self.assertNotIn("A003", tickers)
-        self.assertNotIn("A005", tickers)
+        # A005(ADTV < 50억): Fail
+        assert tickers == ["000010", "000020", "000030", "000040"]
 
     def test_volatility_filter(self):
         filtered = apply_volatility_filter(self.df)
         tickers = filtered["ticker"].to_list()
         
-        # A004(Volume 0): Fail
-        self.assertIn("A001", tickers)
-        self.assertNotIn("A004", tickers)
+        # A004(최근 5거래일 최소 거래량 0): Fail
+        assert "000010" in tickers
+        assert "000040" not in tickers
         
     def test_pipeline(self):
         # 모든 필터 통과해야 하는 종목: A001만 남아야 함?
-        # A002: Qual Fail
-        # A003: Qual Fail, Liq Fail
-        # A004: Qual Fail, Vol Fail
-        # A005: Qual Fail, Liq Fail
+        # A002: Quality Fail
+        # A003: Quality Fail
+        # A004: Volatility Fail
+        # A005: Quality/Liquidity Fail
         
         pipeline = UniverseFilter()
         result = pipeline.apply_all(self.df)
         tickers = result["ticker"].to_list()
         
-        self.assertEqual(len(tickers), 1)
-        self.assertEqual(tickers[0], "A001")
+        assert len(tickers) == 1
+        assert tickers[0] == "000010"
 
 if __name__ == '__main__':
     unittest.main()
