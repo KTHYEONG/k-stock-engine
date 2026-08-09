@@ -5,8 +5,8 @@ import pytest
 
 from src.core.instruments import AssetKind
 from src.etfs.domain.universe import KOSPI_ETF_UNIVERSE
-from src.etfs.simulation.runner import EtfBacktester, EtfSimulationConfig, IndexSwitchParams
-from src.etfs.strategies.index_switch_v1 import IndexSwitchV1
+from src.etfs.backtesting.engine import EtfBacktester, EtfSimulationConfig
+from src.etfs.strategies.index_switch_v1 import IndexSwitchParams, IndexSwitchV1
 from tests.fixtures.etfs.helpers import make_etf_fixture, preprocess_index
 
 

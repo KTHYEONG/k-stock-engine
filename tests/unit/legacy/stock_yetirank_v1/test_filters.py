@@ -1,16 +1,9 @@
-import sys
-from pathlib import Path
-
-# 프로젝트 루트를 Python path에 추가
-project_root = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(project_root))
-
 import unittest
 import polars as pl
-from src.filters.quality import apply_quality_filter
-from src.filters.liquidity import apply_liquidity_filter
-from src.filters.volatility import apply_volatility_filter
-from src.filters.pipeline import UniverseFilter
+from src.legacy.stock_yetirank_v1.filters.quality import apply_quality_filter
+from src.legacy.stock_yetirank_v1.filters.liquidity import apply_liquidity_filter
+from src.legacy.stock_yetirank_v1.filters.volatility import apply_volatility_filter
+from src.legacy.stock_yetirank_v1.filters.pipeline import UniverseFilter
 
 class TestLayer1Filters(unittest.TestCase):
     

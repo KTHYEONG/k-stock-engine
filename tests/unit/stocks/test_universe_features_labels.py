@@ -8,8 +8,8 @@ import pytest
 
 from src.core.instruments import AssetKind
 from src.stocks.domain.universe import PointInTimeUniverse, UniversePolicy
-from src.stocks.features.definitions import MomentumFeature, build_features, feature_set_fingerprint
-from src.stocks.labels.definitions import LabelDefinition
+from src.stocks.research.features import MomentumFeature, build_features, feature_set_fingerprint
+from src.stocks.research.labels import LabelDefinition
 
 
 def universe_frame() -> pl.DataFrame:
