@@ -305,5 +305,8 @@
   },
   "src/storage/parquet_datasets.py": {
     "testing": "tests/unit/storage/test_parquet_datasets.py"
+  },
+  "src/stocks/data/quality.py": {
+    "testing": "tests/unit/stocks/data/test_quality.py"
   }
 }
