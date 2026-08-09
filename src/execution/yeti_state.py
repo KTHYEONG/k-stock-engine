@@ -21,7 +21,7 @@ class PositionState:
 class StateManager:
     """SQLite-based local state for live trading positions and orders."""
 
-    def __init__(self, db_name: str = "trading_state.db"):
+    def __init__(self, db_name: str = "data/trading_state.db"):
         self.db_path = BASE_DIR / db_name
         self._init_db()
 
