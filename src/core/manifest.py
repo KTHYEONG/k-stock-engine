@@ -1,0 +1,81 @@
+"""Shared dataset manifest contract (low-level data boundary type).
+
+``core`` is intentionally small and cannot import ``stocks``, ``etfs``, or a
+provider library, so the manifest lives here and is reused by both asset
+subsystems.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from hashlib import sha256
+
+from src.core.instruments import AssetKind
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetManifest:
+    """Metadata contract written alongside a curated Parquet dataset.
+
+    Consumers validate the manifest before reading Parquet. Mixing stock and
+    ETF rows into one artifact, feature set, or model request is invalid.
+    """
+
+    asset_kind: AssetKind
+    schema_version: str
+    schema_hash: str
+    provider_version: str
+    universe_policy_version: str
+    universe_policy_hash: str
+    feature_set: str
+    feature_set_hash: str
+    label_definition: str
+    label_horizon_sessions: int
+    time_start: datetime
+    time_end: datetime
+    generated_time: datetime
+    row_count: int
+
+    def __post_init__(self) -> None:
+        if self.asset_kind not in (AssetKind.STOCK, AssetKind.ETF):
+            raise ValueError(f"asset_kind must be STOCK or ETF, got {self.asset_kind}")
+        if self.row_count < 0:
+            raise ValueError("row_count must be non-negative")
+
+
+def schema_hash(columns: list[str]) -> str:
+    """Deterministic fingerprint of a column list, stable across sessions."""
+    return sha256("\n".join(columns).encode("utf-8")).hexdigest()
+
+
+def make_manifest(
+    *,
+    asset_kind: AssetKind,
+    columns: list[str],
+    feature_set: str,
+    label_definition: str,
+    label_horizon_sessions: int,
+    time_start: datetime,
+    time_end: datetime,
+    provider_version: str = "fixture",
+    universe_policy_version: str = "fixture",
+    row_count: int,
+    generated_time: datetime | None = None,
+) -> DatasetManifest:
+    """Build a manifest from a concrete column list (hashing the schema)."""
+    return DatasetManifest(
+        asset_kind=asset_kind,
+        schema_version="v1",
+        schema_hash=schema_hash(columns),
+        provider_version=provider_version,
+        universe_policy_version=universe_policy_version,
+        universe_policy_hash=schema_hash(["fixture-universe"]),
+        feature_set=feature_set,
+        feature_set_hash=schema_hash([feature_set]),
+        label_definition=label_definition,
+        label_horizon_sessions=label_horizon_sessions,
+        time_start=time_start,
+        time_end=time_end,
+        generated_time=generated_time or datetime.now(UTC),
+        row_count=row_count,
+    )
