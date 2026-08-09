@@ -23,9 +23,49 @@ __all__ = [
 
 
 def validate_stock_rows_available(df: pl.DataFrame, decision_time: datetime) -> None:
-    """Fail closed if any stock row becomes available after ``decision_time``."""
-    late = df.filter(pl.col("date") > decision_time)
+    """Fail closed on any point-in-time violation.
+
+    Requires explicit ``observation_time`` and ``available_time`` columns rather
+    than treating the session date as availability. Raises
+    ``TemporalViolationError`` when an observation is newer than its
+    availability or when a row becomes available after ``decision_time``, and
+    ``ValueError`` for duplicate or non-monotonic instrument sessions.
+    """
+    required = ("instrument_id", "session", "observation_time", "available_time")
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"panel must carry {', '.join(missing)}")
+
+    duplicates = (
+        df.group_by(["instrument_id", "session"])
+        .len()
+        .filter(pl.col("len") > 1)
+    )
+    if not duplicates.is_empty():
+        raise ValueError("duplicate (instrument_id, session) rows")
+
+    non_monotonic = (
+        df.with_columns(
+            pl.col("observation_time")
+            .shift(1)
+            .over("instrument_id")
+            .alias("_prev_obs")
+        )
+        .filter(
+            pl.col("_prev_obs").is_not_null()
+            & (pl.col("observation_time") < pl.col("_prev_obs"))
+        )
+    )
+    if not non_monotonic.is_empty():
+        raise ValueError("instrument observation times must be non-decreasing")
+
+    late = df.filter(pl.col("observation_time") > pl.col("available_time"))
     if not late.is_empty():
         raise TemporalViolationError(
-            f"{late.height} rows available after decision_time {decision_time.isoformat()}"
+            f"{late.height} rows observe after available_time"
+        )
+    late_decision = df.filter(pl.col("available_time") > decision_time)
+    if not late_decision.is_empty():
+        raise TemporalViolationError(
+            f"{late_decision.height} rows available after decision_time {decision_time.isoformat()}"
         )
