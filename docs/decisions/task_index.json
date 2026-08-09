@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_DATA_CURATION_MIGRATION",
+      "date": "2026-08-09",
+      "adr_id": "ADR_20260809_STOCK_DATA_CURATION_MIGRATION",
+      "domain": "stocks",
+      "title": "Canonical stock data curation and backtest readiness",
+      "why": "Legacy feature partitions were not directly consumable by the modern point-in-time research and replay contracts, and filesystem paths needed to be independent of .env.",
+      "resolution": "Added deterministic legacy-to-v2 curation with target separation, PIT timestamps, quality quarantine, manifest/content hashes, Hive-partitioned Parquet storage, tamper validation, repository-local data paths, and curate/train/simulate wiring.",
+      "impact": "The existing data/processed/features source remains immutable and provisional; canonical data/curated/stocks is the required input for reproducible training and backtesting, while promotion/live remains fail-closed until lineage evidence is supplied."
+    },
+    {
       "task_id": "TASK_KR_EQUITY_TRADING_ENGINE",
       "date": "2026-08-09",
       "adr_id": "ADR_20260809_KR_EQUITY_TRADING_ENGINE",

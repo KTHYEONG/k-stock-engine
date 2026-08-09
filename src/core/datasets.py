@@ -29,6 +29,12 @@ class DatasetCertification(StrEnum):
     PRODUCTION = "production"
 
 
+# Declared physical layout of curated datasets. ``storage_layout`` values are
+# part of the manifest contract: an unknown layout fails validation instead of
+# being guessed at read time.
+HIVE_PARTITION_LAYOUT = "hive:partitions/year(session)/month(session)"
+
+
 @dataclass(frozen=True, slots=True)
 class DatasetManifest:
     """Metadata contract written alongside a curated Parquet dataset.
@@ -55,12 +61,18 @@ class DatasetManifest:
     calendar_hash: str = ""
     corporate_action_hash: str = ""
     cost_source_hash: str = ""
+    content_hash: str = ""
+    storage_layout: str = ""
 
     def __post_init__(self) -> None:
         if self.asset_kind not in (AssetKind.STOCK, AssetKind.ETF):
             raise ValueError(f"asset_kind must be STOCK or ETF, got {self.asset_kind}")
         if self.row_count < 0:
             raise ValueError("row_count must be non-negative")
+        if self.schema_version not in ("v1", "v2"):
+            raise ValueError(f"unsupported schema_version {self.schema_version!r}")
+        if self.storage_layout not in ("", HIVE_PARTITION_LAYOUT):
+            raise ValueError(f"unknown storage_layout {self.storage_layout!r}")
 
 
 def validate_production_manifest(manifest: DatasetManifest) -> None:
@@ -104,16 +116,21 @@ def make_manifest(
     calendar_hash: str = "",
     corporate_action_hash: str = "",
     cost_source_hash: str = "",
+    schema_version: str = "v1",
+    content_hash: str = "",
+    storage_layout: str = "",
 ) -> DatasetManifest:
     """Build a manifest from a concrete column list (hashing the schema).
 
     Provenance is explicit: provider and universe policy versions must be
     supplied by the caller. No fixture defaults are baked into the production
-    factory, so production provenance can never be silently fabricated.
+    factory, so production provenance can never be silently fabricated. New
+    curated datasets advance ``schema_version`` to ``"v2"`` and must carry the
+    immutable ``content_hash`` and declared ``storage_layout``.
     """
     return DatasetManifest(
         asset_kind=asset_kind,
-        schema_version="v1",
+        schema_version=schema_version,
         schema_hash=schema_hash(columns),
         provider_version=provider_version,
         universe_policy_version=universe_policy_version,
@@ -130,6 +147,8 @@ def make_manifest(
         calendar_hash=calendar_hash,
         corporate_action_hash=corporate_action_hash,
         cost_source_hash=cost_source_hash,
+        content_hash=content_hash,
+        storage_layout=storage_layout,
     )
 
 
@@ -159,6 +178,10 @@ def validate_dataset_manifest(
             f"dataset not available at decision_time: dataset ends "
             f"{manifest.time_end.isoformat()}, decision at {decision_time.isoformat()}"
         )
+    if manifest.schema_version == "v2" and not manifest.content_hash:
+        raise ValueError("v2 manifest must carry a content_hash")
+    if manifest.schema_version == "v2" and not manifest.storage_layout:
+        raise ValueError("v2 manifest must carry a storage_layout")
     if not manifest.schema_hash:
         raise ValueError("manifest schema_hash must not be empty")
     if not manifest.universe_policy_hash:
