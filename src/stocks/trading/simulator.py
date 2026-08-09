@@ -5,9 +5,10 @@ from dataclasses import dataclass
 
 import polars as pl
 
+from src.core.costs import CostModel
 from src.core.instruments import AssetKind
-from src.core.portfolio import CostModel, Position
-from src.stocks.strategies.portfolio_policy import PortfolioPolicy
+from src.core.portfolio import Position
+from src.stocks.trading.allocation_policy import AllocationPolicy
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,7 +29,7 @@ class StockSimulator:
     def simulate(
         self,
         scores: pl.DataFrame,
-        policy: PortfolioPolicy,
+        policy: AllocationPolicy,
         asset_kind: AssetKind,
         price_frame: pl.DataFrame | None = None,
     ) -> SimResult:
