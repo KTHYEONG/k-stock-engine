@@ -13,7 +13,7 @@ from pathlib import Path
 
 import polars as pl
 
-from src.core.datasets import DatasetManifest, make_manifest
+from src.core.datasets import DatasetCertification, DatasetManifest, make_manifest
 from src.core.instruments import AssetKind
 from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.research.datasets import (
@@ -21,6 +21,7 @@ from src.stocks.research.datasets import (
     QUALITY_REASON_COLUMN,
     QUALITY_STATUS_COLUMN,
     QUARANTINED_STATUS,
+    research_eligible_frame,
 )
 from src.storage.parquet_datasets import ParquetDatasetStore
 
@@ -195,13 +196,37 @@ class StockDatasetRepository:
         feature_set: str,
         decision_time: datetime,
     ) -> DatasetSnapshot:
-        """Read a validated stock dataset snapshot (stock kind enforced)."""
+        """Read a validated stock dataset snapshot (stock kind enforced).
+
+        Enforces the manifest's requested certification tier and exposes only
+        ``eligible`` rows to modern workflows. A research/production dataset
+        must carry validated master, calendar, action, and quality-report
+        evidence hashes; otherwise the read fails closed.
+        """
         manifest = self.store.read_manifest(dataset_id)
         self._assert_stock(manifest)
         frame = self.store.read(
             dataset_id, AssetKind.STOCK, feature_set, decision_time
         )
+        self._assert_tier_evidence(manifest)
+        frame = research_eligible_frame(frame)
         return DatasetSnapshot(manifest=manifest, frame=frame)
+
+    def _assert_tier_evidence(self, manifest: DatasetManifest) -> None:
+        if manifest.certification is DatasetCertification.PROVISIONAL:
+            return
+        evidence = {
+            "calendar_hash": manifest.calendar_hash,
+            "corporate_action_hash": manifest.corporate_action_hash,
+            "master_hash": manifest.master_hash,
+            "quality_report_hash": manifest.quality_report_hash,
+        }
+        missing = [name for name, value in evidence.items() if not value]
+        if missing:
+            raise ValueError(
+                f"{manifest.certification.value} read requires evidence hashes, "
+                f"missing {missing}"
+            )
 
     def _assert_stock(self, manifest: DatasetManifest) -> None:
         if manifest.asset_kind is not AssetKind.STOCK:
