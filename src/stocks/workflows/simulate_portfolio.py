@@ -1,7 +1,7 @@
-"""Stock portfolio-simulation workflow: artifact -> allocations -> simulator."""
+"""Stock portfolio-simulation workflow: artifact -> allocations -> ledger simulator."""
 from __future__ import annotations
 
-from src.core.costs import CostModel
+from src.core.costs import default_base_schedule
 from src.core.instruments import AssetKind
 from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.research.artifacts import ModelArtifactRegistry
@@ -16,7 +16,7 @@ def simulate_portfolio(
     registry: ModelArtifactRegistry,
     request: SimulationRequest,
 ) -> SimResult:
-    """Score the snapshot, apply the allocation policy, and simulate fills."""
+    """Score the snapshot, apply the constrained policy, and run the ledger."""
     scored = score_model(
         snapshot,
         registry,
@@ -26,6 +26,13 @@ def simulate_portfolio(
         top_k=request.top_k,
         max_single_weight=request.max_single_weight,
         max_exposure=request.max_exposure,
+        participation_limit=request.participation_limit,
+        portfolio_value=request.portfolio_value,
     )
-    simulator = StockSimulator(CostModel(commission_rate=0.00015, tax_rate=0.0023))
-    return simulator.simulate(scored, policy, AssetKind.STOCK, price_frame=scored)
+    simulator = StockSimulator(
+        cost_schedule=request.cost_schedule or default_base_schedule(),
+        initial_cash=request.initial_cash,
+        adtv_participation_limit=request.participation_limit,
+        stress_schedule=request.stress_cost_schedule,
+    )
+    return simulator.simulate(scored, policy, AssetKind.STOCK)
