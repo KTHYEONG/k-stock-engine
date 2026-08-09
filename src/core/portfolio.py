@@ -1,21 +1,12 @@
-"""Portfolio and cost primitives shared by stock and ETF subsystems."""
+"""Portfolio primitives shared by stock and ETF subsystems.
+
+Fill-side cost contracts live in ``core.costs``.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 from src.core.instruments import Instrument
-
-
-@dataclass(frozen=True, slots=True)
-class CostModel:
-    """Fee/tax/slippage assumptions as typed inputs, not strategy constants."""
-
-    commission_rate: float = 0.0
-    tax_rate: float = 0.0
-    slippage_bps: float = 0.0
-
-    def round_trip_cost(self, notional: float) -> float:
-        return notional * (self.commission_rate * 2 + self.tax_rate + self.slippage_bps / 10_000)
 
 
 @dataclass(frozen=True, slots=True)
