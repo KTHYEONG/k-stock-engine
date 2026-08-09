@@ -1,4 +1,1 @@
-"""Re-export of execution ports."""
-from src.execution.ports.broker import BrokerPort, StateStorePort
-
-__all__ = ["BrokerPort", "StateStorePort"]
+"""Execution ports: independent broker and state-store boundaries."""
