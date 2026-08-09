@@ -264,6 +264,7 @@ class FeatureAvailabilityRecord:
     source_hash: str
     null_rate: float
     use_class: str
+    available_time: datetime | None = None
 
     def __post_init__(self) -> None:
         if not self.feature_name:
@@ -274,6 +275,8 @@ class FeatureAvailabilityRecord:
             raise ValueError("null_rate must be within [0, 1]")
         if self.use_class not in ("research", "audit"):
             raise ValueError(f"unknown use_class {self.use_class!r}")
+        if self.available_time is not None and self.available_time.tzinfo is None:
+            raise ValueError("available_time must be timezone-aware")
 
 
 @dataclass(frozen=True, slots=True)
@@ -307,6 +310,7 @@ class StockDataQualityPolicy:
                     f.source_hash,
                     repr(f.null_rate),
                     f.use_class,
+                    f.available_time.isoformat() if f.available_time else "",
                 )
             )
             for f in sorted(self.feature_availability, key=lambda r: r.feature_name)
