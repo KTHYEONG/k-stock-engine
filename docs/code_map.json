@@ -224,7 +224,10 @@
       "tests/unit/stocks/test_simulation.py"
     ]
   },
-  "src/stocks/data/repositories.py": {},
+  "src/stocks/data/repositories.py": {
+    "architecture": "docs/specs/stock_ohlc_quality_quarantine.md",
+    "testing": "tests/unit/stocks/data/test_repositories.py"
+  },
   "src/stocks/data/sources.py": {},
   "src/stocks/domain/universe.py": {
     "testing": "tests/unit/stocks/test_universe_features_labels.py"
