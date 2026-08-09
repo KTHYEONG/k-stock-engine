@@ -1,0 +1,14 @@
+{
+  "tasks": [
+    {
+      "task_id": "TASK_STOCK_ETF_ML_REFACTOR",
+      "date": "2026-08-09",
+      "adr_id": "ADR_20260809_STOCK_ETF_ML_REFACTOR",
+      "domain": "architecture",
+      "title": "Separate stock and ETF architecture with replaceable ML",
+      "why": "Historical stock YetiRank, ETF strategy, data processing, simulation, and unfinished execution paths were coupled and lacked explicit asset boundaries.",
+      "resolution": "Introduced explicit core asset contracts, isolated stocks and etfs packages, point-in-time ML dataset/split/artifact boundaries, ETF parity fixtures, and paper-only execution gates; aligned filters tests and quality tooling with the migration boundary.",
+      "impact": "Research and simulation paths are structurally separated; legacy modules remain excluded/read-only during migration, and live order submission remains gated."
+    }
+  ]
+}
