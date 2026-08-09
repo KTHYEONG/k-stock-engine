@@ -3,26 +3,15 @@ __pycache__/
 *.py[codz]
 *$py.class
 
-# agent
-.agent/
-
-# docs
-/docs/
 
 # data
-/data/
-
-# cursor
-.cursor/
-
-# result
-results/
+data/
+data/*
+trading_state.db
+*.db
 
 # catboost
 catboost_info/
-
-# models
-models/yetirank
 
 # C extensions
 *.so
