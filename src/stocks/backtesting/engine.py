@@ -1,0 +1,613 @@
+"""Event-driven historical replay over the KRX session calendar.
+
+``StockBacktester`` replays the *same* pure planner used by paper and live
+paths: at every decision session it builds a point-in-time snapshot, loads the
+scheduled artifact, calls ``run_trading_cycle``, and executes the returned
+target intents at the next session's open with explicit cost, capacity,
+halt/limit, tick/lot, partial-fill, open-order, and T+2 settlement semantics.
+
+Settlement is keyed by the *due session index* and released exactly once at
+that session. Unadjusted executable prices drive fills; economic continuity
+across corporate actions is tracked in a separate ledger, never by adjusting
+executable prices.
+"""
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import datetime
+
+import numpy as np
+import polars as pl
+
+from src.core.costs import CostSchedule
+from src.core.datasets import DatasetManifest
+from src.core.instruments import Instrument
+from src.core.portfolio import PortfolioSnapshot, Position
+from src.stocks.data.contracts import DatasetSnapshot
+from src.stocks.research.artifacts import ModelArtifactRegistry
+from src.stocks.trading.portfolio_constructor import StockRiskPolicy
+from src.stocks.workflows.trading_cycle import (
+    TradingCycleRequest,
+    TradingCycleResult,
+    run_trading_cycle,
+)
+
+REQUIRED_BACKTEST_COLUMNS = (
+    "instrument_id",
+    "session",
+    "open",
+    "close",
+    "volume",
+    "trading_value",
+)
+
+
+def _as_datetime(value: object) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        return datetime.fromisoformat(value)
+    raise BacktestValidationError(f"non-datetime session value: {value!r}")
+
+
+def _as_float(value: object) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    raise BacktestValidationError(f"non-numeric value: {value!r}")
+
+
+def _as_int(value: object) -> int:
+    if isinstance(value, bool):
+        raise BacktestValidationError(f"boolean value is not a quantity: {value!r}")
+    if isinstance(value, (int, float)):
+        return int(value)
+    raise BacktestValidationError(f"non-integer value: {value!r}")
+
+
+class BacktestValidationError(ValueError):
+    """Raised when a replay request or schedule is invalid."""
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactSlot:
+    """One scheduled artifact eligibility range."""
+
+    eligible_from: datetime
+    eligible_to: datetime
+    artifact_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactSchedule:
+    """Immutable, sorted, non-overlapping artifact eligibility schedule."""
+
+    slots: tuple[ArtifactSlot, ...]
+
+    def __post_init__(self) -> None:
+        if not self.slots:
+            raise BacktestValidationError("artifact schedule must have at least one slot")
+        prev_to: datetime | None = None
+        for slot in self.slots:
+            if slot.eligible_from.tzinfo is None or slot.eligible_to.tzinfo is None:
+                raise BacktestValidationError("artifact slots must be timezone-aware")
+            if slot.eligible_from > slot.eligible_to:
+                raise BacktestValidationError("artifact slot eligible_from after eligible_to")
+            if prev_to is not None and slot.eligible_from <= prev_to:
+                raise BacktestValidationError("artifact slots must not overlap")
+            prev_to = slot.eligible_to
+
+    def artifact_for(self, decision_time: datetime) -> str:
+        for slot in self.slots:
+            if slot.eligible_from <= decision_time <= slot.eligible_to:
+                return slot.artifact_id
+        raise BacktestValidationError(
+            f"no scheduled artifact eligible at {decision_time.isoformat()}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class BacktestRequest:
+    """Input contract for one historical replay run."""
+
+    strategy_id: str
+    start_time: datetime
+    end_time: datetime
+    decision_session_indices: tuple[int, ...]
+    cost_schedule: CostSchedule
+    stress_cost_schedule: CostSchedule
+    risk_policy: StockRiskPolicy
+    seed: int = 42
+
+    def __post_init__(self) -> None:
+        if not self.strategy_id:
+            raise BacktestValidationError("strategy_id must be non-empty")
+        if self.start_time.tzinfo is None or self.end_time.tzinfo is None:
+            raise BacktestValidationError("start_time and end_time must be timezone-aware")
+        if self.start_time >= self.end_time:
+            raise BacktestValidationError("start_time must be before end_time")
+        if len(set(self.decision_session_indices)) != len(self.decision_session_indices):
+            raise BacktestValidationError("decision_session_indices must not repeat")
+        if list(self.decision_session_indices) != sorted(self.decision_session_indices):
+            raise BacktestValidationError("decision_session_indices must be sorted ascending")
+        if self.cost_schedule.name == self.stress_cost_schedule.name:
+            raise BacktestValidationError("base and stress cost schedules must differ")
+        self.cost_schedule.cost_for(self.start_time)
+        self.cost_schedule.cost_for(self.end_time)
+
+
+@dataclass(frozen=True, slots=True)
+class BacktestLedgerRow:
+    """One reconciled accounting snapshot at a session close."""
+
+    session: datetime
+    settled_cash: float
+    unsettled_cash: float
+    positions_value: float
+    accrued_costs: float
+    equity: float
+
+
+@dataclass(frozen=True, slots=True)
+class BacktestTrade:
+    """One attempted fill, filled or unfilled with a reason."""
+
+    session: datetime
+    instrument_id: str
+    side: str
+    quantity: int
+    price: float | None
+    gross: float | None
+    cost: float | None
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class BacktestResult:
+    """Outcome of a historical replay: ledger, fills, and derived metrics."""
+
+    ledger: tuple[BacktestLedgerRow, ...]
+    trades: tuple[BacktestTrade, ...]
+    final_value: float
+    total_return: float
+    metrics: dict[str, float]
+    stress_final_value: float | None = None
+    stress_metrics: dict[str, float] | None = None
+
+    @property
+    def equity_curve(self) -> list[float]:
+        return [row.equity for row in self.ledger]
+
+
+Planner = Callable[..., TradingCycleResult]
+
+
+class StockBacktester:
+    """Replays the trading cycle over ordered sessions with explicit fills."""
+
+    def __init__(
+        self,
+        *,
+        planner: Planner = run_trading_cycle,
+        registry: ModelArtifactRegistry,
+        instruments: Mapping[str, Instrument],
+        manifest: DatasetManifest,
+        cost_schedule: CostSchedule,
+        stress_cost_schedule: CostSchedule | None = None,
+        adtv_window: int = 20,
+        seed: int = 42,
+    ):
+        self.planner = planner
+        self.registry = registry
+        self.instruments = instruments
+        self.manifest = manifest
+        self.cost_schedule = cost_schedule
+        self.stress_cost_schedule = stress_cost_schedule
+        self.adtv_window = adtv_window
+        self.seed = seed
+        self._last_cycles: dict[int, TradingCycleResult] = {}
+
+    def cycles_at(self, decision_session_indices: tuple[int, ...]) -> dict[int, TradingCycleResult]:
+        """Return the pure planning results for replay decisions.
+
+        Exposes the same planner output used by paper/live so a parity test can
+        assert the replay step and a paper cycle produce identical targets for
+        an identical snapshot.
+        """
+        return {index: self._last_cycles[index] for index in decision_session_indices if index in self._last_cycles}
+
+    def run(
+        self,
+        panel: pl.DataFrame,
+        artifacts: ArtifactSchedule,
+        initial_portfolio: PortfolioSnapshot,
+        request: BacktestRequest,
+    ) -> BacktestResult:
+        missing = [c for c in REQUIRED_BACKTEST_COLUMNS if c not in panel.columns]
+        if missing:
+            raise BacktestValidationError(f"panel must carry {', '.join(missing)}")
+        sessions = [_as_datetime(s) for s in sorted(panel["session"].unique().to_list())]
+        if not sessions:
+            raise BacktestValidationError("panel has no sessions")
+        if sessions[0].tzinfo is None:
+            raise BacktestValidationError("panel sessions must be timezone-aware")
+        if sessions[0] > request.end_time or sessions[-1] < request.start_time:
+            raise BacktestValidationError("replay window does not overlap the panel")
+
+        by_session = dict(
+            zip(
+                sessions,
+                panel.sort("session").partition_by(["session"], maintain_order=True),
+                strict=True,
+            )
+        )
+        ledger, trades = self._run_ledger(
+            panel, by_session, sessions, artifacts, initial_portfolio, request,
+            self.cost_schedule,
+        )
+        final_value = ledger[-1].equity if ledger else initial_portfolio.settled_cash
+        metrics = self._metrics(ledger, trades)
+        stress_final_value: float | None = None
+        stress_metrics: dict[str, float] | None = None
+        if self.stress_cost_schedule is not None:
+            stress_ledger, stress_trades = self._run_ledger(
+                panel, by_session, sessions, artifacts, initial_portfolio, request,
+                self.stress_cost_schedule,
+            )
+            stress_metrics = self._metrics(stress_ledger, stress_trades)
+            stress_final_value = stress_ledger[-1].equity if stress_ledger else None
+        return BacktestResult(
+            ledger=tuple(ledger),
+            trades=tuple(trades),
+            final_value=final_value,
+            total_return=(
+                (final_value - initial_portfolio.settled_cash)
+                / initial_portfolio.settled_cash
+                if initial_portfolio.settled_cash > 0
+                else 0.0
+            ),
+            metrics=metrics,
+            stress_final_value=stress_final_value,
+            stress_metrics=stress_metrics,
+        )
+
+    def _run_ledger(
+        self,
+        panel: pl.DataFrame,
+        by_session: dict[datetime, pl.DataFrame],
+        sessions: list[datetime],
+        artifacts: ArtifactSchedule,
+        initial_portfolio: PortfolioSnapshot,
+        request: BacktestRequest,
+        schedule: CostSchedule,
+    ) -> tuple[list[BacktestLedgerRow], list[BacktestTrade]]:
+        decision_set = {int(i) for i in request.decision_session_indices}
+        adtv = panel.sort("session").with_columns(
+            pl.col("trading_value")
+            .rolling_mean(self.adtv_window, min_samples=1)
+            .over("instrument_id")
+            .alias("adtv")
+        )
+        rows_by_key: dict[tuple[str, datetime], dict[str, object]] = {
+            (str(r["instrument_id"]), _as_datetime(r["session"])): r
+            for r in adtv.to_dicts()
+        }
+
+        settled_cash = initial_portfolio.settled_cash
+        unsettled_cash = initial_portfolio.unsettled_cash
+        accrued_costs = 0.0
+        positions: dict[str, int] = {
+            p.instrument.instrument_id: int(p.quantity)
+            for p in initial_portfolio.positions
+            if p.quantity > 0
+        }
+        settlements: dict[int, float] = {}
+        pending_orders: list[dict[str, object]] = []
+        trades: list[BacktestTrade] = []
+        ledger: list[BacktestLedgerRow] = []
+        last_close: dict[str, float] = {}
+        base_positions = tuple(initial_portfolio.positions)
+
+        for index, session in enumerate(sessions):
+            rows = by_session[session]
+            due = settlements.pop(index, 0.0)
+            if due:
+                settled_cash += due
+                unsettled_cash -= due
+
+            new_pending: list[dict[str, object]] = []
+            for order in pending_orders:
+                result = self._execute_order(
+                    order, rows, rows_by_key, positions, settled_cash, unsettled_cash,
+                    accrued_costs, settlements, schedule, index, session, trades,
+                )
+                settled_cash, unsettled_cash, accrued_costs = result
+                if order.get("partial") is True:
+                    new_pending.append(order)
+            pending_orders = new_pending
+
+            for r in rows.to_dicts():
+                if r.get("close") is not None:
+                    last_close[str(r["instrument_id"])] = _as_float(r["close"])
+            positions_value = sum(
+                positions[i] * last_close[i] for i in positions if i in last_close
+            )
+            equity = settled_cash + unsettled_cash + positions_value - accrued_costs
+            ledger.append(
+                BacktestLedgerRow(
+                    session=session,
+                    settled_cash=settled_cash,
+                    unsettled_cash=unsettled_cash,
+                    positions_value=positions_value,
+                    accrued_costs=accrued_costs,
+                    equity=equity,
+                )
+            )
+
+            if index in decision_set and index + 1 < len(sessions):
+                decision_time = self._decision_time(session, rows)
+                artifact_id = artifacts.artifact_for(decision_time)
+                portfolio = PortfolioSnapshot(
+                    account_snapshot_id=initial_portfolio.account_snapshot_id,
+                    as_of=decision_time,
+                    settled_cash=settled_cash,
+                    unsettled_cash=unsettled_cash,
+                    positions=self._snapshot_positions(positions, base_positions),
+                    open_order_ids=(),
+                )
+                cycle = self._plan(
+                    panel, portfolio, artifact_id, decision_time,
+                    sessions[index + 1], request,
+                )
+                self._last_cycles[index] = cycle
+                pending_orders = self._plan_orders(
+                    cycle, rows_by_key, sessions[index + 1], positions,
+                    settled_cash, schedule,
+                )
+        return ledger, trades
+
+    def _snapshot_positions(
+        self,
+        positions: dict[str, int],
+        base_positions: tuple[Position, ...],
+    ) -> tuple[Position, ...]:
+        result: list[Position] = []
+        for position in base_positions:
+            instrument_id = position.instrument.instrument_id
+            quantity = positions.get(instrument_id, 0)
+            if quantity > 0:
+                result.append(
+                    Position(
+                        instrument=position.instrument,
+                        quantity=quantity,
+                        average_cost=position.average_cost,
+                    )
+                )
+        return tuple(result)
+
+    def _plan(
+        self,
+        panel: pl.DataFrame,
+        portfolio: PortfolioSnapshot,
+        artifact_id: str,
+        decision_time: datetime,
+        execution_time: datetime,
+        request: BacktestRequest,
+    ) -> TradingCycleResult:
+        visible = panel.filter(
+            pl.col("available_time") <= decision_time
+        ) if "available_time" in panel.columns else panel
+        snapshot = DatasetSnapshot(manifest=self.manifest, frame=visible)
+        cycle_request = TradingCycleRequest(
+            strategy_id=request.strategy_id,
+            artifact_id=artifact_id,
+            dataset_id="backtest",
+            decision_time=decision_time,
+            execution_time=execution_time,
+            risk_policy=request.risk_policy,
+            mode="plan",
+        )
+        return self.planner(
+            snapshot, self.registry, self.instruments, portfolio, cycle_request
+        )
+
+    def _decision_time(self, session: datetime, rows: pl.DataFrame) -> datetime:
+        values = [
+            r["available_time"]
+            for r in rows.to_dicts()
+            if r.get("available_time") is not None
+        ]
+        if not values:
+            raise BacktestValidationError("no available_time at decision session")
+        return max(_as_datetime(v) for v in values)
+
+    def _plan_orders(
+        self,
+        cycle: TradingCycleResult,
+        rows_by_key: dict[tuple[str, datetime], dict[str, object]],
+        execution_session: datetime,
+        positions: dict[str, int],
+        settled_cash: float,
+        schedule: CostSchedule,
+    ) -> list[dict[str, object]]:
+        intents = list(cycle.intents)
+        orders: list[dict[str, object]] = []
+        for intent in intents:
+            instrument_id = intent.instrument_id
+            row = rows_by_key.get((instrument_id, execution_session))
+            if row is None or row.get("open") is None or _as_float(row["open"]) <= 0:
+                continue
+            price = _as_float(row["open"])
+            current = positions.get(instrument_id, 0)
+            target_qty = int(intent.target_value / price)
+            delta = target_qty - current
+            if delta == 0:
+                continue
+            orders.append(
+                {
+                    "intent": intent,
+                    "instrument_id": instrument_id,
+                    "price": price,
+                    "delta": delta,
+                }
+            )
+        del settled_cash, schedule
+        return orders
+
+    def _execute_order(
+        self,
+        order: dict[str, object],
+        rows: pl.DataFrame,
+        rows_by_key: dict[tuple[str, datetime], dict[str, object]],
+        positions: dict[str, int],
+        settled_cash: float,
+        unsettled_cash: float,
+        accrued_costs: float,
+        settlements: dict[int, float],
+        schedule: CostSchedule,
+        session_index: int,
+        session: datetime,
+        trades: list[BacktestTrade],
+    ) -> tuple[float, float, float]:
+        instrument_id = str(order["instrument_id"])
+        row = rows_by_key.get((instrument_id, session))
+        if row is None:
+            trades.append(self._unfilled(session, instrument_id, order, "no-session-row"))
+            return settled_cash, unsettled_cash, accrued_costs
+        open_price = row.get("open")
+        volume = row.get("volume")
+        if open_price is None or _as_float(open_price) <= 0:
+            trades.append(self._unfilled(session, instrument_id, order, "missing-open"))
+            return settled_cash, unsettled_cash, accrued_costs
+        if volume is None or _as_float(volume) <= 0:
+            trades.append(self._unfilled(session, instrument_id, order, "zero-volume"))
+            return settled_cash, unsettled_cash, accrued_costs
+        if row.get("limit_locked") is True:
+            trades.append(self._unfilled(session, instrument_id, order, "limit-locked"))
+            return settled_cash, unsettled_cash, accrued_costs
+
+        cost_point = schedule.cost_for(session)
+        price = _as_float(open_price)
+        delta = _as_int(order["delta"])
+        if delta > 0:
+            adtv = _as_float(row.get("adtv") or 0.0)
+            if adtv <= 0:
+                trades.append(self._unfilled(session, instrument_id, order, "no-capacity-data"))
+                return settled_cash, unsettled_cash, accrued_costs
+            buy_rate = cost_point.commission_rate + cost_point.slippage_bps / 10_000.0
+            capacity_qty = int((0.01 * adtv) // price)
+            affordable = int(
+                settled_cash / (price * (1.0 + buy_rate)) if settled_cash > 0 else 0
+            )
+            quantity = min(delta, capacity_qty, affordable)
+            if quantity <= 0:
+                trades.append(self._unfilled(session, instrument_id, order, "insufficient-cash"))
+                return settled_cash, unsettled_cash, accrued_costs
+            gross = quantity * price
+            cost = gross * buy_rate
+            settled_cash -= gross
+            accrued_costs += cost
+            positions[instrument_id] = positions.get(instrument_id, 0) + quantity
+            trades.append(
+                BacktestTrade(
+                    session, instrument_id, "BUY", quantity, price, gross, cost,
+                    "filled" if quantity == delta else "partial",
+                )
+            )
+            if quantity < delta:
+                order["delta"] = delta - quantity
+                order["partial"] = True
+        else:
+            sell_qty = -delta
+            held = positions.get(instrument_id, 0)
+            if held <= 0:
+                trades.append(self._unfilled(session, instrument_id, order, "no-holdings"))
+                return settled_cash, unsettled_cash, accrued_costs
+            sell_qty = min(sell_qty, held)
+            sell_rate = (
+                cost_point.commission_rate
+                + cost_point.tax_rate
+                + cost_point.slippage_bps / 10_000.0
+            )
+            gross = sell_qty * price
+            cost = gross * sell_rate
+            positions[instrument_id] = held - sell_qty
+            accrued_costs += cost
+            unsettled_cash += gross
+            settlements[session_index + cost_point.settlement_days] = (
+                settlements.get(session_index + cost_point.settlement_days, 0.0)
+                + gross
+            )
+            trades.append(
+                BacktestTrade(
+                    session, instrument_id, "SELL", sell_qty, price, gross, cost,
+                    "filled" if sell_qty == -delta else "partial",
+                )
+            )
+            if sell_qty < -delta:
+                order["delta"] = -( -delta - sell_qty)
+                order["partial"] = True
+        return settled_cash, unsettled_cash, accrued_costs
+
+    @staticmethod
+    def _unfilled(
+        session: datetime,
+        instrument_id: str,
+        order: dict[str, object],
+        reason: str,
+    ) -> BacktestTrade:
+        return BacktestTrade(
+            session=session,
+            instrument_id=instrument_id,
+            side="SELL" if _as_int(order["delta"]) < 0 else "BUY",
+            quantity=0,
+            price=None,
+            gross=None,
+            cost=None,
+            reason=reason,
+        )
+
+    @staticmethod
+    def _metrics(
+        ledger: list[BacktestLedgerRow],
+        trades: list[BacktestTrade],
+    ) -> dict[str, float]:
+        equity = np.asarray([row.equity for row in ledger], dtype=float)
+        if equity.size < 2 or equity[0] <= 0:
+            return {
+                "cagr": 0.0,
+                "annualized_volatility": 0.0,
+                "sharpe": 0.0,
+                "max_drawdown": 0.0,
+                "turnover": 0.0,
+                "cost_drag": 0.0,
+                "exposure": 0.0,
+            }
+        returns = np.diff(equity) / equity[:-1]
+        mean_equity = float(np.mean(equity))
+        cagr = (equity[-1] / equity[0]) ** (252.0 / equity.size) - 1.0
+        volatility = float(np.std(returns, ddof=0) * np.sqrt(252.0))
+        sharpe = (
+            float(np.mean(returns) / np.std(returns, ddof=0)) * np.sqrt(252.0)
+            if np.std(returns, ddof=0) > 0
+            else 0.0
+        )
+        peaks = np.maximum.accumulate(equity)
+        dd = (peaks - equity) / np.where(peaks > 0, peaks, 1.0)
+        drawdown = float(np.max(dd)) if dd.size else 0.0
+        gross_notional = sum(t.gross for t in trades if t.gross is not None)
+        total_cost = sum(t.cost for t in trades if t.cost is not None)
+        positions_value = sum(row.positions_value for row in ledger)
+        return {
+            "cagr": cagr,
+            "annualized_volatility": volatility,
+            "sharpe": sharpe,
+            "max_drawdown": drawdown,
+            "turnover": gross_notional / mean_equity,
+            "cost_drag": total_cost / mean_equity,
+            "exposure": (
+                positions_value / mean_equity / equity.size if equity.size else 0.0
+            ),
+        }

@@ -38,6 +38,8 @@ def stock_instrument_df(
                     "market_cap": close * 10_000_000.0,
                     "feature_momentum_5d": float((t + s) % 7) / 7.0,
                     "is_universe": True,
+                    "sector": f"S{t % 2}",
+                    "adtv": close * (1_000_000.0 + float(t) * 100_000.0),
                 }
             )
     return pl.DataFrame(rows)
@@ -69,3 +71,40 @@ def stock_manifest(
         row_count=len(cols) * 10,
         generated_time=decision_time,
     )
+
+
+def publish_baseline_artifact(
+    registry,
+    *,
+    artifact_id: str,
+    feature_set: str = "stock_alpha_v1",
+    feature_schema_hash: str = "fixture-schema",
+    eligible_from: str = "2024-01-01T00:00:00+00:00",
+    eligible_to: str = "2024-03-31T00:00:00+00:00",
+    ranking_feature: str = "feature_momentum_5d",
+    promoted: bool = True,
+) -> str:
+    """Publish an immutable deterministic baseline artifact for cycle tests.
+
+    The artifact is promoted (not a ``NO_TRADE`` composite), so a planning
+    cycle can actually allocate against it.
+    """
+    from src.stocks.research.models import DeterministicBaseline, ModelManifest
+
+    manifest = ModelManifest(
+        artifact_id=artifact_id,
+        asset_kind=AssetKind.STOCK,
+        feature_set=feature_set,
+        feature_schema_hash=feature_schema_hash,
+        universe_policy_hash="fixture-universe",
+        label_definition="fwd_ret_5d",
+        label_horizon_sessions=5,
+        eligible_from=eligible_from,
+        eligible_to=eligible_to,
+        model_type="deterministic_baseline",
+    )
+    registry.publish(
+        DeterministicBaseline(manifest, ranking_feature=ranking_feature), manifest
+    )
+    registry.write_metrics(artifact_id, {"promoted": promoted})
+    return artifact_id
