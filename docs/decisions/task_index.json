@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_KR_EQUITY_TRADING_ENGINE",
+      "date": "2026-08-09",
+      "adr_id": "ADR_20260809_KR_EQUITY_TRADING_ENGINE",
+      "domain": "stocks",
+      "title": "Deterministic Korean equity trading cycle",
+      "why": "The stock bounded context lacked a single point-in-time planner that connected certified data, promoted artifacts, constrained sizing, target-position intents, and parity backtesting.",
+      "resolution": "Added a pure trading-cycle planner, certified dataset and promotion gates, content-based cycle fingerprints, deterministic return-volatility sizing with sector/ADTV/gross constraints and DE_RISK handling, target-position execution semantics, and event-driven replay parity.",
+      "impact": "Paper/live paths remain fail-closed behind promotion and readiness evidence; backtests and paper planning share the same planner; task and code ownership are indexed for maintenance."
+    },
+    {
       "task_id": "TASK_STOCK_OHLC_QUALITY_QUARANTINE",
       "date": "2026-08-09",
       "adr_id": "ADR_20260809_STOCK_OHLC_QUALITY_QUARANTINE",
