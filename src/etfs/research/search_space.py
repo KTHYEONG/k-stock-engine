@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,7 +26,7 @@ class SearchSpace:
 class WalkForwardFold:
     """One walk-forward split: train on ``train_end``-bounded data, validate after."""
 
-    train_end: object
-    validation_start: object
-    validation_end: object
-    eval_year: object
+    train_end: datetime | None
+    validation_start: datetime
+    validation_end: datetime
+    eval_year: int
