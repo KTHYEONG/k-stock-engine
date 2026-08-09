@@ -19,10 +19,10 @@ logger = logging.getLogger("run_walk_forward")
 logging.getLogger("optuna").setLevel(logging.ERROR)
 logging.getLogger("etf").setLevel(logging.WARNING)
 
-from src.data.etf_manager import ETFManager
-from src.etf.backtester import ETFBacktester
-from src.etf.monte_carlo import ETFMonteCarloSimulator
-from src.etf.optimizer import ETFOptimizer
+from src.legacy.etf_v1.etf_manager import ETFManager
+from src.legacy.etf_v1.backtester import ETFBacktester
+from src.legacy.etf_v1.monte_carlo import ETFMonteCarloSimulator
+from src.legacy.etf_v1.optimizer import ETFOptimizer
 
 
 def _parse_seed_list(seed_arg: str) -> List[int]:

@@ -15,8 +15,8 @@ from catboost import Pool
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
-from src.data.feature_store import FeatureStore
-from src.utils.logger import setup_logger
+from src.legacy.stock_yetirank_v1.data.feature_store import FeatureStore
+from src.legacy.stock_yetirank_v1.utils.logger import setup_logger
 
 logger = setup_logger("training.data_loader")
 

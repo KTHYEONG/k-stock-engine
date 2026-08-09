@@ -3,10 +3,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from src.execution.kis_client import KisClient
-from src.execution.yeti_strategy import LiveTradePlan, YetiLiveStrategy
-from src.execution.yeti_state import StateManager
-from src.utils.logger import setup_logger
+from src.legacy.live_yeti_v1.kis_client import KisClient
+from src.legacy.live_yeti_v1.yeti_strategy import LiveTradePlan, YetiLiveStrategy
+from src.legacy.live_yeti_v1.yeti_state import StateManager
+from src.legacy.stock_yetirank_v1.utils.logger import setup_logger
 
 
 @dataclass
