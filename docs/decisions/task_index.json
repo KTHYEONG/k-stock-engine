@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_DATA_QUALITY_HARDENING",
+      "date": "2026-08-09",
+      "adr_id": "ADR_20260809_STOCK_DATA_QUALITY_HARDENING",
+      "domain": "stocks",
+      "title": "Stock data quality hardening for research and backtest",
+      "why": "Full source profiling exposed unclassified instruments, invalid OHLC rows, unexplained price discontinuities, missing disclosure availability, and historical coverage gaps that could invalidate strategy research.",
+      "resolution": "Added effective-dated instrument classification, structural bar quarantine, KRX calendar and feature-availability gates, corporate-action interval validation, deterministic quality reports and lineage hashes, and backtest provenance checks.",
+      "impact": "Provisional migrations remain auditable and non-promotable; research/production datasets now require explicit evidence before eligible rows can feed training, replay, paper, or live paths."
+    },
+    {
       "task_id": "TASK_STOCK_DATA_CURATION_MIGRATION",
       "date": "2026-08-09",
       "adr_id": "ADR_20260809_STOCK_DATA_CURATION_MIGRATION",
