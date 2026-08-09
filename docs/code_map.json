@@ -9,6 +9,9 @@
     "testing": "tests/unit/core/test_instruments.py"
   },
   "src/core/market_data.py": {},
+  "src/core/paths.py": {
+    "testing": "tests/unit/core/test_paths.py"
+  },
   "src/core/portfolio.py": {
     "testing": "tests/unit/core/test_portfolio.py"
   },
@@ -207,9 +210,16 @@
       "tests/integration/stocks/test_settlement_replay.py"
     ]
   },
+  "src/stocks/cli/curate.py": {
+    "testing": "tests/unit/stocks/cli/test_curate.py"
+  },
   "src/stocks/cli/intents.py": {},
-  "src/stocks/cli/simulate.py": {},
-  "src/stocks/cli/train.py": {},
+  "src/stocks/cli/simulate.py": {
+    "testing": "tests/unit/stocks/cli/test_simulate.py"
+  },
+  "src/stocks/cli/train.py": {
+    "testing": "tests/unit/stocks/cli/test_train.py"
+  },
   "src/stocks/data/contracts.py": {
     "testing": [
       "tests/integration/stocks/test_cycle_backtest_parity.py",
@@ -221,6 +231,9 @@
       "tests/unit/stocks/workflows/test_trading_cycle.py",
       "tests/unit/stocks/workflows/test_train_model.py"
     ]
+  },
+  "src/stocks/data/curation.py": {
+    "testing": "tests/unit/stocks/data/test_curation.py"
   },
   "src/stocks/data/repositories.py": {
     "testing": "tests/unit/stocks/data/test_repositories.py"
@@ -234,6 +247,7 @@
   },
   "src/stocks/research/datasets.py": {
     "testing": [
+      "tests/unit/stocks/data/test_curation.py",
       "tests/unit/stocks/data/test_repositories.py",
       "tests/unit/stocks/research/test_artifact_registry.py",
       "tests/unit/stocks/research/test_artifacts.py",

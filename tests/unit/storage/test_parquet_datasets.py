@@ -6,9 +6,13 @@ from datetime import UTC, datetime
 import polars as pl
 import pytest
 
-from src.core.datasets import DatasetManifest, make_manifest
+from src.core.datasets import (
+    HIVE_PARTITION_LAYOUT,
+    DatasetManifest,
+    make_manifest,
+)
 from src.core.instruments import AssetKind
-from src.storage.parquet_datasets import ParquetDatasetStore
+from src.storage.parquet_datasets import ParquetDatasetStore, canonical_content_hash
 
 FEATURE_SET = "stock_alpha_v1"
 TIME_START = datetime(2024, 1, 1, tzinfo=UTC)
@@ -95,3 +99,137 @@ class TestParquetDatasetStore:
         imports = re.findall(r"^(?:from|import)\s+(src\.\S+)", text, re.MULTILINE)
         forbidden = ("src.stocks", "src.etfs", "src.execution")
         assert not any(i.startswith(forbidden) for i in imports)
+
+
+def partitioned_frame() -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "instrument_id": ["KRX:1", "KRX:2", "KRX:1", "KRX:2"],
+            "session": [
+                datetime(2024, 1, 4, tzinfo=UTC),
+                datetime(2024, 1, 4, tzinfo=UTC),
+                datetime(2024, 2, 1, tzinfo=UTC),
+                datetime(2024, 2, 1, tzinfo=UTC),
+            ],
+            "observation_time": [
+                datetime(2024, 1, 4, 6, 30, tzinfo=UTC),
+                datetime(2024, 1, 4, 6, 30, tzinfo=UTC),
+                datetime(2024, 2, 1, 6, 30, tzinfo=UTC),
+                datetime(2024, 2, 1, 6, 30, tzinfo=UTC),
+            ],
+            "available_time": [
+                datetime(2024, 1, 4, 6, 31, tzinfo=UTC),
+                datetime(2024, 1, 4, 6, 31, tzinfo=UTC),
+                datetime(2024, 2, 1, 6, 31, tzinfo=UTC),
+                datetime(2024, 2, 1, 6, 31, tzinfo=UTC),
+            ],
+            "close": [100.0, 200.0, 110.0, 220.0],
+        }
+    ).sort(["instrument_id", "session"])
+
+
+def partitioned_manifest(frame: pl.DataFrame) -> DatasetManifest:
+    return make_manifest(
+        asset_kind=AssetKind.STOCK,
+        columns=frame.columns,
+        feature_set=FEATURE_SET,
+        label_definition="fwd_ret_5d",
+        label_horizon_sessions=5,
+        time_start=TIME_START,
+        time_end=TIME_END,
+        provider_version="fixture",
+        universe_policy_version="v1",
+        row_count=frame.height,
+        schema_version="v2",
+        content_hash=canonical_content_hash(frame, frame.columns),
+        storage_layout=HIVE_PARTITION_LAYOUT,
+    )
+
+
+class TestPartitionedRoundTrip:
+    def test_partitioned_write_read_round_trips(self, tmp_path) -> None:
+        store = ParquetDatasetStore(tmp_path / "root")
+        frame = partitioned_frame()
+        manifest = partitioned_manifest(frame)
+        store.write_partitioned(
+            frame,
+            dataset_id="d2",
+            manifest=manifest,
+            expected_feature_set=FEATURE_SET,
+            decision_time=DECISION,
+            content_manifest={"curation_version": "curation-v1", "source": {"file_count": 2}},
+        )
+        out = store.read("d2", AssetKind.STOCK, FEATURE_SET, DECISION)
+        assert out.equals(frame)
+
+        dataset_dir = tmp_path / "root" / "d2"
+        assert (dataset_dir / "partitions" / "year=2024" / "month=01" / "part-00000.parquet").exists()
+        assert (dataset_dir / "partitions" / "year=2024" / "month=02" / "part-00000.parquet").exists()
+        import json
+
+        content = json.loads((dataset_dir / "content_manifest.json").read_text())
+        assert content["output"]["content_hash"] == manifest.content_hash
+        assert len(content["partitions"]) == 2
+
+    def test_existing_dataset_id_is_rejected(self, tmp_path) -> None:
+        store = ParquetDatasetStore(tmp_path / "root")
+        frame = partitioned_frame()
+        manifest = partitioned_manifest(frame)
+        store.write_partitioned(
+            frame, dataset_id="d2", manifest=manifest,
+            expected_feature_set=FEATURE_SET, decision_time=DECISION,
+        )
+        with pytest.raises(ValueError, match="already exists"):
+            store.write_partitioned(
+                frame, dataset_id="d2", manifest=manifest,
+                expected_feature_set=FEATURE_SET, decision_time=DECISION,
+            )
+
+    def test_tampered_partition_fails_closed(self, tmp_path) -> None:
+        store = ParquetDatasetStore(tmp_path / "root")
+        frame = partitioned_frame()
+        manifest = partitioned_manifest(frame)
+        store.write_partitioned(
+            frame, dataset_id="d2", manifest=manifest,
+            expected_feature_set=FEATURE_SET, decision_time=DECISION,
+        )
+        part = next((tmp_path / "root" / "d2" / "partitions").rglob("*.parquet"))
+        with part.open("ab") as fh:
+            fh.write(b"tamper")
+        with pytest.raises(ValueError, match="tampered partition"):
+            store.read("d2", AssetKind.STOCK, FEATURE_SET, DECISION)
+
+    def test_content_hash_mismatch_fails_closed(self, tmp_path) -> None:
+        store = ParquetDatasetStore(tmp_path / "root")
+        frame = partitioned_frame()
+        manifest = partitioned_manifest(frame)
+        store.write_partitioned(
+            frame, dataset_id="d2", manifest=manifest,
+            expected_feature_set=FEATURE_SET, decision_time=DECISION,
+        )
+        manifest_path = tmp_path / "root" / "d2" / "dataset_manifest.json"
+        data = manifest_path.read_text().replace(manifest.content_hash, "0" * 64)
+        manifest_path.write_text(data)
+        with pytest.raises(ValueError, match="content hash"):
+            store.read("d2", AssetKind.STOCK, FEATURE_SET, DECISION)
+
+    def test_partitioned_write_requires_v2_manifest(self, tmp_path) -> None:
+        store = ParquetDatasetStore(tmp_path / "root")
+        frame = partitioned_frame()
+        v1 = make_manifest(
+            asset_kind=AssetKind.STOCK,
+            columns=frame.columns,
+            feature_set=FEATURE_SET,
+            label_definition="fwd_ret_5d",
+            label_horizon_sessions=5,
+            time_start=TIME_START,
+            time_end=TIME_END,
+            provider_version="fixture",
+            universe_policy_version="v1",
+            row_count=frame.height,
+        )
+        with pytest.raises(ValueError, match="schema_version v2"):
+            store.write_partitioned(
+                frame, dataset_id="d3", manifest=v1,
+                expected_feature_set=FEATURE_SET, decision_time=DECISION,
+            )
