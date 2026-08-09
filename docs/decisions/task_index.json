@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ARCH_CONSOLIDATION",
+      "date": "2026-08-09",
+      "adr_id": "ADR_20260809_ARCH_CONSOLIDATION",
+      "domain": "architecture",
+      "title": "Consolidate legacy/modern package duplication",
+      "why": "The refactored tree still exposed duplicate etf/etfs roots and retained historical file layouts, reducing AI navigation efficiency and obscuring ownership.",
+      "resolution": "Consolidated shared contracts under core/storage, organized stocks and ETFs by research/trading/backtesting/workflows, rebuilt execution around intents/orders/readiness, and quarantined historical implementations under src/legacy with parity coverage.",
+      "impact": "Stock and ETF boundaries are explicit, legacy code is isolated, new ML/research components are replaceable, and the architecture remains extensible without reintroducing duplicate roots."
+    },
+    {
       "task_id": "TASK_STOCK_ETF_ML_REFACTOR",
       "date": "2026-08-09",
       "adr_id": "ADR_20260809_STOCK_ETF_ML_REFACTOR",
