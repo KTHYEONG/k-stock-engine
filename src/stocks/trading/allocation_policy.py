@@ -1,4 +1,8 @@
-"""Score-to-target-portfolio policy."""
+"""Score-to-target-allocation policy.
+
+The produced ``Allocation.target_value`` is a target *weight* (a fraction of
+portfolio value), never a currency amount.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,8 +14,8 @@ from src.core.portfolio import Allocation
 
 
 @dataclass(frozen=True, slots=True)
-class PortfolioPolicy:
-    """Maps prediction scores to target allocations within exposure limits."""
+class AllocationPolicy:
+    """Maps prediction scores to target weight allocations within exposure limits."""
 
     top_k: int
     max_single_weight: float = 0.2
