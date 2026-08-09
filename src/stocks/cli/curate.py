@@ -14,6 +14,15 @@ from pathlib import Path
 from src.core.datasets import DatasetCertification
 from src.core.paths import STOCK_DATASET_ROOT, STOCK_FEATURE_SOURCE_ROOT
 from src.stocks.data.curation import StockCurationRequest, curate_legacy_feature_panel
+from src.stocks.data.evidence import (
+    AvailabilityPolicy,
+    feature_availability_from_disclosures,
+    load_corporate_action_snapshot,
+    load_disclosure_availability_records,
+    load_instrument_master_snapshot,
+    load_krx_calendar_snapshot,
+)
+from src.stocks.data.quality import FeatureAvailabilityRecord
 
 logger = logging.getLogger("stocks.cli.curate")
 
@@ -37,7 +46,47 @@ def main(args: list[str] | None = None) -> int:
     parser.add_argument("--calendar-hash", default="")
     parser.add_argument("--corporate-action-hash", default="")
     parser.add_argument("--cost-source-hash", default="")
+    parser.add_argument("--instrument-master-path", type=Path)
+    parser.add_argument("--calendar-path", type=Path)
+    parser.add_argument("--corporate-actions-path", type=Path)
+    parser.add_argument("--disclosure-availability-path", type=Path)
     parsed = parser.parse_args(args)
+
+    instrument_master = (
+        load_instrument_master_snapshot(parsed.instrument_master_path)
+        if parsed.instrument_master_path
+        else None
+    )
+    calendar = (
+        load_krx_calendar_snapshot(parsed.calendar_path) if parsed.calendar_path else None
+    )
+    corporate_actions = None
+    if parsed.corporate_actions_path:
+        if calendar is None:
+            raise ValueError("--corporate-actions-path requires --calendar-path")
+        corporate_actions = load_corporate_action_snapshot(parsed.corporate_actions_path, calendar)
+    feature_availability: tuple[FeatureAvailabilityRecord, ...] = ()
+    if parsed.disclosure_availability_path:
+        records = load_disclosure_availability_records(parsed.disclosure_availability_path)
+        feature_availability = feature_availability_from_disclosures(
+            records, AvailabilityPolicy(calendar=calendar)
+        )
+
+    if parsed.certification is not DatasetCertification.PROVISIONAL:
+        missing = [
+            name
+            for name, value in (
+                ("--instrument-master-path", instrument_master),
+                ("--calendar-path", calendar),
+                ("--corporate-actions-path", corporate_actions),
+                ("--disclosure-availability-path", feature_availability),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError(
+                f"{parsed.certification.value} curation requires evidence artifacts: {missing}"
+            )
 
     request = StockCurationRequest(
         dataset_id=parsed.dataset_id,
@@ -45,9 +94,14 @@ def main(args: list[str] | None = None) -> int:
         end_date=parsed.end_date,
         feature_allowlist_version=parsed.feature_allowlist_version,
         certification=parsed.certification,
-        calendar_hash=parsed.calendar_hash,
-        corporate_action_hash=parsed.corporate_action_hash,
+        calendar_hash=parsed.calendar_hash or (calendar.content_hash if calendar else ""),
+        corporate_action_hash=parsed.corporate_action_hash
+        or (corporate_actions.content_hash if corporate_actions else ""),
         cost_source_hash=parsed.cost_source_hash,
+        instrument_master=instrument_master,
+        corporate_actions=corporate_actions,
+        calendar=calendar,
+        feature_availability=feature_availability,
     )
     result = curate_legacy_feature_panel(
         parsed.source_root, parsed.dataset_root, request
