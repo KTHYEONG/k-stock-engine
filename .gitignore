@@ -4,9 +4,9 @@ __pycache__/
 *$py.class
 
 
-# data
-data/
-data/*
+# data (root-level runtime store only; src data packages are source code)
+/data/
+/data/*
 trading_state.db
 *.db
 

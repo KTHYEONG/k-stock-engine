@@ -14,12 +14,22 @@ from src.core.datasets import DatasetManifest, make_manifest, schema_hash, valid
 from src.core.time import TemporalViolationError
 
 __all__ = [
+    "ELIGIBLE_STATUS",
+    "QUALITY_REASON_COLUMN",
+    "QUALITY_STATUS_COLUMN",
+    "QUARANTINED_STATUS",
     "DatasetManifest",
     "make_manifest",
+    "research_eligible_frame",
     "schema_hash",
     "validate_dataset_manifest",
     "validate_stock_rows_available",
 ]
+
+QUALITY_STATUS_COLUMN = "data_quality_status"
+QUALITY_REASON_COLUMN = "data_quality_reason"
+ELIGIBLE_STATUS = "eligible"
+QUARANTINED_STATUS = "quarantined"
 
 
 def validate_stock_rows_available(df: pl.DataFrame, decision_time: datetime) -> None:
@@ -69,3 +79,13 @@ def validate_stock_rows_available(df: pl.DataFrame, decision_time: datetime) -> 
         raise TemporalViolationError(
             f"{late_decision.height} rows available after decision_time {decision_time.isoformat()}"
         )
+
+
+def research_eligible_frame(df: pl.DataFrame) -> pl.DataFrame:
+    """Return only rows that passed the persisted deterministic quality gate."""
+    if QUALITY_STATUS_COLUMN not in df.columns:
+        return df
+    eligible = df.filter(pl.col(QUALITY_STATUS_COLUMN) == ELIGIBLE_STATUS)
+    if eligible.is_empty():
+        raise ValueError("no research-eligible stock rows")
+    return eligible
