@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_KR_EQUITY_COMPOUNDING_ARCHITECTURE",
+      "date": "2026-08-09",
+      "adr_id": "ADR_20260809_KR_EQUITY_COMPOUNDING_ARCHITECTURE",
+      "domain": "stocks",
+      "title": "Point-in-time Korean equity strategy research and compounding ledger",
+      "why": "The stock research path mixed legacy feature provenance with incomplete temporal validation, one-shot simulation, and ambiguous promotion evidence.",
+      "resolution": "Added deterministic provisional legacy-panel certification, point-in-time feature and label contracts, stable Rank-IC composite derivation, purged walk-forward promotion, constrained target weights, effective-dated costs, settlement-aware multi-session ledger, rebalance exits, and independent stress evaluation.",
+      "impact": "Strategy results are reproducible and fail closed to NO_TRADE when out-of-sample evidence, cost stress, capacity, or ledger invariants do not pass; KIS live integration remains a later boundary."
+    },
+    {
       "task_id": "TASK_ARCH_CONSOLIDATION",
       "date": "2026-08-09",
       "adr_id": "ADR_20260809_ARCH_CONSOLIDATION",
