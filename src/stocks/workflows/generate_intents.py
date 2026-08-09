@@ -14,6 +14,7 @@ def generate_intents(
     strategy_id: str,
     decision_time: datetime,
     execution_time: datetime,
+    account_snapshot_id: str,
 ) -> list[TradeIntent]:
     """Produce validated TradeIntent objects.
 
@@ -33,6 +34,7 @@ def generate_intents(
                 strategy_id=strategy_id,
                 reason=allocation.reason or "score-rank-policy",
                 idempotency_key=f"{strategy_id}:{allocation.instrument.instrument_id}:{decision_time.date().isoformat()}",
+                account_snapshot_id=account_snapshot_id,
             )
         )
     return intents

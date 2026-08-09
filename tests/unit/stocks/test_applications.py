@@ -25,6 +25,7 @@ class TestGenerateIntents:
             strategy_id="stock_alpha_v1",
             decision_time=decision,
             execution_time=decision,
+            account_snapshot_id="account-a",
         )
         assert len(intents) == 1
         intent = intents[0]
