@@ -29,12 +29,15 @@ class Instrument:
     exchange: str
     symbol: str
     currency: str
+    lot_size: int = 1
 
     def __post_init__(self) -> None:
         if not self.instrument_id:
             raise ValueError("instrument_id must be non-empty")
         if not self.symbol:
             raise ValueError("symbol must be non-empty")
+        if self.lot_size < 1:
+            raise ValueError("lot_size must be positive")
 
 
 @dataclass(frozen=True, slots=True)

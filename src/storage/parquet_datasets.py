@@ -14,7 +14,11 @@ from pathlib import Path
 
 import polars as pl
 
-from src.core.datasets import DatasetManifest, validate_dataset_manifest
+from src.core.datasets import (
+    DatasetCertification,
+    DatasetManifest,
+    validate_dataset_manifest,
+)
 from src.core.instruments import AssetKind
 
 MANIFEST_NAME = "dataset_manifest.json"
@@ -100,6 +104,11 @@ def _manifest_to_dict(manifest: DatasetManifest) -> dict[str, object]:
 
 
 def _manifest_from_dict(data: dict[str, object]) -> DatasetManifest:
+    certification = data.get("certification")
+    if isinstance(certification, str):
+        certification = DatasetCertification(certification)
+    elif certification is None or not isinstance(certification, DatasetCertification):
+        certification = DatasetCertification.PROVISIONAL
     return DatasetManifest(
         asset_kind=AssetKind(str(data["asset_kind"])),
         schema_version=str(data["schema_version"]),
@@ -115,4 +124,8 @@ def _manifest_from_dict(data: dict[str, object]) -> DatasetManifest:
         time_end=datetime.fromisoformat(str(data["time_end"])),
         generated_time=datetime.fromisoformat(str(data["generated_time"])),
         row_count=int(str(data["row_count"])),
+        certification=certification,
+        calendar_hash=str(data.get("calendar_hash", "")),
+        corporate_action_hash=str(data.get("corporate_action_hash", "")),
+        cost_source_hash=str(data.get("cost_source_hash", "")),
     )
