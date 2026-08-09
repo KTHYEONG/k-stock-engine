@@ -6,6 +6,7 @@ import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
+from src.core.paths import STOCK_ARTIFACT_ROOT, STOCK_DATASET_ROOT
 from src.stocks.data.repositories import StockDatasetRepository
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.settings import DEFAULT_STOCK_ALPHA
@@ -19,9 +20,9 @@ logger = logging.getLogger("stocks.cli.train")
 def main(args: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Train a stock baseline model artifact")
     parser.add_argument("--artifact-id", required=True)
-    parser.add_argument("--dataset-root", required=True, type=Path)
+    parser.add_argument("--dataset-root", type=Path, default=STOCK_DATASET_ROOT)
     parser.add_argument("--dataset-id", required=True)
-    parser.add_argument("--registry", required=True, type=Path)
+    parser.add_argument("--registry", type=Path, default=STOCK_ARTIFACT_ROOT)
     parser.add_argument("--decision-time", type=datetime.fromisoformat, default=None)
     parsed = parser.parse_args(args)
 
