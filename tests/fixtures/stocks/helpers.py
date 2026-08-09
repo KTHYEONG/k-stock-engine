@@ -15,27 +15,32 @@ def stock_instrument_df(
     horizon: int = 5,
     start: datetime | None = None,
 ) -> pl.DataFrame:
-    """Deterministic daily bars + a momentum feature + forward label."""
+    """Deterministic point-in-time daily bars for stock research tests."""
     start = start or datetime(2024, 1, 1, tzinfo=UTC)
     rows: list[dict] = []
     for t in range(n_tickers):
         for s in range(n_sessions):
             obs = start + timedelta(days=s)
+            close = 100.0 + float((t * 7 + s) % 20)
             rows.append(
                 {
                     "session_index": s,
-                    "date": obs,
+                    "session": obs,
                     "instrument_id": f"KRX:0{t + 1:05d}",
-                    "close": 100.0 + float((t * 7 + s) % 20),
+                    "observation_time": obs.replace(hour=15, minute=30, tzinfo=UTC),
+                    "available_time": obs.replace(hour=15, minute=31, tzinfo=UTC),
+                    "open": close - 1.0,
+                    "high": close + 1.0,
+                    "low": close - 1.5,
+                    "close": close,
+                    "volume": 1_000_000.0 + float(t) * 100_000.0,
+                    "trading_value": close * (1_000_000.0 + float(t) * 100_000.0),
+                    "market_cap": close * 10_000_000.0,
                     "feature_momentum_5d": float((t + s) % 7) / 7.0,
-                    "label_fwd_ret": float((t + s) % 3 - 1) / 10.0,
                     "is_universe": True,
                 }
             )
-    df = pl.DataFrame(rows)
-    return df.with_columns(
-        pl.col("label_fwd_ret").shift(-horizon).over("instrument_id").alias("label_eligible"),
-    )
+    return pl.DataFrame(rows)
 
 
 def stock_manifest(
@@ -47,10 +52,9 @@ def stock_manifest(
 ) -> DatasetManifest:
     cols = columns or [
         "session_index",
-        "date",
+        "session",
         "instrument_id",
         "feature_momentum_5d",
-        "label_fwd_ret",
     ]
     return make_manifest(
         asset_kind=asset_kind,

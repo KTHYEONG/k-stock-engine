@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, UTC
 
+import polars as pl
 import pytest
 
 from src.core.instruments import AssetKind
@@ -43,9 +44,24 @@ class TestDatasetContract:
     def test_row_available_after_decision_is_rejected(self) -> None:
         df = stock_instrument_df()
         decision_time = datetime(2024, 1, 5, 8, 0, tzinfo=UTC)
-        assert df["date"].max() > decision_time
+        assert df["available_time"].max() > decision_time
         with pytest.raises(TemporalViolationError):
             validate_stock_rows_available(df, decision_time)
+
+    def test_duplicate_instrument_session_is_rejected(self) -> None:
+        df = stock_instrument_df(n_sessions=5, n_tickers=1)
+        dup = pl.concat([df, df.filter(pl.col("session_index") == 2)])
+        with pytest.raises(ValueError, match="duplicate"):
+            validate_stock_rows_available(
+                dup, datetime(2024, 1, 20, tzinfo=UTC)
+            )
+
+    def test_valid_panel_passes_validation(self) -> None:
+        df = stock_instrument_df(n_sessions=5, n_tickers=2)
+        assert (
+            validate_stock_rows_available(df, df["available_time"].max())
+            is None
+        )
 
     def test_valid_stock_row_keeps_schema_and_universe_fingerprints(self) -> None:
         df = stock_instrument_df(n_sessions=5, n_tickers=2)
