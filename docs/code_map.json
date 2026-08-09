@@ -6,25 +6,7 @@
     "testing": "tests/unit/core/test_datasets.py"
   },
   "src/core/instruments.py": {
-    "testing": [
-      "tests/integration/execution/test_submission_gate.py",
-      "tests/unit/core/test_datasets.py",
-      "tests/unit/core/test_instrument.py",
-      "tests/unit/core/test_portfolio.py",
-      "tests/unit/etfs/test_analysis.py",
-      "tests/unit/etfs/test_index_switch_v1.py",
-      "tests/unit/etfs/test_optimization_runner.py",
-      "tests/unit/etfs/test_walk_forward.py",
-      "tests/unit/execution/test_broker.py",
-      "tests/unit/execution/test_intents.py",
-      "tests/unit/execution/test_orders.py",
-      "tests/unit/stocks/research/test_artifact_registry.py",
-      "tests/unit/stocks/research/test_dataset_contract.py",
-      "tests/unit/stocks/test_applications.py",
-      "tests/unit/stocks/test_simulation.py",
-      "tests/unit/stocks/test_universe_features_labels.py",
-      "tests/unit/storage/test_parquet_datasets.py"
-    ]
+    "testing": "tests/unit/core/test_instruments.py"
   },
   "src/core/market_data.py": {},
   "src/core/portfolio.py": {
@@ -33,7 +15,11 @@
   "src/core/time.py": {
     "testing": [
       "tests/unit/core/test_instrument.py",
-      "tests/unit/stocks/research/test_dataset_contract.py"
+      "tests/unit/stocks/research/test_dataset_contract.py",
+      "tests/unit/stocks/research/test_research_datasets.py",
+      "tests/unit/stocks/test_simulation.py",
+      "tests/unit/stocks/workflows/test_trading_cycle.py",
+      "tests/unit/stocks/workflows/test_train_model.py"
     ]
   },
   "src/etfs/backtesting/engine.py": {
@@ -215,80 +201,93 @@
   "src/legacy/stock_yetirank_v1/validation/verify_financial_data.py": {},
   "src/legacy/stock_yetirank_v1/validation/verify_index_data.py": {},
   "src/legacy/stock_yetirank_v1/validation/verify_investor_data.py": {},
+  "src/stocks/backtesting/engine.py": {
+    "testing": [
+      "tests/integration/stocks/test_cycle_backtest_parity.py",
+      "tests/integration/stocks/test_settlement_replay.py"
+    ]
+  },
   "src/stocks/cli/intents.py": {},
   "src/stocks/cli/simulate.py": {},
   "src/stocks/cli/train.py": {},
   "src/stocks/data/contracts.py": {
     "testing": [
+      "tests/integration/stocks/test_cycle_backtest_parity.py",
+      "tests/integration/stocks/test_settlement_replay.py",
       "tests/unit/stocks/test_applications.py",
-      "tests/unit/stocks/test_simulation.py"
+      "tests/unit/stocks/test_simulation.py",
+      "tests/unit/stocks/workflows/test_score_model.py",
+      "tests/unit/stocks/workflows/test_simulate_portfolio.py",
+      "tests/unit/stocks/workflows/test_trading_cycle.py",
+      "tests/unit/stocks/workflows/test_train_model.py"
     ]
   },
   "src/stocks/data/repositories.py": {
-    "architecture": "docs/specs/stock_ohlc_quality_quarantine.md",
     "testing": "tests/unit/stocks/data/test_repositories.py"
   },
   "src/stocks/data/sources.py": {},
   "src/stocks/domain/universe.py": {
-    "testing": "tests/unit/stocks/test_universe_features_labels.py"
+    "testing": "tests/unit/stocks/domain/test_universe.py"
   },
   "src/stocks/research/artifacts.py": {
-    "testing": [
-      "tests/unit/stocks/research/test_artifact_registry.py",
-      "tests/unit/stocks/test_applications.py",
-      "tests/unit/stocks/test_simulation.py"
-    ]
+    "testing": "tests/unit/stocks/research/test_artifacts.py"
   },
   "src/stocks/research/datasets.py": {
     "testing": [
+      "tests/unit/stocks/data/test_repositories.py",
       "tests/unit/stocks/research/test_artifact_registry.py",
-      "tests/unit/stocks/research/test_dataset_contract.py"
+      "tests/unit/stocks/research/test_artifacts.py",
+      "tests/unit/stocks/research/test_dataset_contract.py",
+      "tests/unit/stocks/research/test_research_datasets.py"
     ]
   },
   "src/stocks/research/features.py": {
-    "testing": "tests/unit/stocks/test_universe_features_labels.py"
+    "testing": "tests/unit/stocks/research/test_features.py"
   },
   "src/stocks/research/folds.py": {
     "testing": "tests/unit/stocks/research/test_folds.py"
   },
   "src/stocks/research/labels.py": {
-    "testing": "tests/unit/stocks/test_universe_features_labels.py"
+    "testing": "tests/unit/stocks/research/test_labels.py"
   },
   "src/stocks/research/metrics.py": {
-    "testing": "tests/unit/stocks/test_simulation.py"
+    "testing": [
+      "tests/unit/stocks/test_simulation.py",
+      "tests/unit/stocks/trading/test_simulator.py"
+    ]
   },
   "src/stocks/research/models.py": {
-    "testing": "tests/unit/stocks/research/test_artifact_registry.py"
+    "testing": "tests/unit/stocks/research/test_models.py"
   },
   "src/stocks/settings.py": {
     "testing": "tests/unit/stocks/test_stock_settings.py"
   },
   "src/stocks/trading/allocation_policy.py": {
-    "testing": "tests/unit/stocks/test_simulation.py"
+    "testing": "tests/unit/stocks/trading/test_allocation_policy.py"
+  },
+  "src/stocks/trading/portfolio_constructor.py": {
+    "testing": "tests/unit/stocks/trading/test_portfolio_constructor.py"
   },
   "src/stocks/trading/simulator.py": {
-    "testing": "tests/unit/stocks/test_simulation.py"
+    "testing": "tests/unit/stocks/trading/test_simulator.py"
   },
   "src/stocks/workflows/contracts.py": {
-    "testing": [
-      "tests/unit/stocks/test_applications.py",
-      "tests/unit/stocks/test_simulation.py"
-    ]
+    "testing": "tests/unit/stocks/workflows/test_contracts.py"
   },
   "src/stocks/workflows/generate_intents.py": {
-    "testing": "tests/unit/stocks/test_applications.py"
+    "testing": "tests/unit/stocks/workflows/test_generate_intents.py"
   },
   "src/stocks/workflows/score_model.py": {
-    "testing": "tests/unit/stocks/test_applications.py"
+    "testing": "tests/unit/stocks/workflows/test_score_model.py"
   },
   "src/stocks/workflows/simulate_portfolio.py": {
-    "testing": "tests/unit/stocks/test_applications.py"
+    "testing": "tests/unit/stocks/workflows/test_simulate_portfolio.py"
+  },
+  "src/stocks/workflows/trading_cycle.py": {
+    "testing": "tests/unit/stocks/workflows/test_trading_cycle.py"
   },
   "src/stocks/workflows/train_model.py": {
-    "testing": [
-      "tests/unit/stocks/test_applications.py",
-      "tests/unit/stocks/test_simulation.py"
-    ]
+    "testing": "tests/unit/stocks/workflows/test_train_model.py"
   },
   "src/storage/parquet_datasets.py": {
     "testing": "tests/unit/storage/test_parquet_datasets.py"
