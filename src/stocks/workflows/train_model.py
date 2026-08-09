@@ -21,7 +21,7 @@ from src.core.costs import default_base_schedule, default_stress_schedule
 from src.core.instruments import AssetKind
 from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.research.artifacts import ModelArtifactRegistry
-from src.stocks.research.datasets import validate_stock_rows_available
+from src.stocks.research.datasets import research_eligible_frame, validate_stock_rows_available
 from src.stocks.research.features import build_features, phase1_allowlist
 from src.stocks.research.folds import Fold, PurgedWalkForward
 from src.stocks.research.labels import LabelDefinition
@@ -65,7 +65,7 @@ def train_model(
     base = request.base_cost_schedule or default_base_schedule()
     stress = request.stress_cost_schedule or default_stress_schedule()
 
-    frame = snapshot.frame
+    frame = research_eligible_frame(snapshot.frame)
     decision_time = frame["available_time"].max()
     if not isinstance(decision_time, datetime):
         raise ValueError("panel must carry a datetime available_time")
