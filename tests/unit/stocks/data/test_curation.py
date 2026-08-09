@@ -1,6 +1,7 @@
 """Canonical stock data curation: deterministic projection and certification."""
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -16,11 +17,18 @@ from src.stocks.data.curation import (
     StockCurationRequest,
     curate_legacy_feature_panel,
 )
+from src.stocks.data.quality import (
+    CorporateActionInterval,
+    CorporateActionSnapshot,
+    FeatureAvailabilityRecord,
+    InstrumentMasterRecord,
+    InstrumentMasterSnapshot,
+    KRXSessionCalendar,
+)
 from src.stocks.research.datasets import (
     ELIGIBLE_STATUS,
     QUALITY_REASON_COLUMN,
     QUALITY_STATUS_COLUMN,
-    QUARANTINED_STATUS,
 )
 
 DATES = [date(2024, 1, d) for d in (2, 3, 4, 5, 8)]
@@ -83,6 +91,89 @@ def canonical_frame(result) -> pl.DataFrame:
     return pl.read_parquet(result.partition_paths, hive_partitioning=True)
 
 
+def dataset_dir(result) -> Path:
+    # partition_paths live under <dataset>/partitions/year=*/month=*/part-*.parquet
+    return result.partition_paths[0].parent.parent.parent.parent
+
+
+def quarantined_frame(result) -> pl.DataFrame:
+    return pl.read_parquet(dataset_dir(result) / "bars" / "quarantined" / "part-00000.parquet")
+
+
+def non_equity_frame(result) -> pl.DataFrame:
+    return pl.read_parquet(dataset_dir(result) / "benchmarks" / "non_equity" / "part-00000.parquet")
+
+
+def master_snapshot() -> InstrumentMasterSnapshot:
+    return InstrumentMasterSnapshot(
+        version="fixture-master",
+        generated_time=datetime(2026, 1, 1, tzinfo=UTC),
+        records=(
+            InstrumentMasterRecord(
+                source_identifier="000050",
+                instrument_id="KRX:000050",
+                asset_type="common_stock",
+                is_common_stock=True,
+                listed_from=date(2024, 1, 1),
+                tradable_from=date(2024, 1, 1),
+                tradable_to=date(2024, 1, 31),
+                available_time=datetime(2024, 1, 1, tzinfo=UTC),
+            ),
+        ),
+    )
+
+
+def calendar_snapshot() -> KRXSessionCalendar:
+    return KRXSessionCalendar(
+        version="fixture-calendar",
+        sessions=tuple(DATES),
+        generated_time=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+
+def actions_snapshot() -> CorporateActionSnapshot:
+    return CorporateActionSnapshot(
+        version="fixture-actions",
+        generated_time=datetime(2026, 1, 1, tzinfo=UTC),
+        intervals=tuple(
+            CorporateActionInterval(
+                instrument_id="KRX:000050",
+                previous_session=DATES[i - 1],
+                session=DATES[i],
+                action_code="no_action",
+                adjustment_factor=1.0,
+            )
+            for i in range(1, len(DATES))
+        ),
+    )
+
+
+def evidence_request(**overrides) -> StockCurationRequest:
+    base = {
+        "certification": DatasetCertification.RESEARCH,
+        "calendar_hash": "cal",
+        "corporate_action_hash": "ca",
+        "cost_source_hash": "cost",
+        "instrument_master": master_snapshot(),
+        "corporate_actions": actions_snapshot(),
+        "calendar": calendar_snapshot(),
+        "feature_availability": tuple(
+            FeatureAvailabilityRecord(
+                feature_name=name,
+                source_field=name,
+                availability_rule="fixture-eod",
+                source_version="fixture-v1",
+                source_hash="fixture-hash",
+                null_rate=0.0,
+                use_class="research",
+            )
+            for name in ("log_return_5d", "volatility_20d")
+        ),
+    }
+    base.update(overrides)
+    return request(**base)
+
+
 class TestCurateDeterminism:
     def test_repeated_migration_yields_same_content_and_layout(self, tmp_path) -> None:
         source = fixture_source(tmp_path / "src")
@@ -129,7 +220,7 @@ class TestCurateLeakageAndQuarantine:
         result = curate_legacy_feature_panel(source, tmp_path / "out", request())
         frame = canonical_frame(result)
 
-        quarantined = frame.filter(pl.col(QUALITY_STATUS_COLUMN) == QUARANTINED_STATUS)
+        quarantined = quarantined_frame(result)
         assert quarantined.height == 2
         assert quarantined[QUALITY_REASON_COLUMN][0] == "non_positive_or_missing_ohlc"
         eligible = frame.filter(pl.col(QUALITY_STATUS_COLUMN) == ELIGIBLE_STATUS)
@@ -146,29 +237,37 @@ class TestCurateLeakageAndQuarantine:
         assert frame["session"].to_list() == sorted(frame["session"].to_list())
         assert frame["instrument_id"].to_list() == ["KRX:000050"] * 5
 
-    def test_index_rows_are_excluded_and_malformed_tickers_rejected(self, tmp_path) -> None:
+    def test_index_rows_are_routed_to_non_equity_and_unknown_identifiers_quarantined(
+        self, tmp_path
+    ) -> None:
         source = tmp_path / "src"
         kospi = legacy_row(0)
         kospi["ticker"] = "KOSPI"
         kosdaq = legacy_row(1)
         kosdaq["ticker"] = "KOSDAQ"
+        unknown = legacy_row(2)
+        unknown["ticker"] = "0001A0"
         write_feature_files(
             source,
             {
                 0: pl.DataFrame([kospi]),
                 1: pl.DataFrame([kosdaq]),
-                2: pl.DataFrame([legacy_row(2)]),
+                2: pl.DataFrame([unknown]),
+                3: pl.DataFrame([legacy_row(3)]),
             },
         )
         result = curate_legacy_feature_panel(source, tmp_path / "out", request())
         assert canonical_frame(result)["instrument_id"].to_list() == ["KRX:000050"]
+        assert non_equity_frame(result)["instrument_id"].to_list() == ["KRX:KOSDAQ", "KRX:KOSPI"]
+        quarantined = quarantined_frame(result)
+        assert quarantined.filter(pl.col("instrument_id") == "KRX:0001A0")[
+            QUALITY_REASON_COLUMN
+        ].to_list() == ["unclassified_instrument"]
 
-        malformed = tmp_path / "bad"
-        bad_row = legacy_row(0)
-        bad_row["ticker"] = "ABC"
-        write_feature_files(malformed, {0: pl.DataFrame([bad_row])})
-        with pytest.raises(ValueError, match="malformed ticker"):
-            curate_legacy_feature_panel(malformed, tmp_path / "out2", request())
+        report = json.loads(result.quality_report_path.read_text())
+        assert "KRX:0001A0" in report["affected_identifiers"]["unclassified_instrument"]
+        assert report["affected_files"]["unclassified_instrument"] != []
+        assert report["benchmark_routed_identifiers"] == ["KRX:KOSDAQ", "KRX:KOSPI"]
 
 
 class TestCurateFailClosed:
@@ -212,7 +311,11 @@ class TestCurateFailClosed:
         write_feature_files(source, {0: with_nan})
         result = curate_legacy_feature_panel(source, tmp_path / "out", request())
         frame = canonical_frame(result)
-        assert frame["feature__volatility_20d"].to_list() == [None]
+        # NaN is a missing marker: no Inf rejection, and the fully-null
+        # volatility column is absent from eligible predictors and reported.
+        assert "feature__volatility_20d" not in frame.columns
+        report = json.loads(result.quality_report_path.read_text())
+        assert "volatility_20d" in report["fully_null_columns"]
 
 
 class TestCurateCertificationBoundary:
@@ -227,7 +330,7 @@ class TestCurateCertificationBoundary:
 
     def test_research_without_evidence_is_rejected(self, tmp_path) -> None:
         source = fixture_source(tmp_path / "src")
-        with pytest.raises(ValueError, match="evidence"):
+        with pytest.raises(ValueError, match="InstrumentMasterSnapshot"):
             curate_legacy_feature_panel(
                 source, tmp_path / "out",
                 request(certification=DatasetCertification.RESEARCH),
@@ -238,19 +341,16 @@ class TestCurateCertificationBoundary:
         result = curate_legacy_feature_panel(
             source,
             tmp_path / "out",
-            request(
-                certification=DatasetCertification.RESEARCH,
-                calendar_hash="c",
-                corporate_action_hash="ca",
-                cost_source_hash="cost",
-            ),
+            evidence_request(),
         )
         assert result.manifest.certification is DatasetCertification.RESEARCH
-        assert result.manifest.calendar_hash == "c"
+        assert result.manifest.calendar_hash == "cal"
+        assert result.manifest.master_hash
+        assert result.manifest.quality_report_hash
 
     def test_production_without_evidence_is_rejected(self, tmp_path) -> None:
         source = fixture_source(tmp_path / "src")
-        with pytest.raises(ValueError, match="evidence"):
+        with pytest.raises(ValueError, match="InstrumentMasterSnapshot"):
             curate_legacy_feature_panel(
                 source, tmp_path / "out",
                 request(certification=DatasetCertification.PRODUCTION),
@@ -261,12 +361,7 @@ class TestCurateCertificationBoundary:
         result = curate_legacy_feature_panel(
             source,
             tmp_path / "out",
-            request(
-                certification=DatasetCertification.PRODUCTION,
-                calendar_hash="c",
-                corporate_action_hash="ca",
-                cost_source_hash="cost",
-            ),
+            evidence_request(certification=DatasetCertification.PRODUCTION),
         )
         assert validate_production_manifest(result.manifest) is None
         assert result.manifest.certification is DatasetCertification.PRODUCTION
