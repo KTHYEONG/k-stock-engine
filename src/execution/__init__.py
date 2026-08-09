@@ -1,36 +1,18 @@
-"""Execution package exports with lazy loading."""
+"""Execution package: public domain and application boundary.
 
-from importlib import import_module
-from typing import Any
+The legacy live-trading Yeti/KIS code is quarantined under ``legacy``; the
+package root exports the modern paper-gated boundary only.
+"""
+from src.execution.domain.intents import TradeIntent
+from src.execution.domain.orders import OrderRequest, OrderSide, OrderState, OrderStateRecord
+from src.execution.settings import DEFAULT_EXECUTION, ExecutionSettings
 
 __all__ = [
-    "ExecutionConfig",
-    "KisClient",
-    "KisCredentials",
-    "LiveTradePlan",
-    "PositionState",
-    "StateManager",
-    "YetiLiveStrategy",
-    "YetiLiveTrader",
+    "DEFAULT_EXECUTION",
+    "ExecutionSettings",
+    "OrderRequest",
+    "OrderSide",
+    "OrderState",
+    "OrderStateRecord",
+    "TradeIntent",
 ]
-
-_EXPORT_MAP = {
-    "KisClient": ("src.execution.kis_client", "KisClient"),
-    "KisCredentials": ("src.execution.kis_client", "KisCredentials"),
-    "LiveTradePlan": ("src.execution.yeti_strategy", "LiveTradePlan"),
-    "YetiLiveStrategy": ("src.execution.yeti_strategy", "YetiLiveStrategy"),
-    "ExecutionConfig": ("src.execution.yeti_trader", "ExecutionConfig"),
-    "YetiLiveTrader": ("src.execution.yeti_trader", "YetiLiveTrader"),
-    "PositionState": ("src.execution.yeti_state", "PositionState"),
-    "StateManager": ("src.execution.yeti_state", "StateManager"),
-}
-
-
-def __getattr__(name: str) -> Any:
-    if name not in _EXPORT_MAP:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    module_name, attr_name = _EXPORT_MAP[name]
-    module = import_module(module_name)
-    value = getattr(module, attr_name)
-    globals()[name] = value
-    return value
