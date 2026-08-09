@@ -34,6 +34,7 @@ def make_intent(suffix: str = "a") -> TradeIntent:
         strategy_id="stock_alpha_v1",
         reason="score-rank-policy",
         idempotency_key=f"stock_alpha_v1:005930:{decision.date().isoformat()}",
+        account_snapshot_id="account-a",
     )
 
 

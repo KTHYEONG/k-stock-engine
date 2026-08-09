@@ -17,8 +17,10 @@ class IntentValidator:
     def validate(self, intent: TradeIntent, now: datetime) -> None:
         if intent.decision_time > intent.execution_time:
             raise ValueError("intent decision_time after execution_time")
-        if intent.target_value <= 0:
-            raise ValueError("intent target_value must be positive")
+        if intent.target_value < 0:
+            raise ValueError("intent target_value must be non-negative")
+        if not intent.account_snapshot_id:
+            raise ValueError("intent account_snapshot_id must be non-empty")
         if not KRX_DAILY.in_session(intent.execution_time):
             raise ValueError(
                 f"execution outside {KRX_DAILY.name} session: {intent.execution_time.isoformat()}"
