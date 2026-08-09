@@ -76,6 +76,22 @@ class ModelArtifactRegistry:
         model = joblib.load(artifact_dir / MODEL_FILENAME)
         return LoadedModel(model=model, manifest=manifest)
 
+    def read_manifest(self, artifact_id: str) -> ModelManifest:
+        """Return the frozen manifest of ``artifact_id`` without loading the model.
+
+        Unlike ``load`` this performs no eligibility/schema validation; it is
+        used by replay and scheduling code that must inspect the eligibility
+        window before binding a decision time.
+        """
+        artifact_dir = self._artifact_dir(artifact_id)
+        if not artifact_dir.exists():
+            raise FileNotFoundError(f"artifact {artifact_id!r} not found at {artifact_dir}")
+        manifest_path = artifact_dir / MANIFEST_FILENAME
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"artifact {artifact_id!r} has no manifest")
+        with manifest_path.open("r", encoding="utf-8") as fh:
+            return _manifest_from_dict(json.load(fh))
+
     def _validate_manifest(self, manifest: ModelManifest, request: PredictionRequest) -> None:
         if manifest.asset_kind is not request.asset_kind:
             raise ValueError(
@@ -105,6 +121,16 @@ class ModelArtifactRegistry:
             raise FileNotFoundError(f"artifact {artifact_id!r} not found")
         with (artifact_dir / METRICS_FILENAME).open("w", encoding="utf-8") as fh:
             json.dump(metrics, fh, indent=2, default=str)
+
+    def is_promoted(self, artifact_id: str) -> bool:
+        """Return whether immutable promotion evidence marks an artifact promoted."""
+        artifact_dir = self._artifact_dir(artifact_id)
+        metrics_path = artifact_dir / METRICS_FILENAME
+        if not metrics_path.exists():
+            return False
+        with metrics_path.open("r", encoding="utf-8") as fh:
+            metrics = json.load(fh)
+        return isinstance(metrics, dict) and metrics.get("promoted") is True
 
 
 def _parse_iso(value: str) -> datetime:
