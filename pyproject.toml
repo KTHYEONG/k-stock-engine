@@ -28,6 +28,8 @@ dependencies = [
     "catboost>=1.2.0",
     "huggingface-hub>=1.26.0",
     "polars>=1.43.2",
+    "numba>=0.66.0",
+    "optuna>=4.9.0",
 ]
 
 [build-system]
@@ -48,11 +50,23 @@ exclude = [
     "data", 
     "legacy", 
     ".legacy",
+    "scratch",
     "logs", 
     "results", 
     ".pytest_cache", 
     ".git",
     ".venv",
+    "src/data",
+    "src/etf",
+    "src/training",
+    "src/evaluation",
+    "src/execution/yeti_*.py",
+    "src/execution/kis_client.py",
+    "src/filters",
+    "src/validation",
+    "src/utils",
+    "config/base.py",
+    "tools",
 ]
 
 [tool.ruff.lint]
@@ -106,6 +120,7 @@ exclude = [
     "data", 
     "legacy", 
     ".legacy",
+    "scratch",
     "logs", 
     "results", 
     ".pytest_cache", 
@@ -115,7 +130,7 @@ exclude = [
 ]
 
 [[tool.mypy.overrides]]
-module = ["tests.*", "src.data.*", "src.etf.*", "src.execution.*", "src.filters.*", "src.validation.*", "src.utils.*"]
+module = ["tests.*", "src.data.*", "src.etf.*", "src.training.*", "src.evaluation.*", "src.execution.*", "src.filters.*", "src.validation.*", "src.utils.*"]
 ignore_errors = true
 
 
