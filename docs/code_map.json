@@ -1,3 +1,293 @@
 {
-  "src/core/instruments.py": {}
+  "src/core/costs.py": {
+    "testing": "tests/unit/core/test_costs.py"
+  },
+  "src/core/datasets.py": {
+    "testing": "tests/unit/core/test_datasets.py"
+  },
+  "src/core/instruments.py": {
+    "testing": [
+      "tests/integration/execution/test_submission_gate.py",
+      "tests/unit/core/test_datasets.py",
+      "tests/unit/core/test_instrument.py",
+      "tests/unit/core/test_portfolio.py",
+      "tests/unit/etfs/test_analysis.py",
+      "tests/unit/etfs/test_index_switch_v1.py",
+      "tests/unit/etfs/test_optimization_runner.py",
+      "tests/unit/etfs/test_walk_forward.py",
+      "tests/unit/execution/test_broker.py",
+      "tests/unit/execution/test_intents.py",
+      "tests/unit/execution/test_orders.py",
+      "tests/unit/stocks/research/test_artifact_registry.py",
+      "tests/unit/stocks/research/test_dataset_contract.py",
+      "tests/unit/stocks/test_applications.py",
+      "tests/unit/stocks/test_simulation.py",
+      "tests/unit/stocks/test_universe_features_labels.py",
+      "tests/unit/storage/test_parquet_datasets.py"
+    ]
+  },
+  "src/core/market_data.py": {},
+  "src/core/portfolio.py": {
+    "testing": "tests/unit/core/test_portfolio.py"
+  },
+  "src/core/time.py": {
+    "testing": [
+      "tests/unit/core/test_instrument.py",
+      "tests/unit/stocks/research/test_dataset_contract.py"
+    ]
+  },
+  "src/etfs/backtesting/engine.py": {
+    "testing": [
+      "tests/integration/etfs/test_legacy_parity.py",
+      "tests/unit/etfs/test_index_switch_v1.py",
+      "tests/unit/etfs/test_walk_forward.py"
+    ]
+  },
+  "src/etfs/backtesting/results.py": {
+    "testing": "tests/unit/etfs/test_results.py"
+  },
+  "src/etfs/cli/backtest.py": {},
+  "src/etfs/cli/optimize.py": {},
+  "src/etfs/cli/walk_forward.py": {},
+  "src/etfs/data/contracts.py": {
+    "testing": [
+      "tests/unit/etfs/test_analysis.py",
+      "tests/unit/etfs/test_optimization_runner.py",
+      "tests/unit/etfs/test_walk_forward.py"
+    ]
+  },
+  "src/etfs/data/repositories.py": {},
+  "src/etfs/data/sources.py": {},
+  "src/etfs/domain/universe.py": {
+    "testing": [
+      "tests/integration/etfs/test_legacy_parity.py",
+      "tests/unit/etfs/test_analysis.py",
+      "tests/unit/etfs/test_index_switch_v1.py",
+      "tests/unit/etfs/test_optimization_runner.py",
+      "tests/unit/etfs/test_walk_forward.py"
+    ]
+  },
+  "src/etfs/research/analysis.py": {
+    "testing": "tests/unit/etfs/test_analysis.py"
+  },
+  "src/etfs/research/optimization_runner.py": {
+    "testing": "tests/unit/etfs/test_optimization_runner.py"
+  },
+  "src/etfs/research/search_space.py": {
+    "testing": "tests/unit/etfs/test_optimization_runner.py"
+  },
+  "src/etfs/research/walk_forward.py": {
+    "testing": [
+      "tests/unit/etfs/test_analysis.py",
+      "tests/unit/etfs/test_walk_forward.py"
+    ]
+  },
+  "src/etfs/settings.py": {
+    "testing": "tests/unit/etfs/test_etf_settings.py"
+  },
+  "src/etfs/strategies/index_switch_v1.py": {
+    "testing": [
+      "tests/integration/etfs/test_legacy_parity.py",
+      "tests/unit/etfs/test_analysis.py",
+      "tests/unit/etfs/test_index_switch_v1.py",
+      "tests/unit/etfs/test_walk_forward.py"
+    ]
+  },
+  "src/etfs/workflows/backtest.py": {},
+  "src/etfs/workflows/optimize.py": {},
+  "src/etfs/workflows/walk_forward.py": {},
+  "src/execution/adapters/in_memory_state_store.py": {
+    "testing": [
+      "tests/integration/execution/test_submission_gate.py",
+      "tests/unit/execution/test_state_store.py",
+      "tests/unit/execution/test_submit_intents.py",
+      "tests/unit/execution/test_validate_intents.py"
+    ]
+  },
+  "src/execution/adapters/paper_broker.py": {
+    "testing": [
+      "tests/integration/execution/test_submission_gate.py",
+      "tests/unit/execution/test_broker.py",
+      "tests/unit/execution/test_submit_intents.py"
+    ]
+  },
+  "src/execution/application/readiness.py": {
+    "testing": [
+      "tests/integration/execution/test_submission_gate.py",
+      "tests/unit/execution/test_readiness.py",
+      "tests/unit/execution/test_submit_intents.py"
+    ]
+  },
+  "src/execution/application/submit_intents.py": {
+    "testing": [
+      "tests/integration/execution/test_submission_gate.py",
+      "tests/unit/execution/test_submit_intents.py"
+    ]
+  },
+  "src/execution/application/validate_intents.py": {
+    "testing": "tests/unit/execution/test_validate_intents.py"
+  },
+  "src/execution/domain/intents.py": {
+    "testing": [
+      "tests/integration/execution/test_submission_gate.py",
+      "tests/unit/execution/test_intents.py",
+      "tests/unit/stocks/test_applications.py"
+    ]
+  },
+  "src/execution/domain/orders.py": {
+    "testing": [
+      "tests/integration/execution/test_submission_gate.py",
+      "tests/unit/execution/test_broker.py",
+      "tests/unit/execution/test_orders.py",
+      "tests/unit/execution/test_submit_intents.py"
+    ]
+  },
+  "src/execution/ports/broker.py": {
+    "testing": "tests/unit/execution/test_broker.py"
+  },
+  "src/execution/ports/state_store.py": {
+    "testing": "tests/unit/execution/test_state_store.py"
+  },
+  "src/execution/settings.py": {
+    "testing": "tests/unit/execution/test_settings.py"
+  },
+  "src/legacy/etf_v1/backtest_engine_numba.py": {},
+  "src/legacy/etf_v1/backtester.py": {
+    "testing": "tests/integration/etfs/test_legacy_parity.py"
+  },
+  "src/legacy/etf_v1/etf_config.py": {},
+  "src/legacy/etf_v1/etf_manager.py": {},
+  "src/legacy/etf_v1/go_nogo.py": {},
+  "src/legacy/etf_v1/metrics.py": {},
+  "src/legacy/etf_v1/monte_carlo.py": {},
+  "src/legacy/etf_v1/optimizer.py": {},
+  "src/legacy/etf_v1/run_etf_backtest.py": {},
+  "src/legacy/etf_v1/run_static_opt.py": {},
+  "src/legacy/etf_v1/run_walk_forward.py": {},
+  "src/legacy/etf_v1/strategy_engine.py": {
+    "testing": "tests/integration/etfs/test_legacy_parity.py"
+  },
+  "src/legacy/live_yeti_v1/kis_client.py": {},
+  "src/legacy/live_yeti_v1/yeti_runner.py": {},
+  "src/legacy/live_yeti_v1/yeti_state.py": {},
+  "src/legacy/live_yeti_v1/yeti_strategy.py": {},
+  "src/legacy/live_yeti_v1/yeti_trader.py": {},
+  "src/legacy/stock_yetirank_v1/data/collectors/collect_data.py": {},
+  "src/legacy/stock_yetirank_v1/data/collectors/collect_financial_data.py": {},
+  "src/legacy/stock_yetirank_v1/data/collectors/dart_collector.py": {},
+  "src/legacy/stock_yetirank_v1/data/collectors/direct_krx_collector.py": {},
+  "src/legacy/stock_yetirank_v1/data/collectors/investor_data_collector.py": {},
+  "src/legacy/stock_yetirank_v1/data/collectors/krx_openapi_collector.py": {},
+  "src/legacy/stock_yetirank_v1/data/collectors/market_data.py": {},
+  "src/legacy/stock_yetirank_v1/data/collectors/naver_finance_collector.py": {},
+  "src/legacy/stock_yetirank_v1/data/collectors/vix_collector.py": {},
+  "src/legacy/stock_yetirank_v1/data/feature_engineer.py": {},
+  "src/legacy/stock_yetirank_v1/data/feature_store.py": {},
+  "src/legacy/stock_yetirank_v1/data/preprocessors/base_processor.py": {},
+  "src/legacy/stock_yetirank_v1/data/preprocessors/cross_processor.py": {},
+  "src/legacy/stock_yetirank_v1/data/preprocessors/flow_processor.py": {},
+  "src/legacy/stock_yetirank_v1/data/preprocessors/fund_processor.py": {},
+  "src/legacy/stock_yetirank_v1/data/preprocessors/macro_processor.py": {},
+  "src/legacy/stock_yetirank_v1/data/preprocessors/target_processor.py": {},
+  "src/legacy/stock_yetirank_v1/data/preprocessors/tech_processor.py": {},
+  "src/legacy/stock_yetirank_v1/data/preprocessors/universe_filter.py": {},
+  "src/legacy/stock_yetirank_v1/evaluation/backtester.py": {},
+  "src/legacy/stock_yetirank_v1/filters/liquidity.py": {
+    "testing": "tests/unit/legacy/stock_yetirank_v1/test_filters.py"
+  },
+  "src/legacy/stock_yetirank_v1/filters/pipeline.py": {
+    "testing": "tests/unit/legacy/stock_yetirank_v1/test_filters.py"
+  },
+  "src/legacy/stock_yetirank_v1/filters/quality.py": {
+    "testing": "tests/unit/legacy/stock_yetirank_v1/test_filters.py"
+  },
+  "src/legacy/stock_yetirank_v1/filters/volatility.py": {
+    "testing": "tests/unit/legacy/stock_yetirank_v1/test_filters.py"
+  },
+  "src/legacy/stock_yetirank_v1/training/data_loader.py": {},
+  "src/legacy/stock_yetirank_v1/training/trainer.py": {},
+  "src/legacy/stock_yetirank_v1/training/tuner.py": {},
+  "src/legacy/stock_yetirank_v1/utils/logger.py": {},
+  "src/legacy/stock_yetirank_v1/validation/feature_selection.py": {},
+  "src/legacy/stock_yetirank_v1/validation/final_verify_data.py": {},
+  "src/legacy/stock_yetirank_v1/validation/test_krx_direct_crawl.py": {},
+  "src/legacy/stock_yetirank_v1/validation/verify_feature_data.py": {},
+  "src/legacy/stock_yetirank_v1/validation/verify_financial_data.py": {},
+  "src/legacy/stock_yetirank_v1/validation/verify_index_data.py": {},
+  "src/legacy/stock_yetirank_v1/validation/verify_investor_data.py": {},
+  "src/stocks/cli/intents.py": {},
+  "src/stocks/cli/simulate.py": {},
+  "src/stocks/cli/train.py": {},
+  "src/stocks/data/contracts.py": {
+    "testing": [
+      "tests/unit/stocks/test_applications.py",
+      "tests/unit/stocks/test_simulation.py"
+    ]
+  },
+  "src/stocks/data/repositories.py": {},
+  "src/stocks/data/sources.py": {},
+  "src/stocks/domain/universe.py": {
+    "testing": "tests/unit/stocks/test_universe_features_labels.py"
+  },
+  "src/stocks/research/artifacts.py": {
+    "testing": [
+      "tests/unit/stocks/research/test_artifact_registry.py",
+      "tests/unit/stocks/test_applications.py",
+      "tests/unit/stocks/test_simulation.py"
+    ]
+  },
+  "src/stocks/research/datasets.py": {
+    "testing": [
+      "tests/unit/stocks/research/test_artifact_registry.py",
+      "tests/unit/stocks/research/test_dataset_contract.py"
+    ]
+  },
+  "src/stocks/research/features.py": {
+    "testing": "tests/unit/stocks/test_universe_features_labels.py"
+  },
+  "src/stocks/research/folds.py": {
+    "testing": "tests/unit/stocks/research/test_folds.py"
+  },
+  "src/stocks/research/labels.py": {
+    "testing": "tests/unit/stocks/test_universe_features_labels.py"
+  },
+  "src/stocks/research/metrics.py": {
+    "testing": "tests/unit/stocks/test_simulation.py"
+  },
+  "src/stocks/research/models.py": {
+    "testing": "tests/unit/stocks/research/test_artifact_registry.py"
+  },
+  "src/stocks/settings.py": {
+    "testing": "tests/unit/stocks/test_stock_settings.py"
+  },
+  "src/stocks/trading/allocation_policy.py": {
+    "testing": "tests/unit/stocks/test_simulation.py"
+  },
+  "src/stocks/trading/simulator.py": {
+    "testing": "tests/unit/stocks/test_simulation.py"
+  },
+  "src/stocks/workflows/contracts.py": {
+    "testing": [
+      "tests/unit/stocks/test_applications.py",
+      "tests/unit/stocks/test_simulation.py"
+    ]
+  },
+  "src/stocks/workflows/generate_intents.py": {
+    "testing": "tests/unit/stocks/test_applications.py"
+  },
+  "src/stocks/workflows/score_model.py": {
+    "testing": "tests/unit/stocks/test_applications.py"
+  },
+  "src/stocks/workflows/simulate_portfolio.py": {
+    "testing": "tests/unit/stocks/test_applications.py"
+  },
+  "src/stocks/workflows/train_model.py": {
+    "testing": [
+      "tests/unit/stocks/test_applications.py",
+      "tests/unit/stocks/test_simulation.py"
+    ]
+  },
+  "src/storage/parquet_datasets.py": {
+    "testing": "tests/unit/storage/test_parquet_datasets.py"
+  }
 }
