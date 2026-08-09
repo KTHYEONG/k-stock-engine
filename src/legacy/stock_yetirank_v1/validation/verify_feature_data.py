@@ -7,7 +7,7 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
-from src.data.feature_store import FeatureStore
+from src.legacy.stock_yetirank_v1.data.feature_store import FeatureStore
 
 def main():
     store = FeatureStore()

@@ -14,10 +14,10 @@ import polars as pl
 import pandas as pd
 from datetime import datetime
 
-from src.data.feature_store import FeatureStore
-from src.etf.optimizer import ETFOptimizer
-from src.etf.backtester import ETFBacktester
-from src.etf.etf_config import get_quarterly_window, ETFConfig
+from src.legacy.stock_yetirank_v1.data.feature_store import FeatureStore
+from src.legacy.etf_v1.optimizer import ETFOptimizer
+from src.legacy.etf_v1.backtester import ETFBacktester
+from src.legacy.etf_v1.etf_config import get_quarterly_window, ETFConfig
 
 # Standard logger for diagnostics
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')

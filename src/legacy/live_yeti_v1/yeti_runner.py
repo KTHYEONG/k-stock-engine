@@ -14,11 +14,11 @@ if str(ROOT) not in sys.path:
 
 from dotenv import load_dotenv
 
-from src.execution.kis_client import KisClient, KisCredentials
-from src.execution.yeti_strategy import YetiLiveStrategy
-from src.execution.yeti_trader import ExecutionConfig, YetiLiveTrader
-from src.execution.yeti_state import StateManager
-from src.utils.logger import setup_logger
+from src.legacy.live_yeti_v1.kis_client import KisClient, KisCredentials
+from src.legacy.live_yeti_v1.yeti_strategy import YetiLiveStrategy
+from src.legacy.live_yeti_v1.yeti_trader import ExecutionConfig, YetiLiveTrader
+from src.legacy.live_yeti_v1.yeti_state import StateManager
+from src.legacy.stock_yetirank_v1.utils.logger import setup_logger
 
 logger = setup_logger("execution.run_yetirank_live_bot")
 _RUNNING = True
@@ -37,7 +37,7 @@ def run_data_pipeline(low_spec: bool = False):
         start_str = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
         
         logger.info(f"Running collect_data.py for {start_str} ~ {today_str}...")
-        collect_cmd = [sys.executable, "-m", "src.data.collectors.collect_data", "--start", start_str, "--end", today_str]
+        collect_cmd = [sys.executable, "-m", "src.legacy.stock_yetirank_v1.data.collectors.collect_data", "--start", start_str, "--end", today_str]
         if low_spec:
             collect_cmd.append("--low-spec")
             logger.info("Using low-spec (serial) collection mode.")
@@ -46,7 +46,7 @@ def run_data_pipeline(low_spec: bool = False):
         
         logger.info(f"Running feature_engineer.py for {start_str} ~ {today_str}...")
         subprocess.run(
-            [sys.executable, "-m", "src.data.feature_engineer", "--start", start_str, "--end", today_str],
+            [sys.executable, "-m", "src.legacy.stock_yetirank_v1.data.feature_engineer", "--start", start_str, "--end", today_str],
             check=True
         )
         logger.info("✅ Automated data pipeline completed successfully!")

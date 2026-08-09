@@ -16,11 +16,7 @@ sys.path.append(str(PROJECT_ROOT))
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 
-try:
-    from src.data.collectors.krx_openapi_collector import KRXOpenAPICollector
-except ImportError:
-    # 패키지 구조에 따라 경로 조정
-    from .collectors.krx_openapi_collector import KRXOpenAPICollector
+from src.legacy.stock_yetirank_v1.data.collectors.krx_openapi_collector import KRXOpenAPICollector
 
 logger = logging.getLogger("data.etf_manager")
 
@@ -53,14 +49,14 @@ class ETFManager:
     def __init__(self):
         self._collector = None
         # 데이터 저장소 초기화 (data/etf, data/index)
-        from src.data.feature_store import FeatureStore
+        from src.legacy.stock_yetirank_v1.data.feature_store import FeatureStore
         self.etf_store = FeatureStore(base_path=Path("./data/etf_daily"))
         self.index_store = FeatureStore(base_path=Path("./data/market_index"))
 
     @property
     def collector(self):
         if self._collector is None:
-            from src.data.collectors.krx_openapi_collector import KRXOpenAPICollector
+            from src.legacy.stock_yetirank_v1.data.collectors.krx_openapi_collector import KRXOpenAPICollector
             self._collector = KRXOpenAPICollector()
         return self._collector
         

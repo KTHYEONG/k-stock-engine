@@ -1,5 +1,5 @@
 import polars as pl
-from src.data.preprocessors.base_processor import BaseProcessor
+from src.legacy.stock_yetirank_v1.data.preprocessors.base_processor import BaseProcessor
 
 class CrossSectionalProcessor(BaseProcessor):
     """
