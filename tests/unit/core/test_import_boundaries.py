@@ -1,9 +1,9 @@
-"""Phase 1 exit gate: static import-boundary contract.
+"""Architecture boundary contract.
 
-``core`` must not import ``stocks``, ``etfs``, or ``execution``; ``stocks`` and
-``etfs`` must not import one another; ``execution`` may depend on ``core`` only.
-No newly written code may import legacy ``training``/``evaluation``/``filters``/
-``etf`` modules.
+``core`` must not import ``stocks``, ``etfs``, ``execution``, or ``legacy``;
+``stocks`` and ``etfs`` must not import one another or ``legacy``;
+``storage`` imports only ``core``. No modern package may import quarantined
+legacy modules.
 """
 from __future__ import annotations
 
@@ -12,9 +12,20 @@ from pathlib import Path
 
 SRC = Path(__file__).resolve().parent.parent.parent / "src"
 
-FORBIDDEN_CORE = ("src.stocks", "src.etfs", "src.execution", "src.etf", "src.training", "src.evaluation", "src.filters")
+MODERN_PACKAGES = ("core", "storage", "stocks", "etfs", "execution")
+LEGACY_PREFIXES = (
+    "src.legacy",
+    "src.etf",
+    "src.training",
+    "src.evaluation",
+    "src.filters",
+    "src.data.etf_manager",
+    "src.execution.kis_client",
+    "src.execution.yeti",
+)
+FORBIDDEN_CORE = ("src.stocks", "src.etfs", "src.execution", "src.storage", "src.legacy")
 FORBIDDEN_STOCK_ETF_CROSS = {"stocks": "src.etfs", "etfs": "src.stocks"}
-FORBIDDEN_ALL = ("src.training", "src.evaluation", "src.filters", "src.etf", "src.data.etf_manager")
+STORAGE_FORBIDDEN = ("src.stocks", "src.etfs", "src.execution", "src.legacy")
 
 
 def _walk(pkg: str) -> list[Path]:
@@ -43,6 +54,15 @@ class TestImportBoundaries:
                     f"{path} must not import {forbidden}"
                 )
 
+    def test_storage_imports_only_core(self) -> None:
+        for path in _walk("storage"):
+            text = path.read_text(encoding="utf-8")
+            imports = _imports(text)
+            for forbidden in STORAGE_FORBIDDEN:
+                assert not any(i.startswith(forbidden) for i in imports), (
+                    f"{path} must not import {forbidden}"
+                )
+
     def test_stocks_and_etfs_do_not_import_each_other(self) -> None:
         for pkg, forbidden in FORBIDDEN_STOCK_ETF_CROSS.items():
             for path in _walk(pkg):
@@ -52,15 +72,15 @@ class TestImportBoundaries:
                     f"{path} must not import {forbidden}"
                 )
 
-    def test_no_legacy_imports_in_new_code(self) -> None:
-        for pkg in ("core", "stocks", "etfs", "execution"):
+    def test_no_modern_package_imports_legacy(self) -> None:
+        for pkg in MODERN_PACKAGES:
             for path in _walk(pkg):
                 text = path.read_text(encoding="utf-8")
                 imports = _imports(text)
-                for forbidden in FORBIDDEN_ALL:
-                    assert not any(i == forbidden or i.startswith(forbidden + ".") for i in imports), (
-                        f"{path} must not import {forbidden}"
-                    )
+                for legacy in LEGACY_PREFIXES:
+                    assert not any(
+                        i == legacy or i.startswith(legacy + ".") for i in imports
+                    ), f"{path} must not import {legacy}"
 
     def test_execution_depends_only_on_core_beyond_own_tree(self) -> None:
         for path in _walk("execution"):

@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, UTC
 import polars as pl
 
 from src.core.instruments import AssetKind
-from src.stocks.ml.dataset import DatasetManifest, make_manifest
+from src.core.datasets import DatasetManifest, make_manifest
 
 
 def stock_instrument_df(
@@ -60,6 +60,8 @@ def stock_manifest(
         label_horizon_sessions=horizon,
         time_start=datetime(2024, 1, 1, tzinfo=UTC),
         time_end=datetime(2024, 3, 1, tzinfo=UTC),
+        provider_version="fixture",
+        universe_policy_version="fixture",
         row_count=len(cols) * 10,
         generated_time=decision_time,
     )

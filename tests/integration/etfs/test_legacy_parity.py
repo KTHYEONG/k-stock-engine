@@ -9,10 +9,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.etf.backtester import ETFBacktester
-from src.etf.strategy_engine import ETFStrategyEngine
+from src.legacy.etf_v1.backtester import ETFBacktester
+from src.legacy.etf_v1.strategy_engine import ETFStrategyEngine
+from src.etfs.backtesting.engine import EtfBacktester, IndexSwitchParams
 from src.etfs.domain.universe import KOSPI_ETF_UNIVERSE
-from src.etfs.simulation.runner import EtfBacktester, IndexSwitchParams
 from src.etfs.strategies.index_switch_v1 import IndexSwitchV1
 from tests.fixtures.etfs.helpers import make_etf_fixture, preprocess_index
 
