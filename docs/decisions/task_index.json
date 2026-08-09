@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_OHLC_QUALITY_QUARANTINE",
+      "date": "2026-08-09",
+      "adr_id": "ADR_20260809_STOCK_OHLC_QUALITY_QUARANTINE",
+      "domain": "stocks",
+      "title": "Quarantine invalid stock OHLC rows",
+      "why": "Two legacy stock rows contain zero open/high/low values during documented trading-halt or partial-session events, so price backfill would fabricate tradable data.",
+      "resolution": "The provisional legacy adapter now retains every row with deterministic data_quality_status and data_quality_reason fields; non-positive or missing OHLC rows are quarantined and research_eligible_frame excludes them from training and scoring.",
+      "impact": "Source evidence remains auditable, invalid sessions cannot contaminate features, labels, or simulation, and future licensed backfills can replace quarantined rows with provenance."
+    },
+    {
       "task_id": "TASK_KR_EQUITY_COMPOUNDING_ARCHITECTURE",
       "date": "2026-08-09",
       "adr_id": "ADR_20260809_KR_EQUITY_COMPOUNDING_ARCHITECTURE",
