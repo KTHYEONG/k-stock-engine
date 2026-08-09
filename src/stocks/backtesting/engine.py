@@ -14,7 +14,7 @@ executable prices.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 import numpy as np
@@ -175,6 +175,7 @@ class BacktestResult:
     metrics: dict[str, float]
     stress_final_value: float | None = None
     stress_metrics: dict[str, float] | None = None
+    data_quality: dict[str, str] = field(default_factory=dict)
 
     @property
     def equity_curve(self) -> list[float]:
@@ -228,6 +229,7 @@ class StockBacktester:
         missing = [c for c in REQUIRED_BACKTEST_COLUMNS if c not in panel.columns]
         if missing:
             raise BacktestValidationError(f"panel must carry {', '.join(missing)}")
+        self._assert_eligible_and_covered(panel)
         sessions = [_as_datetime(s) for s in sorted(panel["session"].unique().to_list())]
         if not sessions:
             raise BacktestValidationError("panel has no sessions")
@@ -271,7 +273,51 @@ class StockBacktester:
             metrics=metrics,
             stress_final_value=stress_final_value,
             stress_metrics=stress_metrics,
+            data_quality=self._data_quality_evidence(),
         )
+
+    def _data_quality_evidence(self) -> dict[str, str]:
+        """Immutable data-quality lineage recorded with every replay result."""
+        m = self.manifest
+        return {
+            "dataset_content_hash": m.content_hash,
+            "quality_report_hash": m.quality_report_hash,
+            "master_hash": m.master_hash,
+            "calendar_hash": m.calendar_hash,
+            "action_hash": m.corporate_action_hash,
+            "cost_hash": m.cost_source_hash,
+        }
+
+    def _assert_eligible_and_covered(self, panel: pl.DataFrame) -> None:
+        """Fail closed unless every row is eligible and action-covered.
+
+        A derived return across an uncovered action interval must not feed a
+        replay. When the dataset is PROVISIONAL there is no verified action
+        evidence, so only the eligibility gate applies; RESEARCH/PRODUCTION
+        additionally require every row to carry an explicit action-coverage
+        record.
+        """
+        status_column = "data_quality_status"
+        if status_column in panel.columns:
+            non_eligible = panel.filter(pl.col(status_column) != "eligible")
+            if not non_eligible.is_empty():
+                raise BacktestValidationError(
+                    f"{non_eligible.height} non-eligible rows in replay panel"
+                )
+        if self.manifest.certification.value == "provisional":
+            return
+        coverage_column = "action_interval_covered"
+        if coverage_column not in panel.columns:
+            raise BacktestValidationError(
+                f"{self.manifest.certification.value} replay requires action coverage"
+            )
+        uncovered = panel.filter(
+            pl.col(coverage_column).is_null() | (~pl.col(coverage_column))
+        )
+        if not uncovered.is_empty():
+            raise BacktestValidationError(
+                f"{uncovered.height} rows cross an uncovered action interval"
+            )
 
     def _run_ledger(
         self,
