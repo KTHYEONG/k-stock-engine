@@ -16,7 +16,7 @@ project_root = Path(__file__).parent.parent.parent.parent
 sys.path.append(str(project_root))
 load_dotenv(dotenv_path=project_root / ".env")
 
-from src.data.collectors.dart_collector import OpenDartCollector
+from src.legacy.stock_yetirank_v1.data.collectors.dart_collector import OpenDartCollector
 
 logging.basicConfig(
     level=logging.INFO,

@@ -16,9 +16,9 @@ load_dotenv(dotenv_path=env_path)
 # 프로젝트 루트 경로 추가
 sys.path.append(str(Path(__file__).parent.parent.parent.parent))
 
-from src.data.collectors.market_data import MarketDataCollector
-from src.data.feature_store import FeatureStore
-from src.utils.logger import setup_logger
+from src.legacy.stock_yetirank_v1.data.collectors.market_data import MarketDataCollector
+from src.legacy.stock_yetirank_v1.data.feature_store import FeatureStore
+from src.legacy.stock_yetirank_v1.utils.logger import setup_logger
 
 async def main():
     parser = argparse.ArgumentParser(description="Collect Daily Market Data")
