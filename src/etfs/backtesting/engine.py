@@ -1,4 +1,4 @@
-"""ETF fill assumptions and backtest runner.
+"""ETF fill assumptions and backtest engine.
 
 This module ports the legacy Numba engine to deterministic NumPy with identical
 signal, fill, and ledger semantics. Fixture parity with the legacy engine is
@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import numpy as np
 import polars as pl
 
+from src.etfs.backtesting.results import EtfBacktestResult
 from src.etfs.domain.universe import EtfUniverse
 from src.etfs.strategies.index_switch_v1 import IndexSwitchParams, IndexSwitchV1
 
@@ -24,19 +25,6 @@ class EtfSimulationConfig:
     capital_use: float = 0.99
 
 
-@dataclass(frozen=True, slots=True)
-class EtfBacktestResult:
-    market: str
-    total_return_pct: float
-    mdd_pct: float
-    total_trades: int
-    win_rate: float
-    profit_factor: float
-    final_balance: float
-    equity_curve: list[float]
-    trades: list[dict[str, float | int]]
-
-
 def _backtest_engine(
     arr: np.ndarray,
     ibs_exit: float,
@@ -44,6 +32,7 @@ def _backtest_engine(
     stop_loss_pct: float,
     initial_balance: float,
     fee_rate: float,
+    capital_use: float,
 ) -> tuple[list[tuple[int, int, int, float, float, float, float, float]], float, np.ndarray]:
     """Deterministic NumPy port of the legacy Numba ETF engine.
 
@@ -99,7 +88,7 @@ def _backtest_engine(
                 bar_processed = True
 
         if not in_position and not bar_processed and c_sig != 0:
-            target_capital = balance * 0.99
+            target_capital = balance * capital_use
             if c_sig == 1 and b1_o > 0:
                 fill_price = b1_o
                 amount = target_capital / fill_price
@@ -216,7 +205,7 @@ class EtfBacktester:
         p = self.params
         trades, final_balance, equity_curve = _backtest_engine(
             arr, p.ibs_exit, p.max_hold_days, p.stop_loss_pct,
-            self.config.initial_balance, self.config.fee_rate,
+            self.config.initial_balance, self.config.fee_rate, self.config.capital_use,
         )
 
         n_trades = len(trades)
