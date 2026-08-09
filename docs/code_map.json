@@ -308,5 +308,8 @@
   },
   "src/stocks/data/quality.py": {
     "testing": "tests/unit/stocks/data/test_quality.py"
+  },
+  "src/stocks/data/evidence.py": {
+    "testing": "tests/unit/stocks/data/test_evidence.py"
   }
 }

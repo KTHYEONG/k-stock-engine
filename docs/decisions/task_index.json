@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_DATA_EVIDENCE_HARDENING",
+      "date": "2026-08-09",
+      "adr_id": "ADR_20260809_STOCK_DATA_EVIDENCE_HARDENING",
+      "domain": "stocks",
+      "title": "Stock data evidence hardening",
+      "why": "Research data lacked reproducible instrument identity, corporate-action coverage, and point-in-time disclosure availability.",
+      "resolution": "Added deterministic evidence artifact loaders, effective-interval validation, conservative date-only disclosure availability, and curation CLI evidence gates.",
+      "impact": "Research and production curation now fail closed without required evidence; current provisional datasets remain unchanged until authoritative KRX/DART/corporate-action artifacts are supplied."
+    },
+    {
       "task_id": "TASK_STOCK_DATA_QUALITY_HARDENING",
       "date": "2026-08-09",
       "adr_id": "ADR_20260809_STOCK_DATA_QUALITY_HARDENING",
