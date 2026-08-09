@@ -7,8 +7,8 @@ import sys
 PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
-from src.data.preprocessors.base_processor import BaseProcessor
-from src.data.collectors.vix_collector import VixCollector
+from src.legacy.stock_yetirank_v1.data.preprocessors.base_processor import BaseProcessor
+from src.legacy.stock_yetirank_v1.data.collectors.vix_collector import VixCollector
 
 logger = logging.getLogger("preprocessors.macro")
 

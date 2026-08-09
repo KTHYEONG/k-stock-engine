@@ -12,7 +12,7 @@ project_root = os.path.dirname(current_dir) # src/의 상위 (루트)가 아니�
 
 sys.path.append(project_root)
 
-from src.data.collectors.investor_data_collector import InvestorDataCollector
+from src.legacy.stock_yetirank_v1.data.collectors.investor_data_collector import InvestorDataCollector
 import polars as pl
 
 

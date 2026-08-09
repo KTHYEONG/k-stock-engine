@@ -5,8 +5,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import polars as pl
 
-from src.evaluation.backtester import YetiRankBacktester
-from src.execution.yeti_state import PositionState
+from src.legacy.stock_yetirank_v1.evaluation.backtester import YetiRankBacktester
+from src.legacy.live_yeti_v1.yeti_state import PositionState
 
 
 @dataclass

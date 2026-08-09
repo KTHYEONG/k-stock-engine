@@ -7,7 +7,7 @@ import logging
 import pandas as pd
 import polars as pl
 from datetime import datetime
-from src.data.collectors.direct_krx_collector import DirectKRXCollector
+from src.legacy.stock_yetirank_v1.data.collectors.direct_krx_collector import DirectKRXCollector
 
 logger = logging.getLogger("data.collectors.investor")
 

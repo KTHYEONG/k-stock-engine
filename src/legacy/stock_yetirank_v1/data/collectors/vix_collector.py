@@ -11,7 +11,7 @@ from typing import Optional
 PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
-from src.utils.logger import setup_logger
+from src.legacy.stock_yetirank_v1.utils.logger import setup_logger
 
 logger = setup_logger("data.collectors.vix")
 

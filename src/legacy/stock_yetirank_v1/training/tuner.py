@@ -6,8 +6,8 @@ import os
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 from catboost import CatBoostRanker
-from src.training.data_loader import YetiRankDataLoader
-from src.utils.logger import setup_logger
+from src.legacy.stock_yetirank_v1.training.data_loader import YetiRankDataLoader
+from src.legacy.stock_yetirank_v1.utils.logger import setup_logger
 
 logger = setup_logger("training.tuner")
 

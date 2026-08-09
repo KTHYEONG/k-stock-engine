@@ -1,6 +1,6 @@
 import polars as pl
-from src.data.preprocessors.base_processor import BaseProcessor
-from src.data.feature_store import FeatureStore
+from src.legacy.stock_yetirank_v1.data.preprocessors.base_processor import BaseProcessor
+from src.legacy.stock_yetirank_v1.data.feature_store import FeatureStore
 from config.base import DATA_DIR
 import logging
 

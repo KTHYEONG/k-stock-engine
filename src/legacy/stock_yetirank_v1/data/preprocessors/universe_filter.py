@@ -1,6 +1,6 @@
 import polars as pl
 import logging
-from src.data.preprocessors.base_processor import BaseProcessor
+from src.legacy.stock_yetirank_v1.data.preprocessors.base_processor import BaseProcessor
 
 logger = logging.getLogger("preprocessors.filter")
 
