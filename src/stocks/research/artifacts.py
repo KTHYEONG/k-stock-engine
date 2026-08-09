@@ -15,7 +15,7 @@ from pathlib import Path
 import joblib
 
 from src.core.instruments import AssetKind
-from src.stocks.ml.models import Model, ModelManifest
+from src.stocks.research.models import Model, ModelManifest
 
 ARTIFACT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{4,128}$")
 
