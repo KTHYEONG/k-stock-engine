@@ -1,0 +1,47 @@
+"""Artifact manifest inspection: read_manifest without model load."""
+from __future__ import annotations
+
+import pytest
+
+from src.core.instruments import AssetKind
+from src.stocks.research.artifacts import ModelArtifactRegistry
+from src.stocks.research.datasets import schema_hash
+from src.stocks.research.models import DeterministicBaseline, ModelManifest
+
+FEATURES = ["session_index", "instrument_id", "feature_momentum_5d"]
+
+
+def make_manifest(artifact_id: str = "a001") -> ModelManifest:
+    return ModelManifest(
+        artifact_id=artifact_id,
+        asset_kind=AssetKind.STOCK,
+        feature_set="stock_alpha_v1",
+        feature_schema_hash=schema_hash(FEATURES),
+        universe_policy_hash="universe-hash",
+        label_definition="fwd_ret_5d",
+        label_horizon_sessions=5,
+        eligible_from="2024-01-01T00:00:00+00:00",
+        eligible_to="2024-12-31T00:00:00+00:00",
+        model_type="baseline",
+    )
+
+
+class TestReadManifest:
+    def test_read_manifest_returns_frozen_metadata_without_loading_model(self, tmp_path) -> None:
+        registry = ModelArtifactRegistry(tmp_path)
+        model = DeterministicBaseline(manifest=make_manifest())
+        registry.publish(model, model.manifest())
+        manifest = registry.read_manifest("a001")
+        assert manifest.artifact_id == "a001"
+        assert manifest.eligible_from == "2024-01-01T00:00:00+00:00"
+        assert manifest.eligible_to == "2024-12-31T00:00:00+00:00"
+
+    def test_read_manifest_rejects_missing_artifact(self, tmp_path) -> None:
+        registry = ModelArtifactRegistry(tmp_path)
+        with pytest.raises(FileNotFoundError):
+            registry.read_manifest("missing")
+
+    def test_read_manifest_rejects_invalid_artifact_id(self, tmp_path) -> None:
+        registry = ModelArtifactRegistry(tmp_path)
+        with pytest.raises(ValueError, match="invalid artifact_id"):
+            registry.read_manifest("no spaces here")
