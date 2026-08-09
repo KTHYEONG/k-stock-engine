@@ -61,6 +61,8 @@ class DatasetManifest:
     calendar_hash: str = ""
     corporate_action_hash: str = ""
     cost_source_hash: str = ""
+    master_hash: str = ""
+    quality_report_hash: str = ""
     content_hash: str = ""
     storage_layout: str = ""
 
@@ -116,6 +118,8 @@ def make_manifest(
     calendar_hash: str = "",
     corporate_action_hash: str = "",
     cost_source_hash: str = "",
+    master_hash: str = "",
+    quality_report_hash: str = "",
     schema_version: str = "v1",
     content_hash: str = "",
     storage_layout: str = "",
@@ -147,6 +151,8 @@ def make_manifest(
         calendar_hash=calendar_hash,
         corporate_action_hash=corporate_action_hash,
         cost_source_hash=cost_source_hash,
+        master_hash=master_hash,
+        quality_report_hash=quality_report_hash,
         content_hash=content_hash,
         storage_layout=storage_layout,
     )

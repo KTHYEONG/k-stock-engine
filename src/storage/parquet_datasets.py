@@ -312,6 +312,8 @@ def _manifest_from_dict(data: dict[str, object]) -> DatasetManifest:
         calendar_hash=str(data.get("calendar_hash", "")),
         corporate_action_hash=str(data.get("corporate_action_hash", "")),
         cost_source_hash=str(data.get("cost_source_hash", "")),
+        master_hash=str(data.get("master_hash", "")),
+        quality_report_hash=str(data.get("quality_report_hash", "")),
         content_hash=str(data.get("content_hash", "")),
         storage_layout=str(data.get("storage_layout", "")),
     )

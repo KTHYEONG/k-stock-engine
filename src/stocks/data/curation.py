@@ -24,8 +24,8 @@ coverage evidence (calendar, corporate-action, cost-source hashes), and
 """
 from __future__ import annotations
 
+import json
 import logging
-import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from pathlib import Path
@@ -40,11 +40,18 @@ from src.core.datasets import (
     validate_production_manifest,
 )
 from src.core.instruments import AssetKind
+from src.stocks.data.quality import (
+    CorporateActionSnapshot,
+    FeatureAvailabilityRecord,
+    InstrumentMasterSnapshot,
+    KRXSessionCalendar,
+    StockDataQualityPolicy,
+    StockDataQualityReport,
+    validate_canonical_stock_panel,
+)
 from src.stocks.research.datasets import (
-    ELIGIBLE_STATUS,
     QUALITY_REASON_COLUMN,
     QUALITY_STATUS_COLUMN,
-    QUARANTINED_STATUS,
 )
 from src.storage.parquet_datasets import (
     CONTENT_MANIFEST_NAME,
@@ -55,11 +62,7 @@ from src.storage.parquet_datasets import (
 
 logger = logging.getLogger("stocks.data.curation")
 
-CURATION_VERSION = "curation-v1"
-# Explicit index identifiers carried inside the legacy *_feat.parquet files;
-# they are excluded as non-stock rows, never mixed into the stock dataset.
-INDEX_TICKERS = ("KOSPI", "KOSDAQ")
-_TICKER_RE = re.compile(r"^\d{6}$")
+CURATION_VERSION = "curation-v2"
 
 _REQUIRED_SOURCE_COLUMNS = (
     "date",
@@ -90,6 +93,7 @@ _CANONICAL_BASE_COLUMNS = (
     "trading_value",
     "market_cap",
     "sector",
+    "action_interval_covered",
     QUALITY_STATUS_COLUMN,
     QUALITY_REASON_COLUMN,
 )
@@ -228,6 +232,10 @@ class StockCurationRequest:
     calendar_hash: str = ""
     corporate_action_hash: str = ""
     cost_source_hash: str = ""
+    instrument_master: InstrumentMasterSnapshot | None = None
+    corporate_actions: CorporateActionSnapshot | None = None
+    calendar: KRXSessionCalendar | None = None
+    feature_availability: tuple[FeatureAvailabilityRecord, ...] = ()
     generated_time: datetime | None = None
 
     def __post_init__(self) -> None:
@@ -249,6 +257,7 @@ class CuratedDatasetResult:
     partition_paths: tuple[Path, ...]
     row_count: int
     source_file_count: int
+    quality_report_path: Path | None = None
 
 
 def curate_legacy_feature_panel(
@@ -256,20 +265,46 @@ def curate_legacy_feature_panel(
     destination_root: Path,
     request: StockCurationRequest,
 ) -> CuratedDatasetResult:
-    """Migrate legacy feature files into a new canonical partitioned dataset."""
+    """Migrate legacy feature files into a new canonical partitioned dataset.
+
+    Every source row is routed through the quality validator into one of three
+    partitions: ``eligible`` (canonical predictor dataset), ``quarantined``
+    (raw rows with stable reason codes), and ``non_equity`` (index/ETF rows with
+    lineage for a benchmark dataset). An unknown identifier is quarantined
+    rather than aborting the migration. A ``quality_report.json`` is written
+    with counts, affected identifiers/files, null statistics, coverage, action
+    coverage, and evidence hashes.
+    """
     feature_names = feature_allowlist(request.feature_allowlist_version)
     panel, source_entries, source_rows = _read_source_panel(Path(source_root))
     in_window = _normalize_and_reject_non_finite(
         _window_and_dedupe(panel, request.start_date, request.end_date)
     )
-    present_features = [name for name in feature_names if name in panel.columns]
-    canonical = _project_canonical(in_window, present_features)
+
+    policy = StockDataQualityPolicy(
+        certification=request.certification,
+        calendar=request.calendar,
+        feature_availability=request.feature_availability,
+    )
+    report = validate_canonical_stock_panel(
+        in_window,
+        request.instrument_master,
+        request.corporate_actions,
+        policy,
+    )
+    if report.eligible is None:
+        raise ValueError("quality validation produced no eligible partition")
+
+    present_features = [
+        name for name in feature_names if name in panel.columns and name not in report.fully_null_columns
+    ]
+    canonical = _project_canonical(report.eligible, present_features)
 
     ordered_columns = _ordered_columns(present_features)
     canonical = canonical.select(ordered_columns).sort(["instrument_id", "session"])
 
     generated_time = request.generated_time or datetime.now(UTC)
-    manifest = _build_manifest(request, canonical, ordered_columns, generated_time)
+    manifest = _build_manifest(request, canonical, ordered_columns, generated_time, report)
     _validate_certification_evidence(manifest)
 
     content_manifest: dict[str, object] = {
@@ -292,13 +327,17 @@ def curate_legacy_feature_panel(
         decision_time=generated_time,
         content_manifest=content_manifest,
     )
-    partition_paths = tuple(sorted(dataset_dir.rglob("*.parquet")))
+    _write_audit_partitions(dataset_dir, report)
+    quality_report_path = _write_quality_report(dataset_dir, report, generated_time)
+
+    partition_paths = tuple(sorted((dataset_dir / "partitions").rglob("*.parquet")))
     logger.info(
-        "curated %s: %s rows from %s source files -> %s partitions",
+        "curated %s: %s eligible / %s quarantined / %s non-equity rows from %s source files",
         request.dataset_id,
-        canonical.height,
+        report.eligible_row_count,
+        report.quarantined_row_count,
+        report.non_equity_row_count,
         len(source_entries),
-        len(partition_paths),
     )
     return CuratedDatasetResult(
         dataset_id=request.dataset_id,
@@ -307,6 +346,7 @@ def curate_legacy_feature_panel(
         partition_paths=partition_paths,
         row_count=canonical.height,
         source_file_count=len(source_entries),
+        quality_report_path=quality_report_path,
     )
 
 
@@ -333,11 +373,13 @@ def _read_source_panel(
             expected_schema = schema
         elif schema != expected_schema:
             raise ValueError(f"{path}: schema variant vs first file")
+        relative = str(path.relative_to(source_root))
+        lazy = lazy.with_columns(pl.lit(relative).alias("source_file"))
         row_count = int(lazy.select(pl.len()).collect().item())
         total_rows += row_count
         entries.append(
             {
-                "path": str(path.relative_to(source_root)),
+                "path": relative,
                 "sha256": file_sha256(path),
                 "row_count": row_count,
             }
@@ -385,69 +427,30 @@ def _normalize_and_reject_non_finite(panel: pl.DataFrame) -> pl.DataFrame:
 
 
 def _project_canonical(
-    panel: pl.DataFrame, feature_names: list[str]
+    eligible: pl.DataFrame, feature_names: list[str]
 ) -> pl.DataFrame:
-    stocks = panel.filter(~pl.col("ticker").is_in(INDEX_TICKERS))
-    malformed = stocks.filter(~pl.col("ticker").str.contains(_TICKER_RE.pattern))
-    if not malformed.is_empty():
-        offenders = sorted(
-            str(t) for t in malformed["ticker"].unique().to_list()
-        )
-        raise ValueError(
-            f"{malformed.height} malformed ticker identifiers: {offenders[:10]}"
-        )
+    """Project an eligible partition into the canonical predictor schema.
 
-    observation_time = (
-        pl.col("date")
-        .dt.combine(pl.lit(_KRX_CLOSE_TIME))
-        .dt.replace_time_zone("Asia/Seoul")
-        .dt.convert_time_zone("UTC")
-    )
-    available_time = (
-        pl.col("date")
-        .dt.combine(pl.lit(_KRX_AVAILABLE_TIME))
-        .dt.replace_time_zone("Asia/Seoul")
-        .dt.convert_time_zone("UTC")
-    )
-    invalid_ohlc = pl.any_horizontal(
-        [pl.col(column).is_null() | (pl.col(column) <= 0) for column in _OHLC_COLUMNS]
-    )
-    out = stocks.with_columns(
-        (pl.lit("KRX:") + pl.col("ticker")).alias("instrument_id"),
-        pl.col("date")
+    Identity, timestamps, quality status, and action coverage were already
+    computed by the quality validator; this projects the eligible rows into the
+    canonical base + namespaced feature columns and normalizes ``session`` to a
+    UTC-midnight datetime (the canonical store key).
+    """
+    missing = [c for c in _CANONICAL_BASE_COLUMNS if c not in eligible.columns]
+    if missing:
+        raise ValueError(f"eligible panel missing canonical columns {missing}")
+
+    session_utc = (
+        pl.col("session")
         .cast(pl.Date)
         .dt.combine(pl.lit(time.min))
         .dt.replace_time_zone("UTC")
-        .alias("session"),
-        observation_time.alias("observation_time"),
-        available_time.alias("available_time"),
-        pl.when(invalid_ohlc)
-        .then(pl.lit(QUARANTINED_STATUS))
-        .otherwise(pl.lit(ELIGIBLE_STATUS))
-        .alias(QUALITY_STATUS_COLUMN),
-        pl.when(invalid_ohlc)
-        .then(pl.lit("non_positive_or_missing_ohlc"))
-        .otherwise(pl.lit(None, dtype=pl.Utf8))
-        .alias(QUALITY_REASON_COLUMN),
     )
-    base = [
-        "instrument_id",
-        "session",
-        "observation_time",
-        "available_time",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "trading_value",
-        "market_cap",
-        "sector",
-        QUALITY_STATUS_COLUMN,
-        QUALITY_REASON_COLUMN,
-    ]
+    base = [pl.col(c) for c in _CANONICAL_BASE_COLUMNS]
     features = [pl.col(name).alias(f"feature__{name}") for name in feature_names]
-    return out.select([*base, *features])
+    return eligible.select([*base, *features]).with_columns(
+        session_utc.alias("session")
+    )
 
 
 def _ordered_columns(feature_names: list[str]) -> list[str]:
@@ -461,7 +464,10 @@ def _build_manifest(
     canonical: pl.DataFrame,
     ordered_columns: list[str],
     generated_time: datetime,
+    report: StockDataQualityReport,
 ) -> DatasetManifest:
+    report_hash = report.hashes.get("quality_report", "")
+    master_hash = report.hashes.get("master", "")
     return make_manifest(
         asset_kind=AssetKind.STOCK,
         columns=ordered_columns,
@@ -475,9 +481,11 @@ def _build_manifest(
         row_count=canonical.height,
         generated_time=generated_time,
         certification=request.certification,
-        calendar_hash=request.calendar_hash,
+        calendar_hash=request.calendar_hash or (request.calendar.content_hash if request.calendar else ""),
         corporate_action_hash=request.corporate_action_hash,
         cost_source_hash=request.cost_source_hash,
+        master_hash=master_hash,
+        quality_report_hash=report_hash,
         schema_version="v2",
         content_hash=canonical_content_hash(canonical, ordered_columns),
         storage_layout=HIVE_PARTITION_LAYOUT,
@@ -497,6 +505,8 @@ def _validate_certification_evidence(manifest: DatasetManifest) -> None:
         "calendar_hash": manifest.calendar_hash,
         "corporate_action_hash": manifest.corporate_action_hash,
         "cost_source_hash": manifest.cost_source_hash,
+        "master_hash": manifest.master_hash,
+        "quality_report_hash": manifest.quality_report_hash,
     }
     missing = [name for name, value in evidence.items() if not value]
     if missing:
@@ -506,3 +516,53 @@ def _validate_certification_evidence(manifest: DatasetManifest) -> None:
         )
     if manifest.certification is DatasetCertification.PRODUCTION:
         validate_production_manifest(manifest)
+
+
+_AUDIT_COLUMNS = (
+    "instrument_id",
+    "session",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "trading_value",
+    "market_cap",
+    "sector",
+    QUALITY_STATUS_COLUMN,
+    QUALITY_REASON_COLUMN,
+)
+
+
+def _audit_frame(frame: pl.DataFrame) -> pl.DataFrame:
+    """Restrict a routed frame to deterministic audit columns."""
+    keep = [c for c in _AUDIT_COLUMNS if c in frame.columns]
+    extra = [c for c in ("source_file", "action_interval_covered") if c in frame.columns]
+    return frame.select([*keep, *extra]).sort(["instrument_id", "session"])
+
+
+def _write_audit_partitions(
+    dataset_dir: Path, report: StockDataQualityReport
+) -> None:
+    """Write quarantined and non-equity audit partitions with lineage."""
+    if report.quarantined is not None and report.quarantined.height:
+        out_dir = dataset_dir / "bars" / "quarantined"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        _audit_frame(report.quarantined).write_parquet(out_dir / "part-00000.parquet")
+    if report.non_equity is not None and report.non_equity.height:
+        out_dir = dataset_dir / "benchmarks" / "non_equity"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        _audit_frame(report.non_equity).write_parquet(out_dir / "part-00000.parquet")
+
+
+def _write_quality_report(
+    dataset_dir: Path,
+    report: StockDataQualityReport,
+    generated_time: datetime,
+) -> Path:
+    """Write a deterministic ``quality_report.json`` next to the dataset."""
+    report = report.with_generated_time(generated_time)
+    report_path = dataset_dir / "quality_report.json"
+    payload = json.dumps(report.to_json_dict(), indent=2, sort_keys=True, default=str)
+    report_path.write_text(payload, encoding="utf-8")
+    return report_path
