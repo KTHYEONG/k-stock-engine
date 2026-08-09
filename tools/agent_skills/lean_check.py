@@ -577,14 +577,6 @@ def main() -> None:
     parser.add_argument(
         "--pytest-timeout", type=int, default=None, help="Seconds for pytest step"
     )
-    parser.add_argument(
-        "--pytest-timeout",
-        type=int,
-        default=None,
-        help="Seconds to allow the pytest+coverage step (default: auto-scaled by "
-        "test-file count, floor 300s, cap 1200s). Explicitly raising this is the "
-        "right move for heavy orchestrator test files that exceed the default.",
-    )
     args = parser.parse_args()
 
     if args.spec_only:
