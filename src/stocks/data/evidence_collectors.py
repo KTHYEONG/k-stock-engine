@@ -1,13 +1,16 @@
 """External KRX and OpenDART collectors for stock evidence artifacts."""
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import io
 import json
 import os
 import time
 import zipfile
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, ClassVar
@@ -23,9 +26,90 @@ from src.stocks.data.quality import (
 
 JsonRequest = Callable[[str, dict[str, str]], dict[str, Any]]
 
+RETRYABLE_DART_STATUSES = frozenset({"800", "900"})
+TERMINAL_DART_STATUSES = frozenset({"010", "011", "012", "021", "100", "101", "901"})
+BLOCKED_DART_STATUS = "020"
+EMPTY_DART_STATUS = "013"
+OK_DART_STATUS = "000"
+
 
 class EvidenceCollectionError(RuntimeError):
     """Raised when an external evidence response cannot be trusted."""
+
+
+class DartRetryableError(EvidenceCollectionError):
+    """A transient DART transport or rate-limit failure that may succeed on retry."""
+
+
+class DartTerminalError(EvidenceCollectionError):
+    """A permanent DART response failure that must never be retried."""
+
+
+class DartQuotaBlockedError(EvidenceCollectionError):
+    """DART quota exhaustion (status 020) that must stop collection immediately."""
+
+
+class DartPageRequestFailedError(EvidenceCollectionError):
+    """A page request exhausted its retry budget without a usable response."""
+
+    def __init__(self, *, attempt_count: int, last_error: str) -> None:
+        self.attempt_count = attempt_count
+        self.last_error = last_error
+        super().__init__(
+            f"DART page request failed after {attempt_count} attempts: {last_error}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DartRetryPolicy:
+    """Deterministic backoff policy for resumable DART page collection."""
+
+    max_attempts: int = 5
+    initial_backoff_seconds: float = 1.0
+    max_backoff_seconds: float = 30.0
+    min_request_interval_seconds: float = 0.2
+
+    def __post_init__(self) -> None:
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+        durations = (
+            self.initial_backoff_seconds,
+            self.max_backoff_seconds,
+            self.min_request_interval_seconds,
+        )
+        if any(duration < 0 for duration in durations):
+            raise ValueError("backoff durations must be non-negative")
+        if self.max_backoff_seconds < self.initial_backoff_seconds:
+            raise ValueError("max_backoff_seconds must not be below initial_backoff_seconds")
+
+    def to_manifest(self) -> dict[str, Any]:
+        return {
+            "max_attempts": self.max_attempts,
+            "initial_backoff_seconds": self.initial_backoff_seconds,
+            "max_backoff_seconds": self.max_backoff_seconds,
+            "min_request_interval_seconds": self.min_request_interval_seconds,
+        }
+
+
+@contextlib.contextmanager
+def _locked(path: Path) -> Iterator[None]:
+    """Hold a non-blocking exclusive flock; released automatically on process exit."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise EvidenceCollectionError(f"another collector holds the lock: {path}") from exc
+        yield
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def _records_hash(records: list[dict[str, Any]]) -> str:
+    canonical = json.dumps(records, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _now_utc() -> datetime:
@@ -66,9 +150,9 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"invalid monthly calendar artifact: {path}") from exc
+        raise ValueError(f"invalid JSON artifact: {path}") from exc
     if not isinstance(payload, dict):
-        raise ValueError(f"monthly calendar artifact must be a JSON object: {path}")
+        raise ValueError(f"JSON artifact must be an object: {path}")
     return payload
 
 
@@ -449,30 +533,49 @@ class OpenDartEvidenceCollector:
     """Collect immutable OpenDART disclosure and corporate-action candidates."""
 
     BASE_URL = "https://opendart.fss.or.kr/api"
+    DISCLOSURE_ENDPOINT = "list.json"
+    MANIFEST_SCHEMA_VERSION = "dart-disclosures-manifest-1"
 
     def __init__(
         self,
         api_key: str | None = None,
         *,
         request_json: JsonRequest | None = None,
+        raw_request_json: JsonRequest | None = None,
         generated_time: datetime | None = None,
+        sleep: Callable[[float], None] | None = None,
+        monotonic: Callable[[], float] | None = None,
     ) -> None:
         self.api_key = api_key or os.getenv("OPENDART_API_KEY")
-        if not self.api_key and request_json is None:
+        if not self.api_key and request_json is None and raw_request_json is None:
             raise ValueError("OPENDART_API_KEY not found in environment variables")
         self.generated_time = generated_time or _now_utc()
-        self._request_json = request_json or self._request
+        self._request_json = request_json or self._request_validated
+        self._raw_request_json = raw_request_json or self._request
+        self._sleep = sleep or time.sleep
+        self._monotonic = monotonic or time.monotonic
+        self._last_request_time = 0.0
         self._session = requests.Session()
 
     def _request(self, endpoint: str, params: dict[str, str]) -> dict[str, Any]:
+        """Raw DART GET returning the parsed JSON object without status filtering."""
         response = self._session.get(f"{self.BASE_URL}/{endpoint}", params=params, timeout=30)
         if response.status_code != 200:
-            raise EvidenceCollectionError(f"DART HTTP {response.status_code} for {endpoint}")
+            if response.status_code in (408, 429) or 500 <= response.status_code < 600:
+                raise DartRetryableError(f"DART HTTP {response.status_code} for {endpoint}")
+            raise DartTerminalError(f"DART HTTP {response.status_code} for {endpoint}")
         try:
             payload = response.json()
         except ValueError as exc:
-            raise EvidenceCollectionError(f"DART returned invalid JSON for {endpoint}") from exc
-        if not isinstance(payload, dict) or payload.get("status") != "000":
+            raise DartTerminalError(f"DART returned invalid JSON for {endpoint}") from exc
+        if not isinstance(payload, dict):
+            raise DartTerminalError(f"DART response must be an object for {endpoint}")
+        return payload
+
+    def _request_validated(self, endpoint: str, params: dict[str, str]) -> dict[str, Any]:
+        """One-shot collector request that rejects any non-000 API status."""
+        payload = self._request(endpoint, params)
+        if payload.get("status") != OK_DART_STATUS:
             raise EvidenceCollectionError(f"DART rejected request for {endpoint}: {payload}")
         return payload
 
@@ -532,28 +635,514 @@ class OpenDartEvidenceCollector:
             raw = payload.get("list", [])
             if not isinstance(raw, list):
                 raise EvidenceCollectionError("DART disclosure list must be a list")
-            for item in raw:
-                if not isinstance(item, dict):
-                    continue
-                receipt_number = _text(item, "rcept_no")
-                receipt_date = _text(item, "rcept_dt")
-                if not receipt_number or not receipt_date:
-                    raise EvidenceCollectionError("DART disclosure lacks receipt identity")
-                records.append(
-                    {
-                        "rcept_no": receipt_number,
-                        "rcept_dt": receipt_date,
-                        "corp_code": _text(item, "corp_code"),
-                        "corp_name": _text(item, "corp_name"),
-                        "report_nm": _text(item, "report_nm"),
-                        "rm": _text(item, "rm"),
-                    }
-                )
+            records.extend(self._normalize_disclosure_records(payload))
             total_page = int(payload.get("total_page", page))
             if page >= total_page or not raw:
                 break
             page += 1
         return sorted(records, key=lambda item: (item["rcept_dt"], item["rcept_no"]))
+
+    def _normalize_disclosure_records(self, payload: dict[str, Any]) -> list[dict[str, str]]:
+        """Extract and identity-validate raw DART disclosure list items."""
+        raw = payload.get("list", [])
+        if not isinstance(raw, list):
+            raise EvidenceCollectionError("DART disclosure list must be a list")
+        records: list[dict[str, str]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            receipt_number = _text(item, "rcept_no")
+            receipt_date = _text(item, "rcept_dt")
+            if not receipt_number or not receipt_date:
+                raise EvidenceCollectionError("DART disclosure lacks receipt identity")
+            records.append(
+                {
+                    "rcept_no": receipt_number,
+                    "rcept_dt": receipt_date,
+                    "corp_code": _text(item, "corp_code"),
+                    "corp_name": _text(item, "corp_name"),
+                    "report_nm": _text(item, "report_nm"),
+                    "rm": _text(item, "rm"),
+                }
+            )
+        return records
+
+    def _month_page_params(
+        self, month_start: date, month_end: date, page: int, page_count: int
+    ) -> dict[str, str]:
+        return {
+            "crtfc_key": str(self.api_key),
+            "bgn_de": month_start.strftime("%Y%m%d"),
+            "end_de": month_end.strftime("%Y%m%d"),
+            "page_no": str(page),
+            "page_count": str(page_count),
+        }
+
+    @staticmethod
+    def _params_hash(params: dict[str, str]) -> str:
+        canonical = json.dumps(
+            params, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _throttle(self, policy: DartRetryPolicy) -> None:
+        elapsed = self._monotonic() - self._last_request_time
+        if elapsed < policy.min_request_interval_seconds:
+            self._sleep(policy.min_request_interval_seconds - elapsed)
+        self._last_request_time = self._monotonic()
+
+    def _backoff(self, policy: DartRetryPolicy, retry_index: int) -> None:
+        delay = min(
+            policy.max_backoff_seconds,
+            policy.initial_backoff_seconds * (2.0**retry_index),
+        )
+        self._sleep(delay)
+
+    def _request_page_with_retry(
+        self, params: dict[str, str], policy: DartRetryPolicy
+    ) -> dict[str, Any]:
+        """Fetch one disclosure page, classifying failures per the retry policy."""
+        last_error = "unknown DART page error"
+        for attempt in range(policy.max_attempts):
+            self._throttle(policy)
+            try:
+                payload = self._raw_request_json(self.DISCLOSURE_ENDPOINT, params)
+            except DartQuotaBlockedError as exc:
+                raise DartQuotaBlockedError(str(exc)) from exc
+            except DartRetryableError as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+            except DartTerminalError as exc:
+                raise DartTerminalError(str(exc)) from exc
+            except requests.RequestException as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+            except EvidenceCollectionError as exc:
+                raise DartTerminalError(str(exc)) from exc
+            except Exception as exc:  # unexpected injected transport failures are fail-closed
+                raise DartTerminalError(
+                    f"unexpected DART page error: {type(exc).__name__}: {exc}"
+                ) from exc
+            else:
+                if not isinstance(payload, dict):
+                    raise DartTerminalError("DART response must be a JSON object")
+                status = payload.get("status")
+                if status in (OK_DART_STATUS, EMPTY_DART_STATUS):
+                    return payload
+                if status == BLOCKED_DART_STATUS:
+                    raise DartQuotaBlockedError(f"DART quota blocked: {payload}")
+                if status in RETRYABLE_DART_STATUSES:
+                    last_error = f"DART status {status}: {payload}"
+                else:
+                    raise DartTerminalError(f"DART status {status}: {payload}")
+            if attempt < policy.max_attempts - 1:
+                self._backoff(policy, attempt)
+        raise DartPageRequestFailedError(
+            attempt_count=policy.max_attempts, last_error=last_error
+        )
+
+    @staticmethod
+    def _response_total_page(payload: dict[str, Any], page: int) -> int:
+        if payload.get("status") == EMPTY_DART_STATUS:
+            return page
+        total = payload.get("total_page", page)
+        try:
+            return int(total)
+        except (TypeError, ValueError) as exc:
+            raise EvidenceCollectionError("DART response total_page is invalid") from exc
+
+    def _load_valid_checkpoint(
+        self,
+        page_path: Path,
+        month_key: str,
+        page: int,
+        params_hash: str,
+        page_size: int,
+    ) -> dict[str, Any] | None:
+        """Return a reusable page checkpoint or None when it cannot be trusted."""
+        try:
+            checkpoint = _read_json_object(page_path)
+        except ValueError:
+            return None
+        if (
+            checkpoint.get("month") != month_key
+            or checkpoint.get("page_no") != page
+            or checkpoint.get("page_size") != page_size
+            or checkpoint.get("request_params_hash") != params_hash
+        ):
+            return None
+        records = checkpoint.get("records")
+        if not isinstance(records, list):
+            return None
+        if checkpoint.get("sha256") != _records_hash(records):
+            return None
+        return checkpoint
+
+    def _load_or_init_dart_manifest(
+        self,
+        output_dir: Path,
+        start: date,
+        end: date,
+        page_count: int,
+        policy: DartRetryPolicy,
+    ) -> dict[str, Any]:
+        manifest_path = output_dir / "manifest.json"
+        if manifest_path.exists():
+            try:
+                payload = _read_json_object(manifest_path)
+            except ValueError as exc:
+                raise EvidenceCollectionError(
+                    f"resumable manifest unreadable: {manifest_path}"
+                ) from exc
+            if payload.get("schema_version") != self.MANIFEST_SCHEMA_VERSION:
+                raise ValueError(f"incompatible resumable manifest schema in {output_dir}")
+            if (
+                payload.get("requested_start") != start.isoformat()
+                or payload.get("requested_end") != end.isoformat()
+            ):
+                raise ValueError(f"resumable manifest declares a different range in {output_dir}")
+            if payload.get("page_count") != page_count:
+                raise ValueError(f"resumable manifest declares a different page_count in {output_dir}")
+            if payload.get("retry_policy") != policy.to_manifest():
+                raise ValueError(f"resumable manifest declares a different retry policy in {output_dir}")
+            if payload.get("endpoint") != self.DISCLOSURE_ENDPOINT:
+                raise ValueError(f"resumable manifest declares a different endpoint in {output_dir}")
+            payload.setdefault("months", {})
+            return payload
+        return {
+            "schema_version": self.MANIFEST_SCHEMA_VERSION,
+            "requested_start": start.isoformat(),
+            "requested_end": end.isoformat(),
+            "partition": "month",
+            "page_count": page_count,
+            "retry_policy": policy.to_manifest(),
+            "endpoint": self.DISCLOSURE_ENDPOINT,
+            "months": {},
+        }
+
+    def _read_dart_manifest(
+        self, manifest_path: Path, start: date, end: date
+    ) -> dict[str, Any]:
+        try:
+            payload = _read_json_object(manifest_path)
+        except ValueError as exc:
+            raise EvidenceCollectionError(
+                f"resumable manifest unreadable: {manifest_path}"
+            ) from exc
+        if payload.get("schema_version") != self.MANIFEST_SCHEMA_VERSION:
+            raise ValueError(f"incompatible resumable manifest schema in {manifest_path.parent}")
+        if (
+            payload.get("requested_start") != start.isoformat()
+            or payload.get("requested_end") != end.isoformat()
+        ):
+            raise ValueError(
+                f"resumable manifest declares a different range in {manifest_path.parent}"
+            )
+        payload.setdefault("months", {})
+        return payload
+
+    def _dart_month_complete_error(
+        self,
+        output_dir: Path,
+        year: int,
+        month: int,
+        month_start: date,
+        month_end: date,
+        entry: dict[str, Any] | None,
+    ) -> str | None:
+        """Return None when the month artifact satisfies the completion predicate."""
+        month_key = f"{year}-{month:02d}"
+        path = output_dir / "months" / f"{month_key}.json"
+        if not path.is_file():
+            return f"month artifact missing: {path.name}"
+        try:
+            payload = _read_json_object(path)
+        except ValueError as exc:
+            return str(exc)
+        if payload.get("version") != f"dart-disclosures-month-{month_key}":
+            return "month artifact version mismatch"
+        try:
+            declared_start = date.fromisoformat(str(payload["range_start"]))
+            declared_end = date.fromisoformat(str(payload["range_end"]))
+        except (KeyError, ValueError, TypeError):
+            return "month artifact range invalid"
+        if declared_start != month_start or declared_end != month_end:
+            return "month artifact range mismatch"
+        raw_records = payload.get("records")
+        if not isinstance(raw_records, list):
+            return "month artifact records must be a list"
+        if entry is None or entry.get("status") != "complete":
+            return "manifest entry not complete"
+        if entry.get("path") != f"months/{month_key}.json":
+            return "month artifact path mismatch"
+        if entry.get("record_count") != len(raw_records):
+            return "month artifact record_count mismatch"
+        if entry.get("sha256") != hashlib.sha256(path.read_bytes()).hexdigest():
+            return "month artifact digest mismatch"
+        return None
+
+    def _write_dart_month_artifact(
+        self,
+        output_dir: Path,
+        year: int,
+        month: int,
+        month_start: date,
+        month_end: date,
+        records: list[dict[str, Any]],
+    ) -> str:
+        """Atomically write one validated month partition and return its content SHA-256."""
+        month_key = f"{year}-{month:02d}"
+        path = output_dir / "months" / f"{month_key}.json"
+        payload = {
+            "version": f"dart-disclosures-month-{month_key}",
+            "generated_time": self.generated_time.isoformat(),
+            "range_start": month_start.isoformat(),
+            "range_end": month_end.isoformat(),
+            "record_count": len(records),
+            "records": records,
+        }
+        text = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        _atomic_write_text(path, text)
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def _collect_dart_month(
+        self,
+        output_dir: Path,
+        year: int,
+        month: int,
+        month_start: date,
+        month_end: date,
+        manifest: dict[str, Any],
+        page_count: int,
+        policy: DartRetryPolicy,
+    ) -> None:
+        month_key = f"{year}-{month:02d}"
+        manifest_path = output_dir / "manifest.json"
+        page_dir = output_dir / "pages" / month_key
+        entry = manifest["months"].setdefault(
+            month_key,
+            {
+                "range_start": month_start.isoformat(),
+                "range_end": month_end.isoformat(),
+                "status": "in_progress",
+                "next_page": 1,
+                "total_page": None,
+                "record_count": 0,
+            },
+        )
+        entry.update(
+            {
+                "range_start": month_start.isoformat(),
+                "range_end": month_end.isoformat(),
+                "status": "in_progress",
+            }
+        )
+        try:
+            total_page: int | None = None
+            records: list[dict[str, Any]] = []
+            page = 1
+            while True:
+                params = self._month_page_params(month_start, month_end, page, page_count)
+                params_hash = self._params_hash(params)
+                page_path = page_dir / f"{page:05d}.json"
+                checkpoint: dict[str, Any] | None = None
+                if page_path.is_file():
+                    checkpoint = self._load_valid_checkpoint(
+                        page_path, month_key, page, params_hash, page_count
+                    )
+                    if checkpoint is None:
+                        page_path.unlink(missing_ok=True)
+                if checkpoint is None:
+                    payload = self._request_page_with_retry(params, policy)
+                    page_records = self._normalize_disclosure_records(payload)
+                    response_total = self._response_total_page(payload, page)
+                    _write_json(
+                        page_path,
+                        {
+                            "month": month_key,
+                            "page_no": page,
+                            "page_size": page_count,
+                            "request_params_hash": params_hash,
+                            "total_page": response_total,
+                            "record_count": len(page_records),
+                            "records": page_records,
+                            "sha256": _records_hash(page_records),
+                        },
+                    )
+                else:
+                    page_records = checkpoint["records"]
+                    response_total = checkpoint["total_page"]
+                records.extend(page_records)
+                total_page = response_total
+                entry.update(
+                    {
+                        "next_page": page + 1,
+                        "total_page": total_page,
+                        "record_count": len(records),
+                    }
+                )
+                _write_json(manifest_path, manifest)
+                if total_page is not None and page >= total_page:
+                    break
+                page += 1
+            records.sort(key=lambda item: (item["rcept_dt"], item["rcept_no"]))
+            seen: set[str] = set()
+            unique: list[dict[str, Any]] = []
+            for record in records:
+                if record["rcept_no"] in seen:
+                    raise EvidenceCollectionError(
+                        f"DART duplicate receipt number in month {month_key}: {record['rcept_no']}"
+                    )
+                seen.add(record["rcept_no"])
+                unique.append(record)
+            digest = self._write_dart_month_artifact(
+                output_dir, year, month, month_start, month_end, unique
+            )
+            entry.update(
+                {
+                    "status": "complete",
+                    "next_page": total_page + 1 if total_page is not None else 1,
+                    "total_page": total_page,
+                    "record_count": len(unique),
+                    "path": f"months/{month_key}.json",
+                    "sha256": digest,
+                    "last_error": None,
+                }
+            )
+            _write_json(manifest_path, manifest)
+            for stale in page_dir.glob("*.json"):
+                stale.unlink()
+        except DartQuotaBlockedError as exc:
+            entry.update({"status": "blocked", "last_error": f"{type(exc).__name__}: {exc}"})
+            _write_json(manifest_path, manifest)
+            raise
+        except EvidenceCollectionError as exc:
+            entry.update(
+                {
+                    "status": "incomplete",
+                    "last_error": f"{type(exc).__name__}: {exc}",
+                    "attempt_count": getattr(exc, "attempt_count", 1),
+                }
+            )
+            _write_json(manifest_path, manifest)
+            raise
+
+    def collect_disclosure_partitions(
+        self,
+        output_dir: Path,
+        start: date,
+        end: date,
+        *,
+        page_count: int = 100,
+        retry_policy: DartRetryPolicy | None = None,
+    ) -> None:
+        """Collect DART disclosures month-by-month with verified page checkpoints.
+
+        Completed months are digest-validated before reuse and never re-requested.
+        A failing month is marked incomplete or blocked and re-raised; prior months
+        are preserved and later months are never silently attempted.
+        """
+        if start > end:
+            raise ValueError("start must not be after end")
+        if not 1 <= page_count <= 100:
+            raise ValueError("page_count must be within [1, 100]")
+        if output_dir.exists() and not output_dir.is_dir():
+            raise ValueError(f"resumable output target must be a directory: {output_dir}")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        policy = retry_policy or DartRetryPolicy()
+        with _locked(output_dir / "collector.lock"):
+            manifest = self._load_or_init_dart_manifest(
+                output_dir, start, end, page_count, policy
+            )
+            for year, month, month_start, month_end in _iter_month_partitions(start, end):
+                month_key = f"{year}-{month:02d}"
+                entry = manifest["months"].get(month_key)
+                if (
+                    self._dart_month_complete_error(
+                        output_dir, year, month, month_start, month_end, entry
+                    )
+                    is None
+                ):
+                    page_dir = output_dir / "pages" / month_key
+                    if page_dir.is_dir():
+                        for stale in page_dir.glob("*.json"):
+                            stale.unlink()
+                    continue
+                try:
+                    self._collect_dart_month(
+                        output_dir,
+                        year,
+                        month,
+                        month_start,
+                        month_end,
+                        manifest,
+                        page_count,
+                        policy,
+                    )
+                except DartQuotaBlockedError as exc:
+                    raise EvidenceCollectionError(
+                        f"DART disclosure month {month_key} quota blocked"
+                    ) from exc
+                except EvidenceCollectionError as exc:
+                    raise EvidenceCollectionError(
+                        f"DART disclosure month {month_key} collection failed"
+                    ) from exc
+
+    def merge_disclosure_partitions(
+        self, input_dir: Path, start: date, end: date, output_path: Path
+    ) -> None:
+        """Merge only hash-validated complete month artifacts into one final index."""
+        if start > end:
+            raise ValueError("start must not be after end")
+        if not input_dir.is_dir():
+            raise ValueError(f"resumable input must be an existing directory: {input_dir}")
+        manifest_path = input_dir / "manifest.json"
+        if not manifest_path.is_file():
+            raise EvidenceCollectionError(f"resumable manifest missing: {manifest_path}")
+        with _locked(input_dir / "collector.lock"):
+            manifest = self._read_dart_manifest(manifest_path, start, end)
+            merged: list[dict[str, Any]] = []
+            for year, month, month_start, month_end in _iter_month_partitions(start, end):
+                month_key = f"{year}-{month:02d}"
+                entry = manifest["months"].get(month_key)
+                error = self._dart_month_complete_error(
+                    input_dir, year, month, month_start, month_end, entry
+                )
+                if error is not None:
+                    raise EvidenceCollectionError(
+                        f"DART disclosure merge missing valid month {month_key}: {error}"
+                    )
+                payload = _read_json_object(
+                    input_dir / "months" / f"{month_key}.json"
+                )
+                merged.extend(payload["records"])
+            merged.sort(key=lambda item: (item["rcept_dt"], item["rcept_no"]))
+            seen: set[str] = set()
+            unique: list[dict[str, Any]] = []
+            for record in merged:
+                if record["rcept_no"] in seen:
+                    raise EvidenceCollectionError(
+                        f"DART duplicate receipt number across months: {record['rcept_no']}"
+                    )
+                seen.add(record["rcept_no"])
+                unique.append(record)
+            text = json.dumps(
+                {
+                    "version": f"dart-disclosures-{start.isoformat()}-{end.isoformat()}",
+                    "generated_time": self.generated_time.isoformat(),
+                    "record_count": len(unique),
+                    "records": unique,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                indent=2,
+            ) + "\n"
+            new_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            if output_path.exists():
+                if hashlib.sha256(output_path.read_bytes()).hexdigest() == new_digest:
+                    return
+                raise EvidenceCollectionError(
+                    f"merge output already exists with different content: {output_path}"
+                )
+            _atomic_write_text(output_path, text)
 
     def write_disclosure_artifact(self, path: Path, records: Iterable[dict[str, str]]) -> None:
         """Persist raw disclosure index records with retrieval provenance."""
