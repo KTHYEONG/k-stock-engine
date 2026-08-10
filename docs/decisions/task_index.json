@@ -1,6 +1,26 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_COST_MODEL_HARDENING",
+      "date": "2026-08-10",
+      "adr_id": "ADR_20260810_STOCK_COST_MODEL_HARDENING",
+      "domain": "stocks",
+      "title": "KIS 비용 증거와 유동성 슬리피지",
+      "why": "백테스트 비용이 정적 수수료·세율·슬리피지에 의존해 BanKIS 우대수수료 가정, 시행일별 매도세, 주문 유동성을 재현하지 못했다.",
+      "resolution": "비용 증거 로더와 해시 고정 계약, effective-dated KIS 비용, 매도세 분해, ADTV·변동성·호가단위 기반 슬리피지 및 simulator/backtester 연결을 추가했다.",
+      "impact": "비용 산출물은 snapshot에 고정되고 누락 입력은 fail-closed된다. 전체 연구 인증은 역사적 종목 master·DART·검증된 기업행동 증거가 complete가 될 때까지 provisional이다."
+    },
+    {
+      "task_id": "TASK_KIS_COST_SCHEDULE_AND_LIQUIDITY_SLIPPAGE",
+      "date": "2026-08-10",
+      "adr_id": "ADR_20260810_KIS_COST_SCHEDULE_AND_LIQUIDITY_SLIPPAGE",
+      "domain": "stocks",
+      "title": "BanKIS cost schedule, statutory sell tax, and liquidity slippage",
+      "why": "Backtests hardcoded 15bp commission, a single 23bp sell tax, and a fixed 5bp slippage, ignoring market/date/order liquidity.",
+      "resolution": "Added a hash-bound counterfactual cost evidence artifact (BanKIS 0.0036396%/side, effective-dated statutory sell taxes per market, unified KRX tick table, sqrt-impact liquidity model), a fail-closed typed loader, and a shared fill-cost helper wired into both the backtest engine and the simulator; missing liquidity input fails orders closed as missing-liquidity-input and filled trades/manifests now trace artifact hash, commission, tax components, slippage, tick rule, and model parameter hashes.",
+      "impact": "The engine and simulator resolve identical per-fill costs from one evidence artifact; research certification still requires the remaining evidence axes (historical master, full DART, verified actions) to be complete."
+    },
+    {
       "task_id": "TASK_STOCK_RESEARCH_DATA_FOUNDATION",
       "date": "2026-08-10",
       "adr_id": "ADR_20260810_STOCK_RESEARCH_DATA_FOUNDATION",
