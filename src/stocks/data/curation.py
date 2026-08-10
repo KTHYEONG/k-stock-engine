@@ -40,6 +40,14 @@ from src.core.datasets import (
     validate_production_manifest,
 )
 from src.core.instruments import AssetKind
+from src.stocks.data.feature_contracts import (
+    DuplicateRule,
+    FeatureContractBook,
+    contracts_to_json,
+    feature_contract_book_from_allowlist,
+    feature_set_hash,
+    resolve_raw_source_names,
+)
 from src.stocks.data.quality import (
     CorporateActionSnapshot,
     FeatureAvailabilityRecord,
@@ -201,6 +209,40 @@ FEATURE_ALLOWLIST_V1 = (
 _FEATURE_ALLOWLISTS: dict[str, tuple[str, ...]] = {
     "v1": FEATURE_ALLOWLIST_V1,
 }
+
+_TARGET_PREFIXES = ("target_", "label_")
+
+BASE_PANEL_FEATURE_SET = "base_panel"
+BASE_PANEL_LABEL_DEFINITION = "none"
+
+# Raw/derived duplicate fundamental lineage resolved explicitly: the canonical
+# field survives; ``_right`` alternatives are never projected for the same
+# feature. Pairs without an explicit rule are rejected, never guessed.
+_RIGHT_DUPLICATE_ROOTS = (
+    "total_assets",
+    "total_liabilities",
+    "total_equity",
+    "revenue",
+    "operating_income",
+    "net_income",
+    "capital",
+)
+
+
+def default_duplicate_rules() -> tuple[DuplicateRule, ...]:
+    return tuple(
+        DuplicateRule(canonical=root, alternatives=(f"{root}_right",))
+        for root in _RIGHT_DUPLICATE_ROOTS
+    )
+
+
+def default_feature_contract_book(version: str = "v1") -> FeatureContractBook:
+    """The versioned default contract book built from the frozen allowlist."""
+    return feature_contract_book_from_allowlist(
+        version=version,
+        allowlist=feature_allowlist(version),
+        duplicate_rules=default_duplicate_rules(),
+    )
 
 
 def feature_allowlist(version: str) -> tuple[str, ...]:
@@ -566,3 +608,364 @@ def _write_quality_report(
     payload = json.dumps(report.to_json_dict(), indent=2, sort_keys=True, default=str)
     report_path.write_text(payload, encoding="utf-8")
     return report_path
+
+
+_BASE_RESERVED_COLUMNS = frozenset(
+    (
+        "date",
+        "ticker",
+        "source_file",
+        "name",
+        "market",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "trading_value",
+        "market_cap",
+        "sector",
+        "instrument_id",
+        "session",
+        "observation_time",
+        "available_time",
+        "action_interval_covered",
+        QUALITY_STATUS_COLUMN,
+        QUALITY_REASON_COLUMN,
+    )
+)
+_BASE_RAW_COLUMNS = (
+    "instrument_id",
+    "session",
+    "observation_time",
+    "available_time",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "trading_value",
+    "market_cap",
+    "sector",
+    "action_interval_covered",
+    QUALITY_STATUS_COLUMN,
+    QUALITY_REASON_COLUMN,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class BasePanelRequest:
+    """Immutable input contract for one base-panel build.
+
+    The base panel is the immutable, hash-bound store of stable reusable facts
+    plus the deduplicated raw source predictor fields. It never carries forward
+    ``target_*``/``label_*`` columns.
+    """
+
+    dataset_id: str
+    start_date: date
+    end_date: date
+    provider_version: str = "legacy-feature-files"
+    universe_policy_version: str = "provisional-legacy"
+    certification: DatasetCertification = DatasetCertification.PROVISIONAL
+    calendar_hash: str = ""
+    corporate_action_hash: str = ""
+    cost_source_hash: str = ""
+    master_hash: str = ""
+    duplicate_rules: tuple[DuplicateRule, ...] = ()
+    instrument_master: InstrumentMasterSnapshot | None = None
+    corporate_actions: CorporateActionSnapshot | None = None
+    calendar: KRXSessionCalendar | None = None
+    feature_availability: tuple[FeatureAvailabilityRecord, ...] = ()
+    generated_time: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not self.dataset_id:
+            raise ValueError("dataset_id must be non-empty")
+        if self.start_date > self.end_date:
+            raise ValueError("start_date must not be after end_date")
+
+
+@dataclass(frozen=True, slots=True)
+class BasePanelResult:
+    """Immutable outcome of a base-panel build."""
+
+    dataset_id: str
+    manifest: DatasetManifest
+    partition_paths: tuple[Path, ...]
+    row_count: int
+    raw_column_count: int
+    source_file_count: int
+    quality_report_path: Path | None = None
+
+
+def build_base_panel(
+    source_root: Path,
+    destination_root: Path,
+    request: BasePanelRequest,
+) -> BasePanelResult:
+    """Build an immutable base panel from the legacy feature source.
+
+    Reuses the deterministic source read, windowing, NaN normalization, and
+    quality routing of legacy curation, then projects the canonical stable
+    facts plus ``raw__*`` source predictors. The panel is written to the
+    canonical root with a manifest bound to the supplied evidence hashes. The
+    legacy source and existing curated datasets are never modified.
+    """
+    panel, source_entries, source_rows = _read_source_panel(Path(source_root))
+    in_window = _normalize_and_reject_non_finite(
+        _window_and_dedupe(panel, request.start_date, request.end_date)
+    )
+    policy = StockDataQualityPolicy(
+        certification=request.certification,
+        calendar=request.calendar,
+        feature_availability=request.feature_availability,
+    )
+    report = validate_canonical_stock_panel(
+        in_window,
+        request.instrument_master,
+        request.corporate_actions,
+        policy,
+    )
+    if report.eligible is None:
+        raise ValueError("quality validation produced no eligible partition")
+
+    raw_columns = _raw_source_columns(report.eligible, request.duplicate_rules)
+    canonical = _project_base_panel(report.eligible, raw_columns)
+    ordered_columns = _BASE_RAW_COLUMNS + tuple(
+        f"raw__{name}" for name in raw_columns
+    )
+    canonical = canonical.select(ordered_columns).sort(["instrument_id", "session"])
+
+    generated_time = request.generated_time or datetime.now(UTC)
+    manifest = _build_base_manifest(request, canonical, ordered_columns, generated_time, report)
+    _validate_certification_evidence(manifest)
+
+    content_manifest: dict[str, object] = {
+        "base_panel_version": CURATION_VERSION,
+        "generated_time": generated_time.isoformat(),
+        "source": {
+            "root": str(Path(source_root)),
+            "file_count": len(source_entries),
+            "row_count": source_rows,
+            "files": source_entries,
+        },
+    }
+    store = ParquetDatasetStore(Path(destination_root))
+    dataset_dir = store.write_partitioned(
+        canonical,
+        dataset_id=request.dataset_id,
+        manifest=manifest,
+        expected_feature_set=BASE_PANEL_FEATURE_SET,
+        decision_time=generated_time,
+        content_manifest=content_manifest,
+    )
+    _write_audit_partitions(dataset_dir, report)
+    quality_report_path = _write_quality_report(dataset_dir, report, generated_time)
+    partition_paths = tuple(sorted((dataset_dir / "partitions").rglob("*.parquet")))
+    logger.info(
+        "base panel %s: %s rows, %s raw columns from %s source files",
+        request.dataset_id,
+        canonical.height,
+        len(raw_columns),
+        len(source_entries),
+    )
+    return BasePanelResult(
+        dataset_id=request.dataset_id,
+        manifest=manifest,
+        partition_paths=partition_paths,
+        row_count=canonical.height,
+        raw_column_count=len(raw_columns),
+        source_file_count=len(source_entries),
+        quality_report_path=quality_report_path,
+    )
+
+
+def _raw_source_columns(
+    eligible: pl.DataFrame, duplicate_rules: tuple[DuplicateRule, ...]
+) -> tuple[str, ...]:
+    """Deterministic, deduplicated raw predictor columns from the source."""
+    candidates = tuple(
+        column
+        for column in eligible.columns
+        if column not in _BASE_RESERVED_COLUMNS
+        and not column.startswith(_TARGET_PREFIXES)
+    )
+    return resolve_raw_source_names(candidates, duplicate_rules)
+
+
+def _project_base_panel(
+    eligible: pl.DataFrame, raw_columns: tuple[str, ...]
+) -> pl.DataFrame:
+    missing = [c for c in _BASE_RAW_COLUMNS if c not in eligible.columns]
+    if missing:
+        raise ValueError(f"eligible panel missing base columns {missing}")
+    session_utc = (
+        pl.col("session")
+        .cast(pl.Date)
+        .dt.combine(pl.lit(time.min))
+        .dt.replace_time_zone("UTC")
+    )
+    base = [pl.col(c) for c in _BASE_RAW_COLUMNS]
+    raw = [pl.col(name).alias(f"raw__{name}") for name in raw_columns]
+    return eligible.select([*base, *raw]).with_columns(session_utc.alias("session"))
+
+
+def _build_base_manifest(
+    request: BasePanelRequest,
+    canonical: pl.DataFrame,
+    ordered_columns: tuple[str, ...],
+    generated_time: datetime,
+    report: StockDataQualityReport,
+) -> DatasetManifest:
+    report_hash = report.hashes.get("quality_report", "")
+    return make_manifest(
+        asset_kind=AssetKind.STOCK,
+        columns=list(ordered_columns),
+        feature_set=BASE_PANEL_FEATURE_SET,
+        label_definition=BASE_PANEL_LABEL_DEFINITION,
+        label_horizon_sessions=1,
+        time_start=_as_utc_datetime(canonical["observation_time"].min()),
+        time_end=_as_utc_datetime(canonical["observation_time"].max()),
+        provider_version=request.provider_version,
+        universe_policy_version=request.universe_policy_version,
+        row_count=canonical.height,
+        generated_time=generated_time,
+        certification=request.certification,
+        calendar_hash=request.calendar_hash
+        or (request.calendar.content_hash if request.calendar else ""),
+        corporate_action_hash=request.corporate_action_hash,
+        cost_source_hash=request.cost_source_hash,
+        master_hash=request.master_hash or report.hashes.get("master", ""),
+        quality_report_hash=report_hash,
+        schema_version="v2",
+        content_hash=canonical_content_hash(canonical, list(ordered_columns)),
+        storage_layout=HIVE_PARTITION_LAYOUT,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class FeaturePanelRequest:
+    """Immutable input contract for one feature-panel projection."""
+
+    dataset_id: str
+    base_panel_id: str
+    feature_set: str = "stock_alpha_v1"
+    feature_contract_book: FeatureContractBook | None = None
+    provider_version: str = "base-panel"
+    universe_policy_version: str = "provisional-legacy"
+    certification: DatasetCertification = DatasetCertification.PROVISIONAL
+    generated_time: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not self.dataset_id:
+            raise ValueError("dataset_id must be non-empty")
+        if not self.base_panel_id:
+            raise ValueError("base_panel_id must be non-empty")
+
+
+@dataclass(frozen=True, slots=True)
+class FeaturePanelResult:
+    """Immutable outcome of a feature-panel projection."""
+
+    dataset_id: str
+    manifest: DatasetManifest
+    contract_path: Path
+    partition_paths: tuple[Path, ...]
+    row_count: int
+    base_panel_id: str
+
+
+def build_feature_panel(
+    base_root: Path,
+    destination_root: Path,
+    request: FeaturePanelRequest,
+) -> FeaturePanelResult:
+    """Project a reusable, label-free wide feature panel from one base version.
+
+    The base panel is read in full once and projected through the feature
+    contract book into ``feature__*`` columns. ``feature_contract.json`` is
+    written next to the dataset and records the exact contract version, the
+    feature-set hash, and the referenced base-panel id.
+    """
+    book = request.feature_contract_book or default_feature_contract_book()
+    generated_time = request.generated_time or datetime.now(UTC)
+    store = ParquetDatasetStore(Path(base_root))
+    base_manifest = store.read_manifest(request.base_panel_id)
+    base_frame = store.read(
+        request.base_panel_id, AssetKind.STOCK, BASE_PANEL_FEATURE_SET, generated_time
+    )
+    projected = book.project(base_frame, source_prefix="raw__")
+    if projected.is_empty():
+        raise ValueError("feature projection produced no rows")
+    if any(c.startswith(_TARGET_PREFIXES) for c in projected.columns):
+        raise ValueError("feature projection leaked a target/label column")
+
+    ordered_columns = projected.columns
+    manifest = make_manifest(
+        asset_kind=AssetKind.STOCK,
+        columns=ordered_columns,
+        feature_set=request.feature_set,
+        label_definition=BASE_PANEL_LABEL_DEFINITION,
+        label_horizon_sessions=1,
+        time_start=_as_utc_datetime(base_frame["observation_time"].min()),
+        time_end=_as_utc_datetime(base_frame["observation_time"].max()),
+        provider_version=request.provider_version,
+        universe_policy_version=request.universe_policy_version,
+        row_count=projected.height,
+        generated_time=generated_time,
+        certification=request.certification,
+        calendar_hash=base_manifest.calendar_hash,
+        corporate_action_hash=base_manifest.corporate_action_hash,
+        cost_source_hash=base_manifest.cost_source_hash,
+        master_hash=base_manifest.master_hash,
+        quality_report_hash=base_manifest.quality_report_hash,
+        schema_version="v2",
+        content_hash=canonical_content_hash(projected, ordered_columns),
+        storage_layout=HIVE_PARTITION_LAYOUT,
+    )
+    _validate_certification_evidence(manifest)
+
+    content_manifest: dict[str, object] = {
+        "feature_contract_version": book.version,
+        "feature_set_hash": feature_set_hash(book.contracts),
+        "base_panel_id": request.base_panel_id,
+        "base_panel_content_hash": base_manifest.content_hash,
+        "generated_time": generated_time.isoformat(),
+    }
+    out_store = ParquetDatasetStore(Path(destination_root))
+    dataset_dir = out_store.write_partitioned(
+        projected,
+        dataset_id=request.dataset_id,
+        manifest=manifest,
+        expected_feature_set=request.feature_set,
+        decision_time=generated_time,
+        content_manifest=content_manifest,
+    )
+    contract_payload = {
+        "contract_version": book.version,
+        "feature_set_hash": feature_set_hash(book.contracts),
+        "base_panel_id": request.base_panel_id,
+        "contracts": contracts_to_json(book.contracts),
+    }
+    contract_path = dataset_dir / "feature_contract.json"
+    contract_path.write_text(
+        json.dumps(contract_payload, indent=2, sort_keys=True, default=str),
+        encoding="utf-8",
+    )
+    partition_paths = tuple(sorted((dataset_dir / "partitions").rglob("*.parquet")))
+    logger.info(
+        "feature panel %s: %s rows, %s features from base %s",
+        request.dataset_id,
+        projected.height,
+        len(book.contracts),
+        request.base_panel_id,
+    )
+    return FeaturePanelResult(
+        dataset_id=request.dataset_id,
+        manifest=manifest,
+        contract_path=contract_path,
+        partition_paths=partition_paths,
+        row_count=projected.height,
+        base_panel_id=request.base_panel_id,
+    )

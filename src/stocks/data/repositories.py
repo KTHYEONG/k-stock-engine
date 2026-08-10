@@ -15,7 +15,15 @@ import polars as pl
 
 from src.core.datasets import DatasetCertification, DatasetManifest, make_manifest
 from src.core.instruments import AssetKind
-from src.stocks.data.contracts import DatasetSnapshot
+from src.stocks.data.catalog import (
+    CatalogEntry,
+    CatalogStore,
+    ResearchDataSnapshot,
+    SnapshotResolver,
+)
+from src.stocks.data.contracts import CoverageRange, DatasetSnapshot
+from src.stocks.data.curation import BASE_PANEL_FEATURE_SET
+from src.stocks.data.labels import LABEL_FEATURE_SET
 from src.stocks.research.datasets import (
     ELIGIBLE_STATUS,
     QUALITY_REASON_COLUMN,
@@ -233,3 +241,163 @@ class StockDatasetRepository:
             raise ValueError(
                 f"stock repository rejects {manifest.asset_kind.value} manifest"
             )
+
+
+_BASE_TRAINING_COLUMNS = (
+    "instrument_id",
+    "session",
+    "observation_time",
+    "available_time",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "trading_value",
+    "market_cap",
+    "sector",
+    "action_interval_covered",
+    QUALITY_STATUS_COLUMN,
+    QUALITY_REASON_COLUMN,
+)
+
+
+def resolve_snapshot_for_mode(
+    catalog_root: Path,
+    snapshot_id: str,
+    *,
+    mode: str,
+) -> ResearchDataSnapshot:
+    """Resolve a snapshot and reject provisional evidence for paper/live modes."""
+    if not snapshot_id:
+        raise ValueError("a snapshot-id is required; no implicit newest selection")
+    store = CatalogStore(catalog_root)
+    snapshot = SnapshotResolver(store).resolve(snapshot_id)
+    if mode in ("paper", "live") and (
+        snapshot.manifest.certification is DatasetCertification.PROVISIONAL
+    ):
+        raise ValueError(
+            f"snapshot {snapshot_id} is provisional and cannot drive {mode} mode"
+        )
+    return snapshot
+
+
+class ResearchDataRepository:
+    """Snapshot-aware composition of base panels, feature panels, and labels.
+
+    A :class:`ResearchDataSnapshot` selects exact immutable dataset versions;
+    this repository reads them through the verified bounded lazy read plan and
+    composes the training/backtest frame. It never copies rows across versions
+    and never falls back to an implicit newest dataset.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_root: Path,
+        feature_root: Path,
+        label_root: Path,
+    ):
+        self.base_store = ParquetDatasetStore(base_root)
+        self.feature_store = ParquetDatasetStore(feature_root)
+        self.label_store = ParquetDatasetStore(label_root)
+
+    def read_base_bounded(
+        self,
+        entry: CatalogEntry,
+        decision_time: datetime,
+        *,
+        research_range: CoverageRange,
+        columns: tuple[str, ...] = _BASE_TRAINING_COLUMNS,
+    ) -> pl.DataFrame:
+        return self.base_store.read_bounded(
+            entry.name,
+            AssetKind.STOCK,
+            BASE_PANEL_FEATURE_SET,
+            decision_time,
+            session_start=research_range.start,
+            session_end=research_range.end,
+            columns=list(columns),
+        )
+
+    def read_features_bounded(
+        self,
+        entry: CatalogEntry,
+        feature_set: str,
+        decision_time: datetime,
+        *,
+        research_range: CoverageRange,
+    ) -> pl.DataFrame:
+        feature_columns = [
+            c for c in self.feature_store.content_columns(entry.name) if c.startswith("feature__")
+        ]
+        if not feature_columns:
+            raise ValueError(f"feature panel {entry.name} exposes no feature__ columns")
+        return self.feature_store.read_bounded(
+            entry.name,
+            AssetKind.STOCK,
+            feature_set,
+            decision_time,
+            session_start=research_range.start,
+            session_end=research_range.end,
+            columns=["instrument_id", "session", *feature_columns],
+        )
+
+    def read_labels_bounded(
+        self,
+        entry: CatalogEntry,
+        decision_time: datetime,
+        *,
+        research_range: CoverageRange,
+        columns: tuple[str, ...] = ("instrument_id", "session"),
+    ) -> pl.DataFrame:
+        return self.label_store.read_bounded(
+            entry.name,
+            AssetKind.STOCK,
+            LABEL_FEATURE_SET,
+            decision_time,
+            session_start=research_range.start,
+            session_end=research_range.end,
+            columns=list(columns),
+        )
+
+    def compose_training_snapshot(
+        self,
+        snapshot: ResearchDataSnapshot,
+        *,
+        feature_set: str,
+        decision_time: datetime,
+        research_range: CoverageRange | None = None,
+    ) -> DatasetSnapshot:
+        """Compose a training frame from the snapshot's base + feature versions.
+
+        Execution prices and OHLCV come from the referenced base panel; the
+        reusable feature columns come from the referenced feature panel. The
+        result manifest is the feature panel's manifest so evidence hashes and
+        the feature set are preserved.
+        """
+        if snapshot.base_panel is None:
+            raise ValueError("snapshot has no base-panel reference")
+        if snapshot.features is None:
+            raise ValueError("snapshot has no feature-panel reference")
+        range_ = research_range or snapshot.research_range
+
+        base = self.read_base_bounded(
+            snapshot.base_panel, decision_time, research_range=range_
+        )
+        features = self.read_features_bounded(
+            snapshot.features, feature_set, decision_time, research_range=range_
+        )
+        feature_manifest = self.feature_store.read_manifest(snapshot.features.name)
+        if feature_manifest.feature_set != feature_set:
+            raise ValueError(
+                f"snapshot feature panel {snapshot.features.name} has feature_set "
+                f"{feature_manifest.feature_set!r}, requested {feature_set!r}"
+            )
+
+        composed = base.join(
+            features, on=["instrument_id", "session"], how="inner"
+        ).sort(["instrument_id", "session"])
+        if composed.is_empty():
+            raise ValueError("snapshot composition produced no rows")
+        return DatasetSnapshot(manifest=feature_manifest, frame=composed)
