@@ -1,0 +1,80 @@
+{
+  "feature": "dart_resumable_single_worker_collector",
+  "domain": "stocks",
+  "target_file": "/home/kth/k-stock-engine/src/stocks/data/evidence_collectors.py",
+  "symbol": "OpenDartEvidenceCollector",
+  "signature": "class OpenDartEvidenceCollector(api_key: str | None = None, *, request_json: JsonRequest | None = None, generated_time: datetime | None = None)",
+  "python_assertion": "assert OpenDartEvidenceCollector(api_key='fixture-key', request_json=lambda endpoint, params: {'status': '000', 'total_page': 1, 'list': []}).collect_disclosures(date(2024, 1, 1), date(2024, 1, 1)) == []",
+  "requirements": [
+    "Add a single-worker-only monthly disclosure collector; it must not create threads, processes, async tasks, or accept a worker-count option.",
+    "Persist a versioned manifest under the output directory. It must bind requested start/end dates, page size, retry policy, source endpoint, and each month status; a conflicting range or policy fails with ValueError.",
+    "Persist every successfully fetched page atomically before requesting the next page. On resume, validate page SHA-256, request parameters, page number, and page-size before reuse; an invalid checkpoint is marked incomplete and re-fetched.",
+    "After every page and every terminal failure, atomically persist progress. A complete month is written atomically only after all expected pages are validated and the month record list is sorted and unique by receipt number.",
+    "Retry only transient transport exceptions, HTTP 408/429/5xx, and DART statuses 800 or 900. Use deterministic exponential backoff min(max_backoff_seconds, initial_backoff_seconds * 2**retry_index), with default attempts=5, initial=1 second, max=30 seconds, and a configurable minimum inter-request interval.",
+    "Treat DART status 013 for list.json as a valid empty result. Treat status 020 (quota), 010/011/012/021/100/101/901, malformed responses, invalid receipt identity, and exhausted retries as fail-closed terminal errors; do not silently create a complete month.",
+    "Use a non-blocking exclusive process lock on the output directory; a concurrent invocation fails before issuing any request. Process termination must release the lock automatically.",
+    "Merge only complete hash-validated month artifacts. The final disclosure artifact is atomically written, receipt-sorted, duplicate-free, and never replaces an existing output whose bytes differ.",
+    "All sleep, monotonic-clock, and request behavior must be injectable for deterministic tests; no real network or sleep is allowed in unit tests."
+  ],
+  "contracts": [
+    {"file_hint": "src/stocks/data/evidence_collectors.py", "kind": "class", "name": "OpenDartEvidenceCollector"},
+    {"file_hint": "src/stocks/data/evidence_collectors.py", "kind": "function", "name": "OpenDartEvidenceCollector.collect_disclosures"}
+  ],
+  "implementation_contracts": [
+    {
+      "target_file": "src/stocks/data/evidence_collectors.py",
+      "symbol": "DartRetryPolicy",
+      "signature": "class DartRetryPolicy(max_attempts: int = 5, initial_backoff_seconds: float = 1.0, max_backoff_seconds: float = 30.0, min_request_interval_seconds: float = 0.2)"
+    },
+    {
+      "target_file": "src/stocks/data/evidence_collectors.py",
+      "symbol": "OpenDartEvidenceCollector.collect_disclosure_partitions",
+      "signature": "def collect_disclosure_partitions(self, output_dir: Path, start: date, end: date, *, page_count: int = 100, retry_policy: DartRetryPolicy | None = None) -> None"
+    },
+    {
+      "target_file": "src/stocks/data/evidence_collectors.py",
+      "symbol": "OpenDartEvidenceCollector.merge_disclosure_partitions",
+      "signature": "def merge_disclosure_partitions(self, input_dir: Path, start: date, end: date, output_path: Path) -> None"
+    },
+    {
+      "target_file": "src/stocks/cli/collect_evidence.py",
+      "symbol": "main",
+      "signature": "def main(args: list[str] | None = None) -> int"
+    }
+  ],
+  "scenarios": [
+    {
+      "name": "test_dart_disclosures_preserve_receipt_identity_and_candidates",
+      "target_test_file": "tests/unit/stocks/data/test_evidence_collectors.py",
+      "expected_behavior": "Existing disclosure identity and candidate filtering behavior remains covered."
+    },
+    {
+      "name": "test_collect_evidence_resume_and_merge_commands",
+      "target_test_file": "tests/unit/stocks/cli/test_collect_evidence.py",
+      "expected_behavior": "Existing resumable CLI behavior remains covered while DART adds its own resume and merge commands."
+    }
+  ],
+  "planned_test_scenarios": [
+    {"scenario_id": "SCENARIO_DART_PAGE_CHECKPOINT_RESUME", "target_test_file": "tests/unit/stocks/data/test_evidence_collectors.py", "expected_behavior": "After a page-two transient failure, a second invocation reuses the hash-valid page-one checkpoint and requests only page two onward."},
+    {"scenario_id": "SCENARIO_DART_BACKOFF_CLASSIFICATION", "target_test_file": "tests/unit/stocks/data/test_evidence_collectors.py", "expected_behavior": "Transport/429/5xx/800/900 retry with injected delays; quota 020 and invalid-key errors stop without retry."},
+    {"scenario_id": "SCENARIO_DART_EMPTY_MONTH_COMPLETE", "target_test_file": "tests/unit/stocks/data/test_evidence_collectors.py", "expected_behavior": "A status-013 response produces a complete, hash-valid empty month artifact."},
+    {"scenario_id": "SCENARIO_DART_MERGE_FAILS_ON_GAP_OR_TAMPER", "target_test_file": "tests/unit/stocks/data/test_evidence_collectors.py", "expected_behavior": "Merge rejects a missing, incomplete, or digest-mismatched monthly artifact and leaves the final output untouched."},
+    {"scenario_id": "SCENARIO_DART_CLI_SINGLE_WORKER", "target_test_file": "tests/unit/stocks/cli/test_collect_evidence.py", "expected_behavior": "The resume command exposes no concurrency option and delegates to one collector call."}
+  ],
+  "wiring": [
+    {
+      "caller_file": "/home/kth/k-stock-engine/src/stocks/cli/collect_evidence.py",
+      "anchor": "def main(",
+      "import_symbol": "OpenDartEvidenceCollector",
+      "invocation_expression": "dart_collector.collect_disclosures"
+    }
+  ],
+  "planned_wiring": [
+    {
+      "caller_file": "src/stocks/cli/collect_evidence.py",
+      "anchor": "def main(",
+      "import_symbol": "OpenDartEvidenceCollector.collect_disclosure_partitions",
+      "invocation_expression": "dart_collector.collect_disclosure_partitions(parsed.output_dir, parsed.start, parsed.end, page_count=parsed.page_count, retry_policy=policy)"
+    }
+  ]
+}
