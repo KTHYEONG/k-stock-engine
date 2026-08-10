@@ -5,7 +5,11 @@ import argparse
 from datetime import date
 from pathlib import Path
 
-from src.stocks.data.evidence_collectors import KRXEvidenceCollector, OpenDartEvidenceCollector
+from src.stocks.data.evidence_collectors import (
+    DartRetryPolicy,
+    KRXEvidenceCollector,
+    OpenDartEvidenceCollector,
+)
 
 
 def main(args: list[str] | None = None) -> int:
@@ -34,6 +38,22 @@ def main(args: list[str] | None = None) -> int:
     calendar_merge.add_argument("--input-dir", required=True, type=Path)
     calendar_merge.add_argument("--output", required=True, type=Path)
 
+    dart_resume = subparsers.add_parser("dart-disclosures-resume")
+    dart_resume.add_argument("--start", required=True, type=date.fromisoformat)
+    dart_resume.add_argument("--end", required=True, type=date.fromisoformat)
+    dart_resume.add_argument("--output-dir", required=True, type=Path)
+    dart_resume.add_argument("--page-count", type=int, default=100)
+    dart_resume.add_argument("--max-attempts", type=int, default=5)
+    dart_resume.add_argument("--initial-backoff-seconds", type=float, default=1.0)
+    dart_resume.add_argument("--max-backoff-seconds", type=float, default=30.0)
+    dart_resume.add_argument("--min-request-interval-seconds", type=float, default=0.2)
+
+    dart_merge = subparsers.add_parser("dart-disclosures-merge")
+    dart_merge.add_argument("--start", required=True, type=date.fromisoformat)
+    dart_merge.add_argument("--end", required=True, type=date.fromisoformat)
+    dart_merge.add_argument("--input-dir", required=True, type=Path)
+    dart_merge.add_argument("--output", required=True, type=Path)
+
     for name in ("dart-disclosures", "dart-actions"):
         command = subparsers.add_parser(name)
         command.add_argument("--start", required=True, type=date.fromisoformat)
@@ -58,6 +78,25 @@ def main(args: list[str] | None = None) -> int:
     elif parsed.command == "krx-calendar-merge":
         collector = KRXEvidenceCollector()
         collector.merge_calendar_partitions(
+            parsed.input_dir, parsed.start, parsed.end, parsed.output
+        )
+    elif parsed.command == "dart-disclosures-resume":
+        dart_collector = OpenDartEvidenceCollector()
+        dart_collector.collect_disclosure_partitions(
+            parsed.output_dir,
+            parsed.start,
+            parsed.end,
+            page_count=parsed.page_count,
+            retry_policy=DartRetryPolicy(
+                max_attempts=parsed.max_attempts,
+                initial_backoff_seconds=parsed.initial_backoff_seconds,
+                max_backoff_seconds=parsed.max_backoff_seconds,
+                min_request_interval_seconds=parsed.min_request_interval_seconds,
+            ),
+        )
+    elif parsed.command == "dart-disclosures-merge":
+        dart_collector = OpenDartEvidenceCollector()
+        dart_collector.merge_disclosure_partitions(
             parsed.input_dir, parsed.start, parsed.end, parsed.output
         )
     else:
