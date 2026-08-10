@@ -1,35 +1,36 @@
-"""Simulate CLI resolves repository-local canonical paths without environment names."""
+"""Simulate CLI requires an explicit snapshot id and resolves it through the catalog."""
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
-from src.core.paths import STOCK_ARTIFACT_ROOT, STOCK_DATASET_ROOT
+import pytest
+
+from src.core.paths import STOCK_ARTIFACT_ROOT, STOCK_CATALOG_ROOT
 from src.stocks.cli import simulate
 
 
 def test_simulate_cli_defaults_to_canonical_roots() -> None:
-    assert simulate.STOCK_DATASET_ROOT is STOCK_DATASET_ROOT
     assert simulate.STOCK_ARTIFACT_ROOT is STOCK_ARTIFACT_ROOT
+    assert simulate.STOCK_CATALOG_ROOT is STOCK_CATALOG_ROOT
 
 
-def test_simulate_cli_reads_through_stock_dataset_repository(monkeypatch) -> None:
-    captured: dict[str, object] = {}
+def test_simulate_cli_rejects_missing_snapshot_id() -> None:
+    with pytest.raises(SystemExit):
+        simulate.main(["--artifact-id", "a1"])
 
-    class FakeRepo:
-        def read(self, dataset_id, feature_set, decision_time):
-            captured["dataset_id"] = dataset_id
-            captured["feature_set"] = feature_set
-            return None
 
-    monkeypatch.setattr(simulate, "StockDatasetRepository", lambda store: FakeRepo())
+def test_simulate_cli_rejects_provisional_for_paper_mode(monkeypatch) -> None:
+    def fake_resolve(catalog_root, snapshot_id, *, mode):
+        raise ValueError(f"snapshot {snapshot_id} is provisional and cannot drive {mode} mode")
+
+    monkeypatch.setattr(simulate, "resolve_snapshot_for_mode", fake_resolve)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset-id")
-    parser.add_argument("--dataset-root", type=Path, default=simulate.STOCK_DATASET_ROOT)
-    parser.add_argument("--registry", type=Path, default=simulate.STOCK_ARTIFACT_ROOT)
-    args = parser.parse_args(["--dataset-id", "krx_daily_research_v1"])
+    parser.add_argument("--snapshot-id")
+    parser.add_argument("--catalog-root", type=Path, default=simulate.STOCK_CATALOG_ROOT)
+    parser.add_argument("--mode", default="paper")
+    args = parser.parse_args(["--snapshot-id", "prov_snap_1", "--mode", "paper"])
 
-    repo = simulate.StockDatasetRepository(None)
-    repo.read(args.dataset_id, "stock_alpha_v1", None)
-    assert captured == {"dataset_id": "krx_daily_research_v1", "feature_set": "stock_alpha_v1"}
+    with pytest.raises(ValueError, match="provisional"):
+        simulate.resolve_snapshot_for_mode(args.catalog_root, args.snapshot_id, mode=args.mode)
