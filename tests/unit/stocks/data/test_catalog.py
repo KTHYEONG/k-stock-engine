@@ -223,6 +223,26 @@ class TestSnapshotResolver:
         with pytest.raises(ValueError, match="candidate_only"):
             SnapshotResolver(store).resolve("research_1")
 
+    def test_incomplete_cost_evidence_rejects_certification(self, tmp_path) -> None:
+        store = CatalogStore(tmp_path)
+        evidence = {
+            CatalogKind.CALENDAR: entry(CatalogKind.CALENDAR, "cal1"),
+            CatalogKind.INSTRUMENT_MASTER: entry(CatalogKind.INSTRUMENT_MASTER, "m1"),
+            CatalogKind.DISCLOSURES: entry(CatalogKind.DISCLOSURES, "d1"),
+            CatalogKind.CORPORATE_ACTIONS: entry(CatalogKind.CORPORATE_ACTIONS, "a1"),
+            CatalogKind.COSTS: entry(
+                CatalogKind.COSTS,
+                "costs_incomplete",
+                completeness=EvidenceCompleteness.INCOMPLETE,
+            ),
+        }
+        for ref in evidence.values():
+            store.register(ref)
+        refs = {**evidence, **register_dataset_refs(store)}
+        write_snapshot(store, "research_1", list(refs.values()))
+        with pytest.raises(ValueError, match="not complete evidence"):
+            SnapshotResolver(store).resolve("research_1")
+
     def test_hash_mismatch_is_rejected(self, tmp_path) -> None:
         store = CatalogStore(tmp_path)
         complete_evidence(store)
