@@ -1,12 +1,81 @@
 """Deterministic stock fixture builders shared by unit tests."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, UTC
+from datetime import date, datetime, timedelta, UTC
+from math import inf
 
 import polars as pl
 
+from src.core.costs import TickSizeRule
 from src.core.instruments import AssetKind
 from src.core.datasets import DatasetManifest, make_manifest
+from src.stocks.data.contracts import CoverageRange
+from src.stocks.data.costs import (
+    CommissionRule,
+    CostEvidence,
+    LiquidityModelSpec,
+    SellTaxRule,
+    SourceRecord,
+)
+
+
+def cost_evidence_fixture(
+    effective_from: datetime | None = None,
+) -> CostEvidence:
+    """Minimal hash-bound cost evidence covering 2024 for engine/simulator tests.
+
+    Uses the 2024 statutory sell tax (KOSPI 0.03% STT + 0.15% rural = 0.18%,
+    KOSDAQ 0.18% STT) and the unified KRX regular-session tick table, mirroring
+    the real counterfactual artifact's structure.
+    """
+    eff = effective_from or datetime(2024, 1, 1, tzinfo=UTC)
+    source = SourceRecord(
+        uri="https://law.go.kr/fixture",
+        retrieved_at=datetime(2026, 1, 1, tzinfo=UTC),
+        content_hash="fixture-source-hash",
+    )
+    return CostEvidence(
+        schema_version=1,
+        coverage=CoverageRange(start=date(2024, 1, 1), end=date(2024, 3, 31)),
+        assumption_id="fixture_kis_v1",
+        sources=(source,),
+        commission=(
+            CommissionRule(
+                effective_from=eff, buy_rate=0.000036396, sell_rate=0.000036396
+            ),
+        ),
+        sell_taxes=(
+            SellTaxRule(
+                effective_from=eff,
+                market="KOSPI",
+                securities_transaction_tax_rate=0.0003,
+                rural_special_tax_rate=0.0015,
+                source_uri=source.uri,
+                source_hash=source.content_hash,
+            ),
+            SellTaxRule(
+                effective_from=eff,
+                market="KOSDAQ",
+                securities_transaction_tax_rate=0.0018,
+                rural_special_tax_rate=0.0,
+                source_uri=source.uri,
+                source_hash=source.content_hash,
+            ),
+        ),
+        tick_size_rules=(
+            TickSizeRule("krx_test_0", eff, 0.0, 1000.0, 1.0),
+            TickSizeRule("krx_test_1", eff, 1000.0, 5000.0, 5.0),
+            TickSizeRule("krx_test_2", eff, 5000.0, 10000.0, 10.0),
+            TickSizeRule("krx_test_3", eff, 10000.0, 50000.0, 50.0),
+            TickSizeRule("krx_test_4", eff, 50000.0, 100000.0, 100.0),
+            TickSizeRule("krx_test_5", eff, 100000.0, 500000.0, 500.0),
+            TickSizeRule("krx_test_6", eff, 500000.0, inf, 1000.0),
+        ),
+        liquidity_model=LiquidityModelSpec(
+            model_id="sqrt_impact_v1", impact_coefficient=0.1, stress_multiplier=1.5
+        ),
+        content_hash="fixture-cost-hash",
+    )
 
 
 def stock_instrument_df(
