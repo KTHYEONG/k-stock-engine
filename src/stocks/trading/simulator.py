@@ -3,7 +3,9 @@
 The simulator iterates ordered KRX sessions and maintains cash, unsettled cash,
 positions, orders, fills, costs, and equity as a reconciled ledger. It never
 invents a price: missing open, halt, zero volume, or a limit-locked state
-produces an unfilled order with a reason code.
+produces an unfilled order with a reason code. When a :class:`CostEvidence`
+artifact is supplied, per-fill costs are resolved through the same shared
+``resolve_fill_cost`` helper as the backtest engine, so the two paths agree.
 """
 from __future__ import annotations
 
@@ -13,8 +15,13 @@ from datetime import UTC, date, datetime, time
 import numpy as np
 import polars as pl
 
-from src.core.costs import CostSchedule, default_base_schedule
+from src.core.costs import CostSchedule, LiquiditySlippageModel, default_base_schedule
 from src.core.instruments import AssetKind
+from src.stocks.data.costs import (
+    CostEvidence,
+    krx_market_for_code,
+    resolve_fill_cost,
+)
 from src.stocks.research.metrics import max_drawdown
 from src.stocks.trading.allocation_policy import AllocationPolicy, StockTargetWeight
 
@@ -70,6 +77,7 @@ class StockSimulator:
         adtv_participation_limit: float = 0.01,
         adtv_window: int = 20,
         stress_schedule: CostSchedule | None = None,
+        cost_evidence: CostEvidence | None = None,
         seed: int = 42,
     ):
         if initial_cash <= 0:
@@ -84,6 +92,7 @@ class StockSimulator:
         self.adtv_participation_limit = adtv_participation_limit
         self.adtv_window = adtv_window
         self.stress_schedule = stress_schedule
+        self.cost_evidence = cost_evidence
         self.seed = seed
 
     def simulate(
@@ -102,7 +111,8 @@ class StockSimulator:
             None if rebalance_sessions is None else {int(s) for s in rebalance_sessions}
         )
         ledger, trades = self._run_ledger(
-            panel, policy, self.cost_schedule, decision_set
+            panel, policy, self.cost_schedule, decision_set,
+            self._liquidity_model(stress=False),
         )
         if not ledger:
             raise ValueError("simulation produced no ledger rows")
@@ -113,7 +123,8 @@ class StockSimulator:
         stress_final_value: float | None = None
         if self.stress_schedule is not None:
             stress_ledger, stress_trades = self._run_ledger(
-                panel, policy, self.stress_schedule, decision_set
+                panel, policy, self.stress_schedule, decision_set,
+                self._liquidity_model(stress=True),
             )
             stress_metrics = self._metrics(stress_ledger, stress_trades)
             stress_final_value = _num(stress_ledger[-1]["equity"])
@@ -127,12 +138,22 @@ class StockSimulator:
             stress_final_value=stress_final_value,
         )
 
+    def _liquidity_model(self, *, stress: bool) -> LiquiditySlippageModel | None:
+        if self.cost_evidence is None:
+            return None
+        return (
+            self.cost_evidence.stress_liquidity_model
+            if stress
+            else self.cost_evidence.base_liquidity_model
+        )
+
     def _run_ledger(
         self,
         panel: pl.DataFrame,
         policy: AllocationPolicy,
         schedule: CostSchedule,
         decision_set: set[int] | None,
+        liquidity_model: LiquiditySlippageModel | None,
     ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
         df = panel.sort(["session", "instrument_id"]).with_columns(
             pl.col("trading_value")
@@ -156,7 +177,11 @@ class StockSimulator:
         settlement_lag = (
             self.settlement_lag_sessions
             if self.settlement_lag_sessions is not None
-            else schedule.cost_for(first_session_time).settlement_days
+            else (
+                self.cost_evidence.settlement_days
+                if self.cost_evidence is not None
+                else schedule.cost_for(first_session_time).settlement_days
+            )
         )
 
         settled_cash = self.initial_cash
@@ -191,6 +216,7 @@ class StockSimulator:
                     settlement_lag,
                     i,
                     pending_equity,
+                    liquidity_model,
                 )
 
             positions_value = self._mark_positions(rows, positions, last_close)
@@ -261,10 +287,13 @@ class StockSimulator:
         settlement_lag: int,
         session_index: int,
         decision_equity: float,
+        liquidity_model: LiquiditySlippageModel | None,
     ) -> tuple[float, float, float, dict[int, float]]:
         row_by_instrument = {
             str(r["instrument_id"]): r for r in rows.to_dicts()
         }
+        evidence = self.cost_evidence
+        stress = bool(liquidity_model is not None and liquidity_model.stress_multiplier > 1.0)
         for target in pending:
             instrument_id = target.instrument_id
             weight = target.target_weight
@@ -302,41 +331,147 @@ class StockSimulator:
             if delta == 0:
                 continue
             if delta > 0:
-                buy_cost_rate = cost_point.commission_rate + cost_point.slippage_bps / 10_000.0
-                max_affordable = int(
-                    settled_cash
-                    / (price * (1.0 + buy_cost_rate))
-                    if settled_cash > 0
-                    else 0
-                )
-                delta = min(delta, max_affordable)
-                if delta <= 0:
-                    trades.append(
-                        self._unfilled(instrument_id, rows["session"][0], "insufficient-cash")
+                if evidence is not None:
+                    adtv = _num(row.get("adtv"))
+                    volatility = _num(row.get("feature__volatility_20d"))
+                    if adtv <= 0 or volatility <= 0:
+                        trades.append(
+                            self._unfilled(
+                                instrument_id, rows["session"][0], "missing-liquidity-input"
+                            )
+                        )
+                        continue
+                    buy_cost_rate = evidence.commission_for(rows["session"][0]).buy_rate
+                    max_affordable = int(
+                        settled_cash
+                        / (price * (1.0 + buy_cost_rate))
+                        if settled_cash > 0
+                        else 0
                     )
-                    continue
-                gross = delta * price
-                cost = gross * buy_cost_rate
-                settled_cash -= gross
-                accrued_costs += cost
-                positions[instrument_id] = current_qty + delta
-                trades.append(self._fill(instrument_id, rows["session"][0], delta, price, "buy", gross, cost))
+                    delta = min(delta, max_affordable)
+                    if delta <= 0:
+                        trades.append(
+                            self._unfilled(
+                                instrument_id, rows["session"][0], "insufficient-cash"
+                            )
+                        )
+                        continue
+                    gross = delta * price
+                    breakdown, artifact_hash = resolve_fill_cost(
+                        evidence,
+                        side="BUY",
+                        market=krx_market_for_code(instrument_id),
+                        price=price,
+                        notional=gross,
+                        adtv_20d=adtv,
+                        daily_volatility=volatility,
+                        effective_time=rows["session"][0],
+                        stress=stress,
+                    )
+                    buy_cost_rate = breakdown.total_rate(side="BUY")
+                    if gross * (1.0 + buy_cost_rate) > settled_cash:
+                        delta = int(settled_cash // (price * (1.0 + buy_cost_rate)))
+                        if delta <= 0:
+                            trades.append(
+                                self._unfilled(
+                                    instrument_id, rows["session"][0], "insufficient-cash"
+                                )
+                            )
+                            continue
+                        gross = delta * price
+                        breakdown, artifact_hash = resolve_fill_cost(
+                            evidence,
+                            side="BUY",
+                            market=krx_market_for_code(instrument_id),
+                            price=price,
+                            notional=gross,
+                            adtv_20d=adtv,
+                            daily_volatility=volatility,
+                            effective_time=rows["session"][0],
+                            stress=stress,
+                        )
+                        buy_cost_rate = breakdown.total_rate(side="BUY")
+                    cost = gross * buy_cost_rate
+                    settled_cash -= gross
+                    accrued_costs += cost
+                    positions[instrument_id] = current_qty + delta
+                    fill = self._fill(
+                        instrument_id, rows["session"][0], delta, price, "buy", gross, cost
+                    )
+                    fill["cost_breakdown"] = breakdown.to_dict(artifact_hash=artifact_hash)
+                    trades.append(fill)
+                else:
+                    buy_cost_rate = cost_point.commission_rate + cost_point.slippage_bps / 10_000.0
+                    max_affordable = int(
+                        settled_cash
+                        / (price * (1.0 + buy_cost_rate))
+                        if settled_cash > 0
+                        else 0
+                    )
+                    delta = min(delta, max_affordable)
+                    if delta <= 0:
+                        trades.append(
+                            self._unfilled(instrument_id, rows["session"][0], "insufficient-cash")
+                        )
+                        continue
+                    gross = delta * price
+                    cost = gross * buy_cost_rate
+                    settled_cash -= gross
+                    accrued_costs += cost
+                    positions[instrument_id] = current_qty + delta
+                    trades.append(self._fill(instrument_id, rows["session"][0], delta, price, "buy", gross, cost))
             else:
                 sell_qty = -delta
-                sell_cost_rate = (
-                    cost_point.commission_rate
-                    + cost_point.tax_rate
-                    + cost_point.slippage_bps / 10_000.0
-                )
-                gross = sell_qty * price
-                cost = gross * sell_cost_rate
-                positions[instrument_id] = current_qty - sell_qty
-                accrued_costs += cost
-                unsettled_cash += gross
-                settlements[session_index + settlement_lag] = (
-                    settlements.get(session_index + settlement_lag, 0.0) + gross
-                )
-                trades.append(self._fill(instrument_id, rows["session"][0], sell_qty, price, "sell", gross, cost))
+                if evidence is not None:
+                    adtv = _num(row.get("adtv"))
+                    volatility = _num(row.get("feature__volatility_20d"))
+                    if adtv <= 0 or volatility <= 0:
+                        trades.append(
+                            self._unfilled(
+                                instrument_id, rows["session"][0], "missing-liquidity-input"
+                            )
+                        )
+                        continue
+                    gross = sell_qty * price
+                    breakdown, artifact_hash = resolve_fill_cost(
+                        evidence,
+                        side="SELL",
+                        market=krx_market_for_code(instrument_id),
+                        price=price,
+                        notional=gross,
+                        adtv_20d=adtv,
+                        daily_volatility=volatility,
+                        effective_time=rows["session"][0],
+                        stress=stress,
+                    )
+                    sell_cost_rate = breakdown.total_rate(side="SELL")
+                    cost = gross * sell_cost_rate
+                    positions[instrument_id] = current_qty - sell_qty
+                    accrued_costs += cost
+                    unsettled_cash += gross
+                    settlements[session_index + settlement_lag] = (
+                        settlements.get(session_index + settlement_lag, 0.0) + gross
+                    )
+                    fill = self._fill(
+                        instrument_id, rows["session"][0], sell_qty, price, "sell", gross, cost
+                    )
+                    fill["cost_breakdown"] = breakdown.to_dict(artifact_hash=artifact_hash)
+                    trades.append(fill)
+                else:
+                    sell_cost_rate = (
+                        cost_point.commission_rate
+                        + cost_point.tax_rate
+                        + cost_point.slippage_bps / 10_000.0
+                    )
+                    gross = sell_qty * price
+                    cost = gross * sell_cost_rate
+                    positions[instrument_id] = current_qty - sell_qty
+                    accrued_costs += cost
+                    unsettled_cash += gross
+                    settlements[session_index + settlement_lag] = (
+                        settlements.get(session_index + settlement_lag, 0.0) + gross
+                    )
+                    trades.append(self._fill(instrument_id, rows["session"][0], sell_qty, price, "sell", gross, cost))
         return settled_cash, unsettled_cash, accrued_costs, settlements
 
     @staticmethod

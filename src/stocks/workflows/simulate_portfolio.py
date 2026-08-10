@@ -22,6 +22,7 @@ from src.stocks.backtesting.engine import (
     StockBacktester,
 )
 from src.stocks.data.contracts import DatasetSnapshot
+from src.stocks.data.costs import CostEvidence
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.trading.portfolio_constructor import StockRiskPolicy
 from src.stocks.workflows.contracts import SimulationRequest
@@ -31,8 +32,14 @@ def simulate_portfolio(
     snapshot: DatasetSnapshot,
     registry: ModelArtifactRegistry,
     request: SimulationRequest,
+    cost_evidence: CostEvidence | None = None,
 ) -> BacktestResult:
-    """Replay the trading cycle over the snapshot and return the ledger result."""
+    """Replay the trading cycle over the snapshot and return the ledger result.
+
+    ``cost_evidence`` is the hash-bound cost artifact resolved from the research
+    snapshot; when supplied the replay uses the dynamic liquidity slippage model
+    and statutory sell taxes instead of the static base/stress schedules.
+    """
     manifest = snapshot.manifest
     artifact_manifest = registry.read_manifest(request.artifact_id)
     eligible_from = datetime.fromisoformat(artifact_manifest.eligible_from)
@@ -82,6 +89,7 @@ def simulate_portfolio(
         manifest=manifest,
         cost_schedule=base,
         stress_cost_schedule=stress,
+        cost_evidence=cost_evidence,
     )
     return backtester.run(
         frame, artifacts, initial_portfolio, backtest_request
