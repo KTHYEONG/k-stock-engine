@@ -23,6 +23,17 @@ def main(args: list[str] | None = None) -> int:
     calendar.add_argument("--end", required=True, type=date.fromisoformat)
     calendar.add_argument("--output", required=True, type=Path)
 
+    calendar_resume = subparsers.add_parser("krx-calendar-resume")
+    calendar_resume.add_argument("--start", required=True, type=date.fromisoformat)
+    calendar_resume.add_argument("--end", required=True, type=date.fromisoformat)
+    calendar_resume.add_argument("--output-dir", required=True, type=Path)
+
+    calendar_merge = subparsers.add_parser("krx-calendar-merge")
+    calendar_merge.add_argument("--start", required=True, type=date.fromisoformat)
+    calendar_merge.add_argument("--end", required=True, type=date.fromisoformat)
+    calendar_merge.add_argument("--input-dir", required=True, type=Path)
+    calendar_merge.add_argument("--output", required=True, type=Path)
+
     for name in ("dart-disclosures", "dart-actions"):
         command = subparsers.add_parser(name)
         command.add_argument("--start", required=True, type=date.fromisoformat)
@@ -40,6 +51,14 @@ def main(args: list[str] | None = None) -> int:
         collector = KRXEvidenceCollector()
         collector.write_calendar(
             parsed.output, collector.collect_session_calendar(parsed.start, parsed.end)
+        )
+    elif parsed.command == "krx-calendar-resume":
+        collector = KRXEvidenceCollector()
+        collector.collect_calendar_partitions(parsed.output_dir, parsed.start, parsed.end)
+    elif parsed.command == "krx-calendar-merge":
+        collector = KRXEvidenceCollector()
+        collector.merge_calendar_partitions(
+            parsed.input_dir, parsed.start, parsed.end, parsed.output
         )
     else:
         dart_collector = OpenDartEvidenceCollector()
