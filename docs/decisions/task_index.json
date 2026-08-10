@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_RESEARCH_DATA_FOUNDATION",
+      "date": "2026-08-10",
+      "adr_id": "ADR_20260810_STOCK_RESEARCH_DATA_FOUNDATION",
+      "domain": "stocks",
+      "title": "Stock research data foundation and provisional snapshot",
+      "why": "Research and backtest inputs lacked one immutable catalog binding evidence, canonical panels, features, and labels.",
+      "resolution": "Registered available evidence and immutable dataset versions, built provisional base/feature/label panels, created a hash-bound provisional snapshot, and verified bounded reads.",
+      "impact": "Research can reproduce a provisional 2016-01-04..2026-03-03 snapshot without changing legacy or existing curated data; research certification remains blocked by incomplete historical evidence, verified corporate actions, and costs."
+    },
+    {
       "task_id": "TASK_KRX_CALENDAR_RESUMABLE_COLLECTION",
       "date": "2026-08-10",
       "adr_id": "ADR_20260810_KRX_CALENDAR_RESUMABLE_COLLECTION",
