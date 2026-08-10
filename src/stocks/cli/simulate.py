@@ -17,6 +17,7 @@ from src.core.paths import (
     STOCK_CATALOG_ROOT,
     STOCK_DERIVED_ROOT,
 )
+from src.stocks.data.costs import load_cost_evidence
 from src.stocks.data.repositories import (
     ResearchDataRepository,
     resolve_snapshot_for_mode,
@@ -64,6 +65,11 @@ def main(args: list[str] | None = None) -> int:
     )
 
     registry = ModelArtifactRegistry(parsed.registry)
+    cost_evidence = None
+    if snapshot.costs is not None:
+        cost_evidence = load_cost_evidence(
+            Path(snapshot.costs.path), snapshot.research_range
+        )
     request = SimulationRequest(
         artifact_id=parsed.artifact_id,
         decision_time=decision_time,
@@ -71,7 +77,7 @@ def main(args: list[str] | None = None) -> int:
         max_single_weight=settings.max_single_weight,
         max_exposure=settings.max_exposure,
     )
-    result = simulate_portfolio(composed, registry, request)
+    result = simulate_portfolio(composed, registry, request, cost_evidence=cost_evidence)
     logger.info(
         "final_value=%.2f total_return=%.4f", result.final_value, result.total_return
     )
