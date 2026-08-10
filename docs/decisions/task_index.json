@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_HISTORICAL_EVIDENCE_COLLECTION",
+      "date": "2026-08-10",
+      "adr_id": "ADR_20260810_STOCK_HISTORICAL_EVIDENCE_COLLECTION",
+      "domain": "stocks",
+      "title": "Resumable historical KRX and DART evidence collection",
+      "why": "Historical master and disclosure evidence required complete point-in-time coverage, but date-by-date external APIs were slow and concurrent DART requests disconnected.",
+      "resolution": "Collected and cataloged daily KRX historical master evidence, pinned a cost-and-master provisional snapshot, and preserved DART monthly partial partitions as incomplete evidence without false certification.",
+      "impact": "Master and cost evidence now cover the provisional snapshot; DART and corporate actions remain fail-closed until a retrying single-worker resumable collector completes source coverage."
+    },
+    {
       "task_id": "TASK_STOCK_COST_MODEL_HARDENING",
       "date": "2026-08-10",
       "adr_id": "ADR_20260810_STOCK_COST_MODEL_HARDENING",

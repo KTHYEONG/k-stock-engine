@@ -313,7 +313,10 @@
     "testing": "tests/unit/stocks/data/test_evidence.py"
   },
   "src/stocks/data/evidence_collectors.py": {
-    "testing": "tests/unit/stocks/data/test_evidence_collectors.py"
+    "testing": [
+      "tests/unit/stocks/data/test_evidence_collectors.py",
+      "tests/unit/stocks/cli/test_collect_evidence.py"
+    ]
   },
   "src/stocks/cli/collect_evidence.py": {
     "testing": "tests/unit/stocks/cli/test_collect_evidence.py"
