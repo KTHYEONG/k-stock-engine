@@ -1,14 +1,24 @@
 {
   "tasks": [
     {
-      "task_id": "TASK_STOCK_DATA_EVIDENCE_HARDENING",
-      "date": "2026-08-09",
-      "adr_id": "ADR_20260809_STOCK_DATA_EVIDENCE_HARDENING",
+      "task_id": "TASK_KRX_CALENDAR_RESUMABLE_COLLECTION",
+      "date": "2026-08-10",
+      "adr_id": "ADR_20260810_KRX_CALENDAR_RESUMABLE_COLLECTION",
       "domain": "stocks",
-      "title": "Stock data evidence hardening",
-      "why": "Research data lacked reproducible instrument identity, corporate-action coverage, and point-in-time disclosure availability.",
-      "resolution": "Added deterministic evidence artifact loaders, effective-interval validation, conservative date-only disclosure availability, and curation CLI evidence gates.",
-      "impact": "Research and production curation now fail closed without required evidence; current provisional datasets remain unchanged until authoritative KRX/DART/corporate-action artifacts are supplied."
+      "title": "Resumable KRX calendar collection",
+      "why": "One-shot date-by-date KRX calendar collection could block for hours and left no restartable artifact.",
+      "resolution": "Added monthly atomic calendar partitions, resumable manifest validation, fail-closed merge, and explicit collection/merge CLI commands.",
+      "impact": "Historical KRX session calendar collection can resume after API failures without repeating valid months; final calendars are emitted only after complete partition validation."
+    },
+    {
+      "task_id": "TASK_STOCK_DATA_EVIDENCE_HARDENING",
+      "date": "2026-08-10",
+      "adr_id": "ADR_20260810_STOCK_DATA_EVIDENCE_HARDENING",
+      "domain": "stocks",
+      "title": "Stock evidence collection adapters",
+      "why": "Evidence gates were implemented but authoritative KRX and OpenDART collection still needed a reproducible acquisition boundary.",
+      "resolution": "Added KRX instrument/session collectors and OpenDART disclosure/corporate-action candidate collectors with raw receipt timestamps, candidate-only action status, validation tests, and verified sample artifacts.",
+      "impact": "A bounded live collection path now supplies instrument identity and disclosure timing evidence; corporate-action adjustment remains fail-closed until effective dates and adjustment factors are independently verified."
     },
     {
       "task_id": "TASK_STOCK_DATA_QUALITY_HARDENING",
