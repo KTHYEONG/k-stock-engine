@@ -14,13 +14,14 @@ datasets fail closed.
 """
 from __future__ import annotations
 
+import calendar
 import hashlib
 import json
 import os
 import shutil
 import uuid
 from dataclasses import asdict
-from datetime import datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import polars as pl
@@ -38,6 +39,12 @@ MANIFEST_NAME = "dataset_manifest.json"
 CONTENT_MANIFEST_NAME = "content_manifest.json"
 _PARTITION_DIRNAME = "partitions"
 _PARTITION_COLUMNS = ("year", "month")
+
+# Per-process verification cache: (absolute dataset dir, content_hash) ->
+# verified partition paths. A partition digest is checked once per process for
+# a given physical dataset; the cache is never persisted across processes (spec
+# serving rule: keyed only for a single process).
+_VERIFIED_PARTITIONS: dict[tuple[str, str], frozenset[str]] = {}
 
 
 def canonical_content_hash(frame: pl.DataFrame, ordered_columns: list[str]) -> str:
@@ -258,18 +265,15 @@ class ParquetDatasetStore:
             )
         with content_path.open("r", encoding="utf-8") as fh:
             content = json.load(fh)
-        output = content.get("output") or {}
+        output = _content_output(content)
         if output.get("schema_hash") != manifest.schema_hash:
             raise ValueError("content manifest schema hash does not match dataset manifest")
 
-        for entry in content.get("partitions") or []:
-            part_path = dataset_dir / str(entry.get("path", ""))
-            if not part_path.exists():
-                raise FileNotFoundError(f"missing partition {entry.get('path')!r}")
-            if file_sha256(part_path) != entry.get("sha256"):
-                raise ValueError(f"tampered partition {entry.get('path')!r}")
+        self._verify_entries(
+            dataset_dir, _content_partitions(content), manifest.content_hash
+        )
 
-        columns = [str(c) for c in output.get("column_order", [])]
+        columns = _content_column_order(content)
         frame = pl.read_parquet(partitions_dir, hive_partitioning=True)
         recomputed = canonical_content_hash(frame, columns)
         if recomputed != manifest.content_hash:
@@ -279,6 +283,186 @@ class ParquetDatasetStore:
         key_columns = [c for c in ("instrument_id", "session") if c in columns]
         sort_columns = key_columns or columns[:1]
         return frame.select(columns).sort(sort_columns)
+
+    def content_columns(self, dataset_id: str) -> list[str]:
+        """Return the declared column order of a partitioned dataset."""
+        _, _, content = self._load_verified_layout(dataset_id)
+        return _content_column_order(content)
+
+    def bounded_partition_paths(
+        self,
+        dataset_id: str,
+        *,
+        session_start: date,
+        session_end: date,
+    ) -> tuple[Path, ...]:
+        """Return the exact partition files a bounded read would scan.
+
+        The manifest and content manifest are validated and the per-partition
+        digests of the selected partitions are verified before the paths are
+        returned, so the caller can assert that only the intersecting
+        ``year=YYYY/month=MM`` partitions are touched.
+        """
+        dataset_dir, manifest, content = self._load_verified_layout(dataset_id)
+        entries = _select_entries(content, session_start, session_end)
+        paths = tuple(dataset_dir / str(entry["path"]) for entry in entries)
+        self._verify_entries(dataset_dir, entries, manifest.content_hash)
+        return paths
+
+    def read_bounded(
+        self,
+        dataset_id: str,
+        expected_asset_kind: AssetKind,
+        expected_feature_set: str,
+        decision_time: datetime,
+        *,
+        session_start: date,
+        session_end: date,
+        columns: list[str],
+    ) -> pl.DataFrame:
+        """Lazily read only the partitions/columns that intersect the request.
+
+        Only the monthly partitions whose declared session range intersects
+        ``[session_start, session_end]`` are scanned, and only the requested
+        ``columns`` are projected; the session range is filtered before
+        collect. Per-partition digests of the selected partitions are verified
+        (cached per process). The result equals a full read followed by the
+        same projection/filter.
+        """
+        dataset_dir, manifest, content = self._load_verified_layout(dataset_id)
+        validate_dataset_manifest(
+            manifest, expected_asset_kind, expected_feature_set, decision_time
+        )
+        column_order = _content_column_order(content)
+        missing = [c for c in columns if c not in column_order]
+        if missing:
+            raise ValueError(
+                f"bounded read requests columns absent from dataset {dataset_id}: {missing}"
+            )
+        entries = _select_entries(content, session_start, session_end)
+        if not entries:
+            return pl.DataFrame({column: [] for column in columns})
+        self._verify_entries(dataset_dir, entries, manifest.content_hash)
+
+        paths = [dataset_dir / str(entry["path"]) for entry in entries]
+        scan = (
+            pl.scan_parquet(paths)
+            .filter(
+                (pl.col("session") >= datetime.combine(session_start, datetime.min.time(), UTC))
+                & (pl.col("session") <= datetime.combine(session_end, datetime.min.time(), UTC))
+            )
+            .select(columns)
+        )
+        frame = scan.collect()
+        key_columns = [c for c in ("instrument_id", "session") if c in columns]
+        sort_columns = key_columns or columns[:1]
+        return frame.sort(sort_columns)
+
+    def _load_verified_layout(
+        self, dataset_id: str
+    ) -> tuple[Path, DatasetManifest, dict[str, object]]:
+        dataset_dir = self.root / dataset_id
+        manifest_path = dataset_dir / MANIFEST_NAME
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"no manifest for dataset {dataset_id!r}")
+        with manifest_path.open("r", encoding="utf-8") as fh:
+            manifest = _manifest_from_dict(json.load(fh))
+        partitions_dir = dataset_dir / _PARTITION_DIRNAME
+        if not partitions_dir.exists():
+            raise ValueError(
+                f"bounded read requires a partitioned dataset, got {dataset_id!r}"
+            )
+        content_path = dataset_dir / CONTENT_MANIFEST_NAME
+        if not content_path.exists():
+            raise ValueError(
+                f"partitioned dataset {dataset_id!r} has no content manifest"
+            )
+        with content_path.open("r", encoding="utf-8") as fh:
+            content = json.load(fh)
+        output = _content_output(content)
+        if output.get("schema_hash") != manifest.schema_hash:
+            raise ValueError("content manifest schema hash does not match dataset manifest")
+        return dataset_dir, manifest, content
+
+    def _verify_entries(
+        self,
+        dataset_dir: Path,
+        entries: list[dict[str, object]],
+        content_hash: str,
+    ) -> None:
+        cache_key = (str(dataset_dir.resolve()), content_hash)
+        verified = _VERIFIED_PARTITIONS.get(cache_key, frozenset())
+        for entry in entries:
+            path = str(entry.get("path", ""))
+            if path in verified:
+                continue
+            part_path = dataset_dir / path
+            if not part_path.exists():
+                raise FileNotFoundError(f"missing partition {path!r}")
+            if file_sha256(part_path) != entry.get("sha256"):
+                raise ValueError(f"tampered partition {path!r}")
+        _VERIFIED_PARTITIONS[cache_key] = verified.union(str(e["path"]) for e in entries)
+
+
+def _content_output(content: dict[str, object]) -> dict[str, object]:
+    output = content.get("output")
+    if not isinstance(output, dict):
+        raise ValueError("content manifest has no output object")
+    return output
+
+
+def _content_column_order(content: dict[str, object]) -> list[str]:
+    raw_order = _content_output(content).get("column_order")
+    if not isinstance(raw_order, list):
+        raise ValueError("content manifest column_order must be a list")
+    return [str(column) for column in raw_order]
+
+
+def _content_partitions(content: dict[str, object]) -> list[dict[str, object]]:
+    raw = content.get("partitions")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("content manifest partitions must be a list")
+    return [entry for entry in raw if isinstance(entry, dict)]
+
+
+def _select_entries(
+    content: dict[str, object],
+    session_start: date,
+    session_end: date,
+) -> list[dict[str, object]]:
+    """Select content-manifest partitions whose month intersects ``[start, end]``.
+
+    Selection is by the partition's declared ``year=YYYY/month=MM`` bucket, so a
+    reader requesting January 2024 scans ``year=2024/month=01`` even when the
+    observed sessions within it are narrower; row-level session filtering still
+    happens inside the lazy scan before collect.
+    """
+    selected: list[dict[str, object]] = []
+    for entry in _content_partitions(content):
+        year_month = _partition_year_month(str(entry.get("path", "")))
+        if year_month is None:
+            continue
+        year, month = year_month
+        part_start = date(year, month, 1)
+        part_end = date(year, month, calendar.monthrange(year, month)[1])
+        if part_start <= session_end and part_end >= session_start:
+            selected.append(entry)
+    return selected
+
+
+def _partition_year_month(path: str) -> tuple[int, int] | None:
+    """Parse ``year=YYYY/month=MM`` segments out of a partition path."""
+    year = month = None
+    for segment in path.split("/"):
+        if segment.startswith("year="):
+            year = int(segment[len("year=") :])
+        elif segment.startswith("month="):
+            month = int(segment[len("month=") :])
+    if year is None or month is None:
+        return None
+    return year, month
 
 
 def _manifest_to_dict(manifest: DatasetManifest) -> dict[str, object]:
