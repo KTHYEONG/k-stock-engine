@@ -19,6 +19,7 @@ import polars as pl
 from src.core.instruments import AssetKind
 
 TARGET_PREFIXES = ("target_", "label_")
+_V2_FEATURE_PREFIX = "feature__"
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +138,7 @@ class StableRankComposite:
         self._factor_weights: dict[str, float] = {}
         self._orientation: dict[str, float] = {}
         self._winsor: dict[str, tuple[float, float]] = {}
+        self._resolved_factors: dict[str, str | None] = {}
         self._no_trade = True
 
     @property
@@ -157,7 +159,10 @@ class StableRankComposite:
         del validation
         if self.label_column not in train.columns:
             raise ValueError(f"missing label column {self.label_column!r} in training fold")
-        missing = [f for f in self.factors if f not in train.columns]
+        self._resolved_factors = {
+            factor: self._resolve_factor_column(train, factor) for factor in self.factors
+        }
+        missing = [f for f in self.factors if self._resolved_factors[f] is None]
         if missing:
             raise ValueError(f"missing factor columns {missing} in training fold")
 
@@ -212,9 +217,10 @@ class StableRankComposite:
             return frame.with_columns(pl.lit(0.0).alias("pred_score"))
         rank_exprs: list[pl.Expr] = []
         for factor in weighted_factors:
+            column = self._factor_column(factor)
             lo, hi = self._winsor[factor]
-            clipped = pl.col(factor).clip(lo, hi)
-            within = pl.col(factor).count().over(self.session_column)
+            clipped = pl.col(column).clip(lo, hi)
+            within = pl.col(column).count().over(self.session_column)
             rank = (
                 ((clipped.rank("average").over(self.session_column) - 1.0) / (within - 1.0))
                 .fill_null(0.5)
@@ -267,12 +273,13 @@ class StableRankComposite:
             raise ValueError(f"predict rejects target/label columns: {offending}")
 
     def _daily_rank_ic(self, frame: pl.DataFrame, factor: str) -> list[float]:
-        sub = frame.filter(pl.col(factor).is_not_null() & pl.col(self.label_column).is_not_null())
+        column = self._factor_column(factor)
+        sub = frame.filter(pl.col(column).is_not_null() & pl.col(self.label_column).is_not_null())
         ics: list[float] = []
         if sub.is_empty() or self.session_column not in sub.columns:
             return ics
         for rows in sub.sort(self.session_column).partition_by(self.session_column):
-            scores = rows[factor].to_numpy().astype(float)
+            scores = rows[column].to_numpy().astype(float)
             labels = rows[self.label_column].to_numpy().astype(float)
             if len(scores) < 2 or np.std(scores) == 0.0 or np.std(labels) == 0.0:
                 continue
@@ -302,10 +309,26 @@ class StableRankComposite:
         return float(np.quantile(means, self.config.alpha))
 
     def _winsor_quantiles(self, frame: pl.DataFrame, factor: str) -> tuple[float, float]:
-        values = frame[factor].drop_nulls().to_numpy().astype(float)
+        column = self._factor_column(factor)
+        values = frame[column].drop_nulls().to_numpy().astype(float)
         if values.size == 0:
             return (0.0, 0.0)
         return (
             float(np.quantile(values, self.config.winsor_low)),
             float(np.quantile(values, self.config.winsor_high)),
         )
+
+    def _factor_column(self, factor: str) -> str:
+        column = self._resolved_factors.get(factor, factor)
+        if column is None:
+            raise ValueError(f"factor {factor!r} has no resolved column")
+        return column
+
+    @staticmethod
+    def _resolve_factor_column(frame: pl.DataFrame, factor: str) -> str | None:
+        if factor in frame.columns:
+            return factor
+        prefixed = f"{_V2_FEATURE_PREFIX}{factor}"
+        if prefixed in frame.columns:
+            return prefixed
+        return None
