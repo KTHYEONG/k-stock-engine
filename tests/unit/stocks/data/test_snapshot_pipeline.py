@@ -30,8 +30,10 @@ from src.stocks.data.repositories import (
     ResearchDataRepository,
     resolve_snapshot_for_mode,
 )
+from src.stocks.data.readiness import validate_selected_feature_readiness
 from src.stocks.research.labels import LabelDefinition
 from src.storage.parquet_datasets import ParquetDatasetStore
+from tests.fixtures.stocks.helpers import feature_readiness_dataset
 
 DATES = [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4), date(2024, 1, 5), date(2024, 1, 8)]
 GENERATED = datetime(2026, 1, 1, tzinfo=UTC)
@@ -233,6 +235,26 @@ class TestSnapshotPipeline:
         assert "feature__log_return_5d" in frame.columns
         assert "feature__total_assets" in frame.columns
         assert "feature__total_assets_right" not in frame.columns
+
+    def test_readiness_accepts_usable_and_rejects_unusable_without_mutation(
+        self, tmp_path
+    ) -> None:
+        pipeline = build_pipeline(tmp_path)
+        report = validate_selected_feature_readiness(
+            pipeline["derived"] / "features_v1", ("log_return_5d",)
+        )
+        assert report.total_rows == len(DATES)
+        assert report.selected["log_return_5d"].non_null_count == len(DATES)
+
+        dataset_dir = feature_readiness_dataset(tmp_path / "readiness")
+        partition_files = sorted((dataset_dir / "partitions").rglob("*.parquet"))
+        manifest_before = (dataset_dir / "content_manifest.json").read_bytes()
+        with pytest.raises(ValueError, match="fully null"):
+            validate_selected_feature_readiness(dataset_dir, ("inactive",))
+        with pytest.raises(ValueError, match="non-finite"):
+            validate_selected_feature_readiness(dataset_dir, ("bad",))
+        assert sorted((dataset_dir / "partitions").rglob("*.parquet")) == partition_files
+        assert (dataset_dir / "content_manifest.json").read_bytes() == manifest_before
 
     def test_snapshot_resolves_and_composes(self, tmp_path) -> None:
         pipeline = build_pipeline(tmp_path)
