@@ -14,7 +14,11 @@ from src.stocks.trading.allocation_policy import AllocationPolicy
 from src.stocks.trading.simulator import StockSimulator
 from src.stocks.workflows.contracts import TrainingRequest
 from src.stocks.workflows.train_model import train_model
-from tests.fixtures.stocks.helpers import stock_instrument_df, stock_manifest
+from tests.fixtures.stocks.helpers import (
+    stock_instrument_df,
+    stock_v2_composed_df,
+    stock_v2_manifest,
+)
 
 
 def scored_panel(n_sessions: int = 30, n_tickers: int = 5) -> pl.DataFrame:
@@ -193,72 +197,73 @@ class TestStockSimulator:
 
 class TestTrainWiring:
     def test_run_training_publishes_artifact(self, tmp_path) -> None:
-        df = stock_instrument_df(n_sessions=80, n_tickers=3, horizon=5)
-        manifest = stock_manifest(columns=df.columns, horizon=5)
+        df = stock_v2_composed_df(n_sessions=80, n_tickers=3)
+        manifest = stock_v2_manifest(columns=df.columns)
         registry = ModelArtifactRegistry(tmp_path / "artifacts")
         snapshot = DatasetSnapshot(manifest=manifest, frame=df)
         model_manifest = train_model(
             snapshot,
             registry,
-            TrainingRequest(artifact_id="stock_alpha_v1_20240101", n_folds=3),
+            TrainingRequest(artifact_id="stock_alpha_v2_20240101", n_folds=3),
         )
-        assert model_manifest.artifact_id == "stock_alpha_v1_20240101"
-        assert model_manifest.model_type == "stable_rank_composite"
-        assert model_manifest.eligible_from != "2024-01-01T00:00:00+00:00"
+        assert model_manifest.artifact_id == "stock_alpha_v2_20240101"
+        assert model_manifest.model_type == "lambdarank_blend"
+        assert model_manifest.eligible_from == df["session"].min().isoformat()
 
     def test_run_training_writes_evidence_metrics(self, tmp_path) -> None:
         from src.stocks.research.artifacts import METRICS_FILENAME
         import json
 
-        df = stock_instrument_df(n_sessions=80, n_tickers=3, horizon=5)
-        manifest = stock_manifest(columns=df.columns, horizon=5)
+        df = stock_v2_composed_df(n_sessions=80, n_tickers=3)
+        manifest = stock_v2_manifest(columns=df.columns)
         artifact_root = tmp_path / "artifacts"
         registry = ModelArtifactRegistry(artifact_root)
         snapshot = DatasetSnapshot(manifest=manifest, frame=df)
         train_model(
             snapshot,
             registry,
-            TrainingRequest(artifact_id="stock_alpha_v1_20240101", n_folds=3),
+            TrainingRequest(artifact_id="stock_alpha_v2_20240101", n_folds=3),
         )
-        metrics_path = artifact_root / "stock_alpha_v1_20240101" / METRICS_FILENAME
+        metrics_path = artifact_root / "stock_alpha_v2_20240101" / METRICS_FILENAME
         assert metrics_path.exists()
         payload = json.loads(metrics_path.read_text())
-        assert payload["n_folds_evaluated"] >= 2
+        assert payload["promoted"] is False
+        assert payload["no_trade"] is True
         assert "promotion_reasons" in payload
         assert "ledger_metrics" in payload
 
     def test_training_rejects_temporal_leakage(self, tmp_path) -> None:
         from src.core.time import TemporalViolationError
 
-        df = stock_instrument_df(n_sessions=30, n_tickers=2)
+        df = stock_v2_composed_df(n_sessions=30, n_tickers=2)
         bad = df.with_columns(
             pl.when(pl.col("session_index") == 10)
             .then(pl.col("available_time") + pl.duration(hours=2))
             .otherwise(pl.col("observation_time"))
             .alias("observation_time")
         )
-        manifest = stock_manifest(columns=bad.columns, horizon=5)
+        manifest = stock_v2_manifest(columns=bad.columns)
         registry = ModelArtifactRegistry(tmp_path / "artifacts")
         with pytest.raises(TemporalViolationError):
             train_model(
                 DatasetSnapshot(manifest=manifest, frame=bad),
                 registry,
-                TrainingRequest(artifact_id="leak_v1", n_folds=2),
+                TrainingRequest(artifact_id="leak_v2", n_folds=2),
             )
 
     def test_duplicate_version_publish_is_rejected(self, tmp_path) -> None:
-        df = stock_instrument_df(n_sessions=80, n_tickers=3, horizon=5)
-        manifest = stock_manifest(columns=df.columns, horizon=5)
+        df = stock_v2_composed_df(n_sessions=80, n_tickers=3)
+        manifest = stock_v2_manifest(columns=df.columns)
         registry = ModelArtifactRegistry(tmp_path / "artifacts")
         snapshot = DatasetSnapshot(manifest=manifest, frame=df)
         train_model(
             snapshot,
             registry,
-            TrainingRequest(artifact_id="stock_alpha_v1_20240101", n_folds=3),
+            TrainingRequest(artifact_id="stock_alpha_v2_20240101", n_folds=3),
         )
         with pytest.raises(ValueError, match="already exists"):
             train_model(
                 snapshot,
                 registry,
-                TrainingRequest(artifact_id="stock_alpha_v1_20240101", n_folds=3),
+                TrainingRequest(artifact_id="stock_alpha_v2_20240101", n_folds=3),
             )
