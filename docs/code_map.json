@@ -320,5 +320,9 @@
   },
   "src/stocks/cli/collect_evidence.py": {
     "testing": "tests/unit/stocks/cli/test_collect_evidence.py"
+  },
+  "src/stocks/data/readiness.py": {
+    "architecture": "docs/specs/dart_dataset_readiness.md",
+    "testing": "tests/unit/stocks/data/test_readiness.py"
   }
 }

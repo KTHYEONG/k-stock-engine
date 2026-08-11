@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, UTC
 from math import inf
+from pathlib import Path
 
 import polars as pl
 
@@ -16,6 +17,11 @@ from src.stocks.data.costs import (
     LiquidityModelSpec,
     SellTaxRule,
     SourceRecord,
+)
+from src.storage.parquet_datasets import (
+    HIVE_PARTITION_LAYOUT,
+    ParquetDatasetStore,
+    canonical_content_hash,
 )
 
 
@@ -177,3 +183,50 @@ def publish_baseline_artifact(
     )
     registry.write_metrics(artifact_id, {"promoted": promoted})
     return artifact_id
+
+
+def feature_readiness_dataset(root: Path) -> Path:
+    """Build a partitioned feature dataset for readiness-gate tests.
+
+    Columns: ``feature__overnight_ret`` (all finite), ``feature__ret_21_60d``
+    (warm-up nulls in January only), ``feature__inactive`` (fully null), and
+    ``feature__bad`` (January nulls, February +infinity).
+    """
+    rows = []
+    for i in range(4):
+        month = 1 if i < 2 else 2
+        rows.append(
+            {
+                "instrument_id": f"KRX:0000{i + 1}",
+                "session": datetime(2024, month, 2 + i % 2, tzinfo=UTC),
+                "feature__overnight_ret": 0.001 * (i + 1),
+                "feature__ret_21_60d": None if month == 1 else 0.01 * (i + 1),
+                "feature__inactive": None,
+                "feature__bad": None if i < 2 else inf,
+            }
+        )
+    frame = pl.DataFrame(rows)
+    store = ParquetDatasetStore(root)
+    manifest = make_manifest(
+        asset_kind=AssetKind.STOCK,
+        columns=frame.columns,
+        feature_set="stock_alpha_v1",
+        label_definition="fwd_ret_2d",
+        label_horizon_sessions=2,
+        time_start=datetime(2024, 1, 2, tzinfo=UTC),
+        time_end=datetime(2024, 2, 3, tzinfo=UTC),
+        provider_version="fixture",
+        universe_policy_version="fixture",
+        row_count=frame.height,
+        schema_version="v2",
+        content_hash=canonical_content_hash(frame, frame.columns),
+        storage_layout=HIVE_PARTITION_LAYOUT,
+    )
+    return store.write_partitioned(
+        frame,
+        dataset_id="features_readiness_v1",
+        manifest=manifest,
+        expected_feature_set="stock_alpha_v1",
+        decision_time=datetime(2026, 1, 1, tzinfo=UTC),
+        content_manifest={"curation_version": "curation-v1"},
+    )
