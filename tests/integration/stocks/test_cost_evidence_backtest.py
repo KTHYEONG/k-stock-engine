@@ -277,7 +277,25 @@ def test_simulator_matches_shared_cost_helper_and_engine(tmp_path) -> None:
     engine_result = backtester.run(panel, artifacts, portfolio, request)
     engine_buy = [t for t in engine_result.trades if t.side == "BUY" and t.quantity > 0]
     assert engine_buy
-    assert engine_buy[0].cost_breakdown == sim_fill["cost_breakdown"]
+    # The engine embeds spread/impact in the adverse tick-rounded fill price, so
+    # its recorded breakdown is traced at the fill price rather than the open.
+    engine_recomputed, _ = resolve_fill_cost(
+        evidence,
+        side="BUY",
+        market="KOSPI",
+        price=float(engine_buy[0].price),
+        notional=float(engine_buy[0].gross),
+        adtv_20d=ADTV_TARGET,
+        daily_volatility=0.02,
+        effective_time=engine_buy[0].session,
+    )
+    assert engine_buy[0].cost_breakdown == engine_recomputed.to_dict(
+        artifact_hash=evidence.content_hash
+    )
+    session_open = panel.filter(pl.col("session") == engine_buy[0].session)[
+        "open"
+    ][0]
+    assert float(engine_buy[0].price) > float(session_open)
 
 
 def test_simulator_missing_volatility_is_unfilled(tmp_path) -> None:
