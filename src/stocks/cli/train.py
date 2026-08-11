@@ -29,6 +29,8 @@ from src.stocks.workflows.train_model import train_model
 
 logger = logging.getLogger("stocks.cli.train")
 
+STOCK_ALPHA_V2_FEATURE_SET = "stock_alpha_v2"
+
 
 def main(args: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Train a stock baseline model artifact")
@@ -58,9 +60,9 @@ def main(args: list[str] | None = None) -> int:
         feature_root=parsed.feature_root,
         label_root=parsed.label_root,
     )
-    composed = repository.compose_training_snapshot(
+    composed = repository.compose_labeled_training_snapshot(
         snapshot,
-        feature_set=settings.feature_set,
+        feature_set=STOCK_ALPHA_V2_FEATURE_SET,
         decision_time=decision_time,
     )
 
@@ -69,6 +71,10 @@ def main(args: list[str] | None = None) -> int:
         artifact_id=parsed.artifact_id,
         n_folds=settings.n_folds,
         embargo_sessions=settings.embargo_sessions,
+        top_k=20,
+        max_single_weight=0.08,
+        max_exposure=0.90,
+        participation_limit=0.005,
     )
     manifest = train_model(composed, registry, request)
     logger.info("published artifact %s", manifest.artifact_id)
