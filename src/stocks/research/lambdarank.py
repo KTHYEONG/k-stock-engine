@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable
-from typing import cast
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 import lightgbm as lgb
 import numpy as np
@@ -34,6 +34,33 @@ logger = logging.getLogger("stocks.research.lambdarank")
 LAMBDARANK_WEIGHT = 0.50
 STABLE_WEIGHT = 0.50
 _V2_FEATURE_PREFIX = "feature__"
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedLambdaRankFold:
+    """Immutable per-tuning-fold inputs shared by every search candidate.
+
+    All matrices and relevance labels are prepared once per fold and reused
+    verbatim by every ``fit_trial`` call so a candidate never repeats Polars
+    filtering, sorting, matrix conversion, group construction, or
+    observation-weight construction. Arrays are C-contiguous with the pinned
+    dtype and are read-only after preparation.
+    """
+
+    train_matrix: np.ndarray
+    train_relevance: np.ndarray
+    train_group_sizes: list[int]
+    train_weights: np.ndarray
+    validation_matrix: np.ndarray | None
+    validation_relevance: np.ndarray | None
+    validation_group_sizes: list[int] | None
+    predictor_columns: list[str]
+
+
+def _as_readonly(array: np.ndarray) -> np.ndarray:
+    """Pin an array read-only so no later candidate can mutate cached inputs."""
+    array.setflags(write=False)
+    return array
 
 
 class LambdaRankConfig:
@@ -197,18 +224,27 @@ class LambdaRankBlendModel:
         train: pl.DataFrame,
         validation: pl.DataFrame,
         stable_scores: pl.DataFrame,
+        *,
+        prepared: PreparedLambdaRankFold | None = None,
+        callbacks: Sequence[Callable[..., object]] = (),
     ) -> bool:
         """Fit only the LambdaRank booster, reusing cached stable scores.
 
         ``stable_scores`` must carry ``(session, instrument_id, pred_score)``
         and is invariant across every LambdaRank search parameter, so the trial
-        fast path never refits the StableRank composite. Returns whether the
-        booster fit succeeded; the legacy public ``fit``/``predict`` path
-        remains the final-model path and yields identical blend scores for
-        identical data and configuration.
+        fast path never refits the StableRank composite. When ``prepared`` is
+        supplied, the immutable fold matrices are reused and no Polars
+        filtering, sorting, group, weight, or matrix construction is repeated.
+        Supplied ``callbacks`` are appended to the LightGBM early-stopping
+        callback and a callback-raised ``optuna.TrialPruned`` propagates.
+        Returns whether the booster fit succeeded; the legacy public
+        ``fit``/``predict`` path remains the final-model path and yields
+        identical blend scores for identical data and configuration.
         """
         self._stable_scores_cache = stable_scores
-        lambda_ok = self._fit_lambdarank(train, validation)
+        lambda_ok = self._fit_lambdarank(
+            train, validation, prepared=prepared, callbacks=callbacks
+        )
         self._no_trade = not lambda_ok
         return lambda_ok
 
@@ -291,7 +327,16 @@ class LambdaRankBlendModel:
             params=params,
         )
 
-    def _fit_lambdarank(self, train: pl.DataFrame, validation: pl.DataFrame) -> bool:
+    def _fit_lambdarank(
+        self,
+        train: pl.DataFrame,
+        validation: pl.DataFrame,
+        *,
+        prepared: PreparedLambdaRankFold | None = None,
+        callbacks: Sequence[Callable[..., object]] = (),
+    ) -> bool:
+        if prepared is not None:
+            return self._fit_lambdarank_prepared(prepared, callbacks)
         missing = [c for c in self.features if not self._resolve_column(train, c)]
         if missing:
             self._excluded_features = missing
@@ -345,13 +390,16 @@ class LambdaRankBlendModel:
                     params={"verbosity": -1},
                 )
 
-        callbacks = cast("list[Callable[..., object]]", [lgb.early_stopping(self.config.early_stopping_rounds)])
+        callback_chain: list[Callable[..., object]] = [
+            lgb.early_stopping(self.config.early_stopping_rounds)
+        ]
+        callback_chain.extend(callbacks)
         self._booster = lgb.train(
             self.config.lgb_params(),
             train_set,
             num_boost_round=self.config.n_estimators,
             valid_sets=[valid_set] if valid_set is not None else [train_set],
-            callbacks=callbacks,
+            callbacks=callback_chain,
         )
         importance = self._booster.feature_importance("gain")
         self._feature_gains = dict(
@@ -366,6 +414,119 @@ class LambdaRankBlendModel:
             for name, col in zip(self.features, self._resolve_predictor_columns(train), strict=False)
         }
         return True
+
+    def _fit_lambdarank_prepared(
+        self,
+        prepared: PreparedLambdaRankFold,
+        callbacks: Sequence[Callable[..., object]],
+    ) -> bool:
+        """Train the booster on pre-prepared immutable fold matrices."""
+        if not prepared.predictor_columns:
+            return False
+        self._predictor_columns = list(prepared.predictor_columns)
+        self._train_group_count = len(prepared.train_group_sizes)
+        train_set = lgb.Dataset(
+            prepared.train_matrix,
+            label=prepared.train_relevance,
+            group=prepared.train_group_sizes,
+            weight=prepared.train_weights,
+            params={"verbosity": -1},
+        )
+        valid_set: lgb.Dataset | None = None
+        if prepared.validation_group_sizes:
+            valid_set = lgb.Dataset(
+                prepared.validation_matrix,
+                label=prepared.validation_relevance,
+                group=prepared.validation_group_sizes,
+                params={"verbosity": -1},
+            )
+        callback_chain: list[Callable[..., object]] = [
+            lgb.early_stopping(self.config.early_stopping_rounds)
+        ]
+        callback_chain.extend(callbacks)
+        self._booster = lgb.train(
+            self.config.lgb_params(),
+            train_set,
+            num_boost_round=self.config.n_estimators,
+            valid_sets=[valid_set] if valid_set is not None else [train_set],
+            callbacks=callback_chain,
+        )
+        importance = self._booster.feature_importance("gain")
+        self._feature_gains = dict(
+            zip(
+                self._predictor_columns,
+                (float(v) for v in importance),
+                strict=True,
+            )
+        )
+        return True
+
+    def prepare_fold(
+        self,
+        train: pl.DataFrame,
+        validation: pl.DataFrame,
+    ) -> PreparedLambdaRankFold | None:
+        """Derive the immutable cached fold inputs, or ``None`` when unusable.
+
+        Replicates the legacy ``_fit_lambdarank`` derivation exactly so the
+        prepared and uncached trial paths produce identical boosters. A fold
+        missing features, relevance, predictor rows, or qualifying groups
+        returns ``None``; the group-sum invariant still raises ``ValueError``
+        to keep the fail-closed semantics of the uncached path.
+        """
+        missing = [c for c in self.features if not self._resolve_column(train, c)]
+        if missing:
+            return None
+        if self.relevance_column not in train.columns:
+            return None
+        predictor_columns = self._resolve_predictor_columns(train)
+        if not predictor_columns:
+            return None
+
+        usable = train.filter(pl.col(self.relevance_column).is_not_null())
+        for column in predictor_columns:
+            usable = usable.filter(pl.col(column).is_not_null())
+        if usable.is_empty():
+            return None
+        group_sizes, session_order = self._group_sizes(usable)
+        if not group_sizes:
+            return None
+        ordered = (
+            usable.filter(pl.col(self.session_column).is_in(session_order))
+            .sort(self.session_column)
+        )
+        train_matrix = _as_readonly(self._float32_matrix(ordered, predictor_columns))
+        train_relevance = _as_readonly(
+            ordered[self.relevance_column].cast(pl.Int32).to_numpy()
+        )
+        train_weights = _as_readonly(self._observation_weights(ordered, group_sizes))
+
+        validation_matrix: np.ndarray | None = None
+        validation_relevance: np.ndarray | None = None
+        validation_group_sizes: list[int] | None = None
+        if validation is not None and not validation.is_empty():
+            val_used = validation.filter(pl.col(self.relevance_column).is_not_null())
+            val_group_sizes, _ = self._group_sizes(val_used)
+            if val_group_sizes:
+                val_ordered = val_used.sort(self.session_column)
+                validation_matrix = _as_readonly(
+                    self._float32_matrix(val_ordered, predictor_columns)
+                )
+                validation_relevance = _as_readonly(
+                    val_ordered[self.relevance_column].cast(pl.Int32).to_numpy()
+                )
+                validation_group_sizes = val_group_sizes
+
+        return PreparedLambdaRankFold(
+            train_matrix=train_matrix,
+            train_relevance=train_relevance,
+            train_group_sizes=group_sizes,
+            train_weights=train_weights,
+            validation_matrix=validation_matrix,
+            validation_relevance=validation_relevance,
+            validation_group_sizes=validation_group_sizes,
+            predictor_columns=predictor_columns,
+        )
 
     def _resolve_predictor_columns(self, frame: pl.DataFrame) -> list[str]:
         """Manifest-ordered raw plus rank and sector-demeaned rank columns."""
