@@ -176,3 +176,95 @@ def test_collect_evidence_dart_resume_exposes_no_workers_option() -> None:
                 "4",
             ]
         )
+
+
+def test_collect_evidence_dart_publish_requires_catalog_root_and_name() -> None:
+    with pytest.raises(SystemExit):
+        collect_evidence.main(
+            [
+                "dart-disclosures-publish",
+                "--start",
+                "2024-01-01",
+                "--end",
+                "2024-01-31",
+                "--input-dir",
+                "parts",
+                "--output",
+                "disclosures.json",
+            ]
+        )
+    with pytest.raises(SystemExit):
+        collect_evidence.main(
+            [
+                "dart-disclosures-publish",
+                "--start",
+                "2024-01-01",
+                "--end",
+                "2024-01-31",
+                "--input-dir",
+                "parts",
+                "--output",
+                "disclosures.json",
+                "--catalog-root",
+                "catalog",
+            ]
+        )
+
+
+def test_collect_evidence_dart_publish_invokes_publication(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("OPENDART_API_KEY", "fixture-key")
+    calls: list[tuple[str, str, str]] = []
+
+    def fake_publish(
+        self: OpenDartEvidenceCollector,
+        input_dir,
+        start,
+        end,
+        output_path,
+        catalog_root,
+        name,
+    ) -> object:
+        calls.append((str(output_path), str(catalog_root), name))
+        return type(
+            "Entry",
+            (),
+            {
+                "name": name,
+                "content_hash": "abc",
+                "row_count": 2,
+                "coverage": type(
+                    "C", (), {"start": start, "end": end}
+                )(),
+            },
+        )()
+
+    monkeypatch.setattr(
+        OpenDartEvidenceCollector, "publish_disclosure_dataset", fake_publish
+    )
+    assert (
+        collect_evidence.main(
+            [
+                "dart-disclosures-publish",
+                "--start",
+                "2024-01-01",
+                "--end",
+                "2024-01-31",
+                "--input-dir",
+                str(tmp_path / "parts"),
+                "--output",
+                str(tmp_path / "disclosures.json"),
+                "--catalog-root",
+                str(tmp_path / "catalog"),
+                "--name",
+                "dart_disclosures_20240101_20240131_v1",
+            ]
+        )
+        == 0
+    )
+    assert calls == [
+        (
+            str(tmp_path / "disclosures.json"),
+            str(tmp_path / "catalog"),
+            "dart_disclosures_20240101_20240131_v1",
+        )
+    ]
