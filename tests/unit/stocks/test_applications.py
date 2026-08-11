@@ -13,7 +13,7 @@ from src.stocks.workflows.generate_intents import generate_intents
 from src.stocks.workflows.score_model import score_model
 from src.stocks.workflows.simulate_portfolio import simulate_portfolio
 from src.stocks.workflows.train_model import train_model
-from tests.fixtures.stocks.helpers import stock_instrument_df, stock_manifest
+from tests.fixtures.stocks.helpers import stock_v2_composed_df, stock_v2_manifest
 
 
 class TestGenerateIntents:
@@ -36,14 +36,14 @@ class TestGenerateIntents:
 
 
 def build_trained_snapshot(tmp_path) -> tuple[DatasetSnapshot, ModelArtifactRegistry]:
-    df = stock_instrument_df(n_sessions=60, n_tickers=3, horizon=5)
-    manifest = stock_manifest(columns=df.columns, horizon=5)
+    df = stock_v2_composed_df(n_sessions=60, n_tickers=3)
+    manifest = stock_v2_manifest(columns=df.columns)
     registry = ModelArtifactRegistry(tmp_path / "artifacts")
     snapshot = DatasetSnapshot(manifest=manifest, frame=df)
     train_model(
         snapshot,
         registry,
-        TrainingRequest(artifact_id="stock_alpha_v1_20240101", n_folds=3),
+        TrainingRequest(artifact_id="stock_alpha_v2_20240101", n_folds=3),
     )
     return snapshot, registry
 
@@ -52,7 +52,7 @@ class TestScoreModelWiring:
     def test_score_model_loads_artifact_and_scores(self, tmp_path) -> None:
         snapshot, registry = build_trained_snapshot(tmp_path)
         decision = datetime(2024, 2, 20, 8, 50, tzinfo=UTC)
-        scored = score_model(snapshot, registry, ScoringRequest(artifact_id="stock_alpha_v1_20240101", decision_time=decision))
+        scored = score_model(snapshot, registry, ScoringRequest(artifact_id="stock_alpha_v2_20240101", decision_time=decision))
         assert not scored.is_empty()
         assert "pred_score" in scored.columns
 
@@ -62,7 +62,7 @@ class TestScoreModelWiring:
         result = simulate_portfolio(
             snapshot,
             registry,
-            SimulationRequest(artifact_id="stock_alpha_v1_20240101", decision_time=decision),
+            SimulationRequest(artifact_id="stock_alpha_v2_20240101", decision_time=decision),
         )
         assert result.final_value > 0
         assert result.total_return is not None
