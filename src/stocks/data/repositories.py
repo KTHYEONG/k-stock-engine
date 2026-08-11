@@ -361,6 +361,123 @@ class ResearchDataRepository:
             columns=list(columns),
         )
 
+    def _read_base_and_features(
+        self,
+        snapshot: ResearchDataSnapshot,
+        *,
+        feature_set: str,
+        decision_time: datetime,
+        research_range: CoverageRange,
+    ) -> tuple[pl.DataFrame, pl.DataFrame, DatasetManifest]:
+        if snapshot.base_panel is None:
+            raise ValueError("snapshot has no base-panel reference")
+        if snapshot.features is None:
+            raise ValueError("snapshot has no feature-panel reference")
+        base = self.read_base_bounded(
+            snapshot.base_panel, decision_time, research_range=research_range
+        )
+        features = self.read_features_bounded(
+            snapshot.features, feature_set, decision_time, research_range=research_range
+        )
+        feature_manifest = self.feature_store.read_manifest(snapshot.features.name)
+        if feature_manifest.feature_set != feature_set:
+            raise ValueError(
+                f"snapshot feature panel {snapshot.features.name} has feature_set "
+                f"{feature_manifest.feature_set!r}, requested {feature_set!r}"
+            )
+        return base, features, feature_manifest
+
+    def compose_labeled_training_snapshot(
+        self,
+        snapshot: ResearchDataSnapshot,
+        *,
+        feature_set: str,
+        decision_time: datetime,
+        research_range: CoverageRange | None = None,
+    ) -> DatasetSnapshot:
+        """Hash-bound inner join of base, feature, and canonical label rows.
+
+        Labels are canonical rows from the label dataset referenced by the
+        snapshot; only rows whose ``label_available_time`` is at or before
+        ``decision_time`` are joined, so a trainer never observes a label that
+        could not have been known at decision time. Every referenced content
+        hash is verified against the snapshot's pinned catalog entry before the
+        frame is returned.
+        """
+        if snapshot.labels is None:
+            raise ValueError("snapshot has no label-panel reference")
+        range_ = research_range or snapshot.research_range
+
+        base, features, feature_manifest = self._read_base_and_features(
+            snapshot, feature_set=feature_set, decision_time=decision_time,
+            research_range=range_,
+        )
+        if snapshot.base_panel is None:
+            raise ValueError("snapshot has no base-panel reference")
+        if snapshot.features is None:
+            raise ValueError("snapshot has no feature-panel reference")
+        base_manifest = self.base_store.read_manifest(snapshot.base_panel.name)
+        _assert_content_hash_matches(base_manifest, snapshot.base_panel)
+        _assert_content_hash_matches(feature_manifest, snapshot.features)
+
+        label_columns = [
+            c
+            for c in self.label_store.content_columns(snapshot.labels.name)
+            if c not in ("instrument_id", "session")
+        ]
+        if not label_columns:
+            raise ValueError(f"label panel {snapshot.labels.name} exposes no label columns")
+        labels = self.read_labels_bounded(
+            snapshot.labels,
+            decision_time,
+            research_range=range_,
+            columns=("instrument_id", "session", *label_columns),
+        )
+
+        available_column = (
+            "label_available_time" if "label_available_time" in labels.columns else None
+        )
+        if available_column is not None:
+            labels = labels.filter(pl.col(available_column) <= decision_time)
+
+        composed = (
+            base.join(features, on=["instrument_id", "session"], how="inner")
+            .join(labels, on=["instrument_id", "session"], how="inner")
+            .sort(["instrument_id", "session"])
+        )
+        if composed.is_empty():
+            raise ValueError("labeled snapshot composition produced no rows")
+
+        label_manifest = self.label_store.read_manifest(snapshot.labels.name)
+        _assert_content_hash_matches(label_manifest, snapshot.labels)
+        from src.core.datasets import DatasetManifest as _DatasetManifest
+
+        merged_manifest = _DatasetManifest(
+            asset_kind=feature_manifest.asset_kind,
+            schema_version=feature_manifest.schema_version,
+            schema_hash=_composed_schema_hash(feature_set, feature_manifest),
+            provider_version=feature_manifest.provider_version,
+            universe_policy_version=feature_manifest.universe_policy_version,
+            universe_policy_hash=feature_manifest.universe_policy_hash,
+            feature_set=feature_manifest.feature_set,
+            feature_set_hash=feature_manifest.feature_set_hash,
+            label_definition=label_manifest.label_definition,
+            label_horizon_sessions=label_manifest.label_horizon_sessions,
+            time_start=feature_manifest.time_start,
+            time_end=feature_manifest.time_end,
+            generated_time=feature_manifest.generated_time,
+            row_count=composed.height,
+            certification=feature_manifest.certification,
+            calendar_hash=feature_manifest.calendar_hash,
+            corporate_action_hash=feature_manifest.corporate_action_hash,
+            cost_source_hash=feature_manifest.cost_source_hash,
+            master_hash=feature_manifest.master_hash,
+            quality_report_hash=feature_manifest.quality_report_hash,
+            content_hash=feature_manifest.content_hash,
+            storage_layout=feature_manifest.storage_layout,
+        )
+        return DatasetSnapshot(manifest=merged_manifest, frame=composed)
+
     def compose_training_snapshot(
         self,
         snapshot: ResearchDataSnapshot,
@@ -401,3 +518,38 @@ class ResearchDataRepository:
         if composed.is_empty():
             raise ValueError("snapshot composition produced no rows")
         return DatasetSnapshot(manifest=feature_manifest, frame=composed)
+
+
+def _assert_content_hash_matches(
+    manifest: DatasetManifest,
+    entry: CatalogEntry,
+) -> None:
+    """Fail closed unless the stored dataset hash equals the catalog pin."""
+    if not manifest.content_hash:
+        raise ValueError(f"stored dataset {entry.name} has no content_hash")
+    if manifest.content_hash != entry.content_hash:
+        raise ValueError(
+            f"stored dataset {entry.name} content hash {manifest.content_hash} "
+            f"does not match catalog pin {entry.content_hash}"
+        )
+
+
+def _composed_schema_hash(
+    feature_set: str,
+    feature_manifest: DatasetManifest,
+) -> str:
+    """Bind the composed snapshot schema to the frozen v2 feature contract.
+
+    The v2 predictor contract is the ordered stock_alpha_v2 allowlist; its
+    contract-hash is what scoring requests must reproduce, so the composed
+    manifest's ``schema_hash`` carries it instead of a column-list hash.
+    """
+    if feature_set != "stock_alpha_v2":
+        return feature_manifest.schema_hash
+    from src.stocks.data.feature_contracts import feature_contract_book_from_allowlist
+    from src.stocks.research.features import stock_alpha_v2_allowlist
+
+    book = feature_contract_book_from_allowlist(
+        feature_set, stock_alpha_v2_allowlist()
+    )
+    return book.schema_hash

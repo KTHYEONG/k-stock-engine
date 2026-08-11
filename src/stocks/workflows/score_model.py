@@ -25,8 +25,29 @@ def score_model(
         decision_time=request.decision_time,
     )
     loaded = registry.load(request.artifact_id, prediction)
-    feature_frame = build_features(research_eligible_frame(snapshot.frame), phase1_allowlist())
+    gated = _drop_label_columns(research_eligible_frame(snapshot.frame))
+    feature_frame = (
+        gated
+        if manifest.feature_set == "stock_alpha_v2"
+        else build_features(gated, phase1_allowlist())
+    )
     scored = loaded.model.predict(feature_frame)
     if scored.is_empty():
         raise ValueError("no rows scored")
     return scored
+
+
+def _drop_label_columns(frame: pl.DataFrame) -> pl.DataFrame:
+    from src.stocks.research.labels import (
+        LABEL_AVAILABLE_COLUMN,
+        RELEVANCE_COLUMN,
+        RESIDUAL_O2O_LABEL,
+    )
+
+    drops = [
+        c
+        for c in frame.columns
+        if c.startswith(("target_", "label_", "residual_"))
+        or c in (LABEL_AVAILABLE_COLUMN, RELEVANCE_COLUMN, RESIDUAL_O2O_LABEL, "fwd_ret_5d")
+    ]
+    return frame.drop(drops)
