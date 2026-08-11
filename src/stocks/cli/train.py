@@ -13,9 +13,10 @@ from pathlib import Path
 
 from src.core.paths import (
     STOCK_ARTIFACT_ROOT,
-    STOCK_CANONICAL_ROOT,
+    STOCK_BASE_PANEL_ROOT,
     STOCK_CATALOG_ROOT,
-    STOCK_DERIVED_ROOT,
+    STOCK_FEATURE_PANEL_ROOT,
+    STOCK_LABEL_ROOT,
 )
 from src.stocks.data.repositories import (
     ResearchDataRepository,
@@ -34,9 +35,9 @@ def main(args: list[str] | None = None) -> int:
     parser.add_argument("--artifact-id", required=True)
     parser.add_argument("--snapshot-id", required=True, help="immutable research snapshot id")
     parser.add_argument("--catalog-root", type=Path, default=STOCK_CATALOG_ROOT)
-    parser.add_argument("--base-root", type=Path, default=STOCK_CANONICAL_ROOT)
-    parser.add_argument("--feature-root", type=Path, default=STOCK_DERIVED_ROOT)
-    parser.add_argument("--label-root", type=Path, default=STOCK_CANONICAL_ROOT)
+    parser.add_argument("--base-root", type=Path, default=STOCK_BASE_PANEL_ROOT)
+    parser.add_argument("--feature-root", type=Path, default=STOCK_FEATURE_PANEL_ROOT)
+    parser.add_argument("--label-root", type=Path, default=STOCK_LABEL_ROOT)
     parser.add_argument("--registry", type=Path, default=STOCK_ARTIFACT_ROOT)
     parser.add_argument(
         "--mode",

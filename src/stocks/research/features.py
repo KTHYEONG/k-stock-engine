@@ -132,8 +132,11 @@ class CloseLocationFeature(FeatureDefinition):
         for col in ("high", "low", "close"):
             if col not in frame.columns:
                 raise ValueError(f"missing {col} column")
+        price_range = pl.col("high") - pl.col("low")
         location = (
-            (pl.col("close") - pl.col("low")) / (pl.col("high") - pl.col("low"))
+            pl.when(price_range != 0)
+            .then((pl.col("close") - pl.col("low")) / price_range)
+            .otherwise(pl.lit(0.5))
         ).over(ID_COLUMN)
         return frame.with_columns(
             location.rolling_mean(window_size=self.lookback, min_samples=1).alias(self.name)
