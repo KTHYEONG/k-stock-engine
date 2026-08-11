@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace as dataclass_replace
 
 import polars as pl
 import pytest
@@ -10,6 +11,7 @@ from src.core.costs import default_base_schedule, default_stress_schedule
 from src.core.time import TemporalViolationError
 from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.research.artifacts import METRICS_FILENAME, ModelArtifactRegistry
+from src.stocks.research.models import ModelManifest
 from src.stocks.workflows.contracts import TrainingRequest
 from src.stocks.workflows.train_model import (
     PromotionRiskBudget,
@@ -297,7 +299,43 @@ def test_deflated_sharpe_consumes_trials_and_fails_closed() -> None:
     )
 
 
-def test_tuning_never_includes_first_outer_oos(monkeypatch) -> None:
+def _tune_base_manifest(
+    artifact_id: str, manifest, label_definition: str
+) -> ModelManifest:
+    import src.stocks.workflows.train_model as tm
+
+    return tm.ModelManifest(
+        artifact_id=artifact_id,
+        asset_kind=__import__("src.core.instruments", fromlist=["AssetKind"]).AssetKind.STOCK,
+        feature_set="stock_alpha_v2",
+        feature_schema_hash="hash",
+        universe_policy_hash="universe",
+        label_definition=label_definition,
+        label_horizon_sessions=manifest.label_horizon_sessions,
+        eligible_from="2024-01-01T00:00:00+00:00",
+        eligible_to="2024-12-31T00:00:00+00:00",
+        model_type="lambdarank_blend",
+    )
+
+
+def _positive_replay(**overrides) -> ReplayResult:
+    """Deterministic economically eligible replay with fixed positive evidence."""
+    base = ReplayResult(
+        attempted_orders=10,
+        filled_orders=8,
+        strategy_returns=[0.001] * 24,
+        benchmark_returns=[0.0] * 24,
+        excess_returns=[0.001] * 24,
+        metrics={"max_drawdown": 0.05, "turnover": 1.0},
+        base_total_return=0.01,
+        benchmark_total_return=0.005,
+        stress_total_return=0.01,
+        final_value=100_000_001.0,
+    )
+    return dataclass_replace(base, **overrides)
+
+
+def test_tuning_never_includes_first_outer_oos(monkeypatch, tmp_path) -> None:
     import src.stocks.workflows.train_model as tm
 
     monkeypatch.setattr(tm, "_MIN_TRAIN_SESSIONS", 40)
@@ -326,35 +364,34 @@ def test_tuning_never_includes_first_outer_oos(monkeypatch) -> None:
 
     monkeypatch.setattr(tm, "_fit_stable_contexts", fake_stable_contexts)
     monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+    monkeypatch.setattr(
+        tm,
+        "_fit_and_score_candidate",
+        lambda *_a, **_kw: ([0.05, 0.06, 0.07], pl.DataFrame()),
+    )
+    monkeypatch.setattr(tm, "_event_ledger_evaluation", lambda *_a, **_kw: _positive_replay())
 
     request = TrainingRequest(artifact_id="tune_oos", n_folds=3, optuna_trials=3)
     config, n_trials = tm._tune_champion(
         panel,
         folds,
         request,
-        tm.ModelManifest(
-            artifact_id="tune_oos",
-            asset_kind=__import__("src.core.instruments", fromlist=["AssetKind"]).AssetKind.STOCK,
-            feature_set="stock_alpha_v2",
-            feature_schema_hash="hash",
-            universe_policy_hash="universe",
-            label_definition=manifest.label_definition,
-            label_horizon_sessions=manifest.label_horizon_sessions,
-            eligible_from="2024-01-01T00:00:00+00:00",
-            eligible_to="2024-12-31T00:00:00+00:00",
-            model_type="lambdarank_blend",
-        ),
+        _tune_base_manifest("tune_oos", manifest, manifest.label_definition),
         tuple(c for c in df.columns if c.startswith("feature__")),
         "residual_o2o_5d",
         "relevance",
         label_span,
+        dataset_manifest=manifest,
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
     )
     assert captured["tuning_max_session"] < folds[0].validation_decision_start
     assert n_trials == request.optuna_trials
     assert config is not None
 
 
-def test_tuning_counts_pruned_trials_for_deflated_sharpe(monkeypatch) -> None:
+def test_tuning_counts_pruned_trials_for_deflated_sharpe(monkeypatch, tmp_path) -> None:
     import src.stocks.workflows.train_model as tm
 
     monkeypatch.setattr(tm, "_MIN_TRAIN_SESSIONS", 40)
@@ -386,25 +423,247 @@ def test_tuning_counts_pruned_trials_for_deflated_sharpe(monkeypatch) -> None:
         panel,
         folds,
         request,
-        tm.ModelManifest(
-            artifact_id="tune_prune",
-            asset_kind=__import__("src.core.instruments", fromlist=["AssetKind"]).AssetKind.STOCK,
-            feature_set="stock_alpha_v2",
-            feature_schema_hash="hash",
-            universe_policy_hash="universe",
-            label_definition=manifest.label_definition,
-            label_horizon_sessions=manifest.label_horizon_sessions,
-            eligible_from="2024-01-01T00:00:00+00:00",
-            eligible_to="2024-12-31T00:00:00+00:00",
-            model_type="lambdarank_blend",
-        ),
+        _tune_base_manifest("tune_prune", manifest, manifest.label_definition),
         tuple(c for c in df.columns if c.startswith("feature__")),
         "residual_o2o_5d",
         "relevance",
         label_span,
+        dataset_manifest=manifest,
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
     )
     assert n_trials == request.optuna_trials
     assert config is None
+    assert tm.LambdaRankConfig._tuning_telemetry["selection_status"] == (
+        "no_complete_screen_candidate"
+    )
+
+def test_tuning_economic_tie_breaks_by_lowest_trial_number(monkeypatch, tmp_path) -> None:
+    import src.stocks.workflows.train_model as tm
+
+    monkeypatch.setattr(tm, "_MIN_TRAIN_SESSIONS", 40)
+    monkeypatch.setattr(tm, "_VALIDATION_BLOCK_SESSIONS", 30)
+
+    df = stock_v2_composed_df(n_sessions=140, n_tickers=20)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    label_span = (manifest.label_horizon_sessions or 1) + 1
+    folds = tm.PurgedWalkForward(
+        n_folds=3,
+        label_horizon_sessions=label_span,
+        embargo_sessions=5,
+        session_column="session_index",
+        validation_window_sessions=30,
+        min_train_sessions=40,
+    ).split(panel)
+
+    monkeypatch.setattr(
+        tm,
+        "_fit_stable_contexts",
+        lambda _panel, tuning_folds, *_a, **_kw: [None] * len(tuning_folds),
+    )
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+    monkeypatch.setattr(
+        tm,
+        "_fit_and_score_candidate",
+        lambda *_a, **_kw: ([0.05, 0.06, 0.07], pl.DataFrame()),
+    )
+    monkeypatch.setattr(tm, "_event_ledger_evaluation", lambda *_a, **_kw: _positive_replay())
+
+    request = TrainingRequest(artifact_id="tie_break", n_folds=3, optuna_trials=3)
+    config, n_trials = tm._tune_champion(
+        panel,
+        folds,
+        request,
+        _tune_base_manifest("tie_break", manifest, manifest.label_definition),
+        tuple(c for c in df.columns if c.startswith("feature__")),
+        "residual_o2o_5d",
+        "relevance",
+        label_span,
+        dataset_manifest=manifest,
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    assert config is not None
+    assert n_trials == request.optuna_trials
+    telemetry = config._tuning_telemetry
+    assert telemetry["selection_status"] == "selected"
+    assert telemetry["selected_trial_number"] == 0
+    assert telemetry["screened_trials"] == request.optuna_trials
+    assert telemetry["shortlisted_trials"] == request.optuna_trials
+    assert telemetry["economically_eligible_trials"] == request.optuna_trials
+    assert telemetry["selected_inner_bootstrap_lower_bound"] > 0.0
+
+
+def test_tuning_rejects_economically_ineligible_candidates(monkeypatch, tmp_path) -> None:
+    import src.stocks.workflows.train_model as tm
+
+    monkeypatch.setattr(tm, "_MIN_TRAIN_SESSIONS", 40)
+    monkeypatch.setattr(tm, "_VALIDATION_BLOCK_SESSIONS", 30)
+
+    df = stock_v2_composed_df(n_sessions=140, n_tickers=20)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    label_span = (manifest.label_horizon_sessions or 1) + 1
+    folds = tm.PurgedWalkForward(
+        n_folds=3,
+        label_horizon_sessions=label_span,
+        embargo_sessions=5,
+        session_column="session_index",
+        validation_window_sessions=30,
+        min_train_sessions=40,
+    ).split(panel)
+
+    monkeypatch.setattr(
+        tm,
+        "_fit_stable_contexts",
+        lambda _panel, tuning_folds, *_a, **_kw: [None] * len(tuning_folds),
+    )
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+    monkeypatch.setattr(
+        tm,
+        "_fit_and_score_candidate",
+        lambda *_a, **_kw: ([0.05, 0.06, 0.07], pl.DataFrame()),
+    )
+    monkeypatch.setattr(
+        tm,
+        "_event_ledger_evaluation",
+        lambda *_a, **_kw: _positive_replay(attempted_orders=0, filled_orders=0),
+    )
+
+    request = TrainingRequest(artifact_id="no_orders", n_folds=3, optuna_trials=3)
+    config, n_trials = tm._tune_champion(
+        panel,
+        folds,
+        request,
+        _tune_base_manifest("no_orders", manifest, manifest.label_definition),
+        tuple(c for c in df.columns if c.startswith("feature__")),
+        "residual_o2o_5d",
+        "relevance",
+        label_span,
+        dataset_manifest=manifest,
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    assert config is None
+    assert n_trials == request.optuna_trials
+    assert tm.LambdaRankConfig._tuning_telemetry["selection_status"] == (
+        "no_economically_eligible_candidate"
+    )
+    assert tm.LambdaRankConfig._tuning_telemetry["economically_eligible_trials"] == 0
+
+
+def test_tuning_rejects_non_positive_bootstrap_candidates(monkeypatch, tmp_path) -> None:
+    import src.stocks.workflows.train_model as tm
+
+    monkeypatch.setattr(tm, "_MIN_TRAIN_SESSIONS", 40)
+    monkeypatch.setattr(tm, "_VALIDATION_BLOCK_SESSIONS", 30)
+
+    df = stock_v2_composed_df(n_sessions=140, n_tickers=20)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    label_span = (manifest.label_horizon_sessions or 1) + 1
+    folds = tm.PurgedWalkForward(
+        n_folds=3,
+        label_horizon_sessions=label_span,
+        embargo_sessions=5,
+        session_column="session_index",
+        validation_window_sessions=30,
+        min_train_sessions=40,
+    ).split(panel)
+
+    monkeypatch.setattr(
+        tm,
+        "_fit_stable_contexts",
+        lambda _panel, tuning_folds, *_a, **_kw: [None] * len(tuning_folds),
+    )
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+    monkeypatch.setattr(
+        tm,
+        "_fit_and_score_candidate",
+        lambda *_a, **_kw: ([0.05, 0.06, 0.07], pl.DataFrame()),
+    )
+    monkeypatch.setattr(
+        tm,
+        "_event_ledger_evaluation",
+        lambda *_a, **_kw: _positive_replay(
+            excess_returns=[-0.001] * 24, strategy_returns=[-0.001] * 24
+        ),
+    )
+
+    request = TrainingRequest(artifact_id="bad_boot", n_folds=3, optuna_trials=3)
+    config, n_trials = tm._tune_champion(
+        panel,
+        folds,
+        request,
+        _tune_base_manifest("bad_boot", manifest, manifest.label_definition),
+        tuple(c for c in df.columns if c.startswith("feature__")),
+        "residual_o2o_5d",
+        "relevance",
+        label_span,
+        dataset_manifest=manifest,
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    assert config is None
+    assert n_trials == request.optuna_trials
+    assert tm.LambdaRankConfig._tuning_telemetry["selection_status"] == (
+        "no_economically_eligible_candidate"
+    )
+
+
+def test_tuning_skips_candidates_that_fail_full_refit(monkeypatch, tmp_path) -> None:
+    import src.stocks.workflows.train_model as tm
+
+    monkeypatch.setattr(tm, "_MIN_TRAIN_SESSIONS", 40)
+    monkeypatch.setattr(tm, "_VALIDATION_BLOCK_SESSIONS", 30)
+
+    df = stock_v2_composed_df(n_sessions=140, n_tickers=20)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    label_span = (manifest.label_horizon_sessions or 1) + 1
+    folds = tm.PurgedWalkForward(
+        n_folds=3,
+        label_horizon_sessions=label_span,
+        embargo_sessions=5,
+        session_column="session_index",
+        validation_window_sessions=30,
+        min_train_sessions=40,
+    ).split(panel)
+
+    monkeypatch.setattr(
+        tm,
+        "_fit_stable_contexts",
+        lambda _panel, tuning_folds, *_a, **_kw: [None] * len(tuning_folds),
+    )
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+    monkeypatch.setattr(tm, "_fit_and_score_candidate", lambda *_a, **_kw: None)
+    monkeypatch.setattr(tm, "_event_ledger_evaluation", lambda *_a, **_kw: _positive_replay())
+
+    request = TrainingRequest(artifact_id="refit_fail", n_folds=3, optuna_trials=3)
+    config, n_trials = tm._tune_champion(
+        panel,
+        folds,
+        request,
+        _tune_base_manifest("refit_fail", manifest, manifest.label_definition),
+        tuple(c for c in df.columns if c.startswith("feature__")),
+        "residual_o2o_5d",
+        "relevance",
+        label_span,
+        dataset_manifest=manifest,
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    assert config is None
+    assert n_trials == request.optuna_trials
+    assert tm.LambdaRankConfig._tuning_telemetry["selection_status"] == (
+        "no_economically_eligible_candidate"
+    )
 
 
 def test_resource_breach_publishes_no_artifact(tmp_path, monkeypatch) -> None:
