@@ -1,0 +1,8 @@
+creation_rules:
+  # .env 및 .env.enc 파일 대상
+  - path_regex: \.env(\..*)?$
+    input_type: dotenv
+    output_type: dotenv
+    # 실제 본인의 age public key (age1...)로 변경해 주세요
+    age: age1dacxehc33pffhu72njfm0acm5yavwv9v7evasyynuz6dqv2ee5zsa6waj9
+
