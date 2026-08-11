@@ -327,5 +327,9 @@
   },
   "src/stocks/data/inventory.py": {
     "testing": "tests/unit/stocks/data/test_inventory.py"
+  },
+  "src/stocks/data/research_v2.py": {
+    "architecture": "docs/specs/stock_alpha_v2_dataset_contract_rebuild.md",
+    "testing": "tests/integration/stocks/test_stock_alpha_v2_snapshot.py"
   }
 }
