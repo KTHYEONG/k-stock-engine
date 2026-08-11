@@ -29,7 +29,7 @@ from src.core.datasets import (
 )
 from src.core.instruments import AssetKind
 from src.stocks.data.quality import KRXSessionCalendar
-from src.stocks.research.labels import LabelDefinition
+from src.stocks.research.labels import RELEVANCE_COLUMN, LabelDefinition
 from src.storage.parquet_datasets import ParquetDatasetStore, canonical_content_hash
 
 logger = logging.getLogger("stocks.data.labels")
@@ -40,6 +40,10 @@ LABEL_AVAILABLE_COLUMN = "label_available_time"
 LABEL_FEATURE_SET = "labels"
 _KRX_AVAILABLE_TIME = time(15, 31)
 _KRX_TZ = ZoneInfo("Asia/Seoul")
+
+RESIDUAL_O2O_PREFIX = "residual_o2o_"
+MIN_RESIDUAL_GROUP = 20
+RESIDUAL_ALGORITHM_VERSION = "calendar-residual-o2o-v1"
 
 
 def build_label_dataset(
@@ -143,6 +147,168 @@ def build_label_dataset(
     return out
 
 
+def build_residual_o2o_label_dataset(
+    base_panel: pl.DataFrame,
+    calendar: KRXSessionCalendar,
+    *,
+    horizon_sessions: int = 5,
+) -> pl.DataFrame:
+    """Build calendar-correct residual open-to-open labels with LambdaRank relevance.
+
+    For a decision session at calendar position ``p``, a label is computed only
+    when the same instrument has a valid open at both exact calendar sessions:
+
+    ``entry = calendar[p + 1]`` and ``exit = calendar[p + 1 + horizon]``.
+    The gross return is ``log(open(exit) / open(entry))`` and the residual is
+    the gross minus the equal-weight mean gross within the decision session.
+    The per-session 1st/99th percentile-clipped residual rank maps to
+    ``relevance = floor(percentile * 5)`` clipped to integer ``0..4``.
+
+    Sessions with fewer than ``MIN_RESIDUAL_GROUP`` finite residuals are dropped
+    completely and no fabricated label is ever retained. The result schema is:
+
+    ``instrument_id, session, residual_o2o_<horizon>d, relevance, label_available_time``
+
+    ``label_available_time`` is set to the exact exit-session open timestamp in
+    UTC (never the decision session), so a decision row is only usable after the
+    terminal horizon open is observable.
+    """
+    if horizon_sessions <= 0:
+        raise ValueError("horizon_sessions must be positive")
+    missing = [c for c in (ID_COLUMN, SESSION_COLUMN, "open") if c not in base_panel.columns]
+    if missing:
+        raise ValueError(f"residual label requires base panel columns {missing}")
+
+    label_column = f"{RESIDUAL_O2O_PREFIX}{horizon_sessions}d"
+    sessions = list(calendar.sessions)
+    by_date = {session: index for index, session in enumerate(sessions)}
+    if len(by_date) != len(sessions):
+        raise ValueError("calendar contains duplicate sessions")
+
+    panel = base_panel.with_columns(pl.col(SESSION_COLUMN).cast(pl.Date).alias("_session_date"))
+    calendar_frame = pl.DataFrame(
+        {
+            "_session_date": sessions,
+            "_cal_pos": list(range(len(sessions))),
+            "_entry_date": [
+                sessions[p + 1] if p + 1 < len(sessions) else None for p in range(len(sessions))
+            ],
+            "_exit_date": [
+                sessions[p + 1 + horizon_sessions]
+                if p + 1 + horizon_sessions < len(sessions)
+                else None
+                for p in range(len(sessions))
+            ],
+        }
+    )
+    panel = panel.join(calendar_frame, on="_session_date", how="left")
+    unknown = panel.filter(pl.col("_cal_pos").is_null() | pl.col("_session_date").is_null())
+    if not unknown.is_empty():
+        raise ValueError("base panel contains non-calendar sessions")
+
+    prices = panel.select(
+        ID_COLUMN,
+        pl.col("_session_date").alias("_price_date"),
+        pl.col("open"),
+    )
+    entries = prices.select(
+        ID_COLUMN,
+        pl.col("_price_date").alias("_entry_date"),
+        pl.col("open").alias("_entry_open"),
+    )
+    exits = prices.select(
+        ID_COLUMN,
+        pl.col("_price_date").alias("_exit_date"),
+        pl.col("open").alias("_exit_open"),
+    )
+    panel = (
+        panel.join(entries, on=[ID_COLUMN, "_entry_date"], how="left")
+        .join(exits, on=[ID_COLUMN, "_exit_date"], how="left")
+        .filter(pl.col("_entry_open").is_not_null() & pl.col("_exit_open").is_not_null())
+    )
+
+    gross = pl.col("_exit_open").log() - pl.col("_entry_open").log()
+    residual = gross - gross.mean().over(SESSION_COLUMN)
+    label_available = (
+        pl.col("_exit_date")
+        .dt.combine(pl.lit(_KRX_AVAILABLE_TIME))
+        .dt.replace_time_zone("Asia/Seoul")
+        .dt.convert_time_zone("UTC")
+    )
+    session_utc = (
+        pl.col("_session_date")
+        .cast(pl.Datetime)
+        .dt.replace_time_zone("UTC")
+    )
+
+    winsor = (
+        panel.with_columns(residual.alias("_residual"))
+        .group_by(SESSION_COLUMN)
+        .agg(
+            pl.col("_residual").quantile(0.01).alias("__lo"),
+            pl.col("_residual").quantile(0.99).alias("__hi"),
+        )
+    )
+    clipped = (
+        panel.with_columns(residual.alias("_residual"))
+        .join(winsor, on=SESSION_COLUMN, how="left")
+        .with_columns(
+            pl.col("_residual").clip(pl.col("__lo"), pl.col("__hi")).alias("__clipped")
+        )
+    )
+    count = pl.col("_residual").count().over(SESSION_COLUMN)
+    pct_rank = (
+        (pl.col("__clipped").rank("average").over(SESSION_COLUMN) - 1.0) / (count - 1.0)
+    ).fill_null(0.5)
+    relevance = (
+        pl.when(pct_rank.is_not_null())
+        .then((pct_rank * 5.0).floor().cast(pl.Int8).clip(0, 4))
+        .otherwise(None)
+    )
+
+    out = clipped.with_columns(
+        session_utc.alias(SESSION_COLUMN),
+        pl.col("_residual").alias(label_column),
+        relevance.alias(RELEVANCE_COLUMN),
+        label_available.alias(LABEL_AVAILABLE_COLUMN),
+    ).select(
+        ID_COLUMN,
+        SESSION_COLUMN,
+        label_column,
+        RELEVANCE_COLUMN,
+        LABEL_AVAILABLE_COLUMN,
+    )
+
+    eligible_sessions = (
+        out.filter(pl.col(label_column).is_not_null())
+        .group_by(SESSION_COLUMN)
+        .len()
+        .filter(pl.col("len") >= MIN_RESIDUAL_GROUP)[SESSION_COLUMN]
+    )
+    if eligible_sessions.is_empty():
+        logger.info(
+            "residual label %s: no session has at least %s finite residuals",
+            label_column,
+            MIN_RESIDUAL_GROUP,
+        )
+        return out.head(0)
+    out = out.filter(
+        pl.col(SESSION_COLUMN).is_in(eligible_sessions.to_list())
+    ).sort([ID_COLUMN, SESSION_COLUMN])
+    incomplete = out.filter(
+        pl.col(LABEL_AVAILABLE_COLUMN).is_null() | pl.col(label_column).is_null()
+    )
+    if not incomplete.is_empty():
+        raise ValueError("residual label builder emitted an incomplete row")
+    logger.info(
+        "built residual label %s: %s rows over %s eligible sessions",
+        label_column,
+        out.height,
+        len(eligible_sessions),
+    )
+    return out
+
+
 def label_available_time(exit_session: date) -> datetime:
     """Availability timestamp for a terminal horizon session (after close)."""
     return datetime.combine(exit_session, _KRX_AVAILABLE_TIME, tzinfo=_KRX_TZ).astimezone(UTC)
@@ -171,6 +337,7 @@ def publish_label_dataset(
     universe_policy_version: str = "provisional-legacy",
     certification: DatasetCertification = DatasetCertification.PROVISIONAL,
     generated_time: datetime | None = None,
+    algorithm_version: str = "",
 ) -> LabelDatasetResult:
     """Publish an immutable, session-keyed label dataset.
 
@@ -217,6 +384,8 @@ def publish_label_dataset(
         "exit_field": definition.exit_field,
         "generated_time": generated_time.isoformat(),
     }
+    if algorithm_version:
+        content_manifest["label_algorithm_version"] = algorithm_version
     store = ParquetDatasetStore(Path(destination_root))
     dataset_dir = store.write_partitioned(
         labels_frame,
@@ -239,6 +408,47 @@ def publish_label_dataset(
         partition_paths=partition_paths,
         row_count=labels_frame.height,
         base_panel_hash=base_panel_hash,
+    )
+
+
+def publish_residual_o2o_label_dataset(
+    labels_frame: pl.DataFrame,
+    *,
+    destination_root: Path,
+    dataset_id: str,
+    base_panel_hash: str,
+    calendar_hash: str,
+    horizon_sessions: int = 5,
+    provider_version: str = "base-panel-labels",
+    universe_policy_version: str = "provisional-legacy",
+    certification: DatasetCertification = DatasetCertification.PROVISIONAL,
+    generated_time: datetime | None = None,
+) -> LabelDatasetResult:
+    """Publish a calendar-correct residual open-to-open label dataset.
+
+    A dedicated publisher so the generic ``fwd_ret_*`` path stays unchanged for
+    v1 consumers. The label column is ``residual_o2o_<horizon>d`` and the
+    content manifest records the residual-label algorithm version.
+    """
+    label_column = f"{RESIDUAL_O2O_PREFIX}{horizon_sessions}d"
+    definition = LabelDefinition(
+        name=label_column,
+        entry_field="open",
+        exit_field="open",
+        horizon_sessions=horizon_sessions,
+    )
+    return publish_label_dataset(
+        labels_frame,
+        destination_root=destination_root,
+        dataset_id=dataset_id,
+        base_panel_hash=base_panel_hash,
+        calendar_hash=calendar_hash,
+        definition=definition,
+        provider_version=provider_version,
+        universe_policy_version=universe_policy_version,
+        certification=certification,
+        generated_time=generated_time,
+        algorithm_version=RESIDUAL_ALGORITHM_VERSION,
     )
 
 
