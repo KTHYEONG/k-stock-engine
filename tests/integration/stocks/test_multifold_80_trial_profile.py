@@ -57,6 +57,17 @@ def test_multifold_80_trial_profile_completes_under_budget(tmp_path, monkeypatch
     assert resource["peak_rss_mib"] <= _BUDGET_MIB
     assert resource["baseline_rss_mib"] > 0.0
     assert resource["trial_fold_timings_seconds"]
+    assert resource["screened_trials"] >= 0
+    assert resource["pruned_trials"] >= 0
+    assert resource["screened_trials"] + resource["pruned_trials"] == _OPTUNA_TRIALS
+    assert resource["shortlisted_trials"] <= 8
+    assert resource["cache_bytes"] > 0
+    assert resource["screen_seconds"] > 0.0
+    assert resource["selection_status"] in (
+        "selected",
+        "no_complete_screen_candidate",
+        "no_economically_eligible_candidate",
+    )
     assert elapsed_seconds > 0.0
     assert payload["promoted"] is False
     assert payload["no_trade"] is True
