@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_KR_STOCK_ML_RESEARCH_SYSTEM",
+      "date": "2026-08-11",
+      "adr_id": "ADR_20260811_KR_STOCK_ML_RESEARCH_SYSTEM",
+      "domain": "stocks",
+      "title": "Korean stock ML research and robust backtest pipeline",
+      "why": "Establish a reproducible domestic-stock ML research workflow with leakage-safe data, explicit features, deterministic training, and realistic backtesting.",
+      "resolution": "Registered LambdaRank plus StableRankComposite blending, 34 point-in-time features, purged walk-forward folds, canonical labels, event-based fills/costs, constrained portfolio construction, and promotion gates; synchronized ADR and code map.",
+      "impact": "Research-only pipeline; improves reproducibility and prevents lookahead/cost/model-selection errors. Live trading integration remains out of scope."
+    },
+    {
       "task_id": "TASK_DATA_STORAGE_REORGANIZATION",
       "date": "2026-08-11",
       "adr_id": "ADR_20260811_DATA_STORAGE_REORGANIZATION",
