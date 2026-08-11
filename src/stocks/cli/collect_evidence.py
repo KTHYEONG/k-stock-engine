@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from datetime import date
 from pathlib import Path
 
@@ -54,6 +55,14 @@ def main(args: list[str] | None = None) -> int:
     dart_merge.add_argument("--input-dir", required=True, type=Path)
     dart_merge.add_argument("--output", required=True, type=Path)
 
+    dart_publish = subparsers.add_parser("dart-disclosures-publish")
+    dart_publish.add_argument("--start", required=True, type=date.fromisoformat)
+    dart_publish.add_argument("--end", required=True, type=date.fromisoformat)
+    dart_publish.add_argument("--input-dir", required=True, type=Path)
+    dart_publish.add_argument("--output", required=True, type=Path)
+    dart_publish.add_argument("--catalog-root", required=True, type=Path)
+    dart_publish.add_argument("--name", required=True)
+
     for name in ("dart-disclosures", "dart-actions"):
         command = subparsers.add_parser(name)
         command.add_argument("--start", required=True, type=date.fromisoformat)
@@ -98,6 +107,24 @@ def main(args: list[str] | None = None) -> int:
         dart_collector = OpenDartEvidenceCollector()
         dart_collector.merge_disclosure_partitions(
             parsed.input_dir, parsed.start, parsed.end, parsed.output
+        )
+    elif parsed.command == "dart-disclosures-publish":
+        dart_collector = OpenDartEvidenceCollector()
+        entry = dart_collector.publish_disclosure_dataset(
+            parsed.input_dir,
+            parsed.start,
+            parsed.end,
+            parsed.output,
+            parsed.catalog_root,
+            parsed.name,
+        )
+        coverage = (
+            f"{entry.coverage.start}..{entry.coverage.end}"
+            if entry.coverage
+            else "n/a"
+        )
+        sys.stdout.write(
+            f"{entry.name}\t{entry.content_hash}\t{entry.row_count}\t{coverage}\n"
         )
     else:
         dart_collector = OpenDartEvidenceCollector()

@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_DART_DATASET_READINESS",
+      "date": "2026-08-11",
+      "adr_id": "ADR_20260811_DART_DATASET_READINESS",
+      "domain": "stocks-data",
+      "title": "Publish complete DART evidence and gate feature readiness",
+      "why": "The data audit found a complete 123-month DART collection outside the catalog and 32 fully-null derived feature columns that could be selected accidentally.",
+      "resolution": "Added atomic DART disclosure publication into the typed catalog with immutable/idempotent registration, retained disclosures as raw evidence rather than corporate actions, and added content-manifest-backed feature readiness validation that fails closed for missing, fully-null, or non-finite selected features while reporting warm-up nulls.",
+      "impact": "Future research can bind complete DART evidence by immutable name and validate model-selected feature inputs before use; existing datasets, partial artifacts, and snapshots remain unchanged. Ruff, mypy, 466 pytest tests, spec validation, and an actual readiness CLI run passed."
+    },
+    {
       "task_id": "TASK_DATASET_INTEGRITY_AUDIT",
       "date": "2026-08-11",
       "adr_id": "ADR_20260811_DATASET_INTEGRITY_AUDIT",

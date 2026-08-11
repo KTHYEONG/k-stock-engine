@@ -18,6 +18,14 @@ from xml.etree import ElementTree
 
 import requests
 
+from src.core.datasets import schema_hash
+from src.stocks.data.catalog import (
+    CatalogEntry,
+    CatalogKind,
+    CatalogStore,
+    EvidenceCompleteness,
+)
+from src.stocks.data.contracts import CoverageRange
 from src.stocks.data.quality import (
     InstrumentMasterRecord,
     InstrumentMasterSnapshot,
@@ -25,6 +33,8 @@ from src.stocks.data.quality import (
 )
 
 JsonRequest = Callable[[str, dict[str, str]], dict[str, Any]]
+
+DISCLOSURE_RECORD_FIELDS = ("corp_code", "corp_name", "rcept_dt", "rcept_no", "report_nm", "rm")
 
 RETRYABLE_DART_STATUSES = frozenset({"800", "900"})
 TERMINAL_DART_STATUSES = frozenset({"010", "011", "012", "021", "100", "101", "901"})
@@ -154,6 +164,18 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"JSON artifact must be an object: {path}")
     return payload
+
+
+def _disclosure_entry_matches(existing: CatalogEntry, recomputed: CatalogEntry) -> bool:
+    """True when an existing catalog record equals every immutable publication field."""
+    return (
+        existing.content_hash == recomputed.content_hash
+        and existing.schema_hash == recomputed.schema_hash
+        and existing.coverage == recomputed.coverage
+        and existing.completeness == recomputed.completeness
+        and existing.path == recomputed.path
+        and existing.row_count == recomputed.row_count
+    )
 
 
 def _iter_month_partitions(
@@ -1143,6 +1165,96 @@ class OpenDartEvidenceCollector:
                     f"merge output already exists with different content: {output_path}"
                 )
             _atomic_write_text(output_path, text)
+
+    def publish_disclosure_dataset(
+        self,
+        input_dir: Path,
+        start: date,
+        end: date,
+        output_path: Path,
+        catalog_root: Path,
+        name: str,
+    ) -> CatalogEntry:
+        """Publish one immutable complete disclosure artifact into the typed catalog.
+
+        ``merge_disclosure_partitions`` revalidates every monthly partition
+        (digest, range, receipt uniqueness, no-overwrite) before emitting
+        bytes; the merged object is then re-checked for the exact version,
+        integer count, required fields, ``(rcept_dt, rcept_no)`` sort order,
+        receipt uniqueness, and count equality. Only then is a complete
+        ``DISCLOSURES`` entry registered under ``name``. An identical existing
+        record is returned unchanged; a divergent one fails without mutation.
+        DART disclosures remain raw evidence: no corporate-action or snapshot
+        artifact is ever created here.
+        """
+        if not name:
+            raise ValueError("disclosure publication requires an explicit name")
+        if output_path.is_file():
+            try:
+                existing_payload = _read_json_object(output_path)
+                raw_generated = existing_payload.get("generated_time")
+                if isinstance(raw_generated, str):
+                    self.generated_time = datetime.fromisoformat(raw_generated)
+            except ValueError:
+                pass
+        self.merge_disclosure_partitions(input_dir, start, end, output_path)
+        payload = _read_json_object(output_path)
+        expected_version = f"dart-disclosures-{start.isoformat()}-{end.isoformat()}"
+        if payload.get("version") != expected_version:
+            raise ValueError(
+                "merged disclosure artifact version mismatch: expected "
+                f"{expected_version!r}, got {payload.get('version')!r}"
+            )
+        record_count = payload.get("record_count")
+        if not isinstance(record_count, int) or isinstance(record_count, bool):
+            raise ValueError("merged disclosure record_count must be an integer")
+        records = payload.get("records")
+        if not isinstance(records, list):
+            raise ValueError("merged disclosure records must be a list")
+        if len(records) != record_count:
+            raise ValueError(
+                f"merged disclosure record_count {record_count} does not match "
+                f"{len(records)} records"
+            )
+        for index, record in enumerate(records):
+            if not isinstance(record, dict):
+                raise ValueError(f"merged disclosure record {index} must be an object")
+            missing = [field for field in DISCLOSURE_RECORD_FIELDS if field not in record]
+            if missing:
+                raise ValueError(
+                    f"merged disclosure record {index} missing required fields: {missing}"
+                )
+        keys = [(record["rcept_dt"], record["rcept_no"]) for record in records]
+        if keys != sorted(keys):
+            raise ValueError(
+                "merged disclosure records must be sorted by (rcept_dt, rcept_no)"
+            )
+        if len({record["rcept_no"] for record in records}) != len(records):
+            raise ValueError("merged disclosure records contain duplicate rcept_no")
+
+        content_hash = hashlib.sha256(output_path.read_bytes()).hexdigest()
+        entry = CatalogEntry(
+            kind=CatalogKind.DISCLOSURES,
+            name=name,
+            content_hash=content_hash,
+            schema_hash=schema_hash(list(DISCLOSURE_RECORD_FIELDS)),
+            registered_at=datetime.now(UTC),
+            coverage=CoverageRange(start=start, end=end),
+            completeness=EvidenceCompleteness.COMPLETE,
+            path=str(output_path),
+            row_count=record_count,
+        )
+        store = CatalogStore(Path(catalog_root))
+        existing = store.get(entry.kind, entry.name)
+        if existing is not None:
+            if _disclosure_entry_matches(existing, entry):
+                return existing
+            raise ValueError(
+                f"catalog already has {entry.kind.value}:{entry.name} "
+                "with different immutable fields"
+            )
+        store.register(entry)
+        return entry
 
     def write_disclosure_artifact(self, path: Path, records: Iterable[dict[str, str]]) -> None:
         """Persist raw disclosure index records with retrieval provenance."""

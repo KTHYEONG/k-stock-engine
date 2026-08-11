@@ -1,6 +1,8 @@
 """Catalog: typed entries, fail-closed snapshot resolution, retention safety."""
 from __future__ import annotations
 
+import calendar
+import hashlib
 import json
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -20,9 +22,12 @@ from src.stocks.data.catalog import (
     build_snapshot_manifest,
     retention_delete,
     retention_dry_run,
-    snapshot_manifest_hash,
 )
 from src.stocks.data.contracts import CoverageRange, ResearchWindows, TimingConvention
+from src.stocks.data.evidence_collectors import (
+    EvidenceCollectionError,
+    OpenDartEvidenceCollector,
+)
 
 RANGE = CoverageRange(start=date(2024, 1, 1), end=date(2024, 3, 31))
 WINDOWS = ResearchWindows(
@@ -253,7 +258,7 @@ class TestSnapshotResolver:
         )
         refs[CatalogKind.BASE_PANEL] = tampered_base
         write_snapshot(store, "research_1", list(refs.values()))
-        with pytest.raises(ValueError, match="pins.*base_panel"):
+        with pytest.raises(ValueError, match=r"pins.*base_panel"):
             SnapshotResolver(store).resolve("research_1")
 
 
@@ -332,3 +337,159 @@ class TestRetention:
         )
         assert retention_delete(store, registry, (candidate,)) == 1
         assert store.get(CatalogKind.FEATURES, "features_v1") is None
+
+
+def _disclosure_record(page: int, receipt_date: str = "20240102") -> dict[str, str]:
+    return {
+        "rcept_no": f"2024010200000{page}",
+        "rcept_dt": receipt_date,
+        "corp_code": "00126380",
+        "corp_name": "테스트",
+        "report_nm": "현금배당결정",
+        "rm": "",
+    }
+
+
+def _disclosure_month_text(year: int, month: int, records: list[dict[str, str]]) -> str:
+    month_end = date(year, month, calendar.monthrange(year, month)[1])
+    payload = {
+        "version": f"dart-disclosures-month-{year:04d}-{month:02d}",
+        "generated_time": "2026-01-01T00:00:00+00:00",
+        "range_start": date(year, month, 1).isoformat(),
+        "range_end": month_end.isoformat(),
+        "record_count": len(records),
+        "records": records,
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+
+
+def _disclosure_parts(tmp_path: Path) -> Path:
+    """Build a hash-validated two-month disclosure partition set for 2024-01..2024-02."""
+    parts = tmp_path / "parts"
+    (parts / "months").mkdir(parents=True)
+    month_texts: dict[str, str] = {}
+    for month, page in ((1, 1), (2, 2)):
+        month_key = f"2024-{month:02d}"
+        month_texts[month_key] = _disclosure_month_text(
+            2024, month, [_disclosure_record(page, receipt_date=f"20240{month}02")]
+        )
+        (parts / "months" / f"{month_key}.json").write_text(
+            month_texts[month_key], encoding="utf-8"
+        )
+    manifest = {
+        "schema_version": "dart-disclosures-manifest-1",
+        "requested_start": "2024-01-01",
+        "requested_end": "2024-02-29",
+        "months": {
+            key: {
+                "status": "complete",
+                "path": f"months/{key}.json",
+                "record_count": 1,
+                "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            }
+            for key, text in month_texts.items()
+        },
+    }
+    (parts / "manifest.json").write_text(
+        json.dumps(manifest, sort_keys=True), encoding="utf-8"
+    )
+    return parts
+
+
+def _publish_collector() -> OpenDartEvidenceCollector:
+    return OpenDartEvidenceCollector(
+        api_key="fixture-key", generated_time=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+
+
+class TestDisclosurePublication:
+    NAME = "dart_disclosures_20240101_20240229_v1"
+
+    def test_register_and_round_trip(self, tmp_path) -> None:
+        parts = _disclosure_parts(tmp_path)
+        output = tmp_path / f"{self.NAME}.json"
+        catalog_root = tmp_path / "catalog"
+        entry = _publish_collector().publish_disclosure_dataset(
+            parts, date(2024, 1, 1), date(2024, 2, 29), output, catalog_root, self.NAME
+        )
+        assert entry.kind is CatalogKind.DISCLOSURES
+        assert entry.completeness is EvidenceCompleteness.COMPLETE
+        assert entry.coverage == CoverageRange(start=date(2024, 1, 1), end=date(2024, 2, 29))
+        assert entry.row_count == 2
+        assert entry.path == str(output)
+
+        store = CatalogStore(catalog_root)
+        assert store.list(CatalogKind.DISCLOSURES) == (entry,)
+
+        again = _publish_collector().publish_disclosure_dataset(
+            parts, date(2024, 1, 1), date(2024, 2, 29), output, catalog_root, self.NAME
+        )
+        assert again == entry
+        assert len(store.log_path.read_text(encoding="utf-8").splitlines()) == 1
+
+    def test_rerun_with_fresh_collector_is_recoverable(self, tmp_path) -> None:
+        parts = _disclosure_parts(tmp_path)
+        output = tmp_path / f"{self.NAME}.json"
+        catalog_root = tmp_path / "catalog"
+        first = _publish_collector().publish_disclosure_dataset(
+            parts, date(2024, 1, 1), date(2024, 2, 29), output, catalog_root, self.NAME
+        )
+        output_before = output.read_bytes()
+        fresh = OpenDartEvidenceCollector(
+            api_key="fixture-key", generated_time=datetime(2027, 5, 5, tzinfo=UTC)
+        )
+        again = fresh.publish_disclosure_dataset(
+            parts, date(2024, 1, 1), date(2024, 2, 29), output, catalog_root, self.NAME
+        )
+        assert again == first
+        assert output.read_bytes() == output_before
+        store = CatalogStore(catalog_root)
+        assert len(store.log_path.read_text(encoding="utf-8").splitlines()) == 1
+
+    def test_corrupt_month_fails_publication_without_output(self, tmp_path) -> None:
+        parts = _disclosure_parts(tmp_path)
+        month_path = parts / "months" / "2024-02.json"
+        month_path.write_text(
+            month_path.read_text(encoding="utf-8").replace(
+                "20240102000002", "20240102999999"
+            ),
+            encoding="utf-8",
+        )
+        output = tmp_path / f"{self.NAME}.json"
+        with pytest.raises(EvidenceCollectionError, match="2024-02"):
+            _publish_collector().publish_disclosure_dataset(
+                parts, date(2024, 1, 1), date(2024, 2, 29), output,
+                tmp_path / "catalog", self.NAME,
+            )
+        assert not output.exists()
+
+    def test_divergent_catalog_record_fails_without_mutation(self, tmp_path) -> None:
+        parts = _disclosure_parts(tmp_path)
+        output = tmp_path / f"{self.NAME}.json"
+        catalog_root = tmp_path / "catalog"
+        entry = _publish_collector().publish_disclosure_dataset(
+            parts, date(2024, 1, 1), date(2024, 2, 29), output, catalog_root, self.NAME
+        )
+        store = CatalogStore(catalog_root)
+        tampered = store.log_path.read_text(encoding="utf-8").replace(
+            entry.content_hash, "0" * 64
+        )
+        store.log_path.write_text(tampered, encoding="utf-8")
+
+        with pytest.raises(ValueError, match="different immutable fields"):
+            _publish_collector().publish_disclosure_dataset(
+                parts, date(2024, 1, 1), date(2024, 2, 29), output, catalog_root, self.NAME
+            )
+        assert store.list(CatalogKind.DISCLOSURES)[0].content_hash == "0" * 64
+
+    def test_disclosure_publication_is_never_corporate_actions(self, tmp_path) -> None:
+        parts = _disclosure_parts(tmp_path)
+        output = tmp_path / f"{self.NAME}.json"
+        catalog_root = tmp_path / "catalog"
+        entry = _publish_collector().publish_disclosure_dataset(
+            parts, date(2024, 1, 1), date(2024, 2, 29), output, catalog_root, self.NAME
+        )
+        assert entry.kind is CatalogKind.DISCLOSURES
+        store = CatalogStore(catalog_root)
+        assert store.list(CatalogKind.CORPORATE_ACTIONS) == ()
+        assert store.get(CatalogKind.CORPORATE_ACTIONS, self.NAME) is None
