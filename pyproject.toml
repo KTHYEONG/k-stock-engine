@@ -138,6 +138,12 @@ exclude = [
     ".venv"
 ]
 
+[tool.uv]
+# Keep uv's transient cache inside the workspace.  Some managed runners mount
+# /home/kth/.cache read-only, which otherwise makes every `uv run` fail before
+# Python starts.
+cache-dir = "scratch/uv-cache"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
