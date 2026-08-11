@@ -22,7 +22,7 @@ from src.stocks.research.lambdarank import (
     LambdaRankBlendModel,
     LambdaRankConfig,
 )
-from src.stocks.research.models import ModelManifest
+from src.stocks.research.models import ModelManifest, StableRankComposite
 
 
 def build_panel(n_sessions: int = 40, n_tickers: int = 40, seed: int = 7) -> pl.DataFrame:
@@ -131,6 +131,61 @@ def test_small_group_renders_no_trade_zero_scores() -> None:
         transformed.drop([RESIDUAL_O2O_LABEL, RELEVANCE_COLUMN, "label_available_time"])
     )
     assert scored["pred_score"].to_list() == [0.0] * scored.height
+
+
+def test_trial_fast_path_matches_legacy_blend() -> None:
+    import numpy as np
+
+    df = build_panel()
+    feature_columns = v2_feature_columns(df)
+    train = df.filter(pl.col("session_index") < 30)
+    val = df.filter(pl.col("session_index") >= 30)
+    quantiles = fit_v2_winsor_quantiles(train, feature_columns)
+    train_t = apply_v2_transforms(train, feature_columns, winsor_quantiles=quantiles)
+    val_t = apply_v2_transforms(val, feature_columns, winsor_quantiles=quantiles)
+    predict_input = val_t.drop([RESIDUAL_O2O_LABEL, RELEVANCE_COLUMN, "label_available_time"])
+    config = LambdaRankConfig(learning_rate=0.03, num_leaves=31)
+
+    legacy = LambdaRankBlendModel(
+        make_manifest(),
+        stock_alpha_v2_allowlist(),
+        RESIDUAL_O2O_LABEL,
+        config=config,
+        session_column="session",
+        relevance_column=RELEVANCE_COLUMN,
+    )
+    legacy.fit(train_t, val_t)
+    legacy_scored = legacy.predict(predict_input)
+    assert legacy.no_trade is False
+
+    stable = StableRankComposite(
+        factors=stock_alpha_v2_allowlist(),
+        manifest=make_manifest(),
+        label_column=RESIDUAL_O2O_LABEL,
+        block_length=5,
+        session_column="session",
+    )
+    stable.fit(train_t, val_t)
+    stable_scores = stable.predict(predict_input).select("session", "instrument_id", "pred_score")
+
+    trial = LambdaRankBlendModel(
+        make_manifest(),
+        stock_alpha_v2_allowlist(),
+        RESIDUAL_O2O_LABEL,
+        config=config,
+        session_column="session",
+        relevance_column=RELEVANCE_COLUMN,
+    )
+    assert trial.fit_trial(train_t, val_t, stable_scores) is True
+    trial_scored = trial.predict(predict_input)
+    assert (trial_scored["pred_score"].to_numpy() == pytest.approx(legacy_scored["pred_score"].to_numpy()))
+    assert (trial_scored["pred_score"].to_numpy() - legacy_scored["pred_score"].to_numpy()).max() < 1e-12
+
+    matrix = LambdaRankBlendModel._float32_matrix(predict_input, list(feature_columns))
+    assert matrix.dtype == np.float32
+    assert matrix.flags["C_CONTIGUOUS"]
+    relevance = val_t[RELEVANCE_COLUMN].cast(pl.Int32).to_numpy()
+    assert relevance.dtype == np.int32
 
 
 def test_manifest_binds_v2_contract() -> None:

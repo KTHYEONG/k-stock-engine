@@ -43,6 +43,8 @@ class LambdaRankConfig:
     CPU. ``label_gain`` and ``eval_at`` are the ranking evaluation contract.
     """
 
+    _tuning_telemetry: dict[str, object] | None = None
+
     def __init__(
         self,
         *,
@@ -173,6 +175,7 @@ class LambdaRankBlendModel:
         self._predictor_columns: list[str] = []
         self._train_group_count = 0
         self._no_trade = True
+        self._stable_scores_cache: pl.DataFrame | None = None
 
     @property
     def no_trade(self) -> bool:
@@ -184,9 +187,30 @@ class LambdaRankBlendModel:
 
     def fit(self, train: pl.DataFrame, validation: pl.DataFrame) -> None:
         """Fit both components on training rows only."""
+        self._stable_scores_cache = None
         self._stable.fit(train, validation)
         lambda_ok = self._fit_lambdarank(train, validation)
         self._no_trade = not (lambda_ok and not self._stable.no_trade)
+
+    def fit_trial(
+        self,
+        train: pl.DataFrame,
+        validation: pl.DataFrame,
+        stable_scores: pl.DataFrame,
+    ) -> bool:
+        """Fit only the LambdaRank booster, reusing cached stable scores.
+
+        ``stable_scores`` must carry ``(session, instrument_id, pred_score)``
+        and is invariant across every LambdaRank search parameter, so the trial
+        fast path never refits the StableRank composite. Returns whether the
+        booster fit succeeded; the legacy public ``fit``/``predict`` path
+        remains the final-model path and yields identical blend scores for
+        identical data and configuration.
+        """
+        self._stable_scores_cache = stable_scores
+        lambda_ok = self._fit_lambdarank(train, validation)
+        self._no_trade = not lambda_ok
+        return lambda_ok
 
     def predict(self, frame: pl.DataFrame) -> pl.DataFrame:
         """Target-free cross-sectional 50/50 percentile-rank blend."""
@@ -200,10 +224,17 @@ class LambdaRankBlendModel:
         lambda_pred = self._booster.predict(matrix)
         lambda_col = pl.Series("__lambda_score", np.asarray(lambda_pred, dtype=float))
         scored = frame.with_columns(lambda_col)
-        if not self._stable.no_trade:
-            stable_scored = self._stable.predict(frame)
+        if self._stable_scores_cache is not None:
+            stable_scored = self._stable_scores_cache
+        elif not self._stable.no_trade:
+            stable_scored = self._stable.predict(frame).select(
+                self.session_column, "instrument_id", "pred_score"
+            )
+        else:
+            stable_scored = None
+        if stable_scored is not None:
             scored = scored.join(
-                stable_scored.select(self.session_column, "instrument_id", "pred_score"),
+                stable_scored,
                 on=[self.session_column, "instrument_id"],
                 how="left",
             ).rename({"pred_score": "__stable_score"})
@@ -288,8 +319,8 @@ class LambdaRankBlendModel:
         self._train_group_count = len(group_sizes)
         usable = usable.filter(pl.col(self.session_column).is_in(session_order))
         ordered = usable.sort(self.session_column)
-        matrix = ordered.select(self._predictor_columns).to_numpy().astype(np.float32)
-        labels = ordered[self.relevance_column].cast(pl.Int32).to_numpy().astype(int)
+        matrix = self._float32_matrix(ordered, self._predictor_columns)
+        labels = ordered[self.relevance_column].cast(pl.Int32).to_numpy()
         weights = self._observation_weights(ordered, group_sizes)
 
         train_set = lgb.Dataset(
@@ -308,11 +339,8 @@ class LambdaRankBlendModel:
             if val_group_sizes:
                 val_ordered = val_used.sort(self.session_column)
                 valid_set = lgb.Dataset(
-                    val_ordered.select(self._predictor_columns).to_numpy().astype(np.float32),
-                    label=val_ordered[self.relevance_column]
-                    .cast(pl.Int32)
-                    .to_numpy()
-                    .astype(int),
+                    self._float32_matrix(val_ordered, self._predictor_columns),
+                    label=val_ordered[self.relevance_column].cast(pl.Int32).to_numpy(),
                     group=val_group_sizes,
                     params={"verbosity": -1},
                 )
@@ -405,7 +433,26 @@ class LambdaRankBlendModel:
             )
             if not bad.is_empty():
                 raise ValueError(f"non-finite feature value in {column}")
-        return selected.to_numpy().astype(np.float32)
+        return self._float32_matrix(selected, columns)
+
+    @staticmethod
+    def _float32_matrix(frame: pl.DataFrame, columns: list[str]) -> np.ndarray:
+        """Contiguous Float32 design matrix without redundant ``astype`` copies.
+
+        Columns are cast to Float32 in Polars before a single contiguous
+        ``to_numpy`` conversion; ``ascontiguousarray`` only copies when the
+        resulting array does not already carry the required dtype/contiguity.
+        """
+        cast_exprs = [
+            pl.col(column).cast(pl.Float32)
+            if frame.schema[column] != pl.Float32
+            else pl.col(column)
+            for column in columns
+        ]
+        array = frame.select(cast_exprs).to_numpy()
+        if array.dtype != np.float32 or not array.flags["C_CONTIGUOUS"]:
+            array = np.ascontiguousarray(array, dtype=np.float32)
+        return array
 
     def _resolve_column(self, frame: pl.DataFrame, name: str) -> str | None:
         if name in frame.columns:
