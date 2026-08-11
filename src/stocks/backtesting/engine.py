@@ -16,11 +16,12 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
+from math import ceil, floor
 
 import numpy as np
 import polars as pl
 
-from src.core.costs import CostSchedule, LiquiditySlippageModel
+from src.core.costs import CostSchedule, FillCostBreakdown, LiquiditySlippageModel
 from src.core.datasets import DatasetManifest
 from src.core.instruments import Instrument
 from src.core.portfolio import PortfolioSnapshot, Position
@@ -389,14 +390,11 @@ class StockBacktester:
 
             new_pending: list[dict[str, object]] = []
             for order in pending_orders:
-                result = self._execute_order(
+                settled_cash, unsettled_cash, accrued_costs = self._execute_order(
                     order, rows, rows_by_key, positions, settled_cash, unsettled_cash,
                     accrued_costs, settlements, schedule, liquidity_model, index, session,
                     trades,
                 )
-                settled_cash, unsettled_cash, accrued_costs = result
-                if order.get("partial") is True:
-                    new_pending.append(order)
             pending_orders = new_pending
 
             for r in rows.to_dicts():
@@ -549,28 +547,33 @@ class StockBacktester:
             trades.append(self._unfilled(session, instrument_id, order, "no-session-row"))
             return settled_cash, unsettled_cash, accrued_costs
         open_price = row.get("open")
-        volume = row.get("volume")
         if open_price is None or _as_float(open_price) <= 0:
             trades.append(self._unfilled(session, instrument_id, order, "missing-open"))
-            return settled_cash, unsettled_cash, accrued_costs
-        if volume is None or _as_float(volume) <= 0:
-            trades.append(self._unfilled(session, instrument_id, order, "zero-volume"))
             return settled_cash, unsettled_cash, accrued_costs
         if row.get("limit_locked") is True:
             trades.append(self._unfilled(session, instrument_id, order, "limit-locked"))
             return settled_cash, unsettled_cash, accrued_costs
+        if row.get("action_interval_covered") is False:
+            trades.append(self._unfilled(session, instrument_id, order, "no-action-coverage"))
+            return settled_cash, unsettled_cash, accrued_costs
 
         cost_point = schedule.cost_for(session)
-        price = _as_float(open_price)
+        reference_open = _as_float(open_price)
         delta = _as_int(order["delta"])
         evidence = self.cost_evidence
         stress = bool(liquidity_model is not None and liquidity_model.stress_multiplier > 1.0)
+        adtv = _as_float(row.get("adtv") or 0.0)
+        if adtv <= 0:
+            trades.append(self._unfilled(session, instrument_id, order, "no-capacity-data"))
+            return settled_cash, unsettled_cash, accrued_costs
+        capacity_qty = int((0.005 * adtv) // reference_open)
+        if capacity_qty <= 0:
+            trades.append(self._unfilled(session, instrument_id, order, "insufficient-capacity"))
+            return settled_cash, unsettled_cash, accrued_costs
+
         if delta > 0:
-            adtv = _as_float(row.get("adtv") or 0.0)
-            if adtv <= 0:
-                trades.append(self._unfilled(session, instrument_id, order, "no-capacity-data"))
-                return settled_cash, unsettled_cash, accrued_costs
-            capacity_qty = int((0.01 * adtv) // price)
+            quantity = min(delta, capacity_qty)
+            volatility = None
             if evidence is not None:
                 volatility = _as_float(row.get("feature__volatility_20d") or 0.0)
                 if volatility <= 0:
@@ -578,81 +581,44 @@ class StockBacktester:
                         self._unfilled(session, instrument_id, order, "missing-liquidity-input")
                     )
                     return settled_cash, unsettled_cash, accrued_costs
-                buy_rate = evidence.commission_for(session).buy_rate
-                affordable = int(
-                    settled_cash / (price * (1.0 + buy_rate)) if settled_cash > 0 else 0
-                )
+            estimate_gross = quantity * reference_open
+            fill_price = self._adverse_fill_price(
+                reference_open, estimate_gross, adtv, volatility, effective_time=session,
+                side="BUY", stress=stress, schedule=schedule, liquidity_model=liquidity_model,
+            )
+            gross = quantity * fill_price
+            buy_rate = self._fill_cost_rate(
+                evidence, instrument_id, "BUY", session, gross, adtv, volatility, stress,
+            )
+            if gross * (1.0 + buy_rate) > settled_cash:
+                affordable = int(settled_cash // (fill_price * (1.0 + buy_rate)))
                 quantity = min(delta, capacity_qty, affordable)
                 if quantity <= 0:
                     trades.append(self._unfilled(session, instrument_id, order, "insufficient-cash"))
                     return settled_cash, unsettled_cash, accrued_costs
-                gross = quantity * price
-                breakdown, artifact_hash = resolve_fill_cost(
-                    evidence,
-                    side="BUY",
-                    market=krx_market_for_code(instrument_id),
-                    price=price,
-                    notional=gross,
-                    adtv_20d=adtv,
-                    daily_volatility=volatility,
-                    effective_time=session,
-                    stress=stress,
+                gross = quantity * fill_price
+                fill_price = self._adverse_fill_price(
+                    reference_open, gross, adtv, volatility, effective_time=session,
+                    side="BUY", stress=stress, schedule=schedule, liquidity_model=liquidity_model,
                 )
-                buy_rate = breakdown.total_rate(side="BUY")
-                if gross * (1.0 + buy_rate) > settled_cash:
-                    quantity = int(settled_cash // (price * (1.0 + buy_rate)))
-                    if quantity <= 0:
-                        trades.append(
-                            self._unfilled(session, instrument_id, order, "insufficient-cash")
-                        )
-                        return settled_cash, unsettled_cash, accrued_costs
-                    gross = quantity * price
-                    breakdown, artifact_hash = resolve_fill_cost(
-                        evidence,
-                        side="BUY",
-                        market=krx_market_for_code(instrument_id),
-                        price=price,
-                        notional=gross,
-                        adtv_20d=adtv,
-                        daily_volatility=volatility,
-                        effective_time=session,
-                        stress=stress,
-                    )
-                    buy_rate = breakdown.total_rate(side="BUY")
-                cost = gross * buy_rate
-                settled_cash -= gross
-                accrued_costs += cost
-                positions[instrument_id] = positions.get(instrument_id, 0) + quantity
-                trades.append(
-                    BacktestTrade(
-                        session, instrument_id, "BUY", quantity, price, gross, cost,
-                        "filled" if quantity == delta else "partial",
-                        breakdown.to_dict(artifact_hash=artifact_hash),
-                    )
+                gross = quantity * fill_price
+                buy_rate = self._fill_cost_rate(
+                    evidence, instrument_id, "BUY", session, gross, adtv, volatility, stress,
                 )
-            else:
-                buy_rate = cost_point.commission_rate + cost_point.slippage_bps / 10_000.0
-                affordable = int(
-                    settled_cash / (price * (1.0 + buy_rate)) if settled_cash > 0 else 0
+            cost = gross * buy_rate
+            settled_cash -= gross
+            accrued_costs += cost
+            positions[instrument_id] = positions.get(instrument_id, 0) + quantity
+            trades.append(
+                BacktestTrade(
+                    session, instrument_id, "BUY", quantity, fill_price, gross, cost,
+                    "filled" if quantity == delta else "partial",
+                    self._cost_breakdown(
+                        evidence, instrument_id, "BUY", session, fill_price, gross, adtv,
+                        volatility, stress,
+                    ),
                 )
-                quantity = min(delta, capacity_qty, affordable)
-                if quantity <= 0:
-                    trades.append(self._unfilled(session, instrument_id, order, "insufficient-cash"))
-                    return settled_cash, unsettled_cash, accrued_costs
-                gross = quantity * price
-                cost = gross * buy_rate
-                settled_cash -= gross
-                accrued_costs += cost
-                positions[instrument_id] = positions.get(instrument_id, 0) + quantity
-                trades.append(
-                    BacktestTrade(
-                        session, instrument_id, "BUY", quantity, price, gross, cost,
-                        "filled" if quantity == delta else "partial",
-                    )
-                )
-            if quantity < delta:
-                order["delta"] = delta - quantity
-                order["partial"] = True
+            )
         else:
             sell_qty = -delta
             held = positions.get(instrument_id, 0)
@@ -660,67 +626,155 @@ class StockBacktester:
                 trades.append(self._unfilled(session, instrument_id, order, "no-holdings"))
                 return settled_cash, unsettled_cash, accrued_costs
             sell_qty = min(sell_qty, held)
+            volatility = None
             if evidence is not None:
-                adtv = _as_float(row.get("adtv") or 0.0)
                 volatility = _as_float(row.get("feature__volatility_20d") or 0.0)
                 if adtv <= 0 or volatility <= 0:
                     trades.append(
                         self._unfilled(session, instrument_id, order, "missing-liquidity-input")
                     )
                     return settled_cash, unsettled_cash, accrued_costs
-                gross = sell_qty * price
-                breakdown, artifact_hash = resolve_fill_cost(
-                    evidence,
-                    side="SELL",
-                    market=krx_market_for_code(instrument_id),
-                    price=price,
-                    notional=gross,
-                    adtv_20d=adtv,
-                    daily_volatility=volatility,
-                    effective_time=session,
-                    stress=stress,
+            estimate_gross = sell_qty * reference_open
+            fill_price = self._adverse_fill_price(
+                reference_open, estimate_gross, adtv, volatility, effective_time=session,
+                side="SELL", stress=stress, schedule=schedule, liquidity_model=liquidity_model,
+            )
+            gross = sell_qty * fill_price
+            sell_rate = self._fill_cost_rate(
+                evidence, instrument_id, "SELL", session, gross, adtv, volatility, stress,
+            )
+            cost = gross * sell_rate
+            positions[instrument_id] = held - sell_qty
+            accrued_costs += cost
+            unsettled_cash += gross
+            settlement_lag = (
+                evidence.settlement_days if evidence is not None else cost_point.settlement_days
+            )
+            settlements[session_index + settlement_lag] = (
+                settlements.get(session_index + settlement_lag, 0.0) + gross
+            )
+            trades.append(
+                BacktestTrade(
+                    session, instrument_id, "SELL", sell_qty, fill_price, gross, cost,
+                    "filled" if sell_qty == -delta else "partial",
+                    self._cost_breakdown(
+                        evidence, instrument_id, "SELL", session, fill_price, gross, adtv,
+                        volatility, stress,
+                    ),
                 )
-                sell_rate = breakdown.total_rate(side="SELL")
-                cost = gross * sell_rate
-                positions[instrument_id] = held - sell_qty
-                accrued_costs += cost
-                unsettled_cash += gross
-                settlements[session_index + evidence.settlement_days] = (
-                    settlements.get(session_index + evidence.settlement_days, 0.0)
-                    + gross
-                )
-                trades.append(
-                    BacktestTrade(
-                        session, instrument_id, "SELL", sell_qty, price, gross, cost,
-                        "filled" if sell_qty == -delta else "partial",
-                        breakdown.to_dict(artifact_hash=artifact_hash),
-                    )
-                )
-            else:
-                sell_rate = (
-                    cost_point.commission_rate
-                    + cost_point.tax_rate
-                    + cost_point.slippage_bps / 10_000.0
-                )
-                gross = sell_qty * price
-                cost = gross * sell_rate
-                positions[instrument_id] = held - sell_qty
-                accrued_costs += cost
-                unsettled_cash += gross
-                settlements[session_index + cost_point.settlement_days] = (
-                    settlements.get(session_index + cost_point.settlement_days, 0.0)
-                    + gross
-                )
-                trades.append(
-                    BacktestTrade(
-                        session, instrument_id, "SELL", sell_qty, price, gross, cost,
-                        "filled" if sell_qty == -delta else "partial",
-                    )
-                )
-            if sell_qty < -delta:
-                order["delta"] = -( -delta - sell_qty)
-                order["partial"] = True
+            )
         return settled_cash, unsettled_cash, accrued_costs
+
+    def _adverse_fill_price(
+        self,
+        reference_open: float,
+        notional: float,
+        adtv_20d: float,
+        daily_volatility: float | None,
+        *,
+        effective_time: datetime,
+        side: str,
+        stress: bool,
+        schedule: CostSchedule,
+        liquidity_model: LiquiditySlippageModel | None,
+    ) -> float:
+        """Adverse price rounded to the effective tick (up for buys, down for sells).
+
+        The one-way slippage (half spread plus square-root impact) is embedded
+        in the fill price and never charged again as a separate cost.
+        """
+        if liquidity_model is not None:
+            adverse_bps = liquidity_model.slippage_bps(
+                notional=notional,
+                adtv_20d=adtv_20d,
+                daily_volatility=daily_volatility or 0.01,
+                reference_price=reference_open,
+                effective_time=effective_time,
+            )
+        else:
+            adverse_bps = schedule.cost_for(effective_time).slippage_bps
+        adverse = reference_open * (1.0 + adverse_bps / 10_000.0)
+        tick = self._tick_for(reference_open, effective_time)
+        if side == "BUY":
+            return max(ceil(adverse / tick) * tick, tick)
+        return max(floor(adverse / tick) * tick, tick)
+
+    def _tick_for(self, price: float, effective_time: datetime) -> float:
+        if self.cost_evidence is not None:
+            return self.cost_evidence.tick_schedule.tick_size(price, effective_time)
+        return 1.0
+
+    def _fill_cost_rate(
+        self,
+        evidence: CostEvidence | None,
+        instrument_id: str,
+        side: str,
+        effective_time: datetime,
+        notional: float,
+        adtv_20d: float,
+        daily_volatility: float | None,
+        stress: bool,
+    ) -> float:
+        """Commission plus statutory tax only; spread/impact live in the fill price."""
+        if evidence is None:
+            point = self.cost_schedule.cost_for(effective_time)
+            rate = point.commission_rate
+            if side == "SELL":
+                rate += point.tax_rate
+            return rate
+        breakdown = self._resolved_cost(
+            evidence, instrument_id, side, effective_time, 1.0, notional, adtv_20d,
+            daily_volatility, stress,
+        )[0]
+        rate = breakdown.commission_rate
+        if side == "SELL":
+            rate += breakdown.sell_tax_rate
+        return rate
+
+    def _cost_breakdown(
+        self,
+        evidence: CostEvidence | None,
+        instrument_id: str,
+        side: str,
+        effective_time: datetime,
+        price: float,
+        notional: float,
+        adtv_20d: float,
+        daily_volatility: float | None,
+        stress: bool,
+    ) -> dict[str, object] | None:
+        if evidence is None:
+            return None
+        breakdown, artifact_hash = self._resolved_cost(
+            evidence, instrument_id, side, effective_time, price, notional, adtv_20d,
+            daily_volatility, stress,
+        )
+        return breakdown.to_dict(artifact_hash=artifact_hash)
+
+    def _resolved_cost(
+        self,
+        evidence: CostEvidence,
+        instrument_id: str,
+        side: str,
+        effective_time: datetime,
+        price: float,
+        notional: float,
+        adtv_20d: float,
+        daily_volatility: float | None,
+        stress: bool,
+    ) -> tuple[FillCostBreakdown, str]:
+        breakdown, artifact_hash = resolve_fill_cost(
+            evidence,
+            side=side,
+            market=krx_market_for_code(instrument_id),
+            price=price,
+            notional=notional,
+            adtv_20d=adtv_20d,
+            daily_volatility=daily_volatility or 0.01,
+            effective_time=effective_time,
+            stress=stress,
+        )
+        return breakdown, artifact_hash
 
     @staticmethod
     def _unfilled(
