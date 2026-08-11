@@ -28,6 +28,7 @@ from src.stocks.data.evidence_collectors import (
     EvidenceCollectionError,
     OpenDartEvidenceCollector,
 )
+from src.stocks.data.inventory import InventoryLifecycle, Recommendation, scan_inventory
 
 RANGE = CoverageRange(start=date(2024, 1, 1), end=date(2024, 3, 31))
 WINDOWS = ResearchWindows(
@@ -493,3 +494,68 @@ class TestDisclosurePublication:
         store = CatalogStore(catalog_root)
         assert store.list(CatalogKind.CORPORATE_ACTIONS) == ()
         assert store.get(CatalogKind.CORPORATE_ACTIONS, self.NAME) is None
+
+
+class TestInventoryArchiveCandidates:
+    def test_pinned_or_snapshot_referenced_never_archive_candidates(self, tmp_path) -> None:
+        data_root = tmp_path / "data"
+        evidence_dir = data_root / "evidence" / "stocks"
+        evidence_dir.mkdir(parents=True)
+
+        pinned_payload = b"shared calendar payload"
+        pinned_file = evidence_dir / "calendar_v1.json"
+        pinned_file.write_bytes(pinned_payload)
+        duplicate = evidence_dir / "calendar_unregistered_duplicate.json"
+        duplicate.write_bytes(pinned_payload)
+
+        store = CatalogStore(tmp_path / "catalog")
+        pinned_entry = CatalogEntry(
+            kind=CatalogKind.CALENDAR,
+            name="calendar_v1",
+            content_hash=hashlib.sha256(pinned_payload).hexdigest(),
+            schema_hash="schema",
+            registered_at=REGISTERED,
+            completeness=EvidenceCompleteness.COMPLETE,
+            path=str(pinned_file),
+            pinned=True,
+        )
+        store.register(pinned_entry)
+
+        master_payload = b"master payload"
+        master_file = evidence_dir / "master_v1.json"
+        master_file.write_bytes(master_payload)
+        master_entry = CatalogEntry(
+            kind=CatalogKind.INSTRUMENT_MASTER,
+            name="master_v1",
+            content_hash=hashlib.sha256(master_payload).hexdigest(),
+            schema_hash="schema",
+            registered_at=REGISTERED,
+            completeness=EvidenceCompleteness.COMPLETE,
+            path=str(master_file),
+        )
+        store.register(master_entry)
+        write_snapshot(store, "research_1", [pinned_entry, master_entry])
+
+        report = scan_inventory(data_root, store)
+        records = {record.path: record for record in report.records}
+
+        calendar_record = records["evidence/stocks/calendar_v1.json"]
+        assert calendar_record.lifecycle is InventoryLifecycle.EVIDENCE
+        assert calendar_record.recommendation is Recommendation.RETAIN
+        assert "calendar_v1" in calendar_record.catalog_reference
+        assert "research_1" in calendar_record.snapshot_reference
+
+        master_record = records["evidence/stocks/master_v1.json"]
+        assert master_record.recommendation is Recommendation.RETAIN
+        assert "research_1" in master_record.snapshot_reference
+
+        duplicate_record = records["evidence/stocks/calendar_unregistered_duplicate.json"]
+        assert duplicate_record.lifecycle is InventoryLifecycle.ARCHIVE_CANDIDATE
+        assert duplicate_record.recommendation is Recommendation.CANDIDATE
+
+        candidate_paths = {
+            record.path
+            for record in report.records
+            if record.lifecycle is InventoryLifecycle.ARCHIVE_CANDIDATE
+        }
+        assert candidate_paths == {"evidence/stocks/calendar_unregistered_duplicate.json"}
