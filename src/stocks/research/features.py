@@ -11,11 +11,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hashlib import sha256
 
+import numpy as np
 import polars as pl
 
 ID_COLUMN = "instrument_id"
 SESSION_COLUMN = "session"
 _PRICE_COLUMNS = ("open", "high", "low", "close")
+_TARGET_PREFIXES = ("target_", "label_")
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +160,199 @@ def feature_set_fingerprint(features: list[FeatureDefinition]) -> str:
     return sha256(
         "\n".join(f.fingerprint for f in features).encode("utf-8")
     ).hexdigest()
+
+
+STOCK_ALPHA_V2_ALLOWLIST: tuple[str, ...] = (
+    "adtv_20d",
+    "amihud_20d",
+    "bp_ratio",
+    "close_high_ratio_10d",
+    "disparity_120d",
+    "ep_ratio",
+    "flow_consensus",
+    "flow_intensity_20d",
+    "fluc_rate",
+    "foreign_net_buy",
+    "individual_net_buy",
+    "info_ratio_20d",
+    "institution_net_buy",
+    "intraday_ret",
+    "mcap_rank",
+    "min_vol_5d",
+    "net_purchase_total",
+    "overnight_ret",
+    "pbr",
+    "per",
+    "relative_trend_score",
+    "ret_21_60d",
+    "ret_2_5d",
+    "ret_6_20d",
+    "sector_ret_5d",
+    "trend_120d_rank",
+    "turnover_ratio",
+    "vol_20d_rank",
+    "vol_asymmetry_20d",
+    "vol_regime",
+    "volatility_20d",
+    "volatility_60d",
+    "volume_shock",
+    "vpt_20d",
+)
+
+STOCK_ALPHA_V2_FEATURE_SET = "stock_alpha_v2"
+
+
+def stock_alpha_v2_allowlist() -> tuple[str, ...]:
+    """Frozen v2 source allowlist: 34 empirically ready columns in manifest order.
+
+    ``vix_zscore_20d`` is excluded: a US-close value keyed to the same KRX
+    calendar date may not have existed at the KRX decision time. Statement
+    totals and profits are excluded until complete DART facts are normalized.
+    """
+    return STOCK_ALPHA_V2_ALLOWLIST
+
+
+def v2_feature_columns(
+    frame: pl.DataFrame,
+    *,
+    source_prefix: str = "feature__",
+    allowlist: tuple[str, ...] = STOCK_ALPHA_V2_ALLOWLIST,
+) -> tuple[str, ...]:
+    """Ordered ``source_prefix``-qualified v2 columns present in ``frame``.
+
+    The result mirrors the frozen allowlist order so LightGBM always consumes
+    an identical manifest-ordered input contract regardless of panel layout.
+    """
+    return tuple(
+        f"{source_prefix}{name}"
+        for name in allowlist
+        if f"{source_prefix}{name}" in frame.columns
+    )
+
+
+def fit_v2_winsor_quantiles(
+    frame: pl.DataFrame,
+    feature_columns: tuple[str, ...],
+    *,
+    low: float = 0.01,
+    high: float = 0.99,
+) -> dict[str, tuple[float, float]]:
+    """Fit per-feature 1%/99% clip thresholds on training rows only."""
+    quantiles: dict[str, tuple[float, float]] = {}
+    for column in feature_columns:
+        values = frame[column].drop_nulls().to_numpy().astype(float)
+        if values.size == 0:
+            quantiles[column] = (0.0, 0.0)
+            continue
+        quantiles[column] = (
+            float(np.quantile(values, low)),
+            float(np.quantile(values, high)),
+        )
+    return quantiles
+
+
+def apply_v2_transforms(
+    frame: pl.DataFrame,
+    feature_columns: tuple[str, ...],
+    *,
+    winsor_quantiles: dict[str, tuple[float, float]] | None = None,
+    session_column: str = SESSION_COLUMN,
+    sector_column: str = "sector",
+    low: float = 0.01,
+    high: float = 0.99,
+) -> pl.DataFrame:
+    """Build the v2 predictor frame: raw, clipped rank, sector-demeaned rank.
+
+    Each allowlisted feature contributes three float32 predictors: the raw
+    value (null retained for LightGBM), its per-session clipped percentile
+    rank, and its per-session percentile rank demeaned by the session-sector
+    mean. NaN/Inf is rejected; null values are retained for LightGBM.
+    """
+    _reject_target_columns(frame, feature_columns)
+    quantiles = winsor_quantiles or fit_v2_winsor_quantiles(
+        frame, feature_columns, low=low, high=high
+    )
+    missing_quantile = [c for c in feature_columns if c not in quantiles]
+    if missing_quantile:
+        raise ValueError(f"missing winsor quantiles for {missing_quantile}")
+    if sector_column not in frame.columns:
+        raise ValueError(f"frame must carry {sector_column!r} for sector-demeaned rank")
+    for column in feature_columns:
+        non_finite = frame.filter(
+            pl.col(column).is_not_null() & ~pl.col(column).is_finite()
+        )
+        if not non_finite.is_empty():
+            raise ValueError(f"non-finite value in feature column {column}")
+
+    rank_exprs: list[pl.Expr] = []
+    for column in feature_columns:
+        lo, hi = quantiles[column]
+        clipped = pl.col(column).clip(lo, hi)
+        within = pl.col(column).count().over(session_column)
+        rank_exprs.append(
+
+                ((clipped.rank("average").over(session_column) - 1.0) / (within - 1.0))
+                .fill_null(0.5)
+                .cast(pl.Float32)
+                .alias(f"__rank_{column}")
+
+        )
+    ranked = frame.with_columns(rank_exprs)
+
+    sector_exprs: list[pl.Expr] = []
+    for column in feature_columns:
+        sector_mean = (
+            pl.col(f"__rank_{column}").mean().over([session_column, sector_column])
+        )
+        sector_exprs.append(
+            ((pl.col(f"__rank_{column}") - sector_mean).cast(pl.Float32)).alias(
+                f"__sector_rank_{column}"
+            )
+        )
+    expanded = ranked.with_columns(sector_exprs)
+
+    out_exprs: list[pl.Expr] = []
+    for column in expanded.columns:
+        if column.startswith(("__rank_", "__sector_rank_")):
+            continue
+        if column in feature_columns:
+            continue
+        out_exprs.append(pl.col(column))
+    for column in feature_columns:
+        out_exprs.extend(
+            [
+                pl.col(column).cast(pl.Float32).alias(column),
+                pl.col(f"__rank_{column}").alias(f"{column}__rank"),
+                pl.col(f"__sector_rank_{column}").alias(f"{column}__sector_rank"),
+            ]
+        )
+    return expanded.select(out_exprs)
+
+
+def v2_missing_rates(
+    frame: pl.DataFrame,
+    feature_columns: tuple[str, ...],
+    *,
+    coverage_threshold: float = 0.75,
+    missing_flag_threshold: float = 0.01,
+) -> dict[str, float]:
+    """Per-feature training-window null rates and coverage exclusions.
+
+    A non-null ratio below ``coverage_threshold`` excludes the feature;
+    a missing rate above ``missing_flag_threshold`` sets its missing flag.
+    """
+    rates: dict[str, float] = {}
+    for column in feature_columns:
+        non_null = frame[column].is_not_null().sum()
+        rates[column] = 1.0 - (float(non_null) / frame.height if frame.height else 1.0)
+    return rates
+
+
+def _reject_target_columns(frame: pl.DataFrame, feature_columns: tuple[str, ...]) -> None:
+    del frame
+    offending = [c for c in feature_columns if c.startswith(_TARGET_PREFIXES)]
+    if offending:
+        raise ValueError(f"v2 predictor rejects target/label columns: {offending}")
 
 
 def phase1_allowlist() -> list[FeatureDefinition]:
