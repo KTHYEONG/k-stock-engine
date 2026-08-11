@@ -101,8 +101,12 @@ class PurgedWalkForward:
 
         folds: list[Fold] = []
         validation_window = self.validation_window_sessions or max(1, len(sessions) // self.n_folds)
+        # Start validation only after enough sessions exist for a real training
+        # sample.  Purge and embargo rows are excluded from that sample, so
+        # include both intervals in the offset before constructing the block.
+        first_validation_start = self.min_train_sessions + self.label_horizon_sessions + self.embargo_sessions
         for k in range(self.n_folds):
-            v_start = k * validation_window
+            v_start = first_validation_start + k * validation_window
             v_end = (
                 min(len(sessions), v_start + validation_window)
                 if k < self.n_folds - 1

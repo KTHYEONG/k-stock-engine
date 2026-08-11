@@ -9,6 +9,25 @@ from tests.fixtures.stocks.helpers import stock_instrument_df
 
 
 class TestPurgedWalkForward:
+    def test_minimum_training_window_offsets_first_validation_block(self) -> None:
+        df = stock_instrument_df(n_sessions=60, n_tickers=3, horizon=5)
+        splitter = PurgedWalkForward(
+            n_folds=1,
+            label_horizon_sessions=5,
+            embargo_sessions=2,
+            session_column="session_index",
+            validation_window_sessions=10,
+            min_train_sessions=20,
+        )
+
+        folds = splitter.split(df)
+
+        assert folds
+        fold = folds[0]
+        assert fold.num_train() >= 20 * 3
+        assert fold.validation_decision_start >= 20 + 5 + 2
+        assert fold.train_label_end < fold.validation_decision_start
+
     def test_no_training_label_interval_intersects_validation(self) -> None:
         df = stock_instrument_df(n_sessions=60, n_tickers=3, horizon=5)
         splitter = PurgedWalkForward(
@@ -102,4 +121,3 @@ class TestPurgedWalkForward:
         splitter.mark_holdout_inspected("candidate_v1")
         with pytest.raises(ValueError, match="already inspected"):
             splitter.pin_holdout("candidate_v1")
-
