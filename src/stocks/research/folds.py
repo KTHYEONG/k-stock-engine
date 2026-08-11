@@ -45,6 +45,8 @@ class PurgedWalkForward:
         label_horizon_sessions: int,
         embargo_sessions: int = 0,
         session_column: str = "session_index",
+        validation_window_sessions: int | None = None,
+        min_train_sessions: int = 0,
     ):
         if n_folds < 1:
             raise ValueError("n_folds must be positive")
@@ -52,10 +54,16 @@ class PurgedWalkForward:
             raise ValueError("label_horizon_sessions must be positive")
         if embargo_sessions < 0:
             raise ValueError("embargo_sessions must be non-negative")
+        if validation_window_sessions is not None and validation_window_sessions < 1:
+            raise ValueError("validation_window_sessions must be positive")
+        if min_train_sessions < 0:
+            raise ValueError("min_train_sessions must be non-negative")
         self.n_folds = n_folds
         self.label_horizon_sessions = label_horizon_sessions
         self.embargo_sessions = embargo_sessions
         self.session_column = session_column
+        self.validation_window_sessions = validation_window_sessions
+        self.min_train_sessions = min_train_sessions
         self._inspected_holdout_fingerprints: set[str] = set()
 
     def _validate_no_duplicate_sessions(self, samples: pl.DataFrame) -> None:
@@ -92,7 +100,7 @@ class PurgedWalkForward:
         _all_rows, by_session = self._row_index(samples)
 
         folds: list[Fold] = []
-        validation_window = max(1, len(sessions) // self.n_folds)
+        validation_window = self.validation_window_sessions or max(1, len(sessions) // self.n_folds)
         for k in range(self.n_folds):
             v_start = k * validation_window
             v_end = (
@@ -100,6 +108,8 @@ class PurgedWalkForward:
                 if k < self.n_folds - 1
                 else len(sessions)
             )
+            if v_start >= len(sessions):
+                break
             fold = self._purged_fold(sessions, by_session, sessions[v_start:v_end])
             if fold is None:
                 continue
@@ -122,7 +132,7 @@ class PurgedWalkForward:
             return []
         _, by_session = self._row_index(samples)
         folds: list[Fold] = []
-        validation_window = max(1, len(sessions) // n_inner)
+        validation_window = self.validation_window_sessions or max(1, len(sessions) // n_inner)
         for k in range(n_inner):
             v_start = k * validation_window
             v_end = (
@@ -130,6 +140,8 @@ class PurgedWalkForward:
                 if k < n_inner - 1
                 else len(sessions)
             )
+            if v_start >= len(sessions):
+                break
             fold = self._purged_fold(sessions, by_session, sessions[v_start:v_end])
             if fold is not None:
                 folds.append(fold)
@@ -178,6 +190,8 @@ class PurgedWalkForward:
             < validation_decision_start
         ]
         if not train_sessions:
+            return None
+        if len(train_sessions) < self.min_train_sessions:
             return None
         train_mask: list[int] = []
         validation_mask: list[int] = []
