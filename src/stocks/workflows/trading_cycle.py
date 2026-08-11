@@ -149,7 +149,12 @@ def run_trading_cycle(
     if universe_gate.is_empty():
         return _no_trade_result(request, manifest, portfolio, dataset_hash, "empty-universe-after-gate")
 
-    feature_frame = build_features(research_eligible_frame(universe_gate), phase1_allowlist())
+    gated = _drop_label_columns(research_eligible_frame(universe_gate))
+    feature_frame = (
+        gated
+        if manifest.feature_set == "stock_alpha_v2"
+        else build_features(gated, phase1_allowlist())
+    )
     scored = loaded.model.predict(feature_frame)
     if scored.is_empty():
         return _no_trade_result(request, manifest, portfolio, dataset_hash, "empty-scored-panel")
@@ -232,6 +237,23 @@ def _universe_gate(frame: pl.DataFrame) -> pl.DataFrame:
     if "tradable" in gated.columns:
         gated = gated.filter(pl.col("tradable"))
     return gated
+
+
+def _drop_label_columns(frame: pl.DataFrame) -> pl.DataFrame:
+    """Remove canonical label columns so scoring never observes a label."""
+    from src.stocks.research.labels import (
+        LABEL_AVAILABLE_COLUMN,
+        RELEVANCE_COLUMN,
+        RESIDUAL_O2O_LABEL,
+    )
+
+    drops = [
+        c
+        for c in frame.columns
+        if c.startswith(("target_", "label_", "residual_"))
+        or c in (LABEL_AVAILABLE_COLUMN, RELEVANCE_COLUMN, RESIDUAL_O2O_LABEL, "fwd_ret_5d")
+    ]
+    return frame.drop(drops)
 
 
 def _build_intents(
