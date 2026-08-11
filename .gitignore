@@ -49,6 +49,12 @@ pip-delete-this-directory.txt
 #logs
 logs/   
 
+# uv project-local fallback cache
+scratch/uv-cache/
+
+# Project-only temp root (pytest/tempfile/TMPDIR pinned via tests/conftest.py)
+tmp/
+
 # Unit test / coverage reports
 htmlcov/
 .tox/
