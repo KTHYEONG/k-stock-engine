@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_DATA_STORAGE_REORGANIZATION",
+      "date": "2026-08-11",
+      "adr_id": "ADR_20260811_DATA_STORAGE_REORGANIZATION",
+      "domain": "stocks-data",
+      "title": "Data storage inventory and lifecycle reorganization",
+      "why": "The 4.7 GB data tree mixed cataloged research inputs, raw evidence, legacy files, and mutable runtime state, making retention and backtest/ML usage ambiguous.",
+      "resolution": "Added manifest-aware read-only inventory and lifecycle classification, wired catalog CLI inventory output, protected catalog and snapshot references from archive candidates, and documented a staged migration layout without deleting data.",
+      "impact": "Backtest and ML consumers have an auditable modern data boundary; legacy and evidence remain preserved until hash-verified migration. Inventory and tests pass, and physical cleanup remains a separately reviewable operation."
+    },
+    {
       "task_id": "TASK_DART_DATASET_READINESS",
       "date": "2026-08-11",
       "adr_id": "ADR_20260811_DART_DATASET_READINESS",

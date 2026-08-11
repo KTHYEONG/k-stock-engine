@@ -324,5 +324,8 @@
   "src/stocks/data/readiness.py": {
     "architecture": "docs/specs/dart_dataset_readiness.md",
     "testing": "tests/unit/stocks/data/test_readiness.py"
+  },
+  "src/stocks/data/inventory.py": {
+    "testing": "tests/unit/stocks/data/test_inventory.py"
   }
 }
