@@ -126,10 +126,10 @@ def test_event_replay_executes_intents_for_scored_allocations(tmp_path) -> None:
     )
     assert replay.planned_cycles > 0
     assert replay.attempted_orders > 0
-    assert replay.filled_orders >= 0
+    assert replay.filled_orders > 0
+    assert "constraint:insufficient covariance data" not in replay.no_trade_reason_counts
     assert replay.base_total_return != 0.0 or replay.strategy_returns
     assert replay.benchmark_returns
-    assert "no-feasible-allocation" in replay.no_trade_reason_counts
 
 
 def test_training_uses_requested_purged_walk_forward_fold_count(tmp_path, monkeypatch) -> None:
@@ -295,3 +295,200 @@ def test_deflated_sharpe_consumes_trials_and_fails_closed() -> None:
         )
         == 0.0
     )
+
+
+def test_tuning_never_includes_first_outer_oos(monkeypatch) -> None:
+    import src.stocks.workflows.train_model as tm
+
+    monkeypatch.setattr(tm, "_MIN_TRAIN_SESSIONS", 40)
+    monkeypatch.setattr(tm, "_VALIDATION_BLOCK_SESSIONS", 30)
+
+    df = stock_v2_composed_df(n_sessions=140, n_tickers=20)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    label_span = (manifest.label_horizon_sessions or 1) + 1
+    folds = tm.PurgedWalkForward(
+        n_folds=3,
+        label_horizon_sessions=label_span,
+        embargo_sessions=5,
+        session_column="session_index",
+        validation_window_sessions=30,
+        min_train_sessions=40,
+    ).split(panel)
+    assert len(folds) == 3
+
+    captured: dict[str, int] = {}
+
+    def fake_stable_contexts(tuning_panel, tuning_folds, *_args, **_kwargs):
+        captured["tuning_max_session"] = int(tuning_panel["session_index"].max())
+        captured["tuning_min_session"] = int(tuning_panel["session_index"].min())
+        return [None] * len(tuning_folds)
+
+    monkeypatch.setattr(tm, "_fit_stable_contexts", fake_stable_contexts)
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+
+    request = TrainingRequest(artifact_id="tune_oos", n_folds=3, optuna_trials=3)
+    config, n_trials = tm._tune_champion(
+        panel,
+        folds,
+        request,
+        tm.ModelManifest(
+            artifact_id="tune_oos",
+            asset_kind=__import__("src.core.instruments", fromlist=["AssetKind"]).AssetKind.STOCK,
+            feature_set="stock_alpha_v2",
+            feature_schema_hash="hash",
+            universe_policy_hash="universe",
+            label_definition=manifest.label_definition,
+            label_horizon_sessions=manifest.label_horizon_sessions,
+            eligible_from="2024-01-01T00:00:00+00:00",
+            eligible_to="2024-12-31T00:00:00+00:00",
+            model_type="lambdarank_blend",
+        ),
+        tuple(c for c in df.columns if c.startswith("feature__")),
+        "residual_o2o_5d",
+        "relevance",
+        label_span,
+    )
+    assert captured["tuning_max_session"] < folds[0].validation_decision_start
+    assert n_trials == request.optuna_trials
+    assert config is not None
+
+
+def test_tuning_counts_pruned_trials_for_deflated_sharpe(monkeypatch) -> None:
+    import src.stocks.workflows.train_model as tm
+
+    monkeypatch.setattr(tm, "_MIN_TRAIN_SESSIONS", 40)
+    monkeypatch.setattr(tm, "_VALIDATION_BLOCK_SESSIONS", 30)
+
+    df = stock_v2_composed_df(n_sessions=100, n_tickers=10)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    label_span = (manifest.label_horizon_sessions or 1) + 1
+    folds = tm.PurgedWalkForward(
+        n_folds=2,
+        label_horizon_sessions=label_span,
+        embargo_sessions=5,
+        session_column="session_index",
+        validation_window_sessions=30,
+        min_train_sessions=40,
+    ).split(panel)
+    assert len(folds) == 2
+
+    monkeypatch.setattr(
+        tm,
+        "_fit_stable_contexts",
+        lambda _panel, tuning_folds, *_a, **_kw: [None] * len(tuning_folds),
+    )
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: None)
+
+    request = TrainingRequest(artifact_id="tune_prune", n_folds=2, optuna_trials=4)
+    config, n_trials = tm._tune_champion(
+        panel,
+        folds,
+        request,
+        tm.ModelManifest(
+            artifact_id="tune_prune",
+            asset_kind=__import__("src.core.instruments", fromlist=["AssetKind"]).AssetKind.STOCK,
+            feature_set="stock_alpha_v2",
+            feature_schema_hash="hash",
+            universe_policy_hash="universe",
+            label_definition=manifest.label_definition,
+            label_horizon_sessions=manifest.label_horizon_sessions,
+            eligible_from="2024-01-01T00:00:00+00:00",
+            eligible_to="2024-12-31T00:00:00+00:00",
+            model_type="lambdarank_blend",
+        ),
+        tuple(c for c in df.columns if c.startswith("feature__")),
+        "residual_o2o_5d",
+        "relevance",
+        label_span,
+    )
+    assert n_trials == request.optuna_trials
+    assert config is None
+
+
+def test_resource_breach_publishes_no_artifact(tmp_path, monkeypatch) -> None:
+    import src.stocks.workflows.train_model as tm
+
+    monkeypatch.setattr(tm, "_MIN_TRAIN_SESSIONS", 40)
+    monkeypatch.setattr(tm, "_VALIDATION_BLOCK_SESSIONS", 30)
+
+    snapshot, _df = _snapshot(n_sessions=140, n_tickers=20)
+    artifact_root = tmp_path / "artifacts"
+    registry = ModelArtifactRegistry(artifact_root)
+    with pytest.raises(tm.TrainingCapacityError):
+        train_model(
+            snapshot,
+            registry,
+            TrainingRequest(
+                artifact_id="breach_v1", n_folds=3, optuna_trials=2, max_rss_mib=1
+            ),
+        )
+    assert not (artifact_root / "breach_v1").exists()
+
+
+def test_bounded_replay_history_contract(tmp_path) -> None:
+    from src.core.portfolio import PortfolioSnapshot
+    from src.stocks.trading.portfolio_constructor import (
+        StockRiskPolicy,
+        construct_target_allocations,
+    )
+    from src.stocks.workflows.train_model import (
+        _bounded_replay_history,
+        _instruments_from_frame,
+    )
+
+    df = stock_v2_composed_df(n_sessions=100, n_tickers=8)
+    panel = _index_sessions(df)
+    frame = panel.drop("session_index")
+    adtv_lookup = (
+        frame.sort("session")
+        .with_columns(
+            pl.col("trading_value").rolling_mean(20, min_samples=1).over("instrument_id").alias("adtv")
+        )
+        .select("instrument_id", "session", "adtv")
+    )
+    last_30_sessions = frame["session"].unique().sort(descending=True).head(30)
+    oos_scored = frame.filter(pl.col("session").is_in(last_30_sessions)).with_columns(
+        pl.col("market_cap").rank("dense").over("session").cast(pl.Float64).alias("pred_score")
+    )
+    scored_for_replay = (
+        frame.join(
+            oos_scored.select("instrument_id", "session", "pred_score"),
+            on=["instrument_id", "session"],
+            how="left",
+        ).join(adtv_lookup, on=["instrument_id", "session"], how="left")
+    )
+    policy = StockRiskPolicy(top_k=8, gross_cap=1.0, single_name_cap=0.2, participation_limit=0.01)
+    decision_time = oos_scored["session"].max()
+    bounded = _bounded_replay_history(scored_for_replay, decision_time, policy)
+
+    assert bounded["session"].max() <= decision_time
+    assert (
+        bounded["session"].n_unique()
+        <= max(policy.volatility_lookback_sessions, policy.covariance_lookback_sessions) + 1
+    )
+    first_scored = oos_scored["session"].min()
+    pre_os = bounded.filter(pl.col("session") < first_scored)
+    assert pre_os["pred_score"].null_count() == pre_os.height
+    decision_rows = bounded.filter(pl.col("session") == decision_time)
+    assert decision_rows["pred_score"].is_not_null().all()
+
+    instruments = _instruments_from_frame(frame)
+    portfolio = PortfolioSnapshot(
+        account_snapshot_id="promotion",
+        as_of=decision_time,
+        settled_cash=100_000_000.0,
+        unsettled_cash=0.0,
+        positions=(),
+    )
+    full = scored_for_replay.filter(pl.col("session") <= decision_time)
+    assert construct_target_allocations(bounded, instruments, portfolio, policy) == (
+        construct_target_allocations(full, instruments, portfolio, policy)
+    )
+
+    with pytest.raises(ValueError, match="session and pred_score"):
+        _bounded_replay_history(frame, decision_time, policy)
+    empty = scored_for_replay.filter(pl.col("session") < first_scored)
+    with pytest.raises(ValueError, match="no scored cross-section"):
+        _bounded_replay_history(empty, decision_time, policy)

@@ -29,6 +29,24 @@ def test_train_cli_rejects_missing_snapshot_id() -> None:
         train.main(["--artifact-id", "a1"])
 
 
+def test_train_cli_exposes_trial_and_budget_args() -> None:
+    parser = train.build_parser()
+    args = parser.parse_args(
+        [
+            "--artifact-id",
+            "a1",
+            "--snapshot-id",
+            "s1",
+            "--optuna-trials",
+            "120",
+            "--max-rss-mib",
+            "4096",
+        ]
+    )
+    assert args.optuna_trials == 120
+    assert args.max_rss_mib == 4096
+
+
 def test_train_cli_resolves_snapshot_and_composes(monkeypatch) -> None:
     captured: dict[str, object] = {}
 

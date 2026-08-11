@@ -3,17 +3,21 @@
 The workflow consumes the composed labeled v2 snapshot (base OHLCV + ``feature__*``
 stock_alpha_v2 columns + canonical residual labels), runs a purged/embargoed
 expanding walk-forward with quarterly refits, tunes the ``LambdaRankBlendModel``
-with seeded Optuna TPE trials on the development window only, evaluates every
-fold through the event-driven ``StockBacktester`` under base and stress costs,
-and publishes either an immutable champion or an immutable ``NO_TRADE`` artifact.
-Promotion is lexicographic and fail-closed; a failing gate never relaxes
-parameters. Promotion remains false until a frozen candidate passes one new
-252-session forward holdout starting after 2026-03-10.
+with seeded serial Optuna TPE trials on a prequential panel derived exclusively
+from the first outer fold's training mask, evaluates every fold through the
+event-driven ``StockBacktester`` under base and stress costs, and publishes
+either an immutable champion or an immutable ``NO_TRADE`` artifact. The trial
+search is bounded by an explicit or effective RSS budget and replays scored
+scores with bounded point-in-time market history. Promotion is lexicographic
+and fail-closed; a failing gate never relaxes parameters. Promotion remains
+false until a frozen candidate passes one new 252-session forward holdout
+starting after 2026-03-10.
 """
 from __future__ import annotations
 
 import logging
 import math
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
@@ -23,6 +27,7 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 import optuna
 import polars as pl
+import psutil
 
 from src.core.costs import CostSchedule, default_base_schedule, default_stress_schedule
 from src.core.datasets import DatasetManifest
@@ -46,7 +51,8 @@ from src.stocks.research.labels import (
     RESIDUAL_O2O_LABEL,
 )
 from src.stocks.research.lambdarank import LambdaRankBlendModel, LambdaRankConfig
-from src.stocks.research.models import ModelManifest
+from src.stocks.research.models import ModelManifest, StableRankComposite
+from src.stocks.trading.portfolio_constructor import StockRiskPolicy
 from src.stocks.workflows.contracts import TrainingRequest
 
 if TYPE_CHECKING:
@@ -60,10 +66,11 @@ _MIN_TRAIN_SESSIONS = 756
 _VALIDATION_BLOCK_SESSIONS = 252
 _REFIT_EVERY_SESSIONS = 63
 _REBALANCE_EVERY_SESSIONS = 5
-_N_OPTUNA_TRIALS = 80
 _FORWARD_HOLDOUT_START = date(2026, 3, 10)
 _FORWARD_HOLDOUT_SESSIONS = 252
 _MIN_GROUP_SIZE = 20
+_BYTES_PER_CELL = 4
+_ALLOCATION_MULTIPLE = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +102,102 @@ class ReplayResult:
     attempted_orders: int = 0
     filled_orders: int = 0
     no_trade_reason_counts: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingCapacityError(RuntimeError):
+    """Raised when the trial search cannot fit its allocation under the RSS budget."""
+
+    message: str = ""
+
+    def __str__(self) -> str:
+        return self.message
+
+
+class TrialResourceGuard:
+    """Admit each fold's allocation against an explicit or effective RSS budget.
+
+    The effective limit is the explicit ``request.max_rss_mib``; absent one it
+    is the process memory ceiling less the memory already unavailable according
+    to ``psutil.virtual_memory()``. The per-fold estimate is the conservative
+    design-matrix lower bound ``rows * predictor_count * 4 * 3`` bytes and is
+    intentionally not a full peak bound. Baseline, peak RSS, estimates, and
+    trial/fold timings are recorded for Optuna study user attributes and the
+    published artifact metrics.
+    """
+
+    def __init__(self, request: TrainingRequest, predictor_count: int) -> None:
+        self._predictor_count = predictor_count
+        self._limit_mib = (
+            float(request.max_rss_mib)
+            if request.max_rss_mib is not None
+            else self._effective_limit_mib()
+        )
+        self.baseline_rss_mib = self._rss_mib()
+        self.peak_rss_mib = self.baseline_rss_mib
+        self.fold_timings: dict[str, float] = {}
+        self.estimates_mib: dict[str, float] = {}
+
+    @staticmethod
+    def _rss_mib() -> float:
+        return float(psutil.Process().memory_info().rss) / (1024 * 1024)
+
+    @staticmethod
+    def _effective_limit_mib() -> float:
+        vm = psutil.virtual_memory()
+        available = float(vm.available)
+        if available <= 0.0:
+            available = float(vm.total)
+        return available / (1024 * 1024)
+
+    def estimate_mib(self, rows: int) -> float:
+        """Conservative per-fold design-matrix lower bound in MiB."""
+        return rows * self._predictor_count * _BYTES_PER_CELL * _ALLOCATION_MULTIPLE / (1024 * 1024)
+
+    def admit(self, rows: int) -> None:
+        """Reject the run before allocation when the increment cannot fit."""
+        estimate = self.estimate_mib(rows)
+        current = self._rss_mib()
+        self.peak_rss_mib = max(self.peak_rss_mib, current)
+        if current + estimate > self._limit_mib:
+            raise TrainingCapacityError(
+                f"training capacity breach: current RSS {current:.1f} MiB plus "
+                f"estimated design matrix {estimate:.1f} MiB exceeds the "
+                f"{self._limit_mib:.1f} MiB limit"
+            )
+
+    def check_after(self) -> None:
+        """Reject when the sampled process RSS exceeds the limit after a fold."""
+        current = self._rss_mib()
+        self.peak_rss_mib = max(self.peak_rss_mib, current)
+        if current > self._limit_mib:
+            raise TrainingCapacityError(
+                f"training capacity breach: measured RSS {current:.1f} MiB exceeds "
+                f"the {self._limit_mib:.1f} MiB limit"
+            )
+
+    def record_fold(self, key: str, elapsed_seconds: float, estimate_mib: float) -> None:
+        self.fold_timings[key] = elapsed_seconds
+        self.estimates_mib[key] = estimate_mib
+
+    def telemetry(self) -> dict[str, object]:
+        return {
+            "baseline_rss_mib": round(self.baseline_rss_mib, 3),
+            "peak_rss_mib": round(self.peak_rss_mib, 3),
+            "limit_mib": round(self._limit_mib, 3),
+            "trial_fold_timings_seconds": dict(self.fold_timings),
+            "estimates_mib": dict(self.estimates_mib),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _StableTrialContext:
+    """Per-tuning-fold inputs invariant across every LambdaRank search parameter."""
+
+    train_processed: pl.DataFrame
+    validation_processed: pl.DataFrame
+    validation_frame: pl.DataFrame
+    stable_scores: pl.DataFrame
 
 
 def train_model(
@@ -226,6 +329,7 @@ def train_model(
         request.artifact_id,
         _build_metrics(
             request, replay, fold_rank_ic, gates, reasons, published_manifest,
+            tuning_telemetry=getattr(champion_config, "_tuning_telemetry", {}),
         ),
     )
     logger.info(
@@ -297,26 +401,35 @@ def _tune_champion(
     relevance_column: str | None,
     label_span_sessions: int,
 ) -> tuple[LambdaRankConfig | None, int]:
-    """Run seeded Optuna TPE trials on the development folds and select lexicographically.
+    """Run a temporally isolated serial Optuna TPE search and select lexicographically.
 
-    Returns ``(config, n_trials)`` where ``n_trials`` is the actual number of
-    sampled configurations (``len(study.trials)``) consumed by the Deflated
-    Sharpe gate.
+    The tuning panel is derived exclusively from ``folds[0].train_mask``, the
+    last purged-and-embargoed data available before the first outer validation
+    decision, so no outer validation row influences hyperparameter selection.
+    Trials run serially (``n_jobs=1``), one inner fold at a time, pruning
+    immediately on non-positive fold Rank-IC or an Optuna median-pruner
+    decision; per-fold models, predictions, and LightGBM datasets are released
+    before the next fold. Returns ``(config, n_trials)`` where ``n_trials`` is
+    the completed plus pruned terminal trial count fed to Deflated Sharpe; a
+    count that does not equal ``request.optuna_trials`` never selects a
+    champion.
     """
-    dev = (
-        pl.concat([panel[fold.train_mask] for fold in folds])
-        .unique(subset=["instrument_id", "session_index"], keep="first")
-        .sort("session_index")
-    )
-    dev_folds = PurgedWalkForward(
+    tuning_panel = panel[folds[0].train_mask]
+    tuning_folds = PurgedWalkForward(
         n_folds=max(1, min(3, len(folds))),
         label_horizon_sessions=label_span_sessions,
         embargo_sessions=request.embargo_sessions,
         session_column="session_index",
         min_train_sessions=_MIN_TRAIN_SESSIONS // 2,
-    ).split(dev)
-    if not dev_folds:
+    ).split(tuning_panel)
+    if not tuning_folds:
         return None, 0
+
+    guard = TrialResourceGuard(request, predictor_count=len(feature_columns) * 3)
+    contexts = _fit_stable_contexts(
+        tuning_panel, tuning_folds, base_manifest, feature_columns, label_column,
+        relevance_column,
+    )
 
     storage = optuna.storages.InMemoryStorage()
     study = optuna.create_study(
@@ -324,24 +437,167 @@ def _tune_champion(
         study_name=f"lambdarank_v2_{request.artifact_id}",
         storage=storage,
         sampler=optuna.samplers.TPESampler(seed=request.seed, n_startup_trials=10),
+        pruner=optuna.pruners.MedianPruner(
+            n_startup_trials=max(1, request.optuna_trials // 5),
+            n_warmup_steps=0,
+        ),
     )
 
     def objective(trial: optuna.Trial) -> float:
         config = _config_from_trial(trial)
-        _models, _scored, fold_ic = _fit_and_score_folds(
-            dev, dev_folds, request, base_manifest, feature_columns, label_column,
-            relevance_column, config,
-        )
-        if not fold_ic:
-            raise optuna.TrialPruned()
-        if any(ic <= 0.0 for ic in fold_ic):
-            raise optuna.TrialPruned()
-        return float(np.median(fold_ic))
+        fold_rank_ic: list[float] = []
+        for fold_index, fold in enumerate(tuning_folds):
+            ic = _score_trial_fold(
+                tuning_panel, fold, contexts[fold_index], request, base_manifest,
+                feature_columns, label_column, relevance_column, config, guard,
+                trial, fold_index,
+            )
+            if ic is None:
+                raise optuna.TrialPruned()
+            trial.report(float(ic), step=fold_index)
+            if ic <= 0.0:
+                raise optuna.TrialPruned()
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+            fold_rank_ic.append(float(ic))
+        return float(np.median(fold_rank_ic))
 
-    study.optimize(objective, n_trials=_N_OPTUNA_TRIALS, show_progress_bar=False)
-    if not study.trials or study.best_trial is None:
-        return None, len(study.trials)
-    return _config_from_params(dict(study.best_params)), len(study.trials)
+    study.optimize(objective, n_trials=request.optuna_trials, n_jobs=1, show_progress_bar=False)
+    n_terminal = sum(
+        1
+        for t in study.trials
+        if t.state in (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED)
+    )
+    telemetry = guard.telemetry()
+    for name, value in telemetry.items():
+        study.set_user_attr(name, value)
+    study.set_user_attr("n_terminal_trials", n_terminal)
+    study.set_user_attr("optuna_trials", request.optuna_trials)
+    best_trial = _completed_best_trial(study)
+    if n_terminal != request.optuna_trials or not study.trials or best_trial is None:
+        return None, n_terminal
+    champion = _config_from_params(dict(best_trial.params))
+    champion._tuning_telemetry = dict(study.user_attrs)
+    return champion, n_terminal
+
+
+def _completed_best_trial(study: optuna.Study) -> optuna.trial.FrozenTrial | None:
+    """Best completed trial without Optuna's all-pruned ``ValueError``."""
+    best: optuna.trial.FrozenTrial | None = None
+    best_value = float("-inf")
+    for trial in study.trials:
+        if trial.state is not optuna.trial.TrialState.COMPLETE:
+            continue
+        value = trial.value
+        if value is None:
+            continue
+        if best is None or value > best_value:
+            best = trial
+            best_value = value
+    return best
+
+
+def _fit_stable_contexts(
+    tuning_panel: pl.DataFrame,
+    tuning_folds: list[Fold],
+    base_manifest: ModelManifest,
+    feature_columns: tuple[str, ...],
+    label_column: str,
+    relevance_column: str | None,
+) -> list[_StableTrialContext]:
+    """Fit one StableRankComposite per immutable tuning-fold context.
+
+    The composite's fitted weights/orientations/winsors and the validation
+    stable scores are invariant across every LambdaRank search parameter, so
+    they are computed once and cached; only the slim ``(session,
+    instrument_id, pred_score)`` score frame is retained as the search cache.
+    """
+    del relevance_column
+    allowlist = stock_alpha_v2_allowlist()
+    contexts: list[_StableTrialContext] = []
+    for fold in tuning_folds:
+        train_frame = tuning_panel[fold.train_mask]
+        validation_frame = tuning_panel[fold.validation_mask]
+        quantiles = fit_v2_winsor_quantiles(train_frame, feature_columns)
+        train_processed = apply_v2_transforms(
+            train_frame, feature_columns, winsor_quantiles=quantiles
+        )
+        validation_processed = apply_v2_transforms(
+            validation_frame, feature_columns, winsor_quantiles=quantiles
+        )
+        stable = StableRankComposite(
+            factors=allowlist,
+            manifest=base_manifest,
+            label_column=label_column,
+            block_length=base_manifest.label_horizon_sessions,
+            session_column="session",
+        )
+        stable.fit(train_processed, validation_processed)
+        predict_input = _drop_target_columns(validation_processed, label_column)
+        stable_scores = stable.predict(predict_input).select(
+            "session", "instrument_id", "pred_score"
+        )
+        contexts.append(
+            _StableTrialContext(
+                train_processed=train_processed,
+                validation_processed=validation_processed,
+                validation_frame=validation_frame,
+                stable_scores=stable_scores,
+            )
+        )
+    return contexts
+
+
+def _score_trial_fold(
+    tuning_panel: pl.DataFrame,
+    fold: Fold,
+    context: _StableTrialContext,
+    request: TrainingRequest,
+    base_manifest: ModelManifest,
+    feature_columns: tuple[str, ...],
+    label_column: str,
+    relevance_column: str | None,
+    config: LambdaRankConfig,
+    guard: TrialResourceGuard,
+    trial: optuna.Trial,
+    fold_index: int,
+) -> float | None:
+    """Score one tuning fold with the cached stable context; ``None`` prunes.
+
+    The resource guard admits the allocation before fitting, samples process
+    RSS afterward, and a breach raises :class:`TrainingCapacityError`. Fold
+    model, prediction frame, and LightGBM datasets are local to this call and
+    released on return, so a trial never retains every fold's artifacts.
+    """
+    del tuning_panel, fold, feature_columns
+    key = f"trial_{trial.number}_fold_{fold_index}"
+    guard.admit(context.train_processed.height)
+    started = time.perf_counter()
+    model = LambdaRankBlendModel(
+        base_manifest,
+        stock_alpha_v2_allowlist(),
+        label_column,
+        config=config,
+        session_column="session",
+        relevance_column=relevance_column or RELEVANCE_COLUMN,
+    )
+    try:
+        fit_ok = model.fit_trial(
+            context.train_processed, context.validation_processed, context.stable_scores
+        )
+    except ValueError:
+        fit_ok = False
+    if not fit_ok or model.no_trade:
+        guard.record_fold(key, time.perf_counter() - started, guard.estimate_mib(context.train_processed.height))
+        return None
+    predict_input = _drop_target_columns(context.validation_processed, label_column)
+    scored = model.predict(predict_input)
+    ic = _median_rank_ic(context.validation_frame, scored, label_column)
+    guard.record_fold(
+        key, time.perf_counter() - started, guard.estimate_mib(context.train_processed.height)
+    )
+    guard.check_after()
+    return float(ic)
 
 
 def _config_from_trial(trial: optuna.Trial) -> LambdaRankConfig:
@@ -442,7 +698,6 @@ def _event_ledger_evaluation(
         StockBacktester,
     )
     from src.stocks.data.costs import CostEvidence
-    from src.stocks.trading.portfolio_constructor import StockRiskPolicy
     from src.stocks.workflows.trading_cycle import (
         CycleStatus,
         TradingCycleRequest,
@@ -462,9 +717,11 @@ def _event_ledger_evaluation(
         .select("instrument_id", "session", "adtv")
     )
     scored_for_replay = (
-        oos_scored
-        if "adtv" in oos_scored.columns
-        else oos_scored.join(adtv_lookup, on=["instrument_id", "session"], how="left")
+        frame.join(
+            oos_scored.select("instrument_id", "session", "pred_score"),
+            on=["instrument_id", "session"],
+            how="left",
+        ).join(adtv_lookup, on=["instrument_id", "session"], how="left")
     )
     instruments = _instruments_from_frame(frame)
 
@@ -475,7 +732,9 @@ def _event_ledger_evaluation(
         participation_limit=request.participation_limit,
     )
 
-    scored_sessions = sorted(scored_for_replay["session"].unique().to_list())
+    scored_sessions = sorted(
+        scored_for_replay.filter(pl.col("pred_score").is_not_null())["session"].unique().to_list()
+    )
     if not scored_sessions:
         raise ValueError("scored OOS panel exposes no scored session")
     replay_frame = frame.filter(pl.col("session") >= scored_sessions[0])
@@ -507,13 +766,16 @@ def _event_ledger_evaluation(
         cycle_request: TradingCycleRequest,
     ) -> TradingCycleResult:
         del snapshot, registry_inner, instruments_map
-        visible = scored_for_replay.filter(
-            pl.col("session") <= cycle_request.decision_time
-        )
-        if visible.is_empty():
-            return _scored_no_trade(portfolio, cycle_request, "empty-scored-cross-section")
         from src.stocks.trading.portfolio_constructor import construct_target_allocations
 
+        try:
+            visible = _bounded_replay_history(
+                scored_for_replay, cycle_request.decision_time, policy
+            )
+        except ValueError as exc:
+            return _scored_no_trade(portfolio, cycle_request, f"constraint:{exc}")
+        if visible.is_empty():
+            return _scored_no_trade(portfolio, cycle_request, "empty-scored-cross-section")
         try:
             allocations = construct_target_allocations(
                 visible, instruments, portfolio, policy
@@ -619,6 +881,43 @@ def _event_ledger_evaluation(
         filled_orders=result.filled_orders,
         no_trade_reason_counts=no_trade_reason_counts,
     )
+
+
+def _bounded_replay_history(
+    scored: pl.DataFrame,
+    decision_time: datetime,
+    policy: StockRiskPolicy,
+) -> pl.DataFrame:
+    """Select the latest scored cross-section plus bounded point-in-time history.
+
+    Returns at most ``max(volatility_lookback_sessions,
+    covariance_lookback_sessions) + 1`` sessions ending at the latest scored
+    session at or before ``decision_time``. Historical rows before the first
+    OOS score keep ``pred_score = null``; the selection cross-section remains
+    the current frozen OOS score. No row after the decision is included.
+    Raises ``ValueError`` for a missing ``session``/``pred_score`` column or
+    when no scored cross-section exists at or before the decision time.
+    """
+    if "session" not in scored.columns or "pred_score" not in scored.columns:
+        raise ValueError("scored frame must carry session and pred_score columns")
+    visible = scored.filter(pl.col("session") <= decision_time)
+    latest_scored = visible.filter(pl.col("pred_score").is_not_null())
+    if latest_scored.is_empty():
+        raise ValueError(
+            f"no scored cross-section at or before decision_time={decision_time}"
+        )
+    decision_session = latest_scored["session"].max()
+    window = (
+        max(policy.volatility_lookback_sessions, policy.covariance_lookback_sessions)
+        + 1
+    )
+    window_sessions = (
+        visible.filter(pl.col("session") <= decision_session)
+        .select(pl.col("session").unique())
+        .sort("session", descending=True)
+        .head(window)
+    )
+    return visible.join(window_sessions, on="session", how="inner")
 
 
 def _session_as_datetime(session: object) -> datetime:
@@ -1185,6 +1484,8 @@ def _build_metrics(
     gates: dict[str, object],
     reasons: list[str],
     manifest: ModelManifest,
+    *,
+    tuning_telemetry: dict[str, object] | None = None,
 ) -> dict[str, object]:
     return {
         "artifact_id": request.artifact_id,
@@ -1206,4 +1507,6 @@ def _build_metrics(
         "benchmark_total_return": replay.benchmark_total_return,
         "promotion_reasons": reasons,
         "gates": gates,
+        "optuna_trials": request.optuna_trials,
+        "resource": tuning_telemetry or {},
     }
