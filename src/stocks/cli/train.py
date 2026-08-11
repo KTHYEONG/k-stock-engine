@@ -43,7 +43,7 @@ _V2_CONTRACT_MISMATCH_MARKERS = (
 )
 
 
-def main(args: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train a stock baseline model artifact")
     parser.add_argument("--artifact-id", required=True)
     parser.add_argument("--snapshot-id", required=True, help="immutable research snapshot id")
@@ -58,7 +58,24 @@ def main(args: list[str] | None = None) -> int:
         default="research",
         help="paper/live modes reject provisional snapshots",
     )
+    parser.add_argument(
+        "--optuna-trials",
+        type=int,
+        default=80,
+        help="number of serial LambdaRank search trials (default 80)",
+    )
+    parser.add_argument(
+        "--max-rss-mib",
+        type=int,
+        default=None,
+        help="explicit RSS budget in MiB; a breach raises TrainingCapacityError",
+    )
     parser.add_argument("--decision-time", type=datetime.fromisoformat, default=None)
+    return parser
+
+
+def main(args: list[str] | None = None) -> int:
+    parser = build_parser()
     parsed = parser.parse_args(args)
 
     settings = DEFAULT_STOCK_ALPHA
@@ -99,6 +116,8 @@ def main(args: list[str] | None = None) -> int:
         max_single_weight=0.08,
         max_exposure=0.90,
         participation_limit=0.005,
+        optuna_trials=parsed.optuna_trials,
+        max_rss_mib=parsed.max_rss_mib,
     )
     manifest = train_model(composed, registry, request)
     logger.info("published artifact %s", manifest.artifact_id)

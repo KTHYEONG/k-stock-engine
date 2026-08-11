@@ -11,7 +11,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hashlib import sha256
 
-import numpy as np
 import polars as pl
 
 ID_COLUMN = "instrument_id"
@@ -237,16 +236,27 @@ def fit_v2_winsor_quantiles(
     low: float = 0.01,
     high: float = 0.99,
 ) -> dict[str, tuple[float, float]]:
-    """Fit per-feature 1%/99% clip thresholds on training rows only."""
+    """Fit per-feature 1%/99% clip thresholds on training rows only.
+
+    A single vectorized Polars aggregation computes all train-only quantiles;
+    the linear interpolation matches the historical ``np.quantile`` contract.
+    Null-only columns still return ``(0.0, 0.0)``; non-finite values are
+    rejected fail-closed by the calling transform validation.
+    """
     quantiles: dict[str, tuple[float, float]] = {}
-    for column in feature_columns:
-        values = frame[column].drop_nulls().to_numpy().astype(float)
-        if values.size == 0:
-            quantiles[column] = (0.0, 0.0)
-            continue
+    if not feature_columns:
+        return quantiles
+    exprs: list[pl.Expr] = []
+    for index, column in enumerate(feature_columns):
+        source = pl.col(column).cast(pl.Float64)
+        exprs.append(source.quantile(low, interpolation="linear").alias(f"__qlo_{index}"))
+        exprs.append(source.quantile(high, interpolation="linear").alias(f"__qhi_{index}"))
+    values = frame.select(exprs).row(0)
+    for index, column in enumerate(feature_columns):
+        lo = values[2 * index]
+        hi = values[2 * index + 1]
         quantiles[column] = (
-            float(np.quantile(values, low)),
-            float(np.quantile(values, high)),
+            (0.0, 0.0) if lo is None and hi is None else (float(lo), float(hi))
         )
     return quantiles
 

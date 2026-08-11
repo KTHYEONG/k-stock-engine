@@ -30,6 +30,8 @@ class TrainingRequest:
     seed: int = 42
     n_bootstrap: int = 200
     bootstrap_alpha: float = 0.05
+    optuna_trials: int = 80
+    max_rss_mib: int | None = None
     top_k: int = 5
     max_single_weight: float = 0.2
     max_exposure: float = 1.0
@@ -50,6 +52,10 @@ class TrainingRequest:
             raise ValueError("n_bootstrap must be at least 2")
         if not 0.0 < self.bootstrap_alpha < 1.0:
             raise ValueError("bootstrap_alpha must be in (0, 1)")
+        if self.optuna_trials < 1:
+            raise ValueError("optuna_trials must be positive")
+        if self.max_rss_mib is not None and self.max_rss_mib <= 0:
+            raise ValueError("max_rss_mib must be positive when supplied")
 
 
 @dataclass(frozen=True, slots=True)
