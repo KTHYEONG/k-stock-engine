@@ -105,3 +105,57 @@ Sharpe·forward holdout을 모두 충족하지 못했다. 따라서 artifact는 
 - Model: `data/artifacts/stocks/lambdarank_v2_20260811_cost_master_r4_adtvfix/model.joblib`
 
 검증 결과: 대상 workflow 테스트 10 passed, `ruff check` PASS, `mypy` PASS.
+
+## 80-trial production benchmark (2026-08-11)
+
+동일 snapshot을 대상으로 새 artifact ID로 Optuna 80-trial benchmark를
+실행했다. 80개 terminal trial이 모두 완료됐으며, `max_rss_mib=8000` 제한에서
+OOM이나 resource guard 위반은 발생하지 않았다.
+
+- Snapshot: `research_provisional_20160104_20260227_cost_master_v2_r1`
+- Artifact: `lambdarank_v2_20260811_cost_master_r5_80trial_guard`
+- 결과: **NO_TRADE / 미승격**
+- Terminal trials: `80 / 80`
+- RSS: baseline `3297.9 MiB`, peak `3764.1 MiB`, limit `8000 MiB`
+- 실행 시간: 약 26분
+
+### 핵심 성과
+
+| 항목 | 결과 |
+|---|---:|
+| Evaluated folds | 3 |
+| Median Rank-IC | 0.09694661 |
+| Positive fold IC fraction | 1.0000 |
+| CAGR | 0.06291247 |
+| Annualized volatility | 0.08807378 |
+| Sharpe | 0.73728058 |
+| Max drawdown | 0.26692904 |
+| Exposure | 0.70326483 |
+| Turnover | 3.94630349 |
+| Cost drag | 0.00418692 |
+| Planned cycles | 283 |
+| Attempted orders | 3,040 |
+| Filled orders | 3,040 |
+
+### 비용 스트레스 및 승격 게이트
+
+| 항목 | 결과 | 판정 |
+|---|---:|---|
+| Base total return | 0.51544618 | 참고 |
+| Stress total return | 0.51363664 | 통과 |
+| Benchmark total return | -0.15048441 | 참고 |
+| Bootstrap excess lower bound | -0.00013637 | 실패 |
+| Strategy IR vs benchmark IR | 0.693059 vs -0.101442 | 참고 |
+| Deflated Sharpe probability | 0.257165 | 실패 (`< 0.95`) |
+| Forward holdout | 준비 안 됨 | 실패 |
+
+80-trial 탐색 후 Rank-IC는 이전 3-trial 결과보다 소폭 개선됐지만, 비용 반영
+replay의 CAGR·Sharpe·drawdown과 다중검정 보정 후 신뢰도는 개선되지 않았다.
+따라서 해당 artifact는 탐색·검증용으로 보존하며 paper/live 사용은 금지한다.
+
+### 산출물
+
+- Metrics: `data/artifacts/stocks/lambdarank_v2_20260811_cost_master_r5_80trial_guard/metrics.json`
+- Manifest: `data/artifacts/stocks/lambdarank_v2_20260811_cost_master_r5_80trial_guard/manifest.json`
+- Model: `data/artifacts/stocks/lambdarank_v2_20260811_cost_master_r5_80trial_guard/model.joblib`
+- Benchmark log: `scratch/lambdarank_v2_20260811_cost_master_r5_80trial_guard.log`

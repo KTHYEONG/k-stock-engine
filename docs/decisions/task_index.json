@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_BACKTEST_TRIAL_SCALABILITY",
+      "date": "2026-08-11",
+      "adr_id": "ADR_20260811_ML_BACKTEST_TRIAL_SCALABILITY",
+      "domain": "research",
+      "title": "ML/backtest 80-trial scalability and OOM guard",
+      "why": "Corrected three-fold LambdaRank validation could not complete the production 80-trial search: 240 LightGBM fits, repeated StableRank and frame copies, and model-selection leakage inflated runtime and memory risk.",
+      "resolution": "Added temporally isolated prequential tuning, serial fold-level pruning, StableRank reuse, float32/int32 conversion and vectorized quantiles, RSS admission/telemetry with fail-closed artifact publication, bounded point-in-time replay history, and project-local uv cache fallback.",
+      "impact": "Preserves NO_TRADE promotion gates while making the 80-trial path measurable and memory-bounded; replay avoids artificial covariance warm-up skips. 519 tests, ruff, mypy, and contract validation pass."
+    },
+    {
       "task_id": "TASK_STOCK_ALPHA_V2_TRAINING_IMPROVEMENT",
       "date": "2026-08-11",
       "adr_id": "ADR_20260811_STOCK_ALPHA_V2_TRAINING_IMPROVEMENT",
