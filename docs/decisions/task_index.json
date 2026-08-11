@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_LAMBDARANK_ECONOMIC_TUNING",
+      "date": "2026-08-11",
+      "adr_id": "ADR_20260811_STOCK_LAMBDARANK_ECONOMIC_TUNING",
+      "domain": "stocks",
+      "title": "LambdaRank economic tuning acceleration and selection",
+      "why": "80-trial production tuning required 1400.898 seconds in 129 inner-fold fits, while Rank-IC-only selection degraded Sharpe and drawdown.",
+      "resolution": "Added immutable prepared fold caches, reduced-budget NDCG pruning, fixed eight-candidate shortlist, exact inner event-ledger economic selection, and telemetry while preserving 80-trial DSR accounting and fail-closed promotion gates.",
+      "impact": "Reduces repeated tuning preprocessing and full refits; candidate selection now accounts for fills, costs, bootstrap excess, IR, drawdown, and turnover without using outer OOS or forward holdout data."
+    },
+    {
       "task_id": "TASK_ML_BACKTEST_TRIAL_SCALABILITY",
       "date": "2026-08-11",
       "adr_id": "ADR_20260811_ML_BACKTEST_TRIAL_SCALABILITY",
