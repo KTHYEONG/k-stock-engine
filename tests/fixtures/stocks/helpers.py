@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta, UTC
 from math import inf
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 
 from src.core.costs import TickSizeRule
@@ -145,6 +146,73 @@ def stock_manifest(
         universe_policy_version="fixture",
         row_count=len(cols) * 10,
         generated_time=decision_time,
+    )
+
+
+def stock_v2_composed_df(
+    n_sessions: int = 40,
+    n_tickers: int = 40,
+    horizon: int = 5,
+    start: datetime | None = None,
+    seed: int = 7,
+) -> pl.DataFrame:
+    """Deterministic composed v2 training panel: base + feature__* + residual labels.
+
+    Every row carries the 34 ``feature__`` stock_alpha_v2 columns, the
+    ``residual_o2o_5d`` label, its LambdaRank ``relevance``, and a
+    ``label_available_time`` so the trainer and scorer share one contract.
+    """
+    from src.stocks.research.features import stock_alpha_v2_allowlist
+    from src.stocks.research.labels import residual_open_to_open_label
+
+    allowlist = stock_alpha_v2_allowlist()
+    rng = np.random.default_rng(seed)
+    start = start or datetime(2024, 1, 1, tzinfo=UTC)
+    rows: list[dict] = []
+    for t in range(n_tickers):
+        price = 100.0
+        for s in range(n_sessions):
+            obs = start + timedelta(days=s)
+            price = max(10.0, price * (1.0 + float(rng.normal(0.0, 0.02))))
+            rows.append(
+                {
+                    "session_index": s,
+                    "session": obs,
+                    "instrument_id": f"KRX:0{t + 1:05d}",
+                    "observation_time": obs.replace(hour=15, minute=30, tzinfo=UTC),
+                    "available_time": obs.replace(hour=15, minute=31, tzinfo=UTC),
+                    "open": price,
+                    "high": price * 1.01,
+                    "low": price * 0.99,
+                    "close": price * 1.001,
+                    "volume": 1_000_000.0,
+                    "trading_value": price * 1_000_000.0,
+                    "market_cap": price * 10_000_000.0,
+                    "sector": f"S{t % 4}",
+                    "adtv": price * 1_000_000.0,
+                    **{
+                        f"feature__{name}": float(rng.normal(t * 0.01, 1.0))
+                        for name in allowlist
+                    },
+                }
+            )
+    df = pl.DataFrame(rows)
+    labels = residual_open_to_open_label(
+        df.select(["instrument_id", "session", "open"]), horizon_sessions=horizon
+    )
+    return df.join(labels, on=["instrument_id", "session"], how="inner")
+
+
+def stock_v2_manifest(
+    columns: list[str] | None = None,
+    horizon: int = 5,
+    decision_time: datetime | None = None,
+) -> DatasetManifest:
+    return stock_manifest(
+        columns=columns,
+        feature_set="stock_alpha_v2",
+        horizon=horizon,
+        decision_time=decision_time,
     )
 
 
