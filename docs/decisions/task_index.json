@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_DATASET_INTEGRITY_AUDIT",
+      "date": "2026-08-11",
+      "adr_id": "ADR_20260811_DATASET_INTEGRITY_AUDIT",
+      "domain": "stocks-data",
+      "title": "Audit collected and downstream data artifacts",
+      "why": "The complete OpenDART resumable collection and downstream data under data/ required a final integrity, lineage, and usability audit before future research use.",
+      "resolution": "Verified 123 complete DART monthly partitions, 2,280,415 unique receipts, 2,810 valid evidence JSON files, 10,943 readable non-empty Parquet files, manifest row/hash consistency, key uniqueness, OHLC and availability invariants, and dataset key alignment. Recorded that complete DART partitions are not yet catalog-registered or merged, and that 32 derived feature columns are fully null while active features retain documented warm-up/null rows.",
+      "impact": "Evidence and canonical datasets are structurally intact, but future consumers must explicitly select dart_parts_single_worker, register or merge it before catalog-based use, and apply the documented feature-null policy. Preserved the resumable collector specification documents."
+    },
+    {
       "task_id": "TASK_STOCK_HISTORICAL_EVIDENCE_COLLECTION",
       "date": "2026-08-10",
       "adr_id": "ADR_20260810_STOCK_HISTORICAL_EVIDENCE_COLLECTION",
