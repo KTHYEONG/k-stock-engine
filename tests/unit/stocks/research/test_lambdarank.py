@@ -168,6 +168,26 @@ def test_trial_fast_path_matches_legacy_blend() -> None:
     stable.fit(train_t, val_t)
     stable_scores = stable.predict(predict_input).select("session", "instrument_id", "pred_score")
 
+    prepared = LambdaRankBlendModel(
+        make_manifest(),
+        stock_alpha_v2_allowlist(),
+        RESIDUAL_O2O_LABEL,
+        config=config,
+        session_column="session",
+        relevance_column=RELEVANCE_COLUMN,
+    ).prepare_fold(train_t, val_t)
+    assert prepared is not None
+    assert prepared.train_matrix.dtype == np.float32
+    assert prepared.train_matrix.flags["C_CONTIGUOUS"]
+    assert prepared.train_matrix.flags["WRITEABLE"] is False
+    assert prepared.train_relevance.dtype == np.int32
+    assert prepared.train_relevance.flags["WRITEABLE"] is False
+    assert prepared.train_weights.dtype == np.float64
+    assert prepared.train_weights.flags["WRITEABLE"] is False
+    assert prepared.validation_matrix is not None
+    assert prepared.validation_matrix.flags["WRITEABLE"] is False
+    assert prepared.predictor_columns
+
     trial = LambdaRankBlendModel(
         make_manifest(),
         stock_alpha_v2_allowlist(),
@@ -181,11 +201,80 @@ def test_trial_fast_path_matches_legacy_blend() -> None:
     assert (trial_scored["pred_score"].to_numpy() == pytest.approx(legacy_scored["pred_score"].to_numpy()))
     assert (trial_scored["pred_score"].to_numpy() - legacy_scored["pred_score"].to_numpy()).max() < 1e-12
 
+    prepared_trial = LambdaRankBlendModel(
+        make_manifest(),
+        stock_alpha_v2_allowlist(),
+        RESIDUAL_O2O_LABEL,
+        config=config,
+        session_column="session",
+        relevance_column=RELEVANCE_COLUMN,
+    )
+    assert (
+        prepared_trial.fit_trial(
+            train_t, val_t, stable_scores, prepared=prepared
+        )
+        is True
+    )
+    prepared_scored = prepared_trial.predict(predict_input)
+    assert (prepared_scored["pred_score"].to_numpy() == pytest.approx(legacy_scored["pred_score"].to_numpy()))
+    assert (prepared_scored["pred_score"].to_numpy() - legacy_scored["pred_score"].to_numpy()).max() < 1e-12
+    assert (prepared_scored["pred_score"].to_numpy() == pytest.approx(trial_scored["pred_score"].to_numpy()))
+
     matrix = LambdaRankBlendModel._float32_matrix(predict_input, list(feature_columns))
     assert matrix.dtype == np.float32
     assert matrix.flags["C_CONTIGUOUS"]
     relevance = val_t[RELEVANCE_COLUMN].cast(pl.Int32).to_numpy()
     assert relevance.dtype == np.int32
+
+
+def test_trial_callbacks_propagate_trial_pruned() -> None:
+    import optuna
+
+    df = build_panel()
+    feature_columns = v2_feature_columns(df)
+    train = df.filter(pl.col("session_index") < 30)
+    val = df.filter(pl.col("session_index") >= 30)
+    quantiles = fit_v2_winsor_quantiles(train, feature_columns)
+    train_t = apply_v2_transforms(train, feature_columns, winsor_quantiles=quantiles)
+    val_t = apply_v2_transforms(val, feature_columns, winsor_quantiles=quantiles)
+    predict_input = val_t.drop([RESIDUAL_O2O_LABEL, RELEVANCE_COLUMN, "label_available_time"])
+    config = LambdaRankConfig(learning_rate=0.03, num_leaves=31)
+
+    stable = StableRankComposite(
+        factors=stock_alpha_v2_allowlist(),
+        manifest=make_manifest(),
+        label_column=RESIDUAL_O2O_LABEL,
+        block_length=5,
+        session_column="session",
+    )
+    stable.fit(train_t, val_t)
+    stable_scores = stable.predict(predict_input).select("session", "instrument_id", "pred_score")
+    prepared = LambdaRankBlendModel(
+        make_manifest(),
+        stock_alpha_v2_allowlist(),
+        RESIDUAL_O2O_LABEL,
+        config=config,
+        session_column="session",
+        relevance_column=RELEVANCE_COLUMN,
+    ).prepare_fold(train_t, val_t)
+    assert prepared is not None
+
+    def prune_on_first_round(env: object) -> None:
+        del env
+        raise optuna.TrialPruned()
+
+    model = LambdaRankBlendModel(
+        make_manifest(),
+        stock_alpha_v2_allowlist(),
+        RESIDUAL_O2O_LABEL,
+        config=config,
+        session_column="session",
+        relevance_column=RELEVANCE_COLUMN,
+    )
+    with pytest.raises(optuna.TrialPruned):
+        model.fit_trial(
+            train_t, val_t, stable_scores, prepared=prepared, callbacks=(prune_on_first_round,)
+        )
 
 
 def test_manifest_binds_v2_contract() -> None:
