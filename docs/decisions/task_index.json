@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_ALPHA_V2_DATASET_CONTRACT_REBUILD",
+      "date": "2026-08-11",
+      "adr_id": "ADR_20260811_STOCK_ALPHA_V2_DATASET_CONTRACT_REBUILD",
+      "domain": "stocks",
+      "title": "Stock Alpha v2 dataset contract rebuild",
+      "why": "The training CLI rejected the cataloged v1 feature and fwd-return label datasets when the research workflow required v2 features and canonical residual labels.",
+      "resolution": "Added strict v2 feature materialization, calendar-aware residual label publication, immutable snapshot orchestration, semantic composition checks, and an explicit v2 build CLI; legacy v1 datasets remain unchanged and all verification gates pass.",
+      "impact": "Enables reproducible research training from a hash-pinned provisional v2 snapshot while preventing silent v1 downgrade, label recomputation, lookahead, partial publication, and paper/live use of incomplete evidence."
+    },
+    {
       "task_id": "TASK_KR_STOCK_ML_RESEARCH_SYSTEM",
       "date": "2026-08-11",
       "adr_id": "ADR_20260811_KR_STOCK_ML_RESEARCH_SYSTEM",
