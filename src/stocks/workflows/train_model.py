@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import logging
 import math
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
+from hashlib import sha256
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -56,8 +58,6 @@ _ECONOMIC_COLUMNS = ("open", "high", "low", "close", "volume", "trading_value", 
 
 _MIN_TRAIN_SESSIONS = 756
 _VALIDATION_BLOCK_SESSIONS = 252
-_LABEL_PURGE_SESSIONS = 6
-_EMBARGO_SESSIONS = 5
 _REFIT_EVERY_SESSIONS = 63
 _REBALANCE_EVERY_SESSIONS = 5
 _N_OPTUNA_TRIALS = 80
@@ -88,6 +88,13 @@ class ReplayResult:
     excess_returns: list[float] = field(default_factory=list)
     benchmark_returns: list[float] = field(default_factory=list)
     strategy_returns: list[float] = field(default_factory=list)
+    base_total_return: float = 0.0
+    stress_total_return: float | None = None
+    benchmark_total_return: float = 0.0
+    planned_cycles: int = 0
+    attempted_orders: int = 0
+    filled_orders: int = 0
+    no_trade_reason_counts: dict[str, int] = field(default_factory=dict)
 
 
 def train_model(
@@ -147,25 +154,30 @@ def train_model(
             details=f"n_sessions={n_sessions}",
         )
 
+    label_span_sessions = (manifest.label_horizon_sessions or 1) + 1
+    holdout_fold, training_panel = _reserve_forward_holdout(
+        panel, request, label_span_sessions,
+    )
+
     reasons: list[str] = []
     splitter = PurgedWalkForward(
-        n_folds=1,
-        label_horizon_sessions=_LABEL_PURGE_SESSIONS,
-        embargo_sessions=_EMBARGO_SESSIONS,
+        n_folds=request.n_folds,
+        label_horizon_sessions=label_span_sessions,
+        embargo_sessions=request.embargo_sessions,
         session_column="session_index",
         validation_window_sessions=_VALIDATION_BLOCK_SESSIONS,
         min_train_sessions=_MIN_TRAIN_SESSIONS,
     )
-    folds = splitter.split(panel)
+    folds = splitter.split(training_panel)
     if not folds:
         return _publish_no_trade(
             registry, request, base_manifest, panel, label_column, relevance_column,
             "no-eligible-folds",
         )
 
-    champion_config = _tune_champion(
-        panel, folds, request, base_manifest, feature_columns, label_column,
-        relevance_column,
+    champion_config, n_optuna_trials = _tune_champion(
+        training_panel, folds, request, base_manifest, feature_columns, label_column,
+        relevance_column, label_span_sessions,
     )
     if champion_config is None:
         return _publish_no_trade(
@@ -174,7 +186,7 @@ def train_model(
         )
 
     fold_models, scored_frames, fold_rank_ic = _fit_and_score_folds(
-        panel, folds, request, base_manifest, feature_columns, label_column,
+        training_panel, folds, request, base_manifest, feature_columns, label_column,
         relevance_column, champion_config,
     )
     if not fold_models:
@@ -189,15 +201,20 @@ def train_model(
     base = request.base_cost_schedule or default_base_schedule()
     stress = request.stress_cost_schedule or default_stress_schedule()
     replay = _event_ledger_evaluation(
-        panel, oos, request, snapshot.manifest, registry, base, stress,
+        training_panel, oos, request, snapshot.manifest, registry, base, stress,
     )
 
     budget = PromotionRiskBudget()
-    gates = _evaluate_gates(replay, fold_rank_ic, budget, request)
+    gates = _evaluate_gates(
+        replay, fold_rank_ic, budget, request, n_trials=n_optuna_trials,
+    )
     reasons.extend(cast(list[str], gates["reasons"]))
 
-    holdout_ok = _forward_holdout_not_consumed(base_manifest, request)
-    reasons.append(f"gate8_forward_holdout_ready={holdout_ok}")
+    holdout_ok, holdout_reason, _holdout_evidence = _evaluate_forward_holdout(
+        registry, request, base_manifest, panel, holdout_fold, champion_config,
+        feature_columns, label_column, relevance_column, snapshot.manifest, base, stress,
+    )
+    reasons.append(holdout_reason)
     passed = bool(gates["passed"]) and holdout_ok and bool(fold_rank_ic)
 
     model = fold_models[-1] if passed else _no_trade_model(
@@ -278,18 +295,28 @@ def _tune_champion(
     feature_columns: tuple[str, ...],
     label_column: str,
     relevance_column: str | None,
-) -> LambdaRankConfig | None:
-    """Run seeded Optuna TPE trials on the development folds and select lexicographically."""
-    dev = pl.concat([panel[fold.train_mask] for fold in folds])
+    label_span_sessions: int,
+) -> tuple[LambdaRankConfig | None, int]:
+    """Run seeded Optuna TPE trials on the development folds and select lexicographically.
+
+    Returns ``(config, n_trials)`` where ``n_trials`` is the actual number of
+    sampled configurations (``len(study.trials)``) consumed by the Deflated
+    Sharpe gate.
+    """
+    dev = (
+        pl.concat([panel[fold.train_mask] for fold in folds])
+        .unique(subset=["instrument_id", "session_index"], keep="first")
+        .sort("session_index")
+    )
     dev_folds = PurgedWalkForward(
         n_folds=max(1, min(3, len(folds))),
-        label_horizon_sessions=_LABEL_PURGE_SESSIONS,
-        embargo_sessions=_EMBARGO_SESSIONS,
+        label_horizon_sessions=label_span_sessions,
+        embargo_sessions=request.embargo_sessions,
         session_column="session_index",
         min_train_sessions=_MIN_TRAIN_SESSIONS // 2,
     ).split(dev)
     if not dev_folds:
-        return None
+        return None, 0
 
     storage = optuna.storages.InMemoryStorage()
     study = optuna.create_study(
@@ -313,8 +340,8 @@ def _tune_champion(
 
     study.optimize(objective, n_trials=_N_OPTUNA_TRIALS, show_progress_bar=False)
     if not study.trials or study.best_trial is None:
-        return None
-    return _config_from_params(dict(study.best_params))
+        return None, len(study.trials)
+    return _config_from_params(dict(study.best_params)), len(study.trials)
 
 
 def _config_from_trial(trial: optuna.Trial) -> LambdaRankConfig:
@@ -420,10 +447,25 @@ def _event_ledger_evaluation(
         CycleStatus,
         TradingCycleRequest,
         TradingCycleResult,
+        _build_intents,
     )
 
     frame = panel.drop("session_index")
-    sessions = sorted(frame["session"].unique().to_list())
+    adtv_lookup = (
+        frame.sort("session")
+        .with_columns(
+            pl.col("trading_value")
+            .rolling_mean(20, min_samples=1)
+            .over("instrument_id")
+            .alias("adtv")
+        )
+        .select("instrument_id", "session", "adtv")
+    )
+    scored_for_replay = (
+        oos_scored
+        if "adtv" in oos_scored.columns
+        else oos_scored.join(adtv_lookup, on=["instrument_id", "session"], how="left")
+    )
     instruments = _instruments_from_frame(frame)
 
     policy = StockRiskPolicy(
@@ -433,6 +475,30 @@ def _event_ledger_evaluation(
         participation_limit=request.participation_limit,
     )
 
+    scored_sessions = sorted(scored_for_replay["session"].unique().to_list())
+    if not scored_sessions:
+        raise ValueError("scored OOS panel exposes no scored session")
+    replay_frame = frame.filter(pl.col("session") >= scored_sessions[0])
+    sessions = sorted(replay_frame["session"].unique().to_list())
+
+    def _scored_no_trade(
+        portfolio: PortfolioSnapshot,
+        cycle_request: TradingCycleRequest,
+        reason: str,
+    ) -> TradingCycleResult:
+        return TradingCycleResult(
+            status=CycleStatus.NO_TRADE,
+            cycle_id="stub",
+            decision_time=cycle_request.decision_time,
+            dataset_hash="d",
+            artifact_id=cycle_request.artifact_id,
+            account_snapshot_id=portfolio.account_snapshot_id,
+            allocations=(),
+            intents=(),
+            selected_instruments=(),
+            reasons=(reason,),
+        )
+
     def scored_planner(
         snapshot: DatasetSnapshot,
         registry_inner: object,
@@ -441,22 +507,11 @@ def _event_ledger_evaluation(
         cycle_request: TradingCycleRequest,
     ) -> TradingCycleResult:
         del snapshot, registry_inner, instruments_map
-        visible = oos_scored.filter(
+        visible = scored_for_replay.filter(
             pl.col("session") <= cycle_request.decision_time
         )
         if visible.is_empty():
-            return TradingCycleResult(
-                status=CycleStatus.NO_TRADE,
-                cycle_id="stub",
-                decision_time=cycle_request.decision_time,
-                dataset_hash="d",
-                artifact_id=cycle_request.artifact_id,
-                account_snapshot_id=portfolio.account_snapshot_id,
-                allocations=(),
-                intents=(),
-                selected_instruments=(),
-                reasons=("empty-scored-cross-section",),
-            )
+            return _scored_no_trade(portfolio, cycle_request, "empty-scored-cross-section")
         from src.stocks.trading.portfolio_constructor import construct_target_allocations
 
         try:
@@ -464,45 +519,27 @@ def _event_ledger_evaluation(
                 visible, instruments, portfolio, policy
             )
         except ValueError as exc:
-            return TradingCycleResult(
-                status=CycleStatus.NO_TRADE,
-                cycle_id="stub",
-                decision_time=cycle_request.decision_time,
-                dataset_hash="d",
-                artifact_id=cycle_request.artifact_id,
-                account_snapshot_id=portfolio.account_snapshot_id,
-                allocations=(),
-                intents=(),
-                selected_instruments=(),
-                reasons=(f"constraint:{exc}",),
-            )
+            return _scored_no_trade(portfolio, cycle_request, f"constraint:{exc}")
+        if not allocations:
+            return _scored_no_trade(portfolio, cycle_request, "no-feasible-allocation")
+        intents = _build_intents(tuple(allocations), portfolio, cycle_request)
         return TradingCycleResult(
-            status=CycleStatus.PLANNED if allocations else CycleStatus.NO_TRADE,
+            status=CycleStatus.PLANNED,
             cycle_id="stub",
             decision_time=cycle_request.decision_time,
             dataset_hash="d",
             artifact_id=cycle_request.artifact_id,
             account_snapshot_id=portfolio.account_snapshot_id,
             allocations=tuple(allocations),
-            intents=(),
+            intents=intents,
             selected_instruments=tuple(
                 sorted({a.instrument.instrument_id for a in allocations})
             ),
             reasons=("scored-plan",),
         )
 
-    first_session = sessions[0]
-    last_session = sessions[-1]
-    start_time = (
-        first_session
-        if isinstance(first_session, datetime)
-        else datetime.combine(first_session, datetime.min.time(), tzinfo=UTC)
-    )
-    end_time = (
-        last_session
-        if isinstance(last_session, datetime)
-        else datetime.combine(last_session, datetime.min.time(), tzinfo=UTC)
-    )
+    start_time = _session_as_datetime(sessions[0])
+    end_time = _session_as_datetime(sessions[-1])
     decision_indices = tuple(
         i for i in range(len(sessions)) if i % _REBALANCE_EVERY_SESSIONS == 0
     )
@@ -543,10 +580,26 @@ def _event_ledger_evaluation(
         cost_evidence=evidence,
         seed=request.seed,
     )
-    result = backtester.run(frame, artifacts, initial_portfolio, backtest_request)
-    benchmark = _benchmark_return_series(frame)
+    result = backtester.run(replay_frame, artifacts, initial_portfolio, backtest_request)
+    benchmark = _benchmark_return_series(replay_frame)
     strategy_returns = _strategy_return_series(list(result.ledger))
     excess = _aligned_excess(strategy_returns, benchmark)
+    initial_cash = request.initial_cash
+    stress_total: float | None = None
+    if result.stress_final_value is not None and initial_cash > 0:
+        stress_total = (result.stress_final_value - initial_cash) / initial_cash
+    if not benchmark or not all(math.isfinite(value) for value in benchmark):
+        benchmark_total = float("nan")
+    else:
+        benchmark_total = float(np.expm1(np.sum(benchmark)))
+    no_trade_reason_counts = dict(
+        Counter(
+            reason
+            for cycle in backtester._last_cycles.values()
+            if cycle.status is not CycleStatus.PLANNED
+            for reason in cycle.reasons
+        )
+    )
     return ReplayResult(
         ledger=tuple(result.ledger),
         trades=tuple(result.trades),
@@ -556,7 +609,22 @@ def _event_ledger_evaluation(
         excess_returns=excess,
         benchmark_returns=benchmark,
         strategy_returns=strategy_returns,
+        base_total_return=(
+            (result.final_value - initial_cash) / initial_cash if initial_cash > 0 else 0.0
+        ),
+        stress_total_return=stress_total,
+        benchmark_total_return=benchmark_total,
+        planned_cycles=result.planned_cycles,
+        attempted_orders=result.attempted_orders,
+        filled_orders=result.filled_orders,
+        no_trade_reason_counts=no_trade_reason_counts,
     )
+
+
+def _session_as_datetime(session: object) -> datetime:
+    if isinstance(session, datetime):
+        return session
+    return datetime.combine(cast(date, session), datetime.min.time(), tzinfo=UTC)
 
 
 def _benchmark_return_series(panel: pl.DataFrame) -> list[float]:
@@ -690,8 +758,14 @@ def _evaluate_gates(
     fold_rank_ic: list[float],
     budget: PromotionRiskBudget,
     request: TrainingRequest,
+    *,
+    n_trials: int,
 ) -> dict[str, object]:
-    """Lexicographic fail-closed promotion gates over the event ledger."""
+    """Lexicographic fail-closed promotion gates over the event ledger.
+
+    A replay with zero attempted orders is evidence-incomplete and must fail
+    promotion instead of being read as a flat strategy.
+    """
     reasons: list[str] = []
     passed = True
 
@@ -703,6 +777,17 @@ def _evaluate_gates(
     gate1_ok = positive_fraction >= budget.min_positive_refit_fraction
     reasons.append(f"gate1_positive_rank_ic_fraction={positive_fraction:.4f}")
     passed = passed and gate1_ok
+
+    if replay.attempted_orders <= 0:
+        passed = False
+        reasons.append("evidence_incomplete_no_attempted_orders=true")
+    else:
+        reasons.append(f"attempted_orders={replay.attempted_orders}")
+    if replay.filled_orders <= 0:
+        passed = False
+        reasons.append("evidence_incomplete_no_filled_orders=true")
+    else:
+        reasons.append(f"filled_orders={replay.filled_orders}")
 
     excess = replay.excess_returns
     lower_bound = (
@@ -730,17 +815,28 @@ def _evaluate_gates(
     reasons.append(f"gate3_benchmark_ir={benchmark_ir:.6f}")
     passed = passed and gate3_ok
 
-    stress_metrics = replay.stress_metrics or {}
-    benchmark_total = float(np.sum(benchmark_returns)) if benchmark_returns else 0.0
-    gate4_ok = False
-    if stress_metrics:
-        stress_total = float(stress_metrics.get("cagr", 0.0)) * 0.0
-        gate4_ok = stress_total > benchmark_total
+    benchmark_total = replay.benchmark_total_return
+    gate4_ok = bool(
+        replay.stress_total_return is not None
+        and math.isfinite(replay.stress_total_return)
+        and math.isfinite(benchmark_total)
+        and replay.stress_total_return > benchmark_total
+    )
+    stress_value = (
+        f"{replay.stress_total_return:.8f}"
+        if replay.stress_total_return is not None
+        else "nan"
+    )
     reasons.append(f"gate4_stress_cost_excess={gate4_ok}")
+    reasons.append(f"gate4_stress_total_return={stress_value}")
+    reasons.append(f"gate4_benchmark_total_return={benchmark_total:.8f}")
     passed = passed and gate4_ok
 
-    sharpe = float(replay.metrics.get("sharpe", 0.0))
-    deflated_prob = _deflated_sharpe_probability(sharpe, 252, _N_OPTUNA_TRIALS)
+    deflated_prob = _deflated_sharpe_probability(
+        strategy_returns,
+        annualization=252,
+        n_trials=n_trials,
+    )
     gate5_ok = deflated_prob >= budget.deflated_sharpe_probability
     reasons.append(f"gate5_deflated_sharpe_probability={deflated_prob:.6f}")
     passed = passed and gate5_ok
@@ -765,17 +861,74 @@ def _information_ratio(returns: list[float]) -> float:
 
 
 def _deflated_sharpe_probability(
-    sharpe: float,
+    returns: list[float],
     annualization: int,
     n_trials: int,
+    *,
+    skewness: float | None = None,
+    kurtosis: float | None = None,
 ) -> float:
-    del annualization, n_trials
-    if sharpe <= 0.0:
+    """Deterministic trial-count-adjusted Deflated Sharpe probability.
+
+    Returns the probability that the observed non-annualized Sharpe exceeds
+    the expected maximum Sharpe under a null of ``n_trials`` independent
+    zero-mean trials, using the sample skewness and excess kurtosis of the OOS
+    return sample. The annualization factor cancels between the observed Sharpe
+    and its variance estimate, so the result is annualization-invariant. Empty,
+    non-finite, too-short, or zero-variance samples fail closed to 0.0.
+    """
+    from scipy import stats
+
+    arr = np.asarray(returns, dtype=float)
+    if arr.size < 2 or n_trials < 1 or annualization < 1:
+        return 0.0
+    if not np.all(np.isfinite(arr)):
+        return 0.0
+    std = float(arr.std(ddof=1))
+    if std <= 0.0:
+        return 0.0
+    sharpe = float(arr.mean() / std)
+    if skewness is not None and kurtosis is not None:
+        skew = float(skewness)
+        kurt = float(kurtosis)
+    else:
+        skew, kurt = _sample_central_moments(arr)
+    variance = (1.0 - skew * sharpe + (kurt / 4.0) * sharpe * sharpe) / (arr.size - 1)
+    if not math.isfinite(variance) or variance <= 0.0:
+        return 0.0
+    expected_max_sharpe = _expected_maximum_null_sharpe(n_trials) * math.sqrt(variance)
+    return float(stats.norm.cdf((sharpe - expected_max_sharpe) / math.sqrt(variance)))
+
+
+def _sample_central_moments(arr: np.ndarray) -> tuple[float, float]:
+    """Vectorized sample skewness and excess kurtosis without scipy warnings."""
+    mean = float(np.mean(arr))
+    centered = arr - mean
+    variance = float(np.mean(centered * centered))
+    if not math.isfinite(variance) or variance <= 0.0:
+        return 0.0, 0.0
+    m3 = float(np.mean(centered**3))
+    m4 = float(np.mean(centered**4))
+    skew = m3 / variance**1.5
+    kurt = m4 / variance**2 - 3.0
+    if not (math.isfinite(skew) and math.isfinite(kurt)):
+        return 0.0, 0.0
+    return skew, kurt
+
+
+def _expected_maximum_null_sharpe(n_trials: int) -> float:
+    """Expected maximum of ``n_trials`` independent standard normal trials."""
+    if n_trials < 1:
         return 0.0
     from scipy import stats
 
-    # One-sided probability that the observed annualized Sharpe is positive.
-    return float(stats.norm.cdf(sharpe))
+    euler_mascheroni = 0.5772156649015329
+    inv_n = 1.0 / n_trials
+    inv_ne = 1.0 / (n_trials * math.e)
+    return float(
+        (1.0 - euler_mascheroni) * stats.norm.ppf(1.0 - inv_n)
+        + euler_mascheroni * stats.norm.ppf(1.0 - inv_ne)
+    )
 
 
 def _drawdown_from_returns(returns: list[float]) -> float:
@@ -787,17 +940,184 @@ def _drawdown_from_returns(returns: list[float]) -> float:
     return float(np.max(dd)) if dd.size else 0.0
 
 
-def _forward_holdout_not_consumed(
+def _reserve_forward_holdout(
+    panel: pl.DataFrame,
+    request: TrainingRequest,
+    label_span_sessions: int,
+) -> tuple[Fold | None, pl.DataFrame]:
+    """Reserve the dated forward holdout before tuning and outer folds.
+
+    When the immutable snapshot holds at least the required number of
+    label-available sessions on or after ``2026-03-10``, the newest
+    ``holdout_sessions`` are pinned as a locked ``PurgedWalkForward.holdout``
+    and the returned training panel contains only sessions before that block.
+    Otherwise returns ``(None, panel)`` unchanged and promotion stays fail
+    closed.
+    """
+    holdout_sessions = (
+        request.holdout_sessions
+        if request.holdout_sessions > 0
+        else _FORWARD_HOLDOUT_SESSIONS
+    )
+    if holdout_sessions < 1 or LABEL_AVAILABLE_COLUMN not in panel.columns:
+        return None, panel
+    holdout_start = datetime.combine(_FORWARD_HOLDOUT_START, datetime.min.time(), tzinfo=UTC)
+    post_start_sessions = panel.filter(
+        (pl.col("session") >= holdout_start)
+        & pl.col(LABEL_AVAILABLE_COLUMN).is_not_null()
+    )["session_index"].unique().to_list()
+    if len(post_start_sessions) < holdout_sessions:
+        return None, panel
+    splitter = PurgedWalkForward(
+        n_folds=1,
+        label_horizon_sessions=label_span_sessions,
+        embargo_sessions=request.embargo_sessions,
+        session_column="session_index",
+        min_train_sessions=0,
+    )
+    fold = splitter.holdout(panel, holdout_sessions)
+    block_start = _session_as_datetime(
+        panel.filter(
+            pl.col("session_index").is_in(fold.validation_mask)
+        )["session"].min()
+    )
+    if block_start < holdout_start:
+        return None, panel
+    training_panel = panel.filter(pl.col("session_index") < fold.validation_decision_start)
+    return fold, training_panel
+
+
+def _evaluate_forward_holdout(
+    registry: ModelArtifactRegistry,
+    request: TrainingRequest,
+    base_manifest: ModelManifest,
+    panel: pl.DataFrame,
+    holdout_fold: Fold | None,
+    champion_config: LambdaRankConfig,
+    feature_columns: tuple[str, ...],
+    label_column: str,
+    relevance_column: str | None,
+    dataset_manifest: DatasetManifest,
+    base_schedule: CostSchedule,
+    stress_schedule: CostSchedule,
+) -> tuple[bool, str, dict[str, object] | None]:
+    """Fit the frozen candidate on pre-holdout data and replay the block once.
+
+    Returns ``(ready, reason, evidence)``. A candidate fingerprint may inspect
+    the holdout exactly once; a reused fingerprint raises ``ValueError``.
+    Incomplete data leaves the candidate ``NO_TRADE`` with
+    ``forward_holdout_ready=false``.
+    """
+    if holdout_fold is None:
+        return (
+            False,
+            "gate8_forward_holdout_ready=false:insufficient-label-available-sessions-on-or-after-2026-03-10",
+            None,
+        )
+    block_session_indexes = sorted(
+        int(v)
+        for v in panel["session_index"][holdout_fold.validation_mask].unique().to_list()
+    )
+    holdout_session_range = (
+        block_session_indexes[0],
+        block_session_indexes[-1],
+    )
+    fingerprint = _forward_holdout_fingerprint(
+        base_manifest, request, dataset_manifest, holdout_session_range,
+        champion_config, base_schedule, stress_schedule,
+    )
+    existing = registry.read_forward_holdout(request.artifact_id)
+    if existing is not None and existing.get("fingerprint") == fingerprint:
+        raise ValueError(
+            f"forward holdout for candidate fingerprint {fingerprint!r} "
+            f"was already inspected for {request.artifact_id!r}"
+        )
+    models, scored, _fold_ic = _fit_and_score_folds(
+        panel, [holdout_fold], request, base_manifest, feature_columns, label_column,
+        relevance_column, champion_config,
+    )
+    if not models:
+        return False, "gate8_forward_holdout_ready=false:no-fit", None
+    holdout_oos = pl.concat(scored)
+    replay = _event_ledger_evaluation(
+        panel, holdout_oos, request, dataset_manifest, registry, base_schedule,
+        stress_schedule,
+    )
+    if replay.attempted_orders <= 0:
+        return False, "gate8_forward_holdout_ready=false:no-attempted-orders", None
+    if replay.filled_orders <= 0:
+        return False, "gate8_forward_holdout_ready=false:no-filled-orders", None
+    evidence: dict[str, object] = {
+        "feature_schema_hash": base_manifest.feature_schema_hash,
+        "universe_policy_hash": base_manifest.universe_policy_hash,
+        "label_dataset_hash": _label_dataset_hash(dataset_manifest),
+        "holdout_session_range": holdout_session_range,
+        "model_config": _config_snapshot(champion_config),
+        "risk_policy": {
+            name: getattr(request, name)
+            for name in (
+                "top_k",
+                "max_exposure",
+                "max_single_weight",
+                "participation_limit",
+            )
+        },
+        "cost_schedules": (base_schedule.name, stress_schedule.name),
+        "seed": request.seed,
+        "planned_cycles": replay.planned_cycles,
+        "attempted_orders": replay.attempted_orders,
+        "filled_orders": replay.filled_orders,
+        "base_total_return": replay.base_total_return,
+        "stress_total_return": replay.stress_total_return,
+        "ledger_metrics": replay.metrics,
+    }
+    registry.write_forward_holdout(request.artifact_id, fingerprint, evidence)
+    return True, "gate8_forward_holdout_ready=true", evidence
+
+
+def _forward_holdout_fingerprint(
     base_manifest: ModelManifest,
     request: TrainingRequest,
-) -> bool:
-    """A frozen candidate must pass one 252-session holdout after 2026-03-10.
+    dataset_manifest: DatasetManifest,
+    holdout_session_range: tuple[int, int],
+    config: LambdaRankConfig,
+    base_schedule: CostSchedule,
+    stress_schedule: CostSchedule,
+) -> str:
+    """SHA-256 identity binding one forward-holdout evaluation to its inputs."""
+    config_fields = "|".join(
+        f"{name}={value}" for name, value in sorted(_config_snapshot(config).items())
+    )
+    policy_fields = "|".join(
+        f"{name}={getattr(request, name)}"
+        for name in ("top_k", "max_exposure", "max_single_weight", "participation_limit")
+    )
+    key = "|".join(
+        (
+            base_manifest.feature_schema_hash,
+            base_manifest.universe_policy_hash,
+            _label_dataset_hash(dataset_manifest),
+            f"holdout_range={holdout_session_range[0]}..{holdout_session_range[1]}",
+            f"model={config_fields}",
+            f"policy={policy_fields}",
+            base_schedule.name,
+            stress_schedule.name,
+            str(request.seed),
+        )
+    )
+    return sha256(key.encode("utf-8")).hexdigest()
 
-    Until 252 newly collected KRX sessions are evaluated once by this frozen
-    candidate, promotion remains false regardless of historical metrics.
-    """
-    del base_manifest, request
-    return False
+
+def _label_dataset_hash(manifest: DatasetManifest) -> str:
+    return manifest.content_hash or manifest.schema_hash
+
+
+def _config_snapshot(config: LambdaRankConfig) -> dict[str, object]:
+    return {
+        name: value
+        for name, value in vars(config).items()
+        if not name.startswith("_")
+    }
 
 
 def _no_trade_model(
@@ -877,6 +1197,13 @@ def _build_metrics(
         / max(len(fold_rank_ic), 1),
         "ledger_metrics": replay.metrics,
         "stress_metrics": replay.stress_metrics,
+        "planned_cycles": replay.planned_cycles,
+        "attempted_orders": replay.attempted_orders,
+        "filled_orders": replay.filled_orders,
+        "no_trade_reason_counts": replay.no_trade_reason_counts,
+        "base_total_return": replay.base_total_return,
+        "stress_total_return": replay.stress_total_return,
+        "benchmark_total_return": replay.benchmark_total_return,
         "promotion_reasons": reasons,
         "gates": gates,
     }
