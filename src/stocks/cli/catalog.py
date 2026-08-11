@@ -5,16 +5,18 @@ fails closed on any missing, range-incomplete, hash-mismatched, or
 ``candidate_only`` evidence without scanning Parquet; ``validate-readiness``
 rejects a model configuration that selects a missing, fully-null, or
 non-finite feature column; ``retention-dry-run`` lists garbage-collection
-candidates without changing any file.
+candidates without changing any file; ``inventory`` emits a read-only,
+deterministic JSON/text classification of every file under the data root.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
 
-from src.core.paths import STOCK_CATALOG_ROOT
+from src.core.paths import DATA_ROOT, STOCK_CATALOG_ROOT
 from src.stocks.data.catalog import (
     CatalogKind,
     CatalogStore,
@@ -22,6 +24,7 @@ from src.stocks.data.catalog import (
     SnapshotResolver,
     retention_dry_run,
 )
+from src.stocks.data.inventory import InventoryLifecycle, InventoryReport, scan_inventory
 from src.stocks.data.readiness import validate_selected_feature_readiness
 
 logger = logging.getLogger("stocks.cli.catalog")
@@ -40,6 +43,12 @@ def main(args: list[str] | None = None) -> int:
     readiness.add_argument("--dataset-dir", required=True, type=Path)
     readiness.add_argument("--feature", required=True, action="append")
     sub.add_parser("retention-dry-run", help="list GC candidates without changing files")
+    inventory = sub.add_parser(
+        "inventory",
+        help="classify every file under the data root (read-only, no apply)",
+    )
+    inventory.add_argument("--data-root", type=Path, default=DATA_ROOT)
+    inventory.add_argument("--format", choices=("text", "json"), default="text")
     parsed = parser.parse_args(args)
 
     root = getattr(parsed, "catalog_root", None) or STOCK_CATALOG_ROOT
@@ -50,6 +59,8 @@ def main(args: list[str] | None = None) -> int:
         return _validate(store, parsed.snapshot_id)
     if parsed.command == "validate-readiness":
         return _validate_readiness(parsed.dataset_dir, tuple(parsed.feature))
+    if parsed.command == "inventory":
+        return _inventory(store, parsed.data_root, parsed.format)
     return _retention_dry_run(store)
 
 
@@ -93,6 +104,31 @@ def _retention_dry_run(store: CatalogStore) -> int:
     for candidate in candidates:
         sys.stdout.write(f"{candidate.kind.value}\t{candidate.name}\t{candidate.reason}\n")
     return 0
+
+
+def _inventory(store: CatalogStore, data_root: Path, fmt: str) -> int:
+    try:
+        report = scan_inventory(data_root, store)
+    except ValueError as exc:
+        sys.stdout.write(f"inventory failed: {exc}\n")
+        return 1
+    if fmt == "json":
+        sys.stdout.write(json.dumps(report.to_json(), indent=2, sort_keys=True) + "\n")
+        return 0
+    sys.stdout.write(_format_inventory_text(report))
+    return 0
+
+
+def _format_inventory_text(report: InventoryReport) -> str:
+    lines = [f"# inventory {report.data_root}"]
+    for lifecycle in InventoryLifecycle:
+        matching = [r for r in report.records if r.lifecycle is lifecycle]
+        lines.append(f"{lifecycle.value}\t{len(matching)}\t{sum(r.byte_count for r in matching)}")
+    candidate_count = sum(
+        1 for r in report.records if r.lifecycle is InventoryLifecycle.ARCHIVE_CANDIDATE
+    )
+    lines.append(f"candidates\t{candidate_count}")
+    return "\n".join(lines) + "\n"
 
 
 def _validate_readiness(dataset_dir: Path, selected: tuple[str, ...]) -> int:
