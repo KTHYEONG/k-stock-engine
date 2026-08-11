@@ -159,3 +159,58 @@ replay의 CAGR·Sharpe·drawdown과 다중검정 보정 후 신뢰도는 개선�
 - Manifest: `data/artifacts/stocks/lambdarank_v2_20260811_cost_master_r5_80trial_guard/manifest.json`
 - Model: `data/artifacts/stocks/lambdarank_v2_20260811_cost_master_r5_80trial_guard/model.joblib`
 - Benchmark log: `scratch/lambdarank_v2_20260811_cost_master_r5_80trial_guard.log`
+
+## Optimized 80-trial benchmark (2026-08-11)
+
+준비 fold cache, reduced-budget screen, NDCG 중간 pruning, shortlist full-refit,
+inner event-ledger economic selection을 적용한 실제 production snapshot 재실행
+결과다. 기존 r5 artifact는 보존하고 새 artifact ID를 사용했다.
+
+- Snapshot: `research_provisional_20160104_20260227_cost_master_v2_r1`
+- Artifact: `lambdarank_v2_20260811_cost_master_r8_full_benchmark`
+- 실행 명령: `uv run python -m src.stocks.cli.train --artifact-id lambdarank_v2_20260811_cost_master_r8_full_benchmark --snapshot-id research_provisional_20160104_20260227_cost_master_v2_r1 --mode research --optuna-trials 80 --max-rss-mib 8000`
+- 결과: **NO_TRADE / 미승격**
+- Terminal trials: `80 / 80`
+- Wall-clock: **477.22초 (7분 57초)**
+- 기존 r5 기록(약 26분) 대비 약 **69% 단축**
+- RSS: baseline `3315.0 MiB`, peak `3966.6 MiB`, limit `8000 MiB`
+
+### 탐색·선정 단계
+
+| 항목 | 결과 |
+|---|---:|
+| Screened trials | 71 |
+| Pruned trials | 9 |
+| Shortlisted trials | 8 |
+| Economically eligible trials | 0 |
+| Best screen Rank-IC | 0.07573805 |
+| Screen time | 218.84초 |
+| Shortlist full-refit time | 245.93초 |
+| Economic replay time | 73.94초 |
+| Prepared cache | 106,295,948 bytes |
+| Selection status | `no_economically_eligible_candidate` |
+
+### 성과 및 승격 판정
+
+모든 shortlist 후보가 inner 경제성 적격 조건(양의 fold IC, 체결, finite
+replay, bootstrap excess lower bound > 0)을 통과하지 못했다. 따라서 champion을
+선택하지 않고 fail-closed로 종료했으며, outer OOS replay와 CAGR·Sharpe·MDD
+성과 지표는 생성되지 않았다.
+
+- `promoted=false`, `no_trade=true`
+- `n_folds_evaluated=0`
+- `promotion_reasons=["no-champion-trial"]`
+- paper/live 사용 금지 유지
+
+이번 실행은 속도 목표는 충족했지만, Rank-IC가 양수인 후보만으로는 비용·체결을
+반영한 inner bootstrap 안정성을 입증하지 못한다는 점을 확인했다. 다음 단계는
+shortlist 후보별 economic evidence를 상세 출력하고, 신호/포트폴리오 규칙을
+변경하기 전에 해당 조건이 과도하게 엄격한지 기존 promotion budget과 함께
+검토하는 것이다. 게이트를 완화해 승격시키지는 않는다.
+
+### 산출물
+
+- Metrics: `data/artifacts/stocks/lambdarank_v2_20260811_cost_master_r8_full_benchmark/metrics.json`
+- Manifest: `data/artifacts/stocks/lambdarank_v2_20260811_cost_master_r8_full_benchmark/manifest.json`
+- Model: `data/artifacts/stocks/lambdarank_v2_20260811_cost_master_r8_full_benchmark/model.joblib`
+- Benchmark log: `logs/scratch/r8_full_benchmark.log`
