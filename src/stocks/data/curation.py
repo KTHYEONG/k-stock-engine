@@ -969,3 +969,164 @@ def build_feature_panel(
         row_count=projected.height,
         base_panel_id=request.base_panel_id,
     )
+
+
+V2_READINESS_NAME = "v2_readiness.json"
+
+
+def build_stock_alpha_v2_feature_panel(
+    base_root: Path,
+    destination_root: Path,
+    request: FeaturePanelRequest,
+    *,
+    min_coverage: float = 0.75,
+) -> FeaturePanelResult:
+    """Project the frozen 34-name ``stock_alpha_v2`` feature panel.
+
+    Reuses :func:`build_feature_panel` for the deterministic ``raw__`` ->
+    ``feature__`` projection and persistence, but first validates the v2
+    publication gates against the projected frame before any directory or
+    manifest is created:
+
+    - all 34 ``raw__`` source columns of ``stock_alpha_v2_allowlist()`` exist;
+    - the projected feature set is exactly the ordered allowlist;
+    - no ``target_``/``label_`` column leaks;
+    - no selected feature is fully null;
+    - every selected feature has non-null coverage >= ``min_coverage``;
+    - no NaN/Infinity in a selected non-null feature.
+
+    Coverage is a publication gate, not a training-time imputation decision;
+    per-feature coverage, null counts, source base hash, allowlist hash, and the
+    threshold are recorded in an adjacent ``v2_readiness.json`` referenced from
+    ``feature_contract.json``.
+    """
+    from src.stocks.research.features import stock_alpha_v2_allowlist
+
+    if not 0.0 < min_coverage <= 1.0:
+        raise ValueError("min_coverage must be within (0, 1]")
+    allowlist = stock_alpha_v2_allowlist()
+    book = feature_contract_book_from_allowlist("stock_alpha_v2", allowlist)
+    generated_time = request.generated_time or datetime.now(UTC)
+    store = ParquetDatasetStore(Path(base_root))
+    base_manifest = store.read_manifest(request.base_panel_id)
+    base_frame = store.read(
+        request.base_panel_id, AssetKind.STOCK, BASE_PANEL_FEATURE_SET, generated_time
+    )
+
+    missing_sources = [
+        name for name in allowlist if f"raw__{name}" not in base_frame.columns
+    ]
+    if missing_sources:
+        raise ValueError(
+            f"base panel {request.base_panel_id} missing v2 raw source columns "
+            f"{missing_sources}"
+        )
+    projected = book.project(base_frame, source_prefix="raw__")
+    if projected.is_empty():
+        raise ValueError("v2 feature projection produced no rows")
+    coverage = _validate_v2_projection(projected, allowlist, min_coverage)
+
+    v2_request = FeaturePanelRequest(
+        dataset_id=request.dataset_id,
+        base_panel_id=request.base_panel_id,
+        feature_set="stock_alpha_v2",
+        feature_contract_book=book,
+        provider_version=request.provider_version,
+        universe_policy_version=request.universe_policy_version,
+        certification=request.certification,
+        generated_time=request.generated_time,
+    )
+    result = build_feature_panel(base_root, destination_root, v2_request)
+    _write_v2_readiness(result, book, base_manifest, projected, coverage, min_coverage)
+    logger.info(
+        "v2 feature panel %s: %s rows, min coverage %.6f",
+        request.dataset_id,
+        projected.height,
+        min(coverage.values()),
+    )
+    return result
+
+
+def _validate_v2_projection(
+    projected: pl.DataFrame,
+    allowlist: tuple[str, ...],
+    min_coverage: float,
+) -> dict[str, float]:
+    """Fail closed unless the projected v2 frame satisfies publication gates."""
+    expected_columns = ["instrument_id", "session"] + [
+        f"feature__{name}" for name in allowlist
+    ]
+    if projected.columns != expected_columns:
+        raise ValueError(
+            "v2 projection is not exactly the ordered allowlist; "
+            f"expected {len(expected_columns)} columns, got {projected.columns}"
+        )
+    if any(c.startswith(_TARGET_PREFIXES) for c in projected.columns):
+        raise ValueError("v2 feature projection leaked a target/label column")
+
+    coverage: dict[str, float] = {}
+    height = projected.height
+    for name in allowlist:
+        column = f"feature__{name}"
+        null_count = int(projected[column].null_count())
+        non_null = height - null_count
+        if non_null == 0:
+            raise ValueError(f"v2 feature {name!r} is fully null")
+        rate = non_null / height
+        if rate < min_coverage:
+            raise ValueError(
+                f"v2 feature {name!r} coverage {rate:.6f} is below {min_coverage}"
+            )
+        non_finite = projected.filter(
+            pl.col(column).is_not_null() & ~pl.col(column).is_finite()
+        )
+        if not non_finite.is_empty():
+            raise ValueError(f"v2 feature {name!r} contains NaN/Infinity values")
+        coverage[name] = rate
+    return coverage
+
+
+def _write_v2_readiness(
+    result: FeaturePanelResult,
+    book: FeatureContractBook,
+    base_manifest: DatasetManifest,
+    projected: pl.DataFrame,
+    coverage: dict[str, float],
+    min_coverage: float,
+) -> Path:
+    """Write per-feature coverage evidence next to ``feature_contract.json``."""
+    payload: dict[str, object] = {
+        "v2_readiness_version": 1,
+        "feature_set": "stock_alpha_v2",
+        "allowlist_hash": feature_set_hash(book.contracts),
+        "base_panel_id": result.base_panel_id,
+        "base_panel_content_hash": base_manifest.content_hash,
+        "min_coverage": min_coverage,
+        "row_count": projected.height,
+        "features": [
+            {
+                "name": contract.name,
+                "coverage": coverage[contract.name],
+                "null_count": int(
+                    projected[f"feature__{contract.name}"].null_count()
+                ),
+            }
+            for contract in book.contracts
+        ],
+    }
+    dataset_dir = result.contract_path.parent
+    path = dataset_dir / V2_READINESS_NAME
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8"
+    )
+    _reference_v2_readiness(result.contract_path, V2_READINESS_NAME)
+    return path
+
+
+def _reference_v2_readiness(contract_path: Path, readiness_name: str) -> None:
+    """Point ``feature_contract.json`` at the adjacent ``v2_readiness.json``."""
+    payload = json.loads(contract_path.read_text(encoding="utf-8"))
+    payload["v2_readiness"] = readiness_name
+    contract_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8"
+    )

@@ -2,7 +2,10 @@
 
 Training requires an explicit ``--snapshot-id``; there is no implicit newest
 selection. Provisional snapshots are rejected for paper/live modes; evidence
-incomplete snapshots are rejected by the snapshot resolver.
+incomplete snapshots are rejected by the snapshot resolver. Training is v2-only:
+a snapshot that does not satisfy the ``stock_alpha_v2`` feature/label contract
+raises one actionable error naming the materialization CLI instead of silently
+downgrading to v1 or recomputing labels.
 """
 from __future__ import annotations
 
@@ -30,6 +33,14 @@ from src.stocks.workflows.train_model import train_model
 logger = logging.getLogger("stocks.cli.train")
 
 STOCK_ALPHA_V2_FEATURE_SET = "stock_alpha_v2"
+_V2_CONTRACT_MISMATCH_MARKERS = (
+    "feature_set mismatch",
+    "has feature_set",
+    "label_definition",
+    "residual_o2o_5d",
+    "relevance",
+    "v2 composition",
+)
 
 
 def main(args: list[str] | None = None) -> int:
@@ -60,11 +71,24 @@ def main(args: list[str] | None = None) -> int:
         feature_root=parsed.feature_root,
         label_root=parsed.label_root,
     )
-    composed = repository.compose_labeled_training_snapshot(
-        snapshot,
-        feature_set=STOCK_ALPHA_V2_FEATURE_SET,
-        decision_time=decision_time,
-    )
+    try:
+        composed = repository.compose_labeled_training_snapshot(
+            snapshot,
+            feature_set=STOCK_ALPHA_V2_FEATURE_SET,
+            decision_time=decision_time,
+        )
+    except ValueError as exc:
+        message = str(exc)
+        if any(marker in message for marker in _V2_CONTRACT_MISMATCH_MARKERS):
+            raise ValueError(
+                f"snapshot {parsed.snapshot_id} does not satisfy the "
+                f"{STOCK_ALPHA_V2_FEATURE_SET} contract ({message}). "
+                f"Materialize a v2 snapshot first via "
+                f"`python -m src.stocks.cli.build_research_v2 "
+                f"--source-snapshot-id {parsed.snapshot_id} --snapshot-id <id> "
+                f"--feature-dataset-id <id> --label-dataset-id <id>`."
+            ) from exc
+        raise
 
     registry = ModelArtifactRegistry(parsed.registry)
     request = TrainingRequest(
