@@ -11,6 +11,7 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import joblib
 
@@ -22,6 +23,7 @@ ARTIFACT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{4,128}$")
 MODEL_FILENAME = "model.joblib"
 MANIFEST_FILENAME = "manifest.json"
 METRICS_FILENAME = "metrics.json"
+FORWARD_HOLDOUT_FILENAME = "forward_holdout.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +133,44 @@ class ModelArtifactRegistry:
         with metrics_path.open("r", encoding="utf-8") as fh:
             metrics = json.load(fh)
         return isinstance(metrics, dict) and metrics.get("promoted") is True
+
+    def write_forward_holdout(
+        self,
+        artifact_id: str,
+        fingerprint: str,
+        evidence: dict[str, object],
+    ) -> str:
+        """Persist one candidate's forward-holdout evidence atomically.
+
+        A candidate fingerprint may be inspected once; writing a second
+        evaluation for the same fingerprint is rejected with ``ValueError``.
+        """
+        artifact_dir = self._artifact_dir(artifact_id)
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        path = artifact_dir / FORWARD_HOLDOUT_FILENAME
+        existing: dict[str, object] = {}
+        if path.exists():
+            with path.open("r", encoding="utf-8") as fh:
+                existing = json.load(fh)
+        if existing.get("fingerprint") == fingerprint:
+            raise ValueError(
+                f"forward holdout for candidate fingerprint {fingerprint!r} "
+                f"was already inspected for {artifact_id!r}"
+            )
+        payload: dict[str, object] = {"fingerprint": fingerprint, "evidence": evidence}
+        temp = path.with_suffix(".json.tmp")
+        with temp.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, default=str)
+        temp.replace(path)
+        return fingerprint
+
+    def read_forward_holdout(self, artifact_id: str) -> dict[str, object] | None:
+        """Return the persisted forward-holdout evidence for ``artifact_id``."""
+        path = self._artifact_dir(artifact_id) / FORWARD_HOLDOUT_FILENAME
+        if not path.exists():
+            return None
+        with path.open("r", encoding="utf-8") as fh:
+            return cast(dict[str, object], json.load(fh))
 
 
 def _parse_iso(value: str) -> datetime:

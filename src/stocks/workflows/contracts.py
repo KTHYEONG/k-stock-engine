@@ -15,7 +15,13 @@ from src.core.costs import CostSchedule
 
 @dataclass(frozen=True, slots=True)
 class TrainingRequest:
-    """Input contract for the model-training workflow."""
+    """Input contract for the model-training workflow.
+
+    ``n_folds`` and ``embargo_sessions`` are honored by the outer walk-forward;
+    ``holdout_sessions`` is the forward-holdout block size (0 defers to the
+    fixed 252-session contract). ``n_bootstrap`` bounds the moving-block
+    bootstrap resamples and ``seed`` fixes every stochastic step.
+    """
 
     artifact_id: str
     n_folds: int = 3
@@ -32,6 +38,18 @@ class TrainingRequest:
     initial_cash: float = 100_000_000.0
     base_cost_schedule: CostSchedule | None = None
     stress_cost_schedule: CostSchedule | None = None
+
+    def __post_init__(self) -> None:
+        if self.n_folds < 1:
+            raise ValueError("n_folds must be positive")
+        if self.embargo_sessions < 0:
+            raise ValueError("embargo_sessions must be non-negative")
+        if self.holdout_sessions < 0:
+            raise ValueError("holdout_sessions must be non-negative")
+        if self.n_bootstrap < 2:
+            raise ValueError("n_bootstrap must be at least 2")
+        if not 0.0 < self.bootstrap_alpha < 1.0:
+            raise ValueError("bootstrap_alpha must be in (0, 1)")
 
 
 @dataclass(frozen=True, slots=True)
