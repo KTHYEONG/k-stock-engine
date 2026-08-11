@@ -34,6 +34,7 @@ from src.stocks.data.costs import (
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.trading.portfolio_constructor import StockRiskPolicy
 from src.stocks.workflows.trading_cycle import (
+    CycleStatus,
     TradingCycleRequest,
     TradingCycleResult,
     run_trading_cycle,
@@ -183,6 +184,10 @@ class BacktestResult:
     stress_final_value: float | None = None
     stress_metrics: dict[str, float] | None = None
     data_quality: dict[str, str] = field(default_factory=dict)
+    planned_cycles: int = 0
+    attempted_orders: int = 0
+    filled_orders: int = 0
+    no_trade_reasons: tuple[str, ...] = ()
 
     @property
     def equity_curve(self) -> list[float]:
@@ -254,7 +259,7 @@ class StockBacktester:
                 strict=True,
             )
         )
-        ledger, trades = self._run_ledger(
+        ledger, trades, attempted_orders = self._run_ledger(
             panel, by_session, sessions, artifacts, initial_portfolio, request,
             self.cost_schedule, self._liquidity_model(stress=False),
         )
@@ -263,12 +268,24 @@ class StockBacktester:
         stress_final_value: float | None = None
         stress_metrics: dict[str, float] | None = None
         if self.stress_cost_schedule is not None:
-            stress_ledger, stress_trades = self._run_ledger(
+            stress_ledger, _stress_trades, _ = self._run_ledger(
                 panel, by_session, sessions, artifacts, initial_portfolio, request,
                 self.stress_cost_schedule, self._liquidity_model(stress=True),
             )
-            stress_metrics = self._metrics(stress_ledger, stress_trades)
+            stress_metrics = self._metrics(stress_ledger, _stress_trades)
             stress_final_value = stress_ledger[-1].equity if stress_ledger else None
+        planned_cycles = sum(
+            1
+            for index in sorted(self._last_cycles)
+            if self._last_cycles[index].status is CycleStatus.PLANNED
+        )
+        no_trade_reasons = tuple(
+            reason
+            for index in sorted(self._last_cycles)
+            if self._last_cycles[index].status is not CycleStatus.PLANNED
+            for reason in self._last_cycles[index].reasons
+        )
+        filled_orders = sum(1 for trade in trades if trade.quantity > 0)
         return BacktestResult(
             ledger=tuple(ledger),
             trades=tuple(trades),
@@ -283,6 +300,10 @@ class StockBacktester:
             stress_final_value=stress_final_value,
             stress_metrics=stress_metrics,
             data_quality=self._data_quality_evidence(),
+            planned_cycles=planned_cycles,
+            attempted_orders=attempted_orders,
+            filled_orders=filled_orders,
+            no_trade_reasons=no_trade_reasons,
         )
 
     def _data_quality_evidence(self) -> dict[str, str]:
@@ -353,7 +374,7 @@ class StockBacktester:
         request: BacktestRequest,
         schedule: CostSchedule,
         liquidity_model: LiquiditySlippageModel | None,
-    ) -> tuple[list[BacktestLedgerRow], list[BacktestTrade]]:
+    ) -> tuple[list[BacktestLedgerRow], list[BacktestTrade], int]:
         decision_set = {int(i) for i in request.decision_session_indices}
         adtv = panel.sort("session").with_columns(
             pl.col("trading_value")
@@ -380,6 +401,7 @@ class StockBacktester:
         ledger: list[BacktestLedgerRow] = []
         last_close: dict[str, float] = {}
         base_positions = tuple(initial_portfolio.positions)
+        attempted_orders = 0
 
         for index, session in enumerate(sessions):
             rows = by_session[session]
@@ -435,7 +457,8 @@ class StockBacktester:
                     cycle, rows_by_key, sessions[index + 1], positions,
                     settled_cash, schedule,
                 )
-        return ledger, trades
+                attempted_orders += len(pending_orders)
+        return ledger, trades, attempted_orders
 
     def _snapshot_positions(
         self,
