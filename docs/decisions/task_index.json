@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_ALPHA_V2_TRAINING_IMPROVEMENT",
+      "date": "2026-08-11",
+      "adr_id": "ADR_20260811_STOCK_ALPHA_V2_TRAINING_IMPROVEMENT",
+      "domain": "training",
+      "title": "Stock Alpha v2 training replay and promotion evidence",
+      "why": "Single-fold training, overlapping inner-fold rows, missing replay ADTV, and an empty intent tuple invalidated the reported economic replay.",
+      "resolution": "Deduplicated nested development rows, derived replay ADTV from trading value, wired scored allocations into executable intents, added fill-aware evidence gates, corrected stress comparison and trial-adjusted DSR, and added one-time forward-holdout evidence.",
+      "impact": "The same provisional snapshot now yields auditable 3-fold execution metrics while remaining fail-closed until economic and forward-holdout gates pass."
+    },
+    {
       "task_id": "TASK_STOCK_ALPHA_V2_DATASET_CONTRACT_REBUILD",
       "date": "2026-08-11",
       "adr_id": "ADR_20260811_STOCK_ALPHA_V2_DATASET_CONTRACT_REBUILD",
