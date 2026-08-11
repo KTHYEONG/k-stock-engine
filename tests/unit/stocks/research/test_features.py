@@ -12,6 +12,7 @@ from src.stocks.research.features import (
     ReversalFeature,
     TrendFeature,
     build_features,
+    fit_v2_winsor_quantiles,
     phase1_allowlist,
 )
 
@@ -88,3 +89,32 @@ def test_log_market_cap_requires_market_cap() -> None:
     frame = _panel().drop("market_cap")
     with pytest.raises(ValueError, match="market_cap"):
         build_features(frame, [LogMarketCapFeature(name="ln_mktcap", version=1, inputs=("market_cap",))])
+
+
+def test_vectorized_winsor_quantiles_match_numpy_contract() -> None:
+    import numpy as np
+
+    frame = pl.DataFrame(
+        {
+            "feature__a": [1.0, 2.0, 3.0, 4.0, None, 100.0, 0.5, None, 7.0, 8.0],
+            "feature__b": [None] * 10,
+            "feature__c": [10.0, 20.0, None, 40.0, 50.0, 60.0, 70.0, 80.0, None, 100.0],
+        }
+    )
+    columns = ("feature__a", "feature__b", "feature__c")
+    quantiles = fit_v2_winsor_quantiles(frame, columns)
+
+    expected_a = (
+        float(np.quantile(frame["feature__a"].drop_nulls().to_numpy(), 0.01)),
+        float(np.quantile(frame["feature__a"].drop_nulls().to_numpy(), 0.99)),
+    )
+    assert quantiles["feature__a"][0] == pytest.approx(expected_a[0])
+    assert quantiles["feature__a"][1] == pytest.approx(expected_a[1])
+    assert quantiles["feature__b"] == (0.0, 0.0)
+    expected_c = (
+        float(np.quantile(frame["feature__c"].drop_nulls().to_numpy(), 0.01)),
+        float(np.quantile(frame["feature__c"].drop_nulls().to_numpy(), 0.99)),
+    )
+    assert quantiles["feature__c"][0] == pytest.approx(expected_c[0])
+    assert quantiles["feature__c"][1] == pytest.approx(expected_c[1])
+    assert tuple(quantiles) == columns
