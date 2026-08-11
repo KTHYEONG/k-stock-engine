@@ -86,15 +86,20 @@ def test_modern_stock_clis_do_not_reference_legacy_environment_paths() -> None:
 
 def test_train_and_simulate_clis_default_to_canonical_roots() -> None:
     from src.core.paths import (
-        STOCK_CANONICAL_ROOT,
+        STOCK_BASE_PANEL_ROOT,
         STOCK_CATALOG_ROOT,
-        STOCK_DERIVED_ROOT,
+        STOCK_FEATURE_PANEL_ROOT,
+        STOCK_LABEL_ROOT,
     )
     from src.stocks.cli import simulate, train
 
     assert train.STOCK_CATALOG_ROOT is STOCK_CATALOG_ROOT
-    assert train.STOCK_CANONICAL_ROOT is STOCK_CANONICAL_ROOT
-    assert train.STOCK_DERIVED_ROOT is STOCK_DERIVED_ROOT
+    assert train.STOCK_BASE_PANEL_ROOT is STOCK_BASE_PANEL_ROOT
+    assert train.STOCK_FEATURE_PANEL_ROOT is STOCK_FEATURE_PANEL_ROOT
+    assert train.STOCK_LABEL_ROOT is STOCK_LABEL_ROOT
     assert train.STOCK_ARTIFACT_ROOT is STOCK_ARTIFACT_ROOT
     assert simulate.STOCK_CATALOG_ROOT is STOCK_CATALOG_ROOT
+    assert simulate.STOCK_BASE_PANEL_ROOT is STOCK_BASE_PANEL_ROOT
+    assert simulate.STOCK_FEATURE_PANEL_ROOT is STOCK_FEATURE_PANEL_ROOT
+    assert simulate.STOCK_LABEL_ROOT is STOCK_LABEL_ROOT
     assert simulate.STOCK_ARTIFACT_ROOT is STOCK_ARTIFACT_ROOT
