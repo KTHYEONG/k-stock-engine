@@ -6,15 +6,22 @@ from pathlib import Path
 
 import pytest
 
-from src.core.paths import STOCK_ARTIFACT_ROOT, STOCK_CANONICAL_ROOT, STOCK_CATALOG_ROOT, STOCK_DERIVED_ROOT
+from src.core.paths import (
+    STOCK_ARTIFACT_ROOT,
+    STOCK_BASE_PANEL_ROOT,
+    STOCK_CATALOG_ROOT,
+    STOCK_FEATURE_PANEL_ROOT,
+    STOCK_LABEL_ROOT,
+)
 from src.stocks.cli import train
 
 
 def test_train_cli_defaults_to_canonical_roots() -> None:
     assert train.STOCK_ARTIFACT_ROOT is STOCK_ARTIFACT_ROOT
     assert train.STOCK_CATALOG_ROOT is STOCK_CATALOG_ROOT
-    assert train.STOCK_CANONICAL_ROOT is STOCK_CANONICAL_ROOT
-    assert train.STOCK_DERIVED_ROOT is STOCK_DERIVED_ROOT
+    assert train.STOCK_BASE_PANEL_ROOT is STOCK_BASE_PANEL_ROOT
+    assert train.STOCK_FEATURE_PANEL_ROOT is STOCK_FEATURE_PANEL_ROOT
+    assert train.STOCK_LABEL_ROOT is STOCK_LABEL_ROOT
 
 
 def test_train_cli_rejects_missing_snapshot_id() -> None:

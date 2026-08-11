@@ -6,13 +6,22 @@ from pathlib import Path
 
 import pytest
 
-from src.core.paths import STOCK_ARTIFACT_ROOT, STOCK_CATALOG_ROOT
+from src.core.paths import (
+    STOCK_ARTIFACT_ROOT,
+    STOCK_BASE_PANEL_ROOT,
+    STOCK_CATALOG_ROOT,
+    STOCK_FEATURE_PANEL_ROOT,
+    STOCK_LABEL_ROOT,
+)
 from src.stocks.cli import simulate
 
 
 def test_simulate_cli_defaults_to_canonical_roots() -> None:
     assert simulate.STOCK_ARTIFACT_ROOT is STOCK_ARTIFACT_ROOT
     assert simulate.STOCK_CATALOG_ROOT is STOCK_CATALOG_ROOT
+    assert simulate.STOCK_BASE_PANEL_ROOT is STOCK_BASE_PANEL_ROOT
+    assert simulate.STOCK_FEATURE_PANEL_ROOT is STOCK_FEATURE_PANEL_ROOT
+    assert simulate.STOCK_LABEL_ROOT is STOCK_LABEL_ROOT
 
 
 def test_simulate_cli_rejects_missing_snapshot_id() -> None:

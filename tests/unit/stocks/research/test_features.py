@@ -57,6 +57,15 @@ def test_feature_raises_on_non_positive_price() -> None:
         build_features(frame, phase1_allowlist())
 
 
+def test_close_location_uses_neutral_value_for_zero_range_sessions() -> None:
+    frame = _panel().with_columns(
+        pl.col("low").alias("high"),
+        pl.col("low").alias("close"),
+    )
+    out = build_features(frame, phase1_allowlist())
+    assert out["closeloc_20d"].to_list() == [0.5] * frame.height
+
+
 def test_reversal_preserves_raw_units_under_raw_name() -> None:
     frame = pl.DataFrame(
         {
