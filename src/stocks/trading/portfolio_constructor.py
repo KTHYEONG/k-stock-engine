@@ -42,10 +42,12 @@ class StockRiskPolicy:
     """
 
     top_k: int = 20
+    enter_rank: int = 15
+    keep_rank: int = 30
     gross_cap: float = 0.90
     single_name_cap: float = 0.08
     sector_cap: float = 0.25
-    participation_limit: float = 0.01
+    participation_limit: float = 0.005
     target_annual_volatility: float = 0.12
     turnover_budget: float = 0.20
     volatility_lookback_sessions: int = 20
@@ -56,6 +58,8 @@ class StockRiskPolicy:
     def __post_init__(self) -> None:
         if self.top_k <= 0:
             raise ValueError("top_k must be positive")
+        if not (0 < self.enter_rank <= self.keep_rank):
+            raise ValueError("ranks must satisfy 0 < enter_rank <= keep_rank")
         if not (0.0 < self.single_name_cap <= self.sector_cap <= self.gross_cap <= 1.0):
             raise ValueError(
                 "caps must satisfy 0 < single_name_cap <= sector_cap <= gross_cap <= 1"
@@ -109,13 +113,26 @@ def construct_target_allocations(
     if eligible.is_empty():
         return ()
 
-    ranked = eligible.sort(
-        [pl.col("pred_score").sort(descending=True), pl.col("instrument_id").sort()]
-    ).head(policy.top_k)
-
     equity = _portfolio_equity(portfolio, cross_section)
     price_map = _price_map(cross_section)
     current_weights = _current_weights(portfolio, price_map, equity)
+    incumbent_ids = set(current_weights)
+
+    ranked = (
+        eligible.sort(
+            [pl.col("pred_score").sort(descending=True), pl.col("instrument_id").sort()]
+        )
+        .with_row_index("__rank", offset=1)
+        .filter(
+            (pl.col("__rank") <= policy.enter_rank)
+            | (
+                pl.col("instrument_id").is_in(incumbent_ids)
+                & (pl.col("__rank") <= policy.keep_rank)
+            )
+        )
+        .head(policy.top_k)
+        .drop("__rank")
+    )
 
     ids = [str(r) for r in ranked["instrument_id"].to_list()]
     sector_of = {str(r["instrument_id"]): r["sector"] for r in cross_section.to_dicts()}
