@@ -7,6 +7,7 @@ store implementation. A deterministic migration adapter certifies the legacy
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, date, datetime, time
 from pathlib import Path
@@ -23,6 +24,7 @@ from src.stocks.data.catalog import (
 )
 from src.stocks.data.contracts import CoverageRange, DatasetSnapshot
 from src.stocks.data.curation import BASE_PANEL_FEATURE_SET
+from src.stocks.data.feature_contracts import feature_contract_book_from_allowlist
 from src.stocks.data.labels import LABEL_FEATURE_SET
 from src.stocks.research.datasets import (
     ELIGIBLE_STATUS,
@@ -31,6 +33,7 @@ from src.stocks.research.datasets import (
     QUARANTINED_STATUS,
     research_eligible_frame,
 )
+from src.stocks.research.features import stock_alpha_v2_allowlist
 from src.storage.parquet_datasets import ParquetDatasetStore
 
 logger = logging.getLogger("stocks.data.repositories")
@@ -39,6 +42,11 @@ PROVISIONAL_PROVIDER_VERSION = "provisional-legacy"
 _IDENTITY_COLUMNS = ("date", "ticker")
 _OHLC_COLUMNS = ("open", "high", "low", "close")
 _TARGET_PREFIXES = ("target_", "label_")
+
+STOCK_ALPHA_V2_FEATURE_SET = "stock_alpha_v2"
+V2_LABEL_DEFINITION = "residual_o2o_5d"
+V2_LABEL_HORIZON = 5
+V2_REQUIRED_LABEL_COLUMNS = ("residual_o2o_5d", "relevance", "label_available_time")
 
 
 def read_provisional_legacy_panel(
@@ -438,7 +446,10 @@ class ResearchDataRepository:
             "label_available_time" if "label_available_time" in labels.columns else None
         )
         if available_column is not None:
-            labels = labels.filter(pl.col(available_column) <= decision_time)
+            labels = labels.filter(
+                pl.col(available_column).is_not_null()
+                & (pl.col(available_column) <= decision_time)
+            )
 
         composed = (
             base.join(features, on=["instrument_id", "session"], how="inner")
@@ -450,6 +461,10 @@ class ResearchDataRepository:
 
         label_manifest = self.label_store.read_manifest(snapshot.labels.name)
         _assert_content_hash_matches(label_manifest, snapshot.labels)
+        if feature_set == STOCK_ALPHA_V2_FEATURE_SET:
+            self._assert_v2_composition(
+                snapshot, composed, feature_manifest, label_manifest, decision_time
+            )
         from src.core.datasets import DatasetManifest as _DatasetManifest
 
         merged_manifest = _DatasetManifest(
@@ -477,6 +492,106 @@ class ResearchDataRepository:
             storage_layout=feature_manifest.storage_layout,
         )
         return DatasetSnapshot(manifest=merged_manifest, frame=composed)
+
+    def _assert_v2_composition(
+        self,
+        snapshot: ResearchDataSnapshot,
+        composed: pl.DataFrame,
+        feature_manifest: DatasetManifest,
+        label_manifest: DatasetManifest,
+        decision_time: datetime,
+    ) -> None:
+        """Fail closed unless the v2 composition satisfies the frozen contract.
+
+        The feature manifest must declare ``stock_alpha_v2`` with a contract
+        hash equal to an allowlist-built contract book; exactly the 34 ordered
+        ``feature__`` columns must be declared and joined; the label manifest
+        must be ``residual_o2o_5d`` with horizon 5 and carry the residual,
+        relevance, and availability columns; and the composed frame must have no
+        empty result, no duplicate ``(instrument_id, session)``, no non-finite
+        label, and relevance within ``0..4``.
+        """
+        if feature_manifest.feature_set != STOCK_ALPHA_V2_FEATURE_SET:
+            raise ValueError(
+                f"v2 composition requires feature manifest stock_alpha_v2, got "
+                f"{feature_manifest.feature_set!r}"
+            )
+        if snapshot.features is None:
+            raise ValueError("v2 composition has no feature-panel reference")
+        contract_path = (
+            self.feature_store.root / snapshot.features.name / "feature_contract.json"
+        )
+        if not contract_path.is_file():
+            raise ValueError(f"v2 feature panel has no feature_contract.json: {contract_path}")
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        book = feature_contract_book_from_allowlist(
+            STOCK_ALPHA_V2_FEATURE_SET, stock_alpha_v2_allowlist()
+        )
+        expected_hash = book.schema_hash
+        stored_hash = str(contract.get("feature_set_hash", ""))
+        if stored_hash != expected_hash:
+            raise ValueError(
+                f"v2 feature contract hash mismatch: stored {stored_hash}, "
+                f"expected {expected_hash}"
+            )
+        expected_feature_columns = ["instrument_id", "session"] + [
+            f"feature__{name}" for name in stock_alpha_v2_allowlist()
+        ]
+        feature_columns = [
+            c for c in composed.columns if c.startswith("feature__")
+        ]
+        if feature_columns != expected_feature_columns[2:]:
+            raise ValueError(
+                f"v2 composition feature columns do not match the ordered allowlist: "
+                f"got {feature_columns}"
+            )
+        if label_manifest.label_definition != V2_LABEL_DEFINITION:
+            raise ValueError(
+                f"v2 composition requires label definition {V2_LABEL_DEFINITION!r}, "
+                f"got {label_manifest.label_definition!r}"
+            )
+        if label_manifest.label_horizon_sessions != V2_LABEL_HORIZON:
+            raise ValueError(
+                f"v2 composition requires label horizon {V2_LABEL_HORIZON}, "
+                f"got {label_manifest.label_horizon_sessions}"
+            )
+        missing_label_columns = [
+            c for c in V2_REQUIRED_LABEL_COLUMNS if c not in composed.columns
+        ]
+        if missing_label_columns:
+            raise ValueError(
+                f"v2 composition missing required label columns {missing_label_columns}"
+            )
+        duplicates = (
+            composed.group_by(["instrument_id", "session"])
+            .len()
+            .filter(pl.col("len") > 1)
+        )
+        if not duplicates.is_empty():
+            raise ValueError("v2 composition has duplicate (instrument_id, session) rows")
+        non_finite = composed.filter(
+            pl.col(V2_LABEL_DEFINITION).is_not_null()
+            & ~pl.col(V2_LABEL_DEFINITION).is_finite()
+        )
+        if not non_finite.is_empty():
+            raise ValueError("v2 composition contains non-finite residual labels")
+        relevance = composed[V2_REQUIRED_LABEL_COLUMNS[1]]
+        if relevance.null_count():
+            raise ValueError("v2 composition relevance must be integer within 0..4")
+        relevance_values = [
+            float(value) for value in relevance.to_list() if value is not None
+        ]
+        if relevance_values and (
+            min(relevance_values) < 0 or max(relevance_values) > 4
+        ):
+            raise ValueError("v2 composition relevance must be integer within 0..4")
+        if composed[V2_REQUIRED_LABEL_COLUMNS[2]].null_count():
+            raise ValueError("v2 composition joined a row without label_available_time")
+        unavailable = composed.filter(
+            pl.col(V2_REQUIRED_LABEL_COLUMNS[2]) > decision_time
+        )
+        if not unavailable.is_empty():
+            raise ValueError("v2 composition joined an unavailable label row")
 
     def compose_training_snapshot(
         self,
@@ -546,9 +661,6 @@ def _composed_schema_hash(
     """
     if feature_set != "stock_alpha_v2":
         return feature_manifest.schema_hash
-    from src.stocks.data.feature_contracts import feature_contract_book_from_allowlist
-    from src.stocks.research.features import stock_alpha_v2_allowlist
-
     book = feature_contract_book_from_allowlist(
         feature_set, stock_alpha_v2_allowlist()
     )
