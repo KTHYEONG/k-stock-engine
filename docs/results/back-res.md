@@ -1,262 +1,79 @@
-# Stock Alpha v2 재학습 결과
+# Stock Alpha v2 최신 ML 실행 결과
 
-- 실행일: 2026-08-11
+- 실행일: `2026-08-12`
 - Snapshot: `research_provisional_20160104_20260227_cost_master_v2_r1`
-- Artifact: `lambdarank_v2_20260811_cost_master_r4_adtvfix`
-- 결과: **NO_TRADE / 미승격**
-- 검증 프로파일: outer walk-forward 3 folds, Optuna 3 trials
+- Artifact: `lambdarank_v2_20260812_net_alpha_remediation_run`
+- 실행 모드: `research`
+- 실행 명령: `uv run python -m src.stocks.cli.train --artifact-id lambdarank_v2_20260812_net_alpha_remediation_run --snapshot-id research_provisional_20160104_20260227_cost_master_v2_r1 --mode research --optuna-trials 80 --max-rss-mib 8000`
+- 최종 결과: **NO_TRADE / 미승격**
 
-## 실행 범위와 한계
+## 탐색·자원
 
-이번 실행은 production 설정의 Optuna 80 trials가 아니라 3 trials로 축소한
-검증 프로파일이다. 80-trial 실행은 trial당 수십 초 이상 소요되어 제한 시간
-내 최종 artifact 생성 전에 중단했다. 따라서 이번 결과는 수정된 다중 fold 및
-event replay 경로의 실행 검증이며, 80-trial production 탐색 결과로 해석하면
-안 된다.
-
-## 핵심 성과
-
-| 항목 | 결과 | 의미 |
-|---|---:|---|
-| Evaluated folds | 3 | 단일 fold 의존 제거 |
-| Median Rank-IC | 0.09502298 | 세 fold 순위 예측력의 중앙값 |
-| Positive fold IC fraction | 1.0000 | 세 fold 모두 양수 |
-| CAGR | 0.06765591 | 연환산 전략 수익률 |
-| Annualized volatility | 0.08574637 | 연환산 변동성 |
-| Sharpe | 0.80689150 | base 비용 기준 위험조정 성과 |
-| Max drawdown | 0.22505300 | 최대 낙폭 |
-| Exposure | 0.68349673 | 평균 투자 노출 |
-| Turnover | 4.16809787 | replay 누적 turnover |
-| Cost drag | 0.00450877 | 비용이 equity에 미친 drag |
-| Planned cycles | 269 | 정상 계획된 rebalance cycle |
-| Attempted orders | 3,029 | 주문 시도 횟수 |
-| Filled orders | 3,029 | 체결 횟수 |
-
-이전 결과의 exposure·turnover·CAGR가 모두 0이었던 이유는 scored replay가
-allocation을 만들고도 빈 `intents`를 반환했기 때문이다. 이번 결과에서는
-실제 주문과 체결이 발생해 경제성 지표가 유효한 형태로 계산됐다.
-
-## 비용 스트레스 비교
-
-| 항목 | 결과 |
+| 항목 | 수치 |
 |---|---:|
-| Base total return | 0.56212756 |
-| Stress total return | 0.55858005 |
-| Benchmark total return | -0.15048441 |
-| Gate 4 | 통과 |
-
-스트레스 비용에서도 benchmark보다 높은 누적 수익률이 기록됐다. 다만 이는
-historical OOS replay 결과일 뿐, 미래 성과를 보장하지 않는다.
-
-## 승격 게이트 결과
-
-| 게이트 | 결과 | 판정 |
-|---|---:|---|
-| Positive fold IC fraction | 1.0000 | 통과 |
-| Executed orders/fills | 3,029 / 3,029 | 통과 |
-| Bootstrap excess lower bound | -0.00011480 | 실패 |
-| Strategy IR vs benchmark IR | 0.764015 vs -0.101442 | 참고 |
-| Stress cost excess | true | 통과 |
-| Deflated Sharpe probability | 0.871202 | 실패 (`< 0.95`) |
-| Forward holdout | 준비 안 됨 | 실패 |
-
-Bootstrap 하한이 음수이므로 초과수익의 하방 안정성을 입증하지 못했다.
-Deflated Sharpe도 후보 탐색 편향을 보정한 뒤 기준 0.95에 미달했다. 또한
-현재 snapshot은 2026-02-27에서 끝나므로 2026-03-10 이후 label-available
-252-session forward holdout을 구성할 수 없다.
-
-## Replay 품질 진단
-
-`no_trade_reason_counts`:
-
-- `constraint:insufficient covariance data`: 74회
-- `no-feasible-allocation`: 1회
-
-초기 replay 구간은 공분산 lookback 데이터 부족으로 일부 cycle이 건너뛰어졌다.
-그럼에도 269개 cycle이 계획됐고 3,029건이 모두 체결됐다.
-
-## 이번 수정 사항
-
-1. 요청된 `n_folds`와 `embargo_sessions`를 outer splitter에 적용했다.
-2. 중첩 fold의 중복 학습행을 제거했다.
-3. replay scored panel에 trading value 기반 ADTV를 연결했다.
-4. allocation을 `TradeIntent`로 변환해 실제 backtester 주문 경로를 연결했다.
-5. 체결 수가 0이면 promotion을 차단하도록 evidence gate를 강화했다.
-6. stress return과 benchmark return을 직접 비교하도록 Gate 4를 수정했다.
-
-## 최종 판정
-
-모델은 양의 Rank-IC와 실제 체결 성과를 보였지만, bootstrap 안정성·Deflated
-Sharpe·forward holdout을 모두 충족하지 못했다. 따라서 artifact는 의도대로
-`NO_TRADE`이며 paper/live 사용을 금지한다.
-
-## 다음 검증 작업
-
-1. 장시간 실행 환경에서 동일 snapshot을 Optuna 80 trials로 재학습한다.
-2. 2026-03-10 이후 252개 label-available session을 확보한다.
-3. 고정 후보 fingerprint로 forward holdout을 단 한 번 평가한다.
-4. covariance lookback 부족 cycle을 historical context 포함 replay로 재검증한다.
-5. 모든 게이트 통과 전까지 `NO_TRADE`를 유지한다.
-
-## 산출물
-
-- Metrics: `data/artifacts/stocks/lambdarank_v2_20260811_cost_master_r4_adtvfix/metrics.json`
-- Manifest: `data/artifacts/stocks/lambdarank_v2_20260811_cost_master_r4_adtvfix/manifest.json`
-- Model: `data/artifacts/stocks/lambdarank_v2_20260811_cost_master_r4_adtvfix/model.joblib`
-
-검증 결과: 대상 workflow 테스트 10 passed, `ruff check` PASS, `mypy` PASS.
-
-## 80-trial production benchmark (2026-08-11)
-
-동일 snapshot을 대상으로 새 artifact ID로 Optuna 80-trial benchmark를
-실행했다. 80개 terminal trial이 모두 완료됐으며, `max_rss_mib=8000` 제한에서
-OOM이나 resource guard 위반은 발생하지 않았다.
-
-- Snapshot: `research_provisional_20160104_20260227_cost_master_v2_r1`
-- Artifact: `lambdarank_v2_20260811_cost_master_r5_80trial_guard`
-- 결과: **NO_TRADE / 미승격**
-- Terminal trials: `80 / 80`
-- RSS: baseline `3297.9 MiB`, peak `3764.1 MiB`, limit `8000 MiB`
-- 실행 시간: 약 26분
-
-### 핵심 성과
-
-| 항목 | 결과 |
-|---|---:|
-| Evaluated folds | 3 |
-| Median Rank-IC | 0.09694661 |
-| Positive fold IC fraction | 1.0000 |
-| CAGR | 0.06291247 |
-| Annualized volatility | 0.08807378 |
-| Sharpe | 0.73728058 |
-| Max drawdown | 0.26692904 |
-| Exposure | 0.70326483 |
-| Turnover | 3.94630349 |
-| Cost drag | 0.00418692 |
-| Planned cycles | 283 |
-| Attempted orders | 3,040 |
-| Filled orders | 3,040 |
-
-### 비용 스트레스 및 승격 게이트
-
-| 항목 | 결과 | 판정 |
-|---|---:|---|
-| Base total return | 0.51544618 | 참고 |
-| Stress total return | 0.51363664 | 통과 |
-| Benchmark total return | -0.15048441 | 참고 |
-| Bootstrap excess lower bound | -0.00013637 | 실패 |
-| Strategy IR vs benchmark IR | 0.693059 vs -0.101442 | 참고 |
-| Deflated Sharpe probability | 0.257165 | 실패 (`< 0.95`) |
-| Forward holdout | 준비 안 됨 | 실패 |
-
-80-trial 탐색 후 Rank-IC는 이전 3-trial 결과보다 소폭 개선됐지만, 비용 반영
-replay의 CAGR·Sharpe·drawdown과 다중검정 보정 후 신뢰도는 개선되지 않았다.
-따라서 해당 artifact는 탐색·검증용으로 보존하며 paper/live 사용은 금지한다.
-
-### 산출물
-
-- Metrics: `data/artifacts/stocks/lambdarank_v2_20260811_cost_master_r5_80trial_guard/metrics.json`
-- Manifest: `data/artifacts/stocks/lambdarank_v2_20260811_cost_master_r5_80trial_guard/manifest.json`
-- Model: `data/artifacts/stocks/lambdarank_v2_20260811_cost_master_r5_80trial_guard/model.joblib`
-- Benchmark log: `scratch/lambdarank_v2_20260811_cost_master_r5_80trial_guard.log`
-
-## Optimized 80-trial benchmark (2026-08-11)
-
-준비 fold cache, reduced-budget screen, NDCG 중간 pruning, shortlist full-refit,
-inner event-ledger economic selection을 적용한 실제 production snapshot 재실행
-결과다. 기존 r5 artifact는 보존하고 새 artifact ID를 사용했다.
-
-- Snapshot: `research_provisional_20160104_20260227_cost_master_v2_r1`
-- Artifact: `lambdarank_v2_20260811_cost_master_r8_full_benchmark`
-- 실행 명령: `uv run python -m src.stocks.cli.train --artifact-id lambdarank_v2_20260811_cost_master_r8_full_benchmark --snapshot-id research_provisional_20160104_20260227_cost_master_v2_r1 --mode research --optuna-trials 80 --max-rss-mib 8000`
-- 결과: **NO_TRADE / 미승격**
-- Terminal trials: `80 / 80`
-- Wall-clock: **477.22초 (7분 57초)**
-- 기존 r5 기록(약 26분) 대비 약 **69% 단축**
-- RSS: baseline `3315.0 MiB`, peak `3966.6 MiB`, limit `8000 MiB`
-
-### 탐색·선정 단계
-
-| 항목 | 결과 |
-|---|---:|
+| Optuna terminal trials | 80 |
 | Screened trials | 71 |
 | Pruned trials | 9 |
 | Shortlisted trials | 8 |
 | Economically eligible trials | 0 |
-| Best screen Rank-IC | 0.07573805 |
-| Screen time | 218.84초 |
-| Shortlist full-refit time | 245.93초 |
-| Economic replay time | 73.94초 |
 | Prepared cache | 106,295,948 bytes |
+| Peak RSS | 4,532.6 MiB / 8,000 MiB |
+| Screen time | 217.07 s |
+| Full refit time | 282.60 s |
+| Economic replay time | 109.64 s |
 | Selection status | `no_economically_eligible_candidate` |
 
-### 성과 및 승격 판정
+## Shortlist 수치
 
-모든 shortlist 후보가 inner 경제성 적격 조건(양의 fold IC, 체결, finite
-replay, bootstrap excess lower bound > 0)을 통과하지 못했다. 따라서 champion을
-선택하지 않고 fail-closed로 종료했으며, outer OOS replay와 CAGR·Sharpe·MDD
-성과 지표는 생성되지 않았다.
-
-- `promoted=false`, `no_trade=true`
-- `n_folds_evaluated=0`
-- `promotion_reasons=["no-champion-trial"]`
-- paper/live 사용 금지 유지
-
-이번 실행은 속도 목표는 충족했지만, Rank-IC가 양수인 후보만으로는 비용·체결을
-반영한 inner bootstrap 안정성을 입증하지 못한다는 점을 확인했다. 다음 단계는
-shortlist 후보별 economic evidence를 상세 출력하고, 신호/포트폴리오 규칙을
-변경하기 전에 해당 조건이 과도하게 엄격한지 기존 promotion budget과 함께
-검토하는 것이다. 게이트를 완화해 승격시키지는 않는다.
-
-### 산출물
-
-- Metrics: `data/artifacts/stocks/lambdarank_v2_20260811_cost_master_r8_full_benchmark/metrics.json`
-- Manifest: `data/artifacts/stocks/lambdarank_v2_20260811_cost_master_r8_full_benchmark/manifest.json`
-- Model: `data/artifacts/stocks/lambdarank_v2_20260811_cost_master_r8_full_benchmark/model.joblib`
-- Benchmark log: `logs/scratch/r8_full_benchmark.log`
-
-## ADTV 복구 후 80-trial 재실행 (2026-08-12)
-
-직전 최적화 실행에서 replay 캐시에 ADTV가 누락되어 모든 후보가
-`constraint:scores panel must carry adtv`로 종료된 회귀를 수정했다. 전체
-point-in-time panel에서 계산한 20-session causal ADTV를 replay static context에
-포함하고 동일 snapshot·seed·80-trial 조건으로 재실행했다.
-
-- Snapshot: `research_provisional_20160104_20260227_cost_master_v2_r1`
-- Artifact: `lambdarank_v2_20260812_backtest_opt_fixed`
-- 실행 명령: `uv run python -m src.stocks.cli.train --artifact-id lambdarank_v2_20260812_backtest_opt_fixed --snapshot-id research_provisional_20160104_20260227_cost_master_v2_r1 --mode research --optuna-trials 80 --max-rss-mib 8000`
-- 실행 시간: 약 445초 (10:08:32~10:15:57 KST)
-- 결과: **NO_TRADE / 미승격**
-- Terminal trials: `80 / 80`
-- RSS: baseline `3320.2 MiB`, peak `3848.9 MiB`, limit `8000 MiB`
-
-### Replay 및 후보 evidence
-
-| 항목 | 결과 |
+| 항목 | 범위 |
 |---|---:|
-| Screened / pruned trials | 71 / 9 |
-| Shortlisted trials | 8 |
-| Economically eligible trials | 0 |
-| Screen time | 214.19초 |
-| Shortlist full-refit time | 230.91초 |
-| Economic replay time | 60.69초 |
-| Prepared cache | 106,295,948 bytes |
-| Peak RSS | 3,848.9 MiB |
-| Selection status | `no_economically_eligible_candidate` |
+| Median Rank-IC | 0.07462526 ~ 0.08017009 |
+| Average expected net alpha | -0.00169929 ~ -0.00097477 |
+| Bootstrap excess lower bound | -0.00094304 ~ -0.00075492 |
+| Attempted orders | 0 ~ 190 |
+| Filled orders | 0 ~ 190 |
+| Planned cycles | 0 ~ 15 |
+| Strategy IR | 0.0000 ~ 1.5308 |
+| Turnover | 0.0000 ~ 0.9369 |
+| Cash cycles | 59 ~ 74 |
 
-ADTV 복구 후 후보별 replay가 실제로 실행됐고, 후보별 attempted/filled orders는
-`715~737 / 715~737`, planned cycles는 `67~69`로 회복됐다. covariance lookback
-warm-up에 따른 cycle skip은 후보별 5~7회였다. 8개 후보 모두 replay finite 조건과
-체결 조건은 통과했지만 bootstrap excess lower bound가 `-0.00076368`~
-`-0.00066004`로 음수였고, strategy IR도 `-0.4754`~`-0.1551`로 음수였다.
+최고 screen Rank-IC 후보는 trial 58이다.
 
-따라서 이번 결과는 캐시 회귀가 해결된 유효한 economic replay 결과이며, NO_TRADE의
-직접 원인은 모든 shortlist 후보의 `non_positive_bootstrap_lower_bound`다. 게이트를
-완화하지 않았고 outer OOS·paper/live 승격은 수행하지 않았다.
+| 항목 | trial 58 |
+|---|---:|
+| Fold Rank-IC | 0.07573805 / 0.08384901 |
+| Median Rank-IC | 0.07979353 |
+| Average expected net alpha | -0.00122868 |
+| Bootstrap excess lower bound | -0.00094304 |
+| Attempted / filled orders | 0 / 0 |
+| Cash cycles | 74 |
 
-### 산출물
+실제 체결이 가장 많았던 shortlist 후보도 attempted/filled `190 / 190`이었지만,
+average expected net alpha `-0.00106769`, bootstrap 하한 `-0.00075492`로 경제성
+게이트를 통과하지 못했다.
 
-- Metrics: `data/artifacts/stocks/lambdarank_v2_20260812_backtest_opt_fixed/metrics.json`
-- Manifest: `data/artifacts/stocks/lambdarank_v2_20260812_backtest_opt_fixed/manifest.json`
-- Model: `data/artifacts/stocks/lambdarank_v2_20260812_backtest_opt_fixed/model.joblib`
-- Benchmark log: `logs/scratch/lambdarank_v2_20260812_backtest_opt_fixed.log`
+## Rank-IC 해석
+
+Rank-IC `0.07979`는 순위 예측력만 보면 양수이며, 두 fold가 모두 양수(`0.07574`,
+`0.08385`)이므로 신호 방향성이 무작위보다 낫다는 근거는 있다. 다만 Rank-IC는
+순위의 정합도이지 비용 후 수익률·체결 가능성·하방 안정성을 측정하지 않는다.
+
+이번 실행에서는 상위 bucket의 expected active alpha가 양수인 경우도 있었지만,
+round-trip cost `0.0036`을 차감한 expected net alpha가 음수였고 bootstrap 하한도
+음수였다. 따라서 `0.07979`는 “학습이 전혀 안 됨”은 아니지만, 투자 가능한 수준으로
+학습·검증되었다는 의미도 아니다. 현재 증거 기준으로는 모델 순위 신호는 존재하나
+포트폴리오 경제성으로 전환되지 않았으며, `NO_TRADE` 판정이 올바르다.
+
+## 최종 판정
+
+- `promoted=false`
+- `no_trade=true`
+- `promotion_reasons=["no-champion-trial"]`
+- Outer OOS·forward holdout 성과: 미생성
+- Paper/live 사용: 금지
+
+## 산출물
+
+- [Metrics](../../data/artifacts/stocks/lambdarank_v2_20260812_net_alpha_remediation_run/metrics.json)
+- [Manifest](../../data/artifacts/stocks/lambdarank_v2_20260812_net_alpha_remediation_run/manifest.json)
+- [Model](../../data/artifacts/stocks/lambdarank_v2_20260812_net_alpha_remediation_run/model.joblib)
