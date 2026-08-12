@@ -88,8 +88,12 @@ _REPLAY_MARKET_INDEX_OPTIONAL = (
     "feature__volatility_20d",
     "data_quality_status",
 )
+_BOOTSTRAP_START_BYTES = 8
 _BOOTSTRAP_INDEX_BYTES = 8
 _BOOTSTRAP_VALUE_BYTES = 8
+_BOOTSTRAP_BYTES_PER_ROW = (
+    _BOOTSTRAP_START_BYTES + _BOOTSTRAP_INDEX_BYTES + _BOOTSTRAP_VALUE_BYTES
+)
 
 
 class ReplayMode(StrEnum):
@@ -269,6 +273,8 @@ class ReplayResourceGuard:
         self.stage_peak_rss_mib: dict[str, float] = {}
         self.prepared_decision_count = 0
         self.capacity_failure_reason: str | None = None
+        self.bootstrap_batch_size = 0
+        self.bootstrap_workspace_bytes = 0
 
     @staticmethod
     def _rss_mib() -> float:
@@ -323,6 +329,42 @@ class ReplayResourceGuard:
         if current + estimate_mib > self._limit_mib:
             self._fail(stage)
 
+    def bootstrap_workspace_cap(
+        self,
+        *,
+        history_rows: int,
+        projected_output_bytes: int,
+        n_bootstrap: int,
+    ) -> int:
+        """Admit decision preparation and return the bounded bootstrap workspace.
+
+        Samples current RSS once, converts the remaining hard-budget capacity
+        to bytes, and reserves the projected calibrated output plus one
+        conservative draw workspace (``history_rows * 24``) so allocator
+        overlap is modeled instead of assuming an input frame is freed before
+        its output exists. The selected batch cap is limited to the full
+        ``n_bootstrap * history_rows * 24`` upper bound and admitted; when one
+        draw plus the projected output cannot fit, the run stays fail-closed
+        with ``replay_capacity_exceeded:decision_preparation``.
+        """
+        current_mib = self._rss_mib()
+        self.peak_rss_mib = max(self.peak_rss_mib, current_mib)
+        remaining_bytes = int(max(0.0, self._limit_mib - current_mib) * (1024 * 1024))
+        per_draw = history_rows * _BOOTSTRAP_BYTES_PER_ROW
+        reserve = projected_output_bytes + per_draw
+        max_batch = min(
+            remaining_bytes - reserve,
+            _bootstrap_workspace_bytes(n_bootstrap, history_rows),
+        )
+        if max_batch < per_draw:
+            self._fail("decision_preparation")
+        batch_draws = max_batch // per_draw
+        workspace_cap = batch_draws * per_draw
+        self.admit(workspace_cap + reserve, stage="decision_preparation")
+        self.bootstrap_batch_size = batch_draws
+        self.bootstrap_workspace_bytes = workspace_cap
+        return workspace_cap
+
     def check_after(self, *, stage: str) -> None:
         """Record the observed RSS after a materialization and fail on breach."""
         current = self._rss_mib()
@@ -348,6 +390,8 @@ class ReplayResourceGuard:
             "baseline_rss_mib": round(self.baseline_rss_mib, 3),
             "replay_peak_rss_mib": round(self.peak_rss_mib, 3),
             "replay_limit_mib": round(self._limit_mib, 3),
+            "bootstrap_batch_size": int(self.bootstrap_batch_size),
+            "bootstrap_workspace_bytes": int(self.bootstrap_workspace_bytes),
         }
 
 
@@ -376,17 +420,16 @@ def _build_replay_market_index(
 
 
 def _bootstrap_workspace_bytes(
-    request: TrainingRequest,
-    history_sessions: int,
-    instruments: int,
+    n_bootstrap: int,
+    history_rows: int,
 ) -> int:
-    """Known NumPy moving-block bootstrap index/value workspace bytes."""
-    rows = max(history_sessions, 1) * max(instruments, 1)
-    return (
-        request.n_bootstrap
-        * rows
-        * (_BOOTSTRAP_INDEX_BYTES + _BOOTSTRAP_VALUE_BYTES)
-    )
+    """Conservative NumPy moving-block bootstrap workspace bytes for all draws.
+
+    The materialization retains the start-index array, the expanded indices,
+    and the sampled values: three ``int64``/``float64`` row-sized work arrays,
+    i.e. 24 bytes per history row per draw.
+    """
+    return n_bootstrap * history_rows * _BOOTSTRAP_BYTES_PER_ROW
 
 
 @dataclass(frozen=True, slots=True)
@@ -2116,18 +2159,18 @@ def _event_ledger_evaluation(
             calibration_state: dict[str, object] | None = None
             if calibrator is not None:
                 assert calibration_ledger is not None
+                workspace_cap: int | None = None
                 if replay_guard is not None:
-                    replay_guard.admit(
-                        int(visible.estimated_size())
-                        + _bootstrap_workspace_bytes(
-                            request,
-                            int(calibration_ledger["session"].n_unique()),
-                            int(calibration_ledger["instrument_id"].n_unique()),
-                        ),
-                        stage="decision_preparation",
+                    workspace_cap = replay_guard.bootstrap_workspace_cap(
+                        history_rows=calibration_ledger.height,
+                        projected_output_bytes=int(visible.estimated_size()),
+                        n_bootstrap=request.n_bootstrap,
                     )
                 calibration_state = calibrator.prepare_decision(
-                    calibration_ledger, decision_time, base_schedule
+                    calibration_ledger,
+                    decision_time,
+                    base_schedule,
+                    max_bootstrap_workspace_bytes=workspace_cap,
                 )
                 visible = calibrator.apply_prepared(calibration_state, visible)
                 calibration_tracker["state"] = calibrator.calibration_state()
