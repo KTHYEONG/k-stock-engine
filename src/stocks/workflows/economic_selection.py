@@ -1,14 +1,14 @@
 """Deterministic multi-fidelity economic selection policy.
 
-The redesign replaces the fixed ``screen -> top-8 -> every-fold full refit ->
-full replay`` pipeline with an evidence-adaptive successive-promotion funnel:
-for each route, ``route_budget`` screen trials are run once, the
-``ceil(sqrt(route_budget))`` best positive-screen trials are promoted to a
-fold-0 full refit, and the ``ceil(promotion_width / fold_count)`` best
-all-positive candidates become exact economic finalists. Backfill keeps the
-fail-closed property: a rejected finalist is deterministically replaced from
-the promoted list until ``finalist_width`` all-positive candidates exist or the
-list is exhausted.
+The v2 redesign replaces the fixed ``screen -> top-8 -> every-fold full refit ->
+full replay`` pipeline with a fixed-stride proxy screen funnel: for each route,
+``route_budget`` screen trials run once against a deterministic
+``proxy_session_stride`` session subsample of the fold-0 context, the
+``ceil(sqrt(route_budget))`` best positive-screen trials are promoted to a full
+fold-0 refit, and exactly one all-positive candidate becomes the route's
+economic finalist. A rejected finalist is never silently replaced: the route
+has no champion, which is conservative in the financial sense (an additional
+``NO_TRADE`` is acceptable, a relaxed gate is not).
 
 The policy is versioned through :data:`SELECTION_POLICY_VERSION` so every
 promotion decision, resume fingerprint, metric, and artifact provenance can be
@@ -19,19 +19,97 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-SELECTION_POLICY_VERSION = "economic-selection-v1"
+SELECTION_POLICY_VERSION = "economic-selection-v2-proxy-one-finalist"
+
+
+@dataclass(frozen=True, slots=True)
+class ScreenFidelityPolicy:
+    """Fixed-stride proxy screen funnel widths for one route.
+
+    ``route_budget`` is the number of screen trials dedicated to the route.
+    ``proxy_session_stride`` is the deterministic in-split session step used to
+    build the proxy screen context (derived from ``ceil(sqrt(route_budget))``,
+    so a larger search budget automatically keeps a proportional fixed temporal
+    sample). ``promotion_width`` is the number of positive-screen candidates
+    promoted to a full fold-0 refit; ``finalist_width`` is the number of
+    all-positive candidates taken to exact economic replay (one per route).
+    ``widths`` exposes the ``(route_budget, proxy_session_stride,
+    promotion_width, finalist_width)`` profile that drives the 81-trial
+    three-route three-fold profile to a 27-to-6-to-6-to-1 funnel.
+    """
+
+    route_budget: int
+    proxy_session_stride: int
+    promotion_width: int
+    finalist_width: int
+
+    @classmethod
+    def for_budget(
+        cls,
+        *,
+        total_trials: int,
+        route_count: int,
+        fold_count: int,
+    ) -> ScreenFidelityPolicy:
+        """Derive the v2 proxy funnel widths for an equal route budget.
+
+        ``route_budget`` is the equal per-route screen trial count;
+        ``proxy_session_stride`` is ``ceil(sqrt(route_budget))`` so the proxy
+        keeps a fixed temporal sample proportional to the search budget.
+        ``promotion_width`` never exceeds the route budget and a degenerate
+        budget of one trial still promotes two candidates so a screen quality
+        ranking exists before economic evidence is spent. ``finalist_width`` is
+        exactly one: the route's champion is the single top all-positive
+        candidate and a rejected finalist yields no champion. Raises
+        ``ValueError`` for non-positive inputs.
+        """
+        if total_trials < 1 or route_count < 1 or fold_count < 1:
+            raise ValueError("total_trials, route_count, and fold_count must be positive")
+        route_budget = max(1, total_trials // route_count)
+        proxy_session_stride = max(1, math.ceil(math.sqrt(route_budget)))
+        promotion_width = min(
+            route_budget,
+            max(2, math.ceil(math.sqrt(route_budget))),
+        )
+        finalist_width = 1
+        return cls(
+            route_budget=route_budget,
+            proxy_session_stride=proxy_session_stride,
+            promotion_width=promotion_width,
+            finalist_width=finalist_width,
+        )
+
+    @property
+    def widths(self) -> tuple[int, int, int, int]:
+        """The ``(route_budget, stride, promotion, finalist)`` profile."""
+        return (
+            self.route_budget,
+            self.proxy_session_stride,
+            self.promotion_width,
+            self.finalist_width,
+        )
+
+    def to_json_safe(self) -> dict[str, object]:
+        """JSON-safe policy evidence for metrics and provenance."""
+        return {
+            "selection_policy_version": SELECTION_POLICY_VERSION,
+            "route_budget": int(self.route_budget),
+            "proxy_session_stride": int(self.proxy_session_stride),
+            "promotion_width": int(self.promotion_width),
+            "finalist_width": int(self.finalist_width),
+        }
 
 
 @dataclass(frozen=True, slots=True)
 class SelectionPolicy:
-    """Evidence-adaptive promotion widths for one route.
+    """Legacy v1 evidence-adaptive promotion widths for one route.
 
-    ``route_budget`` is the number of screen trials dedicated to the route.
-    ``promotion_width`` is the number of positive-screen candidates promoted
-    to a fold-0 full refit; ``finalist_width`` is the number of all-positive
-    candidates taken to exact economic replay. ``widths`` exposes the
-    ``(route_budget, promotion_width, finalist_width)`` triple that drives the
-    81-trial three-route three-fold profile to a 27-to-6-to-2 funnel.
+    Retained for reference; the active v2 policy is
+    :class:`ScreenFidelityPolicy`. ``route_budget`` is the number of screen
+    trials dedicated to the route, ``promotion_width`` the number of
+    positive-screen candidates promoted to a fold-0 full refit, and
+    ``finalist_width`` the number of all-positive candidates taken to exact
+    economic replay.
     """
 
     route_budget: int
@@ -47,15 +125,7 @@ class SelectionPolicy:
         route_count: int,
         fold_count: int,
     ) -> SelectionPolicy:
-        """Derive the promotion funnel widths for an equal route budget.
-
-        ``promotion_width`` grows with the square root of the route budget and
-        never exceeds the number of positive-screen candidates; a degenerate
-        budget of one trial still promotes at least two candidates so a screen
-        quality ranking exists before economic evidence is spent.
-        ``finalist_width`` shrinks the promotion list by one fold per remaining
-        refit stage. Raises ``ValueError`` for non-positive inputs.
-        """
+        """Derive the legacy promotion funnel widths for an equal route budget."""
         if total_trials < 1 or route_count < 1 or fold_count < 1:
             raise ValueError("total_trials, route_count, and fold_count must be positive")
         route_budget = max(1, total_trials // route_count)
@@ -82,7 +152,7 @@ class SelectionPolicy:
     def to_json_safe(self) -> dict[str, object]:
         """JSON-safe policy evidence for metrics and provenance."""
         return {
-            "selection_policy_version": SELECTION_POLICY_VERSION,
+            "selection_policy_version": "economic-selection-v1",
             "route_budget": int(self.route_budget),
             "promotion_width": int(self.promotion_width),
             "finalist_width": int(self.finalist_width),
