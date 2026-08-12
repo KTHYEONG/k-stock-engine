@@ -71,6 +71,7 @@ class LambdaRankConfig:
     """
 
     _tuning_telemetry: dict[str, object] | None = None
+    _calibration_state: dict[str, object] | None = None
 
     def __init__(
         self,
@@ -203,6 +204,7 @@ class LambdaRankBlendModel:
         self._train_group_count = 0
         self._no_trade = True
         self._stable_scores_cache: pl.DataFrame | None = None
+        self._calibration_state: dict[str, object] | None = None
 
     @property
     def no_trade(self) -> bool:
@@ -211,6 +213,15 @@ class LambdaRankBlendModel:
     @property
     def stable(self) -> StableRankComposite:
         return self._stable
+
+    @property
+    def calibration_state(self) -> dict[str, object] | None:
+        """Frozen causal net-alpha calibration evidence, or ``None``."""
+        return self._calibration_state
+
+    def set_calibration_state(self, state: dict[str, object] | None) -> None:
+        """Bind the JSON-safe calibration snapshot used by prediction columns."""
+        self._calibration_state = None if state is None else dict(state)
 
     def fit(self, train: pl.DataFrame, validation: pl.DataFrame) -> None:
         """Fit both components on training rows only."""
@@ -291,7 +302,14 @@ class LambdaRankBlendModel:
             LAMBDARANK_WEIGHT * lambda_rank + STABLE_WEIGHT * stable_rank
         ).alias("pred_score")
         result = scored.with_columns(blend)
-        return result.drop("__lambda_score", "__stable_score")
+        result = result.drop("__lambda_score", "__stable_score")
+        if self._calibration_state is not None:
+            from src.stocks.research.economic_alpha import CausalAlphaCalibrator
+
+            result = CausalAlphaCalibrator.from_state(
+                self._calibration_state
+            ).apply_frozen(result)
+        return result
 
     def manifest(self) -> ModelManifest:
         params: dict[str, str] = {
@@ -312,6 +330,11 @@ class LambdaRankBlendModel:
             "early_stopping_rounds": str(self.config.early_stopping_rounds),
             "train_group_count": str(self._train_group_count),
             "no_trade": str(self._no_trade).lower(),
+            "calibration_state": (
+                json.dumps(self._calibration_state, sort_keys=True, default=str)
+                if self._calibration_state is not None
+                else ""
+            ),
         }
         return ModelManifest(
             artifact_id=self._manifest.artifact_id,

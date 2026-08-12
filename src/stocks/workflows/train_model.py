@@ -40,6 +40,7 @@ from src.stocks.research.datasets import (
     research_eligible_frame,
     validate_stock_rows_available,
 )
+from src.stocks.research.economic_alpha import CausalAlphaCalibrator
 from src.stocks.research.features import (
     apply_v2_transforms,
     fit_v2_winsor_quantiles,
@@ -113,6 +114,7 @@ class ReplayResult:
     attempted_orders: int = 0
     filled_orders: int = 0
     no_trade_reason_counts: dict[str, int] = field(default_factory=dict)
+    calibration_evidence: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +245,12 @@ class EconomicCandidateEvidence:
     turnover: float
     failure_reasons: tuple[str, ...]
     eligible: bool
+    calibration_history_sessions: int = 0
+    eligible_bucket_count: int = 0
+    average_expected_net_alpha: float = 0.0
+    cash_cycles: int = 0
+    cost_drag: float = 0.0
+    calibration_state: dict[str, object] | None = None
 
     def to_json_safe(self) -> dict[str, object]:
         """JSON-serializable evidence row with deterministic failure reasons."""
@@ -262,6 +270,12 @@ class EconomicCandidateEvidence:
             "turnover": round(self.turnover, 8),
             "failure_reasons": list(self.failure_reasons),
             "eligible": bool(self.eligible),
+            "calibration_history_sessions": int(self.calibration_history_sessions),
+            "eligible_bucket_count": int(self.eligible_bucket_count),
+            "average_expected_net_alpha": round(self.average_expected_net_alpha, 10),
+            "cash_cycles": int(self.cash_cycles),
+            "cost_drag": round(self.cost_drag, 10),
+            "calibration_state": self.calibration_state,
         }
 
 
@@ -390,9 +404,11 @@ def train_model(
 
     oos = pl.concat(scored_frames)
     _reject_non_finite_economic_inputs(oos)
+    champion_oos_ledger = _build_calibration_ledger(oos, training_panel, label_column)
 
     replay = _event_ledger_evaluation(
         training_panel, oos, request, snapshot.manifest, registry, base, stress,
+        calibration_ledger=champion_oos_ledger,
     )
 
     budget = PromotionRiskBudget()
@@ -404,6 +420,7 @@ def train_model(
     holdout_ok, holdout_reason, _holdout_evidence = _evaluate_forward_holdout(
         registry, request, base_manifest, panel, holdout_fold, champion_config,
         feature_columns, label_column, relevance_column, snapshot.manifest, base, stress,
+        calibration_ledger=champion_oos_ledger,
     )
     reasons.append(holdout_reason)
     passed = bool(gates["passed"]) and holdout_ok and bool(fold_rank_ic)
@@ -411,6 +428,11 @@ def train_model(
     model = fold_models[-1] if passed else _no_trade_model(
         base_manifest, feature_columns, label_column, relevance_column, champion_config,
     )
+    champion_calibration_state = replay.calibration_evidence.get("calibration_state")
+    if champion_calibration_state is not None:
+        model.set_calibration_state(
+            cast(dict[str, object], champion_calibration_state)
+        )
     published_manifest = model.manifest()
     registry.publish(model, published_manifest)
     registry.write_metrics(
@@ -1047,6 +1069,7 @@ def _evaluate_economic_candidate(
     bootstrap_lower_bound = _inner_bootstrap_lower_bound(replay, request)
     if bootstrap_lower_bound <= 0.0:
         failures.append("non_positive_bootstrap_lower_bound")
+    calibration_evidence = replay.calibration_evidence or {}
     return EconomicCandidateEvidence(
         trial_number=trial_number,
         screen_rank_ic=screen_rank_ic,
@@ -1065,6 +1088,22 @@ def _evaluate_economic_candidate(
             code for code in _ECONOMIC_FAILURE_CODES if code in failures
         ),
         eligible=not failures,
+        calibration_history_sessions=int(
+            cast(int, calibration_evidence.get("history_sessions", 0))
+        ),
+        eligible_bucket_count=int(
+            cast(int, calibration_evidence.get("eligible_bucket_count", 0))
+        ),
+        average_expected_net_alpha=float(
+            cast(float, calibration_evidence.get("average_expected_net_alpha", 0.0))
+        ),
+        cash_cycles=int(replay.no_trade_reason_counts.get("no-feasible-allocation", 0)),
+        cost_drag=float(replay.metrics.get("cost_drag", 0.0)),
+        calibration_state=(
+            cast(dict[str, object], calibration_evidence.get("calibration_state"))
+            if calibration_evidence.get("calibration_state") is not None
+            else None
+        ),
     )
 
 
@@ -1150,6 +1189,7 @@ def _select_economic_champion(
     refit_started = time.perf_counter()
     candidate_rows: list[tuple[tuple[float, ...], int]] = []
     evidence_by_trial: dict[int, dict[str, float]] = {}
+    calibration_state_by_trial: dict[int, dict[str, object] | None] = {}
     shortlist_evidence: list[dict[str, object]] = []
     early_rejected_seconds: list[float] = []
     replay_seconds = 0.0
@@ -1172,9 +1212,11 @@ def _select_economic_champion(
             logger.info("[EVAL] trial=%s stage=early_rejected", trial_number)
             continue
         replay_started = time.perf_counter()
+        causal_oos_ledger = _build_calibration_ledger(oos, tuning_panel, label_column)
         replay = _event_ledger_evaluation(
             tuning_panel, oos, request, dataset_manifest, registry, base_schedule,
             stress_schedule, replay_context=replay_context,
+            calibration_ledger=causal_oos_ledger,
         )
         replay_seconds += time.perf_counter() - replay_started
         evidence = _evaluate_economic_candidate(
@@ -1209,6 +1251,8 @@ def _select_economic_champion(
             "turnover": evidence.turnover,
             "median_rank_ic": evidence.median_rank_ic,
         }
+        calibration_state_by_trial[trial_number] = evidence.calibration_state
+        calibration_state_by_trial[trial_number] = evidence.calibration_state
         logger.info(
             "[EVAL] trial=%s stage=economically_eligible "
             "bootstrap_lower_bound=%.8f strategy_ir=%.6f",
@@ -1239,6 +1283,9 @@ def _select_economic_champion(
     candidate_rows.sort(key=lambda row: row[0], reverse=True)
     _winner_key, winner_number = candidate_rows[0]
     champion = _config_from_params(dict(study.trials[winner_number].params))
+    winner_calibration_state = calibration_state_by_trial.get(winner_number)
+    if winner_calibration_state is not None:
+        champion._calibration_state = dict(winner_calibration_state)
     return champion, {
         "economically_eligible_trials": len(candidate_rows),
         "full_refit_seconds": refit_seconds,
@@ -1248,6 +1295,7 @@ def _select_economic_champion(
             f"selected_inner_{name}": value
             for name, value in evidence_by_trial[winner_number].items()
         },
+        "selected_calibration_state": winner_calibration_state,
         **selection_tail,
     }
 
@@ -1337,6 +1385,7 @@ def _event_ledger_evaluation(
     stress_schedule: CostSchedule,
     *,
     replay_context: ReplayStaticContext | None = None,
+    calibration_ledger: pl.DataFrame | None = None,
 ) -> ReplayResult:
     """Replay the out-of-sample scored panel through the event-driven backtester.
 
@@ -1394,6 +1443,19 @@ def _event_ledger_evaluation(
         .select("instrument_id", "session", "adtv")
     )
 
+    calibrator = (
+        CausalAlphaCalibrator(
+            bucket_count=request.calibration_bucket_count,
+            min_calibration_sessions=request.min_calibration_sessions,
+            seed=request.seed,
+            n_bootstrap=request.n_bootstrap,
+            bootstrap_alpha=request.bootstrap_alpha,
+        )
+        if calibration_ledger is not None and not calibration_ledger.is_empty()
+        else None
+    )
+    calibration_tracker: dict[str, object] = {}
+
     def _scored_no_trade(
         portfolio: PortfolioSnapshot,
         cycle_request: TradingCycleRequest,
@@ -1431,6 +1493,15 @@ def _event_ledger_evaluation(
         if visible.is_empty():
             return _scored_no_trade(portfolio, cycle_request, "empty-scored-cross-section")
         try:
+            if calibrator is not None:
+                assert calibration_ledger is not None
+                visible = calibrator.transform(
+                    visible,
+                    calibration_ledger,
+                    cycle_request.decision_time,
+                    base_schedule,
+                )
+                calibration_tracker["state"] = calibrator.calibration_state()
             allocations = construct_target_allocations(
                 visible, instruments, portfolio, policy
             )
@@ -1519,6 +1590,26 @@ def _event_ledger_evaluation(
             for reason in cycle.reasons
         )
     )
+    calibration_state = calibration_tracker.get("state")
+    if calibration_state is not None and isinstance(calibration_state, dict):
+        buckets = calibration_state.get("buckets") or []
+        net_alphas = [
+            float(row["expected_active_alpha"]) - float(calibration_state["round_trip_cost"])
+            for row in buckets
+            if row.get("expected_active_alpha") is not None
+        ]
+        calibration_evidence = {
+            "history_sessions": int(calibration_state.get("history_sessions", 0)),
+            "eligible_bucket_count": len(net_alphas),
+            "average_expected_net_alpha": (
+                float(np.mean(net_alphas)) if net_alphas else 0.0
+            ),
+            "round_trip_cost": float(calibration_state.get("round_trip_cost", 0.0)),
+            "exit_cost_rate": float(calibration_state.get("exit_cost_rate", 0.0)),
+            "calibration_state": calibration_state,
+        }
+    else:
+        calibration_evidence = {}
     return ReplayResult(
         ledger=tuple(result.ledger),
         trades=tuple(result.trades),
@@ -1537,6 +1628,7 @@ def _event_ledger_evaluation(
         attempted_orders=result.attempted_orders,
         filled_orders=result.filled_orders,
         no_trade_reason_counts=no_trade_reason_counts,
+        calibration_evidence=calibration_evidence,
     )
 
 
@@ -1647,6 +1739,49 @@ def _drop_target_columns(
         if c.startswith(("target_", "label_")) or c == label_column
     ]
     return frame.drop(drops)
+
+
+def _build_calibration_ledger(
+    oos_scored: pl.DataFrame,
+    panel: pl.DataFrame,
+    label_column: str,
+) -> pl.DataFrame:
+    """Join OOS predictions with their point-in-time labels for calibration.
+
+    The ledger carries ``(session, instrument_id, score, label,
+    label_available_time)`` so ``CausalAlphaCalibrator`` can consume only prior
+    label-available OOS observations. ``panel`` is the parent frame carrying the
+    canonical label columns; every ledger row is a real historical OOS score.
+    """
+    if label_column not in panel.columns:
+        raise ValueError(f"panel has no calibration label column {label_column!r}")
+    if LABEL_AVAILABLE_COLUMN not in panel.columns:
+        raise ValueError("panel has no label_available_time for calibration")
+    required = ("session", "instrument_id")
+    if oos_scored.is_empty() or not all(
+        c in oos_scored.columns for c in required
+    ):
+        return pl.DataFrame(
+            schema={
+                "session": pl.Datetime("us", "UTC"),
+                "instrument_id": pl.Utf8,
+                "score": pl.Float64,
+                label_column: pl.Float64,
+                LABEL_AVAILABLE_COLUMN: pl.Datetime("us", "UTC"),
+            }
+        )
+    if "pred_score" not in oos_scored.columns:
+        raise ValueError("scored frame must carry pred_score for calibration")
+    return oos_scored.select("session", "instrument_id", "pred_score").join(
+        panel.select(
+            "session",
+            "instrument_id",
+            label_column,
+            LABEL_AVAILABLE_COLUMN,
+        ),
+        on=["session", "instrument_id"],
+        how="inner",
+    ).rename({"pred_score": "score"})
 
 
 def _median_rank_ic(
@@ -1956,6 +2091,8 @@ def _evaluate_forward_holdout(
     dataset_manifest: DatasetManifest,
     base_schedule: CostSchedule,
     stress_schedule: CostSchedule,
+    *,
+    calibration_ledger: pl.DataFrame | None = None,
 ) -> tuple[bool, str, dict[str, object] | None]:
     """Fit the frozen candidate on pre-holdout data and replay the block once.
 
@@ -1997,7 +2134,7 @@ def _evaluate_forward_holdout(
     holdout_oos = pl.concat(scored)
     replay = _event_ledger_evaluation(
         panel, holdout_oos, request, dataset_manifest, registry, base_schedule,
-        stress_schedule,
+        stress_schedule, calibration_ledger=calibration_ledger,
     )
     if replay.attempted_orders <= 0:
         return False, "gate8_forward_holdout_ready=false:no-attempted-orders", None
