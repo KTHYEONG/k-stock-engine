@@ -1485,6 +1485,45 @@ def test_resolve_route_specs_keeps_legacy_five_day_columns() -> None:
     assert _resolve_route_specs(df.drop(["relevance"]), (5,)) == ()
 
 
+def test_resolve_route_specs_activates_true_5_10_15_routes() -> None:
+    from src.stocks.research.labels import residual_open_to_open_label
+    from src.stocks.workflows.train_model import _resolve_route_specs
+
+    base = stock_v2_composed_df(n_sessions=60, n_tickers=24)
+    label_frames = []
+    for h in (5, 10, 15):
+        labels = residual_open_to_open_label(
+            base.select(["instrument_id", "session", "open"]), horizon_sessions=h
+        ).rename(
+            {
+                "residual_o2o_5d": f"residual_o2o_{h}d",
+                "relevance": f"relevance_{h}d",
+                "label_available_time": f"label_available_time_{h}d",
+            }
+        )
+        label_frames.append(labels)
+    multi = label_frames[0]
+    for frame in label_frames[1:]:
+        multi = multi.join(frame, on=["instrument_id", "session"], how="inner")
+    multi = multi.filter(
+        pl.col("residual_o2o_5d").is_not_null()
+        & pl.col("residual_o2o_10d").is_not_null()
+        & pl.col("residual_o2o_15d").is_not_null()
+    )
+    assert multi["residual_o2o_10d"].null_count() == 0
+    assert multi["residual_o2o_15d"].null_count() == 0
+    assert not (multi["residual_o2o_10d"] == multi["residual_o2o_5d"]).all()
+    assert not (multi["residual_o2o_15d"] == multi["residual_o2o_5d"]).all()
+
+    routes = _resolve_route_specs(multi, (5, 10, 15))
+    assert [route.horizon for route in routes] == [5, 10, 15]
+    for route, horizon in zip(routes, (5, 10, 15), strict=True):
+        assert route.label_column == f"residual_o2o_{horizon}d"
+        assert route.relevance_column == f"relevance_{horizon}d"
+        assert route.label_available_column == f"label_available_time_{horizon}d"
+        assert route.label_span_sessions == horizon + 1
+
+
 def test_prepare_replay_static_context_uses_route_rebalance_cadence() -> None:
     from src.stocks.workflows.train_model import _prepare_replay_static_context
 
