@@ -63,6 +63,8 @@ def test_multifold_80_trial_profile_completes_under_budget(tmp_path, monkeypatch
     assert resource["shortlisted_trials"] <= 8
     assert resource["cache_bytes"] > 0
     assert resource["screen_seconds"] > 0.0
+    assert resource["full_refit_boosting_rounds"] == 900
+    assert resource["full_refit_early_stopping_rounds"] == 100
     assert resource["selection_status"] in (
         "selected",
         "no_complete_screen_candidate",
