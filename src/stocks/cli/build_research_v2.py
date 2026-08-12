@@ -24,12 +24,15 @@ from src.stocks.data.contracts import CoverageRange, ResearchWindows
 from src.stocks.data.research_v2 import (
     StockAlphaV2MaterializationRequest,
     materialize_stock_alpha_v2_snapshot,
+    materialize_stock_alpha_v3_snapshot,
 )
 
 logger = logging.getLogger("stocks.cli.build_research_v2")
 
+LABEL_HORIZON_MODES = ("five_day", "multi_horizon")
 
-def main(args: list[str] | None = None) -> int:
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Materialize an immutable stock_alpha_v2 research snapshot"
     )
@@ -56,7 +59,21 @@ def main(args: list[str] | None = None) -> int:
     )
     parser.add_argument("--generated-time", type=datetime.fromisoformat, default=None)
     parser.add_argument("--min-coverage", type=float, default=0.75)
-    parsed = parser.parse_args(args)
+    parser.add_argument(
+        "--label-horizon-mode",
+        choices=LABEL_HORIZON_MODES,
+        default="five_day",
+        help=(
+            "five_day publishes the legacy single-horizon label dataset; "
+            "multi_horizon publishes the immutable 5/10/15-session label panel "
+            "so training can select a cost-amortizing route."
+        ),
+    )
+    return parser
+
+
+def main(args: list[str] | None = None) -> int:
+    parsed = build_parser().parse_args(args)
 
     request = StockAlphaV2MaterializationRequest(
         source_snapshot_id=parsed.source_snapshot_id,
@@ -77,8 +94,12 @@ def main(args: list[str] | None = None) -> int:
         min_coverage=parsed.min_coverage,
         calendar_path=parsed.calendar_path,
     )
-    result = materialize_stock_alpha_v2_snapshot(request)
+    if parsed.label_horizon_mode == "multi_horizon":
+        result = materialize_stock_alpha_v3_snapshot(request)
+    else:
+        result = materialize_stock_alpha_v2_snapshot(request)
     sys.stdout.write(
+        f"label_horizon_mode={parsed.label_horizon_mode}\n"
         f"feature_dataset_id={result.feature_dataset_id}\n"
         f"label_dataset_id={result.label_dataset_id}\n"
         f"snapshot_id={result.snapshot_id}\n"
