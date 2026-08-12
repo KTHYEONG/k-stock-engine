@@ -446,6 +446,124 @@ class TestMaterializeSnapshot:
             LABEL_AVAILABLE_COLUMN,
         }.issubset(composed.frame.columns)
 
+    def test_materializes_and_composes_multi_horizon_v3(self, tmp_path) -> None:
+        from src.stocks.data.labels import (
+            MULTI_HORIZON_RESIDUAL_DEFINITION,
+        )
+        from src.stocks.data.research_v2 import (
+            materialize_stock_alpha_v3_snapshot,
+        )
+
+        sessions = weekdays(40)
+        windows = ResearchWindows(
+            train=CoverageRange(sessions[2], sessions[15]),
+            validation=CoverageRange(sessions[16], sessions[18]),
+            test=CoverageRange(sessions[19], sessions[21]),
+        )
+        base_root = tmp_path / "base"
+        feature_root = tmp_path / "features"
+        label_root = tmp_path / "labels"
+        catalog_root = tmp_path / "catalog"
+        calendar_path = tmp_path / "calendar.json"
+        calendar_path.write_text(
+            json.dumps(
+                {
+                    "version": "fixture-calendar",
+                    "sessions": [d.isoformat() for d in sessions],
+                    "generated_time": GENERATED.isoformat(),
+                }
+            ),
+            encoding="utf-8",
+        )
+        write_base_panel(base_root, "base_v1", sessions=sessions)
+        store = CatalogStore(catalog_root)
+        base_entry = CatalogEntry(
+            kind=CatalogKind.BASE_PANEL,
+            name="base_v1",
+            content_hash=ParquetDatasetStore(base_root)
+            .read_manifest("base_v1")
+            .content_hash,
+            schema_hash="schema",
+            registered_at=GENERATED,
+            coverage=CoverageRange(sessions[0], sessions[-1]),
+            completeness=EvidenceCompleteness.COMPLETE,
+            path=str(base_root / "base_v1"),
+        )
+        store.register(base_entry)
+        calendar_entry = register_file_evidence(
+            store,
+            kind=CatalogKind.CALENDAR,
+            name="calendar_v1",
+            path=calendar_path,
+            coverage=CoverageRange(sessions[0], sessions[-1]),
+            completeness=EvidenceCompleteness.COMPLETE,
+            registered_at=GENERATED,
+        )
+        manifest = build_snapshot_manifest(
+            snapshot_id="source_snap_v3",
+            certification=DatasetCertification.PROVISIONAL,
+            timing_convention=TimingConvention.DECISION_AFTER_CLOSE_EXECUTE_NEXT_OPEN,
+            windows=windows,
+            references=(base_entry, calendar_entry),
+        )
+        manifest_path = (
+            catalog_root / "snapshots" / "source_snap_v3" / "snapshot_manifest.json"
+        )
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps(manifest.to_json(), sort_keys=True, indent=2),
+            encoding="utf-8",
+        )
+
+        result = materialize_stock_alpha_v3_snapshot(
+            StockAlphaV2MaterializationRequest(
+                source_snapshot_id="source_snap_v3",
+                feature_dataset_id="features_v3",
+                label_dataset_id="labels_v3",
+                snapshot_id="snap_v3",
+                catalog_root=catalog_root,
+                base_root=base_root,
+                feature_root=feature_root,
+                label_root=label_root,
+                generated_time=GENERATED,
+                windows=windows,
+                certification=DatasetCertification.PROVISIONAL,
+                calendar_path=calendar_path,
+            )
+        )
+        assert result.snapshot_id == "snap_v3"
+        assert result.feature_content_hash
+        assert result.label_content_hash
+
+        store = CatalogStore(catalog_root)
+        assert store.get(CatalogKind.FEATURES, "features_v3") is not None
+        assert store.get(CatalogKind.LABELS, "labels_v3") is not None
+
+        from src.stocks.data.catalog import SnapshotResolver
+
+        repository = ResearchDataRepository(
+            base_root=base_root,
+            feature_root=feature_root,
+            label_root=label_root,
+        )
+        snapshot = SnapshotResolver(store).resolve("snap_v3")
+        composed = repository.compose_labeled_training_snapshot(
+            snapshot,
+            feature_set=STOCK_ALPHA_V2_FEATURE_SET,
+            decision_time=GENERATED,
+        )
+        assert composed.frame.height > 0
+        expected_columns = ["instrument_id", "session"]
+        for h in (5, 10, 15):
+            expected_columns += [
+                f"residual_o2o_{h}d",
+                f"relevance_{h}d",
+                f"label_available_time_{h}d",
+            ]
+        assert all(c in composed.frame.columns for c in expected_columns)
+        assert composed.manifest.label_definition == MULTI_HORIZON_RESIDUAL_DEFINITION
+        assert composed.manifest.label_horizon_sessions == 5
+
     def test_existing_id_creates_no_manifest_or_catalog_append(self, tmp_path) -> None:
         base_root = tmp_path / "base"
         feature_root = tmp_path / "features"

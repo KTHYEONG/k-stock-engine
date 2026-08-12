@@ -373,6 +373,27 @@ class TestEconomicGating:
         assert allocations
         assert all(a.reason == "inverse-vol-constrained" for a in allocations)
 
+    def test_positive_gross_but_non_positive_net_lower_bound_cannot_enter(self) -> None:
+        policy = StockRiskPolicy(top_k=20)
+        panel = _with_economic(scored_panel(seed=76), positive=True).with_columns(
+            pl.lit(-0.001, dtype=pl.Float64).alias("net_alpha_lower_bound")
+        )
+        allocations = construct_target_allocations(
+            panel, instruments_for(10), empty_portfolio(), policy
+        )
+        assert allocations == ()
+
+    def test_positive_net_lower_bound_allows_entry(self) -> None:
+        policy = StockRiskPolicy(top_k=20)
+        panel = _with_economic(scored_panel(seed=77), positive=True).with_columns(
+            pl.lit(0.001, dtype=pl.Float64).alias("net_alpha_lower_bound")
+        )
+        allocations = construct_target_allocations(
+            panel, instruments_for(10), empty_portfolio(), policy
+        )
+        assert allocations
+        assert all(a.reason == "inverse-vol-constrained" for a in allocations)
+
     def test_non_positive_net_alpha_yields_no_synthetic_long(self) -> None:
         policy = StockRiskPolicy(top_k=20)
         panel = _with_economic(scored_panel(seed=72), positive=False)
