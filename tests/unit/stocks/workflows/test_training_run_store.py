@@ -131,6 +131,7 @@ def test_resumed_tune_skips_completed_screen_and_reuses_champion(
     from src.core.costs import default_base_schedule, default_stress_schedule
     from src.stocks.research.artifacts import ModelArtifactRegistry
     from tests.unit.stocks.workflows.test_train_model import (
+        _fake_candidate_context,
         _fold_aware_refit,
         _positive_replay,
         _tune_base_manifest,
@@ -150,7 +151,15 @@ def test_resumed_tune_skips_completed_screen_and_reuses_champion(
         validation_window_sessions=30,
         min_train_sessions=40,
     ).split(panel)
-    monkeypatch.setattr(tm, "_fit_stable_contexts", lambda _p, tf, *_a, **_kw: [None] * len(tf))
+    monkeypatch.setattr(
+        tm,
+        "_fit_stable_contexts",
+        lambda _p, _tf, *_a, **_kw: (
+            _fake_candidate_context(),
+            _fake_candidate_context(),
+            type("_P", (), {"__call__": lambda self, _i: _fake_candidate_context(), "seed": lambda *a, **k: None, "release": lambda self: None})(),
+        ),
+    )
     monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
     monkeypatch.setattr(tm, "_fit_and_score_candidate", _fold_aware_refit())
     monkeypatch.setattr(tm, "_event_ledger_evaluation", lambda *_a, **_kw: _positive_replay())

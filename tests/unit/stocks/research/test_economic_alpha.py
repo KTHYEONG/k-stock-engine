@@ -188,6 +188,7 @@ def test_frozen_state_reproduces_transform_evidence() -> None:
     assert state["exit_cost_rate"] > 0.0
 
 
+@pytest.mark.slow
 def test_prepared_decision_equals_reference_transform_and_isolates_labels() -> None:
     """Route-scoped prepared calibration reproduces the reference transform.
 
@@ -299,6 +300,7 @@ def test_prepared_decision_fails_closed_on_insufficient_history() -> None:
     assert out[LOWER_BOUND_COLUMN].null_count() == out.height
 
 
+@pytest.mark.slow
 def test_negative_bootstrap_lower_bound_bucket_is_null() -> None:
     cal = CausalAlphaCalibrator(bucket_count=5, min_calibration_sessions=10, n_bootstrap=200)
     decision = datetime(2024, 2, 10, tzinfo=UTC)
