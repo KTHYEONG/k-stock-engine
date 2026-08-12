@@ -15,8 +15,10 @@ starting after 2026-03-10.
 """
 from __future__ import annotations
 
+import gc
 import logging
 import math
+import os
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -63,6 +65,7 @@ from src.stocks.research.lambdarank import (
     LambdaRankConfig,
     PreparedLambdaRankFold,
     adaptive_refit_rounds,
+    resolve_lgb_num_threads,
 )
 from src.stocks.research.models import ModelManifest, StableRankComposite
 from src.stocks.trading.portfolio_constructor import (
@@ -70,7 +73,7 @@ from src.stocks.trading.portfolio_constructor import (
     StockRiskPolicy,
     construct_target_allocations_prepared,
 )
-from src.stocks.workflows.contracts import TrainingRequest
+from src.stocks.workflows.contracts import COMPUTE_PLAN_VERSION, TrainingRequest
 from src.stocks.workflows.economic_selection import (
     SELECTION_POLICY_VERSION,
     ScreenFidelityPolicy,
@@ -463,13 +466,50 @@ def _bootstrap_workspace_bytes(
 
 @dataclass(frozen=True, slots=True)
 class _StableTrialContext:
-    """Per-tuning-fold inputs invariant across every LambdaRank search parameter."""
+    """Transient per-fold inputs retained only until preparation completes.
+
+    After :func:`_prepare_candidate_context` runs, the rich transformed
+    train/validation Polars frames are released and the slim
+    :class:`PreparedCandidateContext` becomes the only retained fold state.
+    """
 
     train_processed: pl.DataFrame
     validation_processed: pl.DataFrame
     validation_frame: pl.DataFrame
     stable_scores: pl.DataFrame
     prepared: PreparedLambdaRankFold | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedCandidateContext:
+    """Slim per-fold candidate inputs retained after preparation.
+
+    Carries the immutable prepared fold matrices plus the validation keys and
+    stable scores aligned row-for-row with ``prepared.validation_matrix``, the
+    labels needed for Rank-IC, and the row counts. The rich transformed
+    train/validation frames are released after preparation, so no per-candidate
+    fold retains predictor columns in OOS candidate frames.
+    """
+
+    prepared: PreparedLambdaRankFold
+    validation_index: pl.DataFrame
+    stable_scores: pl.DataFrame
+    labels: pl.DataFrame
+    train_rows: int
+    validation_rows: int
+
+
+@dataclass(slots=True)
+class _SelectionTimings:
+    """Exclusive route-qualified stage timings for one selection funnel."""
+
+    context_prepare_seconds: float = 0.0
+    refit_train_seconds: float = 0.0
+    refit_predict_seconds: float = 0.0
+    replay_prepare_seconds: float = 0.0
+    economic_replay_seconds: float = 0.0
+    actual_refit_rounds: dict[str, int] = field(default_factory=dict)
+    actual_best_iterations: dict[str, int | None] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1245,6 +1285,7 @@ def _tune_champion(
     LambdaRankConfig._tuning_telemetry = None
     per_route_trials = max(1, request.optuna_trials // len(route_specs))
     guard = TrialResourceGuard(request, predictor_count=len(feature_columns) * 3)
+    lgb_threads = _resolve_workflow_threads(request)
 
     route_champions: list[
         tuple[tuple[float, ...], int, RouteSpec, optuna.Study, LambdaRankConfig]
@@ -1279,41 +1320,38 @@ def _tune_champion(
             }
             logger.info("[EVAL] route=%sd stage=no-eligible-tuning-folds", route.horizon)
             continue
-        contexts = _fit_stable_contexts(
-            tuning_panel, tuning_folds, route_manifest, feature_columns,
-            route.label_column, route.relevance_column,
-        )
-        cache_bytes = sum(
-            _fold_cache_bytes(getattr(context, "prepared", None))
-            for context in contexts
-        )
         policy = ScreenFidelityPolicy.for_budget(
             total_trials=request.optuna_trials,
             route_count=max(1, len(route_specs)),
-            fold_count=max(1, len(contexts)),
+            fold_count=max(1, len(tuning_folds)),
         )
-        proxy_context = (
-            _build_proxy_context(
-                contexts[0],
-                policy.proxy_session_stride,
-                base_manifest,
-                feature_columns,
-                route.label_column,
-                route.relevance_column,
+        timings = _SelectionTimings()
+        fold0_context, proxy_context, fold_context = _fit_stable_contexts(
+            tuning_panel, tuning_folds, route_manifest, feature_columns,
+            route.label_column, route.relevance_column,
+            proxy_session_stride=policy.proxy_session_stride,
+            timings=timings,
+        )
+        if fold0_context is None or proxy_context is None:
+            route_attrs[str(route.horizon)] = {
+                "selection_status": "no-prepared-fold-0",
+                "holding_horizon_sessions": route.horizon,
+            }
+            logger.info(
+                "[EVAL] route=%sd stage=no-prepared-fold-0", route.horizon
             )
-            if contexts and contexts[0] is not None
-            else None
-        )
+            continue
+        cache_bytes = _fold_cache_bytes(fold0_context.prepared)
         if proxy_context is not None:
             logger.info(
                 "[EVAL] route=%sd stage=proxy_built stride=%d proxy_train_rows=%d "
                 "proxy_validation_rows=%d full_train_rows=%d full_validation_rows=%d",
                 route.horizon,
                 policy.proxy_session_stride,
-                proxy_context.train_processed.height,
-                proxy_context.validation_processed.height,
-                contexts[0].train_processed.height,
-                contexts[0].validation_processed.height,
+                proxy_context.train_rows,
+                proxy_context.validation_rows,
+                fold0_context.train_rows,
+                fold0_context.validation_rows,
             )
 
         screen_phase = f"screen_h{route.horizon}"
@@ -1327,12 +1365,10 @@ def _tune_champion(
             "screen_fidelity": "session_stride_proxy",
             "proxy_session_stride": policy.proxy_session_stride,
             "proxy_train_rows": (
-                proxy_context.train_processed.height if proxy_context is not None else 0
+                proxy_context.train_rows if proxy_context is not None else 0
             ),
             "proxy_validation_rows": (
-                proxy_context.validation_processed.height
-                if proxy_context is not None
-                else 0
+                proxy_context.validation_rows if proxy_context is not None else 0
             ),
         }
         screen_phase_hash = content_hash(screen_evidence)
@@ -1366,18 +1402,18 @@ def _tune_champion(
             trial: optuna.Trial,
             _route: RouteSpec = route,
             _tuning_folds: list[Fold] = tuning_folds,
-            _contexts: list[_StableTrialContext] = contexts,
-            _proxy_context: _StableTrialContext | None = proxy_context,
+            _proxy_context: PreparedCandidateContext = proxy_context,
             _route_manifest: ModelManifest = route_manifest,
+            _lgb_threads: int = lgb_threads,
         ) -> float:
-            config = _config_from_trial(trial)
+            config = _config_from_trial(trial, num_threads=_lgb_threads)
             screen_config = _screen_config(config)
-            screen_context = _proxy_context if _proxy_context is not None else _contexts[0]
             ic = _score_trial_fold(
-                tuning_panel, _tuning_folds[0], screen_context, request, _route_manifest,
+                tuning_panel, _tuning_folds[0], _proxy_context, request, _route_manifest,
                 feature_columns, _route.label_column, _route.relevance_column,
                 screen_config, guard, trial, 0,
                 callbacks=(_screen_ndcg_callback(trial),), report_progress=False,
+                key_prefix=f"h{_route.horizon}_",
             )
             if ic is None:
                 raise optuna.TrialPruned()
@@ -1454,7 +1490,7 @@ def _tune_champion(
             )
 
         champion, selection = _select_economic_champion(
-            study, shortlist, tuning_panel, tuning_folds, contexts, request,
+            study, shortlist, tuning_panel, tuning_folds, fold_context, request,
             route_manifest, feature_columns, route, guard, dataset_manifest,
             registry, base_schedule, stress_schedule,
             terminal_trial_count=n_terminal,
@@ -1464,6 +1500,8 @@ def _tune_champion(
                 for trial in study.trials
                 if isinstance(trial.user_attrs.get("proxy_best_iteration"), int)
             },
+            lgb_threads=lgb_threads,
+            timings=timings,
         )
         if run_store is not None and selection is not None:
             run_store.checkpoint_phase(
@@ -1499,14 +1537,16 @@ def _tune_champion(
         study.set_user_attr("proxy_session_stride", policy.proxy_session_stride)
         study.set_user_attr(
             "proxy_train_rows",
-            proxy_context.train_processed.height if proxy_context is not None else 0,
+            proxy_context.train_rows if proxy_context is not None else 0,
         )
         study.set_user_attr(
             "proxy_validation_rows",
-            proxy_context.validation_processed.height if proxy_context is not None else 0,
+            proxy_context.validation_rows if proxy_context is not None else 0,
         )
         study.set_user_attr("cache_bytes", cache_bytes)
         study.set_user_attr("screen_seconds", screen_seconds)
+        study.set_user_attr("resolved_lgb_threads", lgb_threads)
+        study.set_user_attr("compute_plan_version", COMPUTE_PLAN_VERSION)
         study.set_user_attr("holding_horizon_sessions", route.horizon)
         study.set_user_attr("label_column", route.label_column)
         study.set_user_attr("relevance_column", route.relevance_column)
@@ -1584,6 +1624,8 @@ def _tune_champion(
         "active_routes": [route.horizon for route in route_specs],
         "per_route_trial_budget": per_route_trials,
         "selection_policy_version": SELECTION_POLICY_VERSION,
+        "compute_plan_version": COMPUTE_PLAN_VERSION,
+        "resolved_lgb_threads": lgb_threads,
         **guard.telemetry(),
         "n_terminal_trials": n_terminal_total,
         "optuna_trials": n_terminal_total,
@@ -1658,9 +1700,12 @@ def _tune_champion(
 
     route_champions.sort(key=lambda row: row[0], reverse=True)
     _winner_key, winner_n_terminal, winner_route, winner_study, _ = route_champions[0]
-    winner_config = _config_from_params(dict(winner_study.trials[
-        int(cast(int, winner_study.user_attrs["selected_trial_number"]))
-    ].params))
+    winner_config = _config_from_params(
+        dict(winner_study.trials[
+            int(cast(int, winner_study.user_attrs["selected_trial_number"]))
+        ].params),
+        num_threads=lgb_threads,
+    )
     winner_selection = {
         name: value
         for name, value in winner_study.user_attrs.items()
@@ -1708,6 +1753,183 @@ def _tune_champion(
     return winner_config, winner_n_terminal, winner_route
 
 
+def _visible_cpu_counts() -> tuple[int, int]:
+    """Visible logical CPUs (cgroup-affine) and physical cores.
+
+    ``logical`` respects the cgroup CPU affinity mask; ``physical`` falls back
+    to half the logical count (minimum one) when detection is unavailable.
+    """
+    try:
+        logical = max(1, len(os.sched_getaffinity(0)))
+    except OSError:
+        logical = max(1, os.cpu_count() or 1)
+    physical = psutil.cpu_count(logical=False)
+    if physical is None or physical < 1:
+        physical = max(1, logical // 2)
+    return physical, logical
+
+
+def _resolve_workflow_threads(request: TrainingRequest) -> int:
+    """Resolve the deterministic workflow LightGBM thread plan once."""
+    physical, logical = _visible_cpu_counts()
+    return resolve_lgb_num_threads(request.lgb_threads, physical, logical)
+
+
+def _fit_stable_context(
+    tuning_panel: pl.DataFrame,
+    fold: Fold,
+    base_manifest: ModelManifest,
+    feature_columns: tuple[str, ...],
+    label_column: str,
+    relevance_column: str | None,
+) -> _StableTrialContext:
+    """Fit one StableRankComposite and prepare one immutable fold context.
+
+    The composite's fitted weights/orientations/winsors and the validation
+    stable scores are invariant across every LambdaRank search parameter, so
+    they are computed once; the prepared fold matrices are derived in the same
+    call. The returned rich context is transient and is slimmed by
+    :func:`_prepare_candidate_context` before retention.
+    """
+    allowlist = stock_alpha_v2_allowlist()
+    train_frame = tuning_panel[fold.train_mask]
+    validation_frame = tuning_panel[fold.validation_mask]
+    quantiles = fit_v2_winsor_quantiles(train_frame, feature_columns)
+    train_processed = apply_v2_transforms(
+        train_frame, feature_columns, winsor_quantiles=quantiles
+    )
+    validation_processed = apply_v2_transforms(
+        validation_frame, feature_columns, winsor_quantiles=quantiles
+    )
+    stable = StableRankComposite(
+        factors=allowlist,
+        manifest=base_manifest,
+        label_column=label_column,
+        block_length=base_manifest.label_horizon_sessions,
+        session_column="session",
+    )
+    stable.fit(train_processed, validation_processed)
+    predict_input = _drop_target_columns(validation_processed, label_column)
+    stable_scores = stable.predict(predict_input).select(
+        "session", "instrument_id", "pred_score"
+    )
+    prepared: PreparedLambdaRankFold | None = None
+    try:
+        prepared = LambdaRankBlendModel(
+            base_manifest,
+            allowlist,
+            label_column,
+            config=LambdaRankConfig(),
+            session_column="session",
+            relevance_column=relevance_column or RELEVANCE_COLUMN,
+        ).prepare_fold(train_processed, validation_processed)
+    except ValueError:
+        prepared = None
+    return _StableTrialContext(
+        train_processed=train_processed,
+        validation_processed=validation_processed,
+        validation_frame=validation_frame,
+        stable_scores=stable_scores,
+        prepared=prepared,
+    )
+
+
+def _prepare_candidate_context(
+    rich: _StableTrialContext,
+    label_column: str,
+    relevance_column: str | None,
+) -> PreparedCandidateContext | None:
+    """Slim a transient fold context into the retained prepared candidate state.
+
+    The validation keys are aligned row-for-row to the prepared validation
+    matrix (the same null-relevance filter and session sort the matrix used);
+    stable scores and labels are narrowed to the retained keys. The rich
+    transformed frames are dropped after this call. Returns ``None`` when the
+    fold cannot be prepared (a degenerate fold is fail-closed and later folds
+    are never built).
+    """
+    prepared = rich.prepared
+    if prepared is None or prepared.validation_matrix is None:
+        return None
+    relevance = relevance_column or RELEVANCE_COLUMN
+    val_used = (
+        rich.validation_processed.filter(pl.col(relevance).is_not_null())
+        .sort("session")
+        .select("session", "instrument_id")
+    )
+    if val_used.height != prepared.validation_matrix.shape[0]:
+        raise ValueError(
+            "prepared validation rows must align with the prepared validation "
+            f"matrix ({val_used.height} != {prepared.validation_matrix.shape[0]})"
+        )
+    validation_index = val_used
+    stable_scores = rich.stable_scores.join(
+        validation_index, on=["session", "instrument_id"], how="inner"
+    )
+    labels = rich.validation_frame.select("session", "instrument_id", pl.col(label_column))
+    return PreparedCandidateContext(
+        prepared=prepared,
+        validation_index=validation_index,
+        stable_scores=stable_scores,
+        labels=labels,
+        train_rows=int(prepared.train_matrix.shape[0]),
+        validation_rows=int(prepared.validation_matrix.shape[0]),
+    )
+
+
+class _FoldContextProvider:
+    """Lazily materialize per-fold prepared candidate contexts on demand.
+
+    Fold 0 is seeded by the caller because the proxy and the six fold-0
+    promotions share it. Any remaining fold is built exactly once when a
+    finalist requests it and is never cached, so a remaining-fold matrix cannot
+    overlap the replay phase or a later fold.
+    """
+
+    def __init__(
+        self,
+        tuning_panel: pl.DataFrame,
+        tuning_folds: list[Fold],
+        base_manifest: ModelManifest,
+        feature_columns: tuple[str, ...],
+        label_column: str,
+        relevance_column: str | None,
+        *,
+        timings: _SelectionTimings | None = None,
+    ) -> None:
+        self._panel = tuning_panel
+        self._folds = tuning_folds
+        self._manifest = base_manifest
+        self._features = feature_columns
+        self._label = label_column
+        self._relevance = relevance_column
+        self._timings = timings
+        self._seeded: dict[int, PreparedCandidateContext | None] = {}
+
+    def seed(self, index: int, context: PreparedCandidateContext | None) -> None:
+        self._seeded[index] = context
+
+    def __call__(self, index: int) -> PreparedCandidateContext | None:
+        if index in self._seeded:
+            return self._seeded[index]
+        if index < 0 or index >= len(self._folds):
+            raise IndexError(f"fold index {index} outside the tuning fold set")
+        started = time.perf_counter()
+        rich = _fit_stable_context(
+            self._panel, self._folds[index], self._manifest, self._features,
+            self._label, self._relevance,
+        )
+        slim = _prepare_candidate_context(rich, self._label, self._relevance)
+        del rich
+        if self._timings is not None:
+            self._timings.context_prepare_seconds += time.perf_counter() - started
+        return slim
+
+    def release(self) -> None:
+        """Drop every seeded context before replay materialization."""
+        self._seeded.clear()
+
+
 def _fit_stable_contexts(
     tuning_panel: pl.DataFrame,
     tuning_folds: list[Fold],
@@ -1715,60 +1937,46 @@ def _fit_stable_contexts(
     feature_columns: tuple[str, ...],
     label_column: str,
     relevance_column: str | None,
-) -> list[_StableTrialContext]:
-    """Fit one StableRankComposite per immutable tuning-fold context.
+    *,
+    proxy_session_stride: int,
+    timings: _SelectionTimings | None = None,
+) -> tuple[
+    PreparedCandidateContext | None,
+    PreparedCandidateContext | None,
+    _FoldContextProvider,
+]:
+    """Build the fold-0 and stride-proxy slim contexts plus a lazy fold provider.
 
-    The composite's fitted weights/orientations/winsors and the validation
-    stable scores are invariant across every LambdaRank search parameter, so
-    they are computed once and cached; only the slim ``(session,
-    instrument_id, pred_score)`` score frame is retained as the search cache.
+    Fold 0 is materialized once because both the proxy and the six fold-0
+    promotions use it; the stride-6 proxy is derived from the rich fold-0 frames
+    before they are released. Folds 1..n are materialized lazily by the returned
+    provider, one at a time and only after a finalist is known. Returns
+    ``(fold0, proxy, provider)``; either slim context is ``None`` when its fold
+    cannot be prepared, in which case the route stays fail-closed and later
+    folds are never built.
     """
-    allowlist = stock_alpha_v2_allowlist()
-    contexts: list[_StableTrialContext] = []
-    for fold in tuning_folds:
-        train_frame = tuning_panel[fold.train_mask]
-        validation_frame = tuning_panel[fold.validation_mask]
-        quantiles = fit_v2_winsor_quantiles(train_frame, feature_columns)
-        train_processed = apply_v2_transforms(
-            train_frame, feature_columns, winsor_quantiles=quantiles
-        )
-        validation_processed = apply_v2_transforms(
-            validation_frame, feature_columns, winsor_quantiles=quantiles
-        )
-        stable = StableRankComposite(
-            factors=allowlist,
-            manifest=base_manifest,
-            label_column=label_column,
-            block_length=base_manifest.label_horizon_sessions,
-            session_column="session",
-        )
-        stable.fit(train_processed, validation_processed)
-        predict_input = _drop_target_columns(validation_processed, label_column)
-        stable_scores = stable.predict(predict_input).select(
-            "session", "instrument_id", "pred_score"
-        )
-        prepared: PreparedLambdaRankFold | None = None
-        try:
-            prepared = LambdaRankBlendModel(
-                base_manifest,
-                allowlist,
-                label_column,
-                config=LambdaRankConfig(),
-                session_column="session",
-                relevance_column=relevance_column or RELEVANCE_COLUMN,
-            ).prepare_fold(train_processed, validation_processed)
-        except ValueError:
-            prepared = None
-        contexts.append(
-            _StableTrialContext(
-                train_processed=train_processed,
-                validation_processed=validation_processed,
-                validation_frame=validation_frame,
-                stable_scores=stable_scores,
-                prepared=prepared,
-            )
-        )
-    return contexts
+    if not tuning_folds:
+        raise ValueError("tuning_folds must not be empty")
+    fold0_rich = _fit_stable_context(
+        tuning_panel, tuning_folds[0], base_manifest, feature_columns,
+        label_column, relevance_column,
+    )
+    proxy_rich = _build_proxy_context(
+        fold0_rich, proxy_session_stride, base_manifest, feature_columns,
+        label_column, relevance_column,
+    )
+    started = time.perf_counter()
+    fold0 = _prepare_candidate_context(fold0_rich, label_column, relevance_column)
+    proxy = _prepare_candidate_context(proxy_rich, label_column, relevance_column)
+    del fold0_rich, proxy_rich
+    if timings is not None:
+        timings.context_prepare_seconds += time.perf_counter() - started
+    provider = _FoldContextProvider(
+        tuning_panel, tuning_folds, base_manifest, feature_columns,
+        label_column, relevance_column, timings=timings,
+    )
+    provider.seed(0, fold0)
+    return fold0, proxy, provider
 
 
 def _proxy_session_filter(
@@ -1851,7 +2059,7 @@ def _build_proxy_context(
 def _score_trial_fold(
     tuning_panel: pl.DataFrame,
     fold: Fold,
-    context: _StableTrialContext,
+    context: PreparedCandidateContext,
     request: TrainingRequest,
     base_manifest: ModelManifest,
     feature_columns: tuple[str, ...],
@@ -1864,21 +2072,24 @@ def _score_trial_fold(
     *,
     callbacks: Sequence[Callable[..., object]] = (),
     report_progress: bool = True,
+    key_prefix: str = "",
 ) -> float | None:
-    """Score one tuning fold with the cached stable context; ``None`` prunes.
+    """Score one tuning fold with the cached slim context; ``None`` prunes.
 
     The resource guard admits the allocation (including the prepared-fold cache
     bytes) before fitting and records elapsed/RSS telemetry in a ``finally`` so
     a callback-raised :class:`optuna.TrialPruned` still leaves timing evidence.
-    A breach raises :class:`TrainingCapacityError`. Fold model, prediction
-    frame, and LightGBM datasets are local to this call and released on return,
-    so a trial never retains every fold's artifacts.
+    ``key_prefix`` qualifies the recorded fold key with the route horizon so
+    cross-route keys never collide. A breach raises
+    :class:`TrainingCapacityError`. Fold model, prediction frame, and LightGBM
+    datasets are local to this call and released on return, so a trial never
+    retains every fold's artifacts.
     """
     del tuning_panel, fold, feature_columns
-    key = f"trial_{trial.number}_fold_{fold_index}"
+    key = f"{key_prefix}trial_{trial.number}_fold_{fold_index}"
     guard.admit(
-        context.train_processed.height,
-        extra_bytes=_fold_cache_bytes(getattr(context, "prepared", None)),
+        context.train_rows,
+        extra_bytes=_fold_cache_bytes(context.prepared),
     )
     started = time.perf_counter()
     try:
@@ -1902,13 +2113,13 @@ def _score_trial_fold(
         guard.record_fold(
             key,
             time.perf_counter() - started,
-            guard.estimate_mib(context.train_processed.height),
+            guard.estimate_mib(context.train_rows),
         )
         guard.check_after()
 
 
 def _score_context_model(
-    context: _StableTrialContext,
+    context: PreparedCandidateContext,
     request: TrainingRequest,
     base_manifest: ModelManifest,
     label_column: str,
@@ -1917,14 +2128,17 @@ def _score_context_model(
     *,
     callbacks: Sequence[Callable[..., object]] = (),
     initial_rounds: int | None = None,
+    timings: _SelectionTimings | None = None,
 ) -> tuple[float, pl.DataFrame, FitTrialOutcome] | None:
-    """Fit one candidate on a cached fold and return ``(rank_ic, scored, outcome)``.
+    """Fit one candidate on a cached prepared fold and return ``(rank_ic, scored, outcome)``.
 
     ``None`` signals a fail-closed fold (missing columns, unusable groups, or
-    invalid inputs). The prepared-fold fast path is used when the context
-    carries immutable matrices; otherwise the uncached path yields identical
-    scores. ``initial_rounds`` selects the adaptive continuation driver for
-    promoted full refits.
+    invalid inputs). The prepared-fold fast path trains on the immutable
+    matrices and predicts directly from ``validation_matrix``, returning a slim
+    ``(session, instrument_id, pred_score)`` frame; no transformed predictor
+    frame is reconstructed or retained. ``initial_rounds`` selects the adaptive
+    continuation driver for promoted full refits. ``timings``, when supplied,
+    accumulates the exclusive train/predict durations of a full refit.
     """
     model = LambdaRankBlendModel(
         base_manifest,
@@ -1935,21 +2149,31 @@ def _score_context_model(
         relevance_column=relevance_column or RELEVANCE_COLUMN,
     )
     try:
-        outcome = model.fit_trial(
-            context.train_processed,
-            context.validation_processed,
+        train_started = time.perf_counter()
+        outcome = model.fit_trial_prepared(
+            context.prepared,
             context.stable_scores,
-            prepared=getattr(context, "prepared", None),
             callbacks=callbacks,
             initial_rounds=initial_rounds,
         )
+        if timings is not None:
+            timings.refit_train_seconds += time.perf_counter() - train_started
     except ValueError:
         return None
     if not outcome.fit_ok or model.no_trade:
         return None
-    predict_input = _drop_target_columns(context.validation_processed, label_column)
-    scored = model.predict(predict_input)
-    ic = _median_rank_ic(context.validation_frame, scored, label_column)
+    try:
+        predict_started = time.perf_counter()
+        scored = model.predict_prepared_scores(
+            context.prepared,
+            context.validation_index,
+            context.stable_scores,
+        )
+        if timings is not None:
+            timings.refit_predict_seconds += time.perf_counter() - predict_started
+    except ValueError:
+        return None
+    ic = _median_rank_ic(context.labels, scored, label_column)
     return float(ic), scored, outcome
 
 
@@ -1998,6 +2222,7 @@ def _screen_config(config: LambdaRankConfig) -> LambdaRankConfig:
             "max_bin",
             "min_group_size",
             "half_life_sessions",
+            "num_threads",
         )
     }
     return LambdaRankConfig(
@@ -2047,6 +2272,7 @@ def _screen_informed_full_refit_config(config: LambdaRankConfig) -> LambdaRankCo
             "max_bin",
             "min_group_size",
             "half_life_sessions",
+            "num_threads",
         )
     }
     return LambdaRankConfig(
@@ -2104,7 +2330,7 @@ def _evaluation_ndcg(env: CallbackEnv) -> float | None:
 def _fit_and_score_candidate(
     tuning_panel: pl.DataFrame,
     tuning_folds: list[Fold],
-    contexts: list[_StableTrialContext],
+    fold_context: Callable[[int], PreparedCandidateContext | None],
     request: TrainingRequest,
     base_manifest: ModelManifest,
     feature_columns: tuple[str, ...],
@@ -2117,35 +2343,38 @@ def _fit_and_score_candidate(
     static_cache_bytes: int = 0,
     fold_indices: tuple[int, ...] | None = None,
     initial_rounds: int | None = None,
+    key_prefix: str = "",
+    timings: _SelectionTimings | None = None,
 ) -> tuple[list[float], pl.DataFrame | None] | None:
     """Full-budget refit of one promoted candidate over selected inner folds.
 
-    ``fold_indices`` selects the folds to refit: the multi-fidelity selector
-    scores fold 0 for every promoted candidate first and only refits the
-    remaining folds for the surviving all-positive finalists. ``initial_rounds``
-    supplies the adaptive continuation first-pass budget derived from the
-    candidate's proxy screen best iteration. Returns
-    ``(fold_rank_ic, concatenated validation scores)`` for the requested folds,
-    ``(fold_rank_ic, None)`` when the first non-positive full-refit Rank-IC
-    rejects the candidate early, or ``None`` when any fold fails closed. The
-    early stop is equivalence-preserving: eligibility already requires every
-    full-refit IC to be strictly positive, so the skipped later folds and
-    replay cannot make that candidate eligible. Per-fold models, prediction
-    frames, and LightGBM datasets are released before the next fold.
+    ``fold_context`` materializes each requested fold lazily (fold 0 is already
+    built and seeded; remaining folds are built on demand and released). The
+    ``initial_rounds`` supplies the adaptive continuation first-pass budget
+    derived from the candidate's proxy screen best iteration. Returns
+    ``(fold_rank_ic, concatenated slim validation scores)`` for the requested
+    folds, ``(fold_rank_ic, None)`` when the first non-positive full-refit
+    Rank-IC rejects the candidate early, or ``None`` when any fold fails closed.
+    The early stop is equivalence-preserving: eligibility already requires every
+    full-refit IC to be strictly positive, so the skipped later folds and replay
+    cannot make that candidate eligible. Per-fold models, prediction frames,
+    and LightGBM datasets are released before the next fold.
     """
     del tuning_panel, feature_columns
-    fold_indices = fold_indices or tuple(range(len(contexts)))
+    fold_indices = fold_indices or tuple(range(len(tuning_folds)))
     fold_rank_ic: list[float] = []
     scored_frames: list[pl.DataFrame] = []
     full_refit_rounds = config.n_estimators
     full_refit_patience = config.early_stopping_rounds
     for fold_index in fold_indices:
-        context = contexts[fold_index]
-        key = f"refit_{candidate_key}_fold_{fold_index}"
+        context = fold_context(fold_index)
+        if context is None:
+            return None
+        key = f"{key_prefix}refit_{candidate_key}_fold_{fold_index}"
         guard.admit(
-            context.train_processed.height,
+            context.train_rows,
             extra_bytes=(
-                _fold_cache_bytes(getattr(context, "prepared", None))
+                _fold_cache_bytes(context.prepared)
                 + static_cache_bytes
             ),
         )
@@ -2162,6 +2391,7 @@ def _fit_and_score_candidate(
             result = _score_context_model(
                 context, request, base_manifest, label_column, relevance_column, config,
                 initial_rounds=initial_rounds,
+                timings=timings,
             )
             if result is None:
                 return None
@@ -2177,11 +2407,18 @@ def _fit_and_score_candidate(
                     outcome.rounds_trained,
                     outcome.used_continuation,
                 )
+            if timings is not None:
+                timings.actual_refit_rounds[
+                    f"{key_prefix}refit_{candidate_key}_fold_{fold_index}"
+                ] = outcome.rounds_trained
+                timings.actual_best_iterations[
+                    f"{key_prefix}refit_{candidate_key}_fold_{fold_index}"
+                ] = outcome.best_iteration
         finally:
             guard.record_fold(
                 key,
                 time.perf_counter() - started,
-                guard.estimate_mib(context.train_processed.height),
+                guard.estimate_mib(context.train_rows),
             )
             guard.check_after()
         fold_rank_ic.append(ic)
@@ -2389,7 +2626,7 @@ def _select_economic_champion(
     shortlist: list[tuple[float, int]],
     tuning_panel: pl.DataFrame,
     tuning_folds: list[Fold],
-    contexts: list[_StableTrialContext],
+    fold_context: _FoldContextProvider,
     request: TrainingRequest,
     route_manifest: ModelManifest,
     feature_columns: tuple[str, ...],
@@ -2403,6 +2640,8 @@ def _select_economic_champion(
     terminal_trial_count: int,
     policy: ScreenFidelityPolicy,
     proxy_best_iteration_by_trial: dict[int, int] | None = None,
+    lgb_threads: int = 1,
+    timings: _SelectionTimings | None = None,
 ) -> tuple[LambdaRankConfig | None, dict[str, object] | None]:
     """Promote, refit, and exactly replay the route's single finalist.
 
@@ -2410,42 +2649,26 @@ def _select_economic_champion(
     is full-refit on fold 0 with an adaptive continuation budget derived from
     each candidate's proxy screen best iteration and ranked by
     ``(-full_fold0_ic, -proxy_ic, trial_number)``. Exactly one candidate is
-    then refit over the remaining folds and runs the exact event ledger. A
-    non-positive fold or a failed replay is never backfilled: the route has no
-    champion, which is intentionally conservative in the financial sense. The
-    normal 81/3/3 profile therefore performs ``policy.promotion_width +
-    (fold_count - 1)`` full-refit folds and at most one economic replay per
-    route. An eligible finalist becomes the route's only champion candidate;
-    the cross-route champion sort still uses ``(bootstrap lower bound, strategy
-    IR, -max drawdown, -turnover, median Rank-IC, -holding horizon, -trial
-    number)``. Returns ``(config, selection telemetry)`` or ``(None, None)``
-    when no promoted candidate survives the funnel.
+    then refit over the remaining folds (materialized lazily one at a time) and
+    runs the exact event ledger. A non-positive fold or a failed replay is
+    never backfilled: the route has no champion, which is intentionally
+    conservative in the financial sense. The normal 81/3/3 profile therefore
+    performs ``policy.promotion_width + (fold_count - 1)`` full-refit folds and
+    at most one economic replay per route. Replay inputs are built only after
+    the finalist passes every fold and every LightGBM fold context and booster
+    is released, so replay and training caches never overlap. An eligible
+    finalist becomes the route's only champion candidate; the cross-route
+    champion sort still uses ``(bootstrap lower bound, strategy IR, -max
+    drawdown, -turnover, median Rank-IC, -holding horizon, -trial number)``.
+    Returns ``(config, selection telemetry)`` or ``(None, None)`` when no
+    promoted candidate survives the funnel.
     """
     if not shortlist:
         return None, None
     replay_guard = ReplayResourceGuard(
         request, replay_mode=ReplayMode.INNER_SELECTION_BASE_ONLY
     )
-    replay_context = _prepare_replay_static_context(
-        tuning_panel, request, holding_horizon_sessions=route.horizon,
-        guard=replay_guard,
-    )
-    validation_sessions = sorted(
-        tuning_panel.filter(
-            pl.col("session_index").is_in(tuning_folds[0].validation_mask)
-        )["session"].unique().to_list()
-    )
-    prepared_route = (
-        PreparedSelectionRoute.build(
-            tuning_panel,
-            [_session_as_datetime(validation_sessions[0])],
-            request,
-            route,
-            guard=replay_guard,
-        )
-        if validation_sessions
-        else None
-    )
+    key_prefix = f"h{route.horizon}_"
     refit_started = time.perf_counter()
     candidate_rows: list[tuple[tuple[float, ...], int]] = []
     evidence_by_trial: dict[int, dict[str, float]] = {}
@@ -2456,22 +2679,23 @@ def _select_economic_champion(
     screen_ic_by_trial = {trial_number: screen_ic for screen_ic, trial_number in shortlist}
     proxy_best_by_trial = dict(proxy_best_iteration_by_trial or {})
 
-    remaining_indices = tuple(range(1, len(contexts)))
+    remaining_indices = tuple(range(1, len(tuning_folds)))
     fold0_ranked: list[tuple[float, float, int, LambdaRankConfig, pl.DataFrame]] = []
     for _screen_ic, trial_number in shortlist:
         frozen = study.trials[trial_number]
-        config = _config_from_params(dict(frozen.params))
+        config = _config_from_params(dict(frozen.params), num_threads=lgb_threads)
         full_refit_config = _screen_informed_full_refit_config(config)
         initial_rounds = adaptive_refit_rounds(proxy_best_by_trial.get(trial_number))
         refit_started_trial = time.perf_counter()
         refit = _fit_and_score_candidate(
-            tuning_panel, tuning_folds, contexts, request, route_manifest,
+            tuning_panel, tuning_folds, fold_context, request, route_manifest,
             feature_columns, route.label_column, route.relevance_column,
             full_refit_config,
             guard, f"trial{trial_number}",
-            static_cache_bytes=replay_context.cache_bytes,
             fold_indices=(0,),
             initial_rounds=initial_rounds,
+            key_prefix=key_prefix,
+            timings=timings,
         )
         if refit is None:
             logger.info("[EVAL] trial=%s stage=refit_failed", trial_number)
@@ -2500,13 +2724,14 @@ def _select_economic_champion(
             continue
         refit_started_trial = time.perf_counter()
         refit = _fit_and_score_candidate(
-            tuning_panel, tuning_folds, contexts, request, route_manifest,
+            tuning_panel, tuning_folds, fold_context, request, route_manifest,
             feature_columns, route.label_column, route.relevance_column,
             full_refit_config,
             guard, f"trial{trial_number}",
-            static_cache_bytes=replay_context.cache_bytes,
             fold_indices=remaining_indices,
             initial_rounds=initial_rounds,
+            key_prefix=key_prefix,
+            timings=timings,
         )
         if refit is None:
             logger.info("[EVAL] trial=%s stage=remaining_folds_refit_failed", trial_number)
@@ -2523,6 +2748,47 @@ def _select_economic_champion(
             "[EVAL] trial=%s stage=all_positive_finalist fold_rank_ic=%s",
             trial_number, full_ic,
         )
+
+    if not finalists:
+        refit_seconds = time.perf_counter() - refit_started
+        logger.info(
+            "[SYS] route=%sd stage=shortlist elapsed_ms=%.1f rss=%.1f",
+            route.horizon,
+            refit_seconds * 1000.0,
+            TrialResourceGuard._rss_mib(),
+        )
+        return None, _selection_telemetry(
+            replay_seconds, timings, lgb_threads,
+            early_rejected_seconds, shortlist_evidence, fold0_ranked, finalists,
+            replay_guard=replay_guard,
+        )
+
+    fold_context.release()
+    gc.collect()
+
+    replay_started = time.perf_counter()
+    replay_context = _prepare_replay_static_context(
+        tuning_panel, request, holding_horizon_sessions=route.horizon,
+        guard=replay_guard,
+    )
+    validation_sessions = sorted(
+        tuning_panel.filter(
+            pl.col("session_index").is_in(tuning_folds[0].validation_mask)
+        )["session"].unique().to_list()
+    )
+    prepared_route = (
+        PreparedSelectionRoute.build(
+            tuning_panel,
+            [_session_as_datetime(validation_sessions[0])],
+            request,
+            route,
+            guard=replay_guard,
+        )
+        if validation_sessions
+        else None
+    )
+    if timings is not None:
+        timings.replay_prepare_seconds += time.perf_counter() - replay_started
 
     for fold_rank_ic, oos, trial_number in finalists:
         _screen_ic = screen_ic_by_trial[trial_number]
@@ -2605,37 +2871,28 @@ def _select_economic_champion(
         refit_seconds * 1000.0,
         TrialResourceGuard._rss_mib(),
     )
-    selection_tail = {
-        "full_refit_boosting_rounds": (
-            _SCREEN_BOOSTING_ROUNDS + 2 * _SCREEN_EARLY_STOPPING_ROUNDS
-        ),
-        "full_refit_early_stopping_rounds": 2 * _SCREEN_EARLY_STOPPING_ROUNDS,
-        "early_rejected_full_refits": len(early_rejected_seconds),
-        "early_rejected_full_refit_seconds": round(
-            float(sum(early_rejected_seconds)), 3
-        ),
-        "shortlist_candidate_evidence": shortlist_evidence,
-        "replay_resource": replay_guard.telemetry(),
-        "promoted_trials": len(fold0_ranked),
-        "all_positive_finalists": len(finalists),
-    }
+    if timings is not None:
+        timings.economic_replay_seconds = replay_seconds
+    selection_tail = _selection_telemetry(
+        replay_seconds, timings, lgb_threads,
+        early_rejected_seconds, shortlist_evidence, fold0_ranked, finalists,
+        replay_guard=replay_guard,
+    )
     if not candidate_rows:
         return None, {
             "economically_eligible_trials": 0,
-            "full_refit_seconds": refit_seconds,
-            "economic_replay_seconds": replay_seconds,
             **selection_tail,
         }
     candidate_rows.sort(key=lambda row: row[0], reverse=True)
     _winner_key, winner_number = candidate_rows[0]
-    champion = _config_from_params(dict(study.trials[winner_number].params))
+    champion = _config_from_params(
+        dict(study.trials[winner_number].params), num_threads=lgb_threads
+    )
     winner_calibration_state = calibration_state_by_trial.get(winner_number)
     if winner_calibration_state is not None:
         champion._calibration_state = dict(winner_calibration_state)
     return champion, {
         "economically_eligible_trials": len(candidate_rows),
-        "full_refit_seconds": refit_seconds,
-        "economic_replay_seconds": replay_seconds,
         "selected_trial_number": winner_number,
         **{
             f"selected_inner_{name}": value
@@ -2646,7 +2903,68 @@ def _select_economic_champion(
     }
 
 
-def _config_from_trial(trial: optuna.Trial) -> LambdaRankConfig:
+def _selection_telemetry(
+    replay_seconds: float,
+    timings: _SelectionTimings | None,
+    lgb_threads: int,
+    early_rejected_seconds: list[float],
+    shortlist_evidence: list[dict[str, object]],
+    fold0_ranked: list[tuple[float, float, int, LambdaRankConfig, pl.DataFrame]],
+    finalists: list[tuple[list[float], pl.DataFrame, int]],
+    *,
+    replay_guard: ReplayResourceGuard | None,
+) -> dict[str, object]:
+    """Route-qualified exclusive stage telemetry for one selection funnel.
+
+    ``full_refit_seconds`` excludes replay preparation and replay execution by
+    construction: it is the sum of the exclusive per-fold train and predict
+    durations, so the overlapping legacy timer double-count is removed.
+    """
+    train_seconds = timings.refit_train_seconds if timings is not None else 0.0
+    predict_seconds = timings.refit_predict_seconds if timings is not None else 0.0
+    best_iterations: dict[str, int | None] = (
+        timings.actual_best_iterations if timings is not None else {}
+    )
+    return {
+        "full_refit_boosting_rounds": (
+            _SCREEN_BOOSTING_ROUNDS + 2 * _SCREEN_EARLY_STOPPING_ROUNDS
+        ),
+        "full_refit_early_stopping_rounds": 2 * _SCREEN_EARLY_STOPPING_ROUNDS,
+        "early_rejected_full_refits": len(early_rejected_seconds),
+        "early_rejected_full_refit_seconds": round(
+            float(sum(early_rejected_seconds)), 3
+        ),
+        "shortlist_candidate_evidence": shortlist_evidence,
+        "replay_resource": (
+            replay_guard.telemetry() if replay_guard is not None else {}
+        ),
+        "promoted_trials": len(fold0_ranked),
+        "all_positive_finalists": len(finalists),
+        "context_prepare_seconds": (
+            round(timings.context_prepare_seconds, 3) if timings is not None else 0.0
+        ),
+        "refit_train_seconds": round(train_seconds, 3),
+        "refit_predict_seconds": round(predict_seconds, 3),
+        "replay_prepare_seconds": (
+            round(timings.replay_prepare_seconds, 3) if timings is not None else 0.0
+        ),
+        "economic_replay_seconds": round(replay_seconds, 3),
+        "full_refit_seconds": round(train_seconds + predict_seconds, 3),
+        "resolved_lgb_threads": int(lgb_threads),
+        "actual_refit_rounds": (
+            dict(timings.actual_refit_rounds) if timings is not None else {}
+        ),
+        "actual_best_iterations": {
+            key: (int(value) if value is not None else None)
+            for key, value in best_iterations.items()
+        },
+    }
+
+
+def _config_from_trial(
+    trial: optuna.Trial,
+    num_threads: int | None = None,
+) -> LambdaRankConfig:
     return _config_from_params(
         {
             "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.05, log=True),
@@ -2658,11 +2976,15 @@ def _config_from_trial(trial: optuna.Trial) -> LambdaRankConfig:
             "lambda_l1": trial.suggest_float("lambda_l1", 1e-4, 10.0, log=True),
             "lambda_l2": trial.suggest_float("lambda_l2", 1e-4, 10.0, log=True),
             "max_bin": trial.suggest_categorical("max_bin", (127, 255)),
-        }
+        },
+        num_threads=num_threads,
     )
 
 
-def _config_from_params(params: dict[str, Any]) -> LambdaRankConfig:
+def _config_from_params(
+    params: dict[str, Any],
+    num_threads: int | None = None,
+) -> LambdaRankConfig:
     return LambdaRankConfig(
         learning_rate=float(params["learning_rate"]),
         num_leaves=int(params["num_leaves"]),
@@ -2673,6 +2995,7 @@ def _config_from_params(params: dict[str, Any]) -> LambdaRankConfig:
         lambda_l1=float(params["lambda_l1"]),
         lambda_l2=float(params["lambda_l2"]),
         max_bin=int(params["max_bin"]),
+        num_threads=num_threads or 1,
     )
 
 

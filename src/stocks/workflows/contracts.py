@@ -15,6 +15,8 @@ from src.core.costs import CostSchedule
 
 SUPPORTED_CANDIDATE_HORIZONS = (5, 10, 15)
 
+COMPUTE_PLAN_VERSION = "sub10-refit-v1"
+
 
 @dataclass(frozen=True, slots=True)
 class TrainingRequest:
@@ -51,6 +53,7 @@ class TrainingRequest:
     candidate_horizons: tuple[int, ...] = (5, 10, 15)
     resume: bool = False
     run_root: Path | None = None
+    lgb_threads: int | None = None
 
     def __post_init__(self) -> None:
         if self.n_folds < 1:
@@ -67,6 +70,8 @@ class TrainingRequest:
             raise ValueError("optuna_trials must be positive")
         if self.max_rss_mib is not None and self.max_rss_mib <= 0:
             raise ValueError("max_rss_mib must be positive when supplied")
+        if self.lgb_threads is not None and self.lgb_threads <= 0:
+            raise ValueError("lgb_threads must be positive when supplied")
         if self.calibration_bucket_count < 2:
             raise ValueError("calibration_bucket_count must be at least 2")
         if self.min_calibration_sessions < 1:

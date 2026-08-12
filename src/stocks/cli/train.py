@@ -71,6 +71,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="explicit RSS budget in MiB; a breach raises TrainingCapacityError",
     )
     parser.add_argument(
+        "--lgb-threads",
+        type=int,
+        default=None,
+        help="explicit LightGBM thread count; None resolves to all visible "
+        "physical cores and an explicit value must not exceed visible logical CPUs",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="resume a fingerprinted training run from its durable checkpoint "
@@ -124,6 +131,7 @@ def main(args: list[str] | None = None) -> int:
         participation_limit=0.005,
         optuna_trials=parsed.optuna_trials,
         max_rss_mib=parsed.max_rss_mib,
+        lgb_threads=parsed.lgb_threads,
         resume=parsed.resume,
         run_root=parsed.registry / ".training" / parsed.artifact_id,
     )

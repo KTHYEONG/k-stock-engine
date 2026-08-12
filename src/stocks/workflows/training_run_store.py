@@ -22,7 +22,7 @@ from typing import Any
 
 from src.core.costs import CostSchedule
 from src.stocks.data.contracts import DatasetSnapshot
-from src.stocks.workflows.contracts import TrainingRequest
+from src.stocks.workflows.contracts import COMPUTE_PLAN_VERSION, TrainingRequest
 from src.stocks.workflows.economic_selection import SELECTION_POLICY_VERSION
 
 _RUN_DIR_NAME = ".training"
@@ -123,6 +123,7 @@ class TrainingRunStore:
                 "base_cost_schedule": _schedule_digest(base_schedule),
                 "stress_cost_schedule": _schedule_digest(stress_schedule),
                 "selection_policy_version": SELECTION_POLICY_VERSION,
+                "compute_plan_version": COMPUTE_PLAN_VERSION,
             }
         )
 
