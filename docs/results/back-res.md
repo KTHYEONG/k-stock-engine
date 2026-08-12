@@ -1,112 +1,85 @@
-# Stock Alpha v2 최신 81-Trial 실행 결과
+# 최신 Stock Alpha v2 81-Trial 실행 결과
 
-## 실행 개요
+## 실행 식별자
 
 | 항목 | 값 |
 |---|---|
 | 실행일 | 2026-08-12 |
 | Snapshot | `research_provisional_20160104_20260812_cost_master_v3_mh2` |
-| Artifact | `lambdarank_v2_20260812_redesign_81trial` |
-| 실행 모드 | `research` |
-| 실행 명령 | `uv run python -m src.stocks.cli.train --artifact-id lambdarank_v2_20260812_redesign_81trial --snapshot-id research_provisional_20160104_20260812_cost_master_v3_mh2 --mode research --optuna-trials 81 --max-rss-mib 8000` |
-| Route | 5 / 10 / 15 sessions |
-| Selection policy | `economic-selection-v1` |
+| Artifact | `lambdarank_v2_20260812_redesign_81trial_postsync` |
+| 모드 | `research` |
+| 정책 | `economic-selection-v2-proxy-one-finalist` |
+| 명령 | `uv run python -m src.stocks.cli.train --artifact-id lambdarank_v2_20260812_redesign_81trial_postsync --snapshot-id research_provisional_20160104_20260812_cost_master_v3_mh2 --mode research --optuna-trials 81 --max-rss-mib 8000` |
 
-실행은 외부 timeout 없이 정상 종료되었고, terminal artifact가 생성되었다.
+이번 실행은 외부 timeout 없이 exit status `0`으로 종료되었고, 3개 route(5/10/15 sessions)에 각각 27 trials를 배정했다.
 
 ## 최종 판정
 
-| 항목 | 값 |
+| 항목 | 결과 |
 |---|---:|
 | `promoted` | `false` |
 | `no_trade` | `true` |
 | `selection_status` | `no_economically_eligible_candidate` |
-| `economically_eligible_trials` | `0` |
-| `capacity_failure_reason` | `null` |
-| `n_terminal_trials` | `81` |
+| `n_folds_evaluated` | 0 |
+| 경제성 통과 후보 | 0 |
+| terminal trials | 81 |
+| screened / pruned | 72 / 9 |
+| shortlisted | 18 |
+| 최고 screen Rank-IC | **0.10341699** |
 
-모든 route에서 finalist가 경제성 gate를 통과하지 못해 승격 가능한 champion이
-없었다. 이는 메모리 실패가 아니라 `no_filled_orders`와
-`non_positive_bootstrap_lower_bound`에 의한 의도된 `NO_TRADE` 결과다.
+모든 finalist가 `no_filled_orders` 및 `non_positive_bootstrap_lower_bound` gate에서 탈락했다. 따라서 모델 artifact는 생성됐지만 champion 승격이나 paper/live 거래 전환은 수행되지 않았다.
 
-## 소요시간 및 메모리
+## 실행 시간 및 메모리
 
-### 외부 프로세스 측정 (`/usr/bin/time -v`)
+### 외부 프로세스 측정
 
 | 항목 | 값 |
 |---|---:|
-| Wall time | **19:54.38** |
-| User time | 1,323.49 s |
-| System time | 176.20 s |
-| Maximum RSS | **7,672.23 MiB** |
-| RSS limit | 8,000 MiB |
-| Exit status | `0` |
+| Wall time | **16:07.07** |
+| User time | 1,093.59 s |
+| System time | 78.30 s |
+| Maximum RSS | **7,613.02 MiB** |
+| RSS hard limit | 8,000 MiB |
+| Exit status | 0 |
 
 ### Workflow telemetry
 
 | 항목 | 값 |
 |---|---:|
-| Baseline RSS | 1,777.50 MiB |
-| Workflow peak RSS | **7,146.48 MiB** |
-| Screen | 373.21 s |
-| Full refit | 753.47 s |
-| Economic replay | 282.45 s |
-| Prepared replay decisions | 1,520 |
-| Replay peak RSS | 5,481.50 MiB |
+| Baseline RSS | 1,559.38 MiB |
+| Workflow peak RSS | **6,919.41 MiB** |
+| Screen | 87.50 s |
+| Full refit | **786.26 s** |
+| Economic replay | 52.69 s |
 | Cache bytes | 1,795,296,912 bytes |
+| Proxy session stride | 6 |
+| Route budget | 27 |
+| Promotion width | 6 |
+| Finalist width | 1 |
 
-외부 RSS와 내부 RSS 모두 8,000 MiB 제한 안에 들어왔으며 capacity failure는
-발생하지 않았다.
-
-## 탐색·최적화 결과
-
-| 항목 | 값 |
-|---|---:|
-| Route budget | 27 trials × 3 routes |
-| Terminal trials | 81 |
-| Screened / pruned | 66 / 15 |
-| Promotion width | 6 per route |
-| Finalist width | 2 per route |
-| Promoted trials | 6 per route |
-| All-positive finalists | 2 per route |
-| Economic replays | 6 total |
-| Legacy fixed shortlist reference | 8 per route |
-
-정상 경로에서 full-refit은 route당 10개 fold 단위로 제한되었고, replay는 route당
-최대 2개 finalist만 수행되었다.
-
-| Route | Screen | Full refit | Replay | Peak RSS | Best screen Rank-IC |
-|---:|---:|---:|---:|---:|---:|
-| 5 | 147.18 s | 348.76 s | 165.50 s | 5,556.56 MiB | 0.08499058 |
-| 10 | 116.94 s | 238.39 s | 71.21 s | 7,146.48 MiB | **0.09533526** |
-| 15 | 109.08 s | 166.32 s | 45.74 s | 7,146.48 MiB | 0.08754609 |
+외부 RSS는 workflow telemetry보다 693.61 MiB 높았지만 8,000 MiB 제한 아래였고 OOM 또는 capacity failure는 발생하지 않았다. 다만 목표인 600초/7,000MiB는 각각 967.07초, 613.02MiB 초과했다.
 
 ## 경제 replay 성과
 
-최종 finalist 6개 모두 주문 체결이 없었고 경제성 gate에서 탈락했다.
-
-| Route | Trial | Median Rank-IC | Attempted orders | Filled orders | Bootstrap lower bound | Strategy IR | 판정 |
+| Route | Finalist trial | Median Rank-IC | Attempted orders | Filled orders | Bootstrap lower bound | Strategy IR | 판정 |
 |---:|---:|---:|---:|---:|---:|---:|---|
-| 5 | 10 | 0.08875145 | 4,519 | 0 | -0.00038778 | 0.0 | 탈락 |
-| 5 | 25 | 0.09093118 | 4,518 | 0 | -0.00038778 | 0.0 | 탈락 |
-| 10 | 16 | 0.10159450 | 2,322 | 0 | -0.00044101 | 0.0 | 탈락 |
-| 10 | 21 | 0.10537896 | 2,253 | 0 | -0.00044101 | 0.0 | 탈락 |
-| 15 | 12 | 0.10713674 | 1,624 | 0 | -0.00043084 | 0.0 | 탈락 |
-| 15 | 26 | 0.10447098 | 1,596 | 0 | -0.00043084 | 0.0 | 탈락 |
+| 5 sessions | 5 | 0.08661119 | 4,419 | 0 | -0.00040279 | 0.0 | 탈락 |
+| 10 sessions | 26 | 0.10283674 | 2,302 | 0 | -0.00040279 | 0.0 | 탈락 |
+| 15 sessions | 19 | 0.10164764 | 1,101 | 0 | -0.00040279 | 0.0 | 탈락 |
+| **합계** | — | — | **7,822** | **0** | — | — | **NO_TRADE** |
 
-합계 attempted orders는 16,832건, filled orders는 0건이다. 따라서 최종 artifact의
-투자 성과 지표는 생성되지 않았으며, paper/live 승격도 수행되지 않았다.
+예측 순위 상관은 양호했지만 실제 체결이 한 건도 없어 strategy IR은 0.0이었다. 음수 bootstrap 하한이 확인되어 경제성 gate를 완화하지 않고 fail-closed 처리한 결과다.
 
-## 병목 관찰
+## 병목 및 성과 해석
 
-- 전체 wall time은 19분 54초로 81-trial 실행이 terminal 상태에 도달했다.
-- Screen 373초보다 full refit 753초와 replay 282초가 더 큰 비용이었다.
-- 최고 RSS는 h10/h15 replay·refit 구간의 7,146.48 MiB telemetry,
-  프로세스 전체 peak는 7,672.23 MiB였다.
-- `decision_preparation`은 route별 bootstrap batch와 replay guard 안에서 수행되었고,
-  capacity guard 중단 없이 fail-closed 경제성 판정을 완료했다.
+- 탐색(screen)은 87.50초로 전체 시간의 약 9%다.
+- full refit이 786.26초로 가장 큰 병목이며, 전체의 약 82%를 차지한다.
+- economic replay는 52.69초로 약 5%다.
+- 81 terminal trials와 18 shortlist evidence는 정상적으로 기록됐다.
+- 메모리 측면에서는 OOM을 피했지만 외부 peak 7,613MiB로 7,000MiB 운영 목표에는 미달했다.
+- 최적화의 다음 우선순위는 full refit fold 수/round budget 및 후보 materialization 동시 메모리 축소이며, 경제성 gate는 현재 결과상 완화할 근거가 없다.
 
 ## 산출물
 
-- [Metrics](../../data/artifacts/stocks/lambdarank_v2_20260812_redesign_81trial/metrics.json)
-- [Manifest](../../data/artifacts/stocks/lambdarank_v2_20260812_redesign_81trial/manifest.json)
+- [Metrics](../../data/artifacts/stocks/lambdarank_v2_20260812_redesign_81trial_postsync/metrics.json)
+- [Manifest](../../data/artifacts/stocks/lambdarank_v2_20260812_redesign_81trial_postsync/manifest.json)
