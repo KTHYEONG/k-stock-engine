@@ -37,6 +37,7 @@ from src.core.datasets import DatasetManifest
 from src.core.instruments import AssetKind, Instrument
 from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.research.artifacts import ModelArtifactRegistry
+from src.stocks.research.calibration_schedule import CausalCalibrationSchedule
 from src.stocks.research.datasets import (
     research_eligible_frame,
     validate_stock_rows_available,
@@ -61,6 +62,11 @@ from src.stocks.research.lambdarank import (
 from src.stocks.research.models import ModelManifest, StableRankComposite
 from src.stocks.trading.portfolio_constructor import StockRiskPolicy
 from src.stocks.workflows.contracts import TrainingRequest
+from src.stocks.workflows.economic_selection import (
+    SELECTION_POLICY_VERSION,
+    SelectionPolicy,
+)
+from src.stocks.workflows.training_run_store import TrainingRunStore, content_hash
 
 if TYPE_CHECKING:
     from src.stocks.backtesting.engine import BacktestLedgerRow
@@ -612,12 +618,23 @@ def train_model(
     base = request.base_cost_schedule or default_base_schedule()
     stress = request.stress_cost_schedule or default_stress_schedule()
 
+    run_store = TrainingRunStore.resolve(
+        snapshot,
+        request,
+        feature_columns,
+        route_specs,
+        base,
+        stress,
+        registry_root=registry.root if request.run_root is not None else None,
+    )
+
     champion_config, n_optuna_trials, champion_route = _tune_champion(
         training_panel, request, base_manifest, feature_columns, route_specs,
         dataset_manifest=snapshot.manifest,
         registry=registry,
         base_schedule=base,
         stress_schedule=stress,
+        run_store=run_store,
     )
     if champion_config is None or champion_route is None:
         return _publish_no_trade(
@@ -919,6 +936,7 @@ def _tune_champion(
     registry: ModelArtifactRegistry,
     base_schedule: CostSchedule,
     stress_schedule: CostSchedule,
+    run_store: TrainingRunStore | None = None,
 ) -> tuple[LambdaRankConfig | None, int, RouteSpec | None]:
     """Run a temporally isolated screen -> shortlist -> economic selection.
 
@@ -929,11 +947,14 @@ def _tune_champion(
     configurations; a LightGBM NDCG callback drives Optuna median pruning, and
     pruned candidates remain terminal trials for Deflated Sharpe. A pruned or
     invalid route stays terminal evidence and is never silently reallocated to
-    another horizon. At most ``_SCREEN_SHORTLIST_SIZE`` positive-screen
-    candidates per horizon are fully refit over every inner fold and replayed
-    through the exact event ledger, then a champion is selected across all
-    routes lexicographically by ``(bootstrap lower bound, strategy IR, -max
-    drawdown, -turnover, median Rank-IC, -holding horizon, -trial number)``.
+    another horizon. The ``ceil(sqrt(route_budget))`` best
+    positive-screen candidates per horizon (six of 27 for the 81/3/3 profile)
+    are promoted to a fold-0 full refit, then the top all-positive finalists
+    (two per route) are refit over the remaining folds and replayed through the
+    exact event ledger; a rejected finalist is deterministically backfilled
+    from the promoted list. A champion is selected across all routes
+    lexicographically by ``(bootstrap lower bound, strategy IR, -max drawdown,
+    -turnover, median Rank-IC, -holding horizon, -trial number)``.
     Returns ``(config, n_trials, route)`` where ``n_trials`` is the selected
     route's terminal screen trial count fed to Deflated Sharpe.
     """
@@ -982,12 +1003,39 @@ def _tune_champion(
             _fold_cache_bytes(getattr(context, "prepared", None))
             for context in contexts
         )
+        policy = SelectionPolicy.for_budget(
+            total_trials=request.optuna_trials,
+            route_count=max(1, len(route_specs)),
+            fold_count=max(1, len(contexts)),
+        )
 
-        storage = optuna.storages.InMemoryStorage()
+        screen_phase = f"screen_h{route.horizon}"
+        screen_evidence = {
+            "route_horizon": route.horizon,
+            "optuna_trials": per_route_trials,
+            "study_name": f"lambdarank_v2_{request.artifact_id}_h{route.horizon}",
+            "seed": request.seed,
+            "screen_boosting_rounds": _SCREEN_BOOSTING_ROUNDS,
+            "screen_early_stopping_rounds": _SCREEN_EARLY_STOPPING_ROUNDS,
+        }
+        screen_phase_hash = content_hash(screen_evidence)
+        study_name = str(screen_evidence["study_name"])
+        storage: optuna.storages.BaseStorage
+        if run_store is not None:
+            storage = optuna.storages.RDBStorage(url=run_store.optuna_storage_url(route.horizon))
+            resumed_screen = bool(
+                run_store.resume
+                and run_store.completed_phase(screen_phase, screen_phase_hash)
+            )
+        else:
+            storage = optuna.storages.InMemoryStorage()
+            resumed_screen = False
+
         study = optuna.create_study(
             direction="maximize",
-            study_name=f"lambdarank_v2_{request.artifact_id}_h{route.horizon}",
+            study_name=study_name,
             storage=storage,
+            load_if_exists=resumed_screen,
             sampler=optuna.samplers.TPESampler(
                 seed=request.seed + route.horizon, n_startup_trials=10
             ),
@@ -1020,14 +1068,24 @@ def _tune_champion(
             )
             return float(ic)
 
-        screen_started = time.perf_counter()
-        study.optimize(
-            screen_objective,
-            n_trials=per_route_trials,
-            n_jobs=1,
-            show_progress_bar=False,
-        )
-        screen_seconds = time.perf_counter() - screen_started
+        if not resumed_screen:
+            screen_started = time.perf_counter()
+            study.optimize(
+                screen_objective,
+                n_trials=per_route_trials,
+                n_jobs=1,
+                show_progress_bar=False,
+            )
+            screen_seconds = time.perf_counter() - screen_started
+            if run_store is not None:
+                run_store.checkpoint_phase(screen_phase, screen_evidence)
+        else:
+            screen_seconds = 0.0
+            logger.info(
+                "[SYS] route=%sd stage=screen_resumed from=%s",
+                route.horizon,
+                run_store.phase_path(screen_phase) if run_store is not None else "",
+            )
         screen_seconds_total += screen_seconds
         logger.info(
             "[SYS] route=%sd stage=screen elapsed_ms=%.1f rss=%.1f",
@@ -1070,10 +1128,10 @@ def _tune_champion(
             ((value, number) for value, number in completed if value > 0.0),
             key=lambda pair: (-pair[0], pair[1]),
         )
-        shortlist = screen_scores[:_SCREEN_SHORTLIST_SIZE]
+        shortlist = screen_scores[: policy.promotion_width]
         for _screen_ic, trial_number in shortlist:
             logger.info(
-                "[EVAL] route=%sd trial=%s stage=shortlisted", route.horizon, trial_number
+                "[EVAL] route=%sd trial=%s stage=promoted", route.horizon, trial_number
             )
 
         champion, selection = _select_economic_champion(
@@ -1081,7 +1139,26 @@ def _tune_champion(
             route_manifest, feature_columns, route, guard, dataset_manifest,
             registry, base_schedule, stress_schedule,
             terminal_trial_count=n_terminal,
+            policy=policy,
         )
+        if run_store is not None and selection is not None:
+            run_store.checkpoint_phase(
+                f"selection_h{route.horizon}",
+                {
+                    "route_horizon": route.horizon,
+                    "promotion_width": policy.promotion_width,
+                    "finalist_width": policy.finalist_width,
+                    "selected_trial_number": selection.get("selected_trial_number"),
+                    "promoted_trials": selection.get("promoted_trials"),
+                    "all_positive_finalists": selection.get("all_positive_finalists"),
+                    "economically_eligible_trials": selection.get(
+                        "economically_eligible_trials"
+                    ),
+                    "economic_replay_seconds": selection.get(
+                        "economic_replay_seconds"
+                    ),
+                },
+            )
 
         telemetry = guard.telemetry()
         for name, value in telemetry.items():
@@ -1091,6 +1168,9 @@ def _tune_champion(
         study.set_user_attr("screened_trials", len(complete))
         study.set_user_attr("pruned_trials", n_terminal - len(complete))
         study.set_user_attr("shortlisted_trials", len(shortlist))
+        study.set_user_attr("selection_policy_version", SELECTION_POLICY_VERSION)
+        for name, value in policy.to_json_safe().items():
+            study.set_user_attr(name, value)
         study.set_user_attr("cache_bytes", cache_bytes)
         study.set_user_attr("screen_seconds", screen_seconds)
         study.set_user_attr("holding_horizon_sessions", route.horizon)
@@ -1169,6 +1249,7 @@ def _tune_champion(
         "candidate_horizons": list(request.candidate_horizons),
         "active_routes": [route.horizon for route in route_specs],
         "per_route_trial_budget": per_route_trials,
+        "selection_policy_version": SELECTION_POLICY_VERSION,
         **guard.telemetry(),
         "n_terminal_trials": n_terminal_total,
         "optuna_trials": n_terminal_total,
@@ -1193,6 +1274,19 @@ def _tune_champion(
         "replay_resource": _merge_replay_telemetry(route_attrs),
         "routes": route_attrs,
     }
+    for policy_key in (
+        "route_budget",
+        "promotion_width",
+        "finalist_width",
+        "fold_count",
+        "all_positive_finalists",
+        "promoted_trials",
+    ):
+        if policy_key not in merged:
+            for attrs in route_attrs.values():
+                if policy_key in attrs:
+                    merged[policy_key] = attrs[policy_key]
+                    break
     if best_screen_rank_ic is not None:
         merged["best_screen_rank_ic"] = best_screen_rank_ic
 
@@ -1239,6 +1333,18 @@ def _tune_champion(
     merged["selected_label_available_column"] = winner_route.label_available_column
     merged.update(winner_selection)
     merged.update(winner_evidence)
+    for policy_key in (
+        "selection_policy_version",
+        "route_budget",
+        "promotion_width",
+        "finalist_width",
+        "fold_count",
+        "all_positive_finalists",
+        "promoted_trials",
+        "early_rejected_full_refits",
+    ):
+        if policy_key in winner_study.user_attrs:
+            merged[policy_key] = winner_study.user_attrs[policy_key]
     winner_config._tuning_telemetry = merged
     logger.info(
         "[EVAL] route=%sd trial=%s stage=selected",
@@ -1573,10 +1679,14 @@ def _fit_and_score_candidate(
     candidate_key: str,
     *,
     static_cache_bytes: int = 0,
+    fold_indices: tuple[int, ...] | None = None,
 ) -> tuple[list[float], pl.DataFrame | None] | None:
-    """Full-budget refit of one shortlisted candidate over every inner fold.
+    """Full-budget refit of one promoted candidate over selected inner folds.
 
-    Returns ``(fold_rank_ic, concatenated validation scores)``, or
+    ``fold_indices`` selects the folds to refit: the multi-fidelity selector
+    scores fold 0 for every promoted candidate first and only refits the
+    remaining folds for the surviving all-positive finalists. Returns
+    ``(fold_rank_ic, concatenated validation scores)`` for the requested folds,
     ``(fold_rank_ic, None)`` when the first non-positive full-refit Rank-IC
     rejects the candidate early, or ``None`` when any fold fails closed. The
     early stop is equivalence-preserving: eligibility already requires every
@@ -1585,11 +1695,13 @@ def _fit_and_score_candidate(
     frames, and LightGBM datasets are released before the next fold.
     """
     del tuning_panel, feature_columns
+    fold_indices = fold_indices or tuple(range(len(contexts)))
     fold_rank_ic: list[float] = []
     scored_frames: list[pl.DataFrame] = []
     full_refit_rounds = config.n_estimators
     full_refit_patience = config.early_stopping_rounds
-    for fold_index, context in enumerate(contexts):
+    for fold_index in fold_indices:
+        context = contexts[fold_index]
         key = f"refit_{candidate_key}_fold_{fold_index}"
         guard.admit(
             context.train_processed.height,
@@ -1640,7 +1752,7 @@ def _fit_and_score_candidate(
             )
             return fold_rank_ic, None
         scored_frames.append(scored)
-    return fold_rank_ic, pl.concat(scored_frames)
+    return fold_rank_ic, pl.concat(scored_frames) if scored_frames else pl.DataFrame()
 
 
 def _prepare_replay_static_context(
@@ -1838,18 +1950,24 @@ def _select_economic_champion(
     stress_schedule: CostSchedule,
     *,
     terminal_trial_count: int,
+    policy: SelectionPolicy,
 ) -> tuple[LambdaRankConfig | None, dict[str, object] | None]:
-    """Replay each shortlisted candidate and pick the top economic evidence.
+    """Promote, refit, and exactly replay the route's multi-fidelity finalists.
 
-    Every candidate is fully refit over all inner folds and replayed through
-    the exact event ledger with the outer base/stress schedules and the route's
-    rebalance cadence. A candidate is skipped after its first non-positive
-    full-refit Rank-IC (later folds and replay cannot make it eligible).
-    Eligible candidates sort descending by ``(bootstrap lower bound, strategy
-    IR, -max drawdown, -turnover, median Rank-IC, -holding horizon, -trial
-    number)``; a tie is won by the lower trial number. Returns
-    ``(config, selection telemetry)`` or ``(None, None)`` when no shortlisted
-    candidate is eligible.
+    The promoted ``shortlist`` (already limited to ``policy.promotion_width``)
+    is first full-refit on fold 0 and ranked by ``(-fold0_rank_ic,
+    -screen_rank_ic, trial_number)``. The best ``policy.finalist_width``
+    candidates are refit over the remaining folds; a non-positive or invalid
+    fold deterministically backfills from the promoted list until
+    ``finalist_width`` all-positive candidates exist or the list is exhausted.
+    Only those all-positive finalists run the exact event ledger, so the normal
+    81/3/3 profile performs ``policy.promotion_width + policy.finalist_width *
+    (fold_count - 1)`` full-refit folds and at most ``policy.finalist_width``
+    economic replays per route. Eligible finalists sort descending by
+    ``(bootstrap lower bound, strategy IR, -max drawdown, -turnover, median
+    Rank-IC, -holding horizon, -trial number)``; a tie is won by the lower
+    trial number. Returns ``(config, selection telemetry)`` or ``(None, None)``
+    when no promoted candidate survives the funnel.
     """
     if not shortlist:
         return None, None
@@ -1867,6 +1985,10 @@ def _select_economic_champion(
     shortlist_evidence: list[dict[str, object]] = []
     early_rejected_seconds: list[float] = []
     replay_seconds = 0.0
+    screen_ic_by_trial = {trial_number: screen_ic for screen_ic, trial_number in shortlist}
+
+    remaining_indices = tuple(range(1, len(contexts)))
+    fold0_ranked: list[tuple[float, float, int, LambdaRankConfig, pl.DataFrame]] = []
     for _screen_ic, trial_number in shortlist:
         frozen = study.trials[trial_number]
         config = _config_from_params(dict(frozen.params))
@@ -1878,15 +2000,58 @@ def _select_economic_champion(
             full_refit_config,
             guard, f"trial{trial_number}",
             static_cache_bytes=replay_context.cache_bytes,
+            fold_indices=(0,),
         )
         if refit is None:
             logger.info("[EVAL] trial=%s stage=refit_failed", trial_number)
             continue
-        fold_rank_ic, oos = refit
-        if oos is None:
+        fold_rank_ic, oos0 = refit
+        if oos0 is None or not fold_rank_ic or fold_rank_ic[0] <= 0.0:
             early_rejected_seconds.append(time.perf_counter() - refit_started_trial)
-            logger.info("[EVAL] trial=%s stage=early_rejected", trial_number)
+            logger.info("[EVAL] trial=%s stage=fold0_rejected", trial_number)
             continue
+        fold0_ranked.append(
+            (float(fold_rank_ic[0]), _screen_ic, trial_number, full_refit_config, oos0)
+        )
+
+    fold0_ranked.sort(key=lambda row: (-row[0], -row[1], row[2]))
+    finalists: list[tuple[list[float], pl.DataFrame, int]] = []
+    for fold0_ic, _screen_ic, trial_number, full_refit_config, oos0 in fold0_ranked:
+        if len(finalists) >= policy.finalist_width:
+            break
+        if not remaining_indices:
+            finalists.append(([fold0_ic], oos0, trial_number))
+            logger.info(
+                "[EVAL] trial=%s stage=all_positive_finalist fold_rank_ic=%s",
+                trial_number, [fold0_ic],
+            )
+            continue
+        refit_started_trial = time.perf_counter()
+        refit = _fit_and_score_candidate(
+            tuning_panel, tuning_folds, contexts, request, route_manifest,
+            feature_columns, route.label_column, route.relevance_column,
+            full_refit_config,
+            guard, f"trial{trial_number}",
+            static_cache_bytes=replay_context.cache_bytes,
+            fold_indices=remaining_indices,
+        )
+        if refit is None:
+            continue
+        remaining_ic, oos_rest = refit
+        if oos_rest is None:
+            early_rejected_seconds.append(time.perf_counter() - refit_started_trial)
+            logger.info("[EVAL] trial=%s stage=backfill_rejected", trial_number)
+            continue
+        full_ic = [fold0_ic, *list(remaining_ic)]
+        full_oos = pl.concat([oos0, oos_rest]) if not oos0.is_empty() or not oos_rest.is_empty() else oos0
+        finalists.append((full_ic, full_oos, trial_number))
+        logger.info(
+            "[EVAL] trial=%s stage=all_positive_finalist fold_rank_ic=%s",
+            trial_number, full_ic,
+        )
+
+    for fold_rank_ic, oos, trial_number in finalists:
+        _screen_ic = screen_ic_by_trial[trial_number]
         replay_started = time.perf_counter()
         causal_oos_ledger = _build_calibration_ledger(
             oos, tuning_panel, route.label_column, route.label_available_column,
@@ -1976,6 +2141,8 @@ def _select_economic_champion(
         ),
         "shortlist_candidate_evidence": shortlist_evidence,
         "replay_resource": replay_guard.telemetry(),
+        "promoted_trials": len(fold0_ranked),
+        "all_positive_finalists": len(finalists),
     }
     if not candidate_rows:
         return None, {
@@ -2124,6 +2291,7 @@ def _event_ledger_evaluation(
         ArtifactSlot,
         BacktestRequest,
         PreparedReplayDecision,
+        PreparedReplayMarket,
         StockBacktester,
     )
     from src.stocks.data.costs import CostEvidence
@@ -2167,18 +2335,14 @@ def _event_ledger_evaluation(
         replay_guard.admit(
             int(replay_frame.estimated_size()), stage="replay_adtv"
         )
-    replay_adtv = (
-        replay_frame.sort("session")
-        .with_columns(
-            pl.col("trading_value")
-            .rolling_mean(20, min_samples=1)
-            .over("instrument_id")
-            .alias("adtv")
-        )
-        .select("instrument_id", "session", "adtv")
+
+    start_time = _session_as_datetime(sessions[0])
+    end_time = _session_as_datetime(sessions[-1])
+    cadence = max(1, int(policy.rebalance_frequency_sessions))
+    decision_indices = tuple(
+        i for i in range(len(sessions)) if i % cadence == 0
     )
-    if replay_guard is not None:
-        replay_guard.check_after(stage="replay_adtv")
+    decision_times = tuple(_session_as_datetime(sessions[i]) for i in decision_indices)
 
     calibrator = (
         CausalAlphaCalibrator(
@@ -2193,6 +2357,18 @@ def _event_ledger_evaluation(
         if calibration_ledger is not None and not calibration_ledger.is_empty()
         else None
     )
+    calibration_schedule: CausalCalibrationSchedule | None = None
+    if calibrator is not None:
+        assert calibration_ledger is not None
+        calibration_schedule = CausalCalibrationSchedule.build(
+            calibration_ledger,
+            decision_times,
+            calibrator,
+            base_schedule,
+            max_workspace_bytes=_bootstrap_workspace_bytes(
+                request.n_bootstrap, int(calibration_ledger.height)
+            ),
+        )
     calibration_tracker: dict[str, object] = {}
 
     def _scored_no_trade(
@@ -2240,17 +2416,26 @@ def _event_ledger_evaluation(
                 assert calibration_ledger is not None
                 workspace_cap: int | None = None
                 if replay_guard is not None:
-                    workspace_cap = replay_guard.bootstrap_workspace_cap(
-                        history_rows=calibration_ledger.height,
-                        projected_output_bytes=int(visible.estimated_size()),
-                        n_bootstrap=request.n_bootstrap,
+                    assert calibration_schedule is not None
+                    prefix_rows = calibration_schedule.eligible_prefix_rows(decision_time)
+                    if prefix_rows > 0:
+                        workspace_cap = replay_guard.bootstrap_workspace_cap(
+                            history_rows=prefix_rows,
+                            projected_output_bytes=int(visible.estimated_size()),
+                            n_bootstrap=request.n_bootstrap,
+                        )
+                if calibration_schedule is not None:
+                    calibration_state = calibration_schedule.state_at(
+                        decision_time,
+                        max_bootstrap_workspace_bytes=workspace_cap,
                     )
-                calibration_state = calibrator.prepare_decision(
-                    calibration_ledger,
-                    decision_time,
-                    base_schedule,
-                    max_bootstrap_workspace_bytes=workspace_cap,
-                )
+                else:
+                    calibration_state = calibrator.prepare_decision(
+                        calibration_ledger,
+                        decision_time,
+                        base_schedule,
+                        max_bootstrap_workspace_bytes=workspace_cap,
+                    )
                 visible = calibrator.apply_prepared(calibration_state, visible)
                 calibration_tracker["state"] = calibrator.calibration_state()
         except ValueError as exc:
@@ -2298,12 +2483,6 @@ def _event_ledger_evaluation(
             reasons=("scored-plan",),
         )
 
-    start_time = _session_as_datetime(sessions[0])
-    end_time = _session_as_datetime(sessions[-1])
-    cadence = max(1, int(policy.rebalance_frequency_sessions))
-    decision_indices = tuple(
-        i for i in range(len(sessions)) if i % cadence == 0
-    )
     initial_portfolio = PortfolioSnapshot(
         account_snapshot_id="promotion",
         as_of=datetime(2000, 1, 1, tzinfo=UTC),
@@ -2355,10 +2534,25 @@ def _event_ledger_evaluation(
             decision_provider=_prepare_decision,
             scenario_planner=_scenario_planner,
         )
-    result = backtester.run(
-        replay_frame, artifacts, initial_portfolio, backtest_request,
-        adtv=replay_adtv,
+    market = PreparedReplayMarket.build(
+        replay_frame,
+        backtester.adtv_window,
+        instruments=instruments,
+        artifacts=artifacts,
+        initial_portfolio=initial_portfolio,
     )
+    score_overlay = (
+        replay_frame.sort(["session", "instrument_id"])
+        .select("instrument_id", "session")
+        .join(
+            scored_for_replay.select("instrument_id", "session", "pred_score"),
+            on=["instrument_id", "session"],
+            how="left",
+        )["pred_score"]
+        .to_numpy()
+        .astype(np.float64)
+    )
+    result = backtester.run_prepared(backtest_request, market, score_overlay)
     if replay_guard is not None:
         replay_guard.check_after(stage="replay")
         replay_guard.record_stage("replay", 0.0)
