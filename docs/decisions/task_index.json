@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "backtest_bottleneck_no_trade_improvement",
+      "date": "2026-08-12",
+      "adr_id": "ADR_20260812_backtest_bottleneck_no_trade_improvement",
+      "domain": "stocks",
+      "title": "Backtest bottleneck and NO_TRADE replay optimization",
+      "why": "Record ADTV cache regression recovery and latest 80-trial economic replay results.",
+      "resolution": "Added causal ADTV to replay static context, restored candidate orders/fills, and documented per-candidate bootstrap failures with fail-closed NO_TRADE.",
+      "impact": "Candidate replay is valid and observable; all eight shortlisted candidates remain unpromoted because bootstrap excess lower bounds are negative."
+    },
+    {
       "task_id": "TASK_STOCK_LAMBDARANK_ECONOMIC_TUNING",
       "date": "2026-08-11",
       "adr_id": "ADR_20260811_STOCK_LAMBDARANK_ECONOMIC_TUNING",

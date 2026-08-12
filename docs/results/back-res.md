@@ -214,3 +214,49 @@ shortlist 후보별 economic evidence를 상세 출력하고, 신호/포트폴�
 - Manifest: `data/artifacts/stocks/lambdarank_v2_20260811_cost_master_r8_full_benchmark/manifest.json`
 - Model: `data/artifacts/stocks/lambdarank_v2_20260811_cost_master_r8_full_benchmark/model.joblib`
 - Benchmark log: `logs/scratch/r8_full_benchmark.log`
+
+## ADTV 복구 후 80-trial 재실행 (2026-08-12)
+
+직전 최적화 실행에서 replay 캐시에 ADTV가 누락되어 모든 후보가
+`constraint:scores panel must carry adtv`로 종료된 회귀를 수정했다. 전체
+point-in-time panel에서 계산한 20-session causal ADTV를 replay static context에
+포함하고 동일 snapshot·seed·80-trial 조건으로 재실행했다.
+
+- Snapshot: `research_provisional_20160104_20260227_cost_master_v2_r1`
+- Artifact: `lambdarank_v2_20260812_backtest_opt_fixed`
+- 실행 명령: `uv run python -m src.stocks.cli.train --artifact-id lambdarank_v2_20260812_backtest_opt_fixed --snapshot-id research_provisional_20160104_20260227_cost_master_v2_r1 --mode research --optuna-trials 80 --max-rss-mib 8000`
+- 실행 시간: 약 445초 (10:08:32~10:15:57 KST)
+- 결과: **NO_TRADE / 미승격**
+- Terminal trials: `80 / 80`
+- RSS: baseline `3320.2 MiB`, peak `3848.9 MiB`, limit `8000 MiB`
+
+### Replay 및 후보 evidence
+
+| 항목 | 결과 |
+|---|---:|
+| Screened / pruned trials | 71 / 9 |
+| Shortlisted trials | 8 |
+| Economically eligible trials | 0 |
+| Screen time | 214.19초 |
+| Shortlist full-refit time | 230.91초 |
+| Economic replay time | 60.69초 |
+| Prepared cache | 106,295,948 bytes |
+| Peak RSS | 3,848.9 MiB |
+| Selection status | `no_economically_eligible_candidate` |
+
+ADTV 복구 후 후보별 replay가 실제로 실행됐고, 후보별 attempted/filled orders는
+`715~737 / 715~737`, planned cycles는 `67~69`로 회복됐다. covariance lookback
+warm-up에 따른 cycle skip은 후보별 5~7회였다. 8개 후보 모두 replay finite 조건과
+체결 조건은 통과했지만 bootstrap excess lower bound가 `-0.00076368`~
+`-0.00066004`로 음수였고, strategy IR도 `-0.4754`~`-0.1551`로 음수였다.
+
+따라서 이번 결과는 캐시 회귀가 해결된 유효한 economic replay 결과이며, NO_TRADE의
+직접 원인은 모든 shortlist 후보의 `non_positive_bootstrap_lower_bound`다. 게이트를
+완화하지 않았고 outer OOS·paper/live 승격은 수행하지 않았다.
+
+### 산출물
+
+- Metrics: `data/artifacts/stocks/lambdarank_v2_20260812_backtest_opt_fixed/metrics.json`
+- Manifest: `data/artifacts/stocks/lambdarank_v2_20260812_backtest_opt_fixed/manifest.json`
+- Model: `data/artifacts/stocks/lambdarank_v2_20260812_backtest_opt_fixed/model.joblib`
+- Benchmark log: `logs/scratch/lambdarank_v2_20260812_backtest_opt_fixed.log`
