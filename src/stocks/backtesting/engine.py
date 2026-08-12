@@ -196,6 +196,70 @@ class BacktestResult:
 
 Planner = Callable[..., TradingCycleResult]
 
+ReplayDecisionProvider = Callable[
+    [datetime, datetime], "PreparedReplayDecision"
+]
+ReplayScenarioPlanner = Callable[
+    ["PreparedReplayDecision", PortfolioSnapshot, TradingCycleRequest],
+    TradingCycleResult,
+]
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedReplayDecision:
+    """Immutable decision inputs prepared once per final decision timestamp.
+
+    Carries the compact bounded allocation history (only allocation columns
+    plus economic evidence columns), the frozen route-specific calibration
+    state, and the decision/execution timestamps. Base and stress portfolio
+    snapshots are advanced independently against this shared input.
+    """
+
+    decision_time: datetime
+    execution_time: datetime
+    visible: pl.DataFrame
+    calibration_state: dict[str, object] | None = None
+    reason: str | None = None
+
+
+@dataclass(slots=True)
+class _ScenarioState:
+    """Mutable base or stress replay state advanced in one paired session loop."""
+
+    account_snapshot_id: str
+    settled_cash: float
+    unsettled_cash: float
+    accrued_costs: float
+    positions: dict[str, int]
+    settlements: dict[int, float]
+    pending_orders: list[dict[str, object]]
+    trades: list[BacktestTrade]
+    ledger: list[BacktestLedgerRow]
+    last_close: dict[str, float]
+    attempted_orders: int
+    base_positions: tuple[Position, ...]
+
+    @classmethod
+    def from_initial(cls, initial_portfolio: PortfolioSnapshot) -> _ScenarioState:
+        return cls(
+            account_snapshot_id=initial_portfolio.account_snapshot_id,
+            settled_cash=initial_portfolio.settled_cash,
+            unsettled_cash=initial_portfolio.unsettled_cash,
+            accrued_costs=0.0,
+            positions={
+                p.instrument.instrument_id: int(p.quantity)
+                for p in initial_portfolio.positions
+                if p.quantity > 0
+            },
+            settlements={},
+            pending_orders=[],
+            trades=[],
+            ledger=[],
+            last_close={},
+            attempted_orders=0,
+            base_positions=tuple(initial_portfolio.positions),
+        )
+
 
 class StockBacktester:
     """Replays the trading cycle over ordered sessions with explicit fills."""
@@ -212,6 +276,8 @@ class StockBacktester:
         cost_evidence: CostEvidence | None = None,
         adtv_window: int = 20,
         seed: int = 42,
+        decision_provider: ReplayDecisionProvider | None = None,
+        scenario_planner: ReplayScenarioPlanner | None = None,
     ):
         self.planner = planner
         self.registry = registry
@@ -222,7 +288,10 @@ class StockBacktester:
         self.cost_evidence = cost_evidence
         self.adtv_window = adtv_window
         self.seed = seed
+        self.decision_provider = decision_provider
+        self.scenario_planner = scenario_planner
         self._last_cycles: dict[int, TradingCycleResult] = {}
+        self.prepared_decision_count = 0
 
     def cycles_at(self, decision_session_indices: tuple[int, ...]) -> dict[int, TradingCycleResult]:
         """Return the pure planning results for replay decisions.
@@ -261,6 +330,11 @@ class StockBacktester:
                 strict=True,
             )
         )
+        if self.decision_provider is not None and self.scenario_planner is not None:
+            return self._run_paired(
+                panel, by_session, sessions, artifacts, initial_portfolio, request,
+                adtv=adtv,
+            )
         ledger, trades, attempted_orders = self._run_ledger(
             panel, by_session, sessions, artifacts, initial_portfolio, request,
             self.cost_schedule, self._liquidity_model(stress=False), adtv=adtv,
@@ -308,6 +382,213 @@ class StockBacktester:
             filled_orders=filled_orders,
             no_trade_reasons=no_trade_reasons,
         )
+
+    def _run_paired(
+        self,
+        panel: pl.DataFrame,
+        by_session: dict[datetime, pl.DataFrame],
+        sessions: list[datetime],
+        artifacts: ArtifactSchedule,
+        initial_portfolio: PortfolioSnapshot,
+        request: BacktestRequest,
+        *,
+        adtv: pl.DataFrame | None = None,
+    ) -> BacktestResult:
+        """Advance independent base/stress states with one decision preparation.
+
+        One chronological session loop advances separate base and stress
+        portfolio/settlement states. At each decision timestamp the replay
+        decision-input provider is asked exactly once for the immutable market
+        and planning inputs; the scenario planner then runs separately for the
+        base and stress portfolio snapshots. Execution stays fully
+        scenario-specific while the prepared history and calibration are shared.
+        """
+        if self.decision_provider is None or self.scenario_planner is None:
+            raise BacktestValidationError(
+                "paired replay requires a decision provider and scenario planner"
+            )
+        decision_set = {int(i) for i in request.decision_session_indices}
+        rows_frame = self._rows_frame_with_adtv(panel, adtv)
+        rows_by_key: dict[tuple[str, datetime], dict[str, object]] = {
+            (str(r["instrument_id"]), _as_datetime(r["session"])): r
+            for r in rows_frame.to_dicts()
+        }
+
+        base_state = _ScenarioState.from_initial(initial_portfolio)
+        stress_state = _ScenarioState.from_initial(initial_portfolio)
+        base_liquidity = self._liquidity_model(stress=False)
+        stress_liquidity = self._liquidity_model(stress=True)
+        base_schedule = self.cost_schedule
+        stress_schedule = self.stress_cost_schedule
+        self.prepared_decision_count = 0
+
+        for index, session in enumerate(sessions):
+            rows = by_session[session]
+            self._advance_scenario(
+                base_state, rows, rows_by_key, index, session, base_schedule,
+                base_liquidity,
+            )
+            if stress_schedule is not None:
+                self._advance_scenario(
+                    stress_state, rows, rows_by_key, index, session,
+                    stress_schedule, stress_liquidity,
+                )
+
+            if index in decision_set and index + 1 < len(sessions):
+                decision_time = self._decision_time(session, rows)
+                execution_time = sessions[index + 1]
+                artifact_id = artifacts.artifact_for(decision_time)
+                prepared = self.decision_provider(decision_time, execution_time)
+                self.prepared_decision_count += 1
+                base_cycle = self._plan_paired(
+                    prepared, base_state, decision_time, execution_time,
+                    artifact_id, request,
+                )
+                self._last_cycles[index] = base_cycle
+                base_state.pending_orders = self._plan_orders(
+                    base_cycle, rows_by_key, execution_time, base_state.positions,
+                    base_state.settled_cash, base_schedule,
+                )
+                base_state.attempted_orders += len(base_state.pending_orders)
+                if stress_schedule is not None:
+                    stress_cycle = self._plan_paired(
+                        prepared, stress_state, decision_time, execution_time,
+                        artifact_id, request,
+                    )
+                    self._last_cycles[index] = stress_cycle
+                    stress_state.pending_orders = self._plan_orders(
+                        stress_cycle, rows_by_key, execution_time,
+                        stress_state.positions, stress_state.settled_cash,
+                        stress_schedule,
+                    )
+                    stress_state.attempted_orders += len(stress_state.pending_orders)
+
+        ledger = base_state.ledger
+        trades = base_state.trades
+        final_value = ledger[-1].equity if ledger else initial_portfolio.settled_cash
+        metrics = self._metrics(ledger, trades)
+        stress_final_value: float | None = None
+        stress_metrics: dict[str, float] | None = None
+        if stress_schedule is not None:
+            stress_metrics = self._metrics(
+                stress_state.ledger, stress_state.trades
+            )
+            stress_final_value = (
+                stress_state.ledger[-1].equity if stress_state.ledger else None
+            )
+        planned_cycles = sum(
+            1
+            for index in sorted(self._last_cycles)
+            if self._last_cycles[index].status is CycleStatus.PLANNED
+        )
+        no_trade_reasons = tuple(
+            reason
+            for index in sorted(self._last_cycles)
+            if self._last_cycles[index].status is not CycleStatus.PLANNED
+            for reason in self._last_cycles[index].reasons
+        )
+        filled_orders = sum(1 for trade in trades if trade.quantity > 0)
+        return BacktestResult(
+            ledger=tuple(ledger),
+            trades=tuple(trades),
+            final_value=final_value,
+            total_return=(
+                (final_value - initial_portfolio.settled_cash)
+                / initial_portfolio.settled_cash
+                if initial_portfolio.settled_cash > 0
+                else 0.0
+            ),
+            metrics=metrics,
+            stress_final_value=stress_final_value,
+            stress_metrics=stress_metrics,
+            data_quality=self._data_quality_evidence(),
+            planned_cycles=planned_cycles,
+            attempted_orders=base_state.attempted_orders,
+            filled_orders=filled_orders,
+            no_trade_reasons=no_trade_reasons,
+        )
+
+    def _advance_scenario(
+        self,
+        state: _ScenarioState,
+        rows: pl.DataFrame,
+        rows_by_key: dict[tuple[str, datetime], dict[str, object]],
+        index: int,
+        session: datetime,
+        schedule: CostSchedule,
+        liquidity_model: LiquiditySlippageModel | None,
+    ) -> None:
+        """Advance one scenario's settlements, orders, and ledger for a session."""
+        due = state.settlements.pop(index, 0.0)
+        if due:
+            state.settled_cash += due
+            state.unsettled_cash -= due
+
+        new_pending: list[dict[str, object]] = []
+        for order in state.pending_orders:
+            state.settled_cash, state.unsettled_cash, state.accrued_costs = (
+                self._execute_order(
+                    order, rows, rows_by_key, state.positions, state.settled_cash,
+                    state.unsettled_cash, state.accrued_costs, state.settlements,
+                    schedule, liquidity_model, index, session, state.trades,
+                )
+            )
+        state.pending_orders = new_pending
+
+        for r in rows.to_dicts():
+            if r.get("close") is not None:
+                state.last_close[str(r["instrument_id"])] = _as_float(r["close"])
+        positions_value = sum(
+            state.positions[i] * state.last_close[i]
+            for i in state.positions
+            if i in state.last_close
+        )
+        equity = (
+            state.settled_cash
+            + state.unsettled_cash
+            + positions_value
+            - state.accrued_costs
+        )
+        state.ledger.append(
+            BacktestLedgerRow(
+                session=session,
+                settled_cash=state.settled_cash,
+                unsettled_cash=state.unsettled_cash,
+                positions_value=positions_value,
+                accrued_costs=state.accrued_costs,
+                equity=equity,
+            )
+        )
+
+    def _plan_paired(
+        self,
+        prepared: PreparedReplayDecision,
+        state: _ScenarioState,
+        decision_time: datetime,
+        execution_time: datetime,
+        artifact_id: str,
+        request: BacktestRequest,
+    ) -> TradingCycleResult:
+        """Run the scenario planner for one scenario against the prepared inputs."""
+        portfolio = PortfolioSnapshot(
+            account_snapshot_id=state.account_snapshot_id,
+            as_of=decision_time,
+            settled_cash=state.settled_cash,
+            unsettled_cash=state.unsettled_cash,
+            positions=self._snapshot_positions(state.positions, state.base_positions),
+            open_order_ids=(),
+        )
+        cycle_request = TradingCycleRequest(
+            strategy_id=request.strategy_id,
+            artifact_id=artifact_id,
+            dataset_id="backtest",
+            decision_time=decision_time,
+            execution_time=execution_time,
+            risk_policy=request.risk_policy,
+            mode="plan",
+        )
+        assert self.scenario_planner is not None
+        return self.scenario_planner(prepared, portfolio, cycle_request)
 
     def _data_quality_evidence(self) -> dict[str, str]:
         """Immutable data-quality lineage recorded with every replay result."""
