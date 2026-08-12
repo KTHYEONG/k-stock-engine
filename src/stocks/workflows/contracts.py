@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 
 from src.core.costs import CostSchedule
 
@@ -22,7 +23,10 @@ class TrainingRequest:
     ``n_folds`` and ``embargo_sessions`` are honored by the outer walk-forward;
     ``holdout_sessions`` is the forward-holdout block size (0 defers to the
     fixed 252-session contract). ``n_bootstrap`` bounds the moving-block
-    bootstrap resamples and ``seed`` fixes every stochastic step.
+    bootstrap resamples and ``seed`` fixes every stochastic step. ``resume``
+    and ``run_root`` select the durable, fingerprinted run store: a resumed run
+    validates the persisted identity and reuses only completed, hash-validated
+    units.
     """
 
     artifact_id: str
@@ -45,6 +49,8 @@ class TrainingRequest:
     calibration_bucket_count: int = 10
     min_calibration_sessions: int = 126
     candidate_horizons: tuple[int, ...] = (5, 10, 15)
+    resume: bool = False
+    run_root: Path | None = None
 
     def __post_init__(self) -> None:
         if self.n_folds < 1:
