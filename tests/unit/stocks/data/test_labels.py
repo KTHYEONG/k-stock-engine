@@ -2,12 +2,17 @@
 from __future__ import annotations
 
 import math
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import polars as pl
 import pytest
 
-from src.stocks.data.labels import LABEL_AVAILABLE_COLUMN, build_label_dataset
+from src.stocks.data.labels import (
+    LABEL_AVAILABLE_COLUMN,
+    build_label_dataset,
+    build_multi_horizon_residual_label_dataset,
+    label_available_time,
+)
 from src.stocks.data.quality import KRXSessionCalendar
 from src.stocks.research.labels import LabelDefinition
 
@@ -119,3 +124,154 @@ class TestCalendarAwareLabels:
         frame = base_panel([105.0, 110.0, 115.0, 120.0, 125.0]).drop("open")
         with pytest.raises(ValueError, match="price columns"):
             build_label_dataset(frame, CALENDAR, DEFINITION)
+
+def _weekday_calendar(n_sessions: int = 70) -> KRXSessionCalendar:
+    sessions: list[date] = []
+    cursor = date(2024, 1, 2)
+    while len(sessions) < n_sessions:
+        if cursor.weekday() < 5:
+            sessions.append(cursor)
+        cursor += timedelta(days=1)
+    return KRXSessionCalendar(
+        version="fixture-weekday-calendar",
+        sessions=tuple(sessions),
+        generated_time=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+
+def _wide_base_panel(calendar: KRXSessionCalendar, n_tickers: int = 24) -> pl.DataFrame:
+    rows: list[dict] = []
+    for t in range(n_tickers):
+        price = 100.0
+        for session in calendar.sessions:
+            price = max(10.0, price * 1.001)
+            rows.append(
+                {
+                    "instrument_id": f"KRX:{t + 1:06d}",
+                    "session": datetime.combine(session, datetime.min.time(), tzinfo=UTC),
+                    "open": price,
+                }
+            )
+    return pl.DataFrame(rows)
+
+
+class TestMultiHorizonResidualLabels:
+    def test_emits_key_aligned_ordered_multi_horizon_schema(self) -> None:
+        calendar = _weekday_calendar()
+        base = _wide_base_panel(calendar)
+        out = build_multi_horizon_residual_label_dataset(base, calendar)
+        assert out.columns == [
+            "instrument_id",
+            "session",
+            "residual_o2o_5d",
+            "relevance_5d",
+            "label_available_time_5d",
+            "residual_o2o_10d",
+            "relevance_10d",
+            "label_available_time_10d",
+            "residual_o2o_15d",
+            "relevance_15d",
+            "label_available_time_15d",
+        ]
+        assert not out.is_empty()
+        assert out["instrument_id"].n_unique() == 24
+        assert not out.select(
+            pl.any_horizontal(
+                pl.col(c).is_null() for c in out.columns if c != "instrument_id"
+            )
+        ).to_series().any()
+
+    def test_all_horizons_share_one_universe(self) -> None:
+        calendar = _weekday_calendar()
+        base = _wide_base_panel(calendar)
+        out = build_multi_horizon_residual_label_dataset(base, calendar)
+        keys = out.select("instrument_id", "session")
+        for column in ("residual_o2o_5d", "residual_o2o_10d", "residual_o2o_15d"):
+            assert out[column].is_not_null().all()
+            assert out[column].is_finite().all()
+
+    def test_each_horizon_has_independent_terminal_availability(self) -> None:
+        calendar = _weekday_calendar()
+        base = _wide_base_panel(calendar)
+        out = build_multi_horizon_residual_label_dataset(base, calendar)
+        ordered = out.sort(["instrument_id", "session"])
+        expected_gaps = {
+            "label_available_time_5d": 6,
+            "label_available_time_10d": 11,
+            "label_available_time_15d": 16,
+        }
+        for column, gap in expected_gaps.items():
+            decision = datetime(2024, 1, 3, tzinfo=UTC)
+            exit_session = calendar.sessions[1 + gap]
+            expected = label_available_time(exit_session)
+            row = ordered.filter(
+                pl.col("instrument_id") == "KRX:000001"
+            ).filter(pl.col("session") == decision)
+            actual = row[column][0]
+            assert actual == expected
+            assert actual > decision
+
+    def test_availability_monotonic_across_horizons(self) -> None:
+        calendar = _weekday_calendar()
+        base = _wide_base_panel(calendar)
+        out = build_multi_horizon_residual_label_dataset(base, calendar)
+        earlier = out["label_available_time_5d"]
+        later = out["label_available_time_10d"]
+        latest = out["label_available_time_15d"]
+        assert (later > earlier).all()
+        assert (latest > later).all()
+
+    def test_rejects_invalid_horizon_sets(self) -> None:
+        calendar = _weekday_calendar()
+        base = _wide_base_panel(calendar)
+        with pytest.raises(ValueError, match="non-empty"):
+            build_multi_horizon_residual_label_dataset(base, calendar, horizons=())
+        with pytest.raises(ValueError, match="ascending and unique"):
+            build_multi_horizon_residual_label_dataset(base, calendar, horizons=(5, 5))
+        with pytest.raises(ValueError, match="ascending and unique"):
+            build_multi_horizon_residual_label_dataset(base, calendar, horizons=(10, 5))
+        with pytest.raises(ValueError, match="unsupported"):
+            build_multi_horizon_residual_label_dataset(base, calendar, horizons=(7,))
+
+    def test_publisher_requires_ordered_schema_and_control_availability(self, tmp_path) -> None:
+        from src.stocks.data.labels import (
+            publish_multi_horizon_residual_label_dataset,
+        )
+        from src.storage.parquet_datasets import ParquetDatasetStore
+
+        calendar = _weekday_calendar()
+        base = _wide_base_panel(calendar)
+        labels = build_multi_horizon_residual_label_dataset(base, calendar)
+        result = publish_multi_horizon_residual_label_dataset(
+            labels,
+            destination_root=tmp_path / "labels",
+            dataset_id="multi_5_10_15d_v1",
+            base_panel_hash="base-hash",
+            calendar_hash="cal-hash",
+        )
+        assert result.row_count == labels.height
+        manifest = result.manifest
+        assert manifest.label_definition == "residual_o2o_multi_5_10_15d"
+        assert manifest.label_horizon_sessions == 5
+        store = ParquetDatasetStore(tmp_path / "labels")
+        assert store.content_columns(result.dataset_id) == labels.columns
+
+    def test_multi_horizon_uses_terminal_availability_not_decision_session(self) -> None:
+        calendar = _weekday_calendar()
+        base = _wide_base_panel(calendar)
+        out = build_multi_horizon_residual_label_dataset(base, calendar)
+        decision = datetime(2024, 1, 2, tzinfo=UTC)
+        row = out.filter(
+            (pl.col("session") == decision)
+            & (pl.col("instrument_id") == "KRX:000001")
+        )
+        assert row.height == 1
+        for column in (
+            "label_available_time_5d",
+            "label_available_time_10d",
+            "label_available_time_15d",
+        ):
+            available = row[column][0]
+            assert available > decision
+        assert row["label_available_time_5d"][0] < row["label_available_time_10d"][0]
+        assert row["label_available_time_10d"][0] < row["label_available_time_15d"][0]
