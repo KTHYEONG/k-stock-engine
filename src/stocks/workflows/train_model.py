@@ -19,7 +19,7 @@ import logging
 import math
 import time
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from hashlib import sha256
@@ -217,6 +217,69 @@ class _StableTrialContext:
     validation_frame: pl.DataFrame
     stable_scores: pl.DataFrame
     prepared: PreparedLambdaRankFold | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EconomicCandidateEvidence:
+    """Immutable per-candidate economic evidence for one shortlisted trial.
+
+    All fields are frozen selection inputs or full-refit/replay diagnostics so
+    the exact failed predicate for every shortlisted trial stays recoverable
+    from the published artifact.
+    """
+
+    trial_number: int
+    screen_rank_ic: float
+    fold_rank_ic: list[float]
+    median_rank_ic: float
+    attempted_orders: int
+    filled_orders: int
+    planned_cycles: int
+    no_trade_reason_counts: dict[str, int]
+    replay_finite: bool
+    bootstrap_lower_bound: float
+    strategy_ir: float
+    max_drawdown: float
+    turnover: float
+    failure_reasons: tuple[str, ...]
+    eligible: bool
+
+    def to_json_safe(self) -> dict[str, object]:
+        """JSON-serializable evidence row with deterministic failure reasons."""
+        return {
+            "trial_number": int(self.trial_number),
+            "screen_rank_ic": round(self.screen_rank_ic, 8),
+            "fold_rank_ic": [round(value, 8) for value in self.fold_rank_ic],
+            "median_rank_ic": round(self.median_rank_ic, 8),
+            "attempted_orders": int(self.attempted_orders),
+            "filled_orders": int(self.filled_orders),
+            "planned_cycles": int(self.planned_cycles),
+            "no_trade_reason_counts": dict(sorted(self.no_trade_reason_counts.items())),
+            "replay_finite": bool(self.replay_finite),
+            "bootstrap_lower_bound": round(self.bootstrap_lower_bound, 8),
+            "strategy_ir": round(self.strategy_ir, 8),
+            "max_drawdown": round(self.max_drawdown, 8),
+            "turnover": round(self.turnover, 8),
+            "failure_reasons": list(self.failure_reasons),
+            "eligible": bool(self.eligible),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayStaticContext:
+    """Immutable point-in-time market inputs shared across economic candidates.
+
+    The market panel, instrument map, and risk policy do not depend on any
+    candidate's scores, so they are built once per selection panel and reused
+    by every shortlist replay; only ``pred_score`` is candidate-specific and
+    joined per replay. ``cache_bytes`` is the estimated resident size of the
+    cached market inputs and participates in every resource-guard admit.
+    """
+
+    market_panel: pl.DataFrame
+    instruments: Mapping[str, Instrument]
+    policy: StockRiskPolicy
+    cache_bytes: int
 
 
 def train_model(
@@ -747,6 +810,11 @@ def _score_context_model(
     return float(ic), scored
 
 
+def _frame_bytes(frame: pl.DataFrame) -> int:
+    """Estimated resident bytes of an immutable replay market input."""
+    return int(frame.estimated_size())
+
+
 def _fold_cache_bytes(prepared: PreparedLambdaRankFold | None) -> int:
     """Byte size of the immutable per-fold matrices held in the search cache."""
     if prepared is None:
@@ -853,12 +921,18 @@ def _fit_and_score_candidate(
     config: LambdaRankConfig,
     guard: TrialResourceGuard,
     candidate_key: str,
-) -> tuple[list[float], pl.DataFrame] | None:
+    *,
+    static_cache_bytes: int = 0,
+) -> tuple[list[float], pl.DataFrame | None] | None:
     """Full-budget refit of one shortlisted candidate over every inner fold.
 
-    Returns ``(fold_rank_ic, concatenated validation scores)`` or ``None``
-    when any fold fails closed. Per-fold models, prediction frames, and
-    LightGBM datasets are released before the next fold.
+    Returns ``(fold_rank_ic, concatenated validation scores)``, or
+    ``(fold_rank_ic, None)`` when the first non-positive full-refit Rank-IC
+    rejects the candidate early, or ``None`` when any fold fails closed. The
+    early stop is equivalence-preserving: eligibility already requires every
+    full-refit IC to be strictly positive, so the skipped later folds and
+    replay cannot make that candidate eligible. Per-fold models, prediction
+    frames, and LightGBM datasets are released before the next fold.
     """
     del tuning_panel, feature_columns
     fold_rank_ic: list[float] = []
@@ -867,7 +941,10 @@ def _fit_and_score_candidate(
         key = f"refit_{candidate_key}_fold_{fold_index}"
         guard.admit(
             context.train_processed.height,
-            extra_bytes=_fold_cache_bytes(getattr(context, "prepared", None)),
+            extra_bytes=(
+                _fold_cache_bytes(getattr(context, "prepared", None))
+                + static_cache_bytes
+            ),
         )
         started = time.perf_counter()
         try:
@@ -885,8 +962,110 @@ def _fit_and_score_candidate(
             )
             guard.check_after()
         fold_rank_ic.append(ic)
+        if ic <= 0.0:
+            logger.info(
+                "[EVAL] %s stage=early_rejected fold_rank_ic=%.6f",
+                candidate_key,
+                ic,
+            )
+            return fold_rank_ic, None
         scored_frames.append(scored)
     return fold_rank_ic, pl.concat(scored_frames)
+
+
+def _prepare_replay_static_context(
+    panel: pl.DataFrame,
+    request: TrainingRequest,
+) -> ReplayStaticContext:
+    """Build the candidate-invariant replay inputs once per selection panel.
+
+    The market frame (carrying the immutable point-in-time market columns),
+    instrument map, and risk policy are shared by every shortlisted candidate.
+    Raises ``ValueError`` for a missing required replay column or a non-finite
+    cached market input.
+    """
+    from src.stocks.backtesting.engine import REQUIRED_BACKTEST_COLUMNS
+
+    frame = panel.drop("session_index")
+    missing = [c for c in REQUIRED_BACKTEST_COLUMNS if c not in frame.columns]
+    if missing:
+        raise ValueError(f"replay panel must carry {', '.join(missing)}")
+    _reject_non_finite_economic_inputs(frame)
+    frame = frame.sort("session").with_columns(
+        pl.col("trading_value")
+        .rolling_mean(20, min_samples=1)
+        .over("instrument_id")
+        .alias("adtv")
+    )
+    instruments = _instruments_from_frame(frame)
+    policy = StockRiskPolicy(
+        top_k=request.top_k,
+        gross_cap=request.max_exposure,
+        single_name_cap=request.max_single_weight,
+        participation_limit=request.participation_limit,
+    )
+    return ReplayStaticContext(
+        market_panel=frame,
+        instruments=instruments,
+        policy=policy,
+        cache_bytes=_frame_bytes(frame),
+    )
+
+
+_ECONOMIC_FAILURE_CODES = (
+    "non_positive_fold_rank_ic",
+    "no_attempted_orders",
+    "no_filled_orders",
+    "non_finite_replay",
+    "non_positive_bootstrap_lower_bound",
+)
+
+
+def _evaluate_economic_candidate(
+    fold_rank_ic: list[float],
+    replay: ReplayResult,
+    request: TrainingRequest,
+    trial_number: int,
+    screen_rank_ic: float,
+) -> EconomicCandidateEvidence:
+    """Evaluate every economic predicate and emit immutable candidate evidence.
+
+    All five predicates are evaluated without early return so the exact failed
+    reason codes stay recoverable for every shortlisted trial. ``eligible``
+    matches the existing fail-closed ``_economically_eligible`` rule exactly.
+    """
+    failures: list[str] = []
+    if not fold_rank_ic or not all(ic > 0.0 for ic in fold_rank_ic):
+        failures.append("non_positive_fold_rank_ic")
+    if replay.attempted_orders <= 0:
+        failures.append("no_attempted_orders")
+    if replay.filled_orders <= 0:
+        failures.append("no_filled_orders")
+    replay_finite = _replay_is_finite(replay)
+    if not replay_finite:
+        failures.append("non_finite_replay")
+    bootstrap_lower_bound = _inner_bootstrap_lower_bound(replay, request)
+    if bootstrap_lower_bound <= 0.0:
+        failures.append("non_positive_bootstrap_lower_bound")
+    return EconomicCandidateEvidence(
+        trial_number=trial_number,
+        screen_rank_ic=screen_rank_ic,
+        fold_rank_ic=list(fold_rank_ic),
+        median_rank_ic=float(np.median(fold_rank_ic)) if fold_rank_ic else 0.0,
+        attempted_orders=replay.attempted_orders,
+        filled_orders=replay.filled_orders,
+        planned_cycles=replay.planned_cycles,
+        no_trade_reason_counts=dict(replay.no_trade_reason_counts),
+        replay_finite=replay_finite,
+        bootstrap_lower_bound=bootstrap_lower_bound,
+        strategy_ir=_information_ratio(replay.strategy_returns),
+        max_drawdown=float(replay.metrics.get("max_drawdown", 1.0)),
+        turnover=float(replay.metrics.get("turnover", 0.0)),
+        failure_reasons=tuple(
+            code for code in _ECONOMIC_FAILURE_CODES if code in failures
+        ),
+        eligible=not failures,
+    )
 
 
 def _economically_eligible(
@@ -957,63 +1136,85 @@ def _select_economic_champion(
     """Replay each shortlisted candidate and pick the top economic evidence.
 
     Every candidate is fully refit over all inner folds and replayed through
-    the exact event ledger with the outer base/stress schedules. Eligible
-    candidates sort descending by ``(bootstrap lower bound, strategy IR,
-    -max drawdown, -turnover, median Rank-IC, -trial number)``; a tie is won
-    by the lower trial number. Returns ``(config, selection telemetry)`` or
-    ``(None, None)`` when no shortlisted candidate is eligible.
+    the exact event ledger with the outer base/stress schedules. A candidate is
+    skipped after its first non-positive full-refit Rank-IC (later folds and
+    replay cannot make it eligible). Eligible candidates sort descending by
+    ``(bootstrap lower bound, strategy IR, -max drawdown, -turnover, median
+    Rank-IC, -trial number)``; a tie is won by the lower trial number. Returns
+    ``(config, selection telemetry)`` or ``(None, None)`` when no shortlisted
+    candidate is eligible.
     """
     if not shortlist:
         return None, None
+    replay_context = _prepare_replay_static_context(tuning_panel, request)
     refit_started = time.perf_counter()
     candidate_rows: list[tuple[tuple[float, ...], int]] = []
     evidence_by_trial: dict[int, dict[str, float]] = {}
+    shortlist_evidence: list[dict[str, object]] = []
+    early_rejected_seconds: list[float] = []
     replay_seconds = 0.0
     for _screen_ic, trial_number in shortlist:
         frozen = study.trials[trial_number]
         config = _config_from_params(dict(frozen.params))
+        refit_started_trial = time.perf_counter()
         refit = _fit_and_score_candidate(
             tuning_panel, tuning_folds, contexts, request, base_manifest,
             feature_columns, label_column, relevance_column, config, guard,
             f"trial{trial_number}",
+            static_cache_bytes=replay_context.cache_bytes,
         )
         if refit is None:
             logger.info("[EVAL] trial=%s stage=refit_failed", trial_number)
             continue
         fold_rank_ic, oos = refit
+        if oos is None:
+            early_rejected_seconds.append(time.perf_counter() - refit_started_trial)
+            logger.info("[EVAL] trial=%s stage=early_rejected", trial_number)
+            continue
         replay_started = time.perf_counter()
         replay = _event_ledger_evaluation(
             tuning_panel, oos, request, dataset_manifest, registry, base_schedule,
-            stress_schedule,
+            stress_schedule, replay_context=replay_context,
         )
         replay_seconds += time.perf_counter() - replay_started
-        if not _economically_eligible(fold_rank_ic, replay, request):
-            logger.info("[EVAL] trial=%s stage=economically_ineligible", trial_number)
+        evidence = _evaluate_economic_candidate(
+            fold_rank_ic, replay, request, trial_number, _screen_ic,
+        )
+        shortlist_evidence.append(evidence.to_json_safe())
+        logger.info(
+            "[EVAL] trial=%s stage=evidence eligible=%s failure_reasons=%s",
+            trial_number,
+            evidence.eligible,
+            list(evidence.failure_reasons),
+        )
+        if not evidence.eligible:
             continue
-        bootstrap_lb = _inner_bootstrap_lower_bound(replay, request)
-        strategy_ir = _information_ratio(replay.strategy_returns)
-        max_dd = float(replay.metrics.get("max_drawdown", 1.0))
-        turnover = float(replay.metrics.get("turnover", 0.0))
-        median_ic = float(np.median(fold_rank_ic))
         candidate_rows.append(
             (
-                (bootstrap_lb, strategy_ir, -max_dd, -turnover, median_ic, -trial_number),
+                (
+                    evidence.bootstrap_lower_bound,
+                    evidence.strategy_ir,
+                    -evidence.max_drawdown,
+                    -evidence.turnover,
+                    evidence.median_rank_ic,
+                    -trial_number,
+                ),
                 trial_number,
             )
         )
         evidence_by_trial[trial_number] = {
-            "bootstrap_lower_bound": bootstrap_lb,
-            "strategy_ir": strategy_ir,
-            "max_drawdown": max_dd,
-            "turnover": turnover,
-            "median_rank_ic": median_ic,
+            "bootstrap_lower_bound": evidence.bootstrap_lower_bound,
+            "strategy_ir": evidence.strategy_ir,
+            "max_drawdown": evidence.max_drawdown,
+            "turnover": evidence.turnover,
+            "median_rank_ic": evidence.median_rank_ic,
         }
         logger.info(
             "[EVAL] trial=%s stage=economically_eligible "
             "bootstrap_lower_bound=%.8f strategy_ir=%.6f",
             trial_number,
-            bootstrap_lb,
-            strategy_ir,
+            evidence.bootstrap_lower_bound,
+            evidence.strategy_ir,
         )
     refit_seconds = time.perf_counter() - refit_started
     logger.info(
@@ -1021,11 +1222,19 @@ def _select_economic_champion(
         refit_seconds * 1000.0,
         TrialResourceGuard._rss_mib(),
     )
+    selection_tail = {
+        "early_rejected_full_refits": len(early_rejected_seconds),
+        "early_rejected_full_refit_seconds": round(
+            float(sum(early_rejected_seconds)), 3
+        ),
+        "shortlist_candidate_evidence": shortlist_evidence,
+    }
     if not candidate_rows:
         return None, {
             "economically_eligible_trials": 0,
             "full_refit_seconds": refit_seconds,
             "economic_replay_seconds": replay_seconds,
+            **selection_tail,
         }
     candidate_rows.sort(key=lambda row: row[0], reverse=True)
     _winner_key, winner_number = candidate_rows[0]
@@ -1039,6 +1248,7 @@ def _select_economic_champion(
             f"selected_inner_{name}": value
             for name, value in evidence_by_trial[winner_number].items()
         },
+        **selection_tail,
     }
 
 
@@ -1125,12 +1335,19 @@ def _event_ledger_evaluation(
     registry: ModelArtifactRegistry,
     base_schedule: CostSchedule,
     stress_schedule: CostSchedule,
+    *,
+    replay_context: ReplayStaticContext | None = None,
 ) -> ReplayResult:
     """Replay the out-of-sample scored panel through the event-driven backtester.
 
     A scored planner constructs constrained target allocations directly from the
     frozen fold predictions, so promotion metrics come from the same event
     ledger used by paper/live paths without needing a pre-published artifact.
+    When ``replay_context`` is supplied its cached market panel, risk policy,
+    and instruments are reused instead of being rebuilt; only ``pred_score``
+    is joined per replay. The replay-window causal 20-session ADTV is computed
+    once and passed to the backtester so the base and stress execution ledgers
+    reuse the same validated column instead of recomputing it twice.
     """
     from src.core.portfolio import PortfolioSnapshot
     from src.stocks.backtesting.engine import (
@@ -1147,31 +1364,16 @@ def _event_ledger_evaluation(
         _build_intents,
     )
 
-    frame = panel.drop("session_index")
-    adtv_lookup = (
-        frame.sort("session")
-        .with_columns(
-            pl.col("trading_value")
-            .rolling_mean(20, min_samples=1)
-            .over("instrument_id")
-            .alias("adtv")
-        )
-        .select("instrument_id", "session", "adtv")
-    )
-    scored_for_replay = (
-        frame.join(
-            oos_scored.select("instrument_id", "session", "pred_score"),
-            on=["instrument_id", "session"],
-            how="left",
-        ).join(adtv_lookup, on=["instrument_id", "session"], how="left")
-    )
-    instruments = _instruments_from_frame(frame)
+    if replay_context is None:
+        replay_context = _prepare_replay_static_context(panel, request)
+    frame = replay_context.market_panel
+    instruments = replay_context.instruments
+    policy = replay_context.policy
 
-    policy = StockRiskPolicy(
-        top_k=request.top_k,
-        gross_cap=request.max_exposure,
-        single_name_cap=request.max_single_weight,
-        participation_limit=request.participation_limit,
+    scored_for_replay = frame.join(
+        oos_scored.select("instrument_id", "session", "pred_score"),
+        on=["instrument_id", "session"],
+        how="left",
     )
 
     scored_sessions = sorted(
@@ -1181,6 +1383,16 @@ def _event_ledger_evaluation(
         raise ValueError("scored OOS panel exposes no scored session")
     replay_frame = frame.filter(pl.col("session") >= scored_sessions[0])
     sessions = sorted(replay_frame["session"].unique().to_list())
+    replay_adtv = (
+        replay_frame.sort("session")
+        .with_columns(
+            pl.col("trading_value")
+            .rolling_mean(20, min_samples=1)
+            .over("instrument_id")
+            .alias("adtv")
+        )
+        .select("instrument_id", "session", "adtv")
+    )
 
     def _scored_no_trade(
         portfolio: PortfolioSnapshot,
@@ -1284,7 +1496,10 @@ def _event_ledger_evaluation(
         cost_evidence=evidence,
         seed=request.seed,
     )
-    result = backtester.run(replay_frame, artifacts, initial_portfolio, backtest_request)
+    result = backtester.run(
+        replay_frame, artifacts, initial_portfolio, backtest_request,
+        adtv=replay_adtv,
+    )
     benchmark = _benchmark_return_series(replay_frame)
     strategy_returns = _strategy_return_series(list(result.ledger))
     excess = _aligned_excess(strategy_returns, benchmark)

@@ -239,6 +239,8 @@ class StockBacktester:
         artifacts: ArtifactSchedule,
         initial_portfolio: PortfolioSnapshot,
         request: BacktestRequest,
+        *,
+        adtv: pl.DataFrame | None = None,
     ) -> BacktestResult:
         missing = [c for c in REQUIRED_BACKTEST_COLUMNS if c not in panel.columns]
         if missing:
@@ -261,7 +263,7 @@ class StockBacktester:
         )
         ledger, trades, attempted_orders = self._run_ledger(
             panel, by_session, sessions, artifacts, initial_portfolio, request,
-            self.cost_schedule, self._liquidity_model(stress=False),
+            self.cost_schedule, self._liquidity_model(stress=False), adtv=adtv,
         )
         final_value = ledger[-1].equity if ledger else initial_portfolio.settled_cash
         metrics = self._metrics(ledger, trades)
@@ -271,6 +273,7 @@ class StockBacktester:
             stress_ledger, _stress_trades, _ = self._run_ledger(
                 panel, by_session, sessions, artifacts, initial_portfolio, request,
                 self.stress_cost_schedule, self._liquidity_model(stress=True),
+                adtv=adtv,
             )
             stress_metrics = self._metrics(stress_ledger, _stress_trades)
             stress_final_value = stress_ledger[-1].equity if stress_ledger else None
@@ -374,17 +377,14 @@ class StockBacktester:
         request: BacktestRequest,
         schedule: CostSchedule,
         liquidity_model: LiquiditySlippageModel | None,
+        *,
+        adtv: pl.DataFrame | None = None,
     ) -> tuple[list[BacktestLedgerRow], list[BacktestTrade], int]:
         decision_set = {int(i) for i in request.decision_session_indices}
-        adtv = panel.sort("session").with_columns(
-            pl.col("trading_value")
-            .rolling_mean(self.adtv_window, min_samples=1)
-            .over("instrument_id")
-            .alias("adtv")
-        )
+        rows_frame = self._rows_frame_with_adtv(panel, adtv)
         rows_by_key: dict[tuple[str, datetime], dict[str, object]] = {
             (str(r["instrument_id"]), _as_datetime(r["session"])): r
-            for r in adtv.to_dicts()
+            for r in rows_frame.to_dicts()
         }
 
         settled_cash = initial_portfolio.settled_cash
@@ -459,6 +459,44 @@ class StockBacktester:
                 )
                 attempted_orders += len(pending_orders)
         return ledger, trades, attempted_orders
+
+    def _rows_frame_with_adtv(
+        self,
+        panel: pl.DataFrame,
+        adtv: pl.DataFrame | None,
+    ) -> pl.DataFrame:
+        """Build the execution row frame, reusing a validated supplied ADTV.
+
+        When ``adtv`` is supplied it replaces any existing ``adtv`` column
+        rather than recomputing the same causal rolling mean; otherwise the
+        current calculation is preserved. A missing key column, a non-finite
+        cached ADTV value, or a supplied ADTV that does not cover every replay
+        row raises ``ValueError``.
+        """
+        if adtv is None:
+            return panel.sort("session").with_columns(
+                pl.col("trading_value")
+                .rolling_mean(self.adtv_window, min_samples=1)
+                .over("instrument_id")
+                .alias("adtv")
+            )
+        missing = [c for c in ("instrument_id", "session", "adtv") if c not in adtv.columns]
+        if missing:
+            raise ValueError(f"supplied ADTV lookup must carry {', '.join(missing)}")
+        non_finite = adtv.filter(
+            pl.col("adtv").is_not_null() & ~pl.col("adtv").is_finite()
+        )
+        if not non_finite.is_empty():
+            raise ValueError("non-finite cached ADTV input in replay rows")
+        rows = panel.drop("adtv", strict=False).join(
+            adtv, on=["instrument_id", "session"], how="left",
+        )
+        uncovered = rows.filter(pl.col("adtv").is_null())
+        if not uncovered.is_empty():
+            raise ValueError(
+                f"supplied ADTV lookup does not cover {uncovered.height} replay rows"
+            )
+        return rows
 
     def _snapshot_positions(
         self,
