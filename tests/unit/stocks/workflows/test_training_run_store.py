@@ -76,6 +76,20 @@ def test_identity_mismatch_raises_value_error(tmp_path) -> None:
         _resolve(run_root, changed)
 
 
+def test_non_resume_with_existing_identity_fails_actionably(tmp_path) -> None:
+    run_root = tmp_path / "durable_run"
+    _resolve(run_root)
+    with pytest.raises(ValueError, match="pass --resume"):
+        _resolve(run_root, _request(run_root))
+
+
+def test_resume_reuses_matching_identity(tmp_path) -> None:
+    run_root = tmp_path / "durable_run"
+    _resolve(run_root)
+    resumed = _resolve(run_root, _request(run_root, resume=True))
+    assert resumed.resume is True
+
+
 def test_resolve_returns_none_without_run_root() -> None:
     request = TrainingRequest(artifact_id="plain", n_folds=3)
     assert (

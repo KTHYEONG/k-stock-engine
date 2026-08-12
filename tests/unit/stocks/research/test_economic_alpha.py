@@ -209,7 +209,7 @@ def test_prepared_decision_equals_reference_transform_and_isolates_labels() -> N
         observations, decision, default_base_schedule(),
         max_bootstrap_workspace_bytes=cap,
     )
-    prepared_out = cal.apply_prepared(prepared, scored)
+    prepared_out = CausalAlphaCalibrator.apply_prepared(prepared, scored)
     reference = cal.transform(scored, observations, decision, default_base_schedule())
 
     assert prepared["history_sessions"] == cal.history_sessions
@@ -227,7 +227,7 @@ def test_prepared_decision_equals_reference_transform_and_isolates_labels() -> N
         future_flipped, decision, default_base_schedule(),
         max_bootstrap_workspace_bytes=cap,
     )
-    flipped_out = cal.apply_prepared(flipped_prepared, scored)
+    flipped_out = CausalAlphaCalibrator.apply_prepared(flipped_prepared, scored)
     assert flipped_out.select(
         ALPHA_COLUMN, LOWER_BOUND_COLUMN
     ).to_dicts() == prepared_out.select(ALPHA_COLUMN, LOWER_BOUND_COLUMN).to_dicts()
@@ -294,7 +294,7 @@ def test_prepared_decision_fails_closed_on_insufficient_history() -> None:
     prepared = cal.prepare_decision(observations, decision, default_base_schedule())
     assert prepared["history_sessions"] < 10
     assert prepared["buckets"] == []
-    out = cal.apply_prepared(prepared, _scored())
+    out = CausalAlphaCalibrator.apply_prepared(prepared, _scored())
     assert out[ALPHA_COLUMN].null_count() == out.height
     assert out[LOWER_BOUND_COLUMN].null_count() == out.height
 
