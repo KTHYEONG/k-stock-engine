@@ -278,6 +278,113 @@ def test_trial_callbacks_propagate_trial_pruned() -> None:
         )
 
 
+def test_resolve_lgb_num_threads_contract() -> None:
+    from src.stocks.research.lambdarank import resolve_lgb_num_threads
+
+    assert resolve_lgb_num_threads(None, physical_cores=4, logical_cores=8) == 4
+    assert resolve_lgb_num_threads(None, physical_cores=4, logical_cores=4) == 4
+    assert resolve_lgb_num_threads(None, physical_cores=1, logical_cores=8) == 1
+    assert resolve_lgb_num_threads(2, physical_cores=4, logical_cores=8) == 2
+    assert resolve_lgb_num_threads(8, physical_cores=4, logical_cores=8) == 8
+    with pytest.raises(ValueError, match="positive"):
+        resolve_lgb_num_threads(0, physical_cores=4, logical_cores=8)
+    with pytest.raises(ValueError, match="positive"):
+        resolve_lgb_num_threads(-2, physical_cores=4, logical_cores=8)
+    with pytest.raises(ValueError, match="logical CPU"):
+        resolve_lgb_num_threads(9, physical_cores=4, logical_cores=8)
+    with pytest.raises(ValueError, match="physical_cores"):
+        resolve_lgb_num_threads(None, physical_cores=0, logical_cores=8)
+
+
+def test_prepared_scoring_matches_reference_and_threads_are_bit_identical() -> None:
+    from src.stocks.research.lambdarank import (
+        LambdaRankBlendModel,
+        LambdaRankConfig,
+    )
+
+    df = build_panel(n_sessions=80, n_tickers=40)
+    feature_columns = v2_feature_columns(df)
+    train = df.filter(pl.col("session_index") < 60)
+    val = df.filter(pl.col("session_index") >= 60)
+    quantiles = fit_v2_winsor_quantiles(train, feature_columns)
+    train_t = apply_v2_transforms(train, feature_columns, winsor_quantiles=quantiles)
+    val_t = apply_v2_transforms(val, feature_columns, winsor_quantiles=quantiles)
+    predict_input = val_t.drop([RESIDUAL_O2O_LABEL, RELEVANCE_COLUMN, "label_available_time"])
+    config = LambdaRankConfig(
+        learning_rate=0.05, num_leaves=15, min_child_samples=500,
+        n_estimators=400, early_stopping_rounds=30,
+    )
+
+    stable = StableRankComposite(
+        factors=stock_alpha_v2_allowlist(),
+        manifest=make_manifest(),
+        label_column=RESIDUAL_O2O_LABEL,
+        block_length=5,
+        session_column="session",
+    )
+    stable.fit(train_t, val_t)
+    stable_scores = stable.predict(predict_input).select("session", "instrument_id", "pred_score")
+
+    def _fit(num_threads: int) -> tuple[LambdaRankBlendModel, pl.DataFrame]:
+        fold_config = LambdaRankConfig(
+            learning_rate=0.05, num_leaves=15, min_child_samples=500,
+            n_estimators=400, early_stopping_rounds=30, num_threads=num_threads,
+        )
+        prepared = LambdaRankBlendModel(
+            make_manifest("prepared_parity"),
+            stock_alpha_v2_allowlist(),
+            RESIDUAL_O2O_LABEL,
+            config=fold_config,
+            session_column="session",
+            relevance_column=RELEVANCE_COLUMN,
+        ).prepare_fold(train_t, val_t)
+        assert prepared is not None
+        model = LambdaRankBlendModel(
+            make_manifest("prepared_parity"),
+            stock_alpha_v2_allowlist(),
+            RESIDUAL_O2O_LABEL,
+            config=fold_config,
+            session_column="session",
+            relevance_column=RELEVANCE_COLUMN,
+        )
+        outcome = model.fit_trial_prepared(prepared, stable_scores)
+        assert outcome.fit_ok is True
+        val_used = (
+            val_t.filter(pl.col(RELEVANCE_COLUMN).is_not_null())
+            .sort("session")
+            .select("session", "instrument_id")
+        )
+        assert val_used.height == prepared.validation_matrix.shape[0]
+        slim = model.predict_prepared_scores(prepared, val_used, stable_scores)
+        assert list(slim.columns) == ["session", "instrument_id", "pred_score"]
+        return model, slim
+
+    single, single_scored = _fit(1)
+    four, four_scored = _fit(4)
+    assert single._booster is not None
+    assert four._booster is not None
+    assert (
+        single._booster.num_trees() == four._booster.num_trees()
+    )
+    assert (single_scored["pred_score"].to_numpy() == four_scored["pred_score"].to_numpy()).all()
+    assert single_scored.equals(four_scored)
+
+    reference = LambdaRankBlendModel(
+        make_manifest("prepared_parity_ref"),
+        stock_alpha_v2_allowlist(),
+        RESIDUAL_O2O_LABEL,
+        config=config,
+        session_column="session",
+        relevance_column=RELEVANCE_COLUMN,
+    )
+    reference.fit(train_t, val_t)
+    reference_scored = reference.predict(predict_input).select(
+        "session", "instrument_id", "pred_score"
+    )
+    joined = reference_scored.join(single_scored, on=["session", "instrument_id"], suffix="_prepared")
+    assert (joined["pred_score"].to_numpy() - joined["pred_score_prepared"].to_numpy()).max() < 1e-12
+
+
 def test_adaptive_continuation_parity_with_one_shot() -> None:
     from src.stocks.research.lambdarank import (
         FitTrialOutcome,
