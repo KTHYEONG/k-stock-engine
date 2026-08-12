@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_RAM_PEAK_PIPELINE_OPTIMIZATION",
+      "date": "2026-08-12",
+      "adr_id": "ADR_20260812_RAM_PEAK_PIPELINE_OPTIMIZATION",
+      "domain": "stocks",
+      "title": "RAM-safe calibration replay",
+      "why": "Economic replay exceeded the RSS guard during decision preparation because all bootstrap workspace draws were admitted at once.",
+      "resolution": "Added deterministic batched bootstrap workspace sizing and replay admission telemetry while preserving causal calibration, bootstrap count, and fail-closed capacity behavior.",
+      "impact": "Prevents replay capacity failure under the recorded 8 GiB budget and bounds calibration peak memory; promotion semantics remain unchanged."
+    },
+    {
       "task_id": "TASK_ECONOMIC_REPLAY_RESOURCE_GUARD_RUN",
       "date": "2026-08-12",
       "adr_id": "ADR_20260812_ECONOMIC_REPLAY_RESOURCE_GUARD_RUN",
