@@ -713,6 +713,177 @@ def test_calibrated_replay_and_plain_replay_share_no_leaked_targets(tmp_path) ->
     assert a.trades == b.trades
 
 
+def test_inner_selection_replay_is_base_only_and_matches_final_base_evidence(
+    tmp_path,
+) -> None:
+    """INNER_SELECTION_BASE_ONLY skips the stress ledger without changing base."""
+    import src.stocks.workflows.train_model as tm
+
+    df = stock_v2_composed_df(n_sessions=70, n_tickers=8)
+    manifest = stock_v2_manifest(columns=df.columns)
+    snapshot = DatasetSnapshot(manifest=manifest, frame=df)
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    panel = _index_sessions(df)
+    last_30 = df["session"].unique().sort(descending=True).head(30)
+    oos_scored = df.filter(pl.col("session").is_in(last_30)).with_columns(
+        pl.col("market_cap").rank("dense").over("session").cast(pl.Float64).alias("pred_score")
+    )
+    request = TrainingRequest(
+        artifact_id="base_only",
+        n_folds=3,
+        calibration_bucket_count=4,
+        min_calibration_sessions=5,
+    )
+    ledger = tm._build_calibration_ledger(oos_scored, panel, "residual_o2o_5d")
+    guard = tm.ReplayResourceGuard(
+        request, replay_mode=tm.ReplayMode.INNER_SELECTION_BASE_ONLY
+    )
+    context = tm._prepare_replay_static_context(panel, request, guard=guard)
+    base_only = tm._event_ledger_evaluation(
+        panel,
+        oos_scored,
+        request,
+        snapshot.manifest,
+        registry,
+        default_base_schedule(),
+        default_stress_schedule(),
+        replay_context=context,
+        calibration_ledger=ledger,
+        replay_mode=tm.ReplayMode.INNER_SELECTION_BASE_ONLY,
+        replay_guard=guard,
+    )
+    assert base_only.stress_total_return is None
+    assert base_only.stress_metrics is None
+    assert base_only.replay_mode == "INNER_SELECTION_BASE_ONLY"
+
+    final_guard = tm.ReplayResourceGuard(
+        request, replay_mode=tm.ReplayMode.FINAL_PROMOTION_BASE_AND_STRESS
+    )
+    final_context = tm._prepare_replay_static_context(panel, request, guard=final_guard)
+    final = tm._event_ledger_evaluation(
+        panel,
+        oos_scored,
+        request,
+        snapshot.manifest,
+        registry,
+        default_base_schedule(),
+        default_stress_schedule(),
+        replay_context=final_context,
+        calibration_ledger=ledger,
+        replay_mode=tm.ReplayMode.FINAL_PROMOTION_BASE_AND_STRESS,
+        replay_guard=final_guard,
+    )
+    assert final.stress_total_return is not None
+    assert base_only.base_total_return == final.base_total_return
+    assert base_only.metrics == final.metrics
+    assert base_only.ledger == final.ledger
+    assert base_only.trades == final.trades
+    assert base_only.attempted_orders == final.attempted_orders
+    assert base_only.filled_orders == final.filled_orders
+    assert base_only.planned_cycles == final.planned_cycles
+    assert base_only.calibration_evidence == final.calibration_evidence
+
+
+def test_compact_replay_market_index_excludes_feature_and_label_columns() -> None:
+    import src.stocks.workflows.train_model as tm
+
+    df = stock_v2_composed_df(n_sessions=40, n_tickers=6)
+    df = df.with_columns(
+        pl.col("residual_o2o_5d").alias("residual_o2o_10d"),
+        pl.col("relevance").alias("relevance_10d"),
+        (pl.col("label_available_time") + pl.duration(days=5)).alias(
+            "label_available_time_10d"
+        ),
+    )
+    panel = _index_sessions(df)
+    context = tm._prepare_replay_static_context(
+        panel, TrainingRequest(artifact_id="compact_scope", n_folds=3)
+    )
+    columns = set(context.market_index.columns)
+    assert {"instrument_id", "session", "available_time", "open", "close"} <= columns
+    assert not any(
+        c.startswith("feature__") and c != "feature__volatility_20d"
+        for c in columns
+    )
+    assert not any(c.startswith("residual_o2o_") for c in columns)
+    assert not any(c.startswith("relevance") for c in columns)
+    assert not any(c.startswith("label_available_time") for c in columns)
+
+
+def test_replay_capacity_failure_raises_and_records_telemetry(tmp_path) -> None:
+    import src.stocks.workflows.train_model as tm
+
+    df = stock_v2_composed_df(n_sessions=40, n_tickers=6)
+    manifest = stock_v2_manifest(columns=df.columns)
+    snapshot = DatasetSnapshot(manifest=manifest, frame=df)
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    panel = _index_sessions(df)
+    oos_scored = df.tail(12).with_columns(
+        pl.col("market_cap").rank("dense").over("session").cast(pl.Float64).alias("pred_score")
+    )
+    request = TrainingRequest(artifact_id="cap_replay", n_folds=3, max_rss_mib=1)
+    guard = tm.ReplayResourceGuard(request)
+    context = tm._prepare_replay_static_context(panel, request)
+    with pytest.raises(tm.TrainingCapacityError, match="replay_capacity_exceeded"):
+        tm._event_ledger_evaluation(
+            panel,
+            oos_scored,
+            request,
+            snapshot.manifest,
+            registry,
+            default_base_schedule(),
+            default_stress_schedule(),
+            replay_context=context,
+            replay_guard=guard,
+        )
+    assert guard.capacity_failure_reason == "replay_capacity_exceeded"
+    telemetry = guard.telemetry()
+    assert telemetry["capacity_failure_reason"] == "replay_capacity_exceeded"
+    assert telemetry["replay_stage_estimated_bytes"]
+    assert telemetry["replay_mode"] == "FINAL_PROMOTION_BASE_AND_STRESS"
+
+
+def test_prepared_replay_reuses_calibration_state_and_counts_decisions(tmp_path) -> None:
+    """Prepared final replay prepares one calibration per decision timestamp."""
+    import src.stocks.workflows.train_model as tm
+
+    df = stock_v2_composed_df(n_sessions=70, n_tickers=8)
+    manifest = stock_v2_manifest(columns=df.columns)
+    snapshot = DatasetSnapshot(manifest=manifest, frame=df)
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    panel = _index_sessions(df)
+    last_30 = df["session"].unique().sort(descending=True).head(30)
+    oos_scored = df.filter(pl.col("session").is_in(last_30)).with_columns(
+        pl.col("market_cap").rank("dense").over("session").cast(pl.Float64).alias("pred_score")
+    )
+    request = TrainingRequest(
+        artifact_id="prepared_decision",
+        n_folds=3,
+        calibration_bucket_count=4,
+        min_calibration_sessions=5,
+    )
+    ledger = tm._build_calibration_ledger(oos_scored, panel, "residual_o2o_5d")
+    replay = tm._event_ledger_evaluation(
+        panel,
+        oos_scored,
+        request,
+        snapshot.manifest,
+        registry,
+        default_base_schedule(),
+        default_stress_schedule(),
+        calibration_ledger=ledger,
+        replay_mode=tm.ReplayMode.FINAL_PROMOTION_BASE_AND_STRESS,
+    )
+    cadence = 5
+    decision_count = sum(
+        1
+        for i in range(len(replay.ledger))
+        if i % cadence == 0 and i + 1 < len(replay.ledger)
+    )
+    assert replay.prepared_decision_count == decision_count
+    assert replay.replay_mode == "FINAL_PROMOTION_BASE_AND_STRESS"
+
+
 def test_tuning_rejects_non_positive_bootstrap_candidates(monkeypatch, tmp_path) -> None:
     import src.stocks.workflows.train_model as tm
 
