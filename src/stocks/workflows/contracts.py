@@ -40,6 +40,8 @@ class TrainingRequest:
     initial_cash: float = 100_000_000.0
     base_cost_schedule: CostSchedule | None = None
     stress_cost_schedule: CostSchedule | None = None
+    calibration_bucket_count: int = 10
+    min_calibration_sessions: int = 126
 
     def __post_init__(self) -> None:
         if self.n_folds < 1:
@@ -56,6 +58,10 @@ class TrainingRequest:
             raise ValueError("optuna_trials must be positive")
         if self.max_rss_mib is not None and self.max_rss_mib <= 0:
             raise ValueError("max_rss_mib must be positive when supplied")
+        if self.calibration_bucket_count < 2:
+            raise ValueError("calibration_bucket_count must be at least 2")
+        if self.min_calibration_sessions < 1:
+            raise ValueError("min_calibration_sessions must be positive")
 
 
 @dataclass(frozen=True, slots=True)
