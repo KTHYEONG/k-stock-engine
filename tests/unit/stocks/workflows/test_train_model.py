@@ -841,6 +841,137 @@ def test_replay_capacity_failure_raises_and_records_telemetry(tmp_path) -> None:
     assert telemetry["capacity_failure_reason"] == "replay_capacity_exceeded"
     assert telemetry["replay_stage_estimated_bytes"]
     assert telemetry["replay_mode"] == "FINAL_PROMOTION_BASE_AND_STRESS"
+    assert telemetry["bootstrap_batch_size"] == 0
+    assert telemetry["bootstrap_workspace_bytes"] == 0
+
+def test_bootstrap_workspace_cap_selects_bounded_batch_and_records_telemetry(
+    monkeypatch,
+) -> None:
+    """Guard picks a positive bounded batch and exposes it in replay telemetry."""
+    import src.stocks.workflows.train_model as tm
+
+    request = TrainingRequest(artifact_id="cap_probe", n_folds=3, max_rss_mib=8000)
+    guard = tm.ReplayResourceGuard(request)
+    monkeypatch.setattr(tm.ReplayResourceGuard, "_rss_mib", lambda self: 1000.0)
+    monkeypatch.setattr(
+        tm.ReplayResourceGuard, "_resolve_limit_mib", lambda cls, req: 8000.0
+    )
+
+    history_rows = 4_000_000
+    per_draw = history_rows * 24
+    cap = guard.bootstrap_workspace_cap(
+        history_rows=history_rows,
+        projected_output_bytes=100_000_000,
+        n_bootstrap=200,
+    )
+    assert cap > 0
+    assert cap <= 200 * per_draw
+    assert cap % per_draw == 0
+    assert guard.bootstrap_batch_size == cap // per_draw
+    assert guard.bootstrap_workspace_bytes == cap
+    admitted = guard.stage_estimated_bytes["decision_preparation"]
+    assert admitted == cap + 100_000_000 + per_draw
+    assert admitted <= 8000 * 1024 * 1024
+    telemetry = guard.telemetry()
+    assert telemetry["bootstrap_batch_size"] == cap // per_draw
+    assert telemetry["bootstrap_workspace_bytes"] == cap
+
+
+def test_bootstrap_workspace_cap_fails_closed_when_one_draw_cannot_fit(
+    monkeypatch,
+) -> None:
+    """One-draw-infeasible memory stays a deterministic decision-preparation failure."""
+    import src.stocks.workflows.train_model as tm
+
+    request = TrainingRequest(artifact_id="cap_fail", n_folds=3, max_rss_mib=8000)
+    guard = tm.ReplayResourceGuard(request)
+    monkeypatch.setattr(tm.ReplayResourceGuard, "_rss_mib", lambda self: 7990.0)
+    monkeypatch.setattr(
+        tm.ReplayResourceGuard, "_resolve_limit_mib", lambda cls, req: 8000.0
+    )
+
+    with pytest.raises(
+        tm.TrainingCapacityError, match="replay_capacity_exceeded:decision_preparation"
+    ):
+        guard.bootstrap_workspace_cap(
+            history_rows=4_000_000,
+            projected_output_bytes=20_000_000,
+            n_bootstrap=200,
+        )
+    assert guard.capacity_failure_reason == "replay_capacity_exceeded"
+    assert guard.telemetry()["capacity_failure_reason"] == "replay_capacity_exceeded"
+
+
+def test_prepared_replay_guarded_passes_cap_to_calibrator(
+    monkeypatch, tmp_path
+) -> None:
+    """A guarded replay passes the bounded workspace cap into prepare_decision."""
+    import src.stocks.workflows.train_model as tm
+    from src.stocks.research.economic_alpha import CausalAlphaCalibrator
+
+    df = stock_v2_composed_df(n_sessions=70, n_tickers=8)
+    manifest = stock_v2_manifest(columns=df.columns)
+    snapshot = DatasetSnapshot(manifest=manifest, frame=df)
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    panel = _index_sessions(df)
+    last_30 = df["session"].unique().sort(descending=True).head(30)
+    oos_scored = df.filter(pl.col("session").is_in(last_30)).with_columns(
+        pl.col("market_cap").rank("dense").over("session").cast(pl.Float64).alias("pred_score")
+    )
+    request = TrainingRequest(
+        artifact_id="guarded_prepared",
+        n_folds=3,
+        calibration_bucket_count=4,
+        min_calibration_sessions=5,
+        max_rss_mib=8000,
+    )
+    ledger = tm._build_calibration_ledger(oos_scored, panel, "residual_o2o_5d")
+    guard = tm.ReplayResourceGuard(request)
+    monkeypatch.setattr(tm.ReplayResourceGuard, "_rss_mib", lambda self: 1000.0)
+
+    captured: dict[str, object] = {}
+    original_prepare = CausalAlphaCalibrator.prepare_decision
+
+    def spy(
+        self,
+        observations,
+        decision_time,
+        cost_schedule,
+        *,
+        max_bootstrap_workspace_bytes=None,
+    ):
+        captured["max_bootstrap_workspace_bytes"] = max_bootstrap_workspace_bytes
+        return original_prepare(
+            self,
+            observations,
+            decision_time,
+            cost_schedule,
+            max_bootstrap_workspace_bytes=max_bootstrap_workspace_bytes,
+        )
+
+    monkeypatch.setattr(CausalAlphaCalibrator, "prepare_decision", spy)
+    replay = tm._event_ledger_evaluation(
+        panel,
+        oos_scored,
+        request,
+        snapshot.manifest,
+        registry,
+        default_base_schedule(),
+        default_stress_schedule(),
+        calibration_ledger=ledger,
+        replay_mode=tm.ReplayMode.FINAL_PROMOTION_BASE_AND_STRESS,
+        replay_guard=guard,
+    )
+    assert replay.prepared_decision_count > 0
+    cap = captured["max_bootstrap_workspace_bytes"]
+    assert isinstance(cap, int)
+    assert cap > 0
+    per_draw = ledger.height * 24
+    assert cap % per_draw == 0
+    telemetry = guard.telemetry()
+    assert telemetry["bootstrap_workspace_bytes"] == cap
+    assert telemetry["bootstrap_batch_size"] == cap // per_draw
+    assert telemetry["replay_peak_rss_mib"] <= 8000.0
 
 
 def test_prepared_replay_reuses_calibration_state_and_counts_decisions(tmp_path) -> None:
