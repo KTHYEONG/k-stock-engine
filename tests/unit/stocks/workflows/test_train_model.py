@@ -108,7 +108,10 @@ def test_train_model_rejects_frame_without_v2_features(tmp_path) -> None:
 
 
 def test_event_replay_executes_intents_for_scored_allocations(tmp_path) -> None:
-    from src.stocks.workflows.train_model import _event_ledger_evaluation
+    from src.stocks.workflows.train_model import (
+        _event_ledger_evaluation,
+        _prepare_replay_static_context,
+    )
 
     df = stock_v2_composed_df(n_sessions=40, n_tickers=8)
     manifest = stock_v2_manifest(columns=df.columns)
@@ -117,10 +120,12 @@ def test_event_replay_executes_intents_for_scored_allocations(tmp_path) -> None:
     oos_scored = df.tail(12).with_columns(
         pl.col("market_cap").rank("dense").over("session").cast(pl.Float64).alias("pred_score")
     )
+    panel = _index_sessions(df)
+    request = TrainingRequest(artifact_id="candidate", n_folds=3)
     replay = _event_ledger_evaluation(
-        _index_sessions(df),
+        panel,
         oos_scored,
-        TrainingRequest(artifact_id="candidate", n_folds=3),
+        request,
         snapshot.manifest,
         registry,
         default_base_schedule(),
@@ -132,6 +137,34 @@ def test_event_replay_executes_intents_for_scored_allocations(tmp_path) -> None:
     assert "constraint:insufficient covariance data" not in replay.no_trade_reason_counts
     assert replay.base_total_return != 0.0 or replay.strategy_returns
     assert replay.benchmark_returns
+
+    context = _prepare_replay_static_context(panel, request)
+    assert context.cache_bytes > 0
+    cached = _event_ledger_evaluation(
+        panel,
+        oos_scored,
+        request,
+        snapshot.manifest,
+        registry,
+        default_base_schedule(),
+        default_stress_schedule(),
+        replay_context=context,
+    )
+    assert cached.planned_cycles == replay.planned_cycles
+    assert cached.attempted_orders == replay.attempted_orders
+    assert cached.filled_orders == replay.filled_orders
+    assert cached.base_total_return == replay.base_total_return
+    assert cached.stress_total_return == replay.stress_total_return
+    assert cached.benchmark_total_return == replay.benchmark_total_return
+    assert cached.metrics == replay.metrics
+    assert cached.stress_metrics == replay.stress_metrics
+    assert cached.no_trade_reason_counts == replay.no_trade_reason_counts
+    assert cached.ledger == replay.ledger
+    assert cached.trades == replay.trades
+    assert cached.strategy_returns == replay.strategy_returns
+    assert cached.excess_returns == replay.excess_returns
+    assert cached.benchmark_returns == replay.benchmark_returns
+    assert cached.final_value == replay.final_value
 
 
 def test_training_uses_requested_purged_walk_forward_fold_count(tmp_path, monkeypatch) -> None:
@@ -554,6 +587,15 @@ def test_tuning_rejects_economically_ineligible_candidates(monkeypatch, tmp_path
         "no_economically_eligible_candidate"
     )
     assert tm.LambdaRankConfig._tuning_telemetry["economically_eligible_trials"] == 0
+    evidence = tm.LambdaRankConfig._tuning_telemetry["shortlist_candidate_evidence"]
+    assert len(evidence) == request.optuna_trials
+    for row in evidence:
+        assert row["eligible"] is False
+        assert set(row["failure_reasons"]) == {
+            "no_attempted_orders",
+            "no_filled_orders",
+        }
+        assert row["trial_number"] in (0, 1, 2)
 
 
 def test_tuning_rejects_non_positive_bootstrap_candidates(monkeypatch, tmp_path) -> None:
@@ -614,6 +656,57 @@ def test_tuning_rejects_non_positive_bootstrap_candidates(monkeypatch, tmp_path)
     assert tm.LambdaRankConfig._tuning_telemetry["selection_status"] == (
         "no_economically_eligible_candidate"
     )
+    evidence = tm.LambdaRankConfig._tuning_telemetry["shortlist_candidate_evidence"]
+    assert len(evidence) == request.optuna_trials
+    for row in evidence:
+        assert row["eligible"] is False
+        assert row["failure_reasons"] == ["non_positive_bootstrap_lower_bound"]
+        assert row["attempted_orders"] > 0
+        assert row["filled_orders"] > 0
+        assert row["bootstrap_lower_bound"] <= 0.0
+
+def test_economic_candidate_evidence_reason_codes() -> None:
+    from src.stocks.workflows.train_model import _evaluate_economic_candidate
+
+    request = TrainingRequest(artifact_id="codes", n_bootstrap=2)
+    finite = ReplayResult(
+        attempted_orders=2,
+        filled_orders=1,
+        excess_returns=[0.001, 0.001],
+        strategy_returns=[0.001, 0.001],
+        benchmark_returns=[0.0, 0.0],
+        metrics={"max_drawdown": 0.0, "turnover": 0.0},
+        final_value=1.0,
+        base_total_return=0.0,
+        benchmark_total_return=0.0,
+        stress_total_return=0.0,
+    )
+    assert _evaluate_economic_candidate([0.01], finite, request, 1, 0.02).eligible is True
+
+    bad_ic = _evaluate_economic_candidate([0.0, 0.01], finite, request, 2, 0.02)
+    assert bad_ic.eligible is False
+    assert bad_ic.failure_reasons == ("non_positive_fold_rank_ic",)
+
+    non_finite = _evaluate_economic_candidate(
+        [0.01], dataclass_replace(finite, strategy_returns=[float("nan")]), request, 3, 0.02,
+    )
+    assert non_finite.eligible is False
+    assert non_finite.failure_reasons == ("non_finite_replay",)
+
+    combined = _evaluate_economic_candidate(
+        [0.0], dataclass_replace(finite, attempted_orders=0), request, 4, 0.02,
+    )
+    assert combined.failure_reasons == (
+        "non_positive_fold_rank_ic",
+        "no_attempted_orders",
+    )
+    row = combined.to_json_safe()
+    assert row["trial_number"] == 4
+    assert row["failure_reasons"] == [
+        "non_positive_fold_rank_ic",
+        "no_attempted_orders",
+    ]
+    assert row["eligible"] is False
 
 
 def test_tuning_skips_candidates_that_fail_full_refit(monkeypatch, tmp_path) -> None:
@@ -664,6 +757,187 @@ def test_tuning_skips_candidates_that_fail_full_refit(monkeypatch, tmp_path) -> 
     assert tm.LambdaRankConfig._tuning_telemetry["selection_status"] == (
         "no_economically_eligible_candidate"
     )
+
+def test_full_refit_early_rejects_non_positive_first_fold(monkeypatch, tmp_path) -> None:
+    import src.stocks.workflows.train_model as tm
+
+    df = stock_v2_composed_df(n_sessions=40, n_tickers=8)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    request = TrainingRequest(artifact_id="early_reject", n_folds=3)
+
+    class _FakeContext:
+        train_processed = pl.DataFrame({"x": [1.0] * 12})
+        prepared = None
+
+    scored = pl.DataFrame(
+        {
+            "session": ["2024-01-01"] * 2,
+            "instrument_id": ["KRX:000001", "KRX:000002"],
+            "pred_score": [0.5, 0.4],
+        }
+    )
+    calls = {"count": 0}
+
+    def fake_score(*_a, **_kw):
+        calls["count"] += 1
+        return (-0.01, scored)
+
+    monkeypatch.setattr(tm, "_score_context_model", fake_score)
+    guard = tm.TrialResourceGuard(request, predictor_count=3)
+    result = tm._fit_and_score_candidate(
+        pl.DataFrame(),
+        [],
+        [_FakeContext()] * 3,
+        request,
+        _tune_base_manifest("early_reject", manifest, manifest.label_definition),
+        ("feature__x",),
+        "residual_o2o_5d",
+        "relevance",
+        tm.LambdaRankConfig(),
+        guard,
+        "trial0",
+    )
+    assert result is not None
+    fold_ic, oos = result
+    assert fold_ic == [-0.01]
+    assert oos is None
+    assert calls["count"] == 1
+
+
+def test_tuning_records_early_rejected_full_refits(monkeypatch, tmp_path) -> None:
+    import src.stocks.workflows.train_model as tm
+
+    monkeypatch.setattr(tm, "_MIN_TRAIN_SESSIONS", 40)
+    monkeypatch.setattr(tm, "_VALIDATION_BLOCK_SESSIONS", 30)
+
+    df = stock_v2_composed_df(n_sessions=140, n_tickers=20)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    label_span = (manifest.label_horizon_sessions or 1) + 1
+    folds = tm.PurgedWalkForward(
+        n_folds=3,
+        label_horizon_sessions=label_span,
+        embargo_sessions=5,
+        session_column="session_index",
+        validation_window_sessions=30,
+        min_train_sessions=40,
+    ).split(panel)
+
+    monkeypatch.setattr(
+        tm,
+        "_fit_stable_contexts",
+        lambda _panel, tuning_folds, *_a, **_kw: [None] * len(tuning_folds),
+    )
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+
+    def fake_refit(*_a, **_kw):
+        del _kw
+        key = str(_a[10])
+        if key == "trial0":
+            return ([-0.01], None)
+        return ([0.05, 0.06, 0.07], pl.DataFrame())
+
+    monkeypatch.setattr(tm, "_fit_and_score_candidate", fake_refit)
+    monkeypatch.setattr(tm, "_event_ledger_evaluation", lambda *_a, **_kw: _positive_replay())
+
+    request = TrainingRequest(artifact_id="early_tele", n_folds=3, optuna_trials=3)
+    config, n_trials = tm._tune_champion(
+        panel,
+        folds,
+        request,
+        _tune_base_manifest("early_tele", manifest, manifest.label_definition),
+        tuple(c for c in df.columns if c.startswith("feature__")),
+        "residual_o2o_5d",
+        "relevance",
+        label_span,
+        dataset_manifest=manifest,
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    assert config is not None
+    assert n_trials == request.optuna_trials
+    telemetry = config._tuning_telemetry
+    assert telemetry["selection_status"] == "selected"
+    assert telemetry["selected_trial_number"] == 1
+    assert telemetry["early_rejected_full_refits"] == 1
+    assert telemetry["early_rejected_full_refit_seconds"] >= 0.0
+    assert len(telemetry["shortlist_candidate_evidence"]) == 2
+
+
+def test_static_context_bytes_participate_in_resource_guard(monkeypatch, tmp_path) -> None:
+    import src.stocks.workflows.train_model as tm
+
+    df = stock_v2_composed_df(n_sessions=40, n_tickers=8)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    request = TrainingRequest(artifact_id="cap_static", n_folds=3)
+    context = tm._prepare_replay_static_context(panel, request)
+    assert context.cache_bytes > 0
+
+    admitted: list[int] = []
+    original = tm.TrialResourceGuard.admit
+
+    def spy(self, rows, *, extra_bytes=0):
+        admitted.append(int(extra_bytes))
+        return original(self, rows, extra_bytes=extra_bytes)
+
+    monkeypatch.setattr(tm.TrialResourceGuard, "admit", spy)
+
+    class _FakeContext:
+        train_processed = pl.DataFrame({"x": [1.0] * 12})
+        prepared = None
+
+    scored = pl.DataFrame(
+        {
+            "session": ["2024-01-01"] * 2,
+            "instrument_id": ["KRX:000001", "KRX:000002"],
+            "pred_score": [0.5, 0.4],
+        }
+    )
+    monkeypatch.setattr(tm, "_score_context_model", lambda *_a, **_kw: (0.03, scored))
+
+    guard = tm.TrialResourceGuard(request, predictor_count=3)
+    result = tm._fit_and_score_candidate(
+        pl.DataFrame(),
+        [],
+        [_FakeContext()] * 3,
+        request,
+        _tune_base_manifest("cap_static", manifest, manifest.label_definition),
+        ("feature__x",),
+        "residual_o2o_5d",
+        "relevance",
+        tm.LambdaRankConfig(),
+        guard,
+        "trial0",
+        static_cache_bytes=context.cache_bytes,
+    )
+    assert result is not None
+    _, oos = result
+    assert oos is not None
+    assert admitted
+    assert all(value >= context.cache_bytes for value in admitted)
+
+    tight = tm.TrialResourceGuard(
+        TrainingRequest(artifact_id="cap_tight", n_folds=3, max_rss_mib=1),
+        predictor_count=3,
+    )
+    with pytest.raises(tm.TrainingCapacityError):
+        tm._fit_and_score_candidate(
+            pl.DataFrame(),
+            [],
+            [_FakeContext()] * 3,
+            request,
+            _tune_base_manifest("cap_tight", manifest, manifest.label_definition),
+            ("feature__x",),
+            "residual_o2o_5d",
+            "relevance",
+            tm.LambdaRankConfig(),
+            tight,
+            "trial0",
+            static_cache_bytes=context.cache_bytes,
+        )
 
 
 def test_resource_breach_publishes_no_artifact(tmp_path, monkeypatch) -> None:
