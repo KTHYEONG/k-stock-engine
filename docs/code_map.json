@@ -207,7 +207,8 @@
   "src/stocks/backtesting/engine.py": {
     "testing": [
       "tests/integration/stocks/test_cycle_backtest_parity.py",
-      "tests/integration/stocks/test_settlement_replay.py"
+      "tests/integration/stocks/test_settlement_replay.py",
+      "tests/unit/stocks/backtesting/test_engine.py"
     ]
   },
   "src/stocks/cli/curate.py": {

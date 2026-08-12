@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "backtest_execution_recovery",
+      "date": "2026-08-13",
+      "adr_id": "ADR_20260813_backtest_execution_recovery",
+      "domain": "stocks",
+      "title": "Prepared backtest execution recovery",
+      "why": "2026-08-12 run had positive Rank-IC but 7,822 attempted orders and zero fills because nullable provisional action coverage was coerced to false and prepared allocation lost pre-OOS warm-up history.",
+      "resolution": "Preserved tri-state action coverage, restored complete-panel allocation warm-up, converted NaN score overlays to null, and recorded deterministic unfilled-order reason telemetry; rerun recovered 1,737 fills while fail-closed gates still produced NO_TRADE.",
+      "impact": "Backtest execution evidence is now valid for provisional research data without relaxing certified-data or economic promotion gates."
+    },
+    {
       "task_id": "TASK_20260812_sub10_81trial_refit_pipeline",
       "date": "2026-08-12",
       "adr_id": "ADR_20260812_20260812_sub10_81trial_refit_pipeline",
