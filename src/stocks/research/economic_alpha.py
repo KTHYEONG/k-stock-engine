@@ -235,6 +235,8 @@ class CausalAlphaCalibrator:
         observations: pl.DataFrame,
         decision_time: datetime,
         cost_schedule: CostSchedule,
+        *,
+        max_bootstrap_workspace_bytes: int | None = None,
     ) -> dict[str, object]:
         """Compute the route-scoped calibration evidence once for a decision.
 
@@ -246,8 +248,12 @@ class CausalAlphaCalibrator:
         bootstrap sampling so the artifact state is canonical. The reference
         ``transform`` and this prepared schedule share the same input ordering
         and therefore produce identical bucket IDs, sample sizes, alpha, and
-        lower bounds for the same decision.
+        lower bounds for the same decision. ``max_bootstrap_workspace_bytes``
+        bounds the bootstrap workspace so a memory-constrained replay processes
+        the draws in deterministic batches without changing the evidence.
         """
+        if max_bootstrap_workspace_bytes is not None and max_bootstrap_workspace_bytes <= 0:
+            raise ValueError("max_bootstrap_workspace_bytes must be positive when supplied")
         _validate_observations(observations, self.label_column, self.label_available_column)
         point = cost_schedule.cost_for(decision_time)
         round_trip_cost = _round_trip_cost_rate(point)
@@ -281,6 +287,7 @@ class CausalAlphaCalibrator:
             n_bootstrap=self.n_bootstrap,
             bootstrap_alpha=self.bootstrap_alpha,
             block_length=self.block_length,
+            max_bootstrap_workspace_bytes=max_bootstrap_workspace_bytes,
         )
         self._last_evidence = tuple(
             sorted(
@@ -509,6 +516,8 @@ def _bucket_statistics(
     n_bootstrap: int = 200,
     bootstrap_alpha: float = 0.05,
     block_length: int = _DEFAULT_BLOCK_LENGTH,
+    *,
+    max_bootstrap_workspace_bytes: int | None = None,
 ) -> pl.DataFrame:
     """Per-bucket shrunk expected alpha and bootstrap lower bound.
 
@@ -518,7 +527,11 @@ def _bucket_statistics(
     trusting a noisy bucket average. Calibration observations are ordered by
     ``(session, instrument_id)`` before bootstrap sampling so the reference
     transform and the prepared-decision schedule share one canonical order.
+    A supplied ``max_bootstrap_workspace_bytes`` is propagated unchanged to the
+    bootstrap helper so memory-bounded replay keeps a bounded peak workspace.
     """
+    if max_bootstrap_workspace_bytes is not None and max_bootstrap_workspace_bytes <= 0:
+        raise ValueError("max_bootstrap_workspace_bytes must be positive when supplied")
     eligible = eligible.sort([SESSION_COLUMN, INSTRUMENT_COLUMN])
     bucketed = eligible.with_columns(
         _bucket_expression(SCORE_COLUMN, bucket_count)
@@ -558,7 +571,12 @@ def _bucket_statistics(
             )
             continue
         lower_bound = _block_bootstrap_lower_bound(
-            residuals, block_length, n_bootstrap, seed + bucket, bootstrap_alpha
+            residuals,
+            block_length,
+            n_bootstrap,
+            seed + bucket,
+            bootstrap_alpha,
+            max_bootstrap_workspace_bytes=max_bootstrap_workspace_bytes,
         )
         if lower_bound <= 0.0:
             rows.append(
@@ -645,8 +663,20 @@ def _block_bootstrap_lower_bound(
     n_bootstrap: int,
     seed: int,
     alpha: float,
+    *,
+    max_bootstrap_workspace_bytes: int | None = None,
 ) -> float:
-    """Vectorized moving-block bootstrap ``alpha`` quantile of block means."""
+    """Vectorized moving-block bootstrap ``alpha`` quantile of block means.
+
+    When ``max_bootstrap_workspace_bytes`` is supplied, the draws are processed
+    in deterministic contiguous batches whose conservative workspace (three
+    row-sized ``int64``/``float64`` work arrays, 24 bytes per row per draw) stays
+    at or below the cap. Consecutive batch shapes partition the first dimension,
+    so the identical RNG stream is consumed in the identical row-major order and
+    the batched means are bit-identical to the legacy one-shot means.
+    """
+    if max_bootstrap_workspace_bytes is not None and max_bootstrap_workspace_bytes <= 0:
+        raise ValueError("max_bootstrap_workspace_bytes must be positive when supplied")
     arr = np.asarray(values, dtype=float)
     if arr.size == 0:
         return 0.0
@@ -655,12 +685,27 @@ def _block_bootstrap_lower_bound(
     block = max(block_length, 1)
     n_blocks = int(np.ceil(n / block))
     max_start = max(1, n - block + 1)
-    starts = rng.integers(0, max_start, size=(n_bootstrap, n_blocks))
     offsets = np.arange(block)
-    index = (starts[:, :, None] + offsets[None, None, :]).reshape(
-        n_bootstrap, n_blocks * block
-    )[:, :n]
-    means = arr[index].mean(axis=1)
+    if max_bootstrap_workspace_bytes is None:
+        starts = rng.integers(0, max_start, size=(n_bootstrap, n_blocks))
+        index = (starts[:, :, None] + offsets[None, None, :]).reshape(
+            n_bootstrap, n_blocks * block
+        )[:, :n]
+        means = arr[index].mean(axis=1)
+        return float(np.quantile(means, alpha))
+    batch_draws = max_bootstrap_workspace_bytes // (n * 24)
+    if batch_draws < 1:
+        raise ValueError("bootstrap workspace cannot fit one draw")
+    batch_draws = min(batch_draws, n_bootstrap)
+    means = np.empty(n_bootstrap, dtype=float)
+    for offset in range(0, n_bootstrap, batch_draws):
+        stop = min(offset + batch_draws, n_bootstrap)
+        count = stop - offset
+        starts = rng.integers(0, max_start, size=(count, n_blocks))
+        index = (starts[:, :, None] + offsets[None, None, :]).reshape(
+            count, n_blocks * block
+        )[:, :n]
+        means[offset:stop] = arr[index].mean(axis=1)
     return float(np.quantile(means, alpha))
 
 
