@@ -70,6 +70,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="explicit RSS budget in MiB; a breach raises TrainingCapacityError",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume a fingerprinted training run from its durable checkpoint "
+        "under <registry>/.training/<artifact-id>/",
+    )
     parser.add_argument("--decision-time", type=datetime.fromisoformat, default=None)
     return parser
 
@@ -118,6 +124,12 @@ def main(args: list[str] | None = None) -> int:
         participation_limit=0.005,
         optuna_trials=parsed.optuna_trials,
         max_rss_mib=parsed.max_rss_mib,
+        resume=parsed.resume,
+        run_root=(
+            parsed.registry / ".training" / parsed.artifact_id
+            if parsed.resume
+            else None
+        ),
     )
     logger.info(
         "frozen candidate route set: holding horizons %s, per-horizon trial "
