@@ -53,6 +53,7 @@ def _positive_observations(n_sessions: int = 60, n_tickers: int = 25) -> pl.Data
     return pl.DataFrame(rows)
 
 
+@pytest.mark.slow
 def test_schedule_states_equal_reference_at_every_decision() -> None:
     cal = CausalAlphaCalibrator(
         bucket_count=5, min_calibration_sessions=10, n_bootstrap=200,
@@ -69,6 +70,7 @@ def test_schedule_states_equal_reference_at_every_decision() -> None:
         _assert_states_equivalent(reference, schedule.state_at(decision_time))
 
 
+@pytest.mark.slow
 def test_schedule_reveals_future_labels_only_after_decision() -> None:
     cal = CausalAlphaCalibrator(
         bucket_count=5, min_calibration_sessions=10, n_bootstrap=200,

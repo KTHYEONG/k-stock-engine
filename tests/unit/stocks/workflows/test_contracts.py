@@ -26,9 +26,15 @@ def test_training_request_validates_trial_and_budget_inputs() -> None:
         TrainingRequest(artifact_id="v1", max_rss_mib=0)
     with pytest.raises(ValueError, match="max_rss_mib must be positive"):
         TrainingRequest(artifact_id="v1", max_rss_mib=-5)
+    with pytest.raises(ValueError, match="lgb_threads must be positive"):
+        TrainingRequest(artifact_id="v1", lgb_threads=0)
+    with pytest.raises(ValueError, match="lgb_threads must be positive"):
+        TrainingRequest(artifact_id="v1", lgb_threads=-2)
     request = TrainingRequest(artifact_id="v1", optuna_trials=120, max_rss_mib=4096)
     assert request.optuna_trials == 120
     assert request.max_rss_mib == 4096
+    assert request.lgb_threads is None
+    assert TrainingRequest(artifact_id="v1", lgb_threads=4).lgb_threads == 4
 
 
 def test_simulation_request_carries_policy_inputs() -> None:

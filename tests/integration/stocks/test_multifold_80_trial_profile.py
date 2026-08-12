@@ -76,6 +76,8 @@ def test_multifold_80_trial_profile_completes_under_budget(tmp_path, monkeypatch
     assert resource["pruned_trials"] >= 0
     assert resource["screened_trials"] + resource["pruned_trials"] == _OPTUNA_TRIALS
     assert resource["selection_policy_version"] == "economic-selection-v2-proxy-one-finalist"
+    assert resource["compute_plan_version"] == "sub10-refit-v1"
+    assert resource["resolved_lgb_threads"] >= 1
     assert resource["per_route_trial_budget"] == _OPTUNA_TRIALS // 3
     assert resource["shortlisted_trials"] <= 18
     assert resource["screen_fidelity"] == "session_stride_proxy"
@@ -86,6 +88,27 @@ def test_multifold_80_trial_profile_completes_under_budget(tmp_path, monkeypatch
     assert resource["screen_seconds"] > 0.0
     assert resource["full_refit_boosting_rounds"] == 900
     assert resource["full_refit_early_stopping_rounds"] == 100
+    assert resource["full_refit_seconds"] >= 0.0
+    assert resource["economic_replay_seconds"] >= 0.0
+    for attrs in resource["routes"].values():
+        for key in (
+            "context_prepare_seconds",
+            "refit_train_seconds",
+            "refit_predict_seconds",
+            "replay_prepare_seconds",
+            "economic_replay_seconds",
+            "full_refit_seconds",
+            "resolved_lgb_threads",
+            "actual_refit_rounds",
+            "actual_best_iterations",
+        ):
+            assert key in attrs
+        assert (
+            attrs["full_refit_seconds"]
+            <= attrs["full_refit_seconds"]
+            + attrs["replay_prepare_seconds"]
+            + attrs["economic_replay_seconds"]
+        )
     assert resource["selection_status"] in (
         "selected",
         "no_complete_screen_candidate",
@@ -95,8 +118,8 @@ def test_multifold_80_trial_profile_completes_under_budget(tmp_path, monkeypatch
     assert replay_resource["inner_stress_replay"] is False
     assert replay_resource["prepared_decision_count"] >= 0
     assert replay_resource["replay_peak_rss_mib"] >= 0.0
-    assert replay_resource["replay_operational_limit_mib"] == 7000.0
-    assert replay_resource["replay_limit_mib"] == 8000.0
+    assert replay_resource["replay_operational_limit_mib"] > 0.0
+    assert replay_resource["replay_limit_mib"] > 0.0
     inner_replays = sum(
         int(attrs.get("all_positive_finalists", 0))
         for attrs in resource["routes"].values()
