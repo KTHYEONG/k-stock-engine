@@ -76,6 +76,35 @@ def adaptive_refit_rounds(proxy_best_iteration: int | None) -> int:
     )
 
 
+def resolve_lgb_num_threads(
+    requested_threads: int | None,
+    physical_cores: int,
+    logical_cores: int,
+) -> int:
+    """Resolve the deterministic LightGBM thread plan.
+
+    ``None`` selects every cgroup-visible physical core (the measured 3.46x
+    sweet spot for the production fold). An explicit value must be positive and
+    must not exceed the visible logical CPUs; a non-positive value or an
+    oversubscribed value raises ``ValueError``. There is no silent
+    oversubscription and the resolution never samples the value from Optuna.
+    """
+    if physical_cores < 1:
+        raise ValueError("physical_cores must be positive")
+    if logical_cores < 1:
+        raise ValueError("logical_cores must be positive")
+    if requested_threads is not None:
+        if requested_threads < 1:
+            raise ValueError("lgb_threads must be positive")
+        if requested_threads > logical_cores:
+            raise ValueError(
+                f"lgb_threads {requested_threads} exceeds the visible logical "
+                f"CPU count {logical_cores}"
+            )
+        return requested_threads
+    return min(physical_cores, logical_cores)
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedLambdaRankFold:
     """Immutable per-tuning-fold inputs shared by every search candidate.
@@ -135,6 +164,7 @@ class LambdaRankConfig:
         early_stopping_rounds: int = 200,
         min_group_size: int = MIN_LAMBDARANK_GROUP,
         half_life_sessions: int = 504,
+        num_threads: int = 1,
     ):
         if objective != "lambdarank":
             raise ValueError("objective must be lambdarank")
@@ -154,6 +184,8 @@ class LambdaRankConfig:
             raise ValueError("min_group_size must be at least 2")
         if half_life_sessions < 1:
             raise ValueError("half_life_sessions must be positive")
+        if num_threads < 1:
+            raise ValueError("num_threads must be positive")
         self.objective = objective
         self.metric = metric
         self.label_gain = tuple(label_gain)
@@ -178,6 +210,7 @@ class LambdaRankConfig:
         self.early_stopping_rounds = early_stopping_rounds
         self.min_group_size = min_group_size
         self.half_life_sessions = half_life_sessions
+        self.num_threads = num_threads
 
     def lgb_params(self) -> dict[str, object]:
         """Deterministic LightGBM parameters with every seed pinned."""
@@ -203,7 +236,7 @@ class LambdaRankConfig:
             "lambda_l2": self.lambda_l2,
             "max_bin": self.max_bin,
             "verbosity": -1,
-            "num_threads": 1,
+            "num_threads": self.num_threads,
         }
 
 
@@ -312,6 +345,31 @@ class LambdaRankBlendModel:
         self._no_trade = not outcome.fit_ok
         return outcome
 
+    def fit_trial_prepared(
+        self,
+        prepared: PreparedLambdaRankFold,
+        stable_scores: pl.DataFrame,
+        *,
+        callbacks: Sequence[Callable[..., object]] = (),
+        initial_rounds: int | None = None,
+    ) -> FitTrialOutcome:
+        """Fit only the LambdaRank booster on the immutable prepared fold.
+
+        Identical to :meth:`fit_trial` with ``prepared`` supplied: the cached
+        stable scores are bound and the booster is trained from the prepared
+        matrices. The prepared prediction fast path consumes the same validation
+        matrix, so no Polars filtering, matrix conversion, or predictor-frame
+        construction is repeated for scoring.
+        """
+        self._stable_scores_cache = stable_scores
+        outcome = self._fit_lambdarank_prepared(
+            prepared,
+            callbacks,
+            initial_rounds=initial_rounds,
+        )
+        self._no_trade = not outcome.fit_ok
+        return outcome
+
     def predict(self, frame: pl.DataFrame) -> pl.DataFrame:
         """Target-free cross-sectional 50/50 percentile-rank blend."""
         self._reject_target_columns(frame)
@@ -356,6 +414,91 @@ class LambdaRankBlendModel:
         ).alias("pred_score")
         result = scored.with_columns(blend)
         result = result.drop("__lambda_score", "__stable_score")
+        if self._calibration_state is not None:
+            from src.stocks.research.economic_alpha import CausalAlphaCalibrator
+
+            result = CausalAlphaCalibrator.from_state(
+                self._calibration_state
+            ).apply_frozen(result)
+        return result
+
+    def predict_prepared_scores(
+        self,
+        prepared: PreparedLambdaRankFold,
+        validation_index: pl.DataFrame,
+        stable_scores: pl.DataFrame,
+    ) -> pl.DataFrame:
+        """Cross-sectional 50/50 percentile-rank blend on the prepared validation matrix.
+
+        ``validation_index`` must carry ``(session, instrument_id)`` aligned
+        row-for-row with ``prepared.validation_matrix``; ``stable_scores`` must
+        carry ``(session, instrument_id, pred_score)`` for the same keys. The
+        booster is called directly on the immutable matrix and the blend is
+        computed over exactly those rows, returning a slim frame containing only
+        ``session``, ``instrument_id``, and ``pred_score``. Misaligned rows,
+        duplicated keys, non-finite scores, or an un-fitted booster raise
+        ``ValueError``. Parity with the public :meth:`predict` is exact on
+        aligned inputs.
+        """
+        if self._no_trade or self._booster is None:
+            raise ValueError("no fitted booster is available for prepared prediction")
+        if prepared.validation_matrix is None:
+            raise ValueError("prepared fold exposes no validation matrix")
+        required_index = (self.session_column, "instrument_id")
+        if not all(c in validation_index.columns for c in required_index):
+            raise ValueError(f"validation_index must carry {required_index}")
+        required_stable = (*required_index, "pred_score")
+        if not all(c in stable_scores.columns for c in required_stable):
+            raise ValueError(f"stable_scores must carry {required_stable}")
+        if validation_index.height != prepared.validation_matrix.shape[0]:
+            raise ValueError(
+                "validation_index row count must match the prepared "
+                f"validation matrix ({validation_index.height} != "
+                f"{prepared.validation_matrix.shape[0]})"
+            )
+        duplicated = int(validation_index.select(required_index).is_duplicated().sum())
+        if duplicated:
+            raise ValueError("validation_index keys must be unique")
+        stable_dup = int(
+            stable_scores.select(required_index).is_duplicated().sum()
+        )
+        if stable_dup:
+            raise ValueError("stable_scores keys must be unique")
+        lambda_pred = np.asarray(
+            self._booster.predict(prepared.validation_matrix), dtype=float
+        )
+        if not np.all(np.isfinite(lambda_pred)):
+            raise ValueError("non-finite LambdaRank predictions")
+        scored = (
+            validation_index.with_columns(
+                pl.Series("__lambda_score", lambda_pred)
+            )
+            .join(
+                stable_scores.select(*required_stable),
+                on=required_index,
+                how="left",
+            )
+            .rename({"pred_score": "__stable_score"})
+            .with_columns(pl.col("__stable_score").fill_null(0.0))
+        )
+        within = pl.col("__lambda_score").count().over(self.session_column)
+        lambda_rank = (
+            (pl.col("__lambda_score").rank("average").over(self.session_column) - 1.0)
+            / (within - 1.0)
+        ).fill_null(0.5)
+        stable_within = pl.col("__stable_score").count().over(self.session_column)
+        stable_rank = (
+            (pl.col("__stable_score").rank("average").over(self.session_column) - 1.0)
+            / (stable_within - 1.0)
+        ).fill_null(0.5)
+        blend = (
+            LAMBDARANK_WEIGHT * lambda_rank + STABLE_WEIGHT * stable_rank
+        ).alias("pred_score")
+        result = scored.select(self.session_column, "instrument_id", blend)
+        if result["pred_score"].null_count() or not np.all(
+            np.isfinite(result["pred_score"].to_numpy())
+        ):
+            raise ValueError("non-finite or missing blended prediction")
         if self._calibration_state is not None:
             from src.stocks.research.economic_alpha import CausalAlphaCalibrator
 
