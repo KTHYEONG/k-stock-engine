@@ -176,7 +176,7 @@ def construct_target_allocations_prepared(
             "adtv": market.adtv[indices],
             "close": market.close[indices],
         }
-    )
+    ).with_columns(pl.col("pred_score").fill_nan(None))
     if calibration_state is not None:
         from src.stocks.research.economic_alpha import CausalAlphaCalibrator
 

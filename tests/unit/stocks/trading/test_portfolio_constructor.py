@@ -501,3 +501,67 @@ def test_prepared_allocations_reject_overlay_length_mismatch() -> None:
             empty_portfolio(),
             StockRiskPolicy(top_k=20),
         )
+
+def test_prepared_allocations_convert_nan_history_overlay_to_null() -> None:
+    """NaN historical overlay rows become null and never enter an allocation."""
+    panel = scored_panel(n_sessions=61, n_tickers=10, seed=9).drop("ret")
+    policy = StockRiskPolicy(top_k=20, participation_limit=0.01)
+    instruments = instruments_for(10)
+    portfolio = empty_portfolio()
+
+    reference = construct_target_allocations(panel, instruments, portfolio, policy)
+    assert reference
+
+    from src.stocks.trading.portfolio_constructor import (
+        PreparedAllocationMarket,
+        construct_target_allocations_prepared,
+    )
+
+    market = PreparedAllocationMarket.build(panel)
+    panel_sorted = panel.sort(["session", "instrument_id"])
+    latest_session = panel_sorted["session"].max()
+    overlay = np.full(market.row_count, np.nan, dtype=np.float64)
+    latest_mask = (panel_sorted["session"] == latest_session).to_numpy()
+    overlay[latest_mask] = (
+        panel_sorted.filter(pl.col("session") == latest_session)["pred_score"]
+        .to_numpy()
+    )
+    assert overlay[~latest_mask].size > 0
+    assert np.isnan(overlay[~latest_mask]).all()
+
+    plain = construct_target_allocations_prepared(
+        market,
+        len(market.sessions) - 1,
+        overlay,
+        None,
+        instruments,
+        portfolio,
+        policy,
+    )
+    assert plain == reference
+
+    calibration_state = {
+        "buckets": [
+            {
+                "bucket": 0,
+                "expected_active_alpha": 0.01,
+                "alpha_lower_bound": 0.005,
+            }
+        ],
+        "bucket_count": 1,
+        "round_trip_cost": 0.001,
+        "exit_cost_rate": 0.0005,
+    }
+    calibrated = construct_target_allocations_prepared(
+        market,
+        len(market.sessions) - 1,
+        overlay,
+        calibration_state,
+        instruments,
+        portfolio,
+        policy,
+    )
+    assert calibrated
+    assert {
+        a.instrument.instrument_id for a in calibrated
+    } == {a.instrument.instrument_id for a in plain}
