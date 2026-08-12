@@ -335,5 +335,8 @@
   },
   "src/stocks/research/economic_alpha.py": {
     "testing": "tests/unit/stocks/research/test_economic_alpha.py"
+  },
+  "src/stocks/cli/build_research_v2.py": {
+    "testing": "tests/unit/stocks/cli/test_build_research_v2.py"
   }
 }

@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ECONOMIC_REPLAY_ALPHA_IMPROVEMENT",
+      "date": "2026-08-12",
+      "adr_id": "ADR_20260812_ECONOMIC_REPLAY_ALPHA_IMPROVEMENT",
+      "domain": "stocks",
+      "title": "Cost-amortized multi-horizon performance discovery",
+      "why": "The multi-horizon route is executable, while economic replay remains the dominant runtime bottleneck.",
+      "resolution": "Synchronized ADR/task registry and code map for explicit five_day/multi_horizon snapshot dispatch and bounded replay execution findings.",
+      "impact": "Keeps the causal, cost, resource, and promotion gates unchanged while preserving a clean workspace for the next replay optimization."
+    },
+    {
       "task_id": "TASK_RAM_PEAK_PIPELINE_OPTIMIZATION",
       "date": "2026-08-12",
       "adr_id": "ADR_20260812_RAM_PEAK_PIPELINE_OPTIMIZATION",
