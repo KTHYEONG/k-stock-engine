@@ -1,123 +1,112 @@
-# Stock Alpha v2 최신 ML 실행 결과
+# Stock Alpha v2 최신 81-Trial 실행 결과
 
 ## 실행 개요
 
 | 항목 | 값 |
 |---|---|
 | 실행일 | 2026-08-12 |
-| Snapshot | `research_provisional_20160104_20260227_cost_master_v2_r1` |
-| Artifact | `lambdarank_v2_20260812_replay_batched_1trial` |
+| Snapshot | `research_provisional_20160104_20260812_cost_master_v3_mh2` |
+| Artifact | `lambdarank_v2_20260812_redesign_81trial` |
 | 실행 모드 | `research` |
-| 실행 명령 | `uv run python -m src.stocks.cli.train --artifact-id lambdarank_v2_20260812_replay_batched_1trial --snapshot-id research_provisional_20160104_20260227_cost_master_v2_r1 --mode research --optuna-trials 1 --max-rss-mib 8000` |
-| Route | 5 sessions (`residual_o2o_5d`) |
-| Rebalance | 5 sessions |
+| 실행 명령 | `uv run python -m src.stocks.cli.train --artifact-id lambdarank_v2_20260812_redesign_81trial --snapshot-id research_provisional_20160104_20260812_cost_master_v3_mh2 --mode research --optuna-trials 81 --max-rss-mib 8000` |
+| Route | 5 / 10 / 15 sessions |
+| Selection policy | `economic-selection-v1` |
 
-이번 실행은 bootstrap workspace를 결정론적 batch 방식으로 제한한 후 `INNER_SELECTION_BASE_ONLY` 경제 replay까지 정상 완료했다. 이전의 `decision_preparation` 용량 가드 중단은 재현되지 않았다.
+실행은 외부 timeout 없이 정상 종료되었고, terminal artifact가 생성되었다.
 
 ## 최종 판정
 
-- `promoted=false`
-- `no_trade=true`
-- `promotion_reasons=["no-champion-trial"]`
-- `selection_status=no_economically_eligible_candidate`
-- `capacity_failure_reason=null`
+| 항목 | 값 |
+|---|---:|
+| `promoted` | `false` |
+| `no_trade` | `true` |
+| `selection_status` | `no_economically_eligible_candidate` |
+| `economically_eligible_trials` | `0` |
+| `capacity_failure_reason` | `null` |
+| `n_terminal_trials` | `81` |
 
-NO_TRADE의 원인은 메모리 부족이 아니라 경제성 gate이다. 유일한 shortlist 후보가 `non_positive_bootstrap_lower_bound` 조건을 통과하지 못해 champion으로 선정되지 않았다. 따라서 paper/live 승격은 수행되지 않는다.
+모든 route에서 finalist가 경제성 gate를 통과하지 못해 승격 가능한 champion이
+없었다. 이는 메모리 실패가 아니라 `no_filled_orders`와
+`non_positive_bootstrap_lower_bound`에 의한 의도된 `NO_TRADE` 결과다.
 
-## 실행·자원 telemetry
+## 소요시간 및 메모리
+
+### 외부 프로세스 측정 (`/usr/bin/time -v`)
 
 | 항목 | 값 |
 |---|---:|
-| Optuna terminal trials | 1 |
-| Screened / pruned trials | 1 / 0 |
-| Shortlisted trials | 1 |
-| Economically eligible trials | 0 |
-| Screen time | 3.4047 s |
-| Full refit time | 360.1087 s |
-| Economic replay time | 198.5954 s |
-| 주요 단계 합계 | 562.1088 s |
-| Baseline RSS | 1,853.5 MiB |
-| Workflow peak RSS | **6,253.6 MiB** |
+| Wall time | **19:54.38** |
+| User time | 1,323.49 s |
+| System time | 176.20 s |
+| Maximum RSS | **7,672.23 MiB** |
 | RSS limit | 8,000 MiB |
-| Replay baseline RSS | 5,007.0 MiB |
-| Replay peak RSS | **5,622.2 MiB** |
-| Replay prepared decisions | 419 |
-| Replay mode | `INNER_SELECTION_BASE_ONLY` |
+| Exit status | `0` |
 
-### 메모리 최적화 효과
-
-| Replay stage | 값 |
-|---|---:|
-| Replay market index | 347,519,119 bytes |
-| Candidate score join | 411,590,033 bytes |
-| Replay ADTV | 86,472,588 bytes |
-| Decision preparation | **3,683,225,197 bytes** |
-| Bootstrap workspace | 3,661,800,000 bytes |
-| Bootstrap batch size | 200 draws |
-
-기존 실행의 `decision_preparation` 예상치 14,301,256,442 bytes와 비교하면 이번 admission 규모는 약 **74.2% 감소**한 3.68GB이다. 8GB RSS 예산 안에서 실제 calibration/replay가 실행되었고, capacity guard는 fail-closed 상태를 유지했다.
-
-## Screen 및 refit 결과
+### Workflow telemetry
 
 | 항목 | 값 |
 |---|---:|
-| Best screen Rank-IC | 0.06937652 |
-| Fold Rank-IC | 0.06937652 / 0.08959503 / 0.08954546 |
-| Median Rank-IC | 0.08954546 |
-| Full-refit fold 0 / 1 / 2 | 7.2302 s / 80.0665 s / 74.0915 s |
-| Fold 0 / 1 / 2 allocation estimate | 93.72 / 386.37 / 801.55 MiB |
-| Replay finite | true |
+| Baseline RSS | 1,777.50 MiB |
+| Workflow peak RSS | **7,146.48 MiB** |
+| Screen | 373.21 s |
+| Full refit | 753.47 s |
+| Economic replay | 282.45 s |
+| Prepared replay decisions | 1,520 |
+| Replay peak RSS | 5,481.50 MiB |
+| Cache bytes | 1,795,296,912 bytes |
 
-## 경제 replay 및 후보 evidence
+외부 RSS와 내부 RSS 모두 8,000 MiB 제한 안에 들어왔으며 capacity failure는
+발생하지 않았다.
 
-| 항목 | 값 |
-|---|---:|
-| Attempted orders | 2,104 |
-| Filled orders | 2,104 |
-| Planned cycles | 196 |
-| Cash cycles | 200 |
-| Strategy IR | 0.52473263 |
-| Max drawdown | 0.16862692 |
-| Turnover | 3.84779217 |
-| Cost drag | 0.0039456708 |
-| Bootstrap lower bound | **-0.00013084** |
-| Average expected net alpha | -0.0004840764 |
-| Candidate eligible | false |
-| Candidate failure | `non_positive_bootstrap_lower_bound` |
-
-Non-trade cycle 사유는 `no-feasible-allocation` 200회, `constraint:insufficient covariance data` 23회였다. 주문 자체는 2,104건 시도되어 모두 체결되었지만, bootstrap lower bound가 0보다 작아 경제성 gate에서 탈락했다.
-
-## Calibration 상태
+## 탐색·최적화 결과
 
 | 항목 | 값 |
 |---|---:|
-| Calibration history sessions | 2,085 |
-| Bucket count | 10 |
-| Minimum calibration sessions | 126 |
-| Bootstrap draws | 200 |
-| Bootstrap alpha | 0.05 |
-| Block length | 5 |
-| Participation limit | 0.01 |
-| Round-trip cost | 0.0036 |
-| Exit cost rate | 0.00295 |
-| Eligible buckets | 6 / 10 |
+| Route budget | 27 trials × 3 routes |
+| Terminal trials | 81 |
+| Screened / pruned | 66 / 15 |
+| Promotion width | 6 per route |
+| Finalist width | 2 per route |
+| Promoted trials | 6 per route |
+| All-positive finalists | 2 per route |
+| Economic replays | 6 total |
+| Legacy fixed shortlist reference | 8 per route |
 
-양의 calibration evidence가 생성된 bucket은 4~9번이다.
+정상 경로에서 full-refit은 route당 10개 fold 단위로 제한되었고, replay는 route당
+최대 2개 finalist만 수행되었다.
 
-| Bucket | Sample size | Expected active alpha | Alpha lower bound |
-|---:|---:|---:|---:|
-| 0 | 76,378 | null | null |
-| 1 | 75,385 | null | null |
-| 2 | 75,470 | null | null |
-| 3 | 75,343 | null | null |
-| 4 | 75,075 | 0.0007504979 | 0.0003183864 |
-| 5 | 75,841 | 0.0025007707 | 0.0020641410 |
-| 6 | 75,440 | 0.0028084588 | 0.0024094793 |
-| 7 | 75,345 | 0.0032551659 | 0.0027702112 |
-| 8 | 75,447 | 0.0040968520 | 0.0037170241 |
-| 9 | 76,609 | 0.0052837966 | 0.0048736853 |
+| Route | Screen | Full refit | Replay | Peak RSS | Best screen Rank-IC |
+|---:|---:|---:|---:|---:|---:|
+| 5 | 147.18 s | 348.76 s | 165.50 s | 5,556.56 MiB | 0.08499058 |
+| 10 | 116.94 s | 238.39 s | 71.21 s | 7,146.48 MiB | **0.09533526** |
+| 15 | 109.08 s | 166.32 s | 45.74 s | 7,146.48 MiB | 0.08754609 |
+
+## 경제 replay 성과
+
+최종 finalist 6개 모두 주문 체결이 없었고 경제성 gate에서 탈락했다.
+
+| Route | Trial | Median Rank-IC | Attempted orders | Filled orders | Bootstrap lower bound | Strategy IR | 판정 |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 5 | 10 | 0.08875145 | 4,519 | 0 | -0.00038778 | 0.0 | 탈락 |
+| 5 | 25 | 0.09093118 | 4,518 | 0 | -0.00038778 | 0.0 | 탈락 |
+| 10 | 16 | 0.10159450 | 2,322 | 0 | -0.00044101 | 0.0 | 탈락 |
+| 10 | 21 | 0.10537896 | 2,253 | 0 | -0.00044101 | 0.0 | 탈락 |
+| 15 | 12 | 0.10713674 | 1,624 | 0 | -0.00043084 | 0.0 | 탈락 |
+| 15 | 26 | 0.10447098 | 1,596 | 0 | -0.00043084 | 0.0 | 탈락 |
+
+합계 attempted orders는 16,832건, filled orders는 0건이다. 따라서 최종 artifact의
+투자 성과 지표는 생성되지 않았으며, paper/live 승격도 수행되지 않았다.
+
+## 병목 관찰
+
+- 전체 wall time은 19분 54초로 81-trial 실행이 terminal 상태에 도달했다.
+- Screen 373초보다 full refit 753초와 replay 282초가 더 큰 비용이었다.
+- 최고 RSS는 h10/h15 replay·refit 구간의 7,146.48 MiB telemetry,
+  프로세스 전체 peak는 7,672.23 MiB였다.
+- `decision_preparation`은 route별 bootstrap batch와 replay guard 안에서 수행되었고,
+  capacity guard 중단 없이 fail-closed 경제성 판정을 완료했다.
 
 ## 산출물
 
-- [Metrics](../../data/artifacts/stocks/lambdarank_v2_20260812_replay_batched_1trial/metrics.json)
-- [Manifest](../../data/artifacts/stocks/lambdarank_v2_20260812_replay_batched_1trial/manifest.json)
+- [Metrics](../../data/artifacts/stocks/lambdarank_v2_20260812_redesign_81trial/metrics.json)
+- [Manifest](../../data/artifacts/stocks/lambdarank_v2_20260812_redesign_81trial/manifest.json)
