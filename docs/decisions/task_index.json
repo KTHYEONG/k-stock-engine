@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260812_ten_minute_81trial_throughput",
+      "date": "2026-08-12",
+      "adr_id": "ADR_20260812_20260812_ten_minute_81trial_throughput",
+      "domain": "stocks",
+      "title": "Ten-minute 81-trial throughput contract alignment",
+      "why": "Align the throughput specification wiring with the active deterministic screen-fidelity policy after the 81-trial baseline exceeded the target runtime and RSS budget.",
+      "resolution": "Updated the throughput contract to reference ScreenFidelityPolicy, the active 27/6/6/1 funnel policy, and verified contract, lint, type, and focused tests.",
+      "impact": "Documentation and ADR indexes synchronized; temporary spec and scratch artifacts purged. Runtime optimization remains measured against the production research command."
+    },
+    {
       "task_id": "economic-selection-engine-redesign-81trial",
       "date": "2026-08-12",
       "adr_id": "ADR_20260812_economic-selection-engine-redesign-81trial",
