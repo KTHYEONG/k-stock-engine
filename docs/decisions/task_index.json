@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ECONOMIC_REPLAY_RESOURCE_GUARD_RUN",
+      "date": "2026-08-12",
+      "adr_id": "ADR_20260812_ECONOMIC_REPLAY_RESOURCE_GUARD_RUN",
+      "domain": "stocks",
+      "title": "Economic replay resource-guard execution result",
+      "why": "Latest ML execution must replace stale backtesting records and expose runtime, RSS, and fail-closed replay evidence.",
+      "resolution": "Replaced docs/results/back-res.md with the 1-trial guarded execution metrics, NO_TRADE decision, and replay capacity failure evidence; registered the decision and refreshed the code map.",
+      "impact": "The result document now reflects the latest reproducible run; oversized replay materialization is documented as safely blocked, with no paper/live promotion."
+    },
+    {
       "task_id": "TASK_COST_AMORTIZED_ALPHA_ROUTING_V1",
       "date": "2026-08-12",
       "adr_id": "ADR_20260812_COST_AMORTIZED_ALPHA_ROUTING_V1",
