@@ -189,6 +189,7 @@ def test_paired_replay_matches_separate_ledgers_and_prepares_decision_once() -> 
     assert reference.filled_orders == optimized.filled_orders
     assert reference.planned_cycles == optimized.planned_cycles
     assert reference.no_trade_reasons == optimized.no_trade_reasons
+    assert reference.unfilled_order_reason_counts == optimized.unfilled_order_reason_counts
     assert prepare_calls["count"] == len(request.decision_session_indices)
     assert paired.prepared_decision_count == len(request.decision_session_indices)
 
@@ -263,6 +264,10 @@ def test_prepared_market_replay_matches_reference_over_immutable_index() -> None
     assert reference_result.filled_orders == prepared_result.filled_orders
     assert reference_result.planned_cycles == prepared_result.planned_cycles
     assert reference_result.no_trade_reasons == prepared_result.no_trade_reasons
+    assert (
+        reference_result.unfilled_order_reason_counts
+        == prepared_result.unfilled_order_reason_counts
+    )
     assert prepared_calls["count"] == len(request.decision_session_indices)
     assert prepared.prepared_decision_count == len(request.decision_session_indices)
 
@@ -323,3 +328,92 @@ def test_run_prepared_rejects_nonfinite_scored_overlay_rows() -> None:
     overlay[0] = float("inf")
     with pytest.raises(BacktestValidationError, match="non-finite values on scored rows"):
         backtester.run_prepared(request, market, overlay)
+
+def test_prepared_replay_preserves_null_action_coverage_and_fails_false() -> None:
+    """Null provisional coverage fills; literal False stays unfilled."""
+    import numpy as np
+
+    df, snapshot, registry, instruments, policy, scored, artifacts, request, portfolio = _paired_inputs()
+    backtester = StockBacktester(
+        registry=registry,
+        instruments=instruments,
+        manifest=snapshot.manifest,
+        cost_schedule=default_base_schedule(),
+        stress_cost_schedule=default_stress_schedule(),
+        decision_provider=lambda dt, et: _prepare(dt, et, scored),
+        scenario_planner=lambda prepared, port, creq: _scenario_planner(
+            prepared, port, creq, instruments, policy
+        ),
+    )
+    overlay_frame = df.sort(["session", "instrument_id"]).select(
+        "instrument_id", "session"
+    ).join(
+        scored.select("instrument_id", "session", "pred_score"),
+        on=["instrument_id", "session"],
+        how="left",
+    )
+    score_overlay = overlay_frame["pred_score"].to_numpy().astype(np.float64)
+
+    null_frame = df.with_columns(
+        pl.lit(None, dtype=pl.Boolean).alias("action_interval_covered")
+    )
+    null_market = PreparedReplayMarket.build(
+        null_frame,
+        backtester.adtv_window,
+        instruments=instruments,
+        artifacts=artifacts,
+        initial_portfolio=portfolio,
+    )
+    assert null_market.value_at(0, "action_interval_covered") is None
+    null_result = backtester.run_prepared(request, null_market, score_overlay)
+    assert null_result.filled_orders > 0
+    assert "no-action-coverage" not in null_result.unfilled_order_reason_counts
+
+    false_frame = df.with_columns(
+        pl.lit(False, dtype=pl.Boolean).alias("action_interval_covered")
+    )
+    false_market = PreparedReplayMarket.build(
+        false_frame,
+        backtester.adtv_window,
+        instruments=instruments,
+        artifacts=artifacts,
+        initial_portfolio=portfolio,
+    )
+    false_result = backtester.run_prepared(request, false_market, score_overlay)
+    assert false_result.filled_orders == 0
+    assert false_result.unfilled_order_reason_counts["no-action-coverage"] == (
+        false_result.attempted_orders
+    )
+
+
+def test_certified_replay_rejects_null_or_false_action_coverage() -> None:
+    """Certified panels with null/False coverage fail closed before replay."""
+    import dataclasses
+
+    from src.core.datasets import DatasetCertification
+
+    df, snapshot, registry, instruments, policy, scored, artifacts, request, portfolio = _paired_inputs()
+    certified_manifest = dataclasses.replace(
+        snapshot.manifest, certification=DatasetCertification.RESEARCH
+    )
+    backtester = StockBacktester(
+        registry=registry,
+        instruments=instruments,
+        manifest=certified_manifest,
+        cost_schedule=default_base_schedule(),
+        stress_cost_schedule=default_stress_schedule(),
+        decision_provider=lambda dt, et: _prepare(dt, et, scored),
+        scenario_planner=lambda prepared, port, creq: _scenario_planner(
+            prepared, port, creq, instruments, policy
+        ),
+    )
+    null_frame = df.with_columns(
+        pl.lit(None, dtype=pl.Boolean).alias("action_interval_covered")
+    )
+    with pytest.raises(BacktestValidationError, match="uncovered action interval"):
+        backtester.run(null_frame, artifacts, portfolio, request)
+    false_frame = df.with_columns(
+        pl.lit(False, dtype=pl.Boolean).alias("action_interval_covered")
+    )
+    with pytest.raises(BacktestValidationError, match="uncovered action interval"):
+        backtester.run(false_frame, artifacts, portfolio, request)

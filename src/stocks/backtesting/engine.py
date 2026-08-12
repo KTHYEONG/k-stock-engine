@@ -13,7 +13,7 @@ executable prices.
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from math import ceil, floor
@@ -73,6 +73,15 @@ def _as_int(value: object) -> int:
     if isinstance(value, (int, float)):
         return int(value)
     raise BacktestValidationError(f"non-integer value: {value!r}")
+
+
+def _unfilled_order_reason_counts(trades: Sequence[BacktestTrade]) -> dict[str, int]:
+    """Deterministic reason histogram over zero-quantity replay trades."""
+    counts: dict[str, int] = {}
+    for trade in trades:
+        if trade.quantity == 0 and trade.reason:
+            counts[trade.reason] = counts.get(trade.reason, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 class BacktestValidationError(ValueError):
@@ -189,6 +198,7 @@ class BacktestResult:
     attempted_orders: int = 0
     filled_orders: int = 0
     no_trade_reasons: tuple[str, ...] = ()
+    unfilled_order_reason_counts: dict[str, int] = field(default_factory=dict)
 
     @property
     def equity_curve(self) -> list[float]:
@@ -304,7 +314,7 @@ class PreparedReplayMarket:
         if key == "action_interval_covered":
             if self.action_interval_covered is None:
                 return default
-            return bool(self.action_interval_covered[index])
+            return self.action_interval_covered[index]
         return default
 
     @classmethod
@@ -380,7 +390,7 @@ class PreparedReplayMarket:
             else None
         )
         action_interval_covered = (
-            ordered["action_interval_covered"].to_numpy().astype(bool)
+            np.asarray(ordered["action_interval_covered"].to_list(), dtype=object)
             if "action_interval_covered" in ordered.columns
             else None
         )
@@ -586,6 +596,7 @@ class StockBacktester:
             attempted_orders=attempted_orders,
             filled_orders=filled_orders,
             no_trade_reasons=no_trade_reasons,
+            unfilled_order_reason_counts=_unfilled_order_reason_counts(trades),
         )
 
     def run_prepared(
@@ -810,6 +821,7 @@ class StockBacktester:
             attempted_orders=base_state.attempted_orders,
             filled_orders=filled_orders,
             no_trade_reasons=no_trade_reasons,
+            unfilled_order_reason_counts=_unfilled_order_reason_counts(trades),
         )
 
     def _run_paired(
