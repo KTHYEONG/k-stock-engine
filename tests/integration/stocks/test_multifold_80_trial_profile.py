@@ -1,15 +1,18 @@
-"""Slow production-snapshot benchmark: serial 80-trial search under an RSS budget.
+"""Slow production-snapshot benchmark: serial 81-trial search under an RSS budget.
 
 Run explicitly with ``pytest -m slow``; excluded from the normal
-``-m "not slow"`` suite. Verifies the search reaches 80 terminal trials under
-an explicit RSS budget, records baseline/peak RSS and trial/fold timing
-telemetry in the published metrics, and never relaxes the promotion gates.
+``-m "not slow"`` suite. Verifies the search reaches 81 terminal screens under
+an explicit RSS budget with the deterministic 27-to-6-to-2 multi-fidelity
+funnel, runs at most six inner economic replays, records baseline/peak RSS and
+trial/fold timing telemetry in the published metrics, and publishes a terminal
+promoted or ``NO_TRADE`` artifact without relaxing the promotion gates.
 """
 from __future__ import annotations
 
 import json
 import time
 
+import polars as pl
 import pytest
 
 from src.stocks.data.contracts import DatasetSnapshot
@@ -18,8 +21,8 @@ from src.stocks.workflows.contracts import TrainingRequest
 from src.stocks.workflows.train_model import train_model
 from tests.fixtures.stocks.helpers import stock_v2_composed_df, stock_v2_manifest
 
-_OPTUNA_TRIALS = 80
-_BUDGET_MIB = 2048
+_OPTUNA_TRIALS = 81
+_BUDGET_MIB = 8000
 
 
 @pytest.mark.slow
@@ -30,6 +33,18 @@ def test_multifold_80_trial_profile_completes_under_budget(tmp_path, monkeypatch
     monkeypatch.setattr(tm, "_VALIDATION_BLOCK_SESSIONS", 30)
 
     df = stock_v2_composed_df(n_sessions=140, n_tickers=20)
+    df = df.with_columns(
+        pl.col("residual_o2o_5d").alias("residual_o2o_10d"),
+        pl.col("relevance").alias("relevance_10d"),
+        (pl.col("label_available_time") + pl.duration(days=5)).alias(
+            "label_available_time_10d"
+        ),
+        pl.col("residual_o2o_5d").alias("residual_o2o_15d"),
+        pl.col("relevance").alias("relevance_15d"),
+        (pl.col("label_available_time") + pl.duration(days=10)).alias(
+            "label_available_time_15d"
+        ),
+    )
     manifest = stock_v2_manifest(columns=df.columns)
     snapshot = DatasetSnapshot(manifest=manifest, frame=df)
     artifact_root = tmp_path / "artifacts"
@@ -60,7 +75,11 @@ def test_multifold_80_trial_profile_completes_under_budget(tmp_path, monkeypatch
     assert resource["screened_trials"] >= 0
     assert resource["pruned_trials"] >= 0
     assert resource["screened_trials"] + resource["pruned_trials"] == _OPTUNA_TRIALS
-    assert resource["shortlisted_trials"] <= 8
+    assert resource["selection_policy_version"] == "economic-selection-v1"
+    assert resource["per_route_trial_budget"] == _OPTUNA_TRIALS // 3
+    assert resource["shortlisted_trials"] <= 18
+    assert resource["promotion_width"] == 6
+    assert resource["finalist_width"] == 2
     assert resource["cache_bytes"] > 0
     assert resource["screen_seconds"] > 0.0
     assert resource["full_refit_boosting_rounds"] == 900
@@ -74,6 +93,11 @@ def test_multifold_80_trial_profile_completes_under_budget(tmp_path, monkeypatch
     assert replay_resource["inner_stress_replay"] is False
     assert replay_resource["prepared_decision_count"] >= 0
     assert replay_resource["replay_peak_rss_mib"] >= 0.0
+    inner_replays = sum(
+        int(attrs.get("all_positive_finalists", 0))
+        for attrs in resource["routes"].values()
+    )
+    assert inner_replays <= 6
     assert elapsed_seconds > 0.0
     assert payload["promoted"] is False
     assert payload["no_trade"] is True

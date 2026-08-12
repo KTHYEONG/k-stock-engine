@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import replace as dataclass_replace
 
 import polars as pl
@@ -375,6 +376,25 @@ def _positive_replay(**overrides) -> ReplayResult:
     return dataclass_replace(base, **overrides)
 
 
+def _fold_aware_refit(fold_ics=(0.05, 0.06, 0.07), *, reject_trials=()) -> Callable:
+    """``_fit_and_score_candidate`` fake honoring the multi-fidelity fold indices.
+
+    The fake mirrors the real implementation contract: it scores only the
+    requested ``fold_indices`` and early-rejects (``(ics, None)``) candidates in
+    ``reject_trials`` on their first fold, so promotion/backfill tests exercise
+    the funnel rather than an all-folds shortcut.
+    """
+
+    def fake(*_a, **_kw):
+        key = str(_a[10])
+        if key in reject_trials:
+            return ([-0.01], None)
+        indices = _kw.get("fold_indices") or tuple(range(len(fold_ics)))
+        return ([fold_ics[i] for i in indices], pl.DataFrame())
+
+    return fake
+
+
 def test_tuning_never_includes_first_outer_oos(monkeypatch, tmp_path) -> None:
     import src.stocks.workflows.train_model as tm
 
@@ -407,7 +427,7 @@ def test_tuning_never_includes_first_outer_oos(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
         tm,
         "_fit_and_score_candidate",
-        lambda *_a, **_kw: ([0.05, 0.06, 0.07], pl.DataFrame()),
+        _fold_aware_refit(),
     )
     monkeypatch.setattr(tm, "_event_ledger_evaluation", lambda *_a, **_kw: _positive_replay())
 
@@ -501,7 +521,7 @@ def test_tuning_economic_tie_breaks_by_lowest_trial_number(monkeypatch, tmp_path
     monkeypatch.setattr(
         tm,
         "_fit_and_score_candidate",
-        lambda *_a, **_kw: ([0.05, 0.06, 0.07], pl.DataFrame()),
+        _fold_aware_refit(),
     )
     monkeypatch.setattr(tm, "_event_ledger_evaluation", lambda *_a, **_kw: _positive_replay())
 
@@ -523,8 +543,11 @@ def test_tuning_economic_tie_breaks_by_lowest_trial_number(monkeypatch, tmp_path
     assert telemetry["selection_status"] == "selected"
     assert telemetry["selected_trial_number"] == 0
     assert telemetry["screened_trials"] == request.optuna_trials
-    assert telemetry["shortlisted_trials"] == request.optuna_trials
-    assert telemetry["economically_eligible_trials"] == request.optuna_trials
+    assert telemetry["selection_policy_version"] == "economic-selection-v1"
+    assert telemetry["promotion_width"] == 2
+    assert telemetry["finalist_width"] == 2
+    assert telemetry["shortlisted_trials"] == 2
+    assert telemetry["economically_eligible_trials"] == 2
     assert telemetry["selected_inner_bootstrap_lower_bound"] > 0.0
 
 
@@ -556,7 +579,7 @@ def test_tuning_rejects_economically_ineligible_candidates(monkeypatch, tmp_path
     monkeypatch.setattr(
         tm,
         "_fit_and_score_candidate",
-        lambda *_a, **_kw: ([0.05, 0.06, 0.07], pl.DataFrame()),
+        _fold_aware_refit(),
     )
     monkeypatch.setattr(
         tm,
@@ -583,14 +606,14 @@ def test_tuning_rejects_economically_ineligible_candidates(monkeypatch, tmp_path
     )
     assert tm.LambdaRankConfig._tuning_telemetry["economically_eligible_trials"] == 0
     evidence = tm.LambdaRankConfig._tuning_telemetry["shortlist_candidate_evidence"]
-    assert len(evidence) == request.optuna_trials
+    assert len(evidence) == 2
     for row in evidence:
         assert row["eligible"] is False
         assert set(row["failure_reasons"]) == {
             "no_attempted_orders",
             "no_filled_orders",
         }
-        assert row["trial_number"] in (0, 1, 2)
+        assert row["trial_number"] in (0, 1)
 
 
 def test_calibrated_replay_records_economic_evidence_and_fails_closed(
@@ -902,14 +925,14 @@ def test_bootstrap_workspace_cap_fails_closed_when_one_draw_cannot_fit(
     assert guard.telemetry()["capacity_failure_reason"] == "replay_capacity_exceeded"
 
 
-def test_prepared_replay_guarded_passes_cap_to_calibrator(
+def test_prepared_replay_guarded_passes_prefix_cap_to_schedule(
     monkeypatch, tmp_path
 ) -> None:
-    """A guarded replay passes the bounded workspace cap into prepare_decision."""
+    """A guarded replay passes the eligible-prefix workspace cap into the schedule."""
     import src.stocks.workflows.train_model as tm
-    from src.stocks.research.economic_alpha import CausalAlphaCalibrator
+    from src.stocks.research.calibration_schedule import CausalCalibrationSchedule
 
-    df = stock_v2_composed_df(n_sessions=70, n_tickers=8)
+    df = stock_v2_composed_df(n_sessions=70, n_tickers=20)
     manifest = stock_v2_manifest(columns=df.columns)
     snapshot = DatasetSnapshot(manifest=manifest, frame=df)
     registry = ModelArtifactRegistry(tmp_path / "artifacts")
@@ -929,27 +952,18 @@ def test_prepared_replay_guarded_passes_cap_to_calibrator(
     guard = tm.ReplayResourceGuard(request)
     monkeypatch.setattr(tm.ReplayResourceGuard, "_rss_mib", lambda self: 1000.0)
 
-    captured: dict[str, object] = {}
-    original_prepare = CausalAlphaCalibrator.prepare_decision
+    captured: dict[str, object] = {"max_bootstrap_workspace_bytes": None, "prefix_rows": 0}
+    original_state_at = CausalCalibrationSchedule.state_at
 
-    def spy(
-        self,
-        observations,
-        decision_time,
-        cost_schedule,
-        *,
-        max_bootstrap_workspace_bytes=None,
-    ):
-        captured["max_bootstrap_workspace_bytes"] = max_bootstrap_workspace_bytes
-        return original_prepare(
-            self,
-            observations,
-            decision_time,
-            cost_schedule,
+    def spy(self, decision_time, *, max_bootstrap_workspace_bytes=None):
+        if max_bootstrap_workspace_bytes is not None:
+            captured["max_bootstrap_workspace_bytes"] = max_bootstrap_workspace_bytes
+            captured["prefix_rows"] = self.eligible_prefix_rows(decision_time)
+        return original_state_at(
+            self, decision_time,
             max_bootstrap_workspace_bytes=max_bootstrap_workspace_bytes,
         )
-
-    monkeypatch.setattr(CausalAlphaCalibrator, "prepare_decision", spy)
+    monkeypatch.setattr(CausalCalibrationSchedule, "state_at", spy)
     replay = tm._event_ledger_evaluation(
         panel,
         oos_scored,
@@ -966,7 +980,9 @@ def test_prepared_replay_guarded_passes_cap_to_calibrator(
     cap = captured["max_bootstrap_workspace_bytes"]
     assert isinstance(cap, int)
     assert cap > 0
-    per_draw = ledger.height * 24
+    prefix_rows = int(captured["prefix_rows"])
+    assert prefix_rows > 0
+    per_draw = prefix_rows * 24
     assert cap % per_draw == 0
     telemetry = guard.telemetry()
     assert telemetry["bootstrap_workspace_bytes"] == cap
@@ -1043,7 +1059,7 @@ def test_tuning_rejects_non_positive_bootstrap_candidates(monkeypatch, tmp_path)
     monkeypatch.setattr(
         tm,
         "_fit_and_score_candidate",
-        lambda *_a, **_kw: ([0.05, 0.06, 0.07], pl.DataFrame()),
+        _fold_aware_refit(),
     )
     monkeypatch.setattr(
         tm,
@@ -1071,7 +1087,7 @@ def test_tuning_rejects_non_positive_bootstrap_candidates(monkeypatch, tmp_path)
         "no_economically_eligible_candidate"
     )
     evidence = tm.LambdaRankConfig._tuning_telemetry["shortlist_candidate_evidence"]
-    assert len(evidence) == request.optuna_trials
+    assert len(evidence) == 2
     for row in evidence:
         assert row["eligible"] is False
         assert row["failure_reasons"] == ["non_positive_bootstrap_lower_bound"]
@@ -1258,14 +1274,7 @@ def test_tuning_records_early_rejected_full_refits(monkeypatch, tmp_path) -> Non
     )
     monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
 
-    def fake_refit(*_a, **_kw):
-        del _kw
-        key = str(_a[10])
-        if key == "trial0":
-            return ([-0.01], None)
-        return ([0.05, 0.06, 0.07], pl.DataFrame())
-
-    monkeypatch.setattr(tm, "_fit_and_score_candidate", fake_refit)
+    monkeypatch.setattr(tm, "_fit_and_score_candidate", _fold_aware_refit(reject_trials=("trial0",)))
     monkeypatch.setattr(tm, "_event_ledger_evaluation", lambda *_a, **_kw: _positive_replay())
 
     request = TrainingRequest(artifact_id="early_tele", n_folds=3, optuna_trials=3)
@@ -1289,7 +1298,8 @@ def test_tuning_records_early_rejected_full_refits(monkeypatch, tmp_path) -> Non
     assert telemetry["early_rejected_full_refit_seconds"] >= 0.0
     assert telemetry["full_refit_boosting_rounds"] == 900
     assert telemetry["full_refit_early_stopping_rounds"] == 100
-    assert len(telemetry["shortlist_candidate_evidence"]) == 2
+    assert telemetry["all_positive_finalists"] == 1
+    assert len(telemetry["shortlist_candidate_evidence"]) == 1
 
 
 def test_screen_informed_full_refit_config_derives_budget_from_screen_constants() -> None:
@@ -1384,7 +1394,8 @@ def test_shortlisted_candidates_refit_with_screen_informed_profile(
 
     def fake_refit(*_a, **_kw):
         refit_configs.append(_a[8])
-        return ([0.05, 0.06, 0.07], pl.DataFrame())
+        indices = _kw.get("fold_indices") or (0, 1, 2)
+        return [0.05, 0.06, 0.07][indices[0] : indices[-1] + 1], pl.DataFrame()
 
     monkeypatch.setattr(tm, "_fit_and_score_candidate", fake_refit)
     monkeypatch.setattr(
@@ -1405,7 +1416,7 @@ def test_shortlisted_candidates_refit_with_screen_informed_profile(
     )
     assert config is not None
     assert n_trials == request.optuna_trials
-    assert len(refit_configs) == request.optuna_trials
+    assert len(refit_configs) == 2
     for cfg in refit_configs:
         assert cfg.n_estimators == 900
         assert cfg.early_stopping_rounds == 100
@@ -1713,7 +1724,7 @@ def _route_tune_mocks(
     monkeypatch.setattr(
         tm,
         "_fit_and_score_candidate",
-        lambda *_a, **_kw: ([0.05, 0.06, 0.07], pl.DataFrame()),
+        _fold_aware_refit(),
     )
 
     def fake_event_ledger(*_a, **_kw):
@@ -1805,12 +1816,12 @@ def test_tuning_records_route_specific_candidate_evidence(monkeypatch, tmp_path)
     assert route is not None
     telemetry = config._tuning_telemetry
     evidence = telemetry["shortlist_candidate_evidence"]
-    assert len(evidence) == 4
+    assert len(evidence) == 2
     assert {row["holding_horizon_sessions"] for row in evidence} == {5, 10}
     assert any(row["label_column"] == "residual_o2o_5d" for row in evidence)
     assert any(row["label_column"] == "residual_o2o_10d" for row in evidence)
     assert any(row["label_available_column"] == "label_available_time_10d" for row in evidence)
-    assert telemetry["economically_eligible_trials"] == 4
+    assert telemetry["economically_eligible_trials"] == 2
     assert set(telemetry["routes"]) == {"5", "10"}
     assert telemetry["per_route_trial_budget"] == 2
 
