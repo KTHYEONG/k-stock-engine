@@ -435,12 +435,104 @@ class TestStockAlphaV2SnapshotIntegration:
         )
         assert exit_code == 0
         out = capsys.readouterr().out
+        assert "label_horizon_mode=five_day" in out
         assert "feature_dataset_id=features_v2_cli" in out
         assert "label_dataset_id=labels_v2_cli" in out
         assert "snapshot_id=snap_v2_cli" in out
         assert "feature_content_hash=" in out
         assert "label_content_hash=" in out
         assert "certification=provisional" in out
+
+        store = CatalogStore(root)
+        snapshot = SnapshotResolver(store).resolve("snap_v2_cli")
+        repository = ResearchDataRepository(
+            base_root=v2_pipeline["base_root"],
+            feature_root=v2_pipeline["feature_root"],
+            label_root=v2_pipeline["label_root"],
+        )
+        composed = repository.compose_labeled_training_snapshot(
+            snapshot,
+            feature_set=STOCK_ALPHA_V2_FEATURE_SET,
+            decision_time=GENERATED,
+        )
+        assert "residual_o2o_5d" in composed.frame.columns
+        assert "relevance" in composed.frame.columns
+        assert "label_available_time" in composed.frame.columns
+        assert not any(
+            c.startswith("residual_o2o_") and c != "residual_o2o_5d"
+            for c in composed.frame.columns
+        )
+
+    def test_build_research_v2_cli_multi_horizon_publishes_route_columns(
+        self, v2_pipeline, capsys
+    ) -> None:
+        root = v2_pipeline["catalog_root"]
+        exit_code = build_research_v2_cli.main(
+            [
+                "--source-snapshot-id",
+                "source_snap_v1",
+                "--feature-dataset-id",
+                "features_v3_cli",
+                "--label-dataset-id",
+                "labels_v3_cli",
+                "--snapshot-id",
+                "snap_v3_cli",
+                "--label-horizon-mode",
+                "multi_horizon",
+                "--catalog-root",
+                str(root),
+                "--base-root",
+                str(v2_pipeline["base_root"]),
+                "--feature-root",
+                str(v2_pipeline["feature_root"]),
+                "--label-root",
+                str(v2_pipeline["label_root"]),
+                "--calendar-path",
+                str(v2_pipeline["calendar_path"]),
+                "--train-start",
+                SESSIONS[2].isoformat(),
+                "--train-end",
+                SESSIONS[8].isoformat(),
+                "--validation-start",
+                SESSIONS[9].isoformat(),
+                "--validation-end",
+                SESSIONS[10].isoformat(),
+                "--test-start",
+                SESSIONS[11].isoformat(),
+                "--test-end",
+                SESSIONS[13].isoformat(),
+                "--certification",
+                "provisional",
+            ]
+        )
+        assert exit_code == 0
+        out = capsys.readouterr().out
+        assert "label_horizon_mode=multi_horizon" in out
+        assert "feature_dataset_id=features_v3_cli" in out
+        assert "label_dataset_id=labels_v3_cli" in out
+        assert "snapshot_id=snap_v3_cli" in out
+
+        store = CatalogStore(root)
+        snapshot = SnapshotResolver(store).resolve("snap_v3_cli")
+        repository = ResearchDataRepository(
+            base_root=v2_pipeline["base_root"],
+            feature_root=v2_pipeline["feature_root"],
+            label_root=v2_pipeline["label_root"],
+        )
+        composed = repository.compose_labeled_training_snapshot(
+            snapshot,
+            feature_set=STOCK_ALPHA_V2_FEATURE_SET,
+            decision_time=GENERATED,
+        )
+        expected_columns = ["instrument_id", "session"]
+        for h in (5, 10, 15):
+            expected_columns += [
+                f"residual_o2o_{h}d",
+                f"relevance_{h}d",
+                f"label_available_time_{h}d",
+            ]
+        assert all(c in composed.frame.columns for c in expected_columns)
+        assert "relevance" not in composed.frame.columns
 
     def test_provisional_snapshot_rejected_for_paper_mode(self, v2_pipeline) -> None:
         with pytest.raises(ValueError, match="provisional"):
