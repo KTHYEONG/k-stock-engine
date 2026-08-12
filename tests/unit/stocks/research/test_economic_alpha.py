@@ -188,6 +188,58 @@ def test_frozen_state_reproduces_transform_evidence() -> None:
     assert state["exit_cost_rate"] > 0.0
 
 
+def test_prepared_decision_equals_reference_transform_and_isolates_labels() -> None:
+    """Route-scoped prepared calibration reproduces the reference transform.
+
+    ``prepare_decision`` + ``apply_prepared`` must be bit-for-bit identical to
+    ``transform`` for the same decision timestamp, and mutating any label that
+    is unavailable at the decision must never change the prepared state or its
+    applied evidence.
+    """
+    cal = CausalAlphaCalibrator(
+        bucket_count=5, min_calibration_sessions=10, n_bootstrap=50,
+        label_column="residual_o2o_5d", label_available_column="label_available_time",
+    )
+    decision = datetime(2024, 2, 10, tzinfo=UTC)
+    observations = _observations()
+    scored = _scored()
+
+    prepared = cal.prepare_decision(observations, decision, default_base_schedule())
+    prepared_out = cal.apply_prepared(prepared, scored)
+    reference = cal.transform(scored, observations, decision, default_base_schedule())
+
+    assert prepared["history_sessions"] == cal.history_sessions
+    assert prepared_out.select(
+        ALPHA_COLUMN, LOWER_BOUND_COLUMN
+    ).to_dicts() == reference.select(ALPHA_COLUMN, LOWER_BOUND_COLUMN).to_dicts()
+
+    future_flipped = observations.with_columns(
+        pl.when(pl.col("session") >= datetime(2024, 2, 9, tzinfo=UTC))
+        .then(pl.lit(0.99))
+        .otherwise(pl.col("residual_o2o_5d"))
+        .alias("residual_o2o_5d")
+    )
+    flipped_prepared = cal.prepare_decision(
+        future_flipped, decision, default_base_schedule()
+    )
+    flipped_out = cal.apply_prepared(flipped_prepared, scored)
+    assert flipped_out.select(
+        ALPHA_COLUMN, LOWER_BOUND_COLUMN
+    ).to_dicts() == prepared_out.select(ALPHA_COLUMN, LOWER_BOUND_COLUMN).to_dicts()
+
+
+def test_prepared_decision_fails_closed_on_insufficient_history() -> None:
+    cal = CausalAlphaCalibrator(bucket_count=5, min_calibration_sessions=10)
+    decision = datetime(2024, 1, 8, tzinfo=UTC)
+    observations = _observations(n_sessions=3)
+    prepared = cal.prepare_decision(observations, decision, default_base_schedule())
+    assert prepared["history_sessions"] < 10
+    assert prepared["buckets"] == []
+    out = cal.apply_prepared(prepared, _scored())
+    assert out[ALPHA_COLUMN].null_count() == out.height
+    assert out[LOWER_BOUND_COLUMN].null_count() == out.height
+
+
 def test_negative_bootstrap_lower_bound_bucket_is_null() -> None:
     cal = CausalAlphaCalibrator(bucket_count=5, min_calibration_sessions=10, n_bootstrap=200)
     decision = datetime(2024, 2, 10, tzinfo=UTC)
