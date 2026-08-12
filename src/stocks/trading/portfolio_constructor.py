@@ -23,6 +23,12 @@ from src.core.instruments import Instrument
 from src.core.portfolio import Allocation, PortfolioSnapshot
 
 REQUIRED_CROSS_SECTION_COLUMNS = ("instrument_id", "pred_score", "sector", "adtv")
+_ECONOMIC_COLUMNS = (
+    "expected_active_alpha",
+    "expected_net_alpha",
+    "alpha_lower_bound",
+    "exit_cost_rate",
+)
 _SESSION_COLUMN = "session"
 _RETURN_COLUMNS = ("log_return", "ret", "close")
 _TOLERANCE = 1e-10
@@ -54,6 +60,7 @@ class StockRiskPolicy:
     covariance_lookback_sessions: int = 60
     rebalance_frequency_sessions: int = 5
     annualization_sessions: int = 252
+    economic_hysteresis: bool = True
 
     def __post_init__(self) -> None:
         if self.top_k <= 0:
@@ -118,6 +125,9 @@ def construct_target_allocations(
     current_weights = _current_weights(portfolio, price_map, equity)
     incumbent_ids = set(current_weights)
 
+    if all(column in cross_section.columns for column in _ECONOMIC_COLUMNS):
+        eligible = _economically_eligible(cross_section, eligible, incumbent_ids)
+
     ranked = (
         eligible.sort(
             [pl.col("pred_score").sort(descending=True), pl.col("instrument_id").sort()]
@@ -133,11 +143,16 @@ def construct_target_allocations(
         .head(policy.top_k)
         .drop("__rank")
     )
+    if ranked.is_empty():
+        return ()
 
     ids = [str(r) for r in ranked["instrument_id"].to_list()]
     sector_of = {str(r["instrument_id"]): r["sector"] for r in cross_section.to_dicts()}
     adtv_of = {str(r["instrument_id"]): float(r["adtv"]) for r in cross_section.to_dicts()}
     vol_of = {str(r["instrument_id"]): float(r["__vol"]) for r in ranked.to_dicts()}
+    priority_alpha_of = _priority_alpha_of(
+        ranked, incumbent_ids, cross_section
+    )
 
     feasible = _portfolio_is_feasible(current_weights, sector_of, equity, policy)
     if feasible:
@@ -151,6 +166,7 @@ def construct_target_allocations(
             panel,
             instruments,
             policy,
+            priority_alpha_of=priority_alpha_of,
         )
     else:
         allocations = _de_risk_allocations(
@@ -223,6 +239,78 @@ def _current_weights(
     return weights
 
 
+def _economically_eligible(
+    cross_section: pl.DataFrame,
+    eligible: pl.DataFrame,
+    incumbent_ids: set[str],
+) -> pl.DataFrame:
+    """Gate entries and holdings on cost-adjusted expected net alpha.
+
+    New entrants require a positive ``expected_net_alpha`` (cost-adjusted
+    expected active return) and a positive ``alpha_lower_bound`` confidence
+    bound. Existing holdings are retained only while the keep-versus-exit net
+    benefit (``expected_active_alpha`` minus the one-way sell cost) is positive
+    with a positive confidence bound. Null/non-finite alpha is never a buy
+    signal: those rows fail the gate and fall through to cash or sell-only.
+    """
+    if "expected_active_alpha" not in cross_section.columns:
+        return eligible
+    incumbent = pl.col("instrument_id").is_in(incumbent_ids)
+    keep_ok = (
+        (pl.col("expected_active_alpha") - pl.col("exit_cost_rate") > 0.0)
+        & (pl.col("expected_active_alpha") > 0.0)
+        & (pl.col("alpha_lower_bound") > 0.0)
+    )
+    enter_ok = (
+        (pl.col("expected_net_alpha") > 0.0)
+        & (pl.col("expected_active_alpha") > 0.0)
+        & (pl.col("alpha_lower_bound") > 0.0)
+    )
+    gate = pl.when(incumbent).then(keep_ok).otherwise(enter_ok)
+    return eligible.filter(gate.fill_null(False))
+
+
+def _priority_alpha_of(
+    ranked: pl.DataFrame,
+    incumbent_ids: set[str],
+    cross_section: pl.DataFrame,
+) -> dict[str, float]:
+    """Per-name positive expected alpha used for relative sizing priority.
+
+    New names size by ``max(expected_net_alpha, 0)``; incumbents size by the
+    keep-versus-exit net benefit ``max(expected_active_alpha - exit_cost, 0)``.
+    """
+    if "expected_net_alpha" not in ranked.columns:
+        return {}
+    ids = [str(r) for r in ranked["instrument_id"].to_list()]
+    net_alpha = {
+        str(r["instrument_id"]): float(r["expected_net_alpha"])
+        for r in cross_section.to_dicts()
+        if r["expected_net_alpha"] is not None
+    }
+    active_alpha = {
+        str(r["instrument_id"]): float(r["expected_active_alpha"])
+        for r in cross_section.to_dicts()
+        if r["expected_active_alpha"] is not None
+    }
+    exit_cost = {
+        str(r["instrument_id"]): float(r["exit_cost_rate"])
+        for r in cross_section.to_dicts()
+        if r["exit_cost_rate"] is not None
+    }
+    priority: dict[str, float] = {}
+    for instrument_id in ids:
+        if instrument_id in incumbent_ids:
+            priority[instrument_id] = max(
+                active_alpha.get(instrument_id, 0.0)
+                - exit_cost.get(instrument_id, 0.0),
+                0.0,
+            )
+        else:
+            priority[instrument_id] = max(net_alpha.get(instrument_id, 0.0), 0.0)
+    return priority
+
+
 def _build_allocations(
     ids: list[str],
     sector_of: dict[str, object],
@@ -233,13 +321,25 @@ def _build_allocations(
     panel: pl.DataFrame,
     instruments: Mapping[str, Instrument],
     policy: StockRiskPolicy,
+    *,
+    priority_alpha_of: dict[str, float] | None = None,
 ) -> tuple[Allocation, ...]:
-    inverse_vols = {instrument_id: 1.0 / vol_of[instrument_id] for instrument_id in ids}
-    total_inverse = sum(inverse_vols.values()) or 1.0
+    if priority_alpha_of:
+        raw_scores = {
+            instrument_id: priority_alpha_of.get(instrument_id, 0.0)
+            / max(vol_of[instrument_id] ** 2, _TOLERANCE)
+            for instrument_id in ids
+        }
+    else:
+        raw_scores = {
+            instrument_id: 1.0 / max(vol_of[instrument_id], _TOLERANCE)
+            for instrument_id in ids
+        }
+    total = sum(raw_scores.values()) or 1.0
 
     weights: dict[str, float] = {}
     for instrument_id in ids:
-        raw = inverse_vols[instrument_id] / total_inverse * policy.gross_cap
+        raw = raw_scores[instrument_id] / total * policy.gross_cap
         capacity = policy.participation_limit * adtv_of[instrument_id] / equity
         weights[instrument_id] = min(raw, policy.single_name_cap, capacity)
 
