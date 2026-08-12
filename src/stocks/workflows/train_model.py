@@ -168,6 +168,7 @@ class ReplayResult:
     attempted_orders: int = 0
     filled_orders: int = 0
     no_trade_reason_counts: dict[str, int] = field(default_factory=dict)
+    unfilled_order_reason_counts: dict[str, int] = field(default_factory=dict)
     calibration_evidence: dict[str, object] = field(default_factory=dict)
     replay_mode: str | None = None
     replay_resource: dict[str, object] = field(default_factory=dict)
@@ -549,6 +550,7 @@ class EconomicCandidateEvidence:
     filled_orders: int
     planned_cycles: int
     no_trade_reason_counts: dict[str, int]
+    unfilled_order_reason_counts: dict[str, int]
     replay_finite: bool
     bootstrap_lower_bound: float
     strategy_ir: float
@@ -579,6 +581,9 @@ class EconomicCandidateEvidence:
             "filled_orders": int(self.filled_orders),
             "planned_cycles": int(self.planned_cycles),
             "no_trade_reason_counts": dict(sorted(self.no_trade_reason_counts.items())),
+            "unfilled_order_reason_counts": dict(
+                sorted(self.unfilled_order_reason_counts.items())
+            ),
             "replay_finite": bool(self.replay_finite),
             "bootstrap_lower_bound": round(self.bootstrap_lower_bound, 8),
             "strategy_ir": round(self.strategy_ir, 8),
@@ -622,15 +627,17 @@ class PreparedSelectionRoute:
     """Candidate-invariant route OOS replay market and decision schedule.
 
     Built once per route after the inner folds are known. Owns one
-    array-backed ``PreparedReplayMarket`` for the route OOS interval, the
-    aligned ``PreparedAllocationMarket`` consumed by
-    :func:`construct_target_allocations_prepared`, the canonical decision and
-    execution session indexes, the bounded 20/60-session window start per
-    decision, and the artifact schedule / initial portfolio the engine requires.
-    A candidate contributes only a NaN ``float64`` overlay scattered by
-    :meth:`scatter_overlay`; no full market-score join, ``partition_by``,
-    ``to_dicts``, ``_bounded_replay_history``, or new ``PreparedReplayMarket``
-    is created in the candidate replay loop.
+    array-backed ``PreparedReplayMarket`` for the route OOS interval (execution
+    only) and the aligned ``PreparedAllocationMarket`` built from the complete
+    panel so the allocator sees the same pre-OOS volatility/covariance/ADTV
+    warm-up as the reference replay, plus the canonical decision and execution
+    session indexes, the OOS-decision-to-full-panel allocation-session index
+    map, and the artifact schedule / initial portfolio the engine requires. A
+    candidate contributes only a NaN ``float64`` execution overlay and an
+    aligned allocation overlay scattered by :meth:`scatter_overlays`; no full
+    market-score join, ``partition_by``, ``to_dicts``,
+    ``_bounded_replay_history``, or new ``PreparedReplayMarket`` is created in
+    the candidate replay loop.
     """
 
     market: PreparedReplayMarket
@@ -638,8 +645,9 @@ class PreparedSelectionRoute:
     sessions: tuple[datetime, ...]
     decision_indices: tuple[int, ...]
     decision_index_by_time: Mapping[datetime, int]
+    allocation_decision_index_by_time: Mapping[datetime, int]
     execution_index_by_decision: Mapping[int, int]
-    window_start_by_decision: Mapping[int, int]
+    allocation_window: int
     artifacts: ArtifactSchedule
     initial_portfolio: PortfolioSnapshot
     cache_bytes: int
@@ -657,7 +665,12 @@ class PreparedSelectionRoute:
 
         ``panel`` is the full pre-OOS training panel; ``oos_sessions`` are the
         chronological scored sessions that begin the route OOS interval. The
-        route cadence is the holding horizon in sessions, matching the replay
+        execution ``PreparedReplayMarket`` covers only OOS sessions while the
+        ``PreparedAllocationMarket`` is built from the complete panel with a
+        causal rolling ADTV so the allocator sees the same pre-OOS warm-up as
+        the reference ``_bounded_replay_history`` path. Each OOS decision
+        timestamp maps to its full-panel allocation session index. The route
+        cadence is the holding horizon in sessions, matching the replay
         policy's rebalance frequency. Raises ``ValueError`` for a panel missing
         the required replay columns or for an empty OOS interval.
         """
@@ -707,14 +720,13 @@ class PreparedSelectionRoute:
             artifacts=artifacts,
             initial_portfolio=initial_portfolio,
         )
-        allocation_market = PreparedAllocationMarket.build(
-            replay_frame.with_columns(
-                pl.col("trading_value")
-                .rolling_mean(20, min_samples=1)
-                .over("instrument_id")
-                .alias("adtv")
-            )
+        allocation_frame = panel.with_columns(
+            pl.col("trading_value")
+            .rolling_mean(20, min_samples=1)
+            .over("instrument_id")
+            .alias("adtv")
         )
+        allocation_market = PreparedAllocationMarket.build(allocation_frame)
         cadence = max(1, int(route.horizon))
         decision_indices = tuple(
             i for i in range(len(sessions)) if i % cadence == 0
@@ -733,18 +745,23 @@ class PreparedSelectionRoute:
             participation_limit=request.participation_limit,
             rebalance_frequency_sessions=cadence,
         )
-        window = (
+        allocation_window = (
             max(policy.volatility_lookback_sessions, policy.covariance_lookback_sessions)
             + 1
         )
+        allocation_session_index_of = {
+            session: i for i, session in enumerate(allocation_market.sessions)
+        }
+        allocation_decision_index_by_time = {
+            decision_times[position]: allocation_session_index_of[
+                sessions[decision_indices[position]]
+            ]
+            for position in range(len(decision_indices))
+        }
         execution_index_by_decision = {
             position: (decision_indices[position] + 1)
             for position in range(len(decision_indices))
             if decision_indices[position] + 1 < len(sessions)
-        }
-        window_start_by_decision = {
-            position: max(0, decision_indices[position] - window + 1)
-            for position in range(len(decision_indices))
         }
         return cls(
             market=market,
@@ -752,8 +769,9 @@ class PreparedSelectionRoute:
             sessions=sessions,
             decision_indices=decision_indices,
             decision_index_by_time=decision_index_by_time,
+            allocation_decision_index_by_time=allocation_decision_index_by_time,
             execution_index_by_decision=execution_index_by_decision,
-            window_start_by_decision=window_start_by_decision,
+            allocation_window=allocation_window,
             artifacts=artifacts,
             initial_portfolio=initial_portfolio,
             cache_bytes=int(replay_frame.estimated_size()),
@@ -777,58 +795,96 @@ class PreparedSelectionRoute:
                 overlay[int(prepared_row.index)] = float(row["pred_score"])
         return overlay
 
+    def scatter_overlays(
+        self, oos_scored: pl.DataFrame
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Scatter the candidate's OOS scores into execution and allocation overlays.
+
+        The execution overlay is aligned to the OOS execution market; the
+        allocation overlay is aligned to the complete-panel allocation market
+        and carries ``NaN`` on every row outside the OOS interval.
+        """
+        execution_overlay = self.scatter_overlay(oos_scored)
+        allocation_overlay = np.full(
+            self.allocation_market.row_count, np.nan, dtype=np.float64
+        )
+        oos_session_set = set(self.sessions)
+        rows_by_key = self.allocation_market.rows_by_key
+        for row in oos_scored.select(
+            "instrument_id", "session", "pred_score"
+        ).iter_rows(named=True):
+            session = _session_as_datetime(row["session"])
+            if session not in oos_session_set:
+                continue
+            allocation_index = rows_by_key.get(
+                (str(row["instrument_id"]), session)
+            )
+            if allocation_index is not None:
+                allocation_overlay[int(allocation_index)] = float(row["pred_score"])
+        return execution_overlay, allocation_overlay
+
     def decision_index_for(self, decision_time: datetime) -> int | None:
-        """Session index of the decision owning ``decision_time``, or ``None``."""
+        """OOS execution session index of the decision owning ``decision_time``."""
         position = self.decision_index_by_time.get(decision_time)
         if position is None or position >= len(self.decision_indices):
             return None
         return int(self.decision_indices[position])
 
-    def window_indices(self, decision_session_index: int) -> np.ndarray:
-        """Row indices of the bounded history window ending at a decision session."""
-        from src.stocks.backtesting.engine import PreparedReplayMarket
+    def allocation_decision_index_for(self, decision_time: datetime) -> int | None:
+        """Full-panel allocation session index owning ``decision_time``."""
+        return self.allocation_decision_index_by_time.get(decision_time)
 
-        market = self.market
-        if not isinstance(market, PreparedReplayMarket):
-            raise TypeError("PreparedSelectionRoute market must be a PreparedReplayMarket")
-        position = self.decision_indices.index(decision_session_index)
-        start = self.window_start_by_decision[position]
+    def window_indices(self, allocation_decision_index: int) -> np.ndarray:
+        """Row indices of the bounded allocation window ending at a decision."""
+        allocation_market = self.allocation_market
+        if allocation_decision_index < 0 or allocation_decision_index >= len(
+            allocation_market.sessions
+        ):
+            raise ValueError(
+                f"allocation decision index {allocation_decision_index} "
+                f"outside allocation sessions"
+            )
+        start = max(0, allocation_decision_index - self.allocation_window + 1)
         return np.concatenate(
             [
-                np.arange(market.session_ranges[i][0], market.session_ranges[i][1])
-                for i in range(start, decision_session_index + 1)
+                np.arange(
+                    allocation_market.session_ranges[i][0],
+                    allocation_market.session_ranges[i][1],
+                )
+                for i in range(start, allocation_decision_index + 1)
             ]
         )
 
     def window_frame(
         self,
-        decision_session_index: int,
-        overlay: np.ndarray,
+        allocation_decision_index: int,
+        allocation_overlay: np.ndarray,
     ) -> pl.DataFrame:
         """Assemble the bounded decision-window frame from static arrays.
 
         Produces exactly the ``(instrument_id, session, pred_score, sector,
         adtv, close)`` cross-section the reference ``_bounded_replay_history``
-        would expose for the same decision, so the prepared allocation core is
-        numerically identical to the reference path. No market-wide join,
+        would expose for the same decision, including pre-OOS warm-up history.
+        Historical overlay rows normalize ``NaN`` to ``null`` so calibration
+        treats them as unscored rather than non-finite. No market-wide join,
         ``partition_by``, or per-row dict materialization is performed.
         """
         allocation_market = self.allocation_market
-        if decision_session_index < 0 or decision_session_index >= len(
+        if allocation_decision_index < 0 or allocation_decision_index >= len(
             allocation_market.sessions
         ):
             raise ValueError(
-                f"decision session index {decision_session_index} outside route sessions"
+                f"allocation decision index {allocation_decision_index} "
+                f"outside allocation sessions"
             )
-        position = self.decision_indices.index(decision_session_index)
-        start = self.window_start_by_decision[position]
+        start = max(0, allocation_decision_index - self.allocation_window + 1)
         indices = np.concatenate(
             [
                 np.arange(
                     allocation_market.session_ranges[i][0],
                     allocation_market.session_ranges[i][1],
                 )
-                for i in range(start, decision_session_index + 1)
+                for i in range(start, allocation_decision_index + 1)
             ]
         )
         if indices.size == 0:
@@ -849,12 +905,12 @@ class PreparedSelectionRoute:
                     allocation_market.row_sessions[indices].tolist(),
                     dtype=pl.Datetime("us", "UTC"),
                 ),
-                "pred_score": np.asarray(overlay)[indices],
+                "pred_score": np.asarray(allocation_overlay)[indices],
                 "sector": allocation_market.sector[indices],
                 "adtv": allocation_market.adtv[indices],
                 "close": allocation_market.close[indices],
             }
-        )
+        ).with_columns(pl.col("pred_score").fill_nan(None))
 
 
 
@@ -2540,6 +2596,7 @@ def _evaluate_economic_candidate(
         filled_orders=replay.filled_orders,
         planned_cycles=replay.planned_cycles,
         no_trade_reason_counts=dict(replay.no_trade_reason_counts),
+        unfilled_order_reason_counts=dict(replay.unfilled_order_reason_counts),
         replay_finite=replay_finite,
         bootstrap_lower_bound=bootstrap_lower_bound,
         strategy_ir=_information_ratio(replay.strategy_returns),
@@ -3112,7 +3169,7 @@ def _event_ledger_evaluation(
     policy = replay_context.policy
 
     if prepared_route is not None:
-        overlay = prepared_route.scatter_overlay(oos_scored)
+        overlay, allocation_overlay = prepared_route.scatter_overlays(oos_scored)
         if replay_guard is not None:
             replay_guard.admit(
                 int(oos_scored.estimated_size()), stage="candidate_overlay"
@@ -3271,13 +3328,17 @@ def _event_ledger_evaluation(
             replay_guard.record_prepared_decision()
         try:
             if prepared_route is not None:
-                decision_session_index = prepared_route.decision_index_for(decision_time)
-                if decision_session_index is None:
+                allocation_decision_index = prepared_route.allocation_decision_index_for(
+                    decision_time
+                )
+                if allocation_decision_index is None:
                     return PreparedReplayDecision(
                         decision_time, execution_time, pl.DataFrame(),
                         calibration_state=None, reason="no-decision-session",
                     )
-                visible = prepared_route.window_frame(decision_session_index, overlay)
+                visible = prepared_route.window_frame(
+                    allocation_decision_index, allocation_overlay
+                )
             else:
                 visible = _bounded_replay_history(
                     scored_for_replay, decision_time, policy
@@ -3316,17 +3377,17 @@ def _event_ledger_evaluation(
             return _scored_no_trade(portfolio, cycle_request, prepared.reason)
         try:
             if prepared_route is not None:
-                decision_session_index = prepared_route.decision_index_for(
+                allocation_decision_index = prepared_route.allocation_decision_index_for(
                     prepared.decision_time
                 )
-                if decision_session_index is None:
+                if allocation_decision_index is None:
                     return _scored_no_trade(
                         portfolio, cycle_request, "no-decision-session"
                     )
                 allocations = construct_target_allocations_prepared(
                     prepared_route.allocation_market,
-                    decision_session_index,
-                    overlay,
+                    allocation_decision_index,
+                    allocation_overlay,
                     prepared.calibration_state,
                     instruments,
                     portfolio,
@@ -3502,6 +3563,7 @@ def _event_ledger_evaluation(
         attempted_orders=result.attempted_orders,
         filled_orders=result.filled_orders,
         no_trade_reason_counts=no_trade_reason_counts,
+        unfilled_order_reason_counts=dict(result.unfilled_order_reason_counts),
         calibration_evidence=calibration_evidence,
         replay_mode=replay_mode.value,
         replay_resource=replay_resource,
@@ -4273,6 +4335,7 @@ def _build_metrics(
         "attempted_orders": replay.attempted_orders,
         "filled_orders": replay.filled_orders,
         "no_trade_reason_counts": replay.no_trade_reason_counts,
+        "unfilled_order_reason_counts": replay.unfilled_order_reason_counts,
         "base_total_return": replay.base_total_return,
         "stress_total_return": replay.stress_total_return,
         "benchmark_total_return": replay.benchmark_total_return,
