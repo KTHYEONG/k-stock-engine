@@ -22,6 +22,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
+from enum import StrEnum
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, cast
 
@@ -68,6 +69,35 @@ logger = logging.getLogger("stocks.workflows.train_model")
 
 _ECONOMIC_COLUMNS = ("open", "high", "low", "close", "volume", "trading_value", "market_cap")
 
+_REPLAY_MARKET_INDEX_REQUIRED = (
+    "instrument_id",
+    "session",
+    "available_time",
+    "open",
+    "close",
+    "volume",
+    "trading_value",
+    "sector",
+    "adtv",
+)
+_REPLAY_MARKET_INDEX_OPTIONAL = (
+    "high",
+    "low",
+    "limit_locked",
+    "action_interval_covered",
+    "feature__volatility_20d",
+    "data_quality_status",
+)
+_BOOTSTRAP_INDEX_BYTES = 8
+_BOOTSTRAP_VALUE_BYTES = 8
+
+
+class ReplayMode(StrEnum):
+    """Replay evidence scope distinguishing selection from final promotion."""
+
+    INNER_SELECTION_BASE_ONLY = "INNER_SELECTION_BASE_ONLY"
+    FINAL_PROMOTION_BASE_AND_STRESS = "FINAL_PROMOTION_BASE_AND_STRESS"
+
 _MIN_TRAIN_SESSIONS = 756
 _VALIDATION_BLOCK_SESSIONS = 252
 _REFIT_EVERY_SESSIONS = 63
@@ -113,6 +143,9 @@ class ReplayResult:
     filled_orders: int = 0
     no_trade_reason_counts: dict[str, int] = field(default_factory=dict)
     calibration_evidence: dict[str, object] = field(default_factory=dict)
+    replay_mode: str | None = None
+    replay_resource: dict[str, object] = field(default_factory=dict)
+    prepared_decision_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,6 +239,154 @@ class TrialResourceGuard:
             "trial_fold_timings_seconds": dict(self.fold_timings),
             "estimates_mib": dict(self.estimates_mib),
         }
+
+
+class ReplayResourceGuard:
+    """Admit replay materializations against a hard process memory ceiling.
+
+    The hard limit is the minimum of the explicit ``request.max_rss_mib``, a
+    finite readable cgroup v2 ``memory.max``, and available host memory plus
+    the current process RSS. Before each replay materialization the concrete
+    ``DataFrame.estimated_size()`` and the known NumPy bootstrap workspaces are
+    admitted; the observed RSS is recorded after the stage. An unsafe admission
+    or observed breach raises ``TrainingCapacityError`` with the deterministic
+    ``replay_capacity_exceeded`` reason so callers can publish a traceable
+    ``NO_TRADE`` artifact instead of leaving a missing result directory.
+    """
+
+    def __init__(
+        self,
+        request: TrainingRequest,
+        *,
+        replay_mode: ReplayMode = ReplayMode.FINAL_PROMOTION_BASE_AND_STRESS,
+    ) -> None:
+        self.replay_mode = replay_mode
+        self._limit_mib = self._resolve_limit_mib(request)
+        self.baseline_rss_mib = self._rss_mib()
+        self.peak_rss_mib = self.baseline_rss_mib
+        self.stage_seconds: dict[str, float] = {}
+        self.stage_estimated_bytes: dict[str, int] = {}
+        self.stage_peak_rss_mib: dict[str, float] = {}
+        self.prepared_decision_count = 0
+        self.capacity_failure_reason: str | None = None
+
+    @staticmethod
+    def _rss_mib() -> float:
+        return float(psutil.Process().memory_info().rss) / (1024 * 1024)
+
+    @staticmethod
+    def _cgroup_v2_memory_max_mib() -> float | None:
+        """Read the finite cgroup v2 ``memory.max`` ceiling when available."""
+        try:
+            with open("/sys/fs/cgroup/memory.max", encoding="utf-8") as handle:
+                raw = handle.read().strip()
+        except OSError:
+            return None
+        if not raw or raw == "max":
+            return None
+        try:
+            value = float(raw)
+        except ValueError:
+            return None
+        if not math.isfinite(value) or value <= 0.0:
+            return None
+        return value / (1024 * 1024)
+
+    @classmethod
+    def _resolve_limit_mib(cls, request: TrainingRequest) -> float:
+        candidates: list[float] = []
+        if request.max_rss_mib is not None:
+            candidates.append(float(request.max_rss_mib))
+        cgroup_mib = cls._cgroup_v2_memory_max_mib()
+        if cgroup_mib is not None:
+            candidates.append(cgroup_mib)
+        vm = psutil.virtual_memory()
+        available = float(vm.available)
+        if available <= 0.0:
+            available = float(vm.total)
+        candidates.append(available / (1024 * 1024) + cls._rss_mib())
+        return min(candidates)
+
+    def _fail(self, stage: str) -> None:
+        self.capacity_failure_reason = "replay_capacity_exceeded"
+        raise TrainingCapacityError(
+            f"replay_capacity_exceeded:{stage} exceeds the {self._limit_mib:.1f} MiB "
+            f"hard process limit"
+        )
+
+    def admit(self, estimated_bytes: int, *, stage: str) -> None:
+        """Reject the run before allocation when the increment cannot fit."""
+        estimate_mib = estimated_bytes / (1024 * 1024)
+        current = self._rss_mib()
+        self.peak_rss_mib = max(self.peak_rss_mib, current)
+        self.stage_estimated_bytes[stage] = int(estimated_bytes)
+        if current + estimate_mib > self._limit_mib:
+            self._fail(stage)
+
+    def check_after(self, *, stage: str) -> None:
+        """Record the observed RSS after a materialization and fail on breach."""
+        current = self._rss_mib()
+        self.peak_rss_mib = max(self.peak_rss_mib, current)
+        self.stage_peak_rss_mib[stage] = current
+        if current > self._limit_mib:
+            self._fail(stage)
+
+    def record_stage(self, stage: str, elapsed_seconds: float) -> None:
+        self.stage_seconds[stage] = elapsed_seconds
+
+    def record_prepared_decision(self) -> None:
+        self.prepared_decision_count += 1
+
+    def telemetry(self) -> dict[str, object]:
+        return {
+            "replay_stage_seconds": dict(self.stage_seconds),
+            "replay_stage_estimated_bytes": dict(self.stage_estimated_bytes),
+            "replay_stage_peak_rss_mib": dict(self.stage_peak_rss_mib),
+            "replay_mode": self.replay_mode.value,
+            "prepared_decision_count": int(self.prepared_decision_count),
+            "capacity_failure_reason": self.capacity_failure_reason,
+            "baseline_rss_mib": round(self.baseline_rss_mib, 3),
+            "replay_peak_rss_mib": round(self.peak_rss_mib, 3),
+            "replay_limit_mib": round(self._limit_mib, 3),
+        }
+
+
+def _build_replay_market_index(
+    panel: pl.DataFrame,
+    *,
+    guard: ReplayResourceGuard | None = None,
+) -> pl.DataFrame:
+    """Drop every non-execution column from the replay market frame.
+
+    Only the smallest column set needed by execution and allocation survives:
+    the explicit point-in-time market columns plus the execution volatility
+    field. ``feature__*`` (except ``feature__volatility_20d``),
+    ``residual_o2o_*``, ``relevance*``, and ``label_available_time*`` columns
+    never enter replay. Raises ``ValueError`` for a missing required column.
+    """
+    missing = [c for c in _REPLAY_MARKET_INDEX_REQUIRED if c not in panel.columns]
+    if missing:
+        raise ValueError(f"replay index must carry {', '.join(missing)}")
+    columns = list(_REPLAY_MARKET_INDEX_REQUIRED) + [
+        c for c in _REPLAY_MARKET_INDEX_OPTIONAL if c in panel.columns
+    ]
+    if guard is not None:
+        guard.admit(int(panel.estimated_size()), stage="replay_market_index")
+    return panel.select(columns)
+
+
+def _bootstrap_workspace_bytes(
+    request: TrainingRequest,
+    history_sessions: int,
+    instruments: int,
+) -> int:
+    """Known NumPy moving-block bootstrap index/value workspace bytes."""
+    rows = max(history_sessions, 1) * max(instruments, 1)
+    return (
+        request.n_bootstrap
+        * rows
+        * (_BOOTSTRAP_INDEX_BYTES + _BOOTSTRAP_VALUE_BYTES)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,14 +492,14 @@ class EconomicCandidateEvidence:
 class ReplayStaticContext:
     """Immutable point-in-time market inputs shared across economic candidates.
 
-    The market panel, instrument map, and risk policy do not depend on any
-    candidate's scores, so they are built once per selection panel and reused
-    by every shortlist replay; only ``pred_score`` is candidate-specific and
-    joined per replay. ``cache_bytes`` is the estimated resident size of the
-    cached market inputs and participates in every resource-guard admit.
+    The compact market index, instrument map, and risk policy do not depend on
+    any candidate's scores, so they are built once per selection panel and
+    reused by every shortlist replay; only ``pred_score`` is candidate-specific
+    and joined per replay. ``cache_bytes`` is the estimated resident size of
+    the cached market inputs and participates in every resource-guard admit.
     """
 
-    market_panel: pl.DataFrame
+    market_index: pl.DataFrame
     instruments: Mapping[str, Instrument]
     policy: StockRiskPolicy
     cache_bytes: int
@@ -435,13 +616,31 @@ def train_model(
         oos, training_panel, route.label_column, route.label_available_column,
     )
 
-    replay = _event_ledger_evaluation(
-        training_panel, oos, request, snapshot.manifest, registry, base, stress,
-        calibration_ledger=champion_oos_ledger,
-        holding_horizon_sessions=route.horizon,
-        label_column=route.label_column,
-        label_available_column=route.label_available_column,
+    replay_guard = ReplayResourceGuard(
+        request, replay_mode=ReplayMode.FINAL_PROMOTION_BASE_AND_STRESS
     )
+    replay_context = _prepare_replay_static_context(
+        training_panel, request, holding_horizon_sessions=route.horizon,
+        guard=replay_guard,
+    )
+    try:
+        replay = _event_ledger_evaluation(
+            training_panel, oos, request, snapshot.manifest, registry, base,
+            stress, replay_context=replay_context,
+            calibration_ledger=champion_oos_ledger,
+            holding_horizon_sessions=route.horizon,
+            label_column=route.label_column,
+            label_available_column=route.label_available_column,
+            replay_mode=ReplayMode.FINAL_PROMOTION_BASE_AND_STRESS,
+            replay_guard=replay_guard,
+        )
+    except TrainingCapacityError as exc:
+        return _publish_no_trade(
+            registry, request, base_manifest, panel, route.label_column,
+            route.relevance_column, "replay-capacity-exceeded",
+            details=str(exc),
+            tuning_telemetry=replay_guard.telemetry(),
+        )
 
     reasons: list[str] = []
     budget = PromotionRiskBudget()
@@ -601,6 +800,53 @@ def _resolve_route_specs(
             + "; ".join(f"{h}d ({reason})" for h, reason in invalid)
         )
     return tuple(routes)
+
+
+def _merge_replay_telemetry(
+    route_attrs: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    """Aggregate per-route replay resource telemetry into one summary."""
+    summaries = [
+        cast(dict[str, object], attrs["replay_resource"])
+        for attrs in route_attrs.values()
+        if isinstance(attrs.get("replay_resource"), dict)
+    ]
+    if not summaries:
+        return {}
+    peak = max(
+        float(cast(float, s.get("replay_peak_rss_mib", 0.0))) for s in summaries
+    )
+    prepared_decision_count = sum(
+        int(cast(int, s.get("prepared_decision_count", 0))) for s in summaries
+    )
+    stage_seconds = cast(
+        dict[str, object],
+        next(
+            (
+                s.get("replay_stage_seconds")
+                for s in summaries
+                if isinstance(s.get("replay_stage_seconds"), dict)
+            ),
+            {},
+        ),
+    )
+    replay_seconds = float(cast(float, stage_seconds.get("replay", 0.0)))
+    return {
+        "replay_stage_seconds": {
+            "replay": round(replay_seconds, 3),
+        },
+        "replay_peak_rss_mib": round(peak, 3),
+        "prepared_decision_count": prepared_decision_count,
+        "inner_stress_replay": False,
+        "capacity_failure_reason": next(
+            (
+                s.get("capacity_failure_reason")
+                for s in summaries
+                if s.get("capacity_failure_reason") is not None
+            ),
+            None,
+        ),
+    }
 
 
 def _route_manifest(base_manifest: ModelManifest, route: RouteSpec) -> ModelManifest:
@@ -897,6 +1143,7 @@ def _tune_champion(
         "early_rejected_full_refits": early_rejected_total,
         "early_rejected_full_refit_seconds": early_rejected_seconds_total,
         "shortlist_candidate_evidence": shortlist_evidence_all,
+        "replay_resource": _merge_replay_telemetry(route_attrs),
         "routes": route_attrs,
     }
     if best_screen_rank_ic is not None:
@@ -1285,14 +1532,16 @@ def _prepare_replay_static_context(
     request: TrainingRequest,
     *,
     holding_horizon_sessions: int = 5,
+    guard: ReplayResourceGuard | None = None,
 ) -> ReplayStaticContext:
     """Build the candidate-invariant replay inputs once per selection panel.
 
-    The market frame (carrying the immutable point-in-time market columns),
-    instrument map, and risk policy are shared by every shortlisted candidate.
-    ``holding_horizon_sessions`` fixes the policy's rebalance cadence so a
-    route replays at its own session frequency. Raises ``ValueError`` for a
-    missing required replay column or a non-finite cached market input.
+    The compact market index (carrying the immutable point-in-time execution
+    columns and the causal 20-session ADTV), instrument map, and risk policy
+    are shared by every shortlisted candidate. ``holding_horizon_sessions``
+    fixes the policy's rebalance cadence so a route replays at its own session
+    frequency. Raises ``ValueError`` for a missing required replay column or a
+    non-finite cached market input.
     """
     from src.stocks.backtesting.engine import REQUIRED_BACKTEST_COLUMNS
 
@@ -1307,7 +1556,8 @@ def _prepare_replay_static_context(
         .over("instrument_id")
         .alias("adtv")
     )
-    instruments = _instruments_from_frame(frame)
+    market_index = _build_replay_market_index(frame, guard=guard)
+    instruments = _instruments_from_frame(market_index)
     policy = StockRiskPolicy(
         top_k=request.top_k,
         gross_cap=request.max_exposure,
@@ -1316,10 +1566,10 @@ def _prepare_replay_static_context(
         rebalance_frequency_sessions=holding_horizon_sessions,
     )
     return ReplayStaticContext(
-        market_panel=frame,
+        market_index=market_index,
         instruments=instruments,
         policy=policy,
-        cache_bytes=_frame_bytes(frame),
+        cache_bytes=_frame_bytes(market_index),
     )
 
 
@@ -1487,8 +1737,12 @@ def _select_economic_champion(
     """
     if not shortlist:
         return None, None
+    replay_guard = ReplayResourceGuard(
+        request, replay_mode=ReplayMode.INNER_SELECTION_BASE_ONLY
+    )
     replay_context = _prepare_replay_static_context(
         tuning_panel, request, holding_horizon_sessions=route.horizon,
+        guard=replay_guard,
     )
     refit_started = time.perf_counter()
     candidate_rows: list[tuple[tuple[float, ...], int]] = []
@@ -1519,14 +1773,25 @@ def _select_economic_champion(
         causal_oos_ledger = _build_calibration_ledger(
             oos, tuning_panel, route.label_column, route.label_available_column,
         )
-        replay = _event_ledger_evaluation(
-            tuning_panel, oos, request, dataset_manifest, registry, base_schedule,
-            stress_schedule, replay_context=replay_context,
-            calibration_ledger=causal_oos_ledger,
-            holding_horizon_sessions=route.horizon,
-            label_column=route.label_column,
-            label_available_column=route.label_available_column,
-        )
+        try:
+            replay = _event_ledger_evaluation(
+                tuning_panel, oos, request, dataset_manifest, registry,
+                base_schedule, stress_schedule, replay_context=replay_context,
+                calibration_ledger=causal_oos_ledger,
+                holding_horizon_sessions=route.horizon,
+                label_column=route.label_column,
+                label_available_column=route.label_available_column,
+                replay_mode=ReplayMode.INNER_SELECTION_BASE_ONLY,
+                replay_guard=replay_guard,
+            )
+        except TrainingCapacityError as exc:
+            replay_guard.capacity_failure_reason = "replay_capacity_exceeded"
+            replay_seconds += time.perf_counter() - replay_started
+            logger.warning(
+                "[EVAL] trial=%s stage=replay_capacity_exceeded %s",
+                trial_number, exc,
+            )
+            continue
         replay_seconds += time.perf_counter() - replay_started
         evidence = _evaluate_economic_candidate(
             fold_rank_ic, replay, request, trial_number, _screen_ic,
@@ -1588,6 +1853,7 @@ def _select_economic_champion(
             float(sum(early_rejected_seconds)), 3
         ),
         "shortlist_candidate_evidence": shortlist_evidence,
+        "replay_resource": replay_guard.telemetry(),
     }
     if not candidate_rows:
         return None, {
@@ -1705,13 +1971,15 @@ def _event_ledger_evaluation(
     holding_horizon_sessions: int = 5,
     label_column: str = "residual_o2o_5d",
     label_available_column: str = "label_available_time",
+    replay_mode: ReplayMode = ReplayMode.FINAL_PROMOTION_BASE_AND_STRESS,
+    replay_guard: ReplayResourceGuard | None = None,
 ) -> ReplayResult:
     """Replay the out-of-sample scored panel through the event-driven backtester.
 
     A scored planner constructs constrained target allocations directly from the
     frozen fold predictions, so promotion metrics come from the same event
     ledger used by paper/live paths without needing a pre-published artifact.
-    When ``replay_context`` is supplied its cached market panel, risk policy,
+    When ``replay_context`` is supplied its compact market index, risk policy,
     and instruments are reused instead of being rebuilt; only ``pred_score``
     is joined per replay. The policy's ``rebalance_frequency_sessions`` (built
     from ``holding_horizon_sessions``) drives the decision cadence, and the
@@ -1720,15 +1988,24 @@ def _event_ledger_evaluation(
     causal 20-session ADTV is computed once and passed to the backtester so the
     base and stress execution ledgers reuse the same validated column instead of
     recomputing it twice.
+
+    ``replay_mode`` selects the evidence scope: inner shortlist selection runs
+    only a base-cost ledger (``INNER_SELECTION_BASE_ONLY``), while final
+    promotion runs the paired base/stress replay with one prepared decision per
+    decision timestamp (``FINAL_PROMOTION_BASE_AND_STRESS``). Every replay
+    materialization is admitted through ``replay_guard`` when supplied, and an
+    unsafe admission or observed RSS breach raises ``TrainingCapacityError``.
     """
     from src.core.portfolio import PortfolioSnapshot
     from src.stocks.backtesting.engine import (
         ArtifactSchedule,
         ArtifactSlot,
         BacktestRequest,
+        PreparedReplayDecision,
         StockBacktester,
     )
     from src.stocks.data.costs import CostEvidence
+    from src.stocks.trading.portfolio_constructor import construct_target_allocations
     from src.stocks.workflows.trading_cycle import (
         CycleStatus,
         TradingCycleRequest,
@@ -1739,16 +2016,23 @@ def _event_ledger_evaluation(
     if replay_context is None:
         replay_context = _prepare_replay_static_context(
             panel, request, holding_horizon_sessions=holding_horizon_sessions,
+            guard=replay_guard,
         )
-    frame = replay_context.market_panel
+    frame = replay_context.market_index
     instruments = replay_context.instruments
     policy = replay_context.policy
 
+    if replay_guard is not None:
+        replay_guard.admit(
+            int(oos_scored.estimated_size()), stage="candidate_score_join"
+        )
     scored_for_replay = frame.join(
         oos_scored.select("instrument_id", "session", "pred_score"),
         on=["instrument_id", "session"],
         how="left",
     )
+    if replay_guard is not None:
+        replay_guard.check_after(stage="candidate_score_join")
 
     scored_sessions = sorted(
         scored_for_replay.filter(pl.col("pred_score").is_not_null())["session"].unique().to_list()
@@ -1757,6 +2041,10 @@ def _event_ledger_evaluation(
         raise ValueError("scored OOS panel exposes no scored session")
     replay_frame = frame.filter(pl.col("session") >= scored_sessions[0])
     sessions = sorted(replay_frame["session"].unique().to_list())
+    if replay_guard is not None:
+        replay_guard.admit(
+            int(replay_frame.estimated_size()), stage="replay_adtv"
+        )
     replay_adtv = (
         replay_frame.sort("session")
         .with_columns(
@@ -1767,6 +2055,8 @@ def _event_ledger_evaluation(
         )
         .select("instrument_id", "session", "adtv")
     )
+    if replay_guard is not None:
+        replay_guard.check_after(stage="replay_adtv")
 
     calibrator = (
         CausalAlphaCalibrator(
@@ -1801,34 +2091,68 @@ def _event_ledger_evaluation(
             reasons=(reason,),
         )
 
-    def scored_planner(
-        snapshot: DatasetSnapshot,
-        registry_inner: object,
-        instruments_map: object,
+    def _prepare_decision(
+        decision_time: datetime,
+        execution_time: datetime,
+    ) -> PreparedReplayDecision:
+        """Prepare immutable market/planning inputs once for a decision."""
+        if replay_guard is not None:
+            replay_guard.record_prepared_decision()
+        try:
+            visible = _bounded_replay_history(
+                scored_for_replay, decision_time, policy
+            )
+        except ValueError as exc:
+            return PreparedReplayDecision(
+                decision_time, execution_time, pl.DataFrame(),
+                calibration_state=None, reason=f"constraint:{exc}",
+            )
+        if visible.is_empty():
+            return PreparedReplayDecision(
+                decision_time, execution_time, pl.DataFrame(),
+                calibration_state=None, reason="empty-scored-cross-section",
+            )
+        try:
+            calibration_state: dict[str, object] | None = None
+            if calibrator is not None:
+                assert calibration_ledger is not None
+                if replay_guard is not None:
+                    replay_guard.admit(
+                        int(visible.estimated_size())
+                        + _bootstrap_workspace_bytes(
+                            request,
+                            int(calibration_ledger["session"].n_unique()),
+                            int(calibration_ledger["instrument_id"].n_unique()),
+                        ),
+                        stage="decision_preparation",
+                    )
+                calibration_state = calibrator.prepare_decision(
+                    calibration_ledger, decision_time, base_schedule
+                )
+                visible = calibrator.apply_prepared(calibration_state, visible)
+                calibration_tracker["state"] = calibrator.calibration_state()
+        except ValueError as exc:
+            return PreparedReplayDecision(
+                decision_time, execution_time, pl.DataFrame(),
+                calibration_state=None, reason=f"constraint:{exc}",
+            )
+        return PreparedReplayDecision(
+            decision_time, execution_time, visible,
+            calibration_state=calibration_state,
+        )
+
+    def _scenario_planner(
+        prepared: PreparedReplayDecision,
         portfolio: PortfolioSnapshot,
         cycle_request: TradingCycleRequest,
     ) -> TradingCycleResult:
-        del snapshot, registry_inner, instruments_map
-        from src.stocks.trading.portfolio_constructor import construct_target_allocations
-
-        try:
-            visible = _bounded_replay_history(
-                scored_for_replay, cycle_request.decision_time, policy
-            )
-        except ValueError as exc:
-            return _scored_no_trade(portfolio, cycle_request, f"constraint:{exc}")
+        """Construct scenario-specific allocations against the prepared inputs."""
+        if prepared.reason is not None:
+            return _scored_no_trade(portfolio, cycle_request, prepared.reason)
+        visible = prepared.visible
         if visible.is_empty():
             return _scored_no_trade(portfolio, cycle_request, "empty-scored-cross-section")
         try:
-            if calibrator is not None:
-                assert calibration_ledger is not None
-                visible = calibrator.transform(
-                    visible,
-                    calibration_ledger,
-                    cycle_request.decision_time,
-                    base_schedule,
-                )
-                calibration_tracker["state"] = calibrator.calibration_state()
             allocations = construct_target_allocations(
                 visible, instruments, portfolio, policy
             )
@@ -1885,20 +2209,37 @@ def _event_ledger_evaluation(
         )
     )
     evidence: CostEvidence | None = getattr(request, "cost_evidence", None)
-    backtester = StockBacktester(
-        planner=scored_planner,
-        registry=registry,
-        instruments=instruments,
-        manifest=dataset_manifest,
-        cost_schedule=base_schedule,
-        stress_cost_schedule=stress_schedule,
-        cost_evidence=evidence,
-        seed=request.seed,
-    )
+    if replay_mode is ReplayMode.INNER_SELECTION_BASE_ONLY:
+        backtester = StockBacktester(
+            registry=registry,
+            instruments=instruments,
+            manifest=dataset_manifest,
+            cost_schedule=base_schedule,
+            stress_cost_schedule=None,
+            cost_evidence=evidence,
+            seed=request.seed,
+            decision_provider=_prepare_decision,
+            scenario_planner=_scenario_planner,
+        )
+    else:
+        backtester = StockBacktester(
+            registry=registry,
+            instruments=instruments,
+            manifest=dataset_manifest,
+            cost_schedule=base_schedule,
+            stress_cost_schedule=stress_schedule,
+            cost_evidence=evidence,
+            seed=request.seed,
+            decision_provider=_prepare_decision,
+            scenario_planner=_scenario_planner,
+        )
     result = backtester.run(
         replay_frame, artifacts, initial_portfolio, backtest_request,
         adtv=replay_adtv,
     )
+    if replay_guard is not None:
+        replay_guard.check_after(stage="replay")
+        replay_guard.record_stage("replay", 0.0)
     benchmark = _benchmark_return_series(replay_frame)
     strategy_returns = _strategy_return_series(list(result.ledger))
     excess = _aligned_excess(strategy_returns, benchmark)
@@ -1938,6 +2279,9 @@ def _event_ledger_evaluation(
         }
     else:
         calibration_evidence = {}
+    replay_resource: dict[str, object] = {}
+    if replay_guard is not None:
+        replay_resource = replay_guard.telemetry()
     return ReplayResult(
         ledger=tuple(result.ledger),
         trades=tuple(result.trades),
@@ -1957,6 +2301,9 @@ def _event_ledger_evaluation(
         filled_orders=result.filled_orders,
         no_trade_reason_counts=no_trade_reason_counts,
         calibration_evidence=calibration_evidence,
+        replay_mode=replay_mode.value,
+        replay_resource=replay_resource,
+        prepared_decision_count=backtester.prepared_decision_count,
     )
 
 
@@ -2494,13 +2841,30 @@ def _evaluate_forward_holdout(
     if not models:
         return False, "gate8_forward_holdout_ready=false:no-fit", None
     holdout_oos = pl.concat(scored)
-    replay = _event_ledger_evaluation(
-        panel, holdout_oos, request, dataset_manifest, registry, base_schedule,
-        stress_schedule, calibration_ledger=calibration_ledger,
-        holding_horizon_sessions=holding_horizon_sessions,
-        label_column=label_column,
-        label_available_column=label_available_column,
+    replay_guard = ReplayResourceGuard(
+        request, replay_mode=ReplayMode.FINAL_PROMOTION_BASE_AND_STRESS
     )
+    replay_context = _prepare_replay_static_context(
+        panel, request, holding_horizon_sessions=holding_horizon_sessions,
+        guard=replay_guard,
+    )
+    try:
+        replay = _event_ledger_evaluation(
+            panel, holdout_oos, request, dataset_manifest, registry,
+            base_schedule, stress_schedule, replay_context=replay_context,
+            calibration_ledger=calibration_ledger,
+            holding_horizon_sessions=holding_horizon_sessions,
+            label_column=label_column,
+            label_available_column=label_available_column,
+            replay_mode=ReplayMode.FINAL_PROMOTION_BASE_AND_STRESS,
+            replay_guard=replay_guard,
+        )
+    except TrainingCapacityError:
+        return (
+            False,
+            "gate8_forward_holdout_ready=false:replay-capacity-exceeded",
+            None,
+        )
     if replay.attempted_orders <= 0:
         return False, "gate8_forward_holdout_ready=false:no-attempted-orders", None
     if replay.filled_orders <= 0:
@@ -2676,4 +3040,7 @@ def _build_metrics(
         "gates": gates,
         "optuna_trials": request.optuna_trials,
         "resource": tuning_telemetry or {},
+        "replay_mode": replay.replay_mode,
+        "replay_resource": replay.replay_resource or {},
+        "prepared_decision_count": replay.prepared_decision_count,
     }
