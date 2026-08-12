@@ -450,3 +450,54 @@ class TestEconomicGating:
         assert all(
             a.instrument.instrument_id != held.instrument_id for a in exiting
         )
+
+
+def test_prepared_allocations_match_reference_constructor() -> None:
+    """The array-backed prepared constructor is bit-identical to the reference."""
+    panel = scored_panel(n_sessions=61, n_tickers=10, seed=9).drop("ret")
+    policy = StockRiskPolicy(top_k=20, participation_limit=0.01)
+    instruments = instruments_for(10)
+    portfolio = empty_portfolio()
+
+    reference = construct_target_allocations(panel, instruments, portfolio, policy)
+    assert reference
+
+    from src.stocks.trading.portfolio_constructor import (
+        PreparedAllocationMarket,
+        construct_target_allocations_prepared,
+    )
+
+    market = PreparedAllocationMarket.build(panel)
+    overlay = (
+        panel.sort(["session", "instrument_id"])["pred_score"].to_numpy().astype(float)
+    )
+    allocations = construct_target_allocations_prepared(
+        market,
+        len(market.sessions) - 1,
+        overlay,
+        None,
+        instruments,
+        portfolio,
+        policy,
+    )
+    assert allocations == reference
+
+
+def test_prepared_allocations_reject_overlay_length_mismatch() -> None:
+    from src.stocks.trading.portfolio_constructor import (
+        PreparedAllocationMarket,
+        construct_target_allocations_prepared,
+    )
+
+    panel = scored_panel(n_sessions=61, n_tickers=10, seed=9).drop("ret")
+    market = PreparedAllocationMarket.build(panel)
+    with pytest.raises(ValueError, match="row count"):
+        construct_target_allocations_prepared(
+            market,
+            len(market.sessions) - 1,
+            np.asarray([0.5] * (market.row_count - 1)),
+            None,
+            instruments_for(10),
+            empty_portfolio(),
+            StockRiskPolicy(top_k=20),
+        )
