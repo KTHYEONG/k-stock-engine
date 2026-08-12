@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ECONOMIC_REPLAY_SHORTLIST_THROUGHPUT",
+      "date": "2026-08-12",
+      "adr_id": "ADR_20260812_ECONOMIC_REPLAY_SHORTLIST_THROUGHPUT",
+      "domain": "stocks",
+      "title": "Bounded shortlist refit execution",
+      "why": "The 81-trial run reached h5 screen completion but did not produce a final artifact before the execution session ended.",
+      "resolution": "Registered the screen-informed 900-round/100-patience shortlist refit optimization and synchronized the bounded execution outcome.",
+      "impact": "Preserves all causal, cost, bootstrap, replay, RSS, and promotion gates while keeping the repository clean for the next durable long-running execution."
+    },
+    {
       "task_id": "TASK_ECONOMIC_REPLAY_ALPHA_IMPROVEMENT",
       "date": "2026-08-12",
       "adr_id": "ADR_20260812_ECONOMIC_REPLAY_ALPHA_IMPROVEMENT",
