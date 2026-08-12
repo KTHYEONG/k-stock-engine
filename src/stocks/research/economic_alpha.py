@@ -665,6 +665,7 @@ def _block_bootstrap_lower_bound(
     alpha: float,
     *,
     max_bootstrap_workspace_bytes: int | None = None,
+    use_prefix_sum: bool = False,
 ) -> float:
     """Vectorized moving-block bootstrap ``alpha`` quantile of block means.
 
@@ -674,17 +675,41 @@ def _block_bootstrap_lower_bound(
     at or below the cap. Consecutive batch shapes partition the first dimension,
     so the identical RNG stream is consumed in the identical row-major order and
     the batched means are bit-identical to the legacy one-shot means.
+
+    ``use_prefix_sum`` selects the block-prefix-sum kernel: the identical seeded
+    block starts are generated and the sampled block means are summed from a
+    precomputed cumulative sum, reducing workspace from ``O(draws * rows)`` to
+    ``O(draws * rows / block_length)``. The result stays within the conservative
+    :func:`_bootstrap_error_bound`; when a lower bound lands inside that bound of
+    the zero economic gate, the bucket is recomputed with the exact reference
+    kernel so a near-gate decision is never made on prefix-sum rounding.
     """
     if max_bootstrap_workspace_bytes is not None and max_bootstrap_workspace_bytes <= 0:
         raise ValueError("max_bootstrap_workspace_bytes must be positive when supplied")
     arr = np.asarray(values, dtype=float)
     if arr.size == 0:
         return 0.0
-    rng = np.random.default_rng(seed)
     n = arr.size
     block = max(block_length, 1)
     n_blocks = int(np.ceil(n / block))
     max_start = max(1, n - block + 1)
+    if use_prefix_sum:
+        estimate = float(
+            np.quantile(
+                _prefix_sum_block_means(
+                    arr, block, n_blocks, max_start, n_bootstrap, seed,
+                    max_workspace_bytes=max_bootstrap_workspace_bytes,
+                ),
+                alpha,
+            )
+        )
+        if abs(estimate) <= _bootstrap_error_bound(arr):
+            return _block_bootstrap_lower_bound(
+                arr, block_length, n_bootstrap, seed, alpha,
+                max_bootstrap_workspace_bytes=max_bootstrap_workspace_bytes,
+            )
+        return estimate
+    rng = np.random.default_rng(seed)
     offsets = np.arange(block)
     if max_bootstrap_workspace_bytes is None:
         starts = rng.integers(0, max_start, size=(n_bootstrap, n_blocks))
@@ -707,6 +732,100 @@ def _block_bootstrap_lower_bound(
         )[:, :n]
         means[offset:stop] = arr[index].mean(axis=1)
     return float(np.quantile(means, alpha))
+
+
+def _prefix_sum_block_means(
+    arr: np.ndarray,
+    block: int,
+    n_blocks: int,
+    max_start: int,
+    n_bootstrap: int,
+    seed: int,
+    *,
+    max_workspace_bytes: int | None = None,
+) -> np.ndarray:
+    """Moving-block bootstrap means via a deterministic block-prefix sum.
+
+    Each draw's sample is the concatenation of ``n_blocks`` length-``block``
+    blocks starting at seeded starts; only the final block may be truncated at
+    ``arr.size``. Complete block sums come from the cumulative-sum array and the
+    final partial block from the truncated cumulative difference, so the mean of
+    every draw equals the reference materialized mean within float rounding.
+    Draws are generated in the identical seeded order and, when a workspace cap
+    is supplied, processed in contiguous batches that consume the same RNG
+    stream in the same row-major order.
+    """
+    csum = np.empty(arr.size + 1, dtype=np.float64)
+    np.cumsum(arr, out=csum[1:])
+    csum[0] = 0.0
+    return _prefix_sum_means_from_csum(
+        csum,
+        n=arr.size,
+        block=block,
+        n_blocks=n_blocks,
+        max_start=max_start,
+        n_bootstrap=n_bootstrap,
+        seed=seed,
+        max_workspace_bytes=max_workspace_bytes,
+    )
+
+
+def _prefix_sum_means_from_csum(
+    csum: np.ndarray,
+    *,
+    n: int,
+    block: int,
+    n_blocks: int,
+    max_start: int,
+    n_bootstrap: int,
+    seed: int,
+    max_workspace_bytes: int | None = None,
+) -> np.ndarray:
+    """Bootstrap means from a precomputed ``float64`` cumulative-sum array.
+
+    ``csum[i]`` is the sum of the first ``i`` residuals, so the schedule can
+    extend cumulative sums incrementally as eligible sessions arrive instead of
+    re-materializing residuals per decision. The generated starts and the
+    reduction order are identical to :func:`_prefix_sum_block_means`.
+    """
+    rng = np.random.default_rng(seed)
+    per_draw_bytes = n_blocks * (8 + 8)
+    batch_draws = n_bootstrap if max_workspace_bytes is None else max(1, max_workspace_bytes // per_draw_bytes)
+    batch_draws = min(batch_draws, n_bootstrap)
+    full_blocks = np.arange(max(0, n_blocks - 1))
+    means = np.empty(n_bootstrap, dtype=np.float64)
+    for offset in range(0, n_bootstrap, batch_draws):
+        stop = min(offset + batch_draws, n_bootstrap)
+        count = stop - offset
+        starts = rng.integers(0, max_start, size=(count, n_blocks))
+        full_sums = csum[starts[:, full_blocks] + block] - csum[starts[:, full_blocks]]
+        last_end = np.minimum(starts[:, -1] + block, n)
+        last_sums = csum[last_end] - csum[starts[:, -1]]
+        means[offset:stop] = (full_sums.sum(axis=1) + last_sums) / n
+    return means
+
+
+def _bootstrap_error_bound(arr: np.ndarray) -> float:
+    """Conservative float64 rounding bound for the prefix-sum reduction.
+
+    A prefix-sum value is the difference of two cumulative sums of at most
+    ``arr.size`` elements; the block sums then combine ``ceil(n / block)`` such
+    differences. The bound is intentionally conservative: ``float64`` epsilon
+    times the data scale times the full reduction depth, so a near-gate value
+    always falls back to the exact reference kernel.
+    """
+    if arr.size == 0:
+        return 0.0
+    return _bootstrap_error_bound_from_scale(
+        float(np.max(np.abs(arr))), arr.size
+    )
+
+
+def _bootstrap_error_bound_from_scale(scale: float, n: int) -> float:
+    """Conservative float64 rounding bound from a tracked residual scale."""
+    if n <= 0:
+        return 0.0
+    return float(np.finfo(float).eps * max(1.0, float(scale)) * (n + 2) * 4.0)
 
 
 def _liquidity_slippage_rates(

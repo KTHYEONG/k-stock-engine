@@ -17,6 +17,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from math import ceil, floor
+from typing import Any
 
 import numpy as np
 import polars as pl
@@ -222,6 +223,201 @@ class PreparedReplayDecision:
     reason: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedRow:
+    """Array-backed replay row: ``get``/``[]`` resolve from the market."""
+
+    market: PreparedReplayMarket
+    index: int
+
+    def get(self, key: str, default: object = None) -> object:
+        return self.market.value_at(self.index, key, default)
+
+    def __getitem__(self, key: str) -> object:
+        return self.market.value_at(self.index, key)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedReplayMarket:
+    """Immutable, array-backed replay market shared by every candidate.
+
+    Built once per training snapshot, the market owns the canonical sorted
+    ``session``/``instrument_id`` row index and aligned ``float64`` arrays for
+    execution fields, close returns, trading value, rolling ADTV, and rolling
+    volatility, so a candidate contributes only an aligned score overlay instead
+    of re-partitioning frames and recomputing market-wide statistics per replay.
+    ``session_ranges`` maps each session index to its contiguous row range;
+    ``rows_by_key`` resolves ``(instrument_id, session)`` rows in ``O(1)``.
+    """
+
+    sessions: tuple[datetime, ...]
+    session_ranges: Mapping[int, tuple[int, int]]
+    rows_by_key: Mapping[tuple[str, datetime], _PreparedRow]
+    instrument_ids: np.ndarray
+    row_session_of: np.ndarray
+    close: np.ndarray
+    open_: np.ndarray
+    volume: np.ndarray
+    trading_value: np.ndarray
+    adtv: np.ndarray
+    volatility: np.ndarray
+    has_volatility: bool
+    available_time: np.ndarray
+    limit_locked: np.ndarray | None
+    action_interval_covered: np.ndarray | None
+    close_returns: np.ndarray
+    instruments: Mapping[str, Instrument]
+    artifacts: ArtifactSchedule | None
+    initial_portfolio: PortfolioSnapshot | None
+    cache_bytes: int
+
+    @property
+    def row_count(self) -> int:
+        return int(self.instrument_ids.size)
+
+    def value_at(self, index: int, key: str, default: object = None) -> object:
+        """Return the aligned column value for one market row."""
+        if key == "instrument_id":
+            return self.instrument_ids[index]
+        if key == "session":
+            return self.sessions[int(self.row_session_of[index])]
+        if key == "open":
+            return self.open_[index]
+        if key == "close":
+            return self.close[index]
+        if key == "volume":
+            return self.volume[index]
+        if key == "trading_value":
+            return self.trading_value[index]
+        if key == "adtv":
+            return self.adtv[index]
+        if key == "feature__volatility_20d":
+            if not self.has_volatility:
+                return default
+            return self.volatility[index]
+        if key == "available_time":
+            return self.available_time[index]
+        if key == "limit_locked":
+            if self.limit_locked is None:
+                return default
+            return bool(self.limit_locked[index])
+        if key == "action_interval_covered":
+            if self.action_interval_covered is None:
+                return default
+            return bool(self.action_interval_covered[index])
+        return default
+
+    @classmethod
+    def build(
+        cls,
+        frame: pl.DataFrame,
+        adtv_window: int,
+        *,
+        instruments: Mapping[str, Instrument] | None = None,
+        artifacts: ArtifactSchedule | None = None,
+        initial_portfolio: PortfolioSnapshot | None = None,
+    ) -> PreparedReplayMarket:
+        """Build the immutable market once from a validated replay frame.
+
+        The frame must carry ``REQUIRED_BACKTEST_COLUMNS``; the causal 20-session
+        rolling ADTV and per-instrument close-return series are computed once and
+        aligned to the canonical ``(session, instrument_id)`` row order. Raises
+        ``BacktestValidationError`` for missing columns or non-finite execution
+        values.
+        """
+        missing = [c for c in REQUIRED_BACKTEST_COLUMNS if c not in frame.columns]
+        if missing:
+            raise BacktestValidationError(f"panel must carry {', '.join(missing)}")
+        ordered = frame.sort(["session", "instrument_id"])
+        if ordered.is_empty():
+            raise BacktestValidationError("panel has no rows")
+        with_adtv = ordered.with_columns(
+            pl.col("trading_value")
+            .rolling_mean(adtv_window, min_samples=1)
+            .over("instrument_id")
+            .alias("adtv")
+        )
+        return_series = (
+            ordered.sort("session")
+            .with_columns(
+                (pl.col("close").log().diff().over("instrument_id")).alias("__logret")
+            )["__logret"]
+            .fill_null(0.0)
+        )
+        sessions = tuple(
+            _as_datetime(s) for s in ordered["session"].unique().sort().to_list()
+        )
+        session_index_of = {
+            session: i for i, session in enumerate(sessions)
+        }
+        row_sessions = [session_index_of[_as_datetime(s)] for s in ordered["session"].to_list()]
+        ranges: dict[int, tuple[int, int]] = {}
+        current = -1
+        start = 0
+        for i, session_idx in enumerate(row_sessions):
+            if session_idx != current:
+                if current != -1:
+                    ranges[current] = (start, i)
+                current = session_idx
+                start = i
+        ranges[current] = (start, len(row_sessions))
+
+        instrument_ids = np.asarray(
+            [str(i) for i in ordered["instrument_id"].to_list()], dtype=object
+        )
+        available_time = np.asarray(
+            [
+                _as_datetime(v)
+                if v is not None
+                else None
+                for v in ordered.get_column("available_time").to_list()
+            ],
+            dtype=object,
+        )
+        limit_locked = (
+            ordered["limit_locked"].to_numpy().astype(bool)
+            if "limit_locked" in ordered.columns
+            else None
+        )
+        action_interval_covered = (
+            ordered["action_interval_covered"].to_numpy().astype(bool)
+            if "action_interval_covered" in ordered.columns
+            else None
+        )
+        rows_by_key: dict[tuple[str, datetime], _PreparedRow] = {}
+        market = cls(
+            sessions=sessions,
+            session_ranges=ranges,
+            rows_by_key=rows_by_key,
+            instrument_ids=instrument_ids,
+            row_session_of=np.asarray(row_sessions, dtype=np.int64),
+            close=ordered["close"].to_numpy().astype(np.float64),
+            open_=ordered["open"].to_numpy().astype(np.float64),
+            volume=ordered["volume"].to_numpy().astype(np.float64),
+            trading_value=ordered["trading_value"].to_numpy().astype(np.float64),
+            adtv=with_adtv["adtv"].to_numpy().astype(np.float64),
+            volatility=(
+                ordered["feature__volatility_20d"].to_numpy().astype(np.float64)
+                if "feature__volatility_20d" in ordered.columns
+                else np.zeros(ordered.height, dtype=np.float64)
+            ),
+            has_volatility="feature__volatility_20d" in ordered.columns,
+            available_time=available_time,
+            limit_locked=limit_locked,
+            action_interval_covered=action_interval_covered,
+            close_returns=return_series.to_numpy().astype(np.float64),
+            instruments=instruments or {},
+            artifacts=artifacts,
+            initial_portfolio=initial_portfolio,
+            cache_bytes=int(ordered.estimated_size()),
+        )
+        for i in range(ordered.height):
+            rows_by_key[
+                (str(ordered["instrument_id"][i]), sessions[int(row_sessions[i])])
+            ] = _PreparedRow(market, i)
+        return market
+
+
 @dataclass(slots=True)
 class _ScenarioState:
     """Mutable base or stress replay state advanced in one paired session loop."""
@@ -331,10 +527,14 @@ class StockBacktester:
             )
         )
         if self.decision_provider is not None and self.scenario_planner is not None:
-            return self._run_paired(
-                panel, by_session, sessions, artifacts, initial_portfolio, request,
-                adtv=adtv,
+            market = PreparedReplayMarket.build(
+                panel,
+                self.adtv_window,
+                instruments=self.instruments,
+                artifacts=artifacts,
+                initial_portfolio=initial_portfolio,
             )
+            return self.run_prepared(request, market, None)
         ledger, trades, attempted_orders = self._run_ledger(
             panel, by_session, sessions, artifacts, initial_portfolio, request,
             self.cost_schedule, self._liquidity_model(stress=False), adtv=adtv,
@@ -383,6 +583,217 @@ class StockBacktester:
             no_trade_reasons=no_trade_reasons,
         )
 
+    def run_prepared(
+        self,
+        request: BacktestRequest,
+        market: PreparedReplayMarket,
+        score_overlay: np.ndarray | None,
+    ) -> BacktestResult:
+        """Replay against a shared immutable prepared market.
+
+        Base and stress portfolio/settlement states are advanced independently
+        over the one immutable ``PreparedReplayMarket``; row data is read from
+        aligned arrays instead of per-session ``partition_by``/``to_dicts`` and
+        market-wide ADTV/returns are computed once. ``score_overlay`` is the
+        candidate's aligned ``float64`` score per market row (``NaN`` when the
+        candidate has no score) and is validated for length; execution reads
+        only market arrays while allocation decisions flow through the prepared
+        decision provider. Raises ``BacktestValidationError`` when the paired
+        decision provider is absent or the overlay length mismatches.
+        """
+        if self.decision_provider is None or self.scenario_planner is None:
+            raise BacktestValidationError(
+                "prepared replay requires a decision provider and scenario planner"
+            )
+        if score_overlay is not None and len(score_overlay) != market.row_count:
+            raise BacktestValidationError(
+                f"score overlay length {len(score_overlay)} does not match "
+                f"market row count {market.row_count}"
+            )
+        return self._run_paired_prepared(request, market)
+
+    def _run_paired_prepared(
+        self,
+        request: BacktestRequest,
+        market: PreparedReplayMarket,
+    ) -> BacktestResult:
+        if self.decision_provider is None or self.scenario_planner is None:
+            raise BacktestValidationError(
+                "prepared replay requires a decision provider and scenario planner"
+            )
+        if market.initial_portfolio is None:
+            raise BacktestValidationError("prepared market requires an initial portfolio")
+        if market.artifacts is None:
+            raise BacktestValidationError("prepared market requires an artifact schedule")
+        decision_set = {int(i) for i in request.decision_session_indices}
+        rows_by_key = market.rows_by_key
+        base_state = _ScenarioState.from_initial(market.initial_portfolio)
+        stress_state = _ScenarioState.from_initial(market.initial_portfolio)
+        base_liquidity = self._liquidity_model(stress=False)
+        stress_liquidity = self._liquidity_model(stress=True)
+        base_schedule = self.cost_schedule
+        stress_schedule = self.stress_cost_schedule
+        self.prepared_decision_count = 0
+
+        for index, session in enumerate(market.sessions):
+            self._advance_prepared_scenario(
+                base_state, market, rows_by_key, index, session, base_schedule,
+                base_liquidity,
+            )
+            if stress_schedule is not None:
+                self._advance_prepared_scenario(
+                    stress_state, market, rows_by_key, index, session,
+                    stress_schedule, stress_liquidity,
+                )
+
+            if index in decision_set and index + 1 < len(market.sessions):
+                decision_time = self._prepared_decision_time(market, index, session)
+                execution_time = market.sessions[index + 1]
+                artifact_id = market.artifacts.artifact_for(decision_time)
+                prepared = self.decision_provider(decision_time, execution_time)
+                self.prepared_decision_count += 1
+                base_cycle = self._plan_paired(
+                    prepared, base_state, decision_time, execution_time,
+                    artifact_id, request,
+                )
+                self._last_cycles[index] = base_cycle
+                base_state.pending_orders = self._plan_orders(
+                    base_cycle, rows_by_key, execution_time, base_state.positions,
+                    base_state.settled_cash, base_schedule,
+                )
+                base_state.attempted_orders += len(base_state.pending_orders)
+                if stress_schedule is not None:
+                    stress_cycle = self._plan_paired(
+                        prepared, stress_state, decision_time, execution_time,
+                        artifact_id, request,
+                    )
+                    self._last_cycles[index] = stress_cycle
+                    stress_state.pending_orders = self._plan_orders(
+                        stress_cycle, rows_by_key, execution_time,
+                        stress_state.positions, stress_state.settled_cash,
+                        stress_schedule,
+                    )
+                    stress_state.attempted_orders += len(stress_state.pending_orders)
+
+        return self._result_from_states(base_state, stress_state, market.initial_portfolio)
+
+    def _advance_prepared_scenario(
+        self,
+        state: _ScenarioState,
+        market: PreparedReplayMarket,
+        rows_by_key: Mapping[tuple[str, datetime], Any],
+        index: int,
+        session: datetime,
+        schedule: CostSchedule,
+        liquidity_model: LiquiditySlippageModel | None,
+    ) -> None:
+        """Advance one scenario reading only aligned prepared-market arrays."""
+        due = state.settlements.pop(index, 0.0)
+        if due:
+            state.settled_cash += due
+            state.unsettled_cash -= due
+
+        new_pending: list[dict[str, object]] = []
+        for order in state.pending_orders:
+            state.settled_cash, state.unsettled_cash, state.accrued_costs = (
+                self._execute_order(
+                    order, None, rows_by_key, state.positions, state.settled_cash,
+                    state.unsettled_cash, state.accrued_costs, state.settlements,
+                    schedule, liquidity_model, index, session, state.trades,
+                )
+            )
+        state.pending_orders = new_pending
+
+        start, stop = market.session_ranges[index]
+        for row in range(start, stop):
+            close = market.close[row]
+            if close is not None and close == close:
+                state.last_close[str(market.instrument_ids[row])] = float(close)
+        positions_value = sum(
+            state.positions[i] * state.last_close[i]
+            for i in state.positions
+            if i in state.last_close
+        )
+        equity = (
+            state.settled_cash
+            + state.unsettled_cash
+            + positions_value
+            - state.accrued_costs
+        )
+        state.ledger.append(
+            BacktestLedgerRow(
+                session=session,
+                settled_cash=state.settled_cash,
+                unsettled_cash=state.unsettled_cash,
+                positions_value=positions_value,
+                accrued_costs=state.accrued_costs,
+                equity=equity,
+            )
+        )
+
+    def _prepared_decision_time(self, market: PreparedReplayMarket, index: int, session: datetime) -> datetime:
+        start, stop = market.session_ranges[index]
+        values: list[datetime] = [
+            value
+            for value in market.available_time[start:stop]
+            if value is not None
+        ]
+        if not values:
+            raise BacktestValidationError("no available_time at decision session")
+        return max(values)
+
+    def _result_from_states(
+        self,
+        base_state: _ScenarioState,
+        stress_state: _ScenarioState,
+        initial_portfolio: PortfolioSnapshot,
+    ) -> BacktestResult:
+        """Derive the immutable result from independent base/stress states."""
+        ledger = base_state.ledger
+        trades = base_state.trades
+        final_value = ledger[-1].equity if ledger else initial_portfolio.settled_cash
+        metrics = self._metrics(ledger, trades)
+        stress_final_value: float | None = None
+        stress_metrics: dict[str, float] | None = None
+        if self.stress_cost_schedule is not None:
+            stress_metrics = self._metrics(
+                stress_state.ledger, stress_state.trades
+            )
+            stress_final_value = (
+                stress_state.ledger[-1].equity if stress_state.ledger else None
+            )
+        planned_cycles = sum(
+            1
+            for index in sorted(self._last_cycles)
+            if self._last_cycles[index].status is CycleStatus.PLANNED
+        )
+        no_trade_reasons = tuple(
+            reason
+            for index in sorted(self._last_cycles)
+            if self._last_cycles[index].status is not CycleStatus.PLANNED
+            for reason in self._last_cycles[index].reasons
+        )
+        filled_orders = sum(1 for trade in trades if trade.quantity > 0)
+        return BacktestResult(
+            ledger=tuple(ledger),
+            trades=tuple(trades),
+            final_value=final_value,
+            total_return=(
+                (final_value - initial_portfolio.settled_cash)
+                / initial_portfolio.settled_cash
+                if initial_portfolio.settled_cash > 0
+                else 0.0
+            ),
+            metrics=metrics,
+            stress_final_value=stress_final_value,
+            stress_metrics=stress_metrics,
+            data_quality=self._data_quality_evidence(),
+            planned_cycles=planned_cycles,
+            attempted_orders=base_state.attempted_orders,
+            filled_orders=filled_orders,
+            no_trade_reasons=no_trade_reasons,
+        )
+
     def _run_paired(
         self,
         panel: pl.DataFrame,
@@ -409,7 +820,7 @@ class StockBacktester:
             )
         decision_set = {int(i) for i in request.decision_session_indices}
         rows_frame = self._rows_frame_with_adtv(panel, adtv)
-        rows_by_key: dict[tuple[str, datetime], dict[str, object]] = {
+        rows_by_key: Mapping[tuple[str, datetime], Any] = {
             (str(r["instrument_id"]), _as_datetime(r["session"])): r
             for r in rows_frame.to_dicts()
         }
@@ -463,56 +874,13 @@ class StockBacktester:
                     )
                     stress_state.attempted_orders += len(stress_state.pending_orders)
 
-        ledger = base_state.ledger
-        trades = base_state.trades
-        final_value = ledger[-1].equity if ledger else initial_portfolio.settled_cash
-        metrics = self._metrics(ledger, trades)
-        stress_final_value: float | None = None
-        stress_metrics: dict[str, float] | None = None
-        if stress_schedule is not None:
-            stress_metrics = self._metrics(
-                stress_state.ledger, stress_state.trades
-            )
-            stress_final_value = (
-                stress_state.ledger[-1].equity if stress_state.ledger else None
-            )
-        planned_cycles = sum(
-            1
-            for index in sorted(self._last_cycles)
-            if self._last_cycles[index].status is CycleStatus.PLANNED
-        )
-        no_trade_reasons = tuple(
-            reason
-            for index in sorted(self._last_cycles)
-            if self._last_cycles[index].status is not CycleStatus.PLANNED
-            for reason in self._last_cycles[index].reasons
-        )
-        filled_orders = sum(1 for trade in trades if trade.quantity > 0)
-        return BacktestResult(
-            ledger=tuple(ledger),
-            trades=tuple(trades),
-            final_value=final_value,
-            total_return=(
-                (final_value - initial_portfolio.settled_cash)
-                / initial_portfolio.settled_cash
-                if initial_portfolio.settled_cash > 0
-                else 0.0
-            ),
-            metrics=metrics,
-            stress_final_value=stress_final_value,
-            stress_metrics=stress_metrics,
-            data_quality=self._data_quality_evidence(),
-            planned_cycles=planned_cycles,
-            attempted_orders=base_state.attempted_orders,
-            filled_orders=filled_orders,
-            no_trade_reasons=no_trade_reasons,
-        )
+        return self._result_from_states(base_state, stress_state, initial_portfolio)
 
     def _advance_scenario(
         self,
         state: _ScenarioState,
         rows: pl.DataFrame,
-        rows_by_key: dict[tuple[str, datetime], dict[str, object]],
+        rows_by_key: Mapping[tuple[str, datetime], Any],
         index: int,
         session: datetime,
         schedule: CostSchedule,
@@ -663,7 +1031,7 @@ class StockBacktester:
     ) -> tuple[list[BacktestLedgerRow], list[BacktestTrade], int]:
         decision_set = {int(i) for i in request.decision_session_indices}
         rows_frame = self._rows_frame_with_adtv(panel, adtv)
-        rows_by_key: dict[tuple[str, datetime], dict[str, object]] = {
+        rows_by_key: Mapping[tuple[str, datetime], Any] = {
             (str(r["instrument_id"]), _as_datetime(r["session"])): r
             for r in rows_frame.to_dicts()
         }
@@ -837,7 +1205,7 @@ class StockBacktester:
     def _plan_orders(
         self,
         cycle: TradingCycleResult,
-        rows_by_key: dict[tuple[str, datetime], dict[str, object]],
+        rows_by_key: Mapping[tuple[str, datetime], Any],
         execution_session: datetime,
         positions: dict[str, int],
         settled_cash: float,
@@ -870,8 +1238,8 @@ class StockBacktester:
     def _execute_order(
         self,
         order: dict[str, object],
-        rows: pl.DataFrame,
-        rows_by_key: dict[tuple[str, datetime], dict[str, object]],
+        rows: pl.DataFrame | None,
+        rows_by_key: Mapping[tuple[str, datetime], Any],
         positions: dict[str, int],
         settled_cash: float,
         unsettled_cash: float,
