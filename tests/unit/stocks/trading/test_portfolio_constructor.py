@@ -231,3 +231,201 @@ class TestDeRisk:
         assert allocations
         for a in allocations:
             assert a.target_value <= equity * policy.single_name_cap + 1e-8
+
+
+def _economic_panel(
+    n_sessions: int = 30,
+    n_tickers: int = 10,
+    seed: int = 3,
+    *,
+    positive_top: int = 3,
+) -> pl.DataFrame:
+    rng = np.random.default_rng(seed)
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    rows = [
+        {
+            "session": start + timedelta(days=s),
+            "instrument_id": f"KRX:{t:06d}",
+            "pred_score": float(t) * 0.1 + s % 2,
+            "sector": f"S{t % 3}",
+            "adtv": 1e9 * t,
+            "close": 50_000.0 + t + s,
+            "ret": float(rng.normal(0.0002, 0.01)),
+            "expected_active_alpha": 0.01 if t <= positive_top else -0.01,
+            "expected_net_alpha": 0.008 if t <= positive_top else -0.012,
+            "alpha_lower_bound": 0.004 if t <= positive_top else -0.002,
+            "exit_cost_rate": 0.002,
+        }
+        for s in range(n_sessions)
+        for t in range(1, n_tickers + 1)
+    ]
+    return pl.DataFrame(rows)
+
+
+def _holding_portfolio(
+    instrument_id: str,
+    price: float,
+    equity: float,
+) -> PortfolioSnapshot:
+    return PortfolioSnapshot(
+        account_snapshot_id="held",
+        as_of=datetime(2024, 1, 1, tzinfo=UTC),
+        settled_cash=equity - 0.05 * equity,
+        unsettled_cash=0.0,
+        positions=(
+            Position(
+                instrument=Instrument(
+                    instrument_id, AssetKind.STOCK, "KRX", instrument_id.split(":")[-1], "KRW", lot_size=1
+                ),
+                quantity=int(0.05 * equity // price),
+                average_cost=price,
+            ),
+        ),
+    )
+
+
+class TestEconomicAllocation:
+    def test_only_positive_net_alpha_names_enter(self) -> None:
+        policy = StockRiskPolicy(top_k=20)
+        panel = _economic_panel(positive_top=3)
+        instruments = instruments_for(10)
+        allocations = construct_target_allocations(panel, instruments, empty_portfolio(), policy)
+        assert [a.instrument.instrument_id for a in allocations] == [
+            f"KRX:{t:06d}" for t in (1, 2, 3)
+        ]
+
+    def test_non_positive_net_alpha_panel_returns_empty_cash(self) -> None:
+        policy = StockRiskPolicy(top_k=20)
+        panel = _economic_panel(positive_top=0)
+        instruments = instruments_for(10)
+        assert (
+            construct_target_allocations(panel, instruments, empty_portfolio(), policy)
+            == ()
+        )
+
+    def test_missing_alpha_columns_preserves_legacy_rank_behavior(self) -> None:
+        policy = StockRiskPolicy(top_k=20)
+        panel = _economic_panel().drop(
+            [
+                "expected_active_alpha",
+                "expected_net_alpha",
+                "alpha_lower_bound",
+                "exit_cost_rate",
+            ]
+        )
+        instruments = instruments_for(10)
+        allocations = construct_target_allocations(panel, instruments, empty_portfolio(), policy)
+        assert allocations
+        assert len(allocations) <= policy.top_k
+
+    def test_hard_caps_are_preserved_with_economic_columns(self) -> None:
+        policy = StockRiskPolicy(top_k=20, single_name_cap=0.08, gross_cap=0.9)
+        panel = _economic_panel(positive_top=8)
+        instruments = instruments_for(10)
+        equity = equity_of(panel, empty_portfolio())
+        allocations = construct_target_allocations(panel, instruments, empty_portfolio(), policy)
+        assert allocations
+        assert sum(a.target_value for a in allocations) <= equity * policy.gross_cap + 1e-8
+        for a in allocations:
+            assert a.target_value <= equity * policy.single_name_cap + 1e-8
+
+    def test_incumbent_with_positive_keep_benefit_is_retained(self) -> None:
+        policy = StockRiskPolicy(top_k=20, turnover_budget=0.5)
+        panel = _economic_panel(positive_top=3)
+        instruments = instruments_for(10)
+        held_id = "KRX:000002"
+        equity = equity_of(panel, empty_portfolio())
+        price = panel.filter(pl.col("instrument_id") == held_id).sort("session")["close"][-1]
+        portfolio = _holding_portfolio(held_id, price, equity)
+        allocations = construct_target_allocations(panel, instruments, portfolio, policy)
+        assert any(a.instrument.instrument_id == held_id for a in allocations)
+
+    def test_incumbent_failing_keep_gate_is_exited(self) -> None:
+        policy = StockRiskPolicy(top_k=20, turnover_budget=0.0)
+        panel = _economic_panel(positive_top=3)
+        instruments = instruments_for(10)
+        held_id = "KRX:000009"
+        equity = equity_of(panel, empty_portfolio())
+        price = panel.filter(pl.col("instrument_id") == held_id).sort("session")["close"][-1]
+        portfolio = _holding_portfolio(held_id, price, equity)
+        allocations = construct_target_allocations(panel, instruments, portfolio, policy)
+        assert all(a.instrument.instrument_id != held_id for a in allocations)
+
+
+def _with_economic(panel: pl.DataFrame, *, positive: bool = True) -> pl.DataFrame:
+    """Attach cost-adjusted net-alpha evidence to a scored panel."""
+    rows = panel.to_dicts()
+    for row in rows:
+        row["expected_active_alpha"] = 0.02 if positive else -0.01
+        row["expected_net_alpha"] = 0.015 if positive else -0.015
+        row["alpha_lower_bound"] = 0.005 if positive else -0.003
+        row["exit_cost_rate"] = 0.002
+    return pl.DataFrame(rows)
+
+
+class TestEconomicGating:
+    def test_only_positive_net_alpha_entries_are_allocated(self) -> None:
+        policy = StockRiskPolicy(top_k=20)
+        panel = _with_economic(scored_panel(seed=71), positive=True)
+        instruments = instruments_for(10)
+        portfolio = empty_portfolio()
+        allocations = construct_target_allocations(panel, instruments, portfolio, policy)
+        assert allocations
+        assert all(a.reason == "inverse-vol-constrained" for a in allocations)
+
+    def test_non_positive_net_alpha_yields_no_synthetic_long(self) -> None:
+        policy = StockRiskPolicy(top_k=20)
+        panel = _with_economic(scored_panel(seed=72), positive=False)
+        instruments = instruments_for(10)
+        portfolio = empty_portfolio()
+        allocations = construct_target_allocations(panel, instruments, portfolio, policy)
+        assert allocations == ()
+
+    def test_missing_or_non_finite_alpha_is_never_a_buy(self) -> None:
+        policy = StockRiskPolicy(top_k=20)
+        panel = scored_panel(seed=73).with_columns(
+            pl.lit(None, dtype=pl.Float64).alias("expected_active_alpha"),
+            pl.lit(None, dtype=pl.Float64).alias("expected_net_alpha"),
+            pl.lit(None, dtype=pl.Float64).alias("alpha_lower_bound"),
+            pl.lit(0.002, dtype=pl.Float64).alias("exit_cost_rate"),
+        )
+        allocations = construct_target_allocations(
+            panel, instruments_for(10), empty_portfolio(), policy
+        )
+        assert allocations == ()
+
+    def test_incumbent_kept_when_net_benefit_positive_and_exited_otherwise(self) -> None:
+        policy = StockRiskPolicy(top_k=20)
+        panel = _with_economic(scored_panel(seed=74), positive=True)
+        instruments = instruments_for(10)
+        equity = equity_of(panel, empty_portfolio())
+        held = next(iter(instruments.values()))
+        price = panel.filter(pl.col("instrument_id") == held.instrument_id).sort(
+            "session"
+        )["close"][-1]
+        portfolio = PortfolioSnapshot(
+            account_snapshot_id="held",
+            as_of=datetime(2024, 1, 1, tzinfo=UTC),
+            settled_cash=equity - 0.03 * equity,
+            unsettled_cash=0.0,
+            positions=(
+                Position(
+                    instrument=held,
+                    quantity=int(0.03 * equity // price),
+                    average_cost=price,
+                ),
+            ),
+        )
+        kept = construct_target_allocations(panel, instruments, portfolio, policy)
+        assert any(a.instrument.instrument_id == held.instrument_id for a in kept)
+
+        exiting_panel = _with_economic(scored_panel(seed=75), positive=False).with_columns(
+            pl.when(pl.col("instrument_id") == held.instrument_id)
+            .then(pl.lit(0.0))
+            .otherwise(pl.col("expected_net_alpha"))
+            .alias("expected_net_alpha")
+        )
+        exiting = construct_target_allocations(exiting_panel, instruments, portfolio, policy)
+        assert all(
+            a.instrument.instrument_id != held.instrument_id for a in exiting
+        )
