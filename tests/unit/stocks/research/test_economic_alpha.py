@@ -197,14 +197,18 @@ def test_prepared_decision_equals_reference_transform_and_isolates_labels() -> N
     applied evidence.
     """
     cal = CausalAlphaCalibrator(
-        bucket_count=5, min_calibration_sessions=10, n_bootstrap=50,
+        bucket_count=5, min_calibration_sessions=10, n_bootstrap=200,
         label_column="residual_o2o_5d", label_available_column="label_available_time",
     )
     decision = datetime(2024, 2, 10, tzinfo=UTC)
     observations = _observations()
     scored = _scored()
+    cap = 65_280
 
-    prepared = cal.prepare_decision(observations, decision, default_base_schedule())
+    prepared = cal.prepare_decision(
+        observations, decision, default_base_schedule(),
+        max_bootstrap_workspace_bytes=cap,
+    )
     prepared_out = cal.apply_prepared(prepared, scored)
     reference = cal.transform(scored, observations, decision, default_base_schedule())
 
@@ -220,12 +224,67 @@ def test_prepared_decision_equals_reference_transform_and_isolates_labels() -> N
         .alias("residual_o2o_5d")
     )
     flipped_prepared = cal.prepare_decision(
-        future_flipped, decision, default_base_schedule()
+        future_flipped, decision, default_base_schedule(),
+        max_bootstrap_workspace_bytes=cap,
     )
     flipped_out = cal.apply_prepared(flipped_prepared, scored)
     assert flipped_out.select(
         ALPHA_COLUMN, LOWER_BOUND_COLUMN
     ).to_dicts() == prepared_out.select(ALPHA_COLUMN, LOWER_BOUND_COLUMN).to_dicts()
+
+def test_batched_bootstrap_matches_legacy_one_shot() -> None:
+    """Batched capped draws are byte-identical to the legacy one-shot path."""
+    from src.stocks.research.economic_alpha import _block_bootstrap_lower_bound
+
+    arr = np.asarray(np.random.default_rng(7).normal(size=137), dtype=float)
+    block = 5
+    seed = 42
+    alpha = 0.05
+    n = arr.size
+    n_blocks = int(np.ceil(n / block))
+    max_start = max(1, n - block + 1)
+    offsets = np.arange(block)
+
+    def _legacy_means() -> np.ndarray:
+        rng = np.random.default_rng(seed)
+        starts = rng.integers(0, max_start, size=(200, n_blocks))
+        index = (starts[:, :, None] + offsets[None, None, :]).reshape(
+            200, n_blocks * block
+        )[:, :n]
+        return arr[index].mean(axis=1)
+
+    legacy_means = _legacy_means()
+    legacy_quantile = float(np.quantile(legacy_means, alpha))
+
+    for batch_draws in (17, 31):
+        batch_cap = batch_draws * n * 24
+        assert batch_cap // (n * 24) == batch_draws
+
+        rng = np.random.default_rng(seed)
+        batched_means = np.empty(200, dtype=float)
+        for offset in range(0, 200, batch_draws):
+            stop = min(offset + batch_draws, 200)
+            count = stop - offset
+            starts = rng.integers(0, max_start, size=(count, n_blocks))
+            index = (starts[:, :, None] + offsets[None, None, :]).reshape(
+                count, n_blocks * block
+            )[:, :n]
+            batched_means[offset:stop] = arr[index].mean(axis=1)
+        np.testing.assert_array_equal(batched_means, legacy_means)
+
+        got = _block_bootstrap_lower_bound(
+            arr, block, 200, seed, alpha, max_bootstrap_workspace_bytes=batch_cap
+        )
+        assert got == legacy_quantile
+
+    with pytest.raises(ValueError, match="bootstrap workspace cannot fit one draw"):
+        _block_bootstrap_lower_bound(
+            arr, block, 200, seed, alpha, max_bootstrap_workspace_bytes=n * 24 - 1
+        )
+    with pytest.raises(ValueError, match="max_bootstrap_workspace_bytes"):
+        _block_bootstrap_lower_bound(
+            arr, block, 200, seed, alpha, max_bootstrap_workspace_bytes=0
+        )
 
 
 def test_prepared_decision_fails_closed_on_insufficient_history() -> None:
