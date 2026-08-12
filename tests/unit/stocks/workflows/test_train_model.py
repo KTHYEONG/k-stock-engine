@@ -13,6 +13,7 @@ from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.research.artifacts import METRICS_FILENAME, ModelArtifactRegistry
 from src.stocks.research.models import ModelManifest
 from src.stocks.workflows.contracts import TrainingRequest
+from src.stocks.research.economic_alpha import ALPHA_COLUMN
 from src.stocks.workflows.train_model import (
     PromotionRiskBudget,
     ReplayResult,
@@ -596,6 +597,126 @@ def test_tuning_rejects_economically_ineligible_candidates(monkeypatch, tmp_path
             "no_filled_orders",
         }
         assert row["trial_number"] in (0, 1, 2)
+
+
+def test_calibrated_replay_records_economic_evidence_and_fails_closed(
+    tmp_path,
+) -> None:
+    import src.stocks.workflows.train_model as tm
+
+    df = stock_v2_composed_df(n_sessions=70, n_tickers=8)
+    manifest = stock_v2_manifest(columns=df.columns)
+    snapshot = DatasetSnapshot(manifest=manifest, frame=df)
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    panel = _index_sessions(df)
+    last_30 = df["session"].unique().sort(descending=True).head(30)
+    oos_scored = df.filter(pl.col("session").is_in(last_30)).with_columns(
+        pl.col("market_cap").rank("dense").over("session").cast(pl.Float64).alias("pred_score")
+    )
+    request = TrainingRequest(
+        artifact_id="calib_replay",
+        n_folds=3,
+        calibration_bucket_count=4,
+        min_calibration_sessions=5,
+    )
+    ledger = tm._build_calibration_ledger(oos_scored, panel, "residual_o2o_5d")
+    assert {"session", "instrument_id", "score", "residual_o2o_5d", "label_available_time"} <= set(
+        ledger.columns
+    )
+    replay = tm._event_ledger_evaluation(
+        panel,
+        oos_scored,
+        request,
+        snapshot.manifest,
+        registry,
+        default_base_schedule(),
+        default_stress_schedule(),
+        calibration_ledger=ledger,
+    )
+    assert replay.calibration_evidence
+    assert "history_sessions" in replay.calibration_evidence
+    assert "eligible_bucket_count" in replay.calibration_evidence
+    assert "calibration_state" in replay.calibration_evidence
+
+    evidence = tm._evaluate_economic_candidate(
+        [0.05, 0.06, 0.07], replay, request, 1, 0.05
+    )
+    assert evidence.calibration_history_sessions >= 0
+    assert evidence.eligible_bucket_count >= 0
+    assert evidence.cash_cycles >= 0
+    row = evidence.to_json_safe()
+    assert "calibration_history_sessions" in row
+    assert "eligible_bucket_count" in row
+
+
+def test_calibration_ledger_is_empty_for_empty_oos(tmp_path) -> None:
+    import src.stocks.workflows.train_model as tm
+
+    df = stock_v2_composed_df(n_sessions=40, n_tickers=8)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    empty = pl.DataFrame(
+        {
+            "session": pl.Series([], dtype=pl.Datetime("us", "UTC")),
+            "instrument_id": pl.Series([], dtype=pl.Utf8),
+            "pred_score": pl.Series([], dtype=pl.Float64),
+        }
+    )
+    ledger = tm._build_calibration_ledger(empty, panel, "residual_o2o_5d")
+    assert ledger.is_empty()
+
+    cal = tm.CausalAlphaCalibrator(
+        bucket_count=4, min_calibration_sessions=5, seed=42
+    )
+    del tmp_path, manifest
+    decision = df["session"].max()
+    scored = df.filter(pl.col("session") == decision).with_columns(
+        pl.col("market_cap").rank("dense").over("session").cast(pl.Float64).alias("pred_score")
+    )
+    out = cal.transform(scored, ledger, decision, default_base_schedule())
+    assert out[ALPHA_COLUMN].null_count() == out.height
+
+
+def test_calibrated_replay_and_plain_replay_share_no_leaked_targets(tmp_path) -> None:
+    """Changing a future label never changes an earlier calibrated decision."""
+    import src.stocks.workflows.train_model as tm
+
+    df = stock_v2_composed_df(n_sessions=70, n_tickers=8)
+    manifest = stock_v2_manifest(columns=df.columns)
+    snapshot = DatasetSnapshot(manifest=manifest, frame=df)
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    panel = _index_sessions(df)
+    last_30 = df["session"].unique().sort(descending=True).head(30)
+    oos_scored = df.filter(pl.col("session").is_in(last_30)).with_columns(
+        pl.col("market_cap").rank("dense").over("session").cast(pl.Float64).alias("pred_score")
+    )
+    request = TrainingRequest(
+        artifact_id="calib_no_leak",
+        n_folds=3,
+        calibration_bucket_count=4,
+        min_calibration_sessions=5,
+    )
+    base_ledger = tm._build_calibration_ledger(oos_scored, panel, "residual_o2o_5d")
+
+    future_threshold = panel.select(pl.col("session").max()).to_series()[0]
+    flipped = panel.with_columns(
+        pl.when(pl.col("label_available_time") > future_threshold)
+        .then(pl.lit(0.99))
+        .otherwise(pl.col("residual_o2o_5d"))
+        .alias("residual_o2o_5d")
+    )
+    flipped_ledger = tm._build_calibration_ledger(oos_scored, flipped, "residual_o2o_5d")
+
+    a = tm._event_ledger_evaluation(
+        panel, oos_scored, request, snapshot.manifest, registry,
+        default_base_schedule(), default_stress_schedule(), calibration_ledger=base_ledger,
+    )
+    b = tm._event_ledger_evaluation(
+        panel, oos_scored, request, snapshot.manifest, registry,
+        default_base_schedule(), default_stress_schedule(), calibration_ledger=flipped_ledger,
+    )
+    assert a.ledger == b.ledger
+    assert a.trades == b.trades
 
 
 def test_tuning_rejects_non_positive_bootstrap_candidates(monkeypatch, tmp_path) -> None:
