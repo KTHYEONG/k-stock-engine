@@ -196,7 +196,9 @@ def test_trial_fast_path_matches_legacy_blend() -> None:
         session_column="session",
         relevance_column=RELEVANCE_COLUMN,
     )
-    assert trial.fit_trial(train_t, val_t, stable_scores) is True
+    outcome = trial.fit_trial(train_t, val_t, stable_scores)
+    assert outcome.fit_ok is True
+    assert outcome.best_iteration is not None
     trial_scored = trial.predict(predict_input)
     assert (trial_scored["pred_score"].to_numpy() == pytest.approx(legacy_scored["pred_score"].to_numpy()))
     assert (trial_scored["pred_score"].to_numpy() - legacy_scored["pred_score"].to_numpy()).max() < 1e-12
@@ -209,12 +211,11 @@ def test_trial_fast_path_matches_legacy_blend() -> None:
         session_column="session",
         relevance_column=RELEVANCE_COLUMN,
     )
-    assert (
-        prepared_trial.fit_trial(
-            train_t, val_t, stable_scores, prepared=prepared
-        )
-        is True
+    prepared_outcome = prepared_trial.fit_trial(
+        train_t, val_t, stable_scores, prepared=prepared
     )
+    assert prepared_outcome.fit_ok is True
+    assert prepared_outcome.best_iteration == outcome.best_iteration
     prepared_scored = prepared_trial.predict(predict_input)
     assert (prepared_scored["pred_score"].to_numpy() == pytest.approx(legacy_scored["pred_score"].to_numpy()))
     assert (prepared_scored["pred_score"].to_numpy() - legacy_scored["pred_score"].to_numpy()).max() < 1e-12
@@ -275,6 +276,111 @@ def test_trial_callbacks_propagate_trial_pruned() -> None:
         model.fit_trial(
             train_t, val_t, stable_scores, prepared=prepared, callbacks=(prune_on_first_round,)
         )
+
+
+def test_adaptive_continuation_parity_with_one_shot() -> None:
+    from src.stocks.research.lambdarank import (
+        FitTrialOutcome,
+        LambdaRankBlendModel,
+        adaptive_refit_rounds,
+        verify_adaptive_parity,
+    )
+
+    df = build_panel(n_sessions=80, n_tickers=40)
+    feature_columns = v2_feature_columns(df)
+    train = df.filter(pl.col("session_index") < 60)
+    val = df.filter(pl.col("session_index") >= 60)
+    quantiles = fit_v2_winsor_quantiles(train, feature_columns)
+    train_t = apply_v2_transforms(train, feature_columns, winsor_quantiles=quantiles)
+    val_t = apply_v2_transforms(val, feature_columns, winsor_quantiles=quantiles)
+    predict_input = val_t.drop([RESIDUAL_O2O_LABEL, RELEVANCE_COLUMN, "label_available_time"])
+    config = LambdaRankConfig(
+        learning_rate=0.05, num_leaves=15, min_child_samples=500,
+        n_estimators=400, early_stopping_rounds=30,
+    )
+
+    stable = StableRankComposite(
+        factors=stock_alpha_v2_allowlist(),
+        manifest=make_manifest(),
+        label_column=RESIDUAL_O2O_LABEL,
+        block_length=5,
+        session_column="session",
+    )
+    stable.fit(train_t, val_t)
+    stable_scores = stable.predict(predict_input).select("session", "instrument_id", "pred_score")
+
+    def _fit(initial_rounds: int | None) -> tuple[FitTrialOutcome, LambdaRankBlendModel]:
+        model = LambdaRankBlendModel(
+            make_manifest("adaptive_parity"),
+            stock_alpha_v2_allowlist(),
+            RESIDUAL_O2O_LABEL,
+            config=config,
+            session_column="session",
+            relevance_column=RELEVANCE_COLUMN,
+        )
+        outcome = model.fit_trial(
+            train_t, val_t, stable_scores, initial_rounds=initial_rounds
+        )
+        return outcome, model
+
+    one_shot, one_shot_model = _fit(None)
+    assert one_shot.fit_ok is True
+    assert adaptive_refit_rounds(one_shot.best_iteration) <= config.n_estimators
+    assert adaptive_refit_rounds(500) == 600
+    assert adaptive_refit_rounds(50) == 200
+    assert adaptive_refit_rounds(10_000) == 900
+
+    continuation, continuation_model = _fit(40)
+    assert continuation.fit_ok is True
+    assert continuation.used_continuation is True
+    assert continuation.best_iteration == one_shot.best_iteration
+    assert continuation.stopped_early == one_shot.stopped_early
+    assert continuation.rounds_trained <= config.n_estimators
+
+    matrix = LambdaRankBlendModel._float32_matrix(
+        predict_input, list(continuation_model._predictor_columns)
+    )
+    assert (
+        verify_adaptive_parity(
+            continuation,
+            one_shot,
+            booster=continuation_model._booster,
+            reference_booster=one_shot_model._booster,
+            predict_input=matrix,
+        )
+        is True
+    )
+    continued_scored = continuation_model.predict(predict_input)
+    reference_scored = one_shot_model.predict(predict_input)
+    assert (
+        continued_scored["pred_score"].to_numpy()
+        - reference_scored["pred_score"].to_numpy()
+    ).max() < 1e-12
+    assert rank_ic(val, continued_scored, RESIDUAL_O2O_LABEL) == pytest.approx(
+        rank_ic(val, reference_scored, RESIDUAL_O2O_LABEL), rel=1e-12, abs=1e-12
+    )
+
+
+def rank_ic(labeled: pl.DataFrame, scored: pl.DataFrame, label_column: str) -> float:
+    import numpy as np
+
+    sub = labeled.select(
+        pl.col("session"), pl.col("instrument_id"), pl.col(label_column)
+    ).join(
+        scored.select("session", "instrument_id", "pred_score"),
+        on=["session", "instrument_id"],
+    ).filter(pl.col(label_column).is_not_null() & pl.col("pred_score").is_not_null())
+    ics: list[float] = []
+    for rows in sub.sort("session").partition_by("session"):
+        scores = rows["pred_score"].to_numpy().astype(float)
+        labels = rows[label_column].to_numpy().astype(float)
+        if len(scores) < 2 or np.std(scores) == 0.0 or np.std(labels) == 0.0:
+            continue
+        rs = np.argsort(np.argsort(scores)) - np.argsort(np.argsort(scores)).mean()
+        rl = np.argsort(np.argsort(labels)) - np.argsort(np.argsort(labels)).mean()
+        denom = float(np.sqrt(float(np.sum(rs * rs)) * float(np.sum(rl * rl))))
+        ics.append(float(np.sum(rs * rl) / denom) if denom > 0.0 else 0.0)
+    return float(np.median(ics)) if ics else 0.0
 
 
 def test_manifest_binds_v2_contract() -> None:

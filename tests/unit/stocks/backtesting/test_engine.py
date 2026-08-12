@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import numpy as np
 import polars as pl
+import pytest
 
 from src.core.costs import default_base_schedule, default_stress_schedule
 from src.core.instruments import AssetKind, Instrument
@@ -13,6 +15,7 @@ from src.stocks.backtesting.engine import (
     ArtifactSlot,
     BacktestRequest,
     BacktestResult,
+    BacktestValidationError,
     PreparedReplayDecision,
     PreparedReplayMarket,
     StockBacktester,
@@ -262,3 +265,61 @@ def test_prepared_market_replay_matches_reference_over_immutable_index() -> None
     assert reference_result.no_trade_reasons == prepared_result.no_trade_reasons
     assert prepared_calls["count"] == len(request.decision_session_indices)
     assert prepared.prepared_decision_count == len(request.decision_session_indices)
+
+
+def test_run_prepared_rejects_missing_and_mismatched_overlay() -> None:
+    """Prepared replay fails closed on a missing or length-mismatched overlay."""
+    df, snapshot, registry, instruments, policy, scored, artifacts, request, portfolio = _paired_inputs()
+    backtester = StockBacktester(
+        registry=registry,
+        instruments=instruments,
+        manifest=snapshot.manifest,
+        cost_schedule=default_base_schedule(),
+        stress_cost_schedule=default_stress_schedule(),
+        decision_provider=lambda dt, et: _prepare(dt, et, scored),
+        scenario_planner=lambda prepared, port, creq: _scenario_planner(
+            prepared, port, creq, instruments, policy
+        ),
+    )
+    market = PreparedReplayMarket.build(
+        df,
+        backtester.adtv_window,
+        instruments=instruments,
+        artifacts=artifacts,
+        initial_portfolio=portfolio,
+    )
+    with pytest.raises(BacktestValidationError, match="requires an aligned score overlay"):
+        backtester.run_prepared(request, market, None)
+    with pytest.raises(BacktestValidationError, match="length"):
+        backtester.run_prepared(
+            request, market, np.zeros(market.row_count + 1, dtype=np.float64)
+        )
+
+
+def test_run_prepared_rejects_nonfinite_scored_overlay_rows() -> None:
+    """A non-finite score on a scored overlay row fails closed."""
+    import numpy as np
+
+    df, snapshot, registry, instruments, policy, scored, artifacts, request, portfolio = _paired_inputs()
+    backtester = StockBacktester(
+        registry=registry,
+        instruments=instruments,
+        manifest=snapshot.manifest,
+        cost_schedule=default_base_schedule(),
+        stress_cost_schedule=default_stress_schedule(),
+        decision_provider=lambda dt, et: _prepare(dt, et, scored),
+        scenario_planner=lambda prepared, port, creq: _scenario_planner(
+            prepared, port, creq, instruments, policy
+        ),
+    )
+    market = PreparedReplayMarket.build(
+        df,
+        backtester.adtv_window,
+        instruments=instruments,
+        artifacts=artifacts,
+        initial_portfolio=portfolio,
+    )
+    overlay = np.full(market.row_count, np.nan, dtype=np.float64)
+    overlay[0] = float("inf")
+    with pytest.raises(BacktestValidationError, match="non-finite values on scored rows"):
+        backtester.run_prepared(request, market, overlay)

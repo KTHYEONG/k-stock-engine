@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import polars as pl
+import pytest
 
 from src.core.costs import default_base_schedule
 from src.stocks.research.calibration_schedule import CausalCalibrationSchedule
@@ -140,3 +141,110 @@ def test_schedule_eligible_prefix_rows_is_monotonic() -> None:
     counts = [schedule.eligible_prefix_rows(dt) for dt in decision_times]
     assert counts == sorted(counts)
     assert counts[-1] > counts[0]
+
+
+def test_session_cluster_schedule_is_deterministic_and_causal() -> None:
+    from src.stocks.research.calibration_schedule import (
+        SessionClusterCalibrationSchedule,
+    )
+
+    cal = CausalAlphaCalibrator(
+        bucket_count=5, min_calibration_sessions=10, n_bootstrap=100,
+    )
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    observations = _positive_observations(n_sessions=60, n_tickers=25)
+    decision_times = [start + timedelta(days=d) for d in range(30, 60, 5)]
+    schedule = SessionClusterCalibrationSchedule.build(
+        observations, decision_times, cal, default_base_schedule(),
+        block_length=5, max_workspace_bytes=10_000_000,
+    )
+    first = schedule.state_at(decision_times[0])
+    second_schedule = SessionClusterCalibrationSchedule.build(
+        observations, decision_times, cal, default_base_schedule(),
+        block_length=5, max_workspace_bytes=10_000_000,
+    )
+    assert first == second_schedule.state_at(decision_times[0])
+    assert first["history_sessions"] >= 10
+    assert first["buckets"]
+    for row in first["buckets"]:
+        if row["expected_active_alpha"] is not None:
+            assert row["alpha_lower_bound"] > 0.0
+            assert row["sample_size"] >= 5
+
+    flipped = observations.with_columns(
+        pl.when(pl.col("session") >= start + timedelta(days=40))
+        .then(pl.lit(0.99))
+        .otherwise(pl.col("residual_o2o_5d"))
+        .alias("residual_o2o_5d")
+    )
+    flipped_schedule = SessionClusterCalibrationSchedule.build(
+        flipped, decision_times, cal, default_base_schedule(),
+        block_length=5, max_workspace_bytes=10_000_000,
+    )
+    _assert_states_equivalent(first, flipped_schedule.state_at(decision_times[0]))
+    telemetry = flipped_schedule.telemetry()
+    assert telemetry["bootstrap_unit"] == "session_cluster"
+    assert telemetry["block_length"] == 5
+    assert telemetry["draws"] == 100
+    assert telemetry["rows"] > 0
+    assert telemetry["sessions"] > 0
+    assert isinstance(telemetry["reference_fallback_count"], int)
+
+
+def test_session_cluster_schedule_reference_fallback_for_partial_availability() -> None:
+    from src.stocks.research.calibration_schedule import (
+        SessionClusterCalibrationSchedule,
+    )
+
+    cal = CausalAlphaCalibrator(
+        bucket_count=5, min_calibration_sessions=10, n_bootstrap=50,
+    )
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    rows: list[dict] = []
+    for s in range(40):
+        for t in range(20):
+            lat = start + timedelta(days=s + 6)
+            if s == 10 and t >= 10:
+                lat = start + timedelta(days=s + 12)
+            rows.append(  # noqa: PERF401
+                {
+                    "instrument_id": f"KRX:{t:06d}",
+                    "session": start + timedelta(days=s),
+                    "score": float(t) + (s % 3),
+                    "residual_o2o_5d": float(0.004 * t + 0.001 * (s % 4)),
+                    "label_available_time": lat,
+                }
+            )
+    observations = pl.DataFrame(rows)
+    decision_times = [start + timedelta(days=d) for d in range(12, 40, 5)]
+    schedule = SessionClusterCalibrationSchedule.build(
+        observations, decision_times, cal, default_base_schedule(),
+        block_length=5, max_workspace_bytes=10_000_000,
+    )
+    assert schedule._use_reference is True
+    for decision_time in decision_times:
+        reference = cal.prepare_decision(observations, decision_time, default_base_schedule())
+        _assert_states_equivalent(reference, schedule.state_at(decision_time))
+    assert schedule.telemetry()["reference_fallback_count"] > 0
+
+
+def test_session_cluster_bootstrap_rejects_non_finite_group_sums() -> None:
+    import numpy as np
+
+    from src.stocks.research.calibration_schedule import (
+        _session_cluster_bootstrap_means,
+    )
+
+    with pytest.raises(ValueError, match="finite"):
+        _session_cluster_bootstrap_means(
+            np.asarray([1.0, float("nan")], dtype=float),
+            np.asarray([2.0, 3.0], dtype=float),
+            block=2, n_blocks=1, max_start=1, n_bootstrap=10, seed=1,
+        )
+    means = _session_cluster_bootstrap_means(
+        np.asarray([1.0, 2.0, 3.0], dtype=float),
+        np.asarray([2.0, 2.0, 2.0], dtype=float),
+        block=2, n_blocks=2, max_start=2, n_bootstrap=25, seed=3,
+    )
+    assert means.shape == (25,)
+    assert np.all(np.isfinite(means))
