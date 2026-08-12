@@ -230,6 +230,139 @@ class CausalAlphaCalibrator:
             bucket_stats=stats,
         )
 
+    def prepare_decision(
+        self,
+        observations: pl.DataFrame,
+        decision_time: datetime,
+        cost_schedule: CostSchedule,
+    ) -> dict[str, object]:
+        """Compute the route-scoped calibration evidence once for a decision.
+
+        Performs the ``session < decision_time`` and
+        ``label_available_column <= decision_time`` filter, score-bucket
+        calculation, shrinkage, and deterministic bootstrap exactly once,
+        returning an immutable state consumed by ``apply_prepared``. The
+        observations are ordered by ``(session, instrument_id)`` before
+        bootstrap sampling so the artifact state is canonical. The reference
+        ``transform`` and this prepared schedule share the same input ordering
+        and therefore produce identical bucket IDs, sample sizes, alpha, and
+        lower bounds for the same decision.
+        """
+        _validate_observations(observations, self.label_column, self.label_available_column)
+        point = cost_schedule.cost_for(decision_time)
+        round_trip_cost = _round_trip_cost_rate(point)
+        exit_cost = _exit_cost_rate(point)
+        eligible = observations.filter(
+            (pl.col(self.label_available_column) <= decision_time)
+            & (pl.col(SESSION_COLUMN) < decision_time)
+        ).sort([SESSION_COLUMN, INSTRUMENT_COLUMN])
+        self._last_history_sessions = int(
+            eligible.select(pl.col(SESSION_COLUMN).n_unique()).to_series()[0]
+        ) if not eligible.is_empty() else 0
+        self._last_round_trip_cost = round_trip_cost
+        self._last_exit_cost = exit_cost
+        if (
+            eligible.is_empty()
+            or self._last_history_sessions < self.min_calibration_sessions
+        ):
+            self._last_evidence = ()
+            return {
+                "bucket_count": int(self.bucket_count),
+                "history_sessions": int(self._last_history_sessions),
+                "round_trip_cost": float(round_trip_cost),
+                "exit_cost_rate": float(exit_cost),
+                "buckets": [],
+            }
+        stats = _bucket_statistics(
+            eligible,
+            self.bucket_count,
+            label_column=self.label_column,
+            seed=self.seed,
+            n_bootstrap=self.n_bootstrap,
+            bootstrap_alpha=self.bootstrap_alpha,
+            block_length=self.block_length,
+        )
+        self._last_evidence = tuple(
+            sorted(
+                (
+                    BucketEvidence(
+                        bucket=int(row["__bucket"]),
+                        sample_size=int(row["sample_size"]),
+                        expected_active_alpha=(
+                            None
+                            if row[ALPHA_COLUMN] is None
+                            else float(row[ALPHA_COLUMN])
+                        ),
+                        alpha_lower_bound=(
+                            None
+                            if row[LOWER_BOUND_COLUMN] is None
+                            else float(row[LOWER_BOUND_COLUMN])
+                        ),
+                    )
+                    for row in stats.to_dicts()
+                ),
+                key=lambda evidence: evidence.bucket,
+            )
+        )
+        return {
+            "bucket_count": int(self.bucket_count),
+            "history_sessions": int(self._last_history_sessions),
+            "round_trip_cost": float(round_trip_cost),
+            "exit_cost_rate": float(exit_cost),
+            "buckets": [
+                {
+                    "bucket": int(evidence.bucket),
+                    "sample_size": int(evidence.sample_size),
+                    "expected_active_alpha": evidence.expected_active_alpha,
+                    "alpha_lower_bound": evidence.alpha_lower_bound,
+                }
+                for evidence in self._last_evidence
+            ],
+        }
+
+    def apply_prepared(
+        self,
+        prepared: dict[str, object],
+        scored: pl.DataFrame,
+    ) -> pl.DataFrame:
+        """Join the frozen prepared evidence onto a compact allocation history.
+
+        ``prepared`` is the immutable state returned by ``prepare_decision``;
+        this operation only joins that fixed bucket table and cost evidence to
+        ``scored``, so it is numerically identical to the reference
+        ``transform`` for the same decision timestamp. ``scored`` is expected
+        to be the already-bounded allocation history (``session <=
+        decision_time``) carrying ``instrument_id``, ``session``, and a score
+        column.
+        """
+        _validate_scored(scored)
+        score_column = _resolve_score_column(scored)
+        buckets = cast(list[dict[str, object]], prepared["buckets"])
+        bucket_stats: pl.DataFrame | None = None
+        if buckets:
+            bucket_stats = pl.DataFrame(
+                {
+                    "__bucket": [
+                        cast(int, b["bucket"]) for b in buckets
+                    ],
+                    ALPHA_COLUMN: [
+                        b.get("expected_active_alpha") for b in buckets
+                    ],
+                    LOWER_BOUND_COLUMN: [
+                        b.get("alpha_lower_bound") for b in buckets
+                    ],
+                }
+            )
+        return _augment(
+            scored,
+            score_column,
+            cast(int, prepared["bucket_count"]),
+            cast(float, prepared["round_trip_cost"]),
+            cast(float, prepared["exit_cost_rate"]),
+            None,
+            bucket_stats=bucket_stats,
+        )
+
     def calibration_state(self) -> dict[str, object]:
         """JSON-safe frozen calibration snapshot for artifact serialization."""
         return {
@@ -382,8 +515,11 @@ def _bucket_statistics(
     The whole function is vectorized except a bounded loop over the fixed bucket
     count, which is not a per-row callback. The global mean anchors the
     shrinkage so low-sample buckets pull toward the history mean rather than
-    trusting a noisy bucket average.
+    trusting a noisy bucket average. Calibration observations are ordered by
+    ``(session, instrument_id)`` before bootstrap sampling so the reference
+    transform and the prepared-decision schedule share one canonical order.
     """
+    eligible = eligible.sort([SESSION_COLUMN, INSTRUMENT_COLUMN])
     bucketed = eligible.with_columns(
         _bucket_expression(SCORE_COLUMN, bucket_count)
     )
