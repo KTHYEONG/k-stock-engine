@@ -2160,11 +2160,28 @@ def test_prepared_selection_route_scatters_per_candidate_overlays() -> None:
     finite = np.isfinite(first)
     assert np.allclose(first[finite], second[finite] / 2.0)
     assert len(prepared.decision_indices) >= 1
-    assert prepared.window_start_by_decision == prepared.window_start_by_decision
+
+    execution_overlay, allocation_overlay = prepared.scatter_overlays(scored)
+    assert execution_overlay.shape == (prepared.market.row_count,)
+    assert allocation_overlay.shape == (prepared.allocation_market.row_count,)
+    assert np.isfinite(execution_overlay).sum() > 0
+    assert np.isfinite(allocation_overlay).sum() > 0
+    assert prepared.allocation_market.row_count >= prepared.market.row_count
+    first_decision_time = tm._decision_time_at(prepared.market, prepared.decision_indices[0])
+    allocation_index = prepared.allocation_decision_index_for(first_decision_time)
+    assert allocation_index is not None
+    assert 0 <= allocation_index < len(prepared.allocation_market.sessions)
 
 
 def test_prepared_route_replay_matches_reference_replay(tmp_path) -> None:
-    """Prepared-route replay produces the same ledger as the reference path."""
+    """Prepared warm-up parity with the reference over an OOS boundary.
+
+    The OOS interval starts 40 sessions into a 70-session panel, so the first
+    decision requires pre-OOS volatility/covariance/ADTV warm-up. With the
+    allocation market built from the complete panel the prepared route must
+    reproduce the reference ledger exactly, fill the same orders, and record no
+    artificial ``no-feasible-allocation`` cycle that the reference does not.
+    """
     import src.stocks.workflows.train_model as tm
     from src.stocks.workflows.train_model import PreparedSelectionRoute
 
@@ -2183,14 +2200,14 @@ def test_prepared_route_replay_matches_reference_replay(tmp_path) -> None:
         calibration_bucket_count=4,
         min_calibration_sessions=5,
     )
-    ledger = tm._build_calibration_ledger(oos_scored, panel, "residual_o2o_5d")
     base = default_base_schedule()
     stress = default_stress_schedule()
     context = tm._prepare_replay_static_context(panel, request)
     reference = tm._event_ledger_evaluation(
         panel, oos_scored, request, snapshot.manifest, registry, base, stress,
-        replay_context=context, calibration_ledger=ledger,
+        replay_context=context,
     )
+    assert reference.filled_orders > 0
     oos_start = oos_scored["session"].min()
     route = tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time")
     prepared_route = PreparedSelectionRoute.build(
@@ -2198,7 +2215,7 @@ def test_prepared_route_replay_matches_reference_replay(tmp_path) -> None:
     )
     prepared = tm._event_ledger_evaluation(
         panel, oos_scored, request, snapshot.manifest, registry, base, stress,
-        replay_context=context, calibration_ledger=ledger, prepared_route=prepared_route,
+        replay_context=context, prepared_route=prepared_route,
     )
     assert reference.ledger == prepared.ledger
     assert reference.trades == prepared.trades
@@ -2207,6 +2224,13 @@ def test_prepared_route_replay_matches_reference_replay(tmp_path) -> None:
     assert reference.filled_orders == prepared.filled_orders
     assert reference.planned_cycles == prepared.planned_cycles
     assert reference.calibration_evidence == prepared.calibration_evidence
+    assert reference.no_trade_reason_counts == prepared.no_trade_reason_counts
+    assert (
+        reference.unfilled_order_reason_counts
+        == prepared.unfilled_order_reason_counts
+    )
+    assert prepared.no_trade_reason_counts == {}
+    assert prepared.unfilled_order_reason_counts == {}
 
 
 def test_proxy_session_filter_is_deterministic_causal_and_rule_fixed() -> None:
