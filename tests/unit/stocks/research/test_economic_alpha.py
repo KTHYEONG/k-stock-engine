@@ -213,3 +213,101 @@ def test_negative_bootstrap_lower_bound_bucket_is_null() -> None:
         for e in evidence
     )
     assert out[LOWER_BOUND_COLUMN].null_count() > 0
+
+def test_route_specific_label_and_availability_columns_are_respected() -> None:
+    cal = CausalAlphaCalibrator(
+        bucket_count=5,
+        min_calibration_sessions=10,
+        n_bootstrap=50,
+        label_column="residual_o2o_10d",
+        label_available_column="label_available_time_10d",
+    )
+    decision = datetime(2024, 2, 10, tzinfo=UTC)
+    rows: list[dict] = []
+    for s in range(40):
+        for t in range(20):
+            rows.append(  # noqa: PERF401
+                {
+                    "instrument_id": f"KRX:{t:06d}",
+                    "session": datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=s),
+                    "score": float(t) + (s % 3),
+                    "residual_o2o_10d": 0.01 if t % 4 == 0 else -0.005,
+                    "label_available_time_10d": datetime(2024, 1, 1, tzinfo=UTC)
+                    + timedelta(days=s + 11),
+                }
+            )
+    observations = pl.DataFrame(rows)
+    scored = _scored()
+
+    with pytest.raises(ValueError, match="residual_o2o_10d"):
+        cal.transform(scored, observations.drop("residual_o2o_10d"), decision, default_base_schedule())
+    with pytest.raises(ValueError, match="label_available_time_10d"):
+        cal.transform(
+            scored, observations.drop("label_available_time_10d"), decision, default_base_schedule()
+        )
+
+    future_flipped = observations.with_columns(
+        pl.when(pl.col("session") >= datetime(2024, 2, 9, tzinfo=UTC))
+        .then(pl.lit(0.99))
+        .otherwise(pl.col("residual_o2o_10d"))
+        .alias("residual_o2o_10d")
+    )
+    baseline = cal.transform(scored, observations, decision, default_base_schedule())
+    flipped = cal.transform(scored, future_flipped, decision, default_base_schedule())
+    assert baseline.select(ALPHA_COLUMN, NET_ALPHA_COLUMN).to_dicts() == flipped.select(
+        ALPHA_COLUMN, NET_ALPHA_COLUMN
+    ).to_dicts()
+
+
+def test_net_alpha_lower_bound_is_lower_bound_minus_round_trip_cost() -> None:
+    from src.core.costs import CostPoint, CostSchedule
+
+    from src.stocks.research.economic_alpha import NET_LOWER_BOUND_COLUMN
+
+    cal = CausalAlphaCalibrator(
+        bucket_count=5, min_calibration_sessions=10, n_bootstrap=80,
+        label_column="residual_o2o_5d", label_available_column="label_available_time",
+    )
+    decision = datetime(2024, 2, 10, tzinfo=UTC)
+    schedule = CostSchedule(
+        name="explicit",
+        points=(CostPoint(decision, 0.001, 0.005, 20.0),),
+    )
+    out = cal.transform(_scored(), _positive_observations(), decision, schedule)
+    lower = out[LOWER_BOUND_COLUMN].drop_nulls()
+    net_lower = out[NET_LOWER_BOUND_COLUMN].drop_nulls()
+    assert not net_lower.is_empty()
+    expected_cost = cal.round_trip_cost
+    assert expected_cost > 0.0
+    for lb, net in zip(lower.to_list(), net_lower.to_list(), strict=True):
+        assert abs(net - (lb - expected_cost)) < 1e-12
+    assert out[NET_LOWER_BOUND_COLUMN].null_count() == out[LOWER_BOUND_COLUMN].null_count()
+
+
+def test_route_state_round_trips_label_columns() -> None:
+    cal = CausalAlphaCalibrator(
+        bucket_count=5, min_calibration_sessions=10, n_bootstrap=50,
+        label_column="residual_o2o_15d", label_available_column="label_available_time_15d",
+    )
+    decision = datetime(2024, 2, 10, tzinfo=UTC)
+    rows: list[dict] = []
+    for s in range(40):
+        for t in range(20):
+            rows.append(  # noqa: PERF401
+                {
+                    "instrument_id": f"KRX:{t:06d}",
+                    "session": datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=s),
+                    "score": float(t),
+                    "residual_o2o_15d": float(0.004 * t) if t % 4 == 0 else -0.005,
+                    "label_available_time_15d": datetime(2024, 1, 1, tzinfo=UTC)
+                    + timedelta(days=s + 16),
+                }
+            )
+    observations = pl.DataFrame(rows)
+    cal.transform(_scored(), observations, decision, default_base_schedule())
+    state = cal.calibration_state()
+    assert state["label_column"] == "residual_o2o_15d"
+    assert state["label_available_column"] == "label_available_time_15d"
+    frozen = CausalAlphaCalibrator.from_state(state)
+    assert frozen.label_column == "residual_o2o_15d"
+    assert frozen.label_available_column == "label_available_time_15d"

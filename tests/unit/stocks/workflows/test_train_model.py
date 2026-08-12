@@ -7,6 +7,8 @@ from dataclasses import replace as dataclass_replace
 import polars as pl
 import pytest
 
+import src.stocks.workflows.train_model as tm
+
 from src.core.costs import default_base_schedule, default_stress_schedule
 from src.core.time import TemporalViolationError
 from src.stocks.data.contracts import DatasetSnapshot
@@ -176,7 +178,11 @@ def test_training_uses_requested_purged_walk_forward_fold_count(tmp_path, monkey
     monkeypatch.setattr(
         tm,
         "_tune_champion",
-        lambda *_args, **_kwargs: (tm.LambdaRankConfig(n_estimators=20, early_stopping_rounds=5), 3),
+        lambda *_args, **_kwargs: (
+            tm.LambdaRankConfig(n_estimators=20, early_stopping_rounds=5),
+            3,
+            tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),
+        ),
     )
 
     df = stock_v2_composed_df(n_sessions=140, n_tickers=20)
@@ -406,15 +412,12 @@ def test_tuning_never_includes_first_outer_oos(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(tm, "_event_ledger_evaluation", lambda *_a, **_kw: _positive_replay())
 
     request = TrainingRequest(artifact_id="tune_oos", n_folds=3, optuna_trials=3)
-    config, n_trials = tm._tune_champion(
-        panel,
-        folds,
+    config, n_trials, _route = tm._tune_champion(
+        panel[folds[0].train_mask],
         request,
         _tune_base_manifest("tune_oos", manifest, manifest.label_definition),
         tuple(c for c in df.columns if c.startswith("feature__")),
-        "residual_o2o_5d",
-        "relevance",
-        label_span,
+        (tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),),
         dataset_manifest=manifest,
         registry=ModelArtifactRegistry(tmp_path / "artifacts"),
         base_schedule=default_base_schedule(),
@@ -453,15 +456,12 @@ def test_tuning_counts_pruned_trials_for_deflated_sharpe(monkeypatch, tmp_path) 
     monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: None)
 
     request = TrainingRequest(artifact_id="tune_prune", n_folds=2, optuna_trials=4)
-    config, n_trials = tm._tune_champion(
-        panel,
-        folds,
+    config, n_trials, _route = tm._tune_champion(
+        panel[folds[0].train_mask],
         request,
         _tune_base_manifest("tune_prune", manifest, manifest.label_definition),
         tuple(c for c in df.columns if c.startswith("feature__")),
-        "residual_o2o_5d",
-        "relevance",
-        label_span,
+        (tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),),
         dataset_manifest=manifest,
         registry=ModelArtifactRegistry(tmp_path / "artifacts"),
         base_schedule=default_base_schedule(),
@@ -506,15 +506,12 @@ def test_tuning_economic_tie_breaks_by_lowest_trial_number(monkeypatch, tmp_path
     monkeypatch.setattr(tm, "_event_ledger_evaluation", lambda *_a, **_kw: _positive_replay())
 
     request = TrainingRequest(artifact_id="tie_break", n_folds=3, optuna_trials=3)
-    config, n_trials = tm._tune_champion(
-        panel,
-        folds,
+    config, n_trials, _route = tm._tune_champion(
+        panel[folds[0].train_mask],
         request,
         _tune_base_manifest("tie_break", manifest, manifest.label_definition),
         tuple(c for c in df.columns if c.startswith("feature__")),
-        "residual_o2o_5d",
-        "relevance",
-        label_span,
+        (tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),),
         dataset_manifest=manifest,
         registry=ModelArtifactRegistry(tmp_path / "artifacts"),
         base_schedule=default_base_schedule(),
@@ -568,15 +565,12 @@ def test_tuning_rejects_economically_ineligible_candidates(monkeypatch, tmp_path
     )
 
     request = TrainingRequest(artifact_id="no_orders", n_folds=3, optuna_trials=3)
-    config, n_trials = tm._tune_champion(
-        panel,
-        folds,
+    config, n_trials, _route = tm._tune_champion(
+        panel[folds[0].train_mask],
         request,
         _tune_base_manifest("no_orders", manifest, manifest.label_definition),
         tuple(c for c in df.columns if c.startswith("feature__")),
-        "residual_o2o_5d",
-        "relevance",
-        label_span,
+        (tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),),
         dataset_manifest=manifest,
         registry=ModelArtifactRegistry(tmp_path / "artifacts"),
         base_schedule=default_base_schedule(),
@@ -758,15 +752,12 @@ def test_tuning_rejects_non_positive_bootstrap_candidates(monkeypatch, tmp_path)
     )
 
     request = TrainingRequest(artifact_id="bad_boot", n_folds=3, optuna_trials=3)
-    config, n_trials = tm._tune_champion(
-        panel,
-        folds,
+    config, n_trials, _route = tm._tune_champion(
+        panel[folds[0].train_mask],
         request,
         _tune_base_manifest("bad_boot", manifest, manifest.label_definition),
         tuple(c for c in df.columns if c.startswith("feature__")),
-        "residual_o2o_5d",
-        "relevance",
-        label_span,
+        (tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),),
         dataset_manifest=manifest,
         registry=ModelArtifactRegistry(tmp_path / "artifacts"),
         base_schedule=default_base_schedule(),
@@ -859,15 +850,12 @@ def test_tuning_skips_candidates_that_fail_full_refit(monkeypatch, tmp_path) -> 
     monkeypatch.setattr(tm, "_event_ledger_evaluation", lambda *_a, **_kw: _positive_replay())
 
     request = TrainingRequest(artifact_id="refit_fail", n_folds=3, optuna_trials=3)
-    config, n_trials = tm._tune_champion(
-        panel,
-        folds,
+    config, n_trials, _route = tm._tune_champion(
+        panel[folds[0].train_mask],
         request,
         _tune_base_manifest("refit_fail", manifest, manifest.label_definition),
         tuple(c for c in df.columns if c.startswith("feature__")),
-        "residual_o2o_5d",
-        "relevance",
-        label_span,
+        (tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),),
         dataset_manifest=manifest,
         registry=ModelArtifactRegistry(tmp_path / "artifacts"),
         base_schedule=default_base_schedule(),
@@ -963,15 +951,12 @@ def test_tuning_records_early_rejected_full_refits(monkeypatch, tmp_path) -> Non
     monkeypatch.setattr(tm, "_event_ledger_evaluation", lambda *_a, **_kw: _positive_replay())
 
     request = TrainingRequest(artifact_id="early_tele", n_folds=3, optuna_trials=3)
-    config, n_trials = tm._tune_champion(
-        panel,
-        folds,
+    config, n_trials, _route = tm._tune_champion(
+        panel[folds[0].train_mask],
         request,
         _tune_base_manifest("early_tele", manifest, manifest.label_definition),
         tuple(c for c in df.columns if c.startswith("feature__")),
-        "residual_o2o_5d",
-        "relevance",
-        label_span,
+        (tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),),
         dataset_manifest=manifest,
         registry=ModelArtifactRegistry(tmp_path / "artifacts"),
         base_schedule=default_base_schedule(),
@@ -1146,3 +1131,278 @@ def test_bounded_replay_history_contract(tmp_path) -> None:
     empty = scored_for_replay.filter(pl.col("session") < first_scored)
     with pytest.raises(ValueError, match="no scored cross-section"):
         _bounded_replay_history(empty, decision_time, policy)
+
+def test_drop_target_columns_isolates_all_route_label_columns() -> None:
+    from src.stocks.workflows.train_model import _drop_target_columns
+
+    df = stock_v2_composed_df(n_sessions=40, n_tickers=6)
+    frame = df.with_columns(
+        pl.col("residual_o2o_5d").alias("residual_o2o_10d"),
+        pl.col("residual_o2o_5d").alias("residual_o2o_15d"),
+        pl.col("relevance").alias("relevance_10d"),
+        pl.lit("x", dtype=pl.Utf8).alias("not_a_label"),
+    )
+    dropped = _drop_target_columns(frame, "residual_o2o_5d")
+    assert "residual_o2o_5d" not in dropped.columns
+    assert "residual_o2o_10d" not in dropped.columns
+    assert "residual_o2o_15d" not in dropped.columns
+    assert "relevance" not in dropped.columns
+    assert "relevance_10d" not in dropped.columns
+    assert "label_available_time" not in dropped.columns
+    assert "not_a_label" in dropped.columns
+
+def test_resolve_route_specs_fails_closed_for_multi_horizon_missing_columns() -> None:
+    from src.stocks.workflows.train_model import _resolve_route_specs
+
+    df = stock_v2_composed_df(n_sessions=40, n_tickers=6)
+    multi = df.with_columns(
+        pl.col("residual_o2o_5d").alias("residual_o2o_10d"),
+        pl.col("relevance").alias("relevance_10d"),
+        (pl.col("label_available_time") + pl.duration(days=5)).alias(
+            "label_available_time_10d"
+        ),
+    )
+    with pytest.raises(ValueError, match="fail closed"):
+        _resolve_route_specs(multi, (5, 10, 15))
+
+    routes = _resolve_route_specs(multi, (5, 10))
+    assert [route.horizon for route in routes] == [5, 10]
+    assert routes[1].label_column == "residual_o2o_10d"
+    assert routes[1].label_available_column == "label_available_time_10d"
+
+
+def test_resolve_route_specs_keeps_legacy_five_day_columns() -> None:
+    from src.stocks.workflows.train_model import _resolve_route_specs
+
+    df = stock_v2_composed_df(n_sessions=40, n_tickers=6)
+    routes = _resolve_route_specs(df, (5, 10, 15))
+    assert [route.horizon for route in routes] == [5]
+    assert routes[0].relevance_column == "relevance"
+    assert routes[0].label_available_column == "label_available_time"
+
+    assert _resolve_route_specs(df.drop(["relevance"]), (5,)) == ()
+
+
+def test_prepare_replay_static_context_uses_route_rebalance_cadence() -> None:
+    from src.stocks.workflows.train_model import _prepare_replay_static_context
+
+    df = stock_v2_composed_df(n_sessions=40, n_tickers=6)
+    panel = _index_sessions(df)
+    request = TrainingRequest(artifact_id="cadence_v1")
+    for horizon in (5, 10, 15):
+        context = _prepare_replay_static_context(
+            panel, request, holding_horizon_sessions=horizon
+        )
+        assert context.policy.rebalance_frequency_sessions == horizon
+
+
+def _route_test_panel() -> pl.DataFrame:
+    df = stock_v2_composed_df(n_sessions=140, n_tickers=20)
+    df = df.with_columns(
+        pl.col("residual_o2o_5d").alias("residual_o2o_10d"),
+        pl.col("relevance").alias("relevance_10d"),
+        (pl.col("label_available_time") + pl.duration(days=5)).alias(
+            "label_available_time_10d"
+        ),
+    )
+    return _index_sessions(df)
+
+
+def _multi_route_request(artifact_id: str, trials: int = 4) -> TrainingRequest:
+    return TrainingRequest(
+        artifact_id=artifact_id,
+        n_folds=3,
+        optuna_trials=trials,
+        candidate_horizons=(5, 10),
+    )
+
+
+def _route_tune_mocks(
+    monkeypatch,
+    *,
+    ledger_replay: dict[int, ReplayResult] | None = None,
+    screen_ic: float | None = 0.01,
+) -> None:
+    monkeypatch.setattr(tm, "_MIN_TRAIN_SESSIONS", 40)
+    monkeypatch.setattr(tm, "_VALIDATION_BLOCK_SESSIONS", 30)
+    monkeypatch.setattr(tm, "_fit_stable_contexts", lambda *_a, **_kw: [None] * 3)
+    monkeypatch.setattr(
+        tm, "_score_trial_fold", lambda *_a, **_kw: screen_ic
+    )
+    monkeypatch.setattr(
+        tm,
+        "_fit_and_score_candidate",
+        lambda *_a, **_kw: ([0.05, 0.06, 0.07], pl.DataFrame()),
+    )
+
+    def fake_event_ledger(*_a, **_kw):
+        horizon = int(_kw.get("holding_horizon_sessions", 5))
+        replay = (ledger_replay or {}).get(horizon)
+        if replay is not None:
+            return replay
+        return _positive_replay()
+
+    monkeypatch.setattr(tm, "_event_ledger_evaluation", fake_event_ledger)
+
+
+def test_tuning_selects_longer_horizon_route_when_bootstrap_is_higher(
+    monkeypatch, tmp_path,
+) -> None:
+    _route_tune_mocks(
+        monkeypatch,
+        ledger_replay={
+            5: _positive_replay(excess_returns=[0.001] * 24),
+            10: _positive_replay(excess_returns=[0.002] * 24),
+        },
+    )
+    request = _multi_route_request("route_win_10d")
+    panel = _route_test_panel()
+    config, n_trials, route = tm._tune_champion(
+        panel,
+        request,
+        _tune_base_manifest("route_win_10d", stock_v2_manifest(columns=panel.columns), "residual_o2o_5d"),
+        tuple(c for c in panel.columns if c.startswith("feature__")),
+        (
+            tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),
+            tm.RouteSpec(10, "residual_o2o_10d", "relevance_10d", "label_available_time_10d"),
+        ),
+        dataset_manifest=stock_v2_manifest(columns=panel.columns),
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    assert route is not None
+    assert route.horizon == 10
+    assert n_trials == 2
+    assert config is not None
+    assert config._tuning_telemetry["selected_horizon"] == 10
+    assert config._tuning_telemetry["selection_status"] == "selected"
+
+
+def test_tuning_tie_breaks_to_shorter_horizon_route(monkeypatch, tmp_path) -> None:
+    _route_tune_mocks(monkeypatch)
+    request = _multi_route_request("route_tie_5d")
+    panel = _route_test_panel()
+    config, _n_trials, route = tm._tune_champion(
+        panel,
+        request,
+        _tune_base_manifest("route_tie_5d", stock_v2_manifest(columns=panel.columns), "residual_o2o_5d"),
+        tuple(c for c in panel.columns if c.startswith("feature__")),
+        (
+            tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),
+            tm.RouteSpec(10, "residual_o2o_10d", "relevance_10d", "label_available_time_10d"),
+        ),
+        dataset_manifest=stock_v2_manifest(columns=panel.columns),
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    assert route is not None
+    assert route.horizon == 5
+    assert config is not None
+    assert config._tuning_telemetry["selected_horizon"] == 5
+
+
+def test_tuning_records_route_specific_candidate_evidence(monkeypatch, tmp_path) -> None:
+    _route_tune_mocks(monkeypatch)
+    request = _multi_route_request("route_evidence")
+    panel = _route_test_panel()
+    config, _n_trials, route = tm._tune_champion(
+        panel,
+        request,
+        _tune_base_manifest("route_evidence", stock_v2_manifest(columns=panel.columns), "residual_o2o_5d"),
+        tuple(c for c in panel.columns if c.startswith("feature__")),
+        (
+            tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),
+            tm.RouteSpec(10, "residual_o2o_10d", "relevance_10d", "label_available_time_10d"),
+        ),
+        dataset_manifest=stock_v2_manifest(columns=panel.columns),
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    assert route is not None
+    telemetry = config._tuning_telemetry
+    evidence = telemetry["shortlist_candidate_evidence"]
+    assert len(evidence) == 4
+    assert {row["holding_horizon_sessions"] for row in evidence} == {5, 10}
+    assert any(row["label_column"] == "residual_o2o_5d" for row in evidence)
+    assert any(row["label_column"] == "residual_o2o_10d" for row in evidence)
+    assert any(row["label_available_column"] == "label_available_time_10d" for row in evidence)
+    assert telemetry["economically_eligible_trials"] == 4
+    assert set(telemetry["routes"]) == {"5", "10"}
+    assert telemetry["per_route_trial_budget"] == 2
+
+
+def test_tuning_returns_no_trade_when_no_route_survives(monkeypatch, tmp_path) -> None:
+    _route_tune_mocks(monkeypatch, screen_ic=None)
+    request = _multi_route_request("route_no_trade")
+    panel = _route_test_panel()
+    config, n_trials, route = tm._tune_champion(
+        panel,
+        request,
+        _tune_base_manifest("route_no_trade", stock_v2_manifest(columns=panel.columns), "residual_o2o_5d"),
+        tuple(c for c in panel.columns if c.startswith("feature__")),
+        (
+            tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),
+            tm.RouteSpec(10, "residual_o2o_10d", "relevance_10d", "label_available_time_10d"),
+        ),
+        dataset_manifest=stock_v2_manifest(columns=panel.columns),
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    assert config is None
+    assert route is None
+    assert n_trials == 4
+    assert tm.LambdaRankConfig._tuning_telemetry["selection_status"] == "no_complete_screen_candidate"
+
+
+def test_event_ledger_cadence_matches_holding_horizon(tmp_path) -> None:
+    from src.stocks.workflows.train_model import _event_ledger_evaluation
+
+    df = stock_v2_composed_df(n_sessions=60, n_tickers=8)
+    manifest = stock_v2_manifest(columns=df.columns)
+    snapshot = DatasetSnapshot(manifest=manifest, frame=df)
+    oos_scored = df.tail(20).with_columns(
+        pl.col("market_cap").rank("dense").over("session").cast(pl.Float64).alias("pred_score")
+    )
+    panel = _index_sessions(df)
+    request = TrainingRequest(artifact_id="cadence_ledger")
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    five_day = _event_ledger_evaluation(
+        panel, oos_scored, request, snapshot.manifest, registry,
+        default_base_schedule(), default_stress_schedule(),
+        holding_horizon_sessions=5,
+    )
+    ten_day = _event_ledger_evaluation(
+        panel, oos_scored, request, snapshot.manifest, registry,
+        default_base_schedule(), default_stress_schedule(),
+        holding_horizon_sessions=10,
+    )
+    assert five_day.planned_cycles > ten_day.planned_cycles
+    assert ten_day.planned_cycles > 0
+
+
+def test_reserve_forward_holdout_uses_route_availability_column() -> None:
+    from src.stocks.workflows.train_model import _reserve_forward_holdout
+
+    df = stock_v2_composed_df(n_sessions=100, n_tickers=6)
+    df = df.with_columns(
+        pl.col("label_available_time").alias("label_available_time_5d"),
+        pl.col("label_available_time").alias("label_available_time_10d"),
+        pl.col("label_available_time").alias("label_available_time_15d"),
+    )
+    panel = _index_sessions(df)
+    request = TrainingRequest(artifact_id="holdout_route")
+    fold, training_panel = _reserve_forward_holdout(
+        panel, request, 6, "label_available_time_5d"
+    )
+    assert fold is None
+    assert training_panel is panel
+
+    legacy_fold, legacy_panel = _reserve_forward_holdout(
+        panel, request, 6, "label_available_time"
+    )
+    assert legacy_fold is None
+    assert legacy_panel is panel
