@@ -94,3 +94,66 @@
 
 - [Metrics](../../data/artifacts/stocks/lambdarank_v2_20260812_sub10_81trial/metrics.json)
 - [Manifest](../../data/artifacts/stocks/lambdarank_v2_20260812_sub10_81trial/manifest.json)
+
+---
+
+# Execution recovery 재실행 결과
+
+## 실행
+
+| 항목 | 값 |
+|---|---|
+| 실행일 | 2026-08-13 |
+| Snapshot | `research_provisional_20160104_20260812_cost_master_v3_mh2` |
+| Artifact | `lambdarank_v2_20260813_execution_recovery` |
+| Mode | `research` |
+| Command | `uv run python -m src.stocks.cli.train --artifact-id lambdarank_v2_20260813_execution_recovery --snapshot-id research_provisional_20160104_20260812_cost_master_v3_mh2 --mode research --optuna-trials 81 --max-rss-mib 8000` |
+| Exit status | `0` |
+
+## 결과 판정
+
+| 항목 | 값 |
+|---|---:|
+| `promoted` | `false` |
+| `no_trade` | `true` |
+| `selection_status` | `selected` (resource telemetry) |
+| `n_folds_evaluated` | 3 |
+| `n_terminal_trials` | 81 |
+| `screened_trials` | 72 |
+| `pruned_trials` | 9 |
+| `shortlisted_trials` | 18 |
+| `economically_eligible_trials` | 1 |
+| `planned_cycles` | 134 |
+| `attempted_orders` | 1,737 |
+| `filled_orders` | **1,737** |
+| `gates.passed` | `false` |
+
+체결은 기존 0건에서 1,737건으로 회복되었다. 그러나 기존 fail-closed
+정책에 따라 최종 승격은 거부되었다.
+
+## 경제성 / 게이트 결과
+
+| 항목 | 값 |
+|---|---:|
+| Gate 1 positive Rank-IC fraction | 1.0000 |
+| Gate 2 excess bootstrap lower bound | **-0.00017155** |
+| Gate 3 strategy IR / benchmark IR | 0.957496 / 0.095455 |
+| Gate 4 stress excess | `true` |
+| Gate 4 stress total / benchmark return | 0.82610756 / 0.15974089 |
+| Gate 5 deflated Sharpe probability | 0.661712 |
+| Gate 6 drawdown ratio | 0.2108 / 0.6174 |
+| Gate 8 forward holdout | `false` (insufficient label-available sessions) |
+
+## Route별 finalist evidence
+
+| Route | Trial | Attempted | Filled | Bootstrap lower bound | Eligible |
+|---:|---:|---:|---:|---:|---:|
+| 5 sessions | 5 | 3,296 | 3,296 | -0.00002456 | `false` |
+| 10 sessions | 26 | 1,823 | 1,823 | **0.00005287** | `true` |
+| 15 sessions | 19 | 939 | 939 | -0.00022462 | `false` |
+
+## 산출물
+
+- [Metrics](../../data/artifacts/stocks/lambdarank_v2_20260813_execution_recovery/metrics.json)
+- [Manifest](../../data/artifacts/stocks/lambdarank_v2_20260813_execution_recovery/manifest.json)
+- [Execution log](../../logs/scratch/execution_recovery_train_20260813.log)
