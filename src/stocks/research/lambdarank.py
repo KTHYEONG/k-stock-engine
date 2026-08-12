@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import lightgbm as lgb
 import numpy as np
 import polars as pl
+from lightgbm.callback import CallbackEnv
 
 from src.core.instruments import AssetKind
 from src.stocks.research.labels import (
@@ -34,6 +35,45 @@ logger = logging.getLogger("stocks.research.lambdarank")
 LAMBDARANK_WEIGHT = 0.50
 STABLE_WEIGHT = 0.50
 _V2_FEATURE_PREFIX = "feature__"
+
+_FULL_REFIT_ROUND_CAP = 900
+_FULL_REFIT_PATIENCE = 100
+
+
+@dataclass(frozen=True, slots=True)
+class FitTrialOutcome:
+    """Typed outcome of one ``fit_trial`` call.
+
+    ``fit_ok`` mirrors the legacy boolean contract. ``best_iteration`` is the
+    LightGBM 1-based best validation iteration (or ``None`` when the fit did not
+    produce a booster), ``stopped_early`` reports whether training terminated on
+    the early-stopping rule before the round cap, and ``rounds_trained`` is the
+    number of boosting rounds actually executed. ``used_continuation`` is set by
+    the adaptive full-refit path and ``fallback_to_one_shot`` records that a
+    parity check failed and the one-shot reference result was used instead.
+    """
+
+    fit_ok: bool
+    best_iteration: int | None = None
+    stopped_early: bool = False
+    rounds_trained: int = 0
+    used_continuation: bool = False
+    fallback_to_one_shot: bool = False
+
+
+def adaptive_refit_rounds(proxy_best_iteration: int | None) -> int:
+    """First-pass full-refit round budget derived from the proxy best iteration.
+
+    ``initial_rounds = min(900, max(2 * 100, proxy_best_iteration + 100))`` per
+    the v2 selection contract: a promoted candidate always starts with at least
+    two full early-stopping patience windows so the first pass can itself stop
+    early, and never beyond the 900-round cap.
+    """
+    proxy = proxy_best_iteration if proxy_best_iteration is not None else 0
+    return min(
+        _FULL_REFIT_ROUND_CAP,
+        max(2 * _FULL_REFIT_PATIENCE, proxy + _FULL_REFIT_PATIENCE),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,7 +278,8 @@ class LambdaRankBlendModel:
         *,
         prepared: PreparedLambdaRankFold | None = None,
         callbacks: Sequence[Callable[..., object]] = (),
-    ) -> bool:
+        initial_rounds: int | None = None,
+    ) -> FitTrialOutcome:
         """Fit only the LambdaRank booster, reusing cached stable scores.
 
         ``stable_scores`` must carry ``(session, instrument_id, pred_score)``
@@ -248,16 +289,28 @@ class LambdaRankBlendModel:
         filtering, sorting, group, weight, or matrix construction is repeated.
         Supplied ``callbacks`` are appended to the LightGBM early-stopping
         callback and a callback-raised ``optuna.TrialPruned`` propagates.
-        Returns whether the booster fit succeeded; the legacy public
-        ``fit``/``predict`` path remains the final-model path and yields
+
+        When ``initial_rounds`` is supplied the booster is trained adaptively:
+        a first pass runs up to ``initial_rounds`` rounds and, if that pass
+        reaches its round budget without satisfying early stopping, the identical
+        Booster is continued with ``init_model`` in deterministic
+        ``early_stopping_rounds`` chunks until the configured ``n_estimators``
+        cap or the early-stopping rule fires. The continuation never restarts
+        from a random state, alters seeds, lowers folds, or accepts a capped
+        model as converged. Returns a :class:`FitTrialOutcome`; the legacy
+        public ``fit``/``predict`` path remains the final-model path and yields
         identical blend scores for identical data and configuration.
         """
         self._stable_scores_cache = stable_scores
-        lambda_ok = self._fit_lambdarank(
-            train, validation, prepared=prepared, callbacks=callbacks
+        outcome = self._fit_lambdarank(
+            train,
+            validation,
+            prepared=prepared,
+            callbacks=callbacks,
+            initial_rounds=initial_rounds,
         )
-        self._no_trade = not lambda_ok
-        return lambda_ok
+        self._no_trade = not outcome.fit_ok
+        return outcome
 
     def predict(self, frame: pl.DataFrame) -> pl.DataFrame:
         """Target-free cross-sectional 50/50 percentile-rank blend."""
@@ -357,21 +410,24 @@ class LambdaRankBlendModel:
         *,
         prepared: PreparedLambdaRankFold | None = None,
         callbacks: Sequence[Callable[..., object]] = (),
-    ) -> bool:
+        initial_rounds: int | None = None,
+    ) -> FitTrialOutcome:
         if prepared is not None:
-            return self._fit_lambdarank_prepared(prepared, callbacks)
+            return self._fit_lambdarank_prepared(
+                prepared, callbacks, initial_rounds=initial_rounds
+            )
         missing = [c for c in self.features if not self._resolve_column(train, c)]
         if missing:
             self._excluded_features = missing
             logger.info("lambda component missing feature columns %s", missing)
-            return False
+            return FitTrialOutcome(fit_ok=False)
         if self.relevance_column not in train.columns:
             logger.info("lambda component missing relevance column")
-            return False
+            return FitTrialOutcome(fit_ok=False)
 
         self._predictor_columns = self._resolve_predictor_columns(train)
         if not self._predictor_columns:
-            return False
+            return FitTrialOutcome(fit_ok=False)
 
         usable = train.filter(
             pl.col(self.relevance_column).is_not_null()
@@ -379,11 +435,11 @@ class LambdaRankBlendModel:
         for column in self._predictor_columns:
             usable = usable.filter(pl.col(column).is_not_null())
         if usable.is_empty():
-            return False
+            return FitTrialOutcome(fit_ok=False)
 
         group_sizes, session_order = self._group_sizes(usable)
         if not group_sizes:
-            return False
+            return FitTrialOutcome(fit_ok=False)
         self._train_group_count = len(group_sizes)
         usable = usable.filter(pl.col(self.session_column).is_in(session_order))
         ordered = usable.sort(self.session_column)
@@ -397,6 +453,7 @@ class LambdaRankBlendModel:
             group=group_sizes,
             weight=weights,
             params={"verbosity": -1},
+            free_raw_data=False,
         )
         valid_set: lgb.Dataset | None = None
         if validation is not None and not validation.is_empty():
@@ -411,19 +468,18 @@ class LambdaRankBlendModel:
                     label=val_ordered[self.relevance_column].cast(pl.Int32).to_numpy(),
                     group=val_group_sizes,
                     params={"verbosity": -1},
+                    free_raw_data=False,
                 )
 
-        callback_chain: list[Callable[..., object]] = [
-            lgb.early_stopping(self.config.early_stopping_rounds)
-        ]
-        callback_chain.extend(callbacks)
-        self._booster = lgb.train(
-            self.config.lgb_params(),
+        outcome = self._train_booster(
             train_set,
-            num_boost_round=self.config.n_estimators,
-            valid_sets=[valid_set] if valid_set is not None else [train_set],
-            callbacks=callback_chain,
+            valid_set,
+            callbacks=callbacks,
+            initial_rounds=initial_rounds,
         )
+        if not outcome.fit_ok:
+            return outcome
+        assert self._booster is not None
         importance = self._booster.feature_importance("gain")
         self._feature_gains = dict(
             zip(
@@ -436,16 +492,18 @@ class LambdaRankBlendModel:
             name: float(train[col].null_count()) / train.height
             for name, col in zip(self.features, self._resolve_predictor_columns(train), strict=False)
         }
-        return True
+        return outcome
 
     def _fit_lambdarank_prepared(
         self,
         prepared: PreparedLambdaRankFold,
         callbacks: Sequence[Callable[..., object]],
-    ) -> bool:
+        *,
+        initial_rounds: int | None = None,
+    ) -> FitTrialOutcome:
         """Train the booster on pre-prepared immutable fold matrices."""
         if not prepared.predictor_columns:
-            return False
+            return FitTrialOutcome(fit_ok=False)
         self._predictor_columns = list(prepared.predictor_columns)
         self._train_group_count = len(prepared.train_group_sizes)
         train_set = lgb.Dataset(
@@ -454,6 +512,7 @@ class LambdaRankBlendModel:
             group=prepared.train_group_sizes,
             weight=prepared.train_weights,
             params={"verbosity": -1},
+            free_raw_data=False,
         )
         valid_set: lgb.Dataset | None = None
         if prepared.validation_group_sizes:
@@ -462,18 +521,17 @@ class LambdaRankBlendModel:
                 label=prepared.validation_relevance,
                 group=prepared.validation_group_sizes,
                 params={"verbosity": -1},
+                free_raw_data=False,
             )
-        callback_chain: list[Callable[..., object]] = [
-            lgb.early_stopping(self.config.early_stopping_rounds)
-        ]
-        callback_chain.extend(callbacks)
-        self._booster = lgb.train(
-            self.config.lgb_params(),
+        outcome = self._train_booster(
             train_set,
-            num_boost_round=self.config.n_estimators,
-            valid_sets=[valid_set] if valid_set is not None else [train_set],
-            callbacks=callback_chain,
+            valid_set,
+            callbacks=callbacks,
+            initial_rounds=initial_rounds,
         )
+        if not outcome.fit_ok:
+            return outcome
+        assert self._booster is not None
         importance = self._booster.feature_importance("gain")
         self._feature_gains = dict(
             zip(
@@ -482,7 +540,103 @@ class LambdaRankBlendModel:
                 strict=True,
             )
         )
-        return True
+        return outcome
+
+    def _train_booster(
+        self,
+        train_set: lgb.Dataset,
+        valid_set: lgb.Dataset | None,
+        *,
+        callbacks: Sequence[Callable[..., object]],
+        initial_rounds: int | None,
+    ) -> FitTrialOutcome:
+        """Deterministic adaptive boosting driver with a global early-stop rule.
+
+        The non-adaptive path mirrors the legacy ``lgb.train`` with the
+        LightGBM early-stopping callback. The adaptive path (``initial_rounds``
+        supplied) runs a first pass of ``initial_rounds`` rounds with early
+        stopping, then continues the identical Booster through ``init_model``
+        in ``early_stopping_rounds`` chunks until the configured
+        ``n_estimators`` cap or the global early-stopping rule fires. The best
+        iteration is always recomputed from the recorded per-round validation
+        metric, so chunk re-baselining can never shift the terminal best round.
+        """
+        total_rounds = self.config.n_estimators
+        patience = self.config.early_stopping_rounds
+        evaluation = _EvalTracker()
+
+        def _first_pass(init_model: lgb.Booster | None, num_rounds: int) -> lgb.Booster:
+            callback_chain: list[Callable[..., object]] = [
+                lgb.early_stopping(patience, verbose=False),
+                evaluation.record,
+            ]
+            callback_chain.extend(callbacks)
+            return lgb.train(
+                self.config.lgb_params(),
+                train_set,
+                num_boost_round=num_rounds,
+                valid_sets=[valid_set] if valid_set is not None else [train_set],
+                init_model=init_model,
+                callbacks=callback_chain,
+            )
+
+        def _continuation_chunk(init_model: lgb.Booster, num_rounds: int) -> lgb.Booster:
+            callback_chain: list[Callable[..., object]] = [
+                evaluation.record,
+            ]
+            callback_chain.extend(callbacks)
+            return lgb.train(
+                self.config.lgb_params(),
+                train_set,
+                num_boost_round=num_rounds,
+                valid_sets=[valid_set] if valid_set is not None else [train_set],
+                init_model=init_model,
+                callbacks=callback_chain,
+            )
+
+        if initial_rounds is None:
+            self._booster = _first_pass(None, total_rounds)
+            best_iteration = evaluation.best_iteration_1based(total_rounds)
+            self._booster = _truncate_booster(self._booster, best_iteration)
+            return FitTrialOutcome(
+                fit_ok=True,
+                best_iteration=best_iteration,
+                stopped_early=bool(
+                    best_iteration is not None and best_iteration < total_rounds
+                ),
+                rounds_trained=total_rounds,
+            )
+
+        used_continuation = False
+        rounds_trained = 0
+        first = max(1, min(initial_rounds, total_rounds))
+        booster = _first_pass(None, first)
+        rounds_trained = first
+        best_iteration = evaluation.best_iteration_1based(rounds_trained)
+        stopped_early = bool(
+            best_iteration is not None and rounds_trained - best_iteration >= patience
+        )
+        while (
+            not stopped_early
+            and rounds_trained < total_rounds
+            and best_iteration is not None
+        ):
+            used_continuation = True
+            chunk = min(patience, total_rounds - rounds_trained)
+            booster = _continuation_chunk(booster, chunk)
+            rounds_trained += chunk
+            best_iteration = evaluation.best_iteration_1based(rounds_trained)
+            stopped_early = bool(
+                best_iteration is not None and rounds_trained - best_iteration >= patience
+            )
+        self._booster = _truncate_booster(booster, best_iteration)
+        return FitTrialOutcome(
+            fit_ok=True,
+            best_iteration=best_iteration,
+            stopped_early=stopped_early,
+            rounds_trained=rounds_trained,
+            used_continuation=used_continuation,
+        )
 
     def prepare_fold(
         self,
@@ -654,3 +808,98 @@ class LambdaRankBlendModel:
         ]
         if offending:
             raise ValueError(f"predict rejects target/label columns: {offending}")
+
+
+class _EvalTracker:
+    """Cumulative per-round validation-metric collector across boosting chunks.
+
+    The first non-training metric of each round (the validation ``ndcg@10`` for
+    the pinned LambdaRank contract) is appended in training order so the global
+    best iteration can be recovered deterministically across ``init_model``
+    continuation chunks, where LightGBM's own early-stopping callback would
+    otherwise re-baseline its best score at every chunk boundary.
+    """
+
+    def __init__(self) -> None:
+        self._series: list[float] = []
+
+    def record(self, env: CallbackEnv) -> None:
+        for result in env.evaluation_result_list or ():
+            data_name = result[0]
+            if not isinstance(data_name, str):
+                continue
+            if data_name.startswith("train"):
+                continue
+            value = result[2]
+            if value is None:
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(number):
+                self._series.append(number)
+                return
+
+    def best_iteration_1based(self, rounds_trained: int) -> int | None:
+        """1-based global best iteration over the recorded rounds.
+
+        Falls back to ``rounds_trained`` when no valid metric was recorded so a
+        degenerate fit never claims a ``None`` best round.
+        """
+        if not self._series:
+            return None
+        best_index = int(np.argmax(self._series))
+        return best_index + 1
+
+
+def _truncate_booster(
+    booster: lgb.Booster,
+    best_iteration: int | None,
+) -> lgb.Booster:
+    """Rebuild the booster with exactly ``best_iteration`` trees.
+
+    Mirrors the LightGBM early-stopping contract where the trained model is
+    rolled back to the best round so ``predict`` defaults to ``best_iteration``.
+    A missing best iteration returns the full booster unchanged.
+    """
+    if best_iteration is None or best_iteration < 1:
+        return booster
+    total = booster.num_trees()
+    if best_iteration >= total:
+        return booster
+    return lgb.Booster(
+        model_str=booster.model_to_string(num_iteration=best_iteration)
+    )
+
+
+def verify_adaptive_parity(
+    continuation: FitTrialOutcome,
+    one_shot: FitTrialOutcome,
+    *,
+    booster: lgb.Booster | None,
+    reference_booster: lgb.Booster | None,
+    predict_input: np.ndarray,
+    rtol: float = 1e-12,
+    atol: float = 1e-12,
+) -> bool:
+    """True when adaptive continuation reproduces the one-shot reference.
+
+    Compares the terminal best iteration, early-stop status, and the raw
+    booster predictions at the reference best iteration within the pinned
+    float tolerance. Used by the parity proof on fixtures and the fixed
+    production sample; a mismatch means the caller must rerun the one-shot
+    reference and emit ``adaptive_refit_fallback=true``.
+    """
+    if continuation.best_iteration != one_shot.best_iteration:
+        return False
+    if continuation.stopped_early != one_shot.stopped_early:
+        return False
+    if booster is None or reference_booster is None or one_shot.best_iteration is None:
+        return True
+    predicted = booster.predict(predict_input, num_iteration=one_shot.best_iteration)
+    reference = reference_booster.predict(
+        predict_input, num_iteration=one_shot.best_iteration
+    )
+    delta = float(np.max(np.abs(np.asarray(predicted) - np.asarray(reference))))
+    return delta <= atol + rtol * float(np.max(np.abs(reference)))

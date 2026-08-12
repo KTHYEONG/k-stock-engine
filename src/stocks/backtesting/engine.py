@@ -486,6 +486,7 @@ class StockBacktester:
         self.seed = seed
         self.decision_provider = decision_provider
         self.scenario_planner = scenario_planner
+        self._score_overlay: np.ndarray | None = None
         self._last_cycles: dict[int, TradingCycleResult] = {}
         self.prepared_decision_count = 0
 
@@ -534,7 +535,11 @@ class StockBacktester:
                 artifacts=artifacts,
                 initial_portfolio=initial_portfolio,
             )
-            return self.run_prepared(request, market, None)
+            return self.run_prepared(
+                request,
+                market,
+                np.full(market.row_count, np.nan, dtype=np.float64),
+            )
         ledger, trades, attempted_orders = self._run_ledger(
             panel, by_session, sessions, artifacts, initial_portfolio, request,
             self.cost_schedule, self._liquidity_model(stress=False), adtv=adtv,
@@ -596,20 +601,33 @@ class StockBacktester:
         aligned arrays instead of per-session ``partition_by``/``to_dicts`` and
         market-wide ADTV/returns are computed once. ``score_overlay`` is the
         candidate's aligned ``float64`` score per market row (``NaN`` when the
-        candidate has no score) and is validated for length; execution reads
-        only market arrays while allocation decisions flow through the prepared
-        decision provider. Raises ``BacktestValidationError`` when the paired
-        decision provider is absent or the overlay length mismatches.
+        candidate has no score). The overlay is validated for length and for
+        finiteness on every scored row and retained on the backtester so the
+        decision provider can read it from a per-run immutable context; a
+        missing, non-finite-for-scored-row, or length-mismatched overlay raises
+        ``BacktestValidationError``. Raises ``BacktestValidationError`` when
+        the paired decision provider is absent.
         """
         if self.decision_provider is None or self.scenario_planner is None:
             raise BacktestValidationError(
                 "prepared replay requires a decision provider and scenario planner"
             )
-        if score_overlay is not None and len(score_overlay) != market.row_count:
+        if score_overlay is None:
+            raise BacktestValidationError(
+                "prepared replay requires an aligned score overlay"
+            )
+        if len(score_overlay) != market.row_count:
             raise BacktestValidationError(
                 f"score overlay length {len(score_overlay)} does not match "
                 f"market row count {market.row_count}"
             )
+        overlay = np.asarray(score_overlay, dtype=np.float64)
+        scored = np.where(~np.isnan(overlay))[0]
+        if scored.size and not bool(np.all(np.isfinite(overlay[scored]))):
+            raise BacktestValidationError(
+                "score overlay carries non-finite values on scored rows"
+            )
+        self._score_overlay = overlay
         return self._run_paired_prepared(request, market)
 
     def _run_paired_prepared(
