@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 
 import numpy as np
 import polars as pl
@@ -36,6 +37,155 @@ _TOLERANCE = 1e-10
 
 class PortfolioConstraintError(ValueError):
     """Raised when constructed targets violate a hard portfolio constraint."""
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedAllocationMarket:
+    """Immutable array-backed route market consumed by the prepared allocator.
+
+    Owns the canonical sorted ``(session, instrument_id)`` row index plus the
+    candidate-invariant ``close``, ADTV, and sector arrays for one route OOS
+    interval, so a candidate contributes only an aligned ``float64`` score
+    overlay instead of re-joining a full market frame. ``session_ranges`` maps
+    each session index to its contiguous row range and ``rows_by_key`` resolves
+    ``(instrument_id, session)`` rows in ``O(1)``.
+    """
+
+    sessions: tuple[datetime, ...]
+    session_ranges: Mapping[int, tuple[int, int]]
+    instrument_ids: np.ndarray
+    row_session_of: np.ndarray
+    row_sessions: np.ndarray
+    close: np.ndarray
+    adtv: np.ndarray
+    sector: np.ndarray
+    rows_by_key: Mapping[tuple[str, datetime], int]
+    cache_bytes: int
+
+    @property
+    def row_count(self) -> int:
+        return int(self.instrument_ids.size)
+
+    @classmethod
+    def build(cls, frame: pl.DataFrame) -> PreparedAllocationMarket:
+        """Build the array-backed market from a validated route OOS frame."""
+        missing = [c for c in ("instrument_id", _SESSION_COLUMN, "sector", "adtv", "close") if c not in frame.columns]
+        if missing:
+            raise ValueError(f"prepared market frame must carry {', '.join(missing)}")
+        ordered = frame.sort([_SESSION_COLUMN, "instrument_id"])
+        if ordered.is_empty():
+            raise ValueError("prepared market frame has no rows")
+        sessions = tuple(
+            datetime.fromisoformat(str(s))
+            if not isinstance(s, datetime)
+            else s
+            for s in ordered[_SESSION_COLUMN].unique().sort().to_list()
+        )
+        session_index_of = {session: i for i, session in enumerate(sessions)}
+        row_sessions_list = [
+            session_index_of[
+                datetime.fromisoformat(str(s)) if not isinstance(s, datetime) else s
+            ]
+            for s in ordered[_SESSION_COLUMN].to_list()
+        ]
+        ranges: dict[int, tuple[int, int]] = {}
+        current = -1
+        start = 0
+        for i, session_idx in enumerate(row_sessions_list):
+            if session_idx != current:
+                if current != -1:
+                    ranges[current] = (start, i)
+                current = session_idx
+                start = i
+        ranges[current] = (start, len(row_sessions_list))
+        row_sessions = np.asarray(
+            [sessions[i] for i in row_sessions_list], dtype=object
+        )
+        instrument_ids = np.asarray(
+            [str(i) for i in ordered["instrument_id"].to_list()], dtype=object
+        )
+        rows_by_key: dict[tuple[str, datetime], int] = {}
+        market = cls(
+            sessions=sessions,
+            session_ranges=ranges,
+            instrument_ids=instrument_ids,
+            row_session_of=np.asarray(row_sessions_list, dtype=np.int64),
+            row_sessions=row_sessions,
+            close=ordered["close"].to_numpy().astype(np.float64),
+            adtv=ordered["adtv"].to_numpy().astype(np.float64),
+            sector=np.asarray(ordered["sector"].to_list(), dtype=object),
+            rows_by_key=rows_by_key,
+            cache_bytes=int(ordered.estimated_size()),
+        )
+        for i in range(ordered.height):
+            rows_by_key[
+                (str(ordered["instrument_id"][i]), sessions[int(row_sessions_list[i])])
+            ] = i
+        return market
+
+
+def construct_target_allocations_prepared(
+    market: PreparedAllocationMarket,
+    decision_index: int,
+    score_overlay: np.ndarray,
+    calibration_state: Mapping[str, object] | None,
+    instruments: Mapping[str, Instrument],
+    portfolio: PortfolioSnapshot,
+    policy: StockRiskPolicy,
+) -> tuple[Allocation, ...]:
+    """Construct constrained targets from prepared arrays and one score overlay.
+
+    Assembles only the bounded ``(volatility, covariance)`` history window
+    ending at ``decision_index`` from static arrays, applies the frozen
+    ``calibration_state`` bucket table when supplied, and delegates the
+    constraint-satisfying allocation construction to the reference
+    :func:`construct_target_allocations` so the prepared and reference paths
+    produce identical allocations, order intents, fills, ledger, and metrics.
+    ``score_overlay`` must be aligned to ``market`` rows (``NaN`` where the
+    candidate has no score). Raises ``ValueError`` on an overlay length
+    mismatch or a non-finite market input.
+    """
+    if score_overlay is None or len(score_overlay) != market.row_count:
+        raise ValueError(
+            f"score overlay length {0 if score_overlay is None else len(score_overlay)} "
+            f"does not match prepared market row count {market.row_count}"
+        )
+    if not np.all(np.isfinite(market.close)) or not np.all(np.isfinite(market.adtv)):
+        raise ValueError("prepared market close/adtv must be finite")
+    if decision_index < 0 or decision_index >= len(market.sessions):
+        raise ValueError(f"decision_index {decision_index} outside route sessions")
+    window = (
+        max(policy.volatility_lookback_sessions, policy.covariance_lookback_sessions)
+        + 1
+    )
+    start = max(0, decision_index - window + 1)
+    indices = np.concatenate(
+        [np.arange(market.session_ranges[i][0], market.session_ranges[i][1])
+         for i in range(start, decision_index + 1)]
+    )
+    if indices.size == 0:
+        return ()
+    window_frame = pl.DataFrame(
+        {
+            "instrument_id": market.instrument_ids[indices],
+            _SESSION_COLUMN: pl.Series(
+                market.row_sessions[indices].tolist(), dtype=pl.Datetime("us", "UTC")
+            ),
+            "pred_score": np.asarray(score_overlay)[indices],
+            "sector": market.sector[indices],
+            "adtv": market.adtv[indices],
+            "close": market.close[indices],
+        }
+    )
+    if calibration_state is not None:
+        from src.stocks.research.economic_alpha import CausalAlphaCalibrator
+
+        window_frame = CausalAlphaCalibrator.apply_prepared(
+            dict(calibration_state), window_frame
+        )
+    return construct_target_allocations(
+        window_frame, instruments, portfolio, policy
+    )
 
 
 @dataclass(frozen=True, slots=True)

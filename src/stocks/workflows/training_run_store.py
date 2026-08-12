@@ -160,6 +160,12 @@ class TrainingRunStore:
         store = cls(identity, resume=request.resume)
         identity_path = run_root / _IDENTITY_FILENAME
         if identity_path.exists():
+            if not request.resume:
+                raise ValueError(
+                    f"training run root {run_root} already holds an identity; "
+                    "pass --resume to continue only hash-validated phases, or "
+                    "choose a new artifact id to start a fresh durable run"
+                )
             persisted = json.loads(identity_path.read_text())
             if persisted.get("fingerprint") != identity.fingerprint:
                 raise ValueError(
