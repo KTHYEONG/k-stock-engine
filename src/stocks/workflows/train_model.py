@@ -37,7 +37,10 @@ from src.core.datasets import DatasetManifest
 from src.core.instruments import AssetKind, Instrument
 from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.research.artifacts import ModelArtifactRegistry
-from src.stocks.research.calibration_schedule import CausalCalibrationSchedule
+from src.stocks.research.calibration_schedule import (
+    CausalCalibrationSchedule,
+    SessionClusterCalibrationSchedule,
+)
 from src.stocks.research.datasets import (
     research_eligible_frame,
     validate_stock_rows_available,
@@ -55,21 +58,32 @@ from src.stocks.research.labels import (
     RELEVANCE_COLUMN,
 )
 from src.stocks.research.lambdarank import (
+    FitTrialOutcome,
     LambdaRankBlendModel,
     LambdaRankConfig,
     PreparedLambdaRankFold,
+    adaptive_refit_rounds,
 )
 from src.stocks.research.models import ModelManifest, StableRankComposite
-from src.stocks.trading.portfolio_constructor import StockRiskPolicy
+from src.stocks.trading.portfolio_constructor import (
+    PreparedAllocationMarket,
+    StockRiskPolicy,
+    construct_target_allocations_prepared,
+)
 from src.stocks.workflows.contracts import TrainingRequest
 from src.stocks.workflows.economic_selection import (
     SELECTION_POLICY_VERSION,
-    SelectionPolicy,
+    ScreenFidelityPolicy,
 )
 from src.stocks.workflows.training_run_store import TrainingRunStore, content_hash
 
 if TYPE_CHECKING:
-    from src.stocks.backtesting.engine import BacktestLedgerRow
+    from src.core.portfolio import PortfolioSnapshot
+    from src.stocks.backtesting.engine import (
+        ArtifactSchedule,
+        BacktestLedgerRow,
+        PreparedReplayMarket,
+    )
 
 logger = logging.getLogger("stocks.workflows.train_model")
 
@@ -120,7 +134,6 @@ _SCREEN_BOOSTING_ROUNDS = 800
 _SCREEN_EARLY_STOPPING_ROUNDS = 50
 _SCREEN_NDCG_WARMUP_ROUNDS = 100
 _SCREEN_NDCG_INTERVAL_ROUNDS = 50
-_SCREEN_SHORTLIST_SIZE = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,10 +269,15 @@ class ReplayResourceGuard:
 
     The hard limit is the minimum of the explicit ``request.max_rss_mib``, a
     finite readable cgroup v2 ``memory.max``, and available host memory plus
-    the current process RSS. Before each replay materialization the concrete
-    ``DataFrame.estimated_size()`` and the known NumPy bootstrap workspaces are
-    admitted; the observed RSS is recorded after the stage. An unsafe admission
-    or observed breach raises ``TrainingCapacityError`` with the deterministic
+    the current process RSS. Replay work is admitted against a more
+    conservative *operational* ceiling that reserves one eighth of the hard
+    ceiling for native LightGBM/Polars allocator and OS transient allocations:
+    ``operational_limit = hard_limit - hard_limit / 8`` (7,000 MiB for an
+    8,000 MiB ceiling). Before each replay materialization the concrete
+    ``DataFrame.estimated_size()``, the known NumPy bootstrap workspaces, the
+    candidate score overlay, and the projected output arrays are admitted; the
+    observed RSS is recorded after the stage. An unsafe admission or observed
+    breach raises ``TrainingCapacityError`` with the deterministic
     ``replay_capacity_exceeded`` reason so callers can publish a traceable
     ``NO_TRADE`` artifact instead of leaving a missing result directory.
     """
@@ -271,7 +289,8 @@ class ReplayResourceGuard:
         replay_mode: ReplayMode = ReplayMode.FINAL_PROMOTION_BASE_AND_STRESS,
     ) -> None:
         self.replay_mode = replay_mode
-        self._limit_mib = self._resolve_limit_mib(request)
+        self._hard_limit_mib = self._resolve_limit_mib(request)
+        self._operational_limit_mib = self._hard_limit_mib - self._hard_limit_mib / 8.0
         self.baseline_rss_mib = self._rss_mib()
         self.peak_rss_mib = self.baseline_rss_mib
         self.stage_seconds: dict[str, float] = {}
@@ -322,8 +341,9 @@ class ReplayResourceGuard:
     def _fail(self, stage: str) -> None:
         self.capacity_failure_reason = "replay_capacity_exceeded"
         raise TrainingCapacityError(
-            f"replay_capacity_exceeded:{stage} exceeds the {self._limit_mib:.1f} MiB "
-            f"hard process limit"
+            f"replay_capacity_exceeded:{stage} exceeds the "
+            f"{self._operational_limit_mib:.1f} MiB operational ceiling "
+            f"(hard {self._hard_limit_mib:.1f} MiB)"
         )
 
     def admit(self, estimated_bytes: int, *, stage: str) -> None:
@@ -332,7 +352,7 @@ class ReplayResourceGuard:
         current = self._rss_mib()
         self.peak_rss_mib = max(self.peak_rss_mib, current)
         self.stage_estimated_bytes[stage] = int(estimated_bytes)
-        if current + estimate_mib > self._limit_mib:
+        if current + estimate_mib > self._operational_limit_mib:
             self._fail(stage)
 
     def bootstrap_workspace_cap(
@@ -344,8 +364,8 @@ class ReplayResourceGuard:
     ) -> int:
         """Admit decision preparation and return the bounded bootstrap workspace.
 
-        Samples current RSS once, converts the remaining hard-budget capacity
-        to bytes, and reserves the projected calibrated output plus one
+        Samples current RSS once, converts the remaining operational-budget
+        capacity to bytes, and reserves the projected calibrated output plus one
         conservative draw workspace (``history_rows * 24``) so allocator
         overlap is modeled instead of assuming an input frame is freed before
         its output exists. The selected batch cap is limited to the full
@@ -355,7 +375,9 @@ class ReplayResourceGuard:
         """
         current_mib = self._rss_mib()
         self.peak_rss_mib = max(self.peak_rss_mib, current_mib)
-        remaining_bytes = int(max(0.0, self._limit_mib - current_mib) * (1024 * 1024))
+        remaining_bytes = int(
+            max(0.0, self._operational_limit_mib - current_mib) * (1024 * 1024)
+        )
         per_draw = history_rows * _BOOTSTRAP_BYTES_PER_ROW
         reserve = projected_output_bytes + per_draw
         max_batch = min(
@@ -376,7 +398,7 @@ class ReplayResourceGuard:
         current = self._rss_mib()
         self.peak_rss_mib = max(self.peak_rss_mib, current)
         self.stage_peak_rss_mib[stage] = current
-        if current > self._limit_mib:
+        if current > self._operational_limit_mib:
             self._fail(stage)
 
     def record_stage(self, stage: str, elapsed_seconds: float) -> None:
@@ -395,7 +417,8 @@ class ReplayResourceGuard:
             "capacity_failure_reason": self.capacity_failure_reason,
             "baseline_rss_mib": round(self.baseline_rss_mib, 3),
             "replay_peak_rss_mib": round(self.peak_rss_mib, 3),
-            "replay_limit_mib": round(self._limit_mib, 3),
+            "replay_limit_mib": round(self._hard_limit_mib, 3),
+            "replay_operational_limit_mib": round(self._operational_limit_mib, 3),
             "bootstrap_batch_size": int(self.bootstrap_batch_size),
             "bootstrap_workspace_bytes": int(self.bootstrap_workspace_bytes),
         }
@@ -554,6 +577,247 @@ class ReplayStaticContext:
     cache_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedSelectionRoute:
+    """Candidate-invariant route OOS replay market and decision schedule.
+
+    Built once per route after the inner folds are known. Owns one
+    array-backed ``PreparedReplayMarket`` for the route OOS interval, the
+    aligned ``PreparedAllocationMarket`` consumed by
+    :func:`construct_target_allocations_prepared`, the canonical decision and
+    execution session indexes, the bounded 20/60-session window start per
+    decision, and the artifact schedule / initial portfolio the engine requires.
+    A candidate contributes only a NaN ``float64`` overlay scattered by
+    :meth:`scatter_overlay`; no full market-score join, ``partition_by``,
+    ``to_dicts``, ``_bounded_replay_history``, or new ``PreparedReplayMarket``
+    is created in the candidate replay loop.
+    """
+
+    market: PreparedReplayMarket
+    allocation_market: PreparedAllocationMarket
+    sessions: tuple[datetime, ...]
+    decision_indices: tuple[int, ...]
+    decision_index_by_time: Mapping[datetime, int]
+    execution_index_by_decision: Mapping[int, int]
+    window_start_by_decision: Mapping[int, int]
+    artifacts: ArtifactSchedule
+    initial_portfolio: PortfolioSnapshot
+    cache_bytes: int
+
+    @classmethod
+    def build(
+        cls,
+        panel: pl.DataFrame,
+        oos_sessions: Sequence[datetime],
+        request: TrainingRequest,
+        route: RouteSpec,
+        guard: ReplayResourceGuard | None = None,
+    ) -> PreparedSelectionRoute:
+        """Build the immutable route market, allocation market, and decision map.
+
+        ``panel`` is the full pre-OOS training panel; ``oos_sessions`` are the
+        chronological scored sessions that begin the route OOS interval. The
+        route cadence is the holding horizon in sessions, matching the replay
+        policy's rebalance frequency. Raises ``ValueError`` for a panel missing
+        the required replay columns or for an empty OOS interval.
+        """
+        from src.core.portfolio import PortfolioSnapshot
+        from src.stocks.backtesting.engine import (
+            REQUIRED_BACKTEST_COLUMNS,
+            ArtifactSchedule,
+            ArtifactSlot,
+            PreparedReplayMarket,
+        )
+
+        if not oos_sessions:
+            raise ValueError("PreparedSelectionRoute requires a non-empty OOS interval")
+        replay_frame = panel.filter(pl.col("session") >= oos_sessions[0])
+        if replay_frame.is_empty():
+            raise ValueError("PreparedSelectionRoute OOS interval exposes no rows")
+        missing = [c for c in REQUIRED_BACKTEST_COLUMNS if c not in replay_frame.columns]
+        if missing:
+            raise ValueError(f"prepared route panel must carry {', '.join(missing)}")
+        instruments = _instruments_from_frame(replay_frame)
+        sessions = tuple(
+            _session_as_datetime(s)
+            for s in replay_frame["session"].unique().sort().to_list()
+        )
+        artifacts = ArtifactSchedule(
+            slots=(
+                ArtifactSlot(
+                    eligible_from=sessions[0],
+                    eligible_to=sessions[-1],
+                    artifact_id=request.artifact_id,
+                ),
+            )
+        )
+        initial_portfolio = PortfolioSnapshot(
+            account_snapshot_id="promotion",
+            as_of=datetime(2000, 1, 1, tzinfo=UTC),
+            settled_cash=request.initial_cash,
+            unsettled_cash=0.0,
+            positions=(),
+        )
+        if guard is not None:
+            guard.admit(int(replay_frame.estimated_size()), stage="prepared_route")
+        market = PreparedReplayMarket.build(
+            replay_frame,
+            adtv_window=20,
+            instruments=instruments,
+            artifacts=artifacts,
+            initial_portfolio=initial_portfolio,
+        )
+        allocation_market = PreparedAllocationMarket.build(
+            replay_frame.with_columns(
+                pl.col("trading_value")
+                .rolling_mean(20, min_samples=1)
+                .over("instrument_id")
+                .alias("adtv")
+            )
+        )
+        cadence = max(1, int(route.horizon))
+        decision_indices = tuple(
+            i for i in range(len(sessions)) if i % cadence == 0
+        )
+        decision_times = tuple(
+            _decision_time_at(market, i) for i in decision_indices
+        )
+        decision_index_by_time = {
+            decision_times[position]: position
+            for position in range(len(decision_indices))
+        }
+        policy = StockRiskPolicy(
+            top_k=request.top_k,
+            gross_cap=request.max_exposure,
+            single_name_cap=request.max_single_weight,
+            participation_limit=request.participation_limit,
+            rebalance_frequency_sessions=cadence,
+        )
+        window = (
+            max(policy.volatility_lookback_sessions, policy.covariance_lookback_sessions)
+            + 1
+        )
+        execution_index_by_decision = {
+            position: (decision_indices[position] + 1)
+            for position in range(len(decision_indices))
+            if decision_indices[position] + 1 < len(sessions)
+        }
+        window_start_by_decision = {
+            position: max(0, decision_indices[position] - window + 1)
+            for position in range(len(decision_indices))
+        }
+        return cls(
+            market=market,
+            allocation_market=allocation_market,
+            sessions=sessions,
+            decision_indices=decision_indices,
+            decision_index_by_time=decision_index_by_time,
+            execution_index_by_decision=execution_index_by_decision,
+            window_start_by_decision=window_start_by_decision,
+            artifacts=artifacts,
+            initial_portfolio=initial_portfolio,
+            cache_bytes=int(replay_frame.estimated_size()),
+        )
+
+    def scatter_overlay(self, oos_scored: pl.DataFrame) -> np.ndarray:
+        """Scatter the candidate's narrow OOS scores into a NaN float64 overlay."""
+        from src.stocks.backtesting.engine import PreparedReplayMarket
+
+        market = self.market
+        if not isinstance(market, PreparedReplayMarket):
+            raise TypeError("PreparedSelectionRoute market must be a PreparedReplayMarket")
+        overlay = np.full(market.row_count, np.nan, dtype=np.float64)
+        rows_by_key = market.rows_by_key
+        for row in oos_scored.select("instrument_id", "session", "pred_score").iter_rows(
+            named=True
+        ):
+            key = (str(row["instrument_id"]), _session_as_datetime(row["session"]))
+            prepared_row = rows_by_key.get(key)
+            if prepared_row is not None:
+                overlay[int(prepared_row.index)] = float(row["pred_score"])
+        return overlay
+
+    def decision_index_for(self, decision_time: datetime) -> int | None:
+        """Session index of the decision owning ``decision_time``, or ``None``."""
+        position = self.decision_index_by_time.get(decision_time)
+        if position is None or position >= len(self.decision_indices):
+            return None
+        return int(self.decision_indices[position])
+
+    def window_indices(self, decision_session_index: int) -> np.ndarray:
+        """Row indices of the bounded history window ending at a decision session."""
+        from src.stocks.backtesting.engine import PreparedReplayMarket
+
+        market = self.market
+        if not isinstance(market, PreparedReplayMarket):
+            raise TypeError("PreparedSelectionRoute market must be a PreparedReplayMarket")
+        position = self.decision_indices.index(decision_session_index)
+        start = self.window_start_by_decision[position]
+        return np.concatenate(
+            [
+                np.arange(market.session_ranges[i][0], market.session_ranges[i][1])
+                for i in range(start, decision_session_index + 1)
+            ]
+        )
+
+    def window_frame(
+        self,
+        decision_session_index: int,
+        overlay: np.ndarray,
+    ) -> pl.DataFrame:
+        """Assemble the bounded decision-window frame from static arrays.
+
+        Produces exactly the ``(instrument_id, session, pred_score, sector,
+        adtv, close)`` cross-section the reference ``_bounded_replay_history``
+        would expose for the same decision, so the prepared allocation core is
+        numerically identical to the reference path. No market-wide join,
+        ``partition_by``, or per-row dict materialization is performed.
+        """
+        allocation_market = self.allocation_market
+        if decision_session_index < 0 or decision_session_index >= len(
+            allocation_market.sessions
+        ):
+            raise ValueError(
+                f"decision session index {decision_session_index} outside route sessions"
+            )
+        position = self.decision_indices.index(decision_session_index)
+        start = self.window_start_by_decision[position]
+        indices = np.concatenate(
+            [
+                np.arange(
+                    allocation_market.session_ranges[i][0],
+                    allocation_market.session_ranges[i][1],
+                )
+                for i in range(start, decision_session_index + 1)
+            ]
+        )
+        if indices.size == 0:
+            return pl.DataFrame(
+                schema={
+                    "instrument_id": pl.Utf8,
+                    "session": pl.Datetime("us", "UTC"),
+                    "pred_score": pl.Float64,
+                    "sector": pl.Utf8,
+                    "adtv": pl.Float64,
+                    "close": pl.Float64,
+                }
+            )
+        return pl.DataFrame(
+            {
+                "instrument_id": allocation_market.instrument_ids[indices],
+                "session": pl.Series(
+                    allocation_market.row_sessions[indices].tolist(),
+                    dtype=pl.Datetime("us", "UTC"),
+                ),
+                "pred_score": np.asarray(overlay)[indices],
+                "sector": allocation_market.sector[indices],
+                "adtv": allocation_market.adtv[indices],
+                "close": allocation_market.close[indices],
+            }
+        )
+
+
+
 def train_model(
     snapshot: DatasetSnapshot,
     registry: ModelArtifactRegistry,
@@ -683,6 +947,13 @@ def train_model(
         training_panel, request, holding_horizon_sessions=route.horizon,
         guard=replay_guard,
     )
+    prepared_route = PreparedSelectionRoute.build(
+        training_panel,
+        [_session_as_datetime(oos["session"].min())],
+        request,
+        route,
+        guard=replay_guard,
+    )
     try:
         replay = _event_ledger_evaluation(
             training_panel, oos, request, snapshot.manifest, registry, base,
@@ -693,6 +964,7 @@ def train_model(
             label_available_column=route.label_available_column,
             replay_mode=ReplayMode.FINAL_PROMOTION_BASE_AND_STRESS,
             replay_guard=replay_guard,
+            prepared_route=prepared_route,
         )
     except TrainingCapacityError as exc:
         return _publish_no_trade(
@@ -896,6 +1168,15 @@ def _merge_replay_telemetry(
             "replay": round(replay_seconds, 3),
         },
         "replay_peak_rss_mib": round(peak, 3),
+        "replay_operational_limit_mib": round(
+            float(
+                cast(float, summaries[0].get("replay_operational_limit_mib", 0.0))
+            ),
+            3,
+        ),
+        "replay_limit_mib": round(
+            float(cast(float, summaries[0].get("replay_limit_mib", 0.0))), 3
+        ),
         "prepared_decision_count": prepared_decision_count,
         "inner_stress_replay": False,
         "capacity_failure_reason": next(
@@ -938,25 +1219,28 @@ def _tune_champion(
     stress_schedule: CostSchedule,
     run_store: TrainingRunStore | None = None,
 ) -> tuple[LambdaRankConfig | None, int, RouteSpec | None]:
-    """Run a temporally isolated screen -> shortlist -> economic selection.
+    """Run a temporally isolated proxy screen -> promotion -> exact selection.
 
     The tuning panel is the last purged-and-embargoed data available before the
     first outer validation decision, so no outer validation row influences
     candidate selection. Each active route gets an equal, explicit screen budget
     of ``request.optuna_trials // len(route_specs)`` serial seeded TPE
-    configurations; a LightGBM NDCG callback drives Optuna median pruning, and
-    pruned candidates remain terminal trials for Deflated Sharpe. A pruned or
-    invalid route stays terminal evidence and is never silently reallocated to
-    another horizon. The ``ceil(sqrt(route_budget))`` best
-    positive-screen candidates per horizon (six of 27 for the 81/3/3 profile)
-    are promoted to a fold-0 full refit, then the top all-positive finalists
-    (two per route) are refit over the remaining folds and replayed through the
-    exact event ledger; a rejected finalist is deterministically backfilled
-    from the promoted list. A champion is selected across all routes
+    configurations, all scored against one fixed-stride ``session_stride_proxy``
+    context built from the fold-0 context (every ``ceil(sqrt(route_budget))``-th
+    in-split session). A LightGBM NDCG callback drives Optuna median pruning,
+    and pruned candidates remain terminal trials for Deflated Sharpe. A pruned
+    or invalid route stays terminal evidence and is never silently reallocated
+    to another horizon. The top ``ceil(sqrt(route_budget))`` positive-screen
+    candidates per horizon (six of 27 for the 81/3/3 profile) are promoted to a
+    full fold-0 refit with an adaptive continuation budget derived from the
+    proxy best iteration, then the single top all-positive candidate (ranked by
+    ``(-full_fold0_ic, -proxy_ic, trial_number)``) is refit over the remaining
+    folds and replayed exactly once through the event ledger; a rejected
+    finalist is never backfilled. A champion is selected across all routes
     lexicographically by ``(bootstrap lower bound, strategy IR, -max drawdown,
-    -turnover, median Rank-IC, -holding horizon, -trial number)``.
-    Returns ``(config, n_trials, route)`` where ``n_trials`` is the selected
-    route's terminal screen trial count fed to Deflated Sharpe.
+    -turnover, median Rank-IC, -holding horizon, -trial number)``. Returns
+    ``(config, n_trials, route)`` where ``n_trials`` is the selected route's
+    terminal screen trial count fed to Deflated Sharpe.
     """
     LambdaRankConfig._tuning_telemetry = None
     per_route_trials = max(1, request.optuna_trials // len(route_specs))
@@ -1003,11 +1287,34 @@ def _tune_champion(
             _fold_cache_bytes(getattr(context, "prepared", None))
             for context in contexts
         )
-        policy = SelectionPolicy.for_budget(
+        policy = ScreenFidelityPolicy.for_budget(
             total_trials=request.optuna_trials,
             route_count=max(1, len(route_specs)),
             fold_count=max(1, len(contexts)),
         )
+        proxy_context = (
+            _build_proxy_context(
+                contexts[0],
+                policy.proxy_session_stride,
+                base_manifest,
+                feature_columns,
+                route.label_column,
+                route.relevance_column,
+            )
+            if contexts and contexts[0] is not None
+            else None
+        )
+        if proxy_context is not None:
+            logger.info(
+                "[EVAL] route=%sd stage=proxy_built stride=%d proxy_train_rows=%d "
+                "proxy_validation_rows=%d full_train_rows=%d full_validation_rows=%d",
+                route.horizon,
+                policy.proxy_session_stride,
+                proxy_context.train_processed.height,
+                proxy_context.validation_processed.height,
+                contexts[0].train_processed.height,
+                contexts[0].validation_processed.height,
+            )
 
         screen_phase = f"screen_h{route.horizon}"
         screen_evidence = {
@@ -1017,6 +1324,16 @@ def _tune_champion(
             "seed": request.seed,
             "screen_boosting_rounds": _SCREEN_BOOSTING_ROUNDS,
             "screen_early_stopping_rounds": _SCREEN_EARLY_STOPPING_ROUNDS,
+            "screen_fidelity": "session_stride_proxy",
+            "proxy_session_stride": policy.proxy_session_stride,
+            "proxy_train_rows": (
+                proxy_context.train_processed.height if proxy_context is not None else 0
+            ),
+            "proxy_validation_rows": (
+                proxy_context.validation_processed.height
+                if proxy_context is not None
+                else 0
+            ),
         }
         screen_phase_hash = content_hash(screen_evidence)
         study_name = str(screen_evidence["study_name"])
@@ -1050,12 +1367,14 @@ def _tune_champion(
             _route: RouteSpec = route,
             _tuning_folds: list[Fold] = tuning_folds,
             _contexts: list[_StableTrialContext] = contexts,
+            _proxy_context: _StableTrialContext | None = proxy_context,
             _route_manifest: ModelManifest = route_manifest,
         ) -> float:
             config = _config_from_trial(trial)
             screen_config = _screen_config(config)
+            screen_context = _proxy_context if _proxy_context is not None else _contexts[0]
             ic = _score_trial_fold(
-                tuning_panel, _tuning_folds[0], _contexts[0], request, _route_manifest,
+                tuning_panel, _tuning_folds[0], screen_context, request, _route_manifest,
                 feature_columns, _route.label_column, _route.relevance_column,
                 screen_config, guard, trial, 0,
                 callbacks=(_screen_ndcg_callback(trial),), report_progress=False,
@@ -1140,6 +1459,11 @@ def _tune_champion(
             registry, base_schedule, stress_schedule,
             terminal_trial_count=n_terminal,
             policy=policy,
+            proxy_best_iteration_by_trial={
+                trial.number: int(cast(int, trial.user_attrs.get("proxy_best_iteration", 0)))
+                for trial in study.trials
+                if isinstance(trial.user_attrs.get("proxy_best_iteration"), int)
+            },
         )
         if run_store is not None and selection is not None:
             run_store.checkpoint_phase(
@@ -1171,6 +1495,16 @@ def _tune_champion(
         study.set_user_attr("selection_policy_version", SELECTION_POLICY_VERSION)
         for name, value in policy.to_json_safe().items():
             study.set_user_attr(name, value)
+        study.set_user_attr("screen_fidelity", "session_stride_proxy")
+        study.set_user_attr("proxy_session_stride", policy.proxy_session_stride)
+        study.set_user_attr(
+            "proxy_train_rows",
+            proxy_context.train_processed.height if proxy_context is not None else 0,
+        )
+        study.set_user_attr(
+            "proxy_validation_rows",
+            proxy_context.validation_processed.height if proxy_context is not None else 0,
+        )
         study.set_user_attr("cache_bytes", cache_bytes)
         study.set_user_attr("screen_seconds", screen_seconds)
         study.set_user_attr("holding_horizon_sessions", route.horizon)
@@ -1276,6 +1610,7 @@ def _tune_champion(
     }
     for policy_key in (
         "route_budget",
+        "proxy_session_stride",
         "promotion_width",
         "finalist_width",
         "fold_count",
@@ -1286,6 +1621,16 @@ def _tune_champion(
             for attrs in route_attrs.values():
                 if policy_key in attrs:
                     merged[policy_key] = attrs[policy_key]
+                    break
+    for telemetry_key in (
+        "screen_fidelity",
+        "proxy_train_rows",
+        "proxy_validation_rows",
+    ):
+        if telemetry_key not in merged:
+            for attrs in route_attrs.values():
+                if telemetry_key in attrs:
+                    merged[telemetry_key] = attrs[telemetry_key]
                     break
     if best_screen_rank_ic is not None:
         merged["best_screen_rank_ic"] = best_screen_rank_ic
@@ -1336,6 +1681,7 @@ def _tune_champion(
     for policy_key in (
         "selection_policy_version",
         "route_budget",
+        "proxy_session_stride",
         "promotion_width",
         "finalist_width",
         "fold_count",
@@ -1345,6 +1691,14 @@ def _tune_champion(
     ):
         if policy_key in winner_study.user_attrs:
             merged[policy_key] = winner_study.user_attrs[policy_key]
+    for telemetry_key in (
+        "screen_fidelity",
+        "proxy_train_rows",
+        "proxy_validation_rows",
+        "best_screen_rank_ic",
+    ):
+        if telemetry_key in winner_study.user_attrs:
+            merged[telemetry_key] = winner_study.user_attrs[telemetry_key]
     winner_config._tuning_telemetry = merged
     logger.info(
         "[EVAL] route=%sd trial=%s stage=selected",
@@ -1417,6 +1771,83 @@ def _fit_stable_contexts(
     return contexts
 
 
+def _proxy_session_filter(
+    frame: pl.DataFrame,
+    stride: int,
+    session_column: str = "session",
+) -> pl.DataFrame:
+    """Keep sessions whose ordinal within the frame is congruent to zero.
+
+    The ordinal is the 0-based position of the session in the frame's own
+    chronological session order, so the same fixed rule is applied to the train
+    and validation splits independently. All retained rows keep their original
+    columns, groups, relevance, label availability, and stable score values; the
+    selection is deterministic, causal, and never stratifies by labels or picks
+    a candidate-specific sample.
+    """
+    if stride <= 0:
+        raise ValueError("proxy session stride must be positive")
+    sessions = (
+        frame.select(pl.col(session_column).unique().alias(session_column))
+        .sort(session_column)
+        .with_row_index("__ordinal")
+        .filter(pl.col("__ordinal") % stride == 0)
+        .select(session_column)
+    )
+    return frame.join(sessions, on=session_column, how="inner")
+
+
+def _build_proxy_context(
+    full_context: _StableTrialContext,
+    stride: int,
+    base_manifest: ModelManifest,
+    feature_columns: tuple[str, ...],
+    label_column: str,
+    relevance_column: str | None,
+) -> _StableTrialContext:
+    """Build the fixed-stride proxy screen context from the fold-0 context.
+
+    The proxy reuses the already-transformed fold-0 context, filtering both the
+    train and validation splits by the same ``session ordinal % stride == 0``
+    rule. The cached stable scores are filtered to the retained validation
+    sessions unchanged (the composite score is a per-session cross-sectional
+    percentile rank, so retained rows keep identical values), and the prepared
+    fold matrices are rebuilt once from the filtered frames so the screen fast
+    path still avoids per-trial Polars work. Raises ``ValueError`` when the
+    proxy exposes no qualifying group (a degenerate proxy is never silently
+    accepted as a screen signal).
+    """
+    proxy_train = _proxy_session_filter(full_context.train_processed, stride)
+    proxy_validation = _proxy_session_filter(
+        full_context.validation_processed, stride
+    )
+    proxy_validation_frame = _proxy_session_filter(
+        full_context.validation_frame, stride
+    )
+    proxy_stable_scores = _proxy_session_filter(
+        full_context.stable_scores, stride
+    )
+    prepared: PreparedLambdaRankFold | None = None
+    try:
+        prepared = LambdaRankBlendModel(
+            base_manifest,
+            stock_alpha_v2_allowlist(),
+            label_column,
+            config=LambdaRankConfig(),
+            session_column="session",
+            relevance_column=relevance_column or RELEVANCE_COLUMN,
+        ).prepare_fold(proxy_train, proxy_validation)
+    except ValueError:
+        prepared = None
+    return _StableTrialContext(
+        train_processed=proxy_train,
+        validation_processed=proxy_validation,
+        validation_frame=proxy_validation_frame,
+        stable_scores=proxy_stable_scores,
+        prepared=prepared,
+    )
+
+
 def _score_trial_fold(
     tuning_panel: pl.DataFrame,
     fold: Fold,
@@ -1457,7 +1888,9 @@ def _score_trial_fold(
         )
         if result is None:
             return None
-        ic, _scored = result
+        ic, _scored, outcome = result
+        if outcome.best_iteration is not None:
+            trial.set_user_attr("proxy_best_iteration", outcome.best_iteration)
         if report_progress:
             trial.report(float(ic), step=fold_index)
             if ic <= 0.0:
@@ -1483,13 +1916,15 @@ def _score_context_model(
     config: LambdaRankConfig,
     *,
     callbacks: Sequence[Callable[..., object]] = (),
-) -> tuple[float, pl.DataFrame] | None:
-    """Fit one candidate on a cached fold and return ``(rank_ic, scored)``.
+    initial_rounds: int | None = None,
+) -> tuple[float, pl.DataFrame, FitTrialOutcome] | None:
+    """Fit one candidate on a cached fold and return ``(rank_ic, scored, outcome)``.
 
     ``None`` signals a fail-closed fold (missing columns, unusable groups, or
     invalid inputs). The prepared-fold fast path is used when the context
     carries immutable matrices; otherwise the uncached path yields identical
-    scores.
+    scores. ``initial_rounds`` selects the adaptive continuation driver for
+    promoted full refits.
     """
     model = LambdaRankBlendModel(
         base_manifest,
@@ -1500,21 +1935,22 @@ def _score_context_model(
         relevance_column=relevance_column or RELEVANCE_COLUMN,
     )
     try:
-        fit_ok = model.fit_trial(
+        outcome = model.fit_trial(
             context.train_processed,
             context.validation_processed,
             context.stable_scores,
             prepared=getattr(context, "prepared", None),
             callbacks=callbacks,
+            initial_rounds=initial_rounds,
         )
     except ValueError:
-        fit_ok = False
-    if not fit_ok or model.no_trade:
+        return None
+    if not outcome.fit_ok or model.no_trade:
         return None
     predict_input = _drop_target_columns(context.validation_processed, label_column)
     scored = model.predict(predict_input)
     ic = _median_rank_ic(context.validation_frame, scored, label_column)
-    return float(ic), scored
+    return float(ic), scored, outcome
 
 
 def _frame_bytes(frame: pl.DataFrame) -> int:
@@ -1680,12 +2116,15 @@ def _fit_and_score_candidate(
     *,
     static_cache_bytes: int = 0,
     fold_indices: tuple[int, ...] | None = None,
+    initial_rounds: int | None = None,
 ) -> tuple[list[float], pl.DataFrame | None] | None:
     """Full-budget refit of one promoted candidate over selected inner folds.
 
     ``fold_indices`` selects the folds to refit: the multi-fidelity selector
     scores fold 0 for every promoted candidate first and only refits the
-    remaining folds for the surviving all-positive finalists. Returns
+    remaining folds for the surviving all-positive finalists. ``initial_rounds``
+    supplies the adaptive continuation first-pass budget derived from the
+    candidate's proxy screen best iteration. Returns
     ``(fold_rank_ic, concatenated validation scores)`` for the requested folds,
     ``(fold_rank_ic, None)`` when the first non-positive full-refit Rank-IC
     rejects the candidate early, or ``None`` when any fold fails closed. The
@@ -1721,11 +2160,23 @@ def _fit_and_score_candidate(
         )
         try:
             result = _score_context_model(
-                context, request, base_manifest, label_column, relevance_column, config
+                context, request, base_manifest, label_column, relevance_column, config,
+                initial_rounds=initial_rounds,
             )
             if result is None:
                 return None
-            ic, scored = result
+            ic, scored, outcome = result
+            if outcome.best_iteration is not None:
+                logger.info(
+                    "[EVAL] %s stage=full_refit_best_iteration fold=%d best=%d "
+                    "stopped_early=%s rounds=%d continuation=%s",
+                    candidate_key,
+                    fold_index,
+                    outcome.best_iteration,
+                    outcome.stopped_early,
+                    outcome.rounds_trained,
+                    outcome.used_continuation,
+                )
         finally:
             guard.record_fold(
                 key,
@@ -1950,23 +2401,24 @@ def _select_economic_champion(
     stress_schedule: CostSchedule,
     *,
     terminal_trial_count: int,
-    policy: SelectionPolicy,
+    policy: ScreenFidelityPolicy,
+    proxy_best_iteration_by_trial: dict[int, int] | None = None,
 ) -> tuple[LambdaRankConfig | None, dict[str, object] | None]:
-    """Promote, refit, and exactly replay the route's multi-fidelity finalists.
+    """Promote, refit, and exactly replay the route's single finalist.
 
     The promoted ``shortlist`` (already limited to ``policy.promotion_width``)
-    is first full-refit on fold 0 and ranked by ``(-fold0_rank_ic,
-    -screen_rank_ic, trial_number)``. The best ``policy.finalist_width``
-    candidates are refit over the remaining folds; a non-positive or invalid
-    fold deterministically backfills from the promoted list until
-    ``finalist_width`` all-positive candidates exist or the list is exhausted.
-    Only those all-positive finalists run the exact event ledger, so the normal
-    81/3/3 profile performs ``policy.promotion_width + policy.finalist_width *
-    (fold_count - 1)`` full-refit folds and at most ``policy.finalist_width``
-    economic replays per route. Eligible finalists sort descending by
-    ``(bootstrap lower bound, strategy IR, -max drawdown, -turnover, median
-    Rank-IC, -holding horizon, -trial number)``; a tie is won by the lower
-    trial number. Returns ``(config, selection telemetry)`` or ``(None, None)``
+    is full-refit on fold 0 with an adaptive continuation budget derived from
+    each candidate's proxy screen best iteration and ranked by
+    ``(-full_fold0_ic, -proxy_ic, trial_number)``. Exactly one candidate is
+    then refit over the remaining folds and runs the exact event ledger. A
+    non-positive fold or a failed replay is never backfilled: the route has no
+    champion, which is intentionally conservative in the financial sense. The
+    normal 81/3/3 profile therefore performs ``policy.promotion_width +
+    (fold_count - 1)`` full-refit folds and at most one economic replay per
+    route. An eligible finalist becomes the route's only champion candidate;
+    the cross-route champion sort still uses ``(bootstrap lower bound, strategy
+    IR, -max drawdown, -turnover, median Rank-IC, -holding horizon, -trial
+    number)``. Returns ``(config, selection telemetry)`` or ``(None, None)``
     when no promoted candidate survives the funnel.
     """
     if not shortlist:
@@ -1978,6 +2430,22 @@ def _select_economic_champion(
         tuning_panel, request, holding_horizon_sessions=route.horizon,
         guard=replay_guard,
     )
+    validation_sessions = sorted(
+        tuning_panel.filter(
+            pl.col("session_index").is_in(tuning_folds[0].validation_mask)
+        )["session"].unique().to_list()
+    )
+    prepared_route = (
+        PreparedSelectionRoute.build(
+            tuning_panel,
+            [_session_as_datetime(validation_sessions[0])],
+            request,
+            route,
+            guard=replay_guard,
+        )
+        if validation_sessions
+        else None
+    )
     refit_started = time.perf_counter()
     candidate_rows: list[tuple[tuple[float, ...], int]] = []
     evidence_by_trial: dict[int, dict[str, float]] = {}
@@ -1986,6 +2454,7 @@ def _select_economic_champion(
     early_rejected_seconds: list[float] = []
     replay_seconds = 0.0
     screen_ic_by_trial = {trial_number: screen_ic for screen_ic, trial_number in shortlist}
+    proxy_best_by_trial = dict(proxy_best_iteration_by_trial or {})
 
     remaining_indices = tuple(range(1, len(contexts)))
     fold0_ranked: list[tuple[float, float, int, LambdaRankConfig, pl.DataFrame]] = []
@@ -1993,6 +2462,7 @@ def _select_economic_champion(
         frozen = study.trials[trial_number]
         config = _config_from_params(dict(frozen.params))
         full_refit_config = _screen_informed_full_refit_config(config)
+        initial_rounds = adaptive_refit_rounds(proxy_best_by_trial.get(trial_number))
         refit_started_trial = time.perf_counter()
         refit = _fit_and_score_candidate(
             tuning_panel, tuning_folds, contexts, request, route_manifest,
@@ -2001,6 +2471,7 @@ def _select_economic_champion(
             guard, f"trial{trial_number}",
             static_cache_bytes=replay_context.cache_bytes,
             fold_indices=(0,),
+            initial_rounds=initial_rounds,
         )
         if refit is None:
             logger.info("[EVAL] trial=%s stage=refit_failed", trial_number)
@@ -2019,6 +2490,7 @@ def _select_economic_champion(
     for fold0_ic, _screen_ic, trial_number, full_refit_config, oos0 in fold0_ranked:
         if len(finalists) >= policy.finalist_width:
             break
+        initial_rounds = adaptive_refit_rounds(proxy_best_by_trial.get(trial_number))
         if not remaining_indices:
             finalists.append(([fold0_ic], oos0, trial_number))
             logger.info(
@@ -2034,13 +2506,15 @@ def _select_economic_champion(
             guard, f"trial{trial_number}",
             static_cache_bytes=replay_context.cache_bytes,
             fold_indices=remaining_indices,
+            initial_rounds=initial_rounds,
         )
         if refit is None:
+            logger.info("[EVAL] trial=%s stage=remaining_folds_refit_failed", trial_number)
             continue
         remaining_ic, oos_rest = refit
         if oos_rest is None:
             early_rejected_seconds.append(time.perf_counter() - refit_started_trial)
-            logger.info("[EVAL] trial=%s stage=backfill_rejected", trial_number)
+            logger.info("[EVAL] trial=%s stage=finalist_rejected", trial_number)
             continue
         full_ic = [fold0_ic, *list(remaining_ic)]
         full_oos = pl.concat([oos0, oos_rest]) if not oos0.is_empty() or not oos_rest.is_empty() else oos0
@@ -2066,6 +2540,7 @@ def _select_economic_champion(
                 label_available_column=route.label_available_column,
                 replay_mode=ReplayMode.INNER_SELECTION_BASE_ONLY,
                 replay_guard=replay_guard,
+                prepared_route=prepared_route,
             )
         except TrainingCapacityError as exc:
             replay_guard.capacity_failure_reason = "replay_capacity_exceeded"
@@ -2262,6 +2737,7 @@ def _event_ledger_evaluation(
     label_available_column: str = "label_available_time",
     replay_mode: ReplayMode = ReplayMode.FINAL_PROMOTION_BASE_AND_STRESS,
     replay_guard: ReplayResourceGuard | None = None,
+    prepared_route: PreparedSelectionRoute | None = None,
 ) -> ReplayResult:
     """Replay the out-of-sample scored panel through the event-driven backtester.
 
@@ -2312,37 +2788,60 @@ def _event_ledger_evaluation(
     instruments = replay_context.instruments
     policy = replay_context.policy
 
-    if replay_guard is not None:
-        replay_guard.admit(
-            int(oos_scored.estimated_size()), stage="candidate_score_join"
+    if prepared_route is not None:
+        overlay = prepared_route.scatter_overlay(oos_scored)
+        if replay_guard is not None:
+            replay_guard.admit(
+                int(oos_scored.estimated_size()), stage="candidate_overlay"
+            )
+        sessions = prepared_route.sessions
+        decision_indices = prepared_route.decision_indices
+        decision_times = tuple(sessions[i] for i in decision_indices)
+        start_time = sessions[0]
+        end_time = sessions[-1]
+        cadence = max(1, int(policy.rebalance_frequency_sessions))
+        replay_frame = panel.filter(pl.col("session") >= start_time)
+        if replay_guard is not None:
+            replay_guard.admit(
+                int(replay_frame.estimated_size()), stage="replay_adtv"
+            )
+        market = prepared_route.market
+    else:
+        overlay = np.zeros(0, dtype=np.float64)
+        if replay_guard is not None:
+            replay_guard.admit(
+                int(oos_scored.estimated_size()), stage="candidate_score_join"
+            )
+        scored_for_replay = frame.join(
+            oos_scored.select("instrument_id", "session", "pred_score"),
+            on=["instrument_id", "session"],
+            how="left",
         )
-    scored_for_replay = frame.join(
-        oos_scored.select("instrument_id", "session", "pred_score"),
-        on=["instrument_id", "session"],
-        how="left",
-    )
-    if replay_guard is not None:
-        replay_guard.check_after(stage="candidate_score_join")
+        if replay_guard is not None:
+            replay_guard.check_after(stage="candidate_score_join")
 
-    scored_sessions = sorted(
-        scored_for_replay.filter(pl.col("pred_score").is_not_null())["session"].unique().to_list()
-    )
-    if not scored_sessions:
-        raise ValueError("scored OOS panel exposes no scored session")
-    replay_frame = frame.filter(pl.col("session") >= scored_sessions[0])
-    sessions = sorted(replay_frame["session"].unique().to_list())
-    if replay_guard is not None:
-        replay_guard.admit(
-            int(replay_frame.estimated_size()), stage="replay_adtv"
+        scored_sessions = sorted(
+            scored_for_replay.filter(pl.col("pred_score").is_not_null())["session"].unique().to_list()
         )
+        if not scored_sessions:
+            raise ValueError("scored OOS panel exposes no scored session")
+        replay_frame = frame.filter(pl.col("session") >= scored_sessions[0])
+        sessions = tuple(
+            _session_as_datetime(s)
+            for s in sorted(replay_frame["session"].unique().to_list())
+        )
+        if replay_guard is not None:
+            replay_guard.admit(
+                int(replay_frame.estimated_size()), stage="replay_adtv"
+            )
 
-    start_time = _session_as_datetime(sessions[0])
-    end_time = _session_as_datetime(sessions[-1])
-    cadence = max(1, int(policy.rebalance_frequency_sessions))
-    decision_indices = tuple(
-        i for i in range(len(sessions)) if i % cadence == 0
-    )
-    decision_times = tuple(_session_as_datetime(sessions[i]) for i in decision_indices)
+        start_time = sessions[0]
+        end_time = sessions[-1]
+        cadence = max(1, int(policy.rebalance_frequency_sessions))
+        decision_indices = tuple(
+            i for i in range(len(sessions)) if i % cadence == 0
+        )
+        decision_times = tuple(sessions[i] for i in decision_indices)
 
     calibrator = (
         CausalAlphaCalibrator(
@@ -2358,17 +2857,30 @@ def _event_ledger_evaluation(
         else None
     )
     calibration_schedule: CausalCalibrationSchedule | None = None
+    session_cluster_schedule: SessionClusterCalibrationSchedule | None = None
     if calibrator is not None:
         assert calibration_ledger is not None
-        calibration_schedule = CausalCalibrationSchedule.build(
-            calibration_ledger,
-            decision_times,
-            calibrator,
-            base_schedule,
-            max_workspace_bytes=_bootstrap_workspace_bytes(
-                request.n_bootstrap, int(calibration_ledger.height)
-            ),
-        )
+        if replay_mode is ReplayMode.INNER_SELECTION_BASE_ONLY:
+            session_cluster_schedule = SessionClusterCalibrationSchedule.build(
+                calibration_ledger,
+                decision_times,
+                calibrator,
+                base_schedule,
+                block_length=holding_horizon_sessions,
+                max_workspace_bytes=_bootstrap_workspace_bytes(
+                    request.n_bootstrap, int(calibration_ledger.height)
+                ),
+            )
+        else:
+            calibration_schedule = CausalCalibrationSchedule.build(
+                calibration_ledger,
+                decision_times,
+                calibrator,
+                base_schedule,
+                max_workspace_bytes=_bootstrap_workspace_bytes(
+                    request.n_bootstrap, int(calibration_ledger.height)
+                ),
+            )
     calibration_tracker: dict[str, object] = {}
 
     def _scored_no_trade(
@@ -2389,6 +2901,44 @@ def _event_ledger_evaluation(
             reasons=(reason,),
         )
 
+    def _state_at(
+        decision_time: datetime,
+        visible: pl.DataFrame,
+    ) -> dict[str, object] | None:
+        """Frozen calibration state at a decision, or ``None`` without a ledger."""
+        if calibrator is None:
+            return None
+        assert calibration_ledger is not None
+        workspace_cap: int | None = None
+        active_schedule = (
+            session_cluster_schedule
+            if session_cluster_schedule is not None
+            else calibration_schedule
+        )
+        if replay_guard is not None:
+            assert active_schedule is not None
+            prefix_rows = active_schedule.eligible_prefix_rows(decision_time)
+            if prefix_rows > 0:
+                workspace_cap = replay_guard.bootstrap_workspace_cap(
+                    history_rows=prefix_rows,
+                    projected_output_bytes=int(visible.estimated_size()),
+                    n_bootstrap=request.n_bootstrap,
+                )
+        if active_schedule is not None:
+            state = active_schedule.state_at(
+                decision_time,
+                max_bootstrap_workspace_bytes=workspace_cap,
+            )
+        else:
+            state = calibrator.prepare_decision(
+                calibration_ledger,
+                decision_time,
+                base_schedule,
+                max_bootstrap_workspace_bytes=workspace_cap,
+            )
+        calibration_tracker["state"] = calibrator.calibration_state()
+        return state
+
     def _prepare_decision(
         decision_time: datetime,
         execution_time: datetime,
@@ -2397,9 +2947,18 @@ def _event_ledger_evaluation(
         if replay_guard is not None:
             replay_guard.record_prepared_decision()
         try:
-            visible = _bounded_replay_history(
-                scored_for_replay, decision_time, policy
-            )
+            if prepared_route is not None:
+                decision_session_index = prepared_route.decision_index_for(decision_time)
+                if decision_session_index is None:
+                    return PreparedReplayDecision(
+                        decision_time, execution_time, pl.DataFrame(),
+                        calibration_state=None, reason="no-decision-session",
+                    )
+                visible = prepared_route.window_frame(decision_session_index, overlay)
+            else:
+                visible = _bounded_replay_history(
+                    scored_for_replay, decision_time, policy
+                )
         except ValueError as exc:
             return PreparedReplayDecision(
                 decision_time, execution_time, pl.DataFrame(),
@@ -2411,38 +2970,14 @@ def _event_ledger_evaluation(
                 calibration_state=None, reason="empty-scored-cross-section",
             )
         try:
-            calibration_state: dict[str, object] | None = None
-            if calibrator is not None:
-                assert calibration_ledger is not None
-                workspace_cap: int | None = None
-                if replay_guard is not None:
-                    assert calibration_schedule is not None
-                    prefix_rows = calibration_schedule.eligible_prefix_rows(decision_time)
-                    if prefix_rows > 0:
-                        workspace_cap = replay_guard.bootstrap_workspace_cap(
-                            history_rows=prefix_rows,
-                            projected_output_bytes=int(visible.estimated_size()),
-                            n_bootstrap=request.n_bootstrap,
-                        )
-                if calibration_schedule is not None:
-                    calibration_state = calibration_schedule.state_at(
-                        decision_time,
-                        max_bootstrap_workspace_bytes=workspace_cap,
-                    )
-                else:
-                    calibration_state = calibrator.prepare_decision(
-                        calibration_ledger,
-                        decision_time,
-                        base_schedule,
-                        max_bootstrap_workspace_bytes=workspace_cap,
-                    )
-                visible = calibrator.apply_prepared(calibration_state, visible)
-                calibration_tracker["state"] = calibrator.calibration_state()
+            calibration_state = _state_at(decision_time, visible)
         except ValueError as exc:
             return PreparedReplayDecision(
                 decision_time, execution_time, pl.DataFrame(),
                 calibration_state=None, reason=f"constraint:{exc}",
             )
+        if prepared_route is None and calibration_state is not None:
+            visible = CausalAlphaCalibrator.apply_prepared(calibration_state, visible)
         return PreparedReplayDecision(
             decision_time, execution_time, visible,
             calibration_state=calibration_state,
@@ -2456,13 +2991,33 @@ def _event_ledger_evaluation(
         """Construct scenario-specific allocations against the prepared inputs."""
         if prepared.reason is not None:
             return _scored_no_trade(portfolio, cycle_request, prepared.reason)
-        visible = prepared.visible
-        if visible.is_empty():
-            return _scored_no_trade(portfolio, cycle_request, "empty-scored-cross-section")
         try:
-            allocations = construct_target_allocations(
-                visible, instruments, portfolio, policy
-            )
+            if prepared_route is not None:
+                decision_session_index = prepared_route.decision_index_for(
+                    prepared.decision_time
+                )
+                if decision_session_index is None:
+                    return _scored_no_trade(
+                        portfolio, cycle_request, "no-decision-session"
+                    )
+                allocations = construct_target_allocations_prepared(
+                    prepared_route.allocation_market,
+                    decision_session_index,
+                    overlay,
+                    prepared.calibration_state,
+                    instruments,
+                    portfolio,
+                    policy,
+                )
+            else:
+                visible = prepared.visible
+                if visible.is_empty():
+                    return _scored_no_trade(
+                        portfolio, cycle_request, "empty-scored-cross-section"
+                    )
+                allocations = construct_target_allocations(
+                    visible, instruments, portfolio, policy
+                )
         except ValueError as exc:
             return _scored_no_trade(portfolio, cycle_request, f"constraint:{exc}")
         if not allocations:
@@ -2534,24 +3089,27 @@ def _event_ledger_evaluation(
             decision_provider=_prepare_decision,
             scenario_planner=_scenario_planner,
         )
-    market = PreparedReplayMarket.build(
-        replay_frame,
-        backtester.adtv_window,
-        instruments=instruments,
-        artifacts=artifacts,
-        initial_portfolio=initial_portfolio,
-    )
-    score_overlay = (
-        replay_frame.sort(["session", "instrument_id"])
-        .select("instrument_id", "session")
-        .join(
-            scored_for_replay.select("instrument_id", "session", "pred_score"),
-            on=["instrument_id", "session"],
-            how="left",
-        )["pred_score"]
-        .to_numpy()
-        .astype(np.float64)
-    )
+    if prepared_route is not None:
+        score_overlay = overlay
+    else:
+        market = PreparedReplayMarket.build(
+            replay_frame,
+            backtester.adtv_window,
+            instruments=instruments,
+            artifacts=artifacts,
+            initial_portfolio=initial_portfolio,
+        )
+        score_overlay = (
+            replay_frame.sort(["session", "instrument_id"])
+            .select("instrument_id", "session")
+            .join(
+                scored_for_replay.select("instrument_id", "session", "pred_score"),
+                on=["instrument_id", "session"],
+                how="left",
+            )["pred_score"]
+            .to_numpy()
+            .astype(np.float64)
+        )
     result = backtester.run_prepared(backtest_request, market, score_overlay)
     if replay_guard is not None:
         replay_guard.check_after(stage="replay")
@@ -2595,9 +3153,14 @@ def _event_ledger_evaluation(
         }
     else:
         calibration_evidence = {}
+    if session_cluster_schedule is not None:
+        calibration_evidence["bootstrap_unit"] = "session_cluster"
+        calibration_evidence.update(session_cluster_schedule.telemetry())
     replay_resource: dict[str, object] = {}
     if replay_guard is not None:
         replay_resource = replay_guard.telemetry()
+        if session_cluster_schedule is not None:
+            replay_resource.update(session_cluster_schedule.telemetry())
     return ReplayResult(
         ledger=tuple(result.ledger),
         trades=tuple(result.trades),
@@ -2664,6 +3227,31 @@ def _session_as_datetime(session: object) -> datetime:
     if isinstance(session, datetime):
         return session
     return datetime.combine(cast(date, session), datetime.min.time(), tzinfo=UTC)
+
+
+def _decision_time_at(
+    market: object,
+    session_index: int,
+) -> datetime:
+    """Max point-in-time ``available_time`` at a prepared-market session.
+
+    Mirrors ``StockBacktester._prepared_decision_time`` so the prepared route's
+    decision-time map resolves exactly the decision timestamps the engine passes
+    to its decision provider.
+    """
+    from src.stocks.backtesting.engine import PreparedReplayMarket
+
+    if not isinstance(market, PreparedReplayMarket):
+        raise TypeError("decision-time lookup requires a PreparedReplayMarket")
+    start, stop = market.session_ranges[session_index]
+    values = [
+        value
+        for value in market.available_time[start:stop]
+        if value is not None
+    ]
+    if not values:
+        raise ValueError("no available_time at decision session")
+    return max(cast(list[datetime], values))
 
 
 def _benchmark_return_series(panel: pl.DataFrame) -> list[float]:
@@ -3164,6 +3752,18 @@ def _evaluate_forward_holdout(
         panel, request, holding_horizon_sessions=holding_horizon_sessions,
         guard=replay_guard,
     )
+    prepared_route = PreparedSelectionRoute.build(
+        panel,
+        [_session_as_datetime(holdout_oos["session"].min())],
+        request,
+        RouteSpec(
+            horizon=holding_horizon_sessions,
+            label_column=label_column,
+            relevance_column=relevance_column or RELEVANCE_COLUMN,
+            label_available_column=label_available_column,
+        ),
+        guard=replay_guard,
+    )
     try:
         replay = _event_ledger_evaluation(
             panel, holdout_oos, request, dataset_manifest, registry,
@@ -3174,6 +3774,7 @@ def _evaluate_forward_holdout(
             label_available_column=label_available_column,
             replay_mode=ReplayMode.FINAL_PROMOTION_BASE_AND_STRESS,
             replay_guard=replay_guard,
+            prepared_route=prepared_route,
         )
     except TrainingCapacityError:
         return (

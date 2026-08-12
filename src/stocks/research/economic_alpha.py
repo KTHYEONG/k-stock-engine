@@ -327,8 +327,8 @@ class CausalAlphaCalibrator:
             ],
         }
 
+    @staticmethod
     def apply_prepared(
-        self,
         prepared: dict[str, object],
         scored: pl.DataFrame,
     ) -> pl.DataFrame:
@@ -340,7 +340,7 @@ class CausalAlphaCalibrator:
         ``transform`` for the same decision timestamp. ``scored`` is expected
         to be the already-bounded allocation history (``session <=
         decision_time``) carrying ``instrument_id``, ``session``, and a score
-        column.
+        column. Stateless: the prepared state fully determines the output.
         """
         _validate_scored(scored)
         score_column = _resolve_score_column(scored)
