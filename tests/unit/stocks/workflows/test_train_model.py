@@ -543,11 +543,11 @@ def test_tuning_economic_tie_breaks_by_lowest_trial_number(monkeypatch, tmp_path
     assert telemetry["selection_status"] == "selected"
     assert telemetry["selected_trial_number"] == 0
     assert telemetry["screened_trials"] == request.optuna_trials
-    assert telemetry["selection_policy_version"] == "economic-selection-v1"
+    assert telemetry["selection_policy_version"] == "economic-selection-v2-proxy-one-finalist"
     assert telemetry["promotion_width"] == 2
-    assert telemetry["finalist_width"] == 2
+    assert telemetry["finalist_width"] == 1
     assert telemetry["shortlisted_trials"] == 2
-    assert telemetry["economically_eligible_trials"] == 2
+    assert telemetry["economically_eligible_trials"] == 1
     assert telemetry["selected_inner_bootstrap_lower_bound"] > 0.0
 
 
@@ -606,14 +606,14 @@ def test_tuning_rejects_economically_ineligible_candidates(monkeypatch, tmp_path
     )
     assert tm.LambdaRankConfig._tuning_telemetry["economically_eligible_trials"] == 0
     evidence = tm.LambdaRankConfig._tuning_telemetry["shortlist_candidate_evidence"]
-    assert len(evidence) == 2
+    assert len(evidence) == 1
     for row in evidence:
         assert row["eligible"] is False
         assert set(row["failure_reasons"]) == {
             "no_attempted_orders",
             "no_filled_orders",
         }
-        assert row["trial_number"] in (0, 1)
+        assert row["trial_number"] == 0
 
 
 def test_calibrated_replay_records_economic_evidence_and_fails_closed(
@@ -804,7 +804,22 @@ def test_inner_selection_replay_is_base_only_and_matches_final_base_evidence(
     assert base_only.attempted_orders == final.attempted_orders
     assert base_only.filled_orders == final.filled_orders
     assert base_only.planned_cycles == final.planned_cycles
-    assert base_only.calibration_evidence == final.calibration_evidence
+    assert base_only.calibration_evidence.get("bootstrap_unit") == "session_cluster"
+    assert "bootstrap_unit" not in final.calibration_evidence
+    cluster_keys = {
+        "bootstrap_unit",
+        "block_length",
+        "rows",
+        "sessions",
+        "draws",
+        "reference_fallback_count",
+    }
+    shared_evidence = {
+        key: value
+        for key, value in base_only.calibration_evidence.items()
+        if key not in cluster_keys
+    }
+    assert shared_evidence == final.calibration_evidence
 
 
 def test_compact_replay_market_index_excludes_feature_and_label_columns() -> None:
@@ -866,6 +881,25 @@ def test_replay_capacity_failure_raises_and_records_telemetry(tmp_path) -> None:
     assert telemetry["replay_mode"] == "FINAL_PROMOTION_BASE_AND_STRESS"
     assert telemetry["bootstrap_batch_size"] == 0
     assert telemetry["bootstrap_workspace_bytes"] == 0
+
+def test_replay_guard_reserves_one_eighth_operational_headroom(monkeypatch) -> None:
+    """A hard 8,000 MiB ceiling admits only below the 7,000 MiB operational cap."""
+    import src.stocks.workflows.train_model as tm
+
+    request = TrainingRequest(artifact_id="headroom", n_folds=3, max_rss_mib=8000)
+    guard = tm.ReplayResourceGuard(request)
+    monkeypatch.setattr(
+        tm.ReplayResourceGuard, "_resolve_limit_mib", lambda cls, req: 8000.0
+    )
+    monkeypatch.setattr(tm.ReplayResourceGuard, "_rss_mib", lambda self: 6500.0)
+    guard.admit(400 * 1024 * 1024, stage="overlay")
+    assert guard.telemetry()["replay_operational_limit_mib"] == 7000.0
+    assert guard.telemetry()["replay_limit_mib"] == 8000.0
+
+    monkeypatch.setattr(tm.ReplayResourceGuard, "_rss_mib", lambda self: 6600.0)
+    with pytest.raises(tm.TrainingCapacityError, match="operational ceiling"):
+        guard.admit(500 * 1024 * 1024, stage="overlay_too_large")
+
 
 def test_bootstrap_workspace_cap_selects_bounded_batch_and_records_telemetry(
     monkeypatch,
@@ -1087,7 +1121,7 @@ def test_tuning_rejects_non_positive_bootstrap_candidates(monkeypatch, tmp_path)
         "no_economically_eligible_candidate"
     )
     evidence = tm.LambdaRankConfig._tuning_telemetry["shortlist_candidate_evidence"]
-    assert len(evidence) == 2
+    assert len(evidence) == 1
     for row in evidence:
         assert row["eligible"] is False
         assert row["failure_reasons"] == ["non_positive_bootstrap_lower_bound"]
@@ -1210,7 +1244,11 @@ def test_full_refit_early_rejects_non_positive_first_fold(monkeypatch, tmp_path,
 
     def fake_score(*_a, **_kw):
         calls["count"] += 1
-        return (-0.01, scored)
+        return (
+            -0.01,
+            scored,
+            tm.FitTrialOutcome(fit_ok=True, best_iteration=1, stopped_early=True),
+        )
 
     monkeypatch.setattr(tm, "_score_context_model", fake_score)
     guard = tm.TrialResourceGuard(request, predictor_count=3)
@@ -1455,7 +1493,15 @@ def test_static_context_bytes_participate_in_resource_guard(monkeypatch, tmp_pat
             "pred_score": [0.5, 0.4],
         }
     )
-    monkeypatch.setattr(tm, "_score_context_model", lambda *_a, **_kw: (0.03, scored))
+    monkeypatch.setattr(
+        tm,
+        "_score_context_model",
+        lambda *_a, **_kw: (
+            0.03,
+            scored,
+            tm.FitTrialOutcome(fit_ok=True, best_iteration=1, stopped_early=True),
+        ),
+    )
 
     guard = tm.TrialResourceGuard(request, predictor_count=3)
     result = tm._fit_and_score_candidate(
@@ -1898,3 +1944,100 @@ def test_reserve_forward_holdout_uses_route_availability_column() -> None:
     )
     assert legacy_fold is None
     assert legacy_panel is panel
+
+
+def test_prepared_selection_route_scatters_per_candidate_overlays() -> None:
+    """One immutable route market is reused; only the overlay differs per candidate."""
+    import numpy as np
+
+    import src.stocks.workflows.train_model as tm
+    from src.stocks.workflows.train_model import PreparedSelectionRoute
+
+    df = stock_v2_composed_df(n_sessions=70, n_tickers=8)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    request = TrainingRequest(artifact_id="route_market", n_folds=3)
+    route = tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time")
+    oos_start = panel["session"].unique().sort().tail(1).to_list()[0]
+    prepared = PreparedSelectionRoute.build(
+        panel, [tm._session_as_datetime(oos_start)], request, route
+    )
+    assert prepared.market is prepared.market
+    scored = panel.tail(40).with_columns(
+        pl.col("market_cap").rank("dense").over("session").cast(pl.Float64).alias("pred_score")
+    ).select("instrument_id", "session", "pred_score")
+    first = prepared.scatter_overlay(scored)
+    assert first.shape == (prepared.market.row_count,)
+    assert np.isfinite(first).sum() > 0
+    assert np.isnan(first).sum() > 0
+    second_scored = scored.with_columns(pl.col("pred_score") * 2.0)
+    second = prepared.scatter_overlay(second_scored)
+    assert not np.array_equal(first, second)
+    finite = np.isfinite(first)
+    assert np.allclose(first[finite], second[finite] / 2.0)
+    assert len(prepared.decision_indices) >= 1
+    assert prepared.window_start_by_decision == prepared.window_start_by_decision
+
+
+def test_prepared_route_replay_matches_reference_replay(tmp_path) -> None:
+    """Prepared-route replay produces the same ledger as the reference path."""
+    import src.stocks.workflows.train_model as tm
+    from src.stocks.workflows.train_model import PreparedSelectionRoute
+
+    df = stock_v2_composed_df(n_sessions=70, n_tickers=8)
+    manifest = stock_v2_manifest(columns=df.columns)
+    snapshot = DatasetSnapshot(manifest=manifest, frame=df)
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    panel = _index_sessions(df)
+    last_30 = df["session"].unique().sort(descending=True).head(30)
+    oos_scored = df.filter(pl.col("session").is_in(last_30)).with_columns(
+        pl.col("market_cap").rank("dense").over("session").cast(pl.Float64).alias("pred_score")
+    )
+    request = TrainingRequest(
+        artifact_id="prepared_parity",
+        n_folds=3,
+        calibration_bucket_count=4,
+        min_calibration_sessions=5,
+    )
+    ledger = tm._build_calibration_ledger(oos_scored, panel, "residual_o2o_5d")
+    base = default_base_schedule()
+    stress = default_stress_schedule()
+    context = tm._prepare_replay_static_context(panel, request)
+    reference = tm._event_ledger_evaluation(
+        panel, oos_scored, request, snapshot.manifest, registry, base, stress,
+        replay_context=context, calibration_ledger=ledger,
+    )
+    oos_start = oos_scored["session"].min()
+    route = tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time")
+    prepared_route = PreparedSelectionRoute.build(
+        panel, [tm._session_as_datetime(oos_start)], request, route
+    )
+    prepared = tm._event_ledger_evaluation(
+        panel, oos_scored, request, snapshot.manifest, registry, base, stress,
+        replay_context=context, calibration_ledger=ledger, prepared_route=prepared_route,
+    )
+    assert reference.ledger == prepared.ledger
+    assert reference.trades == prepared.trades
+    assert reference.metrics == prepared.metrics
+    assert reference.attempted_orders == prepared.attempted_orders
+    assert reference.filled_orders == prepared.filled_orders
+    assert reference.planned_cycles == prepared.planned_cycles
+    assert reference.calibration_evidence == prepared.calibration_evidence
+
+
+def test_proxy_session_filter_is_deterministic_causal_and_rule_fixed() -> None:
+    """Stride-6 proxy keeps ordinal%6==0 sessions identically in train/validation."""
+    import src.stocks.workflows.train_model as tm
+
+    df = stock_v2_composed_df(n_sessions=70, n_tickers=8)
+    panel = _index_sessions(df)
+    first = tm._proxy_session_filter(panel, stride=6)
+    second = tm._proxy_session_filter(panel, stride=6)
+    assert first.equals(second)
+    kept_sessions = sorted(first["session"].unique().to_list())
+    all_sessions = sorted(panel["session"].unique().to_list())
+    expected = [s for i, s in enumerate(all_sessions) if i % 6 == 0]
+    assert kept_sessions == expected
+    assert len(kept_sessions) < len(all_sessions)
+    assert "session_index" in first.columns
+    assert first.schema == panel.schema
