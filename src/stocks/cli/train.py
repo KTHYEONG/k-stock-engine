@@ -119,6 +119,12 @@ def main(args: list[str] | None = None) -> int:
         optuna_trials=parsed.optuna_trials,
         max_rss_mib=parsed.max_rss_mib,
     )
+    logger.info(
+        "frozen candidate route set: holding horizons %s, per-horizon trial "
+        "budget %s",
+        list(request.candidate_horizons),
+        request.optuna_trials // len(request.candidate_horizons),
+    )
     manifest = train_model(composed, registry, request)
     logger.info("published artifact %s", manifest.artifact_id)
     return 0
