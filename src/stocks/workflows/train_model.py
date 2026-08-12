@@ -1185,6 +1185,10 @@ def _tune_champion(
         "economic_replay_seconds": replay_seconds_total,
         "early_rejected_full_refits": early_rejected_total,
         "early_rejected_full_refit_seconds": early_rejected_seconds_total,
+        "full_refit_boosting_rounds": (
+            _SCREEN_BOOSTING_ROUNDS + 2 * _SCREEN_EARLY_STOPPING_ROUNDS
+        ),
+        "full_refit_early_stopping_rounds": 2 * _SCREEN_EARLY_STOPPING_ROUNDS,
         "shortlist_candidate_evidence": shortlist_evidence_all,
         "replay_resource": _merge_replay_telemetry(route_attrs),
         "routes": route_attrs,
@@ -1461,6 +1465,55 @@ def _screen_config(config: LambdaRankConfig) -> LambdaRankConfig:
     )
 
 
+def _screen_informed_full_refit_config(config: LambdaRankConfig) -> LambdaRankConfig:
+    """Frozen full-refit budget for shortlisted candidates only.
+
+    Every shortlisted candidate keeps its sampled hyperparameters and pinned
+    seeds, but the boosting budget is bounded by the structural screen
+    relation (the whole screen horizon plus two screen-patience windows)
+    instead of the unpinned 5,000-round default. Returns a new config; the
+    frozen Optuna-sampled config is never mutated.
+    """
+    n_estimators = _SCREEN_BOOSTING_ROUNDS + 2 * _SCREEN_EARLY_STOPPING_ROUNDS
+    patience = 2 * _SCREEN_EARLY_STOPPING_ROUNDS
+    if n_estimators < 1:
+        raise ValueError("derived full-refit boosting rounds must be positive")
+    if patience < 1:
+        raise ValueError("derived full-refit early-stopping patience must be positive")
+    if patience >= n_estimators:
+        raise ValueError(
+            "derived full-refit early-stopping patience must be smaller "
+            "than the boosting-round budget"
+        )
+    params = {
+        name: getattr(config, name)
+        for name in (
+            "objective",
+            "metric",
+            "label_gain",
+            "eval_at",
+            "seed",
+            "num_leaves",
+            "learning_rate",
+            "max_depth",
+            "min_child_samples",
+            "feature_fraction",
+            "bagging_fraction",
+            "bagging_freq",
+            "lambda_l1",
+            "lambda_l2",
+            "max_bin",
+            "min_group_size",
+            "half_life_sessions",
+        )
+    }
+    return LambdaRankConfig(
+        **params,
+        n_estimators=n_estimators,
+        early_stopping_rounds=patience,
+    )
+
+
 def _screen_ndcg_callback(trial: optuna.Trial) -> Callable[[CallbackEnv], None]:
     """LightGBM callback reporting validation NDCG for Optuna median pruning.
 
@@ -1534,6 +1587,8 @@ def _fit_and_score_candidate(
     del tuning_panel, feature_columns
     fold_rank_ic: list[float] = []
     scored_frames: list[pl.DataFrame] = []
+    full_refit_rounds = config.n_estimators
+    full_refit_patience = config.early_stopping_rounds
     for fold_index, context in enumerate(contexts):
         key = f"refit_{candidate_key}_fold_{fold_index}"
         guard.admit(
@@ -1544,6 +1599,14 @@ def _fit_and_score_candidate(
             ),
         )
         started = time.perf_counter()
+        logger.info(
+            "[EVAL] %s stage=full_refit_fold_start fold=%d rounds=%d patience=%d rss=%.1f",
+            candidate_key,
+            fold_index,
+            full_refit_rounds,
+            full_refit_patience,
+            TrialResourceGuard._rss_mib(),
+        )
         try:
             result = _score_context_model(
                 context, request, base_manifest, label_column, relevance_column, config
@@ -1559,6 +1622,16 @@ def _fit_and_score_candidate(
             )
             guard.check_after()
         fold_rank_ic.append(ic)
+        logger.info(
+            "[EVAL] %s stage=full_refit_fold_done fold=%d rounds=%d patience=%d "
+            "elapsed_ms=%.1f rss=%.1f",
+            candidate_key,
+            fold_index,
+            full_refit_rounds,
+            full_refit_patience,
+            (time.perf_counter() - started) * 1000.0,
+            TrialResourceGuard._rss_mib(),
+        )
         if ic <= 0.0:
             logger.info(
                 "[EVAL] %s stage=early_rejected fold_rank_ic=%.6f",
@@ -1797,10 +1870,12 @@ def _select_economic_champion(
     for _screen_ic, trial_number in shortlist:
         frozen = study.trials[trial_number]
         config = _config_from_params(dict(frozen.params))
+        full_refit_config = _screen_informed_full_refit_config(config)
         refit_started_trial = time.perf_counter()
         refit = _fit_and_score_candidate(
             tuning_panel, tuning_folds, contexts, request, route_manifest,
-            feature_columns, route.label_column, route.relevance_column, config,
+            feature_columns, route.label_column, route.relevance_column,
+            full_refit_config,
             guard, f"trial{trial_number}",
             static_cache_bytes=replay_context.cache_bytes,
         )
@@ -1891,6 +1966,10 @@ def _select_economic_champion(
         TrialResourceGuard._rss_mib(),
     )
     selection_tail = {
+        "full_refit_boosting_rounds": (
+            _SCREEN_BOOSTING_ROUNDS + 2 * _SCREEN_EARLY_STOPPING_ROUNDS
+        ),
+        "full_refit_early_stopping_rounds": 2 * _SCREEN_EARLY_STOPPING_ROUNDS,
         "early_rejected_full_refits": len(early_rejected_seconds),
         "early_rejected_full_refit_seconds": round(
             float(sum(early_rejected_seconds)), 3
