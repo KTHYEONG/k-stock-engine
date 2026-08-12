@@ -125,11 +125,7 @@ def main(args: list[str] | None = None) -> int:
         optuna_trials=parsed.optuna_trials,
         max_rss_mib=parsed.max_rss_mib,
         resume=parsed.resume,
-        run_root=(
-            parsed.registry / ".training" / parsed.artifact_id
-            if parsed.resume
-            else None
-        ),
+        run_root=parsed.registry / ".training" / parsed.artifact_id,
     )
     logger.info(
         "frozen candidate route set: holding horizons %s, per-horizon trial "
