@@ -68,6 +68,10 @@ def test_multifold_80_trial_profile_completes_under_budget(tmp_path, monkeypatch
         "no_complete_screen_candidate",
         "no_economically_eligible_candidate",
     )
+    replay_resource = resource["replay_resource"]
+    assert replay_resource["inner_stress_replay"] is False
+    assert replay_resource["prepared_decision_count"] >= 0
+    assert replay_resource["replay_peak_rss_mib"] >= 0.0
     assert elapsed_seconds > 0.0
     assert payload["promoted"] is False
     assert payload["no_trade"] is True
