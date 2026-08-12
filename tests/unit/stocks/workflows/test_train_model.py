@@ -1169,7 +1169,9 @@ def test_tuning_skips_candidates_that_fail_full_refit(monkeypatch, tmp_path) -> 
         "no_economically_eligible_candidate"
     )
 
-def test_full_refit_early_rejects_non_positive_first_fold(monkeypatch, tmp_path) -> None:
+def test_full_refit_early_rejects_non_positive_first_fold(monkeypatch, tmp_path, caplog) -> None:
+    import logging
+
     import src.stocks.workflows.train_model as tm
 
     df = stock_v2_composed_df(n_sessions=40, n_tickers=8)
@@ -1196,24 +1198,38 @@ def test_full_refit_early_rejects_non_positive_first_fold(monkeypatch, tmp_path)
 
     monkeypatch.setattr(tm, "_score_context_model", fake_score)
     guard = tm.TrialResourceGuard(request, predictor_count=3)
-    result = tm._fit_and_score_candidate(
-        pl.DataFrame(),
-        [],
-        [_FakeContext()] * 3,
-        request,
-        _tune_base_manifest("early_reject", manifest, manifest.label_definition),
-        ("feature__x",),
-        "residual_o2o_5d",
-        "relevance",
-        tm.LambdaRankConfig(),
-        guard,
-        "trial0",
-    )
+    with caplog.at_level(logging.INFO, logger="stocks.workflows.train_model"):
+        result = tm._fit_and_score_candidate(
+            pl.DataFrame(),
+            [],
+            [_FakeContext()] * 3,
+            request,
+            _tune_base_manifest("early_reject", manifest, manifest.label_definition),
+            ("feature__x",),
+            "residual_o2o_5d",
+            "relevance",
+            tm._screen_informed_full_refit_config(tm.LambdaRankConfig()),
+            guard,
+            "trial0",
+        )
     assert result is not None
     fold_ic, oos = result
     assert fold_ic == [-0.01]
     assert oos is None
     assert calls["count"] == 1
+    assert any(
+        "full_refit_fold_start" in message
+        and "rounds=900" in message
+        and "patience=100" in message
+        for message in caplog.messages
+    )
+    assert any(
+        "full_refit_fold_done" in message
+        and "rounds=900" in message
+        and "patience=100" in message
+        and "elapsed_ms=" in message
+        for message in caplog.messages
+    )
 
 
 def test_tuning_records_early_rejected_full_refits(monkeypatch, tmp_path) -> None:
@@ -1271,7 +1287,131 @@ def test_tuning_records_early_rejected_full_refits(monkeypatch, tmp_path) -> Non
     assert telemetry["selected_trial_number"] == 1
     assert telemetry["early_rejected_full_refits"] == 1
     assert telemetry["early_rejected_full_refit_seconds"] >= 0.0
+    assert telemetry["full_refit_boosting_rounds"] == 900
+    assert telemetry["full_refit_early_stopping_rounds"] == 100
     assert len(telemetry["shortlist_candidate_evidence"]) == 2
+
+
+def test_screen_informed_full_refit_config_derives_budget_from_screen_constants() -> None:
+    import src.stocks.workflows.train_model as tm
+    from src.stocks.research.lambdarank import LambdaRankConfig
+
+    source = LambdaRankConfig(
+        num_leaves=47,
+        learning_rate=0.021,
+        max_depth=7,
+        min_child_samples=900,
+        feature_fraction=0.64,
+        bagging_fraction=0.82,
+        lambda_l1=0.01,
+        lambda_l2=2.5,
+        max_bin=127,
+        n_estimators=1234,
+        early_stopping_rounds=42,
+    )
+    refit = tm._screen_informed_full_refit_config(source)
+    assert refit is not source
+    assert refit.objective == "lambdarank"
+    assert refit.label_gain == LambdaRankConfig().label_gain
+    assert refit.eval_at == (10, 20)
+    assert refit.seed == 42
+    assert refit.num_leaves == 47
+    assert refit.learning_rate == 0.021
+    assert refit.max_depth == 7
+    assert refit.min_child_samples == 900
+    assert refit.feature_fraction == 0.64
+    assert refit.bagging_fraction == 0.82
+    assert refit.bagging_freq == 1
+    assert refit.lambda_l1 == 0.01
+    assert refit.lambda_l2 == 2.5
+    assert refit.max_bin == 127
+    assert refit.min_group_size == source.min_group_size
+    assert refit.half_life_sessions == 504
+    assert refit.n_estimators == (
+        tm._SCREEN_BOOSTING_ROUNDS + 2 * tm._SCREEN_EARLY_STOPPING_ROUNDS
+    )
+    assert refit.early_stopping_rounds == 2 * tm._SCREEN_EARLY_STOPPING_ROUNDS
+    assert refit.n_estimators == 900
+    assert refit.early_stopping_rounds == 100
+    assert source.n_estimators == 1234
+    assert source.early_stopping_rounds == 42
+
+
+def test_screen_informed_full_refit_config_rejects_broken_invariant(
+    monkeypatch,
+) -> None:
+    import src.stocks.workflows.train_model as tm
+
+    monkeypatch.setattr(tm, "_SCREEN_EARLY_STOPPING_ROUNDS", 0)
+    with pytest.raises(ValueError, match="patience"):
+        tm._screen_informed_full_refit_config(tm.LambdaRankConfig())
+
+    monkeypatch.setattr(tm, "_SCREEN_EARLY_STOPPING_ROUNDS", 50)
+    monkeypatch.setattr(tm, "_SCREEN_BOOSTING_ROUNDS", 0)
+    with pytest.raises(ValueError, match="smaller"):
+        tm._screen_informed_full_refit_config(tm.LambdaRankConfig())
+
+
+def test_shortlisted_candidates_refit_with_screen_informed_profile(
+    monkeypatch, tmp_path
+) -> None:
+    import src.stocks.workflows.train_model as tm
+
+    monkeypatch.setattr(tm, "_MIN_TRAIN_SESSIONS", 40)
+    monkeypatch.setattr(tm, "_VALIDATION_BLOCK_SESSIONS", 30)
+
+    df = stock_v2_composed_df(n_sessions=140, n_tickers=20)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    label_span = (manifest.label_horizon_sessions or 1) + 1
+    folds = tm.PurgedWalkForward(
+        n_folds=3,
+        label_horizon_sessions=label_span,
+        embargo_sessions=5,
+        session_column="session_index",
+        validation_window_sessions=30,
+        min_train_sessions=40,
+    ).split(panel)
+
+    monkeypatch.setattr(
+        tm,
+        "_fit_stable_contexts",
+        lambda _panel, tuning_folds, *_a, **_kw: [None] * len(tuning_folds),
+    )
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+
+    refit_configs: list[tm.LambdaRankConfig] = []
+
+    def fake_refit(*_a, **_kw):
+        refit_configs.append(_a[8])
+        return ([0.05, 0.06, 0.07], pl.DataFrame())
+
+    monkeypatch.setattr(tm, "_fit_and_score_candidate", fake_refit)
+    monkeypatch.setattr(
+        tm, "_event_ledger_evaluation", lambda *_a, **_kw: _positive_replay()
+    )
+
+    request = TrainingRequest(artifact_id="refit_profile", n_folds=3, optuna_trials=3)
+    config, n_trials, _route = tm._tune_champion(
+        panel[folds[0].train_mask],
+        request,
+        _tune_base_manifest("refit_profile", manifest, manifest.label_definition),
+        tuple(c for c in df.columns if c.startswith("feature__")),
+        (tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),),
+        dataset_manifest=manifest,
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    assert config is not None
+    assert n_trials == request.optuna_trials
+    assert len(refit_configs) == request.optuna_trials
+    for cfg in refit_configs:
+        assert cfg.n_estimators == 900
+        assert cfg.early_stopping_rounds == 100
+    telemetry = config._tuning_telemetry
+    assert telemetry["full_refit_boosting_rounds"] == 900
+    assert telemetry["full_refit_early_stopping_rounds"] == 100
 
 
 def test_static_context_bytes_participate_in_resource_guard(monkeypatch, tmp_path) -> None:
