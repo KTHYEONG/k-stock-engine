@@ -250,7 +250,7 @@ def _drop_label_columns(frame: pl.DataFrame) -> pl.DataFrame:
     drops = [
         c
         for c in frame.columns
-        if c.startswith(("target_", "label_", "residual_"))
+        if c.startswith(("target_", "label_", "residual_", "relevance_"))
         or c in (LABEL_AVAILABLE_COLUMN, RELEVANCE_COLUMN, RESIDUAL_O2O_LABEL, "fwd_ret_5d")
     ]
     return frame.drop(drops)
