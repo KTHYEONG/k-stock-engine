@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_COST_AMORTIZED_ALPHA_ROUTING_V1",
+      "date": "2026-08-12",
+      "adr_id": "ADR_20260812_COST_AMORTIZED_ALPHA_ROUTING_V1",
+      "domain": "stocks",
+      "title": "Cost-amortized alpha routing v1",
+      "why": "The 2026-08-12 ML replay had positive Rank-IC but a fixed 5-session 36bp round-trip hurdle made every candidate economically ineligible.",
+      "resolution": "Registered a causal 5/10/15-session multi-horizon route design with route-specific labels, availability timestamps, matching rebalance cadence, net-alpha lower-bound gating, and fail-closed stress promotion.",
+      "impact": "Future implementation can test longer cost-amortizing holding periods without relaxing leakage, execution-cost, bootstrap, DSR, drawdown, or NO_TRADE gates."
+    },
+    {
       "task_id": "TASK_ML_BACKTEST_PERFORMANCE_REMEDIATION",
       "date": "2026-08-12",
       "adr_id": "ADR_20260812_ML_BACKTEST_PERFORMANCE_REMEDIATION",
