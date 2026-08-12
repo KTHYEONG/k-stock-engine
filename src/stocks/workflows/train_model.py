@@ -51,7 +51,6 @@ from src.stocks.research.folds import Fold, PurgedWalkForward
 from src.stocks.research.labels import (
     LABEL_AVAILABLE_COLUMN,
     RELEVANCE_COLUMN,
-    RESIDUAL_O2O_LABEL,
 )
 from src.stocks.research.lambdarank import (
     LambdaRankBlendModel,
@@ -72,7 +71,6 @@ _ECONOMIC_COLUMNS = ("open", "high", "low", "close", "volume", "trading_value", 
 _MIN_TRAIN_SESSIONS = 756
 _VALIDATION_BLOCK_SESSIONS = 252
 _REFIT_EVERY_SESSIONS = 63
-_REBALANCE_EVERY_SESSIONS = 5
 _FORWARD_HOLDOUT_START = date(2026, 3, 10)
 _FORWARD_HOLDOUT_SESSIONS = 252
 _MIN_GROUP_SIZE = 20
@@ -222,6 +220,26 @@ class _StableTrialContext:
 
 
 @dataclass(frozen=True, slots=True)
+class RouteSpec:
+    """Immutable route definition binding one holding horizon to its labels.
+
+    A route is valid only when the composed snapshot carries its residual,
+    relevance, and availability columns; every purge/embargo, rebalance cadence,
+    calibration window, and cost amortization for the route uses
+    ``horizon`` sessions.
+    """
+
+    horizon: int
+    label_column: str
+    relevance_column: str
+    label_available_column: str
+
+    @property
+    def label_span_sessions(self) -> int:
+        return self.horizon + 1
+
+
+@dataclass(frozen=True, slots=True)
 class EconomicCandidateEvidence:
     """Immutable per-candidate economic evidence for one shortlisted trial.
 
@@ -251,6 +269,11 @@ class EconomicCandidateEvidence:
     cash_cycles: int = 0
     cost_drag: float = 0.0
     calibration_state: dict[str, object] | None = None
+    holding_horizon_sessions: int = 5
+    label_column: str = ""
+    relevance_column: str = ""
+    label_available_column: str = ""
+    terminal_trial_count: int = 0
 
     def to_json_safe(self) -> dict[str, object]:
         """JSON-serializable evidence row with deterministic failure reasons."""
@@ -276,6 +299,11 @@ class EconomicCandidateEvidence:
             "cash_cycles": int(self.cash_cycles),
             "cost_drag": round(self.cost_drag, 10),
             "calibration_state": self.calibration_state,
+            "holding_horizon_sessions": int(self.holding_horizon_sessions),
+            "label_column": str(self.label_column),
+            "relevance_column": str(self.relevance_column),
+            "label_available_column": str(self.label_available_column),
+            "terminal_trial_count": int(self.terminal_trial_count),
         }
 
 
@@ -320,18 +348,17 @@ def train_model(
         raise ValueError("composed snapshot exposes no stock_alpha_v2 feature columns")
     _reject_predictor_target_columns(frame, feature_columns)
 
-    label_column = _resolve_label_column(frame, manifest)
-    if label_column not in frame.columns:
+    route_specs = _resolve_route_specs(frame, request.candidate_horizons)
+    if not route_specs:
         raise ValueError(
-            f"composed snapshot has no canonical label column {label_column!r}"
+            "composed snapshot exposes no complete route label/relevance/availability "
+            f"column set for candidate horizons {request.candidate_horizons}"
         )
-    relevance_column = RELEVANCE_COLUMN if RELEVANCE_COLUMN in frame.columns else None
-    if relevance_column is None and _will_need_lambdarank(frame):
-        raise ValueError(f"composed snapshot has no {RELEVANCE_COLUMN!r} column")
 
     panel = _index_sessions(frame)
     n_sessions = int(panel["session_index"].n_unique())
-    eligible_from, eligible_to = _eligibility_from_panel(panel, manifest.label_horizon_sessions)
+    control_route = route_specs[0]
+    eligible_from, eligible_to = _eligibility_from_panel(panel, control_route.horizon)
 
     base_manifest = ModelManifest(
         artifact_id=request.artifact_id,
@@ -339,8 +366,8 @@ def train_model(
         feature_set="stock_alpha_v2",
         feature_schema_hash=manifest.schema_hash,
         universe_policy_hash=manifest.universe_policy_hash,
-        label_definition=label_column,
-        label_horizon_sessions=manifest.label_horizon_sessions or 5,
+        label_definition=control_route.label_column,
+        label_horizon_sessions=control_route.horizon,
         eligible_from=eligible_from,
         eligible_to=eligible_to,
         model_type="lambdarank_blend",
@@ -348,20 +375,38 @@ def train_model(
 
     if n_sessions < _MIN_TRAIN_SESSIONS:
         return _publish_no_trade(
-            registry, request, base_manifest, panel, label_column, relevance_column,
-            "insufficient-history",
+            registry, request, base_manifest, panel, control_route.label_column,
+            control_route.relevance_column, "insufficient-history",
             details=f"n_sessions={n_sessions}",
         )
 
-    label_span_sessions = (manifest.label_horizon_sessions or 1) + 1
     holdout_fold, training_panel = _reserve_forward_holdout(
-        panel, request, label_span_sessions,
+        panel, request, control_route.label_span_sessions,
+        control_route.label_available_column,
     )
 
-    reasons: list[str] = []
+    base = request.base_cost_schedule or default_base_schedule()
+    stress = request.stress_cost_schedule or default_stress_schedule()
+
+    champion_config, n_optuna_trials, champion_route = _tune_champion(
+        training_panel, request, base_manifest, feature_columns, route_specs,
+        dataset_manifest=snapshot.manifest,
+        registry=registry,
+        base_schedule=base,
+        stress_schedule=stress,
+    )
+    if champion_config is None or champion_route is None:
+        return _publish_no_trade(
+            registry, request, base_manifest, panel, control_route.label_column,
+            control_route.relevance_column, "no-champion-trial",
+            tuning_telemetry=LambdaRankConfig._tuning_telemetry,
+        )
+
+    route = champion_route
+    route_manifest = _route_manifest(base_manifest, route)
     splitter = PurgedWalkForward(
         n_folds=request.n_folds,
-        label_horizon_sessions=label_span_sessions,
+        label_horizon_sessions=route.label_span_sessions,
         embargo_sessions=request.embargo_sessions,
         session_column="session_index",
         validation_window_sessions=_VALIDATION_BLOCK_SESSIONS,
@@ -370,47 +415,35 @@ def train_model(
     folds = splitter.split(training_panel)
     if not folds:
         return _publish_no_trade(
-            registry, request, base_manifest, panel, label_column, relevance_column,
-            "no-eligible-folds",
-        )
-
-    base = request.base_cost_schedule or default_base_schedule()
-    stress = request.stress_cost_schedule or default_stress_schedule()
-
-    champion_config, n_optuna_trials = _tune_champion(
-        training_panel, folds, request, base_manifest, feature_columns, label_column,
-        relevance_column, label_span_sessions,
-        dataset_manifest=snapshot.manifest,
-        registry=registry,
-        base_schedule=base,
-        stress_schedule=stress,
-    )
-    if champion_config is None:
-        return _publish_no_trade(
-            registry, request, base_manifest, panel, label_column, relevance_column,
-            "no-champion-trial",
-            tuning_telemetry=LambdaRankConfig._tuning_telemetry,
+            registry, request, base_manifest, panel, route.label_column,
+            route.relevance_column, "no-eligible-folds",
         )
 
     fold_models, scored_frames, fold_rank_ic = _fit_and_score_folds(
-        training_panel, folds, request, base_manifest, feature_columns, label_column,
-        relevance_column, champion_config,
+        training_panel, folds, request, route_manifest, feature_columns,
+        route.label_column, route.relevance_column, champion_config,
     )
     if not fold_models:
         return _publish_no_trade(
-            registry, request, base_manifest, panel, label_column, relevance_column,
-            "no-fit-folds",
+            registry, request, base_manifest, panel, route.label_column,
+            route.relevance_column, "no-fit-folds",
         )
 
     oos = pl.concat(scored_frames)
     _reject_non_finite_economic_inputs(oos)
-    champion_oos_ledger = _build_calibration_ledger(oos, training_panel, label_column)
+    champion_oos_ledger = _build_calibration_ledger(
+        oos, training_panel, route.label_column, route.label_available_column,
+    )
 
     replay = _event_ledger_evaluation(
         training_panel, oos, request, snapshot.manifest, registry, base, stress,
         calibration_ledger=champion_oos_ledger,
+        holding_horizon_sessions=route.horizon,
+        label_column=route.label_column,
+        label_available_column=route.label_available_column,
     )
 
+    reasons: list[str] = []
     budget = PromotionRiskBudget()
     gates = _evaluate_gates(
         replay, fold_rank_ic, budget, request, n_trials=n_optuna_trials,
@@ -418,15 +451,20 @@ def train_model(
     reasons.extend(cast(list[str], gates["reasons"]))
 
     holdout_ok, holdout_reason, _holdout_evidence = _evaluate_forward_holdout(
-        registry, request, base_manifest, panel, holdout_fold, champion_config,
-        feature_columns, label_column, relevance_column, snapshot.manifest, base, stress,
+        registry, request, route_manifest, panel, holdout_fold, champion_config,
+        feature_columns, route.label_column, route.relevance_column,
+        snapshot.manifest, base, stress,
         calibration_ledger=champion_oos_ledger,
+        label_span_sessions=route.label_span_sessions,
+        label_available_column=route.label_available_column,
+        holding_horizon_sessions=route.horizon,
     )
     reasons.append(holdout_reason)
     passed = bool(gates["passed"]) and holdout_ok and bool(fold_rank_ic)
 
     model = fold_models[-1] if passed else _no_trade_model(
-        base_manifest, feature_columns, label_column, relevance_column, champion_config,
+        route_manifest, feature_columns, route.label_column, route.relevance_column,
+        champion_config,
     )
     champion_calibration_state = replay.calibration_evidence.get("calibration_state")
     if champion_calibration_state is not None:
@@ -452,12 +490,17 @@ def train_model(
 
 
 def _restrict_labels_available(frame: pl.DataFrame, decision_time: datetime) -> pl.DataFrame:
-    if LABEL_AVAILABLE_COLUMN in frame.columns:
-        return frame.filter(
-            pl.col(LABEL_AVAILABLE_COLUMN).is_null()
-            | (pl.col(LABEL_AVAILABLE_COLUMN) <= decision_time)
+    availability_columns = [
+        c for c in frame.columns if c.startswith("label_available_time")
+    ]
+    if not availability_columns:
+        return frame
+    condition = pl.lit(True)
+    for column in availability_columns:
+        condition = condition & (
+            pl.col(column).is_null() | (pl.col(column) <= decision_time)
         )
-    return frame
+    return frame.filter(condition)
 
 
 def _index_sessions(frame: pl.DataFrame) -> pl.DataFrame:
@@ -468,18 +511,6 @@ def _index_sessions(frame: pl.DataFrame) -> pl.DataFrame:
     return frame.with_columns(
         pl.col("session_index").rank("dense").cast(pl.Int64).alias("session_index")
     )
-
-
-def _resolve_label_column(frame: pl.DataFrame, manifest: DatasetManifest) -> str:
-    candidates = [RESIDUAL_O2O_LABEL, manifest.label_definition]
-    for candidate in candidates:
-        if candidate and candidate in frame.columns:
-            return str(candidate)
-    return RESIDUAL_O2O_LABEL
-
-
-def _will_need_lambdarank(frame: pl.DataFrame) -> bool:
-    return not frame.is_empty()
 
 
 def _eligibility_from_panel(
@@ -500,173 +531,427 @@ def _reject_predictor_target_columns(frame: pl.DataFrame, feature_columns: tuple
     if offending:
         raise ValueError(f"v2 predictors must not be target/label columns: {offending}")
 
+def _resolve_route_specs(
+    frame: pl.DataFrame,
+    candidate_horizons: tuple[int, ...],
+) -> tuple[RouteSpec, ...]:
+    """Resolve active route specs from the composed snapshot columns.
+
+    A configured horizon is active only when all three route columns
+    (``residual_o2o_{h}d``, ``relevance_{h}d``, ``label_available_time_{h}d``)
+    are present. The legacy five-day names ``relevance`` and
+    ``label_available_time`` are accepted for the control horizon so v2
+    single-horizon composed frames remain trainable. In a multi-horizon (v3)
+    composed frame a configured horizon with a missing or non-finite route
+    column fails closed with ``ValueError``; inactive legacy routes are logged
+    and excluded and are never silently substituted with another horizon's
+    labels.
+    """
+    multi_horizon = any(
+        column.startswith("residual_o2o_") and column != "residual_o2o_5d"
+        for column in frame.columns
+    )
+    routes: list[RouteSpec] = []
+    invalid: list[tuple[int, str]] = []
+    for horizon in candidate_horizons:
+        label_column = f"residual_o2o_{horizon}d"
+        relevance_column = f"relevance_{horizon}d"
+        availability_column = f"label_available_time_{horizon}d"
+        if (
+            label_column not in frame.columns
+            or relevance_column not in frame.columns
+            or availability_column not in frame.columns
+        ):
+            if horizon == 5 and RELEVANCE_COLUMN in frame.columns:
+                relevance_column = RELEVANCE_COLUMN
+            if horizon == 5 and LABEL_AVAILABLE_COLUMN in frame.columns:
+                availability_column = LABEL_AVAILABLE_COLUMN
+        missing = [
+            column
+            for column in (label_column, relevance_column, availability_column)
+            if column not in frame.columns
+        ]
+        if missing:
+            if multi_horizon:
+                invalid.append((horizon, f"missing columns {missing}"))
+            else:
+                logger.info(
+                    "route horizon %s invalid: missing columns %s",
+                    horizon,
+                    missing,
+                )
+            continue
+        if multi_horizon and not frame.filter(
+            pl.col(label_column).is_not_null()
+            & ~pl.col(label_column).is_finite()
+        ).is_empty():
+            invalid.append((horizon, f"non-finite {label_column}"))
+            continue
+        routes.append(
+            RouteSpec(
+                horizon=horizon,
+                label_column=label_column,
+                relevance_column=relevance_column,
+                label_available_column=availability_column,
+            )
+        )
+    if invalid:
+        raise ValueError(
+            "candidate route horizons fail closed: "
+            + "; ".join(f"{h}d ({reason})" for h, reason in invalid)
+        )
+    return tuple(routes)
+
+
+def _route_manifest(base_manifest: ModelManifest, route: RouteSpec) -> ModelManifest:
+    """Route-specific model manifest binding the label and holding horizon."""
+    return ModelManifest(
+        artifact_id=base_manifest.artifact_id,
+        asset_kind=base_manifest.asset_kind,
+        feature_set=base_manifest.feature_set,
+        feature_schema_hash=base_manifest.feature_schema_hash,
+        universe_policy_hash=base_manifest.universe_policy_hash,
+        label_definition=route.label_column,
+        label_horizon_sessions=route.horizon,
+        eligible_from=base_manifest.eligible_from,
+        eligible_to=base_manifest.eligible_to,
+        model_type=base_manifest.model_type,
+    )
+
 
 def _tune_champion(
-    panel: pl.DataFrame,
-    folds: list[Fold],
+    tuning_panel: pl.DataFrame,
     request: TrainingRequest,
     base_manifest: ModelManifest,
     feature_columns: tuple[str, ...],
-    label_column: str,
-    relevance_column: str | None,
-    label_span_sessions: int,
+    route_specs: tuple[RouteSpec, ...],
     *,
     dataset_manifest: DatasetManifest,
     registry: ModelArtifactRegistry,
     base_schedule: CostSchedule,
     stress_schedule: CostSchedule,
-) -> tuple[LambdaRankConfig | None, int]:
+) -> tuple[LambdaRankConfig | None, int, RouteSpec | None]:
     """Run a temporally isolated screen -> shortlist -> economic selection.
 
-    The tuning panel is derived exclusively from ``folds[0].train_mask``, the
-    last purged-and-embargoed data available before the first outer validation
-    decision, so no outer validation row influences candidate selection. All
-    ``request.optuna_trials`` serial seeded TPE configurations are screened on
-    the first inner fold under a frozen reduced boosting budget; a LightGBM
-    NDCG callback drives Optuna median pruning, and pruned candidates remain
-    terminal trials for Deflated Sharpe. The fixed shortlist of at most eight
-    positive-screen candidates is fully refit over every inner fold and
-    replayed through the exact event ledger, then ranked by economic evidence.
-    Returns ``(config, n_trials)`` where ``n_trials`` is the terminal screen
-    trial count fed to Deflated Sharpe.
+    The tuning panel is the last purged-and-embargoed data available before the
+    first outer validation decision, so no outer validation row influences
+    candidate selection. Each active route gets an equal, explicit screen budget
+    of ``request.optuna_trials // len(route_specs)`` serial seeded TPE
+    configurations; a LightGBM NDCG callback drives Optuna median pruning, and
+    pruned candidates remain terminal trials for Deflated Sharpe. A pruned or
+    invalid route stays terminal evidence and is never silently reallocated to
+    another horizon. At most ``_SCREEN_SHORTLIST_SIZE`` positive-screen
+    candidates per horizon are fully refit over every inner fold and replayed
+    through the exact event ledger, then a champion is selected across all
+    routes lexicographically by ``(bootstrap lower bound, strategy IR, -max
+    drawdown, -turnover, median Rank-IC, -holding horizon, -trial number)``.
+    Returns ``(config, n_trials, route)`` where ``n_trials`` is the selected
+    route's terminal screen trial count fed to Deflated Sharpe.
     """
     LambdaRankConfig._tuning_telemetry = None
-    tuning_panel = panel[folds[0].train_mask]
-    tuning_folds = PurgedWalkForward(
-        n_folds=max(1, min(3, len(folds))),
-        label_horizon_sessions=label_span_sessions,
-        embargo_sessions=request.embargo_sessions,
-        session_column="session_index",
-        min_train_sessions=_MIN_TRAIN_SESSIONS // 2,
-    ).split(tuning_panel)
-    if not tuning_folds:
-        return None, 0
-
+    per_route_trials = max(1, request.optuna_trials // len(route_specs))
     guard = TrialResourceGuard(request, predictor_count=len(feature_columns) * 3)
-    contexts = _fit_stable_contexts(
-        tuning_panel, tuning_folds, base_manifest, feature_columns, label_column,
-        relevance_column,
-    )
-    cache_bytes = sum(
-        _fold_cache_bytes(getattr(context, "prepared", None)) for context in contexts
-    )
 
-    storage = optuna.storages.InMemoryStorage()
-    study = optuna.create_study(
-        direction="maximize",
-        study_name=f"lambdarank_v2_{request.artifact_id}",
-        storage=storage,
-        sampler=optuna.samplers.TPESampler(seed=request.seed, n_startup_trials=10),
-        pruner=optuna.pruners.MedianPruner(
-            n_startup_trials=max(1, request.optuna_trials // 5),
-            n_warmup_steps=0,
-        ),
-    )
+    route_champions: list[
+        tuple[tuple[float, ...], int, RouteSpec, optuna.Study, LambdaRankConfig]
+    ] = []
+    route_attrs: dict[str, dict[str, object]] = {}
+    shortlist_evidence_all: list[dict[str, object]] = []
+    n_terminal_total = 0
+    screened_total = 0
+    pruned_total = 0
+    shortlisted_total = 0
+    eligible_total = 0
+    best_screen_rank_ic: float | None = None
+    screen_seconds_total = 0.0
+    refit_seconds_total = 0.0
+    replay_seconds_total = 0.0
+    early_rejected_total = 0
+    early_rejected_seconds_total = 0.0
 
-    def screen_objective(trial: optuna.Trial) -> float:
-        config = _config_from_trial(trial)
-        screen_config = _screen_config(config)
-        ic = _score_trial_fold(
-            tuning_panel, tuning_folds[0], contexts[0], request, base_manifest,
-            feature_columns, label_column, relevance_column, screen_config, guard,
-            trial, 0, callbacks=(_screen_ndcg_callback(trial),), report_progress=False,
-        )
-        if ic is None:
-            raise optuna.TrialPruned()
-        logger.info(
-            "[EVAL] trial=%s stage=screen_rank_ic rank_ic=%.6f", trial.number, ic
-        )
-        return float(ic)
-
-    screen_started = time.perf_counter()
-    study.optimize(
-        screen_objective,
-        n_trials=request.optuna_trials,
-        n_jobs=1,
-        show_progress_bar=False,
-    )
-    screen_seconds = time.perf_counter() - screen_started
-    logger.info(
-        "[SYS] stage=screen elapsed_ms=%.1f rss=%.1f",
-        screen_seconds * 1000.0,
-        TrialResourceGuard._rss_mib(),
-    )
-
-    n_terminal = sum(
-        1
-        for t in study.trials
-        if t.state in (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED)
-    )
-    if n_terminal != request.optuna_trials:
-        LambdaRankConfig._tuning_telemetry = {
-            "n_terminal_trials": n_terminal,
-            "optuna_trials": request.optuna_trials,
-            "selection_status": "incomplete",
-        }
-        return None, n_terminal
-    complete = [
-        t
-        for t in study.trials
-        if t.state is optuna.trial.TrialState.COMPLETE and t.value is not None
-    ]
-    completed: list[tuple[float, int]] = []
-    for trial in complete:
-        trial_value = trial.value
-        if trial_value is None:
+    for route in route_specs:
+        route_manifest = _route_manifest(base_manifest, route)
+        tuning_folds = PurgedWalkForward(
+            n_folds=max(1, min(3, request.n_folds)),
+            label_horizon_sessions=route.label_span_sessions,
+            embargo_sessions=request.embargo_sessions,
+            session_column="session_index",
+            min_train_sessions=_MIN_TRAIN_SESSIONS // 2,
+        ).split(tuning_panel)
+        if not tuning_folds:
+            route_attrs[str(route.horizon)] = {
+                "selection_status": "no-eligible-tuning-folds",
+                "holding_horizon_sessions": route.horizon,
+            }
+            logger.info("[EVAL] route=%sd stage=no-eligible-tuning-folds", route.horizon)
             continue
-        completed.append((float(trial_value), trial.number))
-    best_screen_rank_ic = max((value for value, _ in completed), default=None)
-    screen_scores = sorted(
-        ((value, number) for value, number in completed if value > 0.0),
-        key=lambda pair: (-pair[0], pair[1]),
-    )
-    shortlist = screen_scores[:_SCREEN_SHORTLIST_SIZE]
-    for _screen_ic, trial_number in shortlist:
-        logger.info("[EVAL] trial=%s stage=shortlisted", trial_number)
+        contexts = _fit_stable_contexts(
+            tuning_panel, tuning_folds, route_manifest, feature_columns,
+            route.label_column, route.relevance_column,
+        )
+        cache_bytes = sum(
+            _fold_cache_bytes(getattr(context, "prepared", None))
+            for context in contexts
+        )
 
-    champion, selection = _select_economic_champion(
-        study, shortlist, tuning_panel, tuning_folds, contexts, request, base_manifest,
-        feature_columns, label_column, relevance_column, guard, dataset_manifest,
-        registry, base_schedule, stress_schedule,
-    )
+        storage = optuna.storages.InMemoryStorage()
+        study = optuna.create_study(
+            direction="maximize",
+            study_name=f"lambdarank_v2_{request.artifact_id}_h{route.horizon}",
+            storage=storage,
+            sampler=optuna.samplers.TPESampler(
+                seed=request.seed + route.horizon, n_startup_trials=10
+            ),
+            pruner=optuna.pruners.MedianPruner(
+                n_startup_trials=max(1, per_route_trials // 5),
+                n_warmup_steps=0,
+            ),
+        )
 
-    telemetry = guard.telemetry()
-    for name, value in telemetry.items():
-        study.set_user_attr(name, value)
-    study.set_user_attr("n_terminal_trials", n_terminal)
-    study.set_user_attr("optuna_trials", request.optuna_trials)
-    study.set_user_attr("screened_trials", len(complete))
-    study.set_user_attr("pruned_trials", n_terminal - len(complete))
-    study.set_user_attr("shortlisted_trials", len(shortlist))
-    study.set_user_attr("cache_bytes", cache_bytes)
-    study.set_user_attr("screen_seconds", screen_seconds)
-    if best_screen_rank_ic is not None:
-        study.set_user_attr("best_screen_rank_ic", best_screen_rank_ic)
-    if champion is None or selection is None:
+        def screen_objective(
+            trial: optuna.Trial,
+            _route: RouteSpec = route,
+            _tuning_folds: list[Fold] = tuning_folds,
+            _contexts: list[_StableTrialContext] = contexts,
+            _route_manifest: ModelManifest = route_manifest,
+        ) -> float:
+            config = _config_from_trial(trial)
+            screen_config = _screen_config(config)
+            ic = _score_trial_fold(
+                tuning_panel, _tuning_folds[0], _contexts[0], request, _route_manifest,
+                feature_columns, _route.label_column, _route.relevance_column,
+                screen_config, guard, trial, 0,
+                callbacks=(_screen_ndcg_callback(trial),), report_progress=False,
+            )
+            if ic is None:
+                raise optuna.TrialPruned()
+            logger.info(
+                "[EVAL] route=%sd trial=%s stage=screen_rank_ic rank_ic=%.6f",
+                _route.horizon, trial.number, ic,
+            )
+            return float(ic)
+
+        screen_started = time.perf_counter()
+        study.optimize(
+            screen_objective,
+            n_trials=per_route_trials,
+            n_jobs=1,
+            show_progress_bar=False,
+        )
+        screen_seconds = time.perf_counter() - screen_started
+        screen_seconds_total += screen_seconds
+        logger.info(
+            "[SYS] route=%sd stage=screen elapsed_ms=%.1f rss=%.1f",
+            route.horizon,
+            screen_seconds * 1000.0,
+            TrialResourceGuard._rss_mib(),
+        )
+
+        n_terminal = sum(
+            1
+            for t in study.trials
+            if t.state
+            in (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED)
+        )
+        if n_terminal != per_route_trials:
+            route_attrs[str(route.horizon)] = {
+                "n_terminal_trials": n_terminal,
+                "optuna_trials": per_route_trials,
+                "selection_status": "incomplete",
+                "holding_horizon_sessions": route.horizon,
+            }
+            continue
+        complete = [
+            t
+            for t in study.trials
+            if t.state is optuna.trial.TrialState.COMPLETE and t.value is not None
+        ]
+        completed: list[tuple[float, int]] = []
+        for trial in complete:
+            trial_value = trial.value
+            if trial_value is None:
+                continue
+            completed.append((float(trial_value), trial.number))
+        best_route_ic = max((value for value, _ in completed), default=None)
+        if best_route_ic is not None and (
+            best_screen_rank_ic is None or best_route_ic > best_screen_rank_ic
+        ):
+            best_screen_rank_ic = best_route_ic
+        screen_scores = sorted(
+            ((value, number) for value, number in completed if value > 0.0),
+            key=lambda pair: (-pair[0], pair[1]),
+        )
+        shortlist = screen_scores[:_SCREEN_SHORTLIST_SIZE]
+        for _screen_ic, trial_number in shortlist:
+            logger.info(
+                "[EVAL] route=%sd trial=%s stage=shortlisted", route.horizon, trial_number
+            )
+
+        champion, selection = _select_economic_champion(
+            study, shortlist, tuning_panel, tuning_folds, contexts, request,
+            route_manifest, feature_columns, route, guard, dataset_manifest,
+            registry, base_schedule, stress_schedule,
+            terminal_trial_count=n_terminal,
+        )
+
+        telemetry = guard.telemetry()
+        for name, value in telemetry.items():
+            study.set_user_attr(name, value)
+        study.set_user_attr("n_terminal_trials", n_terminal)
+        study.set_user_attr("optuna_trials", per_route_trials)
+        study.set_user_attr("screened_trials", len(complete))
+        study.set_user_attr("pruned_trials", n_terminal - len(complete))
+        study.set_user_attr("shortlisted_trials", len(shortlist))
+        study.set_user_attr("cache_bytes", cache_bytes)
+        study.set_user_attr("screen_seconds", screen_seconds)
+        study.set_user_attr("holding_horizon_sessions", route.horizon)
+        study.set_user_attr("label_column", route.label_column)
+        study.set_user_attr("relevance_column", route.relevance_column)
+        study.set_user_attr("label_available_column", route.label_available_column)
+        if best_route_ic is not None:
+            study.set_user_attr("best_screen_rank_ic", best_route_ic)
         if selection is not None:
             for name, value in selection.items():
                 study.set_user_attr(name, value)
-        if not shortlist:
-            study.set_user_attr("selection_status", "no_complete_screen_candidate")
+        if champion is None or selection is None:
+            study.set_user_attr(
+                "selection_status",
+                "no_complete_screen_candidate"
+                if not shortlist
+                else "no_economically_eligible_candidate",
+            )
+            logger.info(
+                "[EVAL] route=%sd stage=selection_status %s",
+                route.horizon,
+                study.user_attrs["selection_status"],
+            )
         else:
-            study.set_user_attr("selection_status", "no_economically_eligible_candidate")
+            study.set_user_attr("selection_status", "selected")
+            logger.info(
+                "[EVAL] route=%sd trial=%s stage=selected",
+                route.horizon,
+                int(cast(int, selection["selected_trial_number"])),
+            )
+
+        n_terminal_total += n_terminal
+        screened_total += len(complete)
+        pruned_total += n_terminal - len(complete)
+        shortlisted_total += len(shortlist)
+        route_evidence = cast(
+            list[dict[str, object]],
+            selection.get("shortlist_candidate_evidence", []) if selection else [],
+        )
+        shortlist_evidence_all.extend(route_evidence)
+        eligible_route = int(
+            cast(int, selection.get("economically_eligible_trials", 0)) if selection else 0
+        )
+        eligible_total += eligible_route
+        refit_seconds_total += float(
+            cast(float, selection.get("full_refit_seconds", 0.0)) if selection else 0.0
+        )
+        replay_seconds_total += float(
+            cast(float, selection.get("economic_replay_seconds", 0.0)) if selection else 0.0
+        )
+        early_rejected_total += int(
+            cast(int, selection.get("early_rejected_full_refits", 0)) if selection else 0
+        )
+        early_rejected_seconds_total += float(
+            cast(
+                float,
+                selection.get("early_rejected_full_refit_seconds", 0.0) if selection else 0.0,
+            )
+        )
+        route_attrs[str(route.horizon)] = dict(study.user_attrs)
+
+        if champion is None or selection is None:
+            continue
+        key = (
+            float(cast(float, selection["selected_inner_bootstrap_lower_bound"])),
+            float(cast(float, selection["selected_inner_strategy_ir"])),
+            -float(cast(float, selection["selected_inner_max_drawdown"])),
+            -float(cast(float, selection["selected_inner_turnover"])),
+            float(cast(float, selection["selected_inner_median_rank_ic"])),
+            -route.horizon,
+            -int(cast(int, selection["selected_trial_number"])),
+        )
+        route_champions.append((key, n_terminal, route, study, champion))
+
+    merged: dict[str, object] = {
+        "candidate_horizons": list(request.candidate_horizons),
+        "active_routes": [route.horizon for route in route_specs],
+        "per_route_trial_budget": per_route_trials,
+        **guard.telemetry(),
+        "n_terminal_trials": n_terminal_total,
+        "optuna_trials": n_terminal_total,
+        "screened_trials": screened_total,
+        "pruned_trials": pruned_total,
+        "shortlisted_trials": shortlisted_total,
+        "economically_eligible_trials": eligible_total,
+        "cache_bytes": sum(
+            int(cast(int, attrs.get("cache_bytes", 0)))
+            for attrs in route_attrs.values()
+        ),
+        "screen_seconds": screen_seconds_total,
+        "full_refit_seconds": refit_seconds_total,
+        "economic_replay_seconds": replay_seconds_total,
+        "early_rejected_full_refits": early_rejected_total,
+        "early_rejected_full_refit_seconds": early_rejected_seconds_total,
+        "shortlist_candidate_evidence": shortlist_evidence_all,
+        "routes": route_attrs,
+    }
+    if best_screen_rank_ic is not None:
+        merged["best_screen_rank_ic"] = best_screen_rank_ic
+
+    if not route_champions:
+        statuses = [
+            str(attrs.get("selection_status"))
+            for attrs in route_attrs.values()
+            if attrs.get("selection_status")
+        ]
+        if not statuses:
+            merged["selection_status"] = "no-eligible-route"
+        elif "no_complete_screen_candidate" in statuses:
+            merged["selection_status"] = "no_complete_screen_candidate"
+        elif "no_economically_eligible_candidate" in statuses:
+            merged["selection_status"] = "no_economically_eligible_candidate"
+        else:
+            merged["selection_status"] = statuses[0]
+        LambdaRankConfig._tuning_telemetry = merged
         logger.info(
             "[EVAL] stage=selection_status %s",
-            study.user_attrs["selection_status"],
+            merged["selection_status"],
         )
-        LambdaRankConfig._tuning_telemetry = dict(study.user_attrs)
-        return None, n_terminal
+        return None, n_terminal_total, None
 
-    for name, value in selection.items():
-        study.set_user_attr(name, value)
-    study.set_user_attr("selection_status", "selected")
-    assert champion is not None
-    champion._tuning_telemetry = dict(study.user_attrs)
+    route_champions.sort(key=lambda row: row[0], reverse=True)
+    _winner_key, winner_n_terminal, winner_route, winner_study, _ = route_champions[0]
+    winner_config = _config_from_params(dict(winner_study.trials[
+        int(cast(int, winner_study.user_attrs["selected_trial_number"]))
+    ].params))
+    winner_selection = {
+        name: value
+        for name, value in winner_study.user_attrs.items()
+        if name.startswith("selected_")
+    }
+    winner_evidence = {
+        name: value
+        for name, value in winner_study.user_attrs.items()
+        if name.startswith("selected_inner_")
+    }
+    merged["selection_status"] = "selected"
+    merged["selected_horizon"] = winner_route.horizon
+    merged["selected_label_column"] = winner_route.label_column
+    merged["selected_relevance_column"] = winner_route.relevance_column
+    merged["selected_label_available_column"] = winner_route.label_available_column
+    merged.update(winner_selection)
+    merged.update(winner_evidence)
+    winner_config._tuning_telemetry = merged
     logger.info(
-        "[EVAL] trial=%s stage=selected",
-        int(cast(int, selection["selected_trial_number"])),
+        "[EVAL] route=%sd trial=%s stage=selected",
+        winner_route.horizon,
+        int(cast(int, winner_selection["selected_trial_number"])),
     )
-    return champion, n_terminal
+    return winner_config, winner_n_terminal, winner_route
 
 
 def _fit_stable_contexts(
@@ -998,13 +1283,16 @@ def _fit_and_score_candidate(
 def _prepare_replay_static_context(
     panel: pl.DataFrame,
     request: TrainingRequest,
+    *,
+    holding_horizon_sessions: int = 5,
 ) -> ReplayStaticContext:
     """Build the candidate-invariant replay inputs once per selection panel.
 
     The market frame (carrying the immutable point-in-time market columns),
     instrument map, and risk policy are shared by every shortlisted candidate.
-    Raises ``ValueError`` for a missing required replay column or a non-finite
-    cached market input.
+    ``holding_horizon_sessions`` fixes the policy's rebalance cadence so a
+    route replays at its own session frequency. Raises ``ValueError`` for a
+    missing required replay column or a non-finite cached market input.
     """
     from src.stocks.backtesting.engine import REQUIRED_BACKTEST_COLUMNS
 
@@ -1025,6 +1313,7 @@ def _prepare_replay_static_context(
         gross_cap=request.max_exposure,
         single_name_cap=request.max_single_weight,
         participation_limit=request.participation_limit,
+        rebalance_frequency_sessions=holding_horizon_sessions,
     )
     return ReplayStaticContext(
         market_panel=frame,
@@ -1049,6 +1338,12 @@ def _evaluate_economic_candidate(
     request: TrainingRequest,
     trial_number: int,
     screen_rank_ic: float,
+    *,
+    holding_horizon_sessions: int = 5,
+    label_column: str = "",
+    relevance_column: str = "",
+    label_available_column: str = "",
+    terminal_trial_count: int = 0,
 ) -> EconomicCandidateEvidence:
     """Evaluate every economic predicate and emit immutable candidate evidence.
 
@@ -1104,6 +1399,11 @@ def _evaluate_economic_candidate(
             if calibration_evidence.get("calibration_state") is not None
             else None
         ),
+        holding_horizon_sessions=holding_horizon_sessions,
+        label_column=label_column,
+        relevance_column=relevance_column,
+        label_available_column=label_available_column,
+        terminal_trial_count=terminal_trial_count,
     )
 
 
@@ -1162,30 +1462,34 @@ def _select_economic_champion(
     tuning_folds: list[Fold],
     contexts: list[_StableTrialContext],
     request: TrainingRequest,
-    base_manifest: ModelManifest,
+    route_manifest: ModelManifest,
     feature_columns: tuple[str, ...],
-    label_column: str,
-    relevance_column: str | None,
+    route: RouteSpec,
     guard: TrialResourceGuard,
     dataset_manifest: DatasetManifest,
     registry: ModelArtifactRegistry,
     base_schedule: CostSchedule,
     stress_schedule: CostSchedule,
+    *,
+    terminal_trial_count: int,
 ) -> tuple[LambdaRankConfig | None, dict[str, object] | None]:
     """Replay each shortlisted candidate and pick the top economic evidence.
 
     Every candidate is fully refit over all inner folds and replayed through
-    the exact event ledger with the outer base/stress schedules. A candidate is
-    skipped after its first non-positive full-refit Rank-IC (later folds and
-    replay cannot make it eligible). Eligible candidates sort descending by
-    ``(bootstrap lower bound, strategy IR, -max drawdown, -turnover, median
-    Rank-IC, -trial number)``; a tie is won by the lower trial number. Returns
+    the exact event ledger with the outer base/stress schedules and the route's
+    rebalance cadence. A candidate is skipped after its first non-positive
+    full-refit Rank-IC (later folds and replay cannot make it eligible).
+    Eligible candidates sort descending by ``(bootstrap lower bound, strategy
+    IR, -max drawdown, -turnover, median Rank-IC, -holding horizon, -trial
+    number)``; a tie is won by the lower trial number. Returns
     ``(config, selection telemetry)`` or ``(None, None)`` when no shortlisted
     candidate is eligible.
     """
     if not shortlist:
         return None, None
-    replay_context = _prepare_replay_static_context(tuning_panel, request)
+    replay_context = _prepare_replay_static_context(
+        tuning_panel, request, holding_horizon_sessions=route.horizon,
+    )
     refit_started = time.perf_counter()
     candidate_rows: list[tuple[tuple[float, ...], int]] = []
     evidence_by_trial: dict[int, dict[str, float]] = {}
@@ -1198,9 +1502,9 @@ def _select_economic_champion(
         config = _config_from_params(dict(frozen.params))
         refit_started_trial = time.perf_counter()
         refit = _fit_and_score_candidate(
-            tuning_panel, tuning_folds, contexts, request, base_manifest,
-            feature_columns, label_column, relevance_column, config, guard,
-            f"trial{trial_number}",
+            tuning_panel, tuning_folds, contexts, request, route_manifest,
+            feature_columns, route.label_column, route.relevance_column, config,
+            guard, f"trial{trial_number}",
             static_cache_bytes=replay_context.cache_bytes,
         )
         if refit is None:
@@ -1212,15 +1516,25 @@ def _select_economic_champion(
             logger.info("[EVAL] trial=%s stage=early_rejected", trial_number)
             continue
         replay_started = time.perf_counter()
-        causal_oos_ledger = _build_calibration_ledger(oos, tuning_panel, label_column)
+        causal_oos_ledger = _build_calibration_ledger(
+            oos, tuning_panel, route.label_column, route.label_available_column,
+        )
         replay = _event_ledger_evaluation(
             tuning_panel, oos, request, dataset_manifest, registry, base_schedule,
             stress_schedule, replay_context=replay_context,
             calibration_ledger=causal_oos_ledger,
+            holding_horizon_sessions=route.horizon,
+            label_column=route.label_column,
+            label_available_column=route.label_available_column,
         )
         replay_seconds += time.perf_counter() - replay_started
         evidence = _evaluate_economic_candidate(
             fold_rank_ic, replay, request, trial_number, _screen_ic,
+            holding_horizon_sessions=route.horizon,
+            label_column=route.label_column,
+            relevance_column=route.relevance_column,
+            label_available_column=route.label_available_column,
+            terminal_trial_count=terminal_trial_count,
         )
         shortlist_evidence.append(evidence.to_json_safe())
         logger.info(
@@ -1239,6 +1553,7 @@ def _select_economic_champion(
                     -evidence.max_drawdown,
                     -evidence.turnover,
                     evidence.median_rank_ic,
+                    -route.horizon,
                     -trial_number,
                 ),
                 trial_number,
@@ -1250,8 +1565,8 @@ def _select_economic_champion(
             "max_drawdown": evidence.max_drawdown,
             "turnover": evidence.turnover,
             "median_rank_ic": evidence.median_rank_ic,
+            "holding_horizon_sessions": route.horizon,
         }
-        calibration_state_by_trial[trial_number] = evidence.calibration_state
         calibration_state_by_trial[trial_number] = evidence.calibration_state
         logger.info(
             "[EVAL] trial=%s stage=economically_eligible "
@@ -1262,7 +1577,8 @@ def _select_economic_champion(
         )
     refit_seconds = time.perf_counter() - refit_started
     logger.info(
-        "[SYS] stage=shortlist elapsed_ms=%.1f rss=%.1f",
+        "[SYS] route=%sd stage=shortlist elapsed_ms=%.1f rss=%.1f",
+        route.horizon,
         refit_seconds * 1000.0,
         TrialResourceGuard._rss_mib(),
     )
@@ -1386,6 +1702,9 @@ def _event_ledger_evaluation(
     *,
     replay_context: ReplayStaticContext | None = None,
     calibration_ledger: pl.DataFrame | None = None,
+    holding_horizon_sessions: int = 5,
+    label_column: str = "residual_o2o_5d",
+    label_available_column: str = "label_available_time",
 ) -> ReplayResult:
     """Replay the out-of-sample scored panel through the event-driven backtester.
 
@@ -1394,9 +1713,13 @@ def _event_ledger_evaluation(
     ledger used by paper/live paths without needing a pre-published artifact.
     When ``replay_context`` is supplied its cached market panel, risk policy,
     and instruments are reused instead of being rebuilt; only ``pred_score``
-    is joined per replay. The replay-window causal 20-session ADTV is computed
-    once and passed to the backtester so the base and stress execution ledgers
-    reuse the same validated column instead of recomputing it twice.
+    is joined per replay. The policy's ``rebalance_frequency_sessions`` (built
+    from ``holding_horizon_sessions``) drives the decision cadence, and the
+    causal calibrator is bound to the route's label and availability columns so
+    a 10/15-day route is cost-amortized over its own horizon. The replay-window
+    causal 20-session ADTV is computed once and passed to the backtester so the
+    base and stress execution ledgers reuse the same validated column instead of
+    recomputing it twice.
     """
     from src.core.portfolio import PortfolioSnapshot
     from src.stocks.backtesting.engine import (
@@ -1414,7 +1737,9 @@ def _event_ledger_evaluation(
     )
 
     if replay_context is None:
-        replay_context = _prepare_replay_static_context(panel, request)
+        replay_context = _prepare_replay_static_context(
+            panel, request, holding_horizon_sessions=holding_horizon_sessions,
+        )
     frame = replay_context.market_panel
     instruments = replay_context.instruments
     policy = replay_context.policy
@@ -1450,6 +1775,8 @@ def _event_ledger_evaluation(
             seed=request.seed,
             n_bootstrap=request.n_bootstrap,
             bootstrap_alpha=request.bootstrap_alpha,
+            label_column=label_column,
+            label_available_column=label_available_column,
         )
         if calibration_ledger is not None and not calibration_ledger.is_empty()
         else None
@@ -1527,8 +1854,9 @@ def _event_ledger_evaluation(
 
     start_time = _session_as_datetime(sessions[0])
     end_time = _session_as_datetime(sessions[-1])
+    cadence = max(1, int(policy.rebalance_frequency_sessions))
     decision_indices = tuple(
-        i for i in range(len(sessions)) if i % _REBALANCE_EVERY_SESSIONS == 0
+        i for i in range(len(sessions)) if i % cadence == 0
     )
     initial_portfolio = PortfolioSnapshot(
         account_snapshot_id="promotion",
@@ -1736,7 +2064,8 @@ def _drop_target_columns(
     drops = [
         c
         for c in frame.columns
-        if c.startswith(("target_", "label_")) or c == label_column
+        if c.startswith(("target_", "label_", "residual_o2o_", "relevance_"))
+        or c in (label_column, RELEVANCE_COLUMN, LABEL_AVAILABLE_COLUMN)
     ]
     return frame.drop(drops)
 
@@ -1745,18 +2074,22 @@ def _build_calibration_ledger(
     oos_scored: pl.DataFrame,
     panel: pl.DataFrame,
     label_column: str,
+    label_available_column: str = LABEL_AVAILABLE_COLUMN,
 ) -> pl.DataFrame:
     """Join OOS predictions with their point-in-time labels for calibration.
 
     The ledger carries ``(session, instrument_id, score, label,
-    label_available_time)`` so ``CausalAlphaCalibrator`` can consume only prior
-    label-available OOS observations. ``panel`` is the parent frame carrying the
-    canonical label columns; every ledger row is a real historical OOS score.
+    label_available_column)`` so ``CausalAlphaCalibrator`` can consume only
+    prior label-available OOS observations. ``panel`` is the parent frame
+    carrying the route's label columns; every ledger row is a real historical
+    OOS score.
     """
     if label_column not in panel.columns:
         raise ValueError(f"panel has no calibration label column {label_column!r}")
-    if LABEL_AVAILABLE_COLUMN not in panel.columns:
-        raise ValueError("panel has no label_available_time for calibration")
+    if label_available_column not in panel.columns:
+        raise ValueError(
+            f"panel has no {label_available_column!r} for calibration"
+        )
     required = ("session", "instrument_id")
     if oos_scored.is_empty() or not all(
         c in oos_scored.columns for c in required
@@ -1767,7 +2100,7 @@ def _build_calibration_ledger(
                 "instrument_id": pl.Utf8,
                 "score": pl.Float64,
                 label_column: pl.Float64,
-                LABEL_AVAILABLE_COLUMN: pl.Datetime("us", "UTC"),
+                label_available_column: pl.Datetime("us", "UTC"),
             }
         )
     if "pred_score" not in oos_scored.columns:
@@ -1777,7 +2110,7 @@ def _build_calibration_ledger(
             "session",
             "instrument_id",
             label_column,
-            LABEL_AVAILABLE_COLUMN,
+            label_available_column,
         ),
         on=["session", "instrument_id"],
         how="inner",
@@ -2035,6 +2368,7 @@ def _reserve_forward_holdout(
     panel: pl.DataFrame,
     request: TrainingRequest,
     label_span_sessions: int,
+    label_available_column: str = LABEL_AVAILABLE_COLUMN,
 ) -> tuple[Fold | None, pl.DataFrame]:
     """Reserve the dated forward holdout before tuning and outer folds.
 
@@ -2043,19 +2377,21 @@ def _reserve_forward_holdout(
     ``holdout_sessions`` are pinned as a locked ``PurgedWalkForward.holdout``
     and the returned training panel contains only sessions before that block.
     Otherwise returns ``(None, panel)`` unchanged and promotion stays fail
-    closed.
+    closed. ``label_available_column`` is the control route's availability
+    column so both legacy five-day and multi-horizon panels reserve the block
+    against the right labels.
     """
     holdout_sessions = (
         request.holdout_sessions
         if request.holdout_sessions > 0
         else _FORWARD_HOLDOUT_SESSIONS
     )
-    if holdout_sessions < 1 or LABEL_AVAILABLE_COLUMN not in panel.columns:
+    if holdout_sessions < 1 or label_available_column not in panel.columns:
         return None, panel
     holdout_start = datetime.combine(_FORWARD_HOLDOUT_START, datetime.min.time(), tzinfo=UTC)
     post_start_sessions = panel.filter(
         (pl.col("session") >= holdout_start)
-        & pl.col(LABEL_AVAILABLE_COLUMN).is_not_null()
+        & pl.col(label_available_column).is_not_null()
     )["session_index"].unique().to_list()
     if len(post_start_sessions) < holdout_sessions:
         return None, panel
@@ -2093,13 +2429,19 @@ def _evaluate_forward_holdout(
     stress_schedule: CostSchedule,
     *,
     calibration_ledger: pl.DataFrame | None = None,
+    label_span_sessions: int = 6,
+    label_available_column: str = LABEL_AVAILABLE_COLUMN,
+    holding_horizon_sessions: int = 5,
 ) -> tuple[bool, str, dict[str, object] | None]:
     """Fit the frozen candidate on pre-holdout data and replay the block once.
 
-    Returns ``(ready, reason, evidence)``. A candidate fingerprint may inspect
-    the holdout exactly once; a reused fingerprint raises ``ValueError``.
-    Incomplete data leaves the candidate ``NO_TRADE`` with
-    ``forward_holdout_ready=false``.
+    The holdout block is the same newest ``holdout_sessions`` pinned by
+    ``_reserve_forward_holdout``, but the fold is rebuilt with the route's
+    ``label_span_sessions`` purge/embargo so a 10/15-day route never trains on
+    a label that overlaps the holdout decisions. Returns ``(ready, reason,
+    evidence)``. A candidate fingerprint may inspect the holdout exactly once;
+    a reused fingerprint raises ``ValueError``. Incomplete data leaves the
+    candidate ``NO_TRADE`` with ``forward_holdout_ready=false``.
     """
     if holdout_fold is None:
         return (
@@ -2107,9 +2449,29 @@ def _evaluate_forward_holdout(
             "gate8_forward_holdout_ready=false:insufficient-label-available-sessions-on-or-after-2026-03-10",
             None,
         )
+    holdout_sessions = (
+        request.holdout_sessions
+        if request.holdout_sessions > 0
+        else _FORWARD_HOLDOUT_SESSIONS
+    )
+    route_splitter = PurgedWalkForward(
+        n_folds=1,
+        label_horizon_sessions=label_span_sessions,
+        embargo_sessions=request.embargo_sessions,
+        session_column="session_index",
+        min_train_sessions=0,
+    )
+    try:
+        route_fold = route_splitter.holdout(panel, holdout_sessions)
+    except ValueError:
+        return (
+            False,
+            "gate8_forward_holdout_ready=false:insufficient-label-available-sessions-on-or-after-2026-03-10",
+            None,
+        )
     block_session_indexes = sorted(
         int(v)
-        for v in panel["session_index"][holdout_fold.validation_mask].unique().to_list()
+        for v in panel["session_index"][route_fold.validation_mask].unique().to_list()
     )
     holdout_session_range = (
         block_session_indexes[0],
@@ -2117,7 +2479,7 @@ def _evaluate_forward_holdout(
     )
     fingerprint = _forward_holdout_fingerprint(
         base_manifest, request, dataset_manifest, holdout_session_range,
-        champion_config, base_schedule, stress_schedule,
+        champion_config, base_schedule, stress_schedule, holding_horizon_sessions,
     )
     existing = registry.read_forward_holdout(request.artifact_id)
     if existing is not None and existing.get("fingerprint") == fingerprint:
@@ -2126,7 +2488,7 @@ def _evaluate_forward_holdout(
             f"was already inspected for {request.artifact_id!r}"
         )
     models, scored, _fold_ic = _fit_and_score_folds(
-        panel, [holdout_fold], request, base_manifest, feature_columns, label_column,
+        panel, [route_fold], request, base_manifest, feature_columns, label_column,
         relevance_column, champion_config,
     )
     if not models:
@@ -2135,6 +2497,9 @@ def _evaluate_forward_holdout(
     replay = _event_ledger_evaluation(
         panel, holdout_oos, request, dataset_manifest, registry, base_schedule,
         stress_schedule, calibration_ledger=calibration_ledger,
+        holding_horizon_sessions=holding_horizon_sessions,
+        label_column=label_column,
+        label_available_column=label_available_column,
     )
     if replay.attempted_orders <= 0:
         return False, "gate8_forward_holdout_ready=false:no-attempted-orders", None
@@ -2146,6 +2511,9 @@ def _evaluate_forward_holdout(
         "label_dataset_hash": _label_dataset_hash(dataset_manifest),
         "holdout_session_range": holdout_session_range,
         "model_config": _config_snapshot(champion_config),
+        "holding_horizon_sessions": holding_horizon_sessions,
+        "label_column": label_column,
+        "label_available_column": label_available_column,
         "risk_policy": {
             name: getattr(request, name)
             for name in (
@@ -2176,6 +2544,7 @@ def _forward_holdout_fingerprint(
     config: LambdaRankConfig,
     base_schedule: CostSchedule,
     stress_schedule: CostSchedule,
+    holding_horizon_sessions: int = 5,
 ) -> str:
     """SHA-256 identity binding one forward-holdout evaluation to its inputs."""
     config_fields = "|".join(
@@ -2196,6 +2565,7 @@ def _forward_holdout_fingerprint(
             base_schedule.name,
             stress_schedule.name,
             str(request.seed),
+            f"holding_horizon_sessions={holding_horizon_sessions}",
         )
     )
     return sha256(key.encode("utf-8")).hexdigest()

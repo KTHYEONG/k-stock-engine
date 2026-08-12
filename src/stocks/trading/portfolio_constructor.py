@@ -247,11 +247,13 @@ def _economically_eligible(
     """Gate entries and holdings on cost-adjusted expected net alpha.
 
     New entrants require a positive ``expected_net_alpha`` (cost-adjusted
-    expected active return) and a positive ``alpha_lower_bound`` confidence
-    bound. Existing holdings are retained only while the keep-versus-exit net
-    benefit (``expected_active_alpha`` minus the one-way sell cost) is positive
-    with a positive confidence bound. Null/non-finite alpha is never a buy
-    signal: those rows fail the gate and fall through to cash or sell-only.
+    expected active return), a positive ``alpha_lower_bound`` confidence bound,
+    and a positive ``net_alpha_lower_bound`` (the bootstrap lower bound net of
+    the full round-trip cost) when the economic panel exposes it. Existing
+    holdings are retained only while the keep-versus-exit net benefit
+    (``expected_active_alpha`` minus the one-way sell cost) is positive with a
+    positive confidence bound. Null/non-finite alpha is never a buy signal:
+    those rows fail the gate and fall through to cash or sell-only.
     """
     if "expected_active_alpha" not in cross_section.columns:
         return eligible
@@ -261,10 +263,16 @@ def _economically_eligible(
         & (pl.col("expected_active_alpha") > 0.0)
         & (pl.col("alpha_lower_bound") > 0.0)
     )
+    net_lower_bound_ok = (
+        (pl.col("net_alpha_lower_bound") > 0.0)
+        if "net_alpha_lower_bound" in cross_section.columns
+        else pl.lit(True)
+    )
     enter_ok = (
         (pl.col("expected_net_alpha") > 0.0)
         & (pl.col("expected_active_alpha") > 0.0)
         & (pl.col("alpha_lower_bound") > 0.0)
+        & net_lower_bound_ok
     )
     gate = pl.when(incumbent).then(keep_ok).otherwise(enter_ok)
     return eligible.filter(gate.fill_null(False))

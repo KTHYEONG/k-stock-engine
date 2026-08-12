@@ -2,13 +2,16 @@
 
 ``CausalAlphaCalibrator`` maps each current cross-sectional score percentile
 bucket to an expected residual active return using only *prior* label-available
-out-of-sample observations (``label_available_time <= decision_time`` and
-``session < decision_time``), shrinks the bucket mean toward the history mean,
+out-of-sample observations (the route's ``label_available_column <= decision_time``
+and ``session < decision_time``), shrinks the bucket mean toward the history mean,
 and requires a positive moving-block bootstrap lower bound before the bucket is
 usable. The expected alpha is then netted against the effective round-trip and
 one-way exit costs resolved from the decision's ``CostSchedule`` (plus optional
-liquidity impact), so ``expected_net_alpha`` is in the same 5-session unit as the
-``residual_o2o_5d`` label.
+liquidity impact), so ``expected_net_alpha`` is in the same session unit as the
+route's residual label, and ``net_alpha_lower_bound`` is the bootstrap lower
+bound net of the full round-trip cost. The label and availability columns are
+constructor parameters so a longer-horizon route is calibrated against its own
+label without scaling a five-day estimate.
 
 A bucket whose evidence is insufficient or whose bootstrap lower bound is not
 positive yields ``null`` expected alpha: ``null`` is not a buy signal and drives
@@ -35,6 +38,7 @@ LABEL_AVAILABLE_COLUMN = "label_available_time"
 ALPHA_COLUMN = "expected_active_alpha"
 NET_ALPHA_COLUMN = "expected_net_alpha"
 LOWER_BOUND_COLUMN = "alpha_lower_bound"
+NET_LOWER_BOUND_COLUMN = "net_alpha_lower_bound"
 EXIT_COST_COLUMN = "exit_cost_rate"
 
 _MIN_BUCKET_OBSERVATIONS = 5
@@ -87,6 +91,8 @@ class CausalAlphaCalibrator:
         bootstrap_alpha: float = 0.05,
         block_length: int = _DEFAULT_BLOCK_LENGTH,
         participation_limit: float = _DEFAULT_PARTICIPATION_LIMIT,
+        label_column: str = LABEL_COLUMN,
+        label_available_column: str = LABEL_AVAILABLE_COLUMN,
     ) -> None:
         if bucket_count < 2:
             raise ValueError("bucket_count must be at least 2")
@@ -100,6 +106,10 @@ class CausalAlphaCalibrator:
             raise ValueError("block_length must be positive")
         if not 0.0 <= participation_limit <= 1.0:
             raise ValueError("participation_limit must be in [0, 1]")
+        if not label_column:
+            raise ValueError("label_column must be non-empty")
+        if not label_available_column:
+            raise ValueError("label_available_column must be non-empty")
         self.bucket_count = bucket_count
         self.min_calibration_sessions = min_calibration_sessions
         self.seed = seed
@@ -107,6 +117,8 @@ class CausalAlphaCalibrator:
         self.bootstrap_alpha = bootstrap_alpha
         self.block_length = block_length
         self.participation_limit = participation_limit
+        self.label_column = label_column
+        self.label_available_column = label_available_column
         self._last_evidence: tuple[BucketEvidence, ...] = ()
         self._last_history_sessions = 0
         self._last_round_trip_cost = 0.0
@@ -139,16 +151,17 @@ class CausalAlphaCalibrator:
         """Return ``scored`` augmented with expected-active/net-alpha evidence.
 
         ``observations`` must carry ``instrument_id``, ``session``, ``score``,
-        the residual label, and ``label_available_time``; ``scored`` must carry
-        ``instrument_id``, ``session``, and a score column (``pred_score`` or
-        ``score``). Missing or non-finite inputs raise ``ValueError``. Only
-        observations with ``label_available_time <= decision_time`` and
+        the route's residual label (``label_column``), and the route's
+        ``label_available_column``; ``scored`` must carry ``instrument_id``,
+        ``session``, and a score column (``pred_score`` or ``score``). Missing
+        or non-finite inputs raise ``ValueError``. Only observations with
+        ``label_available_column <= decision_time`` and
         ``session < decision_time`` are used, so no current or future label can
         leak into the calibration. ``scored`` rows at or after the decision time
         are excluded from the returned frame.
         """
         _validate_scored(scored)
-        _validate_observations(observations)
+        _validate_observations(observations, self.label_column, self.label_available_column)
         score_column = _resolve_score_column(scored)
         visible = scored.filter(pl.col(SESSION_COLUMN) <= decision_time)
 
@@ -164,7 +177,7 @@ class CausalAlphaCalibrator:
         )
 
         eligible = observations.filter(
-            (pl.col(LABEL_AVAILABLE_COLUMN) <= decision_time)
+            (pl.col(self.label_available_column) <= decision_time)
             & (pl.col(SESSION_COLUMN) < decision_time)
         )
         self._last_history_sessions = int(
@@ -183,6 +196,7 @@ class CausalAlphaCalibrator:
         stats = _bucket_statistics(
             eligible,
             self.bucket_count,
+            label_column=self.label_column,
             seed=self.seed,
             n_bootstrap=self.n_bootstrap,
             bootstrap_alpha=self.bootstrap_alpha,
@@ -226,6 +240,8 @@ class CausalAlphaCalibrator:
             "bootstrap_alpha": float(self.bootstrap_alpha),
             "block_length": int(self.block_length),
             "participation_limit": float(self.participation_limit),
+            "label_column": str(self.label_column),
+            "label_available_column": str(self.label_available_column),
             "history_sessions": int(self._last_history_sessions),
             "round_trip_cost": round(float(self._last_round_trip_cost), 12),
             "exit_cost_rate": round(float(self._last_exit_cost), 12),
@@ -243,6 +259,10 @@ class CausalAlphaCalibrator:
             bootstrap_alpha=cast(float, state["bootstrap_alpha"]),
             block_length=cast(int, state["block_length"]),
             participation_limit=cast(float, state["participation_limit"]),
+            label_column=cast(str, state.get("label_column", LABEL_COLUMN)),
+            label_available_column=cast(
+                str, state.get("label_available_column", LABEL_AVAILABLE_COLUMN)
+            ),
         )
         calibrator._last_history_sessions = cast(int, state["history_sessions"])
         calibrator._last_round_trip_cost = cast(float, state["round_trip_cost"])
@@ -301,13 +321,17 @@ def _validate_scored(scored: pl.DataFrame) -> None:
         raise ValueError("non-finite score in scored frame")
 
 
-def _validate_observations(observations: pl.DataFrame) -> None:
+def _validate_observations(
+    observations: pl.DataFrame,
+    label_column: str = LABEL_COLUMN,
+    label_available_column: str = LABEL_AVAILABLE_COLUMN,
+) -> None:
     required = (
         INSTRUMENT_COLUMN,
         SESSION_COLUMN,
         SCORE_COLUMN,
-        LABEL_COLUMN,
-        LABEL_AVAILABLE_COLUMN,
+        label_column,
+        label_available_column,
     )
     missing = [c for c in required if c not in observations.columns]
     if missing:
@@ -316,7 +340,10 @@ def _validate_observations(observations: pl.DataFrame) -> None:
         )
     non_finite = observations.filter(
         (pl.col(SCORE_COLUMN).is_not_null() & ~pl.col(SCORE_COLUMN).is_finite())
-        | (pl.col(LABEL_COLUMN).is_not_null() & ~pl.col(LABEL_COLUMN).is_finite())
+        | (
+            pl.col(label_column).is_not_null()
+            & ~pl.col(label_column).is_finite()
+        )
     )
     if not non_finite.is_empty():
         raise ValueError("non-finite calibration input")
@@ -344,6 +371,7 @@ def _bucket_expression(score_column: str, bucket_count: int) -> pl.Expr:
 def _bucket_statistics(
     eligible: pl.DataFrame,
     bucket_count: int,
+    label_column: str = LABEL_COLUMN,
     seed: int = 42,
     n_bootstrap: int = 200,
     bootstrap_alpha: float = 0.05,
@@ -360,11 +388,13 @@ def _bucket_statistics(
         _bucket_expression(SCORE_COLUMN, bucket_count)
     )
     grouped = bucketed.group_by("__bucket").agg(
-        pl.col(LABEL_COLUMN).count().alias("sample_size"),
-        pl.col(LABEL_COLUMN).mean().alias("bucket_mean"),
-        pl.col(LABEL_COLUMN).implode().alias("__residuals"),
+        pl.col(label_column).count().alias("sample_size"),
+        pl.col(label_column).mean().alias("bucket_mean"),
+        pl.col(label_column).implode().alias("__residuals"),
     )
-    global_mean_series = bucketed.select(pl.col(LABEL_COLUMN).mean()).to_series()
+    global_mean_series = bucketed.select(
+        pl.col(label_column).mean()
+    ).to_series()
     global_mean_value = global_mean_series[0] if not global_mean_series.is_empty() else None
     if global_mean_value is None:
         return pl.DataFrame(
@@ -443,6 +473,7 @@ def _augment(
         stats, on="__bucket", how="left"
     )
     active = pl.col(ALPHA_COLUMN)
+    lower = pl.col(LOWER_BOUND_COLUMN)
     cost_expr: pl.Expr = pl.lit(round_trip_cost, dtype=pl.Float64)
     drops = ["__bucket"]
     if liquidity_rate is not None:
@@ -451,6 +482,7 @@ def _augment(
         drops.append("__liquidity_rate")
     return out.with_columns(
         (active - cost_expr).alias(NET_ALPHA_COLUMN),
+        (lower - cost_expr).alias(NET_LOWER_BOUND_COLUMN),
         pl.lit(exit_cost_rate, dtype=pl.Float64).alias(EXIT_COST_COLUMN),
     ).drop(*drops)
 

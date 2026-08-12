@@ -12,6 +12,8 @@ from datetime import datetime
 
 from src.core.costs import CostSchedule
 
+SUPPORTED_CANDIDATE_HORIZONS = (5, 10, 15)
+
 
 @dataclass(frozen=True, slots=True)
 class TrainingRequest:
@@ -42,6 +44,7 @@ class TrainingRequest:
     stress_cost_schedule: CostSchedule | None = None
     calibration_bucket_count: int = 10
     min_calibration_sessions: int = 126
+    candidate_horizons: tuple[int, ...] = (5, 10, 15)
 
     def __post_init__(self) -> None:
         if self.n_folds < 1:
@@ -62,6 +65,23 @@ class TrainingRequest:
             raise ValueError("calibration_bucket_count must be at least 2")
         if self.min_calibration_sessions < 1:
             raise ValueError("min_calibration_sessions must be positive")
+        if not self.candidate_horizons:
+            raise ValueError("candidate_horizons must be non-empty")
+        if tuple(self.candidate_horizons) != tuple(
+            sorted(set(self.candidate_horizons))
+        ):
+            raise ValueError(
+                "candidate_horizons must be strictly ascending and unique"
+            )
+        unsupported = [
+            h for h in self.candidate_horizons
+            if h not in SUPPORTED_CANDIDATE_HORIZONS
+        ]
+        if unsupported:
+            raise ValueError(
+                f"unsupported candidate horizons {unsupported}; "
+                f"supported {SUPPORTED_CANDIDATE_HORIZONS}"
+            )
 
 
 @dataclass(frozen=True, slots=True)

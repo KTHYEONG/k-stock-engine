@@ -44,6 +44,8 @@ _KRX_TZ = ZoneInfo("Asia/Seoul")
 RESIDUAL_O2O_PREFIX = "residual_o2o_"
 MIN_RESIDUAL_GROUP = 20
 RESIDUAL_ALGORITHM_VERSION = "calendar-residual-o2o-v1"
+SUPPORTED_RESIDUAL_HORIZONS = (5, 10, 15)
+MULTI_HORIZON_RESIDUAL_DEFINITION = "residual_o2o_multi_5_10_15d"
 
 
 def build_label_dataset(
@@ -308,6 +310,78 @@ def build_residual_o2o_label_dataset(
     )
     return out
 
+def build_multi_horizon_residual_label_dataset(
+    base_panel: pl.DataFrame,
+    calendar: KRXSessionCalendar,
+    *,
+    horizons: tuple[int, ...] = (5, 10, 15),
+) -> pl.DataFrame:
+    """Build a key-aligned multi-horizon residual open-to-open label panel.
+
+    Each horizon ``h`` is computed independently with the same calendar-correct
+    open-to-open residual and relevance semantics as the single-horizon builder,
+    then the panels are inner-joined on ``(instrument_id, session)`` so every
+    emitted key carries all horizons and all selected routes share an identical
+    universe. A decision-session key is emitted only when every horizon has a
+    finite label, its own ``relevance``, and at least ``MIN_RESIDUAL_GROUP``
+    finite same-session constituents for each relevance calculation. The result
+    schema is exactly:
+
+    ``instrument_id, session, residual_o2o_<h0>d, relevance_<h0>d,
+    label_available_time_<h0>d, residual_o2o_<h1>d, ...``
+
+    with each ``label_available_time_<h>d`` bound to that horizon's terminal
+    exit-session open in UTC.
+
+    Raises:
+        ValueError: for an empty, unsupported, duplicated, or non-ascending
+            horizon set, or when any emitted key has a non-finite horizon label.
+    """
+    if not horizons:
+        raise ValueError("horizons must be non-empty")
+    if tuple(horizons) != tuple(sorted(set(horizons))):
+        raise ValueError("horizons must be strictly ascending and unique")
+    unsupported = [h for h in horizons if h not in SUPPORTED_RESIDUAL_HORIZONS]
+    if unsupported:
+        raise ValueError(
+            f"unsupported residual horizons {unsupported}; "
+            f"supported {SUPPORTED_RESIDUAL_HORIZONS}"
+        )
+    horizon_frames = [
+        build_residual_o2o_label_dataset(base_panel, calendar, horizon_sessions=h)
+        for h in horizons
+    ]
+    renamed: list[pl.DataFrame] = []
+    for h, frame in zip(horizons, horizon_frames, strict=True):
+        renamed.append(
+            frame.rename(
+                {
+                    RELEVANCE_COLUMN: f"relevance_{h}d",
+                    LABEL_AVAILABLE_COLUMN: f"label_available_time_{h}d",
+                }
+            )
+        )
+    out = renamed[0]
+    for frame in renamed[1:]:
+        out = out.join(frame, on=[ID_COLUMN, SESSION_COLUMN], how="inner")
+    out = out.sort([ID_COLUMN, SESSION_COLUMN])
+    finite_columns = [
+        c for c in out.columns if c.startswith(RESIDUAL_O2O_PREFIX)
+    ]
+    incomplete = out.filter(
+        pl.any_horizontal(
+            pl.col(c).is_null() | ~pl.col(c).is_finite() for c in finite_columns
+        )
+    )
+    if not incomplete.is_empty():
+        raise ValueError("multi-horizon label builder emitted an incomplete row")
+    logger.info(
+        "built multi-horizon residual label panel %s: %s rows",
+        tuple(horizons),
+        out.height,
+    )
+    return out
+
 
 def label_available_time(exit_session: date) -> datetime:
     """Availability timestamp for a terminal horizon session (after close)."""
@@ -449,6 +523,105 @@ def publish_residual_o2o_label_dataset(
         certification=certification,
         generated_time=generated_time,
         algorithm_version=RESIDUAL_ALGORITHM_VERSION,
+    )
+
+def publish_multi_horizon_residual_label_dataset(
+    labels_frame: pl.DataFrame,
+    *,
+    destination_root: Path,
+    dataset_id: str,
+    base_panel_hash: str,
+    calendar_hash: str,
+    horizons: tuple[int, ...] = (5, 10, 15),
+    provider_version: str = "base-panel-labels",
+    universe_policy_version: str = "provisional-legacy",
+    certification: DatasetCertification = DatasetCertification.PROVISIONAL,
+    generated_time: datetime | None = None,
+) -> LabelDatasetResult:
+    """Publish the immutable multi-horizon residual label panel.
+
+    The manifest declares ``label_definition="residual_o2o_multi_5_10_15d"``
+    and ``label_horizon_sessions`` equal to the control horizon (the first
+    element of ``horizons``), so v2 consumers keyed on the five-day primary
+    label keep a stable contract. The content manifest records the ordered
+    horizon set and the residual-label algorithm version; the schema/content
+    hashes bind the exact column order and values.
+    """
+    if not horizons:
+        raise ValueError("horizons must be non-empty")
+    expected_columns: list[str] = [ID_COLUMN, SESSION_COLUMN]
+    for h in horizons:
+        expected_columns += [
+            f"{RESIDUAL_O2O_PREFIX}{h}d",
+            f"relevance_{h}d",
+            f"label_available_time_{h}d",
+        ]
+    if labels_frame.columns != expected_columns:
+        raise ValueError(
+            "multi-horizon label dataset must carry exactly "
+            f"{expected_columns}, got {labels_frame.columns}"
+        )
+    if labels_frame.is_empty():
+        raise ValueError("cannot publish an empty multi-horizon label dataset")
+    control_available = f"label_available_time_{horizons[0]}d"
+    if labels_frame.filter(pl.col(control_available).is_null()).height:
+        raise ValueError(
+            "multi-horizon label dataset contains rows without the control "
+            "label_available_time"
+        )
+    generated_time = generated_time or datetime.now(UTC)
+    ordered_columns = list(labels_frame.columns)
+    manifest = make_manifest(
+        asset_kind=AssetKind.STOCK,
+        columns=ordered_columns,
+        feature_set=LABEL_FEATURE_SET,
+        label_definition=MULTI_HORIZON_RESIDUAL_DEFINITION,
+        label_horizon_sessions=horizons[0],
+        time_start=_as_utc_datetime(labels_frame[SESSION_COLUMN].min()),
+        time_end=_as_utc_datetime(labels_frame[SESSION_COLUMN].max()),
+        provider_version=provider_version,
+        universe_policy_version=universe_policy_version,
+        row_count=labels_frame.height,
+        generated_time=generated_time,
+        certification=certification,
+        calendar_hash=calendar_hash,
+        schema_version="v2",
+        content_hash=canonical_content_hash(labels_frame, ordered_columns),
+        storage_layout=HIVE_PARTITION_LAYOUT,
+    )
+    content_manifest: dict[str, object] = {
+        "base_panel_hash": base_panel_hash,
+        "calendar_hash": calendar_hash,
+        "label_definition": MULTI_HORIZON_RESIDUAL_DEFINITION,
+        "label_horizon_sessions": horizons[0],
+        "horizons": list(horizons),
+        "entry_field": "open",
+        "exit_field": "open",
+        "generated_time": generated_time.isoformat(),
+        "label_algorithm_version": RESIDUAL_ALGORITHM_VERSION,
+    }
+    store = ParquetDatasetStore(Path(destination_root))
+    dataset_dir = store.write_partitioned(
+        labels_frame,
+        dataset_id=dataset_id,
+        manifest=manifest,
+        expected_feature_set=LABEL_FEATURE_SET,
+        decision_time=generated_time,
+        content_manifest=content_manifest,
+    )
+    partition_paths = tuple(sorted((dataset_dir / "partitions").rglob("*.parquet")))
+    logger.info(
+        "published multi-horizon label dataset %s: %s rows, horizons %s",
+        dataset_id,
+        labels_frame.height,
+        list(horizons),
+    )
+    return LabelDatasetResult(
+        dataset_id=dataset_id,
+        manifest=manifest,
+        partition_paths=partition_paths,
+        row_count=labels_frame.height,
+        base_panel_hash=base_panel_hash,
     )
 
 

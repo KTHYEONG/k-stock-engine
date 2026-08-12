@@ -47,8 +47,12 @@ from src.stocks.data.curation import (
 from src.stocks.data.evidence import load_krx_calendar_snapshot
 from src.stocks.data.labels import (
     LABEL_FEATURE_SET,
+    MULTI_HORIZON_RESIDUAL_DEFINITION,
     RESIDUAL_O2O_PREFIX,
+    SUPPORTED_RESIDUAL_HORIZONS,
+    build_multi_horizon_residual_label_dataset,
     build_residual_o2o_label_dataset,
+    publish_multi_horizon_residual_label_dataset,
     publish_residual_o2o_label_dataset,
 )
 from src.stocks.data.quality import KRXSessionCalendar
@@ -61,6 +65,8 @@ logger = logging.getLogger("stocks.data.research_v2")
 STOCK_ALPHA_V2_FEATURE_SET = "stock_alpha_v2"
 RESIDUAL_LABEL_DEFINITION = f"{RESIDUAL_O2O_PREFIX}5d"
 RESIDUAL_HORIZON_SESSIONS = 5
+MULTI_HORIZON_LABEL_DEFINITION = MULTI_HORIZON_RESIDUAL_DEFINITION
+MULTI_HORIZON_HORIZONS = SUPPORTED_RESIDUAL_HORIZONS
 
 _CERTIFICATION_EVIDENCE = (
     (CatalogKind.INSTRUMENT_MASTER, "master"),
@@ -240,6 +246,144 @@ def materialize_stock_alpha_v2_snapshot(
         request.snapshot_id,
         request.feature_dataset_id,
         request.label_dataset_id,
+        request.source_snapshot_id,
+    )
+    return StockAlphaV2MaterializationResult(
+        snapshot_id=request.snapshot_id,
+        feature_dataset_id=request.feature_dataset_id,
+        label_dataset_id=request.label_dataset_id,
+        feature_content_hash=feature_manifest.content_hash,
+        label_content_hash=label_manifest.content_hash,
+        feature_row_count=feature_result.row_count,
+        label_row_count=label_result.row_count,
+        min_coverage=request.min_coverage,
+        certification=request.certification,
+    )
+
+def materialize_stock_alpha_v3_snapshot(
+    request: StockAlphaV2MaterializationRequest,
+) -> StockAlphaV2MaterializationResult:
+    """Materialize a v3 snapshot with the immutable multi-horizon label panel.
+
+    Mirrors the v2 path (same feature panel, preflight, evidence, and atomic
+    manifest write) but builds and publishes the key-aligned
+    ``residual_o2o_multi_5_10_15d`` label dataset so training can select a
+    (5/10/15)-session cost-amortizing route. The manifest declares the
+    multi-horizon label definition with a five-day control horizon; the source
+    base panel, features, and every existing v2 artifact are never modified.
+    """
+    catalog = CatalogStore(request.catalog_root)
+    source = SnapshotResolver(catalog).resolve(request.source_snapshot_id)
+    if source.base_panel is None:
+        raise ValueError("source snapshot has no base-panel reference")
+    if source.calendar is None:
+        raise ValueError("source snapshot has no calendar reference")
+    base_entry = source.base_panel
+    calendar_entry = source.calendar
+    base_store = ParquetDatasetStore(request.base_root)
+    base_manifest = base_store.read_manifest(base_entry.name)
+    calendar = _load_calendar(request, source, calendar_entry)
+    _preflight(request, catalog, source, base_manifest, calendar)
+
+    allowlist = stock_alpha_v2_allowlist()
+    feature_result = build_stock_alpha_v2_feature_panel(
+        request.base_root,
+        request.feature_root,
+        FeaturePanelRequest(
+            dataset_id=request.feature_dataset_id,
+            base_panel_id=base_entry.name,
+            feature_set=STOCK_ALPHA_V2_FEATURE_SET,
+            generated_time=request.generated_time,
+            certification=request.certification,
+        ),
+        min_coverage=request.min_coverage,
+    )
+    feature_manifest = _re_read_features(request, allowlist, feature_result)
+
+    base_frame = base_store.read(
+        base_entry.name, AssetKind.STOCK, BASE_PANEL_FEATURE_SET,
+        request.generated_time,
+    )
+    labels_frame = build_multi_horizon_residual_label_dataset(base_frame, calendar)
+    label_result = publish_multi_horizon_residual_label_dataset(
+        labels_frame,
+        destination_root=request.label_root,
+        dataset_id=request.label_dataset_id,
+        base_panel_hash=base_manifest.content_hash,
+        calendar_hash=calendar.content_hash,
+        horizons=MULTI_HORIZON_HORIZONS,
+        certification=request.certification,
+        generated_time=request.generated_time,
+    )
+    label_manifest = _re_read_labels_multi_horizon(request, calendar)
+
+    feature_entry = CatalogEntry(
+        kind=CatalogKind.FEATURES,
+        name=request.feature_dataset_id,
+        content_hash=feature_manifest.content_hash,
+        schema_hash=feature_manifest.schema_hash,
+        registered_at=request.generated_time,
+        coverage=CoverageRange(
+            start=feature_manifest.time_start.date(),
+            end=feature_manifest.time_end.date(),
+        ),
+        completeness=EvidenceCompleteness.COMPLETE,
+        path=str(request.feature_root / request.feature_dataset_id),
+        references=(
+            (CatalogKind.BASE_PANEL.value, base_entry.name),
+            (CatalogKind.CALENDAR.value, calendar_entry.name),
+        ),
+        row_count=feature_result.row_count,
+    )
+    label_entry = CatalogEntry(
+        kind=CatalogKind.LABELS,
+        name=request.label_dataset_id,
+        content_hash=label_manifest.content_hash,
+        schema_hash=label_manifest.schema_hash,
+        registered_at=request.generated_time,
+        coverage=CoverageRange(
+            start=label_manifest.time_start.date(),
+            end=label_manifest.time_end.date(),
+        ),
+        completeness=EvidenceCompleteness.COMPLETE,
+        path=str(request.label_root / request.label_dataset_id),
+        references=(
+            (CatalogKind.BASE_PANEL.value, base_entry.name),
+            (CatalogKind.CALENDAR.value, calendar_entry.name),
+        ),
+        row_count=label_result.row_count,
+    )
+    catalog.register(feature_entry)
+    catalog.register(label_entry)
+
+    manifest = build_snapshot_manifest(
+        snapshot_id=request.snapshot_id,
+        certification=request.certification,
+        timing_convention=source.manifest.timing_convention,
+        windows=request.windows,
+        references=_replacement_references(source, feature_entry, label_entry),
+    )
+    _write_manifest_atomic(request.catalog_root, manifest)
+
+    resolved = SnapshotResolver(catalog).resolve(request.snapshot_id)
+    repository = ResearchDataRepository(
+        base_root=request.base_root,
+        feature_root=request.feature_root,
+        label_root=request.label_root,
+    )
+    composed = repository.compose_labeled_training_snapshot(
+        resolved,
+        feature_set=STOCK_ALPHA_V2_FEATURE_SET,
+        decision_time=request.generated_time,
+    )
+    if composed.frame.is_empty():
+        raise ValueError("v3 snapshot composition produced no rows")
+
+    logger.info(
+        "materialized v3 snapshot %s: %s features, multi-horizon labels %s from source %s",
+        request.snapshot_id,
+        request.feature_dataset_id,
+        list(MULTI_HORIZON_HORIZONS),
         request.source_snapshot_id,
     )
     return StockAlphaV2MaterializationResult(
@@ -471,6 +615,103 @@ def _assert_label_availability(
     too_early = joined.filter(pl.col("label_available_time") < exit_open)
     if not too_early.is_empty():
         raise ValueError("v2 label re-read available before exit-session open")
+
+def _re_read_labels_multi_horizon(
+    request: StockAlphaV2MaterializationRequest,
+    calendar: KRXSessionCalendar,
+) -> DatasetManifest:
+    """Re-read the written multi-horizon label dataset and verify its contract."""
+    store = ParquetDatasetStore(request.label_root)
+    manifest = store.read_manifest(request.label_dataset_id)
+    if manifest.label_definition != MULTI_HORIZON_LABEL_DEFINITION:
+        raise ValueError(
+            "v3 label re-read manifest definition "
+            f"{manifest.label_definition!r}, expected {MULTI_HORIZON_LABEL_DEFINITION!r}"
+        )
+    if manifest.label_horizon_sessions != RESIDUAL_HORIZON_SESSIONS:
+        raise ValueError(
+            "v3 label re-read control horizon "
+            f"{manifest.label_horizon_sessions}, expected {RESIDUAL_HORIZON_SESSIONS}"
+        )
+    expected_columns = ["instrument_id", "session"]
+    for h in MULTI_HORIZON_HORIZONS:
+        expected_columns += [
+            f"{RESIDUAL_O2O_PREFIX}{h}d",
+            f"relevance_{h}d",
+            f"label_available_time_{h}d",
+        ]
+    if store.content_columns(request.label_dataset_id) != expected_columns:
+        raise ValueError("v3 label re-read schema mismatch")
+    research = request.windows.research_range
+    frame = store.read_bounded(
+        request.label_dataset_id,
+        AssetKind.STOCK,
+        LABEL_FEATURE_SET,
+        request.generated_time,
+        session_start=research.start,
+        session_end=research.end,
+        columns=expected_columns,
+    )
+    if frame.is_empty():
+        raise ValueError("v3 label re-read produced no rows in the research range")
+    if frame.columns != expected_columns:
+        raise ValueError("v3 label re-read produced unexpected columns")
+    for h in MULTI_HORIZON_HORIZONS:
+        residual = f"{RESIDUAL_O2O_PREFIX}{h}d"
+        relevance = f"relevance_{h}d"
+        if frame.filter(
+            pl.col(residual).is_not_null() & ~pl.col(residual).is_finite()
+        ).height:
+            raise ValueError(f"v3 label re-read contains non-finite residuals in {residual}")
+        relevance_values = [
+            float(value) for value in frame[relevance].to_list() if value is not None
+        ]
+        if relevance_values and (
+            min(relevance_values) < 0 or max(relevance_values) > 4
+        ):
+            raise ValueError(f"v3 label re-read relevance {relevance} outside 0..4")
+    _assert_label_availability_multi_horizon(frame, calendar)
+    return manifest
+
+
+def _assert_label_availability_multi_horizon(
+    frame: pl.DataFrame,
+    calendar: KRXSessionCalendar,
+) -> None:
+    """Every horizon's label must be available at or after its exit-session open."""
+    sessions = list(calendar.sessions)
+    cal = pl.DataFrame(
+        {
+            "_cal_pos": list(range(len(sessions))),
+            "_session_date": sessions,
+        }
+    )
+    base = frame.with_columns(pl.col("session").cast(pl.Date).alias("_session_date")).join(
+        cal, on="_session_date", how="left"
+    )
+    for h in MULTI_HORIZON_HORIZONS:
+        exits = pl.DataFrame(
+            {
+                "_cal_pos": list(range(len(sessions))),
+                "_exit_date": [
+                    sessions[p + 1 + h] if p + 1 + h < len(sessions) else None
+                    for p in range(len(sessions))
+                ],
+            }
+        )
+        exit_open = pl.col("_exit_date").dt.combine(pl.lit(time.min)).dt.replace_time_zone("UTC")
+        joined = base.join(exits, on="_cal_pos", how="left")
+        unknown = joined.filter(pl.col("_exit_date").is_null())
+        if not unknown.is_empty():
+            raise ValueError(
+                f"v3 label re-read decision session outside calendar horizon {h}d"
+            )
+        available = f"label_available_time_{h}d"
+        too_early = joined.filter(pl.col(available) < exit_open)
+        if not too_early.is_empty():
+            raise ValueError(
+                f"v3 label re-read {available} available before exit-session open"
+            )
 
 
 def _replacement_references(
