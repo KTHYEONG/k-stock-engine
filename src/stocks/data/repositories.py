@@ -47,6 +47,17 @@ STOCK_ALPHA_V2_FEATURE_SET = "stock_alpha_v2"
 V2_LABEL_DEFINITION = "residual_o2o_5d"
 V2_LABEL_HORIZON = 5
 V2_REQUIRED_LABEL_COLUMNS = ("residual_o2o_5d", "relevance", "label_available_time")
+MULTI_HORIZON_LABEL_DEFINITION = "residual_o2o_multi_5_10_15d"
+MULTI_HORIZON_HORIZONS = (5, 10, 15)
+MULTI_HORIZON_LABEL_COLUMNS = tuple(
+    column
+    for h in MULTI_HORIZON_HORIZONS
+    for column in (
+        f"residual_o2o_{h}d",
+        f"relevance_{h}d",
+        f"label_available_time_{h}d",
+    )
+)
 
 
 def read_provisional_legacy_panel(
@@ -443,7 +454,9 @@ class ResearchDataRepository:
         )
 
         available_column = (
-            "label_available_time" if "label_available_time" in labels.columns else None
+            "label_available_time_5d"
+            if "label_available_time_5d" in labels.columns
+            else ("label_available_time" if "label_available_time" in labels.columns else None)
         )
         if available_column is not None:
             labels = labels.filter(
@@ -501,15 +514,17 @@ class ResearchDataRepository:
         label_manifest: DatasetManifest,
         decision_time: datetime,
     ) -> None:
-        """Fail closed unless the v2 composition satisfies the frozen contract.
+        """Fail closed unless the v2/v3 composition satisfies the frozen contract.
 
         The feature manifest must declare ``stock_alpha_v2`` with a contract
         hash equal to an allowlist-built contract book; exactly the 34 ordered
-        ``feature__`` columns must be declared and joined; the label manifest
-        must be ``residual_o2o_5d`` with horizon 5 and carry the residual,
-        relevance, and availability columns; and the composed frame must have no
-        empty result, no duplicate ``(instrument_id, session)``, no non-finite
-        label, and relevance within ``0..4``.
+        ``feature__`` columns must be declared and joined. The label manifest
+        must be either the single-horizon ``residual_o2o_5d`` (horizon 5) or the
+        multi-horizon ``residual_o2o_multi_5_10_15d`` panel whose ordered
+        per-horizon residual/relevance/availability columns all pass the label
+        contract. The composed frame must have no empty result, no duplicate
+        ``(instrument_id, session)``, and no label unavailable at
+        ``decision_time``.
         """
         if feature_manifest.feature_set != STOCK_ALPHA_V2_FEATURE_SET:
             raise ValueError(
@@ -545,11 +560,27 @@ class ResearchDataRepository:
                 f"v2 composition feature columns do not match the ordered allowlist: "
                 f"got {feature_columns}"
             )
-        if label_manifest.label_definition != V2_LABEL_DEFINITION:
-            raise ValueError(
-                f"v2 composition requires label definition {V2_LABEL_DEFINITION!r}, "
-                f"got {label_manifest.label_definition!r}"
+        if label_manifest.label_definition == V2_LABEL_DEFINITION:
+            self._assert_single_horizon_labels(
+                composed, label_manifest, decision_time,
             )
+        elif label_manifest.label_definition == MULTI_HORIZON_LABEL_DEFINITION:
+            self._assert_multi_horizon_labels(
+                composed, label_manifest, decision_time,
+            )
+        else:
+            raise ValueError(
+                f"v2 composition unsupported label definition "
+                f"{label_manifest.label_definition!r}"
+            )
+
+    def _assert_single_horizon_labels(
+        self,
+        composed: pl.DataFrame,
+        label_manifest: DatasetManifest,
+        decision_time: datetime,
+    ) -> None:
+        """Fail closed unless the v2 single-horizon label contract holds."""
         if label_manifest.label_horizon_sessions != V2_LABEL_HORIZON:
             raise ValueError(
                 f"v2 composition requires label horizon {V2_LABEL_HORIZON}, "
@@ -592,6 +623,76 @@ class ResearchDataRepository:
         )
         if not unavailable.is_empty():
             raise ValueError("v2 composition joined an unavailable label row")
+
+    def _assert_multi_horizon_labels(
+        self,
+        composed: pl.DataFrame,
+        label_manifest: DatasetManifest,
+        decision_time: datetime,
+    ) -> None:
+        """Fail closed unless the v3 multi-horizon label contract holds.
+
+        Exactly the ordered ``(residual, relevance, availability)`` column
+        triples for each supported horizon must be present; every residual must
+        be finite, every relevance must be integer ``0..4``, every availability
+        column must be non-null, and no row may carry an availability time
+        after ``decision_time``. Rows without any label value are excluded by
+        the inner join before this assertion runs.
+        """
+        if label_manifest.label_horizon_sessions != V2_LABEL_HORIZON:
+            raise ValueError(
+                "v3 composition requires control label horizon "
+                f"{V2_LABEL_HORIZON}, got {label_manifest.label_horizon_sessions}"
+            )
+        present = [c for c in MULTI_HORIZON_LABEL_COLUMNS if c in composed.columns]
+        if present != list(MULTI_HORIZON_LABEL_COLUMNS):
+            raise ValueError(
+                "v3 composition requires the ordered multi-horizon label columns "
+                f"{list(MULTI_HORIZON_LABEL_COLUMNS)}, missing/extra {present}"
+            )
+        duplicates = (
+            composed.group_by(["instrument_id", "session"])
+            .len()
+            .filter(pl.col("len") > 1)
+        )
+        if not duplicates.is_empty():
+            raise ValueError("v3 composition has duplicate (instrument_id, session) rows")
+        for h in MULTI_HORIZON_HORIZONS:
+            residual = f"residual_o2o_{h}d"
+            relevance = f"relevance_{h}d"
+            available = f"label_available_time_{h}d"
+            non_finite = composed.filter(
+                pl.col(residual).is_not_null() & ~pl.col(residual).is_finite()
+            )
+            if not non_finite.is_empty():
+                raise ValueError(
+                    f"v3 composition contains non-finite residual labels in {residual}"
+                )
+            relevance_values = [
+                float(value)
+                for value in composed[relevance].to_list()
+                if value is not None
+            ]
+            if relevance_values and (
+                min(relevance_values) < 0 or max(relevance_values) > 4
+            ):
+                raise ValueError(
+                    f"v3 composition relevance {relevance} must be integer 0..4"
+                )
+            if composed[available].null_count():
+                raise ValueError(
+                    f"v3 composition joined a row without {available}"
+                )
+        unavailable = composed.filter(
+            pl.any_horizontal(
+                pl.col(f"label_available_time_{h}d") > decision_time
+                for h in MULTI_HORIZON_HORIZONS
+            )
+        )
+        if not unavailable.is_empty():
+            raise ValueError(
+                "v3 composition joined a row with an unavailable horizon label"
+            )
 
     def compose_training_snapshot(
         self,
