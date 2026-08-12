@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_BACKTEST_PERFORMANCE_REMEDIATION",
+      "date": "2026-08-12",
+      "adr_id": "ADR_20260812_ML_BACKTEST_PERFORMANCE_REMEDIATION",
+      "domain": "stocks",
+      "title": "ML backtest performance remediation",
+      "why": "Rank-IC 신호와 비용 후 경제적 성과의 차이를 최신 80-trial 실행 결과로 기록함",
+      "resolution": "최신 net-alpha calibrated ML 실행 결과만 back-res 문서에 수치 중심으로 동기화하고 Rank-IC 해석을 추가함",
+      "impact": "문서가 최신 NO_TRADE 판정과 비용·bootstrap 근거만 반영하며 과거 실행 결과는 제거됨"
+    },
+    {
       "task_id": "backtest_bottleneck_no_trade_improvement",
       "date": "2026-08-12",
       "adr_id": "ADR_20260812_backtest_bottleneck_no_trade_improvement",
