@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260812_sub10_81trial_refit_pipeline",
+      "date": "2026-08-12",
+      "adr_id": "ADR_20260812_20260812_sub10_81trial_refit_pipeline",
+      "domain": "stocks",
+      "title": "Sub-10-minute 81-trial refit pipeline",
+      "why": "The latest 81-trial run completed in 16:07 with 7,613 MiB external RSS; full refits were serial and eager fold/replay caches overlapped.",
+      "resolution": "Implemented measured LightGBM thread resolution, prepared scoring telemetry, and resource-aware refit pipeline while preserving deterministic ranking and fail-closed economic selection.",
+      "impact": "Synchronized ADR/task/code-map indexes and removed temporary spec and benchmark artifacts before production verification."
+    },
+    {
       "task_id": "TASK_20260812_ten_minute_81trial_throughput",
       "date": "2026-08-12",
       "adr_id": "ADR_20260812_20260812_ten_minute_81trial_throughput",
