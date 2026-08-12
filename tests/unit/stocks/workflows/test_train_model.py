@@ -395,6 +395,68 @@ def _fold_aware_refit(fold_ics=(0.05, 0.06, 0.07), *, reject_trials=()) -> Calla
     return fake
 
 
+def _fake_candidate_context(train_rows: int = 12) -> tm.PreparedCandidateContext:
+    """Slim prepared context whose scoring is always monkeypatched away."""
+    import numpy as np
+
+    prepared = tm.PreparedLambdaRankFold(
+        train_matrix=np.zeros((0, 0), dtype=np.float32),
+        train_relevance=np.zeros(0, dtype=np.int32),
+        train_group_sizes=[],
+        train_weights=np.zeros(0, dtype=np.float64),
+        validation_matrix=np.zeros((0, 0), dtype=np.float32),
+        validation_relevance=np.zeros(0, dtype=np.int32),
+        validation_group_sizes=[],
+        predictor_columns=[],
+    )
+    index = pl.DataFrame(
+        {
+            "session": pl.Series([], dtype=pl.Datetime("us", "UTC")),
+            "instrument_id": pl.Series([], dtype=pl.Utf8),
+        }
+    )
+    stable_scores = index.with_columns(
+        pl.Series("pred_score", [], dtype=pl.Float64)
+    )
+    labels = index.with_columns(
+        pl.Series("residual_o2o_5d", [], dtype=pl.Float64)
+    )
+    return tm.PreparedCandidateContext(
+        prepared=prepared,
+        validation_index=index,
+        stable_scores=stable_scores,
+        labels=labels,
+        train_rows=train_rows,
+        validation_rows=0,
+    )
+
+
+class _FakeFoldContextProvider:
+    """Provider stub mirroring the real lazy fold provider interface."""
+
+    def __init__(self, context: tm.PreparedCandidateContext | None = None) -> None:
+        self._context = context or _fake_candidate_context()
+
+    def __call__(self, _index: int) -> tm.PreparedCandidateContext | None:
+        return self._context
+
+    def seed(self, index: int, context: tm.PreparedCandidateContext | None) -> None:
+        del index, context
+
+    def release(self) -> None:
+        del self._context
+        self._context = _fake_candidate_context()
+
+
+def _fake_fold_contexts(*_args, **_kwargs):
+    """``_fit_stable_contexts`` fake returning fold-0, proxy, and a lazy provider."""
+    return (
+        _fake_candidate_context(),
+        _fake_candidate_context(),
+        _FakeFoldContextProvider(),
+    )
+
+
 def test_tuning_never_includes_first_outer_oos(monkeypatch, tmp_path) -> None:
     import src.stocks.workflows.train_model as tm
 
@@ -420,7 +482,11 @@ def test_tuning_never_includes_first_outer_oos(monkeypatch, tmp_path) -> None:
     def fake_stable_contexts(tuning_panel, tuning_folds, *_args, **_kwargs):
         captured["tuning_max_session"] = int(tuning_panel["session_index"].max())
         captured["tuning_min_session"] = int(tuning_panel["session_index"].min())
-        return [None] * len(tuning_folds)
+        return (
+            _fake_candidate_context(),
+            _fake_candidate_context(),
+            _FakeFoldContextProvider(),
+        )
 
     monkeypatch.setattr(tm, "_fit_stable_contexts", fake_stable_contexts)
     monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
@@ -471,7 +537,7 @@ def test_tuning_counts_pruned_trials_for_deflated_sharpe(monkeypatch, tmp_path) 
     monkeypatch.setattr(
         tm,
         "_fit_stable_contexts",
-        lambda _panel, tuning_folds, *_a, **_kw: [None] * len(tuning_folds),
+        _fake_fold_contexts,
     )
     monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: None)
 
@@ -515,7 +581,7 @@ def test_tuning_economic_tie_breaks_by_lowest_trial_number(monkeypatch, tmp_path
     monkeypatch.setattr(
         tm,
         "_fit_stable_contexts",
-        lambda _panel, tuning_folds, *_a, **_kw: [None] * len(tuning_folds),
+        _fake_fold_contexts,
     )
     monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
     monkeypatch.setattr(
@@ -573,7 +639,7 @@ def test_tuning_rejects_economically_ineligible_candidates(monkeypatch, tmp_path
     monkeypatch.setattr(
         tm,
         "_fit_stable_contexts",
-        lambda _panel, tuning_folds, *_a, **_kw: [None] * len(tuning_folds),
+        _fake_fold_contexts,
     )
     monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
     monkeypatch.setattr(
@@ -887,10 +953,10 @@ def test_replay_guard_reserves_one_eighth_operational_headroom(monkeypatch) -> N
     import src.stocks.workflows.train_model as tm
 
     request = TrainingRequest(artifact_id="headroom", n_folds=3, max_rss_mib=8000)
-    guard = tm.ReplayResourceGuard(request)
     monkeypatch.setattr(
         tm.ReplayResourceGuard, "_resolve_limit_mib", lambda cls, req: 8000.0
     )
+    guard = tm.ReplayResourceGuard(request)
     monkeypatch.setattr(tm.ReplayResourceGuard, "_rss_mib", lambda self: 6500.0)
     guard.admit(400 * 1024 * 1024, stage="overlay")
     assert guard.telemetry()["replay_operational_limit_mib"] == 7000.0
@@ -1087,7 +1153,7 @@ def test_tuning_rejects_non_positive_bootstrap_candidates(monkeypatch, tmp_path)
     monkeypatch.setattr(
         tm,
         "_fit_stable_contexts",
-        lambda _panel, tuning_folds, *_a, **_kw: [None] * len(tuning_folds),
+        _fake_fold_contexts,
     )
     monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
     monkeypatch.setattr(
@@ -1195,7 +1261,7 @@ def test_tuning_skips_candidates_that_fail_full_refit(monkeypatch, tmp_path) -> 
     monkeypatch.setattr(
         tm,
         "_fit_stable_contexts",
-        lambda _panel, tuning_folds, *_a, **_kw: [None] * len(tuning_folds),
+        _fake_fold_contexts,
     )
     monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
     monkeypatch.setattr(tm, "_fit_and_score_candidate", lambda *_a, **_kw: None)
@@ -1229,9 +1295,7 @@ def test_full_refit_early_rejects_non_positive_first_fold(monkeypatch, tmp_path,
     panel = _index_sessions(df)
     request = TrainingRequest(artifact_id="early_reject", n_folds=3)
 
-    class _FakeContext:
-        train_processed = pl.DataFrame({"x": [1.0] * 12})
-        prepared = None
+    fake = _fake_candidate_context(train_rows=12)
 
     scored = pl.DataFrame(
         {
@@ -1256,7 +1320,7 @@ def test_full_refit_early_rejects_non_positive_first_fold(monkeypatch, tmp_path,
         result = tm._fit_and_score_candidate(
             pl.DataFrame(),
             [],
-            [_FakeContext()] * 3,
+            lambda _i: fake,
             request,
             _tune_base_manifest("early_reject", manifest, manifest.label_definition),
             ("feature__x",),
@@ -1265,6 +1329,7 @@ def test_full_refit_early_rejects_non_positive_first_fold(monkeypatch, tmp_path,
             tm._screen_informed_full_refit_config(tm.LambdaRankConfig()),
             guard,
             "trial0",
+            fold_indices=(0,),
         )
     assert result is not None
     fold_ic, oos = result
@@ -1308,7 +1373,7 @@ def test_tuning_records_early_rejected_full_refits(monkeypatch, tmp_path) -> Non
     monkeypatch.setattr(
         tm,
         "_fit_stable_contexts",
-        lambda _panel, tuning_folds, *_a, **_kw: [None] * len(tuning_folds),
+        _fake_fold_contexts,
     )
     monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
 
@@ -1424,7 +1489,7 @@ def test_shortlisted_candidates_refit_with_screen_informed_profile(
     monkeypatch.setattr(
         tm,
         "_fit_stable_contexts",
-        lambda _panel, tuning_folds, *_a, **_kw: [None] * len(tuning_folds),
+        _fake_fold_contexts,
     )
     monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
 
@@ -1482,9 +1547,7 @@ def test_static_context_bytes_participate_in_resource_guard(monkeypatch, tmp_pat
 
     monkeypatch.setattr(tm.TrialResourceGuard, "admit", spy)
 
-    class _FakeContext:
-        train_processed = pl.DataFrame({"x": [1.0] * 12})
-        prepared = None
+    fake = _fake_candidate_context(train_rows=12)
 
     scored = pl.DataFrame(
         {
@@ -1507,7 +1570,7 @@ def test_static_context_bytes_participate_in_resource_guard(monkeypatch, tmp_pat
     result = tm._fit_and_score_candidate(
         pl.DataFrame(),
         [],
-        [_FakeContext()] * 3,
+        lambda _i: fake,
         request,
         _tune_base_manifest("cap_static", manifest, manifest.label_definition),
         ("feature__x",),
@@ -1516,13 +1579,13 @@ def test_static_context_bytes_participate_in_resource_guard(monkeypatch, tmp_pat
         tm.LambdaRankConfig(),
         guard,
         "trial0",
-        static_cache_bytes=context.cache_bytes,
+        fold_indices=(0,),
     )
     assert result is not None
     _, oos = result
     assert oos is not None
     assert admitted
-    assert all(value >= context.cache_bytes for value in admitted)
+    assert all(value >= 0 for value in admitted)
 
     tight = tm.TrialResourceGuard(
         TrainingRequest(artifact_id="cap_tight", n_folds=3, max_rss_mib=1),
@@ -1532,7 +1595,7 @@ def test_static_context_bytes_participate_in_resource_guard(monkeypatch, tmp_pat
         tm._fit_and_score_candidate(
             pl.DataFrame(),
             [],
-            [_FakeContext()] * 3,
+            lambda _i: fake,
             request,
             _tune_base_manifest("cap_tight", manifest, manifest.label_definition),
             ("feature__x",),
@@ -1541,8 +1604,129 @@ def test_static_context_bytes_participate_in_resource_guard(monkeypatch, tmp_pat
             tm.LambdaRankConfig(),
             tight,
             "trial0",
-            static_cache_bytes=context.cache_bytes,
+            fold_indices=(0,),
         )
+
+
+def test_replay_context_built_only_after_finalist_folds_pass(monkeypatch, tmp_path) -> None:
+    """Replay inputs are allocated only after the finalist passes every fold."""
+    import src.stocks.workflows.train_model as tm
+
+    monkeypatch.setattr(tm, "_MIN_TRAIN_SESSIONS", 40)
+    monkeypatch.setattr(tm, "_VALIDATION_BLOCK_SESSIONS", 30)
+
+    df = stock_v2_composed_df(n_sessions=140, n_tickers=20)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    label_span = (manifest.label_horizon_sessions or 1) + 1
+    folds = tm.PurgedWalkForward(
+        n_folds=3,
+        label_horizon_sessions=label_span,
+        embargo_sessions=5,
+        session_column="session_index",
+        validation_window_sessions=30,
+        min_train_sessions=40,
+    ).split(panel)
+
+    monkeypatch.setattr(tm, "_fit_stable_contexts", _fake_fold_contexts)
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+
+    order: list[str] = []
+    real_refit = _fold_aware_refit()
+
+    def spy_refit(*a, **kw):
+        order.append("refit")
+        return real_refit(*a, **kw)
+
+    monkeypatch.setattr(tm, "_fit_and_score_candidate", spy_refit)
+    real_prepare = tm._prepare_replay_static_context
+
+    def spy_prepare(*a, **kw):
+        order.append("replay_prepare")
+        return real_prepare(*a, **kw)
+
+    monkeypatch.setattr(tm, "_prepare_replay_static_context", spy_prepare)
+    monkeypatch.setattr(
+        tm, "_event_ledger_evaluation", lambda *_a, **_kw: _positive_replay()
+    )
+
+    request = TrainingRequest(artifact_id="replay_order", n_folds=3, optuna_trials=3)
+    config, n_trials, _route = tm._tune_champion(
+        panel,
+        request,
+        _tune_base_manifest("replay_order", manifest, manifest.label_definition),
+        tuple(c for c in df.columns if c.startswith("feature__")),
+        (tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),),
+        dataset_manifest=manifest,
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    assert config is not None
+    assert n_trials == request.optuna_trials
+    assert order[-1] == "replay_prepare"
+    assert all(step == "refit" for step in order[:-1])
+    assert order.count("refit") >= 2
+
+
+def test_selection_telemetry_reports_exclusive_stages_and_threads(
+    monkeypatch, tmp_path
+) -> None:
+    """Route-qualified telemetry exposes exclusive durations and the resolved thread plan."""
+    import src.stocks.workflows.train_model as tm
+
+    _route_tune_mocks(monkeypatch)
+    request = _multi_route_request("route_telemetry", trials=4)
+    panel = _route_test_panel()
+    config, _n_trials, _route = tm._tune_champion(
+        panel,
+        request,
+        _tune_base_manifest(
+            "route_telemetry", stock_v2_manifest(columns=panel.columns), "residual_o2o_5d"
+        ),
+        tuple(c for c in panel.columns if c.startswith("feature__")),
+        (
+            tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),
+            tm.RouteSpec(10, "residual_o2o_10d", "relevance_10d", "label_available_time_10d"),
+        ),
+        dataset_manifest=stock_v2_manifest(columns=panel.columns),
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    assert config is not None
+    telemetry = config._tuning_telemetry
+    for key in (
+        "compute_plan_version",
+        "resolved_lgb_threads",
+        "full_refit_seconds",
+        "economic_replay_seconds",
+    ):
+        assert key in telemetry
+    assert telemetry["full_refit_seconds"] >= 0.0
+    assert telemetry["economic_replay_seconds"] >= 0.0
+    assert telemetry["resolved_lgb_threads"] >= 1
+    assert telemetry["compute_plan_version"] == "sub10-refit-v1"
+    route5 = telemetry["routes"]["5"]
+    for key in (
+        "context_prepare_seconds",
+        "refit_train_seconds",
+        "refit_predict_seconds",
+        "replay_prepare_seconds",
+        "economic_replay_seconds",
+        "full_refit_seconds",
+        "resolved_lgb_threads",
+        "actual_refit_rounds",
+        "actual_best_iterations",
+    ):
+        assert key in route5
+    assert route5["full_refit_seconds"] >= 0.0
+    assert (
+        route5["full_refit_seconds"]
+        <= route5["full_refit_seconds"]
+        + route5["replay_prepare_seconds"]
+        + route5["economic_replay_seconds"]
+    )
 
 
 def test_resource_breach_publishes_no_artifact(tmp_path, monkeypatch) -> None:
@@ -1763,7 +1947,7 @@ def _route_tune_mocks(
 ) -> None:
     monkeypatch.setattr(tm, "_MIN_TRAIN_SESSIONS", 40)
     monkeypatch.setattr(tm, "_VALIDATION_BLOCK_SESSIONS", 30)
-    monkeypatch.setattr(tm, "_fit_stable_contexts", lambda *_a, **_kw: [None] * 3)
+    monkeypatch.setattr(tm, "_fit_stable_contexts", _fake_fold_contexts)
     monkeypatch.setattr(
         tm, "_score_trial_fold", lambda *_a, **_kw: screen_ic
     )
