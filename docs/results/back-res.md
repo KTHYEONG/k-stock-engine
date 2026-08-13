@@ -537,3 +537,143 @@ telemetry이며, 투자 성과 개선 여부는 판단할 수 없다.
 - [Metrics](../../data/artifacts/stocks/lambdarank_v2_20260813_v5_throughput_latest/metrics.json)
 - [Manifest](../../data/artifacts/stocks/lambdarank_v2_20260813_v5_throughput_latest/manifest.json)
 - 실행 로그: `scratch/v5_throughput_latest_run.log` (sync cleanup 대상)
+
+---
+
+# 2026-08-13 V5 candidate-recovery ML 실행 결과
+
+## 결론
+
+candidate-recovery 구현 후 production snapshot에서 81개 trial을 실행했다.
+기존의 `81/81 fold_none`과 달리 **79개 trial이 usable screen evidence로
+완료**됐고, 2개만 `no_filled_orders` hard-prune 됐다. 다만 confirmation
+단계에서 통과한 후보가 0개여서 full refit과 exact economic replay는
+실행되지 않았고 최종 결과는 보수적인 `NO_TRADE`다.
+
+이번 실행은 screen evidence 보존과 failure attribution은 개선했지만,
+투자 성과 개선 자체를 입증한 실행은 아니다. 최종 artifact의 수익률,
+IR, MDD는 **0이 아니라 미실행/산출 불가**다.
+
+## 실행 식별자 및 자원
+
+| 항목 | 값 |
+|---|---:|
+| Artifact | `lambdarank_v2_20260813_candidate_recovery_latest` |
+| Snapshot | `research_provisional_20160104_20260812_cost_master_v3_mh2` |
+| Mode | `research` |
+| Selection policy | `economic-selection-v6-confirmed-recovery` |
+| Compute plan | `sub10-refit-v1` |
+| 실행 구간 | `20:38:36 ~ 20:50:43` (KST) |
+| 총 실행 시간 | **약 727.1초 (12분 7초)** |
+| Terminal trials | **81** |
+| Usable / hard-pruned | **79 / 2** |
+| Screen 시간 | **357.551초** |
+| Full refit 시간 | `0.0초` |
+| Economic replay 시간 | `0.0초` |
+| Baseline / peak RSS | **1,699.746 / 6,329.012 MiB** |
+| RSS limit | `8,000 MiB` |
+| RSS headroom | **1,670.988 MiB** |
+| LightGBM threads | `4` |
+| Cache bytes | `369,804,132` |
+| Proxy session stride | `6` |
+
+## Route별 funnel 결과
+
+| Route | Terminal | Screen usable | Hard-pruned | Confirmation 시도 | Confirmation 통과 | Best fold-0 lower bound | Screen 초 | Peak RSS MiB |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 5 sessions | 27 | 27 | 0 | 6 | 0 | **-0.00177818** | 151.223 | 4,350.418 |
+| 10 sessions | 27 | 27 | 0 | 6 | 0 | **-0.00253505** | 112.306 | 6,329.012 |
+| 15 sessions | 27 | 25 | 2 | 6 | 0 | **-0.00455169** | 94.022 | 6,329.012 |
+| **합계** | **81** | **79** | **2** | **18** | **0** | — | **357.551** | **6,329.012** |
+
+모든 route에서 `strict_shortlisted_trials=0`,
+`recovery_shortlisted_trials=0`, `economically_eligible_trials=0`이었다.
+따라서 candidate evidence row, promoted trial, all-positive finalist는
+생성되지 않았다.
+
+## ML search 상세
+
+최종 manifest는 champion을 선택하지 않았으므로 selected blend weight는
+없다. 대신 81 terminal trial에서 탐색된 LambdaRank blend weight 분포는
+다음과 같다.
+
+| LambdaRank weight | StableRank weight | Trial 수 |
+|---:|---:|---:|
+| 0.25 | 0.75 | 21 |
+| 0.50 | 0.50 | 28 |
+| 0.75 | 0.25 | 32 |
+
+모델 공통 설정은 LambdaRank objective, NDCG metric, seed `42`, label gain
+`0,1,3,7,15`, eval-at `10,20`, 34개 feature, `num_leaves=31`, learning
+rate `0.03`, 최대 5,000 round, early stopping 200이다. 최종 manifest의
+model type은 `lambdarank_blend`, label은 `residual_o2o_5d`이며
+`no_trade=true`다.
+
+## Proxy 데이터 보존 및 screen 자원
+
+| Route | Proxy train rows | Proxy validation rows | Fold retention |
+|---:|---:|---:|---:|
+| 5 sessions | 11,886 | 225,160 | fold 0/1/2 모두 **100%** |
+| 10 sessions | 11,886 | 226,660 | fold 0/1/2 모두 **100%** |
+| 15 sessions | 11,886 | 228,211 | fold 0/1/2 모두 **100%** |
+
+모든 route에서 fold별 `labeled_rows == retained_rows`였다. 데이터 누락이나
+prepared matrix retention 손실이 이번 NO_TRADE의 원인은 아니다.
+
+## Screen failure 및 no-trade telemetry
+
+| Route | Hard failure reason | Screen no-trade reason counts |
+|---:|---|---|
+| 5 sessions | 없음 | `constraint:insufficient covariance data=1,015`, `no-feasible-allocation=1,342` |
+| 10 sessions | 없음 | `constraint:insufficient covariance data=494`, `no-feasible-allocation=865` |
+| 15 sessions | `no_filled_orders=2` | `constraint:insufficient covariance data=134`, `no-feasible-allocation=859` |
+
+`constraint:insufficient covariance data`와 `no-feasible-allocation`은
+screen 내부 decision 단위의 현금/배분 telemetry이며, 전체 trial 실패 수와
+동일한 의미가 아니다. 15-session route의 2개 trial만 실제로 fill이 없어
+hard-prune 됐다.
+
+## 최종 성과 및 gate 상태
+
+| 항목 | 결과 |
+|---|---|
+| Promoted / no_trade | `false / true` |
+| Folds evaluated | `0` |
+| Median Rank-IC | `0.0` (champion 미선정 sentinel) |
+| Promotion reason | `no-champion-trial` |
+| Selection status | `no_complete_screen_candidate` |
+| Confirmation passed | `0 / 18` |
+| Economically eligible trials | `0` |
+| Full refit / exact replay | **미실행** |
+| Ledger / stress metrics | `{}` / `null` |
+| Orders, fills, return, IR, max DD, turnover | **미실행 / 산출 불가** |
+| Gate | `passed=false` |
+
+이번 실행은 final economic gate에 도달할 후보를 만들지 못했으므로
+백테스팅 성과를 이전 artifact와 직접 비교할 수 없다. 비교 가능한 개선은
+`fold_none` 은폐를 제거해 79개 usable candidate를 보존한 점과 blend weight,
+hard failure, no-trade reason을 artifact telemetry로 남긴 점이다.
+
+## 해석 및 다음 개선 포인트
+
+1. **screen evidence 경로는 개선됐다.** 기존 throughput 실행의
+   `screened=0/pruned=81`에서 이번에는 `screened=79/pruned=2`가 됐다.
+   음수 lower bound를 hard-invalid로 오인하지 않고 confirmation 후보로
+   다룬 설계가 의도대로 동작했다.
+2. **경제적 후보 회복은 아직 실패했다.** 18개 confirmation이 모두 탈락해
+   full refit으로 진행되지 않았다. 세 route의 최고 fold-0 lower bound가
+   모두 음수인 것이 직접적인 원인이다.
+3. **데이터·메모리 문제는 아니다.** fold retention은 100%였고 peak RSS는
+   8,000 MiB 제한보다 낮았다. 다음 분석은 confirmation 탈락의 fold별
+   lower bound, Rank-IC, filled orders, calibration gate를 후보 단위로
+   비교하는 데 집중해야 한다.
+4. **ML blend 탐색만으로는 부족했다.** 0.25/0.50/0.75 세 blend가 모두
+   탐색됐지만 양수 screen candidate가 없었다. 비용·covariance feasibility와
+   causal calibration이 실제 포트폴리오 진입을 제한하는 비중을 별도로
+   분석해야 한다.
+
+## 산출물
+
+- [Metrics](../../data/artifacts/stocks/lambdarank_v2_20260813_candidate_recovery_latest/metrics.json)
+- [Manifest](../../data/artifacts/stocks/lambdarank_v2_20260813_candidate_recovery_latest/manifest.json)
+- 실행 로그: `logs/scratch/v5_candidate_recovery_latest.log`

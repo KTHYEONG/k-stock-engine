@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_V5_CANDIDATE_RECOVERY",
+      "date": "2026-08-13",
+      "adr_id": "ADR_20260813_STOCK_V5_CANDIDATE_RECOVERY",
+      "domain": "stocks",
+      "title": "V5 candidate recovery and blend search",
+      "why": "The latest V5 run produced 81 fold-none prunes despite fitted models and filled orders; a spec-defined recovery funnel is now implemented and independently verified.",
+      "resolution": "Registered the v6 confirmed-recovery policy, configurable LambdaRank blend weights, compact screen evidence, bounded fold confirmation, recovery shortlist, and reason-level telemetry while preserving final economic gates.",
+      "impact": "Negative screen evidence is no longer confused with hard-invalid failure; a bounded set of candidates can reach full economic validation without relaxing costs, bootstrap, DSR, holdout, or multiplicity controls."
+    },
+    {
       "task_id": "TASK_STOCK_V5_THROUGHPUT_RESULT",
       "date": "2026-08-13",
       "adr_id": "ADR_20260813_STOCK_V5_THROUGHPUT_RESULT",
