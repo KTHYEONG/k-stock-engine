@@ -118,3 +118,48 @@ def test_vectorized_winsor_quantiles_match_numpy_contract() -> None:
     assert quantiles["feature__c"][0] == pytest.approx(expected_c[0])
     assert quantiles["feature__c"][1] == pytest.approx(expected_c[1])
     assert tuple(quantiles) == columns
+
+
+def test_apply_v2_transforms_emits_rank_sector_rank_and_missing_indicators() -> None:
+    from src.stocks.research.features import apply_v2_transforms
+
+    frame = pl.DataFrame(
+        {
+            "session": [
+                datetime(2024, 1, 1, tzinfo=UTC),
+                datetime(2024, 1, 1, tzinfo=UTC),
+                datetime(2024, 1, 1, tzinfo=UTC),
+                datetime(2024, 1, 2, tzinfo=UTC),
+                datetime(2024, 1, 2, tzinfo=UTC),
+                datetime(2024, 1, 2, tzinfo=UTC),
+            ],
+            "sector": ["S1", "S1", "S2", "S1", "S1", "S2"],
+            "feature__x": [1.0, 2.0, None, 3.0, None, 4.0],
+            "feature__y": [0.5, None, 0.7, 0.9, 1.1, None],
+        }
+    )
+    transformed = apply_v2_transforms(
+        frame,
+        ("feature__x", "feature__y"),
+        winsor_quantiles={
+            "feature__x": (0.0, 4.0),
+            "feature__y": (0.0, 1.0),
+        },
+    )
+    for name in (
+        "feature__x__rank",
+        "feature__x__sector_rank",
+        "feature__x__missing",
+        "feature__y__rank",
+        "feature__y__sector_rank",
+        "feature__y__missing",
+    ):
+        assert name in transformed.columns
+    assert transformed["feature__x__missing"].to_list() == [0.0, 0.0, 1.0, 0.0, 1.0, 0.0]
+    assert transformed["feature__y__missing"].to_list() == [0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    assert transformed["feature__x__missing"].dtype == pl.Float32
+    assert transformed["feature__x"].to_list() == [1.0, 2.0, None, 3.0, None, 4.0]
+    rank_x = transformed["feature__x__rank"].to_list()
+    assert rank_x[2] == pytest.approx(0.5)
+    assert rank_x[4] == pytest.approx(0.5)
+    assert transformed["feature__x__rank"].dtype == pl.Float32

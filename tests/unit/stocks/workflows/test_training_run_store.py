@@ -156,7 +156,7 @@ def test_resumed_tune_skips_completed_screen_and_reuses_champion(
         "_fit_stable_contexts",
         lambda _p, _tf, *_a, **_kw: (
             _fake_candidate_context(),
-            _fake_candidate_context(),
+            tuple(_fake_candidate_context() for _ in _tf),
             type("_P", (), {"__call__": lambda self, _i: _fake_candidate_context(), "seed": lambda *a, **k: None, "release": lambda self: None})(),
         ),
     )
