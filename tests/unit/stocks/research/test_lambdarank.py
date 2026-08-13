@@ -83,6 +83,44 @@ def test_lambdarank_config_objective_and_gain_contract() -> None:
 def test_blend_weights_are_frozen() -> None:
     assert LAMBDARANK_WEIGHT == 0.50
     assert STABLE_WEIGHT == 0.50
+    assert LambdaRankConfig().lambdarank_weight == 0.50
+    assert LambdaRankConfig().lambdarank_weight == LAMBDARANK_WEIGHT
+
+
+def test_blend_weight_validation_and_manifest_provenance() -> None:
+    with pytest.raises(ValueError, match="lambdarank_weight"):
+        LambdaRankConfig(lambdarank_weight=-0.1)
+    with pytest.raises(ValueError, match="lambdarank_weight"):
+        LambdaRankConfig(lambdarank_weight=1.1)
+    for weight in (0.0, 0.25, 0.5, 0.75, 1.0):
+        config = LambdaRankConfig(lambdarank_weight=weight)
+        assert config.lambdarank_weight == weight
+
+    df = build_panel()
+    feature_columns = v2_feature_columns(df)
+    train = df.filter(pl.col("session_index") < 30)
+    val = df.filter(pl.col("session_index") >= 30)
+    quantiles = fit_v2_winsor_quantiles(train, feature_columns)
+    train_t = apply_v2_transforms(train, feature_columns, winsor_quantiles=quantiles)
+    val_t = apply_v2_transforms(val, feature_columns, winsor_quantiles=quantiles)
+    model = LambdaRankBlendModel(
+        make_manifest(),
+        stock_alpha_v2_allowlist(),
+        RESIDUAL_O2O_LABEL,
+        config=LambdaRankConfig(learning_rate=0.03, num_leaves=31, lambdarank_weight=0.75),
+        session_column="session",
+        relevance_column=RELEVANCE_COLUMN,
+    )
+    model.fit(train_t, val_t)
+    assert model.no_trade is False
+    predict_input = val_t.drop(
+        [RESIDUAL_O2O_LABEL, RELEVANCE_COLUMN, "label_available_time"]
+    )
+    scored = model.predict(predict_input)
+    assert scored["pred_score"].null_count() == 0
+    params = model.manifest().params
+    assert params["blend_weight_lambdarank"] == "0.750000"
+    assert params["blend_weight_stable"] == "0.250000"
 
 
 def test_model_fits_and_blends_percentile_ranks() -> None:

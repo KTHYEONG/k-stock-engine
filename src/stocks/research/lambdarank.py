@@ -33,7 +33,7 @@ from src.stocks.research.models import (
 logger = logging.getLogger("stocks.research.lambdarank")
 
 LAMBDARANK_WEIGHT = 0.50
-STABLE_WEIGHT = 0.50
+STABLE_WEIGHT = 1.0 - LAMBDARANK_WEIGHT
 _V2_FEATURE_PREFIX = "feature__"
 
 _FULL_REFIT_ROUND_CAP = 900
@@ -165,6 +165,7 @@ class LambdaRankConfig:
         min_group_size: int = MIN_LAMBDARANK_GROUP,
         half_life_sessions: int = 504,
         num_threads: int = 1,
+        lambdarank_weight: float = LAMBDARANK_WEIGHT,
     ):
         if objective != "lambdarank":
             raise ValueError("objective must be lambdarank")
@@ -186,6 +187,8 @@ class LambdaRankConfig:
             raise ValueError("half_life_sessions must be positive")
         if num_threads < 1:
             raise ValueError("num_threads must be positive")
+        if not 0.0 <= float(lambdarank_weight) <= 1.0:
+            raise ValueError("lambdarank_weight must be within [0.0, 1.0]")
         self.objective = objective
         self.metric = metric
         self.label_gain = tuple(label_gain)
@@ -211,6 +214,7 @@ class LambdaRankConfig:
         self.min_group_size = min_group_size
         self.half_life_sessions = half_life_sessions
         self.num_threads = num_threads
+        self.lambdarank_weight = float(lambdarank_weight)
 
     def lgb_params(self) -> dict[str, object]:
         """Deterministic LightGBM parameters with every seed pinned."""
@@ -410,7 +414,8 @@ class LambdaRankBlendModel:
             / (stable_within - 1.0)
         ).fill_null(0.5)
         blend = (
-            LAMBDARANK_WEIGHT * lambda_rank + STABLE_WEIGHT * stable_rank
+            self.config.lambdarank_weight * lambda_rank
+            + (1.0 - self.config.lambdarank_weight) * stable_rank
         ).alias("pred_score")
         result = scored.with_columns(blend)
         result = result.drop("__lambda_score", "__stable_score")
@@ -492,7 +497,8 @@ class LambdaRankBlendModel:
             / (stable_within - 1.0)
         ).fill_null(0.5)
         blend = (
-            LAMBDARANK_WEIGHT * lambda_rank + STABLE_WEIGHT * stable_rank
+            self.config.lambdarank_weight * lambda_rank
+            + (1.0 - self.config.lambdarank_weight) * stable_rank
         ).alias("pred_score")
         result = scored.select(self.session_column, "instrument_id", blend)
         if result["pred_score"].null_count() or not np.all(
@@ -514,8 +520,8 @@ class LambdaRankBlendModel:
             "label_gain": ",".join(str(g) for g in self.config.label_gain),
             "eval_at": ",".join(str(v) for v in self.config.eval_at),
             "seed": str(self.config.seed),
-            "blend_weight_lambdarank": f"{LAMBDARANK_WEIGHT:.6f}",
-            "blend_weight_stable": f"{STABLE_WEIGHT:.6f}",
+            "blend_weight_lambdarank": f"{self.config.lambdarank_weight:.6f}",
+            "blend_weight_stable": f"{1.0 - self.config.lambdarank_weight:.6f}",
             "feature_list": ",".join(self.features),
             "feature_gains": json.dumps(self._feature_gains, sort_keys=True),
             "missing_rates": json.dumps(self._missing_rates, sort_keys=True),
