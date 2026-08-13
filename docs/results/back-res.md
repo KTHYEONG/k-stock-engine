@@ -211,3 +211,88 @@ fail-closed 조건은 완화하지 않았다.
 승격할 수 있다”는 증거는 아니다. 레이블 데이터가 `2026-02-10`에서 끝나
 2026-03-10 이후 252개 label-available 세션을 아직 제공하지 못하므로,
 forward holdout 역시 성숙할 때까지 `NO_TRADE`가 유지된다.
+
+---
+
+# Compounding stability telemetry 재실행 결과
+
+## 실행
+
+| 항목 | 값 |
+|---|---|
+| 실행일 | 2026-08-13 |
+| Snapshot | `research_provisional_20160104_20260812_cost_master_v3_mh2` |
+| Artifact | `lambdarank_v2_20260813_stability_telemetry` |
+| Mode | `research` |
+| Selection policy | `economic-selection-v3-compounding` |
+| Compute plan | `lgb_threads` 기본 설정 |
+| Command | `LOG_LEVEL=DEBUG PYTHONPATH=. timeout 1800 uv run python -m src.stocks.cli.train --artifact-id lambdarank_v2_20260813_stability_telemetry --snapshot-id research_provisional_20160104_20260812_cost_master_v3_mh2 --mode research --optuna-trials 81 --max-rss-mib 8000` |
+| Exit status | `0` |
+
+## 결과 판정
+
+| 항목 | 값 |
+|---|---:|
+| `promoted` | `false` |
+| `no_trade` | `true` |
+| `selection_status` | `no_economically_eligible_candidate` |
+| `n_terminal_trials` | 81 |
+| `screened_trials` | 72 |
+| `pruned_trials` | 9 |
+| `shortlisted_trials` | 18 |
+| `economically_eligible_trials` | **0** |
+| `best_screen_rank_ic` | 0.10341699 |
+| `gates.passed` | `false` |
+
+이번 실행은 최종 promotion replay까지 도달하지 못했다. 18개 shortlist
+후보를 6개 compounding policy와 조합해 평가했지만, 36개 `(trial, policy)`
+모두 DSR gate를 통과하지 못해 최종 OOS ledger와 최종 수익률은 생성되지
+않았다. fail-closed 동작으로 `NO_TRADE` artifact가 발행됐다.
+
+## 실행 자원
+
+| 항목 | 값 |
+|---|---:|
+| Screen | 37.27 s |
+| Full refit | 299.03 s |
+| Economic replay | 619.83 s |
+| Peak RSS | 5,191.44 MiB |
+
+## Compounding telemetry 분석
+
+새 telemetry는 inner candidate evidence에 정상 저장됐다. 대표적으로 가장
+높은 복리 bootstrap 하한은 10세션 route의 trial 14, policy
+`5:ga2_tb0.2`에서 `0.00101887`이었지만 DSR은 `0.56010868`로 요구치
+`0.95`에 미달했다.
+
+| Route / trial | Policy | Bootstrap 하한 | DSR | 평균 scale | p10 scale | 평균 turnover lambda | 판정 |
+|---|---|---:|---:|---:|---:|---:|---|
+| 10 / 14 | `5:ga2_tb0.2` | **0.00101887** | 0.560109 | 0.980991 | 1.000000 | 0.386896 | DSR 실패 |
+| 10 / 26 | `3:ga1_tb0.2` | 0.00092562 | 0.557029 | 0.994579 | 1.000000 | 0.381727 | DSR 실패 |
+| 5 / 5 | `5:ga2_tb0.2` | -0.00005951 | — | 0.975481 | 1.000000 | 0.390777 | 하한 실패 |
+| 15 / 19 | `5:ga2_tb0.2` | -0.00316764 | — | 0.891989 | 0.659710 | 0.417864 | 하한 실패 |
+
+`cash_count`는 telemetry상 0이었고, `positive_scale_fraction`은 모든
+후보에서 1.0이었다. 즉 이번 실행의 병목은 covariance/variance 때문에
+현금화된 것이 아니라, 양수 edge를 가진 포지션을 구성한 뒤에도 81개 후보
+탐색에 대한 통계적 확실성(DSR)이 부족했던 것이다. 특히 15세션 route는
+평균 scale 0.892, p10 scale 0.660까지 축소되고 복리 하한도 크게 음수여서
+현재 데이터에서는 우선순위가 낮다.
+
+## 해석 및 다음 단계
+
+1. **체결 경로는 정상이다.** 이번 실행은 후보 selection 단계에서 종료됐기
+   때문에 최종 attempted/filled order 수를 산출하지 않았지만, 이전
+   execution recovery 실행에서 1,737/1,737 전량 체결이 이미 확인됐다.
+2. **telemetry 수집은 성공했다.** decision count, cash reason, confidence
+   scale, gross exposure, turnover lambda가 후보별 JSON에 저장됐다.
+3. **성과 기준 완화는 정당화되지 않는다.** 최고 하한도 DSR 0.56으로
+   0.95에 크게 못 미치므로 Gate 5 또는 forward holdout 조건을 낮추면 안 된다.
+4. **개선 방향은 모델·feature의 OOS 안정성 검증이다.** 현 단계에서 policy
+   grid를 늘리거나 결과를 보고 policy를 수동 선택하지 않고, 동일 snapshot의
+   block별 손실·feature 기여·forward label 성숙을 추가 확인해야 한다.
+
+## 산출물
+
+- [Metrics](../../data/artifacts/stocks/lambdarank_v2_20260813_stability_telemetry/metrics.json)
+- [Manifest](../../data/artifacts/stocks/lambdarank_v2_20260813_stability_telemetry/manifest.json)
