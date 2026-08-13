@@ -19,7 +19,7 @@ def test_for_budget_produces_27_to_6_to_6_to_3_profile() -> None:
     assert policy.proxy_session_stride == 6
     assert policy.promotion_width == 6
     assert policy.economic_finalist_width == 3
-    assert SELECTION_POLICY_VERSION == "economic-selection-v4-stability"
+    assert SELECTION_POLICY_VERSION == "economic-selection-v5-execution-matched"
 
 
 def test_for_budget_never_exceeds_positive_screen_candidates() -> None:

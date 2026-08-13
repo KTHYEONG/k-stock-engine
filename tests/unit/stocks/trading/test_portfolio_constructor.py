@@ -807,6 +807,29 @@ def test_prepared_allocations_reject_overlay_length_mismatch() -> None:
             StockRiskPolicy(top_k=20),
         )
 
+
+def test_prepared_allocations_reject_non_finite_scored_overlay() -> None:
+    """Non-finite values on scored overlay rows are rejected, never used."""
+    from src.stocks.trading.portfolio_constructor import (
+        PreparedAllocationMarket,
+        construct_target_allocations_prepared,
+    )
+
+    panel = scored_panel(n_sessions=61, n_tickers=10, seed=9).drop("ret")
+    market = PreparedAllocationMarket.build(panel)
+    overlay = np.full(market.row_count, np.nan, dtype=np.float64)
+    overlay[0] = float("inf")
+    with pytest.raises(ValueError, match="non-finite scored values"):
+        construct_target_allocations_prepared(
+            market,
+            len(market.sessions) - 1,
+            overlay,
+            None,
+            instruments_for(10),
+            empty_portfolio(),
+            StockRiskPolicy(top_k=20),
+        )
+
 def test_prepared_allocations_convert_nan_history_overlay_to_null() -> None:
     """NaN historical overlay rows become null and never enter an allocation."""
     panel = scored_panel(n_sessions=61, n_tickers=10, seed=9).drop("ret")
