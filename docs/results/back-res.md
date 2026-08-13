@@ -677,3 +677,72 @@ hard failure, no-trade reason을 artifact telemetry로 남긴 점이다.
 - [Metrics](../../data/artifacts/stocks/lambdarank_v2_20260813_candidate_recovery_latest/metrics.json)
 - [Manifest](../../data/artifacts/stocks/lambdarank_v2_20260813_candidate_recovery_latest/manifest.json)
 - 실행 로그: `logs/scratch/v5_candidate_recovery_latest.log`
+
+---
+
+# 2026-08-13 90-trial ML-only / blend ablation 실행 결과
+
+## 실행
+
+| 항목 | 값 |
+|---|---|
+| Artifact | `lambdarank_v2_20260813_ensemble_ablation_90` |
+| Snapshot | `research_provisional_20160104_20260812_cost_master_v3_mh2` |
+| Command | `uv run python -m src.stocks.cli.train --artifact-id lambdarank_v2_20260813_ensemble_ablation_90 --snapshot-id research_provisional_20160104_20260812_cost_master_v3_mh2 --mode research --optuna-trials 90 --max-rss-mib 8000` |
+| Exit status | `0` |
+| 실행 시간 | 약 11분 (`22:10:00`~`22:21:04` KST) |
+| Peak RSS | **6,223.387 MiB / 8,000 MiB** |
+| Global DSR multiplicity | **90** |
+
+## 결과 판정
+
+| 항목 | 값 |
+|---|---:|
+| `promoted` / `no_trade` | `false / true` |
+| `n_folds_evaluated` | `0` |
+| Terminal / screened / pruned | **90 / 83 / 7** |
+| Confirmation attempts / confirmed | **18 / 0** |
+| Shortlisted / economically eligible | `0 / 0` |
+| Full refit / exact economic replay | **미실행** |
+| `selection_status` | `no_complete_screen_candidate` |
+| Gate | `passed=false` |
+
+## Family별 탐색
+
+각 route에서 다섯 family를 정확히 6회씩 평가하여 전체 18회씩 균형을
+맞췄다.
+
+| Family | LambdaRank weight | 전체 trial 수 |
+|---|---:|---:|
+| `stable_only` | 0.00 | 18 |
+| `blend_25` | 0.25 | 18 |
+| `blend_50` | 0.50 | 18 |
+| `blend_75` | 0.75 | 18 |
+| `ml_only` | 1.00 | 18 |
+
+## Route별 screen 결과
+
+| Route | Terminal | Screened | Pruned | Best screen lower bound | Confirmation | Confirmed |
+|---:|---:|---:|---:|---:|---:|---:|
+| 5 sessions | 30 | 27 | 3 | -0.00151904 | 6 | 0 |
+| 10 sessions | 30 | 28 | 2 | -0.00304526 | 6 | 0 |
+| 15 sessions | 30 | 28 | 2 | -0.00469325 | 6 | 0 |
+
+Screen no-trade telemetry는 `constraint:insufficient covariance data` **1,620건**,
+`no-feasible-allocation` **3,663건**이었다. hard-prune 7건은
+`no_filled_orders`였다.
+
+## 해석
+
+이번 실행은 ML-only와 blend를 동일한 trial 수로 비교하는 ablation 자체는
+완료했지만, 세 route의 최고 screen lower bound가 모두 음수였고 confirmation
+18건이 모두 탈락했다. 따라서 exact economic replay와 ML-only 대비 paired
+differential bootstrap은 실행되지 않았다. 이는 두 family 중 우열이
+확정됐다는 뜻이 아니라, 경제적 비교 단계에 도달할 후보가 없었다는
+뜻이다. 기존 fail-closed 정책에 따라 `NO_TRADE`를 유지한다.
+
+## 산출물
+
+- [Metrics](../../data/artifacts/stocks/lambdarank_v2_20260813_ensemble_ablation_90/metrics.json)
+- [Manifest](../../data/artifacts/stocks/lambdarank_v2_20260813_ensemble_ablation_90/manifest.json)
+- 실행 로그: `scratch/ensemble_ablation_90.log`
