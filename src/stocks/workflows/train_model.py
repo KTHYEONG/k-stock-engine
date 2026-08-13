@@ -23,6 +23,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from dataclasses import replace as dataclass_replace
 from datetime import UTC, date, datetime
 from enum import StrEnum
 from hashlib import sha256
@@ -82,6 +83,10 @@ from src.stocks.workflows.economic_selection import (
     SELECTION_POLICY_VERSION,
     ScreenFidelityPolicy,
 )
+from src.stocks.workflows.execution_matched_replay import (
+    ExecutionMatchedEvidence,
+    ExecutionMatchedReplayKernel,
+)
 from src.stocks.workflows.training_run_store import TrainingRunStore, content_hash
 
 if TYPE_CHECKING:
@@ -139,6 +144,8 @@ _BYTES_PER_CELL = 4
 _ALLOCATION_MULTIPLE = 3
 _SCREEN_BOOSTING_ROUNDS = 800
 _SCREEN_EARLY_STOPPING_ROUNDS = 50
+
+_KERNEL_PARITY_VERSION = "execution-matched-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -528,6 +535,7 @@ class PreparedCandidateContext:
     labels: pl.DataFrame
     train_rows: int
     validation_rows: int
+    execution_kernel: ExecutionMatchedReplayKernel | None = None
 
 
 @dataclass(slots=True)
@@ -1488,6 +1496,26 @@ def _tune_champion(
                 "[EVAL] route=%sd stage=no-prepared-fold-0", route.horizon
             )
             continue
+        proxy_contexts = _attach_proxy_kernels(
+            tuning_panel,
+            tuning_folds,
+            proxy_contexts,
+            request,
+            route,
+            dataset_manifest=dataset_manifest,
+            registry=registry,
+            base_schedule=base_schedule,
+            stress_schedule=stress_schedule,
+        )
+        if any(proxy is None or proxy.execution_kernel is None for proxy in proxy_contexts):
+            route_attrs[str(route.horizon)] = {
+                "selection_status": "no-prepared-fold-0",
+                "holding_horizon_sessions": route.horizon,
+            }
+            logger.info(
+                "[EVAL] route=%sd stage=no-proxy-kernel", route.horizon
+            )
+            continue
         proxy_reference = next(
             (proxy for proxy in proxy_contexts if proxy is not None),
             None,
@@ -1514,7 +1542,7 @@ def _tune_champion(
             "seed": request.seed,
             "screen_boosting_rounds": _SCREEN_BOOSTING_ROUNDS,
             "screen_early_stopping_rounds": _SCREEN_EARLY_STOPPING_ROUNDS,
-            "screen_fidelity": "session_stride_proxy",
+            "screen_fidelity": "execution_matched",
             "proxy_session_stride": policy.proxy_session_stride,
             "proxy_train_rows": (
                 proxy_reference.train_rows if proxy_reference is not None else 0
@@ -1579,7 +1607,7 @@ def _tune_champion(
             if any(bound is None for bound in fold_lower_bounds):
                 raise optuna.TrialPruned()
             valid_bounds = [float(bound) for bound in fold_lower_bounds if bound is not None]
-            trial.set_user_attr("proxy_economic_lower_bounds", valid_bounds)
+            trial.set_user_attr("proxy_execution_lower_bounds", valid_bounds)
             objective = min(valid_bounds)
             logger.info(
                 "[EVAL] route=%sd trial=%s stage=screen_proxy_lower_bound "
@@ -1702,8 +1730,17 @@ def _tune_champion(
         study.set_user_attr("selection_policy_version", SELECTION_POLICY_VERSION)
         for name, value in policy.to_json_safe().items():
             study.set_user_attr(name, value)
-        study.set_user_attr("screen_fidelity", "session_stride_proxy")
+        study.set_user_attr("screen_fidelity", "execution_matched")
         study.set_user_attr("proxy_session_stride", policy.proxy_session_stride)
+        study.set_user_attr("kernel_parity_version", _KERNEL_PARITY_VERSION)
+        study.set_user_attr(
+            "proxy_kernel_cache_bytes",
+            sum(
+                int(proxy.execution_kernel.cache_bytes)
+                for proxy in proxy_contexts
+                if proxy is not None and proxy.execution_kernel is not None
+            ),
+        )
         study.set_user_attr(
             "proxy_train_rows",
             proxy_reference.train_rows if proxy_reference is not None else 0,
@@ -1799,7 +1836,7 @@ def _tune_champion(
 
         proxy_min_by_trial: dict[int, float] = {}
         for trial in study.trials:
-            bounds = trial.user_attrs.get("proxy_economic_lower_bounds")
+            bounds = trial.user_attrs.get("proxy_execution_lower_bounds")
             if isinstance(bounds, list) and bounds:
                 proxy_min_by_trial[int(trial.number)] = float(min(bounds))
         concordance_x: list[float] = []
@@ -2227,6 +2264,60 @@ def _fit_stable_contexts(
     return fold0, tuple(proxy_contexts), provider
 
 
+def _attach_proxy_kernels(
+    tuning_panel: pl.DataFrame,
+    tuning_folds: list[Fold],
+    proxy_contexts: tuple[PreparedCandidateContext | None, ...],
+    request: TrainingRequest,
+    route: RouteSpec,
+    *,
+    dataset_manifest: DatasetManifest,
+    registry: ModelArtifactRegistry,
+    base_schedule: CostSchedule,
+    stress_schedule: CostSchedule,
+) -> tuple[PreparedCandidateContext | None, ...]:
+    """Build one immutable execution-matched proxy kernel per purged fold.
+
+    Each proxy fold kernel owns the prepared route built from the fold's
+    contiguous validation interval (the first validation session onward), the
+    replay static context, and the frozen route schedules. Candidate-specific
+    data is only an aligned score overlay and a causal calibration ledger, so a
+    kernel is built once per fold and reused by every screen trial.
+    """
+    attached: list[PreparedCandidateContext | None] = []
+    for _fold_index, (proxy, fold) in enumerate(zip(proxy_contexts, tuning_folds, strict=True)):
+        if proxy is None:
+            attached.append(None)
+            continue
+        validation_mask = set(fold.validation_mask)
+        first_validation = (
+            tuning_panel.filter(pl.col("session_index").is_in(list(validation_mask)))
+            .select(pl.col("session").min())
+            .item()
+        )
+        if first_validation is None:
+            attached.append(None)
+            continue
+        try:
+            kernel = ExecutionMatchedReplayKernel.build(
+                tuning_panel,
+                [_session_as_datetime(first_validation)],
+                request,
+                route,
+                dataset_manifest=dataset_manifest,
+                registry=registry,
+                base_schedule=base_schedule,
+                stress_schedule=stress_schedule,
+            )
+        except (ValueError, TypeError):
+            attached.append(None)
+            continue
+        attached.append(
+            dataclass_replace(proxy, execution_kernel=kernel)
+        )
+    return tuple(attached)
+
+
 def _proxy_session_filter(
     frame: pl.DataFrame,
     stride: int,
@@ -2263,10 +2354,11 @@ def _build_proxy_context(
 ) -> _StableTrialContext:
     """Build the fixed-stride proxy screen context from the fold-0 context.
 
-    The proxy reuses the already-transformed fold-0 context, filtering both the
-    train and validation splits by the same ``session ordinal % stride == 0``
-    rule. The cached stable scores are filtered to the retained validation
-    sessions unchanged (the composite score is a per-session cross-sectional
+    Only the training split is thinned by the fixed ``session ordinal %
+    stride == 0`` rule so the screen fit stays affordable; the validation
+    (execution) sessions are never thinned, so the execution-matched kernel can
+    score every route decision at its true cadence. The cached stable scores are
+    kept unchanged (the composite score is a per-session cross-sectional
     percentile rank, so retained rows keep identical values), and the prepared
     fold matrices are rebuilt once from the filtered frames so the screen fast
     path still avoids per-trial Polars work. Raises ``ValueError`` when the
@@ -2274,15 +2366,9 @@ def _build_proxy_context(
     accepted as a screen signal).
     """
     proxy_train = _proxy_session_filter(full_context.train_processed, stride)
-    proxy_validation = _proxy_session_filter(
-        full_context.validation_processed, stride
-    )
-    proxy_validation_frame = _proxy_session_filter(
-        full_context.validation_frame, stride
-    )
-    proxy_stable_scores = _proxy_session_filter(
-        full_context.stable_scores, stride
-    )
+    proxy_validation = full_context.validation_processed
+    proxy_validation_frame = full_context.validation_frame
+    proxy_stable_scores = full_context.stable_scores
     prepared: PreparedLambdaRankFold | None = None
     try:
         prepared = LambdaRankBlendModel(
@@ -2328,14 +2414,15 @@ def _score_trial_fold(
     bytes) before fitting and records elapsed/RSS telemetry in a ``finally`` so
     a callback-raised :class:`optuna.TrialPruned` still leaves timing evidence.
     ``key_prefix`` qualifies the recorded fold key with the route horizon so
-    cross-route keys never collide. The returned value is the cost-aware
-    non-overlapping proxy compounding lower bound, never a Rank-IC; a missing,
-    non-finite, insufficient-block, or non-positive fold fails closed to
-    ``None``. A breach raises :class:`TrainingCapacityError`. Fold model,
-    prediction frame, and LightGBM datasets are local to this call and released
-    on return, so a trial never retains every fold's artifacts.
+    cross-route keys never collide. The returned value is the execution-matched
+    holding-period block-log bootstrap lower bound from the canonical base
+    kernel replay, never a Rank-IC; a missing, non-finite, insufficient-block,
+    or non-positive fold fails closed to ``None``. A breach raises
+    :class:`TrainingCapacityError`. Fold model, prediction frame, and LightGBM
+    datasets are local to this call and released on return, so a trial never
+    retains every fold's artifacts.
     """
-    del tuning_panel, fold, feature_columns
+    del fold, feature_columns
     key = f"{key_prefix}trial_{trial.number}_fold_{fold_index}"
     guard.admit(
         context.train_rows,
@@ -2352,19 +2439,31 @@ def _score_trial_fold(
         _ic, scored, outcome = result
         if outcome.best_iteration is not None:
             trial.set_user_attr("proxy_best_iteration", outcome.best_iteration)
-        bound = _economic_screen_score(
-            context.labels,
+        kernel = context.execution_kernel
+        if kernel is None:
+            return None
+        calibration_ledger = _build_calibration_ledger(
             scored,
-            label_column=label_column,
-            top_k=request.top_k,
-            holding_horizon_sessions=int(base_manifest.label_horizon_sessions),
-            cost_schedule=request.stress_cost_schedule or default_stress_schedule(),
-            n_bootstrap=request.n_bootstrap,
-            bootstrap_alpha=request.bootstrap_alpha,
-            seed=request.seed,
+            tuning_panel,
+            label_column,
+            kernel.label_available_column,
+        )
+        evidence = kernel.run_base(
+            scored,
+            calibration_ledger,
+            replay_mode="INNER_SELECTION_BASE_ONLY",
+        )
+        if evidence.filled_orders <= 0:
+            return None
+        bound = _execution_matched_lower_bound(
+            evidence, request, base_manifest, trial.number
         )
         if not math.isfinite(bound) or bound <= 0.0:
             return None
+        trial.set_user_attr(
+            f"{key_prefix}proxy_execution_lower_bound",
+            round(float(bound), 8),
+        )
         if report_progress:
             trial.report(float(bound), step=fold_index)
             if trial.should_prune():
@@ -2377,6 +2476,28 @@ def _score_trial_fold(
             guard.estimate_mib(context.train_rows),
         )
         guard.check_after()
+
+
+def _execution_matched_lower_bound(
+    evidence: ExecutionMatchedEvidence,
+    request: TrainingRequest,
+    base_manifest: ModelManifest,
+    trial_number: int,
+) -> float:
+    """Holding-period block-log bootstrap lower bound from kernel evidence."""
+    budget = PromotionRiskBudget()
+    compounding = _compounding_evidence(
+        evidence.strategy_returns,
+        evidence.benchmark_returns,
+        evidence.decision_boundaries,
+        int(base_manifest.label_horizon_sessions),
+        request,
+        budget,
+        trial_number,
+    )
+    if compounding.complete_block_count < 3:
+        return 0.0
+    return compounding.bootstrap_lower_bound
 
 
 def _score_context_model(
@@ -3521,6 +3642,30 @@ def _event_ledger_evaluation(
     policy.compounding_evidence.clear()
 
     if prepared_route is not None:
+        kernel = ExecutionMatchedReplayKernel(
+            panel=panel,
+            prepared_route=prepared_route,
+            instruments=instruments,
+            policy=policy,
+            request=request,
+            dataset_manifest=dataset_manifest,
+            registry=registry,
+            base_schedule=base_schedule,
+            stress_schedule=stress_schedule,
+            holding_horizon_sessions=holding_horizon_sessions,
+            label_column=label_column,
+            label_available_column=label_available_column,
+            replay_guard=replay_guard,
+        )
+        kernel_evidence = kernel.run_base(
+            oos_scored,
+            calibration_ledger,
+            replay_mode=replay_mode.value,
+            replay_guard=replay_guard,
+        )
+        return _evidence_to_replay_result(kernel_evidence, replay_mode)
+
+    if prepared_route is not None:
         overlay, allocation_overlay = prepared_route.scatter_overlays(oos_scored)
         if replay_guard is not None:
             replay_guard.admit(
@@ -3927,6 +4072,38 @@ def _event_ledger_evaluation(
         decision_boundaries=list(decision_indices),
         holding_horizon_sessions=int(holding_horizon_sessions),
         compounding_overlay=compounding_overlay,
+    )
+
+
+def _evidence_to_replay_result(
+    evidence: ExecutionMatchedEvidence,
+    replay_mode: ReplayMode,
+) -> ReplayResult:
+    """Convert kernel evidence back into the promotion ``ReplayResult`` shape."""
+    return ReplayResult(
+        ledger=evidence.ledger,
+        trades=evidence.trades,
+        metrics=evidence.metrics,
+        stress_metrics=evidence.stress_metrics,
+        final_value=evidence.final_value,
+        excess_returns=list(evidence.excess_returns),
+        benchmark_returns=list(evidence.benchmark_returns),
+        strategy_returns=list(evidence.strategy_returns),
+        base_total_return=evidence.base_total_return,
+        stress_total_return=evidence.stress_total_return,
+        benchmark_total_return=evidence.benchmark_total_return,
+        planned_cycles=evidence.planned_cycles,
+        attempted_orders=evidence.attempted_orders,
+        filled_orders=evidence.filled_orders,
+        no_trade_reason_counts=dict(evidence.no_trade_reason_counts),
+        unfilled_order_reason_counts=dict(evidence.unfilled_order_reason_counts),
+        calibration_evidence=dict(evidence.calibration_evidence),
+        replay_mode=replay_mode.value,
+        replay_resource=dict(evidence.replay_resource),
+        prepared_decision_count=evidence.prepared_decision_count,
+        decision_boundaries=list(evidence.decision_boundaries),
+        holding_horizon_sessions=evidence.holding_horizon_sessions,
+        compounding_overlay=dict(evidence.compounding_overlay),
     )
 
 
