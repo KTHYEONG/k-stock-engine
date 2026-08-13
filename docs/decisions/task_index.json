@@ -1,6 +1,26 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_V5_THROUGHPUT_RESULT",
+      "date": "2026-08-13",
+      "adr_id": "ADR_20260813_STOCK_V5_THROUGHPUT_RESULT",
+      "domain": "stocks",
+      "title": "V5 throughput benchmark and no-trade evidence",
+      "why": "Latest V5 execution needed reproducible runtime, memory, ML screen telemetry, and explicit no-trade backtesting limits in the result record.",
+      "resolution": "Recorded artifact-level route metrics, stage timing aggregates, ML configuration, resource usage, and the distinction between unexecuted economic backtesting and zero performance.",
+      "impact": "Backtest result analysis can compare throughput and screening bottlenecks without treating no-trade fields as zero alpha; task indexes and code map are synchronized."
+    },
+    {
+      "task_id": "TASK_STOCK_V5_FOLD_BOUNDARY_DIAGNOSTICS",
+      "date": "2026-08-13",
+      "adr_id": "ADR_20260813_STOCK_V5_FOLD_BOUNDARY_DIAGNOSTICS",
+      "domain": "risk",
+      "title": "V5 execution-matched fold boundary diagnostics",
+      "why": "The v5 reference run fail-closed during fold preparation with no screen or replay trials, and DEBUG reproduction showed the proxy kernel could not resolve the third fold validation boundary.",
+      "resolution": "Diagnosed Fold validation_mask row positions being queried as session_index values; added DEBUG diagnostics for full/proxy preparation and kernel construction failures, and registered a contract to bind kernels from row-position validation frames with explicit boundary and route-status validation.",
+      "impact": "The v5 implementation remains fail-closed and unchanged in selection economics; future repair must prevent pre-validation kernel anchoring, distinguish no-prepared-fold from no-proxy-kernel, and preserve 81-trial multiplicity, causal replay, costs, fills, settlement, and NO_TRADE gates."
+    },
+    {
       "task_id": "EXECUTION_MATCHED_ALPHA_ARCHITECTURE",
       "date": "2026-08-13",
       "adr_id": "ADR_20260813_EXECUTION_MATCHED_ALPHA_ARCHITECTURE",
