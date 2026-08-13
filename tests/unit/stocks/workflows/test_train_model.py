@@ -396,6 +396,17 @@ def _positive_replay(**overrides) -> ReplayResult:
         benchmark_total_return=0.005,
         stress_total_return=0.01,
         final_value=100_000_001.0,
+        compounding_overlay={
+            "decision_count": 8,
+            "cash_count": 0,
+            "cash_reasons": {},
+            "mean_confidence_scale": 0.5,
+            "p10_confidence_scale": 0.3,
+            "positive_scale_fraction": 1.0,
+            "mean_gross_before_compounding": 0.9,
+            "mean_gross_after_compounding": 0.45,
+            "mean_turnover_lambda": 1.0,
+        },
     )
     return dataclass_replace(base, **overrides)
 
@@ -2380,6 +2391,111 @@ def test_compounding_evidence_blocks_are_exact_and_fail_closed() -> None:
     assert five.dsr_probability == reference_dsr
 
 
+def test_compounding_overlay_summary_is_complete_and_json_safe() -> None:
+    from src.stocks.workflows.train_model import _compounding_overlay_summary
+
+    records = [
+        {
+            "decision_session": "2024-01-05T00:00:00+00:00",
+            "candidate_count": 10,
+            "ranked_count": 8,
+            "selected_count": 6,
+            "confidence_edge_h": 0.01,
+            "confidence_variance_h": 0.02,
+            "confidence_scale": 0.5,
+            "gross_before_compounding": 0.9,
+            "gross_after_compounding": 0.45,
+            "turnover_lambda": 0.8,
+            "cash_reason": None,
+        },
+        {
+            "decision_session": "2024-01-10T00:00:00+00:00",
+            "candidate_count": 9,
+            "ranked_count": 7,
+            "selected_count": 5,
+            "confidence_edge_h": 0.004,
+            "confidence_variance_h": 0.01,
+            "confidence_scale": 0.4,
+            "gross_before_compounding": 0.9,
+            "gross_after_compounding": 0.36,
+            "turnover_lambda": 1.0,
+            "cash_reason": None,
+        },
+        {
+            "decision_session": "2024-01-15T00:00:00+00:00",
+            "candidate_count": 8,
+            "ranked_count": 6,
+            "selected_count": 4,
+            "confidence_edge_h": 0.005,
+            "confidence_variance_h": None,
+            "confidence_scale": 0.0,
+            "gross_before_compounding": 0.9,
+            "gross_after_compounding": 0.0,
+            "turnover_lambda": 0.0,
+            "cash_reason": "invalid-confidence-variance",
+        },
+    ]
+    compact = _compounding_overlay_summary(records)
+    assert compact["decision_count"] == 3
+    assert compact["cash_count"] == 1
+    assert compact["cash_reasons"] == {"invalid-confidence-variance": 1}
+    assert compact["mean_confidence_scale"] == pytest.approx(0.3)
+    assert 0.0 <= compact["p10_confidence_scale"] <= compact["mean_confidence_scale"]
+    assert compact["positive_scale_fraction"] == pytest.approx(2 / 3)
+    assert compact["mean_gross_before_compounding"] == pytest.approx(0.9)
+    assert compact["mean_gross_after_compounding"] == pytest.approx(0.27)
+    assert compact["mean_turnover_lambda"] == pytest.approx(0.6)
+    assert "records" not in compact
+    json.dumps(compact)
+
+    full = _compounding_overlay_summary(records, include_records=True)
+    assert len(full["records"]) == 3
+    assert full["records"][2]["confidence_variance_h"] is None
+    json.dumps(full)
+
+    empty = _compounding_overlay_summary([])
+    assert empty["decision_count"] == 0
+    assert empty["cash_count"] == 0
+    assert empty["cash_reasons"] == {}
+    assert empty["positive_scale_fraction"] == 0.0
+
+
+def test_economic_candidate_evidence_propagates_compact_compounding_overlay() -> None:
+    from src.stocks.workflows.train_model import (
+        EconomicCandidateEvidence,
+        _evaluate_economic_candidate,
+    )
+
+    overlay = {
+        "decision_count": 5,
+        "cash_count": 2,
+        "cash_reasons": {"non-positive-confidence-edge": 2},
+        "mean_confidence_scale": 0.4,
+        "p10_confidence_scale": 0.1,
+        "positive_scale_fraction": 0.6,
+        "mean_gross_before_compounding": 0.8,
+        "mean_gross_after_compounding": 0.5,
+        "mean_turnover_lambda": 0.9,
+    }
+    request = TrainingRequest(artifact_id="overlay_prop", n_folds=3)
+    replay = _positive_replay(compounding_overlay=dict(overlay))
+    evidence = _evaluate_economic_candidate(
+        [0.05, 0.06, 0.07], replay, request, 0, 0.05
+    )
+    assert isinstance(evidence, EconomicCandidateEvidence)
+    assert evidence.compounding_overlay == overlay
+    safe = evidence.to_json_safe()
+    assert safe["compounding_overlay"] == overlay
+    assert "records" not in safe["compounding_overlay"]
+    json.dumps(safe)
+
+    defaulted = _evaluate_economic_candidate(
+        [0.05, 0.06, 0.07], _positive_replay(), request, 1, 0.05
+    )
+    assert defaulted.compounding_overlay == _positive_replay().compounding_overlay
+    assert "records" not in defaulted.to_json_safe()["compounding_overlay"]
+
+
 def test_gate2_and_gate5_consume_block_log_compounding_evidence() -> None:
     budget = PromotionRiskBudget()
     request = TrainingRequest(artifact_id="gate_blk", n_folds=3)
@@ -2481,8 +2597,79 @@ def test_tuning_six_policy_grid_is_complete_deterministic_and_guarded(
     assert len(evidence) == 12
     assert {row["policy_id"] for row in evidence} == expected_policies
     assert {row["trial_number"] for row in evidence} == {0, 1}
+    for row in evidence:
+        overlay = row["compounding_overlay"]
+        assert "records" not in overlay
+        assert overlay["decision_count"] == 8
+        assert "mean_confidence_scale" in overlay
     assert telemetry["compounding_policy_replays"] == evidence
     assert isinstance(telemetry.get("replay_resource"), dict)
+
+
+def test_final_metrics_preserve_full_per_decision_overlay(tmp_path) -> None:
+    from src.stocks.workflows.train_model import _build_metrics
+
+    class _StubManifest:
+        model_type = "lambdarank_blend"
+
+    records = [
+        {
+            "decision_session": "2024-01-05T00:00:00+00:00",
+            "candidate_count": 10,
+            "ranked_count": 8,
+            "selected_count": 6,
+            "confidence_edge_h": 0.01,
+            "confidence_variance_h": 0.02,
+            "confidence_scale": 0.5,
+            "gross_before_compounding": 0.9,
+            "gross_after_compounding": 0.45,
+            "turnover_lambda": 0.8,
+            "cash_reason": None,
+        },
+        {
+            "decision_session": "2024-01-15T00:00:00+00:00",
+            "candidate_count": 8,
+            "ranked_count": 6,
+            "selected_count": 4,
+            "confidence_edge_h": 0.005,
+            "confidence_variance_h": None,
+            "confidence_scale": 0.0,
+            "gross_before_compounding": 0.9,
+            "gross_after_compounding": 0.0,
+            "turnover_lambda": 0.0,
+            "cash_reason": "invalid-confidence-variance",
+        },
+    ]
+    replay = _positive_replay(
+        compounding_overlay={
+            "decision_count": len(records),
+            "cash_count": 1,
+            "cash_reasons": {"invalid-confidence-variance": 1},
+            "mean_confidence_scale": 0.25,
+            "p10_confidence_scale": 0.0,
+            "positive_scale_fraction": 0.5,
+            "mean_gross_before_compounding": 0.9,
+            "mean_gross_after_compounding": 0.225,
+            "mean_turnover_lambda": 0.4,
+            "records": records,
+        }
+    )
+    manifest = _StubManifest()
+    metrics = _build_metrics(
+        TrainingRequest(artifact_id="metrics_overlay", n_folds=3),
+        replay,
+        [0.05, 0.06, 0.07],
+        {"passed": True, "reasons": []},
+        ["promoted"],
+        manifest,
+    )
+    overlay = metrics["compounding_overlay"]
+    assert isinstance(overlay, dict)
+    assert overlay["decision_count"] == 2
+    assert overlay["cash_count"] == 1
+    assert len(overlay["records"]) == 2
+    assert overlay["records"][1]["confidence_variance_h"] is None
+    json.dumps(metrics)
 
 
 def test_tuning_lower_rank_ic_candidate_with_higher_compounding_objective_wins(

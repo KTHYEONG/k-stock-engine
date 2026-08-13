@@ -12,6 +12,7 @@ All frame-level transforms are vectorized Polars/NumPy; per-row filtering,
 """
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -22,6 +23,8 @@ import polars as pl
 
 from src.core.instruments import Instrument
 from src.core.portfolio import Allocation, PortfolioSnapshot
+
+logger = logging.getLogger("stocks.trading.portfolio_constructor")
 
 REQUIRED_CROSS_SECTION_COLUMNS = ("instrument_id", "pred_score", "sector", "adtv")
 _ECONOMIC_COLUMNS = (
@@ -315,13 +318,16 @@ def construct_target_allocations(
                 & (pl.col("__rank") <= policy.keep_rank)
             )
         )
-        .head(policy.top_k)
-        .drop("__rank")
     )
+    ranked_count = ranked.height
+    ranked = ranked.head(policy.top_k).drop("__rank")
     if ranked.is_empty():
         return ()
 
     ids = [str(r) for r in ranked["instrument_id"].to_list()]
+    decision_session = cross_section[_SESSION_COLUMN][0]
+    candidate_count = eligible.height
+    selected_count = len(ids)
     net_lower_bound_of: dict[str, float] = {}
     if policy.compounding.enabled and "net_alpha_lower_bound" in cross_section.columns:
         net_lower_bound_of = {
@@ -334,7 +340,18 @@ def construct_target_allocations(
                 net_lower_bound_of[instrument_id]
             ):
                 _record_compounding_decision(
-                    policy, None, None, None, "invalid-confidence-variance"
+                    policy,
+                    decision_session=decision_session,
+                    candidate_count=candidate_count,
+                    ranked_count=ranked_count,
+                    selected_count=selected_count,
+                    confidence_edge_h=None,
+                    confidence_variance_h=None,
+                    confidence_scale=None,
+                    gross_before_compounding=0.0,
+                    gross_after_compounding=0.0,
+                    turnover_lambda=0.0,
+                    cash_reason="invalid-confidence-variance",
                 )
                 return ()
     sector_of = {str(r["instrument_id"]): r["sector"] for r in cross_section.to_dicts()}
@@ -358,6 +375,10 @@ def construct_target_allocations(
             policy,
             priority_alpha_of=priority_alpha_of,
             net_lower_bound_of=net_lower_bound_of,
+            decision_session=decision_session,
+            candidate_count=candidate_count,
+            ranked_count=ranked_count,
+            selected_count=selected_count,
         )
     else:
         allocations = _de_risk_allocations(
@@ -523,6 +544,10 @@ def _build_allocations(
     *,
     priority_alpha_of: dict[str, float] | None = None,
     net_lower_bound_of: dict[str, float] | None = None,
+    decision_session: object = "",
+    candidate_count: int = 0,
+    ranked_count: int = 0,
+    selected_count: int = 0,
 ) -> tuple[Allocation, ...]:
     if priority_alpha_of:
         raw_scores = {
@@ -547,17 +572,39 @@ def _build_allocations(
     weights = _scale_gross(weights, policy.gross_cap)
     weights = _scale_volatility(weights, panel, ids, policy)
 
+    gross_before_compounding = sum(weights.values())
+    compounding_applied = False
+    confidence_edge_h: float | None = None
+    confidence_variance_h: float | None = None
+    confidence_scale: float | None = None
     if policy.compounding.enabled and net_lower_bound_of:
-        scale, edge_h, variance_h, cash_reason = _compounding_scale(
-            weights, net_lower_bound_of, panel, ids, policy
+        confidence_scale, confidence_edge_h, confidence_variance_h, cash_reason = (
+            _compounding_scale(
+                weights, net_lower_bound_of, panel, ids, policy
+            )
         )
-        _record_compounding_decision(policy, edge_h, variance_h, scale, cash_reason)
         if cash_reason is not None:
+            _record_compounding_decision(
+                policy,
+                decision_session=decision_session,
+                candidate_count=candidate_count,
+                ranked_count=ranked_count,
+                selected_count=selected_count,
+                confidence_edge_h=confidence_edge_h,
+                confidence_variance_h=confidence_variance_h,
+                confidence_scale=confidence_scale,
+                gross_before_compounding=gross_before_compounding,
+                gross_after_compounding=0.0,
+                turnover_lambda=0.0,
+                cash_reason=cash_reason,
+            )
             return ()
         weights = {
-            instrument_id: weight * scale
+            instrument_id: weight * confidence_scale
             for instrument_id, weight in weights.items()
         }
+        compounding_applied = True
+    gross_after_compounding = sum(weights.values())
 
     if policy.turnover_budget > 0.0:
         target_full = dict.fromkeys(current_weights, 0.0)
@@ -571,6 +618,23 @@ def _build_allocations(
             )
     else:
         target_full = dict(weights)
+        lambda_ = 1.0
+
+    if compounding_applied:
+        _record_compounding_decision(
+            policy,
+            decision_session=decision_session,
+            candidate_count=candidate_count,
+            ranked_count=ranked_count,
+            selected_count=selected_count,
+            confidence_edge_h=confidence_edge_h,
+            confidence_variance_h=confidence_variance_h,
+            confidence_scale=confidence_scale,
+            gross_before_compounding=gross_before_compounding,
+            gross_after_compounding=gross_after_compounding,
+            turnover_lambda=lambda_,
+            cash_reason=None,
+        )
 
     allocations: list[Allocation] = []
     for instrument_id, weight in target_full.items():
@@ -681,25 +745,55 @@ def _compounding_scale(
 
 def _record_compounding_decision(
     policy: StockRiskPolicy,
+    *,
+    decision_session: object,
+    candidate_count: int,
+    ranked_count: int,
+    selected_count: int,
     confidence_edge_h: float | None,
     confidence_variance_h: float | None,
     confidence_scale: float | None,
+    gross_before_compounding: float,
+    gross_after_compounding: float,
+    turnover_lambda: float,
     cash_reason: str | None,
 ) -> None:
-    """Append one deterministic per-decision compounding record to the policy."""
-    policy.compounding_evidence.append(
-        {
-            "confidence_edge_h": (
-                None if confidence_edge_h is None else float(confidence_edge_h)
-            ),
-            "confidence_variance_h": (
-                None if confidence_variance_h is None else float(confidence_variance_h)
-            ),
-            "confidence_scale": (
-                None if confidence_scale is None else float(confidence_scale)
-            ),
-            "cash_reason": cash_reason,
-        }
+    """Append one deterministic JSON-safe per-decision compounding record.
+
+    The record captures the decision inputs and outcome without reading any
+    future returns or labels. Numeric diagnostics that are not finite are
+    stored as ``None`` and the decision is fail-closed through ``cash_reason``.
+    The same record is emitted only through the ``stocks.trading.portfolio_constructor``
+    DEBUG logger; default INFO runs keep allocation values, messages, and
+    behavior unchanged.
+    """
+
+    def _finite_or_none(value: float | None) -> float | None:
+        if value is None:
+            return None
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else None
+
+    if isinstance(decision_session, datetime):
+        decision_session = decision_session.isoformat()
+    record: dict[str, object] = {
+        "decision_session": str(decision_session),
+        "candidate_count": int(candidate_count),
+        "ranked_count": int(ranked_count),
+        "selected_count": int(selected_count),
+        "confidence_edge_h": _finite_or_none(confidence_edge_h),
+        "confidence_variance_h": _finite_or_none(confidence_variance_h),
+        "confidence_scale": _finite_or_none(confidence_scale),
+        "gross_before_compounding": float(gross_before_compounding),
+        "gross_after_compounding": float(gross_after_compounding),
+        "turnover_lambda": float(turnover_lambda),
+        "cash_reason": cash_reason,
+    }
+    policy.compounding_evidence.append(record)
+    logger.debug(
+        "compounding_decision session=%s record=%s",
+        record["decision_session"],
+        record,
     )
 
 

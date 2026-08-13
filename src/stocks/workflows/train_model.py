@@ -619,6 +619,7 @@ class EconomicCandidateEvidence:
     compounding_block_count: int = 0
     legacy_daily_excess_lower_bound: float = 0.0
     replay_resource: dict[str, object] = field(default_factory=dict)
+    compounding_overlay: dict[str, object] = field(default_factory=dict)
 
     def to_json_safe(self) -> dict[str, object]:
         """JSON-serializable evidence row with deterministic failure reasons."""
@@ -660,6 +661,7 @@ class EconomicCandidateEvidence:
                 self.legacy_daily_excess_lower_bound, 8
             ),
             "replay_resource": dict(self.replay_resource or {}),
+            "compounding_overlay": dict(self.compounding_overlay or {}),
         }
 
 
@@ -2748,6 +2750,7 @@ def _evaluate_economic_candidate(
         compounding_block_count=compounding.complete_block_count,
         legacy_daily_excess_lower_bound=_inner_bootstrap_lower_bound(replay, request),
         replay_resource=dict(replay.replay_resource or {}),
+        compounding_overlay=dict(replay.compounding_overlay or {}),
     )
 
 
@@ -3720,24 +3723,10 @@ def _event_ledger_evaluation(
         replay_resource = replay_guard.telemetry()
         if session_cluster_schedule is not None:
             replay_resource.update(session_cluster_schedule.telemetry())
-    overlay_records = list(policy.compounding_evidence)
-    scales = [
-        float(cast(float, record["confidence_scale"]))
-        for record in overlay_records
-        if record.get("confidence_scale") is not None
-    ]
-    cash_reasons = Counter(
-        str(record["cash_reason"])
-        for record in overlay_records
-        if record.get("cash_reason") is not None
+    compounding_overlay = _compounding_overlay_summary(
+        list(policy.compounding_evidence),
+        include_records=replay_mode is not ReplayMode.INNER_SELECTION_BASE_ONLY,
     )
-    compounding_overlay = {
-        "decision_count": len(overlay_records),
-        "mean_confidence_scale": float(np.mean(scales)) if scales else 0.0,
-        "cash_count": sum(cash_reasons.values()),
-        "cash_reasons": dict(sorted(cash_reasons.items())),
-        "records": overlay_records,
-    }
     return ReplayResult(
         ledger=tuple(result.ledger),
         trades=tuple(result.trades),
@@ -4066,6 +4055,60 @@ def _compounding_evidence(
         complete_block_count=len(blocks),
         rejected_block_count=rejected,
     )
+
+
+def _compounding_overlay_summary(
+    records: Sequence[dict[str, object]],
+    *,
+    include_records: bool = False,
+) -> dict[str, object]:
+    """Compact JSON-safe compounding-overlay summary from per-decision records.
+
+    The summary is the single source of truth propagated to the final
+    ``metrics`` payload and to every ``(trial, policy)`` inner candidate
+    evidence row. Per-decision records are preserved only when
+    ``include_records`` is true, i.e. only for the final artifact.
+    """
+    decision_count = len(records)
+    scales = [
+        float(cast(float, record["confidence_scale"]))
+        for record in records
+        if record.get("confidence_scale") is not None
+    ]
+    cash_reasons = Counter(
+        str(record["cash_reason"])
+        for record in records
+        if record.get("cash_reason") is not None
+    )
+    gross_before = [
+        float(cast(float, record["gross_before_compounding"])) for record in records
+    ]
+    gross_after = [
+        float(cast(float, record["gross_after_compounding"])) for record in records
+    ]
+    lambdas = [float(cast(float, record["turnover_lambda"])) for record in records]
+    summary: dict[str, object] = {
+        "decision_count": decision_count,
+        "cash_count": sum(cash_reasons.values()),
+        "cash_reasons": dict(sorted(cash_reasons.items())),
+        "mean_confidence_scale": float(np.mean(scales)) if scales else 0.0,
+        "p10_confidence_scale": (
+            float(np.percentile(scales, 10)) if scales else 0.0
+        ),
+        "positive_scale_fraction": (
+            sum(1 for scale in scales if scale > 0.0) / max(decision_count, 1)
+        ),
+        "mean_gross_before_compounding": (
+            float(np.mean(gross_before)) if gross_before else 0.0
+        ),
+        "mean_gross_after_compounding": (
+            float(np.mean(gross_after)) if gross_after else 0.0
+        ),
+        "mean_turnover_lambda": float(np.mean(lambdas)) if lambdas else 0.0,
+    }
+    if include_records:
+        summary["records"] = [dict(record) for record in records]
+    return summary
 
 
 def _moving_block_bootstrap_lower_bound(
