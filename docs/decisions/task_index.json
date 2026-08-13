@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_ENSEMBLE_ABLATION_90",
+      "date": "2026-08-13",
+      "adr_id": "ADR_20260813_STOCK_ENSEMBLE_ABLATION_90",
+      "domain": "stocks",
+      "title": "90-trial ML-only and blend ablation",
+      "why": "Backtest evidence did not directly test ML-only or provide a controlled family comparison.",
+      "resolution": "Registered a balanced 90-trial five-family ablation, recorded the production NO_TRADE result, and preserved fail-closed promotion and exact economic comparison gates.",
+      "impact": "Adds auditable family provenance and documents that no family reached confirmation; no production promotion or gate relaxation."
+    },
+    {
       "task_id": "TASK_STOCK_V5_CANDIDATE_RECOVERY",
       "date": "2026-08-13",
       "adr_id": "ADR_20260813_STOCK_V5_CANDIDATE_RECOVERY",
