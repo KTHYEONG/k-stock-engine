@@ -61,6 +61,7 @@ from src.stocks.research.labels import (
     RELEVANCE_COLUMN,
 )
 from src.stocks.research.lambdarank import (
+    LAMBDARANK_WEIGHT,
     FitTrialOutcome,
     LambdaRankBlendModel,
     LambdaRankConfig,
@@ -565,6 +566,104 @@ class _SelectionTimings:
     actual_refit_rounds: dict[str, int] = field(default_factory=dict)
     actual_best_iterations: dict[str, int | None] = field(default_factory=dict)
     fold_telemetry: dict[str, dict[str, object]] = field(default_factory=dict)
+
+
+_SCREEN_FAILURE_REASONS = frozenset(
+    {
+        "fit_failed",
+        "no_filled_orders",
+        "insufficient_compounding_blocks",
+        "non_finite_compounding",
+        "non_positive_point_estimate",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ScreenFoldEvidence:
+    """Immutable JSON-safe economic evidence for one proxy screen fold.
+
+    Carries only finite scalars and small maps; the block-log-excess series
+    lives on the object for the confirmation-pooling step but is never
+    serialized. ``ranking_score`` is the fold's holding-period block-log
+    bootstrap lower bound, which may be negative; a negative bound is usable
+    screen evidence, never a ``None`` sentinel. ``failure_reason`` is one
+    deterministic code from :data:`_SCREEN_FAILURE_REASONS` when the fold is not
+    usable, and ``None`` otherwise.
+    """
+
+    rank_ic: float
+    attempted_orders: int
+    filled_orders: int
+    planned_cycles: int
+    complete_block_count: int
+    rejected_block_count: int
+    block_log_excess_mean: float
+    lower_bound: float
+    dsr_probability: float
+    usable: bool
+    failure_reason: str | None
+    no_trade_reason_counts: dict[str, int] = field(default_factory=dict)
+    calibration_history_sessions: int = 0
+    eligible_bucket_count: int = 0
+    cash_cycles: int = 0
+    block_log_excess: tuple[float, ...] = ()
+
+    @property
+    def ranking_score(self) -> float:
+        """The finite fold lower bound used to rank screen candidates."""
+        return self.lower_bound
+
+    def to_json_safe(self) -> dict[str, object]:
+        """Compact deterministic JSON-safe evidence; never raw arrays or ledgers."""
+        return {
+            "rank_ic": round(self.rank_ic, 8),
+            "attempted_orders": int(self.attempted_orders),
+            "filled_orders": int(self.filled_orders),
+            "planned_cycles": int(self.planned_cycles),
+            "complete_block_count": int(self.complete_block_count),
+            "rejected_block_count": int(self.rejected_block_count),
+            "block_log_excess_mean": round(self.block_log_excess_mean, 8),
+            "ranking_score": round(self.ranking_score, 8),
+            "dsr_probability": round(self.dsr_probability, 8),
+            "usable": bool(self.usable),
+            "failure_reason": self.failure_reason,
+            "no_trade_reason_counts": dict(
+                sorted(self.no_trade_reason_counts.items())
+            ),
+            "calibration_history_sessions": int(self.calibration_history_sessions),
+            "eligible_bucket_count": int(self.eligible_bucket_count),
+            "cash_cycles": int(self.cash_cycles),
+        }
+
+
+def _record_screen_failure(
+    trial: optuna.Trial,
+    key_prefix: str,
+    reason: str,
+    evidence: Mapping[str, object],
+) -> None:
+    """Record a deterministic ``screen_failure_reason`` plus scalar evidence."""
+    trial.set_user_attr(f"{key_prefix}screen_failure_reason", reason)
+    for name, value in evidence.items():
+        trial.set_user_attr(f"{key_prefix}screen_failure_{name}", value)
+
+
+@dataclass(frozen=True, slots=True)
+class _ScreenTrialRecord:
+    """Frozen-trial-compatible writable record for confirmation-fold scoring.
+
+    Optuna frozen trials are immutable, so the bounded confirmation funnel
+    scores already-completed trials through this record, which satisfies the
+    ``number``/``set_user_attr`` surface that :func:`_score_trial_fold`
+    requires without mutating the study.
+    """
+
+    number: int
+    user_attrs: dict[str, object] = field(default_factory=dict)
+
+    def set_user_attr(self, key: str, value: object) -> None:
+        self.user_attrs[key] = value
 
 
 @dataclass(frozen=True, slots=True)
@@ -1630,36 +1729,54 @@ def _tune_champion(
         ) -> float:
             config = _config_from_trial(trial, num_threads=_lgb_threads)
             screen_config = _screen_config(config)
-            if any(proxy is None for proxy in _proxy_contexts):
+            fold0_proxy = _proxy_contexts[0]
+            if fold0_proxy is None:
                 raise optuna.TrialPruned()
-            valid_bounds: list[float] = []
-            for fold_index, proxy_context in enumerate(_proxy_contexts):
-                bound = _score_trial_fold(
-                    tuning_panel, _tuning_folds[fold_index],
-                    cast(PreparedCandidateContext, proxy_context),
-                    request, _route_manifest, feature_columns,
-                    _route.label_column, _route.relevance_column,
-                    screen_config, guard, trial, fold_index,
-                    callbacks=(), report_progress=False,
-                    key_prefix=f"h{_route.horizon}_",
-                )
-                if bound is None:
-                    executed = fold_index + 1
-                    skipped = len(_proxy_contexts) - executed
-                    trial.set_user_attr("executed_proxy_folds", executed)
-                    trial.set_user_attr("skipped_proxy_folds", skipped)
-                    trial.set_user_attr("terminal_fold_index", fold_index)
-                    trial.set_user_attr("terminal_reason", "fold_none")
-                    raise optuna.TrialPruned()
-                valid_bounds.append(float(bound))
-            trial.set_user_attr("proxy_execution_lower_bounds", valid_bounds)
-            objective = min(valid_bounds)
+            evidence = _score_trial_fold(
+                tuning_panel, _tuning_folds[0],
+                fold0_proxy,
+                request, _route_manifest, feature_columns,
+                _route.label_column, _route.relevance_column,
+                screen_config, guard, trial, 0,
+                callbacks=(), report_progress=False,
+                key_prefix=f"h{_route.horizon}_",
+            )
+            if evidence is None:
+                trial.set_user_attr("executed_proxy_folds", 1)
+                trial.set_user_attr("skipped_proxy_folds", len(_proxy_contexts) - 1)
+                trial.set_user_attr("terminal_fold_index", 0)
+                trial.set_user_attr("terminal_reason", "hard_pruned")
+                raise optuna.TrialPruned()
+            trial.set_user_attr("executed_proxy_folds", 1)
+            trial.set_user_attr("skipped_proxy_folds", len(_proxy_contexts) - 1)
+            trial.set_user_attr("terminal_fold_index", 0)
+            trial.set_user_attr("terminal_reason", "complete")
+            trial.set_user_attr(
+                "screen_fold0_rank_ic", round(float(evidence.rank_ic), 8)
+            )
+            trial.set_user_attr(
+                "screen_fold0_lower_bound", round(float(evidence.ranking_score), 8)
+            )
+            trial.set_user_attr(
+                "screen_fold0_mean", round(float(evidence.block_log_excess_mean), 8)
+            )
+            trial.set_user_attr(
+                "screen_fold0_block_count", int(evidence.complete_block_count)
+            )
+            trial.set_user_attr(
+                "screen_fold0_cash_cycles", int(evidence.cash_cycles)
+            )
+            trial.set_user_attr(
+                "screen_fold0_no_trade_reason_counts",
+                dict(sorted(evidence.no_trade_reason_counts.items())),
+            )
+            objective = float(evidence.ranking_score)
             logger.info(
-                "[EVAL] route=%sd trial=%s stage=screen_proxy_lower_bound "
-                "bounds=%s objective=%.8f",
+                "[EVAL] route=%sd trial=%s stage=screen_fold0_lower_bound "
+                "bound=%.8f rank_ic=%.8f mean=%.8f",
                 _route.horizon, trial.number,
-                [round(bound, 8) for bound in valid_bounds],
-                objective,
+                objective, float(evidence.rank_ic),
+                float(evidence.block_log_excess_mean),
             )
             return objective
 
@@ -1720,15 +1837,175 @@ def _tune_champion(
             or best_route_lb > best_screen_proxy_lower_bound
         ):
             best_screen_proxy_lower_bound = best_route_lb
-        screen_scores = sorted(
-            ((value, number) for value, number in completed if value > 0.0),
-            key=lambda pair: (-pair[0], pair[1]),
+
+        screen_usable = 0
+        screen_hard_pruned = 0
+        screen_failure_counts: Counter[str] = Counter()
+        blend_weight_counts: dict[float, int] = {}
+        screen_cash_cycles_total = 0
+        screen_no_trade_reason_counts_agg: Counter[str] = Counter()
+        for trial in study.trials:
+            blend_weight = trial.params.get("lambdarank_weight")
+            if isinstance(blend_weight, (int, float)):
+                weight = float(blend_weight)
+                blend_weight_counts[weight] = (
+                    blend_weight_counts.get(weight, 0) + 1
+                )
+            failure_reason = trial.user_attrs.get(
+                f"h{route.horizon}_screen_failure_reason"
+            )
+            if failure_reason is not None:
+                screen_hard_pruned += 1
+                screen_failure_counts[str(failure_reason)] += 1
+            elif trial.state is optuna.trial.TrialState.COMPLETE:
+                screen_usable += 1
+                cash_cycles = trial.user_attrs.get("screen_fold0_cash_cycles")
+                if isinstance(cash_cycles, int):
+                    screen_cash_cycles_total += cash_cycles
+                reasons = trial.user_attrs.get(
+                    "screen_fold0_no_trade_reason_counts"
+                )
+                if isinstance(reasons, dict):
+                    for reason, count in reasons.items():
+                        if isinstance(count, int):
+                            screen_no_trade_reason_counts_agg[str(reason)] += count
+
+        sortable: list[tuple[float, float, float, int, int]] = []
+        for trial in complete:
+            lb = trial.user_attrs.get("screen_fold0_lower_bound")
+            mean = trial.user_attrs.get("screen_fold0_mean")
+            ic = trial.user_attrs.get("screen_fold0_rank_ic")
+            if (
+                not isinstance(lb, (int, float))
+                or not isinstance(mean, (int, float))
+                or not isinstance(ic, (int, float))
+            ):
+                continue
+            sortable.append(
+                (float(lb), float(mean), float(ic), -trial.number, trial.number)
+            )
+        sortable.sort(
+            key=lambda row: (row[0], row[1], row[2], row[3]), reverse=True
         )
-        shortlist = screen_scores[: policy.promotion_width]
+        confirmation = sortable[: policy.confirmation_width]
+        confirmation_candidates = [row[4] for row in confirmation]
+        confirmed_rows: list[dict[str, object]] = []
+        candidate_pooled: list[
+            tuple[float, float, float, int, int]
+        ] = []
+        for trial_number in confirmation_candidates:
+            frozen_config = _config_from_params(
+                dict(study.trials[trial_number].params),
+                num_threads=lgb_threads,
+            )
+            screen_config = _screen_config(frozen_config)
+            record = _ScreenTrialRecord(trial_number)
+            fold_evidences: list[ScreenFoldEvidence] = []
+            ok = True
+            for fold_index in range(len(tuning_folds)):
+                proxy = proxy_contexts[fold_index]
+                if proxy is None:
+                    ok = False
+                    break
+                ev = _score_trial_fold(
+                    tuning_panel, tuning_folds[fold_index], proxy, request,
+                    route_manifest, feature_columns, route.label_column,
+                    route.relevance_column, screen_config, guard,
+                    cast(optuna.Trial, record),
+                    fold_index, callbacks=(), report_progress=False,
+                    key_prefix=f"h{route.horizon}_",
+                )
+                if ev is None or ev.rank_ic <= 0.0:
+                    ok = False
+                    break
+                fold_evidences.append(ev)
+            if not ok or len(fold_evidences) != len(tuning_folds):
+                continue
+            pooled_lb, pooled_mean, pooled_dsr, pooled_blocks = (
+                _pool_screen_evidence(
+                    fold_evidences, request, total_terminal_screen_trials
+                )
+            )
+            candidate_pooled.append(
+                (pooled_lb, pooled_mean, pooled_dsr, pooled_blocks, trial_number)
+            )
+            confirmed_rows.append(
+                {
+                    "trial_number": int(trial_number),
+                    "selection_source": "confirmed",
+                    "pooled_lower_bound": round(pooled_lb, 8),
+                    "pooled_mean_log_excess": round(pooled_mean, 8),
+                    "pooled_dsr_probability": round(pooled_dsr, 8),
+                    "pooled_block_count": int(pooled_blocks),
+                    "fold_evidence": [
+                        ev.to_json_safe() for ev in fold_evidences
+                    ],
+                }
+            )
+        strict_candidates = [
+            (lb, mean, dsr, blocks, number)
+            for lb, mean, dsr, blocks, number in candidate_pooled
+            if lb > 0.0
+        ]
+        strict_candidates.sort(key=lambda row: (-row[0], row[4]))
+        recovery_candidates = [
+            (lb, mean, dsr, blocks, number)
+            for lb, mean, dsr, blocks, number in candidate_pooled
+            if lb <= 0.0 and mean > 0.0
+        ]
+        recovery_candidates.sort(key=lambda row: (-row[1], row[4]))
+        selection_source_by_trial: dict[int, str] = {}
+        if strict_candidates:
+            strict_shortlisted = strict_candidates[: policy.promotion_width]
+            shortlist = [
+                (lb, number)
+                for lb, _mean, _dsr, _blocks, number in strict_shortlisted
+            ]
+            selection_source_by_trial = {
+                number: "strict"
+                for _lb, _mean, _dsr, _blocks, number in strict_shortlisted
+            }
+        else:
+            recovery_shortlisted = recovery_candidates[: policy.recovery_width]
+            shortlist = [
+                (lb, number)
+                for lb, _mean, _dsr, _blocks, number in recovery_shortlisted
+            ]
+            selection_source_by_trial = {
+                number: "recovery_positive_mean"
+                for _lb, _mean, _dsr, _blocks, number in recovery_shortlisted
+            }
+        strict_shortlisted_trials = sum(
+            1
+            for number in selection_source_by_trial.values()
+            if number == "strict"
+        )
+        recovery_shortlisted_trials = len(shortlist) - strict_shortlisted_trials
         for _screen_lb, trial_number in shortlist:
             logger.info(
-                "[EVAL] route=%sd trial=%s stage=promoted", route.horizon, trial_number
+                "[EVAL] route=%sd trial=%s stage=promoted source=%s",
+                route.horizon, trial_number,
+                selection_source_by_trial.get(trial_number, "strict"),
             )
+        for _name, _value in {
+            "screen_usable_trials": screen_usable,
+            "screen_hard_pruned_trials": screen_hard_pruned,
+            "screen_failure_counts": dict(sorted(screen_failure_counts.items())),
+            "screen_cash_cycles": screen_cash_cycles_total,
+            "screen_no_trade_reason_counts": dict(
+                sorted(screen_no_trade_reason_counts_agg.items())
+            ),
+            "confirmation_trials": len(confirmation),
+            "confirmed_trials": len(candidate_pooled),
+            "strict_shortlisted_trials": strict_shortlisted_trials,
+            "recovery_shortlisted_trials": recovery_shortlisted_trials,
+            "confirmed_candidate_evidence": confirmed_rows,
+            "blend_weight_distribution": {
+                f"{weight:.2f}": int(count)
+                for weight, count in sorted(blend_weight_counts.items())
+            },
+        }.items():
+            study.set_user_attr(_name, _value)
 
         champion, selection = _select_economic_champion(
             study, shortlist, tuning_panel, tuning_folds, fold_context, request,
@@ -1742,6 +2019,7 @@ def _tune_champion(
                 for trial in study.trials
                 if isinstance(trial.user_attrs.get("proxy_best_iteration"), int)
             },
+            selection_source_by_trial=selection_source_by_trial,
             lgb_threads=lgb_threads,
             timings=timings,
         )
@@ -1804,6 +2082,10 @@ def _tune_champion(
         study.set_user_attr("label_available_column", route.label_available_column)
         if best_route_lb is not None:
             study.set_user_attr("best_screen_proxy_lower_bound", best_route_lb)
+        if champion is not None:
+            study.set_user_attr(
+                "selected_blend_weight", float(champion.lambdarank_weight)
+            )
         selection_telemetry = selection
         if selection_telemetry is None:
             selection_telemetry = _selection_telemetry(
@@ -1881,9 +2163,9 @@ def _tune_champion(
 
         proxy_min_by_trial: dict[int, float] = {}
         for trial in study.trials:
-            bounds = trial.user_attrs.get("proxy_execution_lower_bounds")
-            if isinstance(bounds, list) and bounds:
-                proxy_min_by_trial[int(trial.number)] = float(min(bounds))
+            bound = trial.user_attrs.get("screen_fold0_lower_bound")
+            if isinstance(bound, (int, float)) and math.isfinite(float(bound)):
+                proxy_min_by_trial[int(trial.number)] = float(bound)
         concordance_x: list[float] = []
         concordance_y: list[float] = []
         for row in route_evidence:
@@ -1913,6 +2195,31 @@ def _tune_champion(
         )
         route_champions.append((key, n_terminal, route, study, champion))
 
+    def _sum_route_count(key: str) -> int:
+        return sum(
+            int(cast(int, attrs.get(key, 0)))
+            for attrs in route_attrs.values()
+            if isinstance(attrs.get(key), int)
+        )
+
+    def _merge_route_counter(key: str) -> dict[str, int]:
+        counter: Counter[str] = Counter()
+        for attrs in route_attrs.values():
+            counts = attrs.get(key)
+            if isinstance(counts, dict):
+                for name, count in counts.items():
+                    if isinstance(count, int):
+                        counter[str(name)] += count
+        return dict(sorted(counter.items()))
+
+    confirmed_candidate_evidence_merged: list[dict[str, object]] = []
+    for attrs in route_attrs.values():
+        rows = attrs.get("confirmed_candidate_evidence")
+        if isinstance(rows, list):
+            confirmed_candidate_evidence_merged.extend(
+                cast(list[dict[str, object]], rows)
+            )
+
     merged: dict[str, object] = {
         "candidate_horizons": list(request.candidate_horizons),
         "active_routes": [route.horizon for route in route_specs],
@@ -1932,6 +2239,27 @@ def _tune_champion(
         "pruned_trials": pruned_total,
         "shortlisted_trials": shortlisted_total,
         "economically_eligible_trials": eligible_total,
+        "screen_usable_trials": _sum_route_count("screen_usable_trials"),
+        "screen_hard_pruned_trials": _sum_route_count(
+            "screen_hard_pruned_trials"
+        ),
+        "screen_cash_cycles": _sum_route_count("screen_cash_cycles"),
+        "screen_failure_counts": _merge_route_counter("screen_failure_counts"),
+        "screen_no_trade_reason_counts": _merge_route_counter(
+            "screen_no_trade_reason_counts"
+        ),
+        "confirmation_trials": _sum_route_count("confirmation_trials"),
+        "confirmed_trials": _sum_route_count("confirmed_trials"),
+        "strict_shortlisted_trials": _sum_route_count(
+            "strict_shortlisted_trials"
+        ),
+        "recovery_shortlisted_trials": _sum_route_count(
+            "recovery_shortlisted_trials"
+        ),
+        "confirmed_candidate_evidence": confirmed_candidate_evidence_merged,
+        "blend_weight_distribution": _merge_route_counter(
+            "blend_weight_distribution"
+        ),
         "cache_bytes": sum(
             int(cast(int, attrs.get("cache_bytes", 0)))
             for attrs in route_attrs.values()
@@ -1953,7 +2281,9 @@ def _tune_champion(
         "route_budget",
         "proxy_session_stride",
         "promotion_width",
+        "confirmation_width",
         "economic_finalist_width",
+        "recovery_width",
         "fold_count",
         "all_positive_finalists",
         "promoted_trials",
@@ -1967,6 +2297,7 @@ def _tune_champion(
         "screen_fidelity",
         "proxy_train_rows",
         "proxy_validation_rows",
+        "selected_blend_weight",
     ):
         if telemetry_key not in merged:
             for attrs in route_attrs.values():
@@ -2027,7 +2358,9 @@ def _tune_champion(
         "route_budget",
         "proxy_session_stride",
         "promotion_width",
+        "confirmation_width",
         "economic_finalist_width",
+        "recovery_width",
         "fold_count",
         "all_positive_finalists",
         "promoted_trials",
@@ -2047,6 +2380,7 @@ def _tune_champion(
         "best_screen_proxy_lower_bound",
         "proxy_exact_spearman_concordance",
         "fold_retention_telemetry",
+        "selected_blend_weight",
     ):
         if telemetry_key in winner_study.user_attrs:
             merged[telemetry_key] = winner_study.user_attrs[telemetry_key]
@@ -2540,20 +2874,21 @@ def _score_trial_fold(
     callbacks: Sequence[Callable[..., object]] = (),
     report_progress: bool = True,
     key_prefix: str = "",
-) -> float | None:
-    """Score one tuning fold with the cached slim context; ``None`` prunes.
+) -> ScreenFoldEvidence | None:
+    """Score one tuning fold and return compact :class:`ScreenFoldEvidence`.
 
     The resource guard admits the allocation (including the prepared-fold cache
     bytes) before fitting and records elapsed/RSS telemetry in a ``finally`` so
     a callback-raised :class:`optuna.TrialPruned` still leaves timing evidence.
     ``key_prefix`` qualifies the recorded fold key with the route horizon so
-    cross-route keys never collide. The returned value is the execution-matched
-    holding-period block-log bootstrap lower bound from the canonical base
-    kernel replay, never a Rank-IC; a missing, non-finite, insufficient-block,
-    or non-positive fold fails closed to ``None``. A breach raises
-    :class:`TrainingCapacityError`. Fold model, prediction frame, and LightGBM
-    datasets are local to this call and released on return, so a trial never
-    retains every fold's artifacts.
+    cross-route keys never collide. Every fitted, finite replay produces
+    evidence -- including a **negative** bootstrap lower bound, which is usable
+    screen evidence, never a ``None`` sentinel. ``None`` is reserved for
+    hard-invalid model/kernel/capacity paths only, and each such return records
+    a deterministic ``screen_failure_reason`` plus scalar evidence in the trial
+    user attrs first. A breach raises :class:`TrainingCapacityError`. Fold
+    model, prediction frame, and LightGBM datasets are local to this call and
+    released on return, so a trial never retains every fold's artifacts.
     """
     del fold, feature_columns
     key = f"{key_prefix}trial_{trial.number}_fold_{fold_index}"
@@ -2572,12 +2907,19 @@ def _score_trial_fold(
             key, "fit_predict", time.perf_counter() - model_started
         )
         if result is None:
+            _record_screen_failure(trial, key_prefix, "fit_failed", {})
             return None
         _ic, scored, outcome = result
         if outcome.best_iteration is not None:
             trial.set_user_attr("proxy_best_iteration", outcome.best_iteration)
         kernel = context.execution_kernel
         if kernel is None:
+            _record_screen_failure(
+                trial,
+                key_prefix,
+                "fit_failed",
+                {"rank_ic": round(float(_ic), 8)},
+            )
             return None
         ledger_started = time.perf_counter()
         calibration_ledger = _build_calibration_ledger(
@@ -2601,21 +2943,112 @@ def _score_trial_fold(
         for stage, seconds in evidence.replay_stage_seconds.items():
             guard.record_fold_stage(key, stage, float(seconds))
         if evidence.filled_orders <= 0:
+            _record_screen_failure(
+                trial,
+                key_prefix,
+                "no_filled_orders",
+                {
+                    "rank_ic": round(float(_ic), 8),
+                    "attempted_orders": int(evidence.attempted_orders),
+                    "filled_orders": int(evidence.filled_orders),
+                },
+            )
             return None
-        bound = _execution_matched_lower_bound(
-            evidence, request, base_manifest, trial.number
+        compounding = _compounding_evidence(
+            evidence.strategy_returns,
+            evidence.benchmark_returns,
+            evidence.decision_boundaries,
+            int(base_manifest.label_horizon_sessions),
+            request,
+            PromotionRiskBudget(),
+            trial.number,
         )
-        if not math.isfinite(bound) or bound <= 0.0:
+        if compounding.complete_block_count < 3:
+            _record_screen_failure(
+                trial,
+                key_prefix,
+                "insufficient_compounding_blocks",
+                {
+                    "rank_ic": round(float(_ic), 8),
+                    "attempted_orders": int(evidence.attempted_orders),
+                    "filled_orders": int(evidence.filled_orders),
+                    "complete_block_count": int(compounding.complete_block_count),
+                },
+            )
             return None
+        lower_bound = float(compounding.bootstrap_lower_bound)
+        if not math.isfinite(lower_bound):
+            _record_screen_failure(
+                trial,
+                key_prefix,
+                "non_finite_compounding",
+                {
+                    "rank_ic": round(float(_ic), 8),
+                    "filled_orders": int(evidence.filled_orders),
+                    "complete_block_count": int(compounding.complete_block_count),
+                },
+            )
+            return None
+        mean = float(np.mean(compounding.block_log_excess))
+        if not math.isfinite(mean):
+            _record_screen_failure(
+                trial,
+                key_prefix,
+                "non_finite_compounding",
+                {
+                    "rank_ic": round(float(_ic), 8),
+                    "filled_orders": int(evidence.filled_orders),
+                    "block_log_excess_mean": round(mean, 8),
+                },
+            )
+            return None
+        if mean <= 0.0:
+            _record_screen_failure(
+                trial,
+                key_prefix,
+                "non_positive_point_estimate",
+                {
+                    "rank_ic": round(float(_ic), 8),
+                    "filled_orders": int(evidence.filled_orders),
+                    "block_log_excess_mean": round(mean, 8),
+                    "lower_bound": round(lower_bound, 8),
+                },
+            )
+            return None
+        calibration_evidence = evidence.calibration_evidence or {}
+        fold_evidence = ScreenFoldEvidence(
+            rank_ic=float(_ic),
+            attempted_orders=evidence.attempted_orders,
+            filled_orders=evidence.filled_orders,
+            planned_cycles=evidence.planned_cycles,
+            complete_block_count=compounding.complete_block_count,
+            rejected_block_count=compounding.rejected_block_count,
+            block_log_excess_mean=mean,
+            lower_bound=lower_bound,
+            dsr_probability=float(compounding.dsr_probability),
+            usable=True,
+            failure_reason=None,
+            no_trade_reason_counts=dict(evidence.no_trade_reason_counts),
+            calibration_history_sessions=int(
+                cast(int, calibration_evidence.get("history_sessions", 0))
+            ),
+            eligible_bucket_count=int(
+                cast(int, calibration_evidence.get("eligible_bucket_count", 0))
+            ),
+            cash_cycles=int(
+                evidence.no_trade_reason_counts.get("no-feasible-allocation", 0)
+            ),
+            block_log_excess=tuple(compounding.block_log_excess),
+        )
         trial.set_user_attr(
             f"{key_prefix}proxy_execution_lower_bound",
-            round(float(bound), 8),
+            round(lower_bound, 8),
         )
         if report_progress:
-            trial.report(float(bound), step=fold_index)
+            trial.report(float(lower_bound), step=fold_index)
             if trial.should_prune():
                 raise optuna.TrialPruned()
-        return float(bound)
+        return fold_evidence
     finally:
         guard.record_fold(
             key,
@@ -2795,6 +3228,7 @@ def _screen_config(config: LambdaRankConfig) -> LambdaRankConfig:
             "min_group_size",
             "half_life_sessions",
             "num_threads",
+            "lambdarank_weight",
         )
     }
     return LambdaRankConfig(
@@ -2845,6 +3279,7 @@ def _screen_informed_full_refit_config(config: LambdaRankConfig) -> LambdaRankCo
             "min_group_size",
             "half_life_sessions",
             "num_threads",
+            "lambdarank_weight",
         )
     }
     return LambdaRankConfig(
@@ -3217,15 +3652,21 @@ def _select_economic_champion(
     total_terminal_screen_trials: int = 0,
     policy: ScreenFidelityPolicy,
     proxy_best_iteration_by_trial: dict[int, int] | None = None,
+    selection_source_by_trial: dict[int, str] | None = None,
     lgb_threads: int = 1,
     timings: _SelectionTimings | None = None,
 ) -> tuple[LambdaRankConfig | None, dict[str, object] | None]:
     """Promote, refit, and exactly replay the route's economic finalists.
 
-    The promoted ``shortlist`` (already limited to ``policy.promotion_width``)
+    The promoted ``shortlist`` (already limited to ``policy.promotion_width``
+    strict candidates, or ``policy.recovery_width`` ``recovery_positive_mean``
+    candidates when no confirmed candidate has a positive pooled lower bound)
     is full-refit on fold 0 with an adaptive continuation budget derived from
     each candidate's proxy screen best iteration and ranked by
-    ``(-full_fold0_ic, -proxy_lower_bound, trial_number)``. Up to
+    ``(-full_fold0_ic, -proxy_lower_bound, trial_number)``. Recovery candidates
+    carry ``selection_source='recovery_positive_mean'`` (supplied via
+    ``selection_source_by_trial``) and are never backfilled beyond the
+    pre-registered recovery width. Up to
     ``policy.economic_finalist_width`` all-positive candidates are then refit
     over the remaining folds and each is replayed through the exact event
     ledger exactly once under the single pre-registered default
@@ -3289,6 +3730,17 @@ def _select_economic_champion(
     early_rejected_seconds: list[float] = []
     replay_seconds = 0.0
     screen_lb_by_trial = {trial_number: screen_lb for screen_lb, trial_number in shortlist}
+    source_by_trial = dict(selection_source_by_trial or {})
+    recovery_shortlisted_trials = sum(
+        1
+        for trial_number in screen_lb_by_trial
+        if source_by_trial.get(trial_number) == "recovery_positive_mean"
+    )
+    if recovery_shortlisted_trials > policy.recovery_width:
+        raise ValueError(
+            "recovery shortlist cannot exceed the pre-registered recovery width "
+            f"({recovery_shortlisted_trials} > {policy.recovery_width})"
+        )
     proxy_best_by_trial = dict(proxy_best_iteration_by_trial or {})
 
     remaining_indices = tuple(range(1, len(tuning_folds)))
@@ -3439,6 +3891,9 @@ def _select_economic_champion(
                 {
                     "trial_number": int(trial_number),
                     "policy_id": policy_id,
+                    "selection_source": source_by_trial.get(
+                        trial_number, "strict"
+                    ),
                     "eligible": False,
                     "failure_reasons": ["replay_capacity_exceeded"],
                     "attempted_orders": 0,
@@ -3478,6 +3933,10 @@ def _select_economic_champion(
             selection_multiplicity_version=SELECTION_MULTIPLICITY_VERSION,
         )
         shortlist_evidence.append(evidence.to_json_safe())
+        evidence_row = shortlist_evidence[-1]
+        evidence_row["selection_source"] = source_by_trial.get(
+            trial_number, "strict"
+        )
         logger.info(
             "[EVAL] trial=%s policy=%s stage=evidence eligible=%s failure_reasons=%s",
             trial_number,
@@ -3654,6 +4113,9 @@ def _config_from_trial(
             "lambda_l1": trial.suggest_float("lambda_l1", 1e-4, 10.0, log=True),
             "lambda_l2": trial.suggest_float("lambda_l2", 1e-4, 10.0, log=True),
             "max_bin": trial.suggest_categorical("max_bin", (127, 255)),
+            "lambdarank_weight": trial.suggest_categorical(
+                "lambdarank_weight", (0.25, 0.50, 0.75)
+            ),
         },
         num_threads=num_threads,
     )
@@ -3674,6 +4136,7 @@ def _config_from_params(
         lambda_l2=float(params["lambda_l2"]),
         max_bin=int(params["max_bin"]),
         num_threads=num_threads or 1,
+        lambdarank_weight=float(params.get("lambdarank_weight", LAMBDARANK_WEIGHT)),
     )
 
 
@@ -4581,6 +5044,45 @@ def _compounding_evidence(
         dsr_probability=dsr_probability,
         complete_block_count=len(blocks),
         rejected_block_count=rejected,
+    )
+
+def _pool_screen_evidence(
+    evidences: Sequence[ScreenFoldEvidence],
+    request: TrainingRequest,
+    n_trials: int,
+) -> tuple[float, float, float, int]:
+    """Pool confirmed folds into one economic comparator.
+
+    The concatenated already-computed block-log-excess series (the final
+    economic replay judges a concatenated OOS ledger, so the proxy comparator
+    uses the same aggregate unit) yields one seeded moving-block bootstrap
+    lower bound, one Deflated Sharpe probability, the pooled mean log excess,
+    and the pooled complete-block count. Returns
+    ``(lower_bound, mean_log_excess, dsr_probability, block_count)``.
+    """
+    blocks: list[float] = []
+    for evidence in evidences:
+        blocks.extend(evidence.block_log_excess)
+    if not blocks:
+        return 0.0, 0.0, 0.0, 0
+    budget = PromotionRiskBudget()
+    lower_bound = _moving_block_bootstrap_lower_bound(
+        blocks,
+        block_length=2,
+        n_bootstrap=max(request.n_bootstrap, 2),
+        seed=request.seed,
+        alpha=budget.bootstrap_alpha,
+    )
+    dsr_probability = _deflated_sharpe_probability(
+        blocks,
+        annualization=252,
+        n_trials=n_trials,
+    )
+    return (
+        float(lower_bound),
+        float(np.mean(blocks)),
+        float(dsr_probability),
+        len(blocks),
     )
 
 
