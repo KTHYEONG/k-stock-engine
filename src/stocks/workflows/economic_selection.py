@@ -21,7 +21,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-SELECTION_POLICY_VERSION = "economic-selection-v5-execution-matched"
+SELECTION_POLICY_VERSION = "economic-selection-v6-confirmed-recovery"
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,19 +32,26 @@ class ScreenFidelityPolicy:
     ``proxy_session_stride`` is the deterministic in-split session step used to
     build the proxy screen context (derived from ``ceil(sqrt(route_budget))``,
     so a larger search budget automatically keeps a proportional fixed temporal
-    sample). ``promotion_width`` is the number of positive-screen candidates
-    promoted to a full fold-0 refit; ``economic_finalist_width`` is the number
+    sample). ``promotion_width`` is the number of candidates confirmed on the
+    remaining proxy folds and promoted to a full fold-0 refit;
+    ``confirmation_width`` is the bounded confirmation funnel width
+    (equal to ``promotion_width``); ``economic_finalist_width`` is the number
     of all-positive candidates taken to the exact single-policy compounding
-    replay (``ceil(sqrt(promotion_width))`` per route).
+    replay (``ceil(sqrt(promotion_width))`` per route); ``recovery_width`` is
+    the pre-registered recovery ceiling (equal to ``economic_finalist_width``)
+    for candidates admitted solely on a positive pooled mean log excess.
     ``widths`` exposes the ``(route_budget, proxy_session_stride,
-    promotion_width, economic_finalist_width)`` profile that drives the
-    81-trial three-route three-fold profile to a 27-to-6-to-6-to-3 funnel.
+    promotion_width, confirmation_width, economic_finalist_width,
+    recovery_width)`` profile that drives the 81-trial three-route three-fold
+    profile to a 27-to-6-to-6-to-6-to-3-to-3 funnel.
     """
 
     route_budget: int
     proxy_session_stride: int
     promotion_width: int
+    confirmation_width: int
     economic_finalist_width: int
+    recovery_width: int
 
     @classmethod
     def for_budget(
@@ -62,10 +69,17 @@ class ScreenFidelityPolicy:
         ``promotion_width`` never exceeds the route budget and a degenerate
         budget of one trial still promotes two candidates so a screen quality
         ranking exists before economic evidence is spent.
-        ``economic_finalist_width`` is ``ceil(sqrt(promotion_width))``: the
-        route's top all-positive candidates are each replayed exactly once
-        under the single default compounding policy, and a rejected finalist
-        yields no champion. Raises ``ValueError`` for non-positive inputs.
+        ``confirmation_width`` equals ``promotion_width`` and bounds the
+        two-stage confirmation funnel: only the top fold-0 candidates are
+        replayed on the remaining proxy folds before the pooled economic
+        comparator runs. ``economic_finalist_width`` is
+        ``ceil(sqrt(promotion_width))``: the route's top all-positive
+        candidates are each replayed exactly once under the single default
+        compounding policy, and a rejected finalist yields no champion.
+        ``recovery_width`` equals ``economic_finalist_width`` and caps how many
+        recovery candidates (positive pooled mean log excess, no positive
+        pooled lower bound) may reach full refit. Raises ``ValueError`` for
+        non-positive inputs.
         """
         if total_trials < 1 or route_count < 1 or fold_count < 1:
             raise ValueError("total_trials, route_count, and fold_count must be positive")
@@ -79,21 +93,27 @@ class ScreenFidelityPolicy:
             promotion_width,
             max(1, math.ceil(math.sqrt(promotion_width))),
         )
+        confirmation_width = promotion_width
+        recovery_width = economic_finalist_width
         return cls(
             route_budget=route_budget,
             proxy_session_stride=proxy_session_stride,
             promotion_width=promotion_width,
+            confirmation_width=confirmation_width,
             economic_finalist_width=economic_finalist_width,
+            recovery_width=recovery_width,
         )
 
     @property
-    def widths(self) -> tuple[int, int, int, int]:
-        """The ``(route_budget, stride, promotion, economic_finalist)`` profile."""
+    def widths(self) -> tuple[int, int, int, int, int, int]:
+        """The ``(route_budget, stride, promotion, confirmation, finalist, recovery)`` profile."""
         return (
             self.route_budget,
             self.proxy_session_stride,
             self.promotion_width,
+            self.confirmation_width,
             self.economic_finalist_width,
+            self.recovery_width,
         )
 
     def to_json_safe(self) -> dict[str, object]:
@@ -103,7 +123,9 @@ class ScreenFidelityPolicy:
             "route_budget": int(self.route_budget),
             "proxy_session_stride": int(self.proxy_session_stride),
             "promotion_width": int(self.promotion_width),
+            "confirmation_width": int(self.confirmation_width),
             "economic_finalist_width": int(self.economic_finalist_width),
+            "recovery_width": int(self.recovery_width),
             "configured_compounding_policy_cells": 1,
         }
 
