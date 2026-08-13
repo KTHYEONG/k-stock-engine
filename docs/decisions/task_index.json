@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "BACKTEST_ROBUSTNESS_OVERHAUL",
+      "date": "2026-08-13",
+      "adr_id": "ADR_20260813_BACKTEST_ROBUSTNESS_OVERHAUL",
+      "domain": "signal",
+      "title": "Backtest Robustness Overhaul v4",
+      "why": "Replace Rank-IC-first selection with cost-aware multi-fold stability screening and correct missing-value/recency handling.",
+      "resolution": "Implemented rank-stationary predictors, native missing-row retention, newest-anchored weights, three-fold economic proxy screening, global multiplicity 81, single-policy replay, active-IR Gate 3, and recorded the completed reference run as fail-closed NO_TRADE.",
+      "impact": "Selection is more conservative and economically aligned; reference snapshot completed within the RSS budget but produced no promotable candidate."
+    },
+    {
       "task_id": "backtest_performance_improvement",
       "date": "2026-08-13",
       "adr_id": "ADR_20260813_backtest_performance_improvement",
