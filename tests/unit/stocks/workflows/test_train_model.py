@@ -5,6 +5,7 @@ import json
 import math
 from collections.abc import Callable
 from dataclasses import replace as dataclass_replace
+from datetime import UTC, datetime
 
 import polars as pl
 import pytest
@@ -446,6 +447,7 @@ def _fake_candidate_context(train_rows: int = 12) -> tm.PreparedCandidateContext
     )
     index = pl.DataFrame(
         {
+            "session_index": pl.Series([], dtype=pl.Int64),
             "session": pl.Series([], dtype=pl.Datetime("us", "UTC")),
             "instrument_id": pl.Series([], dtype=pl.Utf8),
         }
@@ -484,10 +486,11 @@ class _FakeFoldContextProvider:
 
 
 def _fake_fold_contexts(*_args, **_kwargs):
-    """``_fit_stable_contexts`` fake returning fold-0, proxy, and a lazy provider."""
+    """``_fit_stable_contexts`` fake returning fold-0, per-fold proxies, and a provider."""
+    tuning_folds = _args[1] if len(_args) > 1 else []
     return (
         _fake_candidate_context(),
-        _fake_candidate_context(),
+        tuple(_fake_candidate_context() for _ in tuning_folds),
         _FakeFoldContextProvider(),
     )
 
@@ -519,7 +522,7 @@ def test_tuning_never_includes_first_outer_oos(monkeypatch, tmp_path) -> None:
         captured["tuning_min_session"] = int(tuning_panel["session_index"].min())
         return (
             _fake_candidate_context(),
-            _fake_candidate_context(),
+            tuple(_fake_candidate_context() for _ in tuning_folds),
             _FakeFoldContextProvider(),
         )
 
@@ -644,13 +647,13 @@ def test_tuning_economic_tie_breaks_by_lowest_trial_number(monkeypatch, tmp_path
     assert telemetry["selection_status"] == "selected"
     assert telemetry["selected_trial_number"] == 0
     assert telemetry["screened_trials"] == request.optuna_trials
-    assert telemetry["selection_policy_version"] == "economic-selection-v3-compounding"
+    assert telemetry["selection_policy_version"] == "economic-selection-v4-stability"
     assert telemetry["promotion_width"] == 2
     assert telemetry["economic_finalist_width"] == 2
     assert telemetry["shortlisted_trials"] == 2
-    assert telemetry["economically_eligible_trials"] == 12
-    assert telemetry["selected_policy_id"] == "5:ga2_tb0.2"
-    assert telemetry["selected_growth_risk_aversion"] == 2.0
+    assert telemetry["economically_eligible_trials"] == 2
+    assert telemetry["selected_policy_id"] == "default:neutral"
+    assert telemetry["selected_growth_risk_aversion"] == 1.0
     assert telemetry["selected_turnover_budget"] == 0.2
     assert telemetry["selected_inner_compounding_lower_bound"] > 0.0
     assert telemetry["selected_inner_dsr_probability"] >= 0.95
@@ -711,9 +714,10 @@ def test_tuning_rejects_economically_ineligible_candidates(monkeypatch, tmp_path
     )
     assert tm.LambdaRankConfig._tuning_telemetry["economically_eligible_trials"] == 0
     evidence = tm.LambdaRankConfig._tuning_telemetry["shortlist_candidate_evidence"]
-    assert len(evidence) == 12
+    assert len(evidence) == 2
     assert {row["trial_number"] for row in evidence} == {0, 1}
-    assert len({row["policy_id"] for row in evidence}) == 6
+    assert len({row["policy_id"] for row in evidence}) == 1
+    assert {row["policy_id"] for row in evidence} == {"default:neutral"}
     for row in evidence:
         assert row["eligible"] is False
         assert set(row["failure_reasons"]) == {
@@ -1227,7 +1231,7 @@ def test_tuning_rejects_non_positive_bootstrap_candidates(monkeypatch, tmp_path)
         "no_economically_eligible_candidate"
     )
     evidence = tm.LambdaRankConfig._tuning_telemetry["shortlist_candidate_evidence"]
-    assert len(evidence) == 12
+    assert len(evidence) == 2
     for row in evidence:
         assert row["eligible"] is False
         assert "non_positive_bootstrap_lower_bound" in row["failure_reasons"]
@@ -1461,7 +1465,7 @@ def test_tuning_records_early_rejected_full_refits(monkeypatch, tmp_path) -> Non
     assert telemetry["full_refit_boosting_rounds"] == 900
     assert telemetry["full_refit_early_stopping_rounds"] == 100
     assert telemetry["all_positive_finalists"] == 1
-    assert len(telemetry["shortlist_candidate_evidence"]) == 6
+    assert len(telemetry["shortlist_candidate_evidence"]) == 1
 
 
 def test_screen_informed_full_refit_config_derives_budget_from_screen_constants() -> None:
@@ -2060,7 +2064,7 @@ def test_tuning_selects_longer_horizon_route_when_bootstrap_is_higher(
     )
     assert route is not None
     assert route.horizon == 10
-    assert n_trials == 2
+    assert n_trials == 4
     assert config is not None
     assert config._tuning_telemetry["selected_horizon"] == 10
     assert config._tuning_telemetry["selection_status"] == "selected"
@@ -2111,20 +2115,13 @@ def test_tuning_records_route_specific_candidate_evidence(monkeypatch, tmp_path)
     assert route is not None
     telemetry = config._tuning_telemetry
     evidence = telemetry["shortlist_candidate_evidence"]
-    assert len(evidence) == 24
+    assert len(evidence) == 4
     assert {row["holding_horizon_sessions"] for row in evidence} == {5, 10}
-    assert {row["policy_id"] for row in evidence} == {
-        "0:ga0.5_tb0.1",
-        "1:ga0.5_tb0.2",
-        "2:ga1_tb0.1",
-        "3:ga1_tb0.2",
-        "4:ga2_tb0.1",
-        "5:ga2_tb0.2",
-    }
+    assert {row["policy_id"] for row in evidence} == {"default:neutral"}
     assert any(row["label_column"] == "residual_o2o_5d" for row in evidence)
     assert any(row["label_column"] == "residual_o2o_10d" for row in evidence)
     assert any(row["label_available_column"] == "label_available_time_10d" for row in evidence)
-    assert telemetry["economically_eligible_trials"] == 12
+    assert telemetry["economically_eligible_trials"] == 2
     assert set(telemetry["routes"]) == {"5", "10"}
     assert telemetry["per_route_trial_budget"] == 2
 
@@ -2496,6 +2493,139 @@ def test_economic_candidate_evidence_propagates_compact_compounding_overlay() ->
     assert "records" not in defaulted.to_json_safe()["compounding_overlay"]
 
 
+def test_gate3_active_information_ratio_replaces_stable_ir() -> None:
+    budget = PromotionRiskBudget()
+    request = TrainingRequest(artifact_id="gate3", n_folds=3)
+
+    good = _evaluate_gates(
+        _positive_replay(),
+        [0.05, 0.06, 0.07],
+        budget,
+        request,
+        n_trials=3,
+    )
+    reasons = {str(r) for r in good["reasons"]}
+    assert any(r.startswith("gate3_active_information_ratio=") for r in reasons)
+    assert all("stable_ir" not in r for r in reasons)
+    assert good["passed"] is True
+
+    flat = _evaluate_gates(
+        _positive_replay(strategy_returns=[0.001] * 60, benchmark_returns=[0.001] * 60),
+        [0.05, 0.06, 0.07],
+        budget,
+        request,
+        n_trials=3,
+    )
+    flat_reasons = {str(r) for r in flat["reasons"]}
+    assert any(
+        r.startswith("gate3_active_information_ratio=0.0")
+        for r in flat_reasons
+    )
+    assert flat["passed"] is False
+
+
+def test_economic_screen_score_prefers_stable_low_turnover_top_k() -> None:
+    from datetime import timedelta
+
+    from src.stocks.workflows.train_model import _economic_screen_score
+
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    rows = [
+        {
+            "session_index": i,
+            "session": start + timedelta(days=i),
+            "instrument_id": name,
+        }
+        for i in range(30)
+        for name in ("A", "B", "C", "D", "E")
+    ]
+    labels = pl.DataFrame(rows)
+    costs = default_stress_schedule()
+
+    good = labels.with_columns(
+        pl.Series([0.08, 0.07, 0.06, 0.05, 0.04] * 30).alias("residual_o2o_5d")
+    )
+    good_scores = labels.with_columns(
+        pl.Series([0.9, 0.8, 0.7, 0.6, 0.5] * 30).alias("pred_score")
+    )
+    high_turnover = labels.with_columns(
+        pl.Series(
+            ([0.9, 0.5, 0.1, 0.3, 0.2] * 15)
+            + ([0.1, 0.9, 0.5, 0.3, 0.2] * 15)
+        ).alias("pred_score")
+    )
+    stable_bound = _economic_screen_score(
+        good, good_scores,
+        label_column="residual_o2o_5d",
+        top_k=2,
+        holding_horizon_sessions=5,
+        cost_schedule=costs,
+        n_bootstrap=200,
+        bootstrap_alpha=0.05,
+        seed=42,
+    )
+    churn_bound = _economic_screen_score(
+        good, high_turnover,
+        label_column="residual_o2o_5d",
+        top_k=2,
+        holding_horizon_sessions=5,
+        cost_schedule=costs,
+        n_bootstrap=200,
+        bootstrap_alpha=0.05,
+        seed=42,
+    )
+    assert stable_bound > churn_bound
+    assert stable_bound > 0.0
+
+
+def test_economic_screen_score_fails_closed_on_insufficient_blocks() -> None:
+    from src.stocks.workflows.train_model import _economic_screen_score
+
+    labels = pl.DataFrame(
+        {
+            "session_index": [0, 1, 2],
+            "session": [
+                datetime(2024, 1, 1, tzinfo=UTC),
+                datetime(2024, 1, 2, tzinfo=UTC),
+                datetime(2024, 1, 3, tzinfo=UTC),
+            ],
+            "instrument_id": ["A", "B", "C"],
+            "residual_o2o_5d": [0.01, 0.02, 0.03],
+        }
+    )
+    scored = pl.DataFrame(
+        {
+            "session": labels["session"],
+            "instrument_id": ["A", "B", "C"],
+            "pred_score": [0.9, 0.8, 0.7],
+        }
+    )
+    assert (
+        _economic_screen_score(
+            labels, scored,
+            label_column="residual_o2o_5d",
+            top_k=2,
+            holding_horizon_sessions=5,
+            cost_schedule=default_stress_schedule(),
+            n_bootstrap=200,
+            bootstrap_alpha=0.05,
+            seed=42,
+        )
+        == 0.0
+    )
+    with pytest.raises(ValueError, match="session_index"):
+        _economic_screen_score(
+            labels.drop("session_index"), scored,
+            label_column="residual_o2o_5d",
+            top_k=2,
+            holding_horizon_sessions=5,
+            cost_schedule=default_stress_schedule(),
+            n_bootstrap=200,
+            bootstrap_alpha=0.05,
+            seed=42,
+        )
+
+
 def test_gate2_and_gate5_consume_block_log_compounding_evidence() -> None:
     budget = PromotionRiskBudget()
     request = TrainingRequest(artifact_id="gate_blk", n_folds=3)
@@ -2537,7 +2667,7 @@ def test_gate2_and_gate5_consume_block_log_compounding_evidence() -> None:
     assert negative["passed"] is False
 
 
-def test_tuning_six_policy_grid_is_complete_deterministic_and_guarded(
+def test_tuning_single_default_policy_is_deterministic_and_guarded(
     monkeypatch, tmp_path,
 ) -> None:
     import src.stocks.workflows.train_model as tm
@@ -2583,18 +2713,11 @@ def test_tuning_six_policy_grid_is_complete_deterministic_and_guarded(
     )
     assert config is not None
     assert n_trials == request.optuna_trials
-    assert calls["count"] == 12
+    assert calls["count"] == 2
     telemetry = config._tuning_telemetry
-    expected_policies = {
-        "0:ga0.5_tb0.1",
-        "1:ga0.5_tb0.2",
-        "2:ga1_tb0.1",
-        "3:ga1_tb0.2",
-        "4:ga2_tb0.1",
-        "5:ga2_tb0.2",
-    }
+    expected_policies = {"default:neutral"}
     evidence = telemetry["shortlist_candidate_evidence"]
-    assert len(evidence) == 12
+    assert len(evidence) == 2
     assert {row["policy_id"] for row in evidence} == expected_policies
     assert {row["trial_number"] for row in evidence} == {0, 1}
     for row in evidence:
@@ -2604,6 +2727,8 @@ def test_tuning_six_policy_grid_is_complete_deterministic_and_guarded(
         assert "mean_confidence_scale" in overlay
     assert telemetry["compounding_policy_replays"] == evidence
     assert isinstance(telemetry.get("replay_resource"), dict)
+    assert telemetry["configured_compounding_policy_cells"] == 1
+    assert telemetry["exact_compounding_policy_replays"] == 2
 
 
 def test_final_metrics_preserve_full_per_decision_overlay(tmp_path) -> None:
@@ -2710,7 +2835,7 @@ def test_tuning_lower_rank_ic_candidate_with_higher_compounding_objective_wins(
     state = {"n": 0}
 
     def spy_ledger(*_a, **_kw):
-        key = "trial0" if state["n"] < 6 else "trial1"
+        key = "trial0" if state["n"] < 1 else "trial1"
         state["n"] += 1
         return ledger[key]
 
@@ -2731,7 +2856,7 @@ def test_tuning_lower_rank_ic_candidate_with_higher_compounding_objective_wins(
     assert config is not None
     telemetry = config._tuning_telemetry
     assert telemetry["selected_trial_number"] == 1
-    assert telemetry["selected_policy_id"] == "5:ga2_tb0.2"
+    assert telemetry["selected_policy_id"] == "default:neutral"
 
 
 def test_tuning_candidate_failing_dsr_cannot_win(monkeypatch, tmp_path) -> None:
@@ -2837,30 +2962,30 @@ def test_economic_candidate_evidence_search_ledger_reconciliation() -> None:
         request,
         1,
         0.02,
-        terminal_trial_count=27,
-        policy_id="5:ga2_tb0.2",
+        terminal_trial_count=81,
+        policy_id="default:neutral",
         total_terminal_screen_trials=81,
         route_terminal_screen_trials=27,
-        exact_compounding_policy_replays=6,
-        configured_compounding_policy_cells=6,
-        selection_multiplicity_version="selection-multiplicity-raw-count-v1",
+        exact_compounding_policy_replays=1,
+        configured_compounding_policy_cells=1,
+        selection_multiplicity_version="selection-multiplicity-global-count-v1",
     )
     assert isinstance(evidence, EconomicCandidateEvidence)
     assert evidence.eligible is True
     assert evidence.total_terminal_screen_trials == 81
     assert evidence.route_terminal_screen_trials == 27
-    assert evidence.exact_compounding_policy_replays == 6
-    assert evidence.configured_compounding_policy_cells == 6
+    assert evidence.exact_compounding_policy_replays == 1
+    assert evidence.configured_compounding_policy_cells == 1
     row = evidence.to_json_safe()
     assert row["total_terminal_screen_trials"] == 81
     assert row["route_terminal_screen_trials"] == 27
-    assert row["exact_compounding_policy_replays"] == 6
-    assert row["configured_compounding_policy_cells"] == 6
+    assert row["exact_compounding_policy_replays"] == 1
+    assert row["configured_compounding_policy_cells"] == 1
     assert row["selection_multiplicity_version"] == (
-        "selection-multiplicity-raw-count-v1"
+        "selection-multiplicity-global-count-v1"
     )
-    assert row["terminal_trial_count"] == 27
-    assert row["policy_id"] == "5:ga2_tb0.2"
+    assert row["terminal_trial_count"] == 81
+    assert row["policy_id"] == "default:neutral"
     assert row["total_terminal_screen_trials"] == row["route_terminal_screen_trials"] * 3
     json.dumps(row)
 
@@ -2891,20 +3016,20 @@ def test_tuning_emits_reconciled_search_ledger(monkeypatch, tmp_path) -> None:
     assert telemetry["total_terminal_screen_trials"] == 4
     assert telemetry["n_terminal_trials"] == 4
     assert telemetry["route_terminal_screen_trials"] == 2
-    assert telemetry["configured_compounding_policy_cells"] == 6
-    assert telemetry["exact_compounding_policy_replays"] == 24
+    assert telemetry["configured_compounding_policy_cells"] == 1
+    assert telemetry["exact_compounding_policy_replays"] == 4
     assert telemetry["selection_multiplicity_version"] == (
-        "selection-multiplicity-raw-count-v1"
+        "selection-multiplicity-global-count-v1"
     )
     for row in telemetry["shortlist_candidate_evidence"]:
         assert row["total_terminal_screen_trials"] == 4
         assert row["route_terminal_screen_trials"] == 2
-        assert row["exact_compounding_policy_replays"] == 6
-        assert row["configured_compounding_policy_cells"] == 6
+        assert row["exact_compounding_policy_replays"] == 1
+        assert row["configured_compounding_policy_cells"] == 1
         assert row["selection_multiplicity_version"] == (
-            "selection-multiplicity-raw-count-v1"
+            "selection-multiplicity-global-count-v1"
         )
-        assert row["policy_id"]
+        assert row["policy_id"] == "default:neutral"
     for attrs in telemetry["routes"].values():
         assert attrs["route_terminal_screen_trials"] == 2
         assert attrs["total_terminal_screen_trials"] == 4
@@ -2956,10 +3081,10 @@ def test_no_eligible_run_emits_complete_search_ledger(monkeypatch, tmp_path) -> 
     assert telemetry["selection_status"] == "no_economically_eligible_candidate"
     assert telemetry["total_terminal_screen_trials"] == 3
     assert telemetry["n_terminal_trials"] == 3
-    assert telemetry["configured_compounding_policy_cells"] == 6
-    assert telemetry["exact_compounding_policy_replays"] == 12
+    assert telemetry["configured_compounding_policy_cells"] == 1
+    assert telemetry["exact_compounding_policy_replays"] == 2
     assert telemetry["selection_multiplicity_version"] == (
-        "selection-multiplicity-raw-count-v1"
+        "selection-multiplicity-global-count-v1"
     )
     route_attrs = telemetry["routes"]["5"]
     assert route_attrs["route_terminal_screen_trials"] == 3
@@ -2967,8 +3092,8 @@ def test_no_eligible_run_emits_complete_search_ledger(monkeypatch, tmp_path) -> 
     for row in telemetry["shortlist_candidate_evidence"]:
         assert row["total_terminal_screen_trials"] == 3
         assert row["route_terminal_screen_trials"] == 3
-        assert row["exact_compounding_policy_replays"] == 6
-        assert row["configured_compounding_policy_cells"] == 6
+        assert row["exact_compounding_policy_replays"] == 1
+        assert row["configured_compounding_policy_cells"] == 1
         assert row["selection_multiplicity_version"] == (
-            "selection-multiplicity-raw-count-v1"
+            "selection-multiplicity-global-count-v1"
         )
