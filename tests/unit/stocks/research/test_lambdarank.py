@@ -228,6 +228,182 @@ def test_trial_fast_path_matches_legacy_blend() -> None:
     assert relevance.dtype == np.int32
 
 
+def test_trial_fast_path_preserves_labeled_rows_with_predictor_nulls() -> None:
+    """Null predictors never delete a labeled row; prepared and uncached agree."""
+    import numpy as np
+
+    df = build_panel(n_sessions=60, n_tickers=40)
+    feature_columns = v2_feature_columns(df)
+    train = df.filter(pl.col("session_index") < 45)
+    val = df.filter(pl.col("session_index") >= 45)
+
+    rng = np.random.default_rng(11)
+    null_feature = feature_columns[0]
+    train = train.with_columns(
+        pl.when(pl.Series(rng.random(train.height)) < 0.3)
+        .then(None)
+        .otherwise(pl.col(null_feature))
+        .alias(null_feature)
+    )
+
+    quantiles = fit_v2_winsor_quantiles(train, feature_columns)
+    train_t = apply_v2_transforms(train, feature_columns, winsor_quantiles=quantiles)
+    val_t = apply_v2_transforms(val, feature_columns, winsor_quantiles=quantiles)
+    predict_input = val_t.drop([RESIDUAL_O2O_LABEL, RELEVANCE_COLUMN, "label_available_time"])
+
+    eligible = int(train.filter(pl.col(RELEVANCE_COLUMN).is_not_null()).height)
+    config = LambdaRankConfig(
+        learning_rate=0.05, num_leaves=15, n_estimators=200,
+        early_stopping_rounds=20,
+    )
+
+    model = LambdaRankBlendModel(
+        make_manifest("null_retention"),
+        stock_alpha_v2_allowlist(),
+        RESIDUAL_O2O_LABEL,
+        config=config,
+        session_column="session",
+        relevance_column=RELEVANCE_COLUMN,
+    )
+    stable = StableRankComposite(
+        factors=stock_alpha_v2_allowlist(),
+        manifest=make_manifest("null_retention_stable"),
+        label_column=RESIDUAL_O2O_LABEL,
+        block_length=5,
+        session_column="session",
+    )
+    stable.fit(train_t, val_t)
+    stable_scores = stable.predict(predict_input).select(
+        "session", "instrument_id", "pred_score"
+    )
+    outcome = model.fit_trial(train_t, val_t, stable_scores=stable_scores)
+    assert outcome.fit_ok is True
+
+    prepared = LambdaRankBlendModel(
+        make_manifest("null_retention_prepared"),
+        stock_alpha_v2_allowlist(),
+        RESIDUAL_O2O_LABEL,
+        config=config,
+        session_column="session",
+        relevance_column=RELEVANCE_COLUMN,
+    ).prepare_fold(train_t, val_t)
+    assert prepared is not None
+    assert prepared.train_matrix.shape[0] == eligible
+    assert model._train_group_count == len(prepared.train_group_sizes)
+    assert prepared.predictor_columns
+
+    reference = LambdaRankBlendModel(
+        make_manifest("null_retention_ref"),
+        stock_alpha_v2_allowlist(),
+        RESIDUAL_O2O_LABEL,
+        config=config,
+        session_column="session",
+        relevance_column=RELEVANCE_COLUMN,
+    )
+    reference.fit(train_t, val_t)
+    reference_scored = reference.predict(predict_input).select(
+        "session", "instrument_id", "pred_score"
+    )
+    trial_model = LambdaRankBlendModel(
+        make_manifest("null_retention_prepared_trial"),
+        stock_alpha_v2_allowlist(),
+        RESIDUAL_O2O_LABEL,
+        config=config,
+        session_column="session",
+        relevance_column=RELEVANCE_COLUMN,
+    )
+    trial_outcome = trial_model.fit_trial_prepared(
+        prepared, stable_scores=stable_scores
+    )
+    assert trial_outcome.fit_ok is True
+    val_used = (
+        val_t.filter(pl.col(RELEVANCE_COLUMN).is_not_null())
+        .sort("session")
+        .select("session", "instrument_id")
+    )
+    assert val_used.height == prepared.validation_matrix.shape[0]
+    joined = reference_scored.join(
+        trial_model.predict_prepared_scores(prepared, val_used, stable_scores),
+        on=["session", "instrument_id"],
+        suffix="_prepared",
+    )
+    assert (
+        joined["pred_score"].to_numpy() - joined["pred_score_prepared"].to_numpy()
+    ).max() < 1e-12
+
+
+def test_observation_weights_are_newest_anchored_and_session_sums_are_recency() -> None:
+    """Newest session sums to 1.0; older sessions receive exp2 decay from newest."""
+    import numpy as np
+
+    df = build_panel(n_sessions=40, n_tickers=40)
+    feature_columns = v2_feature_columns(df)
+    train = df.filter(pl.col("session_index") < 30)
+    quantiles = fit_v2_winsor_quantiles(train, feature_columns)
+    train_t = apply_v2_transforms(train, feature_columns, winsor_quantiles=quantiles)
+    model = LambdaRankBlendModel(
+        make_manifest("recency"),
+        stock_alpha_v2_allowlist(),
+        RESIDUAL_O2O_LABEL,
+        config=LambdaRankConfig(half_life_sessions=504),
+        session_column="session",
+        relevance_column=RELEVANCE_COLUMN,
+    )
+    usable = train_t.filter(pl.col(RELEVANCE_COLUMN).is_not_null())
+    group_sizes, _ = model._group_sizes(usable)
+    ordered = usable.filter(
+        pl.col("session").is_in(
+            usable.group_by("session").len().filter(
+                pl.col("len") >= model.config.min_group_size
+            )["session"]
+        )
+    ).sort("session")
+    weights = model._observation_weights(ordered, group_sizes)
+    assert len(weights) == ordered.height
+    assert np.all(np.isfinite(weights))
+    start = 0
+    session_sums: list[float] = []
+    for size in group_sizes:
+        session_sums.append(float(np.sum(weights[start : start + size])))
+        start += size
+    assert session_sums[-1] == pytest.approx(1.0, abs=1e-9)
+    assert session_sums[0] <= session_sums[-1]
+    assert session_sums[0] == pytest.approx(
+        np.exp2(-(len(session_sums) - 1) / 504.0), rel=1e-9
+    )
+    assert session_sums == sorted(session_sums)
+
+
+def test_resolve_predictor_columns_returns_rank_sector_rank_and_missing_only() -> None:
+    """Raw feature levels never enter the booster design matrix."""
+    df = build_panel(n_sessions=40, n_tickers=40)
+    feature_columns = v2_feature_columns(df)
+    train = df.filter(pl.col("session_index") < 30)
+    quantiles = fit_v2_winsor_quantiles(train, feature_columns)
+    train_t = apply_v2_transforms(train, feature_columns, winsor_quantiles=quantiles)
+    model = LambdaRankBlendModel(
+        make_manifest("predictors"),
+        stock_alpha_v2_allowlist(),
+        RESIDUAL_O2O_LABEL,
+        session_column="session",
+        relevance_column=RELEVANCE_COLUMN,
+    )
+    columns = model._resolve_predictor_columns(train_t)
+    expected = [
+        column
+        for feature in model.features
+        for column in (
+            f"feature__{feature}__rank",
+            f"feature__{feature}__sector_rank",
+            f"feature__{feature}__missing",
+        )
+    ]
+    assert columns == expected
+    assert not any(
+        column in train_t.columns and column not in expected for column in columns
+    )
+
+
 def test_trial_callbacks_propagate_trial_pruned() -> None:
     import optuna
 
