@@ -14,11 +14,12 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import polars as pl
@@ -124,6 +125,7 @@ class ExecutionMatchedEvidence:
     calibration_evidence: dict[str, object] = field(default_factory=dict)
     replay_resource: dict[str, object] = field(default_factory=dict)
     compounding_overlay: dict[str, object] = field(default_factory=dict)
+    replay_stage_seconds: dict[str, float] = field(default_factory=dict)
     kernel_parity_version: str = KERNEL_PARITY_VERSION
     replay_mode: str | None = None
     # In-memory parity reference; never persisted to metrics.
@@ -199,6 +201,11 @@ class ExecutionMatchedReplayKernel:
         self._label_available_column = label_available_column
         self._replay_guard = replay_guard
         self._cache_bytes = int(prepared_route.cache_bytes)
+        first, last = prepared_route.sessions[0], prepared_route.sessions[-1]
+        self._replay_frame = panel.filter(
+            (pl.col("session") >= first) & (pl.col("session") <= last)
+        )
+        self._benchmark_returns = _benchmark_return_series(self._replay_frame)
 
     @classmethod
     def build(
@@ -214,26 +221,23 @@ class ExecutionMatchedReplayKernel:
         stress_schedule: CostSchedule,
         guard: Any | None = None,
     ) -> ExecutionMatchedReplayKernel:
-        """Build the candidate-invariant kernel for one contiguous OOS interval."""
-        from src.stocks.workflows.train_model import (
-            PreparedSelectionRoute,
-            _prepare_replay_static_context,
-        )
+        """Build the candidate-invariant kernel for one contiguous OOS interval.
+
+        The prepared route owns the bounded execution market, the instrument
+        map, and the frozen risk policy; no redundant full-panel replay static
+        context is constructed. Benchmark returns are computed once from the
+        bounded route interval and cached for every candidate replay.
+        """
+        from src.stocks.workflows.train_model import PreparedSelectionRoute
 
         prepared_route = PreparedSelectionRoute.build(
             panel, oos_sessions, request, route, guard=guard
         )
-        replay_context = _prepare_replay_static_context(
-            panel,
-            request,
-            holding_horizon_sessions=int(route.horizon),
-            guard=guard,
-        )
         return cls(
             panel=panel,
             prepared_route=prepared_route,
-            instruments=replay_context.instruments,
-            policy=replay_context.policy,
+            instruments=prepared_route.instruments,
+            policy=prepared_route.policy,
             request=request,
             dataset_manifest=dataset_manifest,
             registry=registry,
@@ -288,7 +292,15 @@ class ExecutionMatchedReplayKernel:
         request = self._request
         policy.compounding_evidence.clear()
 
+        stage_seconds: dict[str, float] = {
+            "overlay": 0.0,
+            "window_frame": 0.0,
+            "allocator": 0.0,
+            "calibration_state": 0.0,
+        }
+        overlay_started = time.perf_counter()
         overlay, allocation_overlay = route.scatter_overlays(oos_scored)
+        stage_seconds["overlay"] += time.perf_counter() - overlay_started
         if guard is not None:
             guard.admit(int(oos_scored.estimated_size()), stage="candidate_overlay")
         sessions = route.sessions
@@ -297,8 +309,7 @@ class ExecutionMatchedReplayKernel:
         start_time = sessions[0]
         end_time = sessions[-1]
 
-        panel = self._panel
-        replay_frame = panel.filter(pl.col("session") >= start_time)
+        replay_frame = self._replay_frame
         if guard is not None:
             guard.admit(int(replay_frame.estimated_size()), stage="replay_adtv")
         market = route.market
@@ -413,9 +424,11 @@ class ExecutionMatchedReplayKernel:
                         decision_time, execution_time, pl.DataFrame(),
                         calibration_state=None, reason="no-decision-session",
                     )
+                window_started = time.perf_counter()
                 visible = route.window_frame(
                     allocation_decision_index, allocation_overlay
                 )
+                stage_seconds["window_frame"] += time.perf_counter() - window_started
             except ValueError as exc:
                 return PreparedReplayDecision(
                     decision_time, execution_time, pl.DataFrame(),
@@ -427,7 +440,11 @@ class ExecutionMatchedReplayKernel:
                     calibration_state=None, reason="empty-scored-cross-section",
                 )
             try:
+                calibration_started = time.perf_counter()
                 calibration_state = _state_at(decision_time, visible)
+                stage_seconds["calibration_state"] += (
+                    time.perf_counter() - calibration_started
+                )
             except ValueError as exc:
                 return PreparedReplayDecision(
                     decision_time, execution_time, pl.DataFrame(),
@@ -453,6 +470,7 @@ class ExecutionMatchedReplayKernel:
                     return _scored_no_trade(
                         portfolio, cycle_request, "no-decision-session"
                     )
+                allocator_started = time.perf_counter()
                 allocations = construct_target_allocations_prepared(
                     route.allocation_market,
                     allocation_decision_index,
@@ -462,6 +480,7 @@ class ExecutionMatchedReplayKernel:
                     portfolio,
                     policy,
                 )
+                stage_seconds["allocator"] += time.perf_counter() - allocator_started
             except ValueError as exc:
                 return _scored_no_trade(
                     portfolio, cycle_request, f"constraint:{exc}"
@@ -528,7 +547,7 @@ class ExecutionMatchedReplayKernel:
             guard.check_after(stage="replay")
             guard.record_stage("replay", 0.0)
 
-        benchmark = _benchmark_return_series(replay_frame)
+        benchmark = self._benchmark_returns
         strategy_returns = _strategy_return_series(list(result.ledger))
         excess = _aligned_excess(strategy_returns, benchmark)
         initial_cash = request.initial_cash
@@ -575,6 +594,16 @@ class ExecutionMatchedReplayKernel:
             replay_resource = guard.telemetry()
             if session_cluster_schedule is not None:
                 replay_resource.update(session_cluster_schedule.telemetry())
+            stage_seconds_payload = dict(
+                cast(dict[str, object], replay_resource.get("replay_stage_seconds") or {})
+            )
+            stage_seconds_payload.update(
+                {
+                    stage: round(seconds, 3)
+                    for stage, seconds in stage_seconds.items()
+                }
+            )
+            replay_resource["replay_stage_seconds"] = stage_seconds_payload
         from src.stocks.workflows.train_model import _compounding_overlay_summary
 
         compounding_overlay = _compounding_overlay_summary(
@@ -608,6 +637,9 @@ class ExecutionMatchedReplayKernel:
             replay_resource=replay_resource,
             compounding_overlay=compounding_overlay,
             replay_mode=replay_mode,
+            replay_stage_seconds={
+                stage: round(seconds, 3) for stage, seconds in stage_seconds.items()
+            },
             ledger=tuple(result.ledger),
             trades=tuple(result.trades),
         )

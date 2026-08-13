@@ -16,6 +16,7 @@ starting after 2026-03-10.
 from __future__ import annotations
 
 import gc
+import itertools
 import logging
 import math
 import os
@@ -245,6 +246,7 @@ class TrialResourceGuard:
         self.peak_rss_mib = self.baseline_rss_mib
         self.fold_timings: dict[str, float] = {}
         self.estimates_mib: dict[str, float] = {}
+        self.fold_stage_timings: dict[str, dict[str, float]] = {}
 
     @staticmethod
     def _rss_mib() -> float:
@@ -295,12 +297,25 @@ class TrialResourceGuard:
         self.fold_timings[key] = elapsed_seconds
         self.estimates_mib[key] = estimate_mib
 
+    def record_fold_stage(self, key: str, stage: str, elapsed_seconds: float) -> None:
+        """Record one exclusive scalar stage duration for a scored screen fold.
+
+        Stage keys are scalar, never raw rows, scores, labels, orders, or
+        ledgers. Callers accumulate exclusive per-stage durations so the
+        recorded values never double-count overlapping phases.
+        """
+        self.fold_stage_timings.setdefault(key, {})[stage] = float(elapsed_seconds)
+
     def telemetry(self) -> dict[str, object]:
         return {
             "baseline_rss_mib": round(self.baseline_rss_mib, 3),
             "peak_rss_mib": round(self.peak_rss_mib, 3),
             "limit_mib": round(self._limit_mib, 3),
             "trial_fold_timings_seconds": dict(self.fold_timings),
+            "trial_fold_stage_timings_seconds": {
+                key: dict(stages)
+                for key, stages in self.fold_stage_timings.items()
+            },
             "estimates_mib": dict(self.estimates_mib),
         }
 
@@ -698,17 +713,18 @@ class PreparedSelectionRoute:
     """Candidate-invariant route OOS replay market and decision schedule.
 
     Built once per route after the inner folds are known. Owns one
-    array-backed ``PreparedReplayMarket`` for the route OOS interval (execution
-    only) and the aligned ``PreparedAllocationMarket`` built from the complete
-    panel so the allocator sees the same pre-OOS volatility/covariance/ADTV
-    warm-up as the reference replay, plus the canonical decision and execution
-    session indexes, the OOS-decision-to-full-panel allocation-session index
-    map, and the artifact schedule / initial portfolio the engine requires. A
-    candidate contributes only a NaN ``float64`` execution overlay and an
-    aligned allocation overlay scattered by :meth:`scatter_overlays`; no full
-    market-score join, ``partition_by``, ``to_dicts``,
-    ``_bounded_replay_history``, or new ``PreparedReplayMarket`` is created in
-    the candidate replay loop.
+    array-backed ``PreparedReplayMarket`` bounded to exactly the contiguous
+    OOS session interval ``[first, last]`` (execution only) and the aligned
+    ``PreparedAllocationMarket`` built from the complete panel so the allocator
+    sees the same pre-OOS volatility/covariance/ADTV warm-up as the reference
+    replay, plus the canonical decision and execution session indexes, the
+    OOS-decision-to-full-panel allocation-session index map, the instrument
+    map and frozen ``StockRiskPolicy``, and the artifact schedule / initial
+    portfolio the engine requires. A candidate contributes only a NaN
+    ``float64`` execution overlay and an aligned allocation overlay scattered
+    by :meth:`scatter_overlays`; no full market-score join, ``partition_by``,
+    ``to_dicts``, ``_bounded_replay_history``, or new ``PreparedReplayMarket``
+    is created in the candidate replay loop.
     """
 
     market: PreparedReplayMarket
@@ -719,6 +735,8 @@ class PreparedSelectionRoute:
     allocation_decision_index_by_time: Mapping[datetime, int]
     execution_index_by_decision: Mapping[int, int]
     allocation_window: int
+    instruments: Mapping[str, Instrument]
+    policy: StockRiskPolicy
     artifacts: ArtifactSchedule
     initial_portfolio: PortfolioSnapshot
     cache_bytes: int
@@ -735,15 +753,16 @@ class PreparedSelectionRoute:
         """Build the immutable route market, allocation market, and decision map.
 
         ``panel`` is the full pre-OOS training panel; ``oos_sessions`` are the
-        chronological scored sessions that begin the route OOS interval. The
-        execution ``PreparedReplayMarket`` covers only OOS sessions while the
-        ``PreparedAllocationMarket`` is built from the complete panel with a
-        causal rolling ADTV so the allocator sees the same pre-OOS warm-up as
-        the reference ``_bounded_replay_history`` path. Each OOS decision
-        timestamp maps to its full-panel allocation session index. The route
-        cadence is the holding horizon in sessions, matching the replay
-        policy's rebalance frequency. Raises ``ValueError`` for a panel missing
-        the required replay columns or for an empty OOS interval.
+        complete strictly-increasing contiguous OOS interval to replay. The
+        execution ``PreparedReplayMarket`` is bounded to exactly
+        ``[first, last]`` while the ``PreparedAllocationMarket`` is built from
+        the complete panel with a causal rolling ADTV so the allocator sees the
+        same pre-OOS warm-up as the reference ``_bounded_replay_history`` path.
+        Each OOS decision timestamp maps to its full-panel allocation session
+        index. The route cadence is the holding horizon in sessions, matching
+        the replay policy's rebalance frequency. Raises ``ValueError`` for an
+        empty, non-contiguous, or boundary-mismatched OOS interval, for a panel
+        missing the required replay columns, or for an empty OOS interval.
         """
         from src.core.portfolio import PortfolioSnapshot
         from src.stocks.backtesting.engine import (
@@ -755,17 +774,32 @@ class PreparedSelectionRoute:
 
         if not oos_sessions:
             raise ValueError("PreparedSelectionRoute requires a non-empty OOS interval")
-        replay_frame = panel.filter(pl.col("session") >= oos_sessions[0])
+        expected_sessions = tuple(_session_as_datetime(session) for session in oos_sessions)
+        for earlier, later in itertools.pairwise(expected_sessions):
+            if earlier >= later:
+                raise ValueError(
+                    "PreparedSelectionRoute OOS sessions must be strictly increasing"
+                )
+        replay_frame = panel.filter(
+            (pl.col("session") >= expected_sessions[0])
+            & (pl.col("session") <= expected_sessions[-1])
+        )
         if replay_frame.is_empty():
             raise ValueError("PreparedSelectionRoute OOS interval exposes no rows")
         missing = [c for c in REQUIRED_BACKTEST_COLUMNS if c not in replay_frame.columns]
         if missing:
             raise ValueError(f"prepared route panel must carry {', '.join(missing)}")
-        instruments = _instruments_from_frame(replay_frame)
+        instruments = _instruments_from_frame(panel)
         sessions = tuple(
             _session_as_datetime(s)
             for s in replay_frame["session"].unique().sort().to_list()
         )
+        if sessions != expected_sessions:
+            raise ValueError(
+                "PreparedSelectionRoute OOS interval must be a complete contiguous "
+                "bounded interval; expected ordered sessions do not match the "
+                "panel sessions between the first and last OOS session"
+            )
         artifacts = ArtifactSchedule(
             slots=(
                 ArtifactSlot(
@@ -843,6 +877,8 @@ class PreparedSelectionRoute:
             allocation_decision_index_by_time=allocation_decision_index_by_time,
             execution_index_by_decision=execution_index_by_decision,
             allocation_window=allocation_window,
+            instruments=instruments,
+            policy=policy,
             artifacts=artifacts,
             initial_portfolio=initial_portfolio,
             cache_bytes=int(replay_frame.estimated_size()),
@@ -1129,9 +1165,13 @@ def train_model(
         turnover_budget=selected_turnover_budget,
         compounding=selected_compounding,
     )
+    oos_sessions = tuple(
+        _session_as_datetime(session)
+        for session in oos.select(pl.col("session").unique()).sort("session")["session"].to_list()
+    )
     prepared_route = PreparedSelectionRoute.build(
         training_panel,
-        [_session_as_datetime(oos["session"].min())],
+        oos_sessions,
         request,
         route,
         guard=replay_guard,
@@ -1509,7 +1549,7 @@ def _tune_champion(
         )
         if any(proxy is None or proxy.execution_kernel is None for proxy in proxy_contexts):
             route_attrs[str(route.horizon)] = {
-                "selection_status": "no-prepared-fold-0",
+                "selection_status": "no-proxy-kernel",
                 "holding_horizon_sessions": route.horizon,
             }
             logger.info(
@@ -1592,8 +1632,9 @@ def _tune_champion(
             screen_config = _screen_config(config)
             if any(proxy is None for proxy in _proxy_contexts):
                 raise optuna.TrialPruned()
-            fold_lower_bounds = [
-                _score_trial_fold(
+            valid_bounds: list[float] = []
+            for fold_index, proxy_context in enumerate(_proxy_contexts):
+                bound = _score_trial_fold(
                     tuning_panel, _tuning_folds[fold_index],
                     cast(PreparedCandidateContext, proxy_context),
                     request, _route_manifest, feature_columns,
@@ -1602,11 +1643,15 @@ def _tune_champion(
                     callbacks=(), report_progress=False,
                     key_prefix=f"h{_route.horizon}_",
                 )
-                for fold_index, proxy_context in enumerate(_proxy_contexts)
-            ]
-            if any(bound is None for bound in fold_lower_bounds):
-                raise optuna.TrialPruned()
-            valid_bounds = [float(bound) for bound in fold_lower_bounds if bound is not None]
+                if bound is None:
+                    executed = fold_index + 1
+                    skipped = len(_proxy_contexts) - executed
+                    trial.set_user_attr("executed_proxy_folds", executed)
+                    trial.set_user_attr("skipped_proxy_folds", skipped)
+                    trial.set_user_attr("terminal_fold_index", fold_index)
+                    trial.set_user_attr("terminal_reason", "fold_none")
+                    raise optuna.TrialPruned()
+                valid_bounds.append(float(bound))
             trial.set_user_attr("proxy_execution_lower_bounds", valid_bounds)
             objective = min(valid_bounds)
             logger.info(
@@ -2084,7 +2129,16 @@ def _fit_stable_context(
             session_column="session",
             relevance_column=relevance_column or RELEVANCE_COLUMN,
         ).prepare_fold(train_processed, validation_processed)
-    except ValueError:
+    except ValueError as exc:
+        logger.debug(
+            "[EVAL] stage=prepare_full_fold_failed label=%s train_rows=%d "
+            "validation_rows=%d error_type=%s error=%s",
+            label_column,
+            train_processed.height,
+            validation_processed.height,
+            type(exc).__name__,
+            exc,
+        )
         prepared = None
     return _StableTrialContext(
         train_processed=train_processed,
@@ -2278,30 +2332,55 @@ def _attach_proxy_kernels(
 ) -> tuple[PreparedCandidateContext | None, ...]:
     """Build one immutable execution-matched proxy kernel per purged fold.
 
-    Each proxy fold kernel owns the prepared route built from the fold's
-    contiguous validation interval (the first validation session onward), the
-    replay static context, and the frozen route schedules. Candidate-specific
+    Each proxy fold kernel owns the prepared route built from exactly the fold's
+    ordered validation sessions (``tuning_panel[fold.validation_mask]``, row
+    positions only), the bounded execution market, and the frozen route
+    schedules; the kernel's route sessions are asserted to equal the validation
+    interval exactly so no tail session is ever replayed. Candidate-specific
     data is only an aligned score overlay and a causal calibration ledger, so a
     kernel is built once per fold and reused by every screen trial.
     """
     attached: list[PreparedCandidateContext | None] = []
-    for _fold_index, (proxy, fold) in enumerate(zip(proxy_contexts, tuning_folds, strict=True)):
+    for fold_index, (proxy, fold) in enumerate(zip(proxy_contexts, tuning_folds, strict=True)):
         if proxy is None:
+            logger.debug(
+                "[EVAL] stage=proxy_kernel_skipped fold=%d reason=missing_proxy_context",
+                fold_index,
+            )
             attached.append(None)
             continue
-        validation_mask = set(fold.validation_mask)
-        first_validation = (
-            tuning_panel.filter(pl.col("session_index").is_in(list(validation_mask)))
-            .select(pl.col("session").min())
-            .item()
-        )
+        validation_frame = tuning_panel[fold.validation_mask]
+        validation_rows = validation_frame.height
+        if validation_rows == 0:
+            logger.debug(
+                "[EVAL] stage=proxy_kernel_skipped fold=%d route=%d "
+                "reason=empty_validation_mask validation_rows=0",
+                fold_index,
+                route.horizon,
+            )
+            attached.append(None)
+            continue
+        first_validation = validation_frame.select(pl.col("session").min()).item()
         if first_validation is None:
+            logger.debug(
+                "[EVAL] stage=proxy_kernel_skipped fold=%d route=%d "
+                "reason=missing_validation_session validation_rows=%d",
+                fold_index,
+                route.horizon,
+                validation_rows,
+            )
             attached.append(None)
             continue
+        ordered_validation_sessions = tuple(
+            _session_as_datetime(session)
+            for session in validation_frame.select(
+                pl.col("session").unique()
+            ).sort("session")["session"].to_list()
+        )
         try:
             kernel = ExecutionMatchedReplayKernel.build(
                 tuning_panel,
-                [_session_as_datetime(first_validation)],
+                ordered_validation_sessions,
                 request,
                 route,
                 dataset_manifest=dataset_manifest,
@@ -2309,9 +2388,53 @@ def _attach_proxy_kernels(
                 base_schedule=base_schedule,
                 stress_schedule=stress_schedule,
             )
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as exc:
+            logger.debug(
+                "[EVAL] stage=proxy_kernel_build_failed fold=%d route=%d "
+                "first_validation=%s validation_rows=%d validation_sessions=%d "
+                "proxy_train_rows=%d proxy_validation_rows=%d "
+                "error_type=%s error=%s",
+                fold_index,
+                route.horizon,
+                first_validation,
+                validation_rows,
+                len(ordered_validation_sessions),
+                proxy.train_rows,
+                proxy.validation_rows,
+                type(exc).__name__,
+                exc,
+            )
             attached.append(None)
             continue
+        if kernel.prepared_route.sessions != ordered_validation_sessions:
+            logger.debug(
+                "[EVAL] stage=proxy_kernel_boundary_mismatch fold=%d route=%d "
+                "first_validation=%s kernel_start=%s kernel_end=%s "
+                "validation_rows=%d validation_sessions=%d "
+                "error_type=ValueError reason=oos_interval",
+                fold_index,
+                route.horizon,
+                first_validation,
+                kernel.prepared_route.sessions[0],
+                kernel.prepared_route.sessions[-1],
+                validation_rows,
+                len(ordered_validation_sessions),
+            )
+            attached.append(None)
+            continue
+        logger.debug(
+            "[EVAL] stage=proxy_kernel_attached route=%d fold=%d "
+            "validation_rows=%d validation_sessions=%d "
+            "first_validation=%s last_validation=%s kernel_start=%s kernel_end=%s",
+            route.horizon,
+            fold_index,
+            validation_rows,
+            len(ordered_validation_sessions),
+            first_validation,
+            ordered_validation_sessions[-1],
+            kernel.prepared_route.sessions[0],
+            kernel.prepared_route.sessions[-1],
+        )
         attached.append(
             dataclass_replace(proxy, execution_kernel=kernel)
         )
@@ -2379,7 +2502,17 @@ def _build_proxy_context(
             session_column="session",
             relevance_column=relevance_column or RELEVANCE_COLUMN,
         ).prepare_fold(proxy_train, proxy_validation)
-    except ValueError:
+    except ValueError as exc:
+        logger.debug(
+            "[EVAL] stage=prepare_proxy_fold_failed label=%s train_rows=%d "
+            "validation_rows=%d stride=%d error_type=%s error=%s",
+            label_column,
+            proxy_train.height,
+            proxy_validation.height,
+            stride,
+            type(exc).__name__,
+            exc,
+        )
         prepared = None
     return _StableTrialContext(
         train_processed=proxy_train,
@@ -2430,9 +2563,13 @@ def _score_trial_fold(
     )
     started = time.perf_counter()
     try:
+        model_started = time.perf_counter()
         result = _score_context_model(
             context, request, base_manifest, label_column, relevance_column, config,
             callbacks=callbacks,
+        )
+        guard.record_fold_stage(
+            key, "fit_predict", time.perf_counter() - model_started
         )
         if result is None:
             return None
@@ -2442,17 +2579,27 @@ def _score_trial_fold(
         kernel = context.execution_kernel
         if kernel is None:
             return None
+        ledger_started = time.perf_counter()
         calibration_ledger = _build_calibration_ledger(
             scored,
             tuning_panel,
             label_column,
             kernel.label_available_column,
         )
+        guard.record_fold_stage(
+            key, "calibration_ledger", time.perf_counter() - ledger_started
+        )
+        replay_started = time.perf_counter()
         evidence = kernel.run_base(
             scored,
             calibration_ledger,
             replay_mode="INNER_SELECTION_BASE_ONLY",
         )
+        guard.record_fold_stage(
+            key, "replay", time.perf_counter() - replay_started
+        )
+        for stage, seconds in evidence.replay_stage_seconds.items():
+            guard.record_fold_stage(key, stage, float(seconds))
         if evidence.filled_orders <= 0:
             return None
         bound = _execution_matched_lower_bound(
@@ -3241,15 +3388,17 @@ def _select_economic_champion(
         tuning_panel, request, holding_horizon_sessions=route.horizon,
         guard=replay_guard,
     )
-    validation_sessions = sorted(
-        tuning_panel.filter(
-            pl.col("session_index").is_in(tuning_folds[0].validation_mask)
-        )["session"].unique().to_list()
+    validation_frame = tuning_panel[tuning_folds[0].validation_mask]
+    validation_sessions = tuple(
+        _session_as_datetime(session)
+        for session in validation_frame.select(
+            pl.col("session").unique()
+        ).sort("session")["session"].to_list()
     )
     prepared_route = (
         PreparedSelectionRoute.build(
             tuning_panel,
-            [_session_as_datetime(validation_sessions[0])],
+            validation_sessions,
             request,
             route,
             guard=replay_guard,
@@ -4990,9 +5139,15 @@ def _evaluate_forward_holdout(
         turnover_budget=turnover_budget,
         compounding=compounding,
     )
+    holdout_route_sessions = tuple(
+        _session_as_datetime(session)
+        for session in holdout_oos.select(
+            pl.col("session").unique()
+        ).sort("session")["session"].to_list()
+    )
     prepared_route = PreparedSelectionRoute.build(
         panel,
-        [_session_as_datetime(holdout_oos["session"].min())],
+        holdout_route_sessions,
         request,
         RouteSpec(
             horizon=holding_horizon_sessions,
