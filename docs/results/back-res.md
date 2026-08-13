@@ -381,3 +381,63 @@ holdout 단계로 진행하지 않고 fail-closed `NO_TRADE`를 발행했다. �
 
 - [Metrics](../../data/artifacts/stocks/lambdarank_v2_20260813_pipeline_recheck/metrics.json)
 - [Manifest](../../data/artifacts/stocks/lambdarank_v2_20260813_pipeline_recheck/manifest.json)
+
+---
+
+# 2026-08-13 Backtest Robustness Overhaul 실행 결과
+
+## 한눈에 보는 결론
+
+v4 안정성 선택 funnel은 정상 실행됐지만, 최종 승격 후보는 없었다. 최고
+후보도 비용 차감 후 bootstrap 하한과 DSR 기준을 통과하지 못해, 의도한
+fail-closed 결과인 `NO_TRADE`가 발행됐다.
+
+## 실행 및 핵심 성과 데이터
+
+| 항목 | 값 |
+|---|---:|
+| Artifact | `lambdarank_v2_20260813_backtest_robustness_run` |
+| Snapshot | `research_provisional_20160104_20260812_cost_master_v3_mh2` |
+| Selection policy | `economic-selection-v4-stability` |
+| Terminal screen trials | **81** (route당 27) |
+| Global multiplicity | **81** |
+| Configured policy cells | **1** |
+| Exact economic replays | **3** |
+| Promoted / NO_TRADE | `false / true` |
+| Promotion reason | `no-champion-trial` |
+| Peak RSS | **5,113.652 MiB / 8,000 MiB** |
+
+| Route | Screen 결과 | Full-refit | Exact replay | 최종 결과 |
+|---|---:|---:|---:|---|
+| 5 sessions | 18 complete, 9 pruned, 6 shortlist | 6 promoted | 3 | 경제성 후보 0 |
+| 10 sessions | 27 pruned | 0 | 0 | complete screen candidate 없음 |
+| 15 sessions | 27 pruned | 0 | 0 | complete screen candidate 없음 |
+
+5-session route의 replay 후보 3개는 모두 동일하게 탈락했다.
+
+| 항목 | 최고 관측값 | 기준 |
+|---|---:|---:|
+| Proxy economic lower bound | **0.00473164** | 양수 |
+| Exact bootstrap lower bound | **-0.00036014** | `> 0` 필요 |
+| DSR probability | **0.13478672** | `>= 0.95` 필요 |
+| Fold retention | **100%** (3 folds) | relevance-eligible rows 보존 |
+
+## 해석
+
+- 모델 학습과 비용 반영 replay 자체는 완료됐다. 자원 한도 초과나 체결
+  오류가 아니라, 통계적·경제적 승격 기준을 통과하지 못한 결과다.
+- Proxy screen에서는 양수 lower bound 후보가 나왔지만, exact replay에서는
+  비용을 반영한 lower bound가 음수가 됐다. 따라서 proxy와 실제 목적함수의
+  정렬만으로 승격하지 않았다.
+- DSR `0.1348`은 전역 81회 탐색을 반영한 값으로, `0.95` 기준과 큰 차이가
+  있다. trial 수나 threshold를 줄이지 않고 `NO_TRADE`를 유지한 것이 spec의
+  요구와 일치한다.
+- 이번 실행은 연구 성공(alpha discovery)을 증명하지 못했다. 대신 missing-row
+  retention, newest-anchored weighting, 3-fold economic screen, global
+  multiplicity, single-policy replay가 실제 artifact telemetry에 반영됐음을
+  확인했다.
+
+## 산출물
+
+- [Metrics](../../data/artifacts/stocks/lambdarank_v2_20260813_backtest_robustness_run/metrics.json)
+- [Manifest](../../data/artifacts/stocks/lambdarank_v2_20260813_backtest_robustness_run/manifest.json)
