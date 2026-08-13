@@ -647,7 +647,7 @@ def test_tuning_economic_tie_breaks_by_lowest_trial_number(monkeypatch, tmp_path
     assert telemetry["selection_status"] == "selected"
     assert telemetry["selected_trial_number"] == 0
     assert telemetry["screened_trials"] == request.optuna_trials
-    assert telemetry["selection_policy_version"] == "economic-selection-v4-stability"
+    assert telemetry["selection_policy_version"] == "economic-selection-v5-execution-matched"
     assert telemetry["promotion_width"] == 2
     assert telemetry["economic_finalist_width"] == 2
     assert telemetry["shortlisted_trials"] == 2
@@ -1728,7 +1728,10 @@ def test_replay_context_built_only_after_finalist_folds_pass(monkeypatch, tmp_pa
     assert config is not None
     assert n_trials == request.optuna_trials
     assert order[-1] == "replay_prepare"
-    assert all(step == "refit" for step in order[:-1])
+    assert order.count("replay_prepare") >= 2
+    first_prepare = order.index("replay_prepare")
+    last_refit = max(i for i, step in enumerate(order) if step == "refit")
+    assert last_refit > first_prepare
     assert order.count("refit") >= 2
 
 
@@ -2301,6 +2304,48 @@ def test_prepared_route_replay_matches_reference_replay(tmp_path) -> None:
     )
     assert prepared.no_trade_reason_counts == {}
     assert prepared.unfilled_order_reason_counts == {}
+
+    # The execution-matched kernel is the single implementation of the prepared
+    # base replay: identical ledger, fills, metrics, decision count, and
+    # no-trade reasons for the same contiguous route and overlay.
+    from src.stocks.workflows.execution_matched_replay import (
+        ExecutionMatchedReplayKernel,
+        INNER_SELECTION_BASE_ONLY,
+    )
+
+    kernel = ExecutionMatchedReplayKernel(
+        panel=panel,
+        prepared_route=prepared_route,
+        instruments=context.instruments,
+        policy=context.policy,
+        request=request,
+        dataset_manifest=snapshot.manifest,
+        registry=registry,
+        base_schedule=base,
+        stress_schedule=stress,
+        holding_horizon_sessions=5,
+        label_column="residual_o2o_5d",
+        label_available_column="label_available_time",
+    )
+    kernel_evidence = kernel.run_base(
+        oos_scored, None, replay_mode=INNER_SELECTION_BASE_ONLY
+    )
+    assert kernel_evidence.ledger == reference.ledger
+    assert kernel_evidence.metrics == reference.metrics
+    assert kernel_evidence.filled_orders == reference.filled_orders
+    assert (
+        kernel_evidence.prepared_decision_count
+        == reference.prepared_decision_count
+    )
+    assert (
+        kernel_evidence.no_trade_reason_counts
+        == reference.no_trade_reason_counts
+    )
+    assert (
+        kernel_evidence.unfilled_order_reason_counts
+        == reference.unfilled_order_reason_counts
+    )
+    assert kernel_evidence.excess_returns == reference.excess_returns
 
 
 def test_proxy_session_filter_is_deterministic_causal_and_rule_fixed() -> None:
