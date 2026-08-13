@@ -160,7 +160,25 @@ def test_resumed_tune_skips_completed_screen_and_reuses_champion(
             type("_P", (), {"__call__": lambda self, _i: _fake_candidate_context(), "seed": lambda *a, **k: None, "release": lambda self: None})(),
         ),
     )
-    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+    monkeypatch.setattr(
+        tm,
+        "_score_trial_fold",
+        lambda *_a, **_kw: tm.ScreenFoldEvidence(
+            rank_ic=0.05,
+            attempted_orders=10,
+            filled_orders=8,
+            planned_cycles=1,
+            complete_block_count=4,
+            rejected_block_count=0,
+            block_log_excess_mean=0.01,
+            lower_bound=0.01,
+            dsr_probability=0.97,
+            usable=True,
+            failure_reason=None,
+            no_trade_reason_counts={},
+            block_log_excess=(0.01, 0.01, 0.01, 0.01),
+        ),
+    )
     monkeypatch.setattr(tm, "_fit_and_score_candidate", _fold_aware_refit())
     monkeypatch.setattr(tm, "_event_ledger_evaluation", lambda *_a, **_kw: _positive_replay())
 
