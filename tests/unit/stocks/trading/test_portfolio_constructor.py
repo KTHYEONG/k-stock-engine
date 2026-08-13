@@ -1,6 +1,8 @@
 """PLAN-03-CONSTRAINED-SIZING: randomized feasible inputs preserve every constraint."""
 from __future__ import annotations
 
+import json
+import math
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
@@ -600,6 +602,159 @@ class TestCompoundingOverlay:
             construct_target_allocations(panel, instruments, portfolio, disabled)
         )
         assert legacy.compounding_evidence == []
+
+    @staticmethod
+    def _economic_panel(seed: int = 83) -> pl.DataFrame:
+        return _with_economic(scored_panel(seed=seed), positive=True).with_columns(
+            pl.lit(0.004, dtype=pl.Float64).alias("net_alpha_lower_bound")
+        )
+
+    def test_decision_record_is_complete_json_safe_and_finite(self) -> None:
+        panel = self._economic_panel()
+        instruments = instruments_for(10)
+        portfolio = empty_portfolio()
+        policy = StockRiskPolicy(
+            top_k=20,
+            gross_cap=0.9,
+            single_name_cap=0.08,
+            turnover_budget=0.2,
+            compounding=CompoundingPolicyConfig(growth_risk_aversion=50.0),
+        )
+        allocations = construct_target_allocations(panel, instruments, portfolio, policy)
+        assert allocations
+        record = policy.compounding_evidence[-1]
+        for key in (
+            "decision_session",
+            "candidate_count",
+            "ranked_count",
+            "selected_count",
+            "gross_before_compounding",
+            "gross_after_compounding",
+            "turnover_lambda",
+            "confidence_edge_h",
+            "confidence_variance_h",
+            "confidence_scale",
+            "cash_reason",
+        ):
+            assert key in record
+        assert record["cash_reason"] is None
+        assert str(record["decision_session"])
+        assert (
+            int(record["candidate_count"])
+            >= int(record["ranked_count"])
+            >= int(record["selected_count"])
+            >= 1
+        )
+        assert int(record["selected_count"]) == len(allocations)
+        assert float(record["gross_before_compounding"]) > 0.0
+        assert float(record["gross_after_compounding"]) <= (
+            float(record["gross_before_compounding"]) + 1e-12
+        )
+        assert 0.0 <= float(record["turnover_lambda"]) <= 1.0
+        assert all(
+            math.isfinite(float(value))
+            for key, value in record.items()
+            if isinstance(value, float) and key != "decision_session"
+        )
+        json.dumps(record)
+
+    def test_cash_branches_record_complete_fail_closed_fields(self) -> None:
+        instruments = instruments_for(10)
+        equity = equity_of(self._economic_panel(seed=85), empty_portfolio())
+        held_id = "KRX:000005"
+        held = instruments[held_id]
+
+        def _portfolio() -> PortfolioSnapshot:
+            price = self._economic_panel(seed=85).filter(
+                pl.col("instrument_id") == held_id
+            ).sort("session")["close"][-1]
+            return PortfolioSnapshot(
+                account_snapshot_id="held",
+                as_of=datetime(2024, 1, 1, tzinfo=UTC),
+                settled_cash=equity - 0.05 * equity,
+                unsettled_cash=0.0,
+                positions=(
+                    Position(
+                        instrument=held,
+                        quantity=int(0.05 * equity // price),
+                        average_cost=price,
+                    ),
+                ),
+            )
+
+        negative_edge = self._economic_panel(seed=85).with_columns(
+            pl.when(pl.col("instrument_id") == held_id)
+            .then(pl.lit(-0.5))
+            .otherwise(pl.col("net_alpha_lower_bound"))
+            .alias("net_alpha_lower_bound")
+        )
+        policy = StockRiskPolicy(top_k=20)
+        assert construct_target_allocations(
+            negative_edge, instruments, _portfolio(), policy
+        ) == ()
+        record = policy.compounding_evidence[-1]
+        assert record["cash_reason"] == "non-positive-confidence-edge"
+        assert float(record["confidence_scale"]) == 0.0
+        assert float(record["gross_after_compounding"]) == 0.0
+        assert float(record["turnover_lambda"]) == 0.0
+        assert float(record["gross_before_compounding"]) >= 0.0
+        json.dumps(record)
+
+        non_finite = self._economic_panel(seed=87).with_columns(
+            pl.when(pl.col("instrument_id") == held_id)
+            .then(pl.lit(float("nan")))
+            .otherwise(pl.col("net_alpha_lower_bound"))
+            .alias("net_alpha_lower_bound")
+        )
+        policy2 = StockRiskPolicy(top_k=20)
+        assert construct_target_allocations(
+            non_finite, instruments, _portfolio(), policy2
+        ) == ()
+        record2 = policy2.compounding_evidence[-1]
+        assert record2["cash_reason"] == "invalid-confidence-variance"
+        assert record2["confidence_variance_h"] is None
+        assert record2["confidence_scale"] is None
+        assert float(record2["gross_after_compounding"]) == 0.0
+        assert float(record2["turnover_lambda"]) == 0.0
+        json.dumps(record2)
+
+    def test_fail_closed_missing_lower_bound_still_records_complete_keys(self) -> None:
+        panel = self._economic_panel(seed=89)
+        instruments = instruments_for(10)
+        held_id = "KRX:000005"
+        held = instruments[held_id]
+        price = panel.filter(pl.col("instrument_id") == held_id).sort("session")["close"][-1]
+        equity = equity_of(panel, empty_portfolio())
+        portfolio = PortfolioSnapshot(
+            account_snapshot_id="held",
+            as_of=datetime(2024, 1, 1, tzinfo=UTC),
+            settled_cash=equity - 0.05 * equity,
+            unsettled_cash=0.0,
+            positions=(
+                Position(
+                    instrument=held,
+                    quantity=int(0.05 * equity // price),
+                    average_cost=price,
+                ),
+            ),
+        )
+        policy = StockRiskPolicy(top_k=20)
+        missing = panel.with_columns(
+            pl.when(pl.col("instrument_id") == held_id)
+            .then(pl.lit(None))
+            .otherwise(pl.col("net_alpha_lower_bound"))
+            .alias("net_alpha_lower_bound")
+        )
+        assert construct_target_allocations(missing, instruments, portfolio, policy) == ()
+        record = policy.compounding_evidence[-1]
+        assert record["cash_reason"] == "invalid-confidence-variance"
+        assert record["confidence_scale"] is None
+        assert record["confidence_edge_h"] is None
+        for key in ("candidate_count", "ranked_count", "selected_count"):
+            assert isinstance(record[key], int)
+        assert float(record["gross_before_compounding"]) == 0.0
+        assert float(record["gross_after_compounding"]) == 0.0
+        json.dumps(record)
 
 
 def test_prepared_allocations_match_reference_constructor() -> None:
