@@ -176,6 +176,10 @@ def construct_target_allocations_prepared(
         )
     if not np.all(np.isfinite(market.close)) or not np.all(np.isfinite(market.adtv)):
         raise ValueError("prepared market close/adtv must be finite")
+    overlay = np.asarray(score_overlay, dtype=np.float64)
+    scored = np.where(~np.isnan(overlay))[0]
+    if scored.size and not bool(np.all(np.isfinite(overlay[scored]))):
+        raise ValueError("prepared score overlay carries non-finite scored values")
     if decision_index < 0 or decision_index >= len(market.sessions):
         raise ValueError(f"decision_index {decision_index} outside route sessions")
     window = (
@@ -195,7 +199,7 @@ def construct_target_allocations_prepared(
             _SESSION_COLUMN: pl.Series(
                 market.row_sessions[indices].tolist(), dtype=pl.Datetime("us", "UTC")
             ),
-            "pred_score": np.asarray(score_overlay)[indices],
+            "pred_score": np.asarray(overlay)[indices],
             "sector": market.sector[indices],
             "adtv": market.adtv[indices],
             "close": market.close[indices],

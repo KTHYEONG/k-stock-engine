@@ -21,7 +21,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-SELECTION_POLICY_VERSION = "economic-selection-v4-stability"
+SELECTION_POLICY_VERSION = "economic-selection-v5-execution-matched"
 
 
 @dataclass(frozen=True, slots=True)
