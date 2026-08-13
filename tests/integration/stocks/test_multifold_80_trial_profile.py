@@ -95,12 +95,12 @@ def test_multifold_80_trial_profile_completes_under_budget(tmp_path, monkeypatch
     assert resource["screened_trials"] >= 0
     assert resource["pruned_trials"] >= 0
     assert resource["screened_trials"] + resource["pruned_trials"] == _OPTUNA_TRIALS
-    assert resource["selection_policy_version"] == "economic-selection-v4-stability"
+    assert resource["selection_policy_version"] == "economic-selection-v5-execution-matched"
     assert resource["compute_plan_version"] == "sub10-refit-v1"
     assert resource["resolved_lgb_threads"] >= 1
     assert resource["per_route_trial_budget"] == _OPTUNA_TRIALS // 3
     assert resource["shortlisted_trials"] <= 18
-    assert resource["screen_fidelity"] == "session_stride_proxy"
+    assert resource["screen_fidelity"] == "execution_matched"
     assert resource["proxy_session_stride"] == 6
     assert resource["promotion_width"] == 6
     assert resource["economic_finalist_width"] == 3
