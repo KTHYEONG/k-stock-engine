@@ -1,12 +1,14 @@
-"""Slow production-snapshot benchmark: serial 81-trial search under an RSS budget.
+"""Slow production-snapshot benchmark: serial 90-trial ablation search under RSS.
 
 Run explicitly with ``pytest -m slow``; excluded from the normal
-``-m "not slow"`` suite. Verifies the search reaches 81 terminal screens under
-an explicit RSS budget with the deterministic 27-to-6-to-6-to-3 multi-fidelity
-funnel, runs at most nine inner economic replays (one per all-positive
-finalist under the single default policy), records baseline/peak RSS and
-trial/fold timing telemetry in the published metrics, and publishes a terminal
-promoted or ``NO_TRADE`` artifact without relaxing the promotion gates.
+``-m "not slow"`` suite. Verifies the search reaches 90 terminal screens under
+an explicit RSS budget with the registered five-family ablation profile: 30
+trials per route and six trials per family per route, global Deflated-Sharpe
+multiplicity 90, the same 30-to-6-to-6-to-3 multi-fidelity funnel, at most nine
+inner economic replays (one per all-positive finalist under the single default
+policy), candidate-family provenance and compact confirmation rejection
+telemetry in the published metrics, and a terminal promoted or ``NO_TRADE``
+artifact without relaxing the promotion gates.
 """
 from __future__ import annotations
 
@@ -22,7 +24,9 @@ from src.stocks.workflows.contracts import TrainingRequest
 from src.stocks.workflows.train_model import train_model
 from tests.fixtures.stocks.helpers import stock_v2_composed_df, stock_v2_manifest
 
-_OPTUNA_TRIALS = 81
+_OPTUNA_TRIALS = 90
+_PER_ROUTE_TRIALS = _OPTUNA_TRIALS // 3
+_FAMILY_COUNT = 5
 _BUDGET_MIB = 8000
 
 
@@ -69,6 +73,7 @@ def test_multifold_80_trial_profile_completes_under_budget(tmp_path, monkeypatch
     )
     assert payload["optuna_trials"] == _OPTUNA_TRIALS
     resource = payload["resource"]
+    assert resource["ablation_profile"] is True
     assert resource["n_terminal_trials"] == _OPTUNA_TRIALS
     assert resource["total_terminal_screen_trials"] == _OPTUNA_TRIALS
     assert resource["configured_compounding_policy_cells"] == 1
@@ -98,8 +103,28 @@ def test_multifold_80_trial_profile_completes_under_budget(tmp_path, monkeypatch
     assert resource["selection_policy_version"] == "economic-selection-v6-confirmed-recovery"
     assert resource["compute_plan_version"] == "sub10-refit-v1"
     assert resource["resolved_lgb_threads"] >= 1
-    assert resource["per_route_trial_budget"] == _OPTUNA_TRIALS // 3
+    assert resource["per_route_trial_budget"] == _PER_ROUTE_TRIALS
     assert resource["shortlisted_trials"] <= 18
+    family_per_route = dict.fromkeys(
+        ("stable_only", "blend_25", "blend_50", "blend_75", "ml_only"),
+        _PER_ROUTE_TRIALS // _FAMILY_COUNT,
+    )
+    for attrs in resource["routes"].values():
+        assert attrs["candidate_family_distribution"] == family_per_route
+    assert resource["candidate_family_distribution"] == {
+        family: count * len(resource["routes"])
+        for family, count in family_per_route.items()
+    }
+    assert isinstance(resource["confirmation_records"], list)
+    for record in resource["confirmation_records"]:
+        assert record["candidate_family"] in family_per_route
+        assert record["terminal_reason"] in (
+            "confirmed",
+            "hard_failure",
+            "rank_ic_non_positive",
+            "pooled_economic_rejection",
+        )
+    assert isinstance(resource["family_differential"], list)
     assert resource["screen_fidelity"] == "execution_matched"
     assert resource["proxy_session_stride"] == 6
     assert resource["promotion_width"] == 6
@@ -147,6 +172,7 @@ def test_multifold_80_trial_profile_completes_under_budget(tmp_path, monkeypatch
         "selected",
         "no_complete_screen_candidate",
         "no_economically_eligible_candidate",
+        "no_differential_superior_candidate",
     )
     replay_resource = resource["replay_resource"]
     assert replay_resource["inner_stress_replay"] is False

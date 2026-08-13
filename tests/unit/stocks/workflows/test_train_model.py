@@ -2400,6 +2400,7 @@ def test_screen_objective_short_circuits_on_first_terminal_fold(
         def __init__(self) -> None:
             self.number = 0
             self.user_attrs: dict[str, object] = {}
+            self.study = type("_FakeStudy", (), {"user_attrs": {}})()
 
         def set_user_attr(self, key: str, value: object) -> None:
             self.user_attrs[key] = value
@@ -2489,6 +2490,7 @@ def test_screen_objective_scores_only_fold_zero_and_retains_negative_bound(
         def __init__(self) -> None:
             self.number = 0
             self.user_attrs: dict[str, object] = {}
+            self.study = type("_FakeStudy", (), {"user_attrs": {}})()
 
         def set_user_attr(self, key: str, value: object) -> None:
             self.user_attrs[key] = value
@@ -3301,6 +3303,125 @@ def test_tuning_recovery_shortlist_from_negative_pooled_bound(monkeypatch, tmp_p
     for row in telemetry["confirmed_candidate_evidence"]:
         assert row["pooled_lower_bound"] < 0.0
         assert row["pooled_mean_log_excess"] > 0.0
+    assert telemetry["family_differential"] == []
+
+
+def test_config_from_trial_five_way_ablation_cycle() -> None:
+    """Registered ablation profile assigns the fixed family cycle by trial number."""
+    import optuna
+
+    study = optuna.create_study(direction="maximize")
+    study.set_user_attr(
+        "ablation_family_weights", list(tm.LAMBDARANK_ABLATION_WEIGHTS)
+    )
+    recorded: list[tuple[float, object]] = []
+
+    def objective(trial: optuna.Trial) -> float:
+        config = tm._config_from_trial(trial)
+        recorded.append(
+            (config.lambdarank_weight, trial.user_attrs.get("lambdarank_weight"))
+        )
+        return config.lambdarank_weight
+
+    study.optimize(objective, n_trials=15)
+    weights = tm.LAMBDARANK_ABLATION_WEIGHTS
+    assert weights == (0.0, 0.25, 0.5, 0.75, 1.0)
+    for index, (config_weight, attr_weight) in enumerate(recorded):
+        assert config_weight == weights[index % 5]
+        assert attr_weight == weights[index % 5]
+        config = tm.LambdaRankConfig(lambdarank_weight=config_weight)
+        if config_weight == 0.0:
+            assert config.candidate_family == "stable_only"
+        elif config_weight == 1.0:
+            assert config.candidate_family == "ml_only"
+        else:
+            assert config.candidate_family.startswith("blend_")
+
+
+def test_paired_family_differential_is_fail_closed() -> None:
+    """Non-common, missing, non-finite, or non-positive evidence never dominates."""
+    budget = PromotionRiskBudget()
+
+    def _screen_evidence(
+        blocks: tuple[float, ...], ids: tuple[int, ...] | None = None
+    ) -> tm.ScreenFoldEvidence:
+        mean = float(sum(blocks) / len(blocks)) if blocks else 0.0
+        return tm.ScreenFoldEvidence(
+            rank_ic=0.05,
+            attempted_orders=10,
+            filled_orders=8,
+            planned_cycles=1,
+            complete_block_count=len(blocks),
+            rejected_block_count=0,
+            block_log_excess_mean=mean,
+            lower_bound=0.01,
+            dsr_probability=0.97,
+            usable=True,
+            failure_reason=None,
+            no_trade_reason_counts={},
+            block_log_excess=blocks,
+            block_ids=tuple(range(len(blocks))) if ids is None else ids,
+        )
+
+    def differential(
+        reference_blocks: tuple[float, ...],
+        candidate_blocks: tuple[float, ...],
+    ) -> float | None:
+        reference = [_screen_evidence(reference_blocks)]
+        candidate = [_screen_evidence(candidate_blocks)]
+        return tm._paired_family_differential_lower_bound(
+            reference,
+            candidate,
+            n_bootstrap=200,
+            seed=42,
+            alpha=budget.bootstrap_alpha,
+        )
+
+    passing = differential((0.001,) * 12, (0.004,) * 12)
+    assert passing is not None
+    assert passing > 0.0
+    non_positive = differential((0.002,) * 12, (0.002,) * 12)
+    assert non_positive is not None
+    assert non_positive <= 0.0
+    unequal_folds = tm._paired_family_differential_lower_bound(
+        [_screen_evidence((0.001,) * 4)],
+        [
+            _screen_evidence((0.001,) * 4),
+            _screen_evidence((0.001,) * 4),
+        ],
+        n_bootstrap=200,
+        seed=42,
+        alpha=budget.bootstrap_alpha,
+    )
+    assert unequal_folds is None
+    empty = differential((), ())
+    assert empty is None
+    assert tm._paired_family_differential_lower_bound(
+        [_screen_evidence((0.001,) * 4)],
+        [_screen_evidence((0.004,) * 4, ids=(10, 11, 12, 13))],
+        n_bootstrap=200,
+        seed=42,
+        alpha=budget.bootstrap_alpha,
+    ) is None
+
+
+def test_ablation_profile_requires_divisible_route_budget() -> None:
+    """The registered 90-trial ablation profile demands a five-divisible route budget."""
+    route = tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time")
+    balanced = tm._resolve_ablation_family_weights(
+        TrainingRequest(artifact_id="ablation", optuna_trials=90),
+        (route, route, route),
+    )
+    assert balanced == tm.LAMBDARANK_ABLATION_WEIGHTS
+    with pytest.raises(ValueError, match="divisible"):
+        tm._resolve_ablation_family_weights(
+            TrainingRequest(artifact_id="ablation", optuna_trials=90),
+            (route,) * 5,
+        )
+    assert tm._resolve_ablation_family_weights(
+        TrainingRequest(artifact_id="regular", optuna_trials=81),
+        (route, route, route),
+    ) is None
 
 
 def test_forward_holdout_fingerprint_changes_with_selected_policy() -> None:
@@ -3443,6 +3564,7 @@ def test_score_trial_fold_records_failure_reason_on_hard_invalid(monkeypatch) ->
         def __init__(self) -> None:
             self.number = 0
             self.user_attrs: dict[str, object] = {}
+            self.study = type("_FakeStudy", (), {"user_attrs": {}})()
 
         def set_user_attr(self, key: str, value: object) -> None:
             self.user_attrs[key] = value

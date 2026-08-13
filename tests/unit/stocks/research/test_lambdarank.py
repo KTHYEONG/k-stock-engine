@@ -95,6 +95,11 @@ def test_blend_weight_validation_and_manifest_provenance() -> None:
     for weight in (0.0, 0.25, 0.5, 0.75, 1.0):
         config = LambdaRankConfig(lambdarank_weight=weight)
         assert config.lambdarank_weight == weight
+    assert LambdaRankConfig(lambdarank_weight=0.0).candidate_family == "stable_only"
+    assert LambdaRankConfig(lambdarank_weight=1.0).candidate_family == "ml_only"
+    assert LambdaRankConfig(lambdarank_weight=0.25).candidate_family == "blend_25"
+    assert LambdaRankConfig(lambdarank_weight=0.5).candidate_family == "blend_50"
+    assert LambdaRankConfig(lambdarank_weight=0.75).candidate_family == "blend_75"
 
     df = build_panel()
     feature_columns = v2_feature_columns(df)
@@ -121,6 +126,7 @@ def test_blend_weight_validation_and_manifest_provenance() -> None:
     params = model.manifest().params
     assert params["blend_weight_lambdarank"] == "0.750000"
     assert params["blend_weight_stable"] == "0.250000"
+    assert model.config.candidate_family == "blend_75"
 
 
 def test_model_fits_and_blends_percentile_ranks() -> None:
