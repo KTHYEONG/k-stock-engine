@@ -61,6 +61,7 @@ from src.stocks.research.labels import (
     RELEVANCE_COLUMN,
 )
 from src.stocks.research.lambdarank import (
+    LAMBDARANK_ABLATION_WEIGHTS,
     LAMBDARANK_WEIGHT,
     FitTrialOutcome,
     LambdaRankBlendModel,
@@ -149,6 +150,8 @@ _SCREEN_EARLY_STOPPING_ROUNDS = 50
 
 _KERNEL_PARITY_VERSION = "execution-matched-v1"
 
+_ABLATION_TERMINAL_TRIALS = 90
+
 
 @dataclass(frozen=True, slots=True)
 class PromotionRiskBudget:
@@ -174,6 +177,7 @@ class CompoundingEvidence:
     """
 
     block_log_excess: list[float]
+    block_ids: list[int]
     bootstrap_lower_bound: float
     dsr_probability: float
     complete_block_count: int
@@ -608,6 +612,7 @@ class ScreenFoldEvidence:
     eligible_bucket_count: int = 0
     cash_cycles: int = 0
     block_log_excess: tuple[float, ...] = ()
+    block_ids: tuple[int, ...] = ()
 
     @property
     def ranking_score(self) -> float:
@@ -734,6 +739,8 @@ class EconomicCandidateEvidence:
     exact_compounding_policy_replays: int = 0
     configured_compounding_policy_cells: int = 0
     selection_multiplicity_version: str = ""
+    compounding_block_log_excess: tuple[float, ...] = ()
+    compounding_block_ids: tuple[int, ...] = ()
 
     def to_json_safe(self) -> dict[str, object]:
         """JSON-serializable evidence row with deterministic failure reasons."""
@@ -1567,6 +1574,7 @@ def _tune_champion(
     terminal screen trial count fed to Deflated Sharpe.
     """
     LambdaRankConfig._tuning_telemetry = None
+    ablation_weights = _resolve_ablation_family_weights(request, route_specs)
     per_route_trials = max(1, request.optuna_trials // len(route_specs))
     total_terminal_screen_trials = per_route_trials * len(route_specs)
     guard = TrialResourceGuard(request, predictor_count=len(feature_columns) * 3)
@@ -1716,6 +1724,10 @@ def _tune_champion(
                 n_warmup_steps=0,
             ),
         )
+        if ablation_weights is not None:
+            study.set_user_attr(
+                "ablation_family_weights", list(ablation_weights)
+            )
 
         def screen_objective(
             trial: optuna.Trial,
@@ -1728,6 +1740,7 @@ def _tune_champion(
             _lgb_threads: int = lgb_threads,
         ) -> float:
             config = _config_from_trial(trial, num_threads=_lgb_threads)
+            trial.set_user_attr("candidate_family", config.candidate_family)
             screen_config = _screen_config(config)
             fold0_proxy = _proxy_contexts[0]
             if fold0_proxy is None:
@@ -1845,7 +1858,9 @@ def _tune_champion(
         screen_cash_cycles_total = 0
         screen_no_trade_reason_counts_agg: Counter[str] = Counter()
         for trial in study.trials:
-            blend_weight = trial.params.get("lambdarank_weight")
+            blend_weight = trial.user_attrs.get("lambdarank_weight")
+            if not isinstance(blend_weight, (int, float)):
+                blend_weight = trial.params.get("lambdarank_weight")
             if isinstance(blend_weight, (int, float)):
                 weight = float(blend_weight)
                 blend_weight_counts[weight] = (
@@ -1890,22 +1905,27 @@ def _tune_champion(
         confirmation = sortable[: policy.confirmation_width]
         confirmation_candidates = [row[4] for row in confirmation]
         confirmed_rows: list[dict[str, object]] = []
+        confirmation_records: list[dict[str, object]] = []
         candidate_pooled: list[
             tuple[float, float, float, int, int]
         ] = []
+        candidate_fold_evidence_by_family: dict[
+            str, list[tuple[float, int, list[ScreenFoldEvidence]]]
+        ] = {}
         for trial_number in confirmation_candidates:
-            frozen_config = _config_from_params(
-                dict(study.trials[trial_number].params),
+            frozen_config = _config_from_trial_record(
+                study.trials[trial_number],
                 num_threads=lgb_threads,
             )
+            candidate_family = frozen_config.candidate_family
             screen_config = _screen_config(frozen_config)
             record = _ScreenTrialRecord(trial_number)
             fold_evidences: list[ScreenFoldEvidence] = []
-            ok = True
+            terminal_reason = "confirmed"
             for fold_index in range(len(tuning_folds)):
                 proxy = proxy_contexts[fold_index]
                 if proxy is None:
-                    ok = False
+                    terminal_reason = "hard_failure"
                     break
                 ev = _score_trial_fold(
                     tuning_panel, tuning_folds[fold_index], proxy, request,
@@ -1915,23 +1935,69 @@ def _tune_champion(
                     fold_index, callbacks=(), report_progress=False,
                     key_prefix=f"h{route.horizon}_",
                 )
-                if ev is None or ev.rank_ic <= 0.0:
-                    ok = False
+                if ev is None:
+                    terminal_reason = "hard_failure"
+                    break
+                if ev.rank_ic <= 0.0:
+                    terminal_reason = "rank_ic_non_positive"
+                    fold_evidences.append(ev)
                     break
                 fold_evidences.append(ev)
-            if not ok or len(fold_evidences) != len(tuning_folds):
+            if terminal_reason != "confirmed" or len(fold_evidences) != len(tuning_folds):
+                confirmation_records.append(
+                    {
+                        "trial_number": int(trial_number),
+                        "candidate_family": candidate_family,
+                        "terminal_reason": terminal_reason,
+                        "fold_evidence": [
+                            ev.to_json_safe() for ev in fold_evidences
+                        ],
+                    }
+                )
                 continue
             pooled_lb, pooled_mean, pooled_dsr, pooled_blocks = (
                 _pool_screen_evidence(
                     fold_evidences, request, total_terminal_screen_trials
                 )
             )
+            if pooled_lb <= 0.0 and pooled_mean <= 0.0:
+                confirmation_records.append(
+                    {
+                        "trial_number": int(trial_number),
+                        "candidate_family": candidate_family,
+                        "terminal_reason": "pooled_economic_rejection",
+                        "pooled_lower_bound": round(pooled_lb, 8),
+                        "pooled_mean_log_excess": round(pooled_mean, 8),
+                        "fold_evidence": [
+                            ev.to_json_safe() for ev in fold_evidences
+                        ],
+                    }
+                )
+                continue
+            confirmation_records.append(
+                {
+                    "trial_number": int(trial_number),
+                    "candidate_family": candidate_family,
+                    "terminal_reason": "confirmed",
+                    "pooled_lower_bound": round(pooled_lb, 8),
+                    "pooled_mean_log_excess": round(pooled_mean, 8),
+                    "pooled_dsr_probability": round(pooled_dsr, 8),
+                    "pooled_block_count": int(pooled_blocks),
+                    "fold_evidence": [
+                        ev.to_json_safe() for ev in fold_evidences
+                    ],
+                }
+            )
             candidate_pooled.append(
                 (pooled_lb, pooled_mean, pooled_dsr, pooled_blocks, trial_number)
             )
+            candidate_fold_evidence_by_family.setdefault(
+                candidate_family, []
+            ).append((pooled_lb, trial_number, fold_evidences))
             confirmed_rows.append(
                 {
                     "trial_number": int(trial_number),
+                    "candidate_family": candidate_family,
                     "selection_source": "confirmed",
                     "pooled_lower_bound": round(pooled_lb, 8),
                     "pooled_mean_log_excess": round(pooled_mean, 8),
@@ -1942,6 +2008,7 @@ def _tune_champion(
                     ],
                 }
             )
+        family_differential: list[dict[str, object]] = []
         strict_candidates = [
             (lb, mean, dsr, blocks, number)
             for lb, mean, dsr, blocks, number in candidate_pooled
@@ -2000,6 +2067,23 @@ def _tune_champion(
             "strict_shortlisted_trials": strict_shortlisted_trials,
             "recovery_shortlisted_trials": recovery_shortlisted_trials,
             "confirmed_candidate_evidence": confirmed_rows,
+            "confirmation_records": confirmation_records,
+            "family_differential": family_differential,
+            "candidate_family_distribution": dict(
+                sorted(
+                    Counter(
+                        str(
+                            cast(
+                                str,
+                                trial.user_attrs.get(
+                                    "candidate_family", "unknown"
+                                ),
+                            )
+                        )
+                        for trial in study.trials
+                    ).items()
+                )
+            ),
             "blend_weight_distribution": {
                 f"{weight:.2f}": int(count)
                 for weight, count in sorted(blend_weight_counts.items())
@@ -2023,6 +2107,32 @@ def _tune_champion(
             lgb_threads=lgb_threads,
             timings=timings,
         )
+        gated_family: str | None = None
+        exact_differential = (
+            cast(list[dict[str, object]], selection.get("family_differential", []))
+            if selection
+            else []
+        )
+        if (
+            champion is not None
+            and ablation_weights is not None
+            and champion.candidate_family in ("blend_25", "blend_50", "blend_75")
+            and not any(
+                row.get("candidate_family") == champion.candidate_family
+                and row.get("passes_differential") is True
+                and row.get("evidence_stage") == "exact_economic_replay"
+                for row in exact_differential
+                if isinstance(row, dict)
+            )
+        ):
+            gated_family = champion.candidate_family
+            logger.info(
+                "[EVAL] route=%sd stage=differential_gate_failed family=%s",
+                route.horizon,
+                gated_family,
+            )
+            champion = None
+            selection = None
         if run_store is not None and selection is not None:
             run_store.checkpoint_phase(
                 f"selection_h{route.horizon}",
@@ -2109,12 +2219,19 @@ def _tune_champion(
             for name, value in selection.items():
                 study.set_user_attr(name, value)
         if champion is None or selection is None:
-            study.set_user_attr(
-                "selection_status",
-                "no_complete_screen_candidate"
-                if not shortlist
-                else "no_economically_eligible_candidate",
-            )
+            if gated_family is not None:
+                study.set_user_attr(
+                    "selection_status",
+                    "no_differential_superior_candidate",
+                )
+                study.set_user_attr("differential_gated_family", gated_family)
+            else:
+                study.set_user_attr(
+                    "selection_status",
+                    "no_complete_screen_candidate"
+                    if not shortlist
+                    else "no_economically_eligible_candidate",
+                )
             logger.info(
                 "[EVAL] route=%sd stage=selection_status %s",
                 route.horizon,
@@ -2212,18 +2329,25 @@ def _tune_champion(
                         counter[str(name)] += count
         return dict(sorted(counter.items()))
 
-    confirmed_candidate_evidence_merged: list[dict[str, object]] = []
-    for attrs in route_attrs.values():
-        rows = attrs.get("confirmed_candidate_evidence")
-        if isinstance(rows, list):
-            confirmed_candidate_evidence_merged.extend(
-                cast(list[dict[str, object]], rows)
-            )
+    def _merge_route_rows(key: str) -> list[dict[str, object]]:
+        merged_rows: list[dict[str, object]] = []
+        for attrs in route_attrs.values():
+            rows = attrs.get(key)
+            if isinstance(rows, list):
+                merged_rows.extend(cast(list[dict[str, object]], rows))
+        return merged_rows
+
+    confirmed_candidate_evidence_merged = _merge_route_rows(
+        "confirmed_candidate_evidence"
+    )
+    confirmation_records_merged = _merge_route_rows("confirmation_records")
+    family_differential_merged = _merge_route_rows("family_differential")
 
     merged: dict[str, object] = {
         "candidate_horizons": list(request.candidate_horizons),
         "active_routes": [route.horizon for route in route_specs],
         "per_route_trial_budget": per_route_trials,
+        "ablation_profile": ablation_weights is not None,
         "selection_policy_version": SELECTION_POLICY_VERSION,
         "compute_plan_version": COMPUTE_PLAN_VERSION,
         "selection_multiplicity_version": SELECTION_MULTIPLICITY_VERSION,
@@ -2257,6 +2381,11 @@ def _tune_champion(
             "recovery_shortlisted_trials"
         ),
         "confirmed_candidate_evidence": confirmed_candidate_evidence_merged,
+        "confirmation_records": confirmation_records_merged,
+        "family_differential": family_differential_merged,
+        "candidate_family_distribution": _merge_route_counter(
+            "candidate_family_distribution"
+        ),
         "blend_weight_distribution": _merge_route_counter(
             "blend_weight_distribution"
         ),
@@ -2319,6 +2448,8 @@ def _tune_champion(
             merged["selection_status"] = "no_complete_screen_candidate"
         elif "no_economically_eligible_candidate" in statuses:
             merged["selection_status"] = "no_economically_eligible_candidate"
+        elif "no_differential_superior_candidate" in statuses:
+            merged["selection_status"] = "no_differential_superior_candidate"
         else:
             merged["selection_status"] = statuses[0]
         LambdaRankConfig._tuning_telemetry = merged
@@ -2330,10 +2461,10 @@ def _tune_champion(
 
     route_champions.sort(key=lambda row: row[0], reverse=True)
     _winner_key, _winner_n_terminal, winner_route, winner_study, _ = route_champions[0]
-    winner_config = _config_from_params(
-        dict(winner_study.trials[
+    winner_config = _config_from_trial_record(
+        winner_study.trials[
             int(cast(int, winner_study.user_attrs["selected_trial_number"]))
-        ].params),
+        ],
         num_threads=lgb_threads,
     )
     winner_selection = {
@@ -3039,6 +3170,7 @@ def _score_trial_fold(
                 evidence.no_trade_reason_counts.get("no-feasible-allocation", 0)
             ),
             block_log_excess=tuple(compounding.block_log_excess),
+            block_ids=tuple(compounding.block_ids),
         )
         trial.set_user_attr(
             f"{key_prefix}proxy_execution_lower_bound",
@@ -3581,6 +3713,8 @@ def _evaluate_economic_candidate(
         exact_compounding_policy_replays=exact_compounding_policy_replays,
         configured_compounding_policy_cells=configured_compounding_policy_cells,
         selection_multiplicity_version=selection_multiplicity_version,
+        compounding_block_log_excess=tuple(compounding.block_log_excess),
+        compounding_block_ids=tuple(compounding.block_ids),
     )
 
 
@@ -3747,7 +3881,7 @@ def _select_economic_champion(
     fold0_ranked: list[tuple[float, float, int, LambdaRankConfig, pl.DataFrame]] = []
     for _screen_lb, trial_number in shortlist:
         frozen = study.trials[trial_number]
-        config = _config_from_params(dict(frozen.params), num_threads=lgb_threads)
+        config = _config_from_trial_record(frozen, num_threads=lgb_threads)
         full_refit_config = _screen_informed_full_refit_config(config)
         initial_rounds = adaptive_refit_rounds(proxy_best_by_trial.get(trial_number))
         refit_started_trial = time.perf_counter()
@@ -3992,12 +4126,51 @@ def _select_economic_champion(
     if not candidate_rows:
         return None, {
             "economically_eligible_trials": 0,
+            "family_differential": [],
             **selection_tail,
         }
     candidate_rows.sort(key=lambda row: row[0], reverse=True)
+    family_evidence: dict[str, tuple[int, EconomicCandidateEvidence]] = {}
+    for _cell_key, (trial_number, _policy_id) in candidate_rows:
+        evidence = best_cell_by_trial[trial_number][1]
+        family = _config_from_trial_record(
+            study.trials[trial_number], num_threads=lgb_threads
+        ).candidate_family
+        current = family_evidence.get(family)
+        if current is None or evidence.bootstrap_lower_bound > current[1].bootstrap_lower_bound:
+            family_evidence[family] = (trial_number, evidence)
+    family_differential: list[dict[str, object]] = []
+    ml_entry = family_evidence.get("ml_only")
+    if ml_entry is not None:
+        for blend_family in ("blend_25", "blend_50", "blend_75"):
+            blend_entry = family_evidence.get(blend_family)
+            if blend_entry is None:
+                continue
+            differential_lb = _paired_economic_differential_lower_bound(
+                ml_entry[1],
+                blend_entry[1],
+                n_bootstrap=max(request.n_bootstrap, 2),
+                seed=request.seed,
+                alpha=PromotionRiskBudget().bootstrap_alpha,
+            )
+            family_differential.append(
+                {
+                    "reference_family": "ml_only",
+                    "candidate_family": blend_family,
+                    "reference_trial_number": int(ml_entry[0]),
+                    "candidate_trial_number": int(blend_entry[0]),
+                    "differential_lower_bound": (
+                        round(differential_lb, 8) if differential_lb is not None else None
+                    ),
+                    "passes_differential": bool(
+                        differential_lb is not None and differential_lb > 0.0
+                    ),
+                    "evidence_stage": "exact_economic_replay",
+                }
+            )
     _winner_key, (winner_number, winner_policy_id) = candidate_rows[0]
-    champion = _config_from_params(
-        dict(study.trials[winner_number].params), num_threads=lgb_threads
+    champion = _config_from_trial_record(
+        study.trials[winner_number], num_threads=lgb_threads
     )
     _winner_cell_key, winner_evidence = best_cell_by_trial[int(winner_number)]
     winner_calibration_state = winner_evidence.calibration_state
@@ -4020,6 +4193,7 @@ def _select_economic_champion(
         "selected_inner_strategy_ir": winner_evidence.strategy_ir,
         "selected_inner_holding_horizon_sessions": winner_evidence.holding_horizon_sessions,
         "selected_calibration_state": winner_calibration_state,
+        "family_differential": family_differential,
         "compounding_policy_replays": shortlist_evidence,
         **selection_tail,
     }
@@ -4102,23 +4276,48 @@ def _config_from_trial(
     trial: optuna.Trial,
     num_threads: int | None = None,
 ) -> LambdaRankConfig:
-    return _config_from_params(
-        {
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.05, log=True),
-            "num_leaves": trial.suggest_int("num_leaves", 15, 63),
-            "max_depth": trial.suggest_int("max_depth", 4, 8),
-            "min_child_samples": trial.suggest_int("min_child_samples", 500, 5000, log=True),
-            "feature_fraction": trial.suggest_float("feature_fraction", 0.6, 1.0),
-            "bagging_fraction": trial.suggest_float("bagging_fraction", 0.7, 1.0),
-            "lambda_l1": trial.suggest_float("lambda_l1", 1e-4, 10.0, log=True),
-            "lambda_l2": trial.suggest_float("lambda_l2", 1e-4, 10.0, log=True),
-            "max_bin": trial.suggest_categorical("max_bin", (127, 255)),
-            "lambdarank_weight": trial.suggest_categorical(
-                "lambdarank_weight", (0.25, 0.50, 0.75)
-            ),
-        },
-        num_threads=num_threads,
-    )
+    params = {
+        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.05, log=True),
+        "num_leaves": trial.suggest_int("num_leaves", 15, 63),
+        "max_depth": trial.suggest_int("max_depth", 4, 8),
+        "min_child_samples": trial.suggest_int("min_child_samples", 500, 5000, log=True),
+        "feature_fraction": trial.suggest_float("feature_fraction", 0.6, 1.0),
+        "bagging_fraction": trial.suggest_float("bagging_fraction", 0.7, 1.0),
+        "lambda_l1": trial.suggest_float("lambda_l1", 1e-4, 10.0, log=True),
+        "lambda_l2": trial.suggest_float("lambda_l2", 1e-4, 10.0, log=True),
+        "max_bin": trial.suggest_categorical("max_bin", (127, 255)),
+    }
+    ablation_weights = trial.study.user_attrs.get("ablation_family_weights")
+    if isinstance(ablation_weights, (tuple, list)) and ablation_weights:
+        weight = float(
+            ablation_weights[trial.number % len(ablation_weights)]
+        )
+        trial.set_user_attr("lambdarank_weight", weight)
+        params["lambdarank_weight"] = weight
+    else:
+        params["lambdarank_weight"] = trial.suggest_categorical(
+            "lambdarank_weight", (0.25, 0.50, 0.75)
+        )
+    return _config_from_params(params, num_threads=num_threads)
+
+def _config_from_trial_record(
+    trial: optuna.Trial | optuna.trial.FrozenTrial,
+    num_threads: int | None = None,
+) -> LambdaRankConfig:
+    """Reconstruct the frozen config of a completed trial.
+
+    The ablation family weight is a deterministic function of the route-local
+    trial number, not a TPE-sampled parameter, so it is recorded on the trial
+    user attrs by :func:`_config_from_trial` and given precedence here; all
+    other search parameters come from the recorded trial params. The numeric
+    component weight therefore survives the confirmation and selection funnel
+    exactly as screened.
+    """
+    params = dict(trial.params)
+    ablation_weight = trial.user_attrs.get("lambdarank_weight")
+    if isinstance(ablation_weight, (int, float)):
+        params["lambdarank_weight"] = float(ablation_weight)
+    return _config_from_params(params, num_threads=num_threads)
 
 
 def _config_from_params(
@@ -4138,6 +4337,128 @@ def _config_from_params(
         num_threads=num_threads or 1,
         lambdarank_weight=float(params.get("lambdarank_weight", LAMBDARANK_WEIGHT)),
     )
+
+def _resolve_ablation_family_weights(
+    request: TrainingRequest,
+    route_specs: Sequence[RouteSpec],
+) -> tuple[float, ...] | None:
+    """Return the registered ablation family weights for the 90-trial profile.
+
+    The registered ablation profile is exactly ``_ABLATION_TERMINAL_TRIALS``
+    (90) requested terminal screen trials across the active routes. It requires
+    an equal per-route budget divisible by the five-family cycle so every family
+    receives the same number of trials per route; a registered ablation request
+    whose route budget is not divisible by five is rejected rather than run
+    unbalanced. Returns ``None`` for any other (non-ablation) profile.
+    """
+    if request.optuna_trials != _ABLATION_TERMINAL_TRIALS:
+        return None
+    if len(route_specs) < 1:
+        raise ValueError("ablation profile requires at least one active route")
+    if request.optuna_trials % len(route_specs) != 0:
+        raise ValueError(
+            f"ablation profile requires {_ABLATION_TERMINAL_TRIALS} trials split "
+            f"evenly across {len(route_specs)} routes; "
+            f"{request.optuna_trials} % {len(route_specs)} != 0"
+        )
+    per_route = request.optuna_trials // len(route_specs)
+    if per_route % len(LAMBDARANK_ABLATION_WEIGHTS) != 0:
+        raise ValueError(
+            f"ablation profile route budget {per_route} is not divisible by the "
+            f"five-family cycle; requested {request.optuna_trials} across "
+            f"{len(route_specs)} routes"
+        )
+    return tuple(float(weight) for weight in LAMBDARANK_ABLATION_WEIGHTS)
+
+
+def _paired_family_differential_lower_bound(
+    reference_fold_evidence: Sequence[ScreenFoldEvidence],
+    candidate_fold_evidence: Sequence[ScreenFoldEvidence],
+    *,
+    n_bootstrap: int,
+    seed: int,
+    alpha: float,
+    block_length: int = 2,
+) -> float | None:
+    """Fail-closed paired lower bound of (candidate - reference) block log excess.
+
+    ``reference_fold_evidence`` and ``candidate_fold_evidence`` must be the
+    confirmation fold evidence of the same route, so matching fold positions
+    share the identical validation decision blocks; only the exact common block
+    prefix of each fold participates in the ordered difference. Returns ``None``
+    (fail-closed) when the fold counts differ, any common block is missing or
+    non-finite, or the seeded moving-block bootstrap lower bound is non-finite.
+    A returned bound must be strictly positive for the candidate to dominate the
+    reference; a non-positive bound never passes the differential gate.
+    """
+    if len(reference_fold_evidence) != len(candidate_fold_evidence):
+        return None
+    differences: list[float] = []
+    for reference, candidate in zip(
+        reference_fold_evidence, candidate_fold_evidence, strict=True
+    ):
+        if len(reference.block_ids) != len(reference.block_log_excess) or len(
+            candidate.block_ids
+        ) != len(candidate.block_log_excess):
+            return None
+        reference_blocks = dict(zip(reference.block_ids, reference.block_log_excess, strict=True))
+        candidate_blocks = dict(zip(candidate.block_ids, candidate.block_log_excess, strict=True))
+        common_ids = sorted(reference_blocks.keys() & candidate_blocks.keys())
+        if len(common_ids) < 3:
+            return None
+        for block_id in common_ids:
+            difference = candidate_blocks[block_id] - reference_blocks[block_id]
+            if not math.isfinite(difference):
+                return None
+            differences.append(difference)
+    if not differences:
+        return None
+    lower_bound = _moving_block_bootstrap_lower_bound(
+        differences,
+        block_length=block_length,
+        n_bootstrap=n_bootstrap,
+        seed=seed,
+        alpha=alpha,
+    )
+    if not math.isfinite(lower_bound):
+        return None
+    return lower_bound
+
+
+def _paired_economic_differential_lower_bound(
+    reference: EconomicCandidateEvidence,
+    candidate: EconomicCandidateEvidence,
+    *,
+    n_bootstrap: int,
+    seed: int,
+    alpha: float,
+    block_length: int = 2,
+) -> float | None:
+    """Compare eligible exact-replay compounding blocks on shared boundaries."""
+    if len(reference.compounding_block_ids) != len(reference.compounding_block_log_excess):
+        return None
+    if len(candidate.compounding_block_ids) != len(candidate.compounding_block_log_excess):
+        return None
+    reference_blocks = dict(
+        zip(reference.compounding_block_ids, reference.compounding_block_log_excess, strict=True)
+    )
+    candidate_blocks = dict(
+        zip(candidate.compounding_block_ids, candidate.compounding_block_log_excess, strict=True)
+    )
+    common_ids = sorted(reference_blocks.keys() & candidate_blocks.keys())
+    if len(common_ids) < 3:
+        return None
+    differences = [candidate_blocks[index] - reference_blocks[index] for index in common_ids]
+    if not all(math.isfinite(value) for value in differences):
+        return None
+    lower_bound = _moving_block_bootstrap_lower_bound(
+        differences,
+        block_length=block_length,
+        n_bootstrap=n_bootstrap,
+        seed=seed,
+        alpha=alpha,
+    )
+    return float(lower_bound) if math.isfinite(lower_bound) else None
 
 
 def _fit_and_score_folds(
@@ -4998,6 +5319,7 @@ def _compounding_evidence(
     if not boundaries:
         boundaries = list(range(0, common - horizon + 1, horizon))
     blocks: list[float] = []
+    block_ids: list[int] = []
     rejected = 0
     for start in boundaries:
         if start + horizon > common:
@@ -5018,9 +5340,11 @@ def _compounding_evidence(
             math.log1p(value) for value in bench_simple
         )
         blocks.append(float(block_excess))
+        block_ids.append(start)
     if len(blocks) < 3:
         return CompoundingEvidence(
             block_log_excess=[],
+            block_ids=[],
             bootstrap_lower_bound=0.0,
             dsr_probability=0.0,
             complete_block_count=0,
@@ -5040,6 +5364,7 @@ def _compounding_evidence(
     )
     return CompoundingEvidence(
         block_log_excess=blocks,
+        block_ids=block_ids,
         bootstrap_lower_bound=lower_bound,
         dsr_probability=dsr_probability,
         complete_block_count=len(blocks),
