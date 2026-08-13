@@ -10,6 +10,7 @@ import pytest
 from src.core.instruments import AssetKind, Instrument
 from src.core.portfolio import PortfolioSnapshot, Position
 from src.stocks.trading.portfolio_constructor import (
+    CompoundingPolicyConfig,
     PortfolioConstraintError,
     StockRiskPolicy,
     construct_target_allocations,
@@ -450,6 +451,155 @@ class TestEconomicGating:
         assert all(
             a.instrument.instrument_id != held.instrument_id for a in exiting
         )
+
+
+class TestCompoundingOverlay:
+    def test_rejects_non_positive_or_non_finite_risk_aversion(self) -> None:
+        with pytest.raises(ValueError, match="growth_risk_aversion"):
+            CompoundingPolicyConfig(growth_risk_aversion=0.0)
+        with pytest.raises(ValueError, match="growth_risk_aversion"):
+            CompoundingPolicyConfig(growth_risk_aversion=-1.0)
+        with pytest.raises(ValueError, match="growth_risk_aversion"):
+            CompoundingPolicyConfig(growth_risk_aversion=float("nan"))
+        with pytest.raises(ValueError, match="growth_risk_aversion"):
+            CompoundingPolicyConfig(growth_risk_aversion=float("inf"))
+
+    def test_positive_finite_edge_scales_exposure_within_unit_and_holds_caps(self) -> None:
+        panel = _with_economic(scored_panel(seed=83), positive=True).with_columns(
+            pl.lit(0.004, dtype=pl.Float64).alias("net_alpha_lower_bound")
+        )
+        instruments = instruments_for(10)
+        portfolio = empty_portfolio()
+        equity = equity_of(panel, portfolio)
+        policy = StockRiskPolicy(
+            top_k=20,
+            gross_cap=0.9,
+            single_name_cap=0.08,
+            turnover_budget=0.0,
+            compounding=CompoundingPolicyConfig(growth_risk_aversion=50.0),
+        )
+        allocations = construct_target_allocations(panel, instruments, portfolio, policy)
+        assert allocations
+        scale = float(policy.compounding_evidence[-1]["confidence_scale"])
+        assert 0.0 < scale <= 1.0
+        assert policy.compounding_evidence[-1]["cash_reason"] is None
+        assert policy.compounding_evidence[-1]["confidence_edge_h"] > 0.0
+        assert policy.compounding_evidence[-1]["confidence_variance_h"] > 0.0
+        assert sum(a.target_value for a in allocations) <= equity * policy.gross_cap + 1e-8
+        for a in allocations:
+            assert a.target_value <= equity * policy.single_name_cap + 1e-8
+            assert a.target_value >= 0.0
+
+        baseline_policy = StockRiskPolicy(
+            top_k=20,
+            gross_cap=0.9,
+            single_name_cap=0.08,
+            turnover_budget=0.0,
+            compounding=CompoundingPolicyConfig(enabled=False),
+        )
+        baseline = construct_target_allocations(panel, instruments, portfolio, baseline_policy)
+        assert sum(a.target_value for a in allocations) < sum(
+            a.target_value for a in baseline
+        )
+
+    def test_non_positive_correlated_basket_edge_returns_cash(self) -> None:
+        panel = _with_economic(scored_panel(seed=85), positive=True).with_columns(
+            pl.lit(0.004, dtype=pl.Float64).alias("net_alpha_lower_bound")
+        )
+        instruments = instruments_for(10)
+        equity = equity_of(panel, empty_portfolio())
+        held_id = "KRX:000005"
+        held = instruments[held_id]
+        price = panel.filter(pl.col("instrument_id") == held_id).sort("session")["close"][-1]
+        portfolio = PortfolioSnapshot(
+            account_snapshot_id="held",
+            as_of=datetime(2024, 1, 1, tzinfo=UTC),
+            settled_cash=equity - 0.05 * equity,
+            unsettled_cash=0.0,
+            positions=(
+                Position(
+                    instrument=held,
+                    quantity=int(0.05 * equity // price),
+                    average_cost=price,
+                ),
+            ),
+        )
+        negative_edge = panel.with_columns(
+            pl.when(pl.col("instrument_id") == held_id)
+            .then(pl.lit(-0.5))
+            .otherwise(pl.col("net_alpha_lower_bound"))
+            .alias("net_alpha_lower_bound")
+        )
+        policy = StockRiskPolicy(top_k=20)
+        allocations = construct_target_allocations(
+            negative_edge, instruments, portfolio, policy
+        )
+        assert allocations == ()
+        assert policy.compounding_evidence[-1]["cash_reason"] == (
+            "non-positive-confidence-edge"
+        )
+
+    def test_missing_or_non_finite_lower_bound_fails_closed(self) -> None:
+        panel = _with_economic(scored_panel(seed=87), positive=True).with_columns(
+            pl.lit(0.004, dtype=pl.Float64).alias("net_alpha_lower_bound")
+        )
+        instruments = instruments_for(10)
+        equity = equity_of(panel, empty_portfolio())
+        held_id = "KRX:000005"
+        held = instruments[held_id]
+        price = panel.filter(pl.col("instrument_id") == held_id).sort("session")["close"][-1]
+        portfolio = PortfolioSnapshot(
+            account_snapshot_id="held",
+            as_of=datetime(2024, 1, 1, tzinfo=UTC),
+            settled_cash=equity - 0.05 * equity,
+            unsettled_cash=0.0,
+            positions=(
+                Position(
+                    instrument=held,
+                    quantity=int(0.05 * equity // price),
+                    average_cost=price,
+                ),
+            ),
+        )
+        non_finite = panel.with_columns(
+            pl.when(pl.col("instrument_id") == held_id)
+            .then(pl.lit(float("nan")))
+            .otherwise(pl.col("net_alpha_lower_bound"))
+            .alias("net_alpha_lower_bound")
+        )
+        policy = StockRiskPolicy(top_k=20)
+        allocations = construct_target_allocations(non_finite, instruments, portfolio, policy)
+        assert allocations == ()
+        assert policy.compounding_evidence[-1]["cash_reason"] == (
+            "invalid-confidence-variance"
+        )
+
+        missing = panel.with_columns(
+            pl.when(pl.col("instrument_id") == held_id)
+            .then(pl.lit(None))
+            .otherwise(pl.col("net_alpha_lower_bound"))
+            .alias("net_alpha_lower_bound")
+        )
+        policy2 = StockRiskPolicy(top_k=20)
+        assert (
+            construct_target_allocations(missing, instruments, portfolio, policy2) == ()
+        )
+        assert policy2.compounding_evidence[-1]["cash_reason"] == (
+            "invalid-confidence-variance"
+        )
+
+    def test_legacy_panel_without_economic_columns_is_unchanged(self) -> None:
+        panel = scored_panel(seed=91)
+        instruments = instruments_for(10)
+        portfolio = empty_portfolio()
+        legacy = StockRiskPolicy(top_k=20)
+        disabled = StockRiskPolicy(
+            top_k=20, compounding=CompoundingPolicyConfig(enabled=False)
+        )
+        assert construct_target_allocations(panel, instruments, portfolio, legacy) == (
+            construct_target_allocations(panel, instruments, portfolio, disabled)
+        )
+        assert legacy.compounding_evidence == []
 
 
 def test_prepared_allocations_match_reference_constructor() -> None:
