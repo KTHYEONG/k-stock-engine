@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_BACKTEST_STABILITY_TELEMETRY",
+      "date": "2026-08-13",
+      "adr_id": "ADR_20260813_STOCK_BACKTEST_STABILITY_TELEMETRY",
+      "domain": "risk",
+      "title": "Stock alpha backtest stability telemetry",
+      "why": "2026-08-13 stability telemetry rerun showed all 36 trial-policy candidates failed DSR despite positive candidates; document latest evidence and preserve fail-closed promotion.",
+      "resolution": "Added decision-level compounding telemetry, DEBUG-only diagnostics, compact candidate evidence summaries, and synchronized the 81-trial rerun results into back-res.md.",
+      "impact": "No promotion thresholds or policy grid were relaxed; artifact remains NO_TRADE. Documentation and task/code indexes updated."
+    },
+    {
       "task_id": "TASK_STOCK_COMPOUNDING_POLICY_SYNC",
       "date": "2026-08-13",
       "adr_id": "ADR_20260813_STOCK_COMPOUNDING_POLICY_SYNC",
