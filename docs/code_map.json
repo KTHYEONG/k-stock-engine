@@ -281,7 +281,11 @@
     "testing": "tests/unit/stocks/trading/test_allocation_policy.py"
   },
   "src/stocks/trading/portfolio_constructor.py": {
-    "testing": "tests/unit/stocks/trading/test_portfolio_constructor.py"
+    "testing": [
+      "tests/unit/stocks/trading/test_portfolio_constructor.py",
+      "tests/unit/stocks/workflows/test_execution_matched_replay.py"
+    ],
+    "architecture": "docs/results/back-res.md"
   },
   "src/stocks/trading/simulator.py": {
     "testing": "tests/unit/stocks/trading/test_simulator.py"

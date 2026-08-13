@@ -441,3 +441,99 @@ fail-closed 결과인 `NO_TRADE`가 발행됐다.
 
 - [Metrics](../../data/artifacts/stocks/lambdarank_v2_20260813_backtest_robustness_run/metrics.json)
 - [Manifest](../../data/artifacts/stocks/lambdarank_v2_20260813_backtest_robustness_run/manifest.json)
+
+---
+
+# 2026-08-13 V5 execution throughput latest run
+
+## 결론
+
+V5 throughput 경로는 artifact를 정상 발행했으며 **81개 screen trial을
+약 7분에 처리**했다. 다만 3개 route 모두 fold-0에서 전부 prune되어
+`NO_TRADE`가 유지됐다. 따라서 이번 실행에는 경제적 finalist, full refit,
+OOS 주문·수익률 성과가 없다. 이는 값이 0이라는 뜻이 아니라 해당 단계가
+실행되지 않아 산출되지 않았다는 뜻이다.
+
+## 실행 및 자원 성과
+
+| 항목 | 값 |
+|---|---:|
+| Artifact | `lambdarank_v2_20260813_v5_throughput_latest` |
+| Snapshot | `research_provisional_20160104_20260812_cost_master_v3_mh2` |
+| Mode / command plan | `research` / `sub10-refit-v1` |
+| Selection policy | `economic-selection-v5-execution-matched` |
+| 실행 시간 | **약 419.3초 (6분 59초)** |
+| Screen 시간 | **331.880초** |
+| Context 준비 시간 합계 | **52.503초** |
+| Baseline / peak RSS | **1,705.750 / 5,880.656 MiB** |
+| RSS hard limit | `8,000 MiB` |
+| Cache bytes | `369,804,132` |
+| LightGBM threads | `4` |
+| Proxy session stride | `6` |
+
+이전 중단 실행의 h5 22 trial/약 1,295초(약 58.9초/trial)와 비교하면,
+이번에는 81 trial을 약 419초(약 5.18초/trial)에 처리했다. trial 수가
+늘었음에도 trial당 관측 시간은 약 11.4배 낮아졌다.
+
+## Route 및 ML screen 상세
+
+| Route | Terminal / screened / pruned | Screen 초 | Peak RSS MiB | Proxy train / validation rows |
+|---:|---:|---:|---:|---:|
+| 5 sessions | 27 / 0 / 27 | 128.657 | 4,317.512 | 11,886 / 225,160 |
+| 10 sessions | 27 / 0 / 27 | 120.684 | 5,880.656 | 11,886 / 226,660 |
+| 15 sessions | 27 / 0 / 27 | 82.538 | 5,880.656 | 11,886 / 228,211 |
+| **합계** | **81 / 0 / 81** | **331.880** | **5,880.656** | — |
+
+모델은 `lambdarank_blend`이며 LambdaRank/StableRank 가중치는 각각
+`0.5/0.5`, seed `42`, 34개 feature, `num_leaves=31`, learning rate
+`0.03`, 최대 boosting round `5,000`, early stopping `200`이다. 학습
+group count는 `0`으로 기록됐고 최종 manifest의 `no_trade=true`다.
+
+screen trial에서 관측된 fold-stage 시간은 다음과 같다. 각 route 27개
+trial의 합/평균이며, 병목 분석용 telemetry다.
+
+| Route | fit+predict 평균 | replay 평균 | window frame 평균 | allocator 평균 | calibration state 평균 |
+|---:|---:|---:|---:|---:|---:|
+| 5 sessions | 1.371초 | **3.197초** | 1.493초 | 0.386초 | 0.400초 |
+| 10 sessions | **2.137초** | **2.115초** | 0.815초 | 0.219초 | 0.178초 |
+| 15 sessions | 1.019초 | **1.684초** | 0.546초 | 0.159초 | 0.117초 |
+
+모든 trial이 screen 완료 전에 prune되었으므로 rank-IC, proxy lower bound,
+best trial score 및 fold retention의 최종 후보 수치는 생성되지 않았다.
+후속 개선에서는 prune 원인별 분포와 fit/predict 변동성을 추가로 계측해야
+한다.
+
+## 백테스팅 성과의 산출 범위
+
+| 지표 | 결과 |
+|---|---|
+| Promoted / no_trade | `false / true` |
+| Folds evaluated | `0` |
+| Promotion reason | `no-champion-trial` |
+| Selection status | `no_complete_screen_candidate` |
+| Full refit seconds | `0.0` |
+| Economic replay seconds | `0.0` |
+| Prepared decision count | `0` |
+| Ledger metrics / stress metrics | `{}` / `null` |
+| 주문·filled orders·return·IR·max DD·turnover | **미실행 / 산출 불가** |
+
+screen trial 내부의 execution-matched proxy replay stage는 route별로
+수행됐지만, 경제적 finalist가 0개라 최종 ledger replay로 승격되지 않았다.
+따라서 이번 결과에서 확인 가능한 성과는 실행 throughput과 ML screen
+telemetry이며, 투자 성과 개선 여부는 판단할 수 없다.
+
+## 분석 포인트
+
+1. throughput 개선은 확인됐다. 현재 남은 screen 비용은 replay(특히 h5 평균
+   3.197초)와 fit/predict 변동성(최대 h10 5.639초)에 집중된다.
+2. 세 route 모두 동일하게 fold-0에서 완전 prune됐으므로 후속 route/fold와
+   경제적 백테스트가 열리지 않았다. screening 기준 자체의 적합성 및
+   prune 사유 telemetry가 다음 분석의 우선순위다.
+3. peak RSS 5,880.656 MiB는 8,000 MiB 제한 아래지만 baseline 대비 약
+   4,175 MiB 증가했다. 후보별 context/cache 공유가 추가 최적화 지점이다.
+
+## 산출물
+
+- [Metrics](../../data/artifacts/stocks/lambdarank_v2_20260813_v5_throughput_latest/metrics.json)
+- [Manifest](../../data/artifacts/stocks/lambdarank_v2_20260813_v5_throughput_latest/manifest.json)
+- 실행 로그: `scratch/v5_throughput_latest_run.log` (sync cleanup 대상)
