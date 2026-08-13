@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "backtest_performance_improvement",
+      "date": "2026-08-13",
+      "adr_id": "ADR_20260813_backtest_performance_improvement",
+      "domain": "stocks",
+      "title": "Backtest performance evidence ledger and pipeline recheck",
+      "why": "Document the completed 81-trial ML pipeline recheck and preserve the fail-closed NO_TRADE decision with detailed route evidence.",
+      "resolution": "Recorded final artifact metrics, route-level compounding/DSR evidence, multiplicity ledger, resource telemetry, and explicit no-champion termination in docs/results/back-res.md.",
+      "impact": "Documentation and task-index synchronization only; promotion thresholds and trading behavior are unchanged."
+    },
+    {
       "task_id": "TASK_STOCK_BACKTEST_STABILITY_TELEMETRY",
       "date": "2026-08-13",
       "adr_id": "ADR_20260813_STOCK_BACKTEST_STABILITY_TELEMETRY",

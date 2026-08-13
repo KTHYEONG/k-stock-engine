@@ -296,3 +296,88 @@ forward holdout 역시 성숙할 때까지 `NO_TRADE`가 유지된다.
 
 - [Metrics](../../data/artifacts/stocks/lambdarank_v2_20260813_stability_telemetry/metrics.json)
 - [Manifest](../../data/artifacts/stocks/lambdarank_v2_20260813_stability_telemetry/manifest.json)
+
+---
+
+# 2026-08-13 Pipeline Recheck 결과 (spec ledger 적용)
+
+## 실행 및 완료 상태
+
+| 항목 | 값 |
+|---|---|
+| 실행일 | 2026-08-13 |
+| Snapshot | `research_provisional_20160104_20260812_cost_master_v3_mh2` |
+| Artifact | `lambdarank_v2_20260813_pipeline_recheck` |
+| Mode | `research` |
+| Command | `uv run python -m src.stocks.cli.train --artifact-id lambdarank_v2_20260813_pipeline_recheck --snapshot-id research_provisional_20160104_20260812_cost_master_v3_mh2 --mode research --optuna-trials 81 --max-rss-mib 8000 --resume` |
+| Selection policy | `economic-selection-v3-compounding` |
+| Compute plan | `sub10-refit-v1` |
+| Multiplicity ledger | `selection-multiplicity-raw-count-v1` |
+| `promoted` / `no_trade` | `false` / `true` |
+| `promotion_reasons` | `no-champion-trial` |
+| `n_folds_evaluated` | `0` |
+
+이번 실행은 모든 route의 screen/refit/economic selection을 완료하고 artifact를
+발행했다. 최종 champion 후보가 없었으므로 최종 OOS promotion replay와 forward
+holdout 단계로 진행하지 않고 fail-closed `NO_TRADE`를 발행했다. 이는 실행 실패가
+아니라 경제성 후보 0건에 따른 정상 종료다.
+
+## Search / resource telemetry
+
+| 항목 | 값 |
+|---|---:|
+| Total terminal screen trials | **81** |
+| Route당 screen budget | **27** (5/10/15 sessions) |
+| Screened complete trials | **72** |
+| Pruned trials | **9** |
+| Shortlisted trials | **18** |
+| Configured compounding policy cells | **6** |
+| Exact `(trial, policy)` replays | **36** |
+| Economically eligible trials | **0** |
+| Best screen Rank-IC | **0.10341699** |
+| Baseline RSS | **1,698.730 MiB** |
+| Peak RSS | **4,950.281 MiB** / 8,000 MiB limit |
+| Cache bytes | **340,529,292** |
+| Screen time | **54.774 s** |
+| Full refit time | **399.644 s** |
+| Economic replay time | **593.032 s** |
+| Early-rejected full refits | **0** |
+
+## Route별 finalist evidence
+
+아래 값은 route별 shortlist candidate evidence 중 bootstrap lower bound가 가장
+높은 `(trial, policy)`를 대표 행으로 표시한 것이다. 모든 route에서 `filled_orders`
+는 `attempted_orders`와 동일했으며, 실행 체결 장애는 없었다.
+
+| Route | Representative `(trial, policy)` | Fold Rank-IC | Filled / attempted | Cycles | Compounding blocks | Bootstrap lower bound | DSR | Geometric excess growth | Strategy IR | Max DD | Turnover | Cost drag | 판정 |
+|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 5 sessions | `5, 5:ga2_tb0.2` | 0.083863 / 0.112489 / 0.086611 | 3,306 / 3,306 | 309 | 492 | **-0.00005951** | 0.373188 | 0.001583 | 0.515361 | 0.283755 | 4.265427 | 0.004602 | Lower bound + DSR 실패 |
+| 10 sessions | `14, 5:ga2_tb0.2` | 0.093903 / 0.124910 / 0.102702 | 1,706 / 1,706 | 158 | 246 | **0.00101887** | **0.560109** | 0.003914 | 0.646232 | 0.234516 | 2.372108 | 0.002150 | DSR 실패 |
+| 15 sessions | `18, 1:ga0.5_tb0.2` | 0.085153 / 0.131309 / 0.106263 | 968 / 968 | 80 | 164 | **-0.00208807** | 0.198817 | 0.003906 | 0.509787 | 0.190880 | 1.965466 | 0.001659 | Lower bound + DSR 실패 |
+
+### Route 전체 범위
+
+| Route | Candidate evidence rows | Lower-bound 범위 | DSR 범위 | 합산 filled / attempted |
+|---:|---:|---:|---:|---:|
+| 5 sessions | 12 | -0.00054105 ~ -0.00005951 | 0.296024 ~ 0.373188 | 40,189 / 40,189 |
+| 10 sessions | 12 | 0.00019244 ~ 0.00101887 | 0.404139 ~ 0.560109 | 21,349 / 21,349 |
+| 15 sessions | 12 | -0.00366042 ~ -0.00208807 | 0.105857 ~ 0.198817 | 11,474 / 11,474 |
+
+## 해석
+
+1. **실행 경로는 정상이다.** 대표 evidence의 모든 주문이 체결됐고,
+   resource peak RSS도 hard limit 아래였다.
+2. **10-session route가 상대적으로 가장 강하다.** 최고 lower bound는
+   `0.00101887`이지만 DSR은 `0.56010868`로 요구치 `0.95`의 58.96% 수준에
+   그쳤다. 따라서 최종 승격 증거로 사용할 수 없다.
+3. **다중검정 ledger가 명시됐다.** 81개 terminal screen, route당 27개,
+   6개 policy cell, 실제 36회 replay가 artifact에 기록됐다. DSR을 높이기 위해
+   trial 수를 축소하거나 policy를 수동 선택하지 않았다.
+4. **최종 OOS/holdout 수치는 생성되지 않았다.** `n_folds_evaluated=0`은 최종
+   replay 실패가 아니라 economically eligible candidate가 0건이어서
+   `no-champion-trial` fail-closed 경로로 종료된 의미다.
+
+## 산출물
+
+- [Metrics](../../data/artifacts/stocks/lambdarank_v2_20260813_pipeline_recheck/metrics.json)
+- [Manifest](../../data/artifacts/stocks/lambdarank_v2_20260813_pipeline_recheck/manifest.json)
