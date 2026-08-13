@@ -788,6 +788,179 @@ def test_prepared_allocations_match_reference_constructor() -> None:
     assert allocations == reference
 
 
+def test_prepared_allocations_match_reference_for_stateful_and_calibrated_decisions() -> None:
+    """Prepared and reference allocators agree on stateful, calibrated, and short-history decisions.
+
+    The array-backed path must reproduce the reference constructor exactly for a
+    feasible incumbent portfolio (turnover path), an infeasible incumbent
+    portfolio (sell-only ``DE_RISK`` path), a frozen calibration bucket table
+    (economic gates and compounding), and a two-session window with missing
+    covariance history -- either bit-identical allocations or the same
+    ``PortfolioConstraintError`` outcome.
+    """
+    from src.stocks.research.economic_alpha import CausalAlphaCalibrator
+    from src.stocks.trading.portfolio_constructor import (
+        PreparedAllocationMarket,
+        _SESSION_COLUMN,
+        construct_target_allocations_prepared,
+    )
+
+    panel = scored_panel(n_sessions=61, n_tickers=10, seed=9).drop("ret")
+    policy = StockRiskPolicy(top_k=20, participation_limit=0.01)
+    instruments = instruments_for(10)
+    market = PreparedAllocationMarket.build(panel)
+    overlay = (
+        panel.sort(["session", "instrument_id"])["pred_score"].to_numpy().astype(float)
+    )
+    decision_index = len(market.sessions) - 1
+    base = datetime(2024, 1, 1, tzinfo=UTC)
+
+    def reference_allocations(
+        portfolio: PortfolioSnapshot,
+        *,
+        cal_state: dict[str, object] | None = None,
+        target_market=market,
+        target_index: int = decision_index,
+        target_overlay: np.ndarray = overlay,
+    ) -> tuple[tuple[object, ...], str | None]:
+        window_len = (
+            max(policy.volatility_lookback_sessions, policy.covariance_lookback_sessions)
+            + 1
+        )
+        start = max(0, target_index - window_len + 1)
+        indices = np.concatenate(
+            [
+                np.arange(target_market.session_ranges[i][0], target_market.session_ranges[i][1])
+                for i in range(start, target_index + 1)
+            ]
+        )
+        window_frame = pl.DataFrame(
+            {
+                "instrument_id": target_market.instrument_ids[indices],
+                _SESSION_COLUMN: pl.Series(
+                    target_market.row_sessions[indices].tolist(),
+                    dtype=pl.Datetime("us", "UTC"),
+                ),
+                "pred_score": np.asarray(target_overlay)[indices],
+                "sector": target_market.sector[indices],
+                "adtv": target_market.adtv[indices],
+                "close": target_market.close[indices],
+            }
+        ).with_columns(pl.col("pred_score").fill_nan(None))
+        if cal_state is not None:
+            window_frame = CausalAlphaCalibrator.apply_prepared(cal_state, window_frame)
+        try:
+            return construct_target_allocations(
+                window_frame, instruments, portfolio, policy
+            ), None
+        except PortfolioConstraintError as exc:
+            return (), str(exc)
+
+    def prepared_allocations(
+        portfolio: PortfolioSnapshot,
+        *,
+        cal_state: dict[str, object] | None = None,
+        target_market=market,
+        target_index: int = decision_index,
+        target_overlay: np.ndarray = overlay,
+    ) -> tuple[tuple[object, ...], str | None]:
+        try:
+            return construct_target_allocations_prepared(
+                target_market,
+                target_index,
+                target_overlay,
+                cal_state,
+                instruments,
+                portfolio,
+                policy,
+            ), None
+        except PortfolioConstraintError as exc:
+            return (), str(exc)
+
+    cash_portfolio = PortfolioSnapshot(
+        account_snapshot_id="cash",
+        as_of=base,
+        settled_cash=1_000_000_000.0,
+        unsettled_cash=0.0,
+        positions=(),
+    )
+    feasible_holding = PortfolioSnapshot(
+        account_snapshot_id="feasible",
+        as_of=base,
+        settled_cash=900_000_000.0,
+        unsettled_cash=0.0,
+        positions=(
+            Position(
+                instrument=instruments["KRX:000004"], quantity=2000.0, average_cost=50000.0
+            ),
+        ),
+    )
+    infeasible_holding = PortfolioSnapshot(
+        account_snapshot_id="over_cap",
+        as_of=base,
+        settled_cash=0.0,
+        unsettled_cash=0.0,
+        positions=(
+            Position(
+                instrument=instruments["KRX:000004"], quantity=3000.0, average_cost=50000.0
+            ),
+        ),
+    )
+    buckets = [
+        {
+            "bucket": bucket,
+            "sample_size": 10,
+            "expected_active_alpha": 0.003,
+            "alpha_lower_bound": 0.002,
+        }
+        for bucket in range(4)
+    ]
+    cal_state = {
+        "bucket_count": 4,
+        "history_sessions": 30,
+        "round_trip_cost": 0.0005,
+        "exit_cost_rate": 0.0003,
+        "buckets": buckets,
+    }
+
+    scenarios = [
+        ("cash", cash_portfolio, None),
+        ("feasible-holding", feasible_holding, None),
+        ("over-cap-holding", infeasible_holding, None),
+        ("calibrated", cash_portfolio, cal_state),
+    ]
+    for name, portfolio, cal_state in scenarios:
+        ref, ref_error = reference_allocations(portfolio, cal_state=cal_state)
+        prep, prep_error = prepared_allocations(portfolio, cal_state=cal_state)
+        assert ref_error == prep_error, name
+        assert ref == prep, name
+        assert prep == prep
+
+    # Two-session window: the reference pivot drops the null first session, so
+    # the covariance is degenerate; both paths must agree exactly.
+    short_panel = panel.head(2 * 10)
+    short_market = PreparedAllocationMarket.build(short_panel)
+    short_overlay = (
+        short_panel.sort(["session", "instrument_id"])["pred_score"]
+        .to_numpy()
+        .astype(float)
+    )
+    ref, ref_error = reference_allocations(
+        cash_portfolio,
+        target_market=short_market,
+        target_index=len(short_market.sessions) - 1,
+        target_overlay=short_overlay,
+    )
+    prep, prep_error = prepared_allocations(
+        cash_portfolio,
+        target_market=short_market,
+        target_index=len(short_market.sessions) - 1,
+        target_overlay=short_overlay,
+    )
+    assert ref_error == prep_error
+    assert ref == prep
+
+
 def test_prepared_allocations_reject_overlay_length_mismatch() -> None:
     from src.stocks.trading.portfolio_constructor import (
         PreparedAllocationMarket,

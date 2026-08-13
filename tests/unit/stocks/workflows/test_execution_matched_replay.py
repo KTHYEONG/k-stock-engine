@@ -43,8 +43,12 @@ def _route_materialization(tmp_path) -> tuple[dict, dict, object]:
     )
     oos_start = oos_scored["session"].min()
     route = RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time")
+    oos_sessions = tuple(
+        tm._session_as_datetime(session)
+        for session in oos_scored["session"].unique().sort().to_list()
+    )
     prepared_route = PreparedSelectionRoute.build(
-        panel, [tm._session_as_datetime(oos_start)], request, route
+        panel, oos_sessions, request, route
     )
     prepared = tm._event_ledger_evaluation(
         panel, oos_scored, request, snapshot.manifest, registry, base, stress,
@@ -93,6 +97,9 @@ def test_execution_matched_kernel_base_replay_matches_reference(tmp_path) -> Non
     kernel = state["kernel"]
     oos_scored = state["oos_scored"]
     panel = state["panel"]
+    oos_start = oos_scored["session"].min()
+    assert oos_start > panel["session"].min()
+    assert kernel.prepared_route.sessions[0] == tm._session_as_datetime(oos_start)
     evidence = kernel.run_base(
         oos_scored,
         None,
@@ -105,6 +112,14 @@ def test_execution_matched_kernel_base_replay_matches_reference(tmp_path) -> Non
     assert evidence.no_trade_reason_counts == reference.no_trade_reason_counts
     assert evidence.kernel_parity_version == "execution-matched-v1"
     assert evidence.excess_returns == reference.excess_returns
+    # The bounded route replays exactly its own decision schedule; the tail is
+    # never part of the proxy interval.
+    route = state["route"]
+    expected_decision_count = sum(
+        1 for index in state["prepared_route"].decision_indices
+        if index + 1 < len(state["prepared_route"].sessions)
+    )
+    assert evidence.prepared_decision_count == expected_decision_count
 
 
 def test_execution_matched_proxy_rejects_equal_weight_sign_flip(tmp_path) -> None:
@@ -136,8 +151,12 @@ def test_execution_matched_proxy_rejects_equal_weight_sign_flip(tmp_path) -> Non
     context = tm._prepare_replay_static_context(panel, request)
     oos_start = oos_scored["session"].min()
     route = RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time")
+    oos_sessions = tuple(
+        tm._session_as_datetime(session)
+        for session in oos_scored["session"].unique().sort().to_list()
+    )
     prepared_route = PreparedSelectionRoute.build(
-        panel, [tm._session_as_datetime(oos_start)], request, route
+        panel, oos_sessions, request, route
     )
     kernel = ExecutionMatchedReplayKernel(
         panel=panel,

@@ -6,6 +6,7 @@ import math
 from collections.abc import Callable
 from dataclasses import replace as dataclass_replace
 from datetime import UTC, datetime
+from typing import cast
 
 import polars as pl
 import pytest
@@ -1728,10 +1729,10 @@ def test_replay_context_built_only_after_finalist_folds_pass(monkeypatch, tmp_pa
     assert config is not None
     assert n_trials == request.optuna_trials
     assert order[-1] == "replay_prepare"
-    assert order.count("replay_prepare") >= 2
+    assert order.count("replay_prepare") == 1
     first_prepare = order.index("replay_prepare")
     last_refit = max(i for i, step in enumerate(order) if step == "refit")
-    assert last_refit > first_prepare
+    assert first_prepare > last_refit
     assert order.count("refit") >= 2
 
 
@@ -2203,7 +2204,7 @@ def test_reserve_forward_holdout_uses_route_availability_column() -> None:
     assert legacy_panel is panel
 
 
-def test_prepared_selection_route_scatters_per_candidate_overlays() -> None:
+def test_prepared_selection_route_scatters_per_candidate_overlays(tmp_path) -> None:
     """One immutable route market is reused; only the overlay differs per candidate."""
     import numpy as np
 
@@ -2245,6 +2246,240 @@ def test_prepared_selection_route_scatters_per_candidate_overlays() -> None:
     assert allocation_index is not None
     assert 0 <= allocation_index < len(prepared.allocation_market.sessions)
 
+    # Row-offset fold fixture: validation_mask holds panel row positions that
+    # the legacy session_index lookup would resolve to a later boundary. The
+    # fixed row-position selection must attach the kernel at the actual
+    # validation minimum session.
+    offset_panel = _index_sessions(df).sort(["session", "instrument_id"])
+    offset_with_positions = offset_panel.with_row_index("__row_idx")
+    offset_sessions = sorted(offset_panel["session"].unique().to_list())
+    validation_sessions = offset_sessions[5:15]
+    expected_min = validation_sessions[0]
+    validation_mask = (
+        offset_with_positions.filter(pl.col("session").is_in(validation_sessions))
+        .select("__row_idx")
+        .to_series()
+        .to_list()
+    )
+    legacy_first = (
+        offset_panel.filter(pl.col("session_index").is_in(validation_mask))
+        .select(pl.col("session").min())
+        .item()
+    )
+    assert legacy_first != expected_min
+    row_offset_fold = tm.Fold(
+        train_mask=[],
+        validation_mask=validation_mask,
+        train_label_end=0,
+        validation_decision_start=0,
+    )
+    attached = tm._attach_proxy_kernels(
+        offset_panel,
+        [row_offset_fold],
+        (_fake_candidate_context(),),
+        request,
+        route,
+        dataset_manifest=manifest,
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    assert attached[0] is not None
+    assert attached[0].execution_kernel is not None
+    assert attached[0].execution_kernel.prepared_route.sessions[0] == (
+        tm._session_as_datetime(expected_min)
+    )
+    assert attached[0].execution_kernel.prepared_route.sessions[0] != (
+        tm._session_as_datetime(legacy_first)
+    )
+
+
+def test_prepared_route_bounds_to_exact_interval_and_rejects_tail() -> None:
+    """Route sessions equal exactly the ordered OOS interval; no tail replays."""
+    import src.stocks.workflows.train_model as tm
+    from src.stocks.workflows.train_model import PreparedSelectionRoute
+
+    df = stock_v2_composed_df(n_sessions=70, n_tickers=8)
+    panel = _index_sessions(df)
+    request = TrainingRequest(artifact_id="bound_route", n_folds=3)
+    route = tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time")
+    all_sessions = panel["session"].unique().sort().to_list()
+    interval = [tm._session_as_datetime(session) for session in all_sessions[40:70]]
+    prepared = PreparedSelectionRoute.build(panel, interval, request, route)
+    assert prepared.sessions == tuple(interval)
+    assert prepared.market.sessions == prepared.sessions
+    assert prepared.market.sessions[-1] == interval[-1]
+    assert prepared.decision_indices[-1] < len(prepared.sessions)
+
+    # A non-contiguous interval (missing sessions) fails closed.
+    with pytest.raises(ValueError, match="complete contiguous"):
+        PreparedSelectionRoute.build(
+            panel, [interval[0], interval[7]], request, route
+        )
+    # A session not present in the panel between the boundaries fails closed.
+    with pytest.raises(ValueError, match="complete contiguous"):
+        PreparedSelectionRoute.build(
+            panel, [interval[0], interval[1], interval[-1]], request, route
+        )
+    # A single-session interval bounds exactly to that session, never the tail.
+    single = PreparedSelectionRoute.build(panel, [interval[0]], request, route)
+    assert single.sessions == (interval[0],)
+    assert single.market.sessions == (interval[0],)
+
+
+def test_screen_objective_short_circuits_on_first_terminal_fold(
+    monkeypatch, tmp_path
+) -> None:
+    """Fold-0 ``None`` executes exactly one fold, skips the rest, and stays pruned."""
+    import optuna
+
+    import src.stocks.workflows.train_model as tm
+
+    monkeypatch.setattr(tm, "_MIN_TRAIN_SESSIONS", 40)
+    monkeypatch.setattr(tm, "_VALIDATION_BLOCK_SESSIONS", 30)
+    df = stock_v2_composed_df(n_sessions=140, n_tickers=20)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    label_span = (manifest.label_horizon_sessions or 1) + 1
+    folds = tm.PurgedWalkForward(
+        n_folds=3,
+        label_horizon_sessions=label_span,
+        embargo_sessions=5,
+        session_column="session_index",
+        validation_window_sessions=30,
+        min_train_sessions=40,
+    ).split(panel)
+    monkeypatch.setattr(tm, "_fit_stable_contexts", _fake_fold_contexts)
+    called_folds: list[int] = []
+
+    def fold0_none(*args, **kwargs):
+        called_folds.append(int(args[11]))
+        return None
+
+    monkeypatch.setattr(tm, "_score_trial_fold", fold0_none)
+    captured: dict[str, object] = {}
+
+    def spy_optimize(self, func, *args, **kwargs):
+        captured["func"] = func
+
+    monkeypatch.setattr(optuna.study.Study, "optimize", spy_optimize)
+
+    class _FakeTrial:
+        def __init__(self) -> None:
+            self.number = 0
+            self.user_attrs: dict[str, object] = {}
+
+        def set_user_attr(self, key: str, value: object) -> None:
+            self.user_attrs[key] = value
+
+        def suggest_float(self, _name: str, low: float, high: float, **_) -> float:
+            return low
+
+        def suggest_int(self, _name: str, low: int, high: int, **_) -> int:
+            return low
+
+        def suggest_categorical(self, _name: str, choices: tuple) -> object:
+            return choices[0]
+
+    tm._tune_champion(
+        panel,
+        TrainingRequest(artifact_id="short_circuit", n_folds=3, optuna_trials=3),
+        _tune_base_manifest("short_circuit", manifest, manifest.label_definition),
+        tuple(c for c in df.columns if c.startswith("feature__")),
+        (tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),),
+        dataset_manifest=manifest,
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    objective = captured["func"]
+    assert callable(objective)
+    trial = _FakeTrial()
+    with pytest.raises(optuna.TrialPruned):
+        cast(Callable, objective)(trial)
+    assert called_folds == [0]
+    assert trial.user_attrs["executed_proxy_folds"] == 1
+    assert trial.user_attrs["skipped_proxy_folds"] == 2
+    assert trial.user_attrs["terminal_fold_index"] == 0
+    assert trial.user_attrs["terminal_reason"] == "fold_none"
+
+
+def test_screen_objective_retains_exact_minimum_when_all_folds_valid(
+    monkeypatch, tmp_path
+) -> None:
+    """All-valid screen folds preserve the exact minimum of the fold bounds."""
+    import optuna
+
+    import src.stocks.workflows.train_model as tm
+
+    monkeypatch.setattr(tm, "_MIN_TRAIN_SESSIONS", 40)
+    monkeypatch.setattr(tm, "_VALIDATION_BLOCK_SESSIONS", 30)
+    df = stock_v2_composed_df(n_sessions=140, n_tickers=20)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    label_span = (manifest.label_horizon_sessions or 1) + 1
+    folds = tm.PurgedWalkForward(
+        n_folds=3,
+        label_horizon_sessions=label_span,
+        embargo_sessions=5,
+        session_column="session_index",
+        validation_window_sessions=30,
+        min_train_sessions=40,
+    ).split(panel)
+    monkeypatch.setattr(tm, "_fit_stable_contexts", _fake_fold_contexts)
+    bounds = [0.05, 0.03, 0.07]
+    called_folds: list[int] = []
+
+    def valid_score(*args, **kwargs):
+        fold_index = int(args[11])
+        called_folds.append(fold_index)
+        return bounds[fold_index]
+
+    monkeypatch.setattr(tm, "_score_trial_fold", valid_score)
+    captured: dict[str, object] = {}
+
+    def spy_optimize(self, func, *args, **kwargs):
+        captured["func"] = func
+
+    monkeypatch.setattr(optuna.study.Study, "optimize", spy_optimize)
+
+    class _FakeTrial:
+        def __init__(self) -> None:
+            self.number = 0
+            self.user_attrs: dict[str, object] = {}
+
+        def set_user_attr(self, key: str, value: object) -> None:
+            self.user_attrs[key] = value
+
+        def suggest_float(self, _name: str, low: float, high: float, **_) -> float:
+            return low
+
+        def suggest_int(self, _name: str, low: int, high: int, **_) -> int:
+            return low
+
+        def suggest_categorical(self, _name: str, choices: tuple) -> object:
+            return choices[0]
+
+    tm._tune_champion(
+        panel,
+        TrainingRequest(artifact_id="valid_screen", n_folds=3, optuna_trials=3),
+        _tune_base_manifest("valid_screen", manifest, manifest.label_definition),
+        tuple(c for c in df.columns if c.startswith("feature__")),
+        (tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),),
+        dataset_manifest=manifest,
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    objective = captured["func"]
+    assert callable(objective)
+    trial = _FakeTrial()
+    value = cast(Callable, objective)(trial)
+    assert called_folds == [0, 1, 2]
+    assert value == min(bounds)
+    assert trial.user_attrs["proxy_execution_lower_bounds"] == bounds
+    assert "executed_proxy_folds" not in trial.user_attrs
+
 
 def test_prepared_route_replay_matches_reference_replay(tmp_path) -> None:
     """Prepared warm-up parity with the reference over an OOS boundary.
@@ -2283,8 +2518,12 @@ def test_prepared_route_replay_matches_reference_replay(tmp_path) -> None:
     assert reference.filled_orders > 0
     oos_start = oos_scored["session"].min()
     route = tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time")
+    oos_sessions = tuple(
+        tm._session_as_datetime(session)
+        for session in oos_scored["session"].unique().sort().to_list()
+    )
     prepared_route = PreparedSelectionRoute.build(
-        panel, [tm._session_as_datetime(oos_start)], request, route
+        panel, oos_sessions, request, route
     )
     prepared = tm._event_ledger_evaluation(
         panel, oos_scored, request, snapshot.manifest, registry, base, stress,
