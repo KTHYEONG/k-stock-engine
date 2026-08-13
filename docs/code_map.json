@@ -302,7 +302,10 @@
     "testing": "tests/unit/stocks/workflows/test_trading_cycle.py"
   },
   "src/stocks/workflows/train_model.py": {
-    "testing": "tests/unit/stocks/workflows/test_train_model.py",
+    "testing": [
+      "tests/unit/stocks/workflows/test_train_model.py",
+      "tests/integration/stocks/test_multifold_80_trial_profile.py"
+    ],
     "architecture": "docs/results/back-res.md"
   },
   "src/storage/parquet_datasets.py": {

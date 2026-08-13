@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 import numpy as np
@@ -37,6 +37,27 @@ _TOLERANCE = 1e-10
 
 class PortfolioConstraintError(ValueError):
     """Raised when constructed targets violate a hard portfolio constraint."""
+
+
+@dataclass(frozen=True, slots=True)
+class CompoundingPolicyConfig:
+    """Immutable lower-confidence compounding overlay configuration.
+
+    ``growth_risk_aversion`` prices horizon-unit variance against the
+    confidence edge in the exponential utility overlay; it must be finite and
+    strictly positive. ``enabled`` turns the overlay on for economic panels
+    that expose ``net_alpha_lower_bound``; legacy score-only panels are
+    unaffected either way.
+    """
+
+    enabled: bool = True
+    growth_risk_aversion: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.growth_risk_aversion) or self.growth_risk_aversion <= 0.0:
+            raise ValueError(
+                "growth_risk_aversion must be finite and strictly positive"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,6 +232,10 @@ class StockRiskPolicy:
     rebalance_frequency_sessions: int = 5
     annualization_sessions: int = 252
     economic_hysteresis: bool = True
+    compounding: CompoundingPolicyConfig = field(default_factory=CompoundingPolicyConfig)
+    compounding_evidence: list[dict[str, object]] = field(
+        default_factory=list, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if self.top_k <= 0:
@@ -297,6 +322,21 @@ def construct_target_allocations(
         return ()
 
     ids = [str(r) for r in ranked["instrument_id"].to_list()]
+    net_lower_bound_of: dict[str, float] = {}
+    if policy.compounding.enabled and "net_alpha_lower_bound" in cross_section.columns:
+        net_lower_bound_of = {
+            str(r["instrument_id"]): float(r["net_alpha_lower_bound"])
+            for r in cross_section.to_dicts()
+            if r["net_alpha_lower_bound"] is not None
+        }
+        for instrument_id in ids:
+            if instrument_id not in net_lower_bound_of or not math.isfinite(
+                net_lower_bound_of[instrument_id]
+            ):
+                _record_compounding_decision(
+                    policy, None, None, None, "invalid-confidence-variance"
+                )
+                return ()
     sector_of = {str(r["instrument_id"]): r["sector"] for r in cross_section.to_dicts()}
     adtv_of = {str(r["instrument_id"]): float(r["adtv"]) for r in cross_section.to_dicts()}
     vol_of = {str(r["instrument_id"]): float(r["__vol"]) for r in ranked.to_dicts()}
@@ -317,6 +357,7 @@ def construct_target_allocations(
             instruments,
             policy,
             priority_alpha_of=priority_alpha_of,
+            net_lower_bound_of=net_lower_bound_of,
         )
     else:
         allocations = _de_risk_allocations(
@@ -481,6 +522,7 @@ def _build_allocations(
     policy: StockRiskPolicy,
     *,
     priority_alpha_of: dict[str, float] | None = None,
+    net_lower_bound_of: dict[str, float] | None = None,
 ) -> tuple[Allocation, ...]:
     if priority_alpha_of:
         raw_scores = {
@@ -504,6 +546,18 @@ def _build_allocations(
     weights = _scale_sectors(weights, sector_of, policy.sector_cap)
     weights = _scale_gross(weights, policy.gross_cap)
     weights = _scale_volatility(weights, panel, ids, policy)
+
+    if policy.compounding.enabled and net_lower_bound_of:
+        scale, edge_h, variance_h, cash_reason = _compounding_scale(
+            weights, net_lower_bound_of, panel, ids, policy
+        )
+        _record_compounding_decision(policy, edge_h, variance_h, scale, cash_reason)
+        if cash_reason is not None:
+            return ()
+        weights = {
+            instrument_id: weight * scale
+            for instrument_id, weight in weights.items()
+        }
 
     if policy.turnover_budget > 0.0:
         target_full = dict.fromkeys(current_weights, 0.0)
@@ -582,6 +636,71 @@ def _scale_volatility(
     forecast_vol = math.sqrt(portfolio_variance) * math.sqrt(policy.annualization_sessions)
     scalar = min(1.0, policy.target_annual_volatility / forecast_vol)
     return {instrument_id: weight * scalar for instrument_id, weight in weights.items()}
+
+
+def _compounding_scale(
+    weights: dict[str, float],
+    net_lower_bound_of: dict[str, float],
+    panel: pl.DataFrame,
+    ids: list[str],
+    policy: StockRiskPolicy,
+) -> tuple[float, float, float, str | None]:
+    """Return ``(scale, confidence_edge_h, confidence_variance_h, cash_reason)``.
+
+    The risky target scale ``s*`` prices the horizon-unit lower-confidence
+    edge ``A_h = w.T @ net_alpha_lower_bound`` against the horizon-scaled
+    portfolio variance ``V_h = h * w.T @ Sigma_daily @ w`` with the policy's
+    ``growth_risk_aversion``. ``net_alpha_lower_bound`` already nets the
+    calibrated route-level round-trip cost, so it is never cost-subtracted
+    again. ``s*`` only reduces a constrained target, never increases it. A
+    non-positive edge, a non-finite/negative variance, or unavailable
+    covariance yields ``cash_reason`` and a zero risky scale.
+    """
+    horizon = max(1, int(policy.rebalance_frequency_sessions))
+    risk_aversion = policy.compounding.growth_risk_aversion
+    vector = np.asarray([weights[instrument_id] for instrument_id in ids], dtype=float)
+    lower = np.asarray(
+        [net_lower_bound_of.get(instrument_id, 0.0) for instrument_id in ids],
+        dtype=float,
+    )
+    confidence_edge_h = float(vector @ lower)
+    if not math.isfinite(confidence_edge_h) or confidence_edge_h <= 0.0:
+        return 0.0, confidence_edge_h, 0.0, "non-positive-confidence-edge"
+    return_matrix = _return_matrix(panel, ids, policy.covariance_lookback_sessions)
+    if return_matrix is None:
+        return 0.0, confidence_edge_h, float("nan"), "invalid-confidence-variance"
+    covariance = _shrinkage_covariance(return_matrix)
+    confidence_variance_h = horizon * float(vector @ covariance @ vector)
+    if not math.isfinite(confidence_variance_h) or confidence_variance_h < 0.0:
+        return 0.0, confidence_edge_h, confidence_variance_h, "invalid-confidence-variance"
+    if confidence_variance_h == 0.0:
+        return 1.0, confidence_edge_h, confidence_variance_h, None
+    scale = min(1.0, max(0.0, confidence_edge_h / (risk_aversion * confidence_variance_h)))
+    return scale, confidence_edge_h, confidence_variance_h, None
+
+
+def _record_compounding_decision(
+    policy: StockRiskPolicy,
+    confidence_edge_h: float | None,
+    confidence_variance_h: float | None,
+    confidence_scale: float | None,
+    cash_reason: str | None,
+) -> None:
+    """Append one deterministic per-decision compounding record to the policy."""
+    policy.compounding_evidence.append(
+        {
+            "confidence_edge_h": (
+                None if confidence_edge_h is None else float(confidence_edge_h)
+            ),
+            "confidence_variance_h": (
+                None if confidence_variance_h is None else float(confidence_variance_h)
+            ),
+            "confidence_scale": (
+                None if confidence_scale is None else float(confidence_scale)
+            ),
+            "cash_reason": cash_reason,
+        }
+    )
 
 
 def _return_matrix(
