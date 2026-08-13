@@ -2,8 +2,9 @@
 
 Run explicitly with ``pytest -m slow``; excluded from the normal
 ``-m "not slow"`` suite. Verifies the search reaches 81 terminal screens under
-an explicit RSS budget with the deterministic 27-to-6-to-2 multi-fidelity
-funnel, runs at most six inner economic replays, records baseline/peak RSS and
+an explicit RSS budget with the deterministic 27-to-6-to-6-to-3 multi-fidelity
+funnel, runs at most nine inner economic replays (one per all-positive
+finalist under the single default policy), records baseline/peak RSS and
 trial/fold timing telemetry in the published metrics, and publishes a terminal
 promoted or ``NO_TRADE`` artifact without relaxing the promotion gates.
 """
@@ -70,34 +71,31 @@ def test_multifold_80_trial_profile_completes_under_budget(tmp_path, monkeypatch
     resource = payload["resource"]
     assert resource["n_terminal_trials"] == _OPTUNA_TRIALS
     assert resource["total_terminal_screen_trials"] == _OPTUNA_TRIALS
-    assert resource["configured_compounding_policy_cells"] == 6
+    assert resource["configured_compounding_policy_cells"] == 1
     assert resource["selection_multiplicity_version"] == (
-        "selection-multiplicity-raw-count-v1"
+        "selection-multiplicity-global-count-v1"
     )
     assert payload["total_terminal_screen_trials"] == _OPTUNA_TRIALS
-    assert payload["configured_compounding_policy_cells"] == 6
+    assert payload["configured_compounding_policy_cells"] == 1
     assert payload["selection_multiplicity_version"] == (
-        "selection-multiplicity-raw-count-v1"
+        "selection-multiplicity-global-count-v1"
     )
     for row in resource["shortlist_candidate_evidence"]:
         assert row["total_terminal_screen_trials"] == _OPTUNA_TRIALS
         assert row["route_terminal_screen_trials"] == _OPTUNA_TRIALS // 3
-        assert row["configured_compounding_policy_cells"] == 6
+        assert row["configured_compounding_policy_cells"] == 1
         assert row["selection_multiplicity_version"] == (
-            "selection-multiplicity-raw-count-v1"
+            "selection-multiplicity-global-count-v1"
         )
-        assert row["policy_id"]
-        if row["replay_finite"]:
-            assert row["exact_compounding_policy_replays"] == 6
-        else:
-            assert row["exact_compounding_policy_replays"] < 6
+        assert row["policy_id"] == "default:neutral"
+        assert row["exact_compounding_policy_replays"] == 1
     assert resource["peak_rss_mib"] <= _BUDGET_MIB
     assert resource["baseline_rss_mib"] > 0.0
     assert resource["trial_fold_timings_seconds"]
     assert resource["screened_trials"] >= 0
     assert resource["pruned_trials"] >= 0
     assert resource["screened_trials"] + resource["pruned_trials"] == _OPTUNA_TRIALS
-    assert resource["selection_policy_version"] == "economic-selection-v3-compounding"
+    assert resource["selection_policy_version"] == "economic-selection-v4-stability"
     assert resource["compute_plan_version"] == "sub10-refit-v1"
     assert resource["resolved_lgb_threads"] >= 1
     assert resource["per_route_trial_budget"] == _OPTUNA_TRIALS // 3
@@ -105,7 +103,7 @@ def test_multifold_80_trial_profile_completes_under_budget(tmp_path, monkeypatch
     assert resource["screen_fidelity"] == "session_stride_proxy"
     assert resource["proxy_session_stride"] == 6
     assert resource["promotion_width"] == 6
-    assert resource["economic_finalist_width"] == 2
+    assert resource["economic_finalist_width"] == 3
     assert resource["cache_bytes"] > 0
     assert resource["screen_seconds"] > 0.0
     assert resource["full_refit_boosting_rounds"] == 900
@@ -146,7 +144,7 @@ def test_multifold_80_trial_profile_completes_under_budget(tmp_path, monkeypatch
         int(attrs.get("all_positive_finalists", 0))
         for attrs in resource["routes"].values()
     )
-    assert inner_replays <= 3
+    assert inner_replays <= 9
     assert elapsed_seconds > 0.0
     assert payload["promoted"] is False
     assert payload["no_trade"] is True
