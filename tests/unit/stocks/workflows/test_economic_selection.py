@@ -14,12 +14,24 @@ from src.stocks.workflows.economic_selection import (
 
 def test_for_budget_produces_27_to_6_to_6_to_3_profile() -> None:
     policy = ScreenFidelityPolicy.for_budget(total_trials=81, route_count=3, fold_count=3)
-    assert policy.widths == (27, 6, 6, 3)
+    assert policy.widths == (27, 6, 6, 6, 3, 3)
     assert policy.route_budget == 27
     assert policy.proxy_session_stride == 6
     assert policy.promotion_width == 6
+    assert policy.confirmation_width == 6
     assert policy.economic_finalist_width == 3
-    assert SELECTION_POLICY_VERSION == "economic-selection-v5-execution-matched"
+    assert policy.recovery_width == 3
+    assert SELECTION_POLICY_VERSION == "economic-selection-v6-confirmed-recovery"
+
+
+def test_confirmation_width_equals_promotion_width_and_recovery_equals_finalist() -> None:
+    for trials in (12, 27, 81):
+        policy = ScreenFidelityPolicy.for_budget(
+            total_trials=trials, route_count=1, fold_count=3
+        )
+        assert policy.confirmation_width == policy.promotion_width
+        assert policy.recovery_width == policy.economic_finalist_width
+        assert policy.recovery_width <= policy.promotion_width
 
 
 def test_for_budget_never_exceeds_positive_screen_candidates() -> None:
@@ -62,7 +74,9 @@ def test_to_json_safe_records_version_widths_and_one_policy_cell() -> None:
     assert payload["route_budget"] == 27
     assert payload["proxy_session_stride"] == 6
     assert payload["promotion_width"] == 6
+    assert payload["confirmation_width"] == 6
     assert payload["economic_finalist_width"] == 3
+    assert payload["recovery_width"] == 3
     assert payload["configured_compounding_policy_cells"] == 1
 
 

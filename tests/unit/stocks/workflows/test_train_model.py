@@ -496,6 +496,30 @@ def _fake_fold_contexts(*_args, **_kwargs):
     )
 
 
+def _fake_fold_evidence(
+    lower_bound: float = 0.01,
+    mean: float = 0.01,
+    rank_ic: float = 0.05,
+    block_count: int = 4,
+) -> tm.ScreenFoldEvidence:
+    """Deterministic usable :class:`ScreenFoldEvidence` for ``_score_trial_fold`` fakes."""
+    return tm.ScreenFoldEvidence(
+        rank_ic=rank_ic,
+        attempted_orders=10,
+        filled_orders=8,
+        planned_cycles=1,
+        complete_block_count=block_count,
+        rejected_block_count=0,
+        block_log_excess_mean=mean,
+        lower_bound=lower_bound,
+        dsr_probability=0.97,
+        usable=True,
+        failure_reason=None,
+        no_trade_reason_counts={},
+        block_log_excess=(mean, mean, mean, mean),
+    )
+
+
 def test_tuning_never_includes_first_outer_oos(monkeypatch, tmp_path) -> None:
     import src.stocks.workflows.train_model as tm
 
@@ -528,7 +552,7 @@ def test_tuning_never_includes_first_outer_oos(monkeypatch, tmp_path) -> None:
         )
 
     monkeypatch.setattr(tm, "_fit_stable_contexts", fake_stable_contexts)
-    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: _fake_fold_evidence())
     monkeypatch.setattr(
         tm,
         "_fit_and_score_candidate",
@@ -622,7 +646,7 @@ def test_tuning_economic_tie_breaks_by_lowest_trial_number(monkeypatch, tmp_path
         "_fit_stable_contexts",
         _fake_fold_contexts,
     )
-    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: _fake_fold_evidence())
     monkeypatch.setattr(
         tm,
         "_fit_and_score_candidate",
@@ -648,7 +672,7 @@ def test_tuning_economic_tie_breaks_by_lowest_trial_number(monkeypatch, tmp_path
     assert telemetry["selection_status"] == "selected"
     assert telemetry["selected_trial_number"] == 0
     assert telemetry["screened_trials"] == request.optuna_trials
-    assert telemetry["selection_policy_version"] == "economic-selection-v5-execution-matched"
+    assert telemetry["selection_policy_version"] == "economic-selection-v6-confirmed-recovery"
     assert telemetry["promotion_width"] == 2
     assert telemetry["economic_finalist_width"] == 2
     assert telemetry["shortlisted_trials"] == 2
@@ -684,7 +708,7 @@ def test_tuning_rejects_economically_ineligible_candidates(monkeypatch, tmp_path
         "_fit_stable_contexts",
         _fake_fold_contexts,
     )
-    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: _fake_fold_evidence())
     monkeypatch.setattr(
         tm,
         "_fit_and_score_candidate",
@@ -1200,7 +1224,7 @@ def test_tuning_rejects_non_positive_bootstrap_candidates(monkeypatch, tmp_path)
         "_fit_stable_contexts",
         _fake_fold_contexts,
     )
-    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: _fake_fold_evidence())
     monkeypatch.setattr(
         tm,
         "_fit_and_score_candidate",
@@ -1327,7 +1351,7 @@ def test_tuning_skips_candidates_that_fail_full_refit(monkeypatch, tmp_path) -> 
         "_fit_stable_contexts",
         _fake_fold_contexts,
     )
-    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: _fake_fold_evidence())
     monkeypatch.setattr(tm, "_fit_and_score_candidate", lambda *_a, **_kw: None)
     monkeypatch.setattr(tm, "_event_ledger_evaluation", lambda *_a, **_kw: _positive_replay())
 
@@ -1439,7 +1463,7 @@ def test_tuning_records_early_rejected_full_refits(monkeypatch, tmp_path) -> Non
         "_fit_stable_contexts",
         _fake_fold_contexts,
     )
-    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: _fake_fold_evidence())
 
     monkeypatch.setattr(tm, "_fit_and_score_candidate", _fold_aware_refit(reject_trials=("trial0",)))
     monkeypatch.setattr(tm, "_event_ledger_evaluation", lambda *_a, **_kw: _positive_replay())
@@ -1555,7 +1579,7 @@ def test_shortlisted_candidates_refit_with_screen_informed_profile(
         "_fit_stable_contexts",
         _fake_fold_contexts,
     )
-    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: _fake_fold_evidence())
 
     refit_configs: list[tm.LambdaRankConfig] = []
 
@@ -1693,7 +1717,7 @@ def test_replay_context_built_only_after_finalist_folds_pass(monkeypatch, tmp_pa
     ).split(panel)
 
     monkeypatch.setattr(tm, "_fit_stable_contexts", _fake_fold_contexts)
-    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: _fake_fold_evidence())
 
     order: list[str] = []
     real_refit = _fold_aware_refit()
@@ -2016,7 +2040,15 @@ def _route_tune_mocks(
     monkeypatch.setattr(tm, "_VALIDATION_BLOCK_SESSIONS", 30)
     monkeypatch.setattr(tm, "_fit_stable_contexts", _fake_fold_contexts)
     monkeypatch.setattr(
-        tm, "_score_trial_fold", lambda *_a, **_kw: screen_ic
+        tm,
+        "_score_trial_fold",
+        (lambda *_a, **_kw: None)
+        if screen_ic is None
+        else (
+            lambda *_a, **_kw: _fake_fold_evidence(
+                lower_bound=screen_ic, rank_ic=screen_ic
+            )
+        ),
     )
     monkeypatch.setattr(
         tm,
@@ -2401,13 +2433,21 @@ def test_screen_objective_short_circuits_on_first_terminal_fold(
     assert trial.user_attrs["executed_proxy_folds"] == 1
     assert trial.user_attrs["skipped_proxy_folds"] == 2
     assert trial.user_attrs["terminal_fold_index"] == 0
-    assert trial.user_attrs["terminal_reason"] == "fold_none"
+    assert trial.user_attrs["terminal_reason"] == "hard_pruned"
+
+    fold0_negative = _fake_fold_evidence(lower_bound=-0.0024, mean=0.0016)
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: fold0_negative)
+    trial2 = _FakeTrial()
+    value = cast(Callable, objective)(trial2)
+    assert value == pytest.approx(-0.0024)
+    assert trial2.user_attrs["terminal_reason"] == "complete"
+    assert trial2.user_attrs["screen_fold0_lower_bound"] == pytest.approx(-0.0024)
 
 
-def test_screen_objective_retains_exact_minimum_when_all_folds_valid(
+def test_screen_objective_scores_only_fold_zero_and_retains_negative_bound(
     monkeypatch, tmp_path
 ) -> None:
-    """All-valid screen folds preserve the exact minimum of the fold bounds."""
+    """Fold-0 is the only scored proxy fold; a negative bound stays complete."""
     import optuna
 
     import src.stocks.workflows.train_model as tm
@@ -2427,13 +2467,15 @@ def test_screen_objective_retains_exact_minimum_when_all_folds_valid(
         min_train_sessions=40,
     ).split(panel)
     monkeypatch.setattr(tm, "_fit_stable_contexts", _fake_fold_contexts)
-    bounds = [0.05, 0.03, 0.07]
+    bounds = [-0.03, 0.03, 0.07]
     called_folds: list[int] = []
 
     def valid_score(*args, **kwargs):
         fold_index = int(args[11])
         called_folds.append(fold_index)
-        return bounds[fold_index]
+        return _fake_fold_evidence(
+            lower_bound=bounds[fold_index], mean=0.0016
+        )
 
     monkeypatch.setattr(tm, "_score_trial_fold", valid_score)
     captured: dict[str, object] = {}
@@ -2475,10 +2517,11 @@ def test_screen_objective_retains_exact_minimum_when_all_folds_valid(
     assert callable(objective)
     trial = _FakeTrial()
     value = cast(Callable, objective)(trial)
-    assert called_folds == [0, 1, 2]
-    assert value == min(bounds)
-    assert trial.user_attrs["proxy_execution_lower_bounds"] == bounds
-    assert "executed_proxy_folds" not in trial.user_attrs
+    assert called_folds == [0]
+    assert value == pytest.approx(-0.03)
+    assert trial.user_attrs["terminal_reason"] == "complete"
+    assert trial.user_attrs["screen_fold0_lower_bound"] == pytest.approx(-0.03)
+    assert trial.user_attrs["screen_fold0_rank_ic"] == pytest.approx(0.05)
 
 
 def test_prepared_route_replay_matches_reference_replay(tmp_path) -> None:
@@ -2973,7 +3016,7 @@ def test_tuning_single_default_policy_is_deterministic_and_guarded(
     ).split(panel)
 
     monkeypatch.setattr(tm, "_fit_stable_contexts", _fake_fold_contexts)
-    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: _fake_fold_evidence())
     monkeypatch.setattr(tm, "_fit_and_score_candidate", _fold_aware_refit())
     calls = {"count": 0}
 
@@ -3103,7 +3146,7 @@ def test_tuning_lower_rank_ic_candidate_with_higher_compounding_objective_wins(
     ).split(panel)
 
     monkeypatch.setattr(tm, "_fit_stable_contexts", _fake_fold_contexts)
-    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: _fake_fold_evidence())
 
     def fake_refit(*_a, **_kw):
         key = str(_a[10])
@@ -3163,7 +3206,7 @@ def test_tuning_candidate_failing_dsr_cannot_win(monkeypatch, tmp_path) -> None:
     ).split(panel)
 
     monkeypatch.setattr(tm, "_fit_stable_contexts", _fake_fold_contexts)
-    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: _fake_fold_evidence())
     monkeypatch.setattr(tm, "_fit_and_score_candidate", _fold_aware_refit())
     monkeypatch.setattr(
         tm,
@@ -3192,6 +3235,72 @@ def test_tuning_candidate_failing_dsr_cannot_win(monkeypatch, tmp_path) -> None:
         assert row["eligible"] is False
         assert row["failure_reasons"] == ["dsr_below_threshold"]
         assert row["bootstrap_lower_bound"] > 0.0
+
+def test_tuning_recovery_shortlist_from_negative_pooled_bound(monkeypatch, tmp_path) -> None:
+    """Negative pooled lower bound with positive mean admits bounded recovery candidates."""
+    import src.stocks.workflows.train_model as tm
+
+    monkeypatch.setattr(tm, "_MIN_TRAIN_SESSIONS", 40)
+    monkeypatch.setattr(tm, "_VALIDATION_BLOCK_SESSIONS", 30)
+
+    df = stock_v2_composed_df(n_sessions=140, n_tickers=20)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    label_span = (manifest.label_horizon_sessions or 1) + 1
+    folds = tm.PurgedWalkForward(
+        n_folds=3,
+        label_horizon_sessions=label_span,
+        embargo_sessions=5,
+        session_column="session_index",
+        validation_window_sessions=30,
+        min_train_sessions=40,
+    ).split(panel)
+
+    monkeypatch.setattr(tm, "_fit_stable_contexts", _fake_fold_contexts)
+    monkeypatch.setattr(
+        tm,
+        "_score_trial_fold",
+        lambda *_a, **_kw: _fake_fold_evidence(lower_bound=-0.01, mean=0.0016),
+    )
+    monkeypatch.setattr(
+        tm,
+        "_pool_screen_evidence",
+        lambda *_a, **_kw: (-0.0024, 0.0016, 0.5, 12),
+    )
+    monkeypatch.setattr(tm, "_fit_and_score_candidate", _fold_aware_refit())
+    monkeypatch.setattr(
+        tm,
+        "_event_ledger_evaluation",
+        lambda *_a, **_kw: _positive_replay(strategy_returns=[0.001] * 60),
+    )
+
+    request = TrainingRequest(artifact_id="recovery_path", n_folds=3, optuna_trials=3)
+    config, n_trials, _route = tm._tune_champion(
+        panel[folds[0].train_mask],
+        request,
+        _tune_base_manifest("recovery_path", manifest, manifest.label_definition),
+        tuple(c for c in df.columns if c.startswith("feature__")),
+        (tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),),
+        dataset_manifest=manifest,
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    assert config is None
+    assert n_trials == request.optuna_trials
+    telemetry = tm.LambdaRankConfig._tuning_telemetry
+    assert telemetry["selection_status"] == "no_economically_eligible_candidate"
+    assert telemetry["strict_shortlisted_trials"] == 0
+    assert telemetry["recovery_shortlisted_trials"] > 0
+    assert telemetry["recovery_shortlisted_trials"] <= telemetry["recovery_width"]
+    assert telemetry["confirmation_trials"] == telemetry["promotion_width"]
+    for row in telemetry["shortlist_candidate_evidence"]:
+        assert row["selection_source"] == "recovery_positive_mean"
+        assert row["eligible"] is False
+    assert telemetry["confirmed_candidate_evidence"]
+    for row in telemetry["confirmed_candidate_evidence"]:
+        assert row["pooled_lower_bound"] < 0.0
+        assert row["pooled_mean_log_excess"] > 0.0
 
 
 def test_forward_holdout_fingerprint_changes_with_selected_policy() -> None:
@@ -3273,6 +3382,80 @@ def test_economic_candidate_evidence_search_ledger_reconciliation() -> None:
     assert row["total_terminal_screen_trials"] == row["route_terminal_screen_trials"] * 3
     json.dumps(row)
 
+def test_screen_fold_evidence_is_json_safe_and_pooling_is_deterministic() -> None:
+    import src.stocks.workflows.train_model as tm
+
+    ev = tm.ScreenFoldEvidence(
+        rank_ic=0.06,
+        attempted_orders=10,
+        filled_orders=8,
+        planned_cycles=1,
+        complete_block_count=4,
+        rejected_block_count=0,
+        block_log_excess_mean=0.0006,
+        lower_bound=-0.0024,
+        dsr_probability=0.026,
+        usable=True,
+        failure_reason=None,
+        no_trade_reason_counts={"no-feasible-allocation": 2},
+        block_log_excess=(0.001, 0.002, -0.001, 0.002),
+    )
+    assert ev.ranking_score == ev.lower_bound
+    row = ev.to_json_safe()
+    assert "block_log_excess" not in row
+    assert row["failure_reason"] is None
+    assert row["usable"] is True
+    json.dumps(row)
+    assert ev.failure_reason in tm._SCREEN_FAILURE_REASONS or ev.failure_reason is None
+
+    request = TrainingRequest(artifact_id="pool_evidence", n_bootstrap=2)
+    lb, mean, dsr, blocks = tm._pool_screen_evidence(
+        [ev, ev, ev], request, n_trials=81
+    )
+    assert blocks == 12
+    assert mean == pytest.approx(0.001, abs=1e-9)
+    assert 0.0 < dsr <= 1.0
+    assert math.isfinite(lb)
+    assert tm._pool_screen_evidence([], request, n_trials=81) == (0.0, 0.0, 0.0, 0)
+
+def test_score_trial_fold_records_failure_reason_on_hard_invalid(monkeypatch) -> None:
+    """A hard-invalid fold records ``screen_failure_reason`` and returns ``None``."""
+    import src.stocks.workflows.train_model as tm
+
+    request = TrainingRequest(artifact_id="sf_fail", n_folds=3)
+    guard = tm.TrialResourceGuard(request, predictor_count=3)
+    context = _fake_candidate_context(train_rows=8)
+    manifest = tm.ModelManifest(
+        artifact_id="sf_fail",
+        asset_kind=__import__("src.core.instruments", fromlist=["AssetKind"]).AssetKind.STOCK,
+        feature_set="stock_alpha_v2",
+        feature_schema_hash="hash",
+        universe_policy_hash="universe",
+        label_definition="residual_o2o_5d",
+        label_horizon_sessions=5,
+        eligible_from="2024-01-01T00:00:00+00:00",
+        eligible_to="2024-12-31T00:00:00+00:00",
+        model_type="lambdarank_blend",
+    )
+    monkeypatch.setattr(tm, "_score_context_model", lambda *_a, **_kw: None)
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.number = 0
+            self.user_attrs: dict[str, object] = {}
+
+        def set_user_attr(self, key: str, value: object) -> None:
+            self.user_attrs[key] = value
+
+    recorder = _Recorder()
+    result = tm._score_trial_fold(
+        pl.DataFrame(), None, context, request, manifest, (), "residual_o2o_5d",
+        None, tm.LambdaRankConfig(), guard, cast(object, recorder), 0,
+        report_progress=False, key_prefix="h5_",
+    )
+    assert result is None
+    assert recorder.user_attrs["h5_screen_failure_reason"] == "fit_failed"
+
 
 def test_tuning_emits_reconciled_search_ledger(monkeypatch, tmp_path) -> None:
     _route_tune_mocks(monkeypatch)
@@ -3337,7 +3520,7 @@ def test_no_eligible_run_emits_complete_search_ledger(monkeypatch, tmp_path) -> 
     ).split(panel)
 
     monkeypatch.setattr(tm, "_fit_stable_contexts", _fake_fold_contexts)
-    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: _fake_fold_evidence())
     monkeypatch.setattr(tm, "_fit_and_score_candidate", _fold_aware_refit())
     monkeypatch.setattr(
         tm,
