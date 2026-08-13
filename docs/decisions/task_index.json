@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "EXECUTION_MATCHED_ALPHA_ARCHITECTURE",
+      "date": "2026-08-13",
+      "adr_id": "ADR_20260813_EXECUTION_MATCHED_ALPHA_ARCHITECTURE",
+      "domain": "signal",
+      "title": "Execution-matched alpha architecture v5",
+      "why": "The v4 reference run showed proxy economic lower bounds turning negative under exact replay, with high turnover and cost drag despite honest global multiplicity.",
+      "resolution": "Added a canonical execution-matched replay kernel, causal costed hold/replace labels, stateful proxy tests, and v5 selection contracts while preserving costs, fills, settlement, thresholds, multiplicity, and NO_TRADE semantics.",
+      "impact": "Candidate selection is aligned with executable portfolio-state outcomes; the implementation can reject proxy sign flips before promotion and records the v5 architecture for future research runs."
+    },
+    {
       "task_id": "BACKTEST_ROBUSTNESS_OVERHAUL",
       "date": "2026-08-13",
       "adr_id": "ADR_20260813_BACKTEST_ROBUSTNESS_OVERHAUL",
