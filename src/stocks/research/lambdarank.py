@@ -576,7 +576,11 @@ class LambdaRankBlendModel:
             pl.col(self.relevance_column).is_not_null()
         )
         for column in self._predictor_columns:
-            usable = usable.filter(pl.col(column).is_not_null())
+            bad = usable.filter(
+                pl.col(column).is_not_null() & ~pl.col(column).is_finite()
+            )
+            if not bad.is_empty():
+                raise ValueError(f"non-finite predictor value in {column}")
         if usable.is_empty():
             return FitTrialOutcome(fit_ok=False)
 
@@ -631,10 +635,13 @@ class LambdaRankBlendModel:
                 strict=True,
             )
         )
-        self._missing_rates = {
-            name: float(train[col].null_count()) / train.height
-            for name, col in zip(self.features, self._resolve_predictor_columns(train), strict=False)
-        }
+        self._missing_rates = {}
+        for name in self.features:
+            raw = self._resolve_column(train, name)
+            if raw is None:
+                self._missing_rates[name] = 0.0
+                continue
+            self._missing_rates[name] = float(train[raw].null_count()) / train.height
         return outcome
 
     def _fit_lambdarank_prepared(
@@ -792,7 +799,9 @@ class LambdaRankBlendModel:
         prepared and uncached trial paths produce identical boosters. A fold
         missing features, relevance, predictor rows, or qualifying groups
         returns ``None``; the group-sum invariant still raises ``ValueError``
-        to keep the fail-closed semantics of the uncached path.
+        to keep the fail-closed semantics of the uncached path. Rows are
+        filtered only by relevance and minimum group eligibility; null
+        predictors are never deleted.
         """
         missing = [c for c in self.features if not self._resolve_column(train, c)]
         if missing:
@@ -805,7 +814,11 @@ class LambdaRankBlendModel:
 
         usable = train.filter(pl.col(self.relevance_column).is_not_null())
         for column in predictor_columns:
-            usable = usable.filter(pl.col(column).is_not_null())
+            bad = usable.filter(
+                pl.col(column).is_not_null() & ~pl.col(column).is_finite()
+            )
+            if not bad.is_empty():
+                raise ValueError(f"non-finite predictor value in {column}")
         if usable.is_empty():
             return None
         group_sizes, session_order = self._group_sizes(usable)
@@ -849,16 +862,26 @@ class LambdaRankBlendModel:
         )
 
     def _resolve_predictor_columns(self, frame: pl.DataFrame) -> list[str]:
-        """Manifest-ordered raw plus rank and sector-demeaned rank columns."""
+        """Manifest-ordered rank, sector-rank, and missing-indicator columns.
+
+        Raw source feature levels never enter the LightGBM design matrix; for
+        every manifest feature the resolved source column must expose the three
+        derived predictors (``__rank``, ``__sector_rank``, ``__missing``). A
+        missing derived column fails closed with ``ValueError``.
+        """
         columns: list[str] = []
         for name in self.features:
             raw = self._resolve_column(frame, name)
             if raw is None:
                 continue
-            for suffix in ("", "__rank", "__sector_rank"):
+            for suffix in ("__rank", "__sector_rank", "__missing"):
                 candidate = raw + suffix
-                if candidate in frame.columns:
-                    columns.append(candidate)
+                if candidate not in frame.columns:
+                    raise ValueError(
+                        f"missing derived predictor column {candidate!r} "
+                        f"for feature {name!r}"
+                    )
+                columns.append(candidate)
         return columns
 
     def _group_sizes(
@@ -892,15 +915,22 @@ class LambdaRankBlendModel:
         )
         joined = ordered.join(session_positions, on=self.session_column)
         positions = joined["__pos"].to_numpy().astype(float)
+        max_position = float(positions.max()) if positions.size else 0.0
         half_life = self.config.half_life_sessions
-        decay = np.exp2(-positions / float(half_life))
+        age_from_newest = max_position - positions
+        recency = np.exp2(-age_from_newest / float(half_life))
         weights = np.empty(len(ordered), dtype=float)
         start = 0
         for size in group_sizes:
             if size > 0:
                 weights[start : start + size] = 1.0 / size
             start += size
-        return (weights * decay).astype(float)
+        result = (weights * recency).astype(float)
+        if len(result) != len(ordered):
+            raise ValueError("observation weight length must match the ordered row count")
+        if not np.all(np.isfinite(result)):
+            raise ValueError("observation weights must be finite")
+        return result
 
     def _feature_matrix(self, frame: pl.DataFrame) -> np.ndarray:
         columns = self._predictor_columns or self._resolve_predictor_columns(frame)

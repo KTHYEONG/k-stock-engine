@@ -271,12 +271,17 @@ def apply_v2_transforms(
     low: float = 0.01,
     high: float = 0.99,
 ) -> pl.DataFrame:
-    """Build the v2 predictor frame: raw, clipped rank, sector-demeaned rank.
+    """Build the v2 predictor frame: raw, clipped rank, sector rank, missing flag.
 
-    Each allowlisted feature contributes three float32 predictors: the raw
-    value (null retained for LightGBM), its per-session clipped percentile
-    rank, and its per-session percentile rank demeaned by the session-sector
-    mean. NaN/Inf is rejected; null values are retained for LightGBM.
+    Each allowlisted source column is retained unchanged (StableRank and
+    diagnostics consume the raw levels) and additionally contributes three
+    float32 LambdaRank predictors: the per-session clipped percentile rank
+    (``{column}__rank``, null mapped to ``0.5``), the same rank demeaned by
+    its session-sector mean (``{column}__sector_rank``), and a deterministic
+    missing indicator (``{column}__missing``, ``1.0`` when the source is null
+    and ``0.0`` otherwise). NaN/Inf in a non-null source is rejected; null
+    sources are preserved for LightGBM through the rank fill and the missing
+    indicator.
     """
     _reject_target_columns(frame, feature_columns)
     quantiles = winsor_quantiles or fit_v2_winsor_quantiles(
@@ -329,11 +334,13 @@ def apply_v2_transforms(
             continue
         out_exprs.append(pl.col(column))
     for column in feature_columns:
+        missing_indicator = pl.when(pl.col(column).is_null()).then(1.0).otherwise(0.0).cast(pl.Float32)
         out_exprs.extend(
             [
                 pl.col(column).cast(pl.Float32).alias(column),
                 pl.col(f"__rank_{column}").alias(f"{column}__rank"),
                 pl.col(f"__sector_rank_{column}").alias(f"{column}__sector_rank"),
+                missing_indicator.alias(f"{column}__missing"),
             ]
         )
     return expanded.select(out_exprs)

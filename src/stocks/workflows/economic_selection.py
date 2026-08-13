@@ -1,15 +1,16 @@
 """Deterministic multi-fidelity economic selection policy.
 
-The v2 redesign replaces the fixed ``screen -> top-8 -> every-fold full refit ->
-full replay`` pipeline with a fixed-stride proxy screen funnel: for each route,
-``route_budget`` screen trials run once against a deterministic
-``proxy_session_stride`` session subsample of the fold-0 context, the
-``ceil(sqrt(route_budget))`` best positive-screen trials are promoted to a full
-fold-0 refit, and the top two all-positive candidates become the route's
-economic finalists. Each finalist is replayed under the frozen six-policy
-compounding grid. A rejected finalist is never silently replaced: the route
-has no champion, which is conservative in the financial sense (an additional
-``NO_TRADE`` is acceptable, a relaxed gate is not).
+The v4 stability redesign replaces the v2/v3 ``screen -> promoted -> every-fold
+full refit -> six-policy replay`` pipeline with an economically aligned proxy
+screen funnel: for each route, ``route_budget`` screen trials run against every
+purged fixed-stride proxy fold, the ``ceil(sqrt(route_budget))`` best
+positive-screen trials are promoted to a full fold-0 refit, and the
+``ceil(sqrt(promotion_width))`` all-positive candidates become the route's
+economic finalists. Each finalist is replayed exactly once under the single
+pre-registered default ``StockRiskPolicy``; the six-policy compounding grid is
+removed from active selection. A rejected finalist is never silently replaced:
+the route has no champion, which is conservative in the financial sense (an
+additional ``NO_TRADE`` is acceptable, a relaxed gate is not).
 
 The policy is versioned through :data:`SELECTION_POLICY_VERSION` so every
 promotion decision, resume fingerprint, metric, and artifact provenance can be
@@ -20,7 +21,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-SELECTION_POLICY_VERSION = "economic-selection-v3-compounding"
+SELECTION_POLICY_VERSION = "economic-selection-v4-stability"
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,11 +34,11 @@ class ScreenFidelityPolicy:
     so a larger search budget automatically keeps a proportional fixed temporal
     sample). ``promotion_width`` is the number of positive-screen candidates
     promoted to a full fold-0 refit; ``economic_finalist_width`` is the number
-    of all-positive candidates taken to the exact six-policy compounding
-    replay (two per route).
+    of all-positive candidates taken to the exact single-policy compounding
+    replay (``ceil(sqrt(promotion_width))`` per route).
     ``widths`` exposes the ``(route_budget, proxy_session_stride,
     promotion_width, economic_finalist_width)`` profile that drives the
-    81-trial three-route three-fold profile to a 27-to-6-to-6-to-2 funnel.
+    81-trial three-route three-fold profile to a 27-to-6-to-6-to-3 funnel.
     """
 
     route_budget: int
@@ -53,16 +54,17 @@ class ScreenFidelityPolicy:
         route_count: int,
         fold_count: int,
     ) -> ScreenFidelityPolicy:
-        """Derive the v2 proxy funnel widths for an equal route budget.
+        """Derive the v4 proxy funnel widths for an equal route budget.
 
         ``route_budget`` is the equal per-route screen trial count;
         ``proxy_session_stride`` is ``ceil(sqrt(route_budget))`` so the proxy
         keeps a fixed temporal sample proportional to the search budget.
         ``promotion_width`` never exceeds the route budget and a degenerate
         budget of one trial still promotes two candidates so a screen quality
-        ranking exists before economic evidence is spent. ``economic_finalist_width``
-        is two: the route's top two all-positive candidates are each replayed
-        under the frozen six-policy compounding grid, and a rejected finalist
+        ranking exists before economic evidence is spent.
+        ``economic_finalist_width`` is ``ceil(sqrt(promotion_width))``: the
+        route's top all-positive candidates are each replayed exactly once
+        under the single default compounding policy, and a rejected finalist
         yields no champion. Raises ``ValueError`` for non-positive inputs.
         """
         if total_trials < 1 or route_count < 1 or fold_count < 1:
@@ -73,7 +75,10 @@ class ScreenFidelityPolicy:
             route_budget,
             max(2, math.ceil(math.sqrt(route_budget))),
         )
-        economic_finalist_width = min(promotion_width, 2)
+        economic_finalist_width = min(
+            promotion_width,
+            max(1, math.ceil(math.sqrt(promotion_width))),
+        )
         return cls(
             route_budget=route_budget,
             proxy_session_stride=proxy_session_stride,
@@ -99,6 +104,7 @@ class ScreenFidelityPolicy:
             "proxy_session_stride": int(self.proxy_session_stride),
             "promotion_width": int(self.promotion_width),
             "economic_finalist_width": int(self.economic_finalist_width),
+            "configured_compounding_policy_cells": 1,
         }
 
 
