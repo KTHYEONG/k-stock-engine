@@ -23,7 +23,6 @@ import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from dataclasses import replace as dataclass_replace
 from datetime import UTC, date, datetime
 from enum import StrEnum
 from hashlib import sha256
@@ -33,7 +32,6 @@ import numpy as np
 import optuna
 import polars as pl
 import psutil
-from lightgbm.callback import CallbackEnv
 
 from src.core.costs import CostSchedule, default_base_schedule, default_stress_schedule
 from src.core.datasets import DatasetManifest
@@ -141,8 +139,6 @@ _BYTES_PER_CELL = 4
 _ALLOCATION_MULTIPLE = 3
 _SCREEN_BOOSTING_ROUNDS = 800
 _SCREEN_EARLY_STOPPING_ROUNDS = 50
-_SCREEN_NDCG_WARMUP_ROUNDS = 100
-_SCREEN_NDCG_INTERVAL_ROUNDS = 50
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,23 +171,9 @@ class CompoundingEvidence:
     rejected_block_count: int
 
 
-_COMPOUNDING_POLICY_GRID: tuple[tuple[float, float], ...] = (
-    (0.5, 0.10),
-    (0.5, 0.20),
-    (1.0, 0.10),
-    (1.0, 0.20),
-    (2.0, 0.10),
-    (2.0, 0.20),
-)
-
-
-def _compounding_policy_id(
-    growth_risk_aversion: float,
-    turnover_budget: float,
-) -> str:
-    """Deterministic frozen-grid policy id ordered lexicographically by grid."""
-    index = _COMPOUNDING_POLICY_GRID.index((growth_risk_aversion, turnover_budget))
-    return f"{index}:ga{growth_risk_aversion:g}_tb{turnover_budget:g}"
+_DEFAULT_COMPOUNDING_POLICY_ID = "default:neutral"
+_DEFAULT_GROWTH_RISK_AVERSION = 1.0
+_DEFAULT_TURNOVER_BUDGET = 0.20
 
 
 @dataclass(frozen=True, slots=True)
@@ -559,6 +541,7 @@ class _SelectionTimings:
     economic_replay_seconds: float = 0.0
     actual_refit_rounds: dict[str, int] = field(default_factory=dict)
     actual_best_iterations: dict[str, int | None] = field(default_factory=dict)
+    fold_telemetry: dict[str, dict[str, object]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -591,7 +574,7 @@ class EconomicCandidateEvidence:
     """
 
     trial_number: int
-    screen_rank_ic: float
+    screen_economic_lower_bound: float
     fold_rank_ic: list[float]
     median_rank_ic: float
     attempted_orders: int
@@ -634,7 +617,9 @@ class EconomicCandidateEvidence:
         """JSON-serializable evidence row with deterministic failure reasons."""
         return {
             "trial_number": int(self.trial_number),
-            "screen_rank_ic": round(self.screen_rank_ic, 8),
+            "screen_economic_lower_bound": round(
+                self.screen_economic_lower_bound, 8
+            ),
             "fold_rank_ic": [round(value, 8) for value in self.fold_rank_ic],
             "median_rank_ic": round(self.median_rank_ic, 8),
             "attempted_orders": int(self.attempted_orders),
@@ -1457,7 +1442,7 @@ def _tune_champion(
     shortlisted_total = 0
     eligible_total = 0
     replays_evaluated_total = 0
-    best_screen_rank_ic: float | None = None
+    best_screen_proxy_lower_bound: float | None = None
     screen_seconds_total = 0.0
     refit_seconds_total = 0.0
     replay_seconds_total = 0.0
@@ -1486,13 +1471,15 @@ def _tune_champion(
             fold_count=max(1, len(tuning_folds)),
         )
         timings = _SelectionTimings()
-        fold0_context, proxy_context, fold_context = _fit_stable_contexts(
+        fold0_context, proxy_contexts, fold_context = _fit_stable_contexts(
             tuning_panel, tuning_folds, route_manifest, feature_columns,
             route.label_column, route.relevance_column,
             proxy_session_stride=policy.proxy_session_stride,
             timings=timings,
         )
-        if fold0_context is None or proxy_context is None:
+        if fold0_context is None or any(
+            proxy is None for proxy in proxy_contexts
+        ):
             route_attrs[str(route.horizon)] = {
                 "selection_status": "no-prepared-fold-0",
                 "holding_horizon_sessions": route.horizon,
@@ -1501,18 +1488,23 @@ def _tune_champion(
                 "[EVAL] route=%sd stage=no-prepared-fold-0", route.horizon
             )
             continue
+        proxy_reference = next(
+            (proxy for proxy in proxy_contexts if proxy is not None),
+            None,
+        )
         cache_bytes = _fold_cache_bytes(fold0_context.prepared)
-        if proxy_context is not None:
-            logger.info(
-                "[EVAL] route=%sd stage=proxy_built stride=%d proxy_train_rows=%d "
-                "proxy_validation_rows=%d full_train_rows=%d full_validation_rows=%d",
-                route.horizon,
-                policy.proxy_session_stride,
-                proxy_context.train_rows,
-                proxy_context.validation_rows,
-                fold0_context.train_rows,
-                fold0_context.validation_rows,
-            )
+        logger.info(
+            "[EVAL] route=%sd stage=proxy_built stride=%d proxy_folds=%d "
+            "proxy_train_rows=%s proxy_validation_rows=%s "
+            "full_train_rows=%d full_validation_rows=%d",
+            route.horizon,
+            policy.proxy_session_stride,
+            len(proxy_contexts),
+            [p.train_rows if p is not None else 0 for p in proxy_contexts],
+            [p.validation_rows if p is not None else 0 for p in proxy_contexts],
+            fold0_context.train_rows,
+            fold0_context.validation_rows,
+        )
 
         screen_phase = f"screen_h{route.horizon}"
         screen_evidence = {
@@ -1525,10 +1517,10 @@ def _tune_champion(
             "screen_fidelity": "session_stride_proxy",
             "proxy_session_stride": policy.proxy_session_stride,
             "proxy_train_rows": (
-                proxy_context.train_rows if proxy_context is not None else 0
+                proxy_reference.train_rows if proxy_reference is not None else 0
             ),
             "proxy_validation_rows": (
-                proxy_context.validation_rows if proxy_context is not None else 0
+                proxy_reference.validation_rows if proxy_reference is not None else 0
             ),
         }
         screen_phase_hash = content_hash(screen_evidence)
@@ -1562,26 +1554,41 @@ def _tune_champion(
             trial: optuna.Trial,
             _route: RouteSpec = route,
             _tuning_folds: list[Fold] = tuning_folds,
-            _proxy_context: PreparedCandidateContext = proxy_context,
+            _proxy_contexts: tuple[
+                PreparedCandidateContext | None, ...
+            ] = proxy_contexts,
             _route_manifest: ModelManifest = route_manifest,
             _lgb_threads: int = lgb_threads,
         ) -> float:
             config = _config_from_trial(trial, num_threads=_lgb_threads)
             screen_config = _screen_config(config)
-            ic = _score_trial_fold(
-                tuning_panel, _tuning_folds[0], _proxy_context, request, _route_manifest,
-                feature_columns, _route.label_column, _route.relevance_column,
-                screen_config, guard, trial, 0,
-                callbacks=(_screen_ndcg_callback(trial),), report_progress=False,
-                key_prefix=f"h{_route.horizon}_",
-            )
-            if ic is None:
+            if any(proxy is None for proxy in _proxy_contexts):
                 raise optuna.TrialPruned()
+            fold_lower_bounds = [
+                _score_trial_fold(
+                    tuning_panel, _tuning_folds[fold_index],
+                    cast(PreparedCandidateContext, proxy_context),
+                    request, _route_manifest, feature_columns,
+                    _route.label_column, _route.relevance_column,
+                    screen_config, guard, trial, fold_index,
+                    callbacks=(), report_progress=False,
+                    key_prefix=f"h{_route.horizon}_",
+                )
+                for fold_index, proxy_context in enumerate(_proxy_contexts)
+            ]
+            if any(bound is None for bound in fold_lower_bounds):
+                raise optuna.TrialPruned()
+            valid_bounds = [float(bound) for bound in fold_lower_bounds if bound is not None]
+            trial.set_user_attr("proxy_economic_lower_bounds", valid_bounds)
+            objective = min(valid_bounds)
             logger.info(
-                "[EVAL] route=%sd trial=%s stage=screen_rank_ic rank_ic=%.6f",
-                _route.horizon, trial.number, ic,
+                "[EVAL] route=%sd trial=%s stage=screen_proxy_lower_bound "
+                "bounds=%s objective=%.8f",
+                _route.horizon, trial.number,
+                [round(bound, 8) for bound in valid_bounds],
+                objective,
             )
-            return float(ic)
+            return objective
 
         if not resumed_screen:
             screen_started = time.perf_counter()
@@ -1634,17 +1641,18 @@ def _tune_champion(
             if trial_value is None:
                 continue
             completed.append((float(trial_value), trial.number))
-        best_route_ic = max((value for value, _ in completed), default=None)
-        if best_route_ic is not None and (
-            best_screen_rank_ic is None or best_route_ic > best_screen_rank_ic
+        best_route_lb = max((value for value, _ in completed), default=None)
+        if best_route_lb is not None and (
+            best_screen_proxy_lower_bound is None
+            or best_route_lb > best_screen_proxy_lower_bound
         ):
-            best_screen_rank_ic = best_route_ic
+            best_screen_proxy_lower_bound = best_route_lb
         screen_scores = sorted(
             ((value, number) for value, number in completed if value > 0.0),
             key=lambda pair: (-pair[0], pair[1]),
         )
         shortlist = screen_scores[: policy.promotion_width]
-        for _screen_ic, trial_number in shortlist:
+        for _screen_lb, trial_number in shortlist:
             logger.info(
                 "[EVAL] route=%sd trial=%s stage=promoted", route.horizon, trial_number
             )
@@ -1698,11 +1706,11 @@ def _tune_champion(
         study.set_user_attr("proxy_session_stride", policy.proxy_session_stride)
         study.set_user_attr(
             "proxy_train_rows",
-            proxy_context.train_rows if proxy_context is not None else 0,
+            proxy_reference.train_rows if proxy_reference is not None else 0,
         )
         study.set_user_attr(
             "proxy_validation_rows",
-            proxy_context.validation_rows if proxy_context is not None else 0,
+            proxy_reference.validation_rows if proxy_reference is not None else 0,
         )
         study.set_user_attr("cache_bytes", cache_bytes)
         study.set_user_attr("screen_seconds", screen_seconds)
@@ -1712,8 +1720,27 @@ def _tune_champion(
         study.set_user_attr("label_column", route.label_column)
         study.set_user_attr("relevance_column", route.relevance_column)
         study.set_user_attr("label_available_column", route.label_available_column)
-        if best_route_ic is not None:
-            study.set_user_attr("best_screen_rank_ic", best_route_ic)
+        if best_route_lb is not None:
+            study.set_user_attr("best_screen_proxy_lower_bound", best_route_lb)
+        selection_telemetry = selection
+        if selection_telemetry is None:
+            selection_telemetry = _selection_telemetry(
+                0.0,
+                timings,
+                lgb_threads,
+                [],
+                [],
+                [],
+                [],
+                replay_guard=None,
+                total_terminal_screen_trials=total_terminal_screen_trials,
+                route_terminal_screen_trials=n_terminal,
+                exact_compounding_policy_replays=0,
+                configured_compounding_policy_cells=1,
+                selection_multiplicity_version=SELECTION_MULTIPLICITY_VERSION,
+            )
+        for name, value in selection_telemetry.items():
+            study.set_user_attr(name, value)
         if selection is not None:
             for name, value in selection.items():
                 study.set_user_attr(name, value)
@@ -1770,6 +1797,25 @@ def _tune_champion(
         )
         route_attrs[str(route.horizon)] = dict(study.user_attrs)
 
+        proxy_min_by_trial: dict[int, float] = {}
+        for trial in study.trials:
+            bounds = trial.user_attrs.get("proxy_economic_lower_bounds")
+            if isinstance(bounds, list) and bounds:
+                proxy_min_by_trial[int(trial.number)] = float(min(bounds))
+        concordance_x: list[float] = []
+        concordance_y: list[float] = []
+        for row in route_evidence:
+            trial_number = int(cast(int, row.get("trial_number", -1)))
+            if trial_number in proxy_min_by_trial:
+                replay_lb = row.get("bootstrap_lower_bound")
+                if isinstance(replay_lb, (int, float)) and math.isfinite(float(replay_lb)):
+                    concordance_x.append(proxy_min_by_trial[trial_number])
+                    concordance_y.append(float(replay_lb))
+        if concordance_x:
+            route_attrs[str(route.horizon)]["proxy_exact_spearman_concordance"] = round(
+                _spearman_concordance(concordance_x, concordance_y), 8
+            )
+
         if champion is None or selection is None:
             continue
         key = (
@@ -1797,7 +1843,8 @@ def _tune_champion(
         "n_terminal_trials": n_terminal_total,
         "optuna_trials": n_terminal_total,
         "total_terminal_screen_trials": total_terminal_screen_trials,
-        "configured_compounding_policy_cells": len(_COMPOUNDING_POLICY_GRID),
+        "global_multiplicity_count": total_terminal_screen_trials,
+        "configured_compounding_policy_cells": 1,
         "exact_compounding_policy_replays": replays_evaluated_total,
         "screened_trials": screened_total,
         "pruned_trials": pruned_total,
@@ -1844,8 +1891,8 @@ def _tune_champion(
                 if telemetry_key in attrs:
                     merged[telemetry_key] = attrs[telemetry_key]
                     break
-    if best_screen_rank_ic is not None:
-        merged["best_screen_rank_ic"] = best_screen_rank_ic
+    if best_screen_proxy_lower_bound is not None:
+        merged["best_screen_proxy_lower_bound"] = best_screen_proxy_lower_bound
 
     if not route_champions:
         statuses = [
@@ -1869,7 +1916,7 @@ def _tune_champion(
         return None, n_terminal_total, None
 
     route_champions.sort(key=lambda row: row[0], reverse=True)
-    _winner_key, winner_n_terminal, winner_route, winner_study, _ = route_champions[0]
+    _winner_key, _winner_n_terminal, winner_route, winner_study, _ = route_champions[0]
     winner_config = _config_from_params(
         dict(winner_study.trials[
             int(cast(int, winner_study.user_attrs["selected_trial_number"]))
@@ -1915,7 +1962,9 @@ def _tune_champion(
         "screen_fidelity",
         "proxy_train_rows",
         "proxy_validation_rows",
-        "best_screen_rank_ic",
+        "best_screen_proxy_lower_bound",
+        "proxy_exact_spearman_concordance",
+        "fold_retention_telemetry",
     ):
         if telemetry_key in winner_study.user_attrs:
             merged[telemetry_key] = winner_study.user_attrs[telemetry_key]
@@ -1925,7 +1974,7 @@ def _tune_champion(
         winner_route.horizon,
         int(cast(int, winner_selection["selected_trial_number"])),
     )
-    return winner_config, winner_n_terminal, winner_route
+    return winner_config, total_terminal_screen_trials, winner_route
 
 
 def _visible_cpu_counts() -> tuple[int, int]:
@@ -2041,7 +2090,9 @@ def _prepare_candidate_context(
     stable_scores = rich.stable_scores.join(
         validation_index, on=["session", "instrument_id"], how="inner"
     )
-    labels = rich.validation_frame.select("session", "instrument_id", pl.col(label_column))
+    labels = rich.validation_frame.select(
+        "session_index", "session", "instrument_id", pl.col(label_column)
+    )
     return PreparedCandidateContext(
         prepared=prepared,
         validation_index=validation_index,
@@ -2117,18 +2168,21 @@ def _fit_stable_contexts(
     timings: _SelectionTimings | None = None,
 ) -> tuple[
     PreparedCandidateContext | None,
-    PreparedCandidateContext | None,
+    tuple[PreparedCandidateContext | None, ...],
     _FoldContextProvider,
 ]:
-    """Build the fold-0 and stride-proxy slim contexts plus a lazy fold provider.
+    """Build the full fold-0 context, per-fold proxy contexts, and a lazy provider.
 
-    Fold 0 is materialized once because both the proxy and the six fold-0
-    promotions use it; the stride-6 proxy is derived from the rich fold-0 frames
-    before they are released. Folds 1..n are materialized lazily by the returned
-    provider, one at a time and only after a finalist is known. Returns
-    ``(fold0, proxy, provider)``; either slim context is ``None`` when its fold
-    cannot be prepared, in which case the route stays fail-closed and later
-    folds are never built.
+    Fold 0 is materialized and retained in full because every promoted
+    full-refit and the fold-0 proxy share it. One slim fixed-stride proxy
+    context is built for every tuning fold so every Optuna trial can be scored
+    on all purged proxy folds; the rich full contexts for folds 1..n are
+    discarded after their proxy preparation. Later full folds are materialized
+    lazily by the returned provider, one at a time and only after a finalist is
+    known. Returns ``(fold0, proxy_contexts, provider)`` where ``proxy_contexts``
+    is one entry per tuning fold; either a full fold-0 or a proxy entry is
+    ``None`` when its fold cannot be prepared, in which case the route stays
+    fail-closed and later folds are never built.
     """
     if not tuning_folds:
         raise ValueError("tuning_folds must not be empty")
@@ -2136,14 +2190,33 @@ def _fit_stable_contexts(
         tuning_panel, tuning_folds[0], base_manifest, feature_columns,
         label_column, relevance_column,
     )
-    proxy_rich = _build_proxy_context(
-        fold0_rich, proxy_session_stride, base_manifest, feature_columns,
-        label_column, relevance_column,
-    )
     started = time.perf_counter()
     fold0 = _prepare_candidate_context(fold0_rich, label_column, relevance_column)
-    proxy = _prepare_candidate_context(proxy_rich, label_column, relevance_column)
-    del fold0_rich, proxy_rich
+    proxy_contexts: list[PreparedCandidateContext | None] = []
+    for index, fold in enumerate(tuning_folds):
+        if index == 0:
+            rich = fold0_rich
+        else:
+            rich = _fit_stable_context(
+                tuning_panel, fold, base_manifest, feature_columns,
+                label_column, relevance_column,
+            )
+        proxy_rich = _build_proxy_context(
+            rich, proxy_session_stride, base_manifest, feature_columns,
+            label_column, relevance_column,
+        )
+        proxy = _prepare_candidate_context(proxy_rich, label_column, relevance_column)
+        proxy_contexts.append(proxy)
+        if timings is not None:
+            timings.fold_telemetry[f"fold_{index}"] = _fold_retention_telemetry(
+                rich.train_processed,
+                rich.prepared,
+                relevance_column or RELEVANCE_COLUMN,
+            )
+        del proxy_rich
+        if index != 0:
+            del rich
+    del fold0_rich
     if timings is not None:
         timings.context_prepare_seconds += time.perf_counter() - started
     provider = _FoldContextProvider(
@@ -2151,7 +2224,7 @@ def _fit_stable_contexts(
         label_column, relevance_column, timings=timings,
     )
     provider.seed(0, fold0)
-    return fold0, proxy, provider
+    return fold0, tuple(proxy_contexts), provider
 
 
 def _proxy_session_filter(
@@ -2255,10 +2328,12 @@ def _score_trial_fold(
     bytes) before fitting and records elapsed/RSS telemetry in a ``finally`` so
     a callback-raised :class:`optuna.TrialPruned` still leaves timing evidence.
     ``key_prefix`` qualifies the recorded fold key with the route horizon so
-    cross-route keys never collide. A breach raises
-    :class:`TrainingCapacityError`. Fold model, prediction frame, and LightGBM
-    datasets are local to this call and released on return, so a trial never
-    retains every fold's artifacts.
+    cross-route keys never collide. The returned value is the cost-aware
+    non-overlapping proxy compounding lower bound, never a Rank-IC; a missing,
+    non-finite, insufficient-block, or non-positive fold fails closed to
+    ``None``. A breach raises :class:`TrainingCapacityError`. Fold model,
+    prediction frame, and LightGBM datasets are local to this call and released
+    on return, so a trial never retains every fold's artifacts.
     """
     del tuning_panel, fold, feature_columns
     key = f"{key_prefix}trial_{trial.number}_fold_{fold_index}"
@@ -2274,16 +2349,27 @@ def _score_trial_fold(
         )
         if result is None:
             return None
-        ic, _scored, outcome = result
+        _ic, scored, outcome = result
         if outcome.best_iteration is not None:
             trial.set_user_attr("proxy_best_iteration", outcome.best_iteration)
+        bound = _economic_screen_score(
+            context.labels,
+            scored,
+            label_column=label_column,
+            top_k=request.top_k,
+            holding_horizon_sessions=int(base_manifest.label_horizon_sessions),
+            cost_schedule=request.stress_cost_schedule or default_stress_schedule(),
+            n_bootstrap=request.n_bootstrap,
+            bootstrap_alpha=request.bootstrap_alpha,
+            seed=request.seed,
+        )
+        if not math.isfinite(bound) or bound <= 0.0:
+            return None
         if report_progress:
-            trial.report(float(ic), step=fold_index)
-            if ic <= 0.0:
-                raise optuna.TrialPruned()
+            trial.report(float(bound), step=fold_index)
             if trial.should_prune():
                 raise optuna.TrialPruned()
-        return float(ic)
+        return float(bound)
     finally:
         guard.record_fold(
             key,
@@ -2375,6 +2461,49 @@ def _fold_cache_bytes(prepared: PreparedLambdaRankFold | None) -> int:
     return total
 
 
+def _fold_retention_telemetry(
+    train: pl.DataFrame,
+    prepared: PreparedLambdaRankFold | None,
+    relevance_column: str,
+) -> dict[str, object]:
+    """Flat per-fold retention telemetry for one prepared fold.
+
+    ``labeled_rows`` is the relevance-eligible row count before preparation;
+    ``retained_rows`` is the prepared train matrix height (rows with null
+    predictors are retained, so the retention ratio is exactly the null
+    predictor drop, if any). ``oldest_session_weight`` and
+    ``newest_session_weight`` are the per-session recency weight sums of the
+    first and last chronological sessions in the prepared fold.
+    """
+    if relevance_column in train.columns:
+        labeled = int(train.filter(pl.col(relevance_column).is_not_null()).height)
+    else:
+        labeled = 0
+    retained = int(prepared.train_matrix.shape[0]) if prepared is not None else 0
+    oldest_weight = 0.0
+    newest_weight = 0.0
+    if prepared is not None and prepared.train_group_sizes:
+        sizes = prepared.train_group_sizes
+        weights = prepared.train_weights
+        start = 0
+        for size in sizes:
+            start += int(size)
+        end = start
+        start = 0
+        first = sizes[0]
+        oldest_weight = float(np.sum(weights[start : start + int(first)]))
+        last = sizes[-1]
+        newest_weight = float(np.sum(weights[end - int(last) : end]))
+    retention_ratio = float(retained / labeled) if labeled else 0.0
+    return {
+        "labeled_rows": labeled,
+        "retained_rows": retained,
+        "retention_ratio": round(retention_ratio, 6),
+        "oldest_session_weight": round(oldest_weight, 8),
+        "newest_session_weight": round(newest_weight, 8),
+    }
+
+
 def _screen_config(config: LambdaRankConfig) -> LambdaRankConfig:
     """Frozen reduced-budget screen profile; not a candidate parameter."""
     params = {
@@ -2455,51 +2584,6 @@ def _screen_informed_full_refit_config(config: LambdaRankConfig) -> LambdaRankCo
         n_estimators=n_estimators,
         early_stopping_rounds=patience,
     )
-
-
-def _screen_ndcg_callback(trial: optuna.Trial) -> Callable[[CallbackEnv], None]:
-    """LightGBM callback reporting validation NDCG for Optuna median pruning.
-
-    Reports every ``_SCREEN_NDCG_INTERVAL_ROUNDS`` after a frozen warm-up and
-    raises ``optuna.TrialPruned`` when Optuna decides the trial should stop;
-    the exception propagates through ``lgb.train`` and ``fit_trial`` so the
-    screen candidate stays a terminal (pruned) trial.
-    """
-
-    def callback(env: CallbackEnv) -> None:
-        iteration = int(env.iteration)
-        if iteration < _SCREEN_NDCG_WARMUP_ROUNDS:
-            return
-        if (iteration - _SCREEN_NDCG_WARMUP_ROUNDS) % _SCREEN_NDCG_INTERVAL_ROUNDS != 0:
-            return
-        ndcg = _evaluation_ndcg(env)
-        if ndcg is None:
-            return
-        trial.report(ndcg, iteration)
-        if trial.should_prune():
-            raise optuna.TrialPruned()
-
-    return callback
-
-
-def _evaluation_ndcg(env: CallbackEnv) -> float | None:
-    """First finite validation NDCG reported by the LightGBM callback env."""
-    for result in env.evaluation_result_list or ():
-        if not isinstance(result, (tuple, list)) or len(result) < 3:
-            continue
-        metric = result[1]
-        if not isinstance(metric, str) or not metric.startswith("ndcg"):
-            continue
-        value = result[2]
-        if value is None:
-            continue
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            continue
-        if math.isfinite(number):
-            return number
-    return None
 
 
 def _fit_and_score_candidate(
@@ -2686,7 +2770,7 @@ def _evaluate_economic_candidate(
     replay: ReplayResult,
     request: TrainingRequest,
     trial_number: int,
-    screen_rank_ic: float,
+    screen_economic_lower_bound: float,
     *,
     holding_horizon_sessions: int = 5,
     label_column: str = "",
@@ -2721,6 +2805,7 @@ def _evaluate_economic_candidate(
     if not replay_finite:
         failures.append("non_finite_replay")
     budget = PromotionRiskBudget()
+    dsr_count = total_terminal_screen_trials or terminal_trial_count
     compounding = _compounding_evidence(
         replay.strategy_returns,
         replay.benchmark_returns,
@@ -2728,7 +2813,7 @@ def _evaluate_economic_candidate(
         holding_horizon_sessions,
         request,
         budget,
-        terminal_trial_count,
+        dsr_count,
     )
     bootstrap_lower_bound = compounding.bootstrap_lower_bound
     if bootstrap_lower_bound <= 0.0:
@@ -2739,7 +2824,7 @@ def _evaluate_economic_candidate(
     calibration_evidence = replay.calibration_evidence or {}
     return EconomicCandidateEvidence(
         trial_number=trial_number,
-        screen_rank_ic=screen_rank_ic,
+        screen_economic_lower_bound=screen_economic_lower_bound,
         fold_rank_ic=list(fold_rank_ic),
         median_rank_ic=float(np.median(fold_rank_ic)) if fold_rank_ic else 0.0,
         attempted_orders=replay.attempted_orders,
@@ -2867,38 +2952,56 @@ def _select_economic_champion(
     lgb_threads: int = 1,
     timings: _SelectionTimings | None = None,
 ) -> tuple[LambdaRankConfig | None, dict[str, object] | None]:
-    """Promote, refit, and exactly replay the route's two economic finalists.
+    """Promote, refit, and exactly replay the route's economic finalists.
 
     The promoted ``shortlist`` (already limited to ``policy.promotion_width``)
     is full-refit on fold 0 with an adaptive continuation budget derived from
     each candidate's proxy screen best iteration and ranked by
-    ``(-full_fold0_ic, -proxy_ic, trial_number)``. Up to
+    ``(-full_fold0_ic, -proxy_lower_bound, trial_number)``. Up to
     ``policy.economic_finalist_width`` all-positive candidates are then refit
     over the remaining folds and each is replayed through the exact event
-    ledger under the frozen six-policy
-    ``(growth_risk_aversion, turnover_budget)`` grid. A non-positive fold or a
-    failed replay is never backfilled: a route without an eligible finalist has
-    no champion, which is intentionally conservative in the financial sense.
-    Replay inputs are built once per route and reused; only the candidate score
-    overlay and the per-cell risk policy differ. ``ReplayResourceGuard`` admits
-    and releases every replay, and a capacity failure makes that candidate
-    ineligible rather than permitting an unguarded replay. Only candidates
-    with positive Rank-IC folds, actual fills, a finite replay, a strictly
-    positive block-log compounding bootstrap lower bound, and a Deflated
-    Sharpe probability at or above the frozen threshold are ordered by
-    ``(compounding lower bound, DSR probability, geometric excess growth,
-    -max drawdown, -turnover, median Rank-IC, -holding horizon, -trial number,
-    policy id)``. Returns ``(config, selection telemetry)`` or ``(None, None)``
-    when no promoted candidate survives the funnel.
+    ledger exactly once under the single pre-registered default
+    ``StockRiskPolicy`` (``CompoundingPolicyConfig()`` and its frozen turnover
+    budget). The former six-policy compounding grid is removed from active
+    selection. A non-positive fold or a failed replay is never backfilled: a
+    route without an eligible finalist has no champion, which is intentionally
+    conservative in the financial sense. Replay inputs are built once per route
+    and reused; only the candidate score overlay differs.
+    ``ReplayResourceGuard`` admits and releases every replay, and a capacity
+    failure makes that candidate ineligible rather than permitting an unguarded
+    replay. Only candidates with positive Rank-IC folds, actual fills, a finite
+    replay, a strictly positive block-log compounding bootstrap lower bound,
+    and a Deflated Sharpe probability at or above the frozen threshold are
+    ordered by ``(compounding lower bound, DSR probability, geometric excess
+    growth, -max drawdown, -turnover, median Rank-IC, -holding horizon,
+    -trial number, policy id)``. The DSR input count for every route and final
+    promotion is ``total_terminal_screen_trials`` (the global terminal screen
+    count, including completed and pruned/failed trials). Returns ``(config,
+    selection telemetry)`` or ``(None, None)`` when no promoted candidate
+    survives the funnel.
     """
-    if not shortlist:
-        return None, None
     replay_guard = ReplayResourceGuard(
         request, replay_mode=ReplayMode.INNER_SELECTION_BASE_ONLY
     )
     route_terminal_screen_trials = terminal_trial_count
-    configured_compounding_policy_cells = len(_COMPOUNDING_POLICY_GRID)
+    configured_compounding_policy_cells = 1
     exact_compounding_policy_replays = 0
+    if not shortlist:
+        return None, _selection_telemetry(
+            0.0,
+            timings,
+            lgb_threads,
+            [],
+            [],
+            [],
+            [],
+            replay_guard=replay_guard,
+            total_terminal_screen_trials=total_terminal_screen_trials,
+            route_terminal_screen_trials=route_terminal_screen_trials,
+            exact_compounding_policy_replays=exact_compounding_policy_replays,
+            configured_compounding_policy_cells=configured_compounding_policy_cells,
+            selection_multiplicity_version=SELECTION_MULTIPLICITY_VERSION,
+        )
     key_prefix = f"h{route.horizon}_"
     refit_started = time.perf_counter()
     candidate_rows: list[
@@ -2917,12 +3020,12 @@ def _select_economic_champion(
     shortlist_evidence: list[dict[str, object]] = []
     early_rejected_seconds: list[float] = []
     replay_seconds = 0.0
-    screen_ic_by_trial = {trial_number: screen_ic for screen_ic, trial_number in shortlist}
+    screen_lb_by_trial = {trial_number: screen_lb for screen_lb, trial_number in shortlist}
     proxy_best_by_trial = dict(proxy_best_iteration_by_trial or {})
 
     remaining_indices = tuple(range(1, len(tuning_folds)))
     fold0_ranked: list[tuple[float, float, int, LambdaRankConfig, pl.DataFrame]] = []
-    for _screen_ic, trial_number in shortlist:
+    for _screen_lb, trial_number in shortlist:
         frozen = study.trials[trial_number]
         config = _config_from_params(dict(frozen.params), num_threads=lgb_threads)
         full_refit_config = _screen_informed_full_refit_config(config)
@@ -2947,12 +3050,12 @@ def _select_economic_champion(
             logger.info("[EVAL] trial=%s stage=fold0_rejected", trial_number)
             continue
         fold0_ranked.append(
-            (float(fold_rank_ic[0]), _screen_ic, trial_number, full_refit_config, oos0)
+            (float(fold_rank_ic[0]), _screen_lb, trial_number, full_refit_config, oos0)
         )
 
     fold0_ranked.sort(key=lambda row: (-row[0], -row[1], row[2]))
     finalists: list[tuple[list[float], pl.DataFrame, int]] = []
-    for fold0_ic, _screen_ic, trial_number, full_refit_config, oos0 in fold0_ranked:
+    for fold0_ic, _screen_lb, trial_number, full_refit_config, oos0 in fold0_ranked:
         if len(finalists) >= policy.economic_finalist_width:
             break
         initial_rounds = adaptive_refit_rounds(proxy_best_by_trial.get(trial_number))
@@ -3037,125 +3140,106 @@ def _select_economic_champion(
         timings.replay_prepare_seconds += time.perf_counter() - replay_started
 
     for fold_rank_ic, oos, trial_number in finalists:
-        _screen_ic = screen_ic_by_trial[trial_number]
+        _screen_lb = screen_lb_by_trial[trial_number]
         causal_oos_ledger = _build_calibration_ledger(
             oos, tuning_panel, route.label_column, route.label_available_column,
         )
-        cell_replays: list[tuple[str, ReplayResult]] = []
-        capacity_failed = False
-        for growth_risk_aversion, turnover_budget in _COMPOUNDING_POLICY_GRID:
-            if capacity_failed:
-                break
-            policy_id = _compounding_policy_id(growth_risk_aversion, turnover_budget)
-            replay_started = time.perf_counter()
-            cell_policy = dataclass_replace(
-                replay_context.policy,
-                turnover_budget=turnover_budget,
-                compounding=CompoundingPolicyConfig(
-                    growth_risk_aversion=growth_risk_aversion
-                ),
-            )
-            cell_context = dataclass_replace(
-                replay_context, policy=cell_policy
-            )
-            try:
-                replay = _event_ledger_evaluation(
-                    tuning_panel, oos, request, dataset_manifest, registry,
-                    base_schedule, stress_schedule, replay_context=cell_context,
-                    calibration_ledger=causal_oos_ledger,
-                    holding_horizon_sessions=route.horizon,
-                    label_column=route.label_column,
-                    label_available_column=route.label_available_column,
-                    replay_mode=ReplayMode.INNER_SELECTION_BASE_ONLY,
-                    replay_guard=replay_guard,
-                    prepared_route=prepared_route,
-                )
-            except TrainingCapacityError as exc:
-                replay_guard.capacity_failure_reason = "replay_capacity_exceeded"
-                replay_seconds += time.perf_counter() - replay_started
-                capacity_failed = True
-                logger.warning(
-                    "[EVAL] trial=%s policy=%s stage=replay_capacity_exceeded %s",
-                    trial_number, policy_id, exc,
-                )
-                shortlist_evidence.append(
-                    {
-                        "trial_number": int(trial_number),
-                        "policy_id": policy_id,
-                        "eligible": False,
-                        "failure_reasons": ["replay_capacity_exceeded"],
-                        "attempted_orders": 0,
-                        "filled_orders": 0,
-                        "replay_finite": False,
-                        "replay_resource": replay_guard.telemetry(),
-                        "total_terminal_screen_trials": int(
-                            total_terminal_screen_trials
-                        ),
-                        "route_terminal_screen_trials": int(
-                            route_terminal_screen_trials
-                        ),
-                        "exact_compounding_policy_replays": len(cell_replays),
-                        "configured_compounding_policy_cells": int(
-                            configured_compounding_policy_cells
-                        ),
-                        "selection_multiplicity_version": str(
-                            SELECTION_MULTIPLICITY_VERSION
-                        ),
-                    }
-                )
-                continue
-            replay_seconds += time.perf_counter() - replay_started
-            cell_replays.append((policy_id, replay))
-        replays_for_trial = len(cell_replays)
-        exact_compounding_policy_replays += replays_for_trial
-        for policy_id, replay in cell_replays:
-            evidence = _evaluate_economic_candidate(
-                fold_rank_ic, replay, request, trial_number, _screen_ic,
+        policy_id = _DEFAULT_COMPOUNDING_POLICY_ID
+        replay_started = time.perf_counter()
+        try:
+            replay = _event_ledger_evaluation(
+                tuning_panel, oos, request, dataset_manifest, registry,
+                base_schedule, stress_schedule, replay_context=replay_context,
+                calibration_ledger=causal_oos_ledger,
                 holding_horizon_sessions=route.horizon,
                 label_column=route.label_column,
-                relevance_column=route.relevance_column,
                 label_available_column=route.label_available_column,
-                terminal_trial_count=terminal_trial_count,
-                policy_id=policy_id,
-                total_terminal_screen_trials=total_terminal_screen_trials,
-                route_terminal_screen_trials=route_terminal_screen_trials,
-                exact_compounding_policy_replays=replays_for_trial,
-                configured_compounding_policy_cells=configured_compounding_policy_cells,
-                selection_multiplicity_version=SELECTION_MULTIPLICITY_VERSION,
+                replay_mode=ReplayMode.INNER_SELECTION_BASE_ONLY,
+                replay_guard=replay_guard,
+                prepared_route=prepared_route,
             )
-            shortlist_evidence.append(evidence.to_json_safe())
-            logger.info(
-                "[EVAL] trial=%s policy=%s stage=evidence eligible=%s failure_reasons=%s",
-                trial_number,
-                policy_id,
-                evidence.eligible,
-                list(evidence.failure_reasons),
+        except TrainingCapacityError as exc:
+            replay_guard.capacity_failure_reason = "replay_capacity_exceeded"
+            replay_seconds += time.perf_counter() - replay_started
+            logger.warning(
+                "[EVAL] trial=%s policy=%s stage=replay_capacity_exceeded %s",
+                trial_number, policy_id, exc,
             )
-            if not evidence.eligible:
-                continue
-            cell_key = (
-                evidence.bootstrap_lower_bound,
-                evidence.dsr_probability,
-                evidence.geometric_excess_growth,
-                -evidence.max_drawdown,
-                -evidence.turnover,
-                evidence.median_rank_ic,
-                -route.horizon,
-                -trial_number,
-                policy_id,
+            shortlist_evidence.append(
+                {
+                    "trial_number": int(trial_number),
+                    "policy_id": policy_id,
+                    "eligible": False,
+                    "failure_reasons": ["replay_capacity_exceeded"],
+                    "attempted_orders": 0,
+                    "filled_orders": 0,
+                    "replay_finite": False,
+                    "replay_resource": replay_guard.telemetry(),
+                    "total_terminal_screen_trials": int(
+                        total_terminal_screen_trials
+                    ),
+                    "route_terminal_screen_trials": int(
+                        route_terminal_screen_trials
+                    ),
+                    "exact_compounding_policy_replays": 1,
+                    "configured_compounding_policy_cells": int(
+                        configured_compounding_policy_cells
+                    ),
+                    "selection_multiplicity_version": str(
+                        SELECTION_MULTIPLICITY_VERSION
+                    ),
+                }
             )
-            candidate_rows.append((cell_key, (trial_number, policy_id)))
-            current_best = best_cell_by_trial.get(trial_number)
-            if current_best is None or cell_key > current_best[0]:
-                best_cell_by_trial[trial_number] = (cell_key, evidence)
-            logger.info(
-                "[EVAL] trial=%s policy=%s stage=economically_eligible "
-                "compounding_lower_bound=%.8f dsr_probability=%.6f",
-                trial_number,
-                policy_id,
-                evidence.bootstrap_lower_bound,
-                evidence.dsr_probability,
-            )
+            continue
+        replay_seconds += time.perf_counter() - replay_started
+        exact_compounding_policy_replays += 1
+        evidence = _evaluate_economic_candidate(
+            fold_rank_ic, replay, request, trial_number, _screen_lb,
+            holding_horizon_sessions=route.horizon,
+            label_column=route.label_column,
+            relevance_column=route.relevance_column,
+            label_available_column=route.label_available_column,
+            terminal_trial_count=total_terminal_screen_trials,
+            policy_id=policy_id,
+            total_terminal_screen_trials=total_terminal_screen_trials,
+            route_terminal_screen_trials=route_terminal_screen_trials,
+            exact_compounding_policy_replays=1,
+            configured_compounding_policy_cells=configured_compounding_policy_cells,
+            selection_multiplicity_version=SELECTION_MULTIPLICITY_VERSION,
+        )
+        shortlist_evidence.append(evidence.to_json_safe())
+        logger.info(
+            "[EVAL] trial=%s policy=%s stage=evidence eligible=%s failure_reasons=%s",
+            trial_number,
+            policy_id,
+            evidence.eligible,
+            list(evidence.failure_reasons),
+        )
+        if not evidence.eligible:
+            continue
+        cell_key = (
+            evidence.bootstrap_lower_bound,
+            evidence.dsr_probability,
+            evidence.geometric_excess_growth,
+            -evidence.max_drawdown,
+            -evidence.turnover,
+            evidence.median_rank_ic,
+            -route.horizon,
+            -trial_number,
+            policy_id,
+        )
+        candidate_rows.append((cell_key, (trial_number, policy_id)))
+        current_best = best_cell_by_trial.get(trial_number)
+        if current_best is None or cell_key > current_best[0]:
+            best_cell_by_trial[trial_number] = (cell_key, evidence)
+        logger.info(
+            "[EVAL] trial=%s policy=%s stage=economically_eligible "
+            "compounding_lower_bound=%.8f dsr_probability=%.6f",
+            trial_number,
+            policy_id,
+            evidence.bootstrap_lower_bound,
+            evidence.dsr_probability,
+        )
         gc.collect()
     refit_seconds = time.perf_counter() - refit_started
     logger.info(
@@ -3190,12 +3274,8 @@ def _select_economic_champion(
     winner_calibration_state = winner_evidence.calibration_state
     if winner_calibration_state is not None:
         champion._calibration_state = dict(winner_calibration_state)
-    selected_policy = next(
-        (cell for cell in _COMPOUNDING_POLICY_GRID
-         if _compounding_policy_id(cell[0], cell[1]) == winner_policy_id),
-        _COMPOUNDING_POLICY_GRID[0],
-    )
-    selected_growth_risk_aversion, selected_turnover_budget = selected_policy
+    selected_growth_risk_aversion = _DEFAULT_GROWTH_RISK_AVERSION
+    selected_turnover_budget = _DEFAULT_TURNOVER_BUDGET
     return champion, {
         "economically_eligible_trials": len(candidate_rows),
         "selected_trial_number": winner_number,
@@ -3283,6 +3363,9 @@ def _selection_telemetry(
             configured_compounding_policy_cells
         ),
         "selection_multiplicity_version": str(selection_multiplicity_version),
+        "fold_retention_telemetry": (
+            dict(timings.fold_telemetry) if timings is not None else {}
+        ),
     }
 
 
@@ -4059,6 +4142,33 @@ def _median_rank_ic(
     return float(np.median(ics)) if ics else 0.0
 
 
+def _spearman_concordance(
+    xs: Sequence[float],
+    ys: Sequence[float],
+) -> float:
+    """Spearman rank concordance between two paired series, ``0.0`` on failure.
+
+    Used as a diagnostic between the proxy minimum economic lower bound and the
+    exact replay lower bound. Fewer than two valid pairs, or zero rank variance
+    in either series, fails closed to ``0.0``.
+    """
+    pairs = [
+        (float(x), float(y))
+        for x, y in zip(xs, ys, strict=False)
+        if math.isfinite(float(x)) and math.isfinite(float(y))
+    ]
+    if len(pairs) < 2:
+        return 0.0
+    xs_arr = np.asarray([p[0] for p in pairs], dtype=float)
+    ys_arr = np.asarray([p[1] for p in pairs], dtype=float)
+    rx = np.argsort(np.argsort(xs_arr)).astype(float)
+    ry = np.argsort(np.argsort(ys_arr)).astype(float)
+    denom = math.sqrt(float(np.sum((rx - rx.mean()) ** 2) * np.sum((ry - ry.mean()) ** 2)))
+    if denom <= 0.0:
+        return 0.0
+    return float(np.sum((rx - rx.mean()) * (ry - ry.mean())) / denom)
+
+
 def _reject_non_finite_economic_inputs(frame: pl.DataFrame) -> None:
     for column in _ECONOMIC_COLUMNS:
         if column in frame.columns:
@@ -4224,6 +4334,123 @@ def _moving_block_bootstrap_lower_bound(
     return float(np.quantile(means, alpha))
 
 
+def _economic_screen_score(
+    labeled: pl.DataFrame,
+    scored: pl.DataFrame,
+    *,
+    label_column: str,
+    top_k: int,
+    holding_horizon_sessions: int,
+    cost_schedule: CostSchedule,
+    n_bootstrap: int,
+    bootstrap_alpha: float,
+    seed: int,
+) -> float:
+    """Cost-aware non-overlapping proxy compounding lower bound for one fold.
+
+    Joins the validation labels ``(session_index, session, instrument_id,
+    label_column)`` to the finite model predictions, greedily retains decision
+    sessions at least ``holding_horizon_sessions`` apart so forward label
+    windows never overlap, then for each retained decision selects the top
+    ``min(top_k, available_names)`` names at equal weight. One-way portfolio
+    turnover is half the L1 distance from the prior equal weights (the first
+    decision has turnover ``1.0``), the effective stress cost point is resolved
+    at the decision time, and each block's net log excess is
+    ``mean(label) - turnover * round_trip_rate`` with
+    ``round_trip_rate = 2*commission + tax + 2*slippage_bps/10000``. The
+    seeded moving-block bootstrap (block length two rebalances) lower bound is
+    returned; fewer than three valid blocks, a non-finite block, or an invalid
+    group returns ``0.0`` fail-closed. Missing identity/session/label/score
+    columns and invalid scalar arguments raise ``ValueError``.
+    """
+    if top_k < 1:
+        raise ValueError("top_k must be positive")
+    if holding_horizon_sessions < 1:
+        raise ValueError("holding_horizon_sessions must be positive")
+    if n_bootstrap < 2:
+        raise ValueError("n_bootstrap must be at least 2")
+    if not 0.0 < bootstrap_alpha < 1.0:
+        raise ValueError("bootstrap_alpha must be in (0, 1)")
+    required = ("session", "instrument_id")
+    for column in required:
+        if column not in labeled.columns or column not in scored.columns:
+            raise ValueError(
+                f"economic screen inputs must carry {column} in both labeled and scored"
+            )
+    if "session_index" not in labeled.columns:
+        raise ValueError("economic screen labeled frame must carry session_index")
+    if label_column not in labeled.columns:
+        raise ValueError(f"economic screen labeled frame must carry {label_column}")
+    if "pred_score" not in scored.columns:
+        raise ValueError("economic screen scored frame must carry pred_score")
+
+    joined = labeled.select(
+        "session_index", "session", "instrument_id", pl.col(label_column)
+    ).join(
+        scored.select("session", "instrument_id", "pred_score"),
+        on=["session", "instrument_id"],
+        how="inner",
+    ).filter(
+        pl.col(label_column).is_not_null()
+        & pl.col("pred_score").is_not_null()
+        & pl.col(label_column).is_finite()
+        & pl.col("pred_score").is_finite()
+    )
+    if joined.is_empty():
+        return 0.0
+    decision_sessions: list[tuple[int, object]] = []
+    last_kept: int | None = None
+    for row in joined.select("session_index", "session").unique().sort("session_index").iter_rows():
+        index = int(row[0])
+        if last_kept is None or index - last_kept >= holding_horizon_sessions:
+            decision_sessions.append((index, row[1]))
+            last_kept = index
+    if len(decision_sessions) < 3:
+        return 0.0
+    blocks: list[float] = []
+    previous_names: list[str] = []
+    for index, decision_time in decision_sessions:
+        cross = joined.filter(pl.col("session_index") == index)
+        k = min(top_k, int(cross.height))
+        if k < 1:
+            continue
+        top = cross.sort("pred_score", descending=True).head(k)
+        names = top["instrument_id"].to_list()
+        if previous_names:
+            union = set(previous_names) | set(names)
+            turnover = 0.5 * sum(
+                abs(
+                    (1.0 / k if name in names else 0.0)
+                    - (1.0 / len(previous_names) if name in previous_names else 0.0)
+                )
+                for name in union
+            )
+        else:
+            turnover = 1.0
+        previous_names = names
+        decision = cost_schedule.cost_for(_session_as_datetime(decision_time))
+        round_trip_rate = (
+            2.0 * decision.commission_rate
+            + decision.tax_rate
+            + 2.0 * decision.slippage_bps / 10000.0
+        )
+        mean_value = top[label_column].mean()
+        mean_label = float(cast(float, mean_value)) if mean_value is not None else 0.0
+        block = mean_label - turnover * round_trip_rate
+        if not math.isfinite(block):
+            return 0.0
+        blocks.append(block)
+    if len(blocks) < 3:
+        return 0.0
+    return _moving_block_bootstrap_lower_bound(
+        blocks,
+        block_length=2,
+        n_bootstrap=max(n_bootstrap, 2),
+        seed=seed,
+        alpha=bootstrap_alpha,
+    )
+
+
 def _evaluate_gates(
     replay: ReplayResult,
     fold_rank_ic: list[float],
@@ -4295,12 +4522,13 @@ def _evaluate_gates(
 
     strategy_returns = replay.strategy_returns
     benchmark_returns = replay.benchmark_returns
-    strategy_ir = _information_ratio(strategy_returns)
-    benchmark_ir = _information_ratio(benchmark_returns)
-    stable_ir = strategy_ir * 0.5
-    gate3_ok = strategy_ir > stable_ir and strategy_ir > benchmark_ir
-    reasons.append(f"gate3_strategy_ir={strategy_ir:.6f}")
-    reasons.append(f"gate3_benchmark_ir={benchmark_ir:.6f}")
+    aligned_excess = _aligned_excess(strategy_returns, benchmark_returns)
+    active_ir = _active_information_ratio(aligned_excess)
+    gate3_ok = math.isfinite(active_ir) and active_ir > 0.0
+    reasons.append(f"gate3_active_information_ratio={active_ir:.6f}")
+    reasons.append(
+        f"gate3_aligned_observations={len(aligned_excess)}"
+    )
     passed = passed and gate3_ok
 
     benchmark_total = replay.benchmark_total_return
@@ -4342,6 +4570,22 @@ def _information_ratio(returns: list[float]) -> float:
     if arr.size < 2 or np.std(arr, ddof=0) <= 0.0:
         return 0.0
     return float(np.mean(arr) / np.std(arr, ddof=0)) * math.sqrt(252.0)
+
+
+def _active_information_ratio(excess_returns: list[float]) -> float:
+    """Annualized active information ratio of aligned strategy-minus-benchmark returns.
+
+    Computed as ``mean(excess) / std(excess) * sqrt(252)`` on the aligned
+    excess series. Fewer than two observations, zero variance, or a non-finite
+    value fails closed to ``0.0`` so the caller's ``> 0`` predicate rejects it.
+    """
+    arr = np.asarray(excess_returns, dtype=float)
+    if arr.size < 2 or not np.all(np.isfinite(arr)):
+        return 0.0
+    std = float(np.std(arr, ddof=0))
+    if std <= 0.0:
+        return 0.0
+    return float(np.mean(arr) / std) * math.sqrt(252.0)
 
 
 def _deflated_sharpe_probability(
