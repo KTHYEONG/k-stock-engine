@@ -34,6 +34,7 @@ logger = logging.getLogger("stocks.research.lambdarank")
 
 LAMBDARANK_WEIGHT = 0.50
 STABLE_WEIGHT = 1.0 - LAMBDARANK_WEIGHT
+LAMBDARANK_ABLATION_WEIGHTS = (0.00, 0.25, 0.50, 0.75, 1.00)
 _V2_FEATURE_PREFIX = "feature__"
 
 _FULL_REFIT_ROUND_CAP = 900
@@ -215,6 +216,22 @@ class LambdaRankConfig:
         self.half_life_sessions = half_life_sessions
         self.num_threads = num_threads
         self.lambdarank_weight = float(lambdarank_weight)
+
+    @property
+    def candidate_family(self) -> str:
+        """The registered ablation family for this blend weight.
+
+        Endpoints ``0.00`` and ``1.00`` classify exactly as ``stable_only`` and
+        ``ml_only``; interior weights map to their explicit blend family (for
+        example ``0.25`` -> ``blend_25``). Classification is provenance only and
+        never alters prediction mathematics.
+        """
+        weight = self.lambdarank_weight
+        if weight == 0.0:
+            return "stable_only"
+        if weight == 1.0:
+            return "ml_only"
+        return f"blend_{round(weight * 100):02d}"
 
     def lgb_params(self) -> dict[str, object]:
         """Deterministic LightGBM parameters with every seed pinned."""
