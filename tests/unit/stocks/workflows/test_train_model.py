@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable
 from dataclasses import replace as dataclass_replace
 
@@ -359,13 +360,36 @@ def _tune_base_manifest(
     )
 
 
+_POSITIVE_STRATEGY_RETURNS = [
+    0.0008 + 0.0015 * math.sin(i * 0.9) + 0.0004 * math.sin(i * 4.7)
+    for i in range(60)
+]
+
+_ROUTE_WIN_STRATEGY_RETURNS = [
+    0.001159, 0.003395, -0.000352, 0.002659, 0.003004, -0.005431, 0.00016,
+    0.010969, 0.001472, -0.007989, -0.000291, 0.006111, 0.006077, 0.001659,
+    -0.008162, -0.003485, 0.013171, 0.007402, -0.009659, -0.004747, 0.006794,
+    0.006375, 0.002412, -0.004144, -0.005319, 0.007112, 0.008814, -0.004793,
+    -0.0037, 0.005473, 0.001649, -0.000219, 0.003495, -4e-05, -0.000629,
+    0.00276, -0.000499, 0.001796, 0.006933, -0.002835, -0.00707, 0.006918,
+    0.009254, -0.002686, -0.005036, -0.000509, 0.005294, 0.009499, -0.001755,
+    -0.011632, 0.003333, 0.013942, 0.00045, -0.007443, -0.001108, 0.003948,
+    0.007268, 0.002696, -0.007765, -0.001467,
+]
+
+
 def _positive_replay(**overrides) -> ReplayResult:
-    """Deterministic economically eligible replay with fixed positive evidence."""
+    """Deterministic economically eligible replay with fixed positive evidence.
+
+    The 60-session strategy series produces twelve complete five-session block
+    log-excess values whose moving-block bootstrap lower bound is positive and
+    whose Deflated Sharpe probability clears the 0.95 budget threshold.
+    """
     base = ReplayResult(
         attempted_orders=10,
         filled_orders=8,
-        strategy_returns=[0.001] * 24,
-        benchmark_returns=[0.0] * 24,
+        strategy_returns=list(_POSITIVE_STRATEGY_RETURNS),
+        benchmark_returns=[0.0] * len(_POSITIVE_STRATEGY_RETURNS),
         excess_returns=[0.001] * 24,
         metrics={"max_drawdown": 0.05, "turnover": 1.0},
         base_total_return=0.01,
@@ -609,12 +633,16 @@ def test_tuning_economic_tie_breaks_by_lowest_trial_number(monkeypatch, tmp_path
     assert telemetry["selection_status"] == "selected"
     assert telemetry["selected_trial_number"] == 0
     assert telemetry["screened_trials"] == request.optuna_trials
-    assert telemetry["selection_policy_version"] == "economic-selection-v2-proxy-one-finalist"
+    assert telemetry["selection_policy_version"] == "economic-selection-v3-compounding"
     assert telemetry["promotion_width"] == 2
-    assert telemetry["finalist_width"] == 1
+    assert telemetry["economic_finalist_width"] == 2
     assert telemetry["shortlisted_trials"] == 2
-    assert telemetry["economically_eligible_trials"] == 1
-    assert telemetry["selected_inner_bootstrap_lower_bound"] > 0.0
+    assert telemetry["economically_eligible_trials"] == 12
+    assert telemetry["selected_policy_id"] == "5:ga2_tb0.2"
+    assert telemetry["selected_growth_risk_aversion"] == 2.0
+    assert telemetry["selected_turnover_budget"] == 0.2
+    assert telemetry["selected_inner_compounding_lower_bound"] > 0.0
+    assert telemetry["selected_inner_dsr_probability"] >= 0.95
 
 
 def test_tuning_rejects_economically_ineligible_candidates(monkeypatch, tmp_path) -> None:
@@ -672,14 +700,15 @@ def test_tuning_rejects_economically_ineligible_candidates(monkeypatch, tmp_path
     )
     assert tm.LambdaRankConfig._tuning_telemetry["economically_eligible_trials"] == 0
     evidence = tm.LambdaRankConfig._tuning_telemetry["shortlist_candidate_evidence"]
-    assert len(evidence) == 1
+    assert len(evidence) == 12
+    assert {row["trial_number"] for row in evidence} == {0, 1}
+    assert len({row["policy_id"] for row in evidence}) == 6
     for row in evidence:
         assert row["eligible"] is False
         assert set(row["failure_reasons"]) == {
             "no_attempted_orders",
             "no_filled_orders",
         }
-        assert row["trial_number"] == 0
 
 
 def test_calibrated_replay_records_economic_evidence_and_fails_closed(
@@ -1187,10 +1216,10 @@ def test_tuning_rejects_non_positive_bootstrap_candidates(monkeypatch, tmp_path)
         "no_economically_eligible_candidate"
     )
     evidence = tm.LambdaRankConfig._tuning_telemetry["shortlist_candidate_evidence"]
-    assert len(evidence) == 1
+    assert len(evidence) == 12
     for row in evidence:
         assert row["eligible"] is False
-        assert row["failure_reasons"] == ["non_positive_bootstrap_lower_bound"]
+        assert "non_positive_bootstrap_lower_bound" in row["failure_reasons"]
         assert row["attempted_orders"] > 0
         assert row["filled_orders"] > 0
         assert row["bootstrap_lower_bound"] <= 0.0
@@ -1199,32 +1228,48 @@ def test_economic_candidate_evidence_reason_codes() -> None:
     from src.stocks.workflows.train_model import _evaluate_economic_candidate
 
     request = TrainingRequest(artifact_id="codes", n_bootstrap=2)
-    finite = ReplayResult(
+    finite = dataclass_replace(
+        _positive_replay(),
         attempted_orders=2,
         filled_orders=1,
         excess_returns=[0.001, 0.001],
-        strategy_returns=[0.001, 0.001],
-        benchmark_returns=[0.0, 0.0],
         metrics={"max_drawdown": 0.0, "turnover": 0.0},
         final_value=1.0,
         base_total_return=0.0,
         benchmark_total_return=0.0,
         stress_total_return=0.0,
     )
-    assert _evaluate_economic_candidate([0.01], finite, request, 1, 0.02).eligible is True
+    assert (
+        _evaluate_economic_candidate(
+            [0.01], finite, request, 1, 0.02, terminal_trial_count=3
+        ).eligible
+        is True
+    )
 
-    bad_ic = _evaluate_economic_candidate([0.0, 0.01], finite, request, 2, 0.02)
+    bad_ic = _evaluate_economic_candidate(
+        [0.0, 0.01], finite, request, 2, 0.02, terminal_trial_count=3
+    )
     assert bad_ic.eligible is False
     assert bad_ic.failure_reasons == ("non_positive_fold_rank_ic",)
 
     non_finite = _evaluate_economic_candidate(
-        [0.01], dataclass_replace(finite, strategy_returns=[float("nan")]), request, 3, 0.02,
+        [0.01],
+        dataclass_replace(finite, strategy_returns=[float("nan")]),
+        request,
+        3,
+        0.02,
+        terminal_trial_count=3,
     )
     assert non_finite.eligible is False
-    assert non_finite.failure_reasons == ("non_finite_replay",)
+    assert set(non_finite.failure_reasons) == {
+        "non_finite_replay",
+        "non_positive_bootstrap_lower_bound",
+        "dsr_below_threshold",
+    }
 
     combined = _evaluate_economic_candidate(
         [0.0], dataclass_replace(finite, attempted_orders=0), request, 4, 0.02,
+        terminal_trial_count=3,
     )
     assert combined.failure_reasons == (
         "non_positive_fold_rank_ic",
@@ -1237,6 +1282,9 @@ def test_economic_candidate_evidence_reason_codes() -> None:
         "no_attempted_orders",
     ]
     assert row["eligible"] is False
+    assert row["policy_id"] == ""
+    assert "dsr_probability" in row
+    assert "geometric_excess_growth" in row
 
 
 def test_tuning_skips_candidates_that_fail_full_refit(monkeypatch, tmp_path) -> None:
@@ -1402,7 +1450,7 @@ def test_tuning_records_early_rejected_full_refits(monkeypatch, tmp_path) -> Non
     assert telemetry["full_refit_boosting_rounds"] == 900
     assert telemetry["full_refit_early_stopping_rounds"] == 100
     assert telemetry["all_positive_finalists"] == 1
-    assert len(telemetry["shortlist_candidate_evidence"]) == 1
+    assert len(telemetry["shortlist_candidate_evidence"]) == 6
 
 
 def test_screen_informed_full_refit_config_derives_budget_from_screen_constants() -> None:
@@ -1973,8 +2021,14 @@ def test_tuning_selects_longer_horizon_route_when_bootstrap_is_higher(
     _route_tune_mocks(
         monkeypatch,
         ledger_replay={
-            5: _positive_replay(excess_returns=[0.001] * 24),
-            10: _positive_replay(excess_returns=[0.002] * 24),
+            5: _positive_replay(
+                strategy_returns=list(_POSITIVE_STRATEGY_RETURNS),
+                excess_returns=[0.001] * 24,
+            ),
+            10: _positive_replay(
+                strategy_returns=list(_ROUTE_WIN_STRATEGY_RETURNS),
+                excess_returns=[0.002] * 24,
+            ),
         },
     )
     request = _multi_route_request("route_win_10d")
@@ -2046,12 +2100,20 @@ def test_tuning_records_route_specific_candidate_evidence(monkeypatch, tmp_path)
     assert route is not None
     telemetry = config._tuning_telemetry
     evidence = telemetry["shortlist_candidate_evidence"]
-    assert len(evidence) == 2
+    assert len(evidence) == 24
     assert {row["holding_horizon_sessions"] for row in evidence} == {5, 10}
+    assert {row["policy_id"] for row in evidence} == {
+        "0:ga0.5_tb0.1",
+        "1:ga0.5_tb0.2",
+        "2:ga1_tb0.1",
+        "3:ga1_tb0.2",
+        "4:ga2_tb0.1",
+        "5:ga2_tb0.2",
+    }
     assert any(row["label_column"] == "residual_o2o_5d" for row in evidence)
     assert any(row["label_column"] == "residual_o2o_10d" for row in evidence)
     assert any(row["label_available_column"] == "label_available_time_10d" for row in evidence)
-    assert telemetry["economically_eligible_trials"] == 2
+    assert telemetry["economically_eligible_trials"] == 12
     assert set(telemetry["routes"]) == {"5", "10"}
     assert telemetry["per_route_trial_budget"] == 2
 
@@ -2249,3 +2311,317 @@ def test_proxy_session_filter_is_deterministic_causal_and_rule_fixed() -> None:
     assert len(kept_sessions) < len(all_sessions)
     assert "session_index" in first.columns
     assert first.schema == panel.schema
+
+
+def test_compounding_evidence_blocks_are_exact_and_fail_closed() -> None:
+    from src.stocks.workflows.train_model import (
+        _compounding_evidence,
+        _deflated_sharpe_probability,
+        _moving_block_bootstrap_lower_bound,
+    )
+
+    request = TrainingRequest(artifact_id="blocks", n_bootstrap=200)
+    budget = PromotionRiskBudget()
+
+    five = _compounding_evidence([0.001] * 30, [0.0] * 30, [], 5, request, budget, 3)
+    assert five.complete_block_count == 6
+    assert five.block_log_excess == [0.005] * 6
+    assert five.bootstrap_lower_bound > 0.0
+    assert five.rejected_block_count == 0
+
+    ten = _compounding_evidence([0.001] * 30, [0.0] * 30, [], 10, request, budget, 3)
+    assert ten.complete_block_count == 3
+    assert all(abs(value - 0.01) < 1e-12 for value in ten.block_log_excess)
+
+    incomplete = _compounding_evidence(
+        [0.001] * 33, [0.0] * 33, [], 5, request, budget, 3
+    )
+    assert incomplete.complete_block_count == 6
+
+    too_few = _compounding_evidence([0.001] * 30, [0.0] * 30, [], 15, request, budget, 3)
+    assert too_few.block_log_excess == []
+    assert too_few.bootstrap_lower_bound == 0.0
+    assert too_few.dsr_probability == 0.0
+    assert too_few.complete_block_count == 0
+
+    non_finite = _compounding_evidence(
+        [0.001] * 10 + [float("nan")] * 5 + [0.001] * 15,
+        [0.0] * 30,
+        [],
+        5,
+        request,
+        budget,
+        3,
+    )
+    assert non_finite.rejected_block_count == 1
+    assert non_finite.complete_block_count == 5
+
+    total_loss = _compounding_evidence(
+        [float("-inf")] * 30, [0.0] * 30, [], 5, request, budget, 3
+    )
+    assert total_loss.rejected_block_count == 6
+    assert total_loss.complete_block_count == 0
+    assert total_loss.bootstrap_lower_bound == 0.0
+
+    aligned = _compounding_evidence(
+        [0.001] * 40, [0.0005] * 40, [0, 5, 10, 15, 20, 25, 30], 5, request, budget, 3
+    )
+    assert aligned.complete_block_count == 7
+    assert all(abs(value - 0.0025) < 1e-12 for value in aligned.block_log_excess)
+
+    reference_lb = _moving_block_bootstrap_lower_bound(
+        five.block_log_excess, 2, max(request.n_bootstrap, 2), request.seed,
+        budget.bootstrap_alpha,
+    )
+    assert five.bootstrap_lower_bound == reference_lb
+    reference_dsr = _deflated_sharpe_probability(
+        five.block_log_excess, annualization=252, n_trials=3
+    )
+    assert five.dsr_probability == reference_dsr
+
+
+def test_gate2_and_gate5_consume_block_log_compounding_evidence() -> None:
+    budget = PromotionRiskBudget()
+    request = TrainingRequest(artifact_id="gate_blk", n_folds=3)
+
+    good = _evaluate_gates(
+        _positive_replay(), [0.05, 0.06, 0.07], budget, request, n_trials=3
+    )
+    good_reasons = {str(r) for r in good["reasons"]}
+    assert any(r.startswith("gate2_compounding_lower_bound=0.00") for r in good_reasons)
+    assert "gate2_compounding_block_count=12" in good_reasons
+    assert any(r.startswith("legacy_daily_excess_lower_bound=") for r in good_reasons)
+    assert any(r.startswith("gate5_deflated_sharpe_probability=1.0") for r in good_reasons)
+    assert good["passed"] is True
+
+    flat = _evaluate_gates(
+        _positive_replay(strategy_returns=[0.001] * 60),
+        [0.05, 0.06, 0.07],
+        budget,
+        request,
+        n_trials=3,
+    )
+    flat_reasons = {str(r) for r in flat["reasons"]}
+    assert any(r.startswith("gate5_deflated_sharpe_probability=0.0") for r in flat_reasons)
+    assert flat["passed"] is False
+
+    negative = _evaluate_gates(
+        _positive_replay(strategy_returns=[-0.001] * 60),
+        [0.05, 0.06, 0.07],
+        budget,
+        request,
+        n_trials=3,
+    )
+    neg_reasons = {str(r) for r in negative["reasons"]}
+    assert any(
+        float(r.split("=")[1]) <= 0.0
+        for r in neg_reasons
+        if r.startswith("gate2_compounding_lower_bound=")
+    )
+    assert negative["passed"] is False
+
+
+def test_tuning_six_policy_grid_is_complete_deterministic_and_guarded(
+    monkeypatch, tmp_path,
+) -> None:
+    import src.stocks.workflows.train_model as tm
+
+    monkeypatch.setattr(tm, "_MIN_TRAIN_SESSIONS", 40)
+    monkeypatch.setattr(tm, "_VALIDATION_BLOCK_SESSIONS", 30)
+
+    df = stock_v2_composed_df(n_sessions=140, n_tickers=20)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    label_span = (manifest.label_horizon_sessions or 1) + 1
+    folds = tm.PurgedWalkForward(
+        n_folds=3,
+        label_horizon_sessions=label_span,
+        embargo_sessions=5,
+        session_column="session_index",
+        validation_window_sessions=30,
+        min_train_sessions=40,
+    ).split(panel)
+
+    monkeypatch.setattr(tm, "_fit_stable_contexts", _fake_fold_contexts)
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+    monkeypatch.setattr(tm, "_fit_and_score_candidate", _fold_aware_refit())
+    calls = {"count": 0}
+
+    def spy_ledger(*_a, **_kw):
+        calls["count"] += 1
+        return _positive_replay()
+
+    monkeypatch.setattr(tm, "_event_ledger_evaluation", spy_ledger)
+
+    request = TrainingRequest(artifact_id="grid", n_folds=3, optuna_trials=3)
+    config, n_trials, _route = tm._tune_champion(
+        panel[folds[0].train_mask],
+        request,
+        _tune_base_manifest("grid", manifest, manifest.label_definition),
+        tuple(c for c in df.columns if c.startswith("feature__")),
+        (tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),),
+        dataset_manifest=manifest,
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    assert config is not None
+    assert n_trials == request.optuna_trials
+    assert calls["count"] == 12
+    telemetry = config._tuning_telemetry
+    expected_policies = {
+        "0:ga0.5_tb0.1",
+        "1:ga0.5_tb0.2",
+        "2:ga1_tb0.1",
+        "3:ga1_tb0.2",
+        "4:ga2_tb0.1",
+        "5:ga2_tb0.2",
+    }
+    evidence = telemetry["shortlist_candidate_evidence"]
+    assert len(evidence) == 12
+    assert {row["policy_id"] for row in evidence} == expected_policies
+    assert {row["trial_number"] for row in evidence} == {0, 1}
+    assert telemetry["compounding_policy_replays"] == evidence
+    assert isinstance(telemetry.get("replay_resource"), dict)
+
+
+def test_tuning_lower_rank_ic_candidate_with_higher_compounding_objective_wins(
+    monkeypatch, tmp_path,
+) -> None:
+    import src.stocks.workflows.train_model as tm
+
+    monkeypatch.setattr(tm, "_MIN_TRAIN_SESSIONS", 40)
+    monkeypatch.setattr(tm, "_VALIDATION_BLOCK_SESSIONS", 30)
+
+    df = stock_v2_composed_df(n_sessions=140, n_tickers=20)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    label_span = (manifest.label_horizon_sessions or 1) + 1
+    folds = tm.PurgedWalkForward(
+        n_folds=3,
+        label_horizon_sessions=label_span,
+        embargo_sessions=5,
+        session_column="session_index",
+        validation_window_sessions=30,
+        min_train_sessions=40,
+    ).split(panel)
+
+    monkeypatch.setattr(tm, "_fit_stable_contexts", _fake_fold_contexts)
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+
+    def fake_refit(*_a, **_kw):
+        key = str(_a[10])
+        ics = [0.07, 0.08, 0.09] if key == "trial0" else [0.05, 0.06, 0.07]
+        indices = _kw.get("fold_indices") or tuple(range(len(ics)))
+        return ([ics[i] for i in indices], pl.DataFrame())
+
+    monkeypatch.setattr(tm, "_fit_and_score_candidate", fake_refit)
+    ledger = {
+        "trial0": _positive_replay(strategy_returns=list(_POSITIVE_STRATEGY_RETURNS)),
+        "trial1": _positive_replay(strategy_returns=list(_ROUTE_WIN_STRATEGY_RETURNS)),
+    }
+    state = {"n": 0}
+
+    def spy_ledger(*_a, **_kw):
+        key = "trial0" if state["n"] < 6 else "trial1"
+        state["n"] += 1
+        return ledger[key]
+
+    monkeypatch.setattr(tm, "_event_ledger_evaluation", spy_ledger)
+
+    request = TrainingRequest(artifact_id="winner", n_folds=3, optuna_trials=3)
+    config, n_trials, _route = tm._tune_champion(
+        panel[folds[0].train_mask],
+        request,
+        _tune_base_manifest("winner", manifest, manifest.label_definition),
+        tuple(c for c in df.columns if c.startswith("feature__")),
+        (tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),),
+        dataset_manifest=manifest,
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    assert config is not None
+    telemetry = config._tuning_telemetry
+    assert telemetry["selected_trial_number"] == 1
+    assert telemetry["selected_policy_id"] == "5:ga2_tb0.2"
+
+
+def test_tuning_candidate_failing_dsr_cannot_win(monkeypatch, tmp_path) -> None:
+    import src.stocks.workflows.train_model as tm
+
+    monkeypatch.setattr(tm, "_MIN_TRAIN_SESSIONS", 40)
+    monkeypatch.setattr(tm, "_VALIDATION_BLOCK_SESSIONS", 30)
+
+    df = stock_v2_composed_df(n_sessions=140, n_tickers=20)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    label_span = (manifest.label_horizon_sessions or 1) + 1
+    folds = tm.PurgedWalkForward(
+        n_folds=3,
+        label_horizon_sessions=label_span,
+        embargo_sessions=5,
+        session_column="session_index",
+        validation_window_sessions=30,
+        min_train_sessions=40,
+    ).split(panel)
+
+    monkeypatch.setattr(tm, "_fit_stable_contexts", _fake_fold_contexts)
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+    monkeypatch.setattr(tm, "_fit_and_score_candidate", _fold_aware_refit())
+    monkeypatch.setattr(
+        tm,
+        "_event_ledger_evaluation",
+        lambda *_a, **_kw: _positive_replay(strategy_returns=[0.001] * 60),
+    )
+
+    request = TrainingRequest(artifact_id="dsr_fail", n_folds=3, optuna_trials=3)
+    config, n_trials, _route = tm._tune_champion(
+        panel[folds[0].train_mask],
+        request,
+        _tune_base_manifest("dsr_fail", manifest, manifest.label_definition),
+        tuple(c for c in df.columns if c.startswith("feature__")),
+        (tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),),
+        dataset_manifest=manifest,
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    assert config is None
+    assert n_trials == request.optuna_trials
+    telemetry = tm.LambdaRankConfig._tuning_telemetry
+    assert telemetry["selection_status"] == "no_economically_eligible_candidate"
+    assert telemetry["economically_eligible_trials"] == 0
+    for row in telemetry["shortlist_candidate_evidence"]:
+        assert row["eligible"] is False
+        assert row["failure_reasons"] == ["dsr_below_threshold"]
+        assert row["bootstrap_lower_bound"] > 0.0
+
+
+def test_forward_holdout_fingerprint_changes_with_selected_policy() -> None:
+    from src.stocks.workflows.train_model import _forward_holdout_fingerprint
+
+    df = stock_v2_composed_df(n_sessions=40, n_tickers=6)
+    dataset_manifest = stock_v2_manifest(columns=df.columns)
+    base_manifest = _tune_base_manifest(
+        "fp", dataset_manifest, dataset_manifest.label_definition
+    )
+    request = TrainingRequest(artifact_id="fp", n_folds=3)
+    config = tm.LambdaRankConfig()
+    base = default_base_schedule()
+    stress = default_stress_schedule()
+
+    first = _forward_holdout_fingerprint(
+        base_manifest, request, dataset_manifest, (1, 252), config, base, stress, 5,
+        selected_policy="0:ga0.5_tb0.1",
+    )
+    second = _forward_holdout_fingerprint(
+        base_manifest, request, dataset_manifest, (1, 252), config, base, stress, 5,
+        selected_policy="5:ga2_tb0.2",
+    )
+    third = _forward_holdout_fingerprint(
+        base_manifest, request, dataset_manifest, (1, 252), config, base, stress, 5,
+        selected_policy="0:ga0.5_tb0.1",
+    )
+    assert first == third
+    assert first != second
