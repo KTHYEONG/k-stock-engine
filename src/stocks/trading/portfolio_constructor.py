@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import cast
 
 import numpy as np
 import polars as pl
@@ -68,11 +69,17 @@ class PreparedAllocationMarket:
     """Immutable array-backed route market consumed by the prepared allocator.
 
     Owns the canonical sorted ``(session, instrument_id)`` row index plus the
-    candidate-invariant ``close``, ADTV, and sector arrays for one route OOS
-    interval, so a candidate contributes only an aligned ``float64`` score
-    overlay instead of re-joining a full market frame. ``session_ranges`` maps
-    each session index to its contiguous row range and ``rows_by_key`` resolves
-    ``(instrument_id, session)`` rows in ``O(1)``.
+    candidate-invariant ``close``, ADTV, sector, per-row log-return, and
+    causal rolling-volatility arrays for one route OOS interval, so a candidate
+    contributes only an aligned ``float64`` score overlay instead of re-joining
+    a full market frame. ``session_ranges`` maps each session index to its
+    contiguous row range and ``rows_by_key`` resolves ``(instrument_id,
+    session)`` rows in ``O(1)``. When the market is dense (every session
+    carries the same sorted instrument cross-section) ``returns_matrix`` gives
+    the ``(n_sessions, n_instruments)`` return history so the prepared
+    allocator builds per-decision windows without per-row Python work;
+    ``instrument_position_of`` aligns every row to its ``sorted_instruments``
+    column for the non-dense fallback.
     """
 
     sessions: tuple[datetime, ...]
@@ -83,6 +90,15 @@ class PreparedAllocationMarket:
     close: np.ndarray
     adtv: np.ndarray
     sector: np.ndarray
+    returns: np.ndarray
+    volatility_lookback_sessions: int
+    vol_series: np.ndarray
+    dense: bool
+    n_instruments: int
+    sorted_instruments: np.ndarray
+    instrument_position_of: np.ndarray
+    instrument_position_lookup: Mapping[str, int]
+    returns_matrix: np.ndarray
     rows_by_key: Mapping[tuple[str, datetime], int]
     cache_bytes: int
 
@@ -91,8 +107,20 @@ class PreparedAllocationMarket:
         return int(self.instrument_ids.size)
 
     @classmethod
-    def build(cls, frame: pl.DataFrame) -> PreparedAllocationMarket:
-        """Build the array-backed market from a validated route OOS frame."""
+    def build(
+        cls,
+        frame: pl.DataFrame,
+        volatility_lookback_sessions: int = 20,
+    ) -> PreparedAllocationMarket:
+        """Build the array-backed market from a validated route OOS frame.
+
+        ``volatility_lookback_sessions`` fixes the cached causal rolling-std
+        window; the reference path computes the same expression on the bounded
+        decision window, so the cached per-row value is bit-identical for every
+        decision cross-section whose lookback matches.
+        """
+        if volatility_lookback_sessions < 1:
+            raise ValueError("volatility lookback sessions must be positive")
         missing = [c for c in ("instrument_id", _SESSION_COLUMN, "sector", "adtv", "close") if c not in frame.columns]
         if missing:
             raise ValueError(f"prepared market frame must carry {', '.join(missing)}")
@@ -128,6 +156,45 @@ class PreparedAllocationMarket:
         instrument_ids = np.asarray(
             [str(i) for i in ordered["instrument_id"].to_list()], dtype=object
         )
+        unique_ids = [str(i) for i in ordered["instrument_id"].unique().sort().to_list()]
+        n_instruments = len(unique_ids)
+        sorted_instruments = np.asarray(unique_ids, dtype=object)
+        position_map = {instrument: position for position, instrument in enumerate(unique_ids)}
+        instrument_position_of = np.asarray(
+            [position_map[str(i)] for i in ordered["instrument_id"].to_list()],
+            dtype=np.int64,
+        )
+        logret = pl.col("close").log() - pl.col("close").log().shift(1).over(
+            "instrument_id"
+        )
+        with_ret = ordered.with_columns(
+            logret.alias("__ret"),
+            logret.rolling_std(
+                window_size=volatility_lookback_sessions, min_samples=2
+            )
+            .over("instrument_id")
+            .alias("__vol"),
+        )
+        returns = with_ret["__ret"].to_numpy().astype(np.float64)
+        vol_series = with_ret["__vol"].to_numpy().astype(np.float64)
+        n_sessions = len(sessions)
+        dense = ordered.height == n_sessions * n_instruments
+        if dense:
+            first_session_ids = [
+                str(i) for i in ordered["instrument_id"][ranges[0][0]:ranges[0][1]].to_list()
+            ]
+            dense = first_session_ids == unique_ids
+        if dense:
+            returns_matrix = returns.reshape(n_sessions, n_instruments)
+        else:
+            returns_matrix = np.full(
+                (n_sessions, n_instruments), np.nan, dtype=np.float64
+            )
+            for session_index in range(n_sessions):
+                lo, hi = ranges[session_index]
+                returns_matrix[
+                    session_index, instrument_position_of[lo:hi]
+                ] = returns[lo:hi]
         rows_by_key: dict[tuple[str, datetime], int] = {}
         market = cls(
             sessions=sessions,
@@ -138,6 +205,15 @@ class PreparedAllocationMarket:
             close=ordered["close"].to_numpy().astype(np.float64),
             adtv=ordered["adtv"].to_numpy().astype(np.float64),
             sector=np.asarray(ordered["sector"].to_list(), dtype=object),
+            returns=returns,
+            volatility_lookback_sessions=volatility_lookback_sessions,
+            vol_series=vol_series,
+            dense=dense,
+            n_instruments=n_instruments,
+            sorted_instruments=sorted_instruments,
+            instrument_position_of=instrument_position_of,
+            instrument_position_lookup=position_map,
+            returns_matrix=returns_matrix,
             rows_by_key=rows_by_key,
             cache_bytes=int(ordered.estimated_size()),
         )
@@ -157,14 +233,18 @@ def construct_target_allocations_prepared(
     portfolio: PortfolioSnapshot,
     policy: StockRiskPolicy,
 ) -> tuple[Allocation, ...]:
-    """Construct constrained targets from prepared arrays and one score overlay.
+    """Construct constrained targets from prepared causal arrays and one overlay.
 
-    Assembles only the bounded ``(volatility, covariance)`` history window
-    ending at ``decision_index`` from static arrays, applies the frozen
-    ``calibration_state`` bucket table when supplied, and delegates the
-    constraint-satisfying allocation construction to the reference
-    :func:`construct_target_allocations` so the prepared and reference paths
-    produce identical allocations, order intents, fills, ledger, and metrics.
+    The hot path builds the bounded ``(volatility, covariance)`` history window
+    directly from the immutable causal return arrays, ranks the current
+    cross-section, applies the frozen ``calibration_state`` bucket table when
+    supplied, and runs the same constrained target construction as the
+    reference :func:`construct_target_allocations` -- with the shrinkage
+    covariance computed once per ``(decision, selected-name set)`` and reused
+    for volatility scaling, compounding scaling, and post-validation. The
+    public :func:`construct_target_allocations` and
+    :meth:`PreparedSelectionRoute.window_frame` are never invoked on this path;
+    the reference implementation is kept unchanged as the parity oracle.
     ``score_overlay`` must be aligned to ``market`` rows (``NaN`` where the
     candidate has no score). Raises ``ValueError`` on an overlay length
     mismatch or a non-finite market input.
@@ -182,38 +262,412 @@ def construct_target_allocations_prepared(
         raise ValueError("prepared score overlay carries non-finite scored values")
     if decision_index < 0 or decision_index >= len(market.sessions):
         raise ValueError(f"decision_index {decision_index} outside route sessions")
-    window = (
+    return _construct_allocations_prepared(
+        market, decision_index, overlay, calibration_state,
+        instruments, portfolio, policy,
+    )
+
+
+def _average_rank(values: np.ndarray) -> np.ndarray:
+    """Average (dense) ranks of ``values``, mirroring Polars ``rank('average')``.
+
+    Ranks are assigned over the non-null values ascending; exact float ties
+    receive the mean of their ordinal ranks, matching the reference bucket
+    expression exactly.
+    """
+    n = values.size
+    if n == 0:
+        return np.asarray([], dtype=np.float64)
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(n, dtype=np.float64)
+    ranks[order] = np.arange(1, n + 1, dtype=np.float64)
+    sorted_values = values[order]
+    start = 0
+    while start < n:
+        end = start + 1
+        while end < n and sorted_values[end] == sorted_values[start]:
+            end += 1
+        if end - start > 1:
+            ranks[order[start:end]] = (start + 1 + end) / 2.0
+        start = end
+    return ranks
+
+
+def _prepared_economics(
+    calibration_state: Mapping[str, object],
+    scores: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Frozen bucket statistics joined onto the decision cross-section scores.
+
+    Mirrors ``CausalAlphaCalibrator.apply_prepared`` restricted to the decision
+    cross-section: scores are average-ranked within the session, bucketed, and
+    joined to the frozen bucket table, then the net columns and exit cost are
+    derived. Unscored rows and rows without bucket statistics stay ``NaN`` so
+    the economic gates exclude them exactly as the reference null semantics do.
+    """
+    bucket_count = int(cast(int, calibration_state.get("bucket_count", 0)))
+    round_trip_cost = float(
+        cast(float, calibration_state.get("round_trip_cost", 0.0))
+    )
+    exit_cost_rate = float(
+        cast(float, calibration_state.get("exit_cost_rate", 0.0))
+    )
+    bucket_stats = {
+        int(cast(int, bucket["bucket"])): (
+            bucket.get("expected_active_alpha"),
+            bucket.get("alpha_lower_bound"),
+        )
+        for bucket in cast(
+            Sequence[Mapping[str, object]],
+            calibration_state.get("buckets") or [],
+        )
+    }
+    n = scores.size
+    active = np.full(n, np.nan, dtype=np.float64)
+    lower = np.full(n, np.nan, dtype=np.float64)
+    scored_positions = np.where(~np.isnan(scores))[0]
+    if scored_positions.size:
+        values = scores[scored_positions]
+        within = int(scored_positions.size)
+        if within > 1:
+            pct_rank = (_average_rank(values) - 1.0) / (within - 1.0)
+        else:
+            pct_rank = np.full(within, 0.5, dtype=np.float64)
+        buckets = (
+            np.floor(pct_rank * bucket_count).clip(0, bucket_count - 1).astype(np.int64)
+        )
+        for position, bucket in zip(scored_positions, buckets, strict=True):
+            stats = bucket_stats.get(int(bucket))
+            if stats is None:
+                continue
+            active_alpha, alpha_lower = stats
+            if active_alpha is not None:
+                active[position] = float(cast(float, active_alpha))
+            if alpha_lower is not None:
+                lower[position] = float(cast(float, alpha_lower))
+    net_alpha = np.where(np.isnan(active), np.nan, active - round_trip_cost)
+    net_lower = np.where(np.isnan(lower), np.nan, lower - round_trip_cost)
+    return {
+        "expected_active_alpha": active,
+        "alpha_lower_bound": lower,
+        "expected_net_alpha": net_alpha,
+        "net_alpha_lower_bound": net_lower,
+        "exit_cost_rate": np.full(n, exit_cost_rate, dtype=np.float64),
+    }
+
+
+def _window_returns(
+    market: PreparedAllocationMarket,
+    start: int,
+    decision_index: int,
+) -> np.ndarray:
+    """Bounded ``(window_sessions, n_instruments)`` return matrix.
+
+    The matrix carries within-window log returns: the first window appearance
+    of every instrument is ``NaN`` exactly as the reference window-frame diff
+    produces, and later appearances use the causal full-market diff. Dense
+    markets are served by the precomputed reshape; the scatter path handles
+    any cross-section gap identically.
+    """
+    if market.dense:
+        result = market.returns_matrix[start:decision_index + 1].copy()
+        result[0, :] = np.nan
+        return result
+    result = np.full(
+        (decision_index - start + 1, market.n_instruments), np.nan, dtype=np.float64
+    )
+    seen = np.zeros(market.n_instruments, dtype=bool)
+    for offset, session_index in enumerate(range(start, decision_index + 1)):
+        lo, hi = market.session_ranges[session_index]
+        cols = market.instrument_position_of[lo:hi]
+        first = ~seen[cols]
+        values = market.returns[lo:hi]
+        result[offset, cols] = np.where(first, np.nan, values)
+        seen[cols] = True
+    return result
+
+
+def _prepared_return_matrix(
+    returns: np.ndarray,
+    market: PreparedAllocationMarket,
+    selected_ids: Sequence[str],
+    lookback: int,
+) -> np.ndarray | None:
+    """Return matrix for ``selected_ids`` mirroring the reference pivot.
+
+    Columns follow ``selected_ids`` order; rows are the window sessions where
+    every selected name has a within-window return (the reference
+    ``drop_nulls``), truncated to the trailing ``lookback`` sessions. ``None``
+    reproduces the reference ``insufficient covariance data`` outcome.
+    """
+    cols = [market.instrument_position_lookup.get(instrument_id) for instrument_id in selected_ids]
+    if any(col is None for col in cols):
+        return None
+    selected = returns[:, cast(list[int], cols)]
+    keep = np.all(np.isfinite(selected), axis=1)
+    rows = selected[keep]
+    if rows.ndim != 2 or rows.shape[0] < 2 or rows.shape[1] != len(selected_ids):
+        return None
+    return rows[-lookback:]
+
+
+def _prepared_vol_fallback(
+    market: PreparedAllocationMarket,
+    returns_window: np.ndarray,
+    decision_index: int,
+    lookback: int,
+) -> np.ndarray:
+    """Causal rolling volatility for a mismatched lookback via the exact Polars expression."""
+    cs_lo, cs_hi = market.session_ranges[decision_index]
+    cols = market.instrument_position_of[cs_lo:cs_hi]
+    out = np.full(cs_hi - cs_lo, np.nan, dtype=np.float64)
+    window_rows = returns_window[-lookback:, :]
+    for offset, col in enumerate(cols):
+        rolled = pl.Series("__ret", window_rows[:, col]).rolling_std(
+            window_size=lookback, min_samples=2
+        )
+        tail_value = rolled[-1]
+        if tail_value is not None:
+            out[offset] = float(tail_value)
+    return out
+
+
+def _prepared_equity_and_prices(
+    portfolio: PortfolioSnapshot,
+    cs_ids: np.ndarray,
+    close: np.ndarray,
+) -> tuple[float, dict[str, float]]:
+    """Mark-to-market equity and close price map for the decision cross-section."""
+    price_map = {
+        str(cs_ids[position]): float(close[position])
+        for position in range(cs_ids.size)
+        if not np.isnan(close[position])
+    }
+    equity = portfolio.equity(price_map)
+    if not math.isfinite(equity) or equity <= 0:
+        raise PortfolioConstraintError(f"portfolio equity must be finite and positive, got {equity}")
+    return equity, price_map
+
+
+def _prepared_priority_alpha_of(
+    selected_ids: Sequence[str],
+    incumbent_ids: set[str],
+    econ: Mapping[str, np.ndarray],
+    cs_ids: np.ndarray,
+) -> dict[str, float]:
+    """Per-name priority alpha mirroring :func:`_priority_alpha_of`."""
+    active = econ["expected_active_alpha"]
+    net = econ["expected_net_alpha"]
+    exit_rate = econ["exit_cost_rate"]
+    net_alpha: dict[str, float] = {}
+    active_alpha: dict[str, float] = {}
+    exit_cost: dict[str, float] = {}
+    for position in range(cs_ids.size):
+        instrument_id = str(cs_ids[position])
+        if not np.isnan(net[position]):
+            net_alpha[instrument_id] = float(net[position])
+        if not np.isnan(active[position]):
+            active_alpha[instrument_id] = float(active[position])
+        exit_cost[instrument_id] = float(exit_rate[position])
+    priority: dict[str, float] = {}
+    for instrument_id in selected_ids:
+        if instrument_id in incumbent_ids:
+            priority[instrument_id] = max(
+                active_alpha.get(instrument_id, 0.0)
+                - exit_cost.get(instrument_id, 0.0),
+                0.0,
+            )
+        else:
+            priority[instrument_id] = max(net_alpha.get(instrument_id, 0.0), 0.0)
+    return priority
+
+
+def _construct_allocations_prepared(
+    market: PreparedAllocationMarket,
+    decision_index: int,
+    overlay: np.ndarray,
+    calibration_state: Mapping[str, object] | None,
+    instruments: Mapping[str, Instrument],
+    portfolio: PortfolioSnapshot,
+    policy: StockRiskPolicy,
+) -> tuple[Allocation, ...]:
+    """Array-backed constrained target construction for one prepared decision."""
+    window_len = (
         max(policy.volatility_lookback_sessions, policy.covariance_lookback_sessions)
         + 1
     )
-    start = max(0, decision_index - window + 1)
-    indices = np.concatenate(
-        [np.arange(market.session_ranges[i][0], market.session_ranges[i][1])
-         for i in range(start, decision_index + 1)]
-    )
-    if indices.size == 0:
-        return ()
-    window_frame = pl.DataFrame(
-        {
-            "instrument_id": market.instrument_ids[indices],
-            _SESSION_COLUMN: pl.Series(
-                market.row_sessions[indices].tolist(), dtype=pl.Datetime("us", "UTC")
-            ),
-            "pred_score": np.asarray(overlay)[indices],
-            "sector": market.sector[indices],
-            "adtv": market.adtv[indices],
-            "close": market.close[indices],
-        }
-    ).with_columns(pl.col("pred_score").fill_nan(None))
-    if calibration_state is not None:
-        from src.stocks.research.economic_alpha import CausalAlphaCalibrator
+    start = max(0, decision_index - window_len + 1)
+    cs_lo, cs_hi = market.session_ranges[decision_index]
+    cs_slice = slice(cs_lo, cs_hi)
+    scores = overlay[cs_slice]
+    close = market.close[cs_slice]
+    adtv = market.adtv[cs_slice]
+    sector = market.sector[cs_slice]
+    cs_ids = market.instrument_ids[cs_slice]
+    returns_window = _window_returns(market, start, decision_index)
 
-        window_frame = CausalAlphaCalibrator.apply_prepared(
-            dict(calibration_state), window_frame
+    if policy.volatility_lookback_sessions == market.volatility_lookback_sessions:
+        vol = market.vol_series[cs_slice].astype(np.float64)
+    else:
+        vol = _prepared_vol_fallback(
+            market, returns_window, decision_index, policy.volatility_lookback_sessions
         )
-    return construct_target_allocations(
-        window_frame, instruments, portfolio, policy
+
+    eligible = (
+        ~np.isnan(scores)
+        & ~np.isnan(vol)
+        & (vol > 0.0)
+        & (adtv > 0.0)
+        & ~np.isnan(close)
     )
+    if not bool(np.any(eligible)):
+        return ()
+    equity, price_map = _prepared_equity_and_prices(portfolio, cs_ids, close)
+    current_weights = _current_weights(portfolio, price_map, equity)
+    incumbent_ids = set(current_weights)
+
+    econ: dict[str, np.ndarray] | None = None
+    if calibration_state is not None:
+        econ = _prepared_economics(calibration_state, scores)
+        active = econ["expected_active_alpha"]
+        net_alpha = econ["expected_net_alpha"]
+        lower = econ["alpha_lower_bound"]
+        net_lower = econ["net_alpha_lower_bound"]
+        exit_rate = econ["exit_cost_rate"]
+        incumbent_mask = np.asarray(
+            [str(instrument_id) in incumbent_ids for instrument_id in cs_ids], dtype=bool
+        )
+        keep_ok = (
+            (active - exit_rate > 0.0)
+            & (active > 0.0)
+            & (lower > 0.0)
+        )
+        enter_ok = (
+            (net_alpha > 0.0)
+            & (active > 0.0)
+            & (lower > 0.0)
+            & (net_lower > 0.0)
+        )
+        gate = np.where(incumbent_mask, keep_ok, enter_ok)
+        eligible = eligible & np.where(np.isnan(active), False, gate)
+        if not bool(np.any(eligible)):
+            return ()
+
+    positions = np.where(eligible)[0]
+    preds = scores[positions]
+    id_strs = np.asarray([str(cs_ids[position]) for position in positions], dtype=object)
+    # The reference ranks ``eligible.sort([col('pred_score').sort(descending=True),
+    # col('instrument_id').sort()])``, whose sort-key expressions are evaluated
+    # positionally: row ``p`` carries the ``p``-th largest score and the ``p``-th
+    # smallest instrument id. Replicate that exact ordering bit-for-bit.
+    score_desc = np.sort(preds)[::-1]
+    id_asc = id_strs[np.argsort(id_strs, kind="mergesort")]
+    order = np.lexsort((id_asc, score_desc))
+    positions_sorted = positions[order]
+    ranks = np.arange(1, positions_sorted.size + 1, dtype=np.int64)
+    incumbent_of = np.asarray(
+        [str(cs_ids[position]) in incumbent_ids for position in positions_sorted],
+        dtype=bool,
+    )
+    keep = (ranks <= policy.enter_rank) | (
+        incumbent_of & (ranks <= policy.keep_rank)
+    )
+    ranked_positions = positions_sorted[keep]
+    ranked_count = int(ranked_positions.size)
+    ranked_positions = ranked_positions[: policy.top_k]
+    if ranked_positions.size == 0:
+        return ()
+    selected_ids = [str(cs_ids[position]) for position in ranked_positions]
+    selected_count = len(selected_ids)
+    candidate_count = int(eligible.sum())
+    decision_session = market.sessions[decision_index]
+
+    net_lower_bound_of: dict[str, float] = {}
+    if policy.compounding.enabled and econ is not None:
+        net_lower_all = econ["net_alpha_lower_bound"]
+        for position in range(cs_ids.size):
+            value = net_lower_all[position]
+            if not np.isnan(value):
+                net_lower_bound_of[str(cs_ids[position])] = float(value)
+        for instrument_id in selected_ids:
+            if (
+                instrument_id not in net_lower_bound_of
+                or not math.isfinite(net_lower_bound_of[instrument_id])
+            ):
+                _record_compounding_decision(
+                    policy,
+                    decision_session=decision_session,
+                    candidate_count=candidate_count,
+                    ranked_count=ranked_count,
+                    selected_count=selected_count,
+                    confidence_edge_h=None,
+                    confidence_variance_h=None,
+                    confidence_scale=None,
+                    gross_before_compounding=0.0,
+                    gross_after_compounding=0.0,
+                    turnover_lambda=0.0,
+                    cash_reason="invalid-confidence-variance",
+                )
+                return ()
+
+    sector_of = {str(cs_ids[position]): sector[position] for position in range(cs_ids.size)}
+    adtv_of = {str(cs_ids[position]): float(adtv[position]) for position in range(cs_ids.size)}
+    vol_of = {str(cs_ids[position]): float(vol[position]) for position in ranked_positions}
+    priority_alpha_of: dict[str, float] = {}
+    if econ is not None:
+        priority_alpha_of = _prepared_priority_alpha_of(
+            selected_ids, incumbent_ids, econ, cs_ids
+        )
+
+    feasible = _portfolio_is_feasible(current_weights, sector_of, equity, policy)
+    if feasible:
+        ids_matrix = _prepared_return_matrix(
+            returns_window, market, selected_ids, policy.covariance_lookback_sessions
+        )
+        if ids_matrix is None:
+            raise PortfolioConstraintError("insufficient covariance data")
+        covariance = _shrinkage_covariance(ids_matrix)
+        allocations = _build_allocations(
+            selected_ids,
+            sector_of,
+            adtv_of,
+            vol_of,
+            current_weights,
+            equity,
+            pl.DataFrame(),
+            instruments,
+            policy,
+            priority_alpha_of=priority_alpha_of,
+            net_lower_bound_of=net_lower_bound_of,
+            decision_session=decision_session,
+            candidate_count=candidate_count,
+            ranked_count=ranked_count,
+            selected_count=selected_count,
+            covariance=covariance,
+        )
+    else:
+        allocations = _de_risk_allocations(
+            current_weights, sector_of, equity, instruments, policy
+        )
+
+    post_weights = {
+        allocation.instrument.instrument_id: allocation.target_value / equity
+        for allocation in allocations
+        if allocation.target_value > 0
+    }
+    post_covariance: np.ndarray | None = None
+    if post_weights:
+        post_matrix = _prepared_return_matrix(
+            returns_window, market, sorted(post_weights), policy.covariance_lookback_sessions
+        )
+        if post_matrix is None:
+            raise PortfolioConstraintError("insufficient covariance data")
+        post_covariance = _shrinkage_covariance(post_matrix)
+    _post_validate(
+        allocations, equity, policy, sector_of, adtv_of, pl.DataFrame(),
+        covariance=post_covariance,
+    )
+    return tuple(sorted(allocations, key=lambda a: a.instrument.instrument_id))
 
 
 @dataclass(frozen=True, slots=True)
@@ -552,6 +1006,7 @@ def _build_allocations(
     candidate_count: int = 0,
     ranked_count: int = 0,
     selected_count: int = 0,
+    covariance: np.ndarray | None = None,
 ) -> tuple[Allocation, ...]:
     if priority_alpha_of:
         raw_scores = {
@@ -574,7 +1029,9 @@ def _build_allocations(
 
     weights = _scale_sectors(weights, sector_of, policy.sector_cap)
     weights = _scale_gross(weights, policy.gross_cap)
-    weights = _scale_volatility(weights, panel, ids, policy)
+    weights = _scale_volatility(
+        weights, panel, ids, policy, covariance=covariance
+    )
 
     gross_before_compounding = sum(weights.values())
     compounding_applied = False
@@ -584,7 +1041,8 @@ def _build_allocations(
     if policy.compounding.enabled and net_lower_bound_of:
         confidence_scale, confidence_edge_h, confidence_variance_h, cash_reason = (
             _compounding_scale(
-                weights, net_lower_bound_of, panel, ids, policy
+                weights, net_lower_bound_of, panel, ids, policy,
+                covariance=covariance,
             )
         )
         if cash_reason is not None:
@@ -692,12 +1150,15 @@ def _scale_volatility(
     panel: pl.DataFrame,
     ids: list[str],
     policy: StockRiskPolicy,
+    *,
+    covariance: np.ndarray | None = None,
 ) -> dict[str, float]:
-    return_matrix = _return_matrix(panel, ids, policy.covariance_lookback_sessions)
-    if return_matrix is None:
-        raise PortfolioConstraintError("insufficient covariance data")
+    if covariance is None:
+        return_matrix = _return_matrix(panel, ids, policy.covariance_lookback_sessions)
+        if return_matrix is None:
+            raise PortfolioConstraintError("insufficient covariance data")
+        covariance = _shrinkage_covariance(return_matrix)
     vector = np.asarray([weights[instrument_id] for instrument_id in ids], dtype=float)
-    covariance = _shrinkage_covariance(return_matrix)
     portfolio_variance = float(vector @ covariance @ vector)
     if portfolio_variance <= 0.0 or not math.isfinite(portfolio_variance):
         return dict(weights)
@@ -712,6 +1173,8 @@ def _compounding_scale(
     panel: pl.DataFrame,
     ids: list[str],
     policy: StockRiskPolicy,
+    *,
+    covariance: np.ndarray | None = None,
 ) -> tuple[float, float, float, str | None]:
     """Return ``(scale, confidence_edge_h, confidence_variance_h, cash_reason)``.
 
@@ -734,10 +1197,11 @@ def _compounding_scale(
     confidence_edge_h = float(vector @ lower)
     if not math.isfinite(confidence_edge_h) or confidence_edge_h <= 0.0:
         return 0.0, confidence_edge_h, 0.0, "non-positive-confidence-edge"
-    return_matrix = _return_matrix(panel, ids, policy.covariance_lookback_sessions)
-    if return_matrix is None:
-        return 0.0, confidence_edge_h, float("nan"), "invalid-confidence-variance"
-    covariance = _shrinkage_covariance(return_matrix)
+    if covariance is None:
+        return_matrix = _return_matrix(panel, ids, policy.covariance_lookback_sessions)
+        if return_matrix is None:
+            return 0.0, confidence_edge_h, float("nan"), "invalid-confidence-variance"
+        covariance = _shrinkage_covariance(return_matrix)
     confidence_variance_h = horizon * float(vector @ covariance @ vector)
     if not math.isfinite(confidence_variance_h) or confidence_variance_h < 0.0:
         return 0.0, confidence_edge_h, confidence_variance_h, "invalid-confidence-variance"
@@ -912,6 +1376,8 @@ def _post_validate(
     sector_of: Mapping[str, object],
     adtv_of: Mapping[str, float],
     panel: pl.DataFrame,
+    *,
+    covariance: np.ndarray | None = None,
 ) -> None:
     total = sum(a.target_value for a in allocations)
     if total > equity * policy.gross_cap + _TOLERANCE:
@@ -941,10 +1407,11 @@ def _post_validate(
         if a.target_value > 0
     }
     if weights:
-        matrix = _return_matrix(panel, sorted(weights), policy.covariance_lookback_sessions)
-        if matrix is None:
-            raise PortfolioConstraintError("insufficient covariance data")
-        covariance = _shrinkage_covariance(matrix)
+        if covariance is None:
+            matrix = _return_matrix(panel, sorted(weights), policy.covariance_lookback_sessions)
+            if matrix is None:
+                raise PortfolioConstraintError("insufficient covariance data")
+            covariance = _shrinkage_covariance(matrix)
         vector = np.asarray([weights[i] for i in sorted(weights)], dtype=float)
         variance = float(vector @ covariance @ vector)
         forecast_vol = math.sqrt(max(variance, 0.0)) * math.sqrt(policy.annualization_sessions)
