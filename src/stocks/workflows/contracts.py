@@ -17,6 +17,8 @@ SUPPORTED_CANDIDATE_HORIZONS = (5, 10, 15)
 
 COMPUTE_PLAN_VERSION = "sub10-refit-v1"
 
+SELECTION_MULTIPLICITY_VERSION = "selection-multiplicity-raw-count-v1"
+
 
 @dataclass(frozen=True, slots=True)
 class TrainingRequest:
