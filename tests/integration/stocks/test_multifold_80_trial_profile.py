@@ -69,6 +69,28 @@ def test_multifold_80_trial_profile_completes_under_budget(tmp_path, monkeypatch
     assert payload["optuna_trials"] == _OPTUNA_TRIALS
     resource = payload["resource"]
     assert resource["n_terminal_trials"] == _OPTUNA_TRIALS
+    assert resource["total_terminal_screen_trials"] == _OPTUNA_TRIALS
+    assert resource["configured_compounding_policy_cells"] == 6
+    assert resource["selection_multiplicity_version"] == (
+        "selection-multiplicity-raw-count-v1"
+    )
+    assert payload["total_terminal_screen_trials"] == _OPTUNA_TRIALS
+    assert payload["configured_compounding_policy_cells"] == 6
+    assert payload["selection_multiplicity_version"] == (
+        "selection-multiplicity-raw-count-v1"
+    )
+    for row in resource["shortlist_candidate_evidence"]:
+        assert row["total_terminal_screen_trials"] == _OPTUNA_TRIALS
+        assert row["route_terminal_screen_trials"] == _OPTUNA_TRIALS // 3
+        assert row["configured_compounding_policy_cells"] == 6
+        assert row["selection_multiplicity_version"] == (
+            "selection-multiplicity-raw-count-v1"
+        )
+        assert row["policy_id"]
+        if row["replay_finite"]:
+            assert row["exact_compounding_policy_replays"] == 6
+        else:
+            assert row["exact_compounding_policy_replays"] < 6
     assert resource["peak_rss_mib"] <= _BUDGET_MIB
     assert resource["baseline_rss_mib"] > 0.0
     assert resource["trial_fold_timings_seconds"]
