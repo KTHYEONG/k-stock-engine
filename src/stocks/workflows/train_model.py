@@ -75,7 +75,11 @@ from src.stocks.trading.portfolio_constructor import (
     StockRiskPolicy,
     construct_target_allocations_prepared,
 )
-from src.stocks.workflows.contracts import COMPUTE_PLAN_VERSION, TrainingRequest
+from src.stocks.workflows.contracts import (
+    COMPUTE_PLAN_VERSION,
+    SELECTION_MULTIPLICITY_VERSION,
+    TrainingRequest,
+)
 from src.stocks.workflows.economic_selection import (
     SELECTION_POLICY_VERSION,
     ScreenFidelityPolicy,
@@ -620,6 +624,11 @@ class EconomicCandidateEvidence:
     legacy_daily_excess_lower_bound: float = 0.0
     replay_resource: dict[str, object] = field(default_factory=dict)
     compounding_overlay: dict[str, object] = field(default_factory=dict)
+    total_terminal_screen_trials: int = 0
+    route_terminal_screen_trials: int = 0
+    exact_compounding_policy_replays: int = 0
+    configured_compounding_policy_cells: int = 0
+    selection_multiplicity_version: str = ""
 
     def to_json_safe(self) -> dict[str, object]:
         """JSON-serializable evidence row with deterministic failure reasons."""
@@ -662,6 +671,15 @@ class EconomicCandidateEvidence:
             ),
             "replay_resource": dict(self.replay_resource or {}),
             "compounding_overlay": dict(self.compounding_overlay or {}),
+            "total_terminal_screen_trials": int(self.total_terminal_screen_trials),
+            "route_terminal_screen_trials": int(self.route_terminal_screen_trials),
+            "exact_compounding_policy_replays": int(
+                self.exact_compounding_policy_replays
+            ),
+            "configured_compounding_policy_cells": int(
+                self.configured_compounding_policy_cells
+            ),
+            "selection_multiplicity_version": str(self.selection_multiplicity_version),
         }
 
 
@@ -1418,6 +1436,7 @@ def _tune_champion(
     """
     LambdaRankConfig._tuning_telemetry = None
     per_route_trials = max(1, request.optuna_trials // len(route_specs))
+    total_terminal_screen_trials = per_route_trials * len(route_specs)
     guard = TrialResourceGuard(request, predictor_count=len(feature_columns) * 3)
     lgb_threads = _resolve_workflow_threads(request)
 
@@ -1437,6 +1456,7 @@ def _tune_champion(
     pruned_total = 0
     shortlisted_total = 0
     eligible_total = 0
+    replays_evaluated_total = 0
     best_screen_rank_ic: float | None = None
     screen_seconds_total = 0.0
     refit_seconds_total = 0.0
@@ -1634,6 +1654,7 @@ def _tune_champion(
             route_manifest, feature_columns, route, guard, dataset_manifest,
             registry, base_schedule, stress_schedule,
             terminal_trial_count=n_terminal,
+            total_terminal_screen_trials=total_terminal_screen_trials,
             policy=policy,
             proxy_best_iteration_by_trial={
                 trial.number: int(cast(int, trial.user_attrs.get("proxy_best_iteration", 0)))
@@ -1744,6 +1765,9 @@ def _tune_champion(
                 selection.get("early_rejected_full_refit_seconds", 0.0) if selection else 0.0,
             )
         )
+        replays_evaluated_total += int(
+            cast(int, selection.get("exact_compounding_policy_replays", 0)) if selection else 0
+        )
         route_attrs[str(route.horizon)] = dict(study.user_attrs)
 
         if champion is None or selection is None:
@@ -1767,10 +1791,14 @@ def _tune_champion(
         "per_route_trial_budget": per_route_trials,
         "selection_policy_version": SELECTION_POLICY_VERSION,
         "compute_plan_version": COMPUTE_PLAN_VERSION,
+        "selection_multiplicity_version": SELECTION_MULTIPLICITY_VERSION,
         "resolved_lgb_threads": lgb_threads,
         **guard.telemetry(),
         "n_terminal_trials": n_terminal_total,
         "optuna_trials": n_terminal_total,
+        "total_terminal_screen_trials": total_terminal_screen_trials,
+        "configured_compounding_policy_cells": len(_COMPOUNDING_POLICY_GRID),
+        "exact_compounding_policy_replays": replays_evaluated_total,
         "screened_trials": screened_total,
         "pruned_trials": pruned_total,
         "shortlisted_trials": shortlisted_total,
@@ -1876,6 +1904,10 @@ def _tune_champion(
         "promoted_trials",
         "early_rejected_full_refits",
         "compounding_policy_replays",
+        "total_terminal_screen_trials",
+        "route_terminal_screen_trials",
+        "configured_compounding_policy_cells",
+        "selection_multiplicity_version",
     ):
         if policy_key in winner_study.user_attrs:
             merged[policy_key] = winner_study.user_attrs[policy_key]
@@ -2662,6 +2694,11 @@ def _evaluate_economic_candidate(
     label_available_column: str = "",
     terminal_trial_count: int = 0,
     policy_id: str = "",
+    total_terminal_screen_trials: int = 0,
+    route_terminal_screen_trials: int = 0,
+    exact_compounding_policy_replays: int = 0,
+    configured_compounding_policy_cells: int = 0,
+    selection_multiplicity_version: str = "",
 ) -> EconomicCandidateEvidence:
     """Evaluate every economic predicate and emit immutable candidate evidence.
 
@@ -2751,6 +2788,11 @@ def _evaluate_economic_candidate(
         legacy_daily_excess_lower_bound=_inner_bootstrap_lower_bound(replay, request),
         replay_resource=dict(replay.replay_resource or {}),
         compounding_overlay=dict(replay.compounding_overlay or {}),
+        total_terminal_screen_trials=total_terminal_screen_trials,
+        route_terminal_screen_trials=route_terminal_screen_trials,
+        exact_compounding_policy_replays=exact_compounding_policy_replays,
+        configured_compounding_policy_cells=configured_compounding_policy_cells,
+        selection_multiplicity_version=selection_multiplicity_version,
     )
 
 
@@ -2819,6 +2861,7 @@ def _select_economic_champion(
     stress_schedule: CostSchedule,
     *,
     terminal_trial_count: int,
+    total_terminal_screen_trials: int = 0,
     policy: ScreenFidelityPolicy,
     proxy_best_iteration_by_trial: dict[int, int] | None = None,
     lgb_threads: int = 1,
@@ -2853,6 +2896,9 @@ def _select_economic_champion(
     replay_guard = ReplayResourceGuard(
         request, replay_mode=ReplayMode.INNER_SELECTION_BASE_ONLY
     )
+    route_terminal_screen_trials = terminal_trial_count
+    configured_compounding_policy_cells = len(_COMPOUNDING_POLICY_GRID)
+    exact_compounding_policy_replays = 0
     key_prefix = f"h{route.horizon}_"
     refit_started = time.perf_counter()
     candidate_rows: list[
@@ -2956,6 +3002,11 @@ def _select_economic_champion(
             replay_seconds, timings, lgb_threads,
             early_rejected_seconds, shortlist_evidence, fold0_ranked, finalists,
             replay_guard=replay_guard,
+            total_terminal_screen_trials=total_terminal_screen_trials,
+            route_terminal_screen_trials=route_terminal_screen_trials,
+            exact_compounding_policy_replays=exact_compounding_policy_replays,
+            configured_compounding_policy_cells=configured_compounding_policy_cells,
+            selection_multiplicity_version=SELECTION_MULTIPLICITY_VERSION,
         )
 
     fold_context.release()
@@ -2990,6 +3041,7 @@ def _select_economic_champion(
         causal_oos_ledger = _build_calibration_ledger(
             oos, tuning_panel, route.label_column, route.label_available_column,
         )
+        cell_replays: list[tuple[str, ReplayResult]] = []
         capacity_failed = False
         for growth_risk_aversion, turnover_budget in _COMPOUNDING_POLICY_GRID:
             if capacity_failed:
@@ -3036,10 +3088,27 @@ def _select_economic_champion(
                         "filled_orders": 0,
                         "replay_finite": False,
                         "replay_resource": replay_guard.telemetry(),
+                        "total_terminal_screen_trials": int(
+                            total_terminal_screen_trials
+                        ),
+                        "route_terminal_screen_trials": int(
+                            route_terminal_screen_trials
+                        ),
+                        "exact_compounding_policy_replays": len(cell_replays),
+                        "configured_compounding_policy_cells": int(
+                            configured_compounding_policy_cells
+                        ),
+                        "selection_multiplicity_version": str(
+                            SELECTION_MULTIPLICITY_VERSION
+                        ),
                     }
                 )
                 continue
             replay_seconds += time.perf_counter() - replay_started
+            cell_replays.append((policy_id, replay))
+        replays_for_trial = len(cell_replays)
+        exact_compounding_policy_replays += replays_for_trial
+        for policy_id, replay in cell_replays:
             evidence = _evaluate_economic_candidate(
                 fold_rank_ic, replay, request, trial_number, _screen_ic,
                 holding_horizon_sessions=route.horizon,
@@ -3048,6 +3117,11 @@ def _select_economic_champion(
                 label_available_column=route.label_available_column,
                 terminal_trial_count=terminal_trial_count,
                 policy_id=policy_id,
+                total_terminal_screen_trials=total_terminal_screen_trials,
+                route_terminal_screen_trials=route_terminal_screen_trials,
+                exact_compounding_policy_replays=replays_for_trial,
+                configured_compounding_policy_cells=configured_compounding_policy_cells,
+                selection_multiplicity_version=SELECTION_MULTIPLICITY_VERSION,
             )
             shortlist_evidence.append(evidence.to_json_safe())
             logger.info(
@@ -3096,6 +3170,11 @@ def _select_economic_champion(
         replay_seconds, timings, lgb_threads,
         early_rejected_seconds, shortlist_evidence, fold0_ranked, finalists,
         replay_guard=replay_guard,
+        total_terminal_screen_trials=total_terminal_screen_trials,
+        route_terminal_screen_trials=route_terminal_screen_trials,
+        exact_compounding_policy_replays=exact_compounding_policy_replays,
+        configured_compounding_policy_cells=configured_compounding_policy_cells,
+        selection_multiplicity_version=SELECTION_MULTIPLICITY_VERSION,
     )
     if not candidate_rows:
         return None, {
@@ -3147,6 +3226,11 @@ def _selection_telemetry(
     finalists: list[tuple[list[float], pl.DataFrame, int]],
     *,
     replay_guard: ReplayResourceGuard | None,
+    total_terminal_screen_trials: int = 0,
+    route_terminal_screen_trials: int = 0,
+    exact_compounding_policy_replays: int = 0,
+    configured_compounding_policy_cells: int = 0,
+    selection_multiplicity_version: str = "",
 ) -> dict[str, object]:
     """Route-qualified exclusive stage telemetry for one selection funnel.
 
@@ -3192,6 +3276,13 @@ def _selection_telemetry(
             key: (int(value) if value is not None else None)
             for key, value in best_iterations.items()
         },
+        "total_terminal_screen_trials": int(total_terminal_screen_trials),
+        "route_terminal_screen_trials": int(route_terminal_screen_trials),
+        "exact_compounding_policy_replays": int(exact_compounding_policy_replays),
+        "configured_compounding_policy_cells": int(
+            configured_compounding_policy_cells
+        ),
+        "selection_multiplicity_version": str(selection_multiplicity_version),
     }
 
 
@@ -4653,6 +4744,21 @@ def _publish_no_trade(
             "gates": {"passed": False},
             "optuna_trials": request.optuna_trials,
             "resource": tuning_telemetry or {},
+            "total_terminal_screen_trials": (tuning_telemetry or {}).get(
+                "total_terminal_screen_trials", 0
+            ),
+            "route_terminal_screen_trials": (tuning_telemetry or {}).get(
+                "route_terminal_screen_trials", 0
+            ),
+            "exact_compounding_policy_replays": (tuning_telemetry or {}).get(
+                "exact_compounding_policy_replays", 0
+            ),
+            "configured_compounding_policy_cells": (tuning_telemetry or {}).get(
+                "configured_compounding_policy_cells", 0
+            ),
+            "selection_multiplicity_version": (tuning_telemetry or {}).get(
+                "selection_multiplicity_version", ""
+            ),
         },
     )
     logger.info("published NO_TRADE artifact %s (%s)", request.artifact_id, reason)
@@ -4692,6 +4798,21 @@ def _build_metrics(
         "gates": gates,
         "optuna_trials": request.optuna_trials,
         "resource": tuning_telemetry or {},
+        "total_terminal_screen_trials": (tuning_telemetry or {}).get(
+            "total_terminal_screen_trials", 0
+        ),
+        "route_terminal_screen_trials": (tuning_telemetry or {}).get(
+            "route_terminal_screen_trials", 0
+        ),
+        "exact_compounding_policy_replays": (tuning_telemetry or {}).get(
+            "exact_compounding_policy_replays", 0
+        ),
+        "configured_compounding_policy_cells": (tuning_telemetry or {}).get(
+            "configured_compounding_policy_cells", 0
+        ),
+        "selection_multiplicity_version": (tuning_telemetry or {}).get(
+            "selection_multiplicity_version", ""
+        ),
         "replay_mode": replay.replay_mode,
         "replay_resource": replay.replay_resource or {},
         "prepared_decision_count": replay.prepared_decision_count,
