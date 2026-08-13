@@ -23,6 +23,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from dataclasses import replace as dataclass_replace
 from datetime import UTC, date, datetime
 from enum import StrEnum
 from hashlib import sha256
@@ -69,6 +70,7 @@ from src.stocks.research.lambdarank import (
 )
 from src.stocks.research.models import ModelManifest, StableRankComposite
 from src.stocks.trading.portfolio_constructor import (
+    CompoundingPolicyConfig,
     PreparedAllocationMarket,
     StockRiskPolicy,
     construct_target_allocations_prepared,
@@ -150,6 +152,45 @@ class PromotionRiskBudget:
 
 
 @dataclass(frozen=True, slots=True)
+class CompoundingEvidence:
+    """Holding-period-consistent compounding evidence for one replay.
+
+    ``block_log_excess`` is the ordered series of complete route-length
+    block log-excess wealth differences
+    ``sum(log1p(strategy)) - sum(log1p(benchmark))``. ``bootstrap_lower_bound``
+    is the seeded moving-block bootstrap (block length two rebalances) lower
+    confidence bound of that series; ``dsr_probability`` is the Deflated Sharpe
+    probability of the same series. ``complete_block_count`` and
+    ``rejected_block_count`` make the fail-closed boundary visible.
+    """
+
+    block_log_excess: list[float]
+    bootstrap_lower_bound: float
+    dsr_probability: float
+    complete_block_count: int
+    rejected_block_count: int
+
+
+_COMPOUNDING_POLICY_GRID: tuple[tuple[float, float], ...] = (
+    (0.5, 0.10),
+    (0.5, 0.20),
+    (1.0, 0.10),
+    (1.0, 0.20),
+    (2.0, 0.10),
+    (2.0, 0.20),
+)
+
+
+def _compounding_policy_id(
+    growth_risk_aversion: float,
+    turnover_budget: float,
+) -> str:
+    """Deterministic frozen-grid policy id ordered lexicographically by grid."""
+    index = _COMPOUNDING_POLICY_GRID.index((growth_risk_aversion, turnover_budget))
+    return f"{index}:ga{growth_risk_aversion:g}_tb{turnover_budget:g}"
+
+
+@dataclass(frozen=True, slots=True)
 class ReplayResult:
     """Event-ledger outcome used by the promotion gates."""
 
@@ -173,6 +214,9 @@ class ReplayResult:
     replay_mode: str | None = None
     replay_resource: dict[str, object] = field(default_factory=dict)
     prepared_decision_count: int = 0
+    decision_boundaries: list[int] = field(default_factory=list)
+    holding_horizon_sessions: int = 5
+    compounding_overlay: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -569,6 +613,12 @@ class EconomicCandidateEvidence:
     relevance_column: str = ""
     label_available_column: str = ""
     terminal_trial_count: int = 0
+    policy_id: str = ""
+    dsr_probability: float = 0.0
+    geometric_excess_growth: float = 0.0
+    compounding_block_count: int = 0
+    legacy_daily_excess_lower_bound: float = 0.0
+    replay_resource: dict[str, object] = field(default_factory=dict)
 
     def to_json_safe(self) -> dict[str, object]:
         """JSON-serializable evidence row with deterministic failure reasons."""
@@ -602,6 +652,14 @@ class EconomicCandidateEvidence:
             "relevance_column": str(self.relevance_column),
             "label_available_column": str(self.label_available_column),
             "terminal_trial_count": int(self.terminal_trial_count),
+            "policy_id": str(self.policy_id),
+            "dsr_probability": round(self.dsr_probability, 8),
+            "geometric_excess_growth": round(self.geometric_excess_growth, 8),
+            "compounding_block_count": int(self.compounding_block_count),
+            "legacy_daily_excess_lower_bound": round(
+                self.legacy_daily_excess_lower_bound, 8
+            ),
+            "replay_resource": dict(self.replay_resource or {}),
         }
 
 
@@ -1005,6 +1063,19 @@ def train_model(
 
     route = champion_route
     route_manifest = _route_manifest(base_manifest, route)
+    tuning_telemetry = getattr(champion_config, "_tuning_telemetry", None) or {}
+    selected_policy_id = str(tuning_telemetry.get("selected_policy_id", ""))
+    selected_growth_risk_aversion = float(
+        tuning_telemetry.get("selected_growth_risk_aversion", 1.0)
+    )
+    selected_turnover_budget = float(
+        tuning_telemetry.get("selected_turnover_budget", 0.20)
+    )
+    selected_compounding = (
+        CompoundingPolicyConfig(growth_risk_aversion=selected_growth_risk_aversion)
+        if selected_policy_id
+        else None
+    )
     splitter = PurgedWalkForward(
         n_folds=request.n_folds,
         label_horizon_sessions=route.label_span_sessions,
@@ -1042,6 +1113,8 @@ def train_model(
     replay_context = _prepare_replay_static_context(
         training_panel, request, holding_horizon_sessions=route.horizon,
         guard=replay_guard,
+        turnover_budget=selected_turnover_budget,
+        compounding=selected_compounding,
     )
     prepared_route = PreparedSelectionRoute.build(
         training_panel,
@@ -1085,6 +1158,9 @@ def train_model(
         label_span_sessions=route.label_span_sessions,
         label_available_column=route.label_available_column,
         holding_horizon_sessions=route.horizon,
+        selected_policy_id=selected_policy_id,
+        compounding=selected_compounding,
+        turnover_budget=selected_turnover_budget,
     )
     reasons.append(holdout_reason)
     passed = bool(gates["passed"]) and holdout_ok and bool(fold_rank_ic)
@@ -1344,7 +1420,13 @@ def _tune_champion(
     lgb_threads = _resolve_workflow_threads(request)
 
     route_champions: list[
-        tuple[tuple[float, ...], int, RouteSpec, optuna.Study, LambdaRankConfig]
+        tuple[
+            tuple[float, float, float, float, float, float, int, int, str],
+            int,
+            RouteSpec,
+            optuna.Study,
+            LambdaRankConfig,
+        ]
     ] = []
     route_attrs: dict[str, dict[str, object]] = {}
     shortlist_evidence_all: list[dict[str, object]] = []
@@ -1565,7 +1647,7 @@ def _tune_champion(
                 {
                     "route_horizon": route.horizon,
                     "promotion_width": policy.promotion_width,
-                    "finalist_width": policy.finalist_width,
+                    "economic_finalist_width": policy.economic_finalist_width,
                     "selected_trial_number": selection.get("selected_trial_number"),
                     "promoted_trials": selection.get("promoted_trials"),
                     "all_positive_finalists": selection.get("all_positive_finalists"),
@@ -1665,13 +1747,15 @@ def _tune_champion(
         if champion is None or selection is None:
             continue
         key = (
-            float(cast(float, selection["selected_inner_bootstrap_lower_bound"])),
-            float(cast(float, selection["selected_inner_strategy_ir"])),
+            float(cast(float, selection["selected_inner_compounding_lower_bound"])),
+            float(cast(float, selection["selected_inner_dsr_probability"])),
+            float(cast(float, selection["selected_inner_geometric_excess_growth"])),
             -float(cast(float, selection["selected_inner_max_drawdown"])),
             -float(cast(float, selection["selected_inner_turnover"])),
             float(cast(float, selection["selected_inner_median_rank_ic"])),
             -route.horizon,
             -int(cast(int, selection["selected_trial_number"])),
+            str(cast(str, selection["selected_policy_id"])),
         )
         route_champions.append((key, n_terminal, route, study, champion))
 
@@ -1710,7 +1794,7 @@ def _tune_champion(
         "route_budget",
         "proxy_session_stride",
         "promotion_width",
-        "finalist_width",
+        "economic_finalist_width",
         "fold_count",
         "all_positive_finalists",
         "promoted_trials",
@@ -1784,11 +1868,12 @@ def _tune_champion(
         "route_budget",
         "proxy_session_stride",
         "promotion_width",
-        "finalist_width",
+        "economic_finalist_width",
         "fold_count",
         "all_positive_finalists",
         "promoted_trials",
         "early_rejected_full_refits",
+        "compounding_policy_replays",
     ):
         if policy_key in winner_study.user_attrs:
             merged[policy_key] = winner_study.user_attrs[policy_key]
@@ -2505,6 +2590,8 @@ def _prepare_replay_static_context(
     *,
     holding_horizon_sessions: int = 5,
     guard: ReplayResourceGuard | None = None,
+    turnover_budget: float | None = None,
+    compounding: CompoundingPolicyConfig | None = None,
 ) -> ReplayStaticContext:
     """Build the candidate-invariant replay inputs once per selection panel.
 
@@ -2512,8 +2599,10 @@ def _prepare_replay_static_context(
     columns and the causal 20-session ADTV), instrument map, and risk policy
     are shared by every shortlisted candidate. ``holding_horizon_sessions``
     fixes the policy's rebalance cadence so a route replays at its own session
-    frequency. Raises ``ValueError`` for a missing required replay column or a
-    non-finite cached market input.
+    frequency. ``turnover_budget`` and ``compounding`` override the frozen risk
+    policy so a selected compounding grid cell replays unchanged. Raises
+    ``ValueError`` for a missing required replay column or a non-finite cached
+    market input.
     """
     from src.stocks.backtesting.engine import REQUIRED_BACKTEST_COLUMNS
 
@@ -2536,6 +2625,8 @@ def _prepare_replay_static_context(
         single_name_cap=request.max_single_weight,
         participation_limit=request.participation_limit,
         rebalance_frequency_sessions=holding_horizon_sessions,
+        turnover_budget=turnover_budget if turnover_budget is not None else 0.20,
+        compounding=compounding if compounding is not None else CompoundingPolicyConfig(),
     )
     return ReplayStaticContext(
         market_index=market_index,
@@ -2551,6 +2642,8 @@ _ECONOMIC_FAILURE_CODES = (
     "no_filled_orders",
     "non_finite_replay",
     "non_positive_bootstrap_lower_bound",
+    "dsr_below_threshold",
+    "replay_capacity_exceeded",
 )
 
 
@@ -2566,12 +2659,17 @@ def _evaluate_economic_candidate(
     relevance_column: str = "",
     label_available_column: str = "",
     terminal_trial_count: int = 0,
+    policy_id: str = "",
 ) -> EconomicCandidateEvidence:
     """Evaluate every economic predicate and emit immutable candidate evidence.
 
-    All five predicates are evaluated without early return so the exact failed
-    reason codes stay recoverable for every shortlisted trial. ``eligible``
-    matches the existing fail-closed ``_economically_eligible`` rule exactly.
+    All predicates are evaluated without early return so the exact failed
+    reason codes stay recoverable for every shortlisted (trial, policy) replay.
+    ``eligible`` requires positive Rank-IC folds, attempted and filled orders,
+    a finite replay, a strictly positive holding-period block-log compounding
+    bootstrap lower bound, and a Deflated Sharpe probability at or above the
+    frozen risk-budget threshold. The legacy daily arithmetic excess bootstrap
+    is retained only as ``legacy_daily_excess_lower_bound`` diagnostic.
     """
     failures: list[str] = []
     if not fold_rank_ic or not all(ic > 0.0 for ic in fold_rank_ic):
@@ -2583,9 +2681,22 @@ def _evaluate_economic_candidate(
     replay_finite = _replay_is_finite(replay)
     if not replay_finite:
         failures.append("non_finite_replay")
-    bootstrap_lower_bound = _inner_bootstrap_lower_bound(replay, request)
+    budget = PromotionRiskBudget()
+    compounding = _compounding_evidence(
+        replay.strategy_returns,
+        replay.benchmark_returns,
+        replay.decision_boundaries,
+        holding_horizon_sessions,
+        request,
+        budget,
+        terminal_trial_count,
+    )
+    bootstrap_lower_bound = compounding.bootstrap_lower_bound
     if bootstrap_lower_bound <= 0.0:
         failures.append("non_positive_bootstrap_lower_bound")
+    dsr_probability = compounding.dsr_probability
+    if dsr_probability < budget.deflated_sharpe_probability:
+        failures.append("dsr_below_threshold")
     calibration_evidence = replay.calibration_evidence or {}
     return EconomicCandidateEvidence(
         trial_number=trial_number,
@@ -2627,6 +2738,16 @@ def _evaluate_economic_candidate(
         relevance_column=relevance_column,
         label_available_column=label_available_column,
         terminal_trial_count=terminal_trial_count,
+        policy_id=policy_id,
+        dsr_probability=dsr_probability,
+        geometric_excess_growth=(
+            float(np.mean(compounding.block_log_excess))
+            if compounding.block_log_excess
+            else 0.0
+        ),
+        compounding_block_count=compounding.complete_block_count,
+        legacy_daily_excess_lower_bound=_inner_bootstrap_lower_bound(replay, request),
+        replay_resource=dict(replay.replay_resource or {}),
     )
 
 
@@ -2700,25 +2821,29 @@ def _select_economic_champion(
     lgb_threads: int = 1,
     timings: _SelectionTimings | None = None,
 ) -> tuple[LambdaRankConfig | None, dict[str, object] | None]:
-    """Promote, refit, and exactly replay the route's single finalist.
+    """Promote, refit, and exactly replay the route's two economic finalists.
 
     The promoted ``shortlist`` (already limited to ``policy.promotion_width``)
     is full-refit on fold 0 with an adaptive continuation budget derived from
     each candidate's proxy screen best iteration and ranked by
-    ``(-full_fold0_ic, -proxy_ic, trial_number)``. Exactly one candidate is
-    then refit over the remaining folds (materialized lazily one at a time) and
-    runs the exact event ledger. A non-positive fold or a failed replay is
-    never backfilled: the route has no champion, which is intentionally
-    conservative in the financial sense. The normal 81/3/3 profile therefore
-    performs ``policy.promotion_width + (fold_count - 1)`` full-refit folds and
-    at most one economic replay per route. Replay inputs are built only after
-    the finalist passes every fold and every LightGBM fold context and booster
-    is released, so replay and training caches never overlap. An eligible
-    finalist becomes the route's only champion candidate; the cross-route
-    champion sort still uses ``(bootstrap lower bound, strategy IR, -max
-    drawdown, -turnover, median Rank-IC, -holding horizon, -trial number)``.
-    Returns ``(config, selection telemetry)`` or ``(None, None)`` when no
-    promoted candidate survives the funnel.
+    ``(-full_fold0_ic, -proxy_ic, trial_number)``. Up to
+    ``policy.economic_finalist_width`` all-positive candidates are then refit
+    over the remaining folds and each is replayed through the exact event
+    ledger under the frozen six-policy
+    ``(growth_risk_aversion, turnover_budget)`` grid. A non-positive fold or a
+    failed replay is never backfilled: a route without an eligible finalist has
+    no champion, which is intentionally conservative in the financial sense.
+    Replay inputs are built once per route and reused; only the candidate score
+    overlay and the per-cell risk policy differ. ``ReplayResourceGuard`` admits
+    and releases every replay, and a capacity failure makes that candidate
+    ineligible rather than permitting an unguarded replay. Only candidates
+    with positive Rank-IC folds, actual fills, a finite replay, a strictly
+    positive block-log compounding bootstrap lower bound, and a Deflated
+    Sharpe probability at or above the frozen threshold are ordered by
+    ``(compounding lower bound, DSR probability, geometric excess growth,
+    -max drawdown, -turnover, median Rank-IC, -holding horizon, -trial number,
+    policy id)``. Returns ``(config, selection telemetry)`` or ``(None, None)``
+    when no promoted candidate survives the funnel.
     """
     if not shortlist:
         return None, None
@@ -2727,9 +2852,19 @@ def _select_economic_champion(
     )
     key_prefix = f"h{route.horizon}_"
     refit_started = time.perf_counter()
-    candidate_rows: list[tuple[tuple[float, ...], int]] = []
-    evidence_by_trial: dict[int, dict[str, float]] = {}
-    calibration_state_by_trial: dict[int, dict[str, object] | None] = {}
+    candidate_rows: list[
+        tuple[
+            tuple[float, float, float, float, float, float, int, int, str],
+            tuple[int, str],
+        ]
+    ] = []
+    best_cell_by_trial: dict[
+        int,
+        tuple[
+            tuple[float, float, float, float, float, float, int, int, str],
+            EconomicCandidateEvidence,
+        ],
+    ] = {}
     shortlist_evidence: list[dict[str, object]] = []
     early_rejected_seconds: list[float] = []
     replay_seconds = 0.0
@@ -2769,7 +2904,7 @@ def _select_economic_champion(
     fold0_ranked.sort(key=lambda row: (-row[0], -row[1], row[2]))
     finalists: list[tuple[list[float], pl.DataFrame, int]] = []
     for fold0_ic, _screen_ic, trial_number, full_refit_config, oos0 in fold0_ranked:
-        if len(finalists) >= policy.finalist_width:
+        if len(finalists) >= policy.economic_finalist_width:
             break
         initial_rounds = adaptive_refit_rounds(proxy_best_by_trial.get(trial_number))
         if not remaining_indices:
@@ -2849,78 +2984,102 @@ def _select_economic_champion(
 
     for fold_rank_ic, oos, trial_number in finalists:
         _screen_ic = screen_ic_by_trial[trial_number]
-        replay_started = time.perf_counter()
         causal_oos_ledger = _build_calibration_ledger(
             oos, tuning_panel, route.label_column, route.label_available_column,
         )
-        try:
-            replay = _event_ledger_evaluation(
-                tuning_panel, oos, request, dataset_manifest, registry,
-                base_schedule, stress_schedule, replay_context=replay_context,
-                calibration_ledger=causal_oos_ledger,
+        capacity_failed = False
+        for growth_risk_aversion, turnover_budget in _COMPOUNDING_POLICY_GRID:
+            if capacity_failed:
+                break
+            policy_id = _compounding_policy_id(growth_risk_aversion, turnover_budget)
+            replay_started = time.perf_counter()
+            cell_policy = dataclass_replace(
+                replay_context.policy,
+                turnover_budget=turnover_budget,
+                compounding=CompoundingPolicyConfig(
+                    growth_risk_aversion=growth_risk_aversion
+                ),
+            )
+            cell_context = dataclass_replace(
+                replay_context, policy=cell_policy
+            )
+            try:
+                replay = _event_ledger_evaluation(
+                    tuning_panel, oos, request, dataset_manifest, registry,
+                    base_schedule, stress_schedule, replay_context=cell_context,
+                    calibration_ledger=causal_oos_ledger,
+                    holding_horizon_sessions=route.horizon,
+                    label_column=route.label_column,
+                    label_available_column=route.label_available_column,
+                    replay_mode=ReplayMode.INNER_SELECTION_BASE_ONLY,
+                    replay_guard=replay_guard,
+                    prepared_route=prepared_route,
+                )
+            except TrainingCapacityError as exc:
+                replay_guard.capacity_failure_reason = "replay_capacity_exceeded"
+                replay_seconds += time.perf_counter() - replay_started
+                capacity_failed = True
+                logger.warning(
+                    "[EVAL] trial=%s policy=%s stage=replay_capacity_exceeded %s",
+                    trial_number, policy_id, exc,
+                )
+                shortlist_evidence.append(
+                    {
+                        "trial_number": int(trial_number),
+                        "policy_id": policy_id,
+                        "eligible": False,
+                        "failure_reasons": ["replay_capacity_exceeded"],
+                        "attempted_orders": 0,
+                        "filled_orders": 0,
+                        "replay_finite": False,
+                        "replay_resource": replay_guard.telemetry(),
+                    }
+                )
+                continue
+            replay_seconds += time.perf_counter() - replay_started
+            evidence = _evaluate_economic_candidate(
+                fold_rank_ic, replay, request, trial_number, _screen_ic,
                 holding_horizon_sessions=route.horizon,
                 label_column=route.label_column,
+                relevance_column=route.relevance_column,
                 label_available_column=route.label_available_column,
-                replay_mode=ReplayMode.INNER_SELECTION_BASE_ONLY,
-                replay_guard=replay_guard,
-                prepared_route=prepared_route,
+                terminal_trial_count=terminal_trial_count,
+                policy_id=policy_id,
             )
-        except TrainingCapacityError as exc:
-            replay_guard.capacity_failure_reason = "replay_capacity_exceeded"
-            replay_seconds += time.perf_counter() - replay_started
-            logger.warning(
-                "[EVAL] trial=%s stage=replay_capacity_exceeded %s",
-                trial_number, exc,
-            )
-            continue
-        replay_seconds += time.perf_counter() - replay_started
-        evidence = _evaluate_economic_candidate(
-            fold_rank_ic, replay, request, trial_number, _screen_ic,
-            holding_horizon_sessions=route.horizon,
-            label_column=route.label_column,
-            relevance_column=route.relevance_column,
-            label_available_column=route.label_available_column,
-            terminal_trial_count=terminal_trial_count,
-        )
-        shortlist_evidence.append(evidence.to_json_safe())
-        logger.info(
-            "[EVAL] trial=%s stage=evidence eligible=%s failure_reasons=%s",
-            trial_number,
-            evidence.eligible,
-            list(evidence.failure_reasons),
-        )
-        if not evidence.eligible:
-            continue
-        candidate_rows.append(
-            (
-                (
-                    evidence.bootstrap_lower_bound,
-                    evidence.strategy_ir,
-                    -evidence.max_drawdown,
-                    -evidence.turnover,
-                    evidence.median_rank_ic,
-                    -route.horizon,
-                    -trial_number,
-                ),
+            shortlist_evidence.append(evidence.to_json_safe())
+            logger.info(
+                "[EVAL] trial=%s policy=%s stage=evidence eligible=%s failure_reasons=%s",
                 trial_number,
+                policy_id,
+                evidence.eligible,
+                list(evidence.failure_reasons),
             )
-        )
-        evidence_by_trial[trial_number] = {
-            "bootstrap_lower_bound": evidence.bootstrap_lower_bound,
-            "strategy_ir": evidence.strategy_ir,
-            "max_drawdown": evidence.max_drawdown,
-            "turnover": evidence.turnover,
-            "median_rank_ic": evidence.median_rank_ic,
-            "holding_horizon_sessions": route.horizon,
-        }
-        calibration_state_by_trial[trial_number] = evidence.calibration_state
-        logger.info(
-            "[EVAL] trial=%s stage=economically_eligible "
-            "bootstrap_lower_bound=%.8f strategy_ir=%.6f",
-            trial_number,
-            evidence.bootstrap_lower_bound,
-            evidence.strategy_ir,
-        )
+            if not evidence.eligible:
+                continue
+            cell_key = (
+                evidence.bootstrap_lower_bound,
+                evidence.dsr_probability,
+                evidence.geometric_excess_growth,
+                -evidence.max_drawdown,
+                -evidence.turnover,
+                evidence.median_rank_ic,
+                -route.horizon,
+                -trial_number,
+                policy_id,
+            )
+            candidate_rows.append((cell_key, (trial_number, policy_id)))
+            current_best = best_cell_by_trial.get(trial_number)
+            if current_best is None or cell_key > current_best[0]:
+                best_cell_by_trial[trial_number] = (cell_key, evidence)
+            logger.info(
+                "[EVAL] trial=%s policy=%s stage=economically_eligible "
+                "compounding_lower_bound=%.8f dsr_probability=%.6f",
+                trial_number,
+                policy_id,
+                evidence.bootstrap_lower_bound,
+                evidence.dsr_probability,
+            )
+        gc.collect()
     refit_seconds = time.perf_counter() - refit_started
     logger.info(
         "[SYS] route=%sd stage=shortlist elapsed_ms=%.1f rss=%.1f",
@@ -2941,21 +3100,36 @@ def _select_economic_champion(
             **selection_tail,
         }
     candidate_rows.sort(key=lambda row: row[0], reverse=True)
-    _winner_key, winner_number = candidate_rows[0]
+    _winner_key, (winner_number, winner_policy_id) = candidate_rows[0]
     champion = _config_from_params(
         dict(study.trials[winner_number].params), num_threads=lgb_threads
     )
-    winner_calibration_state = calibration_state_by_trial.get(winner_number)
+    _winner_cell_key, winner_evidence = best_cell_by_trial[int(winner_number)]
+    winner_calibration_state = winner_evidence.calibration_state
     if winner_calibration_state is not None:
         champion._calibration_state = dict(winner_calibration_state)
+    selected_policy = next(
+        (cell for cell in _COMPOUNDING_POLICY_GRID
+         if _compounding_policy_id(cell[0], cell[1]) == winner_policy_id),
+        _COMPOUNDING_POLICY_GRID[0],
+    )
+    selected_growth_risk_aversion, selected_turnover_budget = selected_policy
     return champion, {
         "economically_eligible_trials": len(candidate_rows),
         "selected_trial_number": winner_number,
-        **{
-            f"selected_inner_{name}": value
-            for name, value in evidence_by_trial[winner_number].items()
-        },
+        "selected_policy_id": winner_policy_id,
+        "selected_growth_risk_aversion": float(selected_growth_risk_aversion),
+        "selected_turnover_budget": float(selected_turnover_budget),
+        "selected_inner_compounding_lower_bound": winner_evidence.bootstrap_lower_bound,
+        "selected_inner_dsr_probability": winner_evidence.dsr_probability,
+        "selected_inner_geometric_excess_growth": winner_evidence.geometric_excess_growth,
+        "selected_inner_max_drawdown": winner_evidence.max_drawdown,
+        "selected_inner_turnover": winner_evidence.turnover,
+        "selected_inner_median_rank_ic": winner_evidence.median_rank_ic,
+        "selected_inner_strategy_ir": winner_evidence.strategy_ir,
+        "selected_inner_holding_horizon_sessions": winner_evidence.holding_horizon_sessions,
         "selected_calibration_state": winner_calibration_state,
+        "compounding_policy_replays": shortlist_evidence,
         **selection_tail,
     }
 
@@ -3167,6 +3341,7 @@ def _event_ledger_evaluation(
     frame = replay_context.market_index
     instruments = replay_context.instruments
     policy = replay_context.policy
+    policy.compounding_evidence.clear()
 
     if prepared_route is not None:
         overlay, allocation_overlay = prepared_route.scatter_overlays(oos_scored)
@@ -3545,6 +3720,24 @@ def _event_ledger_evaluation(
         replay_resource = replay_guard.telemetry()
         if session_cluster_schedule is not None:
             replay_resource.update(session_cluster_schedule.telemetry())
+    overlay_records = list(policy.compounding_evidence)
+    scales = [
+        float(cast(float, record["confidence_scale"]))
+        for record in overlay_records
+        if record.get("confidence_scale") is not None
+    ]
+    cash_reasons = Counter(
+        str(record["cash_reason"])
+        for record in overlay_records
+        if record.get("cash_reason") is not None
+    )
+    compounding_overlay = {
+        "decision_count": len(overlay_records),
+        "mean_confidence_scale": float(np.mean(scales)) if scales else 0.0,
+        "cash_count": sum(cash_reasons.values()),
+        "cash_reasons": dict(sorted(cash_reasons.items())),
+        "records": overlay_records,
+    }
     return ReplayResult(
         ledger=tuple(result.ledger),
         trades=tuple(result.trades),
@@ -3568,6 +3761,9 @@ def _event_ledger_evaluation(
         replay_mode=replay_mode.value,
         replay_resource=replay_resource,
         prepared_decision_count=backtester.prepared_decision_count,
+        decision_boundaries=list(decision_indices),
+        holding_horizon_sessions=int(holding_horizon_sessions),
+        compounding_overlay=compounding_overlay,
     )
 
 
@@ -3791,6 +3987,87 @@ def _reject_non_finite_economic_inputs(frame: pl.DataFrame) -> None:
                 raise ValueError(f"non-finite economic input in {column}")
 
 
+def _compounding_evidence(
+    strategy_returns: list[float],
+    benchmark_returns: list[float],
+    decision_boundaries: list[int],
+    holding_horizon_sessions: int,
+    request: TrainingRequest,
+    budget: PromotionRiskBudget,
+    n_trials: int,
+) -> CompoundingEvidence:
+    """Build holding-period-consistent compounding evidence.
+
+    The aligned daily return series are split into complete route-length
+    intervals of ``holding_horizon_sessions`` consecutive returns anchored at
+    ``decision_boundaries`` (defaulting to a uniform cadence from index zero).
+    For every complete interval the block log-excess wealth difference
+    ``sum(log1p(strategy)) - sum(log1p(benchmark))`` is computed; an interval
+    with a non-finite value or a return ``<= -1`` is rejected, not clipped.
+    Incomplete leading/trailing intervals are dropped and fewer than three
+    complete blocks fail closed to a zero lower bound and zero DSR probability.
+    The seeded moving-block bootstrap (block length two rebalances) yields the
+    lower bound, and Deflated Sharpe is applied to the same block series.
+    """
+    horizon = max(1, int(holding_horizon_sessions))
+    common = min(len(strategy_returns), len(benchmark_returns))
+    boundaries = sorted(
+        int(boundary)
+        for boundary in decision_boundaries
+        if 0 <= int(boundary) < common
+    )
+    if not boundaries:
+        boundaries = list(range(0, common - horizon + 1, horizon))
+    blocks: list[float] = []
+    rejected = 0
+    for start in boundaries:
+        if start + horizon > common:
+            continue
+        strat = strategy_returns[start : start + horizon]
+        bench = benchmark_returns[start : start + horizon]
+        strat_simple = [math.expm1(float(value)) for value in strat]
+        bench_simple = [math.expm1(float(value)) for value in bench]
+        if (
+            not all(math.isfinite(float(value)) for value in strat_simple)
+            or not all(math.isfinite(float(value)) for value in bench_simple)
+            or any(value <= -1.0 for value in strat_simple)
+            or any(value <= -1.0 for value in bench_simple)
+        ):
+            rejected += 1
+            continue
+        block_excess = sum(math.log1p(value) for value in strat_simple) - sum(
+            math.log1p(value) for value in bench_simple
+        )
+        blocks.append(float(block_excess))
+    if len(blocks) < 3:
+        return CompoundingEvidence(
+            block_log_excess=[],
+            bootstrap_lower_bound=0.0,
+            dsr_probability=0.0,
+            complete_block_count=0,
+            rejected_block_count=rejected,
+        )
+    lower_bound = _moving_block_bootstrap_lower_bound(
+        blocks,
+        block_length=2,
+        n_bootstrap=max(request.n_bootstrap, 2),
+        seed=request.seed,
+        alpha=budget.bootstrap_alpha,
+    )
+    dsr_probability = _deflated_sharpe_probability(
+        blocks,
+        annualization=252,
+        n_trials=n_trials,
+    )
+    return CompoundingEvidence(
+        block_log_excess=blocks,
+        bootstrap_lower_bound=lower_bound,
+        dsr_probability=dsr_probability,
+        complete_block_count=len(blocks),
+        rejected_block_count=rejected,
+    )
+
+
 def _moving_block_bootstrap_lower_bound(
     values: list[float],
     block_length: int,
@@ -3824,7 +4101,12 @@ def _evaluate_gates(
     """Lexicographic fail-closed promotion gates over the event ledger.
 
     A replay with zero attempted orders is evidence-incomplete and must fail
-    promotion instead of being read as a flat strategy.
+    promotion instead of being read as a flat strategy. Gate 2 requires a
+    strictly positive moving-block bootstrap lower bound of complete
+    holding-period block log-excess returns, and Gate 5 evaluates Deflated
+    Sharpe on that same block series with the supplied terminal trial count.
+    The legacy daily arithmetic excess bootstrap survives only as the
+    ``legacy_daily_excess_lower_bound`` diagnostic.
     """
     reasons: list[str] = []
     passed = True
@@ -3849,21 +4131,33 @@ def _evaluate_gates(
     else:
         reasons.append(f"filled_orders={replay.filled_orders}")
 
-    excess = replay.excess_returns
-    lower_bound = (
+    compounding = _compounding_evidence(
+        replay.strategy_returns,
+        replay.benchmark_returns,
+        replay.decision_boundaries,
+        replay.holding_horizon_sessions,
+        request,
+        budget,
+        n_trials,
+    )
+    lower_bound = compounding.bootstrap_lower_bound
+    gate2_ok = lower_bound > 0.0
+    reasons.append(f"gate2_compounding_lower_bound={lower_bound:.8f}")
+    reasons.append(f"gate2_compounding_block_count={compounding.complete_block_count}")
+    passed = passed and gate2_ok
+
+    legacy_daily = (
         _moving_block_bootstrap_lower_bound(
-            excess,
+            replay.excess_returns,
             max(5, 1),
             max(request.n_bootstrap, 2),
             request.seed,
             budget.bootstrap_alpha,
         )
-        if excess
+        if replay.excess_returns
         else 0.0
     )
-    gate2_ok = lower_bound > 0.0
-    reasons.append(f"gate2_excess_lower_bound={lower_bound:.8f}")
-    passed = passed and gate2_ok
+    reasons.append(f"legacy_daily_excess_lower_bound={legacy_daily:.8f}")
 
     strategy_returns = replay.strategy_returns
     benchmark_returns = replay.benchmark_returns
@@ -3892,11 +4186,7 @@ def _evaluate_gates(
     reasons.append(f"gate4_benchmark_total_return={benchmark_total:.8f}")
     passed = passed and gate4_ok
 
-    deflated_prob = _deflated_sharpe_probability(
-        strategy_returns,
-        annualization=252,
-        n_trials=n_trials,
-    )
+    deflated_prob = compounding.dsr_probability
     gate5_ok = deflated_prob >= budget.deflated_sharpe_probability
     reasons.append(f"gate5_deflated_sharpe_probability={deflated_prob:.6f}")
     passed = passed and gate5_ok
@@ -4068,13 +4358,18 @@ def _evaluate_forward_holdout(
     label_span_sessions: int = 6,
     label_available_column: str = LABEL_AVAILABLE_COLUMN,
     holding_horizon_sessions: int = 5,
+    selected_policy_id: str = "",
+    compounding: CompoundingPolicyConfig | None = None,
+    turnover_budget: float | None = None,
 ) -> tuple[bool, str, dict[str, object] | None]:
     """Fit the frozen candidate on pre-holdout data and replay the block once.
 
     The holdout block is the same newest ``holdout_sessions`` pinned by
     ``_reserve_forward_holdout``, but the fold is rebuilt with the route's
     ``label_span_sessions`` purge/embargo so a 10/15-day route never trains on
-    a label that overlaps the holdout decisions. Returns ``(ready, reason,
+    a label that overlaps the holdout decisions. The selected compounding
+    policy id and risk fields bind the holdout fingerprint and evidence, and
+    the frozen policy is replayed unchanged. Returns ``(ready, reason,
     evidence)``. A candidate fingerprint may inspect the holdout exactly once;
     a reused fingerprint raises ``ValueError``. Incomplete data leaves the
     candidate ``NO_TRADE`` with ``forward_holdout_ready=false``.
@@ -4116,6 +4411,7 @@ def _evaluate_forward_holdout(
     fingerprint = _forward_holdout_fingerprint(
         base_manifest, request, dataset_manifest, holdout_session_range,
         champion_config, base_schedule, stress_schedule, holding_horizon_sessions,
+        selected_policy=selected_policy_id,
     )
     existing = registry.read_forward_holdout(request.artifact_id)
     if existing is not None and existing.get("fingerprint") == fingerprint:
@@ -4136,6 +4432,8 @@ def _evaluate_forward_holdout(
     replay_context = _prepare_replay_static_context(
         panel, request, holding_horizon_sessions=holding_horizon_sessions,
         guard=replay_guard,
+        turnover_budget=turnover_budget,
+        compounding=compounding,
     )
     prepared_route = PreparedSelectionRoute.build(
         panel,
@@ -4171,6 +4469,19 @@ def _evaluate_forward_holdout(
         return False, "gate8_forward_holdout_ready=false:no-attempted-orders", None
     if replay.filled_orders <= 0:
         return False, "gate8_forward_holdout_ready=false:no-filled-orders", None
+    risk_policy: dict[str, object] = {
+        name: getattr(request, name)
+        for name in (
+            "top_k",
+            "max_exposure",
+            "max_single_weight",
+            "participation_limit",
+        )
+    }
+    if turnover_budget is not None:
+        risk_policy["turnover_budget"] = float(turnover_budget)
+    if compounding is not None:
+        risk_policy["growth_risk_aversion"] = float(compounding.growth_risk_aversion)
     evidence: dict[str, object] = {
         "feature_schema_hash": base_manifest.feature_schema_hash,
         "universe_policy_hash": base_manifest.universe_policy_hash,
@@ -4180,15 +4491,8 @@ def _evaluate_forward_holdout(
         "holding_horizon_sessions": holding_horizon_sessions,
         "label_column": label_column,
         "label_available_column": label_available_column,
-        "risk_policy": {
-            name: getattr(request, name)
-            for name in (
-                "top_k",
-                "max_exposure",
-                "max_single_weight",
-                "participation_limit",
-            )
-        },
+        "selected_policy_id": selected_policy_id,
+        "risk_policy": risk_policy,
         "cost_schedules": (base_schedule.name, stress_schedule.name),
         "seed": request.seed,
         "planned_cycles": replay.planned_cycles,
@@ -4211,6 +4515,7 @@ def _forward_holdout_fingerprint(
     base_schedule: CostSchedule,
     stress_schedule: CostSchedule,
     holding_horizon_sessions: int = 5,
+    selected_policy: str = "",
 ) -> str:
     """SHA-256 identity binding one forward-holdout evaluation to its inputs."""
     config_fields = "|".join(
@@ -4232,6 +4537,7 @@ def _forward_holdout_fingerprint(
             stress_schedule.name,
             str(request.seed),
             f"holding_horizon_sessions={holding_horizon_sessions}",
+            f"selected_policy={selected_policy}",
         )
     )
     return sha256(key.encode("utf-8")).hexdigest()
@@ -4346,4 +4652,6 @@ def _build_metrics(
         "replay_mode": replay.replay_mode,
         "replay_resource": replay.replay_resource or {},
         "prepared_decision_count": replay.prepared_decision_count,
+        "compounding_overlay": replay.compounding_overlay,
+        "selected_policy_id": (tuning_telemetry or {}).get("selected_policy_id"),
     }

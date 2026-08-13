@@ -157,3 +157,57 @@
 - [Metrics](../../data/artifacts/stocks/lambdarank_v2_20260813_execution_recovery/metrics.json)
 - [Manifest](../../data/artifacts/stocks/lambdarank_v2_20260813_execution_recovery/manifest.json)
 - [Execution log](../../logs/scratch/execution_recovery_train_20260813.log)
+
+---
+
+# Compounding selection policy 동기화 후 검증 결과
+
+## 실행 검증
+
+| 항목 | 값 |
+|---|---:|
+| 실행일 | 2026-08-13 |
+| 전체 테스트 | **643 passed** |
+| 정책 버전 | `economic-selection-v3-compounding` |
+| 경제 finalist 폭 | `2` |
+| Ruff / mypy | `PASS / PASS` |
+| ADR | `ADR_20260813_STOCK_COMPOUNDING_POLICY_SYNC` |
+
+구버전 `economic-selection-v2-proxy-one-finalist`를 기대하던 81-trial 통합
+테스트를 현재 v3 정책(`economic_finalist_width=2`)에 맞춰 동기화했다. 이
+변경은 테스트·문서의 정책 식별자만 정정한 것이며, promotion threshold나
+fail-closed 조건은 완화하지 않았다.
+
+## 백테스트 판정
+
+| 항목 | 값 |
+|---|---:|
+| 체결 | **1,737 / 1,737** |
+| Base 누적수익률 | **82.90%** |
+| Stress 누적수익률 | **82.61%** |
+| Benchmark 누적수익률 | **15.97%** |
+| `promoted` | `false` |
+| `no_trade` | `true` |
+
+### 쉽게 읽는 결론
+
+1. **주문 실행 문제는 해결됐다.** 계획된 주문 1,737건이 모두 체결되어,
+   “신호는 있으나 체결이 0건”인 이전 장애는 재현되지 않았다.
+2. **겉보기 수익률은 좋다.** Base와 Stress 모두 benchmark보다 높고, 비용을
+   반영한 Stress에서도 누적수익률이 82.61%였다.
+3. **그래도 자동 승격은 거부됐다.** Gate 2는 비용·시계열 변동성을 반영한
+   초과수익 bootstrap 하한을 검사하는데 `-0.00017155`로 0보다 작았다.
+   관측된 평균 성과가 우연이 아니라고 확신할 수 없다는 뜻이다.
+4. **모델의 순위 예측력과 자산증식은 다른 문제다.** 모든 outer fold의
+   Rank-IC는 양수였지만, 개별 종목 순위를 실제 포트폴리오로 바꾸는 과정의
+   회전율·상관위험·현금 구간을 거친 뒤 안정적인 복리 초과성장이 입증되지
+   않았다.
+5. **추가로 DSR도 부족하다.** Deflated Sharpe probability가 `0.661712`로
+   요구치 `0.95`보다 낮아, 81개 후보를 탐색한 뒤 선택된 결과의
+   multiple-testing 위험도 통과하지 못했다.
+
+따라서 이번 결과는 “실행 가능한 전략이며 역사적 누적수익률은 높다”까지
+확인한 것이고, “새 데이터에서도 자산을 안정적으로 증식할 전략으로
+승격할 수 있다”는 증거는 아니다. 레이블 데이터가 `2026-02-10`에서 끝나
+2026-03-10 이후 252개 label-available 세션을 아직 제공하지 못하므로,
+forward holdout 역시 성숙할 때까지 `NO_TRADE`가 유지된다.

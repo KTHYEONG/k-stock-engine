@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_COMPOUNDING_POLICY_SYNC",
+      "date": "2026-08-13",
+      "adr_id": "ADR_20260813_STOCK_COMPOUNDING_POLICY_SYNC",
+      "domain": "stocks",
+      "title": "Compounding selection policy contract synchronization",
+      "why": "The active v3 compounding selection policy changed the economic finalist contract, leaving the 81-trial integration assertion pinned to the retired v2 one-finalist policy.",
+      "resolution": "Updated the integration profile to assert economic-selection-v3-compounding and economic_finalist_width=2, then verified the six-policy compounding selection and full regression suite.",
+      "impact": "Test provenance now matches the active deterministic selection policy; no promotion thresholds or fail-closed behavior were relaxed."
+    },
+    {
       "task_id": "backtest_execution_recovery",
       "date": "2026-08-13",
       "adr_id": "ADR_20260813_backtest_execution_recovery",
