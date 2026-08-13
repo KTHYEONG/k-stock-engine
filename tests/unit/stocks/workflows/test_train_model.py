@@ -2812,3 +2812,163 @@ def test_forward_holdout_fingerprint_changes_with_selected_policy() -> None:
     )
     assert first == third
     assert first != second
+
+
+def test_economic_candidate_evidence_search_ledger_reconciliation() -> None:
+    from src.stocks.workflows.train_model import (
+        EconomicCandidateEvidence,
+        _evaluate_economic_candidate,
+    )
+
+    request = TrainingRequest(artifact_id="ledger_fields", n_bootstrap=2)
+    replay = _positive_replay(
+        attempted_orders=2,
+        filled_orders=1,
+        excess_returns=[0.001, 0.001],
+        metrics={"max_drawdown": 0.0, "turnover": 0.0},
+        final_value=1.0,
+        base_total_return=0.0,
+        benchmark_total_return=0.0,
+        stress_total_return=0.0,
+    )
+    evidence = _evaluate_economic_candidate(
+        [0.01],
+        replay,
+        request,
+        1,
+        0.02,
+        terminal_trial_count=27,
+        policy_id="5:ga2_tb0.2",
+        total_terminal_screen_trials=81,
+        route_terminal_screen_trials=27,
+        exact_compounding_policy_replays=6,
+        configured_compounding_policy_cells=6,
+        selection_multiplicity_version="selection-multiplicity-raw-count-v1",
+    )
+    assert isinstance(evidence, EconomicCandidateEvidence)
+    assert evidence.eligible is True
+    assert evidence.total_terminal_screen_trials == 81
+    assert evidence.route_terminal_screen_trials == 27
+    assert evidence.exact_compounding_policy_replays == 6
+    assert evidence.configured_compounding_policy_cells == 6
+    row = evidence.to_json_safe()
+    assert row["total_terminal_screen_trials"] == 81
+    assert row["route_terminal_screen_trials"] == 27
+    assert row["exact_compounding_policy_replays"] == 6
+    assert row["configured_compounding_policy_cells"] == 6
+    assert row["selection_multiplicity_version"] == (
+        "selection-multiplicity-raw-count-v1"
+    )
+    assert row["terminal_trial_count"] == 27
+    assert row["policy_id"] == "5:ga2_tb0.2"
+    assert row["total_terminal_screen_trials"] == row["route_terminal_screen_trials"] * 3
+    json.dumps(row)
+
+
+def test_tuning_emits_reconciled_search_ledger(monkeypatch, tmp_path) -> None:
+    _route_tune_mocks(monkeypatch)
+    request = _multi_route_request("route_ledger")
+    panel = _route_test_panel()
+    config, _n_trials, route = tm._tune_champion(
+        panel,
+        request,
+        _tune_base_manifest(
+            "route_ledger", stock_v2_manifest(columns=panel.columns), "residual_o2o_5d"
+        ),
+        tuple(c for c in panel.columns if c.startswith("feature__")),
+        (
+            tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),
+            tm.RouteSpec(10, "residual_o2o_10d", "relevance_10d", "label_available_time_10d"),
+        ),
+        dataset_manifest=stock_v2_manifest(columns=panel.columns),
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    assert config is not None
+    assert route is not None
+    telemetry = config._tuning_telemetry
+    assert telemetry["total_terminal_screen_trials"] == 4
+    assert telemetry["n_terminal_trials"] == 4
+    assert telemetry["route_terminal_screen_trials"] == 2
+    assert telemetry["configured_compounding_policy_cells"] == 6
+    assert telemetry["exact_compounding_policy_replays"] == 24
+    assert telemetry["selection_multiplicity_version"] == (
+        "selection-multiplicity-raw-count-v1"
+    )
+    for row in telemetry["shortlist_candidate_evidence"]:
+        assert row["total_terminal_screen_trials"] == 4
+        assert row["route_terminal_screen_trials"] == 2
+        assert row["exact_compounding_policy_replays"] == 6
+        assert row["configured_compounding_policy_cells"] == 6
+        assert row["selection_multiplicity_version"] == (
+            "selection-multiplicity-raw-count-v1"
+        )
+        assert row["policy_id"]
+    for attrs in telemetry["routes"].values():
+        assert attrs["route_terminal_screen_trials"] == 2
+        assert attrs["total_terminal_screen_trials"] == 4
+
+
+def test_no_eligible_run_emits_complete_search_ledger(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(tm, "_MIN_TRAIN_SESSIONS", 40)
+    monkeypatch.setattr(tm, "_VALIDATION_BLOCK_SESSIONS", 30)
+
+    df = stock_v2_composed_df(n_sessions=140, n_tickers=20)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    label_span = (manifest.label_horizon_sessions or 1) + 1
+    folds = tm.PurgedWalkForward(
+        n_folds=3,
+        label_horizon_sessions=label_span,
+        embargo_sessions=5,
+        session_column="session_index",
+        validation_window_sessions=30,
+        min_train_sessions=40,
+    ).split(panel)
+
+    monkeypatch.setattr(tm, "_fit_stable_contexts", _fake_fold_contexts)
+    monkeypatch.setattr(tm, "_score_trial_fold", lambda *_a, **_kw: 0.01)
+    monkeypatch.setattr(tm, "_fit_and_score_candidate", _fold_aware_refit())
+    monkeypatch.setattr(
+        tm,
+        "_event_ledger_evaluation",
+        lambda *_a, **_kw: _positive_replay(strategy_returns=[0.001] * 60),
+    )
+
+    request = TrainingRequest(
+        artifact_id="no_eligible_ledger", n_folds=3, optuna_trials=3
+    )
+    config, n_trials, _route = tm._tune_champion(
+        panel[folds[0].train_mask],
+        request,
+        _tune_base_manifest("no_eligible_ledger", manifest, manifest.label_definition),
+        tuple(c for c in df.columns if c.startswith("feature__")),
+        (tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),),
+        dataset_manifest=manifest,
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    assert config is None
+    assert n_trials == request.optuna_trials
+    telemetry = tm.LambdaRankConfig._tuning_telemetry
+    assert telemetry["selection_status"] == "no_economically_eligible_candidate"
+    assert telemetry["total_terminal_screen_trials"] == 3
+    assert telemetry["n_terminal_trials"] == 3
+    assert telemetry["configured_compounding_policy_cells"] == 6
+    assert telemetry["exact_compounding_policy_replays"] == 12
+    assert telemetry["selection_multiplicity_version"] == (
+        "selection-multiplicity-raw-count-v1"
+    )
+    route_attrs = telemetry["routes"]["5"]
+    assert route_attrs["route_terminal_screen_trials"] == 3
+    assert route_attrs["total_terminal_screen_trials"] == 3
+    for row in telemetry["shortlist_candidate_evidence"]:
+        assert row["total_terminal_screen_trials"] == 3
+        assert row["route_terminal_screen_trials"] == 3
+        assert row["exact_compounding_policy_replays"] == 6
+        assert row["configured_compounding_policy_cells"] == 6
+        assert row["selection_multiplicity_version"] == (
+            "selection-multiplicity-raw-count-v1"
+        )
