@@ -344,6 +344,10 @@
     "testing": "tests/unit/stocks/cli/test_build_research_v2.py"
   },
   "src/stocks/workflows/economic_selection.py": {
-    "testing": "tests/unit/stocks/workflows/test_economic_selection.py"
+    "testing": [
+      "tests/unit/stocks/workflows/test_economic_selection.py",
+      "tests/unit/stocks/trading/test_portfolio_constructor.py"
+    ],
+    "architecture": "docs/results/back-res.md"
   }
 }
