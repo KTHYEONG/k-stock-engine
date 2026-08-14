@@ -298,3 +298,98 @@ def feature_readiness_dataset(root: Path) -> Path:
         decision_time=datetime(2026, 1, 1, tzinfo=UTC),
         content_manifest={"curation_version": "curation-v1"},
     )
+
+
+def stock_net_alpha_composed_df(
+    n_sessions: int = 100,
+    n_tickers: int = 8,
+    candidate_horizon_sessions: tuple[int, ...] = (3, 5, 8, 10, 15, 20),
+    seed: int = 11,
+) -> pl.DataFrame:
+    """Deterministic composed net-alpha panel: raw sources + per-horizon labels.
+
+    Every row carries the canonical ``stock_net_alpha_v1`` raw source columns
+    (by raw name, so ``build_model_features`` can canonicalize them), the
+    ``net_alpha_<h>d_target`` continuous label for every candidate horizon, and
+    the exact exit-open ``label_available_time_<h>d`` availability columns the
+    trainer gates on.
+    """
+    rng = np.random.default_rng(seed)
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    rows: list[dict] = []
+    for t in range(n_tickers):
+        for s in range(n_sessions):
+            obs = start + timedelta(days=s)
+            momentum = float(rng.normal(0.0, 1.0))
+            rows.append(
+                {
+                    "session_index": s,
+                    "session": obs,
+                    "instrument_id": f"KRX:0{t + 1:05d}",
+                    "observation_time": obs.replace(hour=15, minute=30, tzinfo=UTC),
+                    "available_time": obs.replace(hour=15, minute=31, tzinfo=UTC),
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.0,
+                    "close": 100.5,
+                    "volume": 1_000_000.0,
+                    "trading_value": 100.5 * 1_000_000.0,
+                    "market_cap": 1.0e11,
+                    "sector": f"S{t % 4}",
+                    "adtv": 1.0e8,
+                    "beta": 1.0,
+                    "volatility": 0.02,
+                    "ep_ratio": float(rng.normal(0.0, 1.0)),
+                    "bp_ratio": float(rng.normal(0.0, 1.0)),
+                    "overnight_ret": momentum,
+                    "intraday_ret": -momentum,
+                    "ret_2_5d": momentum * 0.5,
+                    "ret_6_20d": momentum * 0.3,
+                    "ret_21_60d": momentum * 0.2,
+                    "close_high_ratio_10d": momentum * 0.4,
+                    "relative_trend_score": momentum * 0.6,
+                    "sector_ret_5d": momentum * 0.1,
+                    "disparity_120d": momentum * 0.7,
+                    "foreign_net_buy": float(rng.normal(0.0, 1.0)),
+                    "institution_net_buy": float(rng.normal(0.0, 1.0)),
+                    "individual_net_buy": float(rng.normal(0.0, 1.0)),
+                    "flow_consensus": float(rng.normal(0.0, 1.0)),
+                    "flow_intensity_20d": float(rng.normal(0.0, 1.0)),
+                    "volume_shock": float(rng.normal(0.0, 1.0)),
+                    "vpt_20d": float(rng.normal(0.0, 1.0)),
+                    "info_ratio_20d": float(rng.normal(0.0, 1.0)),
+                    "vol_asymmetry_20d": float(rng.normal(0.0, 1.0)),
+                    "mcap_rank": float(t) / n_tickers,
+                    "min_vol_5d": float(rng.normal(0.02, 0.005)),
+                    "volatility_20d": float(rng.normal(0.02, 0.005)),
+                    "volatility_60d": float(rng.normal(0.02, 0.005)),
+                    "vol_regime": float(rng.normal(0.0, 1.0)),
+                    "adtv_20d": 1.0e8,
+                    "turnover_ratio": float(rng.normal(0.01, 0.001)),
+                    "amihud_20d": float(rng.normal(1.0e-9, 1.0e-10)),
+                    "fluc_rate": float(rng.normal(0.02, 0.005)),
+                }
+            )
+    frame = pl.DataFrame(rows)
+    for horizon in candidate_horizon_sessions:
+        target = (
+            pl.col("overnight_ret") * 0.02 - pl.col("intraday_ret") * 0.01
+        ).alias(f"net_alpha_{horizon}d_target")
+        available = (pl.col("session") + pl.duration(days=horizon)).alias(
+            f"label_available_time_{horizon}d"
+        )
+        frame = frame.with_columns(target, available)
+    return frame
+
+
+def stock_net_alpha_manifest(
+    columns: list[str] | None = None,
+    horizon: int = 5,
+    decision_time: datetime | None = None,
+) -> DatasetManifest:
+    return stock_manifest(
+        columns=columns,
+        feature_set="stock_net_alpha_v1",
+        horizon=horizon,
+        decision_time=decision_time,
+    )

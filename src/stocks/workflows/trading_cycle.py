@@ -156,6 +156,7 @@ def run_trading_cycle(
         else build_features(gated, phase1_allowlist())
     )
     scored = loaded.model.predict(feature_frame)
+    scored = _adapt_score_column(scored, manifest.feature_set)
     if scored.is_empty():
         return _no_trade_result(request, manifest, portfolio, dataset_hash, "empty-scored-panel")
 
@@ -378,3 +379,20 @@ def _fingerprints(
         "cost_hash": manifest.cost_source_hash,
         "risk_policy_hash": sha256(policy_fields.encode("utf-8")).hexdigest(),
     }
+
+
+def _adapt_score_column(
+    scored: pl.DataFrame, feature_set: str
+) -> pl.DataFrame:
+    """Adapter: canonical net-alpha score column -> domain ``pred_score``.
+
+    The shared domain constructor (``portfolio_constructor``) consumes
+    ``pred_score``; net-alpha models emit ``predicted_net_alpha``. The mapping
+    is applied only at the workflow boundary so the domain code stays
+    net-alpha-independent.
+    """
+    if feature_set != "stock_net_alpha_v1":
+        return scored
+    if "predicted_net_alpha" in scored.columns and "pred_score" not in scored.columns:
+        return scored.rename({"predicted_net_alpha": "pred_score"})
+    return scored
