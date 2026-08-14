@@ -5,36 +5,38 @@ from datetime import UTC, datetime
 
 import pytest
 
-from src.stocks.workflows.contracts import SimulationRequest, TrainingRequest
+from src.stocks.ml.contracts import NetAlphaTrainingRequest
+from src.stocks.workflows.contracts import SimulationRequest
 
 
 def test_training_request_defaults_are_explicit() -> None:
-    request = TrainingRequest(artifact_id="v1")
-    assert request.n_folds == 3
+    request = NetAlphaTrainingRequest(artifact_id="v1")
+    assert request.fold_count == 3
     assert request.seed == 42
-    assert request.holdout_sessions == 0
-    assert request.optuna_trials == 80
+    assert request.forward_holdout_sessions == 0
+    assert request.candidate_horizon_sessions == (3, 5, 8, 10, 15, 20)
     assert request.max_rss_mib is None
+    assert request.model_threads == 1
 
 
-def test_training_request_validates_trial_and_budget_inputs() -> None:
-    with pytest.raises(ValueError, match="optuna_trials must be positive"):
-        TrainingRequest(artifact_id="v1", optuna_trials=0)
-    with pytest.raises(ValueError, match="optuna_trials must be positive"):
-        TrainingRequest(artifact_id="v1", optuna_trials=-3)
+def test_training_request_validates_inputs() -> None:
+    with pytest.raises(ValueError, match="model_threads must be positive"):
+        NetAlphaTrainingRequest(artifact_id="v1", model_threads=0)
     with pytest.raises(ValueError, match="max_rss_mib must be positive"):
-        TrainingRequest(artifact_id="v1", max_rss_mib=0)
+        NetAlphaTrainingRequest(artifact_id="v1", max_rss_mib=0)
     with pytest.raises(ValueError, match="max_rss_mib must be positive"):
-        TrainingRequest(artifact_id="v1", max_rss_mib=-5)
-    with pytest.raises(ValueError, match="lgb_threads must be positive"):
-        TrainingRequest(artifact_id="v1", lgb_threads=0)
-    with pytest.raises(ValueError, match="lgb_threads must be positive"):
-        TrainingRequest(artifact_id="v1", lgb_threads=-2)
-    request = TrainingRequest(artifact_id="v1", optuna_trials=120, max_rss_mib=4096)
-    assert request.optuna_trials == 120
+        NetAlphaTrainingRequest(artifact_id="v1", max_rss_mib=-5)
+    with pytest.raises(ValueError, match="candidate_horizon_sessions must be non-empty"):
+        NetAlphaTrainingRequest(artifact_id="v1", candidate_horizon_sessions=())
+    with pytest.raises(ValueError, match="candidate_horizon_sessions must be strictly ascending"):
+        NetAlphaTrainingRequest(artifact_id="v1", candidate_horizon_sessions=(5, 3))
+    request = NetAlphaTrainingRequest(artifact_id="v1", model_threads=2, max_rss_mib=4096)
+    assert request.model_threads == 2
     assert request.max_rss_mib == 4096
-    assert request.lgb_threads is None
-    assert TrainingRequest(artifact_id="v1", lgb_threads=4).lgb_threads == 4
+    assert not hasattr(request, "optuna_trials")
+    assert not hasattr(request, "lgb_threads")
+    assert not hasattr(request, "run_root")
+    assert not hasattr(request, "resume")
 
 
 def test_simulation_request_carries_policy_inputs() -> None:
