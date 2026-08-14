@@ -163,3 +163,88 @@ def test_apply_v2_transforms_emits_rank_sector_rank_and_missing_indicators() -> 
     assert rank_x[2] == pytest.approx(0.5)
     assert rank_x[4] == pytest.approx(0.5)
     assert transformed["feature__x__rank"].dtype == pl.Float32
+
+
+def test_apply_v3_transforms_excludes_non_alpha_and_emits_rank_sector_rank() -> None:
+    from src.stocks.research.features import apply_v3_transforms
+
+    frame = pl.DataFrame(
+        {
+            "session": [
+                datetime(2024, 1, 1, tzinfo=UTC),
+                datetime(2024, 1, 1, tzinfo=UTC),
+                datetime(2024, 1, 1, tzinfo=UTC),
+                datetime(2024, 1, 2, tzinfo=UTC),
+                datetime(2024, 1, 2, tzinfo=UTC),
+                datetime(2024, 1, 2, tzinfo=UTC),
+            ],
+            "sector": ["S1", "S1", "S2", "S1", "S1", "S2"],
+            "momentum": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            "volatility": [0.2, 0.3, 0.1, 0.4, 0.5, 0.3],
+            "adtv": [1.0e9, 2.0e9, 3.0e9, 4.0e9, 5.0e9, 6.0e9],
+        }
+    )
+    roles = {"momentum": "ALPHA", "volatility": "RISK", "adtv": "LIQUIDITY"}
+    transformed, learner_columns = apply_v3_transforms(frame, roles)
+    # RISK/LIQUIDITY sources never enter the learner.
+    assert "momentum__rank" in learner_columns
+    assert "momentum__sector_rank" in learner_columns
+    assert not any("volatility" in c or "adtv" in c for c in learner_columns)
+    assert not any(c.startswith(("volatility", "adtv")) for c in transformed.columns)
+
+
+def test_apply_v3_transforms_rejects_invalid_roles() -> None:
+    from src.stocks.research.features import apply_v3_transforms
+
+    frame = pl.DataFrame(
+        {
+            "session": [datetime(2024, 1, 1, tzinfo=UTC)] * 3,
+            "sector": ["S1"] * 3,
+            "momentum": [1.0, 2.0, 3.0],
+        }
+    )
+    with pytest.raises(ValueError, match="one of"):
+        apply_v3_transforms(frame, {"momentum": "SIGNAL"})
+
+
+def test_apply_v3_transforms_missing_flag_only_for_mixed_sources() -> None:
+    from src.stocks.research.features import apply_v3_transforms
+
+    frame = pl.DataFrame(
+        {
+            "session": [datetime(2024, 1, 1, tzinfo=UTC)] * 6,
+            "sector": ["S1"] * 6,
+            "mixed": [1.0, None, 3.0, 0.5, 2.0, None],
+            "complete": [3.0, 2.0, 1.0, 4.0, 0.5, 2.5],
+        }
+    )
+    transformed, learner_columns = apply_v3_transforms(
+        frame, {"mixed": "ALPHA", "complete": "ALPHA"}
+    )
+    assert "mixed__missing" in learner_columns
+    assert "complete__missing" not in learner_columns
+    assert transformed["mixed__missing"].to_list() == [0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+
+
+def test_apply_v3_transforms_clusters_exact_rank_equivalent_sources() -> None:
+    from src.stocks.research.features import apply_v3_transforms
+
+    frame = pl.DataFrame(
+        {
+            "session": [datetime(2024, 1, 1, tzinfo=UTC)] * 8
+            + [datetime(2024, 1, 2, tzinfo=UTC)] * 8,
+            "sector": ["S1"] * 16,
+            "disparity": [float(i % 8) for i in range(16)],
+            "trend_rank": [float(i % 8) for i in range(16)],
+            "independent": [float((i * 7 + 3) % 11) for i in range(16)],
+        }
+    )
+    transformed, learner_columns = apply_v3_transforms(
+        frame,
+        {"trend_rank": "ALPHA", "disparity": "ALPHA", "independent": "ALPHA"},
+    )
+    # disparity == trend_rank exactly, so only the lexicographically first
+    # canonical source survives with its rank/sector-rank predictors.
+    assert "disparity__rank" in learner_columns
+    assert "trend_rank__rank" not in learner_columns
+    assert "independent__rank" in learner_columns

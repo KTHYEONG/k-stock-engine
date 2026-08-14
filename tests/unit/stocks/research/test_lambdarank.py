@@ -101,6 +101,15 @@ def test_blend_weight_validation_and_manifest_provenance() -> None:
     assert LambdaRankConfig(lambdarank_weight=0.5).candidate_family == "blend_50"
     assert LambdaRankConfig(lambdarank_weight=0.75).candidate_family == "blend_75"
 
+
+def test_structural_num_leaves_max_depth_invariant() -> None:
+    with pytest.raises(ValueError, match="2\\*\\*max_depth"):
+        LambdaRankConfig(num_leaves=17, max_depth=4)
+    with pytest.raises(ValueError, match="max_depth"):
+        LambdaRankConfig(max_depth=0)
+    config = LambdaRankConfig(num_leaves=16, max_depth=4)
+    assert config.num_leaves == 16
+
     df = build_panel()
     feature_columns = v2_feature_columns(df)
     train = df.filter(pl.col("session_index") < 30)

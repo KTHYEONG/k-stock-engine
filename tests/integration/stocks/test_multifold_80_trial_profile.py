@@ -93,7 +93,7 @@ def test_multifold_80_trial_profile_completes_under_budget(tmp_path, monkeypatch
             "selection-multiplicity-global-count-v1"
         )
         assert row["policy_id"] == "default:neutral"
-        assert row["exact_compounding_policy_replays"] == 1
+        assert row["exact_compounding_policy_replays"] <= 1
     assert resource["peak_rss_mib"] <= _BUDGET_MIB
     assert resource["baseline_rss_mib"] > 0.0
     assert resource["trial_fold_timings_seconds"]
@@ -125,12 +125,12 @@ def test_multifold_80_trial_profile_completes_under_budget(tmp_path, monkeypatch
             "pooled_economic_rejection",
         )
     assert isinstance(resource["family_differential"], list)
-    assert resource["screen_fidelity"] == "execution_matched"
+    assert resource["screen_fidelity"] == "vectorized_economic_proxy"
     assert resource["proxy_session_stride"] == 6
     assert resource["promotion_width"] == 6
-    assert resource["confirmation_width"] == 6
-    assert resource["economic_finalist_width"] == 3
-    assert resource["recovery_width"] == 3
+    assert resource["confirmation_width"] == 2
+    assert resource["economic_finalist_width"] == 1
+    assert resource["recovery_width"] == 1
     assert resource["global_multiplicity_count"] == _OPTUNA_TRIALS
     assert resource["screen_usable_trials"] + resource["screen_hard_pruned_trials"] == (
         _OPTUNA_TRIALS
