@@ -355,5 +355,8 @@
       "tests/unit/stocks/trading/test_portfolio_constructor.py"
     ],
     "architecture": "docs/results/back-res.md"
+  },
+  "src/stocks/research/lambdarank.py": {
+    "testing": "tests/unit/stocks/research/test_lambdarank.py"
   }
 }
