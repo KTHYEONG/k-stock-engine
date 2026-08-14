@@ -4154,6 +4154,8 @@ def _select_economic_champion(
     if timings is not None:
         timings.replay_prepare_seconds += time.perf_counter() - replay_started
 
+    transfer_labels = _transfer_label_frame(tuning_panel, route.label_column)
+
     for fold_rank_ic, oos, trial_number in finalists:
         _screen_lb = screen_lb_by_trial[trial_number]
         causal_oos_ledger = _build_calibration_ledger(
@@ -4225,7 +4227,7 @@ def _select_economic_champion(
             configured_compounding_policy_cells=configured_compounding_policy_cells,
             selection_multiplicity_version=SELECTION_MULTIPLICITY_VERSION,
             oos_scored=oos if not oos.is_empty() else None,
-            panel=tuning_panel,
+            panel=transfer_labels,
             top_k=request.top_k,
         )
         shortlist_evidence.append(evidence.to_json_safe())
@@ -5544,6 +5546,27 @@ def _reject_duplicate_keys(frame: pl.DataFrame, label: str) -> None:
         )
 
 
+def _transfer_label_frame(
+    panel: pl.DataFrame,
+    label_column: str,
+) -> pl.DataFrame:
+    """Compact, deduplicated label frame for economic-transfer diagnostics.
+
+    Projects ``panel`` to the four columns the diagnostic needs (``session``,
+    ``instrument_id``, ``label_column``, and the resolved availability column)
+    BEFORE any duplicate-key check, so the full panel is never ``group_by``'d or
+    re-materialized per finalist. Projection preserves ``(session,
+    instrument_id)`` rows 1:1, so duplicate detection and inner-join results are
+    identical to operating on the full panel.
+    """
+    availability_column = _resolve_label_available_column(panel, label_column)
+    label_frame = panel.select(
+        "session", "instrument_id", label_column, availability_column
+    )
+    _reject_duplicate_keys(label_frame, "panel")
+    return label_frame
+
+
 def _economic_transfer_evidence(
     oos_scored: pl.DataFrame,
     panel: pl.DataFrame,
@@ -5583,11 +5606,9 @@ def _economic_transfer_evidence(
         raise ValueError("panel must carry " + ", ".join(missing_panel))
     availability_column = _resolve_label_available_column(panel, label_column)
     _reject_duplicate_keys(oos_scored, "oos_scored")
-    _reject_duplicate_keys(panel, "panel")
+    label_frame = _transfer_label_frame(panel, label_column)
     joined = oos_scored.select("session", "instrument_id", "pred_score").join(
-        panel.select(
-            "session", "instrument_id", label_column, availability_column
-        ),
+        label_frame,
         on=["session", "instrument_id"],
         how="inner",
     )

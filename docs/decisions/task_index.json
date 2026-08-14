@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_SELECTION_MEMORY_FIX",
+      "date": "2026-08-14",
+      "adr_id": "ADR_20260814_STOCK_SELECTION_MEMORY_FIX",
+      "domain": "stocks",
+      "title": "Selection-phase full-panel join OOM recovery",
+      "why": "Post compounding-growth-v1, the 81-trial run died silently after trial 26 (h5 screen) inside _select_economic_champion. study_h5.db showed confirmation attrs written but selection/guard attrs absent; sync_run succeeded only because all_positive_finalists=0 skipped the finalist path. The 8fe74d4 _economic_transfer_evidence still did the full-panel join/group_by that ADR_20260814_STOCK_COMPOUNDING_TELEMETRY_OPT blamed for the screen-phase OOM.",
+      "resolution": "Added _transfer_label_frame(panel, label_column) that projects to the four label columns before any duplicate-key check, so the full tuning panel is never group_by'd or re-materialized per finalist. Wired it into _economic_transfer_evidence (replacing _reject_duplicate_keys(panel) + inline panel.select) and into _select_economic_champion (compact frame built once, passed as panel= instead of tuning_panel). Output is byte-identical (projection preserves (session, instrument_id) 1:1).",
+      "impact": "Removes the selection-phase OOM anti-pattern; the 81-trial run can now reach phase_selection and publish CAGR/MDD/DSR artifacts. Diagnostic parity preserved; gates/objectives/DSR multiplicity unchanged."
+    },
+    {
       "task_id": "TASK_STOCK_COMPOUNDING_TELEMETRY_OPT",
       "date": "2026-08-14",
       "adr_id": "ADR_20260814_STOCK_COMPOUNDING_TELEMETRY_OPT",
