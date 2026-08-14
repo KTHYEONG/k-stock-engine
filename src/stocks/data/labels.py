@@ -477,8 +477,13 @@ def _sector_design_matrix(sector_labels: np.ndarray, log_sizes: np.ndarray, beta
     for values in controls:
         mean = float(np.nanmean(values))
         std = float(np.nanstd(values))
-        standardized = np.where(np.isnan(values), 0.0, (values - mean) / std if std > 0 else np.zeros_like(values))
-        dummy_cols.append(standardized)
+        # A constant control contributes no explanatory dimension and would
+        # make the least-squares design rank deficient. Omit it explicitly;
+        # this is important for source vintages without point-in-time beta.
+        if std > 0:
+            dummy_cols.append(
+                np.where(np.isnan(values), 0.0, (values - mean) / std)
+            )
     return np.column_stack([np.ones(sectors.shape[0], dtype=np.float64), *dummy_cols])
 
 

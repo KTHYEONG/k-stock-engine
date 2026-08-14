@@ -363,37 +363,33 @@ class TestStockAlphaV2SnapshotIntegration:
         assert (feature_root / "features_v1" / "dataset_manifest.json").exists()
         assert (label_root / "labels_v1" / "dataset_manifest.json").exists()
 
-    def test_train_cli_reaches_training_without_contract_error(
+    def test_train_cli_rejects_legacy_snapshot_with_actionable_error(
         self, v2_pipeline, tmp_path, monkeypatch, capsys
     ) -> None:
         artifact_root = tmp_path / "artifacts"
-        exit_code = train_cli.main(
-            [
-                "--artifact-id",
-                "stock_alpha_v2_integration",
-                "--snapshot-id",
-                "snap_v2",
-                "--catalog-root",
-                str(v2_pipeline["catalog_root"]),
-                "--base-root",
-                str(v2_pipeline["base_root"]),
-                "--feature-root",
-                str(v2_pipeline["feature_root"]),
-                "--label-root",
-                str(v2_pipeline["label_root"]),
-                "--registry",
-                str(artifact_root),
-                "--mode",
-                "research",
-                "--decision-time",
-                GENERATED.isoformat(),
-            ]
-        )
-        assert exit_code == 0
-        metrics_path = artifact_root / "stock_alpha_v2_integration" / "metrics.json"
-        assert metrics_path.exists()
-        metrics = json.loads(metrics_path.read_text())
-        assert metrics["no_trade"] is True
+        with pytest.raises(ValueError, match="net-alpha"):
+            train_cli.main(
+                [
+                    "--artifact-id",
+                    "stock_alpha_v2_integration",
+                    "--snapshot-id",
+                    "snap_v2",
+                    "--catalog-root",
+                    str(v2_pipeline["catalog_root"]),
+                    "--base-root",
+                    str(v2_pipeline["base_root"]),
+                    "--feature-root",
+                    str(v2_pipeline["feature_root"]),
+                    "--label-root",
+                    str(v2_pipeline["label_root"]),
+                    "--registry",
+                    str(artifact_root),
+                    "--mode",
+                    "research",
+                    "--decision-time",
+                    GENERATED.isoformat(),
+                ]
+            )
 
     def test_build_research_v2_cli_prints_ids_and_hashes(self, v2_pipeline, capsys) -> None:
         root = v2_pipeline["catalog_root"]

@@ -21,6 +21,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, time
 from pathlib import Path
+from typing import Union
 
 import polars as pl
 
@@ -44,6 +45,7 @@ from src.stocks.data.curation import (
     BASE_PANEL_FEATURE_SET,
     FeaturePanelRequest,
     FeaturePanelResult,
+    build_feature_panel,
     build_stock_alpha_v2_feature_panel,
 )
 from src.stocks.data.evidence import load_krx_calendar_snapshot
@@ -61,10 +63,15 @@ from src.stocks.data.labels import (
 )
 from src.stocks.data.quality import KRXSessionCalendar
 from src.stocks.data.repositories import ResearchDataRepository
+from src.stocks.ml.contracts import DEFAULT_CANDIDATE_HORIZON_SESSIONS
 from src.stocks.research.features import stock_alpha_v2_allowlist
 from src.storage.parquet_datasets import ParquetDatasetStore
 
 logger = logging.getLogger("stocks.data.research_v2")
+
+MaterializationRequest = Union[
+    "StockAlphaV2MaterializationRequest", "NetAlphaMaterializationRequest"
+]
 
 STOCK_ALPHA_V2_FEATURE_SET = "stock_alpha_v2"
 RESIDUAL_LABEL_DEFINITION = f"{RESIDUAL_O2O_PREFIX}5d"
@@ -443,7 +450,15 @@ def _publish_net_alpha_labels(
     derived from the replay minimum order unit and portfolio value, never an
     arbitrary participation constant.
     """
+    # Evidence entries are versioned by semantic name (for example
+    # ``kis_lifetime_preferential_counterfactual_v1``); ``costs`` is the
+    # catalog kind, not a valid entry name.  Prefer the source snapshot's
+    # exact reference and fall back to the sole registered cost entry for
+    # backwards-compatible callers.
     cost_entry = catalog.get(CatalogKind.COSTS, "costs")
+    if cost_entry is None:
+        entries = catalog.list(CatalogKind.COSTS)
+        cost_entry = entries[0] if len(entries) == 1 else None
     if cost_entry is None:
         raise ValueError("net-alpha label publication requires a costs catalog entry")
     cost_evidence = load_cost_evidence(
@@ -509,7 +524,7 @@ def _publish_net_alpha_labels(
 
 
 def _preflight(
-    request: StockAlphaV2MaterializationRequest,
+    request: MaterializationRequest,
     catalog: CatalogStore,
     source: ResearchDataSnapshot,
     base_manifest: DatasetManifest,
@@ -567,7 +582,7 @@ def _preflight(
 
 
 def _load_calendar(
-    request: StockAlphaV2MaterializationRequest,
+    request: MaterializationRequest,
     source: ResearchDataSnapshot,
     calendar_entry: CatalogEntry,
 ) -> KRXSessionCalendar:
@@ -623,6 +638,58 @@ def _re_read_features(
         if coverage < request.min_coverage:
             raise ValueError(
                 f"v2 feature {column} coverage {coverage:.6f} below "
+                f"{request.min_coverage} in the research range"
+            )
+    return manifest
+
+
+def _re_read_net_alpha_features(
+    request: NetAlphaMaterializationRequest,
+    allowlist: tuple[tuple[str, str], ...],
+    feature_result: FeaturePanelResult,
+) -> DatasetManifest:
+    """Re-read the written net-alpha feature panel and verify its contract."""
+    from src.stocks.ml.contracts import CANONICAL_FEATURE_SET
+
+    store = ParquetDatasetStore(request.feature_root)
+    manifest = store.read_manifest(request.feature_dataset_id)
+    if manifest.content_hash != feature_result.manifest.content_hash:
+        raise ValueError(
+            "net-alpha feature re-read content hash mismatch "
+            f"{manifest.content_hash} vs built {feature_result.manifest.content_hash}"
+        )
+    if manifest.feature_set != CANONICAL_FEATURE_SET:
+        raise ValueError(
+            f"net-alpha feature re-read manifest feature_set "
+            f"{manifest.feature_set!r}, expected {CANONICAL_FEATURE_SET!r}"
+        )
+    expected_columns = ["instrument_id", "session"] + [
+        f"feature__{source}" for source, _role in allowlist
+    ]
+    if store.content_columns(request.feature_dataset_id) != expected_columns:
+        raise ValueError("net-alpha feature re-read column order mismatch")
+    research = request.windows.research_range
+    frame = store.read_bounded(
+        request.feature_dataset_id,
+        AssetKind.STOCK,
+        CANONICAL_FEATURE_SET,
+        request.generated_time,
+        session_start=research.start,
+        session_end=research.end,
+        columns=expected_columns,
+    )
+    if frame.is_empty():
+        raise ValueError(
+            "net-alpha feature re-read produced no rows in the research range"
+        )
+    if frame.columns != expected_columns:
+        raise ValueError("net-alpha feature re-read produced unexpected columns")
+    height = frame.height
+    for column in expected_columns[2:]:
+        coverage = (height - int(frame[column].null_count())) / height
+        if coverage < request.min_coverage:
+            raise ValueError(
+                f"net-alpha feature {column} coverage {coverage:.6f} below "
                 f"{request.min_coverage} in the research range"
             )
     return manifest
@@ -861,3 +928,266 @@ def _write_manifest_atomic(catalog_root: Path, manifest: SnapshotManifest) -> No
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, target)
+
+
+@dataclass(frozen=True, slots=True)
+class NetAlphaMaterializationRequest:
+    """Explicit, non-empty inputs for one net-alpha snapshot materialization.
+
+    Materializes the canonical ``stock_net_alpha_v1`` feature panel and the
+    long, ``horizon_sessions``-partitioned net-alpha label dataset from one
+    source snapshot's base panel and calendar, then publishes a replacement
+    snapshot manifest.
+    """
+
+    source_snapshot_id: str
+    feature_dataset_id: str
+    label_dataset_id: str
+    snapshot_id: str
+    catalog_root: Path
+    base_root: Path
+    feature_root: Path
+    label_root: Path
+    generated_time: datetime
+    windows: ResearchWindows
+    certification: DatasetCertification = DatasetCertification.PROVISIONAL
+    min_coverage: float = 0.75
+    calendar_path: Path | None = None
+    candidate_horizon_sessions: tuple[int, ...] = DEFAULT_CANDIDATE_HORIZON_SESSIONS
+    reference_notional: float = 100_000_000.0
+
+    def __post_init__(self) -> None:
+        for field in (
+            "source_snapshot_id",
+            "feature_dataset_id",
+            "label_dataset_id",
+            "snapshot_id",
+        ):
+            if not getattr(self, field):
+                raise ValueError(f"{field} must be non-empty")
+        if not 0.0 < self.min_coverage <= 1.0:
+            raise ValueError("min_coverage must be within (0, 1]")
+        if not self.candidate_horizon_sessions:
+            raise ValueError("candidate_horizon_sessions must be non-empty")
+        if tuple(self.candidate_horizon_sessions) != tuple(
+            sorted(set(self.candidate_horizon_sessions))
+        ):
+            raise ValueError(
+                "candidate_horizon_sessions must be strictly ascending and unique"
+            )
+        if any(h < 1 for h in self.candidate_horizon_sessions):
+            raise ValueError("candidate_horizon_sessions must be positive sessions")
+        if self.reference_notional <= 0:
+            raise ValueError("reference_notional must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class NetAlphaMaterializationResult:
+    """Immutable outcome of one net-alpha snapshot materialization."""
+
+    snapshot_id: str
+    feature_dataset_id: str
+    label_dataset_id: str
+    feature_content_hash: str
+    label_content_hash: str
+    feature_row_count: int
+    label_row_count: int
+    min_coverage: float
+    certification: DatasetCertification
+
+
+def materialize_net_alpha_snapshot(
+    request: NetAlphaMaterializationRequest,
+) -> NetAlphaMaterializationResult:
+    """Materialize a canonical ``stock_net_alpha_v1`` research snapshot.
+
+    Builds and publishes the ``stock_net_alpha_v1`` feature panel (semantic
+    roles) and the long, ``horizon_sessions``-partitioned net-alpha label
+    dataset, then registers catalog entries and writes the replacement snapshot
+    manifest atomically. Every horizon keeps its own universe; no common
+    universe inner join is performed.
+    """
+    from src.stocks.ml.features import (
+        STOCK_NET_ALPHA_V1_FEATURE_SET,
+        stock_net_alpha_v1_contract_book,
+        stock_net_alpha_v1_role_allowlist,
+    )
+    from src.stocks.ml.labels import (
+        build_partitioned_net_alpha_labels,
+        publish_partitioned_net_alpha_label_dataset,
+    )
+
+    catalog = CatalogStore(request.catalog_root)
+    source = SnapshotResolver(catalog).resolve(request.source_snapshot_id)
+    if source.base_panel is None:
+        raise ValueError("source snapshot has no base-panel reference")
+    if source.calendar is None:
+        raise ValueError("source snapshot has no calendar reference")
+    base_entry = source.base_panel
+    calendar_entry = source.calendar
+    base_store = ParquetDatasetStore(request.base_root)
+    base_manifest = base_store.read_manifest(base_entry.name)
+    calendar = _load_calendar(request, source, calendar_entry)
+    _preflight(request, catalog, source, base_manifest, calendar)
+
+    feature_result = build_feature_panel(
+        request.base_root,
+        request.feature_root,
+        FeaturePanelRequest(
+            dataset_id=request.feature_dataset_id,
+            base_panel_id=base_entry.name,
+            feature_set=STOCK_NET_ALPHA_V1_FEATURE_SET,
+            feature_contract_book=stock_net_alpha_v1_contract_book(),
+            generated_time=request.generated_time,
+            certification=request.certification,
+        ),
+    )
+    feature_manifest = _re_read_net_alpha_features(
+        request, stock_net_alpha_v1_role_allowlist(), feature_result
+    )
+
+    base_frame = base_store.read(
+        base_entry.name, AssetKind.STOCK, BASE_PANEL_FEATURE_SET,
+        request.generated_time,
+    )
+    cost_entry = source.costs
+    if cost_entry is None:
+        entries = catalog.list(CatalogKind.COSTS)
+        cost_entry = entries[0] if len(entries) == 1 else None
+    if cost_entry is None:
+        raise ValueError("net-alpha label publication requires a costs catalog entry")
+    cost_evidence = load_cost_evidence(
+        Path(cost_entry.path),
+        CoverageRange(
+            start=base_manifest.time_start.date(),
+            end=min(base_manifest.time_end.date(), cost_entry.coverage.end),
+        ),
+    )
+    # Do not manufacture labels beyond the verified cost-evidence horizon.
+    # The base panel can be refreshed ahead of the cost catalog, so trim only
+    # the label source rows while retaining the full feature dataset.
+    if cost_entry.coverage.end < base_manifest.time_end.date():
+        base_frame = base_frame.filter(
+            pl.col("session") <= cost_entry.coverage.end
+        )
+    # The canonical base panel stores derived controls under explicit
+    # ``raw__`` names.  Normalize them at the label boundary rather than
+    # requiring a second, duplicate feature panel.  Beta is unavailable in
+    # this source vintage; a neutral zero beta keeps the risk projection
+    # deterministic and makes the limitation visible in the manifest.
+    aliases = {
+        "adtv": "raw__adtv_20d",
+        "volatility": "raw__volatility_20d",
+    }
+    for target, source_column in aliases.items():
+        if target not in base_frame.columns and source_column in base_frame.columns:
+            base_frame = base_frame.with_columns(pl.col(source_column).alias(target))
+    if "beta" not in base_frame.columns:
+        base_frame = base_frame.with_columns(pl.lit(0.0).alias("beta"))
+    cost_schedule = CostSchedule(
+        name="net-alpha-reference",
+        points=(
+            CostPoint(
+                effective_from=datetime(2000, 1, 1, tzinfo=UTC),
+                commission_rate=cost_evidence.commission_for(
+                    request.generated_time
+                ).buy_rate,
+                tax_rate=cost_evidence.sell_tax_for(
+                    krx_market_for_code(base_frame["instrument_id"][0]),
+                    request.generated_time,
+                ).sell_tax_rate,
+                slippage_bps=(
+                    cost_evidence.liquidity_model.impact_coefficient * 10_000.0
+                ),
+                settlement_days=cost_evidence.settlement_days,
+            ),
+        ),
+    )
+    liquidity_model = cost_evidence.base_liquidity_model
+
+    labels_frame = build_partitioned_net_alpha_labels(
+        base_frame,
+        calendar,
+        cost_schedule,
+        liquidity_model,
+        horizon_sessions=request.candidate_horizon_sessions,
+        reference_notional=request.reference_notional,
+    )
+    label_result = publish_partitioned_net_alpha_label_dataset(
+        labels_frame,
+        destination_root=request.label_root,
+        dataset_id=request.label_dataset_id,
+        base_panel_hash=base_manifest.content_hash,
+        calendar_hash=calendar.content_hash,
+        horizon_sessions=request.candidate_horizon_sessions,
+        certification=request.certification,
+        generated_time=request.generated_time,
+    )
+    label_manifest = label_result.manifest
+
+    feature_entry = CatalogEntry(
+        kind=CatalogKind.FEATURES,
+        name=request.feature_dataset_id,
+        content_hash=feature_manifest.content_hash,
+        schema_hash=feature_manifest.schema_hash,
+        registered_at=request.generated_time,
+        coverage=CoverageRange(
+            start=feature_manifest.time_start.date(),
+            end=feature_manifest.time_end.date(),
+        ),
+        completeness=EvidenceCompleteness.COMPLETE,
+        path=str(request.feature_root / request.feature_dataset_id),
+        references=(
+            (CatalogKind.BASE_PANEL.value, base_entry.name),
+            (CatalogKind.CALENDAR.value, calendar_entry.name),
+        ),
+        row_count=feature_result.row_count,
+    )
+    label_entry = CatalogEntry(
+        kind=CatalogKind.LABELS,
+        name=request.label_dataset_id,
+        content_hash=label_manifest.content_hash,
+        schema_hash=label_manifest.schema_hash,
+        registered_at=request.generated_time,
+        coverage=CoverageRange(
+            start=label_manifest.time_start.date(),
+            end=label_manifest.time_end.date(),
+        ),
+        completeness=EvidenceCompleteness.COMPLETE,
+        path=str(request.label_root / request.label_dataset_id),
+        references=(
+            (CatalogKind.BASE_PANEL.value, base_entry.name),
+            (CatalogKind.CALENDAR.value, calendar_entry.name),
+        ),
+        row_count=label_result.row_count,
+    )
+    catalog.register(feature_entry)
+    catalog.register(label_entry)
+
+    manifest = build_snapshot_manifest(
+        snapshot_id=request.snapshot_id,
+        certification=request.certification,
+        timing_convention=source.manifest.timing_convention,
+        windows=request.windows,
+        references=_replacement_references(source, feature_entry, label_entry),
+    )
+    _write_manifest_atomic(request.catalog_root, manifest)
+
+    logger.info(
+        "materialized net-alpha snapshot %s: features %s, labels %s horizons %s",
+        request.snapshot_id,
+        request.feature_dataset_id,
+        request.label_dataset_id,
+        list(request.candidate_horizon_sessions),
+    )
+    return NetAlphaMaterializationResult(
+        snapshot_id=request.snapshot_id,
+        feature_dataset_id=request.feature_dataset_id,
+        label_dataset_id=request.label_dataset_id,
+        feature_content_hash=feature_manifest.content_hash,
+        label_content_hash=label_manifest.content_hash,
+        feature_row_count=feature_result.row_count,
+        label_row_count=label_result.row_count,
+        min_coverage=request.min_coverage,
+        certification=request.certification,
+    )

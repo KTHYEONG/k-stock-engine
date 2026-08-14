@@ -219,7 +219,8 @@
     "testing": "tests/unit/stocks/cli/test_simulate.py"
   },
   "src/stocks/cli/train.py": {
-    "testing": "tests/unit/stocks/cli/test_train.py"
+    "testing": "tests/unit/stocks/cli/test_train.py",
+    "architecture": "docs/specs/stock_ml_mainline_simplification.md"
   },
   "src/stocks/data/contracts.py": {
     "testing": [

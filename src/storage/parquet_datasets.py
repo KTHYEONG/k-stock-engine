@@ -152,9 +152,16 @@ class ParquetDatasetStore:
         partitions_dir.mkdir(parents=True)
 
         year_col, month_col = _PARTITION_COLUMNS
+        session_column = (
+            "session" if "session" in frame.columns else "decision_session"
+        )
+        if session_column not in frame.columns:
+            raise ValueError(
+                "partitioned write requires a session or decision_session column"
+            )
         partitioned = frame.with_columns(
-            pl.col("session").dt.strftime("%Y").alias(year_col),
-            pl.col("session").dt.strftime("%m").alias(month_col),
+            pl.col(session_column).dt.strftime("%Y").alias(year_col),
+            pl.col(session_column).dt.strftime("%m").alias(month_col),
         )
         entries: list[dict[str, object]] = []
         for sub in partitioned.sort([year_col, month_col]).partition_by(
@@ -170,8 +177,8 @@ class ParquetDatasetStore:
                 {
                     "path": str(part_path.relative_to(staging)),
                     "row_count": sub.height,
-                    "session_start": _iso_dt(sub["session"].min()),
-                    "session_end": _iso_dt(sub["session"].max()),
+                    "session_start": _iso_dt(sub[session_column].min()),
+                    "session_end": _iso_dt(sub[session_column].max()),
                     "sha256": file_sha256(part_path),
                 }
             )
