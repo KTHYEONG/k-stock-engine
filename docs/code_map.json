@@ -268,7 +268,8 @@
   "src/stocks/research/metrics.py": {
     "testing": [
       "tests/unit/stocks/test_simulation.py",
-      "tests/unit/stocks/trading/test_simulator.py"
+      "tests/unit/stocks/trading/test_simulator.py",
+      "tests/unit/stocks/research/test_metrics.py"
     ]
   },
   "src/stocks/research/models.py": {

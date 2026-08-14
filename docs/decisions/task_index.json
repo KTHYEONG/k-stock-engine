@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ML_BACKTEST_ECONOMIC_VALIDITY",
+      "date": "2026-08-14",
+      "adr_id": "ADR_20260814_ML_BACKTEST_ECONOMIC_VALIDITY",
+      "domain": "stocks",
+      "title": "ML ranking-to-compounding validity audit",
+      "why": "Rank-IC was positive but promotion failed after economic replay, requiring evidence-based documentation and contract registration.",
+      "resolution": "Registered the diagnostic economic-transfer specification and preserved fail-closed promotion gates; documented ranking, allocation, execution, and compounding bottlenecks.",
+      "impact": "Updates task/code indexes and removes temporary spec/scratch/tmp artifacts after the audit."
+    },
+    {
       "task_id": "TASK_STOCK_ENSEMBLE_ABLATION_90",
       "date": "2026-08-13",
       "adr_id": "ADR_20260813_STOCK_ENSEMBLE_ABLATION_90",
