@@ -4,9 +4,17 @@ from __future__ import annotations
 import math
 from datetime import UTC, date, datetime, timedelta
 
+import numpy as np
 import polars as pl
 import pytest
 
+from src.core.costs import (
+    CostPoint,
+    CostSchedule,
+    LiquiditySlippageModel,
+    TickSizeRule,
+    TickSizeSchedule,
+)
 from src.stocks.data.labels import (
     LABEL_AVAILABLE_COLUMN,
     build_label_dataset,
@@ -275,3 +283,163 @@ class TestMultiHorizonResidualLabels:
             assert available > decision
         assert row["label_available_time_5d"][0] < row["label_available_time_10d"][0]
         assert row["label_available_time_10d"][0] < row["label_available_time_15d"][0]
+
+
+def _cost_aware_base_panel(calendar: KRXSessionCalendar, n_tickers: int = 35) -> pl.DataFrame:
+    rows: list[dict] = []
+    for t in range(n_tickers):
+        price = 100.0 + t
+        rows.extend(
+            {
+                "instrument_id": f"KRX:{t + 1:06d}",
+                "session": datetime.combine(session, datetime.min.time(), tzinfo=UTC),
+                "open": price,
+                "sector": f"SEC{t % 4}",
+                "adtv": 5.0e8 + t * 1.0e7,
+                "market_cap": 1.0e11 + t * 1.0e9,
+                "beta": 0.8 + (t % 5) * 0.1,
+                "volatility": 0.02 + (t % 7) * 0.001,
+            }
+            for session in calendar.sessions
+        )
+    return pl.DataFrame(rows)
+
+
+def _cost_schedule() -> CostSchedule:
+    return CostSchedule(
+        name="fixture-base",
+        points=(
+            CostPoint(
+                effective_from=datetime(2000, 1, 1, tzinfo=UTC),
+                commission_rate=0.00015,
+                tax_rate=0.0023,
+                slippage_bps=5.0,
+            ),
+        ),
+    )
+
+
+def _liquidity_model() -> LiquiditySlippageModel:
+    tick = TickSizeSchedule(
+        rules=(
+            TickSizeRule(
+                rule_id="r1",
+                effective_from=datetime(2000, 1, 1, tzinfo=UTC),
+                lower_inclusive=0.0,
+                upper_exclusive=float("inf"),
+                tick=1.0,
+            ),
+        ),
+    )
+    return LiquiditySlippageModel(impact_coefficient=0.1, tick_schedule=tick)
+
+
+class TestCostAwareResidualLabels:
+    def test_single_horizon_emits_full_component_schema(self) -> None:
+        from src.stocks.data.labels import build_single_horizon_cost_aware_residual_labels
+
+        calendar = _weekday_calendar()
+        base = _cost_aware_base_panel(calendar)
+        out = build_single_horizon_cost_aware_residual_labels(
+            base, calendar, _cost_schedule(), _liquidity_model(),
+            horizon_sessions=5, reference_participation=0.01,
+        )
+        assert out.columns == [
+            "instrument_id",
+            "session",
+            "gross_o2o_5d",
+            "risk_fitted_5d",
+            "risk_residual_5d",
+            "reference_cost_5d",
+            "net_residual_o2o_5d",
+            "relevance_5d",
+            "label_available_time_5d",
+        ]
+        assert not out.is_empty()
+        assert out["net_residual_o2o_5d"].is_finite().all()
+        assert out["relevance_5d"].min() == 0
+        assert out["relevance_5d"].max() == 4
+
+    def test_net_residual_is_gross_minus_risk_minus_cost(self) -> None:
+        from src.stocks.data.labels import build_single_horizon_cost_aware_residual_labels
+
+        calendar = _weekday_calendar()
+        base = _cost_aware_base_panel(calendar)
+        out = build_single_horizon_cost_aware_residual_labels(
+            base, calendar, _cost_schedule(), _liquidity_model(),
+            horizon_sessions=5, reference_participation=0.01,
+        )
+        gross = out["gross_o2o_5d"].to_numpy()
+        fitted = out["risk_fitted_5d"].to_numpy()
+        cost = out["reference_cost_5d"].to_numpy()
+        net = out["net_residual_o2o_5d"].to_numpy()
+        assert np.allclose(net, gross - fitted - cost)
+
+    def test_multi_horizon_inner_joins_to_shared_universe(self) -> None:
+        from src.stocks.data.labels import (
+            build_multi_horizon_cost_aware_residual_label_dataset,
+        )
+
+        calendar = _weekday_calendar()
+        base = _cost_aware_base_panel(calendar)
+        out = build_multi_horizon_cost_aware_residual_label_dataset(
+            base, calendar, _cost_schedule(), _liquidity_model(),
+            reference_participation=0.01,
+        )
+        for prefix in (
+            "gross_o2o_5d",
+            "risk_fitted_5d",
+            "risk_residual_5d",
+            "reference_cost_5d",
+            "net_residual_o2o_5d",
+            "relevance_5d",
+            "label_available_time_5d",
+            "gross_o2o_10d",
+            "net_residual_o2o_10d",
+            "net_residual_o2o_15d",
+        ):
+            assert prefix in out.columns
+        assert out["net_residual_o2o_5d"].is_finite().all()
+        assert out["net_residual_o2o_10d"].is_finite().all()
+        assert out["net_residual_o2o_15d"].is_finite().all()
+
+    def test_rejects_invalid_horizon_sets_and_participation(self) -> None:
+        from src.stocks.data.labels import (
+            build_multi_horizon_cost_aware_residual_label_dataset,
+        )
+
+        calendar = _weekday_calendar()
+        base = _cost_aware_base_panel(calendar)
+        with pytest.raises(ValueError, match="non-empty"):
+            build_multi_horizon_cost_aware_residual_label_dataset(
+                base, calendar, _cost_schedule(), _liquidity_model(),
+                horizons=(), reference_participation=0.01,
+            )
+        with pytest.raises(ValueError, match="ascending and unique"):
+            build_multi_horizon_cost_aware_residual_label_dataset(
+                base, calendar, _cost_schedule(), _liquidity_model(),
+                horizons=(5, 5), reference_participation=0.01,
+            )
+        with pytest.raises(ValueError, match="unsupported"):
+            build_multi_horizon_cost_aware_residual_label_dataset(
+                base, calendar, _cost_schedule(), _liquidity_model(),
+                horizons=(7,), reference_participation=0.01,
+            )
+        with pytest.raises(ValueError, match="positive"):
+            build_multi_horizon_cost_aware_residual_label_dataset(
+                base, calendar, _cost_schedule(), _liquidity_model(),
+                reference_participation=0.0,
+            )
+
+    def test_rejects_missing_risk_control_columns(self) -> None:
+        from src.stocks.data.labels import (
+            build_multi_horizon_cost_aware_residual_label_dataset,
+        )
+
+        calendar = _weekday_calendar()
+        base = _cost_aware_base_panel(calendar).drop("beta")
+        with pytest.raises(ValueError, match="base panel columns"):
+            build_multi_horizon_cost_aware_residual_label_dataset(
+                base, calendar, _cost_schedule(), _liquidity_model(),
+                reference_participation=0.01,
+            )

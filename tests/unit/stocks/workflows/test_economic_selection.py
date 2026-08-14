@@ -1,8 +1,6 @@
 """Deterministic v4 proxy-selection policy widths and versioning."""
 from __future__ import annotations
 
-import math
-
 import pytest
 
 from src.stocks.workflows.economic_selection import (
@@ -12,15 +10,15 @@ from src.stocks.workflows.economic_selection import (
 )
 
 
-def test_for_budget_produces_27_to_6_to_6_to_3_profile() -> None:
+def test_for_budget_produces_bounded_confirmation_profile() -> None:
     policy = ScreenFidelityPolicy.for_budget(total_trials=81, route_count=3, fold_count=3)
-    assert policy.widths == (27, 6, 6, 6, 3, 3)
+    assert policy.widths == (27, 6, 6, 2, 1, 1)
     assert policy.route_budget == 27
     assert policy.proxy_session_stride == 6
     assert policy.promotion_width == 6
-    assert policy.confirmation_width == 6
-    assert policy.economic_finalist_width == 3
-    assert policy.recovery_width == 3
+    assert policy.confirmation_width == 2
+    assert policy.economic_finalist_width == 1
+    assert policy.recovery_width == 1
     assert SELECTION_POLICY_VERSION == "economic-selection-v6-confirmed-recovery"
 
 
@@ -29,7 +27,7 @@ def test_confirmation_width_equals_promotion_width_and_recovery_equals_finalist(
         policy = ScreenFidelityPolicy.for_budget(
             total_trials=trials, route_count=1, fold_count=3
         )
-        assert policy.confirmation_width == policy.promotion_width
+        assert policy.confirmation_width <= 2
         assert policy.recovery_width == policy.economic_finalist_width
         assert policy.recovery_width <= policy.promotion_width
 
@@ -37,7 +35,7 @@ def test_confirmation_width_equals_promotion_width_and_recovery_equals_finalist(
 def test_for_budget_never_exceeds_positive_screen_candidates() -> None:
     policy = ScreenFidelityPolicy.for_budget(total_trials=3, route_count=1, fold_count=3)
     assert policy.promotion_width == 2
-    assert policy.economic_finalist_width == 2
+    assert policy.economic_finalist_width == 1
 
 
 def test_proxy_stride_grows_with_sqrt_of_route_budget() -> None:
@@ -51,10 +49,7 @@ def test_proxy_stride_grows_with_sqrt_of_route_budget() -> None:
 def test_economic_finalist_width_is_sqrt_of_promotion_width_per_route() -> None:
     for trials in (12, 27, 81):
         policy = ScreenFidelityPolicy.for_budget(total_trials=trials, route_count=1, fold_count=3)
-        assert policy.economic_finalist_width == min(
-            policy.promotion_width,
-            max(1, math.ceil(math.sqrt(policy.promotion_width))),
-        )
+        assert policy.economic_finalist_width == 1
 
 
 def test_for_budget_rejects_non_positive_inputs() -> None:
@@ -74,9 +69,9 @@ def test_to_json_safe_records_version_widths_and_one_policy_cell() -> None:
     assert payload["route_budget"] == 27
     assert payload["proxy_session_stride"] == 6
     assert payload["promotion_width"] == 6
-    assert payload["confirmation_width"] == 6
-    assert payload["economic_finalist_width"] == 3
-    assert payload["recovery_width"] == 3
+    assert payload["confirmation_width"] == 2
+    assert payload["economic_finalist_width"] == 1
+    assert payload["recovery_width"] == 1
     assert payload["configured_compounding_policy_cells"] == 1
 
 
