@@ -270,7 +270,8 @@
       "tests/unit/stocks/test_simulation.py",
       "tests/unit/stocks/trading/test_simulator.py",
       "tests/unit/stocks/research/test_metrics.py"
-    ]
+    ],
+    "architecture": "docs/results/back-res.md"
   },
   "src/stocks/research/models.py": {
     "testing": "tests/unit/stocks/research/test_models.py"
