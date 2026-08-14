@@ -443,3 +443,75 @@ class TestCostAwareResidualLabels:
                 base, calendar, _cost_schedule(), _liquidity_model(),
                 reference_participation=0.01,
             )
+
+
+class TestNetAlphaLabels:
+    def test_emits_continuous_target_without_relevance(self) -> None:
+        from src.stocks.data.labels import build_net_alpha_label_dataset
+
+        calendar = _weekday_calendar()
+        base = _cost_aware_base_panel(calendar)
+        out = build_net_alpha_label_dataset(
+            base, calendar, _cost_schedule(), _liquidity_model(),
+            horizon_sessions=5, reference_notional=1.0e6,
+        )
+        assert not out.is_empty()
+        assert "net_alpha_5d_target" in out.columns
+        assert "relevance_5d" not in out.columns
+        assert out["net_alpha_5d_target"].is_finite().all()
+        assert out["net_residual_o2o_5d"].is_finite().all()
+
+    def test_target_is_median_and_mad_normalized(self) -> None:
+        from src.stocks.data.labels import build_net_alpha_label_dataset
+
+        calendar = _weekday_calendar()
+        base = _cost_aware_base_panel(calendar)
+        out = build_net_alpha_label_dataset(
+            base, calendar, _cost_schedule(), _liquidity_model(),
+            horizon_sessions=5, reference_notional=1.0e6,
+        )
+        for session in out["session"].unique():
+            per_session = out.filter(pl.col("session") == session)
+            net = per_session["net_residual_o2o_5d"].to_numpy()
+            target = per_session["net_alpha_5d_target"].to_numpy()
+            median = float(np.median(net))
+            mad = float(np.median(np.abs(net - median)))
+            assert mad > 0.0
+            assert np.allclose(target, (net - median) / mad)
+
+    def test_net_is_gross_minus_risk_minus_reference_cost(self) -> None:
+        from src.stocks.data.labels import build_net_alpha_label_dataset
+
+        calendar = _weekday_calendar()
+        base = _cost_aware_base_panel(calendar)
+        out = build_net_alpha_label_dataset(
+            base, calendar, _cost_schedule(), _liquidity_model(),
+            horizon_sessions=5, reference_notional=1.0e6,
+        )
+        gross = out["gross_o2o_5d"].to_numpy()
+        fitted = out["risk_fitted_5d"].to_numpy()
+        cost = out["reference_cost_5d"].to_numpy()
+        net = out["net_residual_o2o_5d"].to_numpy()
+        assert np.allclose(net, gross - fitted - cost)
+
+    def test_rejects_non_positive_reference_notional(self) -> None:
+        from src.stocks.data.labels import build_net_alpha_label_dataset
+
+        calendar = _weekday_calendar()
+        base = _cost_aware_base_panel(calendar)
+        with pytest.raises(ValueError, match="reference_notional"):
+            build_net_alpha_label_dataset(
+                base, calendar, _cost_schedule(), _liquidity_model(),
+                horizon_sessions=5, reference_notional=0.0,
+            )
+
+    def test_rejects_missing_required_columns(self) -> None:
+        from src.stocks.data.labels import build_net_alpha_label_dataset
+
+        calendar = _weekday_calendar()
+        base = _cost_aware_base_panel(calendar).drop("adtv")
+        with pytest.raises(ValueError, match="base panel columns"):
+            build_net_alpha_label_dataset(
+                base, calendar, _cost_schedule(), _liquidity_model(),
+                horizon_sessions=5, reference_notional=1.0e6,
+            )

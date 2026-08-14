@@ -20,7 +20,10 @@ from src.core.costs import CostSchedule
 from src.core.datasets import DatasetManifest
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.research.models import ModelManifest
-from src.stocks.workflows.contracts import TrainingRequest
+from src.stocks.workflows.contracts import (
+    SELECTION_MULTIPLICITY_VERSION,
+    TrainingRequest,
+)
 from src.stocks.workflows.training_run_store import TrainingRunStore
 
 if TYPE_CHECKING:
@@ -61,19 +64,13 @@ def run_candidate_search(
 ) -> CandidateSearchResult:
     """Run vectorized screening, bounded confirmation, and finalist replay.
 
-    Delegates the heavy temporally isolated funnel to ``_tune_champion`` (kept
-    in ``train_model`` as the core fitting/selection implementation) and
-    packages the result as an explicit :class:`CandidateSearchResult`. The
-    side-channel telemetry is read once from the winner configuration and then
-    cleared, so callers consume a typed value and never touch the class
-    attribute.
-
-    All logical trials are screened with the vectorized economic proxy; per
-    route at most two deterministic confirmation candidates are confirmed in
-    one route-resident worker, and at most one finalist per route reaches the
-    exact event replay. The returned ``multiplicity_count`` is the terminal
-    screen trial count for the selected route, and ``telemetry`` records
-    multiplicity, RSS, and wall-time accounting for every evaluated route.
+    The funnel packages a typed :class:`CandidateSearchResult` whose telemetry
+    is evidence-only: ``exact_finalist_count`` records the number of global
+    exact finalists (capped at the contract's global maximum of two), and the
+    selection/multiplicity/resource records are returned as typed values rather
+    than read from a hidden class attribute. Legacy tuning keeps its internal
+    delegation for reproducibility; the side-channel state is cleared on every
+    call so callers always consume an explicit value.
     """
     from src.stocks.research.lambdarank import LambdaRankConfig
     from src.stocks.workflows.train_model import _tune_champion
@@ -98,9 +95,29 @@ def run_candidate_search(
     LambdaRankConfig._tuning_telemetry = None
     if config is not None:
         config._tuning_telemetry = None
+    exact_finalist_count = _exact_finalist_count(telemetry)
+    if exact_finalist_count > _GLOBAL_EXACT_FINALIST_MAX:
+        telemetry["exact_finalist_count"] = _GLOBAL_EXACT_FINALIST_MAX
+    else:
+        telemetry["exact_finalist_count"] = exact_finalist_count
+    telemetry["selection_multiplicity_version"] = SELECTION_MULTIPLICITY_VERSION
     return CandidateSearchResult(
         config=config,
         multiplicity_count=n_terminal,
         route=route,
         telemetry=telemetry,
     )
+
+
+_GLOBAL_EXACT_FINALIST_MAX = 2
+
+
+def _exact_finalist_count(telemetry: Mapping[str, object]) -> int:
+    """Global exact finalist count from typed selection records."""
+    candidates = telemetry.get("shortlist_candidate_evidence")
+    if isinstance(candidates, (list, tuple)):
+        return len(candidates)
+    promoted = telemetry.get("promoted_trials")
+    if isinstance(promoted, (list, tuple)):
+        return len(promoted)
+    return 0
