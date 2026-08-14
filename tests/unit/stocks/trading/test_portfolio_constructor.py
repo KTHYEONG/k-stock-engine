@@ -1066,3 +1066,153 @@ def test_prepared_allocations_convert_nan_history_overlay_to_null() -> None:
     assert {
         a.instrument.instrument_id for a in calibrated
     } == {a.instrument.instrument_id for a in plain}
+
+def test_causal_covariance_uses_full_shrinkage_when_complete() -> None:
+    from src.stocks.trading.portfolio_constructor import (
+        causal_covariance_or_fallback,
+        _shrinkage_covariance,
+    )
+
+    rng = np.random.default_rng(11)
+    matrix = rng.normal(0.001, 0.01, size=(60, 3))
+    covariance, source = causal_covariance_or_fallback(
+        matrix,
+        volatility_lookback_sessions=20,
+        covariance_lookback_sessions=60,
+    )
+    assert source == "full"
+    assert covariance.shape == (3, 3)
+    assert np.allclose(covariance, _shrinkage_covariance(matrix))
+    assert np.all(np.isfinite(covariance))
+    assert np.allclose(covariance, covariance.T)
+    assert np.all(np.linalg.eigvalsh(covariance) >= -1e-12)
+
+
+def test_causal_covariance_fallback_is_conservative_psd_and_never_zero_fills() -> None:
+    from src.stocks.trading.portfolio_constructor import (
+        causal_covariance_or_fallback,
+    )
+
+    rng = np.random.default_rng(12)
+    matrix = rng.normal(0.001, 0.01, size=(60, 3))
+    matrix[20:, 0] = np.nan
+    matrix[:20, 1] = np.nan
+    matrix[10:30, 2] = np.nan
+    covariance, source = causal_covariance_or_fallback(
+        matrix,
+        volatility_lookback_sessions=20,
+        covariance_lookback_sessions=60,
+    )
+    assert source == "fallback"
+    assert covariance.shape == (3, 3)
+    assert np.all(np.isfinite(covariance))
+    assert np.allclose(covariance, covariance.T)
+    assert np.all(np.linalg.eigvalsh(covariance) >= -1e-12)
+    variance_2 = covariance[1, 1]
+    assert variance_2 > 0.0
+    missing_pair_correlation = covariance[0, 1] / math.sqrt(
+        covariance[0, 0] * covariance[1, 1]
+    )
+    assert missing_pair_correlation > 0.0
+
+
+def test_causal_covariance_fails_closed_without_own_volatility_history() -> None:
+    from src.stocks.trading.portfolio_constructor import (
+        PortfolioConstraintError,
+        causal_covariance_or_fallback,
+    )
+
+    rng = np.random.default_rng(13)
+    matrix = rng.normal(0.001, 0.01, size=(40, 2))
+    matrix[:20, 0] = np.nan
+    matrix[10:, 1] = np.nan
+    with pytest.raises(PortfolioConstraintError, match="insufficient covariance"):
+        causal_covariance_or_fallback(
+            matrix,
+            volatility_lookback_sessions=20,
+            covariance_lookback_sessions=60,
+        )
+
+    all_nan = np.full((40, 2), np.nan)
+    with pytest.raises(PortfolioConstraintError, match="insufficient covariance"):
+        causal_covariance_or_fallback(
+            all_nan,
+            volatility_lookback_sessions=20,
+            covariance_lookback_sessions=60,
+        )
+
+    zero_variance = rng.normal(0.001, 0.0, size=(40, 2))
+    zero_variance[1:, 1] = np.nan
+    with pytest.raises(PortfolioConstraintError, match="insufficient covariance"):
+        causal_covariance_or_fallback(
+            zero_variance,
+            volatility_lookback_sessions=20,
+            covariance_lookback_sessions=60,
+        )
+
+
+def test_prepared_and_reference_fallback_covariance_inputs_are_identical() -> None:
+    """Prepared and reference raw covariance windows agree under fallback."""
+    from datetime import timedelta
+
+    from src.stocks.trading.portfolio_constructor import (
+        PreparedAllocationMarket,
+        _covariance,
+        _prepared_return_matrix,
+        _return_matrix,
+        _window_returns,
+        causal_covariance_or_fallback,
+    )
+
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    rows = []
+    for session in range(60):
+        for instrument_id, present in (
+            ("A", True),
+            ("B", True),
+            ("C", session < 21),
+            ("D", session >= 39),
+        ):
+            if not present:
+                continue
+            rows.append(
+                {
+                    "session": start + timedelta(days=session),
+                    "instrument_id": instrument_id,
+                    "sector": "S1",
+                    "adtv": 1e9,
+                    "close": 50_000.0 + session,
+                }
+            )
+    panel = pl.DataFrame(rows)
+    ids = ["A", "B", "C", "D"]
+
+    reference_matrix = _return_matrix(panel, ids)
+    assert reference_matrix is not None
+    assert reference_matrix.shape == (60, 4)
+    assert np.count_nonzero(np.all(np.isfinite(reference_matrix), axis=1)) < 2
+
+    market = PreparedAllocationMarket.build(panel)
+    decision_index = len(market.sessions) - 1
+    window = _window_returns(market, 0, decision_index)
+    prepared_matrix = _prepared_return_matrix(window, market, ids)
+    assert prepared_matrix is not None
+    assert np.array_equal(
+        np.isnan(prepared_matrix), np.isnan(reference_matrix)
+    )
+
+    policy = StockRiskPolicy(
+        top_k=4,
+        volatility_lookback_sessions=20,
+        covariance_lookback_sessions=60,
+    )
+    ref_cov, ref_source = _covariance(panel, ids, policy)
+    prep_cov, prep_source = causal_covariance_or_fallback(
+        prepared_matrix,
+        volatility_lookback_sessions=20,
+        covariance_lookback_sessions=60,
+    )
+    assert ref_source == prep_source == "fallback"
+    assert np.allclose(ref_cov, prep_cov)
+    assert np.all(np.isfinite(ref_cov))
+    assert np.all(np.linalg.eigvalsh(ref_cov) >= -1e-12)

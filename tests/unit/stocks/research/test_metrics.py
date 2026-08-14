@@ -1,6 +1,7 @@
 """Ranking-quality and economic-attribution metrics."""
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime, timedelta
 
 import polars as pl
@@ -113,3 +114,51 @@ def test_economic_transfer_attribution_rejects_invalid_inputs() -> None:
     )
     with pytest.raises(ValueError, match="non-finite"):
         economic_transfer_attribution(non_finite, "residual_o2o_5d", 2)
+
+def test_compounded_growth_metrics_is_exact_and_evidence_complete() -> None:
+    from src.stocks.research.metrics import compounded_growth_metrics
+
+    daily = [0.01] * 252
+    metrics = compounded_growth_metrics(daily, 252)
+    assert metrics["evidence_complete"] == 1.0
+    assert metrics["cagr"] == pytest.approx((1.01) ** 252 - 1, rel=1e-12)
+    assert metrics["mdd"] == 0.0
+    assert math.isinf(metrics["calmar"])
+
+    short = compounded_growth_metrics([0.01, 0.02], 252)
+    expected = math.expm1((math.log1p(0.01) + math.log1p(0.02)) * 252 / 2)
+    assert short["evidence_complete"] == 1.0
+    assert short["cagr"] == pytest.approx(expected, rel=1e-12)
+
+    drawdown = compounded_growth_metrics(
+        [0.01, 0.02, -0.03, 0.01, 0.02], 252
+    )
+    assert drawdown["evidence_complete"] == 1.0
+    assert drawdown["mdd"] > 0.0
+    assert drawdown["calmar"] == pytest.approx(
+        drawdown["cagr"] / drawdown["mdd"], rel=1e-12
+    )
+
+    flat = compounded_growth_metrics([0.0] * 252, 252)
+    assert flat["evidence_complete"] == 1.0
+    assert flat["cagr"] == 0.0
+    assert flat["calmar"] == 0.0
+
+
+def test_compounded_growth_metrics_fails_closed_on_incomplete_evidence() -> None:
+    from src.stocks.research.metrics import compounded_growth_metrics
+
+    for invalid in ([], [-1.0], [-1.01], [float("nan")], [float("inf")], [None], [1.0, float("nan")]):
+        metrics = compounded_growth_metrics(list(invalid), 252)
+        assert metrics["evidence_complete"] == 0.0, invalid
+        assert metrics["cagr"] == 0.0
+        assert metrics["mdd"] == 0.0
+        assert metrics["calmar"] == 0.0
+    with pytest.raises(ValueError, match="annualization"):
+        compounded_growth_metrics([0.01], 0)
+
+
+def test_compounded_growth_metrics_contract_assertion() -> None:
+    from src.stocks.research.metrics import compounded_growth_metrics
+
+    assert compounded_growth_metrics([0.01] * 252, 252)["cagr"] > 0.0
