@@ -3058,6 +3058,138 @@ def test_economic_transfer_evidence_injects_registered_compounding_gate_values()
     json.dumps(safe)
 
 
+def test_transfer_label_frame_projects_and_dedups() -> None:
+    """SCENARIO_ML_SELECTION_MEMORY_FIX_01: the helper projects to the four
+    label columns and dedups the projected frame, never the full panel."""
+    from src.stocks.workflows.train_model import _transfer_label_frame
+
+    _oos, panel = _transfer_evidence_panel(n_sessions=6)
+    label_frame = _transfer_label_frame(panel, "residual_o2o_5d")
+    assert set(label_frame.columns) == {
+        "session", "instrument_id", "residual_o2o_5d", "label_available_time"
+    }
+    assert label_frame.height == panel.height
+    assert label_frame.columns == panel.select(
+        "session", "instrument_id", "residual_o2o_5d", "label_available_time"
+    ).columns
+
+    duplicated = pl.concat([panel, panel.head(1)])
+    with pytest.raises(ValueError, match="duplicate"):
+        _transfer_label_frame(duplicated, "residual_o2o_5d")
+
+    no_availability = panel.drop("label_available_time")
+    with pytest.raises(ValueError, match="availability"):
+        _transfer_label_frame(no_availability, "residual_o2o_5d")
+
+
+def test_economic_transfer_evidence_compact_equals_full_panel() -> None:
+    """SCENARIO_ML_SELECTION_MEMORY_FIX_02: a compact label frame yields
+    byte-identical diagnostic output to passing the full wide panel."""
+    from src.stocks.workflows.train_model import (
+        _economic_transfer_evidence,
+        _transfer_label_frame,
+    )
+
+    oos_scored, panel = _transfer_evidence_panel(n_sessions=6)
+    wide = panel.with_columns(
+        pl.Series("feature__volatility_20d", [0.01] * panel.height),
+        pl.Series("residual_o2o_10d", [0.02] * panel.height),
+    )
+    replay = _positive_replay()
+    full = _economic_transfer_evidence(oos_scored, wide, "residual_o2o_5d", 2, replay)
+    compact = _economic_transfer_evidence(
+        oos_scored,
+        _transfer_label_frame(wide, "residual_o2o_5d"),
+        "residual_o2o_5d",
+        2,
+        replay,
+    )
+    assert full == compact
+    assert set(compact["ranking"]) == set(full["ranking"])
+    json.dumps(compact)
+
+
+def test_select_economic_champion_passes_compact_labels(monkeypatch, tmp_path) -> None:
+    """SCENARIO_ML_SELECTION_MEMORY_FIX_03: _select_economic_champion passes the
+    compact four-column label frame to _evaluate_economic_candidate, never the
+    full tuning panel."""
+    import src.stocks.workflows.train_model as tm
+
+    monkeypatch.setattr(tm, "_MIN_TRAIN_SESSIONS", 40)
+    monkeypatch.setattr(tm, "_VALIDATION_BLOCK_SESSIONS", 30)
+
+    df = stock_v2_composed_df(n_sessions=140, n_tickers=20)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    label_span = (manifest.label_horizon_sessions or 1) + 1
+    folds = tm.PurgedWalkForward(
+        n_folds=3,
+        label_horizon_sessions=label_span,
+        embargo_sessions=5,
+        session_column="session_index",
+        validation_window_sessions=30,
+        min_train_sessions=40,
+    ).split(panel)
+    assert len(folds) == 3
+
+    monkeypatch.setattr(tm, "_fit_stable_contexts", _fake_fold_contexts)
+    monkeypatch.setattr(
+        tm,
+        "_score_trial_fold",
+        lambda *_a, **_kw: _fake_fold_evidence(lower_bound=0.01, mean=0.02),
+    )
+    monkeypatch.setattr(
+        tm,
+        "_pool_screen_evidence",
+        lambda *_a, **_kw: (0.01, 0.02, 0.97, 12),
+    )
+
+    def _refit_with_oos(*_a, **_kw):
+        indices = _kw.get("fold_indices") or tuple(range(3))
+        oos = pl.DataFrame(
+            {
+                "session": [datetime(2024, 1, 5, tzinfo=UTC)],
+                "instrument_id": ["A"],
+                "pred_score": [0.9],
+            }
+        )
+        return ([0.05] * len(indices), oos)
+
+    monkeypatch.setattr(tm, "_fit_and_score_candidate", _refit_with_oos)
+    monkeypatch.setattr(
+        tm,
+        "_event_ledger_evaluation",
+        lambda *_a, **_kw: _positive_replay(strategy_returns=[0.001] * 60),
+    )
+    monkeypatch.setattr(tm, "_build_calibration_ledger", lambda *_a, **_kw: pl.DataFrame())
+
+    captured: dict[str, object] = {}
+    real_evaluate = tm._evaluate_economic_candidate
+
+    def recorder(*args, **kwargs):
+        captured["panel"] = kwargs.get("panel")
+        return real_evaluate(*args, **kwargs)
+
+    monkeypatch.setattr(tm, "_evaluate_economic_candidate", recorder)
+
+    request = TrainingRequest(artifact_id="compact_selection", n_folds=3, optuna_trials=3)
+    tm._tune_champion(
+        panel[folds[0].train_mask],
+        request,
+        _tune_base_manifest("compact_selection", manifest, manifest.label_definition),
+        tuple(c for c in df.columns if c.startswith("feature__")),
+        (tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),),
+        dataset_manifest=manifest,
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    panel_arg = captured["panel"]
+    assert panel_arg is not None
+    assert set(panel_arg.columns) == {
+        "session", "instrument_id", "residual_o2o_5d", "label_available_time"
+    }
+
 def test_gate3_active_information_ratio_replaces_stable_ir() -> None:
     budget = PromotionRiskBudget()
     request = TrainingRequest(artifact_id="gate3", n_folds=3)
