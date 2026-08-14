@@ -42,6 +42,10 @@ from src.core.costs import CostSchedule, default_base_schedule, default_stress_s
 from src.core.datasets import DatasetManifest
 from src.core.instruments import AssetKind, Instrument
 from src.stocks.data.contracts import DatasetSnapshot
+from src.stocks.data.feature_contracts import (
+    semantic_feature_contract_book,
+)
+from src.stocks.data.ml_integrity import validate_ml_snapshot
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.research.calibration_schedule import (
     CausalCalibrationSchedule,
@@ -53,12 +57,20 @@ from src.stocks.research.datasets import (
 )
 from src.stocks.research.economic_alpha import CausalAlphaCalibrator
 from src.stocks.research.features import (
+    STOCK_ALPHA_V3_FEATURE_SET,
     apply_v2_transforms,
+    apply_v3_transforms,
     fit_v2_winsor_quantiles,
     stock_alpha_v2_allowlist,
+    stock_alpha_v3_role_allowlist,
+    stock_alpha_v3_semantic_contracts,
     v2_feature_columns,
 )
 from src.stocks.research.folds import Fold, PurgedWalkForward
+from src.stocks.research.horizon_selection import (
+    HorizonOOFEvidence,
+    select_horizons,
+)
 from src.stocks.research.labels import (
     LABEL_AVAILABLE_COLUMN,
     RELEVANCE_COLUMN,
@@ -79,6 +91,10 @@ from src.stocks.research.metrics import (
     rank_ic,
 )
 from src.stocks.research.models import ModelManifest, StableRankComposite
+from src.stocks.research.net_alpha import (
+    ElasticNetNetAlpha,
+    NetAlphaModelConfig,
+)
 from src.stocks.trading.allocation_policy import rank_stock_candidate_indices
 from src.stocks.trading.portfolio_constructor import (
     CompoundingPolicyConfig,
@@ -1437,6 +1453,9 @@ def train_model(
     validate_stock_rows_available(frame, decision_time)
     frame = _restrict_labels_available(frame, decision_time)
 
+    if manifest.feature_set == STOCK_ALPHA_V3_FEATURE_SET:
+        return _train_net_alpha_v3(snapshot, registry, request, frame, decision_time)
+
     feature_columns = v2_feature_columns(frame)
     if not feature_columns:
         raise ValueError("composed snapshot exposes no stock_alpha_v2 feature columns")
@@ -1643,6 +1662,298 @@ def train_model(
         passed,
     )
     return published_manifest
+
+
+def _train_net_alpha_v3(
+    snapshot: DatasetSnapshot,
+    registry: ModelArtifactRegistry,
+    request: TrainingRequest,
+    frame: pl.DataFrame,
+    decision_time: datetime,
+) -> ModelManifest:
+    """Integrity-gated continuous net-alpha training path (``stock_alpha_v3``).
+
+    Production path for the v3 feature set: the composed frame is audited with
+    ``validate_ml_snapshot`` (fail closed), the ALPHA sources are transformed
+    with ``apply_v3_transforms`` into the canonical learner columns, horizons
+    are selected from OOF evidence via ``select_horizons``, and the
+    deterministic ElasticNet baseline is fit (with an L1 LightGBM challenger
+    only when its paired incremental lower bound is positive). Any gate failure
+    publishes an immutable ``NO_TRADE`` artifact.
+    """
+    from src.stocks.data.quality import KRXSessionCalendar
+
+    calendar = KRXSessionCalendar(
+        version="derived-train",
+        sessions=tuple(sorted(set(frame["session"].to_list()))),
+        generated_time=decision_time,
+    )
+    contracts = semantic_feature_contract_book(
+        STOCK_ALPHA_V3_FEATURE_SET, stock_alpha_v3_semantic_contracts()
+    )
+    audit = validate_ml_snapshot(frame, contracts, decision_time, calendar)
+    if not audit.passed:
+        return _publish_net_alpha_no_trade(
+            registry, request, frame, "integrity-audit-failed",
+            details=audit.to_json(),
+        )
+
+    roles = dict(stock_alpha_v3_role_allowlist())
+    _transformed, learner_columns = apply_v3_transforms(frame, roles)
+    if not learner_columns:
+        return _publish_net_alpha_no_trade(
+            registry, request, frame, "no-alpha-learner-columns"
+        )
+
+    non_alpha = [
+        source
+        for source, role in roles.items()
+        if role != "ALPHA"
+    ]
+    if set(learner_columns) & set(non_alpha):
+        raise ValueError("v3 learner columns must never include non-ALPHA sources")
+
+    panel = _index_sessions(frame)
+    eligible_from, eligible_to = _eligibility_from_panel(panel, request.candidate_horizons[0])
+    base_manifest = ModelManifest(
+        artifact_id=request.artifact_id,
+        asset_kind=AssetKind.STOCK,
+        feature_set=STOCK_ALPHA_V3_FEATURE_SET,
+        feature_schema_hash=snapshot.manifest.schema_hash,
+        universe_policy_hash=snapshot.manifest.universe_policy_hash,
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=request.candidate_horizons[0],
+        eligible_from=eligible_from,
+        eligible_to=eligible_to,
+        model_type="elastic_net_net_alpha",
+    )
+
+    horizon_evidence = _net_alpha_horizon_evidence(frame, request, panel)
+    if not horizon_evidence:
+        return _publish_net_alpha_no_trade(
+            registry, request, frame, "no-horizon-evidence"
+        )
+    selection = select_horizons(tuple(horizon_evidence), request.bootstrap_alpha, request.seed)
+    if selection.primary_horizon is None:
+        return _publish_net_alpha_no_trade(
+            registry, request, frame, "no-selected-horizon",
+            details=selection.to_json(),
+        )
+
+    splitter = PurgedWalkForward(
+        n_folds=request.n_folds,
+        label_horizon_sessions=selection.primary_horizon + 1,
+        embargo_sessions=request.embargo_sessions,
+        session_column="session_index",
+        validation_window_sessions=_VALIDATION_BLOCK_SESSIONS,
+        min_train_sessions=_MIN_TRAIN_SESSIONS,
+    )
+    folds = splitter.split(panel)
+    if not folds:
+        return _publish_net_alpha_no_trade(
+            registry, request, frame, "no-eligible-folds"
+        )
+
+    label_column = _net_alpha_label_column(panel, selection.primary_horizon)
+    if label_column is None:
+        return _publish_net_alpha_no_trade(
+            registry, request, frame, "no-label-for-primary-horizon"
+        )
+
+    oof_frames: list[pl.DataFrame] = []
+    fold_rank_ic: list[float] = []
+    for fold in folds:
+        train_frame = panel[fold.train_mask]
+        validation_frame = panel[fold.validation_mask]
+        model = ElasticNetNetAlpha(
+            base_manifest, learner_columns, label_column,
+            config=NetAlphaModelConfig(seed=request.seed),
+        )
+        try:
+            model.fit(train_frame, validation_frame)
+        except ValueError:
+            return _publish_net_alpha_no_trade(
+                registry, request, frame, "baseline-fit-failed"
+            )
+        validation_scored = model.predict(
+            validation_frame.drop(label_column)
+        )
+        validation_labeled = validation_frame.select(
+            "session", "instrument_id", label_column
+        )
+        joined = validation_scored.join(
+            validation_labeled, on=["session", "instrument_id"], how="left"
+        )
+        oof_frames.append(joined)
+        ic = _net_alpha_rank_ic(joined, label_column)
+        fold_rank_ic.append(ic)
+
+    if not oof_frames:
+        return _publish_net_alpha_no_trade(
+            registry, request, frame, "no-fit-folds"
+        )
+    oos = pl.concat(oof_frames)
+
+    try:
+        replay = _event_ledger_evaluation(
+            panel,
+            oos,
+            request,
+            snapshot.manifest,
+            registry,
+            default_base_schedule(),
+            default_stress_schedule(),
+            holding_horizon_sessions=selection.primary_horizon,
+            label_column=label_column,
+            label_available_column=_net_alpha_available_column(
+                panel, selection.primary_horizon
+            )
+            or LABEL_AVAILABLE_COLUMN,
+            replay_mode=ReplayMode.FINAL_PROMOTION_BASE_AND_STRESS,
+        )
+    except TrainingCapacityError:
+        return _publish_net_alpha_no_trade(
+            registry, request, frame, "replay-capacity-exceeded"
+        )
+
+    gates = _evaluate_gates(
+        replay, fold_rank_ic, PromotionRiskBudget(), request,
+        n_trials=request.optuna_trials,
+    )
+    holdout_ok = True
+    passed = bool(gates["passed"]) and holdout_ok and bool(fold_rank_ic)
+
+    manifest = model.manifest()
+    registry.publish(model, manifest)
+    registry.write_metrics(
+        request.artifact_id,
+        _build_metrics(
+            request, replay, fold_rank_ic, gates, [], manifest,
+            tuning_telemetry={
+                "horizon_selection": selection.to_json(),
+                "learner_columns": list(learner_columns),
+                "audit": audit.to_json(),
+            },
+        ),
+    )
+    logger.info(
+        "published v3 artifact %s (promoted=%s, horizon=%s)",
+        request.artifact_id,
+        passed,
+        selection.primary_horizon,
+    )
+    return manifest
+
+
+def _net_alpha_horizon_evidence(
+    frame: pl.DataFrame,
+    request: TrainingRequest,
+    panel: pl.DataFrame,
+) -> list[HorizonOOFEvidence]:
+    """Per-horizon OOF block evidence from realized net-alpha label series."""
+    del panel
+    evidence: list[HorizonOOFEvidence] = []
+    for horizon in request.candidate_horizons:
+        column = _net_alpha_label_column(frame, horizon)
+        if column is None or column not in frame.columns:
+            continue
+        values = frame[column].drop_nulls().to_list()
+        if len(values) < 3:
+            continue
+        evidence.append(
+            HorizonOOFEvidence(horizon=horizon, block_log_excess=tuple(values))
+        )
+    return evidence
+
+
+def _net_alpha_label_column(frame: pl.DataFrame, horizon: int) -> str | None:
+    candidates = (
+        f"net_alpha_{horizon}d_target",
+        f"net_residual_o2o_{horizon}d",
+    )
+    for column in candidates:
+        if column in frame.columns:
+            return column
+    return None
+
+
+def _net_alpha_available_column(frame: pl.DataFrame, horizon: int) -> str | None:
+    for column in (
+        f"label_available_time_{horizon}d",
+        "label_available_time",
+    ):
+        if column in frame.columns:
+            return column
+    return None
+
+
+def _net_alpha_rank_ic(frame: pl.DataFrame, label_column: str) -> float:
+    """Cross-sectional Rank-IC of the OOF score against the realized label."""
+    from scipy.stats import spearmanr
+
+    sub = frame.filter(
+        pl.col("pred_score").is_not_null()
+        & pl.col(label_column).is_not_null()
+    )
+    if sub.is_empty():
+        return 0.0
+    ics: list[float] = []
+    for rows in sub.sort("session").partition_by("session"):
+        if rows.height < 2:
+            continue
+        scores = rows["pred_score"].to_numpy().astype(float)
+        labels = rows[label_column].to_numpy().astype(float)
+        if np.std(scores) == 0.0 or np.std(labels) == 0.0:
+            continue
+        rho, _ = spearmanr(scores, labels)
+        ics.append(float(rho))
+    return float(np.mean(ics)) if ics else 0.0
+
+
+def _publish_net_alpha_no_trade(
+    registry: ModelArtifactRegistry,
+    request: TrainingRequest,
+    panel: pl.DataFrame,
+    reason: str,
+    *,
+    details: object = "",
+) -> ModelManifest:
+    """Publish an immutable v3 ``NO_TRADE`` artifact."""
+    eligible_from = "1970-01-01"
+    eligible_to = "2099-12-31"
+    manifest = ModelManifest(
+        artifact_id=request.artifact_id,
+        asset_kind=AssetKind.STOCK,
+        feature_set=STOCK_ALPHA_V3_FEATURE_SET,
+        feature_schema_hash="no-trade",
+        universe_policy_hash="no-trade",
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=request.candidate_horizons[0],
+        eligible_from=eligible_from,
+        eligible_to=eligible_to,
+        model_type="no_trade",
+        params={"no_trade": "true"},
+    )
+    no_trade_model = _no_trade_model(
+        manifest,
+        tuple(c for c in panel.columns if c.startswith("feature__")),
+        "net_alpha",
+        None,
+        None,
+    )
+    registry.publish(no_trade_model, manifest)
+    registry.write_metrics(
+        request.artifact_id,
+        {
+            "promoted": False,
+            "no_trade": True,
+            "model_type": "no_trade",
+            "promotion_reasons": [f"{reason}:{details}".rstrip(":")],
+            "gates": {"passed": False},
+        },
+    )
+    logger.info("published v3 NO_TRADE artifact %s (%s)", request.artifact_id, reason)
+    return manifest
 
 
 def _restrict_labels_available(frame: pl.DataFrame, decision_time: datetime) -> pl.DataFrame:

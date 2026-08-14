@@ -60,6 +60,12 @@ _COST_AWARE_CONTROL_COLUMNS = ("market_cap", "beta", "volatility")
 _MIN_COST_AWARE_ROWS_PER_SESSION = 30
 _REFERENCE_PARTICIPATION = 0.01
 
+NET_ALPHA_TARGET_PREFIX = "net_alpha_"
+NET_ALPHA_CONTINUOUS_SUFFIX = "_target"
+NET_ALPHA_DEFINITION = "net_alpha_o2o"
+NET_ALPHA_ALGORITHM_VERSION = "calendar-net-alpha-o2o-v1"
+_MIN_NET_ALPHA_ROWS_PER_SESSION = 30
+
 
 def build_label_dataset(
     base_panel: pl.DataFrame,
@@ -761,6 +767,230 @@ def build_multi_horizon_cost_aware_residual_label_dataset(
     return out
 
 
+def build_net_alpha_label_dataset(
+    base_panel: pl.DataFrame,
+    calendar: KRXSessionCalendar,
+    cost_schedule: CostSchedule,
+    liquidity_model: LiquiditySlippageModel,
+    *,
+    horizon_sessions: int,
+    reference_notional: float,
+) -> pl.DataFrame:
+    """Build a continuous, session-robust net-alpha label horizon.
+
+    Replaces the quintile ``relevance`` target with the cost/risk-aware net
+    residual open-to-open label normalized to a continuous session-robust
+    scale: within each decision session the net residual is median-centered and
+    divided by its MAD (median absolute deviation), so the cross-sectional
+    target is comparable across sessions and preserves return magnitude. A
+    session whose MAD is zero is unlearnable and is excluded with its reason
+    recorded.
+
+    ``reference_notional`` is the reference notional for the round-trip cost
+    (derived from the replay minimum order unit and portfolio value, never an
+    arbitrary participation constant). ``label_available_time`` is the exact
+    exit-session open timestamp in UTC.
+
+    The result schema is ``instrument_id, session, gross_o2o_<h>d,
+    risk_fitted_<h>d, risk_residual_<h>d, reference_cost_<h>d,
+    net_residual_o2o_<h>d, net_alpha_<h>d_target, label_available_time_<h>d``
+    with no relevance column.
+    """
+    if horizon_sessions <= 0:
+        raise ValueError("horizon_sessions must be positive")
+    if reference_notional <= 0:
+        raise ValueError("reference_notional must be positive")
+    required = (
+        ID_COLUMN,
+        SESSION_COLUMN,
+        "open",
+        "sector",
+        "adtv",
+        *_COST_AWARE_CONTROL_COLUMNS,
+    )
+    missing = [c for c in required if c not in base_panel.columns]
+    if missing:
+        raise ValueError(f"net-alpha label requires base panel columns {missing}")
+
+    sessions = list(calendar.sessions)
+    by_date = {session: index for index, session in enumerate(sessions)}
+    if len(by_date) != len(sessions):
+        raise ValueError("calendar contains duplicate sessions")
+
+    panel = base_panel.with_columns(pl.col(SESSION_COLUMN).cast(pl.Date).alias("_session_date"))
+    calendar_frame = pl.DataFrame(
+        {
+            "_session_date": sessions,
+            "_cal_pos": list(range(len(sessions))),
+            "_entry_date": [sessions[p + 1] if p + 1 < len(sessions) else None for p in range(len(sessions))],
+            "_exit_date": [
+                sessions[p + 1 + horizon_sessions]
+                if p + 1 + horizon_sessions < len(sessions)
+                else None
+                for p in range(len(sessions))
+            ],
+        }
+    )
+    panel = panel.join(calendar_frame, on="_session_date", how="left")
+    unknown = panel.filter(pl.col("_cal_pos").is_null() | pl.col("_session_date").is_null())
+    if not unknown.is_empty():
+        raise ValueError("base panel contains non-calendar sessions")
+
+    prices = panel.select(
+        ID_COLUMN,
+        pl.col("_session_date").alias("_price_date"),
+        pl.col("open"),
+    )
+    entries = prices.select(
+        ID_COLUMN,
+        pl.col("_price_date").alias("_entry_date"),
+        pl.col("open").alias("_entry_open"),
+    )
+    exits = prices.select(
+        ID_COLUMN,
+        pl.col("_price_date").alias("_exit_date"),
+        pl.col("open").alias("_exit_open"),
+    )
+    panel = (
+        panel.join(entries, on=[ID_COLUMN, "_entry_date"], how="left")
+        .join(exits, on=[ID_COLUMN, "_exit_date"], how="left")
+        .filter(pl.col("_entry_open").is_not_null() & pl.col("_exit_open").is_not_null())
+    )
+    gross = pl.col("_exit_open").log() - pl.col("_entry_open").log()
+    panel = panel.with_columns(gross.alias("_gross"))
+    label_available = (
+        pl.col("_exit_date")
+        .dt.combine(pl.lit(_KRX_AVAILABLE_TIME))
+        .dt.replace_time_zone("Asia/Seoul")
+        .dt.convert_time_zone("UTC")
+    )
+    panel = panel.with_columns(label_available.alias("_label_available"))
+
+    suffix = f"{horizon_sessions}d"
+    gross_column = f"{COST_AWARE_GROSS_PREFIX}{suffix}"
+    fitted_column = f"{COST_AWARE_RISK_FITTED_PREFIX}{suffix}"
+    residual_column = f"{COST_AWARE_RISK_RESIDUAL_PREFIX}{suffix}"
+    cost_column = f"{COST_AWARE_REFERENCE_COST_PREFIX}{suffix}"
+    net_column = f"{COST_AWARE_O2O_PREFIX}{suffix}"
+    target_column = f"{NET_ALPHA_TARGET_PREFIX}{suffix}{NET_ALPHA_CONTINUOUS_SUFFIX}"
+    available_column = f"label_available_time_{suffix}"
+
+    log_size = panel.select(
+        ID_COLUMN, SESSION_COLUMN, pl.col("market_cap").log().alias("_log_size")
+    )
+    panel = panel.join(log_size, on=[ID_COLUMN, SESSION_COLUMN], how="left")
+
+    rows: list[dict[str, object]] = []
+    rejected_sessions: list[tuple[object, str]] = []
+    for session_date in panel["_session_date"].unique().sort():
+        session = panel.filter(pl.col("_session_date") == session_date)
+        finite = session.filter(
+            pl.col("_gross").is_not_null()
+            & pl.col("_gross").is_finite()
+            & pl.col("_log_size").is_not_null()
+            & pl.col("beta").is_not_null()
+            & pl.col("volatility").is_not_null()
+            & pl.col("adtv").is_not_null()
+            & (pl.col("adtv") > 0)
+            & pl.col("sector").is_not_null()
+            & pl.col("open").is_not_null()
+            & (pl.col("open") > 0)
+        )
+        if finite.height < _MIN_NET_ALPHA_ROWS_PER_SESSION:
+            rejected_sessions.append((session_date, "undersized"))
+            continue
+        design = _sector_design_matrix(
+            np.asarray(finite["sector"].to_list(), dtype=object),
+            np.asarray(finite["_log_size"].to_list(), dtype=np.float64),
+            np.asarray(finite["beta"].to_list(), dtype=np.float64),
+            np.asarray(finite["volatility"].to_list(), dtype=np.float64),
+        )
+        if design.shape[0] <= design.shape[1]:
+            rejected_sessions.append((session_date, "rank-deficient"))
+            continue
+        gross_values = np.asarray(finite["_gross"].to_list(), dtype=np.float64)
+        if not np.all(np.isfinite(design)):
+            rejected_sessions.append((session_date, "non-finite-design"))
+            continue
+        try:
+            fitted = _project_risk_return(design, gross_values)
+        except ValueError:
+            rejected_sessions.append((session_date, "risk-projection-failed"))
+            continue
+        residual = gross_values - fitted
+        adtvs = np.asarray(finite["adtv"].to_list(), dtype=np.float64)
+        vols = np.asarray(finite["volatility"].to_list(), dtype=np.float64)
+        reference_prices = np.asarray(finite["open"].to_list(), dtype=np.float64)
+        decision_times = [_as_utc_datetime(value) for value in finite[SESSION_COLUMN].to_list()]
+        costs = np.asarray(
+            [
+                _round_trip_cost_rate(
+                    cost_schedule,
+                    liquidity_model,
+                    decision_time=decision_time,
+                    adtv=float(adtv),
+                    volatility=float(vol),
+                    reference_price=float(price),
+                    participation=reference_notional / float(adtv),
+                )
+                for decision_time, adtv, vol, price in zip(
+                    decision_times, adtvs, vols, reference_prices, strict=True
+                )
+            ],
+            dtype=np.float64,
+        )
+        net = residual - costs
+        median = float(np.median(net))
+        mad = float(np.median(np.abs(net - median)))
+        if not np.isfinite(mad) or mad <= 0.0:
+            rejected_sessions.append((session_date, "zero-mad"))
+            continue
+        target = (net - median) / mad
+        available_times = finite["_label_available"].to_list()
+        session_objects = finite[SESSION_COLUMN].to_list()
+        instrument_ids = finite[ID_COLUMN].to_list()
+        rows.extend(
+            {
+                ID_COLUMN: instrument_ids[index],
+                SESSION_COLUMN: _as_utc_datetime(session_objects[index]),
+                gross_column: float(gross_values[index]),
+                fitted_column: float(fitted[index]),
+                residual_column: float(residual[index]),
+                cost_column: float(costs[index]),
+                net_column: float(net[index]),
+                target_column: float(target[index]),
+                available_column: available_times[index],
+            }
+            for index in range(finite.height)
+        )
+    if not rows:
+        logger.info(
+            "net-alpha label %s: no session cleared risk/cost/MAD gates",
+            target_column,
+        )
+        return pl.DataFrame(
+            schema={
+                ID_COLUMN: pl.Utf8,
+                SESSION_COLUMN: pl.Datetime("us", "UTC"),
+                gross_column: pl.Float64,
+                fitted_column: pl.Float64,
+                residual_column: pl.Float64,
+                cost_column: pl.Float64,
+                net_column: pl.Float64,
+                target_column: pl.Float64,
+                available_column: pl.Datetime("us", "UTC"),
+            }
+        )
+    out = pl.DataFrame(rows)
+    logger.info(
+        "built net-alpha label %s: %s rows, rejected sessions %s",
+        target_column,
+        out.height,
+        rejected_sessions,
+    )
+    return out
+
+
 @dataclass(frozen=True, slots=True)
 class LabelDatasetResult:
     """Immutable outcome of a label-dataset publication."""
@@ -988,6 +1218,97 @@ def publish_multi_horizon_residual_label_dataset(
         dataset_id,
         labels_frame.height,
         list(horizons),
+    )
+    return LabelDatasetResult(
+        dataset_id=dataset_id,
+        manifest=manifest,
+        partition_paths=partition_paths,
+        row_count=labels_frame.height,
+        base_panel_hash=base_panel_hash,
+    )
+
+
+def publish_net_alpha_label_dataset(
+    labels_frame: pl.DataFrame,
+    *,
+    destination_root: Path,
+    dataset_id: str,
+    base_panel_hash: str,
+    calendar_hash: str,
+    horizon_sessions: int,
+    provider_version: str = "base-panel-labels",
+    universe_policy_version: str = "provisional-legacy",
+    certification: DatasetCertification = DatasetCertification.PROVISIONAL,
+    generated_time: datetime | None = None,
+) -> LabelDatasetResult:
+    """Publish a continuous net-alpha label horizon.
+
+    The manifest declares ``label_definition="net_alpha_o2o"`` with the exact
+    horizon; the content manifest records the net-alpha algorithm version and
+    the reference notional semantics. Each horizon is published independently
+    (no common-universe inner join), so the training side records per-horizon
+    label universes instead of shrinking the sample.
+    """
+    if horizon_sessions <= 0:
+        raise ValueError("horizon_sessions must be positive")
+    suffix = f"{horizon_sessions}d"
+    definition = LabelDefinition(
+        name=f"{COST_AWARE_O2O_PREFIX}{suffix}",
+        entry_field="open",
+        exit_field="open",
+        horizon_sessions=horizon_sessions,
+    )
+    required = (ID_COLUMN, SESSION_COLUMN, definition.name, LABEL_AVAILABLE_COLUMN)
+    missing = [c for c in required if c not in labels_frame.columns]
+    if missing:
+        raise ValueError(f"net-alpha label dataset missing columns {missing}")
+    if labels_frame.is_empty():
+        raise ValueError("cannot publish an empty net-alpha label dataset")
+    generated_time = generated_time or datetime.now(UTC)
+    ordered_columns = list(labels_frame.columns)
+    manifest = make_manifest(
+        asset_kind=AssetKind.STOCK,
+        columns=ordered_columns,
+        feature_set=LABEL_FEATURE_SET,
+        label_definition=NET_ALPHA_DEFINITION,
+        label_horizon_sessions=horizon_sessions,
+        time_start=_as_utc_datetime(labels_frame[SESSION_COLUMN].min()),
+        time_end=_as_utc_datetime(labels_frame[SESSION_COLUMN].max()),
+        provider_version=provider_version,
+        universe_policy_version=universe_policy_version,
+        row_count=labels_frame.height,
+        generated_time=generated_time,
+        certification=certification,
+        calendar_hash=calendar_hash,
+        schema_version="v2",
+        content_hash=canonical_content_hash(labels_frame, ordered_columns),
+        storage_layout=HIVE_PARTITION_LAYOUT,
+    )
+    content_manifest: dict[str, object] = {
+        "base_panel_hash": base_panel_hash,
+        "calendar_hash": calendar_hash,
+        "label_definition": NET_ALPHA_DEFINITION,
+        "label_horizon_sessions": horizon_sessions,
+        "entry_field": "open",
+        "exit_field": "open",
+        "generated_time": generated_time.isoformat(),
+        "label_algorithm_version": NET_ALPHA_ALGORITHM_VERSION,
+    }
+    store = ParquetDatasetStore(Path(destination_root))
+    dataset_dir = store.write_partitioned(
+        labels_frame,
+        dataset_id=dataset_id,
+        manifest=manifest,
+        expected_feature_set=LABEL_FEATURE_SET,
+        decision_time=generated_time,
+        content_manifest=content_manifest,
+    )
+    partition_paths = tuple(sorted((dataset_dir / "partitions").rglob("*.parquet")))
+    logger.info(
+        "published net-alpha label dataset %s: %s rows, horizon %s",
+        dataset_id,
+        labels_frame.height,
+        horizon_sessions,
     )
     return LabelDatasetResult(
         dataset_id=dataset_id,
