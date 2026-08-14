@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_ML_RUN_COMPLETION",
+      "date": "2026-08-14",
+      "adr_id": "ADR_20260814_STOCK_ML_RUN_COMPLETION",
+      "domain": "stocks",
+      "title": "Durable ML run completion under memory peaks",
+      "why": "Repeated 81-trial stock ML runs completed the h5 screen but ended before h10 confirmation and final metrics were published, with no durable evidence of the termination cause.",
+      "resolution": "Added explicit LightGBM resource cleanup, isolated confirmation-candidate execution, per-cell confirmation checkpoints and resume state, and phase RSS telemetry while preserving economic selection gates and deterministic ranking contracts.",
+      "impact": "Confirmation progress survives worker termination and native-memory peaks; final artifacts can be resumed and audited without changing CAGR/MDD or promotion semantics."
+    },
+    {
       "task_id": "TASK_STOCK_SELECTION_MEMORY_FIX",
       "date": "2026-08-14",
       "adr_id": "ADR_20260814_STOCK_SELECTION_MEMORY_FIX",
