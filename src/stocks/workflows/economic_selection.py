@@ -93,7 +93,8 @@ class ScreenFidelityPolicy:
             promotion_width,
             max(1, math.ceil(math.sqrt(promotion_width))),
         )
-        confirmation_width = promotion_width
+        confirmation_width = min(2, promotion_width)
+        economic_finalist_width = min(1, promotion_width)
         recovery_width = economic_finalist_width
         return cls(
             route_budget=route_budget,
