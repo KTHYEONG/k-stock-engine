@@ -211,7 +211,7 @@ def test_calibrated_replay_and_cycle_produce_identical_targets(tmp_path) -> None
         label_horizon_sessions=manifest.label_horizon_sessions,
         eligible_from="2024-01-01T00:00:00+00:00",
         eligible_to="2024-03-31T00:00:00+00:00",
-        model_type="lambdarank_blend",
+        model_type="net_alpha_elastic_net",
     )
     registry.publish(_CalibratedRankingModel(), model_manifest)
     registry.write_metrics("a002", {"promoted": True})

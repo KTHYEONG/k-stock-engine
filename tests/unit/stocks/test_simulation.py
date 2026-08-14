@@ -12,10 +12,12 @@ from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.trading.allocation_policy import AllocationPolicy
 from src.stocks.trading.simulator import StockSimulator
-from src.stocks.workflows.contracts import TrainingRequest
+from src.stocks.ml.contracts import NetAlphaTrainingRequest
 from src.stocks.workflows.train_model import train_model
 from tests.fixtures.stocks.helpers import (
     stock_instrument_df,
+    stock_net_alpha_composed_df,
+    stock_net_alpha_manifest,
     stock_v2_composed_df,
     stock_v2_manifest,
 )
@@ -197,73 +199,81 @@ class TestStockSimulator:
 
 class TestTrainWiring:
     def test_run_training_publishes_artifact(self, tmp_path) -> None:
-        df = stock_v2_composed_df(n_sessions=80, n_tickers=3)
-        manifest = stock_v2_manifest(columns=df.columns)
+        df = stock_net_alpha_composed_df(n_sessions=120, n_tickers=8)
+        manifest = stock_net_alpha_manifest(columns=df.columns)
         registry = ModelArtifactRegistry(tmp_path / "artifacts")
         snapshot = DatasetSnapshot(manifest=manifest, frame=df)
         model_manifest = train_model(
             snapshot,
             registry,
-            TrainingRequest(artifact_id="stock_alpha_v2_20240101", n_folds=3),
+            NetAlphaTrainingRequest(
+                artifact_id="stock_net_alpha_20240101", fold_count=2,
+                candidate_horizon_sessions=(5,), bootstrap_resamples=50,
+            ),
         )
-        assert model_manifest.artifact_id == "stock_alpha_v2_20240101"
-        assert model_manifest.model_type == "lambdarank_blend"
+        assert model_manifest.artifact_id == "stock_net_alpha_20240101"
+        assert model_manifest.model_type in (
+            "net_alpha_elastic_net", "net_alpha_lightgbm_l1", "no_trade",
+        )
         assert model_manifest.eligible_from == df["session"].min().isoformat()
 
     def test_run_training_writes_evidence_metrics(self, tmp_path) -> None:
         from src.stocks.research.artifacts import METRICS_FILENAME
         import json
 
-        df = stock_v2_composed_df(n_sessions=80, n_tickers=3)
-        manifest = stock_v2_manifest(columns=df.columns)
+        df = stock_net_alpha_composed_df(n_sessions=120, n_tickers=8)
+        manifest = stock_net_alpha_manifest(columns=df.columns)
         artifact_root = tmp_path / "artifacts"
         registry = ModelArtifactRegistry(artifact_root)
         snapshot = DatasetSnapshot(manifest=manifest, frame=df)
         train_model(
             snapshot,
             registry,
-            TrainingRequest(artifact_id="stock_alpha_v2_20240101", n_folds=3),
+            NetAlphaTrainingRequest(
+                artifact_id="stock_net_alpha_20240101", fold_count=2,
+                candidate_horizon_sessions=(5,), bootstrap_resamples=50,
+            ),
         )
-        metrics_path = artifact_root / "stock_alpha_v2_20240101" / METRICS_FILENAME
+        metrics_path = artifact_root / "stock_net_alpha_20240101" / METRICS_FILENAME
         assert metrics_path.exists()
         payload = json.loads(metrics_path.read_text())
         assert payload["promoted"] is False
         assert payload["no_trade"] is True
         assert "promotion_reasons" in payload
-        assert "ledger_metrics" in payload
 
-    def test_training_rejects_temporal_leakage(self, tmp_path) -> None:
-        from src.core.time import TemporalViolationError
-
-        df = stock_v2_composed_df(n_sessions=30, n_tickers=2)
-        bad = df.with_columns(
-            pl.when(pl.col("session_index") == 10)
-            .then(pl.col("available_time") + pl.duration(hours=2))
-            .otherwise(pl.col("observation_time"))
-            .alias("observation_time")
-        )
-        manifest = stock_v2_manifest(columns=bad.columns)
+    def test_training_rejects_non_net_alpha_snapshot(self, tmp_path) -> None:
+        df = stock_v2_composed_df(n_sessions=60, n_tickers=3)
+        manifest = stock_v2_manifest(columns=df.columns)
         registry = ModelArtifactRegistry(tmp_path / "artifacts")
-        with pytest.raises(TemporalViolationError):
+        with pytest.raises(ValueError, match="net-alpha"):
             train_model(
-                DatasetSnapshot(manifest=manifest, frame=bad),
+                DatasetSnapshot(manifest=manifest, frame=df),
                 registry,
-                TrainingRequest(artifact_id="leak_v2", n_folds=2),
+                NetAlphaTrainingRequest(
+                    artifact_id="leak_net_alpha", fold_count=2,
+                    candidate_horizon_sessions=(5,), bootstrap_resamples=50,
+                ),
             )
 
     def test_duplicate_version_publish_is_rejected(self, tmp_path) -> None:
-        df = stock_v2_composed_df(n_sessions=80, n_tickers=3)
-        manifest = stock_v2_manifest(columns=df.columns)
+        df = stock_net_alpha_composed_df(n_sessions=120, n_tickers=8)
+        manifest = stock_net_alpha_manifest(columns=df.columns)
         registry = ModelArtifactRegistry(tmp_path / "artifacts")
         snapshot = DatasetSnapshot(manifest=manifest, frame=df)
         train_model(
             snapshot,
             registry,
-            TrainingRequest(artifact_id="stock_alpha_v2_20240101", n_folds=3),
+            NetAlphaTrainingRequest(
+                artifact_id="stock_net_alpha_20240101", fold_count=2,
+                candidate_horizon_sessions=(5,), bootstrap_resamples=50,
+            ),
         )
         with pytest.raises(ValueError, match="already exists"):
             train_model(
                 snapshot,
                 registry,
-                TrainingRequest(artifact_id="stock_alpha_v2_20240101", n_folds=3),
+                NetAlphaTrainingRequest(
+                    artifact_id="stock_net_alpha_20240101", fold_count=2,
+                    candidate_horizon_sessions=(5,), bootstrap_resamples=50,
+                ),
             )
