@@ -52,3 +52,90 @@ def max_drawdown(equity_curve: list[float] | np.ndarray) -> float:
     peaks = np.maximum.accumulate(eq)
     dd = (peaks - eq) / np.where(peaks > 0, peaks, 1.0)
     return float(np.max(dd)) if dd.size else 0.0
+
+
+def economic_transfer_attribution(
+    scored: pl.DataFrame,
+    label_column: str,
+    top_k: int,
+) -> dict[str, float | int]:
+    """Cross-sectional ranking-to-selected-tail attribution per retained session.
+
+    For every retained session the score-to-label ordering is measured with the
+    cross-sectional Spearman Rank-IC, and the label mean of the top ``top_k``
+    names is compared against the session universe mean so the report can see
+    whether the ordering concentrates in the ownable tail before any costs or
+    allocation. Top-k membership turnover versus the preceding retained session
+    quantifies how much of the tail is rebuilt each decision (``1.0`` for the
+    first retained session). Rows with a missing label are excluded, never
+    zero-filled, and a non-finite score or label entering a retained session
+    raises ``ValueError``. An empty valid frame returns zero-valued aggregates.
+    """
+    if top_k < 1:
+        raise ValueError("top_k must be positive")
+    required = ("session", "instrument_id", "pred_score", label_column)
+    missing = [column for column in required if column not in scored.columns]
+    if missing:
+        raise ValueError(
+            "economic transfer attribution requires " + ", ".join(missing)
+        )
+    valid = scored.filter(
+        pl.col("pred_score").is_not_null() & pl.col(label_column).is_not_null()
+    )
+    non_finite = valid.filter(
+        ~pl.col("pred_score").is_finite() | ~pl.col(label_column).is_finite()
+    )
+    if not non_finite.is_empty():
+        raise ValueError("non-finite score or label enters a retained session")
+    if valid.is_empty():
+        return {
+            "decision_count": 0,
+            "retained_session_count": 0,
+            "session_coverage": 0.0,
+            "positive_rank_ic_session_count": 0,
+            "mean_rank_ic": 0.0,
+            "mean_top_k_label": 0.0,
+            "mean_universe_label": 0.0,
+            "mean_top_k_active_label": 0.0,
+            "mean_membership_turnover": 0.0,
+        }
+    total_sessions = int(
+        scored.select(pl.col("session").n_unique()).to_series()[0]
+    )
+    rank_ics: list[float] = []
+    top_k_labels: list[float] = []
+    universe_labels: list[float] = []
+    active_labels: list[float] = []
+    turnovers: list[float] = []
+    previous_members: set[str] = set()
+    previous_size = 0
+    for cross in valid.sort("session").partition_by("session"):
+        k = min(top_k, int(cross.height))
+        top = cross.sort("pred_score", descending=True).head(k)
+        members = set(top["instrument_id"].to_list())
+        turnover = (
+            1.0
+            - len(previous_members & members) / max(previous_size, len(members))
+            if previous_size
+            else 1.0
+        )
+        universe = float(np.mean(cross[label_column].to_numpy()))
+        top_mean = float(np.mean(top[label_column].to_numpy()))
+        rank_ics.append(rank_ic(cross["pred_score"], cross[label_column]))
+        universe_labels.append(universe)
+        top_k_labels.append(top_mean)
+        active_labels.append(top_mean - universe)
+        turnovers.append(turnover)
+        previous_members, previous_size = members, len(members)
+    retained = len(rank_ics)
+    return {
+        "decision_count": retained,
+        "retained_session_count": retained,
+        "session_coverage": retained / max(total_sessions, 1),
+        "positive_rank_ic_session_count": sum(1 for value in rank_ics if value > 0.0),
+        "mean_rank_ic": float(np.mean(rank_ics)) if rank_ics else 0.0,
+        "mean_top_k_label": float(np.mean(top_k_labels)) if top_k_labels else 0.0,
+        "mean_universe_label": float(np.mean(universe_labels)) if universe_labels else 0.0,
+        "mean_top_k_active_label": float(np.mean(active_labels)) if active_labels else 0.0,
+        "mean_membership_turnover": float(np.mean(turnovers)) if turnovers else 0.0,
+    }
