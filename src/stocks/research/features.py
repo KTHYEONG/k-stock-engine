@@ -8,6 +8,7 @@ names.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 
@@ -17,6 +18,10 @@ ID_COLUMN = "instrument_id"
 SESSION_COLUMN = "session"
 _PRICE_COLUMNS = ("open", "high", "low", "close")
 _TARGET_PREFIXES = ("target_", "label_")
+
+FEATURE_ROLES = ("ALPHA", "RISK", "LIQUIDITY", "CONTROL")
+_ALPHA_ROLE = "ALPHA"
+_V3_RANK_EQUIVALENT_CORRELATION = 0.999
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,6 +368,156 @@ def v2_missing_rates(
         non_null = frame[column].is_not_null().sum()
         rates[column] = 1.0 - (float(non_null) / frame.height if frame.height else 1.0)
     return rates
+
+
+def _validate_v3_roles(feature_roles: Mapping[str, str]) -> None:
+    invalid = [c for c, role in feature_roles.items() if role not in FEATURE_ROLES]
+    if invalid:
+        raise ValueError(
+            f"v3 feature roles must be one of {FEATURE_ROLES}; invalid sources {invalid}"
+        )
+
+
+def _rank_equivalent_cluster(
+    frame: pl.DataFrame,
+    alpha_sources: tuple[str, ...],
+    session_column: str,
+) -> tuple[str, ...]:
+    """Deterministic correlation-cluster reduction of exact-duplicate sources.
+
+    Only training-fold rows participate: each ALPHA source is ranked within its
+    session and pairwise rank correlations are computed over the training
+    window. Sources whose same-session rank series have correlation at or above
+    ``_V3_RANK_EQUIVALENT_CORRELATION`` form one family; the representative is
+    the lexicographically first canonical source name in the family, never the
+    one with the best full-history IC. A single source or a
+    non-finite/incomplete correlation returns the input unchanged.
+    """
+    if len(alpha_sources) <= 1:
+        return alpha_sources
+    ordered = tuple(sorted(alpha_sources))
+    ranked = frame.select(
+        *(
+            (pl.col(source).rank("average").over(session_column)).alias(f"__rk_{index}")
+            for index, source in enumerate(ordered)
+        )
+    )
+    keep: list[str] = []
+    for index, source in enumerate(ordered):
+        if ranked[f"__rk_{index}"].is_null().all():
+            keep.append(source)
+            continue
+        duplicate = False
+        for prior_index in range(index):
+            corr_value = ranked.select(
+                pl.corr(f"__rk_{index}", f"__rk_{prior_index}")
+            ).to_series()[0]
+            if corr_value is not None and float(corr_value) >= _V3_RANK_EQUIVALENT_CORRELATION:
+                duplicate = True
+                break
+        if not duplicate:
+            keep.append(source)
+    return tuple(keep)
+
+
+def apply_v3_transforms(
+    frame: pl.DataFrame,
+    feature_roles: Mapping[str, str],
+    *,
+    session_column: str = SESSION_COLUMN,
+    sector_column: str = "sector",
+) -> tuple[pl.DataFrame, tuple[str, ...]]:
+    """Build the v3 predictor frame: role-aware ranks, sector ranks, missing flags.
+
+    Only sources declared with role ``ALPHA`` enter the learner. Each canonical
+    ALPHA source is ranked once within its session from its raw causal value;
+    the sector-relative rank is derived from that rank (never re-ranked).
+    Exact rank-equivalent families are reduced to one deterministic
+    representative using training-fold rows only. A missing indicator is
+    emitted only for a source with both missing and observed values in the
+    fold, so no constant indicator is ever created.
+
+    Args:
+        frame: training-fold panel carrying ``session_column``, ``sector_column``
+            and every declared source column.
+        feature_roles: mapping of source column to exactly one of
+            ``FEATURE_ROLES``.
+
+    Returns:
+        ``(transformed, learner_columns)`` where ``learner_columns`` names the
+        emitted ALPHA predictor columns in deterministic order.
+    """
+    _validate_v3_roles(feature_roles)
+    if session_column not in frame.columns:
+        raise ValueError(f"frame must carry {session_column!r}")
+    if sector_column not in frame.columns:
+        raise ValueError(f"frame must carry {sector_column!r} for sector-relative rank")
+    sources = tuple(feature_roles)
+    missing = [c for c in sources if c not in frame.columns]
+    if missing:
+        raise ValueError(f"v3 feature sources missing from frame: {missing}")
+    _reject_target_columns(frame, sources)
+    for column in sources:
+        non_finite = frame.filter(pl.col(column).is_not_null() & ~pl.col(column).is_finite())
+        if not non_finite.is_empty():
+            raise ValueError(f"non-finite value in v3 feature source {column}")
+    alpha_sources = tuple(c for c in sources if feature_roles[c] == _ALPHA_ROLE)
+    canonical = _rank_equivalent_cluster(frame, alpha_sources, session_column)
+    if not canonical:
+        return frame, ()
+
+    rank_exprs: list[pl.Expr] = []
+    for index, column in enumerate(canonical):
+        within = pl.col(column).count().over(session_column)
+        rank = ((pl.col(column).rank("average").over(session_column) - 1.0) / (within - 1.0))
+        rank_exprs.append(
+            rank.fill_null(0.5).cast(pl.Float32).alias(f"__v3_rank_{index}")
+        )
+    ranked = frame.with_columns(rank_exprs)
+
+    sector_exprs: list[pl.Expr] = []
+    for index, _ in enumerate(canonical):
+        sector_mean = pl.col(f"__v3_rank_{index}").mean().over([session_column, sector_column])
+        sector_exprs.append(
+            ((pl.col(f"__v3_rank_{index}") - sector_mean).cast(pl.Float32)).alias(
+                f"__v3_sector_rank_{index}"
+            )
+        )
+    expanded = ranked.with_columns(sector_exprs)
+
+    out_exprs: list[pl.Expr] = []
+    for column in expanded.columns:
+        if column.startswith(("__v3_rank_", "__v3_sector_rank_")):
+            continue
+        if column in sources:
+            continue
+        out_exprs.append(pl.col(column))
+    learner_columns: list[str] = []
+    for index, column in enumerate(canonical):
+        missing_indicator = (
+            pl.when(pl.col(column).is_null()).then(1.0).otherwise(0.0).cast(pl.Float32)
+        )
+        null_count = int(frame[column].is_null().sum())
+        observed_count = int(frame[column].is_not_null().sum())
+        if null_count > 0 and observed_count > 0:
+            missing_name = f"{column}__missing"
+            out_exprs.extend(
+                [
+                    pl.col(f"__v3_rank_{index}").alias(f"{column}__rank"),
+                    pl.col(f"__v3_sector_rank_{index}").alias(f"{column}__sector_rank"),
+                    missing_indicator.alias(missing_name),
+                ]
+            )
+            learner_columns.extend([f"{column}__rank", f"{column}__sector_rank", missing_name])
+        else:
+            out_exprs.extend(
+                [
+                    pl.col(f"__v3_rank_{index}").alias(f"{column}__rank"),
+                    pl.col(f"__v3_sector_rank_{index}").alias(f"{column}__sector_rank"),
+                ]
+            )
+            learner_columns.extend([f"{column}__rank", f"{column}__sector_rank"])
+    return expanded.select(out_exprs), tuple(learner_columns)
 
 
 def _reject_target_columns(frame: pl.DataFrame, feature_columns: tuple[str, ...]) -> None:

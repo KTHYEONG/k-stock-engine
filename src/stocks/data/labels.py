@@ -19,8 +19,10 @@ from datetime import UTC, date, datetime, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import polars as pl
 
+from src.core.costs import CostSchedule, LiquiditySlippageModel
 from src.core.datasets import (
     HIVE_PARTITION_LAYOUT,
     DatasetCertification,
@@ -46,6 +48,17 @@ MIN_RESIDUAL_GROUP = 20
 RESIDUAL_ALGORITHM_VERSION = "calendar-residual-o2o-v1"
 SUPPORTED_RESIDUAL_HORIZONS = (5, 10, 15)
 MULTI_HORIZON_RESIDUAL_DEFINITION = "residual_o2o_multi_5_10_15d"
+
+COST_AWARE_O2O_PREFIX = "net_residual_o2o_"
+COST_AWARE_GROSS_PREFIX = "gross_o2o_"
+COST_AWARE_RISK_FITTED_PREFIX = "risk_fitted_"
+COST_AWARE_RISK_RESIDUAL_PREFIX = "risk_residual_"
+COST_AWARE_REFERENCE_COST_PREFIX = "reference_cost_"
+COST_AWARE_RESIDUAL_ALGORITHM_VERSION = "calendar-cost-aware-residual-o2o-v1"
+MULTI_HORIZON_COST_AWARE_DEFINITION = "net_residual_o2o_multi_5_10_15d"
+_COST_AWARE_CONTROL_COLUMNS = ("market_cap", "beta", "volatility")
+_MIN_COST_AWARE_ROWS_PER_SESSION = 30
+_REFERENCE_PARTICIPATION = 0.01
 
 
 def build_label_dataset(
@@ -386,6 +399,366 @@ def build_multi_horizon_residual_label_dataset(
 def label_available_time(exit_session: date) -> datetime:
     """Availability timestamp for a terminal horizon session (after close)."""
     return datetime.combine(exit_session, _KRX_AVAILABLE_TIME, tzinfo=_KRX_TZ).astimezone(UTC)
+
+
+def _round_trip_cost_rate(
+    cost_schedule: CostSchedule,
+    liquidity_model: LiquiditySlippageModel,
+    *,
+    decision_time: datetime,
+    adtv: float,
+    volatility: float,
+    reference_price: float,
+    participation: float,
+) -> float:
+    """One round trip cost rate (decimal) for the reference notional.
+
+    The reference notional is ``participation * decision_time_ADTV``; slippage
+    uses the point-in-time liquidity model at that notional, and the round trip
+    adds buy/sell commission once each plus the sell-side tax. Fails closed on
+    non-positive inputs or a missing cost-coverage decision time.
+    """
+    if participation <= 0:
+        raise ValueError("reference participation must be positive")
+    notional = participation * adtv
+    if notional <= 0:
+        raise ValueError("reference notional must be positive")
+    point = cost_schedule.cost_for(decision_time)
+    slippage_bps = liquidity_model.slippage_bps(
+        notional=notional,
+        adtv_20d=adtv,
+        daily_volatility=volatility,
+        reference_price=reference_price,
+        effective_time=decision_time,
+    )
+    return (
+        2.0 * point.commission_rate + point.tax_rate + 2.0 * slippage_bps / 10_000.0
+    )
+
+
+def _project_risk_return(
+    design: np.ndarray,
+    gross: np.ndarray,
+) -> np.ndarray:
+    """Equal-weight cross-sectional risk projection via deterministic SVD.
+
+    Solves ``min ||gross - design @ beta||`` with ``np.linalg.lstsq``
+    (deterministic SVD path) and returns the fitted values. The caller rejects
+    rank-deficient or non-finite sessions; no row is ever fabricated here.
+    """
+    coefficients, _, rank, _ = np.linalg.lstsq(design, gross, rcond=None)
+    if rank < design.shape[1]:
+        raise ValueError("risk projection is rank-deficient")
+    fitted = np.asarray(design @ coefficients, dtype=np.float64)
+    if not np.all(np.isfinite(fitted)):
+        raise ValueError("risk projection produced non-finite fitted returns")
+    return fitted
+
+
+def _sector_design_matrix(sector_labels: np.ndarray, log_sizes: np.ndarray, betas: np.ndarray, vols: np.ndarray) -> np.ndarray:
+    """Deterministic equal-weight design: intercept, sector dummies, controls.
+
+    Sector dummies omit the lexicographically first sector (reference category)
+    to keep the design full rank; the three decision-time controls are
+    standardized cross-sectionally (z-scores) after log-size conversion.
+    """
+    sectors = np.asarray([str(s) for s in sector_labels], dtype=object)
+    unique = np.sort(np.unique(sectors))
+    dummy_cols = [
+        (sectors == sector).astype(np.float64) for sector in unique[1:]
+    ]
+    controls = [log_sizes, betas, vols]
+    for values in controls:
+        mean = float(np.nanmean(values))
+        std = float(np.nanstd(values))
+        standardized = np.where(np.isnan(values), 0.0, (values - mean) / std if std > 0 else np.zeros_like(values))
+        dummy_cols.append(standardized)
+    return np.column_stack([np.ones(sectors.shape[0], dtype=np.float64), *dummy_cols])
+
+
+def build_single_horizon_cost_aware_residual_labels(
+    base_panel: pl.DataFrame,
+    calendar: KRXSessionCalendar,
+    cost_schedule: CostSchedule,
+    liquidity_model: LiquiditySlippageModel,
+    *,
+    horizon_sessions: int,
+    reference_participation: float,
+) -> pl.DataFrame:
+    """Build one cost-aware, risk-residualized open-to-open label horizon.
+
+    For each decision session with at least ``_MIN_COST_AWARE_ROWS_PER_SESSION``
+    finite constituents, the gross open-to-open return is projected on an
+    equal-weight cross-sectional design (intercept, sector dummies omitting the
+    lexicographically first sector, decision-time standardized log-size, beta,
+    and volatility) with deterministic SVD. The risk residual is
+    ``gross - fitted`` and the net residual subtracts the point-in-time round
+    trip cost at ``reference_participation * decision_time_ADTV``. Sessions that
+    are rank-deficient, undersized, or non-finite are rejected outright.
+
+    The result schema is ``instrument_id, session, gross_o2o_<h>d,
+    risk_fitted_<h>d, risk_residual_<h>d, reference_cost_<h>d,
+    net_residual_<h>d, relevance_<h>d, label_available_time_<h>d`` where
+    ``relevance`` is the target-only cross-sectional quintile of the net
+    residual and ``label_available_time`` is the terminal exit-open timestamp.
+    """
+    if horizon_sessions <= 0:
+        raise ValueError("horizon_sessions must be positive")
+    if reference_participation <= 0:
+        raise ValueError("reference_participation must be positive")
+    required = (
+        ID_COLUMN,
+        SESSION_COLUMN,
+        "open",
+        "sector",
+        "adtv",
+        *_COST_AWARE_CONTROL_COLUMNS,
+    )
+    missing = [c for c in required if c not in base_panel.columns]
+    if missing:
+        raise ValueError(f"cost-aware residual label requires base panel columns {missing}")
+
+    sessions = list(calendar.sessions)
+    by_date = {session: index for index, session in enumerate(sessions)}
+    if len(by_date) != len(sessions):
+        raise ValueError("calendar contains duplicate sessions")
+
+    panel = base_panel.with_columns(pl.col(SESSION_COLUMN).cast(pl.Date).alias("_session_date"))
+    calendar_frame = pl.DataFrame(
+        {
+            "_session_date": sessions,
+            "_cal_pos": list(range(len(sessions))),
+            "_entry_date": [sessions[p + 1] if p + 1 < len(sessions) else None for p in range(len(sessions))],
+            "_exit_date": [
+                sessions[p + 1 + horizon_sessions]
+                if p + 1 + horizon_sessions < len(sessions)
+                else None
+                for p in range(len(sessions))
+            ],
+        }
+    )
+    panel = panel.join(calendar_frame, on="_session_date", how="left")
+    unknown = panel.filter(pl.col("_cal_pos").is_null() | pl.col("_session_date").is_null())
+    if not unknown.is_empty():
+        raise ValueError("base panel contains non-calendar sessions")
+
+    prices = panel.select(
+        ID_COLUMN,
+        pl.col("_session_date").alias("_price_date"),
+        pl.col("open"),
+    )
+    entries = prices.select(
+        ID_COLUMN,
+        pl.col("_price_date").alias("_entry_date"),
+        pl.col("open").alias("_entry_open"),
+    )
+    exits = prices.select(
+        ID_COLUMN,
+        pl.col("_price_date").alias("_exit_date"),
+        pl.col("open").alias("_exit_open"),
+    )
+    panel = (
+        panel.join(entries, on=[ID_COLUMN, "_entry_date"], how="left")
+        .join(exits, on=[ID_COLUMN, "_exit_date"], how="left")
+        .filter(pl.col("_entry_open").is_not_null() & pl.col("_exit_open").is_not_null())
+    )
+    gross = pl.col("_exit_open").log() - pl.col("_entry_open").log()
+    panel = panel.with_columns(gross.alias("_gross"))
+    label_available = (
+        pl.col("_exit_date")
+        .dt.combine(pl.lit(_KRX_AVAILABLE_TIME))
+        .dt.replace_time_zone("Asia/Seoul")
+        .dt.convert_time_zone("UTC")
+    )
+    panel = panel.with_columns(label_available.alias("_label_available"))
+
+    suffix = f"{horizon_sessions}d"
+    gross_column = f"{COST_AWARE_GROSS_PREFIX}{suffix}"
+    fitted_column = f"{COST_AWARE_RISK_FITTED_PREFIX}{suffix}"
+    residual_column = f"{COST_AWARE_RISK_RESIDUAL_PREFIX}{suffix}"
+    cost_column = f"{COST_AWARE_REFERENCE_COST_PREFIX}{suffix}"
+    net_column = f"{COST_AWARE_O2O_PREFIX}{suffix}"
+    relevance_column = f"relevance_{suffix}"
+    available_column = f"label_available_time_{suffix}"
+
+    log_size = panel.select(
+        ID_COLUMN, SESSION_COLUMN, pl.col("market_cap").log().alias("_log_size")
+    )
+    panel = panel.join(log_size, on=[ID_COLUMN, SESSION_COLUMN], how="left")
+
+    rows: list[dict[str, object]] = []
+    for session_date in panel["_session_date"].unique().sort():
+        session = panel.filter(pl.col("_session_date") == session_date)
+        finite = session.filter(
+            pl.col("_gross").is_not_null()
+            & pl.col("_gross").is_finite()
+            & pl.col("_log_size").is_not_null()
+            & pl.col("beta").is_not_null()
+            & pl.col("volatility").is_not_null()
+            & pl.col("adtv").is_not_null()
+            & (pl.col("adtv") > 0)
+            & pl.col("sector").is_not_null()
+            & pl.col("open").is_not_null()
+            & (pl.col("open") > 0)
+        )
+        if finite.height < _MIN_COST_AWARE_ROWS_PER_SESSION:
+            continue
+        design = _sector_design_matrix(
+            np.asarray(finite["sector"].to_list(), dtype=object),
+            np.asarray(finite["_log_size"].to_list(), dtype=np.float64),
+            np.asarray(finite["beta"].to_list(), dtype=np.float64),
+            np.asarray(finite["volatility"].to_list(), dtype=np.float64),
+        )
+        if design.shape[0] <= design.shape[1]:
+            continue
+        gross_values = np.asarray(finite["_gross"].to_list(), dtype=np.float64)
+        if not np.all(np.isfinite(design)):
+            continue
+        try:
+            fitted = _project_risk_return(design, gross_values)
+        except ValueError:
+            continue
+        residual = gross_values - fitted
+        adtvs = np.asarray(finite["adtv"].to_list(), dtype=np.float64)
+        vols = np.asarray(finite["volatility"].to_list(), dtype=np.float64)
+        reference_prices = np.asarray(finite["open"].to_list(), dtype=np.float64)
+        decision_times = [_as_utc_datetime(value) for value in finite[SESSION_COLUMN].to_list()]
+        costs = [
+            _round_trip_cost_rate(
+                cost_schedule,
+                liquidity_model,
+                decision_time=decision_time,
+                adtv=float(adtv),
+                volatility=float(vol),
+                reference_price=float(price),
+                participation=reference_participation,
+            )
+            for decision_time, adtv, vol, price in zip(
+                decision_times, adtvs, vols, reference_prices, strict=True
+            )
+        ]
+        cost_array = np.asarray(costs, dtype=np.float64)
+        net = residual - cost_array
+        order = np.argsort(net, kind="stable")
+        n = net.shape[0]
+        quintile = np.zeros(n, dtype=np.int8)
+        for bucket in range(5):
+            lo = int(np.ceil(bucket * n / 5.0))
+            hi = int(np.floor((bucket + 1) * n / 5.0))
+            quintile[order[lo:hi]] = bucket
+        available_times = finite["_label_available"].to_list()
+        for index, row in enumerate(finite.iter_rows(named=True)):
+            rows.append(
+                {
+                    ID_COLUMN: row[ID_COLUMN],
+                    SESSION_COLUMN: _as_utc_datetime(row[SESSION_COLUMN]),
+                    gross_column: float(gross_values[index]),
+                    fitted_column: float(fitted[index]),
+                    residual_column: float(residual[index]),
+                    cost_column: float(cost_array[index]),
+                    net_column: float(net[index]),
+                    relevance_column: int(quintile[index]),
+                    available_column: available_times[index],
+                }
+            )
+    if not rows:
+        logger.info(
+            "cost-aware residual label %s: no session cleared risk/cost gates",
+            net_column,
+        )
+        return pl.DataFrame(
+            schema={
+                ID_COLUMN: pl.Utf8,
+                SESSION_COLUMN: pl.Datetime("us", "UTC"),
+                gross_column: pl.Float64,
+                fitted_column: pl.Float64,
+                residual_column: pl.Float64,
+                cost_column: pl.Float64,
+                net_column: pl.Float64,
+                relevance_column: pl.Int8,
+                available_column: pl.Datetime("us", "UTC"),
+            }
+        )
+    out = pl.DataFrame(rows)
+    logger.info(
+        "built cost-aware residual label %s: %s rows",
+        net_column,
+        out.height,
+    )
+    return out
+
+
+def build_multi_horizon_cost_aware_residual_label_dataset(
+    base_panel: pl.DataFrame,
+    calendar: KRXSessionCalendar,
+    cost_schedule: CostSchedule,
+    liquidity_model: LiquiditySlippageModel,
+    *,
+    horizons: tuple[int, ...] = (5, 10, 15),
+    reference_participation: float,
+) -> pl.DataFrame:
+    """Build a key-aligned multi-horizon cost-aware residual label panel.
+
+    Each horizon is computed with the calendar-correct open-to-open gross
+    return, the cross-sectional risk projection, and the point-in-time
+    reference cost exactly as the single-horizon builder, then the panels are
+    inner-joined on ``(instrument_id, session)`` so all routes share an
+    identical universe. ``reference_participation`` is the participation rate
+    used to size the reference round-trip cost notional.
+
+    The result schema is ``instrument_id, session, gross_o2o_<h0>d,
+    risk_fitted_<h0>d, risk_residual_<h0>d, reference_cost_<h0>d,
+    net_residual_<h0>d, relevance_<h0>d, label_available_time_<h0>d,
+    gross_o2o_<h1>d, ...``.
+
+    Raises:
+        ValueError: for an empty, unsupported, duplicated, or non-ascending
+            horizon set, a non-positive participation rate, missing risk/cost
+            inputs, or when any emitted key has a non-finite net residual.
+    """
+    if not horizons:
+        raise ValueError("horizons must be non-empty")
+    if tuple(horizons) != tuple(sorted(set(horizons))):
+        raise ValueError("horizons must be strictly ascending and unique")
+    unsupported = [h for h in horizons if h not in SUPPORTED_RESIDUAL_HORIZONS]
+    if unsupported:
+        raise ValueError(
+            f"unsupported residual horizons {unsupported}; "
+            f"supported {SUPPORTED_RESIDUAL_HORIZONS}"
+        )
+    if reference_participation <= 0:
+        raise ValueError("reference_participation must be positive")
+    horizon_frames = [
+        build_single_horizon_cost_aware_residual_labels(
+            base_panel,
+            calendar,
+            cost_schedule,
+            liquidity_model,
+            horizon_sessions=h,
+            reference_participation=reference_participation,
+        )
+        for h in horizons
+    ]
+    out = horizon_frames[0]
+    for frame in horizon_frames[1:]:
+        out = out.join(frame, on=[ID_COLUMN, SESSION_COLUMN], how="inner")
+    out = out.sort([ID_COLUMN, SESSION_COLUMN])
+    incomplete = out.filter(
+        pl.any_horizontal(
+            pl.col(c).is_null() | ~pl.col(c).is_finite()
+            for c in out.columns
+            if c not in (ID_COLUMN, SESSION_COLUMN)
+            and not c.startswith("label_available_time_")
+        )
+    )
+    if not incomplete.is_empty():
+        raise ValueError("multi-horizon cost-aware label builder emitted an incomplete row")
+    logger.info(
+        "built multi-horizon cost-aware residual label panel %s: %s rows",
+        tuple(horizons),
+        out.height,
+    )
+    return out
 
 
 @dataclass(frozen=True, slots=True)

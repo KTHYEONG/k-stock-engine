@@ -9,11 +9,55 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import polars as pl
 
 from src.core.instruments import AssetKind
 
 _MAX_PROJECTION_ITERATIONS = 64
+
+
+def rank_stock_candidate_indices(scores: np.ndarray, instrument_ids: np.ndarray) -> np.ndarray:
+    """Return the stable ranking permutation ordering rows by score then id.
+
+    Orders original aligned rows by ``pred_score`` descending and
+    ``instrument_id`` ascending, so the returned int64 permutation can gather
+    the original rows without ever sorting the score and identifier arrays
+    independently. Ties resolve by ascending identifier.
+
+    Args:
+        scores: one-dimensional aligned model scores.
+        instrument_ids: one-dimensional aligned instrument identifiers sharing
+            the length of ``scores``.
+
+    Returns:
+        int64 permutation ``order`` such that ``instrument_ids[order]`` lists
+        identifiers from the highest score to the lowest.
+
+    Raises:
+        ValueError: when arrays are not one-dimensional, lengths differ, an
+            identifier is null or duplicated, or a score is non-finite.
+    """
+    scores_array = np.asarray(scores)
+    ids_array = np.asarray(instrument_ids)
+    if scores_array.ndim != 1 or ids_array.ndim != 1:
+        raise ValueError("scores and instrument_ids must be one-dimensional")
+    if scores_array.shape[0] != ids_array.shape[0]:
+        raise ValueError("scores and instrument_ids must have equal length")
+    if not bool(np.all(np.isfinite(scores_array))):
+        raise ValueError("scores must be finite")
+    null_ids = np.zeros(ids_array.shape[0], dtype=bool)
+    if ids_array.dtype.kind == "O":
+        null_ids |= np.frompyfunc(lambda value: value is None, 1, 1)(ids_array).astype(bool)
+    if ids_array.dtype.kind == "f":
+        null_ids |= np.isnan(ids_array.astype(np.float64))
+    if bool(np.any(null_ids)):
+        raise ValueError("instrument_ids must not contain null identifiers")
+    id_text = np.asarray([str(identifier) for identifier in ids_array], dtype=object)
+    if np.unique(id_text).size != id_text.size:
+        raise ValueError("instrument_ids must be unique")
+    order = np.lexsort((id_text, -np.asarray(scores_array, dtype=np.float64)))
+    return order.astype(np.int64, copy=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,9 +121,11 @@ class AllocationPolicy:
         if self.participation_limit > 0 and self.adtv_column not in scores.columns:
             raise ValueError(f"missing capacity input {self.adtv_column!r}")
 
-        ranked = scores.sort(
-            [pl.col(score_column).sort(descending=True), pl.col(instrument_column).sort()]
-        ).head(self.top_k)
+        order = rank_stock_candidate_indices(
+            np.asarray(scores[score_column].to_list(), dtype=np.float64),
+            np.asarray(scores[instrument_column].to_list(), dtype=object),
+        )
+        ranked = scores.gather(order).head(self.top_k)
 
         raw_weights: list[float] = []
         sectors: list[object] = []

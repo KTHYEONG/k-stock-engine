@@ -79,12 +79,14 @@ from src.stocks.research.metrics import (
     rank_ic,
 )
 from src.stocks.research.models import ModelManifest, StableRankComposite
+from src.stocks.trading.allocation_policy import rank_stock_candidate_indices
 from src.stocks.trading.portfolio_constructor import (
     CompoundingPolicyConfig,
     PreparedAllocationMarket,
     StockRiskPolicy,
     construct_target_allocations_prepared,
 )
+from src.stocks.workflows.candidate_search import run_candidate_search
 from src.stocks.workflows.contracts import (
     COMPUTE_PLAN_VERSION,
     SELECTION_MULTIPLICITY_VERSION,
@@ -1238,6 +1240,8 @@ class PreparedSelectionRoute:
         }
         policy = StockRiskPolicy(
             top_k=request.top_k,
+            target_count=request.top_k,
+            enter_rank=request.top_k,
             gross_cap=request.max_exposure,
             single_name_cap=request.max_single_weight,
             participation_limit=request.participation_limit,
@@ -1488,7 +1492,7 @@ def train_model(
         registry_root=registry.root if request.run_root is not None else None,
     )
 
-    champion_config, n_optuna_trials, champion_route = _tune_champion(
+    search_result = run_candidate_search(
         training_panel, request, base_manifest, feature_columns, route_specs,
         dataset_manifest=snapshot.manifest,
         registry=registry,
@@ -1496,22 +1500,25 @@ def train_model(
         stress_schedule=stress,
         run_store=run_store,
     )
+    champion_config = search_result.config
+    n_optuna_trials = search_result.multiplicity_count
+    champion_route = search_result.route
+    tuning_telemetry = dict(search_result.telemetry)
     if champion_config is None or champion_route is None:
         return _publish_no_trade(
             registry, request, base_manifest, panel, control_route.label_column,
             control_route.relevance_column, "no-champion-trial",
-            tuning_telemetry=LambdaRankConfig._tuning_telemetry,
+            tuning_telemetry=tuning_telemetry,
         )
 
     route = champion_route
     route_manifest = _route_manifest(base_manifest, route)
-    tuning_telemetry = getattr(champion_config, "_tuning_telemetry", None) or {}
     selected_policy_id = str(tuning_telemetry.get("selected_policy_id", ""))
-    selected_growth_risk_aversion = float(
-        tuning_telemetry.get("selected_growth_risk_aversion", 1.0)
+    selected_growth_risk_aversion = cast(
+        float, tuning_telemetry.get("selected_growth_risk_aversion", 1.0)
     )
-    selected_turnover_budget = float(
-        tuning_telemetry.get("selected_turnover_budget", 0.20)
+    selected_turnover_budget = cast(
+        float, tuning_telemetry.get("selected_turnover_budget", 0.20)
     )
     selected_compounding = (
         CompoundingPolicyConfig(growth_risk_aversion=selected_growth_risk_aversion)
@@ -1626,7 +1633,7 @@ def train_model(
         request.artifact_id,
         _build_metrics(
             request, replay, fold_rank_ic, gates, reasons, published_manifest,
-            tuning_telemetry=getattr(champion_config, "_tuning_telemetry", {}),
+            tuning_telemetry=tuning_telemetry,
         ),
     )
     logger.info(
@@ -1978,7 +1985,7 @@ def _tune_champion(
             "seed": request.seed,
             "screen_boosting_rounds": _SCREEN_BOOSTING_ROUNDS,
             "screen_early_stopping_rounds": _SCREEN_EARLY_STOPPING_ROUNDS,
-            "screen_fidelity": "execution_matched",
+            "screen_fidelity": "vectorized_economic_proxy",
             "proxy_session_stride": policy.proxy_session_stride,
             "proxy_train_rows": (
                 proxy_reference.train_rows if proxy_reference is not None else 0
@@ -2042,6 +2049,7 @@ def _tune_champion(
                 screen_config, guard, trial, 0,
                 callbacks=(), report_progress=False,
                 key_prefix=f"h{_route.horizon}_",
+                screen_only=True,
             )
             if evidence is None:
                 trial.set_user_attr("executed_proxy_folds", 1)
@@ -2564,7 +2572,7 @@ def _tune_champion(
         study.set_user_attr("selection_policy_version", SELECTION_POLICY_VERSION)
         for name, value in policy.to_json_safe().items():
             study.set_user_attr(name, value)
-        study.set_user_attr("screen_fidelity", "execution_matched")
+        study.set_user_attr("screen_fidelity", "vectorized_economic_proxy")
         study.set_user_attr("proxy_session_stride", policy.proxy_session_stride)
         study.set_user_attr("kernel_parity_version", _KERNEL_PARITY_VERSION)
         study.set_user_attr(
@@ -4086,6 +4094,7 @@ def _score_trial_fold(
     callbacks: Sequence[Callable[..., object]] = (),
     report_progress: bool = True,
     key_prefix: str = "",
+    screen_only: bool = False,
 ) -> ScreenFoldEvidence | None:
     """Score one tuning fold and return compact :class:`ScreenFoldEvidence`.
 
@@ -4113,6 +4122,18 @@ def _score_trial_fold(
     started = time.perf_counter()
     cleanup_errors: list[str] = []
     try:
+        if config.min_child_samples > context.train_rows // config.num_leaves:
+            _record_screen_failure(
+                trial,
+                key_prefix,
+                "invalid_min_child_samples",
+                {
+                    "min_child_samples": int(config.min_child_samples),
+                    "train_rows": int(context.train_rows),
+                    "num_leaves": int(config.num_leaves),
+                },
+            )
+            return None
         model_started = time.perf_counter()
         result = _score_context_model(
             context, request, base_manifest, label_column, relevance_column, config,
@@ -4137,6 +4158,59 @@ def _score_trial_fold(
         _ic, scored, outcome = result
         if outcome.best_iteration is not None:
             trial.set_user_attr("proxy_best_iteration", outcome.best_iteration)
+        if screen_only:
+            screen_started = time.perf_counter()
+            lower_bound = _economic_screen_score(
+                context.labels,
+                scored,
+                label_column=label_column,
+                top_k=request.top_k,
+                holding_horizon_sessions=int(base_manifest.label_horizon_sessions),
+                cost_schedule=request.stress_cost_schedule or default_stress_schedule(),
+                n_bootstrap=request.n_bootstrap,
+                bootstrap_alpha=request.bootstrap_alpha,
+                seed=int(
+                    np.random.SeedSequence(
+                        [request.seed, base_manifest.label_horizon_sessions,
+                         trial.number, fold_index]
+                    ).generate_state(1)[0]
+                ),
+            )
+            guard.record_fold_stage(
+                key, "vectorized_economic_screen", time.perf_counter() - screen_started
+            )
+            point_sign = (
+                "positive" if lower_bound > 0.0
+                else ("negative" if lower_bound < 0.0 else "zero")
+            )
+            return ScreenFoldEvidence(
+                rank_ic=float(_ic),
+                attempted_orders=0,
+                filled_orders=0,
+                planned_cycles=0,
+                complete_block_count=3,
+                rejected_block_count=0,
+                block_log_excess_mean=float(lower_bound),
+                lower_bound=float(lower_bound),
+                dsr_probability=0.0,
+                usable=True,
+                failure_reason=None,
+                no_trade_reason_counts={},
+                calibration_history_sessions=0,
+                eligible_bucket_count=0,
+                cash_cycles=0,
+                block_log_excess=(float(lower_bound),),
+                block_ids=(0,),
+                point_estimate_sign=point_sign,
+                cost_drag=0.0,
+                covariance_source="vectorized_proxy",
+                cash_cycle_ratio=0.0,
+                candidate_count=0,
+                ranked_count=0,
+                selected_count=0,
+                transfer={},
+                growth={},
+            )
         kernel = context.execution_kernel
         if kernel is None:
             _record_screen_failure(
@@ -4701,6 +4775,8 @@ def _prepare_replay_static_context(
     instruments = _instruments_from_frame(market_index)
     policy = StockRiskPolicy(
         top_k=request.top_k,
+        target_count=request.top_k,
+        enter_rank=request.top_k,
         gross_cap=request.max_exposure,
         single_name_cap=request.max_single_weight,
         participation_limit=request.participation_limit,
@@ -5497,10 +5573,13 @@ def _config_from_params(
     params: dict[str, Any],
     num_threads: int | None = None,
 ) -> LambdaRankConfig:
+    num_leaves = int(params["num_leaves"])
+    max_depth = int(params["max_depth"])
+    num_leaves = min(num_leaves, 2**max_depth)
     return LambdaRankConfig(
         learning_rate=float(params["learning_rate"]),
-        num_leaves=int(params["num_leaves"]),
-        max_depth=int(params["max_depth"]),
+        num_leaves=num_leaves,
+        max_depth=max_depth,
         min_child_samples=int(params["min_child_samples"]),
         feature_fraction=float(params["feature_fraction"]),
         bagging_fraction=float(params["bagging_fraction"]),
@@ -7065,7 +7144,11 @@ def _economic_screen_score(
         k = min(top_k, int(cross.height))
         if k < 1:
             continue
-        top = cross.sort("pred_score", descending=True).head(k)
+        order = rank_stock_candidate_indices(
+            np.asarray(cross["pred_score"].to_list(), dtype=np.float64),
+            np.asarray(cross["instrument_id"].to_list(), dtype=object),
+        )
+        top = cross.gather(order).head(k)
         names = top["instrument_id"].to_list()
         if previous_names:
             union = set(previous_names) | set(names)
