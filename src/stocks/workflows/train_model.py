@@ -20,6 +20,7 @@ import itertools
 import logging
 import math
 import os
+import re
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -70,6 +71,7 @@ from src.stocks.research.lambdarank import (
     adaptive_refit_rounds,
     resolve_lgb_num_threads,
 )
+from src.stocks.research.metrics import economic_transfer_attribution, rank_ic
 from src.stocks.research.models import ModelManifest, StableRankComposite
 from src.stocks.trading.portfolio_constructor import (
     CompoundingPolicyConfig,
@@ -741,6 +743,7 @@ class EconomicCandidateEvidence:
     selection_multiplicity_version: str = ""
     compounding_block_log_excess: tuple[float, ...] = ()
     compounding_block_ids: tuple[int, ...] = ()
+    economic_transfer_evidence: dict[str, object] = field(default_factory=dict)
 
     def to_json_safe(self) -> dict[str, object]:
         """JSON-serializable evidence row with deterministic failure reasons."""
@@ -794,6 +797,7 @@ class EconomicCandidateEvidence:
                 self.configured_compounding_policy_cells
             ),
             "selection_multiplicity_version": str(self.selection_multiplicity_version),
+            "economic_transfer_evidence": dict(self.economic_transfer_evidence or {}),
         }
 
 
@@ -3618,6 +3622,9 @@ def _evaluate_economic_candidate(
     exact_compounding_policy_replays: int = 0,
     configured_compounding_policy_cells: int = 0,
     selection_multiplicity_version: str = "",
+    oos_scored: pl.DataFrame | None = None,
+    panel: pl.DataFrame | None = None,
+    top_k: int = 0,
 ) -> EconomicCandidateEvidence:
     """Evaluate every economic predicate and emit immutable candidate evidence.
 
@@ -3627,7 +3634,10 @@ def _evaluate_economic_candidate(
     a finite replay, a strictly positive holding-period block-log compounding
     bootstrap lower bound, and a Deflated Sharpe probability at or above the
     frozen risk-budget threshold. The legacy daily arithmetic excess bootstrap
-    is retained only as ``legacy_daily_excess_lower_bound`` diagnostic.
+    is retained only as ``legacy_daily_excess_lower_bound`` diagnostic. When
+    ``oos_scored``, ``panel``, and ``top_k`` are supplied the diagnostic-only
+    economic-transfer report is attached with the registered compounding lower
+    bound and DSR injected unchanged.
     """
     failures: list[str] = []
     if not fold_rank_ic or not all(ic > 0.0 for ic in fold_rank_ic):
@@ -3657,6 +3667,40 @@ def _evaluate_economic_candidate(
     if dsr_probability < budget.deflated_sharpe_probability:
         failures.append("dsr_below_threshold")
     calibration_evidence = replay.calibration_evidence or {}
+    transfer_evidence: dict[str, object] = {}
+    if (
+        oos_scored is not None
+        and panel is not None
+        and top_k >= 1
+        and label_column
+    ):
+        transfer_evidence = _economic_transfer_evidence(
+            oos_scored, panel, label_column, top_k, replay
+        )
+        compounding_section = cast(
+            dict[str, object], transfer_evidence["compounding"]
+        )
+        compounding_section["block_log_excess"] = [
+            round(float(value), 10) for value in compounding.block_log_excess
+        ]
+        compounding_section["block_ids"] = list(compounding.block_ids)
+        compounding_section["complete_block_count"] = int(
+            compounding.complete_block_count
+        )
+        compounding_section["rejected_block_count"] = int(
+            compounding.rejected_block_count
+        )
+        compounding_section["bootstrap_lower_bound"] = float(
+            compounding.bootstrap_lower_bound
+        )
+        compounding_section["dsr_probability"] = float(
+            compounding.dsr_probability
+        )
+        compounding_section["geometric_excess_growth"] = (
+            float(np.mean(compounding.block_log_excess))
+            if compounding.block_log_excess
+            else 0.0
+        )
     return EconomicCandidateEvidence(
         trial_number=trial_number,
         screen_economic_lower_bound=screen_economic_lower_bound,
@@ -3715,6 +3759,7 @@ def _evaluate_economic_candidate(
         selection_multiplicity_version=selection_multiplicity_version,
         compounding_block_log_excess=tuple(compounding.block_log_excess),
         compounding_block_ids=tuple(compounding.block_ids),
+        economic_transfer_evidence=transfer_evidence,
     )
 
 
@@ -4065,6 +4110,9 @@ def _select_economic_champion(
             exact_compounding_policy_replays=1,
             configured_compounding_policy_cells=configured_compounding_policy_cells,
             selection_multiplicity_version=SELECTION_MULTIPLICITY_VERSION,
+            oos_scored=oos if not oos.is_empty() else None,
+            panel=tuning_panel,
+            top_k=request.top_k,
         )
         shortlist_evidence.append(evidence.to_json_safe())
         evidence_row = shortlist_evidence[-1]
@@ -5287,27 +5335,21 @@ def _reject_non_finite_economic_inputs(frame: pl.DataFrame) -> None:
                 raise ValueError(f"non-finite economic input in {column}")
 
 
-def _compounding_evidence(
-    strategy_returns: list[float],
-    benchmark_returns: list[float],
-    decision_boundaries: list[int],
+def _block_log_excess_series(
+    strategy_returns: Sequence[float],
+    benchmark_returns: Sequence[float],
+    decision_boundaries: Sequence[int],
     holding_horizon_sessions: int,
-    request: TrainingRequest,
-    budget: PromotionRiskBudget,
-    n_trials: int,
-) -> CompoundingEvidence:
-    """Build holding-period-consistent compounding evidence.
+) -> tuple[list[float], list[int], int]:
+    """Complete block log-excess wealth series with rejection accounting.
 
-    The aligned daily return series are split into complete route-length
-    intervals of ``holding_horizon_sessions`` consecutive returns anchored at
+    The aligned return series are split into complete route-length intervals
+    of ``holding_horizon_sessions`` consecutive returns anchored at
     ``decision_boundaries`` (defaulting to a uniform cadence from index zero).
     For every complete interval the block log-excess wealth difference
     ``sum(log1p(strategy)) - sum(log1p(benchmark))`` is computed; an interval
     with a non-finite value or a return ``<= -1`` is rejected, not clipped.
-    Incomplete leading/trailing intervals are dropped and fewer than three
-    complete blocks fail closed to a zero lower bound and zero DSR probability.
-    The seeded moving-block bootstrap (block length two rebalances) yields the
-    lower bound, and Deflated Sharpe is applied to the same block series.
+    Returns ``(blocks, block_ids, rejected_count)``.
     """
     horizon = max(1, int(holding_horizon_sessions))
     common = min(len(strategy_returns), len(benchmark_returns))
@@ -5341,6 +5383,291 @@ def _compounding_evidence(
         )
         blocks.append(float(block_excess))
         block_ids.append(start)
+    return blocks, block_ids, rejected
+
+
+def _resolve_label_available_column(
+    panel: pl.DataFrame,
+    label_column: str,
+) -> str:
+    """Resolve the route's label availability column on ``panel``.
+
+    Prefers the canonical ``LABEL_AVAILABLE_COLUMN``, then a horizon-scoped
+    ``label_available_time_{N}d`` matching a ``label_column`` ending in ``_Nd``,
+    then a sole ``label_available_time*`` column. Raises ``ValueError`` when no
+    availability column is present.
+    """
+    if LABEL_AVAILABLE_COLUMN in panel.columns:
+        return LABEL_AVAILABLE_COLUMN
+    suffix_match = re.fullmatch(r".*_(\d+)d$", label_column)
+    if suffix_match is not None:
+        scoped = f"label_available_time_{suffix_match.group(1)}d"
+        if scoped in panel.columns:
+            return scoped
+    availability = [
+        column
+        for column in panel.columns
+        if column.startswith("label_available_time")
+    ]
+    if len(availability) == 1:
+        return availability[0]
+    raise ValueError(
+        "panel must carry the label availability column for label "
+        f"column {label_column!r}"
+    )
+
+
+def _reject_duplicate_keys(frame: pl.DataFrame, label: str) -> None:
+    """Reject duplicate ``(session, instrument_id)`` keys before joining."""
+    duplicated = (
+        frame.group_by(["session", "instrument_id"], maintain_order=True)
+        .len()
+        .filter(pl.col("len") > 1)
+    )
+    if not duplicated.is_empty():
+        raise ValueError(
+            f"{label} carries duplicate (session, instrument_id) keys"
+        )
+
+
+def _economic_transfer_evidence(
+    oos_scored: pl.DataFrame,
+    panel: pl.DataFrame,
+    label_column: str,
+    top_k: int,
+    replay: ReplayResult,
+) -> dict[str, object]:
+    """Diagnostic-only causal transfer report for one candidate replay.
+
+    Joins the route labels onto the OOS score overlay only after label
+    availability (a non-null realized label and availability timestamp) and
+    reports, per retained decision session, the cross-sectional Rank-IC and
+    selected-tail label attribution; the allocator/selection overlay; the
+    execution ledger; and the replay's block-log compounding series. It never
+    modifies promotion gates, shortlisting, multiplicity counts, Optuna
+    values, or forward-holdout eligibility. Unavailable-label decisions are
+    excluded and counted in ``excluded_unavailable_label_sessions``, never
+    backfilled. The compounding ``bootstrap_lower_bound`` and
+    ``dsr_probability`` are injected by the registered gate evidence in
+    ``_evaluate_economic_candidate`` and are ``None`` here until then.
+    """
+    if top_k < 1:
+        raise ValueError("top_k must be positive")
+    missing_scored = [
+        column
+        for column in ("session", "instrument_id", "pred_score")
+        if column not in oos_scored.columns
+    ]
+    if missing_scored:
+        raise ValueError("oos_scored must carry " + ", ".join(missing_scored))
+    missing_panel = [
+        column
+        for column in ("session", "instrument_id", label_column)
+        if column not in panel.columns
+    ]
+    if missing_panel:
+        raise ValueError("panel must carry " + ", ".join(missing_panel))
+    availability_column = _resolve_label_available_column(panel, label_column)
+    _reject_duplicate_keys(oos_scored, "oos_scored")
+    _reject_duplicate_keys(panel, "panel")
+    joined = oos_scored.select("session", "instrument_id", "pred_score").join(
+        panel.select(
+            "session", "instrument_id", label_column, availability_column
+        ),
+        on=["session", "instrument_id"],
+        how="inner",
+    )
+    available = joined.filter(
+        pl.col(label_column).is_not_null()
+        & pl.col(availability_column).is_not_null()
+    )
+    non_finite = available.filter(
+        ~pl.col("pred_score").is_finite() | ~pl.col(label_column).is_finite()
+    )
+    if not non_finite.is_empty():
+        raise ValueError(
+            "non-finite retained input in economic transfer evidence"
+        )
+    scored_session_count = int(
+        oos_scored.select(pl.col("session").n_unique()).to_series()[0]
+    )
+    retained_session_count = int(
+        available.select(pl.col("session").n_unique()).to_series()[0]
+    )
+    attribution = economic_transfer_attribution(
+        available, label_column, top_k
+    )
+    overlay = dict(replay.compounding_overlay or {})
+    overlay_decision_count = int(
+        cast(int, overlay.get("decision_count", 0))
+    )
+    selected_count = (
+        overlay_decision_count
+        if overlay.get("decision_count") is not None
+        else replay.prepared_decision_count
+    )
+    sessions: list[str] = []
+    ranking_ic: list[float] = []
+    top_k_mean_label: list[float] = []
+    universe_mean_label: list[float] = []
+    active_label: list[float] = []
+    membership_turnover: list[float] = []
+    if not available.is_empty():
+        previous_members: set[str] = set()
+        previous_size = 0
+        for cross in (
+            available.sort(
+                ["session", "pred_score"], descending=[False, True]
+            ).partition_by("session")
+        ):
+            sessions.append(
+                _session_as_datetime(cross["session"][0]).isoformat()
+            )
+            ranking_ic.append(
+                rank_ic(cross["pred_score"], cross[label_column])
+            )
+            k = min(top_k, int(cross.height))
+            top = cross.sort("pred_score", descending=True).head(k)
+            members = set(top["instrument_id"].to_list())
+            if previous_size:
+                membership_turnover.append(
+                    1.0
+                    - len(previous_members & members)
+                    / max(previous_size, len(members))
+                )
+            else:
+                membership_turnover.append(1.0)
+            universe = float(cast(float, cross[label_column].mean()))
+            top_mean = float(cast(float, top[label_column].mean()))
+            universe_mean_label.append(universe)
+            top_k_mean_label.append(top_mean)
+            active_label.append(top_mean - universe)
+            previous_members, previous_size = members, len(members)
+    blocks, block_ids, rejected = _block_log_excess_series(
+        replay.strategy_returns,
+        replay.benchmark_returns,
+        replay.decision_boundaries,
+        replay.holding_horizon_sessions,
+    )
+    return {
+        "schema_version": "economic-transfer-v1",
+        "ranking": {
+            "decision_count": int(attribution["decision_count"]),
+            "retained_session_count": retained_session_count,
+            "excluded_unavailable_label_sessions": int(
+                scored_session_count - retained_session_count
+            ),
+            "coverage": float(
+                retained_session_count / max(scored_session_count, 1)
+            ),
+            "mean_rank_ic": float(attribution["mean_rank_ic"]),
+            "positive_rank_ic_session_count": int(
+                attribution["positive_rank_ic_session_count"]
+            ),
+            "sessions": sessions,
+            "rank_ic": [round(float(value), 10) for value in ranking_ic],
+        },
+        "top_k_label": {
+            "mean_top_k_active_label": float(
+                attribution["mean_top_k_active_label"]
+            ),
+            "mean_membership_turnover": float(
+                attribution["mean_membership_turnover"]
+            ),
+            "top_k_mean_label": [
+                round(float(value), 10) for value in top_k_mean_label
+            ],
+            "universe_mean_label": [
+                round(float(value), 10) for value in universe_mean_label
+            ],
+            "top_k_active_label": [
+                round(float(value), 10) for value in active_label
+            ],
+            "membership_turnover": [
+                round(float(value), 10) for value in membership_turnover
+            ],
+        },
+        "selection": {
+            "selected_count": selected_count,
+            "compounding_overlay_decision_count": overlay_decision_count,
+            "cash_count": int(cast(int, overlay.get("cash_count", 0))),
+            "cash_reasons": dict(
+                cast(dict[str, int], overlay.get("cash_reasons", {}))
+            ),
+            "mean_confidence_scale": float(
+                cast(float, overlay.get("mean_confidence_scale", 0.0))
+            ),
+            "p10_confidence_scale": float(
+                cast(float, overlay.get("p10_confidence_scale", 0.0))
+            ),
+            "positive_scale_fraction": float(
+                cast(float, overlay.get("positive_scale_fraction", 0.0))
+            ),
+            "mean_gross_before_compounding": float(
+                cast(float, overlay.get("mean_gross_before_compounding", 0.0))
+            ),
+            "mean_gross_after_compounding": float(
+                cast(float, overlay.get("mean_gross_after_compounding", 0.0))
+            ),
+            "mean_turnover_lambda": float(
+                cast(float, overlay.get("mean_turnover_lambda", 0.0))
+            ),
+        },
+        "execution": {
+            "attempted_orders": int(replay.attempted_orders),
+            "filled_orders": int(replay.filled_orders),
+            "unfilled_orders": max(
+                int(replay.attempted_orders - replay.filled_orders), 0
+            ),
+            "unfilled_order_reason_counts": dict(
+                replay.unfilled_order_reason_counts
+            ),
+            "cost_drag": float(replay.metrics.get("cost_drag", 0.0)),
+        },
+        "compounding": {
+            "block_log_excess": [
+                round(float(value), 10) for value in blocks
+            ],
+            "block_ids": list(block_ids),
+            "complete_block_count": len(blocks),
+            "rejected_block_count": rejected,
+            "geometric_excess_growth": (
+                float(np.mean(blocks)) if blocks else 0.0
+            ),
+            "bootstrap_lower_bound": None,
+            "dsr_probability": None,
+        },
+    }
+
+
+def _compounding_evidence(
+    strategy_returns: list[float],
+    benchmark_returns: list[float],
+    decision_boundaries: list[int],
+    holding_horizon_sessions: int,
+    request: TrainingRequest,
+    budget: PromotionRiskBudget,
+    n_trials: int,
+) -> CompoundingEvidence:
+    """Build holding-period-consistent compounding evidence.
+
+    The aligned daily return series are split into complete route-length
+    intervals of ``holding_horizon_sessions`` consecutive returns anchored at
+    ``decision_boundaries`` (defaulting to a uniform cadence from index zero).
+    For every complete interval the block log-excess wealth difference
+    ``sum(log1p(strategy)) - sum(log1p(benchmark))`` is computed; an interval
+    with a non-finite value or a return ``<= -1`` is rejected, not clipped.
+    Incomplete leading/trailing intervals are dropped and fewer than three
+    complete blocks fail closed to a zero lower bound and zero DSR probability.
+    The seeded moving-block bootstrap (block length two rebalances) yields the
+    lower bound, and Deflated Sharpe is applied to the same block series.
+    """
+    blocks, block_ids, rejected = _block_log_excess_series(
+        strategy_returns,
+        benchmark_returns,
+        decision_boundaries,
+        holding_horizon_sessions,
+    )
     if len(blocks) < 3:
         return CompoundingEvidence(
             block_log_excess=[],

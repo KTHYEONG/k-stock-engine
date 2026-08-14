@@ -413,6 +413,45 @@ def _positive_replay(**overrides) -> ReplayResult:
     return dataclass_replace(base, **overrides)
 
 
+def _transfer_evidence_panel(
+    n_sessions: int = 6,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Deterministic panel + OOS score overlay for economic-transfer tests.
+
+    The panel carries ``residual_o2o_5d`` and ``label_available_time`` so the
+    diagnostic can join realized labels point-in-time. The final session's
+    labels are left null to exercise unavailable-label exclusion.
+    """
+    from datetime import timedelta
+
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    rows = [
+        {
+            "session": start + timedelta(days=i),
+            "instrument_id": name,
+        }
+        for i in range(n_sessions)
+        for name in ("A", "B", "C", "D", "E")
+    ]
+    labels = pl.DataFrame(rows)
+    panel = labels.with_columns(
+        pl.Series("residual_o2o_5d", [0.08, 0.07, 0.06, 0.05, 0.04] * n_sessions),
+        pl.Series(
+            "label_available_time",
+            [start + timedelta(days=i) for i in range(n_sessions)] * 5,
+        ),
+    ).with_columns(
+        pl.when(pl.col("session") == pl.col("session").max())
+        .then(None)
+        .otherwise(pl.col("residual_o2o_5d"))
+        .alias("residual_o2o_5d")
+    )
+    oos_scored = labels.with_columns(
+        pl.Series("pred_score", [0.9, 0.8, 0.7, 0.6, 0.5] * n_sessions)
+    )
+    return oos_scored, panel
+
+
 def _fold_aware_refit(fold_ics=(0.05, 0.06, 0.07), *, reject_trials=()) -> Callable:
     """``_fit_and_score_candidate`` fake honoring the multi-fidelity fold indices.
 
@@ -2632,6 +2671,64 @@ def test_prepared_route_replay_matches_reference_replay(tmp_path) -> None:
     assert kernel_evidence.excess_returns == reference.excess_returns
 
 
+def test_prepared_replay_matches_reference_replay(tmp_path) -> None:
+    """Reference and prepared replays produce identical transfer evidence."""
+    import src.stocks.workflows.train_model as tm
+    from src.stocks.workflows.train_model import (
+        PreparedSelectionRoute,
+        _economic_transfer_evidence,
+    )
+
+    df = stock_v2_composed_df(n_sessions=70, n_tickers=8)
+    manifest = stock_v2_manifest(columns=df.columns)
+    snapshot = DatasetSnapshot(manifest=manifest, frame=df)
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    panel = _index_sessions(df)
+    last_30 = df["session"].unique().sort(descending=True).head(30).implode()
+    oos_scored = df.filter(pl.col("session").is_in(last_30)).with_columns(
+        pl.col("market_cap").rank("dense").over("session").cast(pl.Float64).alias("pred_score")
+    )
+    request = TrainingRequest(
+        artifact_id="transfer_parity",
+        n_folds=3,
+        calibration_bucket_count=4,
+        min_calibration_sessions=5,
+    )
+    base = default_base_schedule()
+    stress = default_stress_schedule()
+    context = tm._prepare_replay_static_context(panel, request)
+    reference = tm._event_ledger_evaluation(
+        panel, oos_scored, request, snapshot.manifest, registry, base, stress,
+        replay_context=context,
+    )
+    assert reference.filled_orders > 0
+    oos_sessions = tuple(
+        tm._session_as_datetime(session)
+        for session in oos_scored["session"].unique().sort().to_list()
+    )
+    prepared_route = PreparedSelectionRoute.build(
+        panel, oos_sessions, request, tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time")
+    )
+    prepared = tm._event_ledger_evaluation(
+        panel, oos_scored, request, snapshot.manifest, registry, base, stress,
+        replay_context=context, prepared_route=prepared_route,
+    )
+    reference_transfer = _economic_transfer_evidence(
+        oos_scored, panel, "residual_o2o_5d", 3, reference
+    )
+    prepared_transfer = _economic_transfer_evidence(
+        oos_scored, panel, "residual_o2o_5d", 3, prepared
+    )
+    assert reference_transfer == prepared_transfer
+    assert reference_transfer["schema_version"] == "economic-transfer-v1"
+    assert (
+        reference_transfer["execution"]["filled_orders"]
+        == reference.filled_orders
+        == prepared.filled_orders
+    )
+    json.dumps(reference_transfer)
+
+
 def test_proxy_session_filter_is_deterministic_causal_and_rule_fixed() -> None:
     """Stride-6 proxy keeps ordinal%6==0 sessions identically in train/validation."""
     import src.stocks.workflows.train_model as tm
@@ -2820,6 +2917,98 @@ def test_economic_candidate_evidence_propagates_compact_compounding_overlay() ->
     )
     assert defaulted.compounding_overlay == _positive_replay().compounding_overlay
     assert "records" not in defaulted.to_json_safe()["compounding_overlay"]
+
+
+def test_economic_transfer_evidence_reconciles_replay_overlay_and_label_availability() -> None:
+    from src.stocks.workflows.train_model import (
+        _economic_transfer_evidence,
+    )
+
+    oos_scored, panel = _transfer_evidence_panel(n_sessions=6)
+    replay = _positive_replay(
+        attempted_orders=10,
+        filled_orders=8,
+        metrics={"max_drawdown": 0.05, "turnover": 1.0, "cost_drag": 0.0021},
+        unfilled_order_reason_counts={"liquidity": 2},
+        compounding_overlay={
+            "decision_count": 3,
+            "cash_count": 1,
+            "cash_reasons": {"non-positive-confidence-edge": 1},
+            "mean_confidence_scale": 0.5,
+            "p10_confidence_scale": 0.3,
+            "positive_scale_fraction": 1.0,
+            "mean_gross_before_compounding": 0.9,
+            "mean_gross_after_compounding": 0.5,
+            "mean_turnover_lambda": 1.0,
+        },
+    )
+    evidence = _economic_transfer_evidence(
+        oos_scored, panel, "residual_o2o_5d", 2, replay
+    )
+    assert evidence["schema_version"] == "economic-transfer-v1"
+    assert evidence["ranking"]["decision_count"] == 5
+    assert evidence["ranking"]["excluded_unavailable_label_sessions"] == 1
+    assert evidence["ranking"]["coverage"] == pytest.approx(5 / 6)
+    assert evidence["ranking"]["mean_rank_ic"] > 0.0
+    assert evidence["top_k_label"]["mean_top_k_active_label"] > 0.0
+    assert evidence["selection"]["selected_count"] == 3
+    assert evidence["selection"]["compounding_overlay_decision_count"] == 3
+    assert evidence["selection"]["cash_count"] == 1
+    assert evidence["selection"]["mean_confidence_scale"] == pytest.approx(0.5)
+    assert evidence["execution"]["attempted_orders"] == 10
+    assert evidence["execution"]["filled_orders"] == 8
+    assert evidence["execution"]["unfilled_orders"] == 2
+    assert evidence["execution"]["unfilled_order_reason_counts"] == {"liquidity": 2}
+    assert evidence["execution"]["cost_drag"] == pytest.approx(0.0021)
+    assert evidence["compounding"]["complete_block_count"] >= 3
+    assert evidence["compounding"]["bootstrap_lower_bound"] is None
+    assert evidence["compounding"]["dsr_probability"] is None
+    json.dumps(evidence)
+
+    with pytest.raises(ValueError, match="duplicate"):
+        _economic_transfer_evidence(
+            pl.concat([oos_scored, oos_scored.head(1)]),
+            panel,
+            "residual_o2o_5d",
+            2,
+            replay,
+        )
+
+
+def test_economic_transfer_evidence_injects_registered_compounding_gate_values() -> None:
+    from src.stocks.workflows.train_model import (
+        _evaluate_economic_candidate,
+    )
+
+    oos_scored, panel = _transfer_evidence_panel(n_sessions=6)
+    request = TrainingRequest(artifact_id="transfer_inject", n_folds=3)
+    replay = _positive_replay()
+    evidence = _evaluate_economic_candidate(
+        [0.05, 0.06, 0.07],
+        replay,
+        request,
+        0,
+        0.05,
+        label_column="residual_o2o_5d",
+        oos_scored=oos_scored,
+        panel=panel,
+        top_k=2,
+    )
+    transfer = evidence.economic_transfer_evidence
+    assert transfer["schema_version"] == "economic-transfer-v1"
+    compounding = transfer["compounding"]
+    assert compounding["bootstrap_lower_bound"] == pytest.approx(
+        evidence.bootstrap_lower_bound
+    )
+    assert compounding["dsr_probability"] == pytest.approx(evidence.dsr_probability)
+    assert compounding["complete_block_count"] == evidence.compounding_block_count
+    assert (
+        transfer["selection"]["selected_count"]
+        == replay.compounding_overlay["decision_count"]
+    )
+    safe = evidence.to_json_safe()
+    assert safe["economic_transfer_evidence"]["schema_version"] == "economic-transfer-v1"
+    json.dumps(safe)
 
 
 def test_gate3_active_information_ratio_replaces_stable_ir() -> None:
