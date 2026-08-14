@@ -6,6 +6,9 @@ solely by NDCG or one backtest metric.
 """
 from __future__ import annotations
 
+import math
+from collections.abc import Sequence
+
 import numpy as np
 import polars as pl
 from scipy.stats import rankdata
@@ -52,6 +55,55 @@ def max_drawdown(equity_curve: list[float] | np.ndarray) -> float:
     peaks = np.maximum.accumulate(eq)
     dd = (peaks - eq) / np.where(peaks > 0, peaks, 1.0)
     return float(np.max(dd)) if dd.size else 0.0
+
+
+def compounded_growth_metrics(
+    returns: Sequence[float],
+    annualization_sessions: int,
+) -> dict[str, float]:
+    """Annualized compound-growth and drawdown metrics for one return series.
+
+    Only finite realized returns strictly greater than ``-1`` are accepted;
+    an empty, non-finite, or ``<= -1`` series is evidence-incomplete and is
+    never zero-filled, so ``evidence_complete`` is ``0.0`` and the metrics are
+    reported as zero. Otherwise ``cagr`` annualizes the exact geometric-mean
+    log growth over the observed return-interval count, ``mdd`` is the peak
+    drawdown of the cumulative equity curve, and ``calmar`` is ``cagr / mdd``
+    with ``mdd == 0`` mapping to ``+inf`` for a positive CAGR and ``0``
+    otherwise. The result is deterministic and JSON-safe for finite inputs.
+    """
+    if annualization_sessions <= 0:
+        raise ValueError("annualization_sessions must be positive")
+    arr = np.asarray(returns, dtype=float)
+    if (
+        arr.size == 0
+        or not bool(np.all(np.isfinite(arr)))
+        or bool(np.any(arr <= -1.0))
+    ):
+        return {
+            "evidence_complete": 0.0,
+            "cagr": 0.0,
+            "mdd": 0.0,
+            "calmar": 0.0,
+        }
+    log_growth = float(np.sum(np.log1p(arr)))
+    cagr = float(
+        math.expm1(log_growth * annualization_sessions / arr.size)
+    )
+    equity = np.cumprod(1.0 + arr)
+    peaks = np.maximum.accumulate(equity)
+    mdd = float(np.max(1.0 - equity / np.where(peaks > 0, peaks, 1.0)))
+    calmar = (
+        (float("inf") if cagr > 0.0 else 0.0)
+        if mdd == 0.0
+        else cagr / mdd
+    )
+    return {
+        "evidence_complete": 1.0,
+        "cagr": cagr,
+        "mdd": mdd,
+        "calmar": calmar,
+    }
 
 
 def economic_transfer_attribution(
