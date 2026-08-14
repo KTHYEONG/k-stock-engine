@@ -4506,3 +4506,242 @@ def test_no_eligible_run_emits_complete_search_ledger(monkeypatch, tmp_path) -> 
         assert row["selection_multiplicity_version"] == (
             "selection-multiplicity-global-count-v1"
         )
+
+
+def test_trial_resource_guard_records_phase_rss_and_enforces_watermark() -> None:
+    """SCENARIO_RUN_COMPLETION_01: scalar phase RSS is recorded and the 90%
+    operating watermark fails closed before an allocation is attempted."""
+    request = TrainingRequest(artifact_id="phase_rss", n_folds=3, max_rss_mib=100)
+    guard = tm.TrialResourceGuard(request, predictor_count=3)
+    guard.record_phase_rss("fit", 50.0)
+    guard.record_phase_rss("replay", 80.0)
+    assert guard.phase_rss_mib["fit"] == 50.0
+    assert guard.phase_rss_mib["replay"] == 80.0
+    assert guard.peak_rss_mib >= 80.0
+    telemetry = guard.telemetry()
+    assert telemetry["phase_rss_mib"]["fit"] == 50.0
+    assert telemetry["peak_rss_mib"] >= 80.0
+    with pytest.raises(tm.TrainingCapacityError, match="90% operating watermark"):
+        guard.record_phase_rss("worker_peak", 91.0)
+
+
+def test_confirmation_candidate_result_round_trips_json_safe() -> None:
+    """SCENARIO_RUN_COMPLETION_02: the worker result schema survives a JSON-safe
+    round trip and rejects an incomplete schema fail-closed."""
+    result = tm.ConfirmationCandidateResult(
+        trial_number=3,
+        candidate_family="blend_50",
+        route_horizon=5,
+        terminal_reason="confirmed",
+        fold_evidence=({"rank_ic": 0.05},),
+        block_log_excess=((0.01, 0.01),),
+        block_ids=((0, 1),),
+        failed_fold_index=None,
+        failure_reason=None,
+        worker_exit_code=0,
+        worker_peak_rss_mib=100.0,
+        phase_elapsed_seconds={"worker_start": 1.0},
+        input_identity_hash="in",
+        selection_identity_hash="sel",
+        is_hard_failure=False,
+    )
+    payload = result.to_json_safe()
+    json.dumps(payload)
+    restored = tm.ConfirmationCandidateResult.from_json_safe(payload)
+    assert restored == result
+    with pytest.raises(ValueError, match="incomplete confirmation result"):
+        tm.ConfirmationCandidateResult.from_json_safe({"trial_number": 1})
+
+
+def test_screen_fold_evidence_json_safe_round_trip_restores_block_series() -> None:
+    """SCENARIO_RUN_COMPLETION_03: to_json_safe excludes the block series but
+    from_json_safe restores it exactly so pooling is byte-identical."""
+    evidence = tm.ScreenFoldEvidence(
+        rank_ic=0.05,
+        attempted_orders=10,
+        filled_orders=8,
+        planned_cycles=1,
+        complete_block_count=4,
+        rejected_block_count=0,
+        block_log_excess_mean=0.01,
+        lower_bound=0.01,
+        dsr_probability=0.97,
+        usable=True,
+        failure_reason=None,
+        no_trade_reason_counts={"no-feasible-allocation": 1},
+        block_log_excess=(0.01, 0.02, 0.03, 0.04),
+        block_ids=(1, 2, 3, 4),
+        point_estimate_sign="positive",
+    )
+    payload = evidence.to_json_safe()
+    assert "block_log_excess" not in payload
+    restored = tm.ScreenFoldEvidence.from_json_safe(
+        payload,
+        block_log_excess=evidence.block_log_excess,
+        block_ids=evidence.block_ids,
+    )
+    assert restored.block_log_excess == evidence.block_log_excess
+    assert restored.block_ids == evidence.block_ids
+    assert restored.lower_bound == evidence.lower_bound
+    with pytest.raises(ValueError, match="incomplete screen fold evidence"):
+        tm.ScreenFoldEvidence.from_json_safe({"rank_ic": 0.05})
+
+
+def test_confirmation_worker_runs_candidate_and_fails_closed_deterministically(
+    tmp_path,
+) -> None:
+    """SCENARIO_RUN_COMPLETION_04: a real worker returns a JSON-safe result and
+    fails the candidate closed on a fixture that cannot produce filled orders,
+    without crashing the parent process."""
+    from src.core.costs import default_base_schedule, default_stress_schedule
+    from src.stocks.research.artifacts import ModelArtifactRegistry
+
+    df = stock_v2_composed_df(n_sessions=140, n_tickers=20)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    label_span = (manifest.label_horizon_sessions or 1) + 1
+    folds = tm.PurgedWalkForward(
+        n_folds=3,
+        label_horizon_sessions=label_span,
+        embargo_sessions=5,
+        session_column="session_index",
+        validation_window_sessions=30,
+        min_train_sessions=40,
+    ).split(panel)
+    assert len(folds) >= 3
+    route = tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time")
+    request = TrainingRequest(artifact_id="worker_isolated", n_folds=3, optuna_trials=3)
+    feature_columns = tuple(c for c in df.columns if c.startswith("feature__"))
+    base_manifest = _tune_base_manifest(
+        "worker_isolated", manifest, manifest.label_definition
+    )
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    tm._CONFIRMATION_WORKER_INPUTS.update(
+        {
+            "panel": panel,
+            "tuning_folds": folds,
+            "base_manifest": base_manifest,
+            "feature_columns": feature_columns,
+            "dataset_manifest": manifest,
+            "registry": registry,
+            "base_schedule": default_base_schedule(),
+            "stress_schedule": default_stress_schedule(),
+            "proxy_session_stride": 1,
+            "lgb_threads": 1,
+            "route": route,
+            "frozen_params": {
+                "learning_rate": 0.03,
+                "num_leaves": 31,
+                "max_depth": 6,
+                "min_child_samples": 1000,
+                "feature_fraction": 0.8,
+                "bagging_fraction": 0.9,
+                "lambda_l1": 0.001,
+                "lambda_l2": 0.001,
+                "max_bin": 255,
+                "lambdarank_weight": 0.5,
+            },
+            "ablation_weight": None,
+            "selection_identity_hash": "sel-worker",
+        }
+    )
+    result = tm._run_confirmation_candidate_worker(
+        request, route, 0, "fingerprint-worker"
+    )
+    assert result.trial_number == 0
+    assert result.route_horizon == 5
+    json.dumps(result.to_json_safe())
+    # On this fixture the real proxy replay cannot fill orders, so the worker
+    # fails the candidate closed deterministically; it never yields a usable
+    # evidence row from a partial/hard-failed worker.
+    if result.is_hard_failure:
+        assert result.terminal_reason == "hard_failure"
+        assert result.failure_reason is not None
+        assert not result.fold_evidence
+    else:
+        assert result.terminal_reason in ("confirmed", "rank_ic_non_positive")
+        assert result.fold_evidence
+
+
+def test_confirmation_supervisor_rejects_invalid_schema_without_spawning(
+    monkeypatch,
+) -> None:
+    """SCENARIO_RUN_COMPLETION_05: a worker result that fails schema validation
+    is hard-failed as ``confirmation_worker_exit:invalid_schema``."""
+
+    class _FakeProcess:
+        def __init__(self, exitcode: int) -> None:
+            self._exitcode = exitcode
+
+        def start(self) -> None:
+            return None
+
+        def join(self, timeout: float | None = None) -> None:
+            del timeout
+            return None
+
+        def is_alive(self) -> bool:
+            return False
+
+        @property
+        def exitcode(self) -> int:
+            return self._exitcode
+
+    class _FakeQueue:
+        def __init__(self, result: object) -> None:
+            self._result = result
+
+        def get_nowait(self) -> object:
+            return self._result
+
+    class _FakeContext:
+        def __init__(self, result: object) -> None:
+            self._result = result
+            self._exitcode = 0
+
+        def Queue(self) -> _FakeQueue:  # noqa: N802
+            return _FakeQueue(self._result)
+
+        def Process(self, **_kwargs) -> _FakeProcess:  # noqa: N802
+            del _kwargs
+            return _FakeProcess(self._exitcode)
+
+    request = TrainingRequest(artifact_id="worker_schema", n_folds=3, max_rss_mib=4096)
+    route = tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time")
+    schema_df = stock_v2_composed_df(n_sessions=10, n_tickers=3)
+    schema_manifest = stock_v2_manifest(columns=schema_df.columns)
+    tm._CONFIRMATION_WORKER_INPUTS.update(
+        {
+            "panel": pl.DataFrame({"instrument_id": ["A"], "session": [1]}),
+            "tuning_folds": [],
+            "base_manifest": _tune_base_manifest(
+                "worker_schema", schema_manifest, "residual_o2o_5d"
+            ),
+            "feature_columns": ("feature__a",),
+            "dataset_manifest": None,
+            "registry": None,
+            "base_schedule": default_base_schedule(),
+            "stress_schedule": default_stress_schedule(),
+            "proxy_session_stride": 1,
+            "lgb_threads": 1,
+            "route": route,
+            "frozen_params": {
+                "learning_rate": 0.03,
+                "num_leaves": 31,
+                "max_depth": 6,
+                "min_child_samples": 1000,
+                "feature_fraction": 0.8,
+                "bagging_fraction": 0.9,
+                "lambda_l1": 0.001,
+                "lambda_l2": 0.001,
+                "max_bin": 255,
+                "lambdarank_weight": 0.5,
+            },
+            "ablation_weight": None,
+            "selection_identity_hash": "sel-schema",
+        }
+    )
+    monkeypatch.setattr(tm, "_CONFIRMATION_MP_CONTEXT", _FakeContext({"not": "a result"}))
+    result = tm._run_confirmation_candidate_worker(request, route, 0, "fingerprint-schema")
+    assert result.is_hard_failure is True
+    assert "confirmation_worker_exit" in str(result.failure_reason)

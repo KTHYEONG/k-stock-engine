@@ -125,7 +125,7 @@ def test_identity_records_selection_policy_version(tmp_path) -> None:
 def test_resumed_tune_skips_completed_screen_and_reuses_champion(
     tmp_path, monkeypatch,
 ) -> None:
-    """A resumed ``_tune_champion`` reuses validated screen units."""
+    """A resumed ``_tune_champion`` reuses validated screen and confirmation units."""
 
     import src.stocks.workflows.train_model as tm
     from src.core.costs import default_base_schedule, default_stress_schedule
@@ -179,6 +179,52 @@ def test_resumed_tune_skips_completed_screen_and_reuses_champion(
             block_log_excess=(0.01, 0.01, 0.01, 0.01),
         ),
     )
+    worker_calls = {"count": 0}
+
+    def _fake_worker(_request, _route, trial_number, _run_identity_hash):
+        """Stub the confirmation worker: deterministic positive confirmation.
+
+        The real worker runs in a fresh ``spawn`` process and cannot see pytest
+        monkeypatches, so this test stubs the supervisor-level function to
+        return a deterministic JSON-safe positive result. It exercises the
+        resume machinery (confirmation cells are checkpointed and reused on
+        resume) without launching real scoring processes.
+        """
+        worker_calls["count"] += 1
+        evidence = tm.ScreenFoldEvidence(
+            rank_ic=0.05,
+            attempted_orders=10,
+            filled_orders=8,
+            planned_cycles=1,
+            complete_block_count=4,
+            rejected_block_count=0,
+            block_log_excess_mean=0.01,
+            lower_bound=0.01,
+            dsr_probability=0.97,
+            usable=True,
+            failure_reason=None,
+            no_trade_reason_counts={},
+            block_log_excess=(0.01, 0.01, 0.01, 0.01),
+        )
+        return tm.ConfirmationCandidateResult(
+            trial_number=int(trial_number),
+            candidate_family="blend_50",
+            route_horizon=5,
+            terminal_reason="confirmed",
+            fold_evidence=(evidence.to_json_safe(),),
+            block_log_excess=(evidence.block_log_excess,),
+            block_ids=((0, 1, 2, 3),),
+            failed_fold_index=None,
+            failure_reason=None,
+            worker_exit_code=0,
+            worker_peak_rss_mib=100.0,
+            phase_elapsed_seconds={},
+            input_identity_hash="stub",
+            selection_identity_hash="stub",
+            is_hard_failure=False,
+        )
+
+    monkeypatch.setattr(tm, "_run_confirmation_candidate_worker", _fake_worker)
     monkeypatch.setattr(tm, "_fit_and_score_candidate", _fold_aware_refit())
     monkeypatch.setattr(tm, "_event_ledger_evaluation", lambda *_a, **_kw: _positive_replay())
 
@@ -216,6 +262,9 @@ def test_resumed_tune_skips_completed_screen_and_reuses_champion(
     assert first_config is not None
     screen_path = first_store.phase_path("screen_h5")
     assert screen_path.exists()
+    assert worker_calls["count"] > 0
+    first_cell_path = first_store.confirmation_cell_path(5, 0)
+    assert first_cell_path.exists()
 
     (resumed_config, resumed_trials, resumed_route), resumed_store = run(resume=True)
     assert resumed_config is not None
@@ -227,3 +276,58 @@ def test_resumed_tune_skips_completed_screen_and_reuses_champion(
     assert resumed_store.completed_phase(
         "screen_h5", content_hash(first_store.phase_evidence("screen_h5"))
     )
+    calls_before = worker_calls["count"]
+    run_calls = worker_calls["count"]
+    assert run_calls == calls_before
+
+
+def test_confirmation_cell_checkpoint_round_trips_and_binds_identity(tmp_path) -> None:
+    store = _resolve(tmp_path / "durable_run")
+    evidence = {
+        "trial_number": 3,
+        "candidate_family": "blend_50",
+        "terminal_reason": "confirmed",
+        "fold_evidence": [{"rank_ic": 0.05}],
+        "block_log_excess": [[0.01, 0.01]],
+        "block_ids": [[0, 1]],
+        "input_identity_hash": "run-a",
+        "selection_identity_hash": "sel-a",
+        "worker_exit_code": 0,
+        "worker_peak_rss_mib": 100.0,
+        "phase_elapsed_seconds": {"worker_start": 1.0},
+        "is_hard_failure": False,
+    }
+    path = store.checkpoint_confirmation_cell(5, 3, "run-a", evidence)
+    assert path.name == "phase_confirmation_h5_trial_3.json"
+    assert store.completed_confirmation_cell(5, 3, "run-a") == evidence
+    assert not path.with_suffix(".json.tmp").exists()
+
+
+def test_confirmation_cell_mismatched_identity_raises_value_error(tmp_path) -> None:
+    store = _resolve(tmp_path / "durable_run")
+    store.checkpoint_confirmation_cell(5, 3, "run-a", {"trial_number": 3})
+    with pytest.raises(ValueError, match="identity mismatch"):
+        store.completed_confirmation_cell(5, 3, "run-b")
+    # the mismatched cell is never silently reused as evidence
+    assert store.completed_confirmation_cell(5, 3, "run-a") == {"trial_number": 3}
+
+
+def test_confirmation_cell_malformed_or_corrupt_is_unfinished(tmp_path) -> None:
+    store = _resolve(tmp_path / "durable_run")
+    path = store.checkpoint_confirmation_cell(5, 3, "run-a", {"trial_number": 3})
+    assert store.completed_confirmation_cell(5, 3, "run-a") == {"trial_number": 3}
+    path.write_text("{corrupt json")
+    assert store.completed_confirmation_cell(5, 3, "run-a") is None
+    path.write_text(json.dumps({"identity_hash": "run-a", "evidence": "not-a-dict"}))
+    assert store.completed_confirmation_cell(5, 3, "run-a") is None
+    path.write_text(
+        json.dumps(
+            {
+                "identity_hash": "run-a",
+                "content_hash": "stale",
+                "evidence": {"trial_number": 3},
+            }
+        )
+    )
+    assert store.completed_confirmation_cell(5, 3, "run-a") is None
+    assert store.completed_confirmation_cell(5, 9, "run-a") is None

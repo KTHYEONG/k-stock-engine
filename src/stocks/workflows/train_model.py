@@ -19,7 +19,9 @@ import gc
 import itertools
 import logging
 import math
+import multiprocessing
 import os
+import queue
 import re
 import time
 from collections import Counter
@@ -107,6 +109,10 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger("stocks.workflows.train_model")
+
+_CONFIRMATION_MP_CONTEXT = multiprocessing.get_context("spawn")
+
+_CONFIRMATION_WORKER_INPUTS: dict[str, object] = {}
 
 _ECONOMIC_COLUMNS = ("open", "high", "low", "close", "volume", "trading_value", "market_cap")
 
@@ -277,6 +283,7 @@ class TrialResourceGuard:
         self.fold_timings: dict[str, float] = {}
         self.estimates_mib: dict[str, float] = {}
         self.fold_stage_timings: dict[str, dict[str, float]] = {}
+        self.phase_rss_mib: dict[str, float] = {}
 
     @staticmethod
     def _rss_mib() -> float:
@@ -336,11 +343,36 @@ class TrialResourceGuard:
         """
         self.fold_stage_timings.setdefault(key, {})[stage] = float(elapsed_seconds)
 
+    def record_phase_rss(self, phase: str, rss_mib: float) -> None:
+        """Record scalar RSS at a phase boundary and enforce the operating watermark.
+
+        ``phase`` names a scalar lifecycle boundary (screen-to-confirmation
+        transition, worker start/finish, fit, predict, calibration, replay,
+        native close) and ``rss_mib`` is the measured or conservatively
+        projected RSS in MiB. The measured value updates the running peak. An
+        RSS at or above 90% of the resolved limit is an operating breach and
+        fails closed with ``TrainingCapacityError`` so an allocation is never
+        attempted past the watermark. Only scalars are recorded; raw ledgers,
+        score arrays, labels, and model internals never enter telemetry.
+        """
+        self.phase_rss_mib[phase] = float(rss_mib)
+        self.peak_rss_mib = max(self.peak_rss_mib, float(rss_mib))
+        watermark = self._limit_mib * 0.90
+        if float(rss_mib) > watermark:
+            raise TrainingCapacityError(
+                f"training phase rss breach: {phase} RSS {rss_mib:.1f} MiB "
+                f"exceeds the 90% operating watermark {watermark:.1f} MiB "
+                f"(limit {self._limit_mib:.1f} MiB)"
+            )
+
     def telemetry(self) -> dict[str, object]:
         return {
             "baseline_rss_mib": round(self.baseline_rss_mib, 3),
             "peak_rss_mib": round(self.peak_rss_mib, 3),
             "limit_mib": round(self._limit_mib, 3),
+            "phase_rss_mib": {
+                phase: round(float(rss), 3) for phase, rss in self.phase_rss_mib.items()
+            },
             "trial_fold_timings_seconds": dict(self.fold_timings),
             "trial_fold_stage_timings_seconds": {
                 key: dict(stages)
@@ -691,6 +723,92 @@ class ScreenFoldEvidence:
             },
         }
 
+    @classmethod
+    def from_json_safe(
+        cls,
+        payload: Mapping[str, object],
+        *,
+        block_log_excess: Sequence[float] = (),
+        block_ids: Sequence[int] = (),
+    ) -> ScreenFoldEvidence:
+        """Reconstruct a fold evidence from its JSON-safe payload.
+
+        ``to_json_safe`` intentionally excludes the block series, so a
+        confirmation worker returns ``block_log_excess``/``block_ids``
+        alongside the payload and the parent feeds them back here to restore
+        the exact series the pooling step consumes. Missing fields fail closed
+        with ``ValueError`` rather than silently producing degraded evidence.
+        """
+        required = (
+            "rank_ic",
+            "attempted_orders",
+            "filled_orders",
+            "planned_cycles",
+            "complete_block_count",
+            "rejected_block_count",
+            "block_log_excess_mean",
+            "ranking_score",
+            "dsr_probability",
+            "usable",
+            "failure_reason",
+            "no_trade_reason_counts",
+            "calibration_history_sessions",
+            "eligible_bucket_count",
+            "cash_cycles",
+            "point_estimate_sign",
+            "cost_drag",
+            "covariance_source",
+            "cash_cycle_ratio",
+            "candidate_count",
+            "ranked_count",
+            "selected_count",
+            "transfer",
+            "growth",
+        )
+        missing = [name for name in required if name not in payload]
+        if missing:
+            raise ValueError(f"incomplete screen fold evidence, missing {missing}")
+        return cls(
+            rank_ic=float(cast(float, payload["rank_ic"])),
+            attempted_orders=int(cast(int, payload["attempted_orders"])),
+            filled_orders=int(cast(int, payload["filled_orders"])),
+            planned_cycles=int(cast(int, payload["planned_cycles"])),
+            complete_block_count=int(cast(int, payload["complete_block_count"])),
+            rejected_block_count=int(cast(int, payload["rejected_block_count"])),
+            block_log_excess_mean=float(cast(float, payload["block_log_excess_mean"])),
+            lower_bound=float(cast(float, payload["ranking_score"])),
+            dsr_probability=float(cast(float, payload["dsr_probability"])),
+            usable=bool(payload["usable"]),
+            failure_reason=(
+                str(payload["failure_reason"]) if payload.get("failure_reason") is not None else None
+            ),
+            no_trade_reason_counts={
+                str(k): int(cast(int, v))
+                for k, v in cast(
+                    Mapping[str, object], payload["no_trade_reason_counts"]
+                ).items()
+            },
+            calibration_history_sessions=int(
+                cast(int, payload["calibration_history_sessions"])
+            ),
+            eligible_bucket_count=int(cast(int, payload["eligible_bucket_count"])),
+            cash_cycles=int(cast(int, payload["cash_cycles"])),
+            block_log_excess=tuple(float(value) for value in block_log_excess),
+            block_ids=tuple(int(value) for value in block_ids),
+            point_estimate_sign=str(payload["point_estimate_sign"]),
+            cost_drag=float(cast(float, payload["cost_drag"])),
+            covariance_source=str(payload["covariance_source"]),
+            cash_cycle_ratio=float(cast(float, payload["cash_cycle_ratio"])),
+            candidate_count=int(cast(int, payload["candidate_count"])),
+            ranked_count=int(cast(int, payload["ranked_count"])),
+            selected_count=int(cast(int, payload["selected_count"])),
+            transfer=dict(cast(Mapping[str, object], payload["transfer"])),
+            growth={
+                str(k): float(cast(float, v))
+                for k, v in cast(Mapping[str, object], payload["growth"]).items()
+            },
+        )
+
 
 def _record_screen_failure(
     trial: optuna.Trial,
@@ -719,6 +837,123 @@ class _ScreenTrialRecord:
 
     def set_user_attr(self, key: str, value: object) -> None:
         self.user_attrs[key] = value
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmationCandidateResult:
+    """JSON-safe outcome of one candidate's confirmation, worker-bound or in-process.
+
+    Carries only scalars, small maps, and per-fold block series. ``fold_evidence``
+    holds each completed fold's :meth:`ScreenFoldEvidence.to_json_safe` payload
+    while ``block_log_excess``/``block_ids`` restore the pooling series the
+    payload intentionally excludes. ``terminal_reason`` is the fold-loop outcome
+    (``confirmed``, ``rank_ic_non_positive``, or ``hard_failure``); worker-level
+    failures (nonzero exit, timeout, RSS breach, invalid schema, identity
+    mismatch) are surfaced as ``is_hard_failure`` with ``failure_reason``.
+    ``worker_exit_code`` is the OS exit code (0 for a clean worker), and
+    ``worker_peak_rss_mib``/``phase_elapsed_seconds`` are scalar telemetry.
+    ``input_identity_hash`` and ``selection_identity_hash`` bind the cell to the
+    run/route/trial/frozen-config identity and to the selection-relevant
+    evidence, so a resumed run never reuses a stale cell.
+    """
+
+    trial_number: int
+    candidate_family: str
+    route_horizon: int
+    terminal_reason: str
+    fold_evidence: tuple[dict[str, object], ...] = ()
+    block_log_excess: tuple[tuple[float, ...], ...] = ()
+    block_ids: tuple[tuple[int, ...], ...] = ()
+    failed_fold_index: int | None = None
+    failure_reason: str | None = None
+    worker_exit_code: int = 0
+    worker_peak_rss_mib: float = 0.0
+    phase_elapsed_seconds: dict[str, float] = field(default_factory=dict)
+    input_identity_hash: str = ""
+    selection_identity_hash: str = ""
+    is_hard_failure: bool = False
+
+    def to_json_safe(self) -> dict[str, object]:
+        return {
+            "trial_number": int(self.trial_number),
+            "candidate_family": str(self.candidate_family),
+            "route_horizon": int(self.route_horizon),
+            "terminal_reason": str(self.terminal_reason),
+            "fold_evidence": [dict(payload) for payload in self.fold_evidence],
+            "block_log_excess": [list(series) for series in self.block_log_excess],
+            "block_ids": [list(series) for series in self.block_ids],
+            "failed_fold_index": self.failed_fold_index,
+            "failure_reason": self.failure_reason,
+            "worker_exit_code": int(self.worker_exit_code),
+            "worker_peak_rss_mib": round(float(self.worker_peak_rss_mib), 3),
+            "phase_elapsed_seconds": {
+                phase: round(float(seconds), 3)
+                for phase, seconds in sorted(self.phase_elapsed_seconds.items())
+            },
+            "input_identity_hash": str(self.input_identity_hash),
+            "selection_identity_hash": str(self.selection_identity_hash),
+            "is_hard_failure": bool(self.is_hard_failure),
+        }
+
+    @classmethod
+    def from_json_safe(cls, payload: Mapping[str, object]) -> ConfirmationCandidateResult:
+        """Reconstruct a result from its JSON-safe payload, or fail closed."""
+        required = (
+            "trial_number",
+            "candidate_family",
+            "route_horizon",
+            "terminal_reason",
+            "fold_evidence",
+            "block_log_excess",
+            "block_ids",
+            "worker_exit_code",
+            "worker_peak_rss_mib",
+            "input_identity_hash",
+            "selection_identity_hash",
+            "is_hard_failure",
+        )
+        missing = [name for name in required if name not in payload]
+        if missing:
+            raise ValueError(f"incomplete confirmation result, missing {missing}")
+        return cls(
+            trial_number=int(cast(int, payload["trial_number"])),
+            candidate_family=str(payload["candidate_family"]),
+            route_horizon=int(cast(int, payload["route_horizon"])),
+            terminal_reason=str(payload["terminal_reason"]),
+            fold_evidence=tuple(
+                dict(cast(Mapping[str, object], row))
+                for row in cast(Sequence[object], payload["fold_evidence"])
+            ),
+            block_log_excess=tuple(
+                tuple(float(cast(float, value)) for value in cast(Sequence[object], series))
+                for series in cast(Sequence[object], payload["block_log_excess"])
+            ),
+            block_ids=tuple(
+                tuple(int(cast(int, value)) for value in cast(Sequence[object], series))
+                for series in cast(Sequence[object], payload["block_ids"])
+            ),
+            failed_fold_index=(
+                int(cast(int, payload["failed_fold_index"]))
+                if payload.get("failed_fold_index") is not None
+                else None
+            ),
+            failure_reason=(
+                str(payload["failure_reason"])
+                if payload.get("failure_reason") is not None
+                else None
+            ),
+            worker_exit_code=int(cast(int, payload["worker_exit_code"])),
+            worker_peak_rss_mib=float(cast(float, payload["worker_peak_rss_mib"])),
+            phase_elapsed_seconds={
+                str(phase): float(cast(float, seconds))
+                for phase, seconds in cast(
+                    Mapping[str, object], payload.get("phase_elapsed_seconds") or {}
+                ).items()
+            },
+            input_identity_hash=str(payload["input_identity_hash"]),
+            selection_identity_hash=str(payload["selection_identity_hash"]),
+            is_hard_failure=bool(payload["is_hard_failure"]),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1655,6 +1890,8 @@ def _tune_champion(
     replay_seconds_total = 0.0
     early_rejected_total = 0
     early_rejected_seconds_total = 0.0
+    abnormal_worker_exits_total = 0
+    confirmation_resume_cells_total = 0
 
     for route in route_specs:
         route_manifest = _route_manifest(base_manifest, route)
@@ -1678,15 +1915,15 @@ def _tune_champion(
             fold_count=max(1, len(tuning_folds)),
         )
         timings = _SelectionTimings()
+        durable_route = run_store is not None
         fold0_context, proxy_contexts, fold_context = _fit_stable_contexts(
             tuning_panel, tuning_folds, route_manifest, feature_columns,
             route.label_column, route.relevance_column,
             proxy_session_stride=policy.proxy_session_stride,
             timings=timings,
+            durable=durable_route,
         )
-        if fold0_context is None or any(
-            proxy is None for proxy in proxy_contexts
-        ):
+        if fold0_context is None or proxy_contexts[0] is None:
             route_attrs[str(route.horizon)] = {
                 "selection_status": "no-prepared-fold-0",
                 "holding_horizon_sessions": route.horizon,
@@ -1706,7 +1943,7 @@ def _tune_champion(
             base_schedule=base_schedule,
             stress_schedule=stress_schedule,
         )
-        if any(proxy is None or proxy.execution_kernel is None for proxy in proxy_contexts):
+        if proxy_contexts[0] is None or proxy_contexts[0].execution_kernel is None:
             route_attrs[str(route.horizon)] = {
                 "selection_status": "no-proxy-kernel",
                 "holding_horizon_sessions": route.horizon,
@@ -1767,7 +2004,7 @@ def _tune_champion(
             direction="maximize",
             study_name=study_name,
             storage=storage,
-            load_if_exists=resumed_screen,
+            load_if_exists=bool(run_store is not None and run_store.resume),
             sampler=optuna.samplers.TPESampler(
                 seed=request.seed + route.horizon, n_startup_trials=10
             ),
@@ -1851,12 +2088,20 @@ def _tune_champion(
 
         if not resumed_screen:
             screen_started = time.perf_counter()
-            study.optimize(
-                screen_objective,
-                n_trials=per_route_trials,
-                n_jobs=1,
-                show_progress_bar=False,
+            terminal_now = sum(
+                1
+                for t in study.trials
+                if t.state
+                in (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED)
             )
+            remaining = max(0, per_route_trials - terminal_now)
+            if remaining > 0:
+                study.optimize(
+                    screen_objective,
+                    n_trials=remaining,
+                    n_jobs=1,
+                    show_progress_bar=False,
+                )
             screen_seconds = time.perf_counter() - screen_started
             if run_store is not None:
                 run_store.checkpoint_phase(screen_phase, screen_evidence)
@@ -1968,59 +2213,139 @@ def _tune_champion(
         candidate_fold_evidence_by_family: dict[
             str, list[tuple[float, int, list[ScreenFoldEvidence]]]
         ] = {}
+        run_fingerprint = (
+            run_store.identity.fingerprint if run_store is not None else ""
+        )
+        if run_store is not None:
+            _CONFIRMATION_WORKER_INPUTS.update(
+                {
+                    "panel": tuning_panel,
+                    "tuning_folds": tuning_folds,
+                    "base_manifest": route_manifest,
+                    "feature_columns": feature_columns,
+                    "dataset_manifest": dataset_manifest,
+                    "registry": registry,
+                    "base_schedule": base_schedule,
+                    "stress_schedule": stress_schedule,
+                    "proxy_session_stride": policy.proxy_session_stride,
+                    "lgb_threads": lgb_threads,
+                    "route": route,
+                }
+            )
         for trial_number in confirmation_candidates:
             frozen_config = _config_from_trial_record(
                 study.trials[trial_number],
                 num_threads=lgb_threads,
             )
             candidate_family = frozen_config.candidate_family
-            screen_config = _screen_config(frozen_config)
-            record = _ScreenTrialRecord(trial_number)
-            fold_evidences: list[ScreenFoldEvidence] = []
-            terminal_reason = "confirmed"
-            failed_fold_index: int | None = None
-            hard_failure_reason: str | None = None
-            for fold_index in range(len(tuning_folds)):
-                proxy = proxy_contexts[fold_index]
-                if proxy is None:
-                    terminal_reason = "hard_failure"
-                    failed_fold_index = fold_index
-                    hard_failure_reason = "no_proxy_context"
-                    break
-                ev = _score_trial_fold(
-                    tuning_panel, tuning_folds[fold_index], proxy, request,
-                    route_manifest, feature_columns, route.label_column,
-                    route.relevance_column, screen_config, guard,
-                    cast(optuna.Trial, record),
-                    fold_index, callbacks=(), report_progress=False,
-                    key_prefix=f"h{route.horizon}_",
+            identity_hash = _confirmation_identity_hash(
+                run_fingerprint, route, trial_number, frozen_config
+            )
+            selection_identity_hash = _confirmation_selection_identity_hash(
+                route, trial_number, frozen_config, total_terminal_screen_trials
+            )
+            if run_store is not None:
+                _CONFIRMATION_WORKER_INPUTS.update(
+                    {
+                        "frozen_params": dict(study.trials[trial_number].params),
+                        "ablation_weight": study.trials[trial_number].user_attrs.get(
+                            "lambdarank_weight"
+                        ),
+                        "selection_identity_hash": selection_identity_hash,
+                    }
                 )
-                if ev is None:
-                    terminal_reason = "hard_failure"
-                    failed_fold_index = fold_index
-                    hard_failure_reason = str(
-                        record.user_attrs.get(
-                            f"h{route.horizon}_screen_failure_reason", "unknown"
-                        )
+                if run_store.resume:
+                    cached = run_store.completed_confirmation_cell(
+                        route.horizon, trial_number, identity_hash
                     )
-                    break
-                if ev.rank_ic <= 0.0:
-                    terminal_reason = "rank_ic_non_positive"
-                    fold_evidences.append(ev)
-                    break
-                fold_evidences.append(ev)
-            if terminal_reason != "confirmed" or len(fold_evidences) != len(tuning_folds):
+                    if cached is not None:
+                        confirmation_resume_cells_total += 1
+                        result = ConfirmationCandidateResult.from_json_safe(cached)
+                    else:
+                        result = _run_confirmation_candidate_worker(
+                            request, route, trial_number, run_fingerprint
+                        )
+                        run_store.checkpoint_confirmation_cell(
+                            route.horizon, trial_number, identity_hash,
+                            result.to_json_safe(),
+                        )
+                else:
+                    result = _run_confirmation_candidate_worker(
+                        request, route, trial_number, run_fingerprint
+                    )
+                    run_store.checkpoint_confirmation_cell(
+                        route.horizon, trial_number, identity_hash,
+                        result.to_json_safe(),
+                    )
+            else:
+                result = _confirm_candidate_in_process(
+                    tuning_panel, tuning_folds, proxy_contexts, request, route,
+                    route_manifest, feature_columns, frozen_config, trial_number,
+                    lgb_threads=lgb_threads,
+                    run_identity_hash=run_fingerprint,
+                    selection_identity_hash=selection_identity_hash,
+                )
+            if result.is_hard_failure:
+                confirmation_records.append(
+                    {
+                        "trial_number": int(trial_number),
+                        "candidate_family": str(
+                            result.candidate_family or candidate_family
+                        ),
+                        "terminal_reason": "hard_failure",
+                        "failure_reason": (
+                            result.failure_reason or "confirmation_worker_exit"
+                        ),
+                        "worker_exit_code": int(result.worker_exit_code),
+                        "worker_peak_rss_mib": round(
+                            float(result.worker_peak_rss_mib), 3
+                        ),
+                        "phase_elapsed_seconds": dict(
+                            result.phase_elapsed_seconds
+                        ),
+                        "fold_evidence": [
+                            dict(payload) for payload in result.fold_evidence
+                        ],
+                    }
+                )
+                abnormal_worker_exits_total += 1
+                logger.warning(
+                    "[EVAL] route=%sd trial=%s stage=confirmation_hard_failure reason=%s",
+                    route.horizon,
+                    trial_number,
+                    result.failure_reason,
+                )
+                continue
+            fold_evidences: list[ScreenFoldEvidence] = []
+            for payload, blocks, ids in zip(
+                result.fold_evidence,
+                result.block_log_excess,
+                result.block_ids,
+                strict=True,
+            ):
+                fold_evidences.append(
+                    ScreenFoldEvidence.from_json_safe(
+                        payload, block_log_excess=blocks, block_ids=ids
+                    )
+                )
+            if result.terminal_reason != "confirmed" or len(
+                fold_evidences
+            ) != len(tuning_folds):
                 record_entry: dict[str, object] = {
                     "trial_number": int(trial_number),
                     "candidate_family": candidate_family,
-                    "terminal_reason": terminal_reason,
+                    "terminal_reason": result.terminal_reason,
+                    "worker_peak_rss_mib": round(
+                        float(result.worker_peak_rss_mib), 3
+                    ),
+                    "phase_elapsed_seconds": dict(result.phase_elapsed_seconds),
                     "fold_evidence": [
                         ev.to_json_safe() for ev in fold_evidences
                     ],
                 }
-                if failed_fold_index is not None:
-                    record_entry["failed_fold_index"] = int(failed_fold_index)
-                    record_entry["failure_reason"] = hard_failure_reason or "unknown"
+                if result.failed_fold_index is not None:
+                    record_entry["failed_fold_index"] = int(result.failed_fold_index)
+                    record_entry["failure_reason"] = result.failure_reason or "unknown"
                 confirmation_records.append(record_entry)
                 continue
             pooled_lb, pooled_mean, pooled_dsr, pooled_blocks = (
@@ -2036,6 +2361,10 @@ def _tune_champion(
                         "terminal_reason": "pooled_economic_rejection",
                         "pooled_lower_bound": round(pooled_lb, 8),
                         "pooled_mean_log_excess": round(pooled_mean, 8),
+                        "worker_peak_rss_mib": round(
+                            float(result.worker_peak_rss_mib), 3
+                        ),
+                        "phase_elapsed_seconds": dict(result.phase_elapsed_seconds),
                         "fold_evidence": [
                             ev.to_json_safe() for ev in fold_evidences
                         ],
@@ -2051,6 +2380,10 @@ def _tune_champion(
                     "pooled_mean_log_excess": round(pooled_mean, 8),
                     "pooled_dsr_probability": round(pooled_dsr, 8),
                     "pooled_block_count": int(pooled_blocks),
+                    "worker_peak_rss_mib": round(
+                        float(result.worker_peak_rss_mib), 3
+                    ),
+                    "phase_elapsed_seconds": dict(result.phase_elapsed_seconds),
                     "fold_evidence": [
                         ev.to_json_safe() for ev in fold_evidences
                     ],
@@ -2466,6 +2799,8 @@ def _tune_champion(
         "economic_replay_seconds": replay_seconds_total,
         "early_rejected_full_refits": early_rejected_total,
         "early_rejected_full_refit_seconds": early_rejected_seconds_total,
+        "abnormal_worker_exits": abnormal_worker_exits_total,
+        "confirmation_resume_cells": confirmation_resume_cells_total,
         "full_refit_boosting_rounds": (
             _SCREEN_BOOSTING_ROUNDS + 2 * _SCREEN_EARLY_STOPPING_ROUNDS
         ),
@@ -2790,6 +3125,7 @@ def _fit_stable_contexts(
     *,
     proxy_session_stride: int,
     timings: _SelectionTimings | None = None,
+    durable: bool = False,
 ) -> tuple[
     PreparedCandidateContext | None,
     tuple[PreparedCandidateContext | None, ...],
@@ -2801,7 +3137,11 @@ def _fit_stable_contexts(
     full-refit and the fold-0 proxy share it. One slim fixed-stride proxy
     context is built for every tuning fold so every Optuna trial can be scored
     on all purged proxy folds; the rich full contexts for folds 1..n are
-    discarded after their proxy preparation. Later full folds are materialized
+    discarded after their proxy preparation. When ``durable`` is true the parent
+    retains only the fold-0 proxy and kernel (the screen's only live fold), the
+    remaining proxy entries are ``None``, and confirmation fold contexts are
+    materialized lazily inside confirmation workers one at a time so the parent
+    never holds three fold matrices/kernels. Later full folds are materialized
     lazily by the returned provider, one at a time and only after a finalist is
     known. Returns ``(fold0, proxy_contexts, provider)`` where ``proxy_contexts``
     is one entry per tuning fold; either a full fold-0 or a proxy entry is
@@ -2820,11 +3160,16 @@ def _fit_stable_contexts(
     for index, fold in enumerate(tuning_folds):
         if index == 0:
             rich = fold0_rich
+        elif durable:
+            rich = None
         else:
             rich = _fit_stable_context(
                 tuning_panel, fold, base_manifest, feature_columns,
                 label_column, relevance_column,
             )
+        if rich is None:
+            proxy_contexts.append(None)
+            continue
         proxy_rich = _build_proxy_context(
             rich, proxy_session_stride, base_manifest, feature_columns,
             label_column, relevance_column,
@@ -2849,6 +3194,115 @@ def _fit_stable_contexts(
     )
     provider.seed(0, fold0)
     return fold0, tuple(proxy_contexts), provider
+
+
+def _attach_proxy_kernel(
+    proxy: PreparedCandidateContext,
+    fold: Fold,
+    tuning_panel: pl.DataFrame,
+    request: TrainingRequest,
+    route: RouteSpec,
+    *,
+    fold_index: int,
+    dataset_manifest: DatasetManifest,
+    registry: ModelArtifactRegistry,
+    base_schedule: CostSchedule,
+    stress_schedule: CostSchedule,
+) -> PreparedCandidateContext | None:
+    """Attach one immutable execution-matched proxy kernel to a prepared context.
+
+    The kernel owns the prepared route built from exactly the fold's ordered
+    validation sessions (``tuning_panel[fold.validation_mask]``, row positions
+    only), the bounded execution market, and the frozen route schedules; the
+    kernel's route sessions are asserted to equal the validation interval
+    exactly so no tail session is ever replayed. Candidate-specific data is only
+    an aligned score overlay and a causal calibration ledger. Returns ``None``
+    when the fold cannot own a kernel (missing/empty validation or an
+    unsupported interval), never a degraded kernel.
+    """
+    validation_frame = tuning_panel[fold.validation_mask]
+    validation_rows = validation_frame.height
+    if validation_rows == 0:
+        logger.debug(
+            "[EVAL] stage=proxy_kernel_skipped fold=%d route=%d "
+            "reason=empty_validation_mask validation_rows=0",
+            fold_index,
+            route.horizon,
+        )
+        return None
+    first_validation = validation_frame.select(pl.col("session").min()).item()
+    if first_validation is None:
+        logger.debug(
+            "[EVAL] stage=proxy_kernel_skipped fold=%d route=%d "
+            "reason=missing_validation_session validation_rows=%d",
+            fold_index,
+            route.horizon,
+            validation_rows,
+        )
+        return None
+    ordered_validation_sessions = tuple(
+        _session_as_datetime(session)
+        for session in validation_frame.select(
+            pl.col("session").unique()
+        ).sort("session")["session"].to_list()
+    )
+    try:
+        kernel = ExecutionMatchedReplayKernel.build(
+            tuning_panel,
+            ordered_validation_sessions,
+            request,
+            route,
+            dataset_manifest=dataset_manifest,
+            registry=registry,
+            base_schedule=base_schedule,
+            stress_schedule=stress_schedule,
+        )
+    except (ValueError, TypeError) as exc:
+        logger.debug(
+            "[EVAL] stage=proxy_kernel_build_failed fold=%d route=%d "
+            "first_validation=%s validation_rows=%d validation_sessions=%d "
+            "proxy_train_rows=%d proxy_validation_rows=%d "
+            "error_type=%s error=%s",
+            fold_index,
+            route.horizon,
+            first_validation,
+            validation_rows,
+            len(ordered_validation_sessions),
+            proxy.train_rows,
+            proxy.validation_rows,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    if kernel.prepared_route.sessions != ordered_validation_sessions:
+        logger.debug(
+            "[EVAL] stage=proxy_kernel_boundary_mismatch fold=%d route=%d "
+            "first_validation=%s kernel_start=%s kernel_end=%s "
+            "validation_rows=%d validation_sessions=%d "
+            "error_type=ValueError reason=oos_interval",
+            fold_index,
+            route.horizon,
+            first_validation,
+            kernel.prepared_route.sessions[0],
+            kernel.prepared_route.sessions[-1],
+            validation_rows,
+            len(ordered_validation_sessions),
+        )
+        return None
+    logger.debug(
+        "[EVAL] stage=proxy_kernel_attached route=%d fold=%d "
+        "validation_rows=%d validation_sessions=%d "
+        "first_validation=%s last_validation=%s kernel_start=%s kernel_end=%s",
+        route.horizon,
+        fold_index,
+        validation_rows,
+        len(ordered_validation_sessions),
+        first_validation,
+        ordered_validation_sessions[-1],
+        kernel.prepared_route.sessions[0],
+        kernel.prepared_route.sessions[-1],
+    )
+    return dataclass_replace(proxy, execution_kernel=kernel)
 
 
 def _attach_proxy_kernels(
@@ -2882,96 +3336,624 @@ def _attach_proxy_kernels(
             )
             attached.append(None)
             continue
-        validation_frame = tuning_panel[fold.validation_mask]
-        validation_rows = validation_frame.height
-        if validation_rows == 0:
-            logger.debug(
-                "[EVAL] stage=proxy_kernel_skipped fold=%d route=%d "
-                "reason=empty_validation_mask validation_rows=0",
-                fold_index,
-                route.horizon,
-            )
-            attached.append(None)
-            continue
-        first_validation = validation_frame.select(pl.col("session").min()).item()
-        if first_validation is None:
-            logger.debug(
-                "[EVAL] stage=proxy_kernel_skipped fold=%d route=%d "
-                "reason=missing_validation_session validation_rows=%d",
-                fold_index,
-                route.horizon,
-                validation_rows,
-            )
-            attached.append(None)
-            continue
-        ordered_validation_sessions = tuple(
-            _session_as_datetime(session)
-            for session in validation_frame.select(
-                pl.col("session").unique()
-            ).sort("session")["session"].to_list()
-        )
-        try:
-            kernel = ExecutionMatchedReplayKernel.build(
+        attached.append(
+            _attach_proxy_kernel(
+                proxy,
+                fold,
                 tuning_panel,
-                ordered_validation_sessions,
                 request,
                 route,
+                fold_index=fold_index,
                 dataset_manifest=dataset_manifest,
                 registry=registry,
                 base_schedule=base_schedule,
                 stress_schedule=stress_schedule,
             )
-        except (ValueError, TypeError) as exc:
-            logger.debug(
-                "[EVAL] stage=proxy_kernel_build_failed fold=%d route=%d "
-                "first_validation=%s validation_rows=%d validation_sessions=%d "
-                "proxy_train_rows=%d proxy_validation_rows=%d "
-                "error_type=%s error=%s",
-                fold_index,
-                route.horizon,
-                first_validation,
-                validation_rows,
-                len(ordered_validation_sessions),
-                proxy.train_rows,
-                proxy.validation_rows,
-                type(exc).__name__,
-                exc,
-            )
-            attached.append(None)
-            continue
-        if kernel.prepared_route.sessions != ordered_validation_sessions:
-            logger.debug(
-                "[EVAL] stage=proxy_kernel_boundary_mismatch fold=%d route=%d "
-                "first_validation=%s kernel_start=%s kernel_end=%s "
-                "validation_rows=%d validation_sessions=%d "
-                "error_type=ValueError reason=oos_interval",
-                fold_index,
-                route.horizon,
-                first_validation,
-                kernel.prepared_route.sessions[0],
-                kernel.prepared_route.sessions[-1],
-                validation_rows,
-                len(ordered_validation_sessions),
-            )
-            attached.append(None)
-            continue
-        logger.debug(
-            "[EVAL] stage=proxy_kernel_attached route=%d fold=%d "
-            "validation_rows=%d validation_sessions=%d "
-            "first_validation=%s last_validation=%s kernel_start=%s kernel_end=%s",
-            route.horizon,
-            fold_index,
-            validation_rows,
-            len(ordered_validation_sessions),
-            first_validation,
-            ordered_validation_sessions[-1],
-            kernel.prepared_route.sessions[0],
-            kernel.prepared_route.sessions[-1],
-        )
-        attached.append(
-            dataclass_replace(proxy, execution_kernel=kernel)
         )
     return tuple(attached)
+
+
+def _confirmation_identity_hash(
+    run_fingerprint: str,
+    route: RouteSpec,
+    trial_number: int,
+    config: LambdaRankConfig,
+) -> str:
+    """Content hash binding one confirmation cell to its frozen identity.
+
+    The hash covers the run fingerprint, the route horizon, the trial number,
+    and the frozen config snapshot so a resumed run never reuses a cell whose
+    inputs changed. The selection identity additionally binds the route policy
+    inputs that drive pooling so a policy change fails the cell closed.
+    """
+    return content_hash(
+        {
+            "run_fingerprint": run_fingerprint,
+            "route_horizon": route.horizon,
+            "trial_number": int(trial_number),
+            "frozen_config": _config_snapshot(config),
+        }
+    )
+
+
+def _confirmation_selection_identity_hash(
+    route: RouteSpec,
+    trial_number: int,
+    config: LambdaRankConfig,
+    total_terminal_screen_trials: int,
+) -> str:
+    """Content hash of the selection-relevant inputs feeding confirmation pooling."""
+    return content_hash(
+        {
+            "route_horizon": route.horizon,
+            "trial_number": int(trial_number),
+            "candidate_family": config.candidate_family,
+            "screen_config": _config_snapshot(_screen_config(config)),
+            "total_terminal_screen_trials": int(total_terminal_screen_trials),
+        }
+    )
+
+
+def _build_proxy_context_for_fold(
+    tuning_panel: pl.DataFrame,
+    tuning_folds: list[Fold],
+    base_manifest: ModelManifest,
+    feature_columns: tuple[str, ...],
+    label_column: str,
+    relevance_column: str | None,
+    request: TrainingRequest,
+    route: RouteSpec,
+    *,
+    fold_index: int,
+    proxy_session_stride: int,
+    dataset_manifest: DatasetManifest,
+    registry: ModelArtifactRegistry,
+    base_schedule: CostSchedule,
+    stress_schedule: CostSchedule,
+) -> PreparedCandidateContext | None:
+    """Materialize exactly one confirmation fold's proxy context and kernel.
+
+    Builds the full fold context, thins its training split to the fixed proxy
+    stride, slims it to the retained prepared state, and attaches the
+    execution-matched kernel for that fold. The context is local to one fold and
+    one candidate; the caller releases it before the next fold so only one fold
+    kernel is ever alive at a time inside a confirmation worker.
+    """
+    if fold_index < 0 or fold_index >= len(tuning_folds):
+        raise IndexError(f"fold index {fold_index} outside the tuning fold set")
+    rich = _fit_stable_context(
+        tuning_panel,
+        tuning_folds[fold_index],
+        base_manifest,
+        feature_columns,
+        label_column,
+        relevance_column,
+    )
+    proxy_rich = _build_proxy_context(
+        rich,
+        proxy_session_stride,
+        base_manifest,
+        feature_columns,
+        label_column,
+        relevance_column,
+    )
+    del rich
+    proxy = _prepare_candidate_context(proxy_rich, label_column, relevance_column)
+    del proxy_rich
+    if proxy is None:
+        return None
+    return _attach_proxy_kernel(
+        proxy,
+        tuning_folds[fold_index],
+        tuning_panel,
+        request,
+        route,
+        fold_index=fold_index,
+        dataset_manifest=dataset_manifest,
+        registry=registry,
+        base_schedule=base_schedule,
+        stress_schedule=stress_schedule,
+    )
+
+
+def _score_confirmation_folds(
+    tuning_panel: pl.DataFrame,
+    tuning_folds: list[Fold],
+    context_provider: Callable[[int], PreparedCandidateContext | None],
+    request: TrainingRequest,
+    base_manifest: ModelManifest,
+    feature_columns: tuple[str, ...],
+    label_column: str,
+    relevance_column: str | None,
+    screen_config: LambdaRankConfig,
+    guard: TrialResourceGuard,
+    trial_number: int,
+    route_horizon: int,
+) -> tuple[list[ScreenFoldEvidence], str, int | None, str | None]:
+    """Score every confirmation fold of one frozen candidate.
+
+    ``context_provider(index)`` yields the prepared proxy context (with kernel)
+    for a fold; the caller controls whether folds come from prebuilt contexts
+    (in-process) or are materialized lazily one at a time (worker). Returns
+    ``(evidences, terminal_reason, failed_fold_index, failure_reason)``. A fold
+    that cannot be scored fails the candidate closed with the deterministic
+    ``hard_failure`` terminal reason; a non-positive finite Rank-IC stops the
+    loop early with ``rank_ic_non_positive`` and keeps that fold's evidence so
+    the caller can record it.
+    """
+    fold_evidences: list[ScreenFoldEvidence] = []
+    terminal_reason = "confirmed"
+    failed_fold_index: int | None = None
+    failure_reason: str | None = None
+    for fold_index in range(len(tuning_folds)):
+        proxy = context_provider(fold_index)
+        if proxy is None:
+            terminal_reason = "hard_failure"
+            failed_fold_index = fold_index
+            failure_reason = "no_proxy_context"
+            break
+        record = _ScreenTrialRecord(trial_number)
+        ev = _score_trial_fold(
+            tuning_panel,
+            tuning_folds[fold_index],
+            proxy,
+            request,
+            base_manifest,
+            feature_columns,
+            label_column,
+            relevance_column,
+            screen_config,
+            guard,
+            cast(optuna.Trial, record),
+            fold_index,
+            callbacks=(),
+            report_progress=False,
+            key_prefix=f"h{route_horizon}_",
+        )
+        if ev is None:
+            terminal_reason = "hard_failure"
+            failed_fold_index = fold_index
+            failure_reason = str(
+                record.user_attrs.get(
+                    f"h{route_horizon}_screen_failure_reason", "unknown"
+                )
+            )
+            break
+        if ev.rank_ic <= 0.0:
+            terminal_reason = "rank_ic_non_positive"
+            fold_evidences.append(ev)
+            break
+        fold_evidences.append(ev)
+    return fold_evidences, terminal_reason, failed_fold_index, failure_reason
+
+
+def _confirm_candidate_in_process(
+    tuning_panel: pl.DataFrame,
+    tuning_folds: list[Fold],
+    proxy_contexts: tuple[PreparedCandidateContext | None, ...],
+    request: TrainingRequest,
+    route: RouteSpec,
+    base_manifest: ModelManifest,
+    feature_columns: tuple[str, ...],
+    frozen_config: LambdaRankConfig,
+    trial_number: int,
+    *,
+    lgb_threads: int,
+    run_identity_hash: str,
+    selection_identity_hash: str,
+) -> ConfirmationCandidateResult:
+    """Score one candidate's confirmation folds in the current process.
+
+    Legacy in-process path used when no durable run store is present: folds
+    come from the prebuilt proxy contexts (fold 0 carries the screen kernel;
+    remaining folds carry their own kernels). Returns the same JSON-safe
+    :class:`ConfirmationCandidateResult` shape as the worker so the caller's
+    pooling/selection logic is byte-identical across process boundaries.
+    """
+    del lgb_threads
+    screen_config = _screen_config(frozen_config)
+    guard = TrialResourceGuard(
+        request, predictor_count=len(feature_columns) * 3
+    )
+    guard.record_phase_rss(
+        "screen_to_confirmation_transition", TrialResourceGuard._rss_mib()
+    )
+
+    def _provider(fold_index: int) -> PreparedCandidateContext | None:
+        return proxy_contexts[fold_index]
+
+    fold_evidences, terminal_reason, failed_fold_index, failure_reason = (
+        _score_confirmation_folds(
+            tuning_panel,
+            tuning_folds,
+            _provider,
+            request,
+            base_manifest,
+            feature_columns,
+            route.label_column,
+            route.relevance_column,
+            screen_config,
+            guard,
+            trial_number,
+            route.horizon,
+        )
+    )
+    input_identity_hash = _confirmation_identity_hash(
+        run_identity_hash, route, trial_number, frozen_config
+    )
+    return ConfirmationCandidateResult(
+        trial_number=int(trial_number),
+        candidate_family=frozen_config.candidate_family,
+        route_horizon=int(route.horizon),
+        terminal_reason=terminal_reason,
+        fold_evidence=tuple(ev.to_json_safe() for ev in fold_evidences),
+        block_log_excess=tuple(tuple(ev.block_log_excess) for ev in fold_evidences),
+        block_ids=tuple(tuple(ev.block_ids) for ev in fold_evidences),
+        failed_fold_index=failed_fold_index,
+        failure_reason=failure_reason,
+        worker_exit_code=0,
+        worker_peak_rss_mib=guard.peak_rss_mib,
+        phase_elapsed_seconds={
+            "worker_total_seconds": 0.0,
+            **{
+                key: round(float(seconds), 3)
+                for key, seconds in guard.fold_timings.items()
+            },
+        },
+        input_identity_hash=input_identity_hash,
+        selection_identity_hash=selection_identity_hash,
+        is_hard_failure=terminal_reason == "hard_failure",
+    )
+
+
+def _confirmation_worker_entry(
+    payload: dict[str, object],
+    request: TrainingRequest,
+    route: RouteSpec,
+    trial_number: int,
+    run_identity_hash: str,
+    result_queue: multiprocessing.Queue[object],
+) -> None:
+    """Score one frozen candidate's confirmation folds inside the worker process.
+
+    The worker is started with the ``spawn`` start method, so it is a fresh
+    interpreter that re-initializes its own native allocators and OpenMP runtimes
+    (forking after LightGBM training deadlocks the child). All inputs travel
+    through the pickled ``payload``: the heavy tuning panel is passed as an
+    argument rather than copied-on-write, and the worker builds each fold's
+    proxy context and execution-matched kernel lazily, one at a time, so only
+    one fold kernel is ever alive. Returns a JSON-safe
+    :class:`ConfirmationCandidateResult` on the queue. A nonzero exit, timeout,
+    invalid schema, identity mismatch, or RSS watermark breach is converted by
+    the supervisor to ``hard_failure:confirmation_worker_exit``; inside the
+    worker an exception or watermark breach is reported as a hard failure so
+    the parent never sees partial evidence.
+    """
+    try:
+        panel = cast(pl.DataFrame, payload["panel"])
+        tuning_folds = cast(list[Fold], payload["tuning_folds"])
+        base_manifest = cast(ModelManifest, payload["base_manifest"])
+        feature_columns = cast(tuple[str, ...], payload["feature_columns"])
+        dataset_manifest = cast(DatasetManifest, payload["dataset_manifest"])
+        registry = cast(ModelArtifactRegistry, payload["registry"])
+        base_schedule = cast(CostSchedule, payload["base_schedule"])
+        stress_schedule = cast(CostSchedule, payload["stress_schedule"])
+        proxy_session_stride = int(cast(int, payload["proxy_session_stride"]))
+        lgb_threads = int(cast(int, payload["lgb_threads"]))
+        frozen_params = cast(dict[str, Any], payload["frozen_params"])
+        ablation_weight = payload.get("ablation_weight")
+        selection_identity_hash = str(cast(str, payload["selection_identity_hash"]))
+        params = dict(frozen_params)
+        if ablation_weight is not None:
+            params["lambdarank_weight"] = float(cast(float, ablation_weight))
+        config = _config_from_params(params, num_threads=lgb_threads)
+        screen_config = _screen_config(config)
+        input_identity_hash = _confirmation_identity_hash(
+            run_identity_hash, route, trial_number, config
+        )
+        guard = TrialResourceGuard(request, predictor_count=len(feature_columns) * 3)
+        guard.record_phase_rss("worker_start", TrialResourceGuard._rss_mib())
+        worker_started = time.perf_counter()
+
+        def _provider(fold_index: int) -> PreparedCandidateContext | None:
+            return _build_proxy_context_for_fold(
+                panel,
+                tuning_folds,
+                base_manifest,
+                feature_columns,
+                route.label_column,
+                route.relevance_column,
+                request,
+                route,
+                fold_index=fold_index,
+                proxy_session_stride=proxy_session_stride,
+                dataset_manifest=dataset_manifest,
+                registry=registry,
+                base_schedule=base_schedule,
+                stress_schedule=stress_schedule,
+            )
+
+        fold_evidences, terminal_reason, failed_fold_index, failure_reason = (
+            _score_confirmation_folds(
+                panel,
+                tuning_folds,
+                _provider,
+                request,
+                base_manifest,
+                feature_columns,
+                route.label_column,
+                route.relevance_column,
+                screen_config,
+                guard,
+                trial_number,
+                route.horizon,
+            )
+        )
+        guard.record_phase_rss("worker_finish", TrialResourceGuard._rss_mib())
+        result = ConfirmationCandidateResult(
+            trial_number=int(trial_number),
+            candidate_family=config.candidate_family,
+            route_horizon=int(route.horizon),
+            terminal_reason=terminal_reason,
+            fold_evidence=tuple(ev.to_json_safe() for ev in fold_evidences),
+            block_log_excess=tuple(tuple(ev.block_log_excess) for ev in fold_evidences),
+            block_ids=tuple(tuple(ev.block_ids) for ev in fold_evidences),
+            failed_fold_index=failed_fold_index,
+            failure_reason=failure_reason,
+            worker_exit_code=0,
+            worker_peak_rss_mib=guard.peak_rss_mib,
+            phase_elapsed_seconds={
+                "worker_total_seconds": round(time.perf_counter() - worker_started, 3),
+                **{
+                    key: round(float(seconds), 3)
+                    for key, seconds in guard.fold_timings.items()
+                },
+            },
+            input_identity_hash=input_identity_hash,
+            selection_identity_hash=selection_identity_hash,
+            is_hard_failure=terminal_reason == "hard_failure",
+        )
+        result_queue.put(result.to_json_safe())
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "confirmation worker failed for route=%sd trial=%s",
+            route.horizon,
+            trial_number,
+        )
+        result_queue.put(
+            ConfirmationCandidateResult(
+                trial_number=int(trial_number),
+                candidate_family="",
+                route_horizon=int(route.horizon),
+                terminal_reason="hard_failure",
+                failed_fold_index=None,
+                failure_reason=f"confirmation_worker_exit:{type(exc).__name__}:{exc}",
+                worker_exit_code=1,
+                worker_peak_rss_mib=0.0,
+                input_identity_hash=run_identity_hash,
+                selection_identity_hash="",
+                is_hard_failure=True,
+            ).to_json_safe()
+        )
+
+
+def _run_confirmation_candidate_worker(
+    request: TrainingRequest,
+    route: RouteSpec,
+    trial_number: int,
+    run_identity_hash: str,
+) -> ConfirmationCandidateResult:
+    """Run one frozen candidate's confirmation folds in a fresh bounded process.
+
+    The parent supervises one worker per candidate: it records the
+    screen-to-confirmation transition RSS, enforces the 90% operating watermark
+    before launching, waits within a bounded timeout, and fails the candidate
+    closed with ``hard_failure:confirmation_worker_exit`` on a nonzero exit,
+    timeout, invalid result schema, identity mismatch, or watermark breach.
+    Only the small JSON-safe result crosses the process boundary; the heavy
+    prepared contexts, replay ledger, and Booster stay inside the worker and are
+    reclaimed by the OS when it exits.
+    """
+    guard = TrialResourceGuard(
+        request, predictor_count=_CONFIRMATION_WORKER_PREDICTOR_MULTIPLIER
+    )
+    guard.record_phase_rss(
+        "screen_to_confirmation_transition", TrialResourceGuard._rss_mib()
+    )
+    try:
+        worker_estimate = _confirmation_worker_estimate_mib(
+            cast(pl.DataFrame, _CONFIRMATION_WORKER_INPUTS["panel"])
+        )
+        guard.record_phase_rss(
+            "confirmation_worker_pre_launch",
+            TrialResourceGuard._rss_mib() + worker_estimate,
+        )
+    except (KeyError, TrainingCapacityError) as exc:
+        return ConfirmationCandidateResult(
+            trial_number=int(trial_number),
+            candidate_family="",
+            route_horizon=int(route.horizon),
+            terminal_reason="hard_failure",
+            failed_fold_index=None,
+            failure_reason=f"replay_capacity_exceeded:{exc}",
+            worker_exit_code=1,
+            worker_peak_rss_mib=guard.peak_rss_mib,
+            input_identity_hash=run_identity_hash,
+            selection_identity_hash="",
+            is_hard_failure=True,
+        )
+
+    result_queue: multiprocessing.Queue[object] = _CONFIRMATION_MP_CONTEXT.Queue()
+    payload: dict[str, object] = {
+        "panel": _CONFIRMATION_WORKER_INPUTS["panel"],
+        "tuning_folds": _CONFIRMATION_WORKER_INPUTS["tuning_folds"],
+        "base_manifest": _CONFIRMATION_WORKER_INPUTS["base_manifest"],
+        "feature_columns": _CONFIRMATION_WORKER_INPUTS["feature_columns"],
+        "dataset_manifest": _CONFIRMATION_WORKER_INPUTS["dataset_manifest"],
+        "registry": _CONFIRMATION_WORKER_INPUTS["registry"],
+        "base_schedule": _CONFIRMATION_WORKER_INPUTS["base_schedule"],
+        "stress_schedule": _CONFIRMATION_WORKER_INPUTS["stress_schedule"],
+        "proxy_session_stride": _CONFIRMATION_WORKER_INPUTS["proxy_session_stride"],
+        "lgb_threads": _CONFIRMATION_WORKER_INPUTS["lgb_threads"],
+        "frozen_params": _CONFIRMATION_WORKER_INPUTS["frozen_params"],
+        "ablation_weight": _CONFIRMATION_WORKER_INPUTS.get("ablation_weight"),
+        "selection_identity_hash": _CONFIRMATION_WORKER_INPUTS.get(
+            "selection_identity_hash"
+        ),
+    }
+    process = _CONFIRMATION_MP_CONTEXT.Process(
+        target=_confirmation_worker_entry,
+        args=(payload, request, route, trial_number, run_identity_hash, result_queue),
+        daemon=True,
+    )
+    try:
+        process.start()
+    except Exception as exc:  # noqa: BLE001
+        return ConfirmationCandidateResult(
+            trial_number=int(trial_number),
+            candidate_family="",
+            route_horizon=int(route.horizon),
+            terminal_reason="hard_failure",
+            failed_fold_index=None,
+            failure_reason=f"confirmation_worker_exit:spawn_failed:{type(exc).__name__}",
+            worker_exit_code=1,
+            worker_peak_rss_mib=guard.peak_rss_mib,
+            input_identity_hash=run_identity_hash,
+            selection_identity_hash="",
+            is_hard_failure=True,
+        )
+    process.join(timeout=_CONFIRMATION_WORKER_TIMEOUT_SECONDS)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=_CONFIRMATION_WORKER_KILL_TIMEOUT_SECONDS)
+        return ConfirmationCandidateResult(
+            trial_number=int(trial_number),
+            candidate_family="",
+            route_horizon=int(route.horizon),
+            terminal_reason="hard_failure",
+            failed_fold_index=None,
+            failure_reason="confirmation_worker_exit:timeout",
+            worker_exit_code=1,
+            worker_peak_rss_mib=guard.peak_rss_mib,
+            input_identity_hash=run_identity_hash,
+            selection_identity_hash="",
+            is_hard_failure=True,
+        )
+    if process.exitcode != 0:
+        return ConfirmationCandidateResult(
+            trial_number=int(trial_number),
+            candidate_family="",
+            route_horizon=int(route.horizon),
+            terminal_reason="hard_failure",
+            failed_fold_index=None,
+            failure_reason="confirmation_worker_exit:nonzero_exit",
+            worker_exit_code=int(cast(int, process.exitcode)),
+            worker_peak_rss_mib=guard.peak_rss_mib,
+            input_identity_hash=run_identity_hash,
+            selection_identity_hash="",
+            is_hard_failure=True,
+        )
+    try:
+        raw = result_queue.get_nowait()
+    except (queue.Empty, EOFError):
+        return ConfirmationCandidateResult(
+            trial_number=int(trial_number),
+            candidate_family="",
+            route_horizon=int(route.horizon),
+            terminal_reason="hard_failure",
+            failed_fold_index=None,
+            failure_reason="confirmation_worker_exit:no_result",
+            worker_exit_code=1,
+            worker_peak_rss_mib=guard.peak_rss_mib,
+            input_identity_hash=run_identity_hash,
+            selection_identity_hash="",
+            is_hard_failure=True,
+        )
+    if not isinstance(raw, dict):
+        return ConfirmationCandidateResult(
+            trial_number=int(trial_number),
+            candidate_family="",
+            route_horizon=int(route.horizon),
+            terminal_reason="hard_failure",
+            failed_fold_index=None,
+            failure_reason="confirmation_worker_exit:invalid_schema",
+            worker_exit_code=1,
+            worker_peak_rss_mib=guard.peak_rss_mib,
+            input_identity_hash=run_identity_hash,
+            selection_identity_hash="",
+            is_hard_failure=True,
+        )
+    try:
+        result = ConfirmationCandidateResult.from_json_safe(raw)
+    except ValueError:
+        return ConfirmationCandidateResult(
+            trial_number=int(trial_number),
+            candidate_family="",
+            route_horizon=int(route.horizon),
+            terminal_reason="hard_failure",
+            failed_fold_index=None,
+            failure_reason="confirmation_worker_exit:invalid_schema",
+            worker_exit_code=1,
+            worker_peak_rss_mib=guard.peak_rss_mib,
+            input_identity_hash=run_identity_hash,
+            selection_identity_hash="",
+            is_hard_failure=True,
+        )
+    expected_input_hash = _confirmation_identity_hash(
+        run_identity_hash,
+        route,
+        trial_number,
+        _config_from_params(
+            cast(dict[str, Any], _CONFIRMATION_WORKER_INPUTS["frozen_params"]),
+            num_threads=int(cast(int, _CONFIRMATION_WORKER_INPUTS["lgb_threads"])),
+        ),
+    )
+    expected_selection_hash = str(
+        cast(str, _CONFIRMATION_WORKER_INPUTS["selection_identity_hash"])
+    )
+    if (
+        result.input_identity_hash != expected_input_hash
+        or result.selection_identity_hash != expected_selection_hash
+        or result.trial_number != int(trial_number)
+        or result.route_horizon != int(route.horizon)
+    ):
+        return ConfirmationCandidateResult(
+            trial_number=int(trial_number),
+            candidate_family="",
+            route_horizon=int(route.horizon),
+            terminal_reason="hard_failure",
+            failed_fold_index=None,
+            failure_reason="confirmation_worker_exit:identity_mismatch",
+            worker_exit_code=1,
+            worker_peak_rss_mib=guard.peak_rss_mib,
+            input_identity_hash=run_identity_hash,
+            selection_identity_hash="",
+            is_hard_failure=True,
+        )
+    return result
+
+
+_CONFIRMATION_WORKER_PREDICTOR_MULTIPLIER = 3
+
+_CONFIRMATION_WORKER_TIMEOUT_SECONDS = 3600
+
+_CONFIRMATION_WORKER_KILL_TIMEOUT_SECONDS = 30
+
+
+def _confirmation_worker_estimate_mib(panel: pl.DataFrame) -> float:
+    """Conservative MiB estimate of one worker's live-input plus workspace peak.
+
+    The worker inherits the panel copy-on-write and additionally materializes
+    the full fold context, the proxy context, and one execution-matched kernel
+    at a time. The estimate is a structural multiple of the panel's estimated
+    size so the pre-launch watermark check never admits a worker whose
+    conservative peak is already over the 90% operating ceiling.
+    """
+    panel_bytes = max(int(panel.estimated_size()), 1)
+    return float(panel_bytes * _CONFIRMATION_WORKER_ESTIMATE_MULTIPLE) / (1024 * 1024)
+
+
+_CONFIRMATION_WORKER_ESTIMATE_MULTIPLE = 4
 
 
 def _proxy_session_filter(
@@ -3127,18 +4109,30 @@ def _score_trial_fold(
         context.train_rows,
         extra_bytes=_fold_cache_bytes(context.prepared),
     )
+    guard.record_phase_rss(f"{key_prefix}fold_start", TrialResourceGuard._rss_mib())
     started = time.perf_counter()
+    cleanup_errors: list[str] = []
     try:
         model_started = time.perf_counter()
         result = _score_context_model(
             context, request, base_manifest, label_column, relevance_column, config,
             callbacks=callbacks,
+            cleanup_errors=cleanup_errors,
         )
         guard.record_fold_stage(
             key, "fit_predict", time.perf_counter() - model_started
         )
+        guard.record_phase_rss(
+            f"{key_prefix}fit_predict", TrialResourceGuard._rss_mib()
+        )
+        guard.record_phase_rss(
+            f"{key_prefix}native_close", TrialResourceGuard._rss_mib()
+        )
         if result is None:
             _record_screen_failure(trial, key_prefix, "fit_failed", {})
+            return None
+        if cleanup_errors:
+            _record_screen_failure(trial, key_prefix, "native_cleanup_failed", {})
             return None
         _ic, scored, outcome = result
         if outcome.best_iteration is not None:
@@ -3162,6 +4156,9 @@ def _score_trial_fold(
         guard.record_fold_stage(
             key, "calibration_ledger", time.perf_counter() - ledger_started
         )
+        guard.record_phase_rss(
+            f"{key_prefix}calibration", TrialResourceGuard._rss_mib()
+        )
         replay_started = time.perf_counter()
         evidence = kernel.run_base(
             scored,
@@ -3171,6 +4168,7 @@ def _score_trial_fold(
         guard.record_fold_stage(
             key, "replay", time.perf_counter() - replay_started
         )
+        guard.record_phase_rss(f"{key_prefix}replay", TrialResourceGuard._rss_mib())
         for stage, seconds in evidence.replay_stage_seconds.items():
             guard.record_fold_stage(key, stage, float(seconds))
         if evidence.filled_orders <= 0:
@@ -3341,6 +4339,7 @@ def _score_context_model(
     callbacks: Sequence[Callable[..., object]] = (),
     initial_rounds: int | None = None,
     timings: _SelectionTimings | None = None,
+    cleanup_errors: list[str] | None = None,
 ) -> tuple[float, pl.DataFrame, FitTrialOutcome] | None:
     """Fit one candidate on a cached prepared fold and return ``(rank_ic, scored, outcome)``.
 
@@ -3350,7 +4349,10 @@ def _score_context_model(
     ``(session, instrument_id, pred_score)`` frame; no transformed predictor
     frame is reconstructed or retained. ``initial_rounds`` selects the adaptive
     continuation driver for promoted full refits. ``timings``, when supplied,
-    accumulates the exclusive train/predict durations of a full refit.
+    accumulates the exclusive train/predict durations of a full refit. The
+    temporary model is closed after predictions are materialized; a native
+    cleanup error is never suppressed and is appended to ``cleanup_errors`` as
+    a deterministic failure reason so the caller can fail the fold closed.
     """
     model = LambdaRankBlendModel(
         base_manifest,
@@ -3361,32 +4363,37 @@ def _score_context_model(
         relevance_column=relevance_column or RELEVANCE_COLUMN,
     )
     try:
-        train_started = time.perf_counter()
-        outcome = model.fit_trial_prepared(
-            context.prepared,
-            context.stable_scores,
-            callbacks=callbacks,
-            initial_rounds=initial_rounds,
-        )
-        if timings is not None:
-            timings.refit_train_seconds += time.perf_counter() - train_started
-    except ValueError:
-        return None
-    if not outcome.fit_ok or model.no_trade:
-        return None
-    try:
-        predict_started = time.perf_counter()
-        scored = model.predict_prepared_scores(
-            context.prepared,
-            context.validation_index,
-            context.stable_scores,
-        )
-        if timings is not None:
-            timings.refit_predict_seconds += time.perf_counter() - predict_started
-    except ValueError:
-        return None
-    ic = _median_rank_ic(context.labels, scored, label_column)
-    return float(ic), scored, outcome
+        try:
+            train_started = time.perf_counter()
+            outcome = model.fit_trial_prepared(
+                context.prepared,
+                context.stable_scores,
+                callbacks=callbacks,
+                initial_rounds=initial_rounds,
+            )
+            if timings is not None:
+                timings.refit_train_seconds += time.perf_counter() - train_started
+        except ValueError:
+            return None
+        if not outcome.fit_ok or model.no_trade:
+            return None
+        try:
+            predict_started = time.perf_counter()
+            scored = model.predict_prepared_scores(
+                context.prepared,
+                context.validation_index,
+                context.stable_scores,
+            )
+            if timings is not None:
+                timings.refit_predict_seconds += time.perf_counter() - predict_started
+        except ValueError:
+            return None
+        ic = _median_rank_ic(context.labels, scored, label_column)
+        return float(ic), scored, outcome
+    finally:
+        model.close()
+        if model.close_error is not None and cleanup_errors is not None:
+            cleanup_errors.append(model.close_error)
 
 
 def _frame_bytes(frame: pl.DataFrame) -> int:
@@ -3600,12 +4607,14 @@ def _fit_and_score_candidate(
             TrialResourceGuard._rss_mib(),
         )
         try:
+            cleanup_errors: list[str] = []
             result = _score_context_model(
                 context, request, base_manifest, label_column, relevance_column, config,
                 initial_rounds=initial_rounds,
                 timings=timings,
+                cleanup_errors=cleanup_errors,
             )
-            if result is None:
+            if result is None or cleanup_errors:
                 return None
             ic, scored, outcome = result
             if outcome.best_iteration is not None:
