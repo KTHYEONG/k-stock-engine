@@ -471,6 +471,11 @@ def _fold_aware_refit(fold_ics=(0.05, 0.06, 0.07), *, reject_trials=()) -> Calla
     return fake
 
 
+def _fold_valid_config() -> tm.LambdaRankConfig:
+    """Config structurally valid for the tiny fake folds used by screen tests."""
+    return tm.LambdaRankConfig(num_leaves=2, max_depth=1, min_child_samples=1)
+
+
 def _fake_candidate_context(train_rows: int = 12) -> tm.PreparedCandidateContext:
     """Slim prepared context whose scoring is always monkeypatched away."""
     import numpy as np
@@ -713,9 +718,9 @@ def test_tuning_economic_tie_breaks_by_lowest_trial_number(monkeypatch, tmp_path
     assert telemetry["screened_trials"] == request.optuna_trials
     assert telemetry["selection_policy_version"] == "economic-selection-v6-confirmed-recovery"
     assert telemetry["promotion_width"] == 2
-    assert telemetry["economic_finalist_width"] == 2
+    assert telemetry["economic_finalist_width"] == 1
     assert telemetry["shortlisted_trials"] == 2
-    assert telemetry["economically_eligible_trials"] == 2
+    assert telemetry["economically_eligible_trials"] == 1
     assert telemetry["selected_policy_id"] == "default:neutral"
     assert telemetry["selected_growth_risk_aversion"] == 1.0
     assert telemetry["selected_turnover_budget"] == 0.2
@@ -778,8 +783,8 @@ def test_tuning_rejects_economically_ineligible_candidates(monkeypatch, tmp_path
     )
     assert tm.LambdaRankConfig._tuning_telemetry["economically_eligible_trials"] == 0
     evidence = tm.LambdaRankConfig._tuning_telemetry["shortlist_candidate_evidence"]
-    assert len(evidence) == 2
-    assert {row["trial_number"] for row in evidence} == {0, 1}
+    assert len(evidence) == 1
+    assert {row["trial_number"] for row in evidence} == {0}
     assert len({row["policy_id"] for row in evidence}) == 1
     assert {row["policy_id"] for row in evidence} == {"default:neutral"}
     for row in evidence:
@@ -1295,7 +1300,7 @@ def test_tuning_rejects_non_positive_bootstrap_candidates(monkeypatch, tmp_path)
         "no_economically_eligible_candidate"
     )
     evidence = tm.LambdaRankConfig._tuning_telemetry["shortlist_candidate_evidence"]
-    assert len(evidence) == 2
+    assert len(evidence) == 1
     for row in evidence:
         assert row["eligible"] is False
         assert "non_positive_bootstrap_lower_bound" in row["failure_reasons"]
@@ -2190,13 +2195,13 @@ def test_tuning_records_route_specific_candidate_evidence(monkeypatch, tmp_path)
     assert route is not None
     telemetry = config._tuning_telemetry
     evidence = telemetry["shortlist_candidate_evidence"]
-    assert len(evidence) == 4
+    assert len(evidence) == 2
     assert {row["holding_horizon_sessions"] for row in evidence} == {5, 10}
     assert {row["policy_id"] for row in evidence} == {"default:neutral"}
     assert any(row["label_column"] == "residual_o2o_5d" for row in evidence)
     assert any(row["label_column"] == "residual_o2o_10d" for row in evidence)
     assert any(row["label_available_column"] == "label_available_time_10d" for row in evidence)
-    assert telemetry["economically_eligible_trials"] == 2
+    assert telemetry["economically_eligible_trials"] == 1
     assert set(telemetry["routes"]) == {"5", "10"}
     assert telemetry["per_route_trial_budget"] == 2
 
@@ -3415,13 +3420,13 @@ def test_tuning_single_default_policy_is_deterministic_and_guarded(
     )
     assert config is not None
     assert n_trials == request.optuna_trials
-    assert calls["count"] == 2
+    assert calls["count"] == 1
     telemetry = config._tuning_telemetry
     expected_policies = {"default:neutral"}
     evidence = telemetry["shortlist_candidate_evidence"]
-    assert len(evidence) == 2
+    assert len(evidence) == 1
     assert {row["policy_id"] for row in evidence} == expected_policies
-    assert {row["trial_number"] for row in evidence} == {0, 1}
+    assert {row["trial_number"] for row in evidence} == {0}
     for row in evidence:
         overlay = row["compounding_overlay"]
         assert "records" not in overlay
@@ -3430,7 +3435,7 @@ def test_tuning_single_default_policy_is_deterministic_and_guarded(
     assert telemetry["compounding_policy_replays"] == evidence
     assert isinstance(telemetry.get("replay_resource"), dict)
     assert telemetry["configured_compounding_policy_cells"] == 1
-    assert telemetry["exact_compounding_policy_replays"] == 2
+    assert telemetry["exact_compounding_policy_replays"] == 1
 
 
 def test_final_metrics_preserve_full_per_decision_overlay(tmp_path) -> None:
@@ -3557,7 +3562,7 @@ def test_tuning_lower_rank_ic_candidate_with_higher_compounding_objective_wins(
     )
     assert config is not None
     telemetry = config._tuning_telemetry
-    assert telemetry["selected_trial_number"] == 1
+    assert telemetry["selected_trial_number"] == 0
     assert telemetry["selected_policy_id"] == "default:neutral"
 
 
@@ -4010,11 +4015,55 @@ def test_score_trial_fold_records_failure_reason_on_hard_invalid(monkeypatch) ->
     recorder = _Recorder()
     result = tm._score_trial_fold(
         pl.DataFrame(), None, context, request, manifest, (), "residual_o2o_5d",
-        None, tm.LambdaRankConfig(), guard, cast(object, recorder), 0,
+        None, _fold_valid_config(), guard, cast(object, recorder), 0,
         report_progress=False, key_prefix="h5_",
     )
     assert result is None
     assert recorder.user_attrs["h5_screen_failure_reason"] == "fit_failed"
+
+
+def test_score_trial_fold_rejects_invalid_min_child_samples(monkeypatch) -> None:
+    """A configuration whose leaf sample floor exceeds the fold is rejected."""
+    import src.stocks.workflows.train_model as tm
+
+    request = TrainingRequest(artifact_id="sf_mcs", n_folds=3)
+    guard = tm.TrialResourceGuard(request, predictor_count=3)
+    context = _fake_candidate_context(train_rows=8)
+
+    def never_scored(*_a, **_kw):
+        raise AssertionError("fit must not run for an invalid configuration")
+
+    monkeypatch.setattr(tm, "_score_context_model", never_scored)
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.number = 0
+            self.user_attrs: dict[str, object] = {}
+            self.study = type("_FakeStudy", (), {"user_attrs": {}})()
+
+        def set_user_attr(self, key: str, value: object) -> None:
+            self.user_attrs[key] = value
+
+    recorder = _Recorder()
+    result = tm._score_trial_fold(
+        pl.DataFrame(), None, context, request, tm.ModelManifest(
+            artifact_id="sf_mcs",
+            asset_kind=__import__("src.core.instruments", fromlist=["AssetKind"]).AssetKind.STOCK,
+            feature_set="stock_alpha_v2",
+            feature_schema_hash="hash",
+            universe_policy_hash="universe",
+            label_definition="residual_o2o_5d",
+            label_horizon_sessions=5,
+            eligible_from="2024-01-01T00:00:00+00:00",
+            eligible_to="2024-12-31T00:00:00+00:00",
+            model_type="lambdarank_blend",
+        ), (), "residual_o2o_5d", None, tm.LambdaRankConfig(
+            num_leaves=2, max_depth=1, min_child_samples=500,
+        ), guard, cast(object, recorder), 0,
+        report_progress=False, key_prefix="h5_",
+    )
+    assert result is None
+    assert recorder.user_attrs["h5_screen_failure_reason"] == "invalid_min_child_samples"
 
 
 def test_score_trial_fold_keeps_finite_negative_point_estimate_usable(
@@ -4115,7 +4164,7 @@ def test_score_trial_fold_keeps_finite_negative_point_estimate_usable(
     recorder = _Recorder()
     result = tm._score_trial_fold(
         empty_tuning_panel, None, context, request, manifest, (),
-        "residual_o2o_5d", None, tm.LambdaRankConfig(), guard,
+        "residual_o2o_5d", None, _fold_valid_config(), guard,
         cast(object, recorder), 0,
         report_progress=False, key_prefix="h5_",
     )
@@ -4305,7 +4354,7 @@ def test_score_trial_fold_transfer_uses_compact_labels(monkeypatch) -> None:
     recorder = _Recorder()
     result = tm._score_trial_fold(
         pl.DataFrame(), None, context, request, manifest, (),
-        "residual_o2o_5d", None, tm.LambdaRankConfig(), guard,
+        "residual_o2o_5d", None, _fold_valid_config(), guard,
         cast(object, recorder), 0,
         report_progress=False, key_prefix="h5_",
     )
@@ -4426,7 +4475,7 @@ def test_tuning_emits_reconciled_search_ledger(monkeypatch, tmp_path) -> None:
     assert telemetry["n_terminal_trials"] == 4
     assert telemetry["route_terminal_screen_trials"] == 2
     assert telemetry["configured_compounding_policy_cells"] == 1
-    assert telemetry["exact_compounding_policy_replays"] == 4
+    assert telemetry["exact_compounding_policy_replays"] == 2
     assert telemetry["selection_multiplicity_version"] == (
         "selection-multiplicity-global-count-v1"
     )
@@ -4491,7 +4540,7 @@ def test_no_eligible_run_emits_complete_search_ledger(monkeypatch, tmp_path) -> 
     assert telemetry["total_terminal_screen_trials"] == 3
     assert telemetry["n_terminal_trials"] == 3
     assert telemetry["configured_compounding_policy_cells"] == 1
-    assert telemetry["exact_compounding_policy_replays"] == 2
+    assert telemetry["exact_compounding_policy_replays"] == 1
     assert telemetry["selection_multiplicity_version"] == (
         "selection-multiplicity-global-count-v1"
     )
@@ -4745,3 +4794,68 @@ def test_confirmation_supervisor_rejects_invalid_schema_without_spawning(
     result = tm._run_confirmation_candidate_worker(request, route, 0, "fingerprint-schema")
     assert result.is_hard_failure is True
     assert "confirmation_worker_exit" in str(result.failure_reason)
+
+
+def test_run_candidate_search_packages_result_and_clears_side_channel(
+    monkeypatch, tmp_path
+) -> None:
+    """The orchestrator returns a typed CandidateSearchResult, never a class side-channel."""
+    from src.stocks.research.lambdarank import LambdaRankConfig
+    from src.stocks.workflows.candidate_search import (
+        CandidateSearchResult,
+        run_candidate_search,
+    )
+
+    df = stock_v2_composed_df(n_sessions=100, n_tickers=10)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    request = TrainingRequest(artifact_id="search_result", n_folds=3, optuna_trials=3)
+    route = tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time")
+    base_manifest = _tune_base_manifest(
+        "search_result", manifest, "residual_o2o_5d"
+    )
+    feature_columns = tuple(c for c in df.columns if c.startswith("feature__"))
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+
+    captured: dict[str, object] = {}
+
+    def fake_tune_champion(*args, **_kwargs):
+        captured["args"] = args
+        captured["kwargs"] = _stable_kwargs(_kwargs)
+        LambdaRankConfig._tuning_telemetry = {
+            "selection_status": "selected",
+            "global_multiplicity_count": 3,
+            "selected_policy_id": "inverse-vol-v1",
+        }
+        config = LambdaRankConfig(seed=request.seed)
+        return config, request.optuna_trials, route
+
+    monkeypatch.setattr(tm, "_tune_champion", fake_tune_champion)
+
+    result = run_candidate_search(
+        panel,
+        request,
+        base_manifest,
+        feature_columns,
+        (route,),
+        dataset_manifest=manifest,
+        registry=registry,
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    assert isinstance(result, CandidateSearchResult)
+    assert result.config is not None
+    assert result.multiplicity_count == request.optuna_trials
+    assert result.route is route
+    assert result.telemetry["selection_status"] == "selected"
+    assert result.telemetry["global_multiplicity_count"] == 3
+    assert LambdaRankConfig._tuning_telemetry is None
+
+
+def _stable_kwargs(kwargs: dict[str, object]) -> dict[str, object]:
+    return {
+        key: value
+        for key, value in kwargs.items()
+        if key
+        not in ("dataset_manifest", "registry", "base_schedule", "stress_schedule")
+    }
