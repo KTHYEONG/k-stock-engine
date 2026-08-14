@@ -12,6 +12,7 @@ from src.stocks.data.feature_contracts import (
     feature_contract_book_from_allowlist,
     make_feature_contract,
     resolve_raw_source_names,
+    semantic_feature_contract_book,
 )
 
 ALLOWLIST = ("total_assets", "total_liabilities", "per", "pbr")
@@ -99,3 +100,93 @@ class TestContractDeterminism:
         base = make_feature_contract(name="per", source_field="per")
         altered = make_feature_contract(name="per", source_field="pbr")
         assert base.dependency_hash != altered.dependency_hash
+
+
+class TestSemanticContracts:
+    def test_semantic_book_requires_role_and_lineage(self) -> None:
+        book = semantic_feature_contract_book(
+            "stock_alpha_v3",
+            (
+                {
+                    "name": "adtv_20d",
+                    "role": "LIQUIDITY",
+                    "source_field": "adtv_20d",
+                    "source_dataset_ids": ("base_panel",),
+                    "source_columns": ("adtv_20d",),
+                    "formula_id": "stock_alpha_v3:adtv_20d:v1",
+                    "lookback_sessions": 20,
+                    "adjustment_basis": "split_adjusted",
+                    "null_policy": "retain_null",
+                    "stale_after_sessions": 0,
+                    "expected_frequency": "session",
+                },
+            ),
+        )
+        contract = book.contracts[0]
+        assert contract.role == "LIQUIDITY"
+        assert contract.lookback_sessions == 20
+        assert contract.formula_id == "stock_alpha_v3:adtv_20d:v1"
+        assert contract.adjustment_basis == "split_adjusted"
+        assert contract.source_dataset_ids == ("base_panel",)
+
+    def test_semantic_book_rejects_invalid_role(self) -> None:
+        with pytest.raises(ValueError, match="role must be one of"):
+            semantic_feature_contract_book(
+                "v1",
+                (
+                    {
+                        "name": "x",
+                        "role": "SIGNAL",
+                        "source_field": "x",
+                        "source_dataset_ids": ("base_panel",),
+                        "source_columns": ("x",),
+                        "formula_id": "v1:x:v1",
+                        "lookback_sessions": 1,
+                        "adjustment_basis": "split_adjusted",
+                        "null_policy": "retain_null",
+                        "stale_after_sessions": 0,
+                        "expected_frequency": "session",
+                    },
+                ),
+            )
+
+    def test_semantic_book_rejects_generic_fallback(self) -> None:
+        with pytest.raises(ValueError, match="generic fallback"):
+            semantic_feature_contract_book(
+                "v1",
+                (
+                    {
+                        "name": "x",
+                        "role": "ALPHA",
+                        "source_field": "x",
+                        "source_dataset_ids": ("base_panel",),
+                        "source_columns": ("x",),
+                        "formula_id": "",
+                        "lookback_sessions": 0,
+                        "adjustment_basis": "split_adjusted",
+                        "null_policy": "retain_null",
+                        "stale_after_sessions": 0,
+                        "expected_frequency": "session",
+                    },
+                ),
+            )
+
+    def test_semantic_hash_changes_with_lineage(self) -> None:
+        base = {
+            "name": "ep_ratio",
+            "role": "ALPHA",
+            "source_field": "ep_ratio",
+            "source_dataset_ids": ("base_panel",),
+            "source_columns": ("ep_ratio",),
+            "formula_id": "stock_alpha_v3:ep_ratio:v1",
+            "lookback_sessions": 0,
+            "adjustment_basis": "split_adjusted",
+            "null_policy": "retain_null",
+            "stale_after_sessions": 0,
+            "expected_frequency": "session",
+        }
+        first = semantic_feature_contract_book("v1", (base,)).contracts[0]
+        changed = dict(base)
+        changed["formula_id"] = "stock_alpha_v3:ep_ratio:v2"
+        second = semantic_feature_contract_book("v1", (changed,)).contracts[0]
+        assert first.dependency_hash != second.dependency_hash

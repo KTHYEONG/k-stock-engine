@@ -205,6 +205,8 @@ STOCK_ALPHA_V2_ALLOWLIST: tuple[str, ...] = (
 
 STOCK_ALPHA_V2_FEATURE_SET = "stock_alpha_v2"
 
+STOCK_ALPHA_V3_FEATURE_SET = "stock_alpha_v3"
+
 
 def stock_alpha_v2_allowlist() -> tuple[str, ...]:
     """Frozen v2 source allowlist: 34 empirically ready columns in manifest order.
@@ -214,6 +216,107 @@ def stock_alpha_v2_allowlist() -> tuple[str, ...]:
     totals and profits are excluded until complete DART facts are normalized.
     """
     return STOCK_ALPHA_V2_ALLOWLIST
+
+
+STOCK_ALPHA_V3_ROLES: dict[str, str] = {
+    # ALPHA/value
+    "ep_ratio": "ALPHA",
+    "bp_ratio": "ALPHA",
+    # ALPHA/price
+    "overnight_ret": "ALPHA",
+    "intraday_ret": "ALPHA",
+    "ret_2_5d": "ALPHA",
+    "ret_6_20d": "ALPHA",
+    "ret_21_60d": "ALPHA",
+    "close_high_ratio_10d": "ALPHA",
+    "relative_trend_score": "ALPHA",
+    "sector_ret_5d": "ALPHA",
+    "disparity_120d": "ALPHA",
+    # ALPHA/flow
+    "foreign_net_buy": "ALPHA",
+    "institution_net_buy": "ALPHA",
+    "individual_net_buy": "ALPHA",
+    "flow_consensus": "ALPHA",
+    "flow_intensity_20d": "ALPHA",
+    "volume_shock": "ALPHA",
+    "vpt_20d": "ALPHA",
+    # ALPHA/quality
+    "info_ratio_20d": "ALPHA",
+    "vol_asymmetry_20d": "ALPHA",
+    # RISK
+    "mcap_rank": "RISK",
+    "min_vol_5d": "RISK",
+    "volatility_20d": "RISK",
+    "volatility_60d": "RISK",
+    "vol_regime": "RISK",
+    # LIQUIDITY
+    "adtv_20d": "LIQUIDITY",
+    "turnover_ratio": "LIQUIDITY",
+    "amihud_20d": "LIQUIDITY",
+    "fluc_rate": "LIQUIDITY",
+}
+
+
+def stock_alpha_v3_allowlist() -> tuple[str, ...]:
+    """Ordered v3 ALPHA source allowlist in canonical manifest order."""
+    return tuple(
+        source
+        for source in STOCK_ALPHA_V2_ALLOWLIST
+        if STOCK_ALPHA_V3_ROLES.get(source) == _ALPHA_ROLE
+    )
+
+
+def stock_alpha_v3_role_allowlist() -> tuple[tuple[str, str], ...]:
+    """Ordered ``(source, role)`` pairs for every v3-declared source."""
+    return tuple(
+        (source, STOCK_ALPHA_V3_ROLES[source])
+        for source in STOCK_ALPHA_V2_ALLOWLIST
+        if source in STOCK_ALPHA_V3_ROLES
+    )
+
+
+def _v3_lookback_sessions(source: str) -> int:
+    """Derive the declared lookback from the source naming convention."""
+    suffix = source.rsplit("_", 1)[-1]
+    if suffix.isdigit():
+        return int(suffix)
+    if source.startswith(("overnight_ret", "intraday_ret", "fluc_rate", "sector_ret")):
+        return 1
+    return 0
+
+
+def stock_alpha_v3_semantic_contracts() -> tuple[dict[str, object], ...]:
+    """Semantic per-feature contract declarations for the v3 role allowlist.
+
+    Every entry carries the role and lineage required by the semantic contract
+    book: ``name``, ``role``, ``source_field``, ``source_dataset_ids``,
+    ``source_columns``, ``formula_id``, ``lookback_sessions``,
+    ``adjustment_basis``, ``null_policy``, ``stale_after_sessions``, and
+    ``expected_frequency``. ``formula_id`` names the canonical computation the
+    source column implements, so a formula change can never be published under
+    an unchanged contract.
+    """
+    contracts: list[dict[str, object]] = []
+    for source, role in stock_alpha_v3_role_allowlist():
+        formula_id = f"{STOCK_ALPHA_V3_FEATURE_SET}:{source}:v1"
+        contracts.append(
+            {
+                "name": source,
+                "role": role,
+                "source_field": source,
+                "source_dataset_ids": ("base_panel",),
+                "source_columns": (source,),
+                "formula_id": formula_id,
+                "lookback_sessions": _v3_lookback_sessions(source),
+                "observation_rule": "session_close",
+                "availability_rule": "next_session_open",
+                "adjustment_basis": "split_adjusted",
+                "null_policy": "retain_null",
+                "stale_after_sessions": 0,
+                "expected_frequency": "session",
+            }
+        )
+    return tuple(contracts)
 
 
 def v2_feature_columns(

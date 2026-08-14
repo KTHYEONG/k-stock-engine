@@ -23,6 +23,10 @@ class FeatureSourceKind(StrEnum):
     DERIVED = "derived"
 
 
+FEATURE_ROLES = ("ALPHA", "RISK", "LIQUIDITY", "CONTROL")
+_DEFAULT_ROLE = "ALPHA"
+
+
 @dataclass(frozen=True, slots=True)
 class DuplicateRule:
     """Explicit resolution for source fields that would collapse to one name.
@@ -44,7 +48,14 @@ class DuplicateRule:
 
 @dataclass(frozen=True, slots=True)
 class FeatureContract:
-    """One feature: names, types, source field, timing rules, and null policy."""
+    """One feature: names, types, source lineage, timing rules, and null policy.
+
+    Every contract declares exactly one economic role and a semantic lineage:
+    the source datasets and columns the feature is derived from, the formula
+    identity, adjustment basis, null/stale policy, and expected frequency. These
+    fields are bound into ``dependency_hash`` so a source-column or formula
+    change can never be published under the same feature name.
+    """
 
     name: str
     data_type: str
@@ -54,6 +65,13 @@ class FeatureContract:
     availability_rule: str
     lookback_sessions: int
     null_policy: str
+    role: str = _DEFAULT_ROLE
+    source_dataset_ids: tuple[str, ...] = ()
+    source_columns: tuple[str, ...] = ()
+    formula_id: str = ""
+    adjustment_basis: str = ""
+    stale_after_sessions: int = 0
+    expected_frequency: str = ""
     dependency_hash: str = ""
 
     def __post_init__(self) -> None:
@@ -65,6 +83,12 @@ class FeatureContract:
             raise ValueError(f"feature {self.name} requires a source_field")
         if self.lookback_sessions < 0:
             raise ValueError("lookback_sessions must be non-negative")
+        if self.role not in FEATURE_ROLES:
+            raise ValueError(
+                f"feature role must be one of {FEATURE_ROLES}; got {self.role!r}"
+            )
+        if self.stale_after_sessions < 0:
+            raise ValueError("stale_after_sessions must be non-negative")
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -76,6 +100,13 @@ class FeatureContract:
             "availability_rule": self.availability_rule,
             "lookback_sessions": self.lookback_sessions,
             "null_policy": self.null_policy,
+            "role": self.role,
+            "source_dataset_ids": list(self.source_dataset_ids),
+            "source_columns": list(self.source_columns),
+            "formula_id": self.formula_id,
+            "adjustment_basis": self.adjustment_basis,
+            "stale_after_sessions": self.stale_after_sessions,
+            "expected_frequency": self.expected_frequency,
             "dependency_hash": self.dependency_hash,
         }
 
@@ -88,8 +119,21 @@ def feature_dependency_hash(fields: Mapping[str, object]) -> str:
         f"{payload['name']}:{payload['data_type']}:{payload['source_field']}:"
         f"{payload['source_kind']}:{payload['observation_rule']}:"
         f"{payload['availability_rule']}:{payload['lookback_sessions']}:"
-        f"{payload['null_policy']}".encode()
+        f"{payload['null_policy']}:{payload['role']}:"
+        f"{','.join(str(v) for v in _as_sequence(payload['source_dataset_ids']))}:"
+        f"{','.join(str(v) for v in _as_sequence(payload['source_columns']))}:"
+        f"{payload['formula_id']}:{payload['adjustment_basis']}:"
+        f"{payload['stale_after_sessions']}:{payload['expected_frequency']}".encode()
     ).hexdigest()
+
+
+def _as_sequence(value: object) -> tuple[object, ...]:
+    """Narrow a ``Mapping[str, object]`` payload value to a sequence for hashing."""
+    if isinstance(value, (tuple, list)):
+        return tuple(value)
+    if value is None:
+        return ()
+    return (value,)
 
 
 def make_feature_contract(
@@ -102,6 +146,13 @@ def make_feature_contract(
     availability_rule: str = "next_session_open",
     lookback_sessions: int = 0,
     null_policy: str = "retain_null",
+    role: str = _DEFAULT_ROLE,
+    source_dataset_ids: tuple[str, ...] = (),
+    source_columns: tuple[str, ...] = (),
+    formula_id: str = "",
+    adjustment_basis: str = "",
+    stale_after_sessions: int = 0,
+    expected_frequency: str = "",
 ) -> FeatureContract:
     """Build a contract with a deterministic dependency hash."""
     fields = {
@@ -113,6 +164,13 @@ def make_feature_contract(
         "availability_rule": availability_rule,
         "lookback_sessions": lookback_sessions,
         "null_policy": null_policy,
+        "role": role,
+        "source_dataset_ids": tuple(source_dataset_ids),
+        "source_columns": tuple(source_columns),
+        "formula_id": formula_id,
+        "adjustment_basis": adjustment_basis,
+        "stale_after_sessions": stale_after_sessions,
+        "expected_frequency": expected_frequency,
     }
     dependency_hash = feature_dependency_hash(fields)
     return FeatureContract(
@@ -124,6 +182,13 @@ def make_feature_contract(
         availability_rule=availability_rule,
         lookback_sessions=lookback_sessions,
         null_policy=null_policy,
+        role=role,
+        source_dataset_ids=tuple(source_dataset_ids),
+        source_columns=tuple(source_columns),
+        formula_id=formula_id,
+        adjustment_basis=adjustment_basis,
+        stale_after_sessions=stale_after_sessions,
+        expected_frequency=expected_frequency,
         dependency_hash=dependency_hash,
     )
 
@@ -149,11 +214,70 @@ def feature_contract_book_from_allowlist(
     allowlist: tuple[str, ...],
     duplicate_rules: tuple[DuplicateRule, ...] = (),
 ) -> FeatureContractBook:
-    """Build a contract book whose contracts mirror a frozen allowlist."""
+    """Build a contract book whose contracts mirror a frozen allowlist.
+
+    The generic fallback (``lookback=0``, ``source_kind=raw``, default role)
+    exists only for read-only reproducibility of legacy v2 artifacts. New
+    production feature sets must use :func:`semantic_feature_contract_book`,
+    which requires an explicit role and lineage for every feature.
+    """
     contracts = tuple(
         make_feature_contract(name=name, source_field=name) for name in allowlist
     )
     return FeatureContractBook(version=version, contracts=contracts, duplicate_rules=duplicate_rules)
+
+
+def semantic_feature_contract_book(
+    version: str,
+    features: tuple[Mapping[str, object], ...],
+    duplicate_rules: tuple[DuplicateRule, ...] = (),
+) -> FeatureContractBook:
+    """Build a contract book from explicit per-feature semantic declarations.
+
+    Every entry must carry ``name``, ``role`` (one of ``FEATURE_ROLES``),
+    ``source_field``, and the lineage fields ``source_dataset_ids``,
+    ``source_columns``, ``formula_id``, ``adjustment_basis``,
+    ``stale_after_sessions``, and ``expected_frequency``. A generic production
+    fallback contract (``lookback_sessions=0`` with ``source_kind=raw`` and an
+    empty lineage) is rejected, so no feature can be declared without a
+    meaningful semantic contract.
+    """
+    contracts = tuple(
+        make_feature_contract(
+            name=str(entry["name"]),
+            data_type=str(entry.get("data_type", "Float64")),
+            source_field=str(entry["source_field"]),
+            source_kind=FeatureSourceKind(str(entry.get("source_kind", "raw"))),
+            observation_rule=str(entry.get("observation_rule", "session_close")),
+            availability_rule=str(entry.get("availability_rule", "next_session_open")),
+            lookback_sessions=int(str(entry.get("lookback_sessions", 0))),
+            null_policy=str(entry.get("null_policy", "retain_null")),
+            role=str(entry["role"]),
+            source_dataset_ids=tuple(str(v) for v in _as_sequence(entry["source_dataset_ids"])),
+            source_columns=tuple(str(v) for v in _as_sequence(entry["source_columns"])),
+            formula_id=str(entry["formula_id"]),
+            adjustment_basis=str(entry["adjustment_basis"]),
+            stale_after_sessions=int(str(entry["stale_after_sessions"])),
+            expected_frequency=str(entry["expected_frequency"]),
+        )
+        for entry in features
+    )
+    _reject_generic_fallback_contracts(contracts)
+    return FeatureContractBook(version=version, contracts=contracts, duplicate_rules=duplicate_rules)
+
+
+def _reject_generic_fallback_contracts(contracts: tuple[FeatureContract, ...]) -> None:
+    """Fail closed on a semantically empty ``lookback=0/raw`` production contract."""
+    for contract in contracts:
+        if (
+            contract.lookback_sessions == 0
+            and contract.source_kind is FeatureSourceKind.RAW
+            and not contract.formula_id
+        ):
+            raise ValueError(
+                f"generic fallback contract for {contract.name!r}: "
+                "lookback_sessions=0 raw sources require a formula_id"
+            )
 
 
 def resolve_raw_source_names(
@@ -197,6 +321,17 @@ def contracts_from_json(payload: list[dict[str, object]]) -> tuple[FeatureContra
                 availability_rule=str(raw["availability_rule"]),
                 lookback_sessions=int(str(raw["lookback_sessions"])),
                 null_policy=str(raw["null_policy"]),
+                role=str(raw.get("role", _DEFAULT_ROLE)),
+                source_dataset_ids=tuple(
+                    str(v) for v in _as_sequence(raw.get("source_dataset_ids", []))
+                ),
+                source_columns=tuple(
+                    str(v) for v in _as_sequence(raw.get("source_columns", []))
+                ),
+                formula_id=str(raw.get("formula_id", "")),
+                adjustment_basis=str(raw.get("adjustment_basis", "")),
+                stale_after_sessions=int(str(raw.get("stale_after_sessions", 0))),
+                expected_frequency=str(raw.get("expected_frequency", "")),
                 dependency_hash=str(raw.get("dependency_hash", "")),
             )
         )
