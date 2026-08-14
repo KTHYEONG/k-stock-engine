@@ -28,6 +28,7 @@ from src.stocks.workflows.train_model import (
     train_model,
 )
 from tests.fixtures.stocks.helpers import (
+    stock_manifest,
     stock_v2_composed_df,
     stock_v2_manifest,
 )
@@ -4859,3 +4860,114 @@ def _stable_kwargs(kwargs: dict[str, object]) -> dict[str, object]:
         if key
         not in ("dataset_manifest", "registry", "base_schedule", "stress_schedule")
     }
+
+
+def _v3_composed_frame(n_sessions: int = 100, n_tickers: int = 8) -> pl.DataFrame:
+    """Deterministic v3-style composed frame with raw sources and net-alpha labels.
+
+    The frame carries the ALPHA source columns by their raw names (so
+    ``apply_v3_transforms`` can canonicalize them), a ``net_alpha_5d_target``
+    label, and the availability columns the trainer gates on.
+    """
+    import numpy as np
+    from datetime import timedelta
+
+    rng = np.random.default_rng(11)
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    rows: list[dict] = []
+    for t in range(n_tickers):
+        for s in range(n_sessions):
+            obs = start + timedelta(days=s)
+            momentum = float(rng.normal(0.0, 1.0))
+            rows.append(
+                {
+                    "session_index": s,
+                    "session": obs,
+                    "instrument_id": f"KRX:0{t + 1:05d}",
+                    "observation_time": obs.replace(hour=15, minute=30, tzinfo=UTC),
+                    "available_time": obs.replace(hour=15, minute=31, tzinfo=UTC),
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.0,
+                    "close": 100.5,
+                    "volume": 1_000_000.0,
+                    "trading_value": 100.5 * 1_000_000.0,
+                    "market_cap": 1.0e11,
+                    "sector": f"S{t % 4}",
+                    "adtv": 1.0e8,
+                    "beta": 1.0,
+                    "volatility": 0.02,
+                    "ep_ratio": float(rng.normal(0.0, 1.0)),
+                    "bp_ratio": float(rng.normal(0.0, 1.0)),
+                    "overnight_ret": momentum,
+                    "intraday_ret": -momentum,
+                    "ret_2_5d": momentum * 0.5,
+                    "ret_6_20d": momentum * 0.3,
+                    "ret_21_60d": momentum * 0.2,
+                    "close_high_ratio_10d": momentum * 0.4,
+                    "relative_trend_score": momentum * 0.6,
+                    "sector_ret_5d": momentum * 0.1,
+                    "disparity_120d": momentum * 0.7,
+                    "foreign_net_buy": float(rng.normal(0.0, 1.0)),
+                    "institution_net_buy": float(rng.normal(0.0, 1.0)),
+                    "individual_net_buy": float(rng.normal(0.0, 1.0)),
+                    "flow_consensus": float(rng.normal(0.0, 1.0)),
+                    "flow_intensity_20d": float(rng.normal(0.0, 1.0)),
+                    "volume_shock": float(rng.normal(0.0, 1.0)),
+                    "vpt_20d": float(rng.normal(0.0, 1.0)),
+                    "info_ratio_20d": float(rng.normal(0.0, 1.0)),
+                    "vol_asymmetry_20d": float(rng.normal(0.0, 1.0)),
+                    "mcap_rank": float(t) / n_tickers,
+                    "min_vol_5d": float(rng.normal(0.02, 0.005)),
+                    "volatility_20d": float(rng.normal(0.02, 0.005)),
+                    "volatility_60d": float(rng.normal(0.02, 0.005)),
+                    "vol_regime": float(rng.normal(0.0, 1.0)),
+                    "adtv_20d": 1.0e8,
+                    "turnover_ratio": float(rng.normal(0.01, 0.001)),
+                    "amihud_20d": float(rng.normal(1.0e-9, 1.0e-10)),
+                    "fluc_rate": float(rng.normal(0.02, 0.005)),
+                }
+            )
+    frame = pl.DataFrame(rows)
+    target = (
+        pl.col("overnight_ret") * 0.02 - pl.col("intraday_ret") * 0.01
+    ).alias("net_alpha_5d_target")
+    available = (pl.col("session") + pl.duration(days=5)).alias(
+        "label_available_time_5d"
+    )
+    return frame.with_columns(target, available)
+
+
+def test_train_net_alpha_v3_publishes_no_trade_without_positive_evidence(
+    tmp_path,
+) -> None:
+    """The v3 path runs the integrity audit and fails closed to NO_TRADE."""
+    from src.stocks.data.feature_contracts import semantic_feature_contract_book
+    from src.stocks.research.features import stock_alpha_v3_semantic_contracts
+
+    frame = _v3_composed_frame()
+    manifest = stock_manifest(
+        columns=frame.columns,
+        feature_set="stock_alpha_v3",
+        horizon=5,
+        decision_time=datetime(2024, 1, 1, tzinfo=UTC),
+    )
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    snapshot = DatasetSnapshot(manifest=manifest, frame=frame)
+    result = train_model(
+        snapshot,
+        registry,
+        TrainingRequest(artifact_id="v3_no_trade", n_folds=2, candidate_horizons=(5,)),
+    )
+    assert result.artifact_id == "v3_no_trade"
+    assert result.feature_set == "stock_alpha_v3"
+    assert result.model_type == "no_trade" or result.model_type == "elastic_net_net_alpha"
+
+    # The v3 path always runs the semantic audit with real role/lineage contracts.
+    book = semantic_feature_contract_book(
+        "stock_alpha_v3", stock_alpha_v3_semantic_contracts()
+    )
+    assert all(
+        c.role in {"ALPHA", "RISK", "LIQUIDITY", "CONTROL"}
+        for c in book.contracts
+    )

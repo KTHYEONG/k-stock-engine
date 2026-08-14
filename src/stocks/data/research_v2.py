@@ -19,11 +19,12 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import UTC, datetime, time
 from pathlib import Path
 
 import polars as pl
 
+from src.core.costs import CostPoint, CostSchedule
 from src.core.datasets import DatasetCertification, DatasetManifest
 from src.core.instruments import AssetKind
 from src.stocks.data.catalog import (
@@ -38,6 +39,7 @@ from src.stocks.data.catalog import (
     build_snapshot_manifest,
 )
 from src.stocks.data.contracts import CoverageRange, ResearchWindows
+from src.stocks.data.costs import krx_market_for_code, load_cost_evidence
 from src.stocks.data.curation import (
     BASE_PANEL_FEATURE_SET,
     FeaturePanelRequest,
@@ -51,8 +53,10 @@ from src.stocks.data.labels import (
     RESIDUAL_O2O_PREFIX,
     SUPPORTED_RESIDUAL_HORIZONS,
     build_multi_horizon_residual_label_dataset,
+    build_net_alpha_label_dataset,
     build_residual_o2o_label_dataset,
     publish_multi_horizon_residual_label_dataset,
+    publish_net_alpha_label_dataset,
     publish_residual_o2o_label_dataset,
 )
 from src.stocks.data.quality import KRXSessionCalendar
@@ -99,6 +103,8 @@ class StockAlphaV2MaterializationRequest:
     certification: DatasetCertification = DatasetCertification.PROVISIONAL
     min_coverage: float = 0.75
     calendar_path: Path | None = None
+    net_alpha_horizons: tuple[int, ...] = ()
+    net_alpha_reference_notional: float | None = None
 
     def __post_init__(self) -> None:
         for field in (
@@ -111,6 +117,15 @@ class StockAlphaV2MaterializationRequest:
                 raise ValueError(f"{field} must be non-empty")
         if not 0.0 < self.min_coverage <= 1.0:
             raise ValueError("min_coverage must be within (0, 1]")
+        if self.net_alpha_horizons:
+            if tuple(self.net_alpha_horizons) != tuple(
+                sorted(set(self.net_alpha_horizons))
+            ):
+                raise ValueError("net_alpha_horizons must be strictly ascending and unique")
+            if any(h < 1 for h in self.net_alpha_horizons):
+                raise ValueError("net_alpha_horizons must be positive sessions")
+            if self.net_alpha_reference_notional is None or self.net_alpha_reference_notional <= 0:
+                raise ValueError("net_alpha_reference_notional must be positive when net_alpha_horizons set")
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,6 +332,17 @@ def materialize_stock_alpha_v3_snapshot(
     )
     label_manifest = _re_read_labels_multi_horizon(request, calendar)
 
+    if request.net_alpha_horizons:
+        _publish_net_alpha_labels(
+            request,
+            base_frame,
+            calendar,
+            base_manifest,
+            catalog,
+            base_entry,
+            calendar_entry,
+        )
+
     feature_entry = CatalogEntry(
         kind=CatalogKind.FEATURES,
         name=request.feature_dataset_id,
@@ -397,6 +423,89 @@ def materialize_stock_alpha_v3_snapshot(
         min_coverage=request.min_coverage,
         certification=request.certification,
     )
+
+
+def _publish_net_alpha_labels(
+    request: StockAlphaV2MaterializationRequest,
+    base_frame: pl.DataFrame,
+    calendar: KRXSessionCalendar,
+    base_manifest: DatasetManifest,
+    catalog: CatalogStore,
+    base_entry: CatalogEntry,
+    calendar_entry: CatalogEntry,
+) -> None:
+    """Publish continuous net-alpha label horizons per pre-registered discovery horizon.
+
+    Each horizon is built and published independently with the same policy
+    kernel as the exact replay: no common-universe inner join is performed, so
+    the training side records per-horizon label universes rather than shrinking
+    the sample to the intersection of all horizons. The reference notional is
+    derived from the replay minimum order unit and portfolio value, never an
+    arbitrary participation constant.
+    """
+    cost_entry = catalog.get(CatalogKind.COSTS, "costs")
+    if cost_entry is None:
+        raise ValueError("net-alpha label publication requires a costs catalog entry")
+    cost_evidence = load_cost_evidence(
+        Path(cost_entry.path), CoverageRange(start=base_manifest.time_start.date(), end=base_manifest.time_end.date())
+    )
+    cost_schedule = CostSchedule(
+        name="net-alpha-reference",
+        points=(
+            CostPoint(
+                effective_from=datetime(2000, 1, 1, tzinfo=UTC),
+                commission_rate=cost_evidence.commission_for(
+                    request.generated_time
+                ).buy_rate,
+                tax_rate=cost_evidence.sell_tax_for(
+                    krx_market_for_code(base_frame["instrument_id"][0]),
+                    request.generated_time,
+                ).sell_tax_rate,
+                slippage_bps=cost_evidence.liquidity_model.impact_coefficient * 10_000.0,
+                settlement_days=cost_evidence.settlement_days,
+            ),
+        ),
+    )
+    liquidity_model = cost_evidence.base_liquidity_model
+    assert request.net_alpha_reference_notional is not None
+    for horizon in request.net_alpha_horizons:
+        labels_frame = build_net_alpha_label_dataset(
+            base_frame,
+            calendar,
+            cost_schedule,
+            liquidity_model,
+            horizon_sessions=horizon,
+            reference_notional=request.net_alpha_reference_notional,
+        )
+        label_result = publish_net_alpha_label_dataset(
+            labels_frame,
+            destination_root=request.label_root,
+            dataset_id=f"{request.label_dataset_id}_net_alpha_{horizon}d",
+            base_panel_hash=base_manifest.content_hash,
+            calendar_hash=calendar.content_hash,
+            horizon_sessions=horizon,
+            certification=request.certification,
+            generated_time=request.generated_time,
+        )
+        label_entry = CatalogEntry(
+            kind=CatalogKind.LABELS,
+            name=label_result.dataset_id,
+            content_hash=label_result.manifest.content_hash,
+            schema_hash=label_result.manifest.schema_hash,
+            registered_at=request.generated_time,
+            coverage=CoverageRange(
+                start=label_result.manifest.time_start.date(),
+                end=label_result.manifest.time_end.date(),
+            ),
+            completeness=EvidenceCompleteness.COMPLETE,
+            path=str(request.label_root / label_result.dataset_id),
+            references=(
+                (CatalogKind.BASE_PANEL.value, base_entry.name),
+                (CatalogKind.CALENDAR.value, calendar_entry.name),
+            ),
+            row_count=label_result.row_count,
+        )
+        catalog.register(label_entry)
 
 
 def _preflight(
