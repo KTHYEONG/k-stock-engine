@@ -1,45 +1,43 @@
-# 2026-08-14 completion validation ML / 백테스트 결과
+# 2026-08-14 최신 ML / 백테스트 실행 결과
 
-## 실행 및 자원
+현재 수정 코드로 실행한 최신 결과만 기록한다. 기존 completion-validation 결과는
+삭제하고, partial checkpoint를 `--resume`으로 이어서 81-trial 실행을 완료했다.
+
+## 실행
 
 | 항목 | 값 |
 |---|---|
-| Artifact | `lambdarank_v2_20260814_completion_validation` |
+| Artifact | `lambdarank_v2_20260814_redesign_validation` |
 | Snapshot | `research_provisional_20160104_20260812_cost_master_v3_mh2` |
-| Command | `PYTHONPATH=. LOG_LEVEL=INFO uv run python -m src.stocks.cli.train --artifact-id lambdarank_v2_20260814_completion_validation --snapshot-id research_provisional_20160104_20260812_cost_master_v3_mh2 --mode research --optuna-trials 81 --max-rss-mib 8000` |
-| 실행 구간 | `2026-08-14 13:33:17.969 ~ 14:00:16.143 KST` |
-| Exit status | `0` |
-| Wall time | **1,618.174 s (26분 58.174초)** |
-| Screen / full refit / economic replay | **329.716 / 364.643 / 28.406 s** |
-| Baseline / peak RSS | **1,749.66 / 5,757.00 MiB** |
-| RSS limit | `8,000 MiB` |
-| LGBM threads | `4` |
+| Command | `uv run python -m src.stocks.cli.train --artifact-id lambdarank_v2_20260814_redesign_validation --snapshot-id research_provisional_20160104_20260812_cost_master_v3_mh2 --mode research --optuna-trials 81 --max-rss-mib 8000 --resume` |
+| 실행 완료 | `2026-08-14 16:22:45 KST` |
+| Optuna terminal trials | **81** |
+| Screened / pruned | **28 / 53** |
+| Confirmation attempts / confirmed | **6 / 6** |
+| Exact replay | **3** |
+| Resume wall time | 약 **7분 18초** |
 
-## ML 성능 및 탐색
+## 자원 사용량
 
 | 항목 | 값 |
 |---|---:|
-| Terminal trials | **81** |
-| Screened / pruned | **79 / 2** |
-| Confirmation attempts / confirmed | **18 / 18** |
-| Global multiplicity count | `81` |
-| Confirmation Rank-IC | **0.05169472 ~ 0.13608934** |
-| Confirmation Rank-IC 평균 / 중앙값 | **0.09452876 / 0.08837467** |
-| 최고 fold DSR probability | **0.30378388** |
-| Best screen proxy lower bound | **-0.00177818** |
+| Screen | **28.834 s** |
+| Full refit | **168.558 s** |
+| Economic replay | **9.370 s** |
+| Baseline RSS | **1,776.312 MiB** |
+| Peak RSS | **6,062.648 MiB** |
+| RSS limit | `8,000 MiB` |
 
-## Route별 후보 및 백테스트
+## Route별 exact 백테스트
 
-| Route | Screened | Pruned | Confirmed | Exact replay | Shortlist fills | Shortlist median Rank-IC | Bootstrap lower bound 범위 | Strategy IR 범위 | MDD 범위 |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 5 sessions | 27 | 0 | 6 | 3 | 2,468 | 0.09073461 ~ 0.09388179 | -0.00190350 ~ -0.00160112 | 0.4223 ~ 0.6037 | 21.17% ~ 22.45% |
-| 10 sessions | 27 | 0 | 6 | 3 | 1,393 | 0.09546132 ~ 0.10779940 | -0.00538307 ~ -0.00380743 | 0.3737 ~ 0.4503 | 19.10% ~ 24.13% |
-| 15 sessions | 25 | 2 | 6 | 3 | 1,084 | 0.08460602 ~ 0.09439248 | -0.00732762 ~ -0.00405612 | 0.2934 ~ 0.5683 | 19.60% ~ 24.74% |
-| **합계** | **79** | **2** | **18** | **9** | **4,945** | — | **모두 음수** | — | — |
+| Route | Fold Rank-IC | Bootstrap lower bound | Strategy IR | MDD | 체결 |
+|---:|---|---:|---:|---:|---:|
+| 5 sessions | 0.083128 / 0.109571 / 0.088390 | **-0.00197981** | 0.372769 | 23.297% | 1,376 / 1,376 |
+| 10 sessions | 0.095408 / 0.103027 / 0.092571 | **-0.00492472** | 0.198844 | 26.754% | 809 / 809 |
+| 15 sessions | 0.096843 / 0.140104 / 0.104314 | **-0.01011171** | 1.076857 | 2.635% | 74 / 74 |
 
-모든 exact replay 후보에서 주문은 **4,945 / 4,945건 체결**됐다. Confirmation
-fold 기준 CAGR은 **-2.0703% ~ +24.7657%**, MDD는 **5.0875% ~ 29.1199%**로
-fold 간 편차가 컸다.
+모든 exact 후보에서 주문은 **2,259 / 2,259건 체결**됐다. 그러나 세 후보 모두
+bootstrap lower bound가 음수이고 DSR 승격 기준을 충족하지 못했다.
 
 ## 최종 판정
 
@@ -47,17 +45,16 @@ fold 간 편차가 컸다.
 |---|---|
 | `promoted` / `no_trade` | `false / true` |
 | `selection_status` | `no_economically_eligible_candidate` |
-| Economically eligible trials | `0` |
-| `n_folds_evaluated` | `0` (최종 champion 없음) |
-| `promotion_reasons` | `no-champion-trial` |
-| `ledger_metrics` / `stress_metrics` | `{}` / `null` |
+| Economically eligible trials | **0** |
+| Promotion reason | `no-champion-trial` |
+| 최종 champion | 없음 |
 
-Rank-IC 양수 신호와 체결 정상 여부는 확인됐지만, 9개 exact replay 후보의
-bootstrap lower bound가 모두 음수이고 DSR도 승격 기준에 미달해 최종 승격하지
-않았다.
+Rank-IC는 모든 route에서 양수였지만, 실제 비용·체결·bootstrap·DSR을 함께 적용한
+경제성 검증은 실패했다. 따라서 최신 코드도 배포 가능한 champion을 생성하지 않고
+보수적으로 `no_trade`로 종료했다.
 
 ## 산출물
 
-- [Metrics](../../data/artifacts/stocks/lambdarank_v2_20260814_completion_validation/metrics.json)
-- [Manifest](../../data/artifacts/stocks/lambdarank_v2_20260814_completion_validation/manifest.json)
-- 실행 로그: `scratch/lambdarank_v2_20260814_completion_validation.log`
+- [Metrics](../../data/artifacts/stocks/lambdarank_v2_20260814_redesign_validation/metrics.json)
+- [Manifest](../../data/artifacts/stocks/lambdarank_v2_20260814_redesign_validation/manifest.json)
+- 실행 로그는 sync 정리 정책에 따라 삭제했으며, metrics/manifest를 영구 산출물로 보존한다.

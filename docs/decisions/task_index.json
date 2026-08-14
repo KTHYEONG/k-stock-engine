@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_BACKTEST_ARCHITECTURE_REDESIGN",
+      "date": "2026-08-14",
+      "adr_id": "ADR_20260814_ML_BACKTEST_ARCHITECTURE_REDESIGN",
+      "domain": "signal",
+      "title": "ML and backtesting architecture redesign",
+      "why": "Legacy ML/backtest execution was too slow and produced economically unreliable results.",
+      "resolution": "Applied shared deterministic ranking, vectorized economic screening, bounded confirmation/finalist selection, delta-based participation sizing, and synchronized latest execution results.",
+      "impact": "Improves search runtime and memory control while failing closed when bootstrap/DSR evidence does not support deployment."
+    },
+    {
       "task_id": "TASK_STOCK_ML_RUN_COMPLETION",
       "date": "2026-08-14",
       "adr_id": "ADR_20260814_STOCK_ML_RUN_COMPLETION",
