@@ -746,3 +746,83 @@ differential bootstrap은 실행되지 않았다. 이는 두 family 중 우열�
 - [Metrics](../../data/artifacts/stocks/lambdarank_v2_20260813_ensemble_ablation_90/metrics.json)
 - [Manifest](../../data/artifacts/stocks/lambdarank_v2_20260813_ensemble_ablation_90/manifest.json)
 - 실행 로그: `scratch/ensemble_ablation_90.log`
+
+---
+
+# 2026-08-14 sync 후 ML / 백테스트 실행 결과
+
+## 실행
+
+| 항목 | 값 |
+|---|---|
+| Artifact | `lambdarank_v2_20260814_sync_run` |
+| Snapshot | `research_provisional_20160104_20260812_cost_master_v3_mh2` |
+| Command | `PYTHONPATH=. LOG_LEVEL=INFO uv run python -m src.stocks.cli.train --artifact-id lambdarank_v2_20260814_sync_run --snapshot-id research_provisional_20160104_20260812_cost_master_v3_mh2 --mode research --optuna-trials 81 --max-rss-mib 8000` |
+| 실행 구간 | `2026-08-14 08:57:40 ~ 09:05:56 KST` |
+| Exit status | `0` |
+| Selection policy | `economic-selection-v6-confirmed-recovery` |
+| Multiplicity | `selection-multiplicity-global-count-v1`, terminal trials `81` |
+| Peak RSS | **6,249.301 MiB / 8,000 MiB** |
+
+## 결과 판정
+
+| 항목 | 값 |
+|---|---:|
+| `promoted` / `no_trade` | `false / true` |
+| Terminal / screened / pruned | **81 / 79 / 2** |
+| Confirmation attempts / confirmed | **18 / 0** |
+| Shortlisted / economically eligible | **0 / 0** |
+| Full refit / exact economic replay | **미실행 / 미실행** |
+| `selection_status` | `no_complete_screen_candidate` |
+| `n_folds_evaluated` | `0` |
+| Gate | `passed=false` |
+
+## ML 성능 및 route별 screen
+
+Confirmation fold evidence 36개에서 Rank-IC는 **0.05169472 ~ 0.13608934**,
+평균 **0.09668661**이었다. 양의 순위 신호는 관측됐지만, 최종 후보가 없어
+`best_screen_rank_ic`는 산출되지 않았다.
+
+| Route | Screened | Hard-pruned | Confirmation | Confirmed | 최고 proxy lower bound | Screen no-trade |
+|---:|---:|---:|---:|---:|---:|---|
+| 5 sessions | 27 | 0 | 6 | 0 | -0.00177818 | covariance 1,015 / allocation 1,342 |
+| 10 sessions | 27 | 0 | 6 | 0 | -0.00253505 | covariance 494 / allocation 865 |
+| 15 sessions | 25 | 2 | 6 | 0 | -0.00455169 | covariance 134 / allocation 859 |
+
+DSR은 confirmation evidence에서 최대 **0.30378388**로, 승격 기준
+`0.95`에 미달했다. 최고 proxy lower bound도 route별 모두 불확실성 조정
+단계에서 양수가 아니었다.
+
+## Screen 경제성 replay
+
+최종 OOS promotion replay는 후보 0건으로 실행되지 않았다. 다만 confirmation
+단계의 execution-matched screen replay에서는 총 **23,320 / 23,320 주문이
+체결**되었다.
+
+| 지표 | 값 |
+|---|---:|
+| Screen attempted / filled orders | **23,320 / 23,320** |
+| Screen compounding blocks | route별 최소 54개 이상 |
+| `ledger_metrics` | `{}` |
+| `stress_metrics` | `null` |
+| 최종 수익률 / IR / MDD / turnover | **미실행 / 산출 불가** |
+
+## 해석
+
+1. **실행 체결 장애는 재현되지 않았다.** screen replay의 모든 attempted
+   order가 체결됐다.
+2. **ML 순위 신호는 존재한다.** Rank-IC 평균은 약 0.097이지만, 이는 전체
+   횡단면 순위 품질이지 자산증식의 증거가 아니다.
+3. **경제성 후보는 회복되지 않았다.** 18개 confirmation이 모두 탈락해
+   full refit, exact base/stress OOS replay, forward holdout으로 진행하지
+   못했다.
+4. 이번 `NO_TRADE` 원인은 백테스터의 체결 실패가 아니라 **compound lower
+   bound/DSR을 통과하지 못한 모델·배분 조합**이다. 따라서 게이트 완화보다
+   Top-K tail 성과와 allocation/covariance 손실을 분리 계측하는 것이 다음
+   병목이다.
+
+## 산출물
+
+- [Metrics](../../data/artifacts/stocks/lambdarank_v2_20260814_sync_run/metrics.json)
+- [Manifest](../../data/artifacts/stocks/lambdarank_v2_20260814_sync_run/manifest.json)
+- 실행 로그: `scratch/lambdarank_v2_20260814_sync_run.log`
