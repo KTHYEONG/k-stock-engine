@@ -299,6 +299,7 @@ class LambdaRankBlendModel:
         self._no_trade = True
         self._stable_scores_cache: pl.DataFrame | None = None
         self._calibration_state: dict[str, object] | None = None
+        self._close_error: str | None = None
 
     @property
     def no_trade(self) -> bool:
@@ -316,6 +317,38 @@ class LambdaRankBlendModel:
     def set_calibration_state(self, state: dict[str, object] | None) -> None:
         """Bind the JSON-safe calibration snapshot used by prediction columns."""
         self._calibration_state = None if state is None else dict(state)
+
+    def close(self) -> None:
+        """Idempotently release native LightGBM resources held by a fitted model.
+
+        Frees the fitted Booster's Datasets through the supported
+        ``Booster.free_dataset`` API when a booster is fitted, then clears the
+        booster and cached stable-score references so a temporary model never
+        retains a native allocator or a duplicate prediction frame. Predictions
+        already materialized by a caller are never altered and prepared
+        immutable fold matrices (:class:`PreparedLambdaRankFold`) are never
+        mutated. A native cleanup error on a live fit is never silently
+        suppressed: it is recorded as a deterministic caller-visible reason in
+        :attr:`close_error`. Calling ``close()`` again, including after an
+        error, is safe.
+        """
+        booster = self._booster
+        if booster is not None:
+            try:
+                booster.free_dataset()
+            except Exception as exc:  # noqa: BLE001
+                self._close_error = (
+                    f"native_cleanup_failed:{type(exc).__name__}:{exc}"
+                )
+                return
+            self._booster = None
+        self._stable_scores_cache = None
+        self._close_error = None
+
+    @property
+    def close_error(self) -> str | None:
+        """Deterministic native-cleanup failure reason, or ``None`` after a clean close."""
+        return self._close_error
 
     def fit(self, train: pl.DataFrame, validation: pl.DataFrame) -> None:
         """Fit both components on training rows only."""
