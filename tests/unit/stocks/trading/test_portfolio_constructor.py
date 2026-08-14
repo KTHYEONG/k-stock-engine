@@ -767,10 +767,21 @@ def test_prepared_allocations_match_reference_constructor() -> None:
     reference = construct_target_allocations(panel, instruments, portfolio, policy)
     assert reference
 
+    from src.stocks.trading.allocation_policy import rank_stock_candidate_indices
     from src.stocks.trading.portfolio_constructor import (
         PreparedAllocationMarket,
         construct_target_allocations_prepared,
     )
+
+    cross = panel.filter(pl.col("session") == panel.select(pl.col("session").max()).to_series()[0])
+    oracle_order = rank_stock_candidate_indices(
+        np.asarray(cross["pred_score"].to_list(), dtype=np.float64),
+        np.asarray(cross["instrument_id"].to_list(), dtype=object),
+    )
+    oracle_top = sorted(
+        cross.gather(oracle_order)["instrument_id"].to_list()[: policy.top_k]
+    )
+    assert sorted(a.instrument.instrument_id for a in reference) == oracle_top
 
     market = PreparedAllocationMarket.build(panel)
     overlay = (
@@ -786,6 +797,7 @@ def test_prepared_allocations_match_reference_constructor() -> None:
         policy,
     )
     assert allocations == reference
+    assert sorted(a.instrument.instrument_id for a in allocations) == oracle_top
 
 
 def test_prepared_allocations_match_reference_for_stateful_and_calibrated_decisions() -> None:
