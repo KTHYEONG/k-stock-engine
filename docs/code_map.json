@@ -312,7 +312,7 @@
       "tests/unit/stocks/workflows/test_train_model.py",
       "tests/integration/stocks/test_multifold_80_trial_profile.py"
     ],
-    "architecture": "docs/results/back-res.md"
+    "architecture": "docs/specs/ml_economic_alpha_redesign.md"
   },
   "src/storage/parquet_datasets.py": {
     "testing": "tests/unit/storage/test_parquet_datasets.py"

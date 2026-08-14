@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_ML_ECONOMIC_ALPHA_REDESIGN",
+      "date": "2026-08-14",
+      "adr_id": "ADR_20260814_STOCK_ML_ECONOMIC_ALPHA_REDESIGN",
+      "domain": "signal",
+      "title": "Stock ML economic alpha redesign",
+      "why": "Latest 81-trial backtest had positive Rank-IC but every exact route failed cost-aware bootstrap and DSR gates; 5/10/15 sessions were hard-coded and correlated while refit and RSS were costly.",
+      "resolution": "Registered the net-alpha redesign contract: horizon discovery, cost/risk-aware continuous labels, semantic feature lineage and role gating, common execution policy, constrained marginal sizing, and fold-cache resource budgets.",
+      "impact": "Future research can select at most one primary and one conditional secondary horizon from nested OOF economic evidence, reject invalid or semantically ambiguous data, reduce redundant predictors and memory, and preserve fail-closed NO_TRADE promotion."
+    },
+    {
       "task_id": "TASK_ML_BACKTEST_ARCHITECTURE_REDESIGN",
       "date": "2026-08-14",
       "adr_id": "ADR_20260814_ML_BACKTEST_ARCHITECTURE_REDESIGN",
