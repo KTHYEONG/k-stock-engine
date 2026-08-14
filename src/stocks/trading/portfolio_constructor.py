@@ -24,6 +24,7 @@ import polars as pl
 
 from src.core.instruments import Instrument
 from src.core.portfolio import Allocation, PortfolioSnapshot
+from src.stocks.trading.allocation_policy import rank_stock_candidate_indices
 
 logger = logging.getLogger("stocks.trading.portfolio_constructor")
 
@@ -557,13 +558,7 @@ def _construct_allocations_prepared(
     positions = np.where(eligible)[0]
     preds = scores[positions]
     id_strs = np.asarray([str(cs_ids[position]) for position in positions], dtype=object)
-    # The reference ranks ``eligible.sort([col('pred_score').sort(descending=True),
-    # col('instrument_id').sort()])``, whose sort-key expressions are evaluated
-    # positionally: row ``p`` carries the ``p``-th largest score and the ``p``-th
-    # smallest instrument id. Replicate that exact ordering bit-for-bit.
-    score_desc = np.sort(preds)[::-1]
-    id_asc = id_strs[np.argsort(id_strs, kind="mergesort")]
-    order = np.lexsort((id_asc, score_desc))
+    order = rank_stock_candidate_indices(preds, id_strs)
     positions_sorted = positions[order]
     ranks = np.arange(1, positions_sorted.size + 1, dtype=np.int64)
     incumbent_of = np.asarray(
@@ -676,6 +671,7 @@ def _construct_allocations_prepared(
     _post_validate(
         allocations, equity, policy, sector_of, adtv_of, pl.DataFrame(),
         covariance=post_covariance,
+        current_weights=current_weights,
     )
     return tuple(sorted(allocations, key=lambda a: a.instrument.instrument_id))
 
@@ -690,6 +686,7 @@ class StockRiskPolicy:
     """
 
     top_k: int = 20
+    target_count: int | None = None
     enter_rank: int = 15
     keep_rank: int = 30
     gross_cap: float = 0.90
@@ -711,6 +708,13 @@ class StockRiskPolicy:
     def __post_init__(self) -> None:
         if self.top_k <= 0:
             raise ValueError("top_k must be positive")
+        if self.target_count is not None:
+            if self.target_count <= 0:
+                raise ValueError("target_count must be positive")
+            if self.target_count != self.top_k or self.target_count != self.enter_rank:
+                raise ValueError(
+                    "target_count, top_k, and enter_rank must agree for v3 policy"
+                )
         if not (0 < self.enter_rank <= self.keep_rank):
             raise ValueError("ranks must satisfy 0 < enter_rank <= keep_rank")
         if not (0.0 < self.single_name_cap <= self.sector_cap <= self.gross_cap <= 1.0):
@@ -774,10 +778,12 @@ def construct_target_allocations(
     if all(column in cross_section.columns for column in _ECONOMIC_COLUMNS):
         eligible = _economically_eligible(cross_section, eligible, incumbent_ids)
 
+    order = rank_stock_candidate_indices(
+        np.asarray(eligible["pred_score"].to_list(), dtype=np.float64),
+        np.asarray(eligible["instrument_id"].to_list(), dtype=object),
+    )
     ranked = (
-        eligible.sort(
-            [pl.col("pred_score").sort(descending=True), pl.col("instrument_id").sort()]
-        )
+        eligible.gather(order)
         .with_row_index("__rank", offset=1)
         .filter(
             (pl.col("__rank") <= policy.enter_rank)
@@ -853,7 +859,10 @@ def construct_target_allocations(
             current_weights, sector_of, equity, instruments, policy
         )
 
-    _post_validate(allocations, equity, policy, sector_of, adtv_of, panel)
+    _post_validate(
+        allocations, equity, policy, sector_of, adtv_of, panel,
+        current_weights=current_weights,
+    )
     return tuple(sorted(allocations, key=lambda a: a.instrument.instrument_id))
 
 
@@ -1037,8 +1046,7 @@ def _build_allocations(
     weights: dict[str, float] = {}
     for instrument_id in ids:
         raw = raw_scores[instrument_id] / total * policy.gross_cap
-        capacity = policy.participation_limit * adtv_of[instrument_id] / equity
-        weights[instrument_id] = min(raw, policy.single_name_cap, capacity)
+        weights[instrument_id] = min(raw, policy.single_name_cap)
 
     weights = _scale_sectors(weights, sector_of, policy.sector_cap)
     weights = _scale_gross(weights, policy.gross_cap)
@@ -1095,6 +1103,22 @@ def _build_allocations(
     else:
         target_full = dict(weights)
         lambda_ = 1.0
+
+    if policy.participation_limit > 0.0:
+        for instrument_id in current_weights:
+            target_full.setdefault(instrument_id, 0.0)
+        for instrument_id, target in target_full.items():
+            current = current_weights.get(instrument_id, 0.0)
+            delta_cap = policy.participation_limit * adtv_of.get(
+                instrument_id, 0.0
+            ) / equity
+            if delta_cap <= 0.0:
+                raise PortfolioConstraintError(
+                    f"missing capacity for {instrument_id}"
+                )
+            target_full[instrument_id] = min(
+                max(target, current - delta_cap), current + delta_cap
+            )
 
     if compounding_applied:
         _record_compounding_decision(
@@ -1486,6 +1510,7 @@ def _post_validate(
     panel: pl.DataFrame,
     *,
     covariance: np.ndarray | None = None,
+    current_weights: Mapping[str, float] | None = None,
 ) -> None:
     total = sum(a.target_value for a in allocations)
     if total > equity * policy.gross_cap + _TOLERANCE:
@@ -1503,8 +1528,13 @@ def _post_validate(
         adtv = adtv_of.get(instrument_id)
         if adtv is None or adtv <= 0:
             raise PortfolioConstraintError(f"missing capacity for {instrument_id}")
-        if policy.participation_limit > 0 and weight > policy.participation_limit * adtv / equity + _TOLERANCE:
-            raise PortfolioConstraintError(f"capacity cap exceeded for {instrument_id}")
+        if policy.participation_limit > 0:
+            current = (current_weights or {}).get(instrument_id, 0.0)
+            delta_cap = policy.participation_limit * adtv / equity
+            if abs(weight - current) > delta_cap + _TOLERANCE:
+                raise PortfolioConstraintError(
+                    f"capacity delta cap exceeded for {instrument_id}"
+                )
         if allocation.target_value < -_TOLERANCE:
             raise PortfolioConstraintError("target value must be non-negative")
     if any(total > policy.sector_cap + _TOLERANCE for total in sector_totals.values()):

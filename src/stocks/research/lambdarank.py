@@ -174,6 +174,12 @@ class LambdaRankConfig:
             raise ValueError("label_gain must be (0, 1, 3, 7, 15)")
         if num_leaves < 2:
             raise ValueError("num_leaves must be at least 2")
+        if max_depth < 1:
+            raise ValueError("max_depth must be at least 1")
+        if num_leaves > 2**max_depth:
+            raise ValueError(
+                f"num_leaves {num_leaves} exceeds 2**max_depth = {2**max_depth}"
+            )
         if learning_rate <= 0:
             raise ValueError("learning_rate must be positive")
         if min_child_samples < 1:
