@@ -187,6 +187,14 @@ class TrainingRunStore:
     def phase_path(self, phase: str) -> Path:
         return self.root / f"phase_{phase}.json"
 
+    def confirmation_cell_path(
+        self,
+        route_horizon: int,
+        trial_number: int,
+    ) -> Path:
+        """Path of one candidate confirmation cell under the run root."""
+        return self.root / f"phase_confirmation_h{route_horizon}_trial_{trial_number}.json"
+
     def completed_phase(self, phase: str, content_hash: str) -> bool:
         """True only when the phase checkpoint exists with the same content."""
         path = self.phase_path(phase)
@@ -223,3 +231,71 @@ class TrainingRunStore:
             return {}
         evidence = payload.get("evidence")
         return evidence if isinstance(evidence, dict) else {}
+
+    def checkpoint_confirmation_cell(
+        self,
+        route_horizon: int,
+        trial_number: int,
+        identity_hash: str,
+        evidence: dict[str, object],
+    ) -> Path:
+        """Atomically write one hash-bound confirmation-cell checkpoint.
+
+        The cell is bound to the caller-supplied ``identity_hash`` (the
+        run-fingerprint/route/trial/frozen-config identity); a later
+        ``completed_confirmation_cell`` with a different hash raises
+        ``ValueError`` instead of silently reusing stale evidence. The write is
+        atomic (write-then-rename) so a hard kill never leaves a partial cell.
+        """
+        payload = {
+            "phase": f"confirmation_h{route_horizon}",
+            "cell": f"trial_{trial_number}",
+            "identity_hash": identity_hash,
+            "content_hash": _digest(evidence),
+            "evidence": evidence,
+            "selection_policy_version": SELECTION_POLICY_VERSION,
+        }
+        path = self.confirmation_cell_path(route_horizon, trial_number)
+        tmp = path.with_suffix(f"{path.suffix}.tmp")
+        tmp.write_text(
+            json.dumps(payload, indent=2, sort_keys=True, default=str)
+        )
+        tmp.replace(path)
+        return path
+
+    def completed_confirmation_cell(
+        self,
+        route_horizon: int,
+        trial_number: int,
+        identity_hash: str,
+    ) -> dict[str, object] | None:
+        """Return one completed confirmation cell's evidence, or ``None``.
+
+        A cell is reusable for ``--resume`` only when its persisted identity
+        hash matches ``identity_hash`` and its evidence content hash validates.
+        A mismatched persisted identity raises ``ValueError`` so stale cells are
+        never silently reused; malformed or content-corrupted cell JSON is
+        treated as unfinished and returns ``None`` so the caller reruns exactly
+        that cell.
+        """
+        path = self.confirmation_cell_path(route_horizon, trial_number)
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+        persisted_hash = payload.get("identity_hash")
+        if persisted_hash != identity_hash:
+            raise ValueError(
+                f"confirmation cell identity mismatch for h{route_horizon} "
+                f"trial {trial_number}: persisted "
+                f"{persisted_hash} != expected {identity_hash}; stale cells "
+                "must not be silently reused"
+            )
+        evidence = payload.get("evidence")
+        if not isinstance(evidence, dict):
+            return None
+        if payload.get("content_hash") != _digest(evidence):
+            return None
+        return evidence
