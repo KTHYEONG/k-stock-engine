@@ -721,3 +721,86 @@ def test_manifest_binds_v2_contract() -> None:
     assert published.params is not None
     assert published.params["objective"] == "lambdarank"
     assert published.params["label_gain"] == "0,1,3,7,15"
+
+
+def test_close_is_idempotent_and_clears_native_references() -> None:
+    """``close()`` is safe to call twice and clears booster/cache references.
+
+    Predictions materialized before the close stay valid; the fitted booster and
+    cached stable-score frame are released and the native cleanup error surface
+    stays deterministic.
+    """
+    import numpy as np
+
+    df = build_panel(n_sessions=80, n_tickers=40)
+    feature_columns = v2_feature_columns(df)
+    train = df.filter(pl.col("session_index") < 60)
+    val = df.filter(pl.col("session_index") >= 60)
+    quantiles = fit_v2_winsor_quantiles(train, feature_columns)
+    train_t = apply_v2_transforms(train, feature_columns, winsor_quantiles=quantiles)
+    val_t = apply_v2_transforms(val, feature_columns, winsor_quantiles=quantiles)
+    predict_input = val_t.drop([RESIDUAL_O2O_LABEL, RELEVANCE_COLUMN, "label_available_time"])
+    stable = StableRankComposite(
+        factors=stock_alpha_v2_allowlist(),
+        manifest=make_manifest("close_test"),
+        label_column=RESIDUAL_O2O_LABEL,
+        block_length=5,
+        session_column="session",
+    )
+    stable.fit(train_t, val_t)
+    stable_scores = stable.predict(predict_input).select("session", "instrument_id", "pred_score")
+
+    prepared = LambdaRankBlendModel(
+        make_manifest("close_prepared"),
+        stock_alpha_v2_allowlist(),
+        RESIDUAL_O2O_LABEL,
+        config=LambdaRankConfig(num_threads=1),
+        session_column="session",
+        relevance_column=RELEVANCE_COLUMN,
+    ).prepare_fold(train_t, val_t)
+    assert prepared is not None
+    model = LambdaRankBlendModel(
+        make_manifest("close_test"),
+        stock_alpha_v2_allowlist(),
+        RESIDUAL_O2O_LABEL,
+        config=LambdaRankConfig(num_threads=1),
+        session_column="session",
+        relevance_column=RELEVANCE_COLUMN,
+    )
+    outcome = model.fit_trial_prepared(prepared, stable_scores)
+    assert outcome.fit_ok is True
+    assert model._booster is not None
+    assert model._stable_scores_cache is not None
+
+    val_used = (
+        val_t.filter(pl.col(RELEVANCE_COLUMN).is_not_null())
+        .sort("session")
+        .select("session", "instrument_id")
+    )
+    scored = model.predict_prepared_scores(prepared, val_used, stable_scores)
+    materialized = scored["pred_score"].to_numpy().copy()
+    assert np.all(np.isfinite(materialized))
+
+    model.close()
+    assert model._booster is None
+    assert model._stable_scores_cache is None
+    assert model.close_error is None
+    model.close()
+    assert model._booster is None
+    assert model.close_error is None
+
+
+def test_close_is_safe_without_a_fitted_booster() -> None:
+    """``close()`` on an unfitted or failed model never raises."""
+    model = LambdaRankBlendModel(
+        make_manifest("close_unfitted"),
+        stock_alpha_v2_allowlist(),
+        RESIDUAL_O2O_LABEL,
+        config=LambdaRankConfig(num_threads=1),
+        session_column="session",
+        relevance_column=RELEVANCE_COLUMN,
+    )
+    assert model._booster is None
+    model.close()
+    assert model._booster is None
+    assert model.close_error is None
