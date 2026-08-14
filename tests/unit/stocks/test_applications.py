@@ -8,12 +8,16 @@ from src.core.portfolio import Allocation
 from src.execution.domain.intents import TradeIntent
 from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.research.artifacts import ModelArtifactRegistry
-from src.stocks.workflows.contracts import ScoringRequest, SimulationRequest, TrainingRequest
+from src.stocks.ml.contracts import NetAlphaTrainingRequest
+from src.stocks.workflows.contracts import ScoringRequest, SimulationRequest
 from src.stocks.workflows.generate_intents import generate_intents
 from src.stocks.workflows.score_model import score_model
 from src.stocks.workflows.simulate_portfolio import simulate_portfolio
 from src.stocks.workflows.train_model import train_model
-from tests.fixtures.stocks.helpers import stock_v2_composed_df, stock_v2_manifest
+from tests.fixtures.stocks.helpers import (
+    stock_net_alpha_composed_df,
+    stock_net_alpha_manifest,
+)
 
 
 class TestGenerateIntents:
@@ -36,14 +40,17 @@ class TestGenerateIntents:
 
 
 def build_trained_snapshot(tmp_path) -> tuple[DatasetSnapshot, ModelArtifactRegistry]:
-    df = stock_v2_composed_df(n_sessions=60, n_tickers=3)
-    manifest = stock_v2_manifest(columns=df.columns)
+    df = stock_net_alpha_composed_df(n_sessions=120, n_tickers=8)
+    manifest = stock_net_alpha_manifest(columns=df.columns)
     registry = ModelArtifactRegistry(tmp_path / "artifacts")
     snapshot = DatasetSnapshot(manifest=manifest, frame=df)
     train_model(
         snapshot,
         registry,
-        TrainingRequest(artifact_id="stock_alpha_v2_20240101", n_folds=3),
+        NetAlphaTrainingRequest(
+            artifact_id="stock_net_alpha_20240101", fold_count=2,
+            candidate_horizon_sessions=(5,), bootstrap_resamples=50,
+        ),
     )
     return snapshot, registry
 
@@ -51,18 +58,24 @@ def build_trained_snapshot(tmp_path) -> tuple[DatasetSnapshot, ModelArtifactRegi
 class TestScoreModelWiring:
     def test_score_model_loads_artifact_and_scores(self, tmp_path) -> None:
         snapshot, registry = build_trained_snapshot(tmp_path)
-        decision = datetime(2024, 2, 20, 8, 50, tzinfo=UTC)
-        scored = score_model(snapshot, registry, ScoringRequest(artifact_id="stock_alpha_v2_20240101", decision_time=decision))
+        decision = datetime(2024, 4, 29, 0, 0, tzinfo=UTC)
+        scored = score_model(
+            snapshot,
+            registry,
+            ScoringRequest(artifact_id="stock_net_alpha_20240101", decision_time=decision),
+        )
         assert not scored.is_empty()
-        assert "pred_score" in scored.columns
+        assert "predicted_net_alpha" in scored.columns
 
     def test_simulate_portfolio_reconciles(self, tmp_path) -> None:
         snapshot, registry = build_trained_snapshot(tmp_path)
-        decision = datetime(2024, 2, 20, 8, 50, tzinfo=UTC)
+        decision = datetime(2024, 4, 29, 0, 0, tzinfo=UTC)
         result = simulate_portfolio(
             snapshot,
             registry,
-            SimulationRequest(artifact_id="stock_alpha_v2_20240101", decision_time=decision),
+            SimulationRequest(
+                artifact_id="stock_net_alpha_20240101", decision_time=decision
+            ),
         )
         assert result.final_value > 0
         assert result.total_return is not None

@@ -29,7 +29,21 @@ def test_train_cli_rejects_missing_snapshot_id() -> None:
         train.main(["--artifact-id", "a1"])
 
 
-def test_train_cli_exposes_trial_and_budget_args() -> None:
+def test_train_cli_rejects_legacy_trial_flag() -> None:
+    with pytest.raises(SystemExit):
+        train.main(
+            [
+                "--artifact-id",
+                "a1",
+                "--snapshot-id",
+                "s1",
+                "--optuna-trials",
+                "120",
+            ]
+        )
+
+
+def test_train_cli_exposes_net_alpha_args() -> None:
     parser = train.build_parser()
     args = parser.parse_args(
         [
@@ -37,14 +51,20 @@ def test_train_cli_exposes_trial_and_budget_args() -> None:
             "a1",
             "--snapshot-id",
             "s1",
-            "--optuna-trials",
-            "120",
+            "--candidate-horizon-sessions",
+            "3,5,8,10,15,20",
             "--max-rss-mib",
             "4096",
+            "--model-threads",
+            "2",
         ]
     )
-    assert args.optuna_trials == 120
+    assert args.candidate_horizon_sessions == "3,5,8,10,15,20"
     assert args.max_rss_mib == 4096
+    assert args.model_threads == 2
+    assert not hasattr(args, "optuna_trials")
+    assert not hasattr(args, "lgb_threads")
+    assert not hasattr(args, "resume")
 
 
 def test_train_cli_resolves_snapshot_and_composes(monkeypatch) -> None:
@@ -79,6 +99,6 @@ def test_train_cli_resolves_snapshot_and_composes(monkeypatch) -> None:
 
     snapshot = train.resolve_snapshot_for_mode(args.catalog_root, args.snapshot_id, mode="research")
     repo = train.ResearchDataRepository(base_root=args.catalog_root)
-    repo.compose_training_snapshot(snapshot, feature_set="stock_alpha_v1", decision_time=None)
+    repo.compose_training_snapshot(snapshot, feature_set="stock_net_alpha_v1", decision_time=None)
     assert captured["snapshot_id"] == "research_snap_1"
     assert captured["mode"] == "research"

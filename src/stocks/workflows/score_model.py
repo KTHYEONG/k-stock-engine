@@ -5,6 +5,11 @@ import polars as pl
 
 from src.core.instruments import AssetKind
 from src.stocks.data.contracts import DatasetSnapshot
+from src.stocks.ml.contracts import CANONICAL_FEATURE_SET
+from src.stocks.ml.features import (
+    build_model_features,
+    stock_net_alpha_v1_roles,
+)
 from src.stocks.research.artifacts import ModelArtifactRegistry, PredictionRequest
 from src.stocks.research.datasets import research_eligible_frame
 from src.stocks.research.features import build_features, phase1_allowlist
@@ -26,11 +31,14 @@ def score_model(
     )
     loaded = registry.load(request.artifact_id, prediction)
     gated = _drop_label_columns(research_eligible_frame(snapshot.frame))
-    feature_frame = (
-        gated
-        if manifest.feature_set == "stock_alpha_v2"
-        else build_features(gated, phase1_allowlist())
-    )
+    if manifest.feature_set == CANONICAL_FEATURE_SET:
+        feature_frame, _model_columns = build_model_features(
+            gated, stock_net_alpha_v1_roles()
+        )
+    elif manifest.feature_set == "stock_alpha_v2":
+        feature_frame = gated
+    else:
+        feature_frame = build_features(gated, phase1_allowlist())
     scored = loaded.model.predict(feature_frame)
     if scored.is_empty():
         raise ValueError("no rows scored")

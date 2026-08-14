@@ -29,7 +29,6 @@ dependencies = [
     "huggingface-hub>=1.26.0",
     "polars>=1.43.2",
     "numba>=0.66.0",
-    "optuna>=4.9.0",
 ]
 
 [build-system]
