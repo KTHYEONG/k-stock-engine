@@ -396,7 +396,7 @@ def _positive_replay(**overrides) -> ReplayResult:
         metrics={"max_drawdown": 0.05, "turnover": 1.0},
         base_total_return=0.01,
         benchmark_total_return=0.005,
-        stress_total_return=0.01,
+        stress_total_return=0.02,
         final_value=100_000_001.0,
         compounding_overlay={
             "decision_count": 8,
@@ -2881,6 +2881,53 @@ def test_compounding_overlay_summary_is_complete_and_json_safe() -> None:
     assert empty["cash_count"] == 0
     assert empty["cash_reasons"] == {}
     assert empty["positive_scale_fraction"] == 0.0
+    assert empty["covariance_source_counts"] == {}
+    assert empty["dominant_covariance_source"] == ""
+
+
+def test_compounding_overlay_summary_reports_covariance_sources() -> None:
+    from src.stocks.workflows.train_model import _compounding_overlay_summary
+
+    records = [
+        {
+            "decision_session": f"2024-01-{day:02d}T00:00:00+00:00",
+            "candidate_count": 10,
+            "ranked_count": 8,
+            "selected_count": 6,
+            "confidence_edge_h": 0.01,
+            "confidence_variance_h": 0.02,
+            "confidence_scale": 0.5,
+            "gross_before_compounding": 0.9,
+            "gross_after_compounding": 0.45,
+            "turnover_lambda": 0.8,
+            "cash_reason": None,
+            "covariance_source": "full",
+        }
+        for day in (5, 10, 15)
+    ]
+    records.append(
+        {
+            "decision_session": "2024-01-20T00:00:00+00:00",
+            "candidate_count": 4,
+            "ranked_count": 3,
+            "selected_count": 2,
+            "confidence_edge_h": 0.005,
+            "confidence_variance_h": None,
+            "confidence_scale": 0.0,
+            "gross_before_compounding": 0.9,
+            "gross_after_compounding": 0.0,
+            "turnover_lambda": 0.0,
+            "cash_reason": "invalid-confidence-variance",
+            "covariance_source": "fallback",
+        }
+    )
+    compact = _compounding_overlay_summary(records)
+    assert compact["covariance_source_counts"] == {"fallback": 1, "full": 3}
+    assert compact["dominant_covariance_source"] == "full"
+    assert compact["mean_selected_count"] == pytest.approx(5.0)
+    assert compact["mean_ranked_count"] == pytest.approx(6.75)
+    assert compact["mean_candidate_count"] == pytest.approx(8.5)
+    json.dumps(compact)
 
 
 def test_economic_candidate_evidence_propagates_compact_compounding_overlay() -> None:
@@ -3156,6 +3203,11 @@ def test_gate2_and_gate5_consume_block_log_compounding_evidence() -> None:
     assert "gate2_compounding_block_count=12" in good_reasons
     assert any(r.startswith("legacy_daily_excess_lower_bound=") for r in good_reasons)
     assert any(r.startswith("gate5_deflated_sharpe_probability=1.0") for r in good_reasons)
+    assert any(r.startswith("gate7_base_cagr=") for r in good_reasons)
+    assert any(r.startswith("gate7_stress_cagr=") for r in good_reasons)
+    assert any(r.startswith("gate7_base_excess_cagr=") for r in good_reasons)
+    assert any(r.startswith("gate7_base_mdd=") for r in good_reasons)
+    assert any(r.startswith("gate7_base_calmar=") for r in good_reasons)
     assert good["passed"] is True
 
     flat = _evaluate_gates(
@@ -3495,6 +3547,71 @@ def test_tuning_recovery_shortlist_from_negative_pooled_bound(monkeypatch, tmp_p
     assert telemetry["family_differential"] == []
 
 
+def test_confirmation_all_negative_pooled_mean_is_rejected_not_recovered(
+    monkeypatch, tmp_path,
+) -> None:
+    """An all-negative pooled mean is economically rejected, never recovered."""
+    import src.stocks.workflows.train_model as tm
+
+    monkeypatch.setattr(tm, "_MIN_TRAIN_SESSIONS", 40)
+    monkeypatch.setattr(tm, "_VALIDATION_BLOCK_SESSIONS", 30)
+
+    df = stock_v2_composed_df(n_sessions=140, n_tickers=20)
+    manifest = stock_v2_manifest(columns=df.columns)
+    panel = _index_sessions(df)
+    label_span = (manifest.label_horizon_sessions or 1) + 1
+    folds = tm.PurgedWalkForward(
+        n_folds=3,
+        label_horizon_sessions=label_span,
+        embargo_sessions=5,
+        session_column="session_index",
+        validation_window_sessions=30,
+        min_train_sessions=40,
+    ).split(panel)
+
+    monkeypatch.setattr(tm, "_fit_stable_contexts", _fake_fold_contexts)
+    monkeypatch.setattr(
+        tm,
+        "_score_trial_fold",
+        lambda *_a, **_kw: _fake_fold_evidence(lower_bound=-0.01, mean=-0.0016),
+    )
+    monkeypatch.setattr(
+        tm,
+        "_pool_screen_evidence",
+        lambda *_a, **_kw: (-0.01, -0.0016, 0.0, 12),
+    )
+    monkeypatch.setattr(tm, "_fit_and_score_candidate", _fold_aware_refit())
+    monkeypatch.setattr(
+        tm,
+        "_event_ledger_evaluation",
+        lambda *_a, **_kw: _positive_replay(strategy_returns=[0.001] * 60),
+    )
+
+    request = TrainingRequest(artifact_id="reject_path", n_folds=3, optuna_trials=3)
+    config, n_trials, _route = tm._tune_champion(
+        panel[folds[0].train_mask],
+        request,
+        _tune_base_manifest("reject_path", manifest, manifest.label_definition),
+        tuple(c for c in df.columns if c.startswith("feature__")),
+        (tm.RouteSpec(5, "residual_o2o_5d", "relevance", "label_available_time"),),
+        dataset_manifest=manifest,
+        registry=ModelArtifactRegistry(tmp_path / "artifacts"),
+        base_schedule=default_base_schedule(),
+        stress_schedule=default_stress_schedule(),
+    )
+    assert config is None
+    assert n_trials == request.optuna_trials
+    telemetry = tm.LambdaRankConfig._tuning_telemetry
+    assert telemetry["strict_shortlisted_trials"] == 0
+    assert telemetry["recovery_shortlisted_trials"] == 0
+    assert telemetry["confirmation_records"]
+    for row in telemetry["confirmation_records"]:
+        if row["terminal_reason"] in ("confirmed", "pooled_economic_rejection"):
+            assert row["pooled_mean_log_excess"] <= 0.0
+            assert row["pooled_lower_bound"] < 0.0
+    assert telemetry["shortlist_candidate_evidence"] == []
+
+
 def test_config_from_trial_five_way_ablation_cycle() -> None:
     """Registered ablation profile assigns the fixed family cycle by trial number."""
     import optuna
@@ -3766,6 +3883,388 @@ def test_score_trial_fold_records_failure_reason_on_hard_invalid(monkeypatch) ->
     )
     assert result is None
     assert recorder.user_attrs["h5_screen_failure_reason"] == "fit_failed"
+
+
+def test_score_trial_fold_keeps_finite_negative_point_estimate_usable(
+    monkeypatch,
+) -> None:
+    """A finite negative fold mean is usable evidence, never a None sentinel."""
+    import src.stocks.workflows.train_model as tm
+
+    request = TrainingRequest(artifact_id="neg_mean", n_folds=3)
+    guard = tm.TrialResourceGuard(request, predictor_count=3)
+    context = _fake_candidate_context(train_rows=8)
+    manifest = tm.ModelManifest(
+        artifact_id="neg_mean",
+        asset_kind=__import__("src.core.instruments", fromlist=["AssetKind"]).AssetKind.STOCK,
+        feature_set="stock_alpha_v2",
+        feature_schema_hash="hash",
+        universe_policy_hash="universe",
+        label_definition="residual_o2o_5d",
+        label_horizon_sessions=5,
+        eligible_from="2024-01-01T00:00:00+00:00",
+        eligible_to="2024-12-31T00:00:00+00:00",
+        model_type="lambdarank_blend",
+    )
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.number = 0
+            self.user_attrs: dict[str, object] = {}
+
+        def set_user_attr(self, key: str, value: object) -> None:
+            self.user_attrs[key] = value
+
+    replay_evidence = tm.ExecutionMatchedEvidence(
+        metrics={"cost_drag": 0.0005},
+        strategy_returns=[0.001] * 30,
+        benchmark_returns=[0.002] * 30,
+        decision_boundaries=[],
+        attempted_orders=5,
+        filled_orders=4,
+        no_trade_reason_counts={"no-feasible-allocation": 1},
+        compounding_overlay={
+            "decision_count": 6,
+            "mean_candidate_count": 8.0,
+            "mean_ranked_count": 6.0,
+            "mean_selected_count": 4.0,
+            "dominant_covariance_source": "fallback",
+        },
+    )
+
+    class _FakeKernel:
+        prepared_route = type(
+            "_Route",
+            (),
+            {"policy": tm.StockRiskPolicy(annualization_sessions=252)},
+        )()
+        label_available_column = "label_available_time"
+        cache_bytes = 0
+
+        def run_base(self, *_a, **_kw) -> tm.ExecutionMatchedEvidence:
+            return replay_evidence
+
+    context = dataclass_replace(context, execution_kernel=_FakeKernel())
+    empty_scored = pl.DataFrame(
+        {
+            "session": pl.Series([], dtype=pl.Datetime("us", "UTC")),
+            "instrument_id": pl.Series([], dtype=pl.Utf8),
+            "pred_score": pl.Series([], dtype=pl.Float64),
+        }
+    )
+    empty_tuning_panel = pl.DataFrame(
+        {
+            "session": pl.Series([], dtype=pl.Datetime("us", "UTC")),
+            "instrument_id": pl.Series([], dtype=pl.Utf8),
+            "residual_o2o_5d": pl.Series([], dtype=pl.Float64),
+        }
+    )
+    monkeypatch.setattr(
+        tm,
+        "_score_context_model",
+        lambda *_a, **_kw: (0.06, empty_scored, tm.FitTrialOutcome(fit_ok=True)),
+    )
+    monkeypatch.setattr(
+        tm,
+        "_compounding_evidence",
+        lambda *_a, **_kw: tm.CompoundingEvidence(
+            block_log_excess=[-0.001, -0.002, -0.001],
+            block_ids=[0, 5, 10],
+            bootstrap_lower_bound=-0.002,
+            dsr_probability=0.0,
+            complete_block_count=3,
+            rejected_block_count=0,
+        ),
+    )
+    monkeypatch.setattr(
+        tm, "_build_calibration_ledger", lambda *_a, **_kw: pl.DataFrame()
+    )
+
+    recorder = _Recorder()
+    result = tm._score_trial_fold(
+        empty_tuning_panel, None, context, request, manifest, (),
+        "residual_o2o_5d", None, tm.LambdaRankConfig(), guard,
+        cast(object, recorder), 0,
+        report_progress=False, key_prefix="h5_",
+    )
+    assert result is not None
+    assert result.usable is True
+    assert result.failure_reason is None
+    assert result.block_log_excess_mean < 0.0
+    assert result.point_estimate_sign == "negative"
+    assert result.cost_drag == pytest.approx(0.0005)
+    assert result.covariance_source == "fallback"
+    assert result.cash_cycle_ratio == pytest.approx(1 / 6)
+    assert result.candidate_count == 8
+    assert recorder.user_attrs["h5_proxy_point_estimate_sign"] == "negative"
+    json.dumps(result.to_json_safe())
+
+
+def test_fold_transfer_attribution_matches_full_panel_join() -> None:
+    """Compact labels join reproduces the full-panel ranking-to-tail attribution."""
+    from datetime import timedelta
+
+    from src.stocks.research.metrics import economic_transfer_attribution
+    from src.stocks.workflows.train_model import _fold_transfer_attribution
+
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    rows = [
+        {
+            "session": start + timedelta(days=i),
+            "instrument_id": name,
+            "residual_o2o_5d": 0.08 - i * 0.001 - (0.05 if name == "E" else 0.0),
+        }
+        for i in range(6)
+        for name in ("A", "B", "C", "D", "E")
+    ]
+    panel = pl.DataFrame(rows)
+    scored = panel.filter(
+        pl.col("session") >= start + timedelta(days=3)
+    ).select("session", "instrument_id").with_columns(
+        pl.Series("pred_score", [0.9, 0.8, 0.7, 0.6, 0.5] * 3)
+    )
+    full_labels = panel.select(
+        "session", "instrument_id", "residual_o2o_5d"
+    )
+    compact_labels = panel.filter(
+        pl.col("session") >= start + timedelta(days=3)
+    ).select("session", "instrument_id", "residual_o2o_5d")
+
+    compact = _fold_transfer_attribution(
+        scored, compact_labels, "residual_o2o_5d", 2
+    )
+    full = dict(
+        economic_transfer_attribution(
+            scored.join(
+                full_labels,
+                on=["session", "instrument_id"],
+                how="left",
+            ),
+            "residual_o2o_5d",
+            2,
+        )
+    )
+    assert compact == full
+    assert compact["decision_count"] == 3
+    json.dumps(compact)
+
+    assert _fold_transfer_attribution(
+        scored, compact_labels, "residual_o2o_5d", 0
+    ) == {}
+    assert _fold_transfer_attribution(
+        scored, compact_labels, "", 2
+    ) == {}
+    non_finite = scored.with_columns(
+        pl.when(pl.col("instrument_id") == "A")
+        .then(float("inf"))
+        .otherwise(pl.col("pred_score"))
+        .alias("pred_score")
+    )
+    assert _fold_transfer_attribution(
+        non_finite, compact_labels, "residual_o2o_5d", 2
+    ) == {}
+
+
+def test_score_trial_fold_transfer_uses_compact_labels(monkeypatch) -> None:
+    """The fold transfer telemetry joins context.labels, never the full panel."""
+    import src.stocks.workflows.train_model as tm
+
+    request = TrainingRequest(artifact_id="compact_transfer", n_folds=3)
+    guard = tm.TrialResourceGuard(request, predictor_count=3)
+    context = _fake_candidate_context(train_rows=8)
+    manifest = tm.ModelManifest(
+        artifact_id="compact_transfer",
+        asset_kind=__import__("src.core.instruments", fromlist=["AssetKind"]).AssetKind.STOCK,
+        feature_set="stock_alpha_v2",
+        feature_schema_hash="hash",
+        universe_policy_hash="universe",
+        label_definition="residual_o2o_5d",
+        label_horizon_sessions=5,
+        eligible_from="2024-01-01T00:00:00+00:00",
+        eligible_to="2024-12-31T00:00:00+00:00",
+        model_type="lambdarank_blend",
+    )
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.number = 0
+            self.user_attrs: dict[str, object] = {}
+
+        def set_user_attr(self, key: str, value: object) -> None:
+            self.user_attrs[key] = value
+
+    replay_evidence = tm.ExecutionMatchedEvidence(
+        metrics={"cost_drag": 0.0005},
+        strategy_returns=[0.001] * 30,
+        benchmark_returns=[0.002] * 30,
+        decision_boundaries=[],
+        attempted_orders=5,
+        filled_orders=4,
+        no_trade_reason_counts={},
+        compounding_overlay={"decision_count": 6, "dominant_covariance_source": "full"},
+    )
+
+    class _FakeKernel:
+        prepared_route = type(
+            "_Route",
+            (),
+            {"policy": tm.StockRiskPolicy(annualization_sessions=252)},
+        )()
+        label_available_column = "label_available_time"
+        cache_bytes = 0
+
+        def run_base(self, *_a, **_kw) -> tm.ExecutionMatchedEvidence:
+            return replay_evidence
+
+    context = dataclass_replace(context, execution_kernel=_FakeKernel())
+    scored = pl.DataFrame(
+        {
+            "session": [
+                datetime(2024, 1, 5, tzinfo=UTC),
+                datetime(2024, 1, 6, tzinfo=UTC),
+            ],
+            "instrument_id": ["A", "B"],
+            "pred_score": [0.9, 0.8],
+        }
+    )
+    labels = pl.DataFrame(
+        {
+            "session": [
+                datetime(2024, 1, 5, tzinfo=UTC),
+                datetime(2024, 1, 6, tzinfo=UTC),
+            ],
+            "instrument_id": ["A", "B"],
+            "residual_o2o_5d": [0.06, 0.05],
+        }
+    )
+    context = dataclass_replace(context, labels=labels)
+    monkeypatch.setattr(
+        tm,
+        "_score_context_model",
+        lambda *_a, **_kw: (0.06, scored, tm.FitTrialOutcome(fit_ok=True)),
+    )
+    monkeypatch.setattr(
+        tm,
+        "_compounding_evidence",
+        lambda *_a, **_kw: tm.CompoundingEvidence(
+            block_log_excess=[-0.001, -0.002, -0.001],
+            block_ids=[0, 5, 10],
+            bootstrap_lower_bound=-0.002,
+            dsr_probability=0.0,
+            complete_block_count=3,
+            rejected_block_count=0,
+        ),
+    )
+    monkeypatch.setattr(
+        tm, "_build_calibration_ledger", lambda *_a, **_kw: pl.DataFrame()
+    )
+    expected_transfer = dict(
+        tm.economic_transfer_attribution(
+            scored.join(
+                labels,
+                on=["session", "instrument_id"],
+                how="left",
+            ),
+            "residual_o2o_5d",
+            2,
+        )
+    )
+
+    recorder = _Recorder()
+    result = tm._score_trial_fold(
+        pl.DataFrame(), None, context, request, manifest, (),
+        "residual_o2o_5d", None, tm.LambdaRankConfig(), guard,
+        cast(object, recorder), 0,
+        report_progress=False, key_prefix="h5_",
+    )
+    assert result is not None
+    assert result.usable is True
+    assert result.transfer == expected_transfer
+    assert result.transfer["decision_count"] == 2
+    json.dumps(result.to_json_safe())
+
+
+def test_gate7_growth_budget_fails_closed_on_any_violation() -> None:
+    from src.stocks.workflows.train_model import (
+        CompoundingGrowthBudget,
+        _annualized_stress_cagr,
+        _evaluate_gates,
+    )
+
+    budget = PromotionRiskBudget()
+    request = TrainingRequest(artifact_id="gate7", n_folds=3)
+    positive = _positive_replay()
+    good = _evaluate_gates(positive, [0.05, 0.06, 0.07], budget, request, n_trials=3)
+    assert good["passed"] is True
+
+    low_cagr = _evaluate_gates(
+        _positive_replay(strategy_returns=[0.0001] * 60),
+        [0.05, 0.06, 0.07],
+        budget,
+        request,
+        n_trials=3,
+    )
+    assert low_cagr["passed"] is False
+    base_cagr_value = next(
+        float(r.split("=")[1])
+        for r in low_cagr["reasons"]
+        if r.startswith("gate7_base_cagr=")
+    )
+    assert base_cagr_value < budget.growth.minimum_base_cagr
+
+    high_mdd = _evaluate_gates(
+        _positive_replay(
+            strategy_returns=[0.1] + [-0.5] + [0.05] * 58,
+        ),
+        [0.05, 0.06, 0.07],
+        budget,
+        request,
+        n_trials=3,
+    )
+    assert high_mdd["passed"] is False
+
+    low_stress = _evaluate_gates(
+        _positive_replay(stress_total_return=-0.05),
+        [0.05, 0.06, 0.07],
+        budget,
+        request,
+        n_trials=3,
+    )
+    assert low_stress["passed"] is False
+    assert any(r.startswith("gate7_stress_cagr=") for r in low_stress["reasons"])
+
+    missing_stress = _evaluate_gates(
+        _positive_replay(stress_total_return=None),
+        [0.05, 0.06, 0.07],
+        budget,
+        request,
+        n_trials=3,
+    )
+    assert missing_stress["passed"] is False
+    assert "gate7_stress_evidence_incomplete=true" in missing_stress["reasons"]
+
+    low_excess = _evaluate_gates(
+        _positive_replay(strategy_returns=[0.001] * 60, benchmark_returns=[0.001] * 60),
+        [0.05, 0.06, 0.07],
+        budget,
+        request,
+        n_trials=3,
+    )
+    assert low_excess["passed"] is False
+
+    tighter = PromotionRiskBudget(
+        growth=CompoundingGrowthBudget(minimum_base_cagr=0.99)
+    )
+    tight = _evaluate_gates(positive, [0.05, 0.06, 0.07], tighter, request, n_trials=3)
+    assert tight["passed"] is False
+
+    assert _annualized_stress_cagr(0.02, 60, 252) == pytest.approx(
+        math.expm1(math.log1p(0.02) * 252 / 60)
+    )
+    assert _annualized_stress_cagr(None, 60, 252) is None
+    assert _annualized_stress_cagr(-1.0, 60, 252) is None
+    assert _annualized_stress_cagr(float("nan"), 60, 252) is None
+    assert _annualized_stress_cagr(0.01, 0, 252) is None
 
 
 def test_tuning_emits_reconciled_search_ledger(monkeypatch, tmp_path) -> None:

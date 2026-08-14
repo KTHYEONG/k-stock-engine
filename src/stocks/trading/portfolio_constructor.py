@@ -391,24 +391,25 @@ def _prepared_return_matrix(
     returns: np.ndarray,
     market: PreparedAllocationMarket,
     selected_ids: Sequence[str],
-    lookback: int,
 ) -> np.ndarray | None:
-    """Return matrix for ``selected_ids`` mirroring the reference pivot.
+    """Causal raw return window for ``selected_ids`` mirroring the reference pivot.
 
-    Columns follow ``selected_ids`` order; rows are the window sessions where
-    every selected name has a within-window return (the reference
-    ``drop_nulls``), truncated to the trailing ``lookback`` sessions. ``None``
-    reproduces the reference ``insufficient covariance data`` outcome.
+    Columns follow ``selected_ids`` order and rows are the full decision
+    window sessions, carrying ``NaN`` for any unobserved return, exactly like
+    the reference :func:`_return_matrix`. ``None`` reproduces the reference
+    ``insufficient covariance data`` structural failure when a selected name
+    has no column in the market.
     """
-    cols = [market.instrument_position_lookup.get(instrument_id) for instrument_id in selected_ids]
+    cols = [
+        market.instrument_position_lookup.get(instrument_id)
+        for instrument_id in selected_ids
+    ]
     if any(col is None for col in cols):
         return None
     selected = returns[:, cast(list[int], cols)]
-    keep = np.all(np.isfinite(selected), axis=1)
-    rows = selected[keep]
-    if rows.ndim != 2 or rows.shape[0] < 2 or rows.shape[1] != len(selected_ids):
+    if selected.ndim != 2 or selected.shape[1] != len(selected_ids):
         return None
-    return rows[-lookback:]
+    return selected
 
 
 def _prepared_vol_fallback(
@@ -622,11 +623,15 @@ def _construct_allocations_prepared(
     feasible = _portfolio_is_feasible(current_weights, sector_of, equity, policy)
     if feasible:
         ids_matrix = _prepared_return_matrix(
-            returns_window, market, selected_ids, policy.covariance_lookback_sessions
+            returns_window, market, selected_ids
         )
         if ids_matrix is None:
             raise PortfolioConstraintError("insufficient covariance data")
-        covariance = _shrinkage_covariance(ids_matrix)
+        covariance, covariance_source = causal_covariance_or_fallback(
+            ids_matrix,
+            volatility_lookback_sessions=policy.volatility_lookback_sessions,
+            covariance_lookback_sessions=policy.covariance_lookback_sessions,
+        )
         allocations = _build_allocations(
             selected_ids,
             sector_of,
@@ -644,6 +649,7 @@ def _construct_allocations_prepared(
             ranked_count=ranked_count,
             selected_count=selected_count,
             covariance=covariance,
+            covariance_source=covariance_source,
         )
     else:
         allocations = _de_risk_allocations(
@@ -658,11 +664,15 @@ def _construct_allocations_prepared(
     post_covariance: np.ndarray | None = None
     if post_weights:
         post_matrix = _prepared_return_matrix(
-            returns_window, market, sorted(post_weights), policy.covariance_lookback_sessions
+            returns_window, market, sorted(post_weights)
         )
         if post_matrix is None:
             raise PortfolioConstraintError("insufficient covariance data")
-        post_covariance = _shrinkage_covariance(post_matrix)
+        post_covariance, _ = causal_covariance_or_fallback(
+            post_matrix,
+            volatility_lookback_sessions=policy.volatility_lookback_sessions,
+            covariance_lookback_sessions=policy.covariance_lookback_sessions,
+        )
     _post_validate(
         allocations, equity, policy, sector_of, adtv_of, pl.DataFrame(),
         covariance=post_covariance,
@@ -1007,7 +1017,10 @@ def _build_allocations(
     ranked_count: int = 0,
     selected_count: int = 0,
     covariance: np.ndarray | None = None,
+    covariance_source: str = "",
 ) -> tuple[Allocation, ...]:
+    if covariance is None:
+        covariance, covariance_source = _covariance(panel, ids, policy)
     if priority_alpha_of:
         raw_scores = {
             instrument_id: priority_alpha_of.get(instrument_id, 0.0)
@@ -1059,6 +1072,7 @@ def _build_allocations(
                 gross_after_compounding=0.0,
                 turnover_lambda=0.0,
                 cash_reason=cash_reason,
+                covariance_source=covariance_source,
             )
             return ()
         weights = {
@@ -1096,6 +1110,7 @@ def _build_allocations(
             gross_after_compounding=gross_after_compounding,
             turnover_lambda=lambda_,
             cash_reason=None,
+            covariance_source=covariance_source,
         )
 
     allocations: list[Allocation] = []
@@ -1154,10 +1169,7 @@ def _scale_volatility(
     covariance: np.ndarray | None = None,
 ) -> dict[str, float]:
     if covariance is None:
-        return_matrix = _return_matrix(panel, ids, policy.covariance_lookback_sessions)
-        if return_matrix is None:
-            raise PortfolioConstraintError("insufficient covariance data")
-        covariance = _shrinkage_covariance(return_matrix)
+        covariance, _ = _covariance(panel, ids, policy)
     vector = np.asarray([weights[instrument_id] for instrument_id in ids], dtype=float)
     portfolio_variance = float(vector @ covariance @ vector)
     if portfolio_variance <= 0.0 or not math.isfinite(portfolio_variance):
@@ -1198,10 +1210,7 @@ def _compounding_scale(
     if not math.isfinite(confidence_edge_h) or confidence_edge_h <= 0.0:
         return 0.0, confidence_edge_h, 0.0, "non-positive-confidence-edge"
     if covariance is None:
-        return_matrix = _return_matrix(panel, ids, policy.covariance_lookback_sessions)
-        if return_matrix is None:
-            return 0.0, confidence_edge_h, float("nan"), "invalid-confidence-variance"
-        covariance = _shrinkage_covariance(return_matrix)
+        covariance, _ = _covariance(panel, ids, policy)
     confidence_variance_h = horizon * float(vector @ covariance @ vector)
     if not math.isfinite(confidence_variance_h) or confidence_variance_h < 0.0:
         return 0.0, confidence_edge_h, confidence_variance_h, "invalid-confidence-variance"
@@ -1225,13 +1234,18 @@ def _record_compounding_decision(
     gross_after_compounding: float,
     turnover_lambda: float,
     cash_reason: str | None,
+    covariance_source: str = "",
 ) -> None:
     """Append one deterministic JSON-safe per-decision compounding record.
 
     The record captures the decision inputs and outcome without reading any
     future returns or labels. Numeric diagnostics that are not finite are
     stored as ``None`` and the decision is fail-closed through ``cash_reason``.
-    The same record is emitted only through the ``stocks.trading.portfolio_constructor``
+    ``covariance_source`` records whether the covariance matrix used for this
+    decision came from the complete-matrix shrinkage path (``full``) or the
+    conservative common-correlation fallback (``fallback``); it is ``""`` for
+    decisions that never reach covariance construction. The same record is
+    emitted only through the ``stocks.trading.portfolio_constructor``
     DEBUG logger; default INFO runs keep allocation values, messages, and
     behavior unchanged.
     """
@@ -1256,6 +1270,7 @@ def _record_compounding_decision(
         "gross_after_compounding": float(gross_after_compounding),
         "turnover_lambda": float(turnover_lambda),
         "cash_reason": cash_reason,
+        "covariance_source": str(covariance_source),
     }
     policy.compounding_evidence.append(record)
     logger.debug(
@@ -1268,8 +1283,14 @@ def _record_compounding_decision(
 def _return_matrix(
     panel: pl.DataFrame,
     ids: list[str],
-    lookback: int,
 ) -> np.ndarray | None:
+    """Causal raw per-session return matrix for ``ids`` (``NaN`` where missing).
+
+    Pivots the selected names to one row per session and returns the raw
+    window without dropping incomplete sessions, so the caller can run the
+    complete-matrix path or the conservative fallback on exactly the same
+    input. Returns ``None`` only when no selected name matches the panel.
+    """
     with_return = panel.filter(pl.col("instrument_id").is_in(ids)).with_columns(
         _returns_column(panel).alias("__logret")
     )
@@ -1283,13 +1304,35 @@ def _return_matrix(
             aggregate_function="first",
         )
     )
-    pivoted = pivoted.drop_nulls()
     columns = [c for c in pivoted.columns if c != _SESSION_COLUMN]
-    arr = pivoted.tail(lookback).select(columns).to_numpy()
-    if arr.ndim != 2 or arr.shape[0] < 2 or arr.shape[1] != len(ids):
+    if not columns:
+        return None
+    arr = pivoted.select(columns).to_numpy()
+    if arr.ndim != 2 or arr.shape[1] != len(ids):
         return None
     order = [columns.index(instrument_id) for instrument_id in ids]
     return np.asarray(arr[:, order], dtype=float)
+
+
+def _covariance(
+    panel: pl.DataFrame,
+    ids: list[str],
+    policy: StockRiskPolicy,
+) -> tuple[np.ndarray, str]:
+    """Full-or-fallback causal covariance for ``ids`` on one decision window.
+
+    Both the prepared and reference construction paths must agree on the exact
+    covariance result and its ``full``/``fallback`` source so the same matrix
+    flows into scaling, compounding, and post-validation.
+    """
+    matrix = _return_matrix(panel, ids)
+    if matrix is None:
+        raise PortfolioConstraintError("insufficient covariance data")
+    return causal_covariance_or_fallback(
+        matrix,
+        volatility_lookback_sessions=policy.volatility_lookback_sessions,
+        covariance_lookback_sessions=policy.covariance_lookback_sessions,
+    )
 
 
 def _shrinkage_covariance(returns: np.ndarray) -> np.ndarray:
@@ -1300,6 +1343,71 @@ def _shrinkage_covariance(returns: np.ndarray) -> np.ndarray:
     diagonal = np.diag(sample)
     target = np.diag(np.full(n_assets, float(np.mean(diagonal))))
     return 0.5 * sample + 0.5 * target
+
+
+def causal_covariance_or_fallback(
+    returns: np.ndarray,
+    *,
+    volatility_lookback_sessions: int,
+    covariance_lookback_sessions: int,
+) -> tuple[np.ndarray, str]:
+    """Causal covariance with a conservative common-correlation fallback.
+
+    ``returns`` is the causal raw return window (rows are sessions, columns are
+    selected assets, ``NaN`` marks an unobserved return at that point in time);
+    it must contain no future rows. When a complete trailing matrix of at least
+    two sessions exists within ``covariance_lookback_sessions`` the existing
+    shrinkage covariance is returned unchanged with ``source='full'``.
+    Otherwise every selected asset must expose at least
+    ``volatility_lookback_sessions`` finite own returns with finite positive
+    variance; pair correlations are estimated only from overlapping rows and a
+    PSD common-correlation matrix built from the upper quartile of the observed
+    positive pair correlations (perfect correlation when no positive pair is
+    observable) is combined with the diagonal own variances. A missing pair is
+    never treated as zero correlation, so the fallback overstates risk when
+    data is sparse instead of understating it. Any asset without sufficient
+    finite volatility history fails closed as
+    :class:`PortfolioConstraintError`. Returns ``(covariance, source)`` where
+    ``source`` is ``'full'`` or ``'fallback'``.
+    """
+    if volatility_lookback_sessions < 1 or covariance_lookback_sessions < 1:
+        raise ValueError("lookback sessions must be positive")
+    matrix = np.asarray(returns, dtype=float)
+    if matrix.ndim != 2 or matrix.shape[1] == 0:
+        raise PortfolioConstraintError("insufficient covariance data")
+    n_assets = int(matrix.shape[1])
+
+    complete = matrix[np.all(np.isfinite(matrix), axis=1)]
+    complete_tail = complete[-covariance_lookback_sessions:]
+    if complete_tail.shape[0] >= 2:
+        return _shrinkage_covariance(complete_tail), "full"
+
+    variances = np.empty(n_assets, dtype=float)
+    for asset in range(n_assets):
+        own = matrix[:, asset]
+        own = own[np.isfinite(own)]
+        if own.size < volatility_lookback_sessions:
+            raise PortfolioConstraintError("insufficient covariance data")
+        variance = float(np.var(own, ddof=0))
+        if not math.isfinite(variance) or variance <= 0.0:
+            raise PortfolioConstraintError("insufficient covariance data")
+        variances[asset] = variance
+    observed: list[float] = []
+    for i in range(n_assets):
+        for j in range(i + 1, n_assets):
+            both = np.isfinite(matrix[:, i]) & np.isfinite(matrix[:, j])
+            if np.count_nonzero(both) >= 2:
+                left = matrix[both, i]
+                right = matrix[both, j]
+                if np.std(left) > 0.0 and np.std(right) > 0.0:
+                    rho = float(np.corrcoef(left, right)[0, 1])
+                    if math.isfinite(rho) and rho > 0.0:
+                        observed.append(rho)
+    common = float(np.quantile(observed, 0.75)) if observed else 1.0
+    correlation = np.full((n_assets, n_assets), common, dtype=float)
+    np.fill_diagonal(correlation, 1.0)
+    std = np.sqrt(variances)
+    return (std[:, None] * correlation) * std[None, :], "fallback"
 
 
 def _turnover_lambda(
@@ -1408,10 +1516,7 @@ def _post_validate(
     }
     if weights:
         if covariance is None:
-            matrix = _return_matrix(panel, sorted(weights), policy.covariance_lookback_sessions)
-            if matrix is None:
-                raise PortfolioConstraintError("insufficient covariance data")
-            covariance = _shrinkage_covariance(matrix)
+            covariance, _ = _covariance(panel, sorted(weights), policy)
         vector = np.asarray([weights[i] for i in sorted(weights)], dtype=float)
         variance = float(vector @ covariance @ vector)
         forecast_vol = math.sqrt(max(variance, 0.0)) * math.sqrt(policy.annualization_sessions)

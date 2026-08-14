@@ -71,7 +71,11 @@ from src.stocks.research.lambdarank import (
     adaptive_refit_rounds,
     resolve_lgb_num_threads,
 )
-from src.stocks.research.metrics import economic_transfer_attribution, rank_ic
+from src.stocks.research.metrics import (
+    compounded_growth_metrics,
+    economic_transfer_attribution,
+    rank_ic,
+)
 from src.stocks.research.models import ModelManifest, StableRankComposite
 from src.stocks.trading.portfolio_constructor import (
     CompoundingPolicyConfig,
@@ -156,6 +160,22 @@ _ABLATION_TERMINAL_TRIALS = 90
 
 
 @dataclass(frozen=True, slots=True)
+class CompoundingGrowthBudget:
+    """Fixed compounding-growth promotion budget for Gate 7.
+
+    The thresholds are pre-registered investment-policy values of
+    ``compounding-growth-v1``; they are never Optuna search parameters and are
+    not adjusted after results are observed.
+    """
+
+    minimum_base_cagr: float = 0.10
+    minimum_stress_cagr: float = 0.06
+    minimum_excess_cagr: float = 0.04
+    maximum_base_mdd: float = 0.20
+    minimum_base_calmar: float = 0.50
+
+
+@dataclass(frozen=True, slots=True)
 class PromotionRiskBudget:
     """Versioned risk budget enforced by the promotion gates."""
 
@@ -163,6 +183,9 @@ class PromotionRiskBudget:
     bootstrap_alpha: float = 0.05
     deflated_sharpe_probability: float = 0.95
     max_benchmark_drawdown_ratio: float = 1.10
+    growth: CompoundingGrowthBudget = field(
+        default_factory=CompoundingGrowthBudget
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -580,7 +603,6 @@ _SCREEN_FAILURE_REASONS = frozenset(
         "no_filled_orders",
         "insufficient_compounding_blocks",
         "non_finite_compounding",
-        "non_positive_point_estimate",
     }
 )
 
@@ -595,7 +617,12 @@ class ScreenFoldEvidence:
     bootstrap lower bound, which may be negative; a negative bound is usable
     screen evidence, never a ``None`` sentinel. ``failure_reason`` is one
     deterministic code from :data:`_SCREEN_FAILURE_REASONS` when the fold is not
-    usable, and ``None`` otherwise.
+    usable, and ``None`` otherwise. ``point_estimate_sign`` records the sign of
+    the finite block-log mean (``positive``/``negative``/``zero``), ``transfer``
+    carries the pure ranking-to-tail attribution, ``growth`` carries the
+    diagnostic base CAGR/MDD/Calmar, and ``covariance_source``/
+    ``cash_cycle_ratio``/``cost_drag`` report the allocation/execution path.
+    These telemetry fields never enter the Optuna objective or gate thresholds.
     """
 
     rank_ic: float
@@ -615,6 +642,15 @@ class ScreenFoldEvidence:
     cash_cycles: int = 0
     block_log_excess: tuple[float, ...] = ()
     block_ids: tuple[int, ...] = ()
+    point_estimate_sign: str = "positive"
+    cost_drag: float = 0.0
+    covariance_source: str = ""
+    cash_cycle_ratio: float = 0.0
+    candidate_count: int = 0
+    ranked_count: int = 0
+    selected_count: int = 0
+    transfer: dict[str, object] = field(default_factory=dict)
+    growth: dict[str, float] = field(default_factory=dict)
 
     @property
     def ranking_score(self) -> float:
@@ -641,6 +677,18 @@ class ScreenFoldEvidence:
             "calibration_history_sessions": int(self.calibration_history_sessions),
             "eligible_bucket_count": int(self.eligible_bucket_count),
             "cash_cycles": int(self.cash_cycles),
+            "point_estimate_sign": str(self.point_estimate_sign),
+            "cost_drag": round(self.cost_drag, 8),
+            "covariance_source": str(self.covariance_source),
+            "cash_cycle_ratio": round(self.cash_cycle_ratio, 8),
+            "candidate_count": int(self.candidate_count),
+            "ranked_count": int(self.ranked_count),
+            "selected_count": int(self.selected_count),
+            "transfer": dict(self.transfer or {}),
+            "growth": {
+                key: round(float(value), 8)
+                for key, value in sorted((self.growth or {}).items())
+            },
         }
 
 
@@ -1787,6 +1835,10 @@ def _tune_champion(
                 "screen_fold0_no_trade_reason_counts",
                 dict(sorted(evidence.no_trade_reason_counts.items())),
             )
+            trial.set_user_attr(
+                "screen_fold0_point_estimate_sign",
+                str(evidence.point_estimate_sign),
+            )
             objective = float(evidence.ranking_score)
             logger.info(
                 "[EVAL] route=%sd trial=%s stage=screen_fold0_lower_bound "
@@ -1926,10 +1978,14 @@ def _tune_champion(
             record = _ScreenTrialRecord(trial_number)
             fold_evidences: list[ScreenFoldEvidence] = []
             terminal_reason = "confirmed"
+            failed_fold_index: int | None = None
+            hard_failure_reason: str | None = None
             for fold_index in range(len(tuning_folds)):
                 proxy = proxy_contexts[fold_index]
                 if proxy is None:
                     terminal_reason = "hard_failure"
+                    failed_fold_index = fold_index
+                    hard_failure_reason = "no_proxy_context"
                     break
                 ev = _score_trial_fold(
                     tuning_panel, tuning_folds[fold_index], proxy, request,
@@ -1941,6 +1997,12 @@ def _tune_champion(
                 )
                 if ev is None:
                     terminal_reason = "hard_failure"
+                    failed_fold_index = fold_index
+                    hard_failure_reason = str(
+                        record.user_attrs.get(
+                            f"h{route.horizon}_screen_failure_reason", "unknown"
+                        )
+                    )
                     break
                 if ev.rank_ic <= 0.0:
                     terminal_reason = "rank_ic_non_positive"
@@ -1948,16 +2010,18 @@ def _tune_champion(
                     break
                 fold_evidences.append(ev)
             if terminal_reason != "confirmed" or len(fold_evidences) != len(tuning_folds):
-                confirmation_records.append(
-                    {
-                        "trial_number": int(trial_number),
-                        "candidate_family": candidate_family,
-                        "terminal_reason": terminal_reason,
-                        "fold_evidence": [
-                            ev.to_json_safe() for ev in fold_evidences
-                        ],
-                    }
-                )
+                record_entry: dict[str, object] = {
+                    "trial_number": int(trial_number),
+                    "candidate_family": candidate_family,
+                    "terminal_reason": terminal_reason,
+                    "fold_evidence": [
+                        ev.to_json_safe() for ev in fold_evidences
+                    ],
+                }
+                if failed_fold_index is not None:
+                    record_entry["failed_fold_index"] = int(failed_fold_index)
+                    record_entry["failure_reason"] = hard_failure_reason or "unknown"
+                confirmation_records.append(record_entry)
                 continue
             pooled_lb, pooled_mean, pooled_dsr, pooled_blocks = (
                 _pool_screen_evidence(
@@ -2992,6 +3056,37 @@ def _build_proxy_context(
     )
 
 
+def _fold_transfer_attribution(
+    scored: pl.DataFrame,
+    labels: pl.DataFrame,
+    label_column: str,
+    top_k: int,
+) -> dict[str, object]:
+    """Compact ranking-to-tail attribution for one fold's scored cross-section.
+
+    Joins the scored cross-section only against the fold's validation-scoped
+    label frame (``labels``, e.g. :attr:`PreparedCandidateContext.labels`)
+    instead of the full tuning panel, so per-fold screen telemetry stays
+    bounded by the fold validation rows. Returns the pure
+    :func:`economic_transfer_attribution` map, or an empty dict when ``top_k``
+    is invalid, ``label_column`` is empty, or non-finite retained inputs fail
+    closed through ``ValueError``.
+    """
+    if top_k < 1 or not label_column:
+        return {}
+    try:
+        scored_with_label = scored.join(
+            labels.select("session", "instrument_id", label_column),
+            on=["session", "instrument_id"],
+            how="left",
+        )
+        return dict(
+            economic_transfer_attribution(scored_with_label, label_column, top_k)
+        )
+    except ValueError:
+        return {}
+
+
 def _score_trial_fold(
     tuning_panel: pl.DataFrame,
     fold: Fold,
@@ -3017,9 +3112,10 @@ def _score_trial_fold(
     a callback-raised :class:`optuna.TrialPruned` still leaves timing evidence.
     ``key_prefix`` qualifies the recorded fold key with the route horizon so
     cross-route keys never collide. Every fitted, finite replay produces
-    evidence -- including a **negative** bootstrap lower bound, which is usable
-    screen evidence, never a ``None`` sentinel. ``None`` is reserved for
-    hard-invalid model/kernel/capacity paths only, and each such return records
+    evidence -- including a **negative** bootstrap lower bound or a
+    **non-positive** finite point estimate, both of which are usable screen
+    evidence, never a ``None`` sentinel. ``None`` is reserved for hard-invalid
+    model/kernel/capacity paths only, and each such return records
     a deterministic ``screen_failure_reason`` plus scalar evidence in the trial
     user attrs first. A breach raises :class:`TrainingCapacityError`. Fold
     model, prediction frame, and LightGBM datasets are local to this call and
@@ -3137,20 +3233,27 @@ def _score_trial_fold(
                 },
             )
             return None
-        if mean <= 0.0:
-            _record_screen_failure(
-                trial,
-                key_prefix,
-                "non_positive_point_estimate",
-                {
-                    "rank_ic": round(float(_ic), 8),
-                    "filled_orders": int(evidence.filled_orders),
-                    "block_log_excess_mean": round(mean, 8),
-                    "lower_bound": round(lower_bound, 8),
-                },
-            )
-            return None
+        point_sign = (
+            "positive" if mean > 0.0 else ("negative" if mean < 0.0 else "zero")
+        )
+        trial.set_user_attr(f"{key_prefix}proxy_point_estimate_sign", point_sign)
         calibration_evidence = evidence.calibration_evidence or {}
+        overlay = dict(evidence.compounding_overlay or {})
+        decision_count = int(cast(int, overlay.get("decision_count", 0)))
+        cash_cycles = int(
+            evidence.no_trade_reason_counts.get("no-feasible-allocation", 0)
+        )
+        transfer = _fold_transfer_attribution(
+            scored, context.labels, label_column, request.top_k
+        )
+        growth: dict[str, float] = {}
+        if kernel is not None:
+            risk_policy = kernel.prepared_route.policy
+            growth = dict(
+                compounded_growth_metrics(
+                    evidence.strategy_returns, risk_policy.annualization_sessions
+                )
+            )
         fold_evidence = ScreenFoldEvidence(
             rank_ic=float(_ic),
             attempted_orders=evidence.attempted_orders,
@@ -3170,11 +3273,22 @@ def _score_trial_fold(
             eligible_bucket_count=int(
                 cast(int, calibration_evidence.get("eligible_bucket_count", 0))
             ),
-            cash_cycles=int(
-                evidence.no_trade_reason_counts.get("no-feasible-allocation", 0)
-            ),
+            cash_cycles=cash_cycles,
             block_log_excess=tuple(compounding.block_log_excess),
             block_ids=tuple(compounding.block_ids),
+            point_estimate_sign=point_sign,
+            cost_drag=float(evidence.metrics.get("cost_drag", 0.0)),
+            covariance_source=str(
+                cast(str, overlay.get("dominant_covariance_source", ""))
+            ),
+            cash_cycle_ratio=(
+                cash_cycles / max(decision_count, 1) if decision_count else 0.0
+            ),
+            candidate_count=int(cast(int, overlay.get("mean_candidate_count", 0))),
+            ranked_count=int(cast(int, overlay.get("mean_ranked_count", 0))),
+            selected_count=int(cast(int, overlay.get("mean_selected_count", 0))),
+            transfer=transfer,
+            growth=growth,
         )
         trial.set_user_attr(
             f"{key_prefix}proxy_execution_lower_bound",
@@ -5747,8 +5861,11 @@ def _compounding_overlay_summary(
 
     The summary is the single source of truth propagated to the final
     ``metrics`` payload and to every ``(trial, policy)`` inner candidate
-    evidence row. Per-decision records are preserved only when
-    ``include_records`` is true, i.e. only for the final artifact.
+    evidence row. It aggregates the covariance matrix source
+    (``full``/``fallback``) and the selected/ranked/candidate counts per
+    decision so pool-level cash and covariance provenance stay visible.
+    Per-decision records are preserved only when ``include_records`` is true,
+    i.e. only for the final artifact.
     """
     decision_count = len(records)
     scales = [
@@ -5768,6 +5885,25 @@ def _compounding_overlay_summary(
         float(cast(float, record["gross_after_compounding"])) for record in records
     ]
     lambdas = [float(cast(float, record["turnover_lambda"])) for record in records]
+    selected = [
+        int(cast(int, record.get("selected_count", 0))) for record in records
+    ]
+    ranked = [
+        int(cast(int, record.get("ranked_count", 0))) for record in records
+    ]
+    candidate = [
+        int(cast(int, record.get("candidate_count", 0))) for record in records
+    ]
+    covariance_sources = Counter(
+        str(record.get("covariance_source") or "")
+        for record in records
+        if record.get("covariance_source")
+    )
+    dominant_covariance_source = (
+        max(covariance_sources, key=covariance_sources.__getitem__)
+        if covariance_sources
+        else ""
+    )
     summary: dict[str, object] = {
         "decision_count": decision_count,
         "cash_count": sum(cash_reasons.values()),
@@ -5786,6 +5922,11 @@ def _compounding_overlay_summary(
             float(np.mean(gross_after)) if gross_after else 0.0
         ),
         "mean_turnover_lambda": float(np.mean(lambdas)) if lambdas else 0.0,
+        "mean_selected_count": float(np.mean(selected)) if selected else 0.0,
+        "mean_ranked_count": float(np.mean(ranked)) if ranked else 0.0,
+        "mean_candidate_count": float(np.mean(candidate)) if candidate else 0.0,
+        "covariance_source_counts": dict(sorted(covariance_sources.items())),
+        "dominant_covariance_source": str(dominant_covariance_source),
     }
     if include_records:
         summary["records"] = [dict(record) for record in records]
@@ -5931,6 +6072,33 @@ def _economic_screen_score(
     )
 
 
+def _annualized_stress_cagr(
+    stress_total_return: float | None,
+    n_base_returns: int,
+    annualization_sessions: int,
+) -> float | None:
+    """Annualize the stress total return over the base return-interval count.
+
+    The stress leg is only summarized as ``stress_final_value`` by the
+    backtester, so the exact interval-level stress returns are unavailable.
+    Because ``1 + stress_total_return`` equals the stress equity multiplier,
+    ``sum(log1p(stress returns)) == log1p(stress_total_return)``, matching the
+    compounding-growth CAGR formula. ``None`` marks evidence-incomplete stress
+    evidence (missing, non-finite, or ``<= -1`` total return, or no base
+    return interval).
+    """
+    if (
+        stress_total_return is None
+        or not math.isfinite(stress_total_return)
+        or stress_total_return <= -1.0
+        or n_base_returns <= 0
+    ):
+        return None
+    return math.expm1(
+        math.log1p(stress_total_return) * annualization_sessions / n_base_returns
+    )
+
+
 def _evaluate_gates(
     replay: ReplayResult,
     fold_rank_ic: list[float],
@@ -5946,7 +6114,11 @@ def _evaluate_gates(
     strictly positive moving-block bootstrap lower bound of complete
     holding-period block log-excess returns, and Gate 5 evaluates Deflated
     Sharpe on that same block series with the supplied terminal trial count.
-    The legacy daily arithmetic excess bootstrap survives only as the
+    Gate 7 evaluates the fixed ``compounding-growth-v1`` budget (base/stress
+    CAGR, base excess CAGR, base MDD, base Calmar) on exact final replay
+    return intervals only; screen CAGR/MDD never promotes, never alters Optuna
+    objectives, and never reduces the DSR multiplicity count. The legacy daily
+    arithmetic excess bootstrap survives only as the
     ``legacy_daily_excess_lower_bound`` diagnostic.
     """
     reasons: list[str] = []
@@ -6041,6 +6213,42 @@ def _evaluate_gates(
     )
     reasons.append(f"gate6_drawdown_ratio={strategy_drawdown:.4f}/{benchmark_drawdown:.4f}")
     passed = passed and gate6_ok
+
+    annualization = 252
+    base_growth = compounded_growth_metrics(strategy_returns, annualization)
+    benchmark_growth = compounded_growth_metrics(benchmark_returns, annualization)
+    growth = budget.growth
+    if base_growth["evidence_complete"] == 0.0:
+        passed = False
+        reasons.append("gate7_base_evidence_incomplete=true")
+    else:
+        gate7_base_cagr_ok = (
+            base_growth["cagr"] >= growth.minimum_base_cagr
+        )
+        gate7_base_mdd_ok = base_growth["mdd"] <= growth.maximum_base_mdd
+        gate7_base_calmar_ok = base_growth["calmar"] >= growth.minimum_base_calmar
+        reasons.append(f"gate7_base_cagr={base_growth['cagr']:.8f}")
+        reasons.append(f"gate7_base_mdd={base_growth['mdd']:.8f}")
+        reasons.append(f"gate7_base_calmar={base_growth['calmar']:.6f}")
+        passed = passed and gate7_base_cagr_ok and gate7_base_mdd_ok and gate7_base_calmar_ok
+    if benchmark_growth["evidence_complete"] == 0.0:
+        passed = False
+        reasons.append("gate7_benchmark_evidence_incomplete=true")
+    else:
+        excess_cagr = base_growth["cagr"] - benchmark_growth["cagr"]
+        gate7_excess_ok = excess_cagr >= growth.minimum_excess_cagr
+        reasons.append(f"gate7_base_excess_cagr={excess_cagr:.8f}")
+        passed = passed and gate7_excess_ok
+    stress_cagr = _annualized_stress_cagr(
+        replay.stress_total_return, len(strategy_returns), annualization
+    )
+    if stress_cagr is None:
+        passed = False
+        reasons.append("gate7_stress_evidence_incomplete=true")
+    else:
+        gate7_stress_ok = stress_cagr >= growth.minimum_stress_cagr
+        reasons.append(f"gate7_stress_cagr={stress_cagr:.8f}")
+        passed = passed and gate7_stress_ok
 
     return {"passed": passed, "reasons": reasons}
 
@@ -6505,6 +6713,14 @@ def _build_metrics(
     *,
     tuning_telemetry: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    annualization = 252
+    growth_metrics: dict[str, object] = {
+        "base": compounded_growth_metrics(replay.strategy_returns, annualization),
+        "benchmark": compounded_growth_metrics(replay.benchmark_returns, annualization),
+        "stress_cagr": _annualized_stress_cagr(
+            replay.stress_total_return, len(replay.strategy_returns), annualization
+        ),
+    }
     return {
         "artifact_id": request.artifact_id,
         "model_type": manifest.model_type,
@@ -6524,6 +6740,15 @@ def _build_metrics(
         "base_total_return": replay.base_total_return,
         "stress_total_return": replay.stress_total_return,
         "benchmark_total_return": replay.benchmark_total_return,
+        "growth_metrics": growth_metrics,
+        "covariance_source_counts": dict(
+            cast(dict[str, int], (replay.compounding_overlay or {}).get(
+                "covariance_source_counts", {}
+            ))
+        ),
+        "dominant_covariance_source": str(
+            (replay.compounding_overlay or {}).get("dominant_covariance_source", "")
+        ),
         "promotion_reasons": reasons,
         "gates": gates,
         "optuna_trials": request.optuna_trials,
