@@ -397,6 +397,38 @@ class TestEconomicGating:
         assert allocations
         assert all(a.reason == "inverse-vol-constrained" for a in allocations)
 
+
+def no_trade_when_alpha_lcb_not_above_marginal_hurdle() -> bool:
+    """Contract oracle: an alpha lower bound below the marginal hurdle yields no trade.
+
+    A candidate whose ``net_alpha_lower_bound`` does not beat the round-trip
+    marginal cost (the entry/exit hurdle) must never produce a new order, even
+    when the gross alpha is positive.
+    """
+    policy = StockRiskPolicy(top_k=20)
+    positive = _with_economic(scored_panel(seed=78), positive=True)
+    below_hurdle = positive.with_columns(
+        pl.lit(-0.001, dtype=pl.Float64).alias("net_alpha_lower_bound")
+    )
+    if construct_target_allocations(
+        below_hurdle, instruments_for(10), empty_portfolio(), policy
+    ):
+        return False
+    above_hurdle = positive.with_columns(
+        pl.lit(0.001, dtype=pl.Float64).alias("net_alpha_lower_bound")
+    )
+    return bool(
+        construct_target_allocations(
+            above_hurdle, instruments_for(10), empty_portfolio(), policy
+        )
+    )
+
+
+def test_no_trade_when_alpha_lcb_not_above_marginal_hurdle() -> None:
+    assert no_trade_when_alpha_lcb_not_above_marginal_hurdle()
+
+
+class TestEconomicGatingRemainder:
     def test_non_positive_net_alpha_yields_no_synthetic_long(self) -> None:
         policy = StockRiskPolicy(top_k=20)
         panel = _with_economic(scored_panel(seed=72), positive=False)

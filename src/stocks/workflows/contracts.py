@@ -13,8 +13,6 @@ from pathlib import Path
 
 from src.core.costs import CostSchedule
 
-SUPPORTED_CANDIDATE_HORIZONS = (5, 10, 15)
-
 COMPUTE_PLAN_VERSION = "sub10-refit-v1"
 
 SELECTION_MULTIPLICITY_VERSION = "selection-multiplicity-global-count-v1"
@@ -86,15 +84,8 @@ class TrainingRequest:
             raise ValueError(
                 "candidate_horizons must be strictly ascending and unique"
             )
-        unsupported = [
-            h for h in self.candidate_horizons
-            if h not in SUPPORTED_CANDIDATE_HORIZONS
-        ]
-        if unsupported:
-            raise ValueError(
-                f"unsupported candidate horizons {unsupported}; "
-                f"supported {SUPPORTED_CANDIDATE_HORIZONS}"
-            )
+        if any(h < 1 for h in self.candidate_horizons):
+            raise ValueError("candidate_horizons must be positive sessions")
 
 
 @dataclass(frozen=True, slots=True)

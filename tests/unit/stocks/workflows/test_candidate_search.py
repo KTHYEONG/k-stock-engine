@@ -11,7 +11,9 @@ def test_candidate_search_returns_typed_result_and_consumes_telemetry(monkeypatc
     import src.stocks.research.lambdarank as lambdarank
     import src.stocks.workflows.train_model as train_model
 
-    config = SimpleNamespace(_tuning_telemetry={"selection_status": "selected"})
+    config = SimpleNamespace(
+        _tuning_telemetry={"selection_status": "selected"}
+    )
     route = SimpleNamespace(horizon=5)
 
     def fake_tune(*_args, **_kwargs):
@@ -39,6 +41,41 @@ def test_candidate_search_returns_typed_result_and_consumes_telemetry(monkeypatc
     assert result.config is config
     assert result.multiplicity_count == 7
     assert result.route is route
-    assert result.telemetry == {"selection_status": "selected"}
+    assert result.telemetry["selection_status"] == "selected"
+    assert result.telemetry["exact_finalist_count"] == 0
+    assert "selection_multiplicity_version" in result.telemetry
     assert config._tuning_telemetry is None
     assert lambdarank.LambdaRankConfig._tuning_telemetry is None
+
+
+def test_candidate_search_counts_evidence_only_and_caps_finalists(monkeypatch) -> None:
+    import src.stocks.research.lambdarank as lambdarank
+    import src.stocks.workflows.train_model as train_model
+
+    config = SimpleNamespace(
+        _tuning_telemetry={"shortlist_candidate_evidence": [{}, {}, {}, {}]}
+    )
+    route = SimpleNamespace(horizon=5)
+
+    def fake_tune(*_args, **_kwargs):
+        return config, 9, route
+
+    monkeypatch.setattr(train_model, "_tune_champion", fake_tune)
+    monkeypatch.setattr(
+        lambdarank.LambdaRankConfig,
+        "_tuning_telemetry",
+        {"shortlist_candidate_evidence": [{}, {}, {}, {}]},
+    )
+
+    result = run_candidate_search(
+        pl.DataFrame(),
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        (),
+        (),
+        dataset_manifest=None,  # type: ignore[arg-type]
+        registry=None,  # type: ignore[arg-type]
+        base_schedule=None,  # type: ignore[arg-type]
+        stress_schedule=None,  # type: ignore[arg-type]
+    )
+    assert result.telemetry["exact_finalist_count"] == 2
