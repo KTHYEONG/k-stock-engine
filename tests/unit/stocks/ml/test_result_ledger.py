@@ -587,3 +587,42 @@ def test_rebuild_from_registry_recovers_cache(tmp_path) -> None:
         "no_trade",
     }
     assert latest["input"]["snapshot_id"] is None
+
+
+def test_record_completed_preserves_no_trade_policy_frontier_projection(tmp_path) -> None:
+    """Acceptance 5: the no-trade run's 12 dropout reasons reach the ledger."""
+    from src.stocks.ml.result_ledger import _project_policy_frontier
+
+    dropout = {
+        f"{h}:{p}": "missing-realized-vintages:0"
+        for h in (3, 5, 8, 10, 15, 20)
+        for p in ("legacy_overlay_5bps", "lower_bound_only")
+    }
+    metrics = {
+        **_default_metrics("no_trade"),
+        "policy_frontier": {
+            "candidate_count": 0,
+            "profile_ids": ["legacy_overlay_5bps", "lower_bound_only"],
+            "dropout_reasons": dropout,
+            "segment_sums": {"h3:legacy_overlay_5bps:s0": {"scored_sessions": 20}},
+        },
+    }
+    projected = _project_policy_frontier(metrics)
+    assert projected["candidate_count"] == 0
+    assert projected["profile_ids"] == ["legacy_overlay_5bps", "lower_bound_only"]
+    assert len(projected["dropout_reasons"]) == 12
+    assert projected["segment_sums"]["h3:legacy_overlay_5bps:s0"]["scored_sessions"] == 20
+    assert "scores" not in json.dumps(projected)
+    assert "returns" not in json.dumps(projected)
+
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    artifact_id = "na_frontier_ledger"
+    _write_artifact(registry.root, artifact_id, model_type="no_trade", metrics=metrics)
+    context = _context(artifact_id)
+    ledger_inst = MlResultLedger(tmp_path / "results")
+    ledger_inst.record_completed(context, _manifest(artifact_id, "no_trade"), registry)
+    latest = _latest(tmp_path / "results")
+    frontier = latest["observability"]["policy_frontier"]
+    assert frontier["candidate_count"] == 0
+    assert len(frontier["dropout_reasons"]) == 12
+    assert "20:lower_bound_only" in frontier["dropout_reasons"]

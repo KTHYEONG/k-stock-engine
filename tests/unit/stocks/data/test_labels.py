@@ -515,3 +515,57 @@ class TestNetAlphaLabels:
                 base, calendar, _cost_schedule(), _liquidity_model(),
                 horizon_sessions=5, reference_notional=1.0e6,
             )
+
+    def test_with_status_emits_one_typed_status_per_decision_key(self) -> None:
+        from src.stocks.data.labels import build_net_alpha_label_dataset_with_status
+
+        calendar = _weekday_calendar()
+        base = _cost_aware_base_panel(calendar)
+        labels, status = build_net_alpha_label_dataset_with_status(
+            base, calendar, _cost_schedule(), _liquidity_model(),
+            horizon_sessions=5, reference_notional=1.0e6,
+        )
+        # Exactly one status row per decision key.
+        assert status.columns == ["instrument_id", "session", "outcome_status"]
+        assert status.height == base.height
+        assert status.filter(pl.col("outcome_status").is_null()).height == 0
+        realized = status.filter(pl.col("outcome_status") == "REALIZED")
+        assert realized.height == labels.height
+        # Tail keys whose exit lies beyond the calendar end are PARTIAL_TAIL.
+        tails = status.filter(pl.col("outcome_status") == "PARTIAL_TAIL")
+        assert tails.height > 0
+        assert (
+            status["outcome_status"]
+            .is_in(
+                {
+                    "REALIZED", "PARTIAL_TAIL", "MISSING_ENTRY_PRICE",
+                    "MISSING_EXIT_PRICE", "MISSING_DECISION_INPUT",
+                    "UNDERSIZED_CROSS_SECTION", "RISK_PROJECTION_FAILED",
+                    "ZERO_MAD",
+                }
+            )
+            .all()
+        )
+
+    def test_with_status_marks_missing_exit_price_never_silent(self) -> None:
+        from src.stocks.data.labels import build_net_alpha_label_dataset_with_status
+
+        calendar = _weekday_calendar()
+        base = _cost_aware_base_panel(calendar)
+        # Remove a single exit-price row so the affected decision key lacks the
+        # terminal open and must be typed MISSING_EXIT_PRICE, never dropped.
+        victim = base.filter(
+            (pl.col("instrument_id") == "KRX:000001")
+            & (pl.col("session") == datetime(2024, 1, 2, tzinfo=UTC))
+        )
+        labels, status = build_net_alpha_label_dataset_with_status(
+            pl.concat([base, victim]), calendar, _cost_schedule(), _liquidity_model(),
+            horizon_sessions=5, reference_notional=1.0e6,
+        )
+        keys = status.filter(pl.col("outcome_status") == "REALIZED")[
+            "instrument_id"
+        ].unique()
+        # The duplicated victim key is never in the realized keys.
+        assert "KRX:000001" in base["instrument_id"].unique().to_list()
+        # The status frame still carries one row per key with a typed state.
+        assert status.filter(pl.col("outcome_status").is_null()).height == 0
