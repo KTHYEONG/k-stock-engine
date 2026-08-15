@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_REALIZED_OUTCOME_INTEGRITY",
+      "date": "2026-08-15",
+      "adr_id": "ADR_20260815_ML_REALIZED_OUTCOME_INTEGRITY",
+      "domain": "stocks",
+      "title": "ML realized-outcome integrity",
+      "why": "Full production OOF replay showed positive Rank IC but every horizon was rejected because selected vintages lacked horizon-specific realized keys; the score universe was a label-derived cross-horizon union with no typed omission reason.",
+      "resolution": "Registered the evidence-based integrity specification: preserve the decision-time feature universe, separate future outcome status from eligibility, classify unresolved and partial-tail outcomes, keep replay fail-closed, and persist bounded policy-frontier diagnostics.",
+      "impact": "Prevents future-label selection bias and false cash/zero-fill evidence; enables future implementation to distinguish data coverage, evaluation structure, and replay logic while retaining auditable NO_TRADE results."
+    },
+    {
       "task_id": "TASK_ML_BACKTEST_BREAKTHROUGH",
       "date": "2026-08-15",
       "adr_id": "ADR_20260815_ML_BACKTEST_BREAKTHROUGH",

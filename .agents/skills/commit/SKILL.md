@@ -9,14 +9,20 @@ Ultra-fast automated git execution protocol. Includes a concise 1-line rationale
 
 ## Directives
 
-1. **Fast Inspection (No Full Diff)**:
-   - Inspect status using `git status --short`.
-   - Do NOT read full diff or run linter (`ruff`), type checker (`mypy`), or unit tests.
+1. **Zero Working-Tree Modification (STRICT IMMUTABILITY)**:
+   - Treat the current working tree state as 100% intentional by the user (As-Is).
+   - NEVER modify, recreate, edit, or revert any files.
+   - NEVER execute commands that alter the working tree state (e.g., `git restore`, `git checkout`, `git reset`, `git clean`, file writes/deletions).
+   - Stage deleted (`D`), modified (`M`), and untracked (`??`) files exactly as they currently exist.
 
-2. **Chained Execution**:
+2. **Fast Inspection (No Full Diff / No Verification)**:
+   - Inspect status using `git status --short`.
+   - Do NOT read full diff or run linters (`ruff`), type checkers (`mypy`), or unit tests (`pytest`).
+
+3. **Chained Execution**:
    - **Single Layer / Small Changes**: Stage and commit in a single chained shell command:
      ```bash
-     git add <files> && git commit -m "<type>: <Korean summary <= 50 chars>" -m "- **Why:** <Concise reason ending with ~함.>" && git log -n 1 --oneline
+     git add -A && git commit -m "<type>: <Korean summary <= 50 chars>" -m "- **Why:** <Concise reason ending with ~함.>" && git log -n 1 --oneline
      ```
    - **Multi-Layer / Large Changes**: If file paths cross distinct logical boundaries (e.g. `src/` vs `docs/` vs `tests/`), split by path boundaries and chain consecutive commits in one command:
      ```bash
