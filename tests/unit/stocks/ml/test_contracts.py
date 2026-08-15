@@ -85,3 +85,71 @@ def test_policy_portfolio_fingerprint_is_deterministic_and_sensitive() -> None:
     assert base != policy_portfolio_fingerprint(20, 0.2, 0.9, 0.005)
     assert base != policy_portfolio_fingerprint(20, 0.08, 1.0, 0.005)
     assert base != policy_portfolio_fingerprint(20, 0.08, 0.9, 0.01)
+
+def test_outcome_status_vocabulary_is_fixed_and_validated() -> None:
+    from src.stocks.ml.contracts import (
+        OUTCOME_PARTIAL_TAIL,
+        OUTCOME_REALIZED,
+        OUTCOME_STATUS_VOCABULARY,
+        RESOLVED_OUTCOME_STATUSES,
+        validate_outcome_status,
+    )
+
+    assert OUTCOME_REALIZED in OUTCOME_STATUS_VOCABULARY
+    assert OUTCOME_PARTIAL_TAIL in OUTCOME_STATUS_VOCABULARY
+    assert len(OUTCOME_STATUS_VOCABULARY) >= 9
+    assert RESOLVED_OUTCOME_STATUSES == (OUTCOME_REALIZED,)
+    assert validate_outcome_status(OUTCOME_REALIZED) == OUTCOME_REALIZED
+    assert validate_outcome_status(OUTCOME_PARTIAL_TAIL) == OUTCOME_PARTIAL_TAIL
+    with pytest.raises(ValueError, match="unknown outcome status"):
+        validate_outcome_status("FABRICATED_STATE")
+    with pytest.raises(ValueError, match="non-empty string"):
+        validate_outcome_status("")
+
+
+def test_outcome_status_counts_bounded_record() -> None:
+    from src.stocks.ml.contracts import (
+        OUTCOME_MISSING_EXIT_PRICE,
+        OUTCOME_PARTIAL_TAIL,
+        OUTCOME_REALIZED,
+        OutcomeStatusCounts,
+    )
+
+    counts = OutcomeStatusCounts.from_mapping(
+        {OUTCOME_REALIZED: 5, OUTCOME_MISSING_EXIT_PRICE: 3, OUTCOME_PARTIAL_TAIL: 1}
+    )
+    assert counts.realized == 5
+    assert counts.partial_tail == 1
+    assert counts.unresolved == 3
+    assert counts.count(OUTCOME_REALIZED) == 5
+    assert counts.to_json() == {
+        OUTCOME_MISSING_EXIT_PRICE: 3,
+        OUTCOME_PARTIAL_TAIL: 1,
+        OUTCOME_REALIZED: 5,
+    }
+    with pytest.raises(ValueError, match="unknown outcome status"):
+        OutcomeStatusCounts.from_mapping({"FABRICATED_STATE": 1})
+    with pytest.raises(ValueError, match="non-negative int"):
+        OutcomeStatusCounts.from_mapping({OUTCOME_REALIZED: -1})
+
+
+def test_horizon_join_evidence_records_decision_realized_status() -> None:
+    from src.stocks.ml.contracts import (
+        OUTCOME_REALIZED,
+        HorizonJoinEvidence,
+        OutcomeStatusCounts,
+    )
+
+    evidence = HorizonJoinEvidence(
+        horizon_sessions=5,
+        feature_rows=100,
+        label_rows=80,
+        joined_rows=80,
+        decision_rows=100,
+        realized_rows=80,
+        status_counts=OutcomeStatusCounts.from_mapping({OUTCOME_REALIZED: 80}),
+    )
+    assert evidence.decision_rows == 100
+    assert evidence.realized_rows == 80
+    assert evidence.status_counts is not None
+    assert evidence.status_counts.realized == 80
