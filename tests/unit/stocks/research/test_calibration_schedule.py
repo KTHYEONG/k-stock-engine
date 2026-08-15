@@ -250,3 +250,24 @@ def test_session_cluster_bootstrap_rejects_non_finite_group_sums() -> None:
     )
     assert means.shape == (25,)
     assert np.all(np.isfinite(means))
+
+
+def test_session_cluster_bootstrap_precomputed_cumsum_is_identical() -> None:
+    import numpy as np
+
+    from src.stocks.research.calibration_schedule import (
+        _session_cluster_bootstrap_means,
+    )
+
+    sums = np.asarray([0.5, -1.25, 2.0, 3.75, -0.5], dtype=float)
+    counts = np.asarray([250.0, 180.0, 320.0, 90.0, 400.0], dtype=float)
+    csum_sums = np.zeros(sums.size + 1, dtype=np.float64)
+    np.cumsum(sums, out=csum_sums[1:])
+    csum_counts = np.zeros(counts.size + 1, dtype=np.float64)
+    np.cumsum(counts, out=csum_counts[1:])
+    kwargs = {"block": 2, "n_blocks": 3, "max_start": 4, "n_bootstrap": 200, "seed": 11}
+    reference = _session_cluster_bootstrap_means(sums, counts, **kwargs)
+    incremental = _session_cluster_bootstrap_means(
+        sums, counts, csum_sums=csum_sums, csum_counts=csum_counts, **kwargs
+    )
+    assert np.array_equal(reference, incremental)

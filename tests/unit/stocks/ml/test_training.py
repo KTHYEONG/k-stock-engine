@@ -130,6 +130,36 @@ def test_select_elastic_alpha_recovers_linear_signal() -> None:
     assert alpha == pytest.approx(fraction * alpha_max)
 
 
+def test_compute_alpha_max_reuses_precomputed_standardized_design() -> None:
+    rng = np.random.default_rng(3)
+    rows: list[dict] = []
+    for s in range(40):
+        for t in range(10):
+            rows.append(  # noqa: PERF401
+                {
+                    "session_index": s,
+                    "session": datetime(2024, 1, 1, tzinfo=UTC),
+                    "instrument_id": f"KRX:{t:05d}",
+                    "feature__test_x": float(rng.normal(0.0, 1.0)),
+                    "feature__test_y": float(rng.normal(0.0, 1.0)),
+                    "net_alpha_target": float(rng.normal(0.0, 1.0)),
+                    "realized_net_return": 0.0,
+                }
+            )
+    fold_train = pl.DataFrame(rows)
+    columns = ("feature__test_x", "feature__test_y")
+    fraction = 0.1
+    fresh = training._compute_alpha_max(fold_train, columns, fraction, seed=7)
+    standardized = training._standardized_design(fold_train, columns)
+    precomputed = training._compute_alpha_max(
+        fold_train, columns, fraction, seed=7, standardized=standardized
+    )
+    assert fresh is not None
+    assert precomputed is not None
+    assert precomputed[0] == pytest.approx(fresh[0])
+    assert precomputed[1] == pytest.approx(fresh[1])
+
+
 def test_fit_oof_reports_fit_error_instead_of_swallowing() -> None:
     from src.stocks.ml.contracts import FoldScoreDiagnostic
 
