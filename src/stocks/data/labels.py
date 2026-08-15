@@ -800,6 +800,43 @@ def build_net_alpha_label_dataset(
     risk_fitted_<h>d, risk_residual_<h>d, reference_cost_<h>d,
     net_residual_o2o_<h>d, net_alpha_<h>d_target, label_available_time_<h>d``
     with no relevance column.
+
+    This is the realised-label projection of
+    :func:`build_net_alpha_label_dataset_with_status`; the two-return variant
+    also emits the outcome-status sidecar that classifies every rejected
+    decision key.
+    """
+    labels, _status = build_net_alpha_label_dataset_with_status(
+        base_panel,
+        calendar,
+        cost_schedule,
+        liquidity_model,
+        horizon_sessions=horizon_sessions,
+        reference_notional=reference_notional,
+    )
+    return labels
+
+
+def build_net_alpha_label_dataset_with_status(
+    base_panel: pl.DataFrame,
+    calendar: KRXSessionCalendar,
+    cost_schedule: CostSchedule,
+    liquidity_model: LiquiditySlippageModel,
+    *,
+    horizon_sessions: int,
+    reference_notional: float,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Build a net-alpha label horizon and its typed outcome-status sidecar.
+
+    The realised label frame is exactly the current :func:`build_net_alpha_label_dataset`
+    output. The status sidecar additionally emits exactly one row per decision
+    key ``(instrument_id, session)`` with a typed state from the fixed
+    vocabulary: ``REALIZED``, ``PARTIAL_TAIL`` (required exit beyond the
+    calendar tail), ``MISSING_ENTRY_PRICE``/``MISSING_EXIT_PRICE``,
+    ``MISSING_DECISION_INPUT`` (control unavailable), and the label
+    construction failures ``UNDERSIZED_CROSS_SECTION``, ``RISK_PROJECTION_FAILED``,
+    and ``ZERO_MAD``. A key is never silently dropped without a typed state, so
+    the outcome evidence remains economically evaluable.
     """
     if horizon_sessions <= 0:
         raise ValueError("horizon_sessions must be positive")
@@ -859,17 +896,31 @@ def build_net_alpha_label_dataset(
     panel = (
         panel.join(entries, on=[ID_COLUMN, "_entry_date"], how="left")
         .join(exits, on=[ID_COLUMN, "_exit_date"], how="left")
-        .filter(pl.col("_entry_open").is_not_null() & pl.col("_exit_open").is_not_null())
     )
+    panel = panel.with_columns(
+        pl.when(
+            pl.col("_entry_date").is_null() | pl.col("_exit_date").is_null()
+        )
+        .then(pl.lit("PARTIAL_TAIL"))
+        .when(pl.col("_entry_open").is_null())
+        .then(pl.lit("MISSING_ENTRY_PRICE"))
+        .when(pl.col("_exit_open").is_null())
+        .then(pl.lit("MISSING_EXIT_PRICE"))
+        .otherwise(pl.lit(None, dtype=pl.Utf8))
+        .alias("_tail_status")
+    )
+    complete = panel.filter(pl.col("_tail_status").is_null())
+    incomplete = panel.filter(pl.col("_tail_status").is_not_null())
     gross = pl.col("_exit_open").log() - pl.col("_entry_open").log()
-    panel = panel.with_columns(gross.alias("_gross"))
+    complete = complete.with_columns(gross.alias("_gross"))
     label_available = (
         pl.col("_exit_date")
         .dt.combine(pl.lit(_KRX_AVAILABLE_TIME))
         .dt.replace_time_zone("Asia/Seoul")
         .dt.convert_time_zone("UTC")
     )
-    panel = panel.with_columns(label_available.alias("_label_available"))
+    complete = complete.with_columns(label_available.alias("_label_available"))
+    panel = complete
 
     suffix = f"{horizon_sessions}d"
     gross_column = f"{COST_AWARE_GROSS_PREFIX}{suffix}"
@@ -886,6 +937,7 @@ def build_net_alpha_label_dataset(
     panel = panel.join(log_size, on=[ID_COLUMN, SESSION_COLUMN], how="left")
 
     rows: list[dict[str, object]] = []
+    status_rows: list[dict[str, object]] = []
     rejected_sessions: list[tuple[object, str]] = []
     for session_date in panel["_session_date"].unique().sort():
         session = panel.filter(pl.col("_session_date") == session_date)
@@ -901,8 +953,40 @@ def build_net_alpha_label_dataset(
             & pl.col("open").is_not_null()
             & (pl.col("open") > 0)
         )
+        session_status = session.with_columns(
+            pl.col("_gross")
+            .is_not_null()
+            .and_(pl.col("_gross").is_finite())
+            .and_(pl.col("_log_size").is_not_null())
+            .and_(pl.col("beta").is_not_null())
+            .and_(pl.col("volatility").is_not_null())
+            .and_(pl.col("adtv").is_not_null())
+            .and_(pl.col("adtv") > 0)
+            .and_(pl.col("sector").is_not_null())
+            .and_(pl.col("open").is_not_null())
+            .and_(pl.col("open") > 0)
+            .alias("_finite")
+        )
+        missing_input = session_status.filter(~pl.col("_finite"))
+        if not missing_input.is_empty():
+            status_rows.extend(
+                {
+                    ID_COLUMN: row[ID_COLUMN],
+                    SESSION_COLUMN: _as_utc_datetime(row[SESSION_COLUMN]),
+                    "outcome_status": "MISSING_DECISION_INPUT",
+                }
+                for row in missing_input.iter_rows(named=True)
+            )
         if finite.height < _MIN_NET_ALPHA_ROWS_PER_SESSION:
             rejected_sessions.append((session_date, "undersized"))
+            status_rows.extend(
+                {
+                    ID_COLUMN: row[ID_COLUMN],
+                    SESSION_COLUMN: _as_utc_datetime(row[SESSION_COLUMN]),
+                    "outcome_status": "UNDERSIZED_CROSS_SECTION",
+                }
+                for row in finite.iter_rows(named=True)
+            )
             continue
         design = _sector_design_matrix(
             np.asarray(finite["sector"].to_list(), dtype=object),
@@ -912,15 +996,39 @@ def build_net_alpha_label_dataset(
         )
         if design.shape[0] <= design.shape[1]:
             rejected_sessions.append((session_date, "rank-deficient"))
+            status_rows.extend(
+                {
+                    ID_COLUMN: row[ID_COLUMN],
+                    SESSION_COLUMN: _as_utc_datetime(row[SESSION_COLUMN]),
+                    "outcome_status": "RISK_PROJECTION_FAILED",
+                }
+                for row in finite.iter_rows(named=True)
+            )
             continue
         gross_values = np.asarray(finite["_gross"].to_list(), dtype=np.float64)
         if not np.all(np.isfinite(design)):
             rejected_sessions.append((session_date, "non-finite-design"))
+            status_rows.extend(
+                {
+                    ID_COLUMN: row[ID_COLUMN],
+                    SESSION_COLUMN: _as_utc_datetime(row[SESSION_COLUMN]),
+                    "outcome_status": "RISK_PROJECTION_FAILED",
+                }
+                for row in finite.iter_rows(named=True)
+            )
             continue
         try:
             fitted = _project_risk_return(design, gross_values)
         except ValueError:
             rejected_sessions.append((session_date, "risk-projection-failed"))
+            status_rows.extend(
+                {
+                    ID_COLUMN: row[ID_COLUMN],
+                    SESSION_COLUMN: _as_utc_datetime(row[SESSION_COLUMN]),
+                    "outcome_status": "RISK_PROJECTION_FAILED",
+                }
+                for row in finite.iter_rows(named=True)
+            )
             continue
         residual = gross_values - fitted
         adtvs = np.asarray(finite["adtv"].to_list(), dtype=np.float64)
@@ -949,6 +1057,14 @@ def build_net_alpha_label_dataset(
         mad = float(np.median(np.abs(net - median)))
         if not np.isfinite(mad) or mad <= 0.0:
             rejected_sessions.append((session_date, "zero-mad"))
+            status_rows.extend(
+                {
+                    ID_COLUMN: row[ID_COLUMN],
+                    SESSION_COLUMN: _as_utc_datetime(row[SESSION_COLUMN]),
+                    "outcome_status": "ZERO_MAD",
+                }
+                for row in finite.iter_rows(named=True)
+            )
             continue
         target = (net - median) / mad
         available_times = finite["_label_available"].to_list()
@@ -968,32 +1084,69 @@ def build_net_alpha_label_dataset(
             }
             for index in range(finite.height)
         )
+        status_rows.extend(
+            {
+                ID_COLUMN: row[ID_COLUMN],
+                SESSION_COLUMN: _as_utc_datetime(row[SESSION_COLUMN]),
+                "outcome_status": "REALIZED",
+            }
+            for row in finite.iter_rows(named=True)
+        )
+
+    if not incomplete.is_empty():
+        status_rows.extend(
+            {
+                ID_COLUMN: row[ID_COLUMN],
+                SESSION_COLUMN: _as_utc_datetime(row[SESSION_COLUMN]),
+                "outcome_status": row["_tail_status"],
+            }
+            for row in incomplete.iter_rows(named=True)
+        )
     if not rows:
         logger.info(
             "net-alpha label %s: no session cleared risk/cost/MAD gates",
             target_column,
         )
-        return pl.DataFrame(
-            schema={
-                ID_COLUMN: pl.Utf8,
-                SESSION_COLUMN: pl.Datetime("us", "UTC"),
-                gross_column: pl.Float64,
-                fitted_column: pl.Float64,
-                residual_column: pl.Float64,
-                cost_column: pl.Float64,
-                net_column: pl.Float64,
-                target_column: pl.Float64,
-                available_column: pl.Datetime("us", "UTC"),
+        labels = pl.DataFrame(
+            {
+                ID_COLUMN: pl.Series(dtype=pl.Utf8),
+                SESSION_COLUMN: pl.Series(dtype=pl.Datetime("us", "UTC")),
+                gross_column: pl.Series(dtype=pl.Float64),
+                fitted_column: pl.Series(dtype=pl.Float64),
+                residual_column: pl.Series(dtype=pl.Float64),
+                cost_column: pl.Series(dtype=pl.Float64),
+                net_column: pl.Series(dtype=pl.Float64),
+                target_column: pl.Series(dtype=pl.Float64),
+                available_column: pl.Series(dtype=pl.Datetime("us", "UTC")),
             }
         )
-    out = pl.DataFrame(rows)
+    else:
+        labels = pl.DataFrame(rows)
+    status_frame = pl.DataFrame(
+        status_rows,
+        schema={
+            ID_COLUMN: pl.Utf8,
+            SESSION_COLUMN: pl.Datetime("us", "UTC"),
+            "outcome_status": pl.Utf8,
+        },
+    ).sort([ID_COLUMN, SESSION_COLUMN])
+    unknown = status_frame.filter(
+        ~pl.col("outcome_status").is_in(
+            ("REALIZED", "PARTIAL_TAIL", "MISSING_ENTRY_PRICE",
+             "MISSING_EXIT_PRICE", "MISSING_DECISION_INPUT",
+             "UNDERSIZED_CROSS_SECTION", "RISK_PROJECTION_FAILED",
+             "ZERO_MAD", "UNSUPPORTED_CORPORATE_ACTION")
+        )
+    )
+    if not unknown.is_empty():
+        raise ValueError("net-alpha status sidecar emitted an unknown state")
     logger.info(
         "built net-alpha label %s: %s rows, rejected sessions %s",
         target_column,
-        out.height,
+        labels.height,
         rejected_sessions,
     )
-    return out
+    return labels, status_frame
 
 
 @dataclass(frozen=True, slots=True)
