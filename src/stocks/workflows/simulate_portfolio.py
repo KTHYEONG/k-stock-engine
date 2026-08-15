@@ -3,9 +3,18 @@
 The simulation workflow replays the *same* pure planner used by paper and live
 paths through ``StockBacktester``, so a historical replay step and a paper
 planning cycle produce identical target allocations for identical inputs.
+
+Policy equivalence: the trained artifact's selected ``policy_profile`` (id,
+no-trade band, and portfolio fingerprint) is the single source of truth. The
+backtester is always constructed from that profile, and a user request that
+explicitly diverges from it (different profile id, different band, or a
+different top-k/single-name/gross/participation fingerprint) raises
+``ValueError`` so the independent backtest can never silently use a different
+top-k/exposure/band than the OOF that selected the policy.
 """
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import cast
 
@@ -23,7 +32,9 @@ from src.stocks.backtesting.engine import (
 )
 from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.data.costs import CostEvidence
+from src.stocks.ml.contracts import policy_portfolio_fingerprint
 from src.stocks.research.artifacts import ModelArtifactRegistry
+from src.stocks.research.models import ModelManifest
 from src.stocks.trading.portfolio_constructor import StockRiskPolicy
 from src.stocks.workflows.contracts import SimulationRequest
 
@@ -36,24 +47,24 @@ def simulate_portfolio(
 ) -> BacktestResult:
     """Replay the trading cycle over the snapshot and return the ledger result.
 
-    ``cost_evidence`` is the hash-bound cost artifact resolved from the research
-    snapshot; when supplied the replay uses the dynamic liquidity slippage model
-    and statutory sell taxes instead of the static base/stress schedules.
+    The ``StockRiskPolicy`` is always constructed from the artifact's selected
+    ``policy_profile`` when the artifact carries one. A divergent explicit
+    request (profile id, no-trade band, or portfolio fingerprint) raises
+    ``ValueError``. ``cost_evidence`` is the hash-bound cost artifact resolved
+    from the research snapshot; when supplied the replay uses the dynamic
+    liquidity slippage model and statutory sell taxes instead of the static
+    base/stress schedules.
     """
     manifest = snapshot.manifest
     artifact_manifest = registry.read_manifest(request.artifact_id)
     eligible_from = datetime.fromisoformat(artifact_manifest.eligible_from)
     eligible_to = datetime.fromisoformat(artifact_manifest.eligible_to)
 
+    policy = _policy_from_artifact(artifact_manifest, request)
+
     frame = snapshot.frame
     sessions = sorted(frame["session"].unique().to_list())
     instruments = _instruments_from_frame(frame)
-    policy = StockRiskPolicy(
-        top_k=request.top_k,
-        gross_cap=request.max_exposure,
-        single_name_cap=request.max_single_weight,
-        participation_limit=request.participation_limit,
-    )
     base = request.cost_schedule or default_base_schedule()
     stress = request.stress_cost_schedule or default_stress_schedule()
     decision_indices = _decision_indices(sessions, eligible_from, eligible_to)
@@ -94,6 +105,104 @@ def simulate_portfolio(
     return backtester.run(
         frame, artifacts, initial_portfolio, backtest_request
     )
+
+
+def artifact_policy_profile(
+    registry: ModelArtifactRegistry, artifact_id: str
+) -> dict[str, object] | None:
+    """Return the artifact's selected ``policy_profile`` params, or ``None``.
+
+    ``None`` covers ``NO_TRADE`` and legacy artifacts that never recorded a
+    selected profile. Callers (e.g. the simulate CLI) use the returned profile
+    to build an exactly matching ``SimulationRequest``.
+    """
+    return _parse_policy_profile(registry.read_manifest(artifact_id))
+
+
+def _parse_policy_profile(
+    artifact_manifest: ModelManifest,
+) -> dict[str, object] | None:
+    """Parse the immutable ``policy_profile`` params, or ``None`` when absent."""
+    raw = artifact_manifest.params or {}
+    payload = raw.get("policy_profile")
+    if not payload:
+        return None
+    if not isinstance(payload, str):
+        raise ValueError("manifest policy_profile must be a JSON string")
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"manifest policy_profile is malformed: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("manifest policy_profile must be a JSON object")
+    return parsed
+
+
+def _policy_from_artifact(
+    artifact_manifest: ModelManifest, request: SimulationRequest
+) -> StockRiskPolicy:
+    """Construct the operational policy from the artifact's selected profile.
+
+    When the artifact carries no ``policy_profile`` (e.g. a ``NO_TRADE`` or
+    legacy artifact), the request's own caps are used unchanged. When it does,
+    the artifact profile is the single source of truth and any divergent
+    explicit request raises ``ValueError``.
+    """
+    profile = _parse_policy_profile(artifact_manifest)
+    if profile is None:
+        return StockRiskPolicy(
+            top_k=request.top_k,
+            gross_cap=request.max_exposure,
+            single_name_cap=request.max_single_weight,
+            participation_limit=request.participation_limit,
+            no_trade_band_bps=request.no_trade_band_bps or 0.0,
+        )
+    _validate_request_policy(request, profile)
+    return StockRiskPolicy(
+        top_k=cast(int, profile["top_k"]),
+        gross_cap=cast(float, profile["max_exposure"]),
+        single_name_cap=cast(float, profile["max_single_weight"]),
+        participation_limit=cast(float, profile["participation_limit"]),
+        no_trade_band_bps=cast(float, profile["no_trade_band_bps"]),
+    )
+
+
+def _validate_request_policy(
+    request: SimulationRequest, profile: dict[str, object]
+) -> None:
+    """Fail closed when an explicit request diverges from the artifact profile."""
+    if (
+        request.policy_profile_id is not None
+        and request.policy_profile_id != profile["profile_id"]
+    ):
+        raise ValueError(
+            "portfolio simulation policy_profile_id "
+            f"{request.policy_profile_id!r} diverges from the artifact profile "
+            f"{profile['profile_id']!r}"
+        )
+    artifact_band = cast(float, profile["no_trade_band_bps"])
+    if (
+        request.no_trade_band_bps is not None
+        and abs(request.no_trade_band_bps - artifact_band) > 1e-12
+    ):
+        raise ValueError(
+            "portfolio simulation no_trade_band_bps "
+            f"{request.no_trade_band_bps} diverges from the artifact band "
+            f"{artifact_band}"
+        )
+    request_fingerprint = policy_portfolio_fingerprint(
+        request.top_k,
+        request.max_single_weight,
+        request.max_exposure,
+        request.participation_limit,
+    )
+    if request_fingerprint != profile["portfolio_fingerprint"]:
+        raise ValueError(
+            "portfolio simulation portfolio caps diverge from the artifact "
+            "policy profile; the independent backtester must use the same "
+            "top-k/max_single_weight/max_exposure/participation_limit as the "
+            "OOF that selected the policy"
+        )
 
 
 def _decision_indices(
