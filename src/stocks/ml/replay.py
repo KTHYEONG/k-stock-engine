@@ -35,7 +35,13 @@ import numpy as np
 import polars as pl
 
 from src.core.costs import CostSchedule, LiquiditySlippageModel, default_base_schedule
-from src.stocks.ml.contracts import PortfolioSettings, RiskSettings
+from src.stocks.ml.contracts import (
+    OUTCOME_PARTIAL_TAIL,
+    OUTCOME_REALIZED,
+    OUTCOME_STATUS_COLUMN,
+    PortfolioSettings,
+    RiskSettings,
+)
 from src.stocks.ml.labels import ID_COLUMN, RISK_RESIDUAL_COLUMN, SESSION_COLUMN
 from src.stocks.ml.models import SCORE_COLUMN
 
@@ -90,7 +96,12 @@ class ReplaySegmentDiagnostic:
     ``cash_vintage_count``, ``missing_realized_vintage_count``, and
     ``partial_vintage_count`` partition the segment's vintages; the accounting
     invariant ``matured + cash + missing + partial == scored_sessions`` always
-    holds and is validated by the replay. ``base_active_fraction`` and
+    holds and is validated by the replay. ``unresolved_outcome_counts`` is the
+    bounded per-status-signature breakdown of the missing-realized vintages
+    (its sum equals ``missing_realized_vintage_count``). A signature contains
+    every distinct unresolved order state for one vintage in sorted order, so
+    multi-name orders neither over-count a vintage nor hide mixed causes.
+    ``base_active_fraction`` and
     ``stress_active_fraction`` are the matured/observed active fraction; the
     order and maturity timeline is cost-independent, so a base and a stress
     replay of the same calibrated panel report identical diagnostics.
@@ -107,6 +118,7 @@ class ReplaySegmentDiagnostic:
     partial_vintage_count: int
     base_active_fraction: float
     stress_active_fraction: float
+    unresolved_outcome_counts: tuple[tuple[str, int], ...] = ()
 
     @property
     def evaluated_vintage_count(self) -> int:
@@ -132,6 +144,9 @@ class ReplaySegmentDiagnostic:
             "cash_vintage_count": int(self.cash_vintage_count),
             "missing_realized_vintage_count": int(self.missing_realized_vintage_count),
             "partial_vintage_count": int(self.partial_vintage_count),
+            "unresolved_outcome_counts": {
+                str(status): int(count) for status, count in self.unresolved_outcome_counts
+            },
             "base_active_fraction": round(float(self.base_active_fraction), 12),
             "stress_active_fraction": round(float(self.stress_active_fraction), 12),
         }
@@ -170,6 +185,7 @@ class ReplayEvaluation:
     cash_vintage_count: int = 0
     missing_realized_vintage_count: int = 0
     partial_vintage_count: int = 0
+    unresolved_outcome_counts: tuple[tuple[str, int], ...] = ()
     segment_diagnostics: tuple[ReplaySegmentDiagnostic, ...] = ()
 
     @property
@@ -232,6 +248,9 @@ class ReplayEvaluation:
             "active_cohort_count": int(self.active_cohort_count),
             "missing_realized_cohort_count": int(self.missing_realized_cohort_count),
             "partial_cohort_count": int(self.partial_cohort_count),
+            "unresolved_outcome_counts": {
+                str(status): int(count) for status, count in self.unresolved_outcome_counts
+            },
             "period_net_returns": [float(value) for value in self.period_net_returns],
             "segments": [diag.to_json() for diag in self.segment_diagnostics],
         }
@@ -279,6 +298,7 @@ class NetAlphaPolicyReplay:
         *,
         decision_time: datetime | None = None,
         segment_column: str | None = None,
+        status: pl.DataFrame | None = None,
     ) -> ReplayEvaluation:
         """Evaluate the scored OOF panel through the common policy.
 
@@ -300,6 +320,14 @@ class NetAlphaPolicyReplay:
                 vintages whose maturity leaves the segment are counted per
                 segment as partial. When absent the replay is equivalent to one
                 single segment (continuous holdout, paper, and live behavior).
+            status: optional typed outcome-status projection carrying
+                ``instrument_id``, ``session``, and ``outcome_status`` for every
+                score key. A selected order with a ``REALIZED`` status is
+                evaluated normally; ``PARTIAL_TAIL`` inside a mature segment is
+                a ``ValueError`` (only the segment-local maturity rule may
+                classify a tail); every other typed state increments the
+                ``unresolved_outcome_counts`` of the owning vintage and is never
+                zero-filled or silently omitted.
 
         Returns:
             An immutable ``ReplayEvaluation`` with deterministic ``orders``.
@@ -307,8 +335,9 @@ class NetAlphaPolicyReplay:
         Raises:
             ValueError: for a missing scored column, a non-empty realized frame
                 that lacks canonical columns, carries non-finite outcomes, or
-                repeats keys, or when a realized replay has no liquidity model
-                or cost coverage.
+                repeats keys, a realized replay without liquidity model or cost
+                coverage, a ``PARTIAL_TAIL`` status inside a mature segment, or
+                a score key absent from a supplied status projection.
         """
         del decision_time
         required = (_ID, _SESSION, SCORE_COLUMN)
@@ -338,6 +367,40 @@ class NetAlphaPolicyReplay:
                     "volatility_20d": float(row["volatility_20d"]),
                 }
             realized_sessions = set(realized[_SESSION].to_list())
+
+        status_by_key: dict[tuple[str, object], str] = {}
+        if status is not None and not status.is_empty():
+            missing = [
+                c for c in (_ID, _SESSION, OUTCOME_STATUS_COLUMN)
+                if c not in status.columns
+            ]
+            if missing:
+                raise ValueError(f"status projection missing columns {missing}")
+            for row in status.select(_ID, _SESSION, OUTCOME_STATUS_COLUMN).iter_rows(
+                named=True
+            ):
+                state = str(row[OUTCOME_STATUS_COLUMN])
+                if state not in {
+                    "REALIZED", "PARTIAL_TAIL", "MISSING_ENTRY_PRICE",
+                    "MISSING_EXIT_PRICE", "MISSING_DECISION_INPUT",
+                    "UNDERSIZED_CROSS_SECTION", "RISK_PROJECTION_FAILED",
+                    "ZERO_MAD", "UNSUPPORTED_CORPORATE_ACTION",
+                }:
+                    raise ValueError(f"unknown outcome status {state!r} in projection")
+                key = (str(row[_ID]), row[_SESSION])
+                if key in status_by_key and status_by_key[key] != state:
+                    raise ValueError(
+                        f"status projection maps score key {key} to conflicting "
+                        f"states {status_by_key[key]!r}/{state!r}"
+                    )
+                status_by_key[key] = state
+            realized_sessions = {
+                row[_SESSION]
+                for row in status.select(_ID, _SESSION, OUTCOME_STATUS_COLUMN)
+                .filter(pl.col(OUTCOME_STATUS_COLUMN) == OUTCOME_REALIZED)
+                .select(_SESSION)
+                .iter_rows(named=True)
+            }
 
         portfolio = self._portfolio
         all_sessions = sorted(oof_scores[_SESSION].unique().to_list())
@@ -468,6 +531,9 @@ class NetAlphaPolicyReplay:
         segment_counts: dict[int, list[int]] = {
             segment: [0, 0, 0, 0] for segment in segment_lengths
         }
+        segment_unresolved: dict[int, dict[str, int]] = {
+            segment: {} for segment in segment_lengths
+        }
         for position, session in enumerate(all_sessions):
             segment, local_pos = session_segment[session]
             counts = segment_counts[segment]
@@ -478,12 +544,27 @@ class NetAlphaPolicyReplay:
             members = orders_by_session.get(session, [])
             if members:
                 growth: list[float] = []
+                unresolved_states: set[str] = set()
                 complete = True
                 for order in members:
-                    realized_value = realized_by_key.get(
-                        (order.instrument_id, order.decision_session)
-                    )
+                    key = (order.instrument_id, order.decision_session)
+                    outcome_state: str | None = status_by_key.get(key)
+                    if outcome_state == OUTCOME_PARTIAL_TAIL:
+                        raise ValueError(
+                            f"selected order {key} carries PARTIAL_TAIL inside a "
+                            "mature segment; only the segment-local maturity rule "
+                            "may classify a chronological tail"
+                        )
+                    if outcome_state not in (None, OUTCOME_REALIZED):
+                        unresolved_states.add(str(outcome_state))
+                        complete = False
+                        continue
+                    realized_value = realized_by_key.get(key)
                     if realized_value is None:
+                        if outcome_state == OUTCOME_REALIZED:
+                            raise ValueError(
+                                f"REALIZED status {key} has no replay outcome inputs"
+                            )
                         complete = False
                         break
                     cost_rate = self._realized_cost(
@@ -493,6 +574,11 @@ class NetAlphaPolicyReplay:
                 if not complete or len(growth) != len(members):
                     missing_realized += 1
                     counts[2] += 1
+                    if unresolved_states:
+                        signature = "|".join(sorted(unresolved_states))
+                        segment_unresolved[segment][signature] = (
+                            segment_unresolved[segment].get(signature, 0) + 1
+                        )
                     continue
                 net_return = float(np.mean(growth))
                 period_returns.append(net_return)
@@ -522,6 +608,24 @@ class NetAlphaPolicyReplay:
 
         diagnostics = self._segment_diagnostics(
             session_counts, segment_lengths, segment_counts,
+            segment_unresolved=(
+                segment_unresolved if status_by_key else None
+            ),
+        )
+        total_unresolved = tuple(
+            sorted(
+                {
+                    state: sum(
+                        segment_unresolved[segment].get(state, 0)
+                        for segment in segment_unresolved
+                    )
+                    for state in {
+                        state
+                        for segment in segment_unresolved.values()
+                        for state in segment
+                    }
+                }.items()
+            )
         )
         return ReplayEvaluation(
             orders=tuple(orders),
@@ -533,6 +637,7 @@ class NetAlphaPolicyReplay:
             calibration_ready_sessions=calibration_ready_session_count,
             realized_sessions=len(realized_sessions),
             eligible_sessions=eligible_sessions,
+            unresolved_outcome_counts=total_unresolved,
             active_sessions=active_session_count,
             matured_vintage_count=matured,
             cash_vintage_count=cash,
@@ -571,13 +676,19 @@ class NetAlphaPolicyReplay:
         session_counts: dict[int, list[int]],
         segment_lengths: dict[int, int],
         segment_counts: dict[int, list[int]],
+        *,
+        segment_unresolved: dict[int, dict[str, int]] | None = None,
     ) -> tuple[ReplaySegmentDiagnostic, ...]:
         """Assemble and validate the bounded per-segment accounting diagnostics.
 
         Each segment's ``matured + cash + missing + partial`` partition must
         equal its ``scored_sessions``; a broken accounting relation raises
         ``ValueError`` because the diagnostic contract is an invariant.
+        ``segment_unresolved`` optionally carries vintage-level unresolved
+        status-signature counts per segment; when supplied, its per-segment sum
+        must equal the segment's missing-realized count.
         """
+        unresolved = segment_unresolved or {}
         diagnostics: list[ReplaySegmentDiagnostic] = []
         for segment in sorted(segment_counts):
             matured, cash, missing, partial = segment_counts[segment]
@@ -593,6 +704,14 @@ class NetAlphaPolicyReplay:
             active_fraction = (
                 float(matured / observed) if observed > 0 else 0.0
             )
+            typed = tuple(sorted(unresolved.get(segment, {}).items()))
+            if segment_unresolved is not None and (
+                sum(count for _state, count in typed) != missing
+            ):
+                raise ValueError(
+                    f"segment {segment} typed unresolved counts {typed} do not "
+                    f"sum to missing-realized {missing}"
+                )
             diagnostics.append(
                 ReplaySegmentDiagnostic(
                     segment_id=segment,
@@ -606,6 +725,7 @@ class NetAlphaPolicyReplay:
                     partial_vintage_count=partial,
                     base_active_fraction=active_fraction,
                     stress_active_fraction=active_fraction,
+                    unresolved_outcome_counts=typed,
                 )
             )
         return tuple(diagnostics)
