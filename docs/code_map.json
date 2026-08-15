@@ -361,6 +361,9 @@
     "testing": "tests/unit/stocks/research/test_lambdarank.py"
   },
   "src/stocks/ml/training.py": {
-    "testing": "tests/unit/stocks/workflows/test_train_model.py"
+    "testing": [
+      "tests/unit/stocks/workflows/test_train_model.py",
+      "tests/unit/stocks/ml/test_training.py"
+    ]
   }
 }
