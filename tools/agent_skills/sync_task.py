@@ -160,6 +160,50 @@ def _clean_scratch_dir() -> int:
     return count
 
 
+def _clean_tmp_dir() -> int:
+    tmp_dir = "tmp"
+    if not os.path.exists(tmp_dir):
+        return 0
+    count = 0
+    for root, dirs, files in os.walk(tmp_dir, topdown=False):
+        for f in files:
+            if f == ".gitignore":
+                continue
+            fpath = os.path.join(root, f)
+            try:
+                os.remove(fpath)
+                count += 1
+            except OSError:
+                pass
+        for d in dirs:
+            dpath = os.path.join(root, d)
+            with contextlib.suppress(OSError):
+                os.rmdir(dpath)
+    return count
+
+
+def _clean_logs_dir() -> int:
+    logs_dir = "logs"
+    if not os.path.exists(logs_dir):
+        return 0
+    count = 0
+    for root, dirs, files in os.walk(logs_dir, topdown=False):
+        for f in files:
+            if f == ".gitignore":
+                continue
+            fpath = os.path.join(root, f)
+            try:
+                os.remove(fpath)
+                count += 1
+            except OSError:
+                pass
+        for d in dirs:
+            dpath = os.path.join(root, d)
+            with contextlib.suppress(OSError):
+                os.rmdir(dpath)
+    return count
+
+
 def _clean_specs(remove_specs: list[str] | None = None) -> int:
     specs_dir = "docs/specs"
     if not _path_exists(specs_dir):
@@ -258,12 +302,17 @@ def main() -> None:
         gen_code_map.main()
 
 
-    # 3. Temp & Scratch Wipe
+    # 3. Temp & Scratch & Logs Wipe
     try:
         wiped = _wipe_temp_artifacts()
         scratch_wiped = _clean_scratch_dir()
-        if wiped > 0 or scratch_wiped > 0:
-            logs.append(f"Wiped {wiped} temp, {scratch_wiped} scratch files")
+        tmp_wiped = _clean_tmp_dir()
+        logs_wiped = _clean_logs_dir()
+        total_cleaned = wiped + scratch_wiped + tmp_wiped + logs_wiped
+        if total_cleaned > 0:
+            logs.append(
+                f"Wiped {wiped} temp, {scratch_wiped} scratch, {tmp_wiped} tmp, {logs_wiped} logs files"
+            )
     except Exception as e:
         errors.append(f"Temp wipe failed: {e}")
 
