@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import numpy as np
 import polars as pl
 
 from src.core.costs import CostSchedule, LiquiditySlippageModel
@@ -176,6 +177,126 @@ class NetAlphaResearchData:
                 raise ValueError(
                     f"NetAlphaResearchData horizon {horizon} label frame is empty"
                 )
+
+
+@dataclass(frozen=True, slots=True)
+class RegularizationGrid:
+    """Pre-registered scale-invariant ElasticNet penalty fractions.
+
+    The selector evaluates these fractions of the fold-local ``alpha_max``
+    (``max(abs(X.T @ y)) / n`` on a centered target and standardized design)
+    instead of a fixed absolute penalty, so the chosen strength is invariant to
+    target units.
+    """
+
+    fractions: tuple[float, ...] = (0.01, 0.03, 0.10, 0.30)
+
+    def __post_init__(self) -> None:
+        if not self.fractions:
+            raise ValueError("fractions must be non-empty")
+        if any(not np.isfinite(f) or f <= 0.0 for f in self.fractions):
+            raise ValueError("fractions must be finite and positive")
+        if tuple(self.fractions) != tuple(sorted(set(self.fractions))):
+            raise ValueError("fractions must be strictly ascending and unique")
+
+
+@dataclass(frozen=True, slots=True)
+class FoldScoreDiagnostic:
+    """One purged fold's target-free prediction diagnostics.
+
+    Carries the fold score standard deviation, finite/unique prediction counts,
+    the fold-local regularization metadata selected by the nested ElasticNet
+    selector, and a deterministic failure reason. The reason is the empty string
+    when the fold produced usable non-constant predictions; expected invalid
+    inputs are classified here (``fit-error:...``, ``constant-oof-score``, ...)
+    so the ``ValueError`` is never silently swallowed.
+    """
+
+    fold_index: int
+    score_std: float = 0.0
+    finite_count: int = 0
+    unique_count: int = 0
+    rank_ic: float = 0.0
+    alpha: float | None = None
+    fraction: float | None = None
+    alpha_max: float | None = None
+    failure_reason: str = ""
+
+    def __post_init__(self) -> None:
+        if self.fold_index < 0:
+            raise ValueError("fold_index must be non-negative")
+        if self.finite_count < 0 or self.unique_count < 0:
+            raise ValueError("finite/unique counts must be non-negative")
+        if not np.isfinite(self.score_std) or self.score_std < 0.0:
+            raise ValueError("score_std must be a finite non-negative value")
+        if not np.isfinite(self.rank_ic):
+            raise ValueError("rank_ic must be finite")
+        for name in ("alpha", "fraction", "alpha_max"):
+            value = getattr(self, name)
+            if value is not None and not np.isfinite(value):
+                raise ValueError(f"{name} must be finite when supplied")
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "fold_index": int(self.fold_index),
+            "score_std": round(float(self.score_std), 12),
+            "finite_count": int(self.finite_count),
+            "unique_count": int(self.unique_count),
+            "rank_ic": round(float(self.rank_ic), 12),
+            "alpha": None if self.alpha is None else round(float(self.alpha), 12),
+            "fraction": None if self.fraction is None else round(float(self.fraction), 12),
+            "alpha_max": None if self.alpha_max is None else round(float(self.alpha_max), 12),
+            "failure_reason": self.failure_reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class HorizonOOFDiagnostic:
+    """Aggregated per-horizon OOF diagnostics for one model family."""
+
+    horizon_sessions: int
+    model_family: str
+    fold_diagnostics: tuple[FoldScoreDiagnostic, ...] = ()
+    failure_reason: str = ""
+
+    def __post_init__(self) -> None:
+        if self.horizon_sessions < 1:
+            raise ValueError("horizon_sessions must be a positive session count")
+        if not self.model_family:
+            raise ValueError("model_family must be non-empty")
+
+    @property
+    def fold_score_stds(self) -> tuple[float, ...]:
+        return tuple(diag.score_std for diag in self.fold_diagnostics)
+
+    @property
+    def fold_finite_counts(self) -> tuple[int, ...]:
+        return tuple(diag.finite_count for diag in self.fold_diagnostics)
+
+    @property
+    def fold_unique_counts(self) -> tuple[int, ...]:
+        return tuple(diag.unique_count for diag in self.fold_diagnostics)
+
+    @property
+    def fold_rank_ics(self) -> tuple[float, ...]:
+        return tuple(diag.rank_ic for diag in self.fold_diagnostics)
+
+    @property
+    def usable_fold_count(self) -> int:
+        return sum(1 for diag in self.fold_diagnostics if not diag.failure_reason)
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "horizon_sessions": int(self.horizon_sessions),
+            "model_family": self.model_family,
+            "fold_score_stds": [round(float(v), 12) for v in self.fold_score_stds],
+            "fold_finite_counts": [int(v) for v in self.fold_finite_counts],
+            "fold_unique_counts": [int(v) for v in self.fold_unique_counts],
+            "fold_rank_ics": [round(float(v), 12) for v in self.fold_rank_ics],
+            "usable_fold_count": int(self.usable_fold_count),
+            "failure_reason": self.failure_reason,
+            "folds": [diag.to_json() for diag in self.fold_diagnostics],
+        }
 
 
 @dataclass(frozen=True, slots=True)
