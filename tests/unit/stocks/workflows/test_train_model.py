@@ -16,7 +16,11 @@ import pytest
 
 from src.core.instruments import AssetKind
 from src.stocks.data.contracts import DatasetSnapshot
-from src.stocks.ml.contracts import NetAlphaTrainingRequest
+from src.stocks.ml.contracts import (
+    CompoundingCertificationSettings,
+    NetAlphaTrainingRequest,
+    RiskSettings,
+)
 from src.stocks.ml.features import build_model_features, stock_net_alpha_v1_roles
 from src.stocks.research.artifacts import (
     METRICS_FILENAME,
@@ -56,6 +60,46 @@ def _request(artifact_id: str, **kwargs) -> NetAlphaTrainingRequest:
     return NetAlphaTrainingRequest(**defaults)
 
 
+def _compound_request(artifact_id: str, **kwargs) -> NetAlphaTrainingRequest:
+    """Request tuned to certify a 300-session synthetic fixture holdout."""
+    defaults = {
+        "artifact_id": artifact_id,
+        "fold_count": 2,
+        "candidate_horizon_sessions": (3, 5, 8, 10, 15, 20),
+        "bootstrap_resamples": 50,
+        "liquidity_model": stock_liquidity_model(),
+        "risk": RiskSettings(min_calibration_sessions=40),
+        "compounding": CompoundingCertificationSettings(
+            min_observed_sessions=40,
+            min_active_cohort_fraction=0.5,
+            max_drawdown=0.5,
+        ),
+    }
+    defaults.update(kwargs)
+    return NetAlphaTrainingRequest(**defaults)
+
+
+def _holdout_eligibility(
+    df: pl.DataFrame, primary_horizon_sessions: int
+) -> tuple[str, str]:
+    """First/last realized holdout sessions for the selected primary horizon.
+
+    ``eligible_from`` is the first raw holdout session; ``eligible_to`` is the
+    last session whose label is available at the decision time (``session +
+    horizon days <= last session``), i.e. the last realized holdout session.
+    """
+    from datetime import timedelta
+
+    sessions = sorted(df["session"].unique().to_list())
+    holdout_count = max(1, len(sessions) // 5)
+    holdout_start = sessions[-holdout_count]
+    last = sessions[-1]
+    return (
+        holdout_start.isoformat(),
+        (last - timedelta(days=primary_horizon_sessions)).isoformat(),
+    )
+
+
 def _feature_frame(df: pl.DataFrame) -> pl.DataFrame:
     """Build the canonical learner frame exactly as the trainer consumes it."""
     drops = [
@@ -78,7 +122,8 @@ def test_train_net_alpha_publishes_artifact_or_no_trade(tmp_path) -> None:
         "net_alpha_lightgbm_l1",
         "no_trade",
     }
-    assert manifest.eligible_from == df["session"].min().isoformat()
+    if manifest.model_type == "no_trade":
+        assert manifest.eligible_from == df["session"].min().isoformat()
     if manifest.model_type != "no_trade":
         stored = json.loads(
             (tmp_path / "artifacts" / "na_mainline" / "manifest.json").read_text()
@@ -103,6 +148,56 @@ def test_train_net_alpha_publishes_artifact_or_no_trade(tmp_path) -> None:
         holdout = registry.read_forward_holdout(manifest.artifact_id)
         assert holdout is not None
         assert holdout.get("evidence", {}).get("passed") is True
+
+
+def test_train_net_alpha_promoted_eligibility_is_forward_holdout(tmp_path) -> None:
+    """A promoted artifact is eligible only over its realized holdout interval."""
+    snapshot, df = _snapshot(n_sessions=300)
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    manifest = train_model(
+        snapshot, registry, _compound_request("na_holdout_elig")
+    )
+    if manifest.model_type == "no_trade":
+        return
+    metrics = json.loads(
+        (tmp_path / "artifacts" / "na_holdout_elig" / "metrics.json").read_text()
+    )
+    primary = metrics["primary_horizon_sessions"]
+    holdout_from, holdout_to = _holdout_eligibility(df, primary)
+    assert manifest.eligible_from == holdout_from
+    assert manifest.eligible_to == holdout_to
+    assert manifest.eligible_from != df["session"].min().isoformat()
+    holdout = metrics["holdout"]
+    assert holdout["eligibility"]["eligible_from"] == holdout_from
+    assert holdout["eligibility"]["eligible_to"] == holdout_to
+    assert holdout["certificate"]["passed"] is True
+    assert holdout["certificate"]["base"]["passed"] is True
+    assert holdout["certificate"]["stress"]["passed"] is True
+    assert holdout["certificate"]["base"]["cagr"] > 0.0
+    assert holdout["certificate"]["base"]["lower_cagr"] > 0.0
+    assert holdout["certificate"]["stress"]["cagr"] > 0.0
+    assert holdout["certificate"]["stress"]["lower_cagr"] > 0.0
+    assert holdout["cohorts"]["observed_sessions"] >= 40
+    assert holdout["cohorts"]["active_cohort_count"] > 0
+    assert holdout["cohorts"]["missing_realized_cohorts"] == 0
+
+
+def test_train_net_alpha_no_trade_diagnostics_are_explicit(tmp_path) -> None:
+    """A failed holdout publishes explicit no-trade diagnostics, never a gate."""
+    snapshot, _df = _snapshot()
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    manifest = train_model(snapshot, registry, _request("na_no_trade_diag"))
+    assert manifest.model_type == "no_trade"
+    metrics = json.loads(
+        (tmp_path / "artifacts" / "na_no_trade_diag" / "metrics.json").read_text()
+    )
+    holdout = metrics.get("holdout")
+    if holdout is not None:
+        assert holdout["passed"] is False
+        reason = holdout["reason"]
+        assert reason.startswith(("holdout-", "holdout-replay-"))
+        assert "certificate" in holdout
+        assert "cohorts" in holdout
 
 
 def test_train_net_alpha_writes_complete_no_trade_evidence(tmp_path) -> None:
