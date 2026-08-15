@@ -50,6 +50,7 @@ class CatalogKind(StrEnum):
     BASE_PANEL = "base_panel"
     FEATURES = "features"
     LABELS = "labels"
+    OUTCOME_STATUS = "outcome_status"
     SNAPSHOT = "snapshot"
 
 
@@ -304,6 +305,7 @@ class ResearchDataSnapshot:
     base_panel: CatalogEntry
     features: CatalogEntry | None
     labels: CatalogEntry | None
+    outcome_status: CatalogEntry | None
     calendar: CatalogEntry | None
     master: CatalogEntry | None
     corporate_actions: CatalogEntry | None
@@ -313,6 +315,17 @@ class ResearchDataSnapshot:
     @property
     def research_range(self) -> CoverageRange:
         return self.manifest.windows.research_range
+
+    @property
+    def status_provenance(self) -> str:
+        """Pinned vs legacy-inferred outcome-status provenance.
+
+        ``pinned`` means the snapshot manifest declares a hash-bound
+        ``OUTCOME_STATUS`` reference. ``legacy-inferred`` means no status
+        artifact is pinned (a legacy snapshot): it is diagnostic-only and must
+        never be promoted for certified training/backtesting.
+        """
+        return "pinned" if self.outcome_status is not None else "legacy-inferred"
 
     def reference(self, kind: CatalogKind) -> CatalogEntry | None:
         for entry in self.manifest.references:
@@ -343,11 +356,13 @@ class SnapshotResolver:
         references = self._resolve_references(manifest)
         self._assert_range_complete(manifest, references)
         self._assert_evidence(manifest, references)
+        self._assert_status_reference(manifest, references)
         return ResearchDataSnapshot(
             manifest=manifest,
             base_panel=references[CatalogKind.BASE_PANEL],
             features=references.get(CatalogKind.FEATURES),
             labels=references.get(CatalogKind.LABELS),
+            outcome_status=references.get(CatalogKind.OUTCOME_STATUS),
             calendar=references.get(CatalogKind.CALENDAR),
             master=references.get(CatalogKind.INSTRUMENT_MASTER),
             corporate_actions=references.get(CatalogKind.CORPORATE_ACTIONS),
@@ -451,6 +466,34 @@ class SnapshotResolver:
                 raise ValueError(
                     f"{kind.value}:{entry.name} is not complete evidence"
                 )
+
+    def _assert_status_reference(
+        self, manifest: SnapshotManifest, references: dict[CatalogKind, CatalogEntry]
+    ) -> None:
+        """Require a pinned, complete outcome-status reference to certify.
+
+        A legacy snapshot without a pinned ``OUTCOME_STATUS`` reference stays
+        resolvable for diagnostic replay only; it can never be certified. A
+        certified snapshot must pin a hash-consistent, complete status entry so
+        no outcome is silently classified from a legacy fallback.
+        """
+        certification = manifest.certification
+        status = references.get(CatalogKind.OUTCOME_STATUS)
+        if certification is DatasetCertification.PROVISIONAL:
+            if status is not None and status.completeness is EvidenceCompleteness.CANDIDATE_ONLY:
+                raise ValueError(
+                    f"outcome_status:{status.name} is candidate_only and cannot be referenced"
+                )
+            return
+        if status is None:
+            raise ValueError(
+                f"{certification.value} snapshot requires a pinned outcome-status "
+                "reference; legacy-inferred status provenance cannot certify"
+            )
+        if status.completeness is not EvidenceCompleteness.COMPLETE:
+            raise ValueError(
+                f"outcome_status:{status.name} is not complete evidence and cannot certify"
+            )
 
 
 @dataclass(frozen=True, slots=True)
