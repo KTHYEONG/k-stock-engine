@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 import polars as pl
 
-from src.core.costs import CostSchedule
+from src.core.costs import CostSchedule, LiquiditySlippageModel
 from src.core.datasets import DatasetManifest
 
 DEFAULT_CANDIDATE_HORIZON_SESSIONS = (3, 5, 8, 10, 15, 20)
@@ -93,6 +93,7 @@ class NetAlphaTrainingRequest:
     risk: RiskSettings = field(default_factory=RiskSettings)
     base_cost_schedule: CostSchedule | None = None
     stress_cost_schedule: CostSchedule | None = None
+    liquidity_model: LiquiditySlippageModel | None = None
 
     def __post_init__(self) -> None:
         if not self.artifact_id:

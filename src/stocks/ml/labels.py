@@ -52,6 +52,7 @@ AVAILABLE_COLUMN = "label_available_time"
 GROSS_COLUMN = "gross_return"
 RISK_RESIDUAL_COLUMN = "risk_residual"
 REFERENCE_COST_COLUMN = "reference_cost"
+REALIZED_RETURN_COLUMN = "realized_net_return"
 
 
 def _horizon_suffix(horizon_sessions: int) -> str:
