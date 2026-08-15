@@ -894,10 +894,12 @@ def _replacement_references(
     source: ResearchDataSnapshot,
     feature_entry: CatalogEntry,
     label_entry: CatalogEntry,
+    status_entry: CatalogEntry | None = None,
 ) -> tuple[CatalogEntry, ...]:
-    """Source references with only FEATURES/LABELS replaced (or appended)."""
+    """Source references with FEATURES/LABELS/OUTCOME_STATUS replaced (or appended)."""
     replaced_features = False
     replaced_labels = False
+    replaced_status = False
     refs: list[CatalogEntry] = []
     for entry in source.manifest.references:
         if entry.kind is CatalogKind.FEATURES:
@@ -906,12 +908,18 @@ def _replacement_references(
         elif entry.kind is CatalogKind.LABELS:
             refs.append(label_entry)
             replaced_labels = True
+        elif entry.kind is CatalogKind.OUTCOME_STATUS:
+            if status_entry is not None:
+                refs.append(status_entry)
+                replaced_status = True
         else:
             refs.append(entry)
     if not replaced_features:
         refs.append(feature_entry)
     if not replaced_labels:
         refs.append(label_entry)
+    if status_entry is not None and not replaced_status:
+        refs.append(status_entry)
     return tuple(refs)
 
 
@@ -1131,7 +1139,7 @@ def materialize_net_alpha_snapshot(
         generated_time=request.generated_time,
     )
     label_manifest = label_result.manifest
-    publish_outcome_status_sidecar(
+    status_result = publish_outcome_status_sidecar(
         status_frame,
         destination_root=request.label_root,
         dataset_id=f"{request.label_dataset_id}{OUTCOME_STATUS_DATASET_SUFFIX}",
@@ -1178,23 +1186,57 @@ def materialize_net_alpha_snapshot(
         ),
         row_count=label_result.row_count,
     )
+    status_references: list[tuple[str, str]] = [
+        (CatalogKind.BASE_PANEL.value, base_entry.name),
+        (CatalogKind.CALENDAR.value, calendar_entry.name),
+        (CatalogKind.LABELS.value, request.label_dataset_id),
+    ]
+    if source.master is not None:
+        status_references.append(
+            (CatalogKind.INSTRUMENT_MASTER.value, source.master.name)
+        )
+    if source.corporate_actions is not None:
+        status_references.append(
+            (CatalogKind.CORPORATE_ACTIONS.value, source.corporate_actions.name)
+        )
+    status_references.append((CatalogKind.COSTS.value, cost_entry.name))
+    status_entry = CatalogEntry(
+        kind=CatalogKind.OUTCOME_STATUS,
+        name=status_result.dataset_id,
+        content_hash=status_result.manifest.content_hash,
+        schema_hash=status_result.manifest.schema_hash,
+        registered_at=request.generated_time,
+        coverage=CoverageRange(
+            start=status_result.manifest.time_start.date(),
+            end=status_result.manifest.time_end.date(),
+        ),
+        completeness=EvidenceCompleteness.COMPLETE,
+        path=str(request.label_root / status_result.dataset_id),
+        references=tuple(status_references),
+        row_count=status_result.row_count,
+    )
     catalog.register(feature_entry)
     catalog.register(label_entry)
+    catalog.register(status_entry)
 
     manifest = build_snapshot_manifest(
         snapshot_id=request.snapshot_id,
         certification=request.certification,
         timing_convention=source.manifest.timing_convention,
         windows=request.windows,
-        references=_replacement_references(source, feature_entry, label_entry),
+        references=_replacement_references(
+            source, feature_entry, label_entry, status_entry
+        ),
     )
     _write_manifest_atomic(request.catalog_root, manifest)
 
     logger.info(
-        "materialized net-alpha snapshot %s: features %s, labels %s horizons %s",
+        "materialized net-alpha snapshot %s: features %s, labels %s, status %s "
+        "horizons %s",
         request.snapshot_id,
         request.feature_dataset_id,
         request.label_dataset_id,
+        status_result.dataset_id,
         list(request.candidate_horizon_sessions),
     )
     return NetAlphaMaterializationResult(

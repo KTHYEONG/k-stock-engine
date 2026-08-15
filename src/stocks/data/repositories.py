@@ -552,11 +552,13 @@ class ResearchDataRepository:
         label_manifest = self.label_store.read_manifest(snapshot.labels.name)
         _assert_content_hash_matches(label_manifest, snapshot.labels)
 
-        status_id = f"{snapshot.labels.name}{OUTCOME_STATUS_DATASET_SUFFIX}"
         status = self._read_outcome_status_sidecar(
-            status_id, decision_time, research_range
+            snapshot.outcome_status, decision_time, research_range
         )
         if status is not None and not status.is_empty():
+            self._validate_status_spine(
+                status, labels, certification=snapshot.manifest.certification
+            )
             composed = decision_universe.join(
                 status, on=["instrument_id", "session"], how="left"
             )
@@ -569,6 +571,12 @@ class ResearchDataRepository:
                 labels, on=join_keys, how="left"
             ).sort(["instrument_id", "session"])
         else:
+            legacy_status_id = f"{snapshot.labels.name}{OUTCOME_STATUS_DATASET_SUFFIX}"
+            logger.info(
+                "net-alpha composition uses legacy-inferred statuses: no pinned "
+                "OUTCOME_STATUS reference (legacy sibling %s)",
+                legacy_status_id,
+            )
             composed = decision_universe.join(
                 labels, on=["instrument_id", "session"], how="left"
             ).sort(["instrument_id", "session"])
@@ -608,28 +616,72 @@ class ResearchDataRepository:
 
     def _read_outcome_status_sidecar(
         self,
-        dataset_id: str,
+        status_entry: CatalogEntry | None,
         decision_time: datetime,
         research_range: CoverageRange,
     ) -> pl.DataFrame | None:
-        """Read the hash-bound outcome-status sidecar dataset, if present.
+        """Read the declared, hash-checked outcome-status sidecar, if pinned.
 
-        The sidecar is a sibling dataset published alongside the net-alpha
-        labels. Returns ``None`` when it is absent (a legacy snapshot), so the
-        trainer falls back to deriving statuses from label availability.
+        Reads exactly the OUTCOME_STATUS reference the snapshot manifest
+        declares and verifies its content hash before returning rows. Returns
+        ``None`` when the snapshot has no pinned reference (a legacy snapshot),
+        so the caller falls back to legacy-inferred provenance that is
+        diagnostic-only and never promoted.
         """
-        try:
-            return self.label_store.read_bounded(
-                dataset_id,
-                AssetKind.STOCK,
-                LABEL_FEATURE_SET,
-                decision_time,
-                session_start=research_range.start,
-                session_end=research_range.end,
-                columns=["instrument_id", "session", HORIZON_COLUMN, OUTCOME_STATUS_COLUMN],
-            )
-        except (FileNotFoundError, ValueError):
+        if status_entry is None:
             return None
+        manifest = self.label_store.read_manifest(status_entry.name)
+        _assert_content_hash_matches(manifest, status_entry)
+        return self.label_store.read_bounded(
+            status_entry.name,
+            AssetKind.STOCK,
+            LABEL_FEATURE_SET,
+            decision_time,
+            session_start=research_range.start,
+            session_end=research_range.end,
+            columns=["instrument_id", "session", HORIZON_COLUMN, OUTCOME_STATUS_COLUMN],
+        )
+
+    def _validate_status_spine(
+        self,
+        status: pl.DataFrame,
+        labels: pl.DataFrame,
+        *,
+        certification: DatasetCertification,
+    ) -> None:
+        """Fail closed unless the pinned status spine is complete and duplicate-free.
+
+        The sidecar must emit exactly one row per ``(instrument_id, session,
+        horizon_sessions)`` decision key, carry only vocabulary statuses, and
+        cover every horizon the label panel declares. Certified execution is
+        rejected when any decision key, horizon coverage, or status value is
+        missing or inconsistent.
+        """
+        from src.stocks.ml.contracts import OUTCOME_STATUS_VOCABULARY
+
+        identity = ["instrument_id", "session", HORIZON_COLUMN]
+        duplicates = status.group_by(identity).len().filter(pl.col("len") > 1)
+        if not duplicates.is_empty():
+            raise ValueError(
+                "outcome-status sidecar must emit exactly one row per "
+                f"(instrument_id, session, horizon_sessions); "
+                f"{duplicates.height} keys are duplicated"
+            )
+        unknown = status.filter(
+            ~pl.col(OUTCOME_STATUS_COLUMN).is_in(list(OUTCOME_STATUS_VOCABULARY))
+        )
+        if not unknown.is_empty():
+            raise ValueError("outcome-status sidecar contains unknown states")
+        if certification is DatasetCertification.PROVISIONAL:
+            return
+        if HORIZON_COLUMN in labels.columns and HORIZON_COLUMN in status.columns:
+            label_horizons = set(labels[HORIZON_COLUMN].unique().to_list())
+            status_horizons = set(status[HORIZON_COLUMN].unique().to_list())
+            if label_horizons and not label_horizons <= status_horizons:
+                raise ValueError(
+                    f"outcome-status sidecar horizon coverage {sorted(status_horizons)} "
+                    f"is missing label horizons {sorted(label_horizons - status_horizons)}"
+                )
 
     def _assert_v2_composition(
         self,
