@@ -30,3 +30,26 @@ def pytest_configure(config: Config) -> None:
     os.environ["PYTEST_DEBUG_TEMPROOT"] = str(_TEMP_ROOT)
     os.environ["TMPDIR"] = str(_TEMP_ROOT)
     tempfile.tempdir = str(_TEMP_ROOT)
+
+
+def pytest_sessionfinish(session: object, exitstatus: int) -> None:
+    """Clean up project-local temporary files if all tests passed.
+
+    On exitstatus == 0 (all tests passed), purged immediately to prevent disk bloating.
+    On exitstatus != 0 (failures or errors), preserved for debugging.
+    """
+    del session
+    if exitstatus == 0 and _TEMP_ROOT.exists():
+        import shutil
+
+        # Clean all items inside _TEMP_ROOT without removing the root itself
+        for item in _TEMP_ROOT.iterdir():
+            if item.name == ".gitignore":
+                continue
+            try:
+                if item.is_dir() and not item.is_symlink():
+                    shutil.rmtree(item, ignore_errors=True)
+                else:
+                    item.unlink(missing_ok=True)
+            except OSError:
+                pass
