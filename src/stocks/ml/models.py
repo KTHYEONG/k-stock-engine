@@ -23,12 +23,14 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, replace
+from typing import Any, Protocol, runtime_checkable
 
 import lightgbm as lgb
 import numpy as np
 import polars as pl
 from sklearn.linear_model import ElasticNet
 
+from src.stocks.research.economic_alpha import CausalAlphaCalibrator
 from src.stocks.research.models import Model, ModelManifest
 
 TARGET_PREFIXES = ("target_", "label_")
@@ -38,7 +40,13 @@ MIN_BUCKET_OBSERVATIONS = 5
 
 @dataclass(frozen=True, slots=True)
 class NetAlphaModelConfig:
-    """Deterministic training configuration shared by baseline and challenger."""
+    """Deterministic training configuration shared by baseline and challenger.
+
+    ``elastic_alpha_fraction`` and ``elastic_alpha_max`` record the fold-local
+    scale-invariant penalty selection used by the net-alpha trainer; they are
+    optional metadata so an explicit absolute ``elastic_alpha`` remains valid
+    for tests and backward-compatible deserialization.
+    """
 
     seed: int = 42
     num_leaves: int = 31
@@ -50,6 +58,8 @@ class NetAlphaModelConfig:
     early_stopping_rounds: int = 50
     elastic_alpha: float = 0.5
     elastic_l1_ratio: float = 0.5
+    elastic_alpha_fraction: float | None = None
+    elastic_alpha_max: float | None = None
 
     def __post_init__(self) -> None:
         if self.num_leaves < 2:
@@ -66,6 +76,14 @@ class NetAlphaModelConfig:
             raise ValueError("elastic_alpha must be non-negative")
         if not 0.0 <= self.elastic_l1_ratio <= 1.0:
             raise ValueError("elastic_l1_ratio must be in [0, 1]")
+        if self.elastic_alpha_fraction is not None and (
+            not np.isfinite(self.elastic_alpha_fraction) or self.elastic_alpha_fraction <= 0.0
+        ):
+            raise ValueError("elastic_alpha_fraction must be finite and positive when supplied")
+        if self.elastic_alpha_max is not None and (
+            not np.isfinite(self.elastic_alpha_max) or self.elastic_alpha_max <= 0.0
+        ):
+            raise ValueError("elastic_alpha_max must be finite and positive when supplied")
 
 
 def _float32_matrix(frame: pl.DataFrame, columns: tuple[str, ...]) -> np.ndarray:
@@ -168,6 +186,10 @@ class ElasticNetNetAlpha:
             "seed": str(self._config.seed),
             "feature_columns": ",".join(self._feature_columns),
         }
+        if self._config.elastic_alpha_fraction is not None:
+            params["alpha_fraction"] = f"{self._config.elastic_alpha_fraction:.6g}"
+        if self._config.elastic_alpha_max is not None:
+            params["alpha_max"] = f"{self._config.elastic_alpha_max:.6g}"
         return ModelManifest(
             artifact_id=self._manifest.artifact_id,
             asset_kind=self._manifest.asset_kind,
@@ -267,21 +289,28 @@ class LightGbmNetAlpha:
                     reference=train_set,
                     params={"verbosity": -1},
                 )
+        # Early stopping needs a finite labeled validation Dataset.  The
+        # target-free outer validation frame and the empty final-refit frame
+        # train the deterministic fixed estimator budget instead and never
+        # request early stopping (installing it without a valid set raises).
+        callbacks: list[Any] = []
+        if valid_set is not None:
+            callbacks = [
+                lgb.early_stopping(
+                    self._config.early_stopping_rounds, verbose=False, min_delta=0.0
+                )
+            ]
         self._booster = lgb.train(
             self._params(),
             train_set,
             num_boost_round=self._config.n_estimators,
             valid_sets=[valid_set] if valid_set is not None else None,
-            callbacks=[
-                lgb.early_stopping(
-                    self._config.early_stopping_rounds,
-                    verbose=False,
-                    min_delta=0.0,
-                )
-            ],
+            callbacks=callbacks,
         )
-        if self._booster.best_iteration > 0:
+        if valid_set is not None and self._booster.best_iteration > 0:
             self._best_iteration = self._booster.best_iteration
+        else:
+            self._best_iteration = None
 
     def predict(self, frame: pl.DataFrame) -> pl.DataFrame:
         if self._booster is None:
@@ -291,6 +320,8 @@ class LightGbmNetAlpha:
         if missing:
             raise ValueError(f"missing feature columns {missing} in predict frame")
         features = _float32_matrix(frame, self._feature_columns)
+        if not features.flags.writeable:
+            features = features.copy()
         features[~np.isfinite(features)] = 0.0
         scores = np.asarray(
             self._booster.predict(features, num_iteration=self._best_iteration),
@@ -560,10 +591,12 @@ class CalibratedNetAlphaModel:
     decimal ``net_alpha_lower_bound``, so production planning consumes the same
     economic score the replay gated on. The wrapper is joblib-serialized with
     the calibration table; ``manifest`` also records the serialized calibration
-    for auditability.
+    for auditability. ``calibrator`` is any applier exposing ``apply(scored)``
+    and a ``state`` with ``to_json()`` — the legacy ``NetAlphaCalibrator`` or
+    the causal session-cluster adapter.
     """
 
-    def __init__(self, model: Model, calibrator: NetAlphaCalibrator):
+    def __init__(self, model: Model, calibrator: CalibrationApplier):
         if model is None:
             raise ValueError("CalibratedNetAlphaModel requires a base model")
         if calibrator is None:
@@ -585,3 +618,67 @@ class CalibratedNetAlphaModel:
             self._calibrator.state.to_json(), sort_keys=True
         )
         return replace(base, params=params)
+
+
+@runtime_checkable
+class CalibrationStateView(Protocol):
+    """Serialization view of a frozen calibration state."""
+
+    def to_json(self) -> dict[str, object]: ...
+
+
+@runtime_checkable
+class CalibrationApplier(Protocol):
+    """Prediction-time calibration contract: apply a frozen state to a frame."""
+
+    @property
+    def state(self) -> CalibrationStateView: ...
+
+    def apply(self, scored: pl.DataFrame) -> pl.DataFrame: ...
+
+
+@dataclass(frozen=True, slots=True)
+class CausalCalibrationState:
+    """JSON-safe frozen causal calibration snapshot for artifact serialization."""
+
+    payload: dict[str, object]
+
+    def to_json(self) -> dict[str, object]:
+        return dict(self.payload)
+
+
+class CausalCalibrationAdapter:
+    """Applies a frozen causal calibration state to any scored frame.
+
+    ``state`` is the immutable dict produced by
+    ``CausalAlphaCalibrator.prepare_decision`` /
+    ``SessionClusterCalibrationSchedule.state_at``. ``apply`` preserves
+    ``predicted_net_alpha`` and appends decimal ``expected_net_alpha`` and
+    ``net_alpha_lower_bound``; a frozen state with no eligible positive bucket
+    yields zero/absent economic scores and cash, never an exception or a buy.
+    """
+
+    def __init__(self, calibrator: object, state: dict[str, object]):
+        self._calibrator = calibrator
+        self._state = state
+
+    def apply(self, scored: pl.DataFrame) -> pl.DataFrame:
+        if SCORE_COLUMN not in scored.columns:
+            raise ValueError(f"apply requires a {SCORE_COLUMN!r} score column")
+        prepared = scored.rename({SCORE_COLUMN: "score"})
+        augmented = CausalAlphaCalibrator.apply_prepared(self._state, prepared)
+        return augmented.drop(
+            "expected_active_alpha", "alpha_lower_bound", "exit_cost_rate"
+        ).with_columns(
+            pl.col("expected_net_alpha").cast(pl.Float64),
+            pl.col("net_alpha_lower_bound").cast(pl.Float64),
+        ).rename({"score": SCORE_COLUMN})
+
+    @property
+    def state(self) -> CausalCalibrationState:
+        payload = (
+            self._calibrator.calibration_state()
+            if isinstance(self._calibrator, CausalAlphaCalibrator)
+            else self._state
+        )
+        return CausalCalibrationState(payload)
