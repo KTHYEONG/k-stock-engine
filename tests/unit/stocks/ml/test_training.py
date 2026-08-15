@@ -24,6 +24,7 @@ def test_forward_holdout_contract_signature() -> None:
         "holdout_panel",
         "request",
         "horizon_sessions",
+        "profile",
     ]
 
 
@@ -83,6 +84,12 @@ def _compound_request():
     )
 
 
+def _legacy_profile():
+    from src.stocks.ml.contracts import PolicyProfile
+
+    return PolicyProfile(profile_id="legacy_overlay_5bps", no_trade_band_bps=5.0)
+
+
 def test_forward_holdout_empty_panel_fails_closed() -> None:
     request = _compound_request()
     evidence = _evaluate_forward_holdout(
@@ -91,6 +98,7 @@ def test_forward_holdout_empty_panel_fails_closed() -> None:
         pl.DataFrame(),
         request,
         1,
+        _legacy_profile(),
     )
     assert evidence["passed"] is False
     assert evidence["reason"] == "holdout-has-no-realized"
@@ -104,13 +112,14 @@ def test_forward_holdout_passes_with_complete_base_and_stress() -> None:
         _holdout_panel(n_sessions=60),
         request,
         1,
+        _legacy_profile(),
     )
     assert evidence["passed"] is True
     assert evidence["reason"] == ""
     assert evidence["order_count"] == 60
-    assert evidence["block_count"] == 60
-    assert evidence["cohorts"]["observed_sessions"] == 60
-    assert evidence["cohorts"]["active_cohort_count"] == 60
+    assert evidence["block_count"] == 59
+    assert evidence["cohorts"]["observed_sessions"] == 59
+    assert evidence["cohorts"]["active_cohort_count"] == 59
     assert evidence["cohorts"]["missing_realized_cohorts"] == 0
     certificate = evidence["certificate"]
     assert certificate["passed"] is True
@@ -127,6 +136,7 @@ def test_forward_holdout_no_economic_edge_is_explicit() -> None:
         _holdout_panel(n_sessions=60),
         request,
         1,
+        _legacy_profile(),
     )
     assert evidence["passed"] is False
     assert evidence["reason"] == "holdout-no-economic-edge"
@@ -143,7 +153,7 @@ def test_forward_holdout_incomplete_realized_cohorts_is_explicit() -> None:
             base = frame.with_columns(
                 pl.lit(0.05).alias("predicted_net_alpha")
             )
-            extra = base.tail(1).with_columns(
+            extra = base.head(1).with_columns(
                 pl.lit("KRX:99999").alias("instrument_id")
             )
             return pl.concat([base, extra])
@@ -154,6 +164,7 @@ def test_forward_holdout_incomplete_realized_cohorts_is_explicit() -> None:
         panel,
         request,
         1,
+        _legacy_profile(),
     )
     assert evidence["passed"] is False
     assert evidence["reason"] == "holdout-incomplete-realized-cohorts"
@@ -168,6 +179,7 @@ def test_forward_holdout_compound_certification_failure_is_explicit() -> None:
         _holdout_panel(n_sessions=10),
         request,
         1,
+        _legacy_profile(),
     )
     assert evidence["passed"] is False
     assert evidence["reason"].startswith(
@@ -239,6 +251,46 @@ def _training_fixture(
     )
     folds = splitter.split(pre_holdout)
     return data, request, pre_holdout, folds, learner_columns, schema
+
+
+def test_coverage_failure_reason_fails_closed_on_missing_and_incomplete() -> None:
+    from dataclasses import replace
+
+    from src.stocks.ml.horizons import HorizonOOFEvidence
+
+    request = _compound_request()
+    base_evidence = HorizonOOFEvidence(
+        horizon_sessions=3,
+        profile_id="lower_bound_only",
+        model_family="net_alpha_elastic_net",
+        base_log_growth=tuple(0.01 for _ in range(40)),
+        stress_log_growth=tuple(0.01 for _ in range(40)),
+        cohort_segment_ids=(0,) * 20 + (1,) * 20,
+        complete_cohort_count=40,
+        active_cohort_count=40,
+        partial_cohort_count=0,
+        missing_cohort_count=0,
+        segment_count=2,
+        fold_rank_ics=(0.1, 0.2),
+    )
+    assert training._coverage_failure_reason(base_evidence, request) == ""
+
+    missing = replace(base_evidence, missing_cohort_count=2)
+    assert training._coverage_failure_reason(missing, request).startswith(
+        "missing-realized-vintages:"
+    )
+
+    incomplete = replace(
+        base_evidence, cohort_segment_ids=(0,) * 40, segment_count=2
+    )
+    assert training._coverage_failure_reason(incomplete, request).startswith(
+        "incomplete-segment-coverage:"
+    )
+
+    inactive = replace(base_evidence, active_cohort_count=0)
+    assert training._coverage_failure_reason(inactive, request).startswith(
+        "active-coverage-insufficient:"
+    )
 
 
 def test_score_is_constant_classifies_degenerate_predictions() -> None:
@@ -363,7 +415,12 @@ def test_fit_oof_reports_fit_error_instead_of_swallowing() -> None:
 
 def test_horizon_evidence_constant_baseline_triggers_structural_fallback() -> None:
     """A constant linear screen must skip the challenger and cap it at one horizon."""
-    from src.stocks.ml.contracts import FoldScoreDiagnostic, HorizonOOFDiagnostic
+    from src.stocks.ml.contracts import (
+        FoldScoreDiagnostic,
+        HorizonOOFDiagnostic,
+        PolicyProfile,
+    )
+    from src.stocks.ml.horizons import HorizonOOFEvidence
 
     data, request, pre_holdout, folds, learner_columns, _schema = _training_fixture()
     diagnostic = HorizonOOFDiagnostic(
@@ -373,28 +430,40 @@ def test_horizon_evidence_constant_baseline_triggers_structural_fallback() -> No
             FoldScoreDiagnostic(fold_index=0, failure_reason="constant-oof-score"),
         ),
     )
-    discovery = training.HorizonDiscovery(
-        evidence=(),
-        diagnostics=(diagnostic,),
-        oof_by_horizon={},
+    profile = PolicyProfile(profile_id="legacy_overlay_5bps", no_trade_band_bps=5.0)
+    evidence = HorizonOOFEvidence(
+        horizon_sessions=5,
+        profile_id="legacy_overlay_5bps",
+        model_family="net_alpha_elastic_net",
+        base_log_growth=(0.01,),
+        stress_log_growth=(0.01,),
+        cohort_segment_ids=(0,),
+        complete_cohort_count=1,
+        active_cohort_count=1,
+        partial_cohort_count=0,
+        missing_cohort_count=0,
+        segment_count=1,
+        fold_rank_ics=(0.1,),
     )
     selection = training.HorizonSelectionEvidence(
         primary_horizon_sessions=5,
-        adjusted_lower_growth={5: {"base": 0.001, "stress": 0.001}},
-        base_p_values={5: 0.01},
-        stress_p_values={5: 0.01},
-        base_holm_thresholds={5: 0.05},
-        stress_holm_thresholds={5: 0.05},
+        primary_profile_id="legacy_overlay_5bps",
+        adjusted_lower_growth={
+            (5, "legacy_overlay_5bps"): {"base": 0.001, "stress": 0.001}
+        },
+        base_p_values={(5, "legacy_overlay_5bps"): 0.01},
+        stress_p_values={(5, "legacy_overlay_5bps"): 0.01},
+        base_holm_thresholds={(5, "legacy_overlay_5bps"): 0.05},
+        stress_holm_thresholds={(5, "legacy_overlay_5bps"): 0.05},
         selection_reasons=(),
     )
-    reason = training._rankability_gate(
-        diagnostic, discovery, 5, selection, request
-    )
+    reason = training._rankability_gate(diagnostic, evidence, selection, request)
     assert reason.startswith("challenger-skipped:no-rankability-evidence:constant-score")
 
     manifest = training._base_manifest(request, data, data.feature_frame, 5)
     selected, failure, oof, _labels, _ics, _diag = training._adopt_model_family(
         pre_holdout, folds, data, request, manifest, learner_columns, 5,
+        profile, selection,
         pl.DataFrame(), pl.DataFrame(), [], diagnostic, reason,
     )
     assert selected == "net_alpha_elastic_net"
