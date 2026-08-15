@@ -372,5 +372,8 @@
   "src/main.py": {},
   "src/stocks/ml/data.py": {
     "testing": "tests/unit/stocks/ml/test_data.py"
+  },
+  "src/stocks/data/catalog.py": {
+    "testing": "tests/unit/stocks/data/test_catalog.py"
   }
 }
