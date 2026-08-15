@@ -14,7 +14,7 @@ worker, LambdaRank route, or fixed 5/10/15 horizon exists here.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
@@ -61,6 +61,7 @@ from src.stocks.ml.models import (
     NetAlphaModelConfig,
 )
 from src.stocks.ml.replay import NetAlphaPolicyReplay
+from src.stocks.ml.result_ledger import peak_rss_mib as _peak_rss_mib
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.research.calibration_schedule import SessionClusterCalibrationSchedule
 from src.stocks.research.economic_alpha import CausalAlphaCalibrator
@@ -77,6 +78,41 @@ _REFERENCE_NOTIONAL = 100_000_000.0
 _NESTED_INNER_FOLDS = 3
 _NESTED_MIN_TRAIN_SESSIONS = 5
 _ALPHA_TIE_TOLERANCE = 1e-12
+
+
+class TrainingTelemetry:
+    """Bounded scalar/dictionary observer for one training run.
+
+    The telemetry observes only already-computed values: it never fits a second
+    model, runs a second replay, or rescans the panel. The terminal projection
+    is embedded under ``run_observability`` in the artifact ``metrics.json``.
+    """
+
+    def __init__(self, clock: Callable[[], datetime] | None = None) -> None:
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._started_at = self._clock()
+        self._last_at = self._started_at
+        self._phases: list[dict[str, object]] = []
+        self._horizons: list[dict[str, object]] = []
+
+    def phase(self, name: str, evidence: Mapping[str, object] | None = None) -> None:
+        now = self._clock()
+        elapsed_ms = int((now - self._last_at).total_seconds() * 1000)
+        sample: dict[str, object] = {
+            "name": name,
+            "elapsed_ms": elapsed_ms,
+            "peak_rss_mib": _peak_rss_mib(),
+        }
+        if evidence:
+            sample.update(dict(evidence))
+        self._phases.append(sample)
+        self._last_at = now
+
+    def add_horizon(self, entry: Mapping[str, object]) -> None:
+        self._horizons.append(dict(entry))
+
+    def to_dict(self) -> dict[str, object]:
+        return {"phases": list(self._phases), "horizons": list(self._horizons)}
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +157,7 @@ def train_net_alpha_model(
             "via `python -m src.stocks.cli.build_research --pipeline net-alpha`."
         )
 
+    telemetry = TrainingTelemetry()
     frame = data.feature_frame
     schema_hash = data.manifest.schema_hash or "net-alpha-v1"
     universe_policy_hash = data.manifest.universe_policy_hash or "net-alpha-v1"
@@ -136,48 +173,105 @@ def train_net_alpha_model(
         decision_time,
         calendar,
     )
+    telemetry.phase(
+        "integrity_audit",
+        {
+            "passed": audit.passed,
+            "audit_reason_count": sum(1 for check in audit.checks if not check.passed),
+            "row_count": int(audit.row_count),
+        },
+    )
     if not audit.passed:
         return _publish_no_trade(
             registry, request, frame, "integrity-audit-failed",
             details=audit.to_json(),
             schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+            telemetry=telemetry,
         )
 
     roles = dict(stock_net_alpha_v1_roles())
     transformed, learner_columns = build_model_features(frame, roles)
+    telemetry.phase(
+        "feature_transform",
+        {
+            "learner_feature_count": len(learner_columns),
+            "panel_rows": int(transformed.height),
+            "panel_sessions": (
+                int(transformed["session"].n_unique())
+                if not transformed.is_empty()
+                else 0
+            ),
+        },
+    )
     if not learner_columns:
         return _publish_no_trade(
             registry, request, frame, "no-alpha-learner-columns",
             schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+            telemetry=telemetry,
         )
 
     panel = _index_sessions(transformed)
     pre_holdout, holdout, holdout_reason = _locked_holdout(panel, request)
+    telemetry.phase(
+        "holdout_lock",
+        {
+            "pre_holdout_rows": int(pre_holdout.height),
+            "pre_holdout_sessions": (
+                int(pre_holdout["session"].n_unique())
+                if not pre_holdout.is_empty()
+                else 0
+            ),
+            "holdout_rows": int(holdout.height),
+            "holdout_sessions": (
+                int(holdout["session"].n_unique())
+                if not holdout.is_empty()
+                else 0
+            ),
+            "reason": holdout_reason,
+        },
+    )
     if holdout_reason:
         return _publish_no_trade(
             registry, request, frame, holdout_reason,
             schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+            telemetry=telemetry,
         )
 
     discovery = _build_horizon_evidence(
         pre_holdout, frame, data, request, learner_columns
     )
+    _record_horizon_discovery(telemetry, discovery)
     if not discovery.evidence:
         return _publish_no_trade(
             registry, request, frame, "no-horizon-evidence",
             details={"oof_diagnostics": [d.to_json() for d in discovery.diagnostics]},
             schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+            telemetry=telemetry,
         )
 
     selection = select_horizons(
         discovery.evidence, request.bootstrap_alpha, request.seed,
         n_bootstrap=request.bootstrap_resamples,
     )
+    telemetry.phase(
+        "primary_selection",
+        {
+            "lower_bounds": {
+                int(horizon): float(bound)
+                for horizon, bound in selection.lower_bounds.items()
+            },
+            "primary_horizon_sessions": selection.primary_horizon_sessions,
+            "secondary_horizon_sessions": selection.secondary_horizon_sessions,
+            "effective_horizon_count": float(selection.effective_horizon_count),
+            "selection_reasons": list(selection.selection_reasons),
+        },
+    )
     if selection.primary_horizon_sessions is None:
         return _publish_no_trade(
             registry, request, frame, "no-selected-horizon",
             details=selection.to_json(),
             schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+            telemetry=telemetry,
         )
 
     primary = selection.primary_horizon_sessions
@@ -194,6 +288,7 @@ def train_net_alpha_model(
         return _publish_no_trade(
             registry, request, frame, "no-label-for-primary-horizon",
             schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+            telemetry=telemetry,
         )
     if (
         RISK_RESIDUAL_COLUMN not in label_frame.columns
@@ -202,6 +297,7 @@ def train_net_alpha_model(
         return _publish_no_trade(
             registry, request, frame, "no-realized-for-primary-horizon",
             schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+            telemetry=telemetry,
         )
 
     splitter = PurgedWalkForward(
@@ -217,6 +313,7 @@ def train_net_alpha_model(
         return _publish_no_trade(
             registry, request, frame, "no-eligible-folds",
             schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+            telemetry=telemetry,
         )
 
     base_manifest = _base_manifest(
@@ -231,11 +328,21 @@ def train_net_alpha_model(
             pre_holdout, folds, data, request, base_manifest, learner_columns,
             primary,
         )
+        telemetry.phase(
+            "model_comparison",
+            {
+                "baseline_available": False,
+                "challenger_available": not oof.is_empty(),
+                "selected_model_type": selected_model_type,
+                "challenger_failure_reason": oof_diag.failure_reason or "",
+            },
+        )
         if oof.is_empty() or not fold_rank_ic:
             return _publish_no_trade(
                 registry, request, frame, "baseline-oof-failed",
                 details={"oof_diagnostics": [oof_diag.to_json()]},
                 schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+                telemetry=telemetry,
             )
     else:
         baseline_oof, baseline_labels, baseline_ics, baseline_diag = _baseline_oof(
@@ -267,11 +374,21 @@ def train_net_alpha_model(
                 oof_diag,
                 failure_reason=challenger_failure_reason,
             )
+        telemetry.phase(
+            "model_comparison",
+            {
+                "baseline_available": not baseline_oof.is_empty(),
+                "challenger_available": not challenger_oof.is_empty(),
+                "selected_model_type": selected_model_type,
+                "challenger_failure_reason": challenger_failure_reason or "",
+            },
+        )
         if oof.is_empty() or not fold_rank_ic:
             return _publish_no_trade(
                 registry, request, frame, "baseline-oof-failed",
                 details={"oof_diagnostics": [oof_diag.to_json()]},
                 schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+                telemetry=telemetry,
             )
 
     calibrated = _causal_oof_calibrate(oof, oof_labels, request, primary)
@@ -290,10 +407,18 @@ def train_net_alpha_model(
         pre_holdout, data, request, base_manifest, learner_columns,
         primary, selected_model_type,
     )
+    telemetry.phase(
+        "final_refit",
+        {
+            "model_family": selected_model_type,
+            "fit_succeeded": final_model is not None,
+        },
+    )
     if final_model is None:
         return _publish_no_trade(
             registry, request, frame, "final-refit-failed",
             schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+            telemetry=telemetry,
         )
 
     holdout_panel = holdout.join(
@@ -313,6 +438,17 @@ def train_net_alpha_model(
         calibration = _empty_causal_calibration(request, primary)
     holdout_evidence = _evaluate_forward_holdout(
         final_model, calibration, holdout_panel, request, primary,
+    )
+    holdout_order_count = holdout_evidence.get("order_count", 0)
+    holdout_block_count = holdout_evidence.get("block_count", 0)
+    telemetry.phase(
+        "forward_holdout",
+        {
+            "passed": bool(holdout_evidence.get("passed", False)),
+            "reason": str(holdout_evidence.get("reason", "")),
+            "order_count": holdout_order_count if isinstance(holdout_order_count, int) else 0,
+            "block_count": holdout_block_count if isinstance(holdout_block_count, int) else 0,
+        },
     )
 
     passed = (
@@ -335,11 +471,21 @@ def train_net_alpha_model(
             selection.evidence_hash,
             holdout_evidence,
         )
+    telemetry.phase(
+        "artifact_publish",
+        {
+            "artifact_id": request.artifact_id,
+            "model_type": manifest.model_type,
+            "promoted": passed,
+            "no_trade": not passed,
+        },
+    )
     registry.write_metrics(
         request.artifact_id,
         _build_metrics(
             request, evaluation, fold_rank_ic, selection, manifest,
             holdout_evidence=holdout_evidence,
+            telemetry=telemetry,
         ),
     )
     logger.info(
@@ -591,6 +737,78 @@ def _build_label_join(data: NetAlphaResearchData, horizon_sessions: int) -> pl.D
         (pl.col(RISK_RESIDUAL_COLUMN) - pl.col(REFERENCE_COST_COLUMN))
         .alias(REALIZED_RETURN_COLUMN)
     )
+
+
+def _record_horizon_discovery(
+    telemetry: TrainingTelemetry, discovery: HorizonDiscovery
+) -> None:
+    eligible = {evidence.horizon_sessions for evidence in discovery.evidence}
+    telemetry.phase(
+        "horizon_discovery",
+        {
+            "candidate_horizons": [
+                diag.horizon_sessions for diag in discovery.diagnostics
+            ],
+            "evidence_horizons": sorted(eligible),
+            "diagnostics_count": len(discovery.diagnostics),
+        },
+    )
+    for diagnostic in discovery.diagnostics:
+        telemetry.add_horizon(_horizon_entry(diagnostic, eligible))
+
+
+def _horizon_entry(
+    diagnostic: HorizonOOFDiagnostic, eligible: set[int]
+) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "horizon_sessions": diagnostic.horizon_sessions,
+        "model_family": diagnostic.model_family,
+        "admission": _admission_state(diagnostic, eligible),
+        "reason": diagnostic.failure_reason,
+        "usable_fold_count": diagnostic.usable_fold_count,
+        "fold_score_stds": [
+            round(float(value), 12) for value in diagnostic.fold_score_stds
+        ],
+        "fold_finite_counts": [
+            int(value) for value in diagnostic.fold_finite_counts
+        ],
+        "fold_unique_counts": [
+            int(value) for value in diagnostic.fold_unique_counts
+        ],
+        "fold_rank_ics": [
+            round(float(value), 12) for value in diagnostic.fold_rank_ics
+        ],
+    }
+    entry.update(_fold_alpha_metadata(diagnostic))
+    return entry
+
+
+def _admission_state(diagnostic: HorizonOOFDiagnostic, eligible: set[int]) -> str:
+    if diagnostic.horizon_sessions in eligible:
+        return "eligible"
+    reason = diagnostic.failure_reason
+    if reason:
+        return reason.split(":", 1)[0] or "rejected"
+    return "no-nonzero-blocks"
+
+
+def _fold_alpha_metadata(diagnostic: HorizonOOFDiagnostic) -> dict[str, object]:
+    for fold in reversed(diagnostic.fold_diagnostics):
+        if fold.alpha is not None:
+            return {
+                "selected_alpha": round(float(fold.alpha), 12),
+                "selected_fraction": (
+                    round(float(fold.fraction), 12)
+                    if fold.fraction is not None
+                    else None
+                ),
+                "selected_alpha_max": (
+                    round(float(fold.alpha_max), 12)
+                    if fold.alpha_max is not None
+                    else None
+                ),
+            }
+    return {}
 
 
 def _build_horizon_evidence(
@@ -1246,6 +1464,7 @@ def _publish_no_trade(
     details: object = "",
     schema_hash: str = "no-trade",
     universe_policy_hash: str = "no-trade",
+    telemetry: TrainingTelemetry | None = None,
 ) -> ModelManifest:
     """Publish a complete immutable ``NO_TRADE`` artifact with evidence."""
     eligible_from, eligible_to = _eligibility(frame)
@@ -1268,6 +1487,17 @@ def _publish_no_trade(
         "net_alpha",
     )
     registry.publish(model, manifest)
+    if telemetry is not None:
+        telemetry.phase(
+            "artifact_publish",
+            {
+                "artifact_id": request.artifact_id,
+                "model_type": "no_trade",
+                "promoted": False,
+                "no_trade": True,
+                "reason": reason,
+            },
+        )
     metrics: dict[str, object] = {
         "promoted": False,
         "no_trade": True,
@@ -1278,6 +1508,11 @@ def _publish_no_trade(
             else [f"{reason}:{details}".rstrip(":")]
         ),
         "gates": {"passed": False},
+        "run_observability": (
+            telemetry.to_dict()
+            if telemetry is not None
+            else {"phases": [], "horizons": []}
+        ),
     }
     if isinstance(details, dict):
         metrics.update(details)
@@ -1294,6 +1529,7 @@ def _build_metrics(
     manifest: ModelManifest,
     *,
     holdout_evidence: dict[str, object],
+    telemetry: TrainingTelemetry,
 ) -> dict[str, object]:
     del request
     return {
@@ -1310,4 +1546,5 @@ def _build_metrics(
             "passed": manifest.model_type != "no_trade",
             "reasons": list(selection.selection_reasons),
         },
+        "run_observability": telemetry.to_dict(),
     }
