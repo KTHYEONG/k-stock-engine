@@ -1,15 +1,19 @@
-"""Horizon discovery: cohort-unit bootstrap, Holm admission, one primary horizon.
+"""Horizon/profile discovery: vintage bootstrap, Holm admission, one primary.
 
-Selection is the single gate between the pre-registered candidate horizon grid
-and the learner. Every candidate carries base and stress per-session log-growth
-cohort evidence over the common, segment-identity-preserving OOF calendar.
-Admission applies a one-sided centered moving-block bootstrap in cohort units
-(resampling never crosses a segment boundary) and Holm-Bonferroni multiplicity
-control across all pre-registered horizons; a horizon is economically admissible
-only when both its base and stress adjusted lower growth bounds are strictly
-positive. At most one primary horizon is selected (the maximum stress-cost
-adjusted lower growth, ties preferring the shorter horizon). There is no
-secondary horizon and no effective-horizon heuristic here.
+Selection is the single gate between the pre-registered candidate
+``(horizon, profile)`` frontier and the learner. Every candidate carries base
+and stress per-session log-growth evidence over the common,
+segment-identity-preserving OOF calendar; ``profile_id`` records which policy
+profile produced the evidence. Admission applies a one-sided centered
+moving-block bootstrap in per-vintage session units with a block length of at
+least the candidate horizon (preserving the dependency of overlapping h-day
+returns; resampling never crosses a segment boundary) and Holm-Bonferroni
+multiplicity control across the whole frontier. A ``(horizon, profile)``
+candidate is economically admissible only when both its base and stress
+adjusted lower growth bounds are strictly positive. At most one primary
+``(horizon, profile)`` pair is selected (maximum stress-cost adjusted lower
+growth, ties preferring the shorter horizon then the lexicographically
+smaller profile id).
 """
 from __future__ import annotations
 
@@ -23,20 +27,27 @@ DEFAULT_BOOTSTRAP_RESAMPLES = 200
 _BOUND_TOLERANCE = 1e-12
 
 
+def _frontier_key(horizon_sessions: int, profile_id: str) -> tuple[int, str]:
+    return (horizon_sessions, profile_id)
+
+
 @dataclass(frozen=True, slots=True)
 class HorizonOOFEvidence:
-    """One horizon's base/stress cohort log-growth evidence.
+    """One ``(horizon, profile)`` candidate's base/stress vintage log-growth evidence.
 
-    ``base_log_growth`` and ``stress_log_growth`` are parallel per-session log
-    growth series ``log1p(r) / horizon_sessions`` over the complete cohorts of
-    the common OOF calendar; ``cohort_segment_ids`` is the segment identity of
-    each cohort so resampling never crosses a segment boundary. ``model_family``
-    records which family produced the OOF scores. The cohort counts publish the
-    complete/active/partial/missing decomposition and ``fold_rank_ics`` the
-    session-mean Rank-IC per usable fold.
+    ``base_log_growth`` and ``stress_log_growth`` are parallel per-vintage log
+    growth series ``log1p(r)`` over the evaluated vintages of the common OOF
+    calendar (each decision session is one overlapping holding vintage);
+    ``cohort_segment_ids`` is the segment identity of each vintage so
+    resampling never crosses a segment boundary. ``profile_id`` records which
+    pre-registered policy profile produced the evidence and
+    ``model_family`` which family produced the OOF scores. The vintage counts
+    publish the evaluated/active/partial/missing decomposition and
+    ``fold_rank_ics`` the session-mean Rank-IC per usable fold.
     """
 
     horizon_sessions: int
+    profile_id: str
     model_family: str
     base_log_growth: tuple[float, ...]
     stress_log_growth: tuple[float, ...]
@@ -52,6 +63,8 @@ class HorizonOOFEvidence:
     def __post_init__(self) -> None:
         if self.horizon_sessions < 1:
             raise ValueError("horizon_sessions must be a positive session count")
+        if not self.profile_id:
+            raise ValueError("profile_id must be non-empty")
         if len(self.base_log_growth) != len(self.stress_log_growth):
             raise ValueError("base and stress log growth series must be parallel")
         if len(self.base_log_growth) != len(self.cohort_segment_ids):
@@ -72,23 +85,25 @@ class HorizonOOFEvidence:
 
 @dataclass(frozen=True, slots=True)
 class HorizonSelectionEvidence:
-    """Immutable outcome of one Holm-adjusted horizon-discovery run.
+    """Immutable outcome of one Holm-adjusted frontier-discovery run.
 
-    ``primary_horizon_sessions`` is ``None`` when no candidate is economically
-    admissible (a normal ``NO_TRADE`` outcome). ``adjusted_lower_growth`` maps a
-    candidate horizon to its per-session log-growth lower means at the
-    candidate's Holm threshold for the ``base`` and ``stress`` cost paths; the
-    annualized ``LB_CAGR`` is derived by the caller as
+    ``primary_horizon_sessions`` and ``primary_profile_id`` are ``None`` when
+    no ``(horizon, profile)`` candidate is economically admissible (a normal
+    ``NO_TRADE`` outcome). ``adjusted_lower_growth`` maps a candidate keyed by
+    ``(horizon_sessions, profile_id)`` to its per-vintage log-growth lower
+    means at the candidate's Holm threshold for the ``base`` and ``stress``
+    cost paths; the annualized ``LB_CAGR`` is derived by the caller as
     ``expm1(annualization_sessions * lower_growth)``. ``rankability_reason``
     records why the linear screen may not run a nonlinear challenger.
     """
 
     primary_horizon_sessions: int | None
-    adjusted_lower_growth: dict[int, dict[str, float]]
-    base_p_values: dict[int, float]
-    stress_p_values: dict[int, float]
-    base_holm_thresholds: dict[int, float]
-    stress_holm_thresholds: dict[int, float]
+    primary_profile_id: str | None
+    adjusted_lower_growth: dict[tuple[int, str], dict[str, float]]
+    base_p_values: dict[tuple[int, str], float]
+    stress_p_values: dict[tuple[int, str], float]
+    base_holm_thresholds: dict[tuple[int, str], float]
+    stress_holm_thresholds: dict[tuple[int, str], float]
     selection_reasons: tuple[str, ...]
     rankability_reason: str = ""
     rank_ic_lower_bound: float = 0.0
@@ -101,17 +116,30 @@ class HorizonSelectionEvidence:
             else (self.primary_horizon_sessions,)
         )
 
+    @property
+    def selected_profile_id(self) -> str | None:
+        return self.primary_profile_id
+
     def to_json(self) -> dict[str, object]:
+        def keyed(mapping: dict[tuple[int, str], float]) -> dict[str, float]:
+            return {
+                f"{horizon}:{profile}": float(value)
+                for (horizon, profile), value in sorted(mapping.items())
+            }
+
         return {
             "primary_horizon_sessions": self.primary_horizon_sessions,
+            "primary_profile_id": self.primary_profile_id,
             "adjusted_lower_growth": {
-                str(horizon): dict(path)
-                for horizon, path in sorted(self.adjusted_lower_growth.items())
+                f"{horizon}:{profile}": dict(path)
+                for (horizon, profile), path in sorted(
+                    self.adjusted_lower_growth.items()
+                )
             },
-            "base_p_values": dict(self.base_p_values),
-            "stress_p_values": dict(self.stress_p_values),
-            "base_holm_thresholds": dict(self.base_holm_thresholds),
-            "stress_holm_thresholds": dict(self.stress_holm_thresholds),
+            "base_p_values": keyed(self.base_p_values),
+            "stress_p_values": keyed(self.stress_p_values),
+            "base_holm_thresholds": keyed(self.base_holm_thresholds),
+            "stress_holm_thresholds": keyed(self.stress_holm_thresholds),
             "selection_reasons": list(self.selection_reasons),
             "rankability_reason": self.rankability_reason,
             "rank_ic_lower_bound": self.rank_ic_lower_bound,
@@ -121,16 +149,16 @@ class HorizonSelectionEvidence:
     def evidence_hash(self) -> str:
         payload = sha256()
         payload.update(f"{self.primary_horizon_sessions}".encode())
-        for horizon, path in sorted(self.adjusted_lower_growth.items()):
+        for (horizon, profile), path in sorted(self.adjusted_lower_growth.items()):
             payload.update(
-                f"{horizon}:{path.get('base', 0.0):.17g}:"
+                f"{horizon}:{profile}:{path.get('base', 0.0):.17g}:"
                 f"{path.get('stress', 0.0):.17g};".encode()
             )
         return payload.hexdigest()
 
 
 def _segment_block_length(n_cohorts: int) -> int:
-    """Deterministic moving-block length ``ceil(n ** (1/3))`` in cohort units."""
+    """Deterministic moving-block length ``ceil(n ** (1/3))`` in session units."""
     if n_cohorts < 1:
         raise ValueError("segment must contain at least one cohort")
     block: int = ceil(float(n_cohorts) ** (1.0 / 3.0))
@@ -139,7 +167,7 @@ def _segment_block_length(n_cohorts: int) -> int:
 
 @dataclass(frozen=True, slots=True)
 class _CohortBootstrap:
-    """One candidate cost path's cohort-unit bootstrap summary."""
+    """One candidate cost path's session-unit bootstrap summary."""
 
     observed_mean: float
     boot_means: np.ndarray
@@ -155,14 +183,17 @@ def _cohort_bootstrap(
     cohort_segment_ids: tuple[int, ...],
     n_bootstrap: int,
     seed: int,
+    min_block_length: int = 1,
 ) -> _CohortBootstrap | None:
-    """One-sided centered moving-block bootstrap in non-overlapping cohort units.
+    """One-sided centered moving-block bootstrap in per-vintage session units.
 
     Resampling is performed independently within each segment with block length
-    ``ceil(n_s ** (1/3))`` cohorts and never crosses a segment boundary; the
-    per-segment resample means are pooled weighted by cohort count. Returns
-    ``None`` (inadmissible) when any segment has fewer than two resampling
-    blocks.
+    ``max(ceil(n_s ** (1/3)), min_block_length)`` sessions and never crosses a
+    segment boundary; the block length is at least ``min_block_length`` (the
+    candidate horizon) so the dependency of overlapping h-day returns is
+    preserved. The per-segment resample means are pooled weighted by vintage
+    count. Returns ``None`` (inadmissible) when any segment has fewer than two
+    resampling blocks.
     """
     by_segment: dict[int, list[float]] = {}
     for segment, value in zip(cohort_segment_ids, log_growth, strict=True):
@@ -172,7 +203,7 @@ def _cohort_bootstrap(
     n_blocks_total = 0
     for segment in sorted(by_segment):
         values = np.asarray(by_segment[segment], dtype=float)
-        block = _segment_block_length(values.size)
+        block = max(_segment_block_length(values.size), min_block_length)
         n_blocks = int(np.ceil(values.size / block))
         if n_blocks < 2:
             return None
@@ -204,50 +235,60 @@ def _cohort_bootstrap(
 
 def _holm_admission(
     candidates: tuple[HorizonOOFEvidence, ...],
-    bootstrap: dict[int, dict[str, _CohortBootstrap | None]],
+    bootstrap: dict[tuple[int, str], dict[str, _CohortBootstrap | None]],
     bootstrap_alpha: float,
 ) -> tuple[
-    dict[int, float],
-    dict[int, float],
-    dict[int, float],
+    dict[tuple[int, str], float],
+    dict[tuple[int, str], float],
+    dict[tuple[int, str], float],
     list[str],
 ]:
     """Holm-Bonferroni control across all candidates on the least favorable path.
 
-    The family is the candidate horizon set; each candidate's combined p-value is
-    the maximum of its base and stress centered p-values (the least favorable
-    path). The hypothesis at sorted rank ``j`` is rejected when
-    ``combined_p <= alpha / (m - j + 1)``. Returns the per-candidate combined
-    p-values, the base and stress Holm thresholds, and rejection reasons.
+    The family is the candidate ``(horizon, profile)`` set; each candidate's
+    combined p-value is the maximum of its base and stress centered p-values
+    (the least favorable path). The hypothesis at sorted rank ``j`` is rejected
+    when ``combined_p <= alpha / (m - j + 1)``. Returns the per-candidate
+    combined p-values, the base and stress Holm thresholds, and rejection
+    reasons.
     """
-    combined: dict[int, float] = {}
+    combined: dict[tuple[int, str], float] = {}
     for candidate in candidates:
-        horizon = candidate.horizon_sessions
-        base = bootstrap[horizon].get("base")
-        stress = bootstrap[horizon].get("stress")
+        key = _frontier_key(candidate.horizon_sessions, candidate.profile_id)
+        base = bootstrap[key].get("base")
+        stress = bootstrap[key].get("stress")
         if base is None or stress is None:
-            combined[horizon] = 1.0
+            combined[key] = 1.0
             continue
-        combined[horizon] = max(base.p_value, stress.p_value)
+        combined[key] = max(base.p_value, stress.p_value)
     m = len(candidates)
-    ordered = sorted(candidates, key=lambda candidate: combined[candidate.horizon_sessions])
-    base_thresholds: dict[int, float] = {}
-    stress_thresholds: dict[int, float] = {}
+    ordered = sorted(
+        candidates,
+        key=lambda candidate: (
+            combined[_frontier_key(candidate.horizon_sessions, candidate.profile_id)],
+            candidate.horizon_sessions,
+            candidate.profile_id,
+        ),
+    )
+    base_thresholds: dict[tuple[int, str], float] = {}
+    stress_thresholds: dict[tuple[int, str], float] = {}
     reasons: list[str] = []
     for rank, candidate in enumerate(ordered, start=1):
-        horizon = candidate.horizon_sessions
+        key = _frontier_key(candidate.horizon_sessions, candidate.profile_id)
         threshold = bootstrap_alpha / (m - rank + 1)
-        base_thresholds[horizon] = threshold
-        stress_thresholds[horizon] = threshold
-        base = bootstrap[horizon]["base"]
-        stress = bootstrap[horizon]["stress"]
+        base_thresholds[key] = threshold
+        stress_thresholds[key] = threshold
+        base = bootstrap[key]["base"]
+        stress = bootstrap[key]["stress"]
         if base is None or stress is None:
             reasons.append(
-                f"h{horizon}: inadmissible (fewer than two resampling blocks)"
+                f"h{candidate.horizon_sessions}:{candidate.profile_id} "
+                "inadmissible (fewer than two resampling blocks)"
             )
-        elif combined[horizon] > threshold:
+        elif combined[key] > threshold:
             reasons.append(
-                f"h{horizon}: Holm p {combined[horizon]:.6g} > {threshold:.6g}"
+                f"h{candidate.horizon_sessions}:{candidate.profile_id} "
+                f"Holm p {combined[key]:.6g} > {threshold:.6g}"
             )
     return combined, base_thresholds, stress_thresholds, reasons
 
@@ -258,21 +299,23 @@ def select_horizons(
     seed: int,
     n_bootstrap: int = DEFAULT_BOOTSTRAP_RESAMPLES,
 ) -> HorizonSelectionEvidence:
-    """Select at most one economically admissible primary horizon.
+    """Select at most one economically admissible primary ``(horizon, profile)``.
 
-    Selection is evidence-only: every candidate's base and stress per-session
-    log-growth series are resampled in cohort units (segment-local, never across
-    segment boundaries) and one-sided centered p-values are computed for the
-    null ``mean(g) <= 0``. Holm-Bonferroni is applied across every pre-registered
-    candidate; a horizon is admissible only when both its base and stress
-    adjusted lower growth are strictly positive. The primary is the admissible
-    horizon with the maximum stress-cost adjusted lower growth (ties prefer the
-    shorter horizon). ``primary_horizon_sessions`` is ``None`` when no candidate
-    is admissible (the ``NO_TRADE`` outcome).
+    Selection is evidence-only: every candidate's base and stress per-vintage
+    log-growth series are resampled in session units (segment-local, block
+    length at least the candidate horizon, never across segment boundaries) and
+    one-sided centered p-values are computed for the null ``mean(g) <= 0``.
+    Holm-Bonferroni is applied across every pre-registered candidate
+    ``(horizon, profile)`` pair; a pair is admissible only when both its base
+    and stress adjusted lower growth are strictly positive. The primary is the
+    admissible pair with the maximum stress-cost adjusted lower growth (ties
+    prefer the shorter horizon then the lexicographically smaller profile id).
+    ``primary_horizon_sessions``/``primary_profile_id`` are ``None`` when no
+    pair is admissible (the ``NO_TRADE`` outcome).
 
     Args:
-        evidence: pre-registered candidate horizons with their base/stress cohort
-            evidence, in ascending horizon order.
+        evidence: pre-registered candidate ``(horizon, profile)`` pairs with
+            their base/stress vintage evidence.
         bootstrap_alpha: bootstrap alpha quantile for the lower bound and Holm
             family-wise control.
         seed: deterministic bootstrap seed.
@@ -290,22 +333,26 @@ def select_horizons(
     if n_bootstrap < 2:
         raise ValueError("n_bootstrap must be at least 2")
 
-    ordered = tuple(sorted(evidence, key=lambda candidate: candidate.horizon_sessions))
-    bootstrap: dict[int, dict[str, _CohortBootstrap | None]] = {}
+    ordered = tuple(
+        sorted(evidence, key=lambda candidate: (candidate.horizon_sessions, candidate.profile_id))
+    )
+    bootstrap: dict[tuple[int, str], dict[str, _CohortBootstrap | None]] = {}
     for candidate in ordered:
-        horizon = candidate.horizon_sessions
-        bootstrap[horizon] = {
+        key = _frontier_key(candidate.horizon_sessions, candidate.profile_id)
+        bootstrap[key] = {
             "base": _cohort_bootstrap(
                 candidate.base_log_growth,
                 candidate.cohort_segment_ids,
                 n_bootstrap,
                 seed,
+                min_block_length=candidate.horizon_sessions,
             ),
             "stress": _cohort_bootstrap(
                 candidate.stress_log_growth,
                 candidate.cohort_segment_ids,
                 n_bootstrap,
-                seed + horizon,
+                seed + candidate.horizon_sessions,
+                min_block_length=candidate.horizon_sessions,
             ),
         }
 
@@ -313,51 +360,60 @@ def select_horizons(
         ordered, bootstrap, bootstrap_alpha
     )
 
-    adjusted_lower_growth: dict[int, dict[str, float]] = {}
+    adjusted_lower_growth: dict[tuple[int, str], dict[str, float]] = {}
     admissible: list[HorizonOOFEvidence] = []
     for candidate in ordered:
-        horizon = candidate.horizon_sessions
-        threshold = base_thresholds[horizon]
-        base = bootstrap[horizon]["base"]
-        stress = bootstrap[horizon]["stress"]
+        key = _frontier_key(candidate.horizon_sessions, candidate.profile_id)
+        threshold = base_thresholds[key]
+        base = bootstrap[key]["base"]
+        stress = bootstrap[key]["stress"]
         base_lower = 0.0
         stress_lower = 0.0
         if base is not None:
             base_lower = base.lower_mean(threshold)
         if stress is not None:
             stress_lower = stress.lower_mean(threshold)
-        adjusted_lower_growth[horizon] = {
+        adjusted_lower_growth[key] = {
             "base": base_lower,
             "stress": stress_lower,
         }
         if base_lower > 0.0 and stress_lower > 0.0:
             admissible.append(candidate)
             reasons.append(
-                f"h{horizon}: admissible base={base_lower:.6g} stress={stress_lower:.6g}"
+                f"h{candidate.horizon_sessions}:{candidate.profile_id} "
+                f"admissible base={base_lower:.6g} stress={stress_lower:.6g}"
             )
         else:
             reasons.append(
-                f"h{horizon}: adjusted lower growth base={base_lower:.6g} "
+                f"h{candidate.horizon_sessions}:{candidate.profile_id} "
+                f"adjusted lower growth base={base_lower:.6g} "
                 f"stress={stress_lower:.6g} not strictly positive"
             )
 
-    primary: int | None = None
+    primary_horizon: int | None = None
+    primary_profile: str | None = None
     if admissible:
-        primary = _best_primary(admissible, adjusted_lower_growth)
-        reasons.append(f"primary={primary} (max stress adjusted lower growth)")
+        primary_horizon, primary_profile = _best_primary(
+            admissible, adjusted_lower_growth
+        )
+        reasons.append(
+            f"primary=h{primary_horizon}:{primary_profile} "
+            "(max stress adjusted lower growth)"
+        )
     else:
         reasons.append("no candidate is economically admissible")
 
-    base_p_values: dict[int, float] = {}
-    stress_p_values: dict[int, float] = {}
-    for horizon in bootstrap:
-        base = bootstrap[horizon]["base"]
-        stress = bootstrap[horizon]["stress"]
-        base_p_values[horizon] = base.p_value if base is not None else 1.0
-        stress_p_values[horizon] = stress.p_value if stress is not None else 1.0
+    base_p_values: dict[tuple[int, str], float] = {}
+    stress_p_values: dict[tuple[int, str], float] = {}
+    for key, path in bootstrap.items():
+        base = path["base"]
+        stress = path["stress"]
+        base_p_values[key] = base.p_value if base is not None else 1.0
+        stress_p_values[key] = stress.p_value if stress is not None else 1.0
 
     return HorizonSelectionEvidence(
-        primary_horizon_sessions=primary,
+        primary_horizon_sessions=primary_horizon,
+        primary_profile_id=primary_profile,
         adjusted_lower_growth=adjusted_lower_growth,
         base_p_values=base_p_values,
         stress_p_values=stress_p_values,
@@ -369,17 +425,29 @@ def select_horizons(
 
 def _best_primary(
     admissible: list[HorizonOOFEvidence],
-    adjusted_lower_growth: dict[int, dict[str, float]],
-) -> int:
-    """Maximum stress adjusted lower growth; ties prefer the shorter horizon."""
-    best = admissible[0].horizon_sessions
+    adjusted_lower_growth: dict[tuple[int, str], dict[str, float]],
+) -> tuple[int, str]:
+    """Maximum stress adjusted lower growth; ties prefer shorter horizon, then id."""
+    best = admissible[0]
+    best_stress = adjusted_lower_growth[
+        _frontier_key(best.horizon_sessions, best.profile_id)
+    ]["stress"]
     for candidate in admissible[1:]:
-        horizon = candidate.horizon_sessions
-        current = adjusted_lower_growth[horizon]["stress"]
-        best_value = adjusted_lower_growth[best]["stress"]
+        key = _frontier_key(candidate.horizon_sessions, candidate.profile_id)
+        current = adjusted_lower_growth[key]["stress"]
         if (
-            current > best_value + _BOUND_TOLERANCE
-            or (abs(current - best_value) <= _BOUND_TOLERANCE and horizon < best)
+            current > best_stress + _BOUND_TOLERANCE
+            or (
+                abs(current - best_stress) <= _BOUND_TOLERANCE
+                and (
+                    candidate.horizon_sessions < best.horizon_sessions
+                    or (
+                        candidate.horizon_sessions == best.horizon_sessions
+                        and candidate.profile_id < best.profile_id
+                    )
+                )
+            )
         ):
-            best = horizon
-    return best
+            best = candidate
+            best_stress = current
+    return best.horizon_sessions, best.profile_id

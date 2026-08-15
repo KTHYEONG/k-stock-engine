@@ -307,13 +307,19 @@ def _build_schema(retained_cap: int) -> dict[str, object]:
                 "data": "bounded data shape + join evidence",
                 "cost_context": "cost schedule kind and evidence identity",
             },
-            "outcome": "promotion/no-trade evidence and gates",
+            "outcome": (
+                "promotion/no-trade evidence, selected profile, and gates"
+            ),
             "observability": {
                 "phases": "bounded phase samples",
                 "horizons": "per-candidate admission and fold diagnostics",
                 "summary": (
                     "bounded fold/cohort/multiplicity/operation-count/schema "
                     "diagnostics; never raw arrays"
+                ),
+                "policy_frontier": (
+                    "bounded candidate count, profile ids, per-(horizon,profile) "
+                    "dropout reasons, and per-segment vintage sums"
                 ),
                 "replay": "aggregate period-return summary",
                 "holdout": (
@@ -484,6 +490,10 @@ def _project_request(request: NetAlphaTrainingRequest) -> dict[str, object]:
         "candidate_horizon_sessions": [
             int(horizon) for horizon in request.candidate_horizon_sessions
         ],
+        "policy_profiles": [
+            {"profile_id": profile.profile_id, "no_trade_band_bps": profile.no_trade_band_bps}
+            for profile in request.policy_profiles
+        ],
         "fold_count": request.fold_count,
         "embargo_sessions": request.embargo_sessions,
         "forward_holdout_sessions": request.forward_holdout_sessions,
@@ -567,6 +577,7 @@ def _project_outcome(
     if not isinstance(raw_reasons, list):
         raw_reasons = gates.get("reasons", []) if isinstance(gates, dict) else []
     reasons = [_normalize_message(reason) for reason in raw_reasons if isinstance(reason, str)]
+    selected_profile = metrics.get("selected_profile")
     return {
         "model_family": model_type,
         "model_type": model_type,
@@ -574,6 +585,18 @@ def _project_outcome(
         "no_trade": no_trade,
         "promotion_reasons": reasons,
         "selected_horizons": _selected_horizons(metrics, manifest),
+        "selected_profile": {
+            "profile_id": (
+                str(selected_profile.get("profile_id", ""))
+                if isinstance(selected_profile, dict)
+                else str(metrics.get("primary_profile_id") or "")
+            ),
+            "no_trade_band_bps": (
+                _as_float(selected_profile.get("no_trade_band_bps"))
+                if isinstance(selected_profile, dict)
+                else None
+            ),
+        },
         "gates": {
             "passed": bool(gates.get("passed", promoted)),
             "reasons": [
@@ -709,6 +732,46 @@ def _project_holdout(metrics: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+def _project_policy_frontier(metrics: Mapping[str, object]) -> dict[str, object]:
+    """Bounded selected-profile frontier projection (dropout reasons, segment sums).
+
+    Never emits scores, returns, or per-instrument data; only the candidate
+    count, profile ids, per-``(horizon, profile)`` dropout reasons, and the
+    bounded per-segment vintage sums.
+    """
+    frontier = metrics.get("policy_frontier")
+    if not isinstance(frontier, dict):
+        return {}
+    profile_ids = frontier.get("profile_ids")
+    dropout = frontier.get("dropout_reasons")
+    segment_sums = frontier.get("segment_sums")
+    return {
+        "candidate_count": _as_int(frontier.get("candidate_count")),
+        "profile_ids": [
+            _normalize_message(value)
+            for value in (profile_ids if isinstance(profile_ids, (list, tuple)) else [])
+        ],
+        "dropout_reasons": (
+            {
+                str(key): _normalize_message(value)
+                for key, value in dropout.items()
+                if isinstance(dropout, dict)
+            }
+            if isinstance(dropout, dict)
+            else {}
+        ),
+        "segment_sums": (
+            {
+                str(key): _sanitize_deep(value)
+                for key, value in segment_sums.items()
+                if isinstance(segment_sums, dict)
+            }
+            if isinstance(segment_sums, dict)
+            else {}
+        ),
+    }
+
+
 def _bounded_observability_summary(
     telemetry: Mapping[str, object],
 ) -> dict[str, object]:
@@ -716,8 +779,8 @@ def _bounded_observability_summary(
 
     Scans the terminal telemetry phases for the bounded scalars the redesigned
     trainer publishes (schema fingerprint, path counts, fold geometry, cohort
-    completeness, adjusted evidence, challenger reason) and never extracts raw
-    score, label, order, or return arrays.
+    completeness, adjusted evidence, challenger reason, policy-frontier dropout
+    reasons) and never extracts raw score, label, order, or return arrays.
     """
     phases = telemetry.get("phases")
     if not isinstance(phases, list):
@@ -739,9 +802,28 @@ def _bounded_observability_summary(
     ):
         if key in discovery:
             summary[key] = discovery[key]
+    frontier = by_name.get("policy_frontier", {})
+    if isinstance(frontier.get("candidate_count"), int):
+        summary["frontier_candidate_count"] = frontier["candidate_count"]
+        summary["frontier_candidate_bound"] = frontier.get("candidate_bound")
+        summary["frontier_profile_ids"] = frontier.get("profile_ids")
+        dropout = frontier.get("dropout_reasons")
+        if isinstance(dropout, dict):
+            summary["frontier_dropout_reasons"] = {
+                str(key): _normalize_message(value)
+                for key, value in dropout.items()
+            }
+        segment_sums = frontier.get("segment_sums")
+        if isinstance(segment_sums, dict):
+            summary["frontier_segment_sums"] = {
+                str(key): _sanitize_deep(value)
+                for key, value in segment_sums.items()
+            }
     selection = by_name.get("primary_selection", {})
     if "primary_horizon_sessions" in selection:
         summary["primary_horizon_sessions"] = selection["primary_horizon_sessions"]
+    if "primary_profile_id" in selection:
+        summary["primary_profile_id"] = selection["primary_profile_id"]
     if "rankability_reason" in selection:
         summary["rankability_reason"] = selection["rankability_reason"]
     comparison = by_name.get("model_comparison", {})
@@ -764,6 +846,7 @@ def _observability_from(
             "phases": list(telemetry.get("phases") or []),
             "horizons": list(telemetry.get("horizons") or []),
             "summary": _bounded_observability_summary(telemetry),
+            "policy_frontier": _project_policy_frontier(metrics),
         }
     run_obs = metrics.get("run_observability")
     if isinstance(run_obs, dict):
@@ -771,8 +854,14 @@ def _observability_from(
             "phases": list(run_obs.get("phases") or []),
             "horizons": list(run_obs.get("horizons") or []),
             "summary": _bounded_observability_summary(run_obs),
+            "policy_frontier": _project_policy_frontier(metrics),
         }
-    return {"phases": [], "horizons": [], "summary": {}}
+    return {
+        "phases": [],
+        "horizons": [],
+        "summary": {},
+        "policy_frontier": _project_policy_frontier(metrics),
+    }
 
 
 def _project_completed(
@@ -802,6 +891,9 @@ def _project_completed(
             "phases": _sanitize_deep(observability.get("phases")),
             "horizons": _sanitize_deep(observability.get("horizons")),
             "summary": _sanitize_deep(observability.get("summary")),
+            "policy_frontier": _sanitize_deep(
+                observability.get("policy_frontier")
+            ),
             "replay": _project_replay(metrics),
             "holdout": _project_holdout(metrics),
         },
@@ -900,6 +992,9 @@ def _project_reconcile_record(
             "phases": _sanitize_deep(observability["phases"]),
             "horizons": _sanitize_deep(observability["horizons"]),
             "summary": _sanitize_deep(observability["summary"]),
+            "policy_frontier": _sanitize_deep(
+                _project_policy_frontier(metrics)
+            ),
             "replay": _project_replay(metrics),
             "holdout": _project_holdout(metrics),
         },
