@@ -552,3 +552,222 @@ def test_evaluate_deterministic_for_identical_inputs() -> None:
     assert first.orders == second.orders
     assert first.period_net_returns == second.period_net_returns
     assert first.segment_diagnostics == second.segment_diagnostics
+
+
+def _status_projection(
+    scored: pl.DataFrame,
+    realized: pl.DataFrame,
+    *,
+    unresolved: set[tuple[str, object]] | None = None,
+    tail: set[tuple[str, object]] | None = None,
+) -> pl.DataFrame:
+    """All-REALIZED status projection, with optional typed unresolved/tail keys."""
+    rows: list[dict[str, object]] = []
+    for row in scored.select("instrument_id", "session").unique().iter_rows(named=True):
+        key = (str(row["instrument_id"]), row["session"])
+        if tail is not None and key in tail:
+            state = "PARTIAL_TAIL"
+        elif unresolved is not None and key in unresolved:
+            state = "MISSING_EXIT_PRICE"
+        elif str(key[0]) in set(realized["instrument_id"].to_list()) or (
+            row["session"] in realized["session"].to_list()
+            and str(row["instrument_id"]) in set(realized["instrument_id"].to_list())
+        ):
+            state = "REALIZED"
+        else:
+            state = "MISSING_EXIT_PRICE"
+        rows.append(
+            {
+                "instrument_id": row["instrument_id"],
+                "session": row["session"],
+                "outcome_status": state,
+            }
+        )
+    return pl.DataFrame(
+        rows,
+        schema={
+            "instrument_id": pl.Utf8,
+            "session": pl.Datetime("us", "UTC"),
+            "outcome_status": pl.Utf8,
+        },
+    )
+
+
+def test_evaluate_status_all_realized_preserves_replay_timeline() -> None:
+    """Acceptance 1: an all-REALIZED status panel changes no order or block."""
+    scored, realized, _sessions = _segmented_panel(names_per_session=2)
+    replay = NetAlphaPolicyReplay(
+        2, _PORTFOLIO, _RISK, liquidity_model=_LIQUIDITY
+    )
+    baseline = replay.evaluate(scored, realized, segment_column="oof_segment_id")
+    status = _status_projection(scored, realized)
+    with_status = replay.evaluate(
+        scored, realized, segment_column="oof_segment_id", status=status
+    )
+    assert with_status.orders == baseline.orders
+    assert with_status.blocks == baseline.blocks
+    assert with_status.period_net_returns == baseline.period_net_returns
+    assert with_status.vintage_segment_ids == baseline.vintage_segment_ids
+    assert with_status.segment_diagnostics == baseline.segment_diagnostics
+    assert with_status.missing_realized_vintage_count == 0
+    assert with_status.unresolved_outcome_counts == ()
+
+
+def test_evaluate_selected_missing_exit_price_is_never_zero_filled() -> None:
+    """Acceptance 2: a selected MISSING_EXIT_PRICE fails closed per typed state."""
+    sessions = _span(6)
+    scored = _scored(
+        [(f"KRX:{pos:05d}", session, 0.05) for pos, session in enumerate(sessions)]
+    )
+    realized = _realized(
+        [
+            (f"KRX:{pos:05d}", session, 0.05, 100.0, 1.0e8, 0.02)
+            for pos, session in enumerate(sessions)
+            if pos != 0
+        ]
+    )
+    missing_key = ("KRX:00000", sessions[0])
+    status = _status_projection(scored, realized, unresolved={missing_key})
+    replay = NetAlphaPolicyReplay(
+        3, _PORTFOLIO, _RISK, liquidity_model=_LIQUIDITY
+    )
+    evaluation = replay.evaluate(scored, realized, status=status)
+    assert evaluation.missing_realized_vintage_count == 1
+    assert evaluation.unresolved_outcome_counts == (("MISSING_EXIT_PRICE", 1),)
+    assert evaluation.period_count == 2
+    assert 0.0 not in evaluation.period_net_returns
+    segment = evaluation.segment_diagnostics[0]
+    assert segment.unresolved_outcome_counts == (("MISSING_EXIT_PRICE", 1),)
+    assert segment.missing_realized_vintage_count == 1
+
+
+def test_evaluate_multi_order_unresolved_vintage_counts_once_by_signature() -> None:
+    """Two unresolved orders invalidate one vintage, not two vintages."""
+    sessions = _span(6)
+    scored = _scored(
+        [
+            (f"KRX:{instrument:05d}", session, 0.05 - instrument * 0.001)
+            for session in sessions
+            for instrument in range(2)
+        ]
+    )
+    realized = _realized(
+        [
+            (f"KRX:{instrument:05d}", session, 0.05, 100.0, 1.0e8, 0.02)
+            for session in sessions
+            for instrument in range(2)
+        ]
+    )
+    unresolved = {
+        (f"KRX:{instrument:05d}", sessions[0]) for instrument in range(2)
+    }
+    status = _status_projection(scored, realized, unresolved=unresolved)
+    replay = NetAlphaPolicyReplay(
+        3, _PORTFOLIO, _RISK, liquidity_model=_LIQUIDITY
+    )
+
+    evaluation = replay.evaluate(scored, realized, status=status)
+
+    assert evaluation.missing_realized_vintage_count == 1
+    assert evaluation.unresolved_outcome_counts == (("MISSING_EXIT_PRICE", 1),)
+    segment = evaluation.segment_diagnostics[0]
+    assert segment.missing_realized_vintage_count == 1
+    assert segment.unresolved_outcome_counts == (("MISSING_EXIT_PRICE", 1),)
+
+
+def test_evaluate_mixed_unresolved_states_preserves_one_vintage_signature() -> None:
+    """A mixed-cause vintage records one deterministic signature."""
+    sessions = _span(6)
+    scored = _scored(
+        [
+            (f"KRX:{instrument:05d}", session, 0.05 - instrument * 0.001)
+            for session in sessions
+            for instrument in range(2)
+        ]
+    )
+    realized = _realized(
+        [
+            (f"KRX:{instrument:05d}", session, 0.05, 100.0, 1.0e8, 0.02)
+            for session in sessions
+            for instrument in range(2)
+        ]
+    )
+    unresolved = {
+        (f"KRX:{instrument:05d}", sessions[0]) for instrument in range(2)
+    }
+    status = _status_projection(scored, realized, unresolved=unresolved).with_columns(
+        pl.when(
+            (pl.col("instrument_id") == "KRX:00001")
+            & (pl.col("session") == sessions[0])
+        )
+        .then(pl.lit("MISSING_ENTRY_PRICE"))
+        .otherwise(pl.col("outcome_status"))
+        .alias("outcome_status")
+    )
+    replay = NetAlphaPolicyReplay(
+        3, _PORTFOLIO, _RISK, liquidity_model=_LIQUIDITY
+    )
+
+    evaluation = replay.evaluate(scored, realized, status=status)
+
+    assert evaluation.missing_realized_vintage_count == 1
+    assert evaluation.unresolved_outcome_counts == (
+        (("MISSING_ENTRY_PRICE|MISSING_EXIT_PRICE"), 1),
+    )
+
+
+def test_evaluate_segment_tail_is_partial_and_mature_tail_raises() -> None:
+    """Acceptance 3: chronological tail is PARTIAL_TAIL; mature-segment tail is error."""
+    scored, realized, _sessions = _segmented_panel()
+    replay = NetAlphaPolicyReplay(
+        2, _PORTFOLIO, _RISK, liquidity_model=_LIQUIDITY
+    )
+    # Every key is realized except the trailing position of the last segment.
+    tail_key = ("KRX:00005", scored["session"].to_list()[-1])
+    status = _status_projection(scored, realized, tail={tail_key})
+    evaluation = replay.evaluate(
+        scored, realized, segment_column="oof_segment_id", status=status
+    )
+    # The tail key lives in a segment-local tail position (position 2, horizon 2)
+    # and is therefore a chronological partial vintage, not a mature failure.
+    assert evaluation.partial_vintage_count == 4
+    assert evaluation.missing_realized_vintage_count == 0
+
+    # The same sidecar PARTIAL_TAIL in a mature position (first session of
+    # segment 0) must raise ValueError: only the segment-local maturity rule
+    # may classify a tail.
+    mature_tail = ("KRX:00000", scored["session"].to_list()[0])
+    bad_status = _status_projection(scored, realized, tail={mature_tail})
+    with pytest.raises(ValueError, match="PARTIAL_TAIL inside a mature segment"):
+        replay.evaluate(
+            scored, realized, segment_column="oof_segment_id", status=bad_status
+        )
+
+
+def test_evaluate_realized_status_without_inputs_raises() -> None:
+    """A REALIZED status whose replay inputs are absent is a contract violation."""
+    sessions = _span(6)
+    scored = _scored(
+        [(f"KRX:{pos:05d}", session, 0.05) for pos, session in enumerate(sessions)]
+    )
+    realized = _realized(
+        [
+            (f"KRX:{pos:05d}", session, 0.05, 100.0, 1.0e8, 0.02)
+            for pos, session in enumerate(sessions)
+            if pos != 0
+        ]
+    )
+    # The missing key (session zero) is declared REALIZED even though its
+    # realized inputs are absent from the panel.
+    status = _status_projection(scored, realized)
+    status = status.with_columns(
+        pl.when(pl.col("session") == sessions[0])
+        .then(pl.lit("REALIZED"))
+        .otherwise(pl.col("outcome_status"))
+        .alias("outcome_status")
+    )
+    replay = NetAlphaPolicyReplay(
+        3, _PORTFOLIO, _RISK, liquidity_model=_LIQUIDITY
+    )
+    with pytest.raises(ValueError, match="REALIZED status"):
+        replay.evaluate(scored, realized, status=status)

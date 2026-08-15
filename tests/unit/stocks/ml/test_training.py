@@ -292,6 +292,14 @@ def test_coverage_failure_reason_fails_closed_on_missing_and_incomplete() -> Non
         "active-coverage-insufficient:"
     )
 
+    typed = replace(
+        base_evidence,
+        unresolved_outcome_counts=(("MISSING_EXIT_PRICE", 2),),
+    )
+    reason = training._coverage_failure_reason(typed, request)
+    assert reason.startswith("unresolved-outcome:")
+    assert "MISSING_EXIT_PRICE:2" in reason
+
 
 def test_score_is_constant_classifies_degenerate_predictions() -> None:
     assert training._score_is_constant(np.asarray([0.0, 0.0])) is True
@@ -609,6 +617,16 @@ def test_run_observability_preserves_terminal_no_trade_reason(tmp_path) -> None:
     assert all("admission" in entry for entry in run_obs["horizons"])
     json.dumps(run_obs)
     assert len(json.dumps(run_obs).encode("utf-8")) < 24 * 1024
+    frontier = metrics["policy_frontier"]
+    assert frontier["candidate_count"] == 0
+    assert frontier["profile_ids"] == ["legacy_overlay_5bps", "lower_bound_only"]
+    assert len(frontier["dropout_reasons"]) == 12
+    assert all(
+        f"{h}:{p}" in frontier["dropout_reasons"]
+        for h in (3, 5, 8, 10, 15, 20)
+        for p in ("legacy_overlay_5bps", "lower_bound_only")
+    )
+    json.dumps(frontier)
 
 
 def test_train_net_alpha_model_promotes_champion_or_no_trade(tmp_path) -> None:
@@ -669,3 +687,67 @@ def test_train_net_alpha_model_promotes_champion_or_no_trade(tmp_path) -> None:
     )
     assert discovery_phase["path_evaluation_bound"] == 6 * 2 * (3 + 1)
     assert discovery_phase["path_evaluation_count"] <= discovery_phase["path_evaluation_bound"]
+
+
+def test_horizon_evidence_coverage_rejects_unresolved_outcomes() -> None:
+    """Acceptance 2: a selected unresolved outcome fails the coverage preflight."""
+    from dataclasses import replace
+
+    from src.stocks.ml.contracts import (
+        OUTCOME_MISSING_EXIT_PRICE,
+        OUTCOME_REALIZED,
+    )
+
+    data, request, pre_holdout, folds, learner_columns, _schema = _training_fixture()
+    discovery = training._build_horizon_evidence(
+        pre_holdout, folds, data, request, learner_columns
+    )
+    # The fixture derives a fully-REALIZED status panel, so every candidate that
+    # reaches replay must have no typed unresolved counts.
+    for candidate in discovery.evidence:
+        assert candidate.unresolved_outcome_counts == ()
+
+    # A candidate whose replay would fail with a typed unresolved outcome must
+    # be rejected by the coverage gate before bootstrap.
+    evidence = discovery.evidence[0] if discovery.evidence else None
+    if evidence is None:
+        pytest.skip("fixture produced no horizon evidence")
+    unresolved = replace(
+        evidence,
+        unresolved_outcome_counts=((OUTCOME_MISSING_EXIT_PRICE, 1),),
+    )
+    reason = training._coverage_failure_reason(unresolved, request)
+    assert reason.startswith("unresolved-outcome:")
+    assert OUTCOME_MISSING_EXIT_PRICE in reason
+    assert OUTCOME_REALIZED not in reason
+
+
+def test_replay_costs_base_stress_share_status_and_maturity() -> None:
+    """Acceptance 1: base/stress replay with a status panel share the timeline."""
+    from dataclasses import replace
+
+    data, request, pre_holdout, folds, learner_columns, _schema = _training_fixture()
+    discovery = training._build_horizon_evidence(
+        pre_holdout, folds, data, request, learner_columns
+    )
+    if not discovery.evidence:
+        pytest.skip("fixture produced no horizon evidence")
+    primary = discovery.evidence[0].horizon_sessions
+    oof, oof_labels, _ics = discovery.oof_by_horizon[primary]
+    coverage = discovery.coverage_by_horizon[primary]
+    risk = replace(
+        request.risk,
+        no_trade_band_bps=(
+            5.0
+            if discovery.evidence[0].profile_id == "legacy_overlay_5bps"
+            else 0.0
+        ),
+    )
+    base_eval, stress_eval = training._replay_costs(
+        oof, oof_labels, request, primary, risk,
+        status=coverage.status_projection,
+    )
+    assert base_eval.segment_diagnostics == stress_eval.segment_diagnostics
+    assert base_eval.vintage_segment_ids == stress_eval.vintage_segment_ids
+    assert base_eval.unresolved_outcome_counts == ()
+    assert base_eval.missing_realized_vintage_count == 0
