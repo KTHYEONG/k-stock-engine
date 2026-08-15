@@ -245,3 +245,77 @@ def test_train_net_alpha_model_types_are_canonical(tmp_path) -> None:
             "net_alpha_elastic_net",
             "net_alpha_lightgbm_l1",
         }
+
+
+def test_train_model_records_completed_through_injected_observer(tmp_path) -> None:
+    snapshot, _df = _snapshot()
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    calls: list[tuple] = []
+
+    class _SpyObserver:
+        def record_completed(self, context, manifest, registry, telemetry=None):
+            del registry, telemetry
+            calls.append(("completed", context.artifact_id, manifest.artifact_id))
+
+        def record_failed(self, context, phase, exc, telemetry=None):
+            del context, phase, exc, telemetry
+            calls.append(("failed",))
+
+    train_model(snapshot, registry, _request("na_obs"), observer=_SpyObserver())
+    assert calls == [("completed", "na_obs", "na_obs")]
+
+
+def test_train_model_records_failure_through_injected_observer(tmp_path) -> None:
+    df = stock_net_alpha_composed_df(
+        n_sessions=120, n_tickers=8, audit_clean=True, label_scale=50.0
+    )
+    realized_drops = [
+        c
+        for c in df.columns
+        if c.startswith(("risk_residual_", "reference_cost_"))
+    ]
+    df = df.drop(realized_drops)
+    manifest = stock_net_alpha_manifest(columns=df.columns)
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    calls: list[tuple] = []
+
+    class _SpyObserver:
+        def record_completed(self, *args, **kwargs):
+            del args, kwargs
+            calls.append(("completed",))
+
+        def record_failed(self, context, phase, exc, telemetry=None):
+            del context, telemetry
+            calls.append(("failed", phase, type(exc).__name__))
+
+    with pytest.raises(ValueError, match="realized-outcome"):
+        train_model(
+            DatasetSnapshot(manifest=manifest, frame=df),
+            registry,
+            _request("na_fail_obs"),
+            observer=_SpyObserver(),
+        )
+    assert calls
+    assert calls[0][0] == "failed"
+    assert calls[0][2] == "ValueError"
+
+
+def test_train_model_ledger_failure_does_not_change_artifact(tmp_path) -> None:
+    snapshot, _df = _snapshot()
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+
+    class _ExplodingObserver:
+        def record_completed(self, context, manifest, registry, telemetry=None):
+            del context, manifest, registry, telemetry
+            raise RuntimeError("ledger boom")
+
+        def record_failed(self, context, phase, exc, telemetry=None):
+            del context, phase, exc, telemetry
+
+    manifest = train_model(
+        snapshot,
+        registry,
+        _request("na_obs_ledger_fail"),
+        observer=_ExplodingObserver(),
+    )
+    assert manifest.artifact_id == "na_obs_ledger_fail"
