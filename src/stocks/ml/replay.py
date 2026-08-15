@@ -192,10 +192,16 @@ class NetAlphaPolicyReplay:
         decision_sessions: list[int] = []
 
         cohort_weights: dict[int, list[PolicyOrder]] = {}
+        by_session = {
+            key[0]: frame
+            for key, frame in scored.partition_by(
+                _SESSION, maintain_order=True, as_dict=True
+            ).items()
+        }
         for session in sessions:
             position = session_index[session]
             cohort = position // cohort_size
-            cross = scored.filter(pl.col(_SESSION) == session).sort(
+            cross = by_session[session].sort(
                 [economic_score, _ID], descending=[True, False]
             )
             top = cross.head(portfolio.top_k)
