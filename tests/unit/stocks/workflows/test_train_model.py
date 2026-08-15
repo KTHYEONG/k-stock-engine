@@ -70,6 +70,7 @@ def _compound_request(artifact_id: str, **kwargs) -> NetAlphaTrainingRequest:
         "liquidity_model": stock_liquidity_model(),
         "risk": RiskSettings(min_calibration_sessions=40),
         "compounding": CompoundingCertificationSettings(
+            annualization_sessions=60,
             min_observed_sessions=40,
             min_active_cohort_fraction=0.5,
             max_drawdown=0.5,
@@ -209,7 +210,7 @@ def test_train_net_alpha_writes_complete_no_trade_evidence(tmp_path) -> None:
     )
     artifact_root = tmp_path / "artifacts"
     registry = ModelArtifactRegistry(artifact_root)
-    train_model(snapshot, registry, _request("na_no_trade"))
+    train_model(snapshot, registry, _compound_request("na_no_trade"))
     metrics_path = artifact_root / "na_no_trade" / METRICS_FILENAME
     assert metrics_path.exists()
     payload = json.loads(metrics_path.read_text())
@@ -286,7 +287,7 @@ def test_train_net_alpha_v3_publishes_no_trade_without_positive_evidence(
     manifest = stock_net_alpha_manifest(columns=df.columns)
     registry = ModelArtifactRegistry(tmp_path / "artifacts")
     snapshot = DatasetSnapshot(manifest=manifest, frame=df)
-    result = train_model(snapshot, registry, _request("na_no_evidence"))
+    result = train_model(snapshot, registry, _compound_request("na_no_evidence"))
     assert result.artifact_id == "na_no_evidence"
     assert result.model_type == "no_trade"
     metrics = json.loads(
@@ -318,7 +319,7 @@ def test_train_net_alpha_missing_realized_outcomes_fail_closed(tmp_path) -> None
     registry = ModelArtifactRegistry(tmp_path / "artifacts")
     snapshot = DatasetSnapshot(manifest=manifest, frame=df)
     with pytest.raises(ValueError, match="realized-outcome"):
-        train_model(snapshot, registry, _request("na_missing_realized"))
+        train_model(snapshot, registry, _compound_request("na_missing_realized"))
 
 
 def test_train_net_alpha_model_types_are_canonical(tmp_path) -> None:
@@ -387,7 +388,7 @@ def test_train_model_records_failure_through_injected_observer(tmp_path) -> None
         train_model(
             DatasetSnapshot(manifest=manifest, frame=df),
             registry,
-            _request("na_fail_obs"),
+            _compound_request("na_fail_obs"),
             observer=_SpyObserver(),
         )
     assert calls

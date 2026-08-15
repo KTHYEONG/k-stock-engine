@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import numpy as np
+import pytest
 import polars as pl
 
 from src.core.instruments import AssetKind
@@ -240,3 +241,128 @@ class _DummyModel:
 
     def manifest(self) -> ModelManifest:
         return self._manifest
+
+
+def test_session_balanced_weights_equalize_session_totals() -> None:
+    from src.stocks.ml.models import (
+        normalize_session_weights,
+        session_balanced_weights,
+    )
+
+    frame = pl.DataFrame(
+        {
+            "session": [1, 1, 1, 2, 2],
+            "instrument_id": ["a", "b", "c", "d", "e"],
+            "x": [1.0, 2.0, 3.0, 4.0, 5.0],
+        }
+    )
+    raw = session_balanced_weights(frame)
+    assert raw[0] == pytest.approx(1.0 / 3.0)
+    assert raw[3] == pytest.approx(1.0 / 2.0)
+    normalized = normalize_session_weights(raw)
+    assert normalized.sum() == pytest.approx(frame.height)
+    # Each session carries equal total training weight despite different sizes.
+    assert normalized[:3].sum() == pytest.approx(normalized[3:].sum())
+
+
+def test_session_balanced_weights_reject_malformed() -> None:
+    from src.stocks.ml.models import normalize_session_weights
+
+    with pytest.raises(ValueError, match="malformed"):
+        normalize_session_weights(np.asarray([0.0, 1.0, -1.0]))
+    with pytest.raises(ValueError, match="malformed"):
+        normalize_session_weights(np.asarray([np.nan, 1.0]))
+
+
+def test_weighted_path_selection_matches_independent_elastic_fits() -> None:
+    from scipy.stats import spearmanr
+    from sklearn.linear_model import ElasticNet
+
+    from src.stocks.ml.models import (
+        _float32_matrix,
+        fit_weighted_elastic_path,
+        normalize_session_weights,
+        session_balanced_weights,
+        weighted_fold_statistics,
+    )
+
+    rng = np.random.default_rng(11)
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    rows: list[dict] = []
+    for s in range(80):
+        for t in range(12):
+            x1 = float(rng.normal(0.0, 1.0))
+            x2 = float(rng.normal(0.0, 1.0))
+            x3 = float(rng.normal(0.0, 1.0))
+            target = 0.3 * x1 - 0.2 * x2 + 0.1 * x3 + rng.normal(0.0, 0.01)
+            rows.append(
+                {
+                    "session_index": s,
+                    "session": start,
+                    "instrument_id": f"KRX:{t:05d}",
+                    "feature__a": x1,
+                    "feature__b": x2,
+                    "feature__c": x3,
+                    "net_alpha_target": target,
+                    "realized_net_return": target,
+                }
+            )
+    frame = pl.DataFrame(rows)
+    train = frame.filter(pl.col("session_index") < 60)
+    validation = frame.filter(pl.col("session_index") >= 60)
+    columns = ("feature__a", "feature__b", "feature__c")
+    fractions = (0.01, 0.03, 0.10, 0.30)
+    solution = fit_weighted_elastic_path(train, columns, fractions, seed=42)
+    assert solution is not None
+    alpha_max = solution.alpha_max
+
+    def _rank_ic_for(scores: np.ndarray, val: pl.DataFrame) -> float:
+        sub = val.with_columns(pl.Series("__score", scores)).select(
+            "session", "__score", "realized_net_return"
+        ).filter(
+            pl.col("__score").is_not_null()
+            & pl.col("realized_net_return").is_not_null()
+        )
+        ics = []
+        for rows_ in sub.partition_by("session"):
+            if rows_.height < 2:
+                continue
+            rho, _ = spearmanr(
+                rows_["__score"].to_numpy(), rows_["realized_net_return"].to_numpy()
+            )
+            ics.append(float(rho))
+        return float(np.mean(ics)) if ics else 0.0
+
+    path_scores = solution.predict(validation, columns)
+    path_ics = {
+        fraction: _rank_ic_for(path_scores[fraction], validation)
+        for fraction in fractions
+    }
+    best_path = max(fractions, key=lambda f: path_ics[f])
+
+    features = _float32_matrix(train, columns)
+    targets = train["net_alpha_target"].cast(pl.Float64).to_numpy()
+    valid = np.isfinite(features).all(axis=1) & np.isfinite(targets)
+    weights = normalize_session_weights(
+        session_balanced_weights(train), total=int(valid.sum())
+    )[valid]
+    mean, std = weighted_fold_statistics(features, weights, valid)
+    standardized = (features[valid] - mean) / std
+    independent_ics: dict[float, float] = {}
+    for fraction in fractions:
+        model = ElasticNet(
+            alpha=fraction * alpha_max,
+            l1_ratio=0.5,
+            max_iter=2000,
+            random_state=42,
+        )
+        model.fit(standardized, targets[valid], sample_weight=weights)
+        val_features = _float32_matrix(validation, columns)
+        val_std = (val_features - mean) / std
+        val_std[~np.isfinite(val_std)] = 0.0
+        independent_ics[fraction] = _rank_ic_for(
+            model.predict(val_std), validation
+        )
+    best_independent = max(fractions, key=lambda f: independent_ics[f])
+    assert best_path == best_independent
+    assert path_ics[best_path] == pytest.approx(independent_ics[best_path], abs=1e-6)
