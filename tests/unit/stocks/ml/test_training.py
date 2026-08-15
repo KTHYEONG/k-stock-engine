@@ -201,6 +201,90 @@ def test_horizon_evidence_constant_baseline_triggers_structural_fallback(monkeyp
     )
 
 
+class _FakeClock:
+    def __init__(self, start: datetime) -> None:
+        self.value = start
+
+    def __call__(self) -> datetime:
+        return self.value
+
+    def advance(self, delta) -> None:
+        self.value += delta
+
+
+def test_training_telemetry_records_phases_without_fitting() -> None:
+    from datetime import timedelta
+
+    clock = _FakeClock(datetime(2024, 1, 1, tzinfo=UTC))
+    telemetry = training.TrainingTelemetry(clock=clock)
+    telemetry.phase("integrity_audit", {"passed": True})
+    clock.advance(timedelta(seconds=2))
+    telemetry.phase("feature_transform", {"learner_feature_count": 4})
+    data = telemetry.to_dict()
+    assert [p["name"] for p in data["phases"]] == [
+        "integrity_audit",
+        "feature_transform",
+    ]
+    assert data["phases"][0]["elapsed_ms"] == 0
+    assert data["phases"][1]["elapsed_ms"] == 2000
+    assert data["phases"][1]["learner_feature_count"] == 4
+    assert data["phases"][0]["peak_rss_mib"] is None or isinstance(
+        data["phases"][0]["peak_rss_mib"], float
+    )
+
+
+def test_run_observability_preserves_terminal_no_trade_reason(tmp_path) -> None:
+    import json
+    from pathlib import Path
+
+    from src.stocks.data.contracts import DatasetSnapshot
+    from src.stocks.ml.contracts import NetAlphaTrainingRequest
+    from src.stocks.ml.data import compose_net_alpha_training_data
+    from src.stocks.research.artifacts import ModelArtifactRegistry
+    from tests.fixtures.stocks.helpers import (
+        stock_liquidity_model,
+        stock_net_alpha_composed_df,
+        stock_net_alpha_manifest,
+    )
+
+    df = stock_net_alpha_composed_df(
+        n_sessions=120, n_tickers=8, audit_clean=True, label_scale=0.0
+    )
+    snapshot = DatasetSnapshot(
+        manifest=stock_net_alpha_manifest(columns=df.columns), frame=df
+    )
+    data = compose_net_alpha_training_data(
+        snapshot, datetime(2024, 12, 31, tzinfo=UTC), (3, 5, 8, 10, 15, 20)
+    )
+    registry = ModelArtifactRegistry(Path(tmp_path) / "artifacts")
+    request = NetAlphaTrainingRequest(
+        artifact_id="na_obs_reason",
+        fold_count=2,
+        candidate_horizon_sessions=(3, 5, 8, 10, 15, 20),
+        bootstrap_resamples=50,
+        liquidity_model=stock_liquidity_model(),
+    )
+    manifest = training.train_net_alpha_model(data, registry, request)
+    assert manifest.model_type == "no_trade"
+    metrics = json.loads(
+        (Path(tmp_path) / "artifacts" / "na_obs_reason" / "metrics.json").read_text()
+    )
+    run_obs = metrics["run_observability"]
+    phases = run_obs["phases"]
+    names = [p["name"] for p in phases]
+    assert names[:4] == [
+        "integrity_audit",
+        "feature_transform",
+        "holdout_lock",
+        "horizon_discovery",
+    ]
+    assert phases[-1]["name"] == "artifact_publish"
+    assert phases[-1]["reason"] == "no-horizon-evidence"
+    assert all("admission" in entry for entry in run_obs["horizons"])
+    json.dumps(run_obs)
+    assert len(json.dumps(run_obs).encode("utf-8")) < 24 * 1024
+
+
 def test_train_net_alpha_model_promotes_champion_or_no_trade(tmp_path) -> None:
     from datetime import UTC, datetime
     from pathlib import Path
