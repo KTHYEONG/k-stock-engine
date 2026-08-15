@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_NET_ALPHA_OOF_SIGNAL_RECOVERY",
+      "date": "2026-08-15",
+      "adr_id": "ADR_20260815_STOCK_NET_ALPHA_OOF_SIGNAL_RECOVERY",
+      "domain": "stocks",
+      "title": "Stock net-alpha OOF signal recovery",
+      "why": "OOF evidence was empty because the fixed ElasticNet penalty produced constant predictions, LightGBM target-free early stopping failed, and replay ValueErrors were hidden.",
+      "resolution": "Added fold-local scale-invariant regularization, target-free LightGBM training, causal session-cluster calibration, structural fallback routing, and typed OOF/replay diagnostics; preserved economic gates.",
+      "impact": "Replay failures are observable and fail closed; causal OOF and holdout evidence remain required. Ruff, mypy, spec compliance, and 692 tests pass."
+    },
+    {
       "task_id": "TASK_STOCK_NET_ALPHA_DATA_VALIDATION_AUDIT",
       "date": "2026-08-14",
       "adr_id": "ADR_20260814_STOCK_NET_ALPHA_DATA_VALIDATION_AUDIT",
