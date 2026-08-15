@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
-from src.core.costs import TickSizeRule
+from src.core.costs import LiquiditySlippageModel, TickSizeRule, TickSizeSchedule
 from src.core.instruments import AssetKind
 from src.core.datasets import DatasetManifest, make_manifest
 from src.stocks.data.contracts import CoverageRange
@@ -305,6 +305,8 @@ def stock_net_alpha_composed_df(
     n_tickers: int = 8,
     candidate_horizon_sessions: tuple[int, ...] = (3, 5, 8, 10, 15, 20),
     seed: int = 11,
+    audit_clean: bool = False,
+    label_scale: float = 1.0,
 ) -> pl.DataFrame:
     """Deterministic composed net-alpha panel: raw sources + per-horizon labels.
 
@@ -312,7 +314,11 @@ def stock_net_alpha_composed_df(
     (by raw name, so ``build_model_features`` can canonicalize them), the
     ``net_alpha_<h>d_target`` continuous label for every candidate horizon, and
     the exact exit-open ``label_available_time_<h>d`` availability columns the
-    trainer gates on.
+    trainer gates on. With ``audit_clean`` the panel clears the net-alpha
+    integrity audit: the ADTV source varies across sessions and the first
+    observation of each instrument carries the declared warm-up nulls.
+    ``label_scale`` scales the synthetic label/residual so the ElasticNet
+    baseline can recover the linear signal at small training-sample sizes.
     """
     rng = np.random.default_rng(seed)
     start = datetime(2024, 1, 1, tzinfo=UTC)
@@ -371,15 +377,62 @@ def stock_net_alpha_composed_df(
                 }
             )
     frame = pl.DataFrame(rows)
+    if audit_clean:
+        frame = frame.with_columns(
+            (
+                pl.col("adtv_20d")
+                * (1.0 + 0.1 * pl.col("session_index").cast(pl.Float64) / n_sessions)
+            ).alias("adtv_20d")
+        )
+        frame = frame.with_columns(
+            pl.int_range(0, pl.len()).over("instrument_id").alias("__obs")
+        )
+        for column in ("fluc_rate", "intraday_ret", "overnight_ret", "sector_ret_5d"):
+            frame = frame.with_columns(
+                pl.when(pl.col("__obs") == 0)
+                .then(None)
+                .otherwise(pl.col(column))
+                .alias(column)
+            )
+        frame = frame.drop("__obs")
     for horizon in candidate_horizon_sessions:
-        target = (
+        signal = label_scale * (
             pl.col("overnight_ret") * 0.02 - pl.col("intraday_ret") * 0.01
-        ).alias(f"net_alpha_{horizon}d_target")
+        )
+        target = signal.alias(f"net_alpha_{horizon}d_target")
+        residual = signal.alias(f"risk_residual_{horizon}d")
+        reference_cost = pl.lit(0.001, dtype=pl.Float64).alias(
+            f"reference_cost_{horizon}d"
+        )
         available = (pl.col("session") + pl.duration(days=horizon)).alias(
             f"label_available_time_{horizon}d"
         )
-        frame = frame.with_columns(target, available)
+        frame = frame.with_columns(target, residual, reference_cost, available)
     return frame
+
+
+def stock_liquidity_model(
+    impact_coefficient: float = 0.05,
+    stress_multiplier: float = 1.0,
+) -> LiquiditySlippageModel:
+    """Deterministic point-in-time liquidity slippage model for net-alpha fixtures."""
+    tick = TickSizeSchedule(
+        rules=(
+            TickSizeRule(
+                rule_id="fixture-tick",
+                effective_from=datetime(2000, 1, 1, tzinfo=UTC),
+                lower_inclusive=0.0,
+                upper_exclusive=inf,
+                tick=0.05,
+            ),
+        )
+    )
+    return LiquiditySlippageModel(
+        impact_coefficient=impact_coefficient,
+        tick_schedule=tick,
+        stress_multiplier=stress_multiplier,
+        model_id="fixture-sqrt-impact-v1",
+    )
 
 
 def stock_net_alpha_manifest(
