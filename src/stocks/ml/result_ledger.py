@@ -1,0 +1,960 @@
+"""Bounded ML result ledger: machine-readable projection of terminal runs.
+
+The ledger is an AI-analysis projection, never an audit store: the immutable
+artifact files under ``data/artifacts`` remain the source of truth. Every
+generated target stays below ``docs/results/ml_runs/`` with fixed byte bounds,
+and ``recent.jsonl`` retains only the newest terminal records. Projections
+contain no per-instrument values, raw OOF scores, raw label rows, raw block
+return vectors, stack traces, or credentials.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import math
+import tempfile
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Protocol
+
+from src.core.instruments import AssetKind
+from src.stocks.ml.contracts import (
+    HorizonJoinEvidence,
+    NetAlphaResearchData,
+    NetAlphaTrainingRequest,
+)
+from src.stocks.research.artifacts import (
+    ARTIFACT_ID_RE,
+    MANIFEST_FILENAME,
+    METRICS_FILENAME,
+    ModelArtifactRegistry,
+)
+from src.stocks.research.models import ModelManifest
+
+logger = logging.getLogger("stocks.ml.result_ledger")
+
+SCHEMA_VERSION = 1
+RETAINED_RECORDS = 128
+MAX_SCHEMA_BYTES = 16 * 1024
+MAX_LATEST_BYTES = 24 * 1024
+MAX_RECORD_BYTES = 24 * 1024
+MAX_META_BYTES = 4 * 1024
+MAX_POINTER_BYTES = 1024
+MAX_MESSAGE_CHARS = 512
+
+LATEST_FILENAME = "latest.json"
+RECENT_FILENAME = "recent.jsonl"
+SCHEMA_FILENAME = "schema.json"
+META_FILENAME = "ledger_meta.json"
+POINTER_FILENAME = "back-res.md"
+
+_REQUIRED_TOP_KEYS = (
+    "schema_version",
+    "artifact_id",
+    "status",
+    "started_at",
+    "finished_at",
+    "runtime",
+    "input",
+    "outcome",
+    "observability",
+    "artifact",
+)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def peak_rss_mib() -> float | None:
+    """Return the process peak RSS in MiB, or ``None`` when unavailable.
+
+    ``resource.getrusage`` reports the peak resident set size in KiB on Linux;
+    the value is converted to MiB.  A missing ``resource`` module records
+    ``None``, never a fabricated zero.
+    """
+    try:
+        import resource
+
+        return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 3)
+    except (ImportError, AttributeError, ValueError):
+        return None
+
+
+def _normalize_message(value: object) -> str:
+    """Collapse a message to one line and cap it to the ledger message bound."""
+    text = str(value)
+    text = " ".join(text.splitlines())
+    return text[:MAX_MESSAGE_CHARS]
+
+
+def _as_int(value: object) -> int:
+    return int(value) if isinstance(value, int) else 0
+
+
+def summarize_numeric(values: Iterable[float | int | None]) -> dict[str, object]:
+    """Aggregate finite-only statistics over ``values``.
+
+    Empty (or fully non-finite) input returns ``count=0`` with ``None``
+    statistics; non-finite values are never averaged or counted.
+    """
+    finite: list[float] = []
+    for value in values:
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            finite.append(number)
+    if not finite:
+        return {
+            "count": 0,
+            "mean": None,
+            "std": None,
+            "min": None,
+            "median": None,
+            "max": None,
+        }
+    ordered = sorted(finite)
+    count = len(ordered)
+    mean = sum(ordered) / count
+    variance = sum((value - mean) ** 2 for value in ordered) / count
+    median = (
+        ordered[count // 2]
+        if count % 2
+        else (ordered[count // 2 - 1] + ordered[count // 2]) / 2.0
+    )
+    return {
+        "count": count,
+        "mean": round(mean, 12),
+        "std": round(math.sqrt(variance), 12),
+        "min": round(ordered[0], 12),
+        "median": round(median, 12),
+        "max": round(ordered[-1], 12),
+    }
+
+
+def _sanitize_deep(value: object) -> object:
+    """Recursively project a value to a bounded JSON-safe object."""
+    if isinstance(value, dict):
+        return {str(key): _sanitize_deep(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_deep(item) for item in value]
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        return value
+    if value is None:
+        return None
+    return _normalize_message(value)
+
+
+def _encode(record: Mapping[str, object]) -> bytes:
+    """Canonical compact UTF-8 JSON encoding for ledger artifacts."""
+    return json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _validate_size(obj: Mapping[str, object], limit: int, label: str) -> None:
+    size = len(_encode(obj))
+    if size > limit:
+        raise ValueError(f"{label} exceeds {limit} bytes ({size} bytes encoded)")
+
+
+def _stable_hash(payload: Mapping[str, object]) -> str:
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _safe_resolve(root: Path, *parts: str) -> Path:
+    """Resolve ``parts`` below ``root``, rejecting traversal/symlink escapes."""
+    root_resolved = root.resolve()
+    target = root_resolved.joinpath(*parts).resolve()
+    if not target.is_relative_to(root_resolved):
+        raise ValueError(f"generated target escapes results root: {target}")
+    return target
+
+
+def _write_atomic(path: Path, payload: bytes) -> None:
+    """Write ``payload`` to ``path`` via a sibling temporary file and replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=path.parent, prefix=".ledger-", delete=False
+    ) as fh:
+        temp_path = Path(fh.name)
+        fh.write(payload)
+    temp_path.replace(path)
+
+
+def _sort_key(record: Mapping[str, object]) -> tuple[object, str]:
+    finished = record.get("finished_at")
+    if isinstance(finished, str):
+        return (0, finished)
+    return (1, str(record.get("artifact_id", "")))
+
+
+def _rebuild_recent(
+    recent_path: Path,
+    artifact_id: str,
+    record: Mapping[str, object],
+    retained_cap: int,
+) -> tuple[list[dict[str, object]], int, int]:
+    """Rebuild the bounded JSONL cache, deduplicating and retaining newest rows.
+
+    Malformed rows are skipped and counted as ``discarded_invalid_records``; a
+    duplicate artifact id replaces the cache entry in place. Returns
+    ``(retained, discarded_due_to_retention, discarded_invalid)``.
+    """
+    lines: list[dict[str, object]] = []
+    invalid = 0
+    if recent_path.exists():
+        with recent_path.open("r", encoding="utf-8") as fh:
+            for raw in fh:
+                stripped = raw.strip()
+                if not stripped:
+                    continue
+                try:
+                    obj = json.loads(stripped)
+                except json.JSONDecodeError:
+                    invalid += 1
+                    continue
+                if not isinstance(obj, dict) or not isinstance(
+                    obj.get("artifact_id"), str
+                ):
+                    invalid += 1
+                    continue
+                lines.append(obj)
+    newest: dict[str, dict[str, object]] = {}
+    for obj in lines:
+        key = str(obj["artifact_id"])
+        if key not in newest or _sort_key(obj) > _sort_key(newest[key]):
+            newest[key] = obj
+    newest[str(artifact_id)] = dict(record)
+    ordered = sorted(newest.values(), key=_sort_key, reverse=True)
+    retained = ordered[:retained_cap]
+    discarded = len(ordered) - len(retained)
+    return retained, discarded, invalid
+
+
+def _read_prior_counts(meta_path: Path) -> tuple[int, int]:
+    """Return previously accumulated discard counts, if any."""
+    if not meta_path.exists():
+        return 0, 0
+    try:
+        with meta_path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (json.JSONDecodeError, OSError):
+        return 0, 0
+    if not isinstance(data, dict):
+        return 0, 0
+    return _as_int(data.get("discarded_count")), _as_int(
+        data.get("discarded_invalid_records")
+    )
+
+
+def _build_meta(
+    updated_at: datetime,
+    retained: int,
+    discarded: int,
+    invalid: int,
+    retained_cap: int,
+) -> dict[str, object]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "updated_at": updated_at.isoformat(),
+        "retained_count": retained,
+        "discarded_count": discarded,
+        "discarded_invalid_records": invalid,
+        "retained_records_cap": retained_cap,
+        "record_byte_limit": MAX_RECORD_BYTES,
+    }
+
+
+def _build_schema(retained_cap: int) -> dict[str, object]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "record_byte_limit": MAX_RECORD_BYTES,
+        "retained_records_cap": retained_cap,
+        "files": {
+            LATEST_FILENAME: "Complete compact projection of the newest terminal run.",
+            RECENT_FILENAME: (
+                "Newest terminal records, one canonical JSON object per line."
+            ),
+            META_FILENAME: (
+                "Schema version, update time, retained/discarded counts, byte limits."
+            ),
+            SCHEMA_FILENAME: "Versioned field dictionary and retention policy.",
+            POINTER_FILENAME: (
+                "Generated 1 KiB pointer to latest.json and recent.jsonl."
+            ),
+        },
+        "record": {
+            "schema_version": "int",
+            "artifact_id": "str",
+            "status": "completed | failed",
+            "started_at": "UTC ISO-8601",
+            "finished_at": "UTC ISO-8601",
+            "runtime": {"elapsed_ms": "int", "peak_rss_mib": "float|null"},
+            "input": {
+                "snapshot_id": "str",
+                "request": "bounded request projection",
+                "data": "bounded data shape + join evidence",
+                "cost_context": "cost schedule kind and evidence identity",
+            },
+            "outcome": "promotion/no-trade evidence and gates",
+            "observability": {
+                "phases": "bounded phase samples",
+                "horizons": "per-candidate admission and fold diagnostics",
+                "replay": "aggregate block-excess summary",
+                "holdout": "forward-holdout pass/counts",
+            },
+            "artifact": {"manifest_path": "str", "metrics_path": "str"},
+        },
+        "forbidden": [
+            "per-instrument values",
+            "raw OOF scores",
+            "raw label rows",
+            "raw block return vectors",
+            "stack traces",
+            "credentials",
+            "arbitrary CLI environment variables",
+        ],
+    }
+
+
+def _build_pointer(
+    record: Mapping[str, object],
+    retained: int,
+    discarded: int,
+    invalid: int,
+    retained_cap: int,
+) -> str:
+    return "\n".join(
+        [
+            "# ML Result Ledger",
+            "",
+            f"- Schema version: {SCHEMA_VERSION}",
+            f"- Latest artifact: {record.get('artifact_id')}",
+            f"- Status: {record.get('status')}",
+            f"- Finished: {record.get('finished_at') or record.get('started_at') or 'n/a'}",
+            f"- Latest JSON: `docs/results/ml_runs/{LATEST_FILENAME}`",
+            f"- Recent JSONL: `docs/results/ml_runs/{RECENT_FILENAME}`",
+            f"- Retention: newest {retained_cap} records, each <= {MAX_RECORD_BYTES} bytes",
+            f"- Retained: {retained} | discarded: {discarded} | invalid: {invalid}",
+            "",
+            "Artifact files under `data/artifacts/` remain the source of truth.",
+            "",
+        ]
+    )
+
+
+def _read_artifact_json(
+    registry: ModelArtifactRegistry, artifact_id: str, filename: str
+) -> dict[str, object]:
+    if not ARTIFACT_ID_RE.match(artifact_id):
+        raise ValueError(f"invalid artifact_id {artifact_id!r}")
+    path = Path(registry.root) / artifact_id / filename
+    if not path.exists():
+        raise ValueError(f"artifact file missing: {path}")
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"malformed artifact file: {path}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"artifact file must be a JSON object: {path}")
+    return data
+
+
+def _validate_artifact_identity(
+    context: MlRunContext,
+    manifest: ModelManifest,
+    manifest_json: Mapping[str, object],
+) -> None:
+    if context.artifact_id != manifest.artifact_id:
+        raise ValueError(
+            f"artifact id mismatch: context {context.artifact_id!r}, "
+            f"manifest {manifest.artifact_id!r}"
+        )
+    persisted = manifest_json.get("artifact_id")
+    if persisted != context.artifact_id:
+        raise ValueError(
+            f"artifact id mismatch: context {context.artifact_id!r}, "
+            f"persisted {persisted!r}"
+        )
+
+
+def _validate_record(record: Mapping[str, object]) -> None:
+    for key in _REQUIRED_TOP_KEYS:
+        if key not in record:
+            raise ValueError(f"ledger record missing required key {key!r}")
+    if record.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError(
+            f"unsupported ledger schema_version {record.get('schema_version')!r}"
+        )
+    if record.get("status") not in ("completed", "failed"):
+        raise ValueError(f"invalid terminal status {record.get('status')!r}")
+    _validate_size(record, MAX_RECORD_BYTES, "ledger record")
+
+
+@dataclass(frozen=True, slots=True)
+class CostRunContext:
+    """Bounded cost context captured for a ledger projection."""
+
+    cost_schedule_kind: str
+    cost_evidence_path: str | None = None
+    cost_evidence_hash: str | None = None
+    has_liquidity_model: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class MlRunContext:
+    """Immutable run context for one ledger record; no frame is copied."""
+
+    artifact_id: str
+    snapshot_id: str
+    started_at: datetime
+    request: NetAlphaTrainingRequest
+    feature_rows: int
+    instrument_count: int
+    session_count: int
+    feature_column_count: int
+    feature_session_range: tuple[str, str] | None
+    label_definition: str
+    label_horizon_sessions: int
+    feature_schema_hash: str
+    universe_policy_hash: str
+    join_evidence: tuple[HorizonJoinEvidence, ...] = ()
+    cost_context: CostRunContext = field(
+        default_factory=lambda: CostRunContext(cost_schedule_kind="base")
+    )
+
+    @classmethod
+    def from_cli(
+        cls,
+        *,
+        request: NetAlphaTrainingRequest,
+        snapshot_id: str,
+        data: NetAlphaResearchData,
+        cost_context: CostRunContext,
+        started_at: datetime,
+    ) -> MlRunContext:
+        """Capture request, snapshot identity, and composed-data shape."""
+        frame = data.feature_frame
+        sessions = sorted(frame["session"].unique().to_list())
+        session_range = (
+            (str(sessions[0]), str(sessions[-1])) if sessions else None
+        )
+        return cls(
+            artifact_id=request.artifact_id,
+            snapshot_id=snapshot_id,
+            started_at=started_at,
+            request=request,
+            feature_rows=int(frame.height),
+            instrument_count=int(frame["instrument_id"].n_unique()),
+            session_count=len(sessions),
+            feature_column_count=len(frame.columns),
+            feature_session_range=session_range,
+            label_definition=data.manifest.label_definition,
+            label_horizon_sessions=data.manifest.label_horizon_sessions,
+            feature_schema_hash=data.manifest.schema_hash or "net-alpha-v1",
+            universe_policy_hash=data.manifest.universe_policy_hash or "net-alpha-v1",
+            join_evidence=tuple(data.join_evidence),
+            cost_context=cost_context,
+        )
+
+
+def _project_request(request: NetAlphaTrainingRequest) -> dict[str, object]:
+    portfolio = request.portfolio
+    risk = request.risk
+    projection: dict[str, object] = {
+        "candidate_horizon_sessions": [
+            int(horizon) for horizon in request.candidate_horizon_sessions
+        ],
+        "fold_count": request.fold_count,
+        "embargo_sessions": request.embargo_sessions,
+        "forward_holdout_sessions": request.forward_holdout_sessions,
+        "bootstrap_alpha": request.bootstrap_alpha,
+        "bootstrap_resamples": request.bootstrap_resamples,
+        "model_threads": request.model_threads,
+        "max_rss_mib": request.max_rss_mib,
+        "seed": request.seed,
+        "portfolio": {
+            "top_k": portfolio.top_k,
+            "max_single_weight": portfolio.max_single_weight,
+            "max_exposure": portfolio.max_exposure,
+            "participation_limit": portfolio.participation_limit,
+            "portfolio_value": portfolio.portfolio_value,
+            "initial_cash": portfolio.initial_cash,
+            "reference_notional": portfolio.reference_notional,
+        },
+        "risk": {
+            "calibration_bucket_count": risk.calibration_bucket_count,
+            "min_calibration_sessions": risk.min_calibration_sessions,
+            "risk_aversion": risk.risk_aversion,
+            "no_trade_band_bps": risk.no_trade_band_bps,
+        },
+    }
+    projection["request_fingerprint"] = _stable_hash(projection)
+    return projection
+
+
+def _project_data(context: MlRunContext) -> dict[str, object]:
+    session_range = (
+        list(context.feature_session_range) if context.feature_session_range else []
+    )
+    return {
+        "feature_rows": context.feature_rows,
+        "instrument_count": context.instrument_count,
+        "session_count": context.session_count,
+        "feature_column_count": context.feature_column_count,
+        "feature_session_range": session_range,
+        "label_definition": context.label_definition,
+        "label_horizon_sessions": context.label_horizon_sessions,
+        "feature_schema_hash": context.feature_schema_hash,
+        "universe_policy_hash": context.universe_policy_hash,
+        "horizons": [
+            {
+                "horizon_sessions": evidence.horizon_sessions,
+                "feature_rows": evidence.feature_rows,
+                "label_rows": evidence.label_rows,
+                "joined_rows": evidence.joined_rows,
+                "drop_reasons": [
+                    _normalize_message(reason) for reason in evidence.drop_reasons
+                ],
+            }
+            for evidence in context.join_evidence
+        ],
+    }
+
+
+def _project_cost_context(cost: CostRunContext) -> dict[str, object]:
+    return {
+        "cost_schedule_kind": cost.cost_schedule_kind,
+        "cost_evidence_path": (
+            _normalize_message(cost.cost_evidence_path)
+            if cost.cost_evidence_path
+            else None
+        ),
+        "cost_evidence_hash": cost.cost_evidence_hash,
+        "liquidity_model": cost.has_liquidity_model,
+    }
+
+
+def _project_outcome(
+    manifest: ModelManifest, metrics: Mapping[str, object]
+) -> dict[str, object]:
+    model_type = str(metrics.get("model_type") or manifest.model_type)
+    promoted = bool(metrics.get("promoted", model_type != "no_trade"))
+    no_trade = bool(metrics.get("no_trade", model_type == "no_trade"))
+    gates = metrics.get("gates")
+    if not isinstance(gates, dict):
+        gates = {}
+    raw_reasons = metrics.get("promotion_reasons")
+    if not isinstance(raw_reasons, list):
+        raw_reasons = gates.get("reasons", []) if isinstance(gates, dict) else []
+    reasons = [_normalize_message(reason) for reason in raw_reasons if isinstance(reason, str)]
+    return {
+        "model_family": model_type,
+        "model_type": model_type,
+        "promoted": promoted,
+        "no_trade": no_trade,
+        "promotion_reasons": reasons,
+        "selected_horizons": _selected_horizons(metrics, manifest),
+        "gates": {
+            "passed": bool(gates.get("passed", promoted)),
+            "reasons": [
+                _normalize_message(reason)
+                for reason in gates.get("reasons", [])
+                if isinstance(reason, str)
+            ],
+        },
+    }
+
+
+def _selected_horizons(
+    metrics: Mapping[str, object], manifest: ModelManifest
+) -> list[int]:
+    selection = metrics.get("horizon_selection")
+    if isinstance(selection, dict):
+        candidates = (
+            selection.get("primary_horizon_sessions"),
+            selection.get("secondary_horizon_sessions"),
+        )
+        selected = [int(h) for h in candidates if isinstance(h, int) and h > 0]
+        if selected:
+            return selected
+    if not metrics.get("no_trade", False) and manifest.label_horizon_sessions:
+        return [manifest.label_horizon_sessions]
+    return []
+
+
+def _project_replay(metrics: Mapping[str, object]) -> dict[str, object]:
+    replay = metrics.get("replay")
+    if not isinstance(replay, dict):
+        return {}
+    order_count = replay.get("order_count")
+    block_count = replay.get("block_count")
+    decisions = replay.get("decisions")
+    block_log_excess = replay.get("block_log_excess")
+    return {
+        "order_count": int(order_count) if isinstance(order_count, int) else 0,
+        "block_count": int(block_count) if isinstance(block_count, int) else 0,
+        "decision_count": (
+            len(decisions) if isinstance(decisions, (list, tuple)) else 0
+        ),
+        "block_excess_summary": summarize_numeric(
+            block_log_excess
+            if isinstance(block_log_excess, (list, tuple))
+            else []
+        ),
+    }
+
+
+def _project_holdout(metrics: Mapping[str, object]) -> dict[str, object]:
+    holdout = metrics.get("holdout")
+    if not isinstance(holdout, dict):
+        return {}
+    order_count = holdout.get("order_count")
+    block_count = holdout.get("block_count")
+    return {
+        "passed": bool(holdout.get("passed", False)),
+        "reason": _normalize_message(holdout.get("reason", "")),
+        "order_count": int(order_count) if isinstance(order_count, int) else 0,
+        "block_count": int(block_count) if isinstance(block_count, int) else 0,
+    }
+
+
+def _observability_from(
+    metrics: Mapping[str, object], telemetry: Mapping[str, object] | None
+) -> dict[str, object]:
+    if isinstance(telemetry, dict):
+        return {
+            "phases": list(telemetry.get("phases") or []),
+            "horizons": list(telemetry.get("horizons") or []),
+        }
+    run_obs = metrics.get("run_observability")
+    if isinstance(run_obs, dict):
+        return {
+            "phases": list(run_obs.get("phases") or []),
+            "horizons": list(run_obs.get("horizons") or []),
+        }
+    return {"phases": [], "horizons": []}
+
+
+def _project_completed(
+    context: MlRunContext,
+    manifest: ModelManifest,
+    metrics: Mapping[str, object],
+    observability: Mapping[str, object],
+    clock: Callable[[], datetime],
+) -> dict[str, object]:
+    finished_at = clock()
+    elapsed_ms = int((finished_at - context.started_at).total_seconds() * 1000)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "artifact_id": context.artifact_id,
+        "status": "completed",
+        "started_at": context.started_at.isoformat(),
+        "finished_at": finished_at.isoformat(),
+        "runtime": {"elapsed_ms": elapsed_ms, "peak_rss_mib": peak_rss_mib()},
+        "input": {
+            "snapshot_id": context.snapshot_id,
+            "request": _project_request(context.request),
+            "data": _project_data(context),
+            "cost_context": _project_cost_context(context.cost_context),
+        },
+        "outcome": _project_outcome(manifest, metrics),
+        "observability": {
+            "phases": _sanitize_deep(observability.get("phases")),
+            "horizons": _sanitize_deep(observability.get("horizons")),
+            "replay": _project_replay(metrics),
+            "holdout": _project_holdout(metrics),
+        },
+        "artifact": {
+            "manifest_path": MANIFEST_FILENAME,
+            "metrics_path": METRICS_FILENAME,
+        },
+    }
+
+
+def _project_failed(
+    context: MlRunContext,
+    phase: str,
+    exc: BaseException,
+    telemetry: Mapping[str, object] | None,
+    clock: Callable[[], datetime],
+) -> dict[str, object]:
+    finished_at = clock()
+    elapsed_ms = int((finished_at - context.started_at).total_seconds() * 1000)
+    phases: list[object] = []
+    if isinstance(telemetry, dict):
+        phases = list(telemetry.get("phases") or [])
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "artifact_id": context.artifact_id,
+        "status": "failed",
+        "started_at": context.started_at.isoformat(),
+        "finished_at": finished_at.isoformat(),
+        "runtime": {"elapsed_ms": elapsed_ms, "peak_rss_mib": peak_rss_mib()},
+        "input": {
+            "snapshot_id": context.snapshot_id,
+            "request": _project_request(context.request),
+            "data": _project_data(context),
+            "cost_context": _project_cost_context(context.cost_context),
+        },
+        "outcome": {},
+        "observability": {
+            "phases": _sanitize_deep(phases),
+            "horizons": [],
+            "replay": {},
+            "holdout": {},
+        },
+        "failure": {
+            "phase": _normalize_message(phase),
+            "exception_type": type(exc).__name__,
+            "message": _normalize_message(str(exc) or type(exc).__name__),
+        },
+        "artifact": {},
+    }
+
+
+def _project_reconcile_record(
+    artifact_id: str,
+    manifest_json: Mapping[str, object],
+    metrics: Mapping[str, object],
+) -> dict[str, object]:
+    model_type = str(
+        metrics.get("model_type") or manifest_json.get("model_type") or "no_trade"
+    )
+    manifest = ModelManifest(
+        artifact_id=artifact_id,
+        asset_kind=AssetKind(str(manifest_json.get("asset_kind") or "STOCK")),
+        feature_set=str(manifest_json.get("feature_set") or ""),
+        feature_schema_hash=str(manifest_json.get("feature_schema_hash") or ""),
+        universe_policy_hash=str(manifest_json.get("universe_policy_hash") or ""),
+        label_definition=str(manifest_json.get("label_definition") or ""),
+        label_horizon_sessions=_as_int(manifest_json.get("label_horizon_sessions")),
+        eligible_from=str(manifest_json.get("eligible_from") or ""),
+        eligible_to=str(manifest_json.get("eligible_to") or ""),
+        model_type=model_type,
+    )
+    observability: dict[str, object] = {"phases": [], "horizons": []}
+    run_obs = metrics.get("run_observability")
+    if isinstance(run_obs, dict):
+        observability = {
+            "phases": list(run_obs.get("phases") or []),
+            "horizons": list(run_obs.get("horizons") or []),
+        }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "artifact_id": artifact_id,
+        "status": "completed",
+        "started_at": None,
+        "finished_at": None,
+        "runtime": {"elapsed_ms": None, "peak_rss_mib": None},
+        "input": {
+            "snapshot_id": None,
+            "request": {},
+            "data": {},
+            "cost_context": {},
+        },
+        "outcome": _project_outcome(manifest, metrics),
+        "observability": {
+            "phases": _sanitize_deep(observability["phases"]),
+            "horizons": _sanitize_deep(observability["horizons"]),
+            "replay": _project_replay(metrics),
+            "holdout": _project_holdout(metrics),
+        },
+        "artifact": {
+            "manifest_path": MANIFEST_FILENAME,
+            "metrics_path": METRICS_FILENAME,
+        },
+    }
+
+
+class ResultLedgerObserver(Protocol):
+    """Optional observer injected into programmatic training workflows."""
+
+    def record_completed(
+        self,
+        context: MlRunContext,
+        manifest: ModelManifest,
+        registry: ModelArtifactRegistry,
+        telemetry: Mapping[str, object] | None = None,
+    ) -> None: ...
+
+    def record_failed(
+        self,
+        context: MlRunContext,
+        phase: str,
+        exc: BaseException,
+        telemetry: Mapping[str, object] | None = None,
+    ) -> None: ...
+
+
+class NullResultLedger:
+    """No-op observer that never touches repository ``docs``."""
+
+    def record_completed(
+        self,
+        context: MlRunContext,
+        manifest: ModelManifest,
+        registry: ModelArtifactRegistry,
+        telemetry: Mapping[str, object] | None = None,
+    ) -> None:
+        del context, manifest, registry, telemetry
+
+    def record_failed(
+        self,
+        context: MlRunContext,
+        phase: str,
+        exc: BaseException,
+        telemetry: Mapping[str, object] | None = None,
+    ) -> None:
+        del context, phase, exc, telemetry
+
+
+class MlResultLedger:
+    """Bounded filesystem ledger under ``<project>/docs/results``."""
+
+    def __init__(
+        self,
+        results_root: Path,
+        *,
+        retained_records: int = RETAINED_RECORDS,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self.root = Path(results_root)
+        self.runs_root = self.root / "ml_runs"
+        self.retained_records = retained_records
+        self._clock = clock or _utc_now
+
+    def record_completed(
+        self,
+        context: MlRunContext,
+        manifest: ModelManifest,
+        registry: ModelArtifactRegistry,
+        telemetry: Mapping[str, object] | None = None,
+    ) -> None:
+        """Project and atomically record one completed terminal run."""
+        metrics = _read_artifact_json(registry, context.artifact_id, METRICS_FILENAME)
+        manifest_json = _read_artifact_json(
+            registry, context.artifact_id, MANIFEST_FILENAME
+        )
+        _validate_artifact_identity(context, manifest, manifest_json)
+        observability = _observability_from(metrics, telemetry)
+        record = _project_completed(
+            context, manifest, metrics, observability, self._clock
+        )
+        self._write_record(context.artifact_id, record)
+
+    def record_failed(
+        self,
+        context: MlRunContext,
+        phase: str,
+        exc: BaseException,
+        telemetry: Mapping[str, object] | None = None,
+    ) -> None:
+        """Record a terminal failure without hiding the original exception."""
+        record = _project_failed(context, phase, exc, telemetry, self._clock)
+        self._write_record(context.artifact_id, record)
+
+    def rebuild_from_registry(self, registry: ModelArtifactRegistry) -> dict[str, int]:
+        """Rebuild the bounded cache from published artifact manifests/metrics.
+
+        Recovery is best-effort: reconstructed records carry no runtime or
+        request context, only the evidence persisted in the artifacts.
+        """
+        root = Path(registry.root)
+        if not root.exists():
+            raise ValueError(f"registry root missing: {root}")
+        records: list[dict[str, object]] = []
+        for artifact_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+            artifact_id = artifact_dir.name
+            if not ARTIFACT_ID_RE.match(artifact_id):
+                continue
+            manifest_path = artifact_dir / MANIFEST_FILENAME
+            metrics_path = artifact_dir / METRICS_FILENAME
+            if not manifest_path.exists() or not metrics_path.exists():
+                continue
+            try:
+                manifest_json = json.loads(manifest_path.read_text(encoding="utf-8"))
+                metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(manifest_json, dict) or not isinstance(metrics, dict):
+                continue
+            if manifest_json.get("artifact_id") != artifact_id:
+                continue
+            records.append(
+                _project_reconcile_record(artifact_id, manifest_json, metrics)
+            )
+        ordered = sorted(records, key=_sort_key, reverse=True)
+        retained = ordered[: self.retained_records]
+        discarded = len(ordered) - len(retained)
+        self._write_cache(retained, discarded, invalid=0)
+        return {
+            "scanned": len(records),
+            "retained": len(retained),
+            "discarded": discarded,
+        }
+
+    def _write_record(self, artifact_id: str, record: dict[str, object]) -> None:
+        if not ARTIFACT_ID_RE.match(artifact_id):
+            raise ValueError(f"invalid artifact_id {artifact_id!r}")
+        if record.get("artifact_id") != artifact_id:
+            raise ValueError("record artifact id does not match key")
+        _validate_record(record)
+        runs_root = self.runs_root
+        runs_root.mkdir(parents=True, exist_ok=True)
+        recent_path = _safe_resolve(runs_root, RECENT_FILENAME)
+        retained, discarded, invalid = _rebuild_recent(
+            recent_path, artifact_id, record, self.retained_records
+        )
+        self._write_cache(retained, discarded, invalid)
+        pointer = _build_pointer(
+            record, len(retained), discarded, invalid, self.retained_records
+        )
+        pointer_path = _safe_resolve(self.root, POINTER_FILENAME)
+        pointer_bytes = pointer.encode("utf-8")
+        if len(pointer_bytes) > MAX_POINTER_BYTES:
+            raise ValueError(f"generated pointer exceeds {MAX_POINTER_BYTES} bytes")
+        _write_atomic(pointer_path, pointer_bytes)
+
+    def _write_cache(
+        self,
+        retained: list[dict[str, object]],
+        discarded: int,
+        invalid: int,
+    ) -> None:
+        latest_path = _safe_resolve(self.runs_root, LATEST_FILENAME)
+        recent_path = _safe_resolve(self.runs_root, RECENT_FILENAME)
+        meta_path = _safe_resolve(self.runs_root, META_FILENAME)
+        schema_path = _safe_resolve(self.runs_root, SCHEMA_FILENAME)
+        prior_discarded, prior_invalid = _read_prior_counts(meta_path)
+        if retained:
+            _validate_size(retained[0], MAX_LATEST_BYTES, "latest.json")
+            _write_atomic(latest_path, _encode(retained[0]))
+        _write_atomic(
+            recent_path, b"".join(_encode(record) + b"\n" for record in retained)
+        )
+        meta = _build_meta(
+            self._clock(),
+            len(retained),
+            prior_discarded + discarded,
+            prior_invalid + invalid,
+            self.retained_records,
+        )
+        _validate_size(meta, MAX_META_BYTES, "ledger_meta.json")
+        _write_atomic(meta_path, _encode(meta))
+        if not schema_path.exists():
+            schema = _build_schema(self.retained_records)
+            _validate_size(schema, MAX_SCHEMA_BYTES, "schema.json")
+            _write_atomic(schema_path, _encode(schema))
