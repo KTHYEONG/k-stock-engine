@@ -67,6 +67,42 @@ class RiskSettings:
         if self.no_trade_band_bps < 0:
             raise ValueError("no_trade_band_bps must be non-negative")
 
+@dataclass(frozen=True, slots=True)
+class CompoundingCertificationSettings:
+    """Pre-registered research-governance policy for compound-growth evidence.
+
+    This is a governance policy, never an optimization knob tuned against a
+    holdout outcome. ``annualization_sessions`` defines one full annualization
+    window and ``min_observed_sessions`` the minimum observed sessions a
+    forward holdout must cover; ``min_active_cohort_fraction`` and
+    ``max_drawdown`` are explicit validated risk-policy fields. The bootstrap
+    is seeded and reuses the request's statistical confidence settings unless
+    explicitly overridden. Values outside their finite domains raise
+    ``ValueError``.
+    """
+
+    annualization_sessions: int = 252
+    min_observed_sessions: int = 252
+    min_active_cohort_fraction: float = 0.5
+    max_drawdown: float = 0.5
+    bootstrap_alpha: float = 0.05
+    bootstrap_resamples: int = 200
+    seed: int = 42
+
+    def __post_init__(self) -> None:
+        if self.annualization_sessions < 1:
+            raise ValueError("annualization_sessions must be positive")
+        if self.min_observed_sessions < 1:
+            raise ValueError("min_observed_sessions must be positive")
+        if not 0.0 < self.min_active_cohort_fraction <= 1.0:
+            raise ValueError("min_active_cohort_fraction must be in (0, 1]")
+        if not 0.0 < self.max_drawdown < 1.0:
+            raise ValueError("max_drawdown must be in (0, 1)")
+        if not 0.0 < self.bootstrap_alpha < 1.0:
+            raise ValueError("bootstrap_alpha must be in (0, 1)")
+        if self.bootstrap_resamples < 2:
+            raise ValueError("bootstrap_resamples must be at least 2")
+
 
 @dataclass(frozen=True, slots=True)
 class NetAlphaTrainingRequest:
@@ -75,7 +111,9 @@ class NetAlphaTrainingRequest:
     ``candidate_horizon_sessions`` is a pre-registered discovery grid, not an
     operating route: the trainer fits the baseline for every candidate and
     selects at most one primary and one conditional secondary horizon from OOF
-    replay evidence. ``model_threads`` is the single thread budget for the
+    replay evidence. ``compounding`` is the pre-registered research-governance
+    certificate policy for the untouched forward holdout, never a post-hoc
+    threshold. ``model_threads`` is the single thread budget for the
     challenger LightGBM (default 1); there is no Optuna trial, resume, or
     ``lgb_threads`` knob.
     """
@@ -92,9 +130,13 @@ class NetAlphaTrainingRequest:
     seed: int = 42
     portfolio: PortfolioSettings = field(default_factory=PortfolioSettings)
     risk: RiskSettings = field(default_factory=RiskSettings)
+    compounding: CompoundingCertificationSettings = field(
+        default_factory=CompoundingCertificationSettings
+    )
     base_cost_schedule: CostSchedule | None = None
     stress_cost_schedule: CostSchedule | None = None
     liquidity_model: LiquiditySlippageModel | None = None
+    stress_liquidity_model: LiquiditySlippageModel | None = None
 
     def __post_init__(self) -> None:
         if not self.artifact_id:

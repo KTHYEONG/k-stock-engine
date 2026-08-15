@@ -21,7 +21,7 @@ from datetime import UTC, datetime
 import numpy as np
 import polars as pl
 
-from src.core.costs import default_base_schedule
+from src.core.costs import default_base_schedule, default_stress_schedule
 from src.core.instruments import AssetKind
 from src.stocks.data.ml_integrity import validate_ml_snapshot
 from src.stocks.data.quality import KRXSessionCalendar
@@ -66,6 +66,7 @@ from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.research.calibration_schedule import SessionClusterCalibrationSchedule
 from src.stocks.research.economic_alpha import CausalAlphaCalibrator
 from src.stocks.research.folds import Fold, PurgedWalkForward
+from src.stocks.research.metrics import certify_compounded_holdout
 from src.stocks.research.models import Model, ModelManifest
 
 logger = logging.getLogger("stocks.ml.training")
@@ -464,6 +465,11 @@ def train_net_alpha_model(
             base_manifest, learner_columns, TARGET_COLUMN
         )
     manifest = model.manifest()
+    if passed:
+        holdout_from, holdout_to = _eligibility(holdout_panel)
+        manifest = replace(
+            manifest, eligible_from=holdout_from, eligible_to=holdout_to
+        )
     registry.publish(model, manifest)
     if passed:
         registry.write_forward_holdout(
@@ -1402,18 +1408,20 @@ def _evaluate_forward_holdout(
     request: NetAlphaTrainingRequest,
     horizon_sessions: int,
 ) -> dict[str, object]:
-    """Evaluate the untouched forward holdout with the same policy replay.
+    """Evaluate the untouched forward holdout under base and stress costs.
 
-    The holdout is scored target-free by the pre-holdout model, the fitted
-    calibration attaches the decimal lower bound, and realized outcomes are
-    replayed through the same cost/risk gate. A failed or absent holdout never
-    relaxes a gate.
+    The locked holdout is scored target-free once by the pre-holdout model and
+    the fitted calibration attaches the decimal lower bound. The identical
+    calibrated frame is then replayed under the base and stress cost schedules
+    (with their matching liquidity models) and the compound certificate gates
+    promotion. No-trade diagnosis is kept separate from missing realized
+    evidence, and no gate is ever relaxed after observing the holdout.
     """
     if holdout_panel.is_empty():
         return {"passed": False, "reason": "holdout-has-no-realized"}
     scored = model.predict(holdout_panel)
     calibrated = calibration.apply(scored)
-    replay = NetAlphaPolicyReplay(
+    base_replay = NetAlphaPolicyReplay(
         horizon_sessions=horizon_sessions,
         portfolio=request.portfolio,
         risk=request.risk,
@@ -1421,16 +1429,63 @@ def _evaluate_forward_holdout(
         liquidity_model=request.liquidity_model,
         seed=request.seed,
     )
+    stress_replay = NetAlphaPolicyReplay(
+        horizon_sessions=horizon_sessions,
+        portfolio=request.portfolio,
+        risk=request.risk,
+        cost_schedule=request.stress_cost_schedule or default_stress_schedule(),
+        liquidity_model=request.stress_liquidity_model or request.liquidity_model,
+        seed=request.seed,
+    )
     try:
-        evaluation = replay.evaluate(calibrated, holdout_panel)
+        base_evaluation = base_replay.evaluate(calibrated, holdout_panel)
+        stress_evaluation = stress_replay.evaluate(calibrated, holdout_panel)
     except ValueError as exc:
         return {"passed": False, "reason": f"holdout-replay-invalid:{exc}"}
-    passed = bool(evaluation.blocks)
+    certificate = certify_compounded_holdout(
+        base_evaluation.period_net_returns,
+        stress_evaluation.period_net_returns,
+        horizon_sessions,
+        base_evaluation.observed_sessions,
+        base_evaluation.active_cohort_count,
+        request.compounding,
+    )
+    missing_realized = (
+        base_evaluation.missing_realized_cohort_count
+        or stress_evaluation.missing_realized_cohort_count
+    )
+    if missing_realized > 0:
+        reason = "holdout-incomplete-realized-cohorts"
+    elif base_evaluation.eligible_sessions == 0:
+        reason = "holdout-no-economic-edge"
+    elif not certificate.passed:
+        reason = (
+            "holdout-compound-certification-failed:"
+            + ";".join(certificate.reasons)
+        )
+    else:
+        reason = ""
     return {
-        "passed": passed,
-        "block_count": len(evaluation.blocks),
-        "order_count": len(evaluation.orders),
-        "reason": "" if passed else "holdout-replay-no-trade",
+        "passed": reason == "",
+        "reason": reason,
+        "block_count": len(base_evaluation.blocks),
+        "order_count": len(base_evaluation.orders),
+        "certificate": certificate.to_json(),
+        "cohorts": {
+            "scored_sessions": base_evaluation.scored_sessions,
+            "realized_sessions": base_evaluation.realized_sessions,
+            "eligible_sessions": base_evaluation.eligible_sessions,
+            "active_sessions": base_evaluation.active_sessions,
+            "orders": len(base_evaluation.orders),
+            "period_count": base_evaluation.period_count,
+            "observed_sessions": base_evaluation.observed_sessions,
+            "active_cohort_count": base_evaluation.active_cohort_count,
+            "missing_realized_cohorts": base_evaluation.missing_realized_cohort_count,
+        },
+        "diagnostics": {
+            "base": base_evaluation.replay_diagnostics(),
+            "stress": stress_evaluation.replay_diagnostics(),
+        },
     }
 
 
@@ -1555,7 +1610,13 @@ def _build_metrics(
         "secondary_horizon_sessions": selection.secondary_horizon_sessions,
         "mean_fold_rank_ic": float(np.mean(fold_rank_ic)) if fold_rank_ic else 0.0,
         "horizon_selection": selection.to_json(),
-        "holdout": holdout_evidence,
+        "holdout": {
+            **holdout_evidence,
+            "eligibility": {
+                "eligible_from": manifest.eligible_from,
+                "eligible_to": manifest.eligible_to,
+            },
+        },
         "replay": getattr(evaluation, "to_json", lambda: {})() if evaluation else {},
         "gates": {
             "passed": manifest.model_type != "no_trade",

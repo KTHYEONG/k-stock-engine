@@ -61,33 +61,82 @@ class PolicyOrder:
 
 @dataclass(frozen=True, slots=True)
 class PolicyBlock:
-    """One cohort's realized block net log-growth."""
+    """One active cohort's realized arithmetic net return.
+
+    ``net_return`` is the equal-weighted arithmetic ``risk_residual -
+    realized_cost`` mean of the cohort's orders; it is a decimal arithmetic
+    return, never a logarithm. Geometric growth is formed later with ``log1p``.
+    """
 
     cohort_id: int
     horizon_sessions: int
-    block_log_excess: float
+    net_return: float
     order_count: int
     notional: float
 
 
 @dataclass(frozen=True, slots=True)
 class ReplayEvaluation:
-    """Deterministic outcome of one policy replay evaluation."""
+    """Deterministic outcome of one policy replay evaluation.
+
+    The ``period_*`` evidence is the certification view over complete,
+    non-overlapping holding cohorts in chronological order. A complete cohort
+    with no allocated order is an observed all-cash cohort carrying a ``0.0``
+    period return; a complete cohort whose required realized row is absent is
+    never zero-filled and instead increments ``missing_realized_cohort_count``.
+    ``blocks`` carry the arithmetic net return of every complete active cohort
+    (used by OOF horizon discovery); trailing partial cohorts never count as
+    evidence.
+    """
 
     orders: tuple[PolicyOrder, ...]
     blocks: tuple[PolicyBlock, ...]
     decisions: tuple[int, ...]
+    period_count: int = 0
+    observed_sessions: int = 0
+    active_cohort_count: int = 0
+    missing_realized_cohort_count: int = 0
+    period_net_returns: tuple[float, ...] = ()
+    scored_sessions: int = 0
+    realized_sessions: int = 0
+    eligible_sessions: int = 0
+    active_sessions: int = 0
+
+    @property
+    def block_net_returns(self) -> tuple[float, ...]:
+        return tuple(block.net_return for block in self.blocks)
 
     @property
     def block_log_excess(self) -> tuple[float, ...]:
-        return tuple(block.block_log_excess for block in self.blocks)
+        """Read-side alias retained for OOF horizon discovery consumers."""
+        return self.block_net_returns
+
+    def replay_diagnostics(self) -> dict[str, int]:
+        """Bounded cohort/diagnostic counts; never score or return arrays."""
+        return {
+            "scored_sessions": int(self.scored_sessions),
+            "realized_sessions": int(self.realized_sessions),
+            "eligible_sessions": int(self.eligible_sessions),
+            "active_sessions": int(self.active_sessions),
+            "orders": len(self.orders),
+            "complete_cohorts": self.period_count + self.missing_realized_cohort_count,
+            "active_cohorts": int(self.active_cohort_count),
+            "observed_sessions": int(self.observed_sessions),
+            "missing_realized_cohorts": int(self.missing_realized_cohort_count),
+        }
 
     def to_json(self) -> dict[str, object]:
         return {
             "order_count": len(self.orders),
             "block_count": len(self.blocks),
-            "block_log_excess": list(self.block_log_excess),
             "decisions": list(self.decisions),
+            "period_count": int(self.period_count),
+            "observed_sessions": int(self.observed_sessions),
+            "active_cohort_count": int(self.active_cohort_count),
+            "missing_realized_cohort_count": int(self.missing_realized_cohort_count),
+            "period_net_returns": [
+                float(value) for value in self.period_net_returns
+            ],
         }
 
 
@@ -97,8 +146,8 @@ class NetAlphaPolicyReplay:
     The replay is fully deterministic for a given input: the same scored panel
     and settings always produce identical orders and block series. Decisions are
     grouped into staggered cohorts keyed by decision session; each cohort's
-    realized block log-growth is the equal-weighted net (cost-after-risk)
-    log return of its positions over the holding horizon.
+    realized arithmetic net return is the equal-weighted net (cost-after-risk)
+    mean of its positions over the holding horizon.
 
     ``evaluate`` returns an immutable :class:`ReplayEvaluation` whose ``orders``
     tuple makes order-for-order equality assertions meaningful.
@@ -169,6 +218,7 @@ class NetAlphaPolicyReplay:
             return ReplayEvaluation(orders=(), blocks=(), decisions=())
 
         realized_by_key: dict[tuple[str, object], dict[str, float]] = {}
+        realized_sessions: set[object] = set()
         if realized is not None and not realized.is_empty():
             self._validate_realized(realized)
             if self._liquidity_model is None:
@@ -181,6 +231,7 @@ class NetAlphaPolicyReplay:
                     "adtv_20d": float(row["adtv_20d"]),
                     "volatility_20d": float(row["volatility_20d"]),
                 }
+            realized_sessions = set(realized[_SESSION].to_list())
 
         portfolio = self._portfolio
         sessions = sorted(scored[_SESSION].unique().to_list())
@@ -188,8 +239,8 @@ class NetAlphaPolicyReplay:
         cohort_size = max(1, int(self._horizon_sessions))
 
         orders: list[PolicyOrder] = []
-        blocks: list[PolicyBlock] = []
         decision_sessions: list[int] = []
+        eligible_sessions = 0
 
         cohort_weights: dict[int, list[PolicyOrder]] = {}
         by_session = {
@@ -208,6 +259,9 @@ class NetAlphaPolicyReplay:
             if top.is_empty():
                 continue
             scores = top[economic_score].to_numpy().astype(float)
+            clean = np.where(np.isfinite(scores), scores, 0.0)
+            if np.any(clean - self._risk.no_trade_band_bps / 10_000.0 > 0.0):
+                eligible_sessions += 1
             weights = self._allocate(scores)
             cohort_orders = [
                 PolicyOrder(
@@ -228,26 +282,55 @@ class NetAlphaPolicyReplay:
                 cohort_weights.setdefault(cohort, []).extend(cohort_orders)
                 decision_sessions.append(position)
 
-        for cohort in sorted(cohort_weights):
-            members = cohort_weights[cohort]
+        scored_session_count = len(sessions)
+        active_session_count = len(decision_sessions)
+        if not realized_by_key:
+            return ReplayEvaluation(
+                orders=tuple(orders),
+                blocks=(),
+                decisions=tuple(decision_sessions),
+                scored_sessions=scored_session_count,
+                realized_sessions=len(realized_sessions),
+                eligible_sessions=eligible_sessions,
+                active_sessions=active_session_count,
+            )
+
+        period_returns: list[float] = []
+        blocks = []
+        active_cohort_count = 0
+        missing_realized_cohorts = 0
+        complete_cohorts = scored_session_count // cohort_size
+        for cohort in range(complete_cohorts):
+            members = cohort_weights.get(cohort, [])
+            if not members:
+                start = cohort * cohort_size
+                cohort_sessions = sessions[start : start + cohort_size]
+                if all(s in realized_sessions for s in cohort_sessions):
+                    period_returns.append(0.0)
+                else:
+                    missing_realized_cohorts += 1
+                continue
             growth: list[float] = []
             for order in members:
                 realized_value = realized_by_key.get(
                     (order.instrument_id, order.decision_session)
                 )
                 if realized_value is None:
-                    continue
+                    break
                 cost_rate = self._realized_cost(
                     order.order_size, order.decision_session, realized_value
                 )
                 growth.append(float(realized_value[_RISK_RESIDUAL]) - cost_rate)
-            if not growth:
+            if len(growth) != len(members):
+                missing_realized_cohorts += 1
                 continue
+            period_returns.append(float(np.mean(growth)))
+            active_cohort_count += 1
             blocks.append(
                 PolicyBlock(
                     cohort_id=cohort,
                     horizon_sessions=self._horizon_sessions,
-                    block_log_excess=float(np.mean(growth)),
+                    net_return=float(np.mean(growth)),
                     order_count=len(growth),
                     notional=float(sum(order.order_size for order in members)),
                 )
@@ -257,6 +340,15 @@ class NetAlphaPolicyReplay:
             orders=tuple(orders),
             blocks=tuple(blocks),
             decisions=tuple(decision_sessions),
+            period_count=len(period_returns),
+            observed_sessions=len(period_returns) * cohort_size,
+            active_cohort_count=active_cohort_count,
+            missing_realized_cohort_count=missing_realized_cohorts,
+            period_net_returns=tuple(period_returns),
+            scored_sessions=scored_session_count,
+            realized_sessions=len(realized_sessions),
+            eligible_sessions=eligible_sessions,
+            active_sessions=active_session_count,
         )
 
     def _allocate(self, scores: np.ndarray) -> np.ndarray:
