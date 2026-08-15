@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 
 import polars as pl
@@ -563,6 +563,243 @@ class TestMaterializeSnapshot:
         assert all(c in composed.frame.columns for c in expected_columns)
         assert composed.manifest.label_definition == MULTI_HORIZON_RESIDUAL_DEFINITION
         assert composed.manifest.label_horizon_sessions == 5
+
+    def test_net_alpha_materialization_registers_status_artifact(self, tmp_path) -> None:
+        from src.stocks.data.catalog import SnapshotResolver
+        from src.stocks.data.research_v2 import (
+            NetAlphaMaterializationRequest,
+            materialize_net_alpha_snapshot,
+        )
+
+        sessions = weekdays(60)
+        windows = ResearchWindows(
+            train=CoverageRange(sessions[2], sessions[15]),
+            validation=CoverageRange(sessions[16], sessions[20]),
+            test=CoverageRange(sessions[21], sessions[25]),
+        )
+        base_root = tmp_path / "base"
+        feature_root = tmp_path / "features"
+        label_root = tmp_path / "labels"
+        catalog_root = tmp_path / "catalog"
+        calendar_path = tmp_path / "calendar.json"
+        calendar_path.write_text(
+            json.dumps(
+                {
+                    "version": "fixture-calendar",
+                    "sessions": [d.isoformat() for d in sessions],
+                    "generated_time": GENERATED.isoformat(),
+                }
+            ),
+            encoding="utf-8",
+        )
+        rows: list[dict[str, object]] = []
+        for t, ticker in enumerate(tuple(f"KRX:{i:06d}" for i in range(1, 61))):
+            for s, session in enumerate(sessions):
+                session_dt_value = datetime.combine(session, datetime.min.time(), tzinfo=UTC)
+                open_price = 100.0 + float(s) + float(t % 7)
+                row: dict[str, object] = {
+                    "instrument_id": ticker,
+                    "session": session_dt_value,
+                    "observation_time": datetime.combine(session, time(15, 30), tzinfo=UTC),
+                    "available_time": datetime.combine(session, time(15, 31), tzinfo=UTC),
+                    "open": open_price,
+                    "high": open_price + 1.0,
+                    "low": max(1.0, open_price - 1.0),
+                    "close": open_price + 0.5,
+                    "volume": 1_000_000.0,
+                    "trading_value": open_price * 1_000_000.0,
+                    "market_cap": 1e12 + float(t) * 1e9,
+                    "sector": f"S{t % 4}",
+                    "action_interval_covered": True,
+                    "data_quality_status": "eligible",
+                    "data_quality_reason": None,
+                    "raw__adtv_20d": 1.0e8 + float(s) * 1.0e6,
+                    "raw__volatility_20d": 0.02 + float(t % 5) * 0.005,
+                }
+                for j, name in enumerate(stock_alpha_v2_allowlist()):
+                    if name not in ("adtv_20d", "volatility_20d"):
+                        row[f"raw__{name}"] = float((t * 31 + s * 7 + j) % 50) / 10.0
+                rows.append(row)
+        base_frame = pl.DataFrame(rows)
+        base_manifest = make_manifest(
+            asset_kind=AssetKind.STOCK,
+            columns=base_frame.columns,
+            feature_set="base_panel",
+            label_definition="none",
+            label_horizon_sessions=1,
+            time_start=session_dt(sessions[0]),
+            time_end=session_dt(sessions[-1]),
+            provider_version="fixture",
+            universe_policy_version="fixture",
+            row_count=base_frame.height,
+            generated_time=GENERATED,
+            schema_version="v2",
+            content_hash=canonical_content_hash(base_frame, base_frame.columns),
+            storage_layout=HIVE_PARTITION_LAYOUT,
+        )
+        ParquetDatasetStore(base_root).write_partitioned(
+            base_frame,
+            dataset_id="base_v1",
+            manifest=base_manifest,
+            expected_feature_set="base_panel",
+            decision_time=GENERATED,
+            content_manifest={"fixture": True},
+        )
+        store = CatalogStore(catalog_root)
+        base_entry = CatalogEntry(
+            kind=CatalogKind.BASE_PANEL,
+            name="base_v1",
+            content_hash=ParquetDatasetStore(base_root)
+            .read_manifest("base_v1")
+            .content_hash,
+            schema_hash="schema",
+            registered_at=GENERATED,
+            coverage=CoverageRange(sessions[0], sessions[-1]),
+            completeness=EvidenceCompleteness.COMPLETE,
+            path=str(base_root / "base_v1"),
+        )
+        store.register(base_entry)
+        calendar_entry = register_file_evidence(
+            store,
+            kind=CatalogKind.CALENDAR,
+            name="calendar_v1",
+            path=calendar_path,
+            coverage=CoverageRange(sessions[0], sessions[-1]),
+            completeness=EvidenceCompleteness.COMPLETE,
+            registered_at=GENERATED,
+        )
+        cost_path = tmp_path / "costs.json"
+        cost_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "coverage": {"start": sessions[0].isoformat(), "end": sessions[-1].isoformat()},
+                    "assumption_id": "test_kis_v1",
+                    "sources": [
+                        {"uri": "https://law.go.kr/fixture", "retrieved_at": GENERATED.isoformat(), "content_hash": "h" * 64}
+                    ],
+                    "commission": [
+                        {"effective_from": sessions[0].isoformat(), "buy_rate": 0.000036396, "sell_rate": 0.000036396}
+                    ],
+                    "sell_taxes": [
+                        {"effective_from": sessions[0].isoformat(), "market": "KOSPI", "securities_transaction_tax_rate": 0.0003, "rural_special_tax_rate": 0.0015, "sell_tax_rate": 0.0018, "source_uri": "https://law.go.kr/fixture", "source_hash": "h" * 64},
+                        {"effective_from": sessions[0].isoformat(), "market": "KOSDAQ", "securities_transaction_tax_rate": 0.0018, "rural_special_tax_rate": 0.0, "sell_tax_rate": 0.0018, "source_uri": "https://law.go.kr/fixture", "source_hash": "h" * 64},
+                    ],
+                    "tick_size_rules": [
+                        {"rule_id": f"krx_{i}", "effective_from": sessions[0].isoformat(), "lower_inclusive": lo, "upper_exclusive": hi, "tick": tick}
+                        for i, (lo, hi, tick) in enumerate(
+                            ((0.0, 1000.0, 1.0), (1000.0, 5000.0, 5.0), (5000.0, 10000.0, 10.0), (10000.0, 50000.0, 50.0), (50000.0, 100000.0, 100.0), (100000.0, 500000.0, 500.0), (500000.0, None, 1000.0))
+                        )
+                    ],
+                    "liquidity_model": {"model_id": "sqrt_impact_v1", "impact_coefficient": 0.1, "stress_multiplier": 1.5},
+                    "settlement_days": 2,
+                }
+            ),
+            encoding="utf-8",
+        )
+        cost_entry = register_file_evidence(
+            store,
+            kind=CatalogKind.COSTS,
+            name="costs_v1",
+            path=cost_path,
+            coverage=CoverageRange(sessions[0], sessions[-1]),
+            completeness=EvidenceCompleteness.COMPLETE,
+            registered_at=GENERATED,
+        )
+        master_path = tmp_path / "master.json"
+        master_path.write_text(json.dumps({"version": "fixture"}), encoding="utf-8")
+        master_entry = register_file_evidence(
+            store,
+            kind=CatalogKind.INSTRUMENT_MASTER,
+            name="master_v1",
+            path=master_path,
+            coverage=CoverageRange(sessions[0], sessions[-1]),
+            completeness=EvidenceCompleteness.COMPLETE,
+            registered_at=GENERATED,
+        )
+        action_path = tmp_path / "actions.json"
+        action_path.write_text(json.dumps({"version": "fixture"}), encoding="utf-8")
+        action_entry = register_file_evidence(
+            store,
+            kind=CatalogKind.CORPORATE_ACTIONS,
+            name="actions_v1",
+            path=action_path,
+            coverage=CoverageRange(sessions[0], sessions[-1]),
+            completeness=EvidenceCompleteness.COMPLETE,
+            registered_at=GENERATED,
+        )
+        manifest = build_snapshot_manifest(
+            snapshot_id="source_snap_na",
+            certification=DatasetCertification.PROVISIONAL,
+            timing_convention=TimingConvention.DECISION_AFTER_CLOSE_EXECUTE_NEXT_OPEN,
+            windows=windows,
+            references=(
+                base_entry,
+                calendar_entry,
+                cost_entry,
+                master_entry,
+                action_entry,
+            ),
+        )
+        manifest_path = (
+            catalog_root / "snapshots" / "source_snap_na" / "snapshot_manifest.json"
+        )
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps(manifest.to_json(), sort_keys=True, indent=2),
+            encoding="utf-8",
+        )
+
+        result = materialize_net_alpha_snapshot(
+            NetAlphaMaterializationRequest(
+                source_snapshot_id="source_snap_na",
+                feature_dataset_id="features_na",
+                label_dataset_id="labels_na",
+                snapshot_id="snap_na",
+                catalog_root=catalog_root,
+                base_root=base_root,
+                feature_root=feature_root,
+                label_root=label_root,
+                generated_time=GENERATED,
+                windows=windows,
+                certification=DatasetCertification.PROVISIONAL,
+                calendar_path=calendar_path,
+                candidate_horizon_sessions=(3, 5),
+                reference_notional=1.0e6,
+            )
+        )
+        assert result.snapshot_id == "snap_na"
+
+        status_entry = store.get(CatalogKind.OUTCOME_STATUS, "labels_na_outcome_status")
+        assert status_entry is not None
+        assert status_entry.content_hash
+        assert status_entry.schema_hash
+        assert status_entry.row_count > 0
+        status_refs = dict(status_entry.references)
+        assert status_refs[CatalogKind.BASE_PANEL.value] == "base_v1"
+        assert status_refs[CatalogKind.CALENDAR.value] == "calendar_v1"
+        assert status_refs[CatalogKind.LABELS.value] == "labels_na"
+        assert status_refs[CatalogKind.INSTRUMENT_MASTER.value] == "master_v1"
+        assert status_refs[CatalogKind.CORPORATE_ACTIONS.value] == "actions_v1"
+        assert status_refs[CatalogKind.COSTS.value] == "costs_v1"
+
+        resolved = SnapshotResolver(store).resolve("snap_na")
+        assert resolved.outcome_status is not None
+        assert resolved.outcome_status.name == "labels_na_outcome_status"
+        assert resolved.status_provenance == "pinned"
+
+        repository = ResearchDataRepository(
+            base_root=base_root,
+            feature_root=feature_root,
+            label_root=label_root,
+        )
+        composed = repository.compose_labeled_training_snapshot(
+            resolved,
+            feature_set="stock_net_alpha_v1",
+            decision_time=GENERATED,
+        )
+        assert composed.frame.height > 0
+        assert "outcome_status" in composed.frame.columns
 
     def test_existing_id_creates_no_manifest_or_catalog_append(self, tmp_path) -> None:
         base_root = tmp_path / "base"
