@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_NET_ALPHA_DATA_VALIDATION_AUDIT",
+      "date": "2026-08-14",
+      "adr_id": "ADR_20260814_STOCK_NET_ALPHA_DATA_VALIDATION_AUDIT",
+      "domain": "stocks",
+      "title": "Stock net-alpha data validation and replay integrity",
+      "why": "Full inspection of the latest NO_TRADE result found healthy source data but replay produced zero realized blocks because the canonical net_alpha_target label was disconnected from replay; additional causal OOF, holdout, direction, and cost-unit defects could also reject or misuse valid data.",
+      "resolution": "Implemented canonical target/outcome wiring, causal horizon evidence and holdout handling, deterministic descending replay with zero-order suppression, decimal dynamic cost/calibration handling, request-controlled bootstrap evidence, and fail-closed nullable cost coverage validation.",
+      "impact": "Valid stock source rows remain auditable and independent by horizon; training and replay now fail closed on malformed provenance while NO_TRADE reflects economic evidence rather than silent schema mismatch. Ruff, mypy, contract checks, and the full test suite pass."
+    },
+    {
       "task_id": "TASK_STOCK_ML_MAINLINE_SIMPLIFICATION",
       "date": "2026-08-14",
       "adr_id": "ADR_20260814_STOCK_ML_MAINLINE_SIMPLIFICATION",
