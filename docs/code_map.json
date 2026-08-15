@@ -368,5 +368,6 @@
   },
   "src/stocks/ml/result_ledger.py": {
     "testing": "tests/unit/stocks/ml/test_result_ledger.py"
-  }
+  },
+  "src/main.py": {}
 }
