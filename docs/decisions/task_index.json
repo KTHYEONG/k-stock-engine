@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_NET_ALPHA_PERF",
+      "date": "2026-08-15",
+      "adr_id": "ADR_20260815_STOCK_NET_ALPHA_PERF",
+      "domain": "stocks",
+      "title": "Net-alpha training runtime & RAM peak optimization",
+      "why": "Full 6-horizon net-alpha run exceeded 20 minutes and aborted before artifact creation; to_dicts() row indexing posed a multi-GB transient RAM peak (OOM risk).",
+      "resolution": "Vectorized PurgedWalkForward._row_index, reused the standardized ElasticNet design across penalty fractions, converted causal-calibration and replay loops to partition-based iteration, maintained incremental prefix sums for the session-cluster bootstrap, and raised the LightGBM CLI thread default to 4; all output is bit-identical.",
+      "impact": "Estimated 15-25 min -> ~6-10 min and removal of the multi-GB to_dicts peak; determinism preserved and verified across thread counts."
+    },
+    {
       "task_id": "TASK_STOCK_ML_RESULT_LEDGER_OBSERVABILITY",
       "date": "2026-08-15",
       "adr_id": "ADR_20260815_STOCK_ML_RESULT_LEDGER_OBSERVABILITY",
