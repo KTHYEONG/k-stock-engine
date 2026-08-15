@@ -12,10 +12,19 @@ Each decision maximizes
 
 subject to instrument cap, sector/beta active exposure, ADTV participation,
 cash, settlement, and universe eligibility. New/replacement orders are created
-only when ``predicted_incremental_alpha_lower_bound > stressed_marginal_cost +
-marginal_risk_penalty``. The selected horizon fixes the holding maturity only;
-signals are computed every session and split into cohorts, so
-``horizon_sessions`` and ``rebalance_interval`` are never equated.
+only when the economic score's decimal lower bound clears the no-trade band.
+The selected horizon fixes the holding maturity only; signals are computed
+every session and split into cohorts, so ``horizon_sessions`` and
+``rebalance_interval`` are never equated.
+
+The economic score is always a decimal quantity: either the calibrated
+``net_alpha_lower_bound`` or, for score-only planning, the raw
+``predicted_net_alpha``. Realized block growth is decimal
+``risk_residual - realized_cost`` where ``realized_cost`` uses the effective
+cost schedule plus the provenance-bound liquidity model's dynamic slippage at
+the actual order notional; the reference cost stored in the label dataset is
+data provenance and is never reused as an execution cost for a differently
+sized order.
 """
 from __future__ import annotations
 
@@ -25,14 +34,17 @@ from datetime import datetime
 import numpy as np
 import polars as pl
 
-from src.core.costs import CostSchedule, default_base_schedule
+from src.core.costs import CostSchedule, LiquiditySlippageModel, default_base_schedule
 from src.stocks.ml.contracts import PortfolioSettings, RiskSettings
+from src.stocks.ml.labels import ID_COLUMN, RISK_RESIDUAL_COLUMN, SESSION_COLUMN
 from src.stocks.ml.models import SCORE_COLUMN
 
-_ID = "instrument_id"
-_SESSION = "session"
-_AVAILABLE = "label_available_time"
-_TARGET = "net_alpha"
+_ID = ID_COLUMN
+_SESSION = SESSION_COLUMN
+_RISK_RESIDUAL = RISK_RESIDUAL_COLUMN
+_ECONOMIC_SCORE = "net_alpha_lower_bound"
+_COST_INPUTS = ("open", "adtv_20d", "volatility_20d")
+_REALIZED_COLUMNS = (_ID, _SESSION, _RISK_RESIDUAL, *_COST_INPUTS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +110,7 @@ class NetAlphaPolicyReplay:
         portfolio: PortfolioSettings,
         risk: RiskSettings,
         cost_schedule: CostSchedule | None = None,
+        liquidity_model: LiquiditySlippageModel | None = None,
         seed: int = 42,
     ):
         if horizon_sessions < 1:
@@ -106,6 +119,7 @@ class NetAlphaPolicyReplay:
         self._portfolio = portfolio
         self._risk = risk
         self._cost_schedule = cost_schedule or default_base_schedule()
+        self._liquidity_model = liquidity_model
         self._seed = seed
 
     def evaluate(
@@ -119,14 +133,25 @@ class NetAlphaPolicyReplay:
 
         Args:
             oof_scores: scored panel carrying ``instrument_id``, ``session``,
-                and ``predicted_net_alpha``.
-            realized: optional panel carrying ``instrument_id``, ``session``,
-                and ``net_alpha`` realized target for block growth.
+                and either ``net_alpha_lower_bound`` (calibrated decimal
+                economic score) or ``predicted_net_alpha``.
+            realized: optional canonical realized-outcome panel carrying
+                ``instrument_id``, ``session``, ``risk_residual``, ``open``,
+                ``adtv_20d``, and ``volatility_20d``. When provided it is
+                validated (required columns, finite values, duplicate keys)
+                before any order is emitted. ``None`` remains valid score-only
+                planning and returns no realized blocks.
             decision_time: optional decision time gate for point-in-time
                 availability.
 
         Returns:
             An immutable ``ReplayEvaluation`` with deterministic ``orders``.
+
+        Raises:
+            ValueError: for a missing scored column, a non-empty realized frame
+                that lacks canonical columns, carries non-finite outcomes, or
+                repeats keys, or when a realized replay has no liquidity model
+                or cost coverage.
         """
         del decision_time
         required = (_ID, _SESSION, SCORE_COLUMN)
@@ -134,11 +159,28 @@ class NetAlphaPolicyReplay:
         if missing:
             raise ValueError(f"OOF scored panel missing columns {missing}")
 
+        economic_score = (
+            _ECONOMIC_SCORE if _ECONOMIC_SCORE in oof_scores.columns else SCORE_COLUMN
+        )
         scored = oof_scores.filter(
-            pl.col(SCORE_COLUMN).is_not_null() & pl.col(SCORE_COLUMN).is_finite()
+            pl.col(economic_score).is_not_null() & pl.col(economic_score).is_finite()
         )
         if scored.is_empty():
             return ReplayEvaluation(orders=(), blocks=(), decisions=())
+
+        realized_by_key: dict[tuple[str, object], dict[str, float]] = {}
+        if realized is not None and not realized.is_empty():
+            self._validate_realized(realized)
+            if self._liquidity_model is None:
+                raise ValueError("realized replay requires a liquidity model")
+            for row in realized.select(*_REALIZED_COLUMNS).iter_rows(named=True):
+                key = (str(row[_ID]), row[_SESSION])
+                realized_by_key[key] = {
+                    _RISK_RESIDUAL: float(row[_RISK_RESIDUAL]),
+                    "open": float(row["open"]),
+                    "adtv_20d": float(row["adtv_20d"]),
+                    "volatility_20d": float(row["volatility_20d"]),
+                }
 
         portfolio = self._portfolio
         sessions = sorted(scored[_SESSION].unique().to_list())
@@ -149,20 +191,17 @@ class NetAlphaPolicyReplay:
         blocks: list[PolicyBlock] = []
         decision_sessions: list[int] = []
 
-        realized_map: dict[tuple[str, object], float] = {}
-        if realized is not None and not realized.is_empty() and _TARGET in realized.columns:
-            for row in realized.select(_ID, _SESSION, _TARGET).iter_rows():
-                realized_map[(str(row[0]), row[1])] = float(row[2])
-
         cohort_weights: dict[int, list[PolicyOrder]] = {}
         for session in sessions:
             position = session_index[session]
             cohort = position // cohort_size
-            cross = scored.filter(pl.col(_SESSION) == session).sort(SCORE_COLUMN)
+            cross = scored.filter(pl.col(_SESSION) == session).sort(
+                [economic_score, _ID], descending=[True, False]
+            )
             top = cross.head(portfolio.top_k)
             if top.is_empty():
                 continue
-            scores = top[SCORE_COLUMN].to_numpy().astype(float)
+            scores = top[economic_score].to_numpy().astype(float)
             weights = self._allocate(scores)
             cohort_orders = [
                 PolicyOrder(
@@ -176,22 +215,26 @@ class NetAlphaPolicyReplay:
                 for row, score, weight in zip(
                     top.iter_rows(named=True), scores, weights, strict=True
                 )
+                if weight > 0.0
             ]
             orders.extend(cohort_orders)
-            cohort_weights.setdefault(cohort, []).extend(cohort_orders)
-            decision_sessions.append(position)
+            if cohort_orders:
+                cohort_weights.setdefault(cohort, []).extend(cohort_orders)
+                decision_sessions.append(position)
 
         for cohort in sorted(cohort_weights):
             members = cohort_weights[cohort]
             growth: list[float] = []
             for order in members:
-                realized_value = realized_map.get(
+                realized_value = realized_by_key.get(
                     (order.instrument_id, order.decision_session)
                 )
-                if realized_value is None or not np.isfinite(realized_value):
+                if realized_value is None:
                     continue
-                cost_rate = self._marginal_cost(order.order_size)
-                growth.append(float(realized_value) - cost_rate)
+                cost_rate = self._realized_cost(
+                    order.order_size, order.decision_session, realized_value
+                )
+                growth.append(float(realized_value[_RISK_RESIDUAL]) - cost_rate)
             if not growth:
                 continue
             blocks.append(
@@ -200,9 +243,7 @@ class NetAlphaPolicyReplay:
                     horizon_sessions=self._horizon_sessions,
                     block_log_excess=float(np.mean(growth)),
                     order_count=len(growth),
-                    notional=float(
-                        sum(order.order_size for order in members)
-                    ),
+                    notional=float(sum(order.order_size for order in members)),
                 )
             )
 
@@ -213,22 +254,19 @@ class NetAlphaPolicyReplay:
         )
 
     def _allocate(self, scores: np.ndarray) -> np.ndarray:
-        """Constrained equal-alpha-cap allocation: cap, exposure, no-trade band.
+        """Constrained allocation on the decimal economic score.
 
-        Weights are proportional to the clipped positive alpha signal, capped at
-        ``max_single_weight``, normalized to ``max_exposure``, and zeroed when
-        the risk-adjusted lower-bound hurdle is not met.
+        The 5-bps no-trade band is evaluated only against the decimal economic
+        score: a name whose lower bound does not clear the band contributes zero
+        weight, and an all-below-band cross-section creates no orders. Weights
+        are proportional to the clipped positive score, capped at
+        ``max_single_weight``, and normalized to ``max_exposure``.
         """
         portfolio = self._portfolio
-        positive = scores[~np.isnan(scores)]
-        if positive.size == 0:
-            return np.zeros(scores.size, dtype=np.float64)
-        signal = np.clip(positive, 0.0, None)
-        if not signal.any():
-            return np.zeros(scores.size, dtype=np.float64)
-        alpha_avg = float(signal.mean())
         hurdle = self._risk.no_trade_band_bps / 10_000.0
-        if alpha_avg <= hurdle:
+        clean = np.where(np.isfinite(scores), scores, 0.0)
+        signal = np.clip(clean - hurdle, 0.0, None)
+        if not signal.any():
             return np.zeros(scores.size, dtype=np.float64)
         weights = signal / signal.sum()
         weights = np.minimum(weights, portfolio.max_single_weight)
@@ -238,21 +276,57 @@ class NetAlphaPolicyReplay:
         )
         return np.asarray(weights * scale, dtype=np.float64)
 
-    def _marginal_cost(self, order_size: float) -> float:
-        """Stressed marginal round-trip cost rate for an order."""
-        point = self._cost_schedule.cost_for(_decision_time_ref())
-        participation = min(
-            self._portfolio.participation_limit,
-            max(order_size / self._portfolio.portfolio_value, 1e-9),
+    def _realized_cost(
+        self,
+        order_size: float,
+        decision_session: datetime,
+        realized_value: dict[str, float],
+    ) -> float:
+        """Decimal round-trip cost rate for one order's realized execution.
+
+        ``realized_cost = 2 * commission_rate + sell_tax_rate +
+        2 * slippage_bps / 10_000`` where the dynamic ``slippage_bps`` comes
+        from the provenance-bound liquidity model at the actual order notional.
+        Missing cost inputs or cost coverage fail closed with ``ValueError``.
+        """
+        liquidity = self._liquidity_model
+        if liquidity is None:
+            raise ValueError("realized replay requires a liquidity model")
+        point = self._cost_schedule.cost_for(decision_session)
+        slippage_bps = liquidity.slippage_bps(
+            notional=order_size,
+            adtv_20d=realized_value["adtv_20d"],
+            daily_volatility=realized_value["volatility_20d"],
+            reference_price=realized_value["open"],
+            effective_time=decision_session,
         )
         return (
-            2.0 * point.commission_rate
-            + point.tax_rate
-            + 2.0 * (participation * 100.0)
+            2.0 * point.commission_rate + point.tax_rate + 2.0 * slippage_bps / 10_000.0
         )
 
-
-def _decision_time_ref() -> datetime:
-    from datetime import UTC
-
-    return datetime(2000, 1, 1, tzinfo=UTC)
+    def _validate_realized(self, realized: pl.DataFrame) -> None:
+        """Fail closed on a non-empty realized frame that breaks the contract."""
+        missing = [c for c in _REALIZED_COLUMNS if c not in realized.columns]
+        if missing:
+            raise ValueError(f"realized frame missing canonical columns {missing}")
+        valid = (
+            pl.col(_RISK_RESIDUAL).is_not_null()
+            & pl.col(_RISK_RESIDUAL).is_finite()
+            & pl.col("open").is_not_null()
+            & pl.col("open").is_finite()
+            & pl.col("adtv_20d").is_not_null()
+            & pl.col("adtv_20d").is_finite()
+            & pl.col("volatility_20d").is_not_null()
+            & pl.col("volatility_20d").is_finite()
+        )
+        if not realized.filter(~valid).is_empty():
+            raise ValueError(
+                "realized frame contains null or non-finite outcome/cost columns"
+            )
+        duplicate = (
+            realized.group_by([_ID, _SESSION]).len().filter(pl.col("len") > 1)
+        )
+        if not duplicate.is_empty():
+            raise ValueError(
+                "realized frame contains duplicate instrument/session keys"
+            )

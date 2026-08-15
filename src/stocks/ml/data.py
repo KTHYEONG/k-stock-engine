@@ -23,6 +23,8 @@ from src.stocks.ml.features import stock_net_alpha_v1_roles
 from src.stocks.ml.labels import (
     AVAILABLE_COLUMN,
     ID_COLUMN,
+    REFERENCE_COST_COLUMN,
+    RISK_RESIDUAL_COLUMN,
     TARGET_COLUMN,
 )
 
@@ -90,7 +92,10 @@ def compose_net_alpha_training_data(
     else:
         label_columns = [
             c for c in frame.columns
-            if c.startswith("net_alpha_") or c.startswith("label_available_time_")
+            if c.startswith("net_alpha_")
+            or c.startswith("label_available_time_")
+            or c.startswith("risk_residual_")
+            or c.startswith("reference_cost_")
         ]
     feature_frame = frame.drop(label_columns)
     if long_format:
@@ -152,6 +157,8 @@ def compose_net_alpha_training_data(
                 pl.col(ID_COLUMN), pl.col(_FEATURE_SESSION),
                 pl.col("net_alpha_target").alias(TARGET_COLUMN),
                 pl.col("label_available_time").alias(AVAILABLE_COLUMN),
+                pl.col("risk_residual").alias(RISK_RESIDUAL_COLUMN),
+                pl.col("reference_cost").alias(REFERENCE_COST_COLUMN),
             )
             feature_rows = frame.filter(pl.col("horizon_sessions") == horizon).height
         else:
@@ -159,12 +166,21 @@ def compose_net_alpha_training_data(
             available_column = _available_column(frame.columns, horizon)
             if target_column is None or available_column is None:
                 continue
-            label_frame = frame.select(
+            residual_column = f"risk_residual_{horizon}d"
+            cost_column = f"reference_cost_{horizon}d"
+            select_columns: list[pl.Expr] = [
                 pl.col(ID_COLUMN),
                 pl.col(_FEATURE_SESSION).alias(_FEATURE_SESSION),
                 pl.col(target_column).alias(TARGET_COLUMN),
                 pl.col(available_column).alias(AVAILABLE_COLUMN),
-            )
+            ]
+            if residual_column in frame.columns:
+                select_columns.append(
+                    pl.col(residual_column).alias(RISK_RESIDUAL_COLUMN)
+                )
+            if cost_column in frame.columns:
+                select_columns.append(pl.col(cost_column).alias(REFERENCE_COST_COLUMN))
+            label_frame = frame.select(select_columns)
             feature_rows = frame.height
         label_rows = int(
             label_frame.filter(pl.col(TARGET_COLUMN).is_not_null()).height

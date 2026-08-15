@@ -13,6 +13,12 @@ import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
+from src.core.costs import (
+    CostSchedule,
+    LiquiditySlippageModel,
+    default_base_schedule,
+    default_stress_schedule,
+)
 from src.core.paths import (
     STOCK_ARTIFACT_ROOT,
     STOCK_BASE_PANEL_ROOT,
@@ -20,6 +26,7 @@ from src.core.paths import (
     STOCK_FEATURE_PANEL_ROOT,
     STOCK_LABEL_ROOT,
 )
+from src.stocks.data.costs import load_cost_evidence
 from src.stocks.data.repositories import (
     ResearchDataRepository,
     resolve_snapshot_for_mode,
@@ -74,6 +81,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="explicit RSS budget in MiB; a breach publishes complete NO_TRADE evidence",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--cost-schedule",
+        choices=("base", "stress"),
+        default="base",
+        help=(
+            "effective-dated cost schedule resolved from the snapshot cost "
+            "evidence when present, else the canonical base/stress schedule"
+        ),
+    )
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--max-single-weight", type=float, default=0.08)
     parser.add_argument("--max-exposure", type=float, default=0.90)
@@ -94,6 +110,29 @@ def _parse_horizons(raw: str) -> tuple[int, ...]:
     if not values:
         raise ValueError("candidate-horizon-sessions must be non-empty")
     return values
+
+
+def _resolve_cost_context(
+    snapshot: object, cost_schedule: str
+) -> tuple[CostSchedule, LiquiditySlippageModel | None]:
+    """Resolve one effective-dated cost schedule plus liquidity model.
+
+    The snapshot's hash-bound cost evidence is the preferred source for both;
+    without it the canonical base/stress schedules are used and the liquidity
+    model is left unset (replay then fails closed on realized outcomes).
+    """
+    costs = getattr(snapshot, "costs", None)
+    if costs is not None:
+        research_range = getattr(snapshot, "research_range", None)
+        if research_range is None:
+            raise ValueError("snapshot cost evidence requires a research_range")
+        evidence = load_cost_evidence(Path(costs.path), research_range)
+        if cost_schedule == "stress":
+            return evidence.stress_schedule(), evidence.stress_liquidity_model
+        return evidence.base_schedule(), evidence.base_liquidity_model
+    if cost_schedule == "stress":
+        return default_stress_schedule(), None
+    return default_base_schedule(), None
 
 
 def main(args: list[str] | None = None) -> int:
@@ -133,6 +172,9 @@ def main(args: list[str] | None = None) -> int:
         candidate_horizon_sessions=_parse_horizons(parsed.candidate_horizon_sessions),
     )
 
+    base_cost_schedule, liquidity_model = _resolve_cost_context(
+        snapshot, parsed.cost_schedule
+    )
     registry = ModelArtifactRegistry(parsed.registry)
     request = NetAlphaTrainingRequest(
         artifact_id=parsed.artifact_id,
@@ -155,6 +197,8 @@ def main(args: list[str] | None = None) -> int:
             reference_notional=parsed.reference_notional,
         ),
         risk=RiskSettings(),
+        base_cost_schedule=base_cost_schedule,
+        liquidity_model=liquidity_model,
     )
     logger.info(
         "training net-alpha mainline artifact %s over candidate horizons %s",
