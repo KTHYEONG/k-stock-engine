@@ -185,3 +185,42 @@ def test_publish_outcome_status_sidecar_binds_schema_and_content_hash(tmp_path) 
         [ID_COLUMN, SESSION_COLUMN, HORIZON_COLUMN]
     ).equals(status)
     assert result.dataset_id.endswith(OUTCOME_STATUS_DATASET_SUFFIX)
+    # Snapshot-pinned: the declared content hash binds the exact spine and the
+    # sidecar emits exactly one row per (instrument_id, session, horizon).
+    duplicate_count = reread.group_by(
+        [ID_COLUMN, SESSION_COLUMN, HORIZON_COLUMN]
+    ).len().filter(pl.col("len") > 1).height
+    assert duplicate_count == 0
+    assert reread.height == status.height
+
+
+def test_publish_outcome_status_sidecar_rejects_duplicate_identity_keys(tmp_path) -> None:
+    import polars as pl
+    from datetime import UTC, datetime
+
+    from src.stocks.ml.labels import (
+        HORIZON_COLUMN,
+        ID_COLUMN,
+        SESSION_COLUMN,
+        publish_outcome_status_sidecar,
+    )
+
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    duplicate_status = pl.DataFrame(
+        {
+            ID_COLUMN: ["KRX:00001", "KRX:00001"],
+            SESSION_COLUMN: [start, start],
+            HORIZON_COLUMN: [3, 3],
+            "outcome_status": ["REALIZED", "PARTIAL_TAIL"],
+        }
+    )
+    with pytest.raises(ValueError, match="exactly one row"):
+        publish_outcome_status_sidecar(
+            duplicate_status,
+            destination_root=tmp_path / "labels",
+            dataset_id="na_labels_outcome_status",
+            base_panel_hash="base-hash",
+            calendar_hash="cal-hash",
+            horizon_sessions=(3,),
+            generated_time=datetime(2024, 2, 1, tzinfo=UTC),
+        )

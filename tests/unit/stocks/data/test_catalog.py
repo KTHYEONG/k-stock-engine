@@ -78,9 +78,15 @@ def register_dataset_refs(store: CatalogStore) -> dict[CatalogKind, CatalogEntry
     base = entry(CatalogKind.BASE_PANEL, "base_panel_v1", content_hash="base")
     features = entry(CatalogKind.FEATURES, "features_v1", content_hash="feat")
     labels = entry(CatalogKind.LABELS, "labels_v1", content_hash="label")
-    for ref in (base, features, labels):
+    status = entry(CatalogKind.OUTCOME_STATUS, "labels_v1_outcome_status", content_hash="status")
+    for ref in (base, features, labels, status):
         store.register(ref)
-    return {CatalogKind.BASE_PANEL: base, CatalogKind.FEATURES: features, CatalogKind.LABELS: labels}
+    return {
+        CatalogKind.BASE_PANEL: base,
+        CatalogKind.FEATURES: features,
+        CatalogKind.LABELS: labels,
+        CatalogKind.OUTCOME_STATUS: status,
+    }
 
 
 def write_snapshot(
@@ -261,6 +267,63 @@ class TestSnapshotResolver:
         write_snapshot(store, "research_1", list(refs.values()))
         with pytest.raises(ValueError, match=r"pins.*base_panel"):
             SnapshotResolver(store).resolve("research_1")
+
+    def test_absent_outcome_status_reference_rejects_certification(self, tmp_path) -> None:
+        store = CatalogStore(tmp_path)
+        refs = {**complete_evidence(store), **register_dataset_refs(store)}
+        del refs[CatalogKind.OUTCOME_STATUS]
+        write_snapshot(store, "research_1", list(refs.values()))
+        with pytest.raises(ValueError, match="pinned outcome-status"):
+            SnapshotResolver(store).resolve("research_1")
+
+    def test_legacy_inferred_status_provenance_cannot_certify(self, tmp_path) -> None:
+        store = CatalogStore(tmp_path)
+        refs = {**complete_evidence(store), **register_dataset_refs(store)}
+        del refs[CatalogKind.OUTCOME_STATUS]
+        write_snapshot(store, "legacy_1", list(refs.values()))
+        with pytest.raises(ValueError, match="legacy-inferred status provenance"):
+            SnapshotResolver(store).resolve("legacy_1")
+
+    def test_hash_mismatched_outcome_status_is_rejected(self, tmp_path) -> None:
+        store = CatalogStore(tmp_path)
+        refs = {**complete_evidence(store), **register_dataset_refs(store)}
+        tampered_status = entry(
+            CatalogKind.OUTCOME_STATUS,
+            "labels_v1_outcome_status",
+            content_hash="tampered",
+        )
+        refs[CatalogKind.OUTCOME_STATUS] = tampered_status
+        write_snapshot(store, "research_1", list(refs.values()))
+        with pytest.raises(ValueError, match=r"pins.*outcome_status"):
+            SnapshotResolver(store).resolve("research_1")
+
+    def test_provisional_snapshot_allows_legacy_inferred_provenance(self, tmp_path) -> None:
+        store = CatalogStore(tmp_path)
+        refs = register_dataset_refs(store)
+        del refs[CatalogKind.OUTCOME_STATUS]
+        write_snapshot(
+            store,
+            "provisional_1",
+            list(refs.values()),
+            certification=DatasetCertification.PROVISIONAL,
+        )
+        snapshot = SnapshotResolver(store).resolve("provisional_1")
+        assert snapshot.status_provenance == "legacy-inferred"
+
+    def test_provisional_snapshot_with_pinned_status_exposes_pinned_provenance(
+        self, tmp_path
+    ) -> None:
+        store = CatalogStore(tmp_path)
+        refs = register_dataset_refs(store)
+        write_snapshot(
+            store,
+            "provisional_1",
+            list(refs.values()),
+            certification=DatasetCertification.PROVISIONAL,
+        )
+        snapshot = SnapshotResolver(store).resolve("provisional_1")
+        assert snapshot.outcome_status is not None
+        assert snapshot.status_provenance == "pinned"
 
 
 class TestRetention:
