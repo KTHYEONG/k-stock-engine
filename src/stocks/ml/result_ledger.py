@@ -311,8 +311,11 @@ def _build_schema(retained_cap: int) -> dict[str, object]:
             "observability": {
                 "phases": "bounded phase samples",
                 "horizons": "per-candidate admission and fold diagnostics",
-                "replay": "aggregate block-excess summary",
-                "holdout": "forward-holdout pass/counts",
+                "replay": "aggregate period-return summary",
+                "holdout": (
+                    "compound certificate (base/stress CAGR, lower CAGR, MDD, "
+                    "Calmar, pass flags), cohort counts, eligibility interval"
+                ),
             },
             "artifact": {"manifest_path": "str", "metrics_path": "str"},
         },
@@ -602,7 +605,11 @@ def _project_replay(metrics: Mapping[str, object]) -> dict[str, object]:
     order_count = replay.get("order_count")
     block_count = replay.get("block_count")
     decisions = replay.get("decisions")
-    block_log_excess = replay.get("block_log_excess")
+    period_net_returns = replay.get("period_net_returns")
+    if not isinstance(period_net_returns, (list, tuple)):
+        # Read-side compatibility for legacy artifacts that serialized the
+        # arithmetic block returns under the old misnamed key.
+        period_net_returns = replay.get("block_log_excess")
     return {
         "order_count": int(order_count) if isinstance(order_count, int) else 0,
         "block_count": int(block_count) if isinstance(block_count, int) else 0,
@@ -610,10 +617,42 @@ def _project_replay(metrics: Mapping[str, object]) -> dict[str, object]:
             len(decisions) if isinstance(decisions, (list, tuple)) else 0
         ),
         "block_excess_summary": summarize_numeric(
-            block_log_excess
-            if isinstance(block_log_excess, (list, tuple))
+            period_net_returns
+            if isinstance(period_net_returns, (list, tuple))
             else []
         ),
+    }
+
+
+def _as_float(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    if isinstance(value, str):
+        try:
+            number = float(value)
+        except ValueError:
+            return None
+        return number if math.isfinite(number) else None
+    return None
+
+
+def _project_certificate_path(path: object) -> dict[str, object]:
+    if not isinstance(path, dict):
+        return {}
+    return {
+        "passed": bool(path.get("passed", False)),
+        "reasons": [
+            _normalize_message(reason)
+            for reason in path.get("reasons", [])
+            if isinstance(reason, str)
+        ],
+        "cagr": _as_float(path.get("cagr")),
+        "lower_cagr": _as_float(path.get("lower_cagr")),
+        "mdd": _as_float(path.get("mdd")),
+        "calmar": _as_float(path.get("calmar")),
     }
 
 
@@ -623,11 +662,46 @@ def _project_holdout(metrics: Mapping[str, object]) -> dict[str, object]:
         return {}
     order_count = holdout.get("order_count")
     block_count = holdout.get("block_count")
+    certificate = holdout.get("certificate")
+    cert = certificate if isinstance(certificate, dict) else {}
+    cohorts = holdout.get("cohorts")
+    cohort_counts = cohorts if isinstance(cohorts, dict) else {}
+    eligibility = holdout.get("eligibility")
+    eligibility = eligibility if isinstance(eligibility, dict) else {}
     return {
         "passed": bool(holdout.get("passed", False)),
         "reason": _normalize_message(holdout.get("reason", "")),
         "order_count": int(order_count) if isinstance(order_count, int) else 0,
         "block_count": int(block_count) if isinstance(block_count, int) else 0,
+        "cohorts": {
+            "scored_sessions": _as_int(cohort_counts.get("scored_sessions")),
+            "realized_sessions": _as_int(cohort_counts.get("realized_sessions")),
+            "eligible_sessions": _as_int(cohort_counts.get("eligible_sessions")),
+            "period_count": _as_int(cohort_counts.get("period_count")),
+            "observed_sessions": _as_int(cohort_counts.get("observed_sessions")),
+            "active_cohort_count": _as_int(
+                cohort_counts.get("active_cohort_count")
+            ),
+            "missing_realized_cohorts": _as_int(
+                cohort_counts.get("missing_realized_cohorts")
+            ),
+        },
+        "certificate": {
+            "passed": bool(cert.get("passed", False)),
+            "reasons": [
+                _normalize_message(reason)
+                for reason in cert.get("reasons", [])
+                if isinstance(reason, str)
+            ],
+            "base": _project_certificate_path(cert.get("base")),
+            "stress": _project_certificate_path(cert.get("stress")),
+        },
+        "eligibility": {
+            "eligible_from": _normalize_message(
+                eligibility.get("eligible_from", "")
+            ),
+            "eligible_to": _normalize_message(eligibility.get("eligible_to", "")),
+        },
     }
 
 
