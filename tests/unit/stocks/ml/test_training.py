@@ -26,6 +26,7 @@ def test_forward_holdout_contract_signature() -> None:
         "horizon_sessions",
     ]
 
+
 class _FakeScoringModel:
     def __init__(self, score: float) -> None:
         self.score = score
@@ -175,12 +176,23 @@ def test_forward_holdout_compound_certification_failure_is_explicit() -> None:
     assert "insufficient-observed-sessions" in evidence["reason"]
 
 
-def _training_fixture(n_sessions: int = 120) -> tuple[object, object, object, list[object], tuple[str, ...]]:
-    """Composed net-alpha fixture: data, request, pre_holdout, folds, learner columns."""
+def _training_fixture(
+    n_sessions: int = 120,
+    annualization_sessions: int = 40,
+) -> tuple[object, object, pl.DataFrame, list[object], tuple[str, ...], object]:
+    """Composed net-alpha fixture: data, request, pre_holdout, folds, columns, schema."""
     from src.stocks.data.contracts import DatasetSnapshot
-    from src.stocks.ml.contracts import NetAlphaTrainingRequest
+    from src.stocks.ml.contracts import (
+        CompoundingCertificationSettings,
+        NetAlphaTrainingRequest,
+        RiskSettings,
+    )
     from src.stocks.ml.data import compose_net_alpha_training_data
-    from src.stocks.ml.features import build_model_features, stock_net_alpha_v1_roles
+    from src.stocks.ml.features import (
+        apply_model_feature_schema,
+        fit_model_feature_schema,
+        stock_net_alpha_v1_roles,
+    )
     from src.stocks.research.folds import PurgedWalkForward
     from tests.fixtures.stocks.helpers import (
         stock_liquidity_model,
@@ -199,27 +211,34 @@ def _training_fixture(n_sessions: int = 120) -> tuple[object, object, object, li
         (3, 5, 8, 10, 15, 20),
     )
     roles = dict(stock_net_alpha_v1_roles())
-    transformed, learner_columns = build_model_features(data.feature_frame, roles)
-    panel = training._index_sessions(transformed)
+    raw = training._index_sessions(data.feature_frame)
+    pre_holdout_raw, _holdout_raw, reason = training._locked_holdout(raw, request=NetAlphaTrainingRequest(artifact_id="na_fixture"))
+    assert reason == ""
+    schema = fit_model_feature_schema(pre_holdout_raw, roles)
+    pre_holdout = apply_model_feature_schema(pre_holdout_raw, schema)
+    learner_columns = schema.learner_columns
     request = NetAlphaTrainingRequest(
         artifact_id="na_test",
         fold_count=2,
         candidate_horizon_sessions=(3, 5, 8, 10, 15, 20),
         bootstrap_resamples=50,
         liquidity_model=stock_liquidity_model(),
+        risk=RiskSettings(min_calibration_sessions=10),
+        compounding=CompoundingCertificationSettings(
+            annualization_sessions=annualization_sessions,
+            min_observed_sessions=10,
+            min_active_cohort_fraction=0.1,
+        ),
     )
-    pre_holdout, _holdout, reason = training._locked_holdout(panel, request)
-    assert reason == ""
     splitter = PurgedWalkForward(
         n_folds=2,
-        label_horizon_sessions=6,
+        label_horizon_sessions=21,
         embargo_sessions=5,
         session_column="session_index",
-        validation_window_sessions=20,
-        min_train_sessions=40,
+        min_train_sessions=annualization_sessions,
     )
     folds = splitter.split(pre_holdout)
-    return data, request, pre_holdout, folds, learner_columns
+    return data, request, pre_holdout, folds, learner_columns, schema
 
 
 def test_score_is_constant_classifies_degenerate_predictions() -> None:
@@ -267,7 +286,7 @@ def test_select_elastic_alpha_recovers_linear_signal() -> None:
         eligible_from="2024-01-01T00:00:00+00:00",
         eligible_to="2024-12-31T00:00:00+00:00",
     )
-    alpha, fraction, alpha_max = training._select_elastic_alpha(
+    alpha, fraction, alpha_max, path_evaluations = training._select_elastic_alpha(
         fold_train, request, ("feature__test_x",), 3, RegularizationGrid(), manifest
     )
     assert alpha is not None
@@ -276,6 +295,7 @@ def test_select_elastic_alpha_recovers_linear_signal() -> None:
     assert alpha_max > 0.0
     assert fraction in RegularizationGrid().fractions
     assert alpha == pytest.approx(fraction * alpha_max)
+    assert path_evaluations <= RegularizationGrid().fractions.__len__() + 1
 
 
 def test_compute_alpha_max_reuses_precomputed_standardized_design() -> None:
@@ -311,7 +331,7 @@ def test_compute_alpha_max_reuses_precomputed_standardized_design() -> None:
 def test_fit_oof_reports_fit_error_instead_of_swallowing() -> None:
     from src.stocks.ml.contracts import FoldScoreDiagnostic
 
-    data, request, pre_holdout, folds, learner_columns = _training_fixture()
+    data, request, pre_holdout, folds, learner_columns, _schema = _training_fixture()
     assert folds
     manifest = training._base_manifest(request, data, data.feature_frame, 5)
 
@@ -327,7 +347,7 @@ def test_fit_oof_reports_fit_error_instead_of_swallowing() -> None:
         def manifest(self) -> object:
             return manifest
 
-    oof, oof_labels, rank_ics, diagnostic = training._fit_oof(
+    oof, oof_labels, rank_ics, diagnostic, _path_count = training._fit_oof(
         pre_holdout, folds, data, request, manifest, learner_columns, 5,
         _ExplodingModel, family="net_alpha_lightgbm_l1",
     )
@@ -341,42 +361,75 @@ def test_fit_oof_reports_fit_error_instead_of_swallowing() -> None:
     )
 
 
-def test_horizon_evidence_constant_baseline_triggers_structural_fallback(monkeypatch) -> None:
+def test_horizon_evidence_constant_baseline_triggers_structural_fallback() -> None:
+    """A constant linear screen must skip the challenger and cap it at one horizon."""
     from src.stocks.ml.contracts import FoldScoreDiagnostic, HorizonOOFDiagnostic
 
-    data, request, pre_holdout, _folds, learner_columns = _training_fixture()
-    real_fit_oof = training._fit_oof
-    call_families: list[str] = []
+    data, request, pre_holdout, folds, learner_columns, _schema = _training_fixture()
+    diagnostic = HorizonOOFDiagnostic(
+        horizon_sessions=5,
+        model_family="net_alpha_elastic_net",
+        fold_diagnostics=(
+            FoldScoreDiagnostic(fold_index=0, failure_reason="constant-oof-score"),
+        ),
+    )
+    discovery = training.HorizonDiscovery(
+        evidence=(),
+        diagnostics=(diagnostic,),
+        oof_by_horizon={},
+    )
+    selection = training.HorizonSelectionEvidence(
+        primary_horizon_sessions=5,
+        adjusted_lower_growth={5: {"base": 0.001, "stress": 0.001}},
+        base_p_values={5: 0.01},
+        stress_p_values={5: 0.01},
+        base_holm_thresholds={5: 0.05},
+        stress_holm_thresholds={5: 0.05},
+        selection_reasons=(),
+    )
+    reason = training._rankability_gate(
+        diagnostic, discovery, 5, selection, request
+    )
+    assert reason.startswith("challenger-skipped:no-rankability-evidence:constant-score")
 
-    def spy_fit_oof(*args, **kwargs):
-        family = kwargs["family"]
-        call_families.append(family)
-        if family == "net_alpha_elastic_net":
-            return (
-                pl.DataFrame(),
-                pl.DataFrame(),
-                [],
-                HorizonOOFDiagnostic(
-                    horizon_sessions=args[6],
-                    model_family="net_alpha_elastic_net",
-                    fold_diagnostics=(
-                        FoldScoreDiagnostic(
-                            fold_index=0, failure_reason="constant-oof-score"
-                        ),
-                    ),
-                ),
-            )
-        return real_fit_oof(*args, **kwargs)
+    manifest = training._base_manifest(request, data, data.feature_frame, 5)
+    selected, failure, oof, _labels, _ics, _diag = training._adopt_model_family(
+        pre_holdout, folds, data, request, manifest, learner_columns, 5,
+        pl.DataFrame(), pl.DataFrame(), [], diagnostic, reason,
+    )
+    assert selected == "net_alpha_elastic_net"
+    assert failure == reason
+    assert oof.is_empty()
 
-    monkeypatch.setattr(training, "_fit_oof", spy_fit_oof)
+
+def test_fold_plan_is_balanced_and_segment_identified() -> None:
+    data, request, pre_holdout, folds, _learner_columns, _schema = _training_fixture()
+    assert len(folds) == 2
+    counts = [len(fold.validation_sessions) for fold in folds]
+    assert max(counts) - min(counts) <= 1
+    assert [fold.segment_id for fold in folds] == [0, 1]
+    for fold in folds:
+        assert fold.train_label_end < fold.validation_decision_start
+
+
+def test_discovery_oof_reuses_cached_baseline_never_refits() -> None:
+    data, request, pre_holdout, folds, learner_columns, _schema = _training_fixture()
     discovery = training._build_horizon_evidence(
-        pre_holdout, data.feature_frame, data, request, learner_columns
+        pre_holdout, folds, data, request, learner_columns
     )
-    assert "net_alpha_lightgbm_l1" in call_families
-    assert discovery.diagnostics
-    assert any(
-        d.model_family == "net_alpha_lightgbm_l1" for d in discovery.diagnostics
+    if not discovery.evidence:
+        pytest.skip("fixture produced no horizon evidence")
+    primary = discovery.evidence[0].horizon_sessions
+    oof, oof_labels, ics, _diagnostic = training._discovery_oof(
+        discovery, primary, folds
     )
+    cached_oof, cached_labels, cached_ics = discovery.oof_by_horizon[primary]
+    # The discovery baseline is reused by identity; the selected primary is
+    # never refit.
+    assert oof is cached_oof
+    assert oof_labels is cached_labels
+    assert ics == cached_ics
+    assert discovery.path_evaluation_count <= discovery.path_evaluation_bound
 
 
 class _FakeClock:
@@ -397,15 +450,33 @@ def test_training_telemetry_records_phases_without_fitting() -> None:
     telemetry = training.TrainingTelemetry(clock=clock)
     telemetry.phase("integrity_audit", {"passed": True})
     clock.advance(timedelta(seconds=2))
-    telemetry.phase("feature_transform", {"learner_feature_count": 4})
+    telemetry.phase(
+        "feature_transform",
+        {
+            "learner_feature_count": 4,
+            "schema_fingerprint": "abc123",
+        },
+    )
+    clock.advance(timedelta(seconds=1))
+    telemetry.phase(
+        "horizon_discovery",
+        {
+            "path_evaluation_count": 48,
+            "path_evaluation_bound": 72,
+        },
+    )
     data = telemetry.to_dict()
     assert [p["name"] for p in data["phases"]] == [
         "integrity_audit",
         "feature_transform",
+        "horizon_discovery",
     ]
     assert data["phases"][0]["elapsed_ms"] == 0
     assert data["phases"][1]["elapsed_ms"] == 2000
     assert data["phases"][1]["learner_feature_count"] == 4
+    assert data["phases"][1]["schema_fingerprint"] == "abc123"
+    assert data["phases"][2]["path_evaluation_count"] == 48
+    assert data["phases"][2]["path_evaluation_bound"] == 72
     assert data["phases"][0]["peak_rss_mib"] is None or isinstance(
         data["phases"][0]["peak_rss_mib"], float
     )
@@ -416,7 +487,10 @@ def test_run_observability_preserves_terminal_no_trade_reason(tmp_path) -> None:
     from pathlib import Path
 
     from src.stocks.data.contracts import DatasetSnapshot
-    from src.stocks.ml.contracts import NetAlphaTrainingRequest
+    from src.stocks.ml.contracts import (
+        CompoundingCertificationSettings,
+        NetAlphaTrainingRequest,
+    )
     from src.stocks.ml.data import compose_net_alpha_training_data
     from src.stocks.research.artifacts import ModelArtifactRegistry
     from tests.fixtures.stocks.helpers import (
@@ -441,6 +515,11 @@ def test_run_observability_preserves_terminal_no_trade_reason(tmp_path) -> None:
         candidate_horizon_sessions=(3, 5, 8, 10, 15, 20),
         bootstrap_resamples=50,
         liquidity_model=stock_liquidity_model(),
+        compounding=CompoundingCertificationSettings(
+            annualization_sessions=40,
+            min_observed_sessions=10,
+            min_active_cohort_fraction=0.1,
+        ),
     )
     manifest = training.train_net_alpha_model(data, registry, request)
     assert manifest.model_type == "no_trade"
@@ -452,8 +531,8 @@ def test_run_observability_preserves_terminal_no_trade_reason(tmp_path) -> None:
     names = [p["name"] for p in phases]
     assert names[:4] == [
         "integrity_audit",
-        "feature_transform",
         "holdout_lock",
+        "feature_transform",
         "horizon_discovery",
     ]
     assert phases[-1]["name"] == "artifact_publish"
@@ -464,11 +543,15 @@ def test_run_observability_preserves_terminal_no_trade_reason(tmp_path) -> None:
 
 
 def test_train_net_alpha_model_promotes_champion_or_no_trade(tmp_path) -> None:
+    import json
     from datetime import UTC, datetime
     from pathlib import Path
 
     from src.stocks.data.contracts import DatasetSnapshot
-    from src.stocks.ml.contracts import NetAlphaTrainingRequest
+    from src.stocks.ml.contracts import (
+        CompoundingCertificationSettings,
+        NetAlphaTrainingRequest,
+    )
     from src.stocks.ml.data import compose_net_alpha_training_data
     from src.stocks.research.artifacts import ModelArtifactRegistry
     from tests.fixtures.stocks.helpers import (
@@ -478,7 +561,7 @@ def test_train_net_alpha_model_promotes_champion_or_no_trade(tmp_path) -> None:
     )
 
     df = stock_net_alpha_composed_df(
-        n_sessions=120, n_tickers=8, audit_clean=True, label_scale=50.0
+        n_sessions=160, n_tickers=8, audit_clean=True, label_scale=50.0
     )
     snapshot = DatasetSnapshot(
         manifest=stock_net_alpha_manifest(columns=df.columns), frame=df
@@ -495,6 +578,11 @@ def test_train_net_alpha_model_promotes_champion_or_no_trade(tmp_path) -> None:
         candidate_horizon_sessions=(3, 5, 8, 10, 15, 20),
         bootstrap_resamples=50,
         liquidity_model=stock_liquidity_model(),
+        compounding=CompoundingCertificationSettings(
+            annualization_sessions=40,
+            min_observed_sessions=10,
+            min_active_cohort_fraction=0.1,
+        ),
     )
     manifest = training.train_net_alpha_model(data, registry, request)
     assert manifest.artifact_id == "na_trainer"
@@ -503,3 +591,12 @@ def test_train_net_alpha_model_promotes_champion_or_no_trade(tmp_path) -> None:
         "net_alpha_lightgbm_l1",
         "no_trade",
     }
+    metrics = json.loads(
+        (Path(tmp_path) / "artifacts" / "na_trainer" / "metrics.json").read_text()
+    )
+    run_obs = metrics["run_observability"]
+    discovery_phase = next(
+        phase for phase in run_obs["phases"] if phase["name"] == "horizon_discovery"
+    )
+    assert discovery_phase["path_evaluation_bound"] == 6 * 2 * (3 + 1)
+    assert discovery_phase["path_evaluation_count"] <= discovery_phase["path_evaluation_bound"]

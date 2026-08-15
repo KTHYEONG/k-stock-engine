@@ -223,6 +223,51 @@ def test_summarize_numeric_finite_only() -> None:
     assert non_finite["mean"] == 1.0
 
 
+def test_observability_projects_bounded_diagnostics_summary() -> None:
+    from src.stocks.ml.result_ledger import _observability_from
+
+    telemetry = {
+        "phases": [
+            {"name": "feature_transform", "schema_fingerprint": "abc123"},
+            {
+                "name": "horizon_discovery",
+                "path_evaluation_count": 48,
+                "path_evaluation_bound": 72,
+                "evidence_horizons": [3],
+                "diagnostics_count": 6,
+            },
+            {
+                "name": "primary_selection",
+                "primary_horizon_sessions": 3,
+                "rankability_reason": "challenger-skipped:no-rankability-evidence",
+            },
+            {
+                "name": "model_comparison",
+                "selected_model_type": "net_alpha_elastic_net",
+                "challenger_failure_reason": "challenger-skipped:no-rankability-evidence",
+            },
+            {
+                "name": "artifact_publish",
+                "promoted": True,
+                "model_type": "net_alpha_elastic_net",
+            },
+        ],
+        "horizons": [],
+    }
+    observability = _observability_from({}, telemetry)
+    summary = observability["summary"]
+    assert isinstance(summary, dict)
+    assert summary["schema_fingerprint"] == "abc123"
+    assert summary["path_evaluation_count"] == 48
+    assert summary["path_evaluation_bound"] == 72
+    assert summary["evidence_horizons"] == [3]
+    assert summary["primary_horizon_sessions"] == 3
+    assert summary["rankability_reason"].startswith("challenger-skipped")
+    assert summary["selected_model_type"] == "net_alpha_elastic_net"
+    assert "period_net_returns" not in summary
+    assert "raw" not in json.dumps(summary).lower()
+
+
 def test_record_completed_projects_canonical_fields(tmp_path) -> None:
     registry = ModelArtifactRegistry(tmp_path / "artifacts")
     artifact_id = "na_completed"
