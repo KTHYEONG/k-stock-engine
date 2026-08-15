@@ -329,3 +329,80 @@ def test_evaluate_score_only_planning_has_no_period_evidence() -> None:
     assert evaluation.observed_sessions == 0
     assert evaluation.active_cohort_count == 0
     assert evaluation.period_net_returns == ()
+
+
+def _segmented_panel() -> tuple[pl.DataFrame, pl.DataFrame, list[datetime]]:
+    """Six sessions split into two OOF segments of three, horizon two."""
+    sessions = [_session(f"2024-01-0{i}T00:00:00+00:00") for i in range(1, 7)]
+    segment_ids = [0, 0, 0, 1, 1, 1]
+    scored = pl.DataFrame(
+        {
+            "instrument_id": [f"KRX:{i:05d}" for i in range(6)],
+            "session": sessions,
+            "oof_segment_id": segment_ids,
+            SCORE_COLUMN: [0.05] * 6,
+        }
+    )
+    realized = pl.DataFrame(
+        {
+            "instrument_id": [f"KRX:{i:05d}" for i in range(6)],
+            "session": sessions,
+            "risk_residual": [0.03] * 6,
+            "open": [100.0] * 6,
+            "adtv_20d": [1.0e8] * 6,
+            "volatility_20d": [0.02] * 6,
+        }
+    )
+    return scored, realized, sessions
+
+
+def test_evaluate_segments_never_share_a_cohort_and_partial_tails_are_counted() -> None:
+    scored, realized, _sessions = _segmented_panel()
+    evaluation = NetAlphaPolicyReplay(
+        2, _PORTFOLIO, _RISK, liquidity_model=stock_liquidity_model()
+    ).evaluate(scored, realized, segment_column="oof_segment_id")
+    # Each three-session segment contributes floor(3 / 2) = 1 complete cohort
+    # and one trailing partial cohort; the gap never merges segments.
+    assert evaluation.period_count == 2
+    assert evaluation.partial_cohort_count == 2
+    assert evaluation.active_cohort_count == 2
+    assert evaluation.missing_realized_cohort_count == 0
+    assert evaluation.observed_sessions == 4
+    segments = [meta[0] for meta in evaluation.cohort_metadata]
+    assert segments == [0, 1]
+    for _segment, start, end in evaluation.cohort_metadata:
+        assert end - start == 2
+    diagnostics = evaluation.replay_diagnostics()
+    assert diagnostics["complete_cohorts"] == 2
+    assert diagnostics["partial_cohorts"] == 2
+
+
+def test_evaluate_single_segment_equivalent_without_segment_column() -> None:
+    scored, realized, _sessions = _segmented_panel()
+    replay = NetAlphaPolicyReplay(
+        2, _PORTFOLIO, _RISK, liquidity_model=stock_liquidity_model()
+    )
+    segmented = replay.evaluate(scored, realized, segment_column="oof_segment_id")
+    # Without the segment column the same six sessions form three complete
+    # cohorts of two (positions 0-1, 2-3, 4-5) with no partial tail.
+    plain = replay.evaluate(scored.drop("oof_segment_id"), realized)
+    assert plain.period_count == 3
+    assert plain.partial_cohort_count == 0
+    assert segmented.period_count != plain.period_count
+
+
+def test_evaluate_segment_missing_realized_cohort_fails_closed() -> None:
+    scored, realized, _sessions = _segmented_panel()
+    # Drop the realized row for one order in segment 1: the complete active
+    # cohort in segment 1 must be excluded and counted as missing, never filled.
+    missing_instrument = "KRX:00003"
+    realized = realized.filter(pl.col("instrument_id") != missing_instrument)
+    evaluation = NetAlphaPolicyReplay(
+        2, _PORTFOLIO, _RISK, liquidity_model=stock_liquidity_model()
+    ).evaluate(scored, realized, segment_column="oof_segment_id")
+    assert evaluation.missing_realized_cohort_count == 1
+    assert evaluation.active_cohort_count == 1
+    assert len(evaluation.period_net_returns) == 1
+    assert len(evaluation.blocks) == 1
+    assert evaluation.cohort_metadata == ((0, 0, 2),)
+    assert evaluation.partial_cohort_count == 2
