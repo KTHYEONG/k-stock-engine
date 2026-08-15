@@ -1075,6 +1075,11 @@ def _build_horizon_evidence(
     path_evaluation_count = 0
     for horizon in sorted(data.labels_by_horizon):
         label_frame = data.labels_by_horizon[horizon]
+        logger.debug(
+            "[ALGO] stage=horizon_start horizon=%d label_rows=%d",
+            horizon,
+            label_frame.height,
+        )
         if label_frame.is_empty() or label_frame.height < 3:
             continue
         if (
@@ -1095,6 +1100,15 @@ def _build_horizon_evidence(
         )
         path_evaluation_count += fold_path_count
         diagnostics.append(diagnostic)
+        logger.debug(
+            "[ALGO] stage=oof_complete horizon=%d oof_rows=%d labeled_rows=%d "
+            "usable_folds=%d path_evaluations=%d",
+            horizon,
+            oof.height,
+            oof_labels.height,
+            len(ics),
+            fold_path_count,
+        )
         if oof.is_empty() or oof_labels.is_empty():
             for profile in request.policy_profiles:
                 dropout_reasons[(horizon, profile.profile_id)] = (
@@ -1104,6 +1118,12 @@ def _build_horizon_evidence(
         calibrated = _causal_oof_calibrate(oof, oof_labels, request, horizon)
         oof_by_horizon[horizon] = (calibrated, oof_labels, ics)
         for profile in request.policy_profiles:
+            logger.debug(
+                "[EVAL] stage=profile_replay horizon=%d profile=%s band_bps=%.3f",
+                horizon,
+                profile.profile_id,
+                profile.no_trade_band_bps,
+            )
             risk = replace(
                 request.risk, no_trade_band_bps=profile.no_trade_band_bps
             )
@@ -1130,6 +1150,16 @@ def _build_horizon_evidence(
             )
             failure_reason = _coverage_failure_reason(candidate_evidence, request)
             dropout_reasons[(horizon, profile.profile_id)] = failure_reason
+            logger.debug(
+                "[EVAL] stage=profile_result horizon=%d profile=%s vintages=%d "
+                "active=%d missing=%d dropout=%s",
+                horizon,
+                profile.profile_id,
+                len(base_evaluation.period_net_returns),
+                base_evaluation.matured_vintage_count,
+                base_evaluation.missing_realized_vintage_count,
+                failure_reason or "none",
+            )
             if failure_reason:
                 continue
             evidence.append(candidate_evidence)
