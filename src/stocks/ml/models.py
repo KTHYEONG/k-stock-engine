@@ -110,6 +110,175 @@ def _reject_target_columns(frame: pl.DataFrame, label_column: str) -> None:
         raise ValueError(f"predict rejects target/label columns: {offending}")
 
 
+def session_balanced_weights(
+    frame: pl.DataFrame, *, session_column: str = "session"
+) -> np.ndarray:
+    """Per-row sample weights giving every training session equal total weight.
+
+    Each row in session ``s`` receives weight ``1 / n_s`` (the reciprocal of its
+    session's finite row count), so a session with more instruments never
+    dominates the training objective. Rows are matched back to ``frame`` by row
+    order. The raw weights are returned; callers normalize them so the total
+    equals the number of finite training rows.
+    """
+    if session_column not in frame.columns:
+        raise ValueError(f"sample-weight frame missing session column {session_column!r}")
+    counts = (
+        frame.group_by(session_column)
+        .agg(pl.len().alias("__session_n"))
+        .sort(session_column)
+    )
+    count_map = {
+        row[session_column]: int(row["__session_n"])
+        for row in counts.iter_rows(named=True)
+    }
+    weights = np.asarray(
+        [1.0 / count_map[value] for value in frame[session_column].to_list()],
+        dtype=np.float64,
+    )
+    if not np.all(np.isfinite(weights)) or not np.all(weights > 0.0):
+        raise ValueError("session-balanced weights must be finite and positive")
+    return weights
+
+
+def normalize_session_weights(
+    weights: np.ndarray, *, total: int | None = None
+) -> np.ndarray:
+    """Scale ``weights`` so they sum to ``total`` (default: their row count)."""
+    arr = np.asarray(weights, dtype=np.float64)
+    if arr.size == 0:
+        return arr
+    if not np.all(np.isfinite(arr)) or float(np.sum(arr)) <= 0.0:
+        raise ValueError("malformed sample weights cannot be normalized")
+    target = float(total if total is not None else arr.size)
+    return arr * (target / float(np.sum(arr)))
+
+
+def weighted_fold_statistics(
+    features: np.ndarray,
+    weights: np.ndarray,
+    valid: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Weighted fold-local mean and variance on the finite-valid design rows.
+
+    The weights are pre-normalized (sum equals the finite row count), so the
+    weighted mean/std reproduce the ordinary fold statistics when every session
+    has equal size. Zero-variance columns are set to unit standard deviation so
+    standardization is always well defined.
+    """
+    sub = features[valid]
+    w = weights[valid]
+    total = float(np.sum(w))
+    if total <= 0.0:
+        raise ValueError("fold has no positive-weight rows")
+    mean = np.sum(sub * w[:, None], axis=0) / total
+    centered = sub - mean
+    variance = np.sum(w[:, None] * centered * centered, axis=0) / total
+    std = np.sqrt(np.maximum(variance, 0.0))
+    std[std == 0.0] = 1.0
+    return mean, std
+
+
+@dataclass(frozen=True, slots=True)
+class ElasticPathSolution:
+    """Frozen weighted ElasticNet coefficient path over one penalty grid.
+
+    ``fractions`` is ascending and ``coefficients[i]``/``intercepts[i]`` solve
+    penalty ``fractions[i] * alpha_max`` in one descending warm-start coordinate
+    path. ``mean``/``std`` are the weighted fold-local standardization frozen
+    from the training slice, so ``predict`` is target-free.
+    """
+
+    fractions: tuple[float, ...]
+    coefficients: np.ndarray
+    intercepts: np.ndarray
+    alpha_max: float
+    mean: np.ndarray
+    std: np.ndarray
+
+    def predict(self, frame: pl.DataFrame, feature_columns: tuple[str, ...]) -> dict[float, np.ndarray]:
+        """Target-free score per penalty fraction on a standardized design."""
+        missing = [c for c in feature_columns if c not in frame.columns]
+        if missing:
+            raise ValueError(f"missing feature columns {missing} in path predict frame")
+        features = _float32_matrix(frame, feature_columns)
+        standardized = (features - self.mean) / self.std
+        standardized[~np.isfinite(standardized)] = 0.0
+        return {
+            fraction: (
+                standardized @ self.coefficients[index] + self.intercepts[index]
+            )
+            for index, fraction in enumerate(self.fractions)
+        }
+
+
+def fit_weighted_elastic_path(
+    frame: pl.DataFrame,
+    feature_columns: tuple[str, ...],
+    fractions: tuple[float, ...],
+    seed: int,
+    *,
+    l1_ratio: float = 0.5,
+) -> ElasticPathSolution | None:
+    """One deterministic weighted coordinate path over every penalty fraction.
+
+    Builds the weighted standardized design once, derives ``alpha_max`` once
+    (``max(abs(X.T @ (w * y_centered))) / sum(w)`` on the weighted
+    fold-standardized design), and solves all penalty fractions in one
+    descending warm-start coordinate descent. Returns ``None`` when the slice
+    has no finite feature/target rows or ``alpha_max`` is degenerate.
+    """
+    if not fractions:
+        raise ValueError("penalty fractions must be non-empty")
+    missing = [c for c in feature_columns if c not in frame.columns]
+    if missing:
+        raise ValueError(f"missing feature columns {missing} in path fit")
+    features = _float32_matrix(frame, feature_columns)
+    targets = frame["net_alpha_target"].cast(pl.Float64).to_numpy()
+    valid = np.isfinite(features).all(axis=1) & np.isfinite(targets)
+    if not valid.any():
+        return None
+    sub = features[valid]
+    y = targets[valid]
+    raw_weights = session_balanced_weights(frame)
+    weights = normalize_session_weights(raw_weights, total=int(valid.sum()))[valid]
+    if not np.all(weights > 0.0):
+        raise ValueError("malformed sample weights cannot be used in elastic path")
+    mean, std = weighted_fold_statistics(features, weights, valid)
+    standardized = (sub - mean) / std
+    y_centered = y - float(np.sum(weights * y) / float(np.sum(weights)))
+    alpha_max = float(
+        np.max(np.abs(standardized.T @ (weights * y_centered)))
+        / float(np.sum(weights))
+    )
+    if not np.isfinite(alpha_max) or alpha_max <= 0.0:
+        return None
+
+    coefficients: list[np.ndarray] = []
+    intercepts: list[float] = []
+    model = ElasticNet(
+        alpha=0.0,
+        l1_ratio=l1_ratio,
+        max_iter=2000,
+        random_state=seed,
+        warm_start=True,
+    )
+    for fraction in sorted(fractions, reverse=True):
+        model.set_params(alpha=fraction * alpha_max)
+        model.fit(standardized, y, sample_weight=weights)
+        coefficients.append(np.asarray(model.coef_, dtype=np.float64))
+        intercepts.append(float(model.intercept_))
+    ordered = tuple(sorted(fractions))
+    return ElasticPathSolution(
+        fractions=ordered,
+        coefficients=np.asarray(list(reversed(coefficients)), dtype=np.float64),
+        intercepts=np.asarray(list(reversed(intercepts)), dtype=np.float64),
+        alpha_max=alpha_max,
+        mean=mean,
+        std=std,
+    )
+
+
 class ElasticNetNetAlpha:
     """Deterministic ElasticNet baseline on fold-standardized rank features."""
 
@@ -147,11 +316,11 @@ class ElasticNetNetAlpha:
         valid = np.isfinite(features).all(axis=1) & finite
         if not valid.any():
             raise ValueError("training fold has no finite feature/target rows")
-        features = features[valid]
-        targets = targets[valid]
-        self._mean = features.mean(axis=0)
-        self._std = features.std(axis=0)
-        self._std[self._std == 0.0] = 1.0
+        raw_weights = session_balanced_weights(train)
+        weights = normalize_session_weights(raw_weights, total=int(valid.sum()))
+        if not np.all(weights[valid] > 0.0):
+            raise ValueError("malformed sample weights cannot be used in ElasticNet")
+        self._mean, self._std = weighted_fold_statistics(features, weights, valid)
         standardized = (features - self._mean) / self._std
         self._model = ElasticNet(
             alpha=self._config.elastic_alpha,
@@ -159,7 +328,7 @@ class ElasticNetNetAlpha:
             max_iter=2000,
             random_state=self._config.seed,
         )
-        self._model.fit(standardized, targets)
+        self._model.fit(standardized[valid], targets[valid], sample_weight=weights[valid])
 
     def predict(self, frame: pl.DataFrame) -> pl.DataFrame:
         if self._model is None:
@@ -255,7 +424,13 @@ class LightGbmNetAlpha:
             "verbosity": -1,
         }
 
-    def fit(self, train: pl.DataFrame, validation: pl.DataFrame) -> None:
+    def fit(
+        self,
+        train: pl.DataFrame,
+        validation: pl.DataFrame,
+        *,
+        num_boost_round: int | None = None,
+    ) -> None:
         if self._label_column not in train.columns:
             raise ValueError(
                 f"missing label column {self._label_column!r} in training fold"
@@ -270,8 +445,17 @@ class LightGbmNetAlpha:
             raise ValueError("training fold has no finite target rows")
         train_features = train_features[finite]
         train_targets = train_targets[finite]
+        raw_weights = session_balanced_weights(train)
+        train_weights = normalize_session_weights(
+            raw_weights, total=int(finite.sum())
+        )[finite]
+        if not np.all(train_weights > 0.0):
+            raise ValueError("malformed sample weights cannot be used in LightGBM")
         train_set = lgb.Dataset(
-            train_features, label=train_targets, params={"verbosity": -1}
+            train_features,
+            label=train_targets,
+            weight=train_weights,
+            params={"verbosity": -1},
         )
         valid_set = None
         if (
@@ -283,9 +467,14 @@ class LightGbmNetAlpha:
             valid_targets = validation[self._label_column].cast(pl.Float64).to_numpy()
             vfinite = np.isfinite(valid_targets)
             if vfinite.any():
+                valid_weights = normalize_session_weights(
+                    session_balanced_weights(validation),
+                    total=int(vfinite.sum()),
+                )[vfinite]
                 valid_set = lgb.Dataset(
                     valid_features[vfinite],
                     label=valid_targets[vfinite],
+                    weight=valid_weights,
                     reference=train_set,
                     params={"verbosity": -1},
                 )
@@ -294,16 +483,17 @@ class LightGbmNetAlpha:
         # train the deterministic fixed estimator budget instead and never
         # request early stopping (installing it without a valid set raises).
         callbacks: list[Any] = []
-        if valid_set is not None:
+        if valid_set is not None and num_boost_round is None:
             callbacks = [
                 lgb.early_stopping(
                     self._config.early_stopping_rounds, verbose=False, min_delta=0.0
                 )
             ]
+        num_round = num_boost_round or self._config.n_estimators
         self._booster = lgb.train(
             self._params(),
             train_set,
-            num_boost_round=self._config.n_estimators,
+            num_boost_round=num_round,
             valid_sets=[valid_set] if valid_set is not None else None,
             callbacks=callbacks,
         )
@@ -328,6 +518,11 @@ class LightGbmNetAlpha:
             dtype=np.float64,
         )
         return frame.with_columns(pl.Series(SCORE_COLUMN, scores))
+
+    @property
+    def best_iteration(self) -> int | None:
+        """Deterministic iteration count selected by inner labeled validation."""
+        return self._best_iteration
 
     def manifest(self) -> ModelManifest:
         params: dict[str, str] = {
