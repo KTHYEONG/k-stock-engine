@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_ML_RESULT_LEDGER_OBSERVABILITY",
+      "date": "2026-08-15",
+      "adr_id": "ADR_20260815_STOCK_ML_RESULT_LEDGER_OBSERVABILITY",
+      "domain": "stocks",
+      "title": "Bounded ML result ledger observability",
+      "why": "Repeated ML runs required manual result transcription and could grow docs/results without a bounded machine-readable history.",
+      "resolution": "Added automatic completed/failed run projections, bounded latest/recent/schema/meta files, atomic writes, reconciliation CLI, structured training telemetry, and generated back-res pointer while preserving artifact files as source of truth.",
+      "impact": "ML runs now leave compact AI-readable lineage, data-shape, economic-evidence, and failure records with 128-entry retention; ledger failures do not alter artifacts and reconciliation can recover derived caches."
+    },
+    {
       "task_id": "TASK_STOCK_NET_ALPHA_OOF_SIGNAL_RECOVERY",
       "date": "2026-08-15",
       "adr_id": "ADR_20260815_STOCK_NET_ALPHA_OOF_SIGNAL_RECOVERY",
