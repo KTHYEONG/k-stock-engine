@@ -536,6 +536,7 @@ def _construct_allocations_prepared(
         lower = econ["alpha_lower_bound"]
         net_lower = econ["net_alpha_lower_bound"]
         exit_rate = econ["exit_cost_rate"]
+        band = policy.no_trade_band_bps / 10_000.0
         incumbent_mask = np.asarray(
             [str(instrument_id) in incumbent_ids for instrument_id in cs_ids], dtype=bool
         )
@@ -548,7 +549,7 @@ def _construct_allocations_prepared(
             (net_alpha > 0.0)
             & (active > 0.0)
             & (lower > 0.0)
-            & (net_lower > 0.0)
+            & (net_lower - band > 0.0)
         )
         gate = np.where(incumbent_mask, keep_ok, enter_ok)
         eligible = eligible & np.where(np.isnan(active), False, gate)
@@ -693,6 +694,7 @@ class StockRiskPolicy:
     single_name_cap: float = 0.08
     sector_cap: float = 0.25
     participation_limit: float = 0.005
+    no_trade_band_bps: float = 0.0
     target_annual_volatility: float = 0.12
     turnover_budget: float = 0.20
     volatility_lookback_sessions: int = 20
@@ -723,6 +725,8 @@ class StockRiskPolicy:
             )
         if not (0.0 <= self.participation_limit <= 1.0):
             raise ValueError("participation_limit must be in [0, 1]")
+        if not math.isfinite(self.no_trade_band_bps) or self.no_trade_band_bps < 0.0:
+            raise ValueError("no_trade_band_bps must be a finite non-negative value")
         if self.target_annual_volatility <= 0:
             raise ValueError("target_annual_volatility must be positive")
         if self.turnover_budget < 0:
@@ -776,7 +780,10 @@ def construct_target_allocations(
     incumbent_ids = set(current_weights)
 
     if all(column in cross_section.columns for column in _ECONOMIC_COLUMNS):
-        eligible = _economically_eligible(cross_section, eligible, incumbent_ids)
+        eligible = _economically_eligible(
+            cross_section, eligible, incumbent_ids,
+            no_trade_band_bps=policy.no_trade_band_bps,
+        )
 
     order = rank_stock_candidate_indices(
         np.asarray(eligible["pred_score"].to_list(), dtype=np.float64),
@@ -932,20 +939,23 @@ def _economically_eligible(
     cross_section: pl.DataFrame,
     eligible: pl.DataFrame,
     incumbent_ids: set[str],
+    no_trade_band_bps: float = 0.0,
 ) -> pl.DataFrame:
     """Gate entries and holdings on cost-adjusted expected net alpha.
 
     New entrants require a positive ``expected_net_alpha`` (cost-adjusted
     expected active return), a positive ``alpha_lower_bound`` confidence bound,
-    and a positive ``net_alpha_lower_bound`` (the bootstrap lower bound net of
-    the full round-trip cost) when the economic panel exposes it. Existing
-    holdings are retained only while the keep-versus-exit net benefit
-    (``expected_active_alpha`` minus the one-way sell cost) is positive with a
-    positive confidence bound. Null/non-finite alpha is never a buy signal:
-    those rows fail the gate and fall through to cash or sell-only.
+    and a ``net_alpha_lower_bound`` (the bootstrap lower bound net of the full
+    round-trip cost) that clears the policy profile's ``no_trade_band_bps``
+    when the economic panel exposes it. Existing holdings are retained only
+    while the keep-versus-exit net benefit (``expected_active_alpha`` minus the
+    one-way sell cost) is positive with a positive confidence bound.
+    Null/non-finite alpha is never a buy signal: those rows fail the gate and
+    fall through to cash or sell-only.
     """
     if "expected_active_alpha" not in cross_section.columns:
         return eligible
+    band = no_trade_band_bps / 10_000.0
     incumbent = pl.col("instrument_id").is_in(incumbent_ids)
     keep_ok = (
         (pl.col("expected_active_alpha") - pl.col("exit_cost_rate") > 0.0)
@@ -953,7 +963,7 @@ def _economically_eligible(
         & (pl.col("alpha_lower_bound") > 0.0)
     )
     net_lower_bound_ok = (
-        (pl.col("net_alpha_lower_bound") > 0.0)
+        (pl.col("net_alpha_lower_bound") - band > 0.0)
         if "net_alpha_lower_bound" in cross_section.columns
         else pl.lit(True)
     )

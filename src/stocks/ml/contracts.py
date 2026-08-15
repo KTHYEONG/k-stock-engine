@@ -7,6 +7,8 @@ one conditional secondary horizon, and there is no fixed 5/10/15 route.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -17,6 +19,93 @@ from src.core.datasets import DatasetManifest
 
 DEFAULT_CANDIDATE_HORIZON_SESSIONS = (3, 5, 8, 10, 15, 20)
 CANONICAL_FEATURE_SET = "stock_net_alpha_v1"
+
+LEGACY_OVERLAY_PROFILE_ID = "legacy_overlay_5bps"
+LOWER_BOUND_ONLY_PROFILE_ID = "lower_bound_only"
+DEFAULT_POLICY_PROFILE_IDS = (LEGACY_OVERLAY_PROFILE_ID, LOWER_BOUND_ONLY_PROFILE_ID)
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyProfile:
+    """Immutable pre-registered economic policy profile for the OOF frontier.
+
+    A profile differs from another only in the decimal no-trade entry band
+    applied on top of the calibrated ``net_alpha_lower_bound``. It never
+    changes the portfolio caps, cost schedules, liquidity model, purging,
+    embargo, or bootstrap alpha. ``profile_id`` must be non-empty and unique
+    within a frontier; ``no_trade_band_bps`` must be a finite non-negative
+    value. ``legacy_overlay_5bps`` reproduces the historical 5-bps entry
+    filter; ``lower_bound_only`` keeps the lower-bound positivity gate without
+    any extra overlay.
+    """
+
+    profile_id: str
+    no_trade_band_bps: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not self.profile_id:
+            raise ValueError("profile_id must be non-empty")
+        if not np.isfinite(self.no_trade_band_bps) or self.no_trade_band_bps < 0.0:
+            raise ValueError("no_trade_band_bps must be a finite non-negative value")
+
+
+DEFAULT_POLICY_PROFILES = (
+    PolicyProfile(profile_id=LEGACY_OVERLAY_PROFILE_ID, no_trade_band_bps=5.0),
+    PolicyProfile(profile_id=LOWER_BOUND_ONLY_PROFILE_ID, no_trade_band_bps=0.0),
+)
+
+
+def validate_policy_profiles(profiles: tuple[PolicyProfile, ...]) -> tuple[PolicyProfile, ...]:
+    """Validate a policy frontier: exactly the two default profiles, no duplicates.
+
+    Raises ``ValueError`` on an empty frontier, a duplicate profile id, a
+    missing default profile, or an unexpected extra profile. The frontier is
+    pre-registered: the discovery grid replays every cached OOF score under
+    these exact policies and never refits a learner per profile.
+    """
+    if not profiles:
+        raise ValueError("policy frontier requires at least one profile")
+    ids = [profile.profile_id for profile in profiles]
+    if len(set(ids)) != len(ids):
+        raise ValueError("policy profile ids must be unique")
+    missing = [default_id for default_id in DEFAULT_POLICY_PROFILE_IDS if default_id not in ids]
+    if missing:
+        raise ValueError(
+            f"default policy profile {missing[0]!r} is missing from the frontier"
+        )
+    if tuple(ids) != DEFAULT_POLICY_PROFILE_IDS:
+        raise ValueError(
+            "policy frontier must contain exactly the two default profiles "
+            f"{DEFAULT_POLICY_PROFILE_IDS}; got {tuple(ids)}"
+        )
+    return profiles
+
+
+def policy_portfolio_fingerprint(
+    top_k: int,
+    max_single_weight: float,
+    max_exposure: float,
+    participation_limit: float,
+) -> str:
+    """Deterministic SHA-256 fingerprint of the policy's portfolio constraints.
+
+    Binds the top-k, single-name cap, gross exposure cap, and participation
+    limit that the training OOF, forward holdout, artifact score, and the
+    independent portfolio backtester must share. Callers with divergent caps
+    produce different fingerprints, so a backtester can never silently use a
+    different policy than the one the artifact was selected under.
+    """
+    payload = json.dumps(
+        {
+            "top_k": int(top_k),
+            "max_single_weight": float(max_single_weight),
+            "max_exposure": float(max_exposure),
+            "participation_limit": float(participation_limit),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,7 +200,10 @@ class NetAlphaTrainingRequest:
     ``candidate_horizon_sessions`` is a pre-registered discovery grid, not an
     operating route: the trainer fits the baseline for every candidate and
     selects at most one primary and one conditional secondary horizon from OOF
-    replay evidence. ``compounding`` is the pre-registered research-governance
+    replay evidence. ``policy_profiles`` is the pre-registered two-policy
+    frontier replayed over each candidate's cached OOF scores; the selected
+    profile is frozen into the artifact and the operational backtester.
+    ``compounding`` is the pre-registered research-governance
     certificate policy for the untouched forward holdout, never a post-hoc
     threshold. ``model_threads`` is the single thread budget for the
     challenger LightGBM (default 1); there is no Optuna trial, resume, or
@@ -120,6 +212,7 @@ class NetAlphaTrainingRequest:
 
     artifact_id: str
     candidate_horizon_sessions: tuple[int, ...] = DEFAULT_CANDIDATE_HORIZON_SESSIONS
+    policy_profiles: tuple[PolicyProfile, ...] = DEFAULT_POLICY_PROFILES
     fold_count: int = 3
     embargo_sessions: int = 5
     forward_holdout_sessions: int = 0
@@ -149,6 +242,7 @@ class NetAlphaTrainingRequest:
             raise ValueError("candidate_horizon_sessions must be strictly ascending and unique")
         if any(h < 1 for h in self.candidate_horizon_sessions):
             raise ValueError("candidate_horizon_sessions must be positive sessions")
+        object.__setattr__(self, "policy_profiles", validate_policy_profiles(tuple(self.policy_profiles)))
         if self.fold_count < 1:
             raise ValueError("fold_count must be positive")
         if self.embargo_sessions < 0:

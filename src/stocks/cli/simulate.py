@@ -10,6 +10,7 @@ import argparse
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 from src.core.paths import (
     STOCK_ARTIFACT_ROOT,
@@ -26,7 +27,10 @@ from src.stocks.data.repositories import (
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.settings import DEFAULT_STOCK_ALPHA
 from src.stocks.workflows.contracts import SimulationRequest
-from src.stocks.workflows.simulate_portfolio import simulate_portfolio
+from src.stocks.workflows.simulate_portfolio import (
+    artifact_policy_profile,
+    simulate_portfolio,
+)
 
 logger = logging.getLogger("stocks.cli.simulate")
 
@@ -71,13 +75,26 @@ def main(args: list[str] | None = None) -> int:
         cost_evidence = load_cost_evidence(
             Path(snapshot.costs.path), snapshot.research_range
         )
-    request = SimulationRequest(
-        artifact_id=parsed.artifact_id,
-        decision_time=decision_time,
-        top_k=settings.top_k,
-        max_single_weight=settings.max_single_weight,
-        max_exposure=settings.max_exposure,
-    )
+    policy_profile = artifact_policy_profile(registry, parsed.artifact_id)
+    if policy_profile is not None:
+        request = SimulationRequest(
+            artifact_id=parsed.artifact_id,
+            decision_time=decision_time,
+            top_k=cast(int, policy_profile["top_k"]),
+            max_single_weight=cast(float, policy_profile["max_single_weight"]),
+            max_exposure=cast(float, policy_profile["max_exposure"]),
+            participation_limit=cast(float, policy_profile["participation_limit"]),
+            policy_profile_id=cast(str, policy_profile["profile_id"]),
+            no_trade_band_bps=cast(float, policy_profile["no_trade_band_bps"]),
+        )
+    else:
+        request = SimulationRequest(
+            artifact_id=parsed.artifact_id,
+            decision_time=decision_time,
+            top_k=settings.top_k,
+            max_single_weight=settings.max_single_weight,
+            max_exposure=settings.max_exposure,
+        )
     result = simulate_portfolio(composed, registry, request, cost_evidence=cost_evidence)
     logger.info(
         "final_value=%.2f total_return=%.4f", result.final_value, result.total_return
