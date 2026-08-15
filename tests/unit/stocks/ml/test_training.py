@@ -26,6 +26,154 @@ def test_forward_holdout_contract_signature() -> None:
         "horizon_sessions",
     ]
 
+class _FakeScoringModel:
+    def __init__(self, score: float) -> None:
+        self.score = score
+
+    def predict(self, frame: pl.DataFrame) -> pl.DataFrame:
+        return frame.with_columns(
+            pl.lit(self.score).alias("predicted_net_alpha")
+        )
+
+
+class _FakeCalibration:
+    def apply(self, scored: pl.DataFrame) -> pl.DataFrame:
+        return scored.with_columns(
+            pl.col("predicted_net_alpha").alias("net_alpha_lower_bound")
+        )
+
+
+def _holdout_panel(
+    n_sessions: int = 60, score: float = 0.05
+) -> pl.DataFrame:
+    from datetime import timedelta
+
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    return pl.DataFrame(
+        {
+            "instrument_id": ["KRX:00001"] * n_sessions,
+            "session": [start + timedelta(days=i) for i in range(n_sessions)],
+            "risk_residual": [0.03] * n_sessions,
+            "open": [100.0] * n_sessions,
+            "adtv_20d": [1.0e8] * n_sessions,
+            "volatility_20d": [0.02] * n_sessions,
+        }
+    )
+
+
+def _compound_request():
+    from src.stocks.ml.contracts import (
+        CompoundingCertificationSettings,
+        NetAlphaTrainingRequest,
+    )
+    from tests.fixtures.stocks.helpers import stock_liquidity_model
+
+    return NetAlphaTrainingRequest(
+        artifact_id="na_holdout_unit",
+        fold_count=2,
+        candidate_horizon_sessions=(3, 5, 8, 10, 15, 20),
+        bootstrap_resamples=50,
+        liquidity_model=stock_liquidity_model(),
+        compounding=CompoundingCertificationSettings(
+            min_observed_sessions=40,
+            min_active_cohort_fraction=0.5,
+            max_drawdown=0.9,
+        ),
+    )
+
+
+def test_forward_holdout_empty_panel_fails_closed() -> None:
+    request = _compound_request()
+    evidence = _evaluate_forward_holdout(
+        _FakeScoringModel(0.05),
+        _FakeCalibration(),
+        pl.DataFrame(),
+        request,
+        1,
+    )
+    assert evidence["passed"] is False
+    assert evidence["reason"] == "holdout-has-no-realized"
+
+
+def test_forward_holdout_passes_with_complete_base_and_stress() -> None:
+    request = _compound_request()
+    evidence = _evaluate_forward_holdout(
+        _FakeScoringModel(0.05),
+        _FakeCalibration(),
+        _holdout_panel(n_sessions=60),
+        request,
+        1,
+    )
+    assert evidence["passed"] is True
+    assert evidence["reason"] == ""
+    assert evidence["order_count"] == 60
+    assert evidence["block_count"] == 60
+    assert evidence["cohorts"]["observed_sessions"] == 60
+    assert evidence["cohorts"]["active_cohort_count"] == 60
+    assert evidence["cohorts"]["missing_realized_cohorts"] == 0
+    certificate = evidence["certificate"]
+    assert certificate["passed"] is True
+    assert certificate["base"]["passed"] is True
+    assert certificate["stress"]["passed"] is True
+    assert "eligibility" not in evidence
+
+
+def test_forward_holdout_no_economic_edge_is_explicit() -> None:
+    request = _compound_request()
+    evidence = _evaluate_forward_holdout(
+        _FakeScoringModel(0.0002),
+        _FakeCalibration(),
+        _holdout_panel(n_sessions=60),
+        request,
+        1,
+    )
+    assert evidence["passed"] is False
+    assert evidence["reason"] == "holdout-no-economic-edge"
+    assert evidence["cohorts"]["eligible_sessions"] == 0
+    assert evidence["cohorts"]["active_cohort_count"] == 0
+
+
+def test_forward_holdout_incomplete_realized_cohorts_is_explicit() -> None:
+    request = _compound_request()
+    panel = _holdout_panel(n_sessions=60)
+
+    class _AugmentingModel:
+        def predict(self, frame: pl.DataFrame) -> pl.DataFrame:
+            base = frame.with_columns(
+                pl.lit(0.05).alias("predicted_net_alpha")
+            )
+            extra = base.tail(1).with_columns(
+                pl.lit("KRX:99999").alias("instrument_id")
+            )
+            return pl.concat([base, extra])
+
+    evidence = _evaluate_forward_holdout(
+        _AugmentingModel(),
+        _FakeCalibration(),
+        panel,
+        request,
+        1,
+    )
+    assert evidence["passed"] is False
+    assert evidence["reason"] == "holdout-incomplete-realized-cohorts"
+    assert evidence["cohorts"]["missing_realized_cohorts"] == 1
+
+
+def test_forward_holdout_compound_certification_failure_is_explicit() -> None:
+    request = _compound_request()
+    evidence = _evaluate_forward_holdout(
+        _FakeScoringModel(0.05),
+        _FakeCalibration(),
+        _holdout_panel(n_sessions=10),
+        request,
+        1,
+    )
+    assert evidence["passed"] is False
+    assert evidence["reason"].startswith(
+        "holdout-compound-certification-failed:"
+    )
+    assert "insufficient-observed-sessions" in evidence["reason"]
+
 
 def _training_fixture(n_sessions: int = 120) -> tuple[object, object, object, list[object], tuple[str, ...]]:
     """Composed net-alpha fixture: data, request, pre_holdout, folds, learner columns."""

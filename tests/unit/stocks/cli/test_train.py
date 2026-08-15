@@ -153,7 +153,7 @@ def _install_train_fakes(monkeypatch, train_result, ledger_cls, captured) -> Non
         train, "compose_net_alpha_training_data", lambda *a, **k: _FakeData()
     )
     monkeypatch.setattr(
-        train, "_resolve_cost_context", lambda snapshot, kind: (None, None)
+        train, "_resolve_cost_contexts", lambda snapshot: (None, None, None, None)
     )
     monkeypatch.setattr(train, "MlResultLedger", ledger_cls)
     monkeypatch.setattr(train, "train_net_alpha_model", _fake_train)

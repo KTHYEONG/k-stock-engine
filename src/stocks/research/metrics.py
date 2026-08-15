@@ -2,16 +2,21 @@
 
 Evaluation records ranking quality and economic metrics separately, including
 costs, turnover, exposure, drawdown, and coverage; it never chooses a model
-solely by NDCG or one backtest metric.
+solely by NDCG or one backtest metric. Forward-holdout compound growth is
+certified only geometrically, over complete observed cohorts, and with a
+seeded vectorized moving-block bootstrap lower bound.
 """
 from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import numpy as np
 import polars as pl
 from scipy.stats import rankdata
+
+from src.stocks.ml.contracts import CompoundingCertificationSettings
 
 
 def ndcg_at_k(scores: pl.Series, labels: pl.Series, k: int | None = None) -> float:
@@ -191,3 +196,187 @@ def economic_transfer_attribution(
         "mean_top_k_active_label": float(np.mean(active_labels)) if active_labels else 0.0,
         "mean_membership_turnover": float(np.mean(turnovers)) if turnovers else 0.0,
     }
+
+def _bootstrap_lower_mean_log_growth(
+    log_growth: np.ndarray,
+    block_length: int,
+    n_bootstrap: int,
+    seed: int,
+    alpha: float,
+) -> float:
+    """Seeded vectorized moving-block bootstrap alpha-quantile of period means."""
+    arr = np.asarray(log_growth, dtype=float)
+    n = arr.size
+    block = min(max(block_length, 1), n)
+    n_blocks = int(np.ceil(n / block))
+    max_start = max(1, n - block + 1)
+    rng = np.random.default_rng(seed)
+    starts = rng.integers(0, max_start, size=(n_bootstrap, n_blocks))
+    offsets = np.arange(block)
+    index = (
+        starts[:, :, None] + offsets[None, None, :]
+    ).reshape(n_bootstrap, n_blocks * block)[:, :n]
+    means = arr[index].mean(axis=1)
+    return float(np.quantile(means, alpha))
+
+
+def _round_or_none(value: float) -> float | None:
+    if not math.isfinite(value):
+        return None
+    return round(float(value), 12)
+
+
+def _certify_path(
+    period_returns: Sequence[float],
+    horizon_sessions: int,
+    observed_sessions: int,
+    active_cohort_count: int,
+    settings: CompoundingCertificationSettings,
+) -> dict[str, object]:
+    """Compute one base/stress path's geometric certificate and fail-closed gates.
+
+    The arithmetic period returns are transformed with ``log1p`` and never
+    zero-filled; a non-finite or ``<= -1`` period series, an insufficient
+    observed-session window, zero/insufficient active coverage, a non-positive
+    CAGR or bootstrap lower CAGR, or a drawdown beyond the immutable policy all
+    fail closed with normalized reasons while still reporting the aggregate
+    values for diagnosis.
+    """
+    arr = np.asarray(list(period_returns), dtype=float)
+    reasons: list[str] = []
+    if (
+        arr.size == 0
+        or not bool(np.all(np.isfinite(arr)))
+        or bool(np.any(arr <= -1.0))
+    ):
+        return {
+            "passed": False,
+            "reasons": ["period-series-incomplete"],
+            "period_count": int(arr.size),
+            "observed_sessions": int(observed_sessions),
+            "active_cohort_count": int(active_cohort_count),
+            "cagr": 0.0,
+            "lower_cagr": 0.0,
+            "mdd": 0.0,
+            "calmar": None,
+        }
+    period_count = int(arr.size)
+    annualization = settings.annualization_sessions
+    log_growth = np.log1p(arr)
+    total_log = float(np.sum(log_growth))
+    cagr = (
+        float(np.expm1(total_log * annualization / observed_sessions))
+        if observed_sessions > 0
+        else 0.0
+    )
+    equity = np.cumprod(1.0 + arr)
+    peaks = np.maximum.accumulate(equity)
+    mdd = float(np.max(1.0 - equity / np.where(peaks > 0, peaks, 1.0)))
+    calmar = (float("inf") if cagr > 0.0 else 0.0) if mdd == 0.0 else cagr / mdd
+    lower_mean = _bootstrap_lower_mean_log_growth(
+        log_growth,
+        horizon_sessions,
+        settings.bootstrap_resamples,
+        settings.seed,
+        settings.bootstrap_alpha,
+    )
+    lower_cagr = float(
+        np.expm1(lower_mean * annualization / horizon_sessions)
+    )
+    if observed_sessions < settings.min_observed_sessions:
+        reasons.append("insufficient-observed-sessions")
+    active_fraction = (
+        active_cohort_count / period_count if period_count > 0 else 0.0
+    )
+    if (
+        active_cohort_count <= 0
+        or active_fraction < settings.min_active_cohort_fraction
+    ):
+        reasons.append("active-coverage-insufficient")
+    if not math.isfinite(cagr) or cagr <= 0.0:
+        reasons.append("non-positive-cagr")
+    if not math.isfinite(lower_cagr) or lower_cagr <= 0.0:
+        reasons.append("non-positive-lower-cagr")
+    if mdd > settings.max_drawdown:
+        reasons.append("max-drawdown-exceeded")
+    return {
+        "passed": not reasons,
+        "reasons": reasons,
+        "period_count": period_count,
+        "observed_sessions": int(observed_sessions),
+        "active_cohort_count": int(active_cohort_count),
+        "cagr": _round_or_none(cagr),
+        "lower_cagr": _round_or_none(lower_cagr),
+        "mdd": _round_or_none(mdd),
+        "calmar": _round_or_none(calmar),
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class CompoundingCertificationEvidence:
+    """Immutable compound-growth certificate for one untouched forward holdout.
+
+    ``base`` and ``stress`` are bounded per-path summaries (counts, CAGR,
+    bootstrap lower CAGR, MDD, Calmar, pass flags and normalized reasons). The
+    certificate holds only aggregate values and never score, label, or return
+    vectors.
+    """
+
+    passed: bool
+    reasons: tuple[str, ...]
+    base: dict[str, object]
+    stress: dict[str, object]
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "passed": bool(self.passed),
+            "reasons": list(self.reasons),
+            "base": dict(self.base),
+            "stress": dict(self.stress),
+        }
+
+
+def certify_compounded_holdout(
+    base_period_returns: Sequence[float],
+    stress_period_returns: Sequence[float],
+    horizon_sessions: int,
+    observed_sessions: int,
+    active_cohort_count: int,
+    settings: CompoundingCertificationSettings,
+) -> CompoundingCertificationEvidence:
+    """Certify the untouched forward holdout under base and stress cost paths.
+
+    Both paths consume the identical frozen scores, sessions, portfolio
+    constraints and realized liquidity rows; only the effective cost/liquidity
+    schedule changes. The certificate passes only when every quantitative gate
+    passes on both paths, and is deterministic for fixed inputs.
+    """
+    if horizon_sessions < 1:
+        raise ValueError("horizon_sessions must be positive")
+    if observed_sessions < 0:
+        raise ValueError("observed_sessions must be non-negative")
+    if active_cohort_count < 0:
+        raise ValueError("active_cohort_count must be non-negative")
+    base = _certify_path(
+        base_period_returns, horizon_sessions, observed_sessions,
+        active_cohort_count, settings,
+    )
+    stress = _certify_path(
+        stress_period_returns, horizon_sessions, observed_sessions,
+        active_cohort_count, settings,
+    )
+    passed = bool(base["passed"]) and bool(stress["passed"])
+    base_reasons = base["reasons"]
+    stress_reasons = stress["reasons"]
+    combined = (
+        list(base_reasons) if isinstance(base_reasons, (list, tuple)) else []
+    ) + (
+        list(stress_reasons) if isinstance(stress_reasons, (list, tuple)) else []
+    )
+    reasons = list(dict.fromkeys(combined))
+    return CompoundingCertificationEvidence(
+        passed=passed,
+        reasons=tuple(reasons),
+        base=base,
+        stress=stress,
+    )

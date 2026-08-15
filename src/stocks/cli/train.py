@@ -100,8 +100,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("base", "stress"),
         default="base",
         help=(
-            "effective-dated cost schedule resolved from the snapshot cost "
-            "evidence when present, else the canonical base/stress schedule"
+            "labels the run's reference schedule kind in the result ledger; "
+            "both base and stress schedules (with matching liquidity models) "
+            "are always resolved from the same snapshot cost evidence, and the "
+            "base schedule remains the only schedule used for fitting and "
+            "calibration"
         ),
     )
     parser.add_argument("--top-k", type=int, default=20)
@@ -126,14 +129,22 @@ def _parse_horizons(raw: str) -> tuple[int, ...]:
     return values
 
 
-def _resolve_cost_context(
-    snapshot: object, cost_schedule: str
-) -> tuple[CostSchedule, LiquiditySlippageModel | None]:
-    """Resolve one effective-dated cost schedule plus liquidity model.
+def _resolve_cost_contexts(
+    snapshot: object,
+) -> tuple[
+    CostSchedule,
+    LiquiditySlippageModel | None,
+    CostSchedule,
+    LiquiditySlippageModel | None,
+]:
+    """Resolve the base and stress cost schedules plus their liquidity models.
 
-    The snapshot's hash-bound cost evidence is the preferred source for both;
-    without it the canonical base/stress schedules are used and the liquidity
-    model is left unset (replay then fails closed on realized outcomes).
+    Both schedules are resolved from the same hash-bound cost evidence when the
+    snapshot provides it, so base/stress certification shares one evidence
+    identity. Without evidence the canonical base/stress schedules are used and
+    the liquidity models are left unset (replay then fails closed on realized
+    outcomes). The base schedule remains the only schedule permitted for fitting
+    and calibration.
     """
     costs = getattr(snapshot, "costs", None)
     if costs is not None:
@@ -141,12 +152,18 @@ def _resolve_cost_context(
         if research_range is None:
             raise ValueError("snapshot cost evidence requires a research_range")
         evidence = load_cost_evidence(Path(costs.path), research_range)
-        if cost_schedule == "stress":
-            return evidence.stress_schedule(), evidence.stress_liquidity_model
-        return evidence.base_schedule(), evidence.base_liquidity_model
-    if cost_schedule == "stress":
-        return default_stress_schedule(), None
-    return default_base_schedule(), None
+        return (
+            evidence.base_schedule(),
+            evidence.base_liquidity_model,
+            evidence.stress_schedule(),
+            evidence.stress_liquidity_model,
+        )
+    return (
+        default_base_schedule(),
+        None,
+        default_stress_schedule(),
+        None,
+    )
 
 
 def main(args: list[str] | None = None) -> int:
@@ -194,9 +211,12 @@ def main(args: list[str] | None = None) -> int:
         len(data.feature_frame.columns),
     )
 
-    base_cost_schedule, liquidity_model = _resolve_cost_context(
-        snapshot, parsed.cost_schedule
-    )
+    (
+        base_cost_schedule,
+        liquidity_model,
+        stress_cost_schedule,
+        stress_liquidity_model,
+    ) = _resolve_cost_contexts(snapshot)
     registry = ModelArtifactRegistry(parsed.registry)
     request = NetAlphaTrainingRequest(
         artifact_id=parsed.artifact_id,
@@ -220,7 +240,9 @@ def main(args: list[str] | None = None) -> int:
         ),
         risk=RiskSettings(),
         base_cost_schedule=base_cost_schedule,
+        stress_cost_schedule=stress_cost_schedule,
         liquidity_model=liquidity_model,
+        stress_liquidity_model=stress_liquidity_model,
     )
     costs = getattr(snapshot, "costs", None)
     cost_context = CostRunContext(

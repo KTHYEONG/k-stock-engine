@@ -109,9 +109,48 @@ def _default_metrics(
             "order_count": 120,
             "block_count": 4,
             "decisions": [1, 1, 1, 1],
-            "block_log_excess": [0.01, 0.02, 0.03, 0.04],
+            "period_net_returns": [0.01, 0.02, 0.03, 0.04],
         },
-        "holdout": {"passed": True, "reason": "", "order_count": 40, "block_count": 3},
+        "holdout": {
+            "passed": True,
+            "reason": "",
+            "order_count": 40,
+            "block_count": 3,
+            "certificate": {
+                "passed": True,
+                "reasons": [],
+                "base": {
+                    "passed": True,
+                    "reasons": [],
+                    "cagr": 0.15,
+                    "lower_cagr": 0.02,
+                    "mdd": 0.08,
+                    "calmar": 1.875,
+                },
+                "stress": {
+                    "passed": True,
+                    "reasons": [],
+                    "cagr": 0.11,
+                    "lower_cagr": 0.01,
+                    "mdd": 0.10,
+                    "calmar": 1.1,
+                },
+            },
+            "cohorts": {
+                "scored_sessions": 60,
+                "realized_sessions": 60,
+                "eligible_sessions": 12,
+                "orders": 40,
+                "period_count": 4,
+                "observed_sessions": 24,
+                "active_cohort_count": 3,
+                "missing_realized_cohorts": 0,
+            },
+            "eligibility": {
+                "eligible_from": "2024-11-01T00:00:00+00:00",
+                "eligible_to": "2024-12-31T00:00:00+00:00",
+            },
+        },
         "run_observability": {
             "phases": [
                 {
@@ -227,8 +266,22 @@ def test_record_completed_projects_canonical_fields(tmp_path) -> None:
     assert observability["horizons"][0]["admission"] == "eligible"
     assert observability["replay"]["block_count"] == 4
     assert "block_log_excess" not in observability["replay"]
+    assert "period_net_returns" not in observability["replay"]
     assert observability["replay"]["block_excess_summary"]["count"] == 4
-    assert observability["holdout"]["passed"] is True
+    holdout = observability["holdout"]
+    assert holdout["passed"] is True
+    assert holdout["order_count"] == 40
+    assert holdout["block_count"] == 3
+    assert holdout["cohorts"]["observed_sessions"] == 24
+    assert holdout["cohorts"]["active_cohort_count"] == 3
+    assert holdout["cohorts"]["eligible_sessions"] == 12
+    assert holdout["cohorts"]["missing_realized_cohorts"] == 0
+    assert holdout["certificate"]["passed"] is True
+    assert holdout["certificate"]["base"]["cagr"] == 0.15
+    assert holdout["certificate"]["stress"]["lower_cagr"] == 0.01
+    assert holdout["certificate"]["stress"]["mdd"] == 0.10
+    assert "period_net_returns" not in holdout["certificate"]["base"]
+    assert holdout["eligibility"]["eligible_from"] == "2024-11-01T00:00:00+00:00"
     assert latest["artifact"]["manifest_path"] == "manifest.json"
     assert latest["artifact"]["metrics_path"] == "metrics.json"
 
@@ -320,7 +373,8 @@ def test_raw_vectors_and_unknown_keys_do_not_enter_projection(tmp_path) -> None:
     registry = ModelArtifactRegistry(tmp_path / "artifacts")
     artifact_id = "na_raw"
     metrics = _default_metrics()
-    metrics["replay"]["block_log_excess"] = [0.01] * 5_000
+    metrics["replay"]["period_net_returns"] = [0.01] * 5_000
+    metrics["holdout"]["cohorts"]["period_net_returns_raw"] = [0.01] * 5_000
     metrics["unknown_oversized_key"] = {"blob": "y" * 30_000}
     metrics["secret_credentials"] = {"token": "x" * 40}
     _write_artifact(registry.root, artifact_id, metrics=metrics)
@@ -332,7 +386,36 @@ def test_raw_vectors_and_unknown_keys_do_not_enter_projection(tmp_path) -> None:
     assert "secret_credentials" not in latest
     replay = latest["observability"]["replay"]
     assert "block_log_excess" not in replay
+    assert "period_net_returns" not in replay
     assert replay["block_excess_summary"]["count"] == 5_000
+    assert "period_net_returns_raw" not in latest["observability"]["holdout"]
+
+
+def test_project_holdout_legacy_artifact_fallback(tmp_path) -> None:
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    artifact_id = "na_legacy_holdout"
+    metrics = _default_metrics()
+    metrics["holdout"] = {
+        "passed": False,
+        "reason": "holdout-replay-no-trade",
+        "order_count": 0,
+        "block_count": 0,
+    }
+    del metrics["replay"]["period_net_returns"]
+    metrics["replay"]["block_log_excess"] = [0.01, 0.02, 0.03]
+    _write_artifact(registry.root, artifact_id, metrics=metrics)
+    context = _context(artifact_id)
+    ledger_inst = MlResultLedger(tmp_path / "results")
+    ledger_inst.record_completed(context, _manifest(artifact_id), registry)
+    holdout = _latest(tmp_path / "results")["observability"]["holdout"]
+    assert holdout["passed"] is False
+    assert holdout["reason"] == "holdout-replay-no-trade"
+    assert holdout["cohorts"]["period_count"] == 0
+    assert holdout["certificate"]["passed"] is False
+    assert holdout["certificate"]["base"] == {}
+    assert holdout["eligibility"] == {"eligible_from": "", "eligible_to": ""}
+    replay = _latest(tmp_path / "results")["observability"]["replay"]
+    assert replay["block_excess_summary"]["count"] == 3
 
 
 def test_retention_dedup_and_discard_metadata(tmp_path) -> None:
