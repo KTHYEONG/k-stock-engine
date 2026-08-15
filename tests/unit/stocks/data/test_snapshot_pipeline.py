@@ -178,7 +178,17 @@ def build_pipeline(tmp_path: Path) -> dict[str, object]:
         completeness=EvidenceCompleteness.COMPLETE,
         path=str(canonical / "labels_v1"),
     )
-    for entry_ in (base_entry, feature_entry, label_entry):
+    status_entry = CatalogEntry(
+        kind=CatalogKind.OUTCOME_STATUS,
+        name="labels_v1_outcome_status",
+        content_hash=f"status-{published.manifest.content_hash}",
+        schema_hash="status-schema",
+        registered_at=GENERATED,
+        coverage=CoverageRange(start=DATES[0], end=DATES[-1]),
+        completeness=EvidenceCompleteness.COMPLETE,
+        path=str(canonical / "labels_v1_outcome_status"),
+    )
+    for entry_ in (base_entry, feature_entry, label_entry, status_entry):
         store.register(entry_)
 
     snapshot = build_snapshot_manifest(
@@ -190,6 +200,7 @@ def build_pipeline(tmp_path: Path) -> dict[str, object]:
             base_entry,
             feature_entry,
             label_entry,
+            status_entry,
             store.require(CatalogKind.CALENDAR, "calendar_v1"),
             store.require(CatalogKind.INSTRUMENT_MASTER, "instrument_master_v1"),
             store.require(CatalogKind.DISCLOSURES, "disclosures_v1"),
