@@ -1,0 +1,461 @@
+"""Bounded ML result ledger: projection, retention, path safety, recovery."""
+from __future__ import annotations
+
+import json
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+from src.stocks.data.contracts import DatasetSnapshot
+from src.stocks.ml.contracts import NetAlphaTrainingRequest
+from src.stocks.ml.data import compose_net_alpha_training_data
+from src.stocks.ml.result_ledger import (
+    CostRunContext,
+    MlResultLedger,
+    MlRunContext,
+    summarize_numeric,
+)
+from src.stocks.research.artifacts import ModelArtifactRegistry
+from src.stocks.research.models import ModelManifest
+from tests.fixtures.stocks.helpers import (
+    stock_net_alpha_composed_df,
+    stock_net_alpha_manifest,
+)
+
+
+class _MutableClock:
+    def __init__(self, start: datetime) -> None:
+        self.value = start
+
+    def __call__(self) -> datetime:
+        return self.value
+
+    def advance(self, delta: timedelta) -> None:
+        self.value += delta
+
+
+def _context(
+    artifact_id: str = "na_ledger",
+    snapshot_id: str = "research_snap_1",
+    started_at: datetime | None = None,
+) -> MlRunContext:
+    df = stock_net_alpha_composed_df(n_sessions=60, n_tickers=4, audit_clean=True)
+    snapshot = DatasetSnapshot(
+        manifest=stock_net_alpha_manifest(columns=df.columns), frame=df
+    )
+    data = compose_net_alpha_training_data(
+        snapshot, datetime(2024, 12, 31, tzinfo=UTC), (3, 5, 8, 10, 15, 20)
+    )
+    return MlRunContext.from_cli(
+        request=NetAlphaTrainingRequest(
+            artifact_id=artifact_id, candidate_horizon_sessions=(3, 5, 8, 10, 15, 20)
+        ),
+        snapshot_id=snapshot_id,
+        data=data,
+        cost_context=CostRunContext(
+            cost_schedule_kind="base",
+            cost_evidence_path="cost_evidence.json",
+            cost_evidence_hash="cost-hash-1",
+            has_liquidity_model=True,
+        ),
+        started_at=started_at or datetime(2024, 1, 1, tzinfo=UTC),
+    )
+
+
+def _manifest(
+    artifact_id: str, model_type: str = "net_alpha_elastic_net"
+) -> ModelManifest:
+    return ModelManifest(
+        artifact_id=artifact_id,
+        asset_kind="stock",
+        feature_set="stock_net_alpha_v1",
+        feature_schema_hash="schema-hash-1",
+        universe_policy_hash="universe-hash-1",
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=5,
+        eligible_from="2024-01-01T00:00:00+00:00",
+        eligible_to="2024-12-31T00:00:00+00:00",
+        model_type=model_type,
+    )
+
+
+def _default_metrics(
+    model_type: str = "net_alpha_elastic_net",
+) -> dict[str, object]:
+    return {
+        "promoted": model_type != "no_trade",
+        "no_trade": model_type == "no_trade",
+        "model_type": model_type,
+        "promotion_reasons": (
+            ["no-horizon-evidence"]
+            if model_type == "no_trade"
+            else ["primary=3 from lower bounds {3:0.01}"]
+        ),
+        "gates": {
+            "passed": model_type != "no_trade",
+            "reasons": ["no-horizon-evidence"],
+        },
+        "horizon_selection": {
+            "primary_horizon_sessions": None if model_type == "no_trade" else 3,
+            "secondary_horizon_sessions": None,
+            "lower_bounds": {"3": 0.01, "5": -0.001},
+            "effective_horizon_count": 1.0,
+            "selection_reasons": ["primary=3"],
+            "correlation_matrix": {},
+        },
+        "replay": {
+            "order_count": 120,
+            "block_count": 4,
+            "decisions": [1, 1, 1, 1],
+            "block_log_excess": [0.01, 0.02, 0.03, 0.04],
+        },
+        "holdout": {"passed": True, "reason": "", "order_count": 40, "block_count": 3},
+        "run_observability": {
+            "phases": [
+                {
+                    "name": "integrity_audit",
+                    "elapsed_ms": 10,
+                    "peak_rss_mib": 100.0,
+                    "passed": True,
+                }
+            ],
+            "horizons": [
+                {
+                    "horizon_sessions": 3,
+                    "model_family": "net_alpha_elastic_net",
+                    "admission": "eligible",
+                    "usable_fold_count": 3,
+                    "fold_rank_ics": [0.05, 0.06, 0.07],
+                }
+            ],
+        },
+    }
+
+
+def _write_artifact(
+    root: Path,
+    artifact_id: str,
+    *,
+    model_type: str = "net_alpha_elastic_net",
+    metrics: dict[str, object] | None = None,
+    manifest: dict[str, object] | None = None,
+) -> None:
+    artifact_dir = root / artifact_id
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    default_manifest: dict[str, object] = {
+        "artifact_id": artifact_id,
+        "asset_kind": "STOCK",
+        "feature_set": "stock_net_alpha_v1",
+        "feature_schema_hash": "schema-hash-1",
+        "universe_policy_hash": "universe-hash-1",
+        "label_definition": "net_alpha_o2o",
+        "label_horizon_sessions": 5,
+        "eligible_from": "2024-01-01T00:00:00+00:00",
+        "eligible_to": "2024-12-31T00:00:00+00:00",
+        "model_type": model_type,
+        "params": {},
+    }
+    (artifact_dir / "manifest.json").write_text(
+        json.dumps(manifest or default_manifest), encoding="utf-8"
+    )
+    (artifact_dir / "metrics.json").write_text(
+        json.dumps(metrics or _default_metrics(model_type)), encoding="utf-8"
+    )
+
+
+def _latest(results_root: Path) -> dict[str, object]:
+    return json.loads((results_root / "ml_runs" / "latest.json").read_text())
+
+
+def test_summarize_numeric_finite_only() -> None:
+    result = summarize_numeric([1.0, 2.0, 3.0, 4.0])
+    assert result["count"] == 4
+    assert result["min"] == 1.0
+    assert result["max"] == 4.0
+    assert result["median"] == 2.5
+    empty = summarize_numeric([])
+    assert empty["count"] == 0
+    assert empty["mean"] is None
+    assert empty["std"] is None
+    non_finite = summarize_numeric([float("nan"), float("inf"), 1.0, None])
+    assert non_finite["count"] == 1
+    assert non_finite["mean"] == 1.0
+
+
+def test_record_completed_projects_canonical_fields(tmp_path) -> None:
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    artifact_id = "na_completed"
+    _write_artifact(registry.root, artifact_id)
+    context = _context(artifact_id)
+    ledger_inst = MlResultLedger(
+        tmp_path / "results", clock=lambda: datetime(2024, 1, 2, tzinfo=UTC)
+    )
+    ledger_inst.record_completed(context, _manifest(artifact_id), registry)
+    latest = _latest(tmp_path / "results")
+    assert latest["schema_version"] == 1
+    assert latest["artifact_id"] == artifact_id
+    assert latest["status"] == "completed"
+    assert latest["started_at"] == "2024-01-01T00:00:00+00:00"
+    assert latest["finished_at"] == "2024-01-02T00:00:00+00:00"
+    assert latest["runtime"]["elapsed_ms"] == 86_400_000
+    request = latest["input"]["request"]
+    assert request["candidate_horizon_sessions"] == [3, 5, 8, 10, 15, 20]
+    assert request["fold_count"] == 3
+    assert "request_fingerprint" in request
+    data = latest["input"]["data"]
+    assert data["instrument_count"] == 4
+    assert data["session_count"] == 60
+    assert data["feature_rows"] > 0
+    assert isinstance(data["label_definition"], str)
+    assert isinstance(data["feature_schema_hash"], str)
+    assert isinstance(data["universe_policy_hash"], str)
+    assert any(entry["horizon_sessions"] == 3 for entry in data["horizons"])
+    cost = latest["input"]["cost_context"]
+    assert cost["cost_schedule_kind"] == "base"
+    assert cost["cost_evidence_hash"] == "cost-hash-1"
+    assert cost["liquidity_model"] is True
+    outcome = latest["outcome"]
+    assert outcome["promoted"] is True
+    assert outcome["no_trade"] is False
+    assert outcome["model_type"] == "net_alpha_elastic_net"
+    assert outcome["selected_horizons"] == [3]
+    assert outcome["gates"]["passed"] is True
+    observability = latest["observability"]
+    assert observability["phases"]
+    assert observability["horizons"][0]["admission"] == "eligible"
+    assert observability["replay"]["block_count"] == 4
+    assert "block_log_excess" not in observability["replay"]
+    assert observability["replay"]["block_excess_summary"]["count"] == 4
+    assert observability["holdout"]["passed"] is True
+    assert latest["artifact"]["manifest_path"] == "manifest.json"
+    assert latest["artifact"]["metrics_path"] == "metrics.json"
+
+
+def test_record_completed_no_trade(tmp_path) -> None:
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    artifact_id = "na_no_trade_record"
+    _write_artifact(registry.root, artifact_id, model_type="no_trade")
+    context = _context(artifact_id)
+    ledger_inst = MlResultLedger(tmp_path / "results")
+    ledger_inst.record_completed(context, _manifest(artifact_id, "no_trade"), registry)
+    latest = _latest(tmp_path / "results")
+    assert latest["outcome"]["no_trade"] is True
+    assert latest["outcome"]["promoted"] is False
+    assert latest["outcome"]["promotion_reasons"] == ["no-horizon-evidence"]
+    assert latest["outcome"]["selected_horizons"] == []
+
+
+def test_record_failed_writes_sanitized_failure(tmp_path) -> None:
+    context = _context("na_failed")
+    ledger_inst = MlResultLedger(
+        tmp_path / "results", clock=lambda: datetime(2024, 1, 2, tzinfo=UTC)
+    )
+    exc = ValueError("boom\nsecond line " + "x" * 600)
+    ledger_inst.record_failed(context, "train_net_alpha_model", exc)
+    latest = _latest(tmp_path / "results")
+    assert latest["status"] == "failed"
+    assert latest["failure"]["phase"] == "train_net_alpha_model"
+    assert latest["failure"]["exception_type"] == "ValueError"
+    message = latest["failure"]["message"]
+    assert isinstance(message, str)
+    assert len(message) == 512
+    assert message.startswith("boom second line")
+    assert latest["artifact"] == {}
+    assert latest["outcome"] == {}
+
+
+def test_record_completed_missing_artifact_raises(tmp_path) -> None:
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    context = _context("na_missing")
+    ledger_inst = MlResultLedger(tmp_path / "results")
+    with pytest.raises(ValueError, match="artifact file missing"):
+        ledger_inst.record_completed(context, _manifest("na_missing"), registry)
+    assert not (tmp_path / "results" / "ml_runs").exists()
+
+
+def test_record_completed_manifest_id_mismatch_raises(tmp_path) -> None:
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    artifact_id = "na_dir"
+    _write_artifact(
+        registry.root,
+        artifact_id,
+        manifest={
+            "artifact_id": "na_other",
+            "asset_kind": "STOCK",
+            "feature_set": "stock_net_alpha_v1",
+            "feature_schema_hash": "schema-hash-1",
+            "universe_policy_hash": "universe-hash-1",
+            "label_definition": "net_alpha_o2o",
+            "label_horizon_sessions": 5,
+            "eligible_from": "2024-01-01T00:00:00+00:00",
+            "eligible_to": "2024-12-31T00:00:00+00:00",
+            "model_type": "net_alpha_elastic_net",
+            "params": {},
+        },
+    )
+    context = _context(artifact_id)
+    ledger_inst = MlResultLedger(tmp_path / "results")
+    with pytest.raises(ValueError, match="artifact id mismatch"):
+        ledger_inst.record_completed(context, _manifest(artifact_id), registry)
+    assert not (tmp_path / "results" / "ml_runs" / "recent.jsonl").exists()
+
+
+def test_oversized_record_rejected_before_write(tmp_path) -> None:
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    artifact_id = "na_huge"
+    metrics = _default_metrics()
+    metrics["promotion_reasons"] = [f"reason-{index}-" + "y" * 40 for index in range(700)]
+    _write_artifact(registry.root, artifact_id, metrics=metrics)
+    context = _context(artifact_id)
+    ledger_inst = MlResultLedger(tmp_path / "results")
+    with pytest.raises(ValueError, match="exceeds"):
+        ledger_inst.record_completed(context, _manifest(artifact_id), registry)
+    assert not (tmp_path / "results" / "ml_runs" / "recent.jsonl").exists()
+    assert not (tmp_path / "results" / "ml_runs" / "latest.json").exists()
+
+
+def test_raw_vectors_and_unknown_keys_do_not_enter_projection(tmp_path) -> None:
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    artifact_id = "na_raw"
+    metrics = _default_metrics()
+    metrics["replay"]["block_log_excess"] = [0.01] * 5_000
+    metrics["unknown_oversized_key"] = {"blob": "y" * 30_000}
+    metrics["secret_credentials"] = {"token": "x" * 40}
+    _write_artifact(registry.root, artifact_id, metrics=metrics)
+    context = _context(artifact_id)
+    ledger_inst = MlResultLedger(tmp_path / "results")
+    ledger_inst.record_completed(context, _manifest(artifact_id), registry)
+    latest = _latest(tmp_path / "results")
+    assert "unknown_oversized_key" not in latest
+    assert "secret_credentials" not in latest
+    replay = latest["observability"]["replay"]
+    assert "block_log_excess" not in replay
+    assert replay["block_excess_summary"]["count"] == 5_000
+
+
+def test_retention_dedup_and_discard_metadata(tmp_path) -> None:
+    base = _context("na_ret_base")
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    clock = _MutableClock(datetime(2024, 1, 1, tzinfo=UTC))
+    ledger_inst = MlResultLedger(tmp_path / "results", clock=clock, retained_records=128)
+    for index in range(130):
+        artifact_id = f"na_ret_{index:03d}"
+        _write_artifact(registry.root, artifact_id, model_type="no_trade")
+        clock.advance(timedelta(seconds=1))
+        ledger_inst.record_completed(
+            replace(base, artifact_id=artifact_id),
+            _manifest(artifact_id, "no_trade"),
+            registry,
+        )
+    lines = (tmp_path / "results" / "ml_runs" / "recent.jsonl").read_text().splitlines()
+    assert len(lines) == 128
+    ids = [json.loads(line)["artifact_id"] for line in lines]
+    assert "na_ret_000" not in ids
+    assert "na_ret_129" in ids
+    meta = json.loads(
+        (tmp_path / "results" / "ml_runs" / "ledger_meta.json").read_text()
+    )
+    assert meta["retained_count"] == 128
+    assert meta["discarded_count"] == 2
+    before = (registry.root / "na_ret_000" / "manifest.json").read_bytes()
+    clock.advance(timedelta(seconds=1))
+    ledger_inst.record_completed(
+        replace(base, artifact_id="na_ret_100"),
+        _manifest("na_ret_100", "no_trade"),
+        registry,
+    )
+    lines = (tmp_path / "results" / "ml_runs" / "recent.jsonl").read_text().splitlines()
+    assert len(lines) == 128
+    assert (
+        sum(1 for line in lines if json.loads(line)["artifact_id"] == "na_ret_100")
+        == 1
+    )
+    assert (registry.root / "na_ret_000" / "manifest.json").read_bytes() == before
+
+
+def test_path_traversal_rejected(tmp_path) -> None:
+    context = _context("../escape")
+    ledger_inst = MlResultLedger(tmp_path / "results")
+    with pytest.raises(ValueError, match="invalid artifact_id"):
+        ledger_inst.record_failed(context, "phase", ValueError("boom"))
+
+
+def test_symlink_escape_rejected_before_write(tmp_path) -> None:
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    artifact_id = "na_link"
+    _write_artifact(registry.root, artifact_id)
+    context = _context(artifact_id)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "ledger_meta.json").write_text("{}", encoding="utf-8")
+    runs = tmp_path / "results" / "ml_runs"
+    runs.mkdir(parents=True)
+    (runs / "ledger_meta.json").symlink_to(outside / "ledger_meta.json")
+    ledger_inst = MlResultLedger(tmp_path / "results")
+    with pytest.raises(ValueError, match="escapes results root"):
+        ledger_inst.record_completed(context, _manifest(artifact_id), registry)
+    assert not (tmp_path / "results" / "ml_runs" / "latest.json").exists()
+
+
+def test_pointer_stays_within_one_kib(tmp_path) -> None:
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    artifact_id = "na_pointer"
+    _write_artifact(registry.root, artifact_id)
+    context = _context(artifact_id)
+    ledger_inst = MlResultLedger(tmp_path / "results")
+    ledger_inst.record_completed(context, _manifest(artifact_id), registry)
+    pointer = tmp_path / "results" / "back-res.md"
+    assert pointer.exists()
+    assert pointer.stat().st_size <= 1024
+    text = pointer.read_text()
+    assert "Latest artifact" in text
+    assert "latest.json" in text
+    assert "recent.jsonl" in text
+    assert "source of truth" in text
+    assert "ML Result Ledger" in text
+
+
+def test_deterministic_records_for_fixed_inputs(tmp_path) -> None:
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    artifact_id = "na_det"
+    _write_artifact(registry.root, artifact_id)
+    context = _context(artifact_id)
+
+    def _clock() -> datetime:
+        return datetime(2024, 1, 2, tzinfo=UTC)
+
+    first = MlResultLedger(tmp_path / "results_a", clock=_clock)
+    second = MlResultLedger(tmp_path / "results_b", clock=_clock)
+    first.record_completed(context, _manifest(artifact_id), registry)
+    second.record_completed(context, _manifest(artifact_id), registry)
+    assert (tmp_path / "results_a" / "ml_runs" / "latest.json").read_bytes() == (
+        tmp_path / "results_b" / "ml_runs" / "latest.json"
+    ).read_bytes()
+    assert (tmp_path / "results_a" / "back-res.md").read_bytes() == (
+        tmp_path / "results_b" / "back-res.md"
+    ).read_bytes()
+
+
+def test_rebuild_from_registry_recovers_cache(tmp_path) -> None:
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    _write_artifact(registry.root, "na_recover")
+    _write_artifact(registry.root, "na_recover_no_trade", model_type="no_trade")
+    ledger_inst = MlResultLedger(tmp_path / "results")
+    stats = ledger_inst.rebuild_from_registry(registry)
+    assert stats["scanned"] == 2
+    assert stats["retained"] == 2
+    lines = (tmp_path / "results" / "ml_runs" / "recent.jsonl").read_text().splitlines()
+    assert len(lines) == 2
+    assert {json.loads(line)["artifact_id"] for line in lines} == {
+        "na_recover",
+        "na_recover_no_trade",
+    }
+    latest = _latest(tmp_path / "results")
+    assert latest["status"] == "completed"
+    assert latest["outcome"]["model_type"] in {
+        "net_alpha_elastic_net",
+        "no_trade",
+    }
+    assert latest["input"]["snapshot_id"] is None
