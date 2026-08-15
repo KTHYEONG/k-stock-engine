@@ -248,3 +248,54 @@ def test_apply_v3_transforms_clusters_exact_rank_equivalent_sources() -> None:
     assert "disparity__rank" in learner_columns
     assert "trend_rank__rank" not in learner_columns
     assert "independent__rank" in learner_columns
+
+
+def test_holdout_mutation_never_changes_schema_or_pre_holdout_transforms() -> None:
+    """Holdout value/null mutations must not change schema, learner columns, or
+    the pre-holdout transform outputs."""
+    from src.stocks.ml.features import (
+        apply_model_feature_schema,
+        fit_model_feature_schema,
+    )
+
+    def _frame() -> pl.DataFrame:
+        sessions = [datetime(2024, 1, 1, tzinfo=UTC)] * 6 + [
+            datetime(2024, 1, 2, tzinfo=UTC)
+        ] * 6
+        sector = ["S1"] * 12
+        momentum = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0] * 2
+        missing_flow = [1.0, None, 3.0, 0.5, 2.0, None] * 2
+        return pl.DataFrame(
+            {
+                "session": sessions,
+                "sector": sector,
+                "instrument_id": [f"KRX:{i}" for i in range(12)],
+                "momentum": momentum,
+                "flow": missing_flow,
+            }
+        )
+
+    roles = {"momentum": "ALPHA", "flow": "ALPHA"}
+    frame = _frame()
+    pre_holdout = frame.filter(pl.col("session") < datetime(2024, 1, 2, tzinfo=UTC))
+    holdout = frame.filter(pl.col("session") >= datetime(2024, 1, 2, tzinfo=UTC))
+    assert not pre_holdout.is_empty()
+    assert not holdout.is_empty()
+
+    schema = fit_model_feature_schema(pre_holdout, roles)
+    baseline_transformed = apply_model_feature_schema(pre_holdout, schema)
+
+    # Mutate every holdout value and null pattern; schema and pre-holdout
+    # transforms must be byte-identical.
+    mutated_holdout = holdout.with_columns(
+        pl.lit(123.0).alias("momentum"),
+        pl.when(pl.col("flow").is_not_null()).then(None).otherwise(1.0).alias("flow"),
+    )
+    mutated_schema = fit_model_feature_schema(mutated_holdout, roles)
+    assert mutated_schema.fingerprint == schema.fingerprint
+    assert mutated_schema.learner_columns == schema.learner_columns
+    assert mutated_schema.representative_sources == schema.representative_sources
+    assert mutated_schema.missing_sources == schema.missing_sources
+
+    mutated_transformed = apply_model_feature_schema(pre_holdout, mutated_schema)
+    assert mutated_transformed.equals(baseline_transformed)
