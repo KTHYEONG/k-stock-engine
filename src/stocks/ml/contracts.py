@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
 import polars as pl
@@ -17,8 +19,51 @@ import polars as pl
 from src.core.costs import CostSchedule, LiquiditySlippageModel
 from src.core.datasets import DatasetManifest
 
+if TYPE_CHECKING:
+    from src.stocks.ml.data import HorizonOutcomeCoverage
+
 DEFAULT_CANDIDATE_HORIZON_SESSIONS = (3, 5, 8, 10, 15, 20)
 CANONICAL_FEATURE_SET = "stock_net_alpha_v1"
+
+OUTCOME_REALIZED = "REALIZED"
+OUTCOME_PARTIAL_TAIL = "PARTIAL_TAIL"
+OUTCOME_MISSING_ENTRY_PRICE = "MISSING_ENTRY_PRICE"
+OUTCOME_MISSING_EXIT_PRICE = "MISSING_EXIT_PRICE"
+OUTCOME_MISSING_DECISION_INPUT = "MISSING_DECISION_INPUT"
+OUTCOME_UNDERSIZED_CROSS_SECTION = "UNDERSIZED_CROSS_SECTION"
+OUTCOME_RISK_PROJECTION_FAILED = "RISK_PROJECTION_FAILED"
+OUTCOME_ZERO_MAD = "ZERO_MAD"
+OUTCOME_UNSUPPORTED_CORPORATE_ACTION = "UNSUPPORTED_CORPORATE_ACTION"
+OUTCOME_STATUS_VOCABULARY = (
+    OUTCOME_REALIZED,
+    OUTCOME_PARTIAL_TAIL,
+    OUTCOME_MISSING_ENTRY_PRICE,
+    OUTCOME_MISSING_EXIT_PRICE,
+    OUTCOME_MISSING_DECISION_INPUT,
+    OUTCOME_UNDERSIZED_CROSS_SECTION,
+    OUTCOME_RISK_PROJECTION_FAILED,
+    OUTCOME_ZERO_MAD,
+    OUTCOME_UNSUPPORTED_CORPORATE_ACTION,
+)
+RESOLVED_OUTCOME_STATUSES = (OUTCOME_REALIZED,)
+TAIL_OUTCOME_STATUS = OUTCOME_PARTIAL_TAIL
+OUTCOME_STATUS_COLUMN = "outcome_status"
+
+
+def validate_outcome_status(value: object) -> str:
+    """Validate a typed outcome status against the fixed vocabulary.
+
+    Raises ``ValueError`` for an unknown, non-string, or empty status. The
+    vocabulary is fixed and immutable; the producer may never invent a state.
+    """
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"outcome status must be a non-empty string, got {value!r}")
+    if value not in OUTCOME_STATUS_VOCABULARY:
+        raise ValueError(
+            f"unknown outcome status {value!r}; allowed "
+            f"{OUTCOME_STATUS_VOCABULARY}"
+        )
+    return value
 
 LEGACY_OVERLAY_PROFILE_ID = "legacy_overlay_5bps"
 LOWER_BOUND_ONLY_PROFILE_ID = "lower_bound_only"
@@ -277,14 +322,108 @@ class HorizonLabelSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class OutcomeStatusCounts:
+    """Immutable bounded per-status outcome counts for one horizon/segment.
+
+    ``counts`` is a sorted tuple of ``(status, count)`` pairs restricted to the
+    fixed vocabulary; an unknown state or a negative count raises
+    ``ValueError``. ``REALIZED`` is the only state that may enter realised
+    return arithmetic; ``PARTIAL_TAIL`` is a chronological tail; every other
+    state is an unresolved, non-certifiable outcome.
+    """
+
+    counts: tuple[tuple[str, int], ...] = ()
+
+    def __post_init__(self) -> None:
+        pairs = []
+        for status, count in self.counts:
+            validate_outcome_status(status)
+            if not isinstance(count, int) or count < 0:
+                raise ValueError(f"outcome status count must be a non-negative int, got {count!r}")
+            pairs.append((status, count))
+        if len({status for status, _ in pairs}) != len(pairs):
+            raise ValueError("outcome status counts contain duplicate states")
+        object.__setattr__(self, "counts", tuple(sorted(pairs)))
+
+    @classmethod
+    def from_mapping(cls, mapping: Mapping[str, int]) -> OutcomeStatusCounts:
+        """Build bounded counts from a status-to-count mapping.
+
+        Unknown states raise ``ValueError``; zero-count states are dropped so
+        the record stays bounded.
+        """
+        pairs = []
+        for status, count in mapping.items():
+            validate_outcome_status(status)
+            if not isinstance(count, int) or count < 0:
+                raise ValueError(
+                    f"outcome status count must be a non-negative int, got {count!r}"
+                )
+            if count > 0:
+                pairs.append((status, count))
+        return cls(tuple(pairs))
+
+    def count(self, status: str) -> int:
+        validate_outcome_status(status)
+        for known, value in self.counts:
+            if known == status:
+                return value
+        return 0
+
+    @property
+    def realized(self) -> int:
+        return self.count(OUTCOME_REALIZED)
+
+    @property
+    def partial_tail(self) -> int:
+        return self.count(OUTCOME_PARTIAL_TAIL)
+
+    @property
+    def unresolved(self) -> int:
+        return sum(
+            count
+            for status, count in self.counts
+            if status not in RESOLVED_OUTCOME_STATUSES and status != OUTCOME_PARTIAL_TAIL
+        )
+
+    def to_json(self) -> dict[str, int]:
+        return dict(self.counts)
+
+
+@dataclass(frozen=True, slots=True)
+class SegmentOutcomeCounts:
+    """Bounded per-segment outcome counts for one horizon."""
+
+    segment_id: int
+    counts: OutcomeStatusCounts
+
+    def __post_init__(self) -> None:
+        if self.segment_id < 0:
+            raise ValueError("segment_id must be non-negative")
+
+    def to_json(self) -> dict[str, object]:
+        return {"segment_id": int(self.segment_id), "counts": self.counts.to_json()}
+
+
+@dataclass(frozen=True, slots=True)
 class HorizonJoinEvidence:
-    """Retained/dropped row evidence for one horizon's point-in-time join."""
+    """Retained/dropped row evidence for one horizon's point-in-time join.
+
+    ``decision_rows`` counts the unique decision feature keys preserved by the
+    composition for the horizon, ``realized_rows`` the rows with a realised
+    label, and ``status_counts`` the bounded per-status outcome counts over the
+    decision universe. ``drop_reasons`` retains the deterministic admission
+    reasons of keys that produced no realised label.
+    """
 
     horizon_sessions: int
     feature_rows: int
     label_rows: int
     joined_rows: int
     drop_reasons: tuple[str, ...] = ()
+    decision_rows: int = 0
+    realized_rows: int = 0
+    status_counts: OutcomeStatusCounts | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,14 +433,21 @@ class NetAlphaResearchData:
     ``feature_frame`` carries one row per ``(instrument_id, decision_session)``
     and the declared ALPHA source columns. ``labels_by_horizon`` maps a
     candidate horizon to an independent label frame; horizons are never
-    inner-joined into a common universe. ``join_evidence`` records retained and
-    dropped row counts per horizon.
+    inner-joined into a common universe. ``status_by_horizon`` maps a candidate
+    horizon to its typed outcome-status sidecar (one status row per decision
+    key), and ``coverage_by_horizon`` the built vectorized outcome coverage.
+    ``join_evidence`` records retained/dropped row counts, decision/realised
+    rows, and per-status counts per horizon.
     """
 
     feature_frame: pl.DataFrame
     labels_by_horizon: dict[int, pl.DataFrame]
     manifest: DatasetManifest
     join_evidence: tuple[HorizonJoinEvidence, ...] = ()
+    status_by_horizon: dict[int, pl.DataFrame] = field(default_factory=dict)
+    coverage_by_horizon: dict[int, HorizonOutcomeCoverage] = field(
+        default_factory=dict
+    )
 
     def __post_init__(self) -> None:
         if self.feature_frame.is_empty():
@@ -312,6 +458,11 @@ class NetAlphaResearchData:
             if frame.is_empty():
                 raise ValueError(
                     f"NetAlphaResearchData horizon {horizon} label frame is empty"
+                )
+        for horizon, frame in self.status_by_horizon.items():
+            if frame.is_empty():
+                raise ValueError(
+                    f"NetAlphaResearchData horizon {horizon} status frame is empty"
                 )
 
 
