@@ -14,12 +14,19 @@ class Fold:
     interval terminates; ``validation_decision_start`` is the session index at
     which the first validation decision is made. Purged + embargoed folds always
     satisfy ``train_label_end < validation_decision_start``.
+
+    ``segment_id`` is the stable identity of this validation segment in the
+    common fold plan (equal to the fold index), and ``validation_sessions``
+    records the exact session-index boundaries of the contiguous validation
+    block so every candidate horizon reuses the same segment.
     """
 
     train_mask: list[int]
     validation_mask: list[int]
     train_label_end: int
     validation_decision_start: int
+    segment_id: int = 0
+    validation_sessions: tuple[int, ...] = ()
 
     def num_train(self) -> int:
         return len(self.train_mask)
@@ -47,6 +54,7 @@ class PurgedWalkForward:
         session_column: str = "session_index",
         validation_window_sessions: int | None = None,
         min_train_sessions: int = 0,
+        balanced: bool = True,
     ):
         if n_folds < 1:
             raise ValueError("n_folds must be positive")
@@ -64,6 +72,7 @@ class PurgedWalkForward:
         self.session_column = session_column
         self.validation_window_sessions = validation_window_sessions
         self.min_train_sessions = min_train_sessions
+        self.balanced = balanced
         self._inspected_holdout_fingerprints: set[str] = set()
 
     def _validate_no_duplicate_sessions(self, samples: pl.DataFrame) -> None:
@@ -94,7 +103,16 @@ class PurgedWalkForward:
         return [int(value) for value in indexed["__row_idx"].to_list()], by_session
 
     def split(self, samples: pl.DataFrame) -> list[Fold]:
-        """Outer expanding walk-forward folds over all samples."""
+        """Outer expanding walk-forward folds over all samples.
+
+        With ``balanced=True`` (default) and no explicit
+        ``validation_window_sessions``, every session after the first
+        validation decision is split into ``n_folds`` contiguous validation
+        segments whose session counts differ by at most one, so no fold
+        inherits a disproportionate remainder. An explicit
+        ``validation_window_sessions`` preserves the legacy fixed-window
+        calendar.
+        """
         if self.session_column not in samples.columns:
             raise ValueError(f"missing session column {self.session_column!r}")
         sessions = sorted(samples[self.session_column].unique().to_list())
@@ -103,13 +121,16 @@ class PurgedWalkForward:
                 f"cannot create {self.n_folds} folds from {len(sessions)} sessions"
             )
         _all_rows, by_session = self._row_index(samples)
+        first_validation_start = (
+            self.min_train_sessions + self.label_horizon_sessions + self.embargo_sessions
+        )
+        if self.balanced and self.validation_window_sessions is None:
+            return self._balanced_contiguous_splits(
+                sessions, by_session, first_validation_start
+            )
 
         folds: list[Fold] = []
         validation_window = self.validation_window_sessions or max(1, len(sessions) // self.n_folds)
-        # Start validation only after enough sessions exist for a real training
-        # sample.  Purge and embargo rows are excluded from that sample, so
-        # include both intervals in the offset before constructing the block.
-        first_validation_start = self.min_train_sessions + self.label_horizon_sessions + self.embargo_sessions
         for k in range(self.n_folds):
             v_start = first_validation_start + k * validation_window
             v_end = (
@@ -119,7 +140,36 @@ class PurgedWalkForward:
             )
             if v_start >= len(sessions):
                 break
-            fold = self._purged_fold(sessions, by_session, sessions[v_start:v_end])
+            fold = self._purged_fold(sessions, by_session, sessions[v_start:v_end], segment_id=k)
+            if fold is None:
+                continue
+            folds.append(fold)
+        return folds
+
+    def _balanced_contiguous_splits(
+        self,
+        sessions: list[int],
+        by_session: dict[int, list[int]],
+        first_validation_start: int,
+    ) -> list[Fold]:
+        """Split every remaining session into balanced contiguous segments.
+
+        Each segment's session count differs from every other by at most one.
+        If ``n_folds`` non-empty contiguous segments cannot be formed (the
+        remaining session count is smaller than ``n_folds``), no fold is
+        returned and the caller fails closed.
+        """
+        remaining = len(sessions) - first_validation_start
+        if remaining < self.n_folds:
+            return []
+        base, extra = divmod(remaining, self.n_folds)
+        folds: list[Fold] = []
+        cursor = first_validation_start
+        for k in range(self.n_folds):
+            width = base + (1 if k < extra else 0)
+            segment = sessions[cursor : cursor + width]
+            cursor += width
+            fold = self._purged_fold(sessions, by_session, segment, segment_id=k)
             if fold is None:
                 continue
             folds.append(fold)
@@ -189,6 +239,7 @@ class PurgedWalkForward:
         sessions: list[int],
         by_session: dict[int, list[int]],
         validation_sessions: list[int],
+        segment_id: int = 0,
     ) -> Fold | None:
         validation_decision_start = validation_sessions[0]
         train_sessions = [
@@ -213,4 +264,6 @@ class PurgedWalkForward:
             validation_mask=sorted(validation_mask),
             train_label_end=train_sessions[-1] + self.label_horizon_sessions,
             validation_decision_start=validation_decision_start,
+            segment_id=segment_id,
+            validation_sessions=tuple(validation_sessions),
         )

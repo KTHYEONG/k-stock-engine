@@ -66,6 +66,8 @@ class PolicyBlock:
     ``net_return`` is the equal-weighted arithmetic ``risk_residual -
     realized_cost`` mean of the cohort's orders; it is a decimal arithmetic
     return, never a logarithm. Geometric growth is formed later with ``log1p``.
+    ``segment_id`` and the ``cohort_start``/``cohort_end`` ordinals record where
+    the complete cohort lives in the OOF calendar.
     """
 
     cohort_id: int
@@ -73,6 +75,9 @@ class PolicyBlock:
     net_return: float
     order_count: int
     notional: float
+    segment_id: int = 0
+    cohort_start: int = 0
+    cohort_end: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +106,8 @@ class ReplayEvaluation:
     realized_sessions: int = 0
     eligible_sessions: int = 0
     active_sessions: int = 0
+    partial_cohort_count: int = 0
+    cohort_metadata: tuple[tuple[int, int, int], ...] = ()
 
     @property
     def block_net_returns(self) -> tuple[float, ...]:
@@ -108,7 +115,11 @@ class ReplayEvaluation:
 
     @property
     def block_log_excess(self) -> tuple[float, ...]:
-        """Read-side alias retained for OOF horizon discovery consumers."""
+        """Read-only compatibility alias for legacy arithmetic block returns.
+
+        The alias is retained for consumers that predate the log-growth rename,
+        but the replay never writes arithmetic returns under a ``log`` name.
+        """
         return self.block_net_returns
 
     def replay_diagnostics(self) -> dict[str, int]:
@@ -123,6 +134,7 @@ class ReplayEvaluation:
             "active_cohorts": int(self.active_cohort_count),
             "observed_sessions": int(self.observed_sessions),
             "missing_realized_cohorts": int(self.missing_realized_cohort_count),
+            "partial_cohorts": int(self.partial_cohort_count),
         }
 
     def to_json(self) -> dict[str, object]:
@@ -134,6 +146,7 @@ class ReplayEvaluation:
             "observed_sessions": int(self.observed_sessions),
             "active_cohort_count": int(self.active_cohort_count),
             "missing_realized_cohort_count": int(self.missing_realized_cohort_count),
+            "partial_cohort_count": int(self.partial_cohort_count),
             "period_net_returns": [
                 float(value) for value in self.period_net_returns
             ],
@@ -177,6 +190,7 @@ class NetAlphaPolicyReplay:
         realized: pl.DataFrame | None = None,
         *,
         decision_time: datetime | None = None,
+        segment_column: str | None = None,
     ) -> ReplayEvaluation:
         """Evaluate the scored OOF panel through the common policy.
 
@@ -192,6 +206,12 @@ class NetAlphaPolicyReplay:
                 planning and returns no realized blocks.
             decision_time: optional decision time gate for point-in-time
                 availability.
+            segment_column: optional OOF segment identity column. When present,
+                the ordinal session index restarts at every segment and no
+                cohort is ever formed across segment boundaries; trailing
+                partial cohorts are excluded and counted per segment. When
+                absent the replay is equivalent to one single segment
+                (continuous holdout, paper, and live behavior).
 
         Returns:
             An immutable ``ReplayEvaluation`` with deterministic ``orders``.
@@ -235,8 +255,25 @@ class NetAlphaPolicyReplay:
 
         portfolio = self._portfolio
         sessions = sorted(scored[_SESSION].unique().to_list())
-        session_index = {session: i for i, session in enumerate(sessions)}
         cohort_size = max(1, int(self._horizon_sessions))
+
+        session_segment: dict[object, tuple[int, int]] = {}
+        if segment_column is not None:
+            if segment_column not in scored.columns:
+                raise ValueError(
+                    f"segment column {segment_column!r} missing from scored panel"
+                )
+            for segment_key, frame in scored.partition_by(
+                segment_column, maintain_order=True, as_dict=True
+            ).items():
+                segment = int(segment_key[0])
+                for local_pos, session in enumerate(
+                    sorted(frame[_SESSION].unique().to_list())
+                ):
+                    session_segment[session] = (segment, local_pos)
+        else:
+            for i, session in enumerate(sessions):
+                session_segment[session] = (0, i)
 
         orders: list[PolicyOrder] = []
         decision_sessions: list[int] = []
@@ -249,9 +286,33 @@ class NetAlphaPolicyReplay:
                 _SESSION, maintain_order=True, as_dict=True
             ).items()
         }
-        for session in sessions:
-            position = session_index[session]
-            cohort = position // cohort_size
+        cohort_counter = -1
+        current_group: tuple[int, int] | None = None
+        current_segment = 0
+        cohort_start = 0
+        cohort_members_sessions: list[object] = []
+        cohort_groups: list[tuple[int, int, int, int, list[object]]] = []
+        for position, session in enumerate(sessions):
+            segment, local_pos = session_segment[session]
+            group = (segment, local_pos // cohort_size)
+            if group != current_group:
+                if current_group is not None:
+                    cohort_groups.append(
+                        (
+                            cohort_counter,
+                            current_segment,
+                            cohort_start,
+                            position,
+                            cohort_members_sessions,
+                        )
+                    )
+                cohort_counter += 1
+                current_group = group
+                current_segment = segment
+                cohort_start = position
+                cohort_members_sessions = []
+            cohort_members_sessions.append(session)
+            cohort = cohort_counter
             cross = by_session[session].sort(
                 [economic_score, _ID], descending=[True, False]
             )
@@ -281,6 +342,16 @@ class NetAlphaPolicyReplay:
             if cohort_orders:
                 cohort_weights.setdefault(cohort, []).extend(cohort_orders)
                 decision_sessions.append(position)
+        if current_group is not None:
+            cohort_groups.append(
+                (
+                    cohort_counter,
+                    current_segment,
+                    cohort_start,
+                    len(sessions),
+                    cohort_members_sessions,
+                )
+            )
 
         scored_session_count = len(sessions)
         active_session_count = len(decision_sessions)
@@ -299,14 +370,18 @@ class NetAlphaPolicyReplay:
         blocks = []
         active_cohort_count = 0
         missing_realized_cohorts = 0
-        complete_cohorts = scored_session_count // cohort_size
-        for cohort in range(complete_cohorts):
+        cohort_metadata: list[tuple[int, int, int]] = []
+        complete_groups = [
+            cohort_group for cohort_group in cohort_groups if len(cohort_group[4]) == cohort_size
+        ]
+        partial_cohort_count = len(cohort_groups) - len(complete_groups)
+        for cohort_group in complete_groups:
+            cohort, segment, start, end, cohort_sessions = cohort_group
             members = cohort_weights.get(cohort, [])
             if not members:
-                start = cohort * cohort_size
-                cohort_sessions = sessions[start : start + cohort_size]
                 if all(s in realized_sessions for s in cohort_sessions):
                     period_returns.append(0.0)
+                    cohort_metadata.append((segment, start, end))
                 else:
                     missing_realized_cohorts += 1
                 continue
@@ -333,8 +408,12 @@ class NetAlphaPolicyReplay:
                     net_return=float(np.mean(growth)),
                     order_count=len(growth),
                     notional=float(sum(order.order_size for order in members)),
+                    segment_id=segment,
+                    cohort_start=start,
+                    cohort_end=end,
                 )
             )
+            cohort_metadata.append((segment, start, end))
 
         return ReplayEvaluation(
             orders=tuple(orders),
@@ -349,6 +428,8 @@ class NetAlphaPolicyReplay:
             realized_sessions=len(realized_sessions),
             eligible_sessions=eligible_sessions,
             active_sessions=active_session_count,
+            partial_cohort_count=partial_cohort_count,
+            cohort_metadata=tuple(cohort_metadata),
         )
 
     def _allocate(self, scores: np.ndarray) -> np.ndarray:
