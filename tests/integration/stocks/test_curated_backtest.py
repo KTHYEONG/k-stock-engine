@@ -16,7 +16,10 @@ from src.stocks.ml.contracts import NetAlphaTrainingRequest
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.trading.portfolio_constructor import StockRiskPolicy
 from src.stocks.workflows.contracts import SimulationRequest
-from src.stocks.workflows.simulate_portfolio import simulate_portfolio
+from src.stocks.workflows.simulate_portfolio import (
+    artifact_policy_profile,
+    simulate_portfolio,
+)
 from src.stocks.workflows.train_model import train_model
 from src.stocks.workflows.trading_cycle import CycleStatus, TradingCycleRequest, run_trading_cycle
 from src.storage.parquet_datasets import ParquetDatasetStore
@@ -124,14 +127,24 @@ def test_curated_dataset_trains_and_simulates_in_plan_mode(curated) -> None:
     )
     assert model_manifest.feature_set == "stock_net_alpha_v1"
 
-    result = simulate_portfolio(
-        net_alpha_snapshot,
-        registry,
-        SimulationRequest(
+    policy_profile = artifact_policy_profile(registry, "stock_net_alpha_curated")
+    if policy_profile is not None:
+        request = SimulationRequest(
             artifact_id="stock_net_alpha_curated",
             decision_time=datetime(2024, 4, 9, 0, 0, tzinfo=UTC),
-        ),
-    )
+            top_k=int(policy_profile["top_k"]),
+            max_single_weight=float(policy_profile["max_single_weight"]),
+            max_exposure=float(policy_profile["max_exposure"]),
+            participation_limit=float(policy_profile["participation_limit"]),
+            policy_profile_id=str(policy_profile["profile_id"]),
+            no_trade_band_bps=float(policy_profile["no_trade_band_bps"]),
+        )
+    else:
+        request = SimulationRequest(
+            artifact_id="stock_net_alpha_curated",
+            decision_time=datetime(2024, 4, 9, 0, 0, tzinfo=UTC),
+        )
+    result = simulate_portfolio(net_alpha_snapshot, registry, request)
     assert result.ledger
     for row in result.ledger:
         assert (
