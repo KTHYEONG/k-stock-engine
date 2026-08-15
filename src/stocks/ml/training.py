@@ -17,9 +17,10 @@ never recomputed. No Optuna, confirmation worker, LambdaRank route, or fixed
 """
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 
 import numpy as np
@@ -35,7 +36,10 @@ from src.stocks.ml.contracts import (
     HorizonOOFDiagnostic,
     NetAlphaResearchData,
     NetAlphaTrainingRequest,
+    PolicyProfile,
     RegularizationGrid,
+    RiskSettings,
+    policy_portfolio_fingerprint,
 )
 from src.stocks.ml.features import (
     apply_model_feature_schema,
@@ -66,7 +70,11 @@ from src.stocks.ml.models import (
     NetAlphaModelConfig,
     fit_weighted_elastic_path,
 )
-from src.stocks.ml.replay import NetAlphaPolicyReplay, ReplayEvaluation
+from src.stocks.ml.replay import (
+    NetAlphaPolicyReplay,
+    ReplayEvaluation,
+    ReplaySegmentDiagnostic,
+)
 from src.stocks.ml.result_ledger import peak_rss_mib as _peak_rss_mib
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.research.calibration_schedule import SessionClusterCalibrationSchedule
@@ -127,18 +135,26 @@ class TrainingTelemetry:
 class HorizonDiscovery:
     """Immutable outcome of per-horizon OOF discovery.
 
-    ``evidence`` are the horizons that cleared the fold-coverage, cohort, and
-    Rank-IC pre-gates; ``diagnostics`` retain the typed per-horizon OOF
-    diagnostics for every candidate horizon, published under ``oof_diagnostics``
-    in ``NO_TRADE`` metrics. ``oof_by_horizon`` retains each candidate's scored
-    OOF frame and realized join in process memory so the selected baseline is
-    never refit; ``path_evaluation_count`` is the discovery optimizer
-    invocation bound ``m * F * (I + 1)``.
+    ``evidence`` are the ``(horizon, profile)`` candidates that cleared the
+    fold-coverage, cohort, missing-realized, and Rank-IC pre-gates;
+    ``diagnostics`` retain the typed per-horizon OOF diagnostics for every
+    candidate horizon, published under ``oof_diagnostics`` in ``NO_TRADE``
+    metrics. ``oof_by_horizon`` retains each candidate's calibrated OOF frame
+    and realized join in process memory so the selected policy is never refit;
+    ``dropout_reasons`` maps every ``(horizon, profile)`` candidate to its
+    deterministic pre-gate reason (empty when admitted), and
+    ``segment_diagnostics_by_candidate`` retains the bounded per-segment
+    replay diagnostics for every evaluated candidate. ``path_evaluation_count``
+    is the discovery optimizer invocation bound ``m * F * (I + 1)``.
     """
 
     evidence: tuple[HorizonOOFEvidence, ...]
     diagnostics: tuple[HorizonOOFDiagnostic, ...]
     oof_by_horizon: Mapping[int, tuple[pl.DataFrame, pl.DataFrame, list[float]]]
+    dropout_reasons: Mapping[tuple[int, str], str] = field(default_factory=dict)
+    segment_diagnostics_by_candidate: Mapping[
+        tuple[int, str], tuple[ReplaySegmentDiagnostic, ...]
+    ] = field(default_factory=dict)
     path_evaluation_count: int = 0
     path_evaluation_bound: int = 0
 
@@ -291,13 +307,36 @@ def train_net_alpha_model(
         n_bootstrap=request.bootstrap_resamples,
     )
     telemetry.phase(
+        "policy_frontier",
+        {
+            "candidate_count": len(discovery.evidence),
+            "candidate_bound": 2 * len(request.candidate_horizon_sessions),
+            "profile_ids": [p.profile_id for p in request.policy_profiles],
+            "dropout_reasons": {
+                f"{horizon}:{profile}": reason
+                for (horizon, profile), reason in sorted(
+                    discovery.dropout_reasons.items()
+                )
+            },
+            "segment_sums": _segment_summaries(
+                discovery.segment_diagnostics_by_candidate,
+                selection.primary_profile_id,
+            ),
+        },
+    )
+    telemetry.phase(
         "primary_selection",
         {
             "adjusted_lower_growth": {
-                int(horizon): {path: float(bound) for path, bound in paths.items()}
-                for horizon, paths in selection.adjusted_lower_growth.items()
+                f"{horizon}:{profile}": {
+                    path: float(bound) for path, bound in paths.items()
+                }
+                for (horizon, profile), paths in sorted(
+                    selection.adjusted_lower_growth.items()
+                )
             },
             "primary_horizon_sessions": selection.primary_horizon_sessions,
+            "primary_profile_id": selection.primary_profile_id,
             "selection_reasons": list(selection.selection_reasons),
             "rankability_reason": selection.rankability_reason,
         },
@@ -311,6 +350,20 @@ def train_net_alpha_model(
         )
 
     primary = selection.primary_horizon_sessions
+    profile = next(
+        (
+            candidate
+            for candidate in request.policy_profiles
+            if candidate.profile_id == selection.primary_profile_id
+        ),
+        None,
+    )
+    if profile is None:
+        return _publish_no_trade(
+            registry, request, frame, "selected-profile-not-in-frontier",
+            schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+            telemetry=telemetry,
+        )
     label_frame = data.labels_by_horizon[primary]
     if TARGET_COLUMN not in label_frame.columns:
         return _publish_no_trade(
@@ -332,14 +385,31 @@ def train_net_alpha_model(
     baseline_oof, baseline_labels, baseline_ics, baseline_diag = _discovery_oof(
         discovery, primary, folds
     )
+    baseline_evidence = next(
+        (
+            candidate
+            for candidate in discovery.evidence
+            if candidate.horizon_sessions == primary
+            and candidate.profile_id == profile.profile_id
+        ),
+        None,
+    )
+    if baseline_evidence is None:
+        return _publish_no_trade(
+            registry, request, frame, "selected-profile-evidence-missing",
+            details=selection.to_json(),
+            schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+            telemetry=telemetry,
+        )
 
     rankability_reason = _rankability_gate(
-        baseline_diag, discovery, primary, selection, request
+        baseline_diag, baseline_evidence, selection, request
     )
     selected_model_type, challenger_failure_reason, oof, oof_labels, fold_rank_ic, oof_diag = (
         _adopt_model_family(
             pre_holdout, folds, data, request, base_manifest, learner_columns,
-            primary, baseline_oof, baseline_labels, baseline_ics, baseline_diag,
+            primary, profile, selection,
+            baseline_oof, baseline_labels, baseline_ics, baseline_diag,
             rankability_reason,
         )
     )
@@ -367,12 +437,12 @@ def train_net_alpha_model(
             telemetry=telemetry,
         )
 
+    risk = replace(request.risk, no_trade_band_bps=profile.no_trade_band_bps)
     calibrated = _causal_oof_calibrate(oof, oof_labels, request, primary)
-
     replay = NetAlphaPolicyReplay(
         horizon_sessions=primary,
         portfolio=request.portfolio,
-        risk=request.risk,
+        risk=risk,
         cost_schedule=request.base_cost_schedule or default_base_schedule(),
         liquidity_model=request.liquidity_model,
         seed=request.seed,
@@ -413,7 +483,7 @@ def train_net_alpha_model(
     else:
         calibration = _empty_causal_calibration(request, primary)
     holdout_evidence = _evaluate_forward_holdout(
-        final_model, calibration, holdout_panel, request, primary,
+        final_model, calibration, holdout_panel, request, primary, profile,
     )
     holdout_order_count = holdout_evidence.get("order_count", 0)
     holdout_block_count = holdout_evidence.get("block_count", 0)
@@ -443,7 +513,13 @@ def train_net_alpha_model(
     if passed:
         holdout_from, holdout_to = _eligibility(holdout_panel)
         manifest = replace(
-            manifest, eligible_from=holdout_from, eligible_to=holdout_to
+            manifest,
+            eligible_from=holdout_from,
+            eligible_to=holdout_to,
+            params={
+                **dict(manifest.params or {}),
+                "policy_profile": _policy_profile_params(request, profile),
+            },
         )
     registry.publish(model, manifest)
     if passed:
@@ -465,17 +541,19 @@ def train_net_alpha_model(
         request.artifact_id,
         _build_metrics(
             request, evaluation, fold_rank_ic, selection, manifest,
+            profile=profile,
             holdout_evidence=holdout_evidence,
             telemetry=telemetry,
             discovery=discovery,
         ),
     )
     logger.info(
-        "published %s artifact %s (promoted=%s, horizon=%s, model=%s)",
+        "published %s artifact %s (promoted=%s, horizon=%s, profile=%s, model=%s)",
         "champion" if passed else "NO_TRADE",
         request.artifact_id,
         passed,
         primary,
+        profile.profile_id,
         manifest.model_type,
     )
     return manifest
@@ -828,16 +906,22 @@ def _fold_alpha_metadata(diagnostic: HorizonOOFDiagnostic) -> dict[str, object]:
     return {}
 
 
-def _per_session_log_growth(period_returns: tuple[float, ...], horizon: int) -> tuple[float, ...]:
-    """Complete-cohort per-session log growth ``log1p(r) / horizon``."""
+def _per_session_log_growth(period_returns: tuple[float, ...]) -> tuple[float, ...]:
+    """Evaluated-vintage per-session log growth ``log1p(r)``.
+
+    Every decision session is one overlapping holding vintage, so each period
+    return is already a per-session observation and no horizon division is
+    applied; the overlapping h-day dependency is preserved by the bootstrap
+    block length floor in ``horizons.select_horizons``.
+    """
     growth: list[float] = []
     for value in period_returns:
         if not np.isfinite(value) or value <= -1.0:
             raise ValueError(
-                f"non-finite or degenerate cohort return {value!r} cannot "
+                f"non-finite or degenerate vintage return {value!r} cannot "
                 "form a per-session log growth"
             )
-        growth.append(float(np.log1p(value)) / horizon)
+        growth.append(float(np.log1p(value)))
     return tuple(growth)
 
 
@@ -846,12 +930,19 @@ def _replay_costs(
     oof_labels: pl.DataFrame,
     request: NetAlphaTrainingRequest,
     horizon_sessions: int,
+    risk: RiskSettings,
 ) -> tuple[ReplayEvaluation, ReplayEvaluation]:
-    """Base and stress policy replay over the same segment-identified OOF panel."""
+    """Base and stress policy replay over the same segment-identified OOF panel.
+
+    Base and stress share the identical frozen calibrated scores, orders, and
+    maturity timeline; only the effective cost/liquidity schedule changes. The
+    segment diagnostics must therefore be identical, and a divergence raises
+    ``ValueError`` because the timeline invariant is part of the contract.
+    """
     base_replay = NetAlphaPolicyReplay(
         horizon_sessions=horizon_sessions,
         portfolio=request.portfolio,
-        risk=request.risk,
+        risk=risk,
         cost_schedule=request.base_cost_schedule or default_base_schedule(),
         liquidity_model=request.liquidity_model,
         seed=request.seed + horizon_sessions,
@@ -859,7 +950,7 @@ def _replay_costs(
     stress_replay = NetAlphaPolicyReplay(
         horizon_sessions=horizon_sessions,
         portfolio=request.portfolio,
-        risk=request.risk,
+        risk=risk,
         cost_schedule=request.stress_cost_schedule or default_stress_schedule(),
         liquidity_model=request.stress_liquidity_model or request.liquidity_model,
         seed=request.seed + horizon_sessions,
@@ -870,43 +961,51 @@ def _replay_costs(
     stress_evaluation = stress_replay.evaluate(
         calibrated, oof_labels, segment_column=_OOF_SEGMENT
     )
+    if base_evaluation.segment_diagnostics != stress_evaluation.segment_diagnostics:
+        raise ValueError(
+            "base and stress replay timelines diverged; order/maturity must "
+            "be identical apart from the cost schedule"
+        )
     return base_evaluation, stress_evaluation
 
 
 def _evidence_from_evaluation(
     horizon_sessions: int,
+    profile_id: str,
     model_family: str,
     base_evaluation: ReplayEvaluation,
     stress_evaluation: ReplayEvaluation,
     fold_rank_ics: tuple[float, ...],
     segment_count: int,
 ) -> HorizonOOFEvidence:
-    """Build a candidate's base/stress cohort evidence from its replays."""
+    """Build a candidate's base/stress vintage evidence from its replays."""
     base_growth = _per_session_log_growth(
-        tuple(base_evaluation.period_net_returns), horizon_sessions
+        tuple(base_evaluation.period_net_returns)
     )
     stress_growth = _per_session_log_growth(
-        tuple(stress_evaluation.period_net_returns), horizon_sessions
+        tuple(stress_evaluation.period_net_returns)
     )
-    segments = tuple(meta[0] for meta in base_evaluation.cohort_metadata)
+    segments = tuple(base_evaluation.vintage_segment_ids)
     if len(segments) != len(base_growth):
         raise ValueError(
-            "cohort metadata and period returns diverged for horizon "
+            "vintage segment ids and period returns diverged for horizon "
             f"{horizon_sessions}"
         )
     complete = (
-        base_evaluation.period_count + base_evaluation.missing_realized_cohort_count
+        base_evaluation.observed_sessions
+        + base_evaluation.missing_realized_vintage_count
     )
     return HorizonOOFEvidence(
         horizon_sessions=horizon_sessions,
+        profile_id=profile_id,
         model_family=model_family,
         base_log_growth=base_growth,
         stress_log_growth=stress_growth,
         cohort_segment_ids=segments,
         complete_cohort_count=complete,
-        active_cohort_count=base_evaluation.active_cohort_count,
-        partial_cohort_count=base_evaluation.partial_cohort_count,
-        missing_cohort_count=base_evaluation.missing_realized_cohort_count,
+        active_cohort_count=base_evaluation.matured_vintage_count,
+        partial_cohort_count=base_evaluation.partial_vintage_count,
+        missing_cohort_count=base_evaluation.missing_realized_vintage_count,
         segment_count=segment_count,
         fold_rank_ics=fold_rank_ics,
     )
@@ -922,12 +1021,14 @@ def _coverage_failure_reason(
             f"incomplete-segment-coverage:{distinct_segments}/"
             f"{evidence.segment_count}"
         )
+    if evidence.missing_cohort_count > 0:
+        return f"missing-realized-vintages:{evidence.missing_cohort_count}"
     if not evidence.fold_rank_ics:
         return "no-usable-fold-rank-ic"
     positive = sum(1 for value in evidence.fold_rank_ics if value > 0.0)
     if positive <= len(evidence.fold_rank_ics) / 2:
         return f"rank-ic-majority-not-positive:{positive}/{len(evidence.fold_rank_ics)}"
-    observed = int(evidence.complete_cohort_count) * evidence.horizon_sessions
+    observed = int(evidence.complete_cohort_count)
     if observed < request.compounding.min_observed_sessions:
         return (
             f"insufficient-observed-sessions:{observed}/"
@@ -950,21 +1051,27 @@ def _build_horizon_evidence(
     request: NetAlphaTrainingRequest,
     learner_columns: tuple[str, ...],
 ) -> HorizonDiscovery:
-    """Per-horizon OOF cohort evidence from purged model predictions only.
+    """Build the two-profile ``(horizon, profile)`` OOF frontier.
 
     Future labels are never a discovery score: every candidate reuses the one
     maximum-horizon balanced fold plan, each fold fits the weighted ElasticNet
     baseline on its train rows only, validation rows are predicted target-free
     with the segment identity preserved, joined to decimal realized outcomes
-    after prediction, causally calibrated, and replayed under base and stress
-    costs. A horizon contributes evidence only when every segment contributes a
-    complete cohort, a strict majority of usable folds has positive session-mean
-    Rank-IC, and the compounding coverage gates pass. Independent horizon
-    universes are never inner-joined.
+    after prediction, causally calibrated once per horizon, and replayed under
+    base and stress costs for every pre-registered policy profile (no learner
+    is ever refit per profile). A ``(horizon, profile)`` candidate contributes
+    evidence only when every segment contributes an evaluated vintage, no
+    realized vintage is missing, a strict majority of usable folds has positive
+    session-mean Rank-IC, and the compounding coverage gates pass. Independent
+    horizon universes are never inner-joined.
     """
     evidence: list[HorizonOOFEvidence] = []
     diagnostics: list[HorizonOOFDiagnostic] = []
     oof_by_horizon: dict[int, tuple[pl.DataFrame, pl.DataFrame, list[float]]] = {}
+    dropout_reasons: dict[tuple[int, str], str] = {}
+    segment_diagnostics_by_candidate: dict[
+        tuple[int, str], tuple[ReplaySegmentDiagnostic, ...]
+    ] = {}
     path_evaluation_count = 0
     for horizon in sorted(data.labels_by_horizon):
         label_frame = data.labels_by_horizon[horizon]
@@ -989,45 +1096,53 @@ def _build_horizon_evidence(
         path_evaluation_count += fold_path_count
         diagnostics.append(diagnostic)
         if oof.is_empty() or oof_labels.is_empty():
+            for profile in request.policy_profiles:
+                dropout_reasons[(horizon, profile.profile_id)] = (
+                    "no-oof-labels"
+                )
             continue
         calibrated = _causal_oof_calibrate(oof, oof_labels, request, horizon)
-        try:
-            base_evaluation, stress_evaluation = _replay_costs(
-                calibrated, oof_labels, request, horizon
+        oof_by_horizon[horizon] = (calibrated, oof_labels, ics)
+        for profile in request.policy_profiles:
+            risk = replace(
+                request.risk, no_trade_band_bps=profile.no_trade_band_bps
             )
-        except ValueError as exc:
-            diagnostics[-1] = replace(
-                diagnostic,
-                failure_reason=(
+            try:
+                base_evaluation, stress_evaluation = _replay_costs(
+                    calibrated, oof_labels, request, horizon, risk
+                )
+            except ValueError as exc:
+                dropout_reasons[(horizon, profile.profile_id)] = (
                     f"replay-error:{type(exc).__name__}:{exc}"
-                ),
+                )
+                continue
+            if not base_evaluation.period_net_returns:
+                dropout_reasons[(horizon, profile.profile_id)] = (
+                    "no-evaluated-vintages"
+                )
+                continue
+            candidate_evidence = _evidence_from_evaluation(
+                horizon, profile.profile_id, "net_alpha_elastic_net",
+                base_evaluation, stress_evaluation, tuple(ics), len(folds),
             )
-            continue
-        complete_cohorts = (
-            base_evaluation.period_count
-            + base_evaluation.missing_realized_cohort_count
-        )
-        if complete_cohorts == 0:
-            diagnostics[-1] = replace(
-                diagnostic, failure_reason="no-complete-cohorts"
+            segment_diagnostics_by_candidate[(horizon, profile.profile_id)] = (
+                base_evaluation.segment_diagnostics
             )
-            continue
-        candidate_evidence = _evidence_from_evaluation(
-            horizon, "net_alpha_elastic_net", base_evaluation, stress_evaluation,
-            tuple(ics), len(folds),
-        )
-        failure_reason = _coverage_failure_reason(candidate_evidence, request)
-        if failure_reason:
-            diagnostics[-1] = replace(diagnostic, failure_reason=failure_reason)
-            continue
-        evidence.append(candidate_evidence)
-        oof_by_horizon[horizon] = (oof, oof_labels, ics)
+            failure_reason = _coverage_failure_reason(candidate_evidence, request)
+            dropout_reasons[(horizon, profile.profile_id)] = failure_reason
+            if failure_reason:
+                continue
+            evidence.append(candidate_evidence)
     return HorizonDiscovery(
         evidence=tuple(evidence),
         diagnostics=tuple(diagnostics),
         oof_by_horizon=oof_by_horizon,
+        dropout_reasons=dropout_reasons,
+        segment_diagnostics_by_candidate=segment_diagnostics_by_candidate,
         path_evaluation_count=path_evaluation_count,
-        path_evaluation_bound=len(diagnostics) * len(folds) * (_NESTED_INNER_FOLDS + 1),
+        path_evaluation_bound=(
+            len(diagnostics) * len(folds) * (_NESTED_INNER_FOLDS + 1)
+        ),
     )
 
 
@@ -1036,7 +1151,8 @@ def _discovery_oof(
     primary_horizon_sessions: int,
     folds: list[Fold],
 ) -> tuple[pl.DataFrame, pl.DataFrame, list[float], HorizonOOFDiagnostic]:
-    """Reuse the discovery baseline OOF; the selected primary is never refit."""
+    """Reuse the discovery calibrated OOF; the selected primary is never refit."""
+    del folds
     cached = discovery.oof_by_horizon.get(primary_horizon_sessions)
     if cached is None:
         raise ValueError(
@@ -1059,29 +1175,21 @@ def _discovery_oof(
 
 def _rankability_gate(
     baseline_diag: HorizonOOFDiagnostic,
-    discovery: HorizonDiscovery,
-    primary: int,
+    evidence: HorizonOOFEvidence,
     selection: HorizonSelectionEvidence,
     request: NetAlphaTrainingRequest,
 ) -> str:
     """Cheap linear rankability gate before any LightGBM fit.
 
-    The nonlinear challenger may run for at most one horizon and only when the
-    linear screen has a non-constant prediction, a positive Holm-adjusted
-    session-mean Rank-IC lower bound, and positive base-cost point growth.
+    The nonlinear challenger may run for at most one ``(horizon, profile)`` and
+    only when the linear screen has a non-constant prediction, a positive
+    Holm-adjusted session-mean Rank-IC lower bound, and positive base-cost point
+    growth on the selected profile's evidence.
     """
     if not baseline_diag.fold_score_stds or all(
         std <= 0.0 for std in baseline_diag.fold_score_stds
     ):
         return "challenger-skipped:no-rankability-evidence:constant-score"
-    evidence = next(
-        (
-            candidate
-            for candidate in discovery.evidence
-            if candidate.horizon_sessions == primary
-        ),
-        None,
-    )
     if evidence is None or not evidence.fold_rank_ics:
         return "challenger-skipped:no-rankability-evidence:no-fold-rank-ic"
     rank_ic_series = tuple(evidence.fold_rank_ics)
@@ -1090,6 +1198,8 @@ def _rankability_gate(
         return "challenger-skipped:no-rankability-evidence:non-positive-rank-ic-bound"
     if float(np.mean(evidence.base_log_growth)) <= 0.0:
         return "challenger-skipped:no-rankability-evidence:non-positive-base-growth"
+    if selection.primary_profile_id is None:
+        return "challenger-skipped:no-rankability-evidence:no-selected-profile"
     return ""
 
 
@@ -1585,6 +1695,8 @@ def _adopt_model_family(
     base_manifest: ModelManifest,
     learner_columns: tuple[str, ...],
     primary_horizon_sessions: int,
+    profile: PolicyProfile,
+    selection: HorizonSelectionEvidence,
     baseline_oof: pl.DataFrame,
     baseline_labels: pl.DataFrame,
     baseline_ics: list[float],
@@ -1594,11 +1706,13 @@ def _adopt_model_family(
     """Conditionally adopt the LightGBM challenger on the selected primary.
 
     The challenger is eligible only when the linear screen is rankable. It
-    replaces the baseline only when its stress-cost annualized log-growth lower
-    bound is strictly positive after including the model-family comparison in
-    multiplicity control. Otherwise the ElasticNet baseline remains. A skipped
-    challenger on a non-rankable screen is a ``NO_TRADE`` signal.
+    replaces the baseline only when its stress-cost adjusted lower growth
+    strictly improves the selected profile's baseline stress adjusted lower
+    growth at the same Holm threshold (the challenger must beat the exact
+    policy that was selected). Otherwise the ElasticNet baseline remains. A
+    skipped challenger on a non-rankable screen is a ``NO_TRADE`` signal.
     """
+    profile_key = (primary_horizon_sessions, profile.profile_id)
     if rankability_reason:
         return (
             "net_alpha_elastic_net",
@@ -1617,9 +1731,11 @@ def _adopt_model_family(
     challenger_calibrated = _causal_oof_calibrate(
         challenger_oof, challenger_labels, request, primary_horizon_sessions
     )
+    risk = replace(request.risk, no_trade_band_bps=profile.no_trade_band_bps)
     try:
         _base_eval, stress_eval = _replay_costs(
-            challenger_calibrated, challenger_labels, request, primary_horizon_sessions
+            challenger_calibrated, challenger_labels, request,
+            primary_horizon_sessions, risk,
         )
     except ValueError as exc:
         return (
@@ -1628,20 +1744,27 @@ def _adopt_model_family(
             baseline_oof, baseline_labels, baseline_ics, baseline_diag,
         )
     stress_growth = _per_session_log_growth(
-        tuple(stress_eval.period_net_returns), primary_horizon_sessions
+        tuple(stress_eval.period_net_returns)
     )
     from src.stocks.ml.horizons import _cohort_bootstrap
 
+    stress_threshold = selection.stress_holm_thresholds.get(
+        profile_key, request.bootstrap_alpha
+    )
+    baseline_stress_lower = selection.adjusted_lower_growth.get(
+        profile_key, {}
+    ).get("stress", 0.0)
     bootstrap = _cohort_bootstrap(
         stress_growth,
-        tuple(meta[0] for meta in stress_eval.cohort_metadata),
+        tuple(stress_eval.vintage_segment_ids),
         request.bootstrap_resamples,
         request.seed + primary_horizon_sessions,
+        min_block_length=primary_horizon_sessions,
     )
     if bootstrap is None:
         return "net_alpha_elastic_net", "", baseline_oof, baseline_labels, baseline_ics, baseline_diag
-    adjusted_stress_lower = bootstrap.lower_mean(request.bootstrap_alpha / 2.0)
-    if adjusted_stress_lower > 0.0:
+    adjusted_stress_lower = bootstrap.lower_mean(stress_threshold)
+    if adjusted_stress_lower > baseline_stress_lower:
         return (
             "net_alpha_lightgbm_l1",
             "",
@@ -1770,24 +1893,27 @@ def _evaluate_forward_holdout(
     holdout_panel: pl.DataFrame,
     request: NetAlphaTrainingRequest,
     horizon_sessions: int,
+    profile: PolicyProfile,
 ) -> dict[str, object]:
     """Evaluate the untouched forward holdout under base and stress costs.
 
     The locked holdout is scored target-free once by the pre-holdout model and
     the fitted calibration attaches the decimal lower bound. The identical
     calibrated frame is then replayed under the base and stress cost schedules
-    (with their matching liquidity models) and the compound certificate gates
-    promotion. No-trade diagnosis is kept separate from missing realized
-    evidence, and no gate is ever relaxed after observing the holdout.
+    (with their matching liquidity models) and the selected policy profile's
+    no-trade band, and the compound certificate gates promotion. No-trade
+    diagnosis is kept separate from missing realized evidence, and no gate is
+    ever relaxed after observing the holdout.
     """
     if holdout_panel.is_empty():
         return {"passed": False, "reason": "holdout-has-no-realized"}
     scored = model.predict(holdout_panel)
     calibrated = calibration.apply(scored)
+    risk = replace(request.risk, no_trade_band_bps=profile.no_trade_band_bps)
     base_replay = NetAlphaPolicyReplay(
         horizon_sessions=horizon_sessions,
         portfolio=request.portfolio,
-        risk=request.risk,
+        risk=risk,
         cost_schedule=request.base_cost_schedule or default_base_schedule(),
         liquidity_model=request.liquidity_model,
         seed=request.seed,
@@ -1795,7 +1921,7 @@ def _evaluate_forward_holdout(
     stress_replay = NetAlphaPolicyReplay(
         horizon_sessions=horizon_sessions,
         portfolio=request.portfolio,
-        risk=request.risk,
+        risk=risk,
         cost_schedule=request.stress_cost_schedule or default_stress_schedule(),
         liquidity_model=request.stress_liquidity_model or request.liquidity_model,
         seed=request.seed,
@@ -1814,8 +1940,8 @@ def _evaluate_forward_holdout(
         request.compounding,
     )
     missing_realized = (
-        base_evaluation.missing_realized_cohort_count
-        or stress_evaluation.missing_realized_cohort_count
+        base_evaluation.missing_realized_vintage_count
+        or stress_evaluation.missing_realized_vintage_count
     )
     if missing_realized > 0:
         reason = "holdout-incomplete-realized-cohorts"
@@ -1843,7 +1969,7 @@ def _evaluate_forward_holdout(
             "period_count": base_evaluation.period_count,
             "observed_sessions": base_evaluation.observed_sessions,
             "active_cohort_count": base_evaluation.active_cohort_count,
-            "missing_realized_cohorts": base_evaluation.missing_realized_cohort_count,
+            "missing_realized_cohorts": base_evaluation.missing_realized_vintage_count,
         },
         "diagnostics": {
             "base": base_evaluation.replay_diagnostics(),
@@ -1954,6 +2080,29 @@ def _publish_no_trade(
     return manifest
 
 
+def _policy_profile_params(
+    request: NetAlphaTrainingRequest, profile: PolicyProfile
+) -> str:
+    """JSON projection of the selected immutable policy profile for the manifest."""
+    return json.dumps(
+        {
+            "profile_id": profile.profile_id,
+            "no_trade_band_bps": profile.no_trade_band_bps,
+            "top_k": request.portfolio.top_k,
+            "max_single_weight": request.portfolio.max_single_weight,
+            "max_exposure": request.portfolio.max_exposure,
+            "participation_limit": request.portfolio.participation_limit,
+            "portfolio_fingerprint": policy_portfolio_fingerprint(
+                request.portfolio.top_k,
+                request.portfolio.max_single_weight,
+                request.portfolio.max_exposure,
+                request.portfolio.participation_limit,
+            ),
+        },
+        sort_keys=True,
+    )
+
+
 def _build_metrics(
     request: NetAlphaTrainingRequest,
     evaluation: object,
@@ -1961,6 +2110,7 @@ def _build_metrics(
     selection: HorizonSelectionEvidence,
     manifest: ModelManifest,
     *,
+    profile: PolicyProfile,
     holdout_evidence: dict[str, object],
     telemetry: TrainingTelemetry,
     discovery: HorizonDiscovery,
@@ -1971,17 +2121,36 @@ def _build_metrics(
         return float(np.expm1(annualization * lower_growth))
 
     adjusted_lower_cagr = {
-        int(horizon): {
+        f"{horizon}:{profile_id}": {
             path: annualized_cagr(bound)
             for path, bound in paths.items()
         }
-        for horizon, paths in selection.adjusted_lower_growth.items()
+        for (horizon, profile_id), paths in selection.adjusted_lower_growth.items()
     }
+    segment_sums = _segment_summaries(
+        discovery.segment_diagnostics_by_candidate, selection.primary_profile_id,
+    )
     return {
         "promoted": manifest.model_type != "no_trade",
         "no_trade": manifest.model_type == "no_trade",
         "model_type": manifest.model_type,
         "primary_horizon_sessions": selection.primary_horizon_sessions,
+        "primary_profile_id": selection.primary_profile_id,
+        "selected_profile": {
+            "profile_id": profile.profile_id,
+            "no_trade_band_bps": profile.no_trade_band_bps,
+        },
+        "policy_frontier": {
+            "candidate_count": len(discovery.evidence),
+            "profile_ids": [p.profile_id for p in request.policy_profiles],
+            "dropout_reasons": {
+                f"{horizon}:{profile_id}": reason
+                for (horizon, profile_id), reason in sorted(
+                    discovery.dropout_reasons.items()
+                )
+            },
+            "segment_sums": segment_sums,
+        },
         "mean_fold_rank_ic": float(np.mean(fold_rank_ic)) if fold_rank_ic else 0.0,
         "horizon_selection": selection.to_json(),
         "adjusted_lower_cagr": adjusted_lower_cagr,
@@ -2000,3 +2169,45 @@ def _build_metrics(
         },
         "run_observability": telemetry.to_dict(),
     }
+
+
+def _segment_summaries(
+    diagnostics_by_candidate: Mapping[tuple[int, str], tuple[ReplaySegmentDiagnostic, ...]],
+    selected_profile_id: str | None,
+) -> dict[str, object]:
+    """Bounded per-segment sums for the selected profile's frontier candidate.
+
+    Only the candidate selected under ``selected_profile_id`` is projected as
+    ``"h<horizon>:<profile>:<segment>"`` entries carrying the bounded vintage
+    counts and active fractions; no score or return array is ever emitted.
+    """
+    summaries: dict[str, object] = {}
+    for (horizon, profile_id), diagnostics in sorted(
+        diagnostics_by_candidate.items()
+    ):
+        if selected_profile_id is not None and profile_id != selected_profile_id:
+            continue
+        for diagnostic in diagnostics:
+            summaries[
+                f"h{horizon}:{profile_id}:s{diagnostic.segment_id}"
+            ] = {
+                "scored_sessions": int(diagnostic.scored_sessions),
+                "calibration_ready_sessions": int(
+                    diagnostic.calibration_ready_sessions
+                ),
+                "eligible_sessions": int(diagnostic.eligible_sessions),
+                "active_sessions": int(diagnostic.active_sessions),
+                "matured_vintages": int(diagnostic.matured_vintage_count),
+                "cash_vintages": int(diagnostic.cash_vintage_count),
+                "missing_realized_vintages": int(
+                    diagnostic.missing_realized_vintage_count
+                ),
+                "partial_vintages": int(diagnostic.partial_vintage_count),
+                "base_active_fraction": round(
+                    float(diagnostic.base_active_fraction), 12
+                ),
+                "stress_active_fraction": round(
+                    float(diagnostic.stress_active_fraction), 12
+                ),
+            }
+    return summaries
