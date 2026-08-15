@@ -311,6 +311,10 @@ def _build_schema(retained_cap: int) -> dict[str, object]:
             "observability": {
                 "phases": "bounded phase samples",
                 "horizons": "per-candidate admission and fold diagnostics",
+                "summary": (
+                    "bounded fold/cohort/multiplicity/operation-count/schema "
+                    "diagnostics; never raw arrays"
+                ),
                 "replay": "aggregate period-return summary",
                 "holdout": (
                     "compound certificate (base/stress CAGR, lower CAGR, MDD, "
@@ -705,6 +709,53 @@ def _project_holdout(metrics: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+def _bounded_observability_summary(
+    telemetry: Mapping[str, object],
+) -> dict[str, object]:
+    """Project bounded fold/cohort/multiplicity/operation/schema diagnostics.
+
+    Scans the terminal telemetry phases for the bounded scalars the redesigned
+    trainer publishes (schema fingerprint, path counts, fold geometry, cohort
+    completeness, adjusted evidence, challenger reason) and never extracts raw
+    score, label, order, or return arrays.
+    """
+    phases = telemetry.get("phases")
+    if not isinstance(phases, list):
+        return {}
+    by_name: dict[str, Mapping[str, object]] = {}
+    for phase in phases:
+        if isinstance(phase, dict) and isinstance(phase.get("name"), str):
+            by_name[str(phase["name"])] = phase
+    summary: dict[str, object] = {}
+    feature = by_name.get("feature_transform", {})
+    if isinstance(feature.get("schema_fingerprint"), str):
+        summary["schema_fingerprint"] = feature["schema_fingerprint"]
+    discovery = by_name.get("horizon_discovery", {})
+    for key in (
+        "path_evaluation_count",
+        "path_evaluation_bound",
+        "evidence_horizons",
+        "diagnostics_count",
+    ):
+        if key in discovery:
+            summary[key] = discovery[key]
+    selection = by_name.get("primary_selection", {})
+    if "primary_horizon_sessions" in selection:
+        summary["primary_horizon_sessions"] = selection["primary_horizon_sessions"]
+    if "rankability_reason" in selection:
+        summary["rankability_reason"] = selection["rankability_reason"]
+    comparison = by_name.get("model_comparison", {})
+    if "selected_model_type" in comparison:
+        summary["selected_model_type"] = comparison["selected_model_type"]
+        summary["challenger_failure_reason"] = comparison.get(
+            "challenger_failure_reason", ""
+        )
+    sanitized = _sanitize_deep(summary)
+    if not isinstance(sanitized, dict):
+        return {}
+    return {str(key): value for key, value in sanitized.items()}
+
+
 def _observability_from(
     metrics: Mapping[str, object], telemetry: Mapping[str, object] | None
 ) -> dict[str, object]:
@@ -712,14 +763,16 @@ def _observability_from(
         return {
             "phases": list(telemetry.get("phases") or []),
             "horizons": list(telemetry.get("horizons") or []),
+            "summary": _bounded_observability_summary(telemetry),
         }
     run_obs = metrics.get("run_observability")
     if isinstance(run_obs, dict):
         return {
             "phases": list(run_obs.get("phases") or []),
             "horizons": list(run_obs.get("horizons") or []),
+            "summary": _bounded_observability_summary(run_obs),
         }
-    return {"phases": [], "horizons": []}
+    return {"phases": [], "horizons": [], "summary": {}}
 
 
 def _project_completed(
@@ -748,6 +801,7 @@ def _project_completed(
         "observability": {
             "phases": _sanitize_deep(observability.get("phases")),
             "horizons": _sanitize_deep(observability.get("horizons")),
+            "summary": _sanitize_deep(observability.get("summary")),
             "replay": _project_replay(metrics),
             "holdout": _project_holdout(metrics),
         },
@@ -787,6 +841,7 @@ def _project_failed(
         "observability": {
             "phases": _sanitize_deep(phases),
             "horizons": [],
+            "summary": {},
             "replay": {},
             "holdout": {},
         },
@@ -819,12 +874,13 @@ def _project_reconcile_record(
         eligible_to=str(manifest_json.get("eligible_to") or ""),
         model_type=model_type,
     )
-    observability: dict[str, object] = {"phases": [], "horizons": []}
+    observability: dict[str, object] = {"phases": [], "horizons": [], "summary": {}}
     run_obs = metrics.get("run_observability")
     if isinstance(run_obs, dict):
         observability = {
             "phases": list(run_obs.get("phases") or []),
             "horizons": list(run_obs.get("horizons") or []),
+            "summary": _bounded_observability_summary(run_obs),
         }
     return {
         "schema_version": SCHEMA_VERSION,
@@ -843,6 +899,7 @@ def _project_reconcile_record(
         "observability": {
             "phases": _sanitize_deep(observability["phases"]),
             "horizons": _sanitize_deep(observability["horizons"]),
+            "summary": _sanitize_deep(observability["summary"]),
             "replay": _project_replay(metrics),
             "holdout": _project_holdout(metrics),
         },
