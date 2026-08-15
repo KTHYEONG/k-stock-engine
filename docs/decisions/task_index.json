@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_ML_HORIZON_EFFICIENCY_REDESIGN",
+      "date": "2026-08-15",
+      "adr_id": "ADR_20260815_STOCK_ML_HORIZON_EFFICIENCY_REDESIGN",
+      "domain": "stocks",
+      "title": "Stock ML horizon evidence and training efficiency redesign",
+      "why": "The six-candidate net-alpha run spent 95.76% of 136.6 seconds in horizon discovery, used severely imbalanced OOF folds, and produced a false positive h20 bootstrap lower bound because seven 20-session cohorts were resampled as one block; strict replay then rejected all horizons.",
+      "resolution": "Implemented holdout-safe feature schema handling, balanced maximum-horizon purged folds, segment-local complete cohorts, annualized base/stress cohort-unit bootstrap with Holm-Bonferroni admission, session-balanced weighted learning, vectorized ElasticNet paths, baseline OOF reuse, and one rankability-gated challenger with bounded observability.",
+      "impact": "OOF evidence and compound-growth claims are now calendar-, cost-, and multiplicity-valid; discovery optimizer invocations are bounded from 234 fits to 72 path evaluations for the current request, while invalid evidence remains explicit NO_TRADE."
+    },
+    {
       "task_id": "TASK_CLEANUP_TMP_LOGS",
       "date": "2026-08-15",
       "adr_id": "ADR_20260815_CLEANUP_TMP_LOGS",
