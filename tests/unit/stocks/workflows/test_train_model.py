@@ -1,24 +1,31 @@
 """Net-alpha mainline training workflow tests.
 
-Covers the transformed-frame training, horizon selection, forward holdout, and
-complete ``NO_TRADE`` evidence contract of the canonical ``stock_net_alpha_v1``
-workflow. The legacy LambdaRank/Optuna v2 path is not part of this suite.
+Covers the transformed-frame training, causal horizon selection, decimal
+realized-outcome replay, untouched forward holdout, calibration persistence,
+and complete ``NO_TRADE`` evidence contract of the canonical
+``stock_net_alpha_v1`` workflow. The legacy LambdaRank/Optuna v2 path is not
+part of this suite.
 """
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 import polars as pl
 import pytest
 
+from src.core.instruments import AssetKind
 from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.ml.contracts import NetAlphaTrainingRequest
+from src.stocks.ml.features import build_model_features, stock_net_alpha_v1_roles
 from src.stocks.research.artifacts import (
     METRICS_FILENAME,
     ModelArtifactRegistry,
+    PredictionRequest,
 )
 from src.stocks.workflows.train_model import train_model
 from tests.fixtures.stocks.helpers import (
+    stock_liquidity_model,
     stock_net_alpha_composed_df,
     stock_net_alpha_manifest,
 )
@@ -27,7 +34,12 @@ from tests.fixtures.stocks.helpers import (
 def _snapshot(
     n_sessions: int = 160, n_tickers: int = 8
 ) -> tuple[DatasetSnapshot, pl.DataFrame]:
-    df = stock_net_alpha_composed_df(n_sessions=n_sessions, n_tickers=n_tickers)
+    df = stock_net_alpha_composed_df(
+        n_sessions=n_sessions,
+        n_tickers=n_tickers,
+        audit_clean=True,
+        label_scale=50.0,
+    )
     manifest = stock_net_alpha_manifest(columns=df.columns)
     return DatasetSnapshot(manifest=manifest, frame=df), df
 
@@ -38,9 +50,21 @@ def _request(artifact_id: str, **kwargs) -> NetAlphaTrainingRequest:
         "fold_count": 2,
         "candidate_horizon_sessions": (3, 5, 8, 10, 15, 20),
         "bootstrap_resamples": 50,
+        "liquidity_model": stock_liquidity_model(),
     }
     defaults.update(kwargs)
     return NetAlphaTrainingRequest(**defaults)
+
+
+def _feature_frame(df: pl.DataFrame) -> pl.DataFrame:
+    """Build the canonical learner frame exactly as the trainer consumes it."""
+    drops = [
+        c
+        for c in df.columns
+        if c.startswith(("net_alpha_", "label_available_time_", "risk_residual_", "reference_cost_"))
+    ]
+    features, _ = build_model_features(df.drop(drops), dict(stock_net_alpha_v1_roles()))
+    return features
 
 
 def test_train_net_alpha_publishes_artifact_or_no_trade(tmp_path) -> None:
@@ -55,10 +79,39 @@ def test_train_net_alpha_publishes_artifact_or_no_trade(tmp_path) -> None:
         "no_trade",
     }
     assert manifest.eligible_from == df["session"].min().isoformat()
+    if manifest.model_type != "no_trade":
+        stored = json.loads(
+            (tmp_path / "artifacts" / "na_mainline" / "manifest.json").read_text()
+        )
+        assert "calibration_state" in stored["params"]
+        loaded = registry.load(
+            manifest.artifact_id,
+            PredictionRequest(
+                asset_kind=AssetKind.STOCK,
+                feature_set=manifest.feature_set,
+                feature_schema_hash=manifest.feature_schema_hash,
+                decision_time=datetime(2024, 6, 1, tzinfo=UTC),
+            ),
+        ).model
+        scored = loaded.predict(_feature_frame(df))
+        assert "predicted_net_alpha" in scored.columns
+        assert "net_alpha_lower_bound" in scored.columns
+        with pytest.raises(ValueError, match="rejects target"):
+            loaded.predict(
+                _feature_frame(df).with_columns(pl.lit(0.0).alias("net_alpha_target"))
+            )
+        holdout = registry.read_forward_holdout(manifest.artifact_id)
+        assert holdout is not None
+        assert holdout.get("evidence", {}).get("passed") is True
 
 
 def test_train_net_alpha_writes_complete_no_trade_evidence(tmp_path) -> None:
-    snapshot, _df = _snapshot()
+    df = stock_net_alpha_composed_df(
+        n_sessions=160, n_tickers=8, audit_clean=True, label_scale=0.0
+    )
+    snapshot = DatasetSnapshot(
+        manifest=stock_net_alpha_manifest(columns=df.columns), frame=df
+    )
     artifact_root = tmp_path / "artifacts"
     registry = ModelArtifactRegistry(artifact_root)
     train_model(snapshot, registry, _request("na_no_trade"))
@@ -124,10 +177,13 @@ def test_train_net_alpha_v3_publishes_no_trade_without_positive_evidence(
 ) -> None:
     """The net-alpha path fails closed to a complete NO_TRADE artifact.
 
-    A snapshot with no positive horizon lower bound must publish ``no_trade``
-    with complete evidence rather than relax a gate.
+    A snapshot with genuinely non-positive evidence (zero-signal labels that
+    still satisfy the integrity audit and carry realized outcomes) must publish
+    ``no_trade`` with complete evidence rather than relax a gate.
     """
-    df = stock_net_alpha_composed_df(n_sessions=120, n_tickers=8, seed=3)
+    df = stock_net_alpha_composed_df(
+        n_sessions=120, n_tickers=8, audit_clean=True, label_scale=0.0
+    )
     manifest = stock_net_alpha_manifest(columns=df.columns)
     registry = ModelArtifactRegistry(tmp_path / "artifacts")
     snapshot = DatasetSnapshot(manifest=manifest, frame=df)
@@ -139,6 +195,30 @@ def test_train_net_alpha_v3_publishes_no_trade_without_positive_evidence(
     )
     assert metrics["no_trade"] is True
     assert metrics["promoted"] is False
+
+
+def test_train_net_alpha_missing_realized_outcomes_fail_closed(tmp_path) -> None:
+    """Missing decimal realized outcomes raise, never silently become NO_TRADE.
+
+    A snapshot whose label frames carry targets but no ``risk_residual`` /
+    ``reference_cost`` realized outcome columns violates the replay schema and
+    must fail closed with ``ValueError`` instead of degrading into an empty
+    block list that looks like a genuine no-trade.
+    """
+    df = stock_net_alpha_composed_df(
+        n_sessions=120, n_tickers=8, audit_clean=True, label_scale=50.0
+    )
+    realized_drops = [
+        c
+        for c in df.columns
+        if c.startswith(("risk_residual_", "reference_cost_"))
+    ]
+    df = df.drop(realized_drops)
+    manifest = stock_net_alpha_manifest(columns=df.columns)
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    snapshot = DatasetSnapshot(manifest=manifest, frame=df)
+    with pytest.raises(ValueError, match="realized-outcome"):
+        train_model(snapshot, registry, _request("na_missing_realized"))
 
 
 def test_train_net_alpha_model_types_are_canonical(tmp_path) -> None:
