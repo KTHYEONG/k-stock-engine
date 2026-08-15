@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 import numpy as np
@@ -27,8 +27,11 @@ from src.stocks.data.ml_integrity import validate_ml_snapshot
 from src.stocks.data.quality import KRXSessionCalendar
 from src.stocks.ml.contracts import (
     CANONICAL_FEATURE_SET,
+    FoldScoreDiagnostic,
+    HorizonOOFDiagnostic,
     NetAlphaResearchData,
     NetAlphaTrainingRequest,
+    RegularizationGrid,
 )
 from src.stocks.ml.features import (
     build_model_features,
@@ -41,6 +44,7 @@ from src.stocks.ml.horizons import (
     select_horizons,
 )
 from src.stocks.ml.labels import (
+    AVAILABLE_COLUMN,
     REALIZED_RETURN_COLUMN,
     REFERENCE_COST_COLUMN,
     RISK_RESIDUAL_COLUMN,
@@ -50,13 +54,16 @@ from src.stocks.ml.labels import (
 from src.stocks.ml.models import (
     SCORE_COLUMN,
     CalibratedNetAlphaModel,
+    CalibrationApplier,
+    CausalCalibrationAdapter,
     ElasticNetNetAlpha,
     LightGbmNetAlpha,
-    NetAlphaCalibrator,
     NetAlphaModelConfig,
 )
 from src.stocks.ml.replay import NetAlphaPolicyReplay
 from src.stocks.research.artifacts import ModelArtifactRegistry
+from src.stocks.research.calibration_schedule import SessionClusterCalibrationSchedule
+from src.stocks.research.economic_alpha import CausalAlphaCalibrator
 from src.stocks.research.folds import Fold, PurgedWalkForward
 from src.stocks.research.models import Model, ModelManifest
 
@@ -67,6 +74,23 @@ _SESSION_IDX = "session_index"
 _MIN_TRAIN_SESSIONS = 40
 _VALIDATION_BLOCK_SESSIONS = 20
 _REFERENCE_NOTIONAL = 100_000_000.0
+_NESTED_INNER_FOLDS = 3
+_NESTED_MIN_TRAIN_SESSIONS = 5
+_ALPHA_TIE_TOLERANCE = 1e-12
+
+
+@dataclass(frozen=True, slots=True)
+class HorizonDiscovery:
+    """Immutable outcome of per-horizon OOF discovery.
+
+    ``evidence`` are the horizons that cleared the three-nonzero-block and
+    positive-lower-bound gates; ``diagnostics`` retain the typed per-horizon
+    OOF diagnostics for every candidate horizon, published under
+    ``oof_diagnostics`` in ``NO_TRADE`` metrics.
+    """
+
+    evidence: tuple[HorizonOOFEvidence, ...]
+    diagnostics: tuple[HorizonOOFDiagnostic, ...]
 
 
 def train_net_alpha_model(
@@ -135,17 +159,18 @@ def train_net_alpha_model(
             schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
         )
 
-    horizon_evidence = _build_horizon_evidence(
+    discovery = _build_horizon_evidence(
         pre_holdout, frame, data, request, learner_columns
     )
-    if not horizon_evidence:
+    if not discovery.evidence:
         return _publish_no_trade(
             registry, request, frame, "no-horizon-evidence",
+            details={"oof_diagnostics": [d.to_json() for d in discovery.diagnostics]},
             schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
         )
 
     selection = select_horizons(
-        tuple(horizon_evidence), request.bootstrap_alpha, request.seed,
+        discovery.evidence, request.bootstrap_alpha, request.seed,
         n_bootstrap=request.bootstrap_resamples,
     )
     if selection.primary_horizon_sessions is None:
@@ -156,6 +181,14 @@ def train_net_alpha_model(
         )
 
     primary = selection.primary_horizon_sessions
+    primary_family = next(
+        (
+            candidate.model_family
+            for candidate in discovery.evidence
+            if candidate.horizon_sessions == primary
+        ),
+        "net_alpha_elastic_net",
+    )
     label_frame = data.labels_by_horizon[primary]
     if TARGET_COLUMN not in label_frame.columns:
         return _publish_no_trade(
@@ -189,37 +222,59 @@ def train_net_alpha_model(
     base_manifest = _base_manifest(
         request, data, frame, primary
     )
-    baseline_oof, baseline_labels, baseline_ics = _baseline_oof(
-        pre_holdout, folds, data, request, base_manifest, learner_columns,
-        primary,
-    )
-    challenger_oof, challenger_labels, challenger_ics = _challenger_oof(
-        pre_holdout, folds, data, request, base_manifest, learner_columns,
-        primary,
-    )
-    selected_model_type = _challenger_if_better(
-        baseline_oof, baseline_labels, challenger_oof, challenger_labels,
-        request, primary,
-    )
-    if selected_model_type == "net_alpha_lightgbm_l1":
-        oof, oof_labels, fold_rank_ic = (
-            challenger_oof, challenger_labels, challenger_ics
+    if primary_family == "net_alpha_lightgbm_l1":
+        # The primary's discovery evidence came from the baseline structural
+        # fallback, so the challenger is the producing family: refit it and
+        # skip the ordinary baseline-vs-challenger comparison.
+        selected_model_type = "net_alpha_lightgbm_l1"
+        oof, oof_labels, fold_rank_ic, oof_diag = _challenger_oof(
+            pre_holdout, folds, data, request, base_manifest, learner_columns,
+            primary,
         )
+        if oof.is_empty() or not fold_rank_ic:
+            return _publish_no_trade(
+                registry, request, frame, "baseline-oof-failed",
+                details={"oof_diagnostics": [oof_diag.to_json()]},
+                schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+            )
     else:
-        oof, oof_labels, fold_rank_ic = baseline_oof, baseline_labels, baseline_ics
-    if oof.is_empty() or not fold_rank_ic:
-        return _publish_no_trade(
-            registry, request, frame, "baseline-oof-failed",
-            schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+        baseline_oof, baseline_labels, baseline_ics, baseline_diag = _baseline_oof(
+            pre_holdout, folds, data, request, base_manifest, learner_columns,
+            primary,
         )
+        challenger_oof, challenger_labels, challenger_ics, _ = _challenger_oof(
+            pre_holdout, folds, data, request, base_manifest, learner_columns,
+            primary,
+        )
+        selected_model_type, challenger_failure_reason = _challenger_if_better(
+            baseline_oof, baseline_labels, challenger_oof, challenger_labels,
+            request, primary,
+        )
+        if selected_model_type == "net_alpha_lightgbm_l1":
+            oof, oof_labels, fold_rank_ic = (
+                challenger_oof, challenger_labels, challenger_ics
+            )
+            oof_diag = HorizonOOFDiagnostic(
+                horizon_sessions=primary,
+                model_family="net_alpha_lightgbm_l1",
+                failure_reason="",
+            )
+        else:
+            oof, oof_labels, fold_rank_ic = baseline_oof, baseline_labels, baseline_ics
+            oof_diag = baseline_diag
+        if challenger_failure_reason:
+            oof_diag = replace(
+                oof_diag,
+                failure_reason=challenger_failure_reason,
+            )
+        if oof.is_empty() or not fold_rank_ic:
+            return _publish_no_trade(
+                registry, request, frame, "baseline-oof-failed",
+                details={"oof_diagnostics": [oof_diag.to_json()]},
+                schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+            )
 
-    calibrator = _fit_calibrator(oof_labels, request, primary, seed=request.seed)
-    if calibrator is None:
-        return _publish_no_trade(
-            registry, request, frame, "calibration-failed",
-            schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
-        )
-    calibrated = calibrator.apply(oof)
+    calibrated = _causal_oof_calibrate(oof, oof_labels, request, primary)
 
     replay = NetAlphaPolicyReplay(
         horizon_sessions=primary,
@@ -249,8 +304,15 @@ def train_net_alpha_model(
         on=[_ID_COLUMN, SESSION_COLUMN],
         how="inner",
     )
+    holdout_sessions = sorted(holdout_panel[SESSION_COLUMN].unique().to_list())
+    if holdout_sessions:
+        calibration = _freeze_causal_calibration(
+            oof_labels, request, primary, holdout_sessions[0],
+        )
+    else:
+        calibration = _empty_causal_calibration(request, primary)
     holdout_evidence = _evaluate_forward_holdout(
-        final_model, calibrator, holdout_panel, request, primary,
+        final_model, calibration, holdout_panel, request, primary,
     )
 
     passed = (
@@ -260,7 +322,7 @@ def train_net_alpha_model(
     )
     model: Model
     if passed:
-        model = CalibratedNetAlphaModel(final_model, calibrator)
+        model = CalibratedNetAlphaModel(final_model, calibration)
     else:
         model = _no_trade_model(
             base_manifest, learner_columns, TARGET_COLUMN
@@ -333,22 +395,6 @@ def _locked_holdout(
     return pre_holdout, holdout, ""
 
 
-def _baseline_factory(
-    base_manifest: ModelManifest,
-    learner_columns: tuple[str, ...],
-    request: NetAlphaTrainingRequest,
-) -> Callable[[], ElasticNetNetAlpha]:
-    def factory() -> ElasticNetNetAlpha:
-        return ElasticNetNetAlpha(
-            base_manifest,
-            learner_columns,
-            TARGET_COLUMN,
-            config=NetAlphaModelConfig(seed=request.seed),
-        )
-
-    return factory
-
-
 def _challenger_factory(
     base_manifest: ModelManifest,
     learner_columns: tuple[str, ...],
@@ -366,24 +412,209 @@ def _challenger_factory(
     return factory
 
 
+def _score_is_constant(values: np.ndarray) -> bool:
+    """True when every finite value is equal (a degenerate prediction)."""
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return True
+    return bool(np.all(finite == finite[0]))
+
+
+def _standardized_design(
+    frame: pl.DataFrame, learner_columns: tuple[str, ...]
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Fold-standardized Float32 design and its finite-valid mask.
+
+    Mirrors ``ElasticNetNetAlpha.fit`` preprocessing so the nested alpha_max
+    and the actual fold fit see the identical standardized design. Returns
+    ``None`` when any learner column is missing.
+    """
+    missing = [c for c in learner_columns if c not in frame.columns]
+    if missing:
+        return None
+    from src.stocks.ml.models import _float32_matrix
+
+    features = _float32_matrix(frame, learner_columns)
+    valid = np.isfinite(features).all(axis=1)
+    if not valid.any():
+        return features, valid
+    sub = features[valid]
+    mean = sub.mean(axis=0)
+    std = sub.std(axis=0)
+    std[std == 0.0] = 1.0
+    return (features - mean) / std, valid
+
+
+def _compute_alpha_max(
+    train_slice: pl.DataFrame,
+    learner_columns: tuple[str, ...],
+    fraction: float,
+    seed: int,
+) -> tuple[float, float] | None:
+    """Scale-invariant absolute ElasticNet penalty for one training slice.
+
+    ``alpha_max = max(abs(X.T @ y_centered)) / n`` on the fold-standardized
+    design; the candidate absolute alpha is ``fraction * alpha_max``. Returns
+    ``(alpha, alpha_max)`` or ``None`` when the slice has no usable rows.
+    """
+    del seed
+    if TARGET_COLUMN not in train_slice.columns:
+        return None
+    standardized = _standardized_design(train_slice, learner_columns)
+    if standardized is None:
+        return None
+    features, valid = standardized
+    targets = train_slice[TARGET_COLUMN].cast(pl.Float64).to_numpy()
+    centered = targets - float(np.mean(targets))
+    keep = valid & np.isfinite(centered)
+    if not keep.any():
+        return None
+    x = features[keep]
+    y = centered[keep]
+    n = x.shape[0]
+    alpha_max = float(np.max(np.abs(x.T @ y))) / n
+    if not np.isfinite(alpha_max) or alpha_max <= 0.0:
+        return None
+    return fraction * alpha_max, alpha_max
+
+
+def _best_fraction(
+    candidates: tuple[float, ...], ics: dict[float, list[float]]
+) -> float:
+    """Largest mean nested rank IC; a tie within 1e-12 picks the stronger penalty."""
+    best = candidates[0]
+    best_ic = float(np.mean(ics[best]))
+    for fraction in candidates[1:]:
+        ic = float(np.mean(ics[fraction]))
+        if ic > best_ic + _ALPHA_TIE_TOLERANCE or (
+            abs(ic - best_ic) <= _ALPHA_TIE_TOLERANCE and fraction > best
+        ):
+            best, best_ic = fraction, ic
+    return best
+
+
+def _select_elastic_alpha(
+    fold_train: pl.DataFrame,
+    request: NetAlphaTrainingRequest,
+    learner_columns: tuple[str, ...],
+    horizon_sessions: int,
+    grid: RegularizationGrid,
+    manifest: ModelManifest,
+) -> tuple[float | None, float | None, float | None]:
+    """Fold-local, scale-invariant ElasticNet penalty selection.
+
+    Uses only the outer fold's purged training rows and nested purged expanding
+    folds. Every fraction is evaluated on its nested validation rank IC; a
+    candidate whose finite predictions are constant in any evaluated inner fold
+    is discarded. Returns ``(selected_alpha, selected_fraction, alpha_max)`` or
+    ``(None, None, None)`` when every candidate is constant or fails.
+    """
+    nested_splitter = PurgedWalkForward(
+        n_folds=request.fold_count,
+        label_horizon_sessions=horizon_sessions,
+        embargo_sessions=request.embargo_sessions,
+        session_column=_SESSION_IDX,
+        min_train_sessions=_NESTED_MIN_TRAIN_SESSIONS,
+    )
+    nested = nested_splitter.inner_folds(fold_train, n_inner=_NESTED_INNER_FOLDS)
+    if not nested:
+        return None, None, None
+    candidate_ics: dict[float, list[float]] = {fraction: [] for fraction in grid.fractions}
+    constant: set[float] = set()
+    alpha_max_by_fraction: dict[float, list[float]] = {
+        fraction: [] for fraction in grid.fractions
+    }
+    for inner in nested:
+        inner_train = fold_train[inner.train_mask]
+        inner_val = fold_train[inner.validation_mask]
+        if inner_train.is_empty() or inner_val.is_empty():
+            continue
+        if TARGET_COLUMN not in inner_train.columns or TARGET_COLUMN not in inner_val.columns:
+            continue
+        for fraction in grid.fractions:
+            computed = _compute_alpha_max(inner_train, learner_columns, fraction, request.seed)
+            if computed is None:
+                continue
+            alpha, alpha_max = computed
+            alpha_max_by_fraction[fraction].append(alpha_max)
+            model = ElasticNetNetAlpha(
+                manifest, learner_columns, TARGET_COLUMN,
+                config=NetAlphaModelConfig(seed=request.seed, elastic_alpha=alpha),
+            )
+            try:
+                model.fit(inner_train, inner_val)
+                predicted = model.predict(inner_val)
+            except ValueError:
+                continue
+            scores = predicted[SCORE_COLUMN].to_numpy().astype(float)
+            if _score_is_constant(scores):
+                constant.add(fraction)
+                continue
+            joined = predicted.join(
+                inner_val.select(
+                    _ID_COLUMN, SESSION_COLUMN, REALIZED_RETURN_COLUMN
+                ),
+                on=[_ID_COLUMN, SESSION_COLUMN],
+                how="inner",
+            )
+            if joined.is_empty():
+                continue
+            candidate_ics[fraction].append(_rank_ic(joined))
+
+    usable = [f for f in grid.fractions if f not in constant and candidate_ics[f]]
+    if usable:
+        best = _best_fraction(tuple(usable), candidate_ics)
+        alpha_max = float(np.mean(alpha_max_by_fraction[best]))
+        return best * alpha_max, best, alpha_max
+    non_constant = [f for f in grid.fractions if f not in constant]
+    if non_constant:
+        # No usable inner fold: pick the stronger (largest) fraction by the
+        # same deterministic order and derive its alpha on the full fold slice.
+        best = max(non_constant)
+        computed = _compute_alpha_max(fold_train, learner_columns, best, request.seed)
+        if computed is None:
+            return None, None, None
+        alpha, alpha_max = computed
+        return alpha, best, alpha_max
+    return None, None, None
+
+
+def _build_label_join(data: NetAlphaResearchData, horizon_sessions: int) -> pl.DataFrame:
+    """Canonical per-horizon label join frame with realized and availability columns."""
+    label_frame = data.labels_by_horizon[horizon_sessions]
+    return label_frame.select(
+        _ID_COLUMN, SESSION_COLUMN, TARGET_COLUMN,
+        AVAILABLE_COLUMN, RISK_RESIDUAL_COLUMN, REFERENCE_COST_COLUMN,
+        "open", "adtv_20d", "volatility_20d",
+    ).with_columns(
+        (pl.col(RISK_RESIDUAL_COLUMN) - pl.col(REFERENCE_COST_COLUMN))
+        .alias(REALIZED_RETURN_COLUMN)
+    )
+
+
 def _build_horizon_evidence(
     pre_holdout: pl.DataFrame,
     frame: pl.DataFrame,
     data: NetAlphaResearchData,
     request: NetAlphaTrainingRequest,
     learner_columns: tuple[str, ...],
-) -> list[HorizonOOFEvidence]:
+) -> HorizonDiscovery:
     """Per-horizon OOF block evidence from purged model predictions only.
 
     Future labels are never a discovery score: for every horizon the
     pre-holdout history is split into purged/embargoed folds, each fold fits
     on its train rows only, validation rows are predicted target-free, the OOF
     predictions are joined to decimal realized outcomes after prediction,
-    cross-calibrated, and replayed through the common policy. A horizon
-    contributes only when it has at least three realized nonzero-order OOF
-    blocks. Independent horizon universes are never inner-joined.
+    causally calibrated, and replayed through the common policy. When the
+    baseline score diagnostics show a constant/invalid OOF prediction, the
+    LightGBM challenger runs as a structural fallback for that horizon and
+    carries its family with the evidence. A horizon contributes only when it
+    has at least three realized nonzero-order OOF blocks. Independent horizon
+    universes are never inner-joined.
     """
     evidence: list[HorizonOOFEvidence] = []
+    diagnostics: list[HorizonOOFDiagnostic] = []
     for horizon in sorted(data.labels_by_horizon):
         label_frame = data.labels_by_horizon[horizon]
         if label_frame.is_empty() or label_frame.height < 3:
@@ -410,16 +641,23 @@ def _build_horizon_evidence(
         folds = splitter.split(pre_holdout)
         if not folds:
             continue
-        oof, oof_labels, _ics = _fit_oof(
+        oof, oof_labels, _ics, diagnostic = _fit_oof(
             pre_holdout, folds, data, request, manifest, learner_columns,
-            horizon, _baseline_factory(manifest, learner_columns, request),
+            horizon, None,
+            family="net_alpha_elastic_net",
         )
+        model_family = "net_alpha_elastic_net"
+        if _score_diagnostics_constant(diagnostic) or oof.is_empty():
+            oof, oof_labels, _ics, diagnostic = _fit_oof(
+                pre_holdout, folds, data, request, manifest, learner_columns,
+                horizon, _challenger_factory(manifest, learner_columns, request),
+                family="net_alpha_lightgbm_l1",
+            )
+            model_family = "net_alpha_lightgbm_l1"
+        diagnostics.append(diagnostic)
         if oof.is_empty() or oof_labels.is_empty():
             continue
-        calibrator = _fit_calibrator(oof_labels, request, horizon, seed=request.seed + horizon)
-        if calibrator is None:
-            continue
-        calibrated = calibrator.apply(oof)
+        calibrated = _causal_oof_calibrate(oof, oof_labels, request, horizon)
         replay = NetAlphaPolicyReplay(
             horizon_sessions=horizon,
             portfolio=request.portfolio,
@@ -430,7 +668,13 @@ def _build_horizon_evidence(
         )
         try:
             evaluation = replay.evaluate(calibrated, oof_labels)
-        except ValueError:
+        except ValueError as exc:
+            diagnostics[-1] = replace(
+                diagnostic,
+                failure_reason=(
+                    f"replay-error:{type(exc).__name__}:{exc}"
+                ),
+            )
             continue
         nonzero_blocks = [b for b in evaluation.blocks if b.order_count > 0]
         if len(nonzero_blocks) < 3:
@@ -439,32 +683,152 @@ def _build_horizon_evidence(
             HorizonOOFEvidence(
                 horizon_sessions=horizon,
                 block_log_excess=tuple(evaluation.block_log_excess),
+                model_family=model_family,
             )
         )
-    return evidence
+    return HorizonDiscovery(evidence=tuple(evidence), diagnostics=tuple(diagnostics))
 
 
-def _fit_calibrator(
-    oof_labels: pl.DataFrame,
-    request: NetAlphaTrainingRequest,
-    horizon_sessions: int,
-    *,
-    seed: int,
-) -> NetAlphaCalibrator | None:
-    """Fit the monotone decimal calibration on OOF predictions."""
-    calibrator = NetAlphaCalibrator(
+def _score_diagnostics_constant(diagnostic: HorizonOOFDiagnostic) -> bool:
+    """True when every fold produced a constant/failed score prediction."""
+    stds = diagnostic.fold_score_stds
+    if not stds:
+        return True
+    return all(std <= 0.0 for std in stds)
+
+
+def _schedule_workspace(request: NetAlphaTrainingRequest) -> int | None:
+    if request.max_rss_mib is None:
+        return None
+    return int(request.max_rss_mib * 1024 * 1024 // 4)
+
+
+def _causal_calibrator(
+    request: NetAlphaTrainingRequest, horizon_sessions: int
+) -> CausalAlphaCalibrator:
+    """Causal session-cluster calibrator on pre-cost ``risk_residual`` outcomes."""
+    return CausalAlphaCalibrator(
         bucket_count=request.risk.calibration_bucket_count,
-        seed=seed,
+        min_calibration_sessions=request.risk.min_calibration_sessions,
+        seed=request.seed + horizon_sessions,
         n_bootstrap=request.bootstrap_resamples,
         bootstrap_alpha=request.bootstrap_alpha,
         block_length=horizon_sessions,
-        label_column=REALIZED_RETURN_COLUMN,
+        label_column=RISK_RESIDUAL_COLUMN,
+        label_available_column=AVAILABLE_COLUMN,
     )
-    try:
-        calibrator.fit(oof_labels)
-    except ValueError:
-        return None
-    return calibrator
+
+
+def _causal_ledger(oof_labels: pl.DataFrame) -> pl.DataFrame:
+    """Finite calibration ledger keyed by ``(session, score, residual, availability)``."""
+    required = (
+        _ID_COLUMN, SESSION_COLUMN, SCORE_COLUMN,
+        RISK_RESIDUAL_COLUMN, AVAILABLE_COLUMN,
+    )
+    missing = [c for c in required if c not in oof_labels.columns]
+    if missing:
+        raise ValueError(f"calibration ledger missing columns {missing}")
+    return (
+        oof_labels.select(*required)
+        .filter(
+            pl.col(SCORE_COLUMN).is_not_null()
+            & pl.col(SCORE_COLUMN).is_finite()
+            & pl.col(RISK_RESIDUAL_COLUMN).is_not_null()
+            & pl.col(RISK_RESIDUAL_COLUMN).is_finite()
+            & pl.col(AVAILABLE_COLUMN).is_not_null()
+        )
+        .rename({SCORE_COLUMN: "score"})
+    )
+
+
+def _causal_oof_calibrate(
+    oof: pl.DataFrame,
+    oof_labels: pl.DataFrame,
+    request: NetAlphaTrainingRequest,
+    horizon_sessions: int,
+) -> pl.DataFrame:
+    """Causal session-cluster calibration applied to OOF scored rows.
+
+    For every OOF decision session ``t`` only ledger rows with ``session < t``
+    and ``label_available_time <= t`` are revealed, honoring
+    ``RiskSettings.min_calibration_sessions``; the frozen state is then applied
+    to that session. A later label can therefore never change an earlier
+    session's calibrated score.
+    """
+    ledger = _causal_ledger(oof_labels)
+    if ledger.is_empty() or oof.is_empty():
+        return _zero_calibrated(oof)
+    calibrator = _causal_calibrator(request, horizon_sessions)
+    schedule = SessionClusterCalibrationSchedule(
+        ledger,
+        calibrator,
+        request.base_cost_schedule or default_base_schedule(),
+        block_length=horizon_sessions,
+        max_workspace_bytes=_schedule_workspace(request),
+    )
+    frames: list[pl.DataFrame] = []
+    for decision_time in sorted(oof[SESSION_COLUMN].unique().to_list()):
+        state = schedule.state_at(decision_time)
+        scored = oof.filter(pl.col(SESSION_COLUMN) == decision_time).rename(
+            {SCORE_COLUMN: "score"}
+        )
+        augmented = CausalAlphaCalibrator.apply_prepared(state, scored)
+        augmented = augmented.drop(
+            "expected_active_alpha", "alpha_lower_bound", "exit_cost_rate"
+        ).with_columns(
+            pl.col("expected_net_alpha").cast(pl.Float64),
+            pl.col("net_alpha_lower_bound").cast(pl.Float64),
+        ).rename({"score": SCORE_COLUMN})
+        frames.append(augmented)
+    if not frames:
+        return _zero_calibrated(oof)
+    return pl.concat(frames)
+
+
+def _zero_calibrated(scored: pl.DataFrame) -> pl.DataFrame:
+    """Cash-only calibration output: zero economic scores, no exception."""
+    return scored.with_columns(
+        pl.lit(0.0, dtype=pl.Float64).alias("expected_net_alpha"),
+        pl.lit(0.0, dtype=pl.Float64).alias("net_alpha_lower_bound"),
+    )
+
+
+def _freeze_causal_calibration(
+    oof_labels: pl.DataFrame,
+    request: NetAlphaTrainingRequest,
+    horizon_sessions: int,
+    decision_time: datetime,
+) -> CausalCalibrationAdapter:
+    """Freeze the causal calibration state at ``decision_time`` from OOF evidence."""
+    ledger = _causal_ledger(oof_labels)
+    calibrator = _causal_calibrator(request, horizon_sessions)
+    schedule = SessionClusterCalibrationSchedule(
+        ledger,
+        calibrator,
+        request.base_cost_schedule or default_base_schedule(),
+        block_length=horizon_sessions,
+        max_workspace_bytes=_schedule_workspace(request),
+    )
+    return CausalCalibrationAdapter(calibrator, schedule.state_at(decision_time))
+
+
+def _empty_causal_calibration(
+    request: NetAlphaTrainingRequest, horizon_sessions: int
+) -> CausalCalibrationAdapter:
+    """Cash-only calibration adapter for an empty holdout panel.
+
+    Used only when the holdout has no realized rows, in which case the holdout
+    gate fails closed; the adapter still emits the public prediction columns
+    with zero economic scores.
+    """
+    state: dict[str, object] = {
+        "bucket_count": int(request.risk.calibration_bucket_count),
+        "history_sessions": 0,
+        "round_trip_cost": 0.0,
+        "exit_cost_rate": 0.0,
+        "buckets": [],
+    }
+    return CausalCalibrationAdapter(_causal_calibrator(request, horizon_sessions), state)
 
 
 def _fit_oof(
@@ -475,42 +839,81 @@ def _fit_oof(
     base_manifest: ModelManifest,
     learner_columns: tuple[str, ...],
     horizon_sessions: int,
-    model_factory: Callable[[], Model],
-) -> tuple[pl.DataFrame, pl.DataFrame, list[float]]:
+    model_factory: Callable[[], Model] | None,
+    *,
+    family: str,
+) -> tuple[pl.DataFrame, pl.DataFrame, list[float], HorizonOOFDiagnostic]:
     """Fit a learner per purged fold and collect target-free OOF predictions.
 
     Each fold trains only on its own train rows (target joined), predicts the
     validation rows with target/availability/realized columns dropped, and the
     resulting OOF predictions are joined to decimal realized outcomes only
-    after prediction. Returns ``(oof_scored, oof_labeled, fold_rank_ics)``.
+    after prediction. The ElasticNet baseline selects a fold-local
+    scale-invariant alpha via nested purged folds. Returns
+    ``(oof_scored, oof_labeled, fold_rank_ics, diagnostic)``; expected invalid
+    inputs are classified in the diagnostic instead of being swallowed.
     """
-    label_frame = data.labels_by_horizon[horizon_sessions]
-    label_join = label_frame.select(
-        _ID_COLUMN, SESSION_COLUMN, TARGET_COLUMN,
-        RISK_RESIDUAL_COLUMN, REFERENCE_COST_COLUMN,
-        "open", "adtv_20d", "volatility_20d",
-    ).with_columns(
-        (pl.col(RISK_RESIDUAL_COLUMN) - pl.col(REFERENCE_COST_COLUMN))
-        .alias(REALIZED_RETURN_COLUMN)
-    )
+    label_join = _build_label_join(data, horizon_sessions)
     oof_frames: list[pl.DataFrame] = []
     label_frames: list[pl.DataFrame] = []
     rank_ics: list[float] = []
-    for fold in folds:
+    fold_diagnostics: list[FoldScoreDiagnostic] = []
+    grid = RegularizationGrid()
+    for fold_index, fold in enumerate(folds):
         train = pre_holdout[fold.train_mask].join(
-            label_join.select(_ID_COLUMN, SESSION_COLUMN, TARGET_COLUMN),
-            on=[_ID_COLUMN, SESSION_COLUMN],
-            how="inner",
+            label_join, on=[_ID_COLUMN, SESSION_COLUMN], how="inner",
         )
         validation = pre_holdout[fold.validation_mask]
         if train.is_empty() or validation.is_empty():
+            fold_diagnostics.append(
+                FoldScoreDiagnostic(fold_index=fold_index, failure_reason="empty-fold")
+            )
             continue
-        model = model_factory()
+        selected_alpha: float | None = None
+        selected_fraction: float | None = None
+        alpha_max: float | None = None
+        if family == "net_alpha_elastic_net":
+            selected_alpha, selected_fraction, alpha_max = _select_elastic_alpha(
+                train, request, learner_columns, horizon_sessions, grid, base_manifest,
+            )
+            if selected_alpha is None:
+                fold_diagnostics.append(
+                    FoldScoreDiagnostic(
+                        fold_index=fold_index, failure_reason="constant-oof-score"
+                    )
+                )
+                continue
+            model: Model = ElasticNetNetAlpha(
+                base_manifest, learner_columns, TARGET_COLUMN,
+                config=NetAlphaModelConfig(
+                    seed=request.seed,
+                    elastic_alpha=selected_alpha,
+                    elastic_alpha_fraction=selected_fraction,
+                    elastic_alpha_max=alpha_max,
+                ),
+            )
+        else:
+            if model_factory is None:
+                raise ValueError("lightgbm OOF requires a model factory")
+            model = model_factory()
         try:
             model.fit(train, validation)
-        except ValueError:
+        except ValueError as exc:
+            fold_diagnostics.append(
+                FoldScoreDiagnostic(
+                    fold_index=fold_index,
+                    alpha=selected_alpha,
+                    fraction=selected_fraction,
+                    alpha_max=alpha_max,
+                    failure_reason=f"fit-error:{type(exc).__name__}:{exc}",
+                )
+            )
             continue
         scored = model.predict(validation)
+        scores = scored[SCORE_COLUMN].to_numpy().astype(float)
+        finite_scores = scores[np.isfinite(scores)]
+        score_std = float(np.std(finite_scores)) if finite_scores.size else 0.0
+        unique_count = int(np.unique(finite_scores).size) if finite_scores.size else 0
         joined = scored.join(
             validation.select(_ID_COLUMN, SESSION_COLUMN, _SESSION_IDX),
             on=[_ID_COLUMN, SESSION_COLUMN],
@@ -518,13 +921,43 @@ def _fit_oof(
         )
         labeled = joined.join(label_join, on=[_ID_COLUMN, SESSION_COLUMN], how="inner")
         if labeled.is_empty():
+            fold_diagnostics.append(
+                FoldScoreDiagnostic(
+                    fold_index=fold_index,
+                    score_std=score_std,
+                    finite_count=int(finite_scores.size),
+                    unique_count=unique_count,
+                    alpha=selected_alpha,
+                    fraction=selected_fraction,
+                    alpha_max=alpha_max,
+                    failure_reason="no-labeled-join",
+                )
+            )
             continue
+        rank_ic = _rank_ic(labeled)
         oof_frames.append(joined)
         label_frames.append(labeled)
-        rank_ics.append(_rank_ic(labeled))
+        rank_ics.append(rank_ic)
+        fold_diagnostics.append(
+            FoldScoreDiagnostic(
+                fold_index=fold_index,
+                score_std=score_std,
+                finite_count=int(finite_scores.size),
+                unique_count=unique_count,
+                rank_ic=rank_ic,
+                alpha=selected_alpha,
+                fraction=selected_fraction,
+                alpha_max=alpha_max,
+            )
+        )
+    diagnostic = HorizonOOFDiagnostic(
+        horizon_sessions=horizon_sessions,
+        model_family=family,
+        fold_diagnostics=tuple(fold_diagnostics),
+    )
     if not oof_frames:
-        return pl.DataFrame(), pl.DataFrame(), []
-    return pl.concat(oof_frames), pl.concat(label_frames), rank_ics
+        return pl.DataFrame(), pl.DataFrame(), [], diagnostic
+    return pl.concat(oof_frames), pl.concat(label_frames), rank_ics, diagnostic
 
 
 def _baseline_oof(
@@ -535,12 +968,12 @@ def _baseline_oof(
     base_manifest: ModelManifest,
     learner_columns: tuple[str, ...],
     primary_horizon_sessions: int,
-) -> tuple[pl.DataFrame, pl.DataFrame, list[float]]:
-    """Deterministic ElasticNet OOF predictions on the selected primary."""
+) -> tuple[pl.DataFrame, pl.DataFrame, list[float], HorizonOOFDiagnostic]:
+    """Deterministic fold-local ElasticNet OOF predictions on the selected primary."""
     return _fit_oof(
         pre_holdout, folds, data, request, base_manifest, learner_columns,
-        primary_horizon_sessions,
-        _baseline_factory(base_manifest, learner_columns, request),
+        primary_horizon_sessions, None,
+        family="net_alpha_elastic_net",
     )
 
 
@@ -552,12 +985,13 @@ def _challenger_oof(
     base_manifest: ModelManifest,
     learner_columns: tuple[str, ...],
     primary_horizon_sessions: int,
-) -> tuple[pl.DataFrame, pl.DataFrame, list[float]]:
+) -> tuple[pl.DataFrame, pl.DataFrame, list[float], HorizonOOFDiagnostic]:
     """Deterministic LightGBM OOF predictions on the selected primary."""
     return _fit_oof(
         pre_holdout, folds, data, request, base_manifest, learner_columns,
         primary_horizon_sessions,
         _challenger_factory(base_manifest, learner_columns, request),
+        family="net_alpha_lightgbm_l1",
     )
 
 
@@ -592,7 +1026,7 @@ def _challenger_if_better(
     challenger_labels: pl.DataFrame,
     request: NetAlphaTrainingRequest,
     primary_horizon_sessions: int,
-) -> str:
+) -> tuple[str, str]:
     """Conditionally adopt the LightGBM challenger on the selected primary.
 
     Both families are OOF-calibrated to decimal lower bounds and replayed;
@@ -601,17 +1035,13 @@ def _challenger_if_better(
     ElasticNet baseline remains.
     """
     if baseline_oof.is_empty() or challenger_oof.is_empty():
-        return "net_alpha_elastic_net"
-    baseline_cal = _fit_calibrator(
-        baseline_labels, request, primary_horizon_sessions, seed=request.seed + 17
+        return "net_alpha_elastic_net", ""
+    baseline_calibrated = _causal_oof_calibrate(
+        baseline_oof, baseline_labels, request, primary_horizon_sessions
     )
-    challenger_cal = _fit_calibrator(
-        challenger_labels, request, primary_horizon_sessions, seed=request.seed + 23
+    challenger_calibrated = _causal_oof_calibrate(
+        challenger_oof, challenger_labels, request, primary_horizon_sessions
     )
-    if baseline_cal is None or challenger_cal is None:
-        return "net_alpha_elastic_net"
-    baseline_calibrated = baseline_cal.apply(baseline_oof)
-    challenger_calibrated = challenger_cal.apply(challenger_oof)
 
     replay = NetAlphaPolicyReplay(
         horizon_sessions=primary_horizon_sessions,
@@ -624,19 +1054,22 @@ def _challenger_if_better(
     try:
         baseline_eval = replay.evaluate(baseline_calibrated, baseline_labels)
         challenger_eval = replay.evaluate(challenger_calibrated, challenger_labels)
-    except ValueError:
-        return "net_alpha_elastic_net"
+    except ValueError as exc:
+        return (
+            "net_alpha_elastic_net",
+            f"challenger-replay-error:{type(exc).__name__}:{exc}",
+        )
 
     baseline_blocks = np.asarray(baseline_eval.block_log_excess, dtype=float)
     challenger_blocks = np.asarray(challenger_eval.block_log_excess, dtype=float)
     if baseline_blocks.size == 0 or challenger_blocks.size == 0:
-        return "net_alpha_elastic_net"
+        return "net_alpha_elastic_net", ""
     length = min(baseline_blocks.size, challenger_blocks.size)
     incremental = challenger_blocks[:length] - baseline_blocks[:length]
     lower_bound = float(np.quantile(incremental, request.bootstrap_alpha))
     if lower_bound > 0.0:
-        return "net_alpha_lightgbm_l1"
-    return "net_alpha_elastic_net"
+        return "net_alpha_lightgbm_l1", ""
+    return "net_alpha_elastic_net", ""
 
 
 def _base_manifest(
@@ -684,9 +1117,13 @@ def _refit_selected(
     selected_model_type: str,
 ) -> Model | None:
     """Refit the single selected family on all pre-holdout history only."""
-    label_frame = data.labels_by_horizon[primary_horizon_sessions]
+    label_join = _build_label_join(data, primary_horizon_sessions)
     train = pre_holdout.join(
-        label_frame.select(_ID_COLUMN, SESSION_COLUMN, TARGET_COLUMN),
+        label_join.select(
+            _ID_COLUMN, SESSION_COLUMN, TARGET_COLUMN,
+            AVAILABLE_COLUMN, RISK_RESIDUAL_COLUMN, REFERENCE_COST_COLUMN,
+            REALIZED_RETURN_COLUMN,
+        ),
         on=[_ID_COLUMN, SESSION_COLUMN],
         how="inner",
     )
@@ -701,11 +1138,22 @@ def _refit_selected(
             num_threads=request.model_threads,
         )
     else:
+        selected_alpha, selected_fraction, alpha_max = _select_elastic_alpha(
+            train, request, learner_columns, primary_horizon_sessions,
+            RegularizationGrid(), base_manifest,
+        )
+        if selected_alpha is None:
+            return None
         model = ElasticNetNetAlpha(
             base_manifest,
             learner_columns,
             TARGET_COLUMN,
-            config=NetAlphaModelConfig(seed=request.seed),
+            config=NetAlphaModelConfig(
+                seed=request.seed,
+                elastic_alpha=selected_alpha,
+                elastic_alpha_fraction=selected_fraction,
+                elastic_alpha_max=alpha_max,
+            ),
         )
     try:
         model.fit(train, train.head(0))
@@ -716,7 +1164,7 @@ def _refit_selected(
 
 def _evaluate_forward_holdout(
     model: Model,
-    calibration: NetAlphaCalibrator,
+    calibration: CalibrationApplier,
     holdout_panel: pl.DataFrame,
     request: NetAlphaTrainingRequest,
     horizon_sessions: int,
@@ -820,16 +1268,20 @@ def _publish_no_trade(
         "net_alpha",
     )
     registry.publish(model, manifest)
-    registry.write_metrics(
-        request.artifact_id,
-        {
-            "promoted": False,
-            "no_trade": True,
-            "model_type": "no_trade",
-            "promotion_reasons": [f"{reason}:{details}".rstrip(":")],
-            "gates": {"passed": False},
-        },
-    )
+    metrics: dict[str, object] = {
+        "promoted": False,
+        "no_trade": True,
+        "model_type": "no_trade",
+        "promotion_reasons": (
+            [reason]
+            if isinstance(details, dict)
+            else [f"{reason}:{details}".rstrip(":")]
+        ),
+        "gates": {"passed": False},
+    }
+    if isinstance(details, dict):
+        metrics.update(details)
+    registry.write_metrics(request.artifact_id, metrics)
     logger.info("published NO_TRADE artifact %s (%s)", request.artifact_id, reason)
     return manifest
 
