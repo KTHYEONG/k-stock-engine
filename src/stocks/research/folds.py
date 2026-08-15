@@ -82,11 +82,16 @@ class PurgedWalkForward:
 
     def _row_index(self, samples: pl.DataFrame) -> tuple[list[int], dict[int, list[int]]]:
         self._validate_no_duplicate_sessions(samples)
-        rows = samples.with_row_index("__row_idx").to_dicts()
+        indexed = samples.with_row_index("__row_idx").select(
+            self.session_column, "__row_idx"
+        )
+        grouped = indexed.group_by(self.session_column, maintain_order=True).agg(
+            pl.col("__row_idx")
+        )
         by_session: dict[int, list[int]] = {}
-        for row in rows:
-            by_session.setdefault(int(row[self.session_column]), []).append(int(row["__row_idx"]))
-        return [int(r["__row_idx"]) for r in rows], by_session
+        for session_value, row_indices in grouped.iter_rows():
+            by_session[int(session_value)] = [int(index) for index in row_indices]
+        return [int(value) for value in indexed["__row_idx"].to_list()], by_session
 
     def split(self, samples: pl.DataFrame) -> list[Fold]:
         """Outer expanding walk-forward folds over all samples."""

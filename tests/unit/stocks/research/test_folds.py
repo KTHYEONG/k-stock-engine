@@ -121,3 +121,17 @@ class TestPurgedWalkForward:
         splitter.mark_holdout_inspected("candidate_v1")
         with pytest.raises(ValueError, match="already inspected"):
             splitter.pin_holdout("candidate_v1")
+
+    def test_row_index_maps_row_indices_to_sessions(self) -> None:
+        df = pl.DataFrame(
+            {
+                "session_index": [3, 1, 3, 1, 2, 3],
+                "instrument_id": ["a", "b", "c", "d", "e", "f"],
+            }
+        )
+        splitter = PurgedWalkForward(
+            n_folds=2, label_horizon_sessions=2, session_column="session_index"
+        )
+        rows, by_session = splitter._row_index(df)
+        assert rows == [0, 1, 2, 3, 4, 5]
+        assert by_session == {3: [0, 2, 5], 1: [1, 3], 2: [4]}

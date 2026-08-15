@@ -597,17 +597,22 @@ def _compute_alpha_max(
     learner_columns: tuple[str, ...],
     fraction: float,
     seed: int,
+    *,
+    standardized: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[float, float] | None:
     """Scale-invariant absolute ElasticNet penalty for one training slice.
 
     ``alpha_max = max(abs(X.T @ y_centered)) / n`` on the fold-standardized
     design; the candidate absolute alpha is ``fraction * alpha_max``. Returns
-    ``(alpha, alpha_max)`` or ``None`` when the slice has no usable rows.
+    ``(alpha, alpha_max)`` or ``None`` when the slice has no usable rows. The
+    ``standardized`` design may be supplied precomputed by the caller so a
+    nested alpha search reuses one design build across every penalty fraction.
     """
     del seed
     if TARGET_COLUMN not in train_slice.columns:
         return None
-    standardized = _standardized_design(train_slice, learner_columns)
+    if standardized is None:
+        standardized = _standardized_design(train_slice, learner_columns)
     if standardized is None:
         return None
     features, valid = standardized
@@ -678,8 +683,12 @@ def _select_elastic_alpha(
             continue
         if TARGET_COLUMN not in inner_train.columns or TARGET_COLUMN not in inner_val.columns:
             continue
+        standardized = _standardized_design(inner_train, learner_columns)
         for fraction in grid.fractions:
-            computed = _compute_alpha_max(inner_train, learner_columns, fraction, request.seed)
+            computed = _compute_alpha_max(
+                inner_train, learner_columns, fraction, request.seed,
+                standardized=standardized,
+            )
             if computed is None:
                 continue
             alpha, alpha_max = computed
@@ -985,9 +994,15 @@ def _causal_oof_calibrate(
         max_workspace_bytes=_schedule_workspace(request),
     )
     frames: list[pl.DataFrame] = []
-    for decision_time in sorted(oof[SESSION_COLUMN].unique().to_list()):
+    by_session = {
+        key[0]: frame
+        for key, frame in oof.partition_by(
+            SESSION_COLUMN, maintain_order=True, as_dict=True
+        ).items()
+    }
+    for decision_time in sorted(by_session):
         state = schedule.state_at(decision_time)
-        scored = oof.filter(pl.col(SESSION_COLUMN) == decision_time).rename(
+        scored = by_session[decision_time].rename(
             {SCORE_COLUMN: "score"}
         )
         augmented = CausalAlphaCalibrator.apply_prepared(state, scored)
