@@ -145,7 +145,12 @@ def build_partitioned_net_alpha_labels_with_status(
             reference_notional=reference_notional,
         )
         status_frames.append(
-            status.with_columns(pl.lit(horizon, dtype=pl.Int64).alias(HORIZON_COLUMN))
+            status.select(
+                pl.col(ID_COLUMN),
+                pl.col(SESSION_COLUMN),
+                pl.lit(horizon, dtype=pl.Int64).alias(HORIZON_COLUMN),
+                pl.col(OUTCOME_STATUS_COLUMN),
+            )
         )
         if wide.is_empty():
             continue
@@ -240,6 +245,15 @@ def publish_outcome_status_sidecar(
     )
     if not unknown.is_empty():
         raise ValueError("outcome-status sidecar contains unknown states")
+    duplicates = status_frame.group_by(
+        [ID_COLUMN, SESSION_COLUMN, HORIZON_COLUMN]
+    ).len().filter(pl.col("len") > 1)
+    if not duplicates.is_empty():
+        raise ValueError(
+            "outcome-status sidecar must emit exactly one row per "
+            "(instrument_id, session, horizon_sessions); "
+            f"{duplicates.height} keys are duplicated"
+        )
     present = sorted(status_frame[HORIZON_COLUMN].unique().to_list())
     if set(present) != set(horizon_sessions):
         raise ValueError(
