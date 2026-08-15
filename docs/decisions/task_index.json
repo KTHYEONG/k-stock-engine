@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_CLEANUP_TMP_LOGS",
+      "date": "2026-08-15",
+      "adr_id": "ADR_20260815_CLEANUP_TMP_LOGS",
+      "domain": "general",
+      "title": "Clean tmp and logs",
+      "why": "Clean temp and log files",
+      "resolution": "Removed tmp and logs files",
+      "impact": "Freed up disk space"
+    },
+    {
       "task_id": "TASK_STOCK_ML_COMPOUNDING_VALIDATION",
       "date": "2026-08-15",
       "adr_id": "ADR_20260815_STOCK_ML_COMPOUNDING_VALIDATION",
