@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_ML_COMPOUNDING_VALIDATION",
+      "date": "2026-08-15",
+      "adr_id": "ADR_20260815_STOCK_ML_COMPOUNDING_VALIDATION",
+      "domain": "stocks",
+      "title": "Forward-holdout compound-growth certification",
+      "why": "The net-alpha run had unstable OOF evidence and no forward-holdout orders, while artifact eligibility could expose an in-sample backtest and replay return fields were mislabeled as logarithmic.",
+      "resolution": "Added strict arithmetic-return replay semantics, base/stress geometric holdout certification with seeded bootstrap and coverage/drawdown gates, explicit no-trade diagnostics, forward-holdout artifact eligibility, bounded ledger projections, and executed a fresh run that failed closed as NO_TRADE.",
+      "impact": "Compound-growth claims now require complete costed forward evidence and cannot use training-period replay; the fresh 2026-08-15 run produced no promoted artifact because all horizons had no nonzero complete OOF blocks."
+    },
+    {
       "task_id": "TASK_STOCK_NET_ALPHA_PERF",
       "date": "2026-08-15",
       "adr_id": "ADR_20260815_STOCK_NET_ALPHA_PERF",
