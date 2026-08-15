@@ -150,16 +150,22 @@ def test_evaluate_zero_weight_cross_section_creates_no_orders() -> None:
 
 
 def test_evaluate_block_growth_uses_decimal_dynamic_cost() -> None:
-    session = datetime(2024, 1, 2, tzinfo=UTC)
     liquidity = stock_liquidity_model()
+    sessions = [
+        datetime(2024, 1, 2, tzinfo=UTC),
+        datetime(2024, 1, 3, tzinfo=UTC),
+        datetime(2024, 1, 4, tzinfo=UTC),
+    ]
     scored = _scored(
-        [("KRX:00001", session, 0.05), ("KRX:00002", session, 0.04)]
+        [
+            (f"KRX:{i:05d}", session, 0.05)
+            for i, session in enumerate(sessions)
+        ]
     )
-    residual_1, residual_2 = 0.03, 0.02
     realized = _realized(
         [
-            ("KRX:00001", session, residual_1, 100.0, 1.0e8, 0.02),
-            ("KRX:00002", session, residual_2, 100.0, 1.0e8, 0.02),
+            (f"KRX:{i:05d}", session, 0.03, 100.0, 1.0e8, 0.02)
+            for i, session in enumerate(sessions)
         ]
     )
     evaluation = NetAlphaPolicyReplay(
@@ -168,7 +174,10 @@ def test_evaluate_block_growth_uses_decimal_dynamic_cost() -> None:
         liquidity_model=liquidity,
     ).evaluate(scored, realized)
     assert len(evaluation.blocks) == 1
-    point = default_base_schedule().cost_for(session)
+    assert evaluation.period_count == 1
+    assert evaluation.active_cohort_count == 1
+    assert len(evaluation.orders) == 3
+    point = default_base_schedule().cost_for(sessions[0])
     expected_costs: list[float] = []
     for order in evaluation.orders:
         slippage_bps = liquidity.slippage_bps(
@@ -176,13 +185,17 @@ def test_evaluate_block_growth_uses_decimal_dynamic_cost() -> None:
             adtv_20d=1.0e8,
             daily_volatility=0.02,
             reference_price=100.0,
-            effective_time=session,
+            effective_time=order.decision_session,
         )
         expected_costs.append(
             2.0 * point.commission_rate + point.tax_rate + 2.0 * slippage_bps / 10_000.0
         )
-    expected_growth = (residual_1 - expected_costs[0] + residual_2 - expected_costs[1]) / 2.0
-    assert evaluation.blocks[0].block_log_excess == pytest.approx(expected_growth, abs=1e-12)
+    expected_growth = (
+        sum(0.03 - cost for cost in expected_costs) / len(expected_costs)
+    )
+    assert evaluation.blocks[0].net_return == pytest.approx(expected_growth, abs=1e-12)
+    assert evaluation.blocks[0].net_return == evaluation.block_net_returns[0]
+    assert evaluation.block_log_excess == evaluation.block_net_returns
 
 
 def test_evaluate_realized_requires_liquidity_model() -> None:
@@ -209,3 +222,110 @@ def test_evaluate_uses_calibrated_lower_bound_as_economic_score() -> None:
     instruments = [order.instrument_id for order in evaluation.orders]
     assert instruments == ["KRX:00001", "KRX:00002"]
     assert np.all([order.predicted_net_alpha > 0.0 for order in evaluation.orders])
+
+def _session(value: str) -> datetime:
+    return datetime.fromisoformat(value)
+
+
+def test_evaluate_period_semantics_cover_complete_cohorts() -> None:
+    liquidity = stock_liquidity_model()
+    sessions = [_session(f"2024-01-0{i}T00:00:00+00:00") for i in range(1, 6)]
+    rows = [
+        (f"KRX:{i:05d}", session, 0.05, 0.03, 100.0, 1.0e8, 0.02)
+        for i, session in enumerate(sessions)
+    ]
+    scored = pl.DataFrame(
+        {
+            "instrument_id": [r[0] for r in rows],
+            "session": [r[1] for r in rows],
+            SCORE_COLUMN: [r[2] for r in rows],
+        }
+    )
+    realized = pl.DataFrame(
+        {
+            "instrument_id": [r[0] for r in rows],
+            "session": [r[1] for r in rows],
+            "risk_residual": [r[3] for r in rows],
+            "open": [r[4] for r in rows],
+            "adtv_20d": [r[5] for r in rows],
+            "volatility_20d": [r[6] for r in rows],
+        }
+    )
+    evaluation = NetAlphaPolicyReplay(
+        3, _PORTFOLIO, _RISK, liquidity_model=liquidity
+    ).evaluate(scored, realized)
+    assert evaluation.period_count == 1
+    assert evaluation.observed_sessions == 3
+    assert evaluation.active_cohort_count == 1
+    assert evaluation.missing_realized_cohort_count == 0
+    assert len(evaluation.period_net_returns) == 1
+    assert evaluation.scored_sessions == 5
+    assert evaluation.realized_sessions == 5
+    assert evaluation.active_sessions == 5
+    diagnostics = evaluation.replay_diagnostics()
+    assert diagnostics["complete_cohorts"] == 1
+    assert diagnostics["active_cohorts"] == 1
+    assert diagnostics["missing_realized_cohorts"] == 0
+    assert diagnostics["orders"] == len(evaluation.orders)
+
+
+def test_evaluate_all_cash_cohort_is_observed_zero_return() -> None:
+    sessions = [_session(f"2024-01-0{i}T00:00:00+00:00") for i in range(1, 4)]
+    scored = _scored(
+        [(f"KRX:{i:05d}", session, 0.0002) for i, session in enumerate(sessions)]
+    )
+    realized = _realized(
+        [
+            (f"KRX:{i:05d}", session, 0.05, 100.0, 1.0e8, 0.02)
+            for i, session in enumerate(sessions)
+        ]
+    )
+    evaluation = NetAlphaPolicyReplay(
+        3, _PORTFOLIO, _RISK, liquidity_model=stock_liquidity_model()
+    ).evaluate(scored, realized)
+    assert evaluation.orders == ()
+    assert evaluation.blocks == ()
+    assert evaluation.period_net_returns == (0.0,)
+    assert evaluation.period_count == 1
+    assert evaluation.active_cohort_count == 0
+    assert evaluation.eligible_sessions == 0
+    assert evaluation.observed_sessions == 3
+
+
+def test_evaluate_missing_realized_cohort_fails_closed_never_zero_filled() -> None:
+    sessions = [_session(f"2024-01-0{i}T00:00:00+00:00") for i in range(1, 4)]
+    scored = _scored(
+        [
+            (f"KRX:{instrument:05d}", session, 0.05)
+            for session in sessions
+            for instrument in range(2)
+        ]
+    )
+    realized = _realized(
+        [
+            (f"KRX:{0:05d}", session, 0.05, 100.0, 1.0e8, 0.02)
+            for session in sessions
+        ]
+    )
+    evaluation = NetAlphaPolicyReplay(
+        3, _PORTFOLIO, _RISK, liquidity_model=stock_liquidity_model()
+    ).evaluate(scored, realized)
+    assert evaluation.missing_realized_cohort_count == 1
+    assert evaluation.period_net_returns == ()
+    assert evaluation.period_count == 0
+    assert evaluation.active_cohort_count == 0
+    assert evaluation.blocks == ()
+
+
+def test_evaluate_score_only_planning_has_no_period_evidence() -> None:
+    session = _session("2024-01-01T00:00:00+00:00")
+    scored = _scored([("KRX:00001", session, 0.05)])
+    evaluation = NetAlphaPolicyReplay(
+        3, _PORTFOLIO, _RISK, liquidity_model=stock_liquidity_model()
+    ).evaluate(scored, realized=None)
+    assert len(evaluation.orders) == 1
+    assert evaluation.blocks == ()
+    assert evaluation.period_count == 0
+    assert evaluation.observed_sessions == 0
+    assert evaluation.active_cohort_count == 0
+    assert evaluation.period_net_returns == ()

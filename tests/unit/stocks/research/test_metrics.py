@@ -162,3 +162,159 @@ def test_compounded_growth_metrics_contract_assertion() -> None:
     from src.stocks.research.metrics import compounded_growth_metrics
 
     assert compounded_growth_metrics([0.01] * 252, 252)["cagr"] > 0.0
+
+def test_certify_compounded_holdout_passes_positive_growth() -> None:
+    from src.stocks.ml.contracts import CompoundingCertificationSettings
+    from src.stocks.research.metrics import certify_compounded_holdout
+
+    settings = CompoundingCertificationSettings(
+        annualization_sessions=252,
+        min_observed_sessions=252,
+        min_active_cohort_fraction=0.5,
+        max_drawdown=0.5,
+    )
+    returns = [0.01] * 84
+    certificate = certify_compounded_holdout(
+        returns, returns, horizon_sessions=3, observed_sessions=252,
+        active_cohort_count=84, settings=settings,
+    )
+    assert certificate.passed is True
+    assert certificate.reasons == ()
+    base = certificate.base
+    assert base["passed"] is True
+    assert base["period_count"] == 84
+    assert base["observed_sessions"] == 252
+    assert base["active_cohort_count"] == 84
+    assert base["cagr"] == pytest.approx((1.01) ** 84 - 1, rel=1e-9)
+    assert base["mdd"] == 0.0
+    assert base["calmar"] is None
+    assert certificate.stress["passed"] is True
+    assert certificate.to_json()["passed"] is True
+    assert certificate.to_json()["reasons"] == []
+
+
+def test_certify_compounded_holdout_bootstrap_is_deterministic() -> None:
+    from src.stocks.ml.contracts import CompoundingCertificationSettings
+    from src.stocks.research.metrics import certify_compounded_holdout
+
+    settings = CompoundingCertificationSettings(
+        min_observed_sessions=60,
+        min_active_cohort_fraction=0.5,
+        max_drawdown=0.9,
+        bootstrap_resamples=200,
+        seed=7,
+    )
+    returns = [0.005 + 0.002 * (index % 5) for index in range(60)]
+    first = certify_compounded_holdout(
+        returns, returns, 1, 60, 60, settings,
+    )
+    second = certify_compounded_holdout(
+        returns, returns, 1, 60, 60, settings,
+    )
+    assert first.to_json() == second.to_json()
+    assert first.base["lower_cagr"] > 0.0
+
+
+def test_certify_compounded_holdout_fails_closed_on_each_gate() -> None:
+    from src.stocks.ml.contracts import CompoundingCertificationSettings
+    from src.stocks.research.metrics import certify_compounded_holdout
+
+    settings = CompoundingCertificationSettings(
+        min_observed_sessions=60,
+        min_active_cohort_fraction=0.5,
+        max_drawdown=0.1,
+    )
+    base_settings = CompoundingCertificationSettings(
+        min_observed_sessions=60,
+        min_active_cohort_fraction=0.5,
+        max_drawdown=0.9,
+    )
+
+    incomplete = certify_compounded_holdout(
+        [], [], 1, 0, 0, settings,
+    )
+    assert incomplete.passed is False
+    assert "period-series-incomplete" in incomplete.reasons
+
+    non_finite = certify_compounded_holdout(
+        [0.01, float("nan")], [0.01, float("nan")], 1, 2, 2, settings,
+    )
+    assert "period-series-incomplete" in non_finite.reasons
+
+    too_short = certify_compounded_holdout(
+        [0.01] * 10, [0.01] * 10, 1, 10, 10, settings,
+    )
+    assert too_short.passed is False
+    assert "insufficient-observed-sessions" in too_short.reasons
+
+    no_coverage = certify_compounded_holdout(
+        [0.01] * 60, [0.01] * 60, 1, 60, 0, base_settings,
+    )
+    assert "active-coverage-insufficient" in no_coverage.reasons
+
+    negative = certify_compounded_holdout(
+        [-0.01] * 60, [-0.01] * 60, 1, 60, 60, base_settings,
+    )
+    assert "non-positive-cagr" in negative.reasons
+    assert "non-positive-lower-cagr" in negative.reasons
+
+    drawdown = certify_compounded_holdout(
+        [-0.30, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12]
+        * 5,
+        [-0.30, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12]
+        * 5,
+        1, 60, 60, settings,
+    )
+    assert "max-drawdown-exceeded" in drawdown.reasons
+
+
+def test_certify_compounded_holdout_stress_path_must_pass() -> None:
+    from src.stocks.ml.contracts import CompoundingCertificationSettings
+    from src.stocks.research.metrics import certify_compounded_holdout
+
+    settings = CompoundingCertificationSettings(
+        min_observed_sessions=60,
+        min_active_cohort_fraction=0.5,
+        max_drawdown=0.9,
+    )
+    certificate = certify_compounded_holdout(
+        [0.01] * 60, [-0.02] * 60, 1, 60, 60, settings,
+    )
+    assert certificate.passed is False
+    assert certificate.base["passed"] is True
+    assert certificate.stress["passed"] is False
+    assert "non-positive-cagr" in certificate.reasons
+
+
+def test_certify_compounded_holdout_rejects_invalid_arguments() -> None:
+    from src.stocks.ml.contracts import CompoundingCertificationSettings
+    from src.stocks.research.metrics import certify_compounded_holdout
+
+    settings = CompoundingCertificationSettings(
+        min_observed_sessions=1, min_active_cohort_fraction=0.5, max_drawdown=0.9
+    )
+    with pytest.raises(ValueError, match="horizon_sessions"):
+        certify_compounded_holdout([0.01], [0.01], 0, 1, 1, settings)
+    with pytest.raises(ValueError, match="observed_sessions"):
+        certify_compounded_holdout([0.01], [0.01], 1, -1, 1, settings)
+    with pytest.raises(ValueError, match="active_cohort_count"):
+        certify_compounded_holdout([0.01], [0.01], 1, 1, -1, settings)
+
+
+def test_compounding_certification_settings_validate_fail_closed() -> None:
+    from src.stocks.ml.contracts import CompoundingCertificationSettings
+
+    with pytest.raises(ValueError, match="annualization_sessions"):
+        CompoundingCertificationSettings(annualization_sessions=0)
+    with pytest.raises(ValueError, match="min_observed_sessions"):
+        CompoundingCertificationSettings(min_observed_sessions=0)
+    with pytest.raises(ValueError, match="min_active_cohort_fraction"):
+        CompoundingCertificationSettings(min_active_cohort_fraction=0.0)
+    with pytest.raises(ValueError, match="min_active_cohort_fraction"):
+        CompoundingCertificationSettings(min_active_cohort_fraction=1.5)
+    with pytest.raises(ValueError, match="max_drawdown"):
+        CompoundingCertificationSettings(max_drawdown=1.0)
+    with pytest.raises(ValueError, match="bootstrap_alpha"):
+        CompoundingCertificationSettings(bootstrap_alpha=0.0)
+    with pytest.raises(ValueError, match="bootstrap_resamples"):
+        CompoundingCertificationSettings(bootstrap_resamples=1)
