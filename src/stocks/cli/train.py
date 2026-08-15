@@ -20,6 +20,7 @@ from src.core.costs import (
     default_stress_schedule,
 )
 from src.core.paths import (
+    PROJECT_ROOT,
     STOCK_ARTIFACT_ROOT,
     STOCK_BASE_PANEL_ROOT,
     STOCK_CATALOG_ROOT,
@@ -38,10 +39,17 @@ from src.stocks.ml.contracts import (
     RiskSettings,
 )
 from src.stocks.ml.data import compose_net_alpha_training_data
+from src.stocks.ml.result_ledger import (
+    CostRunContext,
+    MlResultLedger,
+    MlRunContext,
+)
 from src.stocks.ml.training import train_net_alpha_model
 from src.stocks.research.artifacts import ModelArtifactRegistry
 
 logger = logging.getLogger("stocks.cli.train")
+
+STOCK_RESULTS_DOC_ROOT = PROJECT_ROOT / "docs" / "results"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,6 +61,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--feature-root", type=Path, default=STOCK_FEATURE_PANEL_ROOT)
     parser.add_argument("--label-root", type=Path, default=STOCK_LABEL_ROOT)
     parser.add_argument("--registry", type=Path, default=STOCK_ARTIFACT_ROOT)
+    parser.add_argument(
+        "--results-root",
+        type=Path,
+        default=STOCK_RESULTS_DOC_ROOT,
+        help="directory owning the generated result ledger (default docs/results)",
+    )
     parser.add_argument(
         "--mode",
         choices=("research", "paper", "live"),
@@ -140,6 +154,7 @@ def main(args: list[str] | None = None) -> int:
     parsed = parser.parse_args(args)
 
     decision_time = parsed.decision_time or datetime.now(UTC)
+    started_at = datetime.now(UTC)
     snapshot = resolve_snapshot_for_mode(
         parsed.catalog_root, parsed.snapshot_id, mode=parsed.mode
     )
@@ -171,6 +186,13 @@ def main(args: list[str] | None = None) -> int:
         decision_time,
         candidate_horizon_sessions=_parse_horizons(parsed.candidate_horizon_sessions),
     )
+    logger.info(
+        "[DATA] stage=compose feature_rows=%d instruments=%d sessions=%d columns=%d",
+        data.feature_frame.height,
+        data.feature_frame["instrument_id"].n_unique(),
+        data.feature_frame["session"].n_unique(),
+        len(data.feature_frame.columns),
+    )
 
     base_cost_schedule, liquidity_model = _resolve_cost_context(
         snapshot, parsed.cost_schedule
@@ -200,13 +222,58 @@ def main(args: list[str] | None = None) -> int:
         base_cost_schedule=base_cost_schedule,
         liquidity_model=liquidity_model,
     )
+    costs = getattr(snapshot, "costs", None)
+    cost_context = CostRunContext(
+        cost_schedule_kind=parsed.cost_schedule,
+        cost_evidence_path=Path(costs.path).name if costs is not None else None,
+        cost_evidence_hash=getattr(costs, "content_hash", None),
+        has_liquidity_model=liquidity_model is not None,
+    )
+    context = MlRunContext.from_cli(
+        request=request,
+        snapshot_id=parsed.snapshot_id,
+        data=data,
+        cost_context=cost_context,
+        started_at=started_at,
+    )
+    ledger = MlResultLedger(parsed.results_root)
     logger.info(
-        "training net-alpha mainline artifact %s over candidate horizons %s",
+        "[ALGO] stage=train artifact=%s candidate_horizons=%s",
         request.artifact_id,
         list(request.candidate_horizon_sessions),
     )
-    manifest = train_net_alpha_model(data, registry, request)
-    logger.info("published artifact %s (%s)", manifest.artifact_id, manifest.model_type)
+    try:
+        manifest = train_net_alpha_model(data, registry, request)
+    except Exception as exc:
+        try:
+            ledger.record_failed(context, "train_net_alpha_model", exc)
+        except Exception as ledger_exc:
+            logger.error(
+                "[SYS] stage=result_ledger status=write_failed error=%s", ledger_exc
+            )
+        raise
+    logger.info(
+        "[ALGO] stage=train selected_family=%s artifact=%s",
+        manifest.model_type,
+        manifest.artifact_id,
+    )
+    logger.info(
+        "[EVAL] stage=promotion artifact=%s promoted=%s no_trade=%s",
+        manifest.artifact_id,
+        manifest.model_type != "no_trade",
+        manifest.model_type == "no_trade",
+    )
+    try:
+        ledger.record_completed(context, manifest, registry)
+    except Exception as exc:
+        logger.error(
+            "[SYS] stage=result_ledger status=write_failed error=%s", exc
+        )
+    else:
+        logger.info(
+            "[SYS] stage=result_ledger status=written artifact=%s",
+            manifest.artifact_id,
+        )
     return 0
 
 
