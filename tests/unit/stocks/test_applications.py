@@ -12,7 +12,10 @@ from src.stocks.ml.contracts import NetAlphaTrainingRequest
 from src.stocks.workflows.contracts import ScoringRequest, SimulationRequest
 from src.stocks.workflows.generate_intents import generate_intents
 from src.stocks.workflows.score_model import score_model
-from src.stocks.workflows.simulate_portfolio import simulate_portfolio
+from src.stocks.workflows.simulate_portfolio import (
+    artifact_policy_profile,
+    simulate_portfolio,
+)
 from src.stocks.workflows.train_model import train_model
 from tests.fixtures.stocks.helpers import (
     stock_net_alpha_composed_df,
@@ -70,12 +73,22 @@ class TestScoreModelWiring:
     def test_simulate_portfolio_reconciles(self, tmp_path) -> None:
         snapshot, registry = build_trained_snapshot(tmp_path)
         decision = datetime(2024, 4, 29, 0, 0, tzinfo=UTC)
-        result = simulate_portfolio(
-            snapshot,
-            registry,
-            SimulationRequest(
+        policy_profile = artifact_policy_profile(registry, "stock_net_alpha_20240101")
+        if policy_profile is not None:
+            request = SimulationRequest(
+                artifact_id="stock_net_alpha_20240101",
+                decision_time=decision,
+                top_k=int(policy_profile["top_k"]),
+                max_single_weight=float(policy_profile["max_single_weight"]),
+                max_exposure=float(policy_profile["max_exposure"]),
+                participation_limit=float(policy_profile["participation_limit"]),
+                policy_profile_id=str(policy_profile["profile_id"]),
+                no_trade_band_bps=float(policy_profile["no_trade_band_bps"]),
+            )
+        else:
+            request = SimulationRequest(
                 artifact_id="stock_net_alpha_20240101", decision_time=decision
-            ),
-        )
+            )
+        result = simulate_portfolio(snapshot, registry, request)
         assert result.final_value > 0
         assert result.total_return is not None
