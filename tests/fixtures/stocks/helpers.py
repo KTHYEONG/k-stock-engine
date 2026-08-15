@@ -446,3 +446,61 @@ def stock_net_alpha_manifest(
         horizon=horizon,
         decision_time=decision_time,
     )
+
+def stock_net_alpha_status_frame(
+    composed: pl.DataFrame,
+    candidate_horizon_sessions: tuple[int, ...] = (3, 5, 8, 10, 15, 20),
+    *,
+    unresolved_keys: set[tuple[str, int]] | None = None,
+    decision_time: datetime | None = None,
+) -> pl.DataFrame:
+    """Deterministic long outcome-status sidecar for a composed net-alpha panel.
+
+    Emits exactly one typed status row per ``(instrument_id, session,
+    horizon_sessions)`` in the panel. Keys absent from ``unresolved_keys`` are
+    ``REALIZED`` when their label is available at ``decision_time`` and
+    ``PARTIAL_TAIL`` otherwise; keys in ``unresolved_keys`` are typed
+    ``MISSING_EXIT_PRICE`` regardless, so a deliberately unresolved fixture can
+    exercise the typed fail-closed admission.
+    """
+    from src.stocks.ml.labels import (
+        HORIZON_COLUMN,
+        ID_COLUMN,
+        SESSION_COLUMN,
+        AVAILABLE_COLUMN,
+    )
+
+    rows: list[dict[str, object]] = []
+    for horizon in candidate_horizon_sessions:
+        for row in composed.select(
+            pl.col(ID_COLUMN),
+            pl.col(SESSION_COLUMN),
+            pl.col(f"label_available_time_{horizon}d").alias(AVAILABLE_COLUMN),
+        ).unique().iter_rows(named=True):
+            available = row.get(AVAILABLE_COLUMN)
+            key = (str(row[ID_COLUMN]), row[SESSION_COLUMN])
+            if unresolved_keys is not None and key in unresolved_keys:
+                status = "MISSING_EXIT_PRICE"
+            elif available is not None and (
+                decision_time is None or available <= decision_time
+            ):
+                status = "REALIZED"
+            else:
+                status = "PARTIAL_TAIL"
+            rows.append(
+                {
+                    ID_COLUMN: row[ID_COLUMN],
+                    SESSION_COLUMN: row[SESSION_COLUMN],
+                    HORIZON_COLUMN: horizon,
+                    "outcome_status": status,
+                }
+            )
+    return pl.DataFrame(
+        rows,
+        schema={
+            ID_COLUMN: pl.Utf8,
+            SESSION_COLUMN: pl.Datetime("us", "UTC"),
+            HORIZON_COLUMN: pl.Int64,
+            "outcome_status": pl.Utf8,
+        },
+    ).sort([ID_COLUMN, SESSION_COLUMN, HORIZON_COLUMN])
