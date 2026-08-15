@@ -1013,7 +1013,9 @@ def materialize_net_alpha_snapshot(
         stock_net_alpha_v1_role_allowlist,
     )
     from src.stocks.ml.labels import (
-        build_partitioned_net_alpha_labels,
+        OUTCOME_STATUS_DATASET_SUFFIX,
+        build_partitioned_net_alpha_labels_with_status,
+        publish_outcome_status_sidecar,
         publish_partitioned_net_alpha_label_dataset,
     )
 
@@ -1110,7 +1112,7 @@ def materialize_net_alpha_snapshot(
     )
     liquidity_model = cost_evidence.base_liquidity_model
 
-    labels_frame = build_partitioned_net_alpha_labels(
+    labels_frame, status_frame = build_partitioned_net_alpha_labels_with_status(
         base_frame,
         calendar,
         cost_schedule,
@@ -1129,6 +1131,16 @@ def materialize_net_alpha_snapshot(
         generated_time=request.generated_time,
     )
     label_manifest = label_result.manifest
+    publish_outcome_status_sidecar(
+        status_frame,
+        destination_root=request.label_root,
+        dataset_id=f"{request.label_dataset_id}{OUTCOME_STATUS_DATASET_SUFFIX}",
+        base_panel_hash=base_manifest.content_hash,
+        calendar_hash=calendar.content_hash,
+        horizon_sessions=request.candidate_horizon_sessions,
+        certification=request.certification,
+        generated_time=request.generated_time,
+    )
 
     feature_entry = CatalogEntry(
         kind=CatalogKind.FEATURES,

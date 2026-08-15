@@ -26,6 +26,8 @@ from src.stocks.data.contracts import CoverageRange, DatasetSnapshot
 from src.stocks.data.curation import BASE_PANEL_FEATURE_SET
 from src.stocks.data.feature_contracts import feature_contract_book_from_allowlist
 from src.stocks.data.labels import LABEL_FEATURE_SET
+from src.stocks.ml.contracts import CANONICAL_FEATURE_SET, OUTCOME_STATUS_COLUMN
+from src.stocks.ml.labels import HORIZON_COLUMN, OUTCOME_STATUS_DATASET_SUFFIX
 from src.stocks.research.datasets import (
     ELIGIBLE_STATUS,
     QUALITY_REASON_COLUMN,
@@ -453,6 +455,16 @@ class ResearchDataRepository:
             columns=("instrument_id", "session", *label_columns),
         )
 
+        if feature_set == CANONICAL_FEATURE_SET:
+            return self._compose_net_alpha_snapshot(
+                snapshot,
+                decision_time=decision_time,
+                research_range=range_,
+                base=base,
+                features=features,
+                labels=labels,
+            )
+
         available_column = (
             "label_available_time_5d"
             if "label_available_time_5d" in labels.columns
@@ -505,6 +517,119 @@ class ResearchDataRepository:
             storage_layout=feature_manifest.storage_layout,
         )
         return DatasetSnapshot(manifest=merged_manifest, frame=composed)
+
+    def _compose_net_alpha_snapshot(
+        self,
+        snapshot: ResearchDataSnapshot,
+        *,
+        decision_time: datetime,
+        research_range: CoverageRange,
+        base: pl.DataFrame,
+        features: pl.DataFrame,
+        labels: pl.DataFrame,
+    ) -> DatasetSnapshot:
+        """Net-alpha composition that preserves the full decision score universe.
+
+        The base-plus-feature keys are retained with a LEFT join to the long
+        label/status data: a feature key is never dropped because it lacks an
+        outcome, so the score universe cannot be silently narrowed by the
+        result. When the hash-bound ``outcome_status`` sidecar exists it is
+        joined first as the decision spine, giving exactly one typed status row
+        per ``(instrument_id, session, horizon_sessions)``; otherwise labels
+        are left-joined and ``compose_net_alpha_training_data`` derives
+        statuses from label availability.
+        """
+        if snapshot.labels is None:
+            raise ValueError("snapshot has no label-panel reference")
+        if snapshot.features is None:
+            raise ValueError("snapshot has no feature-panel reference")
+        decision_universe = base.join(
+            features, on=["instrument_id", "session"], how="inner"
+        ).sort(["instrument_id", "session"])
+        if decision_universe.is_empty():
+            raise ValueError("net-alpha composition produced no decision rows")
+
+        label_manifest = self.label_store.read_manifest(snapshot.labels.name)
+        _assert_content_hash_matches(label_manifest, snapshot.labels)
+
+        status_id = f"{snapshot.labels.name}{OUTCOME_STATUS_DATASET_SUFFIX}"
+        status = self._read_outcome_status_sidecar(
+            status_id, decision_time, research_range
+        )
+        if status is not None and not status.is_empty():
+            composed = decision_universe.join(
+                status, on=["instrument_id", "session"], how="left"
+            )
+            join_keys = (
+                ["instrument_id", "session", HORIZON_COLUMN]
+                if HORIZON_COLUMN in labels.columns
+                else ["instrument_id", "session"]
+            )
+            composed = composed.join(
+                labels, on=join_keys, how="left"
+            ).sort(["instrument_id", "session"])
+        else:
+            composed = decision_universe.join(
+                labels, on=["instrument_id", "session"], how="left"
+            ).sort(["instrument_id", "session"])
+        if composed.is_empty():
+            raise ValueError("net-alpha composition produced no rows")
+
+        feature_manifest = self.feature_store.read_manifest(snapshot.features.name)
+        from src.core.datasets import DatasetManifest as _DatasetManifest
+
+        merged_manifest = _DatasetManifest(
+            asset_kind=feature_manifest.asset_kind,
+            schema_version=feature_manifest.schema_version,
+            schema_hash=_composed_schema_hash(
+                CANONICAL_FEATURE_SET, feature_manifest
+            ),
+            provider_version=feature_manifest.provider_version,
+            universe_policy_version=feature_manifest.universe_policy_version,
+            universe_policy_hash=feature_manifest.universe_policy_hash,
+            feature_set=feature_manifest.feature_set,
+            feature_set_hash=feature_manifest.feature_set_hash,
+            label_definition=label_manifest.label_definition,
+            label_horizon_sessions=label_manifest.label_horizon_sessions,
+            time_start=feature_manifest.time_start,
+            time_end=feature_manifest.time_end,
+            generated_time=feature_manifest.generated_time,
+            row_count=composed.height,
+            certification=feature_manifest.certification,
+            calendar_hash=feature_manifest.calendar_hash,
+            corporate_action_hash=feature_manifest.corporate_action_hash,
+            cost_source_hash=feature_manifest.cost_source_hash,
+            master_hash=feature_manifest.master_hash,
+            quality_report_hash=feature_manifest.quality_report_hash,
+            content_hash=feature_manifest.content_hash,
+            storage_layout=feature_manifest.storage_layout,
+        )
+        return DatasetSnapshot(manifest=merged_manifest, frame=composed)
+
+    def _read_outcome_status_sidecar(
+        self,
+        dataset_id: str,
+        decision_time: datetime,
+        research_range: CoverageRange,
+    ) -> pl.DataFrame | None:
+        """Read the hash-bound outcome-status sidecar dataset, if present.
+
+        The sidecar is a sibling dataset published alongside the net-alpha
+        labels. Returns ``None`` when it is absent (a legacy snapshot), so the
+        trainer falls back to deriving statuses from label availability.
+        """
+        try:
+            return self.label_store.read_bounded(
+                dataset_id,
+                AssetKind.STOCK,
+                LABEL_FEATURE_SET,
+                decision_time,
+                session_start=research_range.start,
+                session_end=research_range.end,
+                columns=["instrument_id", "session", HORIZON_COLUMN, OUTCOME_STATUS_COLUMN],
+            )
+        except (FileNotFoundError, ValueError):
+            return None
 
     def _assert_v2_composition(
         self,

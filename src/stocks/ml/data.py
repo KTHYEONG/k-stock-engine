@@ -4,10 +4,13 @@ The snapshot's feature frame (one row per ``(instrument_id, decision_session)``)
 and the long, ``horizon_sessions``-partitioned label dataset are composed into
 ``NetAlphaResearchData``. Each horizon is point-in-time left/inner joined with
 the feature frame independently; horizons are never inner-joined into a common
-universe. Retained and dropped row counts are persisted as join evidence.
+universe. Retained and dropped row counts are persisted as join evidence, and
+the typed outcome-status sidecar is mapped to one status per decision key via
+:class:`HorizonOutcomeCoverage`.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 
 import polars as pl
@@ -16,8 +19,15 @@ from src.core.datasets import DatasetManifest
 from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.ml.contracts import (
     CANONICAL_FEATURE_SET,
+    OUTCOME_MISSING_EXIT_PRICE,
+    OUTCOME_PARTIAL_TAIL,
+    OUTCOME_REALIZED,
+    OUTCOME_STATUS_COLUMN,
+    OUTCOME_STATUS_VOCABULARY,
     HorizonJoinEvidence,
     NetAlphaResearchData,
+    OutcomeStatusCounts,
+    SegmentOutcomeCounts,
 )
 from src.stocks.ml.features import stock_net_alpha_v1_roles
 from src.stocks.ml.labels import (
@@ -30,6 +40,144 @@ from src.stocks.ml.labels import (
 
 _FEATURE_SESSION = "session"
 _FEATURE_PREFIX = "feature__"
+
+
+@dataclass(frozen=True, slots=True)
+class HorizonOutcomeCoverage:
+    """Vectorized per-horizon outcome coverage over the decision score keys.
+
+    Built with Polars joins/group-bys only (never a Python row loop over the
+    panel): every horizon score key is mapped to exactly one typed status and
+    the bounded aggregate counts plus a per-segment projection are exposed.
+    ``status_projection`` is the immutable ``(instrument_id, session,
+    outcome_status)`` lookup consumed by the policy replay.
+    """
+
+    horizon_sessions: int
+    status_projection: pl.DataFrame
+    decision_rows: int
+    realized_rows: int
+    status_counts: OutcomeStatusCounts
+    segment_projection: tuple[SegmentOutcomeCounts, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.horizon_sessions < 1:
+            raise ValueError("horizon_sessions must be positive")
+        required = (ID_COLUMN, "session", OUTCOME_STATUS_COLUMN)
+        missing = [c for c in required if c not in self.status_projection.columns]
+        if missing:
+            raise ValueError(
+                f"outcome coverage status projection missing columns {missing}"
+            )
+        if self.decision_rows < 0 or self.realized_rows < 0:
+            raise ValueError("outcome coverage decision/realised rows must be non-negative")
+        if self.status_projection.filter(
+            pl.col(OUTCOME_STATUS_COLUMN).is_null()
+        ).height:
+            raise ValueError("outcome coverage status projection contains null states")
+
+    @classmethod
+    def build(
+        cls,
+        horizon_sessions: int,
+        score_keys: pl.DataFrame,
+        status_frame: pl.DataFrame,
+        segment_column: str | None = None,
+    ) -> HorizonOutcomeCoverage:
+        """Map every score key to one typed status and aggregate counts.
+
+        ``score_keys`` carries at least ``instrument_id``/``session`` (and an
+        optional segment identity); ``status_frame`` carries one
+        ``outcome_status`` per decision key. A score key absent from the status
+        sidecar fails closed with ``ValueError`` because the sidecar must cover
+        the whole decision universe.
+        """
+        missing = [c for c in (ID_COLUMN, "session") if c not in score_keys.columns]
+        if missing:
+            raise ValueError(f"score keys missing columns {missing}")
+        status_columns = [ID_COLUMN, "session", OUTCOME_STATUS_COLUMN]
+        missing_status = [c for c in status_columns if c not in status_frame.columns]
+        if missing_status:
+            raise ValueError(f"status frame missing columns {missing_status}")
+        status_frame = status_frame.select(*status_columns).unique(
+            subset=[ID_COLUMN, "session"], keep="first"
+        )
+        unknown = status_frame.filter(
+            ~pl.col(OUTCOME_STATUS_COLUMN).is_null()
+            & ~pl.col(OUTCOME_STATUS_COLUMN).is_in(list(OUTCOME_STATUS_VOCABULARY))
+        )
+        if not unknown.is_empty():
+            raise ValueError("status frame contains states outside the vocabulary")
+        projection = score_keys.select(ID_COLUMN, "session").unique(
+            subset=[ID_COLUMN, "session"], keep="first"
+        ).join(status_frame, on=[ID_COLUMN, "session"], how="left")
+        missing_rows = projection.filter(pl.col(OUTCOME_STATUS_COLUMN).is_null())
+        if not missing_rows.is_empty():
+            raise ValueError(
+                f"horizon {horizon_sessions} score keys absent from the outcome "
+                f"status sidecar: {missing_rows.height} keys"
+            )
+        counts_frame = (
+            projection.group_by(OUTCOME_STATUS_COLUMN).len().sort(OUTCOME_STATUS_COLUMN)
+        )
+        counts = OutcomeStatusCounts.from_mapping(
+            {
+                str(row[OUTCOME_STATUS_COLUMN]): int(row["len"])
+                for row in counts_frame.iter_rows(named=True)
+            }
+        )
+        decision_rows = int(
+            score_keys.select(ID_COLUMN, "session").unique().height
+        )
+        realized_rows = counts.realized
+        segment_projection: tuple[SegmentOutcomeCounts, ...] = ()
+        if segment_column is not None:
+            if segment_column not in score_keys.columns:
+                raise ValueError(
+                    f"segment column {segment_column!r} missing from score keys"
+                )
+            segments: list[SegmentOutcomeCounts] = []
+            for segment_key, frame in projection.join(
+                score_keys.select(ID_COLUMN, "session", segment_column).unique(
+                    subset=[ID_COLUMN, "session"], keep="first"
+                ),
+                on=[ID_COLUMN, "session"],
+                how="left",
+            ).partition_by(
+                segment_column, maintain_order=True, as_dict=True
+            ).items():
+                segment_counts = (
+                    frame.group_by(OUTCOME_STATUS_COLUMN).len().sort(OUTCOME_STATUS_COLUMN)
+                )
+                segments.append(
+                    SegmentOutcomeCounts(
+                        segment_id=int(segment_key[0]),
+                        counts=OutcomeStatusCounts.from_mapping(
+                            {
+                                str(row[OUTCOME_STATUS_COLUMN]): int(row["len"])
+                                for row in segment_counts.iter_rows(named=True)
+                            }
+                        ),
+                    )
+                )
+            segment_projection = tuple(sorted(segments, key=lambda s: s.segment_id))
+        return cls(
+            horizon_sessions=horizon_sessions,
+            status_projection=projection.select(*status_columns),
+            decision_rows=decision_rows,
+            realized_rows=realized_rows,
+            status_counts=counts,
+            segment_projection=segment_projection,
+        )
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "horizon_sessions": int(self.horizon_sessions),
+            "decision_rows": int(self.decision_rows),
+            "realized_rows": int(self.realized_rows),
+            "status_counts": self.status_counts.to_json(),
+            "segments": [segment.to_json() for segment in self.segment_projection],
+        }
 
 
 def _reject_feature_set(snapshot: DatasetSnapshot) -> None:
@@ -97,6 +245,8 @@ def compose_net_alpha_training_data(
             or c.startswith("risk_residual_")
             or c.startswith("reference_cost_")
         ]
+    if OUTCOME_STATUS_COLUMN in frame.columns:
+        label_columns = [*label_columns, OUTCOME_STATUS_COLUMN]
     feature_frame = frame.drop(label_columns)
     if long_format:
         # The long label join repeats each feature row once per horizon.  The
@@ -147,7 +297,9 @@ def compose_net_alpha_training_data(
         raise ValueError("net-alpha snapshot feature frame is empty after source renaming")
 
     labels_by_horizon: dict[int, pl.DataFrame] = {}
+    status_by_horizon: dict[int, pl.DataFrame] = {}
     join_evidence: list[HorizonJoinEvidence] = []
+    has_status_column = OUTCOME_STATUS_COLUMN in frame.columns
     for horizon in candidate_horizon_sessions:
         if long_format:
             subset = frame.filter(pl.col("horizon_sessions") == horizon)
@@ -195,6 +347,11 @@ def compose_net_alpha_training_data(
             on=[ID_COLUMN, _FEATURE_SESSION],
             how="inner",
         ).sort([ID_COLUMN, _FEATURE_SESSION])
+        status_frame = _horizon_status_frame(
+            frame, feature_frame, horizon, has_status_column, decision_time
+        )
+        if status_frame is not None:
+            status_by_horizon[horizon] = status_frame
         if joined.is_empty():
             join_evidence.append(
                 HorizonJoinEvidence(
@@ -203,6 +360,13 @@ def compose_net_alpha_training_data(
                     label_rows=label_rows,
                     joined_rows=0,
                     drop_reasons=("no point-in-time available labels",),
+                    decision_rows=int(feature_frame.height),
+                    realized_rows=0,
+                    status_counts=(
+                        _status_counts(status_frame, horizon)
+                        if status_frame is not None
+                        else None
+                    ),
                 )
             )
             continue
@@ -213,6 +377,13 @@ def compose_net_alpha_training_data(
                 feature_rows=feature_rows,
                 label_rows=label_rows,
                 joined_rows=joined.height,
+                decision_rows=int(feature_frame.height),
+                realized_rows=joined.height,
+                status_counts=(
+                    _status_counts(status_frame, horizon)
+                    if status_frame is not None
+                    else None
+                ),
             )
         )
 
@@ -221,12 +392,154 @@ def compose_net_alpha_training_data(
             "no candidate horizon produced point-in-time available labels"
         )
 
+    coverage_by_horizon: dict[int, HorizonOutcomeCoverage] = {}
+    for horizon in candidate_horizon_sessions:
+        status_frame = status_by_horizon.get(horizon)
+        if status_frame is None:
+            continue
+        coverage_by_horizon[horizon] = HorizonOutcomeCoverage.build(
+            horizon,
+            feature_frame.select(ID_COLUMN, _FEATURE_SESSION),
+            status_frame,
+        )
+
     manifest = _net_alpha_manifest(snapshot.manifest, frame)
     return NetAlphaResearchData(
         feature_frame=feature_frame,
         labels_by_horizon=labels_by_horizon,
         manifest=manifest,
         join_evidence=tuple(join_evidence),
+        status_by_horizon=status_by_horizon,
+        coverage_by_horizon=coverage_by_horizon,
+    )
+
+
+def _horizon_status_frame(
+    frame: pl.DataFrame,
+    feature_frame: pl.DataFrame,
+    horizon: int,
+    has_status_column: bool,
+    decision_time: datetime,
+) -> pl.DataFrame | None:
+    """Extract or derive the typed status frame for one horizon.
+
+    When the composed frame carries an ``outcome_status`` column (the
+    net-alpha status sidecar was left-joined), the status rows are extracted
+    directly and every feature key must resolve to a typed state. Otherwise the
+    status is derived from the label rows: an available realised label is
+    ``REALIZED``, a not-yet-available label is ``PARTIAL_TAIL``, and a feature
+    key without any label row for the horizon is ``MISSING_EXIT_PRICE``.
+    """
+    if has_status_column:
+        status_rows = (
+            frame.filter(pl.col("horizon_sessions") == horizon)
+            .select(
+                pl.col(ID_COLUMN).alias(ID_COLUMN),
+                pl.col(_FEATURE_SESSION).alias(_FEATURE_SESSION),
+                pl.col(OUTCOME_STATUS_COLUMN).alias(OUTCOME_STATUS_COLUMN),
+            )
+            .drop_nulls()
+            .unique(subset=[ID_COLUMN, _FEATURE_SESSION], keep="first")
+        )
+        resolved = feature_frame.select(
+            pl.col(ID_COLUMN), pl.col(_FEATURE_SESSION)
+        ).join(
+            status_rows.select(
+                pl.col(ID_COLUMN),
+                pl.col(_FEATURE_SESSION),
+                pl.col(OUTCOME_STATUS_COLUMN),
+            ),
+            on=[ID_COLUMN, _FEATURE_SESSION],
+            how="left",
+        )
+        missing = resolved.filter(pl.col(OUTCOME_STATUS_COLUMN).is_null())
+        if not missing.is_empty():
+            raise ValueError(
+                f"horizon {horizon} feature keys absent from the outcome-status "
+                f"sidecar: {missing.height} keys; the decision universe is not "
+                "fully classified"
+            )
+        return status_rows
+    label_columns = [
+        c
+        for c in frame.columns
+        if c == f"net_alpha_{horizon}d_target"
+        or c == f"label_available_time_{horizon}d"
+        or c == "net_alpha_target"
+        or c == "label_available_time"
+    ]
+    if not label_columns:
+        return None
+    target = next(
+        (
+            c
+            for c in (f"net_alpha_{horizon}d_target", "net_alpha_target")
+            if c in frame.columns
+        ),
+        None,
+    )
+    available = next(
+        (
+            c
+            for c in (f"label_available_time_{horizon}d", "label_available_time")
+            if c in frame.columns
+        ),
+        None,
+    )
+    if target is None or available is None:
+        return None
+    label_rows = (
+        frame.filter(pl.col("horizon_sessions") == horizon)
+        if "horizon_sessions" in frame.columns
+        else frame
+    )
+    realized = label_rows.filter(pl.col(target).is_not_null())
+    status = realized.with_columns(
+        pl.when(pl.col(available).is_null() | (pl.col(available) > decision_time))
+        .then(pl.lit(OUTCOME_PARTIAL_TAIL))
+        .otherwise(pl.lit(OUTCOME_REALIZED))
+        .alias(OUTCOME_STATUS_COLUMN)
+    ).select(
+        pl.col(ID_COLUMN),
+        pl.col(_FEATURE_SESSION).alias(_FEATURE_SESSION),
+        pl.col(OUTCOME_STATUS_COLUMN),
+    )
+    derived = feature_frame.select(
+        pl.col(ID_COLUMN), pl.col(_FEATURE_SESSION)
+    ).join(
+        status.select(
+            pl.col(ID_COLUMN),
+            pl.col(_FEATURE_SESSION),
+            pl.col(OUTCOME_STATUS_COLUMN),
+        ),
+        on=[ID_COLUMN, _FEATURE_SESSION],
+        how="left",
+    ).with_columns(
+        pl.col(OUTCOME_STATUS_COLUMN)
+        .fill_null(OUTCOME_MISSING_EXIT_PRICE)
+        .alias(OUTCOME_STATUS_COLUMN)
+    )
+    return derived.select(
+        pl.col(ID_COLUMN),
+        pl.col(_FEATURE_SESSION).alias(_FEATURE_SESSION),
+        pl.col(OUTCOME_STATUS_COLUMN),
+    )
+
+
+def _status_counts(
+    status_frame: pl.DataFrame | None, horizon: int
+) -> OutcomeStatusCounts | None:
+    """Bounded per-status counts from a horizon status frame."""
+    if status_frame is None:
+        return None
+    counts = (
+        status_frame.group_by(OUTCOME_STATUS_COLUMN).len().sort(OUTCOME_STATUS_COLUMN)
+    )
+    return OutcomeStatusCounts.from_mapping(
+        {
+            str(row[OUTCOME_STATUS_COLUMN]): int(row["len"])
+            for row in counts.iter_rows(named=True)
+        }
     )
 
 

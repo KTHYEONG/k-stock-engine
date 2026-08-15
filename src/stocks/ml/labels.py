@@ -39,9 +39,13 @@ from src.stocks.data.labels import (
     NET_ALPHA_CONTINUOUS_SUFFIX,
     NET_ALPHA_DEFINITION,
     NET_ALPHA_TARGET_PREFIX,
-    build_net_alpha_label_dataset,
+    build_net_alpha_label_dataset_with_status,
 )
 from src.stocks.data.quality import KRXSessionCalendar
+from src.stocks.ml.contracts import (
+    OUTCOME_STATUS_COLUMN,
+    OUTCOME_STATUS_VOCABULARY,
+)
 from src.storage.parquet_datasets import ParquetDatasetStore, canonical_content_hash
 
 ID_COLUMN = "instrument_id"
@@ -93,6 +97,32 @@ def build_partitioned_net_alpha_labels(
         ValueError: for an empty/unsorted/duplicated horizon set, a non-positive
             reference notional, or an unsupported horizon.
     """
+    labels, _status = build_partitioned_net_alpha_labels_with_status(
+        base_panel,
+        calendar,
+        cost_schedule,
+        liquidity_model,
+        horizon_sessions=horizon_sessions,
+        reference_notional=reference_notional,
+    )
+    return labels
+
+
+def build_partitioned_net_alpha_labels_with_status(
+    base_panel: pl.DataFrame,
+    calendar: KRXSessionCalendar,
+    cost_schedule: CostSchedule,
+    liquidity_model: LiquiditySlippageModel,
+    horizon_sessions: tuple[int, ...],
+    reference_notional: float,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Build the long net-alpha label frame and its hash-bound status sidecar.
+
+    Every candidate horizon is built independently. The status sidecar emits
+    exactly one row per ``(instrument_id, decision_session, horizon_sessions)``
+    in the decision universe with a typed outcome state, so the trainer never
+    has to infer why a key lacks a realised label.
+    """
     if not horizon_sessions:
         raise ValueError("horizon_sessions must be non-empty")
     if tuple(horizon_sessions) != tuple(sorted(set(horizon_sessions))):
@@ -103,15 +133,19 @@ def build_partitioned_net_alpha_labels(
         raise ValueError("reference_notional must be positive")
 
     frames: list[pl.DataFrame] = []
+    status_frames: list[pl.DataFrame] = []
     for horizon in horizon_sessions:
         suffix = _horizon_suffix(horizon)
-        wide = build_net_alpha_label_dataset(
+        wide, status = build_net_alpha_label_dataset_with_status(
             base_panel,
             calendar,
             cost_schedule,
             liquidity_model,
             horizon_sessions=horizon,
             reference_notional=reference_notional,
+        )
+        status_frames.append(
+            status.with_columns(pl.lit(horizon, dtype=pl.Int64).alias(HORIZON_COLUMN))
         )
         if wide.is_empty():
             continue
@@ -133,7 +167,7 @@ def build_partitioned_net_alpha_labels(
         frames.append(long)
 
     if not frames:
-        return pl.DataFrame(
+        labels = pl.DataFrame(
             schema={
                 ID_COLUMN: pl.Utf8,
                 SESSION_COLUMN: pl.Datetime("us", "UTC"),
@@ -145,15 +179,119 @@ def build_partitioned_net_alpha_labels(
                 REFERENCE_COST_COLUMN: pl.Float64,
             }
         )
-    out = pl.concat(frames).sort([ID_COLUMN, SESSION_COLUMN, HORIZON_COLUMN])
-    present = sorted(out[HORIZON_COLUMN].unique().to_list())
-    if set(present) != set(horizon_sessions):
-        missing = sorted(set(horizon_sessions) - set(present))
+    else:
+        labels = pl.concat(frames).sort([ID_COLUMN, SESSION_COLUMN, HORIZON_COLUMN])
+        present = sorted(labels[HORIZON_COLUMN].unique().to_list())
+        if set(present) != set(horizon_sessions):
+            missing = sorted(set(horizon_sessions) - set(present))
+            raise ValueError(
+                f"partitioned net-alpha labels missing horizons {missing}; "
+                "no session cleared the risk/cost/MAD gates"
+            )
+    status_out = pl.concat(status_frames).sort(
+        [ID_COLUMN, SESSION_COLUMN, HORIZON_COLUMN]
+    )
+    unknown = status_out.filter(
+        ~pl.col(OUTCOME_STATUS_COLUMN).is_in(list(OUTCOME_STATUS_VOCABULARY))
+    )
+    if not unknown.is_empty():
+        raise ValueError("partitioned net-alpha status sidecar contains unknown states")
+    return labels, status_out
+
+
+OUTCOME_STATUS_DATASET_SUFFIX = "_outcome_status"
+
+
+def publish_outcome_status_sidecar(
+    status_frame: pl.DataFrame,
+    *,
+    destination_root: Path,
+    dataset_id: str,
+    base_panel_hash: str,
+    calendar_hash: str,
+    horizon_sessions: tuple[int, ...],
+    provider_version: str = "base-panel-labels",
+    universe_policy_version: str = "provisional-legacy",
+    certification: DatasetCertification = DatasetCertification.PROVISIONAL,
+    generated_time: datetime | None = None,
+) -> NetAlphaLabelDatasetResult:
+    """Publish the hash-bound per-key outcome-status sidecar dataset.
+
+    The sidecar carries exactly one typed ``outcome_status`` row per
+    ``(instrument_id, decision_session, horizon_sessions)`` in the decision
+    universe, partitioned like the label dataset. Its manifest binds the exact
+    column order and values through the schema/content hashes.
+    """
+    if status_frame.is_empty():
+        raise ValueError("cannot publish an empty outcome-status sidecar")
+    expected_columns = [
+        ID_COLUMN,
+        SESSION_COLUMN,
+        HORIZON_COLUMN,
+        OUTCOME_STATUS_COLUMN,
+    ]
+    if status_frame.columns != expected_columns:
         raise ValueError(
-            f"partitioned net-alpha labels missing horizons {missing}; "
-            "no session cleared the risk/cost/MAD gates"
+            "outcome-status sidecar must carry exactly "
+            f"{expected_columns}, got {status_frame.columns}"
         )
-    return out
+    unknown = status_frame.filter(
+        ~pl.col(OUTCOME_STATUS_COLUMN).is_in(list(OUTCOME_STATUS_VOCABULARY))
+    )
+    if not unknown.is_empty():
+        raise ValueError("outcome-status sidecar contains unknown states")
+    present = sorted(status_frame[HORIZON_COLUMN].unique().to_list())
+    if set(present) != set(horizon_sessions):
+        raise ValueError(
+            f"outcome-status sidecar horizon partitions {present}, "
+            f"expected {sorted(horizon_sessions)}"
+        )
+
+    generated_time = generated_time or datetime.now(UTC)
+    ordered_columns = list(status_frame.columns)
+    manifest = make_manifest(
+        asset_kind=AssetKind.STOCK,
+        columns=ordered_columns,
+        feature_set=LABEL_FEATURE_SET,
+        label_definition=NET_ALPHA_DEFINITION,
+        label_horizon_sessions=horizon_sessions[0],
+        time_start=_as_utc_datetime(status_frame[SESSION_COLUMN].min()),
+        time_end=_as_utc_datetime(status_frame[SESSION_COLUMN].max()),
+        provider_version=provider_version,
+        universe_policy_version=universe_policy_version,
+        row_count=status_frame.height,
+        generated_time=generated_time,
+        certification=certification,
+        calendar_hash=calendar_hash,
+        schema_version="v2",
+        content_hash=canonical_content_hash(status_frame, ordered_columns),
+        storage_layout=HIVE_PARTITION_LAYOUT,
+    )
+    content_manifest: dict[str, object] = {
+        "base_panel_hash": base_panel_hash,
+        "calendar_hash": calendar_hash,
+        "label_definition": NET_ALPHA_DEFINITION,
+        "horizon_sessions": list(horizon_sessions),
+        "outcome_status_vocabulary": list(OUTCOME_STATUS_VOCABULARY),
+        "generated_time": generated_time.isoformat(),
+    }
+    store = ParquetDatasetStore(Path(destination_root))
+    dataset_dir = store.write_partitioned(
+        status_frame,
+        dataset_id=dataset_id,
+        manifest=manifest,
+        expected_feature_set=LABEL_FEATURE_SET,
+        decision_time=generated_time,
+        content_manifest=content_manifest,
+    )
+    partition_paths = tuple(sorted((dataset_dir / "partitions").rglob("*.parquet")))
+    return NetAlphaLabelDatasetResult(
+        dataset_id=dataset_id,
+        manifest=manifest,
+        partition_paths=partition_paths,
+        row_count=status_frame.height,
+        base_panel_hash=base_panel_hash,
+    )
 
 
 def partition_labels_by_horizon(

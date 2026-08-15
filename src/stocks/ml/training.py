@@ -22,6 +22,10 @@ import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.stocks.ml.data import HorizonOutcomeCoverage
 
 import numpy as np
 import polars as pl
@@ -155,6 +159,9 @@ class HorizonDiscovery:
     segment_diagnostics_by_candidate: Mapping[
         tuple[int, str], tuple[ReplaySegmentDiagnostic, ...]
     ] = field(default_factory=dict)
+    coverage_by_horizon: Mapping[int, HorizonOutcomeCoverage] = field(
+        default_factory=dict
+    )
     path_evaluation_count: int = 0
     path_evaluation_bound: int = 0
 
@@ -300,6 +307,9 @@ def train_net_alpha_model(
             },
             schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
             telemetry=telemetry,
+            policy_frontier=_policy_frontier_projection(
+                request, discovery, None
+            ),
         )
 
     selection = select_horizons(
@@ -931,13 +941,16 @@ def _replay_costs(
     request: NetAlphaTrainingRequest,
     horizon_sessions: int,
     risk: RiskSettings,
+    *,
+    status: pl.DataFrame | None = None,
 ) -> tuple[ReplayEvaluation, ReplayEvaluation]:
     """Base and stress policy replay over the same segment-identified OOF panel.
 
-    Base and stress share the identical frozen calibrated scores, orders, and
-    maturity timeline; only the effective cost/liquidity schedule changes. The
-    segment diagnostics must therefore be identical, and a divergence raises
-    ``ValueError`` because the timeline invariant is part of the contract.
+    Base and stress share the identical frozen calibrated scores, orders,
+    maturity timeline, and one immutable typed status projection; only the
+    effective cost/liquidity schedule changes. The segment diagnostics must
+    therefore be identical, and a divergence raises ``ValueError`` because the
+    timeline invariant is part of the contract.
     """
     base_replay = NetAlphaPolicyReplay(
         horizon_sessions=horizon_sessions,
@@ -956,10 +969,10 @@ def _replay_costs(
         seed=request.seed + horizon_sessions,
     )
     base_evaluation = base_replay.evaluate(
-        calibrated, oof_labels, segment_column=_OOF_SEGMENT
+        calibrated, oof_labels, segment_column=_OOF_SEGMENT, status=status
     )
     stress_evaluation = stress_replay.evaluate(
-        calibrated, oof_labels, segment_column=_OOF_SEGMENT
+        calibrated, oof_labels, segment_column=_OOF_SEGMENT, status=status
     )
     if base_evaluation.segment_diagnostics != stress_evaluation.segment_diagnostics:
         raise ValueError(
@@ -1008,6 +1021,7 @@ def _evidence_from_evaluation(
         missing_cohort_count=base_evaluation.missing_realized_vintage_count,
         segment_count=segment_count,
         fold_rank_ics=fold_rank_ics,
+        unresolved_outcome_counts=base_evaluation.unresolved_outcome_counts,
     )
 
 
@@ -1021,6 +1035,12 @@ def _coverage_failure_reason(
             f"incomplete-segment-coverage:{distinct_segments}/"
             f"{evidence.segment_count}"
         )
+    if evidence.unresolved_outcome_counts:
+        typed = ", ".join(
+            f"{state}:{count}"
+            for state, count in sorted(evidence.unresolved_outcome_counts)
+        )
+        return f"unresolved-outcome:{typed}"
     if evidence.missing_cohort_count > 0:
         return f"missing-realized-vintages:{evidence.missing_cohort_count}"
     if not evidence.fold_rank_ics:
@@ -1072,6 +1092,7 @@ def _build_horizon_evidence(
     segment_diagnostics_by_candidate: dict[
         tuple[int, str], tuple[ReplaySegmentDiagnostic, ...]
     ] = {}
+    coverage_by_horizon: dict[int, HorizonOutcomeCoverage] = {}
     path_evaluation_count = 0
     for horizon in sorted(data.labels_by_horizon):
         label_frame = data.labels_by_horizon[horizon]
@@ -1115,8 +1136,31 @@ def _build_horizon_evidence(
                     "no-oof-labels"
                 )
             continue
+        coverage = None
+        status_frame = data.status_by_horizon.get(horizon)
+        if status_frame is not None and not status_frame.is_empty():
+            from src.stocks.ml.data import HorizonOutcomeCoverage
+
+            coverage = HorizonOutcomeCoverage.build(
+                horizon,
+                oof.select(_ID_COLUMN, SESSION_COLUMN, _OOF_SEGMENT),
+                status_frame,
+                segment_column=_OOF_SEGMENT,
+            )
+            coverage_by_horizon[horizon] = coverage
+            logger.info(
+                "[DATA] stage=outcome_coverage horizon=%d realised=%d "
+                "partial_tail=%d unresolved=%d",
+                horizon,
+                coverage.realized_rows,
+                coverage.status_counts.partial_tail,
+                coverage.status_counts.unresolved,
+            )
         calibrated = _causal_oof_calibrate(oof, oof_labels, request, horizon)
         oof_by_horizon[horizon] = (calibrated, oof_labels, ics)
+        status_projection = (
+            coverage.status_projection if coverage is not None else None
+        )
         for profile in request.policy_profiles:
             logger.debug(
                 "[EVAL] stage=profile_replay horizon=%d profile=%s band_bps=%.3f",
@@ -1129,7 +1173,8 @@ def _build_horizon_evidence(
             )
             try:
                 base_evaluation, stress_evaluation = _replay_costs(
-                    calibrated, oof_labels, request, horizon, risk
+                    calibrated, oof_labels, request, horizon, risk,
+                    status=status_projection,
                 )
             except ValueError as exc:
                 dropout_reasons[(horizon, profile.profile_id)] = (
@@ -1169,6 +1214,7 @@ def _build_horizon_evidence(
         oof_by_horizon=oof_by_horizon,
         dropout_reasons=dropout_reasons,
         segment_diagnostics_by_candidate=segment_diagnostics_by_candidate,
+        coverage_by_horizon=coverage_by_horizon,
         path_evaluation_count=path_evaluation_count,
         path_evaluation_bound=(
             len(diagnostics) * len(folds) * (_NESTED_INNER_FOLDS + 1)
@@ -2054,6 +2100,7 @@ def _publish_no_trade(
     schema_hash: str = "no-trade",
     universe_policy_hash: str = "no-trade",
     telemetry: TrainingTelemetry | None = None,
+    policy_frontier: Mapping[str, object] | None = None,
 ) -> ModelManifest:
     """Publish a complete immutable ``NO_TRADE`` artifact with evidence."""
     eligible_from, eligible_to = _eligibility(frame)
@@ -2105,6 +2152,8 @@ def _publish_no_trade(
     }
     if isinstance(details, dict):
         metrics.update(details)
+    if policy_frontier is not None:
+        metrics["policy_frontier"] = policy_frontier
     registry.write_metrics(request.artifact_id, metrics)
     logger.info("published NO_TRADE artifact %s (%s)", request.artifact_id, reason)
     return manifest
@@ -2157,9 +2206,6 @@ def _build_metrics(
         }
         for (horizon, profile_id), paths in selection.adjusted_lower_growth.items()
     }
-    segment_sums = _segment_summaries(
-        discovery.segment_diagnostics_by_candidate, selection.primary_profile_id,
-    )
     return {
         "promoted": manifest.model_type != "no_trade",
         "no_trade": manifest.model_type == "no_trade",
@@ -2170,17 +2216,9 @@ def _build_metrics(
             "profile_id": profile.profile_id,
             "no_trade_band_bps": profile.no_trade_band_bps,
         },
-        "policy_frontier": {
-            "candidate_count": len(discovery.evidence),
-            "profile_ids": [p.profile_id for p in request.policy_profiles],
-            "dropout_reasons": {
-                f"{horizon}:{profile_id}": reason
-                for (horizon, profile_id), reason in sorted(
-                    discovery.dropout_reasons.items()
-                )
-            },
-            "segment_sums": segment_sums,
-        },
+        "policy_frontier": _policy_frontier_projection(
+            request, discovery, selection.primary_profile_id
+        ),
         "mean_fold_rank_ic": float(np.mean(fold_rank_ic)) if fold_rank_ic else 0.0,
         "horizon_selection": selection.to_json(),
         "adjusted_lower_cagr": adjusted_lower_cagr,
@@ -2198,6 +2236,32 @@ def _build_metrics(
             "reasons": list(selection.selection_reasons),
         },
         "run_observability": telemetry.to_dict(),
+    }
+
+
+def _policy_frontier_projection(
+    request: NetAlphaTrainingRequest,
+    discovery: HorizonDiscovery,
+    selected_profile_id: str | None,
+) -> dict[str, object]:
+    """Bounded ``policy_frontier`` projection shared by metrics and no-trade.
+
+    Records the candidate count, profile ids, per-``(horizon, profile)``
+    dropout reasons, and the bounded per-segment/status sums. Raw orders,
+    scores, returns, and instrument identifiers are never included.
+    """
+    return {
+        "candidate_count": len(discovery.evidence),
+        "profile_ids": [p.profile_id for p in request.policy_profiles],
+        "dropout_reasons": {
+            f"{horizon}:{profile_id}": reason
+            for (horizon, profile_id), reason in sorted(
+                discovery.dropout_reasons.items()
+            )
+        },
+        "segment_sums": _segment_summaries(
+            discovery.segment_diagnostics_by_candidate, selected_profile_id
+        ),
     }
 
 
