@@ -146,7 +146,7 @@ cache-dir = "scratch/uv-cache"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-ra -q"
+addopts = "-ra -q --import-mode=importlib"
 pythonpath = ["."]
 markers = [
     "slow: tests that read real parquet files (~0.3s each)",
