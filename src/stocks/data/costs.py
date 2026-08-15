@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Any
 
 from src.core.costs import (
+    CostPoint,
+    CostSchedule,
     FillCostBreakdown,
     LiquiditySlippageModel,
     TickSizeRule,
@@ -137,6 +139,39 @@ class CostEvidence:
             stress_multiplier=self.liquidity_model.stress_multiplier,
             model_id=self.liquidity_model.model_id,
         )
+
+    def base_schedule(self, market: str = "KOSPI") -> CostSchedule:
+        """Effective-dated simplified ``CostSchedule`` from the evidence.
+
+        The commission is the per-side buy rate and the tax is the statutory
+        sell tax for ``market``; slippage is left to the provenance-bound
+        liquidity model, so the schedule contributes commission and tax only.
+        """
+        points = tuple(
+            CostPoint(
+                effective_from=rule.effective_from,
+                commission_rate=rule.buy_rate,
+                tax_rate=self.sell_tax_for(market, rule.effective_from).sell_tax_rate,
+                slippage_bps=0.0,
+                settlement_days=self.settlement_days,
+            )
+            for rule in self.commission
+        )
+        return CostSchedule(name=f"{self.assumption_id}-base", points=points)
+
+    def stress_schedule(self, market: str = "KOSPI") -> CostSchedule:
+        """Effective-dated simplified stress ``CostSchedule`` from the evidence."""
+        points = tuple(
+            CostPoint(
+                effective_from=rule.effective_from,
+                commission_rate=rule.sell_rate,
+                tax_rate=self.sell_tax_for(market, rule.effective_from).sell_tax_rate,
+                slippage_bps=0.0,
+                settlement_days=self.settlement_days,
+            )
+            for rule in self.commission
+        )
+        return CostSchedule(name=f"{self.assumption_id}-stress", points=points)
 
     def commission_for(self, effective_time: datetime) -> CommissionRule:
         """Resolve the commission rule covering ``effective_time``."""

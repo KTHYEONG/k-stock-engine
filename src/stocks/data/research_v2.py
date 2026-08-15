@@ -1056,19 +1056,24 @@ def materialize_net_alpha_snapshot(
         cost_entry = entries[0] if len(entries) == 1 else None
     if cost_entry is None:
         raise ValueError("net-alpha label publication requires a costs catalog entry")
+    cost_coverage = cost_entry.coverage
+    if cost_coverage is None:
+        raise ValueError(
+            "net-alpha label publication requires costs coverage metadata"
+        )
     cost_evidence = load_cost_evidence(
         Path(cost_entry.path),
         CoverageRange(
             start=base_manifest.time_start.date(),
-            end=min(base_manifest.time_end.date(), cost_entry.coverage.end),
+            end=min(base_manifest.time_end.date(), cost_coverage.end),
         ),
     )
     # Do not manufacture labels beyond the verified cost-evidence horizon.
     # The base panel can be refreshed ahead of the cost catalog, so trim only
     # the label source rows while retaining the full feature dataset.
-    if cost_entry.coverage.end < base_manifest.time_end.date():
+    if cost_coverage.end < base_manifest.time_end.date():
         base_frame = base_frame.filter(
-            pl.col("session") <= cost_entry.coverage.end
+            pl.col("session") <= cost_coverage.end
         )
     # The canonical base panel stores derived controls under explicit
     # ``raw__`` names.  Normalize them at the label boundary rather than
