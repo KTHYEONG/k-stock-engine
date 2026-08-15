@@ -122,6 +122,10 @@ def test_train_net_alpha_writes_complete_no_trade_evidence(tmp_path) -> None:
     assert payload["promoted"] is False
     assert "promotion_reasons" in payload
     assert "gates" in payload
+    assert "oof_diagnostics" in payload
+    assert isinstance(payload["oof_diagnostics"], list)
+    assert payload["oof_diagnostics"]
+    assert "no-horizon-evidence" in payload["promotion_reasons"][0]
 
 
 def test_train_net_alpha_rejects_legacy_snapshot(tmp_path) -> None:
@@ -195,6 +199,7 @@ def test_train_net_alpha_v3_publishes_no_trade_without_positive_evidence(
     )
     assert metrics["no_trade"] is True
     assert metrics["promoted"] is False
+    assert "oof_diagnostics" in metrics
 
 
 def test_train_net_alpha_missing_realized_outcomes_fail_closed(tmp_path) -> None:

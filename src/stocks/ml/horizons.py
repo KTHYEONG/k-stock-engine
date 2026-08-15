@@ -26,18 +26,24 @@ class HorizonOOFEvidence:
     produced by the same exact policy kernel (``NetAlphaPolicyReplay``) for the
     given horizon; raw target values are never OOF economic evidence. Block
     length is at least the horizon so overlapping labels stay within one block.
+    ``model_family`` records which family produced the OOF scores: the
+    ElasticNet baseline or the LightGBM structural fallback used when the
+    baseline score diagnostics showed a constant/invalid OOF prediction.
     """
 
     horizon_sessions: int
     block_log_excess: tuple[float, ...]
     label_correlation: dict[int, float] = field(default_factory=dict)
     reasons: tuple[str, ...] = ()
+    model_family: str = "net_alpha_elastic_net"
 
     def __post_init__(self) -> None:
         if self.horizon_sessions < 1:
             raise ValueError("horizon_sessions must be a positive session count")
         if not self.block_log_excess:
             raise ValueError("horizon evidence requires a non-empty block series")
+        if not self.model_family:
+            raise ValueError("model_family must be non-empty")
 
 
 @dataclass(frozen=True, slots=True)
