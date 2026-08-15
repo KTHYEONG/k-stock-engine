@@ -7,8 +7,13 @@ The learner stack is an explicit baseline/challenger pair:
 - ``LightGbmNetAlpha`` is the L1-regression challenger with pinned seed and
   deterministic thread/leaf settings.
 - ``NetAlphaCalibrator`` fits a monotone calibration on OOF predictions only,
-  converting a score into an expected net alpha and a lower bound, without ever
-  reading an in-fold target.
+  converting a score into an expected net alpha and a decimal lower bound,
+  without ever reading an in-fold target. Calibration targets are decimal
+  realized returns (``risk_residual - reference_cost``), never the
+  MAD-standardized ``net_alpha_target``.
+- ``CalibratedNetAlphaModel`` wraps a fitted learner plus the fitted
+  calibration so the persisted artifact applies the decimal lower bound to
+  every production prediction.
 
 A challenger is accepted only when its paired OOF incremental policy-utility
 block-bootstrap lower bound over the baseline is strictly positive; otherwise
@@ -16,18 +21,19 @@ the baseline is retained or both are ``NO_TRADE``.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, replace
 
 import lightgbm as lgb
 import numpy as np
 import polars as pl
 from sklearn.linear_model import ElasticNet
 
-from src.stocks.research.models import ModelManifest
+from src.stocks.research.models import Model, ModelManifest
 
 TARGET_PREFIXES = ("target_", "label_")
 SCORE_COLUMN = "predicted_net_alpha"
-_MIN_BUCKET_OBSERVATIONS = 5
+MIN_BUCKET_OBSERVATIONS = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -351,15 +357,48 @@ class CalibrationState:
             ],
         }
 
+    @classmethod
+    def from_json(cls, payload: dict[str, object]) -> CalibrationState:
+        """Rehydrate a frozen calibration table from its JSON serialization."""
+        raw_buckets = payload.get("buckets") or []
+        if not isinstance(raw_buckets, list):
+            raise ValueError("calibration state 'buckets' must be a list")
+        buckets = tuple(
+            BucketEvidence(
+                bucket=int(item["bucket"]),
+                sample_size=int(item["sample_size"]),
+                expected_alpha=float(item["expected_alpha"]),
+                alpha_lower_bound=float(item["alpha_lower_bound"]),
+            )
+            for item in raw_buckets
+        )
+        raw_boundaries = payload.get("boundaries") or ()
+        boundaries = tuple(
+            float(value)
+            for value in (raw_boundaries if isinstance(raw_boundaries, list) else ())
+        )
+        raw_count = payload.get("bucket_count", 0)
+        bucket_count = int(raw_count) if isinstance(raw_count, (int, float)) else 0
+        return cls(
+            buckets=buckets,
+            bucket_count=bucket_count,
+            boundaries=boundaries,
+        )
+
 
 class NetAlphaCalibrator:
     """Monotone OOF-only calibration of scores to expected net alpha.
 
     Bucket boundaries and statistics are fit on out-of-fold predictions only;
     the in-fold targets are never read at calibration time. Each bucket is
-    usable only when it holds at least ``_MIN_BUCKET_OBSERVATIONS`` observations
+    usable only when it holds at least ``MIN_BUCKET_OBSERVATIONS`` observations
     and its seeded block-bootstrap lower bound is strictly positive; otherwise
     the bucket is treated as a non-trade signal.
+
+    The calibration label is a decimal realized return (``risk_residual -
+    reference_cost``), never the MAD-standardized ``net_alpha_target``, so the
+    ``net_alpha_lower_bound`` it emits is an economic return in compatible
+    units with replay transaction costs.
     """
 
     def __init__(
@@ -369,7 +408,7 @@ class NetAlphaCalibrator:
         n_bootstrap: int = 200,
         bootstrap_alpha: float = 0.05,
         block_length: int = 5,
-        label_column: str = "net_alpha",
+        label_column: str = "realized_net_return",
     ):
         if bucket_count < 2:
             raise ValueError("bucket_count must be at least 2")
@@ -380,6 +419,22 @@ class NetAlphaCalibrator:
         self._block_length = block_length
         self._label_column = label_column
         self._state: CalibrationState | None = None
+
+    @property
+    def state(self) -> CalibrationState:
+        """The frozen calibration table; raises until ``fit`` has run."""
+        if self._state is None:
+            raise ValueError("calibrator has no frozen state; call fit first")
+        return self._state
+
+    def state_json(self) -> dict[str, object]:
+        """JSON serialization of the frozen calibration table."""
+        return self.state.to_json()
+
+    def load_state(self, payload: dict[str, object]) -> NetAlphaCalibrator:
+        """Restore a frozen calibration table from its JSON serialization."""
+        self._state = CalibrationState.from_json(payload)
+        return self
 
     def fit(self, oof: pl.DataFrame) -> CalibrationState:
         """Fit monotone bucket statistics on OOF predictions only."""
@@ -412,7 +467,7 @@ class NetAlphaCalibrator:
         buckets: list[BucketEvidence] = []
         for bucket in range(self._bucket_count):
             rows = joined.filter(pl.col("__bucket") == bucket)
-            if rows.height < _MIN_BUCKET_OBSERVATIONS:
+            if rows.height < MIN_BUCKET_OBSERVATIONS:
                 continue
             labels = rows[self._label_column].to_numpy().astype(float)
             if not np.all(np.isfinite(labels)):
@@ -496,3 +551,37 @@ def _apply_calibration(
         pl.col("net_alpha_lower_bound").fill_null(0.0),
     )
     return merged.drop("bucket_idx")
+
+
+class CalibratedNetAlphaModel:
+    """Learner plus fitted calibration persisted as one production artifact.
+
+    ``predict`` delegates to the wrapped learner and then attaches the frozen
+    decimal ``net_alpha_lower_bound``, so production planning consumes the same
+    economic score the replay gated on. The wrapper is joblib-serialized with
+    the calibration table; ``manifest`` also records the serialized calibration
+    for auditability.
+    """
+
+    def __init__(self, model: Model, calibrator: NetAlphaCalibrator):
+        if model is None:
+            raise ValueError("CalibratedNetAlphaModel requires a base model")
+        if calibrator is None:
+            raise ValueError("CalibratedNetAlphaModel requires a fitted calibrator")
+        self._model = model
+        self._calibrator = calibrator
+
+    def fit(self, train: pl.DataFrame, validation: pl.DataFrame) -> None:
+        self._model.fit(train, validation)
+
+    def predict(self, frame: pl.DataFrame) -> pl.DataFrame:
+        scored = self._model.predict(frame)
+        return self._calibrator.apply(scored)
+
+    def manifest(self) -> ModelManifest:
+        base = self._model.manifest()
+        params = dict(base.params or {})
+        params["calibration_state"] = json.dumps(
+            self._calibrator.state.to_json(), sort_keys=True
+        )
+        return replace(base, params=params)

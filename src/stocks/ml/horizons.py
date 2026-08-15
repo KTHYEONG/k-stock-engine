@@ -129,6 +129,7 @@ def select_horizons(
     evidence: tuple[HorizonOOFEvidence, ...],
     bootstrap_alpha: float,
     seed: int,
+    n_bootstrap: int = DEFAULT_BOOTSTRAP_RESAMPLES,
 ) -> HorizonSelectionEvidence:
     """Select at most one primary and one conditional secondary horizon.
 
@@ -144,6 +145,8 @@ def select_horizons(
             series, in ascending horizon order.
         bootstrap_alpha: bootstrap alpha quantile for the lower bound.
         seed: deterministic bootstrap seed.
+        n_bootstrap: request-controlled moving-block bootstrap resample count;
+            values below two are rejected.
 
     Returns:
         ``HorizonSelectionEvidence``; ``primary_horizon_sessions`` is ``None``
@@ -153,6 +156,8 @@ def select_horizons(
         raise ValueError("select_horizons requires at least one candidate")
     if not 0.0 < bootstrap_alpha < 1.0:
         raise ValueError("bootstrap_alpha must be in (0, 1)")
+    if n_bootstrap < 2:
+        raise ValueError("n_bootstrap must be at least 2")
 
     ordered = tuple(sorted(evidence, key=lambda c: c.horizon_sessions))
     correlation = _horizon_correlation_matrix(ordered)
@@ -162,7 +167,7 @@ def select_horizons(
         lower_bounds[candidate.horizon_sessions] = _moving_block_bootstrap_lower_bound(
             candidate.block_log_excess,
             block_length,
-            n_bootstrap=DEFAULT_BOOTSTRAP_RESAMPLES,
+            n_bootstrap=n_bootstrap,
             seed=seed,
             alpha=bootstrap_alpha,
         )
@@ -191,7 +196,8 @@ def select_horizons(
     )
 
     secondary_horizon_sessions = _conditional_secondary(
-        primary, ordered, lower_bounds, alpha=bootstrap_alpha, seed=seed
+        primary, ordered, lower_bounds, alpha=bootstrap_alpha, seed=seed,
+        n_bootstrap=n_bootstrap,
     )
     if secondary_horizon_sessions is not None:
         reasons.append(
@@ -237,6 +243,7 @@ def _conditional_secondary(
     *,
     alpha: float,
     seed: int,
+    n_bootstrap: int = DEFAULT_BOOTSTRAP_RESAMPLES,
 ) -> int | None:
     """Conditional secondary: paired incremental lower bound over residualized primary."""
     primary_blocks = np.asarray(primary.block_log_excess, dtype=float)
@@ -260,7 +267,7 @@ def _conditional_secondary(
         bound = _moving_block_bootstrap_lower_bound(
             tuple(float(v) for v in residual),
             block_length,
-            n_bootstrap=DEFAULT_BOOTSTRAP_RESAMPLES,
+            n_bootstrap=n_bootstrap,
             seed=seed + candidate.horizon_sessions,
             alpha=alpha,
         )
