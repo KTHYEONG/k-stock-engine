@@ -377,10 +377,19 @@ class _ClusterSessionRecord:
 
 @dataclass(slots=True)
 class _ClusterBucketState:
-    """Chronologically appended per-session cluster aggregates for one bucket."""
+    """Chronologically appended per-session cluster aggregates for one bucket.
+
+    ``csum_sums``/``csum_counts`` mirror the length-``n + 1`` cumulative sums
+    that ``_session_cluster_bootstrap_means`` derives from the raw session
+    aggregates, so a new session only appends ``previous_total + delta``
+    instead of re-running ``np.cumsum`` over the whole history at every
+    ``state_at``. The prefix values are bit-identical to a fresh cumsum.
+    """
 
     session_sums: np.ndarray
     session_counts: np.ndarray
+    csum_sums: np.ndarray
+    csum_counts: np.ndarray
     row_sum: float
     row_count: int
     max_abs: float
@@ -390,6 +399,8 @@ class _ClusterBucketState:
         return cls(
             session_sums=np.zeros(0, dtype=np.float64),
             session_counts=np.zeros(0, dtype=np.float64),
+            csum_sums=np.zeros(1, dtype=np.float64),
+            csum_counts=np.zeros(1, dtype=np.float64),
             row_sum=0.0,
             row_count=0,
             max_abs=0.0,
@@ -546,6 +557,12 @@ class SessionClusterCalibrationSchedule:
                 self._buckets[int(bucket)] = state
             state.session_sums = np.append(state.session_sums, session_sum)
             state.session_counts = np.append(state.session_counts, session_count)
+            state.csum_sums = np.append(
+                state.csum_sums, state.csum_sums[-1] + session_sum
+            )
+            state.csum_counts = np.append(
+                state.csum_counts, state.csum_counts[-1] + session_count
+            )
             state.row_sum += float(session_sum)
             state.row_count += int(session_count)
             state.max_abs = max(
@@ -650,6 +667,8 @@ class SessionClusterCalibrationSchedule:
             max_start=max_start,
             n_bootstrap=self._calibrator.n_bootstrap,
             seed=self._calibrator.seed + bucket,
+            csum_sums=state.csum_sums,
+            csum_counts=state.csum_counts,
         )
         return float(np.quantile(means, self._calibrator.bootstrap_alpha))
 
@@ -708,6 +727,8 @@ def _session_cluster_bootstrap_means(
     max_start: int,
     n_bootstrap: int,
     seed: int,
+    csum_sums: np.ndarray | None = None,
+    csum_counts: np.ndarray | None = None,
 ) -> np.ndarray:
     """Deterministic moving-block bootstrap means over chronological sessions.
 
@@ -715,7 +736,10 @@ def _session_cluster_bootstrap_means(
     (the final block may be truncated) and computes ``draw_sum / draw_count``
     where the sum/count accumulate the sampled block residual sums/counts. The
     prefix-sum reduction keeps the workspace ``O(draws * n_blocks)`` and the
-    seeded RNG stream is consumed in a fixed row-major order.
+    seeded RNG stream is consumed in a fixed row-major order. ``csum_sums`` /
+    ``csum_counts`` may be supplied precomputed by an incremental schedule so
+    the per-decision cumulative-sum pass is skipped entirely; the prefix values
+    are bit-identical to a fresh ``np.cumsum`` of the raw aggregates.
     """
     if session_sums.size == 0:
         return np.zeros(n_bootstrap, dtype=np.float64)
@@ -729,10 +753,12 @@ def _session_cluster_bootstrap_means(
     max_start = max(1, min(max_start, n - block + 1))
     rng = np.random.default_rng(seed)
     starts = rng.integers(0, max_start, size=(n_bootstrap, n_blocks))
-    csum_sums = np.zeros(n + 1, dtype=np.float64)
-    csum_counts = np.zeros(n + 1, dtype=np.float64)
-    np.cumsum(session_sums, out=csum_sums[1:])
-    np.cumsum(session_counts, out=csum_counts[1:])
+    if csum_sums is None:
+        csum_sums = np.zeros(n + 1, dtype=np.float64)
+        np.cumsum(session_sums, out=csum_sums[1:])
+    if csum_counts is None:
+        csum_counts = np.zeros(n + 1, dtype=np.float64)
+        np.cumsum(session_counts, out=csum_counts[1:])
     full_blocks = np.arange(max(0, n_blocks - 1))
     sum_total = (
         csum_sums[starts[:, full_blocks] + block] - csum_sums[starts[:, full_blocks]]
