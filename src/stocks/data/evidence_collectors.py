@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import io
 import json
+import math
 import os
 import time
 import zipfile
@@ -193,6 +194,34 @@ def _iter_month_partitions(
         month_start = max(start, cursor)
         yield cursor.year, cursor.month, month_start, month_end
         cursor = next_month
+
+
+def _parse_price(value: str, field: str) -> float:
+    text = value.replace(",", "").strip()
+    if not text:
+        raise EvidenceCollectionError(f"KRX bar missing price {field}")
+    try:
+        price = float(text)
+    except ValueError as exc:
+        raise EvidenceCollectionError(f"KRX bar invalid price {field}: {value!r}") from exc
+    if not math.isfinite(price) or price < 0:
+        raise EvidenceCollectionError(
+            f"KRX bar has negative or non-finite price {field}: {value!r}"
+        )
+    return price
+
+
+def _parse_nonneg(value: str, field: str) -> float:
+    text = value.replace(",", "").strip()
+    if not text:
+        raise EvidenceCollectionError(f"KRX bar missing {field}")
+    try:
+        parsed = float(text)
+    except ValueError as exc:
+        raise EvidenceCollectionError(f"KRX bar invalid {field}: {value!r}") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise EvidenceCollectionError(f"KRX bar must be finite and non-negative {field}: {value!r}")
+    return parsed
 
 
 class KRXEvidenceCollector:
@@ -549,6 +578,437 @@ class KRXEvidenceCollector:
             generated_time=self.generated_time,
         )
         self.write_calendar(output_path, calendar)
+
+    BAR_SCHEMA_VERSION = "krx-daily-bars-manifest-1"
+    BAR_RECORD_FIELDS = (
+        "instrument_id",
+        "price_date",
+        "market",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "trading_value",
+    )
+
+    def _normalize_daily_bars(
+        self,
+        payload: dict[str, Any],
+        *,
+        price_date: date,
+        market: str,
+        endpoint: str,
+    ) -> list[dict[str, Any]]:
+        """Validate and normalize one full daily-trade response into bars.
+
+        The entire official response is fetched before any target-instrument
+        selection; a single invalid bar fails the whole partition so an official
+        no-bar is never confused with a malformed collection record. The
+        canonical identity mapping is ``KRX:<ISU_SRT_CD>`` and every bar is
+        keyed by ``(instrument_id, price_date)`` with positive, finite OHLC in
+        valid ordering.
+        """
+        raw = payload.get("OutBlock_1", [])
+        if not isinstance(raw, list):
+            raise EvidenceCollectionError(
+                f"KRX daily-trade records must be a list for {endpoint} on {price_date.isoformat()}"
+            )
+        bars: list[dict[str, Any]] = []
+        for index, item in enumerate(raw):
+            if not isinstance(item, dict):
+                raise EvidenceCollectionError(
+                    f"KRX daily-trade record {index} must be an object for {endpoint}"
+                )
+            symbol = _text(item, "ISU_SRT_CD", "ISU_CD")
+            if not symbol:
+                raise EvidenceCollectionError(
+                    f"KRX daily-trade record {index} lacks a symbol for {endpoint}"
+                )
+            open_price = _parse_price(_text(item, "TDD_OPNPRC"), "TDD_OPNPRC")
+            high = _parse_price(_text(item, "TDD_HGPRC"), "TDD_HGPRC")
+            low = _parse_price(_text(item, "TDD_LWPRC"), "TDD_LWPRC")
+            close = _parse_price(_text(item, "TDD_CLSPRC"), "TDD_CLSPRC")
+            volume = _parse_nonneg(
+                _text(item, "ACC_TRDVOL", "TRD_VOL"), "ACC_TRDVOL"
+            )
+            trading_value = _parse_nonneg(
+                _text(item, "ACC_TRDVAL", "TRD_AMT"), "ACC_TRDVAL"
+            )
+            if open_price <= 0 or high <= 0 or low <= 0 or close <= 0:
+                # KRX returns zero-priced records for a successfully served
+                # date when the instrument has no executable auction price.
+                # Preserve the response hash at partition level, but do not
+                # turn this into a fake executable OHLC bar.
+                continue
+            if high < max(open_price, close) or low > min(open_price, close):
+                raise EvidenceCollectionError(
+                    f"KRX bar for {symbol} on {price_date.isoformat()} violates "
+                    "OHLC ordering"
+                )
+            bars.append(
+                {
+                    "instrument_id": f"KRX:{symbol}",
+                    "price_date": price_date.isoformat(),
+                    "market": market,
+                    "open": open_price,
+                    "high": high,
+                    "low": low,
+                    "close": close,
+                    "volume": volume,
+                    "trading_value": trading_value,
+                }
+            )
+        seen: set[str] = set()
+        unique: list[dict[str, Any]] = []
+        for bar in bars:
+            key = f"{bar['instrument_id']}|{bar['price_date']}"
+            if key in seen:
+                raise EvidenceCollectionError(
+                    f"KRX duplicate (instrument_id, price_date) bar in {endpoint} "
+                    f"on {price_date.isoformat()}: {key}"
+                )
+            seen.add(key)
+            unique.append(bar)
+        return unique
+
+    def collect_daily_bars(self, as_of: date, market: str) -> list[dict[str, Any]]:
+        """Collect the full official KOSPI/KOSDAQ daily response for one date.
+
+        Bars are normalized, validated, and returned before any base-universe
+        filtering; an empty successful response is a confirmed no-bar, never a
+        collection failure. ``market`` selects ``ALL`` (both endpoints), or one
+        of ``KOSPI``/``KOSDAQ``.
+        """
+        if market not in ("ALL", "KOSPI", "KOSDAQ"):
+            raise ValueError(f"unknown KRX market {market!r}")
+        bars: list[dict[str, Any]] = []
+        for market_name, endpoint in self._daily_bar_endpoints(market):
+            payload = self._request_json(
+                endpoint, {"basDd": as_of.strftime("%Y%m%d")}
+            )
+            bars.extend(
+                self._normalize_daily_bars(
+                    payload, price_date=as_of, market=market_name, endpoint=endpoint
+                )
+            )
+        return bars
+
+    def _daily_bar_endpoints(self, market: str) -> Iterable[tuple[str, str]]:
+        if market in ("ALL", "KOSPI"):
+            yield "KOSPI", self.ENDPOINTS["KOSPI_TRADE"]
+        if market in ("ALL", "KOSDAQ"):
+            yield "KOSDAQ", self.ENDPOINTS["KOSDAQ_TRADE"]
+
+    def _bar_partition_path(self, output_dir: Path, price_date: date, market: str) -> Path:
+        return output_dir / "dates" / f"{price_date.isoformat()}-{market}.json"
+
+    def _bar_partition_complete_error(
+        self,
+        output_dir: Path,
+        price_date: date,
+        market: str,
+        entry: dict[str, Any] | None,
+    ) -> str | None:
+        """Return None when the date/market partition satisfies completion."""
+        path = self._bar_partition_path(output_dir, price_date, market)
+        if not path.is_file():
+            return f"bar partition missing: {path.name}"
+        try:
+            payload = _read_json_object(path)
+        except ValueError as exc:
+            return str(exc)
+        expected = f"krx-daily-bars-{price_date.isoformat()}-{market}"
+        if payload.get("version") != expected:
+            return "bar partition version mismatch"
+        if payload.get("market") != market or payload.get("requested_date") != price_date.isoformat():
+            return "bar partition request metadata mismatch"
+        if entry is None or entry.get("status") != "complete":
+            return "manifest entry not complete"
+        if entry.get("sha256") != hashlib.sha256(path.read_bytes()).hexdigest():
+            return "bar partition digest mismatch"
+        return None
+
+    def _load_or_init_bar_manifest(
+        self,
+        output_dir: Path,
+        start: date,
+        end: date,
+        markets: tuple[str, ...],
+    ) -> dict[str, Any]:
+        manifest_path = output_dir / "manifest.json"
+        if manifest_path.exists():
+            try:
+                payload = _read_json_object(manifest_path)
+            except ValueError as exc:
+                raise EvidenceCollectionError(
+                    f"resumable manifest unreadable: {manifest_path}"
+                ) from exc
+            if payload.get("schema_version") != self.BAR_SCHEMA_VERSION:
+                raise ValueError(f"incompatible resumable manifest schema in {output_dir}")
+            if (
+                payload.get("requested_start") != start.isoformat()
+                or payload.get("requested_end") != end.isoformat()
+            ):
+                raise ValueError(f"resumable manifest declares a different range in {output_dir}")
+            if tuple(payload.get("markets") or ()) != markets:
+                raise ValueError(f"resumable manifest declares different markets in {output_dir}")
+            payload.setdefault("dates", {})
+            return payload
+        return {
+            "schema_version": self.BAR_SCHEMA_VERSION,
+            "requested_start": start.isoformat(),
+            "requested_end": end.isoformat(),
+            "partition": "date-market",
+            "markets": list(markets),
+            "dates": {},
+        }
+
+    def _write_bar_partition(
+        self,
+        output_dir: Path,
+        price_date: date,
+        market: str,
+        endpoint: str,
+        payload: dict[str, Any],
+        bars: list[dict[str, Any]],
+    ) -> str:
+        """Atomically write one date/market bar partition and return its SHA-256."""
+        path = self._bar_partition_path(output_dir, price_date, market)
+        normalized = {
+            "version": f"krx-daily-bars-{price_date.isoformat()}-{market}",
+            "requested_date": price_date.isoformat(),
+            "market": market,
+            "endpoint": endpoint,
+            "generated_time": self.generated_time.isoformat(),
+            "raw_response_hash": _records_hash([payload]),
+            "parsed_schema_hash": schema_hash(list(self.BAR_RECORD_FIELDS)),
+            "retry_count": self._request_count,
+            "terminal_error_class": None,
+            "bar_count": len(bars),
+            "bars": bars,
+        }
+        text = json.dumps(normalized, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        _atomic_write_text(path, text)
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def collect_bar_partitions(
+        self,
+        output_dir: Path,
+        start: date,
+        end: date,
+        *,
+        market: str = "ALL",
+    ) -> None:
+        """Collect immutable daily bars as resumable date/market partitions.
+
+        The collection unit is one requested date/market response: a completed
+        partition is digest-validated before reuse and never re-requested. A
+        failing partition is marked incomplete and re-raised; prior partitions
+        are preserved. A successful response with zero bars is a complete
+        confirmed no-bar partition, never an empty collection record.
+        """
+        if start > end:
+            raise ValueError("start must not be after end")
+        if market not in ("ALL", "KOSPI", "KOSDAQ"):
+            raise ValueError(f"unknown KRX market {market!r}")
+        markets = tuple(name for name, _ in self._daily_bar_endpoints(market))
+        if output_dir.exists() and not output_dir.is_dir():
+            raise ValueError(f"resumable output target must be a directory: {output_dir}")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        manifest = self._load_or_init_bar_manifest(output_dir, start, end, markets)
+        current = start
+        while current <= end:
+            if current.weekday() < 5:
+                for market_name, endpoint in self._daily_bar_endpoints(market):
+                    key = f"{current.isoformat()}-{market_name}"
+                    entry = manifest["dates"].get(key)
+                    if (
+                        isinstance(entry, dict)
+                        and self._bar_partition_complete_error(
+                            output_dir, current, market_name, entry
+                        )
+                        is None
+                    ):
+                        continue
+                    try:
+                        payload = self._request_json(
+                            endpoint, {"basDd": current.strftime("%Y%m%d")}
+                        )
+                        bars = self._normalize_daily_bars(
+                            payload, price_date=current, market=market_name, endpoint=endpoint
+                        )
+                        digest = self._write_bar_partition(
+                            output_dir, current, market_name, endpoint, payload, bars
+                        )
+                        manifest["dates"][key] = {
+                            "status": "complete",
+                            "path": f"dates/{current.isoformat()}-{market_name}.json",
+                            "bar_count": len(bars),
+                            "sha256": digest,
+                        }
+                    except Exception as exc:
+                        manifest["dates"][key] = {
+                            "status": "incomplete",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                        _write_json(output_dir / "manifest.json", manifest)
+                        raise EvidenceCollectionError(
+                            f"KRX daily-bar partition {key} collection failed"
+                        ) from exc
+                    _write_json(output_dir / "manifest.json", manifest)
+            current += timedelta(days=1)
+
+    def merge_bar_partitions(
+        self, input_dir: Path, start: date, end: date, output_path: Path
+    ) -> None:
+        """Merge only digest-validated complete date/market partitions into one artifact."""
+        if start > end:
+            raise ValueError("start must not be after end")
+        if not input_dir.is_dir():
+            raise ValueError(f"resumable input must be an existing directory: {input_dir}")
+        manifest_path = input_dir / "manifest.json"
+        if not manifest_path.is_file():
+            raise EvidenceCollectionError(f"resumable manifest missing: {manifest_path}")
+        manifest = _read_json_object(manifest_path)
+        if manifest.get("schema_version") != self.BAR_SCHEMA_VERSION:
+            raise ValueError(f"incompatible resumable manifest schema in {input_dir}")
+        if (
+            manifest.get("requested_start") != start.isoformat()
+            or manifest.get("requested_end") != end.isoformat()
+        ):
+            raise ValueError(f"resumable manifest declares a different range in {input_dir}")
+        markets = tuple(manifest.get("markets") or ())
+        merged: list[dict[str, Any]] = []
+        current = start
+        while current <= end:
+            if current.weekday() < 5:
+                for market_name in markets:
+                    key = f"{current.isoformat()}-{market_name}"
+                    entry = manifest["dates"].get(key)
+                    error = self._bar_partition_complete_error(
+                        input_dir, current, market_name, entry
+                    )
+                    if error is not None:
+                        raise EvidenceCollectionError(
+                            f"KRX daily-bar merge missing valid partition {key}: {error}"
+                        )
+                    payload = _read_json_object(
+                        self._bar_partition_path(input_dir, current, market_name)
+                    )
+                    merged.extend(payload["bars"])
+            current += timedelta(days=1)
+        seen: set[tuple[str, str]] = set()
+        unique: list[dict[str, Any]] = []
+        for bar in merged:
+            bar_key = (bar["instrument_id"], bar["price_date"])
+            if bar_key in seen:
+                raise EvidenceCollectionError(
+                    f"KRX duplicate (instrument_id, price_date) bar across partitions: {bar_key}"
+                )
+            seen.add(bar_key)
+            unique.append(bar)
+        unique.sort(key=lambda bar: (bar["price_date"], bar["instrument_id"], bar["market"]))
+        text = json.dumps(
+            {
+                "version": f"krx-daily-bars-{start.isoformat()}-{end.isoformat()}",
+                "generated_time": self.generated_time.isoformat(),
+                "record_count": len(unique),
+                "records": unique,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+        ) + "\n"
+        new_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if output_path.exists():
+            if hashlib.sha256(output_path.read_bytes()).hexdigest() == new_digest:
+                return
+            raise EvidenceCollectionError(
+                f"bar merge output already exists with different content: {output_path}"
+            )
+        _atomic_write_text(output_path, text)
+
+    def publish_bar_dataset(
+        self,
+        input_dir: Path,
+        start: date,
+        end: date,
+        output_path: Path,
+        catalog_root: Path,
+        name: str,
+    ) -> CatalogEntry:
+        """Publish one immutable complete daily-bar evidence artifact into the catalog.
+
+        ``merge_bar_partitions`` revalidates every date/market partition before
+        emitting bytes; the merged artifact is then re-checked for the exact
+        version, integer count, required fields, ``(price_date, instrument_id)``
+        uniqueness, and count equality. Only then is a complete ``RAW_BARS``
+        entry registered under ``name``; a divergent existing record fails
+        without mutation.
+        """
+        if not name:
+            raise ValueError("bar publication requires an explicit name")
+        if output_path.is_file():
+            try:
+                existing_payload = _read_json_object(output_path)
+                raw_generated = existing_payload.get("generated_time")
+                if isinstance(raw_generated, str):
+                    self.generated_time = datetime.fromisoformat(raw_generated)
+            except ValueError:
+                pass
+        self.merge_bar_partitions(input_dir, start, end, output_path)
+        payload = _read_json_object(output_path)
+        expected_version = f"krx-daily-bars-{start.isoformat()}-{end.isoformat()}"
+        if payload.get("version") != expected_version:
+            raise ValueError(
+                "merged bar artifact version mismatch: expected "
+                f"{expected_version!r}, got {payload.get('version')!r}"
+            )
+        record_count = payload.get("record_count")
+        if not isinstance(record_count, int) or isinstance(record_count, bool):
+            raise ValueError("merged bar record_count must be an integer")
+        records = payload.get("records")
+        if not isinstance(records, list):
+            raise ValueError("merged bar records must be a list")
+        if len(records) != record_count:
+            raise ValueError(
+                f"merged bar record_count {record_count} does not match {len(records)} records"
+            )
+        for index, record in enumerate(records):
+            if not isinstance(record, dict):
+                raise ValueError(f"merged bar record {index} must be an object")
+            missing = [field for field in self.BAR_RECORD_FIELDS if field not in record]
+            if missing:
+                raise ValueError(
+                    f"merged bar record {index} missing required fields: {missing}"
+                )
+        keys = [(record["price_date"], record["instrument_id"]) for record in records]
+        if len(set(keys)) != len(keys):
+            raise ValueError("merged bar records contain duplicate (price_date, instrument_id)")
+        content_hash = hashlib.sha256(output_path.read_bytes()).hexdigest()
+        entry = CatalogEntry(
+            kind=CatalogKind.RAW_BARS,
+            name=name,
+            content_hash=content_hash,
+            schema_hash=schema_hash(list(self.BAR_RECORD_FIELDS)),
+            registered_at=datetime.now(UTC),
+            coverage=CoverageRange(start=start, end=end),
+            completeness=EvidenceCompleteness.COMPLETE,
+            path=str(output_path),
+            row_count=record_count,
+        )
+        store = CatalogStore(Path(catalog_root))
+        existing = store.get(entry.kind, entry.name)
+        if existing is not None:
+            if _disclosure_entry_matches(existing, entry):
+                return existing
+            raise ValueError(
+                f"catalog already has {entry.kind.value}:{entry.name} "
+                "with different immutable fields"
+            )
+        store.register(entry)
+        return entry
 
 
 class OpenDartEvidenceCollector:

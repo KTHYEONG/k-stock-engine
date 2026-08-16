@@ -14,6 +14,7 @@ snapshot manifest. Nothing is ever deleted.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -61,8 +62,15 @@ from src.stocks.data.labels import (
     publish_net_alpha_label_dataset,
     publish_residual_o2o_label_dataset,
 )
+from src.stocks.data.outcome_evidence import (
+    OUTCOME_EVIDENCE_DATASET_SUFFIX,
+    build_partitioned_outcome_evidence,
+    publish_outcome_evidence_dataset,
+)
+from src.stocks.data.outcome_open_bars import load_outcome_open_bar_evidence
 from src.stocks.data.quality import KRXSessionCalendar
 from src.stocks.data.repositories import ResearchDataRepository
+from src.stocks.domain.execution_policy import ExecutionOutcomePolicy
 from src.stocks.ml.contracts import DEFAULT_CANDIDATE_HORIZON_SESSIONS
 from src.stocks.research.features import stock_alpha_v2_allowlist
 from src.storage.parquet_datasets import ParquetDatasetStore
@@ -895,11 +903,17 @@ def _replacement_references(
     feature_entry: CatalogEntry,
     label_entry: CatalogEntry,
     status_entry: CatalogEntry | None = None,
+    raw_bar_entry: CatalogEntry | None = None,
+    outcome_open_entry: CatalogEntry | None = None,
+    evidence_entry: CatalogEntry | None = None,
 ) -> tuple[CatalogEntry, ...]:
-    """Source references with FEATURES/LABELS/OUTCOME_STATUS replaced (or appended)."""
+    """Source references with derived artifacts replaced (or appended)."""
     replaced_features = False
     replaced_labels = False
     replaced_status = False
+    replaced_raw_bars = False
+    replaced_outcome_open = False
+    replaced_evidence = False
     refs: list[CatalogEntry] = []
     for entry in source.manifest.references:
         if entry.kind is CatalogKind.FEATURES:
@@ -912,6 +926,17 @@ def _replacement_references(
             if status_entry is not None:
                 refs.append(status_entry)
                 replaced_status = True
+        elif entry.kind is CatalogKind.RAW_BARS:
+            refs.append(raw_bar_entry or entry)
+            replaced_raw_bars = raw_bar_entry is not None
+        elif entry.kind is CatalogKind.OUTCOME_OPEN_BARS:
+            if outcome_open_entry is not None:
+                refs.append(outcome_open_entry)
+                replaced_outcome_open = True
+        elif entry.kind is CatalogKind.OUTCOME_EVIDENCE:
+            if evidence_entry is not None:
+                refs.append(evidence_entry)
+                replaced_evidence = True
         else:
             refs.append(entry)
     if not replaced_features:
@@ -920,7 +945,55 @@ def _replacement_references(
         refs.append(label_entry)
     if status_entry is not None and not replaced_status:
         refs.append(status_entry)
+    if raw_bar_entry is not None and not replaced_raw_bars:
+        refs.append(raw_bar_entry)
+    if outcome_open_entry is not None and not replaced_outcome_open:
+        refs.append(outcome_open_entry)
+    if evidence_entry is not None and not replaced_evidence:
+        refs.append(evidence_entry)
     return tuple(refs)
+
+
+def _load_raw_bar_evidence(
+    catalog: CatalogStore,
+    dataset_id: str | None,
+) -> tuple[CatalogEntry | None, pl.DataFrame | None]:
+    """Load one hash-verified immutable RAW_BARS artifact without network I/O."""
+    if dataset_id is None:
+        return None, None
+    entry = catalog.get(CatalogKind.RAW_BARS, dataset_id)
+    if entry is None:
+        raise ValueError(f"raw bar dataset not found: {dataset_id!r}")
+    if entry.completeness is not EvidenceCompleteness.COMPLETE:
+        raise ValueError(f"raw bar dataset is not complete: {dataset_id!r}")
+    path = Path(entry.path)
+    if not path.is_file():
+        raise ValueError(f"raw bar dataset path is not a file: {path}")
+    content = path.read_bytes()
+    if hashlib.sha256(content).hexdigest() != entry.content_hash:
+        raise ValueError(f"raw bar dataset hash mismatch: {dataset_id!r}")
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"raw bar dataset is invalid JSON: {path}") from exc
+    records = payload.get("records") if isinstance(payload, dict) else None
+    if not isinstance(records, list):
+        raise ValueError("raw bar dataset records must be a list")
+    if payload.get("record_count") != len(records):
+        raise ValueError("raw bar dataset record_count mismatch")
+    required = {"instrument_id", "price_date", "open"}
+    if any(not isinstance(record, dict) or not required.issubset(record) for record in records):
+        raise ValueError("raw bar dataset contains an invalid record")
+    if not records:
+        return entry, pl.DataFrame(
+            schema={"instrument_id": pl.Utf8, "price_date": pl.Date, "open": pl.Float64}
+        )
+    frame = pl.DataFrame(records).select(
+        pl.col("instrument_id").cast(pl.Utf8),
+        pl.col("price_date").cast(pl.Date),
+        pl.col("open").cast(pl.Float64),
+    )
+    return entry, frame
 
 
 def _write_manifest_atomic(catalog_root: Path, manifest: SnapshotManifest) -> None:
@@ -963,6 +1036,9 @@ class NetAlphaMaterializationRequest:
     calendar_path: Path | None = None
     candidate_horizon_sessions: tuple[int, ...] = DEFAULT_CANDIDATE_HORIZON_SESSIONS
     reference_notional: float = 100_000_000.0
+    policy: ExecutionOutcomePolicy | None = None
+    raw_bar_dataset_id: str | None = None
+    outcome_open_bar_dataset_id: str | None = None
 
     def __post_init__(self) -> None:
         for field in (
@@ -987,6 +1063,12 @@ class NetAlphaMaterializationRequest:
             raise ValueError("candidate_horizon_sessions must be positive sessions")
         if self.reference_notional <= 0:
             raise ValueError("reference_notional must be positive")
+        if self.raw_bar_dataset_id is not None and not self.raw_bar_dataset_id:
+            raise ValueError("raw_bar_dataset_id must be non-empty when supplied")
+        if self.outcome_open_bar_dataset_id is not None and not self.outcome_open_bar_dataset_id:
+            raise ValueError("outcome_open_bar_dataset_id must be non-empty when supplied")
+        if self.raw_bar_dataset_id is not None and self.outcome_open_bar_dataset_id is not None:
+            raise ValueError("supply either raw_bar_dataset_id or outcome_open_bar_dataset_id")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1002,6 +1084,7 @@ class NetAlphaMaterializationResult:
     label_row_count: int
     min_coverage: float
     certification: DatasetCertification
+    policy_id: str = "scheduled_open_v1"
 
 
 def materialize_net_alpha_snapshot(
@@ -1027,6 +1110,12 @@ def materialize_net_alpha_snapshot(
         publish_partitioned_net_alpha_label_dataset,
     )
 
+    policy = request.policy
+    if policy is None:
+        from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
+
+        policy = SCHEDULED_OPEN_V1
+
     catalog = CatalogStore(request.catalog_root)
     source = SnapshotResolver(catalog).resolve(request.source_snapshot_id)
     if source.base_panel is None:
@@ -1037,6 +1126,12 @@ def materialize_net_alpha_snapshot(
     calendar_entry = source.calendar
     base_store = ParquetDatasetStore(request.base_root)
     base_manifest = base_store.read_manifest(base_entry.name)
+    raw_bar_entry, raw_bar_evidence = _load_raw_bar_evidence(catalog, request.raw_bar_dataset_id)
+    outcome_open_entry, outcome_open_evidence = load_outcome_open_bar_evidence(
+        catalog, request.outcome_open_bar_dataset_id, request.generated_time
+    )
+    if outcome_open_evidence is not None:
+        raw_bar_evidence = outcome_open_evidence
     calendar = _load_calendar(request, source, calendar_entry)
     _preflight(request, catalog, source, base_manifest, calendar)
 
@@ -1127,6 +1222,8 @@ def materialize_net_alpha_snapshot(
         liquidity_model,
         horizon_sessions=request.candidate_horizon_sessions,
         reference_notional=request.reference_notional,
+        policy=policy,
+        bar_evidence=raw_bar_evidence,
     )
     label_result = publish_partitioned_net_alpha_label_dataset(
         labels_frame,
@@ -1148,6 +1245,25 @@ def materialize_net_alpha_snapshot(
         horizon_sessions=request.candidate_horizon_sessions,
         certification=request.certification,
         generated_time=request.generated_time,
+        policy=policy,
+    )
+    evidence_frame = build_partitioned_outcome_evidence(
+        base_frame,
+        calendar,
+        horizon_sessions=request.candidate_horizon_sessions,
+        policy=policy,
+        bar_evidence=raw_bar_evidence,
+    )
+    evidence_result = publish_outcome_evidence_dataset(
+        evidence_frame,
+        destination_root=request.label_root,
+        dataset_id=f"{request.label_dataset_id}{OUTCOME_EVIDENCE_DATASET_SUFFIX}",
+        base_panel_hash=base_manifest.content_hash,
+        calendar_hash=calendar.content_hash,
+        horizon_sessions=request.candidate_horizon_sessions,
+        certification=request.certification,
+        generated_time=request.generated_time,
+        policy=policy,
     )
 
     feature_entry = CatalogEntry(
@@ -1168,6 +1284,12 @@ def materialize_net_alpha_snapshot(
         ),
         row_count=feature_result.row_count,
     )
+    label_references: list[tuple[str, str]] = [
+        (CatalogKind.BASE_PANEL.value, base_entry.name),
+        (CatalogKind.CALENDAR.value, calendar_entry.name),
+    ]
+    if raw_bar_entry is not None:
+        label_references.append((CatalogKind.RAW_BARS.value, raw_bar_entry.name))
     label_entry = CatalogEntry(
         kind=CatalogKind.LABELS,
         name=request.label_dataset_id,
@@ -1180,10 +1302,7 @@ def materialize_net_alpha_snapshot(
         ),
         completeness=EvidenceCompleteness.COMPLETE,
         path=str(request.label_root / request.label_dataset_id),
-        references=(
-            (CatalogKind.BASE_PANEL.value, base_entry.name),
-            (CatalogKind.CALENDAR.value, calendar_entry.name),
-        ),
+        references=tuple(label_references),
         row_count=label_result.row_count,
     )
     status_references: list[tuple[str, str]] = [
@@ -1200,6 +1319,8 @@ def materialize_net_alpha_snapshot(
             (CatalogKind.CORPORATE_ACTIONS.value, source.corporate_actions.name)
         )
     status_references.append((CatalogKind.COSTS.value, cost_entry.name))
+    if raw_bar_entry is not None:
+        status_references.append((CatalogKind.RAW_BARS.value, raw_bar_entry.name))
     status_entry = CatalogEntry(
         kind=CatalogKind.OUTCOME_STATUS,
         name=status_result.dataset_id,
@@ -1215,9 +1336,33 @@ def materialize_net_alpha_snapshot(
         references=tuple(status_references),
         row_count=status_result.row_count,
     )
+    evidence_references: list[tuple[str, str]] = [
+        (CatalogKind.BASE_PANEL.value, base_entry.name),
+        (CatalogKind.CALENDAR.value, calendar_entry.name),
+        (CatalogKind.LABELS.value, request.label_dataset_id),
+        (CatalogKind.OUTCOME_STATUS.value, status_result.dataset_id),
+    ]
+    if raw_bar_entry is not None:
+        evidence_references.append((CatalogKind.RAW_BARS.value, raw_bar_entry.name))
+    evidence_entry = CatalogEntry(
+        kind=CatalogKind.OUTCOME_EVIDENCE,
+        name=evidence_result.dataset_id,
+        content_hash=evidence_result.manifest.content_hash,
+        schema_hash=evidence_result.manifest.schema_hash,
+        registered_at=request.generated_time,
+        coverage=CoverageRange(
+            start=evidence_result.manifest.time_start.date(),
+            end=evidence_result.manifest.time_end.date(),
+        ),
+        completeness=EvidenceCompleteness.COMPLETE,
+        path=str(request.label_root / evidence_result.dataset_id),
+        references=tuple(evidence_references),
+        row_count=evidence_result.row_count,
+    )
     catalog.register(feature_entry)
     catalog.register(label_entry)
     catalog.register(status_entry)
+    catalog.register(evidence_entry)
 
     manifest = build_snapshot_manifest(
         snapshot_id=request.snapshot_id,
@@ -1225,18 +1370,21 @@ def materialize_net_alpha_snapshot(
         timing_convention=source.manifest.timing_convention,
         windows=request.windows,
         references=_replacement_references(
-            source, feature_entry, label_entry, status_entry
+            source, feature_entry, label_entry, status_entry, raw_bar_entry,
+            outcome_open_entry, evidence_entry,
         ),
     )
     _write_manifest_atomic(request.catalog_root, manifest)
 
     logger.info(
-        "materialized net-alpha snapshot %s: features %s, labels %s, status %s "
-        "horizons %s",
+        "materialized net-alpha snapshot %s: features %s, labels %s, status %s, "
+        "evidence %s, policy %s horizons %s",
         request.snapshot_id,
         request.feature_dataset_id,
         request.label_dataset_id,
         status_result.dataset_id,
+        evidence_result.dataset_id,
+        policy.policy_id,
         list(request.candidate_horizon_sessions),
     )
     return NetAlphaMaterializationResult(
@@ -1249,4 +1397,5 @@ def materialize_net_alpha_snapshot(
         label_row_count=label_result.row_count,
         min_coverage=request.min_coverage,
         certification=request.certification,
+        policy_id=policy.policy_id,
     )

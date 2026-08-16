@@ -20,6 +20,7 @@ from src.core.costs import CostSchedule, LiquiditySlippageModel
 from src.core.datasets import DatasetManifest
 
 if TYPE_CHECKING:
+    from src.stocks.domain.execution_policy import ExecutionOutcomePolicy
     from src.stocks.ml.data import HorizonOutcomeCoverage
 
 DEFAULT_CANDIDATE_HORIZON_SESSIONS = (3, 5, 8, 10, 15, 20)
@@ -275,6 +276,7 @@ class NetAlphaTrainingRequest:
     stress_cost_schedule: CostSchedule | None = None
     liquidity_model: LiquiditySlippageModel | None = None
     stress_liquidity_model: LiquiditySlippageModel | None = None
+    execution_policy: ExecutionOutcomePolicy | None = None
 
     def __post_init__(self) -> None:
         if not self.artifact_id:

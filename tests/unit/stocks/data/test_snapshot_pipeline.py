@@ -292,6 +292,7 @@ class TestSnapshotPipeline:
         )
 
     def test_provisional_snapshot_rejected_for_paper_live(self, tmp_path) -> None:
+        """SCENARIO_PAPER_REMAINS_STRICT"""
         pipeline = build_pipeline(tmp_path)
         from src.stocks.data.catalog import SnapshotResolver
 

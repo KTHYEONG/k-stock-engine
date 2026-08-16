@@ -9,23 +9,25 @@ priority: 8
 
 ## 1. Core Principles
 1. **Explain "Why", Not "What":** Omit obvious code behavior comments. Explain only business context, mathematical rationale, domain constraints, or non-obvious optimizations.
-2. **Token & Patch Efficiency:** Keep comments to a single line where possible. Avoid verbose explanations to reduce token usage and ensure clean diff matching.
-3. **Language Policy:**
+2. **Token & Patch Efficiency:** Keep comments to a single line (max 2 lines). Explain only immediate domain invariants or mathematical reasons. Avoid verbose multi-line explanations or storytelling.
+3. **No Ephemeral Spec References:** NEVER reference temporary `docs/specs/*.md` or `contract.json` paths in code, docstrings, CLI help texts, or comments. Specs are temporary artifacts purged during the sync phase. If external reference is necessary, use persistent `ADR-XXXX` identifiers or self-contained domain rationale.
+4. **Language Policy:**
    - **Docstrings & External Docs:** English only (maintains compatibility with standard Python IDE tools and global conventions).
    - **In-line Comments (`#`):** Korean preferred (ensures fast intuition and readability for Korean maintainers).
-4. **Chat Notification Conciseness:** Keep chat responses and skill status notifications strictly under 5 bullet points (under 80 tokens). Move detailed rationale, experiment logs, and failure histories into markdown files in `docs/` or artifact files.
+5. **Chat Notification Conciseness:** Keep chat responses and skill status notifications strictly under 5 bullet points (under 80 tokens). Move detailed rationale, experiment logs, and failure histories into markdown files in `docs/` or artifact files.
 
 ## 2. Docstring Rules
 - **Standard Format:** Apply Google Style Docstrings (`Args:`, `Returns:`, `Raises:`) for all public classes, functions, and methods.
-- **Conciseness:** Keep descriptions brief and focused on contract and behavior constraints.
+- **Conciseness:** Keep descriptions brief and focused on contract and behavior constraints. Do NOT include temporary spec links or historical design journals.
 - **Private Symbols (`_foo`):** Omit docstrings for internal/private helper functions unless logic is highly complex.
 
 ## 3. In-line Comment Rules (`#`)
 - **Prohibited:**
-  - **Lint / Fix Annotations:** Do NOT leave explanatory comments next to fixes during linter or type-checking cycles (e.g. `x: int = 1  # type fix for mypy`, `import sys  # fixed ruff F401`).
+  - **Ephemeral Spec References:** Citing temporary spec paths/sections (e.g. `# docs/specs/foo.md §2.1`).
+  - **Conversational & Historical Prose:** Multi-line narratives, task progress chronicles, or AI decision logs.
+  - **Lint / Fix Annotations:** Explanatory comments next to fixes during linter or type-checking cycles (e.g. `x: int = 1  # type fix for mypy`, `import sys  # fixed ruff F401`).
   - **Code Restatement:** Restating obvious code in prose (e.g., `i += 1  # increment counter`, `return result  # return result`).
-  - **Conversational Prose:** Multi-line or meta comments about task progress, AI decisions, or refactoring history.
-- **Required / Recommended:**
+- **Required / Recommended (Strictly 1-2 lines max):**
   - **Quant & Mathematical Formulae:** Rationale for formula derivations, slippage, or fee adjustments.
   - **Domain & Exchange Limits:** Reasons for rate limit handling, boundary caps, or API workarounds.
   - **Performance Trade-offs:** Rationale for choosing specific data structures or algorithmic shortcuts.

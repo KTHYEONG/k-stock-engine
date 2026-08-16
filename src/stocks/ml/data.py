@@ -203,7 +203,9 @@ def compose_net_alpha_training_data(
     feature frame (one row per ``(instrument_id, session)``) is extracted
     without label/target columns; each candidate horizon's label rows are
     point-in-time filtered to ``label_available_time <= decision_time`` and
-    joined independently, preserving per-horizon universes.
+    joined independently, preserving per-horizon universes. Retained horizon
+    labels are narrow (identity, target, availability, realized outcomes);
+    execution columns are late-bound by the trainer at fit time.
 
     Args:
         snapshot: the immutable net-alpha snapshot (feature_set
@@ -342,8 +344,10 @@ def compose_net_alpha_training_data(
             & pl.col(AVAILABLE_COLUMN).is_not_null()
             & (pl.col(AVAILABLE_COLUMN) <= decision_time)
         )
-        joined = feature_frame.join(
-            available,
+        # Retain only the narrow horizon labels; execution columns are late-bound
+        # from ``feature_frame`` by ``_build_label_join`` during fitting.
+        joined = available.join(
+            feature_frame.select(ID_COLUMN, _FEATURE_SESSION),
             on=[ID_COLUMN, _FEATURE_SESSION],
             how="inner",
         ).sort([ID_COLUMN, _FEATURE_SESSION])

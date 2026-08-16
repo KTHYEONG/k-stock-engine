@@ -59,6 +59,27 @@ def weekdays(n: int = 20) -> list[date]:
 SESSIONS = weekdays(20)
 
 
+def test_materialization_uses_projection() -> None:
+    """The request contract makes raw and compact outcome sources exclusive."""
+    # materialization_uses_projection
+    from src.stocks.data.research_v2 import NetAlphaMaterializationRequest
+
+    windows = ResearchWindows(
+        train=CoverageRange(start=date(2020, 1, 1), end=date(2020, 1, 2)),
+        validation=CoverageRange(start=date(2020, 1, 3), end=date(2020, 1, 4)),
+        test=CoverageRange(start=date(2020, 1, 5), end=date(2020, 1, 6)),
+    )
+    with pytest.raises(ValueError, match="either raw_bar_dataset_id or outcome_open_bar_dataset_id"):
+        NetAlphaMaterializationRequest(
+            source_snapshot_id="source", feature_dataset_id="features", label_dataset_id="labels",
+            snapshot_id="snapshot", catalog_root=Path("catalog"), base_root=Path("base"),
+            feature_root=Path("features"), label_root=Path("labels"),
+            generated_time=datetime(2024, 1, 10, tzinfo=UTC), windows=windows,
+            certification=DatasetCertification.PROVISIONAL, raw_bar_dataset_id="raw",
+            outcome_open_bar_dataset_id="projection",
+        )
+
+
 def session_dt(session: date) -> datetime:
     return datetime.combine(session, datetime.min.time(), tzinfo=UTC)
 
@@ -787,6 +808,10 @@ class TestMaterializeSnapshot:
         assert resolved.outcome_status is not None
         assert resolved.outcome_status.name == "labels_na_outcome_status"
         assert resolved.status_provenance == "pinned"
+        assert any(
+            entry.kind is CatalogKind.OUTCOME_EVIDENCE
+            for entry in resolved.manifest.references
+        ), "SCENARIO_SNAPSHOT_PINS_OUTCOME_EVIDENCE"
 
         repository = ResearchDataRepository(
             base_root=base_root,

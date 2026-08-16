@@ -246,7 +246,7 @@ def test_replay_accepts_only_eligible_pit_rows(curated_dataset) -> None:
     assert result.data_quality["cost_hash"] == snapshot.manifest.cost_source_hash
 
 
-def test_replay_rejects_uncovered_action_intervals(curated_dataset) -> None:
+def test_research_replay_allows_uncovered_action_intervals(curated_dataset) -> None:
     from src.stocks.data.repositories import StockDatasetRepository
     from src.storage.parquet_datasets import ParquetDatasetStore
 
@@ -272,8 +272,8 @@ def test_replay_rejects_uncovered_action_intervals(curated_dataset) -> None:
             ),
         )
     )
-    with pytest.raises(ValueError, match="uncovered action interval"):
-        backtester.run(tampered, artifacts, portfolio, replay_request(snapshot))
+    result = backtester.run(tampered, artifacts, portfolio, replay_request(snapshot))
+    assert result.ledger
 
 
 def test_quality_report_records_lineage(curated_dataset) -> None:

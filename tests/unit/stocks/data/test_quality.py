@@ -203,7 +203,12 @@ class TestScenario03ActionIntervals:
             ),
             generated_time=datetime(2026, 1, 1, tzinfo=UTC),
         )
-        report = validate_canonical_stock_panel(frame, master(), partial, research_policy())
+        report = validate_canonical_stock_panel(
+            frame,
+            master(),
+            partial,
+            research_policy(certification=DatasetCertification.PRODUCTION),
+        )
         assert report.reason_counts["uncovered_action_interval"] >= 2
         uncovered = report.quarantined.filter(
             pl.col(QUALITY_REASON_COLUMN) == "uncovered_action_interval"
@@ -252,6 +257,21 @@ class TestScenario04FeatureAvailability:
                 StockDataQualityPolicy(certification=DatasetCertification.RESEARCH),
             )
 
+    def test_scenario_research_public_price_panel_does_not_require_actions(self) -> None:
+        """SCENARIO_RESEARCH_PUBLIC_PRICE_PANEL: public-price research is not adjusted."""
+        frame = panel([bar(day) for day in SESSIONS])
+
+        report = validate_canonical_stock_panel(
+            frame,
+            master(),
+            None,
+            research_policy(),
+        )
+
+        assert report.eligible_row_count == frame.height
+        assert report.quarantined_row_count == 0
+        assert report.eligible["action_interval_covered"].null_count() == frame.height
+
     def test_research_rejects_undocumented_feature_column(self) -> None:
         frame = panel([bar(day, roe=0.1) for day in SESSIONS])
         with pytest.raises(ValueError, match="FeatureAvailabilityRecord"):
@@ -287,7 +307,8 @@ class TestScenario04FeatureAvailability:
 
 
 class TestCertificationEvidence:
-    def test_production_requires_master_actions_calendar(self) -> None:
+    def test_scenario_production_action_gate_requires_master_actions_calendar(self) -> None:
+        """SCENARIO_PRODUCTION_ACTION_GATE: adjusted evidence remains fail-closed."""
         frame = panel([bar(day) for day in SESSIONS])
         with pytest.raises(ValueError, match="CorporateActionSnapshot"):
             validate_canonical_stock_panel(

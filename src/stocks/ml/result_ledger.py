@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import tempfile
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -81,6 +82,21 @@ def peak_rss_mib() -> float | None:
 
         return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 3)
     except (ImportError, AttributeError, ValueError):
+        return None
+
+
+def current_rss_mib() -> float | None:
+    """Return the current resident set size in MiB, or ``None`` when unavailable.
+
+    Reads ``/proc/self/statm`` on Linux; any failure records ``None``, never a
+    fabricated zero.
+    """
+    try:
+        with open("/proc/self/statm", encoding="utf-8") as handle:
+            pages = int(handle.read().split()[1])
+        page_bytes = os.sysconf("SC_PAGE_SIZE")
+        return round(pages * page_bytes / (1024.0 * 1024.0), 3)
+    except (OSError, ValueError, IndexError, AttributeError):
         return None
 
 

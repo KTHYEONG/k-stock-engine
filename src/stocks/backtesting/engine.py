@@ -23,7 +23,7 @@ import numpy as np
 import polars as pl
 
 from src.core.costs import CostSchedule, FillCostBreakdown, LiquiditySlippageModel
-from src.core.datasets import DatasetManifest
+from src.core.datasets import DatasetCertification, DatasetManifest
 from src.core.instruments import Instrument
 from src.core.portfolio import PortfolioSnapshot, Position
 from src.stocks.data.contracts import DatasetSnapshot
@@ -32,6 +32,7 @@ from src.stocks.data.costs import (
     krx_market_for_code,
     resolve_fill_cost,
 )
+from src.stocks.domain.execution_policy import ExecutionOutcomePolicy
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.trading.portfolio_constructor import StockRiskPolicy
 from src.stocks.workflows.trading_cycle import (
@@ -482,6 +483,7 @@ class StockBacktester:
         cost_evidence: CostEvidence | None = None,
         adtv_window: int = 20,
         seed: int = 42,
+        policy: ExecutionOutcomePolicy | None = None,
         decision_provider: ReplayDecisionProvider | None = None,
         scenario_planner: ReplayScenarioPlanner | None = None,
     ):
@@ -494,6 +496,7 @@ class StockBacktester:
         self.cost_evidence = cost_evidence
         self.adtv_window = adtv_window
         self.seed = seed
+        self.policy = policy or ExecutionOutcomePolicy(policy_id="scheduled_open_v1")
         self.decision_provider = decision_provider
         self.scenario_planner = scenario_planner
         self._score_overlay: np.ndarray | None = None
@@ -724,13 +727,15 @@ class StockBacktester:
 
         new_pending: list[dict[str, object]] = []
         for order in state.pending_orders:
-            state.settled_cash, state.unsettled_cash, state.accrued_costs = (
+            state.settled_cash, state.unsettled_cash, state.accrued_costs, keep = (
                 self._execute_order(
                     order, None, rows_by_key, state.positions, state.settled_cash,
                     state.unsettled_cash, state.accrued_costs, state.settlements,
                     schedule, liquidity_model, index, session, state.trades,
                 )
             )
+            if keep:
+                new_pending.append(order)
         state.pending_orders = new_pending
 
         start, stop = market.session_ranges[index]
@@ -924,13 +929,15 @@ class StockBacktester:
 
         new_pending: list[dict[str, object]] = []
         for order in state.pending_orders:
-            state.settled_cash, state.unsettled_cash, state.accrued_costs = (
+            state.settled_cash, state.unsettled_cash, state.accrued_costs, keep = (
                 self._execute_order(
                     order, rows, rows_by_key, state.positions, state.settled_cash,
                     state.unsettled_cash, state.accrued_costs, state.settlements,
                     schedule, liquidity_model, index, session, state.trades,
                 )
             )
+            if keep:
+                new_pending.append(order)
         state.pending_orders = new_pending
 
         for r in rows.to_dicts():
@@ -998,6 +1005,8 @@ class StockBacktester:
             "calendar_hash": m.calendar_hash,
             "action_hash": m.corporate_action_hash,
             "cost_hash": m.cost_source_hash,
+            "execution_policy_id": self.policy.policy_id,
+            "execution_policy_hash": self.policy.canonical_hash,
         }
         if self.cost_evidence is not None:
             evidence["cost_artifact_hash"] = self.cost_evidence.content_hash
@@ -1019,10 +1028,8 @@ class StockBacktester:
         """Fail closed unless every row is eligible and action-covered.
 
         A derived return across an uncovered action interval must not feed a
-        replay. When the dataset is PROVISIONAL there is no verified action
-        evidence, so only the eligibility gate applies; RESEARCH/PRODUCTION
-        additionally require every row to carry an explicit action-coverage
-        record.
+        production replay. Public-price Research and PROVISIONAL panels retain
+        the eligibility gate but do not claim exhaustive action coverage.
         """
         status_column = "data_quality_status"
         if status_column in panel.columns:
@@ -1031,7 +1038,7 @@ class StockBacktester:
                 raise BacktestValidationError(
                     f"{non_eligible.height} non-eligible rows in replay panel"
                 )
-        if self.manifest.certification.value == "provisional":
+        if self.manifest.certification is not DatasetCertification.PRODUCTION:
             return
         coverage_column = "action_interval_covered"
         if coverage_column not in panel.columns:
@@ -1091,11 +1098,13 @@ class StockBacktester:
 
             new_pending: list[dict[str, object]] = []
             for order in pending_orders:
-                settled_cash, unsettled_cash, accrued_costs = self._execute_order(
+                settled_cash, unsettled_cash, accrued_costs, keep = self._execute_order(
                     order, rows, rows_by_key, positions, settled_cash, unsettled_cash,
                     accrued_costs, settlements, schedule, liquidity_model, index, session,
                     trades,
                 )
+                if keep:
+                    new_pending.append(order)
             pending_orders = new_pending
 
             for r in rows.to_dicts():
@@ -1246,9 +1255,60 @@ class StockBacktester:
         for intent in intents:
             instrument_id = intent.instrument_id
             row = rows_by_key.get((instrument_id, execution_session))
-            if row is None or row.get("open") is None or _as_float(row["open"]) <= 0:
+            side = "BUY" if intent.target_value > 0 else "SELL"
+            if row is None:
+                if self.policy.permits_deferral:
+                    orders.append(
+                        {
+                            "intent": intent,
+                            "instrument_id": instrument_id,
+                            "side": side,
+                            "target_value": intent.target_value,
+                            "price": None,
+                            "delta": None,
+                            "remaining_entry_delay": self.policy.max_entry_delay_sessions,
+                        }
+                    )
+                    continue
+                orders.append(
+                    {
+                        "intent": intent,
+                        "instrument_id": instrument_id,
+                        "side": side,
+                        "target_value": intent.target_value,
+                        "price": None,
+                        "delta": None,
+                        "remaining_entry_delay": 0,
+                    }
+                )
                 continue
-            price = _as_float(row["open"])
+            open_price = row.get("open")
+            if open_price is None or _as_float(open_price) <= 0:
+                if self.policy.permits_deferral:
+                    orders.append(
+                        {
+                            "intent": intent,
+                            "instrument_id": instrument_id,
+                            "side": side,
+                            "target_value": intent.target_value,
+                            "price": None,
+                            "delta": None,
+                            "remaining_entry_delay": self.policy.max_entry_delay_sessions,
+                        }
+                    )
+                    continue
+                orders.append(
+                    {
+                        "intent": intent,
+                        "instrument_id": instrument_id,
+                        "side": side,
+                        "price": None,
+                        "delta": None,
+                        "remaining_entry_delay": 0,
+                    }
+                )
+                continue
+            price = _as_float(open_price)
             current = positions.get(instrument_id, 0)
             target_qty = int(intent.target_value / price)
             delta = target_qty - current
@@ -1258,8 +1318,11 @@ class StockBacktester:
                 {
                     "intent": intent,
                     "instrument_id": instrument_id,
+                    "side": side,
+                    "target_value": intent.target_value,
                     "price": price,
                     "delta": delta,
+                    "remaining_entry_delay": 0,
                 }
             )
         del settled_cash, schedule
@@ -1280,36 +1343,46 @@ class StockBacktester:
         session_index: int,
         session: datetime,
         trades: list[BacktestTrade],
-    ) -> tuple[float, float, float]:
+    ) -> tuple[float, float, float, bool]:
         instrument_id = str(order["instrument_id"])
         row = rows_by_key.get((instrument_id, session))
         if row is None:
-            trades.append(self._unfilled(session, instrument_id, order, "no-session-row"))
-            return settled_cash, unsettled_cash, accrued_costs
+            keep = self._defer_or_unfilled(
+                order, session, instrument_id, "no-session-row", trades
+            )
+            return settled_cash, unsettled_cash, accrued_costs, keep
         open_price = row.get("open")
         if open_price is None or _as_float(open_price) <= 0:
-            trades.append(self._unfilled(session, instrument_id, order, "missing-open"))
-            return settled_cash, unsettled_cash, accrued_costs
+            keep = self._defer_or_unfilled(
+                order, session, instrument_id, "missing-open", trades
+            )
+            return settled_cash, unsettled_cash, accrued_costs, keep
         if row.get("limit_locked") is True:
             trades.append(self._unfilled(session, instrument_id, order, "limit-locked"))
-            return settled_cash, unsettled_cash, accrued_costs
+            return settled_cash, unsettled_cash, accrued_costs, False
         if row.get("action_interval_covered") is False:
             trades.append(self._unfilled(session, instrument_id, order, "no-action-coverage"))
-            return settled_cash, unsettled_cash, accrued_costs
+            return settled_cash, unsettled_cash, accrued_costs, False
 
         cost_point = schedule.cost_for(session)
         reference_open = _as_float(open_price)
+        if order.get("delta") is None:
+            current = positions.get(instrument_id, 0)
+            target_qty = int(_as_float(order["target_value"]) / reference_open)
+            order["delta"] = target_qty - current
+            if _as_int(order["delta"]) == 0:
+                return settled_cash, unsettled_cash, accrued_costs, False
         delta = _as_int(order["delta"])
         evidence = self.cost_evidence
         stress = bool(liquidity_model is not None and liquidity_model.stress_multiplier > 1.0)
         adtv = _as_float(row.get("adtv") or 0.0)
         if adtv <= 0:
             trades.append(self._unfilled(session, instrument_id, order, "no-capacity-data"))
-            return settled_cash, unsettled_cash, accrued_costs
+            return settled_cash, unsettled_cash, accrued_costs, False
         capacity_qty = int((0.005 * adtv) // reference_open)
         if capacity_qty <= 0:
             trades.append(self._unfilled(session, instrument_id, order, "insufficient-capacity"))
-            return settled_cash, unsettled_cash, accrued_costs
+            return settled_cash, unsettled_cash, accrued_costs, False
 
         if delta > 0:
             quantity = min(delta, capacity_qty)
@@ -1320,7 +1393,7 @@ class StockBacktester:
                     trades.append(
                         self._unfilled(session, instrument_id, order, "missing-liquidity-input")
                     )
-                    return settled_cash, unsettled_cash, accrued_costs
+                    return settled_cash, unsettled_cash, accrued_costs, False
             estimate_gross = quantity * reference_open
             fill_price = self._adverse_fill_price(
                 reference_open, estimate_gross, adtv, volatility, effective_time=session,
@@ -1335,7 +1408,7 @@ class StockBacktester:
                 quantity = min(delta, capacity_qty, affordable)
                 if quantity <= 0:
                     trades.append(self._unfilled(session, instrument_id, order, "insufficient-cash"))
-                    return settled_cash, unsettled_cash, accrued_costs
+                    return settled_cash, unsettled_cash, accrued_costs, False
                 gross = quantity * fill_price
                 fill_price = self._adverse_fill_price(
                     reference_open, gross, adtv, volatility, effective_time=session,
@@ -1364,7 +1437,7 @@ class StockBacktester:
             held = positions.get(instrument_id, 0)
             if held <= 0:
                 trades.append(self._unfilled(session, instrument_id, order, "no-holdings"))
-                return settled_cash, unsettled_cash, accrued_costs
+                return settled_cash, unsettled_cash, accrued_costs, False
             sell_qty = min(sell_qty, held)
             volatility = None
             if evidence is not None:
@@ -1373,7 +1446,7 @@ class StockBacktester:
                     trades.append(
                         self._unfilled(session, instrument_id, order, "missing-liquidity-input")
                     )
-                    return settled_cash, unsettled_cash, accrued_costs
+                    return settled_cash, unsettled_cash, accrued_costs, False
             estimate_gross = sell_qty * reference_open
             fill_price = self._adverse_fill_price(
                 reference_open, estimate_gross, adtv, volatility, effective_time=session,
@@ -1403,7 +1476,7 @@ class StockBacktester:
                     ),
                 )
             )
-        return settled_cash, unsettled_cash, accrued_costs
+        return settled_cash, unsettled_cash, accrued_costs, False
 
     def _adverse_fill_price(
         self,
@@ -1523,16 +1596,40 @@ class StockBacktester:
         order: dict[str, object],
         reason: str,
     ) -> BacktestTrade:
+        delta = order.get("delta")
+        side = str(order.get("side") or ("SELL" if (isinstance(delta, (int, float)) and delta < 0) else "BUY"))
         return BacktestTrade(
             session=session,
             instrument_id=instrument_id,
-            side="SELL" if _as_int(order["delta"]) < 0 else "BUY",
+            side=side,
             quantity=0,
             price=None,
             gross=None,
             cost=None,
             reason=reason,
         )
+
+    def _defer_or_unfilled(
+        self,
+        order: dict[str, object],
+        session: datetime,
+        instrument_id: str,
+        reason: str,
+        trades: list[BacktestTrade],
+    ) -> bool:
+        """Keep an order pending within the policy's bounded entry window.
+
+        A deferred order whose scheduled open is absent stays pending until its
+        ``remaining_entry_delay`` budget expires; expiry has the same unfilled
+        disposition as the scheduled policy. An absent open is never silently
+        omitted, sold at a fabricated price, or converted to a zero return.
+        """
+        remaining = int(_as_int(order.get("remaining_entry_delay", 0)))
+        if remaining > 0:
+            order["remaining_entry_delay"] = remaining - 1
+            return True
+        trades.append(self._unfilled(session, instrument_id, order, reason))
+        return False
 
     @staticmethod
     def _metrics(

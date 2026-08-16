@@ -148,10 +148,10 @@ def _resolve_cost_contexts(
     """
     costs = getattr(snapshot, "costs", None)
     if costs is not None:
-        research_range = getattr(snapshot, "research_range", None)
-        if research_range is None:
-            raise ValueError("snapshot cost evidence requires a research_range")
-        evidence = load_cost_evidence(Path(costs.path), research_range)
+        execution_range = getattr(snapshot, "execution_range", None)
+        if execution_range is None:
+            raise ValueError("snapshot cost evidence requires an execution_range")
+        evidence = load_cost_evidence(Path(costs.path), execution_range)
         return (
             evidence.base_schedule(),
             evidence.base_liquidity_model,
