@@ -486,6 +486,164 @@ class OutcomeEvidenceDatasetResult:
     base_panel_hash: str
 
 
+_UNRESOLVED_STATUSES = ("MISSING_ENTRY_PRICE", "MISSING_EXIT_PRICE", "UNSUPPORTED_CORPORATE_ACTION")
+_DISPOSITION_VOCABULARY = (
+    DISPOSITION_FILLED,
+    DISPOSITION_NO_BAR,
+    DISPOSITION_SOURCE_UNAVAILABLE,
+    DISPOSITION_TAIL,
+    DISPOSITION_UNSUPPORTED_ACTION,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class OutcomeRecoveryReport:
+    """Vectorized bounded recovery classification of unresolved outcome rows.
+
+    Groups every unresolved evidence row by ``(horizon_sessions,
+    resolution_kind, instrument_id, scheduled entry/exit date,
+    outcome_status)`` and partitions them into a recoverable backfill queue
+    (``SOURCE_UNAVAILABLE``), verified structural no-bars
+    (``CONFIRMED_NO_BAR``), and corporate-action rows awaiting a verified
+    settlement (``UNSUPPORTED_CORPORATE_ACTION``). Source hashes, policy hash,
+    and dispositions are preserved per group. No recovery path substitutes
+    another OHLC field, interpolates a price, or mutates the evidence.
+    """
+
+    horizon_sessions: tuple[int, ...]
+    rows: pl.DataFrame
+    recoverable_backfill_count: int
+    confirmed_no_bar_count: int
+    unsupported_corporate_action_count: int
+
+    def __post_init__(self) -> None:
+        if not self.horizon_sessions:
+            raise ValueError("recovery report requires at least one horizon")
+        for name in (
+            "recoverable_backfill_count",
+            "confirmed_no_bar_count",
+            "unsupported_corporate_action_count",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be non-negative")
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "horizon_sessions": list(self.horizon_sessions),
+            "recoverable_backfill_count": int(self.recoverable_backfill_count),
+            "confirmed_no_bar_count": int(self.confirmed_no_bar_count),
+            "unsupported_corporate_action_count": int(
+                self.unsupported_corporate_action_count
+            ),
+            "grouped_rows": int(self.rows.height),
+        }
+
+
+def build_outcome_recovery_report(
+    evidence: pl.DataFrame,
+    candidate_horizon_sessions: tuple[int, ...],
+) -> OutcomeRecoveryReport:
+    """Classify unresolved evidence rows into a bounded recovery report.
+
+    Only rows whose ``outcome_status`` is an unresolved state
+    (``MISSING_ENTRY_PRICE``, ``MISSING_EXIT_PRICE``,
+    ``UNSUPPORTED_CORPORATE_ACTION``) are recovery candidates; resolved and
+    terminal-tail rows are not emitted. Every candidate is grouped with Polars
+    group-bys (never a Python row loop) by horizon, resolution kind,
+    instrument, scheduled entry/exit date, and status, preserving the pinned
+    policy hash, source partition hashes, and dispositions. An unknown
+    resolution kind, a horizon partition mismatch, or missing required columns
+    raises ``ValueError``.
+    """
+    if not candidate_horizon_sessions:
+        raise ValueError("candidate_horizon_sessions must be non-empty")
+    if tuple(candidate_horizon_sessions) != tuple(
+        sorted(set(candidate_horizon_sessions))
+    ):
+        raise ValueError("candidate_horizon_sessions must be strictly ascending and unique")
+    required = (
+        ID_COLUMN,
+        SESSION_COLUMN,
+        "horizon_sessions",
+        "policy_hash",
+        "resolution_kind",
+        "scheduled_entry_session",
+        "scheduled_exit_session",
+        "entry_disposition",
+        "exit_disposition",
+        "entry_partition_hash",
+        "exit_partition_hash",
+        "outcome_status",
+    )
+    missing = [c for c in required if c not in evidence.columns]
+    if missing:
+        raise ValueError(f"outcome evidence missing recovery columns {missing}")
+    present = sorted(evidence["horizon_sessions"].unique().to_list())
+    if set(present) != set(candidate_horizon_sessions):
+        raise ValueError(
+            f"outcome evidence horizon partitions {present}, "
+            f"expected {sorted(candidate_horizon_sessions)}"
+        )
+    unknown = evidence.filter(
+        ~pl.col("resolution_kind").is_in(list(RESOLUTION_KIND_VOCABULARY))
+    )
+    if not unknown.is_empty():
+        raise ValueError("outcome evidence contains unknown resolution kinds")
+    unknown_disposition = evidence.filter(
+        pl.col("entry_disposition").is_not_null()
+        & ~pl.col("entry_disposition").is_in(list(_DISPOSITION_VOCABULARY))
+        | pl.col("exit_disposition").is_not_null()
+        & ~pl.col("exit_disposition").is_in(list(_DISPOSITION_VOCABULARY))
+    )
+    if not unknown_disposition.is_empty():
+        raise ValueError("outcome evidence contains unknown entry/exit dispositions")
+
+    unresolved = evidence.filter(
+        pl.col("outcome_status").is_in(list(_UNRESOLVED_STATUSES))
+    )
+    grouped = (
+        unresolved.group_by(
+            [
+                "horizon_sessions",
+                "resolution_kind",
+                ID_COLUMN,
+                "scheduled_entry_session",
+                "scheduled_exit_session",
+                "outcome_status",
+            ]
+        )
+        .agg(
+            pl.len().alias("count"),
+            pl.col("policy_hash").first().alias("policy_hash"),
+            pl.col("entry_partition_hash").first().alias("entry_partition_hash"),
+            pl.col("exit_partition_hash").first().alias("exit_partition_hash"),
+            pl.col("entry_disposition").first().alias("entry_disposition"),
+            pl.col("exit_disposition").first().alias("exit_disposition"),
+        )
+        .sort(
+            [
+                "horizon_sessions",
+                "resolution_kind",
+                ID_COLUMN,
+                "scheduled_entry_session",
+                "scheduled_exit_session",
+                "outcome_status",
+            ]
+        )
+    )
+
+    def _count(kind: str) -> int:
+        return int(unresolved.filter(pl.col("resolution_kind") == kind).height)
+
+    return OutcomeRecoveryReport(
+        horizon_sessions=tuple(candidate_horizon_sessions),
+        rows=grouped,
+        recoverable_backfill_count=_count(RESOLUTION_SOURCE_UNAVAILABLE),
+        confirmed_no_bar_count=_count(RESOLUTION_CONFIRMED_NO_BAR),
+        unsupported_corporate_action_count=_count(RESOLUTION_UNSUPPORTED_CORPORATE_ACTION),
+    )
+
+
 def publish_outcome_evidence_dataset(
     evidence: pl.DataFrame,
     *,

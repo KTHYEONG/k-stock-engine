@@ -285,23 +285,70 @@ def _readiness_data():
     return compose_net_alpha_training_data(snapshot, _decision_time(), (3, 5))
 
 
-def test_snapshot_outcome_readiness_rejects_historical_unresolved_status() -> None:
-    """SCENARIO_UNRESOLVED_OUTCOME_IS_DIAGNOSTIC: a historical hole fails the report."""
+def _pin_readiness_data(data):
+    """Attach a hash-bound evidence spine, mapping status to resolution kind."""
+    from dataclasses import replace
+
+    evidence_by_horizon: dict[int, pl.DataFrame] = {}
+    for horizon, status in data.status_by_horizon.items():
+        evidence_by_horizon[horizon] = status.select(
+            pl.col("instrument_id"),
+            pl.col("session"),
+            pl.lit(horizon, dtype=pl.Int64).alias("horizon_sessions"),
+            pl.lit("policy-hash-v1").alias("policy_hash"),
+            pl.when(pl.col("outcome_status") == "REALIZED")
+            .then(pl.lit("SCHEDULED_OPEN"))
+            .when(pl.col("outcome_status") == "PARTIAL_TAIL")
+            .then(pl.lit("PARTIAL_TAIL"))
+            .otherwise(pl.lit("CONFIRMED_NO_BAR"))
+            .alias("resolution_kind"),
+        )
+    return replace(
+        data,
+        evidence_by_horizon=evidence_by_horizon,
+        status_provenance="pinned",
+    )
+
+
+def _set_evidence_resolution(data, horizon, key, resolution):
+    """Override one key's evidence resolution kind in a pinned readiness data."""
+    from dataclasses import replace
+
+    instrument, session = key
+    evidence = data.evidence_by_horizon[horizon].with_columns(
+        pl.when(
+            (pl.col("instrument_id") == instrument)
+            & (pl.col("session") == session)
+        )
+        .then(pl.lit(resolution))
+        .otherwise(pl.col("resolution_kind"))
+        .alias("resolution_kind")
+    )
+    return replace(
+        data, evidence_by_horizon={**data.evidence_by_horizon, horizon: evidence}
+    )
+
+
+def _early_key(data, tail_count: int = 3) -> tuple[str, object]:
+    sessions = data.feature_frame["session"].unique().sort().to_list()
+    tail = set(sessions[-tail_count:])
+    early = (
+        data.feature_frame.filter(~pl.col("session").is_in(sorted(tail)))
+        .sort("session")
+        .limit(1)
+    )
+    return str(early["instrument_id"][0]), early["session"][0]
+
+
+def test_snapshot_outcome_readiness_rejects_source_unavailable() -> None:
+    """SCENARIO_UNRESOLVED_OUTCOME_IS_DIAGNOSTIC: a source gap fails the report."""
     from dataclasses import replace
 
     from src.stocks.ml.contracts import OUTCOME_MISSING_EXIT_PRICE
     from src.stocks.ml.data import assess_snapshot_outcome_readiness
 
     data = _readiness_data()
-    sessions = data.feature_frame["session"].unique().sort().to_list()
-    tail = set(sessions[-3:])
-    early = (
-        data.feature_frame.filter(~pl.col("session").is_in(sorted(tail)))
-        .sort("session")
-        .limit(1)
-    )
-    early_id = early["instrument_id"][0]
-    early_session = early["session"][0]
+    early_id, early_session = _early_key(data)
     broken = data.status_by_horizon[3].with_columns(
         pl.when(
             (pl.col("instrument_id") == early_id)
@@ -311,11 +358,16 @@ def test_snapshot_outcome_readiness_rejects_historical_unresolved_status() -> No
         .otherwise(pl.col("outcome_status"))
         .alias("outcome_status")
     )
-    data2 = replace(data, status_by_horizon={**data.status_by_horizon, 3: broken})
-    report = assess_snapshot_outcome_readiness(data2, (3, 5))
+    data = replace(data, status_by_horizon={**data.status_by_horizon, 3: broken})
+    data = _pin_readiness_data(data)
+    data = _set_evidence_resolution(
+        data, 3, (early_id, early_session), "SOURCE_UNAVAILABLE"
+    )
+    report = assess_snapshot_outcome_readiness(data, (3, 5))
     assert not report.passed
     horizon3 = next(h for h in report.horizon_results if h.horizon_sessions == 3)
     assert not horizon3.passed
+    assert horizon3.source_unavailable_rows == 1
     assert horizon3.unresolved_status_counts.count(OUTCOME_MISSING_EXIT_PRICE) == 1
     assert horizon3.earliest_unresolved_session == early_session
     assert horizon3.realized_rows == horizon3.decision_rows - 1
@@ -323,6 +375,34 @@ def test_snapshot_outcome_readiness_rejects_historical_unresolved_status() -> No
     assert horizon5.passed
     assert report.to_json()["passed"] is False
     assert len(report.to_json()["horizons"]) == 2
+
+
+def test_snapshot_outcome_readiness_allows_confirmed_no_bar() -> None:
+    """A verified structural no-bar stays visible and does not fail the gate."""
+    from dataclasses import replace
+
+    from src.stocks.ml.contracts import OUTCOME_MISSING_EXIT_PRICE
+    from src.stocks.ml.data import assess_snapshot_outcome_readiness
+
+    data = _readiness_data()
+    early_id, early_session = _early_key(data)
+    broken = data.status_by_horizon[3].with_columns(
+        pl.when(
+            (pl.col("instrument_id") == early_id)
+            & (pl.col("session") == early_session)
+        )
+        .then(pl.lit(OUTCOME_MISSING_EXIT_PRICE))
+        .otherwise(pl.col("outcome_status"))
+        .alias("outcome_status")
+    )
+    data = replace(data, status_by_horizon={**data.status_by_horizon, 3: broken})
+    data = _pin_readiness_data(data)
+    report = assess_snapshot_outcome_readiness(data, (3, 5))
+    assert report.passed
+    horizon3 = next(h for h in report.horizon_results if h.horizon_sessions == 3)
+    assert horizon3.passed
+    assert horizon3.confirmed_no_bar_rows == 1
+    assert horizon3.unresolved_status_counts.to_json() == {}
 
 
 def test_snapshot_outcome_readiness_allows_terminal_tail_partial_only() -> None:
@@ -343,12 +423,26 @@ def test_snapshot_outcome_readiness_allows_terminal_tail_partial_only() -> None:
         .otherwise(pl.col("outcome_status"))
         .alias("outcome_status")
     )
-    data2 = replace(data, status_by_horizon={**data.status_by_horizon, 3: tail_only})
-    report = assess_snapshot_outcome_readiness(data2, (3,))
+    data = replace(data, status_by_horizon={**data.status_by_horizon, 3: tail_only})
+    data = _pin_readiness_data(data)
+    report = assess_snapshot_outcome_readiness(data, (3,))
     assert report.passed
     horizon3 = report.horizon_results[0]
     assert horizon3.terminal_tail_rows == 16
     assert horizon3.unresolved_status_counts.to_json() == {}
+
+
+def test_snapshot_outcome_readiness_legacy_inferred_is_diagnostic_only() -> None:
+    """SCENARIO_SNAPSHOT_PINS_OUTCOME_EVIDENCE: unpinned provenance fails before OOF."""
+    from src.stocks.ml.data import assess_snapshot_outcome_readiness
+
+    data = _readiness_data()
+    report = assess_snapshot_outcome_readiness(data, (3, 5))
+    assert not report.passed
+    assert report.reason == "outcome-provenance-unpinned"
+    assert all(not result.passed for result in report.horizon_results)
+    assert report.to_json()["reason"] == "outcome-provenance-unpinned"
+    assert report.to_json()["passed"] is False
 
 
 def test_snapshot_outcome_readiness_fails_closed_on_structural_defects() -> None:
@@ -358,7 +452,7 @@ def test_snapshot_outcome_readiness_fails_closed_on_structural_defects() -> None
     from src.stocks.ml.contracts import OUTCOME_PARTIAL_TAIL
     from src.stocks.ml.data import assess_snapshot_outcome_readiness
 
-    data = _readiness_data()
+    data = _pin_readiness_data(_readiness_data())
     status3 = data.status_by_horizon[3]
     status5 = data.status_by_horizon[5]
 

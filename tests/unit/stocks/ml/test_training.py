@@ -580,6 +580,7 @@ def test_run_observability_preserves_terminal_no_trade_reason(tmp_path) -> None:
     from src.stocks.ml.data import compose_net_alpha_training_data
     from src.stocks.research.artifacts import ModelArtifactRegistry
     from tests.fixtures.stocks.helpers import (
+        pin_net_alpha_outcome_evidence,
         stock_liquidity_model,
         stock_net_alpha_composed_df,
         stock_net_alpha_manifest,
@@ -591,8 +592,10 @@ def test_run_observability_preserves_terminal_no_trade_reason(tmp_path) -> None:
     snapshot = DatasetSnapshot(
         manifest=stock_net_alpha_manifest(columns=df.columns), frame=df
     )
-    data = compose_net_alpha_training_data(
-        snapshot, datetime(2024, 12, 31, tzinfo=UTC), (3, 5, 8, 10, 15, 20)
+    data = pin_net_alpha_outcome_evidence(
+        compose_net_alpha_training_data(
+            snapshot, datetime(2024, 12, 31, tzinfo=UTC), (3, 5, 8, 10, 15, 20)
+        )
     )
     registry = ModelArtifactRegistry(Path(tmp_path) / "artifacts")
     request = NetAlphaTrainingRequest(
@@ -653,6 +656,7 @@ def test_memory_budget_breach_publishes_bounded_no_trade(tmp_path) -> None:
     from src.stocks.ml.data import compose_net_alpha_training_data
     from src.stocks.research.artifacts import ModelArtifactRegistry
     from tests.fixtures.stocks.helpers import (
+        pin_net_alpha_outcome_evidence,
         stock_liquidity_model,
         stock_net_alpha_composed_df,
         stock_net_alpha_manifest,
@@ -664,8 +668,10 @@ def test_memory_budget_breach_publishes_bounded_no_trade(tmp_path) -> None:
     snapshot = DatasetSnapshot(
         manifest=stock_net_alpha_manifest(columns=df.columns), frame=df
     )
-    data = compose_net_alpha_training_data(
-        snapshot, datetime(2024, 12, 31, tzinfo=UTC), (3, 5, 8, 10, 15, 20)
+    data = pin_net_alpha_outcome_evidence(
+        compose_net_alpha_training_data(
+            snapshot, datetime(2024, 12, 31, tzinfo=UTC), (3, 5, 8, 10, 15, 20)
+        )
     )
     registry = ModelArtifactRegistry(Path(tmp_path) / "artifacts")
     request = NetAlphaTrainingRequest(
@@ -707,6 +713,7 @@ def test_train_net_alpha_model_promotes_champion_or_no_trade(tmp_path) -> None:
     from src.stocks.ml.data import compose_net_alpha_training_data
     from src.stocks.research.artifacts import ModelArtifactRegistry
     from tests.fixtures.stocks.helpers import (
+        pin_net_alpha_outcome_evidence,
         stock_liquidity_model,
         stock_net_alpha_composed_df,
         stock_net_alpha_manifest,
@@ -718,10 +725,12 @@ def test_train_net_alpha_model_promotes_champion_or_no_trade(tmp_path) -> None:
     snapshot = DatasetSnapshot(
         manifest=stock_net_alpha_manifest(columns=df.columns), frame=df
     )
-    data = compose_net_alpha_training_data(
-        snapshot,
-        datetime(2024, 12, 31, tzinfo=UTC),
-        (3, 5, 8, 10, 15, 20),
+    data = pin_net_alpha_outcome_evidence(
+        compose_net_alpha_training_data(
+            snapshot,
+            datetime(2024, 12, 31, tzinfo=UTC),
+            (3, 5, 8, 10, 15, 20),
+        )
     )
     registry = ModelArtifactRegistry(Path(tmp_path) / "artifacts")
     request = NetAlphaTrainingRequest(
@@ -834,6 +843,7 @@ def test_training_publishes_data_readiness_no_trade_before_oof(tmp_path: Path) -
     from src.stocks.ml.data import compose_net_alpha_training_data
     from src.stocks.research.artifacts import ModelArtifactRegistry
     from tests.fixtures.stocks.helpers import (
+        pin_net_alpha_outcome_evidence,
         stock_liquidity_model,
         stock_net_alpha_composed_df,
         stock_net_alpha_manifest,
@@ -856,16 +866,32 @@ def test_training_publishes_data_readiness_no_trade_before_oof(tmp_path: Path) -
         .sort("session")
         .limit(1)
     )
+    early_id = str(early["instrument_id"][0])
+    early_session = early["session"][0]
     broken = data.status_by_horizon[3].with_columns(
         pl.when(
-            (pl.col("instrument_id") == early["instrument_id"][0])
-            & (pl.col("session") == early["session"][0])
+            (pl.col("instrument_id") == early_id)
+            & (pl.col("session") == early_session)
         )
         .then(pl.lit(OUTCOME_MISSING_EXIT_PRICE))
         .otherwise(pl.col("outcome_status"))
         .alias("outcome_status")
     )
     data = replace(data, status_by_horizon={**data.status_by_horizon, 3: broken})
+    data = pin_net_alpha_outcome_evidence(data)
+    source_unavailable = data.evidence_by_horizon[3].with_columns(
+        pl.when(
+            (pl.col("instrument_id") == early_id)
+            & (pl.col("session") == early_session)
+        )
+        .then(pl.lit("SOURCE_UNAVAILABLE"))
+        .otherwise(pl.col("resolution_kind"))
+        .alias("resolution_kind")
+    )
+    data = replace(
+        data,
+        evidence_by_horizon={**data.evidence_by_horizon, 3: source_unavailable},
+    )
 
     registry = ModelArtifactRegistry(Path(tmp_path) / "artifacts")
     request = NetAlphaTrainingRequest(
