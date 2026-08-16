@@ -396,8 +396,13 @@ def stock_net_alpha_composed_df(
             )
         frame = frame.drop("__obs")
     for horizon in candidate_horizon_sessions:
+        # Warm-up features are null on each instrument's first observation, but
+        # that key's outcome is still realizable (opens exist). Recover the
+        # implied momentum exactly so the label stays non-null and the panel is
+        # a readiness-clean, audit-clean snapshot.
         signal = label_scale * (
-            pl.col("overnight_ret") * 0.02 - pl.col("intraday_ret") * 0.01
+            pl.col("overnight_ret").fill_null(pl.col("ret_2_5d") * 2.0) * 0.02
+            - pl.col("intraday_ret").fill_null(-pl.col("ret_6_20d") / 0.3) * 0.01
         )
         target = signal.alias(f"net_alpha_{horizon}d_target")
         residual = signal.alias(f"risk_residual_{horizon}d")
