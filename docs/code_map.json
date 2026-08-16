@@ -378,5 +378,9 @@
   },
   "src/stocks/data/catalog.py": {
     "testing": "tests/unit/stocks/data/test_catalog.py"
+  },
+  "src/stocks/ml/replay.py": {
+    "architecture": "docs/specs/missing_exit_price_recovery.md",
+    "testing": "tests/unit/stocks/ml/test_replay.py"
   }
 }
