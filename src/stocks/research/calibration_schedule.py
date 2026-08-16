@@ -47,7 +47,9 @@ from src.stocks.research.economic_alpha import (
     _exit_cost_rate,
     _prefix_sum_means_from_csum,
     _round_trip_cost_rate,
+    _shrink_lower_bound,
     _validate_observations,
+    adaptive_bucket_count,
 )
 
 
@@ -221,6 +223,14 @@ class CausalCalibrationSchedule:
         point = self._cost_schedule.cost_for(decision_time)
         round_trip_cost = _round_trip_cost_rate(point)
         exit_cost = _exit_cost_rate(point)
+        bucket_count = adaptive_bucket_count(
+            self._calibrator.bucket_count, self._history_sessions
+        )
+        if bucket_count != self._calibrator.bucket_count:
+            # Adaptive cold-start bucketing re-buckets at the effective count;
+            # the incremental state is nominal-resolution, so delegate to the
+            # exact reference computation for parity by construction.
+            return self._reference_state(decision_time, workspace_cap)
         if self._total_count == 0 or self._history_sessions < self._calibrator.min_calibration_sessions:
             empty: dict[str, object] = {
                 "bucket_count": int(self._calibrator.bucket_count),
@@ -329,10 +339,10 @@ class CausalCalibrationSchedule:
             max_workspace_bytes=workspace_cap,
         )
         estimate = float(np.quantile(means, self._calibrator.bootstrap_alpha))
+        residuals = np.diff(state.csum)
         bound = _bootstrap_error_bound_from_scale(state.max_abs, n)
         if abs(estimate) <= bound:
-            residuals = np.diff(state.csum)
-            return _block_bootstrap_lower_bound(
+            lower = _block_bootstrap_lower_bound(
                 residuals,
                 block,
                 self._calibrator.n_bootstrap,
@@ -340,7 +350,9 @@ class CausalCalibrationSchedule:
                 self._calibrator.bootstrap_alpha,
                 max_bootstrap_workspace_bytes=workspace_cap,
             )
-        return estimate
+        else:
+            lower = estimate
+        return _shrink_lower_bound(lower, float(np.mean(residuals)), n)
 
     def _reference_state(
         self,
@@ -384,8 +396,11 @@ class _ClusterBucketState:
     aggregates, so a new session only appends ``previous_total + delta``
     instead of re-running ``np.cumsum`` over the whole history at every
     ``state_at``. The prefix values are bit-identical to a fresh cumsum.
+    ``session_times`` tracks the session of each aggregate so adjacent nominal
+    buckets can be merged into coarser adaptive buckets in session order.
     """
 
+    session_times: np.ndarray
     session_sums: np.ndarray
     session_counts: np.ndarray
     csum_sums: np.ndarray
@@ -397,6 +412,7 @@ class _ClusterBucketState:
     @classmethod
     def empty(cls) -> _ClusterBucketState:
         return cls(
+            session_times=np.zeros(0, dtype=np.int64),
             session_sums=np.zeros(0, dtype=np.float64),
             session_counts=np.zeros(0, dtype=np.float64),
             csum_sums=np.zeros(1, dtype=np.float64),
@@ -546,6 +562,7 @@ class SessionClusterCalibrationSchedule:
             self._reveal_idx += 1
 
     def _append_session(self, record: _ClusterSessionRecord) -> None:
+        session_ns = round(record.session.timestamp() * 1e9)
         for bucket, session_sum, session_count in zip(
             record.bucket, record.residual_sum, record.residual_count, strict=True
         ):
@@ -555,6 +572,7 @@ class SessionClusterCalibrationSchedule:
             if state is None:
                 state = _ClusterBucketState.empty()
                 self._buckets[int(bucket)] = state
+            state.session_times = np.append(state.session_times, session_ns)
             state.session_sums = np.append(state.session_sums, session_sum)
             state.session_counts = np.append(state.session_counts, session_count)
             state.csum_sums = np.append(
@@ -598,9 +616,24 @@ class SessionClusterCalibrationSchedule:
         point = self._cost_schedule.cost_for(decision_time)
         round_trip_cost = _round_trip_cost_rate(point)
         exit_cost = _exit_cost_rate(point)
+        bucket_count = adaptive_bucket_count(
+            self._calibrator.bucket_count, self._history_sessions
+        )
+        if bucket_count != self._calibrator.bucket_count and (
+            self._calibrator.bucket_count % bucket_count != 0
+        ):
+            # Coarse adaptive buckets only merge exactly from a nominal count
+            # they divide; otherwise re-bucket at the reference resolution.
+            self._reference_fallback_count += 1
+            return self._reference_state(
+                decision_time,
+                max_bootstrap_workspace_bytes
+                if max_bootstrap_workspace_bytes is not None
+                else self._max_workspace_bytes,
+            )
         if self._total_count == 0 or self._history_sessions < self._calibrator.min_calibration_sessions:
             empty: dict[str, object] = {
-                "bucket_count": int(self._calibrator.bucket_count),
+                "bucket_count": int(bucket_count),
                 "history_sessions": int(self._history_sessions),
                 "round_trip_cost": float(round_trip_cost),
                 "exit_cost_rate": float(exit_cost),
@@ -609,9 +642,88 @@ class SessionClusterCalibrationSchedule:
             self._sync_calibrator(empty)
             return empty
         global_mean = self._total_sum / self._total_count
+        states = self._effective_bucket_states(bucket_count)
+        bucket_rows = self._cluster_bucket_rows(states, global_mean)
+        result: dict[str, object] = {
+            "bucket_count": int(bucket_count),
+            "history_sessions": int(self._history_sessions),
+            "round_trip_cost": float(round_trip_cost),
+            "exit_cost_rate": float(exit_cost),
+            "buckets": bucket_rows,
+        }
+        self._sync_calibrator(result)
+        return result
+
+    def _effective_bucket_states(
+        self, bucket_count: int
+    ) -> dict[int, _ClusterBucketState]:
+        """Merge nominal-resolution bucket states to the adaptive count.
+
+        Observations are pre-bucketed at the full nominal resolution, whose
+        buckets merge exactly into coarser adaptive buckets
+        (``floor(pct_rank * 10) // 2 == floor(pct_rank * 5)``). Adjacent
+        nominal buckets are combined into one state whose session aggregates
+        stay in chronological order.
+        """
+        resolution = self._calibrator.bucket_count
+        if bucket_count == resolution:
+            return self._buckets
+        step = resolution // bucket_count
+        merged: dict[int, _ClusterBucketState] = {}
+        for nominal in sorted(self._buckets):
+            effective = nominal // step
+            target = merged.get(effective)
+            if target is None:
+                target = _ClusterBucketState.empty()
+                merged[effective] = target
+            child = self._buckets[nominal]
+            target.session_times = np.concatenate(
+                [target.session_times, child.session_times]
+            )
+            target.session_sums = np.concatenate(
+                [target.session_sums, child.session_sums]
+            )
+            target.session_counts = np.concatenate(
+                [target.session_counts, child.session_counts]
+            )
+            target.row_sum += child.row_sum
+            target.row_count += child.row_count
+            target.max_abs = max(target.max_abs, child.max_abs)
+        for state in merged.values():
+            self._finalize_merged_state(state)
+        return merged
+
+    def _finalize_merged_state(self, state: _ClusterBucketState) -> None:
+        """Sort a merged state by session and rebuild its prefix sums."""
+        order = np.argsort(state.session_times, kind="stable")
+        times = state.session_times[order]
+        sums = state.session_sums[order]
+        counts = state.session_counts[order]
+        unique, inverse = np.unique(times, return_inverse=True)
+        if unique.size < times.size:
+            grouped_sums = np.zeros(unique.size, dtype=np.float64)
+            grouped_counts = np.zeros(unique.size, dtype=np.float64)
+            np.add.at(grouped_sums, inverse, sums)
+            np.add.at(grouped_counts, inverse, counts)
+            sums, counts = grouped_sums, grouped_counts
+        csum_sums = np.zeros(sums.size + 1, dtype=np.float64)
+        np.cumsum(sums, out=csum_sums[1:])
+        csum_counts = np.zeros(counts.size + 1, dtype=np.float64)
+        np.cumsum(counts, out=csum_counts[1:])
+        state.session_times = unique
+        state.session_sums = sums
+        state.session_counts = counts
+        state.csum_sums = csum_sums
+        state.csum_counts = csum_counts
+
+    def _cluster_bucket_rows(
+        self,
+        states: dict[int, _ClusterBucketState],
+        global_mean: float,
+    ) -> list[dict[str, object]]:
         bucket_rows: list[dict[str, object]] = []
-        for bucket in sorted(self._buckets):
-            bucket_state = self._buckets[bucket]
+        for bucket in sorted(states):
+            bucket_state = states[bucket]
             if bucket_state.row_count < _MIN_BUCKET_OBSERVATIONS:
                 bucket_rows.append(
                     {
@@ -644,15 +756,7 @@ class SessionClusterCalibrationSchedule:
                     "alpha_lower_bound": float(lower_bound),
                 }
             )
-        result: dict[str, object] = {
-            "bucket_count": int(self._calibrator.bucket_count),
-            "history_sessions": int(self._history_sessions),
-            "round_trip_cost": float(round_trip_cost),
-            "exit_cost_rate": float(exit_cost),
-            "buckets": bucket_rows,
-        }
-        self._sync_calibrator(result)
-        return result
+        return bucket_rows
 
     def _bucket_lower_bound(self, bucket: int, state: _ClusterBucketState) -> float:
         n = state.session_sums.size
@@ -670,7 +774,8 @@ class SessionClusterCalibrationSchedule:
             csum_sums=state.csum_sums,
             csum_counts=state.csum_counts,
         )
-        return float(np.quantile(means, self._calibrator.bootstrap_alpha))
+        lower = float(np.quantile(means, self._calibrator.bootstrap_alpha))
+        return _shrink_lower_bound(lower, float(np.mean(means)), n)
 
     def _sync_calibrator(self, state: dict[str, object]) -> None:
         calibrator = self._calibrator

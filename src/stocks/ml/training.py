@@ -1409,7 +1409,16 @@ def _build_horizon_evidence(
                     coverage.status_counts.partial_tail,
                     coverage.status_counts.unresolved,
                 )
-            calibrated = _causal_oof_calibrate(oof, oof_labels, request, horizon)
+            initial_train = pre_holdout.filter(
+                pl.col(_SESSION_IDX) < folds[0].validation_decision_start
+            )
+            seed_ledger = build_initial_calibration_seed(
+                initial_train, request, learner_columns, horizon, manifest,
+                data=data,
+            )
+            calibrated = _causal_oof_calibrate(
+                oof, oof_labels, request, horizon, seed_ledger=seed_ledger
+            )
             status_projection = (
                 coverage.status_projection if coverage is not None else None
             )
@@ -1633,11 +1642,52 @@ def _causal_ledger(oof_labels: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def build_initial_calibration_seed(
+    train_data: pl.DataFrame,
+    request: NetAlphaTrainingRequest,
+    learner_columns: tuple[str, ...],
+    horizon_sessions: int,
+    base_manifest: ModelManifest,
+    *,
+    data: NetAlphaResearchData,
+) -> pl.DataFrame:
+    """Produce a causal calibration seed ledger from inner purged folds.
+
+    The outer walk-forward plan's first validation session has no prior outer
+    OOF history, so a cold-start ledger would keep the first fold in cash.
+    Predicting the initial training slice through nested purged folds yields
+    target-free out-of-sample scores whose realized labels are already revealed
+    at the first outer decision session; feeding them as a seed ledger removes
+    the cold start without any lookahead. Returns an empty frame when the slice
+    cannot form usable inner folds.
+    """
+    if train_data.is_empty() or not learner_columns:
+        return pl.DataFrame()
+    splitter = PurgedWalkForward(
+        n_folds=_NESTED_INNER_FOLDS,
+        label_horizon_sessions=horizon_sessions,
+        embargo_sessions=request.embargo_sessions,
+        session_column=_SESSION_IDX,
+        min_train_sessions=_NESTED_MIN_TRAIN_SESSIONS,
+    )
+    inner = splitter.inner_folds(train_data, n_inner=_NESTED_INNER_FOLDS)
+    if not inner:
+        return pl.DataFrame()
+    _scored, seed_labels, _ics, _diagnostic, _path_evaluations = _fit_oof(
+        train_data, inner, data, request, base_manifest, learner_columns,
+        horizon_sessions, None,
+        family="net_alpha_elastic_net",
+    )
+    return seed_labels
+
+
 def _causal_oof_calibrate(
     oof: pl.DataFrame,
     oof_labels: pl.DataFrame,
     request: NetAlphaTrainingRequest,
     horizon_sessions: int,
+    *,
+    seed_ledger: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """Causal session-cluster calibration applied to OOF scored rows.
 
@@ -1645,9 +1695,18 @@ def _causal_oof_calibrate(
     and ``label_available_time <= t`` are revealed, honoring
     ``RiskSettings.min_calibration_sessions``; the frozen state is then applied
     to that session. A later label can therefore never change an earlier
-    session's calibrated score.
+    session's calibrated score. An optional inner-purged ``seed_ledger`` from
+    the initial training slice is prepended so the first outer validation
+    decision already sees a full calibration history instead of a cold start.
     """
-    ledger = _causal_ledger(oof_labels)
+    ledger_frames = [
+        frame
+        for frame in (seed_ledger, oof_labels)
+        if frame is not None and not frame.is_empty()
+    ]
+    if not ledger_frames:
+        return _zero_calibrated(oof)
+    ledger = _causal_ledger(pl.concat(ledger_frames))
     if ledger.is_empty() or oof.is_empty():
         return _zero_calibrated(oof)
     calibrator = _causal_calibrator(request, horizon_sessions)
