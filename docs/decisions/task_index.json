@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "MISSING_EXIT_PRICE_RECOVERY",
+      "date": "2026-08-16",
+      "adr_id": "ADR_20260816_MISSING_EXIT_PRICE_RECOVERY",
+      "domain": "data",
+      "title": "MISSING_EXIT_PRICE provenance recovery and replay safety",
+      "why": "Unresolved exit prices previously conflated source gaps with verified no-bar outcomes and blocked ML readiness without a recoverable backlog.",
+      "resolution": "Added hash-bound outcome evidence, vectorized recovery classification, explicit SOURCE_UNAVAILABLE backfill handling, CONFIRMED_NO_BAR structural exclusion, pinned readiness validation, and replay semantics that distinguish unfilled entries from unresolved filled exits without synthetic returns.",
+      "impact": "ML snapshots now fail only for missing provenance/source gaps or selected unresolved filled vintages; verified no-bars remain auditable, backfill work is explicit, and MISSING_EXIT_PRICE cannot silently inflate or erase performance."
+    },
+    {
       "task_id": "TASK_ML_SNAPSHOT_READINESS_GROWTH_VALIDATION",
       "date": "2026-08-16",
       "adr_id": "ADR_20260816_ML_SNAPSHOT_READINESS_GROWTH_VALIDATION",
