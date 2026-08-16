@@ -64,6 +64,7 @@ from src.stocks.data.labels import (
 )
 from src.stocks.data.outcome_evidence import (
     OUTCOME_EVIDENCE_DATASET_SUFFIX,
+    build_outcome_recovery_report,
     build_partitioned_outcome_evidence,
     publish_outcome_evidence_dataset,
 )
@@ -1270,6 +1271,17 @@ def materialize_net_alpha_snapshot(
         horizon_sessions=request.candidate_horizon_sessions,
         policy=policy,
         bar_evidence=raw_bar_evidence,
+    )
+    recovery = build_outcome_recovery_report(
+        evidence_frame, request.candidate_horizon_sessions
+    )
+    logger.info(
+        "net-alpha snapshot %s outcome recovery: backfill=%d confirmed_no_bar=%d "
+        "unsupported_action=%d",
+        request.snapshot_id,
+        recovery.recoverable_backfill_count,
+        recovery.confirmed_no_bar_count,
+        recovery.unsupported_corporate_action_count,
     )
     evidence_result = publish_outcome_evidence_dataset(
         evidence_frame,

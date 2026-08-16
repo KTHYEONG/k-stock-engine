@@ -40,6 +40,7 @@ from src.stocks.domain.execution_policy import (
     ExecutionOutcomePolicy,
 )
 from src.stocks.ml.contracts import (
+    OUTCOME_MISSING_ENTRY_PRICE,
     OUTCOME_PARTIAL_TAIL,
     OUTCOME_REALIZED,
     OUTCOME_STATUS_COLUMN,
@@ -336,9 +337,13 @@ class NetAlphaPolicyReplay:
                 score key. A selected order with a ``REALIZED`` status is
                 evaluated normally; ``PARTIAL_TAIL`` inside a mature segment is
                 a ``ValueError`` (only the segment-local maturity rule may
-                classify a tail); every other typed state increments the
-                ``unresolved_outcome_counts`` of the owning vintage and is never
-                zero-filled or silently omitted.
+                classify a tail); ``MISSING_ENTRY_PRICE`` marks an unfilled
+                entry order that is cancelled at its execution event (no fill,
+                turnover, cost, exposure, or realized return; the vintage keeps
+                only its filled orders or becomes an observed all-cash vintage);
+                every other typed state increments the
+                ``unresolved_outcome_counts`` of the owning vintage, invalidates
+                it, and is never zero-filled or silently omitted.
             evidence: optional pinned outcome-evidence artifact carrying
                 ``instrument_id``, ``session``, ``policy_hash``, and
                 ``outcome_status``. When supplied its ``policy_hash`` must
@@ -368,6 +373,13 @@ class NetAlphaPolicyReplay:
                 raise ValueError(
                     "outcome evidence is pinned under a foreign execution policy; "
                     f"expected {self.policy_hash}"
+                )
+            duplicates = (
+                evidence.group_by([_ID, _SESSION]).len().filter(pl.col("len") > 1)
+            )
+            if not duplicates.is_empty():
+                raise ValueError(
+                    "outcome evidence contains duplicate instrument/session keys"
                 )
             if status is None:
                 status = evidence.select(
@@ -577,6 +589,7 @@ class NetAlphaPolicyReplay:
             members = orders_by_session.get(session, [])
             if members:
                 growth: list[float] = []
+                filled_orders: list[PolicyOrder] = []
                 unresolved_states: set[str] = set()
                 complete = True
                 for order in members:
@@ -588,6 +601,8 @@ class NetAlphaPolicyReplay:
                             "mature segment; only the segment-local maturity rule "
                             "may classify a chronological tail"
                         )
+                    if outcome_state == OUTCOME_MISSING_ENTRY_PRICE:
+                        continue
                     if outcome_state not in (None, OUTCOME_REALIZED):
                         unresolved_states.add(str(outcome_state))
                         complete = False
@@ -604,7 +619,8 @@ class NetAlphaPolicyReplay:
                         order.order_size, order.decision_session, realized_value
                     )
                     growth.append(float(realized_value[_RISK_RESIDUAL]) - cost_rate)
-                if not complete or len(growth) != len(members):
+                    filled_orders.append(order)
+                if not complete:
                     missing_realized += 1
                     counts[2] += 1
                     if unresolved_states:
@@ -612,6 +628,12 @@ class NetAlphaPolicyReplay:
                         segment_unresolved[segment][signature] = (
                             segment_unresolved[segment].get(signature, 0) + 1
                         )
+                    continue
+                if not filled_orders:
+                    period_returns.append(0.0)
+                    cash += 1
+                    counts[1] += 1
+                    vintage_segments.append(segment)
                     continue
                 net_return = float(np.mean(growth))
                 period_returns.append(net_return)
@@ -623,8 +645,10 @@ class NetAlphaPolicyReplay:
                         vintage_id=int(vintage_ids[position]),
                         horizon_sessions=self._horizon_sessions,
                         net_return=net_return,
-                        order_count=len(growth),
-                        notional=float(sum(order.order_size for order in members)),
+                        order_count=len(filled_orders),
+                        notional=float(
+                            sum(order.order_size for order in filled_orders)
+                        ),
                         segment_id=segment,
                         decision_session_index=local_pos,
                     )

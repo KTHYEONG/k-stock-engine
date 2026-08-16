@@ -30,15 +30,15 @@ from src.stocks.research.artifacts import (
 from src.stocks.workflows.train_model import train_model
 from tests.fixtures.stocks.helpers import (
     stock_liquidity_model,
-    stock_net_alpha_composed_df,
     stock_net_alpha_manifest,
+    stock_net_alpha_pinned_df,
 )
 
 
 def _snapshot(
     n_sessions: int = 160, n_tickers: int = 8
 ) -> tuple[DatasetSnapshot, pl.DataFrame]:
-    df = stock_net_alpha_composed_df(
+    df = stock_net_alpha_pinned_df(
         n_sessions=n_sessions,
         n_tickers=n_tickers,
         audit_clean=True,
@@ -91,7 +91,9 @@ def _holdout_eligibility(
     """
     from datetime import timedelta
 
-    sessions = sorted(df["session"].unique().to_list())
+    # The long-format composition drops each instrument's warm-up observation,
+    # so the trainer's session spine starts at the second distinct session.
+    sessions = sorted(df["session"].unique().to_list())[1:]
     holdout_count = max(1, len(sessions) // 5)
     holdout_start = sessions[-holdout_count]
     last = sessions[-1]
@@ -124,7 +126,7 @@ def test_train_net_alpha_publishes_artifact_or_no_trade(tmp_path) -> None:
         "no_trade",
     }
     if manifest.model_type == "no_trade":
-        assert manifest.eligible_from == df["session"].min().isoformat()
+        assert manifest.eligible_from == sorted(df["session"].unique().to_list())[1].isoformat()
     if manifest.model_type != "no_trade":
         stored = json.loads(
             (tmp_path / "artifacts" / "na_mainline" / "manifest.json").read_text()
@@ -202,7 +204,7 @@ def test_train_net_alpha_no_trade_diagnostics_are_explicit(tmp_path) -> None:
 
 
 def test_train_net_alpha_writes_complete_no_trade_evidence(tmp_path) -> None:
-    df = stock_net_alpha_composed_df(
+    df = stock_net_alpha_pinned_df(
         n_sessions=160, n_tickers=8, audit_clean=True, label_scale=0.0
     )
     snapshot = DatasetSnapshot(
@@ -281,7 +283,7 @@ def test_train_net_alpha_v3_publishes_no_trade_without_positive_evidence(
     still satisfy the integrity audit and carry realized outcomes) must publish
     ``no_trade`` with complete evidence rather than relax a gate.
     """
-    df = stock_net_alpha_composed_df(
+    df = stock_net_alpha_pinned_df(
         n_sessions=120, n_tickers=8, audit_clean=True, label_scale=0.0
     )
     manifest = stock_net_alpha_manifest(columns=df.columns)
@@ -306,15 +308,10 @@ def test_train_net_alpha_missing_realized_outcomes_fail_closed(tmp_path) -> None
     must fail closed with ``ValueError`` instead of degrading into an empty
     block list that looks like a genuine no-trade.
     """
-    df = stock_net_alpha_composed_df(
+    df = stock_net_alpha_pinned_df(
         n_sessions=120, n_tickers=8, audit_clean=True, label_scale=50.0
     )
-    realized_drops = [
-        c
-        for c in df.columns
-        if c.startswith(("risk_residual_", "reference_cost_"))
-    ]
-    df = df.drop(realized_drops)
+    df = df.drop(["risk_residual", "reference_cost"])
     manifest = stock_net_alpha_manifest(columns=df.columns)
     registry = ModelArtifactRegistry(tmp_path / "artifacts")
     snapshot = DatasetSnapshot(manifest=manifest, frame=df)
@@ -362,15 +359,9 @@ def test_train_model_records_completed_through_injected_observer(tmp_path) -> No
 
 
 def test_train_model_records_failure_through_injected_observer(tmp_path) -> None:
-    df = stock_net_alpha_composed_df(
+    df = stock_net_alpha_pinned_df(
         n_sessions=120, n_tickers=8, audit_clean=True, label_scale=50.0
-    )
-    realized_drops = [
-        c
-        for c in df.columns
-        if c.startswith(("risk_residual_", "reference_cost_"))
-    ]
-    df = df.drop(realized_drops)
+    ).drop(["risk_residual", "reference_cost"])
     manifest = stock_net_alpha_manifest(columns=df.columns)
     registry = ModelArtifactRegistry(tmp_path / "artifacts")
     calls: list[tuple] = []
