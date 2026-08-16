@@ -614,7 +614,7 @@ def test_evaluate_status_all_realized_preserves_replay_timeline() -> None:
 
 
 def test_evaluate_selected_missing_exit_price_is_never_zero_filled() -> None:
-    """Acceptance 2: a selected MISSING_EXIT_PRICE fails closed per typed state."""
+    """SCENARIO_REPLAY_NEVER_ZERO_FILLS: unresolved stays outside arithmetic."""
     sessions = _span(6)
     scored = _scored(
         [(f"KRX:{pos:05d}", session, 0.05) for pos, session in enumerate(sessions)]
@@ -771,3 +771,65 @@ def test_evaluate_realized_status_without_inputs_raises() -> None:
     )
     with pytest.raises(ValueError, match="REALIZED status"):
         replay.evaluate(scored, realized, status=status)
+
+
+def test_replay_policy_is_pinned_and_exposed() -> None:
+    from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
+
+    replay = NetAlphaPolicyReplay(3, _PORTFOLIO, _RISK)
+    assert replay.policy == SCHEDULED_OPEN_V1
+    assert replay.policy_hash == SCHEDULED_OPEN_V1.canonical_hash
+
+
+def test_evaluate_rejects_evidence_pinned_under_foreign_policy() -> None:
+    from src.stocks.domain.execution_policy import (
+        SCHEDULED_OPEN_V1,
+        ExecutionOutcomePolicy,
+    )
+
+    session = datetime(2024, 1, 2, tzinfo=UTC)
+    scored = _scored([("KRX:00001", session, 0.02)])
+    foreign = ExecutionOutcomePolicy(
+        policy_id="first_tradable_open_v1", max_entry_delay_sessions=1
+    )
+    evidence = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:00001"],
+            "session": [session],
+            "policy_hash": [foreign.canonical_hash],
+            "outcome_status": ["REALIZED"],
+        }
+    )
+    replay = NetAlphaPolicyReplay(3, _PORTFOLIO, _RISK, policy=SCHEDULED_OPEN_V1)
+    with pytest.raises(ValueError, match="foreign execution policy"):
+        replay.evaluate(scored, realized=None, evidence=evidence)
+
+
+def test_evaluate_uses_evidence_as_status_projection_when_status_omitted() -> None:
+    from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
+
+    sessions = _span(6)
+    scored = _scored(
+        [(f"KRX:{pos:05d}", session, 0.05) for pos, session in enumerate(sessions)]
+    )
+    realized = _realized(
+        [
+            (f"KRX:{pos:05d}", session, 0.05, 100.0, 1.0e8, 0.02)
+            for pos, session in enumerate(sessions)
+            if pos != 0
+        ]
+    )
+    evidence = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:00000"],
+            "session": [sessions[0]],
+            "policy_hash": [SCHEDULED_OPEN_V1.canonical_hash],
+            "outcome_status": ["MISSING_EXIT_PRICE"],
+        }
+    )
+    evaluation = NetAlphaPolicyReplay(
+        3, _PORTFOLIO, _RISK, liquidity_model=_LIQUIDITY, policy=SCHEDULED_OPEN_V1
+    ).evaluate(scored, realized=realized, evidence=evidence)
+    assert len(evaluation.orders) == 6
+    assert evaluation.missing_realized_vintage_count == 1
+    assert evaluation.unresolved_outcome_counts == (("MISSING_EXIT_PRICE", 1),)

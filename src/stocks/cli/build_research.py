@@ -52,6 +52,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--feature-root", type=Path, default=STOCK_FEATURE_PANEL_ROOT)
     parser.add_argument("--label-root", type=Path, default=STOCK_LABEL_ROOT)
     parser.add_argument("--calendar-path", type=Path)
+    parser.add_argument(
+        "--raw-bar-dataset-id",
+        help="optional immutable RAW_BARS catalog dataset used to repair exact open outcomes",
+    )
+    parser.add_argument(
+        "--outcome-open-bar-dataset-id",
+        help="optional compact OUTCOME_OPEN_BARS dataset used to repair exact open outcomes",
+    )
     parser.add_argument("--train-start", required=True, type=date.fromisoformat)
     parser.add_argument("--train-end", required=True, type=date.fromisoformat)
     parser.add_argument("--validation-start", required=True, type=date.fromisoformat)
@@ -119,6 +127,8 @@ def main(args: list[str] | None = None) -> int:
         calendar_path=parsed.calendar_path,
         candidate_horizon_sessions=_parse_horizons(parsed.candidate_horizon_sessions),
         reference_notional=parsed.reference_notional,
+        raw_bar_dataset_id=parsed.raw_bar_dataset_id,
+        outcome_open_bar_dataset_id=parsed.outcome_open_bar_dataset_id,
     )
     result = materialize_net_alpha_snapshot(request)
     sys.stdout.write(

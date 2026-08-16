@@ -23,6 +23,7 @@
 - **Project-Only Temp (No External /tmp):** All temporary artifacts MUST stay inside the repository. Scripts & command output logs go to `scratch/`; tool scratch roots go to `tmp/`. Never write to `/tmp`, `/tmp/opencode`, `%TEMP%`, or any external temp path. Tools that default to an external temp root (pytest `tmp_path`, `tempfile`, `TMPDIR`) are pinned to the project via `tests/conftest.py`. The sync skill purges `scratch/` and `tmp/`.
 - **File Modification Policy:** Use available patch/edit tools for existing files. Create a new file only when it does not exist.
 - **Context Control:** Omit unchanged lines with `# ... existing code ...`. Specify line ranges when viewing large files over 300 lines.
+- **Concise In-Code Comments & No Ephemeral Spec Refs:** In-line comments must be 1-2 lines maximum, explaining only immediate "Why" or domain constraints without multi-line storytelling. NEVER cite temporary `docs/specs/*.md` or `contract.json` paths in code, docstrings, CLI help, or comments (use persistent `ADR-XXXX` IDs or self-contained logic).
 
 ## 5. Domain & Skill Rule Routing
 - **Python Architecture & Standards:** [python.md](file:///.agents/rules/python.md)

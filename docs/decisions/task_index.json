@@ -1,6 +1,46 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_OOF_MEMORY_OPTIMIZATION",
+      "date": "2026-08-16",
+      "adr_id": "ADR_20260816_ML_OOF_MEMORY_OPTIMIZATION",
+      "domain": "ml",
+      "title": "Bounded ML OOF memory",
+      "why": "Six-horizon net-alpha discovery retains full per-horizon labels and calibrated OOF frames, driving measured peak RSS to 9648.812 MiB.",
+      "resolution": "Register a sequential optimization blueprint: narrow horizon labels, temporary admitted-OOF Parquet spooling, deterministic cleanup, and max-RSS guardrails with unchanged fold/data contracts.",
+      "impact": "Implementation target is lower peak RSS with bounded runtime overhead; no snapshot schema, label, fold, or model-selection contract changes."
+    },
+    {
+      "task_id": "TASK_LIGHTWEIGHT_ML_EXECUTION_MANIFEST",
+      "date": "2026-08-16",
+      "adr_id": "ADR_20260816_LIGHTWEIGHT_ML_EXECUTION_MANIFEST",
+      "domain": "stocks",
+      "title": "Lightweight ML execution range",
+      "why": "Research snapshot resolution rejected usable local ML/backtest data because unrelated evidence and costs ended before the feature window.",
+      "resolution": "Added execution-mode snapshot resolution using the hash-bound base/features/labels overlap, bounded repository composition and cost loading to execution_range, and preserved strict full validation for paper/live modes.",
+      "impact": "Local research ML and historical backtests no longer require excessive evidence coverage; point-in-time labels and no-imputation rules remain intact, while operational modes stay fail-closed."
+    },
+    {
+      "task_id": "TASK_STOCK_OUTCOME_BACKFILL_EXECUTION",
+      "date": "2026-08-16",
+      "adr_id": "ADR_20260816_STOCK_OUTCOME_BACKFILL_EXECUTION",
+      "domain": "stocks",
+      "title": "Outcome backfill and unresolved-data handling",
+      "why": "MISSING_EXIT_PRICE rows mixed recoverable API gaps with historical source-unavailable or no-bar outcomes, making ML and backtest readiness ambiguous.",
+      "resolution": "Backfilled 2026-03-11 KRX opens, published immutable outcome evidence with SOURCE_UNAVAILABLE and CONFIRMED_NO_BAR distinctions, pinned evidence in snapshots, excluded unresolved outcomes from realized label arithmetic, and changed ML admission to use observed/active coverage gates.",
+      "impact": "Recoverable exits are restored without imputation; non-recoverable history remains auditable and excluded from return arithmetic, while ML and replay avoid zero-fill and retain coverage diagnostics."
+    },
+    {
+      "task_id": "TASK_DETERMINISTIC_PARQUET_VALIDATION",
+      "date": "2026-08-16",
+      "adr_id": "ADR_20260816_DETERMINISTIC_PARQUET_VALIDATION",
+      "domain": "stocks",
+      "title": "Deterministic multi-horizon Parquet validation",
+      "why": "Multi-horizon label and outcome-status datasets failed closed because row ordering made stored and read-time content hashes disagree; every read also rehashed all decoded rows.",
+      "resolution": "Canonical row hashing now uses a total ordered representation, partitioned reads compare declared manifest hashes and verify per-partition digests without a redundant full-table rehash, and identity output ordering includes horizon_sessions.",
+      "impact": "Existing canonical ML label and status datasets are readable and tamper detection remains fail-closed with lower read overhead."
+    },
+    {
       "task_id": "TASK_STOCK_OUTCOME_BACKFILL_PLAN",
       "date": "2026-08-15",
       "adr_id": "ADR_20260815_STOCK_OUTCOME_BACKFILL_PLAN",

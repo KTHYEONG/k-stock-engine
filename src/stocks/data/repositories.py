@@ -293,7 +293,12 @@ def resolve_snapshot_for_mode(
     if not snapshot_id:
         raise ValueError("a snapshot-id is required; no implicit newest selection")
     store = CatalogStore(catalog_root)
-    snapshot = SnapshotResolver(store).resolve(snapshot_id)
+    resolver = SnapshotResolver(store)
+    snapshot = (
+        resolver.resolve_execution(snapshot_id)
+        if mode == "research"
+        else resolver.resolve(snapshot_id)
+    )
     if mode in ("paper", "live") and (
         snapshot.manifest.certification is DatasetCertification.PROVISIONAL
     ):
@@ -427,7 +432,7 @@ class ResearchDataRepository:
         """
         if snapshot.labels is None:
             raise ValueError("snapshot has no label-panel reference")
-        range_ = research_range or snapshot.research_range
+        range_ = research_range or snapshot.execution_range
 
         base, features, feature_manifest = self._read_base_and_features(
             snapshot, feature_set=feature_set, decision_time=decision_time,
@@ -890,7 +895,7 @@ class ResearchDataRepository:
             raise ValueError("snapshot has no base-panel reference")
         if snapshot.features is None:
             raise ValueError("snapshot has no feature-panel reference")
-        range_ = research_range or snapshot.research_range
+        range_ = research_range or snapshot.execution_range
 
         base = self.read_base_bounded(
             snapshot.base_panel, decision_time, research_range=range_

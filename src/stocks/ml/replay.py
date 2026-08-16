@@ -35,6 +35,10 @@ import numpy as np
 import polars as pl
 
 from src.core.costs import CostSchedule, LiquiditySlippageModel, default_base_schedule
+from src.stocks.domain.execution_policy import (
+    SCHEDULED_OPEN_V1,
+    ExecutionOutcomePolicy,
+)
 from src.stocks.ml.contracts import (
     OUTCOME_PARTIAL_TAIL,
     OUTCOME_REALIZED,
@@ -281,6 +285,7 @@ class NetAlphaPolicyReplay:
         cost_schedule: CostSchedule | None = None,
         liquidity_model: LiquiditySlippageModel | None = None,
         seed: int = 42,
+        policy: ExecutionOutcomePolicy | None = None,
     ):
         if horizon_sessions < 1:
             raise ValueError("horizon_sessions must be positive")
@@ -290,6 +295,11 @@ class NetAlphaPolicyReplay:
         self._cost_schedule = cost_schedule or default_base_schedule()
         self._liquidity_model = liquidity_model
         self._seed = seed
+        self.policy = policy or SCHEDULED_OPEN_V1
+
+    @property
+    def policy_hash(self) -> str:
+        return self.policy.canonical_hash
 
     def evaluate(
         self,
@@ -299,6 +309,7 @@ class NetAlphaPolicyReplay:
         decision_time: datetime | None = None,
         segment_column: str | None = None,
         status: pl.DataFrame | None = None,
+        evidence: pl.DataFrame | None = None,
     ) -> ReplayEvaluation:
         """Evaluate the scored OOF panel through the common policy.
 
@@ -328,6 +339,12 @@ class NetAlphaPolicyReplay:
                 classify a tail); every other typed state increments the
                 ``unresolved_outcome_counts`` of the owning vintage and is never
                 zero-filled or silently omitted.
+            evidence: optional pinned outcome-evidence artifact carrying
+                ``instrument_id``, ``session``, ``policy_hash``, and
+                ``outcome_status``. When supplied its ``policy_hash`` must
+                equal this replay's policy hash (a foreign policy is a
+                ``ValueError``) and it supplies the status projection when
+                ``status`` is omitted.
 
         Returns:
             An immutable ``ReplayEvaluation`` with deterministic ``orders``.
@@ -336,10 +353,26 @@ class NetAlphaPolicyReplay:
             ValueError: for a missing scored column, a non-empty realized frame
                 that lacks canonical columns, carries non-finite outcomes, or
                 repeats keys, a realized replay without liquidity model or cost
-                coverage, a ``PARTIAL_TAIL`` status inside a mature segment, or
-                a score key absent from a supplied status projection.
+                coverage, a ``PARTIAL_TAIL`` status inside a mature segment,
+                evidence pinned under a foreign policy hash, or a score key
+                absent from a supplied status projection.
         """
         del decision_time
+        if evidence is not None and not evidence.is_empty():
+            evidence_required = (_ID, _SESSION, "policy_hash", OUTCOME_STATUS_COLUMN)
+            missing = [c for c in evidence_required if c not in evidence.columns]
+            if missing:
+                raise ValueError(f"outcome evidence missing columns {missing}")
+            foreign = evidence.filter(pl.col("policy_hash") != self.policy_hash)
+            if not foreign.is_empty():
+                raise ValueError(
+                    "outcome evidence is pinned under a foreign execution policy; "
+                    f"expected {self.policy_hash}"
+                )
+            if status is None:
+                status = evidence.select(
+                    _ID, _SESSION, OUTCOME_STATUS_COLUMN
+                )
         required = (_ID, _SESSION, SCORE_COLUMN)
         missing = [c for c in required if c not in oof_scores.columns]
         if missing:
