@@ -43,6 +43,8 @@ EXIT_COST_COLUMN = "exit_cost_rate"
 
 _MIN_BUCKET_OBSERVATIONS = 5
 _SHRINKAGE_THRESHOLD = 20.0
+_ADAPTIVE_BUCKET_MIN_SESSIONS = 252
+_ADAPTIVE_BUCKET_COLD_COUNT = 5
 _DEFAULT_BLOCK_LENGTH = 5
 _VOLATILITY_WINDOW_SESSIONS = 10
 _DEFAULT_PARTICIPATION_LIMIT = 0.01
@@ -123,6 +125,7 @@ class CausalAlphaCalibrator:
         self._last_history_sessions = 0
         self._last_round_trip_cost = 0.0
         self._last_exit_cost = 0.0
+        self._last_effective_bucket_count = bucket_count
 
     @property
     def bucket_evidence(self) -> tuple[BucketEvidence, ...]:
@@ -192,10 +195,13 @@ class CausalAlphaCalibrator:
                 visible, score_column, self.bucket_count,
                 self._last_round_trip_cost, self._last_exit_cost, liquidity_rate,
             )
-
+        bucket_count = adaptive_bucket_count(
+            self.bucket_count, self._last_history_sessions
+        )
+        self._last_effective_bucket_count = bucket_count
         stats = _bucket_statistics(
             eligible,
-            self.bucket_count,
+            bucket_count,
             label_column=self.label_column,
             seed=self.seed,
             n_bootstrap=self.n_bootstrap,
@@ -225,7 +231,7 @@ class CausalAlphaCalibrator:
             )
         )
         return _augment(
-            visible, score_column, self.bucket_count,
+            visible, score_column, bucket_count,
             self._last_round_trip_cost, self._last_exit_cost, liquidity_rate,
             bucket_stats=stats,
         )
@@ -279,9 +285,13 @@ class CausalAlphaCalibrator:
                 "exit_cost_rate": float(exit_cost),
                 "buckets": [],
             }
+        bucket_count = adaptive_bucket_count(
+            self.bucket_count, self._last_history_sessions
+        )
+        self._last_effective_bucket_count = bucket_count
         stats = _bucket_statistics(
             eligible,
-            self.bucket_count,
+            bucket_count,
             label_column=self.label_column,
             seed=self.seed,
             n_bootstrap=self.n_bootstrap,
@@ -312,7 +322,7 @@ class CausalAlphaCalibrator:
             )
         )
         return {
-            "bucket_count": int(self.bucket_count),
+            "bucket_count": int(bucket_count),
             "history_sessions": int(self._last_history_sessions),
             "round_trip_cost": float(round_trip_cost),
             "exit_cost_rate": float(exit_cost),
@@ -373,7 +383,7 @@ class CausalAlphaCalibrator:
     def calibration_state(self) -> dict[str, object]:
         """JSON-safe frozen calibration snapshot for artifact serialization."""
         return {
-            "bucket_count": int(self.bucket_count),
+            "bucket_count": int(self._last_effective_bucket_count),
             "min_calibration_sessions": int(self.min_calibration_sessions),
             "seed": int(self.seed),
             "n_bootstrap": int(self.n_bootstrap),
@@ -442,7 +452,7 @@ class CausalAlphaCalibrator:
             }
         )
         return _augment(
-            scored, score_column, self.bucket_count,
+            scored, score_column, self._last_effective_bucket_count,
             self._last_round_trip_cost, self._last_exit_cost, None,
             bucket_stats=stats,
         )
@@ -495,6 +505,34 @@ def _resolve_score_column(frame: pl.DataFrame) -> str:
     if SCORE_COLUMN in frame.columns:
         return SCORE_COLUMN
     raise ValueError("scored frame must carry pred_score or score")
+
+
+def adaptive_bucket_count(nominal: int, history_sessions: int) -> int:
+    """Fewer score buckets while calibration history is thin.
+
+    Cold-start calibration splits the accumulated sessions into score buckets;
+    splitting a small sample into the full nominal deciles leaves each bucket
+    too thin for a stable block bootstrap. Below one year of sessions the
+    effective count drops to quintiles; at or above it the nominal count is
+    used.
+    """
+    if history_sessions < _ADAPTIVE_BUCKET_MIN_SESSIONS:
+        return min(nominal, _ADAPTIVE_BUCKET_COLD_COUNT)
+    return nominal
+
+
+def _shrink_lower_bound(lower: float, location: float, sample_size: int) -> float:
+    """Pull a thin-sample bootstrap lower bound toward its series location.
+
+    The bootstrap ``alpha`` quantile is a pessimistic estimate whose spread
+    inflates with sample variance; on thin samples it can collapse below zero
+    purely from sampling noise. The deviation from the series location is
+    down-weighted by ``sample_size / (sample_size + one_year_of_sessions)`` so
+    thin samples stay anchored to the observed location while thick samples
+    keep the full pessimistic quantile.
+    """
+    weight = sample_size / (sample_size + _ADAPTIVE_BUCKET_MIN_SESSIONS)
+    return location + (lower - location) * weight
 
 
 def _bucket_expression(score_column: str, bucket_count: int) -> pl.Expr:
@@ -577,6 +615,9 @@ def _bucket_statistics(
             seed + bucket,
             bootstrap_alpha,
             max_bootstrap_workspace_bytes=max_bootstrap_workspace_bytes,
+        )
+        lower_bound = _shrink_lower_bound(
+            lower_bound, float(np.mean(residuals)), sample_size
         )
         if lower_bound <= 0.0:
             rows.append(

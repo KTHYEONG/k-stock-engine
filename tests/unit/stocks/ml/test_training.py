@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import inspect
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -1084,4 +1084,97 @@ def test_coverage_failure_reason_allows_isolated_blocked_vintages() -> None:
     assert training._coverage_failure_reason(dominant, request).startswith(
         "selected-exit-unresolved:"
     )
+
+def _adaptive_observations(
+    n_sessions: int = 120, n_tickers: int = 20
+) -> pl.DataFrame:
+    """Deterministic residual panel with score-correlated positive alpha."""
+    rng = np.random.default_rng(11)
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    rows: list[dict] = []
+    for s in range(n_sessions):
+        for t in range(n_tickers):
+            rows.append(  # noqa: PERF401
+                {
+                    "instrument_id": f"KRX:{t:06d}",
+                    "session": start + timedelta(days=s),
+                    "score": float(t) + (s % 3),
+                    "residual_o2o_5d": float(
+                        0.004 * t + rng.normal(0.0, 0.0002)
+                    ),
+                    "label_available_time": start + timedelta(days=s + 6),
+                }
+            )
+    return pl.DataFrame(rows)
+
+
+def test_fold_zero_active_with_seed_ledger() -> None:
+    """Seed ledger injection removes fold zero's cold-start cash window."""
+    from src.stocks.ml.labels import SESSION_COLUMN
+
+    data, request, pre_holdout, folds, learner_columns, _schema = _training_fixture()
+    horizon = 3
+    manifest = training._base_manifest(request, data, data.feature_frame, horizon)
+    initial_train = pre_holdout.filter(
+        pl.col("session_index") < folds[0].validation_decision_start
+    )
+    seed = training.build_initial_calibration_seed(
+        initial_train, request, learner_columns, horizon, manifest, data=data
+    )
+    assert not seed.is_empty()
+    oof, oof_labels, _ics, _diag, _path = training._fit_oof(
+        pre_holdout, [folds[0]], data, request, manifest, learner_columns,
+        horizon, None, family="net_alpha_elastic_net",
+    )
+    calibrated = training._causal_oof_calibrate(
+        oof, oof_labels, request, horizon, seed_ledger=seed
+    )
+    active = calibrated.filter(
+        pl.col("net_alpha_lower_bound").is_not_null()
+        & (pl.col("net_alpha_lower_bound") > 0.0)
+    )
+    assert active[SESSION_COLUMN].n_unique() > 0
+    first_session = oof[SESSION_COLUMN].min()
+    unseeded = training._causal_oof_calibrate(oof, oof_labels, request, horizon)
+    early = unseeded.filter(pl.col(SESSION_COLUMN) == first_session)
+    assert early["net_alpha_lower_bound"].null_count() == early.height
+
+
+def test_adaptive_bucketing_cold_start() -> None:
+    """Thin history uses quintiles; thick history uses the nominal deciles."""
+    from src.core.costs import default_base_schedule
+    from src.stocks.research.economic_alpha import (
+        CausalAlphaCalibrator,
+        _shrink_lower_bound,
+        adaptive_bucket_count,
+    )
+
+    assert adaptive_bucket_count(10, 251) == 5
+    assert adaptive_bucket_count(10, 252) == 10
+    assert adaptive_bucket_count(5, 100) == 5
+    assert adaptive_bucket_count(5, 400) == 5
+
+    location = 0.004
+    thin = _shrink_lower_bound(-0.02, location, 20)
+    assert location > thin > -0.02
+    assert _shrink_lower_bound(-0.02, location, 2520) < thin
+
+    cal = CausalAlphaCalibrator(
+        bucket_count=10, min_calibration_sessions=5, n_bootstrap=50
+    )
+    cold = cal.prepare_decision(
+        _adaptive_observations(120),
+        datetime(2024, 4, 29, tzinfo=UTC),
+        default_base_schedule(),
+    )
+    assert cold["history_sessions"] >= 5
+    assert cold["bucket_count"] == 5
+    assert cold["buckets"]
+    warm = cal.prepare_decision(
+        _adaptive_observations(300),
+        datetime(2024, 10, 22, tzinfo=UTC),
+        default_base_schedule(),
+    )
+    assert warm["history_sessions"] >= 252
+    assert warm["bucket_count"] == 10
 
