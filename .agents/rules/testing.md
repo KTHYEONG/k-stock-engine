@@ -7,7 +7,7 @@ priority: 8
 
 # Testing Directives & Test Quality Standards
 
-This document defines testing directives focusing on observable behavior, interface contracts, and reliable verification.
+This document defines testing directives focusing on observable behavior, interface contracts, ultra-fast test execution, and reliable verification.
 
 ---
 
@@ -15,6 +15,7 @@ This document defines testing directives focusing on observable behavior, interf
 - **Behavior-Driven Mapping:** Organize tests by component behavior and logical boundary, rather than enforcing rigid 1:1 file mirroring for every utility module.
 - **Observable Behavior:** Test observable outcomes, return contracts, and state mutations rather than internal implementation details.
 - **AAA Pattern:** Structure test cases clearly using Arrange, Act, and Assert steps.
+- **In-Memory First Policy:** Unit tests (`tests/unit/`) MUST use In-Memory fixtures (DataFrames, dicts, mocks) and MUST NOT write Parquet/CSV files to disk (`tmp_path`). Disk I/O is restricted to dedicated storage/integration tests.
 
 ---
 
@@ -22,8 +23,9 @@ This document defines testing directives focusing on observable behavior, interf
 - **Realistic Engine Testing:** Use the production database engine (or test containers matching production SQL dialects) when SQL dialect behavior or query optimization matters.
 - **Mocking Boundaries:** Limit mocking to external network boundaries, third-party APIs, clock interfaces, and hardware I/O.
 - **Stable Semantics over String Matching:** Verify exception types and key semantic phrases rather than relying on brittle, full string error message matching.
-- **Heavy Computation Categorization (`@pytest.mark.slow`):** Any test executing multi-year backtests, block-bootstrapping (>100 iterations), or Monte Carlo simulations (>1000 draws) MUST be decorated with `@pytest.mark.slow` to keep default `uv run pytest` runs fast (<1s per test file).
-- **Fast Test Profiles for Heavy Algorithms:** In unit and integration test fixtures, use lightweight fast profiles (e.g., reduced bootstrap/draw counts or stubbed data loaders) to verify contract wiring without sacrificing suite execution speed.
+- **Fixture Scoping Hygiene:** When disk fixtures or heavy setup are required in integration tests (`tests/integration/`), scope them to `module` or `session` to prevent duplicate I/O per test function.
+- **Heavy Computation Categorization (`@pytest.mark.slow`):** Any test executing multi-year backtests, long horizon replaying (>1,000 bars), block-bootstrapping (>100 iterations), or Monte Carlo simulations (>1,000 draws) MUST be decorated with `@pytest.mark.slow` to keep default `uv run pytest` runs fast (<0.5s per test file).
+- **Fast Test Profiles for Heavy Algorithms:** In unit and integration test fixtures, use lightweight fast profiles (e.g., reduced bootstrap/draw counts or stubbed in-memory data loaders) to verify contract wiring without sacrificing suite execution speed.
 
 ---
 
