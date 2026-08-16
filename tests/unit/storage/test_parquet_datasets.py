@@ -128,6 +128,18 @@ def partitioned_frame() -> pl.DataFrame:
     ).sort(["instrument_id", "session"])
 
 
+def multi_horizon_frame() -> pl.DataFrame:
+    session = datetime(2024, 1, 4, tzinfo=UTC)
+    return pl.DataFrame(
+        {
+            "instrument_id": ["KRX:1", "KRX:1", "KRX:2", "KRX:2"],
+            "session": [session, session, session, session],
+            "horizon_sessions": [5, 3, 5, 3],
+            "target": [0.5, 0.3, 0.6, 0.4],
+        }
+    )
+
+
 def partitioned_manifest(frame: pl.DataFrame) -> DatasetManifest:
     return make_manifest(
         asset_kind=AssetKind.STOCK,
@@ -147,6 +159,29 @@ def partitioned_manifest(frame: pl.DataFrame) -> DatasetManifest:
 
 
 class TestPartitionedRoundTrip:
+    def test_multi_horizon_hash_is_order_invariant(self) -> None:
+        # multi_horizon_hash_is_order_invariant
+        frame = multi_horizon_frame()
+        reversed_frame = frame.reverse()
+        assert canonical_content_hash(frame, frame.columns) == canonical_content_hash(
+            reversed_frame, reversed_frame.columns
+        )
+
+    def test_multi_horizon_partitioned_round_trip(self, tmp_path) -> None:
+        # multi_horizon_partitioned_round_trip
+        store = ParquetDatasetStore(tmp_path / "root")
+        frame = multi_horizon_frame()
+        manifest = partitioned_manifest(frame)
+        store.write_partitioned(
+            frame.reverse(),
+            dataset_id="multi_horizon",
+            manifest=manifest,
+            expected_feature_set=FEATURE_SET,
+            decision_time=DECISION,
+        )
+        out = store.read("multi_horizon", AssetKind.STOCK, FEATURE_SET, DECISION)
+        assert out["horizon_sessions"].to_list() == [3, 5, 3, 5]
+
     def test_partitioned_write_read_round_trips(self, tmp_path) -> None:
         store = ParquetDatasetStore(tmp_path / "root")
         frame = partitioned_frame()
@@ -200,6 +235,7 @@ class TestPartitionedRoundTrip:
             store.read("d2", AssetKind.STOCK, FEATURE_SET, DECISION)
 
     def test_content_hash_mismatch_fails_closed(self, tmp_path) -> None:
+        # manifest_content_hash_disagreement_fails_closed
         store = ParquetDatasetStore(tmp_path / "root")
         frame = partitioned_frame()
         manifest = partitioned_manifest(frame)

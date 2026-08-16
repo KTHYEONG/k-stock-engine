@@ -54,9 +54,13 @@ def canonical_content_hash(frame: pl.DataFrame, ordered_columns: list[str]) -> s
     so it is invariant to source row order and partition layout while still
     detecting any change to content.
     """
-    key_columns = [c for c in ("instrument_id", "session") if c in ordered_columns]
-    sort_columns = key_columns or ordered_columns[:1]
-    rows = frame.select(ordered_columns).sort(sort_columns).hash_rows(seed=0).to_numpy().tobytes()
+    rows = (
+        frame.select(ordered_columns)
+        .sort(ordered_columns)
+        .hash_rows(seed=0)
+        .to_numpy()
+        .tobytes()
+    )
     return hashlib.sha256(
         schema_hash(ordered_columns).encode("utf-8") + b"\x00" + rows
     ).hexdigest()
@@ -71,7 +75,7 @@ def file_sha256(path: Path) -> str:
 
 
 def _iso_dt(value: object) -> str | None:
-    return value.isoformat() if isinstance(value, datetime) else None
+    return value.isoformat() if isinstance(value, (datetime, date)) else None
 
 
 class ParquetDatasetStore:
@@ -154,10 +158,11 @@ class ParquetDatasetStore:
         year_col, month_col = _PARTITION_COLUMNS
         session_column = (
             "session" if "session" in frame.columns else "decision_session"
+            if "decision_session" in frame.columns else "price_date"
         )
         if session_column not in frame.columns:
             raise ValueError(
-                "partitioned write requires a session or decision_session column"
+                "partitioned write requires a session, decision_session, or price_date column"
             )
         partitioned = frame.with_columns(
             pl.col(session_column).dt.strftime("%Y").alias(year_col),
@@ -276,18 +281,19 @@ class ParquetDatasetStore:
         if output.get("schema_hash") != manifest.schema_hash:
             raise ValueError("content manifest schema hash does not match dataset manifest")
 
+        if output.get("content_hash") != manifest.content_hash:
+            raise ValueError("content manifest content hash does not match dataset manifest")
         self._verify_entries(
             dataset_dir, _content_partitions(content), manifest.content_hash
         )
 
         columns = _content_column_order(content)
         frame = pl.read_parquet(partitions_dir, hive_partitioning=True)
-        recomputed = canonical_content_hash(frame, columns)
-        if recomputed != manifest.content_hash:
-            raise ValueError("dataset content hash mismatch")
-        if recomputed != output.get("content_hash"):
-            raise ValueError("content manifest content hash mismatch")
-        key_columns = [c for c in ("instrument_id", "session") if c in columns]
+        key_columns = [
+            c
+            for c in ("instrument_id", "session", "price_date", "horizon_sessions")
+            if c in columns
+        ]
         sort_columns = key_columns or columns[:1]
         return frame.select(columns).sort(sort_columns)
 

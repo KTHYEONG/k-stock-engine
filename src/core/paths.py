@@ -19,10 +19,7 @@ STOCK_ARTIFACT_ROOT = DATA_ROOT / "artifacts" / "stocks"
 # replacement for the manifest-backed dataset store above.
 STOCK_FEATURE_SOURCE_ROOT = DATA_ROOT / "processed" / "features"
 
-# Cataloged lakehouse roots (see docs/specs/stock_research_data_foundation.md).
-# The catalog is the append-only registry; canonical holds immutable base/label
-# datasets; derived holds reusable feature panels; snapshots hold the only
-# train/backtest input selectors; results hold backtest reports/equity curves.
+# Cataloged lakehouse storage hierarchy.
 STOCK_CATALOG_ROOT = DATA_ROOT / "catalog" / "stocks"
 STOCK_CANONICAL_ROOT = DATA_ROOT / "canonical" / "stocks"
 STOCK_DERIVED_ROOT = DATA_ROOT / "derived" / "stocks"

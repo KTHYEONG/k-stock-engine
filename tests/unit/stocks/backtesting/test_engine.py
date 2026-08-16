@@ -386,20 +386,20 @@ def test_prepared_replay_preserves_null_action_coverage_and_fails_false() -> Non
     )
 
 
-def test_certified_replay_rejects_null_or_false_action_coverage() -> None:
-    """Certified panels with null/False coverage fail closed before replay."""
+def test_scenario_research_replay_no_action_gate_and_production_rejects_coverage() -> None:
+    """SCENARIO_RESEARCH_REPLAY_NO_ACTION_GATE: only production requires coverage."""
     import dataclasses
 
     from src.core.datasets import DatasetCertification
 
     df, snapshot, registry, instruments, policy, scored, artifacts, request, portfolio = _paired_inputs()
-    certified_manifest = dataclasses.replace(
+    research_manifest = dataclasses.replace(
         snapshot.manifest, certification=DatasetCertification.RESEARCH
     )
-    backtester = StockBacktester(
+    research_backtester = StockBacktester(
         registry=registry,
         instruments=instruments,
-        manifest=certified_manifest,
+        manifest=research_manifest,
         cost_schedule=default_base_schedule(),
         stress_cost_schedule=default_stress_schedule(),
         decision_provider=lambda dt, et: _prepare(dt, et, scored),
@@ -410,10 +410,222 @@ def test_certified_replay_rejects_null_or_false_action_coverage() -> None:
     null_frame = df.with_columns(
         pl.lit(None, dtype=pl.Boolean).alias("action_interval_covered")
     )
+    research_backtester.run(null_frame, artifacts, portfolio, request)
+
+    production_backtester = StockBacktester(
+        registry=registry,
+        instruments=instruments,
+        manifest=dataclasses.replace(
+            snapshot.manifest, certification=DatasetCertification.PRODUCTION
+        ),
+        cost_schedule=default_base_schedule(),
+        stress_cost_schedule=default_stress_schedule(),
+        decision_provider=lambda dt, et: _prepare(dt, et, scored),
+        scenario_planner=lambda prepared, port, creq: _scenario_planner(
+            prepared, port, creq, instruments, policy
+        ),
+    )
     with pytest.raises(BacktestValidationError, match="uncovered action interval"):
-        backtester.run(null_frame, artifacts, portfolio, request)
+        production_backtester.run(null_frame, artifacts, portfolio, request)
     false_frame = df.with_columns(
         pl.lit(False, dtype=pl.Boolean).alias("action_interval_covered")
     )
     with pytest.raises(BacktestValidationError, match="uncovered action interval"):
-        backtester.run(false_frame, artifacts, portfolio, request)
+        production_backtester.run(false_frame, artifacts, portfolio, request)
+
+
+def test_backtest_data_quality_records_execution_policy() -> None:
+    from src.stocks.domain.execution_policy import (
+        SCHEDULED_OPEN_POLICY_ID,
+        SCHEDULED_OPEN_V1,
+    )
+
+    df, snapshot, registry, instruments, policy, scored, artifacts, request, portfolio = _paired_inputs()
+
+    def planner(snap, reg, inst, port, creq):
+        del snap, reg, inst, port
+        return TradingCycleResult(
+            status=CycleStatus.NO_TRADE, cycle_id="stub",
+            decision_time=creq.decision_time, dataset_hash="d",
+            artifact_id=creq.artifact_id,
+            account_snapshot_id="acc",
+            allocations=(), intents=(), selected_instruments=(),
+            reasons=("none",),
+        )
+
+    backtester = StockBacktester(
+        planner=planner,
+        registry=registry,
+        instruments=instruments,
+        manifest=snapshot.manifest,
+        cost_schedule=default_base_schedule(),
+        policy=SCHEDULED_OPEN_V1,
+    )
+    result = backtester.run(df, artifacts, portfolio, request)
+    assert result.data_quality["execution_policy_id"] == SCHEDULED_OPEN_POLICY_ID
+    assert result.data_quality["execution_policy_hash"] == SCHEDULED_OPEN_V1.canonical_hash
+
+
+def test_missing_execution_open_is_explicit_unfilled_never_silently_dropped() -> None:
+    from src.core.instruments import AssetKind
+    from src.execution.domain.intents import TradeIntent
+    from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
+
+    df, snapshot, registry, instruments, policy, scored, artifacts, request, portfolio = _paired_inputs()
+    df = df.with_columns(
+        pl.when(
+            (pl.col("instrument_id") == "KRX:000001")
+            & (pl.col("session_index") == 11)
+        )
+        .then(None)
+        .otherwise(pl.col("open"))
+        .alias("open")
+    )
+
+    def planner(snap, reg, inst, port, creq):
+        del snap, reg, inst
+        intent = TradeIntent(
+            intent_id="t1",
+            asset_kind=AssetKind.STOCK,
+            instrument_id="KRX:000001",
+            target_value=10_000_000.0,
+            decision_time=creq.decision_time,
+            execution_time=creq.execution_time,
+            strategy_id=creq.strategy_id,
+            reason="scored-plan",
+            idempotency_key="k1",
+            account_snapshot_id=port.account_snapshot_id,
+        )
+        return TradingCycleResult(
+            status=CycleStatus.PLANNED, cycle_id="stub",
+            decision_time=creq.decision_time, dataset_hash="d",
+            artifact_id=creq.artifact_id,
+            account_snapshot_id=port.account_snapshot_id,
+            allocations=(), intents=(intent,),
+            selected_instruments=("KRX:000001",),
+            reasons=("scored-plan",),
+        )
+
+    backtester = StockBacktester(
+        planner=planner,
+        registry=registry,
+        instruments=instruments,
+        manifest=snapshot.manifest,
+        cost_schedule=default_base_schedule(),
+        stress_cost_schedule=default_stress_schedule(),
+        policy=SCHEDULED_OPEN_V1,
+    )
+    result = backtester.run(df, artifacts, portfolio, request)
+    assert result.unfilled_order_reason_counts.get("missing-open", 0) >= 1
+    assert result.filled_orders < 3 * 3
+    assert result.data_quality["execution_policy_id"] == "scheduled_open_v1"
+
+
+def test_deferred_policy_fills_at_first_valid_open_within_bounded_window() -> None:
+    from src.core.instruments import AssetKind
+    from src.execution.domain.intents import TradeIntent
+    from src.stocks.domain.execution_policy import ExecutionOutcomePolicy
+
+    deferred = ExecutionOutcomePolicy(
+        policy_id="first_tradable_open_v1",
+        max_entry_delay_sessions=2,
+        max_exit_delay_sessions=0,
+    )
+    df, snapshot, registry, instruments, policy, scored, artifacts, request, portfolio = _paired_inputs()
+    df = df.with_columns(
+        pl.when(
+            (pl.col("instrument_id") == "KRX:000001")
+            & (pl.col("session_index") == 11)
+        )
+        .then(None)
+        .otherwise(pl.col("open"))
+        .alias("open")
+    )
+
+    def planner(snap, reg, inst, port, creq):
+        del snap, reg, inst
+        intent = TradeIntent(
+            intent_id="t1",
+            asset_kind=AssetKind.STOCK,
+            instrument_id="KRX:000001",
+            target_value=10_000_000.0,
+            decision_time=creq.decision_time,
+            execution_time=creq.execution_time,
+            strategy_id=creq.strategy_id,
+            reason="scored-plan",
+            idempotency_key="k1",
+            account_snapshot_id=port.account_snapshot_id,
+        )
+        return TradingCycleResult(
+            status=CycleStatus.PLANNED, cycle_id="stub",
+            decision_time=creq.decision_time, dataset_hash="d",
+            artifact_id=creq.artifact_id,
+            account_snapshot_id=port.account_snapshot_id,
+            allocations=(), intents=(intent,),
+            selected_instruments=("KRX:000001",),
+            reasons=("scored-plan",),
+        )
+
+    backtester = StockBacktester(
+        planner=planner,
+        registry=registry,
+        instruments=instruments,
+        manifest=snapshot.manifest,
+        cost_schedule=default_base_schedule(),
+        stress_cost_schedule=default_stress_schedule(),
+        policy=deferred,
+    )
+    result = backtester.run(df, artifacts, portfolio, request)
+    assert result.unfilled_order_reason_counts.get("missing-open", 0) == 0
+    assert result.filled_orders > 0
+    assert result.data_quality["execution_policy_id"] == "first_tradable_open_v1"
+
+
+def test_deferred_policy_expired_order_is_explicit_expired_event() -> None:
+    from src.core.instruments import AssetKind
+    from src.execution.domain.intents import TradeIntent
+    from src.stocks.domain.execution_policy import ExecutionOutcomePolicy
+
+    deferred = ExecutionOutcomePolicy(
+        policy_id="first_tradable_open_v1",
+        max_entry_delay_sessions=0,
+        max_exit_delay_sessions=0,
+    )
+    df, snapshot, registry, instruments, policy, scored, artifacts, request, portfolio = _paired_inputs()
+
+    def planner(snap, reg, inst, port, creq):
+        del snap, reg, inst
+        intent = TradeIntent(
+            intent_id="t1",
+            asset_kind=AssetKind.STOCK,
+            instrument_id="KRX:000001",
+            target_value=10_000_000.0,
+            decision_time=creq.decision_time,
+            execution_time=creq.execution_time,
+            strategy_id=creq.strategy_id,
+            reason="scored-plan",
+            idempotency_key="k1",
+            account_snapshot_id=port.account_snapshot_id,
+        )
+        return TradingCycleResult(
+            status=CycleStatus.PLANNED, cycle_id="stub",
+            decision_time=creq.decision_time, dataset_hash="d",
+            artifact_id=creq.artifact_id,
+            account_snapshot_id=port.account_snapshot_id,
+            allocations=(), intents=(intent,),
+            selected_instruments=("KRX:000001",),
+            reasons=("scored-plan",),
+        )
+
+    backtester = StockBacktester(
+        planner=planner,
+        registry=registry,
+        instruments=instruments,
+        manifest=snapshot.manifest,
+        cost_schedule=default_base_schedule(),
+        stress_cost_schedule=default_stress_schedule(),
+        policy=deferred,
+    )
+    result = backtester.run(df, artifacts, portfolio, request)
+    assert result.data_quality["execution_policy_id"] == "first_tradable_open_v1"
+    assert result.filled_orders > 0
