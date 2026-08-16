@@ -342,7 +342,10 @@
   },
   "src/stocks/data/research_v2.py": {
     "architecture": "docs/specs/stock_alpha_v2_dataset_contract_rebuild.md",
-    "testing": "tests/integration/stocks/test_stock_alpha_v2_snapshot.py"
+    "testing": [
+      "tests/integration/stocks/test_stock_alpha_v2_snapshot.py",
+      "tests/unit/stocks/data/test_research_v2.py"
+    ]
   },
   "src/stocks/research/economic_alpha.py": {
     "testing": "tests/unit/stocks/research/test_economic_alpha.py"
