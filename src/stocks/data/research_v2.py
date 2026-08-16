@@ -72,6 +72,7 @@ from src.stocks.data.quality import KRXSessionCalendar
 from src.stocks.data.repositories import ResearchDataRepository
 from src.stocks.domain.execution_policy import ExecutionOutcomePolicy
 from src.stocks.ml.contracts import DEFAULT_CANDIDATE_HORIZON_SESSIONS
+from src.stocks.ml.data import assess_outcome_readiness
 from src.stocks.research.features import stock_alpha_v2_allowlist
 from src.storage.parquet_datasets import ParquetDatasetStore
 
@@ -1225,6 +1226,22 @@ def materialize_net_alpha_snapshot(
         policy=policy,
         bar_evidence=raw_bar_evidence,
     )
+    readiness = assess_outcome_readiness(
+        base_frame.select("instrument_id", "session"),
+        status_frame,
+        request.candidate_horizon_sessions,
+    )
+    logger.info(
+        "net-alpha snapshot %s outcome readiness passed=%s horizons=%s",
+        request.snapshot_id,
+        readiness.passed,
+        [result.horizon_sessions for result in readiness.horizon_results],
+    )
+    if not readiness.passed and request.certification is not DatasetCertification.PROVISIONAL:
+        raise ValueError(
+            "net-alpha snapshot outcome readiness failed: "
+            f"{json.dumps(readiness.to_json(), sort_keys=True)}"
+        )
     label_result = publish_partitioned_net_alpha_label_dataset(
         labels_frame,
         destination_root=request.label_root,
