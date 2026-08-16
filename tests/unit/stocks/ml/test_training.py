@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 from datetime import UTC, datetime
+from pathlib import Path
 
 import numpy as np
 import polars as pl
@@ -614,12 +615,15 @@ def test_run_observability_preserves_terminal_no_trade_reason(tmp_path) -> None:
     run_obs = metrics["run_observability"]
     phases = run_obs["phases"]
     names = [p["name"] for p in phases]
-    assert names[:4] == [
+    assert names[:5] == [
         "integrity_audit",
+        "snapshot_outcome_readiness",
         "holdout_lock",
         "feature_transform",
         "horizon_discovery",
     ]
+    readiness_phase = phases[1]
+    assert readiness_phase["passed"] is True
     assert phases[-1]["name"] == "artifact_publish"
     assert phases[-1]["reason"] == "no-horizon-evidence"
     assert all("admission" in entry for entry in run_obs["horizons"])
@@ -813,3 +817,80 @@ def test_replay_costs_base_stress_share_status_and_maturity() -> None:
     assert base_eval.vintage_segment_ids == stress_eval.vintage_segment_ids
     assert base_eval.unresolved_outcome_counts == ()
     assert base_eval.missing_realized_vintage_count == 0
+
+
+def test_training_publishes_data_readiness_no_trade_before_oof(tmp_path: Path) -> None:
+    """SCENARIO_UNRESOLVED_OUTCOME_IS_DIAGNOSTIC: a data hole stops before OOF."""
+    import json
+    from dataclasses import replace
+    from datetime import UTC, datetime
+
+    from src.stocks.data.contracts import DatasetSnapshot
+    from src.stocks.ml.contracts import (
+        OUTCOME_MISSING_EXIT_PRICE,
+        CompoundingCertificationSettings,
+        NetAlphaTrainingRequest,
+    )
+    from src.stocks.ml.data import compose_net_alpha_training_data
+    from src.stocks.research.artifacts import ModelArtifactRegistry
+    from tests.fixtures.stocks.helpers import (
+        stock_liquidity_model,
+        stock_net_alpha_composed_df,
+        stock_net_alpha_manifest,
+    )
+
+    df = stock_net_alpha_composed_df(
+        n_sessions=120, n_tickers=8, audit_clean=True, label_scale=50.0
+    )
+    snapshot = DatasetSnapshot(
+        manifest=stock_net_alpha_manifest(columns=df.columns), frame=df
+    )
+    data = compose_net_alpha_training_data(
+        snapshot, datetime(2024, 12, 31, tzinfo=UTC),
+        (3, 5, 8, 10, 15, 20),
+    )
+    sessions = data.feature_frame["session"].unique().sort().to_list()
+    tail = set(sessions[-3:])
+    early = (
+        data.feature_frame.filter(~pl.col("session").is_in(sorted(tail)))
+        .sort("session")
+        .limit(1)
+    )
+    broken = data.status_by_horizon[3].with_columns(
+        pl.when(
+            (pl.col("instrument_id") == early["instrument_id"][0])
+            & (pl.col("session") == early["session"][0])
+        )
+        .then(pl.lit(OUTCOME_MISSING_EXIT_PRICE))
+        .otherwise(pl.col("outcome_status"))
+        .alias("outcome_status")
+    )
+    data = replace(data, status_by_horizon={**data.status_by_horizon, 3: broken})
+
+    registry = ModelArtifactRegistry(Path(tmp_path) / "artifacts")
+    request = NetAlphaTrainingRequest(
+        artifact_id="na_readiness_gate",
+        fold_count=2,
+        candidate_horizon_sessions=(3, 5, 8, 10, 15, 20),
+        bootstrap_resamples=50,
+        liquidity_model=stock_liquidity_model(),
+        compounding=CompoundingCertificationSettings(
+            annualization_sessions=40,
+            min_observed_sessions=10,
+            min_active_cohort_fraction=0.1,
+        ),
+    )
+    manifest = training.train_net_alpha_model(data, registry, request)
+    assert manifest.model_type == "no_trade"
+    metrics = json.loads(
+        (Path(tmp_path) / "artifacts" / "na_readiness_gate" / "metrics.json").read_text()
+    )
+    assert metrics["promotion_reasons"] == ["snapshot-outcome-readiness-failed"]
+    assert metrics["snapshot_outcome_readiness"]["passed"] is False
+    phases = metrics["run_observability"]["phases"]
+    names = [phase["name"] for phase in phases]
+    assert names[:2] == ["integrity_audit", "snapshot_outcome_readiness"]
+    assert names[-1] == "artifact_publish"
+    assert phases[-1]["reason"] == "snapshot-outcome-readiness-failed"
+    assert "horizon_discovery" not in names
+    assert "holdout_lock" not in names
