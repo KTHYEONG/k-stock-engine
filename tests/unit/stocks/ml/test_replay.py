@@ -941,3 +941,103 @@ def test_missing_entry_is_unfilled_and_missing_exit_invalidates_vintage() -> Non
     assert only_unfilled.matured_vintage_count == 2
     assert only_unfilled.period_count == 3
     assert only_unfilled.period_net_returns[0] == 0.0
+
+
+def test_scenario_replay_never_zero_fills_blocked_vintage_with_evidence() -> None:
+    """SCENARIO_REPLAY_NEVER_ZERO_FILLS: blocked exit gets a named record, no cash."""
+    from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
+
+    sessions = _span(6)
+    scored = _scored(
+        [(f"KRX:{pos:05d}", session, 0.05) for pos, session in enumerate(sessions)]
+    )
+    realized = _realized(
+        [
+            (f"KRX:{pos:05d}", session, 0.05, 100.0, 1.0e8, 0.02)
+            for pos, session in enumerate(sessions)
+            if pos != 0
+        ]
+    )
+    missing_key = ("KRX:00000", sessions[0])
+    status = _status_projection(scored, realized, unresolved={missing_key})
+    evidence = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:00000"],
+            "session": [sessions[0]],
+            "policy_hash": [SCHEDULED_OPEN_V1.canonical_hash],
+            "outcome_status": ["MISSING_EXIT_PRICE"],
+            "resolution_kind": ["CONFIRMED_NO_BAR"],
+            "scheduled_entry_session": [sessions[0] + __import__("datetime").timedelta(days=1)],
+            "scheduled_exit_session": [sessions[0] + __import__("datetime").timedelta(days=4)],
+            "entry_disposition": ["FILLED"],
+            "exit_disposition": ["NO_BAR"],
+        }
+    )
+    replay = NetAlphaPolicyReplay(
+        3, _PORTFOLIO, _RISK, liquidity_model=_LIQUIDITY, policy=SCHEDULED_OPEN_V1
+    )
+    evaluation = replay.evaluate(scored, realized, status=status, evidence=evidence)
+    assert evaluation.blocked_vintage_count == 1
+    assert len(evaluation.blocked_vintages) == 1
+    blocked = evaluation.blocked_vintages[0]
+    assert blocked.instrument_id == "KRX:00000"
+    assert blocked.decision_session == sessions[0]
+    assert blocked.outcome_status == "MISSING_EXIT_PRICE"
+    assert blocked.resolution_kind == "CONFIRMED_NO_BAR"
+    assert blocked.entry_disposition == "FILLED"
+    assert blocked.exit_disposition == "NO_BAR"
+    assert evaluation.missing_realized_vintage_count == 1
+    assert evaluation.cash_vintage_count == 0
+    assert evaluation.period_count == 2
+    assert 0.0 not in evaluation.period_net_returns
+    assert evaluation.replay_diagnostics()["selected_blocked_exits"] == 1
+
+
+def test_scenario_replay_never_zero_fills_missing_entry_stays_unfilled() -> None:
+    """SCENARIO_REPLAY_NEVER_ZERO_FILLS: unfilled entry keeps a cash vintage."""
+    from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
+
+    sessions = _span(6)
+    scored = _scored(
+        [(f"KRX:{pos:05d}", session, 0.05) for pos, session in enumerate(sessions)]
+    )
+    realized = _realized(
+        [
+            (f"KRX:{pos:05d}", session, 0.05, 100.0, 1.0e8, 0.02)
+            for pos, session in enumerate(sessions)
+            if pos != 0
+        ]
+    )
+    status = _status_projection(
+        scored, realized, unresolved={("KRX:00000", sessions[0])}
+    ).with_columns(
+        pl.when(
+            (pl.col("instrument_id") == "KRX:00000")
+            & (pl.col("session") == sessions[0])
+        )
+        .then(pl.lit("MISSING_ENTRY_PRICE"))
+        .otherwise(pl.col("outcome_status"))
+        .alias("outcome_status")
+    )
+    evidence = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:00000"],
+            "session": [sessions[0]],
+            "policy_hash": [SCHEDULED_OPEN_V1.canonical_hash],
+            "outcome_status": ["MISSING_ENTRY_PRICE"],
+            "resolution_kind": ["CONFIRMED_NO_BAR"],
+            "scheduled_entry_session": [sessions[0] + __import__("datetime").timedelta(days=1)],
+            "scheduled_exit_session": [sessions[0] + __import__("datetime").timedelta(days=4)],
+            "entry_disposition": ["NO_BAR"],
+            "exit_disposition": ["NO_BAR"],
+        }
+    )
+    replay = NetAlphaPolicyReplay(
+        3, _PORTFOLIO, _RISK, liquidity_model=_LIQUIDITY, policy=SCHEDULED_OPEN_V1
+    )
+    evaluation = replay.evaluate(scored, realized, status=status, evidence=evidence)
+    assert evaluation.blocked_vintage_count == 0
+    assert evaluation.missing_realized_vintage_count == 0
+    assert evaluation.cash_vintage_count == 1
+    assert evaluation.period_count == 3
+    assert 0.0 in evaluation.period_net_returns

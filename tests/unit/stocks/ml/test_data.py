@@ -484,3 +484,182 @@ def test_snapshot_outcome_readiness_fails_closed_on_structural_defects() -> None
         assess_snapshot_outcome_readiness(
             replace(data, status_by_horizon={3: misplaced, 5: status5}), (3, 5)
         )
+
+
+def test_scenario_unresolved_outcome_is_diagnostic_reconciliation_queue() -> None:
+    """SCENARIO_UNRESOLVED_OUTCOME_IS_DIAGNOSTIC: source gap is a worklist, not cash."""
+    from datetime import date, timedelta
+
+    from src.stocks.data.outcome_evidence import (
+        RECONCILIATION_ACTION_COLUMN,
+        RECONCILIATION_SOURCE_UNAVAILABLE,
+        build_missing_exit_reconciliation_report,
+        resolve_policy_outcome,
+    )
+    from src.stocks.data.quality import KRXSessionCalendar
+    from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
+
+    unavailable = {date(2024, 1, 5)}
+    evidence = resolve_policy_outcome(
+        pl.DataFrame(
+            {
+                "instrument_id": ["KRX:00001"] * 6,
+                "session": [
+                    (datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i))
+                    for i in range(6)
+                ],
+                "open": [100.0] * 4 + [None, 100.0],
+                "sector": ["S1"] * 6,
+                "adtv": [1.0e8] * 6,
+                "market_cap": [1.0e11] * 6,
+                "beta": [1.0] * 6,
+                "volatility": [0.02] * 6,
+            }
+        ),
+        KRXSessionCalendar(
+            version="fixture",
+            sessions=tuple(
+                (datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i)).date()
+                for i in range(6)
+            ),
+            generated_time=datetime(2024, 1, 1, tzinfo=UTC),
+        ),
+        horizon_sessions=3,
+        policy=SCHEDULED_OPEN_V1,
+        unavailable_sessions=unavailable,
+    )
+    report = build_missing_exit_reconciliation_report(evidence, (3,))
+    assert report.source_unavailable_count == 1
+    assert report.source_unavailable_requests.height == 1
+    request_row = report.source_unavailable_requests.row(0, named=True)
+    assert request_row["instrument_id"] == "KRX:00001"
+    assert request_row["scheduled_exit_session"] == date(2024, 1, 5)
+    action = report.rows.filter(
+        pl.col(RECONCILIATION_ACTION_COLUMN) == RECONCILIATION_SOURCE_UNAVAILABLE
+    )
+    assert action.height == 1
+
+
+def test_scenario_snapshot_pins_outcome_evidence_no_bar_is_unreconciled() -> None:
+    """SCENARIO_SNAPSHOT_PINS_OUTCOME_EVIDENCE: no-bar is not a backfill or a return."""
+    from datetime import date, timedelta
+
+    from src.stocks.data.outcome_evidence import (
+        RECONCILIATION_ACTION_COLUMN,
+        RECONCILIATION_OFFICIAL_OPEN_BACKFILL,
+        RECONCILIATION_VERIFIED_TRADING_HALT,
+        build_missing_exit_reconciliation_report,
+        resolve_policy_outcome,
+    )
+    from src.stocks.data.quality import KRXSessionCalendar
+    from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
+
+    base = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:00001"] * 6,
+            "session": [
+                (datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i))
+                for i in range(6)
+            ],
+            "open": [100.0] * 4 + [None, 100.0],
+            "sector": ["S1"] * 6,
+            "adtv": [1.0e8] * 6,
+            "market_cap": [1.0e11] * 6,
+            "beta": [1.0] * 6,
+            "volatility": [0.02] * 6,
+        }
+    )
+    evidence = resolve_policy_outcome(
+        base,
+        KRXSessionCalendar(
+            version="fixture",
+            sessions=tuple(
+                (datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i)).date()
+                for i in range(6)
+            ),
+            generated_time=datetime(2024, 1, 1, tzinfo=UTC),
+        ),
+        horizon_sessions=3,
+        policy=SCHEDULED_OPEN_V1,
+    )
+    report = build_missing_exit_reconciliation_report(evidence, (3,))
+    assert report.unreconciled_no_bar_count == 1
+    assert report.source_unavailable_count == 0
+    assert report.source_unavailable_requests.height == 0
+    assert report.official_open_backfill_count == 0
+
+    backfilled = build_missing_exit_reconciliation_report(
+        evidence,
+        (3,),
+        official_bars=pl.DataFrame(
+            {
+                "instrument_id": ["KRX:00001"],
+                "price_date": [date(2024, 1, 5)],
+                "open": [105.0],
+            }
+        ),
+    )
+    assert backfilled.official_open_backfill_count == 1
+    assert backfilled.unreconciled_no_bar_count == 0
+    backfill_action = backfilled.rows.filter(
+        pl.col(RECONCILIATION_ACTION_COLUMN) == RECONCILIATION_OFFICIAL_OPEN_BACKFILL
+    )
+    assert backfill_action.height == 1
+
+    halted = build_missing_exit_reconciliation_report(
+        evidence,
+        (3,),
+        corporate_events=pl.DataFrame(
+            {
+                "instrument_id": ["KRX:00001"],
+                "session": [date(2024, 1, 5)],
+                "event_kind": ["TRADING_HALT"],
+                "corporate_action_event_id": ["halt-2024-01-05"],
+            }
+        ),
+    )
+    assert halted.verified_trading_halt_count == 1
+    assert halted.unreconciled_no_bar_count == 0
+    halt_action = halted.rows.filter(
+        pl.col(RECONCILIATION_ACTION_COLUMN) == RECONCILIATION_VERIFIED_TRADING_HALT
+    )
+    assert halt_action["corporate_action_event_id"].to_list() == ["halt-2024-01-05"]
+
+
+def test_scenario_snapshot_pins_outcome_evidence_rejects_foreign_evidence() -> None:
+    """SCENARIO_SNAPSHOT_PINS_OUTCOME_EVIDENCE: foreign policy fails closed."""
+    from src.stocks.ml.data import _horizon_evidence_frame
+
+    data = _readiness_data()
+    horizon = 3
+    feature = data.feature_frame.select(
+        pl.col("instrument_id"), pl.col("session")
+    )
+    status = data.status_by_horizon[horizon]
+    evidence_cols = status.select(
+        pl.col("instrument_id"),
+        pl.col("session"),
+        pl.lit(horizon, dtype=pl.Int64).alias("horizon_sessions"),
+        pl.lit("policy-hash-v1").alias("policy_hash"),
+        pl.lit("SCHEDULED_OPEN").alias("resolution_kind"),
+        pl.col("outcome_status"),
+        pl.col("session").dt.date().alias("scheduled_entry_session"),
+        pl.col("session").dt.date().alias("scheduled_exit_session"),
+        pl.lit("FILLED").alias("entry_disposition"),
+        pl.lit("FILLED").alias("exit_disposition"),
+    )
+    frame = pl.concat(
+        [
+            evidence_cols,
+            evidence_cols.head(1).with_columns(
+                pl.lit("foreign-policy-hash").alias("policy_hash")
+            ),
+        ]
+    )
+    with pytest.raises(ValueError, match="multiple policy hashes"):
+        _horizon_evidence_frame(frame, feature, horizon, has_evidence_columns=True)
+
+    with pytest.raises(ValueError, match="no outcome-evidence partition"):
+        _horizon_evidence_frame(
+            evidence_cols, feature, 999, has_evidence_columns=True
+        )

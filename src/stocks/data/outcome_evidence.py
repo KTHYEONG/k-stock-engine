@@ -495,34 +495,75 @@ _DISPOSITION_VOCABULARY = (
     DISPOSITION_UNSUPPORTED_ACTION,
 )
 
+RECONCILIATION_SOURCE_UNAVAILABLE = RESOLUTION_SOURCE_UNAVAILABLE
+RECONCILIATION_OFFICIAL_OPEN_BACKFILL = "OFFICIAL_OPEN_BACKFILL"
+RECONCILIATION_VERIFIED_TRADING_HALT = "VERIFIED_TRADING_HALT"
+RECONCILIATION_VERIFIED_DELISTING_OR_SETTLEMENT = "VERIFIED_DELISTING_OR_SETTLEMENT"
+RECONCILIATION_UNRECONCILED_NO_BAR = "UNRECONCILED_NO_BAR"
+RECONCILIATION_VOCABULARY = (
+    RECONCILIATION_SOURCE_UNAVAILABLE,
+    RECONCILIATION_OFFICIAL_OPEN_BACKFILL,
+    RECONCILIATION_VERIFIED_TRADING_HALT,
+    RECONCILIATION_VERIFIED_DELISTING_OR_SETTLEMENT,
+    RECONCILIATION_UNRECONCILED_NO_BAR,
+)
+
+_EVENT_KIND_TRADING_HALT = "TRADING_HALT"
+_EVENT_KIND_DELISTING = "DELISTING"
+_EVENT_KIND_SETTLEMENT = "SETTLEMENT"
+_EVENT_KIND_VOCABULARY = (
+    _EVENT_KIND_TRADING_HALT,
+    _EVENT_KIND_DELISTING,
+    _EVENT_KIND_SETTLEMENT,
+)
+
+CORPORATE_EVENT_COLUMNS = (
+    ID_COLUMN,
+    "session",
+    "event_kind",
+    "corporate_action_event_id",
+)
+
+RECONCILIATION_ACTION_COLUMN = "reconciliation_action"
+
 
 @dataclass(frozen=True, slots=True)
-class OutcomeRecoveryReport:
-    """Vectorized bounded recovery classification of unresolved outcome rows.
+class MissingExitReconciliationReport:
+    """Vectorized bounded reconciliation of filled-entry missing exits.
 
-    Groups every unresolved evidence row by ``(horizon_sessions,
-    resolution_kind, instrument_id, scheduled entry/exit date,
-    outcome_status)`` and partitions them into a recoverable backfill queue
-    (``SOURCE_UNAVAILABLE``), verified structural no-bars
-    (``CONFIRMED_NO_BAR``), and corporate-action rows awaiting a verified
-    settlement (``UNSUPPORTED_CORPORATE_ACTION``). Source hashes, policy hash,
-    and dispositions are preserved per group. No recovery path substitutes
-    another OHLC field, interpolates a price, or mutates the evidence.
+    Every filled-entry missing-exit evidence row is classified into one of the
+    five reconciliation actions (``SOURCE_UNAVAILABLE``,
+    ``OFFICIAL_OPEN_BACKFILL``, ``VERIFIED_TRADING_HALT``,
+    ``VERIFIED_DELISTING_OR_SETTLEMENT``, ``UNRECONCILED_NO_BAR``). ``rows``
+    is the grouped classified projection (one row per
+    ``(horizon_sessions, reconciliation_action, instrument_id, scheduled
+    entry/exit date, outcome_status)``) preserving the pinned policy hash,
+    source partition hashes, dispositions, and any verified corporate event
+    id. ``source_unavailable_requests`` carries the exact
+    ``(instrument_id, scheduled_exit_session)`` backfill keys separately from
+    the unreconciled no-bar queue: a source-success/no-bar row is never
+    auto-backfilled. No path substitutes another OHLC field, interpolates a
+    price, or writes a corporate settlement as an OHLC open.
     """
 
     horizon_sessions: tuple[int, ...]
     rows: pl.DataFrame
-    recoverable_backfill_count: int
-    confirmed_no_bar_count: int
-    unsupported_corporate_action_count: int
+    source_unavailable_requests: pl.DataFrame
+    source_unavailable_count: int
+    official_open_backfill_count: int
+    verified_trading_halt_count: int
+    verified_delisting_or_settlement_count: int
+    unreconciled_no_bar_count: int
 
     def __post_init__(self) -> None:
         if not self.horizon_sessions:
-            raise ValueError("recovery report requires at least one horizon")
+            raise ValueError("reconciliation report requires at least one horizon")
         for name in (
-            "recoverable_backfill_count",
-            "confirmed_no_bar_count",
-            "unsupported_corporate_action_count",
+            "source_unavailable_count",
+            "official_open_backfill_count",
+            "verified_trading_halt_count",
+            "verified_delisting_or_settlement_count",
+            "unreconciled_no_bar_count",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must be non-negative")
@@ -530,30 +571,44 @@ class OutcomeRecoveryReport:
     def to_json(self) -> dict[str, object]:
         return {
             "horizon_sessions": list(self.horizon_sessions),
-            "recoverable_backfill_count": int(self.recoverable_backfill_count),
-            "confirmed_no_bar_count": int(self.confirmed_no_bar_count),
-            "unsupported_corporate_action_count": int(
-                self.unsupported_corporate_action_count
+            "source_unavailable_count": int(self.source_unavailable_count),
+            "official_open_backfill_count": int(self.official_open_backfill_count),
+            "verified_trading_halt_count": int(self.verified_trading_halt_count),
+            "verified_delisting_or_settlement_count": int(
+                self.verified_delisting_or_settlement_count
             ),
+            "unreconciled_no_bar_count": int(self.unreconciled_no_bar_count),
+            "source_unavailable_requests": int(self.source_unavailable_requests.height),
             "grouped_rows": int(self.rows.height),
         }
 
 
-def build_outcome_recovery_report(
+def build_missing_exit_reconciliation_report(
     evidence: pl.DataFrame,
     candidate_horizon_sessions: tuple[int, ...],
-) -> OutcomeRecoveryReport:
-    """Classify unresolved evidence rows into a bounded recovery report.
+    official_bars: pl.DataFrame | None = None,
+    corporate_events: pl.DataFrame | None = None,
+) -> MissingExitReconciliationReport:
+    """Classify every filled-entry missing exit into a bounded reconciliation report.
 
-    Only rows whose ``outcome_status`` is an unresolved state
-    (``MISSING_ENTRY_PRICE``, ``MISSING_EXIT_PRICE``,
-    ``UNSUPPORTED_CORPORATE_ACTION``) are recovery candidates; resolved and
-    terminal-tail rows are not emitted. Every candidate is grouped with Polars
-    group-bys (never a Python row loop) by horizon, resolution kind,
-    instrument, scheduled entry/exit date, and status, preserving the pinned
-    policy hash, source partition hashes, and dispositions. An unknown
-    resolution kind, a horizon partition mismatch, or missing required columns
-    raises ``ValueError``.
+    Candidates are filled-entry missing-exit evidence rows (``entry_disposition
+    == FILLED`` with an unresolved ``MISSING_EXIT_PRICE`` or
+    ``UNSUPPORTED_CORPORATE_ACTION`` outcome). ``SOURCE_UNAVAILABLE`` rows
+    become exact backfill requests keyed by ``(instrument_id,
+    scheduled_exit_session)``; ``UNSUPPORTED_CORPORATE_ACTION`` rows route to
+    the settlement policy. A ``CONFIRMED_NO_BAR`` row is reclassified only with
+    independent evidence: a finite positive official open at the exact
+    instrument/date marks ``OFFICIAL_OPEN_BACKFILL``, a verified trading halt
+    marks ``VERIFIED_TRADING_HALT``, a verified delisting/settlement marks
+    ``VERIFIED_DELISTING_OR_SETTLEMENT`` (retaining the event id, never as an
+    OHLC open), and an unattached no-bar stays ``UNRECONCILED_NO_BAR`` and is
+    never auto-backfilled. ``official_bars`` must carry ``instrument_id``,
+    ``price_date``, ``open`` with duplicate-free finite positive opens;
+    ``corporate_events`` must carry ``instrument_id``, ``session``,
+    ``event_kind``, ``corporate_action_event_id`` with duplicate-free keys and
+    vocabulary event kinds. Duplicate evidence, a horizon mismatch, an unknown
+    classification, non-positive opens, or missing provenance columns raise
+    ``ValueError``.
     """
     if not candidate_horizon_sessions:
         raise ValueError("candidate_horizon_sessions must be non-empty")
@@ -577,13 +632,20 @@ def build_outcome_recovery_report(
     )
     missing = [c for c in required if c not in evidence.columns]
     if missing:
-        raise ValueError(f"outcome evidence missing recovery columns {missing}")
+        raise ValueError(f"outcome evidence missing reconciliation columns {missing}")
     present = sorted(evidence["horizon_sessions"].unique().to_list())
     if set(present) != set(candidate_horizon_sessions):
         raise ValueError(
             f"outcome evidence horizon partitions {present}, "
             f"expected {sorted(candidate_horizon_sessions)}"
         )
+    duplicate = (
+        evidence.group_by([ID_COLUMN, SESSION_COLUMN, "horizon_sessions"])
+        .len()
+        .filter(pl.col("len") > 1)
+    )
+    if not duplicate.is_empty():
+        raise ValueError("outcome evidence contains duplicate decision keys")
     unknown = evidence.filter(
         ~pl.col("resolution_kind").is_in(list(RESOLUTION_KIND_VOCABULARY))
     )
@@ -598,14 +660,163 @@ def build_outcome_recovery_report(
     if not unknown_disposition.is_empty():
         raise ValueError("outcome evidence contains unknown entry/exit dispositions")
 
-    unresolved = evidence.filter(
-        pl.col("outcome_status").is_in(list(_UNRESOLVED_STATUSES))
+    candidates = evidence.filter(
+        (pl.col("entry_disposition") == DISPOSITION_FILLED)
+        & pl.col("outcome_status").is_in(("MISSING_EXIT_PRICE", "UNSUPPORTED_CORPORATE_ACTION"))
     )
+    if candidates.is_empty():
+        empty = pl.DataFrame(
+            schema={
+                "horizon_sessions": pl.Int64,
+                RECONCILIATION_ACTION_COLUMN: pl.Utf8,
+                ID_COLUMN: pl.Utf8,
+                "scheduled_entry_session": pl.Date,
+                "scheduled_exit_session": pl.Date,
+                "outcome_status": pl.Utf8,
+                "count": pl.UInt32,
+                "policy_hash": pl.Utf8,
+                "entry_partition_hash": pl.Utf8,
+                "exit_partition_hash": pl.Utf8,
+                "entry_disposition": pl.Utf8,
+                "exit_disposition": pl.Utf8,
+                "corporate_action_event_id": pl.Utf8,
+            }
+        )
+        empty_requests = pl.DataFrame(
+            schema={
+                ID_COLUMN: pl.Utf8,
+                "scheduled_exit_session": pl.Date,
+                "horizon_sessions": pl.Int64,
+            }
+        )
+        return MissingExitReconciliationReport(
+            horizon_sessions=tuple(candidate_horizon_sessions),
+            rows=empty,
+            source_unavailable_requests=empty_requests,
+            source_unavailable_count=0,
+            official_open_backfill_count=0,
+            verified_trading_halt_count=0,
+            verified_delisting_or_settlement_count=0,
+            unreconciled_no_bar_count=0,
+        )
+
+    official_join: pl.DataFrame = pl.DataFrame(
+        schema={
+            ID_COLUMN: pl.Utf8,
+            "scheduled_exit_session": pl.Date,
+            "_official_open": pl.Float64,
+        }
+    )
+    if official_bars is not None:
+        bar_missing = [
+            c for c in (ID_COLUMN, PRICE_DATE_COLUMN, OPEN_COLUMN) if c not in official_bars.columns
+        ]
+        if bar_missing:
+            raise ValueError(f"official bars missing columns {bar_missing}")
+        bar_invalid = official_bars.filter(
+            pl.col(OPEN_COLUMN).is_null()
+            | ~pl.col(OPEN_COLUMN).is_finite()
+            | (pl.col(OPEN_COLUMN) <= 0)
+            | pl.col(PRICE_DATE_COLUMN).is_null()
+        )
+        if not bar_invalid.is_empty():
+            raise ValueError("official bars contain non-positive or non-finite opens")
+        bar_duplicate = (
+            official_bars.group_by([ID_COLUMN, PRICE_DATE_COLUMN])
+            .len()
+            .filter(pl.col("len") > 1)
+        )
+        if not bar_duplicate.is_empty():
+            raise ValueError("official bars contain duplicate (instrument_id, price_date) keys")
+        official_join = official_bars.select(
+            pl.col(ID_COLUMN),
+            pl.col(PRICE_DATE_COLUMN).cast(pl.Date).alias("scheduled_exit_session"),
+            pl.col(OPEN_COLUMN).alias("_official_open"),
+        ).unique(subset=[ID_COLUMN, "scheduled_exit_session"], keep="first")
+
+    event_join: pl.DataFrame = pl.DataFrame(
+        schema={
+            ID_COLUMN: pl.Utf8,
+            "scheduled_exit_session": pl.Date,
+            "_event_kind": pl.Utf8,
+            "corporate_action_event_id": pl.Utf8,
+        }
+    )
+    if corporate_events is not None:
+        event_missing = [
+            c for c in CORPORATE_EVENT_COLUMNS if c not in corporate_events.columns
+        ]
+        if event_missing:
+            raise ValueError(f"corporate events missing columns {event_missing}")
+        event_unknown = corporate_events.filter(
+            ~pl.col("event_kind").is_in(list(_EVENT_KIND_VOCABULARY))
+        )
+        if not event_unknown.is_empty():
+            raise ValueError("corporate events contain unknown event kinds")
+        event_duplicate = (
+            corporate_events.group_by([ID_COLUMN, "session", "corporate_action_event_id"])
+            .len()
+            .filter(pl.col("len") > 1)
+        )
+        if not event_duplicate.is_empty():
+            raise ValueError(
+                "corporate events contain duplicate (instrument_id, session, event id) keys"
+            )
+        event_join = corporate_events.select(
+            pl.col(ID_COLUMN),
+            pl.col("session").cast(pl.Date).alias("scheduled_exit_session"),
+            pl.col("event_kind").alias("_event_kind"),
+            pl.col("corporate_action_event_id"),
+        ).unique(
+            subset=[ID_COLUMN, "scheduled_exit_session", "_event_kind"],
+            keep="first",
+        )
+
+    classified = (
+        candidates.join(
+            official_join,
+            on=[ID_COLUMN, "scheduled_exit_session"],
+            how="left",
+        )
+        .join(
+            event_join.select(
+                pl.col(ID_COLUMN),
+                pl.col("scheduled_exit_session"),
+                pl.col("_event_kind"),
+                pl.col("corporate_action_event_id").alias("_event_id"),
+            ),
+            on=[ID_COLUMN, "scheduled_exit_session"],
+            how="left",
+        )
+        .with_columns(
+            pl.when(pl.col("resolution_kind") == RESOLUTION_SOURCE_UNAVAILABLE)
+            .then(pl.lit(RECONCILIATION_SOURCE_UNAVAILABLE))
+            .when(pl.col("resolution_kind") == RESOLUTION_UNSUPPORTED_CORPORATE_ACTION)
+            .then(pl.lit(RECONCILIATION_VERIFIED_DELISTING_OR_SETTLEMENT))
+            .when(pl.col("_official_open").is_not_null())
+            .then(pl.lit(RECONCILIATION_OFFICIAL_OPEN_BACKFILL))
+            .when(pl.col("_event_kind") == _EVENT_KIND_TRADING_HALT)
+            .then(pl.lit(RECONCILIATION_VERIFIED_TRADING_HALT))
+            .when(pl.col("_event_kind").is_in([_EVENT_KIND_DELISTING, _EVENT_KIND_SETTLEMENT]))
+            .then(pl.lit(RECONCILIATION_VERIFIED_DELISTING_OR_SETTLEMENT))
+            .otherwise(pl.lit(RECONCILIATION_UNRECONCILED_NO_BAR))
+            .alias(RECONCILIATION_ACTION_COLUMN),
+            pl.col("_event_id")
+            .fill_null(pl.col("corporate_action_event_id"))
+            .alias("corporate_action_event_id"),
+        )
+    )
+    unknown_action = classified.filter(
+        ~pl.col(RECONCILIATION_ACTION_COLUMN).is_in(list(RECONCILIATION_VOCABULARY))
+    )
+    if not unknown_action.is_empty():
+        raise ValueError("outcome evidence contains an unknown reconciliation classification")
+
     grouped = (
-        unresolved.group_by(
+        classified.group_by(
             [
                 "horizon_sessions",
-                "resolution_kind",
+                RECONCILIATION_ACTION_COLUMN,
                 ID_COLUMN,
                 "scheduled_entry_session",
                 "scheduled_exit_session",
@@ -619,11 +830,15 @@ def build_outcome_recovery_report(
             pl.col("exit_partition_hash").first().alias("exit_partition_hash"),
             pl.col("entry_disposition").first().alias("entry_disposition"),
             pl.col("exit_disposition").first().alias("exit_disposition"),
+            pl.col("corporate_action_event_id")
+            .drop_nulls()
+            .first()
+            .alias("corporate_action_event_id"),
         )
         .sort(
             [
                 "horizon_sessions",
-                "resolution_kind",
+                RECONCILIATION_ACTION_COLUMN,
                 ID_COLUMN,
                 "scheduled_entry_session",
                 "scheduled_exit_session",
@@ -632,15 +847,37 @@ def build_outcome_recovery_report(
         )
     )
 
-    def _count(kind: str) -> int:
-        return int(unresolved.filter(pl.col("resolution_kind") == kind).height)
+    source_unavailable_requests = (
+        classified.filter(
+            pl.col(RECONCILIATION_ACTION_COLUMN) == RECONCILIATION_SOURCE_UNAVAILABLE
+        )
+        .select(
+            pl.col(ID_COLUMN),
+            pl.col("scheduled_exit_session"),
+            pl.col("horizon_sessions"),
+        )
+        .unique(subset=[ID_COLUMN, "scheduled_exit_session", "horizon_sessions"])
+        .sort([ID_COLUMN, "scheduled_exit_session", "horizon_sessions"])
+    )
 
-    return OutcomeRecoveryReport(
+    def _count(action: str) -> int:
+        return int(
+            classified.filter(
+                pl.col(RECONCILIATION_ACTION_COLUMN) == action
+            ).height
+        )
+
+    return MissingExitReconciliationReport(
         horizon_sessions=tuple(candidate_horizon_sessions),
         rows=grouped,
-        recoverable_backfill_count=_count(RESOLUTION_SOURCE_UNAVAILABLE),
-        confirmed_no_bar_count=_count(RESOLUTION_CONFIRMED_NO_BAR),
-        unsupported_corporate_action_count=_count(RESOLUTION_UNSUPPORTED_CORPORATE_ACTION),
+        source_unavailable_requests=source_unavailable_requests,
+        source_unavailable_count=_count(RECONCILIATION_SOURCE_UNAVAILABLE),
+        official_open_backfill_count=_count(RECONCILIATION_OFFICIAL_OPEN_BACKFILL),
+        verified_trading_halt_count=_count(RECONCILIATION_VERIFIED_TRADING_HALT),
+        verified_delisting_or_settlement_count=_count(
+            RECONCILIATION_VERIFIED_DELISTING_OR_SETTLEMENT
+        ),
+        unreconciled_no_bar_count=_count(RECONCILIATION_UNRECONCILED_NO_BAR),
     )
 
 

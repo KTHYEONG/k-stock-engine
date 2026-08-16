@@ -60,6 +60,7 @@ class HorizonOOFEvidence:
     fold_rank_ics: tuple[float, ...]
     reasons: tuple[str, ...] = ()
     unresolved_outcome_counts: tuple[tuple[str, int], ...] = ()
+    blocked_vintage_count: int = 0
 
     def __post_init__(self) -> None:
         if self.horizon_sessions < 1:
@@ -82,6 +83,8 @@ class HorizonOOFEvidence:
             raise ValueError("cohort segment identity must be a non-negative integer")
         if not self.model_family:
             raise ValueError("model_family must be non-empty")
+        if self.blocked_vintage_count < 0:
+            raise ValueError("blocked_vintage_count must be non-negative")
         seen: set[str] = set()
         for state, count in self.unresolved_outcome_counts:
             if not state:

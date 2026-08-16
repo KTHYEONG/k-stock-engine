@@ -530,6 +530,7 @@ def stock_net_alpha_pinned_df(
     ``status_provenance == "pinned"`` instead of the diagnostic-only
     legacy-inferred path. Every raw source column is retained per horizon row.
     """
+    from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
     from src.stocks.ml.labels import HORIZON_COLUMN, ID_COLUMN, SESSION_COLUMN
 
     wide = stock_net_alpha_composed_df(
@@ -582,7 +583,21 @@ def stock_net_alpha_pinned_df(
                 .then(pl.lit("PARTIAL_TAIL"))
                 .otherwise(pl.lit("CONFIRMED_NO_BAR"))
                 .alias("resolution_kind"),
-                pl.lit("fixture-policy-hash-v1").alias("policy_hash"),
+                pl.lit(SCHEDULED_OPEN_V1.canonical_hash).alias("policy_hash"),
+                pl.col(SESSION_COLUMN)
+                .dt.date()
+                .alias("scheduled_entry_session"),
+                (pl.col(SESSION_COLUMN).dt.date() + pl.duration(days=horizon)).alias(
+                    "scheduled_exit_session"
+                ),
+                pl.when(pl.col("outcome_status") == "PARTIAL_TAIL")
+                .then(pl.lit(None))
+                .otherwise(pl.lit("FILLED"))
+                .alias("entry_disposition"),
+                pl.when(pl.col("outcome_status") == "REALIZED")
+                .then(pl.lit("FILLED"))
+                .otherwise(pl.lit("NO_BAR"))
+                .alias("exit_disposition"),
             )
         )
         parts.append(long)
@@ -599,6 +614,7 @@ def pin_net_alpha_outcome_evidence(data):
     instead of the diagnostic-only legacy-inferred spine.
     """
     from dataclasses import replace
+    from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
     from src.stocks.ml.labels import (
         HORIZON_COLUMN,
         ID_COLUMN,
@@ -611,13 +627,26 @@ def pin_net_alpha_outcome_evidence(data):
             pl.col(ID_COLUMN),
             pl.col(SESSION_COLUMN),
             pl.lit(horizon, dtype=pl.Int64).alias(HORIZON_COLUMN),
-            pl.lit("fixture-policy-hash-v1").alias("policy_hash"),
+            pl.lit(SCHEDULED_OPEN_V1.canonical_hash).alias("policy_hash"),
             pl.when(pl.col("outcome_status") == "REALIZED")
             .then(pl.lit("SCHEDULED_OPEN"))
             .when(pl.col("outcome_status") == "PARTIAL_TAIL")
             .then(pl.lit("PARTIAL_TAIL"))
             .otherwise(pl.lit("CONFIRMED_NO_BAR"))
             .alias("resolution_kind"),
+            pl.col("outcome_status"),
+            pl.col(SESSION_COLUMN).dt.date().alias("scheduled_entry_session"),
+            (pl.col(SESSION_COLUMN).dt.date() + pl.duration(days=horizon)).alias(
+                "scheduled_exit_session"
+            ),
+            pl.when(pl.col("outcome_status") == "PARTIAL_TAIL")
+            .then(pl.lit(None))
+            .otherwise(pl.lit("FILLED"))
+            .alias("entry_disposition"),
+            pl.when(pl.col("outcome_status") == "REALIZED")
+            .then(pl.lit("FILLED"))
+            .otherwise(pl.lit("NO_BAR"))
+            .alias("exit_disposition"),
         )
     return replace(
         data,
