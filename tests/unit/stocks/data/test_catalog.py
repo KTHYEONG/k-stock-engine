@@ -178,6 +178,38 @@ class TestSnapshotManifestDeterminism:
 
 
 class TestSnapshotResolver:
+    def test_execution_resolution_uses_core_dataset_overlap(self, tmp_path) -> None:
+        """SCENARIO_RESEARCH_USES_CORE_OVERLAP"""
+        store = CatalogStore(tmp_path)
+        refs = register_dataset_refs(store)
+        short_labels = entry(
+            CatalogKind.LABELS,
+            "labels_short",
+            content_hash="label-short",
+            coverage=CoverageRange(start=date(2024, 1, 1), end=date(2024, 3, 3)),
+        )
+        stale_costs = entry(
+            CatalogKind.COSTS,
+            "costs_short",
+            coverage=CoverageRange(start=date(2024, 1, 1), end=date(2024, 3, 3)),
+        )
+        store.register(short_labels)
+        store.register(stale_costs)
+        refs[CatalogKind.LABELS] = short_labels
+        refs[CatalogKind.COSTS] = stale_costs
+        write_snapshot(
+            store,
+            "provisional_overlap",
+            list(refs.values()),
+            certification=DatasetCertification.PROVISIONAL,
+        )
+
+        snapshot = SnapshotResolver(store).resolve_execution("provisional_overlap")
+
+        assert snapshot.execution_range == CoverageRange(
+            start=date(2024, 1, 1), end=date(2024, 3, 3)
+        )
+
     def test_resolves_complete_research_snapshot(self, tmp_path) -> None:
         store = CatalogStore(tmp_path)
         refs = {**complete_evidence(store), **register_dataset_refs(store)}

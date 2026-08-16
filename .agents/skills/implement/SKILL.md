@@ -21,6 +21,7 @@ Fast-execution model protocol for mechanical feature implementation based on fro
 
 3. **Surgical Code Modifications & Token Efficiency**:
    - MUST use targeted block/line edits (`replace_file_content` / `multi_replace_file_content`) to prevent code loss or unintended rewrites.
+   - **No Ephemeral Spec References:** Do NOT embed temporary `docs/specs/*.md` file paths or section numbers into code, comments, docstrings, or CLI text. All comments must be concise (1-2 lines) and self-contained.
    - **NO FLUFF**: Do NOT output intermediate phase explanations or duplicate modified code in chat text. Execute edits and commands immediately.
    - **Quiet Commands**: Run test commands with quiet/compact flags (e.g. `pytest -q --tb=short`).
 

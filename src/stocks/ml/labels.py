@@ -42,6 +42,7 @@ from src.stocks.data.labels import (
     build_net_alpha_label_dataset_with_status,
 )
 from src.stocks.data.quality import KRXSessionCalendar
+from src.stocks.domain.execution_policy import ExecutionOutcomePolicy
 from src.stocks.ml.contracts import (
     OUTCOME_STATUS_COLUMN,
     OUTCOME_STATUS_VOCABULARY,
@@ -70,6 +71,8 @@ def build_partitioned_net_alpha_labels(
     liquidity_model: LiquiditySlippageModel,
     horizon_sessions: tuple[int, ...],
     reference_notional: float,
+    policy: ExecutionOutcomePolicy | None = None,
+    bar_evidence: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """Build one long, partitioned net-alpha label dataset for all candidate horizons.
 
@@ -88,6 +91,8 @@ def build_partitioned_net_alpha_labels(
         liquidity_model: the point-in-time liquidity slippage model.
         horizon_sessions: ascending candidate horizons, each strictly positive.
         reference_notional: the reference notional for round-trip cost.
+        policy: the immutable execution policy applied to every horizon
+            (default ``scheduled_open_v1``).
 
     Returns:
         A long ``pl.DataFrame`` with ``horizon_sessions`` partition column whose
@@ -104,6 +109,8 @@ def build_partitioned_net_alpha_labels(
         liquidity_model,
         horizon_sessions=horizon_sessions,
         reference_notional=reference_notional,
+        policy=policy,
+        bar_evidence=bar_evidence,
     )
     return labels
 
@@ -115,13 +122,16 @@ def build_partitioned_net_alpha_labels_with_status(
     liquidity_model: LiquiditySlippageModel,
     horizon_sessions: tuple[int, ...],
     reference_notional: float,
+    policy: ExecutionOutcomePolicy | None = None,
+    bar_evidence: pl.DataFrame | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Build the long net-alpha label frame and its hash-bound status sidecar.
 
     Every candidate horizon is built independently. The status sidecar emits
     exactly one row per ``(instrument_id, decision_session, horizon_sessions)``
     in the decision universe with a typed outcome state, so the trainer never
-    has to infer why a key lacks a realised label.
+    has to infer why a key lacks a realised label. ``policy`` is the immutable
+    execution policy shared with the replay and backtester.
     """
     if not horizon_sessions:
         raise ValueError("horizon_sessions must be non-empty")
@@ -143,6 +153,8 @@ def build_partitioned_net_alpha_labels_with_status(
             liquidity_model,
             horizon_sessions=horizon,
             reference_notional=reference_notional,
+            policy=policy,
+            bar_evidence=bar_evidence,
         )
         status_frames.append(
             status.select(
@@ -219,13 +231,16 @@ def publish_outcome_status_sidecar(
     universe_policy_version: str = "provisional-legacy",
     certification: DatasetCertification = DatasetCertification.PROVISIONAL,
     generated_time: datetime | None = None,
+    policy: ExecutionOutcomePolicy | None = None,
 ) -> NetAlphaLabelDatasetResult:
     """Publish the hash-bound per-key outcome-status sidecar dataset.
 
     The sidecar carries exactly one typed ``outcome_status`` row per
     ``(instrument_id, decision_session, horizon_sessions)`` in the decision
     universe, partitioned like the label dataset. Its manifest binds the exact
-    column order and values through the schema/content hashes.
+    column order and values through the schema/content hashes and, when
+    ``policy`` is supplied, pins the immutable execution policy id and hash so
+    no consumer can silently classify outcomes under a different policy.
     """
     if status_frame.is_empty():
         raise ValueError("cannot publish an empty outcome-status sidecar")
@@ -289,6 +304,9 @@ def publish_outcome_status_sidecar(
         "outcome_status_vocabulary": list(OUTCOME_STATUS_VOCABULARY),
         "generated_time": generated_time.isoformat(),
     }
+    if policy is not None:
+        content_manifest["policy_id"] = policy.policy_id
+        content_manifest["policy_hash"] = policy.canonical_hash
     store = ParquetDatasetStore(Path(destination_root))
     dataset_dir = store.write_partitioned(
         status_frame,

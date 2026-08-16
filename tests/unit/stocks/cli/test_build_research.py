@@ -34,6 +34,7 @@ def test_build_research_cli_defaults_to_net_alpha() -> None:
     )
     assert args.pipeline == "net-alpha"
     assert args.candidate_horizon_sessions == "3,5,8,10,15,20"
+    assert args.raw_bar_dataset_id is None
 
 
 def test_build_research_cli_rejects_legacy_pipeline() -> None:

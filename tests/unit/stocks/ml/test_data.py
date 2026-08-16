@@ -8,14 +8,44 @@ import pytest
 
 from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.ml.data import compose_net_alpha_training_data
+from src.stocks.ml.training import _build_label_join
 from tests.fixtures.stocks.helpers import (
     stock_net_alpha_composed_df,
     stock_net_alpha_manifest,
 )
 
+_NARROW_LABEL_COLUMNS = {
+    "instrument_id",
+    "session",
+    "net_alpha_target",
+    "label_available_time",
+    "risk_residual",
+    "reference_cost",
+}
+
 
 def _decision_time() -> datetime:
     return datetime(2024, 12, 31, tzinfo=UTC)
+
+
+def _assert_narrow_labels_restored(data, horizon: int) -> None:
+    label_frame = data.labels_by_horizon[horizon]
+    assert set(label_frame.columns) == _NARROW_LABEL_COLUMNS
+    join = _build_label_join(data, horizon)
+    assert {
+        "instrument_id",
+        "session",
+        "net_alpha_target",
+        "label_available_time",
+        "risk_residual",
+        "reference_cost",
+        "open",
+        "adtv_20d",
+        "volatility_20d",
+        "realized_net_return",
+    } <= set(join.columns)
+    realized = (join["risk_residual"] - join["reference_cost"]).to_list()
+    assert join["realized_net_return"].to_list() == pytest.approx(realized)
 
 
 def test_wide_composition_retains_decimal_realized_outcomes() -> None:
@@ -27,10 +57,7 @@ def test_wide_composition_retains_decimal_realized_outcomes() -> None:
         snapshot, _decision_time(), (3, 5)
     )
     for horizon in (3, 5):
-        label_frame = data.labels_by_horizon[horizon]
-        assert "risk_residual" in label_frame.columns
-        assert "reference_cost" in label_frame.columns
-        assert "open" in label_frame.columns
+        _assert_narrow_labels_restored(data, horizon)
 
 
 def test_long_composition_retains_decimal_realized_outcomes() -> None:
@@ -43,6 +70,8 @@ def test_long_composition_retains_decimal_realized_outcomes() -> None:
             pl.col("session"),
             pl.col("instrument_id"),
             pl.col("open"),
+            pl.col("adtv_20d"),
+            pl.col("volatility_20d"),
             pl.lit(horizon).alias("horizon_sessions"),
             pl.col(f"net_alpha_{horizon}d_target").alias("net_alpha_target"),
             pl.col(f"label_available_time_{horizon}d").alias("label_available_time"),
@@ -61,10 +90,7 @@ def test_long_composition_retains_decimal_realized_outcomes() -> None:
         snapshot, _decision_time(), (3, 5)
     )
     for horizon in (3, 5):
-        label_frame = data.labels_by_horizon[horizon]
-        assert "risk_residual" in label_frame.columns
-        assert "reference_cost" in label_frame.columns
-        assert "open" in label_frame.columns
+        _assert_narrow_labels_restored(data, horizon)
 
 
 def test_feature_frame_is_target_free() -> None:

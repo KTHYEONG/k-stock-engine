@@ -73,7 +73,7 @@ def main(args: list[str] | None = None) -> int:
     cost_evidence = None
     if snapshot.costs is not None:
         cost_evidence = load_cost_evidence(
-            Path(snapshot.costs.path), snapshot.research_range
+            Path(snapshot.costs.path), snapshot.execution_range
         )
     policy_profile = artifact_policy_profile(registry, parsed.artifact_id)
     if policy_profile is not None:

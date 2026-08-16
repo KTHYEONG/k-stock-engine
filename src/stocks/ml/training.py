@@ -19,9 +19,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -79,6 +83,9 @@ from src.stocks.ml.replay import (
     ReplayEvaluation,
     ReplaySegmentDiagnostic,
 )
+from src.stocks.ml.result_ledger import (
+    current_rss_mib as _current_rss_mib,
+)
 from src.stocks.ml.result_ledger import peak_rss_mib as _peak_rss_mib
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.research.calibration_schedule import SessionClusterCalibrationSchedule
@@ -98,6 +105,96 @@ _REFERENCE_NOTIONAL = 100_000_000.0
 _NESTED_INNER_FOLDS = 3
 _NESTED_MIN_TRAIN_SESSIONS = 5
 _ALPHA_TIE_TOLERANCE = 1e-12
+
+
+class _MemoryBudgetExceededError(Exception):
+    """Signal a ``max_rss_mib`` breach at a safe horizon boundary."""
+
+    def __init__(self, stage: str) -> None:
+        super().__init__(f"memory budget exceeded at {stage}")
+        self.stage = stage
+
+
+def _default_oof_cache_base() -> Path:
+    from src.core.paths import PROJECT_ROOT
+
+    return PROJECT_ROOT / "tmp" / "training"
+
+
+def _atomic_write_parquet(frame: pl.DataFrame, path: Path) -> None:
+    """Write a Zstandard Parquet file atomically via a same-dir rename."""
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    frame.write_parquet(temp_path, compression="zstd")
+    os.replace(temp_path, path)
+
+
+def _read_oof_parquet(path: Path) -> pl.DataFrame:
+    """Load a cached OOF file; missing/corrupt files raise ``ValueError``."""
+    if not path.exists():
+        raise ValueError(f"missing cached OOF file {path}")
+    try:
+        return pl.read_parquet(path)
+    except Exception as exc:
+        raise ValueError(f"corrupt cached OOF file {path}: {exc}") from exc
+
+
+class _OofCache:
+    """Per-run temporary spill cache below ``<registry.root>/.training``.
+
+    Admitted horizons write the calibrated OOF scores and the label join as
+    separate Zstandard Parquet files and release the DataFrames; only the file
+    paths and the small Rank-IC tuple stay in process memory. Reading a
+    missing/corrupt file raises ``ValueError`` and never recomputes an OOF.
+    """
+
+    def __init__(self, base_dir: Path) -> None:
+        base_dir.mkdir(parents=True, exist_ok=True)
+        self._temporary = tempfile.TemporaryDirectory(dir=base_dir, prefix="oof-")
+        self._root = Path(self._temporary.name)
+        self._cache_bytes = 0
+        self._closed = False
+
+    @property
+    def root(self) -> Path:
+        return self._root
+
+    @property
+    def cache_bytes(self) -> int:
+        return self._cache_bytes
+
+    def store(
+        self,
+        horizon_sessions: int,
+        calibrated: pl.DataFrame,
+        labels: pl.DataFrame,
+    ) -> tuple[Path, Path]:
+        if self._closed:
+            raise ValueError("OOF cache is closed")
+        oof_path = self._root / f"horizon_{horizon_sessions}_oof.parquet.zst"
+        labels_path = self._root / f"horizon_{horizon_sessions}_labels.parquet.zst"
+        _atomic_write_parquet(calibrated, oof_path)
+        _atomic_write_parquet(labels, labels_path)
+        self._cache_bytes += oof_path.stat().st_size + labels_path.stat().st_size
+        return oof_path, labels_path
+
+    def load(self, horizon_sessions: int) -> tuple[pl.DataFrame, pl.DataFrame]:
+        oof_path = self._root / f"horizon_{horizon_sessions}_oof.parquet.zst"
+        labels_path = self._root / f"horizon_{horizon_sessions}_labels.parquet.zst"
+        return _read_oof_parquet(oof_path), _read_oof_parquet(labels_path)
+
+    def close(self) -> None:
+        if not self._closed:
+            self._temporary.cleanup()
+            self._closed = True
+
+
+def _enforce_memory_budget(request: NetAlphaTrainingRequest, stage: str) -> None:
+    """Stop discovery at a safe horizon boundary when the peak breaches budget."""
+    if request.max_rss_mib is None:
+        return
+    peak = _peak_rss_mib()
+    if peak is not None and peak > request.max_rss_mib:
+        raise _MemoryBudgetExceededError(stage)
 
 
 class TrainingTelemetry:
@@ -122,6 +219,7 @@ class TrainingTelemetry:
             "name": name,
             "elapsed_ms": elapsed_ms,
             "peak_rss_mib": _peak_rss_mib(),
+            "rss_mib": _current_rss_mib(),
         }
         if evidence:
             sample.update(dict(evidence))
@@ -143,24 +241,34 @@ class HorizonDiscovery:
     fold-coverage, cohort, missing-realized, and Rank-IC pre-gates;
     ``diagnostics`` retain the typed per-horizon OOF diagnostics for every
     candidate horizon, published under ``oof_diagnostics`` in ``NO_TRADE``
-    metrics. ``oof_by_horizon`` retains each candidate's calibrated OOF frame
-    and realized join in process memory so the selected policy is never refit;
+    metrics. ``oof_by_horizon`` retains, per admitted horizon, the temporary
+    cache paths of its calibrated OOF frame and label join plus the small
+    Rank-IC tuple; the frames themselves are spilled to disk so the selected
+    policy is never refit and only one horizon's OOF is ever resident.
     ``dropout_reasons`` maps every ``(horizon, profile)`` candidate to its
     deterministic pre-gate reason (empty when admitted), and
     ``segment_diagnostics_by_candidate`` retains the bounded per-segment
-    replay diagnostics for every evaluated candidate. ``path_evaluation_count``
-    is the discovery optimizer invocation bound ``m * F * (I + 1)``.
+    replay diagnostics for every evaluated candidate. ``horizon_memory``
+    carries the bounded per-horizon ``rss_mib``/``peak_rss_mib``/``elapsed_ms``/
+    ``cache_bytes`` observability. ``oof_cache`` is the per-run spill cache
+    owned by ``train_net_alpha_model`` (``None`` only for a self-created
+    ephemeral cache). ``path_evaluation_count`` is the discovery optimizer
+    invocation bound ``m * F * (I + 1)``.
     """
 
     evidence: tuple[HorizonOOFEvidence, ...]
     diagnostics: tuple[HorizonOOFDiagnostic, ...]
-    oof_by_horizon: Mapping[int, tuple[pl.DataFrame, pl.DataFrame, list[float]]]
+    oof_by_horizon: Mapping[int, tuple[Path, Path, list[float]]]
     dropout_reasons: Mapping[tuple[int, str], str] = field(default_factory=dict)
     segment_diagnostics_by_candidate: Mapping[
         tuple[int, str], tuple[ReplaySegmentDiagnostic, ...]
     ] = field(default_factory=dict)
     coverage_by_horizon: Mapping[int, HorizonOutcomeCoverage] = field(
         default_factory=dict
+    )
+    horizon_memory: Mapping[int, dict[str, object]] = field(default_factory=dict)
+    oof_cache: _OofCache | None = field(
+        default=None, compare=False, hash=False, repr=False
     )
     path_evaluation_count: int = 0
     path_evaluation_bound: int = 0
@@ -294,9 +402,53 @@ def train_net_alpha_model(
             telemetry=telemetry,
         )
 
-    discovery = _build_horizon_evidence(
-        pre_holdout, folds, data, request, learner_columns
-    )
+    cache = _OofCache(registry.root / ".training")
+    try:
+        return _select_publish_and_promote(
+            registry=registry,
+            data=data,
+            request=request,
+            frame=frame,
+            pre_holdout=pre_holdout,
+            holdout=holdout,
+            folds=folds,
+            learner_columns=learner_columns,
+            telemetry=telemetry,
+            schema_hash=schema_hash,
+            universe_policy_hash=universe_policy_hash,
+            oof_cache=cache,
+        )
+    finally:
+        cache.close()
+
+
+def _select_publish_and_promote(
+    *,
+    registry: ModelArtifactRegistry,
+    data: NetAlphaResearchData,
+    request: NetAlphaTrainingRequest,
+    frame: pl.DataFrame,
+    pre_holdout: pl.DataFrame,
+    holdout: pl.DataFrame,
+    folds: list[Fold],
+    learner_columns: tuple[str, ...],
+    telemetry: TrainingTelemetry,
+    schema_hash: str,
+    universe_policy_hash: str,
+    oof_cache: _OofCache,
+) -> ModelManifest:
+    """Run discovery, selection, comparison, and promotion under one OOF cache."""
+    try:
+        discovery = _build_horizon_evidence(
+            pre_holdout, folds, data, request, learner_columns,
+            oof_cache=oof_cache,
+        )
+    except _MemoryBudgetExceededError as exc:
+        return _publish_no_trade(
+            registry, request, frame, f"memory-budget-exceeded:{exc.stage}",
+            schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+            telemetry=telemetry,
+        )
     _record_horizon_discovery(telemetry, discovery)
     if not discovery.evidence:
         return _publish_no_trade(
@@ -456,6 +608,7 @@ def train_net_alpha_model(
         cost_schedule=request.base_cost_schedule or default_base_schedule(),
         liquidity_model=request.liquidity_model,
         seed=request.seed,
+        policy=request.execution_policy,
     )
     evaluation = replay.evaluate(calibrated, oof_labels)
 
@@ -830,15 +983,44 @@ def _select_elastic_alpha(
 
 
 def _build_label_join(data: NetAlphaResearchData, horizon_sessions: int) -> pl.DataFrame:
-    """Canonical per-horizon label join frame with realized and availability columns."""
-    label_frame = data.labels_by_horizon[horizon_sessions]
-    return label_frame.select(
+    """Sole late-binding point: narrow horizon labels joined with execution columns.
+
+    Labels are stored narrow per horizon; ``open``, ``adtv_20d``, and
+    ``volatility_20d`` are projected from the feature frame here so no full
+    feature frame is copied per horizon.
+    """
+    label_columns = (
         _ID_COLUMN, SESSION_COLUMN, TARGET_COLUMN,
         AVAILABLE_COLUMN, RISK_RESIDUAL_COLUMN, REFERENCE_COST_COLUMN,
-        "open", "adtv_20d", "volatility_20d",
-    ).with_columns(
-        (pl.col(RISK_RESIDUAL_COLUMN) - pl.col(REFERENCE_COST_COLUMN))
-        .alias(REALIZED_RETURN_COLUMN)
+    )
+    label_frame = data.labels_by_horizon[horizon_sessions]
+    missing = [c for c in label_columns if c not in label_frame.columns]
+    if missing:
+        raise ValueError(
+            f"horizon {horizon_sessions} label frame is missing required "
+            f"columns {missing}"
+        )
+    execution_columns = (
+        _ID_COLUMN, SESSION_COLUMN, "open", "adtv_20d", "volatility_20d",
+    )
+    missing_exec = [
+        c for c in execution_columns if c not in data.feature_frame.columns
+    ]
+    if missing_exec:
+        raise ValueError(
+            f"feature frame is missing late-bound execution columns {missing_exec}"
+        )
+    return (
+        data.feature_frame.select(*execution_columns)
+        .join(
+            label_frame.select(*label_columns),
+            on=[_ID_COLUMN, SESSION_COLUMN],
+            how="inner",
+        )
+        .with_columns(
+            (pl.col(RISK_RESIDUAL_COLUMN) - pl.col(REFERENCE_COST_COLUMN))
+            .alias(REALIZED_RETURN_COLUMN)
+        )
     )
 
 
@@ -859,11 +1041,19 @@ def _record_horizon_discovery(
         },
     )
     for diagnostic in discovery.diagnostics:
-        telemetry.add_horizon(_horizon_entry(diagnostic, eligible))
+        telemetry.add_horizon(
+            _horizon_entry(
+                diagnostic,
+                eligible,
+                discovery.horizon_memory.get(diagnostic.horizon_sessions),
+            )
+        )
 
 
 def _horizon_entry(
-    diagnostic: HorizonOOFDiagnostic, eligible: set[int]
+    diagnostic: HorizonOOFDiagnostic,
+    eligible: set[int],
+    memory: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     entry: dict[str, object] = {
         "horizon_sessions": diagnostic.horizon_sessions,
@@ -885,6 +1075,8 @@ def _horizon_entry(
         ],
     }
     entry.update(_fold_alpha_metadata(diagnostic))
+    if memory:
+        entry.update(dict(memory))
     return entry
 
 
@@ -959,6 +1151,7 @@ def _replay_costs(
         cost_schedule=request.base_cost_schedule or default_base_schedule(),
         liquidity_model=request.liquidity_model,
         seed=request.seed + horizon_sessions,
+        policy=request.execution_policy,
     )
     stress_replay = NetAlphaPolicyReplay(
         horizon_sessions=horizon_sessions,
@@ -967,6 +1160,7 @@ def _replay_costs(
         cost_schedule=request.stress_cost_schedule or default_stress_schedule(),
         liquidity_model=request.stress_liquidity_model or request.liquidity_model,
         seed=request.seed + horizon_sessions,
+        policy=request.execution_policy,
     )
     base_evaluation = base_replay.evaluate(
         calibrated, oof_labels, segment_column=_OOF_SEGMENT, status=status
@@ -1035,12 +1229,9 @@ def _coverage_failure_reason(
             f"incomplete-segment-coverage:{distinct_segments}/"
             f"{evidence.segment_count}"
         )
-    if evidence.unresolved_outcome_counts:
-        typed = ", ".join(
-            f"{state}:{count}"
-            for state, count in sorted(evidence.unresolved_outcome_counts)
-        )
-        return f"unresolved-outcome:{typed}"
+    # Unresolved vintages stay out of return arithmetic and remain in replay
+    # diagnostics. Existing observed/active coverage gates decide admission;
+    # one missing bar must not discard an otherwise valid research candidate.
     if evidence.missing_cohort_count > 0:
         return f"missing-realized-vintages:{evidence.missing_cohort_count}"
     if not evidence.fold_rank_ics:
@@ -1070,6 +1261,8 @@ def _build_horizon_evidence(
     data: NetAlphaResearchData,
     request: NetAlphaTrainingRequest,
     learner_columns: tuple[str, ...],
+    *,
+    oof_cache: _OofCache | None = None,
 ) -> HorizonDiscovery:
     """Build the two-profile ``(horizon, profile)`` OOF frontier.
 
@@ -1084,17 +1277,26 @@ def _build_horizon_evidence(
     realized vintage is missing, a strict majority of usable folds has positive
     session-mean Rank-IC, and the compounding coverage gates pass. Independent
     horizon universes are never inner-joined.
+
+    Calibrated OOF evidence is spilled to the per-run temporary cache only for
+    horizons with at least one admitted profile; rejected horizons release
+    their frames before the next horizon. ``max_rss_mib`` is enforced at safe
+    horizon boundaries by raising ``_MemoryBudgetExceededError``.
     """
+    if oof_cache is None:
+        oof_cache = _OofCache(_default_oof_cache_base())
     evidence: list[HorizonOOFEvidence] = []
     diagnostics: list[HorizonOOFDiagnostic] = []
-    oof_by_horizon: dict[int, tuple[pl.DataFrame, pl.DataFrame, list[float]]] = {}
+    oof_by_horizon: dict[int, tuple[Path, Path, list[float]]] = {}
     dropout_reasons: dict[tuple[int, str], str] = {}
     segment_diagnostics_by_candidate: dict[
         tuple[int, str], tuple[ReplaySegmentDiagnostic, ...]
     ] = {}
     coverage_by_horizon: dict[int, HorizonOutcomeCoverage] = {}
+    horizon_memory: dict[int, dict[str, object]] = {}
     path_evaluation_count = 0
     for horizon in sorted(data.labels_by_horizon):
+        horizon_started = time.monotonic()
         label_frame = data.labels_by_horizon[horizon]
         logger.debug(
             "[ALGO] stage=horizon_start horizon=%d label_rows=%d",
@@ -1135,79 +1337,93 @@ def _build_horizon_evidence(
                 dropout_reasons[(horizon, profile.profile_id)] = (
                     "no-oof-labels"
                 )
-            continue
-        coverage = None
-        status_frame = data.status_by_horizon.get(horizon)
-        if status_frame is not None and not status_frame.is_empty():
-            from src.stocks.ml.data import HorizonOutcomeCoverage
+        else:
+            coverage = None
+            status_frame = data.status_by_horizon.get(horizon)
+            if status_frame is not None and not status_frame.is_empty():
+                from src.stocks.ml.data import HorizonOutcomeCoverage
 
-            coverage = HorizonOutcomeCoverage.build(
-                horizon,
-                oof.select(_ID_COLUMN, SESSION_COLUMN, _OOF_SEGMENT),
-                status_frame,
-                segment_column=_OOF_SEGMENT,
-            )
-            coverage_by_horizon[horizon] = coverage
-            logger.info(
-                "[DATA] stage=outcome_coverage horizon=%d realised=%d "
-                "partial_tail=%d unresolved=%d",
-                horizon,
-                coverage.realized_rows,
-                coverage.status_counts.partial_tail,
-                coverage.status_counts.unresolved,
-            )
-        calibrated = _causal_oof_calibrate(oof, oof_labels, request, horizon)
-        oof_by_horizon[horizon] = (calibrated, oof_labels, ics)
-        status_projection = (
-            coverage.status_projection if coverage is not None else None
-        )
-        for profile in request.policy_profiles:
-            logger.debug(
-                "[EVAL] stage=profile_replay horizon=%d profile=%s band_bps=%.3f",
-                horizon,
-                profile.profile_id,
-                profile.no_trade_band_bps,
-            )
-            risk = replace(
-                request.risk, no_trade_band_bps=profile.no_trade_band_bps
-            )
-            try:
-                base_evaluation, stress_evaluation = _replay_costs(
-                    calibrated, oof_labels, request, horizon, risk,
-                    status=status_projection,
+                coverage = HorizonOutcomeCoverage.build(
+                    horizon,
+                    oof.select(_ID_COLUMN, SESSION_COLUMN, _OOF_SEGMENT),
+                    status_frame,
+                    segment_column=_OOF_SEGMENT,
                 )
-            except ValueError as exc:
-                dropout_reasons[(horizon, profile.profile_id)] = (
-                    f"replay-error:{type(exc).__name__}:{exc}"
+                coverage_by_horizon[horizon] = coverage
+                logger.info(
+                    "[DATA] stage=outcome_coverage horizon=%d realised=%d "
+                    "partial_tail=%d unresolved=%d",
+                    horizon,
+                    coverage.realized_rows,
+                    coverage.status_counts.partial_tail,
+                    coverage.status_counts.unresolved,
                 )
-                continue
-            if not base_evaluation.period_net_returns:
-                dropout_reasons[(horizon, profile.profile_id)] = (
-                    "no-evaluated-vintages"
+            calibrated = _causal_oof_calibrate(oof, oof_labels, request, horizon)
+            status_projection = (
+                coverage.status_projection if coverage is not None else None
+            )
+            admitted_any = False
+            for profile in request.policy_profiles:
+                logger.debug(
+                    "[EVAL] stage=profile_replay horizon=%d profile=%s band_bps=%.3f",
+                    horizon,
+                    profile.profile_id,
+                    profile.no_trade_band_bps,
                 )
-                continue
-            candidate_evidence = _evidence_from_evaluation(
-                horizon, profile.profile_id, "net_alpha_elastic_net",
-                base_evaluation, stress_evaluation, tuple(ics), len(folds),
-            )
-            segment_diagnostics_by_candidate[(horizon, profile.profile_id)] = (
-                base_evaluation.segment_diagnostics
-            )
-            failure_reason = _coverage_failure_reason(candidate_evidence, request)
-            dropout_reasons[(horizon, profile.profile_id)] = failure_reason
-            logger.debug(
-                "[EVAL] stage=profile_result horizon=%d profile=%s vintages=%d "
-                "active=%d missing=%d dropout=%s",
-                horizon,
-                profile.profile_id,
-                len(base_evaluation.period_net_returns),
-                base_evaluation.matured_vintage_count,
-                base_evaluation.missing_realized_vintage_count,
-                failure_reason or "none",
-            )
-            if failure_reason:
-                continue
-            evidence.append(candidate_evidence)
+                risk = replace(
+                    request.risk, no_trade_band_bps=profile.no_trade_band_bps
+                )
+                try:
+                    base_evaluation, stress_evaluation = _replay_costs(
+                        calibrated, oof_labels, request, horizon, risk,
+                        status=status_projection,
+                    )
+                except ValueError as exc:
+                    dropout_reasons[(horizon, profile.profile_id)] = (
+                        f"replay-error:{type(exc).__name__}:{exc}"
+                    )
+                    continue
+                if not base_evaluation.period_net_returns:
+                    dropout_reasons[(horizon, profile.profile_id)] = (
+                        "no-evaluated-vintages"
+                    )
+                    continue
+                candidate_evidence = _evidence_from_evaluation(
+                    horizon, profile.profile_id, "net_alpha_elastic_net",
+                    base_evaluation, stress_evaluation, tuple(ics), len(folds),
+                )
+                segment_diagnostics_by_candidate[(horizon, profile.profile_id)] = (
+                    base_evaluation.segment_diagnostics
+                )
+                failure_reason = _coverage_failure_reason(candidate_evidence, request)
+                dropout_reasons[(horizon, profile.profile_id)] = failure_reason
+                logger.debug(
+                    "[EVAL] stage=profile_result horizon=%d profile=%s vintages=%d "
+                    "active=%d missing=%d dropout=%s",
+                    horizon,
+                    profile.profile_id,
+                    len(base_evaluation.period_net_returns),
+                    base_evaluation.matured_vintage_count,
+                    base_evaluation.missing_realized_vintage_count,
+                    failure_reason or "none",
+                )
+                if failure_reason:
+                    continue
+                evidence.append(candidate_evidence)
+                admitted_any = True
+            if admitted_any:
+                oof_path, labels_path = oof_cache.store(
+                    horizon, calibrated, oof_labels
+                )
+                oof_by_horizon[horizon] = (oof_path, labels_path, ics)
+            del oof, oof_labels, calibrated
+        horizon_memory[horizon] = {
+            "rss_mib": _current_rss_mib(),
+            "peak_rss_mib": _peak_rss_mib(),
+            "elapsed_ms": int((time.monotonic() - horizon_started) * 1000),
+            "cache_bytes": oof_cache.cache_bytes,
+        }
+        _enforce_memory_budget(request, "horizon_discovery")
     return HorizonDiscovery(
         evidence=tuple(evidence),
         diagnostics=tuple(diagnostics),
@@ -1215,6 +1431,8 @@ def _build_horizon_evidence(
         dropout_reasons=dropout_reasons,
         segment_diagnostics_by_candidate=segment_diagnostics_by_candidate,
         coverage_by_horizon=coverage_by_horizon,
+        horizon_memory=horizon_memory,
+        oof_cache=oof_cache,
         path_evaluation_count=path_evaluation_count,
         path_evaluation_bound=(
             len(diagnostics) * len(folds) * (_NESTED_INNER_FOLDS + 1)
@@ -1227,14 +1445,21 @@ def _discovery_oof(
     primary_horizon_sessions: int,
     folds: list[Fold],
 ) -> tuple[pl.DataFrame, pl.DataFrame, list[float], HorizonOOFDiagnostic]:
-    """Reuse the discovery calibrated OOF; the selected primary is never refit."""
+    """Load the cached primary baseline OOF; the selected primary is never refit.
+
+    The primary's calibrated OOF and labels are read back from the temporary
+    spill cache; a missing or corrupt cache file raises ``ValueError`` and is
+    never recomputed.
+    """
     del folds
     cached = discovery.oof_by_horizon.get(primary_horizon_sessions)
     if cached is None:
         raise ValueError(
             "discovery did not cache the selected primary baseline OOF"
         )
-    oof, oof_labels, ics = cached
+    oof_path, labels_path, ics = cached
+    oof = _read_oof_parquet(oof_path)
+    oof_labels = _read_oof_parquet(labels_path)
     diagnostic = next(
         (
             diag
@@ -1993,6 +2218,7 @@ def _evaluate_forward_holdout(
         cost_schedule=request.base_cost_schedule or default_base_schedule(),
         liquidity_model=request.liquidity_model,
         seed=request.seed,
+        policy=request.execution_policy,
     )
     stress_replay = NetAlphaPolicyReplay(
         horizon_sessions=horizon_sessions,
@@ -2001,6 +2227,7 @@ def _evaluate_forward_holdout(
         cost_schedule=request.stress_cost_schedule or default_stress_schedule(),
         liquidity_model=request.stress_liquidity_model or request.liquidity_model,
         seed=request.seed,
+        policy=request.execution_policy,
     )
     try:
         base_evaluation = base_replay.evaluate(calibrated, holdout_panel)

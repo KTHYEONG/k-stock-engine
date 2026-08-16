@@ -18,9 +18,10 @@ The canonical projection is fail-closed:
 - ``observation_time``/``available_time`` are timezone-aware UTC derived from
   the KRX local close (15:30/15:31 Asia/Seoul).
 
-Certification defaults to ``PROVISIONAL``. Any higher tier requires explicit
-coverage evidence (calendar, corporate-action, cost-source hashes), and
-``PRODUCTION`` additionally must pass ``validate_production_manifest``.
+Certification defaults to ``PROVISIONAL``. ``RESEARCH`` requires calendar,
+cost, master, and feature-availability evidence; corporate-action coverage is
+required only for ``PRODUCTION``, which additionally passes
+``validate_production_manifest``.
 """
 from __future__ import annotations
 
@@ -545,11 +546,12 @@ def _validate_certification_evidence(manifest: DatasetManifest) -> None:
         return
     evidence = {
         "calendar_hash": manifest.calendar_hash,
-        "corporate_action_hash": manifest.corporate_action_hash,
         "cost_source_hash": manifest.cost_source_hash,
         "master_hash": manifest.master_hash,
         "quality_report_hash": manifest.quality_report_hash,
     }
+    if manifest.certification is DatasetCertification.PRODUCTION:
+        evidence["corporate_action_hash"] = manifest.corporate_action_hash
     missing = [name for name, value in evidence.items() if not value]
     if missing:
         raise ValueError(

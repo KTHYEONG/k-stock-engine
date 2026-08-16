@@ -45,6 +45,9 @@ class CatalogKind(StrEnum):
     CALENDAR = "calendar"
     INSTRUMENT_MASTER = "instrument_master"
     DISCLOSURES = "disclosures"
+    RAW_BARS = "raw_bars"
+    OUTCOME_OPEN_BARS = "outcome_open_bars"
+    OUTCOME_EVIDENCE = "outcome_evidence"
     CORPORATE_ACTIONS = "corporate_actions"
     COSTS = "costs"
     BASE_PANEL = "base_panel"
@@ -317,6 +320,25 @@ class ResearchDataSnapshot:
         return self.manifest.windows.research_range
 
     @property
+    def execution_range(self) -> CoverageRange:
+        """Common immutable range usable by local ML and backtests."""
+        core = (self.base_panel, self.features, self.labels)
+        if any(entry is None or entry.coverage is None for entry in core):
+            raise ValueError("execution requires covered base_panel, features, and labels")
+        covered = tuple(
+            entry.coverage
+            for entry in core
+            if entry is not None and entry.coverage is not None
+        )
+        if len(covered) != len(core):
+            raise ValueError("execution requires covered base_panel, features, and labels")
+        start = max(self.research_range.start, *(range_.start for range_ in covered))
+        end = min(self.research_range.end, *(range_.end for range_ in covered))
+        if start > end:
+            raise ValueError("execution datasets have no common covered range")
+        return CoverageRange(start=start, end=end)
+
+    @property
     def status_provenance(self) -> str:
         """Pinned vs legacy-inferred outcome-status provenance.
 
@@ -368,6 +390,29 @@ class SnapshotResolver:
             corporate_actions=references.get(CatalogKind.CORPORATE_ACTIONS),
             costs=references.get(CatalogKind.COSTS),
         )
+
+    def resolve_execution(self, snapshot_id: str) -> ResearchDataSnapshot:
+        """Resolve the minimal hash-bound dataset contract for local execution."""
+        manifest = self._load_manifest(snapshot_id)
+        self._assert_manifest_hash(manifest)
+        references = self._resolve_references(manifest)
+        required = (CatalogKind.BASE_PANEL, CatalogKind.FEATURES, CatalogKind.LABELS)
+        missing = [kind.value for kind in required if kind not in references]
+        if missing:
+            raise ValueError(f"execution snapshot requires datasets, missing {missing}")
+        snapshot = ResearchDataSnapshot(
+            manifest=manifest,
+            base_panel=references[CatalogKind.BASE_PANEL],
+            features=references[CatalogKind.FEATURES],
+            labels=references[CatalogKind.LABELS],
+            outcome_status=references.get(CatalogKind.OUTCOME_STATUS),
+            calendar=references.get(CatalogKind.CALENDAR),
+            master=references.get(CatalogKind.INSTRUMENT_MASTER),
+            corporate_actions=references.get(CatalogKind.CORPORATE_ACTIONS),
+            costs=references.get(CatalogKind.COSTS),
+        )
+        _ = snapshot.execution_range
+        return snapshot
 
     def _load_manifest(self, snapshot_id: str) -> SnapshotManifest:
         manifest_path = self.store.root / "snapshots" / snapshot_id / SNAPSHOT_MANIFEST_NAME

@@ -297,8 +297,7 @@ def test_coverage_failure_reason_fails_closed_on_missing_and_incomplete() -> Non
         unresolved_outcome_counts=(("MISSING_EXIT_PRICE", 2),),
     )
     reason = training._coverage_failure_reason(typed, request)
-    assert reason.startswith("unresolved-outcome:")
-    assert "MISSING_EXIT_PRICE:2" in reason
+    assert reason == ""
 
 
 def test_score_is_constant_classifies_degenerate_predictions() -> None:
@@ -489,10 +488,13 @@ def test_fold_plan_is_balanced_and_segment_identified() -> None:
         assert fold.train_label_end < fold.validation_decision_start
 
 
-def test_discovery_oof_reuses_cached_baseline_never_refits() -> None:
+def test_discovery_oof_reuses_cached_baseline_never_refits(tmp_path) -> None:
+    from pathlib import Path
+
     data, request, pre_holdout, folds, learner_columns, _schema = _training_fixture()
+    cache = training._OofCache(Path(tmp_path) / "training")
     discovery = training._build_horizon_evidence(
-        pre_holdout, folds, data, request, learner_columns
+        pre_holdout, folds, data, request, learner_columns, oof_cache=cache
     )
     if not discovery.evidence:
         pytest.skip("fixture produced no horizon evidence")
@@ -500,13 +502,19 @@ def test_discovery_oof_reuses_cached_baseline_never_refits() -> None:
     oof, oof_labels, ics, _diagnostic = training._discovery_oof(
         discovery, primary, folds
     )
-    cached_oof, cached_labels, cached_ics = discovery.oof_by_horizon[primary]
-    # The discovery baseline is reused by identity; the selected primary is
-    # never refit.
-    assert oof is cached_oof
-    assert oof_labels is cached_labels
+    oof_path, labels_path, cached_ics = discovery.oof_by_horizon[primary]
+    # The discovery baseline is read back from its temporary OOF cache; the
+    # selected primary is never refit.
+    assert "_fit_oof" not in training._discovery_oof.__code__.co_names
+    assert pl.read_parquet(oof_path).equals(oof)
+    assert pl.read_parquet(labels_path).equals(oof_labels)
     assert ics == cached_ics
     assert discovery.path_evaluation_count <= discovery.path_evaluation_bound
+    # Terminal cleanup removes the whole cache directory.
+    cache.close()
+    assert not oof_path.exists()
+    assert not labels_path.exists()
+    assert not cache.root.exists()
 
 
 class _FakeClock:
@@ -629,6 +637,59 @@ def test_run_observability_preserves_terminal_no_trade_reason(tmp_path) -> None:
     json.dumps(frontier)
 
 
+def test_memory_budget_breach_publishes_bounded_no_trade(tmp_path) -> None:
+    import json
+    from pathlib import Path
+
+    from src.stocks.data.contracts import DatasetSnapshot
+    from src.stocks.ml.contracts import (
+        CompoundingCertificationSettings,
+        NetAlphaTrainingRequest,
+    )
+    from src.stocks.ml.data import compose_net_alpha_training_data
+    from src.stocks.research.artifacts import ModelArtifactRegistry
+    from tests.fixtures.stocks.helpers import (
+        stock_liquidity_model,
+        stock_net_alpha_composed_df,
+        stock_net_alpha_manifest,
+    )
+
+    df = stock_net_alpha_composed_df(
+        n_sessions=120, n_tickers=8, audit_clean=True, label_scale=0.0
+    )
+    snapshot = DatasetSnapshot(
+        manifest=stock_net_alpha_manifest(columns=df.columns), frame=df
+    )
+    data = compose_net_alpha_training_data(
+        snapshot, datetime(2024, 12, 31, tzinfo=UTC), (3, 5, 8, 10, 15, 20)
+    )
+    registry = ModelArtifactRegistry(Path(tmp_path) / "artifacts")
+    request = NetAlphaTrainingRequest(
+        artifact_id="na_budget",
+        fold_count=2,
+        candidate_horizon_sessions=(3, 5, 8, 10, 15, 20),
+        bootstrap_resamples=50,
+        max_rss_mib=1,
+        liquidity_model=stock_liquidity_model(),
+        compounding=CompoundingCertificationSettings(
+            annualization_sessions=40,
+            min_observed_sessions=10,
+            min_active_cohort_fraction=0.1,
+        ),
+    )
+    manifest = training.train_net_alpha_model(data, registry, request)
+    assert manifest.model_type == "no_trade"
+    metrics = json.loads(
+        (Path(tmp_path) / "artifacts" / "na_budget" / "metrics.json").read_text()
+    )
+    run_obs = metrics["run_observability"]
+    assert run_obs["phases"][-1]["name"] == "artifact_publish"
+    assert run_obs["phases"][-1]["reason"] == (
+        "memory-budget-exceeded:horizon_discovery"
+    )
+    assert len(json.dumps(run_obs).encode("utf-8")) < 24 * 1024
+
+
 def test_train_net_alpha_model_promotes_champion_or_no_trade(tmp_path) -> None:
     import json
     from datetime import UTC, datetime
@@ -689,8 +750,8 @@ def test_train_net_alpha_model_promotes_champion_or_no_trade(tmp_path) -> None:
     assert discovery_phase["path_evaluation_count"] <= discovery_phase["path_evaluation_bound"]
 
 
-def test_horizon_evidence_coverage_rejects_unresolved_outcomes() -> None:
-    """Acceptance 2: a selected unresolved outcome fails the coverage preflight."""
+def test_horizon_evidence_coverage_keeps_unresolved_outcomes_diagnostic() -> None:
+    """SCENARIO_UNRESOLVED_OUTCOME_IS_DIAGNOSTIC: unresolved is not a sole gate."""
     from dataclasses import replace
 
     from src.stocks.ml.contracts import (
@@ -717,8 +778,7 @@ def test_horizon_evidence_coverage_rejects_unresolved_outcomes() -> None:
         unresolved_outcome_counts=((OUTCOME_MISSING_EXIT_PRICE, 1),),
     )
     reason = training._coverage_failure_reason(unresolved, request)
-    assert reason.startswith("unresolved-outcome:")
-    assert OUTCOME_MISSING_EXIT_PRICE in reason
+    assert reason != f"unresolved-outcome:{OUTCOME_MISSING_EXIT_PRICE}:1"
     assert OUTCOME_REALIZED not in reason
 
 
@@ -733,7 +793,9 @@ def test_replay_costs_base_stress_share_status_and_maturity() -> None:
     if not discovery.evidence:
         pytest.skip("fixture produced no horizon evidence")
     primary = discovery.evidence[0].horizon_sessions
-    oof, oof_labels, _ics = discovery.oof_by_horizon[primary]
+    oof, oof_labels, _ics, _diag = training._discovery_oof(
+        discovery, primary, folds
+    )
     coverage = discovery.coverage_by_horizon[primary]
     risk = replace(
         request.risk,
