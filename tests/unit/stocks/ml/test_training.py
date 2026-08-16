@@ -1050,3 +1050,37 @@ def test_scenario_unresolved_outcome_is_diagnostic_no_trade_blockers(tmp_path) -
     if candidate.blocked_vintage_count == 0:
         reason = training._coverage_failure_reason(unresolved_candidate, request)
         assert reason == "selected-exit-unresolved:1"
+
+
+def test_coverage_failure_reason_allows_isolated_blocked_vintages() -> None:
+    """Isolated blocked vintages below tolerance do not fail admission."""
+    from dataclasses import replace
+
+    from src.stocks.ml.horizons import HorizonOOFEvidence
+
+    request = _compound_request()
+    base_evidence = HorizonOOFEvidence(
+        horizon_sessions=3,
+        profile_id="lower_bound_only",
+        model_family="net_alpha_elastic_net",
+        base_log_growth=tuple(0.01 for _ in range(400)),
+        stress_log_growth=tuple(0.01 for _ in range(400)),
+        cohort_segment_ids=(0,) * 200 + (1,) * 200,
+        complete_cohort_count=400,
+        active_cohort_count=400,
+        partial_cohort_count=0,
+        missing_cohort_count=0,
+        segment_count=2,
+        fold_rank_ics=(0.1, 0.2),
+    )
+    # 2/400 = 0.5% and 4/400 = 1.0% stay within tolerance and are admitted.
+    isolated = replace(base_evidence, blocked_vintage_count=2)
+    assert training._coverage_failure_reason(isolated, request) == ""
+    at_tolerance = replace(base_evidence, blocked_vintage_count=4)
+    assert training._coverage_failure_reason(at_tolerance, request) == ""
+    # 10/400 = 2.5% exceeds the tolerance and still fails closed.
+    dominant = replace(base_evidence, blocked_vintage_count=10)
+    assert training._coverage_failure_reason(dominant, request).startswith(
+        "selected-exit-unresolved:"
+    )
+

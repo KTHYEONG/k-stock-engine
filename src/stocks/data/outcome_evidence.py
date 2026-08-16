@@ -32,6 +32,11 @@ from src.core.datasets import (
 )
 from src.core.instruments import AssetKind
 from src.stocks.data.quality import KRXSessionCalendar
+from src.stocks.data.tradability_events import (
+    HARD_EXCLUSION_STATES,
+    TRADABILITY_STATE_COLUMN,
+    TRADABILITY_STATE_VOCABULARY,
+)
 from src.stocks.domain.execution_policy import ExecutionOutcomePolicy
 from src.storage.parquet_datasets import ParquetDatasetStore, canonical_content_hash
 
@@ -48,6 +53,8 @@ RESOLUTION_CONFIRMED_NO_BAR = "CONFIRMED_NO_BAR"
 RESOLUTION_SOURCE_UNAVAILABLE = "SOURCE_UNAVAILABLE"
 RESOLUTION_VERIFIED_CORPORATE_SETTLEMENT = "VERIFIED_CORPORATE_SETTLEMENT"
 RESOLUTION_UNSUPPORTED_CORPORATE_ACTION = "UNSUPPORTED_CORPORATE_ACTION"
+RESOLUTION_SETTLED_CASH = "SETTLED_CASH"
+RESOLUTION_UNEXECUTABLE_EXIT = "UNEXECUTABLE_EXIT"
 RESOLUTION_PARTIAL_TAIL = "PARTIAL_TAIL"
 
 RESOLUTION_KIND_VOCABULARY = (
@@ -57,6 +64,8 @@ RESOLUTION_KIND_VOCABULARY = (
     RESOLUTION_SOURCE_UNAVAILABLE,
     RESOLUTION_VERIFIED_CORPORATE_SETTLEMENT,
     RESOLUTION_UNSUPPORTED_CORPORATE_ACTION,
+    RESOLUTION_SETTLED_CASH,
+    RESOLUTION_UNEXECUTABLE_EXIT,
     RESOLUTION_PARTIAL_TAIL,
 )
 
@@ -65,6 +74,8 @@ DISPOSITION_NO_BAR = "NO_BAR"
 DISPOSITION_SOURCE_UNAVAILABLE = "SOURCE_UNAVAILABLE"
 DISPOSITION_TAIL = "TAIL"
 DISPOSITION_UNSUPPORTED_ACTION = "UNSUPPORTED_ACTION"
+DISPOSITION_SETTLED_CASH = "SETTLED_CASH"
+DISPOSITION_UNEXECUTABLE_EXIT = "UNEXECUTABLE_EXIT"
 
 _KRX_AVAILABLE_TIME = time(15, 31)
 _KRX_TZ = ZoneInfo("Asia/Seoul")
@@ -154,6 +165,8 @@ def build_partitioned_outcome_evidence(
     policy: ExecutionOutcomePolicy,
     bar_evidence: pl.DataFrame | None = None,
     unavailable_sessions: set[date] | None = None,
+    tradability_events: pl.DataFrame | None = None,
+    settlements: pl.DataFrame | None = None,
     corporate_action_keys: set[tuple[str, date]] | None = None,
     corporate_action_event_id: str | None = None,
 ) -> pl.DataFrame:
@@ -175,6 +188,8 @@ def build_partitioned_outcome_evidence(
             policy=policy,
             bar_evidence=bar_evidence,
             unavailable_sessions=unavailable_sessions,
+            tradability_events=tradability_events,
+            settlements=settlements,
             corporate_action_keys=corporate_action_keys,
             corporate_action_event_id=corporate_action_event_id,
         )
@@ -211,6 +226,60 @@ def _action_key_expr(action_keys: set[tuple[str, date]]) -> pl.Expr:
     ).is_in([f"{instrument}|{day}" for instrument, day in keys])
 
 
+def _validate_settlements(settlements: pl.DataFrame) -> None:
+    """Fail closed on settlement evidence that breaks the provenance contract."""
+    missing = [c for c in SETTLEMENT_COLUMNS if c not in settlements.columns]
+    if missing:
+        raise ValueError(f"settlements missing columns {missing}")
+    invalid = settlements.filter(
+        pl.col("entitlement_date").is_null()
+        | pl.col("per_share_consideration").is_null()
+        | ~pl.col("per_share_consideration").is_finite()
+        | (pl.col("per_share_consideration") <= 0)
+        | (pl.col("settlement_source_id").cast(pl.Utf8).str.strip_chars() == "")
+    )
+    if not invalid.is_empty():
+        raise ValueError(
+            "settlements contain a null entitlement date, a non-positive or "
+            "non-finite per-share consideration, or an empty source id"
+        )
+    duplicate = (
+        settlements.group_by([ID_COLUMN, "entitlement_date"])
+        .len()
+        .filter(pl.col("len") > 1)
+    )
+    if not duplicate.is_empty():
+        raise ValueError(
+            "settlements contain duplicate (instrument_id, entitlement_date) keys"
+        )
+
+
+def _validate_tradability_events(events: pl.DataFrame) -> None:
+    """Fail closed on tradability events that break the canonical-state contract."""
+    required = (ID_COLUMN, "published_at", "effective_session", TRADABILITY_STATE_COLUMN)
+    missing = [c for c in required if c not in events.columns]
+    if missing:
+        raise ValueError(f"tradability events missing columns {missing}")
+    invalid = events.filter(
+        pl.col("published_at").is_null()
+        | pl.col("effective_session").is_null()
+        | ~pl.col(TRADABILITY_STATE_COLUMN).is_in(list(TRADABILITY_STATE_VOCABULARY))
+    )
+    if not invalid.is_empty():
+        raise ValueError(
+            "tradability events contain a null timestamp/session or an unknown state"
+        )
+    duplicate = (
+        events.group_by([ID_COLUMN, "published_at"])
+        .len()
+        .filter(pl.col("len") > 1)
+    )
+    if not duplicate.is_empty():
+        raise ValueError(
+            "tradability events contain duplicate (instrument_id, published_at) keys"
+        )
+
+
 def resolve_policy_outcome(
     base_panel: pl.DataFrame,
     calendar: KRXSessionCalendar,
@@ -219,6 +288,8 @@ def resolve_policy_outcome(
     policy: ExecutionOutcomePolicy,
     bar_evidence: pl.DataFrame | None = None,
     unavailable_sessions: set[date] | None = None,
+    tradability_events: pl.DataFrame | None = None,
+    settlements: pl.DataFrame | None = None,
     entry_partition_hash: str | None = None,
     exit_partition_hash: str | None = None,
     corporate_action_keys: set[tuple[str, date]] | None = None,
@@ -233,8 +304,16 @@ def resolve_policy_outcome(
     when omitted the base panel's own ``open`` is used as the verified source.
     ``unavailable_sessions`` marks request dates whose source response was
     unavailable or invalid (``SOURCE_UNAVAILABLE``); a calendar session with no
-    verified bar is ``CONFIRMED_NO_BAR``. ``corporate_action_keys`` marks keys
-    whose exit can only be an unsupported corporate-action settlement.
+    verified bar is ``CONFIRMED_NO_BAR``. ``tradability_events`` is the
+    canonical classified tradability-status frame (see
+    :func:`classify_tradability_events`); a hard-exclusion state effective at
+    the scheduled exit and published no later than the decision session emits
+    the typed ``UNEXECUTABLE_EXIT`` disposition, never a synthetic zero return.
+    ``settlements`` carries official per-share consideration with a declared
+    entitlement date; a verified settlement closes a filled position as
+    ``REALIZED``/``SETTLED_CASH`` from the official consideration only, never
+    from OHLC. ``corporate_action_keys`` marks keys whose exit can only be an
+    unsupported corporate-action settlement.
 
     Returns the outcome-evidence frame with ``OUTCOME_EVIDENCE_COLUMNS``.
     """
@@ -307,6 +386,72 @@ def resolve_policy_outcome(
     entry_open = pl.col("_entry_open")
     exit_open = pl.col("_exit_open")
 
+    # A verified cash settlement closes a filled position from official
+    # per-share consideration at its declared entitlement date; it is never
+    # synthesized from OHLC and only applies when no exit open resolves.
+    settlement_source_id = pl.col("_settlement_source_id")
+    if settlements is not None and not settlements.is_empty():
+        _validate_settlements(settlements)
+        settlement_join = settlements.select(
+            pl.col(ID_COLUMN),
+            pl.col("entitlement_date").cast(pl.Date).alias("scheduled_exit_session"),
+            pl.col("settlement_source_id").alias("_settlement_source_id"),
+        ).unique(subset=[ID_COLUMN, "scheduled_exit_session"])
+        panel = panel.join(
+            settlement_join,
+            on=[ID_COLUMN, "scheduled_exit_session"],
+            how="left",
+        )
+    else:
+        panel = panel.with_columns(pl.lit(None, dtype=pl.Utf8).alias("_settlement_source_id"))
+    settled = (
+        entry_open.is_not_null()
+        & exit_open.is_null()
+        & settlement_source_id.is_not_null()
+    )
+
+    # A hard-exclusion event effective at the scheduled exit and published no
+    # later than the decision session marks an unexecutable exit; an event
+    # published after the decision never modifies that historical decision.
+    unexecutable = pl.lit(False)
+    if tradability_events is not None and not tradability_events.is_empty():
+        _validate_tradability_events(tradability_events)
+        hard = tradability_events.filter(
+            pl.col("tradability_state").is_in(list(HARD_EXCLUSION_STATES))
+        )
+        if not hard.is_empty():
+            excluded_keys = (
+                panel.select(ID_COLUMN, "_session_date", "scheduled_exit_session")
+                .join(
+                    hard.select(
+                        pl.col(ID_COLUMN),
+                        pl.col("effective_session").cast(pl.Date).alias("_eff_session"),
+                        pl.col("published_at").dt.date().alias("_pub_date"),
+                    ),
+                    on=ID_COLUMN,
+                    how="inner",
+                )
+                .filter(
+                    pl.col("_eff_session") <= pl.col("scheduled_exit_session"),
+                    pl.col("_pub_date") <= pl.col("_session_date"),
+                )
+                .select(ID_COLUMN, "_session_date")
+                .unique()
+            )
+            if not excluded_keys.is_empty():
+                key_expr = pl.concat_str(
+                    pl.col(ID_COLUMN).cast(pl.Utf8),
+                    pl.lit("|"),
+                    pl.col("_session_date").cast(pl.Utf8),
+                    separator="",
+                )
+                unexecutable = key_expr.is_in(
+                    [
+                        f"{instrument}|{day.isoformat()}"
+                        for instrument, day in excluded_keys.iter_rows()
+                    ]
+                )
+
     resolution_kind = (
         pl.when(tail)
         .then(pl.lit(RESOLUTION_PARTIAL_TAIL))
@@ -321,8 +466,12 @@ def resolve_policy_outcome(
             .then(pl.lit(RESOLUTION_SCHEDULED_OPEN))
             .otherwise(pl.lit(RESOLUTION_DEFERRED_OPEN))
         )
+        .when(settled)
+        .then(pl.lit(RESOLUTION_SETTLED_CASH))
         .when(unavailable)
         .then(pl.lit(RESOLUTION_SOURCE_UNAVAILABLE))
+        .when(unexecutable)
+        .then(pl.lit(RESOLUTION_UNEXECUTABLE_EXIT))
         .otherwise(pl.lit(RESOLUTION_CONFIRMED_NO_BAR))
     )
     status = (
@@ -332,8 +481,14 @@ def resolve_policy_outcome(
         .then(pl.lit("UNSUPPORTED_CORPORATE_ACTION"))
         .when(entry_open.is_not_null() & exit_open.is_not_null())
         .then(pl.lit("REALIZED"))
+        .when(settled)
+        .then(pl.lit("REALIZED"))
         .when(entry_open.is_null())
         .then(pl.lit("MISSING_ENTRY_PRICE"))
+        .when(unexecutable)
+        .then(pl.lit("UNEXECUTABLE_EXIT"))
+        .when(unavailable)
+        .then(pl.lit("MISSING_EXIT_PRICE"))
         .otherwise(pl.lit("MISSING_EXIT_PRICE"))
     )
     entry_disposition = (
@@ -352,13 +507,25 @@ def resolve_policy_outcome(
         .then(pl.lit(DISPOSITION_FILLED))
         .when(action_key)
         .then(pl.lit(DISPOSITION_UNSUPPORTED_ACTION))
+        .when(settled)
+        .then(pl.lit(DISPOSITION_SETTLED_CASH))
+        .when(unexecutable)
+        .then(pl.lit(DISPOSITION_UNEXECUTABLE_EXIT))
         .when(unavailable)
         .then(pl.lit(DISPOSITION_SOURCE_UNAVAILABLE))
         .otherwise(pl.lit(DISPOSITION_NO_BAR))
     )
 
     actual_entry = pl.when(tail | action_key).then(None).otherwise(pl.col("_entry_actual"))
-    actual_exit = pl.when(tail | action_key).then(None).otherwise(pl.col("_exit_actual"))
+    actual_exit = (
+        pl.when(tail | action_key)
+        .then(None)
+        .when(settled)
+        .then(pl.col("scheduled_exit_session"))
+        .when(unexecutable)
+        .then(None)
+        .otherwise(pl.col("_exit_actual"))
+    )
     label_available = (
         pl.when(actual_exit.is_not_null())
         .then(
@@ -383,7 +550,10 @@ def resolve_policy_outcome(
         status.alias("outcome_status"),
         pl.lit(entry_partition_hash).alias("entry_partition_hash"),
         pl.lit(exit_partition_hash).alias("exit_partition_hash"),
-        pl.lit(corporate_action_event_id).alias("corporate_action_event_id"),
+        pl.when(settled)
+        .then(settlement_source_id)
+        .otherwise(pl.lit(corporate_action_event_id))
+        .alias("corporate_action_event_id"),
         label_available.alias("label_available_time"),
     ).select(*OUTCOME_EVIDENCE_COLUMNS)
 
@@ -486,13 +656,20 @@ class OutcomeEvidenceDatasetResult:
     base_panel_hash: str
 
 
-_UNRESOLVED_STATUSES = ("MISSING_ENTRY_PRICE", "MISSING_EXIT_PRICE", "UNSUPPORTED_CORPORATE_ACTION")
+_UNRESOLVED_STATUSES = (
+    "MISSING_ENTRY_PRICE",
+    "MISSING_EXIT_PRICE",
+    "UNSUPPORTED_CORPORATE_ACTION",
+    "UNEXECUTABLE_EXIT",
+)
 _DISPOSITION_VOCABULARY = (
     DISPOSITION_FILLED,
     DISPOSITION_NO_BAR,
     DISPOSITION_SOURCE_UNAVAILABLE,
     DISPOSITION_TAIL,
     DISPOSITION_UNSUPPORTED_ACTION,
+    DISPOSITION_SETTLED_CASH,
+    DISPOSITION_UNEXECUTABLE_EXIT,
 )
 
 RECONCILIATION_SOURCE_UNAVAILABLE = RESOLUTION_SOURCE_UNAVAILABLE
@@ -522,6 +699,13 @@ CORPORATE_EVENT_COLUMNS = (
     "session",
     "event_kind",
     "corporate_action_event_id",
+)
+
+SETTLEMENT_COLUMNS = (
+    ID_COLUMN,
+    "entitlement_date",
+    "per_share_consideration",
+    "settlement_source_id",
 )
 
 RECONCILIATION_ACTION_COLUMN = "reconciliation_action"
