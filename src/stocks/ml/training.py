@@ -49,6 +49,7 @@ from src.stocks.ml.contracts import (
     RiskSettings,
     policy_portfolio_fingerprint,
 )
+from src.stocks.ml.data import assess_snapshot_outcome_readiness
 from src.stocks.ml.features import (
     apply_model_feature_schema,
     fit_model_feature_schema,
@@ -330,6 +331,29 @@ def train_net_alpha_model(
         return _publish_no_trade(
             registry, request, frame, "integrity-audit-failed",
             details=audit.to_json(),
+            schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+            telemetry=telemetry,
+        )
+
+    readiness = assess_snapshot_outcome_readiness(
+        data, request.candidate_horizon_sessions
+    )
+    telemetry.phase(
+        "snapshot_outcome_readiness",
+        {
+            "passed": readiness.passed,
+            "horizon_count": len(readiness.horizon_results),
+            "unresolved_horizons": [
+                result.horizon_sessions
+                for result in readiness.horizon_results
+                if not result.passed
+            ],
+        },
+    )
+    if not readiness.passed:
+        return _publish_no_trade(
+            registry, request, frame, "snapshot-outcome-readiness-failed",
+            details={"snapshot_outcome_readiness": readiness.to_json()},
             schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
             telemetry=telemetry,
         )

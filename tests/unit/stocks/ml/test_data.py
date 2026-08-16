@@ -272,3 +272,121 @@ def test_horizon_outcome_coverage_fails_closed_on_unclassified_key() -> None:
     )
     with pytest.raises(ValueError, match="absent from the outcome status sidecar"):
         HorizonOutcomeCoverage.build(3, score_keys, status_frame)
+
+
+def _readiness_data():
+    """Composed wide net-alpha data over a readiness-clean fixture panel."""
+    df = stock_net_alpha_composed_df(
+        n_sessions=30, n_tickers=4, audit_clean=True
+    )
+    snapshot = DatasetSnapshot(
+        manifest=stock_net_alpha_manifest(columns=df.columns), frame=df
+    )
+    return compose_net_alpha_training_data(snapshot, _decision_time(), (3, 5))
+
+
+def test_snapshot_outcome_readiness_rejects_historical_unresolved_status() -> None:
+    """SCENARIO_UNRESOLVED_OUTCOME_IS_DIAGNOSTIC: a historical hole fails the report."""
+    from dataclasses import replace
+
+    from src.stocks.ml.contracts import OUTCOME_MISSING_EXIT_PRICE
+    from src.stocks.ml.data import assess_snapshot_outcome_readiness
+
+    data = _readiness_data()
+    sessions = data.feature_frame["session"].unique().sort().to_list()
+    tail = set(sessions[-3:])
+    early = (
+        data.feature_frame.filter(~pl.col("session").is_in(sorted(tail)))
+        .sort("session")
+        .limit(1)
+    )
+    early_id = early["instrument_id"][0]
+    early_session = early["session"][0]
+    broken = data.status_by_horizon[3].with_columns(
+        pl.when(
+            (pl.col("instrument_id") == early_id)
+            & (pl.col("session") == early_session)
+        )
+        .then(pl.lit(OUTCOME_MISSING_EXIT_PRICE))
+        .otherwise(pl.col("outcome_status"))
+        .alias("outcome_status")
+    )
+    data2 = replace(data, status_by_horizon={**data.status_by_horizon, 3: broken})
+    report = assess_snapshot_outcome_readiness(data2, (3, 5))
+    assert not report.passed
+    horizon3 = next(h for h in report.horizon_results if h.horizon_sessions == 3)
+    assert not horizon3.passed
+    assert horizon3.unresolved_status_counts.count(OUTCOME_MISSING_EXIT_PRICE) == 1
+    assert horizon3.earliest_unresolved_session == early_session
+    assert horizon3.realized_rows == horizon3.decision_rows - 1
+    horizon5 = next(h for h in report.horizon_results if h.horizon_sessions == 5)
+    assert horizon5.passed
+    assert report.to_json()["passed"] is False
+    assert len(report.to_json()["horizons"]) == 2
+
+
+def test_snapshot_outcome_readiness_allows_terminal_tail_partial_only() -> None:
+    """Only a PARTIAL_TAIL confined to the chronological terminal suffix passes."""
+    from dataclasses import replace
+
+    from src.stocks.ml.contracts import OUTCOME_PARTIAL_TAIL
+    from src.stocks.ml.data import assess_snapshot_outcome_readiness
+
+    data = _readiness_data()
+    sessions = data.feature_frame["session"].unique().sort().to_list()
+    # The sidecar marks a contiguous suffix: the final horizon sessions plus the
+    # scheduled-entry offset session (entry executes at the next open).
+    suffix = set(sessions[-4:])
+    tail_only = data.status_by_horizon[3].with_columns(
+        pl.when(pl.col("session").is_in(sorted(suffix)))
+        .then(pl.lit(OUTCOME_PARTIAL_TAIL))
+        .otherwise(pl.col("outcome_status"))
+        .alias("outcome_status")
+    )
+    data2 = replace(data, status_by_horizon={**data.status_by_horizon, 3: tail_only})
+    report = assess_snapshot_outcome_readiness(data2, (3,))
+    assert report.passed
+    horizon3 = report.horizon_results[0]
+    assert horizon3.terminal_tail_rows == 16
+    assert horizon3.unresolved_status_counts.to_json() == {}
+
+
+def test_snapshot_outcome_readiness_fails_closed_on_structural_defects() -> None:
+    """Duplicate/unknown/uncovered keys, absent horizons, and bad tails raise."""
+    from dataclasses import replace
+
+    from src.stocks.ml.contracts import OUTCOME_PARTIAL_TAIL
+    from src.stocks.ml.data import assess_snapshot_outcome_readiness
+
+    data = _readiness_data()
+    status3 = data.status_by_horizon[3]
+    status5 = data.status_by_horizon[5]
+
+    duplicated = pl.concat([status3, status3.head(1)])
+    with pytest.raises(ValueError, match="duplicate decision keys"):
+        assess_snapshot_outcome_readiness(
+            replace(data, status_by_horizon={3: duplicated, 5: status5}), (3, 5)
+        )
+
+    unknown = status3.with_columns(pl.lit("BOGUS").alias("outcome_status"))
+    with pytest.raises(ValueError, match="outside the vocabulary"):
+        assess_snapshot_outcome_readiness(
+            replace(data, status_by_horizon={3: unknown, 5: status5}), (3, 5)
+        )
+
+    with pytest.raises(ValueError, match="outcome-status sidecar for horizon 3"):
+        assess_snapshot_outcome_readiness(
+            replace(data, status_by_horizon={5: status5}), (3, 5)
+        )
+
+    sessions = data.feature_frame["session"].unique().sort().to_list()
+    misplaced = status3.with_columns(
+        pl.when(pl.col("session") == sessions[0])
+        .then(pl.lit(OUTCOME_PARTIAL_TAIL))
+        .otherwise(pl.col("outcome_status"))
+        .alias("outcome_status")
+    )
+    with pytest.raises(ValueError, match="impossible terminal-tail layout"):
+        assess_snapshot_outcome_readiness(
+            replace(data, status_by_horizon={3: misplaced, 5: status5}), (3, 5)
+        )

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import cast
 
 import polars as pl
 
@@ -178,6 +179,235 @@ class HorizonOutcomeCoverage:
             "status_counts": self.status_counts.to_json(),
             "segments": [segment.to_json() for segment in self.segment_projection],
         }
+
+
+@dataclass(frozen=True, slots=True)
+class HorizonSnapshotReadiness:
+    """One horizon's bounded historical-outcome readiness result.
+
+    ``decision_rows`` counts every feature decision key for the horizon,
+    ``realized_rows`` the ``REALIZED`` keys, ``terminal_tail_rows`` the keys in
+    the chronological terminal suffix (where a scheduled entry/exit falls beyond
+    the calendar), and ``unresolved_status_counts`` the sorted per-status counts
+    of every other typed state (historical data holes).
+    ``earliest_unresolved_session`` is the chronologically first unresolved
+    decision session.
+    """
+
+    horizon_sessions: int
+    decision_rows: int
+    realized_rows: int
+    terminal_tail_rows: int
+    unresolved_status_counts: OutcomeStatusCounts
+    earliest_unresolved_session: datetime | None
+    passed: bool
+
+    def __post_init__(self) -> None:
+        if self.horizon_sessions < 1:
+            raise ValueError("horizon_sessions must be positive")
+        for name in ("decision_rows", "realized_rows", "terminal_tail_rows"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be non-negative")
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "horizon_sessions": int(self.horizon_sessions),
+            "decision_rows": int(self.decision_rows),
+            "realized_rows": int(self.realized_rows),
+            "terminal_tail_rows": int(self.terminal_tail_rows),
+            "unresolved_status_counts": self.unresolved_status_counts.to_json(),
+            "earliest_unresolved_session": (
+                self.earliest_unresolved_session.isoformat()
+                if self.earliest_unresolved_session is not None
+                else None
+            ),
+            "passed": bool(self.passed),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotOutcomeReadiness:
+    """Immutable snapshot-wide readiness report, one bounded result per horizon."""
+
+    horizon_results: tuple[HorizonSnapshotReadiness, ...]
+    passed: bool
+
+    def __post_init__(self) -> None:
+        if not self.horizon_results:
+            raise ValueError("readiness report requires at least one horizon result")
+        if self.passed != all(result.passed for result in self.horizon_results):
+            raise ValueError(
+                "readiness report passed flag disagrees with the horizon results"
+            )
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "passed": bool(self.passed),
+            "horizons": [result.to_json() for result in self.horizon_results],
+        }
+
+
+def assess_outcome_readiness(
+    decision_keys: pl.DataFrame,
+    status_frame: pl.DataFrame,
+    candidate_horizon_sessions: tuple[int, ...],
+) -> SnapshotOutcomeReadiness:
+    """Vectorized historical-outcome readiness over a raw decision/status spine.
+
+    ``decision_keys`` carries one ``instrument_id``/``session`` row per decision
+    key; ``status_frame`` is the long, ``horizon_sessions``-partitioned
+    outcome-status sidecar. Every key outside the chronological terminal suffix
+    must be ``REALIZED`` and ``PARTIAL_TAIL`` may appear only inside it; every
+    other typed state is a historical unresolved outcome that fails the report.
+    Structural sidecar defects (missing columns, unknown states, duplicate or
+    uncovered keys, absent horizon partitions, or ``PARTIAL_TAIL`` outside the
+    terminal suffix) raise ``ValueError`` and are never converted into an
+    economic verdict.
+    """
+    if not candidate_horizon_sessions:
+        raise ValueError("candidate_horizon_sessions must be non-empty")
+    if tuple(candidate_horizon_sessions) != tuple(
+        sorted(set(candidate_horizon_sessions))
+    ):
+        raise ValueError("candidate_horizon_sessions must be strictly ascending and unique")
+    required_keys = (ID_COLUMN, "session")
+    missing_keys = [c for c in required_keys if c not in decision_keys.columns]
+    if missing_keys:
+        raise ValueError(f"readiness decision keys missing columns {missing_keys}")
+    required_status = (
+        ID_COLUMN,
+        "session",
+        "horizon_sessions",
+        OUTCOME_STATUS_COLUMN,
+    )
+    missing_status = [c for c in required_status if c not in status_frame.columns]
+    if missing_status:
+        raise ValueError(f"readiness status sidecar missing columns {missing_status}")
+
+    keys = decision_keys.select(*required_keys).unique(
+        subset=[ID_COLUMN, "session"], keep="first"
+    )
+    if keys.is_empty():
+        raise ValueError("readiness requires a non-empty decision universe")
+    snapshot_sessions = keys["session"].unique().sort().to_list()
+
+    unknown = status_frame.filter(
+        ~pl.col(OUTCOME_STATUS_COLUMN).is_in(list(OUTCOME_STATUS_VOCABULARY))
+    )
+    if not unknown.is_empty():
+        raise ValueError("readiness status sidecar contains states outside the vocabulary")
+    duplicates = (
+        status_frame.group_by([ID_COLUMN, "session", "horizon_sessions"])
+        .len()
+        .filter(pl.col("len") > 1)
+    )
+    if not duplicates.is_empty():
+        raise ValueError("readiness status sidecar contains duplicate decision keys")
+    missing_horizons = sorted(
+        set(candidate_horizon_sessions)
+        - set(status_frame["horizon_sessions"].unique().to_list())
+    )
+    if missing_horizons:
+        raise ValueError(
+            f"readiness status sidecar lacks horizon partitions {missing_horizons}"
+        )
+
+    tail_ok_statuses = (OUTCOME_REALIZED, OUTCOME_PARTIAL_TAIL)
+    results: list[HorizonSnapshotReadiness] = []
+    for horizon in candidate_horizon_sessions:
+        status_rows = status_frame.filter(pl.col("horizon_sessions") == horizon)
+        projection = keys.join(
+            status_rows.select(*required_status),
+            on=[ID_COLUMN, "session"],
+            how="left",
+        )
+        uncovered = projection.filter(pl.col(OUTCOME_STATUS_COLUMN).is_null())
+        if not uncovered.is_empty():
+            raise ValueError(
+                f"horizon {horizon} decision keys absent from the outcome-status "
+                f"sidecar: {uncovered.height}"
+            )
+        # PARTIAL_TAIL is emitted only where a decision's scheduled entry/exit
+        # falls beyond the calendar, a contiguous chronological suffix. Derive
+        # that suffix from the sidecar; any PARTIAL_TAIL outside it (e.g. in the
+        # middle of history) is an impossible layout.
+        tail_sessions = sorted(
+            projection.filter(pl.col(OUTCOME_STATUS_COLUMN) == OUTCOME_PARTIAL_TAIL)[
+                "session"
+            ]
+            .unique()
+            .to_list()
+        )
+        if tail_sessions:
+            suffix_start = snapshot_sessions.index(tail_sessions[0])
+            expected_suffix = set(snapshot_sessions[suffix_start:])
+            if set(tail_sessions) != expected_suffix:
+                raise ValueError(
+                    f"horizon {horizon} PARTIAL_TAIL keys outside the chronological "
+                    f"terminal suffix (impossible terminal-tail layout)"
+                )
+            in_tail = pl.col("session").is_in(sorted(expected_suffix))
+        else:
+            in_tail = pl.lit(False)
+        projection = projection.with_columns(in_tail.alias("__in_tail"))
+        unresolved = projection.filter(
+            ~pl.col(OUTCOME_STATUS_COLUMN).is_in(list(tail_ok_statuses))
+        )
+        unresolved_counts = _status_counts(unresolved, horizon)
+        assert unresolved_counts is not None
+        results.append(
+            HorizonSnapshotReadiness(
+                horizon_sessions=int(horizon),
+                decision_rows=int(projection.height),
+                realized_rows=int(
+                    projection.filter(
+                        pl.col(OUTCOME_STATUS_COLUMN) == OUTCOME_REALIZED
+                    ).height
+                ),
+                terminal_tail_rows=int(projection.filter(pl.col("__in_tail")).height),
+                unresolved_status_counts=unresolved_counts,
+                earliest_unresolved_session=(
+                    cast(datetime, unresolved["session"].min())
+                    if not unresolved.is_empty()
+                    else None
+                ),
+                passed=unresolved.is_empty(),
+            )
+        )
+    return SnapshotOutcomeReadiness(
+        horizon_results=tuple(results),
+        passed=all(result.passed for result in results),
+    )
+
+
+def assess_snapshot_outcome_readiness(
+    data: NetAlphaResearchData,
+    candidate_horizon_sessions: tuple[int, ...],
+) -> SnapshotOutcomeReadiness:
+    """Composed-data wrapper delegating to :func:`assess_outcome_readiness`.
+
+    Rebuilds the long status sidecar from ``data.status_by_horizon`` and
+    evaluates readiness over the composed decision universe. An absent
+    per-horizon sidecar raises ``ValueError``.
+    """
+    status_frames: list[pl.DataFrame] = []
+    for horizon in candidate_horizon_sessions:
+        status_rows = data.status_by_horizon.get(horizon)
+        if status_rows is None:
+            raise ValueError(
+                f"readiness requires an outcome-status sidecar for horizon {horizon}"
+            )
+        status_frames.append(
+            status_rows.select(ID_COLUMN, "session", OUTCOME_STATUS_COLUMN).with_columns(
+                pl.lit(horizon, dtype=pl.Int64).alias("horizon_sessions")
+            )
+        )
+    status_frame = pl.concat(status_frames)
+    return assess_outcome_readiness(
+        data.feature_frame.select(ID_COLUMN, "session"),
+        status_frame,
+        candidate_horizon_sessions,
+    )
 
 
 def _reject_feature_set(snapshot: DatasetSnapshot) -> None:
