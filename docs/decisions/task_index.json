@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_SNAPSHOT_READINESS_GROWTH_VALIDATION",
+      "date": "2026-08-16",
+      "adr_id": "ADR_20260816_ML_SNAPSHOT_READINESS_GROWTH_VALIDATION",
+      "domain": "ml",
+      "title": "ML snapshot readiness and growth validation",
+      "why": "Provisional ML runs showed positive Rank-IC but all policy paths were rejected by missing realized vintages, making no_trade a data-readiness verdict rather than an economic verdict.",
+      "resolution": "Added vectorized outcome-readiness assessment, fail-closed training gate before OOF, certified-materialization rejection for incomplete outcomes, and regression coverage for unresolved, terminal-tail, and structural status cases.",
+      "impact": "Prevents incomplete historical outcome data from contaminating policy selection; only repaired immutable snapshots can reach existing base/stress and untouched-holdout compounding promotion gates."
+    },
+    {
       "task_id": "TASK_ML_OOF_MEMORY_OPTIMIZATION",
       "date": "2026-08-16",
       "adr_id": "ADR_20260816_ML_OOF_MEMORY_OPTIMIZATION",
