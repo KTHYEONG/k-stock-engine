@@ -676,7 +676,7 @@ def test_evaluate_multi_order_unresolved_vintage_counts_once_by_signature() -> N
 
 
 def test_evaluate_mixed_unresolved_states_preserves_one_vintage_signature() -> None:
-    """A mixed-cause vintage records one deterministic signature."""
+    """A missing entry is unfilled, so only the exit-side cause invalidates."""
     sessions = _span(6)
     scored = _scored(
         [
@@ -710,10 +710,11 @@ def test_evaluate_mixed_unresolved_states_preserves_one_vintage_signature() -> N
 
     evaluation = replay.evaluate(scored, realized, status=status)
 
+    # The MISSING_ENTRY_PRICE order is an unfilled entry (no exposure, no
+    # return), so it never enters the vintage signature; the remaining
+    # MISSING_EXIT_PRICE order still invalidates the vintage.
     assert evaluation.missing_realized_vintage_count == 1
-    assert evaluation.unresolved_outcome_counts == (
-        (("MISSING_ENTRY_PRICE|MISSING_EXIT_PRICE"), 1),
-    )
+    assert evaluation.unresolved_outcome_counts == (("MISSING_EXIT_PRICE", 1),)
 
 
 def test_evaluate_segment_tail_is_partial_and_mature_tail_raises() -> None:
@@ -833,3 +834,110 @@ def test_evaluate_uses_evidence_as_status_projection_when_status_omitted() -> No
     assert len(evaluation.orders) == 6
     assert evaluation.missing_realized_vintage_count == 1
     assert evaluation.unresolved_outcome_counts == (("MISSING_EXIT_PRICE", 1),)
+
+
+def test_evaluate_rejects_duplicate_evidence_keys() -> None:
+    from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
+
+    session = datetime(2024, 1, 2, tzinfo=UTC)
+    scored = _scored([("KRX:00001", session, 0.02)])
+    evidence = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:00001", "KRX:00001"],
+            "session": [session, session],
+            "policy_hash": [SCHEDULED_OPEN_V1.canonical_hash] * 2,
+            "outcome_status": ["REALIZED", "REALIZED"],
+        }
+    )
+    replay = NetAlphaPolicyReplay(3, _PORTFOLIO, _RISK, policy=SCHEDULED_OPEN_V1)
+    with pytest.raises(ValueError, match="duplicate instrument/session keys"):
+        replay.evaluate(scored, realized=None, evidence=evidence)
+
+def _typed_status_projection(
+    scored: pl.DataFrame,
+    *,
+    missing_entry: set[tuple[str, object]] | None = None,
+    missing_exit: set[tuple[str, object]] | None = None,
+) -> pl.DataFrame:
+    """All-REALIZED status projection with explicit typed missing keys."""
+    missing_entry = missing_entry or set()
+    missing_exit = missing_exit or set()
+    rows: list[dict[str, object]] = []
+    for row in scored.select("instrument_id", "session").unique().iter_rows(named=True):
+        key = (str(row["instrument_id"]), row["session"])
+        if key in missing_entry:
+            state = "MISSING_ENTRY_PRICE"
+        elif key in missing_exit:
+            state = "MISSING_EXIT_PRICE"
+        else:
+            state = "REALIZED"
+        rows.append(
+            {
+                "instrument_id": row["instrument_id"],
+                "session": row["session"],
+                "outcome_status": state,
+            }
+        )
+    return pl.DataFrame(
+        rows,
+        schema={
+            "instrument_id": pl.Utf8,
+            "session": pl.Datetime("us", "UTC"),
+            "outcome_status": pl.Utf8,
+        },
+    )
+
+
+def test_missing_entry_is_unfilled_and_missing_exit_invalidates_vintage() -> None:
+    """SCENARIO_REPLAY_NEVER_ZERO_FILLS: unfilled entries leave cash; missing exits invalidate."""
+    sessions = _span(6)
+    scored = _scored(
+        [
+            (f"KRX:{instrument:05d}", session, 0.05 - instrument * 0.001)
+            for session in sessions
+            for instrument in range(2)
+        ]
+    )
+    realized = _realized(
+        [
+            (f"KRX:{instrument:05d}", session, 0.05, 100.0, 1.0e8, 0.02)
+            for session in sessions
+            for instrument in range(2)
+        ]
+    )
+    # Session zero's two orders fail to fill; session two's KRX:00001 has an
+    # entry but no exit. Every other order is REALIZED.
+    missing_entry = {(f"KRX:{i:05d}", sessions[0]) for i in range(2)}
+    missing_exit = {("KRX:00001", sessions[2])}
+    status = _typed_status_projection(
+        scored, missing_entry=missing_entry, missing_exit=missing_exit
+    )
+    replay = NetAlphaPolicyReplay(
+        3, _PORTFOLIO, _RISK, liquidity_model=_LIQUIDITY
+    )
+
+    evaluation = replay.evaluate(scored, realized, status=status)
+
+    # The unfilled-entry vintage deploys nothing and is observed as cash (0.0),
+    # never a missing-realized vintage; the missing-exit vintage is invalidated.
+    assert evaluation.missing_realized_vintage_count == 1
+    assert evaluation.cash_vintage_count == 1
+    assert evaluation.matured_vintage_count == 1
+    assert evaluation.period_count == 2
+    assert evaluation.period_net_returns[0] == 0.0
+    assert len(evaluation.blocks) == 1
+    assert evaluation.unresolved_outcome_counts == (("MISSING_EXIT_PRICE", 1),)
+    assert 0.0 in evaluation.period_net_returns
+    assert evaluation.observed_sessions == 2
+
+    # A panel whose only non-realized orders are unfilled entries never
+    # increments the missing-realized count (contract python_assertion).
+    only_unfilled = replay.evaluate(
+        scored, realized,
+        status=_typed_status_projection(scored, missing_entry=missing_entry),
+    )
+    assert only_unfilled.missing_realized_vintage_count == 0
+    assert only_unfilled.cash_vintage_count == 1
+    assert only_unfilled.matured_vintage_count == 2
+    assert only_unfilled.period_count == 3
+    assert only_unfilled.period_net_returns[0] == 0.0

@@ -509,3 +509,118 @@ def stock_net_alpha_status_frame(
             "outcome_status": pl.Utf8,
         },
     ).sort([ID_COLUMN, SESSION_COLUMN, HORIZON_COLUMN])
+
+
+
+def stock_net_alpha_pinned_df(
+    n_sessions: int = 120,
+    n_tickers: int = 8,
+    candidate_horizon_sessions: tuple[int, ...] = (3, 5, 8, 10, 15, 20),
+    seed: int = 11,
+    audit_clean: bool = True,
+    label_scale: float = 1.0,
+) -> pl.DataFrame:
+    """Deterministic long-format pinned net-alpha composed panel.
+
+    Returns the long, ``horizon_sessions``-partitioned composed frame that the
+    net-alpha repository produces for a snapshot with a pinned outcome-status
+    sidecar and hash-bound outcome evidence: every decision key carries its
+    typed ``outcome_status`` plus the compact ``resolution_kind``/``policy_hash``
+    evidence spine, so ``compose_net_alpha_training_data`` resolves
+    ``status_provenance == "pinned"`` instead of the diagnostic-only
+    legacy-inferred path. Every raw source column is retained per horizon row.
+    """
+    from src.stocks.ml.labels import HORIZON_COLUMN, ID_COLUMN, SESSION_COLUMN
+
+    wide = stock_net_alpha_composed_df(
+        n_sessions=n_sessions,
+        n_tickers=n_tickers,
+        candidate_horizon_sessions=candidate_horizon_sessions,
+        seed=seed,
+        audit_clean=audit_clean,
+        label_scale=label_scale,
+    )
+    decision_time = wide["available_time"].max()
+    statuses = stock_net_alpha_status_frame(
+        wide, candidate_horizon_sessions, decision_time=decision_time
+    )
+    parts: list[pl.DataFrame] = []
+    for horizon in candidate_horizon_sessions:
+        status_rows = statuses.filter(pl.col(HORIZON_COLUMN) == horizon)
+        wide_columns = [
+            column
+            for h in candidate_horizon_sessions
+            for column in (
+                f"net_alpha_{h}d_target",
+                f"label_available_time_{h}d",
+                f"risk_residual_{h}d",
+                f"reference_cost_{h}d",
+            )
+        ]
+        long = (
+            wide.with_columns(
+                pl.lit(horizon, dtype=pl.Int64).alias(HORIZON_COLUMN),
+                pl.col(f"net_alpha_{horizon}d_target").alias("net_alpha_target"),
+                pl.col(f"label_available_time_{horizon}d").alias(
+                    "label_available_time"
+                ),
+                pl.col(f"risk_residual_{horizon}d").alias("risk_residual"),
+                pl.col(f"reference_cost_{horizon}d").alias("reference_cost"),
+                pl.lit(0.0).alias("gross_return"),
+            )
+            .drop(wide_columns)
+            .join(
+                status_rows.select(ID_COLUMN, SESSION_COLUMN, "outcome_status"),
+                on=[ID_COLUMN, SESSION_COLUMN],
+                how="left",
+            )
+            .with_columns(
+                pl.col("outcome_status").fill_null("PARTIAL_TAIL"),
+                pl.when(pl.col("outcome_status") == "REALIZED")
+                .then(pl.lit("SCHEDULED_OPEN"))
+                .when(pl.col("outcome_status") == "PARTIAL_TAIL")
+                .then(pl.lit("PARTIAL_TAIL"))
+                .otherwise(pl.lit("CONFIRMED_NO_BAR"))
+                .alias("resolution_kind"),
+                pl.lit("fixture-policy-hash-v1").alias("policy_hash"),
+            )
+        )
+        parts.append(long)
+    return pl.concat(parts)
+
+def pin_net_alpha_outcome_evidence(data):
+    """Attach a hash-bound outcome-evidence spine to composed research data.
+
+    Builds a deterministic per-key ``(policy_hash, resolution_kind)`` evidence
+    projection from ``data.status_by_horizon`` (``REALIZED`` maps to
+    ``SCHEDULED_OPEN``, ``PARTIAL_TAIL`` to ``PARTIAL_TAIL``, and any other
+    state to ``CONFIRMED_NO_BAR``) and flips ``status_provenance`` to
+    ``pinned``, so fixture training data exercises the snapshot-pinned path
+    instead of the diagnostic-only legacy-inferred spine.
+    """
+    from dataclasses import replace
+    from src.stocks.ml.labels import (
+        HORIZON_COLUMN,
+        ID_COLUMN,
+        SESSION_COLUMN,
+    )
+
+    evidence_by_horizon: dict[int, pl.DataFrame] = {}
+    for horizon, status in data.status_by_horizon.items():
+        evidence_by_horizon[horizon] = status.select(
+            pl.col(ID_COLUMN),
+            pl.col(SESSION_COLUMN),
+            pl.lit(horizon, dtype=pl.Int64).alias(HORIZON_COLUMN),
+            pl.lit("fixture-policy-hash-v1").alias("policy_hash"),
+            pl.when(pl.col("outcome_status") == "REALIZED")
+            .then(pl.lit("SCHEDULED_OPEN"))
+            .when(pl.col("outcome_status") == "PARTIAL_TAIL")
+            .then(pl.lit("PARTIAL_TAIL"))
+            .otherwise(pl.lit("CONFIRMED_NO_BAR"))
+            .alias("resolution_kind"),
+        )
+    return replace(
+        data,
+        evidence_by_horizon=evidence_by_horizon,
+        status_provenance="pinned",
+    )
