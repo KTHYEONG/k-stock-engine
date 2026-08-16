@@ -503,16 +503,23 @@ def _find_test_files(py_files: list[str]) -> list[str]:
             parts = sf.split("/")
             module_name = parts[-1]
             test_name = f"test_{module_name}"
-            for category in ["unit", "integration", "e2e"]:
+            found_direct = False
+            for category in ["unit", "integration", "e2e", "contract"]:
                 sub_path = "/".join(parts[1:-1])
                 td = f"tests/{category}/{sub_path}" if sub_path else f"tests/{category}"
                 tp = f"{td}/{test_name}"
-                if os.path.exists(tp) and tp not in test_files:
-                    test_files.append(tp)
+                if tp in test_files:
+                    found_direct = True
                     break
-            for tp in repository_files:
-                if tp not in test_files and _test_references_source(tp, sf):
+                if os.path.exists(tp):
                     test_files.append(tp)
+                    found_direct = True
+                    break
+            # Wider AST reverse lookup is only used if NO direct test exists for this module
+            if not found_direct:
+                for tp in repository_files:
+                    if tp not in test_files and _test_references_source(tp, sf):
+                        test_files.append(tp)
     return test_files
 
 
@@ -608,6 +615,7 @@ def main() -> None:
                 if "D" not in line[:2]
                 and line[3:].strip().endswith(".py")
                 and not line[3:].strip().startswith("tools/")
+                and not line[3:].strip().endswith("conftest.py")
                 and os.path.exists(line[3:].strip())
             ]
             args.files = git_files
