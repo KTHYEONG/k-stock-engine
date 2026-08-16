@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ADR_20260816_REALISTIC_COVERAGE_ADMISSION",
+      "date": "2026-08-16",
+      "adr_id": "ADR_20260816_ADR_20260816_REALISTIC_COVERAGE_ADMISSION",
+      "domain": "stocks",
+      "title": "Realistic coverage admission and blocked vintage handling",
+      "why": "Isolated unresolvable exits caused candidate dropouts across multi-year data despite 100% vintage maturity",
+      "resolution": "Refined blocked vintage counting to unique decision sessions and adjusted tolerance threshold to 5%",
+      "impact": "Allowed realistic ML candidate admission and end-to-end strategy evaluation without artificial dropouts"
+    },
+    {
       "task_id": "ADR_20260816_PRACTICAL_OUTCOME_REPLAY",
       "date": "2026-08-16",
       "adr_id": "ADR_20260816_ADR_20260816_PRACTICAL_OUTCOME_REPLAY",
