@@ -33,13 +33,14 @@ def pytest_configure(config: Config) -> None:
 
 
 def pytest_sessionfinish(session: object, exitstatus: int) -> None:
-    """Clean up project-local temporary files if all tests passed.
+    """Clean up project-local temporary files.
 
-    On exitstatus == 0 (all tests passed), purged immediately to prevent disk bloating.
-    On exitstatus != 0 (failures or errors), preserved for debugging.
+    Time Complexity: O(N) where N is the number of temporary entries.
+    Space Complexity: O(1) auxiliary space.
     """
     del session
-    if exitstatus == 0 and _TEMP_ROOT.exists():
+    del exitstatus
+    if _TEMP_ROOT.exists():
         import shutil
 
         # Clean all items inside _TEMP_ROOT without removing the root itself

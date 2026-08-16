@@ -1021,23 +1021,65 @@ def _horizon_evidence_frame(
 ) -> pl.DataFrame | None:
     """Extract the hash-bound outcome-evidence projection for one horizon.
 
-    When the composed frame carries the pinned ``resolution_kind``/``policy_hash``
-    evidence spine, the per-horizon rows are extracted directly and every
-    feature key must resolve to an evidence row; otherwise ``None`` is returned
-    and the horizon stays legacy-inferred (diagnostic-only, never promotable).
+    When the composed frame carries the pinned evidence spine, the per-horizon
+    rows retain the full bounded projection (``policy_hash``,
+    ``resolution_kind``, ``outcome_status``, scheduled entry/exit sessions, and
+    entry/exit dispositions) for every feature key; otherwise ``None`` is
+    returned and the horizon stays legacy-inferred (diagnostic-only, never
+    promotable). An absent horizon partition, duplicate evidence keys, or an
+    evidence spine that is unpinned or policy-incompatible raises
+    ``ValueError``.
     """
     if not has_evidence_columns:
         return None
-    evidence_rows = (
-        frame.filter(pl.col("horizon_sessions") == horizon)
-        .select(
-            pl.col(ID_COLUMN),
-            pl.col(_FEATURE_SESSION).alias(_FEATURE_SESSION),
-            pl.col("horizon_sessions"),
-            pl.col("policy_hash"),
-            pl.col("resolution_kind"),
+    horizon_rows = frame.filter(pl.col("horizon_sessions") == horizon)
+    if horizon_rows.is_empty():
+        raise ValueError(
+            f"requested horizon {horizon} has no outcome-evidence partition "
+            "in the composed frame"
         )
-        .drop_nulls()
+    evidence_columns = (
+        ID_COLUMN,
+        _FEATURE_SESSION,
+        "horizon_sessions",
+        "policy_hash",
+        "resolution_kind",
+        OUTCOME_STATUS_COLUMN,
+        "scheduled_entry_session",
+        "scheduled_exit_session",
+        "entry_disposition",
+        "exit_disposition",
+    )
+    missing_evidence = [c for c in evidence_columns if c not in horizon_rows.columns]
+    if missing_evidence:
+        raise ValueError(
+            f"horizon {horizon} outcome-evidence spine missing columns "
+            f"{missing_evidence}"
+        )
+    policy_rows = horizon_rows.filter(pl.col("policy_hash").is_not_null())
+    if policy_rows.is_empty():
+        raise ValueError(f"horizon {horizon} outcome-evidence spine is unpinned")
+    if policy_rows["policy_hash"].n_unique() != 1:
+        raise ValueError(
+            f"horizon {horizon} outcome-evidence spine carries multiple "
+            "policy hashes"
+        )
+    duplicate = (
+        horizon_rows.group_by([ID_COLUMN, _FEATURE_SESSION, "horizon_sessions"])
+        .len()
+        .filter(pl.col("len") > 1)
+    )
+    if not duplicate.is_empty():
+        raise ValueError(
+            f"horizon {horizon} outcome-evidence spine contains duplicate keys"
+        )
+    evidence_rows = (
+        horizon_rows.select(*evidence_columns)
+        .filter(
+            pl.col("policy_hash").is_not_null()
+            & pl.col("resolution_kind").is_not_null()
+            & pl.col(OUTCOME_STATUS_COLUMN).is_not_null()
+        )
         .unique(
             subset=[ID_COLUMN, _FEATURE_SESSION, "horizon_sessions"], keep="first"
         )
@@ -1045,13 +1087,7 @@ def _horizon_evidence_frame(
     resolved = feature_frame.select(
         pl.col(ID_COLUMN), pl.col(_FEATURE_SESSION)
     ).join(
-        evidence_rows.select(
-            pl.col(ID_COLUMN),
-            pl.col(_FEATURE_SESSION),
-            pl.col("horizon_sessions"),
-            pl.col("policy_hash"),
-            pl.col("resolution_kind"),
-        ),
+        evidence_rows,
         on=[ID_COLUMN, _FEATURE_SESSION],
         how="left",
     )

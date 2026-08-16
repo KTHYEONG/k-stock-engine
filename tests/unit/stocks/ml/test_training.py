@@ -920,3 +920,133 @@ def test_training_publishes_data_readiness_no_trade_before_oof(tmp_path: Path) -
     assert phases[-1]["reason"] == "snapshot-outcome-readiness-failed"
     assert "horizon_discovery" not in names
     assert "holdout_lock" not in names
+
+
+def test_scenario_unresolved_outcome_is_diagnostic_no_trade_blockers(tmp_path) -> None:
+    """SCENARIO_UNRESOLVED_OUTCOME_IS_DIAGNOSTIC: blockers surface in no-trade metrics."""
+    from dataclasses import replace
+
+    from src.stocks.data.contracts import DatasetSnapshot
+    from src.stocks.ml.contracts import (
+        CompoundingCertificationSettings,
+        NetAlphaTrainingRequest,
+        RiskSettings,
+    )
+    from src.stocks.ml.data import compose_net_alpha_training_data
+    from src.stocks.ml.features import (
+        apply_model_feature_schema,
+        fit_model_feature_schema,
+        stock_net_alpha_v1_roles,
+    )
+    from src.stocks.ml.replay import BlockedVintage
+    from src.stocks.research.folds import PurgedWalkForward
+    from tests.fixtures.stocks.helpers import (
+        stock_liquidity_model,
+        stock_net_alpha_manifest,
+        stock_net_alpha_pinned_df,
+    )
+
+    df = stock_net_alpha_pinned_df(
+        n_sessions=120, n_tickers=8, audit_clean=True, label_scale=50.0
+    )
+    snapshot = DatasetSnapshot(
+        manifest=stock_net_alpha_manifest(columns=df.columns), frame=df
+    )
+    data = compose_net_alpha_training_data(
+        snapshot, datetime(2024, 12, 31, tzinfo=UTC), (3, 5, 8, 10, 15, 20)
+    )
+    roles = dict(stock_net_alpha_v1_roles())
+    raw = training._index_sessions(data.feature_frame)
+    request = NetAlphaTrainingRequest(
+        artifact_id="na_blockers",
+        fold_count=2,
+        candidate_horizon_sessions=(3, 5, 8, 10, 15, 20),
+        bootstrap_resamples=50,
+        liquidity_model=stock_liquidity_model(),
+        risk=RiskSettings(min_calibration_sessions=10),
+        compounding=CompoundingCertificationSettings(
+            annualization_sessions=40,
+            min_observed_sessions=10,
+            min_active_cohort_fraction=0.1,
+        ),
+    )
+    pre_holdout_raw, _holdout_raw, reason = training._locked_holdout(
+        raw, request=request
+    )
+    assert reason == ""
+    schema = fit_model_feature_schema(pre_holdout_raw, roles)
+    pre_holdout = apply_model_feature_schema(pre_holdout_raw, schema)
+    learner_columns = schema.learner_columns
+    splitter = PurgedWalkForward(
+        n_folds=2,
+        label_horizon_sessions=21,
+        embargo_sessions=5,
+        session_column="session_index",
+        min_train_sessions=40,
+    )
+    folds = splitter.split(pre_holdout)
+
+    discovery = training._build_horizon_evidence(
+        pre_holdout, folds, data, request, learner_columns
+    )
+    if not discovery.evidence:
+        pytest.skip("fixture produced no horizon evidence")
+    primary = discovery.evidence[0].horizon_sessions
+    coverage = discovery.coverage_by_horizon[primary]
+    risk = replace(
+        request.risk,
+        no_trade_band_bps=(
+            5.0
+            if discovery.evidence[0].profile_id == "legacy_overlay_5bps"
+            else 0.0
+        ),
+    )
+    horizon_evidence = data.evidence_by_horizon.get(primary)
+    assert horizon_evidence is not None
+    key = horizon_evidence.row(0, named=True)
+    blocked_evidence = horizon_evidence.with_columns(
+        pl.when(
+            (pl.col("instrument_id") == key["instrument_id"])
+            & (pl.col("session") == key["session"])
+        )
+        .then(pl.lit("MISSING_EXIT_PRICE"))
+        .otherwise(pl.col("outcome_status"))
+        .alias("outcome_status")
+    )
+    base_eval, stress_eval = training._replay_costs(
+        training._discovery_oof(discovery, primary, folds)[0],
+        training._discovery_oof(discovery, primary, folds)[1],
+        request,
+        primary,
+        risk,
+        evidence=blocked_evidence,
+    )
+    assert base_eval.blocked_vintages == stress_eval.blocked_vintages
+    for blocked in base_eval.blocked_vintages:
+        assert isinstance(blocked, BlockedVintage)
+        assert blocked.outcome_status == "MISSING_EXIT_PRICE"
+        json_blocked = blocked.to_json()
+        assert "period_net_returns" not in json_blocked
+        assert "predicted_net_alpha" not in json_blocked
+        assert "net_return" not in json_blocked
+
+    # The frontier projection persists bounded blocker identities, never returns.
+    from src.stocks.ml.training import _policy_frontier_projection
+
+    projection = _policy_frontier_projection(request, discovery, None)
+    assert isinstance(projection["blocked_vintages"], list)
+    assert len(projection["blocked_vintages"]) <= 64
+    assert projection["blocked_vintage_count"] >= 0
+    for blocked in projection["blocked_vintages"]:
+        assert "net_return" not in blocked
+        assert "period_net_returns" not in blocked
+        assert "predicted_net_alpha" not in blocked
+
+    # A candidate with selected blocked exits fails closed with the exact reason.
+    candidate = discovery.evidence[0]
+    unresolved_candidate = replace(
+        candidate, blocked_vintage_count=candidate.blocked_vintage_count or 1
+    )
+    if candidate.blocked_vintage_count == 0:
+        reason = training._coverage_failure_reason(unresolved_candidate, request)
+        assert reason == "selected-exit-unresolved:1"
