@@ -309,6 +309,7 @@ class ResearchDataSnapshot:
     features: CatalogEntry | None
     labels: CatalogEntry | None
     outcome_status: CatalogEntry | None
+    outcome_evidence: CatalogEntry | None
     calendar: CatalogEntry | None
     master: CatalogEntry | None
     corporate_actions: CatalogEntry | None
@@ -349,6 +350,16 @@ class ResearchDataSnapshot:
         """
         return "pinned" if self.outcome_status is not None else "legacy-inferred"
 
+    @property
+    def evidence_provenance(self) -> str:
+        """Pinned vs unpinned outcome-evidence provenance.
+
+        ``pinned`` means the snapshot manifest declares a hash-bound
+        ``OUTCOME_EVIDENCE`` reference alongside the outcome status; without it
+        a status spine cannot classify confirmed no-bars from collection gaps.
+        """
+        return "pinned" if self.outcome_evidence is not None else "unpinned"
+
     def reference(self, kind: CatalogKind) -> CatalogEntry | None:
         for entry in self.manifest.references:
             if entry.kind is kind:
@@ -385,6 +396,7 @@ class SnapshotResolver:
             features=references.get(CatalogKind.FEATURES),
             labels=references.get(CatalogKind.LABELS),
             outcome_status=references.get(CatalogKind.OUTCOME_STATUS),
+            outcome_evidence=references.get(CatalogKind.OUTCOME_EVIDENCE),
             calendar=references.get(CatalogKind.CALENDAR),
             master=references.get(CatalogKind.INSTRUMENT_MASTER),
             corporate_actions=references.get(CatalogKind.CORPORATE_ACTIONS),
@@ -406,6 +418,7 @@ class SnapshotResolver:
             features=references[CatalogKind.FEATURES],
             labels=references[CatalogKind.LABELS],
             outcome_status=references.get(CatalogKind.OUTCOME_STATUS),
+            outcome_evidence=references.get(CatalogKind.OUTCOME_EVIDENCE),
             calendar=references.get(CatalogKind.CALENDAR),
             master=references.get(CatalogKind.INSTRUMENT_MASTER),
             corporate_actions=references.get(CatalogKind.CORPORATE_ACTIONS),

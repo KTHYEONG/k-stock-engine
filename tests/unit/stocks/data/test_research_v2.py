@@ -808,6 +808,9 @@ class TestMaterializeSnapshot:
         assert resolved.outcome_status is not None
         assert resolved.outcome_status.name == "labels_na_outcome_status"
         assert resolved.status_provenance == "pinned"
+        assert resolved.outcome_evidence is not None
+        assert resolved.outcome_evidence.name == "labels_na_outcome_evidence"
+        assert resolved.evidence_provenance == "pinned"
         assert any(
             entry.kind is CatalogKind.OUTCOME_EVIDENCE
             for entry in resolved.manifest.references

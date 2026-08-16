@@ -438,6 +438,11 @@ class NetAlphaResearchData:
     inner-joined into a common universe. ``status_by_horizon`` maps a candidate
     horizon to its typed outcome-status sidecar (one status row per decision
     key), and ``coverage_by_horizon`` the built vectorized outcome coverage.
+    ``evidence_by_horizon`` maps a horizon to its hash-bound outcome-evidence
+    projection carrying ``resolution_kind``/``policy_hash`` per key, which the
+    data-provenance gate uses to distinguish confirmed no-bars from collection
+    gaps. ``status_provenance`` is ``pinned`` when the composed frame carried a
+    snapshot-pinned status/evidence spine and ``legacy-inferred`` otherwise.
     ``join_evidence`` records retained/dropped row counts, decision/realised
     rows, and per-status counts per horizon.
     """
@@ -450,12 +455,18 @@ class NetAlphaResearchData:
     coverage_by_horizon: dict[int, HorizonOutcomeCoverage] = field(
         default_factory=dict
     )
+    evidence_by_horizon: dict[int, pl.DataFrame] = field(default_factory=dict)
+    status_provenance: str = "legacy-inferred"
 
     def __post_init__(self) -> None:
         if self.feature_frame.is_empty():
             raise ValueError("NetAlphaResearchData requires a non-empty feature frame")
         if not self.labels_by_horizon:
             raise ValueError("NetAlphaResearchData requires at least one horizon")
+        if self.status_provenance not in ("pinned", "legacy-inferred"):
+            raise ValueError(
+                "status_provenance must be 'pinned' or 'legacy-inferred'"
+            )
         for horizon, frame in self.labels_by_horizon.items():
             if frame.is_empty():
                 raise ValueError(
@@ -465,6 +476,11 @@ class NetAlphaResearchData:
             if frame.is_empty():
                 raise ValueError(
                     f"NetAlphaResearchData horizon {horizon} status frame is empty"
+                )
+        for horizon, frame in self.evidence_by_horizon.items():
+            if frame.is_empty():
+                raise ValueError(
+                    f"NetAlphaResearchData horizon {horizon} evidence frame is empty"
                 )
 
 

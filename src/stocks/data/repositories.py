@@ -60,6 +60,14 @@ MULTI_HORIZON_LABEL_COLUMNS = tuple(
         f"label_available_time_{h}d",
     )
 )
+OUTCOME_EVIDENCE_FEATURE_SET = "outcome_evidence"
+_OUTCOME_EVIDENCE_PROJECTION = (
+    "instrument_id",
+    "session",
+    HORIZON_COLUMN,
+    "policy_hash",
+    "resolution_kind",
+)
 
 
 def read_provisional_legacy_panel(
@@ -575,6 +583,22 @@ class ResearchDataRepository:
             composed = composed.join(
                 labels, on=join_keys, how="left"
             ).sort(["instrument_id", "session"])
+            evidence = self._read_outcome_evidence(
+                snapshot.outcome_evidence, decision_time, research_range
+            )
+            if evidence is not None and not evidence.is_empty():
+                if HORIZON_COLUMN in labels.columns:
+                    composed = composed.join(
+                        evidence,
+                        on=["instrument_id", "session", HORIZON_COLUMN],
+                        how="left",
+                    ).sort(["instrument_id", "session"])
+                else:
+                    logger.warning(
+                        "snapshot %s pins outcome evidence but its label panel is "
+                        "not long-format; evidence cannot be bound per horizon",
+                        snapshot.manifest.snapshot_id,
+                    )
         else:
             legacy_status_id = f"{snapshot.labels.name}{OUTCOME_STATUS_DATASET_SUFFIX}"
             logger.info(
@@ -645,6 +669,39 @@ class ResearchDataRepository:
             session_start=research_range.start,
             session_end=research_range.end,
             columns=["instrument_id", "session", HORIZON_COLUMN, OUTCOME_STATUS_COLUMN],
+        )
+
+    def _read_outcome_evidence(
+        self,
+        evidence_entry: CatalogEntry | None,
+        decision_time: datetime,
+        research_range: CoverageRange,
+    ) -> pl.DataFrame | None:
+        """Read the declared, hash-checked outcome-evidence artifact, if pinned.
+
+        Reads exactly the OUTCOME_EVIDENCE reference the snapshot manifest
+        declares and verifies its content hash before returning the compact
+        per-key ``(resolution_kind, policy_hash)`` projection. Returns ``None``
+        when no evidence is pinned, in which case confirmed no-bars cannot be
+        distinguished from collection gaps and the snapshot cannot certify.
+        """
+        if evidence_entry is None:
+            return None
+        manifest = self.label_store.read_manifest(evidence_entry.name)
+        _assert_content_hash_matches(manifest, evidence_entry)
+        frame = self.label_store.read_bounded(
+            evidence_entry.name,
+            AssetKind.STOCK,
+            OUTCOME_EVIDENCE_FEATURE_SET,
+            decision_time,
+            session_start=research_range.start,
+            session_end=research_range.end,
+            columns=list(_OUTCOME_EVIDENCE_PROJECTION),
+        )
+        if frame.is_empty():
+            return frame
+        return frame.with_columns(
+            pl.col("session").cast(pl.Datetime("us", "UTC"))
         )
 
     def _validate_status_spine(
