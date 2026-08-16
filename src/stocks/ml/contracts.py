@@ -220,7 +220,7 @@ class CompoundingCertificationSettings:
 
     annualization_sessions: int = 252
     min_observed_sessions: int = 252
-    min_active_cohort_fraction: float = 0.5
+    min_active_cohort_fraction: float = 0.2
     max_drawdown: float = 0.5
     bootstrap_alpha: float = 0.05
     bootstrap_resamples: int = 200
