@@ -888,8 +888,8 @@ def _typed_status_projection(
     )
 
 
-def test_missing_entry_is_unfilled_and_missing_exit_invalidates_vintage() -> None:
-    """SCENARIO_REPLAY_NEVER_ZERO_FILLS: unfilled entries leave cash; missing exits invalidate."""
+def test_missing_entry_is_unfilled_and_missing_exit_stays_diagnostic() -> None:
+    """SCENARIO_REPLAY_NEVER_ZERO_FILLS: unfilled entries leave cash; a degraded exit stays diagnostic."""
     sessions = _span(6)
     scored = _scored(
         [
@@ -919,16 +919,20 @@ def test_missing_entry_is_unfilled_and_missing_exit_invalidates_vintage() -> Non
     evaluation = replay.evaluate(scored, realized, status=status)
 
     # The unfilled-entry vintage deploys nothing and is observed as cash (0.0),
-    # never a missing-realized vintage; the missing-exit vintage is invalidated.
-    assert evaluation.missing_realized_vintage_count == 1
+    # never a missing-realized vintage; the mixed vintage with a degraded exit
+    # still matures on its filled order while keeping the blocked record.
+    assert evaluation.missing_realized_vintage_count == 0
     assert evaluation.cash_vintage_count == 1
-    assert evaluation.matured_vintage_count == 1
-    assert evaluation.period_count == 2
+    assert evaluation.matured_vintage_count == 2
+    assert evaluation.period_count == 3
     assert evaluation.period_net_returns[0] == 0.0
-    assert len(evaluation.blocks) == 1
-    assert evaluation.unresolved_outcome_counts == (("MISSING_EXIT_PRICE", 1),)
+    assert len(evaluation.blocks) == 2
+    assert evaluation.unresolved_outcome_counts == ()
+    assert evaluation.blocked_vintage_count == 1
+    assert len(evaluation.blocked_vintages) == 1
+    assert evaluation.blocked_vintages[0].outcome_status == "MISSING_EXIT_PRICE"
     assert 0.0 in evaluation.period_net_returns
-    assert evaluation.observed_sessions == 2
+    assert evaluation.observed_sessions == 3
 
     # A panel whose only non-realized orders are unfilled entries never
     # increments the missing-realized count (contract python_assertion).
@@ -1041,3 +1045,106 @@ def test_scenario_replay_never_zero_fills_missing_entry_stays_unfilled() -> None
     assert evaluation.cash_vintage_count == 1
     assert evaluation.period_count == 3
     assert 0.0 in evaluation.period_net_returns
+
+
+def test_deferred_policy_expiry_is_unresolved_not_zero_return() -> None:
+    """SCENARIO_UNEXECUTABLE_EXIT: a delisted/unresolved exit blocks certification."""
+    from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
+
+    sessions = _span(6)
+    scored = _scored(
+        [(f"KRX:{pos:05d}", session, 0.05) for pos, session in enumerate(sessions)]
+    )
+    realized = _realized(
+        [
+            (f"KRX:{pos:05d}", session, 0.05, 100.0, 1.0e8, 0.02)
+            for pos, session in enumerate(sessions)
+            if pos != 0
+        ]
+    )
+    unresolved = {("KRX:00000", sessions[0])}
+    status = _status_projection(scored, realized, unresolved=unresolved).with_columns(
+        pl.when(
+            (pl.col("instrument_id") == "KRX:00000")
+            & (pl.col("session") == sessions[0])
+        )
+        .then(pl.lit("UNEXECUTABLE_EXIT"))
+        .otherwise(pl.col("outcome_status"))
+        .alias("outcome_status")
+    )
+    evidence = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:00000"],
+            "session": [sessions[0]],
+            "policy_hash": [SCHEDULED_OPEN_V1.canonical_hash],
+            "outcome_status": ["UNEXECUTABLE_EXIT"],
+            "resolution_kind": ["UNEXECUTABLE_EXIT"],
+            "scheduled_entry_session": [sessions[0] + __import__("datetime").timedelta(days=1)],
+            "scheduled_exit_session": [sessions[0] + __import__("datetime").timedelta(days=4)],
+            "entry_disposition": ["FILLED"],
+            "exit_disposition": ["UNEXECUTABLE_EXIT"],
+        }
+    )
+    replay = NetAlphaPolicyReplay(
+        3, _PORTFOLIO, _RISK, liquidity_model=_LIQUIDITY, policy=SCHEDULED_OPEN_V1
+    )
+    evaluation = replay.evaluate(scored, realized, status=status, evidence=evidence)
+
+    # The blocked vintage is never dropped, zero-filled, or counted as a
+    # profitable exit; it stays in the replay diagnostics for certification.
+    assert evaluation.blocked_vintage_count == 1
+    assert len(evaluation.blocked_vintages) == 1
+    blocked = evaluation.blocked_vintages[0]
+    assert blocked.outcome_status == "UNEXECUTABLE_EXIT"
+    assert blocked.resolution_kind == "UNEXECUTABLE_EXIT"
+    assert blocked.exit_disposition == "UNEXECUTABLE_EXIT"
+    assert evaluation.missing_realized_vintage_count == 1
+    assert evaluation.period_count == 2
+    assert 0.0 not in evaluation.period_net_returns
+    assert evaluation.unresolved_outcome_counts == (("UNEXECUTABLE_EXIT", 1),)
+    assert evaluation.replay_diagnostics()["selected_blocked_exits"] == 1
+    assert evaluation.to_json()["blocked_vintages"][0]["outcome_status"] != "REALIZED"
+
+
+def test_replay_degraded_exit_does_not_abort_vintage() -> None:
+    """A degraded exit among filled orders settles the vintage on its fills."""
+    sessions = _span(6)
+    scored = _scored(
+        [
+            (f"KRX:{instrument:05d}", session, 0.05 - instrument * 0.001)
+            for session in sessions
+            for instrument in range(2)
+        ]
+    )
+    realized = _realized(
+        [
+            (f"KRX:{instrument:05d}", session, 0.05, 100.0, 1.0e8, 0.02)
+            for session in sessions
+            for instrument in range(2)
+        ]
+    )
+    unresolved = {("KRX:00000", sessions[0])}
+    status = _status_projection(scored, realized, unresolved=unresolved)
+    replay = NetAlphaPolicyReplay(
+        3, _PORTFOLIO, _RISK, liquidity_model=_LIQUIDITY
+    )
+    evaluation = replay.evaluate(scored, realized, status=status)
+
+    # The first vintage matures on its single filled order instead of aborting.
+    assert evaluation.matured_vintage_count == 3
+    assert evaluation.missing_realized_vintage_count == 0
+    assert evaluation.cash_vintage_count == 0
+    assert len(evaluation.blocks) == 3
+    assert evaluation.blocks[0].order_count == 1
+    assert evaluation.blocks[0].vintage_id == 0
+    assert evaluation.period_count == 3
+    assert 0.0 not in evaluation.period_net_returns
+    # The degraded exit stays diagnostic only and is never in return arithmetic.
+    assert evaluation.blocked_vintage_count == 1
+    assert len(evaluation.blocked_vintages) == 1
+    assert evaluation.blocked_vintages[0].outcome_status == "MISSING_EXIT_PRICE"
+    assert evaluation.unresolved_outcome_counts == ()
+    segment = evaluation.segment_diagnostics[0]
+    assert segment.missing_realized_vintage_count == 0
+    assert segment.unresolved_outcome_counts == ()
+

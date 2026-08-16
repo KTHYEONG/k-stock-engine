@@ -832,6 +832,7 @@ def build_net_alpha_label_dataset_with_status(
     reference_notional: float,
     policy: ExecutionOutcomePolicy | None = None,
     bar_evidence: pl.DataFrame | None = None,
+    tradability_events: pl.DataFrame | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Build a net-alpha label horizon and its typed outcome-status sidecar.
 
@@ -875,6 +876,7 @@ def build_net_alpha_label_dataset_with_status(
         horizon_sessions=horizon_sessions,
         policy=policy,
         bar_evidence=bar_evidence,
+        tradability_events=tradability_events,
     )
     prices = merge_open_bar_evidence(panel, bar_evidence).select(
         ID_COLUMN,
@@ -1136,7 +1138,8 @@ def build_net_alpha_label_dataset_with_status(
             ("REALIZED", "PARTIAL_TAIL", "MISSING_ENTRY_PRICE",
              "MISSING_EXIT_PRICE", "MISSING_DECISION_INPUT",
              "UNDERSIZED_CROSS_SECTION", "RISK_PROJECTION_FAILED",
-             "ZERO_MAD", "UNSUPPORTED_CORPORATE_ACTION")
+             "ZERO_MAD", "UNSUPPORTED_CORPORATE_ACTION",
+             "UNEXECUTABLE_EXIT")
         )
     )
     if not unknown.is_empty():

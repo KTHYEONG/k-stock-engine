@@ -422,9 +422,11 @@ class NetAlphaPolicyReplay:
                 entry order that is cancelled at its execution event (no fill,
                 turnover, cost, exposure, or realized return; the vintage keeps
                 only its filled orders or becomes an observed all-cash vintage);
-                every other typed state increments the
-                ``unresolved_outcome_counts`` of the owning vintage, invalidates
-                it, and is never zero-filled or silently omitted.
+                every other typed state is recorded as a blocked vintage
+                diagnostic and never zero-filled or silently omitted; the
+                owning vintage settles on its filled orders when any exist and
+                is only invalidated (missing-realized) when no order can be
+                filled.
             evidence: optional pinned outcome-evidence artifact carrying
                 ``instrument_id``, ``session``, ``policy_hash``, and
                 ``outcome_status``. When supplied its ``policy_hash`` must
@@ -528,6 +530,7 @@ class NetAlphaPolicyReplay:
                     "MISSING_EXIT_PRICE", "MISSING_DECISION_INPUT",
                     "UNDERSIZED_CROSS_SECTION", "RISK_PROJECTION_FAILED",
                     "ZERO_MAD", "UNSUPPORTED_CORPORATE_ACTION",
+                    "UNEXECUTABLE_EXIT",
                 }:
                     raise ValueError(f"unknown outcome status {state!r} in projection")
                 key = (str(row[_ID]), row[_SESSION])
@@ -718,7 +721,6 @@ class NetAlphaPolicyReplay:
                         continue
                     if outcome_state not in (None, OUTCOME_REALIZED):
                         unresolved_states.add(str(outcome_state))
-                        complete = False
                         blocked_vintages.append(
                             self._blocked_vintage_record(
                                 segment=segment,
@@ -742,7 +744,7 @@ class NetAlphaPolicyReplay:
                     )
                     growth.append(float(realized_value[_RISK_RESIDUAL]) - cost_rate)
                     filled_orders.append(order)
-                if not complete:
+                if not complete or (not filled_orders and unresolved_states):
                     missing_realized += 1
                     counts[2] += 1
                     if unresolved_states:

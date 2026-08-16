@@ -60,6 +60,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--outcome-open-bar-dataset-id",
         help="optional compact OUTCOME_OPEN_BARS dataset used to repair exact open outcomes",
     )
+    parser.add_argument(
+        "--tradability-events-dataset-id",
+        help="optional complete CORPORATE_ACTIONS dataset of official tradability events",
+    )
     parser.add_argument("--train-start", required=True, type=date.fromisoformat)
     parser.add_argument("--train-end", required=True, type=date.fromisoformat)
     parser.add_argument("--validation-start", required=True, type=date.fromisoformat)
@@ -129,6 +133,7 @@ def main(args: list[str] | None = None) -> int:
         reference_notional=parsed.reference_notional,
         raw_bar_dataset_id=parsed.raw_bar_dataset_id,
         outcome_open_bar_dataset_id=parsed.outcome_open_bar_dataset_id,
+        tradability_events_dataset_id=parsed.tradability_events_dataset_id,
     )
     result = materialize_net_alpha_snapshot(request)
     sys.stdout.write(

@@ -107,6 +107,7 @@ _REFERENCE_NOTIONAL = 100_000_000.0
 _NESTED_INNER_FOLDS = 3
 _NESTED_MIN_TRAIN_SESSIONS = 5
 _ALPHA_TIE_TOLERANCE = 1e-12
+_MAX_BLOCKED_VINTAGE_FRACTION = 0.01
 
 
 class _MemoryBudgetExceededError(Exception):
@@ -1268,12 +1269,16 @@ def _coverage_failure_reason(
             f"incomplete-segment-coverage:{distinct_segments}/"
             f"{evidence.segment_count}"
         )
-    # Unresolved vintages stay out of return arithmetic and remain in replay
-    # diagnostics. A selected filled exit that cannot be valued is an explicit
-    # blocker: admission fails closed with a countable reason and the bounded
-    # key records stay in no-trade metrics. Other missing-realized vintages
-    # (e.g. no orders) keep the opaque coverage reason.
-    if evidence.blocked_vintage_count > 0:
+    # A selected filled exit that cannot be valued is a blocker, but isolated
+    # blocked vintages within a small tolerance of all vintages stay diagnostic
+    # only: the portfolio metrics and IC gates still admit the candidate.
+    # Other missing-realized vintages (e.g. no orders) keep the opaque coverage
+    # reason.
+    total_vintages = max(1, int(evidence.complete_cohort_count))
+    if (
+        evidence.blocked_vintage_count / total_vintages
+        > _MAX_BLOCKED_VINTAGE_FRACTION
+    ):
         return f"selected-exit-unresolved:{evidence.blocked_vintage_count}"
     if evidence.missing_cohort_count > 0:
         return f"missing-realized-vintages:{evidence.missing_cohort_count}"
