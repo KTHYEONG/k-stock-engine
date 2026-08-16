@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ml_backtest_robustness",
+      "date": "2026-08-16",
+      "adr_id": "ADR_20260816_ml_backtest_robustness",
+      "domain": "quant",
+      "title": "ML Backtest & Validation Robustness Redesign",
+      "why": "Fold 0 cold-start starvation and hyper-pessimistic gating collapsed strategy active coverage to 15.68%",
+      "resolution": "Redesigned walk-forward calibration with inner seed ledger, adaptive bucketing, and realistic active coverage threshold",
+      "impact": "Restores fold 0 trading continuity and prevents valid alpha signals from false-positive no-trade drops"
+    },
+    {
       "task_id": "ADR_20260816_REALISTIC_COVERAGE_ADMISSION",
       "date": "2026-08-16",
       "adr_id": "ADR_20260816_ADR_20260816_REALISTIC_COVERAGE_ADMISSION",
