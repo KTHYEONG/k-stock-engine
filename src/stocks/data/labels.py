@@ -30,7 +30,12 @@ from src.core.datasets import (
     make_manifest,
 )
 from src.core.instruments import AssetKind
+from src.stocks.data.outcome_evidence import merge_open_bar_evidence, resolve_policy_outcome
 from src.stocks.data.quality import KRXSessionCalendar
+from src.stocks.domain.execution_policy import (
+    SCHEDULED_OPEN_V1,
+    ExecutionOutcomePolicy,
+)
 from src.stocks.research.labels import RELEVANCE_COLUMN, LabelDefinition
 from src.storage.parquet_datasets import ParquetDatasetStore, canonical_content_hash
 
@@ -825,6 +830,8 @@ def build_net_alpha_label_dataset_with_status(
     *,
     horizon_sessions: int,
     reference_notional: float,
+    policy: ExecutionOutcomePolicy | None = None,
+    bar_evidence: pl.DataFrame | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Build a net-alpha label horizon and its typed outcome-status sidecar.
 
@@ -837,11 +844,18 @@ def build_net_alpha_label_dataset_with_status(
     construction failures ``UNDERSIZED_CROSS_SECTION``, ``RISK_PROJECTION_FAILED``,
     and ``ZERO_MAD``. A key is never silently dropped without a typed state, so
     the outcome evidence remains economically evaluable.
+
+    Entry/exit sessions are resolved under ``policy`` (default
+    ``scheduled_open_v1``): the scheduled policy requires the exact scheduled
+    opens and a deferred policy may use the first verified open no later than
+    its explicit delay bounds. A missing open is never zero-filled,
+    forward-filled, or replaced by another OHLC field.
     """
     if horizon_sessions <= 0:
         raise ValueError("horizon_sessions must be positive")
     if reference_notional <= 0:
         raise ValueError("reference_notional must be positive")
+    policy = policy or SCHEDULED_OPEN_V1
     required = (
         ID_COLUMN,
         SESSION_COLUMN,
@@ -854,72 +868,59 @@ def build_net_alpha_label_dataset_with_status(
     if missing:
         raise ValueError(f"net-alpha label requires base panel columns {missing}")
 
-    sessions = list(calendar.sessions)
-    by_date = {session: index for index, session in enumerate(sessions)}
-    if len(by_date) != len(sessions):
-        raise ValueError("calendar contains duplicate sessions")
-
     panel = base_panel.with_columns(pl.col(SESSION_COLUMN).cast(pl.Date).alias("_session_date"))
-    calendar_frame = pl.DataFrame(
-        {
-            "_session_date": sessions,
-            "_cal_pos": list(range(len(sessions))),
-            "_entry_date": [sessions[p + 1] if p + 1 < len(sessions) else None for p in range(len(sessions))],
-            "_exit_date": [
-                sessions[p + 1 + horizon_sessions]
-                if p + 1 + horizon_sessions < len(sessions)
-                else None
-                for p in range(len(sessions))
-            ],
-        }
+    evidence = resolve_policy_outcome(
+        panel,
+        calendar,
+        horizon_sessions=horizon_sessions,
+        policy=policy,
+        bar_evidence=bar_evidence,
     )
-    panel = panel.join(calendar_frame, on="_session_date", how="left")
-    unknown = panel.filter(pl.col("_cal_pos").is_null() | pl.col("_session_date").is_null())
-    if not unknown.is_empty():
-        raise ValueError("base panel contains non-calendar sessions")
-
-    prices = panel.select(
+    prices = merge_open_bar_evidence(panel, bar_evidence).select(
         ID_COLUMN,
-        pl.col("_session_date").alias("_price_date"),
+        pl.col("price_date").alias("_price_date"),
         pl.col("open"),
     )
-    entries = prices.select(
+    controls = panel.select(
         ID_COLUMN,
-        pl.col("_price_date").alias("_entry_date"),
-        pl.col("open").alias("_entry_open"),
+        pl.col("_session_date").alias("_decision_date"),
+        "sector",
+        "adtv",
+        "market_cap",
+        "beta",
+        "volatility",
+        "open",
     )
-    exits = prices.select(
-        ID_COLUMN,
-        pl.col("_price_date").alias("_exit_date"),
-        pl.col("open").alias("_exit_open"),
-    )
-    panel = (
-        panel.join(entries, on=[ID_COLUMN, "_entry_date"], how="left")
-        .join(exits, on=[ID_COLUMN, "_exit_date"], how="left")
-    )
-    panel = panel.with_columns(
-        pl.when(
-            pl.col("_entry_date").is_null() | pl.col("_exit_date").is_null()
+    entry_prices = prices.rename({"_price_date": "_actual_entry_date", "open": "_entry_open"})
+    exit_prices = prices.rename({"_price_date": "_actual_exit_date", "open": "_exit_open"})
+    joined = (
+        evidence.join(
+            controls,
+            left_on=[ID_COLUMN, "session"],
+            right_on=[ID_COLUMN, "_decision_date"],
+            how="left",
         )
-        .then(pl.lit("PARTIAL_TAIL"))
-        .when(pl.col("_entry_open").is_null())
-        .then(pl.lit("MISSING_ENTRY_PRICE"))
-        .when(pl.col("_exit_open").is_null())
-        .then(pl.lit("MISSING_EXIT_PRICE"))
-        .otherwise(pl.lit(None, dtype=pl.Utf8))
-        .alias("_tail_status")
+        .join(
+            entry_prices,
+            left_on=[ID_COLUMN, "actual_entry_session"],
+            right_on=[ID_COLUMN, "_actual_entry_date"],
+            how="left",
+        )
+        .join(
+            exit_prices,
+            left_on=[ID_COLUMN, "actual_exit_session"],
+            right_on=[ID_COLUMN, "_actual_exit_date"],
+            how="left",
+        )
     )
-    complete = panel.filter(pl.col("_tail_status").is_null())
-    incomplete = panel.filter(pl.col("_tail_status").is_not_null())
+    complete = joined.filter(pl.col("outcome_status") == "REALIZED")
+    incomplete = evidence.filter(pl.col("outcome_status") != "REALIZED")
     gross = pl.col("_exit_open").log() - pl.col("_entry_open").log()
-    complete = complete.with_columns(gross.alias("_gross"))
-    label_available = (
-        pl.col("_exit_date")
-        .dt.combine(pl.lit(_KRX_AVAILABLE_TIME))
-        .dt.replace_time_zone("Asia/Seoul")
-        .dt.convert_time_zone("UTC")
+    complete = complete.with_columns(
+        gross.alias("_gross"),
+        pl.col("label_available_time").alias("_label_available"),
+        pl.col("session").alias("_session_date"),
     )
-    complete = complete.with_columns(label_available.alias("_label_available"))
     panel = complete
 
     suffix = f"{horizon_sessions}d"
@@ -1098,7 +1099,7 @@ def build_net_alpha_label_dataset_with_status(
             {
                 ID_COLUMN: row[ID_COLUMN],
                 SESSION_COLUMN: _as_utc_datetime(row[SESSION_COLUMN]),
-                "outcome_status": row["_tail_status"],
+                "outcome_status": row["outcome_status"],
             }
             for row in incomplete.iter_rows(named=True)
         )

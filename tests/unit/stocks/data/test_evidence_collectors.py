@@ -593,3 +593,159 @@ def test_dart_merge_never_overwrites_different_output(tmp_path) -> None:
     final.write_bytes(original)
     collector.merge_disclosure_partitions(output_dir, date(2024, 1, 1), date(2024, 1, 31), final)
     assert final.read_bytes() == original
+
+
+def _krx_bar_collector(
+    request: Callable[[str, dict[str, str]], dict],
+    *,
+    generated_time: datetime | None = None,
+) -> KRXEvidenceCollector:
+    return KRXEvidenceCollector(
+        request_json=request,
+        generated_time=generated_time or datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+
+def _kospi_bar(symbol: str = "005930") -> dict[str, str]:
+    return {
+        "ISU_SRT_CD": symbol,
+        "ISU_CD": f"KR7{symbol}0001",
+        "TDD_OPNPRC": "70000",
+        "TDD_HGPRC": "71000",
+        "TDD_LWPRC": "69000",
+        "TDD_CLSPRC": "70500",
+        "TRD_VOL": "100000",
+        "TRD_AMT": "7000000000",
+    }
+
+
+def test_krx_daily_bars_are_normalized_and_validated() -> None:
+    def request(endpoint: str, params: dict[str, str]) -> dict:
+        if endpoint.endswith("stk_bydd_trd") and params["basDd"] == "20240102":
+            return {"OutBlock_1": [_kospi_bar()]}
+        return {"OutBlock_1": []}
+
+    collector = _krx_bar_collector(request)
+    bars = collector.collect_daily_bars(date(2024, 1, 2), "KOSPI")
+    assert len(bars) == 1
+    assert bars[0]["instrument_id"] == "KRX:005930"
+    assert bars[0]["price_date"] == "2024-01-02"
+    assert bars[0]["open"] == 70000.0
+    assert bars[0]["market"] == "KOSPI"
+
+
+def test_krx_daily_bars_accept_real_krx_volume_value_fields() -> None:
+    def request(endpoint: str, params: dict[str, str]) -> dict:
+        bar = _kospi_bar()
+        bar["ACC_TRDVOL"] = bar.pop("TRD_VOL")
+        bar["ACC_TRDVAL"] = bar.pop("TRD_AMT")
+        return {"OutBlock_1": [bar]}
+
+    bars = _krx_bar_collector(request).collect_daily_bars(date(2024, 1, 2), "KOSPI")
+    assert bars[0]["volume"] == 100000.0
+    assert bars[0]["trading_value"] == 7000000000.0
+
+
+def test_krx_bar_collection_rejects_invalid_ohlc_ordering() -> None:
+    def request(endpoint: str, params: dict[str, str]) -> dict:
+        return {"OutBlock_1": [{**_kospi_bar(), "TDD_LWPRC": "80000"}]}
+
+    collector = _krx_bar_collector(request)
+    with pytest.raises(EvidenceCollectionError, match="OHLC ordering"):
+        collector.collect_daily_bars(date(2024, 1, 2), "KOSPI")
+
+
+def test_krx_bar_collection_omits_unexecutable_zero_open() -> None:
+    def request(endpoint: str, params: dict[str, str]) -> dict:
+        return {"OutBlock_1": [{**_kospi_bar(), "TDD_OPNPRC": "0"}]}
+
+    collector = _krx_bar_collector(request)
+    assert collector.collect_daily_bars(date(2024, 1, 2), "KOSPI") == []
+
+
+def test_krx_bar_collection_rejects_duplicate_bars() -> None:
+    def request(endpoint: str, params: dict[str, str]) -> dict:
+        return {"OutBlock_1": [_kospi_bar(), _kospi_bar()]}
+
+    collector = _krx_bar_collector(request)
+    with pytest.raises(EvidenceCollectionError, match="duplicate"):
+        collector.collect_daily_bars(date(2024, 1, 2), "KOSPI")
+
+
+def test_krx_bar_partitions_are_resumable_and_idempotent(tmp_path) -> None:
+    def request(endpoint: str, params: dict[str, str]) -> dict:
+        if params["basDd"] != "20240102":
+            return {"OutBlock_1": []}
+        if endpoint.endswith("stk_bydd_trd"):
+            return {"OutBlock_1": [_kospi_bar()]}
+        return {"OutBlock_1": []}
+
+    collector = _krx_bar_collector(request)
+    output_dir = tmp_path / "parts"
+    collector.collect_bar_partitions(output_dir, date(2024, 1, 1), date(2024, 1, 3))
+    assert (output_dir / "dates" / "2024-01-02-KOSPI.json").is_file()
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["dates"]["2024-01-02-KOSPI"]["status"] == "complete"
+
+    def fail_if_called(endpoint: str, params: dict[str, str]) -> dict:
+        raise AssertionError("no KRX request should be made on a rerun")
+
+    rerun = _krx_bar_collector(fail_if_called)
+    rerun.collect_bar_partitions(output_dir, date(2024, 1, 1), date(2024, 1, 3))
+
+
+def test_krx_successful_empty_response_is_a_complete_no_bar_partition(tmp_path) -> None:
+    def request(endpoint: str, params: dict[str, str]) -> dict:
+        return {"OutBlock_1": []}
+
+    collector = _krx_bar_collector(request)
+    output_dir = tmp_path / "parts"
+    collector.collect_bar_partitions(output_dir, date(2024, 1, 1), date(2024, 1, 1))
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["dates"]["2024-01-01-KOSPI"]["status"] == "complete"
+    assert manifest["dates"]["2024-01-01-KOSPI"]["bar_count"] == 0
+    assert manifest["dates"]["2024-01-01-KOSDAQ"]["status"] == "complete"
+
+
+def test_krx_bar_partition_failure_is_recorded_and_never_an_empty_partition(tmp_path) -> None:
+    def request(endpoint: str, params: dict[str, str]) -> dict:
+        if params["basDd"] == "20240102":
+            raise EvidenceCollectionError("KRX transport failure")
+        return {"OutBlock_1": []}
+
+    collector = _krx_bar_collector(request)
+    output_dir = tmp_path / "parts"
+    with pytest.raises(EvidenceCollectionError, match="collection failed"):
+        collector.collect_bar_partitions(output_dir, date(2024, 1, 1), date(2024, 1, 3))
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["dates"]["2024-01-02-KOSPI"]["status"] == "incomplete"
+    assert not (output_dir / "dates" / "2024-01-02-KOSPI.json").exists()
+
+
+def test_krx_bar_merge_and_publish_register_raw_bars_evidence(tmp_path) -> None:
+    from src.stocks.data.catalog import CatalogStore, CatalogKind
+
+    def request(endpoint: str, params: dict[str, str]) -> dict:
+        if params["basDd"] != "20240102":
+            return {"OutBlock_1": []}
+        if endpoint.endswith("stk_bydd_trd"):
+            return {"OutBlock_1": [_kospi_bar()]}
+        return {"OutBlock_1": []}
+
+    collector = _krx_bar_collector(request)
+    output_dir = tmp_path / "parts"
+    collector.collect_bar_partitions(output_dir, date(2024, 1, 1), date(2024, 1, 3))
+    merged = tmp_path / "bars.json"
+    collector.merge_bar_partitions(output_dir, date(2024, 1, 1), date(2024, 1, 3), merged)
+    payload = json.loads(merged.read_text(encoding="utf-8"))
+    assert payload["record_count"] == 1
+
+    entry = collector.publish_bar_dataset(
+        output_dir, date(2024, 1, 1), date(2024, 1, 3), merged,
+        tmp_path / "catalog", "krx-bars-2024-q1",
+    )
+    assert entry.kind is CatalogKind.RAW_BARS
+    assert entry.completeness.value == "complete"
+    assert entry.row_count == 1
+    store = CatalogStore(tmp_path / "catalog")
+    assert store.get(CatalogKind.RAW_BARS, "krx-bars-2024-q1") is not None

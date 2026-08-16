@@ -3,14 +3,16 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
+from src.stocks.data.catalog import CatalogKind, CatalogStore
 from src.stocks.data.evidence_collectors import (
     DartRetryPolicy,
     KRXEvidenceCollector,
     OpenDartEvidenceCollector,
 )
+from src.stocks.data.outcome_open_bars import publish_outcome_open_bar_dataset
 
 
 def main(args: list[str] | None = None) -> int:
@@ -38,6 +40,32 @@ def main(args: list[str] | None = None) -> int:
     calendar_merge.add_argument("--end", required=True, type=date.fromisoformat)
     calendar_merge.add_argument("--input-dir", required=True, type=Path)
     calendar_merge.add_argument("--output", required=True, type=Path)
+
+    bars_resume = subparsers.add_parser("krx-bars-resume")
+    bars_resume.add_argument("--start", required=True, type=date.fromisoformat)
+    bars_resume.add_argument("--end", required=True, type=date.fromisoformat)
+    bars_resume.add_argument("--output-dir", required=True, type=Path)
+    bars_resume.add_argument("--market", choices=("ALL", "KOSPI", "KOSDAQ"), default="ALL")
+
+    bars_merge = subparsers.add_parser("krx-bars-merge")
+    bars_merge.add_argument("--start", required=True, type=date.fromisoformat)
+    bars_merge.add_argument("--end", required=True, type=date.fromisoformat)
+    bars_merge.add_argument("--input-dir", required=True, type=Path)
+    bars_merge.add_argument("--output", required=True, type=Path)
+
+    bars_publish = subparsers.add_parser("krx-bars-publish")
+    bars_publish.add_argument("--start", required=True, type=date.fromisoformat)
+    bars_publish.add_argument("--end", required=True, type=date.fromisoformat)
+    bars_publish.add_argument("--input-dir", required=True, type=Path)
+    bars_publish.add_argument("--output", required=True, type=Path)
+    bars_publish.add_argument("--catalog-root", required=True, type=Path)
+    bars_publish.add_argument("--name", required=True)
+
+    outcome_open = subparsers.add_parser("krx-outcome-open-project")
+    outcome_open.add_argument("--raw-bar-dataset-id", required=True)
+    outcome_open.add_argument("--destination-root", required=True, type=Path)
+    outcome_open.add_argument("--catalog-root", required=True, type=Path)
+    outcome_open.add_argument("--name", required=True)
 
     dart_resume = subparsers.add_parser("dart-disclosures-resume")
     dart_resume.add_argument("--start", required=True, type=date.fromisoformat)
@@ -89,6 +117,43 @@ def main(args: list[str] | None = None) -> int:
         collector.merge_calendar_partitions(
             parsed.input_dir, parsed.start, parsed.end, parsed.output
         )
+    elif parsed.command == "krx-bars-resume":
+        collector = KRXEvidenceCollector()
+        collector.collect_bar_partitions(
+            parsed.output_dir, parsed.start, parsed.end, market=parsed.market
+        )
+    elif parsed.command == "krx-bars-merge":
+        collector = KRXEvidenceCollector()
+        collector.merge_bar_partitions(
+            parsed.input_dir, parsed.start, parsed.end, parsed.output
+        )
+    elif parsed.command == "krx-bars-publish":
+        collector = KRXEvidenceCollector()
+        entry = collector.publish_bar_dataset(
+            parsed.input_dir,
+            parsed.start,
+            parsed.end,
+            parsed.output,
+            parsed.catalog_root,
+            parsed.name,
+        )
+        coverage = (
+            f"{entry.coverage.start}..{entry.coverage.end}"
+            if entry.coverage
+            else "n/a"
+        )
+        sys.stdout.write(
+            f"{entry.name}\t{entry.content_hash}\t{entry.row_count}\t{coverage}\n"
+        )
+    elif parsed.command == "krx-outcome-open-project":
+        raw_bar_entry = CatalogStore(parsed.catalog_root).require(
+            CatalogKind.RAW_BARS, parsed.raw_bar_dataset_id
+        )
+        entry = publish_outcome_open_bar_dataset(
+            raw_bar_entry, parsed.destination_root, parsed.catalog_root, parsed.name,
+            datetime.now(UTC),
+        )
+        sys.stdout.write(f"{entry.name}\t{entry.content_hash}\t{entry.row_count}\n")
     elif parsed.command == "dart-disclosures-resume":
         dart_collector = OpenDartEvidenceCollector()
         dart_collector.collect_disclosure_partitions(

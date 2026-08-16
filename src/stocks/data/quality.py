@@ -285,10 +285,10 @@ class StockDataQualityPolicy:
 
     ``PROVISIONAL`` may be produced from the present source with a numeric-code
     heuristic (a formatting diagnostic only). ``RESEARCH``/``PRODUCTION``
-    require a validated security master, corporate-action coverage, and the
-    reported availability policy hash. The close+1-minute rule produces
-    PROVISIONAL data only; higher tiers require the calendar/availability
-    evidence supplied here.
+    require a validated security master and availability evidence; only
+    ``PRODUCTION`` requires exhaustive corporate-action coverage. The
+    close+1-minute rule produces PROVISIONAL data only; higher tiers require
+    the calendar/availability evidence supplied here.
     """
 
     certification: DatasetCertification = DatasetCertification.PROVISIONAL
@@ -318,7 +318,7 @@ class StockDataQualityPolicy:
         return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
     def requires_action_coverage(self) -> bool:
-        return self.certification is not DatasetCertification.PROVISIONAL
+        return self.certification is DatasetCertification.PRODUCTION
 
 
 @dataclass(frozen=True, slots=True)
@@ -449,16 +449,16 @@ def validate_canonical_stock_panel(
     if missing:
         raise ValueError(f"panel must carry {', '.join(missing)}")
 
-    is_research = policy.certification is not DatasetCertification.PROVISIONAL
-    if is_research and instrument_master is None:
+    requires_certified_inputs = policy.certification is not DatasetCertification.PROVISIONAL
+    if requires_certified_inputs and instrument_master is None:
         raise ValueError(
             f"{policy.certification.value} requires a validated InstrumentMasterSnapshot"
         )
-    if is_research and corporate_actions is None:
+    if policy.requires_action_coverage() and corporate_actions is None:
         raise ValueError(f"{policy.certification.value} requires a CorporateActionSnapshot")
-    if is_research and policy.calendar is None:
+    if requires_certified_inputs and policy.calendar is None:
         raise ValueError(f"{policy.certification.value} requires a KRXSessionCalendar")
-    if is_research:
+    if requires_certified_inputs:
         _validate_feature_availability(frame, policy)
 
     working = frame.with_columns(pl.col("date").cast(pl.Date).alias("session"))

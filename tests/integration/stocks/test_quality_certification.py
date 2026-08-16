@@ -187,6 +187,26 @@ class TestResearchRequiresEvidence:
         assert report["hashes"]["calendar"]
         assert report["hashes"]["actions"]
 
+    def test_research_public_price_curation_does_not_require_action_hash(self, tmp_path) -> None:
+        source = tmp_path / "source"
+        write_source(source)
+
+        result = curate_legacy_feature_panel(
+            source,
+            tmp_path / "datasets",
+            base_request(
+                "krx_research_public_price_v1",
+                certification=DatasetCertification.RESEARCH,
+                calendar_hash="c",
+                cost_source_hash="cost",
+                instrument_master=master_snapshot(),
+                calendar=calendar_snapshot(),
+            ),
+        )
+
+        assert result.manifest.corporate_action_hash == ""
+        assert result.manifest.certification is DatasetCertification.RESEARCH
+
     def test_production_requires_production_gate(self, tmp_path) -> None:
         source = tmp_path / "source"
         write_source(source)
