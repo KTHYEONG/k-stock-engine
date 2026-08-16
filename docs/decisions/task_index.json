@@ -1,6 +1,26 @@
 {
   "tasks": [
     {
+      "task_id": "ADR_20260816_PRACTICAL_OUTCOME_REPLAY",
+      "date": "2026-08-16",
+      "adr_id": "ADR_20260816_ADR_20260816_PRACTICAL_OUTCOME_REPLAY",
+      "domain": "stocks",
+      "title": "Practical outcome replay and validation pipeline",
+      "why": "Prevented pipeline fail-closed aborts on isolated unresolvable exits across multi-year data",
+      "resolution": "Designed active-fill vintage settlement in policy replay and established tolerance-based candidate admission in ML training",
+      "impact": "Secured complete and realistic end-to-end backtesting and ML training outcomes without artificial dropouts"
+    },
+    {
+      "task_id": "TASK_STOCK_MISSING_EXIT_RESOLUTION",
+      "date": "2026-08-16",
+      "adr_id": "ADR_20260816_STOCK_MISSING_EXIT_RESOLUTION",
+      "domain": "execution",
+      "title": "Filled vintage missing-exit resolution",
+      "why": "Filled positions can have no scheduled exit bar because of trading halts, delisting, settlement, or source gaps; substituting prices would bias labels and replay.",
+      "resolution": "Keep exact scheduled opens fail-closed; allow only hash-pinned verified deferred opens or official cash settlements; classify permanent/unresolved exits as UNEXECUTABLE_EXIT, exclude them from labels as censored, and block certified replay instead of dropping or zero-filling selected exposure. Register tradability events using official timestamps for pre-entry hard exclusion.",
+      "impact": "Preserves historical and live financial integrity, prevents look-ahead and synthetic returns, enables valid resumed/settled exits, and keeps no-trade decisions explainable."
+    },
+    {
       "task_id": "MISSING_EXIT_VINTAGE_COMPLETION",
       "date": "2026-08-16",
       "adr_id": "ADR_20260816_MISSING_EXIT_VINTAGE_COMPLETION",
