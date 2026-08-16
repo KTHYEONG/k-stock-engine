@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "MISSING_EXIT_VINTAGE_COMPLETION",
+      "date": "2026-08-16",
+      "adr_id": "ADR_20260816_MISSING_EXIT_VINTAGE_COMPLETION",
+      "domain": "ml",
+      "title": "MISSING_EXIT_PRICE outcome completion and promotion-safe replay",
+      "why": "The readiness gate now distinguishes provenance, but replay still rejected selected filled vintages whose scheduled exits had no verifiable open; the source evidence showed 567 CONFIRMED_NO_BAR rows and no generic source outage.",
+      "resolution": "Specified and wired the evidence-first resolution model: exact backfill only for SOURCE_UNAVAILABLE, independent classification for no-bar/halt/delisting/settlement, immutable deferred execution policies, full evidence propagation into replay, deterministic blocked-vintage diagnostics, and promotion fail-closed semantics without synthetic returns.",
+      "impact": "ML can continue fitting on point-in-time realized labels and publish auditable diagnostics, while backtests and asset-growth promotion proceed only after selected filled exits are fully reconciled under a matching policy hash."
+    },
+    {
       "task_id": "MISSING_EXIT_PRICE_RECOVERY",
       "date": "2026-08-16",
       "adr_id": "ADR_20260816_MISSING_EXIT_PRICE_RECOVERY",
