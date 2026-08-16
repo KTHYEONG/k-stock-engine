@@ -828,7 +828,7 @@ class NetAlphaPolicyReplay:
             blocked_vintages=tuple(
                 sorted(blocked_vintages, key=lambda b: b._sort_key())[:64]
             ),
-            blocked_vintage_count=len(blocked_vintages),
+            blocked_vintage_count=len({b.decision_session for b in blocked_vintages}),
         )
 
     def _blocked_vintage_record(

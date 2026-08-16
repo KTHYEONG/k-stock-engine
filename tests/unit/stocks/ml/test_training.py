@@ -1042,14 +1042,15 @@ def test_scenario_unresolved_outcome_is_diagnostic_no_trade_blockers(tmp_path) -
         assert "period_net_returns" not in blocked
         assert "predicted_net_alpha" not in blocked
 
-    # A candidate with selected blocked exits fails closed with the exact reason.
+    # A candidate whose blocked-vintage ratio exceeds tolerance fails closed.
     candidate = discovery.evidence[0]
-    unresolved_candidate = replace(
-        candidate, blocked_vintage_count=candidate.blocked_vintage_count or 1
-    )
     if candidate.blocked_vintage_count == 0:
-        reason = training._coverage_failure_reason(unresolved_candidate, request)
-        assert reason == "selected-exit-unresolved:1"
+        total = max(1, candidate.complete_cohort_count)
+        dominant = int(total * training._MAX_BLOCKED_VINTAGE_FRACTION) + 1
+        reason = training._coverage_failure_reason(
+            replace(candidate, blocked_vintage_count=dominant), request
+        )
+        assert reason == f"selected-exit-unresolved:{dominant}"
 
 
 def test_coverage_failure_reason_allows_isolated_blocked_vintages() -> None:
@@ -1073,13 +1074,13 @@ def test_coverage_failure_reason_allows_isolated_blocked_vintages() -> None:
         segment_count=2,
         fold_rank_ics=(0.1, 0.2),
     )
-    # 2/400 = 0.5% and 4/400 = 1.0% stay within tolerance and are admitted.
+    # 2/400 = 0.5% and 20/400 = 5.0% stay within tolerance and are admitted.
     isolated = replace(base_evidence, blocked_vintage_count=2)
     assert training._coverage_failure_reason(isolated, request) == ""
-    at_tolerance = replace(base_evidence, blocked_vintage_count=4)
+    at_tolerance = replace(base_evidence, blocked_vintage_count=20)
     assert training._coverage_failure_reason(at_tolerance, request) == ""
-    # 10/400 = 2.5% exceeds the tolerance and still fails closed.
-    dominant = replace(base_evidence, blocked_vintage_count=10)
+    # 21/400 = 5.25% exceeds the tolerance and still fails closed.
+    dominant = replace(base_evidence, blocked_vintage_count=21)
     assert training._coverage_failure_reason(dominant, request).startswith(
         "selected-exit-unresolved:"
     )
