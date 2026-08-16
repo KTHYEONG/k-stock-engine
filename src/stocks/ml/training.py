@@ -351,8 +351,9 @@ def train_net_alpha_model(
         },
     )
     if not readiness.passed:
+        reason = readiness.reason or "snapshot-outcome-readiness-failed"
         return _publish_no_trade(
-            registry, request, frame, "snapshot-outcome-readiness-failed",
+            registry, request, frame, reason,
             details={"snapshot_outcome_readiness": readiness.to_json()},
             schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
             telemetry=telemetry,

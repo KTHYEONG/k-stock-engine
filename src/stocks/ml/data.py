@@ -10,6 +10,7 @@ the typed outcome-status sidecar is mapped to one status per decision key via
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import cast
@@ -18,6 +19,10 @@ import polars as pl
 
 from src.core.datasets import DatasetManifest
 from src.stocks.data.contracts import DatasetSnapshot
+from src.stocks.data.outcome_evidence import (
+    RESOLUTION_CONFIRMED_NO_BAR,
+    RESOLUTION_SOURCE_UNAVAILABLE,
+)
 from src.stocks.ml.contracts import (
     CANONICAL_FEATURE_SET,
     OUTCOME_MISSING_EXIT_PRICE,
@@ -41,6 +46,20 @@ from src.stocks.ml.labels import (
 
 _FEATURE_SESSION = "session"
 _FEATURE_PREFIX = "feature__"
+
+logger = logging.getLogger("stocks.ml.data")
+
+_RESOLUTION_KIND_VALUES = (
+    "SCHEDULED_OPEN",
+    "DEFERRED_OPEN",
+    "CONFIRMED_NO_BAR",
+    "SOURCE_UNAVAILABLE",
+    "VERIFIED_CORPORATE_SETTLEMENT",
+    "UNSUPPORTED_CORPORATE_ACTION",
+    "PARTIAL_TAIL",
+)
+
+OUTCOME_PROVENANCE_UNPINNED = "outcome-provenance-unpinned"
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,15 +202,17 @@ class HorizonOutcomeCoverage:
 
 @dataclass(frozen=True, slots=True)
 class HorizonSnapshotReadiness:
-    """One horizon's bounded historical-outcome readiness result.
+    """One horizon's bounded data-provenance readiness result.
 
     ``decision_rows`` counts every feature decision key for the horizon,
     ``realized_rows`` the ``REALIZED`` keys, ``terminal_tail_rows`` the keys in
-    the chronological terminal suffix (where a scheduled entry/exit falls beyond
-    the calendar), and ``unresolved_status_counts`` the sorted per-status counts
-    of every other typed state (historical data holes).
-    ``earliest_unresolved_session`` is the chronologically first unresolved
-    decision session.
+    the chronological terminal suffix, ``confirmed_no_bar_rows`` the keys whose
+    evidence resolves to a verified structural no-bar (allowed at the data
+    gate, visible but never economic evidence), and
+    ``source_unavailable_rows`` the keys whose source response was unavailable
+    (a hard data gap that fails the gate). ``unresolved_status_counts`` is the
+    sorted per-status counts of every failing unresolved state, and
+    ``earliest_unresolved_session`` the chronologically first such session.
     """
 
     horizon_sessions: int
@@ -201,11 +222,19 @@ class HorizonSnapshotReadiness:
     unresolved_status_counts: OutcomeStatusCounts
     earliest_unresolved_session: datetime | None
     passed: bool
+    confirmed_no_bar_rows: int = 0
+    source_unavailable_rows: int = 0
 
     def __post_init__(self) -> None:
         if self.horizon_sessions < 1:
             raise ValueError("horizon_sessions must be positive")
-        for name in ("decision_rows", "realized_rows", "terminal_tail_rows"):
+        for name in (
+            "decision_rows",
+            "realized_rows",
+            "terminal_tail_rows",
+            "confirmed_no_bar_rows",
+            "source_unavailable_rows",
+        ):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must be non-negative")
 
@@ -215,6 +244,8 @@ class HorizonSnapshotReadiness:
             "decision_rows": int(self.decision_rows),
             "realized_rows": int(self.realized_rows),
             "terminal_tail_rows": int(self.terminal_tail_rows),
+            "confirmed_no_bar_rows": int(self.confirmed_no_bar_rows),
+            "source_unavailable_rows": int(self.source_unavailable_rows),
             "unresolved_status_counts": self.unresolved_status_counts.to_json(),
             "earliest_unresolved_session": (
                 self.earliest_unresolved_session.isoformat()
@@ -227,10 +258,17 @@ class HorizonSnapshotReadiness:
 
 @dataclass(frozen=True, slots=True)
 class SnapshotOutcomeReadiness:
-    """Immutable snapshot-wide readiness report, one bounded result per horizon."""
+    """Immutable snapshot-wide data-provenance report, one result per horizon.
+
+    ``reason`` carries the deterministic no-trade reason when the whole report
+    fails the provenance gate before any horizon classification, e.g.
+    ``outcome-provenance-unpinned`` for a legacy-inferred status spine without
+    a hash-bound outcome-evidence reference.
+    """
 
     horizon_results: tuple[HorizonSnapshotReadiness, ...]
     passed: bool
+    reason: str = ""
 
     def __post_init__(self) -> None:
         if not self.horizon_results:
@@ -239,10 +277,13 @@ class SnapshotOutcomeReadiness:
             raise ValueError(
                 "readiness report passed flag disagrees with the horizon results"
             )
+        if self.reason and self.passed:
+            raise ValueError("a passed readiness report cannot carry a failure reason")
 
     def to_json(self) -> dict[str, object]:
         return {
             "passed": bool(self.passed),
+            "reason": self.reason,
             "horizons": [result.to_json() for result in self.horizon_results],
         }
 
@@ -251,18 +292,24 @@ def assess_outcome_readiness(
     decision_keys: pl.DataFrame,
     status_frame: pl.DataFrame,
     candidate_horizon_sessions: tuple[int, ...],
+    *,
+    evidence: pl.DataFrame | None = None,
 ) -> SnapshotOutcomeReadiness:
-    """Vectorized historical-outcome readiness over a raw decision/status spine.
+    """Vectorized data-provenance readiness over a raw decision/status spine.
 
     ``decision_keys`` carries one ``instrument_id``/``session`` row per decision
     key; ``status_frame`` is the long, ``horizon_sessions``-partitioned
-    outcome-status sidecar. Every key outside the chronological terminal suffix
-    must be ``REALIZED`` and ``PARTIAL_TAIL`` may appear only inside it; every
-    other typed state is a historical unresolved outcome that fails the report.
-    Structural sidecar defects (missing columns, unknown states, duplicate or
-    uncovered keys, absent horizon partitions, or ``PARTIAL_TAIL`` outside the
-    terminal suffix) raise ``ValueError`` and are never converted into an
-    economic verdict.
+    outcome-status sidecar. When the hash-bound ``evidence`` projection
+    (``instrument_id``, ``session``, ``horizon_sessions``, ``policy_hash``,
+    ``resolution_kind``) is supplied, a key whose evidence resolves to
+    ``CONFIRMED_NO_BAR`` is a verified structural no-bar: it stays visible to
+    execution replay and never fails this data gate, while ``SOURCE_UNAVAILABLE``
+    or any other unresolved state (unsupported action, unproven key) fails it.
+    Without evidence the gate is strict: every non-terminal unresolved key must
+    be ``REALIZED``. Structural sidecar defects (missing columns, unknown states,
+    duplicate or uncovered keys, absent horizon partitions, malformed evidence,
+    or ``PARTIAL_TAIL`` outside the terminal suffix) raise ``ValueError`` and
+    are never converted into an economic verdict.
     """
     if not candidate_horizon_sessions:
         raise ValueError("candidate_horizon_sessions must be non-empty")
@@ -312,6 +359,29 @@ def assess_outcome_readiness(
             f"readiness status sidecar lacks horizon partitions {missing_horizons}"
         )
 
+    evidence_by_horizon: pl.DataFrame | None = None
+    if evidence is not None and not evidence.is_empty():
+        required_evidence = (
+            ID_COLUMN,
+            "session",
+            "horizon_sessions",
+            "policy_hash",
+            "resolution_kind",
+        )
+        missing_evidence = [c for c in required_evidence if c not in evidence.columns]
+        if missing_evidence:
+            raise ValueError(
+                f"readiness outcome evidence missing columns {missing_evidence}"
+            )
+        unknown_kind = evidence.filter(
+            ~pl.col("resolution_kind").is_in(list(_RESOLUTION_KIND_VALUES))
+        )
+        if not unknown_kind.is_empty():
+            raise ValueError(
+                "readiness outcome evidence contains unknown resolution kinds"
+            )
+        evidence_by_horizon = evidence
+
     tail_ok_statuses = (OUTCOME_REALIZED, OUTCOME_PARTIAL_TAIL)
     results: list[HorizonSnapshotReadiness] = []
     for horizon in candidate_horizon_sessions:
@@ -350,9 +420,24 @@ def assess_outcome_readiness(
         else:
             in_tail = pl.lit(False)
         projection = projection.with_columns(in_tail.alias("__in_tail"))
-        unresolved = projection.filter(
-            ~pl.col(OUTCOME_STATUS_COLUMN).is_in(list(tail_ok_statuses))
-        )
+
+        not_ok = ~pl.col(OUTCOME_STATUS_COLUMN).is_in(list(tail_ok_statuses))
+        confirmed_no_bar = pl.lit(False)
+        source_unavailable = pl.lit(False)
+        if evidence_by_horizon is not None:
+            horizon_evidence = evidence_by_horizon.filter(
+                pl.col("horizon_sessions") == horizon
+            ).select(ID_COLUMN, "session", "resolution_kind")
+            projection = projection.join(
+                horizon_evidence, on=[ID_COLUMN, "session"], how="left"
+            )
+            confirmed_no_bar = (
+                pl.col("resolution_kind") == RESOLUTION_CONFIRMED_NO_BAR
+            ).fill_null(False)
+            source_unavailable = (
+                pl.col("resolution_kind") == RESOLUTION_SOURCE_UNAVAILABLE
+            ).fill_null(False)
+        unresolved = projection.filter(not_ok & ~confirmed_no_bar)
         unresolved_counts = _status_counts(unresolved, horizon)
         assert unresolved_counts is not None
         results.append(
@@ -372,6 +457,16 @@ def assess_outcome_readiness(
                     else None
                 ),
                 passed=unresolved.is_empty(),
+                confirmed_no_bar_rows=(
+                    int(projection.filter(not_ok & confirmed_no_bar).height)
+                    if evidence_by_horizon is not None
+                    else 0
+                ),
+                source_unavailable_rows=(
+                    int(projection.filter(not_ok & source_unavailable).height)
+                    if evidence_by_horizon is not None
+                    else 0
+                ),
             )
         )
     return SnapshotOutcomeReadiness(
@@ -386,8 +481,13 @@ def assess_snapshot_outcome_readiness(
 ) -> SnapshotOutcomeReadiness:
     """Composed-data wrapper delegating to :func:`assess_outcome_readiness`.
 
-    Rebuilds the long status sidecar from ``data.status_by_horizon`` and
-    evaluates readiness over the composed decision universe. An absent
+    Rebuilds the long status sidecar and the long outcome-evidence projection
+    from ``data.status_by_horizon`` / ``data.evidence_by_horizon`` and evaluates
+    the data-provenance gate over the composed decision universe. A
+    legacy-inferred spine (``data.status_provenance == "legacy-inferred"``) has
+    no hash-bound evidence to distinguish confirmed no-bars from collection
+    gaps: it fails the gate with ``outcome-provenance-unpinned`` and stays
+    diagnostic-only, exactly like the legacy ``run8`` snapshot. An absent
     per-horizon sidecar raises ``ValueError``.
     """
     status_frames: list[pl.DataFrame] = []
@@ -403,10 +503,135 @@ def assess_snapshot_outcome_readiness(
             )
         )
     status_frame = pl.concat(status_frames)
-    return assess_outcome_readiness(
+
+    evidence_frames: list[pl.DataFrame] = []
+    for horizon in candidate_horizon_sessions:
+        evidence_rows = data.evidence_by_horizon.get(horizon)
+        if evidence_rows is not None and not evidence_rows.is_empty():
+            evidence_frames.append(
+                evidence_rows.select(
+                    ID_COLUMN, "session", "policy_hash", "resolution_kind"
+                ).with_columns(pl.lit(horizon, dtype=pl.Int64).alias("horizon_sessions"))
+            )
+    evidence = (
+        pl.concat(evidence_frames)
+        if evidence_frames
+        else pl.DataFrame(
+            schema={
+                ID_COLUMN: pl.Utf8,
+                "session": pl.Datetime("us", "UTC"),
+                "policy_hash": pl.Utf8,
+                "resolution_kind": pl.Utf8,
+                "horizon_sessions": pl.Int64,
+            }
+        )
+    )
+
+    if (
+        data.status_provenance != "pinned"
+        or not evidence_frames
+        or len(evidence_frames) != len(candidate_horizon_sessions)
+    ):
+        logger.warning(
+            "snapshot outcome provenance is %s (status pinned=%s, evidence "
+            "horizons=%d/%d); publishing %s",
+            data.status_provenance,
+            data.status_provenance == "pinned",
+            len(evidence_frames),
+            len(candidate_horizon_sessions),
+            OUTCOME_PROVENANCE_UNPINNED,
+        )
+        return _unpinned_provenance_readiness(
+            data.feature_frame.select(ID_COLUMN, "session"),
+            status_frame,
+            candidate_horizon_sessions,
+            reason=OUTCOME_PROVENANCE_UNPINNED,
+        )
+    readiness = assess_outcome_readiness(
         data.feature_frame.select(ID_COLUMN, "session"),
         status_frame,
         candidate_horizon_sessions,
+        evidence=evidence,
+    )
+    return readiness
+
+
+def _unpinned_provenance_readiness(
+    decision_keys: pl.DataFrame,
+    status_frame: pl.DataFrame,
+    candidate_horizon_sessions: tuple[int, ...],
+    *,
+    reason: str,
+) -> SnapshotOutcomeReadiness:
+    """Diagnostic-only report for a legacy-inferred spine (never promotable).
+
+    Reuses the structural validation and the terminal-tail layout check of
+    :func:`assess_outcome_readiness` without evidence, then marks every horizon
+    failed with the deterministic provenance reason. The unresolved counts stay
+    diagnostic; the report can never pass.
+    """
+    snapshot_sessions = sorted(decision_keys["session"].unique().to_list())
+    tail_ok_statuses = (OUTCOME_REALIZED, OUTCOME_PARTIAL_TAIL)
+    results: list[HorizonSnapshotReadiness] = []
+    for horizon in candidate_horizon_sessions:
+        required = (ID_COLUMN, "session", "horizon_sessions", OUTCOME_STATUS_COLUMN)
+        status_rows = status_frame.filter(pl.col("horizon_sessions") == horizon)
+        projection = decision_keys.select(ID_COLUMN, "session").unique(
+            subset=[ID_COLUMN, "session"], keep="first"
+        ).join(
+            status_rows.select(*required),
+            on=[ID_COLUMN, "session"],
+            how="left",
+        )
+        uncovered = projection.filter(pl.col(OUTCOME_STATUS_COLUMN).is_null())
+        if not uncovered.is_empty():
+            raise ValueError(
+                f"horizon {horizon} decision keys absent from the outcome-status "
+                f"sidecar: {uncovered.height}"
+            )
+        tail_sessions = sorted(
+            projection.filter(pl.col(OUTCOME_STATUS_COLUMN) == OUTCOME_PARTIAL_TAIL)[
+                "session"
+            ]
+            .unique()
+            .to_list()
+        )
+        if tail_sessions:
+            suffix_start = snapshot_sessions.index(tail_sessions[0])
+            expected_suffix = set(snapshot_sessions[suffix_start:])
+            if set(tail_sessions) != expected_suffix:
+                raise ValueError(
+                    f"horizon {horizon} PARTIAL_TAIL keys outside the chronological "
+                    f"terminal suffix (impossible terminal-tail layout)"
+                )
+        unresolved = projection.filter(
+            ~pl.col(OUTCOME_STATUS_COLUMN).is_in(list(tail_ok_statuses))
+        )
+        unresolved_counts = _status_counts(unresolved, horizon)
+        assert unresolved_counts is not None
+        results.append(
+            HorizonSnapshotReadiness(
+                horizon_sessions=int(horizon),
+                decision_rows=int(projection.height),
+                realized_rows=int(
+                    projection.filter(
+                        pl.col(OUTCOME_STATUS_COLUMN) == OUTCOME_REALIZED
+                    ).height
+                ),
+                terminal_tail_rows=len(tail_sessions),
+                unresolved_status_counts=unresolved_counts,
+                earliest_unresolved_session=(
+                    cast(datetime, unresolved["session"].min())
+                    if not unresolved.is_empty()
+                    else None
+                ),
+                passed=False,
+            )
+        )
+    return SnapshotOutcomeReadiness(
+        horizon_results=tuple(results),
+        passed=False,
+        reason=reason,
     )
 
 
@@ -464,10 +689,15 @@ def compose_net_alpha_training_data(
     # New labels are stored in one long, horizon-partitioned table.  Keep the
     # legacy wide-column fallback for already materialized snapshots.
     long_format = "horizon_sessions" in frame.columns and "net_alpha_target" in frame.columns
+    label_columns: list[str]
     if long_format:
         label_columns = [
-            "horizon_sessions", "net_alpha_target", "label_available_time",
-            "gross_return", "risk_residual", "reference_cost",
+            column
+            for column in (
+                "horizon_sessions", "net_alpha_target", "label_available_time",
+                "gross_return", "risk_residual", "reference_cost",
+            )
+            if column in frame.columns
         ]
     else:
         label_columns = [
@@ -479,6 +709,13 @@ def compose_net_alpha_training_data(
         ]
     if OUTCOME_STATUS_COLUMN in frame.columns:
         label_columns = [*label_columns, OUTCOME_STATUS_COLUMN]
+    has_evidence_columns = (
+        "resolution_kind" in frame.columns
+        and "policy_hash" in frame.columns
+        and "horizon_sessions" in frame.columns
+    )
+    if has_evidence_columns:
+        label_columns = [*label_columns, "resolution_kind", "policy_hash"]
     feature_frame = frame.drop(label_columns)
     if long_format:
         # The long label join repeats each feature row once per horizon.  The
@@ -530,6 +767,7 @@ def compose_net_alpha_training_data(
 
     labels_by_horizon: dict[int, pl.DataFrame] = {}
     status_by_horizon: dict[int, pl.DataFrame] = {}
+    evidence_by_horizon: dict[int, pl.DataFrame] = {}
     join_evidence: list[HorizonJoinEvidence] = []
     has_status_column = OUTCOME_STATUS_COLUMN in frame.columns
     for horizon in candidate_horizon_sessions:
@@ -537,13 +775,19 @@ def compose_net_alpha_training_data(
             subset = frame.filter(pl.col("horizon_sessions") == horizon)
             if subset.is_empty():
                 continue
-            label_frame = subset.select(
-                pl.col(ID_COLUMN), pl.col(_FEATURE_SESSION),
+            label_select: list[pl.Expr] = [
+                pl.col(ID_COLUMN),
+                pl.col(_FEATURE_SESSION),
                 pl.col("net_alpha_target").alias(TARGET_COLUMN),
                 pl.col("label_available_time").alias(AVAILABLE_COLUMN),
-                pl.col("risk_residual").alias(RISK_RESIDUAL_COLUMN),
-                pl.col("reference_cost").alias(REFERENCE_COST_COLUMN),
-            )
+            ]
+            if "risk_residual" in subset.columns:
+                label_select.append(pl.col("risk_residual").alias(RISK_RESIDUAL_COLUMN))
+            if "reference_cost" in subset.columns:
+                label_select.append(
+                    pl.col("reference_cost").alias(REFERENCE_COST_COLUMN)
+                )
+            label_frame = subset.select(label_select)
             feature_rows = frame.filter(pl.col("horizon_sessions") == horizon).height
         else:
             target_column = _target_column(frame.columns, horizon)
@@ -586,6 +830,11 @@ def compose_net_alpha_training_data(
         )
         if status_frame is not None:
             status_by_horizon[horizon] = status_frame
+        evidence_frame = _horizon_evidence_frame(
+            frame, feature_frame, horizon, has_evidence_columns
+        )
+        if evidence_frame is not None:
+            evidence_by_horizon[horizon] = evidence_frame
         if joined.is_empty():
             join_evidence.append(
                 HorizonJoinEvidence(
@@ -645,6 +894,10 @@ def compose_net_alpha_training_data(
         join_evidence=tuple(join_evidence),
         status_by_horizon=status_by_horizon,
         coverage_by_horizon=coverage_by_horizon,
+        evidence_by_horizon=evidence_by_horizon,
+        status_provenance=(
+            "pinned" if has_status_column and has_evidence_columns else "legacy-inferred"
+        ),
     )
 
 
@@ -758,6 +1011,60 @@ def _horizon_status_frame(
         pl.col(_FEATURE_SESSION).alias(_FEATURE_SESSION),
         pl.col(OUTCOME_STATUS_COLUMN),
     )
+
+
+def _horizon_evidence_frame(
+    frame: pl.DataFrame,
+    feature_frame: pl.DataFrame,
+    horizon: int,
+    has_evidence_columns: bool,
+) -> pl.DataFrame | None:
+    """Extract the hash-bound outcome-evidence projection for one horizon.
+
+    When the composed frame carries the pinned ``resolution_kind``/``policy_hash``
+    evidence spine, the per-horizon rows are extracted directly and every
+    feature key must resolve to an evidence row; otherwise ``None`` is returned
+    and the horizon stays legacy-inferred (diagnostic-only, never promotable).
+    """
+    if not has_evidence_columns:
+        return None
+    evidence_rows = (
+        frame.filter(pl.col("horizon_sessions") == horizon)
+        .select(
+            pl.col(ID_COLUMN),
+            pl.col(_FEATURE_SESSION).alias(_FEATURE_SESSION),
+            pl.col("horizon_sessions"),
+            pl.col("policy_hash"),
+            pl.col("resolution_kind"),
+        )
+        .drop_nulls()
+        .unique(
+            subset=[ID_COLUMN, _FEATURE_SESSION, "horizon_sessions"], keep="first"
+        )
+    )
+    resolved = feature_frame.select(
+        pl.col(ID_COLUMN), pl.col(_FEATURE_SESSION)
+    ).join(
+        evidence_rows.select(
+            pl.col(ID_COLUMN),
+            pl.col(_FEATURE_SESSION),
+            pl.col("horizon_sessions"),
+            pl.col("policy_hash"),
+            pl.col("resolution_kind"),
+        ),
+        on=[ID_COLUMN, _FEATURE_SESSION],
+        how="left",
+    )
+    missing = resolved.filter(
+        pl.col("policy_hash").is_null() | pl.col("resolution_kind").is_null()
+    )
+    if not missing.is_empty():
+        raise ValueError(
+            f"horizon {horizon} feature keys absent from the outcome-evidence "
+            f"spine: {missing.height} keys; the decision universe is not fully "
+            "classified"
+        )
+    return evidence_rows
 
 
 def _status_counts(

@@ -14,6 +14,7 @@ from src.stocks.data.outcome_evidence import (
     RESOLUTION_SCHEDULED_OPEN,
     RESOLUTION_SOURCE_UNAVAILABLE,
     RESOLUTION_UNSUPPORTED_CORPORATE_ACTION,
+    build_outcome_recovery_report,
     build_outcome_status_sidecar,
     build_partitioned_outcome_evidence,
     publish_outcome_evidence_dataset,
@@ -285,3 +286,99 @@ def test_rejects_non_calendar_decision_sessions() -> None:
     )
     with pytest.raises(ValueError, match="non-calendar sessions"):
         resolve_policy_outcome(bad, _calendar(), horizon_sessions=1, policy=SCHEDULED_OPEN_V1)
+
+
+def test_build_outcome_recovery_report_classifies_and_groups() -> None:
+    """Acceptance 2: SOURCE_UNAVAILABLE is backfill work, no-bar is structural."""
+    unavailable = {date(2024, 1, 5)}
+    source_unavailable = resolve_policy_outcome(
+        _base(missing_open_sessions={4}),
+        _calendar(),
+        horizon_sessions=3,
+        policy=SCHEDULED_OPEN_V1,
+        unavailable_sessions=unavailable,
+    )
+    confirmed_no_bar = resolve_policy_outcome(
+        _base(missing_open_sessions={5}),
+        _calendar(),
+        horizon_sessions=3,
+        policy=SCHEDULED_OPEN_V1,
+    )
+    unsupported_action = resolve_policy_outcome(
+        _base(),
+        _calendar(),
+        horizon_sessions=3,
+        policy=SCHEDULED_OPEN_V1,
+        corporate_action_keys={("KRX:00001", date(2024, 1, 3))},
+    )
+    evidence = pl.concat(
+        [source_unavailable, confirmed_no_bar, unsupported_action]
+    ).sort(["instrument_id", "session", "horizon_sessions"])
+
+    report = build_outcome_recovery_report(evidence, (3,))
+
+    # Session index 4 feeds the scheduled exit of decision session 0 and the
+    # scheduled entry of decision session 3, so both legs are recoverable
+    # backfill; session index 5 likewise yields two confirmed no-bars.
+    assert report.recoverable_backfill_count == 2
+    assert report.confirmed_no_bar_count == 2
+    assert report.unsupported_corporate_action_count == 1
+    rows = report.rows
+    assert set(rows["resolution_kind"].unique().to_list()) == {
+        RESOLUTION_SOURCE_UNAVAILABLE,
+        RESOLUTION_CONFIRMED_NO_BAR,
+        RESOLUTION_UNSUPPORTED_CORPORATE_ACTION,
+    }
+    unavailable_rows = rows.filter(
+        pl.col("resolution_kind") == RESOLUTION_SOURCE_UNAVAILABLE
+    )
+    assert unavailable_rows["count"].sum() == report.recoverable_backfill_count
+    unavailable_row = unavailable_rows.filter(
+        pl.col("scheduled_exit_session") == date(2024, 1, 5)
+    ).row(0, named=True)
+    assert unavailable_row["policy_hash"] == SCHEDULED_OPEN_V1.canonical_hash
+    assert unavailable_row["outcome_status"] == "MISSING_EXIT_PRICE"
+    assert unavailable_row["entry_partition_hash"] is None
+    no_bar_row = rows.filter(
+        pl.col("resolution_kind") == RESOLUTION_CONFIRMED_NO_BAR
+    ).filter(pl.col("scheduled_exit_session") == date(2024, 1, 6)).row(0, named=True)
+    assert no_bar_row["count"] == 1
+    action_row = rows.filter(
+        pl.col("resolution_kind") == RESOLUTION_UNSUPPORTED_CORPORATE_ACTION
+    ).row(0, named=True)
+    assert action_row["outcome_status"] == "UNSUPPORTED_CORPORATE_ACTION"
+    assert action_row["entry_disposition"] == "FILLED"
+
+
+def test_build_outcome_recovery_report_rejects_malformed_evidence() -> None:
+    evidence = build_partitioned_outcome_evidence(
+        _base(n_sessions=15),
+        _calendar(),
+        horizon_sessions=(3, 5),
+        policy=SCHEDULED_OPEN_V1,
+    )
+    with pytest.raises(ValueError, match="horizon partitions"):
+        build_outcome_recovery_report(evidence, (3,))
+    with pytest.raises(ValueError, match="unknown resolution kinds"):
+        build_outcome_recovery_report(
+            evidence.with_columns(pl.lit("BOGUS_KIND").alias("resolution_kind")),
+            (3, 5),
+        )
+    with pytest.raises(ValueError, match="missing recovery columns"):
+        build_outcome_recovery_report(evidence.drop("scheduled_entry_session"), (3, 5))
+
+
+def test_build_outcome_recovery_report_rejects_unknown_disposition() -> None:
+    evidence = build_partitioned_outcome_evidence(
+        _base(n_sessions=15),
+        _calendar(),
+        horizon_sessions=(3,),
+        policy=SCHEDULED_OPEN_V1,
+    )
+    with pytest.raises(ValueError, match="unknown entry/exit dispositions"):
+        build_outcome_recovery_report(
+            evidence.with_columns(
+                pl.lit("BOGUS_DISP").alias("exit_disposition")
+            ),
+            (3,),
+        )
