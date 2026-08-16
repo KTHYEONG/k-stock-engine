@@ -71,6 +71,7 @@ from src.stocks.data.outcome_evidence import (
 from src.stocks.data.outcome_open_bars import load_outcome_open_bar_evidence
 from src.stocks.data.quality import KRXSessionCalendar
 from src.stocks.data.repositories import ResearchDataRepository
+from src.stocks.data.tradability_events import load_tradability_event_evidence
 from src.stocks.domain.execution_policy import ExecutionOutcomePolicy
 from src.stocks.ml.contracts import DEFAULT_CANDIDATE_HORIZON_SESSIONS
 from src.stocks.ml.data import assess_outcome_readiness
@@ -908,6 +909,7 @@ def _replacement_references(
     raw_bar_entry: CatalogEntry | None = None,
     outcome_open_entry: CatalogEntry | None = None,
     evidence_entry: CatalogEntry | None = None,
+    corporate_actions_entry: CatalogEntry | None = None,
 ) -> tuple[CatalogEntry, ...]:
     """Source references with derived artifacts replaced (or appended)."""
     replaced_features = False
@@ -916,6 +918,7 @@ def _replacement_references(
     replaced_raw_bars = False
     replaced_outcome_open = False
     replaced_evidence = False
+    replaced_corporate_actions = False
     refs: list[CatalogEntry] = []
     for entry in source.manifest.references:
         if entry.kind is CatalogKind.FEATURES:
@@ -939,6 +942,9 @@ def _replacement_references(
             if evidence_entry is not None:
                 refs.append(evidence_entry)
                 replaced_evidence = True
+        elif entry.kind is CatalogKind.CORPORATE_ACTIONS:
+            refs.append(corporate_actions_entry or entry)
+            replaced_corporate_actions = corporate_actions_entry is not None
         else:
             refs.append(entry)
     if not replaced_features:
@@ -953,6 +959,8 @@ def _replacement_references(
         refs.append(outcome_open_entry)
     if evidence_entry is not None and not replaced_evidence:
         refs.append(evidence_entry)
+    if corporate_actions_entry is not None and not replaced_corporate_actions:
+        refs.append(corporate_actions_entry)
     return tuple(refs)
 
 
@@ -1041,6 +1049,7 @@ class NetAlphaMaterializationRequest:
     policy: ExecutionOutcomePolicy | None = None
     raw_bar_dataset_id: str | None = None
     outcome_open_bar_dataset_id: str | None = None
+    tradability_events_dataset_id: str | None = None
 
     def __post_init__(self) -> None:
         for field in (
@@ -1069,6 +1078,8 @@ class NetAlphaMaterializationRequest:
             raise ValueError("raw_bar_dataset_id must be non-empty when supplied")
         if self.outcome_open_bar_dataset_id is not None and not self.outcome_open_bar_dataset_id:
             raise ValueError("outcome_open_bar_dataset_id must be non-empty when supplied")
+        if self.tradability_events_dataset_id is not None and not self.tradability_events_dataset_id:
+            raise ValueError("tradability_events_dataset_id must be non-empty when supplied")
         if self.raw_bar_dataset_id is not None and self.outcome_open_bar_dataset_id is not None:
             raise ValueError("supply either raw_bar_dataset_id or outcome_open_bar_dataset_id")
 
@@ -1131,6 +1142,9 @@ def materialize_net_alpha_snapshot(
     raw_bar_entry, raw_bar_evidence = _load_raw_bar_evidence(catalog, request.raw_bar_dataset_id)
     outcome_open_entry, outcome_open_evidence = load_outcome_open_bar_evidence(
         catalog, request.outcome_open_bar_dataset_id, request.generated_time
+    )
+    tradability_entry, tradability_events = load_tradability_event_evidence(
+        catalog, request.tradability_events_dataset_id, request.generated_time
     )
     if outcome_open_evidence is not None:
         raw_bar_evidence = outcome_open_evidence
@@ -1226,6 +1240,7 @@ def materialize_net_alpha_snapshot(
         reference_notional=request.reference_notional,
         policy=policy,
         bar_evidence=raw_bar_evidence,
+        tradability_events=tradability_events,
     )
     readiness = assess_outcome_readiness(
         base_frame.select("instrument_id", "session"),
@@ -1271,6 +1286,7 @@ def materialize_net_alpha_snapshot(
         horizon_sessions=request.candidate_horizon_sessions,
         policy=policy,
         bar_evidence=raw_bar_evidence,
+        tradability_events=tradability_events,
     )
     recovery = build_missing_exit_reconciliation_report(
         evidence_frame, request.candidate_horizon_sessions
@@ -1322,6 +1338,8 @@ def materialize_net_alpha_snapshot(
     ]
     if raw_bar_entry is not None:
         label_references.append((CatalogKind.RAW_BARS.value, raw_bar_entry.name))
+    if tradability_entry is not None:
+        label_references.append((CatalogKind.CORPORATE_ACTIONS.value, tradability_entry.name))
     label_entry = CatalogEntry(
         kind=CatalogKind.LABELS,
         name=request.label_dataset_id,
@@ -1353,6 +1371,8 @@ def materialize_net_alpha_snapshot(
     status_references.append((CatalogKind.COSTS.value, cost_entry.name))
     if raw_bar_entry is not None:
         status_references.append((CatalogKind.RAW_BARS.value, raw_bar_entry.name))
+    if tradability_entry is not None:
+        status_references.append((CatalogKind.CORPORATE_ACTIONS.value, tradability_entry.name))
     status_entry = CatalogEntry(
         kind=CatalogKind.OUTCOME_STATUS,
         name=status_result.dataset_id,
@@ -1376,6 +1396,8 @@ def materialize_net_alpha_snapshot(
     ]
     if raw_bar_entry is not None:
         evidence_references.append((CatalogKind.RAW_BARS.value, raw_bar_entry.name))
+    if tradability_entry is not None:
+        evidence_references.append((CatalogKind.CORPORATE_ACTIONS.value, tradability_entry.name))
     evidence_entry = CatalogEntry(
         kind=CatalogKind.OUTCOME_EVIDENCE,
         name=evidence_result.dataset_id,
@@ -1404,6 +1426,7 @@ def materialize_net_alpha_snapshot(
         references=_replacement_references(
             source, feature_entry, label_entry, status_entry, raw_bar_entry,
             outcome_open_entry, evidence_entry,
+            tradability_entry,
         ),
     )
     _write_manifest_atomic(request.catalog_root, manifest)

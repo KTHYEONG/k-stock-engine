@@ -21,7 +21,9 @@ from src.core.datasets import DatasetManifest
 from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.data.outcome_evidence import (
     RESOLUTION_CONFIRMED_NO_BAR,
+    RESOLUTION_KIND_VOCABULARY,
     RESOLUTION_SOURCE_UNAVAILABLE,
+    RESOLUTION_UNEXECUTABLE_EXIT,
 )
 from src.stocks.ml.contracts import (
     CANONICAL_FEATURE_SET,
@@ -49,15 +51,7 @@ _FEATURE_PREFIX = "feature__"
 
 logger = logging.getLogger("stocks.ml.data")
 
-_RESOLUTION_KIND_VALUES = (
-    "SCHEDULED_OPEN",
-    "DEFERRED_OPEN",
-    "CONFIRMED_NO_BAR",
-    "SOURCE_UNAVAILABLE",
-    "VERIFIED_CORPORATE_SETTLEMENT",
-    "UNSUPPORTED_CORPORATE_ACTION",
-    "PARTIAL_TAIL",
-)
+_RESOLUTION_KIND_VALUES = RESOLUTION_KIND_VOCABULARY
 
 OUTCOME_PROVENANCE_UNPINNED = "outcome-provenance-unpinned"
 
@@ -423,6 +417,8 @@ def assess_outcome_readiness(
 
         not_ok = ~pl.col(OUTCOME_STATUS_COLUMN).is_in(list(tail_ok_statuses))
         confirmed_no_bar = pl.lit(False)
+        unexecutable_exit = pl.lit(False)
+        missing_decision_input = pl.lit(False)
         source_unavailable = pl.lit(False)
         if evidence_by_horizon is not None:
             horizon_evidence = evidence_by_horizon.filter(
@@ -434,10 +430,19 @@ def assess_outcome_readiness(
             confirmed_no_bar = (
                 pl.col("resolution_kind") == RESOLUTION_CONFIRMED_NO_BAR
             ).fill_null(False)
+            unexecutable_exit = (
+                pl.col("resolution_kind") == RESOLUTION_UNEXECUTABLE_EXIT
+            ).fill_null(False)
+            missing_decision_input = (
+                (pl.col(OUTCOME_STATUS_COLUMN) == "MISSING_DECISION_INPUT")
+                & (pl.col("resolution_kind") == "SCHEDULED_OPEN")
+            ).fill_null(False)
             source_unavailable = (
                 pl.col("resolution_kind") == RESOLUTION_SOURCE_UNAVAILABLE
             ).fill_null(False)
-        unresolved = projection.filter(not_ok & ~confirmed_no_bar)
+        unresolved = projection.filter(
+            not_ok & ~confirmed_no_bar & ~unexecutable_exit & ~missing_decision_input
+        )
         unresolved_counts = _status_counts(unresolved, horizon)
         assert unresolved_counts is not None
         results.append(
@@ -759,6 +764,28 @@ def compose_net_alpha_training_data(
         feature_frame = first_rows.drop("__row")
     if feature_frame.is_empty():
         raise ValueError("net-alpha snapshot feature frame is empty")
+
+    # A hard tradability event is an as-of universe exclusion, not a missing
+    # label to be selected and blocked later in replay.  Remove only keys whose
+    # pinned evidence is explicitly UNEXECUTABLE_EXIT; ordinary no-bar rows
+    # remain in the universe for diagnostic and conservative readiness logic.
+    if long_format and "resolution_kind" in frame.columns:
+        blocked = (
+            frame.filter(
+                pl.col("horizon_sessions").is_in(list(candidate_horizon_sessions))
+                & (pl.col("resolution_kind") == "UNEXECUTABLE_EXIT")
+            )
+            .select(ID_COLUMN, _FEATURE_SESSION)
+            .unique()
+        )
+        if not blocked.is_empty():
+            feature_frame = feature_frame.join(
+                blocked.with_columns(pl.lit(True).alias("__blocked")),
+                on=[ID_COLUMN, _FEATURE_SESSION],
+                how="left",
+            ).filter(pl.col("__blocked").is_null()).drop("__blocked")
+            if feature_frame.is_empty():
+                raise ValueError("all net-alpha decision rows are unexecutable")
 
     roles = stock_net_alpha_v1_roles()
     feature_frame = _rename_feature_sources(feature_frame, roles)

@@ -124,6 +124,7 @@ def build_partitioned_net_alpha_labels_with_status(
     reference_notional: float,
     policy: ExecutionOutcomePolicy | None = None,
     bar_evidence: pl.DataFrame | None = None,
+    tradability_events: pl.DataFrame | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Build the long net-alpha label frame and its hash-bound status sidecar.
 
@@ -155,6 +156,7 @@ def build_partitioned_net_alpha_labels_with_status(
             reference_notional=reference_notional,
             policy=policy,
             bar_evidence=bar_evidence,
+            tradability_events=tradability_events,
         )
         status_frames.append(
             status.select(

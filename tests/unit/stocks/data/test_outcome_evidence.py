@@ -223,6 +223,232 @@ def test_bar_evidence_overlays_matching_base_key_without_dropping_base() -> None
     assert row["actual_exit_session"] == date(2024, 1, 5)
 
 
+def test_settled_cash_uses_official_consideration_not_ohlc() -> None:
+    """SCENARIO_SETTLED_CASH: a verified settlement realizes a filled position."""
+    settlements = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:00001"],
+            "entitlement_date": [date(2024, 1, 5)],
+            "per_share_consideration": [1_000.0],
+            "settlement_source_id": ["settle-1"],
+        }
+    )
+    evidence = resolve_policy_outcome(
+        _base(missing_open_sessions={4}),
+        _calendar(),
+        horizon_sessions=3,
+        policy=SCHEDULED_OPEN_V1,
+        settlements=settlements,
+    )
+    row = evidence.filter(pl.col("session") == date(2024, 1, 1)).row(0, named=True)
+    assert row["outcome_status"] == "REALIZED"
+    assert row["resolution_kind"] == "SETTLED_CASH"
+    assert row["actual_exit_session"] == date(2024, 1, 5)
+    assert row["exit_disposition"] == "SETTLED_CASH"
+    assert row["corporate_action_event_id"] == "settle-1"
+    assert row["label_available_time"] is not None
+
+
+def test_settled_cash_requires_positive_official_consideration() -> None:
+    settlements = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:00001"],
+            "entitlement_date": [date(2024, 1, 5)],
+            "per_share_consideration": [0.0],
+            "settlement_source_id": ["settle-bad"],
+        }
+    )
+    with pytest.raises(ValueError, match="non-positive or non-finite"):
+        resolve_policy_outcome(
+            _base(missing_open_sessions={4}),
+            _calendar(),
+            horizon_sessions=3,
+            policy=SCHEDULED_OPEN_V1,
+            settlements=settlements,
+        )
+
+
+def test_settled_cash_never_overrides_a_verified_exit_open() -> None:
+    settlements = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:00001"],
+            "entitlement_date": [date(2024, 1, 5)],
+            "per_share_consideration": [900.0],
+            "settlement_source_id": ["settle-2"],
+        }
+    )
+    evidence = resolve_policy_outcome(
+        _base(),
+        _calendar(),
+        horizon_sessions=3,
+        policy=SCHEDULED_OPEN_V1,
+        settlements=settlements,
+    )
+    row = evidence.filter(pl.col("session") == date(2024, 1, 1)).row(0, named=True)
+    assert row["outcome_status"] == "REALIZED"
+    assert row["resolution_kind"] == RESOLUTION_SCHEDULED_OPEN
+    assert row["exit_disposition"] == "FILLED"
+    assert row["corporate_action_event_id"] is None
+
+
+def test_hard_exclusion_event_emits_unexecutable_exit() -> None:
+    """SCENARIO_UNEXECUTABLE_EXIT: halt/delisting yields a typed non-realized exit."""
+    events = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:00001"],
+            "published_at": [datetime(2024, 1, 1, 12, 0, tzinfo=UTC)],
+            "effective_session": [date(2024, 1, 5)],
+            "tradability_state": ["DELISTING_OR_SETTLEMENT"],
+        }
+    )
+    evidence = resolve_policy_outcome(
+        _base(missing_open_sessions={4}),
+        _calendar(),
+        horizon_sessions=3,
+        policy=SCHEDULED_OPEN_V1,
+        tradability_events=events,
+    )
+    row = evidence.filter(pl.col("session") == date(2024, 1, 1)).row(0, named=True)
+    assert row["outcome_status"] == "UNEXECUTABLE_EXIT"
+    assert row["resolution_kind"] == "UNEXECUTABLE_EXIT"
+    assert row["actual_exit_session"] is None
+    assert row["exit_disposition"] == "UNEXECUTABLE_EXIT"
+    assert row["label_available_time"] is None
+
+
+def test_event_published_after_decision_cutoff_does_not_modify() -> None:
+    """SCENARIO_PRE_ENTRY_TIMESTAMP_BOUNDARY: a late disclosure never alters a decision."""
+    events = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:00001"],
+            "published_at": [datetime(2024, 1, 3, 12, 0, tzinfo=UTC)],
+            "effective_session": [date(2024, 1, 5)],
+            "tradability_state": ["DELISTING_OR_SETTLEMENT"],
+        }
+    )
+    evidence = resolve_policy_outcome(
+        _base(missing_open_sessions={4}),
+        _calendar(),
+        horizon_sessions=3,
+        policy=SCHEDULED_OPEN_V1,
+        tradability_events=events,
+    )
+    # The halt was published after the Jan 1 decision, so it must not modify it.
+    row = evidence.filter(pl.col("session") == date(2024, 1, 1)).row(0, named=True)
+    assert row["outcome_status"] == "MISSING_EXIT_PRICE"
+    assert row["resolution_kind"] == RESOLUTION_CONFIRMED_NO_BAR
+
+
+def test_event_published_before_decision_but_after_exit_is_not_unexecutable() -> None:
+    events = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:00001"],
+            "published_at": [datetime(2024, 1, 6, 12, 0, tzinfo=UTC)],
+            "effective_session": [date(2024, 1, 5)],
+            "tradability_state": ["ACTIVE_HALT"],
+        }
+    )
+    evidence = resolve_policy_outcome(
+        _base(missing_open_sessions={4}),
+        _calendar(),
+        horizon_sessions=3,
+        policy=SCHEDULED_OPEN_V1,
+        tradability_events=events,
+    )
+    # published after the exit date; cannot make a historical exit unexecutable.
+    row = evidence.filter(pl.col("session") == date(2024, 1, 1)).row(0, named=True)
+    assert row["resolution_kind"] == RESOLUTION_CONFIRMED_NO_BAR
+
+
+def test_settlement_takes_precedence_over_hard_exclusion() -> None:
+    settlements = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:00001"],
+            "entitlement_date": [date(2024, 1, 5)],
+            "per_share_consideration": [1_000.0],
+            "settlement_source_id": ["settle-3"],
+        }
+    )
+    events = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:00001"],
+            "published_at": [datetime(2024, 1, 1, 12, 0, tzinfo=UTC)],
+            "effective_session": [date(2024, 1, 5)],
+            "tradability_state": ["DELISTING_OR_SETTLEMENT"],
+        }
+    )
+    evidence = resolve_policy_outcome(
+        _base(missing_open_sessions={4}),
+        _calendar(),
+        horizon_sessions=3,
+        policy=SCHEDULED_OPEN_V1,
+        tradability_events=events,
+        settlements=settlements,
+    )
+    row = evidence.filter(pl.col("session") == date(2024, 1, 1)).row(0, named=True)
+    assert row["outcome_status"] == "REALIZED"
+    assert row["resolution_kind"] == "SETTLED_CASH"
+
+
+def test_settlements_and_events_reject_duplicate_keys() -> None:
+    dup_settlements = pl.concat(
+        [
+            pl.DataFrame(
+                {
+                    "instrument_id": ["KRX:00001"],
+                    "entitlement_date": [date(2024, 1, 5)],
+                    "per_share_consideration": [1_000.0],
+                    "settlement_source_id": ["a"],
+                }
+            ),
+            pl.DataFrame(
+                {
+                    "instrument_id": ["KRX:00001"],
+                    "entitlement_date": [date(2024, 1, 5)],
+                    "per_share_consideration": [900.0],
+                    "settlement_source_id": ["b"],
+                }
+            ),
+        ]
+    )
+    with pytest.raises(ValueError, match="duplicate"):
+        resolve_policy_outcome(
+            _base(missing_open_sessions={4}),
+            _calendar(),
+            horizon_sessions=3,
+            policy=SCHEDULED_OPEN_V1,
+            settlements=dup_settlements,
+        )
+    dup_events = pl.concat(
+        [
+            pl.DataFrame(
+                {
+                    "instrument_id": ["KRX:00001"],
+                    "published_at": [datetime(2024, 1, 1, 12, 0, tzinfo=UTC)],
+                    "effective_session": [date(2024, 1, 5)],
+                    "tradability_state": ["ACTIVE_HALT"],
+                }
+            ),
+            pl.DataFrame(
+                {
+                    "instrument_id": ["KRX:00001"],
+                    "published_at": [datetime(2024, 1, 1, 12, 0, tzinfo=UTC)],
+                    "effective_session": [date(2024, 1, 5)],
+                    "tradability_state": ["DELISTING_OR_SETTLEMENT"],
+                }
+            ),
+        ]
+    )
+    with pytest.raises(ValueError, match="duplicate"):
+        resolve_policy_outcome(
+            _base(missing_open_sessions={4}),
+            _calendar(),
+            horizon_sessions=3,
+            policy=SCHEDULED_OPEN_V1,
+            tradability_events=dup_events,
+        )
+
+
 def test_partitioned_evidence_and_status_sidecar_align() -> None:
     evidence = build_partitioned_outcome_evidence(
         _base(n_sessions=15),
