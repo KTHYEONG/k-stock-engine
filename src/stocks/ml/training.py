@@ -80,6 +80,7 @@ from src.stocks.ml.models import (
     fit_weighted_elastic_path,
 )
 from src.stocks.ml.replay import (
+    BlockedVintage,
     NetAlphaPolicyReplay,
     ReplayEvaluation,
     ReplaySegmentDiagnostic,
@@ -263,6 +264,9 @@ class HorizonDiscovery:
     dropout_reasons: Mapping[tuple[int, str], str] = field(default_factory=dict)
     segment_diagnostics_by_candidate: Mapping[
         tuple[int, str], tuple[ReplaySegmentDiagnostic, ...]
+    ] = field(default_factory=dict)
+    blocked_vintages_by_candidate: Mapping[
+        tuple[int, str], tuple[BlockedVintage, ...]
     ] = field(default_factory=dict)
     coverage_by_horizon: Mapping[int, HorizonOutcomeCoverage] = field(
         default_factory=dict
@@ -1160,14 +1164,16 @@ def _replay_costs(
     risk: RiskSettings,
     *,
     status: pl.DataFrame | None = None,
+    evidence: pl.DataFrame | None = None,
 ) -> tuple[ReplayEvaluation, ReplayEvaluation]:
     """Base and stress policy replay over the same segment-identified OOF panel.
 
     Base and stress share the identical frozen calibrated scores, orders,
-    maturity timeline, and one immutable typed status projection; only the
-    effective cost/liquidity schedule changes. The segment diagnostics must
-    therefore be identical, and a divergence raises ``ValueError`` because the
-    timeline invariant is part of the contract.
+    maturity timeline, and one immutable typed status/evidence projection; only
+    the effective cost/liquidity schedule changes. The segment diagnostics must
+    therefore be identical, and the selected blocked-exit identities must match
+    exactly; a divergence raises ``ValueError`` because the timeline invariant
+    is part of the contract.
     """
     base_replay = NetAlphaPolicyReplay(
         horizon_sessions=horizon_sessions,
@@ -1188,15 +1194,22 @@ def _replay_costs(
         policy=request.execution_policy,
     )
     base_evaluation = base_replay.evaluate(
-        calibrated, oof_labels, segment_column=_OOF_SEGMENT, status=status
+        calibrated, oof_labels, segment_column=_OOF_SEGMENT,
+        status=status, evidence=evidence,
     )
     stress_evaluation = stress_replay.evaluate(
-        calibrated, oof_labels, segment_column=_OOF_SEGMENT, status=status
+        calibrated, oof_labels, segment_column=_OOF_SEGMENT,
+        status=status, evidence=evidence,
     )
     if base_evaluation.segment_diagnostics != stress_evaluation.segment_diagnostics:
         raise ValueError(
             "base and stress replay timelines diverged; order/maturity must "
             "be identical apart from the cost schedule"
+        )
+    if base_evaluation.blocked_vintages != stress_evaluation.blocked_vintages:
+        raise ValueError(
+            "base and stress replay blocked-exit identities diverged; "
+            "evidence-backed blockers must be cost-independent"
         )
     return base_evaluation, stress_evaluation
 
@@ -1241,6 +1254,7 @@ def _evidence_from_evaluation(
         segment_count=segment_count,
         fold_rank_ics=fold_rank_ics,
         unresolved_outcome_counts=base_evaluation.unresolved_outcome_counts,
+        blocked_vintage_count=base_evaluation.blocked_vintage_count,
     )
 
 
@@ -1255,8 +1269,12 @@ def _coverage_failure_reason(
             f"{evidence.segment_count}"
         )
     # Unresolved vintages stay out of return arithmetic and remain in replay
-    # diagnostics. Existing observed/active coverage gates decide admission;
-    # one missing bar must not discard an otherwise valid research candidate.
+    # diagnostics. A selected filled exit that cannot be valued is an explicit
+    # blocker: admission fails closed with a countable reason and the bounded
+    # key records stay in no-trade metrics. Other missing-realized vintages
+    # (e.g. no orders) keep the opaque coverage reason.
+    if evidence.blocked_vintage_count > 0:
+        return f"selected-exit-unresolved:{evidence.blocked_vintage_count}"
     if evidence.missing_cohort_count > 0:
         return f"missing-realized-vintages:{evidence.missing_cohort_count}"
     if not evidence.fold_rank_ics:
@@ -1316,6 +1334,9 @@ def _build_horizon_evidence(
     dropout_reasons: dict[tuple[int, str], str] = {}
     segment_diagnostics_by_candidate: dict[
         tuple[int, str], tuple[ReplaySegmentDiagnostic, ...]
+    ] = {}
+    blocked_vintages_by_candidate: dict[
+        tuple[int, str], tuple[BlockedVintage, ...]
     ] = {}
     coverage_by_horizon: dict[int, HorizonOutcomeCoverage] = {}
     horizon_memory: dict[int, dict[str, object]] = {}
@@ -1387,6 +1408,7 @@ def _build_horizon_evidence(
             status_projection = (
                 coverage.status_projection if coverage is not None else None
             )
+            horizon_evidence = data.evidence_by_horizon.get(horizon)
             admitted_any = False
             for profile in request.policy_profiles:
                 logger.debug(
@@ -1402,6 +1424,7 @@ def _build_horizon_evidence(
                     base_evaluation, stress_evaluation = _replay_costs(
                         calibrated, oof_labels, request, horizon, risk,
                         status=status_projection,
+                        evidence=horizon_evidence,
                     )
                 except ValueError as exc:
                     dropout_reasons[(horizon, profile.profile_id)] = (
@@ -1419,6 +1442,9 @@ def _build_horizon_evidence(
                 )
                 segment_diagnostics_by_candidate[(horizon, profile.profile_id)] = (
                     base_evaluation.segment_diagnostics
+                )
+                blocked_vintages_by_candidate[(horizon, profile.profile_id)] = (
+                    base_evaluation.blocked_vintages
                 )
                 failure_reason = _coverage_failure_reason(candidate_evidence, request)
                 dropout_reasons[(horizon, profile.profile_id)] = failure_reason
@@ -1455,6 +1481,7 @@ def _build_horizon_evidence(
         oof_by_horizon=oof_by_horizon,
         dropout_reasons=dropout_reasons,
         segment_diagnostics_by_candidate=segment_diagnostics_by_candidate,
+        blocked_vintages_by_candidate=blocked_vintages_by_candidate,
         coverage_by_horizon=coverage_by_horizon,
         horizon_memory=horizon_memory,
         oof_cache=oof_cache,
@@ -2499,9 +2526,18 @@ def _policy_frontier_projection(
     """Bounded ``policy_frontier`` projection shared by metrics and no-trade.
 
     Records the candidate count, profile ids, per-``(horizon, profile)``
-    dropout reasons, and the bounded per-segment/status sums. Raw orders,
-    scores, returns, and instrument identifiers are never included.
+    dropout reasons, the bounded per-segment/status sums, and at most 64
+    lexicographically ordered selected blocked-exit identities. Raw orders,
+    scores, returns, and model predictions are never included.
     """
+    blocked = sorted(
+        (
+            blocked
+            for candidate_blocked in discovery.blocked_vintages_by_candidate.values()
+            for blocked in candidate_blocked
+        ),
+        key=lambda b: b._sort_key(),
+    )
     return {
         "candidate_count": len(discovery.evidence),
         "profile_ids": [p.profile_id for p in request.policy_profiles],
@@ -2514,6 +2550,8 @@ def _policy_frontier_projection(
         "segment_sums": _segment_summaries(
             discovery.segment_diagnostics_by_candidate, selected_profile_id
         ),
+        "blocked_vintages": [blocked.to_json() for blocked in blocked[:64]],
+        "blocked_vintage_count": len(blocked),
     }
 
 

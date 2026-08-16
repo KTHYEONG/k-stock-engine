@@ -29,12 +29,13 @@ sized order.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 
 import numpy as np
 import polars as pl
 
 from src.core.costs import CostSchedule, LiquiditySlippageModel, default_base_schedule
+from src.stocks.data.outcome_evidence import RESOLUTION_KIND_VOCABULARY
 from src.stocks.domain.execution_policy import (
     SCHEDULED_OPEN_V1,
     ExecutionOutcomePolicy,
@@ -87,6 +88,74 @@ class PolicyBlock:
     notional: float
     segment_id: int = 0
     decision_session_index: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class BlockedVintage:
+    """One selected filled order whose exit is unresolved, not a zero return.
+
+    Records the profile-independent replay identity ``(segment_id,
+    vintage_id, instrument_id, decision_session)`` plus the pinned evidence
+    fields (scheduled entry/exit sessions, ``outcome_status``,
+    ``resolution_kind``, and entry/exit dispositions). It never carries a
+    score, label, return, or prediction; a blocked vintage contributes no
+    arithmetic return and is never cash-substituted.
+    """
+
+    segment_id: int
+    vintage_id: int
+    instrument_id: str
+    decision_session: datetime
+    scheduled_entry_session: date | None
+    scheduled_exit_session: date | None
+    outcome_status: str
+    resolution_kind: str
+    entry_disposition: str | None
+    exit_disposition: str | None
+
+    def __post_init__(self) -> None:
+        if self.segment_id < 0:
+            raise ValueError("blocked vintage segment_id must be non-negative")
+        if self.vintage_id < 0:
+            raise ValueError("blocked vintage vintage_id must be non-negative")
+        if not self.instrument_id:
+            raise ValueError("blocked vintage instrument_id must be non-empty")
+        if not self.outcome_status:
+            raise ValueError("blocked vintage outcome_status must be non-empty")
+        if not self.resolution_kind:
+            raise ValueError("blocked vintage resolution_kind must be non-empty")
+
+    def _sort_key(self) -> tuple[object, ...]:
+        return (
+            self.segment_id,
+            self.vintage_id,
+            self.instrument_id,
+            self.decision_session,
+            self.outcome_status,
+            self.resolution_kind,
+        )
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "segment_id": int(self.segment_id),
+            "vintage_id": int(self.vintage_id),
+            "instrument_id": self.instrument_id,
+            "decision_session": self.decision_session.isoformat(),
+            "scheduled_entry_session": (
+                self.scheduled_entry_session.isoformat()
+                if self.scheduled_entry_session is not None
+                else None
+            ),
+            "scheduled_exit_session": (
+                self.scheduled_exit_session.isoformat()
+                if self.scheduled_exit_session is not None
+                else None
+            ),
+            "outcome_status": self.outcome_status,
+            "resolution_kind": self.resolution_kind,
+            "entry_disposition": self.entry_disposition,
+            "exit_disposition": self.exit_disposition,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +261,8 @@ class ReplayEvaluation:
     partial_vintage_count: int = 0
     unresolved_outcome_counts: tuple[tuple[str, int], ...] = ()
     segment_diagnostics: tuple[ReplaySegmentDiagnostic, ...] = ()
+    blocked_vintages: tuple[BlockedVintage, ...] = ()
+    blocked_vintage_count: int = 0
 
     @property
     def period_count(self) -> int:
@@ -208,6 +279,11 @@ class ReplayEvaluation:
     @property
     def missing_realized_cohort_count(self) -> int:
         return self.missing_realized_vintage_count
+
+    @property
+    def selected_blocked_exit_count(self) -> int:
+        """Number of selected filled exits that are blocked, never zero-filled."""
+        return self.blocked_vintage_count
 
     @property
     def partial_cohort_count(self) -> int:
@@ -241,6 +317,7 @@ class ReplayEvaluation:
             "partial_vintages": int(self.partial_vintage_count),
             "observed_sessions": int(self.observed_sessions),
             "active_vintages": int(self.active_cohort_count),
+            "selected_blocked_exits": int(self.blocked_vintage_count),
         }
 
     def to_json(self) -> dict[str, object]:
@@ -253,11 +330,15 @@ class ReplayEvaluation:
             "active_cohort_count": int(self.active_cohort_count),
             "missing_realized_cohort_count": int(self.missing_realized_cohort_count),
             "partial_cohort_count": int(self.partial_cohort_count),
+            "selected_blocked_exit_count": int(self.blocked_vintage_count),
             "unresolved_outcome_counts": {
                 str(status): int(count) for status, count in self.unresolved_outcome_counts
             },
             "period_net_returns": [float(value) for value in self.period_net_returns],
             "segments": [diag.to_json() for diag in self.segment_diagnostics],
+            "blocked_vintages": [
+                blocked.to_json() for blocked in self.blocked_vintages
+            ],
         }
 
 
@@ -363,6 +444,7 @@ class NetAlphaPolicyReplay:
                 absent from a supplied status projection.
         """
         del decision_time
+        evidence_by_key: dict[tuple[str, object], dict[str, object]] = {}
         if evidence is not None and not evidence.is_empty():
             evidence_required = (_ID, _SESSION, "policy_hash", OUTCOME_STATUS_COLUMN)
             missing = [c for c in evidence_required if c not in evidence.columns]
@@ -381,6 +463,22 @@ class NetAlphaPolicyReplay:
                 raise ValueError(
                     "outcome evidence contains duplicate instrument/session keys"
                 )
+            optional_evidence = (
+                "resolution_kind",
+                "scheduled_entry_session",
+                "scheduled_exit_session",
+                "entry_disposition",
+                "exit_disposition",
+            )
+            evidence_cols = set(evidence.columns)
+            for row in evidence.select(
+                _ID,
+                _SESSION,
+                OUTCOME_STATUS_COLUMN,
+                *[c for c in optional_evidence if c in evidence_cols],
+            ).iter_rows(named=True):
+                key = (str(row[_ID]), row[_SESSION])
+                evidence_by_key[key] = dict(row)
             if status is None:
                 status = evidence.select(
                     _ID, _SESSION, OUTCOME_STATUS_COLUMN
@@ -446,6 +544,20 @@ class NetAlphaPolicyReplay:
                 .select(_SESSION)
                 .iter_rows(named=True)
             }
+
+        if evidence_by_key and status_by_key:
+            mismatch = [
+                (key, evidence_by_key[key].get(OUTCOME_STATUS_COLUMN), state)
+                for key, state in status_by_key.items()
+                if key in evidence_by_key
+                and evidence_by_key[key].get(OUTCOME_STATUS_COLUMN) != state
+            ]
+            if mismatch:
+                raise ValueError(
+                    "evidence outcome_status disagrees with the status "
+                    f"projection for {len(mismatch)} keys, e.g. "
+                    f"{mismatch[0]}"
+                )
 
         portfolio = self._portfolio
         all_sessions = sorted(oof_scores[_SESSION].unique().to_list())
@@ -569,6 +681,7 @@ class NetAlphaPolicyReplay:
         period_returns: list[float] = []
         vintage_segments: list[int] = []
         blocks: list[PolicyBlock] = []
+        blocked_vintages: list[BlockedVintage] = []
         matured = 0
         cash = 0
         missing_realized = 0
@@ -606,6 +719,15 @@ class NetAlphaPolicyReplay:
                     if outcome_state not in (None, OUTCOME_REALIZED):
                         unresolved_states.add(str(outcome_state))
                         complete = False
+                        blocked_vintages.append(
+                            self._blocked_vintage_record(
+                                segment=segment,
+                                vintage_id=int(vintage_ids[position]),
+                                order=order,
+                                outcome_state=str(outcome_state),
+                                evidence=evidence_by_key.get(key),
+                            )
+                        )
                         continue
                     realized_value = realized_by_key.get(key)
                     if realized_value is None:
@@ -701,6 +823,68 @@ class NetAlphaPolicyReplay:
             missing_realized_vintage_count=missing_realized,
             partial_vintage_count=partial,
             segment_diagnostics=diagnostics,
+            blocked_vintages=tuple(
+                sorted(blocked_vintages, key=lambda b: b._sort_key())[:64]
+            ),
+            blocked_vintage_count=len(blocked_vintages),
+        )
+
+    def _blocked_vintage_record(
+        self,
+        *,
+        segment: int,
+        vintage_id: int,
+        order: PolicyOrder,
+        outcome_state: str,
+        evidence: dict[str, object] | None,
+    ) -> BlockedVintage:
+        """Deterministic bounded blocked-vintage record for a selected filled order.
+
+        Carries the pinned evidence projection when present; without evidence
+        the exit is unreconciled (``UNRECONCILED_NO_BAR``) and never becomes a
+        synthetic zero return or cash. ``resolution_kind`` must be a known
+        vocabulary value when supplied.
+        """
+        resolution = "UNRECONCILED_NO_BAR"
+        if evidence is not None:
+            kind = evidence.get("resolution_kind")
+            if kind is not None:
+                resolution = str(kind)
+                if resolution not in list(RESOLUTION_KIND_VOCABULARY) and resolution != "UNRECONCILED_NO_BAR":
+                    raise ValueError(
+                        f"unknown resolution_kind {resolution!r} in outcome evidence"
+                    )
+        scheduled_entry = (
+            evidence.get("scheduled_entry_session") if evidence is not None else None
+        )
+        scheduled_exit = (
+            evidence.get("scheduled_exit_session") if evidence is not None else None
+        )
+        entry_disposition = (
+            evidence.get("entry_disposition") if evidence is not None else None
+        )
+        exit_disposition = (
+            evidence.get("exit_disposition") if evidence is not None else None
+        )
+        return BlockedVintage(
+            segment_id=segment,
+            vintage_id=vintage_id,
+            instrument_id=order.instrument_id,
+            decision_session=order.decision_session,
+            scheduled_entry_session=(
+                scheduled_entry if isinstance(scheduled_entry, date) else None
+            ),
+            scheduled_exit_session=(
+                scheduled_exit if isinstance(scheduled_exit, date) else None
+            ),
+            outcome_status=outcome_state,
+            resolution_kind=resolution,
+            entry_disposition=(
+                str(entry_disposition) if isinstance(entry_disposition, str) else None
+            ),
+            exit_disposition=(
+                str(exit_disposition) if isinstance(exit_disposition, str) else None
+            ),
         )
 
     def _score_only_segment_diagnostics(

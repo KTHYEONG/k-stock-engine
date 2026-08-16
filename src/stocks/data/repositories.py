@@ -67,6 +67,11 @@ _OUTCOME_EVIDENCE_PROJECTION = (
     HORIZON_COLUMN,
     "policy_hash",
     "resolution_kind",
+    OUTCOME_STATUS_COLUMN,
+    "scheduled_entry_session",
+    "scheduled_exit_session",
+    "entry_disposition",
+    "exit_disposition",
 )
 
 

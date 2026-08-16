@@ -8,13 +8,17 @@ import pytest
 
 from src.stocks.data.outcome_evidence import (
     OUTCOME_EVIDENCE_COLUMNS,
+    RECONCILIATION_ACTION_COLUMN,
+    RECONCILIATION_SOURCE_UNAVAILABLE,
+    RECONCILIATION_UNRECONCILED_NO_BAR,
+    RECONCILIATION_VERIFIED_DELISTING_OR_SETTLEMENT,
     RESOLUTION_CONFIRMED_NO_BAR,
     RESOLUTION_DEFERRED_OPEN,
     RESOLUTION_PARTIAL_TAIL,
     RESOLUTION_SCHEDULED_OPEN,
     RESOLUTION_SOURCE_UNAVAILABLE,
     RESOLUTION_UNSUPPORTED_CORPORATE_ACTION,
-    build_outcome_recovery_report,
+    build_missing_exit_reconciliation_report,
     build_outcome_status_sidecar,
     build_partitioned_outcome_evidence,
     publish_outcome_evidence_dataset,
@@ -288,69 +292,125 @@ def test_rejects_non_calendar_decision_sessions() -> None:
         resolve_policy_outcome(bad, _calendar(), horizon_sessions=1, policy=SCHEDULED_OPEN_V1)
 
 
-def test_build_outcome_recovery_report_classifies_and_groups() -> None:
-    """Acceptance 2: SOURCE_UNAVAILABLE is backfill work, no-bar is structural."""
+def test_build_missing_exit_reconciliation_report_classifies_and_groups() -> None:
+    """SCENARIO_UNRESOLVED_OUTCOME_IS_DIAGNOSTIC: source gap is a backfill request."""
     unavailable = {date(2024, 1, 5)}
+    # Decision 0 (Jan 1) exits at Jan 5 (unavailable); decision 2 (Jan 3) is an
+    # unsupported corporate action; decision 6 (Jan 7) exits at Jan 11 (missing
+    # open). Each classification uses a distinct decision key, so the merged
+    # evidence is duplicate-free.
     source_unavailable = resolve_policy_outcome(
-        _base(missing_open_sessions={4}),
+        _base(missing_open_sessions={4, 10}),
         _calendar(),
         horizon_sessions=3,
         policy=SCHEDULED_OPEN_V1,
         unavailable_sessions=unavailable,
+        corporate_action_keys={("KRX:00001", date(2024, 1, 3))},
     )
+    evidence = source_unavailable.filter(
+        pl.col("outcome_status").is_in(("MISSING_EXIT_PRICE", "UNSUPPORTED_CORPORATE_ACTION"))
+    )
+    assert not evidence.is_empty()
+
+    report = build_missing_exit_reconciliation_report(evidence, (3,))
+
+    assert report.source_unavailable_count == 1
+    assert report.unreconciled_no_bar_count == 1
+    assert report.verified_delisting_or_settlement_count == 1
+    assert report.official_open_backfill_count == 0
+    assert report.verified_trading_halt_count == 0
+    rows = report.rows
+    assert set(rows[RECONCILIATION_ACTION_COLUMN].unique().to_list()) == {
+        RECONCILIATION_SOURCE_UNAVAILABLE,
+        RECONCILIATION_UNRECONCILED_NO_BAR,
+        RECONCILIATION_VERIFIED_DELISTING_OR_SETTLEMENT,
+    }
+    unavailable_row = rows.filter(
+        pl.col(RECONCILIATION_ACTION_COLUMN) == RECONCILIATION_SOURCE_UNAVAILABLE
+    ).row(0, named=True)
+    assert unavailable_row["count"] == 1
+    assert unavailable_row["policy_hash"] == SCHEDULED_OPEN_V1.canonical_hash
+    assert unavailable_row["outcome_status"] == "MISSING_EXIT_PRICE"
+    assert unavailable_row["entry_partition_hash"] is None
+    no_bar_row = rows.filter(
+        pl.col(RECONCILIATION_ACTION_COLUMN) == RECONCILIATION_UNRECONCILED_NO_BAR
+    ).row(0, named=True)
+    assert no_bar_row["count"] == 1
+    action_row = rows.filter(
+        pl.col(RECONCILIATION_ACTION_COLUMN)
+        == RECONCILIATION_VERIFIED_DELISTING_OR_SETTLEMENT
+    ).row(0, named=True)
+    assert action_row["outcome_status"] == "UNSUPPORTED_CORPORATE_ACTION"
+    assert action_row["entry_disposition"] == "FILLED"
+
+    # Exact source-unavailable backfill requests are emitted separately.
+    requests = report.source_unavailable_requests
+    assert {"instrument_id", "scheduled_exit_session", "horizon_sessions"} <= set(
+        requests.columns
+    )
+    assert requests.height == 1
+    assert requests["scheduled_exit_session"].to_list() == [date(2024, 1, 5)]
+
+
+def test_reconciliation_official_open_backfill_and_verified_events() -> None:
+    """SCENARIO_SNAPSHOT_PINS_OUTCOME_EVIDENCE: halt and settlement stay distinct."""
     confirmed_no_bar = resolve_policy_outcome(
         _base(missing_open_sessions={5}),
         _calendar(),
         horizon_sessions=3,
         policy=SCHEDULED_OPEN_V1,
     )
-    unsupported_action = resolve_policy_outcome(
-        _base(),
-        _calendar(),
-        horizon_sessions=3,
-        policy=SCHEDULED_OPEN_V1,
-        corporate_action_keys={("KRX:00001", date(2024, 1, 3))},
+    # Only the filled-entry missing exit (decision session 1, exit Jan 6) is a
+    # reconciliation candidate; the entry-side MISSING_ENTRY_PRICE row is not.
+    official = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:00001"],
+            "price_date": [date(2024, 1, 6)],
+            "open": [110.0],
+        }
     )
-    evidence = pl.concat(
-        [source_unavailable, confirmed_no_bar, unsupported_action]
-    ).sort(["instrument_id", "session", "horizon_sessions"])
-
-    report = build_outcome_recovery_report(evidence, (3,))
-
-    # Session index 4 feeds the scheduled exit of decision session 0 and the
-    # scheduled entry of decision session 3, so both legs are recoverable
-    # backfill; session index 5 likewise yields two confirmed no-bars.
-    assert report.recoverable_backfill_count == 2
-    assert report.confirmed_no_bar_count == 2
-    assert report.unsupported_corporate_action_count == 1
-    rows = report.rows
-    assert set(rows["resolution_kind"].unique().to_list()) == {
-        RESOLUTION_SOURCE_UNAVAILABLE,
-        RESOLUTION_CONFIRMED_NO_BAR,
-        RESOLUTION_UNSUPPORTED_CORPORATE_ACTION,
-    }
-    unavailable_rows = rows.filter(
-        pl.col("resolution_kind") == RESOLUTION_SOURCE_UNAVAILABLE
+    halt = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:00001"],
+            "session": [date(2024, 1, 6)],
+            "event_kind": ["TRADING_HALT"],
+            "corporate_action_event_id": ["halt-1"],
+        }
     )
-    assert unavailable_rows["count"].sum() == report.recoverable_backfill_count
-    unavailable_row = unavailable_rows.filter(
-        pl.col("scheduled_exit_session") == date(2024, 1, 5)
+    backfill_report = build_missing_exit_reconciliation_report(
+        confirmed_no_bar, (3,), official_bars=official
+    )
+    assert backfill_report.official_open_backfill_count == 1
+    assert backfill_report.unreconciled_no_bar_count == 0
+    assert backfill_report.source_unavailable_count == 0
+
+    halt_report = build_missing_exit_reconciliation_report(
+        confirmed_no_bar, (3,), corporate_events=halt
+    )
+    assert halt_report.verified_trading_halt_count == 1
+    assert halt_report.unreconciled_no_bar_count == 0
+
+    settlement = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:00001"],
+            "session": [date(2024, 1, 6)],
+            "event_kind": ["SETTLEMENT"],
+            "corporate_action_event_id": ["settle-1"],
+        }
+    )
+    settle_report = build_missing_exit_reconciliation_report(
+        confirmed_no_bar, (3,), corporate_events=settlement
+    )
+    assert settle_report.verified_delisting_or_settlement_count == 1
+    row = settle_report.rows.filter(
+        pl.col(RECONCILIATION_ACTION_COLUMN)
+        == RECONCILIATION_VERIFIED_DELISTING_OR_SETTLEMENT
     ).row(0, named=True)
-    assert unavailable_row["policy_hash"] == SCHEDULED_OPEN_V1.canonical_hash
-    assert unavailable_row["outcome_status"] == "MISSING_EXIT_PRICE"
-    assert unavailable_row["entry_partition_hash"] is None
-    no_bar_row = rows.filter(
-        pl.col("resolution_kind") == RESOLUTION_CONFIRMED_NO_BAR
-    ).filter(pl.col("scheduled_exit_session") == date(2024, 1, 6)).row(0, named=True)
-    assert no_bar_row["count"] == 1
-    action_row = rows.filter(
-        pl.col("resolution_kind") == RESOLUTION_UNSUPPORTED_CORPORATE_ACTION
-    ).row(0, named=True)
-    assert action_row["outcome_status"] == "UNSUPPORTED_CORPORATE_ACTION"
-    assert action_row["entry_disposition"] == "FILLED"
+    assert row["corporate_action_event_id"] == "settle-1"
 
 
-def test_build_outcome_recovery_report_rejects_malformed_evidence() -> None:
+def test_reconciliation_rejects_duplicate_or_non_positive_evidence() -> None:
+    """SCENARIO_SNAPSHOT_PINS_OUTCOME_EVIDENCE: malformed inputs fail closed."""
     evidence = build_partitioned_outcome_evidence(
         _base(n_sessions=15),
         _calendar(),
@@ -358,17 +418,84 @@ def test_build_outcome_recovery_report_rejects_malformed_evidence() -> None:
         policy=SCHEDULED_OPEN_V1,
     )
     with pytest.raises(ValueError, match="horizon partitions"):
-        build_outcome_recovery_report(evidence, (3,))
+        build_missing_exit_reconciliation_report(evidence, (3,))
     with pytest.raises(ValueError, match="unknown resolution kinds"):
-        build_outcome_recovery_report(
+        build_missing_exit_reconciliation_report(
             evidence.with_columns(pl.lit("BOGUS_KIND").alias("resolution_kind")),
             (3, 5),
         )
-    with pytest.raises(ValueError, match="missing recovery columns"):
-        build_outcome_recovery_report(evidence.drop("scheduled_entry_session"), (3, 5))
+    with pytest.raises(ValueError, match="missing reconciliation columns"):
+        build_missing_exit_reconciliation_report(
+            evidence.drop("scheduled_entry_session"), (3, 5)
+        )
+    missing = resolve_policy_outcome(
+        _base(missing_open_sessions={4}),
+        _calendar(),
+        horizon_sessions=3,
+        policy=SCHEDULED_OPEN_V1,
+    )
+    missing5 = resolve_policy_outcome(
+        _base(missing_open_sessions={6}),
+        _calendar(),
+        horizon_sessions=5,
+        policy=SCHEDULED_OPEN_V1,
+    )
+    sample = pl.concat(
+        [
+            missing.head(1),
+            missing5.head(1),
+        ]
+    )
+    doubled = pl.concat([sample, sample])
+    with pytest.raises(ValueError, match="duplicate decision keys"):
+        build_missing_exit_reconciliation_report(doubled, (3, 5))
 
 
-def test_build_outcome_recovery_report_rejects_unknown_disposition() -> None:
+def test_reconciliation_rejects_duplicate_official_bar_and_bad_open() -> None:
+    """Only a finite positive official open at the exact key may backfill."""
+    confirmed = resolve_policy_outcome(
+        _base(missing_open_sessions={5}),
+        _calendar(),
+        horizon_sessions=3,
+        policy=SCHEDULED_OPEN_V1,
+    )
+    dup_bars = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:00001", "KRX:00001"],
+            "price_date": [date(2024, 1, 6), date(2024, 1, 6)],
+            "open": [100.0, 101.0],
+        }
+    )
+    with pytest.raises(ValueError, match=r"duplicate .* keys"):
+        build_missing_exit_reconciliation_report(
+            confirmed, (3,), official_bars=dup_bars
+        )
+    bad_open = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:00001"],
+            "price_date": [date(2024, 1, 6)],
+            "open": [0.0],
+        }
+    )
+    with pytest.raises(ValueError, match="non-positive or non-finite opens"):
+        build_missing_exit_reconciliation_report(
+            confirmed, (3,), official_bars=bad_open
+        )
+    bad_event = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:00001"],
+            "session": [date(2024, 1, 6)],
+            "event_kind": ["BOGUS_EVENT"],
+            "corporate_action_event_id": ["e-1"],
+        }
+    )
+    with pytest.raises(ValueError, match="unknown event kinds"):
+        build_missing_exit_reconciliation_report(
+            confirmed, (3,), corporate_events=bad_event
+        )
+
+
+def test_build_missing_exit_reconciliation_report_rejects_unknown_disposition() -> None:
     evidence = build_partitioned_outcome_evidence(
         _base(n_sessions=15),
         _calendar(),
@@ -376,7 +503,7 @@ def test_build_outcome_recovery_report_rejects_unknown_disposition() -> None:
         policy=SCHEDULED_OPEN_V1,
     )
     with pytest.raises(ValueError, match="unknown entry/exit dispositions"):
-        build_outcome_recovery_report(
+        build_missing_exit_reconciliation_report(
             evidence.with_columns(
                 pl.lit("BOGUS_DISP").alias("exit_disposition")
             ),
