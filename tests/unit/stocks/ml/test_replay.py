@@ -1148,3 +1148,33 @@ def test_replay_degraded_exit_does_not_abort_vintage() -> None:
     assert segment.missing_realized_vintage_count == 0
     assert segment.unresolved_outcome_counts == ()
 
+
+def test_replay_blocked_vintage_count_unique_sessions() -> None:
+    """Multiple blocked orders in one decision session count as one blocked vintage."""
+    sessions = _span(6)
+    scored = _scored(
+        [
+            (f"KRX:{instrument:05d}", session, 0.05 - instrument * 0.001)
+            for session in sessions
+            for instrument in range(2)
+        ]
+    )
+    realized = _realized(
+        [
+            (f"KRX:{instrument:05d}", session, 0.05, 100.0, 1.0e8, 0.02)
+            for session in sessions
+            for instrument in range(2)
+        ]
+    )
+    # Both orders in session two are blocked: two order records, one session.
+    missing_exit = {(f"KRX:{i:05d}", sessions[2]) for i in range(2)}
+    status = _typed_status_projection(scored, missing_exit=missing_exit)
+    replay = NetAlphaPolicyReplay(3, _PORTFOLIO, _RISK, liquidity_model=_LIQUIDITY)
+
+    evaluation = replay.evaluate(scored, realized, status=status)
+
+    assert len(evaluation.blocked_vintages) == 2
+    assert evaluation.blocked_vintage_count == 1
+    assert {b.decision_session for b in evaluation.blocked_vintages} == {sessions[2]}
+
+
