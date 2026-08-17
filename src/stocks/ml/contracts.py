@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from src.stocks.domain.execution_policy import ExecutionOutcomePolicy
     from src.stocks.ml.data import HorizonOutcomeCoverage
 
-DEFAULT_CANDIDATE_HORIZON_SESSIONS = (3, 5, 8, 10, 15, 20)
+DEFAULT_CANDIDATE_HORIZON_SESSIONS = (10, 20, 40)
 CANONICAL_FEATURE_SET = "stock_net_alpha_v1"
 
 OUTCOME_REALIZED = "REALIZED"
