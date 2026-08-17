@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ADR_20260817_discovery_replay_perf_optimization",
+      "date": "2026-08-17",
+      "adr_id": "ADR_20260817_ADR_20260817_discovery_replay_perf_optimization",
+      "domain": "quant",
+      "title": "Discovery Replay Optimization & Parity Hardening",
+      "why": "Horizon discovery replay took excessive time and required safe parity error handling in mock environments",
+      "resolution": "Precomputed rolling volatility, bounded lookback indexing, vector mappings, and safe no_trade model inspection",
+      "impact": "Reduced discovery execution time and resolved parity mock exception handling across the entire suite"
+    },
+    {
       "task_id": "ADR_20260817_data_storage_modernization",
       "date": "2026-08-17",
       "adr_id": "ADR_20260817_ADR_20260817_data_storage_modernization",
