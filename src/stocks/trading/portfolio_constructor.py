@@ -12,6 +12,8 @@ All frame-level transforms are vectorized Polars/NumPy; per-row filtering,
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
 from collections.abc import Mapping, Sequence
@@ -738,6 +740,44 @@ class StockRiskPolicy:
             or self.annualization_sessions <= 0
         ):
             raise ValueError("lookbacks, frequency, and annualization must be positive")
+
+
+def stock_risk_policy_fingerprint(policy: StockRiskPolicy) -> str:
+    """Deterministic canonical SHA-256 fingerprint of a frozen risk policy.
+
+    Binds every execution-relevant policy field (target counts, ranks, caps,
+    participation, no-trade band, vol/cov lookbacks, rebalance frequency,
+    annualization, hysteresis, and compounding configuration) so an independent
+    backtester can never silently replay a divergent policy than the one that
+    selected and certified an artifact.
+    """
+    payload = json.dumps(
+        {
+            "top_k": int(policy.top_k),
+            "target_count": None if policy.target_count is None else int(policy.target_count),
+            "enter_rank": int(policy.enter_rank),
+            "keep_rank": int(policy.keep_rank),
+            "gross_cap": float(policy.gross_cap),
+            "single_name_cap": float(policy.single_name_cap),
+            "sector_cap": float(policy.sector_cap),
+            "participation_limit": float(policy.participation_limit),
+            "no_trade_band_bps": float(policy.no_trade_band_bps),
+            "target_annual_volatility": float(policy.target_annual_volatility),
+            "turnover_budget": float(policy.turnover_budget),
+            "volatility_lookback_sessions": int(policy.volatility_lookback_sessions),
+            "covariance_lookback_sessions": int(policy.covariance_lookback_sessions),
+            "rebalance_frequency_sessions": int(policy.rebalance_frequency_sessions),
+            "annualization_sessions": int(policy.annualization_sessions),
+            "economic_hysteresis": bool(policy.economic_hysteresis),
+            "compounding": {
+                "enabled": bool(policy.compounding.enabled),
+                "growth_risk_aversion": float(policy.compounding.growth_risk_aversion),
+            },
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def construct_target_allocations(

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from hashlib import sha256
+from typing import TYPE_CHECKING
 
 import polars as pl
 
@@ -33,7 +34,11 @@ from src.stocks.trading.portfolio_constructor import (
     PortfolioConstraintError,
     StockRiskPolicy,
     construct_target_allocations,
+    stock_risk_policy_fingerprint,
 )
+
+if TYPE_CHECKING:
+    from src.stocks.backtesting.engine import PreparedReplayDecision
 
 _VALID_MODES = ("plan", "paper", "live")
 
@@ -152,7 +157,7 @@ def run_trading_cycle(
     gated = _drop_label_columns(research_eligible_frame(universe_gate))
     feature_frame = (
         gated
-        if manifest.feature_set == "stock_alpha_v2"
+        if manifest.feature_set in ("stock_alpha_v2", "stock_net_alpha_v1")
         else build_features(gated, phase1_allowlist())
     )
     scored = loaded.model.predict(feature_frame)
@@ -160,7 +165,11 @@ def run_trading_cycle(
     if scored.is_empty():
         return _no_trade_result(request, manifest, portfolio, dataset_hash, "empty-scored-panel")
 
-    if getattr(loaded.model, "no_trade", False):
+    if (
+        getattr(loaded.model, "no_trade", False)
+        or getattr(loaded, "model_type", "") == "no_trade"
+        or getattr(loaded.model, "manifest", lambda: None)().params.get("no_trade") == "true"
+    ):
         return _no_trade_result(request, manifest, portfolio, dataset_hash, "no-trade-artifact")
 
     latest = scored.select(pl.col("session").max()).to_series()[0]
@@ -203,6 +212,135 @@ def run_trading_cycle(
         intents=tuple(sorted(intents, key=lambda i: i.instrument_id)),
         selected_instruments=selected,
         reasons=reasons,
+        universe_hash=fingerprints["universe_hash"],
+        feature_hash=fingerprints["feature_hash"],
+        label_hash=fingerprints["label_hash"],
+        cost_hash=fingerprints["cost_hash"],
+        risk_policy_hash=fingerprints["risk_policy_hash"],
+    )
+
+
+def plan_prepared_scored_cycle(
+    prepared: PreparedReplayDecision,
+    portfolio: PortfolioSnapshot,
+    request: TradingCycleRequest,
+    instruments: Mapping[str, Instrument],
+    dataset_hash: str,
+) -> TradingCycleResult:
+    """Plan one cycle from an already-causal-calibrated prepared decision.
+
+    Consumes the compact bounded ``PreparedReplayDecision.visible`` carrying the
+    pre-calibrated production score and economic columns, then runs the exact
+    same allocation constructor, intent builder, and no-trade constructors used
+    by the live/paper path. The only difference from ``run_trading_cycle`` is
+    that the model artifact is never re-scored: the frozen causal score is
+    injected directly, so a replay step and a paper cycle produce identical
+    targets for identical inputs.
+    """
+    visible = prepared.visible
+    if visible.is_empty():
+        return _no_trade_result_prepared(
+            request, portfolio, dataset_hash, "no-rows-available-at-decision-time"
+        )
+    validate_stock_rows_available(visible, request.decision_time)
+    portfolio.validate_as_of(request.decision_time)
+
+    universe_gate = _universe_gate(visible)
+    if universe_gate.is_empty():
+        return _no_trade_result_prepared(
+            request, portfolio, dataset_hash, "empty-universe-after-gate"
+        )
+
+    gated = _drop_label_columns(research_eligible_frame(universe_gate))
+    scored = _adapt_score_column(gated, "stock_net_alpha_v1")
+    if scored.is_empty():
+        return _no_trade_result_prepared(
+            request, portfolio, dataset_hash, "empty-scored-panel"
+        )
+
+    latest = scored.select(pl.col("session").max()).to_series()[0]
+    cross_section = scored.filter(pl.col("session") == latest)
+    if cross_section.is_empty():
+        return _no_trade_result_prepared(
+            request, portfolio, dataset_hash, "empty-latest-cross-section"
+        )
+
+    try:
+        allocations = construct_target_allocations(
+            scored, instruments, portfolio, request.risk_policy
+        )
+    except PortfolioConstraintError as exc:
+        return _no_trade_result_prepared(
+            request, portfolio, dataset_hash, f"constraint:{exc}"
+        )
+
+    if not allocations:
+        return _no_trade_result_prepared(
+            request, portfolio, dataset_hash, "no-feasible-allocation"
+        )
+
+    intents = _build_intents(allocations, portfolio, request)
+    fingerprints = _fingerprints_prepared(request)
+    cycle_id = _cycle_id(request, None, portfolio, dataset_hash)
+
+    selected = tuple(
+        sorted({a.instrument.instrument_id for a in allocations})
+    )
+    de_risk = any(a.reason == "de-risk-sell-only" for a in allocations)
+    reasons = (
+        f"cross_section_session={latest.isoformat()}",
+        f"coverage={len(cross_section)}",
+        "constraints=de-risk" if de_risk else "constraints=ok",
+    )
+    return TradingCycleResult(
+        status=CycleStatus.DE_RISK if de_risk else CycleStatus.PLANNED,
+        cycle_id=cycle_id,
+        decision_time=request.decision_time,
+        dataset_hash=dataset_hash,
+        artifact_id=request.artifact_id,
+        account_snapshot_id=portfolio.account_snapshot_id,
+        allocations=tuple(sorted(allocations, key=lambda a: a.instrument.instrument_id)),
+        intents=tuple(sorted(intents, key=lambda i: i.instrument_id)),
+        selected_instruments=selected,
+        reasons=reasons,
+        universe_hash=fingerprints["universe_hash"],
+        feature_hash=fingerprints["feature_hash"],
+        label_hash=fingerprints["label_hash"],
+        cost_hash=fingerprints["cost_hash"],
+        risk_policy_hash=fingerprints["risk_policy_hash"],
+    )
+
+
+def _fingerprints_prepared(request: TradingCycleRequest) -> dict[str, str]:
+    """Prepared-cycle fingerprints: manifest provenance is unavailable, so only
+    the frozen risk policy is bound; the cycle hash still covers the rows."""
+    return {
+        "universe_hash": "",
+        "feature_hash": "",
+        "label_hash": "",
+        "cost_hash": "",
+        "risk_policy_hash": stock_risk_policy_fingerprint(request.risk_policy),
+    }
+
+
+def _no_trade_result_prepared(
+    request: TradingCycleRequest,
+    portfolio: PortfolioSnapshot,
+    dataset_hash: str,
+    reason: str,
+) -> TradingCycleResult:
+    fingerprints = _fingerprints_prepared(request)
+    return TradingCycleResult(
+        status=CycleStatus.NO_TRADE,
+        cycle_id=_cycle_id(request, None, portfolio, dataset_hash),
+        decision_time=request.decision_time,
+        dataset_hash=dataset_hash,
+        artifact_id=request.artifact_id,
+        account_snapshot_id=portfolio.account_snapshot_id,
+        allocations=(),
+        intents=(),
+        selected_instruments=(),
+        reasons=(reason,),
         universe_hash=fingerprints["universe_hash"],
         feature_hash=fingerprints["feature_hash"],
         label_hash=fingerprints["label_hash"],
@@ -328,10 +466,11 @@ def _no_trade_result(
 
 def _cycle_id(
     request: TradingCycleRequest,
-    manifest: DatasetManifest,
+    manifest: DatasetManifest | None,
     portfolio: PortfolioSnapshot,
     dataset_hash: str,
 ) -> str:
+    del manifest
     key = "|".join(
         (
             request.strategy_id,
@@ -391,8 +530,8 @@ def _adapt_score_column(
     is applied only at the workflow boundary so the domain code stays
     net-alpha-independent.
     """
-    if feature_set != "stock_net_alpha_v1":
-        return scored
     if "predicted_net_alpha" in scored.columns and "pred_score" not in scored.columns:
-        return scored.rename({"predicted_net_alpha": "pred_score"})
+        scored = scored.rename({"predicted_net_alpha": "pred_score"})
+    if "adtv" not in scored.columns and "adtv_20d" in scored.columns:
+        scored = scored.with_columns(pl.col("adtv_20d").alias("adtv"))
     return scored

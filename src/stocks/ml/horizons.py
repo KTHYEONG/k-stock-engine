@@ -311,18 +311,20 @@ def select_horizons(
     bootstrap_alpha: float,
     seed: int,
     n_bootstrap: int = DEFAULT_BOOTSTRAP_RESAMPLES,
+    rebalance_frequency_sessions: int = 1,
 ) -> HorizonSelectionEvidence:
     """Select at most one economically admissible primary ``(horizon, profile)``.
 
     Selection is evidence-only: every candidate's base and stress per-vintage
     log-growth series are resampled in session units (segment-local, block
-    length at least the candidate horizon, never across segment boundaries) and
-    one-sided centered p-values are computed for the null ``mean(g) <= 0``.
-    Holm-Bonferroni is applied across every pre-registered candidate
-    ``(horizon, profile)`` pair; a pair is admissible only when both its base
-    and stress adjusted lower growth are strictly positive. The primary is the
-    admissible pair with the maximum stress-cost adjusted lower growth (ties
-    prefer the shorter horizon then the lexicographically smaller profile id).
+    length at least ``max(horizon, rebalance_frequency_sessions)``, never
+    across segment boundaries) and one-sided centered p-values are computed for
+    the null ``mean(g) <= 0``. Holm-Bonferroni is applied across every
+    pre-registered candidate ``(horizon, profile)`` pair; a pair is admissible
+    only when both its base and stress adjusted lower growth are strictly
+    positive. The primary is the admissible pair with the maximum stress-cost
+    adjusted lower growth (ties prefer the shorter horizon then the
+    lexicographically smaller profile id).
     ``primary_horizon_sessions``/``primary_profile_id`` are ``None`` when no
     pair is admissible (the ``NO_TRADE`` outcome).
 
@@ -334,6 +336,8 @@ def select_horizons(
         seed: deterministic bootstrap seed.
         n_bootstrap: request-controlled moving-block bootstrap resample count;
             values below two are rejected.
+        rebalance_frequency_sessions: the frozen risk policy's rebalance
+            cadence; the bootstrap block floor is ``max(horizon, cadence)``.
 
     Returns:
         ``HorizonSelectionEvidence``; ``primary_horizon_sessions`` is ``None``
@@ -345,6 +349,8 @@ def select_horizons(
         raise ValueError("bootstrap_alpha must be in (0, 1)")
     if n_bootstrap < 2:
         raise ValueError("n_bootstrap must be at least 2")
+    if rebalance_frequency_sessions < 1:
+        raise ValueError("rebalance_frequency_sessions must be positive")
 
     ordered = tuple(
         sorted(evidence, key=lambda candidate: (candidate.horizon_sessions, candidate.profile_id))
@@ -352,20 +358,21 @@ def select_horizons(
     bootstrap: dict[tuple[int, str], dict[str, _CohortBootstrap | None]] = {}
     for candidate in ordered:
         key = _frontier_key(candidate.horizon_sessions, candidate.profile_id)
+        block_floor = max(candidate.horizon_sessions, rebalance_frequency_sessions)
         bootstrap[key] = {
             "base": _cohort_bootstrap(
                 candidate.base_log_growth,
                 candidate.cohort_segment_ids,
                 n_bootstrap,
                 seed,
-                min_block_length=candidate.horizon_sessions,
+                min_block_length=block_floor,
             ),
             "stress": _cohort_bootstrap(
                 candidate.stress_log_growth,
                 candidate.cohort_segment_ids,
                 n_bootstrap,
                 seed + candidate.horizon_sessions,
-                min_block_length=candidate.horizon_sessions,
+                min_block_length=block_floor,
             ),
         }
 
