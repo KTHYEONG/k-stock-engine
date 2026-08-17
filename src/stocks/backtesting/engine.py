@@ -194,6 +194,7 @@ class BacktestResult:
     metrics: dict[str, float]
     stress_final_value: float | None = None
     stress_metrics: dict[str, float] | None = None
+    stress_ledger: tuple[BacktestLedgerRow, ...] = ()
     data_quality: dict[str, str] = field(default_factory=dict)
     planned_cycles: int = 0
     attempted_orders: int = 0
@@ -486,6 +487,8 @@ class StockBacktester:
         policy: ExecutionOutcomePolicy | None = None,
         decision_provider: ReplayDecisionProvider | None = None,
         scenario_planner: ReplayScenarioPlanner | None = None,
+        base_liquidity_model: LiquiditySlippageModel | None = None,
+        stress_liquidity_model: LiquiditySlippageModel | None = None,
     ):
         self.planner = planner
         self.registry = registry
@@ -499,6 +502,8 @@ class StockBacktester:
         self.policy = policy or ExecutionOutcomePolicy(policy_id="scheduled_open_v1")
         self.decision_provider = decision_provider
         self.scenario_planner = scenario_planner
+        self.base_liquidity_model = base_liquidity_model
+        self.stress_liquidity_model = stress_liquidity_model
         self._score_overlay: np.ndarray | None = None
         self._last_cycles: dict[int, TradingCycleResult] = {}
         self.prepared_decision_count = 0
@@ -561,12 +566,14 @@ class StockBacktester:
         metrics = self._metrics(ledger, trades)
         stress_final_value: float | None = None
         stress_metrics: dict[str, float] | None = None
+        stress_ledger_rows: tuple[BacktestLedgerRow, ...] = ()
         if self.stress_cost_schedule is not None:
             stress_ledger, _stress_trades, _ = self._run_ledger(
                 panel, by_session, sessions, artifacts, initial_portfolio, request,
                 self.stress_cost_schedule, self._liquidity_model(stress=True),
                 adtv=adtv,
             )
+            stress_ledger_rows = tuple(stress_ledger)
             stress_metrics = self._metrics(stress_ledger, _stress_trades)
             stress_final_value = stress_ledger[-1].equity if stress_ledger else None
         planned_cycles = sum(
@@ -594,6 +601,7 @@ class StockBacktester:
             metrics=metrics,
             stress_final_value=stress_final_value,
             stress_metrics=stress_metrics,
+            stress_ledger=stress_ledger_rows,
             data_quality=self._data_quality_evidence(),
             planned_cycles=planned_cycles,
             attempted_orders=attempted_orders,
@@ -789,7 +797,9 @@ class StockBacktester:
         metrics = self._metrics(ledger, trades)
         stress_final_value: float | None = None
         stress_metrics: dict[str, float] | None = None
+        stress_ledger_rows: tuple[BacktestLedgerRow, ...] = ()
         if self.stress_cost_schedule is not None:
+            stress_ledger_rows = tuple(stress_state.ledger)
             stress_metrics = self._metrics(
                 stress_state.ledger, stress_state.trades
             )
@@ -821,6 +831,7 @@ class StockBacktester:
             metrics=metrics,
             stress_final_value=stress_final_value,
             stress_metrics=stress_metrics,
+            stress_ledger=stress_ledger_rows,
             data_quality=self._data_quality_evidence(),
             planned_cycles=planned_cycles,
             attempted_orders=base_state.attempted_orders,
@@ -1016,6 +1027,11 @@ class StockBacktester:
 
     def _liquidity_model(self, *, stress: bool) -> LiquiditySlippageModel | None:
         """Resolve the explicit dynamic liquidity model for a ledger run."""
+        if stress:
+            if self.stress_liquidity_model is not None:
+                return self.stress_liquidity_model
+        elif self.base_liquidity_model is not None:
+            return self.base_liquidity_model
         if self.cost_evidence is None:
             return None
         return (
@@ -1401,7 +1417,8 @@ class StockBacktester:
             )
             gross = quantity * fill_price
             buy_rate = self._fill_cost_rate(
-                evidence, instrument_id, "BUY", session, gross, adtv, volatility, stress,
+                evidence, instrument_id, "BUY", session, gross, adtv, volatility,
+                stress, schedule,
             )
             if gross * (1.0 + buy_rate) > settled_cash:
                 affordable = int(settled_cash // (fill_price * (1.0 + buy_rate)))
@@ -1416,7 +1433,8 @@ class StockBacktester:
                 )
                 gross = quantity * fill_price
                 buy_rate = self._fill_cost_rate(
-                    evidence, instrument_id, "BUY", session, gross, adtv, volatility, stress,
+                    evidence, instrument_id, "BUY", session, gross, adtv, volatility,
+                    stress, schedule,
                 )
             cost = gross * buy_rate
             settled_cash -= gross
@@ -1454,7 +1472,8 @@ class StockBacktester:
             )
             gross = sell_qty * fill_price
             sell_rate = self._fill_cost_rate(
-                evidence, instrument_id, "SELL", session, gross, adtv, volatility, stress,
+                evidence, instrument_id, "SELL", session, gross, adtv, volatility,
+                stress, schedule,
             )
             cost = gross * sell_rate
             positions[instrument_id] = held - sell_qty
@@ -1515,6 +1534,9 @@ class StockBacktester:
     def _tick_for(self, price: float, effective_time: datetime) -> float:
         if self.cost_evidence is not None:
             return self.cost_evidence.tick_schedule.tick_size(price, effective_time)
+        model = self.base_liquidity_model or self.stress_liquidity_model
+        if model is not None:
+            return model.tick_schedule.tick_size(price, effective_time)
         return 1.0
 
     def _fill_cost_rate(
@@ -1527,10 +1549,16 @@ class StockBacktester:
         adtv_20d: float,
         daily_volatility: float | None,
         stress: bool,
+        schedule: CostSchedule,
     ) -> float:
-        """Commission plus statutory tax only; spread/impact live in the fill price."""
+        """Commission plus statutory tax only; spread/impact live in the fill price.
+
+        Without a hash-bound evidence artifact the commission/tax comes from the
+        scenario's own effective cost schedule so base and stress runs each use
+        their declared schedule.
+        """
         if evidence is None:
-            point = self.cost_schedule.cost_for(effective_time)
+            point = schedule.cost_for(effective_time)
             rate = point.commission_rate
             if side == "SELL":
                 rate += point.tax_rate

@@ -862,9 +862,7 @@ class CausalCalibrationAdapter:
             raise ValueError(f"apply requires a {SCORE_COLUMN!r} score column")
         prepared = scored.rename({SCORE_COLUMN: "score"})
         augmented = CausalAlphaCalibrator.apply_prepared(self._state, prepared)
-        return augmented.drop(
-            "expected_active_alpha", "alpha_lower_bound", "exit_cost_rate"
-        ).with_columns(
+        return augmented.drop("__bucket", strict=False).with_columns(
             pl.col("expected_net_alpha").cast(pl.Float64),
             pl.col("net_alpha_lower_bound").cast(pl.Float64),
         ).rename({"score": SCORE_COLUMN})
