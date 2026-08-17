@@ -50,6 +50,7 @@ def main(args: list[str] | None = None) -> int:
         default="research",
         help="paper/live modes reject provisional snapshots",
     )
+    parser.add_argument("--feature-set", default=None, help="feature set identifier")
     parser.add_argument("--decision-time", type=datetime.fromisoformat, default=None)
     parsed = parser.parse_args(args)
 
@@ -63,9 +64,10 @@ def main(args: list[str] | None = None) -> int:
         feature_root=parsed.feature_root,
         label_root=parsed.label_root,
     )
+    feature_set = parsed.feature_set or "stock_net_alpha_v1"
     composed = repository.compose_training_snapshot(
         snapshot,
-        feature_set=settings.feature_set,
+        feature_set=feature_set,
         decision_time=decision_time,
     )
 
