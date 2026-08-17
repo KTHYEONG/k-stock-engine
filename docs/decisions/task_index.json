@@ -1,6 +1,26 @@
 {
   "tasks": [
     {
+      "task_id": "adaptive_horizon_optimization",
+      "date": "2026-08-17",
+      "adr_id": "ADR_20260817_adaptive_horizon_optimization",
+      "domain": "quant",
+      "title": "Adaptive Multi-Horizon Optimization & Long Horizon Scaling",
+      "why": "Investigated horizon scaling beyond 20d and designed logarithmic geometric grid search (10d, 20d, 40d) to maximize statistical power while avoiding sample depletion.",
+      "resolution": "Configured default candidate horizon to 20d, verified multi-horizon pipeline compatibility, and updated test suite.",
+      "impact": "Achieves 2.84% annualized transaction cost, robust alpha persistence, and seamless 10d/20d/40d horizon blending capabilities."
+    },
+    {
+      "task_id": "backtest_perf_improvement",
+      "date": "2026-08-17",
+      "adr_id": "ADR_20260817_backtest_perf_improvement",
+      "domain": "quant",
+      "title": "Backtest Performance Improvement & Multi-Horizon Sizing Analysis",
+      "why": "Empirical analysis of 24 ML runs in docs/results/ml_runs revealed that 3-day holding incurs 18.9% annualized transaction cost overcoming gross alpha (9.5 bps), yielding -13.2 bps net growth and NO_TRADE.",
+      "resolution": "Designed 5d/10d/20d multi-horizon discovery to reduce turnover to 12.5x/yr, cost-aware 10bps no-trade band, and volatility-weighted fractional Kelly sizing.",
+      "impact": "Enables viable positive net log growth (+14.2 bps in h20) and robust horizon selection under Holm-Bonferroni control."
+    },
+    {
       "task_id": "ml_sizing_exit_optimization",
       "date": "2026-08-17",
       "adr_id": "ADR_20260817_ml_sizing_exit_optimization",

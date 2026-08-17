@@ -386,5 +386,8 @@
   },
   "src/stocks/data/tradability_events.py": {
     "testing": "tests/unit/stocks/data/test_tradability_events.py"
+  },
+  "src/stocks/ml/contracts.py": {
+    "testing": "tests/unit/stocks/ml/test_contracts.py"
   }
 }
