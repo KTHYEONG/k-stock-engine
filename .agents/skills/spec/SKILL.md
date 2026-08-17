@@ -26,10 +26,11 @@ Produce an unambiguous implementation plan and precision contract (`contract.jso
    - **Blueprint (`docs/specs/<feature>.md`)**: Core architecture, rationale, and failure-mode mitigations.
    - **Precision Contract (`docs/specs/<feature>_contract.json`)**:
      - `target_file`: Absolute path to modify or create.
+     - `context_files`: Array of relative/absolute paths to prerequisite definitions, models, or utilities for direct zero-search context loading.
      - `symbol` & `signature`: Full type-hinted signature.
      - `scenarios`: Array of `{ scenario_id, target_test_file, expected_behavior }` (include edge/boundary cases).
      - `requirements`: Explicit fail-closed exceptions, vectorization, or performance rules.
-     - `wiring`: Declarative caller hook (`caller_file`, `anchor`, `import_symbol`, `invocation_expression`).
+     - `wiring`: Declarative caller hook (`caller_file`, `anchor` with exact target function/class name, `import_symbol`, `invocation_expression`).
 
 5. **Self-Validation Gate**:
    - Verify contract integrity before completing:
@@ -39,10 +40,11 @@ Produce an unambiguous implementation plan and precision contract (`contract.jso
 
 ## Chat Output Format
 
-Keep chat response under 5 lines:
+Keep chat response concise and provide copy-pasteable execution command:
 
 ### 📐 [SPEC] <Task Title>
 - **Goal**: <1-line objective>
 - **Diagnosis**: `[Component]` -> <1-line bottleneck>
 - **Solution**: <1-line architecture decision>
 - **Artifacts**: [`<feature>.md`](file:///docs/specs/<feature>.md), [`<feature>_contract.json`](file:///docs/specs/<feature>_contract.json)
+- **Next Command**: `/implement docs/specs/<feature>_contract.json`
