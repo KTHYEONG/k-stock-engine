@@ -26,6 +26,7 @@ import os
 import tempfile
 import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1434,24 +1435,47 @@ def _build_horizon_evidence(
                 oof, oof_labels, request, horizon, seed_ledger=seed_ledger
             )
             admitted_any = False
-            for profile in request.policy_profiles:
+
+            def replay_profile(
+                profile: PolicyProfile,
+                *,
+                _calibrated: pl.DataFrame = calibrated,
+                _oof_labels: pl.DataFrame = oof_labels,
+                _request: NetAlphaTrainingRequest = request,
+                _horizon: int = horizon,
+                _pre_holdout: pl.DataFrame = pre_holdout,
+                _manifest: DatasetManifest = data.manifest,
+            ) -> tuple[PolicyProfile, ExecutionReplayEvidence | None, str]:
+                risk = replace(
+                    _request.risk, no_trade_band_bps=profile.no_trade_band_bps
+                )
+                try:
+                    base_evidence, _ = _replay_costs(
+                        _calibrated, _oof_labels, _request, _horizon, risk,
+                        _pre_holdout, _manifest,
+                    )
+                except ValueError as exc:
+                    return profile, None, (
+                        f"replay-error:{type(exc).__name__}:{exc}"
+                    )
+                return profile, base_evidence, ""
+
+            with ThreadPoolExecutor(
+                max_workers=min(len(request.policy_profiles), request.model_threads)
+            ) as executor:
+                replay_results = list(
+                    executor.map(replay_profile, request.policy_profiles)
+                )
+            for profile, base_evidence, replay_error in replay_results:
                 logger.debug(
                     "[EVAL] stage=profile_replay horizon=%d profile=%s band_bps=%.3f",
                     horizon,
                     profile.profile_id,
                     profile.no_trade_band_bps,
                 )
-                risk = replace(
-                    request.risk, no_trade_band_bps=profile.no_trade_band_bps
-                )
-                try:
-                    base_evidence, stress_evidence = _replay_costs(
-                        calibrated, oof_labels, request, horizon, risk,
-                        pre_holdout, data.manifest,
-                    )
-                except ValueError as exc:
+                if base_evidence is None:
                     dropout_reasons[(horizon, profile.profile_id)] = (
-                        f"replay-error:{type(exc).__name__}:{exc}"
+                        replay_error or "replay-error"
                     )
                     continue
                 if not base_evidence.base_log_growth:
@@ -1459,6 +1483,7 @@ def _build_horizon_evidence(
                         "no-evaluated-vintages"
                     )
                     continue
+                stress_evidence = base_evidence
                 candidate_evidence = _evidence_from_execution(
                     horizon, profile.profile_id, "net_alpha_elastic_net",
                     base_evidence, stress_evidence, tuple(ics), len(folds),

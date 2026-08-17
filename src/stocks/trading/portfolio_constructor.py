@@ -793,15 +793,16 @@ def construct_target_allocations(
     """
     _validate_scores_frame(scores, instruments)
     panel = scores.sort([_SESSION_COLUMN, "instrument_id"])
-    returns = _returns_column(panel)
-    panel = panel.with_columns(
-        returns.rolling_std(
-            window_size=policy.volatility_lookback_sessions,
-            min_samples=2,
+    if "__vol" not in panel.columns:
+        returns = _returns_column(panel)
+        panel = panel.with_columns(
+            returns.rolling_std(
+                window_size=policy.volatility_lookback_sessions,
+                min_samples=2,
+            )
+            .over("instrument_id")
+            .alias("__vol"),
         )
-        .over("instrument_id")
-        .alias("__vol"),
-    )
 
     cross_section = _latest_cross_section(panel)
     eligible = cross_section.filter(
@@ -852,9 +853,13 @@ def construct_target_allocations(
     net_lower_bound_of: dict[str, float] = {}
     if policy.compounding.enabled and "net_alpha_lower_bound" in cross_section.columns:
         net_lower_bound_of = {
-            str(r["instrument_id"]): float(r["net_alpha_lower_bound"])
-            for r in cross_section.to_dicts()
-            if r["net_alpha_lower_bound"] is not None
+            str(instrument_id): float(value)
+            for instrument_id, value in zip(
+                cross_section["instrument_id"].to_list(),
+                cross_section["net_alpha_lower_bound"].to_list(),
+                strict=True,
+            )
+            if value is not None
         }
         for instrument_id in ids:
             if instrument_id not in net_lower_bound_of or not math.isfinite(
@@ -875,9 +880,29 @@ def construct_target_allocations(
                     cash_reason="invalid-confidence-variance",
                 )
                 return ()
-    sector_of = {str(r["instrument_id"]): r["sector"] for r in cross_section.to_dicts()}
-    adtv_of = {str(r["instrument_id"]): float(r["adtv"]) for r in cross_section.to_dicts()}
-    vol_of = {str(r["instrument_id"]): float(r["__vol"]) for r in ranked.to_dicts()}
+    sector_of = dict(
+        zip(
+            (str(i) for i in cross_section["instrument_id"].to_list()),
+            cross_section["sector"].to_list(),
+            strict=True,
+        )
+    )
+    adtv_of = {
+        str(instrument_id): float(value)
+        for instrument_id, value in zip(
+            cross_section["instrument_id"].to_list(),
+            cross_section["adtv"].to_list(),
+            strict=True,
+        )
+    }
+    vol_of = {
+        str(instrument_id): float(value)
+        for instrument_id, value in zip(
+            ranked["instrument_id"].to_list(),
+            ranked["__vol"].to_list(),
+            strict=True,
+        )
+    }
     priority_alpha_of = _priority_alpha_of(
         ranked, incumbent_ids, cross_section
     )
@@ -949,9 +974,13 @@ def _latest_cross_section(panel: pl.DataFrame) -> pl.DataFrame:
 
 def _price_map(cross_section: pl.DataFrame) -> dict[str, float]:
     return {
-        str(row["instrument_id"]): float(row["close"])
-        for row in cross_section.select(["instrument_id", "close"]).to_dicts()
-        if row["close"] is not None
+        str(instrument_id): float(close)
+        for instrument_id, close in zip(
+            cross_section["instrument_id"].to_list(),
+            cross_section["close"].to_list(),
+            strict=True,
+        )
+        if close is not None
     }
 
 
@@ -1030,20 +1059,27 @@ def _priority_alpha_of(
     if "expected_net_alpha" not in ranked.columns:
         return {}
     ids = [str(r) for r in ranked["instrument_id"].to_list()]
+    ids_series = cross_section["instrument_id"].to_list()
     net_alpha = {
-        str(r["instrument_id"]): float(r["expected_net_alpha"])
-        for r in cross_section.to_dicts()
-        if r["expected_net_alpha"] is not None
+        str(instrument_id): float(value)
+        for instrument_id, value in zip(
+            ids_series, cross_section["expected_net_alpha"].to_list(), strict=True
+        )
+        if value is not None
     }
     active_alpha = {
-        str(r["instrument_id"]): float(r["expected_active_alpha"])
-        for r in cross_section.to_dicts()
-        if r["expected_active_alpha"] is not None
+        str(instrument_id): float(value)
+        for instrument_id, value in zip(
+            ids_series, cross_section["expected_active_alpha"].to_list(), strict=True
+        )
+        if value is not None
     }
     exit_cost = {
-        str(r["instrument_id"]): float(r["exit_cost_rate"])
-        for r in cross_section.to_dicts()
-        if r["exit_cost_rate"] is not None
+        str(instrument_id): float(value)
+        for instrument_id, value in zip(
+            ids_series, cross_section["exit_cost_rate"].to_list(), strict=True
+        )
+        if value is not None
     }
     priority: dict[str, float] = {}
     for instrument_id in ids:
