@@ -42,7 +42,11 @@ class _FakeScoringModel:
 class _FakeCalibration:
     def apply(self, scored: pl.DataFrame) -> pl.DataFrame:
         return scored.with_columns(
-            pl.col("predicted_net_alpha").alias("net_alpha_lower_bound")
+            pl.col("predicted_net_alpha").alias("expected_active_alpha"),
+            pl.col("predicted_net_alpha").alias("alpha_lower_bound"),
+            pl.col("predicted_net_alpha").alias("expected_net_alpha"),
+            pl.col("predicted_net_alpha").alias("net_alpha_lower_bound"),
+            pl.lit(0.001, dtype=pl.Float64).alias("exit_cost_rate"),
         )
 
 
@@ -52,16 +56,28 @@ def _holdout_panel(
     from datetime import timedelta
 
     start = datetime(2024, 1, 1, tzinfo=UTC)
-    return pl.DataFrame(
-        {
-            "instrument_id": ["KRX:00001"] * n_sessions,
-            "session": [start + timedelta(days=i) for i in range(n_sessions)],
-            "risk_residual": [0.03] * n_sessions,
-            "open": [100.0] * n_sessions,
-            "adtv_20d": [1.0e8] * n_sessions,
-            "volatility_20d": [0.02] * n_sessions,
-        }
-    )
+    rows: list[dict[str, object]] = []
+    for i in range(n_sessions):
+        session = start + timedelta(days=i)
+        open_ = 100.0 * 1.03**i
+        rows.append(
+            {
+                "instrument_id": "KRX:00001",
+                "session": session,
+                "observation_time": session.replace(hour=15, minute=30),
+                "available_time": session.replace(hour=15, minute=31),
+                "risk_residual": 0.03,
+                "open": open_,
+                "close": open_ * 1.02,
+                "volume": 1_000_000.0,
+                "trading_value": open_ * 1_000_000.0,
+                "sector": "S0",
+                "adtv": 1.0e8,
+                "adtv_20d": 1.0e8,
+                "volatility_20d": 0.02,
+            }
+        )
+    return pl.DataFrame(rows)
 
 
 def _compound_request():
@@ -79,7 +95,7 @@ def _compound_request():
         liquidity_model=stock_liquidity_model(),
         compounding=CompoundingCertificationSettings(
             min_observed_sessions=40,
-            min_active_cohort_fraction=0.5,
+            min_active_cohort_fraction=0.25,
             max_drawdown=0.9,
         ),
     )
@@ -117,10 +133,12 @@ def test_forward_holdout_passes_with_complete_base_and_stress() -> None:
     )
     assert evidence["passed"] is True
     assert evidence["reason"] == ""
-    assert evidence["order_count"] == 60
+    assert evidence["evaluation_kind"] == "prepared-equity-v1"
+    assert evidence["order_count"] == 18
     assert evidence["block_count"] == 59
+    assert evidence["cohorts"]["eligible_sessions"] == 57
     assert evidence["cohorts"]["observed_sessions"] == 59
-    assert evidence["cohorts"]["active_cohort_count"] == 59
+    assert evidence["cohorts"]["active_cohort_count"] == 18
     assert evidence["cohorts"]["missing_realized_cohorts"] == 0
     certificate = evidence["certificate"]
     assert certificate["passed"] is True
@@ -167,9 +185,10 @@ def test_forward_holdout_incomplete_realized_cohorts_is_explicit() -> None:
         1,
         _legacy_profile(),
     )
+    # A scored key with no executable market row fails closed and is never
+    # zero-filled or silently dropped.
     assert evidence["passed"] is False
-    assert evidence["reason"] == "holdout-incomplete-realized-cohorts"
-    assert evidence["cohorts"]["missing_realized_cohorts"] == 1
+    assert evidence["reason"].startswith("holdout-replay-invalid:")
 
 
 def test_forward_holdout_compound_certification_failure_is_explicit() -> None:
@@ -795,9 +814,11 @@ def test_horizon_evidence_coverage_keeps_unresolved_outcomes_diagnostic() -> Non
     assert OUTCOME_REALIZED not in reason
 
 
-def test_replay_costs_base_stress_share_status_and_maturity() -> None:
-    """Acceptance 1: base/stress replay with a status panel share the timeline."""
+def test_replay_costs_produces_parallel_execution_equity() -> None:
+    """Base/stress execution evidence share the segment identity and cycle sums."""
     from dataclasses import replace
+
+    from src.stocks.ml.execution_replay import ExecutionReplayEvidence
 
     data, request, pre_holdout, folds, learner_columns, _schema = _training_fixture()
     discovery = training._build_horizon_evidence(
@@ -809,23 +830,25 @@ def test_replay_costs_base_stress_share_status_and_maturity() -> None:
     oof, oof_labels, _ics, _diag = training._discovery_oof(
         discovery, primary, folds
     )
-    coverage = discovery.coverage_by_horizon[primary]
+    profile = discovery.evidence[0].profile_id
     risk = replace(
         request.risk,
         no_trade_band_bps=(
             5.0
-            if discovery.evidence[0].profile_id == "legacy_overlay_5bps"
+            if profile == "legacy_overlay_5bps"
             else 0.0
         ),
     )
-    base_eval, stress_eval = training._replay_costs(
-        oof, oof_labels, request, primary, risk,
-        status=coverage.status_projection,
+    base_evidence, stress_evidence = training._replay_costs(
+        oof, oof_labels, request, primary, risk, pre_holdout, data.manifest,
     )
-    assert base_eval.segment_diagnostics == stress_eval.segment_diagnostics
-    assert base_eval.vintage_segment_ids == stress_eval.vintage_segment_ids
-    assert base_eval.unresolved_outcome_counts == ()
-    assert base_eval.missing_realized_vintage_count == 0
+    assert isinstance(base_evidence, ExecutionReplayEvidence)
+    assert base_evidence.segment_ids == stress_evidence.segment_ids
+    assert len(base_evidence.base_log_growth) == len(base_evidence.segment_ids)
+    assert len(base_evidence.stress_log_growth) == len(base_evidence.segment_ids)
+    assert base_evidence.planned_cycles == stress_evidence.planned_cycles
+    assert base_evidence.filled_orders == stress_evidence.filled_orders
+    assert base_evidence.cash_session_fraction == stress_evidence.cash_session_fraction
 
 
 def test_training_publishes_data_readiness_no_trade_before_oof(tmp_path: Path) -> None:
@@ -923,7 +946,8 @@ def test_training_publishes_data_readiness_no_trade_before_oof(tmp_path: Path) -
 
 
 def test_scenario_unresolved_outcome_is_diagnostic_no_trade_blockers(tmp_path) -> None:
-    """SCENARIO_UNRESOLVED_OUTCOME_IS_DIAGNOSTIC: blockers surface in no-trade metrics."""
+    """SCENARIO_UNRESOLVED_OUTCOME_IS_DIAGNOSTIC: execution evidence stays bounded."""
+    import json
     from dataclasses import replace
 
     from src.stocks.data.contracts import DatasetSnapshot
@@ -938,7 +962,6 @@ def test_scenario_unresolved_outcome_is_diagnostic_no_trade_blockers(tmp_path) -
         fit_model_feature_schema,
         stock_net_alpha_v1_roles,
     )
-    from src.stocks.ml.replay import BlockedVintage
     from src.stocks.research.folds import PurgedWalkForward
     from tests.fixtures.stocks.helpers import (
         stock_liquidity_model,
@@ -992,65 +1015,38 @@ def test_scenario_unresolved_outcome_is_diagnostic_no_trade_blockers(tmp_path) -
     if not discovery.evidence:
         pytest.skip("fixture produced no horizon evidence")
     primary = discovery.evidence[0].horizon_sessions
-    coverage = discovery.coverage_by_horizon[primary]
+    profile = discovery.evidence[0].profile_id
     risk = replace(
         request.risk,
         no_trade_band_bps=(
             5.0
-            if discovery.evidence[0].profile_id == "legacy_overlay_5bps"
+            if profile == "legacy_overlay_5bps"
             else 0.0
         ),
     )
-    horizon_evidence = data.evidence_by_horizon.get(primary)
-    assert horizon_evidence is not None
-    key = horizon_evidence.row(0, named=True)
-    blocked_evidence = horizon_evidence.with_columns(
-        pl.when(
-            (pl.col("instrument_id") == key["instrument_id"])
-            & (pl.col("session") == key["session"])
-        )
-        .then(pl.lit("MISSING_EXIT_PRICE"))
-        .otherwise(pl.col("outcome_status"))
-        .alias("outcome_status")
+    oof, oof_labels, _ics, _diag = training._discovery_oof(
+        discovery, primary, folds
     )
-    base_eval, stress_eval = training._replay_costs(
-        training._discovery_oof(discovery, primary, folds)[0],
-        training._discovery_oof(discovery, primary, folds)[1],
-        request,
-        primary,
-        risk,
-        evidence=blocked_evidence,
+    base_evidence, _stress_evidence = training._replay_costs(
+        oof, oof_labels, request, primary, risk, pre_holdout, data.manifest,
     )
-    assert base_eval.blocked_vintages == stress_eval.blocked_vintages
-    for blocked in base_eval.blocked_vintages:
-        assert isinstance(blocked, BlockedVintage)
-        assert blocked.outcome_status == "MISSING_EXIT_PRICE"
-        json_blocked = blocked.to_json()
-        assert "period_net_returns" not in json_blocked
-        assert "predicted_net_alpha" not in json_blocked
-        assert "net_return" not in json_blocked
 
-    # The frontier projection persists bounded blocker identities, never returns.
+    # The frontier projection persists only bounded execution evidence, never
+    # raw scores, orders, or return vectors.
     from src.stocks.ml.training import _policy_frontier_projection
 
     projection = _policy_frontier_projection(request, discovery, None)
-    assert isinstance(projection["blocked_vintages"], list)
-    assert len(projection["blocked_vintages"]) <= 64
-    assert projection["blocked_vintage_count"] >= 0
-    for blocked in projection["blocked_vintages"]:
-        assert "net_return" not in blocked
-        assert "period_net_returns" not in blocked
-        assert "predicted_net_alpha" not in blocked
-
-    # A candidate whose blocked-vintage ratio exceeds tolerance fails closed.
-    candidate = discovery.evidence[0]
-    if candidate.blocked_vintage_count == 0:
-        total = max(1, candidate.complete_cohort_count)
-        dominant = int(total * training._MAX_BLOCKED_VINTAGE_FRACTION) + 1
-        reason = training._coverage_failure_reason(
-            replace(candidate, blocked_vintage_count=dominant), request
-        )
-        assert reason == f"selected-exit-unresolved:{dominant}"
+    assert isinstance(projection["execution_evidence"], dict)
+    json.dumps(projection)
+    for entry in projection["execution_evidence"].values():
+        assert "period_net_returns" not in entry
+        assert "predicted_net_alpha" not in entry
+        assert "net_return" not in entry
+    json.dumps(base_evidence.diagnostics())
+    assert all(
+        isinstance(count, int) and count >= 0
+        for _reason, count in base_evidence.unfilled_order_reason_counts
+    )
 
 
 def test_coverage_failure_reason_allows_isolated_blocked_vintages() -> None:

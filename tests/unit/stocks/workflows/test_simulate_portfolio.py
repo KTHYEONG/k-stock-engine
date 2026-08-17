@@ -8,6 +8,10 @@ import pytest
 
 from src.core.instruments import AssetKind
 from src.stocks.data.contracts import DatasetSnapshot
+from src.stocks.domain.execution_policy import (
+    SCHEDULED_OPEN_POLICY_ID,
+    SCHEDULED_OPEN_V1,
+)
 from src.stocks.ml.contracts import NetAlphaTrainingRequest, policy_portfolio_fingerprint
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.research.models import ModelManifest
@@ -152,3 +156,101 @@ def test_artifact_policy_profile_matches_manifest(tmp_path) -> None:
     assert profile["portfolio_fingerprint"] == policy_portfolio_fingerprint(
         20, 0.08, 0.9, 0.005
     )
+
+
+def _prepared_equity_payload(
+    *,
+    execution_policy_hash: str = SCHEDULED_OPEN_V1.canonical_hash,
+) -> str:
+    from src.stocks.trading.portfolio_constructor import (
+        StockRiskPolicy,
+        stock_risk_policy_fingerprint,
+    )
+
+    policy = StockRiskPolicy(
+        top_k=20,
+        gross_cap=0.9,
+        single_name_cap=0.08,
+        participation_limit=0.005,
+        no_trade_band_bps=0.0,
+    )
+    return json.dumps(
+        {
+            "profile_id": "lower_bound_only",
+            "no_trade_band_bps": 0.0,
+            "top_k": 20,
+            "max_single_weight": 0.08,
+            "max_exposure": 0.9,
+            "participation_limit": 0.005,
+            "portfolio_fingerprint": policy_portfolio_fingerprint(20, 0.08, 0.9, 0.005),
+            "execution_evidence_version": "prepared-equity-v1",
+            "risk_policy_fingerprint": stock_risk_policy_fingerprint(policy),
+            "execution_policy_id": SCHEDULED_OPEN_POLICY_ID,
+            "execution_policy_hash": execution_policy_hash,
+        },
+        sort_keys=True,
+    )
+
+
+def _publish_prepared_equity_artifact(registry: ModelArtifactRegistry) -> str:
+    manifest = ModelManifest(
+        artifact_id="na_prepared_artifact",
+        asset_kind=AssetKind.STOCK,
+        feature_set="stock_net_alpha_v1",
+        feature_schema_hash="h",
+        universe_policy_hash="u",
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=5,
+        eligible_from="2024-01-01T00:00:00+00:00",
+        eligible_to="2024-04-29T00:00:00+00:00",
+        model_type="net_alpha_elastic_net",
+        params={"policy_profile": _prepared_equity_payload()},
+    )
+    registry.publish(_DummyModel(manifest), manifest)
+    return manifest.artifact_id
+
+
+def test_simulate_portfolio_rejects_divergent_prepared_equity_policy(tmp_path) -> None:
+    """prepared-equity-v1 artifacts validate risk/execution fingerprints."""
+    df = stock_net_alpha_composed_df(n_sessions=40, n_tickers=4)
+    manifest = stock_net_alpha_manifest(columns=df.columns)
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    _publish_prepared_equity_artifact(registry)
+    snapshot = DatasetSnapshot(manifest=manifest, frame=df)
+    decision = datetime(2024, 4, 29, 0, 0, tzinfo=UTC)
+    # Default SimulationRequest caps diverge from the artifact risk policy.
+    with pytest.raises(ValueError, match="risk-policy fingerprint diverges"):
+        simulate_portfolio(
+            snapshot,
+            registry,
+            SimulationRequest(artifact_id="na_prepared_artifact", decision_time=decision),
+        )
+    # Matching caps but a foreign execution-policy hash still fails closed.
+    divergent = ModelArtifactRegistry(tmp_path / "divergent")
+    divergent_manifest = ModelManifest(
+        artifact_id="na_divergent",
+        asset_kind=AssetKind.STOCK,
+        feature_set="stock_net_alpha_v1",
+        feature_schema_hash="h",
+        universe_policy_hash="u",
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=5,
+        eligible_from="2024-01-01T00:00:00+00:00",
+        eligible_to="2024-04-29T00:00:00+00:00",
+        model_type="net_alpha_elastic_net",
+        params={"policy_profile": _prepared_equity_payload(execution_policy_hash="deadbeef")},
+    )
+    divergent.publish(_DummyModel(divergent_manifest), divergent_manifest)
+    with pytest.raises(ValueError, match="execution-policy hash diverges"):
+        simulate_portfolio(
+            snapshot,
+            divergent,
+            SimulationRequest(
+                artifact_id="na_divergent",
+                decision_time=decision,
+                top_k=20,
+                max_single_weight=0.08,
+                max_exposure=0.9,
+                participation_limit=0.005,
+            ),
+        )

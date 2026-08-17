@@ -5,15 +5,18 @@ lock the raw forward holdout *before* fitting any feature schema, apply the
 frozen schema to pre-holdout and holdout, build one maximum-horizon balanced
 purged/embargoed fold plan, collect segment-safe causal per-horizon OOF
 evidence (vectorized weighted ElasticNet path, target-free validation
-prediction, decimal realized-outcome calibration, common-policy replay under
+prediction, decimal realized-outcome calibration, and execution-equivalent
+replay of the calibrated scores through the prepared ``StockBacktester`` under
 base and stress costs), Holm-adjusted horizon selection on cohort-unit
 per-session log growth, one evidence-gated deterministic LightGBM challenger on
-the selected primary, and an untouched forward holdout. The final decision
-publishes either one champion family (learner plus fitted decimal calibration)
-or a complete immutable ``NO_TRADE`` artifact. Future labels are never a
-discovery score, the holdout is never refit, and a selected baseline OOF is
-never recomputed. No Optuna, confirmation worker, LambdaRank route, or fixed
-5/10/15 horizon exists here.
+the selected primary, and an untouched forward holdout. The residual-vintage
+``NetAlphaPolicyReplay`` proxy is fully replaced by true long-only equity
+evidence; horizon never drives capital lock or rebalance cadence. The final
+decision publishes either one champion family (learner plus fitted decimal
+calibration) or a complete immutable ``NO_TRADE`` artifact. Future labels are
+never a discovery score, the holdout is never refit, and a selected baseline
+OOF is never recomputed. No Optuna, confirmation worker, LambdaRank route, or
+fixed 5/10/15 horizon exists here.
 """
 from __future__ import annotations
 
@@ -35,9 +38,12 @@ import numpy as np
 import polars as pl
 
 from src.core.costs import default_base_schedule, default_stress_schedule
+from src.core.datasets import DatasetManifest
 from src.core.instruments import AssetKind
+from src.core.portfolio import PortfolioSnapshot
 from src.stocks.data.ml_integrity import validate_ml_snapshot
 from src.stocks.data.quality import KRXSessionCalendar
+from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
 from src.stocks.ml.contracts import (
     CANONICAL_FEATURE_SET,
     FoldScoreDiagnostic,
@@ -50,6 +56,13 @@ from src.stocks.ml.contracts import (
     policy_portfolio_fingerprint,
 )
 from src.stocks.ml.data import assess_snapshot_outcome_readiness
+from src.stocks.ml.execution_replay import (
+    ExecutionEquivalentReplayRequest,
+    ExecutionReplayContext,
+    ExecutionReplayEvidence,
+    instruments_from_frame,
+    replay_execution_equivalent,
+)
 from src.stocks.ml.features import (
     apply_model_feature_schema,
     fit_model_feature_schema,
@@ -79,12 +92,6 @@ from src.stocks.ml.models import (
     NetAlphaModelConfig,
     fit_weighted_elastic_path,
 )
-from src.stocks.ml.replay import (
-    BlockedVintage,
-    NetAlphaPolicyReplay,
-    ReplayEvaluation,
-    ReplaySegmentDiagnostic,
-)
 from src.stocks.ml.result_ledger import (
     current_rss_mib as _current_rss_mib,
 )
@@ -95,6 +102,10 @@ from src.stocks.research.economic_alpha import CausalAlphaCalibrator
 from src.stocks.research.folds import Fold, PurgedWalkForward
 from src.stocks.research.metrics import certify_compounded_holdout
 from src.stocks.research.models import Model, ModelManifest
+from src.stocks.trading.portfolio_constructor import (
+    StockRiskPolicy,
+    stock_risk_policy_fingerprint,
+)
 
 logger = logging.getLogger("stocks.ml.training")
 
@@ -250,8 +261,8 @@ class HorizonDiscovery:
     policy is never refit and only one horizon's OOF is ever resident.
     ``dropout_reasons`` maps every ``(horizon, profile)`` candidate to its
     deterministic pre-gate reason (empty when admitted), and
-    ``segment_diagnostics_by_candidate`` retains the bounded per-segment
-    replay diagnostics for every evaluated candidate. ``horizon_memory``
+    ``execution_evidence_by_candidate`` retains the bounded execution-equivalent
+    evidence for every evaluated candidate. ``horizon_memory``
     carries the bounded per-horizon ``rss_mib``/``peak_rss_mib``/``elapsed_ms``/
     ``cache_bytes`` observability. ``oof_cache`` is the per-run spill cache
     owned by ``train_net_alpha_model`` (``None`` only for a self-created
@@ -263,11 +274,8 @@ class HorizonDiscovery:
     diagnostics: tuple[HorizonOOFDiagnostic, ...]
     oof_by_horizon: Mapping[int, tuple[Path, Path, list[float]]]
     dropout_reasons: Mapping[tuple[int, str], str] = field(default_factory=dict)
-    segment_diagnostics_by_candidate: Mapping[
-        tuple[int, str], tuple[ReplaySegmentDiagnostic, ...]
-    ] = field(default_factory=dict)
-    blocked_vintages_by_candidate: Mapping[
-        tuple[int, str], tuple[BlockedVintage, ...]
+    execution_evidence_by_candidate: Mapping[
+        tuple[int, str], ExecutionReplayEvidence
     ] = field(default_factory=dict)
     coverage_by_horizon: Mapping[int, HorizonOutcomeCoverage] = field(
         default_factory=dict
@@ -497,6 +505,9 @@ def _select_publish_and_promote(
     selection = select_horizons(
         discovery.evidence, request.bootstrap_alpha, request.seed,
         n_bootstrap=request.bootstrap_resamples,
+        rebalance_frequency_sessions=(
+            _risk_policy_for_profile(request, 0.0).rebalance_frequency_sessions
+        ),
     )
     telemetry.phase(
         "policy_frontier",
@@ -510,8 +521,8 @@ def _select_publish_and_promote(
                     discovery.dropout_reasons.items()
                 )
             },
-            "segment_sums": _segment_summaries(
-                discovery.segment_diagnostics_by_candidate,
+            "execution_evidence": _segment_summaries(
+                discovery.execution_evidence_by_candidate,
                 selection.primary_profile_id,
             ),
         },
@@ -631,16 +642,10 @@ def _select_publish_and_promote(
 
     risk = replace(request.risk, no_trade_band_bps=profile.no_trade_band_bps)
     calibrated = _causal_oof_calibrate(oof, oof_labels, request, primary)
-    replay = NetAlphaPolicyReplay(
-        horizon_sessions=primary,
-        portfolio=request.portfolio,
-        risk=risk,
-        cost_schedule=request.base_cost_schedule or default_base_schedule(),
-        liquidity_model=request.liquidity_model,
-        seed=request.seed,
-        policy=request.execution_policy,
+    base_evidence, _stress_evidence = _replay_costs(
+        calibrated, oof_labels, request, primary, risk, pre_holdout, data.manifest,
     )
-    evaluation = replay.evaluate(calibrated, oof_labels)
+    evaluation = base_evidence
 
     final_model = _refit_selected(
         pre_holdout, data, request, base_manifest, learner_columns,
@@ -691,7 +696,7 @@ def _select_publish_and_promote(
     )
 
     passed = (
-        bool(evaluation.blocks)
+        bool(evaluation.filled_orders)
         and bool(fold_rank_ic)
         and bool(holdout_evidence.get("passed", False))
     )
@@ -1138,23 +1143,51 @@ def _fold_alpha_metadata(diagnostic: HorizonOOFDiagnostic) -> dict[str, object]:
     return {}
 
 
-def _per_session_log_growth(period_returns: tuple[float, ...]) -> tuple[float, ...]:
-    """Evaluated-vintage per-session log growth ``log1p(r)``.
+def _risk_policy_for_profile(
+    request: NetAlphaTrainingRequest, band_bps: float
+) -> StockRiskPolicy:
+    """Frozen operational risk policy reconstructed from the request portfolio."""
+    return StockRiskPolicy(
+        top_k=request.portfolio.top_k,
+        gross_cap=request.portfolio.max_exposure,
+        single_name_cap=request.portfolio.max_single_weight,
+        participation_limit=request.portfolio.participation_limit,
+        no_trade_band_bps=band_bps,
+    )
 
-    Every decision session is one overlapping holding vintage, so each period
-    return is already a per-session observation and no horizon division is
-    applied; the overlapping h-day dependency is preserved by the bootstrap
-    block length floor in ``horizons.select_horizons``.
-    """
-    growth: list[float] = []
-    for value in period_returns:
-        if not np.isfinite(value) or value <= -1.0:
-            raise ValueError(
-                f"non-finite or degenerate vintage return {value!r} cannot "
-                "form a per-session log growth"
-            )
-        growth.append(float(np.log1p(value)))
-    return tuple(growth)
+
+def _execution_replay_context(
+    request: NetAlphaTrainingRequest,
+    manifest: DatasetManifest,
+    market_frame: pl.DataFrame,
+    band_bps: float,
+    *,
+    seed: int,
+) -> ExecutionReplayContext:
+    """Immutable execution-equivalent context for one candidate replay."""
+    instruments = instruments_from_frame(market_frame)
+    sessions = sorted(market_frame["session"].unique().to_list())
+    return ExecutionReplayContext(
+        registry=ModelArtifactRegistry(Path("mem://execution-replay")),
+        manifest=manifest,
+        instruments=instruments,
+        artifact_id=request.artifact_id,
+        strategy_id=request.artifact_id,
+        initial_portfolio=PortfolioSnapshot(
+            account_snapshot_id="oof",
+            as_of=sessions[0],
+            settled_cash=request.portfolio.initial_cash,
+            unsettled_cash=0.0,
+            positions=(),
+        ),
+        risk_policy=_risk_policy_for_profile(request, band_bps),
+        base_cost_schedule=request.base_cost_schedule or default_base_schedule(),
+        stress_cost_schedule=request.stress_cost_schedule or default_stress_schedule(),
+        liquidity_model=request.liquidity_model,
+        stress_liquidity_model=request.stress_liquidity_model or request.liquidity_model,
+        execution_policy=request.execution_policy or SCHEDULED_OPEN_V1,
+        seed=seed,
+    )
 
 
 def _replay_costs(
@@ -1163,99 +1196,83 @@ def _replay_costs(
     request: NetAlphaTrainingRequest,
     horizon_sessions: int,
     risk: RiskSettings,
-    *,
-    status: pl.DataFrame | None = None,
-    evidence: pl.DataFrame | None = None,
-) -> tuple[ReplayEvaluation, ReplayEvaluation]:
-    """Base and stress policy replay over the same segment-identified OOF panel.
+    market_frame: pl.DataFrame,
+    manifest: DatasetManifest,
+) -> tuple[ExecutionReplayEvidence, ExecutionReplayEvidence]:
+    """Execution-equivalent base/stress replay over the segment-identified OOF.
 
-    Base and stress share the identical frozen calibrated scores, orders,
-    maturity timeline, and one immutable typed status/evidence projection; only
-    the effective cost/liquidity schedule changes. The segment diagnostics must
-    therefore be identical, and the selected blocked-exit identities must match
-    exactly; a divergence raises ``ValueError`` because the timeline invariant
-    is part of the contract.
+    The calibrated OOF score panel and the raw pre-holdout executable market
+    panel are replayed through ``replay_execution_equivalent`` exactly once;
+    base and stress equity are parallel because one backtester advances both
+    scenarios against the same immutable prepared market. The returned pair is
+    the same immutable evidence object seen from each cost path.
     """
-    base_replay = NetAlphaPolicyReplay(
-        horizon_sessions=horizon_sessions,
-        portfolio=request.portfolio,
-        risk=risk,
-        cost_schedule=request.base_cost_schedule or default_base_schedule(),
-        liquidity_model=request.liquidity_model,
-        seed=request.seed + horizon_sessions,
-        policy=request.execution_policy,
-    )
-    stress_replay = NetAlphaPolicyReplay(
-        horizon_sessions=horizon_sessions,
-        portfolio=request.portfolio,
-        risk=risk,
-        cost_schedule=request.stress_cost_schedule or default_stress_schedule(),
-        liquidity_model=request.stress_liquidity_model or request.liquidity_model,
-        seed=request.seed + horizon_sessions,
-        policy=request.execution_policy,
-    )
-    base_evaluation = base_replay.evaluate(
-        calibrated, oof_labels, segment_column=_OOF_SEGMENT,
-        status=status, evidence=evidence,
-    )
-    stress_evaluation = stress_replay.evaluate(
-        calibrated, oof_labels, segment_column=_OOF_SEGMENT,
-        status=status, evidence=evidence,
-    )
-    if base_evaluation.segment_diagnostics != stress_evaluation.segment_diagnostics:
-        raise ValueError(
-            "base and stress replay timelines diverged; order/maturity must "
-            "be identical apart from the cost schedule"
+    del oof_labels
+    sessions_by_segment: dict[int, list[datetime]] = {}
+    for row in calibrated.select(_OOF_SEGMENT, SESSION_COLUMN).unique().iter_rows(
+        named=True
+    ):
+        sessions_by_segment.setdefault(int(row[_OOF_SEGMENT]), []).append(
+            row[SESSION_COLUMN]
         )
-    if base_evaluation.blocked_vintages != stress_evaluation.blocked_vintages:
-        raise ValueError(
-            "base and stress replay blocked-exit identities diverged; "
-            "evidence-backed blockers must be cost-independent"
-        )
-    return base_evaluation, stress_evaluation
+    decision_sessions_by_segment = {
+        segment: tuple(sorted(sessions))
+        for segment, sessions in sessions_by_segment.items()
+    }
+    context = _execution_replay_context(
+        request, manifest, market_frame, risk.no_trade_band_bps,
+        seed=request.seed + horizon_sessions,
+    )
+    replay_request = ExecutionEquivalentReplayRequest(
+        context=context,
+        market_frame=market_frame,
+        score_frame=calibrated,
+        segment_column=_OOF_SEGMENT,
+        decision_sessions_by_segment=decision_sessions_by_segment,
+        horizon_sessions=horizon_sessions,
+    )
+    evidence = replay_execution_equivalent(replay_request)
+    return evidence, evidence
 
 
-def _evidence_from_evaluation(
+def _evidence_from_execution(
     horizon_sessions: int,
     profile_id: str,
     model_family: str,
-    base_evaluation: ReplayEvaluation,
-    stress_evaluation: ReplayEvaluation,
+    base_evidence: ExecutionReplayEvidence,
+    stress_evidence: ExecutionReplayEvidence,
     fold_rank_ics: tuple[float, ...],
     segment_count: int,
 ) -> HorizonOOFEvidence:
-    """Build a candidate's base/stress vintage evidence from its replays."""
-    base_growth = _per_session_log_growth(
-        tuple(base_evaluation.period_net_returns)
-    )
-    stress_growth = _per_session_log_growth(
-        tuple(stress_evaluation.period_net_returns)
-    )
-    segments = tuple(base_evaluation.vintage_segment_ids)
-    if len(segments) != len(base_growth):
-        raise ValueError(
-            "vintage segment ids and period returns diverged for horizon "
-            f"{horizon_sessions}"
-        )
-    complete = (
-        base_evaluation.observed_sessions
-        + base_evaluation.missing_realized_vintage_count
-    )
+    """Build a candidate's base/stress equity evidence from the prepared replay.
+
+    Every evaluated session contributes one daily equity log-growth value;
+    filled-cycle coverage is derived from ``cash_session_fraction``. A session
+    whose execution input is missing fails closed earlier in the adapter and is
+    never zero-filled, so the missing/partial cohort counts are structurally
+    zero.
+    """
+    if base_evidence.segment_ids != stress_evidence.segment_ids:
+        raise ValueError("base and stress execution segment identities diverged")
+    growth_count = len(base_evidence.base_log_growth)
+    if growth_count == 0:
+        raise ValueError("execution replay produced no evaluated sessions")
+    active = round(base_evidence.planned_cycles * (1.0 - base_evidence.cash_session_fraction))
     return HorizonOOFEvidence(
         horizon_sessions=horizon_sessions,
         profile_id=profile_id,
         model_family=model_family,
-        base_log_growth=base_growth,
-        stress_log_growth=stress_growth,
-        cohort_segment_ids=segments,
-        complete_cohort_count=complete,
-        active_cohort_count=base_evaluation.matured_vintage_count,
-        partial_cohort_count=base_evaluation.partial_vintage_count,
-        missing_cohort_count=base_evaluation.missing_realized_vintage_count,
+        base_log_growth=base_evidence.base_log_growth,
+        stress_log_growth=stress_evidence.stress_log_growth,
+        cohort_segment_ids=base_evidence.segment_ids,
+        complete_cohort_count=growth_count,
+        active_cohort_count=active,
+        partial_cohort_count=0,
+        missing_cohort_count=0,
         segment_count=segment_count,
         fold_rank_ics=fold_rank_ics,
-        unresolved_outcome_counts=base_evaluation.unresolved_outcome_counts,
-        blocked_vintage_count=base_evaluation.blocked_vintage_count,
+        unresolved_outcome_counts=(),
+        blocked_vintage_count=0,
     )
 
 
@@ -1337,11 +1354,8 @@ def _build_horizon_evidence(
     diagnostics: list[HorizonOOFDiagnostic] = []
     oof_by_horizon: dict[int, tuple[Path, Path, list[float]]] = {}
     dropout_reasons: dict[tuple[int, str], str] = {}
-    segment_diagnostics_by_candidate: dict[
-        tuple[int, str], tuple[ReplaySegmentDiagnostic, ...]
-    ] = {}
-    blocked_vintages_by_candidate: dict[
-        tuple[int, str], tuple[BlockedVintage, ...]
+    execution_evidence_by_candidate: dict[
+        tuple[int, str], ExecutionReplayEvidence
     ] = {}
     coverage_by_horizon: dict[int, HorizonOutcomeCoverage] = {}
     horizon_memory: dict[int, dict[str, object]] = {}
@@ -1419,10 +1433,6 @@ def _build_horizon_evidence(
             calibrated = _causal_oof_calibrate(
                 oof, oof_labels, request, horizon, seed_ledger=seed_ledger
             )
-            status_projection = (
-                coverage.status_projection if coverage is not None else None
-            )
-            horizon_evidence = data.evidence_by_horizon.get(horizon)
             admitted_any = False
             for profile in request.policy_profiles:
                 logger.debug(
@@ -1435,41 +1445,39 @@ def _build_horizon_evidence(
                     request.risk, no_trade_band_bps=profile.no_trade_band_bps
                 )
                 try:
-                    base_evaluation, stress_evaluation = _replay_costs(
+                    base_evidence, stress_evidence = _replay_costs(
                         calibrated, oof_labels, request, horizon, risk,
-                        status=status_projection,
-                        evidence=horizon_evidence,
+                        pre_holdout, data.manifest,
                     )
                 except ValueError as exc:
                     dropout_reasons[(horizon, profile.profile_id)] = (
                         f"replay-error:{type(exc).__name__}:{exc}"
                     )
                     continue
-                if not base_evaluation.period_net_returns:
+                if not base_evidence.base_log_growth:
                     dropout_reasons[(horizon, profile.profile_id)] = (
                         "no-evaluated-vintages"
                     )
                     continue
-                candidate_evidence = _evidence_from_evaluation(
+                candidate_evidence = _evidence_from_execution(
                     horizon, profile.profile_id, "net_alpha_elastic_net",
-                    base_evaluation, stress_evaluation, tuple(ics), len(folds),
+                    base_evidence, stress_evidence, tuple(ics), len(folds),
                 )
-                segment_diagnostics_by_candidate[(horizon, profile.profile_id)] = (
-                    base_evaluation.segment_diagnostics
-                )
-                blocked_vintages_by_candidate[(horizon, profile.profile_id)] = (
-                    base_evaluation.blocked_vintages
+                execution_evidence_by_candidate[(horizon, profile.profile_id)] = (
+                    base_evidence
                 )
                 failure_reason = _coverage_failure_reason(candidate_evidence, request)
                 dropout_reasons[(horizon, profile.profile_id)] = failure_reason
                 logger.debug(
-                    "[EVAL] stage=profile_result horizon=%d profile=%s vintages=%d "
-                    "active=%d missing=%d dropout=%s",
+                    "[EVAL] stage=profile_result horizon=%d profile=%s sessions=%d "
+                    "active=%d dropout=%s",
                     horizon,
                     profile.profile_id,
-                    len(base_evaluation.period_net_returns),
-                    base_evaluation.matured_vintage_count,
-                    base_evaluation.missing_realized_vintage_count,
+                    len(base_evidence.base_log_growth),
+                    round(
+                        base_evidence.planned_cycles
+                        * (1.0 - base_evidence.cash_session_fraction)
+                    ),
                     failure_reason or "none",
                 )
                 if failure_reason:
@@ -1494,8 +1502,7 @@ def _build_horizon_evidence(
         diagnostics=tuple(diagnostics),
         oof_by_horizon=oof_by_horizon,
         dropout_reasons=dropout_reasons,
-        segment_diagnostics_by_candidate=segment_diagnostics_by_candidate,
-        blocked_vintages_by_candidate=blocked_vintages_by_candidate,
+        execution_evidence_by_candidate=execution_evidence_by_candidate,
         coverage_by_horizon=coverage_by_horizon,
         horizon_memory=horizon_memory,
         oof_cache=oof_cache,
@@ -1730,11 +1737,12 @@ def _causal_oof_calibrate(
             {SCORE_COLUMN: "score"}
         )
         augmented = CausalAlphaCalibrator.apply_prepared(state, scored)
-        augmented = augmented.drop(
-            "expected_active_alpha", "alpha_lower_bound", "exit_cost_rate"
-        ).with_columns(
+        augmented = augmented.drop("__bucket", strict=False).with_columns(
+            pl.col("expected_active_alpha").cast(pl.Float64),
+            pl.col("alpha_lower_bound").cast(pl.Float64),
             pl.col("expected_net_alpha").cast(pl.Float64),
             pl.col("net_alpha_lower_bound").cast(pl.Float64),
+            pl.col("exit_cost_rate").cast(pl.Float64),
         ).rename({"score": SCORE_COLUMN})
         frames.append(augmented)
     if not frames:
@@ -1744,9 +1752,16 @@ def _causal_oof_calibrate(
 
 def _zero_calibrated(scored: pl.DataFrame) -> pl.DataFrame:
     """Cash-only calibration output: zero economic scores, no exception."""
+    columns = {
+        "expected_net_alpha": 0.0,
+        "net_alpha_lower_bound": 0.0,
+        "expected_active_alpha": 0.0,
+        "alpha_lower_bound": 0.0,
+        "exit_cost_rate": 0.0,
+    }
     return scored.with_columns(
-        pl.lit(0.0, dtype=pl.Float64).alias("expected_net_alpha"),
-        pl.lit(0.0, dtype=pl.Float64).alias("net_alpha_lower_bound"),
+        pl.lit(value, dtype=pl.Float64).alias(column)
+        for column, value in columns.items()
     )
 
 
@@ -2150,9 +2165,9 @@ def _adopt_model_family(
     )
     risk = replace(request.risk, no_trade_band_bps=profile.no_trade_band_bps)
     try:
-        _base_eval, stress_eval = _replay_costs(
+        _base_evidence, stress_evidence = _replay_costs(
             challenger_calibrated, challenger_labels, request,
-            primary_horizon_sessions, risk,
+            primary_horizon_sessions, risk, pre_holdout, data.manifest,
         )
     except ValueError as exc:
         return (
@@ -2160,9 +2175,7 @@ def _adopt_model_family(
             f"challenger-replay-error:{type(exc).__name__}:{exc}",
             baseline_oof, baseline_labels, baseline_ics, baseline_diag,
         )
-    stress_growth = _per_session_log_growth(
-        tuple(stress_eval.period_net_returns)
-    )
+    stress_growth = stress_evidence.stress_log_growth
     from src.stocks.ml.horizons import _cohort_bootstrap
 
     stress_threshold = selection.stress_holm_thresholds.get(
@@ -2173,10 +2186,13 @@ def _adopt_model_family(
     ).get("stress", 0.0)
     bootstrap = _cohort_bootstrap(
         stress_growth,
-        tuple(stress_eval.vintage_segment_ids),
+        stress_evidence.segment_ids,
         request.bootstrap_resamples,
         request.seed + primary_horizon_sessions,
-        min_block_length=primary_horizon_sessions,
+        min_block_length=max(
+            primary_horizon_sessions,
+            _risk_policy_for_profile(request, 0.0).rebalance_frequency_sessions,
+        ),
     )
     if bootstrap is None:
         return "net_alpha_elastic_net", "", baseline_oof, baseline_labels, baseline_ics, baseline_diag
@@ -2312,59 +2328,44 @@ def _evaluate_forward_holdout(
     horizon_sessions: int,
     profile: PolicyProfile,
 ) -> dict[str, object]:
-    """Evaluate the untouched forward holdout under base and stress costs.
+    """Certify the untouched forward holdout on true base/stress equity.
 
     The locked holdout is scored target-free once by the pre-holdout model and
-    the fitted calibration attaches the decimal lower bound. The identical
-    calibrated frame is then replayed under the base and stress cost schedules
-    (with their matching liquidity models) and the selected policy profile's
-    no-trade band, and the compound certificate gates promotion. No-trade
-    diagnosis is kept separate from missing realized evidence, and no gate is
-    ever relaxed after observing the holdout.
+    the fitted calibration attaches the decimal economic columns. The identical
+    calibrated frame is then replayed through the execution-equivalent adapter
+    under the base and stress cost/liquidity schedules and the selected profile
+    band, and the compound certificate (true equity lower-CAGR, observed and
+    filled-cycle coverage, drawdown) gates promotion. A missing execution input,
+    score/market mismatch, or parity error fails closed as a no-trade diagnosis
+    and is never zero-filled. No gate is ever relaxed after observing the
+    holdout.
     """
     if holdout_panel.is_empty():
         return {"passed": False, "reason": "holdout-has-no-realized"}
     scored = model.predict(holdout_panel)
     calibrated = calibration.apply(scored)
+    calibrated = calibrated.with_columns(pl.lit(0, dtype=pl.Int64).alias(_OOF_SEGMENT))
     risk = replace(request.risk, no_trade_band_bps=profile.no_trade_band_bps)
-    base_replay = NetAlphaPolicyReplay(
-        horizon_sessions=horizon_sessions,
-        portfolio=request.portfolio,
-        risk=risk,
-        cost_schedule=request.base_cost_schedule or default_base_schedule(),
-        liquidity_model=request.liquidity_model,
-        seed=request.seed,
-        policy=request.execution_policy,
-    )
-    stress_replay = NetAlphaPolicyReplay(
-        horizon_sessions=horizon_sessions,
-        portfolio=request.portfolio,
-        risk=risk,
-        cost_schedule=request.stress_cost_schedule or default_stress_schedule(),
-        liquidity_model=request.stress_liquidity_model or request.liquidity_model,
-        seed=request.seed,
-        policy=request.execution_policy,
-    )
     try:
-        base_evaluation = base_replay.evaluate(calibrated, holdout_panel)
-        stress_evaluation = stress_replay.evaluate(calibrated, holdout_panel)
+        base_evidence, stress_evidence = _replay_costs(
+            calibrated, calibrated, request, horizon_sessions, risk,
+            holdout_panel, _holdout_stub_manifest(request, holdout_panel),
+        )
     except ValueError as exc:
         return {"passed": False, "reason": f"holdout-replay-invalid:{exc}"}
+    growth_count = len(base_evidence.base_log_growth)
+    filled_sessions = round(
+        base_evidence.planned_cycles * (1.0 - base_evidence.cash_session_fraction)
+    )
     certificate = certify_compounded_holdout(
-        base_evaluation.period_net_returns,
-        stress_evaluation.period_net_returns,
+        tuple(np.expm1(value) for value in base_evidence.base_log_growth),
+        tuple(np.expm1(value) for value in stress_evidence.stress_log_growth),
         horizon_sessions,
-        base_evaluation.observed_sessions,
-        base_evaluation.active_cohort_count,
+        growth_count,
+        filled_sessions,
         request.compounding,
     )
-    missing_realized = (
-        base_evaluation.missing_realized_vintage_count
-        or stress_evaluation.missing_realized_vintage_count
-    )
-    if missing_realized > 0:
-        reason = "holdout-incomplete-realized-cohorts"
-    elif base_evaluation.eligible_sessions == 0:
+    if base_evidence.filled_orders <= 0 or base_evidence.planned_cycles <= 0:
         reason = "holdout-no-economic-edge"
     elif not certificate.passed:
         reason = (
@@ -2376,25 +2377,51 @@ def _evaluate_forward_holdout(
     return {
         "passed": reason == "",
         "reason": reason,
-        "block_count": len(base_evaluation.blocks),
-        "order_count": len(base_evaluation.orders),
+        "evaluation_kind": "prepared-equity-v1",
+        "block_count": growth_count,
+        "order_count": base_evidence.filled_orders,
         "certificate": certificate.to_json(),
         "cohorts": {
-            "scored_sessions": base_evaluation.scored_sessions,
-            "realized_sessions": base_evaluation.realized_sessions,
-            "eligible_sessions": base_evaluation.eligible_sessions,
-            "active_sessions": base_evaluation.active_sessions,
-            "orders": len(base_evaluation.orders),
-            "period_count": base_evaluation.period_count,
-            "observed_sessions": base_evaluation.observed_sessions,
-            "active_cohort_count": base_evaluation.active_cohort_count,
-            "missing_realized_cohorts": base_evaluation.missing_realized_vintage_count,
+            "scored_sessions": growth_count,
+            "realized_sessions": growth_count,
+            "eligible_sessions": base_evidence.planned_cycles,
+            "active_sessions": filled_sessions,
+            "orders": base_evidence.filled_orders,
+            "period_count": growth_count,
+            "observed_sessions": growth_count,
+            "active_cohort_count": filled_sessions,
+            "missing_realized_cohorts": 0,
         },
         "diagnostics": {
-            "base": base_evaluation.replay_diagnostics(),
-            "stress": stress_evaluation.replay_diagnostics(),
+            "base": base_evidence.diagnostics(),
+            "stress": stress_evidence.diagnostics(),
         },
     }
+
+
+def _holdout_stub_manifest(
+    request: NetAlphaTrainingRequest, frame: pl.DataFrame
+) -> DatasetManifest:
+    """Manifest projection for the untouched holdout's execution replay."""
+    sessions = sorted(frame["session"].unique().to_list())
+    first = sessions[0]
+    last = sessions[-1]
+    return DatasetManifest(
+        asset_kind=AssetKind.STOCK,
+        schema_version="v1",
+        schema_hash="net-alpha-v1",
+        provider_version="net-alpha",
+        universe_policy_version="net-alpha-v1",
+        universe_policy_hash="net-alpha-v1",
+        feature_set=CANONICAL_FEATURE_SET,
+        feature_set_hash="net-alpha-v1",
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=request.candidate_horizon_sessions[0],
+        time_start=first,
+        time_end=last,
+        generated_time=last,
+        row_count=frame.height,
+    )
 
 
 def _no_trade_model(
@@ -2414,6 +2441,7 @@ class NoTradeModel:
     def __init__(self, manifest: ModelManifest, learner_columns: tuple[str, ...]):
         self._manifest = manifest
         self._learner_columns = learner_columns
+        self.no_trade: bool = True
 
     def fit(self, train: pl.DataFrame, validation: pl.DataFrame) -> None:
         del train, validation
@@ -2506,6 +2534,8 @@ def _policy_profile_params(
     request: NetAlphaTrainingRequest, profile: PolicyProfile
 ) -> str:
     """JSON projection of the selected immutable policy profile for the manifest."""
+    policy = _risk_policy_for_profile(request, profile.no_trade_band_bps)
+    execution_policy = request.execution_policy or SCHEDULED_OPEN_V1
     return json.dumps(
         {
             "profile_id": profile.profile_id,
@@ -2520,6 +2550,10 @@ def _policy_profile_params(
                 request.portfolio.max_exposure,
                 request.portfolio.participation_limit,
             ),
+            "execution_evidence_version": "prepared-equity-v1",
+            "risk_policy_fingerprint": stock_risk_policy_fingerprint(policy),
+            "execution_policy_id": execution_policy.policy_id,
+            "execution_policy_hash": execution_policy.canonical_hash,
         },
         sort_keys=True,
     )
@@ -2527,7 +2561,7 @@ def _policy_profile_params(
 
 def _build_metrics(
     request: NetAlphaTrainingRequest,
-    evaluation: object,
+    evaluation: ExecutionReplayEvidence,
     fold_rank_ic: list[float],
     selection: HorizonSelectionEvidence,
     manifest: ModelManifest,
@@ -2573,7 +2607,7 @@ def _build_metrics(
                 "eligible_to": manifest.eligible_to,
             },
         },
-        "replay": getattr(evaluation, "to_json", lambda: {})() if evaluation else {},
+        "replay": evaluation.diagnostics(),
         "gates": {
             "passed": manifest.model_type != "no_trade",
             "reasons": list(selection.selection_reasons),
@@ -2590,18 +2624,10 @@ def _policy_frontier_projection(
     """Bounded ``policy_frontier`` projection shared by metrics and no-trade.
 
     Records the candidate count, profile ids, per-``(horizon, profile)``
-    dropout reasons, the bounded per-segment/status sums, and at most 64
-    lexicographically ordered selected blocked-exit identities. Raw orders,
-    scores, returns, and model predictions are never included.
+    dropout reasons, and the bounded execution evidence of every evaluated
+    candidate. Raw orders, scores, returns, and model predictions are never
+    included.
     """
-    blocked = sorted(
-        (
-            blocked
-            for candidate_blocked in discovery.blocked_vintages_by_candidate.values()
-            for blocked in candidate_blocked
-        ),
-        key=lambda b: b._sort_key(),
-    )
     return {
         "candidate_count": len(discovery.evidence),
         "profile_ids": [p.profile_id for p in request.policy_profiles],
@@ -2611,51 +2637,30 @@ def _policy_frontier_projection(
                 discovery.dropout_reasons.items()
             )
         },
-        "segment_sums": _segment_summaries(
-            discovery.segment_diagnostics_by_candidate, selected_profile_id
+        "execution_evidence": _segment_summaries(
+            discovery.execution_evidence_by_candidate, selected_profile_id
         ),
-        "blocked_vintages": [blocked.to_json() for blocked in blocked[:64]],
-        "blocked_vintage_count": len(blocked),
     }
 
 
 def _segment_summaries(
-    diagnostics_by_candidate: Mapping[tuple[int, str], tuple[ReplaySegmentDiagnostic, ...]],
+    execution_evidence_by_candidate: Mapping[
+        tuple[int, str], ExecutionReplayEvidence
+    ],
     selected_profile_id: str | None,
 ) -> dict[str, object]:
-    """Bounded per-segment sums for the selected profile's frontier candidate.
+    """Bounded per-candidate execution evidence for the selected profile.
 
     Only the candidate selected under ``selected_profile_id`` is projected as
-    ``"h<horizon>:<profile>:<segment>"`` entries carrying the bounded vintage
-    counts and active fractions; no score or return array is ever emitted.
+    ``"h<horizon>:<profile>"`` entries carrying bounded planned/filled cycle
+    counts, cash coverage, and turnover; no score or return array is ever
+    emitted.
     """
     summaries: dict[str, object] = {}
-    for (horizon, profile_id), diagnostics in sorted(
-        diagnostics_by_candidate.items()
+    for (horizon, profile_id), evidence in sorted(
+        execution_evidence_by_candidate.items()
     ):
         if selected_profile_id is not None and profile_id != selected_profile_id:
             continue
-        for diagnostic in diagnostics:
-            summaries[
-                f"h{horizon}:{profile_id}:s{diagnostic.segment_id}"
-            ] = {
-                "scored_sessions": int(diagnostic.scored_sessions),
-                "calibration_ready_sessions": int(
-                    diagnostic.calibration_ready_sessions
-                ),
-                "eligible_sessions": int(diagnostic.eligible_sessions),
-                "active_sessions": int(diagnostic.active_sessions),
-                "matured_vintages": int(diagnostic.matured_vintage_count),
-                "cash_vintages": int(diagnostic.cash_vintage_count),
-                "missing_realized_vintages": int(
-                    diagnostic.missing_realized_vintage_count
-                ),
-                "partial_vintages": int(diagnostic.partial_vintage_count),
-                "base_active_fraction": round(
-                    float(diagnostic.base_active_fraction), 12
-                ),
-                "stress_active_fraction": round(
-                    float(diagnostic.stress_active_fraction), 12
-                ),
-            }
+        summaries[f"h{horizon}:{profile_id}"] = evidence.diagnostics()
     return summaries

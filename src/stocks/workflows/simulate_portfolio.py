@@ -32,10 +32,14 @@ from src.stocks.backtesting.engine import (
 )
 from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.data.costs import CostEvidence
+from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
 from src.stocks.ml.contracts import policy_portfolio_fingerprint
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.research.models import ModelManifest
-from src.stocks.trading.portfolio_constructor import StockRiskPolicy
+from src.stocks.trading.portfolio_constructor import (
+    StockRiskPolicy,
+    stock_risk_policy_fingerprint,
+)
 from src.stocks.workflows.contracts import SimulationRequest
 
 
@@ -63,6 +67,8 @@ def simulate_portfolio(
     policy = _policy_from_artifact(artifact_manifest, request)
 
     frame = snapshot.frame
+    if "adtv" not in frame.columns and "adtv_20d" in frame.columns:
+        frame = frame.with_columns(pl.col("adtv_20d").alias("adtv"))
     sessions = sorted(frame["session"].unique().to_list())
     instruments = _instruments_from_frame(frame)
     base = request.cost_schedule or default_base_schedule()
@@ -190,6 +196,9 @@ def _validate_request_policy(
             f"{request.no_trade_band_bps} diverges from the artifact band "
             f"{artifact_band}"
         )
+    if profile.get("execution_evidence_version") == "prepared-equity-v1":
+        _validate_prepared_equity_policy(request, profile, artifact_band)
+        return
     request_fingerprint = policy_portfolio_fingerprint(
         request.top_k,
         request.max_single_weight,
@@ -202,6 +211,40 @@ def _validate_request_policy(
             "policy profile; the independent backtester must use the same "
             "top-k/max_single_weight/max_exposure/participation_limit as the "
             "OOF that selected the policy"
+        )
+
+
+def _validate_prepared_equity_policy(
+    request: SimulationRequest,
+    profile: dict[str, object],
+    artifact_band: float,
+) -> None:
+    """Fail closed when a prepared-equity artifact's stored fingerprints diverge.
+
+    The request-reconstructed risk policy and the default execution policy must
+    match the artifact's ``risk_policy_fingerprint`` and
+    ``execution_policy_hash``; otherwise the independent backtester could
+    silently replay under a different policy than the one that certified the
+    artifact.
+    """
+    policy = StockRiskPolicy(
+        top_k=request.top_k,
+        gross_cap=request.max_exposure,
+        single_name_cap=request.max_single_weight,
+        participation_limit=request.participation_limit,
+        no_trade_band_bps=artifact_band,
+    )
+    if stock_risk_policy_fingerprint(policy) != profile["risk_policy_fingerprint"]:
+        raise ValueError(
+            "portfolio simulation risk-policy fingerprint diverges from the "
+            "artifact policy; the independent backtester must replay under the "
+            "same risk policy that certified the artifact"
+        )
+    if SCHEDULED_OPEN_V1.canonical_hash != profile["execution_policy_hash"]:
+        raise ValueError(
+            "portfolio simulation execution-policy hash diverges from the "
+            "artifact policy; the independent backtester must replay under the "
+            "same execution policy that certified the artifact"
         )
 
 
