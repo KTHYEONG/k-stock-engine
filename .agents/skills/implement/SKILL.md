@@ -12,6 +12,7 @@ Fast-execution protocol for mechanical code implementation based strictly on fro
 1. **Zero Guesswork & Minimalist Implementation**:
    - Treat `contract.json` as absolute truth. Do not invent new parameters, change signatures, or create speculative abstraction layers.
    - Implement strictly what is specified in `requirements` and `scenarios`.
+   - **Zero-Search Context Loading**: Read only `target_file`, `target_test_file`, and files listed in `context_files` (if present) via targeted `view_file`. Do NOT run exploratory `rg` / `find` / `list_dir` commands across the repository.
 
 2. **Phased Mechanical Workflow**:
    - **Phase A (TDD Scenarios)**: Translate `scenarios` from `contract.json` into concrete `pytest` test cases in `target_test_file`.
