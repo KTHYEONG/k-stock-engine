@@ -342,6 +342,22 @@ class ReplayEvaluation:
         }
 
 
+def _realized_volatilities(
+    top: pl.DataFrame,
+    realized_by_key: dict[tuple[str, object], dict[str, float]],
+) -> np.ndarray | None:
+    """``volatility_20d`` array aligned to the top rows, or ``None`` when incomplete."""
+    if not realized_by_key:
+        return None
+    vols: list[float] = []
+    for row in top.iter_rows(named=True):
+        entry = realized_by_key.get((str(row[_ID]), row[_SESSION]))
+        if entry is None:
+            return None
+        vols.append(entry["volatility_20d"])
+    return np.asarray(vols, dtype=np.float64)
+
+
 class NetAlphaPolicyReplay:
     """Deterministic cost/risk-aware policy replay over scored OOF panels.
 
@@ -636,7 +652,11 @@ class NetAlphaPolicyReplay:
                     if np.any(clean - self._risk.no_trade_band_bps / 10_000.0 > 0.0):
                         eligible_sessions += 1
                         counts[2] += 1
-                    weights = self._allocate(scores, available_exposure=available)
+                    weights = self._allocate(
+                        scores,
+                        available_exposure=available,
+                        volatilities=_realized_volatilities(top, realized_by_key),
+                    )
                     cohort_orders = [
                         PolicyOrder(
                             instrument_id=str(row[_ID]),
@@ -974,17 +994,24 @@ class NetAlphaPolicyReplay:
         return tuple(diagnostics)
 
     def _allocate(
-        self, scores: np.ndarray, *, available_exposure: float
+        self,
+        scores: np.ndarray,
+        *,
+        available_exposure: float,
+        volatilities: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Constrained allocation on the decimal economic score.
+        """Fractional Kelly allocation on the decimal economic score.
 
         The profile's no-trade band is evaluated only against the decimal
         economic score: a name whose lower bound does not clear the band
         contributes zero weight, and an all-below-band cross-section creates no
-        orders. Weights are proportional to the clipped positive score, capped
-        at ``max_single_weight``, and scaled so the vintage's total exposure
-        never exceeds the ``available_exposure`` left free by the concurrent
-        active vintages.
+        orders. When per-name ``volatilities`` are supplied, weights are scaled
+        inversely to the idiosyncratic return variance (fractional Kelly,
+        ``w_i ~ (score_i - hurdle) / sigma_i^2``) before the single-name cap;
+        without them the allocation degrades to score-proportional sizing.
+        Weights are capped at ``max_single_weight`` and scaled so the vintage's
+        total exposure never exceeds the ``available_exposure`` left free by
+        the concurrent active vintages.
         """
         portfolio = self._portfolio
         hurdle = self._risk.no_trade_band_bps / 10_000.0
@@ -992,7 +1019,15 @@ class NetAlphaPolicyReplay:
         signal = np.clip(clean - hurdle, 0.0, None)
         if not signal.any():
             return np.zeros(scores.size, dtype=np.float64)
-        weights = signal / signal.sum()
+        if volatilities is None:
+            kelly = signal
+        else:
+            vol = np.where(np.isfinite(volatilities), volatilities, 1.0)
+            variance = np.maximum(vol, 1e-12) ** 2
+            kelly = signal / variance
+        if not kelly.any():
+            return np.zeros(scores.size, dtype=np.float64)
+        weights = kelly / kelly.sum()
         weights = np.minimum(weights, portfolio.max_single_weight)
         if available_exposure <= 0.0:
             return np.zeros(scores.size, dtype=np.float64)
