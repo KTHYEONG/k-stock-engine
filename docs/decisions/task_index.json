@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ADR_20260817_data_storage_modernization",
+      "date": "2026-08-17",
+      "adr_id": "ADR_20260817_ADR_20260817_data_storage_modernization",
+      "domain": "stocks",
+      "title": "Data Storage Modernization & Pipeline Utilization",
+      "why": "Massive monolithic JSON evidence files and path-level version strings created I/O bottlenecks and structural fragmentation.",
+      "resolution": "Designed 3-tier lakehouse architecture (raw, canonical, marts) with Hive-partitioned Parquet, decoupled versioning via manifests, and aligned holdout certification.",
+      "impact": "Reduced storage footprint by over 90%, enabled sub-second lazy scans for ML/backtesting, and eliminated filename versioning debt."
+    },
+    {
       "task_id": "adaptive_horizon_optimization",
       "date": "2026-08-17",
       "adr_id": "ADR_20260817_adaptive_horizon_optimization",
