@@ -542,6 +542,57 @@ def test_evaluate_concurrent_exposure_never_exceeds_cap() -> None:
     assert evaluation.matured_vintage_count > 0
 
 
+def test_fractional_kelly_sizing_inversely_proportional_to_variance() -> None:
+    """Equal alpha with twice the volatility gets a quarter of the weight."""
+    session = datetime(2024, 1, 2, tzinfo=UTC)
+    portfolio = PortfolioSettings(top_k=24)
+    scored = _scored([(f"KRX:{i:05d}", session, 0.05) for i in range(24)])
+    realized = _realized(
+        [
+            (f"KRX:{i:05d}", session, 0.05, 100.0, 1.0e8, 0.02 if i < 12 else 0.04)
+            for i in range(24)
+        ]
+    )
+    evaluation = NetAlphaPolicyReplay(
+        3, portfolio, _RISK, liquidity_model=_LIQUIDITY
+    ).evaluate(scored, realized)
+    weights = {order.instrument_id: order.weight for order in evaluation.orders}
+    assert len(weights) == 24
+    low = [w for i, w in weights.items() if int(i.split(":")[1]) < 12]
+    high = [w for i, w in weights.items() if int(i.split(":")[1]) >= 12]
+    assert len(low) == 12
+    assert len(high) == 12
+    assert low[0] == pytest.approx(4.0 * high[0], rel=1e-12)
+    assert sum(weights.values()) <= _PORTFOLIO.max_exposure + 1e-12
+
+
+def test_allocate_fractional_kelly_variance_scaling_and_bands() -> None:
+    """Direct _allocate: variance scaling plus zero allocation on band/exposure."""
+    replay = NetAlphaPolicyReplay(3, _PORTFOLIO, _RISK)
+    scores = np.asarray([0.05] * 24, dtype=np.float64)
+    volatilities = np.asarray([0.02] * 12 + [0.04] * 12, dtype=np.float64)
+    weights = replay._allocate(
+        scores,
+        available_exposure=0.90,
+        volatilities=volatilities,
+    )
+    assert np.allclose(weights[:12], weights[0])
+    assert np.allclose(weights[12:], weights[12])
+    assert weights[0] == pytest.approx(4.0 * weights[12], rel=1e-12)
+    assert float(weights.sum()) <= 0.90 + 1e-12
+    # A name below the no-trade band contributes no weight even with variance.
+    banded = np.asarray([0.05, 0.0004, 0.05], dtype=np.float64)
+    filtered = replay._allocate(
+        banded,
+        available_exposure=0.90,
+        volatilities=np.asarray([0.02, 0.04, 0.02], dtype=np.float64),
+    )
+    assert filtered[1] == 0.0
+    assert filtered[0] > 0.0
+    # No free exposure means no allocation regardless of signal.
+    assert not replay._allocate(scores, available_exposure=0.0).any()
+
+
 def test_evaluate_deterministic_for_identical_inputs() -> None:
     scored, realized, _sessions = _segmented_panel(names_per_session=4)
     replay = NetAlphaPolicyReplay(
