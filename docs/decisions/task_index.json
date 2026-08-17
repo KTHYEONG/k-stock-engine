@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ml_sizing_exit_optimization",
+      "date": "2026-08-17",
+      "adr_id": "ADR_20260817_ml_sizing_exit_optimization",
+      "domain": "quant",
+      "title": "ML Portfolio Sizing & Exit Optimization",
+      "why": "Linear score sizing ignored asset variance while fixed 3-day holding incurred high turnover transaction costs",
+      "resolution": "Designed volatility-adjusted fractional Kelly sizing and multi-horizon evaluation to improve net growth",
+      "impact": "Reduces risk exposure to volatile names and optimizes turnover cost to alpha ratio"
+    },
+    {
       "task_id": "ml_backtest_robustness",
       "date": "2026-08-16",
       "adr_id": "ADR_20260816_ml_backtest_robustness",
