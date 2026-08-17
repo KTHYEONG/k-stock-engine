@@ -165,11 +165,21 @@ def run_trading_cycle(
     if scored.is_empty():
         return _no_trade_result(request, manifest, portfolio, dataset_hash, "empty-scored-panel")
 
-    if (
+    is_no_trade = (
         getattr(loaded.model, "no_trade", False)
         or getattr(loaded, "model_type", "") == "no_trade"
-        or getattr(loaded.model, "manifest", lambda: None)().params.get("no_trade") == "true"
-    ):
+        or getattr(getattr(loaded, "manifest", None), "model_type", "") == "no_trade"
+    )
+    if not is_no_trade:
+        try:
+            manifest_fn = getattr(loaded.model, "manifest", None)
+            if callable(manifest_fn):
+                m = manifest_fn()
+                if m is not None and getattr(m, "params", {}).get("no_trade") == "true":
+                    is_no_trade = True
+        except (NotImplementedError, AttributeError):
+            pass
+    if is_no_trade:
         return _no_trade_result(request, manifest, portfolio, dataset_hash, "no-trade-artifact")
 
     latest = scored.select(pl.col("session").max()).to_series()[0]
