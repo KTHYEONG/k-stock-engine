@@ -16,6 +16,7 @@ target holding period, or rebalance cadence.
 from __future__ import annotations
 
 import hashlib
+from bisect import bisect_right
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -198,7 +199,7 @@ def replay_execution_equivalent(
             pl.col("session").is_in(segment_sessions)
         )
         decision_indices = tuple(
-            segment_sessions.index(decision) for decision in decisions
+            session_to_index[decision] - first_index for decision in decisions
         )
 
         decision_times = _decision_times(segment_ordered, decisions)
@@ -227,6 +228,11 @@ def replay_execution_equivalent(
             on=["instrument_id", "session"],
             how="left",
         ).with_columns(pl.Series("adtv", prepared_market.adtv))
+        if _can_precompute_volatility(scored_market):
+            scored_market = _precompute_volatility(
+                scored_market, context.risk_policy.volatility_lookback_sessions
+            )
+        session_index = _scored_session_index(scored_market)
         overlay = scored_market[score_column].to_numpy().astype(np.float64)
         dataset_hash = _frame_hash(segment_ordered)
 
@@ -250,7 +256,7 @@ def replay_execution_equivalent(
             policy=context.execution_policy,
             base_liquidity_model=context.liquidity_model,
             stress_liquidity_model=context.stress_liquidity_model,
-            decision_provider=_decision_provider(scored_market),
+            decision_provider=_decision_provider(scored_market, session_index),
             scenario_planner=_scenario_planner(context, dataset_hash),
         )
         result = backtester.run_prepared(bt_request, prepared_market, overlay)
@@ -373,13 +379,17 @@ def _decision_times(
     segment_ordered: pl.DataFrame,
     decisions: tuple[datetime, ...],
 ) -> tuple[datetime, ...]:
-    times = {
-        row["session"]: row["available_time"]
-        for row in segment_ordered.filter(pl.col("session").is_in(decisions))
-        .group_by("session")
-        .agg(pl.col("available_time").max())
-        .iter_rows(named=True)
-    }
+    decision_rows = segment_ordered.filter(pl.col("session").is_in(decisions))
+    times: dict[datetime, datetime] = {}
+    for session, available in zip(
+        decision_rows["session"].to_list(),
+        decision_rows["available_time"].to_list(),
+        strict=True,
+    ):
+        if available is None:
+            continue
+        if session not in times or available > times[session]:
+            times[session] = available
     result: list[datetime] = []
     for decision in decisions:
         value = times.get(decision)
@@ -418,11 +428,87 @@ def _filled_sessions(result: BacktestResult) -> int:
     return len({trade.session for trade in result.trades if trade.quantity > 0})
 
 
+@dataclass(frozen=True, slots=True)
+class _ScoredSessionIndex:
+    """Pre-indexed session boundaries for zero-scan decision slicing."""
+
+    stops: tuple[int, ...]
+    available_times: tuple[datetime, ...]
+    uniform: bool
+
+    def stop_for(self, decision_time: datetime) -> int | None:
+        """Row-prefix stop for every session available at or before decision_time."""
+        if not self.uniform:
+            return None
+        position = bisect_right(self.available_times, decision_time)
+        if position == 0:
+            return 0
+        return int(self.stops[position - 1])
+
+
+def _scored_session_index(scored_market: pl.DataFrame) -> _ScoredSessionIndex:
+    """Build contiguous session row stops from the session-sorted scored panel."""
+    agg = (
+        scored_market.group_by("session")
+        .agg(
+            pl.len().alias("__rows"),
+            pl.col("available_time").max().alias("__available"),
+            pl.col("available_time").n_unique().alias("__variants"),
+        )
+        .sort("session")
+    )
+    stops: list[int] = []
+    running = 0
+    for rows in agg["__rows"].to_list():
+        running += int(rows)
+        stops.append(running)
+    available = tuple(agg["__available"].to_list())
+    uniform = bool((agg["__variants"] == 1).all())
+    monotonic = all(
+        previous <= current for previous, current in pairwise(available)
+    )
+    return _ScoredSessionIndex(
+        stops=tuple(stops),
+        available_times=available,
+        uniform=uniform and monotonic,
+    )
+
+
+_VOLATILITY_GATE_COLUMNS = frozenset({"data_quality_status", "is_universe", "tradable"})
+
+
+def _can_precompute_volatility(scored_market: pl.DataFrame) -> bool:
+    """Slicing/rolling precompute is exact only when no row-gate filter applies."""
+    return not _VOLATILITY_GATE_COLUMNS.intersection(scored_market.columns)
+
+
+def _precompute_volatility(frame: pl.DataFrame, window: int) -> pl.DataFrame:
+    """Causally precompute the constructor's ``__vol`` column once per segment."""
+    if "log_return" in frame.columns:
+        returns = pl.col("log_return")
+    elif "ret" in frame.columns:
+        returns = pl.col("ret").log1p()
+    else:
+        returns = (
+            pl.col("close").log() - pl.col("close").log().shift(1).over("instrument_id")
+        )
+    return frame.with_columns(
+        returns.rolling_std(window_size=window, min_samples=2)
+        .over("instrument_id")
+        .alias("__vol")
+    )
+
+
 def _decision_provider(
     scored_market: pl.DataFrame,
+    session_index: _ScoredSessionIndex,
 ) -> ReplayDecisionProvider:
     def provider(decision_time: datetime, execution_time: datetime) -> PreparedReplayDecision:
-        visible = scored_market.filter(pl.col("available_time") <= decision_time)
+        stop = session_index.stop_for(decision_time)
+        if stop is None:
+            visible = scored_market.filter(pl.col("available_time") <= decision_time)
+        else:
+            visible = scored_market.slice(0, stop)
         return PreparedReplayDecision(decision_time, execution_time, visible)
 
     return provider
