@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 JsonDiag = dict[str, Any]
@@ -494,7 +495,7 @@ def _check_spec_compliance(spec_path: str) -> tuple[int, list[JsonDiag]]:
     return (1 if diagnostics else 0, diagnostics)
 
 
-def _find_test_files(py_files: list[str]) -> list[str]:
+def _find_test_files(py_files: list[str], impact_level: int = 1) -> list[str]:
     test_files = [f for f in py_files if f.startswith("tests/") or "test_" in f]
     source_files = [f for f in py_files if not (f.startswith("tests/") or "test_" in f)]
     repository_files = _repository_test_files()
@@ -552,12 +553,17 @@ def _analyze_impact_level(py_files: list[str]) -> tuple[int, str]:
                 ref_count += 1
 
     if ref_count > 3:
-        return (2, f"Module imported across multiple components ({ref_count} references)")
+        return (
+            2,
+            f"Module imported across multiple components ({ref_count} references)",
+        )
     return (1, "Leaf/isolated module change")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Smart Selective Lean Check with JSON diagnostics.")
+    parser = argparse.ArgumentParser(
+        description="Smart Selective Lean Check with JSON diagnostics."
+    )
     parser.add_argument("--files", nargs="*", default=[])
     parser.add_argument("--spec", default=None, help="Path to spec contract JSON")
     parser.add_argument("--skip-lint", action="store_true", help="Skip Ruff linting")
@@ -637,21 +643,10 @@ def main() -> None:
         print("ALLCHECKS:PASS | No modified .py files detected")
         sys.exit(0)
 
-    # 0. Spec Compliance
-    if args.spec:
-        ec, diags = _check_spec_compliance(args.spec)
-        if ec != 0:
-            _fail_exit_many(
-                "spec-compliance",
-                f"FAIL | Spec compliance failed with {len(diags)} error(s)",
-                diags,
-            )
-        print("PASS | Spec compliance verified")
-
-    # 1. Co-modification Check
-    test_files = _find_test_files(py_files)
+    # 1. Co-modification Check & Test Discovery
     impact_level, impact_reason = _analyze_impact_level(py_files)
     print(f"INFO | Impact Level: {impact_level} ({impact_reason})")
+    test_files = _find_test_files(py_files, impact_level=impact_level)
 
     for pf in py_files:
         if (
@@ -671,8 +666,16 @@ def main() -> None:
                 }
                 _fail_exit("co-modification", f"FAIL | {pf}: test file missing", d)
 
-    # 2. Unsanctioned print() Check
-    if not args.skip_lint:
+    # 2. Parallel Static Checks (Spec, Print-check, Ruff, Mypy)
+    def check_spec_task() -> tuple[str, int, list[JsonDiag], str]:
+        if not args.spec:
+            return ("spec-compliance", 0, [], "")
+        ec, diags = _check_spec_compliance(args.spec)
+        return ("spec-compliance", ec, diags, f"FAIL | Spec compliance failed with {len(diags)} error(s)")
+
+    def check_print_task() -> tuple[str, int, list[JsonDiag], str]:
+        if args.skip_lint:
+            return ("print-check", 0, [], "")
         print_re = re.compile(r"(?<!#)\bprint\s*\(")
         for pf in py_files:
             if pf.startswith("tools/"):
@@ -686,12 +689,12 @@ def main() -> None:
                             "error": "Unsanctioned print() detected",
                             "fix_hint": "Use logging module instead of print()",
                         }
-                        _fail_exit(
-                            "print-check", f"FAIL | {pf}:{idx} print() detected", d
-                        )
+                        return ("print-check", 1, [d], f"FAIL | {pf}:{idx} print() detected")
+        return ("print-check", 0, [], "")
 
-    # 3. Ruff
-    if not args.skip_lint and py_files:
+    def check_ruff_task() -> tuple[str, int, list[JsonDiag], str]:
+        if args.skip_lint or not py_files:
+            return ("ruff", 0, [], "")
         ruff_res = run_cmd(["uv", "run", "ruff", "check", *py_files, "--quiet"])
         if ruff_res.returncode != 0:
             out_sliced = "\n".join(
@@ -703,10 +706,12 @@ def main() -> None:
                 "error": out_sliced,
                 "fix_hint": "Fix ruff lint errors",
             }
-            _fail_exit("ruff", "FAIL | Ruff Lint Failed", d)
+            return ("ruff", 1, [d], "FAIL | Ruff Lint Failed")
+        return ("ruff", 0, [], "")
 
-    # 4. Mypy
-    if not args.skip_mypy and py_files:
+    def check_mypy_task() -> tuple[str, int, list[JsonDiag], str]:
+        if args.skip_mypy or not py_files:
+            return ("mypy", 0, [], "")
         mypy_res = run_cmd(["uv", "run", "mypy", *py_files, "--ignore-missing-imports"])
         if mypy_res.returncode != 0:
             out_sliced = "\n".join(
@@ -718,7 +723,27 @@ def main() -> None:
                 "error": out_sliced,
                 "fix_hint": "Fix mypy type errors",
             }
-            _fail_exit("mypy", "FAIL | Mypy Type Check Failed", d)
+            return ("mypy", 1, [d], "FAIL | Mypy Type Check Failed")
+        return ("mypy", 0, [], "")
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        f_spec = executor.submit(check_spec_task)
+        f_print = executor.submit(check_print_task)
+        f_ruff = executor.submit(check_ruff_task)
+        f_mypy = executor.submit(check_mypy_task)
+
+        # Collect results
+        tasks = [f_spec, f_print, f_ruff, f_mypy]
+        for f in tasks:
+            phase, code, diags, msg = f.result()
+            if code != 0:
+                if len(diags) > 1:
+                    _fail_exit_many(phase, msg, diags)
+                else:
+                    _fail_exit(phase, msg, diags[0] if diags else {})
+
+    if args.spec:
+        print("PASS | Spec compliance verified")
 
     if args.fast:
         print("PASS | Fast Check Passed (Spec, Mapping, Print, Ruff, Mypy verified)")
