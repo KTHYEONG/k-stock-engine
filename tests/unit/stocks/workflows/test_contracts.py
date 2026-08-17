@@ -14,7 +14,7 @@ def test_training_request_defaults_are_explicit() -> None:
     assert request.fold_count == 3
     assert request.seed == 42
     assert request.forward_holdout_sessions == 0
-    assert request.candidate_horizon_sessions == (3, 5, 8, 10, 15, 20)
+    assert request.candidate_horizon_sessions == (10, 20, 40)
     assert request.max_rss_mib is None
     assert request.model_threads == 1
 
