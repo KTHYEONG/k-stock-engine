@@ -54,16 +54,27 @@ class CompoundingPolicyConfig:
     confidence edge in the exponential utility overlay; it must be finite and
     strictly positive. ``enabled`` turns the overlay on for economic panels
     that expose ``net_alpha_lower_bound``; legacy score-only panels are
-    unaffected either way.
+    unaffected either way. ``forecast_horizon_sessions`` is the model's
+    prediction horizon H used to compute the per-session edge; when ``None``
+    the legacy ``rebalance_frequency_sessions`` serves as the effective
+    horizon for backward-compatible v2 artifacts only.
     """
 
     enabled: bool = True
     growth_risk_aversion: float = 1.0
+    forecast_horizon_sessions: int | None = None
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.growth_risk_aversion) or self.growth_risk_aversion <= 0.0:
             raise ValueError(
                 "growth_risk_aversion must be finite and strictly positive"
+            )
+        if self.forecast_horizon_sessions is not None and (
+            not isinstance(self.forecast_horizon_sessions, int)
+            or self.forecast_horizon_sessions < 1
+        ):
+            raise ValueError(
+                "forecast_horizon_sessions must be a positive integer when provided"
             )
 
 
@@ -831,6 +842,11 @@ def stock_risk_policy_fingerprint(policy: StockRiskPolicy) -> str:
             "compounding": {
                 "enabled": bool(policy.compounding.enabled),
                 "growth_risk_aversion": float(policy.compounding.growth_risk_aversion),
+                "forecast_horizon_sessions": (
+                    int(policy.compounding.forecast_horizon_sessions)
+                    if policy.compounding.forecast_horizon_sessions is not None
+                    else None
+                ),
             },
             "economic_ranking_mode": str(policy.economic_ranking_mode),
         },
@@ -1381,28 +1397,38 @@ def _compounding_scale(
 ) -> tuple[float, float, float, str | None]:
     """Return ``(scale, confidence_edge_h, confidence_variance_h, cash_reason)``.
 
-    The risky target scale ``s*`` prices the horizon-unit lower-confidence
-    edge ``A_h = w.T @ net_alpha_lower_bound`` against the horizon-scaled
-    portfolio variance ``V_h = h * w.T @ Sigma_daily @ w`` with the policy's
-    ``growth_risk_aversion``. ``net_alpha_lower_bound`` already nets the
+    The risky target scale ``s*`` prices the per-session lower-confidence
+    edge ``A_1 = (w.T @ net_alpha_lower_bound) / H`` against the one-session
+    portfolio variance ``V_1 = w.T @ Sigma_daily @ w`` with the policy's
+    ``growth_risk_aversion``. ``H`` is ``forecast_horizon_sessions`` when set
+    (v3 path); the legacy ``None`` falls back to ``rebalance_frequency_sessions``
+    for v2 artifacts only. ``net_alpha_lower_bound`` already nets the
     calibrated route-level round-trip cost, so it is never cost-subtracted
     again. ``s*`` only reduces a constrained target, never increases it. A
     non-positive edge, a non-finite/negative variance, or unavailable
     covariance yields ``cash_reason`` and a zero risky scale.
     """
-    horizon = max(1, int(policy.rebalance_frequency_sessions))
+    horizon = max(
+        1,
+        int(
+            policy.compounding.forecast_horizon_sessions
+            if policy.compounding.forecast_horizon_sessions is not None
+            else policy.rebalance_frequency_sessions
+        ),
+    )
     risk_aversion = policy.compounding.growth_risk_aversion
     vector = np.asarray([weights[instrument_id] for instrument_id in ids], dtype=float)
     lower = np.asarray(
         [net_lower_bound_of.get(instrument_id, 0.0) for instrument_id in ids],
         dtype=float,
     )
-    confidence_edge_h = float(vector @ lower)
-    if not math.isfinite(confidence_edge_h) or confidence_edge_h <= 0.0:
-        return 0.0, confidence_edge_h, 0.0, "non-positive-confidence-edge"
+    total_edge_h = float(vector @ lower)
+    if not math.isfinite(total_edge_h) or total_edge_h <= 0.0:
+        return 0.0, total_edge_h, 0.0, "non-positive-confidence-edge"
+    confidence_edge_h = total_edge_h / horizon
     if covariance is None:
         covariance, _ = _covariance(panel, ids, policy)
-    confidence_variance_h = horizon * float(vector @ covariance @ vector)
+    confidence_variance_h = float(vector @ covariance @ vector)
     if not math.isfinite(confidence_variance_h) or confidence_variance_h < 0.0:
         return 0.0, confidence_edge_h, confidence_variance_h, "invalid-confidence-variance"
     if confidence_variance_h == 0.0:
