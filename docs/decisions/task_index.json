@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_COMPOUND_GROWTH_SELECTION",
+      "date": "2026-08-18",
+      "adr_id": "ADR_20260818_ML_COMPOUND_GROWTH_SELECTION",
+      "domain": "execution",
+      "title": "Economic ranking for compounded ML growth",
+      "why": "Positive fold Rank-IC did not translate into positive stress compounded growth, and eligible candidates were ranked by raw model score while sizing used cost-adjusted economic values.",
+      "resolution": "Added explicit raw/economic ranking modes, aligned candidate ordering with calibrated net/keep economic values, fail-closed v2 artifact provenance validation, and process-isolated pytest temporary roots.",
+      "impact": "Preserves all risk and promotion gates while improving cost-aware selection and preventing v1/v2 replay drift."
+    },
+    {
       "task_id": "lean_ml_backtest_data_path",
       "date": "2026-08-18",
       "adr_id": "ADR_20260818_lean_ml_backtest_data_path",
