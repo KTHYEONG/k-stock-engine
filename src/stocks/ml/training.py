@@ -1165,6 +1165,7 @@ def _risk_policy_for_profile(
         participation_limit=request.portfolio.participation_limit,
         no_trade_band_bps=profile.no_trade_band_bps,
         compounding=CompoundingPolicyConfig(growth_risk_aversion=profile.growth_risk_aversion),
+        economic_ranking_mode="economic_net_v1",
     )
 
 
@@ -2427,7 +2428,7 @@ def _evaluate_forward_holdout(
     return {
         "passed": reason == "",
         "reason": reason,
-        "evaluation_kind": "prepared-equity-v1",
+        "evaluation_kind": "prepared-equity-v2-economic-rank",
         "block_count": growth_count,
         "order_count": base_evidence.filled_orders,
         "certificate": certificate.to_json(),
@@ -2601,10 +2602,11 @@ def _policy_profile_params(
                 request.portfolio.max_exposure,
                 request.portfolio.participation_limit,
             ),
-            "execution_evidence_version": "prepared-equity-v1",
+            "execution_evidence_version": "prepared-equity-v2-economic-rank",
             "risk_policy_fingerprint": stock_risk_policy_fingerprint(policy),
             "execution_policy_id": execution_policy.policy_id,
             "execution_policy_hash": execution_policy.canonical_hash,
+            "economic_ranking_mode": policy.economic_ranking_mode,
         },
         sort_keys=True,
     )
