@@ -979,6 +979,80 @@ class ResearchDataRepository:
             raise ValueError("snapshot composition produced no rows")
         return DatasetSnapshot(manifest=feature_manifest, frame=composed)
 
+    def compose_labeled_training_data(
+        self,
+        lineage: object,
+        feature_set: str,
+        decision_time: datetime,
+    ) -> object:
+        """Compose labeled training data from resolved lineage (snapshotless path).
+
+        Reads base, feature, and label panels from the catalog entries in
+        ``lineage``, applies point-in-time filtering, and returns a
+        ``ResearchDataBundle`` with the composed frame, lineage, and outcome
+        coverage. This is the new direct-resolution path that replaces
+        snapshot-based composition.
+        """
+        from src.stocks.data.lineage import ResearchDataBundle, ResolvedDataLineage
+
+        if not isinstance(lineage, ResolvedDataLineage):
+            raise TypeError("lineage must be a ResolvedDataLineage")
+        entries = lineage.entries
+        base_entry = entries.get("base_panel")
+        feature_entry = entries.get("features")
+        label_entry = entries.get("labels")
+        if base_entry is None:
+            raise ValueError("resolved lineage has no base_panel entry")
+        if feature_entry is None:
+            raise ValueError("resolved lineage has no features entry")
+        if label_entry is None:
+            raise ValueError("resolved lineage has no labels entry")
+
+        base = self.read_base_bounded(
+            base_entry, decision_time, research_range=lineage.research_range
+        )
+        features = self.read_features_bounded(
+            feature_entry, feature_set, decision_time,
+            research_range=lineage.research_range,
+        )
+        label_columns = [
+            c
+            for c in self.label_store.content_columns(label_entry.name)
+            if c not in ("instrument_id", "session")
+        ]
+        labels = self.read_labels_bounded(
+            label_entry,
+            decision_time,
+            research_range=lineage.research_range,
+            columns=("instrument_id", "session", *label_columns),
+        )
+
+        available_column = (
+            "label_available_time_5d"
+            if "label_available_time_5d" in labels.columns
+            else ("label_available_time" if "label_available_time" in labels.columns else None)
+        )
+        if available_column is not None:
+            labels = labels.filter(
+                pl.col(available_column).is_not_null()
+                & (pl.col(available_column) <= decision_time)
+            )
+
+        composed = (
+            base.join(features, on=["instrument_id", "session"], how="inner")
+            .join(labels, on=["instrument_id", "session"], how="inner")
+            .sort(["instrument_id", "session"])
+        )
+        if composed.is_empty():
+            raise ValueError("labeled training data composition produced no rows")
+
+        return ResearchDataBundle(
+            frame=composed,
+            manifest=self.feature_store.read_manifest(feature_entry.name),
+            lineage=lineage,
+            outcome_coverage=lineage.outcome_coverage,
+        )
+
 
 def _assert_content_hash_matches(
     manifest: DatasetManifest,
