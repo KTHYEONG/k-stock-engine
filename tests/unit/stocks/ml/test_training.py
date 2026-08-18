@@ -488,14 +488,39 @@ def test_horizon_evidence_constant_baseline_triggers_structural_fallback() -> No
     assert reason.startswith("challenger-skipped:no-rankability-evidence:constant-score")
 
     manifest = training._base_manifest(request, data, data.feature_frame, 5)
-    selected, failure, oof, _labels, _ics, _diag = training._adopt_model_family(
+    baseline_oof = pl.DataFrame({"x": [1.0, 2.0]})
+    baseline_labels = pl.DataFrame({"y": [0.0, 1.0]})
+    selected, failure, oof, labels, ics, diag = training._adopt_model_family(
         pre_holdout, folds, data, request, manifest, learner_columns, 5,
         profile, selection,
-        pl.DataFrame(), pl.DataFrame(), [], diagnostic, reason,
+        baseline_oof, baseline_labels, [0.0372, 0.0550], diagnostic, reason,
     )
     assert selected == "net_alpha_elastic_net"
     assert failure == reason
-    assert oof.is_empty()
+    assert oof.equals(baseline_oof)
+    assert labels.equals(baseline_labels)
+    assert ics == [0.0372, 0.0550]
+    assert diag == diagnostic
+
+def test_rank_ic_lower_bound_small_fold_series_uses_unit_blocks() -> None:
+    from src.stocks.ml.contracts import NetAlphaTrainingRequest
+
+    request = NetAlphaTrainingRequest(
+        artifact_id="na_rankic",
+        fold_count=2,
+        candidate_horizon_sessions=(10,),
+        bootstrap_resamples=200,
+        seed=11,
+    )
+    low = training._rank_ic_lower_bound((0.0372, 0.0550), request)
+    assert low > 0.0
+    assert low <= 0.0372 + 1e-9
+    assert low == training._rank_ic_lower_bound((0.0372, 0.0550), request)
+    assert (
+        training._rank_ic_lower_bound((0.30, 0.40), request)
+        > low
+    )
+    assert training._rank_ic_lower_bound((0.05, 0.05), request) == pytest.approx(0.05)
 
 
 def test_fold_plan_is_balanced_and_segment_identified() -> None:
