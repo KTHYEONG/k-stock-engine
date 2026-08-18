@@ -197,6 +197,25 @@ def _profile_economic_ranking_mode(
     return cast(Literal["raw_score_v1", "economic_net_v1"], raw)
 
 
+def _profile_forecast_horizon_sessions(profile: dict[str, object]) -> int | None:
+    """Extract forecast_horizon_sessions from a policy profile.
+
+    Existing payloads lacking forecast_horizon_sessions return ``None`` for
+    backward-compatible v2 replay. A v3 artifact with the field present must
+    carry a positive integer; non-integer or non-positive values raise
+    ``ValueError``.
+    """
+    raw = profile.get("forecast_horizon_sessions")
+    if raw is None:
+        return None
+    if not isinstance(raw, int) or raw < 1:
+        raise ValueError(
+            "forecast_horizon_sessions must be a positive integer, "
+            f"got {raw!r}"
+        )
+    return raw
+
+
 def _policy_from_artifact(
     artifact_manifest: ModelManifest, request: SimulationRequest
 ) -> StockRiskPolicy:
@@ -219,13 +238,17 @@ def _policy_from_artifact(
     _validate_request_policy(request, profile)
     aversion = _profile_growth_risk_aversion(profile)
     ranking_mode = _profile_economic_ranking_mode(profile)
+    horizon = _profile_forecast_horizon_sessions(profile)
     return StockRiskPolicy(
         top_k=cast(int, profile["top_k"]),
         gross_cap=cast(float, profile["max_exposure"]),
         single_name_cap=cast(float, profile["max_single_weight"]),
         participation_limit=cast(float, profile["participation_limit"]),
         no_trade_band_bps=cast(float, profile["no_trade_band_bps"]),
-        compounding=CompoundingPolicyConfig(growth_risk_aversion=aversion),
+        compounding=CompoundingPolicyConfig(
+            growth_risk_aversion=aversion,
+            forecast_horizon_sessions=horizon,
+        ),
         economic_ranking_mode=ranking_mode,
     )
 
@@ -253,10 +276,18 @@ def _validate_request_policy(
             f"{request.no_trade_band_bps} diverges from the artifact band "
             f"{artifact_band}"
         )
-    if profile.get("execution_evidence_version") in (
+    evidence_version = profile.get("execution_evidence_version")
+    if evidence_version in (
         "prepared-equity-v1",
         "prepared-equity-v2-economic-rank",
     ):
+        _validate_prepared_equity_policy(request, profile, artifact_band)
+        return
+    if evidence_version == "prepared-equity-v3-horizon-consistent":
+        if _profile_forecast_horizon_sessions(profile) is None:
+            raise ValueError(
+                "v3 horizon-consistent policy requires forecast_horizon_sessions"
+            )
         _validate_prepared_equity_policy(request, profile, artifact_band)
         return
     request_fingerprint = policy_portfolio_fingerprint(
@@ -289,13 +320,17 @@ def _validate_prepared_equity_policy(
     """
     aversion = _profile_growth_risk_aversion(profile)
     ranking_mode = _profile_economic_ranking_mode(profile)
+    horizon = _profile_forecast_horizon_sessions(profile)
     policy = StockRiskPolicy(
         top_k=request.top_k,
         gross_cap=request.max_exposure,
         single_name_cap=request.max_single_weight,
         participation_limit=request.participation_limit,
         no_trade_band_bps=artifact_band,
-        compounding=CompoundingPolicyConfig(growth_risk_aversion=aversion),
+        compounding=CompoundingPolicyConfig(
+            growth_risk_aversion=aversion,
+            forecast_horizon_sessions=horizon,
+        ),
         economic_ranking_mode=ranking_mode,
     )
     if stock_risk_policy_fingerprint(policy) != profile["risk_policy_fingerprint"]:
