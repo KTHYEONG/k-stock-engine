@@ -727,7 +727,7 @@ def _select_publish_and_promote(
             eligible_to=holdout_to,
             params={
                 **dict(manifest.params or {}),
-                "policy_profile": _policy_profile_params(request, profile),
+                "policy_profile": _policy_profile_params(request, profile, primary),
             },
         )
     registry.publish(model, manifest)
@@ -1155,7 +1155,7 @@ def _fold_alpha_metadata(diagnostic: HorizonOOFDiagnostic) -> dict[str, object]:
 
 
 def _risk_policy_for_profile(
-    request: NetAlphaTrainingRequest, profile: PolicyProfile
+    request: NetAlphaTrainingRequest, profile: PolicyProfile, horizon_sessions: int
 ) -> StockRiskPolicy:
     """Frozen operational risk policy reconstructed from the request portfolio."""
     return StockRiskPolicy(
@@ -1164,7 +1164,10 @@ def _risk_policy_for_profile(
         single_name_cap=request.portfolio.max_single_weight,
         participation_limit=request.portfolio.participation_limit,
         no_trade_band_bps=profile.no_trade_band_bps,
-        compounding=CompoundingPolicyConfig(growth_risk_aversion=profile.growth_risk_aversion),
+        compounding=CompoundingPolicyConfig(
+            growth_risk_aversion=profile.growth_risk_aversion,
+            forecast_horizon_sessions=horizon_sessions,
+        ),
         economic_ranking_mode="economic_net_v1",
     )
 
@@ -1176,6 +1179,7 @@ def _execution_replay_context(
     profile: PolicyProfile,
     *,
     seed: int,
+    horizon_sessions: int,
 ) -> ExecutionReplayContext:
     """Immutable execution-equivalent context for one candidate replay."""
     instruments = instruments_from_frame(market_frame)
@@ -1193,7 +1197,7 @@ def _execution_replay_context(
             unsettled_cash=0.0,
             positions=(),
         ),
-        risk_policy=_risk_policy_for_profile(request, profile),
+        risk_policy=_risk_policy_for_profile(request, profile, horizon_sessions),
         base_cost_schedule=request.base_cost_schedule or default_base_schedule(),
         stress_cost_schedule=request.stress_cost_schedule or default_stress_schedule(),
         liquidity_model=request.liquidity_model,
@@ -1236,6 +1240,7 @@ def _replay_costs(
     context = _execution_replay_context(
         request, manifest, market_frame, profile,
         seed=request.seed + horizon_sessions,
+        horizon_sessions=horizon_sessions,
     )
     replay_request = ExecutionEquivalentReplayRequest(
         context=context,
@@ -2582,16 +2587,17 @@ def _publish_no_trade(
 
 
 def _policy_profile_params(
-    request: NetAlphaTrainingRequest, profile: PolicyProfile
+    request: NetAlphaTrainingRequest, profile: PolicyProfile, horizon_sessions: int
 ) -> str:
     """JSON projection of the selected immutable policy profile for the manifest."""
-    policy = _risk_policy_for_profile(request, profile)
+    policy = _risk_policy_for_profile(request, profile, horizon_sessions)
     execution_policy = request.execution_policy or SCHEDULED_OPEN_V1
     return json.dumps(
         {
             "profile_id": profile.profile_id,
             "no_trade_band_bps": profile.no_trade_band_bps,
             "growth_risk_aversion": profile.growth_risk_aversion,
+            "forecast_horizon_sessions": horizon_sessions,
             "top_k": request.portfolio.top_k,
             "max_single_weight": request.portfolio.max_single_weight,
             "max_exposure": request.portfolio.max_exposure,
@@ -2602,7 +2608,7 @@ def _policy_profile_params(
                 request.portfolio.max_exposure,
                 request.portfolio.participation_limit,
             ),
-            "execution_evidence_version": "prepared-equity-v2-economic-rank",
+            "execution_evidence_version": "prepared-equity-v3-horizon-consistent",
             "risk_policy_fingerprint": stock_risk_policy_fingerprint(policy),
             "execution_policy_id": execution_policy.policy_id,
             "execution_policy_hash": execution_policy.canonical_hash,
