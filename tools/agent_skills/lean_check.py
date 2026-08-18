@@ -254,11 +254,13 @@ def _is_stub_node(node: ast.AST) -> bool:
 
 def _iter_contract_entries(contract: dict[str, Any]) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = list(contract.get("contracts", []))
-    for change in contract.get("changes", []):
-        symbol = change.get("symbol", "")
+    default_target = contract.get("target_file", "")
+    for change in contract.get("changes", []) + contract.get("symbols", []):
+        symbol = change.get("symbol") or change.get("name", "")
+        target = change.get("target_file") or default_target
         entries.append(
             {
-                "file_hint": _repo_relative(change.get("target_file", "")),
+                "file_hint": _repo_relative(target),
                 "kind": change.get("kind")
                 or ("class" if symbol and symbol[0].isupper() else "function"),
                 "name": symbol,
@@ -267,7 +269,7 @@ def _iter_contract_entries(contract: dict[str, Any]) -> list[dict[str, Any]]:
     return entries
 
 
-def _check_spec_compliance(spec_path: str) -> tuple[int, list[JsonDiag]]:
+def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int, list[JsonDiag]]:
     diagnostics: list[JsonDiag] = []
     try:
         with open(spec_path) as f:
@@ -291,6 +293,18 @@ def _check_spec_compliance(spec_path: str) -> tuple[int, list[JsonDiag]]:
         raw_name: str = c.get("name", "") or c.get("symbol", "")
         name: str = raw_name.split()[0] if raw_name else ""
         if not fh or not name:
+            continue
+        if pre_impl:
+            # During pre-implementation check, verify target path/parent directory validity rather than existing symbol
+            parent_dir = os.path.dirname(fh)
+            if parent_dir and not os.path.exists(parent_dir):
+                d = {
+                    "file": fh,
+                    "line": 0,
+                    "error": f"Spec target parent directory not found: {parent_dir}",
+                    "fix_hint": f"Ensure valid directory path for {fh}",
+                }
+                diagnostics.append(d)
             continue
         if not os.path.exists(fh):
             d = {
@@ -375,47 +389,48 @@ def _check_spec_compliance(spec_path: str) -> tuple[int, list[JsonDiag]]:
                 else:
                     diagnostics.extend(_check_orphaned_implementations(fh, kind, name))
 
-    for s in contract.get("scenarios", []):
-        test_name: str = s.get("name", "") or s.get("scenario_id", "")
-        if not test_name:
-            continue
-        if s.get("scenario_id"):
-            parts = test_name.split("-")
-            reference = "-".join(parts[:2]) if len(parts) >= 2 else parts[0]
-        else:
-            reference = test_name
+    if not pre_impl:
+        for s in contract.get("scenarios", []):
+            test_name: str = s.get("name", "") or s.get("scenario_id", "")
+            if not test_name:
+                continue
+            if s.get("scenario_id"):
+                parts = test_name.split("-")
+                reference = "-".join(parts[:2]) if len(parts) >= 2 else parts[0]
+            else:
+                reference = test_name
 
-        target_test_file: str = _repo_relative(s.get("target_test_file", ""))
-        found = False
-        ref_pattern = re.compile(rf"\b{re.escape(reference)}\b")
-        if target_test_file and os.path.exists(target_test_file):
-            with open(target_test_file) as tf:
-                content = tf.read()
-            found = bool(ref_pattern.search(content)) or bool(
-                re.search(
-                    rf"^[ \t]*def\s+{re.escape(test_name)}\b", content, re.MULTILINE
+            target_test_file: str = _repo_relative(s.get("target_test_file", ""))
+            found = False
+            ref_pattern = re.compile(rf"\b{re.escape(reference)}\b")
+            if target_test_file and os.path.exists(target_test_file):
+                with open(target_test_file) as tf:
+                    content = tf.read()
+                found = bool(ref_pattern.search(content)) or bool(
+                    re.search(
+                        rf"^[ \t]*def\s+{re.escape(test_name)}\b", content, re.MULTILINE
+                    )
                 )
-            )
-        if not found:
-            for _fp, content in _get_tests_files_contents():
-                if bool(ref_pattern.search(content)) or re.search(
-                    rf"^[ \t]*def\s+{re.escape(test_name)}\b", content, re.MULTILINE
-                ):
-                    found = True
-                    break
-        if not found:
-            fix_hint = (
-                f"Write a test referencing {test_name} in {target_test_file}"
-                if target_test_file
-                else f"Write {test_name}"
-            )
-            d = {
-                "file": target_test_file,
-                "line": 0,
-                "error": f"Spec: missing test '{test_name}'",
-                "fix_hint": fix_hint,
-            }
-            diagnostics.append(d)
+            if not found:
+                for _fp, content in _get_tests_files_contents():
+                    if bool(ref_pattern.search(content)) or re.search(
+                        rf"^[ \t]*def\s+{re.escape(test_name)}\b", content, re.MULTILINE
+                    ):
+                        found = True
+                        break
+            if not found:
+                fix_hint = (
+                    f"Write a test referencing {test_name} in {target_test_file}"
+                    if target_test_file
+                    else f"Write {test_name}"
+                )
+                d = {
+                    "file": target_test_file,
+                    "line": 0,
+                    "error": f"Spec: missing test '{test_name}'",
+                    "fix_hint": fix_hint,
+                }
+                diagnostics.append(d)
 
     wirings: list[dict[str, Any]] = []
     if "wiring" in contract and isinstance(contract["wiring"], list):
@@ -443,8 +458,8 @@ def _check_spec_compliance(spec_path: str) -> tuple[int, list[JsonDiag]]:
             w.get("file", "") or w.get("target", "") or w.get("caller_file", "")
         )
         anchor: str = w.get("anchor", "")
-        import_symbol: str = w.get("import_symbol", "") or w.get("callee", "")
-        invocation_symbol: str = w.get("invocation_symbol", "")
+        import_symbol: str = w.get("import_symbol", "") or w.get("callee", "") or w.get("symbol", "")
+        invocation_expr: str = w.get("invocation_expression", "") or w.get("invocation_symbol", "")
         if not wf or not os.path.exists(wf):
             if wf:
                 diagnostics.append(
@@ -473,24 +488,25 @@ def _check_spec_compliance(spec_path: str) -> tuple[int, list[JsonDiag]]:
                             "fix_hint": f"Add ref to {anchor} in {wf}",
                         }
                     )
-            if import_symbol and import_symbol not in wf_content:
-                diagnostics.append(
-                    {
-                        "file": wf,
-                        "line": 0,
-                        "error": f"Spec wiring: missing reference to '{import_symbol}'",
-                        "fix_hint": f"Import {import_symbol} in {wf}",
-                    }
-                )
-            if invocation_symbol and invocation_symbol not in wf_content:
-                diagnostics.append(
-                    {
-                        "file": wf,
-                        "line": 0,
-                        "error": f"Spec wiring: missing invocation of '{invocation_symbol}'",
-                        "fix_hint": f"Invoke {invocation_symbol} in {wf}",
-                    }
-                )
+            if not pre_impl:
+                if import_symbol and import_symbol not in wf_content:
+                    diagnostics.append(
+                        {
+                            "file": wf,
+                            "line": 0,
+                            "error": f"Spec wiring: missing reference to '{import_symbol}'",
+                            "fix_hint": f"Import {import_symbol} in {wf}",
+                        }
+                    )
+                if invocation_expr and invocation_expr not in wf_content:
+                    diagnostics.append(
+                        {
+                            "file": wf,
+                            "line": 0,
+                            "error": f"Spec wiring: missing invocation of '{invocation_expr}'",
+                            "fix_hint": f"Invoke {invocation_expr} in {wf}",
+                        }
+                    )
 
     return (1 if diagnostics else 0, diagnostics)
 
@@ -585,6 +601,11 @@ def main() -> None:
         "--spec-only", action="store_true", help="Run ONLY spec-compliance and exit"
     )
     parser.add_argument(
+        "--pre-impl",
+        action="store_true",
+        help="Run spec-compliance in pre-implementation validation mode (validates schema, paths, and anchors only)",
+    )
+    parser.add_argument(
         "--deselect", nargs="*", default=[], help="Pytest node ids to deselect"
     )
     parser.add_argument(
@@ -592,18 +613,18 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.spec_only:
+    if args.spec_only or args.pre_impl:
         if not args.spec:
-            print("FAIL | --spec-only requires --spec")
+            print("FAIL | --spec-only and --pre-impl require --spec")
             sys.exit(2)
-        ec, diags = _check_spec_compliance(args.spec)
+        ec, diags = _check_spec_compliance(args.spec, pre_impl=args.pre_impl)
         if ec != 0:
             _fail_exit_many(
                 "spec-compliance",
                 f"FAIL | Spec compliance failed with {len(diags)} error(s)",
                 diags,
             )
-        print("PASS | Spec compliance verified")
+        print("PASS | Spec compliance verified" + (" (pre-impl)" if args.pre_impl else ""))
         print(_emit_json("PASS", "spec-compliance", []), file=sys.stderr)
         sys.exit(0)
 
