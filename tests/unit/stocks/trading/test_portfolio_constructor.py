@@ -790,6 +790,102 @@ class TestCompoundingOverlay:
         json.dumps(record)
 
 
+class TestHorizonConsistentLogUtility:
+    def test_horizon_halves_scale(self) -> None:
+        """HC_LOG_UTILITY_01_HORIZON_HALVES_SCALE: doubling forecast_horizon_sessions halves confidence_scale."""
+        panel = TestCompoundingOverlay._economic_panel()
+        instruments = instruments_for(10)
+        portfolio = empty_portfolio()
+
+        policy_h5 = StockRiskPolicy(
+            top_k=20,
+            gross_cap=0.9,
+            single_name_cap=0.08,
+            turnover_budget=0.0,
+            compounding=CompoundingPolicyConfig(
+                growth_risk_aversion=50.0,
+                forecast_horizon_sessions=5,
+            ),
+        )
+        alloc_h5 = construct_target_allocations(panel, instruments, portfolio, policy_h5)
+        assert alloc_h5
+        scale_h5 = float(policy_h5.compounding_evidence[-1]["confidence_scale"])
+
+        policy_h10 = StockRiskPolicy(
+            top_k=20,
+            gross_cap=0.9,
+            single_name_cap=0.08,
+            turnover_budget=0.0,
+            compounding=CompoundingPolicyConfig(
+                growth_risk_aversion=50.0,
+                forecast_horizon_sessions=10,
+            ),
+        )
+        alloc_h10 = construct_target_allocations(panel, instruments, portfolio, policy_h10)
+        assert alloc_h10
+        scale_h10 = float(policy_h10.compounding_evidence[-1]["confidence_scale"])
+
+        assert scale_h5 > 0.0
+        assert scale_h10 > 0.0
+        assert scale_h10 == pytest.approx(scale_h5 / 2, abs=1e-12)
+
+    def test_invalid_horizon_rejects_config(self) -> None:
+        """HC_LOG_UTILITY_02_INVALID_HORIZON_FAILS_CLOSED: non-positive forecast_horizon_sessions raises ValueError."""
+        with pytest.raises(ValueError, match="forecast_horizon_sessions"):
+            CompoundingPolicyConfig(forecast_horizon_sessions=0)
+        with pytest.raises(ValueError, match="forecast_horizon_sessions"):
+            CompoundingPolicyConfig(forecast_horizon_sessions=-1)
+
+    def test_invalid_horizon_fails_closed_to_cash(self) -> None:
+        """HC_LOG_UTILITY_02_INVALID_HORIZON_FAILS_CLOSED: missing/NaN/non-positive lower bound returns cash."""
+        panel = TestCompoundingOverlay._economic_panel()
+        instruments = instruments_for(10)
+        equity = equity_of(panel, empty_portfolio())
+        held_id = "KRX:000005"
+        held = instruments[held_id]
+        price = panel.filter(pl.col("instrument_id") == held_id).sort("session")["close"][-1]
+        portfolio = PortfolioSnapshot(
+            account_snapshot_id="held",
+            as_of=datetime(2024, 1, 1, tzinfo=UTC),
+            settled_cash=equity - 0.05 * equity,
+            unsettled_cash=0.0,
+            positions=(
+                Position(
+                    instrument=held,
+                    quantity=int(0.05 * equity // price),
+                    average_cost=price,
+                ),
+            ),
+        )
+        non_positive = panel.with_columns(
+            pl.when(pl.col("instrument_id") == held_id)
+            .then(pl.lit(-0.1))
+            .otherwise(pl.col("net_alpha_lower_bound"))
+            .alias("net_alpha_lower_bound")
+        )
+        policy = StockRiskPolicy(
+            top_k=20,
+            compounding=CompoundingPolicyConfig(forecast_horizon_sessions=10),
+        )
+        alloc = construct_target_allocations(non_positive, instruments, portfolio, policy)
+        assert alloc == ()
+
+    def test_fingerprint_includes_horizon(self) -> None:
+        """forecast_horizon_sessions affects the risk policy fingerprint."""
+        p1 = StockRiskPolicy(
+            compounding=CompoundingPolicyConfig(forecast_horizon_sessions=5),
+        )
+        p2 = StockRiskPolicy(
+            compounding=CompoundingPolicyConfig(forecast_horizon_sessions=10),
+        )
+        p_none = StockRiskPolicy(
+            compounding=CompoundingPolicyConfig(forecast_horizon_sessions=None),
+        )
+        assert stock_risk_policy_fingerprint(p1) != stock_risk_policy_fingerprint(p2)
+        assert stock_risk_policy_fingerprint(p1) != stock_risk_policy_fingerprint(p_none)
+        assert stock_risk_policy_fingerprint(p2) != stock_risk_policy_fingerprint(p_none)
+
+
 def test_prepared_allocations_match_reference_constructor() -> None:
     """The array-backed prepared constructor is bit-identical to the reference."""
     panel = scored_panel(n_sessions=61, n_tickers=10, seed=9).drop("ret")

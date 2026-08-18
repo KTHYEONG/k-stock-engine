@@ -392,3 +392,196 @@ def test_simulation_preserves_artifact_rank_mode() -> None:
         _profile_economic_ranking_mode(
             {key: value for key, value in v2_profile.items() if key != "economic_ranking_mode"}
         )
+
+
+def _v3_payload(horizon: int = 10) -> str:
+    from src.stocks.trading.portfolio_constructor import (
+        StockRiskPolicy,
+        stock_risk_policy_fingerprint,
+    )
+
+    policy = StockRiskPolicy(
+        top_k=20,
+        gross_cap=0.9,
+        single_name_cap=0.08,
+        participation_limit=0.005,
+        no_trade_band_bps=0.0,
+        compounding=CompoundingPolicyConfig(
+            growth_risk_aversion=1.0,
+            forecast_horizon_sessions=horizon,
+        ),
+        economic_ranking_mode="economic_net_v1",
+    )
+    return json.dumps(
+        {
+            "profile_id": "lower_bound_only",
+            "no_trade_band_bps": 0.0,
+            "growth_risk_aversion": 1.0,
+            "forecast_horizon_sessions": horizon,
+            "top_k": 20,
+            "max_single_weight": 0.08,
+            "max_exposure": 0.9,
+            "participation_limit": 0.005,
+            "portfolio_fingerprint": policy_portfolio_fingerprint(20, 0.08, 0.9, 0.005),
+            "execution_evidence_version": "prepared-equity-v3-horizon-consistent",
+            "risk_policy_fingerprint": stock_risk_policy_fingerprint(policy),
+            "execution_policy_id": SCHEDULED_OPEN_POLICY_ID,
+            "execution_policy_hash": SCHEDULED_OPEN_V1.canonical_hash,
+            "economic_ranking_mode": "economic_net_v1",
+        },
+        sort_keys=True,
+    )
+
+
+def _publish_v3_artifact(
+    registry: ModelArtifactRegistry, horizon: int = 10
+) -> str:
+    manifest = ModelManifest(
+        artifact_id="na_v3_artifact",
+        asset_kind=AssetKind.STOCK,
+        feature_set="stock_net_alpha_v1",
+        feature_schema_hash="h",
+        universe_policy_hash="u",
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=horizon,
+        eligible_from="2024-01-01T00:00:00+00:00",
+        eligible_to="2024-04-29T00:00:00+00:00",
+        model_type="net_alpha_elastic_net",
+        params={"policy_profile": _v3_payload(horizon)},
+    )
+    registry.publish(_DummyModel(manifest), manifest)
+    return manifest.artifact_id
+
+
+def test_horizon_policy_v3_reconstructs_fingerprint(tmp_path) -> None:
+    """HC_LOG_UTILITY_04_V3_SIMULATION_RECONSTRUCTS_OR_REJECTS: v3 artifact reconstructs the same fingerprint."""
+    from src.stocks.trading.portfolio_constructor import (
+        StockRiskPolicy,
+        stock_risk_policy_fingerprint,
+    )
+
+    from src.stocks.workflows.simulate_portfolio import (
+        _policy_from_artifact,
+        _profile_forecast_horizon_sessions,
+    )
+
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    artifact_id = _publish_v3_artifact(registry, horizon=10)
+    artifact_manifest = registry.read_manifest(artifact_id)
+    request = SimulationRequest(
+        artifact_id=artifact_id,
+        decision_time=datetime(2024, 4, 29, tzinfo=UTC),
+        top_k=20,
+        max_single_weight=0.08,
+        max_exposure=0.9,
+        participation_limit=0.005,
+    )
+    policy = _policy_from_artifact(artifact_manifest, request)
+    assert policy.compounding.forecast_horizon_sessions == 10
+
+    profile = json.loads(artifact_manifest.params["policy_profile"])
+    assert _profile_forecast_horizon_sessions(profile) == 10
+
+    expected = StockRiskPolicy(
+        top_k=20,
+        gross_cap=0.9,
+        single_name_cap=0.08,
+        participation_limit=0.005,
+        no_trade_band_bps=0.0,
+        compounding=CompoundingPolicyConfig(
+            growth_risk_aversion=1.0,
+            forecast_horizon_sessions=10,
+        ),
+        economic_ranking_mode="economic_net_v1",
+    )
+    assert stock_risk_policy_fingerprint(policy) == stock_risk_policy_fingerprint(expected)
+
+
+def test_v3_manifest_without_horizon_raises(tmp_path) -> None:
+    """HC_LOG_UTILITY_04_V3_SIMULATION_RECONSTRUCTS_OR_REJECTS: v3 manifest missing horizon raises ValueError."""
+    from src.stocks.workflows.simulate_portfolio import _policy_from_artifact
+
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    artifact_id = _publish_v3_artifact(registry, horizon=10)
+    artifact_manifest = registry.read_manifest(artifact_id)
+
+    broken_profile = json.loads(artifact_manifest.params["policy_profile"])
+    del broken_profile["forecast_horizon_sessions"]
+    from src.stocks.trading.portfolio_constructor import (
+        StockRiskPolicy,
+        stock_risk_policy_fingerprint,
+    )
+
+    broken_profile["risk_policy_fingerprint"] = stock_risk_policy_fingerprint(
+        StockRiskPolicy(
+            top_k=20,
+            gross_cap=0.9,
+            single_name_cap=0.08,
+            participation_limit=0.005,
+            no_trade_band_bps=0.0,
+            compounding=CompoundingPolicyConfig(growth_risk_aversion=1.0),
+            economic_ranking_mode="economic_net_v1",
+        )
+    )
+    broken_manifest = ModelManifest(
+        artifact_id=artifact_id,
+        asset_kind=AssetKind.STOCK,
+        feature_set="stock_net_alpha_v1",
+        feature_schema_hash="h",
+        universe_policy_hash="u",
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=10,
+        eligible_from="2024-01-01T00:00:00+00:00",
+        eligible_to="2024-04-29T00:00:00+00:00",
+        model_type="net_alpha_elastic_net",
+        params={"policy_profile": json.dumps(broken_profile, sort_keys=True)},
+    )
+    request = SimulationRequest(
+        artifact_id=artifact_id,
+        decision_time=datetime(2024, 4, 29, tzinfo=UTC),
+        top_k=20,
+        max_single_weight=0.08,
+        max_exposure=0.9,
+        participation_limit=0.005,
+    )
+    with pytest.raises(ValueError, match="requires forecast_horizon_sessions"):
+        _policy_from_artifact(broken_manifest, request)
+
+
+def test_v3_manifest_non_integer_horizon_raises(tmp_path) -> None:
+    """HC_LOG_UTILITY_04_V3_SIMULATION_RECONSTRUCTS_OR_REJECTS: v3 manifest with non-integer horizon raises ValueError."""
+    from src.stocks.workflows.simulate_portfolio import (
+        _profile_forecast_horizon_sessions,
+    )
+
+    with pytest.raises(ValueError, match="forecast_horizon_sessions must be a positive integer"):
+        _profile_forecast_horizon_sessions({"forecast_horizon_sessions": "abc"})
+    with pytest.raises(ValueError, match="forecast_horizon_sessions must be a positive integer"):
+        _profile_forecast_horizon_sessions({"forecast_horizon_sessions": 0})
+    with pytest.raises(ValueError, match="forecast_horizon_sessions must be a positive integer"):
+        _profile_forecast_horizon_sessions({"forecast_horizon_sessions": -1})
+
+
+def test_legacy_v2_replay_is_stable(tmp_path) -> None:
+    """HC_LOG_UTILITY_05_LEGACY_V2_REPLAY_IS_STABLE: v2 artifact without forecast_horizon_sessions still works."""
+    from src.stocks.workflows.simulate_portfolio import (
+        _policy_from_artifact,
+        _profile_forecast_horizon_sessions,
+    )
+
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    artifact_id = _publish_prepared_equity_artifact(registry)
+    artifact_manifest = registry.read_manifest(artifact_id)
+    request = SimulationRequest(
+        artifact_id=artifact_id,
+        decision_time=datetime(2024, 4, 29, tzinfo=UTC),
+        top_k=20,
+        max_single_weight=0.08,
+        max_exposure=0.9,
+        participation_limit=0.005,
+    )
+    policy = _policy_from_artifact(artifact_manifest, request)
+    assert policy.compounding.forecast_horizon_sessions is None
+
+    profile = json.loads(artifact_manifest.params["policy_profile"])
+    assert _profile_forecast_horizon_sessions(profile) is None
