@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Protocol
 
 from src.core.instruments import AssetKind
+from src.stocks.data.lineage import ResolvedDataLineage
 from src.stocks.ml.contracts import (
     HorizonJoinEvidence,
     NetAlphaResearchData,
@@ -528,6 +529,8 @@ class MlRunContext:
     cost_context: CostRunContext = field(
         default_factory=lambda: CostRunContext(cost_schedule_kind="base")
     )
+    data_lineage: ResolvedDataLineage | None = None
+    input_ids: Mapping[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_cli(
@@ -538,6 +541,8 @@ class MlRunContext:
         data: NetAlphaResearchData,
         cost_context: CostRunContext,
         started_at: datetime,
+        data_lineage: ResolvedDataLineage | None = None,
+        input_ids: Mapping[str, str] | None = None,
     ) -> MlRunContext:
         """Capture request, snapshot identity, and composed-data shape."""
         frame = data.feature_frame
@@ -561,6 +566,8 @@ class MlRunContext:
             universe_policy_hash=data.manifest.universe_policy_hash or "net-alpha-v1",
             join_evidence=tuple(data.join_evidence),
             cost_context=cost_context,
+            data_lineage=data_lineage,
+            input_ids=input_ids or {},
         )
 
 
@@ -963,6 +970,12 @@ def _project_completed(
         "runtime": {"elapsed_ms": elapsed_ms, "peak_rss_mib": peak_rss_mib()},
         "input": {
             "snapshot_id": context.snapshot_id,
+            "input_ids": dict(context.input_ids) if context.input_ids else None,
+            "data_lineage": (
+                context.data_lineage.to_json()
+                if context.data_lineage is not None
+                else None
+            ),
             "request": _project_request(context.request),
             "data": _project_data(context),
             "cost_context": _project_cost_context(context.cost_context),
@@ -1006,6 +1019,7 @@ def _project_failed(
         "runtime": {"elapsed_ms": elapsed_ms, "peak_rss_mib": peak_rss_mib()},
         "input": {
             "snapshot_id": context.snapshot_id,
+            "input_ids": dict(context.input_ids) if context.input_ids else None,
             "request": _project_request(context.request),
             "data": _project_data(context),
             "cost_context": _project_cost_context(context.cost_context),
