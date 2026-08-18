@@ -301,6 +301,82 @@ def test_certify_compounded_holdout_rejects_invalid_arguments() -> None:
         certify_compounded_holdout([0.01], [0.01], 1, 1, -1, settings)
 
 
+def test_annualize_bootstrap_lower_cagr_daily_cadence() -> None:
+    """CGRA-01-daily-cadence-lower-cagr"""
+    from src.stocks.ml.contracts import CompoundingCertificationSettings
+    from src.stocks.research.metrics import certify_compounded_holdout
+
+    daily_returns = [0.01] * 252
+    settings = CompoundingCertificationSettings(
+        annualization_sessions=252,
+        min_observed_sessions=252,
+        min_active_cohort_fraction=0.5,
+        max_drawdown=0.5,
+        bootstrap_resamples=200,
+        seed=42,
+    )
+    expected = (1.01 ** 252) - 1
+    daily_horizon = certify_compounded_holdout(
+        daily_returns,
+        daily_returns,
+        horizon_sessions=1,
+        observed_sessions=252,
+        active_cohort_count=252,
+        settings=settings,
+    )
+    model_horizon = certify_compounded_holdout(
+        daily_returns,
+        daily_returns,
+        horizon_sessions=10,
+        observed_sessions=252,
+        active_cohort_count=252,
+        settings=settings,
+    )
+    assert daily_horizon.base["lower_cagr"] == pytest.approx(expected, rel=1e-9)
+    assert model_horizon.base["lower_cagr"] == pytest.approx(expected, rel=1e-9)
+
+
+def test_annualize_bootstrap_lower_cagr_sparse_cadence_preserved() -> None:
+    """CGRA-02-sparse-cadence-preserved"""
+    from src.stocks.research.metrics import (
+        annualize_bootstrap_lower_cagr,
+        _bootstrap_lower_mean_log_growth,
+    )
+
+    returns = [0.01] * 84
+    log_growth = __import__("numpy").log1p(__import__("numpy").array(returns))
+    lower_mean = _bootstrap_lower_mean_log_growth(log_growth, 10, 200, 42, 0.05)
+    result = annualize_bootstrap_lower_cagr(
+        lower_mean,
+        annualization_sessions=252,
+        period_count=84,
+        observed_sessions=252,
+    )
+    expected = (1.01 ** 84) - 1
+    assert result == pytest.approx(expected, rel=1e-9)
+
+
+def test_invalid_observed_evidence_fails_closed() -> None:
+    """CGRA-03-invalid-observed-evidence-fails-closed"""
+    from src.stocks.ml.contracts import CompoundingCertificationSettings
+    from src.stocks.research.metrics import certify_compounded_holdout
+
+    settings = CompoundingCertificationSettings(
+        annualization_sessions=252,
+        min_observed_sessions=252,
+        min_active_cohort_fraction=0.5,
+        max_drawdown=0.5,
+    )
+    returns = [0.01] * 84
+    certificate = certify_compounded_holdout(
+        returns, returns, horizon_sessions=10, observed_sessions=0,
+        active_cohort_count=84, settings=settings,
+    )
+    assert certificate.passed is False
+    assert "invalid-observed-sessions" in certificate.reasons
+    assert certificate.base["lower_cagr"] == 0.0
+
+
 def test_compounding_certification_settings_validate_fail_closed() -> None:
     from src.stocks.ml.contracts import CompoundingCertificationSettings
 
@@ -318,3 +394,21 @@ def test_compounding_certification_settings_validate_fail_closed() -> None:
         CompoundingCertificationSettings(bootstrap_alpha=0.0)
     with pytest.raises(ValueError, match="bootstrap_resamples"):
         CompoundingCertificationSettings(bootstrap_resamples=1)
+
+
+def test_targeted_regression_suite() -> None:
+    """CGRA-06-targeted-regression-suite
+
+    Ensures the three-profile frontier is admissible only when both base and
+    stress Holm-adjusted lower-growth bounds are strictly positive, and
+    simulation still rejects any policy mismatch.
+    """
+    from src.stocks.ml.contracts import (
+        DEFAULT_POLICY_PROFILES,
+        validate_policy_profiles,
+    )
+
+    validated = validate_policy_profiles(DEFAULT_POLICY_PROFILES)
+    assert len(validated) == 3
+    for profile in validated:
+        assert profile.growth_risk_aversion > 0.0

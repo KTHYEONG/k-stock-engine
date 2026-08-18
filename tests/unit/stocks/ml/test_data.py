@@ -341,6 +341,7 @@ def _early_key(data, tail_count: int = 3) -> tuple[str, object]:
 
 
 def test_snapshot_outcome_readiness_rejects_source_unavailable() -> None:
+    # SDA-04: PIT outcome coverage remains explicit on the direct data path.
     """SCENARIO_UNRESOLVED_OUTCOME_IS_DIAGNOSTIC: a source gap fails the report."""
     from dataclasses import replace
 

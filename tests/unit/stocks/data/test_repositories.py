@@ -71,6 +71,7 @@ class TestReadProvisionalLegacyPanel:
             )
 
     def test_missing_lineage_is_rejected(self, tmp_path) -> None:
+        # SDA-03: direct lineage composition rejects malformed lineage before reads.
         bad = legacy_frame().drop("ticker")
         write_feature_file(tmp_path, "2024", "2024-01-05_feat.parquet", bad)
         with pytest.raises(ValueError, match="lineage"):
@@ -87,7 +88,7 @@ class TestReadProvisionalLegacyPanel:
         assert snapshot.frame[QUALITY_STATUS_COLUMN].to_list() == [QUARANTINED_STATUS] * 5
 
     def test_missing_files_raises(self, tmp_path) -> None:
-        with pytest.raises(FileNotFoundError, match="feat.parquet"):
+        with pytest.raises(FileNotFoundError, match=r"feat\.parquet"):
             read_provisional_legacy_panel(
                 tmp_path, date(2024, 1, 1), date(2024, 1, 31), allowed_features=()
             )
