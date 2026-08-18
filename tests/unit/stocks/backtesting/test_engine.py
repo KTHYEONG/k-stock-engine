@@ -467,6 +467,7 @@ def test_backtest_data_quality_records_execution_policy() -> None:
 
 
 def test_missing_execution_open_is_explicit_unfilled_never_silently_dropped() -> None:
+    """LMD-04: missing execution opens remain explicit unfilled orders."""
     from src.core.instruments import AssetKind
     from src.execution.domain.intents import TradeIntent
     from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1

@@ -15,6 +15,7 @@ from src.stocks.domain.execution_policy import (
 from src.stocks.ml.contracts import NetAlphaTrainingRequest, policy_portfolio_fingerprint
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.research.models import ModelManifest
+from src.stocks.trading.portfolio_constructor import CompoundingPolicyConfig
 from src.stocks.workflows.contracts import SimulationRequest
 from src.stocks.workflows.simulate_portfolio import (
     artifact_policy_profile,
@@ -254,3 +255,96 @@ def test_simulate_portfolio_rejects_divergent_prepared_equity_policy(tmp_path) -
                 participation_limit=0.005,
             ),
         )
+
+
+def test_half_kelly_artifact_parity(tmp_path) -> None:
+    """CGRA-05-half-kelly-artifact-parity"""
+    from src.stocks.trading.portfolio_constructor import (
+        StockRiskPolicy,
+        stock_risk_policy_fingerprint,
+    )
+
+    from src.stocks.workflows.simulate_portfolio import (
+        _profile_growth_risk_aversion,
+        _validate_prepared_equity_policy,
+    )
+
+    policy_aversion_2 = StockRiskPolicy(
+        top_k=20,
+        gross_cap=0.9,
+        single_name_cap=0.08,
+        participation_limit=0.005,
+        no_trade_band_bps=0.0,
+        compounding=CompoundingPolicyConfig(growth_risk_aversion=2.0),
+    )
+    fp2 = stock_risk_policy_fingerprint(policy_aversion_2)
+
+    policy_aversion_1 = StockRiskPolicy(
+        top_k=20,
+        gross_cap=0.9,
+        single_name_cap=0.08,
+        participation_limit=0.005,
+        no_trade_band_bps=0.0,
+        compounding=CompoundingPolicyConfig(growth_risk_aversion=1.0),
+    )
+    fp1 = stock_risk_policy_fingerprint(policy_aversion_1)
+
+    assert fp2 != fp1
+
+    profile_v2 = {
+        "profile_id": "lower_bound_half_kelly",
+        "no_trade_band_bps": 0.0,
+        "growth_risk_aversion": 2.0,
+        "top_k": 20,
+        "max_single_weight": 0.08,
+        "max_exposure": 0.9,
+        "participation_limit": 0.005,
+        "portfolio_fingerprint": policy_portfolio_fingerprint(20, 0.08, 0.9, 0.005),
+        "execution_evidence_version": "prepared-equity-v1",
+        "risk_policy_fingerprint": fp2,
+        "execution_policy_id": SCHEDULED_OPEN_POLICY_ID,
+        "execution_policy_hash": SCHEDULED_OPEN_V1.canonical_hash,
+    }
+    aversion = _profile_growth_risk_aversion(profile_v2)
+    assert aversion == 2.0
+
+    reconstructed = StockRiskPolicy(
+        top_k=20,
+        gross_cap=0.9,
+        single_name_cap=0.08,
+        participation_limit=0.005,
+        no_trade_band_bps=0.0,
+        compounding=CompoundingPolicyConfig(growth_risk_aversion=aversion),
+    )
+    assert stock_risk_policy_fingerprint(reconstructed) == fp2
+
+    mismatched_profile = dict(profile_v2)
+    mismatched_profile["risk_policy_fingerprint"] = fp1
+    with pytest.raises(ValueError, match="risk-policy fingerprint diverges"):
+        _validate_prepared_equity_policy(
+            SimulationRequest(
+                artifact_id="na_half_kelly",
+                decision_time=datetime(2024, 4, 29, tzinfo=UTC),
+                top_k=20,
+                max_single_weight=0.08,
+                max_exposure=0.9,
+                participation_limit=0.005,
+            ),
+            mismatched_profile,
+            0.0,
+        )
+
+    profile_missing = {
+        "profile_id": "lower_bound_only",
+        "no_trade_band_bps": 0.0,
+        "top_k": 20,
+        "max_single_weight": 0.08,
+        "max_exposure": 0.9,
+        "participation_limit": 0.005,
+        "portfolio_fingerprint": policy_portfolio_fingerprint(20, 0.08, 0.9, 0.005),
+        "execution_evidence_version": "prepared-equity-v1",
+        "risk_policy_fingerprint": fp1,
+        "execution_policy_id": SCHEDULED_OPEN_POLICY_ID,
+        "execution_policy_hash": SCHEDULED_OPEN_V1.canonical_hash,
+    }
+    assert _profile_growth_risk_aversion(profile_missing) == 1.0
