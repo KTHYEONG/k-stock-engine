@@ -12,6 +12,7 @@ import pytest
 
 from src.stocks.ml import training
 from src.stocks.trading.portfolio_constructor import CompoundingPolicyConfig
+from src.stocks.trading.portfolio_constructor import stock_risk_policy_fingerprint
 from src.stocks.ml.training import _build_horizon_evidence, _evaluate_forward_holdout
 
 
@@ -1206,16 +1207,19 @@ _TRAINING_ARTIFACT_SCENARIO = "training_artifact_marks_economic_rank_v2"
 
 
 def test_training_artifact_marks_economic_rank_v2() -> None:
-    """Promoted artifact records economic_net_v1 mode and v2 evidence version."""
+    """Promoted artifact records economic_net_v1 mode and v3 horizon-consistent evidence version."""
     data, request, pre_holdout, folds, learner_columns, _schema = _training_fixture()
     profile = _compound_request().policy_profiles[0]
-    policy = training._risk_policy_for_profile(request, profile)
+    horizon = 10
+    policy = training._risk_policy_for_profile(request, profile, horizon)
     assert policy.economic_ranking_mode == "economic_net_v1"
+    assert policy.compounding.forecast_horizon_sessions == horizon
 
-    params_json = training._policy_profile_params(request, profile)
+    params_json = training._policy_profile_params(request, profile, horizon)
     params = json.loads(params_json)
     assert params["economic_ranking_mode"] == "economic_net_v1"
-    assert params["execution_evidence_version"] == "prepared-equity-v2-economic-rank"
+    assert params["execution_evidence_version"] == "prepared-equity-v3-horizon-consistent"
+    assert params["forecast_horizon_sessions"] == horizon
 
     from src.stocks.trading.portfolio_constructor import (
         StockRiskPolicy,
@@ -1232,3 +1236,26 @@ def test_training_artifact_marks_economic_rank_v2() -> None:
         economic_ranking_mode="raw_score_v1",
     )
     assert stock_risk_policy_fingerprint(policy) != stock_risk_policy_fingerprint(raw_policy)
+
+
+def test_horizon_pins_policy() -> None:
+    """HC_LOG_UTILITY_03_TRAINING_REPLAY_PINS_CANDIDATE_HORIZON: _risk_policy_for_profile pins forecast_horizon_sessions."""
+    data, request, pre_holdout, folds, learner_columns, _schema = _training_fixture()
+    profile = _compound_request().policy_profiles[0]
+
+    policy_10 = training._risk_policy_for_profile(request, profile, 10)
+    assert policy_10.compounding.forecast_horizon_sessions == 10
+
+    policy_5 = training._risk_policy_for_profile(request, profile, 5)
+    assert policy_5.compounding.forecast_horizon_sessions == 5
+
+    params_10 = json.loads(training._policy_profile_params(request, profile, 10))
+    assert params_10["forecast_horizon_sessions"] == 10
+
+    params_5 = json.loads(training._policy_profile_params(request, profile, 5))
+    assert params_5["forecast_horizon_sessions"] == 5
+
+    assert (
+        stock_risk_policy_fingerprint(policy_10)
+        != stock_risk_policy_fingerprint(policy_5)
+    )
