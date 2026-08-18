@@ -678,12 +678,12 @@ def test_run_observability_preserves_terminal_no_trade_reason(tmp_path) -> None:
     assert len(json.dumps(run_obs).encode("utf-8")) < 24 * 1024
     frontier = metrics["policy_frontier"]
     assert frontier["candidate_count"] == 0
-    assert frontier["profile_ids"] == ["legacy_overlay_5bps", "lower_bound_only"]
-    assert len(frontier["dropout_reasons"]) == 12
+    assert frontier["profile_ids"] == ["legacy_overlay_5bps", "lower_bound_only", "lower_bound_half_kelly"]
+    assert len(frontier["dropout_reasons"]) == 18
     assert all(
         f"{h}:{p}" in frontier["dropout_reasons"]
         for h in (3, 5, 8, 10, 15, 20)
-        for p in ("legacy_overlay_5bps", "lower_bound_only")
+        for p in ("legacy_overlay_5bps", "lower_bound_only", "lower_bound_half_kelly")
     )
     json.dumps(frontier)
 
@@ -971,7 +971,7 @@ def test_training_publishes_data_readiness_no_trade_before_oof(tmp_path: Path) -
 
 
 def test_scenario_unresolved_outcome_is_diagnostic_no_trade_blockers(tmp_path) -> None:
-    """SCENARIO_UNRESOLVED_OUTCOME_IS_DIAGNOSTIC: execution evidence stays bounded."""
+    """LMD-03: missing exit diagnostics stay bounded and do not define admission."""
     import json
     from dataclasses import replace
 
@@ -1198,4 +1198,3 @@ def test_adaptive_bucketing_cold_start() -> None:
     )
     assert warm["history_sessions"] >= 252
     assert warm["bucket_count"] == 10
-
