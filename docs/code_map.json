@@ -303,7 +303,10 @@
     "testing": "tests/unit/stocks/workflows/test_score_model.py"
   },
   "src/stocks/workflows/simulate_portfolio.py": {
-    "testing": "tests/unit/stocks/workflows/test_simulate_portfolio.py"
+    "testing": [
+      "tests/unit/stocks/workflows/test_simulate_portfolio.py",
+      "tests/conftest.py"
+    ]
   },
   "src/stocks/workflows/trading_cycle.py": {
     "testing": "tests/unit/stocks/workflows/test_trading_cycle.py"
