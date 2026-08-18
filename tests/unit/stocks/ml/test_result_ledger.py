@@ -626,3 +626,88 @@ def test_record_completed_preserves_no_trade_policy_frontier_projection(tmp_path
     assert frontier["candidate_count"] == 0
     assert len(frontier["dropout_reasons"]) == 12
     assert "20:lower_bound_only" in frontier["dropout_reasons"]
+
+
+def test_direct_input_ledger(tmp_path) -> None:
+    """LMD-06: Completed and failed ledger records contain input_ids."""
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    artifact_id = "na_direct_input"
+    _write_artifact(registry.root, artifact_id)
+    
+    df = stock_net_alpha_composed_df(n_sessions=60, n_tickers=4, audit_clean=True)
+    snapshot = DatasetSnapshot(
+        manifest=stock_net_alpha_manifest(columns=df.columns), frame=df
+    )
+    data = compose_net_alpha_training_data(
+        snapshot, datetime(2024, 12, 31, tzinfo=UTC), (3, 5, 8, 10, 15, 20)
+    )
+    
+    # Create context with input_ids
+    context = MlRunContext.from_cli(
+        request=NetAlphaTrainingRequest(
+            artifact_id=artifact_id,
+            candidate_horizon_sessions=(3, 5, 8, 10, 15, 20),
+        ),
+        snapshot_id="direct:base_2024:features_2024:labels_2024",
+        data=data,
+        cost_context=CostRunContext(cost_schedule_kind="base"),
+        started_at=datetime(2024, 1, 1, tzinfo=UTC),
+        input_ids={
+            "base_dataset_id": "base_2024",
+            "feature_dataset_id": "features_2024",
+            "label_dataset_id": "labels_2024",
+        },
+    )
+    
+    ledger_inst = MlResultLedger(tmp_path / "results")
+    ledger_inst.record_completed(context, _manifest(artifact_id), registry)
+    latest = _latest(tmp_path / "results")
+    
+    # Verify input_ids are present
+    assert latest["input"]["input_ids"] == {
+        "base_dataset_id": "base_2024",
+        "feature_dataset_id": "features_2024",
+        "label_dataset_id": "labels_2024",
+    }
+    
+    # Verify snapshot_id contains direct prefix
+    assert latest["input"]["snapshot_id"] == "direct:base_2024:features_2024:labels_2024"
+
+
+def test_direct_input_ledger_failed(tmp_path) -> None:
+    """LMD-06: Failed ledger records contain input_ids."""
+    df = stock_net_alpha_composed_df(n_sessions=60, n_tickers=4, audit_clean=True)
+    snapshot = DatasetSnapshot(
+        manifest=stock_net_alpha_manifest(columns=df.columns), frame=df
+    )
+    data = compose_net_alpha_training_data(
+        snapshot, datetime(2024, 12, 31, tzinfo=UTC), (3, 5, 8, 10, 15, 20)
+    )
+    
+    # Create context with input_ids
+    context = MlRunContext.from_cli(
+        request=NetAlphaTrainingRequest(
+            artifact_id="na_direct_failed",
+            candidate_horizon_sessions=(3, 5, 8, 10, 15, 20),
+        ),
+        snapshot_id="direct:base_2024:features_2024:labels_2024",
+        data=data,
+        cost_context=CostRunContext(cost_schedule_kind="base"),
+        started_at=datetime(2024, 1, 1, tzinfo=UTC),
+        input_ids={
+            "base_dataset_id": "base_2024",
+            "feature_dataset_id": "features_2024",
+            "label_dataset_id": "labels_2024",
+        },
+    )
+    
+    ledger_inst = MlResultLedger(tmp_path / "results")
+    ledger_inst.record_failed(context, "train_net_alpha_model", ValueError("boom"))
+    latest = _latest(tmp_path / "results")
+    
+    # Verify input_ids are present in failed record
+    assert latest["input"]["input_ids"] == {
+        "base_dataset_id": "base_2024",
+        "feature_dataset_id": "features_2024",
+        "label_dataset_id": "labels_2024",
+    }

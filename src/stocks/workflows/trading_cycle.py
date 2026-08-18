@@ -118,6 +118,19 @@ class TradingCycleResult:
         return not self.intents
 
 
+@dataclass(frozen=True, slots=True)
+class MarketSlice:
+    """Immutable market snapshot at a specific decision/execution time.
+
+    Carries the visible frame at decision time and the decision/execution
+    timestamps for backtesting and replay.
+    """
+
+    frame: pl.DataFrame
+    decision_time: datetime
+    execution_time: datetime
+
+
 def run_trading_cycle(
     snapshot: DatasetSnapshot,
     registry: ModelArtifactRegistry,
