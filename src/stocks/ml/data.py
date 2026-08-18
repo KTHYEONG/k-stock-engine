@@ -19,6 +19,8 @@ import polars as pl
 
 from src.core.datasets import DatasetManifest
 from src.stocks.data.contracts import DatasetSnapshot
+from src.stocks.data.direct import MlMarketData
+from src.stocks.data.lineage import ResearchDataBundle
 from src.stocks.data.outcome_evidence import (
     RESOLUTION_CONFIRMED_NO_BAR,
     RESOLUTION_KIND_VOCABULARY,
@@ -640,7 +642,7 @@ def _unpinned_provenance_readiness(
     )
 
 
-def _reject_feature_set(snapshot: DatasetSnapshot) -> None:
+def _reject_feature_set(snapshot: DatasetSnapshot | ResearchDataBundle) -> None:
     """Fail closed unless the composed snapshot is a canonical net-alpha panel."""
     feature_set = snapshot.manifest.feature_set
     if feature_set != CANONICAL_FEATURE_SET:
@@ -653,7 +655,7 @@ def _reject_feature_set(snapshot: DatasetSnapshot) -> None:
 
 
 def compose_net_alpha_training_data(
-    snapshot: DatasetSnapshot,
+    snapshot: DatasetSnapshot | ResearchDataBundle,
     decision_time: datetime,
     candidate_horizon_sessions: tuple[int, ...],
 ) -> NetAlphaResearchData:
@@ -1198,3 +1200,44 @@ def _net_alpha_manifest(
         feature_set_hash=source.feature_set_hash or "net-alpha-v1",
         row_count=frame.height,
     )
+
+
+def validate_ml_market_data(
+    data: MlMarketData,
+    candidate_horizon_sessions: tuple[int, ...],
+) -> None:
+    """Validate composed ML market data for training readiness.
+
+    Checks that the data contains non-empty frames, the requested horizons
+    are present, and the data satisfies the training contract.
+
+    Args:
+        data: the composed ML market data to validate.
+        candidate_horizon_sessions: the expected horizon sessions.
+
+    Raises:
+        ValueError: if the data fails validation.
+    """
+    if not isinstance(data, MlMarketData):
+        raise TypeError(f"expected MlMarketData, got {type(data).__name__}")
+
+    if data.frame.is_empty():
+        raise ValueError("ML market data frame is empty")
+
+    if not data.labels_by_horizon:
+        raise ValueError("ML market data has no horizon labels")
+
+    missing_horizons = [
+        h for h in candidate_horizon_sessions
+        if h not in data.labels_by_horizon
+    ]
+    if missing_horizons:
+        raise ValueError(
+            f"ML market data missing requested horizons: {missing_horizons}"
+        )
+
+    for horizon, label_frame in data.labels_by_horizon.items():
+        if label_frame.is_empty():
+            raise ValueError(
+                f"ML market data horizon {horizon} has empty label frame"
+            )
