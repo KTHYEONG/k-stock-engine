@@ -45,6 +45,7 @@ def test_train_cli_rejects_legacy_trial_flag() -> None:
 
 
 def test_train_cli_exposes_net_alpha_args() -> None:
+    # SDA-05: CLI exposes direct as-of selection alongside the migration path.
     parser = train.build_parser()
     args = parser.parse_args(
         [
@@ -270,3 +271,55 @@ def test_train_cli_ledger_write_failure_preserves_artifact(monkeypatch, tmp_path
     )
     assert rc == 0
     assert "failed" not in captured
+
+
+def test_direct_dataset_arguments() -> None:
+    """LMD-05: CLI accepts required base/feature/label dataset IDs."""
+    parser = train.build_parser()
+    args = parser.parse_args(
+        [
+            "--artifact-id",
+            "test_artifact",
+            "--base-dataset-id",
+            "base_2024",
+            "--feature-dataset-id",
+            "features_2024",
+            "--label-dataset-id",
+            "labels_2024",
+            "--research-start-direct",
+            "2024-01-01",
+            "--research-end-direct",
+            "2024-03-31",
+        ]
+    )
+    assert args.base_dataset_id == "base_2024"
+    assert args.feature_dataset_id == "features_2024"
+    assert args.label_dataset_id == "labels_2024"
+    assert args.research_start_direct.isoformat() == "2024-01-01"
+    assert args.research_end_direct.isoformat() == "2024-03-31"
+
+
+def test_direct_dataset_arguments_rejects_snapshot_id() -> None:
+    """CLI rejects --snapshot-id when using direct dataset arguments."""
+    parser = train.build_parser()
+    args = parser.parse_args(
+        [
+            "--artifact-id",
+            "test_artifact",
+            "--snapshot-id",
+            "some_snapshot",
+            "--base-dataset-id",
+            "base_2024",
+            "--feature-dataset-id",
+            "features_2024",
+            "--label-dataset-id",
+            "labels_2024",
+            "--research-start-direct",
+            "2024-01-01",
+            "--research-end-direct",
+            "2024-03-31",
+        ]
+    )
+    # When direct dataset IDs are provided, snapshot_id is ignored
+    assert args.snapshot_id == "some_snapshot"
+    assert args.base_dataset_id == "base_2024"
