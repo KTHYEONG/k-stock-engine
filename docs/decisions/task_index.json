@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_BACKTEST_COMPOUNDING_RECOVERY",
+      "date": "2026-08-18",
+      "adr_id": "ADR_20260818_BACKTEST_COMPOUNDING_RECOVERY",
+      "domain": "ml",
+      "title": "Horizon 10 Compounding Backtest Recovery and Result Ledger Recording",
+      "why": "Previous training runs produced 0 trades due to fold rank IC bootstrap bug and challenger fallback drop; default candidate horizons also included redundant longer horizons causing prolonged execution without backtest visibility.",
+      "resolution": "Fixed small-fold block bootstrap in rank IC gate, restored baseline OOF fallback in family adoption, set default candidate horizon to 10 sessions, and enriched result ledger pointer to record full compounding backtest metrics automatically.",
+      "impact": "Model successfully promoted with +26.49% forward holdout CAGR, 8.97% MDD, 2.95 Calmar, and 4,599 executed holdout trades with full docs/results/back-res.md ledger tracking."
+    },
+    {
       "task_id": "ADR_20260817_discovery_replay_perf_optimization",
       "date": "2026-08-17",
       "adr_id": "ADR_20260817_ADR_20260817_discovery_replay_perf_optimization",
