@@ -13,19 +13,19 @@ This document defines testing directives focusing on observable behavior, interf
 
 ## 1. Test Architecture & Design
 - **Behavior-Driven Mapping:** Organize tests by component behavior and logical boundary, rather than enforcing rigid 1:1 file mirroring for every utility module.
+- **Contract Verification Over Empirical Validation:** Unit and integration tests verify interface contracts, schema transformations, and boundary logic—NOT machine learning convergence or long-horizon financial profitability.
 - **Observable Behavior:** Test observable outcomes, return contracts, and state mutations rather than internal implementation details.
 - **AAA Pattern:** Structure test cases clearly using Arrange, Act, and Assert steps.
-- **In-Memory First Policy:** Unit tests (`tests/unit/`) MUST use In-Memory fixtures (DataFrames, dicts, mocks) and MUST NOT write Parquet/CSV files to disk (`tmp_path`). Disk I/O is restricted to dedicated storage/integration tests.
+- **In-Memory Minimal Viable Data:** Prefer the smallest in-memory synthetic dataset sufficient to trigger target logic or edge cases over loading large datasets or performing disk I/O.
 
 ---
 
 ## 2. Test Execution, Database & Performance Strategy
+- **Fast Feedback Default:** Unit and integration tests must run near-instantly by default for fast development loops. Avoid end-to-end heavy computation (e.g., long-horizon replays, full-epoch training) in core suites; isolate them with `@pytest.mark.slow` when essential.
 - **Realistic Engine Testing:** Use the production database engine (or test containers matching production SQL dialects) when SQL dialect behavior or query optimization matters.
 - **Mocking Boundaries:** Limit mocking to external network boundaries, third-party APIs, clock interfaces, and hardware I/O.
 - **Stable Semantics over String Matching:** Verify exception types and key semantic phrases rather than relying on brittle, full string error message matching.
 - **Fixture Scoping Hygiene:** When disk fixtures or heavy setup are required in integration tests (`tests/integration/`), scope them to `module` or `session` to prevent duplicate I/O per test function.
-- **Heavy Computation Categorization (`@pytest.mark.slow`):** Any test executing multi-year backtests, long horizon replaying (>1,000 bars), block-bootstrapping (>100 iterations), or Monte Carlo simulations (>1,000 draws) MUST be decorated with `@pytest.mark.slow` to keep default `uv run pytest` runs fast (<0.5s per test file).
-- **Fast Test Profiles for Heavy Algorithms:** In unit and integration test fixtures, use lightweight fast profiles (e.g., reduced bootstrap/draw counts or stubbed in-memory data loaders) to verify contract wiring without sacrificing suite execution speed.
 
 ---
 
