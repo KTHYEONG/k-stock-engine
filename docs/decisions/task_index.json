@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_COMPOUND_GROWTH_HORIZON",
+      "date": "2026-08-18",
+      "adr_id": "ADR_20260818_ML_COMPOUND_GROWTH_HORIZON",
+      "domain": "risk",
+      "title": "Horizon-consistent ML compound-growth exposure",
+      "why": "The h=10 ML forecast was sized against a five-session legacy variance horizon, while the latest stress lower-growth gates failed despite positive Rank-IC.",
+      "resolution": "Pinned forecast_horizon_sessions into compounding policy fingerprints and v3 artifacts, priced lower-confidence alpha per session, and explicitly rejected horizon-missing v3 manifests while preserving v2 compatibility.",
+      "impact": "OOF, holdout, and independent simulation now share identical horizon-aware log-utility sizing; malformed v3 policies fail closed."
+    },
+    {
       "task_id": "TASK_ML_COMPOUND_GROWTH_SELECTION",
       "date": "2026-08-18",
       "adr_id": "ADR_20260818_ML_COMPOUND_GROWTH_SELECTION",
