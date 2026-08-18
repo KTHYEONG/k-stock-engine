@@ -226,6 +226,29 @@ def _round_or_none(value: float) -> float | None:
     return round(float(value), 12)
 
 
+def annualize_bootstrap_lower_cagr(
+    lower_mean: float,
+    *,
+    annualization_sessions: int,
+    period_count: int,
+    observed_sessions: int,
+) -> float:
+    """Annualized lower-bound CAGR from a bootstrap mean log growth.
+
+    The annualization factor is ``annualization_sessions * period_count /
+    observed_sessions`` so that daily-ledger returns are correctly scaled
+    regardless of the horizon block length.
+    """
+    if observed_sessions <= 0:
+        return 0.0
+    if period_count <= 0:
+        return 0.0
+    if not math.isfinite(lower_mean):
+        return 0.0
+    factor = annualization_sessions * period_count / observed_sessions
+    return float(math.expm1(lower_mean * factor))
+
+
 def _certify_path(
     period_returns: Sequence[float],
     horizon_sessions: int,
@@ -260,15 +283,23 @@ def _certify_path(
             "mdd": 0.0,
             "calmar": None,
         }
+    if observed_sessions <= 0:
+        return {
+            "passed": False,
+            "reasons": ["invalid-observed-sessions"],
+            "period_count": int(arr.size),
+            "observed_sessions": int(observed_sessions),
+            "active_cohort_count": int(active_cohort_count),
+            "cagr": 0.0,
+            "lower_cagr": 0.0,
+            "mdd": 0.0,
+            "calmar": None,
+        }
     period_count = int(arr.size)
     annualization = settings.annualization_sessions
     log_growth = np.log1p(arr)
     total_log = float(np.sum(log_growth))
-    cagr = (
-        float(np.expm1(total_log * annualization / observed_sessions))
-        if observed_sessions > 0
-        else 0.0
-    )
+    cagr = float(np.expm1(total_log * annualization / observed_sessions))
     equity = np.cumprod(1.0 + arr)
     peaks = np.maximum.accumulate(equity)
     mdd = float(np.max(1.0 - equity / np.where(peaks > 0, peaks, 1.0)))
@@ -280,8 +311,11 @@ def _certify_path(
         settings.seed,
         settings.bootstrap_alpha,
     )
-    lower_cagr = float(
-        np.expm1(lower_mean * annualization / horizon_sessions)
+    lower_cagr = annualize_bootstrap_lower_cagr(
+        lower_mean,
+        annualization_sessions=annualization,
+        period_count=period_count,
+        observed_sessions=observed_sessions,
     )
     if observed_sessions < settings.min_observed_sessions:
         reasons.append("insufficient-observed-sessions")

@@ -32,11 +32,13 @@ from src.stocks.data.costs import (
     krx_market_for_code,
     resolve_fill_cost,
 )
+from src.stocks.data.lineage import ResearchDataBundle
 from src.stocks.domain.execution_policy import ExecutionOutcomePolicy
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.trading.portfolio_constructor import StockRiskPolicy
 from src.stocks.workflows.trading_cycle import (
     CycleStatus,
+    MarketSlice,
     TradingCycleRequest,
     TradingCycleResult,
     run_trading_cycle,
@@ -50,6 +52,14 @@ REQUIRED_BACKTEST_COLUMNS = (
     "volume",
     "trading_value",
 )
+
+
+def _visible_bundle_frame(
+    bundle: ResearchDataBundle, decision_time: datetime
+) -> pl.DataFrame:
+    """Apply the bundle's point-in-time boundary for a decision session."""
+    visible_frame = bundle.frame.filter(pl.col("available_time") <= decision_time)
+    return visible_frame
 
 
 def _as_datetime(value: object) -> datetime:
@@ -1233,7 +1243,12 @@ class StockBacktester:
         visible = panel.filter(
             pl.col("available_time") <= decision_time
         ) if "available_time" in panel.columns else panel
-        snapshot = DatasetSnapshot(manifest=self.manifest, frame=visible)
+        market_slice = MarketSlice(
+            frame=visible,
+            decision_time=decision_time,
+            execution_time=execution_time,
+        )
+        snapshot = DatasetSnapshot(manifest=self.manifest, frame=market_slice.frame)
         cycle_request = TradingCycleRequest(
             strategy_id=request.strategy_id,
             artifact_id=artifact_id,

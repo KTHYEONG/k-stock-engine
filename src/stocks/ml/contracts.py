@@ -70,7 +70,8 @@ def validate_outcome_status(value: object) -> str:
 
 LEGACY_OVERLAY_PROFILE_ID = "legacy_overlay_5bps"
 LOWER_BOUND_ONLY_PROFILE_ID = "lower_bound_only"
-DEFAULT_POLICY_PROFILE_IDS = (LEGACY_OVERLAY_PROFILE_ID, LOWER_BOUND_ONLY_PROFILE_ID)
+LOWER_BOUND_HALF_KELLY_PROFILE_ID = "lower_bound_half_kelly"
+DEFAULT_POLICY_PROFILE_IDS = (LEGACY_OVERLAY_PROFILE_ID, LOWER_BOUND_ONLY_PROFILE_ID, LOWER_BOUND_HALF_KELLY_PROFILE_ID)
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,33 +79,40 @@ class PolicyProfile:
     """Immutable pre-registered economic policy profile for the OOF frontier.
 
     A profile differs from another only in the decimal no-trade entry band
-    applied on top of the calibrated ``net_alpha_lower_bound``. It never
-    changes the portfolio caps, cost schedules, liquidity model, purging,
-    embargo, or bootstrap alpha. ``profile_id`` must be non-empty and unique
-    within a frontier; ``no_trade_band_bps`` must be a finite non-negative
-    value. ``legacy_overlay_5bps`` reproduces the historical 5-bps entry
-    filter; ``lower_bound_only`` keeps the lower-bound positivity gate without
-    any extra overlay.
+    applied on top of the calibrated ``net_alpha_lower_bound`` and the
+    ``growth_risk_aversion`` scaling the Kelly exposure. It never changes the
+    portfolio caps, cost schedules, liquidity model, purging, embargo, or
+    bootstrap alpha. ``profile_id`` must be non-empty and unique within a
+    frontier; ``no_trade_band_bps`` must be a finite non-negative value;
+    ``growth_risk_aversion`` must be a finite strictly positive value.
+    ``legacy_overlay_5bps`` reproduces the historical 5-bps entry filter;
+    ``lower_bound_only`` keeps the lower-bound positivity gate without any
+    extra overlay; ``lower_bound_half_kelly`` uses half-Kelly exposure
+    (aversion=2).
     """
 
     profile_id: str
     no_trade_band_bps: float = 0.0
+    growth_risk_aversion: float = 1.0
 
     def __post_init__(self) -> None:
         if not self.profile_id:
             raise ValueError("profile_id must be non-empty")
         if not np.isfinite(self.no_trade_band_bps) or self.no_trade_band_bps < 0.0:
             raise ValueError("no_trade_band_bps must be a finite non-negative value")
+        if not np.isfinite(self.growth_risk_aversion) or self.growth_risk_aversion <= 0.0:
+            raise ValueError("growth_risk_aversion must be a finite strictly positive value")
 
 
 DEFAULT_POLICY_PROFILES = (
-    PolicyProfile(profile_id=LEGACY_OVERLAY_PROFILE_ID, no_trade_band_bps=5.0),
-    PolicyProfile(profile_id=LOWER_BOUND_ONLY_PROFILE_ID, no_trade_band_bps=0.0),
+    PolicyProfile(profile_id=LEGACY_OVERLAY_PROFILE_ID, no_trade_band_bps=5.0, growth_risk_aversion=1.0),
+    PolicyProfile(profile_id=LOWER_BOUND_ONLY_PROFILE_ID, no_trade_band_bps=0.0, growth_risk_aversion=1.0),
+    PolicyProfile(profile_id=LOWER_BOUND_HALF_KELLY_PROFILE_ID, no_trade_band_bps=0.0, growth_risk_aversion=2.0),
 )
 
 
 def validate_policy_profiles(profiles: tuple[PolicyProfile, ...]) -> tuple[PolicyProfile, ...]:
-    """Validate a policy frontier: exactly the two default profiles, no duplicates.
+    """Validate a policy frontier: exactly the three default profiles, no duplicates.
 
     Raises ``ValueError`` on an empty frontier, a duplicate profile id, a
     missing default profile, or an unexpected extra profile. The frontier is
@@ -123,7 +131,7 @@ def validate_policy_profiles(profiles: tuple[PolicyProfile, ...]) -> tuple[Polic
         )
     if tuple(ids) != DEFAULT_POLICY_PROFILE_IDS:
         raise ValueError(
-            "policy frontier must contain exactly the two default profiles "
+            "policy frontier must contain exactly the three default profiles "
             f"{DEFAULT_POLICY_PROFILE_IDS}; got {tuple(ids)}"
         )
     return profiles
@@ -279,6 +287,7 @@ class NetAlphaTrainingRequest:
     liquidity_model: LiquiditySlippageModel | None = None
     stress_liquidity_model: LiquiditySlippageModel | None = None
     execution_policy: ExecutionOutcomePolicy | None = None
+    enforce_snapshot_outcome_readiness: bool = True
 
     def __post_init__(self) -> None:
         if not self.artifact_id:
