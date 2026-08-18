@@ -19,7 +19,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import cast
+from typing import Literal, cast
 
 import numpy as np
 import polars as pl
@@ -486,6 +486,45 @@ def _prepared_priority_alpha_of(
     return priority
 
 
+def _economic_rank_values(
+    *,
+    raw_scores: np.ndarray,
+    expected_active_alpha: np.ndarray,
+    expected_net_alpha: np.ndarray,
+    exit_cost_rate: np.ndarray,
+    instrument_ids: np.ndarray,
+    incumbent_ids: set[str],
+    ranking_mode: str,
+) -> np.ndarray:
+    """Compute cost-adjusted ranking values for economic_net_v1 mode.
+
+    For incumbents: ``max(expected_active_alpha - exit_cost_rate, 0)``.
+    For entrants: ``max(expected_net_alpha, 0)``.
+    All inputs must be finite; missing or non-finite values cause fail-closed
+    by raising ``ValueError`` rather than falling back to raw scores.
+    """
+    if ranking_mode == "raw_score_v1":
+        return raw_scores.copy()
+    if ranking_mode != "economic_net_v1":
+        raise ValueError(f"unknown economic_ranking_mode: {ranking_mode}")
+    n = raw_scores.size
+    values = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        instrument_id = str(instrument_ids[i])
+        active = expected_active_alpha[i]
+        net = expected_net_alpha[i]
+        exit_rate = exit_cost_rate[i]
+        if not (np.isfinite(active) and np.isfinite(net) and np.isfinite(exit_rate)):
+            raise ValueError(
+                f"economic_net_v1 requires finite economic values for {instrument_id}"
+            )
+        if instrument_id in incumbent_ids:
+            values[i] = max(active - exit_rate, 0.0)
+        else:
+            values[i] = max(net, 0.0)
+    return values
+
+
 def _construct_allocations_prepared(
     market: PreparedAllocationMarket,
     decision_index: int,
@@ -561,7 +600,22 @@ def _construct_allocations_prepared(
     positions = np.where(eligible)[0]
     preds = scores[positions]
     id_strs = np.asarray([str(cs_ids[position]) for position in positions], dtype=object)
-    order = rank_stock_candidate_indices(preds, id_strs)
+    if policy.economic_ranking_mode == "economic_net_v1" and econ is None:
+        raise ValueError("economic_net_v1 requires calibrated economic inputs")
+    if policy.economic_ranking_mode == "economic_net_v1":
+        assert econ is not None
+        rank_values = _economic_rank_values(
+            raw_scores=preds,
+            expected_active_alpha=econ["expected_active_alpha"][positions],
+            expected_net_alpha=econ["expected_net_alpha"][positions],
+            exit_cost_rate=econ["exit_cost_rate"][positions],
+            instrument_ids=id_strs,
+            incumbent_ids=incumbent_ids,
+            ranking_mode=policy.economic_ranking_mode,
+        )
+    else:
+        rank_values = preds
+    order = rank_stock_candidate_indices(rank_values, id_strs)
     positions_sorted = positions[order]
     ranks = np.arange(1, positions_sorted.size + 1, dtype=np.int64)
     incumbent_of = np.asarray(
@@ -708,6 +762,7 @@ class StockRiskPolicy:
     compounding_evidence: list[dict[str, object]] = field(
         default_factory=list, repr=False, compare=False
     )
+    economic_ranking_mode: Literal["raw_score_v1", "economic_net_v1"] = "raw_score_v1"
 
     def __post_init__(self) -> None:
         if self.top_k <= 0:
@@ -740,6 +795,10 @@ class StockRiskPolicy:
             or self.annualization_sessions <= 0
         ):
             raise ValueError("lookbacks, frequency, and annualization must be positive")
+        if self.economic_ranking_mode not in ("raw_score_v1", "economic_net_v1"):
+            raise ValueError(
+                "economic_ranking_mode must be 'raw_score_v1' or 'economic_net_v1'"
+            )
 
 
 def stock_risk_policy_fingerprint(policy: StockRiskPolicy) -> str:
@@ -747,9 +806,9 @@ def stock_risk_policy_fingerprint(policy: StockRiskPolicy) -> str:
 
     Binds every execution-relevant policy field (target counts, ranks, caps,
     participation, no-trade band, vol/cov lookbacks, rebalance frequency,
-    annualization, hysteresis, and compounding configuration) so an independent
-    backtester can never silently replay a divergent policy than the one that
-    selected and certified an artifact.
+    annualization, hysteresis, compounding configuration, and economic ranking
+    mode) so an independent backtester can never silently replay a divergent
+    policy than the one that selected and certified an artifact.
     """
     payload = json.dumps(
         {
@@ -773,6 +832,7 @@ def stock_risk_policy_fingerprint(policy: StockRiskPolicy) -> str:
                 "enabled": bool(policy.compounding.enabled),
                 "growth_risk_aversion": float(policy.compounding.growth_risk_aversion),
             },
+            "economic_ranking_mode": str(policy.economic_ranking_mode),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -826,10 +886,31 @@ def construct_target_allocations(
             no_trade_band_bps=policy.no_trade_band_bps,
         )
 
-    order = rank_stock_candidate_indices(
-        np.asarray(eligible["pred_score"].to_list(), dtype=np.float64),
-        np.asarray(eligible["instrument_id"].to_list(), dtype=object),
-    )
+    raw_scores = np.asarray(eligible["pred_score"].to_list(), dtype=np.float64)
+    eligible_ids = np.asarray(eligible["instrument_id"].to_list(), dtype=object)
+    if policy.economic_ranking_mode == "economic_net_v1" and not all(
+        column in eligible.columns for column in _ECONOMIC_COLUMNS
+    ):
+        raise ValueError("economic_net_v1 requires calibrated economic inputs")
+    if policy.economic_ranking_mode == "economic_net_v1":
+        rank_values = _economic_rank_values(
+            raw_scores=raw_scores,
+            expected_active_alpha=np.asarray(
+                eligible["expected_active_alpha"].to_list(), dtype=np.float64
+            ),
+            expected_net_alpha=np.asarray(
+                eligible["expected_net_alpha"].to_list(), dtype=np.float64
+            ),
+            exit_cost_rate=np.asarray(
+                eligible["exit_cost_rate"].to_list(), dtype=np.float64
+            ),
+            instrument_ids=eligible_ids,
+            incumbent_ids=incumbent_ids,
+            ranking_mode=policy.economic_ranking_mode,
+        )
+    else:
+        rank_values = raw_scores
+    order = rank_stock_candidate_indices(rank_values, eligible_ids)
     ranked = (
         eligible.gather(order)
         .with_row_index("__rank", offset=1)

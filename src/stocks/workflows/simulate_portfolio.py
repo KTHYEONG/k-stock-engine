@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import math
 from datetime import UTC, datetime
-from typing import cast
+from typing import Literal, cast
 
 import polars as pl
 
@@ -169,6 +169,34 @@ def _profile_growth_risk_aversion(profile: dict[str, object]) -> float:
     return value
 
 
+def _profile_economic_ranking_mode(
+    profile: dict[str, object],
+) -> Literal["raw_score_v1", "economic_net_v1"]:
+    """Extract economic_ranking_mode from a policy profile, defaulting to raw_score_v1.
+
+    Existing payloads lacking economic_ranking_mode default to raw_score_v1
+    for backward-compatible replay of legacy v1 artifacts.
+    """
+    raw = profile.get("economic_ranking_mode")
+    if raw is None:
+        if profile.get("execution_evidence_version") == "prepared-equity-v2-economic-rank":
+            raise ValueError(
+                "economic_ranking_mode is required for prepared-equity-v2-economic-rank"
+            )
+        return "raw_score_v1"
+    if not isinstance(raw, str):
+        raise ValueError(
+            "economic_ranking_mode must be a string, "
+            f"got {type(raw).__name__}"
+        )
+    if raw not in ("raw_score_v1", "economic_net_v1"):
+        raise ValueError(
+            f"economic_ranking_mode must be 'raw_score_v1' or 'economic_net_v1', "
+            f"got {raw!r}"
+        )
+    return cast(Literal["raw_score_v1", "economic_net_v1"], raw)
+
+
 def _policy_from_artifact(
     artifact_manifest: ModelManifest, request: SimulationRequest
 ) -> StockRiskPolicy:
@@ -190,6 +218,7 @@ def _policy_from_artifact(
         )
     _validate_request_policy(request, profile)
     aversion = _profile_growth_risk_aversion(profile)
+    ranking_mode = _profile_economic_ranking_mode(profile)
     return StockRiskPolicy(
         top_k=cast(int, profile["top_k"]),
         gross_cap=cast(float, profile["max_exposure"]),
@@ -197,6 +226,7 @@ def _policy_from_artifact(
         participation_limit=cast(float, profile["participation_limit"]),
         no_trade_band_bps=cast(float, profile["no_trade_band_bps"]),
         compounding=CompoundingPolicyConfig(growth_risk_aversion=aversion),
+        economic_ranking_mode=ranking_mode,
     )
 
 
@@ -223,7 +253,10 @@ def _validate_request_policy(
             f"{request.no_trade_band_bps} diverges from the artifact band "
             f"{artifact_band}"
         )
-    if profile.get("execution_evidence_version") == "prepared-equity-v1":
+    if profile.get("execution_evidence_version") in (
+        "prepared-equity-v1",
+        "prepared-equity-v2-economic-rank",
+    ):
         _validate_prepared_equity_policy(request, profile, artifact_band)
         return
     request_fingerprint = policy_portfolio_fingerprint(
@@ -255,6 +288,7 @@ def _validate_prepared_equity_policy(
     artifact.
     """
     aversion = _profile_growth_risk_aversion(profile)
+    ranking_mode = _profile_economic_ranking_mode(profile)
     policy = StockRiskPolicy(
         top_k=request.top_k,
         gross_cap=request.max_exposure,
@@ -262,6 +296,7 @@ def _validate_prepared_equity_policy(
         participation_limit=request.participation_limit,
         no_trade_band_bps=artifact_band,
         compounding=CompoundingPolicyConfig(growth_risk_aversion=aversion),
+        economic_ranking_mode=ranking_mode,
     )
     if stock_risk_policy_fingerprint(policy) != profile["risk_policy_fingerprint"]:
         raise ValueError(
