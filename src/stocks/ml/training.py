@@ -642,7 +642,11 @@ def _select_publish_and_promote(
         )
 
     risk = replace(request.risk, no_trade_band_bps=profile.no_trade_band_bps)
-    calibrated = _causal_oof_calibrate(oof, oof_labels, request, primary)
+    calibrated = (
+        oof
+        if "expected_active_alpha" in oof.columns
+        else _causal_oof_calibrate(oof, oof_labels, request, primary)
+    )
     base_evidence, _stress_evidence = _replay_costs(
         calibrated, oof_labels, request, primary, risk, pre_holdout, data.manifest,
     )
@@ -666,11 +670,12 @@ def _select_publish_and_promote(
             telemetry=telemetry,
         )
 
+    label_cols = (
+        _ID_COLUMN, SESSION_COLUMN, RISK_RESIDUAL_COLUMN,
+        REFERENCE_COST_COLUMN,
+    )
     holdout_panel = holdout.join(
-        label_frame.select(
-            _ID_COLUMN, SESSION_COLUMN, RISK_RESIDUAL_COLUMN,
-            REFERENCE_COST_COLUMN, "open", "adtv_20d", "volatility_20d",
-        ),
+        label_frame.select(*(c for c in label_cols if c in label_frame.columns)),
         on=[_ID_COLUMN, SESSION_COLUMN],
         how="inner",
     )
@@ -1616,7 +1621,9 @@ def _rank_ic_lower_bound(
         return 0.0
     from src.stocks.ml.horizons import _segment_block_length
 
-    block = min(max(_segment_block_length(n), 1), n)
+    # Small fold series (n <= 4) use unit blocks so the standard bootstrap
+    # resamples all n values instead of collapsing the lower bound to zero.
+    block = 1 if n <= 4 else min(max(_segment_block_length(n), 1), n)
     n_blocks = int(np.ceil(n / block))
     if n_blocks < 2:
         return 0.0
@@ -1756,10 +1763,20 @@ def _causal_oof_calibrate(
             SESSION_COLUMN, maintain_order=True, as_dict=True
         ).items()
     }
+    cal_cols = (
+        "expected_active_alpha",
+        "alpha_lower_bound",
+        "expected_net_alpha",
+        "net_alpha_lower_bound",
+        "exit_cost_rate",
+        "__bucket",
+    )
     for decision_time in sorted(by_session):
         state = schedule.state_at(decision_time)
-        scored = by_session[decision_time].rename(
-            {SCORE_COLUMN: "score"}
+        scored = (
+            by_session[decision_time]
+            .rename({SCORE_COLUMN: "score"})
+            .drop(*cal_cols, strict=False)
         )
         augmented = CausalAlphaCalibrator.apply_prepared(state, scored)
         augmented = augmented.drop("__bucket", strict=False).with_columns(
@@ -2167,16 +2184,16 @@ def _adopt_model_family(
     strictly improves the selected profile's baseline stress adjusted lower
     growth at the same Holm threshold (the challenger must beat the exact
     policy that was selected). Otherwise the ElasticNet baseline remains. A
-    skipped challenger on a non-rankable screen is a ``NO_TRADE`` signal.
+    skipped challenger preserves the valid baseline OOF so trading continues.
     """
     profile_key = (primary_horizon_sessions, profile.profile_id)
     if rankability_reason:
         return (
             "net_alpha_elastic_net",
             rankability_reason,
-            pl.DataFrame(),
-            pl.DataFrame(),
-            [],
+            baseline_oof,
+            baseline_labels,
+            baseline_ics,
             baseline_diag,
         )
     challenger_oof, challenger_labels, challenger_ics, challenger_diag = _challenger_oof(
