@@ -16,6 +16,7 @@ from src.stocks.trading.portfolio_constructor import (
     PortfolioConstraintError,
     StockRiskPolicy,
     construct_target_allocations,
+    stock_risk_policy_fingerprint,
 )
 
 
@@ -1260,3 +1261,180 @@ def test_prepared_and_reference_fallback_covariance_inputs_are_identical() -> No
     assert np.allclose(ref_cov, prep_cov)
     assert np.all(np.isfinite(ref_cov))
     assert np.all(np.linalg.eigvalsh(ref_cov) >= -1e-12)
+
+_ECO_ENTRY_SCENARIO = "economic_entry_rank_overrides_raw_score"
+
+
+def test_economic_entry_rank_overrides_raw_score() -> None:
+    """economic_net_v1 selects by expected_net_alpha, not raw pred_score."""
+    from src.stocks.trading.portfolio_constructor import _economic_rank_values
+
+    policy_raw = StockRiskPolicy(top_k=20, economic_ranking_mode="raw_score_v1")
+    policy_econ = StockRiskPolicy(top_k=20, economic_ranking_mode="economic_net_v1")
+
+    raw_scores = np.array([0.9, 0.1], dtype=np.float64)
+    expected_active_alpha = np.array([0.005, 0.02], dtype=np.float64)
+    expected_net_alpha = np.array([0.003, 0.018], dtype=np.float64)
+    exit_cost_rate = np.array([0.002, 0.002], dtype=np.float64)
+    instrument_ids = np.array(["KRX:A", "KRX:B"], dtype=object)
+    incumbent_ids: set[str] = set()
+
+    vals_raw = _economic_rank_values(
+        raw_scores=raw_scores,
+        expected_active_alpha=expected_active_alpha,
+        expected_net_alpha=expected_net_alpha,
+        exit_cost_rate=exit_cost_rate,
+        instrument_ids=instrument_ids,
+        incumbent_ids=incumbent_ids,
+        ranking_mode=policy_raw.economic_ranking_mode,
+    )
+    vals_econ = _economic_rank_values(
+        raw_scores=raw_scores,
+        expected_active_alpha=expected_active_alpha,
+        expected_net_alpha=expected_net_alpha,
+        exit_cost_rate=exit_cost_rate,
+        instrument_ids=instrument_ids,
+        incumbent_ids=incumbent_ids,
+        ranking_mode=policy_econ.economic_ranking_mode,
+    )
+
+    from src.stocks.trading.allocation_policy import rank_stock_candidate_indices
+
+    order_raw = rank_stock_candidate_indices(vals_raw, instrument_ids)
+    order_econ = rank_stock_candidate_indices(vals_econ, instrument_ids)
+
+    assert list(instrument_ids[order_raw]) == ["KRX:A", "KRX:B"]
+    assert list(instrument_ids[order_econ]) == ["KRX:B", "KRX:A"]
+
+
+_ECO_INCUMBENT_SCENARIO = "economic_incumbent_keep_benefit_rank"
+
+
+def test_economic_incumbent_keep_benefit_rank() -> None:
+    """economic_net_v1 ranks incumbents by active_alpha - exit_cost, entrants by net_alpha."""
+    from src.stocks.trading.portfolio_constructor import _economic_rank_values
+
+    raw_scores = np.array([0.5, 0.5], dtype=np.float64)
+    expected_active_alpha = np.array([0.01, 0.005], dtype=np.float64)
+    expected_net_alpha = np.array([0.008, 0.003], dtype=np.float64)
+    exit_cost_rate = np.array([0.002, 0.002], dtype=np.float64)
+    instrument_ids = np.array(["KRX:INC", "KRX:ENT"], dtype=object)
+    incumbent_ids = {"KRX:INC"}
+
+    vals = _economic_rank_values(
+        raw_scores=raw_scores,
+        expected_active_alpha=expected_active_alpha,
+        expected_net_alpha=expected_net_alpha,
+        exit_cost_rate=exit_cost_rate,
+        instrument_ids=instrument_ids,
+        incumbent_ids=incumbent_ids,
+        ranking_mode="economic_net_v1",
+    )
+    assert vals[0] == pytest.approx(0.008)
+    assert vals[1] == pytest.approx(0.003)
+
+
+def test_economic_rank_values_fails_closed_on_non_finite() -> None:
+    """economic_net_v1 raises ValueError on non-finite economic inputs."""
+    from src.stocks.trading.portfolio_constructor import _economic_rank_values
+
+    raw_scores = np.array([0.5, 0.5], dtype=np.float64)
+    expected_active_alpha = np.array([float("nan"), 0.005], dtype=np.float64)
+    expected_net_alpha = np.array([0.003, 0.003], dtype=np.float64)
+    exit_cost_rate = np.array([0.002, 0.002], dtype=np.float64)
+    instrument_ids = np.array(["KRX:A", "KRX:B"], dtype=object)
+
+    with pytest.raises(ValueError, match="finite economic"):
+        _economic_rank_values(
+            raw_scores=raw_scores,
+            expected_active_alpha=expected_active_alpha,
+            expected_net_alpha=expected_net_alpha,
+            exit_cost_rate=exit_cost_rate,
+            instrument_ids=instrument_ids,
+            incumbent_ids=set(),
+            ranking_mode="economic_net_v1",
+        )
+
+
+_ECO_PARITY_SCENARIO = "prepared_reference_economic_rank_parity"
+
+
+def test_prepared_reference_economic_rank_parity() -> None:
+    """Prepared and reference constructors produce identical allocations under economic_net_v1."""
+    from src.stocks.research.economic_alpha import CausalAlphaCalibrator
+    from src.stocks.trading.portfolio_constructor import (
+        PreparedAllocationMarket,
+        construct_target_allocations_prepared,
+    )
+
+    policy = StockRiskPolicy(top_k=20, economic_ranking_mode="economic_net_v1")
+    panel = scored_panel(n_sessions=61, n_tickers=10, seed=9).drop("ret")
+    instruments = instruments_for(10)
+    portfolio = empty_portfolio()
+
+    buckets = [
+        {
+            "bucket": bucket,
+            "sample_size": 10,
+            "expected_active_alpha": 0.003,
+            "alpha_lower_bound": 0.002,
+        }
+        for bucket in range(4)
+    ]
+    cal_state = {
+        "bucket_count": 4,
+        "history_sessions": 30,
+        "round_trip_cost": 0.0005,
+        "exit_cost_rate": 0.0003,
+        "buckets": buckets,
+    }
+
+    market = PreparedAllocationMarket.build(panel)
+    overlay = (
+        panel.sort(["session", "instrument_id"])["pred_score"].to_numpy().astype(float)
+    )
+
+    window_len = (
+        max(policy.volatility_lookback_sessions, policy.covariance_lookback_sessions)
+        + 1
+    )
+    decision_index = len(market.sessions) - 1
+    start = max(0, decision_index - window_len + 1)
+    indices = np.concatenate(
+        [
+            np.arange(market.session_ranges[i][0], market.session_ranges[i][1])
+            for i in range(start, decision_index + 1)
+        ]
+    )
+    from src.stocks.trading.portfolio_constructor import _SESSION_COLUMN
+
+    window_frame = pl.DataFrame(
+        {
+            "instrument_id": market.instrument_ids[indices],
+            _SESSION_COLUMN: pl.Series(
+                market.row_sessions[indices].tolist(),
+                dtype=pl.Datetime("us", "UTC"),
+            ),
+            "pred_score": np.asarray(overlay)[indices],
+            "sector": market.sector[indices],
+            "adtv": market.adtv[indices],
+            "close": market.close[indices],
+        }
+    ).with_columns(pl.col("pred_score").fill_nan(None))
+    window_frame = CausalAlphaCalibrator.apply_prepared(cal_state, window_frame)
+
+    ref = construct_target_allocations(window_frame, instruments, portfolio, policy)
+    prep = construct_target_allocations_prepared(
+        market, decision_index, overlay, cal_state, instruments, portfolio, policy
+    )
+    assert prep == ref
+
+
+def test_stock_risk_policy_fingerprint_includes_economic_ranking_mode() -> None:
+    """Fingerprint differs when economic_ranking_mode differs."""
+    p1 = StockRiskPolicy(top_k=20, economic_ranking_mode="raw_score_v1")
+    p2 = StockRiskPolicy(top_k=20, economic_ranking_mode="economic_net_v1")
+    assert stock_risk_policy_fingerprint(p1) != stock_risk_policy_fingerprint(p2)
+
+    p3 = StockRiskPolicy(top_k=20, economic_ranking_mode="raw_score_v1")
+    assert stock_risk_policy_fingerprint(p1) == stock_risk_policy_fingerprint(p3)

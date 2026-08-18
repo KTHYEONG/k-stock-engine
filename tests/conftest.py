@@ -15,6 +15,7 @@ from _pytest.config import Config
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _TEMP_ROOT = PROJECT_ROOT / "tmp" / "pytest"
+_ACTIVE_TEMP_ROOT: Path | None = None
 
 
 def pytest_configure(config: Config) -> None:
@@ -26,10 +27,12 @@ def pytest_configure(config: Config) -> None:
     as well.
     """
     del config
-    _TEMP_ROOT.mkdir(parents=True, exist_ok=True)
-    os.environ["PYTEST_DEBUG_TEMPROOT"] = str(_TEMP_ROOT)
-    os.environ["TMPDIR"] = str(_TEMP_ROOT)
-    tempfile.tempdir = str(_TEMP_ROOT)
+    global _ACTIVE_TEMP_ROOT
+    _ACTIVE_TEMP_ROOT = _TEMP_ROOT / f"session-{os.getpid()}"
+    _ACTIVE_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+    os.environ["PYTEST_DEBUG_TEMPROOT"] = str(_ACTIVE_TEMP_ROOT)
+    os.environ["TMPDIR"] = str(_ACTIVE_TEMP_ROOT)
+    tempfile.tempdir = str(_ACTIVE_TEMP_ROOT)
 
 
 def pytest_sessionfinish(session: object, exitstatus: int) -> None:
@@ -40,11 +43,11 @@ def pytest_sessionfinish(session: object, exitstatus: int) -> None:
     """
     del session
     del exitstatus
-    if _TEMP_ROOT.exists():
+    if _ACTIVE_TEMP_ROOT is not None and _ACTIVE_TEMP_ROOT.exists():
         import shutil
 
         # Clean all items inside _TEMP_ROOT without removing the root itself
-        for item in _TEMP_ROOT.iterdir():
+        for item in _ACTIVE_TEMP_ROOT.iterdir():
             if item.name == ".gitignore":
                 continue
             try:

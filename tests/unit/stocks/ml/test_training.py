@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import polars as pl
 import pytest
 
 from src.stocks.ml import training
+from src.stocks.trading.portfolio_constructor import CompoundingPolicyConfig
 from src.stocks.ml.training import _build_horizon_evidence, _evaluate_forward_holdout
 
 
@@ -133,7 +135,7 @@ def test_forward_holdout_passes_with_complete_base_and_stress() -> None:
     )
     assert evidence["passed"] is True
     assert evidence["reason"] == ""
-    assert evidence["evaluation_kind"] == "prepared-equity-v1"
+    assert evidence["evaluation_kind"] == "prepared-equity-v2-economic-rank"
     assert evidence["order_count"] == 18
     assert evidence["block_count"] == 59
     assert evidence["cohorts"]["eligible_sessions"] == 57
@@ -1198,3 +1200,35 @@ def test_adaptive_bucketing_cold_start() -> None:
     )
     assert warm["history_sessions"] >= 252
     assert warm["bucket_count"] == 10
+
+
+_TRAINING_ARTIFACT_SCENARIO = "training_artifact_marks_economic_rank_v2"
+
+
+def test_training_artifact_marks_economic_rank_v2() -> None:
+    """Promoted artifact records economic_net_v1 mode and v2 evidence version."""
+    data, request, pre_holdout, folds, learner_columns, _schema = _training_fixture()
+    profile = _compound_request().policy_profiles[0]
+    policy = training._risk_policy_for_profile(request, profile)
+    assert policy.economic_ranking_mode == "economic_net_v1"
+
+    params_json = training._policy_profile_params(request, profile)
+    params = json.loads(params_json)
+    assert params["economic_ranking_mode"] == "economic_net_v1"
+    assert params["execution_evidence_version"] == "prepared-equity-v2-economic-rank"
+
+    from src.stocks.trading.portfolio_constructor import (
+        StockRiskPolicy,
+        stock_risk_policy_fingerprint,
+    )
+
+    raw_policy = StockRiskPolicy(
+        top_k=request.portfolio.top_k,
+        gross_cap=request.portfolio.max_exposure,
+        single_name_cap=request.portfolio.max_single_weight,
+        participation_limit=request.portfolio.participation_limit,
+        no_trade_band_bps=profile.no_trade_band_bps,
+        compounding=CompoundingPolicyConfig(growth_risk_aversion=profile.growth_risk_aversion),
+        economic_ranking_mode="raw_score_v1",
+    )
+    assert stock_risk_policy_fingerprint(policy) != stock_risk_policy_fingerprint(raw_policy)
