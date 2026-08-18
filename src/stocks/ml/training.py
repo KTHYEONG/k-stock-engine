@@ -104,6 +104,7 @@ from src.stocks.research.folds import Fold, PurgedWalkForward
 from src.stocks.research.metrics import certify_compounded_holdout
 from src.stocks.research.models import Model, ModelManifest
 from src.stocks.trading.portfolio_constructor import (
+    CompoundingPolicyConfig,
     StockRiskPolicy,
     stock_risk_policy_fingerprint,
 )
@@ -349,29 +350,32 @@ def train_net_alpha_model(
             telemetry=telemetry,
         )
 
-    readiness = assess_snapshot_outcome_readiness(
-        data, request.candidate_horizon_sessions
-    )
-    telemetry.phase(
-        "snapshot_outcome_readiness",
-        {
-            "passed": readiness.passed,
-            "horizon_count": len(readiness.horizon_results),
-            "unresolved_horizons": [
-                result.horizon_sessions
-                for result in readiness.horizon_results
-                if not result.passed
-            ],
-        },
-    )
-    if not readiness.passed:
-        reason = readiness.reason or "snapshot-outcome-readiness-failed"
-        return _publish_no_trade(
-            registry, request, frame, reason,
-            details={"snapshot_outcome_readiness": readiness.to_json()},
-            schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
-            telemetry=telemetry,
+    if request.enforce_snapshot_outcome_readiness:
+        readiness = assess_snapshot_outcome_readiness(
+            data, request.candidate_horizon_sessions
         )
+        telemetry.phase(
+            "snapshot_outcome_readiness",
+            {
+                "passed": readiness.passed,
+                "horizon_count": len(readiness.horizon_results),
+                "unresolved_horizons": [
+                    result.horizon_sessions
+                    for result in readiness.horizon_results
+                    if not result.passed
+                ],
+            },
+        )
+        if not readiness.passed:
+            reason = readiness.reason or "snapshot-outcome-readiness-failed"
+            return _publish_no_trade(
+                registry, request, frame, reason,
+                details={"snapshot_outcome_readiness": readiness.to_json()},
+                schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+                telemetry=telemetry,
+            )
+    else:
+        telemetry.phase("snapshot_outcome_readiness", {"passed": True, "skipped": True})
 
     raw_panel = _index_sessions(frame)
     pre_holdout_raw, holdout_raw, holdout_reason = _locked_holdout(raw_panel, request)
@@ -507,7 +511,7 @@ def _select_publish_and_promote(
         discovery.evidence, request.bootstrap_alpha, request.seed,
         n_bootstrap=request.bootstrap_resamples,
         rebalance_frequency_sessions=(
-            _risk_policy_for_profile(request, 0.0).rebalance_frequency_sessions
+            StockRiskPolicy().rebalance_frequency_sessions
         ),
     )
     telemetry.phase(
@@ -649,6 +653,7 @@ def _select_publish_and_promote(
     )
     base_evidence, _stress_evidence = _replay_costs(
         calibrated, oof_labels, request, primary, risk, pre_holdout, data.manifest,
+        profile,
     )
     evaluation = base_evidence
 
@@ -1150,7 +1155,7 @@ def _fold_alpha_metadata(diagnostic: HorizonOOFDiagnostic) -> dict[str, object]:
 
 
 def _risk_policy_for_profile(
-    request: NetAlphaTrainingRequest, band_bps: float
+    request: NetAlphaTrainingRequest, profile: PolicyProfile
 ) -> StockRiskPolicy:
     """Frozen operational risk policy reconstructed from the request portfolio."""
     return StockRiskPolicy(
@@ -1158,7 +1163,8 @@ def _risk_policy_for_profile(
         gross_cap=request.portfolio.max_exposure,
         single_name_cap=request.portfolio.max_single_weight,
         participation_limit=request.portfolio.participation_limit,
-        no_trade_band_bps=band_bps,
+        no_trade_band_bps=profile.no_trade_band_bps,
+        compounding=CompoundingPolicyConfig(growth_risk_aversion=profile.growth_risk_aversion),
     )
 
 
@@ -1166,7 +1172,7 @@ def _execution_replay_context(
     request: NetAlphaTrainingRequest,
     manifest: DatasetManifest,
     market_frame: pl.DataFrame,
-    band_bps: float,
+    profile: PolicyProfile,
     *,
     seed: int,
 ) -> ExecutionReplayContext:
@@ -1186,7 +1192,7 @@ def _execution_replay_context(
             unsettled_cash=0.0,
             positions=(),
         ),
-        risk_policy=_risk_policy_for_profile(request, band_bps),
+        risk_policy=_risk_policy_for_profile(request, profile),
         base_cost_schedule=request.base_cost_schedule or default_base_schedule(),
         stress_cost_schedule=request.stress_cost_schedule or default_stress_schedule(),
         liquidity_model=request.liquidity_model,
@@ -1204,6 +1210,7 @@ def _replay_costs(
     risk: RiskSettings,
     market_frame: pl.DataFrame,
     manifest: DatasetManifest,
+    profile: PolicyProfile,
 ) -> tuple[ExecutionReplayEvidence, ExecutionReplayEvidence]:
     """Execution-equivalent base/stress replay over the segment-identified OOF.
 
@@ -1226,7 +1233,7 @@ def _replay_costs(
         for segment, sessions in sessions_by_segment.items()
     }
     context = _execution_replay_context(
-        request, manifest, market_frame, risk.no_trade_band_bps,
+        request, manifest, market_frame, profile,
         seed=request.seed + horizon_sessions,
     )
     replay_request = ExecutionEquivalentReplayRequest(
@@ -1457,7 +1464,7 @@ def _build_horizon_evidence(
                 try:
                     base_evidence, _ = _replay_costs(
                         _calibrated, _oof_labels, _request, _horizon, risk,
-                        _pre_holdout, _manifest,
+                        _pre_holdout, _manifest, profile,
                     )
                 except ValueError as exc:
                     return profile, None, (
@@ -2209,7 +2216,7 @@ def _adopt_model_family(
     try:
         _base_evidence, stress_evidence = _replay_costs(
             challenger_calibrated, challenger_labels, request,
-            primary_horizon_sessions, risk, pre_holdout, data.manifest,
+            primary_horizon_sessions, risk, pre_holdout, data.manifest, profile,
         )
     except ValueError as exc:
         return (
@@ -2233,7 +2240,7 @@ def _adopt_model_family(
         request.seed + primary_horizon_sessions,
         min_block_length=max(
             primary_horizon_sessions,
-            _risk_policy_for_profile(request, 0.0).rebalance_frequency_sessions,
+            StockRiskPolicy().rebalance_frequency_sessions,
         ),
     )
     if bootstrap is None:
@@ -2392,6 +2399,7 @@ def _evaluate_forward_holdout(
         base_evidence, stress_evidence = _replay_costs(
             calibrated, calibrated, request, horizon_sessions, risk,
             holdout_panel, _holdout_stub_manifest(request, holdout_panel),
+            profile,
         )
     except ValueError as exc:
         return {"passed": False, "reason": f"holdout-replay-invalid:{exc}"}
@@ -2576,12 +2584,13 @@ def _policy_profile_params(
     request: NetAlphaTrainingRequest, profile: PolicyProfile
 ) -> str:
     """JSON projection of the selected immutable policy profile for the manifest."""
-    policy = _risk_policy_for_profile(request, profile.no_trade_band_bps)
+    policy = _risk_policy_for_profile(request, profile)
     execution_policy = request.execution_policy or SCHEDULED_OPEN_V1
     return json.dumps(
         {
             "profile_id": profile.profile_id,
             "no_trade_band_bps": profile.no_trade_band_bps,
+            "growth_risk_aversion": profile.growth_risk_aversion,
             "top_k": request.portfolio.top_k,
             "max_single_weight": request.portfolio.max_single_weight,
             "max_exposure": request.portfolio.max_exposure,

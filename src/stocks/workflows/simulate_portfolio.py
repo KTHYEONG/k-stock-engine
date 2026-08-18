@@ -15,6 +15,7 @@ top-k/exposure/band than the OOF that selected the policy.
 from __future__ import annotations
 
 import json
+import math
 from datetime import UTC, datetime
 from typing import cast
 
@@ -37,6 +38,7 @@ from src.stocks.ml.contracts import policy_portfolio_fingerprint
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.research.models import ModelManifest
 from src.stocks.trading.portfolio_constructor import (
+    CompoundingPolicyConfig,
     StockRiskPolicy,
     stock_risk_policy_fingerprint,
 )
@@ -144,6 +146,29 @@ def _parse_policy_profile(
     return parsed
 
 
+def _profile_growth_risk_aversion(profile: dict[str, object]) -> float:
+    """Extract growth_risk_aversion from a policy profile, defaulting to 1.0.
+
+    Existing payloads lacking growth_risk_aversion default to 1.0 for
+    backward-compatible replay; they are never rewritten.
+    """
+    raw = profile.get("growth_risk_aversion")
+    if raw is None:
+        return 1.0
+    if not isinstance(raw, (int, float)):
+        raise ValueError(
+            "growth_risk_aversion must be a finite strictly positive number, "
+            f"got {type(raw).__name__}"
+        )
+    value = float(raw)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(
+            "growth_risk_aversion must be finite and strictly positive, "
+            f"got {value!r}"
+        )
+    return value
+
+
 def _policy_from_artifact(
     artifact_manifest: ModelManifest, request: SimulationRequest
 ) -> StockRiskPolicy:
@@ -164,12 +189,14 @@ def _policy_from_artifact(
             no_trade_band_bps=request.no_trade_band_bps or 0.0,
         )
     _validate_request_policy(request, profile)
+    aversion = _profile_growth_risk_aversion(profile)
     return StockRiskPolicy(
         top_k=cast(int, profile["top_k"]),
         gross_cap=cast(float, profile["max_exposure"]),
         single_name_cap=cast(float, profile["max_single_weight"]),
         participation_limit=cast(float, profile["participation_limit"]),
         no_trade_band_bps=cast(float, profile["no_trade_band_bps"]),
+        compounding=CompoundingPolicyConfig(growth_risk_aversion=aversion),
     )
 
 
@@ -227,12 +254,14 @@ def _validate_prepared_equity_policy(
     silently replay under a different policy than the one that certified the
     artifact.
     """
+    aversion = _profile_growth_risk_aversion(profile)
     policy = StockRiskPolicy(
         top_k=request.top_k,
         gross_cap=request.max_exposure,
         single_name_cap=request.max_single_weight,
         participation_limit=request.participation_limit,
         no_trade_band_bps=artifact_band,
+        compounding=CompoundingPolicyConfig(growth_risk_aversion=aversion),
     )
     if stock_risk_policy_fingerprint(policy) != profile["risk_policy_fingerprint"]:
         raise ValueError(
