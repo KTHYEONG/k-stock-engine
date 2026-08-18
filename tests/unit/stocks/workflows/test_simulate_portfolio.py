@@ -348,3 +348,47 @@ def test_half_kelly_artifact_parity(tmp_path) -> None:
         "execution_policy_hash": SCHEDULED_OPEN_V1.canonical_hash,
     }
     assert _profile_growth_risk_aversion(profile_missing) == 1.0
+
+
+_SIMULATION_RANK_MODE_SCENARIO = "simulation_preserves_artifact_rank_mode"
+
+
+def test_simulation_preserves_artifact_rank_mode() -> None:
+    """v1 profile defaults to raw_score_v1; v2 profile uses economic_net_v1."""
+    from src.stocks.workflows.simulate_portfolio import (
+        _profile_economic_ranking_mode,
+    )
+
+    v1_profile = {
+        "profile_id": "lower_bound_only",
+        "no_trade_band_bps": 0.0,
+        "top_k": 20,
+        "max_single_weight": 0.08,
+        "max_exposure": 0.9,
+        "participation_limit": 0.005,
+        "portfolio_fingerprint": policy_portfolio_fingerprint(20, 0.08, 0.9, 0.005),
+        "execution_evidence_version": "prepared-equity-v1",
+        "risk_policy_fingerprint": "dummy",
+        "execution_policy_id": SCHEDULED_OPEN_POLICY_ID,
+        "execution_policy_hash": SCHEDULED_OPEN_V1.canonical_hash,
+    }
+    assert _profile_economic_ranking_mode(v1_profile) == "raw_score_v1"
+
+    v2_profile = {
+        **v1_profile,
+        "execution_evidence_version": "prepared-equity-v2-economic-rank",
+        "economic_ranking_mode": "economic_net_v1",
+        "risk_policy_fingerprint": "dummy_v2",
+    }
+    assert _profile_economic_ranking_mode(v2_profile) == "economic_net_v1"
+
+    with pytest.raises(ValueError, match="economic_ranking_mode must be"):
+        _profile_economic_ranking_mode({**v2_profile, "economic_ranking_mode": 42})
+
+    with pytest.raises(ValueError, match="economic_ranking_mode must be"):
+        _profile_economic_ranking_mode({**v2_profile, "economic_ranking_mode": "unknown"})
+
+    with pytest.raises(ValueError, match="economic_ranking_mode is required"):
+        _profile_economic_ranking_mode(
+            {key: value for key, value in v2_profile.items() if key != "economic_ranking_mode"}
+        )
