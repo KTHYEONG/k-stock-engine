@@ -389,5 +389,11 @@
   },
   "src/stocks/ml/contracts.py": {
     "testing": "tests/unit/stocks/ml/test_contracts.py"
+  },
+  "src/stocks/data/lineage.py": {
+    "testing": "tests/unit/stocks/data/test_lineage.py"
+  },
+  "src/stocks/data/direct.py": {
+    "testing": "tests/unit/stocks/data/test_direct.py"
   }
 }

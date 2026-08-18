@@ -1,6 +1,26 @@
 {
   "tasks": [
     {
+      "task_id": "lean_ml_backtest_data_path",
+      "date": "2026-08-18",
+      "adr_id": "ADR_20260818_lean_ml_backtest_data_path",
+      "domain": "stocks",
+      "title": "Lean ML and backtest data path",
+      "why": "Snapshot, catalog provenance, and outcome-sidecar gates repeatedly blocked executable ML/backtest runs for research-only reasons.",
+      "resolution": "Added direct dataset loading and minimal ML market validation, connected direct CLI training, ledger input IDs, and MarketSlice replay wiring while retaining only PIT, key, numeric, chronological, and execution invariants.",
+      "impact": "ML and backtesting can operate on explicit base/feature/label datasets without snapshot or research provenance dependencies; docs/results remains the automatic aggregate run record."
+    },
+    {
+      "task_id": "snapshotless_data_access",
+      "date": "2026-08-18",
+      "adr_id": "ADR_20260818_snapshotless_data_access",
+      "domain": "stocks",
+      "title": "Snapshotless stock data access",
+      "why": "Aggregate snapshot coupling blocked valid ML and backtest data paths and caused provenance-driven no-trade failures.",
+      "resolution": "Added catalog-driven direct dataset compatibility resolution, immutable data lineage capture, PIT-aware ResearchDataBundle composition, CLI as-of selection, and lineage-aware ledger/backtest wiring.",
+      "impact": "ML and backtest workflows can resolve compatible immutable datasets without aggregate snapshot runtime dependency while preserving PIT, hash, certification, and replay invariants."
+    },
+    {
       "task_id": "TASK_BACKTEST_COMPOUNDING_RECOVERY",
       "date": "2026-08-18",
       "adr_id": "ADR_20260818_BACKTEST_COMPOUNDING_RECOVERY",
