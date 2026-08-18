@@ -4,7 +4,6 @@ from __future__ import annotations
 import pytest
 
 from src.stocks.ml.contracts import (
-    DEFAULT_POLICY_PROFILE_IDS,
     DEFAULT_POLICY_PROFILES,
     LOWER_BOUND_ONLY_PROFILE_ID,
     NetAlphaTrainingRequest,
@@ -14,12 +13,14 @@ from src.stocks.ml.contracts import (
 )
 
 
-def test_default_policy_profiles_are_the_two_pre_registered() -> None:
+def test_default_policy_profiles_are_the_three_pre_registered() -> None:
     assert tuple(p.profile_id for p in DEFAULT_POLICY_PROFILES) == (
         "legacy_overlay_5bps",
         "lower_bound_only",
+        "lower_bound_half_kelly",
     )
-    assert tuple(p.no_trade_band_bps for p in DEFAULT_POLICY_PROFILES) == (5.0, 0.0)
+    assert tuple(p.no_trade_band_bps for p in DEFAULT_POLICY_PROFILES) == (5.0, 0.0, 0.0)
+    assert tuple(p.growth_risk_aversion for p in DEFAULT_POLICY_PROFILES) == (1.0, 1.0, 2.0)
 
 
 def test_policy_profile_validates_input_range() -> None:
@@ -46,20 +47,31 @@ def test_validate_policy_profiles_rejects_duplicates() -> None:
 def test_validate_policy_profiles_rejects_missing_default() -> None:
     with pytest.raises(ValueError, match="default policy profile"):
         validate_policy_profiles(
-            (PolicyProfile("legacy_overlay_5bps", 5.0), PolicyProfile("custom", 0.0))
+            (PolicyProfile("legacy_overlay_5bps", 5.0), PolicyProfile("lower_bound_only", 0.0))
         )
+
+
+def test_validate_policy_profiles_rejects_non_positive_aversion() -> None:
+    with pytest.raises(ValueError, match="growth_risk_aversion"):
+        PolicyProfile(profile_id="x", no_trade_band_bps=0.0, growth_risk_aversion=0.0)
+    with pytest.raises(ValueError, match="growth_risk_aversion"):
+        PolicyProfile(profile_id="x", no_trade_band_bps=0.0, growth_risk_aversion=-1.0)
+    with pytest.raises(ValueError, match="growth_risk_aversion"):
+        PolicyProfile(profile_id="x", no_trade_band_bps=0.0, growth_risk_aversion=float("nan"))
 
 
 def test_validate_policy_profiles_rejects_empty_and_extra() -> None:
     with pytest.raises(ValueError, match="at least one profile"):
         validate_policy_profiles(())
-    with pytest.raises(ValueError, match="exactly the two default profiles"):
+    with pytest.raises(ValueError, match="exactly the three default profiles"):
         validate_policy_profiles((*DEFAULT_POLICY_PROFILES, PolicyProfile("extra", 1.0)))
 
 
 def test_training_request_defaults_to_pre_registered_frontier() -> None:
     request = NetAlphaTrainingRequest(artifact_id="v1")
-    assert tuple(p.profile_id for p in request.policy_profiles) == DEFAULT_POLICY_PROFILE_IDS
+    assert tuple(p.profile_id for p in request.policy_profiles) == tuple(
+        p.profile_id for p in DEFAULT_POLICY_PROFILES
+    )
 
 
 def test_training_request_rejects_divergent_frontier() -> None:
@@ -153,3 +165,27 @@ def test_horizon_join_evidence_records_decision_realized_status() -> None:
     assert evidence.realized_rows == 80
     assert evidence.status_counts is not None
     assert evidence.status_counts.realized == 80
+
+
+def test_three_profile_frontier() -> None:
+    """CGRA-04-three-profile-frontier"""
+    from src.stocks.ml.contracts import (
+        DEFAULT_POLICY_PROFILES,
+        LOWER_BOUND_HALF_KELLY_PROFILE_ID,
+        validate_policy_profiles,
+    )
+
+    assert LOWER_BOUND_HALF_KELLY_PROFILE_ID == "lower_bound_half_kelly"
+    assert len(DEFAULT_POLICY_PROFILES) == 3
+    ids = [p.profile_id for p in DEFAULT_POLICY_PROFILES]
+    bands = [p.no_trade_band_bps for p in DEFAULT_POLICY_PROFILES]
+    aversions = [p.growth_risk_aversion for p in DEFAULT_POLICY_PROFILES]
+    assert ids == [
+        "legacy_overlay_5bps",
+        "lower_bound_only",
+        "lower_bound_half_kelly",
+    ]
+    assert bands == [5.0, 0.0, 0.0]
+    assert aversions == [1.0, 1.0, 2.0]
+    validated = validate_policy_profiles(DEFAULT_POLICY_PROFILES)
+    assert len(validated) == 3

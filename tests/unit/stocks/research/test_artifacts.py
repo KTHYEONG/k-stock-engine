@@ -37,6 +37,7 @@ class TestReadManifest:
         assert manifest.eligible_to == "2024-12-31T00:00:00+00:00"
 
     def test_read_manifest_rejects_missing_artifact(self, tmp_path) -> None:
+        # SDA-06: artifact replay must pin immutable lineage before loading data.
         registry = ModelArtifactRegistry(tmp_path)
         with pytest.raises(FileNotFoundError):
             registry.read_manifest("missing")
