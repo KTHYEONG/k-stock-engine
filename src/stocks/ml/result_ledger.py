@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import os
+import re
 import tempfile
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -43,7 +44,7 @@ MAX_SCHEMA_BYTES = 16 * 1024
 MAX_LATEST_BYTES = 24 * 1024
 MAX_RECORD_BYTES = 24 * 1024
 MAX_META_BYTES = 4 * 1024
-MAX_POINTER_BYTES = 1024
+MAX_POINTER_BYTES = 4 * 1024
 MAX_MESSAGE_CHARS = 512
 
 LATEST_FILENAME = "latest.json"
@@ -208,11 +209,17 @@ def _write_atomic(path: Path, payload: bytes) -> None:
     temp_path.replace(path)
 
 
-def _sort_key(record: Mapping[str, object]) -> tuple[object, str]:
+def _sort_key(record: Mapping[str, object]) -> tuple[int, str, str]:
     finished = record.get("finished_at")
-    if isinstance(finished, str):
-        return (0, finished)
-    return (1, str(record.get("artifact_id", "")))
+    if isinstance(finished, str) and finished:
+        return (2, finished, str(record.get("artifact_id", "")))
+    started = record.get("started_at")
+    if isinstance(started, str) and started:
+        return (2, started, str(record.get("artifact_id", "")))
+    artifact_id = str(record.get("artifact_id", ""))
+    match = re.search(r"\d{8}", artifact_id)
+    date_key = match.group(0) if match else "00000000"
+    return (1 if match else 0, date_key, artifact_id)
 
 
 def _rebuild_recent(
@@ -364,23 +371,81 @@ def _build_pointer(
     invalid: int,
     retained_cap: int,
 ) -> str:
-    return "\n".join(
-        [
-            "# ML Result Ledger",
-            "",
-            f"- Schema version: {SCHEMA_VERSION}",
-            f"- Latest artifact: {record.get('artifact_id')}",
-            f"- Status: {record.get('status')}",
-            f"- Finished: {record.get('finished_at') or record.get('started_at') or 'n/a'}",
-            f"- Latest JSON: `docs/results/ml_runs/{LATEST_FILENAME}`",
-            f"- Recent JSONL: `docs/results/ml_runs/{RECENT_FILENAME}`",
-            f"- Retention: newest {retained_cap} records, each <= {MAX_RECORD_BYTES} bytes",
-            f"- Retained: {retained} | discarded: {discarded} | invalid: {invalid}",
-            "",
-            "Artifact files under `data/artifacts/` remain the source of truth.",
-            "",
-        ]
-    )
+    lines = [
+        "# ML Result Ledger",
+        "",
+        f"- Schema version: {SCHEMA_VERSION}",
+        f"- Latest artifact: `{record.get('artifact_id')}`",
+        f"- Status: `{record.get('status')}`",
+        f"- Finished: {record.get('finished_at') or record.get('started_at') or 'n/a'}",
+        f"- Latest JSON: `docs/results/ml_runs/{LATEST_FILENAME}`",
+        f"- Recent JSONL: `docs/results/ml_runs/{RECENT_FILENAME}`",
+        f"- Retention: newest {retained_cap} records, each <= {MAX_RECORD_BYTES} bytes",
+        f"- Retained: {retained} | discarded: {discarded} | invalid: {invalid}",
+        "",
+    ]
+    outcome_raw = record.get("outcome")
+    outcome: Mapping[str, object] = outcome_raw if isinstance(outcome_raw, Mapping) else {}
+    obs_raw = record.get("observability")
+    obs: Mapping[str, object] = obs_raw if isinstance(obs_raw, Mapping) else {}
+    holdout_raw = obs.get("holdout")
+    holdout: Mapping[str, object] = holdout_raw if isinstance(holdout_raw, Mapping) else {}
+    cert_raw = holdout.get("certificate")
+    cert: Mapping[str, object] = cert_raw if isinstance(cert_raw, Mapping) else {}
+    base_cert_raw = cert.get("base")
+    base_cert: Mapping[str, object] = base_cert_raw if isinstance(base_cert_raw, Mapping) else {}
+    summary_raw = obs.get("summary")
+    summary: Mapping[str, object] = summary_raw if isinstance(summary_raw, Mapping) else {}
+    frontier_raw = obs.get("policy_frontier")
+    frontier: Mapping[str, object] = frontier_raw if isinstance(frontier_raw, Mapping) else {}
+    exec_ev_raw = frontier.get("execution_evidence")
+    exec_ev: Mapping[str, object] = exec_ev_raw if isinstance(exec_ev_raw, Mapping) else {}
+
+    model_family = outcome.get("model_family") or outcome.get("model_type") or "n/a"
+    promoted = outcome.get("promoted", False)
+    horizons = outcome.get("selected_horizons") or summary.get("evidence_horizons")
+    selected_horizon = horizons[0] if isinstance(horizons, (list, tuple)) and horizons else None
+
+    lines.extend([
+        "## Latest Backtest & Compounding Performance",
+        "",
+        f"- **Model Family**: `{model_family}`",
+        f"- **Promotion Status**: `{'PROMOTED (Active)' if promoted else 'NO_TRADE (Inactive)'}`",
+        f"- **Selected Horizon**: `{selected_horizon}d`" if selected_horizon is not None else "- **Selected Horizon**: `N/A`",
+    ])
+    if base_cert:
+        cagr = base_cert.get("cagr")
+        mdd = base_cert.get("mdd")
+        calmar = base_cert.get("calmar")
+        lower_cagr = base_cert.get("lower_cagr")
+        if isinstance(cagr, (int, float)):
+            lines.append(f"- **Holdout CAGR (Compounding)**: `{float(cagr) * 100:.2f}%`")
+        if isinstance(mdd, (int, float)):
+            lines.append(f"- **Holdout MDD**: `{float(mdd) * 100:.2f}%`")
+        if isinstance(calmar, (int, float)):
+            lines.append(f"- **Holdout Calmar Ratio**: `{float(calmar):.2f}`")
+        if isinstance(lower_cagr, (int, float)):
+            lines.append(f"- **Holdout Lower-Bound CAGR**: `{float(lower_cagr) * 100:.2f}%`")
+
+    holdout_orders = holdout.get("order_count")
+    if isinstance(holdout_orders, int):
+        lines.append(f"- **Holdout Filled Orders**: `{holdout_orders:,}`")
+
+    if exec_ev:
+        for prof_key, ev in exec_ev.items():
+            if isinstance(ev, Mapping):
+                filled = ev.get("filled_orders")
+                turnover = ev.get("turnover")
+                cycles = ev.get("planned_cycles")
+                if isinstance(filled, int) and isinstance(turnover, (int, float)):
+                    lines.append(f"- **OOF Replay Fills ({prof_key})**: `{filled:,} orders` across `{cycles}` cycles (Annual Turnover: `{float(turnover):.2f}x`)")
+
+    lines.extend([
+        "",
+        "Artifact files under `data/artifacts/` remain the source of truth.",
+        "",
+    ])
+    return "\n".join(lines)
 
 
 def _read_artifact_json(
@@ -966,6 +1031,8 @@ def _project_reconcile_record(
     artifact_id: str,
     manifest_json: Mapping[str, object],
     metrics: Mapping[str, object],
+    *,
+    mtime: str | None = None,
 ) -> dict[str, object]:
     model_type = str(
         metrics.get("model_type") or manifest_json.get("model_type") or "no_trade"
@@ -990,12 +1057,17 @@ def _project_reconcile_record(
             "horizons": list(run_obs.get("horizons") or []),
             "summary": _bounded_observability_summary(run_obs),
         }
+    finished_at = (
+        metrics.get("finished_at")
+        or manifest_json.get("finished_at")
+        or mtime
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "artifact_id": artifact_id,
         "status": "completed",
-        "started_at": None,
-        "finished_at": None,
+        "started_at": manifest_json.get("eligible_from"),
+        "finished_at": str(finished_at) if finished_at else None,
         "runtime": {"elapsed_ms": None, "peak_rss_mib": None},
         "input": {
             "snapshot_id": None,
@@ -1135,13 +1207,22 @@ class MlResultLedger:
                 continue
             if manifest_json.get("artifact_id") != artifact_id:
                 continue
+            mtime = datetime.fromtimestamp(metrics_path.stat().st_mtime, tz=UTC).isoformat()
             records.append(
-                _project_reconcile_record(artifact_id, manifest_json, metrics)
+                _project_reconcile_record(
+                    artifact_id, manifest_json, metrics, mtime=mtime
+                )
             )
         ordered = sorted(records, key=_sort_key, reverse=True)
         retained = ordered[: self.retained_records]
         discarded = len(ordered) - len(retained)
         self._write_cache(retained, discarded, invalid=0)
+        if retained:
+            pointer = _build_pointer(
+                retained[0], len(retained), discarded, 0, self.retained_records
+            )
+            pointer_path = _safe_resolve(self.root, POINTER_FILENAME)
+            _write_atomic(pointer_path, pointer.encode("utf-8"))
         return {
             "scanned": len(records),
             "retained": len(retained),
