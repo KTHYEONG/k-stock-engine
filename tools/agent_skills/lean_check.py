@@ -61,6 +61,10 @@ def run_cmd(cmd: list[str], timeout: int = 120) -> subprocess.CompletedProcess[s
     env = os.environ.copy()
     env["COVERAGE_NO_CTRACE"] = "1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["POLARS_MAX_THREADS"] = "2"
+    env["OMP_NUM_THREADS"] = "2"
+    env["OPENBLAS_NUM_THREADS"] = "2"
+    env["MKL_NUM_THREADS"] = "2"
     try:
         return subprocess.run(  # noqa: S603
             cmd, capture_output=True, text=True, shell=False, timeout=timeout, env=env
@@ -336,7 +340,16 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                 found_impl = False
                 try:
                     tree = ast.parse(sf_content, filename=fh)
-                    if owner:
+                    if kind == "parameter_add" and owner and "." in name:
+                        # parameter_add: verify the owner function exists and
+                        # the leaf parameter is present in its signature.
+                        for node in ast.walk(tree):
+                            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == owner:
+                                target_node = node
+                                arg_names = [a.arg for a in node.args.args]
+                                found_impl = leaf in arg_names
+                                break
+                    elif owner:
                         for node in ast.walk(tree):
                             if isinstance(node, ast.ClassDef) and node.name == owner:
                                 for member in node.body:
@@ -403,14 +416,31 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
             target_test_file: str = _repo_relative(s.get("target_test_file", ""))
             found = False
             ref_pattern = re.compile(rf"\b{re.escape(reference)}\b")
-            if target_test_file and os.path.exists(target_test_file):
-                with open(target_test_file) as tf:
+            if target_test_file and os.path.isfile(target_test_file):
+                with open(target_test_file, encoding="utf-8", errors="ignore") as tf:
                     content = tf.read()
                 found = bool(ref_pattern.search(content)) or bool(
                     re.search(
                         rf"^[ \t]*def\s+{re.escape(test_name)}\b", content, re.MULTILINE
                     )
                 )
+            elif target_test_file and os.path.isdir(target_test_file):
+                for root, _dirs, fnames in os.walk(target_test_file):
+                    for fn in fnames:
+                        if fn.endswith(".py"):
+                            fp = os.path.join(root, fn)
+                            try:
+                                with open(fp, encoding="utf-8", errors="ignore") as tf:
+                                    content = tf.read()
+                                if bool(ref_pattern.search(content)) or re.search(
+                                    rf"^[ \t]*def\s+{re.escape(test_name)}\b", content, re.MULTILINE
+                                ):
+                                    found = True
+                                    break
+                            except OSError:
+                                continue
+                    if found:
+                        break
             if not found:
                 for _fp, content in _get_tests_files_contents():
                     if bool(ref_pattern.search(content)) or re.search(
@@ -668,6 +698,18 @@ def main() -> None:
     impact_level, impact_reason = _analyze_impact_level(py_files)
     print(f"INFO | Impact Level: {impact_level} ({impact_reason})")
     test_files = _find_test_files(py_files, impact_level=impact_level)
+
+    # Ingest target_test_file from spec contract if available
+    if args.spec and os.path.isfile(args.spec):
+        try:
+            with open(args.spec, encoding="utf-8") as sf:
+                spec_data = json.load(sf)
+            for sc in spec_data.get("scenarios", []):
+                ttf = _repo_relative(sc.get("target_test_file", ""))
+                if ttf and os.path.exists(ttf) and ttf not in test_files:
+                    test_files.append(ttf)
+        except Exception:
+            pass
 
     for pf in py_files:
         if (
