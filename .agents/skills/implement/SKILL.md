@@ -16,19 +16,18 @@ Fast-execution protocol for mechanical code implementation based strictly on fro
 
 2. **Phased Mechanical Workflow**:
    - **Phase A (TDD Scenarios)**: Translate `scenarios` from `contract.json` into concrete `pytest` test cases in `target_test_file`.
+     - *Quick TDD Check*: `uv run pytest <target_test_file> -k "<scenario_id>" -q --tb=short`
    - **Phase B (Core Logic)**: Implement source logic in `target_file`.
-     - *Checkpoint*: `uv run python tools/agent_skills/lean_check.py --fast --spec docs/specs/<feature>_contract.json`
+     - *Quick Syntax/Lint Check*: `uv run ruff check <target_file>`
    - **Phase C (Integration Wiring)**: Wire logic into `caller_file` at `anchor` location using `import_symbol` and `invocation_expression`.
-     - *Checkpoint*: `uv run python tools/agent_skills/lean_check.py --fast --spec docs/specs/<feature>_contract.json`
+     - *Quick Syntax/Lint Check*: `uv run ruff check <caller_file>`
 
-3. **Surgical Modifications & Token Efficiency**:
+3. **Surgical Modifications & Hygiene**:
    - Use targeted edits (`replace_file_content`) only. Preserve all surrounding unrelated code and imports.
    - Never embed ephemeral `docs/specs/*.md` file paths or section numbers into comments or docstrings.
-   - **NO FLUFF**: Do NOT output intermediate phase explanations or duplicate modified code in chat text. Execute edits and commands immediately.
-   - **Quiet Commands**: Run test commands with quiet/compact flags (e.g. `pytest -q --tb=short`).
 
-4. **Verification & Adaptive Fix Loop**:
-   - Run verification: `uv run python tools/agent_skills/lean_check.py --spec docs/specs/<feature>_contract.json`
+4. **Final Verification & Adaptive Fix Loop**:
+   - Run full pinpoint verification: `uv run python tools/agent_skills/lean_check.py --spec docs/specs/<feature>_contract.json`
    - **Local Bug Fix (Max 3 attempts)**: Fix straightforward implementation bugs (typos, off-by-one, type errors, imports) autonomously.
    - **Escalation to `/spec`**: STOP immediately and do NOT rewrite caller interfaces or invent new architectures if:
      1) `contract.json` signature/type fundamentally conflicts with existing caller/callee contracts.
@@ -44,4 +43,3 @@ Fast-execution protocol for mechanical code implementation based strictly on fro
 - **Verification**:
   - 🧪 Pytest: <Passed>/<Total> passed
   - 🧹 Ruff / Mypy: <PASS/FAIL>
-
