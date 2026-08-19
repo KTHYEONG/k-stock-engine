@@ -9,14 +9,27 @@ Independent audit gate completing the main development loop (`spec` -> `implemen
 
 ## Directives
 
-1. **Identify Modified Scope**:
-   - Inspect modified files using `git status` or `git diff --name-only`.
+1. **Identify Modified Scope & Active Spec**:
+   - Inspect modified files using `git status --short`.
+   - Identify active spec contract under `docs/specs/*_contract.json` if available.
 
 2. **Standard Audit Execution**:
-   - Code Style & Linter: `uv run ruff check .`
-   - Strict Type Check: `uv run mypy .`
-   - Test Suite Verification: `uv run pytest`
-
+   - Run Smart Selective Verification runner (auto-detects modified `.py` files, executes static checks & pinpoint tests in seconds):
+     ```bash
+     uv run python tools/agent_skills/lean_check.py
+     ```
+   - If a specific contract is targeted, explicitly pass `--spec`:
+     ```bash
+     uv run python tools/agent_skills/lean_check.py --spec docs/specs/<feature>_contract.json
+     ```
+   - **Fast Static Mode** (when testing is verified and checking lint/types/contract only):
+     ```bash
+     uv run python tools/agent_skills/lean_check.py --fast
+     ```
+   - Fallback (if script fails):
+     - Code Style: `uv run ruff check <modified_files>`
+     - Strict Typing: `uv run mypy <modified_files>`
+     - Target Tests: `uv run pytest <target_test_files> -q --tb=line`
 
 3. **Strict Audit Gate (No Code Mutation)**:
    - Perform auditing independently. Do NOT modify source code during the check pass.
