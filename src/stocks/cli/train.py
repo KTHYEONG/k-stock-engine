@@ -38,6 +38,7 @@ from src.stocks.data.repositories import (
 )
 from src.stocks.ml.contracts import (
     DEFAULT_CANDIDATE_HORIZON_SESSIONS,
+    ExecutionFrontierSettings,
     NetAlphaTrainingRequest,
     PortfolioSettings,
     RiskSettings,
@@ -332,9 +333,13 @@ def main(args: list[str] | None = None) -> int:
         stress_liquidity_model,
     ) = _resolve_cost_contexts(snapshot)
     registry = ModelArtifactRegistry(parsed.registry)
+    horizons = _parse_horizons(parsed.candidate_horizon_sessions)
     request = NetAlphaTrainingRequest(
         artifact_id=parsed.artifact_id,
-        candidate_horizon_sessions=_parse_horizons(parsed.candidate_horizon_sessions),
+        candidate_horizon_sessions=horizons,
+        execution_frontier=ExecutionFrontierSettings(
+            candidate_horizon_sessions=horizons,
+        ),
         fold_count=parsed.fold_count,
         embargo_sessions=parsed.embargo_sessions,
         forward_holdout_sessions=parsed.forward_holdout_sessions,
@@ -516,9 +521,13 @@ def _run_direct_training(
     ) = _resolve_cost_contexts(None)
 
     registry = ModelArtifactRegistry(parsed.registry)
+    horizons = _parse_horizons(parsed.candidate_horizon_sessions)
     request = NetAlphaTrainingRequest(
         artifact_id=parsed.artifact_id,
-        candidate_horizon_sessions=_parse_horizons(parsed.candidate_horizon_sessions),
+        candidate_horizon_sessions=horizons,
+        execution_frontier=ExecutionFrontierSettings(
+            candidate_horizon_sessions=horizons,
+        ),
         fold_count=parsed.fold_count,
         embargo_sessions=parsed.embargo_sessions,
         forward_holdout_sessions=parsed.forward_holdout_sessions,

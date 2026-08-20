@@ -2336,8 +2336,11 @@ def _risk_balanced_waterfill(
 ) -> tuple[dict[str, float], float]:
     """Inverse-volatility water-fill under single-name and sector caps.
 
-    ``q_i = 1 / max(sigma_i, epsilon)`` then capped and redistributed until
-    the requested gross is reached or no feasible capacity remains.
+    ``q_i = 1 / max(sigma_i, epsilon)`` then capped and redistributed
+    iteratively until the requested gross is reached or no feasible capacity
+    remains.  The loop redistributes residual gross only among names and
+    sectors below capacity; it terminates when target gross is met or no
+    further allocation is possible.
 
     Returns ``(weights, unallocated_fraction)`` where ``weights`` maps
     instrument_id to target weight and ``unallocated_fraction`` is the
@@ -2345,6 +2348,8 @@ def _risk_balanced_waterfill(
     """
     if not instrument_ids:
         return {}, 1.0
+    if requested_gross <= 0.0:
+        return dict.fromkeys(instrument_ids, 0.0), 1.0
     epsilon = 1e-12
     raw: dict[str, float] = {}
     for iid in instrument_ids:
@@ -2354,16 +2359,32 @@ def _risk_balanced_waterfill(
     total_raw = sum(raw.values())
     if total_raw <= 0.0:
         return dict.fromkeys(instrument_ids, 0.0), 1.0
-    weights = {
-        iid: min(raw[iid] / total_raw * requested_gross, single_name_cap)
-        for iid in instrument_ids
-    }
-    weights = _scale_sectors(weights, sector_of, sector_cap)
+
+    weights: dict[str, float] = dict.fromkeys(instrument_ids, 0.0)
+    sector_exposure: dict[object, float] = {}
+    for _iteration in range(len(instrument_ids) + 1):
+        residual = requested_gross - sum(weights.values())
+        if residual <= 1e-12:
+            break
+        eligible = [
+            iid for iid in instrument_ids
+            if weights[iid] < single_name_cap - 1e-12
+            and sector_exposure.get(sector_of[iid], 0.0) < sector_cap - 1e-12
+        ]
+        if not eligible:
+            break
+        eligible_raw = sum(raw[iid] for iid in eligible)
+        if eligible_raw <= 0.0:
+            break
+        for iid in eligible:
+            share = raw[iid] / eligible_raw * residual
+            name_room = single_name_cap - weights[iid]
+            sector_room = sector_cap - sector_exposure.get(sector_of[iid], 0.0)
+            alloc = min(share, name_room, sector_room, residual)
+            weights[iid] += alloc
+            sector_exposure[sector_of[iid]] = sector_exposure.get(sector_of[iid], 0.0) + alloc
+
     total = sum(weights.values())
-    if total > requested_gross:
-        factor = requested_gross / total
-        weights = {iid: w * factor for iid, w in weights.items()}
-        total = requested_gross
     unallocated = (requested_gross - total) / requested_gross if requested_gross > 0 else 0.0
     return weights, max(0.0, unallocated)
 
