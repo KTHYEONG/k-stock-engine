@@ -114,6 +114,7 @@ class ExecutionReplayEvidence:
     turnover: float
     unfilled_order_reason_counts: tuple[tuple[str, int], ...]
     utility_transition_diagnostics: tuple[tuple[str, float | int], ...] = ()
+    action_diagnostics: tuple[tuple[str, float | int], ...] = ()
 
     def __post_init__(self) -> None:
         if len(self.base_log_growth) != len(self.stress_log_growth):
@@ -138,6 +139,9 @@ class ExecutionReplayEvidence:
             "turnover": round(float(self.turnover), 12),
             "unfilled_order_reason_counts": {
                 str(reason): int(count) for reason, count in self.unfilled_order_reason_counts
+            },
+            "action_diagnostics": {
+                str(key): value for key, value in self.action_diagnostics
             },
         }
 

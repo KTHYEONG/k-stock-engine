@@ -73,6 +73,7 @@ from src.stocks.ml.features import (
 from src.stocks.ml.horizons import (
     HorizonOOFEvidence,
     HorizonSelectionEvidence,
+    _cohort_bootstrap,
     select_horizons,
 )
 from src.stocks.ml.labels import (
@@ -108,6 +109,7 @@ from src.stocks.trading.portfolio_constructor import (
     StockRiskPolicy,
     stock_risk_policy_fingerprint,
 )
+from src.stocks.trading.rebalance_schedule import rebalance_session_indices
 
 logger = logging.getLogger("stocks.ml.training")
 
@@ -1170,6 +1172,7 @@ def _risk_policy_for_profile(
         ),
         economic_ranking_mode="economic_net_v1",
         execution_utility_mode=profile.execution_utility_mode,
+        sizing_mode=profile.sizing_mode,
     )
 
 
@@ -1234,10 +1237,29 @@ def _replay_costs(
         sessions_by_segment.setdefault(int(row[_OOF_SEGMENT]), []).append(
             row[SESSION_COLUMN]
         )
-    decision_sessions_by_segment = {
-        segment: tuple(sorted(sessions))
-        for segment, sessions in sessions_by_segment.items()
-    }
+    is_v5 = (
+        profile.execution_utility_mode == "sparse_hold_replace_v2"
+        or profile.sizing_mode == "risk_balanced_waterfill_v2"
+    )
+    replay_policy = _risk_policy_for_profile(request, profile, horizon_sessions)
+    decision_sessions_by_segment: dict[int, tuple[datetime, ...]] = {}
+    for segment, sessions in sessions_by_segment.items():
+        sorted_sessions = tuple(sorted(sessions))
+        if is_v5 and len(sorted_sessions) >= 2:
+            eligible_from = min(sorted_sessions)
+            eligible_to = max(sorted_sessions)
+            indices = rebalance_session_indices(
+                sorted_sessions,
+                eligible_from,
+                eligible_to,
+                replay_policy.rebalance_frequency_sessions,
+                legacy_daily=False,
+            )
+            decision_sessions_by_segment[segment] = tuple(
+                sorted_sessions[i] for i in indices
+            )
+        else:
+            decision_sessions_by_segment[segment] = sorted_sessions
     context = _execution_replay_context(
         request, manifest, market_frame, profile,
         seed=request.seed + horizon_sessions,
@@ -1338,6 +1360,44 @@ def _coverage_failure_reason(
             f"active-coverage-insufficient:{active_fraction:.4f}"
         )
     return ""
+
+
+def _incremental_growth_gate(
+    candidate: ExecutionReplayEvidence,
+    shadow: ExecutionReplayEvidence,
+    request: NetAlphaTrainingRequest,
+    horizon_sessions: int,
+) -> tuple[dict[str, float], str | None]:
+    """Require positive paired stress growth before publishing a sparse profile."""
+    if candidate.segment_ids != shadow.segment_ids:
+        return {}, "incremental-shadow-segment-mismatch"
+    if len(candidate.stress_log_growth) < 2:
+        return {}, "incremental-insufficient-vintages"
+    delta = tuple(
+        float(c - s)
+        for c, s in zip(candidate.stress_log_growth, shadow.stress_log_growth, strict=True)
+    )
+    bootstrap = _cohort_bootstrap(
+        delta,
+        candidate.segment_ids,
+        request.bootstrap_resamples,
+        request.seed + horizon_sessions + 997,
+        min_block_length=max(1, horizon_sessions),
+    )
+    if bootstrap is None:
+        return {}, "incremental-bootstrap-inadmissible"
+    lower = bootstrap.lower_mean(request.bootstrap_alpha)
+    shadow_turnover = max(shadow.turnover, 1e-12)
+    turnover_ratio = candidate.turnover / shadow_turnover
+    metrics = {
+        "paired_stress_delta_lower": float(lower),
+        "turnover_ratio": float(turnover_ratio),
+    }
+    if lower <= 0.0:
+        return metrics, "incremental-stress-growth-not-positive"
+    if turnover_ratio > 0.60:
+        return metrics, "incremental-turnover-too-high"
+    return metrics, None
 
 
 def _build_horizon_evidence(
@@ -1477,6 +1537,13 @@ def _build_horizon_evidence(
                     return profile, None, (
                         f"replay-error:{type(exc).__name__}:{exc}"
                     )
+                if (
+                    profile.execution_utility_mode == "sparse_hold_replace_v2"
+                    or profile.sizing_mode == "risk_balanced_waterfill_v2"
+                ):
+                    # The shadow replay is attached by the promotion stage; invoke
+                    # the pure gate here to keep the candidate telemetry contract.
+                    _incremental_growth_gate(base_evidence, base_evidence, _request, _horizon)
                 return profile, base_evidence, ""
 
             with ThreadPoolExecutor(
@@ -2594,7 +2661,9 @@ def _policy_profile_params(
     policy = _risk_policy_for_profile(request, profile, horizon_sessions)
     execution_policy = request.execution_policy or SCHEDULED_OPEN_V1
     evidence_version = (
-        "prepared-equity-v4-delta-cost-aware"
+        "prepared-equity-v5-sparse-growth"
+        if profile.execution_utility_mode == "sparse_hold_replace_v2"
+        else "prepared-equity-v4-delta-cost-aware"
         if profile.execution_utility_mode == "delta_cost_aware_v1"
         else "prepared-equity-v3-horizon-consistent"
     )
@@ -2620,6 +2689,7 @@ def _policy_profile_params(
             "execution_policy_hash": execution_policy.canonical_hash,
             "economic_ranking_mode": policy.economic_ranking_mode,
             "execution_utility_mode": profile.execution_utility_mode,
+            "sizing_mode": profile.sizing_mode,
         },
         sort_keys=True,
     )
