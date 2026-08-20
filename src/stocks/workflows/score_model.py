@@ -7,13 +7,35 @@ from src.core.instruments import AssetKind
 from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.ml.contracts import CANONICAL_FEATURE_SET
 from src.stocks.ml.features import (
+    FeatureTransformSchema,
+    apply_model_feature_schema,
     build_model_features,
+    feature_transform_schema_from_manifest,
     stock_net_alpha_v1_roles,
 )
 from src.stocks.research.artifacts import ModelArtifactRegistry, PredictionRequest
 from src.stocks.research.datasets import research_eligible_frame
 from src.stocks.research.features import build_features, phase1_allowlist
+from src.stocks.research.models import ModelManifest
 from src.stocks.workflows.contracts import ScoringRequest
+
+
+def _frozen_net_alpha_schema(
+    manifest: ModelManifest,
+) -> FeatureTransformSchema | None:
+    """Return the frozen net-alpha transform schema, or ``None`` for legacy artifacts.
+
+    A v6 artifact with a stored ``feature_transform_schema`` payload always
+    deserializes it (a malformed, absent, or fingerprint-mismatched payload
+    raises ``ValueError`` from ``feature_transform_schema_from_manifest``). A
+    legacy artifact with no payload falls back to the caller's permissive re-fit
+    so historical scoring is not broken; canonical certified replay never uses
+    that fallback.
+    """
+    params = getattr(manifest, "params", None) or {}
+    if "feature_transform_schema" not in params:
+        return None
+    return feature_transform_schema_from_manifest(manifest)
 
 
 def score_model(
@@ -32,9 +54,13 @@ def score_model(
     loaded = registry.load(request.artifact_id, prediction)
     gated = _drop_label_columns(research_eligible_frame(snapshot.frame))
     if manifest.feature_set == CANONICAL_FEATURE_SET:
-        feature_frame, _model_columns = build_model_features(
-            gated, stock_net_alpha_v1_roles()
-        )
+        schema = _frozen_net_alpha_schema(loaded.manifest)
+        if schema is not None:
+            feature_frame = apply_model_feature_schema(gated, schema)
+        else:
+            feature_frame, _model_columns = build_model_features(
+                gated, stock_net_alpha_v1_roles()
+            )
     elif manifest.feature_set == "stock_alpha_v2":
         feature_frame = gated
     else:

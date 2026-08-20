@@ -7,6 +7,7 @@ import inspect
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import ClassVar
 
 import numpy as np
 import polars as pl
@@ -1318,3 +1319,57 @@ def test_delta_cost_utility_07_oof_holdout_mode_pinning() -> None:
     assert legacy_params["execution_evidence_version"] == "prepared-equity-v3-horizon-consistent"
 
     assert stock_risk_policy_fingerprint(v4_policy) != stock_risk_policy_fingerprint(legacy_policy)
+
+
+def test_multi_horizon_v6() -> None:
+    """MULTI_HORIZON_V6.
+
+    The default candidate grid is exactly (10, 20); a synthetic h20 candidate
+    with positive base/stress/paired lower bounds, passing Holm p-values, and a
+    turnover ratio <= 0.60 is selectable; a missing requested horizon is a
+    deterministic ValueError, not a silent fallback.
+    """
+    from src.stocks.ml.contracts import DEFAULT_CANDIDATE_HORIZON_SESSIONS
+    from src.stocks.ml.horizons import HorizonOOFEvidence, select_horizons
+
+    assert DEFAULT_CANDIDATE_HORIZON_SESSIONS == (10, 20)
+
+    def _positive(count: int, scale: float = 0.01) -> tuple[float, ...]:
+        return tuple(scale for _ in range(count))
+
+    h20 = HorizonOOFEvidence(
+        horizon_sessions=20,
+        profile_id="lower_bound_only",
+        model_family="net_alpha_elastic_net",
+        base_log_growth=_positive(60, 0.01),
+        stress_log_growth=_positive(60, 0.008),
+        cohort_segment_ids=tuple(0 for _ in range(60)),
+        complete_cohort_count=60,
+        active_cohort_count=60,
+        partial_cohort_count=0,
+        missing_cohort_count=0,
+        segment_count=1,
+        fold_rank_ics=(0.1, 0.2, 0.3),
+        paired_stress_log_growth=_positive(60, 0.002),
+        sparse_turnover=1.0,
+        shadow_turnover=2.0,
+    )
+    result = select_horizons(
+        (h20,), 0.05, 42, rebalance_frequency_sessions=5
+    )
+    assert result.primary_horizon_sessions == 20
+    assert result.primary_profile_id == "lower_bound_only"
+    assert result.turnover_ratio[(20, "lower_bound_only")] <= 0.60
+
+    # Missing requested horizon -> deterministic error.
+    request = training.NetAlphaTrainingRequest(
+        artifact_id="missing_horizon", candidate_horizon_sessions=(10, 20)
+    )
+
+    class _FakeData:
+        labels_by_horizon: ClassVar[dict[int, object]] = {10: object()}
+
+    with pytest.raises(ValueError, match="have no label data"):
+        _build_horizon_evidence(
+            pl.DataFrame(), [], _FakeData(), request, ()
+        )

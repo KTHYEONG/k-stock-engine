@@ -1,21 +1,34 @@
 """Direct market data loader: contract tests for the lean ML backtest data path."""
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import polars as pl
 import pytest
 
-from src.core.datasets import DatasetCertification, make_manifest
+from src.core.datasets import HIVE_PARTITION_LAYOUT, make_manifest
 from src.core.instruments import AssetKind
+from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.data.direct import (
     DirectDataRequest,
     DirectMarketDataLoader,
     MlMarketData,
 )
 from src.stocks.ml.data import validate_ml_market_data
+from src.stocks.research.models import ModelManifest
 from src.storage.parquet_datasets import ParquetDatasetStore
+
+
+class _PickleableDummy:
+    """Minimal picklable stand-in model for artifact registry fixtures."""
+
+    def fit(self, train: object, validation: object) -> None:  # pragma: no cover
+        return None
+
+    def predict(self, frame: pl.DataFrame) -> pl.DataFrame:
+        return frame
 
 
 def _write_dataset(
@@ -332,3 +345,119 @@ def test_direct_loader_rejects_zero_usable_labels(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="zero usable labels"):
         loader.load(request)
+
+
+def test_schema_parity_v6(tmp_path: Path) -> None:
+    """DIRECT_SCHEMA_PARITY_V6.
+
+    The direct loader preserves the feature dataset manifest, so a training
+    manifest's feature_schema_hash equals the selected feature dataset's
+    manifest.schema_hash, and the input content hashes carry the feature
+    schema/content identity.
+    """
+    base_root = tmp_path / "base"
+    feature_root = tmp_path / "features"
+    label_root = tmp_path / "labels"
+    base_root.mkdir()
+    feature_root.mkdir()
+    label_root.mkdir()
+
+    base_store = ParquetDatasetStore(base_root)
+    feature_store = ParquetDatasetStore(feature_root)
+    label_store = ParquetDatasetStore(label_root)
+
+    _write_dataset(base_store, "base_2024", _base_frame())
+    _write_dataset(feature_store, "features_2024", _feature_frame())
+    _write_dataset(label_store, "labels_2024", _label_frame())
+
+    loader = DirectMarketDataLoader(
+        base_root=base_root,
+        feature_root=feature_root,
+        label_root=label_root,
+    )
+    request = DirectDataRequest(
+        base_dataset_id="base_2024",
+        feature_dataset_id="features_2024",
+        label_dataset_id="labels_2024",
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 20),
+        candidate_horizon_sessions=(10,),
+    )
+    result = loader.load(request)
+
+    assert result.feature_manifest is not None
+    feature_schema_hash = result.feature_manifest.schema_hash
+    assert result.input_content_hashes["feature_schema_hash"] == feature_schema_hash
+    assert result.input_content_hashes["feature_content_hash"] == (
+        result.feature_manifest.content_hash or feature_schema_hash
+    )
+
+
+def test_v6_simulation_rejects_divergent_feature_content_hash(tmp_path: Path) -> None:
+    """DIRECT_SCHEMA_PARITY_V6 (independent replay).
+
+    A v6 artifact with an exact feature content hash must reject an independent
+    simulation whose snapshot content hash diverges, failing closed before the
+    backtester runs.
+    """
+    import joblib
+    from src.stocks.research.artifacts import (
+        MANIFEST_FILENAME,
+        MODEL_FILENAME,
+        ModelArtifactRegistry,
+        _manifest_to_dict,
+    )
+    from src.stocks.workflows.contracts import SimulationRequest
+    from src.stocks.workflows.simulate_portfolio import simulate_portfolio
+
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    artifact_manifest = ModelManifest(
+        artifact_id="v6_sim",
+        asset_kind=AssetKind.STOCK,
+        feature_set="stock_net_alpha_v1",
+        feature_schema_hash="h",
+        universe_policy_hash="u",
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=10,
+        eligible_from=datetime(2024, 1, 1, tzinfo=UTC).isoformat(),
+        eligible_to=datetime(2024, 3, 31, tzinfo=UTC).isoformat(),
+        model_type="net_alpha_elastic_net",
+        params={
+            "holm_gate_version": "v6",
+            "raw_feature_schema_hash": "h",
+            "feature_content_hash": "feature-abc",
+        },
+    )
+    artifact_dir = registry._artifact_dir("v6_sim")
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    with (artifact_dir / MANIFEST_FILENAME).open("w", encoding="utf-8") as fh:
+        json.dump(_manifest_to_dict(artifact_manifest), fh, indent=2, default=str)
+    joblib.dump(_PickleableDummy(), artifact_dir / MODEL_FILENAME)
+
+    snapshot_manifest = make_manifest(
+        asset_kind=AssetKind.STOCK,
+        columns=_feature_frame().columns,
+        feature_set="stock_net_alpha_v1",
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=10,
+        time_start=datetime(2024, 1, 1, tzinfo=UTC),
+        time_end=datetime(2024, 3, 31, tzinfo=UTC),
+        provider_version="fixture",
+        universe_policy_version="fixture",
+        row_count=_feature_frame().height,
+        generated_time=datetime(2024, 3, 31, tzinfo=UTC),
+        schema_version="v2",
+        storage_layout=HIVE_PARTITION_LAYOUT,
+    )
+    from dataclasses import replace
+
+    snapshot_manifest = replace(snapshot_manifest, content_hash="different-content")
+    snapshot = DatasetSnapshot(
+        manifest=snapshot_manifest, frame=_feature_frame()
+    )
+    request = SimulationRequest(
+        artifact_id="v6_sim",
+        decision_time=datetime(2024, 2, 1, tzinfo=UTC),
+    )
+    with pytest.raises(ValueError, match="v6 independent replay input lineage mismatch"):
+        simulate_portfolio(snapshot, registry, request)

@@ -27,9 +27,18 @@ from src.core.instruments import AssetKind, Instrument
 from src.core.portfolio import Allocation, PortfolioSnapshot
 from src.execution.domain.intents import TradeIntent
 from src.stocks.data.contracts import DatasetSnapshot
+from src.stocks.ml.contracts import CANONICAL_FEATURE_SET
+from src.stocks.ml.features import (
+    FeatureTransformSchema,
+    apply_model_feature_schema,
+    build_model_features,
+    feature_transform_schema_from_manifest,
+    stock_net_alpha_v1_roles,
+)
 from src.stocks.research.artifacts import ModelArtifactRegistry, PredictionRequest
 from src.stocks.research.datasets import research_eligible_frame, validate_stock_rows_available
 from src.stocks.research.features import build_features, phase1_allowlist
+from src.stocks.research.models import ModelManifest
 from src.stocks.trading.portfolio_constructor import (
     PortfolioConstraintError,
     StockRiskPolicy,
@@ -168,11 +177,17 @@ def run_trading_cycle(
         return _no_trade_result(request, manifest, portfolio, dataset_hash, "empty-universe-after-gate")
 
     gated = _drop_label_columns(research_eligible_frame(universe_gate))
-    feature_frame = (
-        gated
-        if manifest.feature_set in ("stock_alpha_v2", "stock_net_alpha_v1")
-        else build_features(gated, phase1_allowlist())
-    )
+    if manifest.feature_set == CANONICAL_FEATURE_SET:
+        schema = _frozen_net_alpha_schema(loaded.manifest)
+        feature_frame = (
+            apply_model_feature_schema(gated, schema)
+            if schema is not None
+            else build_model_features(gated, stock_net_alpha_v1_roles())[0]
+        )
+    elif manifest.feature_set == "stock_alpha_v2":
+        feature_frame = gated
+    else:
+        feature_frame = build_features(gated, phase1_allowlist())
     scored = loaded.model.predict(feature_frame)
     scored = _adapt_score_column(scored, manifest.feature_set)
     if scored.is_empty():
@@ -370,6 +385,20 @@ def _no_trade_result_prepared(
         cost_hash=fingerprints["cost_hash"],
         risk_policy_hash=fingerprints["risk_policy_hash"],
     )
+
+
+def _frozen_net_alpha_schema(manifest: ModelManifest) -> FeatureTransformSchema | None:
+    """Return the frozen net-alpha transform schema, or ``None`` for legacy artifacts.
+
+    A v6 artifact with a stored ``feature_transform_schema`` payload always
+    deserializes it (malformed/missing/fingerprint-mismatched raises
+    ``ValueError``); a legacy artifact without the payload falls back to the
+    caller's permissive re-fit so historical planning is not broken.
+    """
+    params = getattr(manifest, "params", None) or {}
+    if "feature_transform_schema" not in params:
+        return None
+    return feature_transform_schema_from_manifest(manifest)
 
 
 def _validate_mode_evidence(manifest: DatasetManifest, mode: str) -> None:

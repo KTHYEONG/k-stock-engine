@@ -42,7 +42,7 @@ def _evidence(
     )
 
 
-def _positive(horizon: int, scale: float = 0.01, count: int = 10) -> tuple[float, ...]:
+def _positive(horizon: int, scale: float = 0.01, count: int = 60) -> tuple[float, ...]:
     return tuple(float(scale) for _ in range(count))
 
 
@@ -292,3 +292,67 @@ def test_sparse_growth_paired_admission() -> None:
     rejected_ratio = select_horizons((high_turnover,), alpha, 42, rebalance_frequency_sessions=5)
     assert rejected_ratio.primary_horizon_sessions is None
     assert rejected_ratio.turnover_ratio[(10, _LOWER if False else _LEGACY)] > 0.60
+
+
+def test_sparse_growth_v6_holm_hard_gate() -> None:
+    """SPARSE_GROWTH_V6_HOLM_HARD_GATE.
+
+    A candidate whose base/stress lower quantiles are > 0 but whose stress
+    p-value exceeds its own Holm threshold is rejected (primary is None). A
+    paired candidate is evaluated against its own paired Holm threshold, never
+    the base threshold reused.
+    """
+    alpha = 0.05
+    base = _positive(60, 0.01, count=60)  # type: ignore[call-arg]
+    # Mixed-sign stress path: many small-negative cohorts drag the observed mean
+    # to a tiny positive value so 2x-observed is easily exceeded by positive
+    # blocks (centered p-value 0.7 > alpha), yet the 5% quantile lower bound
+    # stays strictly positive. The compound lower-bound gate would pass, but the
+    # per-path Holm p-value gate rejects the candidate.
+    stress = (
+        -0.015879781282870976, -0.015879781282870976, -0.015879781282870976,
+        -0.015879781282870976, -0.015879781282870976, -0.015879781282870976,
+        -0.015879781282870976, -0.015879781282870976, 0.05145225554272906,
+        0.05145225554272906, -0.015879781282870976, -0.015879781282870976,
+        -0.015879781282870976, 0.05145225554272906, -0.015879781282870976,
+        0.05145225554272906, -0.015879781282870976, 0.05145225554272906,
+        -0.015879781282870976, -0.015879781282870976, 0.05145225554272906,
+        -0.015879781282870976, -0.015879781282870976, -0.015879781282870976,
+        -0.015879781282870976, -0.015879781282870976, 0.05145225554272906,
+        -0.015879781282870976, 0.05145225554272906, -0.015879781282870976,
+        -0.015879781282870976, 0.05145225554272906, 0.05145225554272906,
+        -0.015879781282870976, -0.015879781282870976, 0.05145225554272906,
+        -0.015879781282870976, -0.015879781282870976, -0.015879781282870976,
+        0.05145225554272906, 0.05145225554272906, -0.015879781282870976,
+        -0.015879781282870976, -0.015879781282870976, -0.015879781282870976,
+        0.05145225554272906, 0.05145225554272906, -0.015879781282870976,
+        -0.015879781282870976, -0.015879781282870976, -0.015879781282870976,
+        0.05145225554272906, -0.015879781282870976, -0.015879781282870976,
+        -0.015879781282870976, -0.015879781282870976, -0.015879781282870976,
+        -0.015879781282870976, -0.015879781282870976, -0.015879781282870976,
+    )
+    spiky = _evidence(10, base, stress, segments=(0,) * 60, rank_ics=(0.1, 0.2, 0.3))
+    result = select_horizons((spiky,), alpha, 42, rebalance_frequency_sessions=5)
+    assert result.primary_horizon_sessions is None
+    assert result.primary_profile_id is None
+    key = (10, _LEGACY)
+    assert result.adjusted_lower_growth[key]["stress"] > 0.0
+    assert result.stress_p_values[key] > alpha
+
+    # Paired candidate with positive base/stress/paired and a valid turnover
+    # ratio is selectable and carries its own per-path Holm thresholds.
+    paired = _sparse_evidence(
+        10, _positive(60, 0.01), _positive(60, 0.002),
+        sparse_turnover=1.0, shadow_turnover=2.0,
+    )
+    selectable = select_horizons(
+        (paired,), alpha, 42, rebalance_frequency_sessions=5
+    )
+    assert selectable.primary_horizon_sessions == 10
+    key = (10, _LEGACY)
+    assert key in selectable.paired_holm_thresholds
+    assert 0.0 < selectable.paired_holm_thresholds[key] <= alpha
+    assert key in selectable.base_holm_thresholds
+    # The paired lower bound is computed from the paired threshold, confirmed
+    # independent of any base-threshold reuse.
+    assert selectable.paired_lower_bounds[key] > 0.0

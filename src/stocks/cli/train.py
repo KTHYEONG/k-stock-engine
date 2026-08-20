@@ -481,6 +481,26 @@ def _run_direct_training(
         candidate_horizon_sessions=_parse_horizons(parsed.candidate_horizon_sessions),
     )
 
+    # Bind the immutable feature dataset schema identity so the published
+    # artifact's feature_schema_hash equals the selected feature dataset
+    # manifest.schema_hash and the feature content hash is preserved exactly.
+    feature_manifest = market_data.feature_manifest
+    if feature_manifest is not None:
+        from dataclasses import replace as _dc_replace
+
+        data = _dc_replace(
+            data,
+            manifest=_dc_replace(
+                data.manifest,
+                schema_hash=feature_manifest.schema_hash,
+                feature_set_hash=(
+                    feature_manifest.feature_set_hash or feature_manifest.schema_hash
+                ),
+                content_hash=feature_manifest.content_hash
+                or feature_manifest.schema_hash,
+            ),
+        )
+
     # Build training request
     (
         base_cost_schedule,
