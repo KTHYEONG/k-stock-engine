@@ -14,6 +14,7 @@ from src.core.paths import (
     STOCK_LABEL_ROOT,
 )
 from src.stocks.cli import simulate
+from src.stocks.settings import REFERENCE_DATETIME
 
 
 def test_simulate_cli_defaults_to_canonical_roots() -> None:
@@ -22,6 +23,13 @@ def test_simulate_cli_defaults_to_canonical_roots() -> None:
     assert simulate.STOCK_BASE_PANEL_ROOT is STOCK_BASE_PANEL_ROOT
     assert simulate.STOCK_FEATURE_PANEL_ROOT is STOCK_FEATURE_PANEL_ROOT
     assert simulate.STOCK_LABEL_ROOT is STOCK_LABEL_ROOT
+
+
+def test_simulate_parser_default_decision_time_uses_reference_boundary() -> None:
+    args = simulate.build_parser().parse_args(
+        ["--artifact-id", "a1", "--snapshot-id", "s1"]
+    )
+    assert args.decision_time == REFERENCE_DATETIME
 
 
 def test_simulate_cli_rejects_missing_snapshot_id() -> None:
