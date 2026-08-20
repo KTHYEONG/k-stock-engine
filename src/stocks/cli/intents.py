@@ -20,6 +20,7 @@ from src.core.instruments import AssetKind, Instrument
 from src.core.portfolio import Allocation, PortfolioSnapshot
 from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.research.artifacts import ModelArtifactRegistry
+from src.stocks.settings import REFERENCE_DATETIME
 from src.stocks.trading.portfolio_constructor import StockRiskPolicy
 from src.stocks.workflows.generate_intents import generate_intents
 from src.stocks.workflows.trading_cycle import (
@@ -55,8 +56,8 @@ def main(args: list[str] | None = None) -> int:
                 strategy_id=parsed.strategy_id,
                 artifact_id=parsed.artifact_id,
                 dataset_id=parsed.dataset_id,
-                decision_time=parsed.decision_time or datetime.fromisoformat("2024-01-01T00:00:00+00:00"),
-                execution_time=parsed.execution_time or datetime.fromisoformat("2024-01-02T00:00:00+00:00"),
+                decision_time=parsed.decision_time or REFERENCE_DATETIME,
+                execution_time=parsed.execution_time or REFERENCE_DATETIME,
                 risk_policy=StockRiskPolicy(),
                 mode="plan",
             ),
@@ -128,7 +129,7 @@ def _snapshot(path: Path, artifact_id: str) -> DatasetSnapshot:
 def _portfolio(parsed: argparse.Namespace) -> PortfolioSnapshot:
     return PortfolioSnapshot(
         account_snapshot_id=parsed.account_snapshot_id,
-        as_of=parsed.decision_time or datetime.fromisoformat("2024-01-01T00:00:00+00:00"),
+        as_of=parsed.decision_time or REFERENCE_DATETIME,
         settled_cash=100_000_000.0,
         unsettled_cash=0.0,
         positions=(),
