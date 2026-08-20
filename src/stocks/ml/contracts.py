@@ -24,6 +24,8 @@ if TYPE_CHECKING:
     from src.stocks.ml.data import HorizonOutcomeCoverage
 
 DEFAULT_CANDIDATE_HORIZON_SESSIONS = (10, 20)
+DEFAULT_CANDIDATE_REBALANCE_FREQUENCY_SESSIONS = (5, 10, 20)
+DEFAULT_CANDIDATE_TOP_K = (12, 16, 20, 24)
 CANONICAL_FEATURE_SET = "stock_net_alpha_v1"
 
 OUTCOME_REALIZED = "REALIZED"
@@ -124,6 +126,68 @@ class PolicyProfile:
                 f"'risk_balanced_waterfill_v2', or "
                 f"'confidence_mean_variance_v1', got {self.sizing_mode!r}"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionFrontierSettings:
+    """Pre-registered execution frontier: (H, C, K) candidate grid.
+
+    ``candidate_horizon_sessions`` is the set of label horizons H,
+    ``candidate_rebalance_frequency_sessions`` the set of review cadences C
+    (must satisfy C <= H for every H), and ``candidate_top_k`` the set of
+    maximum active-name counts K (must satisfy K >= ceil(gross_cap /
+    single_name_cap)).  All valid (H, C, K) triples are evaluated without
+    model refits; infeasible cells are filtered before replay.
+    """
+
+    candidate_horizon_sessions: tuple[int, ...] = DEFAULT_CANDIDATE_HORIZON_SESSIONS
+    candidate_rebalance_frequency_sessions: tuple[int, ...] = DEFAULT_CANDIDATE_REBALANCE_FREQUENCY_SESSIONS
+    candidate_top_k: tuple[int, ...] = DEFAULT_CANDIDATE_TOP_K
+
+    def __post_init__(self) -> None:
+        if not self.candidate_horizon_sessions:
+            raise ValueError("candidate_horizon_sessions must be non-empty")
+        if not self.candidate_rebalance_frequency_sessions:
+            raise ValueError("candidate_rebalance_frequency_sessions must be non-empty")
+        if not self.candidate_top_k:
+            raise ValueError("candidate_top_k must be non-empty")
+        if tuple(self.candidate_horizon_sessions) != tuple(
+            sorted(set(self.candidate_horizon_sessions))
+        ):
+            raise ValueError("candidate_horizon_sessions must be strictly ascending and unique")
+        if tuple(self.candidate_rebalance_frequency_sessions) != tuple(
+            sorted(set(self.candidate_rebalance_frequency_sessions))
+        ):
+            raise ValueError(
+                "candidate_rebalance_frequency_sessions must be strictly ascending and unique"
+            )
+        if tuple(self.candidate_top_k) != tuple(sorted(set(self.candidate_top_k))):
+            raise ValueError("candidate_top_k must be strictly ascending and unique")
+        if any(h < 1 for h in self.candidate_horizon_sessions):
+            raise ValueError("candidate_horizon_sessions must be positive sessions")
+        if any(c < 1 for c in self.candidate_rebalance_frequency_sessions):
+            raise ValueError("candidate_rebalance_frequency_sessions must be positive sessions")
+        if any(k < 1 for k in self.candidate_top_k):
+            raise ValueError("candidate_top_k must be positive")
+
+    def feasible_cells(
+        self, gross_cap: float, single_name_cap: float
+    ) -> tuple[tuple[int, int, int], ...]:
+        """Return only (H, C, K) triples satisfying C <= H and K >= ceil(gross/single)."""
+        from math import ceil
+
+        min_k = ceil(gross_cap / single_name_cap) if single_name_cap > 0 else 1
+        cells: list[tuple[int, int, int]] = []
+        for h in self.candidate_horizon_sessions:
+            for c in self.candidate_rebalance_frequency_sessions:
+                if c > h:
+                    continue
+                cells.extend(
+                    (h, c, k)
+                    for k in self.candidate_top_k
+                    if k >= min_k
+                )
+        return tuple(cells)
 
 
 DEFAULT_POLICY_PROFILES = (
@@ -308,6 +372,9 @@ class NetAlphaTrainingRequest:
 
     artifact_id: str
     candidate_horizon_sessions: tuple[int, ...] = DEFAULT_CANDIDATE_HORIZON_SESSIONS
+    execution_frontier: ExecutionFrontierSettings = field(
+        default_factory=ExecutionFrontierSettings
+    )
     policy_profiles: tuple[PolicyProfile, ...] = DEFAULT_POLICY_PROFILES
     fold_count: int = 3
     embargo_sessions: int = 5

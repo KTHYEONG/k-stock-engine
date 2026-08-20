@@ -1176,7 +1176,8 @@ def _fold_alpha_metadata(diagnostic: HorizonOOFDiagnostic) -> dict[str, object]:
 
 
 def _risk_policy_for_profile(
-    request: NetAlphaTrainingRequest, profile: PolicyProfile, horizon_sessions: int
+    request: NetAlphaTrainingRequest, profile: PolicyProfile, horizon_sessions: int,
+    top_k: int | None = None,
 ) -> StockRiskPolicy:
     """Frozen operational risk policy reconstructed from the request portfolio.
 
@@ -1187,8 +1188,9 @@ def _risk_policy_for_profile(
     """
     if horizon_sessions < 1:
         raise ValueError("horizon_sessions must be a positive session count")
+    effective_top_k = top_k if top_k is not None else request.portfolio.top_k
     return StockRiskPolicy(
-        top_k=request.portfolio.top_k,
+        top_k=effective_top_k,
         gross_cap=request.portfolio.max_exposure,
         single_name_cap=request.portfolio.max_single_weight,
         participation_limit=request.portfolio.participation_limit,
@@ -2761,10 +2763,12 @@ def _publish_no_trade(
 
 
 def _policy_profile_params(
-    request: NetAlphaTrainingRequest, profile: PolicyProfile, horizon_sessions: int
+    request: NetAlphaTrainingRequest, profile: PolicyProfile, horizon_sessions: int,
+    top_k: int | None = None,
 ) -> str:
     """JSON projection of the selected immutable policy profile for the manifest."""
-    policy = _risk_policy_for_profile(request, profile, horizon_sessions)
+    effective_top_k = top_k if top_k is not None else request.portfolio.top_k
+    policy = _risk_policy_for_profile(request, profile, horizon_sessions, top_k=effective_top_k)
     execution_policy = request.execution_policy or SCHEDULED_OPEN_V1
     evidence_version = (
         "prepared-equity-v5-sparse-growth"
@@ -2786,12 +2790,12 @@ def _policy_profile_params(
             "rebalance_frequency_sessions": horizon_sessions,
             "effective_active_count": effective_active_count,
             "candidate_pool_count": candidate_pool_count,
-            "top_k": request.portfolio.top_k,
+            "top_k": effective_top_k,
             "max_single_weight": request.portfolio.max_single_weight,
             "max_exposure": request.portfolio.max_exposure,
             "participation_limit": request.portfolio.participation_limit,
             "portfolio_fingerprint": policy_portfolio_fingerprint(
-                request.portfolio.top_k,
+                effective_top_k,
                 request.portfolio.max_single_weight,
                 request.portfolio.max_exposure,
                 request.portfolio.participation_limit,
