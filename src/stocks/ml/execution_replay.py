@@ -103,7 +103,19 @@ class ExecutionEquivalentReplayRequest:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionReplayEvidence:
-    """Parallel base/stress daily equity log-growth plus bounded execution sums."""
+    """Parallel base/stress daily equity log-growth plus bounded execution sums.
+
+    Coverage is exposure-based: ``invested_interval_count`` counts the complete
+    ledger return intervals whose prior ledger row carried a positive
+    ``positions_value`` (a held position), regardless of whether any order was
+    placed in that interval. ``observed_interval_count`` is the total number of
+    complete return intervals. ``invested_interval_fraction`` is their ratio and
+    is the canonical admission coverage metric; ``cash_session_fraction`` remains
+    a separate, backward-compatible telemetry value derived from filled
+    decision cycles. ``filled_cycle_count`` counts the planned decision cycles
+    that executed at least one fill. Every per-segment aggregate must sum to the
+    published totals (segment-local integrity is verified by the caller).
+    """
 
     base_log_growth: tuple[float, ...]
     stress_log_growth: tuple[float, ...]
@@ -112,6 +124,10 @@ class ExecutionReplayEvidence:
     filled_orders: int
     cash_session_fraction: float
     turnover: float
+    observed_interval_count: int
+    invested_interval_count: int
+    invested_interval_fraction: float
+    filled_cycle_count: int
     unfilled_order_reason_counts: tuple[tuple[str, int], ...]
     utility_transition_diagnostics: tuple[tuple[str, float | int], ...] = ()
     action_diagnostics: tuple[tuple[str, float | int], ...] = ()
@@ -129,14 +145,30 @@ class ExecutionReplayEvidence:
             raise ValueError("cash_session_fraction must be in [0, 1]")
         if not np.isfinite(self.turnover) or self.turnover < 0.0:
             raise ValueError("turnover must be a finite non-negative value")
+        if self.observed_interval_count < 0:
+            raise ValueError("observed_interval_count must be non-negative")
+        if self.invested_interval_count < 0:
+            raise ValueError("invested_interval_count must be non-negative")
+        if self.invested_interval_count > self.observed_interval_count:
+            raise ValueError(
+                "invested_interval_count cannot exceed observed_interval_count"
+            )
+        if not 0.0 <= self.invested_interval_fraction <= 1.0:
+            raise ValueError("invested_interval_fraction must be in [0, 1]")
+        if self.filled_cycle_count < 0:
+            raise ValueError("filled_cycle_count must be non-negative")
 
     def diagnostics(self) -> dict[str, object]:
         """Bounded execution evidence projection; never raw score/price vectors."""
         return {
             "planned_cycles": int(self.planned_cycles),
             "filled_orders": int(self.filled_orders),
+            "filled_cycle_count": int(self.filled_cycle_count),
             "cash_session_fraction": round(float(self.cash_session_fraction), 12),
             "turnover": round(float(self.turnover), 12),
+            "observed_interval_count": int(self.observed_interval_count),
+            "invested_interval_count": int(self.invested_interval_count),
+            "invested_interval_fraction": round(float(self.invested_interval_fraction), 12),
             "unfilled_order_reason_counts": {
                 str(reason): int(count) for reason, count in self.unfilled_order_reason_counts
             },
@@ -181,6 +213,9 @@ def replay_execution_equivalent(
     total_planned = 0
     total_filled_orders = 0
     total_filled_sessions = 0
+    total_invested_intervals = 0
+    total_observed_intervals = 0
+    total_filled_cycles = 0
     turnover_weighted = 0.0
     unfilled: dict[str, int] = {}
 
@@ -266,8 +301,8 @@ def replay_execution_equivalent(
         )
         result = backtester.run_prepared(bt_request, prepared_market, overlay)
 
-        segment_growth = _ledger_log_growth(result.ledger)
-        stress_segment_growth = _ledger_log_growth(result.stress_ledger)
+        segment_growth, segment_invested = _ledger_growth_and_exposure(result.ledger)
+        stress_segment_growth, _ = _ledger_growth_and_exposure(result.stress_ledger)
         if len(segment_growth) != len(stress_segment_growth):
             raise ValueError(
                 f"base and stress ledgers diverged in session count for segment {segment_id}"
@@ -276,9 +311,14 @@ def replay_execution_equivalent(
         stress_growth.extend(stress_segment_growth)
         segment_ids.extend([segment_id] * len(segment_growth))
 
+        segment_observed = len(segment_growth)
+        segment_filled_cycles = _filled_sessions(result)
         total_planned += int(result.planned_cycles)
         total_filled_orders += int(result.filled_orders)
-        total_filled_sessions += _filled_sessions(result)
+        total_filled_sessions += segment_filled_cycles
+        total_observed_intervals += segment_observed
+        total_invested_intervals += segment_invested
+        total_filled_cycles += segment_filled_cycles
         turnover_weighted += float(result.metrics.get("turnover", 0.0)) * max(1, int(result.planned_cycles))
         for reason, count in result.unfilled_order_reason_counts.items():
             unfilled[str(reason)] = unfilled.get(str(reason), 0) + int(count)
@@ -290,6 +330,11 @@ def replay_execution_equivalent(
         else float(np.clip(1.0 - total_filled_sessions / total_planned, 0.0, 1.0))
     )
     turnover = turnover_weighted / total_planned if total_planned > 0 else 0.0
+    invested_fraction = (
+        float(total_invested_intervals / total_observed_intervals)
+        if total_observed_intervals > 0
+        else 0.0
+    )
     return ExecutionReplayEvidence(
         base_log_growth=tuple(base_growth),
         stress_log_growth=tuple(stress_growth),
@@ -298,6 +343,10 @@ def replay_execution_equivalent(
         filled_orders=total_filled_orders,
         cash_session_fraction=cash_fraction,
         turnover=turnover,
+        observed_interval_count=int(total_observed_intervals),
+        invested_interval_count=int(total_invested_intervals),
+        invested_interval_fraction=invested_fraction,
+        filled_cycle_count=int(total_filled_cycles),
         unfilled_order_reason_counts=tuple(sorted(unfilled.items())),
         utility_transition_diagnostics=(),
     )
@@ -419,15 +468,38 @@ def _frame_hash(frame: pl.DataFrame) -> str:
 
 
 def _ledger_log_growth(ledger: tuple[BacktestLedgerRow, ...]) -> tuple[float, ...]:
+    growth, _ = _ledger_growth_and_exposure(ledger)
+    return growth
+
+
+def _ledger_growth_and_exposure(
+    ledger: tuple[BacktestLedgerRow, ...],
+) -> tuple[tuple[float, ...], int]:
+    """Single O(n) pass over a ledger producing log growth and invested intervals.
+
+    ``growth`` is the per-interval log return ``log(equity_t / equity_{t-1})``;
+    a non-positive or non-finite equity fails closed immediately. ``invested``
+    is the count of complete intervals whose prior ledger row carried a positive
+    ``positions_value`` (a held position), so economic exposure is measured from
+    the ledger rather than from fills. The function never allocates raw
+    score/price vectors.
+    """
     equities = [row.equity for row in ledger]
     growth: list[float] = []
-    for previous, current in pairwise(equities):
+    invested = 0
+    for previous_index, current_index in pairwise(
+        range(len(equities))
+    ):
+        previous = equities[previous_index]
+        current = equities[current_index]
         if previous <= 0.0 or current <= 0.0:
             raise ValueError("non-positive equity in replay ledger")
         if not np.isfinite(previous) or not np.isfinite(current):
             raise ValueError("non-finite equity in replay ledger")
         growth.append(float(np.log(current / previous)))
-    return tuple(growth)
+        if ledger[previous_index].positions_value > 0.0:
+            invested += 1
+    return tuple(growth), invested
 
 
 def _filled_sessions(result: BacktestResult) -> int:

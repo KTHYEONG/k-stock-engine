@@ -35,6 +35,7 @@ from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.data.costs import CostEvidence
 from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
 from src.stocks.ml.contracts import policy_portfolio_fingerprint
+from src.stocks.ml.features import feature_transform_schema_from_manifest
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.research.models import ModelManifest
 from src.stocks.trading.portfolio_constructor import (
@@ -68,6 +69,7 @@ def simulate_portfolio(
     eligible_to = datetime.fromisoformat(artifact_manifest.eligible_to)
 
     policy = _policy_from_artifact(artifact_manifest, request)
+    _validate_artifact_input_lineage(snapshot, artifact_manifest)
 
     frame = snapshot.frame
     if "adtv" not in frame.columns and "adtv_20d" in frame.columns:
@@ -126,6 +128,66 @@ def simulate_portfolio(
     return backtester.run(
         frame, artifacts, initial_portfolio, backtest_request
     )
+
+
+def _validate_artifact_input_lineage(
+    snapshot: DatasetSnapshot,
+    artifact_manifest: ModelManifest,
+) -> None:
+    """Fail closed when a v6 artifact's exact input lineage does not match.
+
+    A v6 artifact (``holm_gate_version == "v6"``) records the raw feature schema
+    hash, the input feature content hash, and the recomputed transform
+    fingerprint. The independent historical replay must bind to the identical
+    feature dataset; a divergent feature schema, content hash, or transform
+    fingerprint raises ``ValueError`` with a diagnostic naming the differing
+    hashes so an unrelated snapshot can never silently replay a v6 artifact.
+    Legacy (pre-v6) artifacts skip this gate and replay under best-effort
+    compatibility.
+    """
+    params = artifact_manifest.params or {}
+    if params.get("holm_gate_version") != "v6":
+        return
+    snapshot_manifest = snapshot.manifest
+    raw_schema_hash = params.get("raw_feature_schema_hash")
+    feature_content_hash = params.get("feature_content_hash")
+    stored_fingerprint = params.get("feature_transform_fingerprint")
+    mismatches: list[str] = []
+    if (
+        raw_schema_hash is not None
+        and snapshot_manifest.schema_hash != raw_schema_hash
+    ):
+        mismatches.append(
+            f"feature_schema_hash snapshot={snapshot_manifest.schema_hash!r} "
+            f"artifact={raw_schema_hash!r}"
+        )
+    if (
+        feature_content_hash is not None
+        and snapshot_manifest.content_hash
+        and feature_content_hash != snapshot_manifest.content_hash
+    ):
+        mismatches.append(
+            f"feature_content_hash snapshot={snapshot_manifest.content_hash!r} "
+            f"artifact={feature_content_hash!r}"
+        )
+    if "feature_transform_schema" in params and stored_fingerprint is not None:
+        try:
+            schema = feature_transform_schema_from_manifest(artifact_manifest)
+        except ValueError as exc:
+            raise ValueError(
+                f"v6 artifact {artifact_manifest.artifact_id!r} transform "
+                f"schema is invalid: {exc}"
+            ) from exc
+        if schema.fingerprint != stored_fingerprint:
+            mismatches.append(
+                f"transform_fingerprint recomputed={schema.fingerprint!r} "
+                f"artifact={stored_fingerprint!r}"
+            )
+    if mismatches:
+        raise ValueError(
+            "v6 independent replay input lineage mismatch for "
+            f"{artifact_manifest.artifact_id!r}: " + "; ".join(mismatches)
+        )
 
 
 def artifact_policy_profile(
