@@ -50,6 +50,7 @@ from src.stocks.ml.result_ledger import (
 )
 from src.stocks.ml.training import train_net_alpha_model
 from src.stocks.research.artifacts import ModelArtifactRegistry
+from src.stocks.settings import REFERENCE_DATE, REFERENCE_DATETIME
 
 logger = logging.getLogger("stocks.cli.train")
 
@@ -79,7 +80,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--research-end",
         type=date.fromisoformat,
-        default=None,
+        default=REFERENCE_DATE,
         help="inclusive research data end date for direct selection",
     )
     parser.add_argument("--catalog-root", type=Path, default=STOCK_CATALOG_ROOT)
@@ -139,7 +140,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--participation-limit", type=float, default=0.005)
     parser.add_argument("--portfolio-value", type=float, default=100_000_000.0)
     parser.add_argument("--reference-notional", type=float, default=100_000_000.0)
-    parser.add_argument("--decision-time", type=datetime.fromisoformat, default=None)
+    parser.add_argument(
+        "--decision-time",
+        type=datetime.fromisoformat,
+        default=REFERENCE_DATETIME,
+        help="decision timestamp (default: 2026-03-10T06:30:00+00:00)",
+    )
     parser.add_argument(
         "--base-dataset-id",
         default=None,
@@ -158,13 +164,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--research-start-direct",
         type=date.fromisoformat,
-        default=None,
+        default=date(2016, 1, 4),
         help="start date for direct dataset loading (requires --base-dataset-id)",
     )
     parser.add_argument(
         "--research-end-direct",
         type=date.fromisoformat,
-        default=None,
+        default=REFERENCE_DATE,
         help="end date for direct dataset loading (requires --base-dataset-id)",
     )
     return parser
@@ -231,7 +237,7 @@ def main(args: list[str] | None = None) -> int:
     if not parsed.snapshot_id and not parsed.as_of:
         parser.error("either --snapshot-id or --as-of is required")
 
-    decision_time = parsed.decision_time or datetime.now(UTC)
+    decision_time = parsed.decision_time or REFERENCE_DATETIME
     started_at = datetime.now(UTC)
     repository = ResearchDataRepository(
         base_root=parsed.base_root,
@@ -424,7 +430,7 @@ def _run_direct_training(
             "direct dataset loading requires --research-start-direct and --research-end-direct"
         )
 
-    decision_time = parsed.decision_time or datetime.now(UTC)
+    decision_time = parsed.decision_time or REFERENCE_DATETIME
     started_at = datetime.now(UTC)
 
     loader = DirectMarketDataLoader(

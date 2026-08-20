@@ -2,6 +2,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, date, datetime
+
+# Pin omitted execution dates to the last complete market-data boundary.
+REFERENCE_DATE = date(2026, 3, 10)
+REFERENCE_DATETIME = datetime(2026, 3, 10, 6, 30, tzinfo=UTC)
 
 
 @dataclass(frozen=True, slots=True)

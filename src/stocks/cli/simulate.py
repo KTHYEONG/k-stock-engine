@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import cast
 
@@ -25,7 +25,7 @@ from src.stocks.data.repositories import (
     resolve_snapshot_for_mode,
 )
 from src.stocks.research.artifacts import ModelArtifactRegistry
-from src.stocks.settings import DEFAULT_STOCK_ALPHA
+from src.stocks.settings import DEFAULT_STOCK_ALPHA, REFERENCE_DATETIME
 from src.stocks.workflows.contracts import SimulationRequest
 from src.stocks.workflows.simulate_portfolio import (
     artifact_policy_profile,
@@ -35,7 +35,7 @@ from src.stocks.workflows.simulate_portfolio import (
 logger = logging.getLogger("stocks.cli.simulate")
 
 
-def main(args: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a stock simulation from an artifact")
     parser.add_argument("--artifact-id", required=True)
     parser.add_argument("--snapshot-id", required=True, help="immutable research snapshot id")
@@ -51,11 +51,21 @@ def main(args: list[str] | None = None) -> int:
         help="paper/live modes reject provisional snapshots",
     )
     parser.add_argument("--feature-set", default=None, help="feature set identifier")
-    parser.add_argument("--decision-time", type=datetime.fromisoformat, default=None)
+    parser.add_argument(
+        "--decision-time",
+        type=datetime.fromisoformat,
+        default=REFERENCE_DATETIME,
+        help="decision timestamp (default: 2026-03-10T06:30:00+00:00)",
+    )
+    return parser
+
+
+def main(args: list[str] | None = None) -> int:
+    parser = build_parser()
     parsed = parser.parse_args(args)
 
     settings = DEFAULT_STOCK_ALPHA
-    decision_time = parsed.decision_time or datetime.now(UTC)
+    decision_time = parsed.decision_time or REFERENCE_DATETIME
     snapshot = resolve_snapshot_for_mode(
         parsed.catalog_root, parsed.snapshot_id, mode=parsed.mode
     )
