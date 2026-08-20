@@ -107,7 +107,11 @@ def _compound_request():
 def _legacy_profile():
     from src.stocks.ml.contracts import PolicyProfile
 
-    return PolicyProfile(profile_id="legacy_overlay_5bps", no_trade_band_bps=5.0)
+    return PolicyProfile(
+        profile_id="legacy_overlay_5bps",
+        no_trade_band_bps=5.0,
+        execution_utility_mode="legacy_target_interpolation_v1",
+    )
 
 
 def test_forward_holdout_empty_panel_fails_closed() -> None:
@@ -1207,18 +1211,20 @@ _TRAINING_ARTIFACT_SCENARIO = "training_artifact_marks_economic_rank_v2"
 
 
 def test_training_artifact_marks_economic_rank_v2() -> None:
-    """Promoted artifact records economic_net_v1 mode and v3 horizon-consistent evidence version."""
+    """Promoted artifact records economic_net_v1 mode and v4 delta-cost-aware evidence version."""
     data, request, pre_holdout, folds, learner_columns, _schema = _training_fixture()
     profile = _compound_request().policy_profiles[0]
     horizon = 10
     policy = training._risk_policy_for_profile(request, profile, horizon)
     assert policy.economic_ranking_mode == "economic_net_v1"
     assert policy.compounding.forecast_horizon_sessions == horizon
+    assert policy.execution_utility_mode == "delta_cost_aware_v1"
 
     params_json = training._policy_profile_params(request, profile, horizon)
     params = json.loads(params_json)
     assert params["economic_ranking_mode"] == "economic_net_v1"
-    assert params["execution_evidence_version"] == "prepared-equity-v3-horizon-consistent"
+    assert params["execution_evidence_version"] == "prepared-equity-v4-delta-cost-aware"
+    assert params["execution_utility_mode"] == "delta_cost_aware_v1"
     assert params["forecast_horizon_sessions"] == horizon
 
     from src.stocks.trading.portfolio_constructor import (
@@ -1259,3 +1265,40 @@ def test_horizon_pins_policy() -> None:
         stock_risk_policy_fingerprint(policy_10)
         != stock_risk_policy_fingerprint(policy_5)
     )
+
+
+DELTA_COST_UTILITY_07 = "DELTA_COST_UTILITY_07_OOF_HOLDOUT_MODE_PINNING"
+
+
+def test_delta_cost_utility_07_oof_holdout_mode_pinning() -> None:
+    """_risk_policy_for_profile pins delta_cost_aware_v1 and changes fingerprint vs legacy."""
+    from src.stocks.ml.contracts import PolicyProfile
+
+    data, request, pre_holdout, folds, learner_columns, _schema = _training_fixture()
+
+    v4_profile = PolicyProfile(
+        profile_id="lower_bound_only",
+        no_trade_band_bps=0.0,
+        execution_utility_mode="delta_cost_aware_v1",
+    )
+    horizon = 10
+    v4_policy = training._risk_policy_for_profile(request, v4_profile, horizon)
+    assert v4_policy.execution_utility_mode == "delta_cost_aware_v1"
+
+    v4_params = json.loads(training._policy_profile_params(request, v4_profile, horizon))
+    assert v4_params["execution_utility_mode"] == "delta_cost_aware_v1"
+    assert v4_params["execution_evidence_version"] == "prepared-equity-v4-delta-cost-aware"
+
+    legacy_profile = PolicyProfile(
+        profile_id="lower_bound_only",
+        no_trade_band_bps=0.0,
+        execution_utility_mode="legacy_target_interpolation_v1",
+    )
+    legacy_policy = training._risk_policy_for_profile(request, legacy_profile, horizon)
+    assert legacy_policy.execution_utility_mode == "legacy_target_interpolation_v1"
+
+    legacy_params = json.loads(training._policy_profile_params(request, legacy_profile, horizon))
+    assert legacy_params["execution_utility_mode"] == "legacy_target_interpolation_v1"
+    assert legacy_params["execution_evidence_version"] == "prepared-equity-v3-horizon-consistent"
+
+    assert stock_risk_policy_fingerprint(v4_policy) != stock_risk_policy_fingerprint(legacy_policy)

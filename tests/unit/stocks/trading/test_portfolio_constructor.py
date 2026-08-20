@@ -1534,3 +1534,233 @@ def test_stock_risk_policy_fingerprint_includes_economic_ranking_mode() -> None:
 
     p3 = StockRiskPolicy(top_k=20, economic_ranking_mode="raw_score_v1")
     assert stock_risk_policy_fingerprint(p1) == stock_risk_policy_fingerprint(p3)
+
+
+def test_stock_risk_policy_fingerprint_includes_execution_utility_mode() -> None:
+    """Fingerprint differs when execution_utility_mode differs."""
+    p1 = StockRiskPolicy(top_k=20)
+    p2 = StockRiskPolicy(top_k=20, execution_utility_mode="delta_cost_aware_v1")
+    p3 = StockRiskPolicy(top_k=20, execution_utility_mode="legacy_target_interpolation_v1")
+    assert stock_risk_policy_fingerprint(p1) != stock_risk_policy_fingerprint(p2)
+    assert stock_risk_policy_fingerprint(p1) == stock_risk_policy_fingerprint(p3)
+    assert stock_risk_policy_fingerprint(p2) != stock_risk_policy_fingerprint(p3)
+
+
+def test_policy_profile_rejects_invalid_execution_utility_mode() -> None:
+    from src.stocks.ml.contracts import PolicyProfile
+    with pytest.raises(ValueError, match="execution_utility_mode"):
+        PolicyProfile(profile_id="test", execution_utility_mode="unknown_mode")
+
+
+DELTA_COST_UTILITY_01 = "DELTA_COST_UTILITY_01_COST_DOMINATED_HOLD"
+
+
+def test_delta_cost_utility_01_cost_dominated_hold() -> None:
+    """High costs make U(1) <= U(0), so s=0 is selected (hold)."""
+    from src.stocks.trading.portfolio_constructor import (
+        _lower_confidence_transition_utility,
+        _select_delta_cost_aware_transition,
+        causal_covariance_or_fallback,
+    )
+
+    ids = ["A", "B"]
+    current = {"A": 0.05, "B": 0.03}
+    target = {"A": 0.08, "B": 0.02}
+    lower_alpha = {"A": 0.001, "B": 0.001}
+    entry_cost = {"A": 0.05, "B": 0.05}
+    exit_cost = {"A": 0.05, "B": 0.05}
+
+    rng = np.random.default_rng(42)
+    returns = rng.normal(0.001, 0.01, size=(60, 2))
+    cov, _ = causal_covariance_or_fallback(
+        returns, volatility_lookback_sessions=20, covariance_lookback_sessions=60
+    )
+
+    u0 = _lower_confidence_transition_utility(
+        current, target, lower_alpha, entry_cost, exit_cost, cov, ids, 10, 1.0, 0.0
+    )
+    u1 = _lower_confidence_transition_utility(
+        current, target, lower_alpha, entry_cost, exit_cost, cov, ids, 10, 1.0, 1.0
+    )
+    assert u1 <= u0 + 1e-12
+
+    final, scale, reason = _select_delta_cost_aware_transition(
+        current, target, lower_alpha, entry_cost, exit_cost, cov, ids, 10, 1.0
+    )
+    assert scale == 0.0
+    assert reason is None
+    for instrument_id in ids:
+        assert final[instrument_id] == pytest.approx(current[instrument_id], abs=1e-12)
+
+
+DELTA_COST_UTILITY_02 = "DELTA_COST_UTILITY_02_EDGE_DOMINATED_TRANSITION"
+
+
+def test_delta_cost_utility_02_edge_dominated_transition() -> None:
+    """Positive lower alpha with low costs yields U(s) > U(0) and 0 < s <= 1."""
+    from src.stocks.trading.portfolio_constructor import (
+        _lower_confidence_transition_utility,
+        _select_delta_cost_aware_transition,
+        causal_covariance_or_fallback,
+    )
+
+    ids = ["A", "B"]
+    current = {"A": 0.0, "B": 0.0}
+    target = {"A": 0.08, "B": 0.05}
+    lower_alpha = {"A": 0.02, "B": 0.015}
+    entry_cost = {"A": 0.001, "B": 0.001}
+    exit_cost = {"A": 0.001, "B": 0.001}
+
+    rng = np.random.default_rng(42)
+    returns = rng.normal(0.001, 0.01, size=(60, 2))
+    cov, _ = causal_covariance_or_fallback(
+        returns, volatility_lookback_sessions=20, covariance_lookback_sessions=60
+    )
+
+    u0 = _lower_confidence_transition_utility(
+        current, target, lower_alpha, entry_cost, exit_cost, cov, ids, 10, 1.0, 0.0
+    )
+
+    final, scale, reason = _select_delta_cost_aware_transition(
+        current, target, lower_alpha, entry_cost, exit_cost, cov, ids, 10, 1.0
+    )
+    assert reason is None
+    assert 0.0 < scale <= 1.0 + 1e-12
+
+    u_selected = _lower_confidence_transition_utility(
+        current, target, lower_alpha, entry_cost, exit_cost, cov, ids, 10, 1.0, scale
+    )
+    assert u_selected > u0 + 1e-12
+
+    for instrument_id in ids:
+        assert 0.0 <= final[instrument_id] <= target[instrument_id] + 1e-12
+
+
+DELTA_COST_UTILITY_03 = "DELTA_COST_UTILITY_03_INVALID_COST_FAILS_CLOSED"
+
+
+def test_delta_cost_utility_03_invalid_cost_fails_closed() -> None:
+    """NaN/negative/inconsistent costs return s=0 without optional buy."""
+    from src.stocks.trading.portfolio_constructor import (
+        _select_delta_cost_aware_transition,
+        causal_covariance_or_fallback,
+    )
+
+    ids = ["A", "B"]
+    current = {"A": 0.0, "B": 0.0}
+    target = {"A": 0.08, "B": 0.05}
+    rng = np.random.default_rng(42)
+    returns = rng.normal(0.001, 0.01, size=(60, 2))
+    cov, _ = causal_covariance_or_fallback(
+        returns, volatility_lookback_sessions=20, covariance_lookback_sessions=60
+    )
+
+    nan_alpha = {"A": float("nan"), "B": 0.01}
+    ok_costs = {"A": 0.001, "B": 0.001}
+    final, scale, reason = _select_delta_cost_aware_transition(
+        current, target, nan_alpha, ok_costs, ok_costs, cov, ids, 10, 1.0
+    )
+    assert scale == 0.0
+    assert reason == "non-finite-lower-alpha"
+
+    neg_alpha = {"A": -0.01, "B": 0.01}
+    final, scale, reason = _select_delta_cost_aware_transition(
+        current, target, neg_alpha, ok_costs, ok_costs, cov, ids, 10, 1.0
+    )
+    assert scale == 0.0
+    assert reason is None
+
+    neg_entry = {"A": -0.001, "B": 0.001}
+    ok_alpha = {"A": 0.01, "B": 0.01}
+    final, scale, reason = _select_delta_cost_aware_transition(
+        current, target, ok_alpha, neg_entry, ok_costs, cov, ids, 10, 1.0
+    )
+    assert scale == 0.0
+    assert reason == "invalid-entry-cost"
+
+
+DELTA_COST_UTILITY_04 = "DELTA_COST_UTILITY_04_PREPARED_REFERENCE_PARITY"
+
+
+def test_delta_cost_utility_04_prepared_reference_parity() -> None:
+    """Prepared and reference constructors emit same weights under delta_cost_aware_v1."""
+    from src.stocks.research.economic_alpha import CausalAlphaCalibrator
+    from src.stocks.trading.portfolio_constructor import (
+        PreparedAllocationMarket,
+        construct_target_allocations_prepared,
+    )
+
+    policy = StockRiskPolicy(
+        top_k=20,
+        economic_ranking_mode="economic_net_v1",
+        execution_utility_mode="delta_cost_aware_v1",
+    )
+    panel = scored_panel(n_sessions=61, n_tickers=10, seed=9).drop("ret")
+    instruments = instruments_for(10)
+    portfolio = empty_portfolio()
+
+    buckets = [
+        {
+            "bucket": bucket,
+            "sample_size": 10,
+            "expected_active_alpha": 0.003,
+            "alpha_lower_bound": 0.002,
+        }
+        for bucket in range(4)
+    ]
+    cal_state = {
+        "bucket_count": 4,
+        "history_sessions": 30,
+        "round_trip_cost": 0.0005,
+        "exit_cost_rate": 0.0003,
+        "buckets": buckets,
+    }
+
+    market = PreparedAllocationMarket.build(panel)
+    overlay = (
+        panel.sort(["session", "instrument_id"])["pred_score"].to_numpy().astype(float)
+    )
+
+    window_len = (
+        max(policy.volatility_lookback_sessions, policy.covariance_lookback_sessions)
+        + 1
+    )
+    decision_index = len(market.sessions) - 1
+    start = max(0, decision_index - window_len + 1)
+    indices = np.concatenate(
+        [
+            np.arange(market.session_ranges[i][0], market.session_ranges[i][1])
+            for i in range(start, decision_index + 1)
+        ]
+    )
+    from src.stocks.trading.portfolio_constructor import _SESSION_COLUMN
+
+    window_frame = pl.DataFrame(
+        {
+            "instrument_id": market.instrument_ids[indices],
+            _SESSION_COLUMN: pl.Series(
+                market.row_sessions[indices].tolist(),
+                dtype=pl.Datetime("us", "UTC"),
+            ),
+            "pred_score": np.asarray(overlay)[indices],
+            "sector": market.sector[indices],
+            "adtv": market.adtv[indices],
+            "close": market.close[indices],
+        }
+    ).with_columns(pl.col("pred_score").fill_nan(None))
+    window_frame = CausalAlphaCalibrator.apply_prepared(cal_state, window_frame)
+
+    ref = construct_target_allocations(window_frame, instruments, portfolio, policy)
+    prep = construct_target_allocations_prepared(
+        market, decision_index, overlay, cal_state, instruments, portfolio, policy
+    )
+    assert sorted(a.instrument.instrument_id for a in prep) == sorted(
+        a.instrument.instrument_id for a in ref
+    )
+    for r, p in zip(
+        sorted(ref, key=lambda a: a.instrument.instrument_id),
+        sorted(prep, key=lambda a: a.instrument.instrument_id),
+        strict=True,
+    ):
+        assert r.instrument.instrument_id == p.instrument.instrument_id
+        assert r.target_value == pytest.approx(p.target_value, abs=1e-12)
