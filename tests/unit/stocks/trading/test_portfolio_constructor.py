@@ -2234,3 +2234,68 @@ def test_utility_cash_growth_recovery() -> None:
     assert sum(weights.values()) <= policy.gross_cap + 1e-8
     assert all(v <= policy.single_name_cap + 1e-8 for v in weights.values())
     assert weights["A"] > weights["B"] > weights["C"]
+
+
+ML_COMPOUNDING_04_WATERFILL_REDISTRIBUTES_CAPACITY = (
+    "ML_COMPOUNDING_04_WATERFILL_REDISTRIBUTES_CAPACITY"
+)
+
+
+def test_waterfill_redistributes_capacity() -> None:
+    """ML_COMPOUNDING_04_WATERFILL_REDISTRIBUTES_CAPACITY.
+
+    For a feasible diversified cross-section, returned weights sum to
+    requested_gross within 1e-10 while each weight <= single_name_cap and
+    every sector total <= sector_cap; for an infeasible cross-section the
+    returned unallocated fraction is strictly positive and equals
+    (requested_gross - sum(weights)) / requested_gross within 1e-10.
+    """
+    from src.stocks.trading.portfolio_constructor import _risk_balanced_waterfill
+
+    vol_of = {"A": 0.02, "B": 0.03, "C": 0.04, "D": 0.05, "E": 0.025, "F": 0.035}
+    sector_of = {"A": "S1", "B": "S1", "C": "S2", "D": "S2", "E": "S3", "F": "S3"}
+    ids = ["A", "B", "C", "D", "E", "F"]
+    requested_gross = 0.90
+    single_name_cap = 0.20
+    sector_cap = 0.35
+
+    weights, unallocated = _risk_balanced_waterfill(
+        ids, vol_of, sector_of,
+        requested_gross=requested_gross,
+        single_name_cap=single_name_cap,
+        sector_cap=sector_cap,
+    )
+    total = sum(weights.values())
+    assert abs(total - requested_gross) <= 1e-10
+    assert unallocated == pytest.approx(0.0, abs=1e-10)
+    for iid in ids:
+        assert weights[iid] <= single_name_cap + 1e-12
+    for sector in {"S1", "S2", "S3"}:
+        sector_total = sum(
+            w for iid, w in weights.items() if sector_of[iid] == sector
+        )
+        assert sector_total <= sector_cap + 1e-12
+
+    tight_vol = {"A": 0.01, "B": 0.01, "C": 0.01, "D": 0.01, "E": 0.01, "F": 0.01}
+    tight_sector = {"A": "S1", "B": "S1", "C": "S1", "D": "S1", "E": "S1", "F": "S1"}
+    tight_weights, tight_unallocated = _risk_balanced_waterfill(
+        ids, tight_vol, tight_sector,
+        requested_gross=0.90,
+        single_name_cap=0.08,
+        sector_cap=0.25,
+    )
+    tight_total = sum(tight_weights.values())
+    assert tight_unallocated > 0.0
+    assert abs(tight_unallocated - (0.90 - tight_total) / 0.90) <= 1e-10
+    assert tight_total < 0.90 - 1e-12
+
+    assert _risk_balanced_waterfill(
+        [], vol_of, sector_of,
+        requested_gross=0.90, single_name_cap=0.08, sector_cap=0.25,
+    ) == ({}, 1.0)
+    zero_gross_weights, zero_gross_unalloc = _risk_balanced_waterfill(
+        ids, vol_of, sector_of,
+        requested_gross=0.0, single_name_cap=0.08, sector_cap=0.25,
+    )
+    assert zero_gross_unalloc == 1.0
+    assert all(v == 0.0 for v in zero_gross_weights.values())
