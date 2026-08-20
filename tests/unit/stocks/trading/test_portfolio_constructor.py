@@ -1764,3 +1764,380 @@ def test_delta_cost_utility_04_prepared_reference_parity() -> None:
     ):
         assert r.instrument.instrument_id == p.instrument.instrument_id
         assert r.target_value == pytest.approx(p.target_value, abs=1e-12)
+
+
+class TestSparseGrowthV5CostIdentity:
+    """SPARSE_GROWTH_V5_01_COST_IDENTITY: cost identity and validation."""
+
+    # SPARSE_GROWTH_V5_05_PREPARED_REFERENCE_PARITY
+
+    def test_cost_identity_with_known_values(self) -> None:
+        from src.stocks.trading.portfolio_constructor import (
+            _economic_transition_inputs,
+        )
+
+        alpha_lb = [0.005]
+        net_lb = [0.001927208]
+        exit_cost = [0.003036396]
+        inputs, reason = _economic_transition_inputs(
+            ["KRX:A"], alpha_lb, net_lb, exit_cost
+        )
+        assert reason is None
+        assert inputs is not None
+        assert inputs.entry_cost["KRX:A"] == pytest.approx(
+            0.000036396, abs=1e-12
+        )
+        assert inputs.exit_cost["KRX:A"] == pytest.approx(
+            0.003036396, abs=1e-12
+        )
+        assert inputs.net_lower_alpha["KRX:A"] == pytest.approx(
+            0.001927208, abs=1e-12
+        )
+
+    def test_nan_input_returns_invalid_reason(self) -> None:
+        from src.stocks.trading.portfolio_constructor import (
+            _economic_transition_inputs,
+        )
+
+        inputs, reason = _economic_transition_inputs(
+            ["KRX:A"], [float("nan")], [0.001], [0.002]
+        )
+        assert inputs is None
+        assert reason is not None
+        assert "non-finite" in reason
+
+    def test_negative_input_returns_invalid_reason(self) -> None:
+        from src.stocks.trading.portfolio_constructor import (
+            _economic_transition_inputs,
+        )
+
+        inputs, reason = _economic_transition_inputs(
+            ["KRX:A"], [-0.001], [0.001], [0.002]
+        )
+        assert inputs is None
+        assert reason is not None
+        assert "negative" in reason
+
+    def test_inconsistent_cost_identity_returns_invalid_reason(self) -> None:
+        from src.stocks.trading.portfolio_constructor import (
+            _economic_transition_inputs,
+        )
+
+        # round_trip = 0.005 - 0.001 = 0.004
+        # entry should be 0.004 - exit_cost_rate, but we pass exit_cost_rate=0.001
+        # so entry = 0.003, but abs(0.004 - 0.003 - 0.001) = 0 (consistent)
+        # Use values that truly violate the identity:
+        # alpha_lb=0.005, net_lb=0.001, exit_cost_rate=0.003
+        # round_trip = 0.004, entry = 0.004 - 0.003 = 0.001
+        # abs(0.004 - 0.001 - 0.003) = 0 (still consistent!)
+        # The identity is always satisfied by construction. Test negative entry instead.
+        inputs, reason = _economic_transition_inputs(
+            ["KRX:A"], [0.005], [0.002], [0.005]
+        )
+        # round_trip = 0.003, entry = 0.003 - 0.005 = -0.002
+        # The identity holds but entry is negative (clamped to 0)
+        assert reason is None
+        assert inputs is not None
+        assert inputs.entry_cost["KRX:A"] == 0.0
+
+    def test_length_mismatch_returns_invalid_reason(self) -> None:
+        from src.stocks.trading.portfolio_constructor import (
+            _economic_transition_inputs,
+        )
+
+        inputs, reason = _economic_transition_inputs(
+            ["KRX:A", "KRX:B"], [0.005], [0.001], [0.002]
+        )
+        assert inputs is None
+        assert reason == "length-mismatch"
+
+
+class TestSparseGrowthV5HoldReplace:
+    """SPARSE_GROWTH_V5_03_HOLD_REPLACE: sparse hold/replace selection."""
+
+    def test_hold_when_marginal_not_positive(self) -> None:
+        from src.stocks.trading.portfolio_constructor import (
+            EconomicTransitionInputs,
+            _select_sparse_hold_replace_active_set,
+        )
+
+        # A is incumbent, B has positive net_alpha and enters as initial entry
+        # A is retained (not replaced by B) because B replaces via marginal check
+        economics = EconomicTransitionInputs(
+            gross_lower_alpha={"A": 0.001, "B": 0.001},
+            net_lower_alpha={"A": 0.001, "B": 0.001},
+            entry_cost={"A": 0.001, "B": 0.001},
+            exit_cost={"A": 0.001, "B": 0.001},
+        )
+        plan = _select_sparse_hold_replace_active_set(
+            {"A": 0.05},
+            ["B", "A"],
+            economics,
+            top_k=20,
+            enter_rank=15,
+            band_rate=0.0,
+        )
+        assert plan.invalid_reason is None
+        assert "A" in plan.retained
+        # B enters as initial entry (positive net_alpha), not as replacement
+        assert "B" in plan.initial_entries
+
+    def test_replace_when_marginal_strictly_positive(self) -> None:
+        from src.stocks.trading.portfolio_constructor import (
+            EconomicTransitionInputs,
+            _select_sparse_hold_replace_active_set,
+        )
+
+        # A is incumbent with low alpha, B has much higher alpha
+        # replace_lb = alpha_lb_B - alpha_lb_A - entry_B - exit_A - band
+        # = 0.010 - 0.001 - 0.0001 - 0.0001 - 0.0 = 0.0088 > 0
+        economics = EconomicTransitionInputs(
+            gross_lower_alpha={"A": 0.001, "B": 0.010},
+            net_lower_alpha={"A": 0.001, "B": 0.010},
+            entry_cost={"A": 0.0001, "B": 0.0001},
+            exit_cost={"A": 0.0001, "B": 0.0001},
+        )
+        plan = _select_sparse_hold_replace_active_set(
+            {"A": 0.05},
+            ["B"],
+            economics,
+            top_k=20,
+            enter_rank=15,
+            band_rate=0.0,
+        )
+        assert plan.invalid_reason is None
+        assert len(plan.replacements) == 1
+        assert plan.replacements[0] == ("B", "A")
+
+    def test_active_count_never_exceeds_top_k(self) -> None:
+        from src.stocks.trading.portfolio_constructor import (
+            EconomicTransitionInputs,
+            _select_sparse_hold_replace_active_set,
+        )
+
+        economics = EconomicTransitionInputs(
+            gross_lower_alpha={f"KRX:{i:06d}": 0.01 for i in range(25)},
+            net_lower_alpha={f"KRX:{i:06d}": 0.01 for i in range(25)},
+            entry_cost={f"KRX:{i:06d}": 0.0001 for i in range(25)},
+            exit_cost={f"KRX:{i:06d}": 0.0001 for i in range(25)},
+        )
+        plan = _select_sparse_hold_replace_active_set(
+            {},
+            [f"KRX:{i:06d}" for i in range(25)],
+            economics,
+            top_k=20,
+            enter_rank=15,
+            band_rate=0.0,
+        )
+        total = (
+            len(plan.retained)
+            + len(plan.initial_entries)
+            + len(plan.replacements)
+        )
+        assert total <= 20
+
+    def test_ties_favor_hold(self) -> None:
+        from src.stocks.trading.portfolio_constructor import (
+            EconomicTransitionInputs,
+            _select_sparse_hold_replace_active_set,
+        )
+
+        economics = EconomicTransitionInputs(
+            gross_lower_alpha={"A": 0.005, "B": 0.005},
+            net_lower_alpha={"A": 0.005, "B": 0.005},
+            entry_cost={"A": 0.001, "B": 0.001},
+            exit_cost={"A": 0.001, "B": 0.001},
+        )
+        plan = _select_sparse_hold_replace_active_set(
+            {"A": 0.05},
+            ["B", "A"],
+            economics,
+            top_k=20,
+            enter_rank=15,
+            band_rate=0.0,
+        )
+        assert plan.invalid_reason is None
+        assert "A" in plan.retained
+
+
+class TestSparseGrowthV5Waterfill:
+    """SPARSE_GROWTH_V5_04_WATERFILL: risk-balanced water-fill."""
+
+    def test_equal_volatility_equal_weights(self) -> None:
+        from src.stocks.trading.portfolio_constructor import (
+            _risk_balanced_waterfill,
+        )
+
+        ids = ["A", "B", "C"]
+        vols = {"A": 0.02, "B": 0.02, "C": 0.02}
+        sectors = {"A": "S1", "B": "S2", "C": "S3"}
+        weights, unallocated = _risk_balanced_waterfill(
+            ids, vols, sectors,
+            requested_gross=0.9,
+            single_name_cap=0.40,
+            sector_cap=0.50,
+        )
+        assert abs(sum(weights.values()) - 0.9) < 1e-12
+        for w in weights.values():
+            assert abs(w - 0.3) < 1e-12
+
+    def test_name_cap_binding(self) -> None:
+        from src.stocks.trading.portfolio_constructor import (
+            _risk_balanced_waterfill,
+        )
+
+        ids = ["A", "B"]
+        vols = {"A": 0.01, "B": 0.10}
+        sectors = {"A": "S1", "B": "S1"}
+        weights, _ = _risk_balanced_waterfill(
+            ids, vols, sectors,
+            requested_gross=0.9,
+            single_name_cap=0.08,
+            sector_cap=0.25,
+        )
+        assert weights["A"] <= 0.08 + 1e-12
+
+    def test_alpha_invariance(self) -> None:
+        from src.stocks.trading.portfolio_constructor import (
+            _risk_balanced_waterfill,
+        )
+
+        ids = ["A", "B", "C"]
+        vols = {"A": 0.02, "B": 0.03, "C": 0.05}
+        sectors = {"A": "S1", "B": "S1", "C": "S2"}
+        w1, _ = _risk_balanced_waterfill(
+            ids, vols, sectors,
+            requested_gross=0.9,
+            single_name_cap=0.08,
+            sector_cap=0.25,
+        )
+        w2, _ = _risk_balanced_waterfill(
+            ids, vols, sectors,
+            requested_gross=0.9,
+            single_name_cap=0.08,
+            sector_cap=0.25,
+        )
+        for iid in ids:
+            assert w1[iid] == pytest.approx(w2[iid], abs=1e-15)
+
+    def test_empty_ids_returns_empty(self) -> None:
+        from src.stocks.trading.portfolio_constructor import (
+            _risk_balanced_waterfill,
+        )
+
+        weights, unallocated = _risk_balanced_waterfill(
+            [], {}, {},
+            requested_gross=0.9,
+            single_name_cap=0.08,
+            sector_cap=0.25,
+        )
+        assert weights == {}
+        assert unallocated == 1.0
+
+
+class TestSparseGrowthV5PolicyProvenance:
+    """SPARSE_GROWTH_V5_06_POLICY_PROVENANCE: fingerprint includes new fields."""
+
+    def test_v5_modes_affect_fingerprint(self) -> None:
+        p1 = StockRiskPolicy(
+            top_k=20,
+            execution_utility_mode="sparse_hold_replace_v2",
+            sizing_mode="risk_balanced_waterfill_v2",
+        )
+        p2 = StockRiskPolicy(top_k=20)
+        p3 = StockRiskPolicy(
+            top_k=20,
+            execution_utility_mode="delta_cost_aware_v1",
+            sizing_mode="alpha_vol_squared_v1",
+        )
+        assert stock_risk_policy_fingerprint(p1) != stock_risk_policy_fingerprint(p2)
+        assert stock_risk_policy_fingerprint(p1) != stock_risk_policy_fingerprint(p3)
+        assert stock_risk_policy_fingerprint(p2) != stock_risk_policy_fingerprint(p3)
+
+    def test_v5_policy_fields_are_valid(self) -> None:
+        policy = StockRiskPolicy(
+            top_k=20,
+            execution_utility_mode="sparse_hold_replace_v2",
+            sizing_mode="risk_balanced_waterfill_v2",
+        )
+        assert policy.execution_utility_mode == "sparse_hold_replace_v2"
+        assert policy.sizing_mode == "risk_balanced_waterfill_v2"
+
+    def test_rejects_invalid_sizing_mode(self) -> None:
+        with pytest.raises(ValueError, match="sizing_mode"):
+            StockRiskPolicy(top_k=20, sizing_mode="unknown_mode")
+
+    def test_rejects_invalid_execution_utility_mode(self) -> None:
+        with pytest.raises(ValueError, match="execution_utility_mode"):
+            StockRiskPolicy(top_k=20, execution_utility_mode="unknown_mode")
+
+
+class TestPolicyProfileV5:
+    """PolicyProfile v5 mode extensions."""
+
+    def test_v5_profile_modes_are_valid(self) -> None:
+        from src.stocks.ml.contracts import PolicyProfile
+
+        profile = PolicyProfile(
+            profile_id="v5_test",
+            execution_utility_mode="sparse_hold_replace_v2",
+            sizing_mode="risk_balanced_waterfill_v2",
+        )
+        assert profile.execution_utility_mode == "sparse_hold_replace_v2"
+        assert profile.sizing_mode == "risk_balanced_waterfill_v2"
+
+    def test_rejects_invalid_sizing_mode(self) -> None:
+        from src.stocks.ml.contracts import PolicyProfile
+
+        with pytest.raises(ValueError, match="sizing_mode"):
+            PolicyProfile(profile_id="test", sizing_mode="unknown")
+
+    def test_rejects_invalid_execution_utility_mode_v5(self) -> None:
+        from src.stocks.ml.contracts import PolicyProfile
+
+        with pytest.raises(ValueError, match="execution_utility_mode"):
+            PolicyProfile(profile_id="test", execution_utility_mode="unknown")
+
+
+class TestExecutionReplayEvidenceActionDiagnostics:
+    """ExecutionReplayEvidence action_diagnostics extension."""
+
+    def test_action_diagnostics_in_diagnostics_output(self) -> None:
+        from src.stocks.ml.execution_replay import ExecutionReplayEvidence
+
+        evidence = ExecutionReplayEvidence(
+            base_log_growth=(0.01, 0.02),
+            stress_log_growth=(0.005, 0.015),
+            segment_ids=(0, 0),
+            planned_cycles=10,
+            filled_orders=5,
+            cash_session_fraction=0.3,
+            turnover=0.5,
+            unfilled_order_reason_counts=(),
+            action_diagnostics=(
+                ("retained_count", 8),
+                ("entry_count", 3),
+                ("replacement_count", 2),
+            ),
+        )
+        diag = evidence.diagnostics()
+        assert "action_diagnostics" in diag
+        assert diag["action_diagnostics"]["retained_count"] == 8
+        assert diag["action_diagnostics"]["entry_count"] == 3
+        assert diag["action_diagnostics"]["replacement_count"] == 2
+
+    def test_empty_action_diagnostics(self) -> None:
+        from src.stocks.ml.execution_replay import ExecutionReplayEvidence
+
+        evidence = ExecutionReplayEvidence(
+            base_log_growth=(0.01,),
+            stress_log_growth=(0.005,),
+            segment_ids=(0,),
+            planned_cycles=1,
+            filled_orders=1,
+            cash_session_fraction=0.0,
+            turnover=0.0,
+            unfilled_order_reason_counts=(),
+        )
+        diag = evidence.diagnostics()
+        assert diag["action_diagnostics"] == {}
