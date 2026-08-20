@@ -3,7 +3,7 @@
   "agent": {
     "code-worker": {
       "mode": "subagent",
-      "model": "deepseek-v4-flash",
+      "model": "mimo-v2.5",
       "temperature": 0.2,
       "description": "Strict Python 3.11+ implementation agent. Focuses purely on logic generation.",
       "prompt": "You are a strict code-generation subagent. [Context & Scope]: Role: Strict code-generation subagent. Dependency: Do not run linter/test tools. [Execution Constraints]: Python 3.11+ syntax, strict typing, Google Style Docstrings. print() prohibited. [Output Workflow]: 1. <plan> (Max 3 lines), 2. <risk> (Max 2 lines), 3. Code block with Time/Space Complexity."
