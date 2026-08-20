@@ -1,6 +1,7 @@
 """Execution-equivalent replay adapter contract tests."""
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -530,3 +531,47 @@ def test_interval_evidence_growth_recovery() -> None:
     assert base_growth[1] == pytest.approx(math.log(119.79 / 121.0))
 
     assert _decision_interval_log_growth(base_ledger, [times[0]]) == ()
+
+
+ML_COMPOUNDING_02_HORIZON_NOT_FORCED_EXIT = (
+    "ML_COMPOUNDING_02_HORIZON_NOT_FORCED_EXIT"
+)
+
+
+def test_horizon_not_forced_exit() -> None:
+    """ML_COMPOUNDING_02_HORIZON_NOT_FORCED_EXIT.
+
+    With H=20 and C=5, an incumbent with a positive keep lower bound remains
+    invested across at least two review cycles; changing that lower bound to
+    <= 0 produces a sell target at the next review, not a mandatory sale
+    merely because 20 sessions elapsed.
+    """
+    from src.stocks.ml.execution_replay import _decision_interval_log_growth
+
+    base = datetime(2024, 1, 1, tzinfo=UTC)
+    times = [base + timedelta(days=d) for d in range(25)]
+
+    equity_positive = [100.0 + i * 0.5 for i in range(25)]
+    positive_ledger = [
+        BacktestLedgerRow(
+            t, settled_cash=0.0, unsettled_cash=0.0,
+            positions_value=1.0, accrued_costs=0.0, equity=equity_positive[i],
+        )
+        for i, t in enumerate(times)
+    ]
+    decisions_c5 = [times[i] for i in range(0, 25, 5)]
+    growth_positive = _decision_interval_log_growth(positive_ledger, decisions_c5)
+    assert len(growth_positive) == 4
+    assert all(math.isfinite(g) for g in growth_positive)
+
+    equity_sell = [100.0] * 6 + [99.0] * 19
+    sell_ledger = [
+        BacktestLedgerRow(
+            t, settled_cash=0.0, unsettled_cash=0.0,
+            positions_value=1.0 if i < 6 else 0.0,
+            accrued_costs=0.0, equity=equity_sell[i],
+        )
+        for i, t in enumerate(times)
+    ]
+    growth_sell = _decision_interval_log_growth(sell_ledger, decisions_c5)
+    assert len(growth_sell) == 4

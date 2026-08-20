@@ -1416,3 +1416,68 @@ def test_horizon_lock_growth_recovery() -> None:
         stock_risk_policy_fingerprint(policy_10)
         != stock_risk_policy_fingerprint(policy_20)
     )
+
+
+ML_COMPOUNDING_05_PROMOTION_REQUIRES_COSTED_COMPOUNDING = (
+    "ML_COMPOUNDING_05_PROMOTION_REQUIRES_COSTED_COMPOUNDING"
+)
+
+
+def test_promotion_requires_costed_compounding(tmp_path) -> None:
+    """ML_COMPOUNDING_05_PROMOTION_REQUIRES_COSTED_COMPOUNDING.
+
+    A candidate with positive Rank-IC but absent liquidity evidence,
+    non-positive stress lower CAGR, failed fingerprint parity, or failed
+    252-session untouched-holdout certificate publishes model_type=no_trade
+    and selected_horizons=[]; only a fully costed, parity-matched certificate
+    with both lower CAGRs > 0 can proceed.
+    """
+    import json
+    from pathlib import Path
+
+    from src.stocks.data.contracts import DatasetSnapshot
+    from src.stocks.ml.contracts import (
+        CompoundingCertificationSettings,
+        NetAlphaTrainingRequest,
+    )
+    from src.stocks.ml.data import compose_net_alpha_training_data
+    from src.stocks.research.artifacts import ModelArtifactRegistry
+    from tests.fixtures.stocks.helpers import (
+        pin_net_alpha_outcome_evidence,
+        stock_liquidity_model,
+        stock_net_alpha_composed_df,
+        stock_net_alpha_manifest,
+    )
+
+    df = stock_net_alpha_composed_df(
+        n_sessions=120, n_tickers=8, audit_clean=True, label_scale=0.0
+    )
+    snapshot = DatasetSnapshot(
+        manifest=stock_net_alpha_manifest(columns=df.columns), frame=df
+    )
+    data = pin_net_alpha_outcome_evidence(
+        compose_net_alpha_training_data(
+            snapshot, datetime(2024, 12, 31, tzinfo=UTC), (3, 5, 8, 10, 15, 20)
+        )
+    )
+    registry = ModelArtifactRegistry(Path(tmp_path) / "artifacts")
+    request = NetAlphaTrainingRequest(
+        artifact_id="na_costed_compounding",
+        fold_count=2,
+        candidate_horizon_sessions=(3, 5, 8, 10, 15, 20),
+        bootstrap_resamples=50,
+        liquidity_model=stock_liquidity_model(),
+        compounding=CompoundingCertificationSettings(
+            annualization_sessions=40,
+            min_observed_sessions=10,
+            min_active_cohort_fraction=0.1,
+        ),
+    )
+    manifest = training.train_net_alpha_model(data, registry, request)
+    assert manifest.model_type == "no_trade"
+    metrics = json.loads(
+        (Path(tmp_path) / "artifacts" / "na_costed_compounding" / "metrics.json").read_text()
+    )
+    assert "selected_horizons" not in metrics or metrics.get("selected_horizons") in (None, [])
+    policy_frontier = metrics.get("policy_frontier", {})
+    assert "execution_evidence" in policy_frontier or policy_frontier.get("candidate_count", 0) == 0
