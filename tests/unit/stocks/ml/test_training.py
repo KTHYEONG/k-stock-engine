@@ -18,6 +18,20 @@ from src.stocks.trading.portfolio_constructor import stock_risk_policy_fingerpri
 from src.stocks.ml.training import _build_horizon_evidence, _evaluate_forward_holdout
 
 
+def test_sparse_shadow_calendar_is_rebalance_bound() -> None:
+    """SPARSE_GROWTH_05_OOF_SHADOW_CALENDAR: shadow uses the frozen cadence."""
+    from src.stocks.trading.rebalance_schedule import rebalance_session_indices
+
+    sessions = tuple(
+        datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=index)
+        for index in range(12)
+    )
+    indices = rebalance_session_indices(
+        list(sessions), sessions[0], sessions[-1], 5, legacy_daily=False
+    )
+    assert indices == (0, 5, 10)
+
+
 def test_horizon_evidence_has_no_proxy_score() -> None:
     assert "_proxy_scores" not in _build_horizon_evidence.__code__.co_names
 
@@ -1220,13 +1234,13 @@ def test_training_artifact_marks_economic_rank_v2() -> None:
     policy = training._risk_policy_for_profile(request, profile, horizon)
     assert policy.economic_ranking_mode == "economic_net_v1"
     assert policy.compounding.forecast_horizon_sessions == horizon
-    assert policy.execution_utility_mode == "delta_cost_aware_v1"
+    assert policy.execution_utility_mode == "sparse_hold_replace_v2"
 
     params_json = training._policy_profile_params(request, profile, horizon)
     params = json.loads(params_json)
     assert params["economic_ranking_mode"] == "economic_net_v1"
-    assert params["execution_evidence_version"] == "prepared-equity-v4-delta-cost-aware"
-    assert params["execution_utility_mode"] == "delta_cost_aware_v1"
+    assert params["execution_evidence_version"] == "prepared-equity-v5-sparse-growth"
+    assert params["execution_utility_mode"] == "sparse_hold_replace_v2"
     assert params["forecast_horizon_sessions"] == horizon
 
     from src.stocks.trading.portfolio_constructor import (
