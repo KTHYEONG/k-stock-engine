@@ -11,6 +11,7 @@ from src.stocks.ml.features import (
     apply_model_feature_schema,
     build_model_features,
     feature_transform_schema_from_manifest,
+    materialize_model_feature_sources,
     stock_net_alpha_v1_roles,
 )
 from src.stocks.research.artifacts import ModelArtifactRegistry, PredictionRequest
@@ -56,8 +57,12 @@ def score_model(
     if manifest.feature_set == CANONICAL_FEATURE_SET:
         schema = _frozen_net_alpha_schema(loaded.manifest)
         if schema is not None:
+            gated = materialize_model_feature_sources(gated, schema.source_order)
             feature_frame = apply_model_feature_schema(gated, schema)
         else:
+            gated = materialize_model_feature_sources(
+                gated, list(stock_net_alpha_v1_roles())
+            )
             feature_frame, _model_columns = build_model_features(
                 gated, stock_net_alpha_v1_roles()
             )
