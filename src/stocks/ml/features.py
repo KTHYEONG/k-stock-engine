@@ -22,7 +22,7 @@ learner matrix or schema fingerprint.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 
@@ -405,6 +405,68 @@ def build_model_features(
     if missing:
         raise ValueError(f"model feature columns missing from transformed frame: {missing}")
     return transformed, schema.learner_columns
+
+
+_FEATURE_SOURCE_PREFIX = "feature__"
+
+
+def materialize_model_feature_sources(
+    frame: pl.DataFrame,
+    source_order: Sequence[str],
+) -> pl.DataFrame:
+    """Resolve every declared source to exactly one of ``source`` or ``feature__source``.
+
+    Each canonical ``source`` in ``source_order`` must materialize from exactly one
+    of the unprefixed column ``source`` or the prefixed ``feature__source``:
+
+    * both present -> their non-null values must be exactly equal; otherwise the
+      frame fails closed before any score/prediction (a schema mismatch),
+    * only the unprefixed column present -> kept as-is,
+    * only the prefixed column present -> renamed to the canonical ``source``,
+    * neither present -> ``ValueError`` (missing source),
+
+    Non-finite values on a present source fail closed. The chosen source binding
+    (canonical name or prefixed name) is recorded on the returned frame under the
+    ``_feature_source_binding`` attribute for the artifact lineage payload.
+    """
+    if not source_order:
+        raise ValueError("materialize_model_feature_sources requires a non-empty source_order")
+    result = frame
+    binding: dict[str, str] = {}
+    for source in source_order:
+        canonical = str(source)
+        prefixed = f"{_FEATURE_SOURCE_PREFIX}{source}"
+        has_canonical = canonical in result.columns
+        has_prefixed = prefixed in result.columns
+        if has_canonical and has_prefixed:
+            conflict = result.filter(
+                pl.col(canonical).is_not_null() & pl.col(prefixed).is_not_null()
+                & (pl.col(canonical) != pl.col(prefixed))
+            )
+            if not conflict.is_empty():
+                raise ValueError(
+                    f"feature source {source!r} conflict between {canonical!r} "
+                    f"and {prefixed!r}; a v7 artifact must resolve exactly one binding"
+                )
+            result = result.drop(prefixed)
+            binding[source] = canonical
+        elif has_canonical:
+            binding[source] = canonical
+        elif has_prefixed:
+            result = result.rename({prefixed: canonical})
+            binding[source] = prefixed
+        else:
+            raise ValueError(
+                f"feature sources missing from frame: {source!r} "
+                f"(neither {canonical!r} nor {prefixed!r} present)"
+            )
+        non_finite = result.filter(
+            pl.col(canonical).is_not_null() & ~pl.col(canonical).is_finite()
+        )
+        if not non_finite.is_empty():
+            raise ValueError(f"non-finite value in feature source {canonical!r}")
+    object.__setattr__(result, "_feature_source_binding", dict(binding))
+    return result
 
 
 def feature_transform_schema_from_manifest(

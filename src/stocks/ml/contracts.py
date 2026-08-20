@@ -95,7 +95,7 @@ class PolicyProfile:
     no_trade_band_bps: float = 0.0
     growth_risk_aversion: float = 1.0
     execution_utility_mode: Literal["legacy_target_interpolation_v1", "delta_cost_aware_v1", "sparse_hold_replace_v2"] = "delta_cost_aware_v1"
-    sizing_mode: Literal["alpha_vol_squared_v1", "risk_balanced_waterfill_v2"] = "alpha_vol_squared_v1"
+    sizing_mode: Literal["alpha_vol_squared_v1", "risk_balanced_waterfill_v2", "confidence_mean_variance_v1"] = "alpha_vol_squared_v1"
 
     def __post_init__(self) -> None:
         if not self.profile_id:
@@ -117,10 +117,12 @@ class PolicyProfile:
         if self.sizing_mode not in (
             "alpha_vol_squared_v1",
             "risk_balanced_waterfill_v2",
+            "confidence_mean_variance_v1",
         ):
             raise ValueError(
-                f"sizing_mode must be 'alpha_vol_squared_v1' or "
-                f"'risk_balanced_waterfill_v2', got {self.sizing_mode!r}"
+                f"sizing_mode must be 'alpha_vol_squared_v1', "
+                f"'risk_balanced_waterfill_v2', or "
+                f"'confidence_mean_variance_v1', got {self.sizing_mode!r}"
             )
 
 
