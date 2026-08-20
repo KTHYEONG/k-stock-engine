@@ -280,6 +280,7 @@ def test_identical_scores_produce_identical_schedule_across_horizons() -> None:
 
 
 DELTA_COST_UTILITY_05 = "DELTA_COST_UTILITY_05_REPLAY_TELEMETRY"
+SPARSE_GROWTH_V5_07_REPLAY_TELEMETRY = "SPARSE_GROWTH_V5_07_REPLAY_TELEMETRY"
 
 
 def test_delta_cost_utility_05_replay_telemetry() -> None:
