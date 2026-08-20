@@ -65,6 +65,7 @@ from src.stocks.ml.execution_replay import (
     replay_execution_equivalent,
 )
 from src.stocks.ml.features import (
+    FeatureTransformSchema,
     apply_model_feature_schema,
     fit_model_feature_schema,
     stock_net_alpha_v1_contract_book,
@@ -458,6 +459,7 @@ def train_net_alpha_model(
             holdout=holdout,
             folds=folds,
             learner_columns=learner_columns,
+            schema=schema,
             telemetry=telemetry,
             schema_hash=schema_hash,
             universe_policy_hash=universe_policy_hash,
@@ -477,6 +479,7 @@ def _select_publish_and_promote(
     holdout: pl.DataFrame,
     folds: list[Fold],
     learner_columns: tuple[str, ...],
+    schema: FeatureTransformSchema,
     telemetry: TrainingTelemetry,
     schema_hash: str,
     universe_policy_hash: str,
@@ -730,6 +733,18 @@ def _select_publish_and_promote(
             params={
                 **dict(manifest.params or {}),
                 "policy_profile": _policy_profile_params(request, profile, primary),
+                "holm_gate_version": "v6",
+                "selected_horizon_sessions": str(int(primary)),
+                "raw_feature_schema_hash": schema_hash,
+                "feature_content_hash": data.manifest.content_hash or universe_policy_hash,
+                "feature_transform_schema": json.dumps(schema.to_json()),
+                "feature_transform_fingerprint": schema.fingerprint,
+                "policy_fingerprint": policy_portfolio_fingerprint(
+                    request.portfolio.top_k,
+                    request.portfolio.max_single_weight,
+                    request.portfolio.max_exposure,
+                    request.portfolio.participation_limit,
+                ),
             },
         )
     registry.publish(model, manifest)
@@ -1328,7 +1343,10 @@ def _evidence_from_execution(
     growth_count = len(base_evidence.base_log_growth)
     if growth_count == 0:
         raise ValueError("execution replay produced no evaluated sessions")
-    active = round(base_evidence.planned_cycles * (1.0 - base_evidence.cash_session_fraction))
+    # Exposure-based active cohort: complete return intervals with a positive
+    # prior ledger positions_value (a held position), not filled-order counts.
+    active = base_evidence.invested_interval_count
+    observed = base_evidence.observed_interval_count
     return HorizonOOFEvidence(
         horizon_sessions=horizon_sessions,
         profile_id=profile_id,
@@ -1336,7 +1354,7 @@ def _evidence_from_execution(
         base_log_growth=base_evidence.base_log_growth,
         stress_log_growth=stress_evidence.stress_log_growth,
         cohort_segment_ids=base_evidence.segment_ids,
-        complete_cohort_count=growth_count,
+        complete_cohort_count=observed,
         active_cohort_count=active,
         partial_cohort_count=0,
         missing_cohort_count=0,
@@ -1462,6 +1480,18 @@ def _build_horizon_evidence(
     """
     if oof_cache is None:
         oof_cache = _OofCache(_default_oof_cache_base())
+    missing_horizons = [
+        h
+        for h in sorted(request.candidate_horizon_sessions)
+        if h not in data.labels_by_horizon
+    ]
+    if missing_horizons:
+        raise ValueError(
+            f"requested horizon(s) {missing_horizons} have no label data; "
+            "every requested candidate horizon must be present in the selected "
+            "labels (a missing requested horizon is a deterministic error, not a "
+            "silent fallback)"
+        )
     evidence: list[HorizonOOFEvidence] = []
     diagnostics: list[HorizonOOFDiagnostic] = []
     oof_by_horizon: dict[int, tuple[Path, Path, list[float]]] = {}
@@ -1608,6 +1638,11 @@ def _build_horizon_evidence(
                 if not base_evidence.base_log_growth:
                     dropout_reasons[(horizon, profile.profile_id)] = (
                         "no-evaluated-vintages"
+                    )
+                    continue
+                if base_evidence.filled_orders == 0:
+                    dropout_reasons[(horizon, profile.profile_id)] = (
+                        "no-filled-orders"
                     )
                     continue
                 stress_evidence = base_evidence

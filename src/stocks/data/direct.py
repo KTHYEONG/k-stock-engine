@@ -18,6 +18,7 @@ from pathlib import Path
 
 import polars as pl
 
+from src.core.datasets import DatasetManifest
 from src.stocks.ml.contracts import CANONICAL_FEATURE_SET
 from src.storage.parquet_datasets import ParquetDatasetStore
 
@@ -48,11 +49,18 @@ class MlMarketData:
 
     Carries the feature frame (one row per ``(instrument_id, session)``),
     per-horizon label frames, and explicit input identifiers for provenance.
+    ``feature_manifest`` is the immutable schema/identity of the selected feature
+    dataset so a training manifest can bind its ``feature_schema_hash`` to the
+    exact feature dataset that produced the model matrix, and
+    ``input_content_hashes`` preserves the raw feature/content identity of every
+    input dataset for certified replay and fail-closed schema/lineage checks.
     """
 
     frame: pl.DataFrame
     labels_by_horizon: Mapping[int, pl.DataFrame]
     input_ids: Mapping[str, str] = field(default_factory=dict)
+    feature_manifest: DatasetManifest | None = None
+    input_content_hashes: Mapping[str, str] = field(default_factory=dict)
 
 
 class DirectMarketDataLoader:
@@ -101,12 +109,39 @@ class DirectMarketDataLoader:
             "feature_dataset_id": request.feature_dataset_id,
             "label_dataset_id": request.label_dataset_id,
         }
+        feature_manifest = self._read_feature_manifest(request)
+        input_content_hashes = {
+            "base_dataset_id": request.base_dataset_id,
+            "feature_dataset_id": request.feature_dataset_id,
+            "label_dataset_id": request.label_dataset_id,
+        }
+        if feature_manifest is not None:
+            input_content_hashes["feature_content_hash"] = (
+                feature_manifest.content_hash or feature_manifest.schema_hash
+            )
+            input_content_hashes["feature_schema_hash"] = feature_manifest.schema_hash
 
         return MlMarketData(
             frame=composed,
             labels_by_horizon=labels_by_horizon,
             input_ids=input_ids,
+            feature_manifest=feature_manifest,
+            input_content_hashes=input_content_hashes,
         )
+
+    def _read_feature_manifest(
+        self, request: DirectDataRequest
+    ) -> DatasetManifest | None:
+        """Read the immutable feature dataset manifest, or ``None`` if absent.
+
+        A missing feature manifest is not a loader failure: the training CLI
+        treats it as a fail-closed schema-parity gap rather than fabricating a
+        hash.
+        """
+        try:
+            return self._feature_store.read_manifest(request.feature_dataset_id)
+        except FileNotFoundError:
+            return None
 
     def _read_base(self, request: DirectDataRequest) -> pl.DataFrame:
         """Read base dataset with bounded session range."""
