@@ -13,11 +13,21 @@ from src.core.datasets import DatasetManifest
 from src.core.instruments import AssetKind, Instrument
 from src.core.portfolio import PortfolioSnapshot
 from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
+from src.stocks.backtesting.engine import BacktestLedgerRow
+from src.stocks.ml.contracts import (
+    CompoundingCertificationSettings,
+    NetAlphaTrainingRequest,
+)
 from src.stocks.ml.execution_replay import (
     ExecutionEquivalentReplayRequest,
     ExecutionReplayContext,
     ExecutionReplayEvidence,
+    _ledger_growth_and_exposure,
     replay_execution_equivalent,
+)
+from src.stocks.ml.training import (
+    _coverage_failure_reason,
+    _evidence_from_execution,
 )
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.trading.portfolio_constructor import StockRiskPolicy
@@ -68,6 +78,10 @@ def test_sparse_telemetry_projection_is_bounded() -> None:
         filled_orders=1,
         cash_session_fraction=0.0,
         turnover=0.1,
+        observed_interval_count=1,
+        invested_interval_count=1,
+        invested_interval_fraction=1.0,
+        filled_cycle_count=1,
         unfilled_order_reason_counts=(),
         action_diagnostics=(("replacement_count", 1), ("turnover_ratio", 0.5)),
     )
@@ -76,6 +90,9 @@ def test_sparse_telemetry_projection_is_bounded() -> None:
         "replacement_count": 1,
         "turnover_ratio": 0.5,
     }
+    assert diagnostics["invested_interval_fraction"] == 1.0
+    assert diagnostics["invested_interval_count"] == 1
+    assert diagnostics["filled_cycle_count"] == 1
 
 
 def _score_frame(
@@ -374,3 +391,96 @@ def test_delta_cost_utility_05_replay_telemetry() -> None:
     assert len(evidence.base_log_growth) == len(evidence.stress_log_growth)
     assert all(np.isfinite(g) for g in evidence.base_log_growth)
     assert all(np.isfinite(g) for g in evidence.stress_log_growth)
+
+
+def _ledger_rows(positions_flags: list[float]) -> tuple[BacktestLedgerRow, ...]:
+    rows: list[BacktestLedgerRow] = []
+    equity = 100.0
+    for index, flag in enumerate(positions_flags):
+        equity += 1.0
+        rows.append(
+            BacktestLedgerRow(
+                session=datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=index),
+                settled_cash=50.0,
+                unsettled_cash=0.0,
+                positions_value=flag,
+                accrued_costs=0.0,
+                equity=equity,
+            )
+        )
+    return tuple(rows)
+
+
+def _v6_request() -> NetAlphaTrainingRequest:
+    return NetAlphaTrainingRequest(
+        artifact_id="exposure_test",
+        candidate_horizon_sessions=(10,),
+        compounding=CompoundingCertificationSettings(
+            min_active_cohort_fraction=0.2,
+            min_observed_sessions=1,
+            bootstrap_alpha=0.05,
+            bootstrap_resamples=50,
+        ),
+    )
+
+
+def test_sparse_growth_v6_exposure_coverage() -> None:
+    """SPARSE_GROWTH_V6_EXPOSURE_COVERAGE.
+
+    Five complete intervals with a positive prior positions_value (a held
+    position) report invested_interval_count == 5 and
+    invested_interval_fraction == 1.0; a held-but-unfilled candidate still
+    clears the exposure coverage gate. Five zero-position intervals report
+    invested_interval_count == 0 and the candidate is rejected.
+    """
+    invested_ledger = _ledger_rows([1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+    growth, invested = _ledger_growth_and_exposure(invested_ledger)
+    assert len(growth) == 5
+    assert invested == 5
+
+    base_evidence = ExecutionReplayEvidence(
+        base_log_growth=growth,
+        stress_log_growth=growth,
+        segment_ids=(0,) * len(growth),
+        planned_cycles=1,
+        filled_orders=1,
+        cash_session_fraction=0.0,
+        turnover=0.1,
+        observed_interval_count=len(growth),
+        invested_interval_count=invested,
+        invested_interval_fraction=invested / len(growth),
+        filled_cycle_count=1,
+        unfilled_order_reason_counts=(),
+    )
+    assert base_evidence.invested_interval_count == 5
+    assert base_evidence.invested_interval_fraction == 1.0
+
+    candidate = _evidence_from_execution(
+        10, "lower_bound_only", "net_alpha_elastic_net",
+        base_evidence, base_evidence, (0.1, 0.2, 0.3), 1,
+    )
+    assert _coverage_failure_reason(candidate, _v6_request()) == ""
+
+    zero_ledger = _ledger_rows([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    zero_growth, zero_invested = _ledger_growth_and_exposure(zero_ledger)
+    assert zero_invested == 0
+    zero_evidence = ExecutionReplayEvidence(
+        base_log_growth=zero_growth,
+        stress_log_growth=zero_growth,
+        segment_ids=(0,) * len(zero_growth),
+        planned_cycles=1,
+        filled_orders=1,
+        cash_session_fraction=0.0,
+        turnover=0.1,
+        observed_interval_count=len(zero_growth),
+        invested_interval_count=zero_invested,
+        invested_interval_fraction=0.0,
+        filled_cycle_count=1,
+        unfilled_order_reason_counts=(),
+    )
+    zero_candidate = _evidence_from_execution(
+        10, "lower_bound_only", "net_alpha_elastic_net",
+        zero_evidence, zero_evidence, (0.1, 0.2, 0.3), 1,
+    )
+    reason = _coverage_failure_reason(zero_candidate, _v6_request())
+    assert "active-coverage-insufficient" in reason

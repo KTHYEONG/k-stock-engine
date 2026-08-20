@@ -431,24 +431,22 @@ def select_horizons(
     admissible: list[HorizonOOFEvidence] = []
     for candidate in ordered:
         key = _frontier_key(candidate.horizon_sessions, candidate.profile_id)
-        threshold = base_thresholds[key]
+        base_threshold = base_thresholds[key]
+        stress_threshold = stress_thresholds[key]
+        paired_threshold = paired_thresholds.get(key, stress_threshold)
         base = bootstrap[key]["base"]
         stress = bootstrap[key]["stress"]
-        base_lower = 0.0
-        stress_lower = 0.0
-        if base is not None:
-            base_lower = base.lower_mean(threshold)
-        if stress is not None:
-            stress_lower = stress.lower_mean(threshold)
+        base_lower = base.lower_mean(base_threshold) if base is not None else 0.0
+        stress_lower = stress.lower_mean(stress_threshold) if stress is not None else 0.0
         adjusted_lower_growth[key] = {
             "base": base_lower,
             "stress": stress_lower,
         }
         paired_lower = 0.0
-        paired_threshold = paired_thresholds.get(key, threshold)
-        if "paired" in bootstrap[key]:
+        has_paired = "paired" in bootstrap[key]
+        if has_paired:
             paired_boot = bootstrap[key]["paired"]
-            paired_lower = paired_boot.lower_mean(threshold) if paired_boot is not None else 0.0
+            paired_lower = paired_boot.lower_mean(paired_threshold) if paired_boot is not None else 0.0
             paired_lower_bounds[key] = paired_lower
             paired_p_values[key] = paired_boot.p_value if paired_boot is not None else 1.0
             paired_holm_thresholds[key] = paired_threshold
@@ -456,14 +454,26 @@ def select_horizons(
         shadow_turnover[key] = float(candidate.shadow_turnover)
         ratio = float(candidate.sparse_turnover) / sh_turnover
         turnover_ratio[key] = ratio
-        has_paired = "paired" in bootstrap[key]
-        paired_ok = (paired_lower > 0.0) if has_paired else True
-        if (
-            base_lower > 0.0
+        base_p = base.p_value if base is not None else 1.0
+        stress_p = stress.p_value if stress is not None else 1.0
+        paired_boot = bootstrap[key].get("paired") if has_paired else None
+        paired_p = paired_boot.p_value if paired_boot is not None else 1.0
+        base_ok = (
+            base is not None
+            and base_p <= base_threshold
+            and base_lower > 0.0
+        )
+        stress_ok = (
+            stress is not None
+            and stress_p <= stress_threshold
             and stress_lower > 0.0
-            and paired_ok
-            and ratio <= 0.60
-        ):
+        )
+        paired_ok = (
+            (paired_lower > 0.0 and paired_p <= paired_threshold)
+            if has_paired
+            else True
+        )
+        if base_ok and stress_ok and paired_ok and ratio <= 0.60:
             admissible.append(candidate)
             reasons.append(
                 f"h{candidate.horizon_sessions}:{candidate.profile_id} "
@@ -474,7 +484,8 @@ def select_horizons(
             reasons.append(
                 f"h{candidate.horizon_sessions}:{candidate.profile_id} "
                 f"rejected base={base_lower:.6g} stress={stress_lower:.6g} "
-                f"paired={paired_lower:.6g} turnover_ratio={ratio:.6g}"
+                f"paired={paired_lower:.6g} turnover_ratio={ratio:.6g} "
+                f"base_p={base_p:.6g} stress_p={stress_p:.6g}"
             )
 
     primary_horizon: int | None = None

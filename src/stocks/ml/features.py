@@ -37,6 +37,7 @@ from src.stocks.research.features import (
     _reject_target_columns,
     _validate_v3_roles,
 )
+from src.stocks.research.models import ModelManifest
 
 STOCK_NET_ALPHA_V1_FEATURE_SET = "stock_net_alpha_v1"
 
@@ -159,6 +160,73 @@ class FeatureTransformSchema:
             "session_column": self.session_column,
             "sector_column": self.sector_column,
         }
+
+    @classmethod
+    def from_json(cls, payload: Mapping[str, object]) -> FeatureTransformSchema:
+        """Strict deserialize from a frozen ``to_json`` payload.
+
+        Any missing, misshapen, or non-list field, or a learner-column order
+        that disagrees with ``source_order``/``representative_sources``, raises
+        ``ValueError`` so a corrupt or partial schema payload can never silently
+        drive a model matrix. The fingerprint is always recomputed from the
+        parsed decisions and is never trusted from the payload.
+        """
+
+        def as_tuple(value: object, name: str) -> tuple[str, ...]:
+            if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+                raise ValueError(f"feature transform schema {name} must be a string list")
+            return tuple(value)
+
+        for required in (
+            "representative_sources",
+            "missing_sources",
+            "source_order",
+            "learner_columns",
+            "session_column",
+            "sector_column",
+        ):
+            if required not in payload:
+                raise ValueError(f"feature transform schema missing field {required!r}")
+        representative = as_tuple(payload["representative_sources"], "representative_sources")
+        missing = as_tuple(payload["missing_sources"], "missing_sources")
+        source_order = as_tuple(payload["source_order"], "source_order")
+        learner_columns = as_tuple(payload["learner_columns"], "learner_columns")
+        session_column = payload["session_column"]
+        sector_column = payload["sector_column"]
+        if not isinstance(session_column, str) or not session_column:
+            raise ValueError("feature transform schema session_column must be a non-empty string")
+        if not isinstance(sector_column, str) or not sector_column:
+            raise ValueError("feature transform schema sector_column must be a non-empty string")
+        for source in representative:
+            if source not in source_order:
+                raise ValueError(
+                    f"representative source {source!r} missing from source_order"
+                )
+        parsed = FeatureTransformSchema(
+            representative_sources=representative,
+            missing_sources=missing,
+            source_order=source_order,
+            learner_columns=learner_columns,
+            session_column=session_column,
+            sector_column=sector_column,
+            fingerprint="",
+        )
+        fingerprint = _schema_fingerprint(parsed)
+        stored = payload.get("fingerprint")
+        if stored is not None and str(stored) != fingerprint:
+            raise ValueError(
+                "feature transform schema fingerprint mismatch: "
+                f"payload {stored!r} != recomputed {fingerprint!r}"
+            )
+        return FeatureTransformSchema(
+            representative_sources=representative,
+            missing_sources=missing,
+            source_order=source_order,
+            learner_columns=learner_columns,
+            session_column=session_column,
+            sector_column=sector_column,
+            fingerprint=fingerprint,
+        )
 
 
 def _schema_fingerprint(schema: FeatureTransformSchema) -> str:
@@ -337,3 +405,39 @@ def build_model_features(
     if missing:
         raise ValueError(f"model feature columns missing from transformed frame: {missing}")
     return transformed, schema.learner_columns
+
+
+def feature_transform_schema_from_manifest(
+    manifest: ModelManifest,
+) -> FeatureTransformSchema:
+    """Load the frozen feature-transform schema persisted on an artifact manifest.
+
+    The canonical production schema is stored under ``params.feature_transform_schema``
+    as the strict ``FeatureTransformSchema.to_json`` payload. A missing payload, a
+    non-string payload, or a JSON parse/validation/fingerprint failure raises
+    ``ValueError`` so scoring and certified backtests never silently re-fit a
+    schema from the current frame. The fingerprint is always recomputed and
+    compared against the stored value; a mismatch fails closed.
+    """
+    params = manifest.params or {}
+    payload = params.get("feature_transform_schema")
+    if payload is None:
+        raise ValueError(
+            f"artifact {manifest.artifact_id!r} carries no frozen "
+            "feature_transform_schema; scoring a v6 artifact requires the "
+            "persisted transform contract"
+        )
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"artifact {manifest.artifact_id!r} feature_transform_schema is "
+                f"malformed JSON: {exc}"
+            ) from exc
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"artifact {manifest.artifact_id!r} feature_transform_schema must be "
+            "a JSON object"
+        )
+    return FeatureTransformSchema.from_json(payload)
