@@ -58,6 +58,26 @@ def _market_frame(
     return pl.DataFrame(rows)
 
 
+def test_sparse_telemetry_projection_is_bounded() -> None:
+    """SPARSE_GROWTH_06_BOUNDED_TELEMETRY_AND_ARTIFACT_PARITY."""
+    evidence = ExecutionReplayEvidence(
+        base_log_growth=(0.001,),
+        stress_log_growth=(0.0005,),
+        segment_ids=(0,),
+        planned_cycles=1,
+        filled_orders=1,
+        cash_session_fraction=0.0,
+        turnover=0.1,
+        unfilled_order_reason_counts=(),
+        action_diagnostics=(("replacement_count", 1), ("turnover_ratio", 0.5)),
+    )
+    diagnostics = evidence.diagnostics()
+    assert diagnostics["action_diagnostics"] == {
+        "replacement_count": 1,
+        "turnover_ratio": 0.5,
+    }
+
+
 def _score_frame(
     n_segments: int = 2, sessions_per_segment: int = 12, n_tickers: int = 3
 ) -> pl.DataFrame:
