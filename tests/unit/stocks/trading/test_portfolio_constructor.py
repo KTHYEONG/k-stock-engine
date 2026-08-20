@@ -2162,3 +2162,75 @@ class TestExecutionReplayEvidenceActionDiagnostics:
         )
         diag = evidence.diagnostics()
         assert diag["action_diagnostics"] == {}
+
+
+def test_active_cap_growth_recovery() -> None:
+    """GROWTH_RECOVERY_ACTIVE_CAP_02.
+
+    With 20 retained incumbents and 20 positive challengers under top_k=20, the
+    sparse-hold/replace active set never exceeds the cap and never appends an
+    initial entry when no slot is free.
+    """
+    from src.stocks.trading.portfolio_constructor import (
+        EconomicTransitionInputs,
+        _select_sparse_hold_replace_active_set,
+    )
+
+    incumbents = [f"KRX:{i:06d}" for i in range(20)]
+    challengers = [f"KRX:{i:06d}" for i in range(20, 40)]
+    economics = EconomicTransitionInputs(
+        gross_lower_alpha=dict.fromkeys(incumbents + challengers, 0.01),
+        net_lower_alpha=dict.fromkeys(incumbents + challengers, 0.01),
+        entry_cost=dict.fromkeys(incumbents + challengers, 0.0001),
+        exit_cost=dict.fromkeys(incumbents + challengers, 0.0001),
+    )
+    plan = _select_sparse_hold_replace_active_set(
+        dict.fromkeys(incumbents, 0.04),
+        challengers,
+        economics,
+        top_k=20,
+        enter_rank=15,
+        band_rate=0.0,
+    )
+    total = len(plan.retained) + len(plan.initial_entries) + len(plan.replacements)
+    assert total <= 20
+    assert len(plan.initial_entries) == 0
+
+
+def test_utility_cash_growth_recovery() -> None:
+    """GROWTH_RECOVERY_UTILITY_CASH_04.
+
+    The confidence mean-variance optimizer returns all-zeros when every net
+    utility is non-positive, and otherwise emits finite, non-negative weights
+    within gross/single caps that strictly favor a higher net lower-bound alpha
+    when covariance is equal.
+    """
+    from src.stocks.trading.portfolio_constructor import (
+        _confidence_mean_variance_weights,
+    )
+
+    policy = StockRiskPolicy(
+        top_k=5,
+        gross_cap=0.9,
+        single_name_cap=0.8,
+        sector_cap=0.9,
+        rebalance_frequency_sessions=10,
+        compounding=CompoundingPolicyConfig(growth_risk_aversion=2.0, forecast_horizon_sessions=10),
+    )
+    ids = ["A", "B", "C"]
+    sector_of = {"A": "S1", "B": "S2", "C": "S3"}
+    cov = np.eye(3) * 0.0001
+
+    weights = _confidence_mean_variance_weights(
+        ids, dict.fromkeys(ids, -0.01), cov, sector_of, policy
+    )
+    assert all(v == 0.0 for v in weights.values())
+
+    weights = _confidence_mean_variance_weights(
+        ids, {"A": 0.02, "B": 0.01, "C": 0.005}, cov, sector_of, policy
+    )
+    assert all(v >= 0.0 for v in weights.values())
+    assert all(math.isfinite(v) for v in weights.values())
+    assert sum(weights.values()) <= policy.gross_cap + 1e-8
+    assert all(v <= policy.single_name_cap + 1e-8 for v in weights.values())
+    assert weights["A"] > weights["B"] > weights["C"]
