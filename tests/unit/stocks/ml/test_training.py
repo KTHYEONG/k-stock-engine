@@ -1373,3 +1373,46 @@ def test_multi_horizon_v6() -> None:
         _build_horizon_evidence(
             pl.DataFrame(), [], _FakeData(), request, ()
         )
+
+
+def test_horizon_lock_growth_recovery() -> None:
+    """GROWTH_RECOVERY_HORIZON_LOCK_03.
+
+    The v7 risk policy locks the rebalance cadence to the forecast horizon:
+    h=10 and h=20 rebuild distinct policies whose rebalance frequency matches
+    the horizon, whose effective active count is ceil(gross/single) with a
+    candidate pool of twice that, and whose fingerprints diverge.
+    """
+    from src.stocks.ml.contracts import PolicyProfile
+    import math
+
+    profile = PolicyProfile(
+        profile_id="lower_bound_only",
+        no_trade_band_bps=0.0,
+        growth_risk_aversion=1.0,
+        sizing_mode="confidence_mean_variance_v1",
+    )
+    request = training.NetAlphaTrainingRequest(artifact_id="x")
+
+    policy_10 = training._risk_policy_for_profile(request, profile, 10)
+    policy_20 = training._risk_policy_for_profile(request, profile, 20)
+
+    assert policy_10.rebalance_frequency_sessions == 10
+    assert policy_20.rebalance_frequency_sessions == 20
+    assert policy_10.compounding.forecast_horizon_sessions == 10
+    assert policy_20.compounding.forecast_horizon_sessions == 20
+    assert policy_10.sizing_mode == "confidence_mean_variance_v1"
+
+    params_10 = json.loads(training._policy_profile_params(request, profile, 10))
+    params_20 = json.loads(training._policy_profile_params(request, profile, 20))
+    assert params_10["effective_active_count"] == math.ceil(
+        request.portfolio.max_exposure / request.portfolio.max_single_weight
+    )
+    assert params_10["candidate_pool_count"] == 2 * params_10["effective_active_count"]
+    assert params_10["rebalance_frequency_sessions"] == 10
+    assert params_20["rebalance_frequency_sessions"] == 20
+
+    assert (
+        stock_risk_policy_fingerprint(policy_10)
+        != stock_risk_policy_fingerprint(policy_20)
+    )
