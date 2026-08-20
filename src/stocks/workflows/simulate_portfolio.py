@@ -330,6 +330,24 @@ def _profile_sizing_mode(
     )
 
 
+def _profile_rebalance_frequency_sessions(profile: dict[str, object]) -> int:
+    """Extract rebalance_frequency_sessions from a policy profile, defaulting to 5.
+
+    v5 artifacts persist the cadence as ``rebalance_frequency_sessions``.
+    Missing values default to 5 for legacy artifacts. Non-integral or
+    non-positive values raise ``ValueError``.
+    """
+    raw = profile.get("rebalance_frequency_sessions")
+    if raw is None:
+        return 5
+    if not isinstance(raw, int) or raw < 1:
+        raise ValueError(
+            "rebalance_frequency_sessions must be a positive integer, "
+            f"got {raw!r}"
+        )
+    return raw
+
+
 def _profile_execution_utility_mode(
     profile: dict[str, object],
 ) -> Literal["legacy_target_interpolation_v1", "delta_cost_aware_v1", "sparse_hold_replace_v2"]:
@@ -392,12 +410,14 @@ def _policy_from_artifact(
     horizon = _profile_forecast_horizon_sessions(profile)
     mode = _profile_execution_utility_mode(profile)
     sizing = _profile_sizing_mode(profile)
+    stored_cadence = _profile_rebalance_frequency_sessions(profile)
     return StockRiskPolicy(
         top_k=cast(int, profile["top_k"]),
         gross_cap=cast(float, profile["max_exposure"]),
         single_name_cap=cast(float, profile["max_single_weight"]),
         participation_limit=cast(float, profile["participation_limit"]),
         no_trade_band_bps=cast(float, profile["no_trade_band_bps"]),
+        rebalance_frequency_sessions=stored_cadence,
         compounding=CompoundingPolicyConfig(
             growth_risk_aversion=aversion,
             forecast_horizon_sessions=horizon,
@@ -600,19 +620,23 @@ def _validate_prepared_equity_policy(
     match the artifact's ``risk_policy_fingerprint`` and
     ``execution_policy_hash``; otherwise the independent backtester could
     silently replay under a different policy than the one that certified the
-    artifact.
+    artifact.  For v5 artifacts, the stored cadence is also reconstructed so
+    that a missing/non-integral/mismatched cadence raises ``ValueError``
+    before replay.
     """
     aversion = _profile_growth_risk_aversion(profile)
     ranking_mode = _profile_economic_ranking_mode(profile)
     horizon = _profile_forecast_horizon_sessions(profile)
     mode = _profile_execution_utility_mode(profile)
     sizing = _profile_sizing_mode(profile)
+    stored_cadence = _profile_rebalance_frequency_sessions(profile)
     policy = StockRiskPolicy(
         top_k=request.top_k,
         gross_cap=request.max_exposure,
         single_name_cap=request.max_single_weight,
         participation_limit=request.participation_limit,
         no_trade_band_bps=artifact_band,
+        rebalance_frequency_sessions=stored_cadence,
         compounding=CompoundingPolicyConfig(
             growth_risk_aversion=aversion,
             forecast_horizon_sessions=horizon,

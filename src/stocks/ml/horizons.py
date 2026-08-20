@@ -58,6 +58,8 @@ class HorizonOOFEvidence:
     missing_cohort_count: int
     segment_count: int
     fold_rank_ics: tuple[float, ...]
+    rebalance_frequency_sessions: int = 5
+    top_k: int = 20
     paired_stress_log_growth: tuple[float, ...] = ()
     sparse_turnover: float = 0.0
     shadow_turnover: float = 0.0
@@ -102,6 +104,10 @@ class HorizonOOFEvidence:
             raise ValueError("model_family must be non-empty")
         if self.blocked_vintage_count < 0:
             raise ValueError("blocked_vintage_count must be non-negative")
+        if self.rebalance_frequency_sessions < 1:
+            raise ValueError("rebalance_frequency_sessions must be a positive session count")
+        if self.top_k < 1:
+            raise ValueError("top_k must be a positive session count")
         seen: set[str] = set()
         for state, count in self.unresolved_outcome_counts:
             if not state:
@@ -134,6 +140,8 @@ class HorizonSelectionEvidence:
     stress_p_values: dict[tuple[int, str], float]
     base_holm_thresholds: dict[tuple[int, str], float]
     stress_holm_thresholds: dict[tuple[int, str], float]
+    primary_rebalance_frequency_sessions: int | None = None
+    primary_top_k: int | None = None
     paired_lower_bounds: dict[tuple[int, str], float] = field(default_factory=dict)
     paired_p_values: dict[tuple[int, str], float] = field(default_factory=dict)
     paired_holm_thresholds: dict[tuple[int, str], float] = field(default_factory=dict)
@@ -165,6 +173,8 @@ class HorizonSelectionEvidence:
         return {
             "primary_horizon_sessions": self.primary_horizon_sessions,
             "primary_profile_id": self.primary_profile_id,
+            "primary_rebalance_frequency_sessions": self.primary_rebalance_frequency_sessions,
+            "primary_top_k": self.primary_top_k,
             "adjusted_lower_growth": {
                 f"{horizon}:{profile}": dict(path)
                 for (horizon, profile), path in sorted(
@@ -345,6 +355,7 @@ def select_horizons(
     seed: int,
     n_bootstrap: int = DEFAULT_BOOTSTRAP_RESAMPLES,
     rebalance_frequency_sessions: int = 1,
+    top_k: int = 20,
 ) -> HorizonSelectionEvidence:
     """Select at most one economically admissible primary ``(horizon, profile)``.
 
@@ -384,6 +395,8 @@ def select_horizons(
         raise ValueError("n_bootstrap must be at least 2")
     if rebalance_frequency_sessions < 1:
         raise ValueError("rebalance_frequency_sessions must be positive")
+    if top_k < 1:
+        raise ValueError("top_k must be positive")
 
     ordered = tuple(
         sorted(evidence, key=lambda candidate: (candidate.horizon_sessions, candidate.profile_id))
@@ -490,12 +503,21 @@ def select_horizons(
 
     primary_horizon: int | None = None
     primary_profile: str | None = None
+    primary_cadence: int | None = None
+    primary_topk: int | None = None
     if admissible:
         primary_horizon, primary_profile = _best_primary(
             admissible, adjusted_lower_growth
         )
+        selected_candidate = next(
+            c for c in admissible
+            if c.horizon_sessions == primary_horizon and c.profile_id == primary_profile
+        )
+        primary_cadence = selected_candidate.rebalance_frequency_sessions
+        primary_topk = selected_candidate.top_k
         reasons.append(
             f"primary=h{primary_horizon}:{primary_profile} "
+            f"c={primary_cadence} k={primary_topk} "
             "(max stress adjusted lower growth)"
         )
     else:
@@ -512,6 +534,8 @@ def select_horizons(
     return HorizonSelectionEvidence(
         primary_horizon_sessions=primary_horizon,
         primary_profile_id=primary_profile,
+        primary_rebalance_frequency_sessions=primary_cadence,
+        primary_top_k=primary_topk,
         adjusted_lower_growth=adjusted_lower_growth,
         base_p_values=base_p_values,
         stress_p_values=stress_p_values,
