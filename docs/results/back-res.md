@@ -1,13 +1,13 @@
 # ML Result Ledger
 
 - Schema version: 1
-- Latest artifact: `net_alpha_horizon_consistent_run_20260818`
+- Latest artifact: `delta_cost_aware_full_20260820`
 - Status: `completed`
-- Finished: 2026-08-18T12:28:53.694385+00:00
+- Finished: 2026-08-20T04:39:29.057506+00:00
 - Latest JSON: `docs/results/ml_runs/latest.json`
 - Recent JSONL: `docs/results/ml_runs/recent.jsonl`
 - Retention: newest 128 records, each <= 24576 bytes
-- Retained: 79 | discarded: 0 | invalid: 0
+- Retained: 81 | discarded: 0 | invalid: 0
 
 ## Latest Backtest & Compounding Performance
 

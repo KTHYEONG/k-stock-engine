@@ -288,7 +288,7 @@
       "tests/unit/stocks/trading/test_portfolio_constructor.py",
       "tests/unit/stocks/workflows/test_execution_matched_replay.py"
     ],
-    "architecture": "docs/results/back-res.md"
+    "architecture": "docs/results/ml_runs/latest.json"
   },
   "src/stocks/trading/simulator.py": {
     "testing": "tests/unit/stocks/trading/test_simulator.py"

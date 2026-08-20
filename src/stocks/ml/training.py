@@ -1169,6 +1169,7 @@ def _risk_policy_for_profile(
             forecast_horizon_sessions=horizon_sessions,
         ),
         economic_ranking_mode="economic_net_v1",
+        execution_utility_mode=profile.execution_utility_mode,
     )
 
 
@@ -2592,6 +2593,11 @@ def _policy_profile_params(
     """JSON projection of the selected immutable policy profile for the manifest."""
     policy = _risk_policy_for_profile(request, profile, horizon_sessions)
     execution_policy = request.execution_policy or SCHEDULED_OPEN_V1
+    evidence_version = (
+        "prepared-equity-v4-delta-cost-aware"
+        if profile.execution_utility_mode == "delta_cost_aware_v1"
+        else "prepared-equity-v3-horizon-consistent"
+    )
     return json.dumps(
         {
             "profile_id": profile.profile_id,
@@ -2608,11 +2614,12 @@ def _policy_profile_params(
                 request.portfolio.max_exposure,
                 request.portfolio.participation_limit,
             ),
-            "execution_evidence_version": "prepared-equity-v3-horizon-consistent",
+            "execution_evidence_version": evidence_version,
             "risk_policy_fingerprint": stock_risk_policy_fingerprint(policy),
             "execution_policy_id": execution_policy.policy_id,
             "execution_policy_hash": execution_policy.canonical_hash,
             "economic_ranking_mode": policy.economic_ranking_mode,
+            "execution_utility_mode": profile.execution_utility_mode,
         },
         sort_keys=True,
     )
