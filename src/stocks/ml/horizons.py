@@ -17,7 +17,7 @@ smaller profile id).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from hashlib import sha256
 from math import ceil
 
@@ -58,6 +58,9 @@ class HorizonOOFEvidence:
     missing_cohort_count: int
     segment_count: int
     fold_rank_ics: tuple[float, ...]
+    paired_stress_log_growth: tuple[float, ...] = ()
+    sparse_turnover: float = 0.0
+    shadow_turnover: float = 0.0
     reasons: tuple[str, ...] = ()
     unresolved_outcome_counts: tuple[tuple[str, int], ...] = ()
     blocked_vintage_count: int = 0
@@ -79,8 +82,22 @@ class HorizonOOFEvidence:
             np.isfinite(self.stress_log_growth)
         ):
             raise ValueError("cohort log growth must be finite")
+        if self.paired_stress_log_growth and len(self.paired_stress_log_growth) != len(
+            self.base_log_growth
+        ):
+            raise ValueError(
+                "paired_stress_log_growth must be parallel to the log growth series"
+            )
+        if self.paired_stress_log_growth and not np.all(
+            np.isfinite(self.paired_stress_log_growth)
+        ):
+            raise ValueError("paired stress log growth must be finite")
         if any(segment < 0 for segment in self.cohort_segment_ids):
             raise ValueError("cohort segment identity must be a non-negative integer")
+        if not np.isfinite(self.sparse_turnover) or self.sparse_turnover < 0.0:
+            raise ValueError("sparse_turnover must be a finite non-negative value")
+        if not np.isfinite(self.shadow_turnover) or self.shadow_turnover < 0.0:
+            raise ValueError("shadow_turnover must be a finite non-negative value")
         if not self.model_family:
             raise ValueError("model_family must be non-empty")
         if self.blocked_vintage_count < 0:
@@ -117,7 +134,12 @@ class HorizonSelectionEvidence:
     stress_p_values: dict[tuple[int, str], float]
     base_holm_thresholds: dict[tuple[int, str], float]
     stress_holm_thresholds: dict[tuple[int, str], float]
-    selection_reasons: tuple[str, ...]
+    paired_lower_bounds: dict[tuple[int, str], float] = field(default_factory=dict)
+    paired_p_values: dict[tuple[int, str], float] = field(default_factory=dict)
+    paired_holm_thresholds: dict[tuple[int, str], float] = field(default_factory=dict)
+    shadow_turnover: dict[tuple[int, str], float] = field(default_factory=dict)
+    turnover_ratio: dict[tuple[int, str], float] = field(default_factory=dict)
+    selection_reasons: tuple[str, ...] = ()
     rankability_reason: str = ""
     rank_ic_lower_bound: float = 0.0
 
@@ -153,6 +175,11 @@ class HorizonSelectionEvidence:
             "stress_p_values": keyed(self.stress_p_values),
             "base_holm_thresholds": keyed(self.base_holm_thresholds),
             "stress_holm_thresholds": keyed(self.stress_holm_thresholds),
+            "paired_lower_bounds": keyed(self.paired_lower_bounds),
+            "paired_p_values": keyed(self.paired_p_values),
+            "paired_holm_thresholds": keyed(self.paired_holm_thresholds),
+            "shadow_turnover": keyed(self.shadow_turnover),
+            "turnover_ratio": keyed(self.turnover_ratio),
             "selection_reasons": list(self.selection_reasons),
             "rankability_reason": self.rankability_reason,
             "rank_ic_lower_bound": self.rank_ic_lower_bound,
@@ -254,6 +281,7 @@ def _holm_admission(
     dict[tuple[int, str], float],
     dict[tuple[int, str], float],
     dict[tuple[int, str], float],
+    dict[tuple[int, str], float],
     list[str],
 ]:
     """Holm-Bonferroni control across all candidates on the least favorable path.
@@ -266,44 +294,49 @@ def _holm_admission(
     reasons.
     """
     combined: dict[tuple[int, str], float] = {}
+    has_paired = any("paired" in path for path in bootstrap.values())
+    hypotheses: list[tuple[float, tuple[int, str], str]] = []
     for candidate in candidates:
         key = _frontier_key(candidate.horizon_sessions, candidate.profile_id)
         base = bootstrap[key].get("base")
         stress = bootstrap[key].get("stress")
+        paired = bootstrap[key].get("paired")
         if base is None or stress is None:
             combined[key] = 1.0
+            hypotheses.extend(((1.0, key, "base"), (1.0, key, "stress")))
+            if paired is not None:
+                hypotheses.append((1.0, key, "paired"))
             continue
         combined[key] = max(base.p_value, stress.p_value)
-    m = len(candidates)
-    ordered = sorted(
-        candidates,
-        key=lambda candidate: (
-            combined[_frontier_key(candidate.horizon_sessions, candidate.profile_id)],
-            candidate.horizon_sessions,
-            candidate.profile_id,
-        ),
-    )
+        hypotheses.extend(((base.p_value, key, "base"), (stress.p_value, key, "stress")))
+        if paired is not None:
+            combined[key] = max(combined[key], paired.p_value)
+            hypotheses.append((paired.p_value, key, "paired"))
+    if not has_paired:
+        hypotheses = [
+            (combined[_frontier_key(candidate.horizon_sessions, candidate.profile_id)],
+             _frontier_key(candidate.horizon_sessions, candidate.profile_id), "combined")
+            for candidate in candidates
+        ]
+    hypotheses.sort(key=lambda item: (item[0], item[1][0], item[1][1], item[2]))
+    m = len(hypotheses)
     base_thresholds: dict[tuple[int, str], float] = {}
     stress_thresholds: dict[tuple[int, str], float] = {}
+    paired_thresholds: dict[tuple[int, str], float] = {}
     reasons: list[str] = []
-    for rank, candidate in enumerate(ordered, start=1):
-        key = _frontier_key(candidate.horizon_sessions, candidate.profile_id)
+    for rank, (p_value, key, path_name) in enumerate(hypotheses, start=1):
         threshold = bootstrap_alpha / (m - rank + 1)
-        base_thresholds[key] = threshold
-        stress_thresholds[key] = threshold
-        base = bootstrap[key]["base"]
-        stress = bootstrap[key]["stress"]
-        if base is None or stress is None:
+        if path_name in ("combined", "base"):
+            base_thresholds[key] = threshold
+        if path_name in ("combined", "stress"):
+            stress_thresholds[key] = threshold
+        if path_name == "paired":
+            paired_thresholds[key] = threshold
+        if p_value > threshold:
             reasons.append(
-                f"h{candidate.horizon_sessions}:{candidate.profile_id} "
-                "inadmissible (fewer than two resampling blocks)"
+                f"h{key[0]}:{key[1]} {path_name} Holm p {p_value:.6g} > {threshold:.6g}"
             )
-        elif combined[key] > threshold:
-            reasons.append(
-                f"h{candidate.horizon_sessions}:{candidate.profile_id} "
-                f"Holm p {combined[key]:.6g} > {threshold:.6g}"
-            )
-    return combined, base_thresholds, stress_thresholds, reasons
+    return combined, base_thresholds, stress_thresholds, paired_thresholds, reasons
 
 
 def select_horizons(
@@ -359,7 +392,7 @@ def select_horizons(
     for candidate in ordered:
         key = _frontier_key(candidate.horizon_sessions, candidate.profile_id)
         block_floor = max(candidate.horizon_sessions, rebalance_frequency_sessions)
-        bootstrap[key] = {
+        path: dict[str, _CohortBootstrap | None] = {
             "base": _cohort_bootstrap(
                 candidate.base_log_growth,
                 candidate.cohort_segment_ids,
@@ -375,12 +408,26 @@ def select_horizons(
                 min_block_length=block_floor,
             ),
         }
+        if candidate.paired_stress_log_growth:
+            path["paired"] = _cohort_bootstrap(
+                candidate.paired_stress_log_growth,
+                candidate.cohort_segment_ids,
+                n_bootstrap,
+                seed + 2 * candidate.horizon_sessions,
+                min_block_length=block_floor,
+            )
+        bootstrap[key] = path
 
-    _combined, base_thresholds, stress_thresholds, reasons = _holm_admission(
+    _combined, base_thresholds, stress_thresholds, paired_thresholds, reasons = _holm_admission(
         ordered, bootstrap, bootstrap_alpha
     )
 
     adjusted_lower_growth: dict[tuple[int, str], dict[str, float]] = {}
+    paired_lower_bounds: dict[tuple[int, str], float] = {}
+    paired_p_values: dict[tuple[int, str], float] = {}
+    paired_holm_thresholds: dict[tuple[int, str], float] = {}
+    shadow_turnover: dict[tuple[int, str], float] = {}
+    turnover_ratio: dict[tuple[int, str], float] = {}
     admissible: list[HorizonOOFEvidence] = []
     for candidate in ordered:
         key = _frontier_key(candidate.horizon_sessions, candidate.profile_id)
@@ -397,17 +444,37 @@ def select_horizons(
             "base": base_lower,
             "stress": stress_lower,
         }
-        if base_lower > 0.0 and stress_lower > 0.0:
+        paired_lower = 0.0
+        paired_threshold = paired_thresholds.get(key, threshold)
+        if "paired" in bootstrap[key]:
+            paired_boot = bootstrap[key]["paired"]
+            paired_lower = paired_boot.lower_mean(threshold) if paired_boot is not None else 0.0
+            paired_lower_bounds[key] = paired_lower
+            paired_p_values[key] = paired_boot.p_value if paired_boot is not None else 1.0
+            paired_holm_thresholds[key] = paired_threshold
+        sh_turnover = max(candidate.shadow_turnover, 1e-12)
+        shadow_turnover[key] = float(candidate.shadow_turnover)
+        ratio = float(candidate.sparse_turnover) / sh_turnover
+        turnover_ratio[key] = ratio
+        has_paired = "paired" in bootstrap[key]
+        paired_ok = (paired_lower > 0.0) if has_paired else True
+        if (
+            base_lower > 0.0
+            and stress_lower > 0.0
+            and paired_ok
+            and ratio <= 0.60
+        ):
             admissible.append(candidate)
             reasons.append(
                 f"h{candidate.horizon_sessions}:{candidate.profile_id} "
-                f"admissible base={base_lower:.6g} stress={stress_lower:.6g}"
+                f"admissible base={base_lower:.6g} stress={stress_lower:.6g} "
+                f"paired={paired_lower:.6g} turnover_ratio={ratio:.6g}"
             )
         else:
             reasons.append(
                 f"h{candidate.horizon_sessions}:{candidate.profile_id} "
-                f"adjusted lower growth base={base_lower:.6g} "
-                f"stress={stress_lower:.6g} not strictly positive"
+                f"rejected base={base_lower:.6g} stress={stress_lower:.6g} "
+                f"paired={paired_lower:.6g} turnover_ratio={ratio:.6g}"
             )
 
     primary_horizon: int | None = None
@@ -439,6 +506,11 @@ def select_horizons(
         stress_p_values=stress_p_values,
         base_holm_thresholds=base_thresholds,
         stress_holm_thresholds=stress_thresholds,
+        paired_lower_bounds=paired_lower_bounds,
+        paired_p_values=paired_p_values,
+        paired_holm_thresholds=paired_holm_thresholds,
+        shadow_turnover=shadow_turnover,
+        turnover_ratio=turnover_ratio,
         selection_reasons=tuple(reasons),
     )
 

@@ -1274,7 +1274,30 @@ def _replay_costs(
         horizon_sessions=horizon_sessions,
     )
     evidence = replay_execution_equivalent(replay_request)
-    return evidence, evidence
+    if not is_v5:
+        return evidence, evidence
+    dense_profile = PolicyProfile(
+        profile_id=profile.profile_id,
+        no_trade_band_bps=profile.no_trade_band_bps,
+        growth_risk_aversion=profile.growth_risk_aversion,
+        execution_utility_mode="delta_cost_aware_v1",
+        sizing_mode="alpha_vol_squared_v1",
+    )
+    shadow_context = _execution_replay_context(
+        request, manifest, market_frame, dense_profile,
+        seed=request.seed + horizon_sessions + 7,
+        horizon_sessions=horizon_sessions,
+    )
+    shadow_request = ExecutionEquivalentReplayRequest(
+        context=shadow_context,
+        market_frame=market_frame,
+        score_frame=calibrated,
+        segment_column=_OOF_SEGMENT,
+        decision_sessions_by_segment=decision_sessions_by_segment,
+        horizon_sessions=horizon_sessions,
+    )
+    shadow_evidence = replay_execution_equivalent(shadow_request)
+    return evidence, shadow_evidence
 
 
 def _evidence_from_execution(
@@ -1285,6 +1308,10 @@ def _evidence_from_execution(
     stress_evidence: ExecutionReplayEvidence,
     fold_rank_ics: tuple[float, ...],
     segment_count: int,
+    *,
+    paired_stress_log_growth: tuple[float, ...] = (),
+    sparse_turnover: float = 0.0,
+    shadow_turnover: float = 0.0,
 ) -> HorizonOOFEvidence:
     """Build a candidate's base/stress equity evidence from the prepared replay.
 
@@ -1292,7 +1319,9 @@ def _evidence_from_execution(
     filled-cycle coverage is derived from ``cash_session_fraction``. A session
     whose execution input is missing fails closed earlier in the adapter and is
     never zero-filled, so the missing/partial cohort counts are structurally
-    zero.
+    zero. ``paired_stress_log_growth`` carries the per-vintage sparse-minus-dense
+    stress improvement and ``sparse_turnover``/``shadow_turnover`` the matched
+    replay turnover pair, segment-aligned to ``base_log_growth``.
     """
     if base_evidence.segment_ids != stress_evidence.segment_ids:
         raise ValueError("base and stress execution segment identities diverged")
@@ -1313,6 +1342,9 @@ def _evidence_from_execution(
         missing_cohort_count=0,
         segment_count=segment_count,
         fold_rank_ics=fold_rank_ics,
+        paired_stress_log_growth=paired_stress_log_growth,
+        sparse_turnover=float(sparse_turnover),
+        shadow_turnover=float(shadow_turnover),
         unresolved_outcome_counts=(),
         blocked_vintage_count=0,
     )
@@ -1524,27 +1556,36 @@ def _build_horizon_evidence(
                 _horizon: int = horizon,
                 _pre_holdout: pl.DataFrame = pre_holdout,
                 _manifest: DatasetManifest = data.manifest,
-            ) -> tuple[PolicyProfile, ExecutionReplayEvidence | None, str]:
+            ) -> tuple[PolicyProfile, ExecutionReplayEvidence | None, ExecutionReplayEvidence | None, str]:
                 risk = replace(
                     _request.risk, no_trade_band_bps=profile.no_trade_band_bps
                 )
                 try:
-                    base_evidence, _ = _replay_costs(
+                    base_evidence, shadow_evidence = _replay_costs(
                         _calibrated, _oof_labels, _request, _horizon, risk,
                         _pre_holdout, _manifest, profile,
                     )
                 except ValueError as exc:
-                    return profile, None, (
+                    return profile, None, None, (
                         f"replay-error:{type(exc).__name__}:{exc}"
                     )
-                if (
+                is_v5 = (
                     profile.execution_utility_mode == "sparse_hold_replace_v2"
                     or profile.sizing_mode == "risk_balanced_waterfill_v2"
-                ):
-                    # The shadow replay is attached by the promotion stage; invoke
-                    # the pure gate here to keep the candidate telemetry contract.
-                    _incremental_growth_gate(base_evidence, base_evidence, _request, _horizon)
-                return profile, base_evidence, ""
+                )
+                shadow_for_gate: ExecutionReplayEvidence | None = shadow_evidence
+                if is_v5:
+                    if shadow_for_gate is None:
+                        return profile, base_evidence, None, "missing-shadow-evidence"
+                    # Genuine matched dense shadow; the paired stress improvement
+                    # is attached to the candidate evidence in the outer loop so
+                    # the HorizonSelection Holm family can gate on all three paths.
+                    _incremental_growth_gate(
+                        base_evidence, shadow_for_gate, _request, _horizon
+                    )
+                else:
+                    shadow_for_gate = None
+                return profile, base_evidence, shadow_for_gate, ""
 
             with ThreadPoolExecutor(
                 max_workers=min(len(request.policy_profiles), request.model_threads)
@@ -1552,7 +1593,7 @@ def _build_horizon_evidence(
                 replay_results = list(
                     executor.map(replay_profile, request.policy_profiles)
                 )
-            for profile, base_evidence, replay_error in replay_results:
+            for profile, base_evidence, shadow_evidence, replay_error in replay_results:
                 logger.debug(
                     "[EVAL] stage=profile_replay horizon=%d profile=%s band_bps=%.3f",
                     horizon,
@@ -1570,9 +1611,26 @@ def _build_horizon_evidence(
                     )
                     continue
                 stress_evidence = base_evidence
+                paired_stress: tuple[float, ...] = ()
+                sparse_turnover = base_evidence.turnover
+                shadow_turnover = (
+                    shadow_evidence.turnover if shadow_evidence is not None else 0.0
+                )
+                if shadow_evidence is not None:
+                    paired_stress = tuple(
+                        float(c - s)
+                        for c, s in zip(
+                            base_evidence.stress_log_growth,
+                            shadow_evidence.stress_log_growth,
+                            strict=True,
+                        )
+                    )
                 candidate_evidence = _evidence_from_execution(
                     horizon, profile.profile_id, "net_alpha_elastic_net",
                     base_evidence, stress_evidence, tuple(ics), len(folds),
+                    paired_stress_log_growth=paired_stress,
+                    sparse_turnover=sparse_turnover,
+                    shadow_turnover=shadow_turnover,
                 )
                 execution_evidence_by_candidate[(horizon, profile.profile_id)] = (
                     base_evidence

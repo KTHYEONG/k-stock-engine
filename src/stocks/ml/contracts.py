@@ -125,9 +125,27 @@ class PolicyProfile:
 
 
 DEFAULT_POLICY_PROFILES = (
-    PolicyProfile(profile_id=LEGACY_OVERLAY_PROFILE_ID, no_trade_band_bps=5.0, growth_risk_aversion=1.0),
-    PolicyProfile(profile_id=LOWER_BOUND_ONLY_PROFILE_ID, no_trade_band_bps=0.0, growth_risk_aversion=1.0),
-    PolicyProfile(profile_id=LOWER_BOUND_HALF_KELLY_PROFILE_ID, no_trade_band_bps=0.0, growth_risk_aversion=2.0),
+    PolicyProfile(
+        profile_id=LEGACY_OVERLAY_PROFILE_ID,
+        no_trade_band_bps=5.0,
+        growth_risk_aversion=1.0,
+        execution_utility_mode="sparse_hold_replace_v2",
+        sizing_mode="risk_balanced_waterfill_v2",
+    ),
+    PolicyProfile(
+        profile_id=LOWER_BOUND_ONLY_PROFILE_ID,
+        no_trade_band_bps=0.0,
+        growth_risk_aversion=1.0,
+        execution_utility_mode="sparse_hold_replace_v2",
+        sizing_mode="risk_balanced_waterfill_v2",
+    ),
+    PolicyProfile(
+        profile_id=LOWER_BOUND_HALF_KELLY_PROFILE_ID,
+        no_trade_band_bps=0.0,
+        growth_risk_aversion=2.0,
+        execution_utility_mode="sparse_hold_replace_v2",
+        sizing_mode="risk_balanced_waterfill_v2",
+    ),
 )
 
 

@@ -1271,6 +1271,14 @@ def _build_allocations(
             enter_rank=policy.enter_rank,
             band_rate=policy.no_trade_band_bps / 10_000.0,
         )
+    elif policy.execution_utility_mode == "sparse_hold_replace_v2":
+        sparse_plan = SparseTransitionPlan(
+            retained=tuple(current_weights),
+            initial_entries=(),
+            replacements=(),
+            cash_exits=(),
+            invalid_reason="missing-or-invalid-economic-inputs",
+        )
     if policy.sizing_mode == "risk_balanced_waterfill_v2" and sparse_plan is not None:
         active_ids = list(
             dict.fromkeys(
@@ -1366,7 +1374,11 @@ def _build_allocations(
         utility_transition_count = int(bool(sparse_plan.replacements or sparse_plan.initial_entries))
         utility_hold_count = len(sparse_plan.retained)
         utility_transition_diagnostics.extend(
-            (("utility_hold_count", utility_hold_count), ("utility_transition_count", utility_transition_count))
+            (
+                ("utility_hold_count", utility_hold_count),
+                ("utility_transition_count", utility_transition_count),
+                ("invalid_cost_input_count", int(sparse_plan.invalid_reason is not None)),
+            )
         )
     elif policy.execution_utility_mode == "delta_cost_aware_v1" and net_lower_bound_of:
         entry_cost_of: dict[str, float] = {}
@@ -2056,10 +2068,12 @@ def _economic_transition_inputs(
         xcr = exit_cost_rate[i]
         if not (math.isfinite(alb) and math.isfinite(nlb) and math.isfinite(xcr)):
             return None, f"non-finite-economic:{iid}"
-        if alb < -1e-12 or nlb < -1e-12 or xcr < -1e-12:
+        if alb < -1e-12 or xcr < -1e-12:
             return None, f"negative-economic:{iid}"
         rt = alb - nlb
         en = rt - xcr
+        if en < -1e-12:
+            return None, f"negative-entry-cost:{iid}"
         if abs(rt - en - xcr) > 1e-12:
             return None, f"inconsistent-cost-identity:{iid}"
         gross[iid] = alb
