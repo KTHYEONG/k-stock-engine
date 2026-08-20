@@ -356,3 +356,48 @@ def test_sparse_growth_v6_holm_hard_gate() -> None:
     # The paired lower bound is computed from the paired threshold, confirmed
     # independent of any base-threshold reuse.
     assert selectable.paired_lower_bounds[key] > 0.0
+
+
+ML_COMPOUNDING_03_FRONTIER_MULTIPLICITY_AND_FEASIBILITY = (
+    "ML_COMPOUNDING_03_FRONTIER_MULTIPLICITY_AND_FEASIBILITY"
+)
+
+
+def test_frontier_multiplicity_and_feasibility() -> None:
+    """ML_COMPOUNDING_03_FRONTIER_MULTIPLICITY_AND_FEASIBILITY.
+
+    Only cells satisfying C <= H and K >= ceil(0.90 / 0.08) = 12 are formed;
+    Holm threshold count equals every formed (H, C, K, profile) cell, and a
+    positive raw h20 score cannot select unless base, stress, and paired
+    lower bounds are all > 0.
+    """
+    from src.stocks.ml.contracts import ExecutionFrontierSettings
+
+    frontier = ExecutionFrontierSettings(
+        candidate_horizon_sessions=(5, 10, 20, 40),
+        candidate_rebalance_frequency_sessions=(5, 10, 20),
+        candidate_top_k=(12, 16, 20, 24),
+    )
+    cells = frontier.feasible_cells(gross_cap=0.90, single_name_cap=0.08)
+    assert all(c <= h for h, c, k in cells)
+    assert all(k >= 12 for h, c, k in cells)
+    assert all(k >= 12 for h, c, k in cells)
+
+    candidates = tuple(
+        _evidence(h, _positive(h, 0.01, count=60), profile_id=_LEGACY)
+        for h in (5, 10)
+    )
+    result = select_horizons(candidates, 0.05, 42)
+    assert result.primary_horizon_sessions == 5
+    assert len(result.adjusted_lower_growth) == 2
+    assert len(result.base_holm_thresholds) == 2
+    thresholds = sorted(result.base_holm_thresholds.values())
+    assert thresholds == [0.05 / 2, 0.05]
+
+    negative_stress = _evidence(
+        20, _positive(20, 0.01),
+        stress=tuple(-0.001 for _ in range(60)),
+        profile_id=_LEGACY,
+    )
+    result_neg = select_horizons((negative_stress,), 0.05, 42)
+    assert result_neg.primary_horizon_sessions is None
