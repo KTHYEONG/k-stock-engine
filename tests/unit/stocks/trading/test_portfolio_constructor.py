@@ -1807,6 +1807,7 @@ class TestSparseGrowthV5CostIdentity:
         assert "non-finite" in reason
 
     def test_negative_input_returns_invalid_reason(self) -> None:
+        """SPARSE_GROWTH_02_COST_IDENTITY_FAIL_CLOSED: invalid economics reject."""
         from src.stocks.trading.portfolio_constructor import (
             _economic_transition_inputs,
         )
@@ -1834,11 +1835,22 @@ class TestSparseGrowthV5CostIdentity:
         inputs, reason = _economic_transition_inputs(
             ["KRX:A"], [0.005], [0.002], [0.005]
         )
-        # round_trip = 0.003, entry = 0.003 - 0.005 = -0.002
-        # The identity holds but entry is negative (clamped to 0)
+        # A negative derived entry cost is not executable and must fail closed.
+        assert inputs is None
+        assert reason is not None
+        assert "negative-entry-cost" in reason
+
+    def test_negative_net_bound_is_valid_for_incumbent(self) -> None:
+        from src.stocks.trading.portfolio_constructor import (
+            _economic_transition_inputs,
+        )
+
+        inputs, reason = _economic_transition_inputs(
+            ["KRX:A"], [0.005], [-0.001], [0.002]
+        )
         assert reason is None
         assert inputs is not None
-        assert inputs.entry_cost["KRX:A"] == 0.0
+        assert inputs.entry_cost["KRX:A"] == pytest.approx(0.004)
 
     def test_length_mismatch_returns_invalid_reason(self) -> None:
         from src.stocks.trading.portfolio_constructor import (
@@ -1883,6 +1895,7 @@ class TestSparseGrowthV5HoldReplace:
         assert "B" in plan.initial_entries
 
     def test_replace_when_marginal_strictly_positive(self) -> None:
+        """SPARSE_GROWTH_03_MARGINAL_TRANSITION: positive marginal replaces."""
         from src.stocks.trading.portfolio_constructor import (
             EconomicTransitionInputs,
             _select_sparse_hold_replace_active_set,
@@ -2103,6 +2116,7 @@ class TestExecutionReplayEvidenceActionDiagnostics:
     """ExecutionReplayEvidence action_diagnostics extension."""
 
     def test_action_diagnostics_in_diagnostics_output(self) -> None:
+        """SPARSE_GROWTH_06_BOUNDED_TELEMETRY_AND_ARTIFACT_PARITY."""
         from src.stocks.ml.execution_replay import ExecutionReplayEvidence
 
         evidence = ExecutionReplayEvidence(
@@ -2116,14 +2130,21 @@ class TestExecutionReplayEvidenceActionDiagnostics:
             unfilled_order_reason_counts=(),
             action_diagnostics=(
                 ("retained_count", 8),
-                ("entry_count", 3),
+                ("initial_entry_count", 3),
                 ("replacement_count", 2),
+                ("cash_exit_count", 1),
+                ("invalid_economic_input_count", 0),
+                ("shadow_turnover", 1.0),
+                ("turnover_ratio", 0.5),
+                ("paired_stress_lower", 0.001),
+                ("p_value", 0.01),
+                ("holm_threshold", 0.0166667),
             ),
         )
         diag = evidence.diagnostics()
         assert "action_diagnostics" in diag
         assert diag["action_diagnostics"]["retained_count"] == 8
-        assert diag["action_diagnostics"]["entry_count"] == 3
+        assert diag["action_diagnostics"]["initial_entry_count"] == 3
         assert diag["action_diagnostics"]["replacement_count"] == 2
 
     def test_empty_action_diagnostics(self) -> None:

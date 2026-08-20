@@ -23,6 +23,31 @@ def test_default_policy_profiles_are_the_three_pre_registered() -> None:
     assert tuple(p.growth_risk_aversion for p in DEFAULT_POLICY_PROFILES) == (1.0, 1.0, 2.0)
 
 
+def test_default_policy_profiles_pin_sparse_frontier() -> None:
+    """SPARSE_GROWTH_01_DEFAULT_FRONTIER: every profile pins the sparse modes."""
+    assert tuple(p.execution_utility_mode for p in DEFAULT_POLICY_PROFILES) == (
+        "sparse_hold_replace_v2",
+        "sparse_hold_replace_v2",
+        "sparse_hold_replace_v2",
+    )
+    assert tuple(p.sizing_mode for p in DEFAULT_POLICY_PROFILES) == (
+        "risk_balanced_waterfill_v2",
+        "risk_balanced_waterfill_v2",
+        "risk_balanced_waterfill_v2",
+    )
+    validated = validate_policy_profiles(DEFAULT_POLICY_PROFILES)
+    assert tuple(p.execution_utility_mode for p in validated) == (
+        "sparse_hold_replace_v2",
+        "sparse_hold_replace_v2",
+        "sparse_hold_replace_v2",
+    )
+    assert tuple(p.sizing_mode for p in validated) == (
+        "risk_balanced_waterfill_v2",
+        "risk_balanced_waterfill_v2",
+        "risk_balanced_waterfill_v2",
+    )
+
+
 def test_policy_profile_validates_input_range() -> None:
     with pytest.raises(ValueError, match="profile_id must be non-empty"):
         PolicyProfile(profile_id="", no_trade_band_bps=0.0)

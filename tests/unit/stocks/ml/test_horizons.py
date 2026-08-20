@@ -225,3 +225,70 @@ def test_bootstrap_block_length_is_at_least_the_horizon() -> None:
     assert floored is None
     unfloored = _cohort_bootstrap(values, (0, 0, 0), 200, 42, min_block_length=1)
     assert unfloored is not None
+
+
+def _sparse_evidence(
+    horizon: int,
+    base: tuple[float, ...],
+    paired: tuple[float, ...],
+    *,
+    sparse_turnover: float,
+    shadow_turnover: float,
+    profile_id: str = _LEGACY,
+) -> HorizonOOFEvidence:
+    segments = tuple(0 for _ in base)
+    return HorizonOOFEvidence(
+        horizon_sessions=horizon,
+        profile_id=profile_id,
+        model_family="net_alpha_elastic_net",
+        base_log_growth=base,
+        stress_log_growth=base,
+        cohort_segment_ids=segments,
+        complete_cohort_count=len(base),
+        active_cohort_count=len(base),
+        partial_cohort_count=0,
+        missing_cohort_count=0,
+        segment_count=1,
+        fold_rank_ics=(0.1, 0.2, 0.3),
+        paired_stress_log_growth=paired,
+        sparse_turnover=sparse_turnover,
+        shadow_turnover=shadow_turnover,
+    )
+
+
+def test_sparse_growth_paired_admission() -> None:
+    """SPARSE_GROWTH_04_MATCHED_SHADOW_ADMISSION.
+
+    A candidate is selectable only when base, stress, and paired lower bounds
+    are strictly positive and the sparse/shadow turnover ratio is at most 0.60;
+    each Holm threshold stays in (0, bootstrap_alpha]. A non-positive paired
+    lower bound or an excessive turnover ratio forces NO_TRADE.
+    """
+    alpha = 0.05
+    good = _sparse_evidence(
+        10, _positive(10, 0.01, count=60), _positive(10, 0.002, count=60),
+        sparse_turnover=1.0, shadow_turnover=2.0,
+    )
+    result = select_horizons((good,), alpha, 42, rebalance_frequency_sessions=5)
+    assert result.primary_horizon_sessions == 10
+    assert result.primary_profile_id == _LEGACY
+    assert result.paired_lower_bounds[(10, _LEGACY)] > 0.0
+    assert result.turnover_ratio[(10, _LEGACY)] <= 0.60
+    assert 0.0 < result.base_holm_thresholds[(10, _LEGACY)] <= alpha
+    assert 0.0 < result.paired_holm_thresholds[(10, _LEGACY)] <= alpha
+
+    negative_paired = _sparse_evidence(
+        10, _positive(10, 0.01, count=60),
+        tuple(-0.002 for _ in range(60)),
+        sparse_turnover=1.0, shadow_turnover=2.0,
+    )
+    rejected = select_horizons((negative_paired,), alpha, 42, rebalance_frequency_sessions=5)
+    assert rejected.primary_horizon_sessions is None
+
+    high_turnover = _sparse_evidence(
+        10, _positive(10, 0.01, count=60), _positive(10, 0.002, count=60),
+        sparse_turnover=1.0, shadow_turnover=1.0,
+    )
+    rejected_ratio = select_horizons((high_turnover,), alpha, 42, rebalance_frequency_sessions=5)
+    assert rejected_ratio.primary_horizon_sessions is None
+    assert rejected_ratio.turnover_ratio[(10, _LOWER if False else _LEGACY)] > 0.60
