@@ -33,6 +33,7 @@ from src.stocks.ml.features import (
     apply_model_feature_schema,
     build_model_features,
     feature_transform_schema_from_manifest,
+    materialize_model_feature_sources,
     stock_net_alpha_v1_roles,
 )
 from src.stocks.research.artifacts import ModelArtifactRegistry, PredictionRequest
@@ -179,11 +180,14 @@ def run_trading_cycle(
     gated = _drop_label_columns(research_eligible_frame(universe_gate))
     if manifest.feature_set == CANONICAL_FEATURE_SET:
         schema = _frozen_net_alpha_schema(loaded.manifest)
-        feature_frame = (
-            apply_model_feature_schema(gated, schema)
-            if schema is not None
-            else build_model_features(gated, stock_net_alpha_v1_roles())[0]
-        )
+        if schema is not None:
+            gated = materialize_model_feature_sources(gated, schema.source_order)
+            feature_frame = apply_model_feature_schema(gated, schema)
+        else:
+            gated = materialize_model_feature_sources(
+                gated, list(stock_net_alpha_v1_roles())
+            )
+            feature_frame = build_model_features(gated, stock_net_alpha_v1_roles())[0]
     elif manifest.feature_set == "stock_alpha_v2":
         feature_frame = gated
     else:

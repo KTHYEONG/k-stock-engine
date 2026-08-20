@@ -785,7 +785,9 @@ class StockRiskPolicy:
     )
     economic_ranking_mode: Literal["raw_score_v1", "economic_net_v1"] = "raw_score_v1"
     execution_utility_mode: Literal["legacy_target_interpolation_v1", "delta_cost_aware_v1", "sparse_hold_replace_v2"] = "legacy_target_interpolation_v1"
-    sizing_mode: Literal["alpha_vol_squared_v1", "risk_balanced_waterfill_v2"] = "alpha_vol_squared_v1"
+    sizing_mode: Literal[
+        "alpha_vol_squared_v1", "risk_balanced_waterfill_v2", "confidence_mean_variance_v1"
+    ] = "alpha_vol_squared_v1"
 
     def __post_init__(self) -> None:
         if self.top_k <= 0:
@@ -835,10 +837,11 @@ class StockRiskPolicy:
         if self.sizing_mode not in (
             "alpha_vol_squared_v1",
             "risk_balanced_waterfill_v2",
+            "confidence_mean_variance_v1",
         ):
             raise ValueError(
-                "sizing_mode must be 'alpha_vol_squared_v1' or "
-                f"'risk_balanced_waterfill_v2', got {self.sizing_mode!r}"
+                "sizing_mode must be 'alpha_vol_squared_v1', "
+                f"'risk_balanced_waterfill_v2', or 'confidence_mean_variance_v1', got {self.sizing_mode!r}"
             )
 
 
@@ -1279,7 +1282,23 @@ def _build_allocations(
             cash_exits=(),
             invalid_reason="missing-or-invalid-economic-inputs",
         )
-    if policy.sizing_mode == "risk_balanced_waterfill_v2" and sparse_plan is not None:
+    if (
+        policy.sizing_mode == "confidence_mean_variance_v1"
+        and net_lower_bound_of is not None
+        and covariance is not None
+    ):
+        confidence_weights = _confidence_mean_variance_weights(
+            ids,
+            net_lower_bound_of,
+            covariance,
+            sector_of,
+            policy,
+        )
+        raw_scores = {
+            instrument_id: confidence_weights.get(instrument_id, 0.0)
+            for instrument_id in ids
+        }
+    elif policy.sizing_mode == "risk_balanced_waterfill_v2" and sparse_plan is not None:
         active_ids = list(
             dict.fromkeys(
                 [*sparse_plan.retained, *sparse_plan.initial_entries]
@@ -2104,12 +2123,18 @@ def _select_sparse_hold_replace_active_set(
 
     Unchanged incumbents keep their current weight exactly.  Initial cash
     deployment admits at most ``enter_rank`` names with
-    ``net_alpha_lower_bound - band > 0``.  The active set never exceeds
-    ``top_k``.
+    ``net_alpha_lower_bound - band > 0``.  The active set strictly satisfies
+    ``len(retained) + len(initial_entries) + len(replacements) <= top_k`` for
+    every current portfolio, including a fully invested one: an initial entry is
+    only appended when a slot is free after all retained incumbents and
+    replacements, so the target holdings may never exceed ``top_k``.
 
-    Replacements are prioritized first, then initial entries fill remaining
-    capacity.
+    Replacements are prioritized first (a challenger replaces exactly one
+    incumbent), then initial entries fill the remaining capacity.
     """
+    if top_k < 1:
+        raise ValueError("top_k must be positive")
+
     incumbent_ids = set(current_weights)
     candidate_list = list(ranked_candidates)
 
@@ -2126,6 +2151,9 @@ def _select_sparse_hold_replace_active_set(
     replaced_incumbents: set[str] = set()
     used_challengers: set[str] = set()
 
+    def active_count() -> int:
+        return len(retained) + len(replacements) + len(initial_entries)
+
     incumbents_sorted = sorted(
         [iid for iid in incumbent_ids if iid in gross_lb],
         key=lambda iid: gross_lb.get(iid, 0.0),
@@ -2133,8 +2161,9 @@ def _select_sparse_hold_replace_active_set(
     )
 
     for incumbent in incumbents_sorted:
-        if len(replacements) + len(initial_entries) >= top_k:
-            break
+        if active_count() >= top_k:
+            cash_exits.append(incumbent)
+            continue
         best_challenger: str | None = None
         best_marginal = 0.0
         for challenger in candidate_list:
@@ -2156,7 +2185,7 @@ def _select_sparse_hold_replace_active_set(
             retained.append(incumbent)
 
     for candidate in candidate_list:
-        if len(initial_entries) + len(replacements) >= top_k:
+        if active_count() >= top_k:
             break
         if candidate in incumbent_ids or candidate in used_challengers:
             continue
@@ -2164,10 +2193,13 @@ def _select_sparse_hold_replace_active_set(
         if nlb - band_rate > 0 and len(initial_entries) < enter_rank:
             initial_entries.append(candidate)
 
-    cash_exits = [
-        iid for iid in incumbent_ids
-        if iid not in retained and iid not in replaced_incumbents
-    ]
+    cash_exits.extend(
+        iid
+        for iid in incumbent_ids
+        if iid not in retained
+        and iid not in replaced_incumbents
+        and iid not in cash_exits
+    )
 
     return SparseTransitionPlan(
         retained=tuple(retained),
@@ -2176,6 +2208,121 @@ def _select_sparse_hold_replace_active_set(
         cash_exits=tuple(cash_exits),
         invalid_reason=None,
     )
+
+
+def _project_confidence_weights(
+    weights: np.ndarray,
+    ids: Sequence[str],
+    sector_of: Mapping[str, object],
+    gross_cap: float,
+    single_name_cap: float,
+    sector_cap: float,
+) -> np.ndarray:
+    """Deterministic cap projection for the confidence mean-variance optimizer.
+
+    Enforces long-only, the single-name cap, the sector cap, and the gross cap
+    in that order, scaling proportionally within each violated group. The result
+    respects every hard constraint while preserving the optimizer's relative
+    tilt toward higher lower-confidence alpha.
+    """
+    w = np.clip(np.asarray(weights, dtype=np.float64), 0.0, None)
+    if w.size == 0:
+        return w
+    w = np.minimum(w, single_name_cap)
+    sectors = [sector_of.get(str(i)) for i in ids]
+    for sector in set(sectors):
+        idx = [k for k, s in enumerate(sectors) if s == sector]
+        if not idx:
+            continue
+        total = float(w[idx].sum())
+        if total > sector_cap + _TOLERANCE:
+            scale = sector_cap / total
+            w[idx] = w[idx] * scale
+    total = float(w.sum())
+    if total > gross_cap + _TOLERANCE:
+        w = w * (gross_cap / total)
+        w = np.minimum(w, single_name_cap)
+    return w
+
+
+def _confidence_mean_variance_weights(
+    active_ids: Sequence[str],
+    lower_alpha_of: Mapping[str, float],
+    covariance: np.ndarray,
+    sector_of: Mapping[str, object],
+    policy: StockRiskPolicy,
+) -> dict[str, float]:
+    """Deterministic projected lower-confidence mean-variance target weights.
+
+    Solves the long-only objective
+        U(w) = (mu_lb^T w) / H - gamma/2 * w^T Sigma w
+    over the active set subject to the gross, single-name, sector, and active
+    caps, where ``H`` is the policy forecast horizon (or rebalance frequency),
+    ``gamma`` the growth risk aversion, ``mu_lb`` the per-name lower-confidence
+    alpha, and ``Sigma`` the causal covariance. The horizon unit makes the
+    utility independent of calendar sampling.
+
+    If no feasible candidate strictly improves the cash (zero) utility, the
+    result is all-zero weights: the optimizer never forces exposure. Otherwise
+    every weight is finite, non-negative, sums to at most ``gross_cap``, and
+    respects the per-name and sector caps; with an equal covariance a strictly
+    higher ``mu_lb`` receives strictly more weight.
+    """
+    ids = [
+        str(i)
+        for i in active_ids
+        if i in lower_alpha_of and math.isfinite(lower_alpha_of[i])
+    ]
+    zero: dict[str, float] = {str(i): 0.0 for i in active_ids}
+    n = len(ids)
+    if n == 0:
+        return zero
+    mu = np.asarray([float(lower_alpha_of[i]) for i in ids], dtype=np.float64)
+    sigma = np.asarray(covariance, dtype=np.float64)
+    if sigma.shape != (n, n) or not np.all(np.isfinite(sigma)):
+        return zero
+    horizon = max(
+        1,
+        int(
+            policy.compounding.forecast_horizon_sessions
+            if policy.compounding.forecast_horizon_sessions is not None
+            else policy.rebalance_frequency_sessions
+        ),
+    )
+    gamma = policy.compounding.growth_risk_aversion
+    if not math.isfinite(gamma) or gamma <= 0.0:
+        gamma = 1.0
+
+    positive = np.clip(mu, 0.0, None)
+    if float(positive.sum()) <= 0.0:
+        return zero
+    w = positive / positive.sum() * policy.gross_cap
+    w = _project_confidence_weights(
+        w, ids, sector_of, policy.gross_cap, policy.single_name_cap, policy.sector_cap
+    )
+
+    largest_eig = float(np.linalg.eigvalsh(sigma).max()) if n > 0 else 0.0
+    step = 1.0 / max(gamma * largest_eig, 1e-9)
+    for _ in range(200):
+        grad = mu / horizon - gamma * (sigma @ w)
+        w_next = _project_confidence_weights(
+            np.clip(w + step * grad, 0.0, None),
+            ids,
+            sector_of,
+            policy.gross_cap,
+            policy.single_name_cap,
+            policy.sector_cap,
+        )
+        util_next = float(mu @ w_next / horizon - 0.5 * gamma * w_next @ sigma @ w_next)
+        util = float(mu @ w / horizon - 0.5 * gamma * w @ sigma @ w)
+        if util_next <= util + 1e-12:
+            break
+        w = w_next
+
+    util = float(mu @ w / horizon - 0.5 * gamma * w @ sigma @ w)
+    if util <= 0.0:
+        return zero
+    return {i: float(weight) for i, weight in zip(ids, w, strict=True)}
 
 
 def _risk_balanced_waterfill(
