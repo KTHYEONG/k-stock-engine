@@ -815,3 +815,141 @@ def test_simulation_parity_growth_recovery(tmp_path) -> None:
             registry_divergent.read_manifest("na_v7_bad"),
             request,
         )
+
+
+ML_COMPOUNDING_01_V5_ARTIFACT_CADENCE_PARITY = (
+    "ML_COMPOUNDING_01_V5_ARTIFACT_CADENCE_PARITY"
+)
+
+
+def test_v5_artifact_cadence_parity(tmp_path) -> None:
+    """ML_COMPOUNDING_01_V5_ARTIFACT_CADENCE_PARITY.
+
+    A v5 sparse profile persisted with H=10 and C=10 reconstructs a policy
+    whose rebalance_frequency_sessions is 10 and whose fingerprint equals the
+    stored risk_policy_fingerprint; a missing/non-integral/mismatched cadence
+    raises ValueError before replay.
+    """
+    from src.stocks.trading.portfolio_constructor import (
+        StockRiskPolicy,
+        stock_risk_policy_fingerprint,
+    )
+    from src.stocks.workflows.simulate_portfolio import (
+        _policy_from_artifact,
+        _profile_rebalance_frequency_sessions,
+    )
+
+    def _v5_payload(cadence: int = 10) -> str:
+        policy = StockRiskPolicy(
+            top_k=20,
+            gross_cap=0.9,
+            single_name_cap=0.08,
+            participation_limit=0.005,
+            no_trade_band_bps=0.0,
+            rebalance_frequency_sessions=cadence,
+            compounding=CompoundingPolicyConfig(
+                growth_risk_aversion=1.0,
+                forecast_horizon_sessions=10,
+            ),
+            execution_utility_mode="sparse_hold_replace_v2",
+            sizing_mode="risk_balanced_waterfill_v2",
+        )
+        return json.dumps({
+            "profile_id": "lower_bound_only",
+            "no_trade_band_bps": 0.0,
+            "top_k": 20,
+            "max_single_weight": 0.08,
+            "max_exposure": 0.9,
+            "participation_limit": 0.005,
+            "portfolio_fingerprint": policy_portfolio_fingerprint(20, 0.08, 0.9, 0.005),
+            "execution_evidence_version": "prepared-equity-v5-sparse-growth",
+            "rebalance_frequency_sessions": cadence,
+            "risk_policy_fingerprint": stock_risk_policy_fingerprint(policy),
+            "execution_policy_id": SCHEDULED_OPEN_POLICY_ID,
+            "execution_policy_hash": SCHEDULED_OPEN_V1.canonical_hash,
+            "execution_utility_mode": "sparse_hold_replace_v2",
+            "sizing_mode": "risk_balanced_waterfill_v2",
+            "growth_risk_aversion": 1.0,
+            "forecast_horizon_sessions": 10,
+        }, sort_keys=True)
+
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    manifest = ModelManifest(
+        artifact_id="na_v5_cadence",
+        asset_kind=AssetKind.STOCK,
+        feature_set="stock_net_alpha_v1",
+        feature_schema_hash="h",
+        universe_policy_hash="u",
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=10,
+        eligible_from="2024-01-01T00:00:00+00:00",
+        eligible_to="2024-04-29T00:00:00+00:00",
+        model_type="net_alpha_elastic_net",
+        params={"policy_profile": _v5_payload(10)},
+    )
+    registry.publish(_DummyModel(manifest), manifest)
+    request = SimulationRequest(
+        artifact_id="na_v5_cadence",
+        decision_time=datetime(2024, 4, 29, tzinfo=UTC),
+        top_k=20,
+        max_single_weight=0.08,
+        max_exposure=0.9,
+        participation_limit=0.005,
+    )
+    policy = _policy_from_artifact(registry.read_manifest("na_v5_cadence"), request)
+    assert policy.rebalance_frequency_sessions == 10
+    expected = StockRiskPolicy(
+        top_k=20, gross_cap=0.9, single_name_cap=0.08,
+        participation_limit=0.005, no_trade_band_bps=0.0,
+        rebalance_frequency_sessions=10,
+        compounding=CompoundingPolicyConfig(
+            growth_risk_aversion=1.0, forecast_horizon_sessions=10,
+        ),
+        execution_utility_mode="sparse_hold_replace_v2",
+        sizing_mode="risk_balanced_waterfill_v2",
+    )
+    assert stock_risk_policy_fingerprint(policy) == stock_risk_policy_fingerprint(expected)
+
+    assert _profile_rebalance_frequency_sessions({"rebalance_frequency_sessions": 10}) == 10
+    assert _profile_rebalance_frequency_sessions({}) == 5
+    with pytest.raises(ValueError, match="positive integer"):
+        _profile_rebalance_frequency_sessions({"rebalance_frequency_sessions": "abc"})
+    with pytest.raises(ValueError, match="positive integer"):
+        _profile_rebalance_frequency_sessions({"rebalance_frequency_sessions": 0})
+
+    bad_manifest = ModelManifest(
+        artifact_id="na_v5_bad_cadence",
+        asset_kind=AssetKind.STOCK,
+        feature_set="stock_net_alpha_v1",
+        feature_schema_hash="h",
+        universe_policy_hash="u",
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=10,
+        eligible_from="2024-01-01T00:00:00+00:00",
+        eligible_to="2024-04-29T00:00:00+00:00",
+        model_type="net_alpha_elastic_net",
+        params={"policy_profile": json.dumps({
+            "profile_id": "lower_bound_only",
+            "no_trade_band_bps": 0.0,
+            "top_k": 20,
+            "max_single_weight": 0.08,
+            "max_exposure": 0.9,
+            "participation_limit": 0.005,
+            "portfolio_fingerprint": policy_portfolio_fingerprint(20, 0.08, 0.9, 0.005),
+            "execution_evidence_version": "prepared-equity-v5-sparse-growth",
+            "rebalance_frequency_sessions": "invalid",
+            "risk_policy_fingerprint": "deadbeef",
+            "execution_policy_id": SCHEDULED_OPEN_POLICY_ID,
+            "execution_policy_hash": SCHEDULED_OPEN_V1.canonical_hash,
+            "execution_utility_mode": "sparse_hold_replace_v2",
+            "sizing_mode": "risk_balanced_waterfill_v2",
+            "growth_risk_aversion": 1.0,
+            "forecast_horizon_sessions": 10,
+        }, sort_keys=True)},
+    )
+    registry_bad = ModelArtifactRegistry(tmp_path / "bad")
+    registry_bad.publish(_DummyModel(bad_manifest), bad_manifest)
+    with pytest.raises(ValueError, match="positive integer"):
+        _policy_from_artifact(
+            registry_bad.read_manifest("na_v5_bad_cadence"), request,
+        )
