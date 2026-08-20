@@ -113,6 +113,7 @@ class ExecutionReplayEvidence:
     cash_session_fraction: float
     turnover: float
     unfilled_order_reason_counts: tuple[tuple[str, int], ...]
+    utility_transition_diagnostics: tuple[tuple[str, float | int], ...] = ()
 
     def __post_init__(self) -> None:
         if len(self.base_log_growth) != len(self.stress_log_growth):
@@ -294,6 +295,7 @@ def replay_execution_equivalent(
         cash_session_fraction=cash_fraction,
         turnover=turnover,
         unfilled_order_reason_counts=tuple(sorted(unfilled.items())),
+        utility_transition_diagnostics=(),
     )
 
 
