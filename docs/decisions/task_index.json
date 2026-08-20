@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_SPARSE_GROWTH_SHADOW_CERTIFICATION",
+      "date": "2026-08-20",
+      "adr_id": "ADR_20260820_ML_SPARSE_GROWTH_SHADOW_CERTIFICATION",
+      "domain": "quant",
+      "title": "Sparse growth shadow certification for ML backtests",
+      "why": "Latest ML runs generated fills but all cost-adjusted lower growth bounds remained negative, so dense turnover was not converting Rank-IC into economic growth.",
+      "resolution": "Promoted the existing sparse hold-replace and risk-balanced sizing modes into the default frontier, added paired dense-shadow stress-growth/Holm admission evidence, corrected incumbent cost-bound handling and fail-closed sparse fallback, and added bounded telemetry and regression coverage.",
+      "impact": "Preserves risk, cost, temporal, holdout, and NO_TRADE gates; artifacts are promoted only when absolute and paired stress lower bounds are positive with sparse turnover at most 60 percent of the shadow."
+    },
+    {
       "task_id": "TASK_SPARSE_GROWTH_V5_COMPOUND_GROWTH",
       "date": "2026-08-20",
       "adr_id": "ADR_20260820_SPARSE_GROWTH_V5_COMPOUND_GROWTH",
