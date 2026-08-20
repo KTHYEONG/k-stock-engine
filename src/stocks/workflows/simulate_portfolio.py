@@ -42,6 +42,7 @@ from src.stocks.trading.portfolio_constructor import (
     StockRiskPolicy,
     stock_risk_policy_fingerprint,
 )
+from src.stocks.trading.rebalance_schedule import rebalance_session_indices
 from src.stocks.workflows.contracts import SimulationRequest
 
 
@@ -75,7 +76,19 @@ def simulate_portfolio(
     instruments = _instruments_from_frame(frame)
     base = request.cost_schedule or default_base_schedule()
     stress = request.stress_cost_schedule or default_stress_schedule()
-    decision_indices = _decision_indices(sessions, eligible_from, eligible_to)
+    profile_payload = _parse_policy_profile(artifact_manifest)
+    is_legacy_daily = not (
+        profile_payload is not None
+        and profile_payload.get("execution_evidence_version")
+        == "prepared-equity-v5-sparse-growth"
+    )
+    decision_indices = rebalance_session_indices(
+        sessions,
+        eligible_from,
+        eligible_to,
+        policy.rebalance_frequency_sessions,
+        legacy_daily=is_legacy_daily,
+    )
 
     initial_portfolio = PortfolioSnapshot(
         account_snapshot_id="backtest",
@@ -216,9 +229,35 @@ def _profile_forecast_horizon_sessions(profile: dict[str, object]) -> int | None
     return raw
 
 
+def _profile_sizing_mode(
+    profile: dict[str, object],
+) -> Literal["alpha_vol_squared_v1", "risk_balanced_waterfill_v2"]:
+    """Extract sizing_mode from a policy profile, defaulting to alpha_vol_squared_v1.
+
+    Existing payloads lacking sizing_mode default to alpha_vol_squared_v1
+    for backward-compatible replay of legacy v1-v4 artifacts.
+    """
+    raw = profile.get("sizing_mode")
+    if raw is None:
+        return "alpha_vol_squared_v1"
+    if not isinstance(raw, str):
+        raise ValueError(
+            "sizing_mode must be a string, "
+            f"got {type(raw).__name__}"
+        )
+    if raw not in ("alpha_vol_squared_v1", "risk_balanced_waterfill_v2"):
+        raise ValueError(
+            f"sizing_mode must be 'alpha_vol_squared_v1' or "
+            f"'risk_balanced_waterfill_v2', got {raw!r}"
+        )
+    return cast(
+        Literal["alpha_vol_squared_v1", "risk_balanced_waterfill_v2"], raw
+    )
+
+
 def _profile_execution_utility_mode(
     profile: dict[str, object],
-) -> Literal["legacy_target_interpolation_v1", "delta_cost_aware_v1"]:
+) -> Literal["legacy_target_interpolation_v1", "delta_cost_aware_v1", "sparse_hold_replace_v2"]:
     """Extract execution_utility_mode from a policy profile, defaulting to legacy.
 
     Existing payloads lacking execution_utility_mode default to
@@ -239,13 +278,14 @@ def _profile_execution_utility_mode(
             "execution_utility_mode must be a string, "
             f"got {type(raw).__name__}"
         )
-    if raw not in ("legacy_target_interpolation_v1", "delta_cost_aware_v1"):
+    if raw not in ("legacy_target_interpolation_v1", "delta_cost_aware_v1", "sparse_hold_replace_v2"):
         raise ValueError(
-            "execution_utility_mode must be 'legacy_target_interpolation_v1' or "
-            f"'delta_cost_aware_v1', got {raw!r}"
+            "execution_utility_mode must be 'legacy_target_interpolation_v1', "
+            "'delta_cost_aware_v1', or 'sparse_hold_replace_v2', "
+            f"got {raw!r}"
         )
     return cast(
-        Literal["legacy_target_interpolation_v1", "delta_cost_aware_v1"], raw
+        Literal["legacy_target_interpolation_v1", "delta_cost_aware_v1", "sparse_hold_replace_v2"], raw
     )
 
 
@@ -273,6 +313,7 @@ def _policy_from_artifact(
     ranking_mode = _profile_economic_ranking_mode(profile)
     horizon = _profile_forecast_horizon_sessions(profile)
     mode = _profile_execution_utility_mode(profile)
+    sizing = _profile_sizing_mode(profile)
     return StockRiskPolicy(
         top_k=cast(int, profile["top_k"]),
         gross_cap=cast(float, profile["max_exposure"]),
@@ -285,6 +326,7 @@ def _policy_from_artifact(
         ),
         economic_ranking_mode=ranking_mode,
         execution_utility_mode=mode,
+        sizing_mode=sizing,
     )
 
 
@@ -333,6 +375,21 @@ def _validate_request_policy(
             )
         _validate_prepared_equity_policy(request, profile, artifact_band)
         return
+    if evidence_version == "prepared-equity-v5-sparse-growth":
+        mode = _profile_execution_utility_mode(profile)
+        sizing = _profile_sizing_mode(profile)
+        if mode != "sparse_hold_replace_v2":
+            raise ValueError(
+                "v5 sparse-growth policy requires execution_utility_mode "
+                "'sparse_hold_replace_v2'"
+            )
+        if sizing != "risk_balanced_waterfill_v2":
+            raise ValueError(
+                "v5 sparse-growth policy requires sizing_mode "
+                "'risk_balanced_waterfill_v2'"
+            )
+        _validate_prepared_equity_policy(request, profile, artifact_band)
+        return
     request_fingerprint = policy_portfolio_fingerprint(
         request.top_k,
         request.max_single_weight,
@@ -365,6 +422,7 @@ def _validate_prepared_equity_policy(
     ranking_mode = _profile_economic_ranking_mode(profile)
     horizon = _profile_forecast_horizon_sessions(profile)
     mode = _profile_execution_utility_mode(profile)
+    sizing = _profile_sizing_mode(profile)
     policy = StockRiskPolicy(
         top_k=request.top_k,
         gross_cap=request.max_exposure,
@@ -377,6 +435,7 @@ def _validate_prepared_equity_policy(
         ),
         economic_ranking_mode=ranking_mode,
         execution_utility_mode=mode,
+        sizing_mode=sizing,
     )
     if stock_risk_policy_fingerprint(policy) != profile["risk_policy_fingerprint"]:
         raise ValueError(
