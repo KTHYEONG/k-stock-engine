@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import UTC, datetime
 
 import pytest
@@ -708,4 +709,109 @@ def test_delta_cost_utility_06_artifact_parity_and_legacy(tmp_path) -> None:
                 max_exposure=0.9,
                 participation_limit=0.005,
             ),
+        )
+
+
+def test_simulation_parity_growth_recovery(tmp_path) -> None:
+    """GROWTH_RECOVERY_SIMULATION_PARITY_06.
+
+    An independent simulation reconstructs the persisted v7 horizon-locked
+    policy (active count, candidate pool, cadence, sizing mode, fingerprint)
+    from the artifact payload, and a divergent stored v7 fingerprint fails
+    closed with ValueError before the backtester runs.
+    """
+    from src.stocks.trading.portfolio_constructor import (
+        StockRiskPolicy,
+        stock_risk_policy_fingerprint,
+    )
+    from src.stocks.workflows.simulate_portfolio import _policy_from_artifact
+
+    def _v7_payload(horizon: int, fingerprint: str | None = None) -> str:
+        policy = StockRiskPolicy(
+            top_k=20,
+            gross_cap=0.9,
+            single_name_cap=0.08,
+            participation_limit=0.005,
+            no_trade_band_bps=0.0,
+            rebalance_frequency_sessions=horizon,
+            compounding=CompoundingPolicyConfig(
+                growth_risk_aversion=1.0,
+                forecast_horizon_sessions=horizon,
+            ),
+            economic_ranking_mode="economic_net_v1",
+            execution_utility_mode="delta_cost_aware_v1",
+            sizing_mode="confidence_mean_variance_v1",
+        )
+        effective = math.ceil(0.9 / 0.08)
+        payload = {
+            "profile_id": "lower_bound_only",
+            "no_trade_band_bps": 0.0,
+            "growth_risk_aversion": 1.0,
+            "forecast_horizon_sessions": horizon,
+            "rebalance_frequency_sessions": horizon,
+            "effective_active_count": effective,
+            "candidate_pool_count": 2 * effective,
+            "top_k": 20,
+            "max_single_weight": 0.08,
+            "max_exposure": 0.9,
+            "participation_limit": 0.005,
+            "portfolio_fingerprint": policy_portfolio_fingerprint(20, 0.08, 0.9, 0.005),
+            "execution_evidence_version": "prepared-equity-v7-horizon-locked",
+            "risk_policy_fingerprint": stock_risk_policy_fingerprint(policy),
+            "v7_risk_policy_fingerprint": (
+                fingerprint
+                if fingerprint is not None
+                else stock_risk_policy_fingerprint(policy)
+            ),
+            "execution_policy_id": SCHEDULED_OPEN_POLICY_ID,
+            "execution_policy_hash": SCHEDULED_OPEN_V1.canonical_hash,
+            "economic_ranking_mode": "economic_net_v1",
+            "execution_utility_mode": "delta_cost_aware_v1",
+            "sizing_mode": "confidence_mean_variance_v1",
+        }
+        return json.dumps(payload, sort_keys=True)
+
+    def _publish(registry: ModelArtifactRegistry, artifact_id: str, payload: str) -> str:
+        manifest = ModelManifest(
+            artifact_id=artifact_id,
+            asset_kind=AssetKind.STOCK,
+            feature_set="stock_net_alpha_v1",
+            feature_schema_hash="h",
+            universe_policy_hash="u",
+            label_definition="net_alpha_o2o",
+            label_horizon_sessions=10,
+            eligible_from="2024-01-01T00:00:00+00:00",
+            eligible_to="2024-04-29T00:00:00+00:00",
+            model_type="net_alpha_elastic_net",
+            params={"policy_profile": payload},
+        )
+        registry.publish(_DummyModel(manifest), manifest)
+        return artifact_id
+
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    artifact_id = _publish(registry, "na_v7_artifact", _v7_payload(10))
+    request = SimulationRequest(
+        artifact_id=artifact_id,
+        decision_time=datetime(2024, 4, 29, tzinfo=UTC),
+        top_k=20,
+        max_single_weight=0.08,
+        max_exposure=0.9,
+        participation_limit=0.005,
+    )
+    policy = _policy_from_artifact(registry.read_manifest(artifact_id), request)
+    assert policy.rebalance_frequency_sessions == 10
+    assert policy.compounding.forecast_horizon_sessions == 10
+    assert policy.sizing_mode == "confidence_mean_variance_v1"
+    assert math.ceil(policy.gross_cap / policy.single_name_cap) == 12
+
+    registry_divergent = ModelArtifactRegistry(tmp_path / "divergent")
+    _publish(
+        registry_divergent,
+        "na_v7_bad",
+        _v7_payload(10, fingerprint="deadbeef"),
+    )
+    with pytest.raises(ValueError, match="fingerprint diverges"):
+        _policy_from_artifact(
+            registry_divergent.read_manifest("na_v7_bad"),
+            request,
         )

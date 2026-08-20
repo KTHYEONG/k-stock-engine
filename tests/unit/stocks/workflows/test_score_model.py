@@ -203,3 +203,81 @@ def test_feature_contract_v6_frozen_transform(tmp_path) -> None:
             registry,
             ScoringRequest(artifact_id="v6_artifact", decision_time=datetime(2024, 6, 1, tzinfo=UTC)),
         )
+
+
+def test_feature_alias_growth_recovery(tmp_path) -> None:
+    """GROWTH_RECOVERY_FEATURE_ALIAS_01.
+
+    A manifest whose schema requires ep_ratio and bp_ratio scores a frame that
+    only exposes the prefixed feature__ep_ratio/feature__bp_ratio columns via the
+    feature-source binding, and raises ValueError before model.predict when the
+    canonical and prefixed columns are both present with conflicting values.
+    """
+    roles = {"ep_ratio": "ALPHA", "bp_ratio": "ALPHA"}
+    fit_frame = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:0001", "KRX:0002"],
+            "session": [datetime(2024, 1, 1, tzinfo=UTC)] * 2,
+            "sector": ["S1", "S2"],
+            "ep_ratio": [1.0, 2.0],
+            "bp_ratio": [3.0, 4.0],
+        }
+    )
+    schema = fit_model_feature_schema(fit_frame, roles)
+    schema_json = json.dumps(schema.to_json())
+
+    prefixed_frame = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:0001", "KRX:0002"],
+            "session": [datetime(2024, 1, 1, tzinfo=UTC)] * 2,
+            "sector": ["S1", "S2"],
+            "feature__ep_ratio": [1.0, 2.0],
+            "feature__bp_ratio": [3.0, 4.0],
+        }
+    )
+    prefixed_manifest = stock_net_alpha_manifest(columns=prefixed_frame.columns)
+
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    model = _V6Model(
+        _v6_manifest(
+            "alias_artifact", schema_json, feature_schema_hash=prefixed_manifest.schema_hash
+        ),
+        schema.learner_columns,
+    )
+    registry.publish(model, model.manifest())
+
+    prefixed_snapshot = DatasetSnapshot(manifest=prefixed_manifest, frame=prefixed_frame)
+    scored = score_model(
+        prefixed_snapshot,
+        registry,
+        ScoringRequest(artifact_id="alias_artifact", decision_time=datetime(2024, 6, 1, tzinfo=UTC)),
+    )
+    assert "predicted_net_alpha" in scored.columns
+
+    conflict_frame = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:0001"],
+            "session": [datetime(2024, 1, 1, tzinfo=UTC)],
+            "sector": ["S1"],
+            "ep_ratio": [1.0],
+            "feature__ep_ratio": [9.0],
+        }
+    )
+    conflict_manifest = stock_net_alpha_manifest(columns=conflict_frame.columns)
+    conflict_model = _V6Model(
+        _v6_manifest(
+            "alias_conflict", schema_json, feature_schema_hash=conflict_manifest.schema_hash
+        ),
+        schema.learner_columns,
+    )
+    registry.publish(conflict_model, conflict_model.manifest())
+    conflict_snapshot = DatasetSnapshot(
+        manifest=conflict_manifest,
+        frame=conflict_frame,
+    )
+    with pytest.raises(ValueError, match="conflict"):
+        score_model(
+            conflict_snapshot,
+            registry,
+            ScoringRequest(artifact_id="alias_conflict", decision_time=datetime(2024, 6, 1, tzinfo=UTC)),
+        )

@@ -484,3 +484,49 @@ def test_sparse_growth_v6_exposure_coverage() -> None:
     )
     reason = _coverage_failure_reason(zero_candidate, _v6_request())
     assert "active-coverage-insufficient" in reason
+
+
+def test_interval_evidence_growth_recovery() -> None:
+    """GROWTH_RECOVERY_INTERVAL_EVIDENCE_05.
+
+    A horizon-locked ten-session replay with decision times at sessions 0, 2,
+    and 4 exposes exactly two complete parallel base/stress interval log-growth
+    observations (the incomplete terminal interval is excluded), matching the
+    interval-count evidence admission contract.
+    """
+    import math
+
+    from src.stocks.ml.execution_replay import _decision_interval_log_growth
+
+    base = datetime(2024, 1, 1, tzinfo=UTC)
+    times = [base + timedelta(days=d) for d in range(5)]
+
+    base_equity = [100.0, 110.0, 121.0, 108.9, 119.79]
+    stress_equity = [100.0, 109.0, 118.0, 110.0, 121.0]
+    base_ledger = [
+        BacktestLedgerRow(
+            t, settled_cash=0.0, unsettled_cash=0.0,
+            positions_value=1.0, accrued_costs=0.0, equity=base_equity[i],
+        )
+        for i, t in enumerate(times)
+    ]
+    stress_ledger = [
+        BacktestLedgerRow(
+            t, settled_cash=0.0, unsettled_cash=0.0,
+            positions_value=1.0, accrued_costs=0.0, equity=stress_equity[i],
+        )
+        for i, t in enumerate(times)
+    ]
+
+    decisions = [times[0], times[2], times[4]]
+    base_growth = _decision_interval_log_growth(base_ledger, decisions)
+    stress_growth = _decision_interval_log_growth(stress_ledger, decisions)
+
+    assert len(base_growth) == 2
+    assert len(stress_growth) == 2
+    assert all(math.isfinite(g) for g in base_growth)
+    assert all(math.isfinite(g) for g in stress_growth)
+    assert base_growth[0] == pytest.approx(math.log(121.0 / 100.0))
+    assert base_growth[1] == pytest.approx(math.log(119.79 / 121.0))
+
+    assert _decision_interval_log_growth(base_ledger, [times[0]]) == ()
