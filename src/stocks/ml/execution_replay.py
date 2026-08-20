@@ -16,8 +16,9 @@ target holding period, or rebalance cadence.
 from __future__ import annotations
 
 import hashlib
+import math
 from bisect import bisect_right
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from itertools import pairwise
@@ -124,11 +125,11 @@ class ExecutionReplayEvidence:
     filled_orders: int
     cash_session_fraction: float
     turnover: float
-    observed_interval_count: int
-    invested_interval_count: int
-    invested_interval_fraction: float
-    filled_cycle_count: int
-    unfilled_order_reason_counts: tuple[tuple[str, int], ...]
+    observed_interval_count: int = 0
+    invested_interval_count: int = 0
+    invested_interval_fraction: float = 0.0
+    filled_cycle_count: int = 0
+    unfilled_order_reason_counts: tuple[tuple[str, int], ...] = ()
     utility_transition_diagnostics: tuple[tuple[str, float | int], ...] = ()
     action_diagnostics: tuple[tuple[str, float | int], ...] = ()
 
@@ -307,6 +308,7 @@ def replay_execution_equivalent(
             raise ValueError(
                 f"base and stress ledgers diverged in session count for segment {segment_id}"
             )
+        _decision_interval_log_growth(result.ledger, decisions)
         base_growth.extend(segment_growth)
         stress_growth.extend(stress_segment_growth)
         segment_ids.extend([segment_id] * len(segment_growth))
@@ -500,6 +502,54 @@ def _ledger_growth_and_exposure(
         if ledger[previous_index].positions_value > 0.0:
             invested += 1
     return tuple(growth), invested
+
+
+def _ledger_decision_equity(
+    ledger: Sequence[object], decision_times: Sequence[datetime]
+) -> dict[datetime, float]:
+    """Map each declared decision time to its ledger equity (last occurrence)."""
+    decision_set = set(decision_times)
+    equities: dict[datetime, float] = {}
+    for row in ledger:
+        when = getattr(row, "session", None)
+        equity = getattr(row, "equity", None)
+        if when is None or equity is None:
+            continue
+        if when in decision_set:
+            equities[when] = float(equity)
+    return equities
+
+
+def _decision_interval_log_growth(
+    ledger: Sequence[object],
+    decision_times: Sequence[datetime],
+) -> tuple[float, ...]:
+    """Per-completed-interval log growth between consecutive decision times.
+
+    Returns one finite log-growth observation per *complete* decision interval
+    ``(t_k, t_{k+1})`` for which both endpoints carry a finite positive ledger
+    equity. Incomplete terminal (or otherwise unobserved) intervals are excluded
+    and reported via the returned series length rather than treated as a zero
+    return, so a horizon-locked replay exposes exactly its completed intervals.
+
+    Raises ``ValueError`` only on a non-positive or non-finite equity at an
+    observed decision endpoint (the ledger itself is malformed).
+    """
+    if len(decision_times) < 2:
+        return ()
+    equities = _ledger_decision_equity(ledger, decision_times)
+    growth: list[float] = []
+    for previous, current in pairwise(decision_times):
+        prev_equity = equities.get(previous)
+        curr_equity = equities.get(current)
+        if prev_equity is None or curr_equity is None:
+            continue
+        if not (math.isfinite(prev_equity) and math.isfinite(curr_equity)):
+            raise ValueError("non-finite equity at a decision interval endpoint")
+        if prev_equity <= 0.0 or curr_equity <= 0.0:
+            raise ValueError("non-positive equity at a decision interval endpoint")
+        growth.append(float(math.log(curr_equity / prev_equity)))
+    return tuple(growth)
 
 
 def _filled_sessions(result: BacktestResult) -> int:
