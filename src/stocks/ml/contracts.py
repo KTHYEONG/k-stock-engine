@@ -94,7 +94,8 @@ class PolicyProfile:
     profile_id: str
     no_trade_band_bps: float = 0.0
     growth_risk_aversion: float = 1.0
-    execution_utility_mode: Literal["legacy_target_interpolation_v1", "delta_cost_aware_v1"] = "delta_cost_aware_v1"
+    execution_utility_mode: Literal["legacy_target_interpolation_v1", "delta_cost_aware_v1", "sparse_hold_replace_v2"] = "delta_cost_aware_v1"
+    sizing_mode: Literal["alpha_vol_squared_v1", "risk_balanced_waterfill_v2"] = "alpha_vol_squared_v1"
 
     def __post_init__(self) -> None:
         if not self.profile_id:
@@ -106,10 +107,20 @@ class PolicyProfile:
         if self.execution_utility_mode not in (
             "legacy_target_interpolation_v1",
             "delta_cost_aware_v1",
+            "sparse_hold_replace_v2",
         ):
             raise ValueError(
-                f"execution_utility_mode must be 'legacy_target_interpolation_v1' or "
-                f"'delta_cost_aware_v1', got {self.execution_utility_mode!r}"
+                f"execution_utility_mode must be 'legacy_target_interpolation_v1', "
+                f"'delta_cost_aware_v1', or 'sparse_hold_replace_v2', "
+                f"got {self.execution_utility_mode!r}"
+            )
+        if self.sizing_mode not in (
+            "alpha_vol_squared_v1",
+            "risk_balanced_waterfill_v2",
+        ):
+            raise ValueError(
+                f"sizing_mode must be 'alpha_vol_squared_v1' or "
+                f"'risk_balanced_waterfill_v2', got {self.sizing_mode!r}"
             )
 
 

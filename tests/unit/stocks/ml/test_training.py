@@ -1,6 +1,8 @@
 """Net-alpha trainer: causal OOF discovery and untouched-holdout contracts."""
 from __future__ import annotations
 
+SPARSE_GROWTH_V5_08_SELECTION_GATES = "SPARSE_GROWTH_V5_08_SELECTION_GATES"
+
 import inspect
 import json
 from datetime import UTC, datetime, timedelta
