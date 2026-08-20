@@ -15,6 +15,7 @@ from src.core.paths import (
     STOCK_LABEL_ROOT,
 )
 from src.stocks.cli import train
+from src.stocks.settings import REFERENCE_DATE, REFERENCE_DATETIME
 
 
 def test_train_cli_defaults_to_canonical_roots() -> None:
@@ -67,6 +68,8 @@ def test_train_cli_exposes_net_alpha_args() -> None:
     assert not hasattr(args, "optuna_trials")
     assert not hasattr(args, "lgb_threads")
     assert not hasattr(args, "resume")
+    assert args.decision_time == REFERENCE_DATETIME
+    assert args.research_end == REFERENCE_DATE
 
 
 def test_train_cli_resolves_snapshot_and_composes(monkeypatch) -> None:
@@ -323,3 +326,20 @@ def test_direct_dataset_arguments_rejects_snapshot_id() -> None:
     # When direct dataset IDs are provided, snapshot_id is ignored
     assert args.snapshot_id == "some_snapshot"
     assert args.base_dataset_id == "base_2024"
+
+
+def test_direct_dataset_defaults_use_reference_boundary() -> None:
+    args = train.build_parser().parse_args(
+        [
+            "--artifact-id",
+            "test_artifact",
+            "--base-dataset-id",
+            "base",
+            "--feature-dataset-id",
+            "features",
+            "--label-dataset-id",
+            "labels",
+        ]
+    )
+    assert args.research_end_direct == REFERENCE_DATE
+    assert args.decision_time == REFERENCE_DATETIME
