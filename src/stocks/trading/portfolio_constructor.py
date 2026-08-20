@@ -713,6 +713,16 @@ def _construct_allocations_prepared(
             selected_count=selected_count,
             covariance=covariance,
             covariance_source=covariance_source,
+            economic_inputs=(
+                _economic_transition_inputs(
+                    selected_ids,
+                    [float(econ["alpha_lower_bound"][int(position)]) for position in ranked_positions],
+                    [float(econ["net_alpha_lower_bound"][int(position)]) for position in ranked_positions],
+                    [float(econ["exit_cost_rate"][int(position)]) for position in ranked_positions],
+                )[0]
+                if policy.execution_utility_mode == "sparse_hold_replace_v2" and econ is not None
+                else None
+            ),
         )
     else:
         allocations = _de_risk_allocations(
@@ -774,7 +784,8 @@ class StockRiskPolicy:
         default_factory=list, repr=False, compare=False
     )
     economic_ranking_mode: Literal["raw_score_v1", "economic_net_v1"] = "raw_score_v1"
-    execution_utility_mode: Literal["legacy_target_interpolation_v1", "delta_cost_aware_v1"] = "legacy_target_interpolation_v1"
+    execution_utility_mode: Literal["legacy_target_interpolation_v1", "delta_cost_aware_v1", "sparse_hold_replace_v2"] = "legacy_target_interpolation_v1"
+    sizing_mode: Literal["alpha_vol_squared_v1", "risk_balanced_waterfill_v2"] = "alpha_vol_squared_v1"
 
     def __post_init__(self) -> None:
         if self.top_k <= 0:
@@ -814,10 +825,20 @@ class StockRiskPolicy:
         if self.execution_utility_mode not in (
             "legacy_target_interpolation_v1",
             "delta_cost_aware_v1",
+            "sparse_hold_replace_v2",
         ):
             raise ValueError(
-                "execution_utility_mode must be 'legacy_target_interpolation_v1' or "
-                f"'delta_cost_aware_v1', got {self.execution_utility_mode!r}"
+                "execution_utility_mode must be 'legacy_target_interpolation_v1', "
+                "'delta_cost_aware_v1', or 'sparse_hold_replace_v2', "
+                f"got {self.execution_utility_mode!r}"
+            )
+        if self.sizing_mode not in (
+            "alpha_vol_squared_v1",
+            "risk_balanced_waterfill_v2",
+        ):
+            raise ValueError(
+                "sizing_mode must be 'alpha_vol_squared_v1' or "
+                f"'risk_balanced_waterfill_v2', got {self.sizing_mode!r}"
             )
 
 
@@ -859,6 +880,7 @@ def stock_risk_policy_fingerprint(policy: StockRiskPolicy) -> str:
             },
             "economic_ranking_mode": str(policy.economic_ranking_mode),
             "execution_utility_mode": str(policy.execution_utility_mode),
+            "sizing_mode": str(policy.sizing_mode),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -1016,6 +1038,17 @@ def construct_target_allocations(
 
     feasible = _portfolio_is_feasible(current_weights, sector_of, equity, policy)
     if feasible:
+        economic_inputs = None
+        if policy.execution_utility_mode == "sparse_hold_replace_v2" and all(
+            column in cross_section.columns for column in _ECONOMIC_COLUMNS
+        ):
+            selected = cross_section.filter(pl.col("instrument_id").is_in(ids)).sort("instrument_id")
+            economic_inputs, _ = _economic_transition_inputs(
+                [str(value) for value in selected["instrument_id"].to_list()],
+                [float(value) for value in selected["alpha_lower_bound"].to_list()],
+                [float(value) for value in selected["net_alpha_lower_bound"].to_list()],
+                [float(value) for value in selected["exit_cost_rate"].to_list()],
+            )
         allocations = _build_allocations(
             ids,
             sector_of,
@@ -1032,6 +1065,7 @@ def construct_target_allocations(
             candidate_count=candidate_count,
             ranked_count=ranked_count,
             selected_count=selected_count,
+            economic_inputs=economic_inputs,
         )
     else:
         allocations = _de_risk_allocations(
@@ -1220,10 +1254,40 @@ def _build_allocations(
     selected_count: int = 0,
     covariance: np.ndarray | None = None,
     covariance_source: str = "",
+    economic_inputs: EconomicTransitionInputs | None = None,
 ) -> tuple[Allocation, ...]:
     if covariance is None:
         covariance, covariance_source = _covariance(panel, ids, policy)
-    if priority_alpha_of:
+    sparse_plan: SparseTransitionPlan | None = None
+    if (
+        policy.execution_utility_mode == "sparse_hold_replace_v2"
+        and economic_inputs is not None
+    ):
+        sparse_plan = _select_sparse_hold_replace_active_set(
+            current_weights,
+            ids,
+            economic_inputs,
+            top_k=policy.top_k,
+            enter_rank=policy.enter_rank,
+            band_rate=policy.no_trade_band_bps / 10_000.0,
+        )
+    if policy.sizing_mode == "risk_balanced_waterfill_v2" and sparse_plan is not None:
+        active_ids = list(
+            dict.fromkeys(
+                [*sparse_plan.retained, *sparse_plan.initial_entries]
+                + [challenger for challenger, _ in sparse_plan.replacements]
+            )
+        )
+        waterfilled, _ = _risk_balanced_waterfill(
+            active_ids,
+            vol_of,
+            sector_of,
+            requested_gross=policy.gross_cap,
+            single_name_cap=policy.single_name_cap,
+            sector_cap=policy.sector_cap,
+        )
+        raw_scores = {instrument_id: waterfilled.get(instrument_id, 0.0) for instrument_id in ids}
+    elif priority_alpha_of:
         raw_scores = {
             instrument_id: priority_alpha_of.get(instrument_id, 0.0)
             / max(vol_of[instrument_id] ** 2, _TOLERANCE)
@@ -1288,7 +1352,23 @@ def _build_allocations(
     invalid_cost_input_count = 0
     utility_transition_diagnostics: list[tuple[str, float | int]] = []
 
-    if policy.execution_utility_mode == "delta_cost_aware_v1" and net_lower_bound_of:
+    if policy.execution_utility_mode == "sparse_hold_replace_v2" and sparse_plan is not None:
+        target_full = dict.fromkeys(current_weights, 0.0)
+        for instrument_id, weight in weights.items():
+            if instrument_id in sparse_plan.retained:
+                target_full[instrument_id] = current_weights.get(instrument_id, weight)
+            elif instrument_id in sparse_plan.initial_entries or any(
+                instrument_id == challenger
+                for challenger, _ in sparse_plan.replacements
+            ):
+                target_full[instrument_id] = weight
+        lambda_ = 1.0
+        utility_transition_count = int(bool(sparse_plan.replacements or sparse_plan.initial_entries))
+        utility_hold_count = len(sparse_plan.retained)
+        utility_transition_diagnostics.extend(
+            (("utility_hold_count", utility_hold_count), ("utility_transition_count", utility_transition_count))
+        )
+    elif policy.execution_utility_mode == "delta_cost_aware_v1" and net_lower_bound_of:
         entry_cost_of: dict[str, float] = {}
         exit_cost_of: dict[str, float] = {}
         lower_alpha_of: dict[str, float] = {}
@@ -1436,8 +1516,8 @@ def _build_allocations(
 
 
 def _scale_sectors(
-    weights: dict[str, float],
-    sector_of: dict[str, object],
+    weights: Mapping[str, float],
+    sector_of: Mapping[str, object],
     sector_cap: float,
 ) -> dict[str, float]:
     sector_total: dict[object, float] = {}
@@ -1906,6 +1986,225 @@ def _de_risk_allocations(
 
 def _instrument(instrument_id: str, instruments: Mapping[str, Instrument]) -> Instrument:
     return instruments[instrument_id]
+
+
+@dataclass(frozen=True, slots=True)
+class EconomicTransitionInputs:
+    """Validated economic cost columns for sparse hold/replace decisions.
+
+    ``gross_lower_alpha`` carries the raw calibrated lower-bound alpha before
+    netting round-trip cost.  ``net_lower_alpha`` carries the net lower-bound.
+    ``entry_cost`` and ``exit_cost`` are the one-way executable cost components
+    derived via the cost identity: round_trip = gross_lower - net_lower,
+    entry = round_trip - exit, exit = exit_cost_rate.  All values are indexed
+    by ``instrument_id``.
+    """
+
+    gross_lower_alpha: Mapping[str, float]
+    net_lower_alpha: Mapping[str, float]
+    entry_cost: Mapping[str, float]
+    exit_cost: Mapping[str, float]
+
+
+@dataclass(frozen=True, slots=True)
+class SparseTransitionPlan:
+    """Deterministic sparse hold/replace decision for one cross-section.
+
+    ``retained`` lists incumbent names kept at unchanged weight.
+    ``initial_entries`` lists new names admitted at rank <= ``enter_rank``.
+    ``replacements`` is a tuple of ``(challenger, incumbent)`` pairs.
+    ``cash_exits`` lists incumbents sold to cash (not replaced).
+    ``invalid_reason`` is ``None`` when the plan is valid; otherwise it
+    describes the economic-data failure that forced a hold/sell-only fallback.
+    """
+
+    retained: tuple[str, ...]
+    initial_entries: tuple[str, ...]
+    replacements: tuple[tuple[str, str], ...]
+    cash_exits: tuple[str, ...]
+    invalid_reason: str | None
+
+
+def _economic_transition_inputs(
+    instrument_ids: Sequence[str],
+    alpha_lower_bound: Sequence[float],
+    net_alpha_lower_bound: Sequence[float],
+    exit_cost_rate: Sequence[float],
+) -> tuple[EconomicTransitionInputs | None, str | None]:
+    """Validate and extract economic cost components via the cost identity.
+
+    For each candidate ``i``:
+        round_trip_i = alpha_lower_bound_i - net_alpha_lower_bound_i
+        entry_i      = round_trip_i - exit_cost_rate_i
+        exit_i       = exit_cost_rate_i
+
+    Returns ``(inputs, None)`` on success or ``(None, reason)`` when any row
+    has non-finite, negative, or inconsistent components.  An inconsistent row
+    is never silently accepted; the caller must treat it as hold/sell-only.
+    """
+    gross: dict[str, float] = {}
+    net: dict[str, float] = {}
+    entry: dict[str, float] = {}
+    exit_: dict[str, float] = {}
+    n = len(instrument_ids)
+    if not (len(alpha_lower_bound) == len(net_alpha_lower_bound) == len(exit_cost_rate) == n):
+        return None, "length-mismatch"
+    for i in range(n):
+        iid = str(instrument_ids[i])
+        alb = alpha_lower_bound[i]
+        nlb = net_alpha_lower_bound[i]
+        xcr = exit_cost_rate[i]
+        if not (math.isfinite(alb) and math.isfinite(nlb) and math.isfinite(xcr)):
+            return None, f"non-finite-economic:{iid}"
+        if alb < -1e-12 or nlb < -1e-12 or xcr < -1e-12:
+            return None, f"negative-economic:{iid}"
+        rt = alb - nlb
+        en = rt - xcr
+        if abs(rt - en - xcr) > 1e-12:
+            return None, f"inconsistent-cost-identity:{iid}"
+        gross[iid] = alb
+        net[iid] = nlb
+        entry[iid] = max(en, 0.0)
+        exit_[iid] = max(xcr, 0.0)
+    return EconomicTransitionInputs(
+        gross_lower_alpha=gross,
+        net_lower_alpha=net,
+        entry_cost=entry,
+        exit_cost=exit_,
+    ), None
+
+
+def _select_sparse_hold_replace_active_set(
+    current_weights: Mapping[str, float],
+    ranked_candidates: Sequence[str],
+    economics: EconomicTransitionInputs,
+    *,
+    top_k: int,
+    enter_rank: int,
+    band_rate: float,
+) -> SparseTransitionPlan:
+    """Stateful sparse hold/replace selection under the marginal invariant.
+
+    A challenger ``i`` replaces incumbent ``j`` only when:
+        alpha_lb_i - alpha_lb_j - entry_i - exit_j - band > 0
+
+    Unchanged incumbents keep their current weight exactly.  Initial cash
+    deployment admits at most ``enter_rank`` names with
+    ``net_alpha_lower_bound - band > 0``.  The active set never exceeds
+    ``top_k``.
+
+    Replacements are prioritized first, then initial entries fill remaining
+    capacity.
+    """
+    incumbent_ids = set(current_weights)
+    candidate_list = list(ranked_candidates)
+
+    retained: list[str] = []
+    initial_entries: list[str] = []
+    replacements: list[tuple[str, str]] = []
+    cash_exits: list[str] = []
+
+    net_lb = economics.net_lower_alpha
+    gross_lb = economics.gross_lower_alpha
+    entry_cost = economics.entry_cost
+    exit_cost = economics.exit_cost
+
+    replaced_incumbents: set[str] = set()
+    used_challengers: set[str] = set()
+
+    incumbents_sorted = sorted(
+        [iid for iid in incumbent_ids if iid in gross_lb],
+        key=lambda iid: gross_lb.get(iid, 0.0),
+        reverse=True,
+    )
+
+    for incumbent in incumbents_sorted:
+        if len(replacements) + len(initial_entries) >= top_k:
+            break
+        best_challenger: str | None = None
+        best_marginal = 0.0
+        for challenger in candidate_list:
+            if challenger in incumbent_ids or challenger in used_challengers:
+                continue
+            alb_i = gross_lb.get(challenger, 0.0)
+            alb_j = gross_lb.get(incumbent, 0.0)
+            ec_i = entry_cost.get(challenger, 0.0)
+            xc_j = exit_cost.get(incumbent, 0.0)
+            marginal = alb_i - alb_j - ec_i - xc_j - band_rate
+            if marginal > best_marginal:
+                best_marginal = marginal
+                best_challenger = challenger
+        if best_challenger is not None and best_marginal > 0:
+            replacements.append((best_challenger, incumbent))
+            used_challengers.add(best_challenger)
+            replaced_incumbents.add(incumbent)
+        else:
+            retained.append(incumbent)
+
+    for candidate in candidate_list:
+        if len(initial_entries) + len(replacements) >= top_k:
+            break
+        if candidate in incumbent_ids or candidate in used_challengers:
+            continue
+        nlb = net_lb.get(candidate, 0.0)
+        if nlb - band_rate > 0 and len(initial_entries) < enter_rank:
+            initial_entries.append(candidate)
+
+    cash_exits = [
+        iid for iid in incumbent_ids
+        if iid not in retained and iid not in replaced_incumbents
+    ]
+
+    return SparseTransitionPlan(
+        retained=tuple(retained),
+        initial_entries=tuple(initial_entries),
+        replacements=tuple(replacements),
+        cash_exits=tuple(cash_exits),
+        invalid_reason=None,
+    )
+
+
+def _risk_balanced_waterfill(
+    instrument_ids: Sequence[str],
+    volatility_of: Mapping[str, float],
+    sector_of: Mapping[str, object],
+    *,
+    requested_gross: float,
+    single_name_cap: float,
+    sector_cap: float,
+) -> tuple[dict[str, float], float]:
+    """Inverse-volatility water-fill under single-name and sector caps.
+
+    ``q_i = 1 / max(sigma_i, epsilon)`` then capped and redistributed until
+    the requested gross is reached or no feasible capacity remains.
+
+    Returns ``(weights, unallocated_fraction)`` where ``weights`` maps
+    instrument_id to target weight and ``unallocated_fraction`` is the
+    remaining capacity as a fraction of ``requested_gross``.
+    """
+    if not instrument_ids:
+        return {}, 1.0
+    epsilon = 1e-12
+    raw: dict[str, float] = {}
+    for iid in instrument_ids:
+        vol = max(volatility_of.get(iid, epsilon), epsilon)
+        raw[iid] = 1.0 / vol
+
+    total_raw = sum(raw.values())
+    if total_raw <= 0.0:
+        return dict.fromkeys(instrument_ids, 0.0), 1.0
+    weights = {
+        iid: min(raw[iid] / total_raw * requested_gross, single_name_cap)
+        for iid in instrument_ids
+    }
+    weights = _scale_sectors(weights, sector_of, sector_cap)
+    total = sum(weights.values())
+    if total > requested_gross:
+        factor = requested_gross / total
+        weights = {iid: w * factor for iid, w in weights.items()}
+        total = requested_gross
+    unallocated = (requested_gross - total) / requested_gross if requested_gross > 0 else 0.0
+    return weights, max(0.0, unallocated)
 
 
 def _post_validate(
