@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_COMPOUND_GROWTH_DELTA_COST_AWARE",
+      "date": "2026-08-20",
+      "adr_id": "ADR_20260820_ML_COMPOUND_GROWTH_DELTA_COST_AWARE",
+      "domain": "quant",
+      "title": "Delta-cost-aware ML compounding execution validation",
+      "why": "Full h10 direct run had positive fold Rank-IC but all cost-after-growth lower bounds were negative; prior target interpolation did not price marginal turnover at transition time.",
+      "resolution": "Implemented and executed a delta-cost-aware transition policy with horizon-unit lower-confidence utility, preserved fail-closed gates, recorded full and smoke runs, and identified turnover increase plus legacy artifact fingerprint incompatibility; no artifact was promoted.",
+      "impact": "Latest full run completed 3-fold/200-bootstrap over 920008 feature rows and remained NO_TRADE; lower-bound-only stress lower growth was -7.4508 bps with turnover 13.1267 and 18631 fills. Independent simulation of the prior v1 artifact failed closed on risk-policy fingerprint mismatch."
+    },
+    {
       "task_id": "TASK_ML_COMPOUND_GROWTH_HORIZON",
       "date": "2026-08-18",
       "adr_id": "ADR_20260818_ML_COMPOUND_GROWTH_HORIZON",
