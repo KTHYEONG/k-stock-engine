@@ -585,3 +585,127 @@ def test_legacy_v2_replay_is_stable(tmp_path) -> None:
 
     profile = json.loads(artifact_manifest.params["policy_profile"])
     assert _profile_forecast_horizon_sessions(profile) is None
+
+
+DELTA_COST_UTILITY_06 = "DELTA_COST_UTILITY_06_ARTIFACT_PARITY_AND_LEGACY"
+
+
+def test_delta_cost_utility_06_artifact_parity_and_legacy(tmp_path) -> None:
+    """v4 invalid mode raises ValueError; v1-v3 reconstructs legacy; valid v4 reconstructs matching fingerprint."""
+    from src.stocks.workflows.simulate_portfolio import (
+        _policy_from_artifact,
+        _profile_execution_utility_mode,
+    )
+
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+
+    # v1-v3 profile without execution_utility_mode -> legacy
+    v1_profile = {
+        "profile_id": "lower_bound_only",
+        "no_trade_band_bps": 0.0,
+        "top_k": 20,
+        "max_single_weight": 0.08,
+        "max_exposure": 0.9,
+        "participation_limit": 0.005,
+        "portfolio_fingerprint": policy_portfolio_fingerprint(20, 0.08, 0.9, 0.005),
+    }
+    assert _profile_execution_utility_mode(v1_profile) == "legacy_target_interpolation_v1"
+
+    # v4 with invalid mode
+    v4_invalid = {**v1_profile, "execution_utility_mode": "unknown"}
+    with pytest.raises(ValueError, match="execution_utility_mode must be"):
+        _profile_execution_utility_mode(v4_invalid)
+
+    # v4 with valid mode
+    v4_valid = {**v1_profile, "execution_utility_mode": "delta_cost_aware_v1"}
+    assert _profile_execution_utility_mode(v4_valid) == "delta_cost_aware_v1"
+
+    # v4 requiring mode but missing it
+    v4_missing = {
+        **v1_profile,
+        "execution_evidence_version": "prepared-equity-v4-delta-cost-aware",
+    }
+    with pytest.raises(ValueError, match="execution_utility_mode is required"):
+        _profile_execution_utility_mode(v4_missing)
+
+    # Publish a v4 artifact and verify fingerprint matches
+    from src.stocks.trading.portfolio_constructor import (
+        StockRiskPolicy,
+        stock_risk_policy_fingerprint,
+    )
+
+    v4_policy = StockRiskPolicy(
+        top_k=20, gross_cap=0.9, single_name_cap=0.08,
+        participation_limit=0.005, no_trade_band_bps=0.0,
+        execution_utility_mode="delta_cost_aware_v1",
+    )
+    v4_payload = json.dumps({
+        **v1_profile,
+        "execution_utility_mode": "delta_cost_aware_v1",
+        "execution_evidence_version": "prepared-equity-v4-delta-cost-aware",
+        "risk_policy_fingerprint": stock_risk_policy_fingerprint(v4_policy),
+        "execution_policy_id": SCHEDULED_OPEN_POLICY_ID,
+        "execution_policy_hash": SCHEDULED_OPEN_V1.canonical_hash,
+    }, sort_keys=True)
+    v4_manifest = ModelManifest(
+        artifact_id="na_v4_artifact",
+        asset_kind=AssetKind.STOCK,
+        feature_set="stock_net_alpha_v1",
+        feature_schema_hash="h",
+        universe_policy_hash="u",
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=5,
+        eligible_from="2024-01-01T00:00:00+00:00",
+        eligible_to="2024-04-29T00:00:00+00:00",
+        model_type="net_alpha_elastic_net",
+        params={"policy_profile": v4_payload},
+    )
+    registry.publish(_DummyModel(v4_manifest), v4_manifest)
+    artifact_manifest = registry.read_manifest("na_v4_artifact")
+    request = SimulationRequest(
+        artifact_id="na_v4_artifact",
+        decision_time=datetime(2024, 4, 29, tzinfo=UTC),
+        top_k=20,
+        max_single_weight=0.08,
+        max_exposure=0.9,
+        participation_limit=0.005,
+    )
+    policy = _policy_from_artifact(artifact_manifest, request)
+    assert policy.execution_utility_mode == "delta_cost_aware_v1"
+    assert stock_risk_policy_fingerprint(policy) == stock_risk_policy_fingerprint(v4_policy)
+
+    # Mismatched fingerprint fails closed
+    bad_payload = json.dumps({
+        **v1_profile,
+        "execution_utility_mode": "delta_cost_aware_v1",
+        "execution_evidence_version": "prepared-equity-v4-delta-cost-aware",
+        "risk_policy_fingerprint": "deadbeef",
+        "execution_policy_id": SCHEDULED_OPEN_POLICY_ID,
+        "execution_policy_hash": SCHEDULED_OPEN_V1.canonical_hash,
+    }, sort_keys=True)
+    bad_manifest = ModelManifest(
+        artifact_id="na_v4_bad",
+        asset_kind=AssetKind.STOCK,
+        feature_set="stock_net_alpha_v1",
+        feature_schema_hash="h",
+        universe_policy_hash="u",
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=5,
+        eligible_from="2024-01-01T00:00:00+00:00",
+        eligible_to="2024-04-29T00:00:00+00:00",
+        model_type="net_alpha_elastic_net",
+        params={"policy_profile": bad_payload},
+    )
+    registry.publish(_DummyModel(bad_manifest), bad_manifest)
+    with pytest.raises(ValueError, match="risk-policy fingerprint diverges"):
+        _policy_from_artifact(
+            registry.read_manifest("na_v4_bad"),
+            SimulationRequest(
+                artifact_id="na_v4_bad",
+                decision_time=datetime(2024, 4, 29, tzinfo=UTC),
+                top_k=20,
+                max_single_weight=0.08,
+                max_exposure=0.9,
+                participation_limit=0.005,
+            ),
+        )

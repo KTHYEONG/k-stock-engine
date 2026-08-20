@@ -774,6 +774,7 @@ class StockRiskPolicy:
         default_factory=list, repr=False, compare=False
     )
     economic_ranking_mode: Literal["raw_score_v1", "economic_net_v1"] = "raw_score_v1"
+    execution_utility_mode: Literal["legacy_target_interpolation_v1", "delta_cost_aware_v1"] = "legacy_target_interpolation_v1"
 
     def __post_init__(self) -> None:
         if self.top_k <= 0:
@@ -809,6 +810,14 @@ class StockRiskPolicy:
         if self.economic_ranking_mode not in ("raw_score_v1", "economic_net_v1"):
             raise ValueError(
                 "economic_ranking_mode must be 'raw_score_v1' or 'economic_net_v1'"
+            )
+        if self.execution_utility_mode not in (
+            "legacy_target_interpolation_v1",
+            "delta_cost_aware_v1",
+        ):
+            raise ValueError(
+                "execution_utility_mode must be 'legacy_target_interpolation_v1' or "
+                f"'delta_cost_aware_v1', got {self.execution_utility_mode!r}"
             )
 
 
@@ -849,6 +858,7 @@ def stock_risk_policy_fingerprint(policy: StockRiskPolicy) -> str:
                 ),
             },
             "economic_ranking_mode": str(policy.economic_ranking_mode),
+            "execution_utility_mode": str(policy.execution_utility_mode),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -1273,35 +1283,120 @@ def _build_allocations(
         compounding_applied = True
     gross_after_compounding = sum(weights.values())
 
-    if policy.turnover_budget > 0.0:
-        target_full = dict.fromkeys(current_weights, 0.0)
-        for instrument_id, weight in weights.items():
-            target_full[instrument_id] = weight
-        lambda_ = _turnover_lambda(target_full, current_weights, policy.turnover_budget)
-        for instrument_id in target_full:
-            current = current_weights.get(instrument_id, 0.0)
-            target_full[instrument_id] = current + lambda_ * (
-                target_full[instrument_id] - current
-            )
-    else:
-        target_full = dict(weights)
-        lambda_ = 1.0
+    utility_hold_count = 0
+    utility_transition_count = 0
+    invalid_cost_input_count = 0
+    utility_transition_diagnostics: list[tuple[str, float | int]] = []
 
-    if policy.participation_limit > 0.0:
-        for instrument_id in current_weights:
-            target_full.setdefault(instrument_id, 0.0)
-        for instrument_id, target in target_full.items():
-            current = current_weights.get(instrument_id, 0.0)
-            delta_cap = policy.participation_limit * adtv_of.get(
-                instrument_id, 0.0
-            ) / equity
-            if delta_cap <= 0.0:
-                raise PortfolioConstraintError(
-                    f"missing capacity for {instrument_id}"
-                )
-            target_full[instrument_id] = min(
-                max(target, current - delta_cap), current + delta_cap
+    if policy.execution_utility_mode == "delta_cost_aware_v1" and net_lower_bound_of:
+        entry_cost_of: dict[str, float] = {}
+        exit_cost_of: dict[str, float] = {}
+        lower_alpha_of: dict[str, float] = {}
+        for instrument_id in ids:
+            nlb = net_lower_bound_of.get(instrument_id)
+            if nlb is None or not math.isfinite(nlb):
+                invalid_cost_input_count += 1
+                continue
+            al = net_lower_bound_of.get(instrument_id, 0.0)
+            exit_cost_of[instrument_id] = al if al > 0.0 else 0.0
+            entry_cost_of[instrument_id] = max(
+                al - exit_cost_of.get(instrument_id, 0.0), 0.0
             )
+            lower_alpha_of[instrument_id] = nlb
+
+        if not invalid_cost_input_count and covariance is not None:
+            target_full_raw = dict.fromkeys(current_weights, 0.0)
+            for instrument_id, weight in weights.items():
+                target_full_raw[instrument_id] = weight
+            target_ids = sorted(set(current_weights) | set(weights))
+            final_weights, selected_scale, invalid_reason = (
+                _select_delta_cost_aware_transition(
+                    current_weights,
+                    target_full_raw,
+                    lower_alpha_of,
+                    entry_cost_of,
+                    exit_cost_of,
+                    covariance,
+                    target_ids,
+                    max(1, policy.compounding.forecast_horizon_sessions or 1),
+                    policy.compounding.growth_risk_aversion,
+                )
+            )
+            if invalid_reason:
+                invalid_cost_input_count += 1
+                target_full = dict(current_weights)
+                lambda_ = 0.0
+            else:
+                target_full = final_weights
+                lambda_ = selected_scale
+                if selected_scale > 0.0:
+                    utility_transition_count = 1
+                else:
+                    utility_hold_count = 1
+                utility_transition_diagnostics.append(
+                    ("utility_scale", selected_scale)
+                )
+                utility_transition_diagnostics.append(
+                    ("utility_hold_count", utility_hold_count)
+                )
+                utility_transition_diagnostics.append(
+                    ("utility_transition_count", utility_transition_count)
+                )
+                utility_transition_diagnostics.append(
+                    ("invalid_cost_input_count", invalid_cost_input_count)
+                )
+
+                if policy.participation_limit > 0.0:
+                    for instrument_id in current_weights:
+                        target_full.setdefault(instrument_id, 0.0)
+                    for instrument_id, target in target_full.items():
+                        current = current_weights.get(instrument_id, 0.0)
+                        delta_cap = (
+                            policy.participation_limit
+                            * adtv_of.get(instrument_id, 0.0)
+                            / equity
+                        )
+                        if delta_cap <= 0.0:
+                            raise PortfolioConstraintError(
+                                f"missing capacity for {instrument_id}"
+                            )
+                        target_full[instrument_id] = min(
+                            max(target, current - delta_cap),
+                            current + delta_cap,
+                        )
+        else:
+            target_full = dict(current_weights)
+            lambda_ = 0.0
+    else:
+        if policy.turnover_budget > 0.0:
+            target_full = dict.fromkeys(current_weights, 0.0)
+            for instrument_id, weight in weights.items():
+                target_full[instrument_id] = weight
+            lambda_ = _turnover_lambda(target_full, current_weights, policy.turnover_budget)
+            for instrument_id in target_full:
+                current = current_weights.get(instrument_id, 0.0)
+                target_full[instrument_id] = current + lambda_ * (
+                    target_full[instrument_id] - current
+                )
+        else:
+            target_full = dict(weights)
+            lambda_ = 1.0
+
+        if policy.participation_limit > 0.0:
+            for instrument_id in current_weights:
+                target_full.setdefault(instrument_id, 0.0)
+            for instrument_id, target in target_full.items():
+                current = current_weights.get(instrument_id, 0.0)
+                delta_cap = policy.participation_limit * adtv_of.get(
+                    instrument_id, 0.0
+                ) / equity
+                if delta_cap <= 0.0:
+                    raise PortfolioConstraintError(
+                        f"missing capacity for {instrument_id}"
+                    )
+                target_full[instrument_id] = min(
+                    max(target, current - delta_cap), current + delta_cap
+                )
 
     if compounding_applied:
         _record_compounding_decision(
@@ -1637,6 +1732,125 @@ def _turnover_lambda(
     if turnover <= 0.0:
         return 1.0
     return min(1.0, budget / turnover)
+
+
+def _lower_confidence_transition_utility(
+    current_weights: Mapping[str, float],
+    target_weights: Mapping[str, float],
+    lower_alpha_of: Mapping[str, float],
+    entry_cost_of: Mapping[str, float],
+    exit_cost_of: Mapping[str, float],
+    covariance: np.ndarray,
+    ids: Sequence[str],
+    horizon_sessions: int,
+    risk_aversion: float,
+    scale: float,
+) -> float:
+    """Lower-confidence horizon-unit log-utility along w(s) = w- + s * d.
+
+    U(s) = (l^T w(s) - sum_i[c_i+ max(d_i,0) + c_i- max(-d_i,0)] * s) / H
+            - gamma/2 * w(s)^T Sigma w(s)
+    """
+    w0 = np.asarray([current_weights.get(i, 0.0) for i in ids], dtype=np.float64)
+    w1 = np.asarray([target_weights.get(i, 0.0) for i in ids], dtype=np.float64)
+    d = w1 - w0
+    ws = w0 + scale * d
+
+    alpha_vec = np.asarray([lower_alpha_of.get(i, 0.0) for i in ids], dtype=np.float64)
+    entry_vec = np.asarray([entry_cost_of.get(i, 0.0) for i in ids], dtype=np.float64)
+    exit_vec = np.asarray([exit_cost_of.get(i, 0.0) for i in ids], dtype=np.float64)
+
+    alpha_term = float(alpha_vec @ ws)
+    cost_term = float(
+        entry_vec @ np.maximum(d, 0.0) + exit_vec @ np.maximum(-d, 0.0)
+    ) * scale
+    var_term = 0.5 * risk_aversion * float(ws @ covariance @ ws)
+
+    return (alpha_term - cost_term) / horizon_sessions - var_term
+
+
+def _select_delta_cost_aware_transition(
+    current_weights: Mapping[str, float],
+    constrained_target: Mapping[str, float],
+    lower_alpha_of: Mapping[str, float],
+    entry_cost_of: Mapping[str, float],
+    exit_cost_of: Mapping[str, float],
+    covariance: np.ndarray,
+    ids: Sequence[str],
+    horizon_sessions: int,
+    risk_aversion: float,
+) -> tuple[dict[str, float], float, str | None]:
+    """Analytic cost-aware transition on the feasible line from w- to w*.
+
+    Returns ``(final_weights, selected_scale, invalid_reason)``.
+    Compares s=0 (hold) and the analytic interior/endpoint optimum;
+    ties break in favor of s=0.
+    """
+    if not ids:
+        return dict(current_weights), 0.0, None
+
+    for i in ids:
+        a = lower_alpha_of.get(i)
+        if a is None or not math.isfinite(a):
+            return dict(current_weights), 0.0, "non-finite-lower-alpha"
+        ec = entry_cost_of.get(i)
+        if ec is None or not math.isfinite(ec) or ec < 0.0:
+            return dict(current_weights), 0.0, "invalid-entry-cost"
+        xc = exit_cost_of.get(i)
+        if xc is None or not math.isfinite(xc) or xc < 0.0:
+            return dict(current_weights), 0.0, "invalid-exit-cost"
+
+    k = len(ids)
+    w0 = np.asarray([current_weights.get(i, 0.0) for i in ids], dtype=np.float64)
+    w1 = np.asarray([constrained_target.get(i, 0.0) for i in ids], dtype=np.float64)
+    d = w1 - w0
+
+    alpha_vec = np.asarray([lower_alpha_of.get(i, 0.0) for i in ids], dtype=np.float64)
+    entry_vec = np.asarray([entry_cost_of.get(i, 0.0) for i in ids], dtype=np.float64)
+    exit_vec = np.asarray([exit_cost_of.get(i, 0.0) for i in ids], dtype=np.float64)
+
+    if not np.all(np.isfinite(covariance)) or covariance.shape != (k, k):
+        return dict(current_weights), 0.0, "invalid-covariance"
+
+    quad = float(d @ covariance @ d)
+    lin = float(alpha_vec @ d) / horizon_sessions - float(
+        entry_vec @ np.maximum(d, 0.0) + exit_vec @ np.maximum(-d, 0.0)
+    )
+
+    u0 = _lower_confidence_transition_utility(
+        current_weights, constrained_target, lower_alpha_of,
+        entry_cost_of, exit_cost_of, covariance, ids,
+        horizon_sessions, risk_aversion, 0.0,
+    )
+
+    candidates = [0.0, 1.0]
+    if quad > 0.0:
+        s_interior = -lin / (risk_aversion * quad)
+        if 0.0 < s_interior < 1.0:
+            candidates.append(s_interior)
+
+    best_s = 0.0
+    best_u = u0
+    for s in candidates:
+        u = _lower_confidence_transition_utility(
+            current_weights, constrained_target, lower_alpha_of,
+            entry_cost_of, exit_cost_of, covariance, ids,
+            horizon_sessions, risk_aversion, s,
+        )
+        if u > best_u + _TOLERANCE:
+            best_u = u
+            best_s = s
+    s_star = best_s
+    u_star = best_u
+
+    if u_star <= u0 + _TOLERANCE:
+        return dict(current_weights), 0.0, None
+
+    final = {
+        i: current_weights.get(i, 0.0) + s_star * (constrained_target.get(i, 0.0) - current_weights.get(i, 0.0))
+        for i in ids
+    }
+    return final, s_star, None
 
 
 def _portfolio_is_feasible(

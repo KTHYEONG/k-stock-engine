@@ -11,7 +11,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import polars as pl
@@ -94,6 +94,7 @@ class PolicyProfile:
     profile_id: str
     no_trade_band_bps: float = 0.0
     growth_risk_aversion: float = 1.0
+    execution_utility_mode: Literal["legacy_target_interpolation_v1", "delta_cost_aware_v1"] = "delta_cost_aware_v1"
 
     def __post_init__(self) -> None:
         if not self.profile_id:
@@ -102,6 +103,14 @@ class PolicyProfile:
             raise ValueError("no_trade_band_bps must be a finite non-negative value")
         if not np.isfinite(self.growth_risk_aversion) or self.growth_risk_aversion <= 0.0:
             raise ValueError("growth_risk_aversion must be a finite strictly positive value")
+        if self.execution_utility_mode not in (
+            "legacy_target_interpolation_v1",
+            "delta_cost_aware_v1",
+        ):
+            raise ValueError(
+                f"execution_utility_mode must be 'legacy_target_interpolation_v1' or "
+                f"'delta_cost_aware_v1', got {self.execution_utility_mode!r}"
+            )
 
 
 DEFAULT_POLICY_PROFILES = (

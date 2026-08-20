@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 import pytest
 
@@ -276,3 +277,79 @@ def test_identical_scores_produce_identical_schedule_across_horizons() -> None:
     assert low_evidence.segment_ids == high_evidence.segment_ids
     assert low_evidence.planned_cycles == high_evidence.planned_cycles
     assert low_evidence.filled_orders == high_evidence.filled_orders
+
+
+DELTA_COST_UTILITY_05 = "DELTA_COST_UTILITY_05_REPLAY_TELEMETRY"
+
+
+def test_delta_cost_utility_05_replay_telemetry() -> None:
+    """Replay under delta_cost_aware_v1 returns finite non-negative diagnostics."""
+    market = _market_frame()
+    instruments = {
+        str(instrument_id): Instrument(
+            str(instrument_id), AssetKind.STOCK, "KRX",
+            str(instrument_id).split(":")[-1], "KRW", lot_size=1,
+        )
+        for instrument_id in sorted(market["instrument_id"].unique().to_list())
+    }
+    sessions = sorted(market["session"].unique().to_list())
+    manifest = DatasetManifest(
+        asset_kind=AssetKind.STOCK,
+        schema_version="v1",
+        schema_hash="h",
+        provider_version="p",
+        universe_policy_version="u",
+        universe_policy_hash="u",
+        feature_set="stock_net_alpha_v1",
+        feature_set_hash="f",
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=5,
+        time_start=sessions[0],
+        time_end=sessions[-1],
+        generated_time=sessions[-1],
+        row_count=market.height,
+    )
+    context = ExecutionReplayContext(
+        registry=ModelArtifactRegistry(Path("mem://replay-telemetry")),
+        manifest=manifest,
+        instruments=instruments,
+        artifact_id="telemetry_test",
+        strategy_id="telemetry_test",
+        initial_portfolio=PortfolioSnapshot(
+            account_snapshot_id="oof",
+            as_of=datetime(2024, 1, 1, tzinfo=UTC),
+            settled_cash=100_000_000.0,
+            unsettled_cash=0.0,
+            positions=(),
+        ),
+        risk_policy=StockRiskPolicy(
+            top_k=3, gross_cap=0.9, single_name_cap=0.3, sector_cap=0.5,
+            participation_limit=0.01, no_trade_band_bps=0.0,
+            execution_utility_mode="delta_cost_aware_v1",
+        ),
+        base_cost_schedule=default_base_schedule(),
+        stress_cost_schedule=default_stress_schedule(),
+        liquidity_model=stock_liquidity_model(),
+        stress_liquidity_model=stock_liquidity_model(stress_multiplier=1.5),
+        execution_policy=SCHEDULED_OPEN_V1,
+        seed=42,
+    )
+    scores = _score_frame()
+    segments = _decision_sessions(market)
+    request = ExecutionEquivalentReplayRequest(
+        context=context,
+        market_frame=market,
+        score_frame=scores,
+        segment_column=_SEGMENT_COLUMN,
+        decision_sessions_by_segment=segments,
+        horizon_sessions=5,
+    )
+    evidence = replay_execution_equivalent(request)
+    assert isinstance(evidence, ExecutionReplayEvidence)
+    assert evidence.planned_cycles > 0
+    assert evidence.filled_orders > 0
+    assert evidence.turnover >= 0.0
+    assert 0.0 <= evidence.cash_session_fraction <= 1.0
+    assert len(evidence.base_log_growth) == len(evidence.stress_log_growth)
+    assert all(np.isfinite(g) for g in evidence.base_log_growth)
+    assert all(np.isfinite(g) for g in evidence.stress_log_growth)

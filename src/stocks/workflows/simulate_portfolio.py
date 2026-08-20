@@ -216,6 +216,39 @@ def _profile_forecast_horizon_sessions(profile: dict[str, object]) -> int | None
     return raw
 
 
+def _profile_execution_utility_mode(
+    profile: dict[str, object],
+) -> Literal["legacy_target_interpolation_v1", "delta_cost_aware_v1"]:
+    """Extract execution_utility_mode from a policy profile, defaulting to legacy.
+
+    Existing payloads lacking execution_utility_mode default to
+    legacy_target_interpolation_v1 for backward-compatible replay.
+    v4 artifacts with an invalid mode raise ``ValueError``.
+    """
+    raw = profile.get("execution_utility_mode")
+    if raw is None:
+        evidence_version = profile.get("execution_evidence_version", "")
+        if evidence_version == "prepared-equity-v4-delta-cost-aware":
+            raise ValueError(
+                "execution_utility_mode is required for "
+                "prepared-equity-v4-delta-cost-aware"
+            )
+        return "legacy_target_interpolation_v1"
+    if not isinstance(raw, str):
+        raise ValueError(
+            "execution_utility_mode must be a string, "
+            f"got {type(raw).__name__}"
+        )
+    if raw not in ("legacy_target_interpolation_v1", "delta_cost_aware_v1"):
+        raise ValueError(
+            "execution_utility_mode must be 'legacy_target_interpolation_v1' or "
+            f"'delta_cost_aware_v1', got {raw!r}"
+        )
+    return cast(
+        Literal["legacy_target_interpolation_v1", "delta_cost_aware_v1"], raw
+    )
+
+
 def _policy_from_artifact(
     artifact_manifest: ModelManifest, request: SimulationRequest
 ) -> StockRiskPolicy:
@@ -239,6 +272,7 @@ def _policy_from_artifact(
     aversion = _profile_growth_risk_aversion(profile)
     ranking_mode = _profile_economic_ranking_mode(profile)
     horizon = _profile_forecast_horizon_sessions(profile)
+    mode = _profile_execution_utility_mode(profile)
     return StockRiskPolicy(
         top_k=cast(int, profile["top_k"]),
         gross_cap=cast(float, profile["max_exposure"]),
@@ -250,6 +284,7 @@ def _policy_from_artifact(
             forecast_horizon_sessions=horizon,
         ),
         economic_ranking_mode=ranking_mode,
+        execution_utility_mode=mode,
     )
 
 
@@ -290,6 +325,14 @@ def _validate_request_policy(
             )
         _validate_prepared_equity_policy(request, profile, artifact_band)
         return
+    if evidence_version == "prepared-equity-v4-delta-cost-aware":
+        if _profile_execution_utility_mode(profile) != "delta_cost_aware_v1":
+            raise ValueError(
+                "v4 delta-cost-aware policy requires execution_utility_mode "
+                "'delta_cost_aware_v1'"
+            )
+        _validate_prepared_equity_policy(request, profile, artifact_band)
+        return
     request_fingerprint = policy_portfolio_fingerprint(
         request.top_k,
         request.max_single_weight,
@@ -321,6 +364,7 @@ def _validate_prepared_equity_policy(
     aversion = _profile_growth_risk_aversion(profile)
     ranking_mode = _profile_economic_ranking_mode(profile)
     horizon = _profile_forecast_horizon_sessions(profile)
+    mode = _profile_execution_utility_mode(profile)
     policy = StockRiskPolicy(
         top_k=request.top_k,
         gross_cap=request.max_exposure,
@@ -332,6 +376,7 @@ def _validate_prepared_equity_policy(
             forecast_horizon_sessions=horizon,
         ),
         economic_ranking_mode=ranking_mode,
+        execution_utility_mode=mode,
     )
     if stock_risk_policy_fingerprint(policy) != profile["risk_policy_fingerprint"]:
         raise ValueError(
