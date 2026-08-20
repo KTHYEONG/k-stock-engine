@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import tempfile
 import time
@@ -68,6 +69,7 @@ from src.stocks.ml.features import (
     FeatureTransformSchema,
     apply_model_feature_schema,
     fit_model_feature_schema,
+    materialize_model_feature_sources,
     stock_net_alpha_v1_contract_book,
     stock_net_alpha_v1_roles,
 )
@@ -408,6 +410,8 @@ def train_net_alpha_model(
         )
 
     roles = dict(stock_net_alpha_v1_roles())
+    pre_holdout_raw = materialize_model_feature_sources(pre_holdout_raw, list(roles))
+    holdout_raw = materialize_model_feature_sources(holdout_raw, list(roles))
     schema = fit_model_feature_schema(pre_holdout_raw, roles)
     pre_holdout = apply_model_feature_schema(pre_holdout_raw, schema)
     holdout = apply_model_feature_schema(holdout_raw, schema)
@@ -1174,13 +1178,22 @@ def _fold_alpha_metadata(diagnostic: HorizonOOFDiagnostic) -> dict[str, object]:
 def _risk_policy_for_profile(
     request: NetAlphaTrainingRequest, profile: PolicyProfile, horizon_sessions: int
 ) -> StockRiskPolicy:
-    """Frozen operational risk policy reconstructed from the request portfolio."""
+    """Frozen operational risk policy reconstructed from the request portfolio.
+
+    The v7 route is horizon-locked: the rebalance cadence equals the forecast
+    horizon so a decision is never re-evaluated before its H-session outcome is
+    realised. The effective active count and candidate pool are derived from the
+    gross and single-name caps and persisted through ``_policy_profile_params``.
+    """
+    if horizon_sessions < 1:
+        raise ValueError("horizon_sessions must be a positive session count")
     return StockRiskPolicy(
         top_k=request.portfolio.top_k,
         gross_cap=request.portfolio.max_exposure,
         single_name_cap=request.portfolio.max_single_weight,
         participation_limit=request.portfolio.participation_limit,
         no_trade_band_bps=profile.no_trade_band_bps,
+        rebalance_frequency_sessions=horizon_sessions,
         compounding=CompoundingPolicyConfig(
             growth_risk_aversion=profile.growth_risk_aversion,
             forecast_horizon_sessions=horizon_sessions,
@@ -2760,12 +2773,19 @@ def _policy_profile_params(
         if profile.execution_utility_mode == "delta_cost_aware_v1"
         else "prepared-equity-v3-horizon-consistent"
     )
+    effective_active_count = math.ceil(
+        request.portfolio.max_exposure / request.portfolio.max_single_weight
+    )
+    candidate_pool_count = 2 * effective_active_count
     return json.dumps(
         {
             "profile_id": profile.profile_id,
             "no_trade_band_bps": profile.no_trade_band_bps,
             "growth_risk_aversion": profile.growth_risk_aversion,
             "forecast_horizon_sessions": horizon_sessions,
+            "rebalance_frequency_sessions": horizon_sessions,
+            "effective_active_count": effective_active_count,
+            "candidate_pool_count": candidate_pool_count,
             "top_k": request.portfolio.top_k,
             "max_single_weight": request.portfolio.max_single_weight,
             "max_exposure": request.portfolio.max_exposure,
@@ -2778,6 +2798,7 @@ def _policy_profile_params(
             ),
             "execution_evidence_version": evidence_version,
             "risk_policy_fingerprint": stock_risk_policy_fingerprint(policy),
+            "v7_risk_policy_fingerprint": stock_risk_policy_fingerprint(policy),
             "execution_policy_id": execution_policy.policy_id,
             "execution_policy_hash": execution_policy.canonical_hash,
             "economic_ranking_mode": policy.economic_ranking_mode,

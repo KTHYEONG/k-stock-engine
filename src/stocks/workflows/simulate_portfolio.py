@@ -293,7 +293,11 @@ def _profile_forecast_horizon_sessions(profile: dict[str, object]) -> int | None
 
 def _profile_sizing_mode(
     profile: dict[str, object],
-) -> Literal["alpha_vol_squared_v1", "risk_balanced_waterfill_v2"]:
+) -> Literal[
+    "alpha_vol_squared_v1",
+    "risk_balanced_waterfill_v2",
+    "confidence_mean_variance_v1",
+]:
     """Extract sizing_mode from a policy profile, defaulting to alpha_vol_squared_v1.
 
     Existing payloads lacking sizing_mode default to alpha_vol_squared_v1
@@ -307,13 +311,22 @@ def _profile_sizing_mode(
             "sizing_mode must be a string, "
             f"got {type(raw).__name__}"
         )
-    if raw not in ("alpha_vol_squared_v1", "risk_balanced_waterfill_v2"):
+    if raw not in (
+        "alpha_vol_squared_v1",
+        "risk_balanced_waterfill_v2",
+        "confidence_mean_variance_v1",
+    ):
         raise ValueError(
-            f"sizing_mode must be 'alpha_vol_squared_v1' or "
-            f"'risk_balanced_waterfill_v2', got {raw!r}"
+            f"sizing_mode must be 'alpha_vol_squared_v1', "
+            f"'risk_balanced_waterfill_v2', or 'confidence_mean_variance_v1', got {raw!r}"
         )
     return cast(
-        Literal["alpha_vol_squared_v1", "risk_balanced_waterfill_v2"], raw
+        Literal[
+            "alpha_vol_squared_v1",
+            "risk_balanced_waterfill_v2",
+            "confidence_mean_variance_v1",
+        ],
+        raw,
     )
 
 
@@ -371,6 +384,9 @@ def _policy_from_artifact(
             no_trade_band_bps=request.no_trade_band_bps or 0.0,
         )
     _validate_request_policy(request, profile)
+    evidence_version = profile.get("execution_evidence_version")
+    if evidence_version == "prepared-equity-v7-horizon-locked":
+        return _reconstruct_v7_policy(profile, request)
     aversion = _profile_growth_risk_aversion(profile)
     ranking_mode = _profile_economic_ranking_mode(profile)
     horizon = _profile_forecast_horizon_sessions(profile)
@@ -390,6 +406,91 @@ def _policy_from_artifact(
         execution_utility_mode=mode,
         sizing_mode=sizing,
     )
+
+
+def _reconstruct_v7_policy(
+    profile: dict[str, object], request: SimulationRequest
+) -> StockRiskPolicy:
+    """Reconstruct the horizon-locked v7 operational policy from its profile.
+
+    The v7 route pins the rebalance cadence to the forecast horizon, derives the
+    effective active count and candidate pool from the gross/single-name caps,
+    and reconstructs the same policy fingerprint the prepared replay and score
+    workflow used. A divergent capped active count, candidate pool, horizon
+    cadence, or stored v7 fingerprint fails closed before the backtester runs.
+    """
+    aversion = _profile_growth_risk_aversion(profile)
+    ranking_mode = _profile_economic_ranking_mode(profile)
+    horizon = _profile_forecast_horizon_sessions(profile)
+    mode = _profile_execution_utility_mode(profile)
+    sizing = _profile_sizing_mode(profile)
+    if horizon is None:
+        raise ValueError("v7 horizon-locked policy requires forecast_horizon_sessions")
+    if profile.get("rebalance_frequency_sessions") != horizon:
+        raise ValueError(
+            "v7 rebalance_frequency_sessions must equal forecast_horizon_sessions"
+        )
+    policy = StockRiskPolicy(
+        top_k=cast(int, profile["top_k"]),
+        gross_cap=cast(float, profile["max_exposure"]),
+        single_name_cap=cast(float, profile["max_single_weight"]),
+        participation_limit=cast(float, profile["participation_limit"]),
+        no_trade_band_bps=cast(float, profile["no_trade_band_bps"]),
+        rebalance_frequency_sessions=horizon,
+        compounding=CompoundingPolicyConfig(
+            growth_risk_aversion=aversion,
+            forecast_horizon_sessions=horizon,
+        ),
+        economic_ranking_mode=ranking_mode,
+        execution_utility_mode=mode,
+        sizing_mode=sizing,
+    )
+    _validate_v7_policy_profile(profile, policy)
+    return policy
+
+
+def _as_int(value: object) -> int | None:
+    """Return ``value`` as an int when it is integral, else ``None``."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    return None
+
+
+def _validate_v7_policy_profile(
+    profile: dict[str, object], policy: StockRiskPolicy
+) -> None:
+    """Fail closed when the v7 derived caps or fingerprint diverge."""
+    effective = profile.get("effective_active_count")
+    if effective is not None:
+        expected_effective = math.ceil(
+            policy.gross_cap / policy.single_name_cap
+        )
+        effective_int = _as_int(effective)
+        if effective_int is None or effective_int != expected_effective:
+            raise ValueError(
+                "v7 effective_active_count "
+                f"{effective} diverges from ceil(gross/single)={expected_effective}"
+            )
+        candidate_pool = profile.get("candidate_pool_count")
+        candidate_int = _as_int(candidate_pool)
+        if candidate_pool is not None and (
+            candidate_int is None or candidate_int != 2 * effective_int
+        ):
+            raise ValueError(
+                "v7 candidate_pool_count "
+                f"{candidate_pool} must be 2x effective_active_count {effective}"
+            )
+    v7_fingerprint = profile.get("v7_risk_policy_fingerprint")
+    if v7_fingerprint is not None and stock_risk_policy_fingerprint(policy) != v7_fingerprint:
+        raise ValueError(
+            "v7 independent replay risk-policy fingerprint diverges from the "
+            "artifact policy; the independent backtester must replay under the "
+            "same horizon-locked policy that certified the artifact"
+        )
 
 
 def _validate_request_policy(
@@ -416,6 +517,27 @@ def _validate_request_policy(
             f"{artifact_band}"
         )
     evidence_version = profile.get("execution_evidence_version")
+    if evidence_version == "prepared-equity-v7-horizon-locked":
+        if _profile_forecast_horizon_sessions(profile) is None:
+            raise ValueError(
+                "v7 horizon-locked policy requires forecast_horizon_sessions"
+            )
+        if (
+            profile.get("rebalance_frequency_sessions")
+            != _profile_forecast_horizon_sessions(profile)
+        ):
+            raise ValueError(
+                "v7 rebalance_frequency_sessions must equal "
+                "forecast_horizon_sessions"
+            )
+        v7_fingerprint = profile.get("v7_risk_policy_fingerprint")
+        if v7_fingerprint is not None:
+            policy = _reconstruct_v7_policy(profile, request)
+            if stock_risk_policy_fingerprint(policy) != v7_fingerprint:
+                raise ValueError(
+                    "v7 independent replay risk-policy fingerprint diverges"
+                )
+        return
     if evidence_version in (
         "prepared-equity-v1",
         "prepared-equity-v2-economic-rank",
