@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_SPARSE_GROWTH_V5_COMPOUND_GROWTH",
+      "date": "2026-08-20",
+      "adr_id": "ADR_20260820_SPARSE_GROWTH_V5_COMPOUND_GROWTH",
+      "domain": "quant",
+      "title": "Sparse hold-replace compound-growth policy and full-range validation",
+      "why": "Backtest compound growth deteriorated because turnover-aware transitions, rebalance cadence, and risk-balanced sizing were not wired consistently across prepared replay and independent simulation.",
+      "resolution": "Added sparse hold-replace transition economics, risk-balanced water-fill sizing, shared rebalance cadence, replay telemetry, incremental-growth gate contract, prepared/reference parity coverage, and direct full-range validation records. The reduced smoke run completed; original-range reruns were attempted and stopped by the environment memory limit, so no unverified promotion was claimed.",
+      "impact": "Contract, lint, typing, and targeted tests pass. Full-range evidence remains fail-closed NO_TRADE when stress lower growth is non-positive or memory budget is exceeded; temporary execution artifacts are purged after registration."
+    },
+    {
       "task_id": "TASK_ML_COMPOUND_GROWTH_DELTA_COST_AWARE",
       "date": "2026-08-20",
       "adr_id": "ADR_20260820_ML_COMPOUND_GROWTH_DELTA_COST_AWARE",
