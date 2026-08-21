@@ -18,6 +18,7 @@ from src.core.instruments import AssetKind
 from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.ml.contracts import (
     CompoundingCertificationSettings,
+    ExecutionFrontierSettings,
     NetAlphaTrainingRequest,
     RiskSettings,
 )
@@ -57,6 +58,10 @@ def _request(artifact_id: str, **kwargs) -> NetAlphaTrainingRequest:
         "liquidity_model": stock_liquidity_model(),
     }
     defaults.update(kwargs)
+    horizon_sessions = defaults["candidate_horizon_sessions"]
+    defaults["execution_frontier"] = ExecutionFrontierSettings(
+        candidate_horizon_sessions=horizon_sessions,
+    )
     return NetAlphaTrainingRequest(**defaults)
 
 
@@ -77,6 +82,10 @@ def _compound_request(artifact_id: str, **kwargs) -> NetAlphaTrainingRequest:
         ),
     }
     defaults.update(kwargs)
+    horizon_sessions = defaults["candidate_horizon_sessions"]
+    defaults["execution_frontier"] = ExecutionFrontierSettings(
+        candidate_horizon_sessions=horizon_sessions,
+    )
     return NetAlphaTrainingRequest(**defaults)
 
 
@@ -406,3 +415,92 @@ def test_train_model_ledger_failure_does_not_change_artifact(tmp_path) -> None:
         observer=_ExplodingObserver(),
     )
     assert manifest.artifact_id == "na_obs_ledger_fail"
+
+
+def test_execution_frontier_replay_policy_and_no_trade_gate() -> None:
+    """ML_EXEC_FRONTIER_02_REPLAY_POLICY_AND_NO_TRADE_GATE.
+
+    A selected synthetic cell persists its own C and K: the operational
+    ``StockRiskPolicy`` uses those exact rebalance cadence and top_k for both the
+    sparse (v5) and matched dense-shadow (delta-cost-aware) replay paths. A
+    candidate whose base, stress, or paired lower bound is <= 0, or whose
+    sparse/shadow turnover ratio exceeds 0.60, remains NO_TRADE (primary None).
+    """
+    from src.stocks.ml.horizons import HorizonOOFEvidence, select_horizons
+    from src.stocks.ml.training import _risk_policy_for_profile
+    from src.stocks.ml.contracts import PolicyProfile
+
+    request = _request("na_exec_frontier")
+    sparse_profile = request.policy_profiles[0]  # legacy_overlay_5bps (v5)
+    dense_profile = PolicyProfile(
+        profile_id="lower_bound_half_kelly",
+        no_trade_band_bps=0.0,
+        growth_risk_aversion=2.0,
+        execution_utility_mode="delta_cost_aware_v1",
+        sizing_mode="alpha_vol_squared_v1",
+    )
+
+    # The same (H=20, C=5, K=12) cell drives both sparse and dense paths.
+    sparse_policy = _risk_policy_for_profile(
+        request, sparse_profile, 20,
+        rebalance_frequency_sessions=5, top_k=12,
+    )
+    dense_policy = _risk_policy_for_profile(
+        request, dense_profile, 20,
+        rebalance_frequency_sessions=5, top_k=12,
+    )
+    for policy in (sparse_policy, dense_policy):
+        assert policy.rebalance_frequency_sessions == 5
+        assert policy.top_k == 12
+        assert policy.compounding.forecast_horizon_sessions == 20
+
+    def _cell(
+        base: tuple[float, ...],
+        stress: tuple[float, ...],
+        paired: tuple[float, ...],
+        *,
+        sparse_turnover: float,
+        shadow_turnover: float,
+    ) -> HorizonOOFEvidence:
+        return HorizonOOFEvidence(
+            horizon_sessions=20,
+            profile_id=sparse_profile.profile_id,
+            model_family="net_alpha_elastic_net",
+            base_log_growth=base,
+            stress_log_growth=stress,
+            cohort_segment_ids=tuple(0 for _ in base),
+            complete_cohort_count=len(base),
+            active_cohort_count=len(base),
+            partial_cohort_count=0,
+            missing_cohort_count=0,
+            segment_count=1,
+            fold_rank_ics=(0.1, 0.2, 0.3),
+            rebalance_frequency_sessions=5,
+            top_k=12,
+            paired_stress_log_growth=paired,
+            sparse_turnover=sparse_turnover,
+            shadow_turnover=shadow_turnover,
+        )
+
+    good = _cell(
+        (0.01,) * 60, (0.01,) * 60, (0.002,) * 60,
+        sparse_turnover=1.0, shadow_turnover=2.0,
+    )
+    selected = select_horizons((good,), 0.05, 42)
+    assert selected.primary_horizon_sessions == 20
+    assert selected.primary_rebalance_frequency_sessions == 5
+    assert selected.primary_top_k == 12
+
+    high_turnover = _cell(
+        (0.01,) * 60, (0.01,) * 60, (0.002,) * 60,
+        sparse_turnover=1.0, shadow_turnover=1.0,
+    )
+    rejected_ratio = select_horizons((high_turnover,), 0.05, 42)
+    assert rejected_ratio.primary_horizon_sessions is None
+
+    negative_stress = _cell(
+        (0.01,) * 60, tuple(-0.001 for _ in range(60)), (0.002,) * 60,
+        sparse_turnover=1.0, shadow_turnover=2.0,
+    )
+    rejected_stress = select_horizons((negative_stress,), 0.05, 42)
+    assert rejected_stress.primary_horizon_sessions is None
