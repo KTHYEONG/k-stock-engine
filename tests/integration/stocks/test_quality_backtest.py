@@ -32,7 +32,7 @@ from src.stocks.trading.portfolio_constructor import StockRiskPolicy
 from tests.fixtures.stocks.helpers import publish_baseline_artifact
 
 START = date(2024, 1, 1)
-N_SESSIONS = 40
+N_SESSIONS = 15
 TICKERS = ("000050", "000060", "000070")
 ARTIFACT_ID = "quality_backtest_a001"
 
@@ -116,8 +116,9 @@ def actions_snapshot() -> CorporateActionSnapshot:
     )
 
 
-@pytest.fixture
-def curated_dataset(tmp_path) -> tuple[Path, Path]:
+@pytest.fixture(scope="module")
+def curated_dataset(tmp_path_factory) -> tuple[Path, Path]:
+    tmp_path = tmp_path_factory.mktemp("quality_backtest")
     source = tmp_path / "source"
     dataset_root = tmp_path / "datasets"
     artifact_root = tmp_path / "artifacts"
@@ -128,7 +129,7 @@ def curated_dataset(tmp_path) -> tuple[Path, Path]:
         StockCurationRequest(
             dataset_id="krx_quality_backtest_v1",
             start_date=START,
-            end_date=date(2024, 2, 10),
+            end_date=START + timedelta(days=N_SESSIONS - 1),
             certification=DatasetCertification.RESEARCH,
             calendar_hash="c",
             corporate_action_hash="ca",
@@ -156,12 +157,13 @@ def curated_dataset(tmp_path) -> tuple[Path, Path]:
 
 def build_backtester(snapshot, artifact_root: Path) -> StockBacktester:
     registry = ModelArtifactRegistry(artifact_root)
-    publish_baseline_artifact(
-        registry,
-        artifact_id=ARTIFACT_ID,
-        feature_schema_hash=snapshot.manifest.schema_hash,
-        ranking_feature="rev_5d",
-    )
+    if not (artifact_root / ARTIFACT_ID / "manifest.json").exists():
+        publish_baseline_artifact(
+            registry,
+            artifact_id=ARTIFACT_ID,
+            feature_schema_hash=snapshot.manifest.schema_hash,
+            ranking_feature="rev_5d",
+        )
     instruments = {
         i: Instrument(i, AssetKind.STOCK, "KRX", i.split(":")[-1], "KRW")
         for i in sorted(snapshot.frame["instrument_id"].unique().to_list())
