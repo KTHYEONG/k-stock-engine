@@ -96,6 +96,31 @@ def as_net_alpha_snapshot(snapshot) -> DatasetSnapshot:
     return DatasetSnapshot(manifest=manifest, frame=frame)
 
 
+def test_confidence_frontier_promotion_gate_is_fail_closed() -> None:
+    """ML_CONFIDENCE_FRONTIER_05_REAL_DATA_PROMOTION_GATE."""
+    from src.stocks.ml.horizons import HorizonOOFEvidence, select_horizons
+
+    evidence = HorizonOOFEvidence(
+        horizon_sessions=10,
+        profile_id="lower_bound_half_kelly",
+        model_family="net_alpha_elastic_net",
+        base_log_growth=(-0.001,) * 20,
+        stress_log_growth=(-0.001,) * 20,
+        cohort_segment_ids=(0,) * 20,
+        complete_cohort_count=20,
+        active_cohort_count=20,
+        partial_cohort_count=0,
+        missing_cohort_count=0,
+        segment_count=1,
+        fold_rank_ics=(0.05, 0.06, 0.07),
+        rebalance_frequency_sessions=5,
+        top_k=20,
+    )
+    selection = select_horizons((evidence,), 0.05, 42)
+    assert selection.primary_horizon_sessions is None
+    assert selection.primary_profile_id is None
+
+
 def test_curated_repository_round_trip_preserves_content_hash(curated) -> None:
     dataset_root, _artifacts = curated
     repo = StockDatasetRepository(ParquetDatasetStore(dataset_root))
