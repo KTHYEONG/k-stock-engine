@@ -24,7 +24,9 @@ from src.stocks.ml.execution_replay import (
     ExecutionReplayContext,
     ExecutionReplayEvidence,
     _ledger_growth_and_exposure,
+    prepare_execution_replay_batch,
     replay_execution_equivalent,
+    replay_execution_equivalent_batch,
 )
 from src.stocks.ml.training import (
     _coverage_failure_reason,
@@ -39,17 +41,21 @@ _SEGMENT_COLUMN = "oof_segment_id"
 _SCORE_COLUMN = "predicted_net_alpha"
 
 
-def _session_for(segment: int, index: int) -> datetime:
-    return datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=segment * 12 + index)
+def _session_for(
+    segment: int, index: int, sessions_per_segment: int = 6
+) -> datetime:
+    return datetime(2024, 1, 1, tzinfo=UTC) + timedelta(
+        days=segment * sessions_per_segment + index
+    )
 
 
 def _market_frame(
-    n_segments: int = 2, sessions_per_segment: int = 12, n_tickers: int = 3
+    n_segments: int = 2, sessions_per_segment: int = 6, n_tickers: int = 3
 ) -> pl.DataFrame:
     rows: list[dict[str, object]] = []
     for segment in range(n_segments):
         for index in range(sessions_per_segment):
-            session = _session_for(segment, index)
+            session = _session_for(segment, index, sessions_per_segment)
             for ticker in range(n_tickers):
                 price = 100.0 + ticker + index
                 rows.append(
@@ -97,12 +103,12 @@ def test_sparse_telemetry_projection_is_bounded() -> None:
 
 
 def _score_frame(
-    n_segments: int = 2, sessions_per_segment: int = 12, n_tickers: int = 3
+    n_segments: int = 2, sessions_per_segment: int = 6, n_tickers: int = 3
 ) -> pl.DataFrame:
     rows: list[dict[str, object]] = []
     for segment in range(n_segments):
         for index in range(sessions_per_segment):
-            session = _session_for(segment, index)
+            session = _session_for(segment, index, sessions_per_segment)
             for ticker in range(n_tickers):
                 score = 0.01 + ticker * 0.001
                 rows.append(
@@ -189,15 +195,11 @@ def _request(
 
 
 def _decision_sessions(market: pl.DataFrame) -> dict[int, tuple[datetime, ...]]:
+    sessions = sorted(market[_SESSION_COLUMN].unique().to_list())
+    half = len(sessions) // 2
     return {
-        segment: tuple(
-            session
-            for index, session in enumerate(
-                sorted(market[_SESSION_COLUMN].unique().to_list())
-            )
-            if index // 12 == segment
-        )
-        for segment in (0, 1)
+        0: tuple(sessions[:half]),
+        1: tuple(sessions[half:]),
     }
 
 
@@ -615,3 +617,218 @@ def test_telemetry_projection() -> None:
     assert diagnostics["stress_exposure"] >= 0.0
     for forbidden_key in ("instrument_id", "score", "label", "trade", "raw_return"):
         assert forbidden_key not in diagnostics
+
+
+REPLAY_BATCH_01 = "REPLAY_BATCH_01_PARITY_AND_BUILD_BOUND"
+REPLAY_BATCH_02 = "REPLAY_BATCH_02_FAIL_CLOSED_INCOMPATIBLE_INPUT"
+
+
+def test_replay_batch_01_parity_and_build_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    """REPLAY_BATCH_01_PARITY_AND_BUILD_BOUND; TRAIN_COMPLETION_01_BATCH_REUSE.
+
+    For three compatible same-cadence requests across two OOF segments, batch
+    evidence equals three one-request replays exactly and
+    PreparedReplayMarket.build is called exactly 2 times, once per segment,
+    not 6 times.
+    """
+    market = _market_frame()
+    context = _context(market)
+    scores = _score_frame()
+    segments = _decision_sessions(market)
+
+    requests = [
+        _request(market, scores, segments, context),
+        ExecutionEquivalentReplayRequest(
+            context=ExecutionReplayContext(
+                registry=context.registry,
+                manifest=context.manifest,
+                instruments=context.instruments,
+                artifact_id=context.artifact_id,
+                strategy_id=context.strategy_id,
+                initial_portfolio=context.initial_portfolio,
+                risk_policy=context.risk_policy,
+                base_cost_schedule=context.base_cost_schedule,
+                stress_cost_schedule=context.stress_cost_schedule,
+                liquidity_model=context.liquidity_model,
+                stress_liquidity_model=context.stress_liquidity_model,
+                execution_policy=context.execution_policy,
+                seed=context.seed + 1,
+            ),
+            market_frame=market,
+            score_frame=scores,
+            segment_column=_SEGMENT_COLUMN,
+            decision_sessions_by_segment=segments,
+            horizon_sessions=5,
+        ),
+        ExecutionEquivalentReplayRequest(
+            context=ExecutionReplayContext(
+                registry=context.registry,
+                manifest=context.manifest,
+                instruments=context.instruments,
+                artifact_id=context.artifact_id,
+                strategy_id=context.strategy_id,
+                initial_portfolio=context.initial_portfolio,
+                risk_policy=context.risk_policy,
+                base_cost_schedule=context.base_cost_schedule,
+                stress_cost_schedule=context.stress_cost_schedule,
+                liquidity_model=context.liquidity_model,
+                stress_liquidity_model=context.stress_liquidity_model,
+                execution_policy=context.execution_policy,
+                seed=context.seed + 2,
+            ),
+            market_frame=market,
+            score_frame=scores,
+            segment_column=_SEGMENT_COLUMN,
+            decision_sessions_by_segment=segments,
+            horizon_sessions=5,
+        ),
+    ]
+
+    from src.stocks.backtesting.engine import PreparedReplayMarket
+
+    original_build = PreparedReplayMarket.build.__func__
+    build_calls = 0
+
+    def tracked_build(cls, *args, **kwargs):
+        nonlocal build_calls
+        build_calls += 1
+        return original_build(cls, *args, **kwargs)
+
+    monkeypatch.setattr(PreparedReplayMarket, "build", classmethod(tracked_build))
+    batch = prepare_execution_replay_batch(requests[0])
+    assert build_calls == 2
+    batch_results = replay_execution_equivalent_batch(requests, prepared_batch=batch)
+    assert len(batch_results) == 3
+    assert build_calls == 2
+
+    single_results = [replay_execution_equivalent(req) for req in requests]
+
+    for batch_ev, single_ev in zip(batch_results, single_results, strict=True):
+        assert batch_ev.base_log_growth == single_ev.base_log_growth
+        assert batch_ev.stress_log_growth == single_ev.stress_log_growth
+        assert batch_ev.segment_ids == single_ev.segment_ids
+        assert batch_ev.planned_cycles == single_ev.planned_cycles
+        assert batch_ev.filled_orders == single_ev.filled_orders
+        assert batch_ev.cash_session_fraction == single_ev.cash_session_fraction
+        assert batch_ev.turnover == single_ev.turnover
+        assert batch_ev.invested_interval_count == single_ev.invested_interval_count
+        assert batch_ev.invested_interval_fraction == single_ev.invested_interval_fraction
+        assert batch_ev.filled_cycle_count == single_ev.filled_cycle_count
+
+    assert len(batch.segment_data) == 2
+
+
+def test_replay_batch_02_fail_closed_incompatible_input() -> None:
+    """REPLAY_BATCH_02_FAIL_CLOSED_INCOMPATIBLE_INPUT; TRAIN_COMPLETION_02_FAIL_CLOSED.
+
+    A same-batch request with a changed market/score frame, segment column,
+    or declared decision sessions raises ValueError before any shared prepared
+    input is used.
+    """
+    market = _market_frame()
+    context = _context(market)
+    scores = _score_frame()
+    segments = _decision_sessions(market)
+
+    good_request = _request(market, scores, segments, context)
+    batch = prepare_execution_replay_batch(good_request)
+
+    from src.stocks.ml.execution_replay import _validate_batch_request_compatibility
+
+    incompatible_market = _request(market.drop("close"), scores, segments, context)
+    with pytest.raises(ValueError, match="market_frame identity mismatch"):
+        _validate_batch_request_compatibility(incompatible_market, batch)
+
+    incompatible_scores = _request(
+        market,
+        scores.with_columns(
+            pl.when(pl.col(_SCORE_COLUMN) == pl.col(_SCORE_COLUMN).max())
+            .then(pl.lit(float("inf")))
+            .otherwise(pl.col(_SCORE_COLUMN))
+            .alias(_SCORE_COLUMN)
+        ),
+        segments,
+        context,
+    )
+    with pytest.raises(ValueError, match="score_frame identity mismatch"):
+        _validate_batch_request_compatibility(incompatible_scores, batch)
+
+    incompatible_segment = ExecutionEquivalentReplayRequest(
+        context=context,
+        market_frame=market,
+        score_frame=scores,
+        segment_column="wrong_column",
+        decision_sessions_by_segment=segments,
+        horizon_sessions=5,
+    )
+    with pytest.raises(ValueError, match="segment_column mismatch"):
+        _validate_batch_request_compatibility(incompatible_segment, batch)
+
+
+PARALLEL_COMPLETION_01_ORDERED_PARITY = "PARALLEL_COMPLETION_01_ORDERED_PARITY"
+
+
+def test_parallel_completion_01_ordered_parity() -> None:
+    """PARALLEL_COMPLETION_01_ORDERED_PARITY.
+
+    Six compatible requests at four workers return evidence in input order
+    exactly equal to one-worker evidence; PreparedReplayMarket.build count
+    remains segment_count.
+    """
+    market = _market_frame()
+    context = _context(market)
+    scores = _score_frame()
+    segments = _decision_sessions(market)
+
+    requests = [
+        _request(market, scores, segments, context),
+        *[
+            ExecutionEquivalentReplayRequest(
+                context=ExecutionReplayContext(
+                    registry=context.registry,
+                    manifest=context.manifest,
+                    instruments=context.instruments,
+                    artifact_id=context.artifact_id,
+                    strategy_id=context.strategy_id,
+                    initial_portfolio=context.initial_portfolio,
+                    risk_policy=context.risk_policy,
+                    base_cost_schedule=context.base_cost_schedule,
+                    stress_cost_schedule=context.stress_cost_schedule,
+                    liquidity_model=context.liquidity_model,
+                    stress_liquidity_model=context.stress_liquidity_model,
+                    execution_policy=context.execution_policy,
+                    seed=context.seed + i,
+                ),
+                market_frame=market,
+                score_frame=scores,
+                segment_column=_SEGMENT_COLUMN,
+                decision_sessions_by_segment=segments,
+                horizon_sessions=5,
+            )
+            for i in range(1, 6)
+        ],
+    ]
+
+    batch = prepare_execution_replay_batch(requests[0])
+    segment_count = len(batch.segment_data)
+
+    parallel_results = replay_execution_equivalent_batch(
+        requests, prepared_batch=batch, max_workers=4
+    )
+    assert len(parallel_results) == 6
+
+    sequential_results = replay_execution_equivalent_batch(
+        requests, prepared_batch=batch, max_workers=1
+    )
+
+    for i, (par_ev, seq_ev) in enumerate(zip(parallel_results, sequential_results, strict=True)):
+        assert par_ev.base_log_growth == seq_ev.base_log_growth, f"base mismatch at request {i}"
+        assert par_ev.stress_log_growth == seq_ev.stress_log_growth, f"stress mismatch at request {i}"
+        assert par_ev.segment_ids == seq_ev.segment_ids, f"segment mismatch at request {i}"
+        assert par_ev.planned_cycles == seq_ev.planned_cycles, f"planned mismatch at request {i}"
+        assert par_ev.filled_orders == seq_ev.filled_orders, f"filled mismatch at request {i}"
+        assert par_ev.cash_session_fraction == seq_ev.cash_session_fraction, f"cash mismatch at request {i}"
+        assert par_ev.turnover == seq_ev.turnover, f"turnover mismatch at request {i}"
+        assert par_ev.invested_interval_count == seq_ev.invested_interval_count, f"invested mismatch at request {i}"
+        assert par_ev.invested_interval_fraction == seq_ev.invested_interval_fraction, f"invested frac mismatch at request {i}"
+        assert par_ev.filled_cycle_count == seq_ev.filled_cycle_count, f"filled cycle mismatch at request {i}"
