@@ -711,3 +711,55 @@ def test_direct_input_ledger_failed(tmp_path) -> None:
         "feature_dataset_id": "features_2024",
         "label_dataset_id": "labels_2024",
     }
+
+
+def test_execution_frontier_bounded_ledger_projection() -> None:
+    """ML_EXEC_FRONTIER_04_BOUNDED_LEDGER_PROJECTION.
+
+    The compact ml_runs request projection contains only the frontier H/C/K lists
+    and the bounded summary carries candidate_bound=60 plus the selected
+    H/C/K/profile scalars; it contains no raw score, order, return, label, or
+    instrument payload.
+    """
+    from src.stocks.ml.result_ledger import (
+        _bounded_observability_summary,
+        _project_request,
+    )
+
+    request = NetAlphaTrainingRequest(artifact_id="na_exec_frontier_ledger")
+    projection = _project_request(request)
+    frontier = projection["execution_frontier"]
+    assert frontier["candidate_horizon_sessions"] == [10, 20]
+    assert frontier["candidate_rebalance_frequency_sessions"] == [5, 10, 20]
+    assert frontier["candidate_top_k"] == [12, 16, 20, 24]
+    assert "scores" not in json.dumps(projection)
+    assert "orders" not in json.dumps(projection)
+    assert "labels" not in json.dumps(projection)
+
+    telemetry = {
+        "phases": [
+            {
+                "name": "policy_frontier",
+                "candidate_count": 60,
+                "candidate_bound": 60,
+                "profile_ids": ["legacy_overlay_5bps", "lower_bound_only", "lower_bound_half_kelly"],
+            },
+            {
+                "name": "primary_selection",
+                "primary_horizon_sessions": 20,
+                "primary_rebalance_frequency_sessions": 5,
+                "primary_top_k": 12,
+                "primary_profile_id": "lower_bound_only",
+            },
+        ],
+        "horizons": [],
+    }
+    summary = _bounded_observability_summary(telemetry)
+    assert summary["frontier_candidate_bound"] == 60
+    assert summary["primary_horizon_sessions"] == 20
+    assert summary["primary_rebalance_frequency_sessions"] == 5
+    assert summary["primary_top_k"] == 12
+    assert summary["primary_profile_id"] == "lower_bound_only"
+    assert "scores" not in json.dumps(summary)
+    assert "orders" not in json.dumps(summary)
+    assert "labels" not in json.dumps(summary)
