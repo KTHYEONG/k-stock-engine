@@ -467,8 +467,8 @@ def test_retention_dedup_and_discard_metadata(tmp_path) -> None:
     base = _context("na_ret_base")
     registry = ModelArtifactRegistry(tmp_path / "artifacts")
     clock = _MutableClock(datetime(2024, 1, 1, tzinfo=UTC))
-    ledger_inst = MlResultLedger(tmp_path / "results", clock=clock, retained_records=128)
-    for index in range(130):
+    ledger_inst = MlResultLedger(tmp_path / "results", clock=clock, retained_records=8)
+    for index in range(10):
         artifact_id = f"na_ret_{index:03d}"
         _write_artifact(registry.root, artifact_id, model_type="no_trade")
         clock.advance(timedelta(seconds=1))
@@ -478,26 +478,26 @@ def test_retention_dedup_and_discard_metadata(tmp_path) -> None:
             registry,
         )
     lines = (tmp_path / "results" / "ml_runs" / "recent.jsonl").read_text().splitlines()
-    assert len(lines) == 128
+    assert len(lines) == 8
     ids = [json.loads(line)["artifact_id"] for line in lines]
     assert "na_ret_000" not in ids
-    assert "na_ret_129" in ids
+    assert "na_ret_009" in ids
     meta = json.loads(
         (tmp_path / "results" / "ml_runs" / "ledger_meta.json").read_text()
     )
-    assert meta["retained_count"] == 128
+    assert meta["retained_count"] == 8
     assert meta["discarded_count"] == 2
     before = (registry.root / "na_ret_000" / "manifest.json").read_bytes()
     clock.advance(timedelta(seconds=1))
     ledger_inst.record_completed(
-        replace(base, artifact_id="na_ret_100"),
-        _manifest("na_ret_100", "no_trade"),
+        replace(base, artifact_id="na_ret_005"),
+        _manifest("na_ret_005", "no_trade"),
         registry,
     )
     lines = (tmp_path / "results" / "ml_runs" / "recent.jsonl").read_text().splitlines()
-    assert len(lines) == 128
+    assert len(lines) == 8
     assert (
-        sum(1 for line in lines if json.loads(line)["artifact_id"] == "na_ret_100")
+        sum(1 for line in lines if json.loads(line)["artifact_id"] == "na_ret_005")
         == 1
     )
     assert (registry.root / "na_ret_000" / "manifest.json").read_bytes() == before
