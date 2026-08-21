@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ML_CONFIDENCE_TURNOVER_V1",
+      "date": "2026-08-21",
+      "adr_id": "ADR_20260821_ML_CONFIDENCE_TURNOVER_V1",
+      "domain": "execution",
+      "title": "Confidence-weighted compound-growth policy",
+      "why": "Positive Rank-IC did not translate into positive cost-stressed compound growth; sparse execution also bypassed the configured turnover budget.",
+      "resolution": "Promoted confidence_mean_variance sizing for the half-Kelly profile, enforced sparse turnover interpolation, corrected replay cost/exposure telemetry to use BacktestResult metrics, and added fail-closed contract tests.",
+      "impact": "Preserves NO_TRADE gates while making executable turnover and economic diagnostics auditable; the full real-data rerun remains pending because the confidence replay exceeded the runtime window."
+    },
+    {
       "task_id": "TASK_ML_EXECUTION_FRONTIER_NO_TRADE_20260821",
       "date": "2026-08-21",
       "adr_id": "ADR_20260821_ML_EXECUTION_FRONTIER_NO_TRADE_20260821",
