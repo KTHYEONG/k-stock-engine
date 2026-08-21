@@ -401,5 +401,12 @@
   "src/stocks/data/direct.py": {
     "testing": "tests/unit/stocks/data/test_direct.py"
   },
-  "src/stocks/ml/features.py": {}
+  "src/stocks/ml/features.py": {},
+  "src/stocks/ml/execution_replay.py": {
+    "architecture": "docs/specs/ml_replay_runtime_scaling.md",
+    "testing": "tests/unit/stocks/ml/test_execution_replay.py"
+  },
+  "tools/agent_skills/lean_check.py": {
+    "testing": "tests/unit/stocks/backtesting/test_engine.py"
+  }
 }
