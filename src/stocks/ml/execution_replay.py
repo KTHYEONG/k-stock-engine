@@ -19,7 +19,7 @@ import hashlib
 import math
 import time
 from bisect import bisect_right
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from itertools import pairwise
@@ -54,6 +54,27 @@ from src.stocks.workflows.trading_cycle import (
 )
 
 _SCORE_CANDIDATES = ("predicted_net_alpha", "pred_score")
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileReplayEvidence:
+    """Named immutable replay evidence: candidate owns base/stress; dense_shadow is optional.
+
+    ``candidate`` contains both base and stress log-growth paths from one
+    policy. ``dense_shadow`` is an optional paired control used only for
+    incremental-growth and turnover-reduction evidence; it is never read as a
+    stress path for certification.
+    """
+
+    candidate: ExecutionReplayEvidence
+    dense_shadow: ExecutionReplayEvidence | None = None
+
+    def __iter__(self) -> Iterator[ExecutionReplayEvidence]:
+        """Preserve the historical two-value unpacking API for callers."""
+        yield self.candidate
+        yield self.dense_shadow or self.candidate
+
+
 _ECONOMIC_COLUMNS = (
     "expected_active_alpha",
     "alpha_lower_bound",
@@ -182,6 +203,8 @@ class ExecutionReplayEvidence:
     stress_cost_drag: float = 0.0
     base_exposure: float = 0.0
     stress_exposure: float = 0.0
+    base_interval_exposure: tuple[float, ...] = ()
+    stress_interval_exposure: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         if len(self.base_log_growth) != len(self.stress_log_growth):
@@ -557,6 +580,8 @@ def _execute_batch_request(
     base_growth: list[float] = []
     stress_growth: list[float] = []
     segment_ids: list[int] = []
+    base_interval_exp: list[float] = []
+    stress_interval_exp: list[float] = []
     total_planned = 0
     total_filled_orders = 0
     total_filled_sessions = 0
@@ -613,6 +638,8 @@ def _execute_batch_request(
         stress_segment_growth, _ = _ledger_growth_and_exposure(
             result.stress_ledger
         )
+        _, seg_base_exp = _ledger_growth_and_interval_exposure(result.ledger)
+        _, seg_stress_exp = _ledger_growth_and_interval_exposure(result.stress_ledger)
         if len(segment_growth) != len(stress_segment_growth):
             raise ValueError(
                 f"base and stress ledgers diverged in session count "
@@ -622,6 +649,8 @@ def _execute_batch_request(
         base_growth.extend(segment_growth)
         stress_growth.extend(stress_segment_growth)
         segment_ids.extend([segment_id] * len(segment_growth))
+        base_interval_exp.extend(seg_base_exp)
+        stress_interval_exp.extend(seg_stress_exp)
 
         segment_observed = len(segment_growth)
         segment_filled_cycles = _filled_sessions(result)
@@ -697,6 +726,8 @@ def _execute_batch_request(
         stress_cost_drag=stress_cost_drag,
         base_exposure=base_exposure,
         stress_exposure=stress_exposure,
+        base_interval_exposure=tuple(base_interval_exp),
+        stress_interval_exposure=tuple(stress_interval_exp),
     )
 
 
@@ -783,6 +814,93 @@ def _ledger_growth_and_exposure(
         if ledger[previous_index].positions_value > 0.0:
             invested += 1
     return tuple(growth), invested
+
+
+def _ledger_growth_and_interval_exposure(
+    ledger: tuple[BacktestLedgerRow, ...],
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """Single O(n) pass producing log growth and per-interval prior-row exposure.
+
+    ``growth`` is ``log(equity_t / equity_{t-1})``. ``exposure`` is
+    ``min(positions_value_{t-1} / equity_{t-1}, 1.0)`` clamped to [0, 1] and
+    finite.  Both series have length ``len(ledger) - 1``.
+    """
+    equities = [row.equity for row in ledger]
+    growth: list[float] = []
+    exposure: list[float] = []
+    for previous_index, current_index in pairwise(range(len(equities))):
+        previous = equities[previous_index]
+        current = equities[current_index]
+        if previous <= 0.0 or current <= 0.0:
+            raise ValueError("non-positive equity in replay ledger")
+        if not np.isfinite(previous) or not np.isfinite(current):
+            raise ValueError("non-finite equity in replay ledger")
+        growth.append(float(np.log(current / previous)))
+        prior_pos = ledger[previous_index].positions_value
+        exp = float(np.clip(prior_pos / previous, 0.0, 1.0)) if previous > 0.0 else 0.0
+        if not np.isfinite(exp):
+            raise ValueError("non-finite interval exposure in replay ledger")
+        exposure.append(exp)
+    return tuple(growth), tuple(exposure)
+
+
+def exposure_matched_benchmark_log_growth(
+    market_frame: pl.DataFrame,
+    sessions: Sequence[datetime],
+    interval_exposure: Sequence[float],
+) -> tuple[float, ...]:
+    """Deterministic gross equal-weight benchmark scaled by prior-interval exposure.
+
+    Uses the same eligible instruments and executable open-to-open intervals as
+    the replay.  Each interval's benchmark growth is
+    ``exposure_t * mean(log(open_{t+1} / open_t))`` over eligible instruments.
+    Zero exposure yields zero growth.  ``interval_exposure`` must have the same
+    length as ``sessions``.
+    """
+    if len(interval_exposure) != len(sessions):
+        raise ValueError(
+            f"interval_exposure length {len(interval_exposure)} "
+            f"does not match sessions length {len(sessions)}"
+        )
+    if len(sessions) < 1:
+        return ()
+    sorted_sessions = sorted(sessions)
+    opens_by_session: dict[datetime, dict[str, float]] = {}
+    for row in (
+        market_frame.select("instrument_id", "session", "open")
+        .filter(pl.col("session").is_in(sorted_sessions))
+        .iter_rows(named=True)
+    ):
+        session = row["session"]
+        if session not in opens_by_session:
+            opens_by_session[session] = {}
+        opens_by_session[session][str(row["instrument_id"])] = float(row["open"])
+    growth: list[float] = []
+    for idx in range(len(sorted_sessions) - 1):
+        current_session = sorted_sessions[idx]
+        next_session = sorted_sessions[idx + 1]
+        exp = float(interval_exposure[idx])
+        if exp == 0.0:
+            growth.append(0.0)
+            continue
+        curr_prices = opens_by_session.get(current_session, {})
+        next_prices = opens_by_session.get(next_session, {})
+        common = set(curr_prices) & set(next_prices)
+        if not common:
+            growth.append(0.0)
+            continue
+        instrument_growth = [
+            math.log(next_prices[instrument] / curr_prices[instrument])
+            for instrument in sorted(common)
+            if curr_prices[instrument] > 0
+        ]
+        if not instrument_growth:
+            growth.append(0.0)
+            continue
+        mean_growth = sum(instrument_growth) / len(instrument_growth)
+        growth.append(max(mean_growth * exp, -1.0))
+    growth.append(0.0)
+    return tuple(growth)
 
 
 def _ledger_decision_equity(

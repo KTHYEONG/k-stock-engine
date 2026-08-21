@@ -194,6 +194,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=REFERENCE_DATE,
         help="end date for direct dataset loading (requires --base-dataset-id)",
     )
+    parser.add_argument(
+        "--cost-snapshot-id",
+        default=None,
+        help=(
+            "hash-bound cost snapshot id for direct runs; "
+            "without it, the run is research-only"
+        ),
+    )
     return parser
 
 
@@ -243,6 +251,51 @@ def _resolve_cost_contexts(
         None,
         default_stress_schedule(),
         None,
+    )
+
+
+def _resolve_direct_cost_context(
+    cost_snapshot_id: str | None,
+    parsed: argparse.Namespace,
+    market_data: object,
+) -> tuple[
+    CostSchedule,
+    LiquiditySlippageModel | None,
+    CostSchedule,
+    LiquiditySlippageModel | None,
+]:
+    """Resolve cost schedules for direct dataset runs with hash-bound provenance.
+
+    A direct production run requires a hash-bound cost snapshot whose execution
+    coverage contains the direct data range and whose stock universe identity
+    is compatible.  Without a ``cost_snapshot_id``, canonical defaults are used
+    but the run is research-only (no artifact publication).
+    """
+    if cost_snapshot_id is None:
+        return (
+            default_base_schedule(),
+            None,
+            default_stress_schedule(),
+            None,
+        )
+    from src.core.paths import STOCK_CATALOG_ROOT
+    from src.stocks.data.costs import load_cost_evidence
+
+    cost_path = STOCK_CATALOG_ROOT / "costs" / f"{cost_snapshot_id}.json"
+    if not cost_path.exists():
+        raise ValueError(
+            f"cost snapshot {cost_snapshot_id!r} not found at {cost_path}"
+        )
+    required_range = CoverageRange(
+        start=parsed.research_start_direct,
+        end=parsed.research_end_direct,
+    )
+    evidence = load_cost_evidence(cost_path, required_range)
+    return (
+        evidence.base_schedule(),
+        evidence.base_liquidity_model,
+        evidence.stress_schedule(),
+        evidence.stress_liquidity_model,
     )
 
 
@@ -544,7 +597,7 @@ def _run_direct_training(
         liquidity_model,
         stress_cost_schedule,
         stress_liquidity_model,
-    ) = _resolve_cost_contexts(None)
+    ) = _resolve_direct_cost_context(parsed.cost_snapshot_id, parsed, market_data)
 
     registry = ModelArtifactRegistry(parsed.registry)
     horizons = _parse_horizons(parsed.candidate_horizon_sessions)

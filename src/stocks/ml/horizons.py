@@ -17,6 +17,7 @@ smaller profile id).
 """
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from hashlib import sha256
 from math import ceil
@@ -642,3 +643,123 @@ def _best_primary(
         best.top_k,
         best.profile_id,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class PrequentialEconomicEvidence:
+    """Outcome of prequential (causal) policy selection across segments.
+
+    ``segment_policies`` maps each segment index to the evidence that
+    determined its policy (``None`` means cash).  Policies are selected only
+    from earlier segments; segment 0 always uses a predeclared seed policy
+    (or cash when no earlier evidence is admissible).
+    """
+
+    segment_policies: dict[int, HorizonOOFEvidence | None]
+
+
+def minimum_resolvable_bootstrap_count(
+    path_hypothesis_count: int, alpha: float
+) -> int:
+    """Minimum bootstrap resample count to resolve the smallest Holm threshold.
+
+    The smallest threshold is ``alpha / path_hypothesis_count``.  A bootstrap
+    with ``n`` draws has p-value resolution ``1/n``.  Returns
+    ``ceil(path_hypothesis_count / alpha)`` so that the smallest drawable
+    p-value is at most the smallest Holm threshold.
+    """
+    if path_hypothesis_count < 1:
+        raise ValueError("path_hypothesis_count must be positive")
+    if not (0.0 < alpha < 1.0):
+        raise ValueError("alpha must be in (0, 1)")
+    return ceil(path_hypothesis_count / alpha)
+
+
+def select_prequential_execution_policy(
+    evidence_by_segment: Mapping[int, Sequence[HorizonOOFEvidence]],
+    bootstrap_alpha: float,
+    seed: int,
+    n_bootstrap: int = DEFAULT_BOOTSTRAP_RESAMPLES,
+) -> PrequentialEconomicEvidence:
+    """Prequential causal policy selection: outer segment uses only earlier segments.
+
+    For each outer segment ``s``, evaluate candidate policies from segments
+    ``< s`` only.  Choose by deterministic admissibility and lower excess
+    growth, then replay the locked choice on ``s``.  When no earlier policy is
+    admissible, segment ``s`` is cash (``None``).  The stitched prequential
+    path is the single strategy-level hypothesis.
+    """
+    if n_bootstrap < 2:
+        raise ValueError("n_bootstrap must be at least 2")
+    required_bootstrap = minimum_resolvable_bootstrap_count(
+        max(1, sum(len(values) for values in evidence_by_segment.values())),
+        bootstrap_alpha,
+    )
+    if n_bootstrap < required_bootstrap:
+        raise ValueError(
+            f"n_bootstrap={n_bootstrap} is below minimum resolvable "
+            f"count {required_bootstrap}"
+        )
+
+    sorted_segments = sorted(evidence_by_segment.keys())
+    segment_policies: dict[int, HorizonOOFEvidence | None] = {}
+    accumulated_evidence: list[HorizonOOFEvidence] = []
+
+    for segment in sorted_segments:
+        candidates = list(accumulated_evidence)
+        if not candidates:
+            segment_policies[segment] = None
+        else:
+            admissible = [
+                c
+                for c in candidates
+                if all(
+                    v > 0.0
+                    for v in (
+                        _candidate_lower_bound(c, bootstrap_alpha, n_bootstrap, seed)
+                    )
+                )
+            ]
+            if admissible:
+                best = min(
+                    admissible,
+                    key=lambda c: (
+                        -_candidate_lower_bound(c, bootstrap_alpha, n_bootstrap, seed)[1],
+                        c.horizon_sessions,
+                        c.profile_id,
+                    ),
+                )
+                segment_policies[segment] = best
+            else:
+                segment_policies[segment] = None
+
+        accumulated_evidence.extend(evidence_by_segment.get(segment, []))
+
+    return PrequentialEconomicEvidence(segment_policies=segment_policies)
+
+
+def _candidate_lower_bound(
+    evidence: HorizonOOFEvidence,
+    bootstrap_alpha: float,
+    n_bootstrap: int,
+    seed: int,
+) -> tuple[float, float]:
+    """Return (base_lower, stress_lower) for a candidate's log-growth series."""
+    block_floor = max(evidence.horizon_sessions, evidence.rebalance_frequency_sessions)
+    base_boot = _cohort_bootstrap(
+        evidence.base_log_growth,
+        evidence.cohort_segment_ids,
+        n_bootstrap,
+        seed,
+        min_block_length=block_floor,
+    )
+    stress_boot = _cohort_bootstrap(
+        evidence.stress_log_growth,
+        evidence.cohort_segment_ids,
+        n_bootstrap,
+        seed + evidence.horizon_sessions,
+        min_block_length=block_floor,
+    )
+    base_lower = base_boot.lower_mean(bootstrap_alpha) if base_boot is not None else 0.0
+    stress_lower = stress_boot.lower_mean(bootstrap_alpha) if stress_boot is not None else 0.0
+    return base_lower, stress_lower
