@@ -581,6 +581,17 @@ def _project_request(request: NetAlphaTrainingRequest) -> dict[str, object]:
         "candidate_horizon_sessions": [
             int(horizon) for horizon in request.candidate_horizon_sessions
         ],
+        "execution_frontier": {
+            "candidate_horizon_sessions": [
+                int(h) for h in request.execution_frontier.candidate_horizon_sessions
+            ],
+            "candidate_rebalance_frequency_sessions": [
+                int(c) for c in request.execution_frontier.candidate_rebalance_frequency_sessions
+            ],
+            "candidate_top_k": [
+                int(k) for k in request.execution_frontier.candidate_top_k
+            ],
+        },
         "policy_profiles": [
             {"profile_id": profile.profile_id, "no_trade_band_bps": profile.no_trade_band_bps}
             for profile in request.policy_profiles
@@ -913,6 +924,12 @@ def _bounded_observability_summary(
     selection = by_name.get("primary_selection", {})
     if "primary_horizon_sessions" in selection:
         summary["primary_horizon_sessions"] = selection["primary_horizon_sessions"]
+    if "primary_rebalance_frequency_sessions" in selection:
+        summary["primary_rebalance_frequency_sessions"] = (
+            selection["primary_rebalance_frequency_sessions"]
+        )
+    if "primary_top_k" in selection:
+        summary["primary_top_k"] = selection["primary_top_k"]
     if "primary_profile_id" in selection:
         summary["primary_profile_id"] = selection["primary_profile_id"]
     if "rankability_reason" in selection:

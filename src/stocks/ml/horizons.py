@@ -27,8 +27,13 @@ DEFAULT_BOOTSTRAP_RESAMPLES = 200
 _BOUND_TOLERANCE = 1e-12
 
 
-def _frontier_key(horizon_sessions: int, profile_id: str) -> tuple[int, str]:
-    return (horizon_sessions, profile_id)
+def _frontier_key(
+    horizon_sessions: int,
+    rebalance_frequency_sessions: int,
+    top_k: int,
+    profile_id: str,
+) -> tuple[int, int, int, str]:
+    return (horizon_sessions, rebalance_frequency_sessions, top_k, profile_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,18 +140,18 @@ class HorizonSelectionEvidence:
 
     primary_horizon_sessions: int | None
     primary_profile_id: str | None
-    adjusted_lower_growth: dict[tuple[int, str], dict[str, float]]
-    base_p_values: dict[tuple[int, str], float]
-    stress_p_values: dict[tuple[int, str], float]
-    base_holm_thresholds: dict[tuple[int, str], float]
-    stress_holm_thresholds: dict[tuple[int, str], float]
+    adjusted_lower_growth: dict[tuple[int, int, int, str], dict[str, float]]
+    base_p_values: dict[tuple[int, int, int, str], float]
+    stress_p_values: dict[tuple[int, int, int, str], float]
+    base_holm_thresholds: dict[tuple[int, int, int, str], float]
+    stress_holm_thresholds: dict[tuple[int, int, int, str], float]
     primary_rebalance_frequency_sessions: int | None = None
     primary_top_k: int | None = None
-    paired_lower_bounds: dict[tuple[int, str], float] = field(default_factory=dict)
-    paired_p_values: dict[tuple[int, str], float] = field(default_factory=dict)
-    paired_holm_thresholds: dict[tuple[int, str], float] = field(default_factory=dict)
-    shadow_turnover: dict[tuple[int, str], float] = field(default_factory=dict)
-    turnover_ratio: dict[tuple[int, str], float] = field(default_factory=dict)
+    paired_lower_bounds: dict[tuple[int, int, int, str], float] = field(default_factory=dict)
+    paired_p_values: dict[tuple[int, int, int, str], float] = field(default_factory=dict)
+    paired_holm_thresholds: dict[tuple[int, int, int, str], float] = field(default_factory=dict)
+    shadow_turnover: dict[tuple[int, int, int, str], float] = field(default_factory=dict)
+    turnover_ratio: dict[tuple[int, int, int, str], float] = field(default_factory=dict)
     selection_reasons: tuple[str, ...] = ()
     rankability_reason: str = ""
     rank_ic_lower_bound: float = 0.0
@@ -164,10 +169,12 @@ class HorizonSelectionEvidence:
         return self.primary_profile_id
 
     def to_json(self) -> dict[str, object]:
-        def keyed(mapping: dict[tuple[int, str], float]) -> dict[str, float]:
+        def keyed(mapping: dict[tuple[int, int, int, str], float]) -> dict[str, float]:
             return {
-                f"{horizon}:{profile}": float(value)
-                for (horizon, profile), value in sorted(mapping.items())
+                f"{horizon}:{cadence}:{top_k}:{profile}": float(value)
+                for (horizon, cadence, top_k, profile), value in sorted(
+                    mapping.items()
+                )
             }
 
         return {
@@ -176,8 +183,8 @@ class HorizonSelectionEvidence:
             "primary_rebalance_frequency_sessions": self.primary_rebalance_frequency_sessions,
             "primary_top_k": self.primary_top_k,
             "adjusted_lower_growth": {
-                f"{horizon}:{profile}": dict(path)
-                for (horizon, profile), path in sorted(
+                f"{horizon}:{cadence}:{top_k}:{profile}": dict(path)
+                for (horizon, cadence, top_k, profile), path in sorted(
                     self.adjusted_lower_growth.items()
                 )
             },
@@ -199,9 +206,12 @@ class HorizonSelectionEvidence:
     def evidence_hash(self) -> str:
         payload = sha256()
         payload.update(f"{self.primary_horizon_sessions}".encode())
-        for (horizon, profile), path in sorted(self.adjusted_lower_growth.items()):
+        for (horizon, cadence, top_k, profile), path in sorted(
+            self.adjusted_lower_growth.items()
+        ):
             payload.update(
-                f"{horizon}:{profile}:{path.get('base', 0.0):.17g}:"
+                f"{horizon}:{cadence}:{top_k}:{profile}:"
+                f"{path.get('base', 0.0):.17g}:"
                 f"{path.get('stress', 0.0):.17g};".encode()
             )
         return payload.hexdigest()
@@ -285,13 +295,13 @@ def _cohort_bootstrap(
 
 def _holm_admission(
     candidates: tuple[HorizonOOFEvidence, ...],
-    bootstrap: dict[tuple[int, str], dict[str, _CohortBootstrap | None]],
+    bootstrap: dict[tuple[int, int, int, str], dict[str, _CohortBootstrap | None]],
     bootstrap_alpha: float,
 ) -> tuple[
-    dict[tuple[int, str], float],
-    dict[tuple[int, str], float],
-    dict[tuple[int, str], float],
-    dict[tuple[int, str], float],
+    dict[tuple[int, int, int, str], float],
+    dict[tuple[int, int, int, str], float],
+    dict[tuple[int, int, int, str], float],
+    dict[tuple[int, int, int, str], float],
     list[str],
 ]:
     """Holm-Bonferroni control across all candidates on the least favorable path.
@@ -303,11 +313,16 @@ def _holm_admission(
     combined p-values, the base and stress Holm thresholds, and rejection
     reasons.
     """
-    combined: dict[tuple[int, str], float] = {}
+    combined: dict[tuple[int, int, int, str], float] = {}
     has_paired = any("paired" in path for path in bootstrap.values())
-    hypotheses: list[tuple[float, tuple[int, str], str]] = []
+    hypotheses: list[tuple[float, tuple[int, int, int, str], str]] = []
     for candidate in candidates:
-        key = _frontier_key(candidate.horizon_sessions, candidate.profile_id)
+        key = _frontier_key(
+        candidate.horizon_sessions,
+        candidate.rebalance_frequency_sessions,
+        candidate.top_k,
+        candidate.profile_id,
+    )
         base = bootstrap[key].get("base")
         stress = bootstrap[key].get("stress")
         paired = bootstrap[key].get("paired")
@@ -324,15 +339,29 @@ def _holm_admission(
             hypotheses.append((paired.p_value, key, "paired"))
     if not has_paired:
         hypotheses = [
-            (combined[_frontier_key(candidate.horizon_sessions, candidate.profile_id)],
-             _frontier_key(candidate.horizon_sessions, candidate.profile_id), "combined")
+            (combined[_frontier_key(
+        candidate.horizon_sessions,
+        candidate.rebalance_frequency_sessions,
+        candidate.top_k,
+        candidate.profile_id,
+    )],
+             _frontier_key(
+        candidate.horizon_sessions,
+        candidate.rebalance_frequency_sessions,
+        candidate.top_k,
+        candidate.profile_id,
+    ), "combined")
             for candidate in candidates
         ]
-    hypotheses.sort(key=lambda item: (item[0], item[1][0], item[1][1], item[2]))
+    hypotheses.sort(
+        key=lambda item: (
+            item[0], item[1][0], item[1][1], item[1][2], item[1][3], item[2]
+        )
+    )
     m = len(hypotheses)
-    base_thresholds: dict[tuple[int, str], float] = {}
-    stress_thresholds: dict[tuple[int, str], float] = {}
-    paired_thresholds: dict[tuple[int, str], float] = {}
+    base_thresholds: dict[tuple[int, int, int, str], float] = {}
+    stress_thresholds: dict[tuple[int, int, int, str], float] = {}
+    paired_thresholds: dict[tuple[int, int, int, str], float] = {}
     reasons: list[str] = []
     for rank, (p_value, key, path_name) in enumerate(hypotheses, start=1):
         threshold = bootstrap_alpha / (m - rank + 1)
@@ -344,7 +373,8 @@ def _holm_admission(
             paired_thresholds[key] = threshold
         if p_value > threshold:
             reasons.append(
-                f"h{key[0]}:{key[1]} {path_name} Holm p {p_value:.6g} > {threshold:.6g}"
+                f"h{key[0]}:c{key[1]}:k{key[2]}:{key[3]} {path_name} "
+                f"Holm p {p_value:.6g} > {threshold:.6g}"
             )
     return combined, base_thresholds, stress_thresholds, paired_thresholds, reasons
 
@@ -354,34 +384,32 @@ def select_horizons(
     bootstrap_alpha: float,
     seed: int,
     n_bootstrap: int = DEFAULT_BOOTSTRAP_RESAMPLES,
-    rebalance_frequency_sessions: int = 1,
-    top_k: int = 20,
 ) -> HorizonSelectionEvidence:
-    """Select at most one economically admissible primary ``(horizon, profile)``.
+    """Select at most one economically admissible primary ``(H, C, K, profile)``.
 
     Selection is evidence-only: every candidate's base and stress per-vintage
     log-growth series are resampled in session units (segment-local, block
-    length at least ``max(horizon, rebalance_frequency_sessions)``, never
-    across segment boundaries) and one-sided centered p-values are computed for
-    the null ``mean(g) <= 0``. Holm-Bonferroni is applied across every
-    pre-registered candidate ``(horizon, profile)`` pair; a pair is admissible
-    only when both its base and stress adjusted lower growth are strictly
-    positive. The primary is the admissible pair with the maximum stress-cost
-    adjusted lower growth (ties prefer the shorter horizon then the
-    lexicographically smaller profile id).
-    ``primary_horizon_sessions``/``primary_profile_id`` are ``None`` when no
-    pair is admissible (the ``NO_TRADE`` outcome).
+    length at least ``max(horizon, rebalance_frequency_sessions)`` from the
+    candidate's own cadence, never across segment boundaries) and one-sided
+    centered p-values are computed for the null ``mean(g) <= 0``. Holm-Bonferroni
+    is applied across every pre-registered candidate ``(horizon,
+    rebalance_frequency_sessions, top_k, profile_id)`` and a candidate is
+    admissible only when its base, stress, and paired lower growth are strictly
+    positive and its sparse/shadow turnover ratio is at most 0.60. The primary
+    is the admissible candidate with the maximum stress-cost adjusted lower
+    growth (ties prefer the shorter horizon, then cadence, then top-k, then the
+    lexicographically smaller profile id). ``primary_horizon_sessions``/
+    ``primary_profile_id`` are ``None`` when no candidate is admissible (the
+    ``NO_TRADE`` outcome).
 
     Args:
-        evidence: pre-registered candidate ``(horizon, profile)`` pairs with
-            their base/stress vintage evidence.
+        evidence: pre-registered candidate ``(horizon, rebalance_frequency_sessions,
+            top_k, profile_id)`` tuples with their base/stress vintage evidence.
         bootstrap_alpha: bootstrap alpha quantile for the lower bound and Holm
             family-wise control.
         seed: deterministic bootstrap seed.
         n_bootstrap: request-controlled moving-block bootstrap resample count;
             values below two are rejected.
-        rebalance_frequency_sessions: the frozen risk policy's rebalance
-            cadence; the bootstrap block floor is ``max(horizon, cadence)``.
 
     Returns:
         ``HorizonSelectionEvidence``; ``primary_horizon_sessions`` is ``None``
@@ -393,18 +421,29 @@ def select_horizons(
         raise ValueError("bootstrap_alpha must be in (0, 1)")
     if n_bootstrap < 2:
         raise ValueError("n_bootstrap must be at least 2")
-    if rebalance_frequency_sessions < 1:
-        raise ValueError("rebalance_frequency_sessions must be positive")
-    if top_k < 1:
-        raise ValueError("top_k must be positive")
 
     ordered = tuple(
-        sorted(evidence, key=lambda candidate: (candidate.horizon_sessions, candidate.profile_id))
+        sorted(
+            evidence,
+            key=lambda candidate: (
+                candidate.horizon_sessions,
+                candidate.rebalance_frequency_sessions,
+                candidate.top_k,
+                candidate.profile_id,
+            ),
+        )
     )
-    bootstrap: dict[tuple[int, str], dict[str, _CohortBootstrap | None]] = {}
+    bootstrap: dict[tuple[int, int, int, str], dict[str, _CohortBootstrap | None]] = {}
     for candidate in ordered:
-        key = _frontier_key(candidate.horizon_sessions, candidate.profile_id)
-        block_floor = max(candidate.horizon_sessions, rebalance_frequency_sessions)
+        key = _frontier_key(
+        candidate.horizon_sessions,
+        candidate.rebalance_frequency_sessions,
+        candidate.top_k,
+        candidate.profile_id,
+    )
+        block_floor = max(
+            candidate.horizon_sessions, candidate.rebalance_frequency_sessions
+        )
         path: dict[str, _CohortBootstrap | None] = {
             "base": _cohort_bootstrap(
                 candidate.base_log_growth,
@@ -435,15 +474,20 @@ def select_horizons(
         ordered, bootstrap, bootstrap_alpha
     )
 
-    adjusted_lower_growth: dict[tuple[int, str], dict[str, float]] = {}
-    paired_lower_bounds: dict[tuple[int, str], float] = {}
-    paired_p_values: dict[tuple[int, str], float] = {}
-    paired_holm_thresholds: dict[tuple[int, str], float] = {}
-    shadow_turnover: dict[tuple[int, str], float] = {}
-    turnover_ratio: dict[tuple[int, str], float] = {}
+    adjusted_lower_growth: dict[tuple[int, int, int, str], dict[str, float]] = {}
+    paired_lower_bounds: dict[tuple[int, int, int, str], float] = {}
+    paired_p_values: dict[tuple[int, int, int, str], float] = {}
+    paired_holm_thresholds: dict[tuple[int, int, int, str], float] = {}
+    shadow_turnover: dict[tuple[int, int, int, str], float] = {}
+    turnover_ratio: dict[tuple[int, int, int, str], float] = {}
     admissible: list[HorizonOOFEvidence] = []
     for candidate in ordered:
-        key = _frontier_key(candidate.horizon_sessions, candidate.profile_id)
+        key = _frontier_key(
+        candidate.horizon_sessions,
+        candidate.rebalance_frequency_sessions,
+        candidate.top_k,
+        candidate.profile_id,
+    )
         base_threshold = base_thresholds[key]
         stress_threshold = stress_thresholds[key]
         paired_threshold = paired_thresholds.get(key, stress_threshold)
@@ -506,12 +550,17 @@ def select_horizons(
     primary_cadence: int | None = None
     primary_topk: int | None = None
     if admissible:
-        primary_horizon, primary_profile = _best_primary(
+        primary_horizon, primary_cadence, primary_topk, primary_profile = _best_primary(
             admissible, adjusted_lower_growth
         )
         selected_candidate = next(
             c for c in admissible
-            if c.horizon_sessions == primary_horizon and c.profile_id == primary_profile
+            if (
+                c.horizon_sessions == primary_horizon
+                and c.rebalance_frequency_sessions == primary_cadence
+                and c.top_k == primary_topk
+                and c.profile_id == primary_profile
+            )
         )
         primary_cadence = selected_candidate.rebalance_frequency_sessions
         primary_topk = selected_candidate.top_k
@@ -523,8 +572,8 @@ def select_horizons(
     else:
         reasons.append("no candidate is economically admissible")
 
-    base_p_values: dict[tuple[int, str], float] = {}
-    stress_p_values: dict[tuple[int, str], float] = {}
+    base_p_values: dict[tuple[int, int, int, str], float] = {}
+    stress_p_values: dict[tuple[int, int, int, str], float] = {}
     for key, path in bootstrap.items():
         base = path["base"]
         stress = path["stress"]
@@ -552,15 +601,25 @@ def select_horizons(
 
 def _best_primary(
     admissible: list[HorizonOOFEvidence],
-    adjusted_lower_growth: dict[tuple[int, str], dict[str, float]],
-) -> tuple[int, str]:
+    adjusted_lower_growth: dict[tuple[int, int, int, str], dict[str, float]],
+) -> tuple[int, int, int, str]:
     """Maximum stress adjusted lower growth; ties prefer shorter horizon, then id."""
     best = admissible[0]
     best_stress = adjusted_lower_growth[
-        _frontier_key(best.horizon_sessions, best.profile_id)
+        _frontier_key(
+            best.horizon_sessions,
+            best.rebalance_frequency_sessions,
+            best.top_k,
+            best.profile_id,
+        )
     ]["stress"]
     for candidate in admissible[1:]:
-        key = _frontier_key(candidate.horizon_sessions, candidate.profile_id)
+        key = _frontier_key(
+        candidate.horizon_sessions,
+        candidate.rebalance_frequency_sessions,
+        candidate.top_k,
+        candidate.profile_id,
+    )
         current = adjusted_lower_growth[key]["stress"]
         if (
             current > best_stress + _BOUND_TOLERANCE
@@ -577,4 +636,9 @@ def _best_primary(
         ):
             best = candidate
             best_stress = current
-    return best.horizon_sessions, best.profile_id
+    return (
+        best.horizon_sessions,
+        best.rebalance_frequency_sessions,
+        best.top_k,
+        best.profile_id,
+    )

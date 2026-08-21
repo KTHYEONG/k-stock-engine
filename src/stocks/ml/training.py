@@ -224,9 +224,11 @@ class HorizonDiscovery:
     evidence: tuple[HorizonOOFEvidence, ...]
     diagnostics: tuple[HorizonOOFDiagnostic, ...]
     oof_by_horizon: Mapping[int, tuple[Path, Path, list[float]]]
-    dropout_reasons: Mapping[tuple[int, str], str] = field(default_factory=dict)
+    dropout_reasons: Mapping[tuple[int, int, int, str], str] = field(
+        default_factory=dict
+    )
     execution_evidence_by_candidate: Mapping[
-        tuple[int, str], ExecutionReplayEvidence
+        tuple[int, int, int, str], ExecutionReplayEvidence
     ] = field(default_factory=dict)
     coverage_by_horizon: Mapping[int, HorizonOutcomeCoverage] = field(
         default_factory=dict
@@ -538,19 +540,21 @@ def _select_publish_and_promote(
     selection = select_horizons(
         discovery.evidence, request.bootstrap_alpha, request.seed,
         n_bootstrap=request.bootstrap_resamples,
-        rebalance_frequency_sessions=(
-            StockRiskPolicy().rebalance_frequency_sessions
-        ),
     )
+    candidate_bound = len(
+        request.execution_frontier.feasible_cells(
+            request.portfolio.max_exposure, request.portfolio.max_single_weight
+        )
+    ) * len(request.policy_profiles)
     telemetry.phase(
         "policy_frontier",
         {
             "candidate_count": len(discovery.evidence),
-            "candidate_bound": 2 * len(request.candidate_horizon_sessions),
+            "candidate_bound": candidate_bound,
             "profile_ids": [p.profile_id for p in request.policy_profiles],
             "dropout_reasons": {
-                f"{horizon}:{profile}": reason
-                for (horizon, profile), reason in sorted(
+                f"{horizon}:{cadence}:{top_k}:{profile}": reason
+                for (horizon, cadence, top_k, profile), reason in sorted(
                     discovery.dropout_reasons.items()
                 )
             },
@@ -564,14 +568,18 @@ def _select_publish_and_promote(
         "primary_selection",
         {
             "adjusted_lower_growth": {
-                f"{horizon}:{profile}": {
+                f"{horizon}:{cadence}:{top_k}:{profile}": {
                     path: float(bound) for path, bound in paths.items()
                 }
-                for (horizon, profile), paths in sorted(
+                for (horizon, cadence, top_k, profile), paths in sorted(
                     selection.adjusted_lower_growth.items()
                 )
             },
             "primary_horizon_sessions": selection.primary_horizon_sessions,
+            "primary_rebalance_frequency_sessions": (
+                selection.primary_rebalance_frequency_sessions
+            ),
+            "primary_top_k": selection.primary_top_k,
             "primary_profile_id": selection.primary_profile_id,
             "selection_reasons": list(selection.selection_reasons),
             "rankability_reason": selection.rankability_reason,
@@ -584,6 +592,8 @@ def _select_publish_and_promote(
             schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
             telemetry=telemetry,
         )
+    assert selection.primary_rebalance_frequency_sessions is not None
+    assert selection.primary_top_k is not None
 
     primary = selection.primary_horizon_sessions
     profile = next(
@@ -627,6 +637,9 @@ def _select_publish_and_promote(
             for candidate in discovery.evidence
             if candidate.horizon_sessions == primary
             and candidate.profile_id == profile.profile_id
+            and candidate.rebalance_frequency_sessions
+            == selection.primary_rebalance_frequency_sessions
+            and candidate.top_k == selection.primary_top_k
         ),
         None,
     )
@@ -682,6 +695,8 @@ def _select_publish_and_promote(
     base_evidence, _stress_evidence = _replay_costs(
         calibrated, oof_labels, request, primary, risk, pre_holdout, data.manifest,
         profile,
+        rebalance_frequency_sessions=selection.primary_rebalance_frequency_sessions,
+        top_k=selection.primary_top_k,
     )
     evaluation = base_evidence
 
@@ -721,6 +736,8 @@ def _select_publish_and_promote(
         calibration = _empty_causal_calibration(request, primary)
     holdout_evidence = _evaluate_forward_holdout(
         final_model, calibration, holdout_panel, request, primary, profile,
+        rebalance_frequency_sessions=selection.primary_rebalance_frequency_sessions,
+        top_k=selection.primary_top_k,
     )
     holdout_order_count = holdout_evidence.get("order_count", 0)
     holdout_block_count = holdout_evidence.get("block_count", 0)
@@ -755,7 +772,14 @@ def _select_publish_and_promote(
             eligible_to=holdout_to,
             params={
                 **dict(manifest.params or {}),
-                "policy_profile": _policy_profile_params(request, profile, primary),
+                "policy_profile": _policy_profile_params(
+                    request, profile, primary,
+                    rebalance_frequency_sessions=(
+                        selection.primary_rebalance_frequency_sessions
+                        or primary
+                    ),
+                    top_k=selection.primary_top_k or request.portfolio.top_k,
+                ),
                 "holm_gate_version": "v6",
                 "selected_horizon_sessions": str(int(primary)),
                 "raw_feature_schema_hash": schema_hash,
@@ -763,7 +787,7 @@ def _select_publish_and_promote(
                 "feature_transform_schema": json.dumps(schema.to_json()),
                 "feature_transform_fingerprint": schema.fingerprint,
                 "policy_fingerprint": policy_portfolio_fingerprint(
-                    request.portfolio.top_k,
+                    selection.primary_top_k or request.portfolio.top_k,
                     request.portfolio.max_single_weight,
                     request.portfolio.max_exposure,
                     request.portfolio.participation_limit,
@@ -1195,26 +1219,34 @@ def _fold_alpha_metadata(diagnostic: HorizonOOFDiagnostic) -> dict[str, object]:
 
 
 def _risk_policy_for_profile(
-    request: NetAlphaTrainingRequest, profile: PolicyProfile, horizon_sessions: int,
-    top_k: int | None = None,
+    request: NetAlphaTrainingRequest,
+    profile: PolicyProfile,
+    horizon_sessions: int,
+    *,
+    rebalance_frequency_sessions: int,
+    top_k: int,
 ) -> StockRiskPolicy:
     """Frozen operational risk policy reconstructed from the request portfolio.
 
-    The v7 route is horizon-locked: the rebalance cadence equals the forecast
-    horizon so a decision is never re-evaluated before its H-session outcome is
-    realised. The effective active count and candidate pool are derived from the
-    gross and single-name caps and persisted through ``_policy_profile_params``.
+    The forecast horizon ``horizon_sessions`` bounds the holding window; the
+    rebalance cadence ``rebalance_frequency_sessions`` may be shorter (``C <= H``)
+    and ``top_k`` is the exact active-name count. The effective active count and
+    candidate pool are derived from the gross and single-name caps and persisted
+    through ``_policy_profile_params``.
     """
     if horizon_sessions < 1:
         raise ValueError("horizon_sessions must be a positive session count")
-    effective_top_k = top_k if top_k is not None else request.portfolio.top_k
+    if rebalance_frequency_sessions < 1:
+        raise ValueError("rebalance_frequency_sessions must be a positive session count")
+    if top_k < 1:
+        raise ValueError("top_k must be a positive session count")
     return StockRiskPolicy(
-        top_k=effective_top_k,
+        top_k=top_k,
         gross_cap=request.portfolio.max_exposure,
         single_name_cap=request.portfolio.max_single_weight,
         participation_limit=request.portfolio.participation_limit,
         no_trade_band_bps=profile.no_trade_band_bps,
-        rebalance_frequency_sessions=horizon_sessions,
+        rebalance_frequency_sessions=rebalance_frequency_sessions,
         compounding=CompoundingPolicyConfig(
             growth_risk_aversion=profile.growth_risk_aversion,
             forecast_horizon_sessions=horizon_sessions,
@@ -1233,6 +1265,8 @@ def _execution_replay_context(
     *,
     seed: int,
     horizon_sessions: int,
+    rebalance_frequency_sessions: int,
+    top_k: int,
 ) -> ExecutionReplayContext:
     """Immutable execution-equivalent context for one candidate replay."""
     instruments = instruments_from_frame(market_frame)
@@ -1250,7 +1284,11 @@ def _execution_replay_context(
             unsettled_cash=0.0,
             positions=(),
         ),
-        risk_policy=_risk_policy_for_profile(request, profile, horizon_sessions),
+        risk_policy=_risk_policy_for_profile(
+            request, profile, horizon_sessions,
+            rebalance_frequency_sessions=rebalance_frequency_sessions,
+            top_k=top_k,
+        ),
         base_cost_schedule=request.base_cost_schedule or default_base_schedule(),
         stress_cost_schedule=request.stress_cost_schedule or default_stress_schedule(),
         liquidity_model=request.liquidity_model,
@@ -1269,6 +1307,9 @@ def _replay_costs(
     market_frame: pl.DataFrame,
     manifest: DatasetManifest,
     profile: PolicyProfile,
+    *,
+    rebalance_frequency_sessions: int,
+    top_k: int,
 ) -> tuple[ExecutionReplayEvidence, ExecutionReplayEvidence]:
     """Execution-equivalent base/stress replay over the segment-identified OOF.
 
@@ -1276,7 +1317,9 @@ def _replay_costs(
     panel are replayed through ``replay_execution_equivalent`` exactly once;
     base and stress equity are parallel because one backtester advances both
     scenarios against the same immutable prepared market. The returned pair is
-    the same immutable evidence object seen from each cost path.
+    the same immutable evidence object seen from each cost path. The exact
+    ``rebalance_frequency_sessions`` (cadence C) and ``top_k`` (K) of the
+    candidate cell drive the sparse and matched dense-shadow replay identically.
     """
     del oof_labels
     sessions_by_segment: dict[int, list[datetime]] = {}
@@ -1290,7 +1333,11 @@ def _replay_costs(
         profile.execution_utility_mode == "sparse_hold_replace_v2"
         or profile.sizing_mode == "risk_balanced_waterfill_v2"
     )
-    replay_policy = _risk_policy_for_profile(request, profile, horizon_sessions)
+    replay_policy = _risk_policy_for_profile(
+        request, profile, horizon_sessions,
+        rebalance_frequency_sessions=rebalance_frequency_sessions,
+        top_k=top_k,
+    )
     decision_sessions_by_segment: dict[int, tuple[datetime, ...]] = {}
     for segment, sessions in sessions_by_segment.items():
         sorted_sessions = tuple(sorted(sessions))
@@ -1313,6 +1360,8 @@ def _replay_costs(
         request, manifest, market_frame, profile,
         seed=request.seed + horizon_sessions,
         horizon_sessions=horizon_sessions,
+        rebalance_frequency_sessions=rebalance_frequency_sessions,
+        top_k=top_k,
     )
     replay_request = ExecutionEquivalentReplayRequest(
         context=context,
@@ -1336,6 +1385,8 @@ def _replay_costs(
         request, manifest, market_frame, dense_profile,
         seed=request.seed + horizon_sessions + 7,
         horizon_sessions=horizon_sessions,
+        rebalance_frequency_sessions=rebalance_frequency_sessions,
+        top_k=top_k,
     )
     shadow_request = ExecutionEquivalentReplayRequest(
         context=shadow_context,
@@ -1361,6 +1412,8 @@ def _evidence_from_execution(
     paired_stress_log_growth: tuple[float, ...] = (),
     sparse_turnover: float = 0.0,
     shadow_turnover: float = 0.0,
+    rebalance_frequency_sessions: int = 5,
+    top_k: int = 20,
 ) -> HorizonOOFEvidence:
     """Build a candidate's base/stress equity evidence from the prepared replay.
 
@@ -1370,7 +1423,9 @@ def _evidence_from_execution(
     never zero-filled, so the missing/partial cohort counts are structurally
     zero. ``paired_stress_log_growth`` carries the per-vintage sparse-minus-dense
     stress improvement and ``sparse_turnover``/``shadow_turnover`` the matched
-    replay turnover pair, segment-aligned to ``base_log_growth``.
+    replay turnover pair, segment-aligned to ``base_log_growth``. The exact
+    candidate ``rebalance_frequency_sessions`` (cadence C) and ``top_k`` (K) are
+    persisted so selection keys and the artifact fingerprint stay distinct.
     """
     if base_evidence.segment_ids != stress_evidence.segment_ids:
         raise ValueError("base and stress execution segment identities diverged")
@@ -1394,6 +1449,8 @@ def _evidence_from_execution(
         missing_cohort_count=0,
         segment_count=segment_count,
         fold_rank_ics=fold_rank_ics,
+        rebalance_frequency_sessions=rebalance_frequency_sessions,
+        top_k=top_k,
         paired_stress_log_growth=paired_stress_log_growth,
         sparse_turnover=float(sparse_turnover),
         shadow_turnover=float(shadow_turnover),
@@ -1526,12 +1583,27 @@ def _build_horizon_evidence(
             "labels (a missing requested horizon is a deterministic error, not a "
             "silent fallback)"
         )
+    if tuple(request.execution_frontier.candidate_horizon_sessions) != tuple(
+        request.candidate_horizon_sessions
+    ):
+        raise ValueError(
+            "execution_frontier.candidate_horizon_sessions must equal "
+            "candidate_horizon_sessions; the declared (H, C, K) frontier and the "
+            "discovery grid must be identical before fitting"
+        )
+    feasible = request.execution_frontier.feasible_cells(
+        request.portfolio.max_exposure, request.portfolio.max_single_weight
+    )
+    cells_by_horizon: dict[int, list[tuple[int, int]]] = {}
+    for h, c, k in feasible:
+        cells_by_horizon.setdefault(h, []).append((c, k))
+
     evidence: list[HorizonOOFEvidence] = []
     diagnostics: list[HorizonOOFDiagnostic] = []
     oof_by_horizon: dict[int, tuple[Path, Path, list[float]]] = {}
-    dropout_reasons: dict[tuple[int, str], str] = {}
+    dropout_reasons: dict[tuple[int, int, int, str], str] = {}
     execution_evidence_by_candidate: dict[
-        tuple[int, str], ExecutionReplayEvidence
+        tuple[int, int, int, str], ExecutionReplayEvidence
     ] = {}
     coverage_by_horizon: dict[int, HorizonOutcomeCoverage] = {}
     horizon_memory: dict[int, dict[str, object]] = {}
@@ -1574,10 +1646,11 @@ def _build_horizon_evidence(
             fold_path_count,
         )
         if oof.is_empty() or oof_labels.is_empty():
-            for profile in request.policy_profiles:
-                dropout_reasons[(horizon, profile.profile_id)] = (
-                    "no-oof-labels"
-                )
+            for c, k in cells_by_horizon.get(horizon, []):
+                for profile in request.policy_profiles:
+                    dropout_reasons[(horizon, c, k, profile.profile_id)] = (
+                        "no-oof-labels"
+                    )
         else:
             coverage = None
             status_frame = data.status_by_horizon.get(horizon)
@@ -1612,7 +1685,7 @@ def _build_horizon_evidence(
             admitted_any = False
 
             def replay_profile(
-                profile: PolicyProfile,
+                spec: tuple[int, int, PolicyProfile],
                 *,
                 _calibrated: pl.DataFrame = calibrated,
                 _oof_labels: pl.DataFrame = oof_labels,
@@ -1620,7 +1693,8 @@ def _build_horizon_evidence(
                 _horizon: int = horizon,
                 _pre_holdout: pl.DataFrame = pre_holdout,
                 _manifest: DatasetManifest = data.manifest,
-            ) -> tuple[PolicyProfile, ExecutionReplayEvidence | None, ExecutionReplayEvidence | None, str]:
+            ) -> tuple[int, int, PolicyProfile, ExecutionReplayEvidence | None, ExecutionReplayEvidence | None, str]:
+                rebalance_frequency_sessions, top_k, profile = spec
                 risk = replace(
                     _request.risk, no_trade_band_bps=profile.no_trade_band_bps
                 )
@@ -1628,10 +1702,13 @@ def _build_horizon_evidence(
                     base_evidence, shadow_evidence = _replay_costs(
                         _calibrated, _oof_labels, _request, _horizon, risk,
                         _pre_holdout, _manifest, profile,
+                        rebalance_frequency_sessions=rebalance_frequency_sessions,
+                        top_k=top_k,
                     )
                 except ValueError as exc:
-                    return profile, None, None, (
-                        f"replay-error:{type(exc).__name__}:{exc}"
+                    return (
+                        rebalance_frequency_sessions, top_k, profile, None, None,
+                        f"replay-error:{type(exc).__name__}:{exc}",
                     )
                 is_v5 = (
                     profile.execution_utility_mode == "sparse_hold_replace_v2"
@@ -1640,7 +1717,10 @@ def _build_horizon_evidence(
                 shadow_for_gate: ExecutionReplayEvidence | None = shadow_evidence
                 if is_v5:
                     if shadow_for_gate is None:
-                        return profile, base_evidence, None, "missing-shadow-evidence"
+                        return (
+                            rebalance_frequency_sessions, top_k, profile,
+                            base_evidence, None, "missing-shadow-evidence",
+                        )
                     # Genuine matched dense shadow; the paired stress improvement
                     # is attached to the candidate evidence in the outer loop so
                     # the HorizonSelection Holm family can gate on all three paths.
@@ -1649,35 +1729,39 @@ def _build_horizon_evidence(
                     )
                 else:
                     shadow_for_gate = None
-                return profile, base_evidence, shadow_for_gate, ""
+                return (
+                    rebalance_frequency_sessions, top_k, profile,
+                    base_evidence, shadow_for_gate, "",
+                )
 
+            candidate_specs: list[tuple[int, int, PolicyProfile]] = [
+                (c, k, profile)
+                for (c, k) in cells_by_horizon.get(horizon, [])
+                for profile in request.policy_profiles
+            ]
             with ThreadPoolExecutor(
-                max_workers=min(len(request.policy_profiles), request.model_threads)
+                max_workers=max(1, min(len(candidate_specs), request.model_threads))
             ) as executor:
-                replay_results = list(
-                    executor.map(replay_profile, request.policy_profiles)
-                )
-            for profile, base_evidence, shadow_evidence, replay_error in replay_results:
+                replay_results = list(executor.map(replay_profile, candidate_specs))
+            for (
+                rebalance_frequency_sessions, top_k, profile,
+                base_evidence, shadow_evidence, replay_error,
+            ) in replay_results:
                 logger.debug(
-                    "[EVAL] stage=profile_replay horizon=%d profile=%s band_bps=%.3f",
-                    horizon,
-                    profile.profile_id,
-                    profile.no_trade_band_bps,
+                    "[EVAL] stage=profile_replay horizon=%d cadence=%d top_k=%d "
+                    "profile=%s band_bps=%.3f",
+                    horizon, rebalance_frequency_sessions, top_k,
+                    profile.profile_id, profile.no_trade_band_bps,
                 )
+                key = (horizon, rebalance_frequency_sessions, top_k, profile.profile_id)
                 if base_evidence is None:
-                    dropout_reasons[(horizon, profile.profile_id)] = (
-                        replay_error or "replay-error"
-                    )
+                    dropout_reasons[key] = replay_error or "replay-error"
                     continue
                 if not base_evidence.base_log_growth:
-                    dropout_reasons[(horizon, profile.profile_id)] = (
-                        "no-evaluated-vintages"
-                    )
+                    dropout_reasons[key] = "no-evaluated-vintages"
                     continue
                 if base_evidence.filled_orders == 0:
-                    dropout_reasons[(horizon, profile.profile_id)] = (
-                        "no-filled-orders"
-                    )
+                    dropout_reasons[key] = "no-filled-orders"
                     continue
                 stress_evidence = base_evidence
                 paired_stress: tuple[float, ...] = ()
@@ -1700,16 +1784,16 @@ def _build_horizon_evidence(
                     paired_stress_log_growth=paired_stress,
                     sparse_turnover=sparse_turnover,
                     shadow_turnover=shadow_turnover,
+                    rebalance_frequency_sessions=rebalance_frequency_sessions,
+                    top_k=top_k,
                 )
-                execution_evidence_by_candidate[(horizon, profile.profile_id)] = (
-                    base_evidence
-                )
+                execution_evidence_by_candidate[key] = base_evidence
                 failure_reason = _coverage_failure_reason(candidate_evidence, request)
-                dropout_reasons[(horizon, profile.profile_id)] = failure_reason
+                dropout_reasons[key] = failure_reason
                 logger.debug(
-                    "[EVAL] stage=profile_result horizon=%d profile=%s sessions=%d "
-                    "active=%d dropout=%s",
-                    horizon,
+                    "[EVAL] stage=profile_result horizon=%d cadence=%d top_k=%d "
+                    "profile=%s sessions=%d active=%d dropout=%s",
+                    horizon, rebalance_frequency_sessions, top_k,
                     profile.profile_id,
                     len(base_evidence.base_log_growth),
                     round(
@@ -2394,7 +2478,14 @@ def _adopt_model_family(
     policy that was selected). Otherwise the ElasticNet baseline remains. A
     skipped challenger preserves the valid baseline OOF so trading continues.
     """
-    profile_key = (primary_horizon_sessions, profile.profile_id)
+    assert selection.primary_rebalance_frequency_sessions is not None
+    assert selection.primary_top_k is not None
+    profile_key = (
+        primary_horizon_sessions,
+        selection.primary_rebalance_frequency_sessions,
+        selection.primary_top_k,
+        profile.profile_id,
+    )
     if rankability_reason:
         return (
             "net_alpha_elastic_net",
@@ -2418,6 +2509,8 @@ def _adopt_model_family(
         _base_evidence, stress_evidence = _replay_costs(
             challenger_calibrated, challenger_labels, request,
             primary_horizon_sessions, risk, pre_holdout, data.manifest, profile,
+            rebalance_frequency_sessions=selection.primary_rebalance_frequency_sessions,
+            top_k=selection.primary_top_k,
         )
     except ValueError as exc:
         return (
@@ -2577,6 +2670,9 @@ def _evaluate_forward_holdout(
     request: NetAlphaTrainingRequest,
     horizon_sessions: int,
     profile: PolicyProfile,
+    *,
+    rebalance_frequency_sessions: int,
+    top_k: int,
 ) -> dict[str, object]:
     """Certify the untouched forward holdout on true base/stress equity.
 
@@ -2601,6 +2697,8 @@ def _evaluate_forward_holdout(
             calibrated, calibrated, request, horizon_sessions, risk,
             holdout_panel, _holdout_stub_manifest(request, holdout_panel),
             profile,
+            rebalance_frequency_sessions=rebalance_frequency_sessions,
+            top_k=top_k,
         )
     except ValueError as exc:
         return {"passed": False, "reason": f"holdout-replay-invalid:{exc}"}
@@ -2782,12 +2880,24 @@ def _publish_no_trade(
 
 
 def _policy_profile_params(
-    request: NetAlphaTrainingRequest, profile: PolicyProfile, horizon_sessions: int,
-    top_k: int | None = None,
+    request: NetAlphaTrainingRequest,
+    profile: PolicyProfile,
+    horizon_sessions: int,
+    *,
+    rebalance_frequency_sessions: int,
+    top_k: int,
 ) -> str:
-    """JSON projection of the selected immutable policy profile for the manifest."""
-    effective_top_k = top_k if top_k is not None else request.portfolio.top_k
-    policy = _risk_policy_for_profile(request, profile, horizon_sessions, top_k=effective_top_k)
+    """JSON projection of the selected immutable policy profile for the manifest.
+
+    Persists the exact selected forecast horizon, rebalance cadence (C), and
+    active-name count (K) so the independent simulator reconstructs an identical
+    ``StockRiskPolicy`` fingerprint.
+    """
+    policy = _risk_policy_for_profile(
+        request, profile, horizon_sessions,
+        rebalance_frequency_sessions=rebalance_frequency_sessions,
+        top_k=top_k,
+    )
     execution_policy = request.execution_policy or SCHEDULED_OPEN_V1
     evidence_version = (
         "prepared-equity-v5-sparse-growth"
@@ -2806,15 +2916,15 @@ def _policy_profile_params(
             "no_trade_band_bps": profile.no_trade_band_bps,
             "growth_risk_aversion": profile.growth_risk_aversion,
             "forecast_horizon_sessions": horizon_sessions,
-            "rebalance_frequency_sessions": horizon_sessions,
+            "rebalance_frequency_sessions": rebalance_frequency_sessions,
             "effective_active_count": effective_active_count,
             "candidate_pool_count": candidate_pool_count,
-            "top_k": effective_top_k,
+            "top_k": top_k,
             "max_single_weight": request.portfolio.max_single_weight,
             "max_exposure": request.portfolio.max_exposure,
             "participation_limit": request.portfolio.participation_limit,
             "portfolio_fingerprint": policy_portfolio_fingerprint(
-                effective_top_k,
+                top_k,
                 request.portfolio.max_single_weight,
                 request.portfolio.max_exposure,
                 request.portfolio.participation_limit,
@@ -2854,7 +2964,9 @@ def _build_metrics(
             path: annualized_cagr(bound)
             for path, bound in paths.items()
         }
-        for (horizon, profile_id), paths in selection.adjusted_lower_growth.items()
+        for (horizon, cadence, top_k, profile_id), paths in (
+            selection.adjusted_lower_growth.items()
+        )
     }
     return {
         "promoted": manifest.model_type != "no_trade",
@@ -2905,8 +3017,8 @@ def _policy_frontier_projection(
         "candidate_count": len(discovery.evidence),
         "profile_ids": [p.profile_id for p in request.policy_profiles],
         "dropout_reasons": {
-            f"{horizon}:{profile_id}": reason
-            for (horizon, profile_id), reason in sorted(
+            f"{horizon}:{cadence}:{top_k}:{profile_id}": reason
+            for (horizon, cadence, top_k, profile_id), reason in sorted(
                 discovery.dropout_reasons.items()
             )
         },
@@ -2918,7 +3030,7 @@ def _policy_frontier_projection(
 
 def _segment_summaries(
     execution_evidence_by_candidate: Mapping[
-        tuple[int, str], ExecutionReplayEvidence
+        tuple[int, int, int, str], ExecutionReplayEvidence
     ],
     selected_profile_id: str | None,
 ) -> dict[str, object]:
@@ -2930,10 +3042,10 @@ def _segment_summaries(
     emitted.
     """
     summaries: dict[str, object] = {}
-    for (horizon, profile_id), evidence in sorted(
+    for (horizon, cadence, top_k, profile_id), evidence in sorted(
         execution_evidence_by_candidate.items()
     ):
         if selected_profile_id is not None and profile_id != selected_profile_id:
             continue
-        summaries[f"h{horizon}:{profile_id}"] = evidence.diagnostics()
+        summaries[f"h{horizon}:{cadence}:{top_k}:{profile_id}"] = evidence.diagnostics()
     return summaries
