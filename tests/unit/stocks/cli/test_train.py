@@ -343,3 +343,12 @@ def test_direct_dataset_defaults_use_reference_boundary() -> None:
     )
     assert args.research_end_direct == REFERENCE_DATE
     assert args.decision_time == REFERENCE_DATETIME
+
+
+def test_direct_cost_provenance_01_requires_known_snapshot(monkeypatch, tmp_path) -> None:
+    """DIRECT_COST_PROVENANCE_01: unknown evidence cannot certify a run."""
+    monkeypatch.setattr(train, "STOCK_CATALOG_ROOT", tmp_path)
+    with pytest.raises(ValueError, match=r"cost snapshot .* not found"):
+        train._resolve_direct_cost_context(
+            "missing-cost-evidence", SimpleNamespace(), object()
+        )
