@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_REPLAY_RUNTIME_SCALING",
+      "date": "2026-08-21",
+      "adr_id": "ADR_20260821_ML_REPLAY_RUNTIME_SCALING",
+      "domain": "ml",
+      "title": "ML replay runtime scaling and economic-result traceability",
+      "why": "ML replay candidates had serial execution and full runs could remain silent for minutes; latest model metrics also needed to be distinguished from economic promotion.",
+      "resolution": "Added bounded ordered replay workers, schedule-semantic batch partitioning, profile-specific dense shadows, cached prepared decision timestamps, and checker fallback when pytest-timeout is unavailable; documented that positive Rank IC alone does not qualify an economically admissible artifact.",
+      "impact": "Compatible replay frontier now reuses immutable preparation and benchmark execution improved from 21.4s to 6.3s with exact parity; latest ML run remains NO_TRADE because all six candidates have negative adjusted lower growth."
+    },
+    {
       "task_id": "ML_CONFIDENCE_TURNOVER_V1",
       "date": "2026-08-21",
       "adr_id": "ADR_20260821_ML_CONFIDENCE_TURNOVER_V1",
