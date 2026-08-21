@@ -575,3 +575,43 @@ def test_horizon_not_forced_exit() -> None:
     ]
     growth_sell = _decision_interval_log_growth(sell_ledger, decisions_c5)
     assert len(growth_sell) == 4
+
+
+def test_telemetry_projection() -> None:
+    """ML_CONFIDENCE_FRONTIER_04_BOUNDED_COST_TELEMETRY.
+
+    Diagnostics include finite aggregate base_cost_drag, stress_cost_drag,
+    base_exposure, and stress_exposure, and contain no instrument_id, score,
+    label, trade, or raw-return collection.
+    """
+    evidence = ExecutionReplayEvidence(
+        base_log_growth=(0.001, 0.002),
+        stress_log_growth=(0.0005, 0.0015),
+        segment_ids=(0, 0),
+        planned_cycles=10,
+        filled_orders=5,
+        cash_session_fraction=0.2,
+        turnover=0.3,
+        observed_interval_count=2,
+        invested_interval_count=2,
+        invested_interval_fraction=1.0,
+        filled_cycle_count=2,
+        unfilled_order_reason_counts=(),
+        action_diagnostics=(("replacement_count", 1),),
+        base_cost_drag=0.001,
+        stress_cost_drag=0.0005,
+        base_exposure=0.85,
+        stress_exposure=0.80,
+    )
+    diagnostics = evidence.diagnostics()
+    assert "base_cost_drag" in diagnostics
+    assert "stress_cost_drag" in diagnostics
+    assert "base_exposure" in diagnostics
+    assert "stress_exposure" in diagnostics
+    assert isinstance(diagnostics["base_cost_drag"], float)
+    assert diagnostics["base_cost_drag"] >= 0.0
+    assert diagnostics["stress_cost_drag"] >= 0.0
+    assert diagnostics["base_exposure"] >= 0.0
+    assert diagnostics["stress_exposure"] >= 0.0
+    for forbidden_key in ("instrument_id", "score", "label", "trade", "raw_return"):
+        assert forbidden_key not in diagnostics
