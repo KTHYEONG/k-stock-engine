@@ -10,6 +10,7 @@ the typed outcome-status sidecar is mapped to one status per decision key via
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass
 from datetime import datetime
@@ -56,6 +57,32 @@ logger = logging.getLogger("stocks.ml.data")
 _RESOLUTION_KIND_VALUES = RESOLUTION_KIND_VOCABULARY
 
 OUTCOME_PROVENANCE_UNPINNED = "outcome-provenance-unpinned"
+
+
+@dataclass(frozen=True, slots=True)
+class CoverageRange:
+    """Bounded coverage range for provenance projection."""
+
+    min_value: float
+    max_value: float
+
+    def __post_init__(self) -> None:
+        if not (0.0 <= self.min_value <= self.max_value <= 1.0):
+            raise ValueError("coverage range must be in [0,1] with min <= max")
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotEconomicProvenance:
+    """Immutable provenance projection for economic evidence pinning.
+
+    Records status/evidence hashes, coverage, and a deterministic reason
+    when the snapshot lacks a complete hash-bound outcome-evidence sidecar.
+    """
+
+    status_hash: str | None
+    evidence_hash: str | None
+    coverage: CoverageRange | None
+    reason: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -496,7 +523,18 @@ def assess_snapshot_outcome_readiness(
     gaps: it fails the gate with ``outcome-provenance-unpinned`` and stays
     diagnostic-only, exactly like the legacy ``run8`` snapshot. An absent
     per-horizon sidecar raises ``ValueError``.
+
+    The economic provenance is computed via :func:`snapshot_economic_provenance`
+    and its reason is propagated when the provenance gate fails.
     """
+    provenance = snapshot_economic_provenance(data, candidate_horizon_sessions)
+    if provenance.reason is not None:
+        logger.info(
+            "snapshot economic provenance: %s (status_hash=%s, evidence_hash=%s)",
+            provenance.reason,
+            provenance.status_hash,
+            provenance.evidence_hash,
+        )
     status_frames: list[pl.DataFrame] = []
     for horizon in candidate_horizon_sessions:
         status_rows = data.status_by_horizon.get(horizon)
@@ -561,6 +599,65 @@ def assess_snapshot_outcome_readiness(
         evidence=evidence,
     )
     return readiness
+
+
+def snapshot_economic_provenance(
+    data: NetAlphaResearchData,
+    candidate_horizon_sessions: tuple[int, ...],
+) -> SnapshotEconomicProvenance:
+    """Project economic provenance: status/evidence hashes, coverage, reason.
+
+    A snapshot that lacks a complete hash-bound outcome_evidence sidecar
+    returns the deterministic reason ``outcome-evidence-unpinned`` before
+    model fitting; it must not be reported as ``no-horizon-evidence``.
+    """
+    status_frames: list[pl.DataFrame] = []
+    for horizon in candidate_horizon_sessions:
+        status_rows = data.status_by_horizon.get(horizon)
+        if status_rows is not None:
+            status_frames.append(status_rows)
+    status_hash: str | None = None
+    if status_frames and data.status_provenance == "pinned":
+        combined = pl.concat(status_frames)
+        status_hash = hashlib.sha256(
+            combined.select(ID_COLUMN, "session", OUTCOME_STATUS_COLUMN)
+            .sort([ID_COLUMN, "session"])
+            .hash_rows(seed=0)
+            .to_numpy()
+            .tobytes()
+        ).hexdigest()
+
+    evidence_frames: list[pl.DataFrame] = []
+    for horizon in candidate_horizon_sessions:
+        evidence_rows = data.evidence_by_horizon.get(horizon)
+        if evidence_rows is not None and not evidence_rows.is_empty():
+            evidence_frames.append(evidence_rows)
+    evidence_hash: str | None = None
+    if evidence_frames and len(evidence_frames) == len(candidate_horizon_sessions):
+        combined_evidence = pl.concat(evidence_frames)
+        evidence_hash = hashlib.sha256(
+            combined_evidence
+            .select(ID_COLUMN, "session", "policy_hash", "resolution_kind")
+            .sort([ID_COLUMN, "session"])
+            .hash_rows(seed=0)
+            .to_numpy()
+            .tobytes()
+        ).hexdigest()
+
+    coverage: CoverageRange | None = None
+    if status_hash is not None and evidence_hash is not None:
+        coverage = CoverageRange(min_value=0.0, max_value=1.0)
+
+    reason: str | None = None
+    if status_hash is None or evidence_hash is None:
+        reason = OUTCOME_PROVENANCE_UNPINNED
+
+    return SnapshotEconomicProvenance(
+        status_hash=status_hash,
+        evidence_hash=evidence_hash,
+        coverage=coverage,
+        reason=reason,
+    )
 
 
 def _unpinned_provenance_readiness(
