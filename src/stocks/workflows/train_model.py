@@ -21,6 +21,7 @@ from src.stocks.ml.result_ledger import (
     ResultLedgerObserver,
 )
 from src.stocks.ml.training import train_net_alpha_model
+from src.stocks.observability.contracts import RunDiagnostics
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.research.models import ModelManifest
 
@@ -33,6 +34,7 @@ def train_model(
     request: NetAlphaTrainingRequest,
     *,
     observer: ResultLedgerObserver | None = None,
+    diagnostics: RunDiagnostics | None = None,
 ) -> ModelManifest:
     """Train the net-alpha mainline and publish a champion or ``NO_TRADE`` artifact.
 
@@ -61,7 +63,7 @@ def train_model(
             started_at=_utc_now(),
         )
     try:
-        manifest = train_net_alpha_model(data, registry, request)
+        manifest = train_net_alpha_model(data, registry, request, diagnostics=diagnostics)
     except Exception as exc:
         if observer is not None and context is not None:
             try:

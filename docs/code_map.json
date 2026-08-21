@@ -369,7 +369,8 @@
   "src/stocks/ml/training.py": {
     "testing": [
       "tests/unit/stocks/workflows/test_train_model.py",
-      "tests/unit/stocks/ml/test_training.py"
+      "tests/unit/stocks/ml/test_training.py",
+      "tests/unit/stocks/test_observability.py"
     ],
     "architecture": "docs/specs/missing_exit_vintage_completion.md"
   },

@@ -903,6 +903,7 @@ def construct_target_allocations(
     returns an empty tuple rather than synthetic weights.
     """
     _validate_scores_frame(scores, instruments)
+
     panel = scores.sort([_SESSION_COLUMN, "instrument_id"])
     if "__vol" not in panel.columns:
         returns = _returns_column(panel)
