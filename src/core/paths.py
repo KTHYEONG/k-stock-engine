@@ -29,3 +29,6 @@ STOCK_FEATURE_PANEL_ROOT = STOCK_DERIVED_ROOT / "features"
 STOCK_SNAPSHOT_ROOT = DATA_ROOT / "snapshots" / "stocks"
 STOCK_RESULTS_ROOT = DATA_ROOT / "results" / "stocks"
 STOCK_EVIDENCE_ROOT = DATA_ROOT / "evidence" / "stocks"
+
+# Diagnostic run logs.
+RUN_DIAGNOSTIC_ROOT = PROJECT_ROOT / "logs" / "runs"

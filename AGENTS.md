@@ -13,6 +13,7 @@
 - **Fact-Based Truth:** Do not fabricate APIs, files, results, or execution status. Rely strictly on empirical codebase facts and verified documentation.
 
 ## 3. Output Policy
+- **Language Policy:** Respond primarily in Korean as the user is Korean. Use English ONLY for technical terminology.
 - **Question:** Direct technical analysis first, then concise answer. Include key reasoning path (2-4 lines) when complexity warrants it.
 - **Bug Fix / Triage:** State root cause first. Suggest fix that addresses root cause — minimal only when scope-limited, holistic when systemic.
 - **Feature Request:** Follow active skill flow (Spec -> Implement -> Check).
