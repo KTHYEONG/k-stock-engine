@@ -63,9 +63,11 @@ from src.stocks.ml.execution_replay import (
     ProfileReplayEvidence,
     exposure_matched_benchmark_log_growth,
     instruments_from_frame,
+    plan_execution_replay_resources,
     prepare_execution_replay_batch,
     replay_execution_equivalent,
     replay_execution_equivalent_batch,
+    stream_execution_replay_batch,
 )
 from src.stocks.ml.features import (
     FeatureTransformSchema,
@@ -126,7 +128,10 @@ from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.research.calibration_schedule import SessionClusterCalibrationSchedule
 from src.stocks.research.economic_alpha import CausalAlphaCalibrator
 from src.stocks.research.folds import Fold, PurgedWalkForward
-from src.stocks.research.metrics import certify_compounded_holdout
+from src.stocks.research.metrics import (
+    certify_compounded_holdout,
+    certify_exposure_matched_excess,
+)
 from src.stocks.research.models import Model, ModelManifest
 from src.stocks.trading.portfolio_constructor import (
     CompoundingPolicyConfig,
@@ -1540,10 +1545,26 @@ def _replay_costs_batch(
 
         if batch_replay_requests:
             cadence_requests = batch_replay_requests
-            primary_evidences = replay_execution_equivalent_batch(
-                cadence_requests, prepared_batch=batch,
-                max_workers=request.model_threads,
-            )
+            if request.max_rss_mib is not None:
+                import os
+                available_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+                segment_bytes = batch.segment_data[next(iter(batch.segment_data))].prepared_market.cache_bytes if batch.segment_data else 0
+                resource_plan = plan_execution_replay_resources(
+                    available_bytes=available_bytes,
+                    prepared_segment_bytes=max(segment_bytes, 1),
+                    requested_workers=request.model_threads,
+                )
+                if resource_plan.max_workers > 0:
+                    primary_evidences = tuple(stream_execution_replay_batch(
+                        cadence_requests, resource_plan,
+                    ))
+                else:
+                    primary_evidences = ()
+            else:
+                primary_evidences = replay_execution_equivalent_batch(
+                    cadence_requests, prepared_batch=batch,
+                    max_workers=request.model_threads,
+                )
         else:
             primary_evidences = ()
 
@@ -1784,6 +1805,9 @@ def _build_horizon_evidence(
             "candidate_horizon_sessions; the declared (H, C, K) frontier and the "
             "discovery grid must be identical before fitting"
         )
+    request.execution_frontier.require_feasible_horizons(
+        request.portfolio.max_exposure, request.portfolio.max_single_weight
+    )
     feasible = request.execution_frontier.feasible_cells(
         request.portfolio.max_exposure, request.portfolio.max_single_weight
     )
@@ -2919,12 +2943,24 @@ def _evaluate_forward_holdout(
         invested_sessions,
         request.compounding,
     )
+    matched_certificate = certify_exposure_matched_excess(
+        base_evidence.base_log_growth,
+        matched_benchmark,
+        horizon_sessions,
+        invested_sessions,
+        request.compounding,
+    )
     if base_evidence.filled_orders <= 0 or base_evidence.planned_cycles <= 0:
         reason = "holdout-no-economic-edge"
     elif not certificate.passed:
         reason = (
             "holdout-compound-certification-failed:"
             + ";".join(certificate.reasons)
+        )
+    elif not matched_certificate.passed:
+        reason = (
+            "holdout-relative-certification-failed:"
+            + ";".join(matched_certificate.reasons)
         )
     else:
         reason = ""
@@ -2935,6 +2971,7 @@ def _evaluate_forward_holdout(
         "block_count": growth_count,
         "order_count": base_evidence.filled_orders,
         "certificate": certificate.to_json(),
+        "matched_certificate": matched_certificate.to_json(),
         "matched_benchmark_log_growth": matched_benchmark,
         "cohorts": {
             "scored_sessions": growth_count,

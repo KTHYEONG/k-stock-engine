@@ -57,6 +57,51 @@ _SCORE_CANDIDATES = ("predicted_net_alpha", "pred_score")
 
 
 @dataclass(frozen=True, slots=True)
+class ReplayResourcePlan:
+    """Bounded resource plan for streaming execution replay.
+
+    ``max_workers`` is in [1, requested_workers] when projected peak fits
+    the budget; 0 means resource-budget-unavailable and no replay starts.
+    ``max_prepared_segments`` is at most 1.  ``projected_peak_bytes`` is
+    the estimated peak RSS for the planned worker count.
+    """
+
+    max_workers: int
+    max_prepared_segments: int
+    projected_peak_bytes: int
+
+
+def plan_execution_replay_resources(
+    available_bytes: int,
+    prepared_segment_bytes: int,
+    requested_workers: int,
+) -> ReplayResourcePlan:
+    """Select a safe worker count from measured segment bytes and headroom.
+
+    If a safe worker cannot be scheduled (available < one segment + fixed
+    reserve), returns a plan with max_workers=0 so the caller publishes
+    resource-budget-unavailable before any replay starts.
+    """
+    fixed_reserve = 50 * 1024 * 1024  # 50 MiB for Python runtime overhead
+    if available_bytes <= 0 or prepared_segment_bytes <= 0:
+        return ReplayResourcePlan(
+            max_workers=0, max_prepared_segments=0, projected_peak_bytes=0
+        )
+    per_worker_budget = prepared_segment_bytes + fixed_reserve
+    if available_bytes < per_worker_budget:
+        return ReplayResourcePlan(
+            max_workers=0, max_prepared_segments=0, projected_peak_bytes=0
+        )
+    max_safe = max(1, available_bytes // per_worker_budget)
+    workers = min(max(1, requested_workers), max_safe)
+    return ReplayResourcePlan(
+        max_workers=workers,
+        max_prepared_segments=1,
+        projected_peak_bytes=workers * prepared_segment_bytes,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class ProfileReplayEvidence:
     """Named immutable replay evidence: candidate owns base/stress; dense_shadow is optional.
 
@@ -239,6 +284,19 @@ class ExecutionReplayEvidence:
             raise ValueError("base_exposure must be a finite non-negative value")
         if not np.isfinite(self.stress_exposure) or self.stress_exposure < 0.0:
             raise ValueError("stress_exposure must be a finite non-negative value")
+        n = len(self.base_log_growth)
+        if self.base_interval_exposure:
+            if len(self.base_interval_exposure) != n:
+                raise ValueError("base_interval_exposure must be parallel to base_log_growth")
+            for exp in self.base_interval_exposure:
+                if not np.isfinite(exp) or not 0.0 <= exp <= 1.0:
+                    raise ValueError("base_interval_exposure values must be finite in [0,1]")
+        if self.stress_interval_exposure:
+            if len(self.stress_interval_exposure) != n:
+                raise ValueError("stress_interval_exposure must be parallel to stress_log_growth")
+            for exp in self.stress_interval_exposure:
+                if not np.isfinite(exp) or not 0.0 <= exp <= 1.0:
+                    raise ValueError("stress_interval_exposure values must be finite in [0,1]")
 
     def diagnostics(self) -> dict[str, object]:
         """Bounded execution evidence projection; never raw score/price vectors."""
@@ -277,6 +335,29 @@ def replay_execution_equivalent(
     declared decision fail closed with ``ValueError``.
     """
     return replay_execution_equivalent_batch((request,))[0]
+
+
+def stream_execution_replay_batch(
+    requests: Sequence[ExecutionEquivalentReplayRequest],
+    resource_plan: ReplayResourcePlan,
+) -> Iterator[ExecutionReplayEvidence]:
+    """Streaming replay: at most one prepared segment and one mutable result per worker.
+
+    Prepares one segment, executes one candidate, aggregates compact evidence,
+    then releases the ledger and segment data before the next candidate/segment.
+    Raw ledgers, segment score frames, and per-candidate market copies are
+    released before the next segment/candidate.  Returns an iterator so the
+    caller consumes and releases results incrementally.
+    """
+    if not requests:
+        return
+    if resource_plan.max_workers == 0:
+        return
+    batch = prepare_execution_replay_batch(requests[0])
+    for request in requests:
+        evidence = _execute_batch_request(request, batch)
+        yield evidence
+    del batch
 
 
 def _validate_market(market: pl.DataFrame) -> None:
