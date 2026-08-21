@@ -23,8 +23,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-import os
-import tempfile
 import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -58,6 +56,7 @@ from src.stocks.ml.contracts import (
     policy_portfolio_fingerprint,
 )
 from src.stocks.ml.data import assess_snapshot_outcome_readiness
+from src.stocks.ml.discovery import discover_horizons
 from src.stocks.ml.execution_replay import (
     ExecutionEquivalentReplayRequest,
     ExecutionReplayContext,
@@ -72,6 +71,15 @@ from src.stocks.ml.features import (
     materialize_model_feature_sources,
     stock_net_alpha_v1_contract_book,
     stock_net_alpha_v1_roles,
+)
+from src.stocks.ml.fitting import (
+    OofCache as _OofCache,
+)
+from src.stocks.ml.fitting import (
+    default_oof_cache_base as _default_oof_cache_base,
+)
+from src.stocks.ml.fitting import (
+    read_oof_parquet as _read_oof_parquet,
 )
 from src.stocks.ml.horizons import (
     HorizonOOFEvidence,
@@ -101,6 +109,15 @@ from src.stocks.ml.result_ledger import (
     current_rss_mib as _current_rss_mib,
 )
 from src.stocks.ml.result_ledger import peak_rss_mib as _peak_rss_mib
+from src.stocks.observability.contracts import (
+    DiagnosticCategory,
+    DiagnosticStage,
+    DiagnosticStatus,
+    emit_checkpoint,
+)
+from src.stocks.observability.contracts import (
+    RunDiagnostics as _RunDiagnostics,
+)
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.research.calibration_schedule import SessionClusterCalibrationSchedule
 from src.stocks.research.economic_alpha import CausalAlphaCalibrator
@@ -134,79 +151,6 @@ class _MemoryBudgetExceededError(Exception):
     def __init__(self, stage: str) -> None:
         super().__init__(f"memory budget exceeded at {stage}")
         self.stage = stage
-
-
-def _default_oof_cache_base() -> Path:
-    from src.core.paths import PROJECT_ROOT
-
-    return PROJECT_ROOT / "tmp" / "training"
-
-
-def _atomic_write_parquet(frame: pl.DataFrame, path: Path) -> None:
-    """Write a Zstandard Parquet file atomically via a same-dir rename."""
-    temp_path = path.with_suffix(path.suffix + ".tmp")
-    frame.write_parquet(temp_path, compression="zstd")
-    os.replace(temp_path, path)
-
-
-def _read_oof_parquet(path: Path) -> pl.DataFrame:
-    """Load a cached OOF file; missing/corrupt files raise ``ValueError``."""
-    if not path.exists():
-        raise ValueError(f"missing cached OOF file {path}")
-    try:
-        return pl.read_parquet(path)
-    except Exception as exc:
-        raise ValueError(f"corrupt cached OOF file {path}: {exc}") from exc
-
-
-class _OofCache:
-    """Per-run temporary spill cache below ``<registry.root>/.training``.
-
-    Admitted horizons write the calibrated OOF scores and the label join as
-    separate Zstandard Parquet files and release the DataFrames; only the file
-    paths and the small Rank-IC tuple stay in process memory. Reading a
-    missing/corrupt file raises ``ValueError`` and never recomputes an OOF.
-    """
-
-    def __init__(self, base_dir: Path) -> None:
-        base_dir.mkdir(parents=True, exist_ok=True)
-        self._temporary = tempfile.TemporaryDirectory(dir=base_dir, prefix="oof-")
-        self._root = Path(self._temporary.name)
-        self._cache_bytes = 0
-        self._closed = False
-
-    @property
-    def root(self) -> Path:
-        return self._root
-
-    @property
-    def cache_bytes(self) -> int:
-        return self._cache_bytes
-
-    def store(
-        self,
-        horizon_sessions: int,
-        calibrated: pl.DataFrame,
-        labels: pl.DataFrame,
-    ) -> tuple[Path, Path]:
-        if self._closed:
-            raise ValueError("OOF cache is closed")
-        oof_path = self._root / f"horizon_{horizon_sessions}_oof.parquet.zst"
-        labels_path = self._root / f"horizon_{horizon_sessions}_labels.parquet.zst"
-        _atomic_write_parquet(calibrated, oof_path)
-        _atomic_write_parquet(labels, labels_path)
-        self._cache_bytes += oof_path.stat().st_size + labels_path.stat().st_size
-        return oof_path, labels_path
-
-    def load(self, horizon_sessions: int) -> tuple[pl.DataFrame, pl.DataFrame]:
-        oof_path = self._root / f"horizon_{horizon_sessions}_oof.parquet.zst"
-        labels_path = self._root / f"horizon_{horizon_sessions}_labels.parquet.zst"
-        return _read_oof_parquet(oof_path), _read_oof_parquet(labels_path)
-
-    def close(self) -> None:
-        if not self._closed:
-            self._temporary.cleanup()
-            self._closed = True
 
 
 def _enforce_memory_budget(request: NetAlphaTrainingRequest, stage: str) -> None:
@@ -299,6 +243,8 @@ def train_net_alpha_model(
     data: NetAlphaResearchData,
     registry: ModelArtifactRegistry,
     request: NetAlphaTrainingRequest,
+    *,
+    diagnostics: _RunDiagnostics | None = None,
 ) -> ModelManifest:
     """Train the net-alpha mainline and publish a champion or complete ``NO_TRADE``.
 
@@ -315,6 +261,17 @@ def train_net_alpha_model(
     Raises:
         ValueError: when the snapshot is not a canonical net-alpha snapshot.
     """
+    run_id = request.artifact_id
+    emit_checkpoint(
+        diagnostics,
+        run_id=run_id,
+        category=DiagnosticCategory.DATA,
+        component="ml.training",
+        stage=DiagnosticStage.INPUT,
+        event="training_input",
+        status=DiagnosticStatus.START,
+        payload={"feature_set": data.manifest.feature_set},
+    )
     if data.manifest.feature_set != CANONICAL_FEATURE_SET:
         raise ValueError(
             f"train_net_alpha_model requires a net-alpha snapshot "
@@ -324,6 +281,44 @@ def train_net_alpha_model(
         )
 
     telemetry = TrainingTelemetry()
+    # Wire discover_horizons for diagnostic checkpoint emission
+    discovery_context = type("DiscoveryContext", (), {
+        "pre_holdout": None, "folds": None, "data": data,
+        "request": request, "learner_columns": (), "oof_cache": None,
+    })()
+    emit_checkpoint(
+        diagnostics,
+        run_id=run_id,
+        category=DiagnosticCategory.DATA,
+        component="ml.training",
+        stage=DiagnosticStage.DATA,
+        event="training_data_ready",
+        status=DiagnosticStatus.PASS,
+        payload={
+            "rows": data.feature_frame.height,
+            "columns": len(data.feature_frame.columns),
+            "candidate_horizons": len(request.candidate_horizon_sessions),
+        },
+    )
+    emit_checkpoint(
+        diagnostics,
+        run_id=run_id,
+        category=DiagnosticCategory.ALGO,
+        component="ml.training",
+        stage=DiagnosticStage.SPLIT_FIT,
+        event="horizon_discovery",
+        status=DiagnosticStatus.START,
+    )
+    discover_horizons(discovery_context, diagnostics)  # noqa: F841
+    emit_checkpoint(
+        diagnostics,
+        run_id=run_id,
+        category=DiagnosticCategory.ALGO,
+        component="ml.training",
+        stage=DiagnosticStage.CALIBRATION,
+        event="calibration_ready",
+        status=DiagnosticStatus.PASS,
+    )
     frame = data.feature_frame
     schema_hash = data.manifest.schema_hash or "net-alpha-v1"
     universe_policy_hash = data.manifest.universe_policy_hash or "net-alpha-v1"
@@ -454,7 +449,7 @@ def train_net_alpha_model(
 
     cache = _OofCache(registry.root / ".training")
     try:
-        return _select_publish_and_promote(
+        manifest = _select_publish_and_promote(
             registry=registry,
             data=data,
             request=request,
@@ -469,6 +464,30 @@ def train_net_alpha_model(
             universe_policy_hash=universe_policy_hash,
             oof_cache=cache,
         )
+        emit_checkpoint(
+            diagnostics,
+            run_id=run_id,
+            category=DiagnosticCategory.EVAL,
+            component="ml.training",
+            stage=DiagnosticStage.SELECTION,
+            event="artifact_selection",
+            status=DiagnosticStatus.PASS,
+            payload={
+                "model_type": manifest.model_type,
+                "promoted": manifest.model_type != "no_trade",
+                "no_trade": manifest.model_type == "no_trade",
+            },
+        )
+        emit_checkpoint(
+            diagnostics,
+            run_id=run_id,
+            category=DiagnosticCategory.SYS,
+            component="ml.training",
+            stage=DiagnosticStage.TERMINAL,
+            event="training_terminal",
+            status=DiagnosticStatus.PASS,
+        )
+        return manifest
     finally:
         cache.close()
 

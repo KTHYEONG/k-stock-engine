@@ -19,11 +19,15 @@ from src.core.paths import (
     STOCK_FEATURE_PANEL_ROOT,
     STOCK_LABEL_ROOT,
 )
+from src.stocks.config.research import resolve_simulation_request
+from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.data.costs import load_cost_evidence
 from src.stocks.data.repositories import (
     ResearchDataRepository,
     resolve_snapshot_for_mode,
 )
+from src.stocks.observability.contracts import RunIdentity
+from src.stocks.observability.recorder import open_run_diagnostics
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.settings import DEFAULT_STOCK_ALPHA, REFERENCE_DATETIME
 from src.stocks.workflows.contracts import SimulationRequest
@@ -75,7 +79,7 @@ def main(args: list[str] | None = None) -> int:
         label_root=parsed.label_root,
     )
     feature_set = parsed.feature_set or "stock_net_alpha_v1"
-    composed = repository.compose_training_snapshot(
+    composed_snapshot = repository.compose_training_snapshot(
         snapshot,
         feature_set=feature_set,
         decision_time=decision_time,
@@ -88,6 +92,9 @@ def main(args: list[str] | None = None) -> int:
             Path(snapshot.costs.path), snapshot.execution_range
         )
     policy_profile = artifact_policy_profile(registry, parsed.artifact_id)
+    resolve_simulation_request(policy_profile or {}, overrides={})
+    identity = RunIdentity(run_id=f"backtest-{parsed.artifact_id}", project="stocks")
+    diagnostics = open_run_diagnostics(identity, {"diagnostics_enabled": True})
     if policy_profile is not None:
         request = SimulationRequest(
             artifact_id=parsed.artifact_id,
@@ -107,7 +114,18 @@ def main(args: list[str] | None = None) -> int:
             max_single_weight=settings.max_single_weight,
             max_exposure=settings.max_exposure,
         )
-    result = simulate_portfolio(composed, registry, request, cost_evidence=cost_evidence)
+    try:
+        result = simulate_portfolio(
+            cast(DatasetSnapshot, composed_snapshot),
+            registry,
+            request,
+            cost_evidence,
+            diagnostics=diagnostics,
+        )
+    except Exception:
+        diagnostics.close("FAIL")
+        raise
+    diagnostics.close("PASS")
     logger.info(
         "final_value=%.2f total_return=%.4f", result.final_value, result.total_return
     )

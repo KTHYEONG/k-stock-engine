@@ -36,6 +36,7 @@ from src.stocks.data.costs import CostEvidence
 from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
 from src.stocks.ml.contracts import policy_portfolio_fingerprint
 from src.stocks.ml.features import feature_transform_schema_from_manifest
+from src.stocks.observability.contracts import RunDiagnostics
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.research.models import ModelManifest
 from src.stocks.trading.portfolio_constructor import (
@@ -52,6 +53,7 @@ def simulate_portfolio(
     registry: ModelArtifactRegistry,
     request: SimulationRequest,
     cost_evidence: CostEvidence | None = None,
+    diagnostics: RunDiagnostics | None = None,
 ) -> BacktestResult:
     """Replay the trading cycle over the snapshot and return the ledger result.
 
@@ -117,7 +119,7 @@ def simulate_portfolio(
             ),
         )
     )
-    backtester = StockBacktester(
+    backtester = StockBacktester(diagnostics=diagnostics,
         registry=registry,
         instruments=instruments,
         manifest=manifest,

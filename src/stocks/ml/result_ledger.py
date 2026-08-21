@@ -39,6 +39,9 @@ from src.stocks.research.models import ModelManifest
 
 logger = logging.getLogger("stocks.ml.result_ledger")
 
+# DiagnosticReport is imported lazily to avoid circular imports
+_DiagnosticReport = None
+
 SCHEMA_VERSION = 1
 RETAINED_RECORDS = 128
 MAX_SCHEMA_BYTES = 16 * 1024
@@ -1116,6 +1119,7 @@ class ResultLedgerObserver(Protocol):
         manifest: ModelManifest,
         registry: ModelArtifactRegistry,
         telemetry: Mapping[str, object] | None = None,
+        diagnostic_report: object | None = None,
     ) -> None: ...
 
     def record_failed(
@@ -1136,8 +1140,9 @@ class NullResultLedger:
         manifest: ModelManifest,
         registry: ModelArtifactRegistry,
         telemetry: Mapping[str, object] | None = None,
+        diagnostic_report: object | None = None,
     ) -> None:
-        del context, manifest, registry, telemetry
+        del context, manifest, registry, telemetry, diagnostic_report
 
     def record_failed(
         self,
@@ -1170,6 +1175,7 @@ class MlResultLedger:
         manifest: ModelManifest,
         registry: ModelArtifactRegistry,
         telemetry: Mapping[str, object] | None = None,
+        diagnostic_report: object | None = None,
     ) -> None:
         """Project and atomically record one completed terminal run."""
         metrics = _read_artifact_json(registry, context.artifact_id, METRICS_FILENAME)
@@ -1181,6 +1187,11 @@ class MlResultLedger:
         record = _project_completed(
             context, manifest, metrics, observability, self._clock
         )
+        if diagnostic_report is not None:
+            if hasattr(diagnostic_report, "to_json"):
+                record["diagnostic_report"] = diagnostic_report.to_json()
+            else:
+                record["diagnostic_report"] = diagnostic_report
         self._write_record(context.artifact_id, record)
 
     def record_failed(

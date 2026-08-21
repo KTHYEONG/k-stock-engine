@@ -22,7 +22,7 @@ from src.core.paths import (
     STOCK_LABEL_ROOT,
 )
 from src.stocks.data.contracts import CoverageRange, ResearchWindows
-from src.stocks.data.research_v2 import (
+from src.stocks.data.materialization import (
     NetAlphaMaterializationRequest,
     materialize_net_alpha_snapshot,
 )
