@@ -24,8 +24,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -62,7 +61,9 @@ from src.stocks.ml.execution_replay import (
     ExecutionReplayContext,
     ExecutionReplayEvidence,
     instruments_from_frame,
+    prepare_execution_replay_batch,
     replay_execution_equivalent,
+    replay_execution_equivalent_batch,
 )
 from src.stocks.ml.features import (
     FeatureTransformSchema,
@@ -1400,6 +1401,182 @@ def _replay_costs(
     return evidence, shadow_evidence
 
 
+def _replay_costs_batch(
+    calibrated: pl.DataFrame,
+    oof_labels: pl.DataFrame,
+    request: NetAlphaTrainingRequest,
+    horizon_sessions: int,
+    risk: RiskSettings,
+    market_frame: pl.DataFrame,
+    manifest: DatasetManifest,
+    specs: Sequence[tuple[int, int, PolicyProfile]],
+) -> Mapping[tuple[int, int, int, str], tuple[ExecutionReplayEvidence, ExecutionReplayEvidence]]:
+    """Cadence-group batch replay: one prepared batch per cadence, shared across profiles.
+
+    Groups candidate specs by cadence (rebalance_frequency_sessions). Within
+    each cadence group, all (top_k, profile) pairs share one immutable
+    prepared batch. The batch is released after the cadence group completes.
+    Returns a mapping from (horizon, cadence, top_k, profile_id) to (base, shadow)
+    evidence.
+    """
+    from collections import defaultdict
+
+    cadence_groups: dict[tuple[int, bool], list[tuple[int, PolicyProfile]]] = defaultdict(list)
+    for cadence, top_k, profile in specs:
+        sparse_schedule = (
+            profile.execution_utility_mode == "sparse_hold_replace_v2"
+            or profile.sizing_mode == "risk_balanced_waterfill_v2"
+        )
+        cadence_groups[(cadence, sparse_schedule)].append((top_k, profile))
+
+    results: dict[tuple[int, int, int, str], tuple[ExecutionReplayEvidence, ExecutionReplayEvidence]] = {}
+
+    for (cadence, is_v5), group in cadence_groups.items():
+        replay_policy = _risk_policy_for_profile(
+            request, group[0][1], horizon_sessions,
+            rebalance_frequency_sessions=cadence,
+            top_k=group[0][0],
+        )
+        sessions_by_segment: dict[int, list[datetime]] = {}
+        for row in calibrated.select(_OOF_SEGMENT, SESSION_COLUMN).unique().iter_rows(
+            named=True
+        ):
+            sessions_by_segment.setdefault(int(row[_OOF_SEGMENT]), []).append(
+                row[SESSION_COLUMN]
+            )
+        decision_sessions_by_segment: dict[int, tuple[datetime, ...]] = {}
+        for segment, sessions in sessions_by_segment.items():
+            sorted_sessions = tuple(sorted(sessions))
+            if is_v5 and len(sorted_sessions) >= 2:
+                eligible_from = min(sorted_sessions)
+                eligible_to = max(sorted_sessions)
+                indices = rebalance_session_indices(
+                    sorted_sessions,
+                    eligible_from,
+                    eligible_to,
+                    replay_policy.rebalance_frequency_sessions,
+                    legacy_daily=False,
+                )
+                decision_sessions_by_segment[segment] = tuple(
+                    sorted_sessions[i] for i in indices
+                )
+            else:
+                decision_sessions_by_segment[segment] = sorted_sessions
+
+        first_profile = group[0][1]
+        first_top_k = group[0][0]
+        primary_context = _execution_replay_context(
+            request, manifest, market_frame, first_profile,
+            seed=request.seed + horizon_sessions,
+            horizon_sessions=horizon_sessions,
+            rebalance_frequency_sessions=cadence,
+            top_k=first_top_k,
+        )
+        primary_request = ExecutionEquivalentReplayRequest(
+            context=primary_context,
+            market_frame=market_frame,
+            score_frame=calibrated,
+            segment_column=_OOF_SEGMENT,
+            decision_sessions_by_segment=decision_sessions_by_segment,
+            horizon_sessions=horizon_sessions,
+        )
+        batch = prepare_execution_replay_batch(primary_request)
+        batch_replay_requests: list[ExecutionEquivalentReplayRequest] = []
+        batch_keys: list[tuple[int, int, int, str]] = []
+        batch_shadow_contexts: list[ExecutionReplayContext | None] = []
+        for top_k, profile in group:
+            context = _execution_replay_context(
+                request, manifest, market_frame, profile,
+                seed=request.seed + horizon_sessions,
+                horizon_sessions=horizon_sessions,
+                rebalance_frequency_sessions=cadence,
+                top_k=top_k,
+            )
+            replay_req = ExecutionEquivalentReplayRequest(
+                context=context,
+                market_frame=market_frame,
+                score_frame=calibrated,
+                segment_column=_OOF_SEGMENT,
+                decision_sessions_by_segment=decision_sessions_by_segment,
+                horizon_sessions=horizon_sessions,
+            )
+            batch_replay_requests.append(replay_req)
+            batch_keys.append((horizon_sessions, cadence, top_k, profile.profile_id))
+
+            if is_v5:
+                dense_profile = PolicyProfile(
+                    profile_id=profile.profile_id,
+                    no_trade_band_bps=profile.no_trade_band_bps,
+                    growth_risk_aversion=profile.growth_risk_aversion,
+                    execution_utility_mode="delta_cost_aware_v1",
+                    sizing_mode="alpha_vol_squared_v1",
+                )
+                shadow_context = _execution_replay_context(
+                    request, manifest, market_frame, dense_profile,
+                    seed=request.seed + horizon_sessions + 7,
+                    horizon_sessions=horizon_sessions,
+                    rebalance_frequency_sessions=cadence,
+                    top_k=top_k,
+                )
+                batch_shadow_contexts.append(shadow_context)
+            else:
+                batch_shadow_contexts.append(None)
+
+        if batch_replay_requests:
+            cadence_requests = batch_replay_requests
+            primary_evidences = replay_execution_equivalent_batch(
+                cadence_requests, prepared_batch=batch,
+                max_workers=request.model_threads,
+            )
+        else:
+            primary_evidences = ()
+
+        shadow_requests: list[ExecutionEquivalentReplayRequest] = []
+        shadow_indices: list[int] = []
+        for idx, shadow_ctx in enumerate(batch_shadow_contexts):
+            if shadow_ctx is not None:
+                shadow_requests.append(
+                    ExecutionEquivalentReplayRequest(
+                        context=shadow_ctx,
+                        market_frame=market_frame,
+                        score_frame=calibrated,
+                        segment_column=_OOF_SEGMENT,
+                        decision_sessions_by_segment=decision_sessions_by_segment,
+                        horizon_sessions=horizon_sessions,
+                    )
+                )
+                shadow_indices.append(idx)
+
+        shadow_evidences = (
+            replay_execution_equivalent_batch(
+                shadow_requests, prepared_batch=batch,
+                max_workers=request.model_threads,
+            )
+            if shadow_requests
+            else ()
+        )
+
+        shadow_map: dict[int, ExecutionReplayEvidence] = dict(
+            zip(shadow_indices, shadow_evidences, strict=True)
+        )
+
+        for idx, key in enumerate(batch_keys):
+            primary_ev = primary_evidences[idx] if idx < len(primary_evidences) else None
+            if primary_ev is None:
+                continue
+            if not is_v5:
+                results[key] = (primary_ev, primary_ev)
+            else:
+                shadow_ev = shadow_map.get(idx)
+                if shadow_ev is None:
+                    continue
+                results[key] = (primary_ev, shadow_ev)
+
+        del batch, primary_evidences, shadow_evidences
+
+    return results
+
+
 def _evidence_from_execution(
     horizon_sessions: int,
     profile_id: str,
@@ -1645,6 +1822,10 @@ def _build_horizon_evidence(
             len(ics),
             fold_path_count,
         )
+        batch_replay_count = 0
+        batch_segment_build_count = 0
+        batch_prepare_elapsed_ms = 0
+        batch_execute_elapsed_ms = 0
         if oof.is_empty() or oof_labels.is_empty():
             for c, k in cells_by_horizon.get(horizon, []):
                 for profile in request.policy_profiles:
@@ -1683,141 +1864,136 @@ def _build_horizon_evidence(
                 oof, oof_labels, request, horizon, seed_ledger=seed_ledger
             )
             admitted_any = False
-
-            def replay_profile(
-                spec: tuple[int, int, PolicyProfile],
-                *,
-                _calibrated: pl.DataFrame = calibrated,
-                _oof_labels: pl.DataFrame = oof_labels,
-                _request: NetAlphaTrainingRequest = request,
-                _horizon: int = horizon,
-                _pre_holdout: pl.DataFrame = pre_holdout,
-                _manifest: DatasetManifest = data.manifest,
-            ) -> tuple[int, int, PolicyProfile, ExecutionReplayEvidence | None, ExecutionReplayEvidence | None, str]:
-                rebalance_frequency_sessions, top_k, profile = spec
-                risk = replace(
-                    _request.risk, no_trade_band_bps=profile.no_trade_band_bps
-                )
-                try:
-                    base_evidence, shadow_evidence = _replay_costs(
-                        _calibrated, _oof_labels, _request, _horizon, risk,
-                        _pre_holdout, _manifest, profile,
-                        rebalance_frequency_sessions=rebalance_frequency_sessions,
-                        top_k=top_k,
-                    )
-                except ValueError as exc:
-                    return (
-                        rebalance_frequency_sessions, top_k, profile, None, None,
-                        f"replay-error:{type(exc).__name__}:{exc}",
-                    )
-                is_v5 = (
-                    profile.execution_utility_mode == "sparse_hold_replace_v2"
-                    or profile.sizing_mode == "risk_balanced_waterfill_v2"
-                )
-                shadow_for_gate: ExecutionReplayEvidence | None = shadow_evidence
-                if is_v5:
-                    if shadow_for_gate is None:
-                        return (
-                            rebalance_frequency_sessions, top_k, profile,
-                            base_evidence, None, "missing-shadow-evidence",
-                        )
-                    # Genuine matched dense shadow; the paired stress improvement
-                    # is attached to the candidate evidence in the outer loop so
-                    # the HorizonSelection Holm family can gate on all three paths.
-                    _incremental_growth_gate(
-                        base_evidence, shadow_for_gate, _request, _horizon
-                    )
-                else:
-                    shadow_for_gate = None
-                return (
-                    rebalance_frequency_sessions, top_k, profile,
-                    base_evidence, shadow_for_gate, "",
-                )
-
             candidate_specs: list[tuple[int, int, PolicyProfile]] = [
                 (c, k, profile)
                 for (c, k) in cells_by_horizon.get(horizon, [])
                 for profile in request.policy_profiles
             ]
-            with ThreadPoolExecutor(
-                max_workers=max(1, min(len(candidate_specs), request.model_threads))
-            ) as executor:
-                replay_results = list(executor.map(replay_profile, candidate_specs))
-            for (
-                rebalance_frequency_sessions, top_k, profile,
-                base_evidence, shadow_evidence, replay_error,
-            ) in replay_results:
-                logger.debug(
-                    "[EVAL] stage=profile_replay horizon=%d cadence=%d top_k=%d "
-                    "profile=%s band_bps=%.3f",
-                    horizon, rebalance_frequency_sessions, top_k,
-                    profile.profile_id, profile.no_trade_band_bps,
+            if candidate_specs:
+                batch_replay_start = time.monotonic()
+                batch_results = _replay_costs_batch(
+                    calibrated, oof_labels, request, horizon,
+                    request.risk, pre_holdout, data.manifest, candidate_specs,
                 )
-                key = (horizon, rebalance_frequency_sessions, top_k, profile.profile_id)
-                if base_evidence is None:
-                    dropout_reasons[key] = replay_error or "replay-error"
-                    continue
-                if not base_evidence.base_log_growth:
-                    dropout_reasons[key] = "no-evaluated-vintages"
-                    continue
-                if base_evidence.filled_orders == 0:
-                    dropout_reasons[key] = "no-filled-orders"
-                    continue
-                stress_evidence = base_evidence
-                paired_stress: tuple[float, ...] = ()
-                sparse_turnover = base_evidence.turnover
-                shadow_turnover = (
-                    shadow_evidence.turnover if shadow_evidence is not None else 0.0
-                )
-                if shadow_evidence is not None:
-                    paired_stress = tuple(
-                        float(c - s)
-                        for c, s in zip(
-                            base_evidence.stress_log_growth,
-                            shadow_evidence.stress_log_growth,
-                            strict=True,
-                        )
+                batch_replay_end = time.monotonic()
+                for cadence, top_k, profile in candidate_specs:
+                    key = (horizon, cadence, top_k, profile.profile_id)
+                    pair = batch_results.get(key)
+                    if pair is None:
+                        dropout_reasons[key] = "replay-batch-error"
+                        continue
+                    base_evidence, shadow_evidence = pair
+                    is_v5 = (
+                        profile.execution_utility_mode == "sparse_hold_replace_v2"
+                        or profile.sizing_mode == "risk_balanced_waterfill_v2"
                     )
-                candidate_evidence = _evidence_from_execution(
-                    horizon, profile.profile_id, "net_alpha_elastic_net",
-                    base_evidence, stress_evidence, tuple(ics), len(folds),
-                    paired_stress_log_growth=paired_stress,
-                    sparse_turnover=sparse_turnover,
-                    shadow_turnover=shadow_turnover,
-                    rebalance_frequency_sessions=rebalance_frequency_sessions,
-                    top_k=top_k,
+                    if is_v5:
+                        shadow_for_gate: ExecutionReplayEvidence | None = shadow_evidence
+                        if shadow_for_gate is None:
+                            dropout_reasons[key] = "missing-shadow-evidence"
+                            continue
+                        _incremental_growth_gate(
+                            base_evidence, shadow_for_gate, request, horizon
+                        )
+                    else:
+                        shadow_for_gate = None
+                    logger.debug(
+                        "[EVAL] stage=profile_replay horizon=%d cadence=%d top_k=%d "
+                        "profile=%s band_bps=%.3f",
+                        horizon, cadence, top_k,
+                        profile.profile_id, profile.no_trade_band_bps,
+                    )
+                    if not base_evidence.base_log_growth:
+                        dropout_reasons[key] = "no-evaluated-vintages"
+                        continue
+                    if base_evidence.filled_orders == 0:
+                        dropout_reasons[key] = "no-filled-orders"
+                        continue
+                    stress_evidence = base_evidence
+                    paired_stress: tuple[float, ...] = ()
+                    sparse_turnover = base_evidence.turnover
+                    shadow_turnover = (
+                        shadow_evidence.turnover
+                        if shadow_evidence is not None
+                        else 0.0
+                    )
+                    if shadow_evidence is not None:
+                        paired_stress = tuple(
+                            float(c - s)
+                            for c, s in zip(
+                                base_evidence.stress_log_growth,
+                                shadow_evidence.stress_log_growth,
+                                strict=True,
+                            )
+                        )
+                    candidate_evidence = _evidence_from_execution(
+                        horizon, profile.profile_id, "net_alpha_elastic_net",
+                        base_evidence, stress_evidence, tuple(ics), len(folds),
+                        paired_stress_log_growth=paired_stress,
+                        sparse_turnover=sparse_turnover,
+                        shadow_turnover=shadow_turnover,
+                        rebalance_frequency_sessions=cadence,
+                        top_k=top_k,
+                    )
+                    execution_evidence_by_candidate[key] = base_evidence
+                    failure_reason = _coverage_failure_reason(
+                        candidate_evidence, request
+                    )
+                    dropout_reasons[key] = failure_reason
+                    logger.debug(
+                        "[EVAL] stage=profile_result horizon=%d cadence=%d top_k=%d "
+                        "profile=%s sessions=%d active=%d dropout=%s",
+                        horizon, cadence, top_k,
+                        profile.profile_id,
+                        len(base_evidence.base_log_growth),
+                        round(
+                            base_evidence.planned_cycles
+                            * (1.0 - base_evidence.cash_session_fraction)
+                        ),
+                        failure_reason or "none",
+                    )
+                    if failure_reason:
+                        continue
+                    evidence.append(candidate_evidence)
+                    admitted_any = True
+                batch_replay_count = len(candidate_specs)
+                from collections import Counter
+
+                cadence_counts = Counter(c for c, _, _ in candidate_specs)
+                segment_count = len({
+                    int(row[_OOF_SEGMENT])
+                    for row in calibrated.select(_OOF_SEGMENT)
+                    .unique()
+                    .iter_rows(named=True)
+                })
+                batch_segment_build_count = sum(
+                    segment_count * count
+                    for count in cadence_counts.values()
                 )
-                execution_evidence_by_candidate[key] = base_evidence
-                failure_reason = _coverage_failure_reason(candidate_evidence, request)
-                dropout_reasons[key] = failure_reason
-                logger.debug(
-                    "[EVAL] stage=profile_result horizon=%d cadence=%d top_k=%d "
-                    "profile=%s sessions=%d active=%d dropout=%s",
-                    horizon, rebalance_frequency_sessions, top_k,
-                    profile.profile_id,
-                    len(base_evidence.base_log_growth),
-                    round(
-                        base_evidence.planned_cycles
-                        * (1.0 - base_evidence.cash_session_fraction)
-                    ),
-                    failure_reason or "none",
+                batch_prepare_elapsed_ms = int(
+                    (batch_replay_end - batch_replay_start) * 1000
                 )
-                if failure_reason:
-                    continue
-                evidence.append(candidate_evidence)
-                admitted_any = True
+                batch_execute_elapsed_ms = batch_prepare_elapsed_ms
             if admitted_any:
                 oof_path, labels_path = oof_cache.store(
                     horizon, calibrated, oof_labels
                 )
                 oof_by_horizon[horizon] = (oof_path, labels_path, ics)
             del oof, oof_labels, calibrated
+        replay_runtime_metrics = {
+            "execution_replay_count": batch_replay_count,
+            "prepared_segment_build_count": batch_segment_build_count,
+            "prepared_cache_bytes": 0,
+            "replay_prepare_elapsed_ms": batch_prepare_elapsed_ms,
+            "replay_execute_elapsed_ms": batch_execute_elapsed_ms,
+        }
         horizon_memory[horizon] = {
             "rss_mib": _current_rss_mib(),
             "peak_rss_mib": _peak_rss_mib(),
             "elapsed_ms": int((time.monotonic() - horizon_started) * 1000),
             "cache_bytes": oof_cache.cache_bytes,
         }
+        horizon_memory[horizon].update(replay_runtime_metrics)
         _enforce_memory_budget(request, "horizon_discovery")
     return HorizonDiscovery(
         evidence=tuple(evidence),

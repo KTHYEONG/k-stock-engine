@@ -20,7 +20,6 @@ from src.core.paths import (
     STOCK_LABEL_ROOT,
 )
 from src.stocks.config.research import resolve_simulation_request
-from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.data.costs import load_cost_evidence
 from src.stocks.data.repositories import (
     ResearchDataRepository,
@@ -116,7 +115,7 @@ def main(args: list[str] | None = None) -> int:
         )
     try:
         result = simulate_portfolio(
-            cast(DatasetSnapshot, composed_snapshot),
+            composed_snapshot,
             registry,
             request,
             cost_evidence,
