@@ -414,3 +414,132 @@ def certify_compounded_holdout(
         base=base,
         stress=stress,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class CompoundingCertificate:
+    """Immutable compound-growth certificate with absolute and relative gates.
+
+    ``passed`` is True only when every absolute base/stress gate and the
+    exposure-matched lower excess CAGR > 0 both pass.  ``promoted`` requires
+    ``passed`` and a positive matched lower excess; an absolute pass with
+    non-positive matched lower excess yields
+    ``RESEARCH_ABSOLUTE_PASS_RELATIVE_UNPROVEN`` and ``promoted=False``.
+    """
+
+    passed: bool
+    reasons: tuple[str, ...]
+    promoted: bool
+    absolute_base: dict[str, object]
+    absolute_stress: dict[str, object]
+    matched_excess_lower_cagr: float
+
+    def to_json(self) -> dict[str, object]:
+        """Return a JSON-safe representation for persisted evaluation evidence."""
+        return {
+            "passed": bool(self.passed),
+            "reasons": list(self.reasons),
+            "promoted": bool(self.promoted),
+            "absolute_base": self.absolute_base,
+            "absolute_stress": self.absolute_stress,
+            "matched_excess_lower_cagr": float(self.matched_excess_lower_cagr),
+        }
+
+
+_RESEARCH_ABSOLUTE_PASS_RELATIVE_UNPROVEN = "RESEARCH_ABSOLUTE_PASS_RELATIVE_UNPROVEN"  # noqa: S105
+
+
+def certify_exposure_matched_excess(
+    strategy_log_growth: Sequence[float],
+    benchmark_log_growth: Sequence[float],
+    horizon_sessions: int,
+    active_cohort_count: int,
+    settings: CompoundingCertificationSettings,
+) -> CompoundingCertificate:
+    """Certify absolute and exposure-matched relative growth evidence.
+
+    The absolute base/stress gates are evaluated via
+    ``certify_compounded_holdout``.  The matched lower excess CAGR is the
+    bootstrap lower bound of the per-interval strategy-minus-benchmark log
+    growth, annualized over the observed sessions.  Promotion requires both
+    absolute gates and a positive matched lower excess CAGR.  An absolute
+    pass with non-positive matched lower excess returns
+    ``RESEARCH_ABSOLUTE_PASS_RELATIVE_UNPROVEN`` and no artifact promotion.
+    """
+    arr_strategy = np.asarray(list(strategy_log_growth), dtype=float)
+    arr_benchmark = np.asarray(list(benchmark_log_growth), dtype=float)
+    if arr_strategy.size == 0 or arr_benchmark.size == 0:
+        return CompoundingCertificate(
+            passed=False,
+            reasons=("empty-growth-series",),
+            promoted=False,
+            absolute_base={},
+            absolute_stress={},
+            matched_excess_lower_cagr=0.0,
+        )
+    n = min(arr_strategy.size, arr_benchmark.size)
+    arr_strategy = arr_strategy[:n]
+    arr_benchmark = arr_benchmark[:n]
+    finite_mask = np.isfinite(arr_strategy) & np.isfinite(arr_benchmark)
+    arr_strategy = arr_strategy[finite_mask]
+    arr_benchmark = arr_benchmark[finite_mask]
+    if arr_strategy.size == 0:
+        return CompoundingCertificate(
+            passed=False,
+            reasons=("no-finite-growth-values",),
+            promoted=False,
+            absolute_base={},
+            absolute_stress={},
+            matched_excess_lower_cagr=0.0,
+        )
+
+    absolute = certify_compounded_holdout(
+        tuple(np.expm1(arr_strategy.tolist())),
+        tuple(np.expm1(arr_strategy.tolist())),
+        horizon_sessions, int(arr_strategy.size),
+        active_cohort_count, settings,
+    )
+    stress_absolute = certify_compounded_holdout(
+        tuple(np.expm1(arr_strategy.tolist())),
+        tuple(np.expm1(arr_strategy.tolist())),
+        horizon_sessions, int(arr_strategy.size),
+        active_cohort_count, settings,
+    )
+
+    excess = arr_strategy - arr_benchmark
+    if excess.size < 2:
+        matched_lower_cagr = 0.0
+    else:
+        block = max(1, horizon_sessions)
+        n_blocks = math.ceil(excess.size / block)
+        if n_blocks < 2:
+            matched_lower_cagr = 0.0
+        else:
+            max_start = max(1, excess.size - block + 1)
+            rng = np.random.default_rng(settings.seed)
+            starts = rng.integers(0, max_start, size=(settings.bootstrap_resamples, n_blocks))
+            offsets = np.arange(block)
+            index = (
+                starts[:, :, None] + offsets[None, None, :]
+            ).reshape(settings.bootstrap_resamples, n_blocks * block)[:, :excess.size]
+            boot_means = excess[index].mean(axis=1)
+            lower_mean = float(np.quantile(boot_means, settings.bootstrap_alpha))
+            factor = settings.annualization_sessions * excess.size / excess.size
+            matched_lower_cagr = float(math.expm1(lower_mean * factor))
+
+    abs_passed = bool(absolute.passed) and bool(stress_absolute.passed)
+    abs_reasons = list(absolute.reasons) + list(stress_absolute.reasons)
+    matched_positive = matched_lower_cagr > 0.0
+    reasons: list[str] = list(dict.fromkeys(abs_reasons))
+    if not matched_positive:
+        reasons.append(_RESEARCH_ABSOLUTE_PASS_RELATIVE_UNPROVEN)
+    passed = abs_passed and matched_positive
+    promoted = passed
+    return CompoundingCertificate(
+        passed=passed,
+        reasons=tuple(reasons),
+        promoted=promoted,
+        absolute_base=absolute.base,
+        absolute_stress=stress_absolute.stress,
+        matched_excess_lower_cagr=round(matched_lower_cagr, 12),
+    )

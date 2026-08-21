@@ -189,6 +189,33 @@ class ExecutionFrontierSettings:
                 )
         return tuple(cells)
 
+    def require_feasible_horizons(
+        self, gross_cap: float, single_name_cap: float
+    ) -> tuple[tuple[int, int, int], ...]:
+        """Validate that every requested horizon has at least one feasible cell.
+
+        Raises ``ValueError`` naming the infeasible horizon and its cadence set
+        when any horizon owns zero feasible (H, C, K) cells.  Returns the
+        feasible cells when all horizons are satisfiable.
+        """
+        from math import ceil
+
+        min_k = ceil(gross_cap / single_name_cap) if single_name_cap > 0 else 1
+        for h in self.candidate_horizon_sessions:
+            has_feasible = any(
+                c <= h and k >= min_k
+                for c in self.candidate_rebalance_frequency_sessions
+                for k in self.candidate_top_k
+            )
+            if not has_feasible:
+                raise ValueError(
+                    f"horizon H={h} has no feasible (H,C,K) cell with "
+                    f"C in {tuple(self.candidate_rebalance_frequency_sessions)} "
+                    f"and K >= {min_k}; every horizon must own at least one "
+                    f"feasible cell before model fitting"
+                )
+        return self.feasible_cells(gross_cap, single_name_cap)
+
 
 DEFAULT_POLICY_PROFILES = (
     PolicyProfile(
