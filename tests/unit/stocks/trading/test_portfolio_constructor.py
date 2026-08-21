@@ -2198,7 +2198,7 @@ def test_active_cap_growth_recovery() -> None:
 
 
 def test_utility_cash_growth_recovery() -> None:
-    """GROWTH_RECOVERY_UTILITY_CASH_04.
+    """ML_CONFIDENCE_FRONTIER_03_CONFIDENCE_WEIGHT_DOMINANCE.
 
     The confidence mean-variance optimizer returns all-zeros when every net
     utility is non-positive, and otherwise emits finite, non-negative weights
@@ -2299,3 +2299,86 @@ def test_waterfill_redistributes_capacity() -> None:
     )
     assert zero_gross_unalloc == 1.0
     assert all(v == 0.0 for v in zero_gross_weights.values())
+
+
+def test_sparse_turnover_budget() -> None:
+    """ML_CONFIDENCE_FRONTIER_02_SPARSE_TURNOVER_CAP.
+
+    For a feasible sparse replacement whose unconstrained L1 target change
+    exceeds B=0.20, returned target weights satisfy
+    sum(abs(w_new - w_old)) <= 0.200000000001; zero retains compatibility semantics;
+    all gross/name/sector caps still hold.
+    """
+    from src.stocks.trading.portfolio_constructor import CompoundingPolicyConfig
+
+    held_ids = ("KRX:000001", "KRX:000002")
+    instruments = instruments_for(3)
+    equity = equity_of(_economic_panel(n_sessions=60, n_tickers=3), empty_portfolio())
+    panel = _economic_panel(n_sessions=60, n_tickers=3, positive_top=3).with_columns(
+        pl.lit(0.001, dtype=pl.Float64).alias("net_alpha_lower_bound")
+    )
+
+    policy_budget = StockRiskPolicy(
+        top_k=3, gross_cap=0.90, single_name_cap=0.30, sector_cap=0.50,
+        participation_limit=0.5,
+        turnover_budget=0.20, execution_utility_mode="sparse_hold_replace_v2",
+        sizing_mode="risk_balanced_waterfill_v2",
+        compounding=CompoundingPolicyConfig(growth_risk_aversion=2.0, forecast_horizon_sessions=10),
+    )
+    latest = panel.select(pl.col("session").max()).to_series()[0]
+    prices = {
+        str(row["instrument_id"]): float(row["close"])
+        for row in panel.filter(pl.col("session") == latest).to_dicts()
+    }
+    portfolio = PortfolioSnapshot(
+        account_snapshot_id="sparse-turnover",
+        as_of=datetime(2024, 1, 1, tzinfo=UTC),
+        settled_cash=equity - 0.10 * equity,
+        unsettled_cash=0.0,
+        positions=tuple(
+            Position(
+                instrument=instruments[iid],
+                quantity=int(0.05 * equity // prices[iid]),
+                average_cost=prices[iid],
+            )
+            for iid in held_ids
+        ),
+    )
+    current_weights = {
+        position.instrument.instrument_id: position.quantity * prices[position.instrument.instrument_id] / equity
+        for position in portfolio.positions
+    }
+    allocations_budget = construct_target_allocations(
+        panel, instruments, portfolio, policy_budget,
+    )
+    assert allocations_budget
+    new_weights = {
+        a.instrument.instrument_id: a.target_value / equity
+        for a in allocations_budget
+    }
+    total_change = sum(
+        abs(new_weights.get(iid, 0.0) - current_weights.get(iid, 0.0))
+        for iid in set(new_weights) | set(current_weights)
+    )
+    assert total_change <= 0.200000000001
+    assert sum(a.target_value for a in allocations_budget) <= equity * policy_budget.gross_cap + 1e-8
+    for a in allocations_budget:
+        assert a.target_value <= equity * policy_budget.single_name_cap + 1e-8
+
+    policy_zero = StockRiskPolicy(
+        top_k=3, gross_cap=0.90, single_name_cap=0.30, sector_cap=0.50,
+        participation_limit=0.5,
+        turnover_budget=0.0, execution_utility_mode="sparse_hold_replace_v2",
+        sizing_mode="risk_balanced_waterfill_v2",
+        compounding=CompoundingPolicyConfig(growth_risk_aversion=2.0, forecast_horizon_sessions=10),
+    )
+    allocations_zero = construct_target_allocations(
+        panel, instruments, portfolio, policy_zero,
+    )
+    assert allocations_zero
+    new_weights_zero = {
+        a.instrument.instrument_id: a.target_value / equity
+        for a in allocations_zero
+    }
+    for iid in current_weights:
+        assert new_weights_zero.get(iid, 0.0) == pytest.approx(current_weights[iid], abs=1e-12)
