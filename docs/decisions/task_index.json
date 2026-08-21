@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "net_alpha_economic_recovery",
+      "date": "2026-08-21",
+      "adr_id": "ADR_20260821_net_alpha_economic_recovery",
+      "domain": "stocks_ml",
+      "title": "Net-alpha economic truth recovery",
+      "why": "Absolute backtest evidence and production promotion were inconsistent because replay roles, exposure coverage, outcome provenance, and opportunity-cost controls were not fully enforced.",
+      "resolution": "Separated candidate and dense-shadow replay evidence, used invested-interval coverage, added prequential/bootstrap and exposure-matched benchmark gates, and enforced direct cost provenance with fail-closed NO_TRADE behavior.",
+      "impact": "ML promotion now requires reproducible economic evidence; unpinned outcome provenance produces an explicit NO_TRADE result and simulator remains all-cash."
+    },
+    {
       "task_id": "TASK_ML_REPLAY_RUNTIME_SCALING",
       "date": "2026-08-21",
       "adr_id": "ADR_20260821_ML_REPLAY_RUNTIME_SCALING",
