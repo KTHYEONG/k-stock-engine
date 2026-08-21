@@ -210,7 +210,7 @@ DEFAULT_POLICY_PROFILES = (
         no_trade_band_bps=0.0,
         growth_risk_aversion=2.0,
         execution_utility_mode="sparse_hold_replace_v2",
-        sizing_mode="risk_balanced_waterfill_v2",
+        sizing_mode="confidence_mean_variance_v1",
     ),
 )
 
