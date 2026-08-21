@@ -195,7 +195,7 @@ def test_paired_replay_matches_separate_ledgers_and_prepares_decision_once() -> 
 
 
 def test_prepared_market_replay_matches_reference_over_immutable_index() -> None:
-    """Prepared replay matches the reference execution on one immutable market."""
+    """TRAIN_COMPLETION_03_HELD_POSITION_VALUATION: prepared replay matches reference."""
     df, snapshot, registry, instruments, policy, scored, artifacts, request, portfolio = _paired_inputs()
 
     prepare_calls = {"count": 0}
@@ -630,3 +630,89 @@ def test_deferred_policy_expired_order_is_explicit_expired_event() -> None:
     result = backtester.run(df, artifacts, portfolio, request)
     assert result.data_quality["execution_policy_id"] == "first_tradable_open_v1"
     assert result.filled_orders > 0
+
+
+PARALLEL_COMPLETION_03_DECISION_TIME_CACHE = "PARALLEL_COMPLETION_03_DECISION_TIME_CACHE"
+
+
+def test_parallel_completion_03_decision_time_cache() -> None:
+    """PARALLEL_COMPLETION_03_DECISION_TIME_CACHE.
+
+    Prepared decision timestamps equal the existing per-session maximum
+    available_time for every decision and run_prepared ledger/trade/metric
+    parity remains exact.
+    """
+    df, snapshot, registry, instruments, policy, scored, artifacts, request, portfolio = _paired_inputs()
+
+    prepare_calls = {"count": 0}
+
+    def counting_provider(decision_time: datetime, execution_time: datetime):
+        prepare_calls["count"] += 1
+        return _prepare(decision_time, execution_time, scored)
+
+    reference = StockBacktester(
+        registry=registry,
+        instruments=instruments,
+        manifest=snapshot.manifest,
+        cost_schedule=default_base_schedule(),
+        stress_cost_schedule=default_stress_schedule(),
+        decision_provider=counting_provider,
+        scenario_planner=lambda prepared, port, creq: _scenario_planner(
+            prepared, port, creq, instruments, policy
+        ),
+    )
+    reference_result = reference.run(df, artifacts, portfolio, request)
+
+    market = PreparedReplayMarket.build(
+        df,
+        reference.adtv_window,
+        instruments=instruments,
+        artifacts=artifacts,
+        initial_portfolio=portfolio,
+    )
+
+    for index in request.decision_session_indices:
+        session = market.sessions[index]
+        prepared_time = reference._prepared_decision_time(market, index, session)
+        start, stop = market.session_ranges[index]
+        manual_times = [
+            v for v in market.available_time[start:stop] if v is not None
+        ]
+        assert manual_times
+        assert prepared_time == max(manual_times)
+
+    overlay_frame = df.sort(["session", "instrument_id"]).select(
+        "instrument_id", "session"
+    ).join(
+        scored.select("instrument_id", "session", "pred_score"),
+        on=["instrument_id", "session"],
+        how="left",
+    )
+    score_overlay = overlay_frame["pred_score"].to_numpy().astype(np.float64)
+
+    prepared = StockBacktester(
+        registry=registry,
+        instruments=instruments,
+        manifest=snapshot.manifest,
+        cost_schedule=default_base_schedule(),
+        stress_cost_schedule=default_stress_schedule(),
+        decision_provider=counting_provider,
+        scenario_planner=lambda prepared, port, creq: _scenario_planner(
+            prepared, port, creq, instruments, policy
+        ),
+    )
+    prepared_result = prepared.run_prepared(request, market, score_overlay)
+
+    assert reference_result.ledger == prepared_result.ledger
+    assert reference_result.trades == prepared_result.trades
+    assert reference_result.metrics == prepared_result.metrics
+    assert reference_result.stress_metrics == prepared_result.stress_metrics
+    assert reference_result.stress_final_value == prepared_result.stress_final_value
+    assert reference_result.attempted_orders == prepared_result.attempted_orders
+    assert reference_result.filled_orders == prepared_result.filled_orders
+    assert reference_result.planned_cycles == prepared_result.planned_cycles
+    assert reference_result.no_trade_reasons == prepared_result.no_trade_reasons
+    assert (
+        reference_result.unfilled_order_reason_counts
+        == prepared_result.unfilled_order_reason_counts
+    )
