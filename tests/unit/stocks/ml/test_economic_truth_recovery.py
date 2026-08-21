@@ -27,7 +27,10 @@ from src.stocks.ml.training import (
     _coverage_failure_reason,
     _evidence_from_execution,
 )
-from src.stocks.research.metrics import certify_compounded_holdout
+from src.stocks.research.metrics import (
+    certify_compounded_holdout,
+    certify_exposure_matched_excess,
+)
 
 
 def _simple_evidence(
@@ -348,3 +351,34 @@ def test_exposure_matched_mismatched_length_raises() -> None:
     market = pl.DataFrame(rows)
     with pytest.raises(ValueError, match="interval_exposure length"):
         exposure_matched_benchmark_log_growth(market, sessions, (0.5, 0.8))
+
+
+# ---------------------------------------------------------------------------
+# RELATIVE_CERTIFICATE_01
+# ---------------------------------------------------------------------------
+
+def test_relative_certificate_non_positive_matched_excess_fails() -> None:
+    """RELATIVE_CERTIFICATE_01.
+
+    Positive absolute base/stress lower CAGR combined with non-positive matched
+    lower excess sets passed=false, reason=RESEARCH_ABSOLUTE_PASS_RELATIVE_UNPROVEN
+    and promoted=false.
+    """
+
+    strategy_growth = [0.001] * 50
+    benchmark_growth = [0.002] * 50
+    settings = CompoundingCertificationSettings(
+        annualization_sessions=252,
+        min_observed_sessions=1,
+        bootstrap_alpha=0.05,
+        bootstrap_resamples=50,
+        seed=42,
+    )
+    cert = certify_exposure_matched_excess(
+        strategy_growth, benchmark_growth,
+        horizon_sessions=10, active_cohort_count=50,
+        settings=settings,
+    )
+    assert not cert.passed
+    assert any("RELATIVE_UNPROVEN" in r for r in cert.reasons)
+    assert not cert.promoted
