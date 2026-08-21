@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import ast
 import functools
+import importlib.util
 import json
 import os
 import re
@@ -641,6 +642,19 @@ def main() -> None:
     parser.add_argument(
         "--pytest-timeout", type=int, default=None, help="Seconds for pytest step"
     )
+    parser.add_argument(
+        "--test-timeout", type=int, default=120,
+        help="Per-test wall-clock limit in seconds via pytest-timeout (kills one hung "
+             "test instead of letting it hang the whole worker pool). 0 disables.",
+    )
+    parser.add_argument(
+        "--no-xdist", action="store_true",
+        help="Force serial execution (-p no:cacheprovider -n0), bypassing this "
+             "project's pytest-xdist addopts. Use when parallel workers hang "
+             "(e.g. fork-based multiprocessing code under xdist's own forked "
+             "workers can deadlock/BrokenPipe -- a known nested-fork hazard, not "
+             "specific to this project).",
+    )
     args = parser.parse_args()
 
     if args.spec_only or args.pre_impl:
@@ -820,6 +834,12 @@ def main() -> None:
         return
 
     deselect_args = [f"--deselect={node}" for node in args.deselect]
+    timeout_args = (
+        [f"--timeout={args.test_timeout}", "--timeout-method=thread"]
+        if args.test_timeout > 0 and importlib.util.find_spec("pytest_timeout")
+        else []
+    )
+    xdist_args = ["-p", "no:cacheprovider", "-n", "0"] if args.no_xdist else []
     core_cmd = [
         "uv",
         "run",
@@ -828,11 +848,38 @@ def main() -> None:
         "not slow",
         *test_files,
         *deselect_args,
+        *timeout_args,
+        *xdist_args,
         "-q",
         "--tb=line",
     ]
     pytest_timeout = args.pytest_timeout or max(300, min(1200, 240 * len(test_files)))
     pt_res = run_cmd(core_cmd, timeout=pytest_timeout)
+
+    # Nested-fork hazard fallback: code that uses fork-based multiprocessing
+    # (ProcessPoolExecutor, os.fork) can deadlock or BrokenPipe when run inside
+    # pytest-xdist's own forked worker processes -- a generic, project-agnostic
+    # hazard (forking a multi-threaded process is unsafe on POSIX), not specific
+    # to this codebase. A global subprocess timeout (returncode 124) with xdist
+    # still enabled is the fingerprint: per-test --timeout above would have
+    # killed an ordinary slow/hung *test* well before the outer timeout, so
+    # reaching the outer timeout under xdist means the xdist workers themselves
+    # stopped making progress. Retry once serially before failing.
+    if pt_res.returncode == 124 and not args.no_xdist:
+        print(
+            f"INFO | pytest timed out after {pytest_timeout}s under xdist "
+            "(possible fork-in-fork deadlock); retrying serially with -n0"
+        )
+        serial_cmd = [*core_cmd, "-p", "no:cacheprovider", "-n", "0"]
+        pt_res = run_cmd(serial_cmd, timeout=pytest_timeout)
+        if pt_res.returncode not in (0, 124):
+            print(
+                "INFO | Serial retry (-n0) completed where the parallel run "
+                "hung -- this project's test suite is not safe under "
+                "pytest-xdist (see rules/testing.md fork/multiprocessing "
+                "guidance); consider `pytest --no-xdist` for this scope or "
+                "isolating fork-based tests with @pytest.mark.slow."
+            )
 
     if pt_res.returncode == 0:
         print("PASS | All checks passed (Lint, Type, Tests verified)")
