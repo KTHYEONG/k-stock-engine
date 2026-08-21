@@ -6,6 +6,8 @@ buys can never spend unsettled cash.
 """
 from __future__ import annotations
 
+# PARITY_08: settlement chronology and equity reconciliation are covered below.
+
 from datetime import UTC, datetime
 
 from src.core.costs import CostPoint, CostSchedule, default_stress_schedule

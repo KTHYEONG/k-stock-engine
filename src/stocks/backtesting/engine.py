@@ -26,6 +26,7 @@ from src.core.costs import CostSchedule, FillCostBreakdown, LiquiditySlippageMod
 from src.core.datasets import DatasetCertification, DatasetManifest
 from src.core.instruments import Instrument
 from src.core.portfolio import PortfolioSnapshot, Position
+from src.stocks.backtesting.metrics import build_backtest_attribution
 from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.data.costs import (
     CostEvidence,
@@ -34,6 +35,13 @@ from src.stocks.data.costs import (
 )
 from src.stocks.data.lineage import ResearchDataBundle
 from src.stocks.domain.execution_policy import ExecutionOutcomePolicy
+from src.stocks.observability.contracts import (
+    DiagnosticCategory,
+    DiagnosticStage,
+    DiagnosticStatus,
+    RunDiagnostics,
+    emit_checkpoint,
+)
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.trading.portfolio_constructor import StockRiskPolicy
 from src.stocks.workflows.trading_cycle import (
@@ -499,6 +507,7 @@ class StockBacktester:
         scenario_planner: ReplayScenarioPlanner | None = None,
         base_liquidity_model: LiquiditySlippageModel | None = None,
         stress_liquidity_model: LiquiditySlippageModel | None = None,
+        diagnostics: RunDiagnostics | None = None,
     ):
         self.planner = planner
         self.registry = registry
@@ -517,6 +526,21 @@ class StockBacktester:
         self._score_overlay: np.ndarray | None = None
         self._last_cycles: dict[int, TradingCycleResult] = {}
         self.prepared_decision_count = 0
+        self.diagnostics = diagnostics
+
+    def _emit(self, stage: DiagnosticStage, event: str, payload: dict[str, object]) -> None:
+        identity = getattr(self.diagnostics, "_identity", None)
+        run_id = getattr(identity, "run_id", None) or self.manifest.content_hash or "backtest"
+        emit_checkpoint(
+            self.diagnostics,
+            run_id=run_id,
+            category=DiagnosticCategory.EVAL,
+            component="backtesting.engine",
+            stage=stage,
+            event=event,
+            status=DiagnosticStatus.PASS,
+            payload=payload,
+        )
 
     def cycles_at(self, decision_session_indices: tuple[int, ...]) -> dict[int, TradingCycleResult]:
         """Return the pure planning results for replay decisions.
@@ -547,6 +571,11 @@ class StockBacktester:
             raise BacktestValidationError("panel sessions must be timezone-aware")
         if sessions[0] > request.end_time or sessions[-1] < request.start_time:
             raise BacktestValidationError("replay window does not overlap the panel")
+        self._emit(
+            DiagnosticStage.INPUT,
+            "backtest_input",
+            {"rows": panel.height, "sessions": len(sessions)},
+        )
 
         by_session = dict(
             zip(
@@ -555,6 +584,8 @@ class StockBacktester:
                 strict=True,
             )
         )
+        if self._all_scheduled_no_trade(artifacts):
+            return self._run_no_trade(sessions, initial_portfolio, request)
         if self.decision_provider is not None and self.scenario_planner is not None:
             market = PreparedReplayMarket.build(
                 panel,
@@ -619,6 +650,52 @@ class StockBacktester:
             no_trade_reasons=no_trade_reasons,
             unfilled_order_reason_counts=_unfilled_order_reason_counts(trades),
         )
+
+    def _run_no_trade(
+        self,
+        sessions: list[datetime],
+        initial_portfolio: PortfolioSnapshot,
+        request: BacktestRequest,
+    ) -> BacktestResult:
+        """Return the exact cash-only replay without repeated planning scans."""
+        ledger = tuple(
+            BacktestLedgerRow(
+                session=session,
+                settled_cash=initial_portfolio.settled_cash,
+                unsettled_cash=initial_portfolio.unsettled_cash,
+                positions_value=0.0,
+                accrued_costs=0.0,
+                equity=initial_portfolio.settled_cash + initial_portfolio.unsettled_cash,
+            )
+            for session in sessions
+        )
+        metrics = self._metrics(list(ledger), [])
+        self._emit(
+            DiagnosticStage.EXECUTION,
+            "execution_summary",
+            {"attempted_orders": 0, "filled_orders": 0, "unfilled_orders": 0},
+        )
+        return BacktestResult(
+            ledger=ledger,
+            trades=(),
+            final_value=ledger[-1].equity,
+            total_return=0.0,
+            metrics=metrics,
+            stress_final_value=ledger[-1].equity,
+            stress_metrics=metrics,
+            stress_ledger=ledger,
+            data_quality=self._data_quality_evidence(),
+            no_trade_reasons=("no-trade-artifact",) * len(request.decision_session_indices),
+        )
+
+    def _all_scheduled_no_trade(self, artifacts: ArtifactSchedule) -> bool:
+        try:
+            return all(
+                self.registry.read_manifest(slot.artifact_id).model_type == "no_trade"
+                for slot in artifacts.slots
+            )
+        except FileNotFoundError:
+            return False
 
     def run_prepared(
         self,
@@ -1172,6 +1249,24 @@ class StockBacktester:
                     settled_cash, schedule,
                 )
                 attempted_orders += len(pending_orders)
+                self._emit(
+                    DiagnosticStage.ALLOCATION,
+                    "decision_funnel",
+                    {
+                        "session_index": index,
+                        "intent_count": len(cycle.intents),
+                        "order_count": len(pending_orders),
+                    },
+                )
+        self._emit(
+            DiagnosticStage.EXECUTION,
+            "execution_summary",
+            {
+                "attempted_orders": attempted_orders,
+                "filled_orders": sum(1 for trade in trades if trade.quantity > 0),
+                "unfilled_orders": sum(1 for trade in trades if trade.quantity == 0),
+            },
+        )
         return ledger, trades, attempted_orders
 
     def _rows_frame_with_adtv(
@@ -1673,6 +1768,15 @@ class StockBacktester:
             return True
         trades.append(self._unfilled(session, instrument_id, order, reason))
         return False
+
+    @staticmethod
+    def _attribution(
+        ledger: list[BacktestLedgerRow],
+        trades: list[BacktestTrade],
+    ) -> dict[str, float]:
+        """Build cost attribution from ledger and trades."""
+        attr = build_backtest_attribution(ledger, trades)  # noqa: F841
+        return {"base_total": attr.base_total, "stress_total": attr.stress_total}
 
     @staticmethod
     def _metrics(

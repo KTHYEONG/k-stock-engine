@@ -9,6 +9,7 @@ route.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import logging
 from datetime import UTC, date, datetime
@@ -29,6 +30,8 @@ from src.core.paths import (
     STOCK_FEATURE_PANEL_ROOT,
     STOCK_LABEL_ROOT,
 )
+from src.stocks.config.research import resolve_training_request
+from src.stocks.config.runtime import StockRuntimeSettings
 from src.stocks.data.contracts import CoverageRange, DatasetSnapshot
 from src.stocks.data.costs import load_cost_evidence
 from src.stocks.data.lineage import ResearchDataBundle, ResolvedDataLineage
@@ -39,6 +42,7 @@ from src.stocks.data.repositories import (
 from src.stocks.ml.contracts import (
     DEFAULT_CANDIDATE_HORIZON_SESSIONS,
     ExecutionFrontierSettings,
+    NetAlphaResearchData,
     NetAlphaTrainingRequest,
     PortfolioSettings,
     RiskSettings,
@@ -50,10 +54,26 @@ from src.stocks.ml.result_ledger import (
     MlRunContext,
 )
 from src.stocks.ml.training import train_net_alpha_model
+from src.stocks.observability.contracts import RunDiagnostics, RunIdentity
+from src.stocks.observability.recorder import open_run_diagnostics
 from src.stocks.research.artifacts import ModelArtifactRegistry
+from src.stocks.research.models import ModelManifest
 from src.stocks.settings import REFERENCE_DATE, REFERENCE_DATETIME
 
 logger = logging.getLogger("stocks.cli.train")
+
+
+def _invoke_training(
+    data: NetAlphaResearchData,
+    registry: ModelArtifactRegistry,
+    request: NetAlphaTrainingRequest,
+    diagnostics: RunDiagnostics,
+) -> ModelManifest:
+    """Preserve compatibility with injected legacy test/application callables."""
+    parameters = inspect.signature(train_net_alpha_model).parameters
+    if "diagnostics" in parameters:
+        return train_net_alpha_model(data, registry, request, diagnostics=diagnostics)
+    return train_net_alpha_model(data, registry, request)
 
 STOCK_RESULTS_DOC_ROOT = PROJECT_ROOT / "docs" / "results"
 
@@ -384,14 +404,19 @@ def main(args: list[str] | None = None) -> int:
         data_lineage=resolved_lineage,
     )
     ledger = MlResultLedger(parsed.results_root)
+    identity = RunIdentity(run_id=request.artifact_id, project="stocks")
+    runtime_settings = StockRuntimeSettings(diagnostics_enabled=True).model_dump()
+    resolve_training_request(request.artifact_id, overrides={})
+    diagnostics = open_run_diagnostics(identity, runtime_settings)
     logger.info(
         "[ALGO] stage=train artifact=%s candidate_horizons=%s",
         request.artifact_id,
         list(request.candidate_horizon_sessions),
     )
     try:
-        manifest = train_net_alpha_model(data, registry, request)
+        manifest = _invoke_training(data, registry, request, diagnostics)
     except Exception as exc:
+        diagnostics.close("FAIL")
         try:
             ledger.record_failed(context, "train_net_alpha_model", exc)
         except Exception as ledger_exc:
@@ -421,6 +446,7 @@ def main(args: list[str] | None = None) -> int:
             "[SYS] stage=result_ledger status=written artifact=%s",
             manifest.artifact_id,
         )
+    diagnostics.close("PASS")
     return 0
 
 
@@ -570,6 +596,10 @@ def _run_direct_training(
     )
 
     ledger = MlResultLedger(parsed.results_root)
+    identity = RunIdentity(run_id=request.artifact_id, project="stocks")
+    runtime_settings = StockRuntimeSettings(diagnostics_enabled=True).model_dump()
+    resolve_training_request(request.artifact_id, overrides={})
+    diagnostics = open_run_diagnostics(identity, runtime_settings)
     logger.info(
         "[ALGO] stage=train artifact=%s candidate_horizons=%s",
         request.artifact_id,
@@ -577,8 +607,9 @@ def _run_direct_training(
     )
 
     try:
-        model_manifest = train_net_alpha_model(data, registry, request)
+        model_manifest = _invoke_training(data, registry, request, diagnostics)
     except Exception as exc:
+        diagnostics.close("FAIL")
         try:
             ledger.record_failed(context, "train_net_alpha_model", exc)
         except Exception as ledger_exc:
@@ -604,6 +635,8 @@ def _run_direct_training(
             "[SYS] stage=result_ledger status=written artifact=%s",
             model_manifest.artifact_id,
         )
+
+    diagnostics.close("PASS")
 
     return 0
 

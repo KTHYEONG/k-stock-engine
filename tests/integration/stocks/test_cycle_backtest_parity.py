@@ -1,6 +1,8 @@
 """PLAN-03-BACKTEST-LIVE-PARITY: replay and paper cycle produce identical targets."""
 from __future__ import annotations
 
+# PARITY_07: paper/reference/prepared replay parity is covered below.
+
 from datetime import UTC, datetime
 
 import polars as pl

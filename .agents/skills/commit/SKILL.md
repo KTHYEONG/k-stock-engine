@@ -22,7 +22,7 @@ Ultra-fast automated git execution protocol. Includes a concise 1-line rationale
 3. **Chained Execution**:
    - **Single Layer / Small Changes**: Stage and commit in a single chained shell command:
      ```bash
-     git add -A && git commit -m "<type>: <Korean summary <= 50 chars>" -m "- **Why:** <Concise reason ending with ~함.>" && git log -n 1 --oneline
+     git add -A && git commit -m "<type>: <Korean summary <= 50 chars>" -m "- **Why:** <Concise reason ending with 함.>" && git log -n 1 --oneline
      ```
    - **Multi-Layer / Large Changes**: If file paths cross distinct logical boundaries (e.g. `src/` vs `docs/` vs `tests/`), split by path boundaries and chain consecutive commits in one command:
      ```bash

@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_AI_OBSERVABLE_RESEARCH_SYNC_20260821",
+      "date": "2026-08-21",
+      "adr_id": "ADR_20260821_AI_OBSERVABLE_RESEARCH_SYNC_20260821",
+      "domain": "architecture",
+      "title": "AI-observable ML and backtest runtime observability",
+      "why": "ML and backtest execution needed structured checkpoints, but full replay exceeded 40 minutes because no-trade artifacts still rescanned the full panel for every decision.",
+      "resolution": "Registered diagnostic event wiring, no-trade replay short-circuit, reusable JSONL file handles, CLI snapshot composition fix, and runtime verification evidence.",
+      "impact": "Full no-trade backtest reduced from timeout over 40 minutes to 6.5 seconds; ML completed with fail-closed NO_TRADE and structured diagnostic events. Historical financial outputs remain unchanged."
+    },
+    {
       "task_id": "TASK_ML_COMPOUNDING_BACKTEST_ROBUSTNESS_20260820",
       "date": "2026-08-20",
       "adr_id": "ADR_20260820_ML_COMPOUNDING_BACKTEST_ROBUSTNESS_20260820",
