@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "net_alpha_runtime_recovery",
+      "date": "2026-08-21",
+      "adr_id": "ADR_20260821_net_alpha_runtime_recovery",
+      "domain": "ml",
+      "title": "Net-alpha ML/backtest runtime evidence",
+      "why": "Production ML/backtest execution was repeatedly confused by no-trade gating, horizon/data mismatches, and sessions that outlived their child process without publishing artifacts.",
+      "resolution": "Recorded the bounded H10/H20 ML run and simulator outcome, preserving fail-closed economic selection and documenting H3 incompatibility and runtime-session failure instead of fabricating performance.",
+      "impact": "Task and code indexes are synchronized; temporary execution logs and project scratch/temp artifacts are purged while permanent result ledgers and artifacts remain."
+    },
+    {
       "task_id": "net_alpha_economic_recovery",
       "date": "2026-08-21",
       "adr_id": "ADR_20260821_net_alpha_economic_recovery",
