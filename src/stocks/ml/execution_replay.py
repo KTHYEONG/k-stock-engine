@@ -132,6 +132,10 @@ class ExecutionReplayEvidence:
     unfilled_order_reason_counts: tuple[tuple[str, int], ...] = ()
     utility_transition_diagnostics: tuple[tuple[str, float | int], ...] = ()
     action_diagnostics: tuple[tuple[str, float | int], ...] = ()
+    base_cost_drag: float = 0.0
+    stress_cost_drag: float = 0.0
+    base_exposure: float = 0.0
+    stress_exposure: float = 0.0
 
     def __post_init__(self) -> None:
         if len(self.base_log_growth) != len(self.stress_log_growth):
@@ -158,6 +162,14 @@ class ExecutionReplayEvidence:
             raise ValueError("invested_interval_fraction must be in [0, 1]")
         if self.filled_cycle_count < 0:
             raise ValueError("filled_cycle_count must be non-negative")
+        if not np.isfinite(self.base_cost_drag) or self.base_cost_drag < 0.0:
+            raise ValueError("base_cost_drag must be a finite non-negative value")
+        if not np.isfinite(self.stress_cost_drag) or self.stress_cost_drag < 0.0:
+            raise ValueError("stress_cost_drag must be a finite non-negative value")
+        if not np.isfinite(self.base_exposure) or self.base_exposure < 0.0:
+            raise ValueError("base_exposure must be a finite non-negative value")
+        if not np.isfinite(self.stress_exposure) or self.stress_exposure < 0.0:
+            raise ValueError("stress_exposure must be a finite non-negative value")
 
     def diagnostics(self) -> dict[str, object]:
         """Bounded execution evidence projection; never raw score/price vectors."""
@@ -176,6 +188,10 @@ class ExecutionReplayEvidence:
             "action_diagnostics": {
                 str(key): value for key, value in self.action_diagnostics
             },
+            "base_cost_drag": round(float(self.base_cost_drag), 12),
+            "stress_cost_drag": round(float(self.stress_cost_drag), 12),
+            "base_exposure": round(float(self.base_exposure), 12),
+            "stress_exposure": round(float(self.stress_exposure), 12),
         }
 
 
@@ -218,6 +234,10 @@ def replay_execution_equivalent(
     total_observed_intervals = 0
     total_filled_cycles = 0
     turnover_weighted = 0.0
+    base_cost_drag_weighted = 0.0
+    stress_cost_drag_weighted = 0.0
+    base_exposure_weighted = 0.0
+    stress_exposure_weighted = 0.0
     unfilled: dict[str, int] = {}
 
     for segment_id in sorted(request.decision_sessions_by_segment):
@@ -321,7 +341,13 @@ def replay_execution_equivalent(
         total_observed_intervals += segment_observed
         total_invested_intervals += segment_invested
         total_filled_cycles += segment_filled_cycles
-        turnover_weighted += float(result.metrics.get("turnover", 0.0)) * max(1, int(result.planned_cycles))
+        segment_weight = max(1, int(result.planned_cycles))
+        turnover_weighted += float(result.metrics.get("turnover", 0.0)) * segment_weight
+        stress_metrics = result.stress_metrics or {}
+        base_cost_drag_weighted += float(result.metrics.get("cost_drag", 0.0)) * segment_weight
+        stress_cost_drag_weighted += float(stress_metrics.get("cost_drag", 0.0)) * segment_weight
+        base_exposure_weighted += float(result.metrics.get("exposure", 0.0)) * segment_weight
+        stress_exposure_weighted += float(stress_metrics.get("exposure", 0.0)) * segment_weight
         for reason, count in result.unfilled_order_reason_counts.items():
             unfilled[str(reason)] = unfilled.get(str(reason), 0) + int(count)
 
@@ -337,6 +363,10 @@ def replay_execution_equivalent(
         if total_observed_intervals > 0
         else 0.0
     )
+    base_cost_drag = base_cost_drag_weighted / total_planned if total_planned else 0.0
+    stress_cost_drag = stress_cost_drag_weighted / total_planned if total_planned else 0.0
+    base_exposure = base_exposure_weighted / total_planned if total_planned else 0.0
+    stress_exposure = stress_exposure_weighted / total_planned if total_planned else 0.0
     return ExecutionReplayEvidence(
         base_log_growth=tuple(base_growth),
         stress_log_growth=tuple(stress_growth),
@@ -351,6 +381,10 @@ def replay_execution_equivalent(
         filled_cycle_count=int(total_filled_cycles),
         unfilled_order_reason_counts=tuple(sorted(unfilled.items())),
         utility_transition_diagnostics=(),
+        base_cost_drag=base_cost_drag,
+        stress_cost_drag=stress_cost_drag,
+        base_exposure=base_exposure,
+        stress_exposure=stress_exposure,
     )
 
 

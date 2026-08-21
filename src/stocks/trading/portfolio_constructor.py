@@ -1390,7 +1390,15 @@ def _build_allocations(
                 for challenger, _ in sparse_plan.replacements
             ):
                 target_full[instrument_id] = weight
-        lambda_ = 1.0
+        if policy.turnover_budget > 0.0:
+            lambda_ = _turnover_lambda(target_full, current_weights, policy.turnover_budget)
+            for instrument_id in target_full:
+                current = current_weights.get(instrument_id, 0.0)
+                target_full[instrument_id] = current + lambda_ * (
+                    target_full[instrument_id] - current
+                )
+        else:
+            lambda_ = 1.0
         utility_transition_count = int(bool(sparse_plan.replacements or sparse_plan.initial_entries))
         utility_hold_count = len(sparse_plan.retained)
         utility_transition_diagnostics.extend(
