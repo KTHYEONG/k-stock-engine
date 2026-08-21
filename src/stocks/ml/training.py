@@ -60,6 +60,8 @@ from src.stocks.ml.execution_replay import (
     ExecutionEquivalentReplayRequest,
     ExecutionReplayContext,
     ExecutionReplayEvidence,
+    ProfileReplayEvidence,
+    exposure_matched_benchmark_log_growth,
     instruments_from_frame,
     prepare_execution_replay_batch,
     replay_execution_equivalent,
@@ -87,6 +89,7 @@ from src.stocks.ml.horizons import (
     HorizonSelectionEvidence,
     _cohort_bootstrap,
     select_horizons,
+    select_prequential_execution_policy,
 )
 from src.stocks.ml.labels import (
     AVAILABLE_COLUMN,
@@ -542,6 +545,19 @@ def _select_publish_and_promote(
         discovery.evidence, request.bootstrap_alpha, request.seed,
         n_bootstrap=request.bootstrap_resamples,
     )
+    prequential = select_prequential_execution_policy(
+        {0: discovery.evidence},
+        request.bootstrap_alpha,
+        request.seed,
+        n_bootstrap=max(
+            request.bootstrap_resamples,
+            max(1, len(discovery.evidence)) * 20,
+        ),
+    )
+    telemetry.phase(
+        "prequential_selection",
+        {"segment_policies": sorted(prequential.segment_policies)},
+    )
     candidate_bound = len(
         request.execution_frontier.feasible_cells(
             request.portfolio.max_exposure, request.portfolio.max_single_weight
@@ -693,13 +709,13 @@ def _select_publish_and_promote(
         if "expected_active_alpha" in oof.columns
         else _causal_oof_calibrate(oof, oof_labels, request, primary)
     )
-    base_evidence, _stress_evidence = _replay_costs(
+    replay = _replay_costs(
         calibrated, oof_labels, request, primary, risk, pre_holdout, data.manifest,
         profile,
         rebalance_frequency_sessions=selection.primary_rebalance_frequency_sessions,
         top_k=selection.primary_top_k,
     )
-    evaluation = base_evidence
+    evaluation = replay.candidate
 
     final_model = _refit_selected(
         pre_holdout, data, request, base_manifest, learner_columns,
@@ -1311,7 +1327,7 @@ def _replay_costs(
     *,
     rebalance_frequency_sessions: int,
     top_k: int,
-) -> tuple[ExecutionReplayEvidence, ExecutionReplayEvidence]:
+) -> ProfileReplayEvidence:
     """Execution-equivalent base/stress replay over the segment-identified OOF.
 
     The calibrated OOF score panel and the raw pre-holdout executable market
@@ -1374,7 +1390,7 @@ def _replay_costs(
     )
     evidence = replay_execution_equivalent(replay_request)
     if not is_v5:
-        return evidence, evidence
+        return ProfileReplayEvidence(candidate=evidence, dense_shadow=None)
     dense_profile = PolicyProfile(
         profile_id=profile.profile_id,
         no_trade_band_bps=profile.no_trade_band_bps,
@@ -1398,7 +1414,7 @@ def _replay_costs(
         horizon_sessions=horizon_sessions,
     )
     shadow_evidence = replay_execution_equivalent(shadow_request)
-    return evidence, shadow_evidence
+    return ProfileReplayEvidence(candidate=evidence, dense_shadow=shadow_evidence)
 
 
 def _replay_costs_batch(
@@ -1410,7 +1426,7 @@ def _replay_costs_batch(
     market_frame: pl.DataFrame,
     manifest: DatasetManifest,
     specs: Sequence[tuple[int, int, PolicyProfile]],
-) -> Mapping[tuple[int, int, int, str], tuple[ExecutionReplayEvidence, ExecutionReplayEvidence]]:
+) -> Mapping[tuple[int, int, int, str], ProfileReplayEvidence]:
     """Cadence-group batch replay: one prepared batch per cadence, shared across profiles.
 
     Groups candidate specs by cadence (rebalance_frequency_sessions). Within
@@ -1429,7 +1445,7 @@ def _replay_costs_batch(
         )
         cadence_groups[(cadence, sparse_schedule)].append((top_k, profile))
 
-    results: dict[tuple[int, int, int, str], tuple[ExecutionReplayEvidence, ExecutionReplayEvidence]] = {}
+    results: dict[tuple[int, int, int, str], ProfileReplayEvidence] = {}
 
     for (cadence, is_v5), group in cadence_groups.items():
         replay_policy = _risk_policy_for_profile(
@@ -1565,12 +1581,12 @@ def _replay_costs_batch(
             if primary_ev is None:
                 continue
             if not is_v5:
-                results[key] = (primary_ev, primary_ev)
+                results[key] = ProfileReplayEvidence(candidate=primary_ev, dense_shadow=None)
             else:
                 shadow_ev = shadow_map.get(idx)
                 if shadow_ev is None:
                     continue
-                results[key] = (primary_ev, shadow_ev)
+                results[key] = ProfileReplayEvidence(candidate=primary_ev, dense_shadow=shadow_ev)
 
         del batch, primary_evidences, shadow_evidences
 
@@ -1882,7 +1898,8 @@ def _build_horizon_evidence(
                     if pair is None:
                         dropout_reasons[key] = "replay-batch-error"
                         continue
-                    base_evidence, shadow_evidence = pair
+                    base_evidence = pair.candidate
+                    shadow_evidence = pair.dense_shadow
                     is_v5 = (
                         profile.execution_utility_mode == "sparse_hold_replace_v2"
                         or profile.sizing_mode == "risk_balanced_waterfill_v2"
@@ -2682,7 +2699,7 @@ def _adopt_model_family(
     )
     risk = replace(request.risk, no_trade_band_bps=profile.no_trade_band_bps)
     try:
-        _base_evidence, stress_evidence = _replay_costs(
+        challenger_replay = _replay_costs(
             challenger_calibrated, challenger_labels, request,
             primary_horizon_sessions, risk, pre_holdout, data.manifest, profile,
             rebalance_frequency_sessions=selection.primary_rebalance_frequency_sessions,
@@ -2694,7 +2711,7 @@ def _adopt_model_family(
             f"challenger-replay-error:{type(exc).__name__}:{exc}",
             baseline_oof, baseline_labels, baseline_ics, baseline_diag,
         )
-    stress_growth = stress_evidence.stress_log_growth
+    stress_growth = challenger_replay.candidate.stress_log_growth
     from src.stocks.ml.horizons import _cohort_bootstrap
 
     stress_threshold = selection.stress_holm_thresholds.get(
@@ -2705,7 +2722,7 @@ def _adopt_model_family(
     ).get("stress", 0.0)
     bootstrap = _cohort_bootstrap(
         stress_growth,
-        stress_evidence.segment_ids,
+        challenger_replay.candidate.segment_ids,
         request.bootstrap_resamples,
         request.seed + primary_horizon_sessions,
         min_block_length=max(
@@ -2869,7 +2886,7 @@ def _evaluate_forward_holdout(
     calibrated = calibrated.with_columns(pl.lit(0, dtype=pl.Int64).alias(_OOF_SEGMENT))
     risk = replace(request.risk, no_trade_band_bps=profile.no_trade_band_bps)
     try:
-        base_evidence, stress_evidence = _replay_costs(
+        replay = _replay_costs(
             calibrated, calibrated, request, horizon_sessions, risk,
             holdout_panel, _holdout_stub_manifest(request, holdout_panel),
             profile,
@@ -2878,16 +2895,28 @@ def _evaluate_forward_holdout(
         )
     except ValueError as exc:
         return {"passed": False, "reason": f"holdout-replay-invalid:{exc}"}
+    base_evidence = replay.candidate
+    stress_evidence = replay.candidate
+    holdout_sessions = tuple(sorted(holdout_panel[SESSION_COLUMN].unique().to_list()))
+    interval_exposure = base_evidence.base_interval_exposure
+    if len(holdout_sessions) == len(interval_exposure) + 1:
+        interval_exposure = (*interval_exposure, 0.0)
+    try:
+        matched_benchmark = exposure_matched_benchmark_log_growth(
+            holdout_panel,
+            holdout_sessions,
+            interval_exposure,
+        )
+    except ValueError as exc:
+        return {"passed": False, "reason": f"holdout-benchmark-invalid:{exc}"}
     growth_count = len(base_evidence.base_log_growth)
-    filled_sessions = round(
-        base_evidence.planned_cycles * (1.0 - base_evidence.cash_session_fraction)
-    )
+    invested_sessions = base_evidence.invested_interval_count
     certificate = certify_compounded_holdout(
         tuple(np.expm1(value) for value in base_evidence.base_log_growth),
         tuple(np.expm1(value) for value in stress_evidence.stress_log_growth),
         horizon_sessions,
         growth_count,
-        filled_sessions,
+        invested_sessions,
         request.compounding,
     )
     if base_evidence.filled_orders <= 0 or base_evidence.planned_cycles <= 0:
@@ -2906,15 +2935,16 @@ def _evaluate_forward_holdout(
         "block_count": growth_count,
         "order_count": base_evidence.filled_orders,
         "certificate": certificate.to_json(),
+        "matched_benchmark_log_growth": matched_benchmark,
         "cohorts": {
             "scored_sessions": growth_count,
             "realized_sessions": growth_count,
             "eligible_sessions": base_evidence.planned_cycles,
-            "active_sessions": filled_sessions,
+            "active_sessions": invested_sessions,
             "orders": base_evidence.filled_orders,
             "period_count": growth_count,
             "observed_sessions": growth_count,
-            "active_cohort_count": filled_sessions,
+            "active_cohort_count": invested_sessions,
             "missing_realized_cohorts": 0,
         },
         "diagnostics": {
