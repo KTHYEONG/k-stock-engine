@@ -23,6 +23,8 @@ def _evidence(
     segments: tuple[int, ...] | None = None,
     rank_ics: tuple[float, ...] = (0.1, 0.2, 0.3),
     profile_id: str = _LEGACY,
+    rebalance_frequency_sessions: int = 5,
+    top_k: int = 20,
 ) -> HorizonOOFEvidence:
     stress = base if stress is None else stress
     segment_ids = segments or tuple(0 for _ in base)
@@ -39,6 +41,8 @@ def _evidence(
         missing_cohort_count=0,
         segment_count=max(set(segment_ids), default=0) + 1,
         fold_rank_ics=rank_ics,
+        rebalance_frequency_sessions=rebalance_frequency_sessions,
+        top_k=top_k,
     )
 
 
@@ -57,10 +61,10 @@ def test_selects_primary_with_positive_lower_bound() -> None:
     assert result.primary_profile_id == _LEGACY
     assert result.selected_horizons == (5,)
     assert result.selected_profile_id == _LEGACY
-    assert result.adjusted_lower_growth[(5, _LEGACY)]["base"] > 0.0
-    assert result.adjusted_lower_growth[(5, _LEGACY)]["stress"] > 0.0
-    assert result.adjusted_lower_growth[(10, _LEGACY)]["stress"] > 0.0
-    assert result.adjusted_lower_growth[(15, _LEGACY)]["stress"] <= 0.0
+    assert result.adjusted_lower_growth[(5, 5, 20, _LEGACY)]["base"] > 0.0
+    assert result.adjusted_lower_growth[(5, 5, 20, _LEGACY)]["stress"] > 0.0
+    assert result.adjusted_lower_growth[(10, 5, 20, _LEGACY)]["stress"] > 0.0
+    assert result.adjusted_lower_growth[(15, 5, 20, _LEGACY)]["stress"] <= 0.0
 
 
 def test_longer_horizon_raw_return_cannot_beat_annualized_growth() -> None:
@@ -86,7 +90,7 @@ def test_uses_request_controlled_resamples() -> None:
     small = select_horizons(candidates, 0.05, 42, n_bootstrap=50)
     large = select_horizons(candidates, 0.05, 42, n_bootstrap=200)
     assert small.primary_horizon_sessions == large.primary_horizon_sessions == 5
-    assert large.adjusted_lower_growth[(5, _LEGACY)]["stress"] > 0.0
+    assert large.adjusted_lower_growth[(5, 5, 20, _LEGACY)]["stress"] > 0.0
 
 
 def test_rejects_resamples_below_two() -> None:
@@ -106,7 +110,7 @@ def test_no_trade_when_all_lower_bounds_non_positive() -> None:
     assert result.primary_horizon_sessions is None
     assert result.primary_profile_id is None
     assert result.selected_horizons == ()
-    bound = result.adjusted_lower_growth[(20, _LEGACY)]["stress"]
+    bound = result.adjusted_lower_growth[(20, 5, 20, _LEGACY)]["stress"]
     mean = float(np.mean(seven))
     assert mean > 0.0
     assert bound != pytest.approx(mean, abs=1e-12)
@@ -140,10 +144,12 @@ def test_segment_resampling_stays_positive_within_segments() -> None:
     # and admit the candidate; resampling never mixes vintage ids across gaps.
     base = (0.01,) * 8
     segments = (0, 0, 0, 0, 1, 1, 1, 1)
-    candidates = (_evidence(3, base, segments=segments),)
+    candidates = (
+        _evidence(3, base, segments=segments, rebalance_frequency_sessions=3),
+    )
     result = select_horizons(candidates, 0.05, 42)
     assert result.primary_horizon_sessions == 3
-    assert result.adjusted_lower_growth[(3, _LEGACY)]["base"] > 0.0
+    assert result.adjusted_lower_growth[(3, 3, 20, _LEGACY)]["base"] > 0.0
 
 
 def test_candidate_order_does_not_change_primary() -> None:
@@ -183,8 +189,8 @@ def test_frontier_selects_between_two_profiles() -> None:
     result = select_horizons(candidates, 0.05, 42)
     assert result.primary_horizon_sessions == 5
     assert result.primary_profile_id == _LOWER
-    assert result.adjusted_lower_growth[(5, _LOWER)]["stress"] > 0.0
-    assert result.adjusted_lower_growth[(5, _LEGACY)]["stress"] <= 0.0
+    assert result.adjusted_lower_growth[(5, 5, 20, _LOWER)]["stress"] > 0.0
+    assert result.adjusted_lower_growth[(5, 5, 20, _LEGACY)]["stress"] <= 0.0
     assert result.to_json()["primary_profile_id"] == _LOWER
 
 
@@ -269,29 +275,29 @@ def test_sparse_growth_paired_admission() -> None:
         10, _positive(10, 0.01, count=60), _positive(10, 0.002, count=60),
         sparse_turnover=1.0, shadow_turnover=2.0,
     )
-    result = select_horizons((good,), alpha, 42, rebalance_frequency_sessions=5)
+    result = select_horizons((good,), alpha, 42)
     assert result.primary_horizon_sessions == 10
     assert result.primary_profile_id == _LEGACY
-    assert result.paired_lower_bounds[(10, _LEGACY)] > 0.0
-    assert result.turnover_ratio[(10, _LEGACY)] <= 0.60
-    assert 0.0 < result.base_holm_thresholds[(10, _LEGACY)] <= alpha
-    assert 0.0 < result.paired_holm_thresholds[(10, _LEGACY)] <= alpha
+    assert result.paired_lower_bounds[(10, 5, 20, _LEGACY)] > 0.0
+    assert result.turnover_ratio[(10, 5, 20, _LEGACY)] <= 0.60
+    assert 0.0 < result.base_holm_thresholds[(10, 5, 20, _LEGACY)] <= alpha
+    assert 0.0 < result.paired_holm_thresholds[(10, 5, 20, _LEGACY)] <= alpha
 
     negative_paired = _sparse_evidence(
         10, _positive(10, 0.01, count=60),
         tuple(-0.002 for _ in range(60)),
         sparse_turnover=1.0, shadow_turnover=2.0,
     )
-    rejected = select_horizons((negative_paired,), alpha, 42, rebalance_frequency_sessions=5)
+    rejected = select_horizons((negative_paired,), alpha, 42)
     assert rejected.primary_horizon_sessions is None
 
     high_turnover = _sparse_evidence(
         10, _positive(10, 0.01, count=60), _positive(10, 0.002, count=60),
         sparse_turnover=1.0, shadow_turnover=1.0,
     )
-    rejected_ratio = select_horizons((high_turnover,), alpha, 42, rebalance_frequency_sessions=5)
+    rejected_ratio = select_horizons((high_turnover,), alpha, 42)
     assert rejected_ratio.primary_horizon_sessions is None
-    assert rejected_ratio.turnover_ratio[(10, _LOWER if False else _LEGACY)] > 0.60
+    assert rejected_ratio.turnover_ratio[(10, 5, 20, _LOWER if False else _LEGACY)] > 0.60
 
 
 def test_sparse_growth_v6_holm_hard_gate() -> None:
@@ -332,10 +338,10 @@ def test_sparse_growth_v6_holm_hard_gate() -> None:
         -0.015879781282870976, -0.015879781282870976, -0.015879781282870976,
     )
     spiky = _evidence(10, base, stress, segments=(0,) * 60, rank_ics=(0.1, 0.2, 0.3))
-    result = select_horizons((spiky,), alpha, 42, rebalance_frequency_sessions=5)
+    result = select_horizons((spiky,), alpha, 42)
     assert result.primary_horizon_sessions is None
     assert result.primary_profile_id is None
-    key = (10, _LEGACY)
+    key = (10, 5, 20, _LEGACY)
     assert result.adjusted_lower_growth[key]["stress"] > 0.0
     assert result.stress_p_values[key] > alpha
 
@@ -346,10 +352,10 @@ def test_sparse_growth_v6_holm_hard_gate() -> None:
         sparse_turnover=1.0, shadow_turnover=2.0,
     )
     selectable = select_horizons(
-        (paired,), alpha, 42, rebalance_frequency_sessions=5
+        (paired,), alpha, 42
     )
     assert selectable.primary_horizon_sessions == 10
-    key = (10, _LEGACY)
+    key = (10, 5, 20, _LEGACY)
     assert key in selectable.paired_holm_thresholds
     assert 0.0 < selectable.paired_holm_thresholds[key] <= alpha
     assert key in selectable.base_holm_thresholds
@@ -401,3 +407,63 @@ def test_frontier_multiplicity_and_feasibility() -> None:
     )
     result_neg = select_horizons((negative_stress,), 0.05, 42)
     assert result_neg.primary_horizon_sessions is None
+
+
+def test_execution_frontier_all_feasible_cells_and_global_holm() -> None:
+    """ML_EXEC_FRONTIER_01_ALL_FEASIBLE_CELLS_AND_GLOBAL_HOLM.
+
+    With the default frontier H=(10,20), C=(5,10,20), K=(12,16,20,24) and caps
+    (0.90, 0.08), exactly 20 feasible (H, C, K) cells are formed; the 3 default
+    profiles generate 60 distinct (H, C, K, profile) Holm keys, and no key has
+    C > H or K < 12.
+    """
+    from src.stocks.ml.contracts import (
+        DEFAULT_POLICY_PROFILES,
+        ExecutionFrontierSettings,
+    )
+
+    frontier = ExecutionFrontierSettings()
+    cells = frontier.feasible_cells(0.90, 0.08)
+    assert len(cells) == 20
+    assert all(c <= h for h, c, k in cells)
+    assert all(k >= 12 for h, c, k in cells)
+
+    candidates = tuple(
+        _evidence(
+            h, _positive(h, 0.01, count=60),
+            profile_id=profile.profile_id,
+            rebalance_frequency_sessions=c,
+            top_k=k,
+        )
+        for (h, c, k) in cells
+        for profile in DEFAULT_POLICY_PROFILES
+    )
+    assert len(candidates) == 60
+
+    result = select_horizons(candidates, 0.05, 42)
+    keys = list(result.adjusted_lower_growth.keys())
+    assert len(keys) == 60
+    assert len(set(keys)) == 60
+    for (h, c, k, _profile_id) in keys:
+        assert c <= h
+        assert k >= 12
+    assert len(result.base_holm_thresholds) == 60
+    assert len(result.stress_holm_thresholds) == 60
+
+
+def test_primary_preserves_selected_nonfirst_execution_cell() -> None:
+    """The selected C/K must not be replaced by the first same-H/profile cell."""
+    first = _evidence(
+        10, _positive(10, 0.001, count=60),
+        rebalance_frequency_sessions=5,
+        top_k=12,
+    )
+    selected = _evidence(
+        10, _positive(10, 0.01, count=60),
+        rebalance_frequency_sessions=10,
+        top_k=20,
+    )
+    result = select_horizons((first, selected), 0.05, 42)
+    assert result.primary_horizon_sessions == 10
+    assert result.primary_rebalance_frequency_sessions == 10
+    assert result.primary_top_k == 20
