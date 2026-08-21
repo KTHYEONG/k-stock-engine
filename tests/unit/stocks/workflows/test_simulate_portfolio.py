@@ -953,3 +953,98 @@ def test_v5_artifact_cadence_parity(tmp_path) -> None:
         _policy_from_artifact(
             registry_bad.read_manifest("na_v5_bad_cadence"), request,
         )
+
+
+def test_execution_frontier_artifact_simulation_parity() -> None:
+    """ML_EXEC_FRONTIER_03_ARTIFACT_SIMULATION_PARITY.
+
+    An artifact selected with H=20, C=5, K=12 reconstructs a simulator policy
+    with forecast_horizon_sessions=20, rebalance_frequency_sessions=5, top_k=12,
+    and an identical risk-policy fingerprint; a K mismatch raises ValueError
+    before replay.
+    """
+    from dataclasses import replace
+
+    from src.stocks.ml.contracts import policy_portfolio_fingerprint
+    from src.stocks.trading.portfolio_constructor import (
+        CompoundingPolicyConfig,
+        StockRiskPolicy,
+        stock_risk_policy_fingerprint,
+    )
+    from src.stocks.workflows.simulate_portfolio import _policy_from_artifact
+
+    request = SimulationRequest(
+        artifact_id="exec_frontier_artifact",
+        decision_time=datetime(2024, 1, 1, tzinfo=UTC),
+        top_k=12,
+        max_single_weight=0.08,
+        max_exposure=0.9,
+        participation_limit=0.005,
+        portfolio_value=100_000_000.0,
+        initial_cash=100_000_000.0,
+        policy_profile_id="exec_frontier_profile",
+        no_trade_band_bps=0.0,
+    )
+    policy = StockRiskPolicy(
+        top_k=12,
+        gross_cap=0.9,
+        single_name_cap=0.08,
+        participation_limit=0.005,
+        no_trade_band_bps=0.0,
+        rebalance_frequency_sessions=5,
+        compounding=CompoundingPolicyConfig(
+            growth_risk_aversion=1.0, forecast_horizon_sessions=20
+        ),
+        economic_ranking_mode="economic_net_v1",
+        execution_utility_mode="sparse_hold_replace_v2",
+        sizing_mode="risk_balanced_waterfill_v2",
+    )
+    fingerprint = stock_risk_policy_fingerprint(policy)
+    profile_payload = {
+        "profile_id": "exec_frontier_profile",
+        "no_trade_band_bps": 0.0,
+        "growth_risk_aversion": 1.0,
+        "forecast_horizon_sessions": 20,
+        "rebalance_frequency_sessions": 5,
+        "top_k": 12,
+        "max_single_weight": 0.08,
+        "max_exposure": 0.9,
+        "participation_limit": 0.005,
+        "portfolio_fingerprint": policy_portfolio_fingerprint(12, 0.08, 0.9, 0.005),
+        "execution_evidence_version": "prepared-equity-v5-sparse-growth",
+        "risk_policy_fingerprint": fingerprint,
+        "v7_risk_policy_fingerprint": fingerprint,
+        "execution_policy_id": SCHEDULED_OPEN_V1.policy_id,
+        "execution_policy_hash": SCHEDULED_OPEN_V1.canonical_hash,
+        "economic_ranking_mode": "economic_net_v1",
+        "execution_utility_mode": "sparse_hold_replace_v2",
+        "sizing_mode": "risk_balanced_waterfill_v2",
+    }
+    base_manifest = ModelManifest(
+        artifact_id="exec_frontier_artifact",
+        asset_kind=AssetKind.STOCK,
+        feature_set="stock_net_alpha_v1",
+        feature_schema_hash="h",
+        universe_policy_hash="u",
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=20,
+        eligible_from="2024-01-01T00:00:00+00:00",
+        eligible_to="2024-04-29T00:00:00+00:00",
+        model_type="net_alpha_elastic_net",
+    )
+    manifest = replace(
+        base_manifest,
+        params={
+            "policy_profile": json.dumps(profile_payload),
+            "holm_gate_version": "v6",
+        },
+    )
+    reconstructed = _policy_from_artifact(manifest, request)
+    assert reconstructed.compounding.forecast_horizon_sessions == 20
+    assert reconstructed.rebalance_frequency_sessions == 5
+    assert reconstructed.top_k == 12
+    assert stock_risk_policy_fingerprint(reconstructed) == fingerprint
+
+    mismatched = replace(request, top_k=20)
+    with pytest.raises(ValueError, match="risk-policy fingerprint"):
+        _policy_from_artifact(manifest, mismatched)
