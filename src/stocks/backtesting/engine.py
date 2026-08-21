@@ -282,6 +282,7 @@ class PreparedReplayMarket:
 
     sessions: tuple[datetime, ...]
     session_ranges: Mapping[int, tuple[int, int]]
+    session_max_available_time: Mapping[int, datetime]
     rows_by_key: Mapping[tuple[str, datetime], _PreparedRow]
     instrument_ids: np.ndarray
     row_session_of: np.ndarray
@@ -404,6 +405,16 @@ class PreparedReplayMarket:
             ],
             dtype=object,
         )
+        session_max_available_time: dict[int, datetime] = {}
+        for session_idx, (range_start, range_stop) in ranges.items():
+            values = [
+                value
+                for value in available_time[range_start:range_stop]
+                if isinstance(value, datetime) and value.tzinfo is not None
+            ]
+            if not values:
+                raise BacktestValidationError("no available_time at prepared session")
+            session_max_available_time[session_idx] = max(values)
         limit_locked = (
             ordered["limit_locked"].to_numpy().astype(bool)
             if "limit_locked" in ordered.columns
@@ -418,6 +429,7 @@ class PreparedReplayMarket:
         market = cls(
             sessions=sessions,
             session_ranges=ranges,
+            session_max_available_time=session_max_available_time,
             rows_by_key=rows_by_key,
             instrument_ids=instrument_ids,
             row_session_of=np.asarray(row_sessions, dtype=np.int64),
@@ -833,16 +845,15 @@ class StockBacktester:
                 new_pending.append(order)
         state.pending_orders = new_pending
 
-        start, stop = market.session_ranges[index]
-        for row in range(start, stop):
-            close = market.close[row]
+        positions_value = 0.0
+        for instrument_id, quantity in state.positions.items():
+            row = rows_by_key.get((instrument_id, session))
+            close = row.get("close") if row is not None else None
             if close is not None and close == close:
-                state.last_close[str(market.instrument_ids[row])] = float(close)
-        positions_value = sum(
-            state.positions[i] * state.last_close[i]
-            for i in state.positions
-            if i in state.last_close
-        )
+                state.last_close[instrument_id] = float(close)
+            last_close = state.last_close.get(instrument_id)
+            if last_close is not None:
+                positions_value += quantity * last_close
         equity = (
             state.settled_cash
             + state.unsettled_cash
@@ -861,15 +872,12 @@ class StockBacktester:
         )
 
     def _prepared_decision_time(self, market: PreparedReplayMarket, index: int, session: datetime) -> datetime:
-        start, stop = market.session_ranges[index]
-        values: list[datetime] = [
-            value
-            for value in market.available_time[start:stop]
-            if value is not None
-        ]
-        if not values:
-            raise BacktestValidationError("no available_time at decision session")
-        return max(values)
+        try:
+            return market.session_max_available_time[index]
+        except KeyError as exc:
+            raise BacktestValidationError(
+                f"no available_time at decision session {session.isoformat()}"
+            ) from exc
 
     def _result_from_states(
         self,
