@@ -24,7 +24,7 @@ def test_default_policy_profiles_are_the_three_pre_registered() -> None:
 
 
 def test_default_policy_profiles_pin_sparse_frontier() -> None:
-    """SPARSE_GROWTH_01_DEFAULT_FRONTIER: every profile pins the sparse modes."""
+    """SPARSE_GROWTH_01_DEFAULT_FRONTIER: first two profiles pin sparse modes, third uses confidence sizing."""
     assert tuple(p.execution_utility_mode for p in DEFAULT_POLICY_PROFILES) == (
         "sparse_hold_replace_v2",
         "sparse_hold_replace_v2",
@@ -33,7 +33,7 @@ def test_default_policy_profiles_pin_sparse_frontier() -> None:
     assert tuple(p.sizing_mode for p in DEFAULT_POLICY_PROFILES) == (
         "risk_balanced_waterfill_v2",
         "risk_balanced_waterfill_v2",
-        "risk_balanced_waterfill_v2",
+        "confidence_mean_variance_v1",
     )
     validated = validate_policy_profiles(DEFAULT_POLICY_PROFILES)
     assert tuple(p.execution_utility_mode for p in validated) == (
@@ -44,7 +44,7 @@ def test_default_policy_profiles_pin_sparse_frontier() -> None:
     assert tuple(p.sizing_mode for p in validated) == (
         "risk_balanced_waterfill_v2",
         "risk_balanced_waterfill_v2",
-        "risk_balanced_waterfill_v2",
+        "confidence_mean_variance_v1",
     )
 
 
@@ -214,3 +214,33 @@ def test_three_profile_frontier() -> None:
     assert aversions == [1.0, 1.0, 2.0]
     validated = validate_policy_profiles(DEFAULT_POLICY_PROFILES)
     assert len(validated) == 3
+
+
+def test_default_policy_profiles_confidence_frontier() -> None:
+    """ML_CONFIDENCE_FRONTIER_01_DEFAULT_PROFILE_COMPOSITION."""
+    from src.stocks.ml.contracts import (
+        DEFAULT_POLICY_PROFILES,
+        validate_policy_profiles,
+    )
+
+    ids = [p.profile_id for p in DEFAULT_POLICY_PROFILES]
+    assert ids == [
+        "legacy_overlay_5bps",
+        "lower_bound_only",
+        "lower_bound_half_kelly",
+    ]
+    assert [p.execution_utility_mode for p in DEFAULT_POLICY_PROFILES] == [
+        "sparse_hold_replace_v2",
+        "sparse_hold_replace_v2",
+        "sparse_hold_replace_v2",
+    ]
+    assert [p.sizing_mode for p in DEFAULT_POLICY_PROFILES] == [
+        "risk_balanced_waterfill_v2",
+        "risk_balanced_waterfill_v2",
+        "confidence_mean_variance_v1",
+    ]
+    half_kelly = DEFAULT_POLICY_PROFILES[2]
+    assert half_kelly.no_trade_band_bps == 0.0
+    assert half_kelly.growth_risk_aversion == 2.0
+    validated = validate_policy_profiles(DEFAULT_POLICY_PROFILES)
+    assert validated[2].sizing_mode == "confidence_mean_variance_v1"
