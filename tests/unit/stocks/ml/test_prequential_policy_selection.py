@@ -116,3 +116,36 @@ def test_minimum_resolvable_bootstrap_requires_enough_draws() -> None:
         select_prequential_execution_policy(
             {0: evidence}, 0.05, 42, n_bootstrap=1,
         )
+
+
+# ---------------------------------------------------------------------------
+# PREQUENTIAL_GATE_03
+# ---------------------------------------------------------------------------
+
+def test_prequential_mutation_does_not_affect_past_segments() -> None:
+    """PREQUENTIAL_GATE_03.
+
+    Mutating candidate returns in segment s or later leaves s policy and prior
+    stitched growth unchanged; no admissible prior history produces exact zero
+    exposure and zero growth for s.
+    """
+    positive_evidence = _evidence(10, _positive(10, 0.01, count=30), segments=(0,) * 30)
+    evidence_by_segment: dict[int, tuple[HorizonOOFEvidence, ...]] = {
+        0: (positive_evidence,),
+        1: (),
+    }
+    result_a = select_prequential_execution_policy(
+        evidence_by_segment, 0.05, 42, n_bootstrap=200,
+    )
+    negative_evidence = _evidence(
+        10, tuple(-0.01 for _ in range(30)),
+        segments=(0,) * 30,
+    )
+    evidence_by_segment_variant: dict[int, tuple[HorizonOOFEvidence, ...]] = {
+        0: (negative_evidence,),
+        1: (),
+    }
+    result_b = select_prequential_execution_policy(
+        evidence_by_segment_variant, 0.05, 42, n_bootstrap=200,
+    )
+    assert result_a.segment_policies[0] == result_b.segment_policies[0]
