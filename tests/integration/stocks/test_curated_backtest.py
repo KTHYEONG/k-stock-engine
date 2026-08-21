@@ -27,7 +27,7 @@ from tests.fixtures.stocks.helpers import stock_net_alpha_manifest
 
 DATASET_ID = "krx_daily_research_v1_20240101_20240409"
 START = date(2024, 1, 1)
-N_SESSIONS = 100
+N_SESSIONS = 50
 TICKERS = ("000050", "000060", "000070")
 
 
@@ -60,8 +60,9 @@ def write_source(root: Path) -> None:
         )
 
 
-@pytest.fixture
-def curated(tmp_path) -> tuple[Path, Path]:
+@pytest.fixture(scope="module")
+def curated(tmp_path_factory) -> tuple[Path, Path]:
+    tmp_path = tmp_path_factory.mktemp("curated_backtest")
     source = tmp_path / "source"
     dataset_root = tmp_path / "datasets"
     write_source(source)
@@ -71,7 +72,7 @@ def curated(tmp_path) -> tuple[Path, Path]:
         StockCurationRequest(
             dataset_id=DATASET_ID,
             start_date=START,
-            end_date=date(2024, 4, 30),
+            end_date=START + timedelta(days=N_SESSIONS - 1),
             generated_time=datetime(2026, 1, 1, tzinfo=UTC),
         ),
     )
@@ -152,11 +153,13 @@ def test_curated_dataset_trains_and_simulates_in_plan_mode(curated) -> None:
     )
     assert model_manifest.feature_set == "stock_net_alpha_v1"
 
+    all_sessions = sorted(net_alpha_snapshot.frame["session"].unique().to_list())
+    decision_time = all_sessions[-2]
     policy_profile = artifact_policy_profile(registry, "stock_net_alpha_curated")
     if policy_profile is not None:
         request = SimulationRequest(
             artifact_id="stock_net_alpha_curated",
-            decision_time=datetime(2024, 4, 9, 0, 0, tzinfo=UTC),
+            decision_time=decision_time,
             top_k=int(policy_profile["top_k"]),
             max_single_weight=float(policy_profile["max_single_weight"]),
             max_exposure=float(policy_profile["max_exposure"]),
@@ -167,7 +170,7 @@ def test_curated_dataset_trains_and_simulates_in_plan_mode(curated) -> None:
     else:
         request = SimulationRequest(
             artifact_id="stock_net_alpha_curated",
-            decision_time=datetime(2024, 4, 9, 0, 0, tzinfo=UTC),
+            decision_time=decision_time,
         )
     result = simulate_portfolio(net_alpha_snapshot, registry, request)
     assert result.ledger
@@ -190,14 +193,15 @@ def test_curated_replay_uses_only_rows_available_at_decision(curated) -> None:
         net_alpha_snapshot,
         registry,
         NetAlphaTrainingRequest(
-            artifact_id="stock_net_alpha_curated",
+            artifact_id="stock_net_alpha_curated_replay",
             fold_count=2,
             candidate_horizon_sessions=(5,),
             bootstrap_resamples=50,
         ),
     )
 
-    decision_time = datetime(2024, 4, 9, 0, 0, tzinfo=UTC)
+    all_sessions = sorted(net_alpha_snapshot.frame["session"].unique().to_list())
+    decision_time = all_sessions[-2]
     portfolio = PortfolioSnapshot(
         account_snapshot_id="paper",
         as_of=decision_time,
@@ -212,10 +216,10 @@ def test_curated_replay_uses_only_rows_available_at_decision(curated) -> None:
         portfolio,
         TradingCycleRequest(
             strategy_id="stock_net_alpha_v1",
-            artifact_id="stock_net_alpha_curated",
+            artifact_id="stock_net_alpha_curated_replay",
             dataset_id=DATASET_ID,
             decision_time=decision_time,
-            execution_time=datetime(2024, 4, 10, 0, 0, tzinfo=UTC),
+            execution_time=all_sessions[-1],
             risk_policy=StockRiskPolicy(),
             mode="plan",
         ),

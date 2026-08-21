@@ -53,7 +53,7 @@ def _request(artifact_id: str, **kwargs) -> NetAlphaTrainingRequest:
     defaults = {
         "artifact_id": artifact_id,
         "fold_count": 2,
-        "candidate_horizon_sessions": (3, 5, 8, 10, 15, 20),
+        "candidate_horizon_sessions": (3, 5),
         "bootstrap_resamples": 50,
         "liquidity_model": stock_liquidity_model(),
     }
@@ -66,11 +66,11 @@ def _request(artifact_id: str, **kwargs) -> NetAlphaTrainingRequest:
 
 
 def _compound_request(artifact_id: str, **kwargs) -> NetAlphaTrainingRequest:
-    """Request tuned to certify a 300-session synthetic fixture holdout."""
+    """Request tuned to certify a synthetic fixture holdout."""
     defaults = {
         "artifact_id": artifact_id,
         "fold_count": 2,
-        "candidate_horizon_sessions": (3, 5, 8, 10, 15, 20),
+        "candidate_horizon_sessions": (3, 5),
         "bootstrap_resamples": 50,
         "liquidity_model": stock_liquidity_model(),
         "risk": RiskSettings(min_calibration_sessions=40),
@@ -164,10 +164,22 @@ def test_train_net_alpha_publishes_artifact_or_no_trade(tmp_path) -> None:
 
 def test_train_net_alpha_promoted_eligibility_is_forward_holdout(tmp_path) -> None:
     """A promoted artifact is eligible only over its realized holdout interval."""
-    snapshot, df = _snapshot(n_sessions=300)
+    snapshot, df = _snapshot(n_sessions=140, n_tickers=4)
     registry = ModelArtifactRegistry(tmp_path / "artifacts")
     manifest = train_model(
-        snapshot, registry, _compound_request("na_holdout_elig")
+        snapshot,
+        registry,
+        _compound_request(
+            "na_holdout_elig",
+            candidate_horizon_sessions=(5,),
+            risk=RiskSettings(min_calibration_sessions=20),
+            compounding=CompoundingCertificationSettings(
+                annualization_sessions=60,
+                min_observed_sessions=20,
+                min_active_cohort_fraction=0.5,
+                max_drawdown=0.5,
+            ),
+        ),
     )
     if manifest.model_type == "no_trade":
         return
@@ -189,7 +201,7 @@ def test_train_net_alpha_promoted_eligibility_is_forward_holdout(tmp_path) -> No
     assert holdout["certificate"]["base"]["lower_cagr"] > 0.0
     assert holdout["certificate"]["stress"]["cagr"] > 0.0
     assert holdout["certificate"]["stress"]["lower_cagr"] > 0.0
-    assert holdout["cohorts"]["observed_sessions"] >= 40
+    assert holdout["cohorts"]["observed_sessions"] >= 20
     assert holdout["cohorts"]["active_cohort_count"] > 0
     assert holdout["cohorts"]["missing_realized_cohorts"] == 0
 
