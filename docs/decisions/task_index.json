@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_EXECUTION_FRONTIER_NO_TRADE_20260821",
+      "date": "2026-08-21",
+      "adr_id": "ADR_20260821_ML_EXECUTION_FRONTIER_NO_TRADE_20260821",
+      "domain": "quant",
+      "title": "ML execution frontier for no-trade recovery",
+      "why": "최근 ML 실행 결과가 no_trade에 고정되어 자산증식 경로가 차단되었으므로 선언된 실행 프론티어를 실제 선택·기록 경로와 일치시켜야 한다.",
+      "resolution": "H/C/K 실행 셀 선택을 primary selection에 보존하고, 선택된 top_k를 policy fingerprint에 반영했으며, 비첫 번째 실행 셀 회귀 테스트를 추가했다.",
+      "impact": "실행 프론티어의 선택 결과와 artifact 정책 식별자가 일치한다. 기존 no_trade 판정의 경제성 게이트는 유지되며, 후속 ML/백테스트가 실제 선택 셀을 재현할 수 있다."
+    },
+    {
       "task_id": "TASK_AI_OBSERVABLE_RESEARCH_SYNC_20260821",
       "date": "2026-08-21",
       "adr_id": "ADR_20260821_AI_OBSERVABLE_RESEARCH_SYNC_20260821",
