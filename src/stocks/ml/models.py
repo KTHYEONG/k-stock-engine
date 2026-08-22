@@ -208,9 +208,23 @@ def weighted_fold_statistics(
     mean = np.sum(sub * w[:, None], axis=0) / total
     centered = sub - mean
     variance = np.sum(w[:, None] * centered * centered, axis=0) / total
-    std = np.sqrt(np.maximum(variance, 0.0))
-    std[std == 0.0] = 1.0
-    return mean, std
+    return mean, _finalize_weighted_std(variance, 1.0, mean)
+
+
+def _finalize_weighted_std(
+    variance: np.ndarray, total: float, mean: np.ndarray
+) -> np.ndarray:
+    """Unit std for zero-variance columns across every design route.
+
+    Exact float equality cannot detect a constant column once the weighted
+    mean carries rounding noise, so variance below a scale-relative epsilon
+    is treated as zero too; every route (frame oracle, extracted arrays,
+    indexed workspace) shares this one rule so parity stays deterministic.
+    """
+    std = np.sqrt(np.maximum(np.asarray(variance, dtype=np.float64) / total, 0.0))
+    scale = np.maximum(np.abs(mean), 1.0)
+    std[std <= scale * 1e-12] = 1.0
+    return std
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,6 +263,26 @@ class ElasticPathResult:
 
 #: Backward-compatible name for the array-native path result.
 ElasticPathSolution = ElasticPathResult
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedElasticDesign:
+    """Bounded indexed-fit workspace over selected canonical-matrix rows.
+
+    ``standardized`` is the single full-size allocation: one Fortran-contiguous
+    float64 design over the valid (all-finite feature/target) rows only.
+    ``target``/``weights`` are aligned to those rows, ``weights`` are the
+    session-balanced values summing to one, and ``row_indices`` records which
+    canonical rows survived. No float32 indexed copy, centered matrix, or
+    second standardized matrix is retained.
+    """
+
+    standardized: np.ndarray
+    target: np.ndarray
+    weights: np.ndarray
+    mean: np.ndarray
+    std: np.ndarray
+    row_indices: np.ndarray
 
 
 def fit_weighted_elastic_path(
@@ -290,9 +324,41 @@ def fit_weighted_elastic_path(
     mean = np.sum(sub * weights[:, None], axis=0) / total
     centered = sub - mean
     variance = np.sum(weights[:, None] * centered * centered, axis=0) / total
-    std = np.sqrt(np.maximum(variance, 0.0))
-    std[std == 0.0] = 1.0
+    std = _finalize_weighted_std(variance, 1.0, mean)
     standardized = (sub - mean) / std
+    return _solve_elastic_path_arrays(
+        standardized,
+        y,
+        weights,
+        mean,
+        std,
+        tuple(alpha_fractions),
+        seed=seed,
+        l1_ratio=l1_ratio,
+    )
+
+
+def _solve_elastic_path_arrays(
+    standardized: np.ndarray,
+    y: np.ndarray,
+    weights: np.ndarray,
+    mean: np.ndarray,
+    std: np.ndarray,
+    alpha_fractions: tuple[float, ...],
+    *,
+    seed: int,
+    l1_ratio: float,
+) -> ElasticPathResult | None:
+    """Shared ``alpha_max`` plus one descending warm-start coordinate path.
+
+    ``standardized`` must be the weighted fold-standardized design over valid
+    rows; ``weights`` sum to one within float rounding. Both the extracted-
+    array oracle route and the indexed design workspace converge here so the
+    penalty selection semantics stay identical.
+    """
+    if not alpha_fractions:
+        raise ValueError("penalty fractions must be non-empty")
+    total = float(np.sum(weights))
     y_centered = y - float(np.sum(weights * y) / total)
     alpha_max = float(
         np.max(np.abs(standardized.T @ (weights * y_centered))) / total
@@ -322,6 +388,134 @@ def fit_weighted_elastic_path(
         alpha_max=alpha_max,
         mean=mean,
         std=std,
+    )
+
+
+#: Bounded row-chunk size for indexed design scans and fills.
+ELASTIC_DESIGN_CHUNK_ROWS = 65536
+
+
+def prepare_indexed_elastic_design(
+    features: np.ndarray,
+    row_indices: np.ndarray,
+    target: np.ndarray,
+    session_codes: np.ndarray,
+    *,
+    chunk_rows: int,
+) -> PreparedElasticDesign | None:
+    """Build the single-allocation indexed fit workspace over selected rows.
+
+    ``features``, ``target``, and ``session_codes`` are full canonical-matrix
+    arrays; ``row_indices`` selects the candidate rows. Bounded chunks scan
+    for validity (all-finite feature vector and target), per-session valid-row
+    counts, weighted mean, and centered weighted variance before exactly one
+    Fortran-order float64 standardized design is allocated and filled
+    chunkwise — so no full-size float32 indexed copy, centered matrix, or
+    second standardized matrix ever exists. Weights keep every valid session's
+    equal share (``w_i = 1 / (n_valid_sessions * valid_rows_in_session_i)``,
+    normalized). Returns ``None`` when no selected row is valid.
+    """
+    chunk = max(1, int(chunk_rows))
+    features_arr = np.asarray(features)
+    rows = np.asarray(row_indices, dtype=np.int64)
+    targets = np.asarray(target, dtype=np.float64)
+    codes = np.asarray(session_codes)
+    n_all = features_arr.shape[0]
+    if targets.shape[0] != n_all or codes.shape[0] != n_all:
+        raise ValueError("features, target, and session_codes must be row-aligned")
+    if rows.ndim != 1:
+        raise ValueError("row_indices must be one-dimensional")
+    if rows.size == 0:
+        return None
+    n_features = features_arr.shape[1]
+
+    # Pass 1: bounded-chunk finite-mask discovery plus per-session counts.
+    valid = np.zeros(rows.size, dtype=bool)
+    max_code = int(codes.max()) + 1
+    counts = np.zeros(max_code, dtype=np.int64)
+    for start in range(0, rows.size, chunk):
+        block_rows = rows[start : start + chunk]
+        block = np.asarray(features_arr[block_rows], dtype=np.float64)
+        block_valid = (
+            np.isfinite(block).all(axis=1) & np.isfinite(targets[block_rows])
+        )
+        valid[start : start + block_rows.size] = block_valid
+        if block_valid.any():
+            counts += np.bincount(
+                codes[block_rows[block_valid]].astype(np.int64),
+                minlength=max_code,
+            )
+    if not valid.any():
+        return None
+    valid_rows = rows[valid]
+    selected_codes = codes[valid_rows].astype(np.int64)
+    raw = 1.0 / counts[selected_codes]
+    weight_total = float(raw.sum())
+    if not np.isfinite(weight_total) or weight_total <= 0.0:
+        raise ValueError("malformed sample weights cannot be normalized")
+    weights_selected = raw / weight_total
+
+    # Pass 2: bounded-chunk weighted mean on valid rows only.
+    mean = np.zeros(n_features, dtype=np.float64)
+    for start in range(0, valid_rows.size, chunk):
+        block_rows = valid_rows[start : start + chunk]
+        block = np.asarray(features_arr[block_rows], dtype=np.float64)
+        w = weights_selected[start : start + block_rows.size]
+        mean += np.sum(block * w[:, None], axis=0)
+
+    # Pass 3: bounded-chunk centered weighted variance.
+    variance = np.zeros(n_features, dtype=np.float64)
+    for start in range(0, valid_rows.size, chunk):
+        block_rows = valid_rows[start : start + chunk]
+        block = np.asarray(features_arr[block_rows], dtype=np.float64)
+        centered = block - mean
+        w = weights_selected[start : start + block_rows.size]
+        variance += np.sum(w[:, None] * centered * centered, axis=0)
+
+    # Pass 4: allocate once and fill chunkwise with the frozen standardization.
+    # Variance was accumulated with the already-normalized weights, so no
+    # second division by weight_total happens here.
+    std = _finalize_weighted_std(variance, 1.0, mean)
+    standardized = np.empty(
+        (int(valid_rows.size), n_features), dtype=np.float64, order="F"
+    )
+    for start in range(0, valid_rows.size, chunk):
+        block_rows = valid_rows[start : start + chunk]
+        block = np.asarray(features_arr[block_rows], dtype=np.float64)
+        standardized[start : start + block_rows.size] = (block - mean) / std
+
+    return PreparedElasticDesign(
+        standardized=standardized,
+        target=np.ascontiguousarray(targets[valid_rows]),
+        weights=weights_selected,
+        mean=mean,
+        std=std,
+        row_indices=np.asarray(valid_rows, dtype=np.int64),
+    )
+
+
+def fit_prepared_elastic_path(
+    design: PreparedElasticDesign,
+    alpha_fractions: tuple[float, ...],
+    *,
+    seed: int = 42,
+    l1_ratio: float = 0.5,
+) -> ElasticPathResult | None:
+    """Solve the deterministic weighted penalty path on an indexed workspace.
+
+    Shares the exact ``alpha_max``/coordinate-descent semantics of
+    :func:`fit_weighted_elastic_path`, but consumes the already-standardized
+    Fortran-order design so no second full-size matrix is materialized.
+    """
+    return _solve_elastic_path_arrays(
+        design.standardized,
+        design.target,
+        design.weights,
+        design.mean,
+        design.std,
+        tuple(alpha_fractions),
+        seed=seed,
+        l1_ratio=l1_ratio,
     )
 
 
