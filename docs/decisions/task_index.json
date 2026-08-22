@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_ML_BACKTESTING_PERFORMANCE_ARCHITECTURE",
+      "date": "2026-08-22",
+      "adr_id": "ADR_20260822_STOCK_ML_BACKTESTING_PERFORMANCE_ARCHITECTURE",
+      "domain": "stocks",
+      "title": "Stock ML and backtesting performance architecture",
+      "why": "Horizon discovery dominated runtime, repeated matrix conversions and long-label feature duplication inflated RSS, and replay preparation retained every segment while telemetry and memory limits were incomplete.",
+      "resolution": "Added bounded projected direct loading with separated labels, prepared training matrices and fold-safe array fitting, corrected invalid-row weight masking, introduced phase and replay resource telemetry, cgroup-aware preallocation, segment-major replay, sparse prepared backtesting contracts, and bounded bootstrap kernels while preserving public facades and financial semantics.",
+      "impact": "Improves runtime and memory headroom under deterministic fail-closed budgets; preserves purging, embargo, causal lookback, execution, settlement, cost, bootstrap, candidate-order, and promotion invariants. Contract, targeted tests, lint, typing, and lean audit pass."
+    },
+    {
       "task_id": "net_alpha_h3_runtime_guard",
       "date": "2026-08-22",
       "adr_id": "ADR_20260822_net_alpha_h3_runtime_guard",
