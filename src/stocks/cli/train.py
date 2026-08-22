@@ -41,6 +41,8 @@ from src.stocks.data.repositories import (
 )
 from src.stocks.ml.contracts import (
     DEFAULT_CANDIDATE_HORIZON_SESSIONS,
+    DEFAULT_CANDIDATE_REBALANCE_FREQUENCY_SESSIONS,
+    DEFAULT_CANDIDATE_TOP_K,
     ExecutionFrontierSettings,
     NetAlphaResearchData,
     NetAlphaTrainingRequest,
@@ -129,6 +131,20 @@ def build_parser() -> argparse.ArgumentParser:
             "pre-registered discovery grid of horizon session counts "
             f"(default {DEFAULT_CANDIDATE_HORIZON_SESSIONS})"
         ),
+    )
+    parser.add_argument(
+        "--candidate-rebalance-frequency-sessions",
+        type=str,
+        default=",".join(
+            str(value) for value in DEFAULT_CANDIDATE_REBALANCE_FREQUENCY_SESSIONS
+        ),
+        help="pre-registered execution cadence grid in sessions",
+    )
+    parser.add_argument(
+        "--candidate-top-k",
+        type=str,
+        default=",".join(str(value) for value in DEFAULT_CANDIDATE_TOP_K),
+        help="pre-registered execution maximum active-name grid",
     )
     parser.add_argument("--fold-count", type=int, default=3)
     parser.add_argument("--embargo-sessions", type=int, default=5)
@@ -407,11 +423,15 @@ def main(args: list[str] | None = None) -> int:
     ) = _resolve_cost_contexts(snapshot)
     registry = ModelArtifactRegistry(parsed.registry)
     horizons = _parse_horizons(parsed.candidate_horizon_sessions)
+    cadences = _parse_horizons(parsed.candidate_rebalance_frequency_sessions)
+    top_k = _parse_horizons(parsed.candidate_top_k)
     request = NetAlphaTrainingRequest(
         artifact_id=parsed.artifact_id,
         candidate_horizon_sessions=horizons,
         execution_frontier=ExecutionFrontierSettings(
             candidate_horizon_sessions=horizons,
+            candidate_rebalance_frequency_sessions=cadences,
+            candidate_top_k=top_k,
         ),
         fold_count=parsed.fold_count,
         embargo_sessions=parsed.embargo_sessions,
@@ -601,11 +621,15 @@ def _run_direct_training(
 
     registry = ModelArtifactRegistry(parsed.registry)
     horizons = _parse_horizons(parsed.candidate_horizon_sessions)
+    cadences = _parse_horizons(parsed.candidate_rebalance_frequency_sessions)
+    top_k = _parse_horizons(parsed.candidate_top_k)
     request = NetAlphaTrainingRequest(
         artifact_id=parsed.artifact_id,
         candidate_horizon_sessions=horizons,
         execution_frontier=ExecutionFrontierSettings(
             candidate_horizon_sessions=horizons,
+            candidate_rebalance_frequency_sessions=cadences,
+            candidate_top_k=top_k,
         ),
         fold_count=parsed.fold_count,
         embargo_sessions=parsed.embargo_sessions,
