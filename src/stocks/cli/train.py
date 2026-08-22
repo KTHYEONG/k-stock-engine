@@ -12,6 +12,7 @@ import argparse
 import inspect
 import json
 import logging
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -49,13 +50,17 @@ from src.stocks.ml.contracts import (
     PortfolioSettings,
     RiskSettings,
 )
-from src.stocks.ml.data import compose_net_alpha_training_data, validate_ml_market_data
+from src.stocks.ml.data import (
+    compose_direct_net_alpha_training_data,
+    compose_net_alpha_training_data,
+    validate_ml_market_data,
+)
 from src.stocks.ml.result_ledger import (
     CostRunContext,
     MlResultLedger,
     MlRunContext,
 )
-from src.stocks.ml.training import train_net_alpha_model
+from src.stocks.ml.training import TrainingOrchestrator, train_net_alpha_model
 from src.stocks.observability.contracts import RunDiagnostics, RunIdentity
 from src.stocks.observability.recorder import open_run_diagnostics
 from src.stocks.research.artifacts import ModelArtifactRegistry
@@ -71,10 +76,13 @@ def _invoke_training(
     request: NetAlphaTrainingRequest,
     diagnostics: RunDiagnostics,
 ) -> ModelManifest:
-    """Preserve compatibility with injected legacy test/application callables."""
+    """Drive the training orchestrator, honoring legacy callable signatures."""
     parameters = inspect.signature(train_net_alpha_model).parameters
     if "diagnostics" in parameters:
-        return train_net_alpha_model(data, registry, request, diagnostics=diagnostics)
+        orchestrator = TrainingOrchestrator(
+            data, registry, request, diagnostics=diagnostics
+        )
+        return orchestrator.run()
     return train_net_alpha_model(data, registry, request)
 
 STOCK_RESULTS_DOC_ROOT = PROJECT_ROOT / "docs" / "results"
@@ -233,6 +241,74 @@ def _parse_horizons(raw: str) -> tuple[int, ...]:
     return values
 
 
+def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest:
+    """Build the typed training request from parsed CLI arguments.
+
+    Cost schedules default to the canonical base/stress pair here so the
+    request exists before any repository/catalog access; callers holding a
+    hash-bound cost snapshot replace the schedules afterwards without altering
+    any validated field.
+    """
+    horizons = _parse_horizons(args.candidate_horizon_sessions)
+    cadences = _parse_horizons(args.candidate_rebalance_frequency_sessions)
+    top_k = _parse_horizons(args.candidate_top_k)
+    return NetAlphaTrainingRequest(
+        artifact_id=args.artifact_id,
+        candidate_horizon_sessions=horizons,
+        execution_frontier=ExecutionFrontierSettings(
+            candidate_horizon_sessions=horizons,
+            candidate_rebalance_frequency_sessions=cadences,
+            candidate_top_k=top_k,
+        ),
+        fold_count=args.fold_count,
+        embargo_sessions=args.embargo_sessions,
+        forward_holdout_sessions=args.forward_holdout_sessions,
+        bootstrap_alpha=args.bootstrap_alpha,
+        bootstrap_resamples=args.bootstrap_resamples,
+        model_threads=args.model_threads,
+        max_rss_mib=args.max_rss_mib,
+        seed=args.seed,
+        portfolio=PortfolioSettings(
+            top_k=args.top_k,
+            max_single_weight=args.max_single_weight,
+            max_exposure=args.max_exposure,
+            participation_limit=args.participation_limit,
+            portfolio_value=args.portfolio_value,
+            initial_cash=args.portfolio_value,
+            reference_notional=args.reference_notional,
+        ),
+        risk=RiskSettings(),
+        base_cost_schedule=default_base_schedule(),
+        stress_cost_schedule=default_stress_schedule(),
+        liquidity_model=None,
+        stress_liquidity_model=None,
+        enforce_snapshot_outcome_readiness=False,
+    )
+
+
+def _validate_static_training_request(request: NetAlphaTrainingRequest) -> None:
+    """Fail closed on an infeasible request before any data allocation.
+
+    Validates execution-frontier feasibility and the static discovery-grid
+    identity purely from the request contract: no repository, catalog,
+    Parquet, or loader is touched.
+    """
+    if tuple(request.execution_frontier.candidate_horizon_sessions) != tuple(
+        request.candidate_horizon_sessions
+    ):
+        raise ValueError(
+            "execution_frontier.candidate_horizon_sessions must equal "
+            "candidate_horizon_sessions"
+        )
+    if request.fold_count < 1:
+        raise ValueError("fold-count must be a positive session count")
+    if request.embargo_sessions < 0:
+        raise ValueError("embargo-sessions must be non-negative")
+    request.execution_frontier.require_feasible_horizons(
+        request.portfolio.max_exposure, request.portfolio.max_single_weight
+    )
+
+
 def _resolve_cost_contexts(
     snapshot: object,
 ) -> tuple[
@@ -319,10 +395,16 @@ def main(args: list[str] | None = None) -> int:
     parser = build_parser()
     parsed = parser.parse_args(args)
 
+    # Build and statically validate the request BEFORE any repository,
+    # catalog, Parquet, or loader access so an infeasible frontier fails
+    # closed without data allocation.
+    request = _build_training_request(parsed)
+    _validate_static_training_request(request)
+
     # Direct dataset loading path
     if parsed.base_dataset_id and parsed.feature_dataset_id and parsed.label_dataset_id:
-        return _run_direct_training(parsed, parser)
-    
+        return _run_direct_training(parsed, parser, request)
+
     # Legacy snapshot/as-of path
     if not parsed.snapshot_id and not parsed.as_of:
         parser.error("either --snapshot-id or --as-of is required")
@@ -422,39 +504,13 @@ def main(args: list[str] | None = None) -> int:
         stress_liquidity_model,
     ) = _resolve_cost_contexts(snapshot)
     registry = ModelArtifactRegistry(parsed.registry)
-    horizons = _parse_horizons(parsed.candidate_horizon_sessions)
-    cadences = _parse_horizons(parsed.candidate_rebalance_frequency_sessions)
-    top_k = _parse_horizons(parsed.candidate_top_k)
-    request = NetAlphaTrainingRequest(
-        artifact_id=parsed.artifact_id,
-        candidate_horizon_sessions=horizons,
-        execution_frontier=ExecutionFrontierSettings(
-            candidate_horizon_sessions=horizons,
-            candidate_rebalance_frequency_sessions=cadences,
-            candidate_top_k=top_k,
-        ),
-        fold_count=parsed.fold_count,
-        embargo_sessions=parsed.embargo_sessions,
-        forward_holdout_sessions=parsed.forward_holdout_sessions,
-        bootstrap_alpha=parsed.bootstrap_alpha,
-        bootstrap_resamples=parsed.bootstrap_resamples,
-        model_threads=parsed.model_threads,
-        max_rss_mib=parsed.max_rss_mib,
-        seed=parsed.seed,
-        portfolio=PortfolioSettings(
-            top_k=parsed.top_k,
-            max_single_weight=parsed.max_single_weight,
-            max_exposure=parsed.max_exposure,
-            participation_limit=parsed.participation_limit,
-            portfolio_value=parsed.portfolio_value,
-            initial_cash=parsed.portfolio_value,
-            reference_notional=parsed.reference_notional,
-        ),
-        risk=RiskSettings(),
+    request = replace(
+        request,
         base_cost_schedule=base_cost_schedule,
         stress_cost_schedule=stress_cost_schedule,
         liquidity_model=liquidity_model,
         stress_liquidity_model=stress_liquidity_model,
+        enforce_snapshot_outcome_readiness=True,
     )
     costs = getattr(snapshot, "costs", None) if snapshot is not None else None
     cost_context = CostRunContext(
@@ -524,9 +580,16 @@ def main(args: list[str] | None = None) -> int:
 
 
 def _run_direct_training(
-    parsed: argparse.Namespace, parser: argparse.ArgumentParser
+    parsed: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    request: NetAlphaTrainingRequest,
 ) -> int:
-    """Run training using direct dataset IDs instead of snapshot resolution."""
+    """Run training using direct dataset IDs instead of snapshot resolution.
+
+    The statically validated request arrives prebuilt; this path only resolves
+    hash-bound cost schedules, performs the bounded separated load, and
+    composes without any repeated-label snapshot.
+    """
     from src.stocks.data.direct import DirectDataRequest, DirectMarketDataLoader
 
     if not parsed.research_start_direct or not parsed.research_end_direct:
@@ -563,32 +626,11 @@ def _run_direct_training(
         len(market_data.frame.columns),
     )
 
-    # Convert to NetAlphaResearchData for compatibility with existing training
-    from src.core.datasets import make_manifest
-    from src.core.instruments import AssetKind
-    from src.stocks.data.contracts import DatasetSnapshot
-    from src.stocks.ml.data import compose_net_alpha_training_data
-
-    # Create a minimal snapshot for compatibility
-    data_manifest = make_manifest(
-        asset_kind=AssetKind.STOCK,
-        columns=market_data.frame.columns,
-        feature_set="stock_net_alpha_v1",
-        label_definition="net_alpha_o2o",
-        label_horizon_sessions=max(_parse_horizons(parsed.candidate_horizon_sessions)),
-        time_start=datetime.combine(parsed.research_start_direct, datetime.min.time()),
-        time_end=datetime.combine(parsed.research_end_direct, datetime.min.time()),
-        generated_time=datetime.now(UTC),
-        row_count=market_data.frame.height,
-        provider_version="direct-loader",
-        universe_policy_version="direct-loader",
-    )
-    snapshot = DatasetSnapshot(manifest=data_manifest, frame=market_data.frame)
-
-    data = compose_net_alpha_training_data(
-        snapshot,
-        decision_time,
-        candidate_horizon_sessions=_parse_horizons(parsed.candidate_horizon_sessions),
+    data = compose_direct_net_alpha_training_data(market_data, decision_time)
+    logger.info(
+        "[DATA] stage=compose_direct decision_rows=%d horizons=%s",
+        data.feature_frame.height,
+        sorted(data.labels_by_horizon),
     )
 
     # Bind the immutable feature dataset schema identity so the published
@@ -596,11 +638,9 @@ def _run_direct_training(
     # manifest.schema_hash and the feature content hash is preserved exactly.
     feature_manifest = market_data.feature_manifest
     if feature_manifest is not None:
-        from dataclasses import replace as _dc_replace
-
-        data = _dc_replace(
+        data = replace(
             data,
-            manifest=_dc_replace(
+            manifest=replace(
                 data.manifest,
                 schema_hash=feature_manifest.schema_hash,
                 feature_set_hash=(
@@ -611,7 +651,6 @@ def _run_direct_training(
             ),
         )
 
-    # Build training request
     (
         base_cost_schedule,
         liquidity_model,
@@ -620,35 +659,8 @@ def _run_direct_training(
     ) = _resolve_direct_cost_context(parsed.cost_snapshot_id, parsed, market_data)
 
     registry = ModelArtifactRegistry(parsed.registry)
-    horizons = _parse_horizons(parsed.candidate_horizon_sessions)
-    cadences = _parse_horizons(parsed.candidate_rebalance_frequency_sessions)
-    top_k = _parse_horizons(parsed.candidate_top_k)
-    request = NetAlphaTrainingRequest(
-        artifact_id=parsed.artifact_id,
-        candidate_horizon_sessions=horizons,
-        execution_frontier=ExecutionFrontierSettings(
-            candidate_horizon_sessions=horizons,
-            candidate_rebalance_frequency_sessions=cadences,
-            candidate_top_k=top_k,
-        ),
-        fold_count=parsed.fold_count,
-        embargo_sessions=parsed.embargo_sessions,
-        forward_holdout_sessions=parsed.forward_holdout_sessions,
-        bootstrap_alpha=parsed.bootstrap_alpha,
-        bootstrap_resamples=parsed.bootstrap_resamples,
-        model_threads=parsed.model_threads,
-        max_rss_mib=parsed.max_rss_mib,
-        seed=parsed.seed,
-        portfolio=PortfolioSettings(
-            top_k=parsed.top_k,
-            max_single_weight=parsed.max_single_weight,
-            max_exposure=parsed.max_exposure,
-            participation_limit=parsed.participation_limit,
-            portfolio_value=parsed.portfolio_value,
-            initial_cash=parsed.portfolio_value,
-            reference_notional=parsed.reference_notional,
-        ),
-        risk=RiskSettings(),
+    request = replace(
+        request,
         base_cost_schedule=base_cost_schedule,
         stress_cost_schedule=stress_cost_schedule,
         liquidity_model=liquidity_model,
