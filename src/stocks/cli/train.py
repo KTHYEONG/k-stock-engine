@@ -166,6 +166,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="explicit RSS budget in MiB; a breach publishes complete NO_TRADE evidence",
     )
+    parser.add_argument(
+        "--memory-reserve-mib",
+        type=int,
+        default=0,
+        help=(
+            "measured concurrent-workload memory reserve in MiB subtracted "
+            "from cgroup/system headroom during pre-allocation planning"
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--cost-schedule",
@@ -267,6 +276,7 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
         bootstrap_resamples=args.bootstrap_resamples,
         model_threads=args.model_threads,
         max_rss_mib=args.max_rss_mib,
+        memory_reserve_mib=args.memory_reserve_mib,
         seed=args.seed,
         portfolio=PortfolioSettings(
             top_k=args.top_k,
@@ -658,6 +668,17 @@ def _run_direct_training(
         stress_liquidity_model,
     ) = _resolve_direct_cost_context(parsed.cost_snapshot_id, parsed, market_data)
 
+    # Retain only provenance metadata and release the raw market container:
+    # NetAlphaResearchData stays the live owner of feature/label frames.
+    input_ids = dict(market_data.input_ids)
+    input_content_hashes = dict(market_data.input_content_hashes)
+    logger.info(
+        "[DATA] stage=provenance_retained datasets=%d content_hashes=%d",
+        len(input_ids),
+        len(input_content_hashes),
+    )
+    del market_data
+
     registry = ModelArtifactRegistry(parsed.registry)
     request = replace(
         request,
@@ -681,7 +702,7 @@ def _run_direct_training(
         data=data,
         cost_context=cost_context,
         started_at=started_at,
-        input_ids=market_data.input_ids,
+        input_ids=input_ids,
     )
 
     ledger = MlResultLedger(parsed.results_root)
