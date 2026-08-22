@@ -394,7 +394,9 @@ class NetAlphaTrainingRequest:
     certificate policy for the untouched forward holdout, never a post-hoc
     threshold. ``model_threads`` is the single thread budget for the
     challenger LightGBM (default 1); there is no Optuna trial, resume, or
-    ``lgb_threads`` knob.
+    ``lgb_threads`` knob. ``memory_reserve_mib`` is the measured
+    concurrent-workload reserve subtracted only from cgroup/system headroom,
+    never from the request RSS budget.
     """
 
     artifact_id: str
@@ -410,6 +412,7 @@ class NetAlphaTrainingRequest:
     bootstrap_resamples: int = 200
     model_threads: int = 1
     max_rss_mib: int | None = None
+    memory_reserve_mib: int = 0
     seed: int = 42
     portfolio: PortfolioSettings = field(default_factory=PortfolioSettings)
     risk: RiskSettings = field(default_factory=RiskSettings)
@@ -449,6 +452,8 @@ class NetAlphaTrainingRequest:
             raise ValueError("model_threads must be positive")
         if self.max_rss_mib is not None and self.max_rss_mib <= 0:
             raise ValueError("max_rss_mib must be positive when supplied")
+        if self.memory_reserve_mib < 0:
+            raise ValueError("memory_reserve_mib must be non-negative")
 
 
 @dataclass(frozen=True, slots=True)

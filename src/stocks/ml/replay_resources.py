@@ -238,3 +238,155 @@ def estimate_replay_allocation(
             f"largest_next={largest_next})"
         ),
     )
+
+
+def read_host_mem_available_bytes() -> int | None:
+    """Host ``MemAvailable`` (system-wide allocatable headroom) or ``None``."""
+    try:
+        with open("/proc/meminfo", "rb") as handle:
+            for line in handle:
+                if line.startswith(b"MemAvailable:"):
+                    kib = int(line.split()[1])
+                    return kib * 1024
+        return None
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceEnvelope:
+    """Typed fail-closed verdict for one training pre-allocation boundary.
+
+    Every finite headroom must still fit ``planned_bytes``: request max RSS
+    minus current process RSS, cgroup limit minus cgroup current minus the
+    concurrent-workload reserve, and ``MemAvailable`` minus that reserve. The
+    reserve is subtracted only from cgroup/system terms; host total RAM never
+    becomes allocatable headroom. ``limiting_source`` names the smallest
+    finite contributor on success and the breached source on failure.
+    """
+
+    ok: bool
+    planned_bytes: int
+    limiting_source: str | None
+    process_headroom_bytes: int | None
+    cgroup_headroom_bytes: int | None
+    system_headroom_bytes: int | None
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "ok": self.ok,
+            "planned_bytes": self.planned_bytes,
+            "limiting_source": self.limiting_source,
+            "process_headroom_bytes": self.process_headroom_bytes,
+            "cgroup_headroom_bytes": self.cgroup_headroom_bytes,
+            "system_headroom_bytes": self.system_headroom_bytes,
+            "reason": self.reason,
+        }
+
+
+def _current_process_rss_bytes() -> int | None:
+    try:
+        with open("/proc/self/status", "rb") as handle:
+            for line in handle:
+                if line.startswith(b"VmRSS:"):
+                    kib = int(line.split()[1])
+                    return kib * 1024
+        return None
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def plan_training_allocation(
+    planned_bytes: int,
+    *,
+    request_limit_bytes: int | None,
+    reserve_bytes: int,
+    current_rss_bytes: int | None = None,
+) -> ResourceEnvelope:
+    """Plan one fitting/calibration allocation against every finite headroom.
+
+    Fails closed before allocation when any finite term cannot fit
+    ``planned_bytes``. Unlimited or unavailable terms are omitted; with no
+    finite term at all the plan is unbounded and succeeds.
+    """
+    planned = int(planned_bytes)
+    if planned < 0:
+        raise ValueError("planned_bytes must be non-negative")
+    reserve = max(0, int(reserve_bytes))
+    rss = (
+        _current_process_rss_bytes()
+        if current_rss_bytes is None
+        else int(current_rss_bytes)
+    )
+    process_limit = (
+        int(request_limit_bytes)
+        if request_limit_bytes is not None and int(request_limit_bytes) > 0
+        else None
+    )
+    process_headroom = (
+        process_limit - rss
+        if process_limit is not None and rss is not None
+        else None
+    )
+    cgroup_limit = read_cgroup_limit_bytes()
+    cgroup_current = read_cgroup_current_bytes()
+    cgroup_headroom = (
+        cgroup_limit - cgroup_current - reserve
+        if cgroup_limit is not None and cgroup_current is not None
+        else None
+    )
+    mem_available = read_host_mem_available_bytes()
+    system_headroom = (
+        mem_available - reserve if mem_available is not None else None
+    )
+    finite = {
+        "request_max_rss": process_headroom,
+        "cgroup": cgroup_headroom,
+        "mem_available": system_headroom,
+    }
+    breaches = [
+        (source, headroom)
+        for source, headroom in finite.items()
+        if headroom is not None and planned > headroom
+    ]
+    if breaches:
+        source, headroom = min(breaches, key=lambda item: item[1])
+        detail = ", ".join(
+            f"{name}={headroom_value}" for name, headroom_value in finite.items() if headroom_value is not None
+        )
+        return ResourceEnvelope(
+            ok=False,
+            planned_bytes=planned,
+            limiting_source=source,
+            process_headroom_bytes=process_headroom,
+            cgroup_headroom_bytes=cgroup_headroom,
+            system_headroom_bytes=system_headroom,
+            reason=(
+                f"planned {planned} bytes exceeds {source} headroom "
+                f"{headroom} bytes ({detail}, reserve={reserve})"
+            ),
+        )
+    bounded = {
+        source: headroom for source, headroom in finite.items() if headroom is not None
+    }
+    if not bounded:
+        return ResourceEnvelope(
+            ok=True,
+            planned_bytes=planned,
+            limiting_source=None,
+            process_headroom_bytes=process_headroom,
+            cgroup_headroom_bytes=cgroup_headroom,
+            system_headroom_bytes=system_headroom,
+            reason="unbounded",
+        )
+    limiting_source, _ = min(bounded.items(), key=lambda item: item[1])
+    return ResourceEnvelope(
+        ok=True,
+        planned_bytes=planned,
+        limiting_source=limiting_source,
+        process_headroom_bytes=process_headroom,
+        cgroup_headroom_bytes=cgroup_headroom,
+        system_headroom_bytes=system_headroom,
+        reason=f"within {limiting_source} headroom",
+    )

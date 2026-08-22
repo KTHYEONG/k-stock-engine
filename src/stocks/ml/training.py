@@ -26,7 +26,7 @@ import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -108,16 +108,30 @@ from src.stocks.ml.models import (
     NetAlphaModelConfig,
 )
 from src.stocks.ml.preparation import (
+    PreparedFold,
     PreparedTrainingMatrix,
     TrainingPanelView,
     prepare_folds,
+    prepare_horizon_labels,
     prepare_training_matrix,
+)
+from src.stocks.ml.replay_resources import (
+    MemoryBudgetExceededError as _EnvelopeBudgetError,
+)
+from src.stocks.ml.replay_resources import (
+    plan_training_allocation as _plan_training_allocation,
 )
 from src.stocks.ml.telemetry import TrainingTelemetry
 from src.stocks.ml.telemetry import (
     current_rss_mib as _current_rss_mib,
 )
+from src.stocks.ml.telemetry import (
+    emit_resource_checkpoint as _emit_resource_checkpoint,
+)
 from src.stocks.ml.telemetry import peak_rss_mib as _peak_rss_mib
+from src.stocks.ml.telemetry import (
+    set_active_telemetry as _set_active_telemetry,
+)
 
 __all__ = ["TrainingTelemetry", "train_net_alpha_model"]
 
@@ -482,6 +496,7 @@ def train_net_alpha_model(
 
     cache = _OofCache(registry.root / ".training")
     try:
+        _set_active_telemetry(telemetry)
         manifest = _select_publish_and_promote(
             registry=registry,
             data=data,
@@ -522,6 +537,7 @@ def train_net_alpha_model(
         )
         return manifest
     finally:
+        _set_active_telemetry(None)
         cache.close()
 
 
@@ -547,9 +563,10 @@ def _select_publish_and_promote(
             pre_holdout, folds, data, request, learner_columns,
             oof_cache=oof_cache,
         )
-    except _MemoryBudgetExceededError as exc:
+    except (_MemoryBudgetExceededError, _EnvelopeBudgetError) as exc:
+        stage = str(getattr(exc, "stage", "") or "fitting_workspace")
         return _publish_no_trade(
-            registry, request, frame, f"memory-budget-exceeded:{exc.stage}",
+            registry, request, frame, f"memory-budget-exceeded:{stage}",
             schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
             telemetry=telemetry,
         )
@@ -1688,6 +1705,30 @@ def _build_horizon_evidence(
     for h, c, k in feasible:
         cells_by_horizon.setdefault(h, []).append((c, k))
 
+    if matrix is None:
+        # One canonical workspace before discovery: OOF fitting and the
+        # calibration seed both reuse it, so no second matrix ever exists.
+        planned_bytes = int(pre_holdout.height) * len(learner_columns) * 4
+        envelope = _plan_training_allocation(
+            planned_bytes,
+            request_limit_bytes=(
+                None
+                if request.max_rss_mib is None
+                else int(request.max_rss_mib) * 1024 * 1024
+            ),
+            reserve_bytes=int(request.memory_reserve_mib) * 1024 * 1024,
+        )
+        _emit_resource_checkpoint(
+            "matrix_prepare", planned_bytes=planned_bytes, envelope=envelope.to_dict()
+        )
+        if not envelope.ok:
+            raise _MemoryBudgetExceededError("matrix_prepare")
+        matrix = prepare_training_matrix(
+            TrainingPanelView(pre_holdout),
+            _on_demand_schema(learner_columns),
+            tuple(folds),
+        )
+
     evidence: list[HorizonOOFEvidence] = []
     diagnostics: list[HorizonOOFDiagnostic] = []
     oof_by_horizon: dict[int, tuple[Path, Path, list[float]]] = {}
@@ -1706,6 +1747,7 @@ def _build_horizon_evidence(
             horizon,
             label_frame.height,
         )
+        _emit_resource_checkpoint(f"horizon_{horizon}_start")
         if label_frame.is_empty() or label_frame.height < 3:
             continue
         if (
@@ -1719,14 +1761,6 @@ def _build_horizon_evidence(
                 "never degrade into an empty block list"
             )
         manifest = _base_manifest(request, data, data.feature_frame, horizon)
-        if matrix is None:
-            # Deferred once-per-run preparation keeps legacy validation order;
-            # the canonical X is then reused by every remaining horizon.
-            matrix = prepare_training_matrix(
-                TrainingPanelView(pre_holdout),
-                _on_demand_schema(learner_columns),
-                tuple(folds),
-            )
         replay_stats: dict[str, int] = {}
         oof, oof_labels, ics, diagnostic, fold_path_count = _fit_oof(
             pre_holdout, folds, data, request, manifest, learner_columns,
@@ -1776,11 +1810,13 @@ def _build_horizon_evidence(
                     coverage.status_counts.partial_tail,
                     coverage.status_counts.unresolved,
                 )
-            initial_train = pre_holdout.filter(
-                pl.col(_SESSION_IDX) < folds[0].validation_decision_start
+            # Session indices are 1-based dense ranks while canonical matrix
+            # codes are 0-based, so the seed window ends one code earlier.
+            initial_rows = np.flatnonzero(
+                matrix.session_code < folds[0].validation_decision_start - 1
             )
             seed_ledger = build_initial_calibration_seed(
-                initial_train, request, learner_columns, horizon, manifest,
+                matrix, initial_rows, request, horizon, manifest,
                 data=data,
             )
             calibrated = _causal_oof_calibrate(
@@ -1793,6 +1829,25 @@ def _build_horizon_evidence(
                 for profile in request.policy_profiles
             ]
             if candidate_specs:
+                replay_planned_bytes = int(
+                    calibrated.estimated_size()
+                ) + int(oof_labels.estimated_size())
+                replay_envelope = _plan_training_allocation(
+                    replay_planned_bytes,
+                    request_limit_bytes=(
+                        None
+                        if request.max_rss_mib is None
+                        else int(request.max_rss_mib) * 1024 * 1024
+                    ),
+                    reserve_bytes=int(request.memory_reserve_mib) * 1024 * 1024,
+                )
+                _emit_resource_checkpoint(
+                    "replay",
+                    planned_bytes=replay_planned_bytes,
+                    envelope=replay_envelope.to_dict(),
+                )
+                if not replay_envelope.ok:
+                    raise _MemoryBudgetExceededError("replay")
                 batch_results = _replay_costs_batch(
                     calibrated, oof_labels, request, horizon,
                     request.risk, pre_holdout, data.manifest, candidate_specs,
@@ -2072,9 +2127,9 @@ def _causal_ledger(oof_labels: pl.DataFrame) -> pl.DataFrame:
 
 
 def build_initial_calibration_seed(
-    train_data: pl.DataFrame,
+    matrix: PreparedTrainingMatrix,
+    initial_train_rows: np.ndarray,
     request: NetAlphaTrainingRequest,
-    learner_columns: tuple[str, ...],
     horizon_sessions: int,
     base_manifest: ModelManifest,
     *,
@@ -2084,30 +2139,74 @@ def build_initial_calibration_seed(
 
     The outer walk-forward plan's first validation session has no prior outer
     OOF history, so a cold-start ledger would keep the first fold in cash.
-    Predicting the initial training slice through nested purged folds yields
-    target-free out-of-sample scores whose realized labels are already revealed
-    at the first outer decision session; feeding them as a seed ledger removes
-    the cold start without any lookahead. Returns an empty frame when the slice
-    cannot form usable inner folds.
+    Scoring the caller-owned canonical matrix rows before that session through
+    nested purged folds yields target-free out-of-sample scores whose realized
+    labels are already revealed at the first outer decision session; feeding
+    them as a seed ledger removes the cold start without any lookahead. The
+    canonical ``PreparedTrainingMatrix`` is consumed through row indices only:
+    no second matrix preparation and no row-level training frame ever exists.
+    Returns an empty frame when the slice cannot form usable inner folds.
     """
-    if train_data.is_empty() or not learner_columns:
+    from src.stocks.ml.fitting import OofFitRequest
+    from src.stocks.ml.fitting import fit_horizon_oof as _fit_horizon_oof
+
+    rows = np.asarray(initial_train_rows, dtype=np.int64)
+    if rows.size == 0:
         return pl.DataFrame()
+    horizon = prepare_horizon_labels(matrix, data, horizon_sessions)
+    left = np.searchsorted(horizon.row_index, rows)
+    left = np.clip(left, 0, max(0, horizon.row_index.size - 1))
+    if not bool((horizon.row_index[left] == rows).any()):
+        return pl.DataFrame()
+
+    codes = matrix.session_code
+    unique_sessions = np.unique(codes[rows])
     splitter = PurgedWalkForward(
         n_folds=_NESTED_INNER_FOLDS,
-        label_horizon_sessions=horizon_sessions,
+        label_horizon_sessions=int(horizon_sessions),
         embargo_sessions=request.embargo_sessions,
         session_column=_SESSION_IDX,
         min_train_sessions=_NESTED_MIN_TRAIN_SESSIONS,
     )
-    inner = splitter.inner_folds(train_data, n_inner=_NESTED_INNER_FOLDS)
-    if not inner:
+    session_frame = pl.DataFrame({_SESSION_IDX: unique_sessions.astype(np.int64)})
+    inner_folds = splitter.inner_folds(session_frame, n_inner=_NESTED_INNER_FOLDS)
+    prepared_inner: list[PreparedFold] = []
+    for index, inner in enumerate(inner_folds):
+        train_sessions = unique_sessions[
+            np.asarray(inner.train_mask, dtype=np.int64)
+        ]
+        validation_sessions = unique_sessions[
+            np.asarray(inner.validation_mask, dtype=np.int64)
+        ]
+        if train_sessions.size == 0 or validation_sessions.size == 0:
+            continue
+        train_rows = np.flatnonzero(np.isin(codes, train_sessions))
+        validation_rows = np.flatnonzero(np.isin(codes, validation_sessions))
+        if train_rows.size == 0 or validation_rows.size == 0:
+            continue
+        # Boundary fields are outer-plan metadata; this inner loop only
+        # consumes the immutable row-index arrays.
+        prepared_inner.append(
+            PreparedFold(
+                fold_index=index,
+                segment_id=index,
+                train_rows=train_rows,
+                validation_rows=validation_rows,
+                train_label_end=0,
+                validation_decision_start=0,
+            )
+        )
+    if not prepared_inner:
         return pl.DataFrame()
-    _scored, seed_labels, _ics, _diagnostic, _path_evaluations = _fit_oof(
-        train_data, inner, data, request, base_manifest, learner_columns,
-        horizon_sessions, None,
-        family="net_alpha_elastic_net",
+    result = _fit_horizon_oof(
+        matrix,
+        horizon,
+        tuple(prepared_inner),
+        OofFitRequest(
+            request=request, manifest=base_manifest, family="net_alpha_elastic_net"
+        ),
     )
-    return seed_labels
+    return result.labeled
 
 
 def _causal_oof_calibrate(
@@ -2127,6 +2226,10 @@ def _causal_oof_calibrate(
     session's calibrated score. An optional inner-purged ``seed_ledger`` from
     the initial training slice is prepended so the first outer validation
     decision already sees a full calibration history instead of a cold start.
+
+    The scored panel is sorted once into contiguous session slices; the five
+    economic columns stream into preallocated Float64 arrays (with an explicit
+    null mask so cash-only states stay true nulls) and attach exactly once.
     """
     ledger_frames = [
         frame
@@ -2135,9 +2238,37 @@ def _causal_oof_calibrate(
     ]
     if not ledger_frames:
         return _zero_calibrated(oof)
-    ledger = _causal_ledger(pl.concat(ledger_frames))
+    # The incremental schedule consumes revealed history in ledger order, so
+    # it must observe ascending availability regardless of caller row order.
+    ledger = _causal_ledger(pl.concat(ledger_frames)).sort(
+        [AVAILABLE_COLUMN, SESSION_COLUMN]
+    )
     if ledger.is_empty() or oof.is_empty():
         return _zero_calibrated(oof)
+
+    economic_columns = (
+        "expected_active_alpha",
+        "alpha_lower_bound",
+        "expected_net_alpha",
+        "net_alpha_lower_bound",
+        "exit_cost_rate",
+    )
+    planned_bytes = len(economic_columns) * int(oof.height) * 8
+    envelope = _plan_training_allocation(
+        planned_bytes,
+        request_limit_bytes=(
+            None
+            if request.max_rss_mib is None
+            else int(request.max_rss_mib) * 1024 * 1024
+        ),
+        reserve_bytes=int(request.memory_reserve_mib) * 1024 * 1024,
+    )
+    _emit_resource_checkpoint(
+        "calibration", planned_bytes=planned_bytes, envelope=envelope.to_dict()
+    )
+    if not envelope.ok:
+        raise _MemoryBudgetExceededError("calibration")
+
     calibrator = _causal_calibrator(request, horizon_sessions)
     schedule = SessionClusterCalibrationSchedule(
         ledger,
@@ -2146,40 +2277,57 @@ def _causal_oof_calibrate(
         block_length=horizon_sessions,
         max_workspace_bytes=_schedule_workspace(request),
     )
-    frames: list[pl.DataFrame] = []
-    by_session = {
-        key[0]: frame
-        for key, frame in oof.partition_by(
-            SESSION_COLUMN, maintain_order=True, as_dict=True
-        ).items()
-    }
-    cal_cols = (
-        "expected_active_alpha",
-        "alpha_lower_bound",
-        "expected_net_alpha",
-        "net_alpha_lower_bound",
-        "exit_cost_rate",
-        "__bucket",
-    )
-    for decision_time in sorted(by_session):
+
+    drop_columns = (*economic_columns, "__bucket")
+    session_physical = oof[SESSION_COLUMN].to_physical().to_numpy()
+    order = np.argsort(session_physical, kind="stable")
+    sorted_sessions = session_physical[order]
+    boundaries = np.flatnonzero(np.diff(sorted_sessions)) + 1
+
+    economic_values = [
+        np.empty(int(oof.height), dtype=np.float64) for _ in economic_columns
+    ]
+    economic_nulls = [
+        np.zeros(int(oof.height), dtype=bool) for _ in economic_columns
+    ]
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    # Chunks are ranges of *sorted* positions; ``order`` maps them back to
+    # caller rows exactly once.
+    sorted_positions = np.arange(int(order.size))
+    for group in np.split(sorted_positions, boundaries):
+        # Contiguous ascending session slices keep schedule.state_at monotone.
+        decision_us = int(sorted_sessions[group[0]])
+        decision_time = epoch + timedelta(microseconds=decision_us)
         state = schedule.state_at(decision_time)
+        rows_here = order[group]
         scored = (
-            by_session[decision_time]
+            oof[rows_here]
             .rename({SCORE_COLUMN: "score"})
-            .drop(*cal_cols, strict=False)
+            .drop(*drop_columns, strict=False)
         )
         augmented = CausalAlphaCalibrator.apply_prepared(state, scored)
-        augmented = augmented.drop("__bucket", strict=False).with_columns(
-            pl.col("expected_active_alpha").cast(pl.Float64),
-            pl.col("alpha_lower_bound").cast(pl.Float64),
-            pl.col("expected_net_alpha").cast(pl.Float64),
-            pl.col("net_alpha_lower_bound").cast(pl.Float64),
-            pl.col("exit_cost_rate").cast(pl.Float64),
-        ).rename({"score": SCORE_COLUMN})
-        frames.append(augmented)
-    if not frames:
-        return _zero_calibrated(oof)
-    return pl.concat(frames)
+        for column_index, column in enumerate(economic_columns):
+            values = augmented[column].cast(pl.Float64)
+            economic_values[column_index][rows_here] = values.to_numpy()
+            economic_nulls[column_index][rows_here] = (
+                ~values.is_not_null().to_numpy()
+            )
+        del scored, augmented
+
+    calibrated_columns: list[object] = []
+    for column_index, column in enumerate(economic_columns):
+        values = pl.Series(column, economic_values[column_index])
+        if economic_nulls[column_index].any():
+            revealed = pl.Series(
+                f"{column}__revealed", ~economic_nulls[column_index]
+            )
+            calibrated_columns.append(
+                pl.when(revealed).then(values).alias(column)
+            )
+        else:
+            calibrated_columns.append(values)
+    del economic_values, economic_nulls
+    return oof.with_columns(calibrated_columns)
 
 
 def _zero_calibrated(scored: pl.DataFrame) -> pl.DataFrame:
