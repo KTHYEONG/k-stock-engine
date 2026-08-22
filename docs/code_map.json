@@ -372,7 +372,8 @@
       "tests/unit/stocks/workflows/test_train_model.py",
       "tests/unit/stocks/ml/test_training.py",
       "tests/unit/stocks/test_observability.py",
-      "tests/unit/stocks/ml/test_economic_truth_recovery.py"
+      "tests/unit/stocks/ml/test_economic_truth_recovery.py",
+      "tests/unit/stocks/ml/test_streaming_execution_replay.py"
     ],
     "architecture": "docs/specs/missing_exit_vintage_completion.md"
   },
