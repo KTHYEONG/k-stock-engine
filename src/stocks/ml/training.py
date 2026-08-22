@@ -1545,9 +1545,14 @@ def _replay_costs_batch(
 
         if batch_replay_requests:
             cadence_requests = batch_replay_requests
+            resource_plan = None
             if request.max_rss_mib is not None:
                 import os
-                available_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+
+                budget_bytes = request.max_rss_mib * 1024 * 1024
+                host_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+                current_bytes = int((_current_rss_mib() or 0.0) * 1024 * 1024)
+                available_bytes = max(0, min(budget_bytes, host_bytes) - current_bytes)
                 segment_bytes = batch.segment_data[next(iter(batch.segment_data))].prepared_market.cache_bytes if batch.segment_data else 0
                 resource_plan = plan_execution_replay_resources(
                     available_bytes=available_bytes,
@@ -1556,7 +1561,7 @@ def _replay_costs_batch(
                 )
                 if resource_plan.max_workers > 0:
                     primary_evidences = tuple(stream_execution_replay_batch(
-                        cadence_requests, resource_plan,
+                        cadence_requests, resource_plan, prepared_batch=batch,
                     ))
                 else:
                     primary_evidences = ()
@@ -1584,14 +1589,21 @@ def _replay_costs_batch(
                 )
                 shadow_indices.append(idx)
 
-        shadow_evidences = (
-            replay_execution_equivalent_batch(
+        if shadow_requests and resource_plan is not None:
+            shadow_evidences = (
+                tuple(stream_execution_replay_batch(
+                    shadow_requests, resource_plan, prepared_batch=batch,
+                ))
+                if resource_plan.max_workers > 0
+                else ()
+            )
+        elif shadow_requests:
+            shadow_evidences = replay_execution_equivalent_batch(
                 shadow_requests, prepared_batch=batch,
                 max_workers=request.model_threads,
             )
-            if shadow_requests
-            else ()
-        )
+        else:
+            shadow_evidences = ()
 
         shadow_map: dict[int, ExecutionReplayEvidence] = dict(
             zip(shadow_indices, shadow_evidences, strict=True)
