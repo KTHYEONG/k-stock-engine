@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "net_alpha_h3_runtime_guard",
+      "date": "2026-08-22",
+      "adr_id": "ADR_20260822_net_alpha_h3_runtime_guard",
+      "domain": "ml",
+      "title": "H3 frontier and replay RSS guard",
+      "why": "H3 runs were blocked by CLI frontier defaults and long executions could lose their child process before publishing ML or backtest evidence.",
+      "resolution": "Wired cadence/top-K grids through snapshot and direct training requests, enforced feasibility, reused prepared replay batches, and bounded budgeted replay by remaining process RSS so resource exhaustion fails closed.",
+      "impact": "H3 requests now reach the intended 12-cell frontier and replay no longer duplicates prepared batches; all focused tests and lean checks pass. Full production artifact remains environment-dependent when the terminal child disappears without output."
+    },
+    {
       "task_id": "net_alpha_runtime_recovery",
       "date": "2026-08-21",
       "adr_id": "ADR_20260821_net_alpha_runtime_recovery",
