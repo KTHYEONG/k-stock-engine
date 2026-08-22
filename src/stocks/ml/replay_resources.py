@@ -14,7 +14,7 @@ cannot hold.
 from __future__ import annotations
 
 import resource
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -390,3 +390,159 @@ def plan_training_allocation(
         system_headroom_bytes=system_headroom,
         reason=f"within {limiting_source} headroom",
     )
+
+
+class TrainingRunDeniedError(MemoryBudgetExceededError):
+    """Typed terminal denial for one guarded training-run boundary."""
+
+    def __init__(
+        self, message: str, *, planned_bytes: int, limit_bytes: int, stage: str
+    ) -> None:
+        super().__init__(message, planned_bytes=planned_bytes, limit_bytes=limit_bytes)
+        self.stage = stage
+
+
+@dataclass(frozen=True, slots=True)
+class GuardBoundaryRecord:
+    """Sampled scalars for one guarded training-run boundary."""
+
+    stage: str
+    current_rss_bytes: int | None
+    cgroup_current_bytes: int | None
+    mem_available_bytes: int | None
+    live_owners: tuple[str, ...]
+    planned_bytes: int
+    verdict: str
+    reason: str = ""
+
+    def payload(self) -> dict[str, object]:
+        """Bounded scalar diagnostic payload for one boundary."""
+        return {
+            "stage": self.stage,
+            "current_rss_bytes": self.current_rss_bytes,
+            "cgroup_current_bytes": self.cgroup_current_bytes,
+            "mem_available_bytes": self.mem_available_bytes,
+            "live_owners": ",".join(self.live_owners)[:512],
+            "live_owner_count": len(self.live_owners),
+            "planned_bytes": self.planned_bytes,
+            "verdict": self.verdict,
+            "reason": self.reason[:512],
+        }
+
+
+_BOUNDARY_HEADROOM_FIELDS = {
+    "request_max_rss": "process_headroom_bytes",
+    "cgroup": "cgroup_headroom_bytes",
+    "mem_available": "system_headroom_bytes",
+}
+
+
+def _emit_boundary_checkpoint(
+    sink: Any, run_id: str, record: GuardBoundaryRecord
+) -> None:
+    """Emit one bounded scalar boundary checkpoint (best-effort telemetry)."""
+    from src.stocks.observability.contracts import (
+        DiagnosticCategory,
+        DiagnosticEvent,
+        DiagnosticStage,
+        DiagnosticStatus,
+    )
+
+    sequence = int(getattr(sink, "_diagnostic_sequence", 0)) + 1
+    sink._diagnostic_sequence = sequence
+    try:
+        sink.emit(
+            DiagnosticEvent(
+                run_id=run_id,
+                sequence=sequence,
+                category=DiagnosticCategory.SYS,
+                component="ml.replay_resources",
+                stage=DiagnosticStage.ALLOCATION,
+                event="training_run_boundary",
+                status=(
+                    DiagnosticStatus.PASS
+                    if record.verdict == "ok"
+                    else DiagnosticStatus.FAIL
+                ),
+                payload=dict(record.payload()),
+            )
+        )
+    except (OSError, ValueError):
+        return
+
+
+class TrainingRunGuard:
+    """Samples RSS/cgroup/MemAvailable at each training materialization boundary.
+
+    Every boundary records the sampled current RSS, cgroup current,
+    ``MemAvailable``, live owner names, planned bytes, and the verdict as one
+    scalar diagnostic event. A predicted breach raises
+    :class:`TrainingRunDeniedError` before any allocation happens so the outer
+    CLI can publish a durable terminal failure instead of dying mid-run.
+    """
+
+    def __init__(
+        self,
+        *,
+        request_limit_bytes: int | None = None,
+        reserve_bytes: int = 0,
+        run_id: str = "training-run",
+        diagnostics: Any | None = None,
+    ) -> None:
+        self._request_limit_bytes = (
+            int(request_limit_bytes)
+            if request_limit_bytes is not None and int(request_limit_bytes) > 0
+            else None
+        )
+        self._reserve_bytes = max(0, int(reserve_bytes))
+        self._run_id = run_id or "training-run"
+        self._diagnostics = diagnostics
+        self.records: list[GuardBoundaryRecord] = []
+
+    @property
+    def denied(self) -> bool:
+        """Whether any recorded boundary breached its finite headroom."""
+        return any(record.verdict == "denied" for record in self.records)
+
+    def boundary(
+        self,
+        stage: str,
+        *,
+        planned_bytes: int,
+        live_owners: Sequence[str] = (),
+    ) -> ResourceEnvelope:
+        """Sample one boundary, record it, and fail closed on a breach."""
+        rss = _current_process_rss_bytes()
+        cgroup_current = read_cgroup_current_bytes()
+        mem_available = read_host_mem_available_bytes()
+        envelope = plan_training_allocation(
+            planned_bytes,
+            request_limit_bytes=self._request_limit_bytes,
+            reserve_bytes=self._reserve_bytes,
+            current_rss_bytes=rss,
+        )
+        record = GuardBoundaryRecord(
+            stage=stage,
+            current_rss_bytes=rss,
+            cgroup_current_bytes=cgroup_current,
+            mem_available_bytes=mem_available,
+            live_owners=tuple(live_owners),
+            planned_bytes=int(envelope.planned_bytes),
+            verdict="ok" if envelope.ok else "denied",
+            reason=envelope.reason,
+        )
+        self.records.append(record)
+        if self._diagnostics is not None:
+            _emit_boundary_checkpoint(self._diagnostics, self._run_id, record)
+        if not envelope.ok:
+            headroom_field = _BOUNDARY_HEADROOM_FIELDS.get(
+                envelope.limiting_source or "", ""
+            )
+            breached = getattr(envelope, headroom_field, None) if headroom_field else None
+            raise TrainingRunDeniedError(
+                f"training run guard denied {stage}: {envelope.reason}",
+                planned_bytes=envelope.planned_bytes,
+                limit_bytes=int(breached) if breached is not None else 0,
+                stage=stage,
+            )
+        return envelope
