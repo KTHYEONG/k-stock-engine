@@ -139,8 +139,8 @@ exclude = [
 [tool.uv]
 # Keep uv's transient cache inside the workspace.  Some managed runners mount
 # /home/kth/.cache read-only, which otherwise makes every `uv run` fail before
-# Python starts.
-cache-dir = "scratch/uv-cache"
+# Python starts.  Volatile tooling data belongs in tmp/, never scratch/.
+cache-dir = "tmp/uv-cache"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

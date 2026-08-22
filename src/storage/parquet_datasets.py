@@ -371,6 +371,50 @@ class ParquetDatasetStore:
         sort_columns = key_columns or columns[:1]
         return frame.sort(sort_columns)
 
+    def scan_bounded(
+        self,
+        dataset_id: str,
+        expected_asset_kind: AssetKind,
+        expected_feature_set: str,
+        decision_time: datetime,
+        *,
+        session_start: date,
+        session_end: date,
+        columns: list[str],
+    ) -> pl.LazyFrame:
+        """Lazily read bounded partitions/columns without collecting.
+
+        Validation and partition selection match :meth:`read_bounded`, but the
+        lazy plan is returned uncollected so callers can push further
+        predicates (for example a label horizon filter) down before one
+        collect. The result equals ``read_bounded(...)`` followed by the same
+        caller-side predicates.
+        """
+        dataset_dir, manifest, content = self._load_verified_layout(dataset_id)
+        validate_dataset_manifest(
+            manifest, expected_asset_kind, expected_feature_set, decision_time
+        )
+        column_order = _content_column_order(content)
+        missing = [c for c in columns if c not in column_order]
+        if missing:
+            raise ValueError(
+                f"bounded read requests columns absent from dataset {dataset_id}: {missing}"
+            )
+        entries = _select_entries(content, session_start, session_end)
+        if not entries:
+            return pl.DataFrame({column: [] for column in columns}).lazy()
+        self._verify_entries(dataset_dir, entries, manifest.content_hash)
+
+        paths = [dataset_dir / str(entry["path"]) for entry in entries]
+        return (
+            pl.scan_parquet(paths)
+            .filter(
+                (pl.col("session") >= datetime.combine(session_start, datetime.min.time(), UTC))
+                & (pl.col("session") <= datetime.combine(session_end, datetime.min.time(), UTC))
+            )
+            .select(columns)
+        )
+
     def _load_verified_layout(
         self, dataset_id: str
     ) -> tuple[Path, DatasetManifest, dict[str, object]]:

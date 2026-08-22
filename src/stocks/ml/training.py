@@ -331,6 +331,7 @@ def train_net_alpha_model(
     discovery_context = type("DiscoveryContext", (), {
         "pre_holdout": None, "folds": None, "data": data,
         "request": request, "learner_columns": (), "oof_cache": None,
+        "registry": registry,
     })()
     emit_checkpoint(
         diagnostics,
@@ -494,7 +495,9 @@ def train_net_alpha_model(
         )
 
 
-    cache = _OofCache(registry.root / ".training")
+    # One run-scoped tmp/training TemporaryDirectory owns all OOF spill files
+    # and is removed on normal close; the registry root stays publish-only.
+    cache = _OofCache(_default_oof_cache_base())
     try:
         _set_active_telemetry(telemetry)
         manifest = _select_publish_and_promote(
@@ -562,6 +565,7 @@ def _select_publish_and_promote(
         discovery = _build_horizon_evidence(
             pre_holdout, folds, data, request, learner_columns,
             oof_cache=oof_cache,
+            registry=registry,
         )
     except (_MemoryBudgetExceededError, _EnvelopeBudgetError) as exc:
         stage = str(getattr(exc, "stage", "") or "fitting_workspace")
@@ -721,6 +725,7 @@ def _select_publish_and_promote(
             primary, profile, selection,
             baseline_oof, baseline_labels, baseline_ics, baseline_diag,
             rankability_reason,
+            registry=registry,
         )
     )
     telemetry.phase(
@@ -754,6 +759,7 @@ def _select_publish_and_promote(
         else _causal_oof_calibrate(oof, oof_labels, request, primary)
     )
     replay = _replay_costs(
+        registry,
         calibrated, oof_labels, request, primary, risk, pre_holdout, data.manifest,
         profile,
         rebalance_frequency_sessions=selection.primary_rebalance_frequency_sessions,
@@ -799,6 +805,7 @@ def _select_publish_and_promote(
         final_model, calibration, holdout_panel, request, primary, profile,
         rebalance_frequency_sessions=selection.primary_rebalance_frequency_sessions,
         top_k=selection.primary_top_k,
+        registry=registry,
     )
     holdout_order_count = holdout_evidence.get("order_count", 0)
     holdout_block_count = holdout_evidence.get("block_count", 0)
@@ -1171,6 +1178,7 @@ def _risk_policy_for_profile(
 
 
 def _execution_replay_context(
+    registry: ModelArtifactRegistry,
     request: NetAlphaTrainingRequest,
     manifest: DatasetManifest,
     market_frame: pl.DataFrame,
@@ -1181,11 +1189,14 @@ def _execution_replay_context(
     rebalance_frequency_sessions: int,
     top_k: int,
 ) -> ExecutionReplayContext:
-    """Immutable execution-equivalent context for one candidate replay."""
+    """Immutable execution-equivalent context for one candidate replay.
+
+    registry=registry instead of ModelArtifactRegistry(Path('mem://execution-replay')).
+    """
     instruments = instruments_from_frame(market_frame)
     sessions = sorted(market_frame["session"].unique().to_list())
     return ExecutionReplayContext(
-        registry=ModelArtifactRegistry(Path("mem://execution-replay")),
+        registry=registry,
         manifest=manifest,
         instruments=instruments,
         artifact_id=request.artifact_id,
@@ -1211,7 +1222,20 @@ def _execution_replay_context(
     )
 
 
+def _require_caller_registry(
+    registry: ModelArtifactRegistry | None,
+) -> ModelArtifactRegistry:
+    """Fail closed unless the caller owns a real artifact registry root."""
+    if registry is None:
+        raise ValueError(
+            "a caller-owned ModelArtifactRegistry is required for replay "
+            "contexts; repository-relative mem: roots are never created"
+        )
+    return registry
+
+
 def _replay_costs(
+    registry: ModelArtifactRegistry,
     calibrated: pl.DataFrame,
     oof_labels: pl.DataFrame,
     request: NetAlphaTrainingRequest,
@@ -1270,6 +1294,7 @@ def _replay_costs(
         else:
             decision_sessions_by_segment[segment] = sorted_sessions
     context = _execution_replay_context(
+        registry,
         request, manifest, market_frame, profile,
         seed=request.seed + horizon_sessions,
         horizon_sessions=horizon_sessions,
@@ -1295,6 +1320,7 @@ def _replay_costs(
         sizing_mode="alpha_vol_squared_v1",
     )
     shadow_context = _execution_replay_context(
+        registry,
         request, manifest, market_frame, dense_profile,
         seed=request.seed + horizon_sessions + 7,
         horizon_sessions=horizon_sessions,
@@ -1314,6 +1340,7 @@ def _replay_costs(
 
 
 def _replay_costs_batch(
+    registry: ModelArtifactRegistry,
     calibrated: pl.DataFrame,
     oof_labels: pl.DataFrame,
     request: NetAlphaTrainingRequest,
@@ -1380,6 +1407,7 @@ def _replay_costs_batch(
         first_profile = group[0][1]
         first_top_k = group[0][0]
         primary_context = _execution_replay_context(
+            registry,
             request, manifest, market_frame, first_profile,
             seed=request.seed + horizon_sessions,
             horizon_sessions=horizon_sessions,
@@ -1401,6 +1429,7 @@ def _replay_costs_batch(
         shadow_requests_list: list[ExecutionEquivalentReplayRequest] = []
         for top_k, profile in group:
             context = _execution_replay_context(
+                registry,
                 request, manifest, market_frame, profile,
                 seed=request.seed + horizon_sessions,
                 horizon_sessions=horizon_sessions,
@@ -1427,6 +1456,7 @@ def _replay_costs_batch(
                     sizing_mode="alpha_vol_squared_v1",
                 )
                 shadow_context = _execution_replay_context(
+                    registry,
                     request, manifest, market_frame, dense_profile,
                     seed=request.seed + horizon_sessions + 7,
                     horizon_sessions=horizon_sessions,
@@ -1653,6 +1683,7 @@ def _build_horizon_evidence(
     *,
     oof_cache: _OofCache | None = None,
     matrix: PreparedTrainingMatrix | None = None,
+    registry: ModelArtifactRegistry | None = None,
 ) -> HorizonDiscovery:
     """Build the two-profile ``(horizon, profile)`` OOF frontier.
 
@@ -1849,7 +1880,8 @@ def _build_horizon_evidence(
                 if not replay_envelope.ok:
                     raise _MemoryBudgetExceededError("replay")
                 batch_results = _replay_costs_batch(
-                    calibrated, oof_labels, request, horizon,
+                    _require_caller_registry(registry), calibrated, oof_labels,
+                    request, horizon,
                     request.risk, pre_holdout, data.manifest, candidate_specs,
                     stats_out=replay_stats,
                 )
@@ -2645,6 +2677,8 @@ def _adopt_model_family(
     baseline_ics: list[float],
     baseline_diag: HorizonOOFDiagnostic,
     rankability_reason: str,
+    *,
+    registry: ModelArtifactRegistry | None = None,
 ) -> tuple[str, str, pl.DataFrame, pl.DataFrame, list[float], HorizonOOFDiagnostic]:
     """Conditionally adopt the LightGBM challenger on the selected primary.
 
@@ -2684,6 +2718,7 @@ def _adopt_model_family(
     risk = replace(request.risk, no_trade_band_bps=profile.no_trade_band_bps)
     try:
         challenger_replay = _replay_costs(
+            _require_caller_registry(registry),
             challenger_calibrated, challenger_labels, request,
             primary_horizon_sessions, risk, pre_holdout, data.manifest, profile,
             rebalance_frequency_sessions=selection.primary_rebalance_frequency_sessions,
@@ -2850,6 +2885,7 @@ def _evaluate_forward_holdout(
     *,
     rebalance_frequency_sessions: int,
     top_k: int,
+    registry: ModelArtifactRegistry | None = None,
 ) -> dict[str, object]:
     """Certify the untouched forward holdout on true base/stress equity.
 
@@ -2871,6 +2907,7 @@ def _evaluate_forward_holdout(
     risk = replace(request.risk, no_trade_band_bps=profile.no_trade_band_bps)
     try:
         replay = _replay_costs(
+            _require_caller_registry(registry),
             calibrated, calibrated, request, horizon_sessions, risk,
             holdout_panel, _holdout_stub_manifest(request, holdout_panel),
             profile,
