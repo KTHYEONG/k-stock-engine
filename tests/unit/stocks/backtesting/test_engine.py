@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import contextlib
+import tempfile
+from pathlib import Path
 
 from datetime import UTC, datetime
 
@@ -63,7 +65,7 @@ def test_backtest_result_preserves_data_quality_evidence() -> None:
 def _paired_inputs():
     df = stock_instrument_df(n_sessions=80, n_tickers=3, horizon=5)
     manifest = stock_manifest(columns=df.columns, horizon=5)
-    registry = ModelArtifactRegistry("mem://paired")
+    registry = ModelArtifactRegistry(Path(tempfile.mkdtemp(prefix="paired-")))
     snapshot = DatasetSnapshot(manifest=manifest, frame=df)
     instruments = {
         i: Instrument(i, AssetKind.STOCK, "KRX", i.split(":")[-1], "KRW", lot_size=1)
@@ -787,7 +789,7 @@ def test_backtest_branch_01_branch_selection_before_partition_by(
     )
 
     # 1) All scheduled artifacts are no_trade: zero partition_by.
-    no_trade_registry = ModelArtifactRegistry("mem://no-trade")
+    no_trade_registry = ModelArtifactRegistry(Path(tempfile.mkdtemp(prefix="no-trade-")))
     _publish_no_trade_artifact(no_trade_registry, "a001")
     backtester = StockBacktester(
         registry=no_trade_registry,

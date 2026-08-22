@@ -7,6 +7,7 @@ parity through the shared ``resolve_fill_cost`` helper.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import tempfile
 
 import polars as pl
 
@@ -397,7 +398,7 @@ def test_replay_economic_parity_01_streaming_matches_batch_reference() -> None:
     )
     request = NetAlphaTrainingRequest(artifact_id="parity", candidate_horizon_sessions=(10,))
     context = ExecutionReplayContext(
-        registry=ModelArtifactRegistry(Path("mem://parity")),
+        registry=ModelArtifactRegistry(Path(tempfile.mkdtemp(prefix="parity-"))),
         manifest=manifest,
         instruments=instruments_from_frame(market),
         artifact_id="parity",
