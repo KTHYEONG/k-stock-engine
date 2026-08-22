@@ -186,3 +186,92 @@ class TestResourcePlan:
         )
         assert plan.max_workers == 0
         assert plan.max_prepared_segments == 0
+
+
+REPLAY_STREAM_01 = "REPLAY-STREAM-01"
+
+
+class TestReplayStream01:
+    """REPLAY-STREAM-01: segment-major streaming contract."""
+
+    def test_stream_builds_each_segment_once_with_single_live_segment(self) -> None:
+        from pathlib import Path
+
+        from src.core.costs import default_base_schedule, default_stress_schedule
+        from src.core.instruments import Instrument
+        from src.core.portfolio import PortfolioSnapshot
+        from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
+        from src.stocks.backtesting.market import PreparedReplayMarket
+        from src.stocks.ml.execution_replay import ExecutionReplayContext
+        from src.stocks.research.artifacts import ModelArtifactRegistry
+        from src.stocks.trading.portfolio_constructor import StockRiskPolicy
+
+        market, scores, segments, manifest = _make_fixture()
+        request = NetAlphaTrainingRequest(
+            artifact_id="stream01", candidate_horizon_sessions=(10,)
+        )
+        instruments = {
+            i: Instrument(i, AssetKind.STOCK, "KRX", i.split(":")[-1], "KRW", lot_size=1)
+            for i in sorted(market["instrument_id"].unique().to_list())
+        }
+        context = ExecutionReplayContext(
+            registry=ModelArtifactRegistry(Path("mem://stream01")),
+            manifest=manifest,
+            instruments=instruments,
+            artifact_id="stream01",
+            strategy_id="stream01",
+            initial_portfolio=PortfolioSnapshot(
+                account_snapshot_id="oof",
+                as_of=min(segments[0]),
+                settled_cash=request.portfolio.initial_cash,
+                unsettled_cash=0.0,
+                positions=(),
+            ),
+            risk_policy=StockRiskPolicy(
+                top_k=3, gross_cap=0.9, single_name_cap=0.3, sector_cap=0.5,
+                participation_limit=0.01, no_trade_band_bps=0.0,
+            ),
+            base_cost_schedule=default_base_schedule(),
+            stress_cost_schedule=default_stress_schedule(),
+            liquidity_model=None,
+            stress_liquidity_model=None,
+            execution_policy=SCHEDULED_OPEN_V1,
+            seed=42,
+        )
+        replay_request = ExecutionEquivalentReplayRequest(
+            context=context,
+            market_frame=market,
+            score_frame=scores,
+            segment_column="oof_segment_id",
+            decision_sessions_by_segment={s: tuple(v) for s, v in segments.items()},
+            horizon_sessions=10,
+        )
+
+        PreparedReplayMarket.reset_build_call_count()
+        stats: dict[str, int] = {}
+        streamed = stream_execution_replay_batch((replay_request,), stats=stats)
+
+        assert stats["prepared_segment_build_count"] == len(segments)
+        assert stats["prepared_segment_build_count"] == (
+            PreparedReplayMarket.build_call_count
+        )
+        assert stats["peak_live_prepared_segments"] == 1
+        assert stats["prepared_cache_bytes"] > 0
+        assert stats["replay_prepare_elapsed_ms"] >= 0
+        assert stats["replay_execute_elapsed_ms"] >= 0
+
+        # Candidate order is exact and compact evidence equals the reference.
+        batch = prepare_execution_replay_batch(replay_request)
+        reference = replay_execution_equivalent_batch(
+            (replay_request,), prepared_batch=batch
+        )[0]
+        assert len(streamed) == 1
+        streamed_ev = streamed[0]
+        assert streamed_ev.segment_ids == reference.segment_ids
+        assert streamed_ev.base_log_growth == pytest.approx(
+            reference.base_log_growth, abs=1e-12
+        )
+        assert streamed_ev.stress_log_growth == pytest.approx(
+            reference.stress_log_growth, abs=1e-12
+        )
+        assert streamed_ev.planned_cycles == reference.planned_cycles

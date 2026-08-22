@@ -310,3 +310,171 @@ def test_simulator_missing_volatility_is_unfilled(tmp_path) -> None:
     reasons = [t.get("reason") for t in result.trades]
     assert "missing-liquidity-input" in reasons
     assert all(t.get("quantity", 0) == 0 for t in result.trades)
+
+
+REPLAY_ECONOMIC_PARITY_01 = "REPLAY-ECONOMIC-PARITY-01"
+
+
+def test_replay_economic_parity_01_streaming_matches_batch_reference() -> None:
+    """REPLAY-ECONOMIC-PARITY-01: segment-major streaming parity.
+
+    Base/stress returns, fills, costs evidence, settlement-driven equity, and
+    candidate ordering are exact (or within 1e-12) between the streaming path
+    and the prepared-batch reference across multiple candidates.
+    """
+    from datetime import UTC, datetime
+    from pathlib import Path
+
+    import polars as pl
+    import pytest
+
+    from src.core.costs import default_base_schedule, default_stress_schedule
+    from src.core.datasets import DatasetManifest
+    from src.core.instruments import AssetKind
+    from src.core.portfolio import PortfolioSnapshot
+    from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
+    from src.stocks.ml.contracts import NetAlphaTrainingRequest
+    from src.stocks.ml.execution_replay import (
+        ExecutionEquivalentReplayRequest,
+        ExecutionReplayContext,
+        instruments_from_frame,
+        prepare_execution_replay_batch,
+        replay_execution_equivalent_batch,
+        stream_execution_replay_batch,
+    )
+    from src.stocks.research.artifacts import ModelArtifactRegistry
+    from src.stocks.trading.portfolio_constructor import StockRiskPolicy
+    from tests.fixtures.stocks.helpers import stock_liquidity_model
+
+    market_rows: list[dict[str, object]] = []
+    score_rows: list[dict[str, object]] = []
+    segments: dict[int, list[datetime]] = {}
+    for seg in range(2):
+        for idx in range(8):
+            session = datetime(2024, 1, 1 + seg * 12 + idx, tzinfo=UTC)
+            segments.setdefault(seg, []).append(session)
+            for t in range(3):
+                price = 100.0 + t + idx * 0.25
+                market_rows.append(
+                    {
+                        "instrument_id": f"KRX:{t + 1:05d}",
+                        "session": session,
+                        "observation_time": session.replace(hour=15, minute=30),
+                        "available_time": session.replace(hour=15, minute=31),
+                        "open": price,
+                        "close": price * 1.01,
+                        "volume": 1e6,
+                        "trading_value": price * 1e6,
+                        "sector": f"S{t % 2}",
+                    }
+                )
+                score = 0.012 - t * 0.002 + idx * 1e-5
+                score_rows.append(
+                    {
+                        "instrument_id": f"KRX:{t + 1:05d}",
+                        "session": session,
+                        "oof_segment_id": seg,
+                        "predicted_net_alpha": score,
+                        "expected_active_alpha": score,
+                        "alpha_lower_bound": score * 0.5,
+                        "expected_net_alpha": score * 0.8,
+                        "net_alpha_lower_bound": score * 0.3,
+                        "exit_cost_rate": 0.0012,
+                    }
+                )
+    market = pl.DataFrame(market_rows)
+    scores = pl.DataFrame(score_rows)
+    manifest = DatasetManifest(
+        asset_kind=AssetKind.STOCK, schema_version="v1", schema_hash="h",
+        provider_version="p", universe_policy_version="u",
+        universe_policy_hash="u", feature_set="stock_net_alpha_v1",
+        feature_set_hash="f", label_definition="net_alpha_o2o",
+        label_horizon_sessions=5,
+        time_start=datetime(2024, 1, 1, tzinfo=UTC),
+        time_end=datetime(2024, 2, 6, tzinfo=UTC),
+        generated_time=datetime(2024, 2, 6, tzinfo=UTC),
+        row_count=market.height,
+    )
+    request = NetAlphaTrainingRequest(artifact_id="parity", candidate_horizon_sessions=(10,))
+    context = ExecutionReplayContext(
+        registry=ModelArtifactRegistry(Path("mem://parity")),
+        manifest=manifest,
+        instruments=instruments_from_frame(market),
+        artifact_id="parity",
+        strategy_id="parity",
+        initial_portfolio=PortfolioSnapshot(
+            account_snapshot_id="oof",
+            as_of=min(segments[0]),
+            settled_cash=request.portfolio.initial_cash,
+            unsettled_cash=0.0,
+            positions=(),
+        ),
+        risk_policy=StockRiskPolicy(
+            top_k=3, gross_cap=0.9, single_name_cap=0.3, sector_cap=0.5,
+            participation_limit=0.01, no_trade_band_bps=0.0,
+        ),
+        base_cost_schedule=default_base_schedule(),
+        stress_cost_schedule=default_stress_schedule(),
+        liquidity_model=stock_liquidity_model(),
+        stress_liquidity_model=stock_liquidity_model(stress_multiplier=1.5),
+        execution_policy=SCHEDULED_OPEN_V1,
+        seed=42,
+    )
+
+    def _req(seed_offset: int) -> ExecutionEquivalentReplayRequest:
+        ctx = context if seed_offset == 0 else ExecutionReplayContext(
+            registry=context.registry,
+            manifest=context.manifest,
+            instruments=context.instruments,
+            artifact_id=context.artifact_id,
+            strategy_id=context.strategy_id,
+            initial_portfolio=context.initial_portfolio,
+            risk_policy=context.risk_policy,
+            base_cost_schedule=context.base_cost_schedule,
+            stress_cost_schedule=context.stress_cost_schedule,
+            liquidity_model=context.liquidity_model,
+            stress_liquidity_model=context.stress_liquidity_model,
+            execution_policy=context.execution_policy,
+            seed=context.seed + seed_offset,
+        )
+        return ExecutionEquivalentReplayRequest(
+            context=ctx,
+            market_frame=market,
+            score_frame=scores,
+            segment_column="oof_segment_id",
+            decision_sessions_by_segment={s: tuple(v) for s, v in segments.items()},
+            horizon_sessions=10,
+        )
+
+    requests = [_req(0), _req(1), _req(2)]
+    batch = prepare_execution_replay_batch(requests[0])
+    reference = replay_execution_equivalent_batch(requests, prepared_batch=batch)
+    stats: dict[str, int] = {}
+    streamed = stream_execution_replay_batch(tuple(requests), stats=stats)
+
+    assert [ev.segment_ids for ev in streamed] == [
+        ev.segment_ids for ev in reference
+    ]
+    for streamed_ev, reference_ev in zip(streamed, reference, strict=True):
+        assert streamed_ev.base_log_growth == pytest.approx(
+            reference_ev.base_log_growth, abs=1e-12
+        )
+        assert streamed_ev.stress_log_growth == pytest.approx(
+            reference_ev.stress_log_growth, abs=1e-12
+        )
+        assert streamed_ev.planned_cycles == reference_ev.planned_cycles
+        assert streamed_ev.filled_orders == reference_ev.filled_orders
+        assert streamed_ev.turnover == pytest.approx(reference_ev.turnover, abs=1e-12)
+        assert streamed_ev.cash_session_fraction == pytest.approx(
+            reference_ev.cash_session_fraction, abs=1e-12
+        )
+        assert streamed_ev.invested_interval_count == (
+            reference_ev.invested_interval_count
+        )
+        assert streamed_ev.filled_cycle_count == reference_ev.filled_cycle_count
+        assert streamed_ev.unfilled_order_reason_counts == (
+            reference_ev.unfilled_order_reason_counts
+        )
+        assert streamed_ev.base_interval_exposure == pytest.approx(
+            reference_ev.base_interval_exposure, abs=1e-12
+        )

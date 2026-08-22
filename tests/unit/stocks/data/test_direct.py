@@ -134,9 +134,9 @@ def test_direct_h10_without_catalog(tmp_path: Path) -> None:
     feature_store = ParquetDatasetStore(feature_root)
     label_store = ParquetDatasetStore(label_root)
 
-    _write_dataset(base_store, "base_2024", _base_frame())
+    _write_dataset(base_store, "base_2024", _base_frame(), feature_set="base_panel")
     _write_dataset(feature_store, "features_2024", _feature_frame())
-    _write_dataset(label_store, "labels_2024", _label_frame())
+    _write_dataset(label_store, "labels_2024", _label_frame(), feature_set="labels")
 
     loader = DirectMarketDataLoader(
         base_root=base_root,
@@ -180,9 +180,9 @@ def test_horizon_and_key_validation(tmp_path: Path) -> None:
     # Test duplicate keys
     base_frame = _base_frame()
     duplicate_base = pl.concat([base_frame, base_frame.head(1)])
-    _write_dataset(base_store, "base_dup", duplicate_base)
+    _write_dataset(base_store, "base_dup", duplicate_base, feature_set="base_panel")
     _write_dataset(feature_store, "features_dup", _feature_frame())
-    _write_dataset(label_store, "labels_dup", _label_frame())
+    _write_dataset(label_store, "labels_dup", _label_frame(), feature_set="labels")
 
     loader = DirectMarketDataLoader(
         base_root=base_root,
@@ -280,18 +280,14 @@ def test_direct_loader_rejects_non_monotonic_sessions() -> None:
     })
 
     # Test validation directly
+    from src.stocks.data.direct import _validate_direct_frame
+
     with pytest.raises(ValueError, match="non-monotonic"):
-        loader._validate_monotonic_sessions(base_frame)
+        _validate_direct_frame(base_frame, ())
 
 
 def test_direct_loader_rejects_non_finite_features() -> None:
     """Direct loader rejects non-finite numeric feature values."""
-    loader = DirectMarketDataLoader(
-        base_root=Path("/nonexistent"),
-        feature_root=Path("/nonexistent"),
-        label_root=Path("/nonexistent"),
-    )
-
     # Create frame with non-finite feature values
     frame = pl.DataFrame({
         "instrument_id": ["KRX:00001", "KRX:00001"],
@@ -303,8 +299,13 @@ def test_direct_loader_rejects_non_finite_features() -> None:
         "feature__volatility_20d": [0.02, float("nan")],
     })
 
+    from src.stocks.data.direct import _validate_direct_frame
+
     with pytest.raises(ValueError, match="non-finite"):
-        loader._validate_numeric_finiteness(frame)
+        _validate_direct_frame(
+            frame,
+            ("feature__momentum_5d", "feature__volatility_20d"),
+        )
 
 
 def test_direct_loader_rejects_zero_usable_labels(tmp_path: Path) -> None:
@@ -324,9 +325,9 @@ def test_direct_loader_rejects_zero_usable_labels(tmp_path: Path) -> None:
     label_frame = _label_frame().with_columns(
         pl.lit(None, dtype=pl.Float64).alias("horizon_10_target")
     )
-    _write_dataset(base_store, "base_no_labels", _base_frame())
+    _write_dataset(base_store, "base_no_labels", _base_frame(), feature_set="base_panel")
     _write_dataset(feature_store, "features_no_labels", _feature_frame())
-    _write_dataset(label_store, "labels_no_labels", label_frame)
+    _write_dataset(label_store, "labels_no_labels", label_frame, feature_set="labels")
 
     loader = DirectMarketDataLoader(
         base_root=base_root,
@@ -366,9 +367,9 @@ def test_schema_parity_v6(tmp_path: Path) -> None:
     feature_store = ParquetDatasetStore(feature_root)
     label_store = ParquetDatasetStore(label_root)
 
-    _write_dataset(base_store, "base_2024", _base_frame())
+    _write_dataset(base_store, "base_2024", _base_frame(), feature_set="base_panel")
     _write_dataset(feature_store, "features_2024", _feature_frame())
-    _write_dataset(label_store, "labels_2024", _label_frame())
+    _write_dataset(label_store, "labels_2024", _label_frame(), feature_set="labels")
 
     loader = DirectMarketDataLoader(
         base_root=base_root,
@@ -461,3 +462,265 @@ def test_v6_simulation_rejects_divergent_feature_content_hash(tmp_path: Path) ->
     )
     with pytest.raises(ValueError, match="v6 independent replay input lineage mismatch"):
         simulate_portfolio(snapshot, registry, request)
+
+
+DIRECT_PUSHDOWN_01 = "DIRECT-PUSHDOWN-01"
+
+
+def test_direct_pushdown_01_only_intersecting_partitions_scanned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DIRECT-PUSHDOWN-01: bounded scans touch only intersecting partitions.
+
+    Only partitions intersecting [start, end] are scanned; collected columns
+    equal the projection and labels contain only requested horizons.
+    """
+    import polars as pl
+
+    base_root = tmp_path / "base"
+    feature_root = tmp_path / "features"
+    label_root = tmp_path / "labels"
+    for root in (base_root, feature_root, label_root):
+        root.mkdir()
+    base_store = ParquetDatasetStore(base_root)
+    feature_store = ParquetDatasetStore(feature_root)
+    label_store = ParquetDatasetStore(label_root)
+
+    # Sessions span three months so the dataset owns three monthly partitions.
+    sessions = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(90)]
+    base_rows, feature_rows, label_rows = [], [], []
+    for session in sessions:
+        for t in range(2):
+            price = 100.0 + t
+            base_rows.append({
+                "instrument_id": f"KRX:{t + 1:05d}",
+                "session": session,
+                "open": price,
+                "close": price * 1.01,
+                "volume": 1_000_000.0,
+                "trading_value": price * 1_000_000.0,
+            })
+            feature_rows.append({
+                "instrument_id": f"KRX:{t + 1:05d}",
+                "session": session,
+                "feature__momentum_5d": 0.1 * t,
+            })
+            label_rows.append({
+                "instrument_id": f"KRX:{t + 1:05d}",
+                "session": session,
+                "horizon_sessions": 10,
+                "net_alpha_target": 0.01,
+                "label_available_time": session + timedelta(days=10),
+            })
+            label_rows.append({
+                "instrument_id": f"KRX:{t + 1:05d}",
+                "session": session,
+                "horizon_sessions": 20,
+                "net_alpha_target": 0.02,
+                "label_available_time": session + timedelta(days=20),
+            })
+    _write_dataset(base_store, "base_q1", pl.DataFrame(base_rows), feature_set="base_panel")
+    _write_dataset(feature_store, "feat_q1", pl.DataFrame(feature_rows))
+    _write_dataset(label_store, "lab_q1", pl.DataFrame(label_rows), feature_set="labels")
+
+    scanned_paths: list[str] = []
+    original_scan = pl.scan_parquet
+
+    def tracking_scan(source: object, *args: object, **kwargs: object):
+        if isinstance(source, (list, tuple)):
+            scanned_paths.extend(str(item) for item in source)
+        else:
+            scanned_paths.append(str(source))
+        return original_scan(source, *args, **kwargs)
+
+    monkeypatch.setattr(pl, "scan_parquet", tracking_scan)
+
+    loader = DirectMarketDataLoader(
+        base_root=base_root, feature_root=feature_root, label_root=label_root
+    )
+    request = DirectDataRequest(
+        base_dataset_id="base_q1",
+        feature_dataset_id="feat_q1",
+        label_dataset_id="lab_q1",
+        start=date(2024, 2, 10),
+        end=date(2024, 2, 14),
+        candidate_horizon_sessions=(10,),
+    )
+    result = loader.load(request)
+
+    # Only February partitions may appear in any scan.
+    assert scanned_paths, "expected bounded scans to occur"
+    for path in scanned_paths:
+        assert "month=02" in path, f"scanned non-intersecting partition: {path}"
+
+    # Collected columns equal the requested projection (plus the loader's
+    # synthesized availability columns for panels that lack them).
+    assert set(result.frame.columns) == {
+        "instrument_id", "session", "open", "close",
+        "volume", "trading_value", "feature__momentum_5d",
+        "observation_time", "available_time",
+    }
+    expected_keys = {
+        (f"KRX:{t + 1:05d}", s)
+        for s in (datetime(2024, 2, d, tzinfo=UTC) for d in range(10, 15))
+        for t in range(2)
+    }
+    actual_keys = set(
+        zip(
+            result.frame["instrument_id"].to_list(),
+            result.frame["session"].to_list(),
+            strict=True,
+        )
+    )
+    assert actual_keys == expected_keys
+    assert result.frame.height == result.frame.select(
+        pl.struct(["instrument_id", "session"]).n_unique()
+    ).item()
+
+    # Labels contain only the requested horizon.
+    assert set(result.labels_by_horizon) == {10}
+    horizon_frame = result.labels_by_horizon[10]
+    assert horizon_frame.height == 10  # 5 sessions x 2 tickers
+
+
+DIRECT_SEPARATION_01 = "DIRECT-SEPARATION-01"
+
+
+def test_direct_separation_01_one_row_per_key_with_independent_labels(
+    tmp_path: Path,
+) -> None:
+    """DIRECT-SEPARATION-01: separated composition keeps frame at N rows.
+
+    For N unique keys and H horizons, frame.height == N with unique keys and
+    labels_by_horizon contains H independently sorted frames equal to the
+    legacy composition's labels.
+    """
+    base_root = tmp_path / "base"
+    feature_root = tmp_path / "features"
+    label_root = tmp_path / "labels"
+    for root in (base_root, feature_root, label_root):
+        root.mkdir()
+    base_store = ParquetDatasetStore(base_root)
+    feature_store = ParquetDatasetStore(feature_root)
+    label_store = ParquetDatasetStore(label_root)
+
+    sessions = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(6)]
+    tickers = 3
+    base_rows, feature_rows, label_rows = [], [], []
+    for session in sessions:
+        for t in range(tickers):
+            price = 100.0 + t
+            base_rows.append({
+                "instrument_id": f"KRX:{t + 1:05d}", "session": session,
+                "open": price, "close": price * 1.01,
+                "volume": 1e6, "trading_value": price * 1e6,
+            })
+            feature_rows.append({
+                "instrument_id": f"KRX:{t + 1:05d}", "session": session,
+                "feature__momentum_5d": 0.1 * t,
+            })
+            # Horizon 20 misses the last session's target (unrealized tail).
+            target_20 = 0.02 if session < sessions[-1] else None
+            available_20 = (
+                session + timedelta(days=20) if target_20 is not None else None
+            )
+            for horizon, target, available in (
+                (10, 0.01, session + timedelta(days=10)),
+                (20, target_20, available_20),
+            ):
+                label_rows.append({
+                    "instrument_id": f"KRX:{t + 1:05d}",
+                    "session": session,
+                    "horizon_sessions": horizon,
+                    "net_alpha_target": target,
+                    "label_available_time": available,
+                })
+    _write_dataset(base_store, "base_sep", pl.DataFrame(base_rows), feature_set="base_panel")
+    _write_dataset(feature_store, "feat_sep", pl.DataFrame(feature_rows))
+    _write_dataset(label_store, "lab_sep", pl.DataFrame(label_rows), feature_set="labels")
+
+    loader = DirectMarketDataLoader(
+        base_root=base_root, feature_root=feature_root, label_root=label_root
+    )
+    request = DirectDataRequest(
+        base_dataset_id="base_sep",
+        feature_dataset_id="feat_sep",
+        label_dataset_id="lab_sep",
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 6),
+        candidate_horizon_sessions=(10, 20),
+    )
+    result = loader.load(request)
+
+    n_keys = len(sessions) * tickers
+    assert result.frame.height == n_keys  # never N * H
+    unique_keys = result.frame.select(
+        pl.struct(["instrument_id", "session"]).n_unique()
+    ).item()
+    assert unique_keys == n_keys
+    assert set(result.labels_by_horizon) == {10, 20}
+
+    # Legacy label semantics: per-horizon rows with non-null targets joined to
+    # the decision keys, sorted by (instrument_id, session).
+    for horizon, expected_rows in ((10, n_keys), (20, n_keys - tickers)):
+        frame = result.labels_by_horizon[horizon]
+        assert frame.height == expected_rows
+        assert set(frame.columns) == {
+            "instrument_id", "session", "target", "label_available_time",
+        }
+        keys = list(
+            zip(
+                frame["instrument_id"].to_list(),
+                frame["session"].to_list(),
+                strict=True,
+            )
+        )
+        assert keys == sorted(keys)
+        assert len(set(keys)) == len(keys)
+
+
+DIRECT_VALIDATION_01 = "DIRECT-VALIDATION-01"
+
+
+def test_direct_validation_01_fail_closed_bounded_plan() -> None:
+    """DIRECT-VALIDATION-01: vectorized validation fails closed.
+
+    Duplicate keys, non-finite values, and source-order violations fail closed
+    through the bounded aggregate/window plan.
+    """
+    from src.stocks.data.direct import _validate_direct_frame
+
+    good = pl.DataFrame({
+        "instrument_id": ["A", "A", "B"],
+        "session": [
+            datetime(2024, 1, 1, tzinfo=UTC),
+            datetime(2024, 1, 2, tzinfo=UTC),
+            datetime(2024, 1, 1, tzinfo=UTC),
+        ],
+        "feature__a": [0.1, 0.2, 0.3],
+    })
+
+    with pytest.raises(ValueError, match="duplicate"):
+        _validate_direct_frame(
+            pl.concat([good, good.head(1)]), ("feature__a",)
+        )
+
+    non_finite = good.with_columns(
+        pl.when(pl.col("instrument_id") == "B")
+        .then(pl.lit(float("nan")))
+        .otherwise(pl.col("feature__a"))
+        .alias("feature__a")
+    )
+    with pytest.raises(ValueError, match="non-finite"):
+        _validate_direct_frame(non_finite, ("feature__a",))
+
+    disordered = pl.DataFrame({
+        "instrument_id": ["A", "A"],
+        "session": [
+            datetime(2024, 1, 3, tzinfo=UTC),
+            datetime(2024, 1, 1, tzinfo=UTC),
+        ],
+        "feature__a": [0.1, 0.2],
+    })
+    with pytest.raises(ValueError, match="non-monotonic"):
+        _validate_direct_frame(disordered, ("feature__a",))

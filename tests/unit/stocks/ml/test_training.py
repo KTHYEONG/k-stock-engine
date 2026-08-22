@@ -383,3 +383,351 @@ class TestParallelCompletionMixedProfileSchedule:
             assert len(base_ev.base_log_growth) > 0
             assert len(base_ev.stress_log_growth) > 0
             assert base_ev.segment_ids == stress_ev.segment_ids
+
+
+PERF_MEASURE_01 = "PERF-MEASURE-01"
+
+
+class TestPerfMeasure01:
+    """PERF-MEASURE-01: disjoint replay timers and observed build/cache stats."""
+
+    def _replay_fixture(self):
+        from datetime import UTC, datetime
+        from pathlib import Path
+
+        import polars as pl
+
+        from src.core.costs import default_base_schedule, default_stress_schedule
+        from src.core.datasets import DatasetManifest
+        from src.core.instruments import AssetKind
+        from src.core.portfolio import PortfolioSnapshot
+        from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
+        from src.stocks.ml.contracts import NetAlphaTrainingRequest as Req
+        from src.stocks.ml.execution_replay import (
+            ExecutionEquivalentReplayRequest,
+            ExecutionReplayContext,
+            instruments_from_frame,
+        )
+        from src.stocks.research.artifacts import ModelArtifactRegistry
+        from src.stocks.trading.portfolio_constructor import StockRiskPolicy
+
+        market_rows, score_rows = [], []
+        segments: dict[int, list[datetime]] = {}
+        for seg in range(2):
+            for idx in range(6):
+                session = datetime(2024, 1, 1 + seg * 12 + idx, tzinfo=UTC)
+                segments.setdefault(seg, []).append(session)
+                for t in range(3):
+                    price = 100.0 + t + idx * 0.1
+                    market_rows.append(
+                        {
+                            "instrument_id": f"KRX:{t + 1:05d}",
+                            "session": session,
+                            "observation_time": session.replace(hour=15, minute=30),
+                            "available_time": session.replace(hour=15, minute=31),
+                            "open": price,
+                            "close": price * 1.01,
+                            "volume": 1e6,
+                            "trading_value": price * 1e6,
+                            "sector": f"S{t % 2}",
+                            "adtv": price * 1e6,
+                        }
+                    )
+                    score_rows.append(
+                        {
+                            "instrument_id": f"KRX:{t + 1:05d}",
+                            "session": session,
+                            "oof_segment_id": seg,
+                            "predicted_net_alpha": 0.01 + t * 0.001,
+                            "expected_active_alpha": 0.01 + t * 0.001,
+                            "alpha_lower_bound": 0.0,
+                            "expected_net_alpha": 0.01 + t * 0.001,
+                            "net_alpha_lower_bound": 0.0,
+                            "exit_cost_rate": 0.001,
+                        }
+                    )
+        market = pl.DataFrame(market_rows)
+        scores = pl.DataFrame(score_rows)
+        manifest = DatasetManifest(
+            asset_kind=AssetKind.STOCK, schema_version="v1", schema_hash="h",
+            provider_version="p", universe_policy_version="u",
+            universe_policy_hash="u", feature_set="stock_net_alpha_v1",
+            feature_set_hash="f", label_definition="net_alpha_o2o",
+            label_horizon_sessions=5,
+            time_start=datetime(2024, 1, 1, tzinfo=UTC),
+            time_end=datetime(2024, 2, 6, tzinfo=UTC),
+            generated_time=datetime(2024, 2, 6, tzinfo=UTC),
+            row_count=market.height,
+        )
+        request = Req(artifact_id="perf_measure", candidate_horizon_sessions=(10,))
+        context = ExecutionReplayContext(
+            registry=ModelArtifactRegistry(Path("mem://perf")),
+            manifest=manifest,
+            instruments=instruments_from_frame(market),
+            artifact_id="perf_measure",
+            strategy_id="perf_measure",
+            initial_portfolio=PortfolioSnapshot(
+                account_snapshot_id="oof",
+                as_of=min(segments[0]),
+                settled_cash=request.portfolio.initial_cash,
+                unsettled_cash=0.0,
+                positions=(),
+            ),
+            risk_policy=StockRiskPolicy(
+                top_k=3, gross_cap=0.9, single_name_cap=0.3, sector_cap=0.5,
+                participation_limit=0.01, no_trade_band_bps=0.0,
+            ),
+            base_cost_schedule=default_base_schedule(),
+            stress_cost_schedule=default_stress_schedule(),
+            liquidity_model=None,
+            stress_liquidity_model=None,
+            execution_policy=SCHEDULED_OPEN_V1,
+            seed=42,
+        )
+        return ExecutionEquivalentReplayRequest(
+            context=context,
+            market_frame=market,
+            score_frame=scores,
+            segment_column="oof_segment_id",
+            decision_sessions_by_segment={s: tuple(v) for s, v in segments.items()},
+            horizon_sessions=10,
+        )
+
+    def test_disjoint_timers_and_observed_build_stats(self) -> None:
+        from src.stocks.backtesting.market import PreparedReplayMarket
+        from src.stocks.ml.execution_replay import stream_execution_replay_batch
+
+        request = self._replay_fixture()
+        PreparedReplayMarket.reset_build_call_count()
+        stats: dict[str, int] = {}
+        evidences = stream_execution_replay_batch((request,), stats=stats)
+        assert len(evidences) == 1
+        assert stats["replay_prepare_elapsed_ms"] >= 0
+        assert stats["replay_execute_elapsed_ms"] >= 0
+        # Build count equals actual segment builds (2 segments here), never a
+        # candidate-cardinality synthesis.
+        assert stats["prepared_segment_build_count"] == 2
+        assert stats["prepared_segment_build_count"] == PreparedReplayMarket.build_call_count
+        assert stats["prepared_cache_bytes"] > 0
+        assert stats["peak_live_prepared_segments"] == 1
+
+
+FAILFAST_FRONTIER_01 = "FAILFAST-FRONTIER-01"
+
+
+class TestFailfastFrontier01:
+    """FAILFAST-FRONTIER-01: an infeasible frontier fails before any IO."""
+
+    def test_infeasible_request_fails_closed_without_data_access(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import polars as pl
+
+        from src.stocks.cli.train import _validate_static_training_request
+        from src.stocks.ml.contracts import (
+            ExecutionFrontierSettings,
+            NetAlphaTrainingRequest,
+        )
+        from src.storage.parquet_datasets import ParquetDatasetStore
+
+        def _forbidden_read(*args: object, **kwargs: object) -> object:
+            raise AssertionError("no Parquet access may precede feasibility")
+
+        monkeypatch.setattr(pl, "read_parquet", _forbidden_read)
+        monkeypatch.setattr(ParquetDatasetStore, "read_bounded", _forbidden_read)
+
+        horizons = (3,)
+        request = NetAlphaTrainingRequest(
+            artifact_id="infeasible",
+            candidate_horizon_sessions=horizons,
+            execution_frontier=ExecutionFrontierSettings(
+                candidate_horizon_sessions=horizons,
+                # Default cadence grid starts at 5 sessions; H=3 owns no cell.
+                candidate_rebalance_frequency_sessions=(5, 10, 20),
+                candidate_top_k=(12,),
+            ),
+        )
+        with pytest.raises(ValueError, match="feasible"):
+            _validate_static_training_request(request)
+
+
+PREPARED_MATRIX_01 = "PREPARED-MATRIX-01"
+
+
+class TestPreparedMatrix01:
+    """PREPARED-MATRIX-01: canonical matrix contract on the composed panel."""
+
+    def test_matrix_contract_holds(self) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        import numpy as np
+        import polars as pl
+
+        rows = []
+        for s in range(5):
+            session = datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=s)
+            rows.extend(
+                {
+                    "instrument_id": f"KRX:{t:05d}",
+                    "session": session,
+                    "feature__a": float(s) + t,
+                    "feature__b": float(t) / 2.0,
+                    "net_alpha_target": 0.01 * s,
+                    "open": 100.0,
+                }
+                for t in range(4)
+            )
+        frame = pl.DataFrame(rows)
+
+        class _Schema:
+            learner_columns = ("feature__a", "feature__b")
+
+        from src.stocks.ml.preparation import prepare_matrix_from_frame
+
+        matrix = prepare_matrix_from_frame(frame, tuple(_Schema.learner_columns))
+        x = matrix.X
+        assert x.dtype == np.float32
+        assert x.flags["C_CONTIGUOUS"]
+        assert x.shape == (frame.height, 2)
+        assert len(matrix.instrument_code) == frame.height
+        assert len(matrix.session_code) == frame.height
+        for forbidden in ("net_alpha_target", "open"):
+            assert forbidden not in matrix.feature_columns
+        # Label alignment is one-to-one over unique keys.
+        keys = matrix.key_of(matrix.instrument_code, matrix.session_code)
+        assert np.unique(keys).size == keys.size
+
+
+OOF_TEMPORAL_01 = "OOF-TEMPORAL-01"
+
+
+class TestOofTemporal01:
+    """OOF-TEMPORAL-01: fold geometry stays purged and Rank-IC parity holds."""
+
+    def test_fold_geometry_and_rank_ic_parity(self) -> None:
+        import numpy as np
+        from scipy.stats import spearmanr
+
+        from src.stocks.ml.fitting import session_rank_ic_from_arrays
+
+        rng = np.random.default_rng(9)
+        n_sessions = 60
+        codes = np.repeat(np.arange(n_sessions), 5).astype(np.int32)
+        scores = rng.normal(size=codes.size)
+        realized = 0.2 * scores + rng.normal(scale=0.05, size=codes.size)
+        valid = np.isfinite(scores) & np.isfinite(realized)
+        array_ic = session_rank_ic_from_arrays(scores, realized, codes, valid)
+
+        frame = pl.DataFrame(
+            {
+                "session_index": codes,
+                SCORE_COL: scores,
+                "realized": realized,
+            }
+        ).filter(np.asarray(valid))
+        ics = []
+        for rows in frame.sort("session_index").partition_by("session_index"):
+            if rows.height < 2:
+                continue
+            score_values = rows[SCORE_COL].to_numpy()
+            realized_values = rows["realized"].to_numpy()
+            rho, _ = spearmanr(score_values, realized_values)
+            if np.std(score_values) and np.std(realized_values):
+                ics.append(float(rho))
+        reference_ic = float(np.mean(ics))
+        assert abs(array_ic - reference_ic) <= 1e-12
+
+    def test_prepared_fold_geometry_is_purged(self) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        import numpy as np
+        import polars as pl
+
+        from src.stocks.ml.preparation import prepare_folds
+        from src.stocks.research.folds import PurgedWalkForward
+
+        sessions = [
+            datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(80)
+        ]
+        panel = pl.DataFrame(
+            {
+                "session_index": np.repeat(np.arange(80), 3).astype(np.int64),
+                "session": [s for s in sessions for _ in range(3)],
+            }
+        )
+        splitter = PurgedWalkForward(
+            n_folds=3,
+            label_horizon_sessions=5,
+            embargo_sessions=2,
+            session_column="session_index",
+        )
+        folds = splitter.split(panel)
+        prepared = prepare_folds(folds)
+        for pfold in prepared:
+            assert pfold.train_label_end < pfold.validation_decision_start
+            overlap = set(pfold.train_rows.tolist()) & set(pfold.validation_rows.tolist())
+            assert not overlap
+
+
+PUBLIC_IMPORTS_01 = "PUBLIC-IMPORTS-01"
+
+
+class TestPublicImports01:
+    """PUBLIC-IMPORTS-01: pre-refactor public imports resolve without cycles."""
+
+    def test_all_public_import_paths_resolve(self) -> None:
+        import importlib
+
+        training = importlib.import_module("src.stocks.ml.training")
+        execution_replay = importlib.import_module("src.stocks.ml.execution_replay")
+        engine = importlib.import_module("src.stocks.backtesting.engine")
+
+        for name in (
+            "TrainingTelemetry",
+            "HorizonDiscovery",
+            "train_net_alpha_model",
+            "TrainingOrchestrator",
+        ):
+            assert hasattr(training, name)
+        for name in (
+            "stream_execution_replay_batch",
+            "prepare_execution_replay_batch",
+            "replay_execution_equivalent_batch",
+            "ExecutionEquivalentReplayRequest",
+            "ExecutionReplayContext",
+            "ExecutionReplayEvidence",
+            "ProfileReplayEvidence",
+            "plan_execution_replay_resources",
+            "instruments_from_frame",
+        ):
+            assert hasattr(execution_replay, name)
+        for name in (
+            "StockBacktester",
+            "BacktestResult",
+            "BacktestRequest",
+            "BacktestTrade",
+            "BacktestLedgerRow",
+            "ArtifactSchedule",
+            "ArtifactSlot",
+            "BacktestValidationError",
+            "PreparedReplayMarket",
+            "REQUIRED_BACKTEST_COLUMNS",
+        ):
+            assert hasattr(engine, name)
+
+    def test_module_graph_has_no_cycles(self) -> None:
+        import subprocess
+        import sys
+
+        code = (
+            "import src.stocks.ml.training, "
+            "src.stocks.ml.execution_replay, "
+            "src.stocks.backtesting.engine; raise SystemExit(0)"
+        )
+        result = subprocess.run(  # noqa: S603 - fixed import-graph probe
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+        )
+        assert result.returncode == 0, result.stderr
+
+
+SCORE_COL = "score"

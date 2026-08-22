@@ -34,25 +34,29 @@ class TestBacktestAttribution:
 
 
 class TestBacktestResult:
-    """BacktestResult captures replay outcome."""
+    """BacktestResult is the canonical engine replay outcome."""
 
-    def test_default_result(self) -> None:
-        result = BacktestResult()
+    def test_default_optional_fields(self) -> None:
+        result = BacktestResult(
+            ledger=(), trades=(), final_value=0.0, total_return=0.0, metrics={}
+        )
         assert result.ledger == ()
         assert result.trades == ()
         assert result.metrics == {}
+        assert result.stress_final_value is None
+        assert result.terminal_equity == 0.0
 
-    def test_result_with_attribution(self) -> None:
-        attr = BacktestAttribution(base_total=100.0)
+    def test_result_with_metrics(self) -> None:
         result = BacktestResult(
-            attribution=attr,
-            terminal_equity=1_000_000.0,
-            turnover=3.5,
-            total_cost=100.0,
+            ledger=(),
+            trades=(),
+            final_value=1_000_000.0,
+            total_return=0.15,
+            metrics={"turnover": 3.5, "cost_drag": 100.0},
         )
-        assert result.attribution is not None
-        assert result.attribution.base_total == 100.0
-        assert result.terminal_equity == 1_000_000.0
+        assert result.total_return == 0.15
+        assert result.turnover_ratio == 3.5
+        assert result.total_cost == 100.0
 
 
 class TestBuildBacktestAttribution:
