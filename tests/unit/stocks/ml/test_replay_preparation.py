@@ -1,6 +1,7 @@
 """Segment metadata and one-segment preparation tests."""
 from __future__ import annotations
 
+import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -78,7 +79,7 @@ def _fixture(n_sessions: int = 40, n_tickers: int = 2):
     )
     request = NetAlphaTrainingRequest(artifact_id="t", candidate_horizon_sessions=(10,))
     context = ExecutionReplayContext(
-        registry=ModelArtifactRegistry(Path("mem://prep")),
+        registry=ModelArtifactRegistry(Path(tempfile.mkdtemp(prefix="replay-prep-"))),
         manifest=manifest,
         instruments=instruments_from_frame(market),
         artifact_id="t",

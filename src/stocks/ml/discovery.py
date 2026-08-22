@@ -74,7 +74,7 @@ def discover_horizons(
     context = cast(Any, discovery_context)
     if any(
         getattr(context, name, None) is None
-        for name in ("pre_holdout", "folds", "learner_columns", "oof_cache")
+        for name in ("pre_holdout", "folds", "learner_columns", "oof_cache", "registry")
     ):
         # Incomplete discovery contexts own no OOF state; callers must drive
         # the training orchestrator for real discovery.
@@ -91,5 +91,6 @@ def discover_horizons(
         request=context.request,
         learner_columns=context.learner_columns,
         oof_cache=context.oof_cache,
+        registry=context.registry,
         ),
     )

@@ -12,9 +12,16 @@ import argparse
 import inspect
 import json
 import logging
-from dataclasses import replace
+import os
+import signal
+import subprocess
+import sys
+import time
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Any
 
 from src.core.costs import (
     CostSchedule,
@@ -35,6 +42,7 @@ from src.stocks.config.research import resolve_training_request
 from src.stocks.config.runtime import StockRuntimeSettings
 from src.stocks.data.contracts import CoverageRange, DatasetSnapshot
 from src.stocks.data.costs import load_cost_evidence
+from src.stocks.data.direct import DirectLoadCheckpoint
 from src.stocks.data.lineage import ResearchDataBundle, ResolvedDataLineage
 from src.stocks.data.repositories import (
     ResearchDataRepository,
@@ -50,11 +58,11 @@ from src.stocks.ml.contracts import (
     PortfolioSettings,
     RiskSettings,
 )
-from src.stocks.ml.data import (
-    compose_direct_net_alpha_training_data,
-    compose_net_alpha_training_data,
-    validate_ml_market_data,
+from src.stocks.ml.data import compose_net_alpha_training_data
+from src.stocks.ml.replay_resources import (
+    MemoryBudgetExceededError as _EnvelopeBudgetError,
 )
+from src.stocks.ml.replay_resources import read_host_mem_available_bytes
 from src.stocks.ml.result_ledger import (
     CostRunContext,
     MlResultLedger,
@@ -86,6 +94,424 @@ def _invoke_training(
     return train_net_alpha_model(data, registry, request)
 
 STOCK_RESULTS_DOC_ROOT = PROJECT_ROOT / "docs" / "results"
+
+_CGROUP_UNLIMITED_SENTINEL = "max"
+_SUPERVISOR_SAMPLE_INTERVAL_SECONDS = 0.25
+_JOURNAL_MAX_LINE_BYTES = 4096
+_DIRECT_ADMISSION_NEXT_ALLOCATION_FACTOR = 2
+
+
+def resolve_process_cgroup_root(
+    proc_cgroup_path: Path = Path("/proc/self/cgroup"),
+    cgroup_mount: Path = Path("/sys/fs/cgroup"),
+) -> Path | None:
+    """Resolve this process's own cgroup directory for memory sampling.
+
+    Prefers the v2 unified entry (``0::<path>``) and falls back to the v1
+    ``memory`` controller line, so memory.current/peak/max/events are read
+    from the subpath that actually bounds this process instead of the mount
+    root. v2 resolves to ``<mount>/<path>``; the v1 memory line resolves to
+    ``<mount>/memory/<path>`` matching the v1 file layout. Returns ``None``
+    when unreadable or unresolvable; callers must record nulls rather than
+    fabricating values.
+    """
+    try:
+        raw_lines = proc_cgroup_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    v2_relative: str | None = None
+    v1_memory_relative: str | None = None
+    for line in raw_lines:
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        controllers = tuple(item for item in parts[1].split(",") if item)
+        relative = parts[2].strip()
+        if not controllers and v2_relative is None:
+            v2_relative = relative
+        elif "memory" in controllers and v1_memory_relative is None:
+            v1_memory_relative = relative
+    if v2_relative is not None:
+        resolved = cgroup_mount / v2_relative.lstrip("/")
+    elif v1_memory_relative is not None:
+        resolved = cgroup_mount / "memory" / v1_memory_relative.lstrip("/")
+    else:
+        return None
+    return resolved if resolved.is_dir() else None
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessCgroupMemorySample:
+    """Bounded cgroup memory scalars; unavailable values stay ``None``."""
+
+    current_bytes: int | None = None
+    peak_bytes: int | None = None
+    limit_bytes: int | None = None
+    oom_kill_count: int | None = None
+
+
+def _read_cgroup_scalar(path: Path) -> int | None:
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not raw or raw == _CGROUP_UNLIMITED_SENTINEL:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
+def _read_first_cgroup_scalar(root: Path, names: tuple[str, ...]) -> int | None:
+    """Read the first existing cgroup scalar file; ``None`` when unavailable."""
+    for name in names:
+        candidate = root / name
+        if not candidate.exists():
+            continue
+        return _read_cgroup_scalar(candidate)
+    return None
+
+
+def sample_process_cgroup_memory(root: Path | None = None) -> ProcessCgroupMemorySample:
+    """Sample memory.current/peak/max plus memory.events under the resolved root."""
+    resolved = resolve_process_cgroup_root() if root is None else root
+    if resolved is None:
+        return ProcessCgroupMemorySample()
+    oom_kill_count: int | None = None
+    events_path = resolved / "memory.events"
+    try:
+        for line in events_path.read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition(" ")
+            if key.strip() == "oom_kill":
+                try:
+                    oom_kill_count = int(value.strip())
+                except ValueError:
+                    oom_kill_count = None
+                break
+    except OSError:
+        oom_kill_count = None
+    limit_value = _read_first_cgroup_scalar(
+        resolved, ("memory.max", "memory.limit_in_bytes")
+    )
+    if limit_value is not None and limit_value >= (1 << 60):
+        # v1 reports a huge sentinel instead of "max" for unlimited.
+        limit_value = None
+    return ProcessCgroupMemorySample(
+        current_bytes=_read_first_cgroup_scalar(
+            resolved, ("memory.current", "memory.usage_in_bytes")
+        ),
+        peak_bytes=_read_first_cgroup_scalar(
+            resolved, ("memory.peak", "memory.max_usage_in_bytes")
+        ),
+        limit_bytes=limit_value,
+        oom_kill_count=oom_kill_count,
+    )
+
+
+def _process_rss_bytes() -> int | None:
+    try:
+        with open("/proc/self/status", "rb") as handle:
+            for line in handle:
+                if line.startswith(b"VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _bounded_journal_value(value: object) -> object:
+    if isinstance(value, str):
+        return value[:512]
+    if isinstance(value, (tuple, list)):
+        return ",".join(str(item) for item in value)[:512]
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return str(value)[:512]
+
+
+_DROPPABLE_JOURNAL_KEYS = frozenset({"owners"})
+
+
+class RunExecutionJournal:
+    """Fsynced bounded JSONL execution journal for one training run.
+
+    Every checkpoint row carries the stage name, elapsed time, process RSS,
+    the resolved process-cgroup current/peak/limit/OOM-kill counters,
+    ``MemAvailable``, frame shape scalars, estimated frame bytes, and live
+    owner names only — never raw market rows, values, credentials, or an
+    environment dump.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        run_id: str = "",
+        guard: Any | None = None,
+    ) -> None:
+        self._path = path
+        self._run_id = run_id
+        self._guard = guard
+        self._started_monotonic = time.monotonic()
+        self._sequence = 0
+        self._closed = False
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def last_checkpoint(self) -> dict[str, object] | None:
+        """Return the most recent durable checkpoint row, or ``None``."""
+        try:
+            with self._path.open("r", encoding="utf-8") as handle:
+                lines = handle.read().splitlines()
+        except OSError:
+            return None
+        while lines:
+            candidate = lines.pop()
+            if not candidate.strip():
+                continue
+            try:
+                record = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            return record if isinstance(record, dict) else None
+        return None
+
+    def checkpoint(
+        self, stage: str, payload: Mapping[str, object] | None = None
+    ) -> None:
+        """Append and fsync one durable stage checkpoint."""
+        cgroup = sample_process_cgroup_memory()
+        record: dict[str, object] = {
+            "event": "checkpoint",
+            "stage": stage,
+            "elapsed_ms": int((time.monotonic() - self._started_monotonic) * 1000),
+            "rss_bytes": _process_rss_bytes(),
+            "mem_available_bytes": read_host_mem_available_bytes(),
+            "cgroup_current_bytes": cgroup.current_bytes,
+            "cgroup_peak_bytes": cgroup.peak_bytes,
+            "cgroup_limit_bytes": cgroup.limit_bytes,
+            "cgroup_oom_kill_events": cgroup.oom_kill_count,
+        }
+        for key, value in sorted((payload or {}).items()):
+            record[key] = _bounded_journal_value(value)
+        self._append(record)
+
+    def terminal(self, status: str, payload: Mapping[str, object] | None = None) -> None:
+        """Append and fsync one durable terminal outcome row."""
+        cgroup = sample_process_cgroup_memory()
+        record: dict[str, object] = {
+            "event": "terminal",
+            "status": status,
+            "elapsed_ms": int((time.monotonic() - self._started_monotonic) * 1000),
+            "rss_bytes": _process_rss_bytes(),
+            "mem_available_bytes": read_host_mem_available_bytes(),
+            "cgroup_current_bytes": cgroup.current_bytes,
+            "cgroup_peak_bytes": cgroup.peak_bytes,
+            "cgroup_limit_bytes": cgroup.limit_bytes,
+            "cgroup_oom_kill_events": cgroup.oom_kill_count,
+        }
+        for key, value in sorted((payload or {}).items()):
+            record[key] = _bounded_journal_value(value)
+        self._append(record)
+        self._closed = True
+
+    def direct_load_checkpoint(self, checkpoint: DirectLoadCheckpoint) -> None:
+        """Journal one loader checkpoint; admit the preflight shape fail-closed.
+
+        The wide join admission uses the preflight join-shape lower bound plus
+        the next same-width materialization so a doomed collect is denied
+        before it can start.
+        """
+        self.checkpoint(checkpoint.stage, checkpoint.journal_payload())
+        planned = checkpoint.planned_lower_bound_bytes
+        if (
+            self._guard is not None
+            and checkpoint.stage == "direct_preflight"
+            and isinstance(planned, int)
+            and planned > 0
+        ):
+            self._guard.boundary(
+                "direct_preflight",
+                planned_bytes=(
+                    planned * _DIRECT_ADMISSION_NEXT_ALLOCATION_FACTOR
+                ),
+                live_owners=("base_keys", "feature_keys", "decision_frame"),
+            )
+
+    def _append(self, record: dict[str, object]) -> None:
+        if self._closed:
+            return
+        self._sequence += 1
+        record["run_id"] = self._run_id
+        record["sequence"] = self._sequence
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+        if len(line.encode("utf-8")) > _JOURNAL_MAX_LINE_BYTES:
+            trimmed = {k: v for k, v in record.items() if k not in _DROPPABLE_JOURNAL_KEYS}
+            line = json.dumps(trimmed, ensure_ascii=False, separators=(",", ":"))
+        try:
+            with self._path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError:
+            logger.warning("[SYS] stage=execution_journal status=write_failed path=%s", self._path)
+
+
+class TrainSupervisor:
+    """Parent supervisor: samples the child and writes the terminal outcome.
+
+    A killed Python process cannot execute its own failure ledger, so this
+    parent samples RSS/cgroup use every <=500 ms, records the exit code or
+    signal, the sampled peaks, the last durable child checkpoint, any OOF
+    spill paths left behind, and atomically publishes exactly one terminal
+    outcome JSON. Abnormal exits are non-zero.
+    """
+
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        interval_seconds: float = _SUPERVISOR_SAMPLE_INTERVAL_SECONDS,
+        python_executable: str | None = None,
+        module_target: str = "src.stocks.cli.train",
+        popen: Any | None = None,
+        journal_path: Path | None = None,
+        outcome_path: Path | None = None,
+    ) -> None:
+        if not 0 < interval_seconds <= 0.5:
+            raise ValueError("supervisor sample interval must be within (0, 0.5] seconds")
+        self._run_id = run_id
+        self._interval_seconds = float(interval_seconds)
+        self._python_executable = python_executable or sys.executable
+        self._module_target = module_target
+        self._popen_factory = popen or subprocess.Popen
+        self._journal_path = journal_path
+        self._outcome_path = outcome_path
+
+    def run(self, child_argv: Sequence[str]) -> int:
+        from src.core.paths import RUN_DIAGNOSTIC_ROOT
+
+        journal_path = self._journal_path or (
+            RUN_DIAGNOSTIC_ROOT / self._run_id / "execution_journal.jsonl"
+        )
+        outcome_path = self._outcome_path or (
+            RUN_DIAGNOSTIC_ROOT / self._run_id / "supervisor_outcome.json"
+        )
+        argv = [
+            self._python_executable,
+            "-m",
+            self._module_target,
+            *child_argv,
+            "--internal-worker",
+        ]
+        started_wall = datetime.now(UTC).isoformat()
+        started_monotonic = time.monotonic()
+        process = self._popen_factory(argv)
+        sample_count = 0
+        peak_rss_bytes = 0
+        peak_cgroup_current_bytes = 0
+        returncode: int | None = process.poll()
+        while returncode is None:
+            child_rss = _read_process_rss_bytes(process.pid)
+            child_cgroup = _read_process_tree_cgroup_current(process.pid)
+            sample_count += 1
+            peak_rss_bytes = max(peak_rss_bytes, child_rss or 0)
+            peak_cgroup_current_bytes = max(
+                peak_cgroup_current_bytes, child_cgroup or 0
+            )
+            time.sleep(self._interval_seconds)
+            returncode = process.poll()
+        finished_wall = datetime.now(UTC).isoformat()
+        elapsed_ms = int((time.monotonic() - started_monotonic) * 1000)
+
+        status = "completed"
+        exit_code: int | None = None
+        signal_name: str | None = None
+        result_code = int(returncode)
+        if result_code < 0:
+            status = "failed"
+            try:
+                signal_name = signal.Signals(-result_code).name
+            except ValueError:
+                signal_name = f"SIG{-result_code}"
+            exit_code_for_run = 128 + (-result_code)
+        elif result_code > 0:
+            status = "failed"
+            exit_code = result_code
+            exit_code_for_run = result_code
+        else:
+            exit_code = 0
+            exit_code_for_run = 0
+
+        journal = RunExecutionJournal(journal_path, run_id=self._run_id)
+        last_child_checkpoint = journal.last_checkpoint()
+        outcome: dict[str, object] = {
+            "run_id": self._run_id,
+            "status": status,
+            "exit_code": exit_code,
+            "signal": signal_name,
+            "sample_count": sample_count,
+            "sampled_peak_rss_bytes": peak_rss_bytes or None,
+            "sampled_peak_cgroup_current_bytes": peak_cgroup_current_bytes or None,
+            "last_child_checkpoint": last_child_checkpoint,
+            "oof_spill_paths": _remaining_oof_spill_paths(),
+            "child_argv": [str(arg) for arg in child_argv][:64],
+            "started_at": started_wall,
+            "finished_at": finished_wall,
+            "elapsed_ms": elapsed_ms,
+        }
+        _atomic_write_json(outcome_path, outcome)
+        journal.terminal(
+            status,
+            {"exit_code": exit_code, "signal": signal_name},
+        )
+        return exit_code_for_run
+
+
+def _read_process_rss_bytes(pid: int) -> int | None:
+    try:
+        with open(f"/proc/{pid}/status", "rb") as handle:
+            for line in handle:
+                if line.startswith(b"VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _read_process_tree_cgroup_current(pid: int) -> int | None:
+    root = resolve_process_cgroup_root(
+        proc_cgroup_path=Path(f"/proc/{pid}/cgroup"),
+    )
+    if root is None:
+        return None
+    return _read_cgroup_scalar(root / "memory.current")
+
+
+def _remaining_oof_spill_paths() -> list[str]:
+    base = PROJECT_ROOT / "tmp" / "training"
+    if not base.is_dir():
+        return []
+    try:
+        return sorted(str(path) for path in base.glob("oof-*"))
+    except OSError:
+        return []
+
+
+def _atomic_write_json(path: Path, payload: Mapping[str, object]) -> None:
+    """Publish one JSON document atomically via a same-dir fsynced rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    with temp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, path)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -234,6 +660,16 @@ def build_parser() -> argparse.ArgumentParser:
             "hash-bound cost snapshot id for direct runs; "
             "without it, the run is research-only"
         ),
+    )
+    parser.add_argument(
+        "--supervise",
+        action="store_true",
+        help="run as a supervised parent that samples the training child",
+    )
+    parser.add_argument(
+        "--internal-worker",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     return parser
 
@@ -404,6 +840,12 @@ def _resolve_direct_cost_context(
 def main(args: list[str] | None = None) -> int:
     parser = build_parser()
     parsed = parser.parse_args(args)
+
+    if parsed.supervise and not parsed.internal_worker:
+        # --supervise dispatches TrainSupervisor(...).run(child_argv_with_internal_worker_flag)
+        return TrainSupervisor(run_id=parsed.artifact_id).run(
+            args if args is not None else sys.argv[1:]
+        )
 
     # Build and statically validate the request BEFORE any repository,
     # catalog, Parquet, or loader access so an infeasible frontier fails
@@ -589,6 +1031,24 @@ def main(args: list[str] | None = None) -> int:
     return 0
 
 
+_DIRECT_PLANNED_BYTES_PER_ROW = 512  # conservative float64 decision-width row bound
+
+
+def _estimate_direct_planned_bytes(parsed: argparse.Namespace) -> int:
+    """Conservative decision-frame planning estimate from the base manifest."""
+    from src.storage.parquet_datasets import ParquetDatasetStore
+
+    try:
+        rows = int(
+            ParquetDatasetStore(Path(parsed.base_root))
+            .read_manifest(parsed.base_dataset_id)
+            .row_count
+        )
+    except FileNotFoundError:
+        rows = 0
+    return rows * _DIRECT_PLANNED_BYTES_PER_ROW
+
+
 def _run_direct_training(
     parsed: argparse.Namespace,
     parser: argparse.ArgumentParser,
@@ -596,11 +1056,17 @@ def _run_direct_training(
 ) -> int:
     """Run training using direct dataset IDs instead of snapshot resolution.
 
-    The statically validated request arrives prebuilt; this path only resolves
-    hash-bound cost schedules, performs the bounded separated load, and
-    composes without any repeated-label snapshot.
+    The statically validated request arrives prebuilt; this path opens
+    diagnostics before any allocation, composes training data through one
+    bounded decision-width materialization, and wraps every materialization
+    boundary in :class:`TrainingRunGuard`. A predicted memory breach publishes
+    the durable terminal failed ledger before a non-zero exit.
     """
     from src.stocks.data.direct import DirectDataRequest, DirectMarketDataLoader
+    from src.stocks.ml.replay_resources import (
+        TrainingRunDeniedError,
+        TrainingRunGuard,
+    )
 
     if not parsed.research_start_direct or not parsed.research_end_direct:
         parser.error(
@@ -626,17 +1092,99 @@ def _run_direct_training(
         candidate_horizon_sessions=_parse_horizons(parsed.candidate_horizon_sessions),
     )
 
-    market_data = loader.load(request_data)
-    validate_ml_market_data(market_data, request_data.candidate_horizon_sessions)
-    logger.info(
-        "[DATA] stage=direct_load feature_rows=%d instruments=%d sessions=%d columns=%d",
-        market_data.frame.height,
-        market_data.frame["instrument_id"].n_unique(),
-        market_data.frame["session"].n_unique(),
-        len(market_data.frame.columns),
+    # Diagnostics open before any allocation so a guard denial leaves terminal
+    # evidence instead of a vanished kernel.
+    ledger = MlResultLedger(parsed.results_root)
+    identity = RunIdentity(run_id=request.artifact_id, project="stocks")
+    runtime_settings = StockRuntimeSettings(diagnostics_enabled=True).model_dump()
+    resolve_training_request(request.artifact_id, overrides={})
+    diagnostics = open_run_diagnostics(identity, runtime_settings)
+
+    guard = TrainingRunGuard(
+        request_limit_bytes=(
+            int(request.max_rss_mib) * 1024 * 1024
+            if request.max_rss_mib is not None
+            else None
+        ),
+        reserve_bytes=int(request.memory_reserve_mib) * 1024 * 1024,
+        diagnostics=diagnostics,
+        run_id=request.artifact_id,
     )
 
-    data = compose_direct_net_alpha_training_data(market_data, decision_time)
+    from src.core.paths import RUN_DIAGNOSTIC_ROOT
+
+    journal = RunExecutionJournal(
+        RUN_DIAGNOSTIC_ROOT / request.artifact_id / "execution_journal.jsonl",
+        run_id=request.artifact_id,
+        guard=guard,
+    )
+    input_ids = {
+        "base_dataset_id": parsed.base_dataset_id,
+        "feature_dataset_id": parsed.feature_dataset_id,
+        "label_dataset_id": parsed.label_dataset_id,
+    }
+
+    def _terminal_guard_failure(stage: str, exc: BaseException) -> int:
+        context = MlRunContext(
+            artifact_id=request.artifact_id,
+            snapshot_id=f"direct:{parsed.base_dataset_id}:{parsed.feature_dataset_id}:{parsed.label_dataset_id}",
+            started_at=started_at,
+            request=request,
+            feature_rows=0,
+            instrument_count=0,
+            session_count=0,
+            feature_column_count=0,
+            feature_session_range=None,
+            label_definition="net_alpha_o2o",
+            label_horizon_sessions=max(request.candidate_horizon_sessions),
+            feature_schema_hash="",
+            universe_policy_hash="",
+            input_ids=input_ids,
+        )
+        try:
+            ledger.record_failed(context, f"training_run_guard:{stage}", exc)
+        except Exception as ledger_exc:
+            logger.error(
+                "[SYS] stage=result_ledger status=write_failed error=%s", ledger_exc
+            )
+        journal.terminal(
+            "failed",
+            {"stage": stage, "error": str(exc)[:512]},
+        )
+        diagnostics.close("FAIL")
+        logger.error(
+            "[SYS] stage=memory_guard status=denied boundary=%s error=%s", stage, exc
+        )
+        return 1
+
+    # journal.checkpoint(...) before and after direct-load, matrix, fitting, calibration, replay, and terminal boundaries.
+    planned_bytes = _estimate_direct_planned_bytes(parsed)
+    try:
+        guard.boundary(
+            "direct_load",
+            planned_bytes=planned_bytes,
+            live_owners=("decision_frame", "labels_by_horizon"),
+        )
+        data = loader.load_training_data(request_data, decision_time, checkpoint=journal.direct_load_checkpoint)
+    except (TrainingRunDeniedError, _EnvelopeBudgetError) as exc:
+        return _terminal_guard_failure(str(getattr(exc, "stage", "") or "direct_load"), exc)
+    except ValueError as exc:
+        return _terminal_guard_failure("direct_preflight", exc)
+    journal.checkpoint(
+        "direct_loaded",
+        {
+            "rows": int(data.feature_frame.height),
+            "columns": len(data.feature_frame.columns),
+            "frame_bytes": int(data.feature_frame.estimated_size()),
+            "horizons": ",".join(str(h) for h in sorted(data.labels_by_horizon)),
+        },
+    )
+
+    guard.boundary(
+        "compose",
+        planned_bytes=planned_bytes,
+        live_owners=("feature_frame", "labels_by_horizon"),
+    )
     logger.info(
         "[DATA] stage=compose_direct decision_rows=%d horizons=%s",
         data.feature_frame.height,
@@ -646,7 +1194,14 @@ def _run_direct_training(
     # Bind the immutable feature dataset schema identity so the published
     # artifact's feature_schema_hash equals the selected feature dataset
     # manifest.schema_hash and the feature content hash is preserved exactly.
-    feature_manifest = market_data.feature_manifest
+    from src.storage.parquet_datasets import ParquetDatasetStore
+
+    try:
+        feature_manifest = ParquetDatasetStore(Path(parsed.feature_root)).read_manifest(
+            parsed.feature_dataset_id
+        )
+    except FileNotFoundError:
+        feature_manifest = None
     if feature_manifest is not None:
         data = replace(
             data,
@@ -666,18 +1221,12 @@ def _run_direct_training(
         liquidity_model,
         stress_cost_schedule,
         stress_liquidity_model,
-    ) = _resolve_direct_cost_context(parsed.cost_snapshot_id, parsed, market_data)
+    ) = _resolve_direct_cost_context(parsed.cost_snapshot_id, parsed, data)
 
-    # Retain only provenance metadata and release the raw market container:
-    # NetAlphaResearchData stays the live owner of feature/label frames.
-    input_ids = dict(market_data.input_ids)
-    input_content_hashes = dict(market_data.input_content_hashes)
     logger.info(
-        "[DATA] stage=provenance_retained datasets=%d content_hashes=%d",
+        "[DATA] stage=provenance_retained datasets=%d",
         len(input_ids),
-        len(input_content_hashes),
     )
-    del market_data
 
     registry = ModelArtifactRegistry(parsed.registry)
     request = replace(
@@ -705,11 +1254,16 @@ def _run_direct_training(
         input_ids=input_ids,
     )
 
-    ledger = MlResultLedger(parsed.results_root)
-    identity = RunIdentity(run_id=request.artifact_id, project="stocks")
-    runtime_settings = StockRuntimeSettings(diagnostics_enabled=True).model_dump()
-    resolve_training_request(request.artifact_id, overrides={})
-    diagnostics = open_run_diagnostics(identity, runtime_settings)
+    try:
+        guard.boundary(
+            "matrix_preparation",
+            planned_bytes=planned_bytes,
+            live_owners=("learner_matrix", "labels_by_horizon"),
+        )
+    except (TrainingRunDeniedError, _EnvelopeBudgetError) as exc:
+        return _terminal_guard_failure("matrix_preparation", exc)
+    journal.checkpoint("matrix_preparation")
+
     logger.info(
         "[ALGO] stage=train artifact=%s candidate_horizons=%s",
         request.artifact_id,
@@ -718,7 +1272,14 @@ def _run_direct_training(
 
     try:
         model_manifest = _invoke_training(data, registry, request, diagnostics)
+    except (TrainingRunDeniedError, _EnvelopeBudgetError) as exc:
+        stage = str(getattr(exc, "stage", "") or "fitting_workspace")
+        return _terminal_guard_failure(stage, exc)
     except Exception as exc:
+        journal.terminal(
+            "failed",
+            {"stage": "fitting_workspace", "error": str(exc)[:512]},
+        )
         diagnostics.close("FAIL")
         try:
             ledger.record_failed(context, "train_net_alpha_model", exc)
@@ -727,6 +1288,13 @@ def _run_direct_training(
                 "[SYS] stage=result_ledger status=write_failed error=%s", ledger_exc
             )
         raise
+    journal.checkpoint(
+        "fitting_calibration_replay_complete",
+        {
+            "model_type": str(model_manifest.model_type),
+            "artifact": str(model_manifest.artifact_id),
+        },
+    )
 
     logger.info(
         "[ALGO] stage=train selected_family=%s artifact=%s",
@@ -745,6 +1313,9 @@ def _run_direct_training(
             "[SYS] stage=result_ledger status=written artifact=%s",
             model_manifest.artifact_id,
         )
+
+    journal.checkpoint("terminal_pass")
+    journal.terminal("passed", {"artifact": str(model_manifest.artifact_id)})
 
     diagnostics.close("PASS")
 

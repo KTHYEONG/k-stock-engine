@@ -724,3 +724,264 @@ def test_direct_validation_01_fail_closed_bounded_plan() -> None:
     })
     with pytest.raises(ValueError, match="non-monotonic"):
         _validate_direct_frame(disordered, ("feature__a",))
+
+
+FULL_TERMINAL_01 = "FULL_TERMINAL_01_LAZY_DIRECT_OWNERSHIP"
+
+
+def _write_long_label_dataset(
+    store: ParquetDatasetStore,
+    dataset_id: str,
+    sessions: list[datetime],
+    tickers: int = 2,
+) -> None:
+    """Long-format H10/H20/H30 labels; horizon 30 is never requested."""
+    last = sessions[-1]
+    rows = []
+    for session in sessions:
+        for t in range(tickers):
+            for horizon in (10, 20, 30):
+                usable = session + timedelta(days=horizon) <= last
+                rows.append({
+                    "instrument_id": f"KRX:{t + 1:05d}",
+                    "session": session,
+                    "horizon_sessions": horizon,
+                    "net_alpha_target": 0.001 * horizon if usable else None,
+                    "label_available_time": session + timedelta(days=horizon),
+                })
+    _write_dataset(store, dataset_id, pl.DataFrame(rows), feature_set="labels")
+
+
+def test_full_terminal_01_lazy_direct_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FULL_TERMINAL_01_LAZY_DIRECT_OWNERSHIP.
+
+    H10/H20 labels are predicate-filtered before collect; after construction
+    exactly one decision-width training frame is live and label frames contain
+    no feature__ columns.
+    """
+    base_root = tmp_path / "base"
+    feature_root = tmp_path / "features"
+    label_root = tmp_path / "labels"
+    for root in (base_root, feature_root, label_root):
+        root.mkdir()
+    base_store = ParquetDatasetStore(base_root)
+    feature_store = ParquetDatasetStore(feature_root)
+    label_store = ParquetDatasetStore(label_root)
+
+    sessions = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(40)]
+    base_rows = []
+    feature_rows = []
+    for session in sessions:
+        for t in range(2):
+            price = 100.0 + t
+            base_rows.append({
+                "instrument_id": f"KRX:{t + 1:05d}", "session": session,
+                "open": price, "close": price * 1.01,
+                "volume": 1e6, "trading_value": price * 1e6,
+            })
+            feature_rows.append({
+                "instrument_id": f"KRX:{t + 1:05d}", "session": session,
+                "feature__momentum_5d": 0.1 * t,
+                "feature__volatility_20d": 0.02,
+            })
+    _write_dataset(base_store, "base_lazy", pl.DataFrame(base_rows), feature_set="base_panel")
+    _write_dataset(feature_store, "feat_lazy", pl.DataFrame(feature_rows))
+    _write_long_label_dataset(label_store, "lab_lazy", sessions)
+
+    def _no_eager_bounded_read(self, *args: object, **kwargs: object):
+        raise AssertionError("load_training_data must not use eager read_bounded")
+
+    monkeypatch.setattr(ParquetDatasetStore, "read_bounded", _no_eager_bounded_read)
+
+    loader = DirectMarketDataLoader(
+        base_root=base_root, feature_root=feature_root, label_root=label_root
+    )
+    request = DirectDataRequest(
+        base_dataset_id="base_lazy",
+        feature_dataset_id="feat_lazy",
+        label_dataset_id="lab_lazy",
+        start=date(2024, 1, 1),
+        end=date(2024, 2, 9),
+        candidate_horizon_sessions=(10, 20),
+    )
+
+    # The horizon predicate must live inside the lazy plan itself, so no other
+    # horizon's rows ever reach a collect.
+    for horizon, expected_scan_rows in ((10, 60), (20, 40)):
+        scan = loader._scan_horizon_labels(request, horizon)
+        assert isinstance(scan, pl.LazyFrame)
+        assert "horizon_sessions" in scan.explain()
+        rows = scan.collect()
+        assert rows.height == expected_scan_rows  # only this horizon's rows
+        assert rows["net_alpha_target"].null_count() == 0
+
+    data = loader.load_training_data(request, datetime(2024, 3, 1, tzinfo=UTC))
+
+    # Requested horizons only; label frames stay narrow and leak-free.
+    assert set(data.labels_by_horizon) == {10, 20}
+    n_keys = len(sessions) * 2 - 2  # one warm-up row dropped per ticker
+    assert data.feature_frame.height == n_keys
+    assert data.feature_frame.select(
+        pl.struct(["instrument_id", "session"]).n_unique()
+    ).item() == data.feature_frame.height
+    for frame in data.labels_by_horizon.values():
+        assert not any(c.startswith("feature__") for c in frame.columns)
+        assert "horizon_sessions" not in frame.columns
+        assert set(frame.columns) <= {
+            "instrument_id",
+            "session",
+            "net_alpha_target",
+            "label_available_time",
+            "gross_return",
+            "risk_residual",
+            "reference_cost",
+        }
+    assert data.labels_by_horizon[10].height == 58
+    assert data.labels_by_horizon[20].height == 38
+
+
+TERMINAL_OBS_02 = "TERMINAL_OBS_02_JOIN_PREFLIGHT_FAILS_CLOSED"
+
+
+def test_terminal_obs_02_join_preflight_fails_closed(tmp_path: Path) -> None:
+    """TERMINAL_OBS_02_JOIN_PREFLIGHT_FAILS_CLOSED.
+
+    A duplicate base key fails closed in the narrow preflight before the wide
+    collect: the final checkpoint carries duplicate_key_count > 0 and no
+    decision-frame-collected event is ever emitted.
+    """
+    base_root = tmp_path / "base"
+    feature_root = tmp_path / "features"
+    label_root = tmp_path / "labels"
+    for root in (base_root, feature_root, label_root):
+        root.mkdir()
+    base_store = ParquetDatasetStore(base_root)
+    feature_store = ParquetDatasetStore(feature_root)
+    label_store = ParquetDatasetStore(label_root)
+
+    sessions = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(6)]
+    feature_rows = []
+    label_rows = []
+    base_rows = []
+    for session in sessions:
+        for t in range(2):
+            price = 100.0 + t
+            base_rows.append({
+                "instrument_id": f"KRX:{t + 1:05d}", "session": session,
+                "open": price, "close": price * 1.01,
+                "volume": 1e6, "trading_value": price * 1e6,
+            })
+            feature_rows.append({
+                "instrument_id": f"KRX:{t + 1:05d}", "session": session,
+                "feature__momentum_5d": 0.1 * t,
+            })
+            label_rows.append({
+                "instrument_id": f"KRX:{t + 1:05d}", "session": session,
+                "horizon_sessions": 10,
+                "net_alpha_target": 0.001,
+                "label_available_time": session + timedelta(days=10),
+            })
+    # Duplicate one identity key on the base side.
+    duplicated_base = pl.concat([pl.DataFrame(base_rows), pl.DataFrame(base_rows).head(1)])
+    _write_dataset(base_store, "base_dup", duplicated_base, feature_set="base_panel")
+    _write_dataset(feature_store, "feat_dup", pl.DataFrame(feature_rows))
+    _write_dataset(label_store, "lab_dup", pl.DataFrame(label_rows), feature_set="labels")
+
+    loader = DirectMarketDataLoader(
+        base_root=base_root, feature_root=feature_root, label_root=label_root
+    )
+    from src.stocks.data.direct import DirectLoadCheckpoint
+
+    request = DirectDataRequest(
+        base_dataset_id="base_dup",
+        feature_dataset_id="feat_dup",
+        label_dataset_id="lab_dup",
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 6),
+        candidate_horizon_sessions=(10,),
+    )
+    checkpoints: list[DirectLoadCheckpoint] = []
+
+    with pytest.raises(ValueError, match="duplicate"):
+        loader.load_training_data(
+            request,
+            datetime(2024, 3, 1, tzinfo=UTC),
+            checkpoint=checkpoints.append,
+        )
+
+    assert checkpoints, "preflight must emit durable checkpoints before failing"
+    final_checkpoint = checkpoints[-1]
+    assert final_checkpoint.stage == "direct_preflight"
+    duplicate_key_count = (final_checkpoint.base_duplicate_keys or 0) + (
+        final_checkpoint.feature_duplicate_keys or 0
+    )
+    assert duplicate_key_count > 0
+    assert all(
+        checkpoint.stage != "decision_frame_collected" for checkpoint in checkpoints
+    )
+
+
+def test_terminal_obs_02_preflight_admits_one_to_one(tmp_path: Path) -> None:
+    """The same fixture without duplicates passes preflight and collects once."""
+    base_root = tmp_path / "base_ok"
+    feature_root = tmp_path / "features_ok"
+    label_root = tmp_path / "labels_ok"
+    for root in (base_root, feature_root, label_root):
+        root.mkdir()
+    base_store = ParquetDatasetStore(base_root)
+    feature_store = ParquetDatasetStore(feature_root)
+    label_store = ParquetDatasetStore(label_root)
+
+    sessions = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(5)]
+    base_rows = []
+    feature_rows = []
+    label_rows = []
+    for session in sessions:
+        for t in range(2):
+            price = 100.0 + t
+            base_rows.append({
+                "instrument_id": f"KRX:{t + 1:05d}", "session": session,
+                "open": price, "close": price * 1.01,
+                "volume": 1e6, "trading_value": price * 1e6,
+            })
+            feature_rows.append({
+                "instrument_id": f"KRX:{t + 1:05d}", "session": session,
+                "feature__momentum_5d": 0.1 * t,
+            })
+            label_rows.append({
+                "instrument_id": f"KRX:{t + 1:05d}", "session": session,
+                "horizon_sessions": 10,
+                "net_alpha_target": 0.001,
+                "label_available_time": session + timedelta(days=10),
+            })
+    _write_dataset(base_store, "base_ok", pl.DataFrame(base_rows), feature_set="base_panel")
+    _write_dataset(feature_store, "feat_ok", pl.DataFrame(feature_rows))
+    _write_dataset(label_store, "lab_ok", pl.DataFrame(label_rows), feature_set="labels")
+
+    loader = DirectMarketDataLoader(
+        base_root=base_root, feature_root=feature_root, label_root=label_root
+    )
+    from src.stocks.data.direct import DirectLoadCheckpoint
+
+    request = DirectDataRequest(
+        base_dataset_id="base_ok",
+        feature_dataset_id="feat_ok",
+        label_dataset_id="lab_ok",
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 5),
+        candidate_horizon_sessions=(10,),
+    )
+    checkpoints: list[DirectLoadCheckpoint] = []
+    data = loader.load_training_data(
+        request, datetime(2024, 3, 1, tzinfo=UTC), checkpoint=checkpoints.append
+    )
+    stages = [checkpoint.stage for checkpoint in checkpoints]
+    assert "decision_frame_collected" not in stages
+    assert "direct_collected" in stages
+    preflight = next(c for c in checkpoints if c.stage == "direct_preflight")
+    assert preflight.predicted_joined_rows == preflight.matched_keys
+    assert preflight.planned_lower_bound_bytes is not None
+    assert preflight.planned_lower_bound_bytes > 0
+    assert data.feature_frame.height == len(sessions) * 2 - 2

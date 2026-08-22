@@ -1,6 +1,26 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_ML_FULL_TERMINAL_OBSERVABILITY_20260822",
+      "date": "2026-08-22",
+      "adr_id": "ADR_20260822_STOCK_ML_FULL_TERMINAL_OBSERVABILITY_20260822",
+      "domain": "stocks_ml",
+      "title": "Stock ML Full Terminal Observability",
+      "why": "full 실행이 direct-load 이후 학습 구간에서 장시간 정체되고 mem:/scratch 임시 산출물이 반복 생성됨",
+      "resolution": "caller-owned registry, tmp-only cache, cgroup subpath sampling, fsynced execution journal, join-cardinality preflight, supervised terminal outcome을 연결하고 full 실행 evidence를 ADR로 기록",
+      "impact": "비정상 종료 원인·메모리 피크·join shape를 분석 가능한 scalar artifact로 남기며 금융 계산과 promotion gate는 변경하지 않음"
+    },
+    {
+      "task_id": "TASK_STOCK_ML_FULL_RUN_TERMINAL_RECOVERY_20260822",
+      "date": "2026-08-22",
+      "adr_id": "ADR_20260822_STOCK_ML_FULL_RUN_TERMINAL_RECOVERY_20260822",
+      "domain": "stocks_ml",
+      "title": "Stock ML Full Run Terminal Recovery",
+      "why": "Full ML 학습·백테스트가 데이터 적재 후 종료되어 완료 artifact와 실패 원인을 남기지 못함",
+      "resolution": "bounded lazy scan, horizon 선필터, 단일 decision-width ownership, TrainingRunGuard 및 durable failure ledger를 연결해 full 실행 종료성을 확보",
+      "impact": "stocks ML direct training의 메모리 피크와 비정상 종료 추적성을 개선하고 수치 결과 계약은 유지"
+    },
+    {
       "task_id": "TASK_STOCK_ML_FULL_RUN_EXECUTION_20260822",
       "date": "2026-08-22",
       "adr_id": "ADR_20260822_STOCK_ML_FULL_RUN_EXECUTION_20260822",

@@ -14,16 +14,21 @@ The composed contract is physically separated:
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
-from dataclasses import dataclass, field
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import polars as pl
 
-from src.core.datasets import DatasetManifest
+from src.core.datasets import DatasetManifest, make_manifest
 from src.core.instruments import AssetKind
-from src.stocks.ml.contracts import CANONICAL_FEATURE_SET
+from src.stocks.ml.contracts import (
+    CANONICAL_FEATURE_SET,
+    HorizonJoinEvidence,
+    NetAlphaResearchData,
+)
 from src.storage.parquet_datasets import ParquetDatasetStore
 
 logger = logging.getLogger("stocks.data.direct")
@@ -38,6 +43,16 @@ _BASE_COLUMNS = (
     "volume",
     "trading_value",
     "sector",
+)
+
+# Narrow per-horizon label projection: identity, target, availability, and
+# realized outcome columns only; horizon/feature columns never survive collect.
+_LABEL_REALIZED_COLUMNS = ("gross_return", "risk_residual", "reference_cost")
+_LONG_HORIZON_COLUMN = "horizon_sessions"
+_WARMUP_NULL_COLUMNS = (
+    "fluc_rate", "intraday_ret", "overnight_ret", "sector_ret_5d",
+    "feature__fluc_rate", "feature__intraday_ret",
+    "feature__overnight_ret", "feature__sector_ret_5d",
 )
 
 
@@ -57,6 +72,52 @@ class DirectDataRequest:
     end: date
     feature_set: str = CANONICAL_FEATURE_SET
     candidate_horizon_sessions: tuple[int, ...] = (10,)
+
+
+@dataclass(frozen=True, slots=True)
+class DirectLoadCheckpoint:
+    """Bounded scalar snapshot of one direct-load boundary.
+
+    Carries only load-shape scalars (stage, elapsed time, rows/columns,
+    estimated frame bytes, live owner names, and the join-preflight key
+    cardinalities). System resources (RSS/cgroup/MemAvailable) are sampled by
+    the durable journal at write time so no raw market rows, values,
+    credentials, or environment dumps ever enter a checkpoint.
+    """
+
+    stage: str
+    elapsed_ms: int = 0
+    rows: int | None = None
+    columns: int | None = None
+    frame_bytes: int | None = None
+    owners: tuple[str, ...] = ()
+    base_rows: int | None = None
+    feature_rows: int | None = None
+    base_distinct_keys: int | None = None
+    feature_distinct_keys: int | None = None
+    base_duplicate_keys: int | None = None
+    feature_duplicate_keys: int | None = None
+    matched_keys: int | None = None
+    predicted_joined_rows: int | None = None
+    planned_lower_bound_bytes: int | None = None
+
+    def journal_payload(self) -> dict[str, object]:
+        """Bounded scalar mapping for durable journaling."""
+        return {
+            "rows": self.rows,
+            "columns": self.columns,
+            "frame_bytes": self.frame_bytes,
+            "owners": ",".join(self.owners)[:512],
+            "base_rows": self.base_rows,
+            "feature_rows": self.feature_rows,
+            "base_distinct_keys": self.base_distinct_keys,
+            "feature_distinct_keys": self.feature_distinct_keys,
+            "base_duplicate_keys": self.base_duplicate_keys,
+            "feature_duplicate_keys": self.feature_duplicate_keys,
+            "matched_keys": self.matched_keys,
+            "predicted_joined_rows": self.predicted_joined_rows,
+            "planned_lower_bound_bytes": self.planned_lower_bound_bytes,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +144,49 @@ class MlMarketData:
 def _decision_boundary(end: date) -> datetime:
     """Far-future coverage boundary: bounded reads accept any dataset end."""
     return datetime.max.replace(tzinfo=UTC)
+
+
+# Fixed-width byte floors per physical polars type; unknown types use one
+# 16-byte view/offset floor so the admission basis never under-counts a row.
+_DTYPE_LOWER_BOUND_BYTES: tuple[tuple[object, int], ...] = (
+    (pl.Int8, 1),
+    (pl.UInt8, 1),
+    (pl.Boolean, 1),
+    (pl.Int16, 2),
+    (pl.UInt16, 2),
+    (pl.Int32, 4),
+    (pl.UInt32, 4),
+    (pl.Float32, 4),
+    (pl.Date, 4),
+    (pl.Int64, 8),
+    (pl.UInt64, 8),
+    (pl.Float64, 8),
+    (pl.Datetime, 8),
+    (pl.Duration, 8),
+)
+_UNKNOWN_DTYPE_FLOOR_BYTES = 16
+
+
+def _dtype_floor_bytes(dtype: pl.DataType) -> int:
+    for candidate, width in _DTYPE_LOWER_BOUND_BYTES:
+        if dtype == candidate:
+            return width
+    return _UNKNOWN_DTYPE_FLOOR_BYTES
+
+
+def _schema_row_floor_bytes(schema: Mapping[str, pl.DataType]) -> int:
+    return sum(_dtype_floor_bytes(dtype) for dtype in schema.values())
+
+
+def _key_multiplicity_stats(keys: pl.DataFrame) -> dict[str, int]:
+    """Narrow key-cardinality scalars from an identity-column frame."""
+    multiplicities = keys.group_by(["instrument_id", "session"]).len()
+    duplicate_rows = int(multiplicities.filter(pl.col("len") > 1).height)
+    return {
+        "rows": int(keys.height),
+        "distinct_keys": int(multiplicities.height),
+        "duplicate_keys": duplicate_rows,
+    }
 
 
 class DirectMarketDataLoader:
@@ -412,6 +516,449 @@ class DirectMarketDataLoader:
             )
 
         return labels_by_horizon
+
+    def _scan_horizon_labels(
+        self, request: DirectDataRequest, horizon_sessions: int
+    ) -> pl.LazyFrame:
+        """Scan one horizon's narrow labels with predicates applied pre-collect.
+
+        Projects identity, target, availability, and realized columns only;
+        the ``horizon_sessions`` filter stays inside the lazy plan so no other
+        horizon is ever materialized. Wide-format horizons whose columns are
+        absent return a typed empty scan (the caller skips them silently,
+        matching the eager path).
+        """
+        present = set(self._label_store.content_columns(request.label_dataset_id))
+        realized = [c for c in _LABEL_REALIZED_COLUMNS if c in present]
+        if {
+            _LONG_HORIZON_COLUMN,
+            "net_alpha_target",
+            "label_available_time",
+        }.issubset(present):
+            return (
+                self._label_store.scan_bounded(
+                    request.label_dataset_id,
+                    AssetKind.STOCK,
+                    "labels",
+                    _decision_boundary(request.end),
+                    session_start=request.start,
+                    session_end=request.end,
+                    columns=[
+                        "instrument_id",
+                        "session",
+                        _LONG_HORIZON_COLUMN,
+                        "net_alpha_target",
+                        "label_available_time",
+                        *realized,
+                    ],
+                )
+                .filter(
+                    (pl.col(_LONG_HORIZON_COLUMN) == horizon_sessions)
+                    & pl.col("net_alpha_target").is_not_null()
+                )
+                .select(
+                    "instrument_id",
+                    "session",
+                    "net_alpha_target",
+                    "label_available_time",
+                    *realized,
+                )
+            )
+        target_column = f"horizon_{horizon_sessions}_target"
+        available_column = f"horizon_{horizon_sessions}_available"
+        if target_column not in present or available_column not in present:
+            return pl.DataFrame(
+                {
+                    "instrument_id": [],
+                    "session": [],
+                    "net_alpha_target": [],
+                    "label_available_time": [],
+                }
+            ).lazy()
+        return (
+            self._label_store.scan_bounded(
+                request.label_dataset_id,
+                AssetKind.STOCK,
+                "labels",
+                _decision_boundary(request.end),
+                session_start=request.start,
+                session_end=request.end,
+                columns=["instrument_id", "session", target_column, available_column],
+            )
+            .filter(pl.col(target_column).is_not_null())
+            .select(
+                "instrument_id",
+                "session",
+                pl.col(target_column).alias("net_alpha_target"),
+                pl.col(available_column).alias("label_available_time"),
+            )
+        )
+
+    def load_training_data(
+        self,
+        request: DirectDataRequest,
+        decision_time: datetime,
+        *,
+        checkpoint: Callable[[DirectLoadCheckpoint], None] | None = None,
+    ) -> NetAlphaResearchData:
+        """Compose training data with one decision-width materialization.
+
+        Builds the decision frame from lazy projected base/features and
+        collects it exactly once, applies warm-up and source renaming before
+        the wide frame escapes, and extracts each requested horizon from a
+        narrow lazy label scan that is released before the next horizon. At
+        most one decision-width frame plus one bounded narrow label frame
+        stay live, and no ``MlMarketData`` container is constructed.
+
+        A narrow identity-only preflight runs before any wide collect and
+        records base/feature row counts, distinct keys, duplicate-key counts,
+        and ``predicted_joined_rows=sum(base_count[key]*feature_count[key])``;
+        duplicate input keys or a predicted non-one-to-one join fails closed
+        before the decision frame is ever materialized.
+        """
+        from src.stocks.ml.features import stock_net_alpha_v1_roles
+
+        if isinstance(decision_time, str):
+            decision_time = datetime.fromisoformat(decision_time)
+        self._active_feature_set = request.feature_set
+
+        started_monotonic = time.monotonic()
+
+        def emit(stage: str, **scalars: object) -> None:
+            if checkpoint is not None:
+                checkpoint(
+                    DirectLoadCheckpoint(
+                        stage=stage,
+                        elapsed_ms=int(
+                            (time.monotonic() - started_monotonic) * 1000
+                        ),
+                        **scalars,  # type: ignore[arg-type]
+                    )
+                )
+
+        base_columns = self._available_columns(
+            self._base_store, request.base_dataset_id, _BASE_COLUMNS
+        )
+        required = ("instrument_id", "session", "open", "close", "volume", "trading_value")
+        missing = [c for c in required if c not in base_columns]
+        if missing:
+            raise ValueError(
+                f"base dataset {request.base_dataset_id} is missing required "
+                f"execution columns {missing}"
+            )
+        feature_identity = self._available_columns(
+            self._feature_store,
+            request.feature_dataset_id,
+            ("instrument_id", "session", "observation_time", "available_time"),
+        )
+        feature_columns = tuple(
+            c
+            for c in self._feature_store.content_columns(request.feature_dataset_id)
+            if c.startswith("feature__")
+        )
+        if not feature_columns:
+            raise ValueError(
+                f"feature dataset {request.feature_dataset_id} exposes no feature__ columns"
+            )
+
+        boundary = _decision_boundary(request.end)
+
+        # Narrow preflight: identity-only projections bound the join shape
+        # before any decision-width materialization can happen.
+        base_keys = self._base_store.scan_bounded(
+            request.base_dataset_id,
+            AssetKind.STOCK,
+            "base_panel",
+            boundary,
+            session_start=request.start,
+            session_end=request.end,
+            columns=["instrument_id", "session"],
+        ).collect()
+        feature_keys = self._feature_store.scan_bounded(
+            request.feature_dataset_id,
+            AssetKind.STOCK,
+            request.feature_set,
+            boundary,
+            session_start=request.start,
+            session_end=request.end,
+            columns=["instrument_id", "session"],
+        ).collect()
+        base_stats = _key_multiplicity_stats(base_keys)
+        feature_stats = _key_multiplicity_stats(feature_keys)
+        multiplicity_join = (
+            base_keys.group_by(["instrument_id", "session"])
+            .len()
+            .join(
+                feature_keys.group_by(["instrument_id", "session"]).len(),
+                on=["instrument_id", "session"],
+                suffix="_feature",
+            )
+        )
+        matched_keys = int(multiplicity_join.height)
+        predicted_joined_rows = int(
+            multiplicity_join.select(
+                (pl.col("len") * pl.col("len_feature")).sum().fill_null(0)
+            ).item()
+            or 0
+        )
+        del multiplicity_join, base_keys, feature_keys
+
+        plan = self._base_store.scan_bounded(
+            request.base_dataset_id,
+            AssetKind.STOCK,
+            "base_panel",
+            boundary,
+            session_start=request.start,
+            session_end=request.end,
+            columns=list(base_columns),
+        ).join(
+            self._feature_store.scan_bounded(
+                request.feature_dataset_id,
+                AssetKind.STOCK,
+                request.feature_set,
+                boundary,
+                session_start=request.start,
+                session_end=request.end,
+                columns=[*feature_identity, *feature_columns],
+            ),
+            on=["instrument_id", "session"],
+            how="inner",
+        )
+
+        # The join preserves whichever side projected these columns (the right
+        # frame is suffixed only on collision), so availability synthesis is a
+        # static decision over the two projections.
+        has_available = "available_time" in base_columns or "available_time" in feature_identity
+        has_observation = (
+            "observation_time" in base_columns or "observation_time" in feature_identity
+        )
+        if not has_available:
+            plan = plan.with_columns(
+                (pl.col("session") + pl.duration(hours=15, minutes=30)).alias(
+                    "available_time"
+                )
+            )
+        if not has_observation:
+            plan = plan.with_columns(pl.col("available_time").alias("observation_time"))
+
+        row_floor_bytes = _schema_row_floor_bytes(plan.collect_schema())
+        emit(
+            "direct_preflight",
+            owners=("base_keys", "feature_keys"),
+            base_rows=base_stats["rows"],
+            feature_rows=feature_stats["rows"],
+            base_distinct_keys=base_stats["distinct_keys"],
+            feature_distinct_keys=feature_stats["distinct_keys"],
+            base_duplicate_keys=base_stats["duplicate_keys"],
+            feature_duplicate_keys=feature_stats["duplicate_keys"],
+            matched_keys=matched_keys,
+            predicted_joined_rows=predicted_joined_rows,
+            planned_lower_bound_bytes=predicted_joined_rows * row_floor_bytes,
+        )
+        if (
+            base_stats["duplicate_keys"]
+            or feature_stats["duplicate_keys"]
+            or predicted_joined_rows != matched_keys
+        ):
+            raise ValueError(
+                "direct join preflight failed before collect: "
+                f"duplicate keys (base={base_stats['duplicate_keys']}, "
+                f"feature={feature_stats['duplicate_keys']}), "
+                f"predicted_joined_rows={predicted_joined_rows} vs one-to-one "
+                f"expectation {matched_keys}"
+            )
+
+        decision_frame = plan.collect()
+
+        if decision_frame.is_empty():
+            raise ValueError("direct base/feature composition produced no rows")
+        # Lazy joins do not guarantee per-instrument source order; normalize
+        # before applying the monotonicity invariant.
+        decision_frame = decision_frame.sort(["instrument_id", "session"])
+        numeric_columns = tuple(
+            c
+            for c in decision_frame.columns
+            if c.startswith("feature__")
+            and decision_frame.schema[c].is_numeric()
+        )
+        _validate_direct_frame(decision_frame, numeric_columns)
+        emit(
+            "direct_collected",
+            rows=int(decision_frame.height),
+            columns=len(decision_frame.columns),
+            frame_bytes=int(decision_frame.estimated_size()),
+            owners=("decision_frame",),
+        )
+        decision_height = decision_frame.height
+        manifest_columns = tuple(decision_frame.columns)
+
+        # Warm-up: drop the single pre-lookback row per instrument, then null
+        # the first remaining row's rolling sources exactly as the snapshot
+        # composition does.
+        feature_frame = (
+            decision_frame.with_columns(
+                pl.int_range(0, pl.len()).over("instrument_id").alias("__warmup_row")
+            )
+            .filter(pl.col("__warmup_row") > 0)
+            .drop("__warmup_row")
+        )
+        first_rows = feature_frame.with_columns(
+            pl.int_range(0, pl.len()).over("instrument_id").alias("__row")
+        )
+        for column in _WARMUP_NULL_COLUMNS:
+            if column in first_rows.columns:
+                first_rows = first_rows.with_columns(
+                    pl.when(pl.col("__row") == 0)
+                    .then(None)
+                    .otherwise(pl.col(column))
+                    .alias(column)
+                )
+        feature_frame = first_rows.drop("__row")
+        del first_rows
+        if feature_frame.is_empty():
+            raise ValueError("net-alpha direct feature frame is empty")
+        roles = stock_net_alpha_v1_roles()
+        rename_sources = {
+            f"feature__{source}": source
+            for source in roles
+            if f"feature__{source}" in feature_frame.columns
+        }
+        if rename_sources:
+            feature_frame = feature_frame.rename(rename_sources)
+        emit(
+            "feature_frame_ready",
+            rows=int(feature_frame.height),
+            columns=len(feature_frame.columns),
+            frame_bytes=int(feature_frame.estimated_size()),
+            owners=("feature_frame", "labels_by_horizon"),
+        )
+        decision_keys = decision_frame.select("instrument_id", "session")
+        del decision_frame
+
+        label_columns = self._label_store.content_columns(request.label_dataset_id)
+        long_format_ready = {
+            _LONG_HORIZON_COLUMN,
+            "net_alpha_target",
+            "label_available_time",
+        }.issubset(label_columns)
+        labels_by_horizon: dict[int, pl.DataFrame] = {}
+        join_evidence: list[HorizonJoinEvidence] = []
+        stage_a_horizons: set[int] = set()
+        for horizon in request.candidate_horizon_sessions:
+            if not long_format_ready and (
+                f"horizon_{horizon}_target" not in label_columns
+                or f"horizon_{horizon}_available" not in label_columns
+            ):
+                continue
+            label_scan = self._scan_horizon_labels(request, horizon)
+            horizon_rows = label_scan.collect()
+            del label_scan
+            if horizon_rows.is_empty():
+                raise ValueError(
+                    f"requested horizon {horizon} has zero usable labels"
+                )
+            stage_a_horizons.add(horizon)
+            duplicates = (
+                horizon_rows.group_by(["instrument_id", "session"])
+                .len()
+                .filter(pl.col("len") > 1)
+            )
+            if not duplicates.is_empty():
+                raise ValueError(
+                    f"duplicate label keys at horizon {horizon}: "
+                    f"{duplicates.height} (instrument_id, session) pairs"
+                )
+            available = horizon_rows.filter(
+                pl.col("net_alpha_target").is_not_null()
+                & pl.col("label_available_time").is_not_null()
+                & (pl.col("label_available_time") <= decision_time)
+            )
+            available_height = int(available.height)
+            joined = available.join(
+                feature_frame.select("instrument_id", "session"),
+                on=["instrument_id", "session"],
+                how="inner",
+            ).sort(["instrument_id", "session"])
+            del available
+            if joined.is_empty():
+                join_evidence.append(
+                    HorizonJoinEvidence(
+                        horizon_sessions=horizon,
+                        feature_rows=decision_height,
+                        label_rows=int(available_height),
+                        joined_rows=0,
+                        drop_reasons=("no point-in-time available labels",),
+                        decision_rows=int(feature_frame.height),
+                        realized_rows=0,
+                    )
+                )
+                continue
+            labels_by_horizon[horizon] = joined
+            emit(
+                f"label_horizon_{horizon}_joined",
+                rows=int(joined.height),
+                columns=len(joined.columns),
+                frame_bytes=int(joined.estimated_size()),
+                owners=(f"labels_by_horizon[{horizon}]", "feature_frame"),
+            )
+            join_evidence.append(
+                HorizonJoinEvidence(
+                    horizon_sessions=horizon,
+                    feature_rows=decision_height,
+                    label_rows=int(available_height),
+                    joined_rows=joined.height,
+                    decision_rows=int(feature_frame.height),
+                    realized_rows=joined.height,
+                )
+            )
+            del horizon_rows
+
+        if not stage_a_horizons:
+            raise ValueError("no candidate horizon produced usable labels")
+        # Mirror the eager path's post-load horizon validation before the
+        # point-in-time composition verdict.
+        missing_horizons = [
+            h for h in request.candidate_horizon_sessions if h not in stage_a_horizons
+        ]
+        if missing_horizons:
+            raise ValueError(
+                f"ML market data missing requested horizons: {missing_horizons}"
+            )
+        if not labels_by_horizon:
+            raise ValueError(
+                "no candidate horizon produced point-in-time available labels"
+            )
+        labels_by_horizon = {h: labels_by_horizon[h] for h in sorted(labels_by_horizon)}
+
+        feature_manifest = self._read_feature_manifest(request)
+        manifest_source: DatasetManifest | None = feature_manifest
+        if manifest_source is None:
+            sessions = sorted(decision_keys["session"].unique().to_list())
+            manifest_source = make_manifest(
+                asset_kind=AssetKind.STOCK,
+                columns=list(manifest_columns),
+                feature_set="stock_net_alpha_v1",
+                label_definition="net_alpha_o2o",
+                label_horizon_sessions=max(labels_by_horizon),
+                time_start=sessions[0],
+                time_end=sessions[-1],
+                generated_time=sessions[-1],
+                row_count=decision_height,
+                provider_version="direct-loader",
+                universe_policy_version="direct-loader",
+            )
+        manifest = replace(
+            manifest_source,
+            feature_set=CANONICAL_FEATURE_SET,
+            feature_set_hash=manifest_source.feature_set_hash or "net-alpha-v1",
+            row_count=feature_frame.height,
+        )
+        return NetAlphaResearchData(
+            feature_frame=feature_frame,
+            labels_by_horizon=labels_by_horizon,
+            manifest=manifest,
+            join_evidence=tuple(join_evidence),
+        )
 
 
 def _validate_direct_frame(
