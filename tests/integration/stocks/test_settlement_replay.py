@@ -10,6 +10,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import polars as pl
+import pytest
+
 from src.core.costs import CostPoint, CostSchedule, default_stress_schedule
 from src.core.instruments import AssetKind, Instrument
 from src.core.portfolio import Allocation, PortfolioSnapshot
@@ -208,3 +211,138 @@ def test_buys_cannot_spend_unsettled_cash(tmp_path) -> None:
     for row in result.ledger:
         assert row.settled_cash >= 0.0 - 1e-8
         assert row.unsettled_cash >= 0.0 - 1e-8
+
+
+BACKTEST_SEMANTICS_01 = "BACKTEST-SEMANTICS-01"
+
+
+def test_backtest_semantics_01_prepared_matches_dataframe_reference(tmp_path) -> None:
+    """BACKTEST-SEMANTICS-01: prepared engine equals the DataFrame reference.
+
+    Next-open execution, T+2 settlement, partial fills, capacity limits, action
+    coverage handling, and base/stress ledger ordering match the DataFrame
+    reference path exactly when the planner sees identical inputs.
+    """
+    from src.stocks.backtesting.engine import PreparedReplayDecision
+
+    df = stock_instrument_df(n_sessions=40, n_tickers=2, horizon=5)
+    manifest = stock_manifest(columns=df.columns, horizon=5)
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    publish_baseline_artifact(
+        registry,
+        artifact_id="a001",
+        feature_schema_hash=manifest.schema_hash,
+    )
+    instruments = {
+        i: Instrument(i, AssetKind.STOCK, "KRX", i.split(":")[-1], "KRW", lot_size=1)
+        for i in sorted(df["instrument_id"].unique().to_list())
+    }
+    artifacts = ArtifactSchedule(
+        slots=(
+            ArtifactSlot(
+                eligible_from=datetime(2024, 1, 1, tzinfo=UTC),
+                eligible_to=datetime(2024, 3, 31, tzinfo=UTC),
+                artifact_id="a001",
+            ),
+        )
+    )
+    request = BacktestRequest(
+        strategy_id="semantics",
+        start_time=datetime(2024, 1, 1, tzinfo=UTC),
+        end_time=datetime(2024, 3, 31, tzinfo=UTC),
+        decision_session_indices=(5, 10, 15),
+        cost_schedule=t2_schedule(),
+        stress_cost_schedule=default_stress_schedule(),
+        risk_policy=StockRiskPolicy(top_k=5, turnover_budget=1.0),
+    )
+    portfolio = PortfolioSnapshot(
+        account_snapshot_id="acc-sem",
+        as_of=datetime(2024, 1, 1, tzinfo=UTC),
+        settled_cash=100_000_000.0,
+        unsettled_cash=0.0,
+        positions=(),
+    )
+
+    reference_backtester = StockBacktester(
+        registry=registry,
+        instruments=instruments,
+        manifest=manifest,
+        cost_schedule=t2_schedule(),
+        stress_cost_schedule=default_stress_schedule(),
+    )
+    reference = reference_backtester.run(df, artifacts, portfolio, request)
+
+    prepared_backtester = StockBacktester(
+        registry=registry,
+        instruments=instruments,
+        manifest=manifest,
+        cost_schedule=t2_schedule(),
+        stress_cost_schedule=default_stress_schedule(),
+        decision_provider=lambda dt, et: PreparedReplayDecision(
+            dt, et, df.filter(pl.col("available_time") <= dt)
+        ),
+        scenario_planner=lambda prepared, port, creq: run_trading_cycle_like(
+            prepared, port, creq, registry, instruments
+        ),
+    )
+    prepared = prepared_backtester.run(df, artifacts, portfolio, request)
+
+    assert len(prepared.ledger) == len(reference.ledger)
+    for prepared_row, reference_row in zip(
+        prepared.ledger, reference.ledger, strict=True
+    ):
+        assert prepared_row.session == reference_row.session
+        for field in (
+            "settled_cash", "unsettled_cash", "positions_value",
+            "accrued_costs", "equity",
+        ):
+            assert getattr(prepared_row, field) == pytest.approx(
+                getattr(reference_row, field), abs=1e-8
+            ), f"ledger {field} diverged at {prepared_row.session}"
+    assert [t.session for t in prepared.trades] == [
+        t.session for t in reference.trades
+    ]
+    for prepared_trade, reference_trade in zip(
+        prepared.trades, reference.trades, strict=True
+    ):
+        assert (
+            prepared_trade.instrument_id,
+            prepared_trade.side,
+            prepared_trade.quantity,
+            prepared_trade.reason,
+        ) == (
+            reference_trade.instrument_id,
+            reference_trade.side,
+            reference_trade.quantity,
+            reference_trade.reason,
+        )
+        if reference_trade.price is not None:
+            assert prepared_trade.price == pytest.approx(reference_trade.price)
+            assert prepared_trade.cost == pytest.approx(reference_trade.cost)
+
+
+def run_trading_cycle_like(prepared, portfolio, cycle_request, registry, instruments):
+    """Run the same default trading-cycle planner on the prepared snapshot."""
+    from src.core.costs import default_base_schedule
+    from src.stocks.data.contracts import DatasetSnapshot
+
+    from src.stocks.workflows.trading_cycle import MarketSlice
+
+    slice_frame = MarketSlice(
+        frame=prepared.visible,
+        decision_time=cycle_request.decision_time,
+        execution_time=cycle_request.execution_time,
+    )
+    snapshot = DatasetSnapshot(manifest=stock_manifest(
+        columns=slice_frame.frame.columns, horizon=5
+    ), frame=slice_frame.frame)
+    del default_base_schedule
+    from src.stocks.workflows.trading_cycle import run_trading_cycle
+
+    return run_trading_cycle(
+        snapshot,
+        registry,
+        instruments,
+        portfolio,
+        cycle_request,
+    )

@@ -467,3 +467,68 @@ def test_primary_preserves_selected_nonfirst_execution_cell() -> None:
     assert result.primary_horizon_sessions == 10
     assert result.primary_rebalance_frequency_sessions == 10
     assert result.primary_top_k == 20
+
+
+BOOTSTRAP_PARITY_01 = "BOOTSTRAP-PARITY-01"
+
+
+def test_bootstrap_parity_01_pooled_matches_materialized_reference() -> None:
+    """BOOTSTRAP-PARITY-01: pooled bounded kernel equals the legacy reference.
+
+    Seeded starts and draw order are exact, boot means differ within 1e-15,
+    the centered p-value/quantiles match, and the pooled workspace is
+    O(B * ceil(N / L) + N) rather than O(B * N).
+    """
+    import numpy as np
+
+    from src.stocks.ml.horizons import _segment_block_length, _cohort_bootstrap
+
+    rng = np.random.default_rng(11)
+    segment_ids = (0, 0, 0, 0, 1, 1, 1, 1, 1)
+    log_growth = tuple(
+        float(v) * 0.004 for v in rng.normal(size=len(segment_ids))
+    )
+    n_bootstrap = 120
+    seed = 42
+    min_block = 2
+
+    # Legacy materialized reference: identical grouping order, seeded starts,
+    # block geometry, truncation, pooling weights, and centered p-value.
+    by_segment: dict[int, list[float]] = {}
+    for segment, value in zip(segment_ids, log_growth, strict=True):
+        by_segment.setdefault(int(segment), []).append(float(value))
+    distributions = []
+    weights = []
+    for segment in sorted(by_segment):
+        values = np.asarray(by_segment[segment], dtype=float)
+        block = max(_segment_block_length(values.size), min_block)
+        n_blocks = int(np.ceil(values.size / block))
+        seg_rng = np.random.default_rng(seed + segment)
+        starts = seg_rng.integers(
+            0, max(1, values.size - block + 1), size=(n_bootstrap, n_blocks)
+        )
+        offsets = np.arange(block)
+        index = (starts[:, :, None] + offsets[None, None, :]).reshape(
+            n_bootstrap, n_blocks * block
+        )[:, : values.size]
+        distributions.append(values[index].mean(axis=1))
+        weights.append(float(values.size))
+    total = sum(weights)
+    reference = sum(w * d for w, d in zip(weights, distributions, strict=True)) / total
+    observed = float(sum(log_growth) / len(log_growth))
+    reference_p_value = float(np.mean(reference >= 2.0 * observed))
+
+    result = _cohort_bootstrap(log_growth, segment_ids, n_bootstrap, seed, min_block)
+    assert result is not None
+    assert result.boot_means.shape == reference.shape
+    assert float(np.max(np.abs(result.boot_means - reference))) <= 1e-15
+    assert result.p_value == reference_p_value
+    assert result.observed_mean == observed
+    assert result.lower_mean(0.05) == pytest.approx(
+        float(np.quantile(reference, 0.05)), abs=1e-15
+    )
+    expected_blocks = sum(
+        int(np.ceil(len(by_segment[s]) / max(_segment_block_length(len(by_segment[s])), min_block)))
+        for s in sorted(by_segment)
+    )
+    assert result.n_blocks_total == expected_blocks

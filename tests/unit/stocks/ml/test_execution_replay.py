@@ -27,6 +27,7 @@ from src.stocks.ml.execution_replay import (
     prepare_execution_replay_batch,
     replay_execution_equivalent,
     replay_execution_equivalent_batch,
+    stream_execution_replay_batch,
 )
 from src.stocks.ml.training import (
     _coverage_failure_reason,
@@ -34,6 +35,13 @@ from src.stocks.ml.training import (
 )
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.trading.portfolio_constructor import StockRiskPolicy
+from src.stocks.ml.replay_preparation import (
+    build_prepared_replay_segment,
+    iter_replay_segment_metadata,
+)
+from src.stocks.ml.replay_resources import (
+    read_cgroup_limit_bytes,
+)
 from tests.fixtures.stocks.helpers import stock_liquidity_model
 
 _SESSION_COLUMN = "session"
@@ -832,3 +840,159 @@ def test_parallel_completion_01_ordered_parity() -> None:
         assert par_ev.invested_interval_count == seq_ev.invested_interval_count, f"invested mismatch at request {i}"
         assert par_ev.invested_interval_fraction == seq_ev.invested_interval_fraction, f"invested frac mismatch at request {i}"
         assert par_ev.filled_cycle_count == seq_ev.filled_cycle_count, f"filled cycle mismatch at request {i}"
+
+
+REPLAY_BUDGET_01 = "REPLAY-BUDGET-01"
+
+
+def test_replay_budget_01_breach_fails_closed_before_any_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REPLAY-BUDGET-01: pre-build invariant breach never allocates.
+
+    If current_live + planned + largest_next exceeds the effective limit, the
+    failure is closed and PreparedReplayMarket.build_call_count stays zero.
+    """
+    from src.stocks.backtesting.market import PreparedReplayMarket
+    from src.stocks.ml.execution_replay import stream_execution_replay_batch
+    from src.stocks.ml.replay_resources import MemoryBudgetExceededError
+
+    market = _market_frame()
+    context = _context(market)
+    scores = _score_frame()
+    request = _request(market, scores, _decision_sessions(market), context)
+
+    PreparedReplayMarket.reset_build_call_count()
+
+    def _forbidden_build(cls, *args: object, **kwargs: object) -> object:
+        raise AssertionError("no market may be built on a breached budget")
+
+    monkeypatch.setattr(PreparedReplayMarket, "build", classmethod(_forbidden_build))
+
+    with pytest.raises(MemoryBudgetExceededError):
+        stream_execution_replay_batch(
+            (request,), request_limit_bytes=64, stats={}
+        )
+
+
+REPLAY_CGROUP_01 = "REPLAY-CGROUP-01"
+
+
+def test_replay_cgroup_01_effective_limit_is_min_of_finite_contributors() -> None:
+    """REPLAY-CGROUP-01: effective limit semantics under mixed limits.
+
+    effective_limit equals the minimum finite request/cgroup/address-space
+    limit; unlimited sentinels are ignored and host RAM never raises it.
+    """
+    from src.stocks.ml.replay_resources import resolve_effective_memory_limit
+
+    mib = 1024 * 1024
+    resolved = resolve_effective_memory_limit(
+        4096 * mib,
+        cgroup_reader=lambda root: 2048 * mib,
+        address_space_reader=lambda: 8192 * mib,
+        host_reader=lambda: 64 * mib,
+    )
+    assert resolved.effective_limit_bytes == 2048 * mib
+
+    unbounded = resolve_effective_memory_limit(
+        None,
+        cgroup_reader=lambda root: None,
+        address_space_reader=lambda: None,
+        host_reader=lambda: 1024,
+    )
+    assert unbounded.effective_limit_bytes is None
+
+    # A huge cgroup v1 sentinel must not masquerade as a finite ceiling.
+    from pathlib import Path
+
+    v1_root = Path("/nonexistent-cgroup-root")
+    assert read_cgroup_limit_bytes(v1_root) is None
+
+
+
+
+REPLAY_LOOKBACK_01 = "REPLAY-LOOKBACK-01"
+
+
+def test_replay_lookback_01_first_session_statistics_match_full_history() -> None:
+    """REPLAY-LOOKBACK-01: causal lookback rows restore full-history statistics.
+
+    Pre-segment causal rows make first-session ADTV equal the full-history
+    rolling reference while emitted evidence begins at the segment start.
+    """
+    import math
+
+    market_rows: list[dict[str, object]] = []
+    score_rows: list[dict[str, object]] = []
+    n_sessions = 30
+    sessions = [
+        datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(n_sessions)
+    ]
+    for index, session in enumerate(sessions):
+        for ticker in range(3):
+            price = 100.0 + ticker + index * 0.5
+            market_rows.append(
+                {
+                    "instrument_id": f"KRX:{ticker + 1:05d}",
+                    "session": session,
+                    "observation_time": session.replace(hour=15, minute=30),
+                    "available_time": session.replace(hour=15, minute=31),
+                    "open": price,
+                    "close": price * 1.01,
+                    "volume": 1e6,
+                    "trading_value": price * 1e6,
+                    "sector": f"S{ticker % 2}",
+                }
+            )
+            score_rows.append(
+                {
+                    "instrument_id": f"KRX:{ticker + 1:05d}",
+                    "session": session,
+                    _SEGMENT_COLUMN: 0,
+                    _SCORE_COLUMN: 0.01 + ticker * 0.001,
+                }
+            )
+    market = pl.DataFrame(market_rows)
+    scores = pl.DataFrame(score_rows)
+    decisions = tuple(sessions[10:])
+    context = _context(market)
+    request = ExecutionEquivalentReplayRequest(
+        context=context,
+        market_frame=market,
+        score_frame=scores,
+        segment_column=_SEGMENT_COLUMN,
+        decision_sessions_by_segment={0: decisions},
+        horizon_sessions=5,
+    )
+
+    stats: dict[str, int] = {}
+    evidence = stream_execution_replay_batch((request,), stats=stats)[0]
+
+    # First decision session's ADTV equals the full-history rolling mean.
+    first_decision = sessions[10]
+    reference = (
+        market.sort(["session", "instrument_id"])
+        .with_columns(
+            pl.col("trading_value")
+            .rolling_mean(20, min_samples=1)
+            .over("instrument_id")
+            .alias("__adtv")
+        )
+        .filter(pl.col("session") == first_decision)["__adtv"]
+        .to_numpy()
+    )
+    metadata = iter_replay_segment_metadata(request)[0]
+    assert metadata.lookback_session_count > 0
+    segment = build_prepared_replay_segment(request, metadata)
+    position = list(segment.prepared_market.sessions).index(first_decision)
+    start, stop = segment.prepared_market.session_ranges[position]
+    assert segment.prepared_market.adtv[start:stop] == pytest.approx(reference)
+
+    # Emitted evidence begins exactly at the declared segment start window.
+    expected_intervals = n_sessions - 10 - 1
+    assert len(evidence.base_log_growth) == expected_intervals
+    assert len(evidence.stress_log_growth) == expected_intervals
+    assert all(math.isfinite(value) for value in evidence.base_log_growth)
+    assert stats["prepared_segment_build_count"] == 1
+
