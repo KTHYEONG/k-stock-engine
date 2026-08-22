@@ -28,7 +28,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from src.stocks.ml.data import HorizonOutcomeCoverage
@@ -63,10 +63,7 @@ from src.stocks.ml.execution_replay import (
     ProfileReplayEvidence,
     exposure_matched_benchmark_log_growth,
     instruments_from_frame,
-    plan_execution_replay_resources,
-    prepare_execution_replay_batch,
     replay_execution_equivalent,
-    replay_execution_equivalent_batch,
     stream_execution_replay_batch,
 )
 from src.stocks.ml.features import (
@@ -109,12 +106,21 @@ from src.stocks.ml.models import (
     ElasticNetNetAlpha,
     LightGbmNetAlpha,
     NetAlphaModelConfig,
-    fit_weighted_elastic_path,
 )
-from src.stocks.ml.result_ledger import (
+from src.stocks.ml.preparation import (
+    PreparedTrainingMatrix,
+    TrainingPanelView,
+    prepare_folds,
+    prepare_training_matrix,
+)
+from src.stocks.ml.telemetry import TrainingTelemetry
+from src.stocks.ml.telemetry import (
     current_rss_mib as _current_rss_mib,
 )
-from src.stocks.ml.result_ledger import peak_rss_mib as _peak_rss_mib
+from src.stocks.ml.telemetry import peak_rss_mib as _peak_rss_mib
+
+__all__ = ["TrainingTelemetry", "train_net_alpha_model"]
+
 from src.stocks.observability.contracts import (
     DiagnosticCategory,
     DiagnosticStage,
@@ -171,42 +177,6 @@ def _enforce_memory_budget(request: NetAlphaTrainingRequest, stage: str) -> None
         raise _MemoryBudgetExceededError(stage)
 
 
-class TrainingTelemetry:
-    """Bounded scalar/dictionary observer for one training run.
-
-    The telemetry observes only already-computed values: it never fits a second
-    model, runs a second replay, or rescans the panel. The terminal projection
-    is embedded under ``run_observability`` in the artifact ``metrics.json``.
-    """
-
-    def __init__(self, clock: Callable[[], datetime] | None = None) -> None:
-        self._clock = clock or (lambda: datetime.now(UTC))
-        self._started_at = self._clock()
-        self._last_at = self._started_at
-        self._phases: list[dict[str, object]] = []
-        self._horizons: list[dict[str, object]] = []
-
-    def phase(self, name: str, evidence: Mapping[str, object] | None = None) -> None:
-        now = self._clock()
-        elapsed_ms = int((now - self._last_at).total_seconds() * 1000)
-        sample: dict[str, object] = {
-            "name": name,
-            "elapsed_ms": elapsed_ms,
-            "peak_rss_mib": _peak_rss_mib(),
-            "rss_mib": _current_rss_mib(),
-        }
-        if evidence:
-            sample.update(dict(evidence))
-        self._phases.append(sample)
-        self._last_at = now
-
-    def add_horizon(self, entry: Mapping[str, object]) -> None:
-        self._horizons.append(dict(entry))
-
-    def to_dict(self) -> dict[str, object]:
-        return {"phases": list(self._phases), "horizons": list(self._horizons)}
-
-
 @dataclass(frozen=True, slots=True)
 class HorizonDiscovery:
     """Immutable outcome of per-horizon OOF discovery.
@@ -248,6 +218,57 @@ class HorizonDiscovery:
     )
     path_evaluation_count: int = 0
     path_evaluation_bound: int = 0
+
+
+class TrainingOrchestrator:
+    """Public orchestrator facade owning one mainline training run.
+
+    Holds the immutable inputs, the operation-scoped telemetry, and the
+    pre-flight feature-set gate; ``run`` drives the single training entry
+    point so CLI and programmatic callers share one orchestration boundary.
+    """
+
+    def __init__(
+        self,
+        data: NetAlphaResearchData,
+        registry: ModelArtifactRegistry,
+        request: NetAlphaTrainingRequest,
+        *,
+        diagnostics: object | None = None,
+    ) -> None:
+        self.data = data
+        self.registry = registry
+        self.request = request
+        self.diagnostics = diagnostics
+        self.telemetry = TrainingTelemetry()
+
+    def candidate_plan(self) -> dict[str, object]:
+        """Bounded static plan of the discovery frontier for this run."""
+        return {
+            "candidate_horizons": list(self.request.candidate_horizon_sessions),
+            "fold_count": int(self.request.fold_count),
+            "embargo_sessions": int(self.request.embargo_sessions),
+            "max_rss_mib": self.request.max_rss_mib,
+        }
+
+    def run(self) -> ModelManifest:
+        """Validate the net-alpha contract and execute the mainline run."""
+        if self.data.manifest.feature_set != CANONICAL_FEATURE_SET:
+            raise ValueError(
+                f"train_net_alpha_model requires a net-alpha snapshot "
+                f"(feature_set={CANONICAL_FEATURE_SET!r}); got "
+                f"{self.data.manifest.feature_set!r}. Materialize a net-alpha "
+                "snapshot via `python -m src.stocks.cli.build_research "
+                "--pipeline net-alpha`."
+            )
+        manifest = train_net_alpha_model(
+            self.data,
+            self.registry,
+            self.request,
+            diagnostics=self.diagnostics,  # type: ignore[arg-type]
+        )
+        self.telemetry.phase("orchestration_complete", {"selected": manifest.model_type})
+        return manifest
 
 
 def train_net_alpha_model(
@@ -457,6 +478,7 @@ def train_net_alpha_model(
             schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
             telemetry=telemetry,
         )
+
 
     cache = _OofCache(registry.root / ".training")
     try:
@@ -913,109 +935,6 @@ def _challenger_factory(
     return factory
 
 
-def _score_is_constant(values: np.ndarray) -> bool:
-    """True when every finite value is equal (a degenerate prediction)."""
-    finite = np.asarray(values, dtype=float)
-    finite = finite[np.isfinite(finite)]
-    if finite.size == 0:
-        return True
-    return bool(np.all(finite == finite[0]))
-
-
-def _standardized_design(
-    frame: pl.DataFrame, learner_columns: tuple[str, ...]
-) -> tuple[np.ndarray, np.ndarray] | None:
-    """Fold-standardized Float32 design and its finite-valid mask.
-
-    Mirrors the weighted preprocessing used by ``ElasticNetNetAlpha.fit`` and
-    ``fit_weighted_elastic_path`` so the nested ``alpha_max`` and the actual
-    fold fit see the identical standardized design. Returns ``None`` when any
-    learner column is missing.
-    """
-    from src.stocks.ml.models import (
-        _float32_matrix,
-        normalize_session_weights,
-        session_balanced_weights,
-        weighted_fold_statistics,
-    )
-
-    missing = [c for c in learner_columns if c not in frame.columns]
-    if missing:
-        return None
-    features = _float32_matrix(frame, learner_columns)
-    valid = np.isfinite(features).all(axis=1)
-    if not valid.any():
-        return features, valid
-    weights = normalize_session_weights(
-        session_balanced_weights(frame), total=int(valid.sum())
-    )
-    mean, std = weighted_fold_statistics(features, weights, valid)
-    return (features - mean) / std, valid
-
-
-def _compute_alpha_max(
-    train_slice: pl.DataFrame,
-    learner_columns: tuple[str, ...],
-    fraction: float,
-    seed: int,
-    *,
-    standardized: tuple[np.ndarray, np.ndarray] | None = None,
-) -> tuple[float, float] | None:
-    """Scale-invariant absolute ElasticNet penalty for one training slice.
-
-    ``alpha_max = max(abs(X.T @ (w * y_centered))) / sum(w)`` on the weighted
-    fold-standardized design; the candidate absolute alpha is
-    ``fraction * alpha_max``. Returns ``(alpha, alpha_max)`` or ``None`` when
-    the slice has no usable rows. The ``standardized`` design may be supplied
-    precomputed by the caller so a nested alpha search reuses one design build
-    across every penalty fraction.
-    """
-    del seed
-    if TARGET_COLUMN not in train_slice.columns:
-        return None
-    if standardized is None:
-        standardized = _standardized_design(train_slice, learner_columns)
-    if standardized is None:
-        return None
-    from src.stocks.ml.models import (
-        normalize_session_weights,
-        session_balanced_weights,
-    )
-
-    features, valid = standardized
-    targets = train_slice[TARGET_COLUMN].cast(pl.Float64).to_numpy()
-    finite = valid & np.isfinite(targets)
-    if not finite.any():
-        return None
-    weights = normalize_session_weights(
-        session_balanced_weights(train_slice), total=int(finite.sum())
-    )
-    sub = weights[finite]
-    x = features[finite]
-    y = targets[finite]
-    y_centered = y - float(np.sum(sub * y) / float(np.sum(sub)))
-    n = float(np.sum(sub))
-    alpha_max = float(np.max(np.abs(x.T @ (sub * y_centered)))) / n
-    if not np.isfinite(alpha_max) or alpha_max <= 0.0:
-        return None
-    return fraction * alpha_max, alpha_max
-
-
-def _best_fraction(
-    candidates: tuple[float, ...], ics: dict[float, list[float]]
-) -> float:
-    """Largest mean nested rank IC; a tie within 1e-12 picks the stronger penalty."""
-    best = candidates[0]
-    best_ic = float(np.mean(ics[best]))
-    for fraction in candidates[1:]:
-        ic = float(np.mean(ics[fraction]))
-        if ic > best_ic + _ALPHA_TIE_TOLERANCE or (
-            abs(ic - best_ic) <= _ALPHA_TIE_TOLERANCE and fraction > best
-        ):
-            best, best_ic = fraction, ic
-    return best
-
-
 def _select_elastic_alpha(
     fold_train: pl.DataFrame,
     request: NetAlphaTrainingRequest,
@@ -1024,94 +943,49 @@ def _select_elastic_alpha(
     grid: RegularizationGrid,
     manifest: ModelManifest,
 ) -> tuple[float | None, float | None, float | None, int]:
-    """Fold-local, scale-invariant ElasticNet penalty selection.
+    """Fold-local scale-invariant penalty selection (prepared-array adapter).
 
-    Uses only the outer fold's purged training rows and nested purged expanding
-    folds. Every fraction is evaluated on its nested validation rank IC through
-    one deterministic weighted coordinate path per inner fold (``alpha_max`` is
-    derived once from the shared standardized design); a candidate whose finite
-    predictions are constant in any evaluated inner fold is discarded. Returns
-    ``(selected_alpha, selected_fraction, alpha_max, path_evaluations)`` or
-    ``(None, None, None, path_evaluations)`` when every candidate fails.
+    Keeps the historical frame signature for late-bound refit paths while the
+    nested selection itself runs on prepared arrays through ``ml.fitting``.
+    Returns ``(selected_alpha, selected_fraction, alpha_max,
+    path_evaluations)`` or ``(None, None, None, path_evaluations)`` when every
+    candidate fails.
     """
     del manifest
-    nested_splitter = PurgedWalkForward(
-        n_folds=request.fold_count,
-        label_horizon_sessions=horizon_sessions,
-        embargo_sessions=request.embargo_sessions,
-        session_column=_SESSION_IDX,
-        min_train_sessions=_NESTED_MIN_TRAIN_SESSIONS,
+    from src.stocks.ml.fitting import _select_elastic_alpha_prepared
+    from src.stocks.ml.labels import REALIZED_RETURN_COLUMN, TARGET_COLUMN
+    from src.stocks.ml.models import _float32_matrix
+    from src.stocks.ml.preparation import (
+        PreparedHorizonLabels,
+        prepare_matrix_from_frame,
     )
-    nested = nested_splitter.inner_folds(fold_train, n_inner=_NESTED_INNER_FOLDS)
-    if not nested:
-        return None, None, None, 0
-    candidate_ics: dict[float, list[float]] = {fraction: [] for fraction in grid.fractions}
-    constant: set[float] = set()
-    alpha_maxes: list[float] = []
-    path_evaluations = 0
-    realized_join = fold_train.select(
-        _ID_COLUMN, SESSION_COLUMN, REALIZED_RETURN_COLUMN
-    )
-    for inner in nested:
-        inner_train = fold_train[inner.train_mask]
-        inner_val = fold_train[inner.validation_mask]
-        if inner_train.is_empty() or inner_val.is_empty():
-            continue
-        if (
-            TARGET_COLUMN not in inner_train.columns
-            or REALIZED_RETURN_COLUMN not in inner_val.columns
-        ):
-            continue
-        solution = fit_weighted_elastic_path(
-            inner_train, learner_columns, grid.fractions, request.seed
-        )
-        if solution is None:
-            continue
-        path_evaluations += 1
-        alpha_maxes.append(solution.alpha_max)
-        scores_by_fraction = solution.predict(inner_val, learner_columns)
-        for fraction in grid.fractions:
-            scores = scores_by_fraction[fraction]
-            if _score_is_constant(scores):
-                constant.add(fraction)
-                continue
-            scored = inner_val.with_columns(
-                pl.Series(SCORE_COLUMN, scores.astype(np.float64))
-            ).select(_ID_COLUMN, SESSION_COLUMN, SCORE_COLUMN)
-            joined = scored.join(realized_join, on=[_ID_COLUMN, SESSION_COLUMN], how="inner")
-            if joined.is_empty():
-                continue
-            candidate_ics[fraction].append(_rank_ic(joined))
 
-    usable = [f for f in grid.fractions if f not in constant and candidate_ics[f]]
-    if usable:
-        best = _best_fraction(tuple(usable), candidate_ics)
-        alpha_max = float(np.mean(alpha_maxes)) if alpha_maxes else 0.0
-        if alpha_max <= 0.0:
-            return None, None, None, min(path_evaluations, _NESTED_INNER_FOLDS)
-        return (
-            best * alpha_max,
-            best,
-            alpha_max,
-            min(path_evaluations, _NESTED_INNER_FOLDS),
+    if TARGET_COLUMN not in fold_train.columns:
+        return None, None, None, 0
+    features = _float32_matrix(fold_train, learner_columns)
+    if not np.isfinite(features).any():
+        return None, None, None, 0
+    matrix = prepare_matrix_from_frame(fold_train, learner_columns)
+    row_index = np.arange(fold_train.height, dtype=np.int64)
+    target = fold_train[TARGET_COLUMN].to_numpy().astype(np.float64)
+    if REALIZED_RETURN_COLUMN in fold_train.columns:
+        realized = (
+            fold_train[REALIZED_RETURN_COLUMN].to_numpy().astype(np.float64)
         )
-    non_constant = [f for f in grid.fractions if f not in constant]
-    if non_constant:
-        # No usable inner fold: pick the stronger (largest) fraction by the
-        # same deterministic order and derive its alpha on the full fold slice.
-        best = max(non_constant)
-        solution = fit_weighted_elastic_path(
-            fold_train, learner_columns, grid.fractions, request.seed
-        )
-        if solution is None:
-            return None, None, None, min(path_evaluations, _NESTED_INNER_FOLDS)
-        return (
-            best * solution.alpha_max,
-            best,
-            solution.alpha_max,
-            min(path_evaluations, _NESTED_INNER_FOLDS) + 1,
-        )
-    return None, None, None, min(path_evaluations, _NESTED_INNER_FOLDS)
+    else:
+        realized = np.full(fold_train.height, np.nan)
+    horizon_view = PreparedHorizonLabels(
+        horizon_sessions=int(horizon_sessions),
+        row_index=row_index,
+        target=target,
+        realized=realized,
+        available_time_ns=np.zeros(fold_train.height, dtype=np.int64),
+        risk_residual=np.full(fold_train.height, np.nan),
+        reference_cost=np.full(fold_train.height, np.nan),
+    )
+    return _select_elastic_alpha_prepared(
+        matrix, horizon_view, row_index, request, grid
+    )
 
 
 def _build_label_join(data: NetAlphaResearchData, horizon_sessions: int) -> pl.DataFrame:
@@ -1431,6 +1305,8 @@ def _replay_costs_batch(
     market_frame: pl.DataFrame,
     manifest: DatasetManifest,
     specs: Sequence[tuple[int, int, PolicyProfile]],
+    *,
+    stats_out: dict[str, int] | None = None,
 ) -> Mapping[tuple[int, int, int, str], ProfileReplayEvidence]:
     """Cadence-group batch replay: one prepared batch per cadence, shared across profiles.
 
@@ -1501,10 +1377,11 @@ def _replay_costs_batch(
             decision_sessions_by_segment=decision_sessions_by_segment,
             horizon_sessions=horizon_sessions,
         )
-        batch = prepare_execution_replay_batch(primary_request)
+        del primary_request  # streaming prepares segments lazily, not eagerly
         batch_replay_requests: list[ExecutionEquivalentReplayRequest] = []
         batch_keys: list[tuple[int, int, int, str]] = []
         batch_shadow_contexts: list[ExecutionReplayContext | None] = []
+        shadow_requests_list: list[ExecutionEquivalentReplayRequest] = []
         for top_k, profile in group:
             context = _execution_replay_context(
                 request, manifest, market_frame, profile,
@@ -1543,41 +1420,13 @@ def _replay_costs_batch(
             else:
                 batch_shadow_contexts.append(None)
 
-        if batch_replay_requests:
-            cadence_requests = batch_replay_requests
-            resource_plan = None
-            if request.max_rss_mib is not None:
-                import os
-
-                budget_bytes = request.max_rss_mib * 1024 * 1024
-                host_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-                current_bytes = int((_current_rss_mib() or 0.0) * 1024 * 1024)
-                available_bytes = max(0, min(budget_bytes, host_bytes) - current_bytes)
-                segment_bytes = batch.segment_data[next(iter(batch.segment_data))].prepared_market.cache_bytes if batch.segment_data else 0
-                resource_plan = plan_execution_replay_resources(
-                    available_bytes=available_bytes,
-                    prepared_segment_bytes=max(segment_bytes, 1),
-                    requested_workers=request.model_threads,
-                )
-                if resource_plan.max_workers > 0:
-                    primary_evidences = tuple(stream_execution_replay_batch(
-                        cadence_requests, resource_plan, prepared_batch=batch,
-                    ))
-                else:
-                    primary_evidences = ()
-            else:
-                primary_evidences = replay_execution_equivalent_batch(
-                    cadence_requests, prepared_batch=batch,
-                    max_workers=request.model_threads,
-                )
-        else:
-            primary_evidences = ()
-
-        shadow_requests: list[ExecutionEquivalentReplayRequest] = []
+        stream_stats: dict[str, int] = {}
+        primary_evidences: tuple[ExecutionReplayEvidence, ...] = ()
+        shadow_evidences: tuple[ExecutionReplayEvidence, ...] = ()
         shadow_indices: list[int] = []
         for idx, shadow_ctx in enumerate(batch_shadow_contexts):
             if shadow_ctx is not None:
-                shadow_requests.append(
+                shadow_requests_list.append(
                     ExecutionEquivalentReplayRequest(
                         context=shadow_ctx,
                         market_frame=market_frame,
@@ -1589,28 +1438,34 @@ def _replay_costs_batch(
                 )
                 shadow_indices.append(idx)
 
-        if shadow_requests and resource_plan is not None:
-            shadow_evidences = (
-                tuple(stream_execution_replay_batch(
-                    shadow_requests, resource_plan, prepared_batch=batch,
-                ))
-                if resource_plan.max_workers > 0
-                else ()
+        # Segment-major streaming: primaries and dense shadows share one live
+        # prepared segment at a time; the effective memory limit is resolved
+        # and every pre-build boundary planned inside the stream itself.
+        combined_requests = [*batch_replay_requests, *shadow_requests_list]
+        combined_evidences: tuple[ExecutionReplayEvidence, ...] = ()
+        if combined_requests:
+            combined_evidences = stream_execution_replay_batch(
+                combined_requests,
+                stats=stream_stats,
+                request_limit_bytes=(
+                    request.max_rss_mib * 1024 * 1024
+                    if request.max_rss_mib is not None
+                    else None
+                ),
             )
-        elif shadow_requests:
-            shadow_evidences = replay_execution_equivalent_batch(
-                shadow_requests, prepared_batch=batch,
-                max_workers=request.model_threads,
-            )
-        else:
-            shadow_evidences = ()
+        primary_evidences = combined_evidences[: len(batch_replay_requests)]
+        shadow_evidences = combined_evidences[len(batch_replay_requests) :]
 
         shadow_map: dict[int, ExecutionReplayEvidence] = dict(
             zip(shadow_indices, shadow_evidences, strict=True)
         )
 
         for idx, key in enumerate(batch_keys):
-            primary_ev = primary_evidences[idx] if idx < len(primary_evidences) else None
+            primary_ev = (
+                primary_evidences[idx]
+                if idx < len(primary_evidences)
+                else None
+            )
             if primary_ev is None:
                 continue
             if not is_v5:
@@ -1619,9 +1474,14 @@ def _replay_costs_batch(
                 shadow_ev = shadow_map.get(idx)
                 if shadow_ev is None:
                     continue
-                results[key] = ProfileReplayEvidence(candidate=primary_ev, dense_shadow=shadow_ev)
+                results[key] = ProfileReplayEvidence(
+                    candidate=primary_ev, dense_shadow=shadow_ev
+                )
 
-        del batch, primary_evidences, shadow_evidences
+        if stats_out is not None:
+            for stat_key, value in stream_stats.items():
+                stats_out[stat_key] = stats_out.get(stat_key, 0) + int(value)
+        del combined_evidences
 
     return results
 
@@ -1775,6 +1635,7 @@ def _build_horizon_evidence(
     learner_columns: tuple[str, ...],
     *,
     oof_cache: _OofCache | None = None,
+    matrix: PreparedTrainingMatrix | None = None,
 ) -> HorizonDiscovery:
     """Build the two-profile ``(horizon, profile)`` OOF frontier.
 
@@ -1858,10 +1719,20 @@ def _build_horizon_evidence(
                 "never degrade into an empty block list"
             )
         manifest = _base_manifest(request, data, data.feature_frame, horizon)
+        if matrix is None:
+            # Deferred once-per-run preparation keeps legacy validation order;
+            # the canonical X is then reused by every remaining horizon.
+            matrix = prepare_training_matrix(
+                TrainingPanelView(pre_holdout),
+                _on_demand_schema(learner_columns),
+                tuple(folds),
+            )
+        replay_stats: dict[str, int] = {}
         oof, oof_labels, ics, diagnostic, fold_path_count = _fit_oof(
             pre_holdout, folds, data, request, manifest, learner_columns,
             horizon, None,
             family="net_alpha_elastic_net",
+            matrix=matrix,
         )
         path_evaluation_count += fold_path_count
         diagnostics.append(diagnostic)
@@ -1922,12 +1793,11 @@ def _build_horizon_evidence(
                 for profile in request.policy_profiles
             ]
             if candidate_specs:
-                batch_replay_start = time.monotonic()
                 batch_results = _replay_costs_batch(
                     calibrated, oof_labels, request, horizon,
                     request.risk, pre_holdout, data.manifest, candidate_specs,
+                    stats_out=replay_stats,
                 )
-                batch_replay_end = time.monotonic()
                 for cadence, top_k, profile in candidate_specs:
                     key = (horizon, cadence, top_k, profile.profile_id)
                     pair = batch_results.get(key)
@@ -2010,23 +1880,17 @@ def _build_horizon_evidence(
                     evidence.append(candidate_evidence)
                     admitted_any = True
                 batch_replay_count = len(candidate_specs)
-                from collections import Counter
-
-                cadence_counts = Counter(c for c, _, _ in candidate_specs)
-                segment_count = len({
-                    int(row[_OOF_SEGMENT])
-                    for row in calibrated.select(_OOF_SEGMENT)
-                    .unique()
-                    .iter_rows(named=True)
-                })
-                batch_segment_build_count = sum(
-                    segment_count * count
-                    for count in cadence_counts.values()
+                # Real observed values: actual segment builds, deduplicated
+                # prepared bytes, and disjoint prepare/execute timers.
+                batch_segment_build_count = int(
+                    replay_stats.get("prepared_segment_build_count", 0)
                 )
                 batch_prepare_elapsed_ms = int(
-                    (batch_replay_end - batch_replay_start) * 1000
+                    replay_stats.get("replay_prepare_elapsed_ms", 0)
                 )
-                batch_execute_elapsed_ms = batch_prepare_elapsed_ms
+                batch_execute_elapsed_ms = int(
+                    replay_stats.get("replay_execute_elapsed_ms", 0)
+                )
             if admitted_any:
                 oof_path, labels_path = oof_cache.store(
                     horizon, calibrated, oof_labels
@@ -2036,9 +1900,14 @@ def _build_horizon_evidence(
         replay_runtime_metrics = {
             "execution_replay_count": batch_replay_count,
             "prepared_segment_build_count": batch_segment_build_count,
-            "prepared_cache_bytes": 0,
+            "prepared_cache_bytes": int(
+                replay_stats.get("prepared_cache_bytes", 0)
+            ),
             "replay_prepare_elapsed_ms": batch_prepare_elapsed_ms,
             "replay_execute_elapsed_ms": batch_execute_elapsed_ms,
+            "peak_live_prepared_segments": int(
+                replay_stats.get("peak_live_prepared_segments", 0)
+            ),
         }
         horizon_memory[horizon] = {
             "rss_mib": _current_rss_mib(),
@@ -2366,6 +2235,16 @@ def _empty_causal_calibration(
     return CausalCalibrationAdapter(_causal_calibrator(request, horizon_sessions), state)
 
 
+def _on_demand_schema(learner_columns: tuple[str, ...]) -> FeatureTransformSchema:
+    """Minimal schema view exposing only ``learner_columns`` for preparation."""
+    from types import SimpleNamespace
+
+    return cast(
+        FeatureTransformSchema,
+        SimpleNamespace(learner_columns=tuple(learner_columns)),
+    )
+
+
 def _fit_oof(
     pre_holdout: pl.DataFrame,
     folds: list[Fold],
@@ -2377,135 +2256,56 @@ def _fit_oof(
     model_factory: Callable[[], Model] | None,
     *,
     family: str,
+    matrix: PreparedTrainingMatrix | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame, list[float], HorizonOOFDiagnostic, int]:
     """Fit a learner per purged fold and collect target-free OOF predictions.
 
-    Each fold trains only on its own train rows (target joined), predicts the
-    validation rows with target/availability/realized columns dropped, and the
-    resulting OOF predictions are joined to decimal realized outcomes only
-    after prediction. The ElasticNet baseline selects a fold-local
-    scale-invariant alpha through one vectorized weighted penalty path per
-    inner fold. Returns ``(oof_scored, oof_labeled, fold_rank_ics,
-    diagnostic, path_evaluations)``; expected invalid inputs are classified in
-    the diagnostic instead of being swallowed.
+    The prepared-array fold loop in ``ml.fitting`` owns the discovery hot
+    path: one canonical matrix, integer fold plans, exact array Rank-IC, and
+    Polars OOF frames constructed once at the boundary. ``matrix`` may be
+    supplied by the orchestrator; otherwise it is prepared on demand for this
+    horizon.
     """
-    label_join = _build_label_join(data, horizon_sessions)
-    oof_frames: list[pl.DataFrame] = []
-    label_frames: list[pl.DataFrame] = []
-    rank_ics: list[float] = []
-    fold_diagnostics: list[FoldScoreDiagnostic] = []
-    grid = RegularizationGrid()
-    path_evaluations = 0
-    for fold_index, fold in enumerate(folds):
-        train = pre_holdout[fold.train_mask].join(
-            label_join, on=[_ID_COLUMN, SESSION_COLUMN], how="inner",
-        )
-        validation = pre_holdout[fold.validation_mask]
-        if train.is_empty() or validation.is_empty():
-            fold_diagnostics.append(
-                FoldScoreDiagnostic(
-                    fold_index=fold_index, failure_reason="empty-fold"
-                )
-            )
-            continue
-        selected_alpha: float | None = None
-        selected_fraction: float | None = None
-        alpha_max: float | None = None
-        if family == "net_alpha_elastic_net":
-            (
-                selected_alpha, selected_fraction, alpha_max, fold_path_count
-            ) = _select_elastic_alpha(
-                train, request, learner_columns, horizon_sessions, grid, base_manifest,
-            )
-            path_evaluations += fold_path_count
-            if selected_alpha is None:
-                fold_diagnostics.append(
-                    FoldScoreDiagnostic(
-                        fold_index=fold_index, failure_reason="constant-oof-score"
-                    )
-                )
-                continue
-            model: Model = ElasticNetNetAlpha(
-                base_manifest, learner_columns, TARGET_COLUMN,
-                config=NetAlphaModelConfig(
-                    seed=request.seed,
-                    elastic_alpha=selected_alpha,
-                    elastic_alpha_fraction=selected_fraction,
-                    elastic_alpha_max=alpha_max,
-                ),
-            )
-            path_evaluations += 1
-        else:
-            if model_factory is None:
-                raise ValueError("lightgbm OOF requires a model factory")
-            model = model_factory()
-        try:
-            model.fit(train, validation)
-        except ValueError as exc:
-            fold_diagnostics.append(
-                FoldScoreDiagnostic(
-                    fold_index=fold_index,
-                    alpha=selected_alpha,
-                    fraction=selected_fraction,
-                    alpha_max=alpha_max,
-                    failure_reason=f"fit-error:{type(exc).__name__}:{exc}",
-                )
-            )
-            continue
-        scored = model.predict(validation)
-        scores = scored[SCORE_COLUMN].to_numpy().astype(float)
-        finite_scores = scores[np.isfinite(scores)]
-        score_std = float(np.std(finite_scores)) if finite_scores.size else 0.0
-        unique_count = int(np.unique(finite_scores).size) if finite_scores.size else 0
-        joined = scored.join(
-            validation.select(_ID_COLUMN, SESSION_COLUMN, _SESSION_IDX),
-            on=[_ID_COLUMN, SESSION_COLUMN],
-            how="left",
-        ).with_columns(pl.lit(fold.segment_id, dtype=pl.Int64).alias(_OOF_SEGMENT))
-        labeled = joined.join(label_join, on=[_ID_COLUMN, SESSION_COLUMN], how="inner")
-        if labeled.is_empty():
-            fold_diagnostics.append(
-                FoldScoreDiagnostic(
-                    fold_index=fold_index,
-                    score_std=score_std,
-                    finite_count=int(finite_scores.size),
-                    unique_count=unique_count,
-                    alpha=selected_alpha,
-                    fraction=selected_fraction,
-                    alpha_max=alpha_max,
-                    failure_reason="no-labeled-join",
-                )
-            )
-            continue
-        rank_ic = _rank_ic(labeled)
-        oof_frames.append(joined)
-        label_frames.append(labeled)
-        rank_ics.append(rank_ic)
-        fold_diagnostics.append(
-            FoldScoreDiagnostic(
-                fold_index=fold_index,
-                score_std=score_std,
-                finite_count=int(finite_scores.size),
-                unique_count=unique_count,
-                rank_ic=rank_ic,
-                alpha=selected_alpha,
-                fraction=selected_fraction,
-                alpha_max=alpha_max,
-            )
-        )
-    diagnostic = HorizonOOFDiagnostic(
-        horizon_sessions=horizon_sessions,
-        model_family=family,
-        fold_diagnostics=tuple(fold_diagnostics),
+    from src.stocks.ml.fitting import OofFitRequest
+    from src.stocks.ml.fitting import fit_horizon_oof as _fit_horizon_oof
+    from src.stocks.ml.preparation import (
+        prepare_horizon_labels,
+        prepare_training_matrix,
     )
-    if not oof_frames:
-        return pl.DataFrame(), pl.DataFrame(), [], diagnostic, path_evaluations
+
+    if family != "net_alpha_elastic_net":
+        raise ValueError(
+            "prepared-array OOF fitting owns the elastic baseline family only; "
+            f"got {family!r}"
+        )
+    if not folds:
+        empty = pl.DataFrame()
+        diagnostic = HorizonOOFDiagnostic(
+            horizon_sessions=horizon_sessions,
+            model_family=family,
+            fold_diagnostics=(),
+        )
+        return empty, empty, [], diagnostic, 0
+
+    if matrix is None:
+        matrix = prepare_training_matrix(
+            TrainingPanelView(pre_holdout),
+            _on_demand_schema(learner_columns),
+            tuple(folds),
+        )
+    horizon_labels = prepare_horizon_labels(matrix, data, horizon_sessions)
+    result = _fit_horizon_oof(
+        matrix,
+        horizon_labels,
+        prepare_folds(folds),
+        OofFitRequest(request=request, manifest=base_manifest, family=family),
+    )
     return (
-        pl.concat(oof_frames),
-        pl.concat(label_frames),
-        rank_ics,
-        diagnostic,
-        path_evaluations,
+        result.oof,
+        result.labeled,
+        result.fold_rank_ics,
+        result.diagnostic,
+        result.path_evaluations,
     )
 
 
