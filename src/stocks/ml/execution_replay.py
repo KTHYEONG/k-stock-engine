@@ -340,6 +340,8 @@ def replay_execution_equivalent(
 def stream_execution_replay_batch(
     requests: Sequence[ExecutionEquivalentReplayRequest],
     resource_plan: ReplayResourcePlan,
+    *,
+    prepared_batch: PreparedExecutionReplayBatch | None = None,
 ) -> Iterator[ExecutionReplayEvidence]:
     """Streaming replay: at most one prepared segment and one mutable result per worker.
 
@@ -353,11 +355,12 @@ def stream_execution_replay_batch(
         return
     if resource_plan.max_workers == 0:
         return
-    batch = prepare_execution_replay_batch(requests[0])
+    batch = prepared_batch or prepare_execution_replay_batch(requests[0])
+    for request in requests:
+        _validate_batch_request_compatibility(request, batch)
     for request in requests:
         evidence = _execute_batch_request(request, batch)
         yield evidence
-    del batch
 
 
 def _validate_market(market: pl.DataFrame) -> None:
