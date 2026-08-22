@@ -73,6 +73,39 @@ def test_train_cli_exposes_net_alpha_args() -> None:
     assert args.research_end == REFERENCE_DATE
 
 
+def test_net_alpha_args_map_memory_reserve_mib() -> None:
+    """ML_FULL_EXECUTION_P0_TELEMETRY_AND_CLI_05: --memory-reserve-mib maps unchanged."""
+    parser = train.build_parser()
+    args = parser.parse_args(
+        [
+            "--artifact-id",
+            "a1",
+            "--snapshot-id",
+            "s1",
+            "--memory-reserve-mib",
+            "768",
+        ]
+    )
+    assert args.memory_reserve_mib == 768
+    request = train._build_training_request(args)
+    assert request.memory_reserve_mib == 768
+
+    default_request = train._build_training_request(
+        parser.parse_args(["--artifact-id", "a1", "--snapshot-id", "s1"])
+    )
+    assert default_request.memory_reserve_mib == 0
+
+
+def test_net_alpha_args_reject_negative_memory_reserve_mib() -> None:
+    from dataclasses import replace as dataclass_replace
+
+    from src.stocks.ml.contracts import NetAlphaTrainingRequest
+
+    request = NetAlphaTrainingRequest(artifact_id="neg")
+    with pytest.raises(ValueError, match="memory_reserve_mib"):
+        dataclass_replace(request, memory_reserve_mib=-1)
+
+
 def test_train_cli_exposes_complete_execution_frontier() -> None:
     """H3_FRONTIER_CLI_01: CLI input preserves the complete H/C/K grid."""
     args = train.build_parser().parse_args(
