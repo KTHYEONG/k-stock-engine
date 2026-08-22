@@ -13,7 +13,7 @@ class TestFrontierFeasibility:
     """FRONTIER_FEASIBILITY_01."""
 
     def test_h3_with_legacy_cadence_raises_value_error(self) -> None:
-        """H=(3,), C=(5,10,20), K=(12,16,20,24): require_feasible_horizons raises ValueError."""
+        """H3_FRONTIER_CLI_02: legacy C=(5,10,20) fails for H=(3,)."""
         frontier = ExecutionFrontierSettings(
             candidate_horizon_sessions=(3,),
             candidate_rebalance_frequency_sessions=(5, 10, 20),
