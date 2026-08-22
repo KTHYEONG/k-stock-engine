@@ -1,6 +1,8 @@
 """Backtest result provenance contract tests."""
 from __future__ import annotations
 
+import contextlib
+
 from datetime import UTC, datetime
 
 import numpy as np
@@ -716,3 +718,125 @@ def test_parallel_completion_03_decision_time_cache() -> None:
         reference_result.unfilled_order_reason_counts
         == prepared_result.unfilled_order_reason_counts
     )
+
+
+BACKTEST_BRANCH_01 = "BACKTEST-BRANCH-01"
+
+
+class _PartitionByCounter:
+    """Counts ``DataFrame.partition_by`` invocations during a run."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.calls = 0
+        original = pl.DataFrame.partition_by
+
+        def counting(self_df: pl.DataFrame, *args: object, **kwargs: object):
+            self.calls += 1
+            return original(self_df, *args, **kwargs)
+
+        monkeypatch.setattr(pl.DataFrame, "partition_by", counting)
+
+    def __enter__(self) -> _PartitionByCounter:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        pass
+
+
+def _publish_no_trade_artifact(registry, artifact_id: str) -> None:
+    import json
+
+    from src.stocks.research.artifacts import (
+        MANIFEST_FILENAME,
+        MODEL_FILENAME,
+        _manifest_to_dict,
+    )
+    from src.stocks.research.models import ModelManifest
+
+    manifest = ModelManifest(
+        artifact_id=artifact_id,
+        asset_kind=AssetKind.STOCK,
+        feature_set="stock_alpha_v1",
+        feature_schema_hash="fixture-schema",
+        universe_policy_hash="fixture-universe",
+        label_definition="fwd_ret_5d",
+        label_horizon_sessions=5,
+        eligible_from="2024-01-01T00:00:00+00:00",
+        eligible_to="2024-03-31T00:00:00+00:00",
+        model_type="no_trade",
+    )
+    artifact_dir = registry._artifact_dir(artifact_id)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    with (artifact_dir / MANIFEST_FILENAME).open("w", encoding="utf-8") as handle:
+        json.dump(_manifest_to_dict(manifest), handle, default=str)
+    import joblib
+
+    joblib.dump(object(), artifact_dir / MODEL_FILENAME)
+
+
+def test_backtest_branch_01_branch_selection_before_partition_by(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKTEST-BRANCH-01: cheap branches avoid materialization entirely.
+
+    No-trade and prebuilt-prepared branches perform zero partition_by calls;
+    the DataFrame reference fallback remains callable.
+    """
+    df, snapshot, registry, instruments, policy, scored, artifacts, request, portfolio = (
+        _paired_inputs()
+    )
+
+    # 1) All scheduled artifacts are no_trade: zero partition_by.
+    no_trade_registry = ModelArtifactRegistry("mem://no-trade")
+    _publish_no_trade_artifact(no_trade_registry, "a001")
+    backtester = StockBacktester(
+        registry=no_trade_registry,
+        instruments=instruments,
+        manifest=snapshot.manifest,
+        cost_schedule=default_base_schedule(),
+        stress_cost_schedule=default_stress_schedule(),
+    )
+    with _PartitionByCounter(monkeypatch) as counter:
+        result = backtester.run(df, artifacts, portfolio, request)
+    assert counter.calls == 0
+    assert result.no_trade_reasons == ("no-trade-artifact",) * len(
+        request.decision_session_indices
+    )
+
+    # 2) Prebuilt-prepared branch (provider + planner wired): zero partition_by.
+    prepared_backtester = StockBacktester(
+        registry=registry,
+        instruments=instruments,
+        manifest=snapshot.manifest,
+        cost_schedule=default_base_schedule(),
+        stress_cost_schedule=default_stress_schedule(),
+        decision_provider=lambda dt, et: PreparedReplayDecision(dt, et, scored.filter(pl.col("available_time") <= dt)),
+        scenario_planner=lambda prepared, port, creq: _scenario_planner(
+            prepared, port, creq, instruments, policy
+        ),
+    )
+    with _PartitionByCounter(monkeypatch) as counter:
+        prepared_result = prepared_backtester.run(df, artifacts, portfolio, request)
+    assert counter.calls == 0
+    assert isinstance(prepared_result, BacktestResult)
+
+    # 3) Reference fallback stays callable for parity certification.
+    reference_backtester = StockBacktester(
+        registry=registry,
+        instruments=instruments,
+        manifest=snapshot.manifest,
+        cost_schedule=default_base_schedule(),
+        stress_cost_schedule=default_stress_schedule(),
+    )
+    from tests.fixtures.stocks.helpers import publish_baseline_artifact
+
+    with contextlib.suppress(ValueError):
+        publish_baseline_artifact(
+            registry,
+            artifact_id="a001",
+            feature_schema_hash=snapshot.manifest.schema_hash,
+        )  # shared mem:// registry may already carry the baseline fixture
+    with _PartitionByCounter(monkeypatch) as counter:
+        fallback_result = reference_backtester.run(df, artifacts, portfolio, request)
+    assert counter.calls >= 1
+    assert isinstance(fallback_result, BacktestResult)
