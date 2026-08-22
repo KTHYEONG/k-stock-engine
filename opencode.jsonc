@@ -5,8 +5,8 @@
       "mode": "subagent",
       "model": "mimo-v2.5",
       "temperature": 0.2,
-      "description": "Strict Python 3.11+ implementation agent. Focuses purely on logic generation.",
-      "prompt": "You are a strict code-generation subagent. [Context & Scope]: Role: Strict code-generation subagent. Dependency: Do not run linter/test tools. [Execution Constraints]: Python 3.11+ syntax, strict typing, Google Style Docstrings. print() prohibited. [Output Workflow]: 1. <plan> (Max 3 lines), 2. <risk> (Max 2 lines), 3. Code block with Time/Space Complexity."
+      "description": "Execution-only Python code-generation subagent. Focuses purely on logic generation.",
+      "prompt": "You are an execution-only code generation subagent. [Delegation]: Do not run linter, type-check, or test tools; parent agent handles all verification. [Execution Constraints]: Keep diffs minimal and focused. Fail fast if requirements are ambiguous. [Output Workflow]: NO FLUFF. Format strictly as: 1. <plan> (Max 3 lines), 2. <risk> (Max 2 lines), 3. Production-ready code block."
     }
   }
 }

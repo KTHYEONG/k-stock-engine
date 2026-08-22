@@ -1,6 +1,26 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_ML_FULL_RUN_EXECUTION_20260822",
+      "date": "2026-08-22",
+      "adr_id": "ADR_20260822_STOCK_ML_FULL_RUN_EXECUTION_20260822",
+      "domain": "stocks_ml",
+      "title": "Stock ML full-run execution evidence",
+      "why": "The reduced ML/backtest run completed and produced auditable NO_TRADE evidence, while the original full-range H10/H20 and H10-only attempts produced no terminal artifact before the process disappeared.",
+      "resolution": "Recorded the execution outcome as fail-closed: smoke completion metrics are retained in the artifact registry during the run, full-range completion is not claimed, and further diagnosis remains required for the missing terminal artifact/resource termination.",
+      "impact": "Prevents unverified performance claims; confirms the bounded pipeline can complete on reduced data while the full-range route remains operationally incomplete."
+    },
+    {
+      "task_id": "TASK_STOCK_ML_FULL_EXECUTION_RELIABILITY_20260822",
+      "date": "2026-08-22",
+      "adr_id": "ADR_20260822_STOCK_ML_FULL_EXECUTION_RELIABILITY_20260822",
+      "domain": "stocks_ml",
+      "title": "Stock ML full execution reliability",
+      "why": "Full ML discovery was vulnerable to OOM before fitting and calibration completed; recent smoke evidence showed replay segment retention was already bounded while fitting temporaries and causal OOF ownership remained high risk.",
+      "resolution": "Added indexed single-workspace ElasticNet fitting, common pre-allocation resource envelopes with cgroup and host-available headroom, single PreparedTrainingMatrix calibration seed wiring, streaming causal OOF output, bounded lifetime ownership, and scalar resource checkpoints while preserving the statistical and economic gates.",
+      "impact": "Full runs now fail closed before unsafe allocations with auditable diagnostics instead of host kills; model parity, causal calibration, replay semantics, and NO_TRADE promotion behavior remain unchanged."
+    },
+    {
       "task_id": "TASK_STOCK_ML_BACKTESTING_PERFORMANCE_ARCHITECTURE",
       "date": "2026-08-22",
       "adr_id": "ADR_20260822_STOCK_ML_BACKTESTING_PERFORMANCE_ARCHITECTURE",
