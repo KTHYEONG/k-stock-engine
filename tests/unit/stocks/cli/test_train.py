@@ -15,6 +15,7 @@ from src.core.paths import (
     STOCK_LABEL_ROOT,
 )
 from src.stocks.cli import train
+from src.stocks.ml.contracts import ExecutionFrontierSettings
 from src.stocks.settings import REFERENCE_DATE, REFERENCE_DATETIME
 
 
@@ -70,6 +71,36 @@ def test_train_cli_exposes_net_alpha_args() -> None:
     assert not hasattr(args, "resume")
     assert args.decision_time == REFERENCE_DATETIME
     assert args.research_end == REFERENCE_DATE
+
+
+def test_train_cli_exposes_complete_execution_frontier() -> None:
+    """H3_FRONTIER_CLI_01: CLI input preserves the complete H/C/K grid."""
+    args = train.build_parser().parse_args(
+        [
+            "--artifact-id",
+            "h3",
+            "--snapshot-id",
+            "snapshot",
+            "--candidate-horizon-sessions",
+            "3",
+            "--candidate-rebalance-frequency-sessions",
+            "1,2,3",
+            "--candidate-top-k",
+            "12,16,20,24",
+        ]
+    )
+
+    assert args.candidate_horizon_sessions == "3"
+    assert args.candidate_rebalance_frequency_sessions == "1,2,3"
+    assert args.candidate_top_k == "12,16,20,24"
+    frontier = ExecutionFrontierSettings(
+        candidate_horizon_sessions=train._parse_horizons(args.candidate_horizon_sessions),
+        candidate_rebalance_frequency_sessions=train._parse_horizons(
+            args.candidate_rebalance_frequency_sessions
+        ),
+        candidate_top_k=train._parse_horizons(args.candidate_top_k),
+    )
+    assert len(frontier.require_feasible_horizons(0.90, 0.08)) == 12
 
 
 def test_train_cli_resolves_snapshot_and_composes(monkeypatch) -> None:

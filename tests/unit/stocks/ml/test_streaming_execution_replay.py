@@ -87,8 +87,10 @@ def _make_fixture(n_segments: int = 2, sessions_per_seg: int = 6, n_tickers: int
 class TestStreamingReplay:
     """STREAMING_REPLAY_01."""
 
-    def test_streaming_matches_legacy_batch(self) -> None:
-        """Streaming and legacy batch replay produce identical results."""
+    def test_streaming_reuses_supplied_prepared_batch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """RSS_REPLAY_01: supplied batch is reused without another preparation."""
         market, scores, segments, manifest = _make_fixture()
         request = NetAlphaTrainingRequest(
             artifact_id="test_streaming",
@@ -138,10 +140,18 @@ class TestStreamingReplay:
             (replay_request,), prepared_batch=batch
         )
 
+        def fail_if_prepared(*args: object, **kwargs: object) -> object:
+            raise AssertionError("streaming must reuse the supplied prepared batch")
+
+        monkeypatch.setattr(
+            "src.stocks.ml.execution_replay.prepare_execution_replay_batch",
+            fail_if_prepared,
+        )
+
         stream_results = list(stream_execution_replay_batch(
             (replay_request,), ReplayResourcePlan(
                 max_workers=1, max_prepared_segments=1, projected_peak_bytes=0
-            )
+            ), prepared_batch=batch,
         ))
         assert len(stream_results) == 1
 
@@ -168,7 +178,7 @@ class TestResourcePlan:
         assert plan.max_prepared_segments == 1
 
     def test_unavailable_when_insufficient_headroom(self) -> None:
-        """Less than one segment plus reserve -> resource-budget-unavailable."""
+        """RSS_REPLAY_02: less than one segment plus reserve admits no worker."""
         plan = plan_execution_replay_resources(
             available_bytes=100 * 1024 * 1024,
             prepared_segment_bytes=600 * 1024 * 1024,
