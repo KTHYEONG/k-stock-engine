@@ -76,10 +76,8 @@ def discover_horizons(
         getattr(context, name, None) is None
         for name in ("pre_holdout", "folds", "learner_columns", "oof_cache")
     ):
-        if hasattr(context, "fit_context"):
-            from src.stocks.ml.fitting import fit_horizon_oof
-
-            return cast(HorizonDiscovery, fit_horizon_oof(context.fit_context))
+        # Incomplete discovery contexts own no OOF state; callers must drive
+        # the training orchestrator for real discovery.
         return HorizonDiscovery((), (), {})
 
     from src.stocks.ml.training import _build_horizon_evidence

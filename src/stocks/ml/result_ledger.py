@@ -921,6 +921,36 @@ def _bounded_observability_summary(
                 str(key): _sanitize_deep(value)
                 for key, value in segment_sums.items()
             }
+    horizons = telemetry.get("horizons")
+    if isinstance(horizons, list):
+        # Bounded replay runtime scalars, aggregated across horizon entries:
+        # disjoint prepare/execute timers plus actual builds and live bytes.
+        prepare_total = 0
+        execute_total = 0
+        build_total = 0
+        cache_peak = 0
+        has_replay_runtime = False
+        for entry in horizons:
+            if not isinstance(entry, dict):
+                continue
+            prepare_value = entry.get("replay_prepare_elapsed_ms")
+            execute_value = entry.get("replay_execute_elapsed_ms")
+            build_value = entry.get("prepared_segment_build_count")
+            cache_value = entry.get("prepared_cache_bytes")
+            if any(
+                isinstance(value, (int, float))
+                for value in (prepare_value, execute_value, build_value, cache_value)
+            ):
+                has_replay_runtime = True
+            prepare_total += int(prepare_value or 0)
+            execute_total += int(execute_value or 0)
+            build_total += int(build_value or 0)
+            cache_peak = max(cache_peak, int(cache_value or 0))
+        if has_replay_runtime:
+            summary["replay_prepare_elapsed_ms"] = prepare_total
+            summary["replay_execute_elapsed_ms"] = execute_total
+            summary["prepared_segment_build_count"] = build_total
+            summary["prepared_cache_bytes_peak"] = cache_peak
     selection = by_name.get("primary_selection", {})
     if "primary_horizon_sessions" in selection:
         summary["primary_horizon_sessions"] = selection["primary_horizon_sessions"]
