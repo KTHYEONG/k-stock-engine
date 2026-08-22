@@ -629,6 +629,10 @@ class NetAlphaResearchData:
                 )
 
 
+#: Training-side alias for the canonical composed read model.
+NetAlphaTrainingData = NetAlphaResearchData
+
+
 @dataclass(frozen=True, slots=True)
 class RegularizationGrid:
     """Pre-registered scale-invariant ElasticNet penalty fractions.
