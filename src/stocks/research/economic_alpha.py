@@ -781,9 +781,10 @@ def _prefix_sum_block_means(
     n_blocks: int,
     max_start: int,
     n_bootstrap: int,
-    seed: int,
+    seed: int | None,
     *,
     max_workspace_bytes: int | None = None,
+    starts: np.ndarray | None = None,
 ) -> np.ndarray:
     """Moving-block bootstrap means via a deterministic block-prefix sum.
 
@@ -794,7 +795,8 @@ def _prefix_sum_block_means(
     every draw equals the reference materialized mean within float rounding.
     Draws are generated in the identical seeded order and, when a workspace cap
     is supplied, processed in contiguous batches that consume the same RNG
-    stream in the same row-major order.
+    stream in the same row-major order. A pre-generated ``starts`` matrix may
+    be supplied to share one externally seeded draw order across kernels.
     """
     csum = np.empty(arr.size + 1, dtype=np.float64)
     np.cumsum(arr, out=csum[1:])
@@ -808,6 +810,7 @@ def _prefix_sum_block_means(
         n_bootstrap=n_bootstrap,
         seed=seed,
         max_workspace_bytes=max_workspace_bytes,
+        starts=starts,
     )
 
 
@@ -819,30 +822,48 @@ def _prefix_sum_means_from_csum(
     n_blocks: int,
     max_start: int,
     n_bootstrap: int,
-    seed: int,
+    seed: int | None,
     max_workspace_bytes: int | None = None,
+    starts: np.ndarray | None = None,
 ) -> np.ndarray:
     """Bootstrap means from a precomputed ``float64`` cumulative-sum array.
 
     ``csum[i]`` is the sum of the first ``i`` residuals, so the schedule can
     extend cumulative sums incrementally as eligible sessions arrive instead of
     re-materializing residuals per decision. The generated starts and the
-    reduction order are identical to :func:`_prefix_sum_block_means`.
+    reduction order are identical to :func:`_prefix_sum_block_means`; a
+    supplied ``starts`` matrix replaces the internal draw entirely.
     """
-    rng = np.random.default_rng(seed)
+    rng = None if starts is not None else np.random.default_rng(seed)
     per_draw_bytes = n_blocks * (8 + 8)
-    batch_draws = n_bootstrap if max_workspace_bytes is None else max(1, max_workspace_bytes // per_draw_bytes)
+    batch_draws = (
+        n_bootstrap if max_workspace_bytes is None else max(1, max_workspace_bytes // per_draw_bytes)
+    )
     batch_draws = min(batch_draws, n_bootstrap)
+    # The sample is the blocks laid out contiguously and truncated at exactly
+    # ``n`` elements, so the final block contributes only its surviving head:
+    # ``n - (n_blocks - 1) * block`` elements from its start.
     full_blocks = np.arange(max(0, n_blocks - 1))
+    last_keep = n - max(0, n_blocks - 1) * block
     means = np.empty(n_bootstrap, dtype=np.float64)
     for offset in range(0, n_bootstrap, batch_draws):
         stop = min(offset + batch_draws, n_bootstrap)
         count = stop - offset
-        starts = rng.integers(0, max_start, size=(count, n_blocks))
-        full_sums = csum[starts[:, full_blocks] + block] - csum[starts[:, full_blocks]]
-        last_end = np.minimum(starts[:, -1] + block, n)
-        last_sums = csum[last_end] - csum[starts[:, -1]]
-        means[offset:stop] = (full_sums.sum(axis=1) + last_sums) / n
+        if starts is None:
+            assert rng is not None
+            block_starts = rng.integers(0, max_start, size=(count, n_blocks))
+        else:
+            block_starts = starts[offset:stop]
+        if full_blocks.size:
+            leading = block_starts[:, full_blocks]
+            full_sums = csum[leading + block] - csum[leading]
+            full_total = full_sums.sum(axis=1)
+        else:
+            full_total = 0.0
+        last_sums = (
+            csum[block_starts[:, -1] + last_keep] - csum[block_starts[:, -1]]
+        )
+        means[offset:stop] = (full_total + last_sums) / n
     return means
 
 

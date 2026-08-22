@@ -24,6 +24,8 @@ from math import ceil
 
 import numpy as np
 
+from src.stocks.research.bootstrap import pooled_segment_bootstrap_means
+
 DEFAULT_BOOTSTRAP_RESAMPLES = 200
 _BOUND_TOLERANCE = 1e-12
 
@@ -253,42 +255,32 @@ def _cohort_bootstrap(
     segment boundary; the block length is at least ``min_block_length`` (the
     candidate horizon) so the dependency of overlapping h-day returns is
     preserved. The per-segment resample means are pooled weighted by vintage
-    count. Returns ``None`` (inadmissible) when any segment has fewer than two
-    resampling blocks.
+    count through the shared bounded-workspace primitive. Returns ``None``
+    (inadmissible) when any segment has fewer than two resampling blocks.
     """
     by_segment: dict[int, list[float]] = {}
     for segment, value in zip(cohort_segment_ids, log_growth, strict=True):
         by_segment.setdefault(int(segment), []).append(float(value))
-    distributions: list[np.ndarray] = []
-    weights: list[float] = []
+    ordered_ids = sorted(by_segment)
+    segments = tuple(
+        np.asarray(by_segment[segment], dtype=float) for segment in ordered_ids
+    )
     n_blocks_total = 0
-    for segment in sorted(by_segment):
-        values = np.asarray(by_segment[segment], dtype=float)
+    for values in segments:
         block = max(_segment_block_length(values.size), min_block_length)
-        n_blocks = int(np.ceil(values.size / block))
-        if n_blocks < 2:
+        if int(np.ceil(values.size / block)) < 2:
             return None
-        n_blocks_total += n_blocks
-        rng = np.random.default_rng(seed + segment)
-        starts = rng.integers(0, max(1, values.size - block + 1), size=(n_bootstrap, n_blocks))
-        offsets = np.arange(block)
-        index = (starts[:, :, None] + offsets[None, None, :]).reshape(
-            n_bootstrap, n_blocks * block
-        )[:, : values.size]
-        distributions.append(values[index].mean(axis=1))
-        weights.append(float(values.size))
-    total = sum(weights)
-    if total <= 0.0:
+        n_blocks_total += int(np.ceil(values.size / block))
+    if not segments:
         return None
-    pooled = np.zeros(n_bootstrap, dtype=np.float64)
-    for weight, distribution in zip(weights, distributions, strict=True):
-        pooled += weight * distribution
-    pooled /= total
+    boot_means = pooled_segment_bootstrap_means(
+        segments, min_block_length, n_bootstrap, seed
+    )
     observed = float(sum(log_growth) / len(log_growth))
-    centered_p_value = float(np.mean(pooled >= 2.0 * observed))
+    centered_p_value = float(np.mean(boot_means >= 2.0 * observed))
     return _CohortBootstrap(
         observed_mean=observed,
-        boot_means=pooled,
+        boot_means=boot_means,
         p_value=centered_p_value,
         n_blocks_total=n_blocks_total,
     )

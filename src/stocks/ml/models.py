@@ -154,6 +154,40 @@ def normalize_session_weights(
     return arr * (target / float(np.sum(arr)))
 
 
+def session_balanced_weights_from_codes(
+    session_codes: np.ndarray, valid: np.ndarray
+) -> np.ndarray:
+    """Session-balanced normalized weights over finite rows only.
+
+    Counts are taken over the *valid* rows of each session only, so a session
+    whose rows carry invalid feature/target values still receives an equal raw
+    total among its surviving rows. The valid mask is applied exactly once:
+    the returned full-length array carries zero weight on invalid rows and
+    sums to one across the selected rows (within float rounding), so fold
+    statistics indexed by the same mask see matching lengths and totals.
+    """
+    codes = np.asarray(session_codes)
+    valid_mask = np.asarray(valid, dtype=bool)
+    if codes.ndim != 1 or valid_mask.shape != codes.shape:
+        raise ValueError("session_codes and valid must be aligned 1-D arrays")
+    if codes.size == 0:
+        return np.zeros(0, dtype=np.float64)
+    selected = np.asarray(codes[valid_mask], dtype=np.int64)
+    counts = np.bincount(selected) if selected.size else np.zeros(0, dtype=np.int64)
+    per_row_counts = (
+        counts[selected].astype(np.float64) if selected.size else np.zeros(0)
+    )
+    raw = np.zeros(codes.size, dtype=np.float64)
+    if selected.size:
+        positive = per_row_counts > 0
+        raw_valid = np.where(positive, 1.0 / np.where(positive, per_row_counts, 1.0), 0.0)
+        total = float(raw_valid.sum())
+        if not np.isfinite(total) or total <= 0.0:
+            raise ValueError("malformed sample weights cannot be normalized")
+        raw[valid_mask] = raw_valid / total
+    return raw
+
+
 def weighted_fold_statistics(
     features: np.ndarray,
     weights: np.ndarray,
@@ -180,13 +214,14 @@ def weighted_fold_statistics(
 
 
 @dataclass(frozen=True, slots=True)
-class ElasticPathSolution:
+class ElasticPathResult:
     """Frozen weighted ElasticNet coefficient path over one penalty grid.
 
-    ``fractions`` is ascending and ``coefficients[i]``/``intercepts[i]`` solve
-    penalty ``fractions[i] * alpha_max`` in one descending warm-start coordinate
-    path. ``mean``/``std`` are the weighted fold-local standardization frozen
-    from the training slice, so ``predict`` is target-free.
+    ``fractions`` is ascending and ``coefficients[:, i]``/``intercepts[i]``
+    solve penalty ``fractions[i] * alpha_max`` in one descending warm-start
+    coordinate path. ``mean``/``std`` are the weighted fold-local
+    standardization frozen from the training slice, so :meth:`predict` is
+    target-free.
     """
 
     fractions: tuple[float, ...]
@@ -196,37 +231,113 @@ class ElasticPathSolution:
     mean: np.ndarray
     std: np.ndarray
 
-    def predict(self, frame: pl.DataFrame, feature_columns: tuple[str, ...]) -> dict[float, np.ndarray]:
+    def predict_array(self, features: np.ndarray) -> dict[float, np.ndarray]:
         """Target-free score per penalty fraction on a standardized design."""
-        missing = [c for c in feature_columns if c not in frame.columns]
-        if missing:
-            raise ValueError(f"missing feature columns {missing} in path predict frame")
-        features = _float32_matrix(frame, feature_columns)
-        standardized = (features - self.mean) / self.std
-        standardized[~np.isfinite(standardized)] = 0.0
+        standardized = (np.asarray(features, dtype=np.float64) - self.mean) / self.std
+        standardized = np.where(np.isfinite(standardized), standardized, 0.0)
         return {
-            fraction: (
-                standardized @ self.coefficients[index] + self.intercepts[index]
-            )
+            fraction: standardized @ self.coefficients[index] + self.intercepts[index]
             for index, fraction in enumerate(self.fractions)
         }
 
+    def predict(
+        self, frame: pl.DataFrame, feature_columns: tuple[str, ...]
+    ) -> dict[float, np.ndarray]:
+        """Frame-based convenience wrapper over :meth:`predict_array`."""
+        return self.predict_array(_float32_matrix(frame, feature_columns))
+
+
+#: Backward-compatible name for the array-native path result.
+ElasticPathSolution = ElasticPathResult
+
 
 def fit_weighted_elastic_path(
+    features: np.ndarray,
+    target: np.ndarray,
+    session_codes: np.ndarray,
+    alpha_fractions: tuple[float, ...],
+    *,
+    seed: int = 42,
+    l1_ratio: float = 0.5,
+) -> ElasticPathResult | None:
+    """One deterministic weighted coordinate path over every penalty fraction.
+
+    Builds the weighted standardized design once on the finite rows only,
+    derives ``alpha_max`` once (``max(abs(X.T @ (w * y_centered))) / sum(w)``
+    on the weighted fold-standardized design), and solves all penalty
+    fractions in one descending warm-start coordinate descent. Weights come
+    from :func:`session_balanced_weights_from_codes`, so mixed non-finite rows
+    keep equal selected row/weight lengths. Returns ``None`` when the slice
+    has no finite feature/target rows or ``alpha_max`` is degenerate.
+    """
+    if not alpha_fractions:
+        raise ValueError("penalty fractions must be non-empty")
+    features_arr = np.asarray(features)
+    targets = np.asarray(target, dtype=np.float64)
+    codes = np.asarray(session_codes)
+    if features_arr.shape[0] != targets.shape[0] or codes.shape[0] != targets.shape[0]:
+        raise ValueError("features, target, and session_codes must be row-aligned")
+    valid = np.isfinite(features_arr).all(axis=1) & np.isfinite(targets)
+    if not valid.any():
+        return None
+    sub = np.asarray(features_arr[valid], dtype=np.float64)
+    y = targets[valid]
+    weights_full = session_balanced_weights_from_codes(codes, valid)
+    weights = weights_full[valid]
+    if not np.all(weights > 0.0):
+        raise ValueError("malformed sample weights cannot be used in elastic path")
+    total = float(np.sum(weights))
+    mean = np.sum(sub * weights[:, None], axis=0) / total
+    centered = sub - mean
+    variance = np.sum(weights[:, None] * centered * centered, axis=0) / total
+    std = np.sqrt(np.maximum(variance, 0.0))
+    std[std == 0.0] = 1.0
+    standardized = (sub - mean) / std
+    y_centered = y - float(np.sum(weights * y) / total)
+    alpha_max = float(
+        np.max(np.abs(standardized.T @ (weights * y_centered))) / total
+    )
+    if not np.isfinite(alpha_max) or alpha_max <= 0.0:
+        return None
+
+    coefficients: list[np.ndarray] = []
+    intercepts: list[float] = []
+    model = ElasticNet(
+        alpha=0.0,
+        l1_ratio=l1_ratio,
+        max_iter=2000,
+        random_state=seed,
+        warm_start=True,
+    )
+    for fraction in sorted(alpha_fractions, reverse=True):
+        model.set_params(alpha=fraction * alpha_max)
+        model.fit(standardized, y, sample_weight=weights)
+        coefficients.append(np.asarray(model.coef_, dtype=np.float64))
+        intercepts.append(float(model.intercept_))
+    ordered = tuple(sorted(alpha_fractions))
+    return ElasticPathResult(
+        fractions=ordered,
+        coefficients=np.asarray(list(reversed(coefficients)), dtype=np.float64),
+        intercepts=np.asarray(list(reversed(intercepts)), dtype=np.float64),
+        alpha_max=alpha_max,
+        mean=mean,
+        std=std,
+    )
+
+
+def _fit_weighted_elastic_path_reference(
     frame: pl.DataFrame,
     feature_columns: tuple[str, ...],
     fractions: tuple[float, ...],
     seed: int,
     *,
     l1_ratio: float = 0.5,
-) -> ElasticPathSolution | None:
-    """One deterministic weighted coordinate path over every penalty fraction.
+) -> ElasticPathResult | None:
+    """Legacy frame-based reference path kept as the parity oracle.
 
-    Builds the weighted standardized design once, derives ``alpha_max`` once
-    (``max(abs(X.T @ (w * y_centered))) / sum(w)`` on the weighted
-    fold-standardized design), and solves all penalty fractions in one
-    descending warm-start coordinate descent. Returns ``None`` when the slice
-    has no finite feature/target rows or ``alpha_max`` is degenerate.
+    Mirrors the historical implementation exactly — full-slice session counts,
+    normalized-then-masked weights, and Polars feature extraction — so parity
+    tests can prove the prepared-array path reproduces it within tolerance.
     """
     if not fractions:
         raise ValueError("penalty fractions must be non-empty")
@@ -238,18 +349,17 @@ def fit_weighted_elastic_path(
     valid = np.isfinite(features).all(axis=1) & np.isfinite(targets)
     if not valid.any():
         return None
+    raw_weights = session_balanced_weights(frame)
+    weights = normalize_session_weights(raw_weights, total=int(valid.sum()))
+    mean, std = weighted_fold_statistics(features, weights, valid)
     sub = features[valid]
     y = targets[valid]
-    raw_weights = session_balanced_weights(frame)
-    weights = normalize_session_weights(raw_weights, total=int(valid.sum()))[valid]
-    if not np.all(weights > 0.0):
-        raise ValueError("malformed sample weights cannot be used in elastic path")
-    mean, std = weighted_fold_statistics(features, weights, valid)
+    w = weights[valid]
     standardized = (sub - mean) / std
-    y_centered = y - float(np.sum(weights * y) / float(np.sum(weights)))
+    y_centered = y - float(np.sum(w * y) / float(np.sum(w)))
     alpha_max = float(
-        np.max(np.abs(standardized.T @ (weights * y_centered)))
-        / float(np.sum(weights))
+        np.max(np.abs(standardized.T @ (w * y_centered)))
+        / float(np.sum(w))
     )
     if not np.isfinite(alpha_max) or alpha_max <= 0.0:
         return None
@@ -265,11 +375,11 @@ def fit_weighted_elastic_path(
     )
     for fraction in sorted(fractions, reverse=True):
         model.set_params(alpha=fraction * alpha_max)
-        model.fit(standardized, y, sample_weight=weights)
+        model.fit(standardized, y, sample_weight=w)
         coefficients.append(np.asarray(model.coef_, dtype=np.float64))
         intercepts.append(float(model.intercept_))
     ordered = tuple(sorted(fractions))
-    return ElasticPathSolution(
+    return ElasticPathResult(
         fractions=ordered,
         coefficients=np.asarray(list(reversed(coefficients)), dtype=np.float64),
         intercepts=np.asarray(list(reversed(intercepts)), dtype=np.float64),

@@ -1338,3 +1338,173 @@ def validate_ml_market_data(
             raise ValueError(
                 f"ML market data horizon {horizon} has empty label frame"
             )
+
+
+def compose_direct_net_alpha_training_data(
+    market_data: MlMarketData,
+    decision_time: str | datetime,
+) -> NetAlphaResearchData:
+    """Compose separated direct-load data without a repeated-label snapshot.
+
+    ``MlMarketData.frame`` already carries exactly one sorted row per
+    ``(instrument_id, session)`` and labels stay independent in
+    ``labels_by_horizon``, so this composition never duplicates feature rows
+    across horizons. Each horizon is point-in-time filtered to
+    ``label_available_time <= decision_time`` and inner-joined to the feature
+    keys independently; duplicate or unmatched label keys fail closed.
+    """
+    if isinstance(decision_time, str):
+        decision_time = datetime.fromisoformat(decision_time)
+    frame = market_data.frame
+    if frame.is_empty():
+        raise ValueError("direct market data frame is empty")
+    identity = (ID_COLUMN, _FEATURE_SESSION)
+    if not all(c in frame.columns for c in identity):
+        raise ValueError(f"direct market frame missing identity columns {identity}")
+    unique_keys = int(
+        frame.select(pl.struct(list(identity)).n_unique()).item()
+    )
+    if unique_keys != frame.height:
+        raise ValueError("direct market frame carries duplicate (instrument_id, session) keys")
+    sorted_keys = frame.sort(list(identity))
+    if not frame.equals(sorted_keys):
+        frame = sorted_keys
+
+    # The source feature panel starts at the first available observation
+    # rather than emitting a warm-up null. Drop that single pre-lookback row
+    # per instrument so the integrity audit cannot treat it as a fabricated
+    # rolling value.
+    feature_frame = (
+        frame.sort([ID_COLUMN, _FEATURE_SESSION])
+        .with_columns(pl.int_range(0, pl.len()).over(ID_COLUMN).alias("__warmup_row"))
+        .filter(pl.col("__warmup_row") > 0)
+        .drop("__warmup_row")
+    )
+    warmup_columns = [
+        "fluc_rate", "intraday_ret", "overnight_ret", "sector_ret_5d",
+        "feature__fluc_rate", "feature__intraday_ret",
+        "feature__overnight_ret", "feature__sector_ret_5d",
+    ]
+    first_rows = feature_frame.with_columns(
+        pl.int_range(0, pl.len()).over(ID_COLUMN).alias("__row")
+    )
+    for column in warmup_columns:
+        if column in first_rows.columns:
+            first_rows = first_rows.with_columns(
+                pl.when(pl.col("__row") == 0)
+                .then(None)
+                .otherwise(pl.col(column))
+                .alias(column)
+            )
+    feature_frame = first_rows.drop("__row")
+    if feature_frame.is_empty():
+        raise ValueError("net-alpha direct feature frame is empty")
+
+    roles = stock_net_alpha_v1_roles()
+    feature_frame = _rename_feature_sources(feature_frame, roles)
+    if feature_frame.is_empty():
+        raise ValueError("net-alpha direct feature frame is empty after source renaming")
+
+    labels_by_horizon: dict[int, pl.DataFrame] = {}
+    join_evidence: list[HorizonJoinEvidence] = []
+    horizons = sorted(market_data.labels_by_horizon)
+    for horizon in horizons:
+        label_frame = market_data.labels_by_horizon[horizon]
+        target_column = (
+            TARGET_COLUMN if TARGET_COLUMN in label_frame.columns else "target"
+        )
+        available_column = (
+            AVAILABLE_COLUMN
+            if AVAILABLE_COLUMN in label_frame.columns
+            else "label_available_time"
+        )
+        required_label_columns = (
+            ID_COLUMN,
+            _FEATURE_SESSION,
+            target_column,
+            available_column,
+        )
+        missing = [c for c in required_label_columns if c not in label_frame.columns]
+        if missing:
+            raise ValueError(
+                f"horizon {horizon} label frame missing columns {missing}"
+            )
+        label_frame = label_frame.rename(
+            {
+                target_column: TARGET_COLUMN,
+                available_column: AVAILABLE_COLUMN,
+            }
+        )
+        duplicate_labels = int(
+            label_frame.select(pl.struct([ID_COLUMN, _FEATURE_SESSION]).n_unique()).item()
+        )
+        if duplicate_labels != label_frame.height:
+            raise ValueError(
+                f"duplicate label keys at horizon {horizon} fail closed"
+            )
+        available = label_frame.filter(
+            pl.col(TARGET_COLUMN).is_not_null()
+            & pl.col(AVAILABLE_COLUMN).is_not_null()
+            & (pl.col(AVAILABLE_COLUMN) <= decision_time)
+        )
+        label_rows = int(available.height)
+        joined = available.join(
+            feature_frame.select(ID_COLUMN, _FEATURE_SESSION),
+            on=[ID_COLUMN, _FEATURE_SESSION],
+            how="inner",
+        ).sort([ID_COLUMN, _FEATURE_SESSION])
+        if joined.is_empty():
+            join_evidence.append(
+                HorizonJoinEvidence(
+                    horizon_sessions=horizon,
+                    feature_rows=frame.height,
+                    label_rows=label_rows,
+                    joined_rows=0,
+                    drop_reasons=("no point-in-time available labels",),
+                    decision_rows=int(feature_frame.height),
+                    realized_rows=0,
+                )
+            )
+            continue
+        labels_by_horizon[horizon] = joined
+        join_evidence.append(
+            HorizonJoinEvidence(
+                horizon_sessions=horizon,
+                feature_rows=frame.height,
+                label_rows=label_rows,
+                joined_rows=joined.height,
+                decision_rows=int(feature_frame.height),
+                realized_rows=joined.height,
+            )
+        )
+
+    if not labels_by_horizon:
+        raise ValueError("no candidate horizon produced point-in-time available labels")
+
+    manifest_source = market_data.feature_manifest
+    if manifest_source is None:
+        from src.core.datasets import make_manifest
+        from src.core.instruments import AssetKind
+
+        sessions = sorted(frame[_FEATURE_SESSION].unique().to_list())
+        manifest_source = make_manifest(
+            asset_kind=AssetKind.STOCK,
+            columns=frame.columns,
+            feature_set="stock_net_alpha_v1",
+            label_definition="net_alpha_o2o",
+            label_horizon_sessions=max(horizons),
+            time_start=sessions[0],
+            time_end=sessions[-1],
+            generated_time=sessions[-1],
+            row_count=frame.height,
+            provider_version="direct-loader",
+            universe_policy_version="direct-loader",
+        )
+    manifest = _net_alpha_manifest(manifest_source, feature_frame)
+
+    return NetAlphaResearchData(
+        feature_frame=feature_frame,
+        labels_by_horizon=labels_by_horizon,
+        manifest=manifest,
+        join_evidence=tuple(join_evidence),
+    )
