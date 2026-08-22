@@ -4,8 +4,8 @@ Scenarios: STREAMING_REPLAY_01, RESOURCE_PLAN_01.
 """
 from __future__ import annotations
 
+import tempfile
 from datetime import UTC, datetime
-
 import polars as pl
 import pytest
 
@@ -100,7 +100,7 @@ class TestStreamingReplay:
 
         context = ExecutionReplayContext(
             registry=__import__("src.stocks.research.artifacts", fromlist=["ModelArtifactRegistry"]).ModelArtifactRegistry(
-                __import__("pathlib").Path("mem://test")
+                __import__("pathlib").Path(tempfile.mkdtemp(prefix="stream-test-"))
             ),
             manifest=manifest,
             instruments=instruments_from_frame(market),
@@ -215,7 +215,7 @@ class TestReplayStream01:
             for i in sorted(market["instrument_id"].unique().to_list())
         }
         context = ExecutionReplayContext(
-            registry=ModelArtifactRegistry(Path("mem://stream01")),
+            registry=ModelArtifactRegistry(Path(tempfile.mkdtemp(prefix="stream01-"))),
             manifest=manifest,
             instruments=instruments,
             artifact_id="stream01",

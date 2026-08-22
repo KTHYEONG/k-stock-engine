@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,7 +16,9 @@ from src.core.paths import (
     STOCK_LABEL_ROOT,
 )
 from src.stocks.cli import train
+from src.stocks.data.direct import DirectDataRequest
 from src.stocks.ml.contracts import ExecutionFrontierSettings
+from src.stocks.research.models import ModelManifest
 from src.stocks.settings import REFERENCE_DATE, REFERENCE_DATETIME
 
 
@@ -416,3 +419,306 @@ def test_direct_cost_provenance_01_requires_known_snapshot(monkeypatch, tmp_path
         train._resolve_direct_cost_context(
             "missing-cost-evidence", SimpleNamespace(), object()
         )
+
+
+FULL_TERMINAL_03 = "FULL_TERMINAL_03_REDUCED_PARITY"
+
+
+def _write_parity_dataset(store, dataset_id, frame, *, feature_set: str) -> None:
+    from dataclasses import replace as dc_replace
+
+    from src.core.datasets import HIVE_PARTITION_LAYOUT, make_manifest
+    from src.core.instruments import AssetKind
+    from src.storage.parquet_datasets import canonical_content_hash
+
+    manifest = make_manifest(
+        asset_kind=AssetKind.STOCK,
+        columns=list(frame.columns),
+        feature_set=feature_set,
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=20,
+        time_start=datetime(2024, 1, 1, tzinfo=UTC),
+        time_end=datetime(2024, 3, 31, tzinfo=UTC),
+        provider_version="fixture",
+        universe_policy_version="fixture",
+        row_count=frame.height,
+        generated_time=datetime.now(UTC),
+        schema_version="v2",
+        storage_layout=HIVE_PARTITION_LAYOUT,
+    )
+    manifest = dc_replace(
+        manifest, content_hash=canonical_content_hash(frame, frame.columns)
+    )
+    store.write_partitioned(
+        frame,
+        dataset_id=dataset_id,
+        manifest=manifest,
+        expected_feature_set=feature_set,
+        decision_time=datetime(2024, 3, 31, tzinfo=UTC),
+    )
+
+
+def _build_parity_fixture(tmp_path):
+    """Reduced deterministic H10/H20 direct fixture shared by both loaders."""
+    import polars as pl
+
+    from src.storage.parquet_datasets import ParquetDatasetStore
+
+    base_root = tmp_path / "base"
+    feature_root = tmp_path / "features"
+    label_root = tmp_path / "labels"
+    for root in (base_root, feature_root, label_root):
+        root.mkdir()
+
+    sessions = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(25)]
+    base_rows = []
+    feature_rows = []
+    label_rows = []
+    last = sessions[-1]
+    for session in sessions:
+        for t in range(2):
+            price = 100.0 + t
+            base_rows.append({
+                "instrument_id": f"KRX:{t + 1:05d}", "session": session,
+                "open": price, "close": price * 1.01,
+                "volume": 1e6, "trading_value": price * 1e6,
+            })
+            feature_rows.append({
+                "instrument_id": f"KRX:{t + 1:05d}", "session": session,
+                "feature__momentum_5d": 0.1 * t,
+                "feature__volatility_20d": 0.02,
+            })
+            for horizon in (10, 20):
+                usable = session + timedelta(days=horizon) <= last
+                label_rows.append({
+                    "instrument_id": f"KRX:{t + 1:05d}", "session": session,
+                    "horizon_sessions": horizon,
+                    "net_alpha_target": 0.001 * horizon if usable else None,
+                    "label_available_time": session + timedelta(days=horizon),
+                })
+
+    base_store = ParquetDatasetStore(base_root)
+    feature_store = ParquetDatasetStore(feature_root)
+    label_store = ParquetDatasetStore(label_root)
+    _write_parity_dataset(base_store, "base_p", pl.DataFrame(base_rows), feature_set="base_panel")
+    _write_parity_dataset(feature_store, "feat_p", pl.DataFrame(feature_rows), feature_set="stock_net_alpha_v1")
+    _write_parity_dataset(label_store, "lab_p", pl.DataFrame(label_rows), feature_set="labels")
+    return (
+        DirectDataRequest(
+            base_dataset_id="base_p",
+            feature_dataset_id="feat_p",
+            label_dataset_id="lab_p",
+            start=date(2024, 1, 1),
+            end=date(2024, 1, 25),
+            candidate_horizon_sessions=(10, 20),
+        ),
+        base_root,
+        feature_root,
+        label_root,
+    )
+
+
+def test_full_terminal_03_reduced_parity(monkeypatch, tmp_path) -> None:
+    """FULL_TERMINAL_03_REDUCED_PARITY.
+
+    The reduced direct fixture preserves decision row count, per-horizon label
+    key set, feature schema hash, and terminal NO_TRADE classification exactly.
+    """
+    import polars as pl
+
+    from src.stocks.data.direct import DirectMarketDataLoader
+    from src.stocks.ml.data import (
+        compose_direct_net_alpha_training_data,
+        validate_ml_market_data,
+    )
+
+    request, base_root, feature_root, label_root = _build_parity_fixture(tmp_path)
+    decision_time = datetime(2024, 3, 1, tzinfo=UTC)
+
+    loader = DirectMarketDataLoader(
+        base_root=base_root, feature_root=feature_root, label_root=label_root
+    )
+    market_data = loader.load(request)
+    validate_ml_market_data(market_data, request.candidate_horizon_sessions)
+    legacy = compose_direct_net_alpha_training_data(market_data, decision_time)
+
+    modern_loader = DirectMarketDataLoader(
+        base_root=tmp_path / "base2",
+        feature_root=tmp_path / "features2",
+        label_root=tmp_path / "labels2",
+    )
+    # Re-point the independent loader at the same physical datasets so the
+    # comparison isolates the composition path, not the fixture copies.
+    modern_loader._base_store = __import__(
+        "src.storage.parquet_datasets", fromlist=["ParquetDatasetStore"]
+    ).ParquetDatasetStore(base_root)
+    modern_loader._feature_store = __import__(
+        "src.storage.parquet_datasets", fromlist=["ParquetDatasetStore"]
+    ).ParquetDatasetStore(feature_root)
+    modern_loader._label_store = __import__(
+        "src.storage.parquet_datasets", fromlist=["ParquetDatasetStore"]
+    ).ParquetDatasetStore(label_root)
+    modern = modern_loader.load_training_data(request, decision_time)
+
+    assert modern.feature_frame.height == legacy.feature_frame.height
+    assert modern.manifest.schema_hash == legacy.manifest.schema_hash
+    assert modern.manifest.content_hash == legacy.manifest.content_hash
+    assert set(modern.labels_by_horizon) == set(legacy.labels_by_horizon)
+    assert modern.feature_frame.equals(legacy.feature_frame)
+    order = ["instrument_id", "session", "net_alpha_target", "label_available_time"]
+    for horizon, label_frame in modern.labels_by_horizon.items():
+        reference = legacy.labels_by_horizon[horizon]
+        assert label_frame.select(order).rows() == reference.select(order).rows()
+        evidence_modern = [
+            e for e in modern.join_evidence if e.horizon_sessions == horizon
+        ]
+        evidence_legacy = [
+            e for e in legacy.join_evidence if e.horizon_sessions == horizon
+        ]
+        assert evidence_modern[0].joined_rows == evidence_legacy[0].joined_rows
+
+    # Terminal classification parity through the CLI direct path.
+    captured: dict[str, object] = {}
+
+    class _CapturingLedger:
+        def __init__(self, results_root):
+            captured["results_root"] = results_root
+
+        def record_completed(self, context, manifest, registry, telemetry=None):
+            captured["completed"] = (context, manifest)
+
+        def record_failed(self, context, phase, exc, telemetry=None):  # pragma: no cover
+            captured["failed"] = (context, phase, exc)
+
+    def _fake_no_trade_train(data, registry, req):
+        captured["train_data"] = data
+        return ModelManifest(
+            artifact_id=req.artifact_id,
+            asset_kind="stock",
+            feature_set="stock_net_alpha_v1",
+            feature_schema_hash=data.manifest.schema_hash,
+            universe_policy_hash=data.manifest.universe_policy_hash,
+            label_definition="net_alpha_o2o",
+            label_horizon_sessions=20,
+            eligible_from="2024-01-01T00:00:00+00:00",
+            eligible_to="2024-03-31T00:00:00+00:00",
+            model_type="no_trade",
+        )
+
+    diag_root = tmp_path / "diag"
+    diag_root.mkdir()
+    monkeypatch.setattr(train, "MlResultLedger", _CapturingLedger)
+    monkeypatch.setattr(train, "train_net_alpha_model", _fake_no_trade_train)
+    monkeypatch.setattr("src.core.paths.RUN_DIAGNOSTIC_ROOT", diag_root)
+
+    rc = train.main(
+        [
+            "--artifact-id", "parity01",
+            "--base-dataset-id", "base_p",
+            "--feature-dataset-id", "feat_p",
+            "--label-dataset-id", "lab_p",
+            "--research-start-direct", "2024-01-01",
+            "--research-end-direct", "2024-01-25",
+            "--base-root", str(base_root),
+            "--feature-root", str(feature_root),
+            "--label-root", str(label_root),
+            "--registry", str(tmp_path / "artifacts"),
+            "--results-root", str(tmp_path / "results"),
+            "--decision-time", decision_time.isoformat(),
+        ]
+    )
+
+    assert rc == 0
+    trained_data = captured["train_data"]
+    assert isinstance(trained_data.feature_frame, pl.DataFrame)
+    assert trained_data.feature_frame.equals(modern.feature_frame)
+    assert trained_data.manifest.schema_hash == modern.manifest.schema_hash
+    _, completed_manifest = captured["completed"]
+    assert completed_manifest.model_type == "no_trade"
+    assert "failed" not in captured
+
+
+TERMINAL_OBS_05 = "TERMINAL_OBS_05_REDUCED_FULL_PARITY"
+
+
+def test_terminal_obs_05_reduced_full_parity(monkeypatch, tmp_path) -> None:
+    """TERMINAL_OBS_05_REDUCED_FULL_PARITY.
+
+    The reduced direct fixture exits 0 with exactly one completed ledger
+    record, and the durable execution journal contains the full stage chain:
+    direct_preflight, direct_collected, matrix_preparation, terminal_pass.
+    """
+    import json as _json
+
+    request, base_root, feature_root, label_root = _build_parity_fixture(tmp_path)
+    del request
+
+    captured: dict[str, object] = {}
+
+    class _CapturingLedger:
+        def __init__(self, results_root):
+            captured["results_root"] = results_root
+
+        def record_completed(self, context, manifest, registry, telemetry=None):
+            captured.setdefault("completed", []).append((context, manifest))
+
+        def record_failed(self, context, phase, exc, telemetry=None):
+            captured.setdefault("failed", []).append((context, phase, exc))
+
+    diag_root = tmp_path / "diag_obs05"
+    diag_root.mkdir()
+    monkeypatch.setattr(train, "MlResultLedger", _CapturingLedger)
+    monkeypatch.setattr(
+        train,
+        "train_net_alpha_model",
+        lambda data, registry, req: ModelManifest(
+            artifact_id=req.artifact_id,
+            asset_kind="stock",
+            feature_set="stock_net_alpha_v1",
+            feature_schema_hash=data.manifest.schema_hash,
+            universe_policy_hash=data.manifest.universe_policy_hash,
+            label_definition="net_alpha_o2o",
+            label_horizon_sessions=20,
+            eligible_from="2024-01-01T00:00:00+00:00",
+            eligible_to="2024-03-31T00:00:00+00:00",
+            model_type="no_trade",
+        ),
+    )
+    monkeypatch.setattr("src.core.paths.RUN_DIAGNOSTIC_ROOT", diag_root)
+
+    rc = train.main(
+        [
+            "--artifact-id", "obs05",
+            "--base-dataset-id", "base_p",
+            "--feature-dataset-id", "feat_p",
+            "--label-dataset-id", "lab_p",
+            "--research-start-direct", "2024-01-01",
+            "--research-end-direct", "2024-01-25",
+            "--base-root", str(base_root),
+            "--feature-root", str(feature_root),
+            "--label-root", str(label_root),
+            "--registry", str(tmp_path / "artifacts"),
+            "--results-root", str(tmp_path / "results"),
+            "--candidate-horizon-sessions", "10,20",
+        ]
+    )
+
+    assert rc == 0
+    assert len(captured["completed"]) == 1  # one completed ledger record
+    assert "failed" not in captured
+
+    journal_lines = (
+        diag_root / "obs05" / "execution_journal.jsonl"
+    ).read_text(encoding="utf-8").splitlines()
+    stages = [
+        record["stage"]
+        for record in (_json.loads(line) for line in journal_lines)
+        if record.get("event") == "checkpoint"
+    ]
+    for required_stage in (
+        "direct_preflight",
+        "direct_collected",
+        "matrix_preparation",
+        "terminal_pass",
+    ):
+        assert required_stage in stages, f"missing journal stage {required_stage}"

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -161,7 +162,7 @@ def _context(market: pl.DataFrame) -> ExecutionReplayContext:
         row_count=market.height,
     )
     return ExecutionReplayContext(
-        registry=ModelArtifactRegistry(Path("mem://execution-replay")),
+        registry=ModelArtifactRegistry(Path(tempfile.mkdtemp(prefix="replay-ctx-"))),
         manifest=manifest,
         instruments=instruments,
         artifact_id="na_replay_test",
@@ -359,7 +360,7 @@ def test_delta_cost_utility_05_replay_telemetry() -> None:
         row_count=market.height,
     )
     context = ExecutionReplayContext(
-        registry=ModelArtifactRegistry(Path("mem://replay-telemetry")),
+        registry=ModelArtifactRegistry(Path(tempfile.mkdtemp(prefix="replay-telemetry-"))),
         manifest=manifest,
         instruments=instruments,
         artifact_id="telemetry_test",

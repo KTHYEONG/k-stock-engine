@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 import pytest
+import tempfile
 
 from src.stocks.ml.fitting import OofCache, atomic_write_parquet, read_oof_parquet
 from src.stocks.ml.discovery import HorizonDiscovery
@@ -154,8 +155,9 @@ class TestReplayBatchBenchmark:
 class TestReplayBatchWiring:
     """REPLAY_BATCH_03_FULL_FRONTIER_WIRING; TRAIN_COMPLETION_04_CADENCE_WIRING."""
 
-    def test_cadence_grouping_preserves_keys_and_bounds_builds(self) -> None:
+    def test_cadence_grouping_preserves_keys_and_bounds_builds(self, tmp_path: Path) -> None:
         from src.stocks.ml.training import _replay_costs_batch
+        from src.stocks.research.artifacts import ModelArtifactRegistry
 
         n_segments = 2
         sessions_per_seg = 6
@@ -234,6 +236,7 @@ class TestReplayBatchWiring:
         from src.stocks.ml.contracts import RiskSettings as _RS
 
         results = _replay_costs_batch(
+            ModelArtifactRegistry(tmp_path / "replay-batch"),
             calibrated=scores,
             oof_labels=scores,
             request=request,
@@ -267,9 +270,10 @@ class TestParallelCompletionMixedProfileSchedule:
     every candidate result key.
     """
 
-    def test_mixed_profiles_preserve_all_keys(self) -> None:
+    def test_mixed_profiles_preserve_all_keys(self, tmp_path: Path) -> None:
         from src.stocks.ml.training import _replay_costs_batch
         from src.stocks.ml.contracts import PolicyProfile
+        from src.stocks.research.artifacts import ModelArtifactRegistry
 
         n_segments = 2
         sessions_per_seg = 6
@@ -361,6 +365,7 @@ class TestParallelCompletionMixedProfileSchedule:
         from src.stocks.ml.contracts import RiskSettings as _RS
 
         results = _replay_costs_batch(
+            ModelArtifactRegistry(tmp_path / "replay-mixed"),
             calibrated=scores,
             oof_labels=scores,
             request=request,
@@ -461,7 +466,7 @@ class TestPerfMeasure01:
         )
         request = Req(artifact_id="perf_measure", candidate_horizon_sessions=(10,))
         context = ExecutionReplayContext(
-            registry=ModelArtifactRegistry(Path("mem://perf")),
+            registry=ModelArtifactRegistry(Path(tempfile.mkdtemp(prefix="perf-"))),
             manifest=manifest,
             instruments=instruments_from_frame(market),
             artifact_id="perf_measure",
@@ -957,7 +962,7 @@ class TestSingleMatrixSeed04:
             telemetry=telemetry,
             schema_hash="h",
             universe_policy_hash="u",
-            oof_cache=training_module._OofCache(registry.root / ".training"),
+            oof_cache=training_module._OofCache(tmp_path / "oof"),
         )
         assert manifest.model_type == "no_trade"
         publish_phase = telemetry.to_dict()["phases"][-1]
