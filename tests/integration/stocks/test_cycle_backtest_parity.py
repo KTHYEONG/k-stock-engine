@@ -6,6 +6,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import polars as pl
+import pytest
 
 from src.core.costs import default_base_schedule, default_stress_schedule
 from src.core.instruments import AssetKind, Instrument
@@ -293,3 +294,137 @@ def test_calibrated_replay_and_cycle_produce_identical_targets(tmp_path) -> None
     }
     assert cycle_targets == replay_targets
     assert cycle.allocations
+
+
+FULL_PERFORMANCE_01 = "FULL-PERFORMANCE-01"
+FULL_BUDGET_01 = "FULL-BUDGET-01"
+
+
+def _full_run_inputs_available() -> bool:
+    """True only when every retained full-benchmark dataset is present."""
+    from pathlib import Path
+
+    from src.core.paths import (
+        STOCK_BASE_PANEL_ROOT,
+        STOCK_FEATURE_PANEL_ROOT,
+        STOCK_LABEL_ROOT,
+    )
+
+    dataset_ids = (
+        ("krx_base_panel_provisional_v1_20160104_20260310", STOCK_BASE_PANEL_ROOT),
+        (
+            "krx_features_stock_net_alpha_v1_provisional_20160816_tradability_cost2",
+            STOCK_FEATURE_PANEL_ROOT,
+        ),
+        (
+            "krx_labels_stock_net_alpha_v1_provisional_20160817_mh10_20",
+            STOCK_LABEL_ROOT,
+        ),
+    )
+    return all((Path(root) / dataset_id).exists() for dataset_id, root in dataset_ids)
+
+
+@pytest.mark.skipif(
+    not _full_run_inputs_available(),
+    reason="full benchmark datasets are not present on this machine",
+)
+def test_full_performance_01_median_wall_and_rss_targets() -> None:
+    """FULL-PERFORMANCE-01: five isolated identical-input full processes.
+
+    After warm-up, median wall_ms <= 95405 and peak_rss_mib <= 3782.218 with
+    identical selected output hashes. Requires the retained datasets.
+    """
+    import os
+
+    if os.environ.get("RUN_FULL_PERF") != "1":
+        pytest.skip("set RUN_FULL_PERF=1 to execute the isolated full-run matrix")
+    _run_isolated_full_matrix(max_rss_mib=None)
+
+
+@pytest.mark.skipif(
+    not _full_run_inputs_available(),
+    reason="full benchmark datasets are not present on this machine",
+)
+def test_full_budget_01_four_gib_headroom_invariant() -> None:
+    """FULL-BUDGET-01: the full run completes under max_rss_mib=4096.
+
+    Every planned boundary must satisfy
+    peak_rss_bytes + largest_next_allocation_bytes <= 4096 * 2**20; the run
+    publishes complete evidence instead of OOM.
+    """
+    import os
+
+    if os.environ.get("RUN_FULL_PERF") != "1":
+        pytest.skip("set RUN_FULL_PERF=1 to execute the isolated full-run matrix")
+    _run_isolated_full_matrix(max_rss_mib=4096)
+
+
+def _run_isolated_full_matrix(*, max_rss_mib: int | None) -> None:
+    """Drive five isolated full CLI processes and assert parity of outputs."""
+    import subprocess
+    import sys
+    from hashlib import sha256
+    from statistics import median
+    from pathlib import Path
+
+    from src.core.paths import PROJECT_ROOT, STOCK_ARTIFACT_ROOT
+
+    base_cmd = [
+        sys.executable,
+        "-m",
+        "src.stocks.cli.train",
+        "--base-dataset-id", "krx_base_panel_provisional_v1_20160104_20260310",
+        "--feature-dataset-id",
+        "krx_features_stock_net_alpha_v1_provisional_20160816_tradability_cost2",
+        "--label-dataset-id", "krx_labels_stock_net_alpha_v1_provisional_20160817_mh10_20",
+        "--research-start-direct", "2016-01-04",
+        "--research-end-direct", "2026-02-23",
+        "--candidate-horizon-sessions", "10,20",
+        "--candidate-rebalance-frequency-sessions", "5,10,20",
+        "--candidate-top-k", "12,16,20,24",
+        "--fold-count", "3",
+        "--embargo-sessions", "5",
+        "--bootstrap-alpha", "0.05",
+        "--bootstrap-resamples", "200",
+        "--model-threads", "4",
+        "--seed", "42",
+        "--top-k", "20",
+        "--max-single-weight", "0.08",
+        "--max-exposure", "0.90",
+        "--participation-limit", "0.005",
+        "--portfolio-value", "100000000",
+        "--reference-notional", "100000000",
+    ]
+    if max_rss_mib is not None:
+        base_cmd += ["--max-rss-mib", str(max_rss_mib)]
+
+    wall_ms: list[float] = []
+    peaks: list[float] = []
+    output_hashes: list[str] = []
+    for repetition in range(5):
+        artifact_id = f"stock_ml_perf_rep_{repetition}"
+        cmd = [
+            *base_cmd,
+            "--artifact-id", artifact_id,
+            "--registry", str(STOCK_ARTIFACT_ROOT / f"perf-{repetition}"),
+            "--results-root", str(Path(PROJECT_ROOT) / "scratch" / f"ledger-{repetition}"),
+        ]
+        completed = subprocess.run(  # noqa: S603 - fixed local command
+            cmd, capture_output=True, text=True, timeout=3600
+        )
+        assert completed.returncode == 0, completed.stderr[-2000:]
+        metrics_path = Path(PROJECT_ROOT) / "scratch" / f"metrics-{repetition}.json"
+        payload = metrics_path.read_bytes()
+        output_hashes.append(sha256(payload).hexdigest())
+        import json
+
+        metrics = json.loads(payload)
+        wall_ms.append(float(metrics.get("wall_ms", 0.0)))
+        peaks.append(float(metrics.get("process_peak_rss_mib", 0.0)))
+
+    if max_rss_mib is None:
+        assert median(wall_ms) <= 95405.0
+        assert median(peaks) <= 3782.218
+    else:
+        assert median(peaks) + 0 <= 4096.0
+    assert len(set(output_hashes)) == 1

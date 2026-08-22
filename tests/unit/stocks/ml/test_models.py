@@ -1,7 +1,7 @@
 """Net-alpha models: decimal OOF calibration serialization and champion wrapper."""
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pytest
@@ -308,11 +308,21 @@ def test_weighted_path_selection_matches_independent_elastic_fits() -> None:
                 }
             )
     frame = pl.DataFrame(rows)
-    train = frame.filter(pl.col("session_index") < 60)
-    validation = frame.filter(pl.col("session_index") >= 60)
+    train_mask = frame["session_index"] < 60
+    validation = frame.filter(~train_mask)
     columns = ("feature__a", "feature__b", "feature__c")
     fractions = (0.01, 0.03, 0.10, 0.30)
-    solution = fit_weighted_elastic_path(train, columns, fractions, seed=42)
+
+    features_full = _float32_matrix(frame, columns)
+    targets_full = frame["net_alpha_target"].cast(pl.Float64).to_numpy()
+    codes_full = np.asarray(frame["session_index"].to_numpy(), dtype=np.int64)
+    solution = fit_weighted_elastic_path(
+        features_full[np.asarray(train_mask)],
+        targets_full[np.asarray(train_mask)],
+        codes_full[np.asarray(train_mask)],
+        fractions,
+        seed=42,
+    )
     assert solution is not None
     alpha_max = solution.alpha_max
 
@@ -340,6 +350,7 @@ def test_weighted_path_selection_matches_independent_elastic_fits() -> None:
     }
     best_path = max(fractions, key=lambda f: path_ics[f])
 
+    train = frame.filter(train_mask)
     features = _float32_matrix(train, columns)
     targets = train["net_alpha_target"].cast(pl.Float64).to_numpy()
     valid = np.isfinite(features).all(axis=1) & np.isfinite(targets)
@@ -366,3 +377,85 @@ def test_weighted_path_selection_matches_independent_elastic_fits() -> None:
     best_independent = max(fractions, key=lambda f: independent_ics[f])
     assert best_path == best_independent
     assert path_ics[best_path] == pytest.approx(independent_ics[best_path], abs=1e-6)
+
+
+WEIGHTS_INVALID_01 = "WEIGHTS-INVALID-01"
+
+
+def test_weights_invalid_01_mixed_non_finite_rows_keep_aligned_lengths() -> None:
+    """WEIGHTS-INVALID-01: valid-only counts keep rows and weights aligned.
+
+    Mixed non-finite rows produce equal selected row/weight lengths; every
+    valid session owns an equal raw total and the normalized weights sum to 1
+    within 1e-12.
+    """
+    from src.stocks.ml.models import session_balanced_weights_from_codes
+
+    codes = np.asarray([0, 0, 0, 1, 1, 1, 2], dtype=np.int64)
+    # Session 0: one invalid row; session 2: two invalid rows.
+    valid = np.asarray([True, True, False, True, True, True, False])
+    weights = session_balanced_weights_from_codes(codes, valid)
+    selected_rows = int(valid.sum())
+    assert weights.shape == codes.shape  # full length preserved
+    selected = weights[valid]
+    assert selected.size == selected_rows
+
+    for code in (0, 1):
+        session_total = float(selected[codes[valid] == code].sum())
+        assert session_total == pytest.approx(0.5)  # each session: 1 / n_sessions
+    total = float(selected.sum())
+    assert abs(total - 1.0) <= 1e-12
+
+
+ELASTIC_PARITY_01 = "ELASTIC-PARITY-01"
+
+
+def test_elastic_parity_01_prepared_path_matches_frame_reference() -> None:
+    """ELASTIC-PARITY-01: prepared arrays reproduce the frame-based path.
+
+    alpha_max, four fractions, coefficients, intercepts, and predictions match
+    the legacy reference within 1e-12 on an all-finite fixture.
+    """
+    from src.stocks.ml.models import (
+        _fit_weighted_elastic_path_reference,
+        fit_weighted_elastic_path,
+    )
+
+    rng = np.random.default_rng(23)
+    columns = ("feature__a", "feature__b", "feature__c")
+    rows: list[dict[str, object]] = []
+    for s in range(40):
+        for t in range(8):
+            a, b, c = (float(rng.normal()) for _ in range(3))
+            rows.append(
+                {
+                    "session": datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=s),
+                    "instrument_id": f"KRX:{t:05d}",
+                    "feature__a": a,
+                    "feature__b": b,
+                    "feature__c": c,
+                    "net_alpha_target": 0.4 * a - 0.3 * b + rng.normal(scale=0.01),
+                }
+            )
+    frame = pl.DataFrame(rows)
+    fractions = (0.01, 0.03, 0.10, 0.30)
+
+    reference = _fit_weighted_elastic_path_reference(
+        frame, columns, fractions, seed=42
+    )
+    features = np.stack([frame[c].to_numpy() for c in columns], axis=1).astype(np.float32)
+    targets = frame["net_alpha_target"].to_numpy().astype(np.float64)
+    codes = np.arange(frame.height, dtype=np.int64) // 8
+    prepared = fit_weighted_elastic_path(features, targets, codes, fractions, seed=42)
+
+    assert reference is not None
+    assert prepared is not None
+    assert prepared.fractions == reference.fractions
+    assert prepared.alpha_max == pytest.approx(reference.alpha_max, abs=1e-12)
+    assert prepared.coefficients == pytest.approx(reference.coefficients, abs=1e-12)
+    assert prepared.intercepts == pytest.approx(reference.intercepts, abs=1e-12)
+    ref_scores = reference.predict(frame, columns)
+    prep_scores = prepared.predict_array(features.astype(np.float64))
+    for fraction in fractions:
+        diff = float(np.max(np.abs(prep_scores[fraction] - ref_scores[fraction])))
+        assert diff <= 1e-12
