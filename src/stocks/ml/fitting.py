@@ -29,6 +29,7 @@ if TYPE_CHECKING:
         NetAlphaTrainingRequest,
         RegularizationGrid,
     )
+    from src.stocks.ml.models import ElasticPathResult
     from src.stocks.ml.preparation import (
         PreparedFold,
         PreparedHorizonLabels,
@@ -114,6 +115,58 @@ _SESSION_COLUMN = "session"
 _SESSION_IDX = "session_index"
 _SCORE_COLUMN = "predicted_net_alpha"
 _OOF_SEGMENT = "oof_segment_id"
+
+
+def _matrix_aligned_target(
+    horizon: PreparedHorizonLabels, num_rows: int
+) -> np.ndarray:
+    """Narrow NaN-padded float64 target vector aligned to canonical rows."""
+    target = np.full(num_rows, np.nan, dtype=np.float64)
+    target[horizon.row_index] = horizon.target
+    return target
+
+
+def _plan_fitting_workspace(
+    request: NetAlphaTrainingRequest,
+    planned_bytes: int,
+    stage: str,
+) -> None:
+    """Fail closed before one fitting workspace allocation.
+
+    The typed envelope checks every finite headroom (request RSS budget minus
+    current process RSS, cgroup limit minus current minus reserve, and
+    ``MemAvailable`` minus reserve) before any array is materialized.
+    """
+    from src.stocks.ml.replay_resources import (
+        MemoryBudgetExceededError,
+        plan_training_allocation,
+    )
+
+    envelope = plan_training_allocation(
+        planned_bytes,
+        request_limit_bytes=(
+            None
+            if request.max_rss_mib is None
+            else int(request.max_rss_mib) * 1024 * 1024
+        ),
+        reserve_bytes=int(request.memory_reserve_mib) * 1024 * 1024,
+    )
+    if not envelope.ok:
+        finite_headrooms = [
+            headroom
+            for headroom in (
+                envelope.process_headroom_bytes,
+                envelope.cgroup_headroom_bytes,
+                envelope.system_headroom_bytes,
+            )
+            if headroom is not None
+        ]
+        raise MemoryBudgetExceededError(
+            f"{stage} workspace of {planned_bytes} bytes exceeds memory "
+            f"envelope: {envelope.reason}",
+            planned_bytes=planned_bytes,
+            limit_bytes=min(finite_headrooms) if finite_headrooms else 0,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,19 +270,25 @@ def _select_elastic_alpha_prepared(
     request: NetAlphaTrainingRequest,
     grid: RegularizationGrid,
 ) -> tuple[float | None, float | None, float | None, int]:
-    """Fold-local scale-invariant penalty selection on prepared arrays.
+    """Fold-local scale-invariant penalty selection on indexed workspaces.
 
     Mirrors the historical nested selection: purged expanding inner folds over
-    the labeled training slice, one weighted coordinate path per inner fold,
-    per-fraction session Rank-IC through exact array ranks, the shared
-    alpha_max mean, and the deterministic stronger-penalty fallback.
+    the labeled training slice, one weighted coordinate path per inner fold on
+    a bounded-chunk Fortran-order design, per-fraction session Rank-IC through
+    exact array ranks, the shared alpha_max mean, and the deterministic
+    stronger-penalty fallback. No full-size ``matrix.X[rows]`` copy exists on
+    this path.
     """
-    from src.stocks.ml.models import fit_weighted_elastic_path
+    from src.stocks.ml.models import (
+        ELASTIC_DESIGN_CHUNK_ROWS,
+        fit_prepared_elastic_path,
+        prepare_indexed_elastic_design,
+    )
     from src.stocks.research.folds import PurgedWalkForward
 
     x_matrix = matrix.X
     codes = matrix.session_code
-    y_train = horizon.target[np.searchsorted(horizon.row_index, train_labeled)]
+    target_full = _matrix_aligned_target(horizon, matrix.num_rows)
     splitter = PurgedWalkForward(
         n_folds=request.fold_count,
         label_horizon_sessions=int(horizon.horizon_sessions),
@@ -251,26 +310,31 @@ def _select_elastic_alpha_prepared(
     def positions_of(rows: np.ndarray) -> np.ndarray:
         return np.searchsorted(horizon.row_index, rows)
 
-    def train_positions_of(rows: np.ndarray) -> np.ndarray:
-        return np.searchsorted(train_labeled, rows)
-
     for inner in nested:
         inner_train = train_labeled[np.asarray(inner.train_mask, dtype=np.int64)]
         inner_val = train_labeled[np.asarray(inner.validation_mask, dtype=np.int64)]
         if inner_train.size == 0 or inner_val.size == 0:
             continue
-        solution = fit_weighted_elastic_path(
-            x_matrix[inner_train],
-            y_train[train_positions_of(inner_train)],
-            codes[inner_train],
-            grid.fractions,
-            seed=request.seed,
+        _plan_fitting_workspace(
+            request,
+            int(inner_train.size) * matrix.num_features * 8,
+            "elastic_alpha_selection",
         )
+        design = prepare_indexed_elastic_design(
+            x_matrix,
+            inner_train,
+            target_full,
+            codes,
+            chunk_rows=ELASTIC_DESIGN_CHUNK_ROWS,
+        )
+        if design is None:
+            continue
+        solution = fit_prepared_elastic_path(design, grid.fractions, seed=request.seed)
         if solution is None:
             continue
         path_evaluations += 1
         alpha_maxes.append(solution.alpha_max)
-        scores_by_fraction = solution.predict_array(x_matrix[inner_val])
+        scores_by_fraction = _predict_rows_by_fraction(x_matrix, inner_val, solution)
         realized_va = horizon.realized[positions_of(inner_val)]
         for fraction in grid.fractions:
             scores = scores_by_fraction[fraction]
@@ -297,13 +361,21 @@ def _select_elastic_alpha_prepared(
     non_constant = [f for f in grid.fractions if f not in constant]
     if non_constant:
         best = max(non_constant)
-        solution = fit_weighted_elastic_path(
-            x_matrix[train_labeled],
-            y_train,
-            codes[train_labeled],
-            grid.fractions,
-            seed=request.seed,
+        _plan_fitting_workspace(
+            request,
+            int(train_labeled.size) * matrix.num_features * 8,
+            "elastic_alpha_selection",
         )
+        design = prepare_indexed_elastic_design(
+            x_matrix,
+            train_labeled,
+            target_full,
+            codes,
+            chunk_rows=ELASTIC_DESIGN_CHUNK_ROWS,
+        )
+        if design is None:
+            return None, None, None, bounded
+        solution = fit_prepared_elastic_path(design, grid.fractions, seed=request.seed)
         if solution is None:
             return None, None, None, bounded
         return (
@@ -324,44 +396,39 @@ def _fit_single_weighted_elastic(
     l1_ratio: float,
     seed: int,
 ) -> tuple[np.ndarray, float, np.ndarray, np.ndarray] | None:
-    """One weighted ElasticNet at a fixed penalty on prepared arrays.
+    """One weighted ElasticNet at a fixed penalty on an indexed workspace.
 
+    ``target`` is the full NaN-padded vector aligned to canonical rows.
     Returns ``(coefficients, intercept, mean, std)`` or ``None`` when the
     slice has no finite rows. Weights use valid-only session counts so mixed
-    invalid rows keep aligned shapes.
+    invalid rows keep aligned shapes; the only full-size allocation is the
+    single Fortran-order standardized design.
     """
     from sklearn.linear_model import ElasticNet
 
-    from src.stocks.ml.models import session_balanced_weights_from_codes
+    from src.stocks.ml.models import ELASTIC_DESIGN_CHUNK_ROWS, prepare_indexed_elastic_design
 
-    sub_full = matrix.X[train_rows]
-    valid = np.isfinite(sub_full).all(axis=1) & np.isfinite(target)
-    if not valid.any():
+    design = prepare_indexed_elastic_design(
+        matrix.X,
+        train_rows,
+        target,
+        matrix.session_code,
+        chunk_rows=ELASTIC_DESIGN_CHUNK_ROWS,
+    )
+    if design is None:
         return None
-    features = np.asarray(sub_full[valid], dtype=np.float64)
-    y = np.asarray(target, dtype=np.float64)[valid]
-    weights = session_balanced_weights_from_codes(
-        matrix.session_code[train_rows], valid
-    )[valid]
-    total = float(np.sum(weights))
-    mean = np.sum(features * weights[:, None], axis=0) / total
-    centered = features - mean
-    variance = np.sum(weights[:, None] * centered * centered, axis=0) / total
-    std = np.sqrt(np.maximum(variance, 0.0))
-    std[std == 0.0] = 1.0
-    standardized = (features - mean) / std
     model = ElasticNet(
         alpha=alpha,
         l1_ratio=l1_ratio,
         max_iter=2000,
         random_state=seed,
     )
-    model.fit(standardized, y, sample_weight=weights)
+    model.fit(design.standardized, design.target, sample_weight=design.weights)
     return (
         np.asarray(model.coef_, dtype=np.float64),
         float(model.intercept_),
-        mean,
-        std,
+        design.mean,
+        design.std,
     )
 
 
@@ -375,6 +442,55 @@ def _predict_prepared(
     standardized = (np.asarray(x_block, dtype=np.float64) - mean) / std
     standardized = np.where(np.isfinite(standardized), standardized, 0.0)
     return np.asarray(standardized @ coefficients + intercept, dtype=np.float64)
+
+
+def _predict_rows(
+    x_matrix: np.ndarray,
+    rows: np.ndarray,
+    coefficients: np.ndarray,
+    intercept: float,
+    mean: np.ndarray,
+    std: np.ndarray,
+) -> np.ndarray:
+    """Chunked standardized prediction over selected rows; no full copy."""
+    from src.stocks.ml.models import ELASTIC_DESIGN_CHUNK_ROWS
+
+    out = np.empty(rows.size, dtype=np.float64)
+    chunk = max(1, int(ELASTIC_DESIGN_CHUNK_ROWS))
+    for start in range(0, rows.size, chunk):
+        block = x_matrix[rows[start : start + chunk]]
+        stop = start + block.shape[0]
+        out[start:stop] = _predict_prepared(
+            block, coefficients, intercept, mean, std
+        )
+    return out
+
+
+def _predict_rows_by_fraction(
+    x_matrix: np.ndarray,
+    rows: np.ndarray,
+    solution: ElasticPathResult,
+) -> dict[float, np.ndarray]:
+    """Chunked target-free scores for every penalty fraction over ``rows``."""
+    from src.stocks.ml.models import ELASTIC_DESIGN_CHUNK_ROWS
+
+    scores = {
+        fraction: np.empty(rows.size, dtype=np.float64)
+        for fraction in solution.fractions
+    }
+    chunk = max(1, int(ELASTIC_DESIGN_CHUNK_ROWS))
+    for start in range(0, rows.size, chunk):
+        block = x_matrix[rows[start : start + chunk]]
+        stop = start + block.shape[0]
+        for index, fraction in enumerate(solution.fractions):
+            scores[fraction][start:stop] = _predict_prepared(
+                block,
+                solution.coefficients[index],
+                float(solution.intercepts[index]),
+                solution.mean,
+                solution.std,
+            )
+    return scores
 
 
 def _datetime_us_series(ns_values: np.ndarray, name: str) -> pl.Series:
@@ -429,6 +545,7 @@ def fit_horizon_oof(
     path_evaluations = 0
     x_matrix = matrix.X
     codes = matrix.session_code
+    target_full = _matrix_aligned_target(horizon, matrix.num_rows)
 
     for pfold in folds:
         fold_index = pfold.fold_index
@@ -444,8 +561,6 @@ def fit_horizon_oof(
                 )
             )
             continue
-        train_positions = np.searchsorted(horizon.row_index, train_labeled)
-        y_train = horizon.target[train_positions]
 
         selected_alpha, selected_fraction, alpha_max, fold_path_count = (
             _select_elastic_alpha_prepared(
@@ -460,9 +575,14 @@ def fit_horizon_oof(
                 )
             )
             continue
+        _plan_fitting_workspace(
+            inner_request,
+            int(train_labeled.size) * matrix.num_features * 8,
+            "outer_fold_fit",
+        )
         fitted = _fit_single_weighted_elastic(
             matrix,
-            y_train,
+            target_full,
             train_labeled,
             selected_alpha,
             l1_ratio=0.5,
@@ -476,8 +596,8 @@ def fit_horizon_oof(
             )
             continue
         coefficients, intercept, mean, std = fitted
-        scores = _predict_prepared(
-            x_matrix[validation_rows], coefficients, intercept, mean, std
+        scores = _predict_rows(
+            x_matrix, validation_rows, coefficients, intercept, mean, std
         )
         finite_scores = scores[np.isfinite(scores)]
         score_std = float(np.std(finite_scores)) if finite_scores.size else 0.0
