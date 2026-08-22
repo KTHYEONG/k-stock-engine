@@ -410,5 +410,9 @@
   },
   "tools/agent_skills/lean_check.py": {
     "testing": "tests/unit/stocks/backtesting/test_engine.py"
+  },
+  "src/stocks/backtesting/contracts.py": {
+    "architecture": "docs/specs/stock_ml_backtesting_performance_architecture.md",
+    "testing": "tests/unit/stocks/backtesting/test_contracts.py"
   }
 }

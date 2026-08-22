@@ -19,7 +19,8 @@ Ultra-fast automated git execution protocol. Includes a concise 1-line rationale
    - Inspect status using `git status --short`.
    - Do NOT read full diff or run linters (`ruff`), type checkers (`mypy`), or unit tests (`pytest`).
 
-3. **Chained Execution**:
+3. **Chained Execution & Atomicity**:
+   - **Atomic Principle**: A commit should represent one independently understandable and reasonably reversible logical change.
    - **Single Layer / Small Changes**: Stage and commit in a single chained shell command:
      ```bash
      git add -A && git commit -m "<type>: <Korean summary <= 50 chars>" -m "- **Why:** <Concise reason ending with 함.>" && git log -n 1 --oneline
@@ -30,7 +31,7 @@ Ultra-fast automated git execution protocol. Includes a concise 1-line rationale
      ```
    - Do NOT output markdown approval drafts or lengthy reasoning.
 
-3. **Message Standard**:
+4. **Message Standard**:
    - Subject: `<type>: <Korean summary <= 50 chars>`
    - Body: `- **Why:** <Concise 1-line reason ending with ~함.>`
 
