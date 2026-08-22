@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 from src.stocks.ml.telemetry import (
     PhaseMemorySample,
+    ResourceCheckpoint,
     TrainingTelemetry,
     current_rss_mib,
     peak_rss_mib,
@@ -80,3 +81,67 @@ def test_process_rss_helpers_are_finite_when_available() -> None:
         # Different sampling mechanisms may disagree by a small window, but
         # both must be finite positive observations.
         assert peak > 0.0
+
+
+def test_resource_checkpoint_records_only_scalar_fields(monkeypatch) -> None:
+    """TELEMETRY-AND-CLI-05: checkpoints carry stage/RSS/cgroup/MemAvailable/planned/reason."""
+    import src.stocks.ml.replay_resources as replay_resources
+    import src.stocks.ml.telemetry as telemetry_module
+
+    monkeypatch.setattr(telemetry_module, "current_rss_mib", lambda: 123.5)
+    monkeypatch.setattr(
+        replay_resources, "read_cgroup_current_bytes", lambda root=None: 4567
+    )
+    monkeypatch.setattr(
+        replay_resources, "read_host_mem_available_bytes", lambda: 8901
+    )
+
+    telemetry = TrainingTelemetry()
+    telemetry.resource_checkpoint("calibration", planned_bytes=2048)
+    entry = telemetry.to_dict()["resource_checkpoints"][0]
+    assert entry["stage"] == "calibration"
+    assert entry["current_rss_mib"] == 123.5
+    assert entry["cgroup_current_bytes"] == 4567
+    assert entry["mem_available_bytes"] == 8901
+    assert entry["planned_bytes"] == 2048
+    assert entry["envelope_reason"] == ""
+
+    checkpoint = ResourceCheckpoint(
+        stage="replay",
+        current_rss_mib=None,
+        cgroup_current_bytes=None,
+        mem_available_bytes=None,
+        planned_bytes=1,
+        envelope_reason="unbounded",
+    )
+    payload = checkpoint.to_dict()
+    for key in (
+        "stage",
+        "current_rss_mib",
+        "cgroup_current_bytes",
+        "mem_available_bytes",
+        "planned_bytes",
+        "envelope_reason",
+    ):
+        assert key in payload
+
+
+def test_emit_resource_checkpoint_is_noop_without_active_run(monkeypatch) -> None:
+    import src.stocks.ml.telemetry as telemetry_module
+
+    monkeypatch.setattr(telemetry_module, "_ACTIVE_TELEMETRY", None)
+    # Must not raise outside an active training run.
+    telemetry_module.emit_resource_checkpoint("fitting", planned_bytes=10)
+
+    telemetry = TrainingTelemetry()
+    telemetry_module.set_active_telemetry(telemetry)
+    try:
+        telemetry_module.emit_resource_checkpoint(
+            "matrix_prepare", planned_bytes=32, envelope={"reason": "within"}
+        )
+    finally:
+        telemetry_module.set_active_telemetry(None)
+    entry = telemetry.to_dict()["resource_checkpoints"][0]
+    assert entry["stage"] == "matrix_prepare"
+    assert entry["planned_bytes"] == 32
+    assert entry["envelope_reason"] == "within"

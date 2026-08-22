@@ -459,3 +459,150 @@ def test_elastic_parity_01_prepared_path_matches_frame_reference() -> None:
     for fraction in fractions:
         diff = float(np.max(np.abs(prep_scores[fraction] - ref_scores[fraction])))
         assert diff <= 1e-12
+
+
+def _indexed_design_fixture(
+    n_sessions: int = 24,
+    n_instruments: int = 6,
+    seed: int = 29,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """ML_FULL_EXECUTION_P0_ELASTIC_PARITY_01 deterministic fixture."""
+    rng = np.random.default_rng(seed)
+    n_rows = n_sessions * n_instruments
+    features = rng.normal(size=(n_rows, 4)).astype(np.float32)
+    features[:, 3] = 2.5  # zero-variance column exercises unit std handling
+    codes = np.repeat(np.arange(n_sessions, dtype=np.int64), n_instruments)
+    targets = (
+        0.5 * features[:, 0].astype(np.float64)
+        - 0.25 * features[:, 1].astype(np.float64)
+        + rng.normal(scale=0.01, size=n_rows)
+    )
+    return features, targets, codes
+
+
+def _indexed_design_frame(
+    features: np.ndarray, targets: np.ndarray, codes: np.ndarray
+) -> pl.DataFrame:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    n_rows = features.shape[0]
+    return pl.DataFrame(
+        {
+            "session": [start + timedelta(days=int(c)) for c in codes],
+            "instrument_id": [f"KRX:{i % 6:05d}" for i in range(n_rows)],
+            "feature__a": features[:, 0],
+            "feature__b": features[:, 1],
+            "feature__c": features[:, 2],
+            "feature__d": features[:, 3],
+            "net_alpha_target": targets,
+        }
+    )
+
+
+def test_elastic_parity_01_indexed_design_matches_frame_reference() -> None:
+    """ELASTIC-PARITY-01: indexed workspace reproduces the frame oracle.
+
+    One chunked Fortran-order float64 design yields alpha_max, every
+    fraction's coefficients/intercepts, and predictions within 1e-10 of the
+    frame-based reference; the zero-variance column keeps std == 1.0.
+    """
+    from src.stocks.ml.models import (
+        _fit_weighted_elastic_path_reference,
+        fit_prepared_elastic_path,
+        prepare_indexed_elastic_design,
+    )
+
+    columns = ("feature__a", "feature__b", "feature__c", "feature__d")
+    fractions = (0.01, 0.03, 0.10, 0.30)
+    features, targets, codes = _indexed_design_fixture()
+    frame = _indexed_design_frame(features, targets, codes)
+
+    reference = _fit_weighted_elastic_path_reference(
+        frame, columns, fractions, seed=42
+    )
+    assert reference is not None
+
+    design = prepare_indexed_elastic_design(
+        features,
+        np.arange(features.shape[0], dtype=np.int64),
+        targets,
+        codes,
+        chunk_rows=9,
+    )
+    assert design is not None
+    assert design.standardized.flags["F_CONTIGUOUS"]
+    assert design.standardized.dtype == np.float64
+    # The zero-variance column standardizes with unit std.
+    assert design.std[3] == pytest.approx(1.0)
+
+    solution = fit_prepared_elastic_path(design, fractions, seed=42)
+    assert solution is not None
+    assert solution.fractions == reference.fractions
+    assert abs(solution.alpha_max - reference.alpha_max) <= 1e-10
+    assert np.max(np.abs(solution.coefficients - reference.coefficients)) <= 1e-10
+    assert np.max(np.abs(solution.intercepts - reference.intercepts)) <= 1e-10
+
+    prep_scores = solution.predict_array(features.astype(np.float64))
+    ref_scores = reference.predict(frame, columns)
+    for fraction in fractions:
+        diff = float(np.max(np.abs(prep_scores[fraction] - ref_scores[fraction])))
+        assert diff <= 1e-10
+
+
+def test_elastic_parity_01_mixed_non_finite_rows_keep_aligned_valid_rows() -> None:
+    """ELASTIC-PARITY-01: mixed non-finite rows retain aligned rows/weights.
+
+    Invalid feature/target rows are excluded exactly once; the surviving
+    target and weight arrays stay row-aligned, weights sum to one, and every
+    valid session carries an equal total share matching the array route
+    within 1e-10.
+    """
+    from src.stocks.ml.models import (
+        fit_prepared_elastic_path,
+        fit_weighted_elastic_path,
+        prepare_indexed_elastic_design,
+    )
+
+    fractions = (0.03, 0.30)
+    features, targets, codes = _indexed_design_fixture()
+    invalid_rows = np.asarray([3, 40, 41, 100])
+    features[invalid_rows[:3], 0] = np.nan
+    targets[invalid_rows[3]] = np.nan
+    expected_valid = (
+        np.isfinite(features).all(axis=1) & np.isfinite(targets)
+    )
+
+    design = prepare_indexed_elastic_design(
+        features,
+        np.arange(features.shape[0], dtype=np.int64),
+        targets,
+        codes,
+        chunk_rows=7,
+    )
+    assert design is not None
+    assert np.array_equal(design.row_indices, expected_valid.nonzero()[0])
+    assert design.target.size == design.weights.size == int(expected_valid.sum())
+    assert abs(float(design.weights.sum()) - 1.0) <= 1e-12
+    valid_codes = codes[expected_valid]
+    for code in np.unique(valid_codes):
+        session_total = float(design.weights[valid_codes == code].sum())
+        assert session_total == pytest.approx(1.0 / 24.0)
+
+    route = fit_weighted_elastic_path(
+        features[expected_valid],
+        targets[expected_valid],
+        codes[expected_valid],
+        fractions,
+        seed=42,
+    )
+    solution = fit_prepared_elastic_path(design, fractions, seed=42)
+    assert route is not None
+    assert solution is not None
+    assert abs(solution.alpha_max - route.alpha_max) <= 1e-10
+    assert np.max(np.abs(solution.coefficients - route.coefficients)) <= 1e-10
+    # Non-finite prediction inputs map to zero standardized values: a fully
+    # invalid row collapses to the intercept alone.
+    block = features[:4].astype(np.float64).copy()
+    block[0, :] = np.nan
+    scores = solution.predict_array(block)[fractions[-1]]
+    assert scores[0] == pytest.approx(float(solution.intercepts[-1]))
+    assert np.isfinite(scores[1:4]).all()

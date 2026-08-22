@@ -731,3 +731,236 @@ class TestPublicImports01:
 
 
 SCORE_COL = "score"
+
+
+SINGLE_MATRIX_SEED_04 = "ML_FULL_EXECUTION_P0_SINGLE_MATRIX_SEED_04"
+
+
+def _seed04_fixture(
+    n_sessions: int = 20,
+    per_session: int = 4,
+    embargo_sessions: int = 1,
+) -> tuple[object, object, NetAlphaTrainingRequest, object]:
+    """Small canonical matrix plus research data for seed-level unit tests."""
+    import numpy as np
+    import polars as pl
+    from datetime import timedelta
+
+    from src.core.datasets import DatasetManifest
+    from src.core.instruments import AssetKind
+    from src.stocks.ml.contracts import NetAlphaResearchData
+    from src.stocks.ml.preparation import prepare_matrix_from_frame
+
+    rng = np.random.default_rng(7)
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    rows: list[dict[str, object]] = []
+    for s in range(n_sessions):
+        session = start + timedelta(days=s)
+        for t in range(per_session):
+            a, b = (float(v) for v in rng.normal(size=2))
+            rows.append(
+                {
+                    "instrument_id": f"KRX:{t + 1:05d}",
+                    "session": session,
+                    "feature__a": a,
+                    "feature__b": b,
+                }
+            )
+    frame = pl.DataFrame(rows)
+    matrix = prepare_matrix_from_frame(frame, ("feature__a", "feature__b"))
+
+    horizon_sessions = 3
+    label_rows = [
+        {
+            "instrument_id": row["instrument_id"],
+            "session": row["session"],
+            "net_alpha_target": float(rng.normal(scale=0.5)),
+            "risk_residual": float(rng.normal(scale=0.003)),
+            "reference_cost": 0.001,
+            "label_available_time": row["session"]
+            + timedelta(days=horizon_sessions),
+        }
+        for row in rows
+    ]
+    manifest = DatasetManifest(
+        asset_kind=AssetKind.STOCK,
+        schema_version="v1",
+        schema_hash="h",
+        provider_version="p",
+        universe_policy_version="u",
+        universe_policy_hash="u",
+        feature_set="stock_net_alpha_v1",
+        feature_set_hash="f",
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=horizon_sessions,
+        time_start=start,
+        time_end=start + timedelta(days=n_sessions),
+        generated_time=start + timedelta(days=n_sessions),
+        row_count=len(rows),
+    )
+    data = NetAlphaResearchData(
+        feature_frame=frame,
+        labels_by_horizon={horizon_sessions: pl.DataFrame(label_rows)},
+        manifest=manifest,
+    )
+    from src.stocks.ml.contracts import ExecutionFrontierSettings
+
+    request = NetAlphaTrainingRequest(
+        artifact_id="seed04",
+        candidate_horizon_sessions=(horizon_sessions,),
+        embargo_sessions=embargo_sessions,
+        execution_frontier=ExecutionFrontierSettings(
+            candidate_horizon_sessions=(horizon_sessions,),
+            candidate_rebalance_frequency_sessions=(1,),
+            candidate_top_k=(12,),
+        ),
+    )
+    model_manifest = _seed04_model_manifest(horizon_sessions)
+    return matrix, data, request, model_manifest
+
+
+def _seed04_model_manifest(horizon_sessions: int):
+    from src.core.instruments import AssetKind
+    from src.stocks.research.models import ModelManifest
+
+    return ModelManifest(
+        artifact_id="seed04",
+        asset_kind=AssetKind.STOCK,
+        feature_set="stock_net_alpha_v1",
+        feature_schema_hash="net-alpha-v1",
+        universe_policy_hash="net-alpha-v1",
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=horizon_sessions,
+        eligible_from="2024-01-01T00:00:00+00:00",
+        eligible_to="2024-12-31T00:00:00+00:00",
+    )
+
+
+class TestSingleMatrixSeed04:
+    """P0_SINGLE_MATRIX_SEED_04: one canonical matrix feeds OOF and the seed."""
+
+    def test_calibration_seed_consumes_caller_matrix_without_second_preparation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import numpy as np
+
+        from src.stocks.ml import training as training_module
+
+        matrix, data, request, model_manifest = _seed04_fixture(
+            n_sessions=40, embargo_sessions=1
+        )
+
+        def _forbidden(*args: object, **kwargs: object) -> None:
+            raise AssertionError("second matrix preparation is forbidden")
+
+        monkeypatch.setattr(
+            training_module, "prepare_training_matrix", _forbidden
+        )
+
+        boundary_code = int(matrix.num_sessions) - 6
+        initial_rows = np.flatnonzero(matrix.session_code < boundary_code)
+        assert initial_rows.size > 0
+
+        seed = training_module.build_initial_calibration_seed(
+            matrix, initial_rows, request, 3, model_manifest, data=data
+        )
+        assert not seed.is_empty()
+        for column in (
+            "instrument_id",
+            "session",
+            "predicted_net_alpha",
+            "risk_residual",
+            "label_available_time",
+            "realized_net_return",
+        ):
+            assert column in seed.columns
+        # Seed rows stay inside the caller's pre-validation window.
+        assert int(seed["session_index"].max()) < boundary_code
+        assert seed["predicted_net_alpha"].is_finite().all()
+        # Target-free: labels are only joined after prediction, so realized
+        # outcomes must exist for every emitted ledger row.
+        assert seed["realized_net_return"].is_not_null().all()
+
+    def test_seed_is_inner_purged_across_segments(self) -> None:
+        import numpy as np
+
+        from src.stocks.ml import training as training_module
+
+        matrix, data, request, model_manifest = _seed04_fixture(
+            n_sessions=40, embargo_sessions=1
+        )
+        boundary_code = int(matrix.num_sessions) - 6
+        initial_rows = np.flatnonzero(matrix.session_code < boundary_code)
+        seed = training_module.build_initial_calibration_seed(
+            matrix, initial_rows, request, 3, model_manifest, data=data
+        )
+        assert not seed.is_empty()
+        segments = sorted(seed["oof_segment_id"].unique().to_list())
+        # Degenerate inner folds legitimately drop out (constant-oof-score);
+        # every surviving segment must still own a disjoint validation block.
+        assert len(segments) >= 1
+        validation_sessions_by_segment = {
+            segment: set(
+                seed.filter(
+                    seed["oof_segment_id"] == segment
+                )["session_index"].to_list()
+            )
+            for segment in segments
+        }
+        # Inner validation blocks are disjoint across segments.
+        seen: set[int] = set()
+        for segment in segments:
+            block = validation_sessions_by_segment[segment]
+            assert not (block & seen)
+            seen |= block
+
+    def test_pre_allocation_breach_publishes_no_trade_before_replay(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.stocks.ml import training as training_module
+        from src.stocks.ml.replay_resources import ResourceEnvelope
+        from src.stocks.ml.telemetry import TrainingTelemetry
+        from src.stocks.research.artifacts import ModelArtifactRegistry
+
+        _, data, request, _ = _seed04_fixture()
+
+        def _failed_envelope(planned_bytes: int, **kwargs: object):
+            del kwargs
+            return ResourceEnvelope(
+                ok=False,
+                planned_bytes=planned_bytes,
+                limiting_source="cgroup",
+                process_headroom_bytes=None,
+                cgroup_headroom_bytes=1,
+                system_headroom_bytes=None,
+                reason="planned bytes exceed cgroup headroom",
+            )
+
+        monkeypatch.setattr(
+            training_module, "_plan_training_allocation", _failed_envelope
+        )
+        registry_root = tmp_path / "registry"
+        registry_root.mkdir()
+        registry = ModelArtifactRegistry(registry_root)
+        telemetry = TrainingTelemetry()
+        frame = data.feature_frame
+        manifest = training_module._select_publish_and_promote(
+            registry=registry,
+            data=data,
+            request=request,
+            frame=frame,
+            pre_holdout=frame,
+            holdout=frame,
+            folds=[],
+            learner_columns=("feature__a", "feature__b"),
+            schema=None,
+            telemetry=telemetry,
+            schema_hash="h",
+            universe_policy_hash="u",
+            oof_cache=training_module._OofCache(registry.root / ".training"),
+        )
+        assert manifest.model_type == "no_trade"
+        publish_phase = telemetry.to_dict()["phases"][-1]
+        assert publish_phase["reason"] == (
+            "memory-budget-exceeded:matrix_prepare"
+        )
