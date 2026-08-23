@@ -244,3 +244,13 @@ def test_default_policy_profiles_confidence_frontier() -> None:
     assert half_kelly.growth_risk_aversion == 2.0
     validated = validate_policy_profiles(DEFAULT_POLICY_PROFILES)
     assert validated[2].sizing_mode == "confidence_mean_variance_v1"
+
+
+def test_discovery_model_family_must_be_declared() -> None:
+    """SCENARIO_DISCOVERY_FAMILY_VALIDATION."""
+    from src.stocks.ml.contracts import ELASTIC_NET_FAMILY
+
+    with pytest.raises(ValueError, match="discovery_model_family"):
+        NetAlphaTrainingRequest(artifact_id="v1", discovery_model_family="not-a-family")
+    request = NetAlphaTrainingRequest(artifact_id="v1")
+    assert request.discovery_model_family == ELASTIC_NET_FAMILY
