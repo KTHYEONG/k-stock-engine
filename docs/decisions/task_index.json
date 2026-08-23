@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_ML_HORIZON_SCOPE_LEDGER_COMPLETION_20260823",
+      "date": "2026-08-23",
+      "adr_id": "ADR_20260823_STOCK_ML_HORIZON_SCOPE_LEDGER_COMPLETION_20260823",
+      "domain": "stocks_ml",
+      "title": "Stock ML H10-only scope and terminal ledger completion",
+      "why": "H10/H20 discovery duplicated horizon-dependent fitting work, while verbose observability projections exceeded the 24 KiB ledger record limit and lost terminal persistence.",
+      "resolution": "Documented H10-only as a pre-registered single-horizon research configuration and defined a schema-v2 digest-backed ledger projection with bounded fallback and rebuild parity.",
+      "impact": "H10-only runs can remove the H20 fit/replay branch with an explicit narrower selection claim; completed and rebuilt valid artifacts retain terminal ledger records under the byte limit while metrics.json remains the full evidence source."
+    },
+    {
       "task_id": "TASK_STOCK_ML_ROLLING_REFIT_TERMINAL_LEDGER_20260823",
       "date": "2026-08-23",
       "adr_id": "ADR_20260823_STOCK_ML_ROLLING_REFIT_TERMINAL_LEDGER_20260823",

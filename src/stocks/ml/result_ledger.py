@@ -42,7 +42,7 @@ logger = logging.getLogger("stocks.ml.result_ledger")
 # DiagnosticReport is imported lazily to avoid circular imports
 _DiagnosticReport = None
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 RETAINED_RECORDS = 128
 MAX_SCHEMA_BYTES = 16 * 1024
 MAX_LATEST_BYTES = 24 * 1024
@@ -179,7 +179,35 @@ def _sanitize_deep(value: object) -> object:
 
 def _encode(record: Mapping[str, object]) -> bytes:
     """Canonical compact UTF-8 JSON encoding for ledger artifacts."""
-    return json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return _canonical_json(record)
+
+
+def _canonical_json(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _digest_summary(value: object) -> dict[str, object]:
+    """Deterministic ``{count, sha256}`` index of an unbounded collection.
+
+    The ledger never copies members of an allowed metric collection; their
+    full evidence stays in the referenced artifact ``metrics.json`` while the
+    canonical digest pins the exact observed content.
+    """
+    sanitized = _sanitize_deep(value)
+    if isinstance(sanitized, dict):
+        count = len(sanitized)
+        payload: object = {
+            str(key): sanitized[key] for key in sorted(sanitized, key=str)
+        }
+    elif isinstance(sanitized, (list, tuple)):
+        count = len(sanitized)
+        payload = list(sanitized)
+    else:
+        return {}
+    return {
+        "count": count,
+        "sha256": hashlib.sha256(_canonical_json(payload)).hexdigest(),
+    }
 
 
 def _validate_size(obj: Mapping[str, object], limit: int, label: str) -> None:
@@ -338,15 +366,19 @@ def _build_schema(retained_cap: int) -> dict[str, object]:
                 "promotion/no-trade evidence, selected profile, and gates"
             ),
             "observability": {
-                "phases": "bounded phase samples",
-                "horizons": "per-candidate admission and fold diagnostics",
+                "phases": (
+                    "bounded phase samples: fixed scalars plus payload digest"
+                ),
+                "horizons": (
+                    "per-candidate admission/fold scalars and numeric summaries"
+                ),
                 "summary": (
                     "bounded fold/cohort/multiplicity/operation-count/schema "
-                    "diagnostics; never raw arrays"
+                    "diagnostics; frontier maps appear only as digests"
                 ),
                 "policy_frontier": (
-                    "bounded candidate count, profile ids, per-(horizon,profile) "
-                    "dropout reasons, and per-segment vintage sums"
+                    "candidate/profile counts plus {count, sha256} digest "
+                    "summaries of profile ids, dropout reasons, segment sums"
                 ),
                 "replay": "aggregate period-return summary",
                 "holdout": (
@@ -354,7 +386,14 @@ def _build_schema(retained_cap: int) -> dict[str, object]:
                     "Calmar, pass flags), cohort counts, eligibility interval"
                 ),
             },
-            "artifact": {"manifest_path": "str", "metrics_path": "str"},
+            "artifact": {
+                "manifest_path": "str",
+                "manifest_bytes": "int",
+                "manifest_sha256": "sha256 hex",
+                "metrics_path": "str",
+                "metrics_bytes": "int",
+                "metrics_sha256": "sha256 hex",
+            },
         },
         "forbidden": [
             "per-instrument values",
@@ -468,6 +507,27 @@ def _read_artifact_json(
     if not isinstance(data, dict):
         raise ValueError(f"artifact file must be a JSON object: {path}")
     return data
+
+
+def _artifact_reference(root: Path, artifact_id: str) -> dict[str, object]:
+    """Exact-byte identity of the artifact files backing one ledger record.
+
+    Returns the validated manifest/metrics filenames, byte lengths, and
+    SHA-256 digests of the bytes used for a completed or rebuilt projection.
+    """
+    reference: dict[str, object] = {}
+    for prefix, filename in (
+        ("manifest", MANIFEST_FILENAME),
+        ("metrics", METRICS_FILENAME),
+    ):
+        path = Path(root) / artifact_id / filename
+        if not path.is_file():
+            raise ValueError(f"artifact file missing: {path}")
+        payload = path.read_bytes()
+        reference[f"{prefix}_path"] = filename
+        reference[f"{prefix}_bytes"] = len(payload)
+        reference[f"{prefix}_sha256"] = hashlib.sha256(payload).hexdigest()
+    return reference
 
 
 def _validate_artifact_identity(
@@ -647,9 +707,9 @@ def _project_data(context: MlRunContext) -> dict[str, object]:
                 "feature_rows": evidence.feature_rows,
                 "label_rows": evidence.label_rows,
                 "joined_rows": evidence.joined_rows,
-                "drop_reasons": [
-                    _normalize_message(reason) for reason in evidence.drop_reasons
-                ],
+                "drop_reasons_digest": _digest_summary(
+                    list(evidence.drop_reasons)
+                ),
             }
             for evidence in context.join_evidence
         ],
@@ -683,12 +743,21 @@ def _project_outcome(
         raw_reasons = gates.get("reasons", []) if isinstance(gates, dict) else []
     reasons = [_normalize_message(reason) for reason in raw_reasons if isinstance(reason, str)]
     selected_profile = metrics.get("selected_profile")
+    gate_reasons = (
+        [
+            _normalize_message(reason)
+            for reason in gates.get("reasons", [])
+            if isinstance(reason, str)
+        ]
+        if isinstance(gates, dict)
+        else []
+    )
     return {
         "model_family": model_type,
         "model_type": model_type,
         "promoted": promoted,
         "no_trade": no_trade,
-        "promotion_reasons": reasons,
+        "promotion_reasons_digest": _digest_summary(reasons),
         "selected_horizons": _selected_horizons(metrics, manifest),
         "selected_profile": {
             "profile_id": (
@@ -704,11 +773,7 @@ def _project_outcome(
         },
         "gates": {
             "passed": bool(gates.get("passed", promoted)),
-            "reasons": [
-                _normalize_message(reason)
-                for reason in gates.get("reasons", [])
-                if isinstance(reason, str)
-            ],
+            "reasons_digest": _digest_summary(gate_reasons),
         },
     }
 
@@ -776,11 +841,9 @@ def _project_certificate_path(path: object) -> dict[str, object]:
         return {}
     return {
         "passed": bool(path.get("passed", False)),
-        "reasons": [
-            _normalize_message(reason)
-            for reason in path.get("reasons", [])
-            if isinstance(reason, str)
-        ],
+        "reasons_digest": _digest_summary(
+            [reason for reason in path.get("reasons", []) if isinstance(reason, str)]
+        ),
         "cagr": _as_float(path.get("cagr")),
         "lower_cagr": _as_float(path.get("lower_cagr")),
         "mdd": _as_float(path.get("mdd")),
@@ -837,43 +900,109 @@ def _project_holdout(metrics: Mapping[str, object]) -> dict[str, object]:
     }
 
 
-def _project_policy_frontier(metrics: Mapping[str, object]) -> dict[str, object]:
-    """Bounded selected-profile frontier projection (dropout reasons, segment sums).
+_COMPACT_SCALAR_KEY_LIMIT = 16
 
-    Never emits scores, returns, or per-instrument data; only the candidate
-    count, profile ids, per-``(horizon, profile)`` dropout reasons, and the
-    bounded per-segment vintage sums.
+
+def _json_scalar(value: object) -> object:
+    """Project one scalar to a bounded finite JSON-safe value."""
+    if isinstance(value, bool) or value is None or isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return _normalize_message(value)
+
+
+def _compact_entry(entry: Mapping[str, object]) -> dict[str, object]:
+    """Fixed-scalar projection of one phase/horizon entry.
+
+    Scalar fields survive (capped count); numeric arrays collapse to
+    finite-only summaries; every other collection is replaced by a
+    deterministic ``payload_digest`` instead of being copied.
+    """
+    scalars: dict[str, object] = {}
+    kept = 0
+    overflow: dict[str, object] = {}
+    for key in sorted(str(item) for item in entry):
+        value = entry[key]
+        if (
+            isinstance(value, (list, tuple))
+            and bool(value)
+            and all(
+                isinstance(item, (int, float)) and not isinstance(item, bool)
+                for item in value
+            )
+        ):
+            scalars[f"{key}_summary"] = summarize_numeric(value)
+            continue
+        if isinstance(value, (dict, list, tuple)):
+            overflow[key] = value
+            continue
+        if kept < _COMPACT_SCALAR_KEY_LIMIT:
+            scalars[key] = _json_scalar(value)
+            kept += 1
+        else:
+            overflow[key] = value
+    if overflow:
+        scalars["payload_digest"] = _digest_summary(overflow)
+    return scalars
+
+
+def _compact_entries(source: Mapping[str, object], key: str) -> list[dict[str, object]]:
+    entries = source.get(key)
+    if not isinstance(entries, (list, tuple)):
+        return []
+    return [
+        _compact_entry(entry) for entry in entries if isinstance(entry, Mapping)
+    ]
+
+
+def _compact_phases(source: Mapping[str, object]) -> list[dict[str, object]]:
+    return _compact_entries(source, "phases")
+
+
+def _compact_horizons(source: Mapping[str, object]) -> list[dict[str, object]]:
+    return _compact_entries(source, "horizons")
+
+
+def _compact_policy_frontier(metrics: Mapping[str, object]) -> dict[str, object]:
+    """Digest-backed frontier index: counts plus ``{count, sha256}`` summaries.
+
+    Never copies policy-frontier maps; candidate/profile counts and the
+    deterministic digests of profile ids, dropout reasons, and segment sums
+    pin the evidence that stays in the artifact metrics.
     """
     frontier = metrics.get("policy_frontier")
     if not isinstance(frontier, dict):
         return {}
     profile_ids = frontier.get("profile_ids")
-    dropout = frontier.get("dropout_reasons")
-    segment_sums = frontier.get("segment_sums")
     return {
         "candidate_count": _as_int(frontier.get("candidate_count")),
-        "profile_ids": [
-            _normalize_message(value)
-            for value in (profile_ids if isinstance(profile_ids, (list, tuple)) else [])
-        ],
-        "dropout_reasons": (
-            {
-                str(key): _normalize_message(value)
-                for key, value in dropout.items()
-                if isinstance(dropout, dict)
-            }
-            if isinstance(dropout, dict)
-            else {}
+        "profile_count": (
+            len(profile_ids) if isinstance(profile_ids, (list, tuple)) else 0
         ),
-        "segment_sums": (
-            {
-                str(key): _sanitize_deep(value)
-                for key, value in segment_sums.items()
-                if isinstance(segment_sums, dict)
-            }
-            if isinstance(segment_sums, dict)
-            else {}
-        ),
+        "profile_ids_digest": _digest_summary(profile_ids),
+        "dropout_reasons_digest": _digest_summary(frontier.get("dropout_reasons")),
+        "segment_sums_digest": _digest_summary(frontier.get("segment_sums")),
+    }
+
+
+def _compact_observability(
+    metrics: Mapping[str, object],
+    telemetry: Mapping[str, object] | None,
+) -> dict[str, object]:
+    """Single bounded observability projector for live and rebuilt records."""
+    source: Mapping[str, object] = {}
+    if isinstance(telemetry, Mapping):
+        source = telemetry
+    else:
+        run_obs = metrics.get("run_observability")
+        if isinstance(run_obs, Mapping):
+            source = run_obs
+    return {
+        "phases": _compact_phases(source),
+        "horizons": _compact_horizons(source),
+        "summary": _bounded_observability_summary(source),
+        "policy_frontier": _compact_policy_frontier(metrics),
     }
 
 
@@ -911,19 +1040,19 @@ def _bounded_observability_summary(
     if isinstance(frontier.get("candidate_count"), int):
         summary["frontier_candidate_count"] = frontier["candidate_count"]
         summary["frontier_candidate_bound"] = frontier.get("candidate_bound")
-        summary["frontier_profile_ids"] = frontier.get("profile_ids")
-        dropout = frontier.get("dropout_reasons")
-        if isinstance(dropout, dict):
-            summary["frontier_dropout_reasons"] = {
-                str(key): _normalize_message(value)
-                for key, value in dropout.items()
-            }
-        segment_sums = frontier.get("segment_sums")
-        if isinstance(segment_sums, dict):
-            summary["frontier_segment_sums"] = {
-                str(key): _sanitize_deep(value)
-                for key, value in segment_sums.items()
-            }
+        profile_ids = frontier.get("profile_ids")
+        summary["frontier_profile_count"] = (
+            len(profile_ids) if isinstance(profile_ids, (list, tuple)) else 0
+        )
+        summary["frontier_profile_ids_digest"] = _digest_summary(profile_ids)
+        # Frontier maps stay in the artifact; the summary pins them by digest
+        # instead of duplicating them beside observability.policy_frontier.
+        summary["frontier_dropout_reasons_digest"] = _digest_summary(
+            frontier.get("dropout_reasons")
+        )
+        summary["frontier_segment_sums_digest"] = _digest_summary(
+            frontier.get("segment_sums")
+        )
     horizons = telemetry.get("horizons")
     if isinstance(horizons, list):
         # Bounded replay runtime scalars, aggregated across horizon entries:
@@ -982,27 +1111,87 @@ def _bounded_observability_summary(
 def _observability_from(
     metrics: Mapping[str, object], telemetry: Mapping[str, object] | None
 ) -> dict[str, object]:
-    if isinstance(telemetry, dict):
-        return {
-            "phases": list(telemetry.get("phases") or []),
-            "horizons": list(telemetry.get("horizons") or []),
-            "summary": _bounded_observability_summary(telemetry),
-            "policy_frontier": _project_policy_frontier(metrics),
-        }
-    run_obs = metrics.get("run_observability")
-    if isinstance(run_obs, dict):
-        return {
-            "phases": list(run_obs.get("phases") or []),
-            "horizons": list(run_obs.get("horizons") or []),
-            "summary": _bounded_observability_summary(run_obs),
-            "policy_frontier": _project_policy_frontier(metrics),
-        }
+    """Compact observability for both live telemetry and persisted state."""
+    return _compact_observability(metrics, telemetry)
+
+
+_FIT_DROP_ORDER = ("runtime", "input", "outcome")
+
+
+def _minimal_terminal_projection(record: Mapping[str, object]) -> dict[str, object]:
+    """Deterministic terminal record for projections exceeding the byte budget.
+
+    Retains identity/status/timing/outcome scalars and the artifact digest
+    references; everything omitted is pinned by ``omitted_record_sha256``.
+    """
+    input_raw = record.get("input")
+    input_map = input_raw if isinstance(input_raw, Mapping) else {}
+    snapshot_id = input_map.get("snapshot_id")
+    outcome_raw = record.get("outcome")
+    outcome_map = outcome_raw if isinstance(outcome_raw, Mapping) else {}
+    profile = outcome_map.get("selected_profile")
+    profile = profile if isinstance(profile, Mapping) else {}
+    horizons = outcome_map.get("selected_horizons")
+    runtime = record.get("runtime")
+    artifact_raw = record.get("artifact")
+    reference = dict(artifact_raw) if isinstance(artifact_raw, Mapping) else {}
     return {
-        "phases": [],
-        "horizons": [],
-        "summary": {},
-        "policy_frontier": _project_policy_frontier(metrics),
+        "schema_version": SCHEMA_VERSION,
+        "artifact_id": _normalize_message(record.get("artifact_id", "")),
+        "status": record.get("status"),
+        "started_at": _normalize_message(record.get("started_at") or ""),
+        "finished_at": _normalize_message(record.get("finished_at") or ""),
+        "runtime": dict(runtime) if isinstance(runtime, Mapping) else {},
+        "input": {
+            "snapshot_id": (
+                _normalize_message(snapshot_id) if isinstance(snapshot_id, str) else None
+            )
+        },
+        "outcome": {
+            "model_family": _json_scalar(outcome_map.get("model_family")),
+            "model_type": _json_scalar(outcome_map.get("model_type")),
+            "promoted": bool(outcome_map.get("promoted", False)),
+            "no_trade": bool(outcome_map.get("no_trade", False)),
+            "selected_profile": {
+                "profile_id": _json_scalar(profile.get("profile_id")),
+                "no_trade_band_bps": _as_float(profile.get("no_trade_band_bps")),
+            },
+            "selected_horizons": [
+                int(horizon)
+                for horizon in (horizons if isinstance(horizons, (list, tuple)) else [])
+                if isinstance(horizon, int)
+            ][:8],
+        },
+        "observability": {},
+        "artifact": reference,
+        "compaction": {
+            "reason": "record exceeded the terminal byte budget",
+            "omitted_record_sha256": hashlib.sha256(_encode(record)).hexdigest(),
+        },
     }
+
+
+def _fit_record_to_limit(record: Mapping[str, object]) -> dict[str, object]:
+    """Return the record when it fits, else the deterministic minimal projection.
+
+    Applied before cache validation so a valid artifact can never fail the
+    terminal write merely because its diagnostics are verbose; only real
+    filesystem or malformed-artifact errors still prevent persistence.
+    """
+    fitted: dict[str, object] = dict(record)
+    if len(_encode(fitted)) <= MAX_RECORD_BYTES:
+        return fitted
+    fitted = _minimal_terminal_projection(record)
+    # Structural guarantee: shed optional sections in fixed order until the
+    # bounded core (identity/status/artifact/compaction) fits.
+    while len(_encode(fitted)) > MAX_RECORD_BYTES:
+        for key in _FIT_DROP_ORDER:
+            if key in fitted:
+                del fitted[key]
+                break
+        else:
+            break
+    return fitted
 
 
 def _project_completed(
@@ -1060,9 +1249,7 @@ def _project_failed(
 ) -> dict[str, object]:
     finished_at = clock()
     elapsed_ms = int((finished_at - context.started_at).total_seconds() * 1000)
-    phases: list[object] = []
-    if isinstance(telemetry, dict):
-        phases = list(telemetry.get("phases") or [])
+    phases = _compact_phases(telemetry if isinstance(telemetry, Mapping) else {})
     return {
         "schema_version": SCHEMA_VERSION,
         "artifact_id": context.artifact_id,
@@ -1079,7 +1266,7 @@ def _project_failed(
         },
         "outcome": {},
         "observability": {
-            "phases": _sanitize_deep(phases),
+            "phases": phases,
             "horizons": [],
             "summary": {},
             "replay": {},
@@ -1100,6 +1287,7 @@ def _project_reconcile_record(
     metrics: Mapping[str, object],
     *,
     mtime: str | None = None,
+    artifact_reference: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     model_type = str(
         metrics.get("model_type") or manifest_json.get("model_type") or "no_trade"
@@ -1116,19 +1304,18 @@ def _project_reconcile_record(
         eligible_to=str(manifest_json.get("eligible_to") or ""),
         model_type=model_type,
     )
-    observability: dict[str, object] = {"phases": [], "horizons": [], "summary": {}}
-    run_obs = metrics.get("run_observability")
-    if isinstance(run_obs, dict):
-        observability = {
-            "phases": list(run_obs.get("phases") or []),
-            "horizons": list(run_obs.get("horizons") or []),
-            "summary": _bounded_observability_summary(run_obs),
-        }
+    observability = _compact_observability(metrics, None)
     finished_at = (
         metrics.get("finished_at")
         or manifest_json.get("finished_at")
         or mtime
     )
+    reference: dict[str, object] = {
+        "manifest_path": MANIFEST_FILENAME,
+        "metrics_path": METRICS_FILENAME,
+    }
+    if artifact_reference is not None:
+        reference.update(artifact_reference)
     return {
         "schema_version": SCHEMA_VERSION,
         "artifact_id": artifact_id,
@@ -1144,19 +1331,14 @@ def _project_reconcile_record(
         },
         "outcome": _project_outcome(manifest, metrics),
         "observability": {
-            "phases": _sanitize_deep(observability["phases"]),
-            "horizons": _sanitize_deep(observability["horizons"]),
-            "summary": _sanitize_deep(observability["summary"]),
-            "policy_frontier": _sanitize_deep(
-                _project_policy_frontier(metrics)
-            ),
+            "phases": observability["phases"],
+            "horizons": observability["horizons"],
+            "summary": observability["summary"],
+            "policy_frontier": observability["policy_frontier"],
             "replay": _project_replay(metrics),
             "holdout": _project_holdout(metrics),
         },
-        "artifact": {
-            "manifest_path": MANIFEST_FILENAME,
-            "metrics_path": METRICS_FILENAME,
-        },
+        "artifact": reference,
     }
 
 
@@ -1233,10 +1415,12 @@ class MlResultLedger:
             registry, context.artifact_id, MANIFEST_FILENAME
         )
         _validate_artifact_identity(context, manifest, manifest_json)
+        reference = _artifact_reference(Path(registry.root), context.artifact_id)
         observability = _observability_from(metrics, telemetry)
         record = _project_completed(
             context, manifest, metrics, observability, self._clock
         )
+        record["artifact"] = reference
         if diagnostic_report is not None:
             if hasattr(diagnostic_report, "to_json"):
                 record["diagnostic_report"] = diagnostic_report.to_json()
@@ -1285,7 +1469,11 @@ class MlResultLedger:
             mtime = datetime.fromtimestamp(metrics_path.stat().st_mtime, tz=UTC).isoformat()
             records.append(
                 _project_reconcile_record(
-                    artifact_id, manifest_json, metrics, mtime=mtime
+                    artifact_id,
+                    manifest_json,
+                    metrics,
+                    mtime=mtime,
+                    artifact_reference=_artifact_reference(root, artifact_id),
                 )
             )
         ordered = sorted(records, key=_sort_key, reverse=True)
@@ -1309,16 +1497,17 @@ class MlResultLedger:
             raise ValueError(f"invalid artifact_id {artifact_id!r}")
         if record.get("artifact_id") != artifact_id:
             raise ValueError("record artifact id does not match key")
-        _validate_record(record)
+        fitted = _fit_record_to_limit(record)
+        _validate_record(fitted)
         runs_root = self.runs_root
         runs_root.mkdir(parents=True, exist_ok=True)
         recent_path = _safe_resolve(runs_root, RECENT_FILENAME)
         retained, discarded, invalid = _rebuild_recent(
-            recent_path, artifact_id, record, self.retained_records
+            recent_path, artifact_id, fitted, self.retained_records
         )
         self._write_cache(retained, discarded, invalid)
         pointer = _build_pointer(
-            record, len(retained), discarded, invalid, self.retained_records
+            fitted, len(retained), discarded, invalid, self.retained_records
         )
         pointer_path = _safe_resolve(self.root, POINTER_FILENAME)
         pointer_bytes = pointer.encode("utf-8")
@@ -1352,7 +1541,17 @@ class MlResultLedger:
         )
         _validate_size(meta, MAX_META_BYTES, "ledger_meta.json")
         _write_atomic(meta_path, _encode(meta))
-        if not schema_path.exists():
+        refresh_schema = True
+        if schema_path.exists():
+            try:
+                stored = json.loads(schema_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError, ValueError):
+                stored = None
+            refresh_schema = not (
+                isinstance(stored, dict)
+                and stored.get("schema_version") == SCHEMA_VERSION
+            )
+        if refresh_schema:
             schema = _build_schema(self.retained_records)
             _validate_size(schema, MAX_SCHEMA_BYTES, "schema.json")
             _write_atomic(schema_path, _encode(schema))
