@@ -14,6 +14,7 @@ bytes.
 """
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import math
@@ -185,13 +186,12 @@ class KRXSessionCalendar:
         return hashlib.sha256((f"{self.version}\n{payload}").encode()).hexdigest()
 
     def is_session(self, day: date) -> bool:
-        return day in self.sessions
+        index = bisect.bisect_left(self.sessions, day)
+        return index < len(self.sessions) and self.sessions[index] == day
 
     def previous_session(self, day: date) -> date | None:
-        for index in range(len(self.sessions) - 1, -1, -1):
-            if self.sessions[index] < day:
-                return self.sessions[index]
-        return None
+        index = bisect.bisect_left(self.sessions, day)
+        return self.sessions[index - 1] if index > 0 else None
 
 
 @dataclass(frozen=True, slots=True)

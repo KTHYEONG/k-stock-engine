@@ -13,12 +13,18 @@ from src.stocks.ml.contracts import (
     EconomicFamilyStudySettings,
     NetAlphaTrainingRequest,
 )
-from src.stocks.ml.economic_research import evaluate_economic_family_study
+from src.stocks.ml.economic_objective import InvalidOofEconomicUtilityError, measure_tail_capture
+from src.stocks.ml.economic_research import (
+    evaluate_economic_family_study,
+    evaluate_economic_window_candidate,
+)
 
 ECONOMIC_FAMILY_03_CAUSAL_FAMILY_SELECTION = "ECONOMIC_FAMILY_03_CAUSAL_FAMILY_SELECTION"
 ECONOMIC_FAMILY_04_ALL_CASH_ON_INSUFFICIENT_ECONOMICS = (
     "ECONOMIC_FAMILY_04_ALL_CASH_ON_INSUFFICIENT_ECONOMICS"
 )
+_LABEL_ID = "instrument_id"
+_LABEL_SESSION = "session"
 
 _FAILURE_ACTIONS = (
     "no-label-capacity",
@@ -453,3 +459,116 @@ def test_settings_reject_invalid_configuration() -> None:
         EconomicFamilyStudySettings(model_families=("mystery_ranker",))
     with pytest.raises(ValueError, match="unique"):
         EconomicFamilyStudySettings(model_families=(ELASTIC_NET_FAMILY, ELASTIC_NET_FAMILY))
+
+
+def _objective_frames(
+    sessions: int,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    utilities = {"A": 0.90, "B": 0.80, "C": 0.05, "D": -0.02}
+    scores = {"A": 9.0, "B": 8.0, "C": 7.0, "D": 6.0}
+    label_rows = []
+    scored_rows = []
+    for session in range(1, sessions + 1):
+        for name in utilities:
+            label_rows.append((name, session, utilities[name], 0.0))
+            scored_rows.append({_LABEL_ID: name, _LABEL_SESSION: session, "predicted_net_alpha": scores[name]})
+    labels = pl.DataFrame(
+        {
+            _LABEL_ID: [r[0] for r in label_rows],
+            _LABEL_SESSION: [r[1] for r in label_rows],
+            "risk_residual": [r[2] for r in label_rows],
+            "reference_cost": [r[3] for r in label_rows],
+        }
+    )
+    return labels, pl.DataFrame(scored_rows)
+
+
+def test_ECONOMIC_FAMILY_05_holdout_blind_integrity(monkeypatch) -> None:
+    """ECONOMIC_FAMILY_05_HOLDOUT_BLIND_INTEGRITY.
+
+    Runtime research validates only the rows its OOF joins actually produce:
+    corrupting locked-holdout labels cannot change any tail-capture evidence,
+    an invalid OOF join raises the typed integrity error and rejects the
+    window candidate with invalid-oof-economic-utility, and the study maps
+    that failure to next_action repair-label-integrity instead of
+    no-label-capacity.
+    """
+    labels, scored = _objective_frames(sessions=12)
+    oof_scored = scored.filter(pl.col(_LABEL_SESSION) <= 9)
+    kwargs = {
+        "top_k": 2,
+        "bootstrap_alpha": 0.05,
+        "bootstrap_resamples": 200,
+        "seed": 5,
+    }
+    baseline = measure_tail_capture(oof_scored, labels, **kwargs)
+
+    holdout_only_corruption = labels.with_columns(
+        pl.when(pl.col(_LABEL_SESSION) >= 10)  # locked forward holdout
+        .then(float("nan"))
+        .otherwise(pl.col("risk_residual"))
+        .alias("risk_residual")
+    )
+    blinded = measure_tail_capture(oof_scored, holdout_only_corruption, **kwargs)
+    assert blinded == baseline
+
+    joined_corruption = labels.with_columns(
+        pl.when(pl.col(_LABEL_SESSION) == 3)  # inside the OOF join
+        .then(None)
+        .otherwise(pl.col("risk_residual"))
+        .alias("risk_residual")
+    )
+    with pytest.raises(InvalidOofEconomicUtilityError):
+        measure_tail_capture(oof_scored, joined_corruption, **kwargs)
+
+    def explode(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise InvalidOofEconomicUtilityError("null oof utility")
+
+    monkeypatch.setattr(economic_research, "_evaluate_window_body", explode)
+    data = SimpleNamespace(
+        feature_frame=pl.DataFrame({"session": list(range(400))}),
+        labels_by_horizon={
+            10: pl.DataFrame(
+                {
+                    _LABEL_ID: ["A"],
+                    _LABEL_SESSION: [1],
+                    "risk_residual": [0.1],
+                    "reference_cost": [0.0],
+                }
+            )
+        },
+    )
+    from src.stocks.ml.contracts import ExecutionFrontierSettings
+
+    result = evaluate_economic_window_candidate(
+        data,
+        _cost_bound_request(
+            candidate_horizon_sessions=(10,),
+            execution_frontier=ExecutionFrontierSettings(candidate_horizon_sessions=(10,)),
+        ),
+        _settings(),
+        registry=_REGISTRY_SENTINEL,
+    )
+    assert result["study_complete"] is False
+    assert result["selected_family"] is None
+    assert result["rejection_reason_counts"] == {"invalid-oof-economic-utility": 1}
+
+    def integrity_rejection(lookback: object) -> dict[str, object]:
+        return {
+            "status": "RESEARCH_ONLY",
+            "artifact_published": False,
+            "study_complete": False,
+            "fold_count": 0,
+            "candidates_evaluated": 0,
+            "selected_family": None,
+            "certificate": None,
+            "families": {},
+            "rejection_reason_counts": {"invalid-oof-economic-utility": 1},
+        }
+
+    _install_candidate(monkeypatch, integrity_rejection)
+    payload = evaluate_economic_family_study(
+        _data(1952), _cost_bound_request(), _settings(), registry=_REGISTRY_SENTINEL
+    )
+    assert payload["selected_family"] is None
+    assert payload["next_action"] == "repair-label-integrity"
