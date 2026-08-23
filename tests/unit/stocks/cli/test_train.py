@@ -722,3 +722,122 @@ def test_terminal_obs_05_reduced_full_parity(monkeypatch, tmp_path) -> None:
         "terminal_pass",
     ):
         assert required_stage in stages, f"missing journal stage {required_stage}"
+
+
+def test_terminal_progress_04_direct_journal_and_lookback_flag(
+    monkeypatch, tmp_path
+) -> None:
+    """TERMINAL_PROGRESS_04_DIRECT_JOURNAL.
+
+    The CLI parses --max-training-lookback-sessions 1260 into the request,
+    the direct run forwards progress into the fsynced journal so it records
+    fitting_started and fitting_complete checkpoints, and the final durable
+    journal row is a terminal passed event.
+    """
+    import json as _json
+
+    request_args, base_root, feature_root, label_root = _build_parity_fixture(
+        tmp_path
+    )
+    del request_args
+
+    parser = train.build_parser()
+    args = parser.parse_args(
+        [
+            "--artifact-id",
+            "lookback04",
+            "--max-training-lookback-sessions",
+            "1260",
+        ]
+    )
+    assert args.max_training_lookback_sessions == 1260
+    built = train._build_training_request(args)
+    assert built.max_training_lookback_sessions == 1260
+    default_built = train._build_training_request(
+        parser.parse_args(["--artifact-id", "lookback04"])
+    )
+    assert default_built.max_training_lookback_sessions is None
+
+    captured: dict[str, object] = {}
+
+    class _CapturingLedger:
+        def __init__(self, results_root):
+            captured["results_root"] = results_root
+
+        def record_completed(self, context, manifest, registry, telemetry=None):
+            captured["completed"] = (context, manifest)
+
+        def record_failed(self, context, phase, exc, telemetry=None):
+            captured["failed"] = (context, phase, exc)
+
+    def _progressing_no_trade(
+        data, registry, req, *, diagnostics=None, progress=None
+    ):
+        del data, registry, diagnostics
+        if progress is not None:
+            progress("fitting_started", {"fold_count": 3})
+            progress("fitting_complete", {"model_type": "no_trade"})
+        return ModelManifest(
+            artifact_id=req.artifact_id,
+            asset_kind="stock",
+            feature_set="stock_net_alpha_v1",
+            feature_schema_hash="fixture-schema",
+            universe_policy_hash="fixture-universe",
+            label_definition="net_alpha_o2o",
+            label_horizon_sessions=20,
+            eligible_from="2024-01-01T00:00:00+00:00",
+            eligible_to="2024-03-31T00:00:00+00:00",
+            model_type="no_trade",
+        )
+
+    diag_root = tmp_path / "diag_tp04"
+    diag_root.mkdir()
+    monkeypatch.setattr(train, "MlResultLedger", _CapturingLedger)
+    # Patch both bindings: _invoke_training inspects the cli-train symbol,
+    # while TrainingOrchestrator.run resolves the ml-training module symbol.
+    monkeypatch.setattr(train, "train_net_alpha_model", _progressing_no_trade)
+    monkeypatch.setattr(
+        "src.stocks.ml.training.train_net_alpha_model", _progressing_no_trade
+    )
+    monkeypatch.setattr("src.core.paths.RUN_DIAGNOSTIC_ROOT", diag_root)
+
+    rc = train.main(
+        [
+            "--artifact-id", "lookback04",
+            "--base-dataset-id", "base_p",
+            "--feature-dataset-id", "feat_p",
+            "--label-dataset-id", "lab_p",
+            "--research-start-direct", "2024-01-01",
+            "--research-end-direct", "2024-01-25",
+            "--base-root", str(base_root),
+            "--feature-root", str(feature_root),
+            "--label-root", str(label_root),
+            "--registry", str(tmp_path / "artifacts"),
+            "--results-root", str(tmp_path / "results"),
+            "--candidate-horizon-sessions", "10,20",
+            "--max-training-lookback-sessions", "1260",
+        ]
+    )
+
+    assert rc == 0
+    assert "failed" not in captured
+    assert isinstance(captured.get("completed"), tuple)
+    run_context, completed_manifest = captured["completed"]
+    assert run_context.request.max_training_lookback_sessions == 1260
+    assert completed_manifest.model_type == "no_trade"
+
+    records = [
+        _json.loads(line)
+        for line in (
+            diag_root / "lookback04" / "execution_journal.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    checkpoint_stages = [
+        record["stage"] for record in records if record.get("event") == "checkpoint"
+    ]
+    assert "fitting_started" in checkpoint_stages
+    assert "fitting_complete" in checkpoint_stages
+    final_record = records[-1]
+    assert final_record["event"] == "terminal"
+    assert final_record["status"] == "passed"

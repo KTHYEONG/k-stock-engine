@@ -713,6 +713,30 @@ def test_direct_input_ledger_failed(tmp_path) -> None:
     }
 
 
+def test_request_lookback_projection_and_fingerprint_identity() -> None:
+    """ROLLING_LOOKBACK_03_REQUEST_AND_LEDGER_IDENTITY.
+
+    A 1260-session cap is accepted and projected as 1260, 251 sessions fail
+    closed at request construction, and otherwise-identical None and 1260
+    requests never share a request_fingerprint.
+    """
+    from src.stocks.ml.result_ledger import _project_request
+
+    request = NetAlphaTrainingRequest(
+        artifact_id="na_lookback", max_training_lookback_sessions=1260
+    )
+    projection = _project_request(request)
+    assert projection["max_training_lookback_sessions"] == 1260
+
+    with pytest.raises(ValueError, match="at least 252"):
+        NetAlphaTrainingRequest(
+            artifact_id="na_lookback_low", max_training_lookback_sessions=251
+        )
+
+    expanding = _project_request(NetAlphaTrainingRequest(artifact_id="na_lookback"))
+    assert expanding["request_fingerprint"] != projection["request_fingerprint"]
+
+
 def test_execution_frontier_bounded_ledger_projection() -> None:
     """ML_EXEC_FRONTIER_04_BOUNDED_LEDGER_PROJECTION.
 
