@@ -42,8 +42,10 @@ from src.stocks.research.features import build_features, phase1_allowlist
 from src.stocks.research.models import ModelManifest
 from src.stocks.trading.portfolio_constructor import (
     PortfolioConstraintError,
+    PreparedAllocationMarket,
     StockRiskPolicy,
     construct_target_allocations,
+    construct_target_allocations_prepared,
     stock_risk_policy_fingerprint,
 )
 
@@ -262,6 +264,27 @@ def run_trading_cycle(
     )
 
 
+def _prepared_cross_section_matches(
+    prepared: PreparedReplayDecision,
+    cross_section: pl.DataFrame,
+) -> bool:
+    """Bypass the reference allocator only for identical current membership."""
+    market = prepared.allocation_market
+    decision_index = prepared.allocation_decision_index
+    overlay = prepared.score_overlay
+    if not isinstance(market, PreparedAllocationMarket) or decision_index is None:
+        return False
+    if overlay is None or len(overlay) != market.row_count:
+        return False
+    session_range = market.session_ranges.get(decision_index)
+    if session_range is None:
+        return False
+    start, stop = session_range
+    prepared_ids = tuple(sorted(str(item) for item in market.instrument_ids[start:stop]))
+    current_ids = tuple(sorted(str(item) for item in cross_section["instrument_id"].to_list()))
+    return prepared_ids == current_ids
+
+
 def plan_prepared_scored_cycle(
     prepared: PreparedReplayDecision,
     portfolio: PortfolioSnapshot,
@@ -307,10 +330,25 @@ def plan_prepared_scored_cycle(
             request, portfolio, dataset_hash, "empty-latest-cross-section"
         )
 
+    use_prepared = _prepared_cross_section_matches(prepared, cross_section)
     try:
-        allocations = construct_target_allocations(
-            scored, instruments, portfolio, request.risk_policy
-        )
+        if use_prepared:
+            assert isinstance(prepared.allocation_market, PreparedAllocationMarket)
+            assert prepared.allocation_decision_index is not None
+            assert prepared.score_overlay is not None
+            allocations = construct_target_allocations_prepared(
+                prepared.allocation_market,
+                prepared.allocation_decision_index,
+                prepared.score_overlay,
+                prepared.calibration_state,
+                instruments,
+                portfolio,
+                request.risk_policy,
+            )
+        else:
+            allocations = construct_target_allocations(
+                scored, instruments, portfolio, request.risk_policy
+            )
     except PortfolioConstraintError as exc:
         return _no_trade_result_prepared(
             request, portfolio, dataset_hash, f"constraint:{exc}"
