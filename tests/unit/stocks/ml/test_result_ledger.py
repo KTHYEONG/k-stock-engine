@@ -1,6 +1,7 @@
 """Bounded ML result ledger: projection, retention, path safety, recovery."""
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -12,12 +13,21 @@ from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.ml.contracts import NetAlphaTrainingRequest
 from src.stocks.ml.data import compose_net_alpha_training_data
 from src.stocks.ml.result_ledger import (
+    MAX_RECORD_BYTES,
+    SCHEMA_FILENAME,
     CostRunContext,
     MlResultLedger,
     MlRunContext,
+    SCHEMA_VERSION,
+    _digest_summary,
+    _encode,
     summarize_numeric,
 )
-from src.stocks.research.artifacts import ModelArtifactRegistry
+from src.stocks.research.artifacts import (
+    MANIFEST_FILENAME,
+    METRICS_FILENAME,
+    ModelArtifactRegistry,
+)
 from src.stocks.research.models import ModelManifest
 from tests.fixtures.stocks.helpers import (
     stock_net_alpha_composed_df,
@@ -278,7 +288,7 @@ def test_record_completed_projects_canonical_fields(tmp_path) -> None:
     )
     ledger_inst.record_completed(context, _manifest(artifact_id), registry)
     latest = _latest(tmp_path / "results")
-    assert latest["schema_version"] == 1
+    assert latest["schema_version"] == SCHEMA_VERSION
     assert latest["artifact_id"] == artifact_id
     assert latest["status"] == "completed"
     assert latest["started_at"] == "2024-01-01T00:00:00+00:00"
@@ -329,6 +339,12 @@ def test_record_completed_projects_canonical_fields(tmp_path) -> None:
     assert holdout["eligibility"]["eligible_from"] == "2024-11-01T00:00:00+00:00"
     assert latest["artifact"]["manifest_path"] == "manifest.json"
     assert latest["artifact"]["metrics_path"] == "metrics.json"
+    manifest_bytes = (registry.root / artifact_id / "manifest.json").read_bytes()
+    metrics_bytes = (registry.root / artifact_id / "metrics.json").read_bytes()
+    assert latest["artifact"]["manifest_bytes"] == len(manifest_bytes)
+    assert latest["artifact"]["metrics_bytes"] == len(metrics_bytes)
+    assert latest["artifact"]["manifest_sha256"] == hashlib.sha256(manifest_bytes).hexdigest()
+    assert latest["artifact"]["metrics_sha256"] == hashlib.sha256(metrics_bytes).hexdigest()
 
 
 def test_record_completed_no_trade(tmp_path) -> None:
@@ -341,7 +357,10 @@ def test_record_completed_no_trade(tmp_path) -> None:
     latest = _latest(tmp_path / "results")
     assert latest["outcome"]["no_trade"] is True
     assert latest["outcome"]["promoted"] is False
-    assert latest["outcome"]["promotion_reasons"] == ["no-horizon-evidence"]
+    reasons = latest["outcome"]["promotion_reasons_digest"]
+    assert reasons["count"] == 1
+    assert len(reasons["sha256"]) == 64
+    assert "no-horizon-evidence" not in json.dumps(latest)
     assert latest["outcome"]["selected_horizons"] == []
 
 
@@ -400,7 +419,7 @@ def test_record_completed_manifest_id_mismatch_raises(tmp_path) -> None:
     assert not (tmp_path / "results" / "ml_runs" / "recent.jsonl").exists()
 
 
-def test_oversized_record_rejected_before_write(tmp_path) -> None:
+def test_oversized_artifact_still_records_within_byte_contract(tmp_path) -> None:
     registry = ModelArtifactRegistry(tmp_path / "artifacts")
     artifact_id = "na_huge"
     metrics = _default_metrics()
@@ -408,10 +427,12 @@ def test_oversized_record_rejected_before_write(tmp_path) -> None:
     _write_artifact(registry.root, artifact_id, metrics=metrics)
     context = _context(artifact_id)
     ledger_inst = MlResultLedger(tmp_path / "results")
-    with pytest.raises(ValueError, match="exceeds"):
-        ledger_inst.record_completed(context, _manifest(artifact_id), registry)
-    assert not (tmp_path / "results" / "ml_runs" / "recent.jsonl").exists()
-    assert not (tmp_path / "results" / "ml_runs" / "latest.json").exists()
+    ledger_inst.record_completed(context, _manifest(artifact_id), registry)
+    latest = _latest(tmp_path / "results")
+    assert latest["artifact_id"] == artifact_id
+    assert len(_encode(latest)) <= MAX_RECORD_BYTES
+    assert latest["outcome"]["promotion_reasons_digest"]["count"] == 700
+    assert "reason-0-" not in json.dumps(latest)
 
 
 def test_raw_vectors_and_unknown_keys_do_not_enter_projection(tmp_path) -> None:
@@ -589,34 +610,38 @@ def test_rebuild_from_registry_recovers_cache(tmp_path) -> None:
     assert latest["input"]["snapshot_id"] is None
 
 
-def test_record_completed_preserves_no_trade_policy_frontier_projection(tmp_path) -> None:
-    """Acceptance 5: the no-trade run's 12 dropout reasons reach the ledger."""
-    from src.stocks.ml.result_ledger import _project_policy_frontier
+def test_record_completed_projects_no_trade_policy_frontier_digest(tmp_path) -> None:
+    """Acceptance 4: dropout reasons stay in metrics.json; the ledger keeps
+    only the deterministic count/digest index plus recoverable evidence."""
+    from src.stocks.ml.result_ledger import _compact_policy_frontier
 
     dropout = {
         f"{h}:{p}": "missing-realized-vintages:0"
         for h in (3, 5, 8, 10, 15, 20)
         for p in ("legacy_overlay_5bps", "lower_bound_only")
     }
-    metrics = {
-        **_default_metrics("no_trade"),
-        "policy_frontier": {
-            "candidate_count": 0,
-            "profile_ids": ["legacy_overlay_5bps", "lower_bound_only"],
-            "dropout_reasons": dropout,
-            "segment_sums": {"h3:legacy_overlay_5bps:s0": {"scored_sessions": 20}},
-        },
+    policy_frontier = {
+        "candidate_count": 0,
+        "profile_ids": ["legacy_overlay_5bps", "lower_bound_only"],
+        "dropout_reasons": dropout,
+        "segment_sums": {"h3:legacy_overlay_5bps:s0": {"scored_sessions": 20}},
     }
-    projected = _project_policy_frontier(metrics)
+    projected = _compact_policy_frontier({"policy_frontier": policy_frontier})
     assert projected["candidate_count"] == 0
-    assert projected["profile_ids"] == ["legacy_overlay_5bps", "lower_bound_only"]
-    assert len(projected["dropout_reasons"]) == 12
-    assert projected["segment_sums"]["h3:legacy_overlay_5bps:s0"]["scored_sessions"] == 20
+    assert projected["profile_count"] == 2
+    assert projected["dropout_reasons_digest"]["count"] == 12
+    assert projected["dropout_reasons_digest"] == _digest_summary(dropout)
+    assert projected["segment_sums_digest"]["count"] == 1
+    assert "missing-realized-vintages" not in json.dumps(projected)
     assert "scores" not in json.dumps(projected)
     assert "returns" not in json.dumps(projected)
 
     registry = ModelArtifactRegistry(tmp_path / "artifacts")
     artifact_id = "na_frontier_ledger"
+    metrics = {
+        **_default_metrics("no_trade"),
+        "policy_frontier": policy_frontier,
+    }
     _write_artifact(registry.root, artifact_id, model_type="no_trade", metrics=metrics)
     context = _context(artifact_id)
     ledger_inst = MlResultLedger(tmp_path / "results")
@@ -624,8 +649,15 @@ def test_record_completed_preserves_no_trade_policy_frontier_projection(tmp_path
     latest = _latest(tmp_path / "results")
     frontier = latest["observability"]["policy_frontier"]
     assert frontier["candidate_count"] == 0
-    assert len(frontier["dropout_reasons"]) == 12
-    assert "20:lower_bound_only" in frontier["dropout_reasons"]
+    assert frontier["dropout_reasons_digest"]["count"] == 12
+    assert "20:lower_bound_only" not in json.dumps(latest)
+    # Full evidence remains recoverable from the referenced artifact.
+    stored = json.loads(
+        (registry.root / artifact_id / "metrics.json").read_text(encoding="utf-8")
+    )
+    assert stored["policy_frontier"]["dropout_reasons"]["20:lower_bound_only"] == (
+        "missing-realized-vintages:0"
+    )
 
 
 def test_direct_input_ledger(tmp_path) -> None:
@@ -735,6 +767,171 @@ def test_request_lookback_projection_and_fingerprint_identity() -> None:
 
     expanding = _project_request(NetAlphaTrainingRequest(artifact_id="na_lookback"))
     assert expanding["request_fingerprint"] != projection["request_fingerprint"]
+
+
+def _oversized_metrics() -> dict[str, object]:
+    """Artifact metrics carrying far more than 24 KiB of run diagnostics."""
+    metrics = _default_metrics()
+    dropout = {
+        f"h{h}:{p}": "missing-realized-vintages:" + "d" * 180
+        for h in range(100)
+        for p in ("legacy_overlay_5bps", "lower_bound_only", "half_kelly", "full_kelly")
+    }
+    metrics["policy_frontier"] = {
+        "candidate_count": 0,
+        "profile_ids": ["legacy_overlay_5bps", "lower_bound_only"],
+        "dropout_reasons": dropout,
+        "segment_sums": {
+            f"h{h}:{p}:s0": {"scored_sessions": h}
+            for h in range(100)
+            for p in ("legacy_overlay_5bps", "lower_bound_only")
+        },
+    }
+    run_obs = metrics["run_observability"]
+    assert isinstance(run_obs, dict)
+    phases = run_obs["phases"]
+    assert isinstance(phases, list)
+    phases.append(
+        {
+            "name": "primary_selection",
+            "elapsed_ms": 12,
+            "selection_reasons": [
+                f"reason-{index}-" + "s" * 80 for index in range(241)
+            ],
+        }
+    )
+    return metrics
+
+
+def test_ml_ledger_completion_01_records_oversized_observability(tmp_path) -> None:
+    """ML_LEDGER_COMPLETION_01_OVERSIZED_OBSERVABILITY.
+
+    An artifact with more than 24 KiB of policy-frontier/selection diagnostics
+    records completed; latest.json stays within MAX_RECORD_BYTES, stores the
+    manifest/metrics SHA-256 and byte lengths, and exposes count/digest indexes
+    instead of the raw diagnostic collections.
+    """
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    artifact_id = "na_oversized_obs"
+    metrics = _oversized_metrics()
+    _write_artifact(registry.root, artifact_id, metrics=metrics)
+    context = _context(artifact_id)
+    ledger_inst = MlResultLedger(
+        tmp_path / "results", clock=lambda: datetime(2024, 1, 2, tzinfo=UTC)
+    )
+    ledger_inst.record_completed(context, _manifest(artifact_id), registry)
+
+    latest_path = tmp_path / "results" / "ml_runs" / "latest.json"
+    raw = latest_path.read_bytes()
+    assert len(raw) <= MAX_RECORD_BYTES
+    latest = json.loads(raw)
+    assert latest["status"] == "completed"
+
+    manifest_bytes = (registry.root / artifact_id / MANIFEST_FILENAME).read_bytes()
+    metrics_bytes = (registry.root / artifact_id / METRICS_FILENAME).read_bytes()
+    assert latest["artifact"]["manifest_sha256"] == hashlib.sha256(manifest_bytes).hexdigest()
+    assert latest["artifact"]["metrics_sha256"] == hashlib.sha256(metrics_bytes).hexdigest()
+    assert latest["artifact"]["manifest_bytes"] == len(manifest_bytes)
+    assert latest["artifact"]["metrics_bytes"] == len(metrics_bytes)
+
+    frontier = latest["observability"]["policy_frontier"]
+    expected_digest = _digest_summary(metrics["policy_frontier"]["dropout_reasons"])
+    assert frontier["dropout_reasons_digest"] == expected_digest
+    assert frontier["dropout_reasons_digest"]["count"] == 400
+    assert frontier["segment_sums_digest"]["count"] == 200
+    text = raw.decode("utf-8")
+    assert "missing-realized-vintages" not in text
+    assert '"selection_reasons"' not in text
+
+    recent_lines = (
+        tmp_path / "results" / "ml_runs" / "recent.jsonl"
+    ).read_text().splitlines()
+    assert len(recent_lines) == 1
+    for line in recent_lines:
+        assert len(line.encode("utf-8")) <= MAX_RECORD_BYTES
+
+
+def test_ml_ledger_completion_02_rebuild_oversized_artifact(tmp_path) -> None:
+    """ML_LEDGER_COMPLETION_02_REBUILD_OVERSIZED_ARTIFACT."""
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    artifact_id = "na_oversized_rebuild"
+    _write_artifact(registry.root, artifact_id, metrics=_oversized_metrics())
+    ledger_inst = MlResultLedger(tmp_path / "results")
+    stats = ledger_inst.rebuild_from_registry(registry)
+    assert stats["scanned"] == 1
+    assert stats["retained"] == 1
+
+    record = json.loads(
+        (tmp_path / "results" / "ml_runs" / "recent.jsonl")
+        .read_text()
+        .splitlines()[0]
+    )
+    assert record["status"] == "completed"
+    assert len(_encode(record)) <= MAX_RECORD_BYTES
+    manifest_bytes = (registry.root / artifact_id / MANIFEST_FILENAME).read_bytes()
+    metrics_bytes = (registry.root / artifact_id / METRICS_FILENAME).read_bytes()
+    assert record["artifact"]["manifest_sha256"] == hashlib.sha256(manifest_bytes).hexdigest()
+    assert record["artifact"]["metrics_sha256"] == hashlib.sha256(metrics_bytes).hexdigest()
+    frontier = record["observability"]["policy_frontier"]
+    assert frontier["dropout_reasons_digest"]["count"] == 400
+    latest = _latest(tmp_path / "results")
+    assert len(_encode(latest)) <= MAX_RECORD_BYTES
+
+
+def test_ml_ledger_completion_03_byte_budget_fallback(tmp_path) -> None:
+    """ML_LEDGER_COMPLETION_03_BYTE_FALLBACK.
+
+    A deliberately oversized optional completed projection is replaced by a
+    deterministic terminal fallback that retains status, the artifact
+    reference, and a compaction digest within MAX_RECORD_BYTES.
+    """
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    artifact_id = "na_fallback"
+    _write_artifact(registry.root, artifact_id)
+    context = _context(artifact_id)
+    report = {"sections": [{"name": f"s{i}", "blob": "y" * 2000} for i in range(40)]}
+
+    def _clock() -> datetime:
+        return datetime(2024, 1, 2, tzinfo=UTC)
+
+    ledger_inst = MlResultLedger(tmp_path / "results", clock=_clock)
+    ledger_inst.record_completed(
+        context, _manifest(artifact_id), registry, diagnostic_report=report
+    )
+    latest = _latest(tmp_path / "results")
+    assert len(_encode(latest)) <= MAX_RECORD_BYTES
+    assert latest["status"] == "completed"
+    compaction = latest["compaction"]
+    assert len(compaction["omitted_record_sha256"]) == 64
+    metrics_bytes = (registry.root / artifact_id / METRICS_FILENAME).read_bytes()
+    assert latest["artifact"]["metrics_sha256"] == hashlib.sha256(metrics_bytes).hexdigest()
+    assert latest["outcome"]["promoted"] is True
+    assert "sections" not in json.dumps(latest)
+
+
+def test_ml_ledger_completion_04_schema_refresh_on_v2_write(tmp_path) -> None:
+    """ML_LEDGER_COMPLETION_04_SCHEMA_REFRESH.
+
+    Writing a v2 terminal record replaces a stale schema.json so the metadata
+    describes the compact digest-backed record shape.
+    """
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    artifact_id = "na_schema_refresh"
+    _write_artifact(registry.root, artifact_id)
+    runs_root = tmp_path / "results" / "ml_runs"
+    runs_root.mkdir(parents=True)
+    stale = {"schema_version": SCHEMA_VERSION - 1, "record_byte_limit": 1024}
+    (runs_root / SCHEMA_FILENAME).write_text(json.dumps(stale), encoding="utf-8")
+
+    ledger_inst = MlResultLedger(tmp_path / "results")
+    ledger_inst.record_completed(_context(artifact_id), _manifest(artifact_id), registry)
+
+    schema = json.loads((runs_root / SCHEMA_FILENAME).read_text(encoding="utf-8"))
+    assert schema["schema_version"] == SCHEMA_VERSION
+    assert schema["record_byte_limit"] == MAX_RECORD_BYTES
+    text = json.dumps(schema)
+    assert "sha256" in text
+    assert "digest" in text
 
 
 def test_execution_frontier_bounded_ledger_projection() -> None:

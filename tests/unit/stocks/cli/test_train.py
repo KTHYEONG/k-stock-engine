@@ -139,6 +139,44 @@ def test_train_cli_exposes_complete_execution_frontier() -> None:
     assert len(frontier.require_feasible_horizons(0.90, 0.08)) == 12
 
 
+def test_train_cli_h10_only_frontier_valid_and_default_unchanged() -> None:
+    """ML_HORIZON_SCOPE_01_H10_ONLY_FRONTIER.
+
+    A pre-registered H10-only frontier parses, every cadence stays feasible
+    for H10 (C <= 10), and the operational grid is H10 x {C5,C10} x K while
+    the default discovery grid remains H10/H20.
+    """
+    args = train.build_parser().parse_args(
+        [
+            "--artifact-id",
+            "h10_only",
+            "--snapshot-id",
+            "s1",
+            "--candidate-horizon-sessions",
+            "10",
+            "--candidate-rebalance-frequency-sessions",
+            "5,10",
+            "--candidate-top-k",
+            "12,16,20,24",
+        ]
+    )
+    request = train._build_training_request(args)
+    assert request.candidate_horizon_sessions == (10,)
+    assert request.execution_frontier.candidate_horizon_sessions == (10,)
+    assert request.execution_frontier.candidate_rebalance_frequency_sessions == (5, 10)
+    cells = request.execution_frontier.require_feasible_horizons(0.90, 0.08)
+    assert {horizon for horizon, _, _ in cells} == {10}
+    assert all(cadence <= 10 for _, cadence, _ in cells)
+    assert len(cells) == 8
+
+    default_request = train._build_training_request(
+        train.build_parser().parse_args(
+            ["--artifact-id", "h_default", "--snapshot-id", "s1"]
+        )
+    )
+    assert default_request.candidate_horizon_sessions == (10, 20)
+
+
 def test_train_cli_resolves_snapshot_and_composes(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
