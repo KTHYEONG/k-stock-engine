@@ -1,10 +1,12 @@
 """Economic tail-objective contract: exact-K labels and tail-capture arithmetic."""
 from __future__ import annotations
 
+import numpy as np
 import polars as pl
 import pytest
 
 from src.stocks.ml.economic_objective import (
+    InvalidOofEconomicUtilityError,
     build_tail_relevance,
     measure_tail_capture,
 )
@@ -165,11 +167,11 @@ def test_economic_family_02_tail_capture_not_rank_ic() -> None:
         seed=42,
     )
 
-    assert ineligible.model_excess_log_growth <= 0.0
+    assert ineligible.model_excess_utility <= 0.0
     assert ineligible.tail_excess_lower_bound <= 0.0
     assert ineligible.tail_gate_ok is False
     assert ineligible.oracle_capacity_ok is True
-    assert ineligible.oracle_excess_log_growth > 0.0
+    assert ineligible.oracle_excess_utility > 0.0
     assert eligible.tail_excess_lower_bound > 0.0
     assert eligible.tail_gate_ok is True
     assert eligible.tail_capture_ratio is not None
@@ -198,3 +200,75 @@ def test_economic_family_02_tail_capture_segment_clusters() -> None:
     assert len(evidence.segments) == 2
     assert {segment.segment_id for segment in evidence.segments} == {0, 1}
     assert evidence.session_count == 6
+
+
+def test_ECONOMIC_UTILITY_04_residual_not_log_growth() -> None:
+    """ECONOMIC_UTILITY_04_RESIDUAL_NOT_LOG_GROWTH.
+
+    Finite residual utility below -1 stays rankable arithmetic utility: no
+    log-domain operation exists, model/oracle excess evidence is finite and
+    arithmetically exact, and the tail gate still requires a strictly
+    positive bootstrapped lower excess utility.
+    """
+    # Four laggards sit at or below the invalid log domain (-1), including a
+    # split-distorted -3.93; they must never break ranking or evidence.
+    utilities = {"A": 0.90, "B": 0.80, "C": 0.05, "D": -3.93,
+                 "E": -2.50, "F": -1.50, "G": -1.20, "H": -0.95}
+    scores = {"A": 9.0, "B": 8.0, "C": 7.0, "D": 6.0,
+              "E": 5.0, "F": 4.0, "G": 3.0, "H": 2.0}
+    labels, scored = _study_frames(utilities, scores, sessions=12)
+
+    relevance = build_tail_relevance(labels, top_k=2)
+    selected = relevance.filter(pl.col("relevance") == 1)
+    assert set(selected[_ID].unique().to_list()) == {"A", "B"}
+
+    evidence = measure_tail_capture(
+        scored,
+        labels,
+        top_k=2,
+        bootstrap_alpha=0.05,
+        bootstrap_resamples=400,
+        seed=11,
+    )
+    universe_mean = float(np.mean(list(utilities.values())))
+    oracle_mean = float(np.mean(sorted(utilities.values(), reverse=True)[:2]))
+    assert np.isfinite(evidence.model_excess_utility)
+    assert np.isfinite(evidence.oracle_excess_utility)
+    assert np.isfinite(evidence.tail_excess_lower_bound)
+    assert evidence.oracle_excess_utility == pytest.approx(oracle_mean - universe_mean)
+    # The score order coincides with the oracle here, so excesses coincide.
+    assert evidence.model_excess_utility == pytest.approx(oracle_mean - universe_mean)
+    assert evidence.tail_gate_ok is True
+
+
+def test_ECONOMIC_UTILITY_04_invalid_oof_join_fails_closed() -> None:
+    """Null or non-finite joined utility raises the typed integrity error."""
+    labels, scored = _study_frames({"A": 0.10, "B": -0.20}, {"A": 1.0, "B": 0.5}, sessions=2)
+    with pytest.raises(InvalidOofEconomicUtilityError, match="null"):
+        measure_tail_capture(
+            scored,
+            labels.with_columns(
+                pl.when(pl.col(_ID) == "A")
+                .then(None)
+                .otherwise(pl.col("risk_residual"))
+                .alias("risk_residual")
+            ),
+            top_k=1,
+            bootstrap_alpha=0.05,
+            bootstrap_resamples=10,
+            seed=1,
+        )
+    with pytest.raises(InvalidOofEconomicUtilityError, match="finite"):
+        measure_tail_capture(
+            scored,
+            labels.with_columns(
+                pl.when(pl.col(_ID) == "B")
+                .then(float("inf"))
+                .otherwise(pl.col("risk_residual"))
+                .alias("risk_residual")
+            ),
+            top_k=1,
+            bootstrap_alpha=0.05,
+            bootstrap_resamples=10,
+            seed=1,
+        )

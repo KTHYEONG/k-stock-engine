@@ -1151,6 +1151,34 @@ def materialize_net_alpha_snapshot(
     calendar = _load_calendar(request, source, calendar_entry)
     _preflight(request, catalog, source, base_manifest, calendar)
 
+    # Fail-closed provenance gate: a new executable label snapshot must bind a
+    # hash-verified CorporateActionSnapshot with no-action interval coverage.
+    from src.stocks.data.evidence import load_corporate_action_snapshot
+
+    action_entry = source.corporate_actions
+    if action_entry is None:
+        raise ValueError(
+            "corporate-action-coverage-required: source snapshot has no "
+            "cataloged corporate-action snapshot"
+        )
+    try:
+        corporate_action_snapshot = load_corporate_action_snapshot(
+            Path(action_entry.path), calendar
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "corporate-action-coverage-required: incompatible "
+            f"corporate-action evidence {action_entry.name!r} ({exc})"
+        ) from exc
+    if not any(
+        interval.action_code == "no_action"
+        for interval in corporate_action_snapshot.intervals
+    ):
+        raise ValueError(
+            "corporate-action-coverage-required: corporate-action evidence "
+            "carries no no-action intervals"
+        )
+
     feature_result = build_feature_panel(
         request.base_root,
         request.feature_root,
@@ -1241,7 +1269,16 @@ def materialize_net_alpha_snapshot(
         policy=policy,
         bar_evidence=raw_bar_evidence,
         tradability_events=tradability_events,
+        corporate_actions=corporate_action_snapshot,
     )
+    unsupported_actions = status_frame.filter(
+        pl.col("outcome_status") == "UNSUPPORTED_CORPORATE_ACTION"
+    )
+    if not unsupported_actions.is_empty():
+        raise ValueError(
+            "corporate-action-coverage-required: corporate-action snapshot "
+            f"leaves {unsupported_actions.height} decision path(s) uncovered"
+        )
     readiness = assess_outcome_readiness(
         base_frame.select("instrument_id", "session"),
         status_frame,
@@ -1267,6 +1304,7 @@ def materialize_net_alpha_snapshot(
         horizon_sessions=request.candidate_horizon_sessions,
         certification=request.certification,
         generated_time=request.generated_time,
+        corporate_actions_hash=corporate_action_snapshot.content_hash,
     )
     label_manifest = label_result.manifest
     status_result = publish_outcome_status_sidecar(
@@ -1279,6 +1317,7 @@ def materialize_net_alpha_snapshot(
         certification=request.certification,
         generated_time=request.generated_time,
         policy=policy,
+        corporate_actions_hash=corporate_action_snapshot.content_hash,
     )
     evidence_frame = build_partitioned_outcome_evidence(
         base_frame,
@@ -1312,6 +1351,7 @@ def materialize_net_alpha_snapshot(
         certification=request.certification,
         generated_time=request.generated_time,
         policy=policy,
+        corporate_actions_hash=corporate_action_snapshot.content_hash,
     )
 
     feature_entry = CatalogEntry(

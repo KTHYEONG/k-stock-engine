@@ -31,7 +31,7 @@ from src.core.datasets import (
 )
 from src.core.instruments import AssetKind
 from src.stocks.data.outcome_evidence import merge_open_bar_evidence, resolve_policy_outcome
-from src.stocks.data.quality import KRXSessionCalendar
+from src.stocks.data.quality import CorporateActionSnapshot, KRXSessionCalendar
 from src.stocks.domain.execution_policy import (
     SCHEDULED_OPEN_V1,
     ExecutionOutcomePolicy,
@@ -822,6 +822,151 @@ def build_net_alpha_label_dataset(
     return labels
 
 
+def classify_label_action_coverage(
+    outcomes: pl.DataFrame,
+    calendar: KRXSessionCalendar,
+    corporate_actions: CorporateActionSnapshot,
+) -> pl.DataFrame:
+    """Flag decision paths crossing an action or uncovered adjacent interval.
+
+    Adds one boolean ``_action_unsupported`` column to ``outcomes``: True when
+    the resolved entry-to-exit path crosses a non-``no_action`` interval or any
+    adjacent calendar pair missing from the snapshot. Keys without resolved
+    entry/exit dates are never flagged here; their own typed outcome status
+    governs. Classification is a stable per-instrument/calendar prefix count
+    over sorted intervals, O(n + a), never one row per holding-day.
+    """
+    required = (ID_COLUMN, "actual_entry_session", "actual_exit_session")
+    missing = [column for column in required if column not in outcomes.columns]
+    if missing:
+        raise ValueError(f"outcome frame missing columns {missing}")
+    positions = pl.DataFrame(
+        {
+            "_cal_date": pl.Series(list(calendar.sessions), dtype=pl.Date),
+            "_cal_pos": pl.Series(range(len(calendar.sessions)), dtype=pl.Int64),
+        }
+    )
+    intervals = pl.DataFrame(
+        {
+            ID_COLUMN: [iv.instrument_id for iv in corporate_actions.intervals],
+            "_prev_date": pl.Series(
+                [iv.previous_session for iv in corporate_actions.intervals], dtype=pl.Date
+            ),
+            "_is_action": [
+                iv.action_code != "no_action" for iv in corporate_actions.intervals
+            ],
+        }
+    ).join(
+        positions.rename({"_cal_date": "_prev_date", "_cal_pos": "_prev_pos"}),
+        on="_prev_date",
+        how="inner",
+    )
+    duplicated = (
+        intervals.group_by([ID_COLUMN, "_prev_pos"]).len().filter(pl.col("len") > 1)
+    )
+    if not duplicated.is_empty():
+        raise ValueError(
+            "corporate action snapshot must carry exactly one interval per "
+            "(instrument_id, previous_session)"
+        )
+
+    decisions = (
+        outcomes.select(
+            pl.col(ID_COLUMN),
+            pl.col("actual_entry_session").cast(pl.Date).alias("_entry_date"),
+            pl.col("actual_exit_session").cast(pl.Date).alias("_exit_date"),
+        )
+        .with_row_index("_action_row")
+        .join(
+            positions.rename({"_cal_date": "_entry_date", "_cal_pos": "_entry_pos"}),
+            on="_entry_date",
+            how="left",
+        )
+        .join(
+            positions.rename({"_cal_date": "_exit_date", "_cal_pos": "_exit_pos"}),
+            on="_exit_date",
+            how="left",
+        )
+    )
+    resolved = decisions.filter(
+        pl.col("_entry_pos").is_not_null() & pl.col("_exit_pos").is_not_null()
+    ).select("_action_row", ID_COLUMN, "_entry_pos", "_exit_pos")
+    if resolved.is_empty():
+        return outcomes.with_columns(pl.lit(False).alias("_action_unsupported"))
+
+    def _ranked(actions_only: bool) -> pl.DataFrame:
+        table = intervals.filter(pl.col("_is_action")) if actions_only else intervals
+        return (
+            table.sort([ID_COLUMN, "_prev_pos"])
+            .with_columns((pl.int_range(pl.len()).over(ID_COLUMN) + 1).alias("_cum"))
+            .sort("_prev_pos")
+            .select(ID_COLUMN, "_prev_pos", "_cum")
+        )
+
+    ranked_intervals = _ranked(False)
+    ranked_actions = _ranked(True)
+
+    def _count_below(boundary_column: str, table: pl.DataFrame, out_name: str) -> pl.DataFrame:
+        counted = (
+            resolved.select(
+                "_action_row", ID_COLUMN, pl.col(boundary_column).alias("_boundary")
+            )
+            .sort([ID_COLUMN, "_boundary"])
+            .join_asof(
+                table,
+                left_on="_boundary",
+                right_on="_prev_pos",
+                by=ID_COLUMN,
+                strategy="backward",
+                allow_exact_matches=False,
+                # Both inputs are explicitly sorted per instrument above.
+                check_sortedness=False,
+            )
+        )
+        return counted.select(
+            "_action_row", pl.col("_cum").fill_null(0).alias(out_name)
+        )
+
+    counts = (
+        resolved.join(
+            _count_below("_entry_pos", ranked_intervals, "_below_entry"), on="_action_row"
+        )
+        .join(
+            _count_below("_exit_pos", ranked_intervals, "_below_exit"), on="_action_row"
+        )
+        .join(
+            _count_below("_entry_pos", ranked_actions, "_actions_below_entry"),
+            on="_action_row",
+        )
+        .join(
+            _count_below("_exit_pos", ranked_actions, "_actions_below_exit"),
+            on="_action_row",
+        )
+        .with_columns(
+            (
+                (pl.col("_exit_pos") - pl.col("_entry_pos"))
+                > (pl.col("_below_exit") - pl.col("_below_entry"))
+            ).alias("_missing_interval"),
+            (
+                (pl.col("_actions_below_exit") - pl.col("_actions_below_entry")) > 0
+            ).alias("_crosses_action"),
+        )
+        .select(
+            "_action_row",
+            (pl.col("_missing_interval") | pl.col("_crosses_action")).alias(
+                "_action_unsupported"
+            ),
+        )
+    )
+    return (
+        outcomes.with_row_index("_action_row")
+        .join(counts, on="_action_row", how="left")
+        .sort("_action_row")
+        .drop("_action_row")
+        .with_columns(pl.col("_action_unsupported").fill_null(False))
+    )
+
+
 def build_net_alpha_label_dataset_with_status(
     base_panel: pl.DataFrame,
     calendar: KRXSessionCalendar,
@@ -833,18 +978,26 @@ def build_net_alpha_label_dataset_with_status(
     policy: ExecutionOutcomePolicy | None = None,
     bar_evidence: pl.DataFrame | None = None,
     tradability_events: pl.DataFrame | None = None,
+    corporate_actions: CorporateActionSnapshot | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Build a net-alpha label horizon and its typed outcome-status sidecar.
 
-    The realised label frame is exactly the current :func:`build_net_alpha_label_dataset`
-    output. The status sidecar additionally emits exactly one row per decision
-    key ``(instrument_id, session)`` with a typed state from the fixed
-    vocabulary: ``REALIZED``, ``PARTIAL_TAIL`` (required exit beyond the
-    calendar tail), ``MISSING_ENTRY_PRICE``/``MISSING_EXIT_PRICE``,
+    Labels are simple decimal rates: ``gross_return = exit_open / entry_open - 1``
+    for a covered no-action path, never a log return. The status sidecar emits
+    exactly one row per decision key ``(instrument_id, session)`` with a typed
+    state from the fixed vocabulary: ``REALIZED``, ``PARTIAL_TAIL`` (required
+    exit beyond the calendar tail), ``MISSING_ENTRY_PRICE``/``MISSING_EXIT_PRICE``,
     ``MISSING_DECISION_INPUT`` (control unavailable), and the label
     construction failures ``UNDERSIZED_CROSS_SECTION``, ``RISK_PROJECTION_FAILED``,
     and ``ZERO_MAD``. A key is never silently dropped without a typed state, so
     the outcome evidence remains economically evaluable.
+
+    When ``corporate_actions`` is supplied, every decision path whose
+    entry-to-exit interval crosses a non-``no_action`` record or an adjacent
+    session pair missing from the snapshot emits exactly one
+    ``UNSUPPORTED_CORPORATE_ACTION`` status and has no label row; adjustment
+    factors are never inferred or clipped. ``None`` keeps the legacy unverified
+    mode, which publication gates reject for new snapshots.
 
     Entry/exit sessions are resolved under ``policy`` (default
     ``scheduled_open_v1``): the scheduled policy requires the exact scheduled
@@ -878,6 +1031,10 @@ def build_net_alpha_label_dataset_with_status(
         bar_evidence=bar_evidence,
         tradability_events=tradability_events,
     )
+    if corporate_actions is None:
+        evidence = evidence.with_columns(pl.lit(False).alias("_action_unsupported"))
+    else:
+        evidence = classify_label_action_coverage(evidence, calendar, corporate_actions)
     prices = merge_open_bar_evidence(panel, bar_evidence).select(
         ID_COLUMN,
         pl.col("price_date").alias("_price_date"),
@@ -915,9 +1072,31 @@ def build_net_alpha_label_dataset_with_status(
             how="left",
         )
     )
-    complete = joined.filter(pl.col("outcome_status") == "REALIZED")
-    incomplete = evidence.filter(pl.col("outcome_status") != "REALIZED")
-    gross = pl.col("_exit_open").log() - pl.col("_entry_open").log()
+    realized = pl.col("outcome_status") == "REALIZED"
+    entry_ok = (
+        pl.col("_entry_open").is_not_null()
+        & pl.col("_entry_open").is_finite()
+        & (pl.col("_entry_open") > 0)
+    )
+    exit_ok = (
+        pl.col("_exit_open").is_not_null()
+        & pl.col("_exit_open").is_finite()
+        & (pl.col("_exit_open") > 0)
+    )
+    # Fail-closed partition of price-complete paths: an action or uncovered
+    # interval is never tradable evidence and unit-broken prices never label.
+    action_blocked = joined.filter(realized & pl.col("_action_unsupported"))
+    bad_entry = joined.filter(
+        realized & ~pl.col("_action_unsupported") & ~entry_ok
+    )
+    bad_exit = joined.filter(
+        realized & ~pl.col("_action_unsupported") & entry_ok & ~exit_ok
+    )
+    complete = joined.filter(
+        realized & ~pl.col("_action_unsupported") & entry_ok & exit_ok
+    )
+    incomplete = evidence.filter(~realized)
+    gross = pl.col("_exit_open") / pl.col("_entry_open") - 1.0
     complete = complete.with_columns(
         gross.alias("_gross"),
         pl.col("label_available_time").alias("_label_available"),
@@ -942,6 +1121,30 @@ def build_net_alpha_label_dataset_with_status(
     rows: list[dict[str, object]] = []
     status_rows: list[dict[str, object]] = []
     rejected_sessions: list[tuple[object, str]] = []
+    status_rows.extend(
+        {
+            ID_COLUMN: row[ID_COLUMN],
+            SESSION_COLUMN: _as_utc_datetime(row[SESSION_COLUMN]),
+            "outcome_status": "UNSUPPORTED_CORPORATE_ACTION",
+        }
+        for row in action_blocked.iter_rows(named=True)
+    )
+    status_rows.extend(
+        {
+            ID_COLUMN: row[ID_COLUMN],
+            SESSION_COLUMN: _as_utc_datetime(row[SESSION_COLUMN]),
+            "outcome_status": "MISSING_ENTRY_PRICE",
+        }
+        for row in bad_entry.iter_rows(named=True)
+    )
+    status_rows.extend(
+        {
+            ID_COLUMN: row[ID_COLUMN],
+            SESSION_COLUMN: _as_utc_datetime(row[SESSION_COLUMN]),
+            "outcome_status": "MISSING_EXIT_PRICE",
+        }
+        for row in bad_exit.iter_rows(named=True)
+    )
     for session_date in panel["_session_date"].unique().sort():
         session = panel.filter(pl.col("_session_date") == session_date)
         finite = session.filter(

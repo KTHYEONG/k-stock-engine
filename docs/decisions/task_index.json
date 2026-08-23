@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_LABEL_INTEGRITY_REPAIR",
+      "date": "2026-08-23",
+      "adr_id": "ADR_20260823_STOCK_LABEL_INTEGRITY_REPAIR",
+      "domain": "data-quality",
+      "title": "Stock label integrity and corporate-action repair",
+      "why": "Realised outcome labels mixed log and simple return units, causing corporate actions to produce impossible returns below -1 that broke tail log-utility and holdout blindness.",
+      "resolution": "Migrated label gross returns to simple decimal rates; enforced fail-closed corporate action interval snapshot validation; replaced tail log1p calculations with arithmetic residual utility; scoped OOF utility validation to preserve holdout blindness.",
+      "impact": "Corporate-action corrupted labels are safely filtered as UNSUPPORTED_CORPORATE_ACTION; research pipeline guarantees unit consistency and strict holdout isolation."
+    },
+    {
       "task_id": "economic-ml-invalid-utility-guard-20260823",
       "date": "2026-08-23",
       "adr_id": "ADR_20260823_economic-ml-invalid-utility-guard-20260823",
@@ -989,16 +999,6 @@
       "why": "One-shot date-by-date KRX calendar collection could block for hours and left no restartable artifact.",
       "resolution": "Added monthly atomic calendar partitions, resumable manifest validation, fail-closed merge, and explicit collection/merge CLI commands.",
       "impact": "Historical KRX session calendar collection can resume after API failures without repeating valid months; final calendars are emitted only after complete partition validation."
-    },
-    {
-      "task_id": "TASK_STOCK_DATA_EVIDENCE_HARDENING",
-      "date": "2026-08-10",
-      "adr_id": "ADR_20260810_STOCK_DATA_EVIDENCE_HARDENING",
-      "domain": "stocks",
-      "title": "Stock evidence collection adapters",
-      "why": "Evidence gates were implemented but authoritative KRX and OpenDART collection still needed a reproducible acquisition boundary.",
-      "resolution": "Added KRX instrument/session collectors and OpenDART disclosure/corporate-action candidate collectors with raw receipt timestamps, candidate-only action status, validation tests, and verified sample artifacts.",
-      "impact": "A bounded live collection path now supplies instrument identity and disclosure timing evidence; corporate-action adjustment remains fail-closed until effective dates and adjustment factors are independently verified."
     }
   ]
 }
