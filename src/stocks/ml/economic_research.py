@@ -31,6 +31,7 @@ from src.stocks.ml.contracts import (
     PolicyProfile,
 )
 from src.stocks.ml.economic_objective import (
+    InvalidOofEconomicUtilityError,
     TailCaptureEvidence,
     build_tail_relevance,
     measure_tail_capture,
@@ -111,6 +112,8 @@ _NO_LABEL_CAPACITY = "no-label-capacity"
 _TAIL_CAPTURE_INSUFFICIENT = "tail-capture-insufficient"
 _EXECUTION_ECONOMICS_INSUFFICIENT = "execution-economics-insufficient"
 _RERUN_QUALIFIED_FAMILY = "rerun-qualified-family"
+_INVALID_OOF_ECONOMIC_UTILITY = "invalid-oof-economic-utility"
+_REPAIR_LABEL_INTEGRITY = "repair-label-integrity"
 
 _STAGE_RANK = {
     _NO_LABEL_CAPACITY: 1,
@@ -254,9 +257,19 @@ def evaluate_economic_family_study(
     study_complete = all(
         bool(payload.get("study_complete")) for payload in candidate_payloads
     )
+    integrity_failures = 0
+    for payload in candidate_payloads:
+        reasons = payload.get("rejection_reason_counts")
+        if isinstance(reasons, Mapping):
+            integrity_failures += int(reasons.get(_INVALID_OOF_ECONOMIC_UTILITY, 0))
     next_action = _RERUN_QUALIFIED_FAMILY
     if best_window is None or best_family is None:
-        next_action = _worst_stage_token(candidate_payloads, worst_stage_rank)
+        # A data-integrity failure is a repair action, never a capacity verdict.
+        next_action = (
+            _REPAIR_LABEL_INTEGRITY
+            if integrity_failures > 0
+            else _worst_stage_token(candidate_payloads, worst_stage_rank)
+        )
         best_window = None
         best_family = None
     recommended_lookback = None
@@ -305,16 +318,6 @@ def evaluate_economic_window_candidate(
     request.execution_frontier.require_feasible_horizons(
         request.portfolio.max_exposure, request.portfolio.max_single_weight
     )
-    for horizon in request.candidate_horizon_sessions:
-        labels = data.labels_by_horizon[horizon]
-        utility = labels.select(
-            (pl.col(RISK_RESIDUAL_COLUMN) - pl.col(REFERENCE_COST_COLUMN)).alias(
-                "__economic_utility"
-            )
-        )["__economic_utility"]
-        values = utility.cast(pl.Float64).to_numpy()
-        if utility.null_count() or not np.all(np.isfinite(values)) or np.any(values <= -1.0):
-            return _window_rejection({}, "invalid-economic-utility")
     feasible = request.execution_frontier.feasible_cells(
         request.portfolio.max_exposure, request.portfolio.max_single_weight
     )
@@ -322,8 +325,13 @@ def evaluate_economic_window_candidate(
     for h, c, k in feasible:
         cells_by_horizon.setdefault(h, {}).setdefault(k, []).append(c)
 
+    # Label integrity is validated only at the OOF score/label join boundary
+    # (see _process_calibrated_scores), so locked-holdout corruption can never
+    # alter a supposedly holdout-blind research result.
     try:
         return _evaluate_window_body(data, request, settings, registry, cells_by_horizon)
+    except InvalidOofEconomicUtilityError:
+        return _window_rejection({}, _INVALID_OOF_ECONOMIC_UTILITY)
     except (_MemoryBudgetExceededError, _EnvelopeBudgetError) as exc:
         stage = str(getattr(exc, "stage", "") or "fitting_workspace")
         return _window_rejection({}, f"memory-budget-exceeded:{stage}")

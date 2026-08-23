@@ -21,7 +21,11 @@ from src.stocks.data.labels import (
     build_multi_horizon_residual_label_dataset,
     label_available_time,
 )
-from src.stocks.data.quality import KRXSessionCalendar
+from src.stocks.data.quality import (
+    CorporateActionInterval,
+    CorporateActionSnapshot,
+    KRXSessionCalendar,
+)
 from src.stocks.research.labels import LabelDefinition
 
 SESSIONS = [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4), date(2024, 1, 8), date(2024, 1, 9)]
@@ -569,3 +573,192 @@ class TestNetAlphaLabels:
         assert "KRX:000001" in base["instrument_id"].unique().to_list()
         # The status frame still carries one row per key with a typed state.
         assert status.filter(pl.col("outcome_status").is_null()).height == 0
+
+
+def _no_action_snapshot(
+    tickers: list[str],
+    sessions: tuple[date, ...],
+    *,
+    action_pairs: dict[str, set[int]] | None = None,
+    missing_pairs: dict[str, set[int]] | None = None,
+) -> CorporateActionSnapshot:
+    actions = action_pairs or {}
+    missing = missing_pairs or {}
+    intervals: list[CorporateActionInterval] = []
+    for ticker in tickers:
+        for position in range(len(sessions) - 1):
+            if position in missing.get(ticker, set()):
+                continue
+            if position in actions.get(ticker, set()):
+                intervals.append(
+                    CorporateActionInterval(
+                        ticker, sessions[position], sessions[position + 1],
+                        "stock_split", 0.5,
+                    )
+                )
+                continue
+            intervals.append(
+                CorporateActionInterval(
+                    ticker, sessions[position], sessions[position + 1], "no_action", 1.0
+                )
+            )
+    return CorporateActionSnapshot(
+        version="fixture-actions-v1",
+        intervals=tuple(intervals),
+        generated_time=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+
+class TestNetAlphaLabelIntegrity:
+    def test_LABEL_INTEGRITY_01_simple_return_unit(self) -> None:
+        """LABEL_INTEGRITY_01_SIMPLE_RETURN_UNIT."""
+        from src.stocks.data.labels import build_net_alpha_label_dataset_with_status
+
+        calendar = _weekday_calendar()
+        sessions = calendar.sessions
+        base = _cost_aware_base_panel(calendar)
+        exit_session = datetime.combine(sessions[4], datetime.min.time(), tzinfo=UTC)
+        base = base.with_columns(
+            pl.when(
+                (pl.col("instrument_id") == "KRX:000001")
+                & (pl.col("session") == exit_session)
+            )
+            .then(pl.lit(50.0))
+            .otherwise(pl.col("open"))
+            .alias("open")
+        )
+        snapshot = _no_action_snapshot(
+            base["instrument_id"].unique().sort().to_list(), sessions
+        )
+
+        labels, status = build_net_alpha_label_dataset_with_status(
+            base, calendar, _cost_schedule(), _liquidity_model(),
+            horizon_sessions=3, reference_notional=1.0e6,
+            corporate_actions=snapshot,
+        )
+        decision = datetime.combine(sessions[0], datetime.min.time(), tzinfo=UTC)
+        row = labels.filter(
+            (pl.col("instrument_id") == "KRX:000001") & (pl.col("session") == decision)
+        )
+        assert row.height == 1
+        gross = row["gross_o2o_3d"][0]
+        assert gross == pytest.approx(-0.5)
+        # A log-return unit would produce log(0.5); simple decimal is exact.
+        assert abs(gross - math.log(0.5)) > 0.1
+        fitted = row["risk_fitted_3d"][0]
+        cost = row["reference_cost_3d"][0]
+        assert math.isfinite(row["risk_residual_3d"][0])
+        assert row["net_residual_o2o_3d"][0] == pytest.approx(gross - fitted - cost)
+        key_status = status.filter(
+            (pl.col("instrument_id") == "KRX:000001") & (pl.col("session") == decision)
+        )
+        assert key_status.height == 1
+        assert key_status["outcome_status"][0] == "REALIZED"
+
+    def test_LABEL_INTEGRITY_02_action_crossing_fail_closed(self) -> None:
+        """LABEL_INTEGRITY_02_ACTION_PATH_FAIL_CLOSED (action crossing)."""
+        from src.stocks.data.labels import build_net_alpha_label_dataset_with_status
+
+        calendar = _weekday_calendar()
+        sessions = calendar.sessions
+        base = _cost_aware_base_panel(calendar)
+        tickers = sorted(base["instrument_id"].unique().to_list())
+        snapshot = _no_action_snapshot(
+            tickers, sessions, action_pairs={"KRX:000002": {2}}
+        )
+
+        labels, status = build_net_alpha_label_dataset_with_status(
+            base, calendar, _cost_schedule(), _liquidity_model(),
+            horizon_sessions=3, reference_notional=1.0e6,
+            corporate_actions=snapshot,
+        )
+        blocked_decisions = [
+            datetime.combine(sessions[d], datetime.min.time(), tzinfo=UTC)
+            for d in (0, 1)  # paths of decisions 0/1 cross interval pair 2
+        ]
+        affected = status.filter(
+            (pl.col("instrument_id") == "KRX:000002")
+            & pl.col("session").is_in(blocked_decisions)
+        )
+        assert affected.height == len(blocked_decisions)
+        assert (
+            affected["outcome_status"].unique().to_list()
+            == ["UNSUPPORTED_CORPORATE_ACTION"]
+        )
+        blocked_keys = affected.select("instrument_id", "session")
+        realized_blocked = labels.join(blocked_keys, on=["instrument_id", "session"], how="semi")
+        assert realized_blocked.height == 0
+        assert (
+            status.filter(
+                (pl.col("instrument_id") == "KRX:000002")
+                & pl.col("session").is_in(blocked_decisions)
+                & (pl.col("outcome_status") == "REALIZED")
+            ).height
+            == 0
+        )
+        # An untouched instrument keeps realised rows on identical dates.
+        untouched = status.filter(
+            (pl.col("instrument_id") == "KRX:000004")
+            & pl.col("session").is_in(blocked_decisions)
+        )
+        assert untouched["outcome_status"].to_list() == ["REALIZED", "REALIZED"]
+
+    def test_LABEL_INTEGRITY_02_missing_coverage_fail_closed(self) -> None:
+        """LABEL_INTEGRITY_02_ACTION_PATH_FAIL_CLOSED (missing coverage)."""
+        from src.stocks.data.labels import classify_label_action_coverage
+        from src.stocks.data.labels import build_net_alpha_label_dataset_with_status
+        from src.stocks.data.outcome_evidence import resolve_policy_outcome
+
+        calendar = _weekday_calendar()
+        sessions = calendar.sessions
+        base = _cost_aware_base_panel(calendar)
+        tickers = sorted(base["instrument_id"].unique().to_list())
+        snapshot = _no_action_snapshot(
+            tickers, sessions, missing_pairs={"KRX:000003": {5}}
+        )
+
+        labels, status = build_net_alpha_label_dataset_with_status(
+            base, calendar, _cost_schedule(), _liquidity_model(),
+            horizon_sessions=3, reference_notional=1.0e6,
+            corporate_actions=snapshot,
+        )
+        # Decision d=3 (pairs 4..6) includes the missing pair 5; decision
+        # d=1 (pairs 2..4) stops exactly before it and must stay REALIZED.
+        blocked_session = datetime.combine(sessions[3], datetime.min.time(), tzinfo=UTC)
+        boundary_ok = datetime.combine(sessions[1], datetime.min.time(), tzinfo=UTC)
+        affected = status.filter(
+            (pl.col("instrument_id") == "KRX:000003")
+            & (pl.col("session") == blocked_session)
+        )
+        assert affected["outcome_status"].to_list() == ["UNSUPPORTED_CORPORATE_ACTION"]
+        kept = status.filter(
+            (pl.col("instrument_id") == "KRX:000003")
+            & (pl.col("session") == boundary_ok)
+        )
+        assert kept["outcome_status"].to_list() == ["REALIZED"]
+        assert (
+            labels.filter(
+                (pl.col("instrument_id") == "KRX:000003")
+                & (pl.col("session") == blocked_session)
+            ).height
+            == 0
+        )
+
+        from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
+
+        panel = base.select("instrument_id", "session", "open")
+        evidence = resolve_policy_outcome(
+            panel, calendar, horizon_sessions=3, policy=SCHEDULED_OPEN_V1
+        )
+        flagged = classify_label_action_coverage(evidence, calendar, snapshot)
+        assert flagged.columns[-1] == "_action_unsupported"
+        target = flagged.filter(
+            (pl.col("instrument_id") == "KRX:000003")
+            & (pl.col("session") == date(2024, 1, 5))
+        )
+        assert target["_action_unsupported"].to_list() == [True]
+        clear = flagged.filter(
+            (pl.col("instrument_id") == "KRX:000003")
+            & (pl.col("session") == date(2024, 1, 3))
+        )
+        assert clear["_action_unsupported"].to_list() == [False]

@@ -1078,6 +1078,7 @@ def publish_outcome_evidence_dataset(
     universe_policy_version: str = "provisional-legacy",
     certification: DatasetCertification = DatasetCertification.PROVISIONAL,
     generated_time: datetime | None = None,
+    corporate_actions_hash: str | None = None,
 ) -> OutcomeEvidenceDatasetResult:
     """Publish the hash-bound per-key outcome-evidence artifact.
 
@@ -1135,6 +1136,8 @@ def publish_outcome_evidence_dataset(
         "resolution_kind_vocabulary": list(RESOLUTION_KIND_VOCABULARY),
         "generated_time": generated_time.isoformat(),
     }
+    if corporate_actions_hash is not None:
+        content_manifest["corporate_actions_hash"] = corporate_actions_hash
     store = ParquetDatasetStore(Path(destination_root))
     dataset_dir = store.write_partitioned(
         evidence,

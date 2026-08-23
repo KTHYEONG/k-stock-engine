@@ -423,5 +423,8 @@
   },
   "src/stocks/ml/economic_objective.py": {
     "testing": "tests/unit/stocks/ml/test_economic_objective.py"
+  },
+  "src/stocks/data/labels.py": {
+    "testing": "tests/unit/stocks/data/test_labels.py"
   }
 }
