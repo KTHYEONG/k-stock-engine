@@ -703,6 +703,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--research-only-economic-family-study",
+        action="store_true",
+        help=(
+            "read-only elastic-net vs tail-LambdaRank family study over every "
+            "declared window on one common causal OOS calendar; prints a "
+            "RESEARCH_ONLY JSON study payload and publishes no artifact"
+        ),
+    )
+    parser.add_argument(
         "--candidate-training-lookback-sessions",
         type=str,
         default="504,756,1260,expanding",
@@ -972,6 +981,86 @@ def run_research_only_temporal_window_study(
     }
 
 
+def run_research_only_economic_family_study(
+    parsed: argparse.Namespace,
+    request: NetAlphaTrainingRequest,
+) -> dict[str, object]:
+    """Run the read-only economic family study over one catalog snapshot.
+
+    Resolves and composes the selected snapshot once, binds its hash-verified
+    base/stress cost schedules plus both liquidity models onto an immutable
+    request copy, and evaluates every declared window x family candidate on
+    one common causal OOS calendar. Nothing is published: no artifact, no
+    metrics write, no result-ledger entry.
+    """
+    if parsed.base_dataset_id or parsed.feature_dataset_id or parsed.label_dataset_id:
+        raise ValueError(
+            "--research-only-economic-family-study requires a cataloged "
+            "snapshot; direct-only dataset requests are rejected "
+            "(cost-evidence-required)"
+        )
+    if not parsed.snapshot_id:
+        raise ValueError(
+            "--research-only-economic-family-study requires --snapshot-id "
+            "(cost-evidence-required); the read-only study never publishes"
+        )
+    from src.stocks.ml.contracts import EconomicFamilyStudySettings
+    from src.stocks.ml.economic_research import evaluate_economic_family_study
+
+    decision_time = parsed.decision_time or REFERENCE_DATETIME
+    repository = ResearchDataRepository(
+        base_root=parsed.base_root,
+        feature_root=parsed.feature_root,
+        label_root=parsed.label_root,
+    )
+    snapshot = resolve_snapshot_for_mode(
+        parsed.catalog_root, parsed.snapshot_id, mode=parsed.mode
+    )
+    (
+        base_cost_schedule,
+        liquidity_model,
+        stress_cost_schedule,
+        stress_liquidity_model,
+    ) = _resolve_cost_contexts(snapshot)
+    if liquidity_model is None or stress_liquidity_model is None:
+        raise ValueError(
+            "--research-only-economic-family-study requires hash-bound "
+            "snapshot cost evidence resolving base/stress schedules and both "
+            "liquidity models (cost-evidence-required)"
+        )
+    composed = repository.compose_labeled_training_snapshot(
+        snapshot,
+        feature_set="stock_net_alpha_v1",
+        decision_time=decision_time,
+    )
+    data = compose_net_alpha_training_data(
+        composed,
+        decision_time,
+        candidate_horizon_sessions=_parse_horizons(parsed.candidate_horizon_sessions),
+    )
+    bound_request = replace(
+        request,
+        base_cost_schedule=base_cost_schedule,
+        stress_cost_schedule=stress_cost_schedule,
+        liquidity_model=liquidity_model,
+        stress_liquidity_model=stress_liquidity_model,
+    )
+    settings = EconomicFamilyStudySettings(
+        candidate_lookback_sessions=_parse_training_lookback_candidates(
+            parsed.candidate_training_lookback_sessions
+        )
+    )
+    payload = evaluate_economic_family_study(
+        data, bound_request, settings, registry=ModelArtifactRegistry(parsed.registry)
+    )
+    return {
+        "status": "RESEARCH_ONLY",
+        "artifact_published": False,
+        "artifact_id": bound_request.artifact_id,
+        **payload,
+    }
+
+
 def _resolve_cost_contexts(
     snapshot: object,
 ) -> tuple[
@@ -1077,6 +1166,11 @@ def main(args: list[str] | None = None) -> int:
 
     if parsed.research_only_temporal_window_study:
         payload = run_research_only_temporal_window_study(parsed, request)
+        sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
+        return 0
+
+    if parsed.research_only_economic_family_study:
+        payload = run_research_only_economic_family_study(parsed, request)
         sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
         return 0
 
