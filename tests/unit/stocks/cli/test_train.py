@@ -1050,3 +1050,159 @@ def test_temporal_window_06_hash_bound_snapshot_forwards_costs(
 
     settings = captured["settings"]
     assert settings.candidate_lookback_sessions == (504, 756, None)
+
+
+def _install_economic_seams(monkeypatch) -> dict[str, object]:
+    base_schedule = SimpleNamespace(kind="base")
+    stress_schedule = SimpleNamespace(kind="stress")
+    evidence = SimpleNamespace(
+        base_schedule=lambda: base_schedule,
+        stress_schedule=lambda: stress_schedule,
+        base_liquidity_model=SimpleNamespace(name="base_liq"),
+        stress_liquidity_model=SimpleNamespace(name="stress_liq"),
+    )
+    monkeypatch.setattr(train, "load_cost_evidence", lambda path, rng: evidence)
+    return {"base": base_schedule, "stress": stress_schedule, "evidence": evidence}
+
+
+def test_economic_family_study_05_catalog_only_rejects_direct_ids(
+    monkeypatch,
+) -> None:
+    """ECONOMIC_FAMILY_05_CATALOG_ONLY_CLI.
+
+    Direct dataset IDs are rejected with a cost-evidence-required error
+    before any study evaluation starts.
+    """
+    _install_economic_seams(monkeypatch)
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("study evaluation must not start")
+
+    monkeypatch.setattr(
+        "src.stocks.ml.economic_research.evaluate_economic_family_study",
+        _forbidden,
+    )
+    with pytest.raises(ValueError, match="cost-evidence-required"):
+        train.main(
+            [
+                "--artifact-id",
+                "econ05a",
+                "--snapshot-id",
+                "research_snap_econ05a",
+                "--base-dataset-id",
+                "base1",
+                "--feature-dataset-id",
+                "feat1",
+                "--label-dataset-id",
+                "label1",
+                "--research-only-economic-family-study",
+            ]
+        )
+
+
+def test_economic_family_study_05_cost_provenance_requires_evidence(
+    monkeypatch,
+) -> None:
+    """A catalog snapshot without hash-bound cost evidence fails closed."""
+    _install_temporal_seams(monkeypatch)
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("study evaluation must not start")
+
+    monkeypatch.setattr(
+        "src.stocks.ml.economic_research.evaluate_economic_family_study",
+        _forbidden,
+    )
+    with pytest.raises(ValueError, match="cost-evidence-required"):
+        train.main(
+            [
+                "--artifact-id",
+                "econ05b",
+                "--snapshot-id",
+                "research_snap_econ05b",
+                "--research-only-economic-family-study",
+            ]
+        )
+
+
+def test_economic_family_study_05_catalog_snapshot_runs_once(
+    monkeypatch, capsys
+) -> None:
+    """A valid hashed snapshot calls the study exactly once and publishes nothing.
+
+    The run returns before any training invocation: artifact_published stays
+    false and train_net_alpha_model is never entered.
+    """
+    seams = _install_economic_seams(monkeypatch)
+    captured: dict[str, object] = {"calls": 0}
+
+    def fake_evaluate(data, request, settings, *, registry):
+        captured["calls"] = int(captured["calls"]) + 1
+        captured["request"] = request
+        captured["settings"] = settings
+        return {
+            "study_complete": True,
+            "next_action": "rerun-qualified-family",
+            "common_fold_count": 3,
+            "selected_family": "economic_tail_lambdarank",
+            "recommended_lookback_sessions": 504,
+            "recommended_is_expanding": False,
+            "rejection_reason_counts": {},
+            "candidates": [],
+        }
+
+    monkeypatch.setattr(
+        train,
+        "resolve_snapshot_for_mode",
+        lambda *a, **k: _FakeHashedSnapshot("costs/fake.json"),
+    )
+    monkeypatch.setattr(train, "ResearchDataRepository", _FakeTemporalRepository)
+    monkeypatch.setattr(
+        train,
+        "compose_net_alpha_training_data",
+        lambda *a, **k: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        "src.stocks.ml.economic_research.evaluate_economic_family_study",
+        fake_evaluate,
+    )
+
+    def _forbidden_training(*args, **kwargs):
+        raise AssertionError("promotion training must never run")
+
+    monkeypatch.setattr(
+        "src.stocks.ml.training.train_net_alpha_model", _forbidden_training
+    )
+
+    rc = train.main(
+        [
+            "--artifact-id",
+            "econ05c",
+            "--snapshot-id",
+            "research_snap_econ05c",
+            "--mode",
+            "research",
+            "--research-only-economic-family-study",
+            "--candidate-training-lookback-sessions",
+            "504,756,expanding",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["calls"] == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "RESEARCH_ONLY"
+    assert payload["artifact_published"] is False
+    assert payload["artifact_id"] == "econ05c"
+
+    request = captured["request"]
+    assert request.base_cost_schedule is seams["base"]
+    assert request.stress_cost_schedule is seams["stress"]
+    assert request.liquidity_model is seams["evidence"].base_liquidity_model
+    assert (
+        request.stress_liquidity_model is seams["evidence"].stress_liquidity_model
+    )
+
+    settings = captured["settings"]
+    assert settings.candidate_lookback_sessions == (504, 756, None)
+    assert settings.model_families[0] == "net_alpha_elastic_net"

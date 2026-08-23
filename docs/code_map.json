@@ -220,7 +220,7 @@
   },
   "src/stocks/cli/train.py": {
     "testing": "tests/unit/stocks/cli/test_train.py",
-    "architecture": "docs/specs/stock_ml_mainline_simplification.md"
+    "architecture": "docs/specs/economic_ml_rebuild.md"
   },
   "src/stocks/data/contracts.py": {
     "testing": [
@@ -420,5 +420,8 @@
   },
   "src/stocks/ml/window_research.py": {
     "testing": "tests/unit/stocks/ml/test_window_research.py"
+  },
+  "src/stocks/ml/economic_objective.py": {
+    "testing": "tests/unit/stocks/ml/test_economic_objective.py"
   }
 }

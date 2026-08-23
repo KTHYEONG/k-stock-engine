@@ -1,6 +1,26 @@
 {
   "tasks": [
     {
+      "task_id": "economic-ml-invalid-utility-guard-20260823",
+      "date": "2026-08-23",
+      "adr_id": "ADR_20260823_economic-ml-invalid-utility-guard-20260823",
+      "domain": "data-quality",
+      "title": "Fail closed on invalid economic utility",
+      "why": "The real economic family run found 1,092 labels with risk_residual minus reference_cost at or below -1, which cannot form log utility and previously crashed the study.",
+      "resolution": "Validate every requested horizon's cost-adjusted utility before fitting and return a bounded research-only rejection with invalid-economic-utility instead of throwing or fabricating growth evidence.",
+      "impact": "Malformed or economically impossible labels no longer crash ML research or enter ranking/replay; the latest run completes and identifies data-quality remediation as the next action."
+    },
+    {
+      "task_id": "economic-ml-rebuild-20260823",
+      "date": "2026-08-23",
+      "adr_id": "ADR_20260823_economic-ml-rebuild-20260823",
+      "domain": "signal",
+      "title": "Economic ML tail-relevance and family study",
+      "why": "Positive Rank-IC did not translate into invested capital or compound growth; the previous study did not control the full window×family×horizon×cadence×top-K×profile candidate family.",
+      "resolution": "Added tail-relevance measurement, exact economic family comparison, causal common-calendar selection, cost/liquidity-bound replay, and full-family bootstrap multiplicity control with consistent alpha/resample propagation.",
+      "impact": "ML research now reports tail capture and economic certification evidence; candidates remain research-only and fail closed unless base, stress, matched-excess, tail, fill, and coverage gates pass."
+    },
+    {
       "task_id": "ML-GROWTH-RECOVERY",
       "date": "2026-08-23",
       "adr_id": "ADR_20260823_ML-GROWTH-RECOVERY",
@@ -979,26 +999,6 @@
       "why": "Evidence gates were implemented but authoritative KRX and OpenDART collection still needed a reproducible acquisition boundary.",
       "resolution": "Added KRX instrument/session collectors and OpenDART disclosure/corporate-action candidate collectors with raw receipt timestamps, candidate-only action status, validation tests, and verified sample artifacts.",
       "impact": "A bounded live collection path now supplies instrument identity and disclosure timing evidence; corporate-action adjustment remains fail-closed until effective dates and adjustment factors are independently verified."
-    },
-    {
-      "task_id": "TASK_STOCK_DATA_QUALITY_HARDENING",
-      "date": "2026-08-09",
-      "adr_id": "ADR_20260809_STOCK_DATA_QUALITY_HARDENING",
-      "domain": "stocks",
-      "title": "Stock data quality hardening for research and backtest",
-      "why": "Full source profiling exposed unclassified instruments, invalid OHLC rows, unexplained price discontinuities, missing disclosure availability, and historical coverage gaps that could invalidate strategy research.",
-      "resolution": "Added effective-dated instrument classification, structural bar quarantine, KRX calendar and feature-availability gates, corporate-action interval validation, deterministic quality reports and lineage hashes, and backtest provenance checks.",
-      "impact": "Provisional migrations remain auditable and non-promotable; research/production datasets now require explicit evidence before eligible rows can feed training, replay, paper, or live paths."
-    },
-    {
-      "task_id": "TASK_STOCK_DATA_CURATION_MIGRATION",
-      "date": "2026-08-09",
-      "adr_id": "ADR_20260809_STOCK_DATA_CURATION_MIGRATION",
-      "domain": "stocks",
-      "title": "Canonical stock data curation and backtest readiness",
-      "why": "Legacy feature partitions were not directly consumable by the modern point-in-time research and replay contracts, and filesystem paths needed to be independent of .env.",
-      "resolution": "Added deterministic legacy-to-v2 curation with target separation, PIT timestamps, quality quarantine, manifest/content hashes, Hive-partitioned Parquet storage, tamper validation, repository-local data paths, and curate/train/simulate wiring.",
-      "impact": "The existing data/processed/features source remains immutable and provisional; canonical data/curated/stocks is the required input for reproducible training and backtesting, while promotion/live remains fail-closed until lineage evidence is supplied."
     }
   ]
 }
