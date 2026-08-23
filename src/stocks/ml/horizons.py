@@ -26,7 +26,7 @@ import numpy as np
 
 from src.stocks.research.bootstrap import pooled_segment_bootstrap_means
 
-DEFAULT_BOOTSTRAP_RESAMPLES = 200
+DEFAULT_BOOTSTRAP_RESAMPLES = 2000
 _BOUND_TOLERANCE = 1e-12
 
 
@@ -290,6 +290,7 @@ def _holm_admission(
     candidates: tuple[HorizonOOFEvidence, ...],
     bootstrap: dict[tuple[int, int, int, str], dict[str, _CohortBootstrap | None]],
     bootstrap_alpha: float,
+    n_bootstrap: int,
 ) -> tuple[
     dict[tuple[int, int, int, str], float],
     dict[tuple[int, int, int, str], float],
@@ -305,6 +306,12 @@ def _holm_admission(
     when ``combined_p <= alpha / (m - j + 1)``. Returns the per-candidate
     combined p-values, the base and stress Holm thresholds, and rejection
     reasons.
+
+    Raises:
+        ValueError: when ``n_bootstrap * bootstrap_alpha`` is below the family
+            size ``m``, because then the smallest rank-1 threshold falls under
+            the k/B grid resolution of the discrete bootstrap p-value and no
+            hypothesis except an exactly-zero draw could ever be admitted.
     """
     combined: dict[tuple[int, int, int, str], float] = {}
     has_paired = any("paired" in path for path in bootstrap.values())
@@ -352,6 +359,12 @@ def _holm_admission(
         )
     )
     m = len(hypotheses)
+    minimum_resamples = ceil(m / bootstrap_alpha)
+    if n_bootstrap < minimum_resamples:
+        raise ValueError(
+            f"n_bootstrap={n_bootstrap} is below the resolvable minimum "
+            f"{minimum_resamples} for alpha={bootstrap_alpha} and family size {m}"
+        )
     base_thresholds: dict[tuple[int, int, int, str], float] = {}
     stress_thresholds: dict[tuple[int, int, int, str], float] = {}
     paired_thresholds: dict[tuple[int, int, int, str], float] = {}
@@ -386,7 +399,10 @@ def select_horizons(
     candidate's own cadence, never across segment boundaries) and one-sided
     centered p-values are computed for the null ``mean(g) <= 0``. Holm-Bonferroni
     is applied across every pre-registered candidate ``(horizon,
-    rebalance_frequency_sessions, top_k, profile_id)`` and a candidate is
+    rebalance_frequency_sessions, top_k, profile_id)``; ``n_bootstrap`` must
+    satisfy ``n_bootstrap >= ceil(family_size / bootstrap_alpha)`` so the rank-1
+    threshold stays measurable on the discrete k/B p-value grid, otherwise a
+    ``ValueError`` is raised before any bootstrap work. A candidate is
     admissible only when its base, stress, and paired lower growth are strictly
     positive and its sparse/shadow turnover ratio is at most 0.60. The primary
     is the admissible candidate with the maximum stress-cost adjusted lower
@@ -464,7 +480,7 @@ def select_horizons(
         bootstrap[key] = path
 
     _combined, base_thresholds, stress_thresholds, paired_thresholds, reasons = _holm_admission(
-        ordered, bootstrap, bootstrap_alpha
+        ordered, bootstrap, bootstrap_alpha, n_bootstrap
     )
 
     adjusted_lower_growth: dict[tuple[int, int, int, str], dict[str, float]] = {}
