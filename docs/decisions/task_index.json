@@ -1,6 +1,26 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_FULL_RUN_EXECUTION_VALIDATION",
+      "date": "2026-08-23",
+      "adr_id": "ADR_20260823_ML_FULL_RUN_EXECUTION_VALIDATION",
+      "domain": "stocks_ml",
+      "title": "Full run execution validation after resolution fix",
+      "why": "The detached H10-only full run was executed to verify the bootstrap resolution guard end-to-end and to confirm the terminal economic verdict on real data.",
+      "resolution": "Detached run ml_h10_b2000_20260823 completed in 367.8s at peak RSS 1447 MiB under the 4096 MiB guard with all 24 frontier cells replayed (sample cell: 189 fills / 19 cycles); the new prequential growth-route gate rejected promotion because every candidate's base/stress lower growth is non-positive, leaving the route fully in cash (0 of 737 intervals invested).",
+      "impact": "Full-run completion is now session-independent and fail-closed; NO_TRADE is the correct economic verdict for the current labels/features/costs, so future promotion work must target signal research or an explicit gate-policy recalibration decision rather than pipeline fixes."
+    },
+    {
+      "task_id": "TASK_ML_BOOTSTRAP_RESOLUTION_GUARD",
+      "date": "2026-08-23",
+      "adr_id": "ADR_20260823_ML_BOOTSTRAP_RESOLUTION_GUARD",
+      "domain": "stocks_ml",
+      "title": "ML bootstrap resolution guard and detached full-run protocol",
+      "why": "Holm admission thresholds (alpha/m ~ 0.0007) sat below the k/B grid of the B=200 centered bootstrap p-value, so 62 of 72 production family hypotheses were only passable with an exactly-zero draw; the acceptance gate was structurally unmeasurable and full-grid runs exceeded interactive execution windows (observed 900s timeout).",
+      "resolution": "Raised DEFAULT_BOOTSTRAP_RESAMPLES to 2000 across horizons.py, NetAlphaTrainingRequest, and cli/train.py; added a fail-closed resolvability guard in _holm_admission raising ValueError when n_bootstrap < ceil(family_size / alpha); wired n_bootstrap through select_horizons; added tools/run_train_detached.sh pinning the H10-only pre-registered scope; fixed the test fixture horizon regression against require_feasible_horizons.",
+      "impact": "Gate statistics, seeds, lower-bound and turnover criteria, and NO_TRADE contracts unchanged; H10-only 24-cell family (m=72) now resolves at defaults (B>=1440 required), 48-cell grids need explicit --bootstrap-resamples >= 2880; full runs complete detached from any session (~172s measured baseline)."
+    },
+    {
       "task_id": "ml_growth_route_execution_completion",
       "date": "2026-08-23",
       "adr_id": "ADR_20260823_ml_growth_route_execution_completion",
@@ -979,26 +999,6 @@
       "why": "The stock bounded context lacked a single point-in-time planner that connected certified data, promoted artifacts, constrained sizing, target-position intents, and parity backtesting.",
       "resolution": "Added a pure trading-cycle planner, certified dataset and promotion gates, content-based cycle fingerprints, deterministic return-volatility sizing with sector/ADTV/gross constraints and DE_RISK handling, target-position execution semantics, and event-driven replay parity.",
       "impact": "Paper/live paths remain fail-closed behind promotion and readiness evidence; backtests and paper planning share the same planner; task and code ownership are indexed for maintenance."
-    },
-    {
-      "task_id": "TASK_STOCK_OHLC_QUALITY_QUARANTINE",
-      "date": "2026-08-09",
-      "adr_id": "ADR_20260809_STOCK_OHLC_QUALITY_QUARANTINE",
-      "domain": "stocks",
-      "title": "Quarantine invalid stock OHLC rows",
-      "why": "Two legacy stock rows contain zero open/high/low values during documented trading-halt or partial-session events, so price backfill would fabricate tradable data.",
-      "resolution": "The provisional legacy adapter now retains every row with deterministic data_quality_status and data_quality_reason fields; non-positive or missing OHLC rows are quarantined and research_eligible_frame excludes them from training and scoring.",
-      "impact": "Source evidence remains auditable, invalid sessions cannot contaminate features, labels, or simulation, and future licensed backfills can replace quarantined rows with provenance."
-    },
-    {
-      "task_id": "TASK_KR_EQUITY_COMPOUNDING_ARCHITECTURE",
-      "date": "2026-08-09",
-      "adr_id": "ADR_20260809_KR_EQUITY_COMPOUNDING_ARCHITECTURE",
-      "domain": "stocks",
-      "title": "Point-in-time Korean equity strategy research and compounding ledger",
-      "why": "The stock research path mixed legacy feature provenance with incomplete temporal validation, one-shot simulation, and ambiguous promotion evidence.",
-      "resolution": "Added deterministic provisional legacy-panel certification, point-in-time feature and label contracts, stable Rank-IC composite derivation, purged walk-forward promotion, constrained target weights, effective-dated costs, settlement-aware multi-session ledger, rebalance exits, and independent stress evaluation.",
-      "impact": "Strategy results are reproducible and fail closed to NO_TRADE when out-of-sample evidence, cost stress, capacity, or ledger invariants do not pass; KIS live integration remains a later boundary."
     }
   ]
 }
