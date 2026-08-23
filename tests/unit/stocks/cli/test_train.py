@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ from src.core.paths import (
     STOCK_LABEL_ROOT,
 )
 from src.stocks.cli import train
+from src.stocks.data.contracts import CoverageRange
 from src.stocks.data.direct import DirectDataRequest
 from src.stocks.ml.contracts import ExecutionFrontierSettings
 from src.stocks.research.models import ModelManifest
@@ -879,3 +881,172 @@ def test_terminal_progress_04_direct_journal_and_lookback_flag(
     final_record = records[-1]
     assert final_record["event"] == "terminal"
     assert final_record["status"] == "passed"
+
+
+TEMPORAL_WINDOW_06_COST_PROVENANCE = "TEMPORAL_WINDOW_06_COST_PROVENANCE"
+TEMPORAL_WINDOW_07_PARSER_CONTRACT = "TEMPORAL_WINDOW_07_PARSER_CONTRACT"
+
+
+def test_temporal_window_07_parser_contract() -> None:
+    """TEMPORAL_WINDOW_07_PARSER_CONTRACT.
+
+    The lookback grid maps 'expanding' to None only in the final position and
+    rejects duplicates, non-ascending values, sub-annual finite values, empty
+    entries, and malformed tokens.
+    """
+    parser = train.build_parser()
+    args = parser.parse_args(
+        ["--artifact-id", "tw07", "--snapshot-id", "s1"]
+    )
+    assert args.candidate_training_lookback_sessions == "504,756,1260,expanding"
+
+    parsed = train._parse_training_lookback_candidates("504,756,1260,expanding")
+    assert parsed == (504, 756, 1260, None)
+    assert train._parse_training_lookback_candidates("252") == (252,)
+
+    for bad, fragment in (
+        ("", "non-empty"),
+        (",", "non-empty"),
+        ("504,504", "strictly ascending"),
+        ("756,504", "strictly ascending"),
+        ("126", "at least 252"),
+        ("expanding,504", "final position"),
+        ("504,expanding,756", "final position"),
+        ("504,expanding,expanding", "final position"),
+        ("504,,756", "empty entry"),
+        ("abc", "integers"),
+    ):
+        with pytest.raises(ValueError, match=fragment):
+            train._parse_training_lookback_candidates(bad)
+
+
+class _FakeCostlessSnapshot:
+    costs = None
+
+
+class _FakeTemporalRepository:
+    def __init__(self, **kwargs):
+        del kwargs
+
+    def compose_labeled_training_snapshot(self, snapshot, **kwargs):
+        del snapshot, kwargs
+        return SimpleNamespace()
+
+
+class _FakeHashedSnapshot:
+    def __init__(self, cost_path: str) -> None:
+        self.costs = SimpleNamespace(path=cost_path, content_hash="hash123")
+        self.execution_range = CoverageRange(
+            start=date(2020, 1, 1), end=date(2026, 3, 10)
+        )
+
+
+def _install_temporal_seams(monkeypatch) -> None:
+    monkeypatch.setattr(
+        train, "resolve_snapshot_for_mode", lambda *a, **k: _FakeCostlessSnapshot()
+    )
+    monkeypatch.setattr(train, "ResearchDataRepository", _FakeTemporalRepository)
+    monkeypatch.setattr(
+        train,
+        "compose_net_alpha_training_data",
+        lambda *a, **k: SimpleNamespace(),
+    )
+
+
+def test_temporal_window_06_cost_provenance_requires_evidence(
+    monkeypatch,
+) -> None:
+    """TEMPORAL_WINDOW_06_COST_PROVENANCE.
+
+    A study request without snapshot cost evidence fails with a semantic
+    cost-evidence-required error before any candidate fitting starts.
+    """
+    _install_temporal_seams(monkeypatch)
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("candidate evaluation must not start")
+
+    monkeypatch.setattr(
+        "src.stocks.ml.window_research.evaluate_temporal_window_study", _forbidden
+    )
+    with pytest.raises(ValueError, match="cost-evidence-required"):
+        train.main(
+            [
+                "--artifact-id",
+                "tw06",
+                "--snapshot-id",
+                "research_snap_tw06",
+                "--research-only-temporal-window-study",
+            ]
+        )
+
+
+def test_temporal_window_06_hash_bound_snapshot_forwards_costs(
+    monkeypatch, capsys
+) -> None:
+    base_schedule = SimpleNamespace(kind="base")
+    stress_schedule = SimpleNamespace(kind="stress")
+    evidence = SimpleNamespace(
+        base_schedule=lambda: base_schedule,
+        stress_schedule=lambda: stress_schedule,
+        base_liquidity_model=SimpleNamespace(name="base_liq"),
+        stress_liquidity_model=SimpleNamespace(name="stress_liq"),
+    )
+    captured: dict[str, object] = {}
+
+    def fake_evaluate(data, request, settings, *, registry):
+        del data, registry
+        captured["request"] = request
+        captured["settings"] = settings
+        return {
+            "study_complete": False,
+            "next_action": "repair-economic-evidence",
+            "common_fold_count": 3,
+            "recommended_lookback_sessions": None,
+            "recommended_is_expanding": False,
+            "rejection_reason_counts": {},
+            "candidates": [],
+        }
+
+    monkeypatch.setattr(
+        train,
+        "resolve_snapshot_for_mode",
+        lambda *a, **k: _FakeHashedSnapshot("costs/fake.json"),
+    )
+    monkeypatch.setattr(train, "ResearchDataRepository", _FakeTemporalRepository)
+    monkeypatch.setattr(
+        train,
+        "compose_net_alpha_training_data",
+        lambda *a, **k: SimpleNamespace(),
+    )
+    monkeypatch.setattr(train, "load_cost_evidence", lambda path, rng: evidence)
+    monkeypatch.setattr(
+        "src.stocks.ml.window_research.evaluate_temporal_window_study",
+        fake_evaluate,
+    )
+
+    rc = train.main(
+        [
+            "--artifact-id",
+            "tw06b",
+            "--snapshot-id",
+            "research_snap_tw06b",
+            "--research-only-temporal-window-study",
+            "--candidate-training-lookback-sessions",
+            "504,756,expanding",
+        ]
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "RESEARCH_ONLY"
+    assert payload["artifact_published"] is False
+
+    request = captured["request"]
+    assert request.base_cost_schedule is base_schedule
+    assert request.stress_cost_schedule is stress_schedule
+    assert request.liquidity_model is evidence.base_liquidity_model
+    assert request.stress_liquidity_model is evidence.stress_liquidity_model
+
+    settings = captured["settings"]
+    assert settings.candidate_lookback_sessions == (504, 756, None)
