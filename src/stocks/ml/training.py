@@ -191,6 +191,27 @@ def _enforce_memory_budget(request: NetAlphaTrainingRequest, stage: str) -> None
         raise _MemoryBudgetExceededError(stage)
 
 
+def _emit_progress(
+    progress: Callable[[str, Mapping[str, object] | None], None] | None,
+    stage: str,
+    payload: dict[str, object],
+) -> None:
+    """Forward one scalar-only progress checkpoint; never alter run outcomes.
+
+    A callback or journal write failure is logged and swallowed so it can
+    neither change financial results nor suppress a training exception.
+    """
+    if progress is None:
+        return
+    try:
+        progress(stage, payload)
+    except Exception:
+        logger.warning(
+            "[SYS] stage=training_progress status=write_failed checkpoint=%s",
+            stage,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class HorizonDiscovery:
     """Immutable outcome of per-horizon OOF discovery.
@@ -249,11 +270,13 @@ class TrainingOrchestrator:
         request: NetAlphaTrainingRequest,
         *,
         diagnostics: object | None = None,
+        progress: Callable[[str, Mapping[str, object] | None], None] | None = None,
     ) -> None:
         self.data = data
         self.registry = registry
         self.request = request
         self.diagnostics = diagnostics
+        self.progress = progress
         self.telemetry = TrainingTelemetry()
 
     def candidate_plan(self) -> dict[str, object]:
@@ -280,6 +303,7 @@ class TrainingOrchestrator:
             self.registry,
             self.request,
             diagnostics=self.diagnostics,  # type: ignore[arg-type]
+            progress=self.progress,
         )
         self.telemetry.phase("orchestration_complete", {"selected": manifest.model_type})
         return manifest
@@ -291,6 +315,7 @@ def train_net_alpha_model(
     request: NetAlphaTrainingRequest,
     *,
     diagnostics: _RunDiagnostics | None = None,
+    progress: Callable[[str, Mapping[str, object] | None], None] | None = None,
 ) -> ModelManifest:
     """Train the net-alpha mainline and publish a champion or complete ``NO_TRADE``.
 
@@ -299,6 +324,9 @@ def train_net_alpha_model(
             per-horizon label frames).
         registry: the immutable artifact registry.
         request: the net-alpha training request.
+        diagnostics: optional run diagnostics sink for checkpoint emission.
+        progress: optional scalar-only progress callback (stage name plus a
+            bounded payload); callback failures never alter results.
 
     Returns:
         The published ``ModelManifest`` with ``model_type`` in
@@ -479,12 +507,15 @@ def train_net_alpha_model(
         )
 
     max_horizon = max(request.candidate_horizon_sessions)
+    # PurgedWalkForward.max_train_sessions bounds each fold's fitting memory
+    # to the newest eligible sessions after purge and embargo.
     splitter = PurgedWalkForward(
         n_folds=request.fold_count,
         label_horizon_sessions=max_horizon + 1,
         embargo_sessions=request.embargo_sessions,
         session_column=_SESSION_IDX,
         min_train_sessions=request.compounding.annualization_sessions,
+        max_train_sessions=request.max_training_lookback_sessions,
     )
     folds = splitter.split(pre_holdout)
     if not folds:
@@ -494,12 +525,24 @@ def train_net_alpha_model(
             telemetry=telemetry,
         )
 
-
     # One run-scoped tmp/training TemporaryDirectory owns all OOF spill files
     # and is removed on normal close; the registry root stays publish-only.
     cache = _OofCache(_default_oof_cache_base())
     try:
         _set_active_telemetry(telemetry)
+        _emit_progress(
+            progress,
+            "fitting_started",
+            {
+                "fold_count": len(folds),
+                "fold_train_rows": int(
+                    sum(len(fold.train_mask) for fold in folds)
+                ),
+                "fold_validation_rows": int(
+                    sum(len(fold.validation_mask) for fold in folds)
+                ),
+            },
+        )
         manifest = _select_publish_and_promote(
             registry=registry,
             data=data,
@@ -514,6 +557,14 @@ def train_net_alpha_model(
             schema_hash=schema_hash,
             universe_policy_hash=universe_policy_hash,
             oof_cache=cache,
+        )
+        _emit_progress(
+            progress,
+            "fitting_complete",
+            {
+                "model_type": str(manifest.model_type),
+                "promoted": bool(manifest.model_type != "no_trade"),
+            },
         )
         emit_checkpoint(
             diagnostics,
@@ -2497,12 +2548,15 @@ def _median_best_iteration(
     base_manifest: ModelManifest,
 ) -> int | None:
     """Median LightGBM best iteration over purged inner labeled validation."""
+    # Challenger nested fitting honors the same rolling lookback cap as the
+    # outer discovery plan.
     nested_splitter = PurgedWalkForward(
         n_folds=request.fold_count,
         label_horizon_sessions=horizon_sessions,
         embargo_sessions=request.embargo_sessions,
         session_column=_SESSION_IDX,
         min_train_sessions=_NESTED_MIN_TRAIN_SESSIONS,
+        max_train_sessions=request.max_training_lookback_sessions,
     )
     nested = nested_splitter.inner_folds(train, n_inner=_NESTED_INNER_FOLDS)
     iterations: list[int] = []
@@ -2820,6 +2874,33 @@ def _eligibility(frame: pl.DataFrame) -> tuple[str, str]:
     return first.isoformat(), end.isoformat()
 
 
+def _apply_final_refit_lookback(
+    pre_holdout: pl.DataFrame,
+    train: pl.DataFrame,
+    request: NetAlphaTrainingRequest,
+    primary_horizon_sessions: int,
+) -> pl.DataFrame:
+    """Apply the request's purge-safe rolling suffix to final refit rows."""
+    lookback = request.max_training_lookback_sessions
+    if lookback is None:
+        return train
+    if _SESSION_IDX not in pre_holdout.columns or _SESSION_IDX not in train.columns:
+        raise ValueError("final refit lookback requires session_index columns")
+
+    # The newest pre-holdout decision is the validation boundary. Keep only
+    # rows whose label interval plus embargo ends before that boundary.
+    boundary = int(cast(int, pre_holdout[_SESSION_IDX].max()))
+    label_horizon = int(primary_horizon_sessions) + 1
+    eligible_end = boundary - label_horizon - request.embargo_sessions
+    train = train.filter(pl.col(_SESSION_IDX) <= eligible_end)
+    if train.is_empty():
+        return train
+    sessions = sorted(train[_SESSION_IDX].unique().to_list())
+    if len(sessions) > lookback:
+        train = train.filter(pl.col(_SESSION_IDX) >= sessions[-lookback])
+    return train
+
+
 def _refit_selected(
     pre_holdout: pl.DataFrame,
     data: NetAlphaResearchData,
@@ -2839,6 +2920,9 @@ def _refit_selected(
         ),
         on=[_ID_COLUMN, SESSION_COLUMN],
         how="inner",
+    )
+    train = _apply_final_refit_lookback(
+        pre_holdout, train, request, primary_horizon_sessions
     )
     if train.is_empty():
         return None

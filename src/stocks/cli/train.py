@@ -17,7 +17,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -83,14 +83,17 @@ def _invoke_training(
     registry: ModelArtifactRegistry,
     request: NetAlphaTrainingRequest,
     diagnostics: RunDiagnostics,
+    progress: Callable[[str, Mapping[str, object] | None], None] | None = None,
 ) -> ModelManifest:
     """Drive the training orchestrator, honoring legacy callable signatures."""
     parameters = inspect.signature(train_net_alpha_model).parameters
     if "diagnostics" in parameters:
         orchestrator = TrainingOrchestrator(
-            data, registry, request, diagnostics=diagnostics
+            data, registry, request, diagnostics=diagnostics, progress=progress
         )
         return orchestrator.run()
+    if "progress" in parameters:
+        return train_net_alpha_model(data, registry, request, progress=progress)
     return train_net_alpha_model(data, registry, request)
 
 STOCK_RESULTS_DOC_ROOT = PROJECT_ROOT / "docs" / "results"
@@ -601,6 +604,16 @@ def build_parser() -> argparse.ArgumentParser:
             "from cgroup/system headroom during pre-allocation planning"
         ),
     )
+    parser.add_argument(
+        "--max-training-lookback-sessions",
+        type=int,
+        default=None,
+        help=(
+            "optional rolling fit-window cap in trading sessions applied "
+            "after purge and embargo (minimum 252); omit for expanding "
+            "training windows"
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--cost-schedule",
@@ -713,6 +726,9 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
         model_threads=args.model_threads,
         max_rss_mib=args.max_rss_mib,
         memory_reserve_mib=args.memory_reserve_mib,
+        # NetAlphaTrainingRequest.max_training_lookback_sessions fails closed
+        # on a non-positive or sub-annual cap before any dataset is loaded.
+        max_training_lookback_sessions=args.max_training_lookback_sessions,
         seed=args.seed,
         portfolio=PortfolioSettings(
             top_k=args.top_k,
@@ -1271,7 +1287,12 @@ def _run_direct_training(
     )
 
     try:
-        model_manifest = _invoke_training(data, registry, request, diagnostics)
+        # RunExecutionJournal.checkpoint is the fsynced progress sink: every
+        # training checkpoint lands durably; write failures never alter the
+        # financial outcome or suppress a training exception.
+        model_manifest = _invoke_training(
+            data, registry, request, diagnostics, progress=journal.checkpoint
+        )
     except (TrainingRunDeniedError, _EnvelopeBudgetError) as exc:
         stage = str(getattr(exc, "stage", "") or "fitting_workspace")
         return _terminal_guard_failure(stage, exc)

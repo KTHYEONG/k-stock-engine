@@ -396,7 +396,10 @@ class NetAlphaTrainingRequest:
     challenger LightGBM (default 1); there is no Optuna trial, resume, or
     ``lgb_threads`` knob. ``memory_reserve_mib`` is the measured
     concurrent-workload reserve subtracted only from cgroup/system headroom,
-    never from the request RSS budget.
+    never from the request RSS budget. ``max_training_lookback_sessions``
+    optionally bounds every fitting fold to the newest eligible sessions
+    after purge and embargo (minimum one annualized year); ``None`` preserves
+    expanding training windows.
     """
 
     artifact_id: str
@@ -413,6 +416,7 @@ class NetAlphaTrainingRequest:
     model_threads: int = 1
     max_rss_mib: int | None = None
     memory_reserve_mib: int = 0
+    max_training_lookback_sessions: int | None = None
     seed: int = 42
     portfolio: PortfolioSettings = field(default_factory=PortfolioSettings)
     risk: RiskSettings = field(default_factory=RiskSettings)
@@ -454,6 +458,15 @@ class NetAlphaTrainingRequest:
             raise ValueError("max_rss_mib must be positive when supplied")
         if self.memory_reserve_mib < 0:
             raise ValueError("memory_reserve_mib must be non-negative")
+        if self.max_training_lookback_sessions is not None:
+            lookback = self.max_training_lookback_sessions
+            if lookback <= 0:
+                raise ValueError("max_training_lookback_sessions must be positive")
+            if lookback < 252:
+                raise ValueError(
+                    "max_training_lookback_sessions must be at least 252 "
+                    f"sessions (one annualized certificate year), got {lookback}"
+                )
 
 
 @dataclass(frozen=True, slots=True)

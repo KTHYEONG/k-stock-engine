@@ -289,12 +289,15 @@ def _select_elastic_alpha_prepared(
     x_matrix = matrix.X
     codes = matrix.session_code
     target_full = _matrix_aligned_target(horizon, matrix.num_rows)
+    # PurgedWalkForward.max_train_sessions applies the request's rolling
+    # lookback cap to nested selection exactly as the outer discovery plan.
     splitter = PurgedWalkForward(
         n_folds=request.fold_count,
         label_horizon_sessions=int(horizon.horizon_sessions),
         embargo_sessions=request.embargo_sessions,
         session_column=_SESSION_IDX,
         min_train_sessions=_NESTED_MIN_TRAIN_SESSIONS,
+        max_train_sessions=request.max_training_lookback_sessions,
     )
     slice_frame = pl.DataFrame({_SESSION_IDX: codes[train_labeled]})
     nested = splitter.inner_folds(slice_frame, n_inner=_NESTED_INNER_FOLDS)
