@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ml_growth_route_execution_completion",
+      "date": "2026-08-23",
+      "adr_id": "ADR_20260823_ml_growth_route_execution_completion",
+      "domain": "stocks",
+      "title": "ML Growth Route Execution Completion",
+      "why": "Research-only growth replay lacked a caller-owned registry and prepared replay bypassed its allocation arrays, preventing reliable full-route evaluation.",
+      "resolution": "Wired the caller-owned registry into research evaluation, attached one immutable prepared allocation market per replay segment, preserved economic columns for prepared economic ranking, and retained reference allocation fallback when parity guards fail.",
+      "impact": "Eliminates the immediate research replay registry failure and removes repeated dataframe allocation work on compatible prepared paths; full 48-candidate grid still requires further runtime profiling because the observed 900-second run timed out."
+    },
+    {
       "task_id": "ml_backtest_compounding_structure",
       "date": "2026-08-23",
       "adr_id": "ADR_20260823_ml_backtest_compounding_structure",
@@ -989,16 +999,6 @@
       "why": "The stock research path mixed legacy feature provenance with incomplete temporal validation, one-shot simulation, and ambiguous promotion evidence.",
       "resolution": "Added deterministic provisional legacy-panel certification, point-in-time feature and label contracts, stable Rank-IC composite derivation, purged walk-forward promotion, constrained target weights, effective-dated costs, settlement-aware multi-session ledger, rebalance exits, and independent stress evaluation.",
       "impact": "Strategy results are reproducible and fail closed to NO_TRADE when out-of-sample evidence, cost stress, capacity, or ledger invariants do not pass; KIS live integration remains a later boundary."
-    },
-    {
-      "task_id": "TASK_ARCH_CONSOLIDATION",
-      "date": "2026-08-09",
-      "adr_id": "ADR_20260809_ARCH_CONSOLIDATION",
-      "domain": "architecture",
-      "title": "Consolidate legacy/modern package duplication",
-      "why": "The refactored tree still exposed duplicate etf/etfs roots and retained historical file layouts, reducing AI navigation efficiency and obscuring ownership.",
-      "resolution": "Consolidated shared contracts under core/storage, organized stocks and ETFs by research/trading/backtesting/workflows, rebuilt execution around intents/orders/readiness, and quarantined historical implementations under src/legacy with parity coverage.",
-      "impact": "Stock and ETF boundaries are explicit, legacy code is isolated, new ML/research components are replaceable, and the architecture remains extensible without reintroducing duplicate roots."
     }
   ]
 }
