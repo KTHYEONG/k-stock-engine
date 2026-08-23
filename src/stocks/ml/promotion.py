@@ -33,9 +33,9 @@ def publish_training_outcome(
     ModelManifest
         The published model manifest.
     """
-    from src.stocks.ml.training import _select_publish_and_promote
+    from src.stocks.ml.training import _run_discovery_and_publish
 
-    return _select_publish_and_promote(
+    return _run_discovery_and_publish(
         registry=context.registry,  # type: ignore[attr-defined]
         data=context.data,  # type: ignore[attr-defined]
         request=context.request,  # type: ignore[attr-defined]

@@ -412,3 +412,136 @@ def test_targeted_regression_suite() -> None:
     assert len(validated) == 3
     for profile in validated:
         assert profile.growth_risk_aversion > 0.0
+
+
+GROWTH_ROUTE_03_CERTIFICATE = "GROWTH_ROUTE_03_CERTIFICATE"
+
+
+def _growth_route(
+    base: tuple[float, ...],
+    stress: tuple[float, ...] | None = None,
+    benchmark: tuple[float, ...] | None = None,
+    *,
+    filled_orders: int = 6,
+    invested_intervals: int | None = None,
+    observed_intervals: int | None = None,
+):
+    from src.stocks.ml.horizons import GrowthRouteEvidence
+
+    count = len(base)
+    return GrowthRouteEvidence(
+        base_log_growth=base,
+        stress_log_growth=stress if stress is not None else base,
+        segment_ids=(0,) * count,
+        selected_policies=((10, 5, 20, "lower_bound_only"),),
+        interval_policies=((10, 5, 20, "lower_bound_only"),) * count,
+        benchmark_log_growth=benchmark if benchmark is not None else (),
+        candidate_count=3,
+        observed_interval_count=observed_intervals if observed_intervals else count,
+        invested_interval_count=(
+            count if invested_intervals is None else invested_intervals
+        ),
+        filled_orders=filled_orders,
+        filled_cycle_count=filled_orders,
+    )
+
+
+def _route_settings():
+    from src.stocks.ml.contracts import CompoundingCertificationSettings
+
+    return CompoundingCertificationSettings(
+        annualization_sessions=252,
+        min_observed_sessions=252,
+        min_active_cohort_fraction=0.2,
+        max_drawdown=0.5,
+        bootstrap_alpha=0.05,
+        bootstrap_resamples=200,
+        seed=42,
+    )
+
+
+def test_growth_route_03_certificate_passes_positive_paths() -> None:
+    """GROWTH_ROUTE_03_CERTIFICATE (positive branch).
+
+    A 252-interval finite route with positive base/stress and matched-excess
+    paths, >=20% invested intervals, an order count > 0, and MDD within the
+    configured cap passes with all three lower-CAGR predicates strictly
+    positive; the certificate is deterministic for fixed inputs.
+    """
+    from src.stocks.research.metrics import certify_growth_route
+
+    route = _growth_route(
+        (0.001,) * 252,
+        (0.0009,) * 252,
+        (0.0005,) * 252,
+        invested_intervals=60,
+    )
+    certificate = certify_growth_route(route, 10, _route_settings())
+    assert certificate["passed"] is True
+    assert certificate["reasons"] == []
+    assert certificate["base_lower_cagr"] > 0.0
+    assert certificate["stress_lower_cagr"] > 0.0
+    assert certificate["matched_lower_excess_cagr"] > 0.0
+    again = certify_growth_route(route, 10, _route_settings())
+    assert again == certificate
+
+
+def test_growth_route_03_certificate_fails_closed_per_predicate() -> None:
+    """GROWTH_ROUTE_03_CERTIFICATE (fail-closed branches).
+
+    Independently making the stress lower CAGR <= 0, the matched lower excess
+    <= 0, the filled order count zero, or one interval non-finite fails closed
+    with that exact normalized predicate.
+    """
+    from src.stocks.research.metrics import certify_growth_route
+
+    settings = _route_settings()
+    negative_stress = certify_growth_route(
+        _growth_route((0.001,) * 252, (-0.001,) * 252, (0.0005,) * 252), 10, settings
+    )
+    assert negative_stress["passed"] is False
+    assert "non-positive-stress-lower-cagr" in negative_stress["reasons"]
+
+    dominated = certify_growth_route(
+        _growth_route((0.001,) * 252, (0.0009,) * 252, (0.004,) * 252), 10, settings
+    )
+    assert dominated["passed"] is False
+    assert "non-positive-matched-lower-excess" in dominated["reasons"]
+
+    no_orders = certify_growth_route(
+        _growth_route(
+            (0.001,) * 252, (0.0009,) * 252, (0.0005,) * 252, filled_orders=0
+        ),
+        10,
+        settings,
+    )
+    assert no_orders["passed"] is False
+    assert "no-filled-orders" in no_orders["reasons"]
+
+    non_finite_series = (0.001,) * 125 + (float("nan"),) + (0.001,) * 126
+    corrupted = _growth_route(
+        (0.001,) * 252, (0.0009,) * 252, (0.0005,) * 252
+    )
+    # The immutable contract rejects non-finite series at construction; the
+    # certificate must still fail closed on a corrupted legacy payload.
+    object.__setattr__(corrupted, "base_log_growth", non_finite_series)
+    broken = certify_growth_route(corrupted, 10, settings)
+    assert broken["passed"] is False
+    assert "period-series-incomplete" in broken["reasons"]
+    assert broken["base_lower_cagr"] is None
+
+    missing_benchmark = certify_growth_route(
+        _growth_route((0.001,) * 252, (0.0009,) * 252), 10, settings
+    )
+    assert missing_benchmark["passed"] is False
+    assert "matched-benchmark-missing" in missing_benchmark["reasons"]
+
+
+def test_growth_route_03_certificate_requires_resolvable_bootstrap() -> None:
+    """The route-level bootstrap must resolve its alpha: resamples < ceil(1/alpha)."""
+    from src.stocks.ml.contracts import CompoundingCertificationSettings
+    from src.stocks.research.metrics import certify_growth_route
+
+    weak = CompoundingCertificationSettings(bootstrap_resamples=19)
+    with pytest.raises(ValueError, match="bootstrap_resamples"):
+        certify_growth_route(_growth_route((0.001,) * 252), 10, weak)

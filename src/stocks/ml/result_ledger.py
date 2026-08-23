@@ -986,6 +986,44 @@ def _compact_policy_frontier(metrics: Mapping[str, object]) -> dict[str, object]
     }
 
 
+def _compact_growth_route(metrics: Mapping[str, object]) -> dict[str, object]:
+    """Bounded growth-route index: scalars plus normalized rejection counts.
+
+    Projects the artifact metrics' ``growth_route`` projection into fixed
+    scalars (candidate/segment counts, selected policy label, lower-growth
+    CAGRs, coverage, fills) and per-reason counts; raw return arrays, policy
+    lists, and any other collection are pinned by digest instead of copied.
+    """
+    route = metrics.get("growth_route")
+    if not isinstance(route, Mapping):
+        return {}
+    reasons = route.get("rejection_reason_counts")
+    reason_counts: dict[str, int] = {}
+    if isinstance(reasons, Mapping):
+        for key, value in reasons.items():
+            count = _as_int(value)
+            if count:
+                reason_counts[_normalize_message(key)] = count
+    return {
+        "version": _json_scalar(route.get("version")),
+        "candidate_count": _as_int(route.get("candidate_count")),
+        "segment_count": _as_int(route.get("segment_count")),
+        "cash_segment_count": _as_int(route.get("cash_segment_count")),
+        "selected_policy": _json_scalar(route.get("selected_policy")),
+        "base_lower_cagr": _as_float(route.get("base_lower_cagr")),
+        "stress_lower_cagr": _as_float(route.get("stress_lower_cagr")),
+        "matched_lower_excess_cagr": _as_float(
+            route.get("matched_lower_excess_cagr")
+        ),
+        "mdd": _as_float(route.get("mdd")),
+        "observed_intervals": _as_int(route.get("observed_intervals")),
+        "invested_intervals": _as_int(route.get("invested_intervals")),
+        "filled_orders": _as_int(route.get("filled_orders")),
+        "rejection_reason_counts": reason_counts,
+        "policies_digest": _digest_summary(route.get("selected_policies_digest")),
+    }
+
+
 def _compact_observability(
     metrics: Mapping[str, object],
     telemetry: Mapping[str, object] | None,
@@ -1003,6 +1041,7 @@ def _compact_observability(
         "horizons": _compact_horizons(source),
         "summary": _bounded_observability_summary(source),
         "policy_frontier": _compact_policy_frontier(metrics),
+        "growth_route": _compact_growth_route(metrics),
     }
 
 
@@ -1230,6 +1269,9 @@ def _project_completed(
             "policy_frontier": _sanitize_deep(
                 observability.get("policy_frontier")
             ),
+            "growth_route": _sanitize_deep(
+                observability.get("growth_route")
+            ),
             "replay": _project_replay(metrics),
             "holdout": _project_holdout(metrics),
         },
@@ -1335,6 +1377,7 @@ def _project_reconcile_record(
             "horizons": observability["horizons"],
             "summary": observability["summary"],
             "policy_frontier": observability["policy_frontier"],
+            "growth_route": observability.get("growth_route", {}),
             "replay": _project_replay(metrics),
             "holdout": _project_holdout(metrics),
         },

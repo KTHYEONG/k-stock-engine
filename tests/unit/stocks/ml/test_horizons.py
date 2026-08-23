@@ -9,6 +9,7 @@ from src.stocks.ml.horizons import (
     HorizonOOFEvidence,
     _cohort_bootstrap,
     select_horizons,
+    stitch_prequential_growth_route,
 )
 
 _LEGACY = "legacy_overlay_5bps"
@@ -470,6 +471,195 @@ def test_primary_preserves_selected_nonfirst_execution_cell() -> None:
 
 
 BOOTSTRAP_PARITY_01 = "BOOTSTRAP-PARITY-01"
+
+
+def _segmented_evidence(
+    horizon: int,
+    segment_values: dict[int, tuple[float, ...]],
+    *,
+    stress: dict[int, tuple[float, ...]] | None = None,
+    profile_id: str = _LEGACY,
+    cadence: int = 5,
+    top_k: int = 20,
+    paired: tuple[float, ...] | None = None,
+    sparse_turnover: float = 0.0,
+    shadow_turnover: float = 0.0,
+) -> HorizonOOFEvidence:
+    """One candidate whose vintages are grouped by OOF segment id."""
+    base: list[float] = []
+    stress_series: list[float] = []
+    segment_ids: list[int] = []
+    for segment in sorted(segment_values):
+        values = segment_values[segment]
+        base.extend(values)
+        stress_series.extend((stress or {}).get(segment, values))
+        segment_ids.extend([segment] * len(values))
+    return HorizonOOFEvidence(
+        horizon_sessions=horizon,
+        profile_id=profile_id,
+        model_family="net_alpha_elastic_net",
+        base_log_growth=tuple(base),
+        stress_log_growth=tuple(stress_series),
+        cohort_segment_ids=tuple(segment_ids),
+        complete_cohort_count=len(base),
+        active_cohort_count=len(base),
+        partial_cohort_count=0,
+        missing_cohort_count=0,
+        segment_count=max(segment_ids, default=0) + 1,
+        fold_rank_ics=(0.1, 0.2, 0.3),
+        rebalance_frequency_sessions=cadence,
+        top_k=top_k,
+        paired_stress_log_growth=paired or (),
+        sparse_turnover=sparse_turnover,
+        shadow_turnover=shadow_turnover,
+    )
+
+
+GROWTH_ROUTE_01_CAUSAL_STITCH = "GROWTH_ROUTE_01_CAUSAL_STITCH"
+
+
+def test_growth_route_01_causal_stitch() -> None:
+    """GROWTH_ROUTE_01_CAUSAL_STITCH.
+
+    For three synthetic OOF segments the policy selected for segment ``s``
+    depends only on candidate evidence with segment id strictly below ``s``:
+    mutating any candidate return in segment ``s`` or later leaves every
+    selection for segments ``<= s`` unchanged. Segment 0 stays cash without a
+    pre-registered seed, and every appended non-cash interval carries exactly
+    one source candidate (the policy selected for its own segment).
+    """
+    alpha = 0.05
+    n_bootstrap = 20  # ceil(1 / alpha): minimum resolvable route bootstrap
+
+    strong = _segmented_evidence(
+        5, {0: (0.02,) * 12, 1: (0.02,) * 12, 2: (0.02,) * 12}, profile_id=_LEGACY
+    )
+    late_bloomer = _segmented_evidence(
+        10, {0: (0.02,) * 12, 1: (0.05,) * 12, 2: (0.05,) * 12},
+        profile_id=_LOWER, cadence=5,
+    )
+    baseline = stitch_prequential_growth_route(
+        (strong, late_bloomer), alpha, 42, n_bootstrap
+    )
+    # Segment 0 has no prior evidence: cash without a seed.
+    assert baseline.selected_policies[0] is None
+    # Segment 1 tie on segment-0 evidence resolves to the deterministic
+    # (H, C, K, profile) order: shorter horizon first.
+    assert baseline.selected_policies[1] == (5, 5, 20, _LEGACY)
+    # Segment 2 sees both earlier segments and picks max stress lower growth.
+    assert baseline.selected_policies[2] == (10, 5, 20, _LOWER)
+
+    # Mutating a candidate's returns at segment s never moves selections <= s.
+    mutated_mid = stitch_prequential_growth_route(
+        (
+            strong,
+            _segmented_evidence(
+                10, {0: (0.02,) * 12, 1: (-0.08,) * 12, 2: (0.05,) * 12},
+                profile_id=_LOWER,
+            ),
+        ),
+        alpha, 42, n_bootstrap,
+    )
+    assert mutated_mid.selected_policies[:2] == baseline.selected_policies[:2]
+
+    mutated_tail = stitch_prequential_growth_route(
+        (
+            strong,
+            _segmented_evidence(
+                10, {0: (0.02,) * 12, 1: (0.05,) * 12, 2: (-0.09,) * 12},
+                profile_id=_LOWER,
+            ),
+        ),
+        alpha, 42, n_bootstrap,
+    )
+    assert mutated_tail.selected_policies == baseline.selected_policies
+
+    mutated_strong = stitch_prequential_growth_route(
+        (
+            _segmented_evidence(
+                5, {0: (0.02,) * 12, 1: (-0.05,) * 12, 2: (0.02,) * 12},
+                profile_id=_LEGACY,
+            ),
+            late_bloomer,
+        ),
+        alpha, 42, n_bootstrap,
+    )
+    assert mutated_strong.selected_policies[:2] == baseline.selected_policies[:2]
+
+    # Chronological append order, one source candidate per non-cash interval,
+    # and cash intervals contribute exactly zero growth with zero exposure.
+    assert list(baseline.segment_ids) == sorted(baseline.segment_ids)
+    assert len(baseline.base_log_growth) == len(baseline.stress_log_growth) == 36
+    assert len(baseline.interval_policies) == 36
+    assert all(value == 0.0 for value in baseline.base_log_growth[:12])
+    assert baseline.interval_policies[:12] == (None,) * 12
+    non_cash = [
+        index
+        for index, key in enumerate(baseline.interval_policies)
+        if key is not None
+    ]
+    assert non_cash
+    for index in non_cash:
+        segment = baseline.segment_ids[index]
+        assert baseline.interval_policies[index] == (
+            baseline.selected_policies[segment]
+        )
+    assert baseline.candidate_count == 2
+    assert baseline.observed_interval_count == 36
+    assert baseline.invested_interval_count == 24
+
+    with pytest.raises(ValueError, match="n_bootstrap"):
+        stitch_prequential_growth_route((strong,), 0.05, 42, 19)
+
+
+GROWTH_ROUTE_02_ABSOLUTE_OBJECTIVE = "GROWTH_ROUTE_02_ABSOLUTE_OBJECTIVE"
+
+
+def test_growth_route_02_absolute_objective() -> None:
+    """GROWTH_ROUTE_02_ABSOLUTE_OBJECTIVE.
+
+    The sparse-minus-dense diagnostic cannot veto selection: a route whose
+    paired sparse-minus-dense lower growth is negative remains selectable when
+    its absolute base/stress lower growth is positive, while any non-positive
+    absolute lower bound makes the route ineligible (all-cash).
+    """
+    alpha = 0.05
+    n_bootstrap = 20
+
+    sparse_loser = _segmented_evidence(
+        5,
+        {0: (0.03,) * 12, 1: (0.03,) * 12},
+        profile_id=_LOWER,
+        paired=(-0.01,) * 24,
+        sparse_turnover=1.0,
+        shadow_turnover=1.0,
+    )
+    route = stitch_prequential_growth_route((sparse_loser,), alpha, 42, n_bootstrap)
+    assert route.selected_policies[0] is None
+    assert route.selected_policies[1] == (5, 5, 20, _LOWER)
+    assert route.sparse_minus_dense_lower_growth < 0.0
+    assert route.invested_interval_count > 0
+
+    negative_base = _segmented_evidence(
+        5, {0: (-0.02,) * 12, 1: (0.03,) * 12}, profile_id=_LOWER
+    )
+    ineligible_base = stitch_prequential_growth_route(
+        (negative_base,), alpha, 42, n_bootstrap
+    )
+    assert all(policy is None for policy in ineligible_base.selected_policies)
+    assert ineligible_base.invested_interval_count == 0
+
+    negative_stress = _segmented_evidence(
+        5,
+        {0: (0.03,) * 12, 1: (0.03,) * 12},
+        stress={0: (-0.02,) * 12, 1: (0.03,) * 12},
+        profile_id=_LOWER,
+    )
+    ineligible_stress = stitch_prequential_growth_route(
+        (negative_stress,), alpha, 42, n_bootstrap
+    )
+    assert all(policy is None for policy in ineligible_stress.selected_policies)
+    assert ineligible_stress.invested_interval_count == 0
 
 
 def test_bootstrap_parity_01_pooled_matches_materialized_reference() -> None:
