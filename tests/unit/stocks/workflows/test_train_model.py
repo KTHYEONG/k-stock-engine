@@ -15,6 +15,7 @@ import polars as pl
 import pytest
 
 from src.core.instruments import AssetKind
+from src.stocks.cli.train import build_parser
 from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.ml.contracts import (
     CompoundingCertificationSettings,
@@ -53,7 +54,7 @@ def _request(artifact_id: str, **kwargs) -> NetAlphaTrainingRequest:
     defaults = {
         "artifact_id": artifact_id,
         "fold_count": 2,
-        "candidate_horizon_sessions": (3, 5),
+        "candidate_horizon_sessions": (5, 10),
         "bootstrap_resamples": 50,
         "liquidity_model": stock_liquidity_model(),
     }
@@ -70,7 +71,7 @@ def _compound_request(artifact_id: str, **kwargs) -> NetAlphaTrainingRequest:
     defaults = {
         "artifact_id": artifact_id,
         "fold_count": 2,
-        "candidate_horizon_sessions": (3, 5),
+        "candidate_horizon_sessions": (5, 10),
         "bootstrap_resamples": 50,
         "liquidity_model": stock_liquidity_model(),
         "risk": RiskSettings(min_calibration_sessions=40),
@@ -516,3 +517,12 @@ def test_execution_frontier_replay_policy_and_no_trade_gate() -> None:
     )
     rejected_stress = select_horizons((negative_stress,), 0.05, 42)
     assert rejected_stress.primary_horizon_sessions is None
+
+
+def test_request_and_cli_defaults_updated() -> None:
+    """request_and_cli_defaults_updated: bootstrap resolvability defaults."""
+    assert NetAlphaTrainingRequest(artifact_id="defaults").bootstrap_resamples == 2000
+    args = build_parser().parse_args(["--artifact-id", "defaults"])
+    assert args.bootstrap_resamples == 2000
+    # Holdout certificate policy is a separate pre-registered scope.
+    assert CompoundingCertificationSettings().bootstrap_resamples == 200
