@@ -693,6 +693,24 @@ def build_parser() -> argparse.ArgumentParser:
             "artifact"
         ),
     )
+    parser.add_argument(
+        "--research-only-temporal-window-study",
+        action="store_true",
+        help=(
+            "read-only comparison of rolling/expanding fit windows on one "
+            "common causal OOS calendar; prints a RESEARCH_ONLY JSON study "
+            "payload and publishes no artifact"
+        ),
+    )
+    parser.add_argument(
+        "--candidate-training-lookback-sessions",
+        type=str,
+        default="504,756,1260,expanding",
+        help=(
+            "ascending unique rolling fit-window candidates in trading "
+            "sessions with an optional trailing 'expanding' control"
+        ),
+    )
     return parser
 
 
@@ -828,6 +846,132 @@ def run_research_only_growth_route(
     }
 
 
+def _parse_training_lookback_candidates(raw: str) -> tuple[int | None, ...]:
+    """Parse the rolling fit-window grid; the trailing 'expanding' is ``None``."""
+    tokens = [token.strip() for token in raw.split(",")]
+    if not any(tokens):
+        raise ValueError(
+            "candidate-training-lookback-sessions must be a non-empty "
+            "comma-separated list of integers or 'expanding'"
+        )
+    values: list[int | None] = []
+    previous_finite: int | None = None
+    for position, entry in enumerate(tokens):
+        if not entry:
+            raise ValueError(
+                "candidate-training-lookback-sessions contains an empty entry"
+            )
+        if entry == "expanding":
+            if position != len(tokens) - 1:
+                raise ValueError(
+                    "'expanding' is only permitted once in the final position"
+                )
+            values.append(None)
+            continue
+        try:
+            value = int(entry)
+        except ValueError as exc:
+            raise ValueError(
+                "candidate-training-lookback-sessions entries must be integers "
+                "or 'expanding'"
+            ) from exc
+        if value < 252:
+            raise ValueError(
+                "finite candidate-training-lookback-sessions must be at least "
+                f"252 sessions (one annualized certificate year), got {value}"
+            )
+        if previous_finite is not None and value <= previous_finite:
+            raise ValueError(
+                "finite candidate-training-lookback-sessions must be strictly "
+                "ascending and unique"
+            )
+        previous_finite = value
+        values.append(value)
+    return tuple(values)
+
+
+def run_research_only_temporal_window_study(
+    parsed: argparse.Namespace,
+    request: NetAlphaTrainingRequest,
+) -> dict[str, object]:
+    """Run the read-only temporal fit-window study over one catalog snapshot.
+
+    Resolves and composes the selected snapshot once, binds its hash-verified
+    base/stress cost schedules plus both liquidity models onto an immutable
+    request copy, and evaluates every declared candidate on one common causal
+    OOS calendar. Nothing is published: no artifact, no metrics write, no
+    result-ledger entry.
+    """
+    if parsed.base_dataset_id or parsed.feature_dataset_id or parsed.label_dataset_id:
+        raise ValueError(
+            "--research-only-temporal-window-study requires a cataloged "
+            "snapshot; direct-only dataset requests are rejected "
+            "(cost-evidence-required)"
+        )
+    if not parsed.snapshot_id:
+        raise ValueError(
+            "--research-only-temporal-window-study requires --snapshot-id "
+            "(cost-evidence-required); the read-only study never publishes"
+        )
+    from src.stocks.ml.window_research import (
+        TemporalWindowStudySettings,
+        evaluate_temporal_window_study,
+    )
+
+    decision_time = parsed.decision_time or REFERENCE_DATETIME
+    repository = ResearchDataRepository(
+        base_root=parsed.base_root,
+        feature_root=parsed.feature_root,
+        label_root=parsed.label_root,
+    )
+    snapshot = resolve_snapshot_for_mode(
+        parsed.catalog_root, parsed.snapshot_id, mode=parsed.mode
+    )
+    (
+        base_cost_schedule,
+        liquidity_model,
+        stress_cost_schedule,
+        stress_liquidity_model,
+    ) = _resolve_cost_contexts(snapshot)
+    if liquidity_model is None or stress_liquidity_model is None:
+        raise ValueError(
+            "--research-only-temporal-window-study requires hash-bound "
+            "snapshot cost evidence resolving base/stress schedules and both "
+            "liquidity models (cost-evidence-required)"
+        )
+    composed = repository.compose_labeled_training_snapshot(
+        snapshot,
+        feature_set="stock_net_alpha_v1",
+        decision_time=decision_time,
+    )
+    data = compose_net_alpha_training_data(
+        composed,
+        decision_time,
+        candidate_horizon_sessions=_parse_horizons(parsed.candidate_horizon_sessions),
+    )
+    bound_request = replace(
+        request,
+        base_cost_schedule=base_cost_schedule,
+        stress_cost_schedule=stress_cost_schedule,
+        liquidity_model=liquidity_model,
+        stress_liquidity_model=stress_liquidity_model,
+    )
+    settings = TemporalWindowStudySettings(
+        candidate_lookback_sessions=_parse_training_lookback_candidates(
+            parsed.candidate_training_lookback_sessions
+        )
+    )
+    payload = evaluate_temporal_window_study(
+        data, bound_request, settings, registry=ModelArtifactRegistry(parsed.registry)
+    )
+    return {
+        "status": "RESEARCH_ONLY",
+        "artifact_published": False,
+        "artifact_id": bound_request.artifact_id,
+        **payload,
+    }
+
+
 def _resolve_cost_contexts(
     snapshot: object,
 ) -> tuple[
@@ -928,6 +1072,11 @@ def main(args: list[str] | None = None) -> int:
 
     if parsed.research_only_growth_route:
         payload = run_research_only_growth_route(parsed, request)
+        sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
+        return 0
+
+    if parsed.research_only_temporal_window_study:
+        payload = run_research_only_temporal_window_study(parsed, request)
         sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
         return 0
 
