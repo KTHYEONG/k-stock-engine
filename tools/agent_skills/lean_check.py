@@ -344,12 +344,36 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                     if kind == "parameter_add" and owner and "." in name:
                         # parameter_add: verify the owner function exists and
                         # the leaf parameter is present in its signature.
+                        # A class owner resolves to its ``leaf`` method (the
+                        # constructor), whose parameter evidence is enforced
+                        # by the companion field entry.
+                        owner_function = None
+                        owner_class = None
                         for node in ast.walk(tree):
-                            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == owner:
-                                target_node = node
-                                arg_names = [a.arg for a in node.args.args]
-                                found_impl = leaf in arg_names
+                            if (
+                                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                and node.name == owner
+                            ):
+                                owner_function = node
                                 break
+                        if owner_function is None:
+                            for node in ast.walk(tree):
+                                if isinstance(node, ast.ClassDef) and node.name == owner:
+                                    owner_class = node
+                                    break
+                        if owner_function is not None:
+                            target_node = owner_function
+                            arg_names = [a.arg for a in owner_function.args.args]
+                            found_impl = leaf in arg_names
+                        elif owner_class is not None:
+                            for member in owner_class.body:
+                                if (
+                                    isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                    and member.name == leaf
+                                ):
+                                    target_node = member
+                                    found_impl = True
+                                    break
                     elif owner:
                         for node in ast.walk(tree):
                             if isinstance(node, ast.ClassDef) and node.name == owner:

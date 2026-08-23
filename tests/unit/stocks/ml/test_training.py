@@ -110,6 +110,33 @@ class TestDiagnosticsWiring:
         param = sig.parameters["diagnostics"]
         assert param.default is None
 
+
+def test_final_refit_lookback_is_purged_and_keeps_newest_sessions() -> None:
+    from src.stocks.ml.training import _apply_final_refit_lookback
+
+    pre_holdout = pl.DataFrame({"session_index": list(range(1, 401))})
+    train = pre_holdout.with_columns(pl.lit(1.0).alias("net_alpha_target"))
+    request = NetAlphaTrainingRequest(
+        artifact_id="final-refit-lookback",
+        max_training_lookback_sessions=252,
+        embargo_sessions=5,
+    )
+
+    limited = _apply_final_refit_lookback(pre_holdout, train, request, 10)
+
+    assert limited["session_index"].to_list() == list(range(133, 385))
+
+
+def test_final_refit_lookback_none_preserves_training_rows() -> None:
+    from src.stocks.ml.training import _apply_final_refit_lookback
+
+    pre_holdout = pl.DataFrame({"session_index": [1, 2, 3]})
+    request = NetAlphaTrainingRequest(artifact_id="final-refit-expanding")
+
+    result = _apply_final_refit_lookback(pre_holdout, pre_holdout, request, 10)
+
+    assert result.equals(pre_holdout)
+
     def test_backtester_accepts_diagnostics_parameter(self) -> None:
         from src.stocks.backtesting.engine import StockBacktester
         import inspect
