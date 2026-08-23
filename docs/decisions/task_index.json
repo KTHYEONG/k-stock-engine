@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_ALPHA_COMPOUND_TRACK",
+      "date": "2026-08-23",
+      "adr_id": "ADR_20260823_ML_ALPHA_COMPOUND_TRACK",
+      "domain": "ml",
+      "title": "ML frozen compound track and LambdaRank discovery wiring",
+      "why": "Prequential growth-route cash-default masked cell-level fills; Rank-IC ElasticNet MSE could not produce measurable invested compound CAGR for research fitness.",
+      "resolution": "Added frozen-policy compound track (always-invested second series with point CAGR), discovery_model_family on NetAlphaTrainingRequest, and fit_tail_lambdarank_oof dispatch in _fit_oof while preserving live prequential certify_growth_route gates.",
+      "impact": "Research payloads now expose frozen_compound_track scalars alongside prequential rejection evidence; production NO_TRADE promotion semantics unchanged; LambdaRank can replace ElasticNet in discovery when family is set."
+    },
+    {
       "task_id": "TASK_STOCK_LABEL_INTEGRITY_REPAIR",
       "date": "2026-08-23",
       "adr_id": "ADR_20260823_STOCK_LABEL_INTEGRITY_REPAIR",
@@ -989,16 +999,6 @@
       "why": "Research and backtest inputs lacked one immutable catalog binding evidence, canonical panels, features, and labels.",
       "resolution": "Registered available evidence and immutable dataset versions, built provisional base/feature/label panels, created a hash-bound provisional snapshot, and verified bounded reads.",
       "impact": "Research can reproduce a provisional 2016-01-04..2026-03-03 snapshot without changing legacy or existing curated data; research certification remains blocked by incomplete historical evidence, verified corporate actions, and costs."
-    },
-    {
-      "task_id": "TASK_KRX_CALENDAR_RESUMABLE_COLLECTION",
-      "date": "2026-08-10",
-      "adr_id": "ADR_20260810_KRX_CALENDAR_RESUMABLE_COLLECTION",
-      "domain": "stocks",
-      "title": "Resumable KRX calendar collection",
-      "why": "One-shot date-by-date KRX calendar collection could block for hours and left no restartable artifact.",
-      "resolution": "Added monthly atomic calendar partitions, resumable manifest validation, fail-closed merge, and explicit collection/merge CLI commands.",
-      "impact": "Historical KRX session calendar collection can resume after API failures without repeating valid months; final calendars are emitted only after complete partition validation."
     }
   ]
 }
