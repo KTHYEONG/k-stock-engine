@@ -65,7 +65,10 @@ from src.stocks.ml.replay_resources import (
 )
 from src.stocks.ml.telemetry import current_rss_mib as _telemetry_current_rss_mib
 from src.stocks.research.artifacts import ModelArtifactRegistry
-from src.stocks.trading.portfolio_constructor import StockRiskPolicy
+from src.stocks.trading.portfolio_constructor import (
+    PreparedAllocationMarket,
+    StockRiskPolicy,
+)
 from src.stocks.workflows.trading_cycle import (
     TradingCycleRequest,
     TradingCycleResult,
@@ -516,7 +519,12 @@ def _execute_candidate_segment(
         policy=context.execution_policy,
         base_liquidity_model=context.liquidity_model,
         stress_liquidity_model=context.stress_liquidity_model,
-        decision_provider=_decision_provider(segment.scored_market, segment.session_index),
+        decision_provider=_decision_provider(
+            segment.scored_market,
+            segment.session_index,
+            PreparedAllocationMarket.build(segment.scored_market),
+            segment.score_overlay,
+        ),
         scenario_planner=_scenario_planner(context, segment.dataset_hash),
     )
     result = backtester.run_prepared(bt_request, segment.prepared_market, segment.score_overlay)
@@ -915,6 +923,8 @@ def _filled_sessions(result: BacktestResult) -> int:
 def _decision_provider(
     scored_market: pl.DataFrame,
     session_index: _ScoredSessionIndex,
+    allocation_market: PreparedAllocationMarket,
+    score_overlay: np.ndarray,
 ) -> ReplayDecisionProvider:
     def provider(decision_time: datetime, execution_time: datetime) -> PreparedReplayDecision:
         stop = session_index.stop_for(decision_time)
@@ -922,7 +932,22 @@ def _decision_provider(
             visible = scored_market.filter(pl.col("available_time") <= decision_time)
         else:
             visible = scored_market.slice(0, stop)
-        return PreparedReplayDecision(decision_time, execution_time, visible)
+        try:
+            allocation_decision_index = next(
+                index
+                for index, session in enumerate(allocation_market.sessions)
+                if session.date() == decision_time.date()
+            )
+        except StopIteration:
+            allocation_decision_index = None
+        return PreparedReplayDecision(
+            decision_time,
+            execution_time,
+            visible,
+            allocation_market=allocation_market,
+            allocation_decision_index=allocation_decision_index,
+            score_overlay=score_overlay,
+        )
 
     return provider
 

@@ -115,6 +115,11 @@ class PreparedAllocationMarket:
     returns_matrix: np.ndarray
     rows_by_key: Mapping[tuple[str, datetime], int]
     cache_bytes: int
+    expected_active_alpha: np.ndarray
+    expected_net_alpha: np.ndarray
+    alpha_lower_bound: np.ndarray
+    net_alpha_lower_bound: np.ndarray
+    exit_cost_rate: np.ndarray
 
     @property
     def row_count(self) -> int:
@@ -210,6 +215,11 @@ class PreparedAllocationMarket:
                     session_index, instrument_position_of[lo:hi]
                 ] = returns[lo:hi]
         rows_by_key: dict[tuple[str, datetime], int] = {}
+        def economic_column(name: str) -> np.ndarray:
+            if name not in ordered.columns:
+                return np.full(ordered.height, np.nan, dtype=np.float64)
+            return ordered[name].to_numpy().astype(np.float64)
+
         market = cls(
             sessions=sessions,
             session_ranges=ranges,
@@ -230,6 +240,11 @@ class PreparedAllocationMarket:
             returns_matrix=returns_matrix,
             rows_by_key=rows_by_key,
             cache_bytes=int(ordered.estimated_size()),
+            expected_active_alpha=economic_column("expected_active_alpha"),
+            expected_net_alpha=economic_column("expected_net_alpha"),
+            alpha_lower_bound=economic_column("alpha_lower_bound"),
+            net_alpha_lower_bound=economic_column("net_alpha_lower_bound"),
+            exit_cost_rate=economic_column("exit_cost_rate"),
         )
         for i in range(ordered.height):
             rows_by_key[
@@ -583,6 +598,15 @@ def _construct_allocations_prepared(
     econ: dict[str, np.ndarray] | None = None
     if calibration_state is not None:
         econ = _prepared_economics(calibration_state, scores)
+    elif not np.all(np.isnan(market.expected_active_alpha[cs_slice])):
+        econ = {
+            "expected_active_alpha": market.expected_active_alpha[cs_slice],
+            "expected_net_alpha": market.expected_net_alpha[cs_slice],
+            "alpha_lower_bound": market.alpha_lower_bound[cs_slice],
+            "net_alpha_lower_bound": market.net_alpha_lower_bound[cs_slice],
+            "exit_cost_rate": market.exit_cost_rate[cs_slice],
+        }
+    if econ is not None:
         active = econ["expected_active_alpha"]
         net_alpha = econ["expected_net_alpha"]
         lower = econ["alpha_lower_bound"]
