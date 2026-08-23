@@ -414,5 +414,8 @@
   "src/stocks/backtesting/contracts.py": {
     "architecture": "docs/specs/stock_ml_backtesting_performance_architecture.md",
     "testing": "tests/unit/stocks/backtesting/test_contracts.py"
+  },
+  "src/stocks/ml/horizons.py": {
+    "testing": "tests/unit/stocks/ml/test_horizons.py"
   }
 }
