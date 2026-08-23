@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_ML_ROLLING_REFIT_TERMINAL_LEDGER_20260823",
+      "date": "2026-08-23",
+      "adr_id": "ADR_20260823_STOCK_ML_ROLLING_REFIT_TERMINAL_LEDGER_20260823",
+      "domain": "stocks_ml",
+      "title": "Stock ML rolling refit and supervised full-run evidence",
+      "why": "Full ML fitting now completes under a bounded 5-year research window, but final refit needed the same purge-safe rolling cap and the completed run exposed a result-ledger size failure.",
+      "resolution": "Applied the purge-safe max_training_lookback_sessions suffix to final ElasticNet/LightGBM refit, added regression coverage, ran the supervised 2021-01-15..2026-02-23 H10/H20 full candidate, preserved terminal and no-trade artifact evidence, and recorded the ledger persistence limitation.",
+      "impact": "Final refit no longer silently reuses all pre-holdout history; full computation completed with terminal status completed and no-trade economic gates unchanged. Ledger publication remains blocked when the serialized record exceeds 24576 bytes."
+    },
+    {
       "task_id": "TASK_STOCK_ML_FULL_TERMINAL_OBSERVABILITY_20260822",
       "date": "2026-08-22",
       "adr_id": "ADR_20260822_STOCK_ML_FULL_TERMINAL_OBSERVABILITY_20260822",

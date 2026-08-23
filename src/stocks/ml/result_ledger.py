@@ -603,6 +603,9 @@ def _project_request(request: NetAlphaTrainingRequest) -> dict[str, object]:
         "bootstrap_resamples": request.bootstrap_resamples,
         "model_threads": request.model_threads,
         "max_rss_mib": request.max_rss_mib,
+        # NetAlphaTrainingRequest.max_training_lookback_sessions joins the
+        # fingerprint so different rolling fit windows never share an identity.
+        "max_training_lookback_sessions": request.max_training_lookback_sessions,
         "seed": request.seed,
         "portfolio": {
             "top_k": portfolio.top_k,

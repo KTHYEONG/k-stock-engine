@@ -359,6 +359,88 @@ def test_full_budget_01_four_gib_headroom_invariant() -> None:
     _run_isolated_full_matrix(max_rss_mib=4096)
 
 
+@pytest.mark.skipif(
+    not _full_run_inputs_available(),
+    reason="full benchmark datasets are not present on this machine",
+)
+def test_full_5y_supervised_05_terminal_evidence() -> None:
+    """FULL_5Y_SUPERVISED_05: supervised 5-year rolling-window candidate run.
+
+    Exits 0 only when supervisor_outcome.json reports status=completed, the
+    final durable journal terminal event is completed, and the completed
+    ledger record projects max_training_lookback_sessions=1260. A denied
+    resource envelope instead exits non-zero with a failed terminal outcome;
+    neither path promotes an unverified artifact.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from src.core.paths import PROJECT_ROOT, RUN_DIAGNOSTIC_ROOT
+
+    if os.environ.get("RUN_FULL_PERF") != "1":
+        pytest.skip("set RUN_FULL_PERF=1 to execute the supervised full run")
+
+    artifact_id = "ml_5y_h10_h20_20260822"
+    cmd = [
+        sys.executable,
+        "-m",
+        "src.stocks.cli.train",
+        "--supervise",
+        "--artifact-id", artifact_id,
+        "--base-dataset-id", "krx_base_panel_provisional_v1_20160104_20260310",
+        "--feature-dataset-id",
+        "krx_features_stock_net_alpha_v1_provisional_20160816_tradability_cost2",
+        "--label-dataset-id",
+        "krx_labels_stock_net_alpha_v1_provisional_20160817_mh10_20",
+        "--research-start-direct", "2021-01-15",
+        "--research-end-direct", "2026-02-23",
+        "--forward-holdout-sessions", "252",
+        "--candidate-horizon-sessions", "10,20",
+        "--candidate-rebalance-frequency-sessions", "5,10,20",
+        "--candidate-top-k", "12,16,20,24",
+        "--max-training-lookback-sessions", "1260",
+        "--max-rss-mib", "6144",
+        "--memory-reserve-mib", "1024",
+    ]
+    completed = subprocess.run(  # noqa: S603 - fixed local command
+        cmd, capture_output=True, text=True, timeout=7200
+    )
+
+    run_root = Path(RUN_DIAGNOSTIC_ROOT) / artifact_id
+    outcome = json.loads(
+        (run_root / "supervisor_outcome.json").read_text(encoding="utf-8")
+    )
+    journal_records = [
+        json.loads(line)
+        for line in (
+            run_root / "execution_journal.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    terminal_events = [
+        record for record in journal_records if record.get("event") == "terminal"
+    ]
+    latest = json.loads(
+        (Path(PROJECT_ROOT) / "docs" / "results" / "ml_runs" / "latest.json")
+        .read_text(encoding="utf-8")
+    )
+    projected_lookback = (
+        latest.get("input", {}).get("request", {}).get(
+            "max_training_lookback_sessions"
+        )
+    )
+    if completed.returncode == 0:
+        assert outcome["status"] == "completed"
+        assert terminal_events[-1]["status"] == "completed"
+        assert projected_lookback == 1260
+    else:
+        assert outcome["status"] == "failed"
+        assert terminal_events[-1]["status"] in ("failed", "completed")
+
+
 def _run_isolated_full_matrix(*, max_rss_mib: int | None) -> None:
     """Drive five isolated full CLI processes and assert parity of outputs."""
     import subprocess

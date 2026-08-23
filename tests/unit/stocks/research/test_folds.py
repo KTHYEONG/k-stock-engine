@@ -122,6 +122,75 @@ class TestPurgedWalkForward:
         with pytest.raises(ValueError, match="already inspected"):
             splitter.pin_holdout("candidate_v1")
 
+    def test_rolling_lookback_cap_keeps_newest_purged_suffix(self) -> None:
+        """ROLLING_LOOKBACK_01_NEWEST_PURGED_SUFFIX.
+
+        With max_train_sessions=20 every fold keeps at most 20 distinct train
+        sessions, exactly the newest eligible sessions after purge and
+        embargo, and the label interval still terminates before validation.
+        """
+        df = stock_instrument_df(n_sessions=80, n_tickers=2, horizon=5)
+        splitter = PurgedWalkForward(
+            n_folds=3,
+            label_horizon_sessions=5,
+            embargo_sessions=2,
+            session_column="session_index",
+            max_train_sessions=20,
+        )
+
+        folds = splitter.split(df)
+
+        assert folds
+        sessions = sorted(df["session_index"].unique().to_list())
+        for fold in folds:
+            train_sessions = sorted(
+                df[fold.train_mask]["session_index"].unique().to_list()
+            )
+            assert len(train_sessions) <= 20
+            eligible = [
+                s
+                for s in sessions
+                if s + 5 + 2 < fold.validation_decision_start
+            ]
+            assert train_sessions == eligible[-20:]
+            assert fold.train_label_end < fold.validation_decision_start
+
+    def test_lookback_none_matches_expanding_masks(self) -> None:
+        """ROLLING_LOOKBACK_02_NONE_PARITY_AND_REJECTION (None parity).
+
+        ``max_train_sessions=None`` reproduces the expanding splitter's
+        train_mask and validation_mask exactly for every fold.
+        """
+        df = stock_instrument_df(n_sessions=60, n_tickers=3, horizon=5)
+        baseline = PurgedWalkForward(
+            n_folds=3,
+            label_horizon_sessions=5,
+            embargo_sessions=2,
+            session_column="session_index",
+        )
+        none_capped = PurgedWalkForward(
+            n_folds=3,
+            label_horizon_sessions=5,
+            embargo_sessions=2,
+            session_column="session_index",
+            max_train_sessions=None,
+        )
+
+        for base_fold, capped_fold in zip(
+            baseline.split(df), none_capped.split(df), strict=True
+        ):
+            assert capped_fold.train_mask == base_fold.train_mask
+            assert capped_fold.validation_mask == base_fold.validation_mask
+
+    def test_lookback_rejects_non_positive_cap(self) -> None:
+        with pytest.raises(ValueError, match="positive"):
+            PurgedWalkForward(
+                n_folds=2,
+                label_horizon_sessions=5,
+                session_column="session_index",
+                max_train_sessions=0,
+            )
+
     def test_row_index_maps_row_indices_to_sessions(self) -> None:
         df = pl.DataFrame(
             {

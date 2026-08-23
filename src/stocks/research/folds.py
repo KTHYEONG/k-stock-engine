@@ -44,6 +44,9 @@ class PurgedWalkForward:
     touch the validation window is purged, then an additional embargo of
     ``embargo_sessions`` is applied. Training windows expand across folds, and
     the newest block can be pinned as a manifest-guarded holdout.
+    ``max_train_sessions`` optionally bounds each training window to the
+    newest eligible sessions retained after purge and embargo; ``None``
+    preserves the expanding behavior exactly.
     """
 
     def __init__(
@@ -55,6 +58,7 @@ class PurgedWalkForward:
         validation_window_sessions: int | None = None,
         min_train_sessions: int = 0,
         balanced: bool = True,
+        max_train_sessions: int | None = None,
     ):
         if n_folds < 1:
             raise ValueError("n_folds must be positive")
@@ -66,6 +70,8 @@ class PurgedWalkForward:
             raise ValueError("validation_window_sessions must be positive")
         if min_train_sessions < 0:
             raise ValueError("min_train_sessions must be non-negative")
+        if max_train_sessions is not None and max_train_sessions <= 0:
+            raise ValueError("max_train_sessions must be positive")
         self.n_folds = n_folds
         self.label_horizon_sessions = label_horizon_sessions
         self.embargo_sessions = embargo_sessions
@@ -73,6 +79,9 @@ class PurgedWalkForward:
         self.validation_window_sessions = validation_window_sessions
         self.min_train_sessions = min_train_sessions
         self.balanced = balanced
+        # Optional rolling fit window: a finite cap retains only the newest
+        # eligible sessions after purge and embargo; None keeps expanding.
+        self.max_train_sessions = max_train_sessions
         self._inspected_holdout_fingerprints: set[str] = set()
 
     def _validate_no_duplicate_sessions(self, samples: pl.DataFrame) -> None:
@@ -253,6 +262,13 @@ class PurgedWalkForward:
             return None
         if len(train_sessions) < self.min_train_sessions:
             return None
+        if (
+            self.max_train_sessions is not None
+            and len(train_sessions) > self.max_train_sessions
+        ):
+            # Retain only the newest eligible sessions; purge and embargo
+            # invariants are preserved by the truncated suffix.
+            train_sessions = train_sessions[-self.max_train_sessions :]
         train_mask: list[int] = []
         validation_mask: list[int] = []
         for s in train_sessions:
