@@ -587,7 +587,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embargo-sessions", type=int, default=5)
     parser.add_argument("--forward-holdout-sessions", type=int, default=0)
     parser.add_argument("--bootstrap-alpha", type=float, default=0.05)
-    parser.add_argument("--bootstrap-resamples", type=int, default=200)
+    parser.add_argument("--bootstrap-resamples", type=int, default=2000)
     parser.add_argument("--model-threads", type=int, default=4)
     parser.add_argument(
         "--max-rss-mib",
