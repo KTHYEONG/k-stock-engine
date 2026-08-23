@@ -817,7 +817,9 @@ def run_research_only_growth_route(
         decision_time,
         candidate_horizon_sessions=_parse_horizons(parsed.candidate_horizon_sessions),
     )
-    payload = evaluate_growth_route_research(data, request)
+    payload = evaluate_growth_route_research(
+        data, request, registry=ModelArtifactRegistry(parsed.registry)
+    )
     return {
         "status": "RESEARCH_ONLY",
         "artifact_published": False,
