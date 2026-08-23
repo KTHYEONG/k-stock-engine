@@ -426,5 +426,8 @@
   },
   "src/stocks/data/labels.py": {
     "testing": "tests/unit/stocks/data/test_labels.py"
+  },
+  "src/stocks/ml/compound_track.py": {
+    "testing": "tests/unit/stocks/ml/test_compound_track.py"
   }
 }
