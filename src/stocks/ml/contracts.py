@@ -799,3 +799,64 @@ class ModelSelectionEvidence:
             "selection_reasons": list(self.selection_reasons),
             "selected_model": self.selected_model,
         }
+
+
+ELASTIC_NET_FAMILY = "net_alpha_elastic_net"
+TAIL_LAMBDARANK_FAMILY = "economic_tail_lambdarank"
+DECLARED_ECONOMIC_FAMILIES = (ELASTIC_NET_FAMILY, TAIL_LAMBDARANK_FAMILY)
+
+
+@dataclass(frozen=True, slots=True)
+class EconomicFamilyStudySettings:
+    """Immutable pre-registered economic-family study configuration.
+
+    ``candidate_lookback_sessions`` mirrors the temporal-window study: strictly
+    ascending finite session caps with at most one trailing ``None`` for the
+    expanding-window control. ``common_min_train_sessions`` must cover the
+    maximum finite candidate so every window shares one first validation
+    boundary on one common purged fold calendar. ``model_families`` is the
+    pre-registered family order; the first entry wins ties deterministically.
+    """
+
+    candidate_lookback_sessions: tuple[int | None, ...] = (504, 756, 1260, None)
+    common_min_train_sessions: int = 1260
+    min_validation_segment_sessions: int = 126
+    model_families: tuple[str, ...] = DECLARED_ECONOMIC_FAMILIES
+
+    def __post_init__(self) -> None:
+        if not self.candidate_lookback_sessions:
+            raise ValueError("candidate_lookback_sessions must be non-empty")
+        finite = [v for v in self.candidate_lookback_sessions if v is not None]
+        if any(v < 1 for v in finite):
+            raise ValueError("finite candidate lookbacks must be positive sessions")
+        if len(set(finite)) != len(finite) or list(finite) != sorted(finite):
+            raise ValueError(
+                "finite candidate lookbacks must be strictly ascending and unique"
+            )
+        if any(v is None for v in tuple(self.candidate_lookback_sessions)[:-1]):
+            raise ValueError(
+                "expanding (None) is only permitted in the final position"
+            )
+        if self.common_min_train_sessions < 1:
+            raise ValueError("common_min_train_sessions must be positive")
+        if self.min_validation_segment_sessions < 1:
+            raise ValueError("min_validation_segment_sessions must be positive")
+        if finite and self.common_min_train_sessions < max(finite):
+            raise ValueError(
+                "common_min_train_sessions must be at least the maximum "
+                "finite candidate lookback"
+            )
+        if not self.model_families:
+            raise ValueError("model_families must be non-empty")
+        if len(set(self.model_families)) != len(self.model_families):
+            raise ValueError("model_families must be unique")
+        unknown = [
+            family
+            for family in self.model_families
+            if family not in DECLARED_ECONOMIC_FAMILIES
+        ]
+        if unknown:
+            raise ValueError(
+                f"unknown model families {unknown}; declared families are "
+                f"{DECLARED_ECONOMIC_FAMILIES}"
+            )
