@@ -59,6 +59,26 @@ def weekdays(n: int = 20) -> list[date]:
 SESSIONS = weekdays(20)
 
 
+def _no_action_interval_records(
+    tickers: tuple[str, ...],
+    sessions: list[date],
+    *,
+    max_pair: int | None = None,
+) -> list[dict[str, str]]:
+    """One no-action record per (ticker, adjacent session pair) for fixtures."""
+    upper = len(sessions) - 1 if max_pair is None else min(max_pair, len(sessions) - 1)
+    return [
+        {
+            "instrument_id": ticker,
+            "previous_session": sessions[p].isoformat(),
+            "session": sessions[p + 1].isoformat(),
+            "action_code": "no_action",
+        }
+        for ticker in tickers
+        for p in range(max(0, upper))
+    ]
+
+
 def test_materialization_uses_projection() -> None:
     """The request contract makes raw and compact outcome sources exclusive."""
     # materialization_uses_projection
@@ -739,7 +759,17 @@ class TestMaterializeSnapshot:
             registered_at=GENERATED,
         )
         action_path = tmp_path / "actions.json"
-        action_path.write_text(json.dumps({"version": "fixture"}), encoding="utf-8")
+        action_tickers = tuple(f"KRX:{i:06d}" for i in range(1, 61))
+        action_path.write_text(
+            json.dumps(
+                {
+                    "version": "fixture-actions-v1",
+                    "generated_time": GENERATED.isoformat(),
+                    "intervals": _no_action_interval_records(action_tickers, sessions),
+                }
+            ),
+            encoding="utf-8",
+        )
         action_entry = register_file_evidence(
             store,
             kind=CatalogKind.CORPORATE_ACTIONS,
@@ -828,6 +858,26 @@ class TestMaterializeSnapshot:
         )
         assert composed.frame.height > 0
         assert "outcome_status" in composed.frame.columns
+
+        # The complete no-action snapshot's content hash is bound into the
+        # label/status/evidence provenance.
+        from src.stocks.data.evidence import load_corporate_action_snapshot
+
+        action_calendar = KRXSessionCalendar(
+            version="fixture-calendar",
+            sessions=tuple(sessions),
+            generated_time=GENERATED,
+        )
+        expected_hash = load_corporate_action_snapshot(action_path, action_calendar).content_hash
+        for dataset_id in (
+            "labels_na",
+            "labels_na_outcome_status",
+            "labels_na_outcome_evidence",
+        ):
+            payload = json.loads(
+                (label_root / dataset_id / "content_manifest.json").read_text()
+            )
+            assert payload.get("corporate_actions_hash") == expected_hash
 
     def test_existing_id_creates_no_manifest_or_catalog_append(self, tmp_path) -> None:
         base_root = tmp_path / "base"
@@ -1181,7 +1231,16 @@ def test_net_alpha_materialization_rejects_non_ready_research_snapshot(tmp_path)
         registered_at=GENERATED,
     )
     action_path = tmp_path / "actions.json"
-    action_path.write_text(json.dumps({"version": "fixture"}), encoding="utf-8")
+    action_path.write_text(
+        json.dumps(
+            {
+                "version": "fixture-actions-v1",
+                "generated_time": GENERATED.isoformat(),
+                "intervals": _no_action_interval_records(tickers, sessions),
+            }
+        ),
+        encoding="utf-8",
+    )
     action_entry = register_file_evidence(
         store,
         kind=CatalogKind.CORPORATE_ACTIONS,
@@ -1229,3 +1288,284 @@ def test_net_alpha_materialization_rejects_non_ready_research_snapshot(tmp_path)
     assert not (catalog_root / "snapshots" / "snap_na_r" / "snapshot_manifest.json").exists()
     resolved = SnapshotResolver(store).resolve("source_snap_na_r")
     assert resolved is not None
+
+
+def _na_integrity_setup(tmp_path: Path, *, mode: str) -> dict[str, object]:
+    """Compact net-alpha source snapshot with configurable action provenance."""
+    sessions = weekdays(40)
+    tickers = tuple(f"KRX:{i:06d}" for i in range(1, 33))
+    windows = ResearchWindows(
+        train=CoverageRange(sessions[2], sessions[15]),
+        validation=CoverageRange(sessions[16], sessions[20]),
+        test=CoverageRange(sessions[21], sessions[25]),
+    )
+    base_root = tmp_path / f"base_{mode}"
+    feature_root = tmp_path / f"features_{mode}"
+    label_root = tmp_path / f"labels_{mode}"
+    catalog_root = tmp_path / f"catalog_{mode}"
+    rows: list[dict[str, object]] = []
+    for t, ticker in enumerate(tickers):
+        for s, session in enumerate(sessions):
+            open_price = 100.0 + float(s) + float(t % 7)
+            row: dict[str, object] = {
+                "instrument_id": ticker,
+                "session": session_dt(session),
+                "observation_time": datetime.combine(session, time(15, 30), tzinfo=UTC),
+                "available_time": datetime.combine(session, time(15, 31), tzinfo=UTC),
+                "open": open_price,
+                "high": open_price + 1.0,
+                "low": max(1.0, open_price - 1.0),
+                "close": open_price + 0.5,
+                "volume": 1_000_000.0,
+                "trading_value": open_price * 1_000_000.0,
+                "market_cap": 1e12 + float(t) * 1e9,
+                "sector": f"S{t % 4}",
+                "action_interval_covered": True,
+                "data_quality_status": "eligible",
+                "data_quality_reason": None,
+                "raw__adtv_20d": 1.0e8 + float(s) * 1.0e6,
+                "raw__volatility_20d": 0.02 + float(t % 5) * 0.005,
+            }
+            for j, name in enumerate(stock_alpha_v2_allowlist()):
+                if name not in ("adtv_20d", "volatility_20d"):
+                    row[f"raw__{name}"] = float((t * 31 + s * 7 + j) % 50) / 10.0
+            rows.append(row)
+    base_frame = pl.DataFrame(rows)
+    base_manifest = make_manifest(
+        asset_kind=AssetKind.STOCK,
+        columns=base_frame.columns,
+        feature_set="base_panel",
+        label_definition="none",
+        label_horizon_sessions=1,
+        time_start=session_dt(sessions[0]),
+        time_end=session_dt(sessions[-1]),
+        provider_version="fixture",
+        universe_policy_version="fixture",
+        row_count=base_frame.height,
+        generated_time=GENERATED,
+        schema_version="v2",
+        content_hash=canonical_content_hash(base_frame, base_frame.columns),
+        storage_layout=HIVE_PARTITION_LAYOUT,
+    )
+    ParquetDatasetStore(base_root).write_partitioned(
+        base_frame,
+        dataset_id="base_na3",
+        manifest=base_manifest,
+        expected_feature_set="base_panel",
+        decision_time=GENERATED,
+        content_manifest={"fixture": True},
+    )
+    store = CatalogStore(catalog_root)
+    base_entry = CatalogEntry(
+        kind=CatalogKind.BASE_PANEL,
+        name="base_na3",
+        content_hash=ParquetDatasetStore(base_root)
+        .read_manifest("base_na3")
+        .content_hash,
+        schema_hash="schema",
+        registered_at=GENERATED,
+        coverage=CoverageRange(sessions[0], sessions[-1]),
+        completeness=EvidenceCompleteness.COMPLETE,
+        path=str(base_root / "base_na3"),
+    )
+    store.register(base_entry)
+    calendar_path = tmp_path / f"calendar_{mode}.json"
+    calendar_path.write_text(
+        json.dumps(
+            {
+                "version": "fixture-calendar",
+                "sessions": [d.isoformat() for d in sessions],
+                "generated_time": GENERATED.isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    references: list[CatalogEntry] = [base_entry]
+    references.append(
+        register_file_evidence(
+            store,
+            kind=CatalogKind.CALENDAR,
+            name=f"calendar_na3_{mode}",
+            path=calendar_path,
+            coverage=CoverageRange(sessions[0], sessions[-1]),
+            completeness=EvidenceCompleteness.COMPLETE,
+            registered_at=GENERATED,
+        )
+    )
+    cost_path = tmp_path / f"costs_{mode}.json"
+    cost_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "coverage": {"start": sessions[0].isoformat(), "end": sessions[-1].isoformat()},
+                "assumption_id": "test_kis_v1",
+                "sources": [
+                    {"uri": "https://law.go.kr/fixture", "retrieved_at": GENERATED.isoformat(), "content_hash": "h" * 64}
+                ],
+                "commission": [
+                    {"effective_from": sessions[0].isoformat(), "buy_rate": 0.000036396, "sell_rate": 0.000036396}
+                ],
+                "sell_taxes": [
+                    {"effective_from": sessions[0].isoformat(), "market": "KOSPI", "securities_transaction_tax_rate": 0.0003, "rural_special_tax_rate": 0.0015, "sell_tax_rate": 0.0018, "source_uri": "https://law.go.kr/fixture", "source_hash": "h" * 64},
+                    {"effective_from": sessions[0].isoformat(), "market": "KOSDAQ", "securities_transaction_tax_rate": 0.0018, "rural_special_tax_rate": 0.0, "sell_tax_rate": 0.0018, "source_uri": "https://law.go.kr/fixture", "source_hash": "h" * 64},
+                ],
+                "tick_size_rules": [
+                    {"rule_id": f"krx_{i}", "effective_from": sessions[0].isoformat(), "lower_inclusive": lo, "upper_exclusive": hi, "tick": tick}
+                    for i, (lo, hi, tick) in enumerate(
+                        ((0.0, 1000.0, 1.0), (1000.0, 5000.0, 5.0), (5000.0, 10000.0, 10.0), (10000.0, 50000.0, 50.0), (50000.0, 100000.0, 100.0), (100000.0, 500000.0, 500.0), (500000.0, None, 1000.0))
+                    )
+                ],
+                "liquidity_model": {"model_id": "sqrt_impact_v1", "impact_coefficient": 0.1, "stress_multiplier": 1.5},
+                "settlement_days": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+    references.append(
+        register_file_evidence(
+            store,
+            kind=CatalogKind.COSTS,
+            name=f"costs_na3_{mode}",
+            path=cost_path,
+            coverage=CoverageRange(sessions[0], sessions[-1]),
+            completeness=EvidenceCompleteness.COMPLETE,
+            registered_at=GENERATED,
+        )
+    )
+    master_path = tmp_path / f"master_{mode}.json"
+    master_path.write_text(json.dumps({"version": "fixture"}), encoding="utf-8")
+    references.append(
+        register_file_evidence(
+            store,
+            kind=CatalogKind.INSTRUMENT_MASTER,
+            name=f"master_na3_{mode}",
+            path=master_path,
+            coverage=CoverageRange(sessions[0], sessions[-1]),
+            completeness=EvidenceCompleteness.COMPLETE,
+            registered_at=GENERATED,
+        )
+    )
+    if mode != "absent":
+        if mode == "incompatible":
+            payload: dict[str, object] = {"version": "fixture"}
+        elif mode == "partial":
+            payload = {
+                "version": "partial-actions-v1",
+                "generated_time": GENERATED.isoformat(),
+                "intervals": _no_action_interval_records(tickers, sessions, max_pair=15),
+            }
+        else:
+            payload = {
+                "version": "full-actions-v1",
+                "generated_time": GENERATED.isoformat(),
+                "intervals": _no_action_interval_records(tickers, sessions),
+            }
+        actions_path = tmp_path / f"actions_{mode}.json"
+        actions_path.write_text(json.dumps(payload), encoding="utf-8")
+        references.append(
+            register_file_evidence(
+                store,
+                kind=CatalogKind.CORPORATE_ACTIONS,
+                name=f"actions_na3_{mode}",
+                path=actions_path,
+                coverage=CoverageRange(sessions[0], sessions[-1]),
+                completeness=EvidenceCompleteness.COMPLETE,
+                registered_at=GENERATED,
+            )
+        )
+    manifest = build_snapshot_manifest(
+        snapshot_id="source_snap_na3",
+        certification=DatasetCertification.PROVISIONAL,
+        timing_convention=TimingConvention.DECISION_AFTER_CLOSE_EXECUTE_NEXT_OPEN,
+        windows=windows,
+        references=tuple(references),
+    )
+    manifest_path = (
+        catalog_root / "snapshots" / "source_snap_na3" / "snapshot_manifest.json"
+    )
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(manifest.to_json(), sort_keys=True, indent=2),
+        encoding="utf-8",
+    )
+    return {
+        "catalog_root": catalog_root,
+        "base_root": base_root,
+        "feature_root": feature_root,
+        "label_root": label_root,
+        "calendar_path": calendar_path,
+        "windows": windows,
+        "sessions": sessions,
+    }
+
+
+def test_LABEL_INTEGRITY_03_snapshot_provenance_required(tmp_path) -> None:
+    """LABEL_INTEGRITY_03_SNAPSHOT_PROVENANCE_REQUIRED.
+
+    Materialization rejects absent, incompatible, and coverage-incomplete
+    corporate-action provenance before any label/status/evidence dataset is
+    written; a complete no-action snapshot reaches the label builder and its
+    content hash is bound into all three published provenances.
+    """
+    from src.stocks.data.evidence import load_corporate_action_snapshot
+    from src.stocks.data.research_v2 import (
+        NetAlphaMaterializationRequest,
+        materialize_net_alpha_snapshot,
+    )
+
+    def attempt(setup: dict[str, object]) -> None:
+        materialize_net_alpha_snapshot(
+            NetAlphaMaterializationRequest(
+                source_snapshot_id="source_snap_na3",
+                feature_dataset_id="features_na3",
+                label_dataset_id="labels_na3",
+                snapshot_id="snap_na3",
+                catalog_root=Path(str(setup["catalog_root"])),
+                base_root=Path(str(setup["base_root"])),
+                feature_root=Path(str(setup["feature_root"])),
+                label_root=Path(str(setup["label_root"])),
+                generated_time=GENERATED,
+                windows=setup["windows"],
+                certification=DatasetCertification.PROVISIONAL,
+                calendar_path=Path(str(setup["calendar_path"])),
+                candidate_horizon_sessions=(3, 5),
+                reference_notional=1.0e6,
+            )
+        )
+
+    for mode in ("absent", "incompatible", "partial"):
+        setup = _na_integrity_setup(tmp_path, mode=mode)
+        with pytest.raises(ValueError, match="corporate-action-coverage-required"):
+            attempt(setup)
+        label_root = Path(str(setup["label_root"]))
+        assert not label_root.exists() or not list(label_root.glob("labels_na3*"))
+        catalog_root = Path(str(setup["catalog_root"]))
+        assert not (catalog_root / "snapshots" / "snap_na3").exists()
+        assert CatalogStore(catalog_root).get(CatalogKind.LABELS, "labels_na3") is None
+        assert (
+            CatalogStore(catalog_root).get(
+                CatalogKind.OUTCOME_STATUS, "labels_na3_outcome_status"
+            )
+            is None
+        )
+
+    complete = _na_integrity_setup(tmp_path, mode="full")
+    attempt(complete)
+    action_calendar = KRXSessionCalendar(
+        version="fixture-calendar",
+        sessions=tuple(complete["sessions"]),
+        generated_time=GENERATED,
+    )
+    expected_hash = load_corporate_action_snapshot(
+        tmp_path / "actions_full.json", action_calendar
+    ).content_hash
+    complete_label_root = Path(str(complete["label_root"]))
+    for dataset_id in (
+        "labels_na3",
+        "labels_na3_outcome_status",
+        "labels_na3_outcome_evidence",
+    ):
+        payload = json.loads(
+            (complete_label_root / dataset_id / "content_manifest.json").read_text()
+        )
+        assert payload.get("corporate_actions_hash") == expected_hash

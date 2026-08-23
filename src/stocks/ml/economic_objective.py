@@ -4,9 +4,12 @@
 ``risk_residual - reference_cost`` per decision session; ties break by
 ascending ``instrument_id`` and any missing, non-finite, or undersized
 cross-section fails closed. ``measure_tail_capture`` compares model-selected
-top-K mean log utility with the same-session oracle top-K and the full
-universe, emitting bounded scalar evidence only. Relevance is an ordering
-target, never realised PnL.
+top-K arithmetic mean residual utility with the same-session oracle top-K and
+the full universe, emitting bounded scalar evidence only. The residual is a
+cross-sectional ordering/utility proxy, never a portfolio return: no
+``log1p`` growth operation exists here, and exact execution-ledger equity is
+the only compound-growth evidence. Relevance is an ordering target, never
+realised PnL.
 """
 from __future__ import annotations
 
@@ -24,11 +27,16 @@ from src.stocks.ml.labels import (
 from src.stocks.ml.models import SCORE_COLUMN
 
 __all__ = [
+    "InvalidOofEconomicUtilityError",
     "SegmentTailEvidence",
     "TailCaptureEvidence",
     "build_tail_relevance",
     "measure_tail_capture",
 ]
+
+
+class InvalidOofEconomicUtilityError(ValueError):
+    """A score-label join carried null or non-finite residual/cost utility."""
 
 _RELEVANCE_COLUMN = "relevance"
 _SEGMENT_COLUMN_CANDIDATES = ("oof_segment_id",)
@@ -43,20 +51,19 @@ def _require_columns(frame: pl.DataFrame, columns: tuple[str, ...], role: str) -
 
 
 def _decimal_utility(frame: pl.DataFrame) -> pl.Series:
+    """Arithmetic decimal residual utility; rankable on the whole real line."""
     values = (
         pl.col(RISK_RESIDUAL_COLUMN) - pl.col(REFERENCE_COST_COLUMN)
     ).alias("__utility")
     series = frame.select(values)["__utility"].cast(pl.Float64)
     if series.null_count() > 0:
-        raise ValueError(
+        raise InvalidOofEconomicUtilityError(
             "economic utility has null risk_residual/reference_cost rows; "
             "a missing realized outcome must fail closed"
         )
     array = series.to_numpy()
     if not np.all(np.isfinite(array)):
-        raise ValueError("economic utility must be finite")
-    if np.any(array <= -1.0):
-        raise ValueError("economic utility <= -1 cannot form log utility")
+        raise InvalidOofEconomicUtilityError("economic utility must be finite")
     return series
 
 
@@ -101,8 +108,8 @@ class SegmentTailEvidence:
 
     segment_id: int
     session_count: int
-    model_excess_log_growth: float
-    oracle_excess_log_growth: float
+    model_excess_utility: float
+    oracle_excess_utility: float
     tail_capture_ratio: float | None
     positive_session_fraction: float
 
@@ -111,16 +118,17 @@ class SegmentTailEvidence:
 class TailCaptureEvidence:
     """Bounded tail-capture comparison of model top-K versus oracle and universe.
 
-    Excesses are the mean per-session ``(top-K mean log utility) - (universe
-    mean log utility)``. ``tail_excess_lower_bound`` is the seeded
-    cluster-bootstrap lower quantile of the model excess; Rank IC is
+    Excesses are the mean per-session ``(top-K mean decimal residual utility)
+    - (universe mean residual utility)`` computed arithmetically; they are
+    never compound-growth quantities. ``tail_excess_lower_bound`` is the seeded
+    cluster-bootstrap lower quantile of the model excess utility; Rank IC is
     deliberately absent because it is observability only.
     """
 
     top_k: int
     session_count: int
-    model_excess_log_growth: float
-    oracle_excess_log_growth: float
+    model_excess_utility: float
+    oracle_excess_utility: float
     tail_capture_ratio: float | None
     positive_session_fraction: float
     tail_excess_lower_bound: float
@@ -131,7 +139,7 @@ class TailCaptureEvidence:
 
     @property
     def oracle_capacity_ok(self) -> bool:
-        return self.oracle_excess_log_growth > 0.0
+        return self.oracle_excess_utility > 0.0
 
     @property
     def tail_gate_ok(self) -> bool:
@@ -169,16 +177,22 @@ def measure_tail_capture(
     segment_column = next(
         (c for c in _SEGMENT_COLUMN_CANDIDATES if c in scored.columns), None
     )
-    label_utility = labels.select(
-        pl.col(ID_COLUMN),
-        pl.col(SESSION_COLUMN),
-        _decimal_utility(labels),
+    # Validate utility only on rows the join actually produces: locked-holdout
+    # labels never influence runtime research evidence.
+    joined = scored.join(
+        labels.select(
+            pl.col(ID_COLUMN),
+            pl.col(SESSION_COLUMN),
+            pl.col(RISK_RESIDUAL_COLUMN),
+            pl.col(REFERENCE_COST_COLUMN),
+        ),
+        on=[ID_COLUMN, SESSION_COLUMN],
+        how="inner",
     )
-    joined = scored.join(label_utility, on=[ID_COLUMN, SESSION_COLUMN], how="inner")
     if joined.is_empty():
         raise ValueError("scored-label join is empty")
 
-    utility = joined["__utility"].to_numpy()
+    utility = _decimal_utility(joined).to_numpy()
     scores = joined[SCORE_COLUMN].cast(pl.Float64).to_numpy()
     ids = joined[ID_COLUMN].to_numpy()
     sessions = joined[SESSION_COLUMN].to_numpy()
@@ -232,8 +246,8 @@ def measure_tail_capture(
             SegmentTailEvidence(
                 segment_id=int(cluster),
                 session_count=int(cluster_counts[local_index]),
-                model_excess_log_growth=model_c,
-                oracle_excess_log_growth=oracle_c,
+                model_excess_utility=model_c,
+                oracle_excess_utility=oracle_c,
                 tail_capture_ratio=(
                     model_c / oracle_c if oracle_c > 0.0 else None
                 ),
@@ -253,8 +267,8 @@ def measure_tail_capture(
     return TailCaptureEvidence(
         top_k=int(top_k),
         session_count=int(model_excess.size),
-        model_excess_log_growth=total_model,
-        oracle_excess_log_growth=total_oracle,
+        model_excess_utility=total_model,
+        oracle_excess_utility=total_oracle,
         tail_capture_ratio=(
             total_model / total_oracle if total_oracle > 0.0 else None
         ),

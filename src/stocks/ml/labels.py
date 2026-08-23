@@ -6,8 +6,8 @@ inner-joined into a common universe, so the trainer records per-horizon label
 universes instead of shrinking the sample. The target is the session-robust
 continuous net residual:
 
-``net_alpha_target(i,t,h) = robust_zscore_session(log(adjusted_open(i,t+h) /
-adjusted_open(i,t+1)) - point_in_time_risk_projection(i,t,h) -
+``net_alpha_target(i,t,h) = robust_zscore_session((adjusted_open(i,t+h) /
+adjusted_open(i,t+1)) - 1 - point_in_time_risk_projection(i,t,h) -
 reference_round_trip_cost(i,t,h))``
 
 The label frame schema is ``instrument_id, decision_session, horizon_sessions,
@@ -41,7 +41,7 @@ from src.stocks.data.labels import (
     NET_ALPHA_TARGET_PREFIX,
     build_net_alpha_label_dataset_with_status,
 )
-from src.stocks.data.quality import KRXSessionCalendar
+from src.stocks.data.quality import CorporateActionSnapshot, KRXSessionCalendar
 from src.stocks.domain.execution_policy import ExecutionOutcomePolicy
 from src.stocks.ml.contracts import (
     OUTCOME_STATUS_COLUMN,
@@ -125,6 +125,7 @@ def build_partitioned_net_alpha_labels_with_status(
     policy: ExecutionOutcomePolicy | None = None,
     bar_evidence: pl.DataFrame | None = None,
     tradability_events: pl.DataFrame | None = None,
+    corporate_actions: CorporateActionSnapshot | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Build the long net-alpha label frame and its hash-bound status sidecar.
 
@@ -132,7 +133,10 @@ def build_partitioned_net_alpha_labels_with_status(
     exactly one row per ``(instrument_id, decision_session, horizon_sessions)``
     in the decision universe with a typed outcome state, so the trainer never
     has to infer why a key lacks a realised label. ``policy`` is the immutable
-    execution policy shared with the replay and backtester.
+    execution policy shared with the replay and backtester. When
+    ``corporate_actions`` is supplied, paths crossing an action or uncovered
+    interval emit ``UNSUPPORTED_CORPORATE_ACTION`` and never a realised label;
+    labels are simple decimal rates (``exit_open / entry_open - 1``).
     """
     if not horizon_sessions:
         raise ValueError("horizon_sessions must be non-empty")
@@ -157,6 +161,7 @@ def build_partitioned_net_alpha_labels_with_status(
             policy=policy,
             bar_evidence=bar_evidence,
             tradability_events=tradability_events,
+            corporate_actions=corporate_actions,
         )
         status_frames.append(
             status.select(
@@ -234,6 +239,7 @@ def publish_outcome_status_sidecar(
     certification: DatasetCertification = DatasetCertification.PROVISIONAL,
     generated_time: datetime | None = None,
     policy: ExecutionOutcomePolicy | None = None,
+    corporate_actions_hash: str | None = None,
 ) -> NetAlphaLabelDatasetResult:
     """Publish the hash-bound per-key outcome-status sidecar dataset.
 
@@ -242,7 +248,9 @@ def publish_outcome_status_sidecar(
     universe, partitioned like the label dataset. Its manifest binds the exact
     column order and values through the schema/content hashes and, when
     ``policy`` is supplied, pins the immutable execution policy id and hash so
-    no consumer can silently classify outcomes under a different policy.
+    no consumer can silently classify outcomes under a different policy. When
+    ``corporate_actions_hash`` is supplied it binds the exact action snapshot
+    that gated every realised label.
     """
     if status_frame.is_empty():
         raise ValueError("cannot publish an empty outcome-status sidecar")
@@ -309,6 +317,8 @@ def publish_outcome_status_sidecar(
     if policy is not None:
         content_manifest["policy_id"] = policy.policy_id
         content_manifest["policy_hash"] = policy.canonical_hash
+    if corporate_actions_hash is not None:
+        content_manifest["corporate_actions_hash"] = corporate_actions_hash
     store = ParquetDatasetStore(Path(destination_root))
     dataset_dir = store.write_partitioned(
         status_frame,
@@ -369,13 +379,15 @@ def publish_partitioned_net_alpha_label_dataset(
     universe_policy_version: str = "provisional-legacy",
     certification: DatasetCertification = DatasetCertification.PROVISIONAL,
     generated_time: datetime | None = None,
+    corporate_actions_hash: str | None = None,
 ) -> NetAlphaLabelDatasetResult:
     """Publish the long, ``horizon_sessions``-partitioned net-alpha label dataset.
 
     The manifest declares ``label_definition="net_alpha_o2o"`` with the control
     horizon (first candidate) and records the horizon set and net-alpha
     algorithm version in the content manifest. The schema/content hashes bind
-    the exact column order and values.
+    the exact column order and values, and ``corporate_actions_hash`` binds the
+    action snapshot that gated every realised row.
     """
     if not horizon_sessions:
         raise ValueError("horizon_sessions must be non-empty")
@@ -440,6 +452,8 @@ def publish_partitioned_net_alpha_label_dataset(
         "generated_time": generated_time.isoformat(),
         "label_algorithm_version": NET_ALPHA_ALGORITHM_VERSION,
     }
+    if corporate_actions_hash is not None:
+        content_manifest["corporate_actions_hash"] = corporate_actions_hash
     store = ParquetDatasetStore(Path(destination_root))
     dataset_dir = store.write_partitioned(
         labels_frame,
