@@ -417,5 +417,8 @@
   },
   "src/stocks/ml/horizons.py": {
     "testing": "tests/unit/stocks/ml/test_horizons.py"
+  },
+  "src/stocks/ml/window_research.py": {
+    "testing": "tests/unit/stocks/ml/test_window_research.py"
   }
 }
