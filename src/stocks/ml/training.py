@@ -3576,6 +3576,7 @@ def evaluate_growth_route_research(
     request: NetAlphaTrainingRequest,
     *,
     registry: ModelArtifactRegistry,
+    min_oof_train_sessions: int | None = None,
 ) -> dict[str, object]:
     """Read-only growth-route evaluation over one data snapshot.
 
@@ -3583,6 +3584,9 @@ def evaluate_growth_route_research(
     route, certifies it, and returns a bounded payload. Nothing is published:
     no artifact, no manifest, no registry write. Every fail-closed gate emits
     a normalized rejection reason instead of fabricated growth.
+    ``min_oof_train_sessions`` optionally raises the splitter's shared warm-up
+    floor so multi-window studies share one first validation boundary; the
+    ``None`` default preserves every existing caller and fold plan exactly.
     """
     frame = data.feature_frame
     raw_panel = _index_sessions(frame)
@@ -3601,12 +3605,15 @@ def evaluate_growth_route_research(
     learner_columns = schema.learner_columns
     if not learner_columns:
         return _growth_route_research_rejection("no-alpha-learner-columns")
+    min_train_sessions = request.compounding.annualization_sessions
+    if min_oof_train_sessions is not None:
+        min_train_sessions = max(min_train_sessions, int(min_oof_train_sessions))
     splitter = PurgedWalkForward(
         n_folds=request.fold_count,
         label_horizon_sessions=max(request.candidate_horizon_sessions) + 1,
         embargo_sessions=request.embargo_sessions,
         session_column=_SESSION_IDX,
-        min_train_sessions=request.compounding.annualization_sessions,
+        min_train_sessions=min_train_sessions,
         max_train_sessions=request.max_training_lookback_sessions,
     )
     folds = splitter.split(pre_holdout)
