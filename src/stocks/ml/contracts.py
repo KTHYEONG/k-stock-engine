@@ -412,7 +412,7 @@ class NetAlphaTrainingRequest:
     embargo_sessions: int = 5
     forward_holdout_sessions: int = 0
     bootstrap_alpha: float = 0.05
-    bootstrap_resamples: int = 200
+    bootstrap_resamples: int = 2000
     model_threads: int = 1
     max_rss_mib: int | None = None
     memory_reserve_mib: int = 0
