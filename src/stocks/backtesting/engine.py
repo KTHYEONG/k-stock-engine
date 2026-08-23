@@ -147,6 +147,9 @@ class PreparedReplayDecision:
     visible: pl.DataFrame
     calibration_state: dict[str, object] | None = None
     reason: str | None = None
+    allocation_market: Any | None = None
+    allocation_decision_index: int | None = None
+    score_overlay: np.ndarray | None = None
 
 
 class StockBacktester:

@@ -3574,6 +3574,8 @@ def _attach_growth_route_execution_evidence(
 def evaluate_growth_route_research(
     data: NetAlphaResearchData,
     request: NetAlphaTrainingRequest,
+    *,
+    registry: ModelArtifactRegistry,
 ) -> dict[str, object]:
     """Read-only growth-route evaluation over one data snapshot.
 
@@ -3613,7 +3615,8 @@ def evaluate_growth_route_research(
     cache = _OofCache(_default_oof_cache_base())
     try:
         discovery = _build_horizon_evidence(
-            pre_holdout, folds, data, request, learner_columns, oof_cache=cache,
+            pre_holdout, folds, data, request, learner_columns,
+            registry=registry, oof_cache=cache,
         )
     except (_MemoryBudgetExceededError, _EnvelopeBudgetError) as exc:
         stage = str(getattr(exc, "stage", "") or "fitting_workspace")
