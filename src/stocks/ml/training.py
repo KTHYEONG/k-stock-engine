@@ -44,8 +44,15 @@ from src.core.portfolio import PortfolioSnapshot
 from src.stocks.data.ml_integrity import validate_ml_snapshot
 from src.stocks.data.quality import KRXSessionCalendar
 from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
+from src.stocks.ml.compound_track import (
+    frozen_compound_track_projection,
+    resolve_frozen_policy_key,
+    stitch_frozen_policy_growth_route,
+)
 from src.stocks.ml.contracts import (
     CANONICAL_FEATURE_SET,
+    ELASTIC_NET_FAMILY,
+    TAIL_LAMBDARANK_FAMILY,
     FoldScoreDiagnostic,
     HorizonOOFDiagnostic,
     NetAlphaResearchData,
@@ -654,6 +661,7 @@ def _run_discovery_and_publish(
     )
     certificate = certify_growth_route(route, primary, request.compounding)
     growth_route = _growth_route_projection(route, certificate)
+    _attach_frozen_compound_track(growth_route, discovery.evidence, request)
     route_reasons = certificate.get("reasons")
     reason_list = (
         [str(reason) for reason in route_reasons]
@@ -1877,7 +1885,7 @@ def _build_horizon_evidence(
         oof, oof_labels, ics, diagnostic, fold_path_count = _fit_oof(
             pre_holdout, folds, data, request, manifest, learner_columns,
             horizon, None,
-            family="net_alpha_elastic_net",
+            family=request.discovery_model_family,
             matrix=matrix,
         )
         path_evaluation_count += fold_path_count
@@ -2534,9 +2542,9 @@ def _fit_oof(
         prepare_training_matrix,
     )
 
-    if family != "net_alpha_elastic_net":
+    if family not in (ELASTIC_NET_FAMILY, TAIL_LAMBDARANK_FAMILY):
         raise ValueError(
-            "prepared-array OOF fitting owns the elastic baseline family only; "
+            "prepared-array OOF fitting owns the declared economic families only; "
             f"got {family!r}"
         )
     if not folds:
@@ -2547,6 +2555,32 @@ def _fit_oof(
             fold_diagnostics=(),
         )
         return empty, empty, [], diagnostic, 0
+
+    if family == TAIL_LAMBDARANK_FAMILY:
+        from src.stocks.ml.economic_research import fit_tail_lambdarank_oof
+
+        ks = [
+            int(k)
+            for h, _cadence, k in request.execution_frontier.feasible_cells(
+                request.portfolio.max_exposure,
+                request.portfolio.max_single_weight,
+            )
+            if h == horizon_sessions
+        ]
+        if not ks:
+            raise ValueError(
+                "tail LambdaRank OOF requires a feasible K cell at "
+                f"horizon {horizon_sessions}"
+            )
+        oof, labeled = fit_tail_lambdarank_oof(
+            pre_holdout, folds, data, request, learner_columns,
+            horizon_sessions, min(ks),
+        )
+        diagnostic = HorizonOOFDiagnostic(
+            horizon_sessions=horizon_sessions,
+            model_family=family,
+        )
+        return oof, labeled, [], diagnostic, 0
 
     if matrix is None:
         matrix = prepare_training_matrix(
@@ -3480,6 +3514,28 @@ def _growth_route_projection(
     }
 
 
+def _attach_frozen_compound_track(
+    growth_route: dict[str, object],
+    evidence: tuple[HorizonOOFEvidence, ...],
+    request: NetAlphaTrainingRequest,
+) -> None:
+    """Attach the always-invested frozen research track as bounded scalars.
+
+    Research observability only: a missing frozen cell is omitted, never a
+    ``_publish_no_trade`` reason, and the live prequential gate stays intact.
+    """
+    try:
+        frozen = stitch_frozen_policy_growth_route(
+            evidence, resolve_frozen_policy_key(request)
+        )
+    except ValueError:
+        return
+    growth_route["frozen_compound_track"] = frozen_compound_track_projection(
+        frozen,
+        annualization_sessions=request.compounding.annualization_sessions,
+    )
+
+
 def _attach_growth_route_execution_evidence(
     route: GrowthRouteEvidence,
     discovery: HorizonDiscovery,
@@ -3649,11 +3705,13 @@ def _growth_route_research_payload(
         else discovery.evidence[0].horizon_sessions
     )
     certificate = certify_growth_route(route, primary, request.compounding)
+    growth_route = _growth_route_projection(route, certificate)
+    _attach_frozen_compound_track(growth_route, discovery.evidence, request)
     return {
         "status": "RESEARCH_ONLY",
         "artifact_published": False,
         "certificate": dict(certificate),
-        "growth_route": _growth_route_projection(route, certificate),
+        "growth_route": growth_route,
     }
 
 

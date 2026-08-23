@@ -98,6 +98,7 @@ from src.stocks.research.models import ModelManifest
 __all__ = [
     "evaluate_economic_family_study",
     "evaluate_economic_window_candidate",
+    "fit_tail_lambdarank_oof",
 ]
 
 logger = logging.getLogger("stocks.ml.economic_research")
@@ -438,7 +439,7 @@ def _evaluate_window_body(
         if TAIL_LAMBDARANK_FAMILY in states:
             state = states[TAIL_LAMBDARANK_FAMILY]
             for k in ks:
-                lambdarank_oof, lambdarank_labels = _lambda_rank_oof(
+                lambdarank_oof, lambdarank_labels = fit_tail_lambdarank_oof(
                     pre_holdout, folds, data, request, learner_columns, horizon, k
                 )
                 gated_candidates += _process_calibrated_scores(
@@ -719,7 +720,7 @@ def _economic_coverage_failure_reason(
     return ""
 
 
-def _lambda_rank_oof(
+def fit_tail_lambdarank_oof(
     pre_holdout: pl.DataFrame,
     folds: list[Fold],
     data: NetAlphaResearchData,
@@ -731,7 +732,9 @@ def _lambda_rank_oof(
     """Deterministic LightGBM LambdaRank OOF scores for one (H, K) cell.
 
     Inner chronological splits pick the boost-round count; every outer model
-    refits to that fixed count so outer validation stays target-free.
+    refits to that fixed count so outer validation stays target-free. The
+    relevance target is ``build_tail_relevance`` exact-K on the decimal
+    ``risk_residual - reference_cost``, never MAD-z.
     """
     label_join = _build_label_join(data, horizon)
     config = NetAlphaModelConfig(seed=request.seed)

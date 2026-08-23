@@ -28,6 +28,10 @@ DEFAULT_CANDIDATE_REBALANCE_FREQUENCY_SESSIONS = (5, 10, 20)
 DEFAULT_CANDIDATE_TOP_K = (12, 16, 20, 24)
 CANONICAL_FEATURE_SET = "stock_net_alpha_v1"
 
+ELASTIC_NET_FAMILY = "net_alpha_elastic_net"
+TAIL_LAMBDARANK_FAMILY = "economic_tail_lambdarank"
+DECLARED_ECONOMIC_FAMILIES = (ELASTIC_NET_FAMILY, TAIL_LAMBDARANK_FAMILY)
+
 OUTCOME_REALIZED = "REALIZED"
 OUTCOME_PARTIAL_TAIL = "PARTIAL_TAIL"
 OUTCOME_MISSING_ENTRY_PRICE = "MISSING_ENTRY_PRICE"
@@ -429,6 +433,7 @@ class NetAlphaTrainingRequest:
     stress_liquidity_model: LiquiditySlippageModel | None = None
     execution_policy: ExecutionOutcomePolicy | None = None
     enforce_snapshot_outcome_readiness: bool = True
+    discovery_model_family: str = ELASTIC_NET_FAMILY
 
     def __post_init__(self) -> None:
         if not self.artifact_id:
@@ -467,6 +472,12 @@ class NetAlphaTrainingRequest:
                     "max_training_lookback_sessions must be at least 252 "
                     f"sessions (one annualized certificate year), got {lookback}"
                 )
+        if self.discovery_model_family not in DECLARED_ECONOMIC_FAMILIES:
+            raise ValueError(
+                f"unknown discovery_model_family "
+                f"{self.discovery_model_family!r}; declared families are "
+                f"{DECLARED_ECONOMIC_FAMILIES}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -799,11 +810,6 @@ class ModelSelectionEvidence:
             "selection_reasons": list(self.selection_reasons),
             "selected_model": self.selected_model,
         }
-
-
-ELASTIC_NET_FAMILY = "net_alpha_elastic_net"
-TAIL_LAMBDARANK_FAMILY = "economic_tail_lambdarank"
-DECLARED_ECONOMIC_FAMILIES = (ELASTIC_NET_FAMILY, TAIL_LAMBDARANK_FAMILY)
 
 
 @dataclass(frozen=True, slots=True)
