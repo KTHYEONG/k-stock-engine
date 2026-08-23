@@ -976,7 +976,7 @@ class TestSingleMatrixSeed04:
         registry = ModelArtifactRegistry(registry_root)
         telemetry = TrainingTelemetry()
         frame = data.feature_frame
-        manifest = training_module._select_publish_and_promote(
+        manifest = training_module._run_discovery_and_publish(
             registry=registry,
             data=data,
             request=request,

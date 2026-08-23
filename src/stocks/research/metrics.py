@@ -11,12 +11,16 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 import polars as pl
 from scipy.stats import rankdata
 
 from src.stocks.ml.contracts import CompoundingCertificationSettings
+
+if TYPE_CHECKING:
+    from src.stocks.ml.horizons import GrowthRouteEvidence
 
 
 def ndcg_at_k(scores: pl.Series, labels: pl.Series, k: int | None = None) -> float:
@@ -542,4 +546,155 @@ def certify_exposure_matched_excess(
         absolute_base=absolute.base,
         absolute_stress=stress_absolute.stress,
         matched_excess_lower_cagr=round(matched_lower_cagr, 12),
+    )
+
+
+def certify_growth_route(
+    route: GrowthRouteEvidence,
+    horizon_sessions: int,
+    settings: CompoundingCertificationSettings,
+) -> dict[str, object]:
+    """Certify a stitched growth route under absolute and relative growth gates.
+
+    The route is one strategy-level hypothesis: its base/stress per-interval
+    log-growth series are bootstrapped with the shared moving-block kernel at
+    ``settings.bootstrap_alpha`` and annualized over the observed intervals.
+    The certificate passes only when the base and stress compound lower CAGR
+    are both strictly positive, the exposure-matched lower excess CAGR over
+    the parallel benchmark series is strictly positive, observed sessions and
+    invested coverage satisfy ``settings``, MDD is within the cap, and at
+    least one order filled. Sparse-minus-dense and turnover diagnostics never
+    enter the decision. Every failure emits a normalized predicate while still
+    reporting the aggregate values for diagnosis.
+
+    Raises:
+        ValueError: when ``bootstrap_resamples`` cannot resolve the alpha
+            quantile (``resamples < ceil(1 / alpha)``).
+    """
+    if horizon_sessions < 1:
+        raise ValueError("horizon_sessions must be positive")
+    minimum_resamples = math.ceil(1.0 / settings.bootstrap_alpha)
+    if settings.bootstrap_resamples < minimum_resamples:
+        raise ValueError(
+            f"bootstrap_resamples={settings.bootstrap_resamples} is below the "
+            f"resolvable minimum {minimum_resamples} for "
+            f"alpha={settings.bootstrap_alpha}"
+        )
+
+    base_log = np.asarray(route.base_log_growth, dtype=float)
+    stress_log = np.asarray(route.stress_log_growth, dtype=float)
+    benchmark_log = np.asarray(route.benchmark_log_growth, dtype=float)
+    observed = int(
+        route.observed_interval_count
+        if route.observed_interval_count > 0
+        else base_log.size
+    )
+    invested = int(route.invested_interval_count)
+
+    def _result(reasons: list[str], **overrides: object) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "passed": not reasons,
+            "reasons": sorted(dict.fromkeys(reasons)),
+            "cagr_base": None,
+            "cagr_stress": None,
+            "base_lower_cagr": None,
+            "stress_lower_cagr": None,
+            "matched_lower_excess_cagr": None,
+            "mdd": None,
+            "observed_intervals": observed,
+            "invested_intervals": invested,
+            "filled_orders": int(route.filled_orders),
+        }
+        payload.update(overrides)
+        return payload
+
+    if (
+        base_log.size == 0
+        or not bool(np.all(np.isfinite(base_log)))
+        or not bool(np.all(np.isfinite(stress_log)))
+        or stress_log.size != base_log.size
+    ):
+        return _result(["period-series-incomplete"])
+    reasons = ["no-filled-orders"] if route.filled_orders <= 0 else []
+
+    equity = np.exp(np.cumsum(base_log))
+    peaks = np.maximum.accumulate(equity)
+    mdd = float(np.max(1.0 - equity / np.where(peaks > 0, peaks, 1.0)))
+    cagr_base = float(np.expm1(float(np.sum(base_log)) * settings.annualization_sessions / observed))
+    cagr_stress = float(
+        np.expm1(float(np.sum(stress_log)) * settings.annualization_sessions / observed)
+    )
+    block_length = max(1, min(horizon_sessions, base_log.size))
+    base_lower_mean = _bootstrap_lower_mean_log_growth(
+        base_log,
+        block_length,
+        settings.bootstrap_resamples,
+        settings.seed,
+        settings.bootstrap_alpha,
+    )
+    stress_lower_mean = _bootstrap_lower_mean_log_growth(
+        stress_log,
+        block_length,
+        settings.bootstrap_resamples,
+        settings.seed + horizon_sessions,
+        settings.bootstrap_alpha,
+    )
+    base_lower_cagr = annualize_bootstrap_lower_cagr(
+        base_lower_mean,
+        annualization_sessions=settings.annualization_sessions,
+        period_count=int(base_log.size),
+        observed_sessions=observed,
+    )
+    stress_lower_cagr = annualize_bootstrap_lower_cagr(
+        stress_lower_mean,
+        annualization_sessions=settings.annualization_sessions,
+        period_count=int(base_log.size),
+        observed_sessions=observed,
+    )
+
+    if observed < settings.min_observed_sessions:
+        reasons.append("insufficient-observed-sessions")
+    invested_fraction = invested / observed if observed > 0 else 0.0
+    if invested <= 0 or invested_fraction < settings.min_active_cohort_fraction:
+        reasons.append("invested-coverage-insufficient")
+    if not math.isfinite(base_lower_cagr) or base_lower_cagr <= 0.0:
+        reasons.append("non-positive-base-lower-cagr")
+    if not math.isfinite(stress_lower_cagr) or stress_lower_cagr <= 0.0:
+        reasons.append("non-positive-stress-lower-cagr")
+    if mdd > settings.max_drawdown:
+        reasons.append("max-drawdown-exceeded")
+
+    matched_lower_excess: float | None = None
+    if benchmark_log.size != base_log.size or benchmark_log.size == 0:
+        reasons.append("matched-benchmark-missing")
+    elif not bool(np.all(np.isfinite(benchmark_log))):
+        reasons.append("period-series-incomplete")
+    else:
+        excess = base_log - benchmark_log
+        excess_lower_mean = _bootstrap_lower_mean_log_growth(
+            excess,
+            block_length,
+            settings.bootstrap_resamples,
+            settings.seed + 2 * horizon_sessions,
+            settings.bootstrap_alpha,
+        )
+        matched_lower_excess = annualize_bootstrap_lower_cagr(
+            excess_lower_mean,
+            annualization_sessions=settings.annualization_sessions,
+            period_count=int(excess.size),
+            observed_sessions=observed,
+        )
+        if not math.isfinite(matched_lower_excess) or matched_lower_excess <= 0.0:
+            reasons.append("non-positive-matched-lower-excess")
+
+    return _result(
+        reasons,
+        cagr_base=_round_or_none(cagr_base),
+        cagr_stress=_round_or_none(cagr_stress),
+        base_lower_cagr=_round_or_none(base_lower_cagr),
+        stress_lower_cagr=_round_or_none(stress_lower_cagr),
+        matched_lower_excess_cagr=(
+            None if matched_lower_excess is None else _round_or_none(matched_lower_excess)
+        ),
+        mdd=_round_or_none(mdd),
     )

@@ -20,6 +20,7 @@ fixed 5/10/15 horizon exists here.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -84,11 +85,13 @@ from src.stocks.ml.fitting import (
     read_oof_parquet as _read_oof_parquet,
 )
 from src.stocks.ml.horizons import (
+    GROWTH_ROUTE_VERSION,
+    GrowthRouteEvidence,
     HorizonOOFEvidence,
     HorizonSelectionEvidence,
     _cohort_bootstrap,
     select_horizons,
-    select_prequential_execution_policy,
+    stitch_prequential_growth_route,
 )
 from src.stocks.ml.labels import (
     AVAILABLE_COLUMN,
@@ -151,6 +154,7 @@ from src.stocks.research.folds import Fold, PurgedWalkForward
 from src.stocks.research.metrics import (
     certify_compounded_holdout,
     certify_exposure_matched_excess,
+    certify_growth_route,
 )
 from src.stocks.research.models import Model, ModelManifest
 from src.stocks.trading.portfolio_constructor import (
@@ -543,7 +547,7 @@ def train_net_alpha_model(
                 ),
             },
         )
-        manifest = _select_publish_and_promote(
+        manifest = _run_discovery_and_publish(
             registry=registry,
             data=data,
             request=request,
@@ -595,7 +599,7 @@ def train_net_alpha_model(
         cache.close()
 
 
-def _select_publish_and_promote(
+def _run_discovery_and_publish(
     *,
     registry: ModelArtifactRegistry,
     data: NetAlphaResearchData,
@@ -611,7 +615,7 @@ def _select_publish_and_promote(
     universe_policy_hash: str,
     oof_cache: _OofCache,
 ) -> ModelManifest:
-    """Run discovery, selection, comparison, and promotion under one OOF cache."""
+    """Run discovery, stitch the growth route, and publish under one OOF cache."""
     try:
         discovery = _build_horizon_evidence(
             pre_holdout, folds, data, request, learner_columns,
@@ -640,22 +644,64 @@ def _select_publish_and_promote(
             ),
         )
 
+    # Contract-mandated route wiring: one prequential strategy-level hypothesis.
+    route = stitch_prequential_growth_route(discovery.evidence, request.bootstrap_alpha, request.seed, request.bootstrap_resamples)  # noqa: E501
+    route = _attach_growth_route_execution_evidence(route, discovery, pre_holdout)
+    primary = (
+        route.selected_policies[-1][0]
+        if route.selected_policies and route.selected_policies[-1] is not None
+        else discovery.evidence[0].horizon_sessions
+    )
+    certificate = certify_growth_route(route, primary, request.compounding)
+    growth_route = _growth_route_projection(route, certificate)
+    route_reasons = certificate.get("reasons")
+    reason_list = (
+        [str(reason) for reason in route_reasons]
+        if isinstance(route_reasons, (list, tuple))
+        else []
+    )
+    telemetry.phase(
+        "growth_route",
+        {
+            "candidate_count": int(route.candidate_count),
+            "segment_count": len(route.selected_policies),
+            "selected_policy": growth_route["selected_policy"],
+            "passed": bool(certificate["passed"]),
+            "rejection_reasons": reason_list,
+        },
+    )
+
+    def _no_trade(
+        reason: str,
+        details: object = "",
+        policy_frontier: Mapping[str, object] | None = None,
+    ) -> ModelManifest:
+        return _publish_no_trade(
+            registry, request, frame, reason,
+            details=details, policy_frontier=policy_frontier,
+            schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+            telemetry=telemetry, growth_route=growth_route,
+        )
+
+    final_policy = (
+        route.selected_policies[-1]
+        if route.selected_policies
+        else None
+    )
+    if not bool(certificate["passed"]) or final_policy is None:
+        rejection_reasons = reason_list or ["growth-route-no-selected-policy"]
+        return _no_trade(
+            "growth-route-rejected:" + ";".join(rejection_reasons),
+            details={
+                "growth_route": growth_route,
+                "growth_route_certificate": dict(certificate),
+            },
+            policy_frontier=_policy_frontier_projection(request, discovery, None),
+        )
+
     selection = select_horizons(
         discovery.evidence, request.bootstrap_alpha, request.seed,
         n_bootstrap=request.bootstrap_resamples,
-    )
-    prequential = select_prequential_execution_policy(
-        {0: discovery.evidence},
-        request.bootstrap_alpha,
-        request.seed,
-        n_bootstrap=max(
-            request.bootstrap_resamples,
-            max(1, len(discovery.evidence)) * 20,
-        ),
-    )
-    telemetry.phase(
-        "prequential_selection",
-        {"segment_policies": sorted(prequential.segment_policies)},
     )
     candidate_bound = len(
         request.execution_frontier.feasible_cells(
@@ -676,9 +722,18 @@ def _select_publish_and_promote(
             },
             "execution_evidence": _segment_summaries(
                 discovery.execution_evidence_by_candidate,
-                selection.primary_profile_id,
+                final_policy[3],
             ),
         },
+    )
+    # The global Holm result is exploratory diagnostics only; the promotion
+    # input is the stitched route's causally selected final policy.
+    selection = replace(
+        selection,
+        primary_horizon_sessions=int(final_policy[0]),
+        primary_rebalance_frequency_sessions=int(final_policy[1]),
+        primary_top_k=int(final_policy[2]),
+        primary_profile_id=str(final_policy[3]),
     )
     telemetry.phase(
         "primary_selection",
@@ -701,15 +756,9 @@ def _select_publish_and_promote(
             "rankability_reason": selection.rankability_reason,
         },
     )
-    if selection.primary_horizon_sessions is None:
-        return _publish_no_trade(
-            registry, request, frame, "no-selected-horizon",
-            details=selection.to_json(),
-            schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
-            telemetry=telemetry,
-        )
     assert selection.primary_rebalance_frequency_sessions is not None
     assert selection.primary_top_k is not None
+    assert selection.primary_horizon_sessions is not None
 
     primary = selection.primary_horizon_sessions
     profile = next(
@@ -721,27 +770,15 @@ def _select_publish_and_promote(
         None,
     )
     if profile is None:
-        return _publish_no_trade(
-            registry, request, frame, "selected-profile-not-in-frontier",
-            schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
-            telemetry=telemetry,
-        )
+        return _no_trade("selected-profile-not-in-frontier")
     label_frame = data.labels_by_horizon[primary]
     if TARGET_COLUMN not in label_frame.columns:
-        return _publish_no_trade(
-            registry, request, frame, "no-label-for-primary-horizon",
-            schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
-            telemetry=telemetry,
-        )
+        return _no_trade("no-label-for-primary-horizon")
     if (
         RISK_RESIDUAL_COLUMN not in label_frame.columns
         or REFERENCE_COST_COLUMN not in label_frame.columns
     ):
-        return _publish_no_trade(
-            registry, request, frame, "no-realized-for-primary-horizon",
-            schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
-            telemetry=telemetry,
-        )
+        return _no_trade("no-realized-for-primary-horizon")
 
     base_manifest = _base_manifest(request, data, frame, primary)
     baseline_oof, baseline_labels, baseline_ics, baseline_diag = _discovery_oof(
@@ -760,11 +797,9 @@ def _select_publish_and_promote(
         None,
     )
     if baseline_evidence is None:
-        return _publish_no_trade(
-            registry, request, frame, "selected-profile-evidence-missing",
+        return _no_trade(
+            "selected-profile-evidence-missing",
             details=selection.to_json(),
-            schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
-            telemetry=telemetry,
         )
 
     rankability_reason = _rankability_gate(
@@ -796,11 +831,9 @@ def _select_publish_and_promote(
             if challenger_failure_reason.startswith("challenger-skipped")
             else "baseline-oof-failed"
         )
-        return _publish_no_trade(
-            registry, request, frame, no_trade_reason,
+        return _no_trade(
+            no_trade_reason,
             details={"oof_diagnostics": [oof_diag.to_json()]},
-            schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
-            telemetry=telemetry,
         )
 
     risk = replace(request.risk, no_trade_band_bps=profile.no_trade_band_bps)
@@ -830,11 +863,7 @@ def _select_publish_and_promote(
         },
     )
     if final_model is None:
-        return _publish_no_trade(
-            registry, request, frame, "final-refit-failed",
-            schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
-            telemetry=telemetry,
-        )
+        return _no_trade("final-refit-failed")
 
     label_cols = (
         _ID_COLUMN, SESSION_COLUMN, RISK_RESIDUAL_COLUMN,
@@ -937,6 +966,7 @@ def _select_publish_and_promote(
             holdout_evidence=holdout_evidence,
             telemetry=telemetry,
             discovery=discovery,
+            growth_route=growth_route,
         ),
     )
     logger.info(
@@ -3145,6 +3175,7 @@ def _publish_no_trade(
     universe_policy_hash: str = "no-trade",
     telemetry: TrainingTelemetry | None = None,
     policy_frontier: Mapping[str, object] | None = None,
+    growth_route: Mapping[str, object] | None = None,
 ) -> ModelManifest:
     """Publish a complete immutable ``NO_TRADE`` artifact with evidence."""
     eligible_from, eligible_to = _eligibility(frame)
@@ -3198,6 +3229,8 @@ def _publish_no_trade(
         metrics.update(details)
     if policy_frontier is not None:
         metrics["policy_frontier"] = policy_frontier
+    if growth_route is not None:
+        metrics["growth_route"] = growth_route
     registry.write_metrics(request.artifact_id, metrics)
     logger.info("published NO_TRADE artifact %s (%s)", request.artifact_id, reason)
     return manifest
@@ -3254,6 +3287,7 @@ def _policy_profile_params(
                 request.portfolio.participation_limit,
             ),
             "execution_evidence_version": evidence_version,
+            "growth_route_version": GROWTH_ROUTE_VERSION,
             "risk_policy_fingerprint": stock_risk_policy_fingerprint(policy),
             "v7_risk_policy_fingerprint": stock_risk_policy_fingerprint(policy),
             "execution_policy_id": execution_policy.policy_id,
@@ -3277,6 +3311,7 @@ def _build_metrics(
     holdout_evidence: dict[str, object],
     telemetry: TrainingTelemetry,
     discovery: HorizonDiscovery,
+    growth_route: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     annualization = request.compounding.annualization_sessions
 
@@ -3292,7 +3327,7 @@ def _build_metrics(
             selection.adjusted_lower_growth.items()
         )
     }
-    return {
+    metrics: dict[str, object] = {
         "promoted": manifest.model_type != "no_trade",
         "no_trade": manifest.model_type == "no_trade",
         "model_type": manifest.model_type,
@@ -3323,6 +3358,9 @@ def _build_metrics(
         },
         "run_observability": telemetry.to_dict(),
     }
+    if growth_route is not None:
+        metrics["growth_route"] = growth_route
+    return metrics
 
 
 def _policy_frontier_projection(
@@ -3373,3 +3411,259 @@ def _segment_summaries(
             continue
         summaries[f"h{horizon}:{cadence}:{top_k}:{profile_id}"] = evidence.diagnostics()
     return summaries
+
+
+def _policy_key_label(key: tuple[int, int, int, str] | None) -> str | None:
+    if key is None:
+        return None
+    horizon, cadence, top_k, profile_id = key
+    return f"{horizon}:{cadence}:{top_k}:{profile_id}"
+
+
+def _growth_route_projection(
+    route: GrowthRouteEvidence, certificate: Mapping[str, object]
+) -> dict[str, object]:
+    """Bounded ``growth_route`` projection shared by metrics and the ledger.
+
+    Records the route version, candidate count, per-segment policy digest,
+    final selected policy, absolute/relative lower growth, coverage, fills,
+    drawdown, and normalized rejection-reason counts. Raw scores, order rows,
+    per-instrument values, and return vectors are never included.
+    """
+    route_reasons = certificate.get("reasons")
+    reasons = (
+        [str(reason) for reason in route_reasons if str(reason)]
+        if isinstance(route_reasons, (list, tuple))
+        else []
+    )
+    rejection_counts: dict[str, int] = {}
+    for reason in reasons:
+        rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+
+    def _digest_policies() -> dict[str, object]:
+        labels = [_policy_key_label(key) for key in route.selected_policies]
+        payload = json.dumps(labels, separators=(",", ":"))
+        return {
+            "count": len(labels),
+            "sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        }
+
+    def _scalar(name: str) -> float | None:
+        value = certificate.get(name)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return round(float(value), 12)
+        return None
+
+    return {
+        "version": route.route_version,
+        "candidate_count": int(route.candidate_count),
+        "segment_count": len(route.selected_policies),
+        "cash_segment_count": sum(
+            1 for key in route.selected_policies if key is None
+        ),
+        "selected_policy": _policy_key_label(
+            route.selected_policies[-1] if route.selected_policies else None
+        ),
+        "selected_policies_digest": _digest_policies(),
+        "base_lower_cagr": _scalar("base_lower_cagr"),
+        "stress_lower_cagr": _scalar("stress_lower_cagr"),
+        "matched_lower_excess_cagr": _scalar("matched_lower_excess_cagr"),
+        "mdd": _scalar("mdd"),
+        "observed_intervals": int(route.observed_interval_count),
+        "invested_intervals": int(route.invested_interval_count),
+        "filled_orders": int(route.filled_orders),
+        "sparse_minus_dense_lower_growth": round(
+            float(route.sparse_minus_dense_lower_growth), 12
+        ),
+        "turnover_ratio": round(float(route.turnover_ratio), 12),
+        "rejection_reason_counts": dict(sorted(rejection_counts.items())),
+    }
+
+
+def _attach_growth_route_execution_evidence(
+    route: GrowthRouteEvidence,
+    discovery: HorizonDiscovery,
+    panel: pl.DataFrame,
+) -> GrowthRouteEvidence:
+    """Attach bounded fills and an optional exposure-matched benchmark series.
+
+    Fill totals aggregate the replay evidence of every distinct selected
+    candidate. The benchmark is stitched from each selected candidate's own
+    exposure-matched benchmark slice only when every selected candidate's
+    interval exposures reconcile with the panel calendar; otherwise it stays
+    empty so the relative gate fails closed instead of fabricating evidence.
+    """
+    keys = {key for key in route.interval_policies if key is not None}
+    if not keys or not discovery.execution_evidence_by_candidate:
+        return route
+    fills = 0
+    filled_cycles = 0
+    benchmarks: dict[tuple[int, int, int, str], tuple[float, ...]] = {}
+    sessions = (
+        tuple(sorted(panel["session"].unique().to_list()))
+        if (not panel.is_empty() and "session" in panel.columns)
+        else ()
+    )
+    benchmark_failed = not sessions
+    for key in sorted(keys):
+        evidence = discovery.execution_evidence_by_candidate.get(key)
+        if evidence is None:
+            continue
+        fills += int(evidence.filled_orders)
+        filled_cycles += int(evidence.filled_cycle_count)
+        if benchmark_failed:
+            continue
+        exposure = evidence.base_interval_exposure
+        adjusted = (*exposure, 0.0) if len(sessions) == len(exposure) + 1 else exposure
+        if len(adjusted) != len(sessions):
+            benchmark_failed = True
+            continue
+        try:
+            benchmark = exposure_matched_benchmark_log_growth(
+                panel, sessions, adjusted
+            )
+        except ValueError:
+            benchmark_failed = True
+            continue
+        if len(benchmark) != len(evidence.base_log_growth):
+            benchmark_failed = True
+            continue
+        benchmarks[key] = benchmark
+    stitched_benchmark: tuple[float, ...] = ()
+    if not benchmark_failed and benchmarks.keys() == keys:
+        positions: dict[tuple[int, int, int, str], dict[int, list[int]]] = {}
+        for candidate in discovery.evidence:
+            source_key = (
+                candidate.horizon_sessions,
+                candidate.rebalance_frequency_sessions,
+                candidate.top_k,
+                candidate.profile_id,
+            )
+            if source_key not in keys:
+                continue
+            grouped: dict[int, list[int]] = {}
+            for index, segment in enumerate(candidate.cohort_segment_ids):
+                grouped.setdefault(int(segment), []).append(index)
+            positions[source_key] = grouped
+        counters: dict[tuple[tuple[int, int, int, str], int], int] = {}
+        values: list[float] = []
+        aligned = True
+        for segment, interval_key in zip(
+            route.segment_ids, route.interval_policies, strict=True
+        ):
+            if interval_key is None:
+                values.append(0.0)
+                continue
+            offset = counters.get((interval_key, int(segment)), 0)
+            indices = positions.get(interval_key, {}).get(int(segment))
+            if indices is None or offset >= len(indices):
+                aligned = False
+                break
+            counters[(interval_key, int(segment))] = offset + 1
+            values.append(float(benchmarks[interval_key][indices[offset]]))
+        if aligned and len(values) == len(route.base_log_growth):
+            stitched_benchmark = tuple(values)
+    return replace(
+        route,
+        filled_orders=fills,
+        filled_cycle_count=filled_cycles,
+        benchmark_log_growth=stitched_benchmark,
+    )
+
+
+def evaluate_growth_route_research(
+    data: NetAlphaResearchData,
+    request: NetAlphaTrainingRequest,
+) -> dict[str, object]:
+    """Read-only growth-route evaluation over one data snapshot.
+
+    Replays the discovery frontier once, stitches the prequential growth
+    route, certifies it, and returns a bounded payload. Nothing is published:
+    no artifact, no manifest, no registry write. Every fail-closed gate emits
+    a normalized rejection reason instead of fabricated growth.
+    """
+    frame = data.feature_frame
+    raw_panel = _index_sessions(frame)
+    pre_holdout_raw, _holdout_raw, holdout_reason = _locked_holdout(raw_panel, request)
+    if holdout_reason or pre_holdout_raw.is_empty():
+        return _growth_route_research_rejection(
+            holdout_reason or "insufficient-pre-holdout-history"
+        )
+    roles = dict(stock_net_alpha_v1_roles())
+    try:
+        materialized = materialize_model_feature_sources(pre_holdout_raw, list(roles))
+        schema = fit_model_feature_schema(materialized, roles)
+        pre_holdout = apply_model_feature_schema(materialized, schema)
+    except ValueError as exc:
+        return _growth_route_research_rejection(f"feature-schema-failed:{exc}")
+    learner_columns = schema.learner_columns
+    if not learner_columns:
+        return _growth_route_research_rejection("no-alpha-learner-columns")
+    splitter = PurgedWalkForward(
+        n_folds=request.fold_count,
+        label_horizon_sessions=max(request.candidate_horizon_sessions) + 1,
+        embargo_sessions=request.embargo_sessions,
+        session_column=_SESSION_IDX,
+        min_train_sessions=request.compounding.annualization_sessions,
+        max_train_sessions=request.max_training_lookback_sessions,
+    )
+    folds = splitter.split(pre_holdout)
+    if not folds:
+        return _growth_route_research_rejection("insufficient-oof-calendar")
+    cache = _OofCache(_default_oof_cache_base())
+    try:
+        discovery = _build_horizon_evidence(
+            pre_holdout, folds, data, request, learner_columns, oof_cache=cache,
+        )
+    except (_MemoryBudgetExceededError, _EnvelopeBudgetError) as exc:
+        stage = str(getattr(exc, "stage", "") or "fitting_workspace")
+        return _growth_route_research_rejection(f"memory-budget-exceeded:{stage}")
+    finally:
+        cache.close()
+    return _growth_route_research_payload(discovery, request, pre_holdout)
+
+
+def _growth_route_research_payload(
+    discovery: HorizonDiscovery,
+    request: NetAlphaTrainingRequest,
+    panel: pl.DataFrame,
+) -> dict[str, object]:
+    """Stitch, certify, and project one read-only research route."""
+    if not discovery.evidence:
+        return _growth_route_research_rejection("no-horizon-evidence")
+    route = stitch_prequential_growth_route(discovery.evidence, request.bootstrap_alpha, request.seed, request.bootstrap_resamples)  # noqa: E501
+    route = _attach_growth_route_execution_evidence(route, discovery, panel)
+    primary = (
+        route.selected_policies[-1][0]
+        if route.selected_policies and route.selected_policies[-1] is not None
+        else discovery.evidence[0].horizon_sessions
+    )
+    certificate = certify_growth_route(route, primary, request.compounding)
+    return {
+        "status": "RESEARCH_ONLY",
+        "artifact_published": False,
+        "certificate": dict(certificate),
+        "growth_route": _growth_route_projection(route, certificate),
+    }
+
+
+def _growth_route_research_rejection(reason: str) -> dict[str, object]:
+    """Bounded read-only rejection payload with one normalized reason."""
+    normalized = str(reason)[:512]
+    return {
+        "status": "RESEARCH_ONLY",
+        "artifact_published": False,
+        "certificate": {
+            "passed": False,
+            "reasons": [normalized],
+            "base_lower_cagr": None,
+            "stress_lower_cagr": None,
+            "matched_lower_excess_cagr": None,
+        },
+        "growth_route": {
+            "version": GROWTH_ROUTE_VERSION,
+            "candidate_count": 0,
+            "selected_policy": None,
+            "rejection_reason_counts": {normalized: 1},
+        },
+    }

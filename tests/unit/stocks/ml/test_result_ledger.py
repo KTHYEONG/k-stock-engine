@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -984,3 +985,92 @@ def test_execution_frontier_bounded_ledger_projection() -> None:
     assert "scores" not in json.dumps(summary)
     assert "orders" not in json.dumps(summary)
     assert "labels" not in json.dumps(summary)
+
+
+GROWTH_ROUTE_04_NO_TRADE_OBSERVABILITY = "GROWTH_ROUTE_04_NO_TRADE_OBSERVABILITY"
+
+
+def test_growth_route_04_no_trade_observability(tmp_path) -> None:
+    """GROWTH_ROUTE_04_NO_TRADE_OBSERVABILITY.
+
+    A no-trade metrics payload carrying a 24-candidate growth route projects
+    candidate_count=24, selected_policy=null, finite lower-growth scalars, and
+    normalized rejection-reason counts into latest.json. The serialized ledger
+    record excludes raw return arrays and stays within the 24576-byte record
+    bound.
+    """
+    from src.stocks.ml.horizons import GrowthRouteEvidence
+    from src.stocks.ml.result_ledger import _compact_growth_route
+    from src.stocks.ml.training import _growth_route_projection
+
+    route = GrowthRouteEvidence(
+        base_log_growth=(0.001, 0.002, -0.0005),
+        stress_log_growth=(0.0008, 0.0015, -0.0006),
+        segment_ids=(0, 0, 1),
+        selected_policies=(None, None),
+        interval_policies=(None, None, None),
+        candidate_count=24,
+        observed_interval_count=3,
+        invested_interval_count=0,
+        filled_orders=0,
+        sparse_minus_dense_lower_growth=-0.0004,
+        turnover_ratio=1.2,
+    )
+    certificate: dict[str, object] = {
+        "passed": False,
+        "reasons": (
+            "non-positive-stress-lower-cagr",
+            "matched-benchmark-missing",
+            "no-filled-orders",
+        ),
+        "base_lower_cagr": 0.25,
+        "stress_lower_cagr": -0.03,
+        "cagr_base": 0.31,
+        "cagr_stress": -0.02,
+        "matched_lower_excess_cagr": None,
+        "mdd": 0.05,
+        "observed_intervals": 3,
+        "invested_intervals": 0,
+        "filled_orders": 0,
+    }
+    metrics = _default_metrics("no_trade")
+    metrics["promotion_reasons"] = ["growth-route-rejected"]
+    metrics["growth_route"] = _growth_route_projection(route, certificate)
+
+    projected = _compact_growth_route(metrics)
+    assert projected["candidate_count"] == 24
+    assert projected["selected_policy"] is None
+    for key in ("base_lower_cagr", "stress_lower_cagr", "matched_lower_excess_cagr"):
+        value = projected[key]
+        assert value is None or math.isfinite(value)
+    rejection_counts = projected["rejection_reason_counts"]
+    assert rejection_counts["non-positive-stress-lower-cagr"] == 1
+    assert rejection_counts["no-filled-orders"] == 1
+
+    registry = ModelArtifactRegistry(tmp_path / "artifacts")
+    artifact_id = "na_no_trade_gr04"
+    _write_artifact(
+        registry.root,
+        artifact_id,
+        model_type="no_trade",
+        metrics=dict(metrics),
+    )
+    context = _context(artifact_id)
+    ledger_inst = MlResultLedger(
+        tmp_path / "results", clock=lambda: datetime(2024, 1, 2, tzinfo=UTC)
+    )
+    ledger_inst.record_completed(context, _manifest(artifact_id, "no_trade"), registry)
+
+    latest = _latest(tmp_path / "results")
+    encoded = len(_encode(latest))
+    assert encoded <= MAX_RECORD_BYTES
+    assert encoded <= 24576
+    growth_route = latest["observability"]["growth_route"]
+    assert growth_route["candidate_count"] == 24
+    assert growth_route["selected_policy"] is None
+    assert growth_route["rejection_reason_counts"]["no-filled-orders"] == 1
+    dumped = json.dumps(latest)
+    assert "base_log_growth" not in dumped
+    assert "stress_log_growth" not in dumped
+    assert "benchmark_log_growth" not in dumped
+    assert "interval_policies" not in dumped

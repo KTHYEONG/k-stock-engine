@@ -755,3 +755,296 @@ def _candidate_lower_bound(
     base_lower = base_boot.lower_mean(bootstrap_alpha) if base_boot is not None else 0.0
     stress_lower = stress_boot.lower_mean(bootstrap_alpha) if stress_boot is not None else 0.0
     return base_lower, stress_lower
+
+
+GROWTH_ROUTE_VERSION = "v1"
+
+PolicyKey = tuple[int, int, int, str]
+
+
+@dataclass(frozen=True, slots=True)
+class GrowthRouteEvidence:
+    """Immutable stitched prequential growth route.
+
+    ``base_log_growth``/``stress_log_growth`` are the aligned per-interval log
+    growth series appended one evaluated OOF segment at a time in
+    chronological order; ``segment_ids`` carries each interval's segment
+    identity. ``selected_policies`` records, per segment, the
+    ``(H, C, K, profile)`` policy causally selected from strictly earlier
+    segments (``None`` marks a cash segment); ``interval_policies`` repeats the
+    per-interval source policy (``None`` for cash intervals).
+    ``benchmark_log_growth`` is an optional parallel exposure-matched
+    benchmark series attached by the caller. Coverage and fills are bounded
+    scalars; sparse-minus-dense growth and turnover ratio are diagnostics only.
+    """
+
+    base_log_growth: tuple[float, ...]
+    stress_log_growth: tuple[float, ...]
+    segment_ids: tuple[int, ...]
+    selected_policies: tuple[PolicyKey | None, ...]
+    interval_policies: tuple[PolicyKey | None, ...] = ()
+    benchmark_log_growth: tuple[float, ...] = ()
+    candidate_count: int = 0
+    observed_interval_count: int = 0
+    invested_interval_count: int = 0
+    filled_orders: int = 0
+    filled_cycle_count: int = 0
+    sparse_minus_dense_lower_growth: float = 0.0
+    turnover_ratio: float = 0.0
+    route_version: str = GROWTH_ROUTE_VERSION
+
+    def __post_init__(self) -> None:
+        count = len(self.base_log_growth)
+        if len(self.stress_log_growth) != count or len(self.segment_ids) != count:
+            raise ValueError(
+                "route base/stress log growth and segment ids must be parallel"
+            )
+        if self.interval_policies and len(self.interval_policies) != count:
+            raise ValueError("interval_policies must be parallel to the route series")
+        if self.benchmark_log_growth and len(self.benchmark_log_growth) != count:
+            raise ValueError(
+                "benchmark_log_growth must be parallel to the route series"
+            )
+        if not np.all(np.isfinite(self.base_log_growth)) or not np.all(
+            np.isfinite(self.stress_log_growth)
+        ):
+            raise ValueError("route log growth must be finite")
+        if self.benchmark_log_growth and not np.all(
+            np.isfinite(self.benchmark_log_growth)
+        ):
+            raise ValueError("route benchmark log growth must be finite")
+        if any(segment < 0 for segment in self.segment_ids):
+            raise ValueError("route segment identity must be non-negative")
+        for key in (*self.selected_policies, *self.interval_policies):
+            if key is None:
+                continue
+            horizon, cadence, top_k, profile_id = key
+            if horizon < 1 or cadence < 1 or top_k < 1 or not profile_id:
+                raise ValueError(
+                    "route policy keys must carry positive H/C/K and a profile id"
+                )
+        if self.candidate_count < 0:
+            raise ValueError("candidate_count must be non-negative")
+        if self.observed_interval_count < 0 or self.invested_interval_count < 0:
+            raise ValueError("route coverage counts must be non-negative")
+        if self.invested_interval_count > self.observed_interval_count:
+            raise ValueError(
+                "invested_interval_count cannot exceed observed_interval_count"
+            )
+        if self.filled_orders < 0 or self.filled_cycle_count < 0:
+            raise ValueError("route fill counts must be non-negative")
+        if not np.isfinite(self.sparse_minus_dense_lower_growth):
+            raise ValueError("sparse_minus_dense_lower_growth must be finite")
+        if not np.isfinite(self.turnover_ratio) or self.turnover_ratio < 0.0:
+            raise ValueError("turnover_ratio must be a finite non-negative value")
+
+    @property
+    def invested_interval_fraction(self) -> float:
+        if self.observed_interval_count <= 0:
+            return 0.0
+        return self.invested_interval_count / self.observed_interval_count
+
+
+def stitch_prequential_growth_route(
+    candidates: tuple[HorizonOOFEvidence, ...],
+    bootstrap_alpha: float,
+    seed: int,
+    n_bootstrap: int,
+) -> GrowthRouteEvidence:
+    """Causally stitch one strategy-level prequential growth route.
+
+    For every outer OOF segment ``s`` (the sorted union of candidate segment
+    identities) each candidate is bootstrapped on its slice of complete
+    segments strictly below ``s`` with the shared moving-block kernel. A
+    candidate is admissible for ``s`` only when both its sliced base and
+    stress lower growth bounds are strictly positive; sparse-minus-dense and
+    turnover diagnostics never gate selection. The admissible candidate with
+    the maximum stress lower growth wins (deterministic ``(H, C, K, profile)``
+    tie-breaks), and exactly that policy's current-segment values are appended;
+    when no earlier candidate qualifies the segment is cash and contributes
+    zero-growth intervals. Segment ``s``'s own returns never influence which
+    policy serves it.
+
+    Args:
+        candidates: the discovery frontier's per-candidate vintage evidence.
+        bootstrap_alpha: one-sided bootstrap quantile for the lower bounds.
+        seed: deterministic bootstrap seed (per-path offsets follow the
+            existing horizon-selection convention).
+        n_bootstrap: resample count; the route is one strategy-level
+            hypothesis, so at least ``ceil(1 / bootstrap_alpha)`` resamples
+            are required to resolve its significance.
+
+    Returns:
+        The immutable :class:`GrowthRouteEvidence` stitched route.
+    """
+    if not candidates:
+        raise ValueError(
+            "stitch_prequential_growth_route requires at least one candidate"
+        )
+    if not 0.0 < bootstrap_alpha < 1.0:
+        raise ValueError("bootstrap_alpha must be in (0, 1)")
+    minimum_resamples = ceil(1.0 / bootstrap_alpha)
+    if n_bootstrap < max(2, minimum_resamples):
+        raise ValueError(
+            f"n_bootstrap={n_bootstrap} is below the resolvable minimum "
+            f"{minimum_resamples} for alpha={bootstrap_alpha}"
+        )
+
+    ordered = tuple(
+        sorted(
+            candidates,
+            key=lambda candidate: (
+                candidate.horizon_sessions,
+                candidate.rebalance_frequency_sessions,
+                candidate.top_k,
+                candidate.profile_id,
+            ),
+        )
+    )
+    segments = sorted(
+        {int(seg) for candidate in ordered for seg in candidate.cohort_segment_ids}
+    )
+
+    base_out: list[float] = []
+    stress_out: list[float] = []
+    segment_out: list[int] = []
+    interval_policy_out: list[PolicyKey | None] = []
+    selected_policies: list[PolicyKey | None] = []
+    paired_deltas: list[float] = []
+    turnover_ratios: list[float] = []
+
+    def _slice_indices(candidate: HorizonOOFEvidence, upper: int) -> list[int]:
+        return [
+            index
+            for index, segment in enumerate(candidate.cohort_segment_ids)
+            if segment < upper
+        ]
+
+    for segment in segments:
+        chosen: HorizonOOFEvidence | None = None
+        chosen_stress_lower = -float("inf")
+        for candidate in ordered:
+            prior_indices = _slice_indices(candidate, segment)
+            if not prior_indices:
+                continue
+            prior_segments = tuple(
+                int(candidate.cohort_segment_ids[index]) for index in prior_indices
+            )
+            block_floor = max(
+                candidate.horizon_sessions, candidate.rebalance_frequency_sessions
+            )
+            base_boot = _cohort_bootstrap(
+                tuple(candidate.base_log_growth[index] for index in prior_indices),
+                prior_segments,
+                n_bootstrap,
+                seed + candidate.horizon_sessions,
+                min_block_length=block_floor,
+            )
+            stress_boot = _cohort_bootstrap(
+                tuple(candidate.stress_log_growth[index] for index in prior_indices),
+                prior_segments,
+                n_bootstrap,
+                seed + 2 * candidate.horizon_sessions,
+                min_block_length=block_floor,
+            )
+            if base_boot is None or stress_boot is None:
+                continue
+            base_lower = base_boot.lower_mean(bootstrap_alpha)
+            stress_lower = stress_boot.lower_mean(bootstrap_alpha)
+            if base_lower <= 0.0 or stress_lower <= 0.0:
+                continue
+            if (
+                stress_lower > chosen_stress_lower + _BOUND_TOLERANCE
+                or chosen is None
+            ):
+                chosen = candidate
+                chosen_stress_lower = stress_lower
+
+        selected_policies.append(
+            None
+            if chosen is None
+            else (
+                chosen.horizon_sessions,
+                chosen.rebalance_frequency_sessions,
+                chosen.top_k,
+                chosen.profile_id,
+            )
+        )
+        if chosen is None:
+            # Every segment id originates from some candidate's calendar, so
+            # at least one candidate covers a cash segment.
+            cash_length = max(
+                (
+                    sum(
+                        1
+                        for seg in candidate.cohort_segment_ids
+                        if int(seg) == segment
+                    )
+                    for candidate in ordered
+                    if any(int(seg) == segment for seg in candidate.cohort_segment_ids)
+                ),
+                default=0,
+            )
+            base_out.extend(0.0 for _ in range(cash_length))
+            stress_out.extend(0.0 for _ in range(cash_length))
+            segment_out.extend([segment] * cash_length)
+            interval_policy_out.extend([None] * cash_length)
+            continue
+
+        key: PolicyKey = (
+            chosen.horizon_sessions,
+            chosen.rebalance_frequency_sessions,
+            chosen.top_k,
+            chosen.profile_id,
+        )
+        current_indices = [
+            index
+            for index, seg in enumerate(chosen.cohort_segment_ids)
+            if int(seg) == segment
+        ]
+        base_out.extend(float(chosen.base_log_growth[index]) for index in current_indices)
+        stress_out.extend(
+            float(chosen.stress_log_growth[index]) for index in current_indices
+        )
+        segment_out.extend([segment] * len(current_indices))
+        interval_policy_out.extend([key] * len(current_indices))
+
+        if chosen.paired_stress_log_growth:
+            paired_boot = _cohort_bootstrap(
+                tuple(
+                    float(chosen.paired_stress_log_growth[index])
+                    for index in current_indices
+                ),
+                tuple(int(chosen.cohort_segment_ids[index]) for index in current_indices),
+                n_bootstrap,
+                seed + 3 * chosen.horizon_sessions,
+                min_block_length=max(
+                    chosen.horizon_sessions, chosen.rebalance_frequency_sessions
+                ),
+            )
+            if paired_boot is not None:
+                paired_deltas.append(paired_boot.lower_mean(bootstrap_alpha))
+        shadow_turnover = max(float(chosen.shadow_turnover), 1e-12)
+        turnover_ratios.append(float(chosen.sparse_turnover) / shadow_turnover)
+
+    return GrowthRouteEvidence(
+        base_log_growth=tuple(base_out),
+        stress_log_growth=tuple(stress_out),
+        segment_ids=tuple(segment_out),
+        selected_policies=tuple(selected_policies),
+        interval_policies=tuple(interval_policy_out),
+        candidate_count=len(ordered),
+        observed_interval_count=len(base_out),
+        invested_interval_count=sum(
+            1
+            for base_value, stress_value in zip(
+                base_out, stress_out, strict=True
+            )
+            if base_value != 0.0 or stress_value != 0.0
+        ),
+        sparse_minus_dense_lower_growth=(
+            float(np.mean(paired_deltas)) if paired_deltas else 0.0
+        ),
+        turnover_ratio=float(np.mean(turnover_ratios)) if turnover_ratios else 0.0,
+        route_version=GROWTH_ROUTE_VERSION,
+    )
