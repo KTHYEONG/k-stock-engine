@@ -254,6 +254,39 @@ def test_prepared_allocations_reject_overlay_length_mismatch() -> None:
         replay_execution_equivalent(_request(naive, scores, segments, context))
 
 
+def test_prepared_replay_allocation_02_uses_segment_allocator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PREPARED_REPLAY_ALLOCATION_02: no dataframe allocator in compatible replay."""
+    market = _market_frame(n_segments=1, sessions_per_segment=8)
+    context = _context(market)
+    scores = _score_frame(n_segments=1, sessions_per_segment=8)
+    sessions = tuple(sorted(market[_SESSION_COLUMN].unique().to_list()))
+    request = _request(market, scores, {0: sessions[1:-1]}, context)
+
+    from src.stocks.trading.portfolio_constructor import PreparedAllocationMarket
+    from src.stocks.workflows import trading_cycle
+
+    original_build = PreparedAllocationMarket.build.__func__
+    build_count = 0
+
+    def tracked_build(cls, *args, **kwargs):
+        nonlocal build_count
+        build_count += 1
+        return original_build(cls, *args, **kwargs)
+
+    monkeypatch.setattr(PreparedAllocationMarket, "build", classmethod(tracked_build))
+    monkeypatch.setattr(
+        trading_cycle,
+        "construct_target_allocations",
+        lambda *args, **kwargs: pytest.fail("reference allocator invoked"),
+    )
+
+    evidence = replay_execution_equivalent(request)
+    assert evidence.planned_cycles > 0
+    assert build_count == 1
+
+
 def test_replay_builds_one_prepared_market_per_segment_with_clean_segment_ids() -> None:
     """Each segment starts from independent initial cash and never mixes ids."""
     market = _market_frame()
@@ -996,4 +1029,3 @@ def test_replay_lookback_01_first_session_statistics_match_full_history() -> Non
     assert len(evidence.stress_log_growth) == expected_intervals
     assert all(math.isfinite(value) for value in evidence.base_log_growth)
     assert stats["prepared_segment_build_count"] == 1
-
