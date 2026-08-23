@@ -5,6 +5,7 @@ import json
 from types import SimpleNamespace
 
 from src.stocks.cli import train
+from src.stocks.research.artifacts import ModelArtifactRegistry
 
 GROWTH_ROUTE_05_READ_ONLY_RESEARCH = "GROWTH_ROUTE_05_READ_ONLY_RESEARCH"
 
@@ -33,7 +34,7 @@ def _install_research_fakes(monkeypatch, evaluation) -> None:
     )
     monkeypatch.setattr(
         "src.stocks.ml.training.evaluate_growth_route_research",
-        lambda data, request: evaluation(request),
+        lambda data, request, *, registry: evaluation(request),
     )
 
 
@@ -147,3 +148,34 @@ def test_growth_route_05_read_only_research(monkeypatch, capsys) -> None:
     assert certificate["base_lower_cagr"] > 0.0
     assert certificate["stress_lower_cagr"] > 0.0
     assert certificate["matched_lower_excess_cagr"] > 0.0
+
+
+def test_growth_route_registry_01_is_caller_owned(monkeypatch, capsys) -> None:
+    """GROWTH_ROUTE_REGISTRY_01: CLI owns the replay artifact registry."""
+    received = []
+
+    def evaluation(data, request, *, registry):
+        del data, request
+        received.append(registry)
+        return _rejected_evaluation(None)
+
+    monkeypatch.setattr(
+        train, "resolve_snapshot_for_mode", lambda *a, **k: _FakeSnapshot()
+    )
+    monkeypatch.setattr(train, "ResearchDataRepository", _FakeRepository)
+    monkeypatch.setattr(
+        train, "compose_net_alpha_training_data", lambda *a, **k: SimpleNamespace()
+    )
+    monkeypatch.setattr(
+        "src.stocks.ml.training.evaluate_growth_route_research", evaluation
+    )
+
+    assert train.main([
+        "--artifact-id", "growth_registry", "--snapshot-id", "research_snap",
+        "--research-only-growth-route",
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "RESEARCH_ONLY"
+    assert payload["artifact_published"] is False
+    assert len(received) == 1
+    assert isinstance(received[0], ModelArtifactRegistry)
