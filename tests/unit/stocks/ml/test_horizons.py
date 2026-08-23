@@ -88,10 +88,13 @@ def test_uses_request_controlled_resamples() -> None:
     )
     default = select_horizons(candidates, 0.05, 42)
     assert default.primary_horizon_sessions == 5
-    small = select_horizons(candidates, 0.05, 42, n_bootstrap=50)
+    small = select_horizons(candidates, 0.05, 42, n_bootstrap=64)
     large = select_horizons(candidates, 0.05, 42, n_bootstrap=200)
     assert small.primary_horizon_sessions == large.primary_horizon_sessions == 5
     assert large.adjusted_lower_growth[(5, 5, 20, _LEGACY)]["stress"] > 0.0
+    # Family size 3 requires ceil(3 / 0.05) resamples for a measurable rank-1 threshold.
+    with pytest.raises(ValueError, match="below the resolvable minimum"):
+        select_horizons(candidates, 0.05, 42, n_bootstrap=50)
 
 
 def test_rejects_resamples_below_two() -> None:
@@ -264,7 +267,7 @@ def _sparse_evidence(
 
 
 def test_sparse_growth_paired_admission() -> None:
-    """SPARSE_GROWTH_04_MATCHED_SHADOW_ADMISSION.
+    """SPARSE_GROWTH_04_MATCHED_SHADOW_ADMISSION / resolution_guard_accepts_sufficient_resamples.
 
     A candidate is selectable only when base, stress, and paired lower bounds
     are strictly positive and the sparse/shadow turnover ratio is at most 0.60;
@@ -722,3 +725,114 @@ def test_bootstrap_parity_01_pooled_matches_materialized_reference() -> None:
         for s in sorted(by_segment)
     )
     assert result.n_blocks_total == expected_blocks
+
+
+def _frontier_cell(
+    seed_offset: int,
+    *,
+    mean: float = 0.0008,
+    sd: float = 0.004,
+    vintages_per_segment: int = 22,
+) -> HorizonOOFEvidence:
+    """One weak-signal frontier cell over 3 prequential segments (~66 vintages)."""
+    rng = np.random.default_rng(100 + seed_offset)
+    segments = (0, 1, 2)
+    count = len(segments) * vintages_per_segment
+
+    def _centered(draw_mean: float, draw_sd: float) -> tuple[float, ...]:
+        values = rng.normal(draw_mean, draw_sd, size=count)
+        # Re-center so the standardized effect is deterministic across seeds.
+        values += draw_mean - values.mean()
+        return tuple(float(v) for v in values)
+
+    base = _centered(mean, sd)
+    stress = tuple(v * 0.9 - 0.0002 for v in base)
+    paired = _centered(0.0003, 0.001)
+    return HorizonOOFEvidence(
+        horizon_sessions=10,
+        rebalance_frequency_sessions=5,
+        top_k=12 + 4 * (seed_offset % 4),
+        profile_id=(_LEGACY, "lower_bound_half_kelly", _LOWER)[seed_offset % 3],
+        model_family="net_alpha_elastic_net",
+        base_log_growth=base,
+        stress_log_growth=stress,
+        cohort_segment_ids=tuple(s for s in segments for _ in range(vintages_per_segment)),
+        complete_cohort_count=len(base),
+        active_cohort_count=len(base),
+        partial_cohort_count=0,
+        missing_cohort_count=0,
+        segment_count=len(segments),
+        fold_rank_ics=(0.054, 0.048, 0.061),
+        paired_stress_log_growth=paired,
+        shadow_turnover=12.0,
+        sparse_turnover=5.0,
+    )
+
+
+def _production_frontier() -> tuple[HorizonOOFEvidence, ...]:
+    """24-cell H10 frontier matching the pre-registered production grid shape."""
+    return tuple(_frontier_cell(index) for index in range(24))
+
+
+def test_resolvable_minimum_guard_rejects_underpowered_family() -> None:
+    """resolution_guard_rejects_underpowered_family.
+
+    A family whose Holm threshold sits below the k/B p-value grid fails closed.
+    """
+    candidates = (
+        _evidence(5, _positive(5, 0.01)),
+        _evidence(10, _positive(10, 0.005)),
+        _evidence(15, tuple(-0.001 for _ in range(10))),
+    )
+    with pytest.raises(ValueError, match="below the resolvable minimum") as exc_info:
+        select_horizons(candidates, 0.05, 42, n_bootstrap=50)
+    message = str(exc_info.value)
+    assert "60" in message
+    assert "family size 3" in message
+
+
+def test_production_family_resolution() -> None:
+    """default_resamples_resolve_production_family.
+
+    The 24-cell production family (m=72) resolves on the default B grid.
+    """
+    assert DEFAULT_BOOTSTRAP_RESAMPLES == 2000
+    from math import ceil
+
+    minimum_resamples = ceil(72 / 0.05)
+    assert minimum_resamples == 1440
+    assert minimum_resamples <= DEFAULT_BOOTSTRAP_RESAMPLES
+
+    import time
+
+    start = time.perf_counter()
+    selection = select_horizons(_production_frontier(), 0.05, 42)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 5.0
+    thresholds = [
+        *selection.base_holm_thresholds.values(),
+        *selection.stress_holm_thresholds.values(),
+        *selection.paired_holm_thresholds.values(),
+    ]
+    assert len(thresholds) > 0
+    assert min(thresholds) >= 1.0 / DEFAULT_BOOTSTRAP_RESAMPLES
+    # Weak synthetic signal stays NO_TRADE; the point is measurability, not promotion.
+    assert selection.primary_horizon_sessions is None
+
+
+def test_attainability_after_resolution_fix() -> None:
+    """strong_signal_candidate_attainable_end_to_end.
+
+    A genuinely strong candidate is admissible once the grid resolves.
+    """
+    strong = _frontier_cell(7, mean=0.004, sd=0.008)
+    selection = select_horizons((strong,), 0.05, 42, n_bootstrap=2000)
+    assert selection.primary_horizon_sessions == 10
+    key = (10, strong.rebalance_frequency_sessions, strong.top_k, strong.profile_id)
+    assert selection.adjusted_lower_growth[key]["base"] > 0.0
+    assert selection.adjusted_lower_growth[key]["stress"] > 0.0
+    assert selection.paired_lower_bounds[key] > 0.0
+    assert selection.turnover_ratio[key] <= 0.60
+
+    with pytest.raises(ValueError, match="below the resolvable minimum"):
+        select_horizons((strong,), 0.05, 42, n_bootstrap=50)
