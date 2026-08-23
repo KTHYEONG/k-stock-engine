@@ -684,6 +684,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--research-only-growth-route",
+        action="store_true",
+        help=(
+            "read-only evaluation of the growth route over the selected "
+            "snapshot; prints a RESEARCH_ONLY JSON payload and publishes no "
+            "artifact"
+        ),
+    )
     return parser
 
 
@@ -769,6 +778,52 @@ def _validate_static_training_request(request: NetAlphaTrainingRequest) -> None:
     request.execution_frontier.require_feasible_horizons(
         request.portfolio.max_exposure, request.portfolio.max_single_weight
     )
+
+
+def run_research_only_growth_route(
+    parsed: argparse.Namespace,
+    request: NetAlphaTrainingRequest,
+) -> dict[str, object]:
+    """Evaluate the growth route over one snapshot without publishing anything.
+
+    Read-only: resolves the selected snapshot, replays the discovery frontier
+    once, stitches the prequential growth route, and certifies it. The result
+    is a bounded JSON payload carrying either the certified growth metrics or
+    normalized rejection reasons; no artifact is ever published.
+    """
+    from src.stocks.ml.training import evaluate_growth_route_research
+
+    if not parsed.snapshot_id:
+        raise ValueError(
+            "--research-only-growth-route requires --snapshot-id; the read-only "
+            "evaluation never publishes an artifact"
+        )
+    decision_time = parsed.decision_time or REFERENCE_DATETIME
+    repository = ResearchDataRepository(
+        base_root=parsed.base_root,
+        feature_root=parsed.feature_root,
+        label_root=parsed.label_root,
+    )
+    snapshot = resolve_snapshot_for_mode(
+        parsed.catalog_root, parsed.snapshot_id, mode=parsed.mode
+    )
+    composed = repository.compose_labeled_training_snapshot(
+        snapshot,
+        feature_set="stock_net_alpha_v1",
+        decision_time=decision_time,
+    )
+    data = compose_net_alpha_training_data(
+        composed,
+        decision_time,
+        candidate_horizon_sessions=_parse_horizons(parsed.candidate_horizon_sessions),
+    )
+    payload = evaluate_growth_route_research(data, request)
+    return {
+        "status": "RESEARCH_ONLY",
+        "artifact_published": False,
+        "artifact_id": request.artifact_id,
+        **payload,
+    }
 
 
 def _resolve_cost_contexts(
@@ -868,6 +923,11 @@ def main(args: list[str] | None = None) -> int:
     # closed without data allocation.
     request = _build_training_request(parsed)
     _validate_static_training_request(request)
+
+    if parsed.research_only_growth_route:
+        payload = run_research_only_growth_route(parsed, request)
+        sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
+        return 0
 
     # Direct dataset loading path
     if parsed.base_dataset_id and parsed.feature_dataset_id and parsed.label_dataset_id:

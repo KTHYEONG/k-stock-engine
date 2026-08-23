@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ml_backtest_compounding_structure",
+      "date": "2026-08-23",
+      "adr_id": "ADR_20260823_ml_backtest_compounding_structure",
+      "domain": "stocks",
+      "title": "Prequential ML Growth Route",
+      "why": "Global frontier admission was economically misaligned: the latest 24 candidates had negative base/stress growth, while prequential policy selection was not wired into the stitched equity path.",
+      "resolution": "Added causal growth-route stitching, absolute and exposure-matched compound certification, bounded no-trade observability, and research-only route diagnostics while preserving fail-closed execution and artifact fingerprints.",
+      "impact": "Training and forward holdout promotion now require positive base/stress/relative lower CAGR from one causally selected execution route; no-trade results retain actionable bounded rejection evidence."
+    },
+    {
       "task_id": "TASK_STOCK_ML_HORIZON_SCOPE_LEDGER_COMPLETION_20260823",
       "date": "2026-08-23",
       "adr_id": "ADR_20260823_STOCK_ML_HORIZON_SCOPE_LEDGER_COMPLETION_20260823",
@@ -989,16 +999,6 @@
       "why": "The refactored tree still exposed duplicate etf/etfs roots and retained historical file layouts, reducing AI navigation efficiency and obscuring ownership.",
       "resolution": "Consolidated shared contracts under core/storage, organized stocks and ETFs by research/trading/backtesting/workflows, rebuilt execution around intents/orders/readiness, and quarantined historical implementations under src/legacy with parity coverage.",
       "impact": "Stock and ETF boundaries are explicit, legacy code is isolated, new ML/research components are replaceable, and the architecture remains extensible without reintroducing duplicate roots."
-    },
-    {
-      "task_id": "TASK_STOCK_ETF_ML_REFACTOR",
-      "date": "2026-08-09",
-      "adr_id": "ADR_20260809_STOCK_ETF_ML_REFACTOR",
-      "domain": "architecture",
-      "title": "Separate stock and ETF architecture with replaceable ML",
-      "why": "Historical stock YetiRank, ETF strategy, data processing, simulation, and unfinished execution paths were coupled and lacked explicit asset boundaries.",
-      "resolution": "Introduced explicit core asset contracts, isolated stocks and etfs packages, point-in-time ML dataset/split/artifact boundaries, ETF parity fixtures, and paper-only execution gates; aligned filters tests and quality tooling with the migration boundary.",
-      "impact": "Research and simulation paths are structurally separated; legacy modules remain excluded/read-only during migration, and live order submission remains gated."
     }
   ]
 }
