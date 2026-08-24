@@ -30,7 +30,12 @@ CANONICAL_FEATURE_SET = "stock_net_alpha_v1"
 
 ELASTIC_NET_FAMILY = "net_alpha_elastic_net"
 TAIL_LAMBDARANK_FAMILY = "economic_tail_lambdarank"
-DECLARED_ECONOMIC_FAMILIES = (ELASTIC_NET_FAMILY, TAIL_LAMBDARANK_FAMILY)
+RAWNET_LGBM_FAMILY = "economic_rawnet_lgbm"
+DECLARED_ECONOMIC_FAMILIES = (
+    ELASTIC_NET_FAMILY,
+    TAIL_LAMBDARANK_FAMILY,
+    RAWNET_LGBM_FAMILY,
+)
 
 OUTCOME_REALIZED = "REALIZED"
 OUTCOME_PARTIAL_TAIL = "PARTIAL_TAIL"
@@ -827,7 +832,9 @@ class EconomicFamilyStudySettings:
     candidate_lookback_sessions: tuple[int | None, ...] = (504, 756, 1260, None)
     common_min_train_sessions: int = 1260
     min_validation_segment_sessions: int = 126
-    model_families: tuple[str, ...] = DECLARED_ECONOMIC_FAMILIES
+    # Pre-registered study grid stays pinned to the legacy two-family split;
+    # RAWNET_LGBM_FAMILY enters via explicit settings or mainline discovery.
+    model_families: tuple[str, ...] = (ELASTIC_NET_FAMILY, TAIL_LAMBDARANK_FAMILY)
 
     def __post_init__(self) -> None:
         if not self.candidate_lookback_sessions:
