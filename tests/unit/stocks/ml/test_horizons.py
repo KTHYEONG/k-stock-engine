@@ -944,3 +944,134 @@ def test_growth_route_seed_none_is_v1_parity() -> None:
     assert route.route_version == "v1"
     assert route.seed_policy is None
     assert route.invested_interval_count < route.observed_interval_count
+
+
+class TestBenchmarkReconciliationReason:
+    """SCENARIO_BENCHMARK_RECONCILIATION_REASON_RECORDED."""
+
+    @staticmethod
+    def _route_and_discovery(n_panel_sessions: int, growth_length: int):
+        from datetime import UTC, datetime
+
+        import polars as pl
+
+        from src.stocks.ml.horizons import HorizonOOFEvidence as _Evidence
+        from src.stocks.ml.training import HorizonDiscovery
+        from src.stocks.ml.execution_replay import ExecutionReplayEvidence
+
+        sessions = [
+            datetime(2024, 1, 1 + i, tzinfo=UTC)
+            for i in range(n_panel_sessions)
+        ]
+        rows = []
+        for session in sessions:
+            for t in range(3):
+                price = 100.0 + t
+                rows.append(
+                    {
+                        "instrument_id": f"KRX:{t + 1:05d}",
+                        "session": session,
+                        "observation_time": session.replace(hour=15, minute=30),
+                        "available_time": session.replace(hour=15, minute=31),
+                        "open": price,
+                        "close": price * 1.01,
+                        "volume": 1_000_000.0,
+                        "trading_value": 100_000_000.0,
+                        "sector": "S0",
+                        "adtv": 100_000_000.0,
+                    }
+                )
+        panel = pl.DataFrame(rows)
+        key = (10, 5, 2, _LOWER)
+        n_growth = growth_length
+        evidence = ExecutionReplayEvidence(
+            base_log_growth=tuple(0.01 for _ in range(n_growth)),
+            stress_log_growth=tuple(0.01 for _ in range(n_growth)),
+            segment_ids=tuple(0 for _ in range(n_growth)),
+            planned_cycles=2,
+            filled_orders=6,
+            cash_session_fraction=0.0,
+            turnover=0.5,
+            observed_interval_count=n_growth,
+            invested_interval_count=n_growth,
+            invested_interval_fraction=1.0,
+            base_interval_exposure=tuple(0.9 for _ in range(growth_length)),
+            stress_interval_exposure=tuple(0.9 for _ in range(growth_length)),
+        )
+        from src.stocks.ml.horizons import GrowthRouteEvidence as _Route
+
+        route = _Route(
+            base_log_growth=tuple(0.01 for _ in range(growth_length)),
+            stress_log_growth=tuple(0.01 for _ in range(growth_length)),
+            segment_ids=tuple(0 for _ in range(growth_length)),
+            selected_policies=(key,),
+            interval_policies=(key,) * growth_length,
+            benchmark_log_growth=(),
+            candidate_count=1,
+            observed_interval_count=growth_length,
+            invested_interval_count=growth_length,
+            filled_orders=6,
+            filled_cycle_count=2,
+            turnover_ratio=0.5,
+        )
+        discovery_evidence = _Evidence(
+            horizon_sessions=10,
+            profile_id=_LOWER,
+            model_family="net_alpha_elastic_net",
+            base_log_growth=tuple(0.01 for _ in range(growth_length)),
+            stress_log_growth=tuple(0.01 for _ in range(growth_length)),
+            cohort_segment_ids=tuple(0 for _ in range(growth_length)),
+            complete_cohort_count=growth_length,
+            active_cohort_count=growth_length,
+            partial_cohort_count=0,
+            missing_cohort_count=0,
+            segment_count=1,
+            fold_rank_ics=(0.2,),
+            rebalance_frequency_sessions=5,
+            top_k=2,
+        )
+        discovery = HorizonDiscovery(
+            evidence=(discovery_evidence,),
+            diagnostics=(),
+            oof_by_horizon={},
+            execution_evidence_by_candidate={key: evidence},
+        )
+        return route, discovery, panel
+
+    def test_benchmark_reconciliation_reason_recorded(self) -> None:
+        """SCENARIO_BENCHMARK_RECONCILIATION_REASON_RECORDED."""
+        from src.stocks.research.metrics import certify_growth_route
+        from src.stocks.ml.contracts import CompoundingCertificationSettings
+        from src.stocks.ml.training import (
+            _attach_growth_route_execution_evidence,
+            _growth_route_projection,
+        )
+
+        settings = CompoundingCertificationSettings()
+        # Five panel sessions against four exposure/growth entries.
+        mismatched_route, discovery, panel = self._route_and_discovery(5, 4)
+        attached = _attach_growth_route_execution_evidence(
+            mismatched_route, discovery, panel
+        )
+        assert attached.benchmark_log_growth == ()
+        assert (
+            attached.benchmark_reconcile_failure
+            == "benchmark-exposure-length-mismatch"
+        )
+        certificate = certify_growth_route(attached, 10, settings)
+        projection = _growth_route_projection(attached, certificate)
+        assert (
+            projection["benchmark_reconcile_failure"]
+            == "benchmark-exposure-length-mismatch"
+        )
+        assert "matched-benchmark-missing" in certificate["reasons"]
+
+    def test_successful_attach_leaves_empty_reason(self) -> None:
+        from src.stocks.ml.training import (
+            _attach_growth_route_execution_evidence,
+        )
+
+        route, discovery, panel = self._route_and_discovery(5, 5)
+        attached = _attach_growth_route_execution_evidence(route, discovery, panel)
+        assert attached.benchmark_reconcile_failure == ""
+        assert len(attached.benchmark_log_growth) == len(route.base_log_growth)

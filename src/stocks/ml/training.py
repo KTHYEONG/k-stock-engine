@@ -708,6 +708,13 @@ def _run_discovery_and_publish(
             },
             policy_frontier=_policy_frontier_projection(request, discovery, None),
         )
+    if str(final_policy[3]).endswith(_BLEND_PROFILE_SUFFIX):
+        reason, details = _blend_champion_no_trade(growth_route, certificate)
+        return _no_trade(
+            reason,
+            details=details,
+            policy_frontier=_policy_frontier_projection(request, discovery, None),
+        )
 
     selection = select_horizons(
         discovery.evidence, request.bootstrap_alpha, request.seed,
@@ -2112,6 +2119,21 @@ def _build_horizon_evidence(
         }
         horizon_memory[horizon].update(replay_runtime_metrics)
         _enforce_memory_budget(request, "horizon_discovery")
+
+    if request.enable_horizon_blend:
+        _replay_blend_candidates(
+            pre_holdout=pre_holdout,
+            folds=folds,
+            data=data,
+            request=request,
+            matrix=matrix,
+            registry=registry,
+            oof_by_horizon=oof_by_horizon,
+            cells_by_horizon=cells_by_horizon,
+            evidence=evidence,
+            dropout_reasons=dropout_reasons,
+            execution_evidence_by_candidate=execution_evidence_by_candidate,
+        )
     return HorizonDiscovery(
         evidence=tuple(evidence),
         diagnostics=tuple(diagnostics),
@@ -2126,6 +2148,178 @@ def _build_horizon_evidence(
             len(diagnostics) * len(folds) * (_NESTED_INNER_FOLDS + 1)
         ),
     )
+
+
+def _replay_blend_candidates(
+    *,
+    pre_holdout: pl.DataFrame,
+    folds: list[Fold],
+    data: NetAlphaResearchData,
+    request: NetAlphaTrainingRequest,
+    matrix: PreparedTrainingMatrix,
+    registry: ModelArtifactRegistry | None,
+    oof_by_horizon: Mapping[int, tuple[Path, Path, list[float]]],
+    cells_by_horizon: Mapping[int, list[tuple[int, int]]],
+    evidence: list[HorizonOOFEvidence],
+    dropout_reasons: dict[tuple[int, int, int, str], str],
+    execution_evidence_by_candidate: dict[
+        tuple[int, int, int, str], ExecutionReplayEvidence
+    ],
+) -> None:
+    """Replay cross-horizon rank-blend candidates at the largest admitted horizon.
+
+    Blend scores are the mean within-session percentile rank of the cached
+    calibrated OOF frames, recomputed through the same causal calibration as
+    the base path before replay. Every failure mode is additive-only: a
+    missing second horizon or an unusable blend frame records
+    ``blend-scores-unavailable`` on the would-be keys and never touches base
+    evidence.
+    """
+    target_horizon = max(request.execution_frontier.candidate_horizon_sessions)
+    cells_at_target = cells_by_horizon.get(target_horizon, [])
+    would_be_keys = [
+        (target_horizon, cadence, top_k,
+         f"{profile.profile_id}{_BLEND_PROFILE_SUFFIX}")
+        for cadence, top_k in cells_at_target
+        for profile in request.policy_profiles
+    ]
+    admitted_horizons = sorted(oof_by_horizon)
+    blended: pl.DataFrame | None = None
+    if len(admitted_horizons) >= 2 and cells_at_target and folds:
+        cached_frames: dict[int, pl.DataFrame] = {}
+        try:
+            for horizon in admitted_horizons:
+                cached_frames[horizon] = _read_oof_parquet(
+                    oof_by_horizon[horizon][0]
+                )
+            try:
+                blended = _blend_calibrated_scores(cached_frames, target_horizon)
+            except ValueError:
+                logger.warning(
+                    "[ALGO] stage=horizon_blend status=unusable "
+                    "reason=blend-scores-unavailable"
+                )
+                blended = None
+        finally:
+            cached_frames.clear()
+    if blended is None:
+        for key in would_be_keys:
+            dropout_reasons[key] = _BLEND_DROPOUT_UNAVAILABLE
+        return
+
+    economic_columns = (
+        "expected_active_alpha",
+        "alpha_lower_bound",
+        "expected_net_alpha",
+        "net_alpha_lower_bound",
+        "exit_cost_rate",
+    )
+    blended_raw = blended.drop(
+        [column for column in economic_columns if column in blended.columns]
+    )
+    del blended
+    anchor_manifest = _base_manifest(request, data, data.feature_frame, target_horizon)
+    initial_rows = np.flatnonzero(
+        matrix.session_code < folds[0].validation_decision_start - 1
+    )
+    seed_ledger = build_initial_calibration_seed(
+        matrix, initial_rows, request, target_horizon, anchor_manifest, data=data,
+    )
+    blend_labels = _read_oof_parquet(oof_by_horizon[target_horizon][1])
+    blend_calibrated = _causal_oof_calibrate(
+        blended_raw,
+        blend_labels,
+        request,
+        target_horizon,
+        seed_ledger=seed_ledger,
+    )
+    del blended_raw, seed_ledger
+    replay_planned_bytes = int(blend_calibrated.estimated_size()) + int(
+        blend_labels.estimated_size()
+    )
+    envelope = _plan_training_allocation(
+        replay_planned_bytes,
+        request_limit_bytes=(
+            None
+            if request.max_rss_mib is None
+            else int(request.max_rss_mib) * 1024 * 1024
+        ),
+        reserve_bytes=int(request.memory_reserve_mib) * 1024 * 1024,
+    )
+    if not envelope.ok:
+        raise _MemoryBudgetExceededError("replay")
+    blend_specs = [
+        (
+            cadence,
+            top_k,
+            replace(
+                profile,
+                profile_id=f"{profile.profile_id}{_BLEND_PROFILE_SUFFIX}",
+            ),
+        )
+        for cadence, top_k in cells_at_target
+        for profile in request.policy_profiles
+    ]
+    family_label = f"{request.discovery_model_family}+mh_blend"
+    anchor_ics = tuple(oof_by_horizon[target_horizon][2])
+    batch_results = _replay_costs_batch(
+        _require_caller_registry(registry),
+        blend_calibrated,
+        blend_labels,
+        request,
+        target_horizon,
+        request.risk,
+        pre_holdout,
+        data.manifest,
+        blend_specs,
+    )
+    del blend_calibrated
+    for cadence, top_k, profile in blend_specs:
+        key = (target_horizon, cadence, top_k, profile.profile_id)
+        pair = batch_results.get(key)
+        if pair is None:
+            dropout_reasons[key] = "replay-batch-error"
+            continue
+        base_evidence = pair.candidate
+        if not base_evidence.base_log_growth:
+            dropout_reasons[key] = "no-evaluated-vintages"
+            continue
+        if base_evidence.filled_orders == 0:
+            dropout_reasons[key] = "no-filled-orders"
+            continue
+        shadow_evidence = pair.dense_shadow
+        if shadow_evidence is None:
+            dropout_reasons[key] = "missing-shadow-evidence"
+            continue
+        _incremental_growth_gate(base_evidence, shadow_evidence, request, target_horizon)
+        paired_stress = tuple(
+            float(candidate - shadow)
+            for candidate, shadow in zip(
+                base_evidence.stress_log_growth,
+                shadow_evidence.stress_log_growth,
+                strict=True,
+            )
+        )
+        candidate_evidence = _evidence_from_execution(
+            target_horizon,
+            profile.profile_id,
+            family_label,
+            base_evidence,
+            base_evidence,
+            anchor_ics,
+            len(folds),
+            paired_stress_log_growth=paired_stress,
+            sparse_turnover=base_evidence.turnover,
+            shadow_turnover=shadow_evidence.turnover,
+            rebalance_frequency_sessions=cadence,
+            top_k=top_k,
+        )
+        failure_reason = _coverage_failure_reason(candidate_evidence, request)
+        dropout_reasons[key] = failure_reason
+        if failure_reason:
+            continue
+        evidence.append(candidate_evidence)
+        execution_evidence_by_candidate[key] = base_evidence
 
 
 def _discovery_oof(
@@ -2533,6 +2727,103 @@ def _on_demand_schema(learner_columns: tuple[str, ...]) -> FeatureTransformSchem
     )
 
 
+_BLEND_PROFILE_SUFFIX = ":blend"
+_BLEND_DROPOUT_UNAVAILABLE = "blend-scores-unavailable"
+
+
+def _fold_score_diagnostics(
+    oof: pl.DataFrame,
+    ics: Sequence[float],
+) -> tuple[FoldScoreDiagnostic, ...]:
+    """Per-fold target-free score diagnostics in ascending segment order.
+
+    ``rank_ic`` takes the positional session-mean Rank-IC from ``ics`` (empty
+    when a family does not compute one); the failure reason stays empty for
+    usable non-constant folds and reads ``constant-oof-score`` otherwise.
+    """
+    if oof.is_empty() or _OOF_SEGMENT not in oof.columns:
+        return ()
+    diagnostics: list[FoldScoreDiagnostic] = []
+    segments = sorted(oof[_OOF_SEGMENT].unique().to_list())
+    for index, segment in enumerate(segments):
+        scores = oof.filter(pl.col(_OOF_SEGMENT) == segment)[SCORE_COLUMN]
+        std_raw = scores.std() if scores.len() else None
+        std = (
+            float(std_raw)
+            if isinstance(std_raw, (int, float))
+            else 0.0
+        )
+        finite_count = int(scores.is_finite().sum()) if scores.len() else 0
+        unique_count = int(scores.n_unique()) if scores.len() else 0
+        rank_ic = float(ics[index]) if index < len(ics) else 0.0
+        diagnostics.append(
+            FoldScoreDiagnostic(
+                fold_index=index,
+                score_std=std if math.isfinite(std) else 0.0,
+                finite_count=finite_count,
+                unique_count=unique_count,
+                rank_ic=rank_ic,
+                failure_reason="" if std > 0.0 else "constant-oof-score",
+            )
+        )
+    return tuple(diagnostics)
+
+
+def _blend_calibrated_scores(
+    frames: Mapping[int, pl.DataFrame], horizon_sessions: int
+) -> pl.DataFrame | None:
+    """Mean within-session percentile rank across horizons on the anchor frame.
+
+    The anchor is the cached calibrated frame at ``horizon_sessions``; every
+    other admitted horizon contributes only its per-session percentile rank of
+    ``predicted_net_alpha`` inner-joined on identity keys, so names absent from
+    any horizon never receive a zero-filled score. The returned frame keeps the
+    anchor schema with ``predicted_net_alpha`` replaced by the blended rank;
+    derived economic columns stay stale and must be recomputed by causal
+    calibration before replay.
+    """
+    anchor = frames.get(horizon_sessions)
+    if anchor is None or anchor.is_empty():
+        return None
+    others = [
+        frame
+        for horizon, frame in sorted(frames.items())
+        if horizon != horizon_sessions and not frame.is_empty()
+    ]
+    if not others:
+        return None
+    keys = [_ID_COLUMN, SESSION_COLUMN, _SESSION_IDX, _OOF_SEGMENT]
+    stacked_frames = []
+    for horizon, frame in sorted(frames.items()):
+        stacked_frames.append(
+            frame.select(*keys, SCORE_COLUMN).with_columns(
+                (
+                    pl.col(SCORE_COLUMN).rank("average").over(SESSION_COLUMN)
+                    / pl.col(SCORE_COLUMN).count().over(SESSION_COLUMN)
+                ).alias("__blend_rank"),
+                pl.lit(int(horizon), dtype=pl.Int64).alias("__blend_horizon"),
+            )
+        )
+    mean_rank = (
+        pl.concat(stacked_frames, how="vertical")
+        .group_by(keys)
+        .agg(pl.col("__blend_rank").mean().alias("__blend_mean"))
+    )
+    blended = (
+        anchor.join(mean_rank, on=list(keys), how="inner")
+        .with_columns(pl.col("__blend_mean").alias(SCORE_COLUMN))
+        .drop("__blend_mean")
+    )
+    if blended.is_empty():
+        return None
+    if (
+        blended[SCORE_COLUMN].null_count() > 0
+        or not bool(blended[SCORE_COLUMN].is_finite().all())
+    ):
+        raise ValueError("blended OOF scores must be finite for every row")
+    return blended
+
+
 def _fit_oof(
     pre_holdout: pl.DataFrame,
     folds: list[Fold],
@@ -2586,6 +2877,7 @@ def _fit_oof(
         diagnostic = HorizonOOFDiagnostic(
             horizon_sessions=horizon_sessions,
             model_family=family,
+            fold_diagnostics=_fold_score_diagnostics(oof, ics),
         )
         return oof, labeled, ics, diagnostic, 0
 
@@ -2612,6 +2904,7 @@ def _fit_oof(
         diagnostic = HorizonOOFDiagnostic(
             horizon_sessions=horizon_sessions,
             model_family=family,
+            fold_diagnostics=_fold_score_diagnostics(oof, ()),
         )
         return oof, labeled, [], diagnostic, 0
 
@@ -3487,6 +3780,25 @@ def _policy_key_label(key: tuple[int, int, int, str] | None) -> str | None:
     return f"{horizon}:{cadence}:{top_k}:{profile_id}"
 
 
+def _blend_champion_no_trade(
+    growth_route: Mapping[str, object],
+    certificate: Mapping[str, object],
+) -> tuple[str, dict[str, object]]:
+    """Fail-closed NO_TRADE arguments for a blended final policy.
+
+    A blended champion has no single-artifact holdout representation yet, so
+    promotion stops pre-holdout instead of fabricating evidence; the research
+    payload is retained verbatim.
+    """
+    return (
+        "blend-champion-holdout-unsupported",
+        {
+            "growth_route": growth_route,
+            "growth_route_certificate": dict(certificate),
+        },
+    )
+
+
 def _growth_route_projection(
     route: GrowthRouteEvidence, certificate: Mapping[str, object]
 ) -> dict[str, object]:
@@ -3551,6 +3863,7 @@ def _growth_route_projection(
             float(route.sparse_minus_dense_lower_growth), 12
         ),
         "turnover_ratio": round(float(route.turnover_ratio), 12),
+        "benchmark_reconcile_failure": str(route.benchmark_reconcile_failure)[:96],
         "rejection_reason_counts": dict(sorted(rejection_counts.items())),
     }
 
@@ -3601,7 +3914,10 @@ def _attach_growth_route_execution_evidence(
         if (not panel.is_empty() and "session" in panel.columns)
         else ()
     )
+    benchmark_failure = ""
     benchmark_failed = not sessions
+    if benchmark_failed:
+        benchmark_failure = "benchmark-panel-missing"
     for key in sorted(keys):
         evidence = discovery.execution_evidence_by_candidate.get(key)
         if evidence is None:
@@ -3614,6 +3930,7 @@ def _attach_growth_route_execution_evidence(
         adjusted = (*exposure, 0.0) if len(sessions) == len(exposure) + 1 else exposure
         if len(adjusted) != len(sessions):
             benchmark_failed = True
+            benchmark_failure = "benchmark-exposure-length-mismatch"
             continue
         try:
             benchmark = exposure_matched_benchmark_log_growth(
@@ -3621,9 +3938,11 @@ def _attach_growth_route_execution_evidence(
             )
         except ValueError:
             benchmark_failed = True
+            benchmark_failure = "benchmark-series-invalid"
             continue
         if len(benchmark) != len(evidence.base_log_growth):
             benchmark_failed = True
+            benchmark_failure = "benchmark-exposure-length-mismatch"
             continue
         benchmarks[key] = benchmark
     stitched_benchmark: tuple[float, ...] = ()
@@ -3660,11 +3979,16 @@ def _attach_growth_route_execution_evidence(
             values.append(float(benchmarks[interval_key][indices[offset]]))
         if aligned and len(values) == len(route.base_log_growth):
             stitched_benchmark = tuple(values)
+        else:
+            benchmark_failure = "benchmark-series-invalid"
+    elif not benchmark_failed:
+        benchmark_failure = "benchmark-candidate-evidence-missing"
     return replace(
         route,
         filled_orders=fills,
         filled_cycle_count=filled_cycles,
         benchmark_log_growth=stitched_benchmark,
+        benchmark_reconcile_failure=benchmark_failure[:96],
     )
 
 

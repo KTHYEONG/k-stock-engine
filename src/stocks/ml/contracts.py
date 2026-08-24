@@ -439,6 +439,7 @@ class NetAlphaTrainingRequest:
     execution_policy: ExecutionOutcomePolicy | None = None
     enforce_snapshot_outcome_readiness: bool = True
     discovery_model_family: str = ELASTIC_NET_FAMILY
+    enable_horizon_blend: bool = False
 
     def __post_init__(self) -> None:
         if not self.artifact_id:
@@ -482,6 +483,11 @@ class NetAlphaTrainingRequest:
                 f"unknown discovery_model_family "
                 f"{self.discovery_model_family!r}; declared families are "
                 f"{DECLARED_ECONOMIC_FAMILIES}"
+            )
+        if self.enable_horizon_blend and len(self.candidate_horizon_sessions) < 2:
+            raise ValueError(
+                "enable_horizon_blend requires at least two candidate horizons; "
+                f"got {tuple(self.candidate_horizon_sessions)}"
             )
 
 
