@@ -429,5 +429,8 @@
   },
   "src/stocks/ml/compound_track.py": {
     "testing": "tests/unit/stocks/ml/test_compound_track.py"
+  },
+  "src/stocks/ml/economic_research.py": {
+    "testing": "tests/unit/stocks/ml/test_economic_research.py"
   }
 }
