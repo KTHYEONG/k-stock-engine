@@ -836,3 +836,111 @@ def test_attainability_after_resolution_fix() -> None:
 
     with pytest.raises(ValueError, match="below the resolvable minimum"):
         select_horizons((strong,), 0.05, 42, n_bootstrap=50)
+
+
+_SEED_KEY = (20, 10, 8, _LOWER)
+
+
+def test_growth_route_seed_invests_segment0() -> None:
+    """SCENARIO_GROWTH_ROUTE_SEED_01_INVESTS_SEGMENT0.
+
+    A pre-registered seed policy invests the otherwise-forced-cash segment 0:
+    its own segment-0 series is spliced verbatim, every interval carries one
+    policy, coverage is complete, and the route is tagged v2.
+    """
+    alpha = 0.05
+    n_bootstrap = 20
+
+    seed_candidate = _segmented_evidence(
+        20,
+        {0: (-0.02,) * 12, 1: (0.02,) * 12, 2: (0.02,) * 12},
+        profile_id=_LOWER,
+        cadence=10,
+        top_k=8,
+    )
+    assert seed_candidate.rebalance_frequency_sessions == 10
+    assert seed_candidate.top_k == 8
+    assert seed_candidate.horizon_sessions == 20
+
+    route = stitch_prequential_growth_route(
+        (seed_candidate,), alpha, 42, n_bootstrap, seed_policy=_SEED_KEY
+    )
+    seg0_length = sum(
+        1 for segment in route.segment_ids if segment == 0
+    )
+    assert seg0_length == 12
+    assert route.selected_policies[0] == _SEED_KEY
+    assert list(route.base_log_growth[:seg0_length]) == [-0.02] * 12
+    assert list(route.stress_log_growth[:seg0_length]) == [-0.02] * 12
+    assert route.observed_interval_count == 36
+    assert route.invested_interval_count == route.observed_interval_count
+    assert route.route_version == "v2"
+    assert route.seed_policy == _SEED_KEY
+
+
+def test_growth_route_seed_admissible_beats_seed() -> None:
+    """SCENARIO_GROWTH_ROUTE_SEED_02_ADMISSIBLE_BEATS_SEED.
+
+    The seed only fills segments no earlier evidence admits; a strictly
+    positive candidate admissible from prior segments wins its segment.
+    """
+    alpha = 0.05
+    n_bootstrap = 20
+
+    seed_candidate = _segmented_evidence(
+        20,
+        {0: (-0.02,) * 12, 1: (-0.02,) * 12, 2: (-0.02,) * 12},
+        profile_id=_LOWER,
+        cadence=10,
+        top_k=8,
+    )
+    strong = _segmented_evidence(
+        5, {0: (0.02,) * 12, 1: (0.02,) * 12}, profile_id=_LEGACY
+    )
+    route = stitch_prequential_growth_route(
+        (seed_candidate, strong), alpha, 42, n_bootstrap, seed_policy=_SEED_KEY
+    )
+    # Segment 0: no earlier evidence exists, the seed invests.
+    assert route.selected_policies[0] == _SEED_KEY
+    # Segment 1: the strong candidate is admissible from segment 0 and beats
+    # the seed; the losing seed candidate is never re-selected.
+    assert route.selected_policies[1] == (5, 5, 20, _LEGACY)
+    seed_positions = [
+        index
+        for index, key in enumerate(route.interval_policies)
+        if key == _SEED_KEY
+    ]
+    assert seed_positions
+    assert all(route.segment_ids[index] == 0 for index in seed_positions)
+
+
+def test_growth_route_seed_missing_candidate_fails_closed() -> None:
+    """SCENARIO_GROWTH_ROUTE_SEED_03_MISSING_CANDIDATE_FAILS_CLOSED."""
+    orphan = _segmented_evidence(5, {0: (0.01,) * 6}, profile_id=_LEGACY)
+    with pytest.raises(ValueError, match="seed policy") as exc_info:
+        stitch_prequential_growth_route(
+            (orphan,), 0.05, 42, 20, seed_policy=_SEED_KEY
+        )
+    assert str(_LOWER) in str(exc_info.value)
+    assert "20" in str(exc_info.value)
+    assert "10" in str(exc_info.value)
+
+
+def test_growth_route_seed_none_is_v1_parity() -> None:
+    """SCENARIO_GROWTH_ROUTE_SEED_04_NONE_IS_V1_PARITY.
+
+    Omitting the seed reproduces v1 exactly: forced-cash segment 0, v1 tag,
+    and a null seed_policy field.
+    """
+    candidate = _segmented_evidence(
+        20,
+        {0: (-0.02,) * 12, 1: (0.02,) * 12, 2: (0.02,) * 12},
+        profile_id=_LOWER,
+        cadence=10,
+    )
+    route = stitch_prequential_growth_route((candidate,), 0.05, 42, 20)
+    assert route.selected_policies[0] is None
+    assert all(value == 0.0 for value in route.base_log_growth[:12])
+    assert route.route_version == "v1"
+    assert route.seed_policy is None
+    assert route.invested_interval_count < route.observed_interval_count
