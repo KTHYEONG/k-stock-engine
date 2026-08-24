@@ -88,7 +88,7 @@ def test_validate_policy_profiles_rejects_non_positive_aversion() -> None:
 def test_validate_policy_profiles_rejects_empty_and_extra() -> None:
     with pytest.raises(ValueError, match="at least one profile"):
         validate_policy_profiles(())
-    with pytest.raises(ValueError, match="exactly the three default profiles"):
+    with pytest.raises(ValueError, match="is not permitted"):
         validate_policy_profiles((*DEFAULT_POLICY_PROFILES, PolicyProfile("extra", 1.0)))
 
 
