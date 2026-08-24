@@ -732,6 +732,14 @@ def build_parser() -> argparse.ArgumentParser:
             "fitting (fail-closed against undeclared values)"
         ),
     )
+    parser.add_argument(
+        "--enable-horizon-blend",
+        action="store_true",
+        help=(
+            "Pre-register cross-horizon rank-blend frontier candidates "
+            "(requires >= 2 candidate horizons)"
+        ),
+    )
     return parser
 
 
@@ -779,6 +787,7 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
         max_training_lookback_sessions=args.max_training_lookback_sessions,
         seed=args.seed,
         discovery_model_family=args.discovery_model_family,
+        enable_horizon_blend=bool(getattr(args, 'enable_horizon_blend', False)),
         portfolio=PortfolioSettings(
             top_k=args.top_k,
             max_single_weight=args.max_single_weight,

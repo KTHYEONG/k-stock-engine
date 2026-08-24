@@ -276,3 +276,21 @@ def test_rawnet_lgbm_01_family_declared() -> None:
         NetAlphaTrainingRequest(artifact_id="v1").discovery_model_family
         == ELASTIC_NET_FAMILY
     )
+
+
+def test_blend_single_horizon_rejected() -> None:
+    """SCENARIO_BLEND_FLAG_SINGLE_HORIZON_REJECTED: blend needs >= 2 horizons."""
+    with pytest.raises(ValueError, match="at least two candidate horizons"):
+        NetAlphaTrainingRequest(
+            artifact_id="blend-single",
+            candidate_horizon_sessions=(20,),
+            enable_horizon_blend=True,
+        )
+    request = NetAlphaTrainingRequest(
+        artifact_id="blend-pair",
+        candidate_horizon_sessions=(10, 20),
+        enable_horizon_blend=True,
+    )
+    assert request.enable_horizon_blend is True
+    default_request = NetAlphaTrainingRequest(artifact_id="blend-off")
+    assert default_request.enable_horizon_blend is False
