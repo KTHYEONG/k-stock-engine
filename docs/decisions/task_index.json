@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_GROWTH_ROUTE_INVESTED_RECOVERY",
+      "date": "2026-08-24",
+      "adr_id": "ADR_20260824_ML_GROWTH_ROUTE_INVESTED_RECOVERY",
+      "domain": "stocks_ml",
+      "title": "Prequential growth route seed-policy invested recovery",
+      "why": "Champion-parity replay experiments on ml_rawnet_h20_20260824 data proved the live prequential route forfeits the entire measured edge (0 of 1953 intervals invested, CAGR 0 percent vs frozen track +4.578 percent) because segment 0 is forced cash and per-slice bootstrap lower bounds never clear zero; sizing levers were measured inert or counterproductive (vol target no-op, turnover-budget removal cut CAGR to 3.1), cadence monotonicity favored C=5 (+5.34 percent best cell), cost drag was negligible, and the lab +38-46 percent figure traced to the retired NetAlphaPolicyReplay vintage proxy.",
+      "resolution": "Added optional ex-ante seed_policy to stitch_prequential_growth_route splicing the seed candidate's segment series only where no earlier evidence admits (admissible selection always outranks the seed, ValueError on unmatched seed, route tagged v2 when spliced), resolved it from the request contract alone via _seed_policy_or_none at both training call sites and the economic family study with a fail-closed v1 fallback recording seed-policy-candidate-missing, attached seed_policy plus invested_interval_fraction bounded scalars to _growth_route_projection, and pinned six contract scenarios including a champion frozen-track parity anchor.",
+      "impact": "Live prequential route now invests every evaluated OOF interval under the declared seed so measured alpha is expressible (parity with frozen track, best frontier cell C=5 K12 half_kelly +5.34 percent reachable without grid changes); certification gates, Holm admission, and NO_TRADE publication semantics are untouched pending pooled lower-bound reversal; six scenarios plus full stocks unit suite pass with lint and type clean."
+    },
+    {
       "task_id": "TASK_ML_RAWNET_H20_EXECUTION_VALIDATION",
       "date": "2026-08-24",
       "adr_id": "ADR_20260824_ML_RAWNET_H20_EXECUTION_VALIDATION",
@@ -989,16 +999,6 @@
       "why": "Historical master and disclosure evidence required complete point-in-time coverage, but date-by-date external APIs were slow and concurrent DART requests disconnected.",
       "resolution": "Collected and cataloged daily KRX historical master evidence, pinned a cost-and-master provisional snapshot, and preserved DART monthly partial partitions as incomplete evidence without false certification.",
       "impact": "Master and cost evidence now cover the provisional snapshot; DART and corporate actions remain fail-closed until a retrying single-worker resumable collector completes source coverage."
-    },
-    {
-      "task_id": "TASK_STOCK_COST_MODEL_HARDENING",
-      "date": "2026-08-10",
-      "adr_id": "ADR_20260810_STOCK_COST_MODEL_HARDENING",
-      "domain": "stocks",
-      "title": "KIS 비용 증거와 유동성 슬리피지",
-      "why": "백테스트 비용이 정적 수수료·세율·슬리피지에 의존해 BanKIS 우대수수료 가정, 시행일별 매도세, 주문 유동성을 재현하지 못했다.",
-      "resolution": "비용 증거 로더와 해시 고정 계약, effective-dated KIS 비용, 매도세 분해, ADTV·변동성·호가단위 기반 슬리피지 및 simulator/backtester 연결을 추가했다.",
-      "impact": "비용 산출물은 snapshot에 고정되고 누락 입력은 fail-closed된다. 전체 연구 인증은 역사적 종목 master·DART·검증된 기업행동 증거가 complete가 될 때까지 provisional이다."
     }
   ]
 }
