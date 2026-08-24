@@ -142,3 +142,51 @@ def test_projection_emits_bounded_scalars_only() -> None:
     assert projection["invested_interval_count"] == 4
     assert projection["filled_orders"] == 0
     assert projection["route_version"] == GROWTH_ROUTE_VERSION
+
+
+def test_projection_emits_invested_fraction_and_seed() -> None:
+    """SCENARIO_GROWTH_ROUTE_SEED_05_PROJECTION_SCALARS."""
+    from src.stocks.ml.training import _growth_route_projection
+
+    candidate = _evidence(
+        base=tuple(math.log1p(0.002) for _ in range(4)),
+    )
+    route = stitch_prequential_growth_route(
+        (candidate,), 0.05, seed=42, n_bootstrap=200, seed_policy=_KEY
+    )
+    projection = _growth_route_projection(route, {"reasons": []})
+    observed = projection["observed_intervals"]
+    invested = projection["invested_intervals"]
+    assert isinstance(observed, int)
+    assert isinstance(invested, int)
+    fraction = projection["invested_interval_fraction"]
+    assert isinstance(fraction, float)
+    assert 0.0 <= fraction <= 1.0
+    assert fraction == round(invested / observed, 12)
+    assert projection["seed_policy"] == "10:5:12:lower_bound_only"
+
+    cash_projection = _growth_route_projection(
+        stitch_prequential_growth_route((candidate,), 0.05, seed=42, n_bootstrap=200),
+        {"reasons": ["no-filled-orders"]},
+    )
+    assert cash_projection["seed_policy"] is None
+    assert cash_projection["invested_interval_fraction"] == 0.0
+    # Bounded scalars only: no per-interval series ever leaks into the payload.
+    for key, value in projection.items():
+        assert not isinstance(value, list), key
+
+
+def test_champion_frozen_track_parity_anchor() -> None:
+    """SCENARIO_GROWTH_ROUTE_SEED_06_CHAMPION_PARITY_ANCHOR."""
+    import json
+    from pathlib import Path
+
+    artifact = Path(
+        "data/artifacts/stocks/ml_rawnet_h20_20260824/metrics.json"
+    )
+    if not artifact.exists():
+        pytest.skip("champion run artifact is not present")
+    metrics = json.loads(artifact.read_text())
+    frozen = metrics["growth_route"]["frozen_compound_track"]
+    assert frozen["policy"] == [20, 10, 8, LOWER_BOUND_ONLY_PROFILE_ID]
+    assert frozen["point_cagr"] == pytest.approx(0.045781471671, abs=1e-9)
