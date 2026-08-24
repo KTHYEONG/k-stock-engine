@@ -51,7 +51,8 @@ from src.stocks.ml.compound_track import (
 )
 from src.stocks.ml.contracts import (
     CANONICAL_FEATURE_SET,
-    ELASTIC_NET_FAMILY,
+    DECLARED_ECONOMIC_FAMILIES,
+    RAWNET_LGBM_FAMILY,
     TAIL_LAMBDARANK_FAMILY,
     FoldScoreDiagnostic,
     HorizonOOFDiagnostic,
@@ -2542,7 +2543,7 @@ def _fit_oof(
         prepare_training_matrix,
     )
 
-    if family not in (ELASTIC_NET_FAMILY, TAIL_LAMBDARANK_FAMILY):
+    if family not in DECLARED_ECONOMIC_FAMILIES:
         raise ValueError(
             "prepared-array OOF fitting owns the declared economic families only; "
             f"got {family!r}"
@@ -2555,6 +2556,20 @@ def _fit_oof(
             fold_diagnostics=(),
         )
         return empty, empty, [], diagnostic, 0
+
+    if family == RAWNET_LGBM_FAMILY:
+        from src.stocks.ml.economic_research import (
+            fit_rawnet_lgbm_oof,
+            rawnet_fold_rank_ics,
+        )
+
+        oof, labeled = fit_rawnet_lgbm_oof(pre_holdout, folds, data, request, learner_columns, horizon_sessions)
+        ics = rawnet_fold_rank_ics(labeled)
+        diagnostic = HorizonOOFDiagnostic(
+            horizon_sessions=horizon_sessions,
+            model_family=family,
+        )
+        return oof, labeled, ics, diagnostic, 0
 
     if family == TAIL_LAMBDARANK_FAMILY:
         from src.stocks.ml.economic_research import fit_tail_lambdarank_oof
