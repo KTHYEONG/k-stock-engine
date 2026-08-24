@@ -808,6 +808,7 @@ class GrowthRouteEvidence:
     sparse_minus_dense_lower_growth: float = 0.0
     turnover_ratio: float = 0.0
     route_version: str = GROWTH_ROUTE_VERSION
+    seed_policy: PolicyKey | None = None
 
     def __post_init__(self) -> None:
         count = len(self.base_log_growth)
@@ -831,7 +832,7 @@ class GrowthRouteEvidence:
             raise ValueError("route benchmark log growth must be finite")
         if any(segment < 0 for segment in self.segment_ids):
             raise ValueError("route segment identity must be non-negative")
-        for key in (*self.selected_policies, *self.interval_policies):
+        for key in (*self.selected_policies, *self.interval_policies, self.seed_policy):
             if key is None:
                 continue
             horizon, cadence, top_k, profile_id = key
@@ -866,6 +867,8 @@ def stitch_prequential_growth_route(
     bootstrap_alpha: float,
     seed: int,
     n_bootstrap: int,
+    *,
+    seed_policy: PolicyKey | None = None,
 ) -> GrowthRouteEvidence:
     """Causally stitch one strategy-level prequential growth route.
 
@@ -876,10 +879,12 @@ def stitch_prequential_growth_route(
     stress lower growth bounds are strictly positive; sparse-minus-dense and
     turnover diagnostics never gate selection. The admissible candidate with
     the maximum stress lower growth wins (deterministic ``(H, C, K, profile)``
-    tie-breaks), and exactly that policy's current-segment values are appended;
-    when no earlier candidate qualifies the segment is cash and contributes
-    zero-growth intervals. Segment ``s``'s own returns never influence which
-    policy serves it.
+    tie-breaks), and exactly that policy's current-segment values are appended.
+    When no earlier candidate qualifies, ``seed_policy`` — declared from the
+    request contract alone, never from outcomes — invests the segment through
+    its matching candidate instead of forcing cash; an admissible selection
+    always outranks the seed. Segment ``s``'s own returns never influence
+    which policy serves it.
 
     Args:
         candidates: the discovery frontier's per-candidate vintage evidence.
@@ -889,9 +894,17 @@ def stitch_prequential_growth_route(
         n_bootstrap: resample count; the route is one strategy-level
             hypothesis, so at least ``ceil(1 / bootstrap_alpha)`` resamples
             are required to resolve its significance.
+        seed_policy: optional ex-ante ``(H, C, K, profile)`` policy used only
+            where no earlier evidence is admissible; must match a candidate.
 
     Returns:
-        The immutable :class:`GrowthRouteEvidence` stitched route.
+        The immutable :class:`GrowthRouteEvidence` stitched route, tagged
+        version ``v2`` when a seed was spliced at least once, else ``v1``.
+
+    Raises:
+        ValueError: when ``candidates`` is empty, ``bootstrap_alpha`` or
+            ``n_bootstrap`` violates resolvability, or ``seed_policy``
+            matches no discovery candidate.
     """
     if not candidates:
         raise ValueError(
@@ -917,6 +930,20 @@ def stitch_prequential_growth_route(
             ),
         )
     )
+    seed_by_key: dict[PolicyKey, HorizonOOFEvidence] = {
+        (
+            int(candidate.horizon_sessions),
+            int(candidate.rebalance_frequency_sessions),
+            int(candidate.top_k),
+            str(candidate.profile_id),
+        ): candidate
+        for candidate in ordered
+    }
+    if seed_policy is not None and seed_policy not in seed_by_key:
+        raise ValueError(
+            f"seed policy {seed_policy!r} matches no discovery candidate; "
+            "refusing to splice an uninvestable seed"
+        )
     segments = sorted(
         {int(seg) for candidate in ordered for seg in candidate.cohort_segment_ids}
     )
@@ -928,6 +955,7 @@ def stitch_prequential_growth_route(
     selected_policies: list[PolicyKey | None] = []
     paired_deltas: list[float] = []
     turnover_ratios: list[float] = []
+    seed_spliced = False
 
     def _slice_indices(candidate: HorizonOOFEvidence, upper: int) -> list[int]:
         return [
@@ -975,6 +1003,13 @@ def stitch_prequential_growth_route(
             ):
                 chosen = candidate
                 chosen_stress_lower = stress_lower
+
+        if chosen is None and seed_policy is not None:
+            # Ex-ante seed: declared from the request contract alone, it only
+            # fills segments no earlier evidence admits and never overrides
+            # an admissible selection.
+            chosen = seed_by_key[seed_policy]
+            seed_spliced = True
 
         selected_policies.append(
             None
@@ -1062,5 +1097,6 @@ def stitch_prequential_growth_route(
             float(np.mean(paired_deltas)) if paired_deltas else 0.0
         ),
         turnover_ratio=float(np.mean(turnover_ratios)) if turnover_ratios else 0.0,
-        route_version=GROWTH_ROUTE_VERSION,
+        route_version="v2" if seed_spliced else GROWTH_ROUTE_VERSION,
+        seed_policy=seed_policy,
     )
