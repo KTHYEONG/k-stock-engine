@@ -97,6 +97,7 @@ from src.stocks.ml.horizons import (
     GrowthRouteEvidence,
     HorizonOOFEvidence,
     HorizonSelectionEvidence,
+    PolicyKey,
     _cohort_bootstrap,
     select_horizons,
     stitch_prequential_growth_route,
@@ -653,7 +654,7 @@ def _run_discovery_and_publish(
         )
 
     # Contract-mandated route wiring: one prequential strategy-level hypothesis.
-    route = stitch_prequential_growth_route(discovery.evidence, request.bootstrap_alpha, request.seed, request.bootstrap_resamples)  # noqa: E501
+    route = stitch_prequential_growth_route(discovery.evidence, request.bootstrap_alpha, request.seed, request.bootstrap_resamples, seed_policy=_seed_policy_or_none(request))  # noqa: E501
     route = _attach_growth_route_execution_evidence(route, discovery, pre_holdout)
     primary = (
         route.selected_policies[-1][0]
@@ -1265,6 +1266,23 @@ def _risk_policy_for_profile(
         execution_utility_mode=profile.execution_utility_mode,
         sizing_mode=profile.sizing_mode,
     )
+
+
+def _seed_policy_or_none(request: NetAlphaTrainingRequest) -> PolicyKey | None:
+    """Ex-ante route seed resolved from the request contract only.
+
+    The frozen-policy key is declared without any outcome knowledge, so it is
+    causal by construction; an infeasible frontier falls back to the v1
+    all-cash route with a recorded reason instead of fabricating evidence.
+    """
+    try:
+        return resolve_frozen_policy_key(request)
+    except ValueError:
+        logger.warning(
+            "[ROUTE] stage=seed_policy status=fallback "
+            "reason=seed-policy-candidate-missing"
+        )
+        return None
 
 
 def _execution_replay_context(
@@ -3514,6 +3532,14 @@ def _growth_route_projection(
             route.selected_policies[-1] if route.selected_policies else None
         ),
         "selected_policies_digest": _digest_policies(),
+        "seed_policy": _policy_key_label(
+            getattr(route, "seed_policy", None)
+        ),
+        "invested_interval_fraction": round(
+            route.invested_interval_count / route.observed_interval_count, 12
+        )
+        if route.observed_interval_count > 0
+        else 0.0,
         "base_lower_cagr": _scalar("base_lower_cagr"),
         "stress_lower_cagr": _scalar("stress_lower_cagr"),
         "matched_lower_excess_cagr": _scalar("matched_lower_excess_cagr"),
@@ -3712,7 +3738,7 @@ def _growth_route_research_payload(
     """Stitch, certify, and project one read-only research route."""
     if not discovery.evidence:
         return _growth_route_research_rejection("no-horizon-evidence")
-    route = stitch_prequential_growth_route(discovery.evidence, request.bootstrap_alpha, request.seed, request.bootstrap_resamples)  # noqa: E501
+    route = stitch_prequential_growth_route(discovery.evidence, request.bootstrap_alpha, request.seed, request.bootstrap_resamples, seed_policy=_seed_policy_or_none(request))  # noqa: E501
     route = _attach_growth_route_execution_evidence(route, discovery, panel)
     primary = (
         route.selected_policies[-1][0]
