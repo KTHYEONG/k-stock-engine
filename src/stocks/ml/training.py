@@ -92,6 +92,7 @@ from src.stocks.ml.fitting import (
 from src.stocks.ml.fitting import (
     read_oof_parquet as _read_oof_parquet,
 )
+from src.stocks.ml.hedge_sleeve import project_hedge_sleeve
 from src.stocks.ml.horizons import (
     GROWTH_ROUTE_VERSION,
     GrowthRouteEvidence,
@@ -3833,8 +3834,51 @@ def _growth_route_projection(
             return round(float(value), 12)
         return None
 
+    blocking_gate_reasons = {
+        "no-filled-orders",
+        "insufficient-observed-sessions",
+        "invested-coverage-insufficient",
+        "max-drawdown-exceeded",
+        "period-series-incomplete",
+    }
+    gate_failures = [reason for reason in reasons if reason in blocking_gate_reasons]
+    matched_lower = _scalar("matched_lower_excess_cagr")
+    if bool(certificate.get("passed")):
+        promotion_status = "PROMOTED"
+    elif (
+        matched_lower is not None
+        and matched_lower > 0.0
+        and not route.benchmark_reconcile_failure
+        and not gate_failures
+    ):
+        promotion_status = "PROMOTABLE_EXCESS"
+    else:
+        promotion_status = "NO_TRADE"
+
+    hedge_projection: dict[str, object] = {}
+    if route.base_log_growth_minus_benchmark:
+        try:
+            projection_payload = project_hedge_sleeve(route.base_log_growth_minus_benchmark)
+            ladder_rows = cast("list[dict[str, object]]", projection_payload["leverage_ladder"])
+            admissible = [
+                cast("float", rung["leverage"])
+                for rung in ladder_rows
+                if rung["admissible"]
+            ]
+            hedge_projection = {
+                "leverage_rung_count": len(ladder_rows),
+                "max_admissible_leverage": max(admissible) if admissible else None,
+                "admissible_rung_count": len(admissible),
+                "excess_point_cagr": round(
+                    cast("float", projection_payload["excess_point_cagr"]), 12
+                ),
+            }
+        except ValueError:
+            hedge_projection = {}
+
     return {
         "version": route.route_version,
+        "promotion_status": promotion_status,
         "candidate_count": int(route.candidate_count),
         "segment_count": len(route.selected_policies),
         "cash_segment_count": sum(
@@ -3864,6 +3908,7 @@ def _growth_route_projection(
         ),
         "turnover_ratio": round(float(route.turnover_ratio), 12),
         "benchmark_reconcile_failure": str(route.benchmark_reconcile_failure)[:96],
+        "hedge_sleeve_projection": hedge_projection,
         "rejection_reason_counts": dict(sorted(rejection_counts.items())),
     }
 
@@ -3888,6 +3933,15 @@ def _attach_frozen_compound_track(
         frozen,
         annualization_sessions=request.compounding.annualization_sessions,
     )
+
+
+def _panel_within_sessions(
+    panel: pl.DataFrame, sessions: tuple[datetime, ...]
+) -> pl.DataFrame:
+    """Scope the market panel to one replay segment's session bounds."""
+    if panel.is_empty() or "session" not in panel.columns or not sessions:
+        return panel
+    return panel.filter(pl.col("session").is_in(list(sessions)))
 
 
 def _attach_growth_route_execution_evidence(
@@ -3927,19 +3981,42 @@ def _attach_growth_route_execution_evidence(
         if benchmark_failed:
             continue
         exposure = evidence.base_interval_exposure
-        adjusted = (*exposure, 0.0) if len(sessions) == len(exposure) + 1 else exposure
-        if len(adjusted) != len(sessions):
+        bounds_by_segment = getattr(
+            evidence, "base_interval_session_bounds", ()
+        )
+        if not bounds_by_segment:
+            benchmark_failed = True
+            benchmark_failure = "benchmark-session-bounds-missing"
+            continue
+        if sum(len(bounds) - 1 for bounds in bounds_by_segment) != len(exposure):
             benchmark_failed = True
             benchmark_failure = "benchmark-exposure-length-mismatch"
             continue
-        try:
-            benchmark = exposure_matched_benchmark_log_growth(
-                panel, sessions, adjusted
-            )
-        except ValueError:
-            benchmark_failed = True
-            benchmark_failure = "benchmark-series-invalid"
+        parts: list[float] = []
+        offset = 0
+        for bounds in bounds_by_segment:
+            segment_exposure = exposure[offset : offset + len(bounds) - 1]
+            offset += len(bounds) - 1
+            adjusted = (*segment_exposure, 0.0)
+            if any(
+                (not np.isfinite(value)) or value < 0.0 or value > 1.0
+                for value in segment_exposure
+            ):
+                benchmark_failed = True
+                benchmark_failure = "benchmark-exposure-invalid"
+                break
+            segment_sessions = bounds
+            segment_panel = _panel_within_sessions(panel, segment_sessions)
+            try:
+                benchmark = exposure_matched_benchmark_log_growth(segment_panel, segment_sessions, adjusted)
+            except ValueError:
+                benchmark_failed = True
+                benchmark_failure = "benchmark-series-invalid"
+                break
+            parts.extend(benchmark[: len(segment_exposure)])
+        if benchmark_failed:
             continue
+        benchmark = tuple(parts)
         if len(benchmark) != len(evidence.base_log_growth):
             benchmark_failed = True
             benchmark_failure = "benchmark-exposure-length-mismatch"
