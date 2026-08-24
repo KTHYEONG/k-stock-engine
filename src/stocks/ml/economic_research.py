@@ -84,6 +84,7 @@ from src.stocks.ml.training import (
     _on_demand_schema,
     _replay_costs_batch,
     _require_caller_registry,
+    _seed_policy_or_none,
     build_initial_calibration_seed,
 )
 from src.stocks.ml.window_research import (
@@ -1297,6 +1298,7 @@ class _FamilyState:
                 request.bootstrap_alpha,
                 request.seed,
                 request.bootstrap_resamples,
+                seed_policy=_seed_policy_or_none(request),
             )
             primary = (
                 route.selected_policies[-1][0]
