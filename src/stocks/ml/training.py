@@ -162,6 +162,7 @@ from src.stocks.research.calibration_schedule import SessionClusterCalibrationSc
 from src.stocks.research.economic_alpha import CausalAlphaCalibrator
 from src.stocks.research.folds import Fold, PurgedWalkForward
 from src.stocks.research.metrics import (
+    _bootstrap_lower_mean_log_growth,
     certify_compounded_holdout,
     certify_exposure_matched_excess,
     certify_growth_route,
@@ -1259,10 +1260,17 @@ def _risk_policy_for_profile(
         raise ValueError("rebalance_frequency_sessions must be a positive session count")
     if top_k < 1:
         raise ValueError("top_k must be a positive session count")
+    single_name_cap = request.portfolio.max_single_weight
+    if profile.single_name_cap_override is not None:
+        # Equal-weight basis ceiling: the override can never exceed 1/K.
+        single_name_cap = min(profile.single_name_cap_override, 1.0 / top_k)
+    gross_cap = request.portfolio.max_exposure
+    if profile.gross_utilization_target is not None:
+        gross_cap = min(profile.gross_utilization_target, request.portfolio.max_exposure)
     return StockRiskPolicy(
         top_k=top_k,
-        gross_cap=request.portfolio.max_exposure,
-        single_name_cap=request.portfolio.max_single_weight,
+        gross_cap=gross_cap,
+        single_name_cap=single_name_cap,
         participation_limit=request.portfolio.participation_limit,
         no_trade_band_bps=profile.no_trade_band_bps,
         rebalance_frequency_sessions=rebalance_frequency_sessions,
@@ -3724,6 +3732,55 @@ def _build_metrics(
     return metrics
 
 
+def _blend_lower_growth_projection(
+    discovery: HorizonDiscovery,
+    *,
+    bootstrap_alpha: float,
+    seed: int,
+    bootstrap_resamples: int,
+) -> dict[str, object]:
+    """Bounded lower-growth scalars for ':blend' frontier candidates.
+
+    Publishes one moving-block bootstrap lower mean per blended candidate so
+    route-selection transparency exists for cross-horizon evidence; plain
+    candidates are covered by the selection payload and never duplicated here.
+    """
+    blend_map: dict[str, object] = {}
+    for candidate in discovery.evidence:
+        if not str(candidate.profile_id).endswith(_BLEND_PROFILE_SUFFIX):
+            continue
+        key = (
+            f"{candidate.horizon_sessions}:{candidate.rebalance_frequency_sessions}:"
+            f"{candidate.top_k}:{candidate.profile_id}"
+        )
+        block_length = max(1, min(candidate.horizon_sessions, len(candidate.base_log_growth)))
+        base_arr = np.asarray(candidate.base_log_growth, dtype=float)
+        stress_arr = np.asarray(candidate.stress_log_growth, dtype=float)
+        blend_map[key] = {
+            "base_lower_growth": round(
+                float(
+                    _bootstrap_lower_mean_log_growth(
+                        base_arr, block_length, bootstrap_resamples, seed, bootstrap_alpha
+                    )
+                ),
+                12,
+            ),
+            "stress_lower_growth": round(
+                float(
+                    _bootstrap_lower_mean_log_growth(
+                        stress_arr,
+                        block_length,
+                        bootstrap_resamples,
+                        seed + candidate.horizon_sessions,
+                        bootstrap_alpha,
+                    )
+                ),
+                12,
+            ),
+        }
+    return blend_map
+
+
 def _policy_frontier_projection(
     request: NetAlphaTrainingRequest,
     discovery: HorizonDiscovery,
@@ -3747,6 +3804,12 @@ def _policy_frontier_projection(
         },
         "execution_evidence": _segment_summaries(
             discovery.execution_evidence_by_candidate, selected_profile_id
+        ),
+        "blend_lower_growth": _blend_lower_growth_projection(
+            discovery,
+            bootstrap_alpha=request.bootstrap_alpha,
+            seed=request.seed,
+            bootstrap_resamples=request.bootstrap_resamples,
         ),
     }
 
@@ -3785,12 +3848,24 @@ def _blend_champion_no_trade(
     growth_route: Mapping[str, object],
     certificate: Mapping[str, object],
 ) -> tuple[str, dict[str, object]]:
-    """Fail-closed NO_TRADE arguments for a blended final policy.
+    """Fail-closed champion arguments for a blended final policy.
 
     A blended champion has no single-artifact holdout representation yet, so
-    promotion stops pre-holdout instead of fabricating evidence; the research
-    payload is retained verbatim.
+    artifact promotion stops pre-holdout. When the certified route carries a
+    positive matched-excess lower bound (``PROMOTABLE_EXCESS``), the verdict is
+    published as a research-only excess outcome instead of plain NO_TRADE;
+    ``promoted`` stays False and the absolute-leg rejection reasons are
+    retained verbatim in the payload.
     """
+    status = growth_route.get("promotion_status")
+    if status == "PROMOTABLE_EXCESS":
+        return (
+            "blend-champion-excess-verdict",
+            {
+                "growth_route": growth_route,
+                "growth_route_certificate": dict(certificate),
+            },
+        )
     return (
         "blend-champion-holdout-unsupported",
         {
@@ -3858,17 +3933,33 @@ def _growth_route_projection(
     hedge_projection: dict[str, object] = {}
     if route.base_log_growth_minus_benchmark:
         try:
-            projection_payload = project_hedge_sleeve(route.base_log_growth_minus_benchmark)
-            ladder_rows = cast("list[dict[str, object]]", projection_payload["leverage_ladder"])
-            admissible = [
+            projection_payload = project_hedge_sleeve(
+                route.base_log_growth_minus_benchmark,
+                vol_managed_lookback=26,
+                vol_managed_target_annualized_vol=0.10,
+            )
+            ladder_rows = cast(
+                'list[dict[str, object]]', projection_payload['leverage_ladder']
+            )
+            static_admissible = [
                 cast("float", rung["leverage"])
                 for rung in ladder_rows
-                if rung["admissible"]
+                if rung["variant"] == "static" and rung["admissible"]
+            ]
+            volman_admissible = [
+                cast("float", rung["leverage"])
+                for rung in ladder_rows
+                if rung["variant"] == "vol_managed" and rung["admissible"]
             ]
             hedge_projection = {
-                "leverage_rung_count": len(ladder_rows),
-                "max_admissible_leverage": max(admissible) if admissible else None,
-                "admissible_rung_count": len(admissible),
+                "leverage_rung_count": len(ladder_rows) // 2,
+                "max_admissible_leverage": (
+                    max(static_admissible) if static_admissible else None
+                ),
+                "vol_managed_max_admissible_leverage": (
+                    max(volman_admissible) if volman_admissible else None
+                ),
+                "admissible_rung_count": len(static_admissible),
                 "excess_point_cagr": round(
                     cast("float", projection_payload["excess_point_cagr"]), 12
                 ),
