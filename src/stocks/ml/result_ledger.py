@@ -1004,7 +1004,7 @@ def _compact_growth_route(metrics: Mapping[str, object]) -> dict[str, object]:
             count = _as_int(value)
             if count:
                 reason_counts[_normalize_message(key)] = count
-    return {
+    summary = {
         "version": _json_scalar(route.get("version")),
         "candidate_count": _as_int(route.get("candidate_count")),
         "segment_count": _as_int(route.get("segment_count")),
@@ -1022,6 +1022,9 @@ def _compact_growth_route(metrics: Mapping[str, object]) -> dict[str, object]:
         "rejection_reason_counts": reason_counts,
         "policies_digest": _digest_summary(route.get("selected_policies_digest")),
     }
+    outcome = route
+    summary['promotion_status'] = outcome.get('promotion_status', 'NO_TRADE')
+    return summary
 
 
 def _compact_observability(

@@ -30,6 +30,26 @@ class ParameterSource(StrEnum):
     ENVIRONMENT = "environment"
 
 
+EXCESS_FULL_KELLY_PROFILE_ID = "excess_full_kelly"
+
+
+def policy_profiles_with_excess_full_kelly() -> tuple[PolicyProfile, ...]:
+    """Opt-in profile ladder adding the excess-full-Kelly rung.
+
+    The default ``CanonicalResearchProfile`` never carries this profile so
+    flag-off runs stay byte-identical; requests opt in by replacing their
+    ``policy_profiles`` with this tuple.
+    """
+    return (
+        *CanonicalResearchProfile().policy_profiles,
+        PolicyProfile(
+            profile_id=EXCESS_FULL_KELLY_PROFILE_ID,
+            no_trade_band_bps=0.0,
+            growth_risk_aversion=1.0,
+        ),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class CanonicalResearchProfile:
     """Single owner of default statistical and portfolio values.

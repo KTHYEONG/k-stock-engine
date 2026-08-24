@@ -260,6 +260,7 @@ class ExecutionReplayEvidence:
     stress_exposure: float = 0.0
     base_interval_exposure: tuple[float, ...] = ()
     stress_interval_exposure: tuple[float, ...] = ()
+    base_interval_session_bounds: tuple[tuple[datetime, ...], ...] = ()
 
     def __post_init__(self) -> None:
         if len(self.base_log_growth) != len(self.stress_log_growth):
@@ -307,6 +308,12 @@ class ExecutionReplayEvidence:
             for exp in self.stress_interval_exposure:
                 if not np.isfinite(exp) or not 0.0 <= exp <= 1.0:
                     raise ValueError("stress_interval_exposure values must be finite in [0,1]")
+        if self.base_interval_session_bounds:
+            bounded = sum(max(0, len(bounds) - 1) for bounds in self.base_interval_session_bounds)
+            if bounded != n:
+                raise ValueError(
+                    "base_interval_session_bounds must partition base_log_growth intervals"
+                )
 
     def diagnostics(self) -> dict[str, object]:
         """Bounded execution evidence projection; never raw score/price vectors."""
@@ -537,6 +544,7 @@ def _execute_candidate_segment(
     stress_segment_growth, _ = _ledger_growth_and_exposure(stress_ledger)
     _, seg_base_exp = _ledger_growth_and_interval_exposure(ledger)
     _, seg_stress_exp = _ledger_growth_and_interval_exposure(stress_ledger)
+    interval_session_bounds = tuple(row.session for row in ledger)
     segment_filled_cycles = _filled_sessions(result)
     stress_metrics = result.stress_metrics or {}
     unfilled = {
@@ -549,6 +557,7 @@ def _execute_candidate_segment(
         stress_growth=stress_segment_growth,
         base_interval_exposure=seg_base_exp,
         stress_interval_exposure=seg_stress_exp,
+        interval_session_bounds=interval_session_bounds,
         planned_cycles=int(result.planned_cycles),
         filled_orders=int(result.filled_orders),
         filled_sessions=segment_filled_cycles,

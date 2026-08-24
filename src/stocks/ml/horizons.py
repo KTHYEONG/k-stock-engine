@@ -862,6 +862,18 @@ class GrowthRouteEvidence:
             return 0.0
         return self.invested_interval_count / self.observed_interval_count
 
+    @property
+    def base_log_growth_minus_benchmark(self) -> tuple[float, ...]:
+        """Parallel matched-excess series; empty when no benchmark is attached."""
+        if not self.benchmark_log_growth:
+            return ()
+        return tuple(
+            float(base) - float(benchmark)
+            for base, benchmark in zip(
+                self.base_log_growth, self.benchmark_log_growth, strict=True
+            )
+        )
+
 
 def stitch_prequential_growth_route(
     candidates: tuple[HorizonOOFEvidence, ...],
