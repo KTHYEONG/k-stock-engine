@@ -9,7 +9,10 @@ from src.stocks.config.research import (
     CanonicalResearchProfile,
 )
 from src.stocks.ml.contracts import DEFAULT_CANDIDATE_REBALANCE_FREQUENCY_SESSIONS
-from src.stocks.ml.hedge_sleeve import project_hedge_sleeve
+from src.stocks.ml.hedge_sleeve import (
+    _vol_managed_scales,
+    project_hedge_sleeve,
+)
 
 
 def _certified_excess_series() -> list[float]:
@@ -28,11 +31,54 @@ def test_leverage_ladder_meets_thirty_percent_at_l2() -> None:
     """SCENARIO_HEDGE_SLEEVE_LADDER."""
     series = _certified_excess_series()
     projection = project_hedge_sleeve(series)
-    ladder = {rung["leverage"]: rung for rung in projection["leverage_ladder"]}
+    ladder = {
+        rung["leverage"]: rung
+        for rung in projection["leverage_ladder"]
+        if rung["variant"] == "static"
+    }
     raw_cagr = projection["excess_point_cagr"]
     assert abs(ladder[1.0]["point_cagr"] - raw_cagr) < 1e-9
     assert ladder[2.0]["point_cagr"] >= 0.30
     assert ladder[2.0]["stress_cagr"] >= 0.25
+
+
+def _clustered_vol_series() -> list[float]:
+    rng = np.random.default_rng(23)
+    calm = 0.0008 + 0.005 * rng.standard_normal(650)
+    volatile = 0.0008 + 0.020 * rng.standard_normal(600)
+    draws = np.concatenate([calm, volatile])
+    return (draws - draws.mean() + 0.0008).tolist()
+
+
+def test_vol_managed_rung_admits_higher_leverage() -> None:
+    """SCENARIO_VOL_MANAGED_RUNG_REDUCES_MDD."""
+    series = _clustered_vol_series()
+    projection = project_hedge_sleeve(
+        series, vol_managed_target_annualized_vol=0.08
+    )
+    by_key = {
+        (rung["variant"], rung["leverage"]): rung
+        for rung in projection["leverage_ladder"]
+    }
+    static_15 = by_key[("static", 1.5)]
+    volman_15 = by_key[("vol_managed", 1.5)]
+    assert static_15["projected_mdd"] > 0.25
+    assert volman_15["projected_mdd"] <= 0.25
+
+
+def test_no_lookahead_in_scaling() -> None:
+    """SCENARIO_VOL_MANAGED_NO_LOOKAHEAD."""
+    base = _certified_excess_series()
+    lookback = 26
+    scales_a = _vol_managed_scales(base, lookback=lookback)
+    perturbed = list(base)
+    k = 400
+    perturbed[k + 3] = perturbed[k + 3] + 10.0
+    scales_b = _vol_managed_scales(perturbed, lookback=lookback)
+    for t in range(k + 1):
+        assert scales_a[t] == scales_b[t]
+    for t in range(lookback):
+        assert scales_a[t] == 0.5
 
 
 def test_projection_raises_on_empty_series() -> None:
