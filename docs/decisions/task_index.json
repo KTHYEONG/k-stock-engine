@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "excess_leverage_utilization_leap",
+      "date": "2026-08-24",
+      "adr_id": "ADR_20260824_excess_leverage_utilization_leap",
+      "domain": "stocks_ml",
+      "title": "Excess leverage and utilization leap (W1 profile-scoped cap overrides, W2 vol-managed hedge ladder, W3 blend-excess carve-out)",
+      "why": "Post-unlock production runs certified the matched-excess stream (point +15.35 percent, LB +8.88 percent, PROMOTABLE_EXCESS) but panel-wide measurement proved the 8-percent single-name cap mathematically ceilings K=8 gross at 64 percent with realized K=12 exposure at 65-76 percent versus a 96-percent theoretical bound while the liquidity cap never binds at reference notional; static leverage stays sealed at L=1.0 because projected MDD scales linearly past the 25-percent cap, and all nine admitted horizon-blend cells were excluded from champion publication by unconditional pre-holdout fail-closed.",
+      "resolution": "Added optional single_name_cap_override and gross_utilization_target fields to PolicyProfile with (0,1] fail-closed validation and amended the caps invariant to except explicit overrides; _risk_policy_for_profile now resolves the override against the equal-weight basis min(override,1/top_k) and clamps utilization target by the request exposure cap; excess_full_kelly opt-in factory carries a 0.16 ceiling and 0.92 utilization target wired through a new --enable-excess-full-kelly CLI flag; project_hedge_sleeve now emits parallel static and vol_managed ladder variants using causal trailing-vol targeting (lookback 26, target 10 percent, clamp [0.25,2.0], warm-up 0.5) with per-variant admissible levers surfaced through growth-route projection and the result ledger; blended champions whose route certifies PROMOTABLE_EXCESS now publish blend-champion-excess-verdict instead of plain holdout-unsupported NO_TRADE with promoted staying False, and frontier projections publish bounded blend_lower_growth bootstrap scalars for transparency.",
+      "impact": "Opt-in runs can lift deployed gross toward 92 percent with equal-weight single-name basis unlocking roughly 20 points of forfeited compounding, vol-managed rungs admit higher leverage under unchanged drawdown governance pending real-series confirmation, blend evidence gains selection transparency plus an excess-verdict path without artifact promotion, and flag-off behavior remains byte-identical; seven pinned scenarios plus full stocks unit suite pass lint and type clean."
+    },
+    {
       "task_id": "hedged_excess_compounding_unlock",
       "date": "2026-08-24",
       "adr_id": "ADR_20260824_hedged_excess_compounding_unlock",
@@ -989,16 +999,6 @@
       "why": "The 4.7 GB data tree mixed cataloged research inputs, raw evidence, legacy files, and mutable runtime state, making retention and backtest/ML usage ambiguous.",
       "resolution": "Added manifest-aware read-only inventory and lifecycle classification, wired catalog CLI inventory output, protected catalog and snapshot references from archive candidates, and documented a staged migration layout without deleting data.",
       "impact": "Backtest and ML consumers have an auditable modern data boundary; legacy and evidence remain preserved until hash-verified migration. Inventory and tests pass, and physical cleanup remains a separately reviewable operation."
-    },
-    {
-      "task_id": "TASK_DART_DATASET_READINESS",
-      "date": "2026-08-11",
-      "adr_id": "ADR_20260811_DART_DATASET_READINESS",
-      "domain": "stocks-data",
-      "title": "Publish complete DART evidence and gate feature readiness",
-      "why": "The data audit found a complete 123-month DART collection outside the catalog and 32 fully-null derived feature columns that could be selected accidentally.",
-      "resolution": "Added atomic DART disclosure publication into the typed catalog with immutable/idempotent registration, retained disclosures as raw evidence rather than corporate actions, and added content-manifest-backed feature readiness validation that fails closed for missing, fully-null, or non-finite selected features while reporting warm-up nulls.",
-      "impact": "Future research can bind complete DART evidence by immutable name and validate model-selected feature inputs before use; existing datasets, partial artifacts, and snapshots remain unchanged. Ruff, mypy, 466 pytest tests, spec validation, and an actual readiness CLI run passed."
     }
   ]
 }
