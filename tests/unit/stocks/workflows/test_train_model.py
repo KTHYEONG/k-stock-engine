@@ -526,3 +526,173 @@ def test_request_and_cli_defaults_updated() -> None:
     assert args.bootstrap_resamples == 2000
     # Holdout certificate policy is a separate pre-registered scope.
     assert CompoundingCertificationSettings().bootstrap_resamples == 200
+
+
+
+def _rawnet_dispatch_fixture():
+    """Minimal causal panel for dispatch-level tests (no fitting executed)."""
+    from datetime import UTC, datetime, timedelta
+
+    import polars as pl
+
+    from src.core.datasets import DatasetManifest
+    from src.core.instruments import AssetKind
+    from src.stocks.ml.contracts import (
+        ExecutionFrontierSettings,
+        NetAlphaResearchData,
+        NetAlphaTrainingRequest,
+    )
+    from src.stocks.research.folds import Fold
+
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    rows = []
+    for s in range(12):
+        session = start + timedelta(days=s)
+        rows.extend(
+            {
+                "instrument_id": f"KRX:{t + 1:05d}",
+                "session": session,
+                "session_index": s,
+                "feature__a": float(t) / 6.0,
+                "open": 10000.0,
+                "adtv_20d": 5.0e9,
+                "volatility_20d": 0.03,
+            }
+            for t in range(6)
+        )
+    frame = pl.DataFrame(rows).sort(["session", "instrument_id"])
+    label_rows = [
+        {
+            "instrument_id": row["instrument_id"],
+            "session": row["session"],
+            "net_alpha_target": 0.0,
+            "risk_residual": 0.001,
+            "reference_cost": 0.0005,
+            "label_available_time": row["session"] + timedelta(days=10),
+        }
+        for row in frame.iter_rows(named=True)
+    ]
+    manifest = DatasetManifest(
+        asset_kind=AssetKind.STOCK,
+        schema_version="v1",
+        schema_hash="h",
+        provider_version="p",
+        universe_policy_version="u",
+        universe_policy_hash="u",
+        feature_set="stock_net_alpha_v1",
+        feature_set_hash="f",
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=10,
+        time_start=start,
+        time_end=start + timedelta(days=12),
+        generated_time=start + timedelta(days=12),
+        row_count=len(rows),
+    )
+    data = NetAlphaResearchData(
+        feature_frame=frame,
+        labels_by_horizon={10: pl.DataFrame(label_rows)},
+        manifest=manifest,
+    )
+    request = NetAlphaTrainingRequest(
+        artifact_id="rawnet-dispatch",
+        candidate_horizon_sessions=(10,),
+        execution_frontier=ExecutionFrontierSettings(
+            candidate_horizon_sessions=(10,),
+            candidate_rebalance_frequency_sessions=(5,),
+            candidate_top_k=(12,),
+        ),
+        model_threads=1,
+    )
+    folds = [
+        Fold(
+            train_mask=list(range(36)),
+            validation_mask=list(range(48, 60)),
+            train_label_end=8,
+            validation_decision_start=10,
+            segment_id=0,
+            validation_sessions=(10, 11),
+        )
+    ]
+    return frame, folds, data, request
+
+
+def test_rawnet_lgbm_04_training_dispatch_fail_closed(monkeypatch) -> None:
+    """SCENARIO_RAWNET_LGBM_04_TRAINING_DISPATCH_FAIL_CLOSED."""
+    import src.stocks.ml.economic_research as economic_research_module
+    from src.stocks.ml.contracts import ELASTIC_NET_FAMILY
+    from src.stocks.ml.training import _fit_oof
+
+    pre_holdout, folds, data, request = _rawnet_dispatch_fixture()
+    calls: dict[str, int] = {}
+
+    def spy(pre_holdout_arg, folds_arg, data_arg, request_arg, learner_columns, horizon_sessions):
+        calls["count"] = calls.get("count", 0) + 1
+        return pl.DataFrame({"instrument_id": ["A"], "score": [0.5]}), pl.DataFrame(
+            {"risk_residual": [0.001]}
+        )
+
+    monkeypatch.setattr(economic_research_module, "fit_rawnet_lgbm_oof", spy)
+    oof, labeled, ics, diagnostic, path_evaluations = _fit_oof(
+        pre_holdout,
+        folds,
+        data,
+        request,
+        None,
+        ("feature__a",),
+        10,
+        None,
+        family="economic_rawnet_lgbm",
+    )
+    assert calls["count"] == 1
+    assert oof.columns == ["instrument_id", "score"]
+    assert labeled.columns == ["risk_residual"]
+    assert ics == []
+    assert path_evaluations == 0
+    assert diagnostic.model_family == "economic_rawnet_lgbm"
+
+    with pytest.raises(ValueError, match="declared economic families"):
+        _fit_oof(
+            pre_holdout,
+            folds,
+            data,
+            request,
+            None,
+            ("feature__a",),
+            10,
+            None,
+            family="unknown-family",
+        )
+    assert calls["count"] == 1
+
+    # The elastic-net family stays admissible (empty folds -> empty evidence).
+    empty = _fit_oof(
+        pre_holdout,
+        [],
+        data,
+        request,
+        None,
+        ("feature__a",),
+        10,
+        None,
+        family=ELASTIC_NET_FAMILY,
+    )
+    assert empty[0].is_empty()
+
+
+def test_rawnet_lgbm_05_cli_family_wiring() -> None:
+    """SCENARIO_RAWNET_LGBM_05_CLI_FAMILY_WIRING."""
+    from src.stocks.cli.train import _build_training_request
+    from src.stocks.ml.contracts import ELASTIC_NET_FAMILY
+
+    args = build_parser().parse_args(
+        ["--artifact-id", "x", "--discovery-model-family", "economic_rawnet_lgbm"]
+    )
+    request = _build_training_request(args)
+    assert request.discovery_model_family == "economic_rawnet_lgbm"
+    default_args = build_parser().parse_args(["--artifact-id", "defaults"])
+    default_request = _build_training_request(default_args)
+    assert default_request.discovery_model_family == ELASTIC_NET_FAMILY
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            ["--artifact-id", "x", "--discovery-model-family", "not-a-family"]
+        )

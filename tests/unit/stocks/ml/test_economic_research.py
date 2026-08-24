@@ -421,6 +421,228 @@ def test_economic_family_study_rejects_missing_cost_evidence() -> None:
         )
 
 
+
+def _rawnet_fixture(
+    n_sessions: int = 60,
+    per_session: int = 30,
+    seed: int = 7,
+    horizon_sessions: int = 10,
+):
+    """Synthetic panel + labels with feature-correlated net utility."""
+    import numpy as np
+    from datetime import UTC, datetime, timedelta
+
+    from src.core.datasets import DatasetManifest
+    from src.core.instruments import AssetKind
+    from src.stocks.ml.contracts import (
+        ExecutionFrontierSettings,
+        NetAlphaResearchData,
+        NetAlphaTrainingRequest,
+    )
+    from src.stocks.research.folds import Fold
+
+    rng = np.random.default_rng(seed)
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    rows: list[dict[str, object]] = []
+    for s in range(n_sessions):
+        session = start + timedelta(days=s)
+        rows.extend(
+            {
+                "instrument_id": f"KRX:{t + 1:05d}",
+                "session": session,
+                "feature__a": float(rng.normal()),
+                "feature__b": float(rng.normal()),
+                "open": 10000.0 + t,
+                "adtv_20d": 5.0e9,
+                "volatility_20d": 0.03,
+            }
+            for t in range(per_session)
+        )
+    frame = pl.DataFrame(rows).sort(["session", "instrument_id"]).with_columns(
+        pl.col("session").rank("dense").cast(pl.Int64).alias("session_index")
+    )
+    label_rows: list[dict[str, object]] = []
+    for row in frame.iter_rows(named=True):
+        utility = 0.002 * row["feature__a"] + float(rng.normal(scale=0.001))
+        label_rows.append(
+            {
+                "instrument_id": row["instrument_id"],
+                "session": row["session"],
+                "net_alpha_target": float(rng.normal(scale=0.5)),
+                "risk_residual": utility + 0.001,
+                "reference_cost": 0.001,
+                "label_available_time": row["session"]
+                + timedelta(days=horizon_sessions),
+            }
+        )
+    manifest = DatasetManifest(
+        asset_kind=AssetKind.STOCK,
+        schema_version="v1",
+        schema_hash="h",
+        provider_version="p",
+        universe_policy_version="u",
+        universe_policy_hash="u",
+        feature_set="stock_net_alpha_v1",
+        feature_set_hash="f",
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=horizon_sessions,
+        time_start=start,
+        time_end=start + timedelta(days=n_sessions),
+        generated_time=start + timedelta(days=n_sessions),
+        row_count=len(rows),
+    )
+    data = NetAlphaResearchData(
+        feature_frame=frame,
+        labels_by_horizon={horizon_sessions: pl.DataFrame(label_rows)},
+        manifest=manifest,
+    )
+    request = NetAlphaTrainingRequest(
+        artifact_id="rawnet",
+        candidate_horizon_sessions=(horizon_sessions,),
+        execution_frontier=ExecutionFrontierSettings(
+            candidate_horizon_sessions=(horizon_sessions,),
+            candidate_rebalance_frequency_sessions=(5,),
+            candidate_top_k=(12,),
+        ),
+        model_threads=1,
+    )
+    session_index = frame["session_index"].to_numpy()
+    folds: list[Fold] = []
+    for i in range(4):
+        val_start = 40 + 4 * i
+        val_rows = [
+            int(pos)
+            for pos in range(frame.height)
+            if val_start <= session_index[pos] < val_start + 4
+        ]
+        train_rows = [
+            int(pos) for pos in range(frame.height) if session_index[pos] < val_start - 3
+        ]
+        folds.append(
+            Fold(
+                train_mask=train_rows,
+                validation_mask=val_rows,
+                train_label_end=val_start - 3,
+                validation_decision_start=val_start,
+                segment_id=i,
+                validation_sessions=(val_start, val_start + 3),
+            )
+        )
+    return frame, folds, data, request, ("feature__a", "feature__b")
+
+
+def test_rawnet_lgbm_02_oof_shape_and_determinism() -> None:
+    """SCENARIO_RAWNET_LGBM_02_OOF_SHAPE_AND_DETERMINISM."""
+    pre_holdout, folds, data, request, learner_columns = _rawnet_fixture()
+    oof1, labeled1 = economic_research.fit_rawnet_lgbm_oof(
+        pre_holdout, folds, data, request, learner_columns, 10
+    )
+    from src.stocks.ml.models import SCORE_COLUMN
+
+    assert not oof1.is_empty()
+    assert {"instrument_id", "session", SCORE_COLUMN}.issubset(oof1.columns)
+    assert oof1[SCORE_COLUMN].null_count() == 0
+    assert bool(oof1[SCORE_COLUMN].is_finite().all())
+    expected_keys: set[tuple[str, object]] = set()
+    for fold in folds:
+        validation = pre_holdout[fold.validation_mask]
+        for inst, sess in zip(
+            validation[_LABEL_ID].to_list(),
+            validation[_LABEL_SESSION].to_list(),
+            strict=True,
+        ):
+            expected_keys.add((inst, sess))
+    got_keys = {
+        (inst, sess)
+        for inst, sess in zip(
+            oof1[_LABEL_ID].to_list(), oof1[_LABEL_SESSION].to_list(), strict=True
+        )
+    }
+    assert got_keys == expected_keys
+    assert oof1.height == len(expected_keys)
+    for column in (
+        "risk_residual",
+        "reference_cost",
+        "realized_net_return",
+        "label_available_time",
+    ):
+        assert column in labeled1.columns
+    assert labeled1.height == oof1.height
+    oof2, labeled2 = economic_research.fit_rawnet_lgbm_oof(
+        pre_holdout, folds, data, request, learner_columns, 10
+    )
+    assert oof1.equals(oof2)
+    assert labeled1.equals(labeled2)
+
+
+def test_rawnet_lgbm_03_seed_bagging_rank_average() -> None:
+    """SCENARIO_RAWNET_LGBM_03_SEED_BAGGING_RANK_AVERAGE."""
+    import polars.testing as pl_testing
+
+    from src.stocks.ml.models import SCORE_COLUMN
+
+    keys = {"instrument_id": ["A", "B", "C", "A", "B", "C"]}
+    sessions = {"session": [1, 1, 1, 2, 2, 2]}
+    seed_a = pl.DataFrame({**keys, **sessions, SCORE_COLUMN: [0.1, 0.5, 0.9, 0.2, 0.4, 0.6]})
+    seed_b = pl.DataFrame({**keys, **sessions, SCORE_COLUMN: [0.9, 0.5, 0.1, 0.6, 0.4, 0.2]})
+    seed_c = pl.DataFrame({**keys, **sessions, SCORE_COLUMN: [0.3, 0.6, 0.2, 0.8, 0.1, 0.5]})
+    averaged = economic_research._rank_average_seed_scores((seed_a, seed_b, seed_c))
+    # Session-1 ascending percentile ranks per seed:
+    #   seed_a A/B/C = 0/.5/1 · seed_b = 1/.5/0 · seed_c(A=.3,B=.6,C=.2) = .5/1/0
+    # Session-2: seed_a = 0/.5/1 · seed_b = 1/.5/0 · seed_c(.8,.1,.5) = 1/0/.5
+    manual = pl.DataFrame(
+        {
+            "instrument_id": ["A", "B", "C", "A", "B", "C"],
+            "session": [1, 1, 1, 2, 2, 2],
+        }
+    ).with_columns(
+        pl.Series(
+            SCORE_COLUMN,
+            [
+                (0.0 + 1.0 + 0.5) / 3.0,
+                (0.5 + 0.5 + 1.0) / 3.0,
+                (1.0 + 0.0 + 0.0) / 3.0,
+                (0.0 + 1.0 + 1.0) / 3.0,
+                (0.5 + 0.5 + 0.0) / 3.0,
+                (1.0 + 0.0 + 0.5) / 3.0,
+            ],
+        )
+    )
+    averaged_sorted = averaged.sort(["instrument_id", "session"])
+    manual_sorted = manual.sort(["instrument_id", "session"])
+    pl_testing.assert_frame_equal(
+        averaged_sorted.select(manual_sorted.columns), manual_sorted, check_dtypes=False
+    )
+    missing_row = seed_c.filter(pl.col("instrument_id") != "C")
+    with pytest.raises(ValueError, match="seed"):
+        economic_research._rank_average_seed_scores((seed_a, seed_b, missing_row))
+    with pytest.raises(ValueError, match="seed"):
+        economic_research._rank_average_seed_scores((seed_a,))
+
+    pre_holdout, folds, data, request, learner_columns = _rawnet_fixture()
+    from dataclasses import replace
+
+    oof_base, _ = economic_research.fit_rawnet_lgbm_oof(
+        pre_holdout, folds, data, request, learner_columns, 10
+    )
+    oof_shifted, _ = economic_research.fit_rawnet_lgbm_oof(
+        pre_holdout,
+        folds,
+        data,
+        replace(request, seed=request.seed + 100),
+        learner_columns,
+        10,
+    )
+    shifted_scores = oof_shifted.rename({SCORE_COLUMN: "shifted_score"})
+    joined = oof_base.join(
+        shifted_scores, on=["instrument_id", "session"], how="inner"
+    )
+    assert joined.height == oof_base.height
+    assert (
+        float((joined[SCORE_COLUMN] - joined["shifted_score"]).abs().max()) > 1e-9
+    )
+
+
 def test_economic_family_study_rejects_sub_annual_windows(monkeypatch) -> None:
     _install_candidate(monkeypatch, lambda lookback: pytest.fail("must not run"))
     with pytest.raises(ValueError, match="annualization_sessions"):

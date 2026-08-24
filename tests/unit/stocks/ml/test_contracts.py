@@ -254,3 +254,25 @@ def test_discovery_model_family_must_be_declared() -> None:
         NetAlphaTrainingRequest(artifact_id="v1", discovery_model_family="not-a-family")
     request = NetAlphaTrainingRequest(artifact_id="v1")
     assert request.discovery_model_family == ELASTIC_NET_FAMILY
+
+
+def test_rawnet_lgbm_01_family_declared() -> None:
+    """SCENARIO_RAWNET_LGBM_01_FAMILY_DECLARED."""
+    from src.stocks.ml.contracts import (
+        DECLARED_ECONOMIC_FAMILIES,
+        ELASTIC_NET_FAMILY,
+        RAWNET_LGBM_FAMILY,
+    )
+
+    assert RAWNET_LGBM_FAMILY == "economic_rawnet_lgbm"
+    assert RAWNET_LGBM_FAMILY in DECLARED_ECONOMIC_FAMILIES
+    request = NetAlphaTrainingRequest(
+        artifact_id="v1", discovery_model_family=RAWNET_LGBM_FAMILY
+    )
+    assert request.discovery_model_family == RAWNET_LGBM_FAMILY
+    with pytest.raises(ValueError, match="discovery_model_family"):
+        NetAlphaTrainingRequest(artifact_id="v1", discovery_model_family="not-a-family")
+    assert (
+        NetAlphaTrainingRequest(artifact_id="v1").discovery_model_family
+        == ELASTIC_NET_FAMILY
+    )
