@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_RECENT_REGIME_SHARPE_UPLIFT",
+      "date": "2026-08-24",
+      "adr_id": "ADR_20260824_ML_RECENT_REGIME_SHARPE_UPLIFT",
+      "domain": "stocks_ml",
+      "title": "Multi-horizon rank-blend frontier candidates and observability repair",
+      "why": "Recent-regime net Sharpe was named the next bottleneck after the seed-route recovery; scratch diagnostics on the champion snapshot proved signal quality is RISING into 2023-25 (h20 Rank-IC 0.030 to 0.099) while the binding constraint is conversion: absolute long-only certification fights an eligible-universe drift near -14 percent per year, the equal-rank H10+H20 blend lifts absolute Sharpe 0.51 to 1.22 and lower bound -3.21 to -0.18 percent, the hedged excess series is already certifiable (LB +12.8 to +16.2 percent), and a KOSPI trend gate was rejected by data (abs Sharpe 0.51 to 0.11).",
+      "resolution": "Added pre-registered enable_horizon_blend request contract with cross-horizon within-session percentile-rank blend candidates built from cached calibrated OOF frames, causally recalibrated at the largest admitted horizon and replayed through the existing batch-replay coverage gates as additive ':blend' evidence; a blended champion now fails closed pre-holdout via blend-champion-holdout-unsupported NO_TRADE publication retaining full research payload; populated rawnet and lambdarank fold diagnostics fixing usable_fold_count=0 telemetry; recorded benchmark reconciliation failure reasons ending silent matched-benchmark-missing; wired --enable-horizon-blend CLI; six pinned scenarios plus full stocks ML suite pass lint and type clean.",
+      "impact": "Flag-off discovery is byte-for-byte unchanged and blend evidence stays additive research-only until single-artifact holdout support exists; every production run now publishes per-family fold rank-IC and the reason benchmark stitching failed; remaining compounding leap sits in the hedge-accounting governance decision (matched-excess certification or futures-hedged sleeve) rather than model class."
+    },
+    {
       "task_id": "TASK_ML_GROWTH_ROUTE_INVESTED_RECOVERY",
       "date": "2026-08-24",
       "adr_id": "ADR_20260824_ML_GROWTH_ROUTE_INVESTED_RECOVERY",
@@ -989,16 +999,6 @@
       "why": "The complete OpenDART resumable collection and downstream data under data/ required a final integrity, lineage, and usability audit before future research use.",
       "resolution": "Verified 123 complete DART monthly partitions, 2,280,415 unique receipts, 2,810 valid evidence JSON files, 10,943 readable non-empty Parquet files, manifest row/hash consistency, key uniqueness, OHLC and availability invariants, and dataset key alignment. Recorded that complete DART partitions are not yet catalog-registered or merged, and that 32 derived feature columns are fully null while active features retain documented warm-up/null rows.",
       "impact": "Evidence and canonical datasets are structurally intact, but future consumers must explicitly select dart_parts_single_worker, register or merge it before catalog-based use, and apply the documented feature-null policy. Preserved the resumable collector specification documents."
-    },
-    {
-      "task_id": "TASK_STOCK_HISTORICAL_EVIDENCE_COLLECTION",
-      "date": "2026-08-10",
-      "adr_id": "ADR_20260810_STOCK_HISTORICAL_EVIDENCE_COLLECTION",
-      "domain": "stocks",
-      "title": "Resumable historical KRX and DART evidence collection",
-      "why": "Historical master and disclosure evidence required complete point-in-time coverage, but date-by-date external APIs were slow and concurrent DART requests disconnected.",
-      "resolution": "Collected and cataloged daily KRX historical master evidence, pinned a cost-and-master provisional snapshot, and preserved DART monthly partial partitions as incomplete evidence without false certification.",
-      "impact": "Master and cost evidence now cover the provisional snapshot; DART and corporate actions remain fail-closed until a retrying single-worker resumable collector completes source coverage."
     }
   ]
 }
