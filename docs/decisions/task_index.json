@@ -1,6 +1,26 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_RAWNET_H20_EXECUTION_VALIDATION",
+      "date": "2026-08-24",
+      "adr_id": "ADR_20260824_ML_RAWNET_H20_EXECUTION_VALIDATION",
+      "domain": "stocks_ml",
+      "title": "Rawnet H20 full-run execution validation and ML quality baseline",
+      "why": "The new economic_rawnet_lgbm family needed end-to-end execution evidence on real direct datasets and three integration defects surfaced only at production scale: prepared-ledger column order mismatch crashed causal calibration, a stale loop variable stamped every OOF frame with the last fold segment id, and missing fold rank-ic returns dropped all 12 frontier cells with no-usable-fold-rank-ic.",
+      "resolution": "Fixed canonical labeled-frame column order, carried fold segment ids through prepared fold tuples, added rawnet_fold_rank_ics mean per-session Spearman computation wired into _fit_oof; executed pre-registered champion run ml_rawnet_h20_20260824 (H20 C10/20 K8/12) completing in 119s discovery plus 152s replay at 2.8GiB peak with 12 of 12 cells admitted and replayed (fills up to 1860, invested coverage 99.8 percent, turnover 1.94); live prequential gate stayed NO_TRADE while the frozen compound track recorded +4.578 percent point CAGR at policy [20,10,8].",
+      "impact": "Promotion gates and NO_TRADE semantics verified intact under the new family; production economics confirm the lab-to-production parity gap (frozen +4.58 vs prior elastic +4.97 baseline), establishing that remaining compounding levers sit in sizing/fill constraints rather than model class; measured ML signal quality baseline session IC 0.047 ICIR 0.64 with top-8 excess +61bp per vintage at 54 percent hit rate concentrated in 2023-25."
+    },
+    {
+      "task_id": "TASK_ML_RAWNET_LGBM_GROWTH_RECOVERY",
+      "date": "2026-08-24",
+      "adr_id": "ADR_20260824_ML_RAWNET_LGBM_GROWTH_RECOVERY",
+      "domain": "ml",
+      "title": "Rawnet LGBM discovery family for compounding growth recovery",
+      "why": "Lab vintage replay on real canonical data showed H10/C5 cost drag and MAD-z objective misalignment suppressed compounding while LambdaRank was destructive (-2.3% CAGR); LGBM on winsorized net utility at H20/C10 reached +38~46% point CAGR with positive bootstrap lower bounds.",
+      "resolution": "Added RAWNET_LGBM_FAMILY to declared economic families with fit_rawnet_lgbm_oof (train-only per-session 1/99 percent winsorized net-utility L2 regression, inner median best-round selection, deterministic 3-seed rank bagging), routed it through _fit_oof fail-closed guard, exposed --discovery-model-family CLI wiring, and pinned EconomicFamilyStudySettings default grid to the legacy two families preserving pre-registered alpha arithmetic.",
+      "impact": "Promotion gates, growth-route stitching, Holm admission, and NO_TRADE semantics unchanged; new family participates in mainline discovery via pre-registered request; five contract scenarios plus full ML unit suite pass with lint/type clean."
+    },
+    {
       "task_id": "TASK_ML_ALPHA_COMPOUND_TRACK",
       "date": "2026-08-23",
       "adr_id": "ADR_20260823_ML_ALPHA_COMPOUND_TRACK",
@@ -979,26 +999,6 @@
       "why": "백테스트 비용이 정적 수수료·세율·슬리피지에 의존해 BanKIS 우대수수료 가정, 시행일별 매도세, 주문 유동성을 재현하지 못했다.",
       "resolution": "비용 증거 로더와 해시 고정 계약, effective-dated KIS 비용, 매도세 분해, ADTV·변동성·호가단위 기반 슬리피지 및 simulator/backtester 연결을 추가했다.",
       "impact": "비용 산출물은 snapshot에 고정되고 누락 입력은 fail-closed된다. 전체 연구 인증은 역사적 종목 master·DART·검증된 기업행동 증거가 complete가 될 때까지 provisional이다."
-    },
-    {
-      "task_id": "TASK_KIS_COST_SCHEDULE_AND_LIQUIDITY_SLIPPAGE",
-      "date": "2026-08-10",
-      "adr_id": "ADR_20260810_KIS_COST_SCHEDULE_AND_LIQUIDITY_SLIPPAGE",
-      "domain": "stocks",
-      "title": "BanKIS cost schedule, statutory sell tax, and liquidity slippage",
-      "why": "Backtests hardcoded 15bp commission, a single 23bp sell tax, and a fixed 5bp slippage, ignoring market/date/order liquidity.",
-      "resolution": "Added a hash-bound counterfactual cost evidence artifact (BanKIS 0.0036396%/side, effective-dated statutory sell taxes per market, unified KRX tick table, sqrt-impact liquidity model), a fail-closed typed loader, and a shared fill-cost helper wired into both the backtest engine and the simulator; missing liquidity input fails orders closed as missing-liquidity-input and filled trades/manifests now trace artifact hash, commission, tax components, slippage, tick rule, and model parameter hashes.",
-      "impact": "The engine and simulator resolve identical per-fill costs from one evidence artifact; research certification still requires the remaining evidence axes (historical master, full DART, verified actions) to be complete."
-    },
-    {
-      "task_id": "TASK_STOCK_RESEARCH_DATA_FOUNDATION",
-      "date": "2026-08-10",
-      "adr_id": "ADR_20260810_STOCK_RESEARCH_DATA_FOUNDATION",
-      "domain": "stocks",
-      "title": "Stock research data foundation and provisional snapshot",
-      "why": "Research and backtest inputs lacked one immutable catalog binding evidence, canonical panels, features, and labels.",
-      "resolution": "Registered available evidence and immutable dataset versions, built provisional base/feature/label panels, created a hash-bound provisional snapshot, and verified bounded reads.",
-      "impact": "Research can reproduce a provisional 2016-01-04..2026-03-03 snapshot without changing legacy or existing curated data; research certification remains blocked by incomplete historical evidence, verified corporate actions, and costs."
     }
   ]
 }
