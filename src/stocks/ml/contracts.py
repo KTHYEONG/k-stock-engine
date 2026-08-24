@@ -83,6 +83,8 @@ LEGACY_OVERLAY_PROFILE_ID = "legacy_overlay_5bps"
 LOWER_BOUND_ONLY_PROFILE_ID = "lower_bound_only"
 LOWER_BOUND_HALF_KELLY_PROFILE_ID = "lower_bound_half_kelly"
 DEFAULT_POLICY_PROFILE_IDS = (LEGACY_OVERLAY_PROFILE_ID, LOWER_BOUND_ONLY_PROFILE_ID, LOWER_BOUND_HALF_KELLY_PROFILE_ID)
+EXCESS_FULL_KELLY_PROFILE_ID = "excess_full_kelly"
+ALLOWED_EXTRA_PROFILE_IDS = (EXCESS_FULL_KELLY_PROFILE_ID,)
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,13 +95,17 @@ class PolicyProfile:
     applied on top of the calibrated ``net_alpha_lower_bound`` and the
     ``growth_risk_aversion`` scaling the Kelly exposure. It never changes the
     portfolio caps, cost schedules, liquidity model, purging, embargo, or
-    bootstrap alpha. ``profile_id`` must be non-empty and unique within a
-    frontier; ``no_trade_band_bps`` must be a finite non-negative value;
+    bootstrap alpha unless an explicit override field is present.
+    ``profile_id`` must be non-empty and unique within a frontier;
+    ``no_trade_band_bps`` must be a finite non-negative value;
     ``growth_risk_aversion`` must be a finite strictly positive value.
     ``legacy_overlay_5bps`` reproduces the historical 5-bps entry filter;
     ``lower_bound_only`` keeps the lower-bound positivity gate without any
     extra overlay; ``lower_bound_half_kelly`` uses half-Kelly exposure
-    (aversion=2).
+    (aversion=2). ``single_name_cap_override`` raises the single-name cap to
+    at most the equal-weight basis ``1/top_k``; ``gross_utilization_target``
+    normalizes deployed gross toward that fraction of equity (both still
+    clamped by the request portfolio caps).
     """
 
     profile_id: str
@@ -107,6 +113,8 @@ class PolicyProfile:
     growth_risk_aversion: float = 1.0
     execution_utility_mode: Literal["legacy_target_interpolation_v1", "delta_cost_aware_v1", "sparse_hold_replace_v2"] = "delta_cost_aware_v1"
     sizing_mode: Literal["alpha_vol_squared_v1", "risk_balanced_waterfill_v2", "confidence_mean_variance_v1"] = "alpha_vol_squared_v1"
+    single_name_cap_override: float | None = None
+    gross_utilization_target: float | None = None
 
     def __post_init__(self) -> None:
         if not self.profile_id:
@@ -115,6 +123,15 @@ class PolicyProfile:
             raise ValueError("no_trade_band_bps must be a finite non-negative value")
         if not np.isfinite(self.growth_risk_aversion) or self.growth_risk_aversion <= 0.0:
             raise ValueError("growth_risk_aversion must be a finite strictly positive value")
+        for field_name in ("single_name_cap_override", "gross_utilization_target"):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            if not np.isfinite(value) or not 0.0 < float(value) <= 1.0:
+                raise ValueError(
+                    f"{field_name} override must be None or finite in (0, 1], "
+                    f"got {value!r}"
+                )
         if self.execution_utility_mode not in (
             "legacy_target_interpolation_v1",
             "delta_cost_aware_v1",
@@ -252,12 +269,14 @@ DEFAULT_POLICY_PROFILES = (
 
 
 def validate_policy_profiles(profiles: tuple[PolicyProfile, ...]) -> tuple[PolicyProfile, ...]:
-    """Validate a policy frontier: exactly the three default profiles, no duplicates.
+    """Validate a policy frontier: the three defaults plus allowed extras only.
 
     Raises ``ValueError`` on an empty frontier, a duplicate profile id, a
-    missing default profile, or an unexpected extra profile. The frontier is
-    pre-registered: the discovery grid replays every cached OOF score under
-    these exact policies and never refits a learner per profile.
+    missing default profile, or an unexpected extra profile. The opt-in
+    ``excess_full_kelly`` rung is the sole permitted extra and must be
+    appended after the defaults. The frontier is pre-registered: the discovery
+    grid replays every cached OOF score under these exact policies and never
+    refits a learner per profile.
     """
     if not profiles:
         raise ValueError("policy frontier requires at least one profile")
@@ -269,10 +288,19 @@ def validate_policy_profiles(profiles: tuple[PolicyProfile, ...]) -> tuple[Polic
         raise ValueError(
             f"default policy profile {missing[0]!r} is missing from the frontier"
         )
-    if tuple(ids) != DEFAULT_POLICY_PROFILE_IDS:
+    extras = [pid for pid in ids if pid not in DEFAULT_POLICY_PROFILE_IDS]
+    disallowed = [pid for pid in extras if pid not in ALLOWED_EXTRA_PROFILE_IDS]
+    if disallowed:
         raise ValueError(
-            "policy frontier must contain exactly the three default profiles "
-            f"{DEFAULT_POLICY_PROFILE_IDS}; got {tuple(ids)}"
+            f"policy frontier extra profile {disallowed[0]!r} is not permitted; "
+            f"allowed extras: {ALLOWED_EXTRA_PROFILE_IDS}"
+        )
+    expected = DEFAULT_POLICY_PROFILE_IDS + tuple(extras)
+    if tuple(ids) != expected:
+        raise ValueError(
+            "policy frontier must keep the default order "
+            f"{DEFAULT_POLICY_PROFILE_IDS} with any allowed extras appended; "
+            f"got {tuple(ids)}"
         )
     return profiles
 
