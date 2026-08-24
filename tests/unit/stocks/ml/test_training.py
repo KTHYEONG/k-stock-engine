@@ -996,3 +996,474 @@ class TestSingleMatrixSeed04:
         assert publish_phase["reason"] == (
             "memory-budget-exceeded:matrix_prepare"
         )
+
+
+def _blend_market_fixture(
+    n_sessions: int = 64,
+    per_session: int = 60,
+    horizons: tuple[int, ...] = (10, 20),
+    empty_second_labels: bool = False,
+    enable_blend: bool = True,
+):
+    """Synthetic pre-holdout panel plus two-horizon labels for blend scenarios."""
+    import numpy as np
+    import polars as pl
+    from datetime import timedelta
+
+    from src.core.datasets import DatasetManifest
+    from src.core.instruments import AssetKind
+    from src.stocks.ml.contracts import (
+        RAWNET_LGBM_FAMILY,
+        CompoundingCertificationSettings,
+        ExecutionFrontierSettings,
+        NetAlphaResearchData,
+        NetAlphaTrainingRequest,
+        PortfolioSettings,
+        RiskSettings,
+    )
+
+    rng = np.random.default_rng(11)
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    rows: list[dict[str, object]] = []
+    for s in range(n_sessions):
+        session = start + timedelta(days=s)
+        for t in range(per_session):
+            a = float(rng.normal())
+            rows.append(
+                {
+                    "instrument_id": f"KRX:{t + 1:05d}",
+                    "session": session,
+                    "available_time": session.replace(hour=15, minute=31),
+                    "observation_time": session.replace(hour=15, minute=30),
+                    "feature__a": a,
+                    "feature__b": float(rng.normal()),
+                    "open": 100.0 + t,
+                    "close": 101.0 + t,
+                    "volume": 10_000_000.0,
+                    "trading_value": 1_000_000_000.0,
+                    "sector": f"S{t % 2}",
+                    "adtv": 1_000_000_000.0,
+                    "adtv_20d": 1_000_000_000.0,
+                    "volatility_20d": 0.02,
+                }
+            )
+    frame = pl.DataFrame(rows)
+
+    def _labels(horizon: int) -> pl.DataFrame:
+        if horizon <= 0:
+            return pl.DataFrame()
+        return pl.DataFrame(
+            [
+                {
+                    "instrument_id": row["instrument_id"],
+                    "session": row["session"],
+                    "net_alpha_target": float(rng.normal(scale=0.01)),
+                    "risk_residual": 0.02 * float(row["feature__a"])
+                    + float(rng.normal(scale=0.001)),
+                    "reference_cost": 0.001,
+                    "label_available_time": row["session"]
+                    + timedelta(days=horizon),
+                }
+                for row in rows
+            ]
+        )
+
+    manifest = DatasetManifest(
+        asset_kind=AssetKind.STOCK,
+        schema_version="v1",
+        schema_hash="h",
+        provider_version="p",
+        universe_policy_version="u",
+        universe_policy_hash="u",
+        feature_set="stock_net_alpha_v1",
+        feature_set_hash="f",
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=max(horizons),
+        time_start=start,
+        time_end=start + timedelta(days=n_sessions),
+        generated_time=start + timedelta(days=n_sessions),
+        row_count=frame.height,
+    )
+    second_labels = _labels(horizons[-1])
+    if empty_second_labels:
+        # Non-empty but unusably small: discovery skips the horizon entirely.
+        second_labels = second_labels.head(2)
+    data = NetAlphaResearchData(
+        feature_frame=frame,
+        labels_by_horizon={
+            horizons[0]: _labels(horizons[0]),
+            horizons[-1]: second_labels,
+        },
+        manifest=manifest,
+    )
+    request = NetAlphaTrainingRequest(
+        artifact_id="blend-diag",
+        candidate_horizon_sessions=horizons,
+        fold_count=2,
+        embargo_sessions=1,
+        forward_holdout_sessions=0,
+        enable_horizon_blend=enable_blend,
+        discovery_model_family=RAWNET_LGBM_FAMILY,
+        risk=RiskSettings(min_calibration_sessions=2),
+        compounding=CompoundingCertificationSettings(min_observed_sessions=8),
+        execution_frontier=ExecutionFrontierSettings(
+            candidate_horizon_sessions=horizons,
+            candidate_rebalance_frequency_sessions=(5,),
+            candidate_top_k=(4,),
+        ),
+        portfolio=PortfolioSettings(
+            top_k=4,
+            max_exposure=1.0,
+            max_single_weight=0.25,
+            portfolio_value=5_000_000.0,
+            initial_cash=5_000_000.0,
+            reference_notional=5_000_000.0,
+        ),
+    )
+    return frame, data, request
+
+
+def _blend_pre_holdout(frame, folds: int = 2):
+    from src.stocks.ml.training import _index_sessions, _locked_holdout
+
+    panel = _index_sessions(frame)
+    class _Req:
+        forward_holdout_sessions = 0
+
+    pre_holdout, _holdout, reason = _locked_holdout(panel, _Req)
+    assert reason == ""
+    del folds
+    return pre_holdout
+
+
+class TestRawnetFoldDiagnostics:
+    """SCENARIO_RAWNET_FOLD_DIAGNOSTICS_POPULATED."""
+
+    def test_rawnet_fold_diagnostics_populated(self, tmp_path: Path) -> None:
+        """SCENARIO_RAWNET_FOLD_DIAGNOSTICS_POPULATED."""
+        from src.stocks.research.folds import PurgedWalkForward
+        from src.stocks.ml import training as training_module
+        from src.stocks.ml.contracts import RAWNET_LGBM_FAMILY
+
+        frame, data, request = _blend_market_fixture(
+            n_sessions=64,
+            per_session=120,
+            horizons=(10,),
+            enable_blend=False,
+        )
+        pre_holdout = _blend_pre_holdout(frame)
+        splitter = PurgedWalkForward(
+            n_folds=3,
+            label_horizon_sessions=6,
+            embargo_sessions=1,
+            session_column="session_index",
+            min_train_sessions=4,
+        )
+        folds = splitter.split(pre_holdout)
+        assert len(folds) >= 2
+        manifest = training_module._base_manifest(
+            request, data, data.feature_frame, 10
+        )
+        oof, labeled, ics, diagnostic, _path_count = training_module._fit_oof(
+            pre_holdout,
+            folds,
+            data,
+            request,
+            manifest,
+            ("feature__a", "feature__b"),
+            10,
+            None,
+            family=RAWNET_LGBM_FAMILY,
+        )
+        assert not oof.is_empty()
+        assert len(diagnostic.fold_diagnostics) == len(folds)
+        assert diagnostic.usable_fold_count == len(folds)
+        assert tuple(
+            round(v, 12) for v in diagnostic.fold_rank_ics
+        ) == tuple(round(v, 12) for v in ics)
+        assert all(d.failure_reason == "" for d in diagnostic.fold_diagnostics)
+
+    def test_fold_score_diagnostics_flags_constant_scores(self) -> None:
+        import polars as pl
+
+        from src.stocks.ml import training as training_module
+
+        oof = pl.DataFrame(
+            {
+                "instrument_id": ["A", "B"] * 3,
+                "session_index": [1, 1, 2, 2, 3, 3],
+                "oof_segment_id": [0, 0, 0, 0, 1, 1],
+                "predicted_net_alpha": [0.5, 0.5, 0.1, 0.2, 7.0, 7.0],
+            }
+        )
+        diags = training_module._fold_score_diagnostics(oof, (0.31,))
+        assert len(diags) == 2
+        assert diags[0].failure_reason == ""
+        assert diags[0].rank_ic == pytest.approx(0.31)
+        assert diags[1].failure_reason == "constant-oof-score"
+        assert diags[1].score_std == 0.0
+
+
+def _stub_replay_batch(monkeypatch: pytest.MonkeyPatch, calls: list) -> None:
+    """Deterministic batch-replay stand-in: every spec admits one filled cell."""
+    from src.stocks.ml import training as training_module
+    from src.stocks.ml.execution_replay import ExecutionReplayEvidence, ProfileReplayEvidence
+
+    def _factory(
+        registry, calibrated, oof_labels, req, horizon_sessions, risk,
+        market_frame, manifest, specs, stats_out=None,
+    ):
+        del registry, calibrated, oof_labels, risk, market_frame, manifest
+        if stats_out is not None:
+            stats_out["prepared_segment_build_count"] = len(specs)
+        results = {}
+        for cadence, top_k, profile in specs:
+            calls.append((horizon_sessions, cadence, top_k, profile.profile_id))
+            growth = tuple(0.01 + 0.0001 * i for i in range(16))
+            segment_ids = tuple(i // 8 for i in range(16))
+            evidence = ExecutionReplayEvidence(
+                base_log_growth=growth,
+                stress_log_growth=growth,
+                segment_ids=segment_ids,
+                planned_cycles=2,
+                filled_orders=10,
+                cash_session_fraction=0.0,
+                turnover=0.5,
+                observed_interval_count=16,
+                invested_interval_count=16,
+                invested_interval_fraction=1.0,
+                base_interval_exposure=tuple(0.9 for _ in range(16)),
+                stress_interval_exposure=tuple(0.9 for _ in range(16)),
+            )
+            results[(horizon_sessions, cadence, top_k, profile.profile_id)] = (
+                ProfileReplayEvidence(candidate=evidence, dense_shadow=evidence)
+            )
+        return results
+
+    monkeypatch.setattr(training_module, "_replay_costs_batch", _factory)
+
+
+class TestHorizonBlendFrontier:
+    """SCENARIO_BLEND_CANDIDATES_ENTER_FRONTIER and DROPS_CLOSED scenarios."""
+
+    @staticmethod
+    def _discovery(
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        request,
+        *,
+        empty_second_labels: bool = False,
+    ):
+        from src.stocks.research.artifacts import ModelArtifactRegistry
+        from src.stocks.ml import training as training_module
+        from src.stocks.research.folds import PurgedWalkForward
+
+        frame, data, _request = _blend_market_fixture(
+            empty_second_labels=empty_second_labels
+        )
+        pre_holdout = _blend_pre_holdout(frame)
+        splitter = PurgedWalkForward(
+            n_folds=2,
+            label_horizon_sessions=6,
+            embargo_sessions=1,
+            session_column="session_index",
+            min_train_sessions=4,
+        )
+        folds = splitter.split(pre_holdout)
+        return training_module._build_horizon_evidence(
+            pre_holdout,
+            folds,
+            data,
+            request,
+            ("feature__a", "feature__b"),
+            registry=ModelArtifactRegistry(tmp_path / "registry-blend"),
+        )
+
+    def test_blend_candidates_enter_frontier(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SCENARIO_BLEND_CANDIDATES_ENTER_FRONTIER."""
+        from dataclasses import replace as dc_replace
+
+        _stub_replay_batch(monkeypatch, [])
+        frame, data, base_request = _blend_market_fixture()
+        request = dc_replace(base_request, enable_horizon_blend=True)
+        discovery = self._discovery(tmp_path, monkeypatch, request)
+        blend_evidence = [
+            item for item in discovery.evidence if item.profile_id.endswith(":blend")
+        ]
+        base_evidence = [
+            item
+            for item in discovery.evidence
+            if not item.profile_id.endswith(":blend")
+        ]
+        assert len(discovery.oof_by_horizon) == 2
+        assert len(blend_evidence) == 3
+        assert all(item.horizon_sessions == 20 for item in blend_evidence)
+        assert all(item.model_family.endswith("+mh_blend") for item in blend_evidence)
+        assert all(len(item.base_log_growth) > 0 for item in blend_evidence)
+        assert len(base_evidence) >= 2
+        for key, reason in discovery.dropout_reasons.items():
+            if key[3].endswith(":blend"):
+                assert reason == "", key
+
+    def test_base_evidence_unchanged_when_flag_off(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from dataclasses import replace as dc_replace
+
+        _, _, base_request = _blend_market_fixture()
+        flag_off = dc_replace(base_request, enable_horizon_blend=False)
+        flag_on = dc_replace(base_request, enable_horizon_blend=True)
+        off = self._discovery(tmp_path, monkeypatch, flag_off)
+        on = self._discovery(tmp_path, monkeypatch, flag_on)
+        base_off = [
+            (e.horizon_sessions, e.profile_id, e.base_log_growth)
+            for e in off.evidence
+        ]
+        base_on = [
+            (e.horizon_sessions, e.profile_id, e.base_log_growth)
+            for e in on.evidence
+            if not e.profile_id.endswith(":blend")
+        ]
+        assert base_on == base_off
+        assert not any(":blend" in item.profile_id for item in off.evidence)
+
+    def test_blend_drops_without_second_horizon(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SCENARIO_BLEND_DROPS_CLOSED_WITHOUT_SECOND_HORIZON.
+
+        Also covers SCENARIO_BLEND_CANDIDATES base-parity assertion.
+        """
+        from dataclasses import replace as dc_replace
+
+        calls: list = []
+        _stub_replay_batch(monkeypatch, calls)
+        frame, data, base_request = _blend_market_fixture(empty_second_labels=True)
+        request = dc_replace(base_request, enable_horizon_blend=True)
+        discovery = self._discovery(
+            tmp_path, monkeypatch, request, empty_second_labels=True
+        )
+        assert not any(
+            item.profile_id.endswith(":blend") for item in discovery.evidence
+        )
+        unavailable = [
+            reason
+            for key, reason in discovery.dropout_reasons.items()
+            if key[3].endswith(":blend")
+        ]
+        assert unavailable
+        assert set(unavailable) == {"blend-scores-unavailable"}
+        assert len(unavailable) == 3
+
+
+class TestBlendChampionGate:
+    """SCENARIO_BLEND_CHAMPION_FAILS_CLOSED_PRE_HOLDOUT."""
+
+    def test_blend_champion_fails_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SCENARIO_BLEND_CHAMPION_FAILS_CLOSED_PRE_HOLDOUT."""
+        from src.stocks.ml import training as training_module
+        from src.stocks.ml.horizons import GrowthRouteEvidence, HorizonOOFEvidence
+        from src.stocks.research.artifacts import ModelArtifactRegistry
+        from src.stocks.ml.telemetry import TrainingTelemetry
+
+        _, data, request = _blend_market_fixture()
+
+        policy_key = (20, 5, 2, "lower_bound_only:blend")
+        route = GrowthRouteEvidence(
+            base_log_growth=tuple(0.01 for _ in range(8)),
+            stress_log_growth=tuple(0.009 for _ in range(8)),
+            segment_ids=tuple(0 for _ in range(8)),
+            selected_policies=(policy_key,),
+            interval_policies=(policy_key,) * 8,
+            benchmark_log_growth=tuple(0.002 for _ in range(8)),
+            candidate_count=3,
+            observed_interval_count=8,
+            invested_interval_count=8,
+            filled_orders=12,
+            filled_cycle_count=4,
+            turnover_ratio=0.4,
+            seed_policy=None,
+        )
+        certificate = {
+            "passed": True,
+            "reasons": [],
+            "cagr_base": 0.12,
+            "cagr_stress": 0.11,
+            "base_lower_cagr": 0.02,
+            "stress_lower_cagr": 0.019,
+            "matched_lower_excess_cagr": 0.03,
+            "mdd": 0.05,
+            "observed_intervals": 8,
+            "invested_intervals": 8,
+            "filled_orders": 12,
+        }
+
+        def _stitch(*args: object, **kwargs: object):
+            del args, kwargs
+            return route
+
+        def _certify(*args: object, **kwargs: object):
+            del args, kwargs
+            return dict(certificate)
+
+        monkeypatch.setattr(
+            training_module, "stitch_prequential_growth_route", _stitch
+        )
+        monkeypatch.setattr(training_module, "certify_growth_route", _certify)
+
+        evidence_item = HorizonOOFEvidence(
+            horizon_sessions=20,
+            profile_id="lower_bound_only",
+            model_family="economic_rawnet_lgbm",
+            base_log_growth=tuple(0.01 for _ in range(8)),
+            stress_log_growth=tuple(0.009 for _ in range(8)),
+            cohort_segment_ids=tuple(0 for _ in range(8)),
+            complete_cohort_count=8,
+            active_cohort_count=8,
+            partial_cohort_count=0,
+            missing_cohort_count=0,
+            segment_count=1,
+            fold_rank_ics=(0.1, 0.2),
+        )
+        discovery = training_module.HorizonDiscovery(
+            evidence=(evidence_item,),
+            diagnostics=(),
+            oof_by_horizon={},
+        )
+        monkeypatch.setattr(
+            training_module, "_build_horizon_evidence", lambda *a, **k: discovery
+        )
+        monkeypatch.setattr(
+            training_module,
+            "_attach_growth_route_execution_evidence",
+            lambda route, discovery_, panel: route,
+        )
+
+        registry_root = tmp_path / "registry-champion"
+        registry_root.mkdir()
+        registry = ModelArtifactRegistry(registry_root)
+        telemetry = TrainingTelemetry()
+        frame = data.feature_frame
+        manifest = training_module._run_discovery_and_publish(
+            registry=registry,
+            data=data,
+            request=request,
+            frame=frame,
+            pre_holdout=frame,
+            holdout=frame,
+            folds=[],
+            learner_columns=("feature__a", "feature__b"),
+            schema=None,
+            telemetry=telemetry,
+            schema_hash="h",
+            universe_policy_hash="u",
+            oof_cache=training_module._OofCache(tmp_path / "oof-champion"),
+        )
+        assert manifest.model_type == "no_trade"
+        publish_phase = telemetry.to_dict()["phases"][-1]
+        reason = str(publish_phase.get("reason", ""))
+        assert "blend-champion-holdout-unsupported" in reason
