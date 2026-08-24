@@ -98,6 +98,7 @@ from src.stocks.research.models import ModelManifest
 __all__ = [
     "evaluate_economic_family_study",
     "evaluate_economic_window_candidate",
+    "fit_rawnet_lgbm_oof",
     "fit_tail_lambdarank_oof",
 ]
 
@@ -108,6 +109,8 @@ _SESSION_IDX = "session_index"
 _OOF_SEGMENT = "oof_segment_id"
 _MIN_STUDY_FOLDS = 3
 _MAX_BLOCKED_VINTAGE_FRACTION = 0.05
+_RAWNET_WINSOR_LO = 0.01
+_RAWNET_WINSOR_HI = 0.99
 
 _NO_LABEL_CAPACITY = "no-label-capacity"
 _TAIL_CAPTURE_INSUFFICIENT = "tail-capture-insufficient"
@@ -786,6 +789,354 @@ def fit_tail_lambdarank_oof(
             pl.lit(fold.segment_id, dtype=pl.Int64).alias(_OOF_SEGMENT),
         )
         labeled = scored.join(label_subset, on=[_ID_COLUMN, SESSION_COLUMN], how="inner")
+        if labeled.is_empty():
+            continue
+        oof_frames.append(scored)
+        label_frames.append(labeled)
+    if not oof_frames:
+        return pl.DataFrame(), pl.DataFrame()
+    return pl.concat(oof_frames), pl.concat(label_frames)
+
+
+
+def _rawnet_lgbm_params(
+    config: NetAlphaModelConfig, num_threads: int, seed: int
+) -> dict[str, object]:
+    """Deterministic L2 regression parameters for one bagging seed."""
+    return {
+        "objective": "regression",
+        "metric": "l2",
+        "num_leaves": config.num_leaves,
+        "learning_rate": config.learning_rate,
+        "max_depth": config.max_depth,
+        "min_child_samples": config.min_child_samples,
+        "feature_fraction": config.feature_fraction,
+        "bagging_fraction": 0.9,
+        "bagging_freq": 1,
+        "lambda_l1": 0.0,
+        "lambda_l2": 1.0,
+        "max_bin": 255,
+        "num_threads": int(num_threads),
+        "seed": int(seed),
+        "deterministic": True,
+        "force_col_wise": True,
+        "data_random_seed": int(seed),
+        "feature_fraction_seed": int(seed),
+        "bagging_seed": int(seed),
+        "verbosity": -1,
+    }
+
+
+def _add_winsorized_utility(train: pl.DataFrame) -> pl.DataFrame:
+    """Per-session 1%/99% clip of ``risk_residual - reference_cost``.
+
+    Quantiles come exclusively from the fold's training join; validation and
+    holdout rows can never move them.
+    """
+    utility = pl.col(RISK_RESIDUAL_COLUMN) - pl.col(REFERENCE_COST_COLUMN)
+    bounds = train.group_by(SESSION_COLUMN).agg(
+        utility.quantile(_RAWNET_WINSOR_LO).alias("__lo"),
+        utility.quantile(_RAWNET_WINSOR_HI).alias("__hi"),
+    )
+    clipped = (
+        train.join(bounds, on=SESSION_COLUMN, how="left")
+        .with_columns(
+            utility.clip(pl.col("__lo"), pl.col("__hi")).alias("__utility")
+        )
+        .drop(["__lo", "__hi"])
+    )
+    if clipped["__utility"].null_count() > 0:
+        raise InvalidOofEconomicUtilityError(
+            "rawnet training rows carry null risk_residual/reference_cost"
+        )
+    return clipped
+
+
+def _inner_rawnet_best_round(
+    train_sorted: pl.DataFrame,
+    learner_columns: tuple[str, ...],
+    config: NetAlphaModelConfig,
+    num_threads: int,
+) -> int | None:
+    """Inner chronological-split early-stopped round count on winsorized L2."""
+    sessions = train_sorted[SESSION_COLUMN].unique().sort().to_list()
+    holdout_n = max(1, len(sessions) // 4)
+    if len(sessions) - holdout_n < 1:
+        return None
+    valid_sessions = sessions[-holdout_n:]
+    inner_valid = train_sorted.filter(
+        pl.col(SESSION_COLUMN).is_in(list(valid_sessions))
+    )
+    inner_train = train_sorted.filter(
+        ~pl.col(SESSION_COLUMN).is_in(list(valid_sessions))
+    )
+    if inner_train.is_empty() or inner_valid.is_empty():
+        return None
+    train_features = _design_matrix(inner_train, learner_columns)
+    valid_features = _design_matrix(inner_valid, learner_columns)
+    params = _rawnet_lgbm_params(config, num_threads, config.seed)
+    train_set = lgb.Dataset(
+        train_features,
+        label=inner_train["__utility"].to_numpy(),
+        params={"verbosity": -1},
+    )
+    valid_set = lgb.Dataset(
+        valid_features,
+        label=inner_valid["__utility"].to_numpy(),
+        reference=train_set,
+        params={"verbosity": -1},
+    )
+    try:
+        booster = lgb.train(
+            params,
+            train_set,
+            num_boost_round=config.n_estimators,
+            valid_sets=[valid_set],
+            callbacks=[lgb.early_stopping(config.early_stopping_rounds, verbose=False)],
+        )
+    except LightGBMError:
+        return None
+    best = int(getattr(booster, "best_iteration", 0) or 0)
+    return best or None
+
+
+def _rawnet_seed_scores(
+    train_sorted: pl.DataFrame,
+    valid_sorted: pl.DataFrame,
+    learner_columns: tuple[str, ...],
+    config: NetAlphaModelConfig,
+    num_threads: int,
+    rounds: int,
+    seed: int,
+) -> np.ndarray:
+    """One seed's validation scores from fixed-round winsorized-L2 fitting."""
+    params = _rawnet_lgbm_params(config, num_threads, seed)
+    train_set = lgb.Dataset(
+        _design_matrix(train_sorted, learner_columns),
+        label=train_sorted["__utility"].to_numpy(),
+        params={"verbosity": -1},
+    )
+    booster = lgb.train(params, train_set, num_boost_round=rounds)
+    return np.asarray(
+        booster.predict(_design_matrix(valid_sorted, learner_columns)),
+        dtype=np.float64,
+    )
+
+
+def _rank_average_seed_scores(seed_frames: Sequence[pl.DataFrame]) -> pl.DataFrame:
+    """Mean cross-sectional percentile rank across per-seed score frames.
+
+    Every seed frame must carry identical ``(instrument_id, session)`` keys
+    and a finite ``score`` column; any coverage mismatch fails closed.
+    """
+    if len(seed_frames) < 2:
+        raise ValueError("seed bagging requires at least two seed score frames")
+    key_sets = [
+        set(
+            zip(
+                frame[_ID_COLUMN].to_list(),
+                frame[SESSION_COLUMN].to_list(),
+                strict=True,
+            )
+        )
+        for frame in seed_frames
+    ]
+    if any(keys != key_sets[0] for keys in key_sets[1:]):
+        raise ValueError(
+            "seed bagging requires identical (instrument_id, session) coverage "
+            "in every seed score frame"
+        )
+    stacked = pl.concat(
+        [
+            frame.select(_ID_COLUMN, SESSION_COLUMN, SCORE_COLUMN).with_columns(
+                pl.lit(index, dtype=pl.Int64).alias("__seed")
+            )
+            for index, frame in enumerate(seed_frames)
+        ],
+        how="vertical",
+    )
+    ranked = stacked.with_columns(
+        pl.col(SCORE_COLUMN)
+        .rank("average")
+        .over([SESSION_COLUMN, "__seed"])
+        .alias("__rk"),
+        pl.len().over([SESSION_COLUMN, "__seed"]).alias("__n"),
+    ).with_columns(
+        pl.when(pl.col("__n") > 1)
+        .then((pl.col("__rk") - 1.0) / (pl.col("__n") - 1.0))
+        .otherwise(0.5)
+        .cast(pl.Float64)
+        .alias("__pct")
+    )
+    averaged = (
+        ranked.group_by([_ID_COLUMN, SESSION_COLUMN])
+        .agg(pl.col("__pct").mean().alias(SCORE_COLUMN))
+        .sort([_ID_COLUMN, SESSION_COLUMN])
+    )
+    if averaged[SCORE_COLUMN].null_count() > 0 or not bool(
+        averaged[SCORE_COLUMN].is_finite().all()
+    ):
+        raise ValueError("seed-bagged scores must be finite for every row")
+    return averaged
+
+
+def rawnet_fold_rank_ics(labeled: pl.DataFrame) -> list[float]:
+    """Mean per-session Rank-IC of bagged scores vs realized net residual.
+
+    One value per ``oof_segment_id`` (ascending), computed only on labeled
+    validation rows so a missing realized outcome never fabricates a fold
+    statistic.
+    """
+    if labeled.is_empty() or _OOF_SEGMENT not in labeled.columns:
+        return []
+    ranked = (
+        labeled.select(
+            _OOF_SEGMENT,
+            _SESSION_IDX,
+            SCORE_COLUMN,
+            RISK_RESIDUAL_COLUMN,
+        )
+        .drop_nulls([SCORE_COLUMN, RISK_RESIDUAL_COLUMN])
+        .with_columns(
+            pl.col(SCORE_COLUMN).rank("average").over(_SESSION_IDX).alias("__rs"),
+            pl.col(RISK_RESIDUAL_COLUMN)
+            .rank("average")
+            .over(_SESSION_IDX)
+            .alias("__rr"),
+        )
+    )
+    per_session = ranked.group_by(_OOF_SEGMENT, _SESSION_IDX).agg(
+        pl.corr("__rs", "__rr").alias("ic")
+    )
+    per_fold = (
+        per_session.drop_nulls("ic")
+        .group_by(_OOF_SEGMENT)
+        .agg(pl.col("ic").mean().alias("fold_ic"))
+        .sort(_OOF_SEGMENT)
+    )
+    values = [
+        float(value)
+        for value in per_fold["fold_ic"].to_list()
+        if np.isfinite(value)
+    ]
+    return values
+
+
+def fit_rawnet_lgbm_oof(
+    pre_holdout: pl.DataFrame,
+    folds: list[Fold],
+    data: NetAlphaResearchData,
+    request: NetAlphaTrainingRequest,
+    learner_columns: tuple[str, ...],
+    horizon_sessions: int,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Deterministic winsorized-net LightGBM regression OOF with seed bagging.
+
+    The regression target is the simple-decimal economic utility
+    ``risk_residual - reference_cost``, winsorized at per-session 1%/99%
+    quantiles computed only on each fold's training join. Three consecutive
+    seeds fit at a shared round count (median of inner early-stopped best
+    iterations); their validation predictions are combined by mean
+    cross-sectional percentile rank so no single seed's ordering dominates.
+    Canonical ``[session, instrument_id]`` sorting precedes every matrix build
+    and repeated calls on identical inputs are bit-identical.
+    """
+    label_join = _build_label_join(data, horizon_sessions)
+    config = NetAlphaModelConfig(seed=request.seed)
+    seeds = (request.seed, request.seed + 1, request.seed + 2)
+
+    inner_iterations: list[int] = []
+    prepared_folds: list[tuple[int, pl.DataFrame, pl.DataFrame]] = []
+    for fold_index, fold in enumerate(folds):
+        raw_train = pre_holdout[fold.train_mask].join(
+            label_join, on=[_ID_COLUMN, SESSION_COLUMN], how="inner"
+        )
+        validation = pre_holdout[fold.validation_mask]
+        if raw_train.is_empty() or validation.is_empty():
+            logger.info(
+                "[RAWRNET] fold=%d skipped train_rows=%d val_rows=%d "
+                "label_join_rows=%d",
+                fold_index,
+                len(fold.train_mask),
+                len(fold.validation_mask),
+                label_join.height,
+            )
+            continue
+        train_sorted = _add_winsorized_utility(raw_train).sort(
+            [SESSION_COLUMN, _ID_COLUMN], maintain_order=True
+        )
+        prepared_folds.append((int(fold.segment_id), train_sorted, validation))
+        best = _inner_rawnet_best_round(
+            train_sorted, learner_columns, config, request.model_threads
+        )
+        logger.info(
+            "[RAWRNET] fold=%d prepared train_rows=%d inner_best_round=%s",
+            fold_index,
+            train_sorted.height,
+            best,
+        )
+        if best is not None:
+            inner_iterations.append(best)
+    if not inner_iterations or not prepared_folds:
+        logger.info(
+            "[RAWRNET] empty result: prepared_folds=%d inner_iterations=%d",
+            len(prepared_folds),
+            len(inner_iterations),
+        )
+        return pl.DataFrame(), pl.DataFrame()
+    rounds = int(np.median(inner_iterations))
+
+    oof_frames: list[pl.DataFrame] = []
+    label_frames: list[pl.DataFrame] = []
+    label_subset = label_join.select(
+        _ID_COLUMN,
+        SESSION_COLUMN,
+        TARGET_COLUMN,
+        AVAILABLE_COLUMN,
+        RISK_RESIDUAL_COLUMN,
+        REFERENCE_COST_COLUMN,
+        REALIZED_RETURN_COLUMN,
+    )
+    for segment_id, train_sorted, validation in prepared_folds:
+        if validation.is_empty():
+            continue
+        valid_sorted = validation.sort([SESSION_COLUMN, _ID_COLUMN], maintain_order=True)
+        seed_frames: list[pl.DataFrame] = []
+        for seed in seeds:
+            predictions = _rawnet_seed_scores(
+                train_sorted,
+                valid_sorted,
+                learner_columns,
+                config,
+                request.model_threads,
+                rounds,
+                seed,
+            )
+            seed_frames.append(
+                valid_sorted.select(_ID_COLUMN, SESSION_COLUMN).with_columns(
+                    pl.Series(SCORE_COLUMN, predictions)
+                )
+            )
+        scored = _rank_average_seed_scores(tuple(seed_frames)).with_columns(
+            pl.lit(segment_id, dtype=pl.Int64).alias(_OOF_SEGMENT)
+        )
+        session_lookup = valid_sorted.select(
+            _ID_COLUMN, SESSION_COLUMN, pl.col(_SESSION_IDX)
+        )
+        scored = scored.join(session_lookup, on=[_ID_COLUMN, SESSION_COLUMN], how="left")
+        if scored[_SESSION_IDX].null_count() > 0:
+            raise ValueError(
+                "rawnet OOF scoring produced a row absent from its fold "
+                "validation partition"
+            )
+        # Canonical column order matches the prepared-array OOF ledger schema
+        # so causal calibration can vstack seed ledgers without recasting.
+        scored = scored.select(
+            _ID_COLUMN, SESSION_COLUMN, _SESSION_IDX, SCORE_COLUMN, _OOF_SEGMENT
+        )
+        labeled = scored.join(
+            label_subset, on=[_ID_COLUMN, SESSION_COLUMN], how="inner"
+        )
         if labeled.is_empty():
             continue
         oof_frames.append(scored)

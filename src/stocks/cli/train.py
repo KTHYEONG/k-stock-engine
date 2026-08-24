@@ -49,9 +49,11 @@ from src.stocks.data.repositories import (
     resolve_snapshot_for_mode,
 )
 from src.stocks.ml.contracts import (
+    DECLARED_ECONOMIC_FAMILIES,
     DEFAULT_CANDIDATE_HORIZON_SESSIONS,
     DEFAULT_CANDIDATE_REBALANCE_FREQUENCY_SESSIONS,
     DEFAULT_CANDIDATE_TOP_K,
+    ELASTIC_NET_FAMILY,
     ExecutionFrontierSettings,
     NetAlphaResearchData,
     NetAlphaTrainingRequest,
@@ -720,6 +722,16 @@ def build_parser() -> argparse.ArgumentParser:
             "sessions with an optional trailing 'expanding' control"
         ),
     )
+    parser.add_argument(
+        "--discovery-model-family",
+        type=str,
+        choices=DECLARED_ECONOMIC_FAMILIES,
+        default=ELASTIC_NET_FAMILY,
+        help=(
+            "pre-registered discovery model family for prepared-array OOF "
+            "fitting (fail-closed against undeclared values)"
+        ),
+    )
     return parser
 
 
@@ -766,6 +778,7 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
         # on a non-positive or sub-annual cap before any dataset is loaded.
         max_training_lookback_sessions=args.max_training_lookback_sessions,
         seed=args.seed,
+        discovery_model_family=args.discovery_model_family,
         portfolio=PortfolioSettings(
             top_k=args.top_k,
             max_single_weight=args.max_single_weight,
