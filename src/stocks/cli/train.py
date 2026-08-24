@@ -38,7 +38,10 @@ from src.core.paths import (
     STOCK_FEATURE_PANEL_ROOT,
     STOCK_LABEL_ROOT,
 )
-from src.stocks.config.research import resolve_training_request
+from src.stocks.config.research import (
+    policy_profiles_with_excess_full_kelly,
+    resolve_training_request,
+)
 from src.stocks.config.runtime import StockRuntimeSettings
 from src.stocks.data.contracts import CoverageRange, DatasetSnapshot
 from src.stocks.data.costs import load_cost_evidence
@@ -53,10 +56,12 @@ from src.stocks.ml.contracts import (
     DEFAULT_CANDIDATE_HORIZON_SESSIONS,
     DEFAULT_CANDIDATE_REBALANCE_FREQUENCY_SESSIONS,
     DEFAULT_CANDIDATE_TOP_K,
+    DEFAULT_POLICY_PROFILES,
     ELASTIC_NET_FAMILY,
     ExecutionFrontierSettings,
     NetAlphaResearchData,
     NetAlphaTrainingRequest,
+    PolicyProfile,
     PortfolioSettings,
     RiskSettings,
 )
@@ -740,6 +745,14 @@ def build_parser() -> argparse.ArgumentParser:
             "(requires >= 2 candidate horizons)"
         ),
     )
+    parser.add_argument(
+        "--enable-excess-full-kelly",
+        action="store_true",
+        help=(
+            "Opt in to the excess_full_kelly frontier profile (equal-weight "
+            "single-name basis and gross utilization target)"
+        ),
+    )
     return parser
 
 
@@ -766,6 +779,9 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
     horizons = _parse_horizons(args.candidate_horizon_sessions)
     cadences = _parse_horizons(args.candidate_rebalance_frequency_sessions)
     top_k = _parse_horizons(args.candidate_top_k)
+    policy_profiles: tuple[PolicyProfile, ...] = DEFAULT_POLICY_PROFILES
+    if bool(getattr(args, 'enable_excess_full_kelly', False)):
+        policy_profiles = policy_profiles_with_excess_full_kelly()
     return NetAlphaTrainingRequest(
         artifact_id=args.artifact_id,
         candidate_horizon_sessions=horizons,
@@ -788,6 +804,7 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
         seed=args.seed,
         discovery_model_family=args.discovery_model_family,
         enable_horizon_blend=bool(getattr(args, 'enable_horizon_blend', False)),
+        policy_profiles=policy_profiles,
         portfolio=PortfolioSettings(
             top_k=args.top_k,
             max_single_weight=args.max_single_weight,

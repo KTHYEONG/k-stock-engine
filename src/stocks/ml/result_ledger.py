@@ -1024,7 +1024,26 @@ def _compact_growth_route(metrics: Mapping[str, object]) -> dict[str, object]:
     }
     outcome = route
     summary['promotion_status'] = outcome.get('promotion_status', 'NO_TRADE')
+    summary['hedge_sleeve'] = _compact_hedge_sleeve(route)
     return summary
+
+
+def _compact_hedge_sleeve(route: Mapping[str, object]) -> dict[str, object]:
+    """Bounded hedge-sleeve scalars from the growth-route projection."""
+    sleeve = route.get("hedge_sleeve_projection")
+    if not isinstance(sleeve, Mapping):
+        return {}
+    return {
+        "leverage_rung_count": _as_int(sleeve.get("leverage_rung_count")),
+        "admissible_rung_count": _as_int(sleeve.get("admissible_rung_count")),
+        "max_admissible_leverage": _as_float(
+            sleeve.get("max_admissible_leverage")
+        ),
+        "vol_managed_max_admissible_leverage": _as_float(
+            sleeve.get("vol_managed_max_admissible_leverage")
+        ),
+        "excess_point_cagr": _as_float(sleeve.get("excess_point_cagr")),
+    }
 
 
 def _compact_observability(
