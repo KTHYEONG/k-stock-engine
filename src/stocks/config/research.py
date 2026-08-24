@@ -19,7 +19,12 @@ from src.stocks.compatibility import (
     parse_execution_utility,
     parse_sizing_method,
 )
-from src.stocks.ml.contracts import PolicyProfile
+from src.stocks.ml.contracts import (
+    EXCESS_FULL_KELLY_PROFILE_ID,
+    PolicyProfile,
+)
+
+__all__ = ["EXCESS_FULL_KELLY_PROFILE_ID", "CanonicalResearchProfile"]
 
 
 class ParameterSource(StrEnum):
@@ -30,7 +35,13 @@ class ParameterSource(StrEnum):
     ENVIRONMENT = "environment"
 
 
-EXCESS_FULL_KELLY_PROFILE_ID = "excess_full_kelly"
+# Canonical constant lives in contracts; the import above re-exports it for
+# config callers.
+
+# Ceiling resolved against the equal-weight basis min(ceiling, 1/top_k) at
+# request build time; 0.16 admits the K=8 basis fully while staying finite.
+_EXCESS_FULL_KELLY_SINGLE_NAME_CEILING = 0.16
+_EXCESS_FULL_KELLY_GROSS_UTILIZATION = 0.92
 
 
 def policy_profiles_with_excess_full_kelly() -> tuple[PolicyProfile, ...]:
@@ -38,7 +49,8 @@ def policy_profiles_with_excess_full_kelly() -> tuple[PolicyProfile, ...]:
 
     The default ``CanonicalResearchProfile`` never carries this profile so
     flag-off runs stay byte-identical; requests opt in by replacing their
-    ``policy_profiles`` with this tuple.
+    ``policy_profiles`` with this tuple. The rung widens its single-name cap
+    toward the equal-weight basis and normalizes deployed gross toward 92%.
     """
     return (
         *CanonicalResearchProfile().policy_profiles,
@@ -46,6 +58,8 @@ def policy_profiles_with_excess_full_kelly() -> tuple[PolicyProfile, ...]:
             profile_id=EXCESS_FULL_KELLY_PROFILE_ID,
             no_trade_band_bps=0.0,
             growth_risk_aversion=1.0,
+            single_name_cap_override=_EXCESS_FULL_KELLY_SINGLE_NAME_CEILING,
+            gross_utilization_target=_EXCESS_FULL_KELLY_GROSS_UTILIZATION,
         ),
     )
 
