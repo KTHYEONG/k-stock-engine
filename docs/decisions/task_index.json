@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "hedged_excess_compounding_unlock",
+      "date": "2026-08-24",
+      "adr_id": "ADR_20260824_hedged_excess_compounding_unlock",
+      "domain": "stocks_ml",
+      "title": "Hedged-excess compounding route unlock (W1 benchmark stitch repair, W2 PROMOTABLE_EXCESS verdict, W3 hedge sleeve projection)",
+      "why": "Latest champion runs failed closed on benchmark-exposure-length-mismatch because _attach_growth_route_execution_evidence passed full-panel sessions to exposure_matched_benchmark_log_growth while candidate evidence covers only segment-scoped intervals, so matched_lower_excess_cagr stayed null and absolute lower bounds carried the full universe-beta drag; scratch label replays confirmed yearly universe net CAGR swings -24..+45 percent making absolute-only certification structurally NO_TRADE despite certifiable excess (ADR LB +12.8..+16.2) and 72-percent diluted sizing converting a Sharpe-1.22 blend stream into 5.4 percent CAGR.",
+      "resolution": "Added base_interval_session_bounds to ExecutionReplayEvidence with partition validation and ledger-bound collection through replay aggregation; rewrote benchmark stitching to compute per-segment scoped exposure-matched benchmarks with fail-closed reasons benchmark-session-bounds-missing/exposure-invalid/length-mismatch; added promotion_status verdict (PROMOTED|PROMOTABLE_EXCESS|NO_TRADE) in the growth-route projection where matched_lower_excess_cagr>0 clears coverage/MDD gates, projected it into the result ledger, attached a bounded research-only hedge_sleeve projection (project_hedge_sleeve leverage ladder over certified base-minus-benchmark series), and introduced opt-in EXCESS_FULL_KELLY_PROFILE_ID factory keeping default profiles byte-identical.",
+      "impact": "Benchmark reconciliation now succeeds on multi-segment prequential routes enabling excess certification on rerun of existing snapshots; absolute gates and NO_TRADE semantics unchanged and flag-off payloads stay economically identical; hedge projections never set promoted or enter manifests; seven pinned scenarios plus full stocks unit suite pass lint and type clean."
+    },
+    {
       "task_id": "TASK_ML_RECENT_REGIME_SHARPE_UPLIFT",
       "date": "2026-08-24",
       "adr_id": "ADR_20260824_ML_RECENT_REGIME_SHARPE_UPLIFT",
@@ -989,16 +999,6 @@
       "why": "The data audit found a complete 123-month DART collection outside the catalog and 32 fully-null derived feature columns that could be selected accidentally.",
       "resolution": "Added atomic DART disclosure publication into the typed catalog with immutable/idempotent registration, retained disclosures as raw evidence rather than corporate actions, and added content-manifest-backed feature readiness validation that fails closed for missing, fully-null, or non-finite selected features while reporting warm-up nulls.",
       "impact": "Future research can bind complete DART evidence by immutable name and validate model-selected feature inputs before use; existing datasets, partial artifacts, and snapshots remain unchanged. Ruff, mypy, 466 pytest tests, spec validation, and an actual readiness CLI run passed."
-    },
-    {
-      "task_id": "TASK_DATASET_INTEGRITY_AUDIT",
-      "date": "2026-08-11",
-      "adr_id": "ADR_20260811_DATASET_INTEGRITY_AUDIT",
-      "domain": "stocks-data",
-      "title": "Audit collected and downstream data artifacts",
-      "why": "The complete OpenDART resumable collection and downstream data under data/ required a final integrity, lineage, and usability audit before future research use.",
-      "resolution": "Verified 123 complete DART monthly partitions, 2,280,415 unique receipts, 2,810 valid evidence JSON files, 10,943 readable non-empty Parquet files, manifest row/hash consistency, key uniqueness, OHLC and availability invariants, and dataset key alignment. Recorded that complete DART partitions are not yet catalog-registered or merged, and that 32 derived feature columns are fully null while active features retain documented warm-up/null rows.",
-      "impact": "Evidence and canonical datasets are structurally intact, but future consumers must explicitly select dart_parts_single_worker, register or merge it before catalog-based use, and apply the documented feature-null policy. Preserved the resumable collector specification documents."
     }
   ]
 }
