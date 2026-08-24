@@ -10,6 +10,7 @@ order.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import numpy as np
 
@@ -39,6 +40,7 @@ class CandidateReplayAccumulator:
     segment_ids: list[int] = field(default_factory=list)
     base_interval_exposure: list[float] = field(default_factory=list)
     stress_interval_exposure: list[float] = field(default_factory=list)
+    interval_session_bounds: list[tuple[datetime, ...]] = field(default_factory=list)
     totals: _SegmentTotals = field(default_factory=_SegmentTotals)
 
     def add_segment(self, summary: SegmentExecutionSummary) -> None:
@@ -69,6 +71,8 @@ class CandidateReplayAccumulator:
         self.segment_ids.extend([segment_id] * len(base_growth))
         self.base_interval_exposure.extend(base_interval_exposure)
         self.stress_interval_exposure.extend(stress_interval_exposure)
+        if summary.interval_session_bounds:
+            self.interval_session_bounds.append(summary.interval_session_bounds)
         weight = max(1, int(planned_cycles))
         totals = self.totals
         totals.planned_cycles += max(0, int(planned_cycles))
@@ -128,6 +132,7 @@ class CandidateReplayAccumulator:
             stress_exposure=weighted(totals.stress_exposure_weighted),
             base_interval_exposure=tuple(self.base_interval_exposure),
             stress_interval_exposure=tuple(self.stress_interval_exposure),
+            base_interval_session_bounds=tuple(self.interval_session_bounds),
         )
 
 
@@ -151,3 +156,4 @@ class SegmentExecutionSummary:
     base_exposure: float
     stress_exposure: float
     unfilled_reason_counts: dict[str, int]
+    interval_session_bounds: tuple[datetime, ...] = ()
