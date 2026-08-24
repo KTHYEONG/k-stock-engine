@@ -1,8 +1,14 @@
-"""PROMOTABLE_EXCESS verdict scenarios: SCENARIO_PROMOTABLE_EXCESS_*."""
+"""PROMOTABLE_EXCESS verdict scenarios: SCENARIO_PROMOTABLE_EXCESS_*, W3 blend."""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from src.stocks.ml.horizons import GrowthRouteEvidence
-from src.stocks.ml.training import _growth_route_projection
+from src.stocks.ml.training import (
+    _blend_champion_no_trade,
+    _growth_route_projection,
+    _policy_frontier_projection,
+)
 
 
 def _route() -> GrowthRouteEvidence:
@@ -93,3 +99,77 @@ def test_promoted_when_certificate_passes() -> None:
     certificate["stress_lower_cagr"] = 0.01
     projection = _growth_route_projection(_route(), certificate)
     assert projection["promotion_status"] == "PROMOTED"
+
+
+def test_blend_champion_publishes_excess_verdict() -> None:
+    """SCENARIO_BLEND_EXCESS_VERDICT_CARVEOUT."""
+    excess_route = dict(_growth_route_projection(_route(), _certificate(
+        ["non-positive-base-lower-cagr", "non-positive-stress-lower-cagr"], 0.128,
+    )))
+    assert excess_route["promotion_status"] == "PROMOTABLE_EXCESS"
+    reason, payload = _blend_champion_no_trade(excess_route, _certificate(
+        ["non-positive-base-lower-cagr", "non-positive-stress-lower-cagr"], 0.128,
+    ))
+    assert reason == "blend-champion-excess-verdict"
+    assert payload["growth_route"]["promotion_status"] == "PROMOTABLE_EXCESS"
+
+    plain_route = dict(_growth_route_projection(_route(), _certificate(
+        ["non-positive-base-lower-cagr"], None,
+    )))
+    reason_plain, _ = _blend_champion_no_trade(plain_route, _certificate(
+        ["non-positive-base-lower-cagr"], None,
+    ))
+    assert reason_plain == "blend-champion-holdout-unsupported"
+
+
+def test_frontier_publishes_blend_lower_growth() -> None:
+    """SCENARIO_BLEND_LOWER_GROWTH_PUBLISHED."""
+    from src.stocks.ml.horizons import HorizonOOFEvidence
+
+    def _candidate(profile_id: str) -> HorizonOOFEvidence:
+        n = 40
+        return HorizonOOFEvidence(
+            horizon_sessions=10,
+            profile_id=profile_id,
+            model_family="economic_rawnet_lgbm",
+            base_log_growth=tuple(0.01 for _ in range(n)),
+            stress_log_growth=tuple(0.008 for _ in range(n)),
+            cohort_segment_ids=tuple(0 for _ in range(n)),
+            complete_cohort_count=n,
+            active_cohort_count=n,
+            partial_cohort_count=0,
+            missing_cohort_count=0,
+            segment_count=1,
+            fold_rank_ics=(0.2,),
+            rebalance_frequency_sessions=5,
+            top_k=12,
+        )
+
+    request = SimpleNamespace(
+        policy_profiles=(
+            SimpleNamespace(profile_id="lower_bound_only"),
+            SimpleNamespace(profile_id="lower_bound_half_kelly"),
+        ),
+        bootstrap_alpha=0.05,
+        seed=42,
+        bootstrap_resamples=200,
+    )
+    discovery = SimpleNamespace(
+        evidence=(_candidate("lower_bound_only"), _candidate("lower_bound_only:blend")),
+        dropout_reasons={},
+        execution_evidence_by_candidate={},
+    )
+    frontier = _policy_frontier_projection(request, discovery, None)
+    blend_map = frontier["blend_lower_growth"]
+    assert set(blend_map.keys()) == {"10:5:12:lower_bound_only:blend"}
+    entry = next(iter(blend_map.values()))
+    assert set(entry.keys()) == {"base_lower_growth", "stress_lower_growth"}
+    assert all(isinstance(v, float) for v in entry.values())
+
+    plain_discovery = SimpleNamespace(
+        evidence=(_candidate("lower_bound_only"),),
+        dropout_reasons={},
+        execution_evidence_by_candidate={},
+    )
+    empty_frontier = _policy_frontier_projection(request, plain_discovery, None)
+    assert empty_frontier["blend_lower_growth"] == {}
