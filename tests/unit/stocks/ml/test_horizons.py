@@ -984,6 +984,9 @@ class TestBenchmarkReconciliationReason:
         panel = pl.DataFrame(rows)
         key = (10, 5, 2, _LOWER)
         n_growth = growth_length
+        interval_bounds: tuple[tuple[datetime, ...], ...] = (
+            (tuple(sessions[: n_growth + 1])),
+        )
         evidence = ExecutionReplayEvidence(
             base_log_growth=tuple(0.01 for _ in range(n_growth)),
             stress_log_growth=tuple(0.01 for _ in range(n_growth)),
@@ -997,6 +1000,7 @@ class TestBenchmarkReconciliationReason:
             invested_interval_fraction=1.0,
             base_interval_exposure=tuple(0.9 for _ in range(growth_length)),
             stress_interval_exposure=tuple(0.9 for _ in range(growth_length)),
+            base_interval_session_bounds=interval_bounds,
         )
         from src.stocks.ml.horizons import GrowthRouteEvidence as _Route
 
@@ -1050,6 +1054,13 @@ class TestBenchmarkReconciliationReason:
         settings = CompoundingCertificationSettings()
         # Five panel sessions against four exposure/growth entries.
         mismatched_route, discovery, panel = self._route_and_discovery(5, 4)
+        evidence = discovery.execution_evidence_by_candidate[(10, 5, 2, _LOWER)]
+        # Corrupt the bounds partition to exercise the length-mismatch path.
+        object.__setattr__(
+            evidence,
+            "base_interval_session_bounds",
+            ((evidence.base_interval_session_bounds[0][:3]),),
+        )
         attached = _attach_growth_route_execution_evidence(
             mismatched_route, discovery, panel
         )
@@ -1071,7 +1082,8 @@ class TestBenchmarkReconciliationReason:
             _attach_growth_route_execution_evidence,
         )
 
-        route, discovery, panel = self._route_and_discovery(5, 5)
+        # Six panel sessions bound the five growth intervals of one segment.
+        route, discovery, panel = self._route_and_discovery(6, 5)
         attached = _attach_growth_route_execution_evidence(route, discovery, panel)
         assert attached.benchmark_reconcile_failure == ""
         assert len(attached.benchmark_log_growth) == len(route.base_log_growth)
