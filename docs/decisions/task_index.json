@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ml_edge_breadth_deployment",
+      "date": "2026-08-25",
+      "adr_id": "ADR_20260825_ml_edge_breadth_deployment",
+      "domain": "stocks_ml",
+      "title": "Profile-scoped frontier feasibility and breadth telemetry",
+      "why": "A/B 실측(ml_rewaterfill_ab_20260825)이 노출 공백의 제약 사슬을 규명: compounding scale p50=1.0 비제약, gross_after≈0.685로 유효 활성 종목 약 8.6/12. ExecutionFrontier.feasible_cells가 요청 레벨 cap만으로 min_k=12를 계산해 excess_full_kelly의 single_name_cap_override=0.16을 무력화, K=8 집중 셀이 프론티어에서 소거된 상태였다. 라벨 2486세션 분석으로 realized-positive breadth는 p_pos≈0.50(세션당 180+)로 풍요해 제약이 인증(nlb) 측임을 확인, 풀 심화 가설은 nlb score-bucket 단조성으로 기각했다.",
+      "resolution": "ExecutionFrontier.feasible_cells_for_profile 추가(single_name_cap_override/gross_utilization_target 반영, override 없으면 legacy feasible_cells와 정확히 동일). _profile_scoped_specs로 프로파일별 스코프 셀만 실행하고 스코프 제외 조합은 dropout 'profile-cap-infeasible'로 레저 투명화. frozen seed/LambdaRank K/require_feasible_horizons 등 기존 호출부 의미 유지, candidate_bound는 프로파일 스코프 합산으로 갱신. sizing 진단에 selected_count mean/p10/p90 추가. 시나리오 5개 신규, 전체 1134 단위 테스트 및 lean_check 통과.",
+      "impact": "A/B 풀런(ml_breadth_ab_20260825)에서 K=8 kelly 셀 8개 생성 및 selected_count 직독(8.0 flat) 확인. 다만 노출 0.710으로 수락 기준 0.85 미달 — 원격계가 네 번째 병목을 규명: target_annual_volatility=0.12 하드코딩 vol-targeting scalar 0.71~0.80이 캡 이전에 바인딩(집중 시 불리). 결정적으로 route가 직전 런과 바이트 동일하고 base_lb -1.75% 음수이므로 절대 북 배치 확대는 음의 certified edge를 증폭한다. 자산증식 경로는 excess(+6.28% LB, point +14.0%) hedge sleeve(vol-managed L≤2.0 admissible) 승격으로 확정."
+    },
+    {
       "task_id": "ml_sparse_utilization_repair",
       "date": "2026-08-25",
       "adr_id": "ADR_20260825_ml_sparse_utilization_repair",
@@ -989,16 +999,6 @@
       "why": "Corrected three-fold LambdaRank validation could not complete the production 80-trial search: 240 LightGBM fits, repeated StableRank and frame copies, and model-selection leakage inflated runtime and memory risk.",
       "resolution": "Added temporally isolated prequential tuning, serial fold-level pruning, StableRank reuse, float32/int32 conversion and vectorized quantiles, RSS admission/telemetry with fail-closed artifact publication, bounded point-in-time replay history, and project-local uv cache fallback.",
       "impact": "Preserves NO_TRADE promotion gates while making the 80-trial path measurable and memory-bounded; replay avoids artificial covariance warm-up skips. 519 tests, ruff, mypy, and contract validation pass."
-    },
-    {
-      "task_id": "TASK_STOCK_ALPHA_V2_TRAINING_IMPROVEMENT",
-      "date": "2026-08-11",
-      "adr_id": "ADR_20260811_STOCK_ALPHA_V2_TRAINING_IMPROVEMENT",
-      "domain": "training",
-      "title": "Stock Alpha v2 training replay and promotion evidence",
-      "why": "Single-fold training, overlapping inner-fold rows, missing replay ADTV, and an empty intent tuple invalidated the reported economic replay.",
-      "resolution": "Deduplicated nested development rows, derived replay ADTV from trading value, wired scored allocations into executable intents, added fill-aware evidence gates, corrected stress comparison and trial-adjusted DSR, and added one-time forward-holdout evidence.",
-      "impact": "The same provisional snapshot now yields auditable 3-fold execution metrics while remaining fail-closed until economic and forward-holdout gates pass."
     }
   ]
 }
