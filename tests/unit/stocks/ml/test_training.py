@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+import numpy as np
+import polars as pl
 import pytest
 import tempfile
 
@@ -22,7 +24,6 @@ from src.stocks.observability.contracts import (
     DiagnosticStatus,
 )
 from src.stocks.observability.recorder import NullRunDiagnostics
-import polars as pl
 
 
 class TestOofCache:
@@ -1211,7 +1212,7 @@ def _stub_replay_batch(monkeypatch: pytest.MonkeyPatch, calls: list) -> None:
 
     def _factory(
         registry, calibrated, oof_labels, req, horizon_sessions, risk,
-        market_frame, manifest, specs, stats_out=None,
+        market_frame, manifest, specs, stats_out=None, sizing_out=None,
     ):
         del registry, calibrated, oof_labels, risk, market_frame, manifest
         if stats_out is not None:
@@ -1467,3 +1468,93 @@ class TestBlendChampionGate:
         publish_phase = telemetry.to_dict()["phases"][-1]
         reason = str(publish_phase.get("reason", ""))
         assert "blend-champion-holdout-unsupported" in reason
+
+
+class TestSizingDiagnostics:
+    """SIZING_DIAGNOSTICS: bounded per-candidate sizing summaries."""
+
+    def test_SIZING_DIAGNOSTICS_01_SUMMARY_BOUNDED(self) -> None:
+        """SIZING_DIAGNOSTICS_01_SUMMARY_BOUNDED."""
+        from src.stocks.ml.training import _sizing_diagnostics_summary
+
+        records = [
+            {
+                "confidence_scale": scale,
+                "gross_before_compounding": 0.9,
+                "gross_after_compounding": 0.9 * scale,
+                "cash_reason": "non-positive-confidence-edge" if scale == 0.0 else None,
+                "covariance_source": "full",
+            }
+            for scale in (0.0, 0.5, 1.0)
+        ]
+        summary = _sizing_diagnostics_summary(records)
+        assert summary["decision_count"] == 3
+        assert summary["cash_decision_count"] == 1
+        assert summary["confidence_scale_mean"] == pytest.approx(0.5)
+        assert summary["confidence_scale_p10"] == pytest.approx(
+            float(np.quantile(np.asarray([0.0, 0.5, 1.0]), 0.1))
+        )
+        assert summary["confidence_scale_p50"] == pytest.approx(0.5)
+        assert summary["confidence_scale_p90"] == pytest.approx(
+            float(np.quantile(np.asarray([0.0, 0.5, 1.0]), 0.9))
+        )
+        assert summary["gross_before_compounding_mean"] == pytest.approx(0.9)
+        assert summary["gross_after_compounding_mean"] == pytest.approx(0.45)
+        assert summary["covariance_source_full_fraction"] == pytest.approx(1.0)
+        fixed_keys = {
+            "decision_count",
+            "cash_decision_count",
+            "confidence_scale_mean",
+            "confidence_scale_p10",
+            "confidence_scale_p50",
+            "confidence_scale_p90",
+            "gross_before_compounding_mean",
+            "gross_after_compounding_mean",
+            "covariance_source_full_fraction",
+        }
+        assert set(summary) == fixed_keys
+        assert all(
+            value is None or isinstance(value, (int, float)) for value in summary.values()
+        )
+
+        empty = _sizing_diagnostics_summary([])
+        assert empty["decision_count"] == 0
+        assert empty["cash_decision_count"] == 0
+        assert empty["confidence_scale_mean"] is None
+        assert empty["gross_after_compounding_mean"] is None
+
+    def test_SIZING_DIAGNOSTICS_02_FRONTIER_EMISSION(self) -> None:
+        """SIZING_DIAGNOSTICS_02_FRONTIER_EMISSION."""
+        from src.stocks.ml.contracts import NetAlphaTrainingRequest
+        from src.stocks.ml.training import (
+            HorizonDiscovery,
+            _policy_frontier_projection,
+        )
+
+        discovery = HorizonDiscovery(
+            evidence=(),
+            diagnostics=(),
+            oof_by_horizon={},
+            sizing_diagnostics_by_candidate={
+                (10, 5, 12, "lower_bound_only"): {"decision_count": 7},
+                (20, 10, 12, "legacy_overlay_5bps"): {"decision_count": 3},
+            },
+        )
+        projection = _policy_frontier_projection(
+            NetAlphaTrainingRequest(artifact_id="diag"), discovery, None
+        )
+        sizing = projection["sizing_diagnostics"]
+        assert set(sizing) == {
+            "10:5:12:lower_bound_only",
+            "20:10:12:legacy_overlay_5bps",
+        }
+        assert list(sizing) == sorted(sizing)
+        assert sizing["10:5:12:lower_bound_only"] == {"decision_count": 7}
+        baseline_keys = set(
+            _policy_frontier_projection(
+                NetAlphaTrainingRequest(artifact_id="diag"),
+                HorizonDiscovery(evidence=(), diagnostics=(), oof_by_horizon={}),
+                None,
+            )
+        )
+        assert baseline_keys == set(projection)

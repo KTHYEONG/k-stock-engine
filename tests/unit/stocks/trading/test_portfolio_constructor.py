@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
@@ -2382,3 +2383,111 @@ def test_sparse_turnover_budget() -> None:
     }
     for iid in current_weights:
         assert new_weights_zero.get(iid, 0.0) == pytest.approx(current_weights[iid], abs=1e-12)
+
+
+class TestSparseRetainedRewaterfill:
+    """SPARSE_REWATERFILL: band-limited retained re-waterfill sizing."""
+
+    def test_SPARSE_REWATERFILL_01_RETAINED_TARGET_REFRESHED(self) -> None:
+        """SPARSE_REWATERFILL_01_RETAINED_TARGET_REFRESHED."""
+        from src.stocks.trading.portfolio_constructor import _retained_target
+
+        assert _retained_target("band_limited_rewaterfill_v1", 0.0, 0.075, 0.030) == 0.075
+        # Drift 4e-4 relative stays inside the 5bps band: frozen current wins.
+        assert _retained_target("band_limited_rewaterfill_v1", 0.0005, 0.07503, 0.075) == 0.075
+        # Drift beyond the band resizes to the fresh target.
+        assert _retained_target("band_limited_rewaterfill_v1", 0.0005, 0.076, 0.075) == 0.076
+
+    def test_SPARSE_REWATERFILL_02_FREEZE_DEFAULT_UNCHANGED(self) -> None:
+        """SPARSE_REWATERFILL_02_FREEZE_DEFAULT_UNCHANGED."""
+        from src.stocks.trading.portfolio_constructor import _retained_target
+
+        for fresh, current in ((0.09, 0.02), (0.01, 0.02), (0.05, 0.0)):
+            assert _retained_target("freeze_v1", 0.0, fresh, current) == current
+        policy = StockRiskPolicy()
+        assert policy.retained_sizing_mode == "freeze_v1"
+        flagged = replace(policy, retained_sizing_mode="band_limited_rewaterfill_v1")
+        assert stock_risk_policy_fingerprint(policy) != stock_risk_policy_fingerprint(flagged)
+
+    def test_SPARSE_REWATERFILL_03_SPARSE_BRANCH_WIRED(self) -> None:
+        """SPARSE_REWATERFILL_03_SPARSE_BRANCH_WIRED.
+
+        A drifted incumbent (current weight far below its waterfill target)
+        keeps its exact frozen weight under freeze_v1 and receives a resized
+        target under band_limited_rewaterfill_v1 on identical inputs.
+        """
+        panel = _economic_panel(n_sessions=60, n_tickers=6, positive_top=6).with_columns(
+            pl.lit(0.008, dtype=pl.Float64).alias("net_alpha_lower_bound")
+        )
+        instruments = instruments_for(6)
+        latest = panel.select(pl.col("session").max()).to_series()[0]
+        price = float(
+            panel.filter(
+                (pl.col("session") == latest) & (pl.col("instrument_id") == "KRX:000001")
+            )["close"][0]
+        )
+        equity = equity_of(panel, empty_portfolio())
+        portfolio = PortfolioSnapshot(
+            account_snapshot_id="drifted",
+            as_of=datetime(2024, 1, 1, tzinfo=UTC),
+            settled_cash=equity - 0.02 * equity,
+            unsettled_cash=0.0,
+            positions=(
+                Position(
+                    instrument=instruments["KRX:000001"],
+                    quantity=int(0.02 * equity // price),
+                    average_cost=price,
+                ),
+            ),
+        )
+        common = {
+            "top_k": 6,
+            "gross_cap": 0.90,
+            "single_name_cap": 0.08,
+            "sector_cap": 0.25,
+            "participation_limit": 0.5,
+            "turnover_budget": 0.0,
+            "execution_utility_mode": "sparse_hold_replace_v2",
+            "sizing_mode": "risk_balanced_waterfill_v2",
+            "compounding": CompoundingPolicyConfig(
+                growth_risk_aversion=1.0, forecast_horizon_sessions=10
+            ),
+        }
+        frozen_allocs = construct_target_allocations(
+            panel,
+            instruments,
+            portfolio,
+            StockRiskPolicy(**common, retained_sizing_mode="freeze_v1"),
+        )
+        rewater_allocs = construct_target_allocations(
+            panel,
+            instruments,
+            portfolio,
+            StockRiskPolicy(**common, retained_sizing_mode="band_limited_rewaterfill_v1"),
+        )
+
+        def weight_by_id(allocations):
+            return {
+                a.instrument.instrument_id: a.target_value / equity
+                for a in allocations
+            }
+
+        quantity = int(0.02 * equity // price)
+        current_weight = quantity * price / equity
+        frozen_weights = weight_by_id(frozen_allocs)
+        rewater_weights = weight_by_id(rewater_allocs)
+        assert frozen_weights["KRX:000001"] == pytest.approx(current_weight, abs=1e-9)
+        assert rewater_weights["KRX:000001"] > frozen_weights["KRX:000001"] + 1e-6
+        assert sum(rewater_weights.values()) > sum(frozen_weights.values())
+
+    def test_SPARSE_REWATERFILL_04_INVALID_MODE_FAIL_CLOSED(self) -> None:
+        """SPARSE_REWATERFILL_04_INVALID_MODE_FAIL_CLOSED."""
+        with pytest.raises(ValueError, match="retained_sizing_mode"):
+            StockRiskPolicy(retained_sizing_mode="bogus")
+        assert StockRiskPolicy(retained_sizing_mode="freeze_v1") is not None
+        assert (
+            StockRiskPolicy(
+                retained_sizing_mode="band_limited_rewaterfill_v1"
+            ).retained_sizing_mode
+            == "band_limited_rewaterfill_v1"
+        )

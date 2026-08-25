@@ -158,6 +158,7 @@ def test_frontier_publishes_blend_lower_growth() -> None:
         evidence=(_candidate("lower_bound_only"), _candidate("lower_bound_only:blend")),
         dropout_reasons={},
         execution_evidence_by_candidate={},
+        sizing_diagnostics_by_candidate={},
     )
     frontier = _policy_frontier_projection(request, discovery, None)
     blend_map = frontier["blend_lower_growth"]
@@ -170,6 +171,7 @@ def test_frontier_publishes_blend_lower_growth() -> None:
         evidence=(_candidate("lower_bound_only"),),
         dropout_reasons={},
         execution_evidence_by_candidate={},
+        sizing_diagnostics_by_candidate={},
     )
     empty_frontier = _policy_frontier_projection(request, plain_discovery, None)
     assert empty_frontier["blend_lower_growth"] == {}
