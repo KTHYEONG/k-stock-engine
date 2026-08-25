@@ -726,11 +726,17 @@ def _run_discovery_and_publish(
         n_bootstrap=request.bootstrap_resamples,
         family_scope=request.holm_family_scope,
     )
-    candidate_bound = len(
-        request.execution_frontier.feasible_cells(
-            request.portfolio.max_exposure, request.portfolio.max_single_weight
+    candidate_bound = sum(
+        len(
+            request.execution_frontier.feasible_cells_for_profile(
+                request.portfolio.max_exposure,
+                request.portfolio.max_single_weight,
+                single_name_cap_override=profile.single_name_cap_override,
+                gross_utilization_target=profile.gross_utilization_target,
+            )
         )
-    ) * len(request.policy_profiles)
+        for profile in request.policy_profiles
+    )
     telemetry.phase(
         "policy_frontier",
         {
@@ -1409,6 +1415,13 @@ def _sizing_diagnostics_summary(
         for record in records
         if str(record.get("covariance_source", "")) == "full"
     )
+    selected_counts = [
+        count
+        for count in (
+            _float_or_none(record.get("selected_count")) for record in records
+        )
+        if count is not None
+    ]
 
     def _quantile(values: list[float], q: float) -> float | None:
         if not values:
@@ -1434,7 +1447,69 @@ def _sizing_diagnostics_summary(
         "covariance_source_full_fraction": (
             full_sources / len(records) if records else None
         ),
+        "selected_count_mean": _mean(selected_counts),
+        "selected_count_p10": _quantile(selected_counts, 0.1),
+        "selected_count_p90": _quantile(selected_counts, 0.9),
     }
+
+
+def _profile_scoped_specs(
+    request: NetAlphaTrainingRequest,
+) -> tuple[
+    list[tuple[int, int, PolicyProfile]],
+    dict[tuple[int, int, int, str], str],
+]:
+    """Profile-scoped replay specs plus dropout transparency.
+
+    Each profile's feasible cell set is derived from its own cap overrides;
+    the returned spec list preserves the legacy (cadence, top_k, profile)
+    ordering for byte-identical execution when scoping is a no-op. Every
+    legacy-feasible (horizon, cadence, top_k) cell excluded for a profile is
+    recorded as ``profile-cap-infeasible`` so the ledger explains absent
+    frontier cells instead of silently shrinking them.
+    """
+    frontier = request.execution_frontier
+    scoped_cells: dict[str, set[tuple[int, int]]] = {}
+    profile_order: dict[str, int] = {}
+    specs: list[tuple[int, int, PolicyProfile]] = []
+    dropouts: dict[tuple[int, int, int, str], str] = {}
+    union_cells: set[tuple[int, int]] = set()
+    horizons_by_cell: dict[tuple[int, int], set[int]] = {}
+    for profile_index, profile in enumerate(request.policy_profiles):
+        cells = frontier.feasible_cells_for_profile(
+            request.portfolio.max_exposure,
+            request.portfolio.max_single_weight,
+            single_name_cap_override=profile.single_name_cap_override,
+            gross_utilization_target=profile.gross_utilization_target,
+        )
+        scoped_cells[profile.profile_id] = {(c, k) for _h, c, k in cells}
+        profile_order[profile.profile_id] = profile_index
+        for h, c, k in cells:
+            union_cells.add((c, k))
+            horizons_by_cell.setdefault((c, k), set()).add(h)
+
+    def _spec_order(spec: tuple[int, int, PolicyProfile]) -> tuple[int, int, int]:
+        cadence, top_k, profile = spec
+        return (cadence, top_k, profile_order[profile.profile_id])
+
+    seen: set[tuple[int, int, str]] = set()
+    scoped_specs: dict[tuple[int, int], list[PolicyProfile]] = {}
+    for c, k in sorted(union_cells):
+        horizon_hits = sorted(horizons_by_cell[(c, k)])
+        for h in horizon_hits:
+            for profile in request.policy_profiles:
+                if (c, k) not in scoped_cells[profile.profile_id]:
+                    dropouts[(h, c, k, profile.profile_id)] = "profile-cap-infeasible"
+                    continue
+                key = (c, k, profile.profile_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                scoped_specs.setdefault((c, k), []).append(profile)
+    for c_k, profiles in scoped_specs.items():
+        specs.extend((c_k[0], c_k[1], profile) for profile in profiles)
+    specs.sort(key=_spec_order)
+    return specs, dropouts
 
 
 def _cadence_decision_sessions(
@@ -1938,11 +2013,11 @@ def _build_horizon_evidence(
     request.execution_frontier.require_feasible_horizons(
         request.portfolio.max_exposure, request.portfolio.max_single_weight
     )
-    feasible = request.execution_frontier.feasible_cells(
-        request.portfolio.max_exposure, request.portfolio.max_single_weight
-    )
+    candidate_specs, scoped_dropout_reasons = _profile_scoped_specs(request)
     cells_by_horizon: dict[int, list[tuple[int, int]]] = {}
-    for h, c, k in feasible:
+    for h, c, k in request.execution_frontier.feasible_cells(
+        request.portfolio.max_exposure, request.portfolio.max_single_weight
+    ):
         cells_by_horizon.setdefault(h, []).append((c, k))
 
     if matrix is None:
@@ -1972,7 +2047,7 @@ def _build_horizon_evidence(
     evidence: list[HorizonOOFEvidence] = []
     diagnostics: list[HorizonOOFDiagnostic] = []
     oof_by_horizon: dict[int, tuple[Path, Path, list[float]]] = {}
-    dropout_reasons: dict[tuple[int, int, int, str], str] = {}
+    dropout_reasons: dict[tuple[int, int, int, str], str] = dict(scoped_dropout_reasons)
     sizing_diagnostics_by_candidate: dict[
         tuple[int, int, int, str], dict[str, object]
     ] = {}
@@ -2066,10 +2141,8 @@ def _build_horizon_evidence(
                 oof, oof_labels, request, horizon, seed_ledger=seed_ledger
             )
             admitted_any = False
-            candidate_specs: list[tuple[int, int, PolicyProfile]] = [
-                (c, k, profile)
-                for (c, k) in cells_by_horizon.get(horizon, [])
-                for profile in request.policy_profiles
+            candidate_specs = [
+                spec for spec in candidate_specs if spec[0] <= horizon
             ]
             if candidate_specs:
                 replay_planned_bytes = int(

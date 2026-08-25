@@ -215,6 +215,53 @@ class ExecutionFrontierSettings:
                 )
         return tuple(cells)
 
+    def feasible_cells_for_profile(
+        self,
+        portfolio_gross_cap: float,
+        portfolio_single_name_cap: float,
+        *,
+        single_name_cap_override: float | None = None,
+        gross_utilization_target: float | None = None,
+    ) -> tuple[tuple[int, int, int], ...]:
+        """Profile-scoped feasible cells under effective per-name caps.
+
+        The per-K single-name cap is ``min(single_name_cap_override, 1/K)``
+        when an override is supplied, else ``portfolio_single_name_cap``;
+        a cell (H, C, K) is feasible iff ``C <= H`` and
+        ``K * cap >= eff_gross`` where
+        ``eff_gross = min(gross_utilization_target or portfolio_gross_cap,
+        portfolio_gross_cap)``. With no overrides this reduces exactly to
+        :meth:`feasible_cells`, so profiles without cap overrides keep the
+        legacy frontier bit-for-bit.
+        """
+        eff_gross = portfolio_gross_cap
+        if gross_utilization_target is not None:
+            eff_gross = min(gross_utilization_target, portfolio_gross_cap)
+        cells: list[tuple[int, int, int]] = []
+        for h in self.candidate_horizon_sessions:
+            for c in self.candidate_rebalance_frequency_sessions:
+                if c > h:
+                    continue
+                cells.extend(
+                    (h, c, k)
+                    for k in self.candidate_top_k
+                    if k * self._effective_single_name_cap(
+                        k, portfolio_single_name_cap, single_name_cap_override
+                    )
+                    >= eff_gross - 1e-12
+                )
+        return tuple(cells)
+
+    @staticmethod
+    def _effective_single_name_cap(
+        top_k: int,
+        base_cap: float,
+        override: float | None,
+    ) -> float:
+        if override is None:
+            return base_cap
+        return min(override, 1.0 / top_k)
+
     def require_feasible_horizons(
         self, gross_cap: float, single_name_cap: float
     ) -> tuple[tuple[int, int, int], ...]:
