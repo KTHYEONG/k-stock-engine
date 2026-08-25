@@ -1,13 +1,13 @@
 # ML Result Ledger
 
 - Schema version: 2
-- Latest artifact: `ml_cadence_repair_20260825`
+- Latest artifact: `ml_rewaterfill_ab_20260825`
 - Status: `completed`
-- Finished: 2026-08-25T03:31:42.410353+00:00
+- Finished: 2026-08-25T05:26:33.527239+00:00
 - Latest JSON: `docs/results/ml_runs/latest.json`
 - Recent JSONL: `docs/results/ml_runs/recent.jsonl`
 - Retention: newest 128 records, each <= 24576 bytes
-- Retained: 102 | discarded: 0 | invalid: 0
+- Retained: 103 | discarded: 0 | invalid: 0
 
 ## Latest Backtest & Compounding Performance
 
