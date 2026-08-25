@@ -390,6 +390,8 @@ def select_horizons(
     bootstrap_alpha: float,
     seed: int,
     n_bootstrap: int = DEFAULT_BOOTSTRAP_RESAMPLES,
+    *,
+    family_scope: str = "frontier",
 ) -> HorizonSelectionEvidence:
     """Select at most one economically admissible primary ``(H, C, K, profile)``.
 
@@ -411,6 +413,13 @@ def select_horizons(
     ``primary_profile_id`` are ``None`` when no candidate is admissible (the
     ``NO_TRADE`` outcome).
 
+    ``family_scope='frontier'`` (the pre-registered default) keeps the Holm
+    p-value gate active. ``family_scope='route_gatekeeping'`` demotes that
+    gate to published diagnostics: combined p-values and thresholds are
+    computed and reported unchanged while admission requires only positive
+    lower bounds and turnover discipline — the statistical burden rests on
+    the strategy-level growth-route certificate and holdout certification.
+
     Args:
         evidence: pre-registered candidate ``(horizon, rebalance_frequency_sessions,
             top_k, profile_id)`` tuples with their base/stress vintage evidence.
@@ -419,6 +428,7 @@ def select_horizons(
         seed: deterministic bootstrap seed.
         n_bootstrap: request-controlled moving-block bootstrap resample count;
             values below two are rejected.
+        family_scope: multiplicity scope selector.
 
     Returns:
         ``HorizonSelectionEvidence``; ``primary_horizon_sessions`` is ``None``
@@ -430,6 +440,11 @@ def select_horizons(
         raise ValueError("bootstrap_alpha must be in (0, 1)")
     if n_bootstrap < 2:
         raise ValueError("n_bootstrap must be at least 2")
+    if family_scope not in ("frontier", "route_gatekeeping"):
+        raise ValueError(
+            "family_scope must be 'frontier' or 'route_gatekeeping', "
+            f"got {family_scope!r}"
+        )
 
     ordered = tuple(
         sorted(
@@ -524,16 +539,13 @@ def select_horizons(
         stress_p = stress.p_value if stress is not None else 1.0
         paired_boot = bootstrap[key].get("paired") if has_paired else None
         paired_p = paired_boot.p_value if paired_boot is not None else 1.0
-        base_ok = (
-            base is not None
-            and base_p <= base_threshold
-            and base_lower > 0.0
-        )
-        stress_ok = (
-            stress is not None
-            and stress_p <= stress_threshold
-            and stress_lower > 0.0
-        )
+        base_ok = base is not None and base_lower > 0.0
+        stress_ok = stress is not None and stress_lower > 0.0
+        if family_scope == "frontier":
+            # Pre-registered per-cell Holm gate; route_gatekeeping demotes it
+            # to published diagnostics while lower bounds still gate.
+            base_ok = base_ok and base_p <= base_threshold
+            stress_ok = stress_ok and stress_p <= stress_threshold
         paired_ok = (
             (paired_lower > 0.0 and paired_p <= paired_threshold)
             if has_paired

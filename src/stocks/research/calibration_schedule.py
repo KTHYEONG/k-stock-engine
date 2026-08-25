@@ -469,7 +469,10 @@ class SessionClusterCalibrationSchedule:
         self._reveal_idx = 0
         self._use_reference = False
         self._reference_fallback_count = 0
+        self._lb_memo: dict[tuple[int, int, float, float], float] = {}
         self._prepare(observations)
+
+    _LB_MEMO_CAP = 200_000
 
     @classmethod
     def build(
@@ -760,6 +763,15 @@ class SessionClusterCalibrationSchedule:
 
     def _bucket_lower_bound(self, bucket: int, state: _ClusterBucketState) -> float:
         n = state.session_sums.size
+        memo_key = (
+            bucket,
+            n,
+            float(state.row_sum),
+            float(state.row_count),
+        )
+        cached = self._lb_memo.get(memo_key)
+        if cached is not None:
+            return cached
         block = max(self._block_length, 1)
         n_blocks = int(np.ceil(n / block))
         max_start = max(1, n - block + 1)
@@ -775,7 +787,10 @@ class SessionClusterCalibrationSchedule:
             csum_counts=state.csum_counts,
         )
         lower = float(np.quantile(means, self._calibrator.bootstrap_alpha))
-        return _shrink_lower_bound(lower, float(np.mean(means)), n)
+        result = _shrink_lower_bound(lower, float(np.mean(means)), n)
+        if len(self._lb_memo) < self._LB_MEMO_CAP:
+            self._lb_memo[memo_key] = result
+        return result
 
     def _sync_calibrator(self, state: dict[str, object]) -> None:
         calibrator = self._calibrator

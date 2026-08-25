@@ -285,12 +285,69 @@ def _prepared_cross_section_matches(
     return prepared_ids == current_ids
 
 
+@dataclass(frozen=True, slots=True)
+class CycleFrameCache:
+    """Segment-level hoist of the per-cycle static frame transforms.
+
+    The daily planner otherwise re-runs the identical row-wise gate, label
+    drop and score adaptation chain on every decision. The cache applies the
+    chain once to the full segment panel and keeps numpy-backed column views,
+    so a day's cross-section materializes from a single boolean mask instead
+    of re-planning the whole query.
+    """
+
+    columns: tuple[str, ...]
+    arrays: dict[str, pl.Series]
+    _available_mask_source: pl.Series
+
+    def cross_section_for(self, decision_time: datetime) -> pl.DataFrame | None:
+        """Transformed rows visible at ``decision_time`` (legacy-equivalent)."""
+        if "available_time" not in self.arrays:
+            return None
+        available = self._available_mask_source
+        cutoff = decision_time
+        mask = available <= cutoff
+        if not mask.any():
+            return pl.DataFrame()
+        return pl.DataFrame(
+            {name: series.filter(mask) for name, series in self.arrays.items()}
+        )
+
+
+def build_cycle_frame_cache(segment_scored_frame: pl.DataFrame) -> CycleFrameCache | None:
+    """Apply the per-cycle static transform chain once for a whole segment.
+
+    Returns ``None`` when the segment cannot serve the cached path (missing
+    schema), letting callers fall back to the legacy per-cycle transforms.
+    """
+    try:
+        gated = _adapt_score_column(
+            _drop_label_columns(research_eligible_frame(_universe_gate(segment_scored_frame))),
+            "stock_net_alpha_v1",
+        )
+        if (
+            "session" not in gated.columns
+            or "instrument_id" not in gated.columns
+            or "available_time" not in gated.columns
+        ):
+            return None
+        arrays = {name: gated[name] for name in gated.columns}
+        return CycleFrameCache(
+            columns=tuple(arrays.keys()),
+            arrays=arrays,
+            _available_mask_source=arrays["available_time"],
+        )
+    except Exception:  # noqa: BLE001 - cache is an optimization only
+        return None
+
+
 def plan_prepared_scored_cycle(
     prepared: PreparedReplayDecision,
     portfolio: PortfolioSnapshot,
     request: TradingCycleRequest,
     instruments: Mapping[str, Instrument],
     dataset_hash: str,
+    cycle_cache: CycleFrameCache | None = None,
 ) -> TradingCycleResult:
     """Plan one cycle from an already-causal-calibrated prepared decision.
 
@@ -303,32 +360,45 @@ def plan_prepared_scored_cycle(
     targets for identical inputs.
     """
     visible = prepared.visible
-    if visible.is_empty():
-        return _no_trade_result_prepared(
-            request, portfolio, dataset_hash, "no-rows-available-at-decision-time"
-        )
-    validate_stock_rows_available(visible, request.decision_time)
-    portfolio.validate_as_of(request.decision_time)
+    if cycle_cache is not None:
+        scored = cycle_cache.cross_section_for(request.decision_time)
+        if scored is None or scored.is_empty():
+            return _no_trade_result_prepared(
+                request, portfolio, dataset_hash, "no-rows-available-at-decision-time"
+            )
+        latest = scored.select(pl.col("session").max()).to_series()[0]
+        cross_section = scored.filter(pl.col("session") == latest)
+        if cross_section.is_empty():
+            return _no_trade_result_prepared(
+                request, portfolio, dataset_hash, "empty-latest-cross-section"
+            )
+    else:
+        if visible.is_empty():
+            return _no_trade_result_prepared(
+                request, portfolio, dataset_hash, "no-rows-available-at-decision-time"
+            )
+        validate_stock_rows_available(visible, request.decision_time)
+        portfolio.validate_as_of(request.decision_time)
 
-    universe_gate = _universe_gate(visible)
-    if universe_gate.is_empty():
-        return _no_trade_result_prepared(
-            request, portfolio, dataset_hash, "empty-universe-after-gate"
-        )
+        universe_gate = _universe_gate(visible)
+        if universe_gate.is_empty():
+            return _no_trade_result_prepared(
+                request, portfolio, dataset_hash, "empty-universe-after-gate"
+            )
 
-    gated = _drop_label_columns(research_eligible_frame(universe_gate))
-    scored = _adapt_score_column(gated, "stock_net_alpha_v1")
-    if scored.is_empty():
-        return _no_trade_result_prepared(
-            request, portfolio, dataset_hash, "empty-scored-panel"
-        )
+        gated = _drop_label_columns(research_eligible_frame(universe_gate))
+        scored = _adapt_score_column(gated, "stock_net_alpha_v1")
+        if scored.is_empty():
+            return _no_trade_result_prepared(
+                request, portfolio, dataset_hash, "empty-scored-panel"
+            )
 
-    latest = scored.select(pl.col("session").max()).to_series()[0]
-    cross_section = scored.filter(pl.col("session") == latest)
-    if cross_section.is_empty():
-        return _no_trade_result_prepared(
-            request, portfolio, dataset_hash, "empty-latest-cross-section"
-        )
+        latest = scored.select(pl.col("session").max()).to_series()[0]
+        cross_section = scored.filter(pl.col("session") == latest)
+        if cross_section.is_empty():
+            return _no_trade_result_prepared(
+                request, portfolio, dataset_hash, "empty-latest-cross-section"
+            )
 
     use_prepared = _prepared_cross_section_matches(prepared, cross_section)
     try:
