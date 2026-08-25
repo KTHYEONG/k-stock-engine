@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "certified_promotion_closeout",
+      "date": "2026-08-25",
+      "adr_id": "ADR_20260825_certified_promotion_closeout",
+      "domain": "stocks_ml",
+      "title": "Certified promotion closeout and performance completion (G1 tail censoring, G2 blend shadow deferral, G3 route gatekeeping, R1 cycle cache, R2 calibration memo, P3 concurrent replay)",
+      "why": "Holdout failed on insufficient-observed-sessions (239/252) as h=10 tail vintages mature past dataset end, blend frontier dropped 12 cells on missing-shadow-evidence because frontier-stage dense-shadow was unconditionally required, frontier Holm m=48 thresholds starved admission versus the m=1 route hypothesis, and cProfile revealed the hot-loop polars op chain with 865934 lazy collects at 831s plus 75k calibration bootstrap draws at 178s dominating a 48-minute grid.",
+      "resolution": "Added allowed_tail_censoring_sessions to CompoundingCertificationSettings (0 default, effective ceil((min-allowed)*0.95) injected as horizon at holdout certification), thread NetAlphaTrainingRequest.holm_family_scope (frontier vs route_gatekeeping) through select_horizons bypassing per-cell Holm while publishing p-values unchanged, removed unconditional blend dense-shadow requirement, introduced CycleFrameCache hoisting the per-cycle universe/rename/drop/score chain to a segment-level build with cross_section_for slicing and cached it into prepared replay, memoized _bucket_lower_bound on (bucket, n, row_sum, row_count) with 200k cap, and parallelized candidate execution per segment via --discovery-workers ThreadPoolExecutor preserving order with sequential fallback.",
+      "impact": "Leverage-blind closeout rerun completed in 15.5min wall (783s discovery, 120+199s replay) at 1.68 GiB peak versus 50min/3.1 GiB, route route remains PROMOTED with excess LB +12.62 percent, vol-managed leverage 2.0 admissible, holdout tail gate cleared, blend cells restored, and flag-off defaults stay byte-identical; eight pinned scenarios plus the full stocks unit suite pass lint and type clean."
+    },
+    {
       "task_id": "excess_leverage_utilization_leap",
       "date": "2026-08-24",
       "adr_id": "ADR_20260824_excess_leverage_utilization_leap",
@@ -989,16 +999,6 @@
       "why": "Establish a reproducible domestic-stock ML research workflow with leakage-safe data, explicit features, deterministic training, and realistic backtesting.",
       "resolution": "Registered LambdaRank plus StableRankComposite blending, 34 point-in-time features, purged walk-forward folds, canonical labels, event-based fills/costs, constrained portfolio construction, and promotion gates; synchronized ADR and code map.",
       "impact": "Research-only pipeline; improves reproducibility and prevents lookahead/cost/model-selection errors. Live trading integration remains out of scope."
-    },
-    {
-      "task_id": "TASK_DATA_STORAGE_REORGANIZATION",
-      "date": "2026-08-11",
-      "adr_id": "ADR_20260811_DATA_STORAGE_REORGANIZATION",
-      "domain": "stocks-data",
-      "title": "Data storage inventory and lifecycle reorganization",
-      "why": "The 4.7 GB data tree mixed cataloged research inputs, raw evidence, legacy files, and mutable runtime state, making retention and backtest/ML usage ambiguous.",
-      "resolution": "Added manifest-aware read-only inventory and lifecycle classification, wired catalog CLI inventory output, protected catalog and snapshot references from archive candidates, and documented a staged migration layout without deleting data.",
-      "impact": "Backtest and ML consumers have an auditable modern data boundary; legacy and evidence remain preserved until hash-verified migration. Inventory and tests pass, and physical cleanup remains a separately reviewable operation."
     }
   ]
 }
