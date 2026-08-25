@@ -1160,3 +1160,43 @@ def test_holm_unique_family_declared_cells_keep_threshold_sequence() -> None:
             token = reason.split("turnover_ratio=")[1]
             value_token = token.split()[0]
             assert value_token == "exempt" or float(value_token) < 1e6
+
+
+def test_ROUTE_TURNOVER_NONE_01_NO_SHADOW_NULL_RATIO() -> None:
+    """ROUTE_TURNOVER_NONE_01_NO_SHADOW_NULL_RATIO.
+
+    Without a dense shadow (shadow_turnover == 0) the stitched route publishes
+    turnover_ratio=None instead of a fabricated denominator; candidates with a
+    real dense shadow yield mean(sparse/shadow); the route projection mirrors
+    both; negative ratios fail closed at construction.
+    """
+    from src.stocks.ml.horizons import GrowthRouteEvidence
+
+    no_shadow = _segmented_evidence(
+        10,
+        {0: (0.02,) * 12, 1: (0.02,) * 12, 2: (0.02,) * 12},
+        profile_id=_LOWER,
+        sparse_turnover=2.0,
+        shadow_turnover=0.0,
+    )
+    route = stitch_prequential_growth_route((no_shadow,), 0.05, 42, 20)
+    assert route.turnover_ratio is None
+
+    shadowed = _segmented_evidence(
+        10,
+        {0: (0.02,) * 12, 1: (0.02,) * 12, 2: (0.02,) * 12},
+        profile_id=_LOWER,
+        sparse_turnover=2.0,
+        shadow_turnover=4.0,
+    )
+    ratio_route = stitch_prequential_growth_route((shadowed,), 0.05, 42, 20)
+    assert ratio_route.turnover_ratio == pytest.approx(2.0 / 4.0, abs=1e-9)
+
+    with pytest.raises(ValueError, match="turnover_ratio"):
+        GrowthRouteEvidence(
+            base_log_growth=(0.01,),
+            stress_log_growth=(0.01,),
+            segment_ids=(0,),
+            selected_policies=((10, 5, 12, _LOWER),),
+            turnover_ratio=-0.5,
+        )
