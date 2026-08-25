@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ml_sparse_utilization_repair",
+      "date": "2026-08-25",
+      "adr_id": "ADR_20260825_ml_sparse_utilization_repair",
+      "domain": "stocks_ml",
+      "title": "Sparse retained re-waterfill opt-in, sizing diagnostics surfacing, honest route turnover ratio",
+      "why": "v5 sparse 실행이 자본을 과소배포하는 것을 레저 실측으로 확인: same-policy A/B에서 exposure 0.695 vs dense 0.904, cadence가 느슐할수록 단조 감소(C20 0.59). 근본 구조는 sparse_hold_replace_v2 분기에서 retained 보유종을 drift된 현재 weight로 동결하고 gross 재센터링이 없는 것(portfolio_constructor). 아울러 stitch 경로가 dense shadow 부재 시 max(shadow,1e-12) 위조 분모로 turnover_ratio 9.47e12를 레저에 발행했고, confidence_scale/gross 궤적이 수집만 되고 어디에도 서피싱되지 않아 노출 붕괴 원인 진단이 불가했다.",
+      "resolution": "StockRiskPolicy.retained_sizing_mode 필드(freeze_v1 기본=byte-identical, band_limited_rewaterfill_v1)와 순수 커널 _retained_target 추가, no-trade band 상대 드리프트 초과 시에만 retained 재수위조. --enable-sparse-retained-rewaterfill 옵트인 플래그를 request→risk policy→fingerprint→manifest params→simulator 3개 재구성 경로까지 스레딩. _sizing_diagnostics_summary로 confidence_scale/gross 분포를 정량 스칼라 세트로 policy_frontier.sizing_diagnostics에 서피싱(HorizonDiscovery.sizing_diagnostics_by_candidate, _replay_costs_batch sizing_out 싱크). stitch_prequential_growth_route는 shadow 부재 시 turnover_ratio=None 발행. 전체 stocks 1129+단위 테스트 및 lean_check 통과.",
+      "impact": "A/B 풀런(ml_rewaterfill_ab_20260825)에서 W3 실측 turnover_ratio 0.4337(게이트 0.60 내), W2 진단 전 셀 수집 확인. W1은 base lower CAGR -2.14→-1.75퍼센트, MDD 28.0→26.7퍼센트 개선에 그쳤으나 신규 원격계가 제약 구조를 정정: confidence_scale p50=1.0, gross_after≈0.685, 유효 활성 종목 약 8.6/12로 edge breadth×single_name_cap이 1차 제약. 다음 레버는 재센터링이 아니라 진입 풀 심화 또는 per-name cap 상향."
+    },
+    {
       "task_id": "ml_growth_conversion_repair",
       "date": "2026-08-25",
       "adr_id": "ADR_20260825_ml_growth_conversion_repair",
@@ -989,16 +999,6 @@
       "why": "Single-fold training, overlapping inner-fold rows, missing replay ADTV, and an empty intent tuple invalidated the reported economic replay.",
       "resolution": "Deduplicated nested development rows, derived replay ADTV from trading value, wired scored allocations into executable intents, added fill-aware evidence gates, corrected stress comparison and trial-adjusted DSR, and added one-time forward-holdout evidence.",
       "impact": "The same provisional snapshot now yields auditable 3-fold execution metrics while remaining fail-closed until economic and forward-holdout gates pass."
-    },
-    {
-      "task_id": "TASK_STOCK_ALPHA_V2_DATASET_CONTRACT_REBUILD",
-      "date": "2026-08-11",
-      "adr_id": "ADR_20260811_STOCK_ALPHA_V2_DATASET_CONTRACT_REBUILD",
-      "domain": "stocks",
-      "title": "Stock Alpha v2 dataset contract rebuild",
-      "why": "The training CLI rejected the cataloged v1 feature and fwd-return label datasets when the research workflow required v2 features and canonical residual labels.",
-      "resolution": "Added strict v2 feature materialization, calendar-aware residual label publication, immutable snapshot orchestration, semantic composition checks, and an explicit v2 build CLI; legacy v1 datasets remain unchanged and all verification gates pass.",
-      "impact": "Enables reproducible research training from a hash-pinned provisional v2 snapshot while preventing silent v1 downgrade, label recomputation, lookahead, partial publication, and paper/live use of incomplete evidence."
     }
   ]
 }
