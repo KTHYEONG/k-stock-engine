@@ -15,6 +15,7 @@ target holding period, or rebalance cadence.
 """
 from __future__ import annotations
 
+import logging
 import math
 import time
 from collections.abc import Iterator, Mapping, Sequence
@@ -70,10 +71,14 @@ from src.stocks.trading.portfolio_constructor import (
     StockRiskPolicy,
 )
 from src.stocks.workflows.trading_cycle import (
+    CycleFrameCache,
     TradingCycleRequest,
     TradingCycleResult,
+    build_cycle_frame_cache,
     plan_prepared_scored_cycle,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,6 +367,7 @@ def stream_execution_replay_batch(
     prepared_batch: PreparedExecutionReplayBatch | None = None,
     request_limit_bytes: int | None = None,
     stats: dict[str, int] | None = None,
+    candidate_workers: int = 1,
 ) -> tuple[ExecutionReplayEvidence, ...]:
     """Segment-major streaming replay under the effective memory limit.
 
@@ -418,6 +424,7 @@ def stream_execution_replay_batch(
             _run_candidates_on_segment(
                 candidate_requests, segment, accumulators,
                 decisions_by_segment=candidate_requests[0].decision_sessions_by_segment,
+                workers=max(1, int(candidate_workers)),
             )
             execute_elapsed_ms += int((_time.monotonic() - segment_start_ms) * 1000)
             peak_live_prepared_segments = max(peak_live_prepared_segments, 1)
@@ -445,6 +452,7 @@ def stream_execution_replay_batch(
                     decisions_by_segment={
                         segment.metadata.segment_id: segment.metadata.decision_sessions,
                     },
+                    workers=max(1, int(candidate_workers)),
                 )
             finally:
                 execute_elapsed_ms += int((_time.monotonic() - execute_started_ms) * 1000)
@@ -478,14 +486,45 @@ def _run_candidates_on_segment(
     accumulators: list[CandidateReplayAccumulator],
     *,
     decisions_by_segment: Mapping[int, tuple[datetime, ...]],
+    workers: int = 1,
 ) -> None:
-    """Execute every candidate against one live prepared segment."""
+    """Execute every candidate against one live prepared segment.
+
+    With ``workers > 1`` candidates execute concurrently (native predict and
+    polars work release the GIL) while accumulator appends stay ordered by
+    declared candidate index; any worker failure falls back to sequential
+    execution of that segment so evidence never loses ordering.
+    """
     segment_id = (
         segment.metadata.segment_id
         if isinstance(segment, PreparedReplaySegment)
         else segment.segment_id
     )
     decisions = decisions_by_segment[int(segment_id)]
+    if workers > 1 and len(candidate_requests) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        try:
+            with ThreadPoolExecutor(max_workers=min(workers, len(candidate_requests))) as pool:
+                futures = [
+                    pool.submit(
+                        _execute_candidate_segment,
+                        candidate_request.context,
+                        segment,
+                        int(segment_id),
+                        decisions,
+                    )
+                    for candidate_request in candidate_requests
+                ]
+                summaries = [future.result() for future in futures]
+            for accumulator, summary in zip(accumulators, summaries, strict=True):
+                accumulator.add_segment(summary)
+            return
+        except Exception as exc:  # noqa: BLE001 - fall back to sequential below
+            logger.warning(
+                "[REPLAY] stage=candidate_workers status=fallback reason=%s",
+                type(exc).__name__,
+            )
     for candidate_request, accumulator in zip(candidate_requests, accumulators, strict=True):
         summary = _execute_candidate_segment(
             candidate_request.context, segment, int(segment_id), decisions
@@ -516,6 +555,7 @@ def _execute_candidate_segment(
         risk_policy=context.risk_policy,
         seed=context.seed,
     )
+    cycle_cache = build_cycle_frame_cache(segment.scored_market)
     backtester = StockBacktester(
         registry=context.registry,
         instruments=context.instruments,
@@ -532,7 +572,7 @@ def _execute_candidate_segment(
             PreparedAllocationMarket.build(segment.scored_market),
             segment.score_overlay,
         ),
-        scenario_planner=_scenario_planner(context, segment.dataset_hash),
+        scenario_planner=_scenario_planner(context, segment.dataset_hash, cycle_cache),
     )
     result = backtester.run_prepared(bt_request, segment.prepared_market, segment.score_overlay)
 
@@ -964,6 +1004,7 @@ def _decision_provider(
 def _scenario_planner(
     context: ExecutionReplayContext,
     dataset_hash: str,
+    cycle_cache: CycleFrameCache | None = None,
 ) -> ReplayScenarioPlanner:
     def planner(
         prepared: PreparedReplayDecision,
@@ -971,7 +1012,12 @@ def _scenario_planner(
         cycle_request: TradingCycleRequest,
     ) -> TradingCycleResult:
         return plan_prepared_scored_cycle(
-            prepared, portfolio, cycle_request, context.instruments, dataset_hash
+            prepared,
+            portfolio,
+            cycle_request,
+            context.instruments,
+            dataset_hash,
+            cycle_cache=cycle_cache,
         )
 
     return planner

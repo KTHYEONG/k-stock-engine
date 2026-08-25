@@ -401,12 +401,21 @@ class CompoundingCertificationSettings:
     bootstrap_alpha: float = 0.05
     bootstrap_resamples: int = 200
     seed: int = 42
+    allowed_tail_censoring_sessions: int = 0
 
     def __post_init__(self) -> None:
         if self.annualization_sessions < 1:
             raise ValueError("annualization_sessions must be positive")
         if self.min_observed_sessions < 1:
             raise ValueError("min_observed_sessions must be positive")
+        if (
+            self.allowed_tail_censoring_sessions < 0
+            or self.allowed_tail_censoring_sessions >= self.min_observed_sessions
+        ):
+            raise ValueError(
+                "allowed_tail_censoring_sessions must be in "
+                "[0, min_observed_sessions)"
+            )
         if not 0.0 < self.min_active_cohort_fraction <= 1.0:
             raise ValueError("min_active_cohort_fraction must be in (0, 1]")
         if not 0.0 < self.max_drawdown < 1.0:
@@ -468,10 +477,19 @@ class NetAlphaTrainingRequest:
     enforce_snapshot_outcome_readiness: bool = True
     discovery_model_family: str = ELASTIC_NET_FAMILY
     enable_horizon_blend: bool = False
+    holm_family_scope: Literal["frontier", "route_gatekeeping"] = "frontier"
+    discovery_workers: int = 1
 
     def __post_init__(self) -> None:
         if not self.artifact_id:
             raise ValueError("artifact_id must be non-empty")
+        if self.holm_family_scope not in ("frontier", "route_gatekeeping"):
+            raise ValueError(
+                "holm_family_scope must be 'frontier' or 'route_gatekeeping', "
+                f"got {self.holm_family_scope!r}"
+            )
+        if self.discovery_workers < 1:
+            raise ValueError("discovery_workers must be a positive integer")
         if not self.candidate_horizon_sessions:
             raise ValueError("candidate_horizon_sessions must be non-empty")
         if tuple(self.candidate_horizon_sessions) != tuple(
