@@ -1034,7 +1034,7 @@ def _compact_hedge_sleeve(route: Mapping[str, object]) -> dict[str, object]:
     sleeve = route.get("hedge_sleeve_projection")
     if not isinstance(sleeve, Mapping):
         return {}
-    return {
+    summary: dict[str, object] = {
         "leverage_rung_count": _as_int(sleeve.get("leverage_rung_count")),
         "admissible_rung_count": _as_int(sleeve.get("admissible_rung_count")),
         "max_admissible_leverage": _as_float(
@@ -1045,6 +1045,23 @@ def _compact_hedge_sleeve(route: Mapping[str, object]) -> dict[str, object]:
         ),
         "excess_point_cagr": _as_float(sleeve.get("excess_point_cagr")),
     }
+    best_rungs = sleeve.get("best_rungs")
+    if isinstance(best_rungs, Mapping):
+        compacted: dict[str, object] = {}
+        for variant in ("static", "vol_managed"):
+            rung = best_rungs.get(variant)
+            if not isinstance(rung, Mapping):
+                continue
+            compacted[variant] = {
+                "leverage": _as_float(rung.get("leverage")),
+                "point_cagr": _as_float(rung.get("point_cagr")),
+                "stress_cagr": _as_float(rung.get("stress_cagr")),
+                "projected_mdd": _as_float(rung.get("projected_mdd")),
+                "margin_buffer": _as_float(rung.get("margin_buffer")),
+            }
+        if compacted:
+            summary["best_rungs"] = compacted
+    return summary
 
 
 def _compact_observability(

@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ADR_20260825_ml_growth_utilization_rung",
+      "date": "2026-08-25",
+      "adr_id": "ADR_20260825_ADR_20260825_ml_growth_utilization_rung",
+      "domain": "risk",
+      "title": "Growth-utilization rung, vol-target override, and hedge best-rung surfacing",
+      "why": "레저 실측이 전환 병목을 규명: 하드코딩 12% 변동성 상한(StockRiskPolicy.target_annual_volatility)이 프로파일의 gross_utilization_target=0.92를 단방향 축소해 realized gross 0.70 vs cap 0.90(유휴 22.5%)을 재생산하고, 인증 가능한 matched-excess(+14~21% point)는 universe drift 대비 절대 게이트 앞에 좌초하며 hedge ladder 세부는 스키마에 남지 않았다.",
+      "resolution": "PolicyProfile에 선언형 vol_target_override 추가(0,1] 검증, opt-in growth_full_utilization 러닝(band 0/aversion 1.0/cap 0.16/utilization 0.95/vol target 0.20)를 policy_profiles_with_growth_rungs()로 투입, 학습-시뮬레이터 3곳 재구성 동기화로 fingerprint parity 확보, _growth_route_projection과 _compact_hedge_sleeve에 static/vol_managed 최고 가용 러닝 스칼라(best_rungs) 서피싱, CLI --enable-growth-utilization-rung/--cert-max-drawdown 추가. 플래그 오프 경로는 바이트 동일 유지.",
+      "impact": "프로덕션 A/B(ml_growth_rung_ab_20260825, 10.2분/RSS 4.3GB)에서 decision 타겟 gross 0.70→0.85 확인 및 vol-managed lev2.0 러닝(point +25.7%/stress +22.4%/projected MDD 17.9%)이 레저에 기록되어 hedged-excess route 판단 근거 확보; 다만 체결 evidence가 baseline과 바이트 동일로 실현 노출 개선은 미확보 — sparse transition/체결 캡의 전환 차단이 차기 병목. 시나리오 8건 신규 테스트, 회귀 654 passed."
+    },
+    {
       "task_id": "ml_edge_breadth_deployment",
       "date": "2026-08-25",
       "adr_id": "ADR_20260825_ml_edge_breadth_deployment",
@@ -989,16 +999,6 @@
       "why": "80-trial production tuning required 1400.898 seconds in 129 inner-fold fits, while Rank-IC-only selection degraded Sharpe and drawdown.",
       "resolution": "Added immutable prepared fold caches, reduced-budget NDCG pruning, fixed eight-candidate shortlist, exact inner event-ledger economic selection, and telemetry while preserving 80-trial DSR accounting and fail-closed promotion gates.",
       "impact": "Reduces repeated tuning preprocessing and full refits; candidate selection now accounts for fills, costs, bootstrap excess, IR, drawdown, and turnover without using outer OOS or forward holdout data."
-    },
-    {
-      "task_id": "TASK_ML_BACKTEST_TRIAL_SCALABILITY",
-      "date": "2026-08-11",
-      "adr_id": "ADR_20260811_ML_BACKTEST_TRIAL_SCALABILITY",
-      "domain": "research",
-      "title": "ML/backtest 80-trial scalability and OOM guard",
-      "why": "Corrected three-fold LambdaRank validation could not complete the production 80-trial search: 240 LightGBM fits, repeated StableRank and frame copies, and model-selection leakage inflated runtime and memory risk.",
-      "resolution": "Added temporally isolated prequential tuning, serial fold-level pruning, StableRank reuse, float32/int32 conversion and vectorized quantiles, RSS admission/telemetry with fail-closed artifact publication, bounded point-in-time replay history, and project-local uv cache fallback.",
-      "impact": "Preserves NO_TRADE promotion gates while making the 80-trial path measurable and memory-bounded; replay avoids artificial covariance warm-up skips. 519 tests, ruff, mypy, and contract validation pass."
     }
   ]
 }

@@ -175,3 +175,61 @@ def test_frontier_publishes_blend_lower_growth() -> None:
     )
     empty_frontier = _policy_frontier_projection(request, plain_discovery, None)
     assert empty_frontier["blend_lower_growth"] == {}
+
+
+def test_SCENARIO_HEDGE_BEST_RUNG_SURFACING_05() -> None:
+    """SCENARIO_HEDGE_BEST_RUNG_SURFACING_05.
+
+    Static ladder admits up to 1.5x while the vol-managed variant reaches
+    2.0x; each variant's best-admissible-rung scalars are surfaced and an
+    all-inadmissible series omits both blocks without raising.
+    """
+    pair = (0.02, -0.017)
+    excess = tuple((pair * 60 + (-0.16,)) * 2)
+    route = GrowthRouteEvidence(
+        base_log_growth=excess,
+        stress_log_growth=excess,
+        segment_ids=tuple(0 for _ in excess),
+        selected_policies=((10, 10, 8, "lower_bound_only"),),
+        benchmark_log_growth=tuple(0.0 for _ in excess),
+        observed_interval_count=len(excess),
+        invested_interval_count=len(excess),
+        filled_orders=100,
+    )
+    projection = _growth_route_projection(route, _certificate([], 0.128))
+    hedge = projection["hedge_sleeve_projection"]
+    assert hedge["max_admissible_leverage"] == 1.5
+    assert hedge["vol_managed_max_admissible_leverage"] == 2.0
+    static = hedge["best_rungs"]["static"]
+    volman = hedge["best_rungs"]["vol_managed"]
+    assert static["leverage"] == 1.5
+    assert volman["leverage"] == 2.0
+    for block in (static, volman):
+        assert set(block) == {
+            "leverage",
+            "point_cagr",
+            "stress_cagr",
+            "projected_mdd",
+            "margin_buffer",
+        }
+        for value in block.values():
+            assert isinstance(value, float)
+            assert round(value, 12) == value
+
+    crashing = tuple(([0.001] * 60 + [-1.5]) * 3)
+    crash_route = GrowthRouteEvidence(
+        base_log_growth=crashing,
+        stress_log_growth=crashing,
+        segment_ids=tuple(0 for _ in crashing),
+        selected_policies=((10, 10, 8, "lower_bound_only"),),
+        benchmark_log_growth=tuple(0.0 for _ in crashing),
+        observed_interval_count=len(crashing),
+        invested_interval_count=len(crashing),
+        filled_orders=100,
+    )
+    crash_projection = _growth_route_projection(
+        crash_route, _certificate([], None)
+    )
+    crash_hedge = crash_projection["hedge_sleeve_projection"]
+    assert crash_hedge["max_admissible_leverage"] is None
+    assert "best_rungs" not in crash_hedge or crash_hedge["best_rungs"] == {}
