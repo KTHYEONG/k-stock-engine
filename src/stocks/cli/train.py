@@ -40,6 +40,7 @@ from src.core.paths import (
 )
 from src.stocks.config.research import (
     policy_profiles_with_excess_full_kelly,
+    policy_profiles_with_growth_rungs,
     resolve_training_request,
 )
 from src.stocks.config.runtime import StockRuntimeSettings
@@ -58,6 +59,7 @@ from src.stocks.ml.contracts import (
     DEFAULT_CANDIDATE_TOP_K,
     DEFAULT_POLICY_PROFILES,
     ELASTIC_NET_FAMILY,
+    CompoundingCertificationSettings,
     ExecutionFrontierSettings,
     NetAlphaResearchData,
     NetAlphaTrainingRequest,
@@ -753,6 +755,25 @@ def build_parser() -> argparse.ArgumentParser:
             "single-name basis and gross utilization target)"
         ),
     )
+    parser.add_argument(
+        "--enable-growth-utilization-rung",
+        action="store_true",
+        help=(
+            "Opt in to the growth_full_utilization frontier profile, which "
+            "extends the excess-full-Kelly rung with a declared 20 percent "
+            "annual volatility budget and a 95 percent gross utilization "
+            "target"
+        ),
+    )
+    parser.add_argument(
+        "--cert-max-drawdown",
+        type=float,
+        default=0.5,
+        help=(
+            "Route certification drawdown cap in (0, 1); the canonical "
+            "default 0.5 keeps today's gates unchanged"
+        ),
+    )
     rewaterfill_help = (
         "Opt in to band-limited retained re-waterfill sizing under "
         "sparse_hold_replace_v2 execution"
@@ -798,6 +819,8 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
     policy_profiles: tuple[PolicyProfile, ...] = DEFAULT_POLICY_PROFILES
     if bool(getattr(args, 'enable_excess_full_kelly', False)):
         policy_profiles = policy_profiles_with_excess_full_kelly()
+    if bool(getattr(args, 'enable_growth_utilization_rung', False)):
+        policy_profiles = policy_profiles_with_growth_rungs()
     return NetAlphaTrainingRequest(
         artifact_id=args.artifact_id,
         candidate_horizon_sessions=horizons,
@@ -825,6 +848,9 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
         discovery_workers=int(getattr(args, 'discovery_workers', 1)),
         enable_sparse_retained_rewaterfill=bool(getattr(args, 'enable_sparse_retained_rewaterfill', False)),
         policy_profiles=policy_profiles,
+        compounding=CompoundingCertificationSettings(
+            max_drawdown=float(getattr(args, 'cert_max_drawdown', 0.5))
+        ),
         portfolio=PortfolioSettings(
             top_k=args.top_k,
             max_single_weight=args.max_single_weight,

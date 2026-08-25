@@ -1665,3 +1665,52 @@ class TestProfileScopedFeasibility:
             "covariance_source_full_fraction",
         }
         assert set(empty) >= legacy_keys
+
+
+class TestVolTargetThreading:
+    """SCENARIO_RISK_POLICY_VOL_THREADING_03."""
+
+    def test_SCENARIO_RISK_POLICY_VOL_THREADING_03(self) -> None:
+        import json as _json
+
+        from src.stocks.config.research import policy_profiles_with_growth_rungs
+        from src.stocks.ml.contracts import DEFAULT_POLICY_PROFILES
+        from src.stocks.ml.training import (
+            _policy_profile_params,
+            _risk_policy_for_profile,
+        )
+        from src.stocks.trading.portfolio_constructor import (
+            stock_risk_policy_fingerprint,
+        )
+
+        request = NetAlphaTrainingRequest(artifact_id="vol_thread")
+        growth_rung = policy_profiles_with_growth_rungs()[-1]
+        legacy = DEFAULT_POLICY_PROFILES[1]
+
+        growth_policy = _risk_policy_for_profile(
+            request, growth_rung, 10,
+            rebalance_frequency_sessions=5, top_k=12,
+        )
+        assert growth_policy.target_annual_volatility == 0.20
+        legacy_policy = _risk_policy_for_profile(
+            request, legacy, 10,
+            rebalance_frequency_sessions=5, top_k=12,
+        )
+        assert legacy_policy.target_annual_volatility == 0.12
+
+        growth_payload = _json.loads(_policy_profile_params(
+            request, growth_rung, 10,
+            rebalance_frequency_sessions=5, top_k=12,
+        ))
+        assert growth_payload["vol_target_override"] == 0.2
+        legacy_payload = _json.loads(_policy_profile_params(
+            request, legacy, 10,
+            rebalance_frequency_sessions=5, top_k=12,
+        ))
+        assert legacy_payload["vol_target_override"] is None
+
+        # fingerprint moves only through the declared vol-target field
+        assert (
+            stock_risk_policy_fingerprint(growth_policy)
+            != stock_risk_policy_fingerprint(legacy_policy)
+        )

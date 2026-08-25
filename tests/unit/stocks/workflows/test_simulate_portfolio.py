@@ -1151,3 +1151,98 @@ def test_SPARSE_REWATERFILL_06_SIM_RECONSTRUCTION_ROUNDTRIP() -> None:
     )
     legacy = _policy_from_artifact(manifest_with_mode(None), request)
     assert legacy.retained_sizing_mode == "freeze_v1"
+
+
+def test_SCENARIO_SIMULATOR_VOL_RECONSTRUCTION_04(tmp_path) -> None:
+    """SCENARIO_SIMULATOR_VOL_RECONSTRUCTION_04."""
+    from src.stocks.trading.portfolio_constructor import (
+        StockRiskPolicy,
+        stock_risk_policy_fingerprint,
+    )
+
+    from src.stocks.workflows.simulate_portfolio import (
+        _policy_from_artifact,
+        _validate_prepared_equity_policy,
+        _profile_vol_target_override,
+    )
+
+    request = SimulationRequest(
+        artifact_id="na_growth_rung",
+        decision_time=datetime(2024, 4, 29, tzinfo=UTC),
+        top_k=12,
+        max_single_weight=0.0833,
+        max_exposure=0.95,
+        participation_limit=0.005,
+    )
+    trained = StockRiskPolicy(
+        top_k=12,
+        gross_cap=0.95,
+        single_name_cap=0.0833,
+        participation_limit=0.005,
+        no_trade_band_bps=0.0,
+        rebalance_frequency_sessions=5,
+        target_annual_volatility=0.2,
+        compounding=CompoundingPolicyConfig(
+            growth_risk_aversion=1.0, forecast_horizon_sessions=10
+        ),
+        economic_ranking_mode="economic_net_v1",
+        execution_utility_mode="sparse_hold_replace_v2",
+        sizing_mode="risk_balanced_waterfill_v2",
+    )
+    fingerprint = stock_risk_policy_fingerprint(trained)
+
+    def payload(override: object) -> dict[str, object]:
+        return {
+            "profile_id": "growth_full_utilization",
+            "no_trade_band_bps": 0.0,
+            "growth_risk_aversion": 1.0,
+            "forecast_horizon_sessions": 10,
+            "rebalance_frequency_sessions": 5,
+            "top_k": 12,
+            "max_single_weight": 0.0833,
+            "max_exposure": 0.95,
+            "participation_limit": 0.005,
+            "portfolio_fingerprint": policy_portfolio_fingerprint(
+                12, 0.0833, 0.95, 0.005
+            ),
+            "execution_evidence_version": "prepared-equity-v5-sparse-growth",
+            "risk_policy_fingerprint": fingerprint,
+            "execution_policy_id": SCHEDULED_OPEN_POLICY_ID,
+            "execution_policy_hash": SCHEDULED_OPEN_V1.canonical_hash,
+            "economic_ranking_mode": "economic_net_v1",
+            "execution_utility_mode": "sparse_hold_replace_v2",
+            "sizing_mode": "risk_balanced_waterfill_v2",
+            "retained_sizing_mode": "freeze_v1",
+            "vol_target_override": override,
+        }
+
+    matching = payload(0.2)
+    assert _profile_vol_target_override(matching) == 0.2
+
+    manifest = ModelManifest(
+        artifact_id="na_growth_rung",
+        asset_kind=AssetKind.STOCK,
+        feature_set="stock_net_alpha_v1",
+        feature_schema_hash="h",
+        universe_policy_hash="u",
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=10,
+        eligible_from="2024-01-01T00:00:00+00:00",
+        eligible_to="2024-04-29T00:00:00+00:00",
+        model_type="net_alpha_elastic_net",
+        params={"policy_profile": json.dumps(matching, sort_keys=True)},
+    )
+    policy = _policy_from_artifact(manifest, request)
+    assert policy.target_annual_volatility == 0.2
+    assert stock_risk_policy_fingerprint(policy) == fingerprint
+
+    # prepared-equity validation passes only under the declared override
+    _validate_prepared_equity_policy(request, dict(matching), 0.0)
+
+    tampered = payload(0.15)
+    with pytest.raises(ValueError, match="risk-policy fingerprint diverges"):
+        _validate_prepared_equity_policy(request, tampered, 0.0)
+
+    for bad in ("high", True):
+        with pytest.raises(ValueError, match="vol_target_override"):
+            _profile_vol_target_override(payload(bad))
