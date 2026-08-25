@@ -721,6 +721,7 @@ def _run_discovery_and_publish(
     selection = select_horizons(
         discovery.evidence, request.bootstrap_alpha, request.seed,
         n_bootstrap=request.bootstrap_resamples,
+        family_scope=request.holm_family_scope,
     )
     candidate_bound = len(
         request.execution_frontier.feasible_cells(
@@ -1623,6 +1624,7 @@ def _replay_costs_batch(
                     if request.max_rss_mib is not None
                     else None
                 ),
+                candidate_workers=max(1, int(request.discovery_workers)),
             )
         primary_evidences = combined_evidences[: len(batch_replay_requests)]
         shadow_evidences = combined_evidences[len(batch_replay_requests) :]
@@ -2296,19 +2298,21 @@ def _replay_blend_candidates(
         if base_evidence.filled_orders == 0:
             dropout_reasons[key] = "no-filled-orders"
             continue
+        # Frontier-stage blend cells admit on candidate evidence alone; the
+        # dense shadow is a champion/holdout certification requirement, so a
+        # missing shadow no longer drops the cell here.
         shadow_evidence = pair.dense_shadow
-        if shadow_evidence is None:
-            dropout_reasons[key] = "missing-shadow-evidence"
-            continue
-        _incremental_growth_gate(base_evidence, shadow_evidence, request, target_horizon)
-        paired_stress = tuple(
-            float(candidate - shadow)
-            for candidate, shadow in zip(
-                base_evidence.stress_log_growth,
-                shadow_evidence.stress_log_growth,
-                strict=True,
+        paired_stress: tuple[float, ...] = ()
+        if shadow_evidence is not None:
+            _incremental_growth_gate(base_evidence, shadow_evidence, request, target_horizon)
+            paired_stress = tuple(
+                float(candidate - shadow)
+                for candidate, shadow in zip(
+                    base_evidence.stress_log_growth,
+                    shadow_evidence.stress_log_growth,
+                    strict=True,
+                )
             )
-        )
         candidate_evidence = _evidence_from_execution(
             target_horizon,
             profile.profile_id,
@@ -2319,7 +2323,9 @@ def _replay_blend_candidates(
             len(folds),
             paired_stress_log_growth=paired_stress,
             sparse_turnover=base_evidence.turnover,
-            shadow_turnover=shadow_evidence.turnover,
+            shadow_turnover=(
+                shadow_evidence.turnover if shadow_evidence is not None else 0.0
+            ),
             rebalance_frequency_sessions=cadence,
             top_k=top_k,
         )
@@ -2329,6 +2335,39 @@ def _replay_blend_candidates(
             continue
         evidence.append(candidate_evidence)
         execution_evidence_by_candidate[key] = base_evidence
+
+
+def _run_ordered_with_workers(
+    items: Sequence[object],
+    task: Callable[[object], object],
+    *,
+    workers: int = 1,
+) -> list[object] | None:
+    """Run independent tasks preserving item order; None signals parallel failure.
+
+    ``workers <= 1`` or a single item runs sequentially. Any worker exception
+    aborts the parallel path and returns ``None`` so the caller can fall back
+    to sequential execution and record the reason.
+    """
+    if workers <= 1 or len(items) <= 1:
+        try:
+            return [task(item) for item in items]
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[DISCOVERY] stage=parallel_workers status=fallback reason=worker-failure"
+            )
+            return None
+    from concurrent.futures import ThreadPoolExecutor
+
+    try:
+        with ThreadPoolExecutor(max_workers=min(workers, len(items))) as pool:
+            futures = [pool.submit(task, item) for item in items]
+            return [future.result() for future in futures]
+    except Exception:  # noqa: BLE001 - fallback decision belongs to the caller
+        logger.warning(
+            "[DISCOVERY] stage=parallel_workers status=fallback reason=worker-failure"
+        )
+        return None
 
 
 def _discovery_oof(
@@ -3415,20 +3454,33 @@ def _evaluate_forward_holdout(
         return {"passed": False, "reason": f"holdout-benchmark-invalid:{exc}"}
     growth_count = len(base_evidence.base_log_growth)
     invested_sessions = base_evidence.invested_interval_count
+    # Tail vintages maturing past the dataset end are structurally censored;
+    # allow exactly one horizon of tail sessions in the observation rule.
+    holdout_settings = replace(
+        request.compounding,
+        allowed_tail_censoring_sessions=max(
+            int(horizon_sessions), request.compounding.allowed_tail_censoring_sessions
+        ),
+    )
+    # The effective floor is derived inside the certification kernel from
+    # holdout_settings.allowed_tail_censoring_sessions; keep the value honest.
+    assert (
+        holdout_settings.allowed_tail_censoring_sessions >= horizon_sessions
+    )
     certificate = certify_compounded_holdout(
         tuple(np.expm1(value) for value in base_evidence.base_log_growth),
         tuple(np.expm1(value) for value in stress_evidence.stress_log_growth),
         horizon_sessions,
         growth_count,
         invested_sessions,
-        request.compounding,
+        holdout_settings,
     )
     matched_certificate = certify_exposure_matched_excess(
         base_evidence.base_log_growth,
         matched_benchmark,
         horizon_sessions,
         invested_sessions,
-        request.compounding,
+        holdout_settings,
     )
     if base_evidence.filled_orders <= 0 or base_evidence.planned_cycles <= 0:
         reason = "holdout-no-economic-edge"

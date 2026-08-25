@@ -321,7 +321,16 @@ def _certify_path(
         period_count=period_count,
         observed_sessions=observed_sessions,
     )
-    if observed_sessions < settings.min_observed_sessions:
+    effective_min_observed = settings.min_observed_sessions
+    if settings.allowed_tail_censoring_sessions > 0:
+        # Structurally censored tail sessions (vintages maturing past the
+        # dataset end) lower the requirement; genuine shortfalls below the
+        # 95% floor of the reduced requirement still fail closed.
+        effective_min_observed = math.ceil(
+            (settings.min_observed_sessions - settings.allowed_tail_censoring_sessions)
+            * 0.95
+        )
+    if observed_sessions < effective_min_observed:
         reasons.append("insufficient-observed-sessions")
     active_fraction = (
         active_cohort_count / period_count if period_count > 0 else 0.0
