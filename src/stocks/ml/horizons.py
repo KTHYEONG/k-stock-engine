@@ -154,7 +154,9 @@ class HorizonSelectionEvidence:
     paired_p_values: dict[tuple[int, int, int, str], float] = field(default_factory=dict)
     paired_holm_thresholds: dict[tuple[int, int, int, str], float] = field(default_factory=dict)
     shadow_turnover: dict[tuple[int, int, int, str], float] = field(default_factory=dict)
-    turnover_ratio: dict[tuple[int, int, int, str], float] = field(default_factory=dict)
+    turnover_ratio: dict[tuple[int, int, int, str], float | None] = field(
+        default_factory=dict
+    )
     selection_reasons: tuple[str, ...] = ()
     rankability_reason: str = ""
     rank_ic_lower_bound: float = 0.0
@@ -172,9 +174,13 @@ class HorizonSelectionEvidence:
         return self.primary_profile_id
 
     def to_json(self) -> dict[str, object]:
-        def keyed(mapping: dict[tuple[int, int, int, str], float]) -> dict[str, float]:
+        def keyed(
+            mapping: Mapping[tuple[int, int, int, str], float | None],
+        ) -> dict[str, float | None]:
             return {
-                f"{horizon}:{cadence}:{top_k}:{profile}": float(value)
+                f"{horizon}:{cadence}:{top_k}:{profile}": (
+                    None if value is None else float(value)
+                )
                 for (horizon, cadence, top_k, profile), value in sorted(
                     mapping.items()
                 )
@@ -503,7 +509,7 @@ def select_horizons(
     paired_p_values: dict[tuple[int, int, int, str], float] = {}
     paired_holm_thresholds: dict[tuple[int, int, int, str], float] = {}
     shadow_turnover: dict[tuple[int, int, int, str], float] = {}
-    turnover_ratio: dict[tuple[int, int, int, str], float] = {}
+    turnover_ratio: dict[tuple[int, int, int, str], float | None] = {}
     admissible: list[HorizonOOFEvidence] = []
     for candidate in ordered:
         key = _frontier_key(
@@ -531,9 +537,15 @@ def select_horizons(
             paired_lower_bounds[key] = paired_lower
             paired_p_values[key] = paired_boot.p_value if paired_boot is not None else 1.0
             paired_holm_thresholds[key] = paired_threshold
-        sh_turnover = max(candidate.shadow_turnover, 1e-12)
         shadow_turnover[key] = float(candidate.shadow_turnover)
-        ratio = float(candidate.sparse_turnover) / sh_turnover
+        # A missing dense shadow publishes an exempt ratio instead of a
+        # fabricated denominator; the ratio gate then cannot auto-reject.
+        has_shadow = candidate.shadow_turnover > 0.0
+        ratio: float | None = (
+            float(candidate.sparse_turnover) / float(candidate.shadow_turnover)
+            if has_shadow
+            else None
+        )
         turnover_ratio[key] = ratio
         base_p = base.p_value if base is not None else 1.0
         stress_p = stress.p_value if stress is not None else 1.0
@@ -551,19 +563,22 @@ def select_horizons(
             if has_paired
             else True
         )
-        if base_ok and stress_ok and paired_ok and ratio <= 0.60:
+        ratio_ok = ratio is None or ratio <= 0.60
+        if base_ok and stress_ok and paired_ok and ratio_ok:
             admissible.append(candidate)
             reasons.append(
                 f"h{candidate.horizon_sessions}:{candidate.profile_id} "
                 f"admissible base={base_lower:.6g} stress={stress_lower:.6g} "
-                f"paired={paired_lower:.6g} turnover_ratio={ratio:.6g}"
+                f"paired={paired_lower:.6g} turnover_ratio="
+                + ("exempt" if ratio is None else f"{ratio:.6g}")
             )
         else:
             reasons.append(
                 f"h{candidate.horizon_sessions}:{candidate.profile_id} "
                 f"rejected base={base_lower:.6g} stress={stress_lower:.6g} "
-                f"paired={paired_lower:.6g} turnover_ratio={ratio:.6g} "
-                f"base_p={base_p:.6g} stress_p={stress_p:.6g}"
+                f"paired={paired_lower:.6g} turnover_ratio="
+                + ("exempt" if ratio is None else f"{ratio:.6g}")
+                + f" base_p={base_p:.6g} stress_p={stress_p:.6g}"
             )
 
     primary_horizon: int | None = None
