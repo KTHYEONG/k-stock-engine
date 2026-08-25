@@ -1515,7 +1515,7 @@ class TestSizingDiagnostics:
             "selected_count_p10",
             "selected_count_p90",
         }
-        assert set(summary) == fixed_keys
+        assert fixed_keys <= set(summary)
         assert all(
             value is None or isinstance(value, (int, float)) for value in summary.values()
         )
@@ -1714,3 +1714,103 @@ class TestVolTargetThreading:
             stock_risk_policy_fingerprint(growth_policy)
             != stock_risk_policy_fingerprint(legacy_policy)
         )
+
+
+class TestLimitsThreadingAndAggregation:
+    """SCENARIO_RISK_POLICY_LIMITS_THREADING_03 / SCENARIO_SIZING_FRACTION_AGGREGATION_06."""
+
+    def test_SCENARIO_RISK_POLICY_LIMITS_THREADING_03(self) -> None:
+        import json as _json
+
+        from src.stocks.config.research import policy_profiles_with_growth_rungs
+        from src.stocks.ml.contracts import DEFAULT_POLICY_PROFILES
+        from src.stocks.ml.training import (
+            _policy_profile_params,
+            _risk_policy_for_profile,
+        )
+        from src.stocks.trading.portfolio_constructor import (
+            stock_risk_policy_fingerprint,
+        )
+
+        request = NetAlphaTrainingRequest(artifact_id="limits_thread")
+        growth_rung = policy_profiles_with_growth_rungs()[-1]
+        legacy = DEFAULT_POLICY_PROFILES[1]
+
+        growth_policy = _risk_policy_for_profile(
+            request, growth_rung, 10,
+            rebalance_frequency_sessions=5, top_k=12,
+        )
+        assert growth_policy.participation_limit == 0.02
+        assert growth_policy.turnover_budget == 0.40
+        assert growth_policy.target_annual_volatility == 0.20
+        legacy_policy = _risk_policy_for_profile(
+            request, legacy, 10,
+            rebalance_frequency_sessions=5, top_k=12,
+        )
+        assert legacy_policy.participation_limit == 0.005
+        assert legacy_policy.turnover_budget == 0.20
+
+        growth_payload = _json.loads(_policy_profile_params(
+            request, growth_rung, 10,
+            rebalance_frequency_sessions=5, top_k=12,
+        ))
+        assert growth_payload["participation_limit_override"] == 0.02
+        assert growth_payload["turnover_budget_override"] == 0.4
+        legacy_payload = _json.loads(_policy_profile_params(
+            request, legacy, 10,
+            rebalance_frequency_sessions=5, top_k=12,
+        ))
+        assert legacy_payload["participation_limit_override"] is None
+        assert legacy_payload["turnover_budget_override"] is None
+
+        assert (
+            stock_risk_policy_fingerprint(growth_policy)
+            != stock_risk_policy_fingerprint(legacy_policy)
+        )
+
+    def test_SCENARIO_SIZING_FRACTION_AGGREGATION_06(self) -> None:
+        from src.stocks.ml.training import _sizing_diagnostics_summary
+
+        records = [
+            {
+                "selected_count": 12,
+                "turnover_lambda": 0.5,
+                "participation_clamped_count": 10,
+                "participation_name_count": 12,
+                "gross_before_compounding": 0.85,
+                "gross_after_compounding": 0.80,
+                "confidence_scale": 1.0,
+                "covariance_source": "full",
+                "cash_reason": None,
+            },
+            {
+                "selected_count": 12,
+                "turnover_lambda": 1.0,
+                "participation_clamped_count": 2,
+                "participation_name_count": 12,
+                "gross_before_compounding": 0.85,
+                "gross_after_compounding": 0.85,
+                "confidence_scale": 0.9,
+                "covariance_source": "fallback",
+                "cash_reason": None,
+            },
+        ]
+        summary = _sizing_diagnostics_summary(records)
+        assert summary["turnover_lambda_mean"] == pytest.approx(0.75)
+        assert summary["participation_clamped_fraction"] == pytest.approx(12 / 24)
+        legacy_keys = {
+            "decision_count",
+            "cash_decision_count",
+            "confidence_scale_mean",
+            "gross_before_compounding_mean",
+            "gross_after_compounding_mean",
+            "covariance_source_full_fraction",
+            "selected_count_mean",
+        }
+        assert set(summary) >= legacy_keys
+
+        none_summary = _sizing_diagnostics_summary(
+            [{"turnover_lambda": None, "cash_reason": None}]
+        )
+        assert none_summary["turnover_lambda_mean"] is None
+        assert none_summary["participation_clamped_fraction"] is None

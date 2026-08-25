@@ -2491,3 +2491,111 @@ class TestSparseRetainedRewaterfill:
             ).retained_sizing_mode
             == "band_limited_rewaterfill_v1"
         )
+
+
+class TestClampTelemetry:
+    """SCENARIO_CLAMP_TELEMETRY_SURFACING_05."""
+
+    def _panel(self) -> pl.DataFrame:
+        rng = np.random.default_rng(11)
+        start = datetime(2024, 1, 1, tzinfo=UTC)
+        return pl.DataFrame(
+            [
+                {
+                    "session": start + timedelta(days=s),
+                    "instrument_id": f"KRX:{t:06d}",
+                    "pred_score": float(t) * 0.1 + (s % 2) * 0.05,
+                    "sector": f"S{t % 2}",
+                    "adtv": 5e6,
+                    "close": 50_000.0 + t,
+                    "ret": float(rng.normal(0.0003, 0.01)),
+                    "expected_active_alpha": 0.01 + t * 0.001,
+                    "expected_net_alpha": 0.008 + t * 0.001,
+                    "alpha_lower_bound": 0.004 + t * 0.0005,
+                    "exit_cost_rate": 0.002,
+                    "net_alpha_lower_bound": 0.006 + t * 0.0004,
+                }
+                for s in range(30)
+                for t in range(1, 5)
+            ]
+        )
+
+    def _run(self, participation_limit: float):
+        from src.core.instruments import AssetKind, Instrument
+        from src.core.portfolio import PortfolioSnapshot, Position
+
+        panel = self._panel()
+        ids = sorted(panel["instrument_id"].unique().to_list())
+        instruments = {
+            i: Instrument(i, AssetKind.STOCK, "KRX", i.split(":")[-1], "KRW", lot_size=1)
+            for i in ids
+        }
+        equity = 1_000_000.0
+        prices = {
+            i: float(panel.filter(pl.col("instrument_id") == i)["close"][-1])
+            for i in ids
+        }
+        portfolio = PortfolioSnapshot(
+            account_snapshot_id="held",
+            as_of=datetime(2024, 1, 29, tzinfo=UTC),
+            settled_cash=equity - sum(
+                0.10 * equity for _ in ids[:3]
+            ),
+            unsettled_cash=0.0,
+            positions=tuple(
+                Position(
+                    instrument=instruments[i],
+                    quantity=int(0.10 * equity / prices[i]),
+                    average_cost=prices[i],
+                )
+                for i in ids[:3]
+            ),
+        )
+        policy = StockRiskPolicy(
+            top_k=4,
+            gross_cap=0.95,
+            single_name_cap=0.25,
+            participation_limit=participation_limit,
+            turnover_budget=1.0,
+            no_trade_band_bps=0.0,
+            rebalance_frequency_sessions=5,
+            compounding=CompoundingPolicyConfig(
+                growth_risk_aversion=1.0, forecast_horizon_sessions=5
+            ),
+            economic_ranking_mode="economic_net_v1",
+        )
+        allocations = construct_target_allocations(panel, instruments, portfolio, policy)
+        record = policy.compounding_evidence[-1]
+        target_gross = sum(a.target_value for a in allocations) / equity
+        return record, target_gross
+
+    def test_SCENARIO_CLAMP_TELEMETRY_SURFACING_05(self) -> None:
+        tight_record, tight_gross = self._run(1e-9)
+        assert tight_record["participation_name_count"] > 0
+        assert (
+            tight_record["participation_clamped_count"]
+            == tight_record["participation_name_count"]
+        )
+        wide_record, wide_gross = self._run(0.9)
+        assert wide_record["participation_clamped_count"] == 0
+        assert wide_gross > tight_gross
+
+    def test_legacy_callers_keep_nullable_keys(self) -> None:
+        policy = StockRiskPolicy(top_k=4)
+        panel = self._panel()
+        from src.core.instruments import AssetKind, Instrument
+        from src.core.portfolio import PortfolioSnapshot
+
+        ids = sorted(panel["instrument_id"].unique().to_list())
+        instruments = {
+            i: Instrument(i, AssetKind.STOCK, "KRX", i.split(":")[-1], "KRW", lot_size=1)
+            for i in ids
+        }
+        empty = PortfolioSnapshot(
+            account_snapshot_id="cash",
+            as_of=datetime(2024, 1, 1, tzinfo=UTC),
+            settled_cash=1_000_000.0,
+            unsettled_cash=0.0,
+            positions=(),
+        )
+        construct_target_allocations(panel, instruments, empty, policy)

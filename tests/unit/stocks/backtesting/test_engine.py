@@ -842,3 +842,54 @@ def test_backtest_branch_01_branch_selection_before_partition_by(
         fallback_result = reference_backtester.run(df, artifacts, portfolio, request)
     assert counter.calls >= 1
     assert isinstance(fallback_result, BacktestResult)
+
+
+def test_SCENARIO_ENGINE_CLIP_COUNTER_07() -> None:
+    """SCENARIO_ENGINE_CLIP_COUNTER_07: capacity-clipped fills surface in metrics."""
+    df, snapshot, registry, instruments, policy, scored, artifacts, request, portfolio = (
+        _paired_inputs()
+    )
+    # Shrink ADTV so the 0.5% participation capacity binds against targets.
+    clipped_df = df.with_columns(
+        (pl.col("trading_value") * 1e-2).alias("trading_value"),
+        (pl.col("adtv") * 1e-2).alias("adtv"),
+    )
+    clipped_snapshot = DatasetSnapshot(manifest=snapshot.manifest, frame=clipped_df)
+
+    def planner(snapshot_inner, reg, inst, port, creq):
+        del reg
+        prepared = PreparedReplayDecision(
+            creq.decision_time,
+            creq.execution_time,
+            scored.filter(pl.col("available_time") <= creq.decision_time),
+        )
+        return _scenario_planner(prepared, port, creq, instruments, policy)
+
+    def run_case(frame: pl.DataFrame, snap: DatasetSnapshot, *, cash: float = 100_000_000.0):
+        backtester = StockBacktester(
+            planner=lambda s, r, i, p, c: planner(snap, r, i, p, c),
+            registry=registry,
+            instruments=instruments,
+            manifest=snap.manifest,
+            cost_schedule=default_base_schedule(),
+            stress_cost_schedule=default_stress_schedule(),
+        )
+        return backtester.run(
+            frame,
+            artifacts,
+            PortfolioSnapshot(
+                account_snapshot_id="promotion",
+                as_of=datetime(2024, 1, 1, tzinfo=UTC),
+                settled_cash=cash,
+                unsettled_cash=0.0,
+                positions=(),
+            ),
+            request,
+        )
+
+    clipped = run_case(clipped_df, clipped_snapshot)
+    control = run_case(df, snapshot, cash=1_000_000.0)
+
+    assert float(clipped.metrics.get("capacity_clipped_count", 0.0)) > 0
+    assert float(clipped.metrics.get("partial_fill_count", 0.0)) > 0
+    assert float(control.metrics.get("capacity_clipped_count", 0.0)) == 0.0

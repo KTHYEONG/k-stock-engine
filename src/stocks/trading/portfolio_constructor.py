@@ -1412,6 +1412,9 @@ def _build_allocations(
     invalid_cost_input_count = 0
     utility_transition_diagnostics: list[tuple[str, float | int]] = []
 
+    clamped_count: int | None = None
+    name_count: int | None = None
+
     if policy.execution_utility_mode == "sparse_hold_replace_v2" and sparse_plan is not None:
         target_full = dict.fromkeys(current_weights, 0.0)
         for instrument_id, weight in weights.items():
@@ -1436,6 +1439,13 @@ def _build_allocations(
                 )
         else:
             lambda_ = 1.0
+        clamped_count, name_count = _apply_participation_clamp(
+            target_full,
+            current_weights,
+            adtv_of,
+            equity,
+            policy.participation_limit,
+        )
         utility_transition_count = int(bool(sparse_plan.replacements or sparse_plan.initial_entries))
         utility_hold_count = len(sparse_plan.retained)
         utility_transition_diagnostics.extend(
@@ -1503,24 +1513,13 @@ def _build_allocations(
                     ("invalid_cost_input_count", invalid_cost_input_count)
                 )
 
-                if policy.participation_limit > 0.0:
-                    for instrument_id in current_weights:
-                        target_full.setdefault(instrument_id, 0.0)
-                    for instrument_id, target in target_full.items():
-                        current = current_weights.get(instrument_id, 0.0)
-                        delta_cap = (
-                            policy.participation_limit
-                            * adtv_of.get(instrument_id, 0.0)
-                            / equity
-                        )
-                        if delta_cap <= 0.0:
-                            raise PortfolioConstraintError(
-                                f"missing capacity for {instrument_id}"
-                            )
-                        target_full[instrument_id] = min(
-                            max(target, current - delta_cap),
-                            current + delta_cap,
-                        )
+                clamped_count, name_count = _apply_participation_clamp(
+                    target_full,
+                    current_weights,
+                    adtv_of,
+                    equity,
+                    policy.participation_limit,
+                )
         else:
             target_full = dict(current_weights)
             lambda_ = 0.0
@@ -1539,21 +1538,13 @@ def _build_allocations(
             target_full = dict(weights)
             lambda_ = 1.0
 
-        if policy.participation_limit > 0.0:
-            for instrument_id in current_weights:
-                target_full.setdefault(instrument_id, 0.0)
-            for instrument_id, target in target_full.items():
-                current = current_weights.get(instrument_id, 0.0)
-                delta_cap = policy.participation_limit * adtv_of.get(
-                    instrument_id, 0.0
-                ) / equity
-                if delta_cap <= 0.0:
-                    raise PortfolioConstraintError(
-                        f"missing capacity for {instrument_id}"
-                    )
-                target_full[instrument_id] = min(
-                    max(target, current - delta_cap), current + delta_cap
-                )
+        clamped_count, name_count = _apply_participation_clamp(
+            target_full,
+            current_weights,
+            adtv_of,
+            equity,
+            policy.participation_limit,
+        )
 
     if compounding_applied:
         _record_compounding_decision(
@@ -1570,6 +1561,8 @@ def _build_allocations(
             turnover_lambda=lambda_,
             cash_reason=None,
             covariance_source=covariance_source,
+            participation_clamped_count=clamped_count,
+            participation_name_count=name_count,
         )
 
     allocations: list[Allocation] = []
@@ -1704,6 +1697,8 @@ def _record_compounding_decision(
     turnover_lambda: float,
     cash_reason: str | None,
     covariance_source: str = "",
+    participation_clamped_count: int | None = None,
+    participation_name_count: int | None = None,
 ) -> None:
     """Append one deterministic JSON-safe per-decision compounding record.
 
@@ -1740,6 +1735,14 @@ def _record_compounding_decision(
         "turnover_lambda": float(turnover_lambda),
         "cash_reason": cash_reason,
         "covariance_source": str(covariance_source),
+        "participation_clamped_count": (
+            None
+            if participation_clamped_count is None
+            else int(participation_clamped_count)
+        ),
+        "participation_name_count": (
+            None if participation_name_count is None else int(participation_name_count)
+        ),
     }
     policy.compounding_evidence.append(record)
     logger.debug(
@@ -1889,6 +1892,44 @@ def _turnover_lambda(
     if turnover <= 0.0:
         return 1.0
     return min(1.0, budget / turnover)
+
+
+def _apply_participation_clamp(
+    target_full: dict[str, float],
+    current_weights: Mapping[str, float],
+    adtv_of: Mapping[str, float],
+    equity: float,
+    participation_limit: float,
+) -> tuple[int, int]:
+    """Clip per-name target moves to the participation delta cap in place.
+
+    Every held or targeted name moves at most ``participation_limit * adtv /
+    equity`` weight per decision; the returned ``(clamped, names)`` counts
+    expose how often the cap bound the transition so a saturated clamp —
+    which would erase policy-level target differences before fills — is
+    visible in the sizing diagnostics instead of silent.
+    """
+    clamped = 0
+    names = 0
+    for instrument_id in list(current_weights):
+        target_full.setdefault(instrument_id, 0.0)
+    for instrument_id, target in target_full.items():
+        current = current_weights.get(instrument_id, 0.0)
+        names += 1
+        if participation_limit > 0.0:
+            adtv = adtv_of.get(instrument_id, 0.0)
+            delta_cap = (
+                participation_limit * adtv / equity if equity > 0.0 else 0.0
+            )
+            if delta_cap <= 0.0:
+                raise PortfolioConstraintError(
+                    f"missing capacity for {instrument_id}"
+                )
+            bounded = min(max(target, current - delta_cap), current + delta_cap)
+            if bounded != target:
+                clamped += 1
+            target_full[instrument_id] = bounded
+    return clamped, names
 
 
 def _lower_confidence_transition_utility(
