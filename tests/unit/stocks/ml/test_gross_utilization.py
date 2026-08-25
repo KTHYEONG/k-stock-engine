@@ -75,7 +75,7 @@ def test_invalid_override_rejected() -> None:
 
 
 def test_flag_off_defaults_unchanged() -> None:
-    """SCENARIO_FLAG_OFF_PARITY_LEAP."""
+    """SCENARIO_FLAG_OFF_PARITY_LEAP + SCENARIO_CLOSEOUT_FLAG_OFF_PARITY."""
     profile = CanonicalResearchProfile()
     assert tuple(p.profile_id for p in profile.policy_profiles) == (
         "legacy_overlay_5bps",
