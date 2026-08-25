@@ -174,6 +174,28 @@ def _check_orphaned_implementations(fh: str, kind: str, name: str) -> list[JsonD
         # field는 정의 자체가 사용처가 아니고, cli_argument 플래그 리터럴은
         # 선행 하이픈 때문에 \b 단어경계 참조 스캔과 구조적으로 불규합이다.
         return []
+    if kind == "registry_entry":
+        # NAME['key'] 형태: 엔트리의 "호출자"는 정의 파일 밖에서 이 키를
+        # 참조하는 코드다(정의 라인 자신은 제외).
+        entry_match = re.match(r"^\w+\[(['\"])(.+?)\1\]$", name)
+        if entry_match is None:
+            return []
+        key_leaf = re.escape(entry_match.group(2))
+        key_pat = re.compile(rf"\b{key_leaf}\b")
+        for fp, content in _get_src_files_contents():
+            if fp == fh:
+                continue
+            for line in content.splitlines():
+                if key_pat.search(line):
+                    return []
+        return [
+            {
+                "file": fh,
+                "line": 0,
+                "error": f"Spec: {kind} '{name}' has no callers in src/ outside its own definition (orphaned implementation)",
+                "fix_hint": f"Wire {name} into its caller per the spec's wiring plan -- it currently does nothing in production",
+            }
+        ]
     leaf = name.rpartition(".")[2] if "." in name else name
     if not leaf:
         return []
@@ -263,7 +285,12 @@ def _iter_contract_entries(contract: dict[str, Any]) -> list[dict[str, Any]]:
     default_target = contract.get("target_file", "")
     for change in contract.get("changes", []) + contract.get("symbols", []):
         symbol = change.get("symbol") or change.get("name", "")
-        target = change.get("target_file") or change.get("file_hint") or default_target
+        target = (
+            change.get("target_file")
+            or change.get("file_hint")
+            or change.get("file")
+            or default_target
+        )
         entries.append(
             {
                 "file_hint": _repo_relative(target),
@@ -385,6 +412,37 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                                 arg_names = [a.arg for a in node.args.args]
                                 found_impl = leaf in arg_names
                                 break
+                    elif kind == "registry_entry":
+                        # 예: NAME['key'] / NAME["key"] 형태의 레지스트리 엔트리.
+                        # 구조(NAME 모듈 수준 dict 할당)와 키 리터럴을 함께 확인한다.
+                        entry_match = re.match(
+                            r"^(?P<owner>\w+)\[(?P<q>['\"])(?P<key>.+?)(?P=q)\]$",
+                            name,
+                        )
+                        if entry_match is None:
+                            found_impl = False
+                        else:
+                            reg_owner = entry_match.group("owner")
+                            key_literal = entry_match.group("key")
+                            has_registry = any(
+                                isinstance(node, (ast.Assign, ast.AnnAssign))
+                                and any(
+                                    isinstance(t, ast.Name) and t.id == reg_owner
+                                    for t in (
+                                        node.targets
+                                        if isinstance(node, ast.Assign)
+                                        else [node.target]
+                                    )
+                                )
+                                for node in ast.walk(tree)
+                            )
+                            # 키 리터럴은 파일의 인용 스타일(' 또는 ")과 무관하게 인정.
+                            found_impl = has_registry and bool(
+                                re.search(
+                                    rf"['\"]{re.escape(key_literal)}['\"]",
+                                    sf_content,
+                                )
+                            )
                     elif owner:
                         for node in ast.walk(tree):
                             if isinstance(node, ast.ClassDef) and node.name == owner:
