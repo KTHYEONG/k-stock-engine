@@ -833,7 +833,7 @@ class GrowthRouteEvidence:
     filled_orders: int = 0
     filled_cycle_count: int = 0
     sparse_minus_dense_lower_growth: float = 0.0
-    turnover_ratio: float = 0.0
+    turnover_ratio: float | None = None
     route_version: str = GROWTH_ROUTE_VERSION
     seed_policy: PolicyKey | None = None
     benchmark_reconcile_failure: str = ""
@@ -880,8 +880,10 @@ class GrowthRouteEvidence:
             raise ValueError("route fill counts must be non-negative")
         if not np.isfinite(self.sparse_minus_dense_lower_growth):
             raise ValueError("sparse_minus_dense_lower_growth must be finite")
-        if not np.isfinite(self.turnover_ratio) or self.turnover_ratio < 0.0:
-            raise ValueError("turnover_ratio must be a finite non-negative value")
+        if self.turnover_ratio is not None and (
+            not np.isfinite(self.turnover_ratio) or self.turnover_ratio < 0.0
+        ):
+            raise ValueError("turnover_ratio must be None or a finite non-negative value")
 
     @property
     def invested_interval_fraction(self) -> float:
@@ -1115,8 +1117,10 @@ def stitch_prequential_growth_route(
             )
             if paired_boot is not None:
                 paired_deltas.append(paired_boot.lower_mean(bootstrap_alpha))
-        shadow_turnover = max(float(chosen.shadow_turnover), 1e-12)
-        turnover_ratios.append(float(chosen.sparse_turnover) / shadow_turnover)
+        if chosen.shadow_turnover > 0.0:
+            turnover_ratios.append(
+                float(chosen.sparse_turnover) / float(chosen.shadow_turnover)
+            )
 
     return GrowthRouteEvidence(
         base_log_growth=tuple(base_out),
@@ -1136,7 +1140,9 @@ def stitch_prequential_growth_route(
         sparse_minus_dense_lower_growth=(
             float(np.mean(paired_deltas)) if paired_deltas else 0.0
         ),
-        turnover_ratio=float(np.mean(turnover_ratios)) if turnover_ratios else 0.0,
+        turnover_ratio=(
+            float(np.mean(turnover_ratios)) if turnover_ratios else None
+        ),
         route_version="v2" if seed_spliced else GROWTH_ROUTE_VERSION,
         seed_policy=seed_policy,
     )

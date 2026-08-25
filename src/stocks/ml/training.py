@@ -263,6 +263,9 @@ class HorizonDiscovery:
         default_factory=dict
     )
     horizon_memory: Mapping[int, dict[str, object]] = field(default_factory=dict)
+    sizing_diagnostics_by_candidate: Mapping[
+        tuple[int, int, int, str], dict[str, object]
+    ] = field(default_factory=dict)
     oof_cache: _OofCache | None = field(
         default=None, compare=False, hash=False, repr=False
     )
@@ -1282,6 +1285,7 @@ def _risk_policy_for_profile(
         economic_ranking_mode="economic_net_v1",
         execution_utility_mode=profile.execution_utility_mode,
         sizing_mode=profile.sizing_mode,
+        retained_sizing_mode=("band_limited_rewaterfill_v1" if request.enable_sparse_retained_rewaterfill else "freeze_v1"),
     )
 
 
@@ -1357,6 +1361,80 @@ def _require_caller_registry(
             "contexts; repository-relative mem: roots are never created"
         )
     return registry
+
+
+def _sizing_diagnostics_summary(
+    records: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    """Bounded JSON-safe sizing summary over per-decision compounding records.
+
+    Surfaces the confidence-scale and gross distributions that explain realized
+    exposure without ever emitting raw per-decision records. Empty input yields
+    zero counts with ``None`` floats; quantiles use ``np.quantile`` on the fixed
+    value array so output is deterministic given the records.
+    """
+
+    def _float_or_none(value: object) -> float | None:
+        try:
+            parsed = float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        return parsed if math.isfinite(parsed) else None
+
+    scales = [
+        scale
+        for scale in (
+            _float_or_none(record.get("confidence_scale")) for record in records
+        )
+        if scale is not None
+    ]
+    gross_before = [
+        gross
+        for gross in (
+            _float_or_none(record.get("gross_before_compounding"))
+            for record in records
+        )
+        if gross is not None
+    ]
+    gross_after = [
+        gross
+        for gross in (
+            _float_or_none(record.get("gross_after_compounding"))
+            for record in records
+        )
+        if gross is not None
+    ]
+    full_sources = sum(
+        1
+        for record in records
+        if str(record.get("covariance_source", "")) == "full"
+    )
+
+    def _quantile(values: list[float], q: float) -> float | None:
+        if not values:
+            return None
+        return float(np.quantile(np.asarray(values, dtype=float), q))
+
+    def _mean(values: list[float]) -> float | None:
+        if not values:
+            return None
+        return float(sum(values) / len(values))
+
+    return {
+        "decision_count": len(records),
+        "cash_decision_count": sum(
+            1 for record in records if record.get("cash_reason") is not None
+        ),
+        "confidence_scale_mean": _mean(scales),
+        "confidence_scale_p10": _quantile(scales, 0.1),
+        "confidence_scale_p50": _quantile(scales, 0.5),
+        "confidence_scale_p90": _quantile(scales, 0.9),
+        "gross_before_compounding_mean": _mean(gross_before),
+        "gross_after_compounding_mean": _mean(gross_after),
+        "covariance_source_full_fraction": (
+            full_sources / len(records) if records else None
+        ),
+    }
 
 
 def _cadence_decision_sessions(
@@ -1487,6 +1565,7 @@ def _replay_costs_batch(
     specs: Sequence[tuple[int, int, PolicyProfile]],
     *,
     stats_out: dict[str, int] | None = None,
+    sizing_out: dict[tuple[int, int, int, str], dict[str, object]] | None = None,
 ) -> Mapping[tuple[int, int, int, str], ProfileReplayEvidence]:
     """Cadence-group batch replay: one prepared batch per cadence, shared across profiles.
 
@@ -1641,6 +1720,10 @@ def _replay_costs_batch(
             )
             if primary_ev is None:
                 continue
+            if sizing_out is not None:
+                sizing_out[key] = _sizing_diagnostics_summary(
+                    batch_replay_requests[idx].context.risk_policy.compounding_evidence
+                )
             if not is_v5:
                 results[key] = ProfileReplayEvidence(candidate=primary_ev, dense_shadow=None)
             else:
@@ -1890,6 +1973,9 @@ def _build_horizon_evidence(
     diagnostics: list[HorizonOOFDiagnostic] = []
     oof_by_horizon: dict[int, tuple[Path, Path, list[float]]] = {}
     dropout_reasons: dict[tuple[int, int, int, str], str] = {}
+    sizing_diagnostics_by_candidate: dict[
+        tuple[int, int, int, str], dict[str, object]
+    ] = {}
     execution_evidence_by_candidate: dict[
         tuple[int, int, int, str], ExecutionReplayEvidence
     ] = {}
@@ -2005,12 +2091,15 @@ def _build_horizon_evidence(
                 )
                 if not replay_envelope.ok:
                     raise _MemoryBudgetExceededError("replay")
+                sizing_by_candidate: dict[tuple[int, int, int, str], dict[str, object]] = {}
                 batch_results = _replay_costs_batch(
                     _require_caller_registry(registry), calibrated, oof_labels,
                     request, horizon,
                     request.risk, pre_holdout, data.manifest, candidate_specs,
                     stats_out=replay_stats,
+                    sizing_out=sizing_by_candidate,
                 )
+                sizing_diagnostics_by_candidate.update(sizing_by_candidate)
                 for cadence, top_k, profile in candidate_specs:
                     key = (horizon, cadence, top_k, profile.profile_id)
                     pair = batch_results.get(key)
@@ -2153,6 +2242,7 @@ def _build_horizon_evidence(
         execution_evidence_by_candidate=execution_evidence_by_candidate,
         coverage_by_horizon=coverage_by_horizon,
         horizon_memory=horizon_memory,
+        sizing_diagnostics_by_candidate=sizing_diagnostics_by_candidate,
         oof_cache=oof_cache,
         path_evaluation_count=path_evaluation_count,
         path_evaluation_bound=(
@@ -3716,6 +3806,7 @@ def _policy_profile_params(
             "economic_ranking_mode": policy.economic_ranking_mode,
             "execution_utility_mode": profile.execution_utility_mode,
             "sizing_mode": profile.sizing_mode,
+            "retained_sizing_mode": policy.retained_sizing_mode,
         },
         sort_keys=True,
     )
@@ -3857,6 +3948,12 @@ def _policy_frontier_projection(
         "execution_evidence": _segment_summaries(
             discovery.execution_evidence_by_candidate, selected_profile_id
         ),
+        "sizing_diagnostics": {
+            f"{horizon}:{cadence}:{top_k}:{profile_id}": dict(summary)
+            for (horizon, cadence, top_k, profile_id), summary in sorted(
+                discovery.sizing_diagnostics_by_candidate.items()
+            )
+        },
         "blend_lower_growth": _blend_lower_growth_projection(
             discovery,
             bootstrap_alpha=request.bootstrap_alpha,
@@ -4049,7 +4146,9 @@ def _growth_route_projection(
         "sparse_minus_dense_lower_growth": round(
             float(route.sparse_minus_dense_lower_growth), 12
         ),
-        "turnover_ratio": round(float(route.turnover_ratio), 12),
+        "turnover_ratio": (
+            None if route.turnover_ratio is None else round(float(route.turnover_ratio), 12)
+        ),
         "benchmark_reconcile_failure": str(route.benchmark_reconcile_failure)[:96],
         "hedge_sleeve_projection": hedge_projection,
         "rejection_reason_counts": dict(sorted(rejection_counts.items())),
