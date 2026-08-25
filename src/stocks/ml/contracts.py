@@ -84,7 +84,8 @@ LOWER_BOUND_ONLY_PROFILE_ID = "lower_bound_only"
 LOWER_BOUND_HALF_KELLY_PROFILE_ID = "lower_bound_half_kelly"
 DEFAULT_POLICY_PROFILE_IDS = (LEGACY_OVERLAY_PROFILE_ID, LOWER_BOUND_ONLY_PROFILE_ID, LOWER_BOUND_HALF_KELLY_PROFILE_ID)
 EXCESS_FULL_KELLY_PROFILE_ID = "excess_full_kelly"
-ALLOWED_EXTRA_PROFILE_IDS = (EXCESS_FULL_KELLY_PROFILE_ID,)
+GROWTH_FULL_UTILIZATION_PROFILE_ID = "growth_full_utilization"
+ALLOWED_EXTRA_PROFILE_IDS = (EXCESS_FULL_KELLY_PROFILE_ID, GROWTH_FULL_UTILIZATION_PROFILE_ID)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,8 +105,10 @@ class PolicyProfile:
     extra overlay; ``lower_bound_half_kelly`` uses half-Kelly exposure
     (aversion=2). ``single_name_cap_override`` raises the single-name cap to
     at most the equal-weight basis ``1/top_k``; ``gross_utilization_target``
-    normalizes deployed gross toward that fraction of equity (both still
-    clamped by the request portfolio caps).
+    normalizes deployed gross toward that fraction of equity; and
+    ``vol_target_override`` replaces the canonical 12% annual volatility
+    budget with a declared value (all three still clamped by the request
+    portfolio caps).
     """
 
     profile_id: str
@@ -115,6 +118,7 @@ class PolicyProfile:
     sizing_mode: Literal["alpha_vol_squared_v1", "risk_balanced_waterfill_v2", "confidence_mean_variance_v1"] = "alpha_vol_squared_v1"
     single_name_cap_override: float | None = None
     gross_utilization_target: float | None = None
+    vol_target_override: float | None = None
 
     def __post_init__(self) -> None:
         if not self.profile_id:
@@ -123,7 +127,11 @@ class PolicyProfile:
             raise ValueError("no_trade_band_bps must be a finite non-negative value")
         if not np.isfinite(self.growth_risk_aversion) or self.growth_risk_aversion <= 0.0:
             raise ValueError("growth_risk_aversion must be a finite strictly positive value")
-        for field_name in ("single_name_cap_override", "gross_utilization_target"):
+        for field_name in (
+            "single_name_cap_override",
+            "gross_utilization_target",
+            "vol_target_override",
+        ):
             value = getattr(self, field_name)
             if value is None:
                 continue
@@ -320,10 +328,10 @@ def validate_policy_profiles(profiles: tuple[PolicyProfile, ...]) -> tuple[Polic
 
     Raises ``ValueError`` on an empty frontier, a duplicate profile id, a
     missing default profile, or an unexpected extra profile. The opt-in
-    ``excess_full_kelly`` rung is the sole permitted extra and must be
-    appended after the defaults. The frontier is pre-registered: the discovery
-    grid replays every cached OOF score under these exact policies and never
-    refits a learner per profile.
+    ``excess_full_kelly`` and ``growth_full_utilization`` rungs are the only
+    permitted extras and must be appended after the defaults. The frontier is
+    pre-registered: the discovery grid replays every cached OOF score under
+    these exact policies and never refits a learner per profile.
     """
     if not profiles:
         raise ValueError("policy frontier requires at least one profile")
