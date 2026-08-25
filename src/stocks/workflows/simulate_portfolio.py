@@ -293,6 +293,30 @@ def _profile_forecast_horizon_sessions(profile: dict[str, object]) -> int | None
     return raw
 
 
+def _profile_vol_target_override(profile: dict[str, object]) -> float | None:
+    """Extract vol_target_override from a policy profile, defaulting to None.
+
+    ``None`` keeps the canonical 12% annual volatility default so legacy
+    payloads replay unchanged. A present value must be finite in (0, 1];
+    anything else fails closed before the backtester can diverge from the
+    certifying artifact.
+    """
+    raw = profile.get("vol_target_override")
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError(
+            "vol_target_override must be a number in (0, 1], "
+            f"got {type(raw).__name__}"
+        )
+    value = float(raw)
+    if not math.isfinite(value) or not 0.0 < value <= 1.0:
+        raise ValueError(
+            f"vol_target_override must be finite in (0, 1], got {value!r}"
+        )
+    return value
+
+
 def _profile_sizing_mode(
     profile: dict[str, object],
 ) -> Literal[
@@ -440,6 +464,10 @@ def _policy_from_artifact(
     mode = _profile_execution_utility_mode(profile)
     sizing = _profile_sizing_mode(profile)
     stored_cadence = _profile_rebalance_frequency_sessions(profile)
+    vol_override = _profile_vol_target_override(profile)
+    policy_kwargs: dict[str, object] = {}
+    if vol_override is not None:
+        policy_kwargs["target_annual_volatility"] = min(vol_override, 1.0)
     return StockRiskPolicy(
         top_k=cast(int, profile["top_k"]),
         gross_cap=cast(float, profile["max_exposure"]),
@@ -455,6 +483,7 @@ def _policy_from_artifact(
         execution_utility_mode=mode,
         sizing_mode=sizing,
         retained_sizing_mode=_profile_retained_sizing_mode(profile),
+        **policy_kwargs,  # type: ignore[arg-type]
     )
 
 
@@ -480,6 +509,10 @@ def _reconstruct_v7_policy(
         raise ValueError(
             "v7 rebalance_frequency_sessions must equal forecast_horizon_sessions"
         )
+    vol_override = _profile_vol_target_override(profile)
+    policy_kwargs: dict[str, object] = {}
+    if vol_override is not None:
+        policy_kwargs["target_annual_volatility"] = min(vol_override, 1.0)
     policy = StockRiskPolicy(
         top_k=cast(int, profile["top_k"]),
         gross_cap=cast(float, profile["max_exposure"]),
@@ -495,6 +528,7 @@ def _reconstruct_v7_policy(
         execution_utility_mode=mode,
         sizing_mode=sizing,
         retained_sizing_mode=_profile_retained_sizing_mode(profile),
+        **policy_kwargs,  # type: ignore[arg-type]
     )
     _validate_v7_policy_profile(profile, policy)
     return policy
@@ -661,6 +695,10 @@ def _validate_prepared_equity_policy(
     mode = _profile_execution_utility_mode(profile)
     sizing = _profile_sizing_mode(profile)
     stored_cadence = _profile_rebalance_frequency_sessions(profile)
+    vol_override = _profile_vol_target_override(profile)
+    policy_kwargs: dict[str, object] = {}
+    if vol_override is not None:
+        policy_kwargs["target_annual_volatility"] = min(vol_override, 1.0)
     policy = StockRiskPolicy(
         top_k=request.top_k,
         gross_cap=request.max_exposure,
@@ -676,6 +714,7 @@ def _validate_prepared_equity_policy(
         execution_utility_mode=mode,
         sizing_mode=sizing,
         retained_sizing_mode=_profile_retained_sizing_mode(profile),
+        **policy_kwargs,  # type: ignore[arg-type]
     )
     if stock_risk_policy_fingerprint(policy) != profile["risk_policy_fingerprint"]:
         raise ValueError(

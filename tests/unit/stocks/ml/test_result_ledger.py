@@ -1074,3 +1074,55 @@ def test_growth_route_04_no_trade_observability(tmp_path) -> None:
     assert "stress_log_growth" not in dumped
     assert "benchmark_log_growth" not in dumped
     assert "interval_policies" not in dumped
+
+
+def test_SCENARIO_LEDGER_HEDGE_COMPACTION_06() -> None:
+    """SCENARIO_LEDGER_HEDGE_COMPACTION_06."""
+    from src.stocks.ml.result_ledger import _compact_hedge_sleeve
+
+    route = {
+        "hedge_sleeve_projection": {
+            "leverage_rung_count": 3,
+            "admissible_rung_count": 2,
+            "max_admissible_leverage": 1.5,
+            "vol_managed_max_admissible_leverage": 2.0,
+            "excess_point_cagr": 0.140053315782,
+            "best_rungs": {
+                "static": {
+                    "leverage": 1.5,
+                    "point_cagr": 0.21,
+                    "stress_cagr": 0.11,
+                    "projected_mdd": 0.2134,
+                    "margin_buffer": 0.775,
+                    "projected_vol": 0.42,
+                },
+                "vol_managed": {
+                    "leverage": 2.0,
+                    "point_cagr": 0.26,
+                    "stress_cagr": 0.14,
+                    "projected_mdd": 0.114,
+                    "margin_buffer": 0.7,
+                },
+            },
+        }
+    }
+    summary = _compact_hedge_sleeve(route)
+    assert summary["max_admissible_leverage"] == 1.5
+    assert summary["excess_point_cagr"] == 0.140053315782
+    best = summary["best_rungs"]
+    assert set(best) == {"static", "vol_managed"}
+    assert best["static"] == {
+        "leverage": 1.5,
+        "point_cagr": 0.21,
+        "stress_cagr": 0.11,
+        "projected_mdd": 0.2134,
+        "margin_buffer": 0.775,
+    }
+    assert "projected_vol" not in best["static"]
+
+    # absent or malformed blocks stay omitted; legacy payloads are unchanged
+    assert "best_rungs" not in _compact_hedge_sleeve(
+        {"hedge_sleeve_projection": {"excess_point_cagr": 0.1}}
+    )
+    legacy = _compact_hedge_sleeve({})
+    assert legacy == {}
