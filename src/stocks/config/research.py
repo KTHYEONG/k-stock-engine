@@ -54,6 +54,13 @@ _EXCESS_FULL_KELLY_GROSS_UTILIZATION = 0.92
 _GROWTH_FULL_UTILIZATION_GROSS_UTILIZATION = 0.95
 _GROWTH_FULL_UTILIZATION_VOL_TARGET = 0.20
 
+# Declared execution-conversion limits: the canonical 0.5% participation cap
+# and 0.20 turnover budget saturate every decision and collapse target
+# differences before fills; the rung declares looser pre-registered limits
+# while the liquidity slippage model still prices the impact.
+_GROWTH_FULL_UTILIZATION_PARTICIPATION = 0.02
+_GROWTH_FULL_UTILIZATION_TURNOVER_BUDGET = 0.40
+
 
 def policy_profiles_with_excess_full_kelly() -> tuple[PolicyProfile, ...]:
     """Opt-in profile ladder adding the excess-full-Kelly rung.
@@ -99,6 +106,8 @@ def policy_profiles_with_growth_rungs() -> tuple[PolicyProfile, ...]:
             single_name_cap_override=_EXCESS_FULL_KELLY_SINGLE_NAME_CEILING,
             gross_utilization_target=_GROWTH_FULL_UTILIZATION_GROSS_UTILIZATION,
             vol_target_override=_GROWTH_FULL_UTILIZATION_VOL_TARGET,
+            participation_limit_override=_GROWTH_FULL_UTILIZATION_PARTICIPATION,
+            turnover_budget_override=_GROWTH_FULL_UTILIZATION_TURNOVER_BUDGET,
         ),
     )
 
