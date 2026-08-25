@@ -22,10 +22,15 @@ from src.stocks.compatibility import (
 from src.stocks.ml.contracts import (
     DEFAULT_POLICY_PROFILES,
     EXCESS_FULL_KELLY_PROFILE_ID,
+    GROWTH_FULL_UTILIZATION_PROFILE_ID,
     PolicyProfile,
 )
 
-__all__ = ["EXCESS_FULL_KELLY_PROFILE_ID", "CanonicalResearchProfile"]
+__all__ = [
+    "EXCESS_FULL_KELLY_PROFILE_ID",
+    "GROWTH_FULL_UTILIZATION_PROFILE_ID",
+    "CanonicalResearchProfile",
+]
 
 
 class ParameterSource(StrEnum):
@@ -43,6 +48,11 @@ class ParameterSource(StrEnum):
 # request build time; 0.16 admits the K=8 basis fully while staying finite.
 _EXCESS_FULL_KELLY_SINGLE_NAME_CEILING = 0.16
 _EXCESS_FULL_KELLY_GROSS_UTILIZATION = 0.92
+
+# Growth-utilization rung: declares its own annual volatility budget so the
+# canonical 12% default no longer silently dilutes the utilization target.
+_GROWTH_FULL_UTILIZATION_GROSS_UTILIZATION = 0.95
+_GROWTH_FULL_UTILIZATION_VOL_TARGET = 0.20
 
 
 def policy_profiles_with_excess_full_kelly() -> tuple[PolicyProfile, ...]:
@@ -65,6 +75,30 @@ def policy_profiles_with_excess_full_kelly() -> tuple[PolicyProfile, ...]:
             sizing_mode="risk_balanced_waterfill_v2",
             single_name_cap_override=_EXCESS_FULL_KELLY_SINGLE_NAME_CEILING,
             gross_utilization_target=_EXCESS_FULL_KELLY_GROSS_UTILIZATION,
+        ),
+    )
+
+
+def policy_profiles_with_growth_rungs() -> tuple[PolicyProfile, ...]:
+    """Opt-in ladder adding the excess-full-Kelly and growth-utilization rungs.
+
+    The ``growth_full_utilization`` rung extends the excess-full-Kelly rung
+    with a declared 20% annual volatility budget and a 95% gross utilization
+    target, so deployed exposure is governed by the declared risk policy
+    rather than the canonical 12% default. Flag-off runs stay byte-identical;
+    cadence scheduling and dense-shadow gating stay uniform across the ladder.
+    """
+    return (
+        *policy_profiles_with_excess_full_kelly(),
+        PolicyProfile(
+            profile_id=GROWTH_FULL_UTILIZATION_PROFILE_ID,
+            no_trade_band_bps=0.0,
+            growth_risk_aversion=1.0,
+            execution_utility_mode="sparse_hold_replace_v2",
+            sizing_mode="risk_balanced_waterfill_v2",
+            single_name_cap_override=_EXCESS_FULL_KELLY_SINGLE_NAME_CEILING,
+            gross_utilization_target=_GROWTH_FULL_UTILIZATION_GROSS_UTILIZATION,
+            vol_target_override=_GROWTH_FULL_UTILIZATION_VOL_TARGET,
         ),
     )
 

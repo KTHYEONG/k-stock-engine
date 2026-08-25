@@ -1206,3 +1206,80 @@ def test_economic_family_study_05_catalog_snapshot_runs_once(
     settings = captured["settings"]
     assert settings.candidate_lookback_sessions == (504, 756, None)
     assert settings.model_families[0] == "net_alpha_elastic_net"
+
+
+def test_SCENARIO_CLI_GROWTH_RUNG_FLAG_07() -> None:
+    """SCENARIO_CLI_GROWTH_RUNG_FLAG_07."""
+    from src.stocks.ml.contracts import DEFAULT_POLICY_PROFILES
+
+    parser = train.build_parser()
+    args = parser.parse_args(
+        [
+            "--artifact-id",
+            "a1",
+            "--snapshot-id",
+            "s1",
+            "--enable-growth-utilization-rung",
+        ]
+    )
+    request = train._build_training_request(args)
+    assert [p.profile_id for p in request.policy_profiles] == [
+        "legacy_overlay_5bps",
+        "lower_bound_only",
+        "lower_bound_half_kelly",
+        "excess_full_kelly",
+        "growth_full_utilization",
+    ]
+    assert request.policy_profiles[-1].vol_target_override == 0.20
+    assert request.policy_profiles[-1].gross_utilization_target == 0.95
+
+    default_request = train._build_training_request(
+        train.build_parser().parse_args(["--artifact-id", "a1", "--snapshot-id", "s1"])
+    )
+    assert default_request.policy_profiles == DEFAULT_POLICY_PROFILES
+
+
+def test_SCENARIO_CLI_CERT_MAX_DRAWDOWN_08() -> None:
+    """SCENARIO_CLI_CERT_MAX_DRAWDOWN_08."""
+    from src.stocks.ml.contracts import CompoundingCertificationSettings
+
+    parser = train.build_parser()
+    args = parser.parse_args(
+        [
+            "--artifact-id",
+            "a1",
+            "--snapshot-id",
+            "s1",
+            "--cert-max-drawdown",
+            "0.3",
+        ]
+    )
+    request = train._build_training_request(args)
+    assert request.compounding.max_drawdown == 0.3
+    canonical = CompoundingCertificationSettings()
+    assert request.compounding.annualization_sessions == canonical.annualization_sessions
+    assert request.compounding.min_observed_sessions == canonical.min_observed_sessions
+    assert (
+        request.compounding.min_active_cohort_fraction
+        == canonical.min_active_cohort_fraction
+    )
+    assert request.compounding.bootstrap_alpha == canonical.bootstrap_alpha
+
+    default_request = train._build_training_request(
+        train.build_parser().parse_args(["--artifact-id", "a1", "--snapshot-id", "s1"])
+    )
+    assert default_request.compounding.max_drawdown == 0.5
+
+    with pytest.raises(ValueError, match="max_drawdown"):
+        train._build_training_request(
+            parser.parse_args(
+                [
+                    "--artifact-id",
+                    "a1",
+                    "--snapshot-id",
+                    "s1",
+                    "--cert-max-drawdown",
+                    "1.5",
+                ]
+            )
+        )

@@ -359,3 +359,30 @@ class TestFrontierProfileScope:
         assert len(
             frontier.feasible_cells_for_profile(0.9, 0.08, single_name_cap_override=0.16)
         ) == 1
+
+
+class TestVolTargetOverride:
+    """SCENARIO_VOL_TARGET_OVERRIDE_VALIDATION_01."""
+
+    def test_SCENARIO_VOL_TARGET_OVERRIDE_VALIDATION_01(self) -> None:
+        from src.stocks.ml.contracts import GROWTH_FULL_UTILIZATION_PROFILE_ID
+
+        profile = PolicyProfile(profile_id="x", vol_target_override=0.2)
+        assert profile.vol_target_override == 0.2
+        assert PolicyProfile(profile_id="x").vol_target_override is None
+        for bad in (0.0, -0.1, float("nan"), float("inf"), 1.0000001):
+            with pytest.raises(ValueError, match="vol_target_override"):
+                PolicyProfile(profile_id="x", vol_target_override=bad)
+
+        # unknown extras stay rejected; the growth rung is admitted as an extra
+        with pytest.raises(ValueError, match="not permitted"):
+            validate_policy_profiles(
+                (*DEFAULT_POLICY_PROFILES, PolicyProfile("unknown_extra", 0.0))
+            )
+        allowed = validate_policy_profiles(
+            (
+                *DEFAULT_POLICY_PROFILES,
+                PolicyProfile(GROWTH_FULL_UTILIZATION_PROFILE_ID, 0.0),
+            )
+        )
+        assert allowed[-1].profile_id == GROWTH_FULL_UTILIZATION_PROFILE_ID

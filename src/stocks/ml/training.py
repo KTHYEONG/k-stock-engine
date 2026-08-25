@@ -1277,6 +1277,16 @@ def _risk_policy_for_profile(
     gross_cap = request.portfolio.max_exposure
     if profile.gross_utilization_target is not None:
         gross_cap = min(profile.gross_utilization_target, request.portfolio.max_exposure)
+    # Declared risk budget replaces the canonical 12% default; the one-sided
+    # scaler and post-validation cap honor it unchanged.
+    vol_target = (
+        float(min(profile.vol_target_override, 1.0))
+        if profile.vol_target_override is not None
+        else None
+    )
+    policy_kwargs: dict[str, object] = {}
+    if vol_target is not None:
+        policy_kwargs["target_annual_volatility"] = vol_target
     return StockRiskPolicy(
         top_k=top_k,
         gross_cap=gross_cap,
@@ -1292,6 +1302,7 @@ def _risk_policy_for_profile(
         execution_utility_mode=profile.execution_utility_mode,
         sizing_mode=profile.sizing_mode,
         retained_sizing_mode=("band_limited_rewaterfill_v1" if request.enable_sparse_retained_rewaterfill else "freeze_v1"),
+        **policy_kwargs,  # type: ignore[arg-type]
     )
 
 
@@ -3880,6 +3891,7 @@ def _policy_profile_params(
             "execution_utility_mode": profile.execution_utility_mode,
             "sizing_mode": profile.sizing_mode,
             "retained_sizing_mode": policy.retained_sizing_mode,
+            "vol_target_override": profile.vol_target_override,
         },
         sort_keys=True,
     )
@@ -4163,6 +4175,38 @@ def _growth_route_projection(
             ladder_rows = cast(
                 'list[dict[str, object]]', projection_payload['leverage_ladder']
             )
+
+            def _best_admissible_rung(
+                variant: str,
+            ) -> dict[str, object] | None:
+                rows = [
+                    row
+                    for row in ladder_rows
+                    if row["variant"] == variant and bool(row.get("admissible"))
+                ]
+                if not rows:
+                    return None
+                best = max(rows, key=lambda row: float(cast('float', row['leverage'])))
+                return {
+                    "leverage": round(float(cast('float', best['leverage'])), 12),
+                    "point_cagr": round(float(cast('float', best['point_cagr'])), 12),
+                    "stress_cagr": round(float(cast('float', best['stress_cagr'])), 12),
+                    "projected_mdd": round(
+                        float(cast('float', best['projected_mdd'])), 12
+                    ),
+                    "margin_buffer": round(
+                        float(cast('float', best['margin_buffer'])), 12
+                    ),
+                }
+
+            best_rungs = {
+                variant: rung
+                for variant, rung in (
+                    ("static", _best_admissible_rung("static")),
+                    ("vol_managed", _best_admissible_rung("vol_managed")),
+                )
+                if rung is not None
+            }
             static_admissible = [
                 cast("float", rung["leverage"])
                 for rung in ladder_rows
@@ -4185,6 +4229,7 @@ def _growth_route_projection(
                 "excess_point_cagr": round(
                     cast("float", projection_payload["excess_point_cagr"]), 12
                 ),
+                "best_rungs": best_rungs,
             }
         except ValueError:
             hedge_projection = {}
