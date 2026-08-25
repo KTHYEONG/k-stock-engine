@@ -15,6 +15,7 @@ from src.stocks.ml.training import _risk_policy_for_profile
 
 def _request(max_exposure: float = 0.90):
     return SimpleNamespace(
+        enable_sparse_retained_rewaterfill=False,
         portfolio=SimpleNamespace(
             max_exposure=max_exposure,
             max_single_weight=0.08,

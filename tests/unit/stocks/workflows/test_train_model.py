@@ -725,3 +725,53 @@ def test_cadence_decision_monotone_pure_kernel() -> None:
 
     with pytest.raises(ValueError, match="frequency_sessions must be positive"):
         _cadence_decision_sessions(sessions, 0)
+
+
+def test_SPARSE_REWATERFILL_05_REQUEST_CLI_THREADING() -> None:
+    """SPARSE_REWATERFILL_05_REQUEST_CLI_THREADING.
+
+    The opt-in flag threads request -> risk policy -> ledger projection:
+    flagged requests build a band_limited_rewaterfill_v1 policy mode, defaults
+    stay freeze_v1, the CLI parser accepts the flag, and flagged/unflagged
+    request projections carry distinct fingerprints.
+    """
+    from src.stocks.cli.train import _build_training_request
+    from src.stocks.ml.result_ledger import _project_request
+    from src.stocks.ml.training import _risk_policy_for_profile
+
+    request = NetAlphaTrainingRequest(
+        artifact_id="rewaterfill",
+        enable_sparse_retained_rewaterfill=True,
+    )
+    default_request = NetAlphaTrainingRequest(artifact_id="defaults")
+    profile = request.policy_profiles[1]
+    assert (
+        _risk_policy_for_profile(
+            request, profile, 10, rebalance_frequency_sessions=5, top_k=12
+        ).retained_sizing_mode
+        == "band_limited_rewaterfill_v1"
+    )
+    assert (
+        _risk_policy_for_profile(
+            default_request, profile, 10, rebalance_frequency_sessions=5, top_k=12
+        ).retained_sizing_mode
+        == "freeze_v1"
+    )
+
+    args = build_parser().parse_args(
+        ["--artifact-id", "flagged", "--enable-sparse-retained-rewaterfill"]
+    )
+    assert _build_training_request(args).enable_sparse_retained_rewaterfill is True
+    default_args = build_parser().parse_args(["--artifact-id", "defaults"])
+    assert (
+        _build_training_request(default_args).enable_sparse_retained_rewaterfill is False
+    )
+
+    flagged_projection = _project_request(request)
+    default_projection = _project_request(default_request)
+    assert flagged_projection["enable_sparse_retained_rewaterfill"] is True
+    assert default_projection["enable_sparse_retained_rewaterfill"] is False
+    assert (
+        flagged_projection["request_fingerprint"]
+        != default_projection["request_fingerprint"]
+    )
