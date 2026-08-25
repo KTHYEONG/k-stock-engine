@@ -753,6 +753,17 @@ def build_parser() -> argparse.ArgumentParser:
             "single-name basis and gross utilization target)"
         ),
     )
+    parser.add_argument(
+        "--holm-family-scope",
+        choices=["frontier", "route_gatekeeping"],
+        default="frontier",
+        help=(
+            "Multiplicity scope: 'route_gatekeeping' demotes per-cell Holm "
+            "admission to diagnostics while the route certificate carries "
+            "the strategy-level hypothesis"
+        ),
+    )
+    parser.add_argument("--discovery-workers", type=int, default=1)
     return parser
 
 
@@ -804,6 +815,9 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
         seed=args.seed,
         discovery_model_family=args.discovery_model_family,
         enable_horizon_blend=bool(getattr(args, 'enable_horizon_blend', False)),
+        # Validation of the literal happens in NetAlphaTrainingRequest.__post_init__.
+        holm_family_scope=str(getattr(args, 'holm_family_scope', 'frontier')),  # type: ignore[arg-type]
+        discovery_workers=int(getattr(args, 'discovery_workers', 1)),
         policy_profiles=policy_profiles,
         portfolio=PortfolioSettings(
             top_k=args.top_k,
