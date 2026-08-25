@@ -753,6 +753,11 @@ def build_parser() -> argparse.ArgumentParser:
             "single-name basis and gross utilization target)"
         ),
     )
+    rewaterfill_help = (
+        "Opt in to band-limited retained re-waterfill sizing under "
+        "sparse_hold_replace_v2 execution"
+    )
+    parser.add_argument("--enable-sparse-retained-rewaterfill", action="store_true", help=rewaterfill_help)
     parser.add_argument(
         "--holm-family-scope",
         choices=["frontier", "route_gatekeeping"],
@@ -818,6 +823,7 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
         # Validation of the literal happens in NetAlphaTrainingRequest.__post_init__.
         holm_family_scope=str(getattr(args, 'holm_family_scope', 'frontier')),  # type: ignore[arg-type]
         discovery_workers=int(getattr(args, 'discovery_workers', 1)),
+        enable_sparse_retained_rewaterfill=bool(getattr(args, 'enable_sparse_retained_rewaterfill', False)),
         policy_profiles=policy_profiles,
         portfolio=PortfolioSettings(
             top_k=args.top_k,
