@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ADR_20260825_ml_execution_conversion_unlock",
+      "date": "2026-08-25",
+      "adr_id": "ADR_20260825_ADR_20260825_ml_execution_conversion_unlock",
+      "domain": "execution",
+      "title": "Execution conversion unlock: declared participation/turnover limits and clamp telemetry",
+      "why": "프로덕션 A/B(ml_growth_rung_ab_20260825)에서 decision 타겟 gross 0.85 vs 0.70 차이에도 체결 evidence가 바이트 동일로 전환이 상실됨. 코드 추적으로 근원 확정: sparse v5 분기에는 참여 클램프가 부재해 post-validate 전면 거부로 전환 버려짐, generic/delta 분기는 participation_limit=0.005 가중치 이동 캡이 포화, engine.py가 동일 0.005 상수를 이중 하드코딩하며 잘림이 텔레메트리 비가시.",
+      "resolution": "PolicyProfile에 participation_limit_override((0,1])와 turnover_budget_override([0,1)) 선언 필드 추가, growth_full_utilization 러닝에 0.02/0.40 선언, 학습 주입과 시뮬레이터 재구성 3곳을 공용 _profile_policy_kwargs로 통일해 fingerprint parity 확보. sparse 분기에 _apply_participation_clamp 신규 적용으로 post-validate fail-closed 대신 캡 내 부분 이동 허용, 세 분기 클램프 포기분을 compounding record(participation_clamped_count/name_count)와 sizing 집계(turnover_lambda_mean/participation_clamped_fraction)로 서피싱, 엔진 capacity 클립을 partial-capacity reason과 capacity_clipped_count/partial_fill_count 메트릭 체인(ExecutionReplayEvidence.base_capacity_clipped_orders)까지 노출.",
+      "impact": "재실행 A/B(ml_growth_rung_ab2_20260825)에서 성장 러닝 전 8셀 노출 0.78~0.83 도달(ab1 0.64~0.71 대비 +11~15%p), participation_clamped_fraction=0.0과 capacity_clipped_orders=0으로 두 클램프 해제 데이터 확정, 대조군 20셀은 바이트 동일 유지. M1 게이트(base_exposure>=0.78) 달성. 다음 병목은 seed/route 선발 계층. 시나리오 7건 신규, 회귀 649 passed."
+    },
+    {
       "task_id": "ADR_20260825_ml_growth_utilization_rung",
       "date": "2026-08-25",
       "adr_id": "ADR_20260825_ADR_20260825_ml_growth_utilization_rung",
@@ -989,16 +999,6 @@
       "why": "Record ADTV cache regression recovery and latest 80-trial economic replay results.",
       "resolution": "Added causal ADTV to replay static context, restored candidate orders/fills, and documented per-candidate bootstrap failures with fail-closed NO_TRADE.",
       "impact": "Candidate replay is valid and observable; all eight shortlisted candidates remain unpromoted because bootstrap excess lower bounds are negative."
-    },
-    {
-      "task_id": "TASK_STOCK_LAMBDARANK_ECONOMIC_TUNING",
-      "date": "2026-08-11",
-      "adr_id": "ADR_20260811_STOCK_LAMBDARANK_ECONOMIC_TUNING",
-      "domain": "stocks",
-      "title": "LambdaRank economic tuning acceleration and selection",
-      "why": "80-trial production tuning required 1400.898 seconds in 129 inner-fold fits, while Rank-IC-only selection degraded Sharpe and drawdown.",
-      "resolution": "Added immutable prepared fold caches, reduced-budget NDCG pruning, fixed eight-candidate shortlist, exact inner event-ledger economic selection, and telemetry while preserving 80-trial DSR accounting and fail-closed promotion gates.",
-      "impact": "Reduces repeated tuning preprocessing and full refits; candidate selection now accounts for fills, costs, bootstrap excess, IR, drawdown, and turnover without using outer OOS or forward holdout data."
     }
   ]
 }

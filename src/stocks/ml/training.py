@@ -1287,11 +1287,20 @@ def _risk_policy_for_profile(
     policy_kwargs: dict[str, object] = {}
     if vol_target is not None:
         policy_kwargs["target_annual_volatility"] = vol_target
+    if profile.participation_limit_override is not None:
+        policy_kwargs["participation_limit"] = float(
+            min(profile.participation_limit_override, 1.0)
+        )
+    else:
+        policy_kwargs["participation_limit"] = float(
+            request.portfolio.participation_limit
+        )
+    if profile.turnover_budget_override is not None:
+        policy_kwargs["turnover_budget"] = float(profile.turnover_budget_override)
     return StockRiskPolicy(
         top_k=top_k,
         gross_cap=gross_cap,
         single_name_cap=single_name_cap,
-        participation_limit=request.portfolio.participation_limit,
         no_trade_band_bps=profile.no_trade_band_bps,
         rebalance_frequency_sessions=rebalance_frequency_sessions,
         compounding=CompoundingPolicyConfig(
@@ -1433,6 +1442,21 @@ def _sizing_diagnostics_summary(
         )
         if count is not None
     ]
+    lambdas = [
+        lam
+        for lam in (
+            _float_or_none(record.get("turnover_lambda")) for record in records
+        )
+        if lam is not None
+    ]
+    clamped_total = 0
+    names_total = 0
+    for record in records:
+        clamped = _float_or_none(record.get("participation_clamped_count"))
+        names = _float_or_none(record.get("participation_name_count"))
+        if clamped is not None and names is not None and names > 0.0:
+            clamped_total += int(clamped)
+            names_total += int(names)
 
     def _quantile(values: list[float], q: float) -> float | None:
         if not values:
@@ -1461,6 +1485,10 @@ def _sizing_diagnostics_summary(
         "selected_count_mean": _mean(selected_counts),
         "selected_count_p10": _quantile(selected_counts, 0.1),
         "selected_count_p90": _quantile(selected_counts, 0.9),
+        "turnover_lambda_mean": _mean(lambdas),
+        "participation_clamped_fraction": (
+            clamped_total / names_total if names_total > 0 else None
+        ),
     }
 
 
@@ -3892,6 +3920,8 @@ def _policy_profile_params(
             "sizing_mode": profile.sizing_mode,
             "retained_sizing_mode": policy.retained_sizing_mode,
             "vol_target_override": profile.vol_target_override,
+            "participation_limit_override": profile.participation_limit_override,
+            "turnover_budget_override": profile.turnover_budget_override,
         },
         sort_keys=True,
     )

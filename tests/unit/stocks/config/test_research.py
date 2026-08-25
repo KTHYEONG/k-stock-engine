@@ -60,3 +60,27 @@ def test_SCENARIO_GROWTH_RUNG_BUILDER_ORDER_02() -> None:
 
     validated = validate_policy_profiles(ladder)
     assert [p.profile_id for p in validated] == [p.profile_id for p in ladder]
+
+
+def test_SCENARIO_GROWTH_RUNG_LIMITS_DECLARED_02() -> None:
+    """SCENARIO_GROWTH_RUNG_LIMITS_DECLARED_02."""
+    from src.stocks.ml.contracts import validate_policy_profiles
+    from src.stocks.config.research import policy_profiles_with_growth_rungs
+
+    ladder = policy_profiles_with_growth_rungs()
+    assert [p.profile_id for p in ladder] == [
+        "legacy_overlay_5bps",
+        "lower_bound_only",
+        "lower_bound_half_kelly",
+        "excess_full_kelly",
+        "growth_full_utilization",
+    ]
+    rung = ladder[-1]
+    assert rung.participation_limit_override == 0.02
+    assert rung.turnover_budget_override == 0.40
+    assert rung.vol_target_override == 0.20
+    assert rung.gross_utilization_target == 0.95
+    kelly = ladder[3]
+    assert kelly.participation_limit_override is None
+    assert kelly.turnover_budget_override is None
+    assert validate_policy_profiles(ladder)[-1] is rung
