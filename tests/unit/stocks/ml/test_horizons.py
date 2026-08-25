@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from dataclasses import replace
 
 from src.stocks.ml.horizons import (
     DEFAULT_BOOTSTRAP_RESAMPLES,
@@ -1087,3 +1088,75 @@ class TestBenchmarkReconciliationReason:
         attached = _attach_growth_route_execution_evidence(route, discovery, panel)
         assert attached.benchmark_reconcile_failure == ""
         assert len(attached.benchmark_log_growth) == len(route.base_log_growth)
+
+
+def _turnover_evidence(
+    horizon: int,
+    profile_id: str,
+    cadence: int,
+    *,
+    sparse_turnover: float,
+    shadow_turnover: float,
+) -> HorizonOOFEvidence:
+    cell = _evidence(
+        horizon,
+        _positive(horizon, 0.01, count=60),
+        profile_id=profile_id,
+        rebalance_frequency_sessions=cadence,
+    )
+    return replace(
+        cell, sparse_turnover=sparse_turnover, shadow_turnover=shadow_turnover
+    )
+
+
+def test_shadow_ratio_exempt_admission_and_numeric_publication() -> None:
+    """SHADOW_RATIO_EXEMPT: missing shadow publishes None and never rejects."""
+    cells = (
+        _turnover_evidence(10, "cell_exempt_a", 5, sparse_turnover=9.5, shadow_turnover=0.0),
+        _turnover_evidence(10, "cell_exempt_b", 10, sparse_turnover=6.0, shadow_turnover=0.0),
+        _turnover_evidence(10, "cell_ratio_pass", 15, sparse_turnover=9.5, shadow_turnover=20.0),
+        _turnover_evidence(10, "cell_ratio_fail", 20, sparse_turnover=9.5, shadow_turnover=10.0),
+    )
+    result = select_horizons(cells, 0.05, 42)
+
+    assert result.turnover_ratio[(10, 5, 20, "cell_exempt_a")] is None
+    assert result.turnover_ratio[(10, 10, 20, "cell_exempt_b")] is None
+    assert result.turnover_ratio[(10, 15, 20, "cell_ratio_pass")] == pytest.approx(0.475)
+    assert result.turnover_ratio[(10, 20, 20, "cell_ratio_fail")] == pytest.approx(0.95)
+
+    joined = "\n".join(result.selection_reasons)
+    assert "turnover_ratio=9." not in joined
+    assert "turnover_ratio=exempt" in joined
+    fail_reasons = [r for r in result.selection_reasons if "cell_ratio_fail" in r]
+    assert any("turnover_ratio=0.95" in r for r in fail_reasons)
+    pass_reasons = [r for r in result.selection_reasons if "cell_ratio_pass" in r]
+    assert any("admissible" in r for r in pass_reasons)
+
+
+def test_holm_unique_family_declared_cells_keep_threshold_sequence() -> None:
+    """HOLM_UNIQUE_FAMILY: Holm sequence counts every declared cell (alpha/m)."""
+    cells = tuple(
+        _evidence(
+            10,
+            _positive(10, 0.01, count=60),
+            profile_id=profile_id,
+            rebalance_frequency_sessions=cadence,
+        )
+        for profile_id, cadence in (
+            (_LEGACY, 5),
+            (_LOWER, 10),
+            ("third_profile", 20),
+        )
+    )
+    result = select_horizons(cells, 0.05, 42)
+
+    thresholds = sorted(result.base_holm_thresholds.values())
+    assert len(thresholds) == 3
+    assert thresholds[0] == pytest.approx(0.05 / 3)
+    assert thresholds[1] == pytest.approx(0.05 / 2)
+    assert thresholds[2] == pytest.approx(0.05)
+    for reason in result.selection_reasons:
+        if "turnover_ratio=" in reason:
+            token = reason.split("turnover_ratio=")[1]
+            value_token = token.split()[0]
+            assert value_token == "exempt" or float(value_token) < 1e6

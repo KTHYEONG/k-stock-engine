@@ -696,3 +696,32 @@ def test_rawnet_lgbm_05_cli_family_wiring() -> None:
         build_parser().parse_args(
             ["--artifact-id", "x", "--discovery-model-family", "not-a-family"]
         )
+
+
+def test_cadence_decision_monotone_pure_kernel() -> None:
+    """CADENCE_DECISION_MONOTONE: decision count strictly decreases with cadence."""
+    from datetime import timedelta
+    from itertools import pairwise
+
+    from src.stocks.ml.training import _cadence_decision_sessions
+
+    sessions = tuple(datetime(2020, 1, 1) + timedelta(days=i) for i in range(101))
+
+    by_freq = {
+        freq: _cadence_decision_sessions(sessions, freq) for freq in (5, 10, 20)
+    }
+    lengths = [len(by_freq[5]), len(by_freq[10]), len(by_freq[20])]
+    assert lengths[0] > lengths[1] > lengths[2] > 0
+    assert lengths == [21, 11, 6]
+    for freq in (5, 10, 20):
+        decisions = by_freq[freq]
+        assert decisions[0] == sessions[0]
+        assert list(decisions) == sorted(decisions)
+        for earlier, later in pairwise(decisions):
+            gap = sessions.index(later) - sessions.index(earlier)
+            assert gap >= freq
+
+    assert _cadence_decision_sessions(sessions, 200) == (sessions[0],)
+
+    with pytest.raises(ValueError, match="frequency_sessions must be positive"):
+        _cadence_decision_sessions(sessions, 0)
