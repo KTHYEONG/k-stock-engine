@@ -294,3 +294,68 @@ def test_blend_single_horizon_rejected() -> None:
     assert request.enable_horizon_blend is True
     default_request = NetAlphaTrainingRequest(artifact_id="blend-off")
     assert default_request.enable_horizon_blend is False
+
+
+class TestFrontierProfileScope:
+    """FRONTIER_PROFILE_SCOPE: profile-scoped frontier feasibility."""
+
+    def test_FRONTIER_PROFILE_SCOPE_01_K8_FEASIBLE_WITH_OVERRIDE(self) -> None:
+        """FRONTIER_PROFILE_SCOPE_01_K8_FEASIBLE_WITH_OVERRIDE."""
+        from src.stocks.ml.contracts import ExecutionFrontierSettings
+
+        frontier = ExecutionFrontierSettings(
+            candidate_horizon_sessions=(10,),
+            candidate_rebalance_frequency_sessions=(5,),
+            candidate_top_k=(8, 12),
+        )
+        scoped = frontier.feasible_cells_for_profile(
+            0.9, 0.08, single_name_cap_override=0.16
+        )
+        assert scoped == ((10, 5, 8), (10, 5, 12))
+        unscoped = frontier.feasible_cells_for_profile(0.9, 0.08)
+        assert unscoped == ((10, 5, 12),)
+        clamped = frontier.feasible_cells_for_profile(
+            0.9, 0.08,
+            single_name_cap_override=0.16,
+            gross_utilization_target=0.92,
+        )
+        assert (10, 5, 8) in clamped
+
+    def test_FRONTIER_PROFILE_SCOPE_02_DEFAULT_PARITY(self) -> None:
+        """FRONTIER_PROFILE_SCOPE_02_DEFAULT_PARITY."""
+        from src.stocks.ml.contracts import ExecutionFrontierSettings
+
+        frontier = ExecutionFrontierSettings(
+            candidate_horizon_sessions=(10, 20),
+            candidate_rebalance_frequency_sessions=(5, 10, 20),
+            candidate_top_k=(8, 12),
+        )
+        legacy = frontier.feasible_cells(0.9, 0.08)
+        for profile in DEFAULT_POLICY_PROFILES:
+            assert (
+                frontier.feasible_cells_for_profile(0.9, 0.08)
+                == legacy
+            ), profile.profile_id
+        # c > h excluded in both
+        assert all(c <= h for h, c, _k in legacy)
+        assert all(c <= h for h, c, _k in frontier.feasible_cells_for_profile(0.9, 0.08))
+
+    def test_FRONTIER_PROFILE_SCOPE_03_NARROW_GRID_INFEASIBLE_WITHOUT_OVERRIDE(self) -> None:
+        """FRONTIER_PROFILE_SCOPE_03_NARROW_GRID_INFEASIBLE_WITHOUT_OVERRIDE."""
+        from src.stocks.ml.contracts import ExecutionFrontierSettings
+
+        frontier = ExecutionFrontierSettings(
+            candidate_horizon_sessions=(10,),
+            candidate_rebalance_frequency_sessions=(5,),
+            candidate_top_k=(8,),
+        )
+        assert frontier.feasible_cells_for_profile(0.9, 0.08) == ()
+        assert (
+            frontier.feasible_cells_for_profile(
+                0.9, 0.08, gross_utilization_target=0.92
+            )
+            == ()
+        )
+        assert len(
+            frontier.feasible_cells_for_profile(0.9, 0.08, single_name_cap_override=0.16)
+        ) == 1
