@@ -384,6 +384,33 @@ def _profile_execution_utility_mode(
     )
 
 
+def _profile_retained_sizing_mode(
+    profile: dict[str, object],
+) -> Literal["freeze_v1", "band_limited_rewaterfill_v1"]:
+    """Extract retained_sizing_mode from a policy profile, defaulting to freeze.
+
+    Payloads persisted before the re-waterfill opt-in lack the key and
+    reconstruct as ``freeze_v1``. Invalid values raise ``ValueError``.
+    """
+    raw = profile.get("retained_sizing_mode")
+    if raw is None:
+        return "freeze_v1"
+    if not isinstance(raw, str):
+        raise ValueError(
+            "retained_sizing_mode must be a string, "
+            f"got {type(raw).__name__}"
+        )
+    if raw not in ("freeze_v1", "band_limited_rewaterfill_v1"):
+        raise ValueError(
+            "retained_sizing_mode must be 'freeze_v1' or "
+            "'band_limited_rewaterfill_v1', "
+            f"got {raw!r}"
+        )
+    return cast(
+        Literal["freeze_v1", "band_limited_rewaterfill_v1"], raw
+    )
+
+
 def _policy_from_artifact(
     artifact_manifest: ModelManifest, request: SimulationRequest
 ) -> StockRiskPolicy:
@@ -427,6 +454,7 @@ def _policy_from_artifact(
         economic_ranking_mode=ranking_mode,
         execution_utility_mode=mode,
         sizing_mode=sizing,
+        retained_sizing_mode=_profile_retained_sizing_mode(profile),
     )
 
 
@@ -466,6 +494,7 @@ def _reconstruct_v7_policy(
         economic_ranking_mode=ranking_mode,
         execution_utility_mode=mode,
         sizing_mode=sizing,
+        retained_sizing_mode=_profile_retained_sizing_mode(profile),
     )
     _validate_v7_policy_profile(profile, policy)
     return policy
@@ -646,6 +675,7 @@ def _validate_prepared_equity_policy(
         economic_ranking_mode=ranking_mode,
         execution_utility_mode=mode,
         sizing_mode=sizing,
+        retained_sizing_mode=_profile_retained_sizing_mode(profile),
     )
     if stock_risk_policy_fingerprint(policy) != profile["risk_policy_fingerprint"]:
         raise ValueError(
