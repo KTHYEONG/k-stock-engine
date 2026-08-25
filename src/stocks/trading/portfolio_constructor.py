@@ -812,6 +812,7 @@ class StockRiskPolicy:
     sizing_mode: Literal[
         "alpha_vol_squared_v1", "risk_balanced_waterfill_v2", "confidence_mean_variance_v1"
     ] = "alpha_vol_squared_v1"
+    retained_sizing_mode: Literal["freeze_v1", "band_limited_rewaterfill_v1"] = "freeze_v1"
 
     def __post_init__(self) -> None:
         if self.top_k <= 0:
@@ -867,6 +868,11 @@ class StockRiskPolicy:
                 "sizing_mode must be 'alpha_vol_squared_v1', "
                 f"'risk_balanced_waterfill_v2', or 'confidence_mean_variance_v1', got {self.sizing_mode!r}"
             )
+        if self.retained_sizing_mode not in ("freeze_v1", "band_limited_rewaterfill_v1"):
+            raise ValueError(
+                "retained_sizing_mode must be 'freeze_v1' or "
+                f"'band_limited_rewaterfill_v1', got {self.retained_sizing_mode!r}"
+            )
 
 
 def stock_risk_policy_fingerprint(policy: StockRiskPolicy) -> str:
@@ -908,6 +914,7 @@ def stock_risk_policy_fingerprint(policy: StockRiskPolicy) -> str:
             "economic_ranking_mode": str(policy.economic_ranking_mode),
             "execution_utility_mode": str(policy.execution_utility_mode),
             "sizing_mode": str(policy.sizing_mode),
+            "retained_sizing_mode": str(policy.retained_sizing_mode),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -1287,6 +1294,7 @@ def _build_allocations(
     if covariance is None:
         covariance, covariance_source = _covariance(panel, ids, policy)
     sparse_plan: SparseTransitionPlan | None = None
+    band_rate = policy.no_trade_band_bps / 10_000.0
     if (
         policy.execution_utility_mode == "sparse_hold_replace_v2"
         and economic_inputs is not None
@@ -1297,7 +1305,7 @@ def _build_allocations(
             economic_inputs,
             top_k=policy.top_k,
             enter_rank=policy.enter_rank,
-            band_rate=policy.no_trade_band_bps / 10_000.0,
+            band_rate=band_rate,
         )
     elif policy.execution_utility_mode == "sparse_hold_replace_v2":
         sparse_plan = SparseTransitionPlan(
@@ -1408,7 +1416,12 @@ def _build_allocations(
         target_full = dict.fromkeys(current_weights, 0.0)
         for instrument_id, weight in weights.items():
             if instrument_id in sparse_plan.retained:
-                target_full[instrument_id] = current_weights.get(instrument_id, weight)
+                target_full[instrument_id] = _retained_target(
+                    policy.retained_sizing_mode,
+                    band_rate,
+                    weight,
+                    current_weights.get(instrument_id, 0.0),
+                )
             elif instrument_id in sparse_plan.initial_entries or any(
                 instrument_id == challenger
                 for challenger, _ in sparse_plan.replacements
@@ -2138,6 +2151,27 @@ def _economic_transition_inputs(
         entry_cost=entry,
         exit_cost=exit_,
     ), None
+
+
+def _retained_target(
+    retained_sizing_mode: str,
+    band_rate: float,
+    fresh_weight: float,
+    current_weight: float,
+) -> float:
+    """Return one retained incumbent's target weight under the sizing mode.
+
+    ``freeze_v1`` keeps the drifted current weight exactly.  Under
+    ``band_limited_rewaterfill_v1`` the incumbent resizes to its fresh
+    ``s*``-scaled waterfill target only when the relative drift exceeds the
+    no-trade band, suppressing micro-trades for banded profiles.
+    """
+    if retained_sizing_mode == "band_limited_rewaterfill_v1":
+        drift = abs(fresh_weight - current_weight)
+        if drift > band_rate * max(current_weight, _TOLERANCE):
+            return fresh_weight
+        return current_weight
+    return current_weight
 
 
 def _select_sparse_hold_replace_active_set(

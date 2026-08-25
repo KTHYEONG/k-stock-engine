@@ -667,6 +667,7 @@ def _project_request(request: NetAlphaTrainingRequest) -> dict[str, object]:
         # fingerprint so different rolling fit windows never share an identity.
         "max_training_lookback_sessions": request.max_training_lookback_sessions,
         "seed": request.seed,
+        "enable_sparse_retained_rewaterfill": request.enable_sparse_retained_rewaterfill,
         "portfolio": {
             "top_k": portfolio.top_k,
             "max_single_weight": portfolio.max_single_weight,
