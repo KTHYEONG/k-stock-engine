@@ -1176,6 +1176,10 @@ class StockBacktester:
 
         if delta > 0:
             quantity = min(delta, capacity_qty)
+            if quantity < delta:
+                # Capacity (not cash) bounded this fill; surfaced so a
+                # saturated participation cap is visible in run evidence.
+                order["capacity_clipped"] = True
             volatility = None
             if evidence is not None:
                 volatility = _as_float(row.get("feature__volatility_20d") or 0.0)
@@ -1210,14 +1214,22 @@ class StockBacktester:
                     evidence, instrument_id, "BUY", session, gross, adtv, volatility,
                     stress, schedule,
                 )
+            if quantity < delta and order.get("capacity_clipped") is not True:
+                order["cash_clipped"] = True
             cost = gross * buy_rate
             settled_cash -= gross
             accrued_costs += cost
             positions[instrument_id] = positions.get(instrument_id, 0) + quantity
+            if quantity == delta:
+                fill_reason = "filled"
+            elif order.get("capacity_clipped") is True:
+                fill_reason = "partial-capacity"
+            else:
+                fill_reason = "partial"
             trades.append(
                 BacktestTrade(
                     session, instrument_id, "BUY", quantity, fill_price, gross, cost,
-                    "filled" if quantity == delta else "partial",
+                    fill_reason,
                     self._cost_breakdown(
                         evidence, instrument_id, "BUY", session, fill_price, gross, adtv,
                         volatility, stress,
@@ -1457,6 +1469,8 @@ class StockBacktester:
                 "turnover": 0.0,
                 "cost_drag": 0.0,
                 "exposure": 0.0,
+                "partial_fill_count": 0.0,
+                "capacity_clipped_count": 0.0,
             }
         returns = np.diff(equity) / equity[:-1]
         mean_equity = float(np.mean(equity))
@@ -1482,5 +1496,15 @@ class StockBacktester:
             "cost_drag": total_cost / mean_equity,
             "exposure": (
                 positions_value / mean_equity / equity.size if equity.size else 0.0
+            ),
+            "partial_fill_count": float(
+                sum(
+                    1
+                    for t in trades
+                    if t.reason == "partial" or t.reason == "partial-capacity"
+                )
+            ),
+            "capacity_clipped_count": float(
+                sum(1 for t in trades if t.reason == "partial-capacity")
             ),
         }

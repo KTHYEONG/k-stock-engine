@@ -386,3 +386,24 @@ class TestVolTargetOverride:
             )
         )
         assert allowed[-1].profile_id == GROWTH_FULL_UTILIZATION_PROFILE_ID
+
+
+class TestParticipationTurnoverOverrides:
+    """SCENARIO_PARTICIPATION_OVERRIDE_VALIDATION_01."""
+
+    def test_SCENARIO_PARTICIPATION_OVERRIDE_VALIDATION_01(self) -> None:
+        profile = PolicyProfile(
+            profile_id="x", participation_limit_override=0.02,
+            turnover_budget_override=0.4,
+        )
+        assert profile.participation_limit_override == 0.02
+        assert profile.turnover_budget_override == 0.4
+        assert PolicyProfile(profile_id="x").participation_limit_override is None
+        assert PolicyProfile(profile_id="x").turnover_budget_override is None
+
+        for bad in (0.0, -0.1, float("nan"), float("inf"), 1.0000001):
+            with pytest.raises(ValueError, match="participation_limit_override"):
+                PolicyProfile(profile_id="x", participation_limit_override=bad)
+        for bad in (-0.1, float("nan"), float("inf"), 1.0, 1.5):
+            with pytest.raises(ValueError, match="turnover_budget_override"):
+                PolicyProfile(profile_id="x", turnover_budget_override=bad)

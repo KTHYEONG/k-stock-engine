@@ -317,6 +317,80 @@ def _profile_vol_target_override(profile: dict[str, object]) -> float | None:
     return value
 
 
+def _profile_participation_limit_override(
+    profile: dict[str, object],
+) -> float | None:
+    """Extract participation_limit_override from a policy profile.
+
+    ``None`` keeps the canonical request participation limit so legacy
+    payloads replay unchanged. A present value must be finite in (0, 1];
+    anything else fails closed before the backtester can diverge.
+    """
+    raw = profile.get("participation_limit_override")
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError(
+            "participation_limit_override must be a number in (0, 1], "
+            f"got {type(raw).__name__}"
+        )
+    value = float(raw)
+    if not math.isfinite(value) or not 0.0 < value <= 1.0:
+        raise ValueError(
+            f"participation_limit_override must be finite in (0, 1], got {value!r}"
+        )
+    return value
+
+
+def _profile_turnover_budget_override(profile: dict[str, object]) -> float | None:
+    """Extract turnover_budget_override from a policy profile.
+
+    ``None`` keeps the canonical 0.20 turnover budget default so legacy
+    payloads replay unchanged. A present value must be finite in [0, 1);
+    anything else fails closed before the backtester can diverge.
+    """
+    raw = profile.get("turnover_budget_override")
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError(
+            "turnover_budget_override must be a number in [0, 1), "
+            f"got {type(raw).__name__}"
+        )
+    value = float(raw)
+    if not math.isfinite(value) or not 0.0 <= value < 1.0:
+        raise ValueError(
+            f"turnover_budget_override must be finite in [0, 1), got {value!r}"
+        )
+    return value
+
+
+def _profile_policy_kwargs(
+    profile: dict[str, object],
+    *,
+    fallback_participation: float | None = None,
+) -> dict[str, object]:
+    """Build the optional StockRiskPolicy kwargs declared by a stored profile.
+
+    ``fallback_participation`` supplies the canonical request limit when the
+    profile declares no participation override; reconstruction sites reading
+    the stored ``participation_limit`` instead leave it unset.
+    """
+    policy_kwargs: dict[str, object] = {}
+    vol_override = _profile_vol_target_override(profile)
+    if vol_override is not None:
+        policy_kwargs["target_annual_volatility"] = min(vol_override, 1.0)
+    participation = _profile_participation_limit_override(profile)
+    if participation is not None:
+        policy_kwargs["participation_limit"] = min(participation, 1.0)
+    elif fallback_participation is not None:
+        policy_kwargs["participation_limit"] = float(fallback_participation)
+    budget = _profile_turnover_budget_override(profile)
+    if budget is not None:
+        policy_kwargs["turnover_budget"] = budget
+    return policy_kwargs
+
+
 def _profile_sizing_mode(
     profile: dict[str, object],
 ) -> Literal[
@@ -464,15 +538,15 @@ def _policy_from_artifact(
     mode = _profile_execution_utility_mode(profile)
     sizing = _profile_sizing_mode(profile)
     stored_cadence = _profile_rebalance_frequency_sessions(profile)
-    vol_override = _profile_vol_target_override(profile)
-    policy_kwargs: dict[str, object] = {}
-    if vol_override is not None:
-        policy_kwargs["target_annual_volatility"] = min(vol_override, 1.0)
+    policy_kwargs = _profile_policy_kwargs(profile)
+    if "participation_limit" not in policy_kwargs:
+        policy_kwargs["participation_limit"] = cast(
+            float, profile["participation_limit"]
+        )
     return StockRiskPolicy(
         top_k=cast(int, profile["top_k"]),
         gross_cap=cast(float, profile["max_exposure"]),
         single_name_cap=cast(float, profile["max_single_weight"]),
-        participation_limit=cast(float, profile["participation_limit"]),
         no_trade_band_bps=cast(float, profile["no_trade_band_bps"]),
         rebalance_frequency_sessions=stored_cadence,
         compounding=CompoundingPolicyConfig(
@@ -509,15 +583,15 @@ def _reconstruct_v7_policy(
         raise ValueError(
             "v7 rebalance_frequency_sessions must equal forecast_horizon_sessions"
         )
-    vol_override = _profile_vol_target_override(profile)
-    policy_kwargs: dict[str, object] = {}
-    if vol_override is not None:
-        policy_kwargs["target_annual_volatility"] = min(vol_override, 1.0)
+    policy_kwargs = _profile_policy_kwargs(profile)
+    if "participation_limit" not in policy_kwargs:
+        policy_kwargs["participation_limit"] = cast(
+            float, profile["participation_limit"]
+        )
     policy = StockRiskPolicy(
         top_k=cast(int, profile["top_k"]),
         gross_cap=cast(float, profile["max_exposure"]),
         single_name_cap=cast(float, profile["max_single_weight"]),
-        participation_limit=cast(float, profile["participation_limit"]),
         no_trade_band_bps=cast(float, profile["no_trade_band_bps"]),
         rebalance_frequency_sessions=horizon,
         compounding=CompoundingPolicyConfig(
@@ -695,15 +769,13 @@ def _validate_prepared_equity_policy(
     mode = _profile_execution_utility_mode(profile)
     sizing = _profile_sizing_mode(profile)
     stored_cadence = _profile_rebalance_frequency_sessions(profile)
-    vol_override = _profile_vol_target_override(profile)
-    policy_kwargs: dict[str, object] = {}
-    if vol_override is not None:
-        policy_kwargs["target_annual_volatility"] = min(vol_override, 1.0)
+    policy_kwargs = _profile_policy_kwargs(
+        profile, fallback_participation=request.participation_limit
+    )
     policy = StockRiskPolicy(
         top_k=request.top_k,
         gross_cap=request.max_exposure,
         single_name_cap=request.max_single_weight,
-        participation_limit=request.participation_limit,
         no_trade_band_bps=artifact_band,
         rebalance_frequency_sessions=stored_cadence,
         compounding=CompoundingPolicyConfig(

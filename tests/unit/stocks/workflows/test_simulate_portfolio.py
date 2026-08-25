@@ -1246,3 +1246,92 @@ def test_SCENARIO_SIMULATOR_VOL_RECONSTRUCTION_04(tmp_path) -> None:
     for bad in ("high", True):
         with pytest.raises(ValueError, match="vol_target_override"):
             _profile_vol_target_override(payload(bad))
+
+
+def test_SCENARIO_SIMULATOR_LIMITS_RECONSTRUCTION_04(tmp_path) -> None:
+    """SCENARIO_SIMULATOR_LIMITS_RECONSTRUCTION_04."""
+    from src.stocks.trading.portfolio_constructor import (
+        StockRiskPolicy,
+        stock_risk_policy_fingerprint,
+    )
+
+    from src.stocks.workflows.simulate_portfolio import (
+        _profile_participation_limit_override,
+        _profile_turnover_budget_override,
+        _validate_prepared_equity_policy,
+    )
+
+    request = SimulationRequest(
+        artifact_id="na_growth_rung",
+        decision_time=datetime(2024, 4, 29, tzinfo=UTC),
+        top_k=12,
+        max_single_weight=0.0833,
+        max_exposure=0.95,
+        participation_limit=0.005,
+    )
+    trained = StockRiskPolicy(
+        top_k=12,
+        gross_cap=0.95,
+        single_name_cap=0.0833,
+        participation_limit=0.02,
+        turnover_budget=0.40,
+        no_trade_band_bps=0.0,
+        rebalance_frequency_sessions=5,
+        target_annual_volatility=0.2,
+        compounding=CompoundingPolicyConfig(
+            growth_risk_aversion=1.0, forecast_horizon_sessions=10
+        ),
+        economic_ranking_mode="economic_net_v1",
+        execution_utility_mode="sparse_hold_replace_v2",
+        sizing_mode="risk_balanced_waterfill_v2",
+    )
+    fingerprint = stock_risk_policy_fingerprint(trained)
+
+    base_payload: dict[str, object] = {
+        "profile_id": "growth_full_utilization",
+        "no_trade_band_bps": 0.0,
+        "growth_risk_aversion": 1.0,
+        "forecast_horizon_sessions": 10,
+        "rebalance_frequency_sessions": 5,
+        "top_k": 12,
+        "max_single_weight": 0.0833,
+        "max_exposure": 0.95,
+        "participation_limit": 0.005,
+        "portfolio_fingerprint": policy_portfolio_fingerprint(
+            12, 0.0833, 0.95, 0.005
+        ),
+        "execution_evidence_version": "prepared-equity-v5-sparse-growth",
+        "risk_policy_fingerprint": fingerprint,
+        "execution_policy_id": SCHEDULED_OPEN_POLICY_ID,
+        "execution_policy_hash": SCHEDULED_OPEN_V1.canonical_hash,
+        "economic_ranking_mode": "economic_net_v1",
+        "execution_utility_mode": "sparse_hold_replace_v2",
+        "sizing_mode": "risk_balanced_waterfill_v2",
+        "retained_sizing_mode": "freeze_v1",
+        "vol_target_override": 0.2,
+        "participation_limit_override": 0.02,
+        "turnover_budget_override": 0.4,
+    }
+
+    assert _profile_participation_limit_override(base_payload) == 0.02
+    assert _profile_turnover_budget_override(base_payload) == 0.4
+    _validate_prepared_equity_policy(request, dict(base_payload), 0.0)
+
+    for tampered_key, value in (
+        ("participation_limit_override", 0.05),
+        ("turnover_budget_override", 0.9),
+    ):
+        tampered = dict(base_payload)
+        tampered[tampered_key] = value
+        with pytest.raises(ValueError, match="risk-policy fingerprint diverges"):
+            _validate_prepared_equity_policy(request, tampered, 0.0)
+
+    for helper, key in (
+        (_profile_participation_limit_override, "participation_limit_override"),
+        (_profile_turnover_budget_override, "turnover_budget_override"),
+    ):
+        for bad in (True, "high"):
+            bad_payload = dict(base_payload)
+            bad_payload[key] = bad
+            with pytest.raises(ValueError, match=key):
+                helper(bad_payload)

@@ -266,6 +266,7 @@ class ExecutionReplayEvidence:
     base_interval_exposure: tuple[float, ...] = ()
     stress_interval_exposure: tuple[float, ...] = ()
     base_interval_session_bounds: tuple[tuple[datetime, ...], ...] = ()
+    base_capacity_clipped_orders: int = 0
 
     def __post_init__(self) -> None:
         if len(self.base_log_growth) != len(self.stress_log_growth):
@@ -298,6 +299,10 @@ class ExecutionReplayEvidence:
             raise ValueError("stress_cost_drag must be a finite non-negative value")
         if not np.isfinite(self.base_exposure) or self.base_exposure < 0.0:
             raise ValueError("base_exposure must be a finite non-negative value")
+        if self.base_capacity_clipped_orders < 0:
+            raise ValueError(
+                "base_capacity_clipped_orders must be non-negative"
+            )
         if not np.isfinite(self.stress_exposure) or self.stress_exposure < 0.0:
             raise ValueError("stress_exposure must be a finite non-negative value")
         n = len(self.base_log_growth)
@@ -341,6 +346,9 @@ class ExecutionReplayEvidence:
             "stress_cost_drag": round(float(self.stress_cost_drag), 12),
             "base_exposure": round(float(self.base_exposure), 12),
             "stress_exposure": round(float(self.stress_exposure), 12),
+            "base_capacity_clipped_orders": int(
+                self.base_capacity_clipped_orders
+            ),
         }
 
 
@@ -608,6 +616,9 @@ def _execute_candidate_segment(
         stress_cost_drag=float(stress_metrics.get("cost_drag", 0.0)),
         base_exposure=float(result.metrics.get("exposure", 0.0)),
         stress_exposure=float(stress_metrics.get("exposure", 0.0)),
+        capacity_clipped_orders=int(
+            result.metrics.get("capacity_clipped_count", 0.0)
+        ),
         unfilled_reason_counts=unfilled,
     )
 

@@ -119,6 +119,8 @@ class PolicyProfile:
     single_name_cap_override: float | None = None
     gross_utilization_target: float | None = None
     vol_target_override: float | None = None
+    participation_limit_override: float | None = None
+    turnover_budget_override: float | None = None
 
     def __post_init__(self) -> None:
         if not self.profile_id:
@@ -140,6 +142,22 @@ class PolicyProfile:
                     f"{field_name} override must be None or finite in (0, 1], "
                     f"got {value!r}"
                 )
+        participation = self.participation_limit_override
+        if participation is not None and (
+            not np.isfinite(participation) or not 0.0 < float(participation) <= 1.0
+        ):
+            raise ValueError(
+                "participation_limit_override must be None or finite in (0, 1], "
+                f"got {participation!r}"
+            )
+        turnover = self.turnover_budget_override
+        if turnover is not None and (
+            not np.isfinite(turnover) or not 0.0 <= float(turnover) < 1.0
+        ):
+            raise ValueError(
+                "turnover_budget_override must be None or finite in [0, 1), "
+                f"got {turnover!r}"
+            )
         if self.execution_utility_mode not in (
             "legacy_target_interpolation_v1",
             "delta_cost_aware_v1",

@@ -28,6 +28,7 @@ class _SegmentTotals:
     stress_cost_drag_weighted: float = 0.0
     base_exposure_weighted: float = 0.0
     stress_exposure_weighted: float = 0.0
+    capacity_clipped_orders: int = 0
 
 
 @dataclass(slots=True)
@@ -86,6 +87,7 @@ class CandidateReplayAccumulator:
         totals.stress_cost_drag_weighted += float(stress_cost_drag) * weight
         totals.base_exposure_weighted += float(base_exposure) * weight
         totals.stress_exposure_weighted += float(stress_exposure) * weight
+        totals.capacity_clipped_orders += int(summary.capacity_clipped_orders)
         for reason, count in unfilled_reason_counts.items():
             key = str(reason)
             self.unfilled_reasons[key] = self.unfilled_reasons.get(key, 0) + int(count)
@@ -133,6 +135,7 @@ class CandidateReplayAccumulator:
             base_interval_exposure=tuple(self.base_interval_exposure),
             stress_interval_exposure=tuple(self.stress_interval_exposure),
             base_interval_session_bounds=tuple(self.interval_session_bounds),
+            base_capacity_clipped_orders=int(totals.capacity_clipped_orders),
         )
 
 
@@ -157,3 +160,4 @@ class SegmentExecutionSummary:
     stress_exposure: float
     unfilled_reason_counts: dict[str, int]
     interval_session_bounds: tuple[datetime, ...] = ()
+    capacity_clipped_orders: int = 0
