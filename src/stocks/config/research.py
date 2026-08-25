@@ -20,6 +20,7 @@ from src.stocks.compatibility import (
     parse_sizing_method,
 )
 from src.stocks.ml.contracts import (
+    DEFAULT_POLICY_PROFILES,
     EXCESS_FULL_KELLY_PROFILE_ID,
     PolicyProfile,
 )
@@ -50,14 +51,18 @@ def policy_profiles_with_excess_full_kelly() -> tuple[PolicyProfile, ...]:
     The default ``CanonicalResearchProfile`` never carries this profile so
     flag-off runs stay byte-identical; requests opt in by replacing their
     ``policy_profiles`` with this tuple. The rung widens its single-name cap
-    toward the equal-weight basis and normalizes deployed gross toward 92%.
+    toward the equal-weight basis, normalizes deployed gross toward 92%, and
+    runs the same v5 sparse execution/sizing pair as the canonical defaults so
+    cadence scheduling and dense-shadow gating stay uniform across the ladder.
     """
     return (
-        *CanonicalResearchProfile().policy_profiles,
+        *DEFAULT_POLICY_PROFILES,
         PolicyProfile(
             profile_id=EXCESS_FULL_KELLY_PROFILE_ID,
             no_trade_band_bps=0.0,
             growth_risk_aversion=1.0,
+            execution_utility_mode="sparse_hold_replace_v2",
+            sizing_mode="risk_balanced_waterfill_v2",
             single_name_cap_override=_EXCESS_FULL_KELLY_SINGLE_NAME_CEILING,
             gross_utilization_target=_EXCESS_FULL_KELLY_GROSS_UTILIZATION,
         ),
@@ -80,23 +85,9 @@ class CanonicalResearchProfile:
     n_folds: int = 3
     embargo_sessions: int = 5
     candidate_horizon_sessions: tuple[int, ...] = (10, 20)
-    policy_profiles: tuple[PolicyProfile, ...] = (
-        PolicyProfile(
-            profile_id="legacy_overlay_5bps",
-            no_trade_band_bps=5.0,
-            growth_risk_aversion=1.0,
-        ),
-        PolicyProfile(
-            profile_id="lower_bound_only",
-            no_trade_band_bps=0.0,
-            growth_risk_aversion=1.0,
-        ),
-        PolicyProfile(
-            profile_id="lower_bound_half_kelly",
-            no_trade_band_bps=0.0,
-            growth_risk_aversion=2.0,
-        ),
-    )
+    # Canonical defaults are the contracts-owned v5 profile ladder so every
+    # entry point (flag on/off) shares one mode identity per profile id.
+    policy_profiles: tuple[PolicyProfile, ...] = DEFAULT_POLICY_PROFILES
 
     def fingerprint(self) -> str:
         canonical = json.dumps(
