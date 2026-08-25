@@ -1359,6 +1359,28 @@ def _require_caller_registry(
     return registry
 
 
+def _cadence_decision_sessions(
+    sorted_sessions: tuple[datetime, ...], frequency_sessions: int
+) -> tuple[datetime, ...]:
+    """Pure cadence kernel: subsample sorted sessions at the given frequency.
+
+    Single definition shared by ``_replay_costs`` and ``_replay_costs_batch``
+    so one cadence always yields one decision schedule. Sessions shorter than
+    two entries cannot be subsampled and pass through unchanged; frequency
+    validation (positive) is delegated to ``rebalance_session_indices``.
+    """
+    if len(sorted_sessions) < 2:
+        return sorted_sessions
+    indices = rebalance_session_indices(
+        sorted_sessions,
+        min(sorted_sessions),
+        max(sorted_sessions),
+        frequency_sessions,
+        legacy_daily=False,
+    )
+    return tuple(sorted_sessions[i] for i in indices)
+
+
 def _replay_costs(
     registry: ModelArtifactRegistry,
     calibrated: pl.DataFrame,
@@ -1403,19 +1425,8 @@ def _replay_costs(
     decision_sessions_by_segment: dict[int, tuple[datetime, ...]] = {}
     for segment, sessions in sessions_by_segment.items():
         sorted_sessions = tuple(sorted(sessions))
-        if is_v5 and len(sorted_sessions) >= 2:
-            eligible_from = min(sorted_sessions)
-            eligible_to = max(sorted_sessions)
-            indices = rebalance_session_indices(
-                sorted_sessions,
-                eligible_from,
-                eligible_to,
-                replay_policy.rebalance_frequency_sessions,
-                legacy_daily=False,
-            )
-            decision_sessions_by_segment[segment] = tuple(
-                sorted_sessions[i] for i in indices
-            )
+        if is_v5:
+            decision_sessions_by_segment[segment] = _cadence_decision_sessions(sorted_sessions, replay_policy.rebalance_frequency_sessions)
         else:
             decision_sessions_by_segment[segment] = sorted_sessions
     context = _execution_replay_context(
@@ -1513,19 +1524,8 @@ def _replay_costs_batch(
         decision_sessions_by_segment: dict[int, tuple[datetime, ...]] = {}
         for segment, sessions in sessions_by_segment.items():
             sorted_sessions = tuple(sorted(sessions))
-            if is_v5 and len(sorted_sessions) >= 2:
-                eligible_from = min(sorted_sessions)
-                eligible_to = max(sorted_sessions)
-                indices = rebalance_session_indices(
-                    sorted_sessions,
-                    eligible_from,
-                    eligible_to,
-                    replay_policy.rebalance_frequency_sessions,
-                    legacy_daily=False,
-                )
-                decision_sessions_by_segment[segment] = tuple(
-                    sorted_sessions[i] for i in indices
-                )
+            if is_v5:
+                decision_sessions_by_segment[segment] = _cadence_decision_sessions(sorted_sessions, replay_policy.rebalance_frequency_sessions)
             else:
                 decision_sessions_by_segment[segment] = sorted_sessions
 
