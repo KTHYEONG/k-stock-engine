@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ml_growth_conversion_repair",
+      "date": "2026-08-25",
+      "adr_id": "ADR_20260825_ml_growth_conversion_repair",
+      "domain": "stocks_ml",
+      "title": "ML frontier conversion repair: profile mode parity, live cadence, shadow-ratio exemption",
+      "why": "ml_closeout_20260824 rejected all 32 frontier cells because CanonicalResearchProfile.policy_profiles omitted the v5 execution/sizing modes (drift from DEFAULT_POLICY_PROFILES), so --enable-excess-full-kelly runs executed non-v5 profiles: rebalance cadence became a no-op (h10 c5/c10 evidence byte-identical, planned_cycles 1707 across all cadences), dense shadows were never built, and horizons.py clamped shadow_turnover to 1e-12 producing turnover_ratio ~9.5e12 that auto-rejected every cell regardless of performance.",
+      "resolution": "Unified CanonicalResearchProfile.policy_profiles onto DEFAULT_POLICY_PROFILES and gave the excess_full_kelly rung explicit sparse_hold_replace_v2/risk_balanced_waterfill_v2 modes; extracted pure _cadence_decision_sessions helper shared by _replay_costs and _replay_costs_batch; select_horizons now publishes turnover_ratio=None (gate exempt) when a dense shadow is absent instead of fabricating a denominator. Full-run rerun (ml_cadence_repair_20260825) verified cadence differentiation (planned_cycles 356/177/87), restored sparse execution (turnover 9.5 to 1.4-2.5/yr, base cost drag 1.14% to 0.10-0.24%), numeric turnover_ratio 0.4586, and growth route PROMOTABLE_EXCESS with matched_lower_excess_cagr +7.83 percent while absolute lower bounds still fail closed to NO_TRADE.",
+      "impact": "Frontier cells now compete on real measured lower bounds instead of fabricated ratios; multiplicity burden reflects executed unique replays; run wall-clock dropped from ~48min to ~6.6min; no absolute/coverage/drawdown gate was relaxed."
+    },
+    {
       "task_id": "certified_promotion_closeout",
       "date": "2026-08-25",
       "adr_id": "ADR_20260825_certified_promotion_closeout",
@@ -989,16 +999,6 @@
       "why": "The training CLI rejected the cataloged v1 feature and fwd-return label datasets when the research workflow required v2 features and canonical residual labels.",
       "resolution": "Added strict v2 feature materialization, calendar-aware residual label publication, immutable snapshot orchestration, semantic composition checks, and an explicit v2 build CLI; legacy v1 datasets remain unchanged and all verification gates pass.",
       "impact": "Enables reproducible research training from a hash-pinned provisional v2 snapshot while preventing silent v1 downgrade, label recomputation, lookahead, partial publication, and paper/live use of incomplete evidence."
-    },
-    {
-      "task_id": "TASK_KR_STOCK_ML_RESEARCH_SYSTEM",
-      "date": "2026-08-11",
-      "adr_id": "ADR_20260811_KR_STOCK_ML_RESEARCH_SYSTEM",
-      "domain": "stocks",
-      "title": "Korean stock ML research and robust backtest pipeline",
-      "why": "Establish a reproducible domestic-stock ML research workflow with leakage-safe data, explicit features, deterministic training, and realistic backtesting.",
-      "resolution": "Registered LambdaRank plus StableRankComposite blending, 34 point-in-time features, purged walk-forward folds, canonical labels, event-based fills/costs, constrained portfolio construction, and promotion gates; synchronized ADR and code map.",
-      "impact": "Research-only pipeline; improves reproducibility and prevents lookahead/cost/model-selection errors. Live trading integration remains out of scope."
     }
   ]
 }
