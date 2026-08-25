@@ -1511,6 +1511,9 @@ class TestSizingDiagnostics:
             "gross_before_compounding_mean",
             "gross_after_compounding_mean",
             "covariance_source_full_fraction",
+            "selected_count_mean",
+            "selected_count_p10",
+            "selected_count_p90",
         }
         assert set(summary) == fixed_keys
         assert all(
@@ -1558,3 +1561,107 @@ class TestSizingDiagnostics:
             )
         )
         assert baseline_keys == set(projection)
+
+
+
+class TestProfileScopedFeasibility:
+    """TRAINING_SCOPE_WIRING_04 + SIZING_DIAGNOSTICS_05 scenarios."""
+
+    def test_TRAINING_SCOPE_WIRING_04_DROPOUT_TRANSPARENCY(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """TRAINING_SCOPE_WIRING_04_DROPOUT_TRANSPARENCY.
+
+        Kelly-scoped frontier executes K=8 only for excess_full_kelly; other
+        profiles record 'profile-cap-infeasible'; frozen seed policy unchanged.
+        """
+        from dataclasses import replace as dc_replace
+
+        from src.stocks.config.research import policy_profiles_with_excess_full_kelly
+        from src.stocks.ml.compound_track import resolve_frozen_policy_key
+        from src.stocks.ml.contracts import ExecutionFrontierSettings
+        from src.stocks.research.artifacts import ModelArtifactRegistry
+        from src.stocks.research.folds import PurgedWalkForward
+        from src.stocks.ml import training as training_module
+
+        _stub_replay_batch(monkeypatch, [])
+        captured: list = []
+        _stub_replay_batch(monkeypatch, captured)
+        frame, data, base_request = _blend_market_fixture()
+        request = dc_replace(
+            base_request,
+            policy_profiles=policy_profiles_with_excess_full_kelly(),
+            candidate_horizon_sessions=(10,),
+            enable_horizon_blend=False,
+            execution_frontier=ExecutionFrontierSettings(
+                candidate_horizon_sessions=(10,),
+                candidate_rebalance_frequency_sessions=(5,),
+                candidate_top_k=(8, 12),
+            ),
+            portfolio=dc_replace(
+                base_request.portfolio,
+                max_exposure=0.9,
+                max_single_weight=0.08,
+            ),
+        )
+        pre_holdout = _blend_pre_holdout(frame)
+        splitter = PurgedWalkForward(
+            n_folds=2,
+            label_horizon_sessions=6,
+            embargo_sessions=1,
+            session_column="session_index",
+            min_train_sessions=4,
+        )
+        folds = splitter.split(pre_holdout)
+        discovery = training_module._build_horizon_evidence(
+            pre_holdout,
+            folds,
+            data,
+            request,
+            ("feature__a", "feature__b"),
+            registry=ModelArtifactRegistry(tmp_path / "registry-scope"),
+        )
+
+        non_kelly = [
+            p.profile_id
+            for p in request.policy_profiles
+            if p.profile_id != "excess_full_kelly"
+        ]
+        for pid in non_kelly:
+            key = (10, 5, 8, pid)
+            assert discovery.dropout_reasons.get(key) == "profile-cap-infeasible", key
+        kelly_at_k8 = {pid for (_h, _c, k, pid) in captured if k == 8}
+        assert kelly_at_k8 == {"excess_full_kelly"}
+        assert resolve_frozen_policy_key(request) == (10, 5, 12, "lower_bound_only")
+
+    def test_SIZING_DIAGNOSTICS_05_SELECTED_COUNT_TELEMETRY(self) -> None:
+        """SIZING_DIAGNOSTICS_05_SELECTED_COUNT_TELEMETRY."""
+        import numpy as np
+
+        from src.stocks.ml.training import _sizing_diagnostics_summary
+
+        records = [{"selected_count": count} for count in (8, 9, 12)]
+        summary = _sizing_diagnostics_summary(records)
+        assert summary["selected_count_mean"] == pytest.approx(29 / 3, abs=1e-9)
+        assert summary["selected_count_p10"] == pytest.approx(
+            float(np.quantile(np.asarray([8.0, 9.0, 12.0]), 0.1))
+        )
+        assert summary["selected_count_p90"] == pytest.approx(
+            float(np.quantile(np.asarray([8.0, 9.0, 12.0]), 0.9))
+        )
+        empty = _sizing_diagnostics_summary([])
+        assert empty["selected_count_mean"] is None
+        assert empty["selected_count_p10"] is None
+        assert empty["selected_count_p90"] is None
+        legacy_keys = {
+            "decision_count",
+            "cash_decision_count",
+            "confidence_scale_mean",
+            "confidence_scale_p10",
+            "confidence_scale_p50",
+            "confidence_scale_p90",
+            "gross_before_compounding_mean",
+            "gross_after_compounding_mean",
+            "covariance_source_full_fraction",
+        }
+        assert set(empty) >= legacy_keys
