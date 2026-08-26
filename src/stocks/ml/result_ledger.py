@@ -685,6 +685,21 @@ def _project_request(request: NetAlphaTrainingRequest) -> dict[str, object]:
             "no_trade_band_bps": risk.no_trade_band_bps,
         },
     }
+    rescope = getattr(request, "universe_rescope", None)
+    if rescope is not None:
+        projection["universe_rescope"] = {
+            "fingerprint": str(rescope.fingerprint),
+            "market_cap_quantile_lo": float(rescope.market_cap_quantile_lo),
+            "market_cap_quantile_hi": float(rescope.market_cap_quantile_hi),
+            "min_market_cap_krw": (
+                None if rescope.min_market_cap_krw is None
+                else float(rescope.min_market_cap_krw)
+            ),
+            "max_adtv_quantile": (
+                None if rescope.max_adtv_quantile is None
+                else float(rescope.max_adtv_quantile)
+            ),
+        }
     projection["request_fingerprint"] = _stable_hash(projection)
     return projection
 

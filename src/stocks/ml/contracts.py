@@ -667,6 +667,55 @@ class SmallCapitalPlanSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class UniverseRescopeSettings:
+    """Pre-registered opportunity-set re-scope policy for direct ML loads.
+
+    Restricts the candidate pool to a trailing market-cap band plus optional
+    absolute floor and turnover ceiling. Only point-in-time columns are used,
+    so membership at decision time t depends solely on values observable at t.
+    """
+
+    market_cap_quantile_lo: float = 0.75
+    market_cap_quantile_hi: float = 1.0
+    min_market_cap_krw: float | None = None
+    max_adtv_quantile: float | None = None
+
+    def __post_init__(self) -> None:
+        lo = float(self.market_cap_quantile_lo)
+        hi = float(self.market_cap_quantile_hi)
+        if not math.isfinite(lo) or not 0.0 <= lo < 1.0:
+            raise ValueError("market_cap_quantile_lo must be finite in [0, 1)")
+        if not math.isfinite(hi) or not 0.0 < hi <= 1.0:
+            raise ValueError("market_cap_quantile_hi must be finite in (0, 1]")
+        if lo >= hi:
+            raise ValueError(
+                "market_cap_quantile_lo must be strictly below market_cap_quantile_hi"
+            )
+        if self.min_market_cap_krw is not None:
+            floor = float(self.min_market_cap_krw)
+            if not math.isfinite(floor) or floor <= 0.0:
+                raise ValueError("min_market_cap_krw must be positive finite or None")
+        if self.max_adtv_quantile is not None:
+            ceiling = float(self.max_adtv_quantile)
+            if not math.isfinite(ceiling) or not 0.0 < ceiling <= 1.0:
+                raise ValueError(
+                    "max_adtv_quantile must be a finite fraction in (0, 1] or None"
+                )
+
+    @property
+    def fingerprint(self) -> str:
+        payload = "\n".join(
+            [
+                repr(float(self.market_cap_quantile_lo)),
+                repr(float(self.market_cap_quantile_hi)),
+                repr(self.min_market_cap_krw),
+                repr(self.max_adtv_quantile),
+            ]
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
 class NetAlphaTrainingRequest:
     """Input contract for the net-alpha training workflow.
 
@@ -723,6 +772,7 @@ class NetAlphaTrainingRequest:
     enable_excess_route: bool = False
     capital_plan: SmallCapitalPlanSettings | None = None
     satellite_settings: SatelliteOverlaySettings | None = None
+    universe_rescope: UniverseRescopeSettings | None = None
 
     def __post_init__(self) -> None:
         if not self.artifact_id:

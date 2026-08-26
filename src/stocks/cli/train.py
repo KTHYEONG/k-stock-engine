@@ -68,6 +68,7 @@ from src.stocks.ml.contracts import (
     RiskSettings,
     SatelliteOverlaySettings,
     SmallCapitalPlanSettings,
+    UniverseRescopeSettings,
 )
 from src.stocks.ml.data import compose_net_alpha_training_data
 from src.stocks.ml.replay_resources import (
@@ -851,6 +852,44 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--discovery-workers", type=int, default=1)
+    parser.add_argument(
+        "--enable-universe-rescope",
+        action="store_true",
+        help=(
+            "Restrict the candidate pool to the trailing market-cap upper "
+            "band (point-in-time only) before fitting and replay"
+        ),
+    )
+    parser.add_argument(
+        "--rescope-mcap-quantile-lo",
+        type=float,
+        default=0.75,
+        help="Keep sessions' members with trailing-mcap rank fraction >= lo",
+    )
+    parser.add_argument(
+        "--rescope-mcap-quantile-hi",
+        type=float,
+        default=1.0,
+        help="Optional upper band edge; 1.0 keeps the largest names",
+    )
+    parser.add_argument(
+        "--rescope-min-market-cap-krw",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional absolute market-cap floor in KRW; 0 (default) omits "
+            "the floor"
+        ),
+    )
+    parser.add_argument(
+        "--rescope-max-adtv-quantile",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional per-session trailing-ADTV quantile ceiling; 0 (default) "
+            "omits the ceiling"
+        ),
+    )
     return parser
 
 
@@ -943,6 +982,24 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
                 ),
             )
             if bool(getattr(args, 'enable_etf_satellite', False))
+            else None
+        ),
+        universe_rescope=(
+            UniverseRescopeSettings(
+                market_cap_quantile_lo=float(args.rescope_mcap_quantile_lo),
+                market_cap_quantile_hi=float(args.rescope_mcap_quantile_hi),
+                min_market_cap_krw=(
+                    float(args.rescope_min_market_cap_krw)
+                    if float(args.rescope_min_market_cap_krw) > 0.0
+                    else None
+                ),
+                max_adtv_quantile=(
+                    float(args.rescope_max_adtv_quantile)
+                    if float(args.rescope_max_adtv_quantile) > 0.0
+                    else None
+                ),
+            )
+            if bool(getattr(args, 'enable_universe_rescope', False))
             else None
         ),
         portfolio=PortfolioSettings(
@@ -1665,7 +1722,7 @@ def _run_direct_training(
             planned_bytes=planned_bytes,
             live_owners=("decision_frame", "labels_by_horizon"),
         )
-        data = loader.load_training_data(request_data, decision_time, checkpoint=journal.direct_load_checkpoint)
+        data = loader.load_training_data(request_data, decision_time, checkpoint=journal.direct_load_checkpoint, rescope=request.universe_rescope)
     except (TrainingRunDeniedError, _EnvelopeBudgetError) as exc:
         return _terminal_guard_failure(str(getattr(exc, "stage", "") or "direct_load"), exc)
     except ValueError as exc:
