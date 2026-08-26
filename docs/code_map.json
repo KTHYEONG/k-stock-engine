@@ -442,5 +442,8 @@
   },
   "src/stocks/ml/satellite_overlay.py": {
     "testing": "tests/unit/stocks/ml/test_satellite_overlay.py"
+  },
+  "src/stocks/ml/universe_rescope.py": {
+    "testing": "tests/unit/stocks/ml/test_universe_rescope.py"
   }
 }

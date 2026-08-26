@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_UNIVERSE_RESCOPE_GROWTH_LIFT",
+      "date": "2026-08-26",
+      "adr_id": "ADR_20260826_UNIVERSE_RESCOPE_GROWTH_LIFT",
+      "domain": "quant",
+      "title": "Universe rescope for compounding base lift (trailing mcap band)",
+      "why": "Eligible-universe equal-weight drift -22.8%/yr (MCAP Q1 -48% to Q5 +9.6%) drags absolute lower CAGR to -1.49% despite certified excess +7.9%; small-cap bleed dominates candidate pool",
+      "resolution": "Added UniverseRescopeSettings (mcap_quantile_lo/hi + floor + adtv ceiling, fingerprint), apply_universe_rescope kernel (per-session rank fraction, fail-closed), DirectDataLoader conditional market_cap scan, CLI flags --enable-universe-rescope/--rescope-*, and ledger projection threading; flag-off byte-identical",
+      "impact": "Loader verified: q75 keeps 230k/925k (p50 90, fraction 0.249) via journal; 1246 tests pass; full-window q75 run exposed economic calibration bucket edge (needs lo~0.60 or bucket 5) for next tuning iteration"
+    },
+    {
       "task_id": "TASK_BREAKTHROUGH_GROWTH_V1",
       "date": "2026-08-26",
       "adr_id": "ADR_20260826_BREAKTHROUGH_GROWTH_V1",
@@ -989,16 +999,6 @@
       "why": "Record the latest full 81-trial run and replace stale backtest results after the selection-engine redesign.",
       "resolution": "Registered the 81-trial artifact telemetry, promotion funnel, route-level timings, RSS peaks, and NO_TRADE economic-gate evidence; synchronized task and code-map indexes.",
       "impact": "The run completed in 19:54.38 with 7,672.23 MiB process RSS under the 8,000 MiB limit; 81 terminal trials completed, six finalists replayed, and no candidate passed the economic gate."
-    },
-    {
-      "task_id": "TASK_ECONOMIC_REPLAY_SHORTLIST_THROUGHPUT",
-      "date": "2026-08-12",
-      "adr_id": "ADR_20260812_ECONOMIC_REPLAY_SHORTLIST_THROUGHPUT",
-      "domain": "stocks",
-      "title": "Bounded shortlist refit execution",
-      "why": "The 81-trial run reached h5 screen completion but did not produce a final artifact before the execution session ended.",
-      "resolution": "Registered the screen-informed 900-round/100-patience shortlist refit optimization and synchronized the bounded execution outcome.",
-      "impact": "Preserves all causal, cost, bootstrap, replay, RSS, and promotion gates while keeping the repository clean for the next durable long-running execution."
     }
   ]
 }
