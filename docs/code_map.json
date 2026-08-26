@@ -435,5 +435,8 @@
   },
   "src/stocks/ml/economic_research.py": {
     "testing": "tests/unit/stocks/ml/test_economic_research.py"
+  },
+  "src/stocks/ml/capital_plan.py": {
+    "testing": "tests/unit/stocks/ml/test_capital_plan.py"
   }
 }
