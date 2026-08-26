@@ -66,6 +66,7 @@ from src.stocks.ml.contracts import (
     PolicyProfile,
     PortfolioSettings,
     RiskSettings,
+    SatelliteOverlaySettings,
     SmallCapitalPlanSettings,
 )
 from src.stocks.ml.data import compose_net_alpha_training_data
@@ -776,6 +777,29 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--enable-unhedged-stack-rung",
+        action="store_true",
+        help=(
+            "Opt in to the unhedged_stack_v1 frontier profile, which extends "
+            "the nem rung with a widened conviction basis (single-name cap "
+            "0.25) for concentrated small-capital routes"
+        ),
+    )
+    parser.add_argument(
+        "--enable-etf-satellite",
+        action="store_true",
+        help=(
+            "Project leveraged/inverse ETF satellites on the gated route's "
+            "freed capital (conservative tax/fee/drag model)"
+        ),
+    )
+    parser.add_argument(
+        "--satellite-mdd-budget",
+        type=float,
+        default=0.35,
+        help="Combined-book MDD budget for the ETF satellite projection",
+    )
+    parser.add_argument(
         "--cert-max-drawdown",
         type=float,
         default=0.5,
@@ -862,6 +886,10 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
         from src.stocks.config.research import policy_profiles_with_unhedged_nem
 
         policy_profiles = policy_profiles_with_unhedged_nem()
+    if bool(getattr(args, 'enable_unhedged_stack_rung', False)):
+        from src.stocks.config.research import policy_profiles_with_unhedged_stack
+
+        policy_profiles = policy_profiles_with_unhedged_stack()
     return NetAlphaTrainingRequest(
         artifact_id=args.artifact_id,
         candidate_horizon_sessions=horizons,
@@ -905,6 +933,16 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
         capital_plan=(
             SmallCapitalPlanSettings(seed_capital_krw=float(args.seed_capital_plan_krw))
             if float(getattr(args, 'seed_capital_plan_krw', 0.0)) > 0.0
+            else None
+        ),
+        satellite_settings=(
+            SatelliteOverlaySettings(
+                enabled=True,
+                mdd_budget=float(
+                    getattr(args, 'satellite_mdd_budget', 0.35)
+                ),
+            )
+            if bool(getattr(args, 'enable_etf_satellite', False))
             else None
         ),
         portfolio=PortfolioSettings(
