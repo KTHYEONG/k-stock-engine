@@ -407,3 +407,28 @@ class TestParticipationTurnoverOverrides:
         for bad in (-0.1, float("nan"), float("inf"), 1.0, 1.5):
             with pytest.raises(ValueError, match="turnover_budget_override"):
                 PolicyProfile(profile_id="x", turnover_budget_override=bad)
+
+
+def test_hedge_grid_validation_failclosed() -> None:
+    """hedge_grid_validation_failclosed.
+
+    hedge_leverage_grid accepts None and strictly ascending grids in
+    [1.0, 5.0]; descending, non-positive, >5.0, non-finite, duplicate, and
+    empty values all fail closed at construction.
+    """
+    from src.stocks.ml.contracts import CompoundingCertificationSettings
+
+    assert CompoundingCertificationSettings().hedge_leverage_grid is None
+    ok = CompoundingCertificationSettings(hedge_leverage_grid=(1.0, 1.5, 2.0, 2.5, 3.0))
+    assert ok.hedge_leverage_grid == (1.0, 1.5, 2.0, 2.5, 3.0)
+
+    for bad in (
+        (3.0, 2.0),
+        (0.5, 2.0),
+        (1.0, 5.5),
+        (1.0, float("nan")),
+        (1.0, float("inf")),
+        (2.0, 2.0),
+    ):
+        with pytest.raises(ValueError, match="hedge_leverage_grid"):
+            CompoundingCertificationSettings(hedge_leverage_grid=bad)
