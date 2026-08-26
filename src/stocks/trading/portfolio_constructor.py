@@ -1563,6 +1563,7 @@ def _build_allocations(
             covariance_source=covariance_source,
             participation_clamped_count=clamped_count,
             participation_name_count=name_count,
+            effective_breadth=_effective_breadth(target_full),
         )
 
     allocations: list[Allocation] = []
@@ -1682,6 +1683,20 @@ def _compounding_scale(
     return scale, confidence_edge_h, confidence_variance_h, None
 
 
+def _effective_breadth(weights: Mapping[str, float]) -> float | None:
+    """Inverse Herfindahl breadth over strictly positive normalized weights."""
+    values = [float(weight) for weight in weights.values() if weight > 0.0]
+    total = sum(values)
+    if total <= 0.0 or not math.isfinite(total):
+        return None
+    shares = [weight / total for weight in values]
+    herfindahl = sum(share * share for share in shares)
+    if herfindahl <= 0.0 or not math.isfinite(herfindahl):
+        return None
+    breadth = 1.0 / herfindahl
+    return breadth if math.isfinite(breadth) else None
+
+
 def _record_compounding_decision(
     policy: StockRiskPolicy,
     *,
@@ -1699,6 +1714,7 @@ def _record_compounding_decision(
     covariance_source: str = "",
     participation_clamped_count: int | None = None,
     participation_name_count: int | None = None,
+    effective_breadth: float | None = None,
 ) -> None:
     """Append one deterministic JSON-safe per-decision compounding record.
 
@@ -1743,6 +1759,7 @@ def _record_compounding_decision(
         "participation_name_count": (
             None if participation_name_count is None else int(participation_name_count)
         ),
+        "effective_breadth": _finite_or_none(effective_breadth),
     }
     policy.compounding_evidence.append(record)
     logger.debug(

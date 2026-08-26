@@ -553,6 +553,7 @@ class NetAlphaTrainingRequest:
     holm_family_scope: Literal["frontier", "route_gatekeeping"] = "frontier"
     discovery_workers: int = 1
     enable_sparse_retained_rewaterfill: bool = False
+    enable_excess_route: bool = False
 
     def __post_init__(self) -> None:
         if not self.artifact_id:
