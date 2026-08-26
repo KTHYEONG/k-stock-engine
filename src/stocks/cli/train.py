@@ -66,6 +66,7 @@ from src.stocks.ml.contracts import (
     PolicyProfile,
     PortfolioSettings,
     RiskSettings,
+    SmallCapitalPlanSettings,
 )
 from src.stocks.ml.data import compose_net_alpha_training_data
 from src.stocks.ml.replay_resources import (
@@ -798,6 +799,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--seed-capital-plan-krw",
+        type=float,
+        default=0.0,
+        help=(
+            "Seed capital in KRW for the small-capital implementation plan; "
+            "0 (default) omits the plan section from the growth route payload"
+        ),
+    )
+    parser.add_argument(
         "--holm-family-scope",
         choices=["frontier", "route_gatekeeping"],
         default="frontier",
@@ -878,6 +888,11 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
                 if getattr(args, 'hedge_leverage_grid', None)
                 else None
             ),
+        ),
+        capital_plan=(
+            SmallCapitalPlanSettings(seed_capital_krw=float(args.seed_capital_plan_krw))
+            if float(getattr(args, 'seed_capital_plan_krw', 0.0)) > 0.0
+            else None
         ),
         portfolio=PortfolioSettings(
             top_k=args.top_k,
