@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ml_hedged_excess_promotion",
+      "date": "2026-08-26",
+      "adr_id": "ADR_20260826_ml_hedged_excess_promotion",
+      "domain": "stocks_ml",
+      "title": "Hedged-excess sleeve certification and declared-ladder seed promotion",
+      "why": "ab2 레저가 절대 LB 음수(base -1.75%/stress -2.16%)로 fail-closed NO_TRADE에 고정되고 matched-excess(+6.28%)는 연구 판정(PROMOTABLE_EXCESS)에만 머물렀으며, seed가 lower_bound_only 하드핀(compound_track.resolve_frozen_policy_key)되어 옵트인 growth rung(exposure 0.78~0.83)이 챔피언이 될 수 없어 선발 계층이 잔여 병목.",
+      "resolution": "certify_hedged_excess_route 신설(moving-block 부트스트랩 excess 하위경계 + settings.max_drawdown 캡 하 project_hedge_sleeve 러닝의 (-stress_cagr, vol_managed 우선, 저 leverage) 결정론 선택 + 하위경계 시나리오 분산드래그 보정 expm1(L*g_lb-0.5*vol^2)>0 게이트, point estimate 금지). _growth_route_projection에 compounding/horizon_sessions 옵트인 kwarg 추가해 blocking gate 청정·벤치마크 부착 시 hedged_excess_certificate bounded scalars 서피싱 및 통과 시 promotion_status=PROMOTED_EXCESS_SLEEVE 승격(artifact promoted/model_type 불변 fail-closed), blend champion 캐리아웃 확장, training 2곳+economic_research 1곳 호출부 wiring. resolve_frozen_policy_key는 선언 ladder 우선순위(growth_full_utilization>excess_full_kelly>lower_bound_only)와 feasible_cells_for_profile 프로파일 스코프 feasibility로 개정, 플래그 오프 경로 바이트 동일.",
+      "impact": "A/B 풀런(ml_hedged_excess_ab3_20260826, 6.4분/RSS 4.3GB)에서 seed=10:5:8:growth_full_utilization 도달, matched_lower_excess +6.28→+7.88%, excess_point +14.0→+17.6%, 인증 스칼라 excess_lower_cagr +10.62%/sleeve_lower_stress_cagr +11.06%(static L2.0 선택, projected MDD 43.1%<=cap)로 PROMOTED_EXCESS_SLEEVE 첫 발동. 절대 게이트 fail-closed 유지(outcome.promoted=False). 시나리오 5건 신규, unit 1156+integration 36 passed, lean_check PASS."
+    },
+    {
       "task_id": "ADR_20260825_ml_execution_conversion_unlock",
       "date": "2026-08-25",
       "adr_id": "ADR_20260825_ADR_20260825_ml_execution_conversion_unlock",
@@ -989,16 +999,6 @@
       "why": "Rank-IC 신호와 비용 후 경제적 성과의 차이를 최신 80-trial 실행 결과로 기록함",
       "resolution": "최신 net-alpha calibrated ML 실행 결과만 back-res 문서에 수치 중심으로 동기화하고 Rank-IC 해석을 추가함",
       "impact": "문서가 최신 NO_TRADE 판정과 비용·bootstrap 근거만 반영하며 과거 실행 결과는 제거됨"
-    },
-    {
-      "task_id": "backtest_bottleneck_no_trade_improvement",
-      "date": "2026-08-12",
-      "adr_id": "ADR_20260812_backtest_bottleneck_no_trade_improvement",
-      "domain": "stocks",
-      "title": "Backtest bottleneck and NO_TRADE replay optimization",
-      "why": "Record ADTV cache regression recovery and latest 80-trial economic replay results.",
-      "resolution": "Added causal ADTV to replay static context, restored candidate orders/fills, and documented per-candidate bootstrap failures with fail-closed NO_TRADE.",
-      "impact": "Candidate replay is valid and observable; all eight shortlisted candidates remain unpromoted because bootstrap excess lower bounds are negative."
     }
   ]
 }
