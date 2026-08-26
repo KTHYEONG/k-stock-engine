@@ -668,6 +668,7 @@ def _project_request(request: NetAlphaTrainingRequest) -> dict[str, object]:
         "max_training_lookback_sessions": request.max_training_lookback_sessions,
         "seed": request.seed,
         "enable_sparse_retained_rewaterfill": request.enable_sparse_retained_rewaterfill,
+        "enable_excess_route": request.enable_excess_route,
         "portfolio": {
             "top_k": portfolio.top_k,
             "max_single_weight": portfolio.max_single_weight,
@@ -1026,6 +1027,42 @@ def _compact_growth_route(metrics: Mapping[str, object]) -> dict[str, object]:
     outcome = route
     summary['promotion_status'] = outcome.get('promotion_status', 'NO_TRADE')
     summary['hedge_sleeve'] = _compact_hedge_sleeve(route)
+    excess_route = route.get("excess_route")
+    if isinstance(excess_route, Mapping):
+
+        def _passthrough_digest(value: object) -> dict[str, object]:
+            if isinstance(value, Mapping):
+                return {
+                    "count": _as_int(value.get("count")),
+                    "sha256": str(value.get("sha256", "")),
+                }
+            return {"count": 0, "sha256": ""}
+
+        summary["excess_route"] = {
+            "passed": bool(excess_route.get("passed")),
+            "reasons_digest": _passthrough_digest(
+                excess_route.get("reasons_digest")
+            ),
+            "route_version": _json_scalar(excess_route.get("route_version")),
+            "excess_lower_cagr": _as_float(excess_route.get("excess_lower_cagr")),
+            "sleeve_lower_stress_cagr": _as_float(
+                excess_route.get("sleeve_lower_stress_cagr")
+            ),
+            "hedge_variant": _json_scalar(excess_route.get("hedge_variant")),
+            "hedge_leverage": _as_float(excess_route.get("hedge_leverage")),
+            "hedge_point_cagr": _as_float(excess_route.get("hedge_point_cagr")),
+            "hedge_stress_cagr": _as_float(excess_route.get("hedge_stress_cagr")),
+            "hedge_projected_mdd": _as_float(
+                excess_route.get("hedge_projected_mdd")
+            ),
+            "observed_intervals": _as_int(excess_route.get("observed_intervals")),
+            "invested_intervals": _as_int(excess_route.get("invested_intervals")),
+            "filled_orders": _as_int(excess_route.get("filled_orders")),
+            "selected_policies_digest": _passthrough_digest(
+                excess_route.get("selected_policies_digest")
+            ),
+            "provenance": _json_scalar(excess_route.get("provenance")),
+        }
     return summary
 
 

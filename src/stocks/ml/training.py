@@ -671,6 +671,9 @@ def _run_discovery_and_publish(
     certificate = certify_growth_route(route, primary, request.compounding)
     growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary)  # noqa: E501
     _attach_frozen_compound_track(growth_route, discovery.evidence, request)
+    growth_route = _attach_excess_route_certificate(
+        growth_route, discovery, request, pre_holdout, primary
+    )
     route_reasons = certificate.get("reasons")
     reason_list = (
         [str(reason) for reason in route_reasons]
@@ -1459,6 +1462,13 @@ def _sizing_diagnostics_summary(
         if clamped is not None and names is not None and names > 0.0:
             clamped_total += int(clamped)
             names_total += int(names)
+    breadths = [
+        breadth
+        for breadth in (
+            _float_or_none(record.get("effective_breadth")) for record in records
+        )
+        if breadth is not None
+    ]
 
     def _quantile(values: list[float], q: float) -> float | None:
         if not values:
@@ -1491,6 +1501,9 @@ def _sizing_diagnostics_summary(
         "participation_clamped_fraction": (
             clamped_total / names_total if names_total > 0 else None
         ),
+        "effective_breadth_mean": _mean(breadths),
+        "effective_breadth_p10": _quantile(breadths, 0.1),
+        "effective_breadth_p90": _quantile(breadths, 0.9),
     }
 
 
@@ -3815,7 +3828,11 @@ def _publish_no_trade(
         eligible_from=eligible_from,
         eligible_to=eligible_to,
         model_type="no_trade",
-        params={"no_trade": "true"},
+        params=(
+            {"no_trade": "true", "enable_excess_route": "true"}
+            if request.enable_excess_route
+            else {"no_trade": "true"}
+        ),
     )
     model = _no_trade_model(
         manifest,
@@ -4367,6 +4384,126 @@ def _attach_frozen_compound_track(
     )
 
 
+_BLOCKING_SLEEVE_GATE_REASONS = frozenset(
+    {
+        "no-filled-orders",
+        "insufficient-observed-sessions",
+        "invested-coverage-insufficient",
+        "max-drawdown-exceeded",
+        "period-series-incomplete",
+    }
+)
+
+
+def _attach_excess_route_certificate(
+    growth_route: dict[str, object],
+    discovery: HorizonDiscovery,
+    request: NetAlphaTrainingRequest,
+    panel: pl.DataFrame,
+    primary_horizon: int,
+) -> dict[str, object]:
+    """Attach the opt-in excess-scoped route certificate to a projection.
+
+    Stitches one parallel prequential route whose per-segment champions are
+    selected on exposure-matched excess lower bounds instead of absolute
+    growth, certifies it with the shared hedged-excess kernel, and publishes
+    bounded scalars under ``excess_route``. A passing excess certificate
+    upgrades a research-only outcome to ``PROMOTED_EXCESS_SLEEVE`` only when
+    the primary sleeve verdict is absent or failed and no blocking gate
+    reason survives; the artifact promotion path itself stays untouched.
+    Flag-off callers receive the projection byte-identical.
+    """
+    if not bool(getattr(request, "enable_excess_route", False)):
+        return growth_route
+    benchmarks_by_key, _failures = _compute_candidate_benchmarks(discovery, panel)
+    if not benchmarks_by_key:
+        return growth_route
+    try:
+        excess_route = stitch_prequential_growth_route(
+            discovery.evidence,
+            request.bootstrap_alpha,
+            request.seed,
+            request.bootstrap_resamples,
+            seed_policy=_seed_policy_or_none(request),
+            benchmarks_by_key=benchmarks_by_key,
+        )
+        fills = 0
+        for key in {k for k in excess_route.interval_policies if k is not None}:
+            evidence = discovery.execution_evidence_by_candidate.get(key)
+            if evidence is not None:
+                fills += int(evidence.filled_orders)
+        excess_route = replace(excess_route, filled_orders=fills)
+        certificate = certify_hedged_excess_route(
+            excess_route, max(int(primary_horizon), 1), request.compounding
+        )
+    except ValueError:
+        return growth_route
+    if not excess_route.base_log_growth:
+        return growth_route
+
+    raw_reasons = certificate.get("reasons", ())
+    reasons = (
+        [str(reason) for reason in raw_reasons if str(reason)]
+        if isinstance(raw_reasons, (list, tuple))
+        else []
+    )
+    reasons_payload = json.dumps(sorted(set(reasons)), separators=(",", ":"))
+    labels = [_policy_key_label(key) for key in excess_route.selected_policies]
+    policies_payload = json.dumps(labels, separators=(",", ":"))
+
+    def _finite(value: object) -> float | None:
+        parsed = float(value) if isinstance(value, (int, float)) else None
+        return round(parsed, 12) if parsed is not None and math.isfinite(parsed) else None
+
+    block: dict[str, object] = {
+        "passed": bool(certificate.get("passed")),
+        "reasons_digest": {
+            "count": len(reasons),
+            "sha256": hashlib.sha256(reasons_payload.encode("utf-8")).hexdigest(),
+        },
+        "route_version": str(excess_route.route_version),
+        "excess_lower_cagr": _finite(certificate.get("excess_lower_cagr")),
+        "sleeve_lower_stress_cagr": _finite(
+            certificate.get("sleeve_lower_stress_cagr")
+        ),
+        "hedge_variant": str(certificate.get("hedge_variant", "")),
+        "hedge_leverage": _finite(certificate.get("hedge_leverage")),
+        "hedge_point_cagr": _finite(certificate.get("hedge_point_cagr")),
+        "hedge_stress_cagr": _finite(certificate.get("hedge_stress_cagr")),
+        "hedge_projected_mdd": _finite(certificate.get("hedge_projected_mdd")),
+        "observed_intervals": int(excess_route.observed_interval_count),
+        "invested_intervals": int(excess_route.invested_interval_count),
+        "filled_orders": int(excess_route.filled_orders),
+        "selected_policies_digest": {
+            "count": len(labels),
+            "sha256": hashlib.sha256(policies_payload.encode("utf-8")).hexdigest(),
+        },
+        "provenance": "excess-route-v1",
+    }
+    growth_route["excess_route"] = block
+
+    raw_reason_counts = growth_route.get("rejection_reason_counts", {})
+    reason_keys: set[str] = set()
+    if isinstance(raw_reason_counts, dict):
+        reason_keys = {str(key) for key in raw_reason_counts}
+    blocking_present = bool(reason_keys & _BLOCKING_SLEEVE_GATE_REASONS)
+    primary_sleeve = growth_route.get("hedged_excess_certificate")
+    primary_passed = isinstance(primary_sleeve, dict) and bool(
+        primary_sleeve.get("passed")
+    )
+    if (
+        block["passed"]
+        and not primary_passed
+        and not blocking_present
+        and not str(growth_route.get("benchmark_reconcile_failure", "") or "")
+    ):
+        sourced = dict(certificate)
+        sourced["provenance"] = "excess-route-v1"
+        growth_route["hedged_excess_certificate"] = sourced
+        growth_route["promotion_status"] = "PROMOTED_EXCESS_SLEEVE"
+    return growth_route
+
+
 def _panel_within_sessions(
     panel: pl.DataFrame, sessions: tuple[datetime, ...]
 ) -> pl.DataFrame:
@@ -4374,6 +4511,74 @@ def _panel_within_sessions(
     if panel.is_empty() or "session" not in panel.columns or not sessions:
         return panel
     return panel.filter(pl.col("session").is_in(list(sessions)))
+
+
+def _compute_candidate_benchmarks(
+    discovery: HorizonDiscovery,
+    panel: pl.DataFrame,
+) -> tuple[
+    dict[tuple[int, int, int, str], tuple[float, ...]],
+    dict[tuple[int, int, int, str], str],
+]:
+    """Compute per-candidate exposure-matched benchmark series.
+
+    Pure extraction of the reconciliation loop shared by route benchmark
+    attachment and the excess-scoped route: each candidate's replay evidence
+    must carry interval exposures aligned with per-segment session bounds so
+    one exposure-matched universe benchmark can be stitched. Failures emit a
+    normalized reason per candidate key instead of fabricating series.
+    """
+    benchmarks: dict[tuple[int, int, int, str], tuple[float, ...]] = {}
+    failures: dict[tuple[int, int, int, str], str] = {}
+    sessions = (
+        tuple(sorted(panel["session"].unique().to_list()))
+        if (not panel.is_empty() and "session" in panel.columns)
+        else ()
+    )
+    if not sessions:
+        for key in discovery.execution_evidence_by_candidate:
+            failures[key] = "benchmark-panel-missing"
+        return benchmarks, failures
+    for key, evidence in sorted(discovery.execution_evidence_by_candidate.items()):
+        exposure = evidence.base_interval_exposure
+        bounds_by_segment = getattr(
+            evidence, "base_interval_session_bounds", ()
+        )
+        if not bounds_by_segment:
+            failures[key] = "benchmark-session-bounds-missing"
+            continue
+        if sum(len(bounds) - 1 for bounds in bounds_by_segment) != len(exposure):
+            failures[key] = "benchmark-exposure-length-mismatch"
+            continue
+        parts: list[float] = []
+        failure = ""
+        offset = 0
+        for bounds in bounds_by_segment:
+            segment_exposure = exposure[offset : offset + len(bounds) - 1]
+            offset += len(bounds) - 1
+            adjusted = (*segment_exposure, 0.0)
+            if any(
+                (not np.isfinite(value)) or value < 0.0 or value > 1.0
+                for value in segment_exposure
+            ):
+                failure = "benchmark-exposure-invalid"
+                break
+            segment_panel = _panel_within_sessions(panel, bounds)
+            try:
+                benchmark = exposure_matched_benchmark_log_growth(segment_panel, bounds, adjusted)
+            except ValueError:
+                failure = "benchmark-series-invalid"
+                break
+            parts.extend(benchmark[: len(segment_exposure)])
+        if failure:
+            failures[key] = failure
+            continue
+        benchmark = tuple(parts)
+        if len(benchmark) != len(evidence.base_log_growth):
+            failures[key] = "benchmark-exposure-length-mismatch"
+            continue
+        benchmarks[key] = benchmark
+    return benchmarks, failures
 
 
 def _attach_growth_route_execution_evidence(
@@ -4394,66 +4599,27 @@ def _attach_growth_route_execution_evidence(
         return route
     fills = 0
     filled_cycles = 0
-    benchmarks: dict[tuple[int, int, int, str], tuple[float, ...]] = {}
-    sessions = (
-        tuple(sorted(panel["session"].unique().to_list()))
-        if (not panel.is_empty() and "session" in panel.columns)
-        else ()
-    )
-    benchmark_failure = ""
-    benchmark_failed = not sessions
-    if benchmark_failed:
-        benchmark_failure = "benchmark-panel-missing"
     for key in sorted(keys):
         evidence = discovery.execution_evidence_by_candidate.get(key)
         if evidence is None:
             continue
         fills += int(evidence.filled_orders)
         filled_cycles += int(evidence.filled_cycle_count)
-        if benchmark_failed:
-            continue
-        exposure = evidence.base_interval_exposure
-        bounds_by_segment = getattr(
-            evidence, "base_interval_session_bounds", ()
-        )
-        if not bounds_by_segment:
+    candidate_benchmarks, candidate_failures = _compute_candidate_benchmarks(
+        discovery, panel
+    )
+    benchmarks: dict[tuple[int, int, int, str], tuple[float, ...]] = {
+        key: series
+        for key, series in candidate_benchmarks.items()
+        if key in keys
+    }
+    benchmark_failure = ""
+    benchmark_failed = False
+    for key in sorted(keys):
+        reason = candidate_failures.get(key)
+        if reason is not None:
             benchmark_failed = True
-            benchmark_failure = "benchmark-session-bounds-missing"
-            continue
-        if sum(len(bounds) - 1 for bounds in bounds_by_segment) != len(exposure):
-            benchmark_failed = True
-            benchmark_failure = "benchmark-exposure-length-mismatch"
-            continue
-        parts: list[float] = []
-        offset = 0
-        for bounds in bounds_by_segment:
-            segment_exposure = exposure[offset : offset + len(bounds) - 1]
-            offset += len(bounds) - 1
-            adjusted = (*segment_exposure, 0.0)
-            if any(
-                (not np.isfinite(value)) or value < 0.0 or value > 1.0
-                for value in segment_exposure
-            ):
-                benchmark_failed = True
-                benchmark_failure = "benchmark-exposure-invalid"
-                break
-            segment_sessions = bounds
-            segment_panel = _panel_within_sessions(panel, segment_sessions)
-            try:
-                benchmark = exposure_matched_benchmark_log_growth(segment_panel, segment_sessions, adjusted)
-            except ValueError:
-                benchmark_failed = True
-                benchmark_failure = "benchmark-series-invalid"
-                break
-            parts.extend(benchmark[: len(segment_exposure)])
-        if benchmark_failed:
-            continue
-        benchmark = tuple(parts)
-        if len(benchmark) != len(evidence.base_log_growth):
-            benchmark_failed = True
-            benchmark_failure = "benchmark-exposure-length-mismatch"
-            continue
-        benchmarks[key] = benchmark
+            benchmark_failure = reason
     stitched_benchmark: tuple[float, ...] = ()
     if not benchmark_failed and benchmarks.keys() == keys:
         positions: dict[tuple[int, int, int, str], dict[int, list[int]]] = {}
@@ -4581,6 +4747,9 @@ def _growth_route_research_payload(
     certificate = certify_growth_route(route, primary, request.compounding)
     growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary)  # noqa: E501
     _attach_frozen_compound_track(growth_route, discovery.evidence, request)
+    growth_route = _attach_excess_route_certificate(
+        growth_route, discovery, request, panel, primary
+    )
     return {
         "status": "RESEARCH_ONLY",
         "artifact_published": False,
