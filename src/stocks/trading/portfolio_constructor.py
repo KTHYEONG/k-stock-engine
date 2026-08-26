@@ -1441,12 +1441,15 @@ def _build_allocations(
         compounding_applied = True
     gross_after_compounding = sum(weights.values())
 
+    gross_before_gate = sum(weights.values())
     weights, nem_diagnostics = apply_net_exposure_gate(
         weights, net_exposure_proxy, policy
     )
     if nem_diagnostics:
         record: dict[str, object] = {
             "decision_session": str(decision_session),
+            "gross_pre_nem": float(gross_before_gate),
+            "gross_post_nem": float(sum(weights.values())),
         }
         for key in ("nem_scale", "nem_s_trend", "nem_s_vol"):
             value = nem_diagnostics.get(key)
