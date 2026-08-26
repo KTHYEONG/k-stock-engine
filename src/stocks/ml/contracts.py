@@ -86,7 +86,11 @@ LOWER_BOUND_HALF_KELLY_PROFILE_ID = "lower_bound_half_kelly"
 DEFAULT_POLICY_PROFILE_IDS = (LEGACY_OVERLAY_PROFILE_ID, LOWER_BOUND_ONLY_PROFILE_ID, LOWER_BOUND_HALF_KELLY_PROFILE_ID)
 EXCESS_FULL_KELLY_PROFILE_ID = "excess_full_kelly"
 GROWTH_FULL_UTILIZATION_PROFILE_ID = "growth_full_utilization"
-ALLOWED_EXTRA_PROFILE_IDS = (EXCESS_FULL_KELLY_PROFILE_ID, GROWTH_FULL_UTILIZATION_PROFILE_ID)
+ALLOWED_EXTRA_PROFILE_IDS = (
+    EXCESS_FULL_KELLY_PROFILE_ID,
+    GROWTH_FULL_UTILIZATION_PROFILE_ID,
+    "unhedged_nem_v1",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +126,9 @@ class PolicyProfile:
     vol_target_override: float | None = None
     participation_limit_override: float | None = None
     turnover_budget_override: float | None = None
+    net_exposure_gate_mode: Literal["off_v1", "trend_vol_v1"] = "off_v1"
+    gate_trend_lookback_sessions: int | None = None
+    gate_floor: float | None = None
 
     def __post_init__(self) -> None:
         if not self.profile_id:
@@ -158,6 +165,24 @@ class PolicyProfile:
             raise ValueError(
                 "turnover_budget_override must be None or finite in [0, 1), "
                 f"got {turnover!r}"
+            )
+        if self.net_exposure_gate_mode not in ("off_v1", "trend_vol_v1"):
+            raise ValueError(
+                "net_exposure_gate_mode must be 'off_v1' or 'trend_vol_v1', "
+                f"got {self.net_exposure_gate_mode!r}"
+            )
+        lookback = self.gate_trend_lookback_sessions
+        if lookback is not None and (not isinstance(lookback, int) or lookback < 1):
+            raise ValueError(
+                "gate_trend_lookback_sessions must be a positive integer, "
+                f"got {lookback!r}"
+            )
+        floor = self.gate_floor
+        if floor is not None and (
+            not np.isfinite(floor) or not 0.0 <= float(floor) < 1.0
+        ):
+            raise ValueError(
+                f"gate_floor must be None or finite in [0, 1), got {floor!r}"
             )
         if self.execution_utility_mode not in (
             "legacy_target_interpolation_v1",
