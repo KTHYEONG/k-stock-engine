@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import math
+from datetime import timedelta
 
 import numpy as np
 import pytest
 
-from src.stocks.ml.contracts import CompoundingCertificationSettings
+from src.stocks.ml.contracts import (
+    CompoundingCertificationSettings,
+    ExecutionFrontierSettings,
+)
 from src.stocks.ml.horizons import GrowthRouteEvidence
 from src.stocks.research.metrics import certify_hedged_excess_route
 
@@ -167,3 +171,167 @@ def test_lower_stress_gate_uses_lower_bound_not_point_estimate() -> None:
     assert not math.isclose(
         float(payload["sleeve_lower_stress_cagr"]), 0.0, abs_tol=1e-12
     )
+
+
+def test_excess_route_sleeve_upgrade_gatekeeping() -> None:
+    """excess_route_sleeve_upgrade_gatekeeping.
+
+    A passing excess-route certificate upgrades a research-only outcome to
+    PROMOTED_EXCESS_SLEEVE with provenance when the primary sleeve failed and
+    no blocking gate reason survives; any blocking gate reason (or a passing
+    primary sleeve) keeps the primary verdict authoritative. Flag-off callers
+    receive the projection byte-identical, and outcome.promoted stays False.
+    """
+    from dataclasses import replace as dc_replace
+    from datetime import UTC, datetime
+
+    import polars as pl
+
+    from src.stocks.ml.contracts import NetAlphaTrainingRequest
+    from src.stocks.ml.discovery import HorizonDiscovery
+    from src.stocks.ml.execution_replay import ExecutionReplayEvidence
+    from src.stocks.ml.horizons import HorizonOOFEvidence
+    from src.stocks.ml.training import _attach_excess_route_certificate
+
+    sessions = [datetime(2024, 3, 1, tzinfo=UTC) + timedelta(days=i) for i in range(40)]
+    rows = []
+    for session in sessions:
+        for t in range(3):
+            price = 40.0 + t
+            rows.append(
+                {
+                    "instrument_id": f"KRX:{t + 1:05d}",
+                    "session": session,
+                    "observation_time": session.replace(hour=15, minute=30),
+                    "available_time": session.replace(hour=15, minute=31),
+                    "open": price,
+                    "close": price * 1.01,
+                    "volume": 1_000_000.0,
+                    "trading_value": 100_000_000.0,
+                    "sector": "S0",
+                    "adtv": 100_000_000.0,
+                }
+            )
+    panel = pl.DataFrame(rows)
+    growth_length = 36
+    key = (10, 5, 12, "lower_bound_only")
+    bounds = (tuple(sessions[: growth_length + 1]),)
+    evidence = ExecutionReplayEvidence(
+        base_log_growth=tuple(0.002 for _ in range(growth_length)),
+        stress_log_growth=tuple(0.0015 for _ in range(growth_length)),
+        segment_ids=tuple(0 for _ in range(growth_length)),
+        planned_cycles=4,
+        filled_orders=24,
+        cash_session_fraction=0.0,
+        turnover=0.5,
+        observed_interval_count=growth_length,
+        invested_interval_count=growth_length,
+        invested_interval_fraction=1.0,
+        base_interval_exposure=tuple(0.9 for _ in range(growth_length)),
+        stress_interval_exposure=tuple(0.9 for _ in range(growth_length)),
+        base_interval_session_bounds=bounds,
+    )
+    oof = HorizonOOFEvidence(
+        horizon_sessions=key[0],
+        profile_id=key[3],
+        model_family="net_alpha_elastic_net",
+        base_log_growth=tuple(0.002 for _ in range(growth_length)),
+        stress_log_growth=tuple(0.0015 for _ in range(growth_length)),
+        cohort_segment_ids=tuple(0 for _ in range(growth_length)),
+        complete_cohort_count=growth_length,
+        active_cohort_count=growth_length,
+        partial_cohort_count=0,
+        missing_cohort_count=0,
+        segment_count=1,
+        fold_rank_ics=(0.2,),
+        rebalance_frequency_sessions=key[1],
+        top_k=key[2],
+    )
+    discovery = HorizonDiscovery(
+        evidence=(oof,),
+        diagnostics=(),
+        oof_by_horizon={},
+        execution_evidence_by_candidate={key: evidence},
+    )
+    small_settings = CompoundingCertificationSettings(
+        annualization_sessions=252,
+        min_observed_sessions=growth_length,
+        min_active_cohort_fraction=0.2,
+        max_drawdown=0.5,
+        bootstrap_alpha=0.05,
+        bootstrap_resamples=2000,
+        seed=42,
+    )
+    request = NetAlphaTrainingRequest(
+        artifact_id="na_excess_gate",
+        candidate_horizon_sessions=(10,),
+        execution_frontier=ExecutionFrontierSettings(
+            candidate_horizon_sessions=(10,),
+            candidate_rebalance_frequency_sessions=(5,),
+            candidate_top_k=(12,),
+        ),
+        enable_excess_route=True,
+        compounding=small_settings,
+    )
+
+    def _projection(**overrides: object) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "version": "v2",
+            "promotion_status": "NO_TRADE",
+            "candidate_count": 1,
+            "segment_count": 1,
+            "cash_segment_count": 0,
+            "selected_policy": "10:5:12:lower_bound_only",
+            "observed_intervals": growth_length,
+            "invested_intervals": growth_length,
+            "filled_orders": 24,
+            "rejection_reason_counts": {"non-positive-base-lower-cagr": 1},
+            "benchmark_reconcile_failure": "",
+            "hedge_sleeve_projection": {},
+        }
+        payload.update(overrides)
+        return payload
+
+    # Upgrade path: primary sleeve absent/failing, no blocking reasons.
+    growth_route = _attach_excess_route_certificate(
+        _projection(), discovery, request, panel, key[0]
+    )
+    block = growth_route["excess_route"]
+    assert block["passed"] is True
+    assert block["provenance"] == "excess-route-v1"
+    assert block["filled_orders"] == 24
+    assert growth_route["promotion_status"] == "PROMOTED_EXCESS_SLEEVE"
+    sourced = growth_route["hedged_excess_certificate"]
+    assert sourced["provenance"] == "excess-route-v1"
+    assert sourced["passed"] is True
+
+    # Blocking gates veto the upgrade even with a passing excess certificate.
+    blocked = _attach_excess_route_certificate(
+        _projection(rejection_reason_counts={"no-filled-orders": 1}),
+        discovery,
+        request,
+        panel,
+        key[0],
+    )
+    assert blocked["excess_route"]["passed"] is True
+    assert blocked["promotion_status"] == "NO_TRADE"
+    assert "hedged_excess_certificate" not in blocked
+
+    # A passing primary sleeve stays authoritative and untouched.
+    primary_pass = _projection(
+        hedged_excess_certificate={"passed": True, "reasons": []}
+    )
+    kept = _attach_excess_route_certificate(primary_pass, discovery, request, panel, key[0])
+    assert kept["hedged_excess_certificate"] == {"passed": True, "reasons": []}
+    assert "excess_route" not in kept or kept["excess_route"]["passed"] is True
+    assert kept["promotion_status"] == "NO_TRADE"
+
+    # Flag-off callers are untouched.
+    off = dc_replace(request, enable_excess_route=False)
+    untouched = _attach_excess_route_certificate(
+        _projection(), discovery, off, panel, key[0]
+    )
+    assert untouched == _projection()
+
+    # The research verdict never promotes the artifact itself.
+    assert growth_route.get("promoted", False) is False
