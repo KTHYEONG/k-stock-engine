@@ -439,5 +439,8 @@
   },
   "src/stocks/ml/capital_plan.py": {
     "testing": "tests/unit/stocks/ml/test_capital_plan.py"
+  },
+  "src/stocks/ml/satellite_overlay.py": {
+    "testing": "tests/unit/stocks/ml/test_satellite_overlay.py"
   }
 }

@@ -30,6 +30,7 @@ __all__ = [
     "EXCESS_FULL_KELLY_PROFILE_ID",
     "GROWTH_FULL_UTILIZATION_PROFILE_ID",
     "UNHEDGED_NEM_PROFILE_ID",
+    "UNHEDGED_STACK_PROFILE_ID",
     "CanonicalResearchProfile",
 ]
 
@@ -117,6 +118,37 @@ _UNHEDGED_NEM_PROFILE_ID = "unhedged_nem_v1"
 
 # Public re-export for callers that need the id without private access.
 UNHEDGED_NEM_PROFILE_ID = _UNHEDGED_NEM_PROFILE_ID
+
+# Concentration stack rung: growth overrides + NEM gate + widened conviction
+# basis (single-name cap 0.25) so the frontier measures concentrated variants.
+_UNHEDGED_STACK_PROFILE_ID = "unhedged_stack_v1"
+UNHEDGED_STACK_PROFILE_ID = _UNHEDGED_STACK_PROFILE_ID
+_UNHEDGED_STACK_SINGLE_NAME_CAP = 0.25
+
+
+def policy_profiles_with_unhedged_stack() -> tuple[PolicyProfile, ...]:
+    """Opt-in ladder adding the concentrated gated stack rung.
+
+    ``unhedged_stack_v1`` extends the nem rung with a 0.25 single-name cap so
+    the certified replay can measure conviction concentration on top of the
+    net-exposure gate. Flag-off runs stay byte-identical.
+    """
+    return (
+        *policy_profiles_with_unhedged_nem(),
+        PolicyProfile(
+            profile_id=_UNHEDGED_STACK_PROFILE_ID,
+            no_trade_band_bps=0.0,
+            growth_risk_aversion=1.0,
+            execution_utility_mode="sparse_hold_replace_v2",
+            sizing_mode="risk_balanced_waterfill_v2",
+            single_name_cap_override=_UNHEDGED_STACK_SINGLE_NAME_CAP,
+            gross_utilization_target=_GROWTH_FULL_UTILIZATION_GROSS_UTILIZATION,
+            vol_target_override=_GROWTH_FULL_UTILIZATION_VOL_TARGET,
+            participation_limit_override=_GROWTH_FULL_UTILIZATION_PARTICIPATION,
+            turnover_budget_override=_GROWTH_FULL_UTILIZATION_TURNOVER_BUDGET,
+            net_exposure_gate_mode="trend_vol_v1",
+        ),
+    )
 
 
 def policy_profiles_with_unhedged_nem() -> tuple[PolicyProfile, ...]:
