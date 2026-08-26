@@ -28,7 +28,9 @@ from src.stocks.ml.contracts import (
     CANONICAL_FEATURE_SET,
     HorizonJoinEvidence,
     NetAlphaResearchData,
+    UniverseRescopeSettings,
 )
+from src.stocks.ml.universe_rescope import apply_universe_rescope
 from src.storage.parquet_datasets import ParquetDatasetStore
 
 logger = logging.getLogger("stocks.data.direct")
@@ -100,10 +102,11 @@ class DirectLoadCheckpoint:
     matched_keys: int | None = None
     predicted_joined_rows: int | None = None
     planned_lower_bound_bytes: int | None = None
+    universe_rescope: dict[str, object] | None = None
 
     def journal_payload(self) -> dict[str, object]:
         """Bounded scalar mapping for durable journaling."""
-        return {
+        payload: dict[str, object] = {
             "rows": self.rows,
             "columns": self.columns,
             "frame_bytes": self.frame_bytes,
@@ -118,6 +121,9 @@ class DirectLoadCheckpoint:
             "predicted_joined_rows": self.predicted_joined_rows,
             "planned_lower_bound_bytes": self.planned_lower_bound_bytes,
         }
+        if self.universe_rescope is not None:
+            payload["universe_rescope"] = str(self.universe_rescope)[:512]
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -600,6 +606,7 @@ class DirectMarketDataLoader:
         decision_time: datetime,
         *,
         checkpoint: Callable[[DirectLoadCheckpoint], None] | None = None,
+        rescope: UniverseRescopeSettings | None = None,
     ) -> NetAlphaResearchData:
         """Compose training data with one decision-width materialization.
 
@@ -615,6 +622,12 @@ class DirectMarketDataLoader:
         and ``predicted_joined_rows=sum(base_count[key]*feature_count[key])``;
         duplicate input keys or a predicted non-one-to-one join fails closed
         before the decision frame is ever materialized.
+
+        An enabled ``rescope`` policy masks the base scan to a trailing
+        market-cap band before the feature join so every downstream consumer
+        (fitting, calibration, replay, benchmark) shares one restricted pool;
+        the preflight admission bound then overestimates planned bytes, which
+        stays on the safe side of the memory guard.
         """
         from src.stocks.ml.features import stock_net_alpha_v1_roles
 
@@ -636,10 +649,23 @@ class DirectMarketDataLoader:
                     )
                 )
 
-        base_columns = self._available_columns(
-            self._base_store, request.base_dataset_id, _BASE_COLUMNS
+        wanted_base_columns: tuple[str, ...] = _BASE_COLUMNS
+        required: tuple[str, ...] = (
+            "instrument_id",
+            "session",
+            "open",
+            "close",
+            "volume",
+            "trading_value",
         )
-        required = ("instrument_id", "session", "open", "close", "volume", "trading_value")
+        if rescope is not None:
+            # Conditional extension keeps flag-off loads byte-identical; the
+            # required-column check fails closed on legacy stores.
+            wanted_base_columns = (*_BASE_COLUMNS, "market_cap")
+            required = (*required, "market_cap")
+        base_columns = self._available_columns(
+            self._base_store, request.base_dataset_id, wanted_base_columns
+        )
         missing = [c for c in required if c not in base_columns]
         if missing:
             raise ValueError(
@@ -703,7 +729,7 @@ class DirectMarketDataLoader:
         )
         del multiplicity_join, base_keys, feature_keys
 
-        plan = self._base_store.scan_bounded(
+        base_lf = self._base_store.scan_bounded(
             request.base_dataset_id,
             AssetKind.STOCK,
             "base_panel",
@@ -711,7 +737,11 @@ class DirectMarketDataLoader:
             session_start=request.start,
             session_end=request.end,
             columns=list(base_columns),
-        ).join(
+        )
+        rescope_diagnostics: dict[str, object] = {}
+        if rescope is not None:
+            base_lf, rescope_diagnostics = apply_universe_rescope(base_lf, rescope)
+        plan = base_lf.join(
             self._feature_store.scan_bounded(
                 request.feature_dataset_id,
                 AssetKind.STOCK,
@@ -782,12 +812,16 @@ class DirectMarketDataLoader:
             and decision_frame.schema[c].is_numeric()
         )
         _validate_direct_frame(decision_frame, numeric_columns)
+        emit_extra: dict[str, object] = (
+            {"universe_rescope": rescope_diagnostics} if rescope_diagnostics else {}
+        )
         emit(
             "direct_collected",
             rows=int(decision_frame.height),
             columns=len(decision_frame.columns),
             frame_bytes=int(decision_frame.estimated_size()),
             owners=("decision_frame",),
+            **emit_extra,
         )
         decision_height = decision_frame.height
         manifest_columns = tuple(decision_frame.columns)
