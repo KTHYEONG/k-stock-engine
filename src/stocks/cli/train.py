@@ -767,6 +767,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--enable-unhedged-nem-rung",
+        action="store_true",
+        help=(
+            "Opt in to the unhedged_nem_v1 frontier profile, which extends "
+            "the growth_full_utilization rung with the causal trend/vol "
+            "net-exposure gate for small-capital unhedged routes"
+        ),
+    )
+    parser.add_argument(
         "--cert-max-drawdown",
         type=float,
         default=0.5,
@@ -849,6 +858,10 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
         policy_profiles = policy_profiles_with_excess_full_kelly()
     if bool(getattr(args, 'enable_growth_utilization_rung', False)):
         policy_profiles = policy_profiles_with_growth_rungs()
+    if bool(getattr(args, 'enable_unhedged_nem_rung', False)):
+        from src.stocks.config.research import policy_profiles_with_unhedged_nem
+
+        policy_profiles = policy_profiles_with_unhedged_nem()
     return NetAlphaTrainingRequest(
         artifact_id=args.artifact_id,
         candidate_horizon_sessions=horizons,
