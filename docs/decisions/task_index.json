@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ADR_20260826_excess_route_breadth_certification",
+      "date": "2026-08-26",
+      "adr_id": "ADR_20260826_ADR_20260826_excess_route_breadth_certification",
+      "domain": "stocks_ml",
+      "title": "Excess-scoped route certification and effective-breadth telemetry",
+      "why": "스크래치 검증(OOF 재학습 3-fold parity)에서 breadth가 certified excess LB를 지배(K8-EW LB +7.78%가 프로덕션 인증 +7.88%와 일치, K12-EW +14.51%, K20-EW +20.47%)하나 프론티어가 candidate_top_k=[8,12]에 갇히고 라우트 선정·인증이 절대 시리즈(universe decay -21~-55%/yr 구조적 드래그)에 묶여 breadth 헤드룸이 인증 스칼라로 유입되지 않는 계층을 레저 실측으로 규명.",
+      "resolution": "stitch_prequential_growth_route에 benchmarks_by_key 옵트인 kwarg 신설(세그먼트별 excess base/stress 하위경계 인과 선정, 미보유 candidate 스킵, 벤치마크 병렬 부착, v1/v2-excess 태그, None 경로 바이트 동일), _compute_candidate_benchmarks 순수 추출로 _attach_growth_route_execution_evidence 위임 parity 확보, certify_hedged_excess_route 재사용한 _attach_excess_route_certificate 신설(growth_route.excess_route bounded scalars+digests·provenance 마커 서피싱, primary sleeve 미통과·blocking gate 청정 시 한해 PROMOTED_EXCESS_SLEEVE 승격, promoted=False 불변), enable_excess_route request/CLI/fingerprint/manifest params 스레딩, compounding record에 effective_breadth(1/Σw²) 추가 및 sizing_diagnostics mean/p10/p90 집계.",
+      "impact": "A/B 풀런(ml_excess_route_ab_20260826, 11.2분/RSS 4.2GB/48셀): 대조군 절대 라우트 스칼라 ab3와 정확 동일 parity 확인, v2-excess 라우트 최초 통과(excess_lower_cagr +10.59%, sleeve stress +10.98%, static L2.0, projected MDD 43.1→34.9% 개선), outcome.promoted=False fail-closed 유지. 수용 기준 ≥+14%는 미달 — ENB 텔레메트리로 kelly 농도 가설 기각(ENB 7.57→11.46→14.95, p10≥15=사실상 EW, drag 0.43→0.32%)과 함께 비중첩 stride-10 검증 기하 vs 중첩 빈티지 moving-block 인증 기하의 차이가 원인으로 확정. 시나리오 9건 신규, unit 1165 passed, lean_check PASS."
+    },
+    {
       "task_id": "ml_hedged_excess_promotion",
       "date": "2026-08-26",
       "adr_id": "ADR_20260826_ml_hedged_excess_promotion",
@@ -989,16 +999,6 @@
       "why": "The 2026-08-12 ML replay had positive Rank-IC but a fixed 5-session 36bp round-trip hurdle made every candidate economically ineligible.",
       "resolution": "Registered a causal 5/10/15-session multi-horizon route design with route-specific labels, availability timestamps, matching rebalance cadence, net-alpha lower-bound gating, and fail-closed stress promotion.",
       "impact": "Future implementation can test longer cost-amortizing holding periods without relaxing leakage, execution-cost, bootstrap, DSR, drawdown, or NO_TRADE gates."
-    },
-    {
-      "task_id": "TASK_ML_BACKTEST_PERFORMANCE_REMEDIATION",
-      "date": "2026-08-12",
-      "adr_id": "ADR_20260812_ML_BACKTEST_PERFORMANCE_REMEDIATION",
-      "domain": "stocks",
-      "title": "ML backtest performance remediation",
-      "why": "Rank-IC 신호와 비용 후 경제적 성과의 차이를 최신 80-trial 실행 결과로 기록함",
-      "resolution": "최신 net-alpha calibrated ML 실행 결과만 back-res 문서에 수치 중심으로 동기화하고 Rank-IC 해석을 추가함",
-      "impact": "문서가 최신 NO_TRADE 판정과 비용·bootstrap 근거만 반영하며 과거 실행 결과는 제거됨"
     }
   ]
 }
