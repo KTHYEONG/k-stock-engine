@@ -1573,7 +1573,9 @@ class TestProfileScopedFeasibility:
         """TRAINING_SCOPE_WIRING_04_DROPOUT_TRANSPARENCY.
 
         Kelly-scoped frontier executes K=8 only for excess_full_kelly; other
-        profiles record 'profile-cap-infeasible'; frozen seed policy unchanged.
+        profiles record 'profile-cap-infeasible'; the frozen seed follows the
+        declared-ladder preference and becomes the opted-in rung's first
+        feasible profile-scoped cell.
         """
         from dataclasses import replace as dc_replace
 
@@ -1632,7 +1634,16 @@ class TestProfileScopedFeasibility:
             assert discovery.dropout_reasons.get(key) == "profile-cap-infeasible", key
         kelly_at_k8 = {pid for (_h, _c, k, pid) in captured if k == 8}
         assert kelly_at_k8 == {"excess_full_kelly"}
-        assert resolve_frozen_policy_key(request) == (10, 5, 12, "lower_bound_only")
+        seed_key = resolve_frozen_policy_key(request)
+        assert seed_key[3] == "excess_full_kelly"
+        assert (seed_key[0], seed_key[1], seed_key[2]) in (
+            request.execution_frontier.feasible_cells_for_profile(
+                request.portfolio.max_exposure,
+                request.portfolio.max_single_weight,
+                single_name_cap_override=0.16,
+                gross_utilization_target=0.92,
+            )
+        )
 
     def test_SIZING_DIAGNOSTICS_05_SELECTED_COUNT_TELEMETRY(self) -> None:
         """SIZING_DIAGNOSTICS_05_SELECTED_COUNT_TELEMETRY."""
