@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ADR_20260826_hedge_leverage_ceiling_extension",
+      "date": "2026-08-26",
+      "adr_id": "ADR_20260826_ADR_20260826_hedge_leverage_ceiling_extension",
+      "domain": "risk",
+      "title": "Hedge leverage ceiling extension and vol-managed rung activation",
+      "why": "certify_hedged_excess_route의 사다리 격자가 하드 기본값 (1,1.5,2)에 고정되어 마진 상한(L<=4.67)과 MDD 캡이 허용하는 더 높은 vol-managed 러닝이 잠겨 있었고, 공개 스칼라 앵커 역검증(±1pp)으로 천장 확장 시 선택기가 static/L2.0에서 vol_managed/L3.0으로 전환하며 sleeve_lower_stress가 배증한다는 커널-정확 외삽을 확보.",
+      "resolution": "CompoundingCertificationSettings에 hedge_leverage_grid: tuple|None 필드 추가(엄격 상승·[1,5]·finite 검증 fail-closed, None=레거시 바이트 동일), certify_hedged_excess_route와 _growth_route_projection의 project_hedge_sleeve 호출에 격자 스레딩, CLI --hedge-leverage-grid 옵트인 파싱 주입(--cert-max-drawdown 패턴 준수), ledger _compact_hedge_sleeve에 admissible_leverages variant별 bounded 리스트 서피싱.",
+      "impact": "A/B 풀런(ml_hedge_ceiling_ab_20260826, 10.7분/RSS 4.12GB/48셀): 대조군 절대 라우트 스칼라 직전 런과 정확 동일 parity, 인증서가 vol_managed/L3.0 선출로 수용기준 5/5 충족 — hedge_stress +26.23→+36.12%, hedge_point +39.10→+44.75%, hedge_projected_mdd 34.9→23.75%, sleeve_lower_stress_cagr +10.98→+27.17%(2.5배), 외삽 예측 오차 0.02pp. outcome.promoted=False fail-closed 유지. 시나리오 6건 신규, unit 1171 passed, lean_check PASS."
+    },
+    {
       "task_id": "ADR_20260826_excess_route_breadth_certification",
       "date": "2026-08-26",
       "adr_id": "ADR_20260826_ADR_20260826_excess_route_breadth_certification",
@@ -989,16 +999,6 @@
       "why": "Latest ML execution must replace stale backtesting records and expose runtime, RSS, and fail-closed replay evidence.",
       "resolution": "Replaced docs/results/back-res.md with the 1-trial guarded execution metrics, NO_TRADE decision, and replay capacity failure evidence; registered the decision and refreshed the code map.",
       "impact": "The result document now reflects the latest reproducible run; oversized replay materialization is documented as safely blocked, with no paper/live promotion."
-    },
-    {
-      "task_id": "TASK_COST_AMORTIZED_ALPHA_ROUTING_V1",
-      "date": "2026-08-12",
-      "adr_id": "ADR_20260812_COST_AMORTIZED_ALPHA_ROUTING_V1",
-      "domain": "stocks",
-      "title": "Cost-amortized alpha routing v1",
-      "why": "The 2026-08-12 ML replay had positive Rank-IC but a fixed 5-session 36bp round-trip hurdle made every candidate economically ineligible.",
-      "resolution": "Registered a causal 5/10/15-session multi-horizon route design with route-specific labels, availability timestamps, matching rebalance cadence, net-alpha lower-bound gating, and fail-closed stress promotion.",
-      "impact": "Future implementation can test longer cost-amortizing holding periods without relaxing leakage, execution-cost, bootstrap, DSR, drawdown, or NO_TRADE gates."
     }
   ]
 }
