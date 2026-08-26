@@ -1184,3 +1184,47 @@ def test_excess_route_ledger_block() -> None:
 
     # Research verdicts never promote the artifact itself.
     assert flag_on.get("promoted", False) is False
+
+
+def test_hedge_grid_ledger_surface() -> None:
+    """hedge_grid_ledger_surface.
+
+    The ledger compaction exposes admissible_leverages as bounded float
+    lists per variant when the projection carries them; projections without
+    the key omit it entirely.
+    """
+    from src.stocks.ml.result_ledger import _compact_growth_route
+
+    route = {
+        "version": "v1",
+        "hedge_sleeve_projection": {
+            "leverage_rung_count": 5,
+            "admissible_rung_count": 4,
+            "max_admissible_leverage": 2.0,
+            "vol_managed_max_admissible_leverage": 3.0,
+            "excess_point_cagr": 0.176,
+            "best_rungs": {
+                "vol_managed": {
+                    "leverage": 3.0,
+                    "point_cagr": 0.454,
+                    "stress_cagr": 0.367,
+                    "projected_mdd": 0.265,
+                    "margin_buffer": 0.55,
+                }
+            },
+            "admissible_leverages": {
+                "static": [1.0, 1.5, 2.0],
+                "vol_managed": [1.0, 1.5, 2.0, 2.5, 3.0],
+            },
+        },
+    }
+    compact = _compact_growth_route({"growth_route": route})["hedge_sleeve"]
+    assert compact["admissible_leverages"] == {
+        "static": [1.0, 1.5, 2.0],
+        "vol_managed": [1.0, 1.5, 2.0, 2.5, 3.0],
+    }
+
+    bare = _compact_growth_route(
+        {"growth_route": {"version": "v1", "hedge_sleeve_projection": {}}}
+    )
+    assert "admissible_leverages" not in bare["hedge_sleeve"]

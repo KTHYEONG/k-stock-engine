@@ -335,3 +335,153 @@ def test_excess_route_sleeve_upgrade_gatekeeping() -> None:
 
     # The research verdict never promotes the artifact itself.
     assert growth_route.get("promoted", False) is False
+
+
+def _calibrated_series(n: int = 1500) -> list[float]:
+    """Synthetic clustered excess series matching published overall moments.
+
+    Five [200 calm / 100 wild] cycles: calm carries the positive drift,
+    wild blocks are zero-drift alternating shocks. Overall mean equals
+    ln(1.176)/252 and overall sigma_session equals 0.2137/sqrt(250)
+    exactly, while the vol clustering lets causal vol targeting lift the
+    managed Sharpe the way the real certified route series does.
+    """
+    g = math.log(1.176) / 252
+    sigma_session = 0.2137 / math.sqrt(250)
+    a = g + 0.002                       # calm level (constant drift)
+    b = 3.0 * g - 2.0 * a               # wild block mean
+    s_w = 0.8 * math.sqrt(
+        max(
+            3.0 * (sigma_session**2 - (2.0 / 3.0) * (a - g) ** 2)
+            - (b - g) ** 2,
+            1e-12,
+        )
+    )
+    values: list[float] = []
+    for _cycle in range(5):
+        values.extend([a] * 200)
+        for j in range(50):
+            values.append(b + (s_w if j % 2 == 0 else -s_w))
+            values.append(b - (s_w if j % 2 == 0 else -s_w))
+    return values[:n]
+
+
+def test_hedge_grid_flagoff_parity() -> None:
+    """hedge_grid_flagoff_parity.
+
+    hedge_leverage_grid=None reproduces the certificate payload of the
+    explicit legacy grid (1.0, 1.5, 2.0) exactly.
+    """
+    from dataclasses import replace as dc_replace
+
+    series = _calibrated_series()
+    route = _route(tuple(series))
+    legacy = certify_hedged_excess_route(
+        route, 10, dc_replace(_SETTINGS, min_observed_sessions=100)
+    )
+    explicit = certify_hedged_excess_route(
+        route,
+        10,
+        dc_replace(
+            _SETTINGS,
+            min_observed_sessions=100,
+            hedge_leverage_grid=(1.0, 1.5, 2.0),
+        ),
+    )
+    assert legacy == explicit
+    assert legacy["hedge_variant"] in ("static", "vol_managed")
+
+
+def test_hedge_grid_extension_selector_flip() -> None:
+    """hedge_grid_extension_selector_flip.
+
+    On the calibrated series the extended grid flips the best admissible
+    rung from static/2.0 to vol_managed/3.0, lifts point stress CAGR, and
+    keeps the certificate passing with a higher sleeve_lower_stress_cagr.
+    """
+    from dataclasses import replace as dc_replace
+
+    from src.stocks.ml.hedge_sleeve import project_hedge_sleeve
+
+    series = _calibrated_series()
+    settings_small = dc_replace(_SETTINGS, min_observed_sessions=100)
+
+    def _best_stress(grid: tuple[float, ...]) -> tuple[str, float, float]:
+        proj = project_hedge_sleeve(
+            series,
+            leverage_grid=grid,
+            annualization_sessions=252,
+            max_projected_mdd=0.5,
+        )
+        rows = [
+            r
+            for r in proj["leverage_ladder"]
+            if bool(r.get("admissible"))
+        ]
+        assert rows
+        best = max(rows, key=lambda r: (r["stress_cagr"], -r["leverage"]))
+        return (
+            str(best["variant"]),
+            float(best["leverage"]),
+            float(best["stress_cagr"]),
+        )
+
+    legacy_variant, legacy_lev, legacy_stress = _best_stress((1.0, 1.5, 2.0))
+    ext_variant, ext_lev, ext_stress = _best_stress(
+        (1.0, 1.5, 2.0, 2.5, 3.0)
+    )
+    # The legacy ceiling binds below 3.0; the extension unlocks the
+    # strictly better vol_managed/L3.0 rung.
+    assert legacy_lev <= 2.0
+    assert (ext_variant, ext_lev) == ("vol_managed", 3.0)
+    assert ext_stress > legacy_stress
+
+    route = _route(tuple(series))
+    legacy_cert = certify_hedged_excess_route(route, 10, settings_small)
+    ext_cert = certify_hedged_excess_route(
+        route,
+        10,
+        dc_replace(settings_small, hedge_leverage_grid=(1.0, 1.5, 2.0, 2.5, 3.0)),
+    )
+    assert legacy_cert["passed"] is True
+    assert ext_cert["passed"] is True
+    assert ext_cert["hedge_leverage"] == 3.0
+    assert ext_cert["sleeve_lower_stress_cagr"] > legacy_cert[
+        "sleeve_lower_stress_cagr"
+    ]
+
+
+def test_hedge_grid_mdd_veto() -> None:
+    """hedge_grid_mdd_veto.
+
+    The static L3.0 rung breaches the MDD cap on the calibrated series and
+    never becomes admissible; the certificate still passes because other
+    admissible rungs exist.
+    """
+    from dataclasses import replace as dc_replace
+
+    from src.stocks.ml.hedge_sleeve import project_hedge_sleeve
+
+    series = _calibrated_series()
+    proj = project_hedge_sleeve(
+        series,
+        leverage_grid=(1.0, 1.5, 2.0, 2.5, 3.0),
+        annualization_sessions=252,
+        max_projected_mdd=0.5,
+    )
+    by_key = {
+        (str(row["variant"]), float(row["leverage"])): row
+        for row in proj["leverage_ladder"]
+    }
+    static3 = by_key[("static", 3.0)]
+    assert static3["within_mdd_cap"] is False
+    assert static3["projected_mdd"] > 0.5
+    assert ("static", 3.0) not in [
+        (variant, lev) for variant, levs in proj["admissible_leverages"].items() for lev in levs
+    ]
+    cert = certify_hedged_excess_route(
+        _route(tuple(series)),
+        10,
+        dc_replace(_SETTINGS, min_observed_sessions=100),
+    )
+    assert "no-admissible-hedge-rung" not in cert["reasons"]

@@ -1283,3 +1283,32 @@ def test_SCENARIO_CLI_CERT_MAX_DRAWDOWN_08() -> None:
                 ]
             )
         )
+
+
+def test_hedge_grid_cli_threading() -> None:
+    """hedge_grid_cli_threading.
+
+    --hedge-leverage-grid parses a comma-separated float tuple into the
+    request compounding settings; the absent flag keeps None and the
+    max_drawdown default stays 0.5.
+    """
+    parser = train.build_parser()
+    args = parser.parse_args(
+        [
+            "--artifact-id",
+            "a1",
+            "--snapshot-id",
+            "s1",
+            "--hedge-leverage-grid",
+            "1,1.5,2,2.5,3",
+        ]
+    )
+    assert args.hedge_leverage_grid == "1,1.5,2,2.5,3"
+    request = train._build_training_request(args)
+    assert request.compounding.hedge_leverage_grid == (1.0, 1.5, 2.0, 2.5, 3.0)
+    assert request.compounding.max_drawdown == 0.5
+
+    default_request = train._build_training_request(
+        parser.parse_args(["--artifact-id", "a1", "--snapshot-id", "s1"])
+    )
+    assert default_request.compounding.hedge_leverage_grid is None
