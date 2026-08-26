@@ -54,6 +54,7 @@ from src.stocks.ml.contracts import (
     DECLARED_ECONOMIC_FAMILIES,
     RAWNET_LGBM_FAMILY,
     TAIL_LAMBDARANK_FAMILY,
+    CompoundingCertificationSettings,
     FoldScoreDiagnostic,
     HorizonOOFDiagnostic,
     NetAlphaResearchData,
@@ -166,6 +167,7 @@ from src.stocks.research.metrics import (
     certify_compounded_holdout,
     certify_exposure_matched_excess,
     certify_growth_route,
+    certify_hedged_excess_route,
 )
 from src.stocks.research.models import Model, ModelManifest
 from src.stocks.trading.portfolio_constructor import (
@@ -667,7 +669,7 @@ def _run_discovery_and_publish(
         else discovery.evidence[0].horizon_sessions
     )
     certificate = certify_growth_route(route, primary, request.compounding)
-    growth_route = _growth_route_projection(route, certificate)
+    growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary)  # noqa: E501
     _attach_frozen_compound_track(growth_route, discovery.evidence, request)
     route_reasons = certificate.get("reasons")
     reason_list = (
@@ -4122,7 +4124,7 @@ def _blend_champion_no_trade(
     retained verbatim in the payload.
     """
     status = growth_route.get("promotion_status")
-    if status == "PROMOTABLE_EXCESS":
+    if status in ("PROMOTABLE_EXCESS", "PROMOTED_EXCESS_SLEEVE"):
         return (
             "blend-champion-excess-verdict",
             {
@@ -4140,7 +4142,11 @@ def _blend_champion_no_trade(
 
 
 def _growth_route_projection(
-    route: GrowthRouteEvidence, certificate: Mapping[str, object]
+    route: GrowthRouteEvidence,
+    certificate: Mapping[str, object],
+    *,
+    compounding: CompoundingCertificationSettings | None = None,
+    horizon_sessions: int | None = None,
 ) -> dict[str, object]:
     """Bounded ``growth_route`` projection shared by metrics and the ledger.
 
@@ -4148,6 +4154,11 @@ def _growth_route_projection(
     final selected policy, absolute/relative lower growth, coverage, fills,
     drawdown, and normalized rejection-reason counts. Raw scores, order rows,
     per-instrument values, and return vectors are never included.
+
+    When pre-registered ``compounding`` governance is supplied, the certified
+    hedged-excess sleeve verdict upgrades a research-only excess outcome to
+    ``PROMOTED_EXCESS_SLEEVE``; the artifact promotion path itself stays
+    untouched (fail-closed).
     """
     route_reasons = certificate.get("reasons")
     reasons = (
@@ -4182,8 +4193,36 @@ def _growth_route_projection(
     }
     gate_failures = [reason for reason in reasons if reason in blocking_gate_reasons]
     matched_lower = _scalar("matched_lower_excess_cagr")
+
+    # Certified hedged-excess sleeve: computed only under injected governance
+    # with clean blocking gates and an attached benchmark; legacy positional
+    # callers keep byte-identical output.
+    sleeve_certificate: dict[str, object] | None = None
+    if (
+        compounding is not None
+        and not gate_failures
+        and route.base_log_growth_minus_benchmark
+    ):
+        effective_horizon = int(horizon_sessions) if horizon_sessions is not None else 0
+        if effective_horizon < 1 and route.selected_policies:
+            final_key = route.selected_policies[-1]
+            if final_key is not None:
+                effective_horizon = int(final_key[0])
+        if effective_horizon >= 1:
+            try:
+                sleeve_certificate = certify_hedged_excess_route(
+                    route, effective_horizon, compounding
+                )
+            except ValueError:
+                sleeve_certificate = None
+
+    sleeve_promotable = bool(
+        sleeve_certificate is not None and sleeve_certificate.get("passed")
+    )
     if bool(certificate.get("passed")):
         promotion_status = "PROMOTED"
+    elif sleeve_promotable and not route.benchmark_reconcile_failure:
+        promotion_status = "PROMOTED_EXCESS_SLEEVE"
     elif (
         matched_lower is not None
         and matched_lower > 0.0
@@ -4264,7 +4303,7 @@ def _growth_route_projection(
         except ValueError:
             hedge_projection = {}
 
-    return {
+    projection = {
         "version": route.route_version,
         "promotion_status": promotion_status,
         "candidate_count": int(route.candidate_count),
@@ -4301,6 +4340,9 @@ def _growth_route_projection(
         "hedge_sleeve_projection": hedge_projection,
         "rejection_reason_counts": dict(sorted(rejection_counts.items())),
     }
+    if sleeve_certificate is not None:
+        projection["hedged_excess_certificate"] = sleeve_certificate
+    return projection
 
 
 def _attach_frozen_compound_track(
@@ -4537,7 +4579,7 @@ def _growth_route_research_payload(
         else discovery.evidence[0].horizon_sessions
     )
     certificate = certify_growth_route(route, primary, request.compounding)
-    growth_route = _growth_route_projection(route, certificate)
+    growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary)  # noqa: E501
     _attach_frozen_compound_track(growth_route, discovery.evidence, request)
     return {
         "status": "RESEARCH_ONLY",
