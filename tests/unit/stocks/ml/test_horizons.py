@@ -1200,3 +1200,144 @@ def test_ROUTE_TURNOVER_NONE_01_NO_SHADOW_NULL_RATIO() -> None:
             selected_policies=((10, 5, 12, _LOWER),),
             turnover_ratio=-0.5,
         )
+
+
+# ---------------------------------------------------------------------------
+# Excess-scoped route certification (benchmarks_by_key opt-in)
+# ---------------------------------------------------------------------------
+
+
+def test_excess_route_stitch_selection() -> None:
+    """excess_route_stitch_selection.
+
+    With benchmarks supplied, selection ranks candidates on the excess
+    (base - benchmark) stress lower bound: K20 wins on excess even though
+    K8 wins on absolute series. The chosen benchmark slice is appended in
+    parallel and stays finite; segment s only ever sees segments < s.
+    """
+    alpha = 0.05
+    n_bootstrap = 40
+
+    k8 = _segmented_evidence(
+        5,
+        {0: (0.005,) * 6, 1: (0.005,) * 6, 2: (0.005,) * 6},
+        stress={0: (0.004,) * 6, 1: (0.004,) * 6, 2: (0.004,) * 6},
+        profile_id=_LEGACY,
+        top_k=8,
+    )
+    k20 = _segmented_evidence(
+        5,
+        {0: (0.003,) * 6, 1: (0.003,) * 6, 2: (0.003,) * 6},
+        stress={0: (0.0025,) * 6, 1: (0.0025,) * 6, 2: (0.0025,) * 6},
+        profile_id=_LOWER,
+        top_k=20,
+    )
+    # K8 absolute is stronger but its excess edge is tiny; K20's benchmark
+    # sits far below its base so its excess stream dominates.
+    benchmarks = {
+        (5, 5, 8, _LEGACY): tuple(0.004 for _ in k8.base_log_growth),
+        (5, 5, 20, _LOWER): tuple(-0.001 for _ in k20.base_log_growth),
+    }
+
+    key8 = (5, 5, 8, _LEGACY)
+    key20 = (5, 5, 20, _LOWER)
+    absolute = stitch_prequential_growth_route((k8, k20), alpha, 42, n_bootstrap)
+    assert all(key == key8 or key is None for key in absolute.selected_policies)
+
+    excess = stitch_prequential_growth_route(
+        (k8, k20), alpha, 42, n_bootstrap, benchmarks_by_key=benchmarks
+    )
+    assert excess.selected_policies[1] == key20
+    assert excess.selected_policies[2] == key20
+    assert excess.route_version == "v1-excess"
+    assert len(excess.benchmark_log_growth) == len(excess.base_log_growth)
+    assert all(np.isfinite(excess.benchmark_log_growth))
+    # Segment 0 has no earlier evidence and no seed: cash with empty benchmark.
+    assert excess.selected_policies[0] is None
+    assert all(value == 0.0 for value in excess.benchmark_log_growth[:6])
+
+
+def test_excess_route_flagoff_byte_parity() -> None:
+    """excess_route_flagoff_byte_parity.
+
+    Omitting benchmarks_by_key reproduces the legacy route exactly, including
+    an empty benchmark series and legacy v1/v2 tags.
+    """
+    alpha = 0.05
+    n_bootstrap = 40
+    seed_key = (20, 10, 8, _LOWER)
+    seed_candidate = _segmented_evidence(
+        20,
+        {0: (-0.02,) * 12, 1: (0.02,) * 12, 2: (0.02,) * 12},
+        profile_id=_LOWER,
+        cadence=10,
+        top_k=8,
+    )
+    legacy = stitch_prequential_growth_route(
+        (seed_candidate,), alpha, 42, n_bootstrap, seed_policy=seed_key
+    )
+    explicit_none = stitch_prequential_growth_route(
+        (seed_candidate,),
+        alpha,
+        42,
+        n_bootstrap,
+        seed_policy=seed_key,
+        benchmarks_by_key=None,
+    )
+    assert legacy == explicit_none
+    assert explicit_none.benchmark_log_growth == ()
+    assert explicit_none.route_version in ("v1", "v2")
+    assert explicit_none.selected_policies[0] == seed_key
+
+
+def test_excess_route_failclosed_nonpositive_lb() -> None:
+    """excess_route_failclosed_nonpositive_lb.
+
+    A candidate whose excess lower bound is non-positive is never selected;
+    unadmissible segments fall back to the declared seed policy, then cash,
+    and no exception escapes even when every candidate fails on excess.
+    """
+    alpha = 0.05
+    n_bootstrap = 40
+    seed_key = (20, 10, 8, _LOWER)
+
+    loser = _segmented_evidence(
+        10,
+        {0: (0.01,) * 6, 1: (0.01,) * 6},
+        profile_id=_LEGACY,
+    )
+    # Benchmark sits above the base everywhere: excess is strictly negative.
+    negative_excess = {(10, 5, 20, _LEGACY): tuple(0.02 for _ in loser.base_log_growth)}
+    seed_candidate = _segmented_evidence(
+        20,
+        {0: (-0.02,) * 6, 1: (0.01,) * 6},
+        profile_id=_LOWER,
+        cadence=10,
+        top_k=8,
+    )
+    seed_benchmarks = {
+        **negative_excess,
+        seed_key: tuple(0.0 for _ in seed_candidate.base_log_growth),
+    }
+
+    route = stitch_prequential_growth_route(
+        (loser, seed_candidate),
+        alpha,
+        42,
+        n_bootstrap,
+        seed_policy=seed_key,
+        benchmarks_by_key=seed_benchmarks,
+    )
+    # Segment 0: nothing admissible, the declared seed invests.
+    assert route.selected_policies[0] == seed_key
+    assert list(route.base_log_growth[:6]) == [-0.02] * 6
+    # Segment 1: the loser still fails on excess; the seed remains invested
+    # because no admissible candidate ever outranks it.
+    assert route.selected_policies[1] == seed_key
+
+    # Without any seed, every segment falls back to cash and never crashes.
+    cash_route = stitch_prequential_growth_route(
+        (loser,), alpha, 42, n_bootstrap, benchmarks_by_key=negative_excess
+    )
+    assert all(key is None for key in cash_route.selected_policies)
+    assert cash_route.invested_interval_count == 0

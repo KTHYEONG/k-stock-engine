@@ -1825,3 +1825,202 @@ class TestLimitsThreadingAndAggregation:
         )
         assert none_summary["turnover_lambda_mean"] is None
         assert none_summary["participation_clamped_fraction"] is None
+
+
+class TestCandidateBenchmarks:
+    """candidate_benchmarks_parity: shared per-candidate benchmark kernel."""
+
+    @staticmethod
+    def _discovery_and_panel(n_panel_sessions: int = 8, growth_length: int = 6):
+        from src.stocks.ml.horizons import HorizonOOFEvidence
+
+        sessions = [
+            datetime(2024, 2, 1 + i, tzinfo=UTC) for i in range(n_panel_sessions)
+        ]
+        rows = []
+        for session in sessions:
+            for t in range(3):
+                price = 50.0 + t
+                rows.append(
+                    {
+                        "instrument_id": f"KRX:{t + 1:05d}",
+                        "session": session,
+                        "observation_time": session.replace(hour=15, minute=30),
+                        "available_time": session.replace(hour=15, minute=31),
+                        "open": price,
+                        "close": price * 1.01,
+                        "volume": 1_000_000.0,
+                        "trading_value": 100_000_000.0,
+                        "sector": "S0",
+                        "adtv": 100_000_000.0,
+                    }
+                )
+        panel = pl.DataFrame(rows)
+        key_a = (10, 5, 2, "lower_bound_only")
+        key_b = (10, 5, 3, "legacy_overlay_5bps")
+        bounds = (tuple(sessions[: growth_length + 1]),)
+
+        def _evidence_for(key, filled: int = 6):
+            return ExecutionReplayEvidence(
+                base_log_growth=tuple(0.01 for _ in range(growth_length)),
+                stress_log_growth=tuple(0.01 for _ in range(growth_length)),
+                segment_ids=tuple(0 for _ in range(growth_length)),
+                planned_cycles=2,
+                filled_orders=filled,
+                cash_session_fraction=0.0,
+                turnover=0.5,
+                observed_interval_count=growth_length,
+                invested_interval_count=growth_length,
+                invested_interval_fraction=1.0,
+                base_interval_exposure=tuple(0.9 for _ in range(growth_length)),
+                stress_interval_exposure=tuple(0.9 for _ in range(growth_length)),
+                base_interval_session_bounds=bounds,
+            )
+
+        def _oof_for(key):
+            return HorizonOOFEvidence(
+                horizon_sessions=key[0],
+                profile_id=key[3],
+                model_family="net_alpha_elastic_net",
+                base_log_growth=tuple(0.01 for _ in range(growth_length)),
+                stress_log_growth=tuple(0.01 for _ in range(growth_length)),
+                cohort_segment_ids=tuple(0 for _ in range(growth_length)),
+                complete_cohort_count=growth_length,
+                active_cohort_count=growth_length,
+                partial_cohort_count=0,
+                missing_cohort_count=0,
+                segment_count=1,
+                fold_rank_ics=(0.2,),
+                rebalance_frequency_sessions=key[1],
+                top_k=key[2],
+            )
+
+        discovery = HorizonDiscovery(
+            evidence=(_oof_for(key_a), _oof_for(key_b)),
+            diagnostics=(),
+            oof_by_horizon={},
+            execution_evidence_by_candidate={key_a: _evidence_for(key_a), key_b: _evidence_for(key_b)},
+        )
+        return discovery, panel, (key_a, key_b)
+
+    def test_candidate_benchmarks_parity(self) -> None:
+        """candidate_benchmarks_parity.
+
+        _compute_candidate_benchmarks reproduces the benchmark series that
+        _attach_growth_route_execution_evidence embeds for selected keys, and
+        failure reasons stay inside the normalized vocabulary.
+        """
+        from src.stocks.ml.horizons import GrowthRouteEvidence
+        from src.stocks.ml.training import (
+            _attach_growth_route_execution_evidence,
+            _compute_candidate_benchmarks,
+        )
+
+        discovery, panel, keys = self._discovery_and_panel()
+        key_a, key_b = keys
+        route = GrowthRouteEvidence(
+            base_log_growth=tuple(0.01 for _ in range(6)),
+            stress_log_growth=tuple(0.01 for _ in range(6)),
+            segment_ids=tuple(0 for _ in range(6)),
+            selected_policies=(key_a,),
+            interval_policies=(key_a,) * 6,
+            candidate_count=1,
+            observed_interval_count=6,
+            invested_interval_count=6,
+            filled_orders=6,
+            filled_cycle_count=2,
+        )
+        attached = _attach_growth_route_execution_evidence(route, discovery, panel)
+        assert attached.benchmark_reconcile_failure == ""
+        assert len(attached.benchmark_log_growth) == 6
+
+        computed, failures = _compute_candidate_benchmarks(discovery, panel)
+        assert failures == {}
+        assert set(computed) == {key_a, key_b}
+        for expected, actual in zip(
+            attached.benchmark_log_growth, computed[key_a], strict=True
+        ):
+            assert abs(expected - actual) <= 1e-12
+
+    def test_candidate_benchmarks_failure_vocabulary(self) -> None:
+        """Normalized fail-closed reasons surface per candidate key."""
+        import dataclasses
+
+        from src.stocks.ml.training import _compute_candidate_benchmarks
+
+        discovery, panel, keys = self._discovery_and_panel()
+        key_a, key_b = keys
+        broken = dataclasses.replace(discovery.execution_evidence_by_candidate[key_b])
+        object.__setattr__(
+            broken,
+            "base_interval_session_bounds",
+            ((broken.base_interval_session_bounds[0][:3],)),
+        )
+        discovery.execution_evidence_by_candidate[key_b] = broken
+        computed, failures = _compute_candidate_benchmarks(discovery, panel)
+        assert key_a in computed
+        assert failures.get(key_b) == "benchmark-exposure-length-mismatch"
+
+        empty_panel = panel.clear()
+        computed_empty, failures_empty = _compute_candidate_benchmarks(
+            discovery, empty_panel
+        )
+        assert computed_empty == {}
+        assert set(failures_empty) == {key_a, key_b}
+        assert all(
+            reason == "benchmark-panel-missing" for reason in failures_empty.values()
+        )
+
+
+def test_excess_route_threading_manifest() -> None:
+    """excess_route_threading_manifest.
+
+    Flag-off requests keep the legacy fingerprint payload shape while the new
+    projection key stays False; flag-on runs are distinguishable through both
+    the request fingerprint and the published NO_TRADE manifest params.
+    """
+    from dataclasses import replace as dc_replace
+
+    from src.stocks.ml.result_ledger import _project_request
+    from src.stocks.ml.training import _publish_no_trade
+    from src.stocks.research.artifacts import ModelArtifactRegistry
+
+    off = NetAlphaTrainingRequest(artifact_id="na_excess_off")
+    on = dc_replace(off, enable_excess_route=True)
+    assert off.enable_excess_route is False
+    assert on.enable_excess_route is True
+
+    off_projection = _project_request(off)
+    on_projection = _project_request(on)
+    assert off_projection["enable_excess_route"] is False
+    assert on_projection["enable_excess_route"] is True
+    assert (
+        off_projection["request_fingerprint"]
+        != on_projection["request_fingerprint"]
+    )
+
+    frame = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:00001"] * 2,
+            "session": [
+                datetime(2024, 1, 1, tzinfo=UTC),
+                datetime(2024, 1, 2, tzinfo=UTC),
+            ],
+            "feature__a": [0.1, 0.2],
+        }
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest_off = _publish_no_trade(
+            ModelArtifactRegistry(Path(tmp) / "off"),
+            off,
+            frame,
+            "test-no-trade",
+        )
+        manifest_on = _publish_no_trade(
+            ModelArtifactRegistry(Path(tmp) / "on"),
+            on,
+            frame,
+            "test-no-trade",
+        )
+    assert manifest_off.params == {"no_trade": "true"}
+    assert manifest_on.params == {"no_trade": "true", "enable_excess_route": "true"}
