@@ -1027,6 +1027,22 @@ def _compact_growth_route(metrics: Mapping[str, object]) -> dict[str, object]:
     outcome = route
     summary['promotion_status'] = outcome.get('promotion_status', 'NO_TRADE')
     summary['hedge_sleeve'] = _compact_hedge_sleeve(route)
+    plan = route.get("small_capital_route_plan")
+    if isinstance(plan, Mapping):
+        summary["capital_plan_verdict"] = _json_scalar(plan.get("verdict"))
+        projection = plan.get("unhedged_projection")
+        best_rung = (
+            projection.get("best_rung")
+            if isinstance(projection, Mapping)
+            else None
+        )
+        if isinstance(best_rung, Mapping):
+            summary["capital_plan_unhedged_stress_cagr"] = _as_float(
+                best_rung.get("stress_cagr")
+            )
+            summary["capital_plan_unhedged_mdd"] = _as_float(
+                best_rung.get("projected_mdd")
+            )
     excess_route = route.get("excess_route")
     if isinstance(excess_route, Mapping):
 

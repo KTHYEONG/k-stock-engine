@@ -365,6 +365,52 @@ def _profile_turnover_budget_override(profile: dict[str, object]) -> float | Non
     return value
 
 
+def _profile_net_exposure_params(
+    profile: dict[str, object],
+) -> dict[str, object]:
+    """Extract net-exposure gate fields from a stored policy profile.
+
+    Absent or ``off_v1`` mode yields no kwargs so legacy artifacts replay
+    unchanged. A present mode must be a declared literal; the floor must be
+    finite in ``[0, 1)`` and the trend lookback a positive integer when set.
+    """
+    raw_mode = profile.get("net_exposure_gate_mode", "off_v1")
+    if raw_mode is None:
+        raw_mode = "off_v1"
+    if raw_mode not in ("off_v1", "trend_vol_v1"):
+        raise ValueError(
+            "net_exposure_gate_mode must be 'off_v1' or 'trend_vol_v1', "
+            f"got {raw_mode!r}"
+        )
+    params: dict[str, object] = {}
+    if raw_mode == "off_v1":
+        return params
+    params["net_exposure_gate_mode"] = str(raw_mode)
+    raw_floor = profile.get("gate_floor")
+    if raw_floor is not None:
+        if isinstance(raw_floor, bool) or not isinstance(raw_floor, (int, float)):
+            raise ValueError(
+                f"gate_floor must be a number in [0, 1), got {type(raw_floor).__name__}"
+            )
+        value = float(raw_floor)
+        if not math.isfinite(value) or not 0.0 <= value < 1.0:
+            raise ValueError(f"gate_floor must be finite in [0, 1), got {value!r}")
+        params["gate_floor"] = value
+    raw_lookback = profile.get("gate_trend_lookback_sessions")
+    if raw_lookback is not None:
+        if isinstance(raw_lookback, bool) or not isinstance(raw_lookback, int):
+            raise ValueError(
+                "gate_trend_lookback_sessions must be a positive integer, "
+                f"got {type(raw_lookback).__name__}"
+            )
+        if raw_lookback < 1:
+            raise ValueError(
+                f"gate_trend_lookback_sessions must be >= 1, got {raw_lookback!r}"
+            )
+        params["gate_trend_lookback_sessions"] = int(raw_lookback)
+    return params
+
+
 def _profile_policy_kwargs(
     profile: dict[str, object],
     *,
@@ -388,6 +434,7 @@ def _profile_policy_kwargs(
     budget = _profile_turnover_budget_override(profile)
     if budget is not None:
         policy_kwargs["turnover_budget"] = budget
+    policy_kwargs.update(_profile_net_exposure_params(profile))
     return policy_kwargs
 
 

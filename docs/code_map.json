@@ -287,7 +287,8 @@
     "testing": [
       "tests/unit/stocks/trading/test_portfolio_constructor.py",
       "tests/unit/stocks/workflows/test_execution_matched_replay.py",
-      "tests/integration/stocks/test_curated_backtest.py"
+      "tests/integration/stocks/test_curated_backtest.py",
+      "tests/unit/stocks/trading/test_net_exposure_gate.py"
     ],
     "architecture": "docs/results/ml_runs/latest.json"
   },

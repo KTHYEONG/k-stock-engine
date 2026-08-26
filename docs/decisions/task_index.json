@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_UNHEDGED_GROWTH_NEM",
+      "date": "2026-08-26",
+      "adr_id": "ADR_20260826_UNHEDGED_GROWTH_NEM",
+      "domain": "quant",
+      "title": "Causal net-exposure modulation gate (NEM) for unhedged routes",
+      "why": "Unhedged small-capital route kept beta exposure effectively constant: all three risk controls were portfolio-internal (name covariance trim, model-confidence Kelly p50=1.0, cash transitions 0/754), so bear markets flowed straight into the route (lower CAGR -1.49%, MDD 31.08%) while matched excess alpha stayed positive (+7.88%).",
+      "resolution": "Added pure deterministic kernels net_exposure_gate_scale/apply_net_exposure_gate (equal-weight universe proxy from returns_matrix/panel; m_t=max(gate_floor, s_trend*s_vol) in [floor,1]; fail-open on thin history), StockRiskPolicy+PolicyProfile gate fields with byte-parity defaults, unhedged_nem_v1 opt-in rung via policy_profiles_with_unhedged_nem + --enable-unhedged-nem-rung CLI flag, seed-preference registration in compound_track, ALLOWED_EXTRA_PROFILE_IDS extension, dense-shadow gate-field parity, non-dense proxy fallback via row-session bincount, nem_* sizing diagnostics for gated runs only, and ledger compact projection of capital_plan verdict/unhedged best scalars. Certified A/B on identical data/cell 10:5:8: MDD 31.08->28.52% (-2.56%p), base lower CAGR -1.490->-1.395%, stress lower -1.504->-1.176%, point CAGR 6.09->5.85% (-0.24p trade-off), excess lower diluted -0.28%p to +7.60%, gate active on 30.8% of decisions (mean scale 0.612).",
+      "impact": "src/stocks/trading/portfolio_constructor.py, src/stocks/ml/{contracts,training,compound_track,result_ledger}.py, src/stocks/workflows/simulate_portfolio.py, src/stocks/config/research.py, src/stocks/cli/train.py; tests/unit/stocks/trading/test_net_exposure_gate.py; artifacts ml_hedge_ceiling_ab_20260826 (baseline) vs nem_ab_20260826_v2 (treatment); flag-off paths byte-identical"
+    },
+    {
       "task_id": "TASK_SMALL_CAPITAL_ROUTE_PLAN",
       "date": "2026-08-26",
       "adr_id": "ADR_20260826_SMALL_CAPITAL_ROUTE_PLAN",
@@ -989,16 +999,6 @@
       "why": "The multi-horizon route is executable, while economic replay remains the dominant runtime bottleneck.",
       "resolution": "Synchronized ADR/task registry and code map for explicit five_day/multi_horizon snapshot dispatch and bounded replay execution findings.",
       "impact": "Keeps the causal, cost, resource, and promotion gates unchanged while preserving a clean workspace for the next replay optimization."
-    },
-    {
-      "task_id": "TASK_RAM_PEAK_PIPELINE_OPTIMIZATION",
-      "date": "2026-08-12",
-      "adr_id": "ADR_20260812_RAM_PEAK_PIPELINE_OPTIMIZATION",
-      "domain": "stocks",
-      "title": "RAM-safe calibration replay",
-      "why": "Economic replay exceeded the RSS guard during decision preparation because all bootstrap workspace draws were admitted at once.",
-      "resolution": "Added deterministic batched bootstrap workspace sizing and replay admission telemetry while preserving causal calibration, bootstrap count, and fail-closed capacity behavior.",
-      "impact": "Prevents replay capacity failure under the recorded 8 GiB budget and bounds calibration peak memory; promotion semantics remain unchanged."
     }
   ]
 }

@@ -29,6 +29,7 @@ from src.stocks.ml.contracts import (
 __all__ = [
     "EXCESS_FULL_KELLY_PROFILE_ID",
     "GROWTH_FULL_UTILIZATION_PROFILE_ID",
+    "UNHEDGED_NEM_PROFILE_ID",
     "CanonicalResearchProfile",
 ]
 
@@ -108,6 +109,39 @@ def policy_profiles_with_growth_rungs() -> tuple[PolicyProfile, ...]:
             vol_target_override=_GROWTH_FULL_UTILIZATION_VOL_TARGET,
             participation_limit_override=_GROWTH_FULL_UTILIZATION_PARTICIPATION,
             turnover_budget_override=_GROWTH_FULL_UTILIZATION_TURNOVER_BUDGET,
+        ),
+    )
+
+
+_UNHEDGED_NEM_PROFILE_ID = "unhedged_nem_v1"
+
+# Public re-export for callers that need the id without private access.
+UNHEDGED_NEM_PROFILE_ID = _UNHEDGED_NEM_PROFILE_ID
+
+
+def policy_profiles_with_unhedged_nem() -> tuple[PolicyProfile, ...]:
+    """Opt-in ladder adding the trend/vol net-exposure-gated growth rung.
+
+    The ``unhedged_nem_v1`` rung extends the ``growth_full_utilization`` rung
+    with the causal market-state exposure gate (mode ``trend_vol_v1``) and the
+    default floor/lookback policy fields, so an unhedged small-capital route
+    can de-risk inside the certified replay. Flag-off runs stay
+    byte-identical; cadence scheduling and dense-shadow gating stay uniform.
+    """
+    return (
+        *policy_profiles_with_growth_rungs(),
+        PolicyProfile(
+            profile_id=_UNHEDGED_NEM_PROFILE_ID,
+            no_trade_band_bps=0.0,
+            growth_risk_aversion=1.0,
+            execution_utility_mode="sparse_hold_replace_v2",
+            sizing_mode="risk_balanced_waterfill_v2",
+            single_name_cap_override=_EXCESS_FULL_KELLY_SINGLE_NAME_CEILING,
+            gross_utilization_target=_GROWTH_FULL_UTILIZATION_GROSS_UTILIZATION,
+            vol_target_override=_GROWTH_FULL_UTILIZATION_VOL_TARGET,
+            participation_limit_override=_GROWTH_FULL_UTILIZATION_PARTICIPATION,
+            turnover_budget_override=_GROWTH_FULL_UTILIZATION_TURNOVER_BUDGET,
+            net_exposure_gate_mode="trend_vol_v1",
         ),
     )
 
