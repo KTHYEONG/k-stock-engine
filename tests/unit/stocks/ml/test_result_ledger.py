@@ -1126,3 +1126,61 @@ def test_SCENARIO_LEDGER_HEDGE_COMPACTION_06() -> None:
     )
     legacy = _compact_hedge_sleeve({})
     assert legacy == {}
+
+
+def test_excess_route_ledger_block() -> None:
+    """excess_route_ledger_block.
+
+    The flag-on growth-route projection carries the excess_route block with
+    bounded scalars and digests; the ledger compaction preserves exactly that
+    allow-list; flag-off projections lack the key entirely. Neither path ever
+    flips outcome.promoted.
+    """
+    from src.stocks.ml.result_ledger import _compact_growth_route
+
+    flag_on = {
+        "version": "v1",
+        "promotion_status": "PROMOTED_EXCESS_SLEEVE",
+        "candidate_count": 28,
+        "segment_count": 3,
+        "cash_segment_count": 1,
+        "selected_policy": "10:5:20:growth_full_utilization",
+        "observed_intervals": 100,
+        "invested_intervals": 90,
+        "filled_orders": 40,
+        "rejection_reason_counts": {"non-positive-base-lower-cagr": 1},
+        "hedge_sleeve_projection": {},
+        "excess_route": {
+            "passed": True,
+            "reasons_digest": {"count": 0, "sha256": "a" * 64},
+            "route_version": "v2-excess",
+            "excess_lower_cagr": 0.153,
+            "sleeve_lower_stress_cagr": 0.121,
+            "hedge_variant": "vol_managed",
+            "hedge_leverage": 2.0,
+            "hedge_point_cagr": 0.31,
+            "hedge_stress_cagr": 0.25,
+            "hedge_projected_mdd": 0.18,
+            "observed_intervals": 100,
+            "invested_intervals": 95,
+            "filled_orders": 44,
+            "selected_policies_digest": {"count": 3, "sha256": "b" * 64},
+            "provenance": "excess-route-v1",
+        },
+    }
+    compact = _compact_growth_route({"growth_route": flag_on})
+    block = compact["excess_route"]
+    assert block["passed"] is True
+    assert block["reasons_digest"] == {"count": 0, "sha256": "a" * 64}
+    assert block["excess_lower_cagr"] == pytest.approx(0.153, abs=1e-12)
+    assert block["sleeve_lower_stress_cagr"] == pytest.approx(0.121, abs=1e-12)
+    assert block["hedge_leverage"] == pytest.approx(2.0, abs=1e-12)
+    assert block["provenance"] == "excess-route-v1"
+    assert block["selected_policies_digest"] == {"count": 3, "sha256": "b" * 64}
+
+    flag_off = {key: value for key, value in flag_on.items() if key != "excess_route"}
+    flag_off["promotion_status"] = "NO_TRADE"
+    assert "excess_route" not in _compact_growth_route({"growth_route": flag_off})
+
+    # Research verdicts never promote the artifact itself.
+    assert flag_on.get("promoted", False) is False
