@@ -90,7 +90,56 @@ ALLOWED_EXTRA_PROFILE_IDS = (
     EXCESS_FULL_KELLY_PROFILE_ID,
     GROWTH_FULL_UTILIZATION_PROFILE_ID,
     "unhedged_nem_v1",
+    "unhedged_stack_v1",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class SatelliteOverlaySettings:
+    """Pre-registered ETF-satellite overlay policy for gated unhedged routes.
+
+    Frees capital released by the net-exposure gate into leveraged/inverse
+    index ETF satellites. Taxation models the statutory regime conservatively:
+    gains-only taxation at the full distribution rate (losses carry zero tax;
+    the statutory 과표기준가 Min rule can only lower the real burden below this
+    assumption). Fee/spread defaults reflect typical leveraged-product terms.
+    """
+
+    enabled: bool = False
+    mdd_budget: float = 0.35
+    gain_tax_rate: float = 0.154
+    fee_bps_annual: float = 65.0
+    spread_bps: float = 10.0
+    inverse_multiplier: float = -1.0
+    leveraged_multiplier: float = 2.0
+    inverse_weight_cap: float = 0.60
+    leveraged_weight_cap: float = 0.30
+    cash_reserve_cap: float = 1.0
+
+    def __post_init__(self) -> None:
+        for name in ("mdd_budget", "gain_tax_rate"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or not 0.0 < value < 1.0:
+                raise ValueError(f"{name} must be a finite fraction in (0, 1)")
+        for name in ("fee_bps_annual", "spread_bps"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be a finite non-negative value")
+        for name in (
+            "inverse_multiplier",
+            "leveraged_multiplier",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value == 0.0:
+                raise ValueError(f"{name} must be a finite non-zero multiplier")
+        for name in (
+            "inverse_weight_cap",
+            "leveraged_weight_cap",
+            "cash_reserve_cap",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be a finite fraction in [0, 1]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -673,6 +722,7 @@ class NetAlphaTrainingRequest:
     enable_sparse_retained_rewaterfill: bool = False
     enable_excess_route: bool = False
     capital_plan: SmallCapitalPlanSettings | None = None
+    satellite_settings: SatelliteOverlaySettings | None = None
 
     def __post_init__(self) -> None:
         if not self.artifact_id:

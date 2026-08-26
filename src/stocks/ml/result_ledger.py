@@ -1043,6 +1043,15 @@ def _compact_growth_route(metrics: Mapping[str, object]) -> dict[str, object]:
             summary["capital_plan_unhedged_mdd"] = _as_float(
                 best_rung.get("projected_mdd")
             )
+    satellite = route.get("satellite_overlay_projection")
+    if isinstance(satellite, Mapping):
+        summary["satellite_combined_point_cagr"] = _as_float(
+            satellite.get("combined_point_cagr")
+        )
+        summary["satellite_combined_mdd"] = _as_float(
+            satellite.get("combined_mdd")
+        )
+        summary["satellite_verdict"] = _json_scalar(satellite.get("verdict"))
     excess_route = route.get("excess_route")
     if isinstance(excess_route, Mapping):
 
