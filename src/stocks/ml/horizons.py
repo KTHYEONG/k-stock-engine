@@ -911,6 +911,7 @@ def stitch_prequential_growth_route(
     n_bootstrap: int,
     *,
     seed_policy: PolicyKey | None = None,
+    benchmarks_by_key: Mapping[PolicyKey, tuple[float, ...]] | None = None,
 ) -> GrowthRouteEvidence:
     """Causally stitch one strategy-level prequential growth route.
 
@@ -928,6 +929,13 @@ def stitch_prequential_growth_route(
     always outranks the seed. Segment ``s``'s own returns never influence
     which policy serves it.
 
+    When ``benchmarks_by_key`` is supplied, selection and admissibility
+    operate on the exposure-matched excess series (base minus benchmark,
+    stress minus benchmark) so the route certifies relative performance;
+    candidates without a parallel benchmark series are skipped. The chosen
+    candidate's benchmark slice is appended in parallel to base/stress and
+    the route is tagged ``v1-excess``/``v2-excess``.
+
     Args:
         candidates: the discovery frontier's per-candidate vintage evidence.
         bootstrap_alpha: one-sided bootstrap quantile for the lower bounds.
@@ -938,10 +946,14 @@ def stitch_prequential_growth_route(
             are required to resolve its significance.
         seed_policy: optional ex-ante ``(H, C, K, profile)`` policy used only
             where no earlier evidence is admissible; must match a candidate.
+        benchmarks_by_key: optional per-candidate exposure-matched benchmark
+            series parallel to each candidate's ``base_log_growth``; enables
+            excess-scoped selection when supplied.
 
     Returns:
         The immutable :class:`GrowthRouteEvidence` stitched route, tagged
-        version ``v2`` when a seed was spliced at least once, else ``v1``.
+        version ``v2`` (or ``v2-excess`` in excess scope) when a seed was
+        spliced at least once, else ``v1`` (or ``v1-excess``).
 
     Raises:
         ValueError: when ``candidates`` is empty, ``bootstrap_alpha`` or
@@ -990,8 +1002,26 @@ def stitch_prequential_growth_route(
         {int(seg) for candidate in ordered for seg in candidate.cohort_segment_ids}
     )
 
+    benchmarks: dict[PolicyKey, tuple[float, ...]] | None = None
+    if benchmarks_by_key is not None:
+        benchmarks = {}
+        for candidate in ordered:
+            candidate_key = _frontier_key(
+                candidate.horizon_sessions,
+                candidate.rebalance_frequency_sessions,
+                candidate.top_k,
+                candidate.profile_id,
+            )
+            series = benchmarks_by_key.get(candidate_key)
+            if series is None:
+                continue
+            if len(series) != len(candidate.base_log_growth):
+                continue
+            benchmarks[candidate_key] = tuple(float(value) for value in series)
+
     base_out: list[float] = []
     stress_out: list[float] = []
+    benchmark_out: list[float] = []
     segment_out: list[int] = []
     interval_policy_out: list[PolicyKey | None] = []
     selected_policies: list[PolicyKey | None] = []
@@ -1013,22 +1043,50 @@ def stitch_prequential_growth_route(
             prior_indices = _slice_indices(candidate, segment)
             if not prior_indices:
                 continue
-            prior_segments = tuple(
-                int(candidate.cohort_segment_ids[index]) for index in prior_indices
+            candidate_key = _frontier_key(
+                candidate.horizon_sessions,
+                candidate.rebalance_frequency_sessions,
+                candidate.top_k,
+                candidate.profile_id,
             )
+            if benchmarks is not None:
+                bench = benchmarks.get(candidate_key)
+                if bench is None:
+                    continue
+                base_values = tuple(
+                    float(candidate.base_log_growth[index]) - bench[index]
+                    for index in prior_indices
+                )
+                stress_values = tuple(
+                    float(candidate.stress_log_growth[index]) - bench[index]
+                    for index in prior_indices
+                )
+            else:
+                base_values = tuple(
+                    float(candidate.base_log_growth[index])
+                    for index in prior_indices
+                )
+                stress_values = tuple(
+                    float(candidate.stress_log_growth[index])
+                    for index in prior_indices
+                )
             block_floor = max(
                 candidate.horizon_sessions, candidate.rebalance_frequency_sessions
             )
             base_boot = _cohort_bootstrap(
-                tuple(candidate.base_log_growth[index] for index in prior_indices),
-                prior_segments,
+                base_values,
+                tuple(
+                    int(candidate.cohort_segment_ids[index]) for index in prior_indices
+                ),
                 n_bootstrap,
                 seed + candidate.horizon_sessions,
                 min_block_length=block_floor,
             )
             stress_boot = _cohort_bootstrap(
-                tuple(candidate.stress_log_growth[index] for index in prior_indices),
-                prior_segments,
+                stress_values,
+                tuple(
+                    int(candidate.cohort_segment_ids[index]) for index in prior_indices
+                ),
                 n_bootstrap,
                 seed + 2 * candidate.horizon_sessions,
                 min_block_length=block_floor,
@@ -1080,6 +1138,8 @@ def stitch_prequential_growth_route(
             )
             base_out.extend(0.0 for _ in range(cash_length))
             stress_out.extend(0.0 for _ in range(cash_length))
+            if benchmarks is not None:
+                benchmark_out.extend(0.0 for _ in range(cash_length))
             segment_out.extend([segment] * cash_length)
             interval_policy_out.extend([None] * cash_length)
             continue
@@ -1099,6 +1159,9 @@ def stitch_prequential_growth_route(
         stress_out.extend(
             float(chosen.stress_log_growth[index]) for index in current_indices
         )
+        if benchmarks is not None:
+            bench = benchmarks.get(key, tuple(0.0 for _ in chosen.base_log_growth))
+            benchmark_out.extend(bench[index] for index in current_indices)
         segment_out.extend([segment] * len(current_indices))
         interval_policy_out.extend([key] * len(current_indices))
 
@@ -1122,12 +1185,19 @@ def stitch_prequential_growth_route(
                 float(chosen.sparse_turnover) / float(chosen.shadow_turnover)
             )
 
+    if benchmarks is not None:
+        route_version = "v2-excess" if seed_spliced else "v1-excess"
+    else:
+        route_version = "v2" if seed_spliced else GROWTH_ROUTE_VERSION
     return GrowthRouteEvidence(
         base_log_growth=tuple(base_out),
         stress_log_growth=tuple(stress_out),
         segment_ids=tuple(segment_out),
         selected_policies=tuple(selected_policies),
         interval_policies=tuple(interval_policy_out),
+        benchmark_log_growth=(
+            tuple(benchmark_out) if benchmarks is not None else ()
+        ),
         candidate_count=len(ordered),
         observed_interval_count=len(base_out),
         invested_interval_count=sum(
@@ -1143,6 +1213,6 @@ def stitch_prequential_growth_route(
         turnover_ratio=(
             float(np.mean(turnover_ratios)) if turnover_ratios else None
         ),
-        route_version="v2" if seed_spliced else GROWTH_ROUTE_VERSION,
+        route_version=route_version,
         seed_policy=seed_policy,
     )

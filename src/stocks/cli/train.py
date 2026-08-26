@@ -780,6 +780,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--enable-sparse-retained-rewaterfill", action="store_true", help=rewaterfill_help)
     parser.add_argument(
+        "--enable-excess-route",
+        action="store_true",
+        help=(
+            "Opt in to excess-scoped route certification: one parallel "
+            "prequential route selects per-segment champions on "
+            "exposure-matched excess lower bounds"
+        ),
+    )
+    parser.add_argument(
         "--holm-family-scope",
         choices=["frontier", "route_gatekeeping"],
         default="frontier",
@@ -847,6 +856,7 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
         holm_family_scope=str(getattr(args, 'holm_family_scope', 'frontier')),  # type: ignore[arg-type]
         discovery_workers=int(getattr(args, 'discovery_workers', 1)),
         enable_sparse_retained_rewaterfill=bool(getattr(args, 'enable_sparse_retained_rewaterfill', False)),
+        enable_excess_route=args.enable_excess_route,
         policy_profiles=policy_profiles,
         compounding=CompoundingCertificationSettings(
             max_drawdown=float(getattr(args, 'cert_max_drawdown', 0.5))
