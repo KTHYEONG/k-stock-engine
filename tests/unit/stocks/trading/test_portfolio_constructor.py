@@ -2599,3 +2599,77 @@ class TestClampTelemetry:
             positions=(),
         )
         construct_target_allocations(panel, instruments, empty, policy)
+
+
+def test_effective_breadth_recorded() -> None:
+    """effective_breadth_recorded.
+
+    Equal-weight 8-name decisions record breadth 8.0, concentrated weights
+    record 2.0, cash decisions record None, and the sizing diagnostics
+    summary aggregates mean/p10/p90 over the recorded decisions.
+    """
+    from src.stocks.ml.training import _sizing_diagnostics_summary
+    from src.stocks.trading.portfolio_constructor import (
+        StockRiskPolicy,
+        _effective_breadth,
+        _record_compounding_decision,
+    )
+
+    assert _effective_breadth({f"K{i}": 1.0 for i in range(8)}) == pytest.approx(
+        8.0, abs=1e-9
+    )
+    assert _effective_breadth({"A": 0.5, "B": 0.5}) == pytest.approx(2.0, abs=1e-9)
+    assert _effective_breadth({"A": 0.5, "B": -0.5}) == pytest.approx(1.0, abs=1e-9)
+    assert _effective_breadth({"A": -0.5}) is None
+    assert _effective_breadth({}) is None
+
+    policy = StockRiskPolicy()
+    decision = datetime(2024, 3, 1, tzinfo=UTC)
+
+    def _records(policy: StockRiskPolicy) -> list[dict]:
+        return policy.compounding_evidence
+
+    _record_compounding_decision(
+        policy,
+        decision_session=decision,
+        candidate_count=100,
+        ranked_count=12,
+        selected_count=8,
+        confidence_edge_h=None,
+        confidence_variance_h=None,
+        confidence_scale=None,
+        gross_before_compounding=0.9,
+        gross_after_compounding=0.9,
+        turnover_lambda=1.0,
+        cash_reason="invalid-confidence-variance",
+    )
+    assert _records(policy)[-1]["effective_breadth"] is None
+
+    _record_compounding_decision(
+        policy,
+        decision_session=decision,
+        candidate_count=100,
+        ranked_count=12,
+        selected_count=8,
+        confidence_edge_h=0.01,
+        confidence_variance_h=0.02,
+        confidence_scale=1.0,
+        gross_before_compounding=0.9,
+        gross_after_compounding=0.9,
+        turnover_lambda=1.0,
+        cash_reason=None,
+        effective_breadth=_effective_breadth(
+            {f"K{i}": 0.9 / 8 for i in range(8)}
+        ),
+    )
+    assert _records(policy)[-1]["effective_breadth"] == pytest.approx(8.0, abs=1e-9)
+
+    summary = _sizing_diagnostics_summary(list(_records(policy)))
+    # The cash decision records None and is excluded from breadth aggregates.
+    assert summary["effective_breadth_mean"] == pytest.approx(8.0, abs=1e-9)
+    assert summary["effective_breadth_p10"] == pytest.approx(8.0, abs=1e-9)
+    assert summary["effective_breadth_p90"] == pytest.approx(8.0, abs=1e-9)
+
+    empty_summary = _sizing_diagnostics_summary([])
+    assert empty_summary["effective_breadth_mean"] is None
+    assert empty_summary["effective_breadth_p10"] is None
