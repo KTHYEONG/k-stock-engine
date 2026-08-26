@@ -789,6 +789,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--hedge-leverage-grid",
+        type=str,
+        default=None,
+        help=(
+            "Opt-in comma-separated hedge sleeve leverage grid (e.g. "
+            "'1,1.5,2,2.5,3'); absent keeps the legacy (1,1.5,2) ladder"
+        ),
+    )
+    parser.add_argument(
         "--holm-family-scope",
         choices=["frontier", "route_gatekeeping"],
         default="frontier",
@@ -859,7 +868,16 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
         enable_excess_route=args.enable_excess_route,
         policy_profiles=policy_profiles,
         compounding=CompoundingCertificationSettings(
-            max_drawdown=float(getattr(args, 'cert_max_drawdown', 0.5))
+            max_drawdown=float(getattr(args, 'cert_max_drawdown', 0.5)),
+            hedge_leverage_grid=(
+                tuple(
+                    float(part)
+                    for part in str(args.hedge_leverage_grid).split(',')
+                    if part.strip()
+                )
+                if getattr(args, 'hedge_leverage_grid', None)
+                else None
+            ),
         ),
         portfolio=PortfolioSettings(
             top_k=args.top_k,

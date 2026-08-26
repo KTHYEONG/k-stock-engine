@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
@@ -475,6 +476,7 @@ class CompoundingCertificationSettings:
     bootstrap_resamples: int = 200
     seed: int = 42
     allowed_tail_censoring_sessions: int = 0
+    hedge_leverage_grid: tuple[float, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.annualization_sessions < 1:
@@ -497,6 +499,21 @@ class CompoundingCertificationSettings:
             raise ValueError("bootstrap_alpha must be in (0, 1)")
         if self.bootstrap_resamples < 2:
             raise ValueError("bootstrap_resamples must be at least 2")
+        if self.hedge_leverage_grid is not None:
+            grid = tuple(self.hedge_leverage_grid)
+            if not grid:
+                raise ValueError("hedge_leverage_grid must not be empty when set")
+            if any(not math.isfinite(value) for value in grid):
+                raise ValueError("hedge_leverage_grid values must be finite")
+            if any(value < 1.0 or value > 5.0 for value in grid):
+                raise ValueError(
+                    "hedge_leverage_grid values must be in [1.0, 5.0]"
+                )
+            if list(grid) != sorted(set(grid)):
+                raise ValueError(
+                    "hedge_leverage_grid values must be strictly ascending "
+                    "and unique"
+                )
 
 
 @dataclass(frozen=True, slots=True)

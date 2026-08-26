@@ -4255,6 +4255,12 @@ def _growth_route_projection(
         try:
             projection_payload = project_hedge_sleeve(
                 route.base_log_growth_minus_benchmark,
+                leverage_grid=(
+                    compounding.hedge_leverage_grid
+                    if compounding is not None
+                    and compounding.hedge_leverage_grid is not None
+                    else (1.0, 1.5, 2.0)
+                ),
                 vol_managed_lookback=26,
                 vol_managed_target_annualized_vol=0.10,
             )
