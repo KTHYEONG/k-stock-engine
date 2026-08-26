@@ -1098,6 +1098,21 @@ def _compact_hedge_sleeve(route: Mapping[str, object]) -> dict[str, object]:
             }
         if compacted:
             summary["best_rungs"] = compacted
+    admissible = sleeve.get("admissible_leverages")
+    if isinstance(admissible, Mapping):
+        bounded: dict[str, list[float]] = {}
+        for variant in ("static", "vol_managed"):
+            levs = admissible.get(variant)
+            if isinstance(levs, (list, tuple)):
+                values: list[float] = []
+                for lev in levs:
+                    parsed = _as_float(lev)
+                    if parsed is not None:
+                        values.append(parsed)
+                if values:
+                    bounded[variant] = values
+        if bounded:
+            summary["admissible_leverages"] = bounded
     return summary
 
 
