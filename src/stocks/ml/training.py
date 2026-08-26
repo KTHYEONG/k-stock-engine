@@ -1304,6 +1304,14 @@ def _risk_policy_for_profile(
         )
     if profile.turnover_budget_override is not None:
         policy_kwargs["turnover_budget"] = float(profile.turnover_budget_override)
+    if profile.gate_floor is None:
+        gate_floor_override: float | None = None
+    else:
+        gate_floor_override = float(profile.gate_floor)
+    if profile.gate_trend_lookback_sessions is None:
+        gate_lookback_override: int | None = None
+    else:
+        gate_lookback_override = int(profile.gate_trend_lookback_sessions)
     return StockRiskPolicy(
         top_k=top_k,
         gross_cap=gross_cap,
@@ -1317,7 +1325,20 @@ def _risk_policy_for_profile(
         economic_ranking_mode="economic_net_v1",
         execution_utility_mode=profile.execution_utility_mode,
         sizing_mode=profile.sizing_mode,
-        retained_sizing_mode=("band_limited_rewaterfill_v1" if request.enable_sparse_retained_rewaterfill else "freeze_v1"),
+        retained_sizing_mode=(
+            "band_limited_rewaterfill_v1" if request.enable_sparse_retained_rewaterfill else "freeze_v1"
+        ),
+        net_exposure_gate_mode=profile.net_exposure_gate_mode,
+        gate_floor=(
+            gate_floor_override
+            if gate_floor_override is not None
+            else StockRiskPolicy().gate_floor
+        ),
+        gate_trend_lookback_sessions=(
+            gate_lookback_override
+            if gate_lookback_override is not None
+            else StockRiskPolicy().gate_trend_lookback_sessions
+        ),
         **policy_kwargs,  # type: ignore[arg-type]
     )
 
@@ -1482,7 +1503,7 @@ def _sizing_diagnostics_summary(
             return None
         return float(sum(values) / len(values))
 
-    return {
+    summary: dict[str, object] = {
         "decision_count": len(records),
         "cash_decision_count": sum(
             1 for record in records if record.get("cash_reason") is not None
@@ -1507,6 +1528,37 @@ def _sizing_diagnostics_summary(
         "effective_breadth_p10": _quantile(breadths, 0.1),
         "effective_breadth_p90": _quantile(breadths, 0.9),
     }
+    nem_scales = [
+        value
+        for value in (
+            _float_or_none(record.get("nem_scale")) for record in records
+        )
+        if value is not None
+    ]
+    nem_trends = [
+        value
+        for value in (
+            _float_or_none(record.get("nem_s_trend")) for record in records
+        )
+        if value is not None
+    ]
+    nem_vols = [
+        value
+        for value in (
+            _float_or_none(record.get("nem_s_vol")) for record in records
+        )
+        if value is not None
+    ]
+    if nem_scales:
+        summary["nem_scale_mean"] = _mean(nem_scales)
+        summary["nem_scale_p10"] = _quantile(nem_scales, 0.1)
+        summary["nem_scale_p90"] = _quantile(nem_scales, 0.9)
+        summary["nem_s_trend_mean"] = _mean(nem_trends)
+        summary["nem_s_vol_mean"] = _mean(nem_vols)
+        summary["nem_active_fraction"] = sum(
+            1 for scale in nem_scales if scale < 1.0
+        ) / len(records)
+    return summary
 
 
 def _profile_scoped_specs(
@@ -1663,6 +1715,9 @@ def _replay_costs(
         growth_risk_aversion=profile.growth_risk_aversion,
         execution_utility_mode="delta_cost_aware_v1",
         sizing_mode="alpha_vol_squared_v1",
+        net_exposure_gate_mode=profile.net_exposure_gate_mode,
+        gate_trend_lookback_sessions=profile.gate_trend_lookback_sessions,
+        gate_floor=profile.gate_floor,
     )
     shadow_context = _execution_replay_context(
         registry,
@@ -1789,6 +1844,9 @@ def _replay_costs_batch(
                     growth_risk_aversion=profile.growth_risk_aversion,
                     execution_utility_mode="delta_cost_aware_v1",
                     sizing_mode="alpha_vol_squared_v1",
+                    net_exposure_gate_mode=profile.net_exposure_gate_mode,
+                    gate_trend_lookback_sessions=profile.gate_trend_lookback_sessions,
+                    gate_floor=profile.gate_floor,
                 )
                 shadow_context = _execution_replay_context(
                     registry,
@@ -3943,6 +4001,25 @@ def _policy_profile_params(
             "vol_target_override": profile.vol_target_override,
             "participation_limit_override": profile.participation_limit_override,
             "turnover_budget_override": profile.turnover_budget_override,
+            **(
+                {}
+                if profile.net_exposure_gate_mode == "off_v1"
+                else {
+                    "net_exposure_gate_mode": profile.net_exposure_gate_mode,
+                    **(
+                        {"gate_floor": profile.gate_floor}
+                        if profile.gate_floor is not None
+                        else {}
+                    ),
+                    **(
+                        {
+                            "gate_trend_lookback_sessions": profile.gate_trend_lookback_sessions
+                        }
+                        if profile.gate_trend_lookback_sessions is not None
+                        else {}
+                    ),
+                }
+            ),
         },
         sort_keys=True,
     )

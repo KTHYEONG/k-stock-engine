@@ -32,8 +32,11 @@ __all__ = [
 
 # Ex-ante seed preference: highest declared utilization rung first. The
 # ordering is contract-only (declared profile membership) and never reads
-# outcomes, so the seed stays causal by construction.
+# outcomes, so the seed stays causal by construction. The net-exposure-gated
+# rung outranks its ungated sibling only when explicitly declared on the
+# request, so flag-off runs resolve exactly as before.
 _SEED_PROFILE_PREFERENCE = (
+    "unhedged_nem_v1",
     GROWTH_FULL_UTILIZATION_PROFILE_ID,
     EXCESS_FULL_KELLY_PROFILE_ID,
     LOWER_BOUND_ONLY_PROFILE_ID,
