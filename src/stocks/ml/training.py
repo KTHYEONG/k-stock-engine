@@ -44,6 +44,7 @@ from src.core.portfolio import PortfolioSnapshot
 from src.stocks.data.ml_integrity import validate_ml_snapshot
 from src.stocks.data.quality import KRXSessionCalendar
 from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
+from src.stocks.ml.capital_plan import build_small_capital_route_plan
 from src.stocks.ml.compound_track import (
     frozen_compound_track_projection,
     resolve_frozen_policy_key,
@@ -62,6 +63,7 @@ from src.stocks.ml.contracts import (
     PolicyProfile,
     RegularizationGrid,
     RiskSettings,
+    SmallCapitalPlanSettings,
     policy_portfolio_fingerprint,
 )
 from src.stocks.ml.data import assess_snapshot_outcome_readiness
@@ -669,7 +671,7 @@ def _run_discovery_and_publish(
         else discovery.evidence[0].horizon_sessions
     )
     certificate = certify_growth_route(route, primary, request.compounding)
-    growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary)  # noqa: E501
+    growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary, capital_plan_settings=request.capital_plan)  # noqa: E501
     _attach_frozen_compound_track(growth_route, discovery.evidence, request)
     growth_route = _attach_excess_route_certificate(
         growth_route, discovery, request, pre_holdout, primary
@@ -4164,6 +4166,7 @@ def _growth_route_projection(
     *,
     compounding: CompoundingCertificationSettings | None = None,
     horizon_sessions: int | None = None,
+    capital_plan_settings: SmallCapitalPlanSettings | None = None,
 ) -> dict[str, object]:
     """Bounded ``growth_route`` projection shared by metrics and the ledger.
 
@@ -4365,6 +4368,13 @@ def _growth_route_projection(
     }
     if sleeve_certificate is not None:
         projection["hedged_excess_certificate"] = sleeve_certificate
+    if capital_plan_settings is not None:
+        try:
+            projection["small_capital_route_plan"] = build_small_capital_route_plan(
+                route, capital_plan_settings
+            )
+        except ValueError:
+            projection["small_capital_route_plan"] = {}
     return projection
 
 
@@ -4751,7 +4761,7 @@ def _growth_route_research_payload(
         else discovery.evidence[0].horizon_sessions
     )
     certificate = certify_growth_route(route, primary, request.compounding)
-    growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary)  # noqa: E501
+    growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary, capital_plan_settings=request.capital_plan)  # noqa: E501
     _attach_frozen_compound_track(growth_route, discovery.evidence, request)
     growth_route = _attach_excess_route_certificate(
         growth_route, discovery, request, panel, primary

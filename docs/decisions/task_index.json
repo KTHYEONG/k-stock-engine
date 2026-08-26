@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_SMALL_CAPITAL_ROUTE_PLAN",
+      "date": "2026-08-26",
+      "adr_id": "ADR_20260826_SMALL_CAPITAL_ROUTE_PLAN",
+      "domain": "quant",
+      "title": "Capital-aware route implementation plan layer",
+      "why": "Promoted hedged-excess route implicitly required futures-lot-scale capital; promotion evidence was unit-free with no absolute-capital feasibility check anywhere.",
+      "resolution": "Added pure deterministic kernel build_small_capital_route_plan (futures lot coverage/margin-lockup, inverse-ETF overlay ratio, per-position floor predicates + sub-unit-leverage unhedged fallback projection reusing project_hedge_sleeve), SmallCapitalPlanSettings contract, optional NetAlphaTrainingRequest.capital_plan threaded through _growth_route_projection call sites and train CLI --seed-capital-plan-krw; legacy payloads byte-identical when flag off. 5M KRW verdict: IMPLEMENTABLE via unhedged only; mini-futures hedge opens at ~7.6M+.",
+      "impact": "src/stocks/ml/{capital_plan,contracts,training,economic_research}.py, src/stocks/cli/train.py, tests/unit/stocks/ml/test_capital_plan.py; growth_route payload gains small_capital_route_plan section only when seed capital provided"
+    },
+    {
       "task_id": "ADR_20260826_hedge_leverage_ceiling_extension",
       "date": "2026-08-26",
       "adr_id": "ADR_20260826_ADR_20260826_hedge_leverage_ceiling_extension",
@@ -989,16 +999,6 @@
       "why": "Economic replay exceeded the RSS guard during decision preparation because all bootstrap workspace draws were admitted at once.",
       "resolution": "Added deterministic batched bootstrap workspace sizing and replay admission telemetry while preserving causal calibration, bootstrap count, and fail-closed capacity behavior.",
       "impact": "Prevents replay capacity failure under the recorded 8 GiB budget and bounds calibration peak memory; promotion semantics remain unchanged."
-    },
-    {
-      "task_id": "TASK_ECONOMIC_REPLAY_RESOURCE_GUARD_RUN",
-      "date": "2026-08-12",
-      "adr_id": "ADR_20260812_ECONOMIC_REPLAY_RESOURCE_GUARD_RUN",
-      "domain": "stocks",
-      "title": "Economic replay resource-guard execution result",
-      "why": "Latest ML execution must replace stale backtesting records and expose runtime, RSS, and fail-closed replay evidence.",
-      "resolution": "Replaced docs/results/back-res.md with the 1-trial guarded execution metrics, NO_TRADE decision, and replay capacity failure evidence; registered the decision and refreshed the code map.",
-      "impact": "The result document now reflects the latest reproducible run; oversized replay materialization is documented as safely blocked, with no paper/live promotion."
     }
   ]
 }
