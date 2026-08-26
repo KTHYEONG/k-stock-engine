@@ -517,6 +517,82 @@ class CompoundingCertificationSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class SmallCapitalPlanSettings:
+    """Pre-registered absolute-capital implementation plan inputs.
+
+    Declares the deployment account size and exchange-reference instrument
+    facts so a promoted route's implementability is judged quantitatively
+    instead of being silently assumed. Lot notionals and the initial margin
+    fraction are explicit reference inputs mirroring KOSPI200 contract
+    specifications; refresh them when the exchange contract changes.
+    """
+
+    seed_capital_krw: float
+    equity_utilization: float = 0.95
+    target_beta: float = 1.0
+    full_futures_lot_notional_krw: float = 87_500_000.0
+    mini_futures_lot_notional_krw: float = 8_750_000.0
+    initial_margin_fraction: float = 0.15
+    max_futures_coverage_error: float = 0.20
+    max_margin_locked_fraction: float = 0.30
+    min_position_notional_krw: float = 100_000.0
+    max_overlay_capital_fraction: float = 0.35
+    min_overlay_hedge_ratio: float = 0.50
+    unhedged_leverage_grid: tuple[float, ...] = (0.25, 0.5, 0.75, 1.0)
+    max_projected_mdd: float = 0.35
+    annualization_sessions: int = 252
+
+    def __post_init__(self) -> None:
+        if self.seed_capital_krw <= 0 or not math.isfinite(self.seed_capital_krw):
+            raise ValueError("seed_capital_krw must be a positive finite amount")
+        unit_interval_fields = (
+            "equity_utilization",
+            "initial_margin_fraction",
+            "max_futures_coverage_error",
+            "max_margin_locked_fraction",
+            "max_overlay_capital_fraction",
+            "min_overlay_hedge_ratio",
+        )
+        for name in unit_interval_fields:
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or not 0.0 < value <= 1.0:
+                raise ValueError(f"{name} must be a finite fraction in (0, 1]")
+        if (
+            not math.isfinite(self.max_projected_mdd)
+            or not 0.0 < self.max_projected_mdd < 1.0
+        ):
+            raise ValueError("max_projected_mdd must be a finite fraction in (0, 1)")
+        if not math.isfinite(self.target_beta) or self.target_beta <= 0.0:
+            raise ValueError("target_beta must be positive")
+        for name in (
+            "full_futures_lot_notional_krw",
+            "mini_futures_lot_notional_krw",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be a positive finite notional")
+        if (
+            not math.isfinite(self.min_position_notional_krw)
+            or self.min_position_notional_krw < 0.0
+        ):
+            raise ValueError("min_position_notional_krw must be non-negative")
+        if self.annualization_sessions < 1:
+            raise ValueError("annualization_sessions must be positive")
+        grid = tuple(self.unhedged_leverage_grid)
+        if not grid:
+            raise ValueError("unhedged_leverage_grid must not be empty")
+        if any(not math.isfinite(value) for value in grid):
+            raise ValueError("unhedged_leverage_grid values must be finite")
+        if any(not 0.0 < value <= 1.0 for value in grid):
+            raise ValueError("unhedged_leverage_grid values must be in (0.0, 1.0]")
+        if list(grid) != sorted(set(grid)):
+            raise ValueError(
+                "unhedged_leverage_grid values must be strictly ascending "
+                "and unique"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class NetAlphaTrainingRequest:
     """Input contract for the net-alpha training workflow.
 
@@ -571,6 +647,7 @@ class NetAlphaTrainingRequest:
     discovery_workers: int = 1
     enable_sparse_retained_rewaterfill: bool = False
     enable_excess_route: bool = False
+    capital_plan: SmallCapitalPlanSettings | None = None
 
     def __post_init__(self) -> None:
         if not self.artifact_id:
