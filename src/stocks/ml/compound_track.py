@@ -36,6 +36,7 @@ __all__ = [
 # rung outranks its ungated sibling only when explicitly declared on the
 # request, so flag-off runs resolve exactly as before.
 _SEED_PROFILE_PREFERENCE = (
+    "unhedged_stack_v1",
     "unhedged_nem_v1",
     GROWTH_FULL_UTILIZATION_PROFILE_ID,
     EXCESS_FULL_KELLY_PROFILE_ID,

@@ -63,6 +63,7 @@ from src.stocks.ml.contracts import (
     PolicyProfile,
     RegularizationGrid,
     RiskSettings,
+    SatelliteOverlaySettings,
     SmallCapitalPlanSettings,
     policy_portfolio_fingerprint,
 )
@@ -136,6 +137,10 @@ from src.stocks.ml.replay_resources import (
 )
 from src.stocks.ml.replay_resources import (
     plan_training_allocation as _plan_training_allocation,
+)
+from src.stocks.ml.satellite_overlay import (
+    _nem_component_series,
+    project_satellite_overlay,
 )
 from src.stocks.ml.telemetry import TrainingTelemetry
 from src.stocks.ml.telemetry import (
@@ -614,6 +619,7 @@ def train_net_alpha_model(
         return manifest
     finally:
         _set_active_telemetry(None)
+        _NEM_EVIDENCE_REGISTRY.pop(id(request), None)
         cache.close()
 
 
@@ -671,7 +677,15 @@ def _run_discovery_and_publish(
         else discovery.evidence[0].horizon_sessions
     )
     certificate = certify_growth_route(route, primary, request.compounding)
-    growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary, capital_plan_settings=request.capital_plan)  # noqa: E501
+    satellite_nem_records = (
+        _collect_nem_component_records(request, route.selected_policies[-1])
+        if request.satellite_settings is not None
+        and request.satellite_settings.enabled
+        and route.selected_policies
+        and route.selected_policies[-1] is not None
+        else ()
+    )
+    growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary, capital_plan_settings=request.capital_plan, satellite_settings=request.satellite_settings, nem_component_records=satellite_nem_records)  # noqa: E501
     _attach_frozen_compound_track(growth_route, discovery.evidence, request)
     growth_route = _attach_excess_route_certificate(
         growth_route, discovery, request, pre_holdout, primary
@@ -1360,6 +1374,40 @@ def _seed_policy_or_none(request: NetAlphaTrainingRequest) -> PolicyKey | None:
         return None
 
 
+# Request-scoped registry of gated replay policies' compounding evidence so
+# the certified route projection can read causal NEM components for the
+# SELECTED cell. Keyed by id(request) -> (H,C,K,profile) -> mutable record
+# list owned by the context's risk_policy; popped when the run finishes.
+_NEM_EVIDENCE_REGISTRY: dict[int, dict[tuple[int, int, int, str], list[dict[str, object]]]] = {}
+
+
+def _register_nem_evidence(
+    request: NetAlphaTrainingRequest,
+    key: tuple[int, int, int, str],
+    evidence_list: list[dict[str, object]],
+) -> None:
+    if isinstance(evidence_list, list):
+        _NEM_EVIDENCE_REGISTRY.setdefault(id(request), {})[key] = evidence_list
+
+
+def _collect_nem_component_records(
+    request: NetAlphaTrainingRequest,
+    selected_key: PolicyKey | None,
+) -> list[Mapping[str, object]]:
+    """Merge gated-cell NEM records ordered by decision session."""
+    bucket = _NEM_EVIDENCE_REGISTRY.get(id(request))
+    if not bucket or selected_key is None:
+        return []
+    key = (
+        int(selected_key[0]),
+        int(selected_key[1]),
+        int(selected_key[2]),
+        str(selected_key[3]),
+    )
+    records = [r for r in (bucket.get(key) or []) if "nem_scale" in r]
+    return sorted(records, key=lambda r: str(r.get("decision_session", "")))
+
+
 def _execution_replay_context(
     registry: ModelArtifactRegistry,
     request: NetAlphaTrainingRequest,
@@ -1378,6 +1426,22 @@ def _execution_replay_context(
     """
     instruments = instruments_from_frame(market_frame)
     sessions = sorted(market_frame["session"].unique().to_list())
+    replay_risk_policy = _risk_policy_for_profile(
+        request, profile, horizon_sessions,
+        rebalance_frequency_sessions=rebalance_frequency_sessions,
+        top_k=top_k,
+    )
+    if getattr(replay_risk_policy, "net_exposure_gate_mode", "off_v1") != "off_v1":
+        _register_nem_evidence(
+            request,
+            (
+                int(horizon_sessions),
+                int(rebalance_frequency_sessions),
+                int(top_k),
+                str(profile.profile_id),
+            ),
+            replay_risk_policy.compounding_evidence,
+        )
     return ExecutionReplayContext(
         registry=registry,
         manifest=manifest,
@@ -1391,11 +1455,7 @@ def _execution_replay_context(
             unsettled_cash=0.0,
             positions=(),
         ),
-        risk_policy=_risk_policy_for_profile(
-            request, profile, horizon_sessions,
-            rebalance_frequency_sessions=rebalance_frequency_sessions,
-            top_k=top_k,
-        ),
+        risk_policy=replay_risk_policy,
         base_cost_schedule=request.base_cost_schedule or default_base_schedule(),
         stress_cost_schedule=request.stress_cost_schedule or default_stress_schedule(),
         liquidity_model=request.liquidity_model,
@@ -4244,6 +4304,8 @@ def _growth_route_projection(
     compounding: CompoundingCertificationSettings | None = None,
     horizon_sessions: int | None = None,
     capital_plan_settings: SmallCapitalPlanSettings | None = None,
+    satellite_settings: SatelliteOverlaySettings | None = None,
+    nem_component_records: Sequence[Mapping[str, object]] = (),
 ) -> dict[str, object]:
     """Bounded ``growth_route`` projection shared by metrics and the ledger.
 
@@ -4452,6 +4514,21 @@ def _growth_route_projection(
             )
         except ValueError:
             projection["small_capital_route_plan"] = {}
+    if (
+        satellite_settings is not None
+        and satellite_settings.enabled
+        and route.benchmark_log_growth
+    ):
+        try:
+            projection["satellite_overlay_projection"] = project_satellite_overlay(
+                route.base_log_growth,
+                route.stress_log_growth,
+                route.benchmark_log_growth,
+                _nem_component_series(nem_component_records),
+                satellite_settings,
+            )
+        except ValueError:
+            projection["satellite_overlay_projection"] = {}
     return projection
 
 
@@ -4838,7 +4915,15 @@ def _growth_route_research_payload(
         else discovery.evidence[0].horizon_sessions
     )
     certificate = certify_growth_route(route, primary, request.compounding)
-    growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary, capital_plan_settings=request.capital_plan)  # noqa: E501
+    satellite_nem_records = (
+        _collect_nem_component_records(request, route.selected_policies[-1])
+        if request.satellite_settings is not None
+        and request.satellite_settings.enabled
+        and route.selected_policies
+        and route.selected_policies[-1] is not None
+        else ()
+    )
+    growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary, capital_plan_settings=request.capital_plan, satellite_settings=request.satellite_settings, nem_component_records=satellite_nem_records)  # noqa: E501
     _attach_frozen_compound_track(growth_route, discovery.evidence, request)
     growth_route = _attach_excess_route_certificate(
         growth_route, discovery, request, panel, primary
