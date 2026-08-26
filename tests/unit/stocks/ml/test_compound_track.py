@@ -120,6 +120,43 @@ def test_resolve_frozen_policy_key_fail_closed_without_feasible_cell() -> None:
         resolve_frozen_policy_key(request)
 
 
+def test_seed_ladder_growth_optin_prefers_declared_top_rung() -> None:
+    """SCENARIO_SEED_LADDER_GROWTH_OPTIN_04."""
+    from src.stocks.config.research import policy_profiles_with_growth_rungs
+    from src.stocks.ml.contracts import GROWTH_FULL_UTILIZATION_PROFILE_ID
+
+    growth_request = NetAlphaTrainingRequest(
+        artifact_id="growth",
+        policy_profiles=policy_profiles_with_growth_rungs(),
+    )
+    key = resolve_frozen_policy_key(growth_request)
+    assert key[3] == GROWTH_FULL_UTILIZATION_PROFILE_ID
+    assert key[0] == int(growth_request.candidate_horizon_sessions[0])
+    profile = next(
+        profile
+        for profile in growth_request.policy_profiles
+        if profile.profile_id == key[3]
+    )
+    feasible = growth_request.execution_frontier.feasible_cells_for_profile(
+        growth_request.portfolio.max_exposure,
+        growth_request.portfolio.max_single_weight,
+        single_name_cap_override=profile.single_name_cap_override,
+        gross_utilization_target=profile.gross_utilization_target,
+    )
+    assert (key[0], key[1], key[2]) in feasible
+
+    # Flag-off ladder keeps the legacy lower_bound_only seed byte-identical.
+    legacy_request = NetAlphaTrainingRequest(artifact_id="legacy")
+    legacy_key = resolve_frozen_policy_key(legacy_request)
+    assert legacy_key[3] == LOWER_BOUND_ONLY_PROFILE_ID
+    assert legacy_key[:3] == (10, 5, 12)
+
+    # The frozen stitch still fails closed when the declared seed has no
+    # matching discovery candidate.
+    with pytest.raises(ValueError, match="frozen policy"):
+        stitch_frozen_policy_growth_route((), key)
+
+
 def test_projection_emits_bounded_scalars_only() -> None:
     candidate = _evidence(
         base=tuple(math.log1p(0.002) for _ in range(4)),
