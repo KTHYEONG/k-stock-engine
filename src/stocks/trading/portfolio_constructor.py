@@ -747,6 +747,11 @@ def _construct_allocations_prepared(
                 if policy.execution_utility_mode == "sparse_hold_replace_v2" and econ is not None
                 else None
             ),
+            net_exposure_proxy=(
+                _prepared_market_proxy(market, decision_session)
+                if policy.net_exposure_gate_mode != "off_v1"
+                else None
+            ),
         )
     else:
         allocations = _de_risk_allocations(
@@ -813,6 +818,9 @@ class StockRiskPolicy:
         "alpha_vol_squared_v1", "risk_balanced_waterfill_v2", "confidence_mean_variance_v1"
     ] = "alpha_vol_squared_v1"
     retained_sizing_mode: Literal["freeze_v1", "band_limited_rewaterfill_v1"] = "freeze_v1"
+    net_exposure_gate_mode: Literal["off_v1", "trend_vol_v1"] = "off_v1"
+    gate_trend_lookback_sessions: int = 60
+    gate_floor: float = 0.25
 
     def __post_init__(self) -> None:
         if self.top_k <= 0:
@@ -873,6 +881,15 @@ class StockRiskPolicy:
                 "retained_sizing_mode must be 'freeze_v1' or "
                 f"'band_limited_rewaterfill_v1', got {self.retained_sizing_mode!r}"
             )
+        if self.net_exposure_gate_mode not in ("off_v1", "trend_vol_v1"):
+            raise ValueError(
+                "net_exposure_gate_mode must be 'off_v1' or 'trend_vol_v1', "
+                f"got {self.net_exposure_gate_mode!r}"
+            )
+        if self.gate_trend_lookback_sessions <= 0:
+            raise ValueError("gate_trend_lookback_sessions must be positive")
+        if not math.isfinite(self.gate_floor) or not 0.0 <= self.gate_floor < 1.0:
+            raise ValueError("gate_floor must be a finite fraction in [0, 1)")
 
 
 def stock_risk_policy_fingerprint(policy: StockRiskPolicy) -> str:
@@ -915,6 +932,17 @@ def stock_risk_policy_fingerprint(policy: StockRiskPolicy) -> str:
             "execution_utility_mode": str(policy.execution_utility_mode),
             "sizing_mode": str(policy.sizing_mode),
             "retained_sizing_mode": str(policy.retained_sizing_mode),
+            **(
+                {}
+                if str(policy.net_exposure_gate_mode) == "off_v1"
+                else {
+                    "net_exposure_gate_mode": str(policy.net_exposure_gate_mode),
+                    "gate_floor": float(policy.gate_floor),
+                    "gate_trend_lookback_sessions": int(
+                        policy.gate_trend_lookback_sessions
+                    ),
+                }
+            ),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -1101,6 +1129,11 @@ def construct_target_allocations(
             ranked_count=ranked_count,
             selected_count=selected_count,
             economic_inputs=economic_inputs,
+            net_exposure_proxy=(
+                _panel_market_proxy(panel, decision_session)
+                if policy.net_exposure_gate_mode != "off_v1"
+                else None
+            ),
         )
     else:
         allocations = _de_risk_allocations(
@@ -1290,6 +1323,7 @@ def _build_allocations(
     covariance: np.ndarray | None = None,
     covariance_source: str = "",
     economic_inputs: EconomicTransitionInputs | None = None,
+    net_exposure_proxy: Sequence[float] | None = None,
 ) -> tuple[Allocation, ...]:
     if covariance is None:
         covariance, covariance_source = _covariance(panel, ids, policy)
@@ -1406,6 +1440,22 @@ def _build_allocations(
         }
         compounding_applied = True
     gross_after_compounding = sum(weights.values())
+
+    weights, nem_diagnostics = apply_net_exposure_gate(
+        weights, net_exposure_proxy, policy
+    )
+    if nem_diagnostics:
+        record: dict[str, object] = {
+            "decision_session": str(decision_session),
+        }
+        for key in ("nem_scale", "nem_s_trend", "nem_s_vol"):
+            value = nem_diagnostics.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                record[key] = float(value)
+        reason = nem_diagnostics.get("reason")
+        if isinstance(reason, str) and reason:
+            record["nem_reason"] = reason
+        policy.compounding_evidence.append(record)
 
     utility_hold_count = 0
     utility_transition_count = 0
@@ -1630,6 +1680,116 @@ def _scale_volatility(
     forecast_vol = math.sqrt(portfolio_variance) * math.sqrt(policy.annualization_sessions)
     scalar = min(1.0, policy.target_annual_volatility / forecast_vol)
     return {instrument_id: weight * scalar for instrument_id, weight in weights.items()}
+
+
+def _prepared_market_proxy(
+    market: PreparedAllocationMarket, decision_session: object
+) -> list[float] | None:
+    """Equal-weight universe proxy returns strictly before the decision."""
+    session_index = next(
+        (
+            index
+            for index, session in enumerate(market.sessions)
+            if session == decision_session
+        ),
+        len(market.sessions),
+    )
+    if market.dense:
+        history = market.returns_matrix[:session_index]
+        if history.size == 0:
+            return None
+        return [float(value) for value in history.mean(axis=1)]
+    row_sessions = market.row_session_of
+    mask = (row_sessions >= 0) & (row_sessions < session_index)
+    if not bool(mask.any()):
+        return None
+    session_ids = row_sessions[mask].astype(np.int64)
+    values = market.returns[mask]
+    finite = np.isfinite(values)
+    sums = np.bincount(session_ids[finite], weights=values[finite], minlength=session_index)
+    counts = np.bincount(session_ids[finite], minlength=session_index)
+    counts[counts == 0] = 1
+    means = sums / counts
+    return [float(value) for value in means[:session_index]]
+
+
+def _panel_market_proxy(
+    panel: pl.DataFrame, decision_session: object
+) -> list[float] | None:
+    """Per-session cross-sectional mean log returns strictly before decision."""
+    if panel.is_empty():
+        return None
+    frame = (
+        panel.filter(pl.col(_SESSION_COLUMN) < pl.lit(decision_session))
+        .with_columns(_returns_column(panel).alias("__proxy_row"))
+        .group_by(_SESSION_COLUMN)
+        .agg(pl.col("__proxy_row").mean().alias("__proxy_return"))
+        .sort(_SESSION_COLUMN)
+        .drop_nulls("__proxy_return")
+    )
+    if frame.is_empty():
+        return None
+    return [float(value) for value in frame["__proxy_return"].to_list()]
+
+
+def net_exposure_gate_scale(
+    proxy_returns: Sequence[float],
+    policy: StockRiskPolicy,
+) -> tuple[float, dict[str, object]]:
+    """Return the causal net-exposure multiplier ``m_t`` and its components.
+
+    The proxy series carries strictly-past equal-weight universe log returns.
+    ``s_trend`` collapses to ``gate_floor`` when the trailing trend-window mean
+    is negative; ``s_vol`` shrinks proportionally while realized market vol
+    exceeds the declared volatility budget. ``m_t = max(gate_floor,
+    s_trend * s_vol)`` therefore can only reduce exposure and stays within
+    ``[gate_floor, 1]``. History shorter than the widest lookback fails open to
+    an exact no-op with a recorded reason.
+    """
+    if policy.net_exposure_gate_mode == "off_v1":
+        return 1.0, {}
+    values = np.asarray(proxy_returns, dtype=float)
+    required = max(
+        policy.gate_trend_lookback_sessions, policy.volatility_lookback_sessions
+    )
+    if values.size < required:
+        return 1.0, {"reason": "gate-history-insufficient"}
+    trend_mean = float(values[-policy.gate_trend_lookback_sessions :].mean())
+    vol_window = values[-policy.volatility_lookback_sessions :]
+    sigma_ann = float(vol_window.std()) * math.sqrt(policy.annualization_sessions)
+    s_trend = 1.0 if trend_mean >= 0.0 else float(policy.gate_floor)
+    s_vol = min(1.0, policy.target_annual_volatility / max(sigma_ann, 1e-12))
+    scale = max(float(policy.gate_floor), s_trend * s_vol)
+    return (
+        float(scale),
+        {
+            "nem_scale": float(scale),
+            "nem_s_trend": float(s_trend),
+            "nem_s_vol": float(s_vol),
+        },
+    )
+
+
+def apply_net_exposure_gate(
+    weights: dict[str, float],
+    proxy_returns: Sequence[float] | None,
+    policy: StockRiskPolicy,
+) -> tuple[dict[str, float], dict[str, object]]:
+    """Scale target weights by the NEM multiplier when the gate is enabled.
+
+    Returns the input weights untouched for ``off_v1`` policies (and for
+    fail-open no-ops) together with empty diagnostics; gated runs multiply
+    every weight by ``m_t`` and surface the component diagnostics.
+    """
+    if policy.net_exposure_gate_mode != "trend_vol_v1":
+        return weights, {}
+    if proxy_returns is None:
+        return weights, {"reason": "gate-proxy-unavailable"}
+    scale, components = net_exposure_gate_scale(proxy_returns, policy)
+    scaled = {instrument_id: weight * scale for instrument_id, weight in weights.items()}
+    diagnostics = dict(components)
+    diagnostics.setdefault("nem_scale", scale)
+    return scaled, diagnostics
 
 
 def _compounding_scale(
