@@ -1307,7 +1307,7 @@ class _FamilyState:
             )
             certified = certify_growth_route(route, primary, request.compounding)
             certificate = dict(certified)
-            projection = _growth_route_projection(route, certificate)
+            projection = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary)  # noqa: E501
         qualified = bool(
             self.any_tail_ok
             and certificate is not None

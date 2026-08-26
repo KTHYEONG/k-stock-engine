@@ -9,7 +9,12 @@ from __future__ import annotations
 
 import math
 
-from src.stocks.ml.contracts import LOWER_BOUND_ONLY_PROFILE_ID, NetAlphaTrainingRequest
+from src.stocks.ml.contracts import (
+    EXCESS_FULL_KELLY_PROFILE_ID,
+    GROWTH_FULL_UTILIZATION_PROFILE_ID,
+    LOWER_BOUND_ONLY_PROFILE_ID,
+    NetAlphaTrainingRequest,
+)
 from src.stocks.ml.horizons import (
     GROWTH_ROUTE_VERSION,
     GrowthRouteEvidence,
@@ -25,28 +30,53 @@ __all__ = [
 ]
 
 
+# Ex-ante seed preference: highest declared utilization rung first. The
+# ordering is contract-only (declared profile membership) and never reads
+# outcomes, so the seed stays causal by construction.
+_SEED_PROFILE_PREFERENCE = (
+    GROWTH_FULL_UTILIZATION_PROFILE_ID,
+    EXCESS_FULL_KELLY_PROFILE_ID,
+    LOWER_BOUND_ONLY_PROFILE_ID,
+)
+
+
 def resolve_frozen_policy_key(request: NetAlphaTrainingRequest) -> PolicyKey:
     """First feasible ``(H, C, K)`` cell at ``candidate_horizon_sessions[0]``
-    under ``lower_bound_only``; absent feasibility fails closed."""
+    under the highest declared seed-profile preference; absent feasibility
+    fails closed.
+
+    Preference walks the fixed rung ladder and picks the first profile
+    declared on ``request.policy_profiles``, resolving feasibility with that
+    profile's own cap overrides. Flag-off requests declare no extra rungs and
+    resolve to the legacy ``lower_bound_only`` key unchanged.
+    """
+    declared = {
+        profile.profile_id: profile for profile in request.policy_profiles
+    }
     horizon = int(request.candidate_horizon_sessions[0])
-    cell = next(
-        (
-            (h, cadence, top_k)
-            for h, cadence, top_k in request.execution_frontier.feasible_cells(
-                request.portfolio.max_exposure,
-                request.portfolio.max_single_weight,
-            )
-            if h == horizon
-        ),
-        None,
-    )
-    if cell is None:
-        raise ValueError(
-            f"frozen policy requires a feasible (H,C,K) cell at horizon "
-            f"H={horizon}; refusing to default to cash"
+    for profile_id in _SEED_PROFILE_PREFERENCE:
+        profile = declared.get(profile_id)
+        if profile is None:
+            continue
+        cell = next(
+            (
+                (h, cadence, top_k)
+                for h, cadence, top_k in request.execution_frontier.feasible_cells_for_profile(
+                    request.portfolio.max_exposure,
+                    request.portfolio.max_single_weight,
+                    single_name_cap_override=profile.single_name_cap_override,
+                    gross_utilization_target=profile.gross_utilization_target,
+                )
+                if h == horizon
+            ),
+            None,
         )
-    _h, cadence, top_k = cell
-    return (horizon, cadence, top_k, LOWER_BOUND_ONLY_PROFILE_ID)
+        if cell is not None:
+            return (horizon, cell[1], cell[2], profile_id)
+    raise ValueError(
+        f"frozen policy requires a feasible (H,C,K) cell at horizon "
+        f"H={horizon}; refusing to default to cash"
+    )
 
 
 def stitch_frozen_policy_growth_route(

@@ -11,13 +11,14 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import polars as pl
 from scipy.stats import rankdata
 
 from src.stocks.ml.contracts import CompoundingCertificationSettings
+from src.stocks.ml.hedge_sleeve import project_hedge_sleeve
 
 if TYPE_CHECKING:
     from src.stocks.ml.horizons import GrowthRouteEvidence
@@ -706,4 +707,159 @@ def certify_growth_route(
             None if matched_lower_excess is None else _round_or_none(matched_lower_excess)
         ),
         mdd=_round_or_none(mdd),
+    )
+
+
+def certify_hedged_excess_route(
+    route: GrowthRouteEvidence,
+    horizon_sessions: int,
+    settings: CompoundingCertificationSettings,
+) -> dict[str, object]:
+    """Certify the exposure-matched excess stream for hedge-sleeve promotion.
+
+    The excess series (``base - benchmark``) is bootstrapped with the shared
+    moving-block kernel; the certificate passes only when the annualized
+    excess lower CAGR is strictly positive, a leverage rung from
+    :func:`project_hedge_sleeve` is admissible under the pre-registered
+    ``settings.max_drawdown`` cap, and the variance-drag-adjusted growth of
+    that rung evaluated **on the lower-bound scenario** stays strictly
+    positive. Point estimates never gate. Every failure emits a normalized
+    predicate while still reporting the bounded scalars for diagnosis.
+
+    Raises:
+        ValueError: when ``bootstrap_resamples`` cannot resolve the alpha
+            quantile (``resamples < ceil(1 / alpha)``).
+    """
+    if horizon_sessions < 1:
+        raise ValueError("horizon_sessions must be positive")
+    minimum_resamples = math.ceil(1.0 / settings.bootstrap_alpha)
+    if settings.bootstrap_resamples < minimum_resamples:
+        raise ValueError(
+            f"bootstrap_resamples={settings.bootstrap_resamples} is below the "
+            f"resolvable minimum {minimum_resamples} for "
+            f"alpha={settings.bootstrap_alpha}"
+        )
+
+    base_log = np.asarray(route.base_log_growth, dtype=float)
+    stress_log = np.asarray(route.stress_log_growth, dtype=float)
+    benchmark_log = np.asarray(route.benchmark_log_growth, dtype=float)
+    observed = int(
+        route.observed_interval_count
+        if route.observed_interval_count > 0
+        else base_log.size
+    )
+    invested = int(route.invested_interval_count)
+
+    def _result(reasons: list[str], **overrides: object) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "passed": not reasons,
+            "reasons": sorted(dict.fromkeys(reasons)),
+            "excess_lower_cagr": None,
+            "sleeve_lower_stress_cagr": None,
+            "hedge_variant": "",
+            "hedge_leverage": None,
+            "hedge_point_cagr": None,
+            "hedge_stress_cagr": None,
+            "hedge_projected_mdd": None,
+            "hedge_margin_buffer": None,
+            "observed_intervals": observed,
+            "invested_intervals": invested,
+            "filled_orders": int(route.filled_orders),
+        }
+        payload.update(overrides)
+        return payload
+
+    if (
+        base_log.size == 0
+        or not bool(np.all(np.isfinite(base_log)))
+        or not bool(np.all(np.isfinite(stress_log)))
+        or stress_log.size != base_log.size
+    ):
+        return _result(["period-series-incomplete"])
+    reasons = ["no-filled-orders"] if route.filled_orders <= 0 else []
+    if observed < settings.min_observed_sessions:
+        reasons.append("insufficient-observed-sessions")
+    invested_fraction = invested / observed if observed > 0 else 0.0
+    if invested <= 0 or invested_fraction < settings.min_active_cohort_fraction:
+        reasons.append("invested-coverage-insufficient")
+    if benchmark_log.size != base_log.size or benchmark_log.size == 0:
+        reasons.append("matched-benchmark-missing")
+        return _result(reasons)
+    if not bool(np.all(np.isfinite(benchmark_log))):
+        reasons.append("period-series-incomplete")
+        return _result(reasons)
+
+    excess = base_log - benchmark_log
+    block_length = max(1, min(horizon_sessions, int(excess.size)))
+    excess_lower_mean = _bootstrap_lower_mean_log_growth(
+        excess,
+        block_length,
+        settings.bootstrap_resamples,
+        settings.seed + 3 * horizon_sessions,
+        settings.bootstrap_alpha,
+    )
+    excess_lower_cagr = annualize_bootstrap_lower_cagr(
+        excess_lower_mean,
+        annualization_sessions=settings.annualization_sessions,
+        period_count=int(excess.size),
+        observed_sessions=observed,
+    )
+    if not math.isfinite(excess_lower_cagr) or excess_lower_cagr <= 0.0:
+        reasons.append("non-positive-excess-lower-cagr")
+
+    projection = project_hedge_sleeve(
+        excess.tolist(),
+        annualization_sessions=settings.annualization_sessions,
+        max_projected_mdd=settings.max_drawdown,
+        vol_managed_lookback=26,
+        vol_managed_target_annualized_vol=0.10,
+    )
+    def _scalar(row: dict[str, object], key: str) -> float:
+        return float(cast("float", row[key]))
+
+    ladder_rows = [
+        row
+        for row in cast("list[dict[str, object]]", projection["leverage_ladder"])
+        if bool(row.get("admissible"))
+    ]
+    if not ladder_rows:
+        reasons.append("no-admissible-hedge-rung")
+        return _result(
+            reasons, excess_lower_cagr=_round_or_none(excess_lower_cagr)
+        )
+
+    variant_rank = {"vol_managed": 0, "static": 1}
+    best = min(
+        ladder_rows,
+        key=lambda row: (
+            -_scalar(row, "stress_cagr"),
+            variant_rank[str(row["variant"])],
+            _scalar(row, "leverage"),
+        ),
+    )
+    leverage = _scalar(best, "leverage")
+    projected_vol = _scalar(best, "projected_vol")
+    lower_stress_log = (
+        leverage * excess_lower_mean * settings.annualization_sessions
+        - 0.5 * projected_vol**2
+    )
+    sleeve_lower_stress_cagr = math.expm1(
+        max(min(lower_stress_log, 50.0), -50.0)
+    )
+    if (
+        not math.isfinite(sleeve_lower_stress_cagr)
+        or sleeve_lower_stress_cagr <= 0.0
+    ):
+        reasons.append("non-positive-sleeve-lower-stress-cagr")
+
+    return _result(
+        reasons,
+        excess_lower_cagr=_round_or_none(excess_lower_cagr),
+        sleeve_lower_stress_cagr=_round_or_none(sleeve_lower_stress_cagr),
+        hedge_variant=str(best["variant"]),
+        hedge_leverage=_round_or_none(leverage),
+        hedge_point_cagr=_round_or_none(_scalar(best, "point_cagr")),
+        hedge_stress_cagr=_round_or_none(_scalar(best, "stress_cagr")),
+        hedge_projected_mdd=_round_or_none(_scalar(best, "projected_mdd")),
+        hedge_margin_buffer=_round_or_none(_scalar(best, "margin_buffer")),
     )
