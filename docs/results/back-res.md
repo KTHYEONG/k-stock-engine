@@ -1,13 +1,13 @@
 # ML Result Ledger
 
 - Schema version: 2
-- Latest artifact: `ml_excess_route_ab_20260826`
+- Latest artifact: `ml_hedge_ceiling_ab_20260826`
 - Status: `completed`
-- Finished: 2026-08-26T04:09:31.148284+00:00
+- Finished: 2026-08-26T05:02:30.971058+00:00
 - Latest JSON: `docs/results/ml_runs/latest.json`
 - Recent JSONL: `docs/results/ml_runs/recent.jsonl`
 - Retention: newest 128 records, each <= 24576 bytes
-- Retained: 108 | discarded: 0 | invalid: 0
+- Retained: 109 | discarded: 0 | invalid: 0
 
 ## Latest Backtest & Compounding Performance
 
