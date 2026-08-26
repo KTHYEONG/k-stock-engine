@@ -809,6 +809,11 @@ def certify_hedged_excess_route(
 
     projection = project_hedge_sleeve(
         excess.tolist(),
+        leverage_grid=(
+            settings.hedge_leverage_grid
+            if settings.hedge_leverage_grid is not None
+            else (1.0, 1.5, 2.0)
+        ),
         annualization_sessions=settings.annualization_sessions,
         max_projected_mdd=settings.max_drawdown,
         vol_managed_lookback=26,
