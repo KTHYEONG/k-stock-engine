@@ -177,6 +177,74 @@ def test_frontier_publishes_blend_lower_growth() -> None:
     assert empty_frontier["blend_lower_growth"] == {}
 
 
+def test_SCENARIO_PROMOTED_EXCESS_SLEEVE_VERDICT_05() -> None:
+    """SCENARIO_PROMOTED_EXCESS_SLEEVE_VERDICT_05.
+
+    With compounding governance injected, an absolute-fail route whose excess
+    stream certifies promotes to PROMOTED_EXCESS_SLEEVE with a bounded
+    hedged_excess_certificate payload; the legacy positional call stays
+    byte-identical (PROMOTABLE_EXCESS, no new key), and the blend champion
+    carries the sleeve verdict through the excess-verdict carve-out.
+    """
+    from src.stocks.ml.contracts import CompoundingCertificationSettings
+
+    def _benchmarked_route() -> GrowthRouteEvidence:
+        base = tuple(0.002 for _ in range(1000))
+        return GrowthRouteEvidence(
+            base_log_growth=base,
+            stress_log_growth=base,
+            segment_ids=tuple(0 for _ in range(1000)),
+            selected_policies=((10, 5, 12, "lower_bound_only"),),
+            benchmark_log_growth=tuple(0.0 for _ in range(1000)),
+            observed_interval_count=1000,
+            invested_interval_count=1000,
+            filled_orders=500,
+        )
+
+    settings = CompoundingCertificationSettings(
+        bootstrap_resamples=2000, seed=42, max_drawdown=0.5
+    )
+    certificate = _certificate(
+        ["non-positive-base-lower-cagr", "non-positive-stress-lower-cagr"],
+        0.128,
+    )
+    promoted = _growth_route_projection(
+        _benchmarked_route(),
+        certificate,
+        compounding=settings,
+        horizon_sessions=10,
+    )
+    assert promoted["promotion_status"] == "PROMOTED_EXCESS_SLEEVE"
+    sleeve = promoted["hedged_excess_certificate"]
+    assert isinstance(sleeve, dict)
+    assert sleeve["passed"] is True
+    assert sleeve["excess_lower_cagr"] > 0.0
+    assert "non-positive-base-lower-cagr" in promoted["rejection_reason_counts"]
+
+    # Absolute-failure reasons stay verbatim; the verdict never flips the
+    # artifact promotion flag path (promoted is not part of this projection).
+    legacy = _growth_route_projection(_benchmarked_route(), certificate)
+    assert legacy["promotion_status"] == "PROMOTABLE_EXCESS"
+    assert "hedged_excess_certificate" not in legacy
+
+    # A route without an attached benchmark cannot certify a sleeve: the
+    # verdict falls through to NO_TRADE and no certificate key is added.
+    failed_sleeve = _growth_route_projection(
+        _route(),
+        _certificate(["non-positive-base-lower-cagr"], None),
+        compounding=settings,
+        horizon_sessions=10,
+    )
+    assert failed_sleeve["promotion_status"] == "NO_TRADE"
+    assert "hedged_excess_certificate" not in failed_sleeve
+
+    reason, payload = _blend_champion_no_trade(promoted, certificate)
+    assert reason == "blend-champion-excess-verdict"
+    assert payload["growth_route"]["promotion_status"] == (
+        "PROMOTED_EXCESS_SLEEVE"
+    )
+
+
 def test_SCENARIO_HEDGE_BEST_RUNG_SURFACING_05() -> None:
     """SCENARIO_HEDGE_BEST_RUNG_SURFACING_05.
 
