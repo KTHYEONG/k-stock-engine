@@ -874,6 +874,7 @@ class NetAlphaTrainingRequest:
     universe_rescope: UniverseRescopeSettings | None = None
     account_certification: AccountCertificationSettings | None = None
     route_objective: RouteObjective = field(default_factory=RouteObjective)
+    compound_alpha_mainline: bool = False
 
     def __post_init__(self) -> None:
         if not self.artifact_id:
@@ -930,6 +931,8 @@ class NetAlphaTrainingRequest:
                 "enable_horizon_blend requires at least two candidate horizons; "
                 f"got {tuple(self.candidate_horizon_sessions)}"
             )
+        if not isinstance(self.compound_alpha_mainline, bool):
+            raise ValueError("compound_alpha_mainline must be bool")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1320,3 +1323,193 @@ class EconomicFamilyStudySettings:
                 f"unknown model families {unknown}; declared families are "
                 f"{DECLARED_ECONOMIC_FAMILIES}"
             )
+
+
+COMPOUND_ALPHA_EXPERIMENT_IDS: tuple[str, ...] = (
+    "B00",
+    "C01",
+    "C02",
+    "C03",
+    "C04",
+    "C05",
+    "C06",
+    "C07",
+    "C08",
+    "C09",
+    "C10",
+    "C11",
+    "C12",
+    "C13",
+    "C14",
+    "C15",
+    "C16",
+    "C17",
+    "C18",
+    "C19",
+    "C20",
+    "C21",
+    "C22",
+    "C23",
+)
+
+_COMPOUND_ALPHA_EXPERIMENT_SPECS: tuple[tuple[str, str, str, str, str, str], ...] = (
+    ("B00", "elastic_net", "canonical", "mean", "mean", "delta_cost_aware_v1"),
+    ("C01", "elastic_net", "fold_local_percentile", "mean", "mean", "delta_cost_aware_v1"),
+    ("C02", "elastic_net", "exp_decay", "mean", "mean", "delta_cost_aware_v1"),
+    ("C03", "elastic_net", "sector_residualized", "mean", "mean", "delta_cost_aware_v1"),
+    ("C04", "lgbm", "canonical", "mean_l1", "mean", "delta_cost_aware_v1"),
+    ("C05", "lgbm", "canonical", "mean_huber", "mean", "delta_cost_aware_v1"),
+    ("C06", "lgbm", "canonical", "q20", "q20", "delta_cost_aware_v1"),
+    ("C07", "lgbm", "canonical", "q20_mean", "q20_plus_0_25_mean", "delta_cost_aware_v1"),
+    ("C08", "lgbm", "canonical", "q20_downside", "q20_minus_downside", "delta_cost_aware_v1"),
+    ("C09", "lgbm_bagging", "canonical", "q20", "q20_bagged", "delta_cost_aware_v1"),
+    ("C10", "lambdarank", "canonical", "tail_rank", "tail_rank", "delta_cost_aware_v1"),
+    ("C11", "lambdarank", "canonical", "tail_rank_q20", "tail_rank_q20", "delta_cost_aware_v1"),
+    ("C12", "rawnet_lgbm", "canonical", "winsorized_residual", "mean", "delta_cost_aware_v1"),
+    ("C13", "rawnet_lgbm", "causal_regime_gated", "winsorized_residual", "regime_gated", "delta_cost_aware_v1"),
+    ("C14", "lgbm", "causal_regime_gated", "q20", "regime_gated", "delta_cost_aware_v1"),
+    ("C15", "lgbm", "sector_neutral", "q20", "q20", "delta_cost_aware_v1"),
+    ("C16", "lgbm", "liquidity_conditioned", "q20", "q20", "delta_cost_aware_v1"),
+    ("C17", "lgbm", "ensemble_5_10_20", "q20", "q20_rank_ensemble", "delta_cost_aware_v1"),
+    ("C18", "lgbm", "prequential_horizon_selector", "q20", "prequential_gated", "delta_cost_aware_v1"),
+    ("C19", "lgbm", "q20_tail_rank_ensemble", "q20_rank", "q20_tail_ensemble", "delta_cost_aware_v1"),
+    ("C20", "lgbm", "stacked_q20_mean_rank", "stacked", "stacked", "delta_cost_aware_v1"),
+    ("C21", "lgbm", "canonical", "q20_exit_cost", "q20_exit_deducted", "delta_cost_aware_v1"),
+    ("C22", "lgbm", "stacked_q20_mean_rank", "stacked", "stacked", "delta_cost_aware_v1"),
+    ("C23", "lgbm", "stacked_q20_mean_rank", "stacked", "stacked", "sparse_hold_replace_v2"),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CompoundAlphaExperiment:
+    experiment_id: str
+    learner_kind: str
+    feature_view: str
+    target_kind: str
+    score_kind: str
+    transition_mode: str
+
+    def __post_init__(self) -> None:
+        if self.experiment_id not in COMPOUND_ALPHA_EXPERIMENT_IDS:
+            raise ValueError(f"unknown compound alpha experiment {self.experiment_id!r}")
+        if not self.learner_kind:
+            raise ValueError("learner_kind must be non-empty")
+        if not self.feature_view:
+            raise ValueError("feature_view must be non-empty")
+        if not self.target_kind:
+            raise ValueError("target_kind must be non-empty")
+        if not self.score_kind:
+            raise ValueError("score_kind must be non-empty")
+        if not self.transition_mode:
+            raise ValueError("transition_mode must be non-empty")
+
+
+COMPOUND_ALPHA_EXPERIMENTS: tuple[CompoundAlphaExperiment, ...] = tuple(
+    CompoundAlphaExperiment(
+        experiment_id=eid,
+        learner_kind=lk,
+        feature_view=fv,
+        target_kind=tk,
+        score_kind=sk,
+        transition_mode=tm,
+    )
+    for eid, lk, fv, tk, sk, tm in _COMPOUND_ALPHA_EXPERIMENT_SPECS
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CompoundAlphaStudySettings:
+    experiment_ids: tuple[str, ...] = COMPOUND_ALPHA_EXPERIMENT_IDS
+    minimum_paired_lower_cagr_delta: float = 0.10
+    maximum_point_mdd_worsening: float = 0.02
+
+    def __post_init__(self) -> None:
+        ids = tuple(self.experiment_ids)
+        if len(ids) != len(COMPOUND_ALPHA_EXPERIMENT_IDS):
+            raise ValueError(
+                f"compound alpha study requires exactly {len(COMPOUND_ALPHA_EXPERIMENT_IDS)} experiment ids; got {len(ids)}"
+            )
+        if tuple(ids) != COMPOUND_ALPHA_EXPERIMENT_IDS:
+            raise ValueError(
+                f"compound alpha experiment ids must be exactly {COMPOUND_ALPHA_EXPERIMENT_IDS} in order; got {tuple(ids)}"
+            )
+        if len(set(ids)) != len(ids):
+            raise ValueError("compound alpha experiment ids must be unique")
+        for eid in ids:
+            if eid not in COMPOUND_ALPHA_EXPERIMENT_IDS:
+                raise ValueError(f"unknown compound alpha experiment id {eid!r}")
+        if not math.isfinite(self.minimum_paired_lower_cagr_delta):
+            raise ValueError("minimum_paired_lower_cagr_delta must be finite")
+        if not 0.0 <= self.minimum_paired_lower_cagr_delta <= 5.0:
+            raise ValueError("minimum_paired_lower_cagr_delta must be in [0, 5]")
+        if not math.isfinite(self.maximum_point_mdd_worsening):
+            raise ValueError("maximum_point_mdd_worsening must be finite")
+
+
+@dataclass(frozen=True, slots=True)
+class CompoundFeatureSchema:
+    experiment_id: str
+    fingerprint: str
+    learner_columns: tuple[str, ...]
+    winsor_bounds: tuple[tuple[str, float, float], ...]
+    certified: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CompoundCandidateOof:
+    experiment_id: str
+    oof: pl.DataFrame
+    labels: pl.DataFrame
+    diagnostics: dict[str, object]
+    schema_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class CompoundCandidateEvidence:
+    experiment_id: str
+    base_lower_cagr: float
+    stress_lower_cagr: float
+    base_paired_lower_delta: float
+    stress_paired_lower_delta: float
+    base_paired_lower_delta_bound: float
+    stress_paired_lower_delta_bound: float
+    matched_lower_excess_cagr: float
+    mdd_point: float
+    mdd_stress: float
+    filled_orders: int
+    observed_interval_count: int
+    invested_interval_count: int
+    invested_interval_fraction: float
+    active_cohort_fraction: float
+    coverage_passed: bool
+
+    def __post_init__(self) -> None:
+        if self.experiment_id not in COMPOUND_ALPHA_EXPERIMENT_IDS:
+            raise ValueError(f"unknown experiment {self.experiment_id!r}")
+        for name in (
+            "base_lower_cagr",
+            "stress_lower_cagr",
+            "base_paired_lower_delta",
+            "stress_paired_lower_delta",
+            "base_paired_lower_delta_bound",
+            "stress_paired_lower_delta_bound",
+            "matched_lower_excess_cagr",
+            "mdd_point",
+            "mdd_stress",
+            "invested_interval_fraction",
+            "active_cohort_fraction",
+        ):
+            val = getattr(self, name)
+            if not isinstance(val, (int, float)) or not math.isfinite(float(val)):
+                raise ValueError(f"{name} must be finite, got {val!r}")
+        if self.filled_orders < 0:
+            raise ValueError("filled_orders must be non-negative")
+        if self.observed_interval_count < 0 or self.invested_interval_count < 0:
+            raise ValueError("interval counts must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
+class CompoundChampion:
+    experiment_id: str
+    evidence: CompoundCandidateEvidence
+    baseline_id: str

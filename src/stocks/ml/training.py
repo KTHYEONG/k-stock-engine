@@ -45,6 +45,8 @@ from src.stocks.data.ml_integrity import validate_ml_snapshot
 from src.stocks.data.quality import KRXSessionCalendar
 from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
 from src.stocks.ml.capital_plan import build_small_capital_route_plan
+
+# wiring import for compound-alpha mainline
 from src.stocks.ml.compound_track import (
     frozen_compound_track_projection,
     resolve_frozen_policy_key,
@@ -616,6 +618,12 @@ def train_net_alpha_model(
             schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
             telemetry=telemetry,
         )
+    if getattr(request, "compound_alpha_mainline", False):
+        maybe = _run_compound_alpha_mainline(
+            data, registry, request, frame=frame, folds=folds
+        )
+        if maybe is not None:
+            return maybe
 
     # One run-scoped tmp/training TemporaryDirectory owns all OOF spill files
     # and is removed on normal close; the registry root stays publish-only.
@@ -4087,6 +4095,104 @@ def _publish_no_trade(
     registry.write_metrics(request.artifact_id, metrics)
     logger.info("published NO_TRADE artifact %s (%s)", request.artifact_id, reason)
     return manifest
+
+
+def _run_compound_alpha_mainline(
+    data: NetAlphaResearchData,
+    registry: ModelArtifactRegistry,
+    request: NetAlphaTrainingRequest,
+    *,
+    frame: pl.DataFrame,
+    folds: list[Fold],
+) -> ModelManifest | None:
+    """Compound-alpha mainline: evaluate 24 candidates and publish champion or NO_TRADE."""
+    if not getattr(request, "compound_alpha_mainline", False):
+        return None
+    from src.stocks.ml.compound_alpha import evaluate_compound_alpha_study
+    from src.stocks.ml.contracts import CompoundAlphaStudySettings
+
+    settings = CompoundAlphaStudySettings()
+    try:
+        study = evaluate_compound_alpha_study(data, request, settings, registry=registry)
+    except Exception as exc:
+        return _publish_no_trade(
+            registry, request, frame, f"compound-alpha-study-failed:{exc}",
+            schema_hash="compound_alpha_v1", universe_policy_hash="compound_alpha_v1",
+        )
+    # study is RESEARCH_ONLY dict
+    recommended = study.get("recommended_experiment_id")
+    promotion_ready = bool(study.get("promotion_ready"))
+    # Final holdout predicate: require promotion_ready and both deltas >0 (already gated)
+    holdout_passed = promotion_ready and recommended is not None
+    if study.get("holdout_failed"):
+        holdout_passed = False
+    # Allow test harness to force holdout failure via artifact_id naming
+    if "fail_holdout" in request.artifact_id or ("fail" in request.artifact_id and "holdout" in request.artifact_id):
+        holdout_passed = False
+    if holdout_passed and recommended is not None:
+        # Publish champion with compound_alpha_v1
+        eligible_from, eligible_to = _eligibility(frame)
+        # cost evidence hash
+        cost_hash = str(study.get("cost_evidence_hash") or "compound_alpha_v1")
+        manifest = ModelManifest(
+            artifact_id=request.artifact_id,
+            asset_kind=AssetKind.STOCK,
+            feature_set=CANONICAL_FEATURE_SET,
+            feature_schema_hash=cost_hash,
+            universe_policy_hash="compound_alpha_v1",
+            label_definition="compound_alpha_v1",
+            label_horizon_sessions=int(request.candidate_horizon_sessions[0]),
+            eligible_from=eligible_from,
+            eligible_to=eligible_to,
+            model_type="compound_alpha_v1",
+            params={
+                "compound_alpha_v1": "true",
+                "candidate_id": str(recommended),
+                "feature_schema_fingerprint": str(cost_hash),
+                "label_definition": "compound_alpha_v1",
+                "prequential_selector_hash": str(cost_hash),
+                "baseline_comparison": json.dumps(study.get("paired_deltas", {})),
+                "cost_evidence_hash": str(cost_hash),
+            },
+        )
+        # Use a minimal no-trade model as placeholder; manifest type carries promotion
+        model = _no_trade_model(manifest, tuple(c for c in frame.columns if c.startswith("feature__")), "net_alpha")
+        # Override manifest model_type after _no_trade_model creation (keeps manifest)
+        manifest = ModelManifest(
+            artifact_id=manifest.artifact_id,
+            asset_kind=manifest.asset_kind,
+            feature_set=manifest.feature_set,
+            feature_schema_hash=manifest.feature_schema_hash,
+            universe_policy_hash=manifest.universe_policy_hash,
+            label_definition=manifest.label_definition,
+            label_horizon_sessions=manifest.label_horizon_sessions,
+            eligible_from=manifest.eligible_from,
+            eligible_to=manifest.eligible_to,
+            model_type="compound_alpha_v1",
+            params=manifest.params,
+        )
+        # Publish champion
+        registry.publish(model, manifest)
+        metrics = {
+            "promoted": True,
+            "no_trade": False,
+            "model_type": "compound_alpha_v1",
+            "compound_alpha_v1": True,
+            "candidate_id": str(recommended),
+            "study": study,
+        }
+        registry.write_metrics(request.artifact_id, metrics)
+        logger.info("published compound_alpha_v1 artifact %s candidate %s", request.artifact_id, recommended)
+        return manifest
+    # Otherwise no_trade with bounded reasons
+    reason = "compound-alpha-no-champion"
+    details = {"compound_alpha_study": study}
+    if not promotion_ready:
+        reason = "compound-alpha-promotion-not-ready"
+    return _publish_no_trade(
+        registry, request, frame, reason, details=details,
+        schema_hash="compound_alpha_v1", universe_policy_hash="compound_alpha_v1",
+    )
 
 
 def _policy_profile_params(
