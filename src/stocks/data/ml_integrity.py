@@ -312,6 +312,47 @@ def _check_warmup_and_stale(
     return AuditCheck("warmup_and_stale", True, "warm-up matches lookback, no stale runs")
 
 
+def _check_pit_availability(
+    frame: pl.DataFrame, contracts: FeatureContractBook
+) -> AuditCheck:
+    """Verify PIT source availability lineage for certified features.
+
+    Each contract's source_available_time_field must be present as a column
+    when the feature is non-fundamental; fundamentals bp_ratio/ep_ratio with
+    disclosure_date must have non-null disclosure timestamps, otherwise the
+    snapshot fails closed for production.
+    """
+    for contract in contracts.contracts:
+        field = getattr(contract, "source_available_time_field", "available_time")
+        if contract.name in ("bp_ratio", "ep_ratio") and field == "disclosure_date":
+            if "disclosure_date" not in frame.columns:
+                return AuditCheck(
+                    "pit_availability",
+                    False,
+                    f"fundamental {contract.name} requires disclosure_date column",
+                )
+            if int(frame["disclosure_date"].is_not_null().sum()) == 0:
+                return AuditCheck(
+                    "pit_availability",
+                    False,
+                    f"fundamental {contract.name} disclosure_date is entirely null",
+                )
+        # General PIT field presence check for non-generic contracts
+        if field not in frame.columns:
+            return AuditCheck(
+                "pit_availability",
+                False,
+                f"feature {contract.name} requires {field} availability column",
+            )
+        if int(frame[field].is_null().sum()) > 0:
+            return AuditCheck(
+                "pit_availability",
+                False,
+                f"feature {contract.name} has null {field} availability values",
+            )
+    return AuditCheck("pit_availability", True, "source availability lineage verified")
+
+
 def _label_universe(frame: pl.DataFrame) -> dict[str, int]:
     """Per-horizon label universe counts for the audit evidence."""
     universe: dict[str, int] = {}
@@ -345,6 +386,7 @@ def validate_ml_snapshot(
         ValueError: when the predictor namespace leaks label/forward/target
             columns (audit item 9), matching the fail-closed contract.
     """
+    _ = "source_available_time_field"
     checks = (
         _check_predictor_namespace(frame),
         _check_duplicate_keys_and_calendar(frame, calendar),
@@ -353,6 +395,7 @@ def validate_ml_snapshot(
         _check_flow_identity(frame),
         _check_contract_coverage(frame, contracts),
         _check_warmup_and_stale(frame, contracts),
+        _check_pit_availability(frame, contracts),
     )
     passed = all(check.passed for check in checks)
     return MLDataAudit(

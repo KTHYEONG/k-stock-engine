@@ -12,6 +12,7 @@ import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -28,6 +29,80 @@ DEFAULT_CANDIDATE_HORIZON_SESSIONS = (10, 20)
 DEFAULT_CANDIDATE_REBALANCE_FREQUENCY_SESSIONS = (5, 10, 20)
 DEFAULT_CANDIDATE_TOP_K = (12, 16, 20, 24)
 CANONICAL_FEATURE_SET = "stock_net_alpha_v1"
+
+class RouteObjectiveKind(StrEnum):
+    """Executable routekind: absolute gross vs certified hedged residual."""
+
+    UNHEDGED_ABSOLUTE = "unhedged_absolute"
+    HEDGED_RESIDUAL = "hedged_residual"
+
+
+@dataclass(frozen=True, slots=True)
+class RouteObjective:
+    """Immutable pre-fit route declaration.
+
+    ``hedged_residual`` requires a hedge instrument and evidence hash. Missing
+    evidence fails closed before any fitting.
+    """
+
+    kind: RouteObjectiveKind = RouteObjectiveKind.UNHEDGED_ABSOLUTE
+    hedge_instrument: str | None = None
+    hedge_evidence_hash: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, RouteObjectiveKind):
+            try:
+                object.__setattr__(self, "kind", RouteObjectiveKind(str(self.kind)))
+            except ValueError as exc:
+                raise ValueError(f"unknown RouteObjectiveKind {self.kind!r}") from exc
+        if self.kind is RouteObjectiveKind.HEDGED_RESIDUAL:
+            if not self.hedge_instrument or not self.hedge_evidence_hash:
+                raise ValueError(
+                    "hedged_residual route requires hedge_instrument and hedge_evidence_hash"
+                )
+        else:
+            # unhedged must not carry hedge evidence
+            if self.hedge_instrument or self.hedge_evidence_hash:
+                raise ValueError(
+                    "unhedged_absolute route must not carry hedge_instrument or hedge_evidence_hash"
+                )
+
+
+@dataclass(frozen=True, slots=True)
+class AlphaCapacityAuditSettings:
+    """Immutable capacity-audit windows, hard CAGR/MDD gates, and resource policy."""
+
+    candidate_lookback_sessions: tuple[int | None, ...] = (504, 756, 1260, None)
+    minimum_lower_cagr: float = 0.30
+    maximum_point_mdd: float = 0.10
+    maximum_stress_mdd: float = 0.12
+    max_rss_mib: int | None = None
+    bootstrap_alpha: float = 0.05
+    bootstrap_resamples: int = 2000
+
+    def __post_init__(self) -> None:
+        finite = [v for v in self.candidate_lookback_sessions if v is not None]
+        if not self.candidate_lookback_sessions:
+            raise ValueError("candidate_lookback_sessions must be non-empty")
+        if any(v is None for v in tuple(self.candidate_lookback_sessions)[:-1]):
+            raise ValueError("expanding (None) is only permitted in final position")
+        if len(set(finite)) != len(finite) or list(finite) != sorted(finite):
+            raise ValueError("candidate_lookback_sessions must be strictly ascending and unique")
+        if any(v is not None and v < 1 for v in self.candidate_lookback_sessions):
+            raise ValueError("candidate_lookback_sessions must be positive")
+        if not 0.0 < self.minimum_lower_cagr < 5.0:
+            raise ValueError("minimum_lower_cagr must be finite in (0, 5)")
+        if not 0.0 < self.maximum_point_mdd < 1.0:
+            raise ValueError("maximum_point_mdd must be in (0, 1)")
+        if not 0.0 < self.maximum_stress_mdd < 1.0:
+            raise ValueError("maximum_stress_mdd must be in (0, 1)")
+        if self.max_rss_mib is not None and self.max_rss_mib <= 0:
+            raise ValueError("max_rss_mib must be positive when supplied")
+        if not 0.0 < self.bootstrap_alpha < 1.0:
+            raise ValueError("bootstrap_alpha must be in (0, 1)")
+        if self.bootstrap_resamples < 2:
+            raise ValueError("bootstrap_resamples must be at least 2")
+
 
 ELASTIC_NET_FAMILY = "net_alpha_elastic_net"
 TAIL_LAMBDARANK_FAMILY = "economic_tail_lambdarank"
@@ -798,6 +873,7 @@ class NetAlphaTrainingRequest:
     satellite_settings: SatelliteOverlaySettings | None = None
     universe_rescope: UniverseRescopeSettings | None = None
     account_certification: AccountCertificationSettings | None = None
+    route_objective: RouteObjective = field(default_factory=RouteObjective)
 
     def __post_init__(self) -> None:
         if not self.artifact_id:

@@ -13,12 +13,14 @@ realised PnL.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
 import polars as pl
 
 from src.stocks.ml.labels import (
+    GROSS_COLUMN,
     ID_COLUMN,
     REFERENCE_COST_COLUMN,
     RISK_RESIDUAL_COLUMN,
@@ -32,6 +34,8 @@ __all__ = [
     "TailCaptureEvidence",
     "build_tail_relevance",
     "measure_tail_capture",
+    "project_route_utility",
+    "route_labels_for_capture",
 ]
 
 
@@ -65,6 +69,62 @@ def _decimal_utility(frame: pl.DataFrame) -> pl.Series:
     if not np.all(np.isfinite(array)):
         raise InvalidOofEconomicUtilityError("economic utility must be finite")
     return series
+
+
+def project_route_utility(
+    frame: pl.DataFrame,
+    route: object,
+) -> pl.Series:
+    """Project the route-aligned learning target without stateful cost.
+
+    For ``unhedged_absolute`` the gross absolute outcome is used; for
+    ``hedged_residual`` the risk residual is used only when hedge evidence
+    is certified. The reusable label never bakes an account-specific static
+    cost into the learning target — execution cost stays in the portfolio
+    replay stage. Missing hedge evidence raises before any fit.
+    """
+    kind_value = getattr(route, "kind", route)
+    kind_str = str(getattr(kind_value, "value", kind_value)).lower()
+
+    if kind_str == "hedged_residual":
+        # Must have certified hedge evidence
+        instrument = getattr(route, "hedge_instrument", None)
+        evidence = getattr(route, "hedge_evidence_hash", None)
+        if not instrument or not evidence:
+            raise ValueError(
+                "hedged_residual route requires hedge_instrument and hedge_evidence_hash"
+            )
+        if RISK_RESIDUAL_COLUMN not in frame.columns:
+            raise ValueError(f"frame missing required column {RISK_RESIDUAL_COLUMN!r}")
+        series = frame[RISK_RESIDUAL_COLUMN].cast(pl.Float64)
+        if series.null_count() > 0:
+            raise InvalidOofEconomicUtilityError("hedged residual has null rows")
+        arr = series.to_numpy()
+        if not np.all(np.isfinite(arr)):
+            raise InvalidOofEconomicUtilityError("hedged residual must be finite")
+        return series
+    # Default unhedged_absolute: prefer gross_return when available, otherwise risk_residual
+    if GROSS_COLUMN in frame.columns:
+        series = frame[GROSS_COLUMN].cast(pl.Float64)
+    elif RISK_RESIDUAL_COLUMN in frame.columns:
+        series = frame[RISK_RESIDUAL_COLUMN].cast(pl.Float64)
+    else:
+        raise ValueError(f"frame missing {GROSS_COLUMN!r} or {RISK_RESIDUAL_COLUMN!r}")
+    if series.null_count() > 0:
+        raise InvalidOofEconomicUtilityError("route utility has null rows")
+    arr = series.to_numpy()
+    if not np.all(np.isfinite(arr)):
+        raise InvalidOofEconomicUtilityError("route utility must be finite")
+    return series
+
+
+def route_labels_for_capture(frame: pl.DataFrame, route: object) -> pl.DataFrame:
+    """Build capture labels whose utility matches the pre-bound route."""
+    utility = project_route_utility(frame, route)
+    return frame.select(ID_COLUMN, SESSION_COLUMN).with_columns(
+        utility.alias(RISK_RESIDUAL_COLUMN),
+        pl.lit(0.0).alias(REFERENCE_COST_COLUMN),
+    )
 
 
 def build_tail_relevance(labels: pl.DataFrame, *, top_k: int) -> pl.DataFrame:
@@ -206,6 +266,7 @@ def measure_tail_capture(
     scores = scores[order]
     ids = ids[order]
     clusters = clusters[order]
+    sessions = sessions[order]
 
     boundaries = np.flatnonzero(np.diff(sessions)) + 1
     session_slices = np.split(np.arange(sessions.size), boundaries)
@@ -217,11 +278,11 @@ def measure_tail_capture(
     for index, slice_rows in enumerate(session_slices):
         u = utility[slice_rows]
         k = min(top_k, u.size)
-        universe_mean = float(u.mean())
+        universe_mean = math.fsum(u.tolist()) / u.size
         oracle_pick = np.lexsort((ids[slice_rows], -u))[:k]
         score_pick = np.lexsort((ids[slice_rows], -scores[slice_rows]))[:k]
-        model_mean = float(u[score_pick].mean())
-        oracle_mean = float(u[oracle_pick].mean())
+        model_mean = math.fsum(u[score_pick].tolist()) / k
+        oracle_mean = math.fsum(u[oracle_pick].tolist()) / k
         model_excess[index] = model_mean - universe_mean
         oracle_excess[index] = oracle_mean - universe_mean
         positive[index] = model_mean > 0.0
@@ -239,9 +300,8 @@ def measure_tail_capture(
     segment_evidence: list[SegmentTailEvidence] = []
     for local_index, cluster in enumerate(unique_clusters):
         model_c = float(cluster_sums[local_index] / cluster_counts[local_index])
-        oracle_c = float(
-            oracle_excess[mapped == local_index].mean()
-        )
+        oracle_slice = oracle_excess[mapped == local_index]
+        oracle_c = math.fsum(oracle_slice.tolist()) / oracle_slice.size if oracle_slice.size else 0.0
         segment_evidence.append(
             SegmentTailEvidence(
                 segment_id=int(cluster),
@@ -262,8 +322,8 @@ def measure_tail_capture(
     bootstrap_means = cluster_sums[draws].sum(axis=1) / cluster_counts[draws].sum(axis=1)
     lower_bound = float(np.quantile(bootstrap_means, bootstrap_alpha))
 
-    total_oracle = float(oracle_excess.mean())
-    total_model = float(model_excess.mean())
+    total_oracle = math.fsum(oracle_excess.tolist()) / oracle_excess.size if oracle_excess.size else 0.0
+    total_model = math.fsum(model_excess.tolist()) / model_excess.size if model_excess.size else 0.0
     return TailCaptureEvidence(
         top_k=int(top_k),
         session_count=int(model_excess.size),
