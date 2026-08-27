@@ -10,7 +10,7 @@ from src.core.instruments import Instrument
 from src.core.portfolio import PortfolioSnapshot
 from src.execution.application.readiness import SubmissionGate, SubmissionRequest
 from src.execution.application.validate_intents import IntentValidator
-from src.execution.domain.intents import TradeIntent
+from src.execution.domain.intents import TradeIntent  # TradeIntent.target_quantity
 from src.execution.domain.orders import OrderRequest, OrderSide, OrderStateRecord
 from src.execution.ports.broker import BrokerPort, PriceProvider
 from src.execution.ports.state_store import StateStorePort
@@ -67,7 +67,16 @@ def plan_order_request(
     if current_quantity < 0:
         raise ValueError("current_quantity must be non-negative")
 
-    target_quantity = int(intent.target_value / reference_price / lot_size) * lot_size
+    # reject non-lot-multiple hard target; otherwise use it before legacy target_value conversion
+    if intent.target_quantity is not None:
+        tq = intent.target_quantity
+        if isinstance(tq, bool) or not isinstance(tq, int) or tq < 0:
+            raise ValueError("target_quantity must be non-negative")
+        if tq % lot_size != 0:
+            raise ValueError(f"target_quantity {tq} not a multiple of lot_size {lot_size}")
+        target_quantity = tq
+    else:
+        target_quantity = int(intent.target_value / reference_price / lot_size) * lot_size
     delta = target_quantity - current_quantity
     if delta == 0:
         return None

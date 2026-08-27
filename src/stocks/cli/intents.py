@@ -76,6 +76,7 @@ def main(args: list[str] | None = None) -> int:
                 instrument=_instrument_from_row(row),
                 target_value=float(row["target_value"]),
                 reason=str(row.get("reason", "")),
+                target_quantity=int(row["target_quantity"]) if row.get("target_quantity") is not None else None,
             )
             for row in frame.iter_rows(named=True)
         ]
@@ -94,6 +95,7 @@ def main(args: list[str] | None = None) -> int:
             "asset_kind": i.asset_kind.value,
             "instrument_id": i.instrument_id,
             "target_value": i.target_value,
+            "target_quantity": i.target_quantity,
             "decision_time": i.decision_time.isoformat(),
             "execution_time": i.execution_time.isoformat(),
             "strategy_id": i.strategy_id,
