@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "compounding_ml_overhaul",
+      "date": "2026-08-27",
+      "adr_id": "ADR_20260827_compounding_ml_overhaul",
+      "domain": "stocks",
+      "title": "Compound Alpha 비교 결과 동기화",
+      "why": "24개 ML 후보의 실행 비교 결과와 pseudo-metric 한계를 영구 기록",
+      "resolution": "docs/results/ml-cmp.md에 기준선·후보별 CAGR 비교, C10 코드상 best, 실제 ledger 검증 미완료를 기록",
+      "impact": "비교 보고서 및 작업 인덱스/코드 맵 갱신"
+    },
+    {
       "task_id": "TASK_RETURN_TRANSFER_REARCHITECTURE",
       "date": "2026-08-27",
       "adr_id": "ADR_20260827_RETURN_TRANSFER_REARCHITECTURE",
@@ -989,16 +999,6 @@
       "why": "2026-08-13 stability telemetry rerun showed all 36 trial-policy candidates failed DSR despite positive candidates; document latest evidence and preserve fail-closed promotion.",
       "resolution": "Added decision-level compounding telemetry, DEBUG-only diagnostics, compact candidate evidence summaries, and synchronized the 81-trial rerun results into back-res.md.",
       "impact": "No promotion thresholds or policy grid were relaxed; artifact remains NO_TRADE. Documentation and task/code indexes updated."
-    },
-    {
-      "task_id": "TASK_STOCK_COMPOUNDING_POLICY_SYNC",
-      "date": "2026-08-13",
-      "adr_id": "ADR_20260813_STOCK_COMPOUNDING_POLICY_SYNC",
-      "domain": "stocks",
-      "title": "Compounding selection policy contract synchronization",
-      "why": "The active v3 compounding selection policy changed the economic finalist contract, leaving the 81-trial integration assertion pinned to the retired v2 one-finalist policy.",
-      "resolution": "Updated the integration profile to assert economic-selection-v3-compounding and economic_finalist_width=2, then verified the six-policy compounding selection and full regression suite.",
-      "impact": "Test provenance now matches the active deterministic selection policy; no promotion thresholds or fail-closed behavior were relaxed."
     }
   ]
 }

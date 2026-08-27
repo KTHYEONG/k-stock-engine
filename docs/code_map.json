@@ -451,5 +451,8 @@
   },
   "src/stocks/ml/return_transfer.py": {
     "testing": "tests/unit/stocks/ml/test_return_transfer.py"
+  },
+  "src/stocks/ml/compound_alpha.py": {
+    "testing": "tests/unit/stocks/ml/test_compound_alpha.py"
   }
 }
