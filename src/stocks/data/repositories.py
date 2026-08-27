@@ -533,6 +533,7 @@ class ResearchDataRepository:
             quality_report_hash=feature_manifest.quality_report_hash,
             content_hash=feature_manifest.content_hash,
             storage_layout=feature_manifest.storage_layout,
+            reference_notional=label_manifest.reference_notional,
         )
         return DatasetSnapshot(manifest=merged_manifest, frame=composed)
 
@@ -645,6 +646,7 @@ class ResearchDataRepository:
             quality_report_hash=feature_manifest.quality_report_hash,
             content_hash=feature_manifest.content_hash,
             storage_layout=feature_manifest.storage_layout,
+            reference_notional=label_manifest.reference_notional,
         )
         return DatasetSnapshot(manifest=merged_manifest, frame=composed)
 
