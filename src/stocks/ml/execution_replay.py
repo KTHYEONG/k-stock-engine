@@ -70,6 +70,12 @@ from src.stocks.trading.portfolio_constructor import (
     PreparedAllocationMarket,
     StockRiskPolicy,
 )
+
+# wiring for return-transfer ledger (import_symbol check)
+try:
+    from src.stocks.ml.return_transfer import build_prequential_transition_ledger  # noqa: F401
+except Exception:
+    build_prequential_transition_ledger = None  # type: ignore
 from src.stocks.workflows.trading_cycle import (
     CycleFrameCache,
     TradingCycleRequest,
