@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_SMALL_ACCOUNT_CAGR_CERTIFICATION",
+      "date": "2026-08-27",
+      "adr_id": "ADR_20260827_SMALL_ACCOUNT_CAGR_CERTIFICATION",
+      "domain": "stocks_ml",
+      "title": "Capital-coherent 5M account CAGR gate",
+      "why": "Ledger evidence had 100M replay inputs while the 5M route was only a post-hoc projection; the highest executable 5M stress CAGR was 5.173%, far below the 30% target.",
+      "resolution": "Persisted reference-notional provenance, added AccountCertificationSettings and fail-closed five-way capital coherence, enforced base/stress lower-CAGR and MDD gates, wired CLI/training/economic-study/ledger paths, and retained integer-share replay semantics.",
+      "impact": "136 targeted regression tests passed; account scenarios passed; Ruff, Mypy, and lean fast-check passed. Current evidence still publishes NO_TRADE until a fresh 5M label snapshot and untouched holdout pass."
+    },
+    {
       "task_id": "TASK_UNIVERSE_RESCOPE_GROWTH_LIFT",
       "date": "2026-08-26",
       "adr_id": "ADR_20260826_UNIVERSE_RESCOPE_GROWTH_LIFT",
@@ -989,16 +999,6 @@
       "why": "Align the throughput specification wiring with the active deterministic screen-fidelity policy after the 81-trial baseline exceeded the target runtime and RSS budget.",
       "resolution": "Updated the throughput contract to reference ScreenFidelityPolicy, the active 27/6/6/1 funnel policy, and verified contract, lint, type, and focused tests.",
       "impact": "Documentation and ADR indexes synchronized; temporary spec and scratch artifacts purged. Runtime optimization remains measured against the production research command."
-    },
-    {
-      "task_id": "economic-selection-engine-redesign-81trial",
-      "date": "2026-08-12",
-      "adr_id": "ADR_20260812_economic-selection-engine-redesign-81trial",
-      "domain": "stocks",
-      "title": "81-trial economic selection execution",
-      "why": "Record the latest full 81-trial run and replace stale backtest results after the selection-engine redesign.",
-      "resolution": "Registered the 81-trial artifact telemetry, promotion funnel, route-level timings, RSS peaks, and NO_TRADE economic-gate evidence; synchronized task and code-map indexes.",
-      "impact": "The run completed in 19:54.38 with 7,672.23 MiB process RSS under the 8,000 MiB limit; 81 terminal trials completed, six finalists replayed, and no candidate passed the economic gate."
     }
   ]
 }
