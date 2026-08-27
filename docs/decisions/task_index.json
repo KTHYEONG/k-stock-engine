@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_RETURN_TRANSFER_REARCHITECTURE",
+      "date": "2026-08-27",
+      "adr_id": "ADR_20260827_RETURN_TRANSFER_REARCHITECTURE",
+      "domain": "quant",
+      "title": "Return-transfer portfolio learning architecture",
+      "why": "Static residual ranking showed weak transfer from label edge to stateful portfolio growth; ten-year expanding history, PIT lineage, costs, and hold/replace state required explicit review.",
+      "resolution": "Registered the return-transfer architecture contract, added feature/label/OOF/transition/planner interfaces and research-only CLI wiring, and recorded that exact economic replay remains the required next implementation step.",
+      "impact": "Adds auditable data and portfolio-transition contracts with read-only verification; current research-only evaluator is scaffolding and does not yet prove CAGR/MDD improvement."
+    },
+    {
       "task_id": "evidence_driven_alpha_architecture",
       "date": "2026-08-27",
       "adr_id": "ADR_20260827_evidence_driven_alpha_architecture",
@@ -989,16 +999,6 @@
       "why": "The active v3 compounding selection policy changed the economic finalist contract, leaving the 81-trial integration assertion pinned to the retired v2 one-finalist policy.",
       "resolution": "Updated the integration profile to assert economic-selection-v3-compounding and economic_finalist_width=2, then verified the six-policy compounding selection and full regression suite.",
       "impact": "Test provenance now matches the active deterministic selection policy; no promotion thresholds or fail-closed behavior were relaxed."
-    },
-    {
-      "task_id": "backtest_execution_recovery",
-      "date": "2026-08-13",
-      "adr_id": "ADR_20260813_backtest_execution_recovery",
-      "domain": "stocks",
-      "title": "Prepared backtest execution recovery",
-      "why": "2026-08-12 run had positive Rank-IC but 7,822 attempted orders and zero fills because nullable provisional action coverage was coerced to false and prepared allocation lost pre-OOS warm-up history.",
-      "resolution": "Preserved tri-state action coverage, restored complete-panel allocation warm-up, converted NaN score overlays to null, and recorded deterministic unfilled-order reason telemetry; rerun recovered 1,737 fills while fail-closed gates still produced NO_TRADE.",
-      "impact": "Backtest execution evidence is now valid for provisional research data without relaxing certified-data or economic promotion gates."
     }
   ]
 }

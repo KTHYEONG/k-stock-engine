@@ -448,5 +448,8 @@
   },
   "src/stocks/ml/capacity_audit.py": {
     "testing": "tests/unit/stocks/ml/test_capacity_audit.py"
+  },
+  "src/stocks/ml/return_transfer.py": {
+    "testing": "tests/unit/stocks/ml/test_return_transfer.py"
   }
 }
