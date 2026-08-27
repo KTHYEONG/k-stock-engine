@@ -34,10 +34,16 @@ class Allocation:
     instrument: Instrument
     target_value: float
     reason: str = ""
+    target_quantity: int | None = None
 
     def __post_init__(self) -> None:
         if self.target_value < 0 or not math.isfinite(self.target_value):
             raise ValueError("target_value must be a non-negative finite number")
+        if self.target_quantity is not None:
+            if isinstance(self.target_quantity, bool) or not isinstance(self.target_quantity, int) or self.target_quantity < 0:
+                raise ValueError("target_quantity must be a non-negative integer when provided")
+            if self.target_quantity % self.instrument.lot_size != 0:
+                raise ValueError("target_quantity must be a multiple of lot_size")
 
 
 @dataclass(frozen=True, slots=True)

@@ -38,6 +38,7 @@ class TradeIntent:
     idempotency_key: str
     account_snapshot_id: str
     reference_price_guard_bps: float | None = None
+    target_quantity: int | None = None
 
     def __post_init__(self) -> None:
         if not self.intent_id:
@@ -46,6 +47,8 @@ class TradeIntent:
             raise ValueError("account_snapshot_id must be non-empty")
         if self.target_value < 0 or not math.isfinite(self.target_value):
             raise ValueError("target_value must be a non-negative finite number")
+        if self.target_quantity is not None and (isinstance(self.target_quantity, bool) or not isinstance(self.target_quantity, int) or self.target_quantity < 0):
+            raise ValueError("target_quantity must be a non-negative integer when provided")
         if self.decision_time > self.execution_time:
             raise ValueError("decision_time must not be after execution_time")
         if (

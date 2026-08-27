@@ -29,6 +29,7 @@ def generate_intents(
                 asset_kind=allocation.instrument.asset_kind,
                 instrument_id=allocation.instrument.instrument_id,
                 target_value=allocation.target_value,
+                target_quantity=allocation.target_quantity,
                 decision_time=decision_time,
                 execution_time=execution_time,
                 strategy_id=strategy_id,

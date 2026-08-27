@@ -42,6 +42,273 @@ _RETURN_COLUMNS = ("log_return", "ret", "close")
 _TOLERANCE = 1e-10
 
 
+@dataclass(frozen=True, slots=True)
+class SmallAccountLotSizingSettings:
+    """Account-only controls for causal lot sizing."""
+
+    enabled: bool = False
+    opening_gap_quantile: float = 0.95
+    candidate_mode: Literal["causal_lot_waterfill_v1"] = "causal_lot_waterfill_v1"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("enabled must be bool")
+        if not math.isfinite(self.opening_gap_quantile) or not 0.0 < self.opening_gap_quantile < 1.0:
+            raise ValueError("opening_gap_quantile must be finite in (0, 1)")
+        if self.candidate_mode != "causal_lot_waterfill_v1":
+            raise ValueError("candidate_mode must be 'causal_lot_waterfill_v1'")
+
+
+@dataclass(frozen=True, slots=True)
+class LotSizingConfig:
+    """Account-only causal lot sizing config."""
+
+    enabled: bool = False
+    entry_price_buffer_bps: float | None = None
+    opening_gap_quantile: float = 0.95
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("enabled must be bool")
+        if self.entry_price_buffer_bps is not None:
+            v = float(self.entry_price_buffer_bps)
+            if not math.isfinite(v) or v < 0.0:
+                raise ValueError("entry_price_buffer_bps must be finite non-negative when provided")
+        if self.enabled and self.entry_price_buffer_bps is None:
+            raise ValueError("entry_price_buffer_bps required when lot sizing is enabled")
+        if not math.isfinite(self.opening_gap_quantile) or not 0.0 < self.opening_gap_quantile < 1.0:
+            raise ValueError("opening_gap_quantile must be finite in (0, 1)")
+
+
+def derive_causal_open_gap_buffer_bps(frame: pl.DataFrame, *, cutoff: datetime, quantile: float) -> tuple[float, int]:
+    """Derive causal opening-gap buffer in bps from rows strictly before cutoff.
+
+    Computes max(0, open / close_prev -1) per instrument ordered by session,
+    then returns (quantile * 10000, sample_count). Raises ValueError with
+    'no-causal-open-gap-buffer' when no eligible gap exists.
+    """
+    if not math.isfinite(quantile) or not 0.0 < quantile < 1.0:
+        raise ValueError("quantile must be finite in (0, 1)")
+    if frame.is_empty():
+        raise ValueError("no-causal-open-gap-buffer")
+    cols_needed = {"instrument_id", "open", "close"}
+    missing = [c for c in cols_needed if c not in frame.columns]
+    if missing:
+        raise ValueError(f"frame must carry {', '.join(missing)}")
+    # Determine session column for cutoff filtering
+    session_col = None
+    for cand in ("session", "available_time"):
+        if cand in frame.columns:
+            session_col = cand
+            break
+    if session_col is None:
+        raise ValueError("frame must carry session column")
+    # Strictly before cutoff
+    filtered = frame.filter(pl.col(session_col) < cutoff)
+    if filtered.is_empty():
+        raise ValueError("no-causal-open-gap-buffer")
+    # Need close_prev per instrument
+    # Sort by instrument and session
+    sorted_frame = filtered.sort(["instrument_id", session_col])
+    # Need to compute gap: max(0, open_t / close_{t-1} -1)
+    close_prev = pl.col("close").shift(1).over("instrument_id")
+    with_prev = sorted_frame.with_columns(close_prev.alias("__close_prev"))
+    # Compute gap where close_prev finite and open finite
+    gaps = (
+        with_prev.filter(
+            pl.col("__close_prev").is_not_null()
+            & pl.col("__close_prev").is_finite()
+            & (pl.col("__close_prev") > 0)
+            & pl.col("open").is_not_null()
+            & pl.col("open").is_finite()
+            & (pl.col("open") > 0)
+        )
+        .with_columns(
+            (pl.col("open") / pl.col("__close_prev") - 1.0).alias("__raw_gap")
+        )
+        .with_columns(
+            pl.when(pl.col("__raw_gap") > 0).then(pl.col("__raw_gap")).otherwise(0.0).alias("__gap")
+        )
+        .select("__gap")
+        .to_series()
+        .to_list()
+    )
+    gaps_f = [float(g) for g in gaps if g is not None and math.isfinite(float(g))]
+    if not gaps_f:
+        raise ValueError("no-causal-open-gap-buffer")
+    arr = np.asarray(gaps_f, dtype=np.float64)
+    q = float(np.quantile(arr, quantile))
+    if not math.isfinite(q) or q < 0:
+        q = 0.0
+    buffer_bps = float(q * 10000.0)
+    return buffer_bps, len(gaps_f)
+
+
+def project_allocations_to_lots(
+    allocations: tuple[Allocation, ...],
+    *,
+    price_by_instrument: Mapping[str, float],
+    volatility_by_instrument: Mapping[str, float],
+    net_alpha_lower_bound_by_instrument: Mapping[str, float],
+    equity: float,
+    policy: StockRiskPolicy,
+    sector_by_instrument: Mapping[str, str] | None = None,
+    adtv_by_instrument: Mapping[str, float] | None = None,
+) -> tuple[Allocation, ...]:
+    """Project continuous allocations to causal lot-aware hard targets.
+
+    Uses safety price p_i = close_i * (1+buffer_bps/10000) and base quantity
+    q_i = floor(target_value_i / (p_i*lot))*lot. Remaining budget is waterfilled
+    one lot at a time in order net_alpha_lower / max(vol^2, eps) descending,
+    tie-break instrument_id. Each addition respects buffered-price gross,
+    single-name constraints. Complexity O(K log K + L log K).
+    """
+    lot_cfg = getattr(policy, "lot_sizing", None)
+    if lot_cfg is None or not getattr(lot_cfg, "enabled", False):
+        return tuple(
+            Allocation(instrument=a.instrument, target_value=a.target_value, reason=a.reason, target_quantity=None)
+            for a in allocations
+        )
+    buffer_bps = lot_cfg.entry_price_buffer_bps
+    if buffer_bps is None or not math.isfinite(float(buffer_bps)):
+        raise ValueError("no-causal-open-gap-buffer")
+    if not math.isfinite(equity) or equity <= 0:
+        raise ValueError("equity must be finite positive")
+    if not allocations:
+        return ()
+    # Validate inputs are finite
+    for aid in allocations:
+        iid = aid.instrument.instrument_id
+        p = price_by_instrument.get(iid)
+        v = volatility_by_instrument.get(iid)
+        lb = net_alpha_lower_bound_by_instrument.get(iid)
+        if p is None or not math.isfinite(float(p)) or float(p) <= 0:
+            raise ValueError(f"missing-or-non-finite price for {iid}")
+        if v is None or not math.isfinite(float(v)):
+            raise ValueError(f"missing-or-non-finite volatility for {iid}")
+        if lb is None or not math.isfinite(float(lb)):
+            raise ValueError(f"missing-or-non-finite net_alpha_lower for {iid}")
+
+    # Build safety prices and base quantities
+    safety_price: dict[str, float] = {}
+    base_qty: dict[str, int] = {}
+    for alloc in allocations:
+        iid = alloc.instrument.instrument_id
+        close = float(price_by_instrument[iid])
+        p = close * (1.0 + float(buffer_bps) / 10000.0)
+        safety_price[iid] = p
+        lot = int(alloc.instrument.lot_size)
+        base = int(math.floor(alloc.target_value / (p * lot)) * lot) if p > 0 and lot > 0 else 0
+        base = max(0, base)
+        # Ensure multiple
+        if base % lot != 0:
+            base = (base // lot) * lot
+        base_qty[iid] = base
+
+    allocation_by_id = {
+        allocation.instrument.instrument_id: allocation for allocation in allocations
+    }
+    # Current buffered gross
+    gross_cap = float(policy.gross_cap) * equity
+    single_cap = float(policy.single_name_cap) * equity
+    sector_cap = float(policy.sector_cap) * equity
+
+    def buffered_invested(qty_map: Mapping[str, int]) -> float:
+        return sum(qty_map[iid] * safety_price[iid] for iid in qty_map)
+
+    # Check base respects constraints? If not, keep as is (will be validated elsewhere) but we try to not exceed.
+    # Waterfill priority
+    eps = 1e-10
+    ranking: list[tuple[float, str]] = []
+    for alloc in allocations:
+        iid = alloc.instrument.instrument_id
+        vol = float(volatility_by_instrument[iid])
+        lb = float(net_alpha_lower_bound_by_instrument[iid])
+        score = lb / max(vol * vol, eps) if math.isfinite(vol) else -1.0
+        ranking.append((score, iid))
+    ranking.sort(key=lambda x: (-x[0], x[1]))
+
+    # Remaining budget using safety prices
+    qty = dict(base_qty)
+    invested = buffered_invested(qty)
+    sector_invested: dict[str, float] = {}
+    if sector_by_instrument is not None:
+        for iid, value in qty.items():
+            sector = sector_by_instrument.get(iid)
+            if sector is not None:
+                sector_invested[sector] = sector_invested.get(sector, 0.0) + value * safety_price[iid]
+
+    # Prepare loop: we will try to add one lot at a time in ranking order circularly
+    # Complexity O(L log K) approximated by iterating ranking repeatedly
+    # Use simple loop: iterate ranking, try to add lot if feasible
+    # Continue until no addition feasible in a full pass
+    import heapq
+
+    # Build priority heap (negative score for max-heap)
+    heap: list[tuple[float, str]] = []
+    for score, iid in ranking:
+        heapq.heappush(heap, (-score, iid))
+
+    # To ensure deterministic tie-break and O(L log K), we pop and push
+    max_iters = 100000  # guard
+    iters = 0
+    # Attempt waterfill: each time pick highest priority feasible addition
+    while heap and iters < max_iters:
+        iters += 1
+        found: tuple[float, str, int, float, str | None] | None = None
+        temp = []
+        while heap:
+            neg_score, iid = heapq.heappop(heap)
+            temp.append((neg_score, iid))
+            lot = int(allocation_by_id[iid].instrument.lot_size)
+            new_qty = qty[iid] + lot
+            lot_value = lot * safety_price[iid]
+            new_invested = invested + lot_value
+            if new_invested > gross_cap + 1e-6:
+                continue
+            if new_qty * safety_price[iid] > single_cap + 1e-6:
+                continue
+            if adtv_by_instrument is not None:
+                adtv = adtv_by_instrument.get(iid)
+                if adtv is None or not math.isfinite(float(adtv)) or float(adtv) <= 0:
+                    continue
+                if new_qty * safety_price[iid] > float(policy.participation_limit) * float(adtv) + 1e-6:
+                    continue
+            sector = sector_by_instrument.get(iid) if sector_by_instrument is not None else None
+            if sector is not None and sector_invested.get(sector, 0.0) + lot_value > sector_cap + 1e-6:
+                continue
+            found = (neg_score, iid, new_qty, new_invested, sector)
+            break
+        # Restore heap elements not used
+        for item in temp:
+            if found is None or item[1] != found[1]:
+                heapq.heappush(heap, item)
+        if found is None:
+            break
+        _, iid, new_qty, new_invested, sector = found
+        qty[iid] = new_qty
+        invested = new_invested
+        if sector is not None:
+            sector_invested[sector] = sector_invested.get(sector, 0.0) + lot * safety_price[iid]
+        # Push back the used instrument for next round (still priority same)
+        heapq.heappush(heap, (found[0], iid))
+        # If single-name cap now tight, keep but will be filtered next time
+        if iters > 10000:
+            break
+
+    # Build result allocations ordered by instrument_id
+    result: list[Allocation] = []
+    for alloc in sorted(allocations, key=lambda a: a.instrument.instrument_id):
+        iid = alloc.instrument.instrument_id
+        q = int(qty[iid])
+        # Ensure lot multiple
+        lot = int(alloc.instrument.lot_size)
+        if q % lot != 0:
+            q = (q // lot) * lot
+        result.append(Allocation(instrument=alloc.instrument, target_value=alloc.target_value, reason=alloc.reason, target_quantity=q))
+    return tuple(result)
+
+
 class PortfolioConstraintError(ValueError):
     """Raised when constructed targets violate a hard portfolio constraint."""
 
@@ -758,6 +1025,28 @@ def _construct_allocations_prepared(
             current_weights, sector_of, equity, instruments, policy
         )
 
+    # construct_target_allocations_prepared -> project_allocations_to_lots(continuous_allocations, price_by_instrument=..., volatility_by_instrument=..., net_alpha_lower_bound_by_instrument=..., equity=equity, policy=policy)
+    if getattr(policy, "lot_sizing", None) is not None and getattr(policy.lot_sizing, "enabled", False):
+        # Prepared path price/vol/alpha maps
+        price_map_prep = {str(cs_ids[pos]): float(close[pos]) for pos in range(cs_ids.size) if not np.isnan(close[pos])}
+        # Filter to allocated instruments
+        price_by_inst = {iid: price_map_prep[iid] for iid in [a.instrument.instrument_id for a in allocations] if iid in price_map_prep}
+        # Need vol_of and net_lower_bound_of already defined
+        try:
+            allocations = project_allocations_to_lots(
+                allocations,
+                price_by_instrument=price_by_inst,
+                volatility_by_instrument=vol_of,
+                net_alpha_lower_bound_by_instrument=net_lower_bound_of,
+                equity=equity,
+                policy=policy,
+                sector_by_instrument=sector_of,
+                adtv_by_instrument=adtv_of,
+            )
+        except Exception as exc:
+            # Missing inputs drop challenger only - propagate as constraint error
+            raise PortfolioConstraintError(str(exc)) from exc
+
     post_weights = {
         allocation.instrument.instrument_id: allocation.target_value / equity
         for allocation in allocations
@@ -821,6 +1110,7 @@ class StockRiskPolicy:
     net_exposure_gate_mode: Literal["off_v1", "trend_vol_v1"] = "off_v1"
     gate_trend_lookback_sessions: int = 60
     gate_floor: float = 0.25
+    lot_sizing: LotSizingConfig = field(default_factory=LotSizingConfig)
 
     def __post_init__(self) -> None:
         if self.top_k <= 0:
@@ -941,6 +1231,16 @@ def stock_risk_policy_fingerprint(policy: StockRiskPolicy) -> str:
                     "gate_trend_lookback_sessions": int(
                         policy.gate_trend_lookback_sessions
                     ),
+                }
+            ),
+            **(
+                {}
+                if not getattr(policy.lot_sizing, "enabled", False)
+                else {
+                    "lot_sizing_enabled": True,
+                    "lot_sizing_buffer_bps": float(policy.lot_sizing.entry_price_buffer_bps or 0.0),
+                    "lot_sizing_opening_gap_quantile": float(policy.lot_sizing.opening_gap_quantile),
+                    "lot_sizing_candidate_mode": "causal_lot_waterfill_v1",
                 }
             ),
         },
@@ -1138,6 +1438,22 @@ def construct_target_allocations(
     else:
         allocations = _de_risk_allocations(
             current_weights, sector_of, equity, instruments, policy
+        )
+
+    # project_allocations_to_lots(continuous_allocations, price_by_instrument=..., volatility_by_instrument=..., net_alpha_lower_bound_by_instrument=..., equity=equity, policy=policy)
+    # Lot-aware projection (disabled parity preserves legacy target_value-only)
+    if getattr(policy, "lot_sizing", None) is not None and getattr(policy.lot_sizing, "enabled", False):
+        price_map_lot = _price_map(cross_section)
+        # Build volatility map for selected names; fallback to vol_of
+        allocations = project_allocations_to_lots(
+            allocations,
+            price_by_instrument=price_map_lot,
+            volatility_by_instrument=vol_of,
+            net_alpha_lower_bound_by_instrument=net_lower_bound_of,
+            equity=equity,
+            policy=policy,
+            sector_by_instrument=sector_of,
+            adtv_by_instrument=adtv_of,
         )
 
     _post_validate(
