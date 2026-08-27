@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260827_small_account_compounding",
+      "date": "2026-08-27",
+      "adr_id": "ADR_20260827_20260827_small_account_compounding",
+      "domain": "stocks",
+      "title": "Small-account lot-aware compounding contract",
+      "why": "500만원 이하 계좌에서 연속수량 배분이 실제 주문 lot과 괴리되어 CAGR 검증이 불가능했고, 계좌 규모별 성과를 신뢰성 있게 검증할 기준이 필요했다.",
+      "resolution": "5백만원 기준 notional을 account certification 계약으로 고정하고, causal opening-gap buffer와 lot-aware waterfill을 Allocation·TradeIntent·backtest·replay 경로에 연결했다. 기준 metadata가 없는 label snapshot은 fail-closed로 중단하며, base/stress CAGR·MDD 게이트를 완화하지 않는다.",
+      "impact": "소액 계좌에서도 주문 가능 수량과 유동성 제약을 반영한 재현 가능한 백테스트가 가능해진다. 현재 저장 label manifest의 reference_notional 누락으로 500만원 CAGR은 아직 산출되지 않으며, 새 snapshot 생성 후 검증해야 한다."
+    },
+    {
       "task_id": "TASK_SMALL_ACCOUNT_CAGR_CERTIFICATION",
       "date": "2026-08-27",
       "adr_id": "ADR_20260827_SMALL_ACCOUNT_CAGR_CERTIFICATION",
@@ -989,16 +999,6 @@
       "why": "The latest 81-trial run completed in 16:07 with 7,613 MiB external RSS; full refits were serial and eager fold/replay caches overlapped.",
       "resolution": "Implemented measured LightGBM thread resolution, prepared scoring telemetry, and resource-aware refit pipeline while preserving deterministic ranking and fail-closed economic selection.",
       "impact": "Synchronized ADR/task/code-map indexes and removed temporary spec and benchmark artifacts before production verification."
-    },
-    {
-      "task_id": "TASK_20260812_ten_minute_81trial_throughput",
-      "date": "2026-08-12",
-      "adr_id": "ADR_20260812_20260812_ten_minute_81trial_throughput",
-      "domain": "stocks",
-      "title": "Ten-minute 81-trial throughput contract alignment",
-      "why": "Align the throughput specification wiring with the active deterministic screen-fidelity policy after the 81-trial baseline exceeded the target runtime and RSS budget.",
-      "resolution": "Updated the throughput contract to reference ScreenFidelityPolicy, the active 27/6/6/1 funnel policy, and verified contract, lint, type, and focused tests.",
-      "impact": "Documentation and ADR indexes synchronized; temporary spec and scratch artifacts purged. Runtime optimization remains measured against the production research command."
     }
   ]
 }
