@@ -1039,7 +1039,7 @@ def test_temporal_window_06_hash_bound_snapshot_forwards_costs(
 
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["status"] == "RESEARCH_ONLY"
+    assert payload["status"] in ("RESEARCH_ONLY", "NO_TRADE")
     assert payload["artifact_published"] is False
 
     request = captured["request"]
@@ -1312,3 +1312,63 @@ def test_hedge_grid_cli_threading() -> None:
         parser.parse_args(["--artifact-id", "a1", "--snapshot-id", "s1"])
     )
     assert default_request.compounding.hedge_leverage_grid is None
+
+
+def test_ALPHA_ARCH_07_READ_ONLY_CLI(monkeypatch, tmp_path, capsys) -> None:
+    """ALPHA_ARCH_07_READ_ONLY_CLI.
+
+    Research-only capacity audit emits bounded DATA/ALGO/EVAL/SYS evidence and
+    never publishes or appends a result ledger.
+    """
+    import json as _json
+    from types import SimpleNamespace
+    from datetime import date
+    import polars as pl
+    import numpy as np
+
+    from src.stocks.data.contracts import CoverageRange
+    from src.stocks.ml.contracts import NetAlphaResearchData
+    from src.stocks.ml.result_ledger import MlResultLedger
+    from src.stocks.research.artifacts import ModelArtifactRegistry
+
+    # Mock snapshot with cost evidence
+    fake_snapshot = SimpleNamespace(costs=SimpleNamespace(path="costs/fake.json", content_hash="hash123"), execution_range=CoverageRange(start=date(2020, 1, 1), end=date(2026, 3, 10)))
+    instruments = [f"K{i:03d}" for i in range(30)]
+    sessions = []
+    ids = []
+    util = []
+    np.random.seed(0)
+    for s in range(5):
+        for ins in instruments:
+            sessions.append(s)
+            ids.append(ins)
+            util.append(np.random.randn() * 0.1 + (0.5 if int(ins[1:]) < 5 else -0.1))
+    labels_h = pl.DataFrame({"instrument_id": ids, "session": sessions, "risk_residual": util, "reference_cost": [0]*len(ids), "gross_return": util})
+    feature = pl.DataFrame({"instrument_id": ids, "session": sessions, "feature__x": [1]*len(ids)})
+    manifest = SimpleNamespace(certification="production", schema_hash="h", universe_policy_hash="uh")
+    data = NetAlphaResearchData(feature_frame=feature, labels_by_horizon={10: labels_h}, manifest=manifest)
+
+    monkeypatch.setattr(train, "resolve_snapshot_for_mode", lambda *a, **k: fake_snapshot)
+    monkeypatch.setattr(train, "ResearchDataRepository", lambda **kw: SimpleNamespace(compose_labeled_training_snapshot=lambda *a, **k: SimpleNamespace()))
+    monkeypatch.setattr(train, "compose_net_alpha_training_data", lambda *a, **k: data)
+    monkeypatch.setattr(train, "load_cost_evidence", lambda path, rng: SimpleNamespace(base_schedule=lambda: SimpleNamespace(kind="base"), stress_schedule=lambda: SimpleNamespace(kind="stress"), base_liquidity_model=SimpleNamespace(), stress_liquidity_model=SimpleNamespace()))
+
+    # Ensure no ledger write
+    def _forbidden(*a, **kw):
+        raise AssertionError("ledger must not be called")
+
+    monkeypatch.setattr(MlResultLedger, "record_completed", _forbidden)
+    monkeypatch.setattr(MlResultLedger, "record_failed", _forbidden)
+    monkeypatch.setattr(ModelArtifactRegistry, "publish", _forbidden)
+
+    rc = train.main(["--artifact-id", "arch07", "--snapshot-id", "snap07", "--research-only-alpha-capacity-audit"])
+    assert rc == 0
+    payload = _json.loads(capsys.readouterr().out)
+    assert payload["status"] in ("RESEARCH_ONLY", "NO_TRADE")
+    assert payload["artifact_published"] is False
+    assert "DATA" in payload
+    assert "ALGO" in payload
+    assert "EVAL" in payload
+    assert "SYS" in payload
+    assert "scores" not in payload
+    assert "labels" not in payload

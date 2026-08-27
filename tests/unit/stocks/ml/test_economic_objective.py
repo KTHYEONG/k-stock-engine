@@ -272,3 +272,46 @@ def test_ECONOMIC_UTILITY_04_invalid_oof_join_fails_closed() -> None:
             bootstrap_resamples=10,
             seed=1,
         )
+
+
+def test_ALPHA_ARCH_01_ORDER_INVARIANCE() -> None:
+    """ALPHA_ARCH_01_ORDER_INVARIANCE.
+
+    Session-major, instrument-major, and seeded shuffled inputs produce identical
+    TailCaptureEvidence; real multi-name sessions have strictly positive oracle
+    excess when utilities differ.
+    """
+    import numpy as np
+
+    utilities = {"A": 0.90, "B": 0.80, "C": 0.05, "D": 0.04}
+    scores = {"A": 9.0, "B": 8.0, "C": 7.0, "D": 6.0}
+    labels_sm, scored_sm = _study_frames(utilities, scores, sessions=6)
+    # session-major (already)
+    ev_sm = measure_tail_capture(scored_sm, labels_sm, top_k=2, bootstrap_alpha=0.05, bootstrap_resamples=200, seed=7)
+    # instrument-major: sort by instrument then session
+    all_ids = scored_sm[_ID].to_list()
+    all_sess = scored_sm[_SESSION].to_list()
+    all_scores = scored_sm["predicted_net_alpha"].to_list()
+    all_utils = labels_sm["risk_residual"].to_list()
+    order_im = sorted(range(len(all_ids)), key=lambda i: (all_ids[i], all_sess[i]))
+    labels_im = pl.DataFrame(
+        {"instrument_id": [all_ids[i] for i in order_im], "session": [all_sess[i] for i in order_im], "risk_residual": [all_utils[i] for i in order_im], "reference_cost": [0.0]*len(order_im)}
+    )
+    scored_im = pl.DataFrame(
+        {"instrument_id": [all_ids[i] for i in order_im], "session": [all_sess[i] for i in order_im], "predicted_net_alpha": [all_scores[i] for i in order_im]}
+    )
+    ev_im = measure_tail_capture(scored_im, labels_im, top_k=2, bootstrap_alpha=0.05, bootstrap_resamples=200, seed=7)
+    # shuffled
+    rng = np.random.default_rng(0)
+    perm = rng.permutation(len(all_ids))
+    labels_sh = pl.DataFrame(
+        {"instrument_id": [all_ids[int(i)] for i in perm], "session": [all_sess[int(i)] for i in perm], "risk_residual": [all_utils[int(i)] for i in perm], "reference_cost": [0.0]*len(perm)}
+    )
+    scored_sh = pl.DataFrame(
+        {"instrument_id": [all_ids[int(i)] for i in perm], "session": [all_sess[int(i)] for i in perm], "predicted_net_alpha": [all_scores[int(i)] for i in perm]}
+    )
+    ev_sh = measure_tail_capture(scored_sh, labels_sh, top_k=2, bootstrap_alpha=0.05, bootstrap_resamples=200, seed=7)
+    assert ev_sm.model_excess_utility == ev_im.model_excess_utility == ev_sh.model_excess_utility
+    assert ev_sm.oracle_excess_utility == ev_im.oracle_excess_utility == ev_sh.oracle_excess_utility
+    assert ev_sm.tail_excess_lower_bound == ev_im.tail_excess_lower_bound == ev_sh.tail_excess_lower_bound
+    assert ev_sm.oracle_excess_utility > 0.0

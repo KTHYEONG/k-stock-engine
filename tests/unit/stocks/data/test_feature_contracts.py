@@ -1,7 +1,7 @@
 """Feature contracts: label-free projections and explicit duplicate lineage."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 import polars as pl
 import pytest
@@ -190,3 +190,61 @@ class TestSemanticContracts:
         changed["formula_id"] = "stock_alpha_v3:ep_ratio:v2"
         second = semantic_feature_contract_book("v1", (changed,)).contracts[0]
         assert first.dependency_hash != second.dependency_hash
+
+
+def test_ALPHA_ARCH_03_PIT_LINEAGE() -> None:
+    """ALPHA_ARCH_03_PIT_LINEAGE.
+
+    Explicit 5d, 20d, and 120d lookbacks and DERIVED lineage are hashed;
+    bp/ep without disclosure availability are rejected for production.
+    """
+    from src.stocks.data.ml_integrity import validate_ml_snapshot
+    from src.stocks.data.quality import KRXSessionCalendar
+    from src.stocks.ml.features import stock_net_alpha_v2_contract_book, stock_net_alpha_v2_semantic_contracts
+    import polars as pl
+    from datetime import datetime, UTC
+
+    contracts = stock_net_alpha_v2_semantic_contracts()
+    by_name = {c["name"]: c for c in contracts}
+    assert by_name["disparity_120d"]["lookback_sessions"] == 120
+    assert by_name["flow_intensity_20d"]["lookback_sessions"] == 20
+    assert by_name["ret_2_5d"]["lookback_sessions"] == 5
+    assert by_name["disparity_120d"]["source_kind"] == "derived"
+    # hash includes source_available_time_field
+    from src.stocks.data.feature_contracts import make_feature_contract
+
+    c1 = make_feature_contract(name="x", source_field="x", source_available_time_field="available_time", formula_id="a")
+    c2 = make_feature_contract(name="x", source_field="x", source_available_time_field="disclosure_date", formula_id="a")
+    assert c1.dependency_hash != c2.dependency_hash
+    # bp/ep without disclosure are rejected
+    book = stock_net_alpha_v2_contract_book()
+    bp = book.contract_for("bp_ratio")
+    assert bp.source_available_time_field == "disclosure_date"
+    calendar = KRXSessionCalendar(
+        version="test",
+        sessions=tuple(date(2024, 1, d) for d in range(1, 12)),
+        generated_time=datetime(2024, 1, 1, tzinfo=UTC),
+    )
+    frame = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:1"] * 6 + ["KRX:2"] * 6,
+            "session": [date(2024, 1, d) for d in range(1, 7)] * 2,
+            "observation_time": [datetime(2024, 1, d, 15, 0, tzinfo=UTC) for d in range(1, 7)] * 2,
+            "available_time": [datetime(2024, 1, d, 15, 30, tzinfo=UTC) for d in range(1, 7)] * 2,
+            "open": [100.0 + i for i in range(6)] * 2,
+            "high": [101.0 + i for i in range(6)] * 2,
+            "low": [99.0 + i for i in range(6)] * 2,
+            "close": [100.5 + i for i in range(6)] * 2,
+            "volume": [1_000_000.0] * 12,
+        }
+    )
+    # Add v2 features: need at least bp_ratio/ep_ratio columns, others null
+    for name in [c["name"] for c in stock_net_alpha_v2_semantic_contracts()]:
+        if name not in frame.columns:
+            if name in ("bp_ratio", "ep_ratio"):
+                frame = frame.with_columns(pl.lit(1.0).alias(name))
+            else:
+                frame = frame.with_columns(pl.lit(0.1).alias(name))
+    audit = validate_ml_snapshot(frame, book, datetime(2024, 1, 10, tzinfo=UTC), calendar)
+    assert audit.passed is False
+    assert any(c.name == "pit_availability" and not c.passed for c in audit.checks)
