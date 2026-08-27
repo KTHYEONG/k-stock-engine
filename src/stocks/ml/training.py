@@ -55,6 +55,7 @@ from src.stocks.ml.contracts import (
     DECLARED_ECONOMIC_FAMILIES,
     RAWNET_LGBM_FAMILY,
     TAIL_LAMBDARANK_FAMILY,
+    AccountCertificationSettings,
     CompoundingCertificationSettings,
     FoldScoreDiagnostic,
     HorizonOOFDiagnostic,
@@ -196,6 +197,46 @@ _NESTED_INNER_FOLDS = 3
 _NESTED_MIN_TRAIN_SESSIONS = 5
 _ALPHA_TIE_TOLERANCE = 1e-12
 _MAX_BLOCKED_VINTAGE_FRACTION = 0.05
+
+
+def validate_account_capital_coherence(
+    data: NetAlphaResearchData, request: NetAlphaTrainingRequest
+) -> None:
+    """Fail closed unless account capital coherence holds."""
+
+    acct = request.account_certification
+    if acct is None:
+        return
+    cap = float(acct.account_capital_krw)
+    max_cap = float(acct.max_account_capital_krw)
+    if not math.isfinite(cap) or not math.isfinite(max_cap):
+        raise ValueError("account_capital_krw must be finite")
+    if not 0 < cap <= max_cap:
+        raise ValueError(f"account_capital_krw must be in (0, {max_cap}] got {cap}")
+    if cap > 5_000_000.0:
+        raise ValueError(f"account_capital_krw {cap} exceeds 5_000_000")
+    manifest_notional = data.manifest.reference_notional
+    if manifest_notional is None:
+        raise ValueError("label manifest reference_notional missing in account mode")
+    portfolio = request.portfolio
+    if not (
+        float(manifest_notional) == float(portfolio.reference_notional)
+        == float(portfolio.portfolio_value)
+        == float(portfolio.initial_cash)
+        == float(cap)
+    ):
+        raise ValueError(
+            "capital coherence failed: manifest="
+            f"{manifest_notional}, portfolio_ref={portfolio.reference_notional}, "
+            f"portfolio_value={portfolio.portfolio_value}, "
+            f"initial_cash={portfolio.initial_cash}, account_capital={cap}"
+        )
+    if request.capital_plan is None:
+        raise ValueError("capital_plan missing in account mode")
+    if float(request.capital_plan.seed_capital_krw) != float(cap):
+        raise ValueError(
+            f"capital_plan seed {request.capital_plan.seed_capital_krw} != account_capital {cap}"
+        )
 
 
 class _MemoryBudgetExceededError(Exception):
@@ -345,6 +386,8 @@ def train_net_alpha_model(
     progress: Callable[[str, Mapping[str, object] | None], None] | None = None,
 ) -> ModelManifest:
     """Train the net-alpha mainline and publish a champion or complete ``NO_TRADE``.
+
+    Wiring: validate_account_capital_coherence - validate_account_capital_coherence(data, request) before horizon discovery
 
     Args:
         data: the composed net-alpha research data (feature frame plus
@@ -533,6 +576,7 @@ def train_net_alpha_model(
             telemetry=telemetry,
         )
 
+    validate_account_capital_coherence(data, request)
     max_horizon = max(request.candidate_horizon_sessions)
     # PurgedWalkForward.max_train_sessions bounds each fold's fitting memory
     # to the newest eligible sessions after purge and embargo.
@@ -640,6 +684,7 @@ def _run_discovery_and_publish(
     oof_cache: _OofCache,
 ) -> ModelManifest:
     """Run discovery, stitch the growth route, and publish under one OOF cache."""
+    validate_account_capital_coherence(data, request)
     try:
         discovery = _build_horizon_evidence(
             pre_holdout, folds, data, request, learner_columns,
@@ -676,7 +721,15 @@ def _run_discovery_and_publish(
         if route.selected_policies and route.selected_policies[-1] is not None
         else discovery.evidence[0].horizon_sessions
     )
-    certificate = certify_growth_route(route, primary, request.compounding)
+    _acct = request.account_certification
+    # Wiring: certify_growth_route - both training certificate call sites use account minimum_lower_cagr and max_drawdown only when account certification is present
+    certificate = certify_growth_route(
+        route,
+        primary,
+        request.compounding,
+        minimum_lower_cagr=float(_acct.minimum_lower_cagr) if _acct is not None else 0.0,
+        max_drawdown=float(_acct.max_drawdown) if _acct is not None else None,
+    )
     satellite_nem_records = (
         _collect_nem_component_records(request, route.selected_policies[-1])
         if request.satellite_settings is not None
@@ -685,7 +738,7 @@ def _run_discovery_and_publish(
         and route.selected_policies[-1] is not None
         else ()
     )
-    growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary, capital_plan_settings=request.capital_plan, satellite_settings=request.satellite_settings, nem_component_records=satellite_nem_records)  # noqa: E501
+    growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary, capital_plan_settings=request.capital_plan, satellite_settings=request.satellite_settings, nem_component_records=satellite_nem_records, account_certification=request.account_certification)  # noqa: E501
     _attach_frozen_compound_track(growth_route, discovery.evidence, request)
     growth_route = _attach_excess_route_certificate(
         growth_route, discovery, request, pre_holdout, primary
@@ -4306,6 +4359,7 @@ def _growth_route_projection(
     capital_plan_settings: SmallCapitalPlanSettings | None = None,
     satellite_settings: SatelliteOverlaySettings | None = None,
     nem_component_records: Sequence[Mapping[str, object]] = (),
+    account_certification: AccountCertificationSettings | None = None,
 ) -> dict[str, object]:
     """Bounded ``growth_route`` projection shared by metrics and the ledger.
 
@@ -4529,6 +4583,27 @@ def _growth_route_projection(
             )
         except ValueError:
             projection["satellite_overlay_projection"] = {}
+    if account_certification is not None:
+        try:
+            acct = account_certification
+            if isinstance(acct, AccountCertificationSettings):
+                reasons_raw = certificate.get("reasons")
+                reasons_list = list(reasons_raw) if isinstance(reasons_raw, (list, tuple)) else []
+                projection["account_certification"] = {
+                    "account_capital_krw": float(acct.account_capital_krw),
+                    "minimum_lower_cagr": float(acct.minimum_lower_cagr),
+                    "max_drawdown": float(acct.max_drawdown),
+                    "base_lower_cagr": _scalar("base_lower_cagr"),
+                    "stress_lower_cagr": _scalar("stress_lower_cagr"),
+                    "mdd": _scalar("mdd"),
+                    "passed": bool(certificate.get("passed")),
+                    "reasons": reasons_list,
+                }
+                projection["account_basis"] = float(acct.account_capital_krw)
+                projection["account_target"] = float(acct.minimum_lower_cagr)
+                projection["account_max_drawdown"] = float(acct.max_drawdown)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("account certification projection failed: %s", exc)
     return projection
 
 
@@ -4914,7 +4989,15 @@ def _growth_route_research_payload(
         if route.selected_policies and route.selected_policies[-1] is not None
         else discovery.evidence[0].horizon_sessions
     )
-    certificate = certify_growth_route(route, primary, request.compounding)
+    _acct2 = request.account_certification
+    # Wiring: certify_growth_route - both training certificate call sites use account minimum_lower_cagr and max_drawdown only when account certification is present
+    certificate = certify_growth_route(
+        route,
+        primary,
+        request.compounding,
+        minimum_lower_cagr=float(_acct2.minimum_lower_cagr) if _acct2 is not None else 0.0,
+        max_drawdown=float(_acct2.max_drawdown) if _acct2 is not None else None,
+    )
     satellite_nem_records = (
         _collect_nem_component_records(request, route.selected_policies[-1])
         if request.satellite_settings is not None
@@ -4923,7 +5006,7 @@ def _growth_route_research_payload(
         and route.selected_policies[-1] is not None
         else ()
     )
-    growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary, capital_plan_settings=request.capital_plan, satellite_settings=request.satellite_settings, nem_component_records=satellite_nem_records)  # noqa: E501
+    growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary, capital_plan_settings=request.capital_plan, satellite_settings=request.satellite_settings, nem_component_records=satellite_nem_records, account_certification=request.account_certification)  # noqa: E501
     _attach_frozen_compound_track(growth_route, discovery.evidence, request)
     growth_route = _attach_excess_route_certificate(
         growth_route, discovery, request, panel, primary

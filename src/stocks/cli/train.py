@@ -59,6 +59,7 @@ from src.stocks.ml.contracts import (
     DEFAULT_CANDIDATE_TOP_K,
     DEFAULT_POLICY_PROFILES,
     ELASTIC_NET_FAMILY,
+    AccountCertificationSettings,
     CompoundingCertificationSettings,
     ExecutionFrontierSettings,
     NetAlphaResearchData,
@@ -853,6 +854,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--discovery-workers", type=int, default=1)
     parser.add_argument(
+        "--account-capital-krw",
+        type=float,
+        default=None,
+        help="Account capital in KRW for small-account certification (<=5M); absent disables account mode",
+    )
+    parser.add_argument(
+        "--account-max-capital-krw",
+        type=float,
+        default=5_000_000.0,
+        help="Maximum admissible account capital in KRW",
+    )
+    parser.add_argument(
+        "--account-min-lower-cagr",
+        type=float,
+        default=0.30,
+        help="Minimum lower CAGR required in account mode",
+    )
+    parser.add_argument(
+        "--account-max-drawdown",
+        type=float,
+        default=0.25,
+        help="Maximum drawdown allowed in account mode",
+    )
+    parser.add_argument(
         "--enable-universe-rescope",
         action="store_true",
         help=(
@@ -913,6 +938,8 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
     hash-bound cost snapshot replace the schedules afterwards without altering
     any validated field.
     """
+
+    # Wiring: AccountCertificationSettings - build AccountCertificationSettings from account certification CLI arguments
     horizons = _parse_horizons(args.candidate_horizon_sessions)
     cadences = _parse_horizons(args.candidate_rebalance_frequency_sessions)
     top_k = _parse_horizons(args.candidate_top_k)
@@ -1017,6 +1044,16 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
         liquidity_model=None,
         stress_liquidity_model=None,
         enforce_snapshot_outcome_readiness=False,
+        account_certification=(
+            AccountCertificationSettings(
+                account_capital_krw=float(args.account_capital_krw),
+                max_account_capital_krw=float(args.account_max_capital_krw),
+                minimum_lower_cagr=float(args.account_min_lower_cagr),
+                max_drawdown=float(args.account_max_drawdown),
+            )
+            if getattr(args, "account_capital_krw", None) is not None
+            else None
+        ),
     )
 
 
