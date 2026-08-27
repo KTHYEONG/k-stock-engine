@@ -564,6 +564,8 @@ def _build_intents(
     portfolio: PortfolioSnapshot,
     request: TradingCycleRequest,
 ) -> tuple[TradeIntent, ...]:
+    # TradeIntent.target_quantity
+    # TradeIntent(..., target_value=allocation.target_value, target_quantity=allocation.target_quantity, ...)
     targeted = {a.instrument.instrument_id for a in allocations}
     intents: list[TradeIntent] = []
     for index, allocation in enumerate(allocations):
@@ -573,6 +575,7 @@ def _build_intents(
                 asset_kind=allocation.instrument.asset_kind,
                 instrument_id=allocation.instrument.instrument_id,
                 target_value=allocation.target_value,
+                target_quantity=allocation.target_quantity,
                 decision_time=request.decision_time,
                 execution_time=request.execution_time,
                 strategy_id=request.strategy_id,

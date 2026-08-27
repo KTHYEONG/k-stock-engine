@@ -552,7 +552,45 @@ def _execute_candidate_segment(
     and trades are released before returning so no candidate retains segment
     state.
     """
+    # derive buffer from rows strictly earlier than the segment cutoff and emit bounded provenance
     decision_times = segment.decision_times
+    # Derive causal buffer for account lot challenger (strictly before first decision)
+    risk_policy = context.risk_policy
+    segment_cutoff = min(decisions) if decisions else min(decision_times)
+    # Only derive when lot sizing enabled (account mode)
+    lot_enabled = bool(getattr(getattr(risk_policy, "lot_sizing", None), "enabled", False))
+    if lot_enabled:
+        try:
+            from src.stocks.trading.portfolio_constructor import (
+                LotSizingConfig,
+                derive_causal_open_gap_buffer_bps,
+            )
+
+            # Choose frame that carries open/close/session for buffer
+            buffer_frame = getattr(segment, "scored_market", None)
+            if buffer_frame is None or "open" not in buffer_frame.columns:
+                # Fallback to prepared market not having open; raise dropout
+                raise ValueError("no-causal-open-gap-buffer")
+            buffer_bps, _sample_count = derive_causal_open_gap_buffer_bps(
+                buffer_frame,
+                cutoff=segment_cutoff,
+                quantile=float(risk_policy.lot_sizing.opening_gap_quantile),
+            )
+            # Recreate policy with causal buffer
+            import dataclasses
+
+            risk_policy = dataclasses.replace(
+                risk_policy,
+                lot_sizing=LotSizingConfig(
+                    enabled=True,
+                    entry_price_buffer_bps=float(buffer_bps),
+                    opening_gap_quantile=float(risk_policy.lot_sizing.opening_gap_quantile),
+                ),
+            )
+        except ValueError as exc:
+            if "no-causal-open-gap-buffer" in str(exc):
+                raise ValueError("no-causal-open-gap-buffer") from exc
+            raise
     bt_request = BacktestRequest(
         strategy_id=context.strategy_id,
         start_time=min(decision_times),
@@ -560,10 +598,18 @@ def _execute_candidate_segment(
         decision_session_indices=tuple(segment.decision_indices),
         cost_schedule=context.base_cost_schedule,
         stress_cost_schedule=context.stress_cost_schedule,
-        risk_policy=context.risk_policy,
+        risk_policy=risk_policy,
         seed=context.seed,
     )
     cycle_cache = build_cycle_frame_cache(segment.scored_market)
+    # Need scenario planner bound to potentially updated risk_policy
+    if lot_enabled and risk_policy is not context.risk_policy:
+        from dataclasses import replace as _replace
+
+        new_context = _replace(context, risk_policy=risk_policy)
+        planner = _scenario_planner(new_context, segment.dataset_hash, cycle_cache)
+    else:
+        planner = _scenario_planner(context, segment.dataset_hash, cycle_cache)
     backtester = StockBacktester(
         registry=context.registry,
         instruments=context.instruments,
@@ -580,7 +626,7 @@ def _execute_candidate_segment(
             PreparedAllocationMarket.build(segment.scored_market),
             segment.score_overlay,
         ),
-        scenario_planner=_scenario_planner(context, segment.dataset_hash, cycle_cache),
+        scenario_planner=planner,
     )
     result = backtester.run_prepared(bt_request, segment.prepared_market, segment.score_overlay)
 
