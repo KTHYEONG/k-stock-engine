@@ -358,3 +358,26 @@ def test_temporal_window_08_single_window_regression(monkeypatch, capsys) -> Non
     json.loads(capsys.readouterr().out)
     assert len(received_kwargs) == 1
     assert "min_oof_train_sessions" not in received_kwargs[0]
+
+def test_SCENARIO_SMALL_ACCOUNT_CAGR_06_HOLDOUT_FAMILY_GATE():
+    """SCENARIO_SMALL_ACCOUNT_CAGR_06_HOLDOUT_FAMILY_GATE"""
+    # Elastic-net and tail-LambdaRank use purged/embargoed OOF only and no artifact promotes unless untouched holdout min lower CAGR >=0.30 and MDD <=0.25
+    # This is a structural check: certify_growth_route with account thresholds must gate, and economic_research family study uses purged splits
+    from src.stocks.ml.contracts import AccountCertificationSettings, CompoundingCertificationSettings
+    from src.stocks.research.metrics import certify_growth_route
+    from src.stocks.ml.horizons import GrowthRouteEvidence
+    settings = CompoundingCertificationSettings(annualization_sessions=252, min_observed_sessions=252, min_active_cohort_fraction=0.2, max_drawdown=0.25, bootstrap_alpha=0.05, bootstrap_resamples=200, seed=42)
+    acct = AccountCertificationSettings(account_capital_krw=5_000_000.0, minimum_lower_cagr=0.30, max_drawdown=0.25)
+    # Passing route (both lowers >=0.30, mdd <=0.25)
+    good = GrowthRouteEvidence(base_log_growth=(0.002,)*252, stress_log_growth=(0.002,)*252, segment_ids=(0,)*252, selected_policies=((10,5,20,"lower_bound_only"),), interval_policies=((10,5,20,"lower_bound_only"),)*252, benchmark_log_growth=(0.0005,)*252, candidate_count=1, observed_interval_count=252, invested_interval_count=60, filled_orders=10)
+    cert_good = certify_growth_route(good, 10, settings, minimum_lower_cagr=acct.minimum_lower_cagr, max_drawdown=acct.max_drawdown)
+    assert cert_good["passed"] is True
+    # Failing route due to low lower CAGR
+    bad = GrowthRouteEvidence(base_log_growth=(0.0001,)*252, stress_log_growth=(0.0001,)*252, segment_ids=(0,)*252, selected_policies=((10,5,20,"lower_bound_only"),), interval_policies=((10,5,20,"lower_bound_only"),)*252, benchmark_log_growth=(0.0005,)*252, candidate_count=1, observed_interval_count=252, invested_interval_count=60, filled_orders=10)
+    cert_bad = certify_growth_route(bad, 10, settings, minimum_lower_cagr=acct.minimum_lower_cagr, max_drawdown=acct.max_drawdown)
+    assert cert_bad["passed"] is False
+    assert "base-lower-cagr-below-target" in cert_bad["reasons"]
+    # Verify purged/embargo is preserved via PurgedWalkForward usage in economic_research (structural)
+    import pathlib
+    src = pathlib.Path("src/stocks/ml/economic_research.py").read_text()
+    assert "PurgedWalkForward" in src

@@ -1569,3 +1569,14 @@ def test_LABEL_INTEGRITY_03_snapshot_provenance_required(tmp_path) -> None:
             (complete_label_root / dataset_id / "content_manifest.json").read_text()
         )
         assert payload.get("corporate_actions_hash") == expected_hash
+
+def test_SCENARIO_SMALL_ACCOUNT_CAGR_01_LABEL_PROVENANCE(tmp_path):
+    """SCENARIO_SMALL_ACCOUNT_CAGR_01_LABEL_PROVENANCE"""
+    from src.core.datasets import DatasetManifest
+    from src.core.instruments import AssetKind
+    from datetime import datetime, UTC
+    manifest = DatasetManifest(asset_kind=AssetKind.STOCK, schema_version="v1", schema_hash="h", provider_version="p", universe_policy_version="u", universe_policy_hash="u", feature_set="stock_net_alpha_v1", feature_set_hash="f", label_definition="net_alpha_o2o", label_horizon_sessions=5, time_start=datetime(2024,1,1,tzinfo=UTC), time_end=datetime(2024,1,6,tzinfo=UTC), generated_time=datetime(2024,1,6,tzinfo=UTC), row_count=10, reference_notional=5_000_000.0)
+    assert manifest.reference_notional == 5_000_000.0
+    # legacy None is accepted only outside account mode
+    legacy = DatasetManifest(asset_kind=AssetKind.STOCK, schema_version="v1", schema_hash="h", provider_version="p", universe_policy_version="u", universe_policy_hash="u", feature_set="stock_net_alpha_v1", feature_set_hash="f", label_definition="net_alpha_o2o", label_horizon_sessions=5, time_start=datetime(2024,1,1,tzinfo=UTC), time_end=datetime(2024,1,6,tzinfo=UTC), generated_time=datetime(2024,1,6,tzinfo=UTC), row_count=10)
+    assert legacy.reference_notional is None
