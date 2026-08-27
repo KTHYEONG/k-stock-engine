@@ -445,5 +445,8 @@
   },
   "src/stocks/ml/universe_rescope.py": {
     "testing": "tests/unit/stocks/ml/test_universe_rescope.py"
+  },
+  "src/stocks/ml/capacity_audit.py": {
+    "testing": "tests/unit/stocks/ml/test_capacity_audit.py"
   }
 }

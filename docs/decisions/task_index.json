@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "evidence_driven_alpha_architecture",
+      "date": "2026-08-27",
+      "adr_id": "ADR_20260827_evidence_driven_alpha_architecture",
+      "domain": "quant",
+      "title": "Evidence-driven alpha architecture",
+      "why": "CAGR 30% and MDD 10% target lacked route-aligned, point-in-time, execution-backed evidence",
+      "resolution": "Fixed order-dependent tail grouping; bound route objectives; added PIT lineage checks, capacity audit, common-window evidence, and fail-closed promotion gates",
+      "impact": "Prevents false NO_TRADE/TRADE conclusions and separates ten-year evidence retention from causal fit-window selection"
+    },
+    {
       "task_id": "TASK_20260827_small_account_compounding",
       "date": "2026-08-27",
       "adr_id": "ADR_20260827_20260827_small_account_compounding",
@@ -989,16 +999,6 @@
       "why": "2026-08-12 run had positive Rank-IC but 7,822 attempted orders and zero fills because nullable provisional action coverage was coerced to false and prepared allocation lost pre-OOS warm-up history.",
       "resolution": "Preserved tri-state action coverage, restored complete-panel allocation warm-up, converted NaN score overlays to null, and recorded deterministic unfilled-order reason telemetry; rerun recovered 1,737 fills while fail-closed gates still produced NO_TRADE.",
       "impact": "Backtest execution evidence is now valid for provisional research data without relaxing certified-data or economic promotion gates."
-    },
-    {
-      "task_id": "TASK_20260812_sub10_81trial_refit_pipeline",
-      "date": "2026-08-12",
-      "adr_id": "ADR_20260812_20260812_sub10_81trial_refit_pipeline",
-      "domain": "stocks",
-      "title": "Sub-10-minute 81-trial refit pipeline",
-      "why": "The latest 81-trial run completed in 16:07 with 7,613 MiB external RSS; full refits were serial and eager fold/replay caches overlapped.",
-      "resolution": "Implemented measured LightGBM thread resolution, prepared scoring telemetry, and resource-aware refit pipeline while preserving deterministic ranking and fail-closed economic selection.",
-      "impact": "Synchronized ADR/task/code-map indexes and removed temporary spec and benchmark artifacts before production verification."
     }
   ]
 }
