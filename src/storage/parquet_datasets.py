@@ -557,4 +557,9 @@ def _manifest_from_dict(data: dict[str, object]) -> DatasetManifest:
         quality_report_hash=str(data.get("quality_report_hash", "")),
         content_hash=str(data.get("content_hash", "")),
         storage_layout=str(data.get("storage_layout", "")),
+        reference_notional=(
+            float(str(data["reference_notional"]))
+            if data.get("reference_notional") is not None
+            else None
+        ),
     )

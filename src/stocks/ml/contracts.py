@@ -591,6 +591,30 @@ class CompoundingCertificationSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class AccountCertificationSettings:
+    """Small-account capital coherence and 30% CAGR target."""
+
+    account_capital_krw: float
+    max_account_capital_krw: float = 5_000_000.0
+    minimum_lower_cagr: float = 0.30
+    max_drawdown: float = 0.25
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.account_capital_krw) or not 0 < self.account_capital_krw <= self.max_account_capital_krw:
+            raise ValueError(
+                f"account_capital_krw must be finite in (0, {self.max_account_capital_krw}]"
+            )
+        if not math.isfinite(self.max_account_capital_krw) or self.max_account_capital_krw <= 0:
+            raise ValueError("max_account_capital_krw must be positive finite")
+        if self.max_account_capital_krw > 5_000_000.0:
+            raise ValueError("max_account_capital_krw must be <= 5_000_000")
+        if not math.isfinite(self.minimum_lower_cagr):
+            raise ValueError("minimum_lower_cagr must be finite")
+        if not 0.0 < self.max_drawdown < 1.0:
+            raise ValueError("max_drawdown must be in (0, 1)")
+
+
+@dataclass(frozen=True, slots=True)
 class SmallCapitalPlanSettings:
     """Pre-registered absolute-capital implementation plan inputs.
 
@@ -773,6 +797,7 @@ class NetAlphaTrainingRequest:
     capital_plan: SmallCapitalPlanSettings | None = None
     satellite_settings: SatelliteOverlaySettings | None = None
     universe_rescope: UniverseRescopeSettings | None = None
+    account_certification: AccountCertificationSettings | None = None
 
     def __post_init__(self) -> None:
         if not self.artifact_id:

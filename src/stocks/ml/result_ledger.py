@@ -700,6 +700,14 @@ def _project_request(request: NetAlphaTrainingRequest) -> dict[str, object]:
                 else float(rescope.max_adtv_quantile)
             ),
         }
+    acct = getattr(request, "account_certification", None)
+    if acct is not None:
+        projection["account_certification"] = {
+            "account_capital_krw": float(acct.account_capital_krw),
+            "max_account_capital_krw": float(acct.max_account_capital_krw),
+            "minimum_lower_cagr": float(acct.minimum_lower_cagr),
+            "max_drawdown": float(acct.max_drawdown),
+        }
     projection["request_fingerprint"] = _stable_hash(projection)
     return projection
 
@@ -1006,6 +1014,8 @@ def _compact_policy_frontier(metrics: Mapping[str, object]) -> dict[str, object]
 def _compact_growth_route(metrics: Mapping[str, object]) -> dict[str, object]:
     """Bounded growth-route index: scalars plus normalized rejection counts.
 
+    Wiring: account_certification - project account basis, target, lower-CAGR gate verdict, and MDD only
+
     Projects the artifact metrics' ``growth_route`` projection into fixed
     scalars (candidate/segment counts, selected policy label, lower-growth
     CAGRs, coverage, fills) and per-reason counts; raw return arrays, policy
@@ -1039,6 +1049,24 @@ def _compact_growth_route(metrics: Mapping[str, object]) -> dict[str, object]:
         "rejection_reason_counts": reason_counts,
         "policies_digest": _digest_summary(route.get("selected_policies_digest")),
     }
+    # Account-certification projection: basis, target, MDD gate only (no raw orders/returns).
+    acct = route.get("account_certification")
+    if isinstance(acct, Mapping):
+        summary["account_basis"] = _as_float(acct.get("account_capital_krw"))
+        summary["account_target"] = _as_float(acct.get("minimum_lower_cagr"))
+        summary["account_max_drawdown"] = _as_float(acct.get("max_drawdown"))
+        summary["account_base_lower_cagr"] = _as_float(acct.get("base_lower_cagr"))
+        summary["account_stress_lower_cagr"] = _as_float(acct.get("stress_lower_cagr"))
+        summary["account_mdd"] = _as_float(acct.get("mdd"))
+        summary["account_passed"] = bool(acct.get("passed"))
+        summary["account_reasons_digest"] = _digest_summary(acct.get("reasons"))
+    # Fallback top-level basis fields for older growth_route shapes.
+    if "account_basis" not in summary and isinstance(route.get("account_basis"), (int, float)):
+        summary["account_basis"] = _as_float(route.get("account_basis"))
+    if "account_target" not in summary and isinstance(route.get("account_target"), (int, float)):
+        summary["account_target"] = _as_float(route.get("account_target"))
+    if "account_max_drawdown" not in summary and isinstance(route.get("account_max_drawdown"), (int, float)):
+        summary["account_max_drawdown"] = _as_float(route.get("account_max_drawdown"))
     outcome = route
     summary['promotion_status'] = outcome.get('promotion_status', 'NO_TRADE')
     summary['hedge_sleeve'] = _compact_hedge_sleeve(route)

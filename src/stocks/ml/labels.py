@@ -380,6 +380,7 @@ def publish_partitioned_net_alpha_label_dataset(
     certification: DatasetCertification = DatasetCertification.PROVISIONAL,
     generated_time: datetime | None = None,
     corporate_actions_hash: str | None = None,
+    reference_notional: float | None = None,
 ) -> NetAlphaLabelDatasetResult:
     """Publish the long, ``horizon_sessions``-partitioned net-alpha label dataset.
 
@@ -440,6 +441,7 @@ def publish_partitioned_net_alpha_label_dataset(
         schema_version="v2",
         content_hash=canonical_content_hash(labels_frame, ordered_columns),
         storage_layout=HIVE_PARTITION_LAYOUT,
+        reference_notional=reference_notional,
     )
     content_manifest: dict[str, object] = {
         "base_panel_hash": base_panel_hash,
