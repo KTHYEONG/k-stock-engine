@@ -2673,3 +2673,81 @@ def test_effective_breadth_recorded() -> None:
     empty_summary = _sizing_diagnostics_summary([])
     assert empty_summary["effective_breadth_mean"] is None
     assert empty_summary["effective_breadth_p10"] is None
+
+def test_SCENARIO_SMALL_ACCOUNT_LOT_01_WATERFILL_CONSTRAINTS():
+    """SCENARIO_SMALL_ACCOUNT_LOT_01_WATERFILL_CONSTRAINTS"""
+    from src.core.instruments import AssetKind, Instrument
+    from src.core.portfolio import PortfolioSnapshot
+    from src.stocks.trading.portfolio_constructor import LotSizingConfig, StockRiskPolicy, construct_target_allocations
+    import polars as pl
+    from datetime import UTC, datetime, timedelta
+    # Build deterministic 12-name case
+    n = 12
+    equity = 5_000_000.0
+    instruments = {f"KRX:{i:06d}": Instrument(f"KRX:{i:06d}", AssetKind.STOCK, "KRX", f"{i:06d}", "KRW", lot_size=1) for i in range(1, n+1)}
+    # Make panel with close 50000, sector round robin, pred_score varied
+    start = datetime(2024,1,1,tzinfo=UTC)
+    import numpy as np
+    rng = np.random.default_rng(1)
+    rows=[]  # noqa: PERF401
+    for s in range(80):
+        session = start + timedelta(days=s)
+        for i in range(1, n+1):
+            ret = float(rng.normal(0.001, 0.02))
+            rows.append({"session": session, "instrument_id": f"KRX:{i:06d}", "pred_score": float(i)+ (s%2)*0.01, "sector": f"S{i%3}", "adtv": 1e9, "close": 50000.0, "ret": ret, "expected_active_alpha":0.01, "expected_net_alpha":0.008, "alpha_lower_bound":0.005, "net_alpha_lower_bound":0.004, "exit_cost_rate":0.002})  # noqa: PERF401
+    panel = pl.DataFrame(rows)
+    portfolio = PortfolioSnapshot(account_snapshot_id="acc", as_of=start, settled_cash=equity, unsettled_cash=0.0, positions=())
+    policy_enabled = StockRiskPolicy(top_k=12, gross_cap=0.90, single_name_cap=0.08, sector_cap=0.40, lot_sizing=LotSizingConfig(enabled=True, entry_price_buffer_bps=200.0), compounding=CompoundingPolicyConfig(enabled=True, growth_risk_aversion=1.0, forecast_horizon_sessions=5))
+    allocs = construct_target_allocations(panel, instruments, portfolio, policy_enabled)
+    assert allocs
+    assert len(allocs) <= 12
+    price_map = {f"KRX:{i:06d}": 50000.0 for i in range(1,n+1)}
+    for a in allocs:
+        assert a.target_quantity is not None
+        assert a.target_quantity % instruments[a.instrument.instrument_id].lot_size == 0
+    buffered_gross = sum((a.target_quantity or 0) * price_map[a.instrument.instrument_id] * 1.02 for a in allocs)
+    assert buffered_gross <= 0.90 * equity + 1e-6
+    for a in allocs:
+        buffered_val = (a.target_quantity or 0) * price_map[a.instrument.instrument_id] * 1.02
+        assert buffered_val <= 0.08 * equity + 50000*1.02 + 1e-6
+    # sector check slack 1 lot
+    from collections import defaultdict
+    sec_tot = defaultdict(float)
+    for a in allocs:
+        # Use deterministic sector mapping: S0,S1,S2 round robin
+        iid = int(a.instrument.instrument_id.split(":")[1])
+        sec = f"S{iid%3}"
+        sec_tot[sec] += (a.target_quantity or 0) * price_map[a.instrument.instrument_id] * 1.02
+    for tot in sec_tot.values():
+        assert tot <= 0.40 * equity + 50000*1.02 + 1e-6
+    # disabled floor baseline plus one lot
+    policy_disabled = StockRiskPolicy(top_k=12, gross_cap=0.90, single_name_cap=0.08, sector_cap=0.40, lot_sizing=LotSizingConfig(enabled=False), compounding=CompoundingPolicyConfig(enabled=False))
+    allocs_disabled = construct_target_allocations(panel, instruments, portfolio, policy_disabled)
+    disabled_floor = sum(int(a.target_value / 50000) * 50000 for a in allocs_disabled)
+    assert buffered_gross >= disabled_floor + 50000*0.9  # at least one lot more (approx)
+
+def test_SCENARIO_SMALL_ACCOUNT_LOT_02_DISABLED_PARITY():
+    """SCENARIO_SMALL_ACCOUNT_LOT_02_DISABLED_PARITY"""
+    from src.core.instruments import AssetKind, Instrument
+    from src.core.portfolio import PortfolioSnapshot
+    from src.stocks.trading.portfolio_constructor import LotSizingConfig, StockRiskPolicy, construct_target_allocations, PreparedAllocationMarket, construct_target_allocations_prepared
+    import polars as pl
+    from datetime import UTC, datetime, timedelta
+    instruments = {f"KRX:{i:06d}": Instrument(f"KRX:{i:06d}", AssetKind.STOCK, "KRX", f"{i:06d}", "KRW", lot_size=10) for i in range(1,6)}
+    start = datetime(2024,1,1,tzinfo=UTC)
+    rows=[]  # noqa: PERF401
+    for s in range(60):
+        session = start + timedelta(days=s)
+        for i in range(1,6):
+            rows.append({"session": session, "instrument_id": f"KRX:{i:06d}", "pred_score": float(i), "sector": "S1", "adtv": 1e9, "close": 50000.0, "ret": 0.001})  # noqa: PERF401
+    panel = pl.DataFrame(rows)
+    portfolio = PortfolioSnapshot(account_snapshot_id="acc", as_of=start, settled_cash=100_000_000.0, unsettled_cash=0.0, positions=())
+    policy = StockRiskPolicy(top_k=5, lot_sizing=LotSizingConfig(enabled=False))
+    allocs = construct_target_allocations(panel, instruments, portfolio, policy)
+    assert all(a.target_quantity is None for a in allocs)
+    # prepared parity
+    market = PreparedAllocationMarket.build(panel)
+    overlay = panel.sort(["session","instrument_id"])["pred_score"].to_numpy().astype(float)
+    allocs_prep = construct_target_allocations_prepared(market, len(market.sessions)-1, overlay, None, instruments, portfolio, policy)
+    assert allocs == allocs_prep
+    assert all(a.target_quantity is None for a in allocs_prep)

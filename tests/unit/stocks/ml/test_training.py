@@ -2053,3 +2053,18 @@ def test_SCENARIO_SMALL_ACCOUNT_CAGR_02_COHERENCE_FAIL_CLOSED():
     req_no_plan = NetAlphaTrainingRequest(artifact_id="noplan", candidate_horizon_sessions=(10,), portfolio=PortfolioSettings(portfolio_value=5_000_000.0, initial_cash=5_000_000.0, reference_notional=5_000_000.0), account_certification=acct)
     with pytest.raises(ValueError):  # noqa: PT011
         validate_account_capital_coherence(data_ok, req_no_plan)
+
+def test_SCENARIO_SMALL_ACCOUNT_LOT_06_PROMOTION_GATE():
+    """SCENARIO_SMALL_ACCOUNT_LOT_06_PROMOTION_GATE"""
+    from src.stocks.ml.training import evaluate_small_account_promotion
+    # delta <=0 -> NO_TRADE false
+    assert evaluate_small_account_promotion(challenger_stress_lower_delta=0.0, base_lower_cagr=0.31, stress_lower_cagr=0.31, mdd=0.2) is False
+    assert evaluate_small_account_promotion(challenger_stress_lower_delta=-0.01, base_lower_cagr=0.31, stress_lower_cagr=0.31, mdd=0.2) is False
+    # CAGR <0.30 -> false
+    assert evaluate_small_account_promotion(challenger_stress_lower_delta=0.01, base_lower_cagr=0.29, stress_lower_cagr=0.31, mdd=0.2) is False
+    assert evaluate_small_account_promotion(challenger_stress_lower_delta=0.01, base_lower_cagr=0.31, stress_lower_cagr=0.29, mdd=0.2) is False
+    # MDD >0.25 -> false
+    assert evaluate_small_account_promotion(challenger_stress_lower_delta=0.01, base_lower_cagr=0.31, stress_lower_cagr=0.31, mdd=0.26) is False
+    # only delta>0 and both >=0.30 with MDD <=0.25 -> true
+    assert evaluate_small_account_promotion(challenger_stress_lower_delta=0.01, base_lower_cagr=0.30, stress_lower_cagr=0.30, mdd=0.25) is True
+    assert evaluate_small_account_promotion(challenger_stress_lower_delta=0.001, base_lower_cagr=0.35, stress_lower_cagr=0.40, mdd=0.1) is True

@@ -893,3 +893,45 @@ def test_SCENARIO_ENGINE_CLIP_COUNTER_07() -> None:
     assert float(clipped.metrics.get("capacity_clipped_count", 0.0)) > 0
     assert float(clipped.metrics.get("partial_fill_count", 0.0)) > 0
     assert float(control.metrics.get("capacity_clipped_count", 0.0)) == 0.0
+
+def test_SCENARIO_SMALL_ACCOUNT_LOT_03_HARD_TARGET_EXECUTION():
+    """SCENARIO_SMALL_ACCOUNT_LOT_03_HARD_TARGET_EXECUTION"""
+    from src.stocks.backtesting.engine import StockBacktester, BacktestRequest, ArtifactSchedule, ArtifactSlot
+    from src.execution.domain.intents import TradeIntent
+    from src.core.instruments import Instrument, AssetKind
+    from src.core.portfolio import PortfolioSnapshot
+    from src.stocks.workflows.trading_cycle import TradingCycleResult, CycleStatus
+    from datetime import UTC, datetime
+    import tempfile
+    from pathlib import Path
+
+    import polars as pl
+    from src.stocks.research.artifacts import ModelArtifactRegistry
+    from src.core.costs import default_base_schedule, default_stress_schedule
+    from src.core.datasets import DatasetManifest
+    sessions = [datetime(2024,1,1,tzinfo=UTC), datetime(2024,1,2,tzinfo=UTC), datetime(2024,1,3,tzinfo=UTC)]
+    rows=[]  # noqa: PERF401
+    for s in sessions:
+        for iid in ['KRX:000001']:
+            rows.append({'session': s, 'instrument_id': iid, 'open': 100.0, 'close':100.0, 'high':100,'low':100,'volume':1e6,'trading_value':1e8,'available_time': s, 'observation_time': s, 'adtv':1e8, 'action_interval_covered': True, 'data_quality_status':'eligible'})  # noqa: PERF401
+    panel = pl.DataFrame(rows)
+    manifest = DatasetManifest(asset_kind=AssetKind.STOCK, schema_version='v1', schema_hash='h', provider_version='p', universe_policy_version='u', universe_policy_hash='u', feature_set='stock_net_alpha_v1', feature_set_hash='f', label_definition='net_alpha_o2o', label_horizon_sessions=5, time_start=sessions[0], time_end=sessions[-1], generated_time=sessions[-1], row_count=panel.height)
+    registry = ModelArtifactRegistry(Path(tempfile.mkdtemp()))
+    instruments = {'KRX:000001': Instrument('KRX:000001', AssetKind.STOCK,'KRX','000001','KRW', lot_size=1)}
+    decision = sessions[0]
+    execution = sessions[1]
+    intent_hard = TradeIntent(intent_id='int-hard', asset_kind=AssetKind.STOCK, instrument_id='KRX:000001', target_value=1600.0, target_quantity=17, decision_time=decision, execution_time=execution, strategy_id='test', reason='hard', idempotency_key='k-hard', account_snapshot_id='acc')
+    intent_legacy = TradeIntent(intent_id='int-leg', asset_kind=AssetKind.STOCK, instrument_id='KRX:000001', target_value=1600.0, target_quantity=None, decision_time=decision, execution_time=execution, strategy_id='test', reason='legacy', idempotency_key='k-leg', account_snapshot_id='acc')
+    def planner_hard(snapshot, reg, inst, port, req):
+        return TradingCycleResult(status=CycleStatus.PLANNED, cycle_id='c', decision_time=req.decision_time, dataset_hash='d', artifact_id=req.artifact_id, account_snapshot_id=port.account_snapshot_id, allocations=(), intents=(intent_hard,), selected_instruments=('KRX:000001',), reasons=('hard',))
+    def planner_leg(snapshot, reg, inst, port, req):
+        return TradingCycleResult(status=CycleStatus.PLANNED, cycle_id='c', decision_time=req.decision_time, dataset_hash='d', artifact_id=req.artifact_id, account_snapshot_id=port.account_snapshot_id, allocations=(), intents=(intent_legacy,), selected_instruments=('KRX:000001',), reasons=('leg',))
+    portfolio = PortfolioSnapshot(account_snapshot_id='acc', as_of=sessions[0], settled_cash=100_000_000.0, unsettled_cash=0.0, positions=())
+    artifacts = ArtifactSchedule(slots=(ArtifactSlot(eligible_from=sessions[0], eligible_to=sessions[-1], artifact_id='a001'),))
+    request = BacktestRequest(strategy_id='test', start_time=sessions[0], end_time=sessions[-1], decision_session_indices=(0,), cost_schedule=default_base_schedule(), stress_cost_schedule=default_stress_schedule(), risk_policy=None, seed=42)
+    bt_hard = StockBacktester(planner=planner_hard, registry=registry, instruments=instruments, manifest=manifest, cost_schedule=default_base_schedule())
+    res_hard = bt_hard.run(panel, artifacts, portfolio, request)
+    assert res_hard.trades[0].quantity == 17
+    bt_leg = StockBacktester(planner=planner_leg, registry=registry, instruments=instruments, manifest=manifest, cost_schedule=default_base_schedule())
+    res_leg = bt_leg.run(panel, artifacts, portfolio, request)
+    assert res_leg.trades[0].quantity == 16
