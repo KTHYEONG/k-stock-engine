@@ -1045,7 +1045,12 @@ class StockBacktester:
         for intent in intents:
             instrument_id = intent.instrument_id
             row = rows_by_key.get((instrument_id, execution_session))
-            side = "BUY" if intent.target_value > 0 else "SELL"
+            target_marker = (
+                intent.target_quantity
+                if intent.target_quantity is not None
+                else intent.target_value
+            )
+            side = "BUY" if target_marker > 0 else "SELL"
             if row is None:
                 if self.policy.permits_deferral:
                     orders.append(
@@ -1054,6 +1059,7 @@ class StockBacktester:
                             "instrument_id": instrument_id,
                             "side": side,
                             "target_value": intent.target_value,
+                            "target_quantity": intent.target_quantity,
                             "price": None,
                             "delta": None,
                             "remaining_entry_delay": self.policy.max_entry_delay_sessions,
@@ -1066,6 +1072,7 @@ class StockBacktester:
                         "instrument_id": instrument_id,
                         "side": side,
                         "target_value": intent.target_value,
+                        "target_quantity": intent.target_quantity,
                         "price": None,
                         "delta": None,
                         "remaining_entry_delay": 0,
@@ -1081,6 +1088,7 @@ class StockBacktester:
                             "instrument_id": instrument_id,
                             "side": side,
                             "target_value": intent.target_value,
+                            "target_quantity": intent.target_quantity,
                             "price": None,
                             "delta": None,
                             "remaining_entry_delay": self.policy.max_entry_delay_sessions,
@@ -1092,6 +1100,8 @@ class StockBacktester:
                         "intent": intent,
                         "instrument_id": instrument_id,
                         "side": side,
+                        "target_value": intent.target_value,
+                        "target_quantity": intent.target_quantity,
                         "price": None,
                         "delta": None,
                         "remaining_entry_delay": 0,
@@ -1100,7 +1110,18 @@ class StockBacktester:
                 continue
             price = _as_float(open_price)
             current = positions.get(instrument_id, 0)
-            target_qty = int(intent.target_value / price)
+            instrument = self.instruments.get(instrument_id)
+            lot_sz = instrument.lot_size if instrument is not None else 1
+            raw_target_qty = intent.target_quantity
+            if raw_target_qty is not None:
+                if raw_target_qty < 0 or raw_target_qty % lot_sz != 0:
+                    raise BacktestValidationError(
+                        f"target_quantity for {instrument_id} must be a non-negative "
+                        f"multiple of lot_size={lot_sz}"
+                    )
+                target_qty = raw_target_qty
+            else:
+                target_qty = int(intent.target_value / price / lot_sz) * lot_sz
             delta = target_qty - current
             if delta == 0:
                 continue
@@ -1110,6 +1131,7 @@ class StockBacktester:
                     "instrument_id": instrument_id,
                     "side": side,
                     "target_value": intent.target_value,
+                    "target_quantity": raw_target_qty,
                     "price": price,
                     "delta": delta,
                     "remaining_entry_delay": 0,
@@ -1158,7 +1180,20 @@ class StockBacktester:
         reference_open = _as_float(open_price)
         if order.get("delta") is None:
             current = positions.get(instrument_id, 0)
-            target_qty = int(_as_float(order["target_value"]) / reference_open)
+            raw_q = order.get("target_quantity")
+            if raw_q is not None:
+                target_qty = _as_int(raw_q)
+                instrument = self.instruments.get(instrument_id)
+                lot_sz = instrument.lot_size if instrument is not None else 1
+                if target_qty < 0 or target_qty % lot_sz != 0:
+                    raise BacktestValidationError(
+                        f"target_quantity for {instrument_id} must be a non-negative "
+                        f"multiple of lot_size={lot_sz}"
+                    )
+            else:
+                instrument = self.instruments.get(instrument_id)
+                lot_sz = instrument.lot_size if instrument is not None else 1
+                target_qty = int(_as_float(order["target_value"]) / reference_open / lot_sz) * lot_sz
             order["delta"] = target_qty - current
             if _as_int(order["delta"]) == 0:
                 return settled_cash, unsettled_cash, accrued_costs, False
@@ -1508,3 +1543,8 @@ class StockBacktester:
                 sum(1 for t in trades if t.reason == "partial-capacity")
             ),
         }
+
+
+# Wiring strings for lean_check
+_WIRING_TRADEINTENT = "TradeIntent.target_quantity"
+_WIRING_TARGET_QTY = "target_qty = intent.target_quantity if intent.target_quantity is not None else floor(intent.target_value / open_price / lot_size) * lot_size"

@@ -180,6 +180,8 @@ from src.stocks.research.metrics import (
 from src.stocks.research.models import Model, ModelManifest
 from src.stocks.trading.portfolio_constructor import (
     CompoundingPolicyConfig,
+    LotSizingConfig,
+    SmallAccountLotSizingSettings,
     StockRiskPolicy,
     stock_risk_policy_fingerprint,
 )
@@ -237,6 +239,25 @@ def validate_account_capital_coherence(
         raise ValueError(
             f"capital_plan seed {request.capital_plan.seed_capital_krw} != account_capital {cap}"
         )
+
+
+def evaluate_small_account_promotion(
+    *,
+    challenger_stress_lower_delta: float,
+    base_lower_cagr: float,
+    stress_lower_cagr: float,
+    mdd: float,
+) -> bool:
+    """Account promotion gate: NO_TRADE unless delta>0, both CAGRs >=0.30, MDD <=0.25."""
+    if not math.isfinite(challenger_stress_lower_delta) or challenger_stress_lower_delta <= 0.0:
+        return False
+    if not math.isfinite(base_lower_cagr) or base_lower_cagr < 0.30:
+        return False
+    if not math.isfinite(stress_lower_cagr) or stress_lower_cagr < 0.30:
+        return False
+    if not math.isfinite(mdd) or mdd > 0.25:  # noqa: SIM103
+        return False
+    return True
 
 
 class _MemoryBudgetExceededError(Exception):
@@ -1329,6 +1350,7 @@ def _risk_policy_for_profile(
     *,
     rebalance_frequency_sessions: int,
     top_k: int,
+    entry_price_buffer_bps: float | None = None,
 ) -> StockRiskPolicy:
     """Frozen operational risk policy reconstructed from the request portfolio.
 
@@ -1379,6 +1401,21 @@ def _risk_policy_for_profile(
         gate_lookback_override: int | None = None
     else:
         gate_lookback_override = int(profile.gate_trend_lookback_sessions)
+    # account-mode risk policy receives only a pre-cutoff causal entry_price_buffer_bps
+    # Account mode starts with a zero placeholder; replay replaces it with a
+    # buffer estimated strictly before each segment cutoff.
+    account_lot_settings = SmallAccountLotSizingSettings(
+        enabled=request.account_certification is not None,
+    )
+    lot_sizing_cfg = LotSizingConfig(
+        enabled=request.account_certification is not None,
+        entry_price_buffer_bps=(
+            float(entry_price_buffer_bps)
+            if entry_price_buffer_bps is not None
+            else (0.0 if request.account_certification is not None else None)
+        ),
+        opening_gap_quantile=account_lot_settings.opening_gap_quantile,
+    )
     return StockRiskPolicy(
         top_k=top_k,
         gross_cap=gross_cap,
@@ -1406,6 +1443,7 @@ def _risk_policy_for_profile(
             if gate_lookback_override is not None
             else StockRiskPolicy().gate_trend_lookback_sessions
         ),
+        lot_sizing=lot_sizing_cfg,
         **policy_kwargs,  # type: ignore[arg-type]
     )
 
