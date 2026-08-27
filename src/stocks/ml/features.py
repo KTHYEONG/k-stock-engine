@@ -40,6 +40,7 @@ from src.stocks.research.features import (
 from src.stocks.research.models import ModelManifest
 
 STOCK_NET_ALPHA_V1_FEATURE_SET = "stock_net_alpha_v1"
+STOCK_NET_ALPHA_V2_FEATURE_SET = "stock_net_alpha_v2"
 
 SESSION_COLUMN = "session"
 
@@ -117,6 +118,75 @@ def stock_net_alpha_v1_contract_book() -> FeatureContractBook:
 
     return semantic_feature_contract_book(
         STOCK_NET_ALPHA_V1_FEATURE_SET, stock_net_alpha_v1_semantic_contracts()
+    )
+
+
+def _v2_lookback_sessions(source: str) -> int:
+    """Explicit lookback for v2: handles suffixes like 120d, 5d, 2_5d."""
+    # Direct trailing <digits>d pattern
+    if source.endswith("d"):
+        # Take segment after last underscore, strip trailing d
+        tail = source.rsplit("_", 1)[-1]
+        if tail.endswith("d"):
+            tail = tail[:-1]
+            if tail.isdigit():
+                return int(tail)
+        # For patterns like ret_2_5d -> tail is 5d -> already handled
+        # For disparity_120d -> 120d -> 120
+        # Also handle embedded numbers like 120d inside
+        import re
+
+        match = re.search(r"(\d+)d$", source)
+        if match:
+            return int(match.group(1))
+    # Fallback to legacy trailing integer
+    suffix = source.rsplit("_", 1)[-1]
+    if suffix.isdigit():
+        return int(suffix)
+    if source.startswith(("overnight_ret", "intraday_ret", "fluc_rate", "sector_ret")):
+        return 1
+    return 0
+
+
+def stock_net_alpha_v2_semantic_contracts() -> tuple[dict[str, object], ...]:
+    """Semantic contracts for stock_net_alpha_v2 with explicit lookbacks and DERIVED lineage.
+
+    Every feature carries DERIVED source_kind, explicit lookback, formula lineage,
+    and source_available_time_field. Fundamentals bp_ratio/ep_ratio bind to
+    disclosure_date and fail closed for production without PIT timestamps.
+    """
+    contracts: list[dict[str, object]] = []
+    for source, role in stock_net_alpha_v1_role_allowlist():
+        formula_id = f"{STOCK_NET_ALPHA_V2_FEATURE_SET}:{source}:v1"
+        avail_field = "disclosure_date" if source in ("bp_ratio", "ep_ratio") else "available_time"
+        contracts.append(
+            {
+                "name": source,
+                "role": role,
+                "source_field": source,
+                "source_dataset_ids": ("base_panel",),
+                "source_columns": (source,),
+                "formula_id": formula_id,
+                "source_kind": "derived",
+                "lookback_sessions": _v2_lookback_sessions(source),
+                "observation_rule": "session_close",
+                "availability_rule": "next_session_open",
+                "adjustment_basis": "split_adjusted",
+                "null_policy": "retain_null",
+                "stale_after_sessions": 0,
+                "expected_frequency": "session",
+                "source_available_time_field": avail_field,
+            }
+        )
+    return tuple(contracts)
+
+
+def stock_net_alpha_v2_contract_book() -> FeatureContractBook:
+    """Feature contract book for v2 with explicit PIT lineage."""
+    from src.stocks.data.feature_contracts import semantic_feature_contract_book
+
+    return semantic_feature_contract_book(
+        STOCK_NET_ALPHA_V2_FEATURE_SET, stock_net_alpha_v2_semantic_contracts()
     )
 
 

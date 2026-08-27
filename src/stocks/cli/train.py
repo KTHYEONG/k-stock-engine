@@ -725,6 +725,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--research-only-alpha-capacity-audit",
+        action="store_true",
+        help=(
+            "read-only capacity audit: route-first oracle, common-window, "
+            "model-tail, and exact replay; prints bounded RESEARCH_ONLY JSON "
+            "and publishes no artifact"
+        ),
+    )
+    parser.add_argument(
         "--candidate-training-lookback-sessions",
         type=str,
         default="504,756,1260,expanding",
@@ -1334,6 +1343,112 @@ def run_research_only_economic_family_study(
     }
 
 
+def run_research_only_alpha_capacity_audit(
+    parsed: argparse.Namespace,
+    request: NetAlphaTrainingRequest,
+) -> dict[str, object]:
+    """Read-only capacity audit: oracle, common-window, tail, and replay.
+
+    Resolves snapshot, binds cost evidence, runs the capacity audit orchestrator,
+    and returns bounded RESEARCH_ONLY JSON. Never publishes artifact, metrics,
+    or result-ledger entry.
+    """
+    # Wiring: evaluate_alpha_capacity_audit
+    from src.stocks.ml.capacity_audit import evaluate_alpha_capacity_audit
+    from src.stocks.ml.contracts import AlphaCapacityAuditSettings
+
+    if parsed.base_dataset_id or parsed.feature_dataset_id or parsed.label_dataset_id:
+        raise ValueError(
+            "--research-only-alpha-capacity-audit requires a cataloged "
+            "snapshot; direct-only dataset requests are rejected "
+            "(cost-evidence-required)"
+        )
+    if not parsed.snapshot_id:
+        raise ValueError(
+            "--research-only-alpha-capacity-audit requires --snapshot-id "
+            "(cost-evidence-required); the read-only audit never publishes"
+        )
+    decision_time = parsed.decision_time or REFERENCE_DATETIME
+    repository = ResearchDataRepository(
+        base_root=parsed.base_root,
+        feature_root=parsed.feature_root,
+        label_root=parsed.label_root,
+    )
+    snapshot = resolve_snapshot_for_mode(
+        parsed.catalog_root, parsed.snapshot_id, mode=parsed.mode
+    )
+    (
+        base_cost_schedule,
+        liquidity_model,
+        stress_cost_schedule,
+        stress_liquidity_model,
+    ) = _resolve_cost_contexts(snapshot)
+    if liquidity_model is None or stress_liquidity_model is None:
+        raise ValueError(
+            "--research-only-alpha-capacity-audit requires hash-bound "
+            "snapshot cost evidence resolving base/stress schedules and both "
+            "liquidity models (cost-evidence-required)"
+        )
+    composed = repository.compose_labeled_training_snapshot(
+        snapshot,
+        feature_set="stock_net_alpha_v1",
+        decision_time=decision_time,
+    )
+    data = compose_net_alpha_training_data(
+        composed,
+        decision_time,
+        candidate_horizon_sessions=_parse_horizons(parsed.candidate_horizon_sessions),
+    )
+    bound_request = replace(
+        request,
+        base_cost_schedule=base_cost_schedule,
+        stress_cost_schedule=stress_cost_schedule,
+        liquidity_model=liquidity_model,
+        stress_liquidity_model=stress_liquidity_model,
+    )
+    settings = AlphaCapacityAuditSettings(
+        candidate_lookback_sessions=_parse_training_lookback_candidates(
+            parsed.candidate_training_lookback_sessions
+        )
+    )
+    # Bounded evidence envelope
+    t0 = time.monotonic()
+    payload = evaluate_alpha_capacity_audit(
+        data, bound_request, settings, registry=ModelArtifactRegistry(parsed.registry)
+    )
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    # Add bounded DATA/ALGO/EVAL/SYS scalars without dumping raw rows
+    data_evidence = {
+        "snapshot_id": parsed.snapshot_id,
+        "feature_rows": int(data.feature_frame.height),
+        "session_count": int(data.feature_frame["session"].n_unique()) if "session" in data.feature_frame.columns else 0,
+    }
+    algo_evidence = {
+        "route_kind": bound_request.route_objective.kind.value,
+        "candidate_windows": list(settings.candidate_lookback_sessions),
+        "adjusted_bootstrap_alpha": payload.get("adjusted_bootstrap_alpha"),
+    }
+    eval_evidence = {
+        "oracle_feasible": payload.get("oracle", {}).get("feasible") if isinstance(payload.get("oracle"), dict) else None,
+        "promotion_passed": payload.get("promotion_passed"),
+        "next_action": payload.get("next_action"),
+    }
+    sys_evidence = {
+        "elapsed_ms": elapsed_ms,
+        "planned_bytes": int(data.feature_frame.height * 64),
+    }
+    return {
+        "status": "RESEARCH_ONLY",
+        "artifact_published": False,
+        "artifact_id": bound_request.artifact_id,
+        "DATA": data_evidence,
+        "ALGO": algo_evidence,
+        "EVAL": eval_evidence,
+        "SYS": sys_evidence,
+        **payload,
+    }
+
+
 def _resolve_cost_contexts(
     snapshot: object,
 ) -> tuple[
@@ -1444,6 +1559,11 @@ def main(args: list[str] | None = None) -> int:
 
     if parsed.research_only_economic_family_study:
         payload = run_research_only_economic_family_study(parsed, request)
+        sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
+        return 0
+
+    if parsed.research_only_alpha_capacity_audit:
+        payload = run_research_only_alpha_capacity_audit(parsed, request)
         sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
         return 0
 
