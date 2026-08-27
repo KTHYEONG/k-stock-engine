@@ -1111,6 +1111,8 @@ def materialize_net_alpha_snapshot(
     manifest atomically. Every horizon keeps its own universe; no common
     universe inner join is performed.
     """
+
+    # Wiring: DatasetManifest.reference_notional - persist request.reference_notional on immutable label and composite snapshot manifests
     from src.stocks.ml.features import (
         STOCK_NET_ALPHA_V1_FEATURE_SET,
         stock_net_alpha_v1_contract_book,
@@ -1305,6 +1307,7 @@ def materialize_net_alpha_snapshot(
         certification=request.certification,
         generated_time=request.generated_time,
         corporate_actions_hash=corporate_action_snapshot.content_hash,
+        reference_notional=request.reference_notional,
     )
     label_manifest = label_result.manifest
     status_result = publish_outcome_status_sidecar(

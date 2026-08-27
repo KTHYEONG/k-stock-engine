@@ -65,6 +65,7 @@ class DatasetManifest:
     quality_report_hash: str = ""
     content_hash: str = ""
     storage_layout: str = ""
+    reference_notional: float | None = None
 
     def __post_init__(self) -> None:
         if self.asset_kind not in (AssetKind.STOCK, AssetKind.ETF):
@@ -75,6 +76,11 @@ class DatasetManifest:
             raise ValueError(f"unsupported schema_version {self.schema_version!r}")
         if self.storage_layout not in ("", HIVE_PARTITION_LAYOUT):
             raise ValueError(f"unknown storage_layout {self.storage_layout!r}")
+        if self.reference_notional is not None:
+            import math as _math
+
+            if not _math.isfinite(self.reference_notional) or self.reference_notional <= 0:
+                raise ValueError("reference_notional must be positive finite when supplied")
 
 
 def validate_production_manifest(manifest: DatasetManifest) -> None:
@@ -123,6 +129,7 @@ def make_manifest(
     schema_version: str = "v1",
     content_hash: str = "",
     storage_layout: str = "",
+    reference_notional: float | None = None,
 ) -> DatasetManifest:
     """Build a manifest from a concrete column list (hashing the schema).
 
@@ -155,6 +162,7 @@ def make_manifest(
         quality_report_hash=quality_report_hash,
         content_hash=content_hash,
         storage_layout=storage_layout,
+        reference_notional=reference_notional,
     )
 
 
