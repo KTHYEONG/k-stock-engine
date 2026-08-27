@@ -35,6 +35,7 @@ from src.stocks.ml.economic_objective import (
     TailCaptureEvidence,
     build_tail_relevance,
     measure_tail_capture,
+    route_labels_for_capture,
 )
 from src.stocks.ml.features import (
     apply_model_feature_schema,
@@ -549,9 +550,13 @@ def _process_calibrated_scores(
     gated = 0
     for k in ks:
         gated += 1
+        # Wiring: project_route_utility -> measure_tail_capture
+        capture_labels = route_labels_for_capture(
+            data.labels_by_horizon[horizon], request.route_objective
+        )
         capture = measure_tail_capture(
             calibrated,
-            data.labels_by_horizon[horizon],
+            capture_labels,
             top_k=int(k),
             bootstrap_alpha=request.bootstrap_alpha,
             bootstrap_resamples=request.bootstrap_resamples,
