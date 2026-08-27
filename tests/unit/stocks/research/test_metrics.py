@@ -545,3 +545,31 @@ def test_growth_route_03_certificate_requires_resolvable_bootstrap() -> None:
     weak = CompoundingCertificationSettings(bootstrap_resamples=19)
     with pytest.raises(ValueError, match="bootstrap_resamples"):
         certify_growth_route(_growth_route((0.001,) * 252), 10, weak)
+
+def test_SCENARIO_SMALL_ACCOUNT_CAGR_03_TARGET_GATE():
+    """SCENARIO_SMALL_ACCOUNT_CAGR_03_TARGET_GATE"""
+    from src.stocks.ml.horizons import GrowthRouteEvidence
+    from src.stocks.ml.contracts import CompoundingCertificationSettings
+    from src.stocks.research.metrics import certify_growth_route
+    settings = CompoundingCertificationSettings(annualization_sessions=252, min_observed_sessions=252, min_active_cohort_fraction=0.2, max_drawdown=0.5, bootstrap_alpha=0.05, bootstrap_resamples=200, seed=42)
+    good = GrowthRouteEvidence(base_log_growth=(0.002,)*252, stress_log_growth=(0.002,)*252, segment_ids=(0,)*252, selected_policies=((10,5,20,"lower_bound_only"),), interval_policies=((10,5,20,"lower_bound_only"),)*252, benchmark_log_growth=(0.0005,)*252, candidate_count=1, observed_interval_count=252, invested_interval_count=60, filled_orders=10)
+    cert = certify_growth_route(good, 10, settings, minimum_lower_cagr=0.30, max_drawdown=0.25)
+    assert cert["passed"] is True
+    assert cert["base_lower_cagr"] >= 0.30
+    assert cert["stress_lower_cagr"] >= 0.30
+    assert cert["mdd"] <= 0.25
+    # base below target
+    low_base = GrowthRouteEvidence(base_log_growth=(0.0001,)*252, stress_log_growth=(0.002,)*252, segment_ids=(0,)*252, selected_policies=((10,5,20,"lower_bound_only"),), interval_policies=((10,5,20,"lower_bound_only"),)*252, benchmark_log_growth=(0.0005,)*252, candidate_count=1, observed_interval_count=252, invested_interval_count=60, filled_orders=10)
+    cert2 = certify_growth_route(low_base, 10, settings, minimum_lower_cagr=0.30, max_drawdown=0.25)
+    assert cert2["passed"] is False
+    assert "base-lower-cagr-below-target" in cert2["reasons"]
+    # stress below target
+    low_stress = GrowthRouteEvidence(base_log_growth=(0.002,)*252, stress_log_growth=(0.0001,)*252, segment_ids=(0,)*252, selected_policies=((10,5,20,"lower_bound_only"),), interval_policies=((10,5,20,"lower_bound_only"),)*252, benchmark_log_growth=(0.0005,)*252, candidate_count=1, observed_interval_count=252, invested_interval_count=60, filled_orders=10)
+    cert3 = certify_growth_route(low_stress, 10, settings, minimum_lower_cagr=0.30, max_drawdown=0.25)
+    assert cert3["passed"] is False
+    assert "stress-lower-cagr-below-target" in cert3["reasons"]
+    # mdd exceed
+    big_dd = GrowthRouteEvidence(base_log_growth=tuple(-0.3 if i==10 else 0.002 for i in range(252)), stress_log_growth=(0.002,)*252, segment_ids=(0,)*252, selected_policies=((10,5,20,"lower_bound_only"),), interval_policies=((10,5,20,"lower_bound_only"),)*252, benchmark_log_growth=(0.0005,)*252, candidate_count=1, observed_interval_count=252, invested_interval_count=60, filled_orders=10)
+    cert4 = certify_growth_route(big_dd, 10, settings, minimum_lower_cagr=0.30, max_drawdown=0.25)
+    assert cert4["passed"] is False
+    assert "max-drawdown-exceeded" in cert4["reasons"]

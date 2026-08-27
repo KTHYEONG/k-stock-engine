@@ -2024,3 +2024,32 @@ def test_excess_route_threading_manifest() -> None:
         )
     assert manifest_off.params == {"no_trade": "true"}
     assert manifest_on.params == {"no_trade": "true", "enable_excess_route": "true"}
+
+def test_SCENARIO_SMALL_ACCOUNT_CAGR_02_COHERENCE_FAIL_CLOSED():
+    """SCENARIO_SMALL_ACCOUNT_CAGR_02_COHERENCE_FAIL_CLOSED"""
+    import polars as pl
+    import pytest
+    from datetime import datetime, UTC
+    from src.core.datasets import DatasetManifest
+    from src.core.instruments import AssetKind
+    from src.stocks.ml.contracts import AccountCertificationSettings, NetAlphaResearchData, NetAlphaTrainingRequest, PortfolioSettings, SmallCapitalPlanSettings
+    from src.stocks.ml.training import validate_account_capital_coherence
+    frame = pl.DataFrame({"instrument_id":["A"],"session":[datetime(2024,1,1,tzinfo=UTC)],"feature__a":[1.0]})
+    labels = pl.DataFrame({"instrument_id":["A"],"session":[datetime(2024,1,1,tzinfo=UTC)],"net_alpha_target":[0.01],"label_available_time":[datetime(2024,1,2,tzinfo=UTC)],"risk_residual":[0.01],"reference_cost":[0.001]})
+    manifest_ok = DatasetManifest(asset_kind=AssetKind.STOCK, schema_version="v1", schema_hash="h", provider_version="p", universe_policy_version="u", universe_policy_hash="u", feature_set="stock_net_alpha_v1", feature_set_hash="f", label_definition="net_alpha_o2o", label_horizon_sessions=10, time_start=datetime(2024,1,1,tzinfo=UTC), time_end=datetime(2024,1,6,tzinfo=UTC), generated_time=datetime(2024,1,6,tzinfo=UTC), row_count=10, reference_notional=5_000_000.0)
+    manifest_missing = DatasetManifest(asset_kind=AssetKind.STOCK, schema_version="v1", schema_hash="h", provider_version="p", universe_policy_version="u", universe_policy_hash="u", feature_set="stock_net_alpha_v1", feature_set_hash="f", label_definition="net_alpha_o2o", label_horizon_sessions=10, time_start=datetime(2024,1,1,tzinfo=UTC), time_end=datetime(2024,1,6,tzinfo=UTC), generated_time=datetime(2024,1,6,tzinfo=UTC), row_count=10)
+    data_ok = NetAlphaResearchData(feature_frame=frame, labels_by_horizon={10: labels}, manifest=manifest_ok)
+    acct = AccountCertificationSettings(account_capital_krw=5_000_000.0)
+    req_ok = NetAlphaTrainingRequest(artifact_id="ok", candidate_horizon_sessions=(10,), portfolio=PortfolioSettings(portfolio_value=5_000_000.0, initial_cash=5_000_000.0, reference_notional=5_000_000.0), capital_plan=SmallCapitalPlanSettings(seed_capital_krw=5_000_000.0), account_certification=acct)
+    validate_account_capital_coherence(data_ok, req_ok)
+    data_missing = NetAlphaResearchData(feature_frame=frame, labels_by_horizon={10: labels}, manifest=manifest_missing)
+    with pytest.raises(ValueError):  # noqa: PT011
+        validate_account_capital_coherence(data_missing, req_ok)
+    with pytest.raises(ValueError):  # noqa: PT011
+        AccountCertificationSettings(account_capital_krw=6_000_000.0)
+    req_bad_port = NetAlphaTrainingRequest(artifact_id="bad", candidate_horizon_sessions=(10,), portfolio=PortfolioSettings(portfolio_value=100_000_000.0, initial_cash=100_000_000.0, reference_notional=100_000_000.0), capital_plan=SmallCapitalPlanSettings(seed_capital_krw=5_000_000.0), account_certification=acct)
+    with pytest.raises(ValueError):  # noqa: PT011
+        validate_account_capital_coherence(data_ok, req_bad_port)
+    req_no_plan = NetAlphaTrainingRequest(artifact_id="noplan", candidate_horizon_sessions=(10,), portfolio=PortfolioSettings(portfolio_value=5_000_000.0, initial_cash=5_000_000.0, reference_notional=5_000_000.0), account_certification=acct)
+    with pytest.raises(ValueError):  # noqa: PT011
+        validate_account_capital_coherence(data_ok, req_no_plan)
