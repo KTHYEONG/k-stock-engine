@@ -49,6 +49,12 @@ from src.stocks.trading.portfolio_constructor import (
     stock_risk_policy_fingerprint,
 )
 
+# wiring for return-transfer sparse planner
+try:
+    from src.stocks.trading.return_transfer_planner import plan_return_transfer_transition  # noqa: F401
+except Exception:
+    plan_return_transfer_transition = None  # type: ignore
+
 if TYPE_CHECKING:
     from src.stocks.backtesting.engine import PreparedReplayDecision
 

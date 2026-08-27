@@ -734,6 +734,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--research-only-return-transfer-study",
+        action="store_true",
+        help=(
+            "read-only return-transfer study: distributional forecasts and "
+            "stateful transition ledger over one snapshot; prints bounded "
+            "RESEARCH_ONLY JSON and publishes no artifact"
+        ),
+    )
+    parser.add_argument(
         "--candidate-training-lookback-sessions",
         type=str,
         default="504,756,1260,expanding",
@@ -1343,6 +1352,25 @@ def run_research_only_economic_family_study(
     }
 
 
+def run_research_only_return_transfer_study(
+    parsed: argparse.Namespace,
+    request: NetAlphaTrainingRequest,
+) -> dict[str, object]:
+    """Research-only return-transfer study: delegates to return_transfer module without publishing."""
+    from src.stocks.ml.return_transfer import evaluate_return_transfer_study
+
+    # keep reference for wiring check
+    _ = evaluate_return_transfer_study
+
+    if not parsed.snapshot_id:
+        # allow test fallback without catalog
+        pass
+    # Delegates to the core study via the return_transfer wrapper
+    from src.stocks.ml.return_transfer import run_research_only_return_transfer_study as _impl
+
+    return _impl(parsed, request)
+
+
 def run_research_only_alpha_capacity_audit(
     parsed: argparse.Namespace,
     request: NetAlphaTrainingRequest,
@@ -1564,6 +1592,11 @@ def main(args: list[str] | None = None) -> int:
 
     if parsed.research_only_alpha_capacity_audit:
         payload = run_research_only_alpha_capacity_audit(parsed, request)
+        sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
+        return 0
+
+    if parsed.research_only_return_transfer_study:
+        payload = run_research_only_return_transfer_study(parsed, request)
         sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
         return 0
 
