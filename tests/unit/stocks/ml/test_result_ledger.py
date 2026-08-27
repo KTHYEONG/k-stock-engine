@@ -1228,3 +1228,37 @@ def test_hedge_grid_ledger_surface() -> None:
         {"growth_route": {"version": "v1", "hedge_sleeve_projection": {}}}
     )
     assert "admissible_leverages" not in bare["hedge_sleeve"]
+
+def test_SCENARIO_SMALL_ACCOUNT_CAGR_05_LEDGER_BOUNDED(tmp_path):
+    """SCENARIO_SMALL_ACCOUNT_CAGR_05_LEDGER_BOUNDED"""
+    import json
+    from src.stocks.ml.result_ledger import _compact_growth_route, MAX_RECORD_BYTES, _encode
+    from src.stocks.ml.training import _growth_route_projection
+    from src.stocks.ml.horizons import GrowthRouteEvidence
+    from src.stocks.ml.contracts import CompoundingCertificationSettings, AccountCertificationSettings
+    from src.stocks.research.metrics import certify_growth_route
+    settings = CompoundingCertificationSettings(annualization_sessions=252, min_observed_sessions=252, min_active_cohort_fraction=0.2, max_drawdown=0.5, bootstrap_alpha=0.05, bootstrap_resamples=200, seed=42)
+    route = GrowthRouteEvidence(base_log_growth=(0.002,)*252, stress_log_growth=(0.002,)*252, segment_ids=(0,)*252, selected_policies=((10,5,20,"lower_bound_only"),), interval_policies=((10,5,20,"lower_bound_only"),)*252, benchmark_log_growth=(0.0005,)*252, candidate_count=1, observed_interval_count=252, invested_interval_count=60, filled_orders=10)
+    acct = AccountCertificationSettings(account_capital_krw=5_000_000.0)
+    cert = certify_growth_route(route, 10, settings, minimum_lower_cagr=0.30, max_drawdown=0.25)
+    proj = _growth_route_projection(route, cert, account_certification=acct)
+    compact = _compact_growth_route({"growth_route": proj})
+    assert "account_basis" in compact
+    assert compact["account_basis"] == 5_000_000.0
+    assert compact["account_target"] == 0.30
+    assert "account_max_drawdown" in compact
+    assert compact["account_max_drawdown"] == 0.25
+    assert "account_base_lower_cagr" in compact
+    assert "account_stress_lower_cagr" in compact
+    assert "account_mdd" in compact
+    # verdict present
+    assert "account_passed" in compact
+    # bounded scalars fit 24,576-byte limit and no raw orders/returns
+    encoded = _encode(compact)
+    assert len(encoded) <= MAX_RECORD_BYTES
+    assert len(encoded) <= 24576
+    dumped = json.dumps(compact)
+    assert "base_log_growth" not in dumped
+    assert "stress_log_growth" not in dumped
+    assert "orders" not in dumped.lower() or "filled_orders" in dumped  # filled_orders is allowed scalar
+    assert "returns" not in dumped or "period_net_returns" not in dumped
