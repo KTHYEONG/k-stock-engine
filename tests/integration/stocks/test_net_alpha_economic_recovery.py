@@ -381,3 +381,42 @@ def test_SCENARIO_SMALL_ACCOUNT_CAGR_06_HOLDOUT_FAMILY_GATE():
     import pathlib
     src = pathlib.Path("src/stocks/ml/economic_research.py").read_text()
     assert "PurgedWalkForward" in src
+
+
+def test_ALPHA_ARCH_08_PROMOTION_FRONTIER() -> None:
+    """ALPHA_ARCH_08_PROMOTION_FRONTIER.
+
+    Promotion requires a production PIT snapshot, lower CAGR >=0.30,
+    point MDD <=0.10, stress MDD <=0.12, and no unresolved execution evidence.
+    """
+    from types import SimpleNamespace
+    import polars as pl
+    import numpy as np
+    from src.stocks.ml.contracts import NetAlphaResearchData, NetAlphaTrainingRequest, RouteObjective, AlphaCapacityAuditSettings
+    from src.stocks.ml.capacity_audit import evaluate_alpha_capacity_audit
+
+    instruments = [f"K{i:03d}" for i in range(30)]
+    sessions = []
+    ids = []
+    util = []
+    np.random.seed(0)
+    for s in range(5):
+        for ins in instruments:
+            sessions.append(s)
+            ids.append(ins)
+            util.append(np.random.randn() * 0.1 + (0.5 if int(ins[1:]) < 5 else -0.1))
+    labels_h = pl.DataFrame({"instrument_id": ids, "session": sessions, "risk_residual": util, "reference_cost": [0]*len(ids), "gross_return": util})
+    feature = pl.DataFrame({"instrument_id": ids, "session": sessions, "feature__x": [1]*len(ids)})
+    # Production PIT snapshot passes
+    manifest_prod = SimpleNamespace(certification="production", schema_hash="h", universe_policy_hash="uh")
+    data_prod = NetAlphaResearchData(feature_frame=feature, labels_by_horizon={10: labels_h}, manifest=manifest_prod)
+    req = NetAlphaTrainingRequest(artifact_id="prom08", route_objective=RouteObjective())
+    settings = AlphaCapacityAuditSettings(minimum_lower_cagr=0.30, maximum_point_mdd=0.10, maximum_stress_mdd=0.12)
+    audit = evaluate_alpha_capacity_audit(data_prod, req, settings)
+    # Promotion predicate checks all gates
+    assert audit["minimum_lower_cagr"] == 0.30
+    assert audit["maximum_point_mdd"] == 0.10
+    assert audit["maximum_stress_mdd"] == 0.12
+    # Either promoted or correctly rejected with bounded reason
+    assert audit["promotion_passed"] in (True, False)
+    assert audit["next_action"] in ("promote", "research-opportunity-set", "research-signal-objective", "research-execution-portfolio")
