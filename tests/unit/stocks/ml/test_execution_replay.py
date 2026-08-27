@@ -1051,3 +1051,31 @@ def test_SCENARIO_SMALL_ACCOUNT_CAGR_04_INTEGER_REPLAY_BASIS():
     # Dummy evidence that integer quantities remain integer after any scaling (no scalar rescaling)
     quantities = [10, 20, 30]
     assert all(isinstance(q, int) for q in quantities)
+
+def test_SCENARIO_SMALL_ACCOUNT_LOT_05_CAUSAL_BUFFER():
+    """SCENARIO_SMALL_ACCOUNT_LOT_05_CAUSAL_BUFFER"""
+    import polars as pl
+    from datetime import UTC, datetime, timedelta
+    from src.stocks.trading.portfolio_constructor import derive_causal_open_gap_buffer_bps
+    import pytest
+    base = datetime(2024,1,1,tzinfo=UTC)
+    rows=[]
+    for i in range(5):
+        session = base + timedelta(days=i)
+        rows.append({"instrument_id":"KRX:000001","session":session,"open":100.0+i,"close":100.0+i,"available_time":session})
+    frame = pl.DataFrame(rows)
+    cutoff = base + timedelta(days=3)
+    bps, cnt = derive_causal_open_gap_buffer_bps(frame, cutoff=cutoff, quantile=0.95)
+    cnt_before = cnt
+    bps_before = bps
+    # Append extreme gap at cutoff
+    extra = pl.DataFrame([{"instrument_id":"KRX:000001","session":cutoff,"open":500.0,"close":500.0,"available_time":cutoff}])
+    frame2 = pl.concat([frame, extra])
+    bps2, cnt2 = derive_causal_open_gap_buffer_bps(frame2, cutoff=cutoff, quantile=0.95)
+    assert bps2 == bps_before
+    assert cnt2 == cnt_before
+    # no eligible gap -> dropout
+    empty_frame = pl.DataFrame([{"instrument_id":"KRX:000001","session":base,"open":100.0,"close":100.0,"available_time":base}])
+    # cutoff before any gap can be computed (needs prev close)
+    with pytest.raises(ValueError, match="no-causal-open-gap-buffer"):
+        derive_causal_open_gap_buffer_bps(empty_frame, cutoff=base, quantile=0.95)

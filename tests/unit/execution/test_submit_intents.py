@@ -179,3 +179,22 @@ def paper_positions(quantity: float):
         unsettled_cash=0.0,
         positions=(Position(instrument=instrument, quantity=quantity, average_cost=5_000.0),),
     )
+
+def test_SCENARIO_SMALL_ACCOUNT_LOT_04_LIVE_LOT_REJECTION():
+    """SCENARIO_SMALL_ACCOUNT_LOT_04_LIVE_LOT_REJECTION"""
+    from src.execution.domain.intents import TradeIntent
+    from src.core.instruments import AssetKind
+    from src.execution.application.submit_intents import plan_order_request
+    from datetime import UTC, datetime
+    import pytest
+    def make(qty, tv=1700):
+        return TradeIntent(intent_id='i', asset_kind=AssetKind.STOCK, instrument_id='KRX:005930', target_value=float(tv), target_quantity=qty, decision_time=datetime(2024,6,3,1,0,tzinfo=UTC), execution_time=datetime(2024,6,3,1,15,tzinfo=UTC), strategy_id='s', reason='r', idempotency_key='k', account_snapshot_id='a')
+    with pytest.raises(ValueError, match="multiple"):
+        plan_order_request(make(17, 1700), order_id='o', request_time=datetime(2024,6,3,1,15,tzinfo=UTC), reference_price=100.0, current_quantity=0, lot_size=10)
+    order = plan_order_request(make(20, 2000), order_id='o', request_time=datetime(2024,6,3,1,15,tzinfo=UTC), reference_price=100.0, current_quantity=0, lot_size=10)
+    assert order is not None
+    assert order.quantity == 20
+    order_none = plan_order_request(make(None, 1050), order_id='o', request_time=datetime(2024,6,3,1,15,tzinfo=UTC), reference_price=100.0, current_quantity=0, lot_size=10)
+    # floor(1050/100/10)*10 = 10
+    assert order_none is not None
+    assert order_none.quantity == 10
