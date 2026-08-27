@@ -72,6 +72,7 @@ class FeatureContract:
     adjustment_basis: str = ""
     stale_after_sessions: int = 0
     expected_frequency: str = ""
+    source_available_time_field: str = "available_time"
     dependency_hash: str = ""
 
     def __post_init__(self) -> None:
@@ -107,6 +108,7 @@ class FeatureContract:
             "adjustment_basis": self.adjustment_basis,
             "stale_after_sessions": self.stale_after_sessions,
             "expected_frequency": self.expected_frequency,
+            "source_available_time_field": self.source_available_time_field,
             "dependency_hash": self.dependency_hash,
         }
 
@@ -123,7 +125,8 @@ def feature_dependency_hash(fields: Mapping[str, object]) -> str:
         f"{','.join(str(v) for v in _as_sequence(payload['source_dataset_ids']))}:"
         f"{','.join(str(v) for v in _as_sequence(payload['source_columns']))}:"
         f"{payload['formula_id']}:{payload['adjustment_basis']}:"
-        f"{payload['stale_after_sessions']}:{payload['expected_frequency']}".encode()
+        f"{payload['stale_after_sessions']}:{payload['expected_frequency']}:"
+        f"{payload.get('source_available_time_field', 'available_time')}".encode()
     ).hexdigest()
 
 
@@ -153,6 +156,7 @@ def make_feature_contract(
     adjustment_basis: str = "",
     stale_after_sessions: int = 0,
     expected_frequency: str = "",
+    source_available_time_field: str = "available_time",
 ) -> FeatureContract:
     """Build a contract with a deterministic dependency hash."""
     fields = {
@@ -171,6 +175,7 @@ def make_feature_contract(
         "adjustment_basis": adjustment_basis,
         "stale_after_sessions": stale_after_sessions,
         "expected_frequency": expected_frequency,
+        "source_available_time_field": source_available_time_field,
     }
     dependency_hash = feature_dependency_hash(fields)
     return FeatureContract(
@@ -189,6 +194,7 @@ def make_feature_contract(
         adjustment_basis=adjustment_basis,
         stale_after_sessions=stale_after_sessions,
         expected_frequency=expected_frequency,
+        source_available_time_field=source_available_time_field,
         dependency_hash=dependency_hash,
     )
 
@@ -259,6 +265,7 @@ def semantic_feature_contract_book(
             adjustment_basis=str(entry["adjustment_basis"]),
             stale_after_sessions=int(str(entry["stale_after_sessions"])),
             expected_frequency=str(entry["expected_frequency"]),
+            source_available_time_field=str(entry.get("source_available_time_field", "available_time")),
         )
         for entry in features
     )
@@ -332,6 +339,7 @@ def contracts_from_json(payload: list[dict[str, object]]) -> tuple[FeatureContra
                 adjustment_basis=str(raw.get("adjustment_basis", "")),
                 stale_after_sessions=int(str(raw.get("stale_after_sessions", 0))),
                 expected_frequency=str(raw.get("expected_frequency", "")),
+                source_available_time_field=str(raw.get("source_available_time_field", "available_time")),
                 dependency_hash=str(raw.get("dependency_hash", "")),
             )
         )
