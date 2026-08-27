@@ -563,6 +563,9 @@ def certify_growth_route(
     route: GrowthRouteEvidence,
     horizon_sessions: int,
     settings: CompoundingCertificationSettings,
+    *,
+    minimum_lower_cagr: float = 0.0,
+    max_drawdown: float | None = None,
 ) -> dict[str, object]:
     """Certify a stitched growth route under absolute and relative growth gates.
 
@@ -671,8 +674,14 @@ def certify_growth_route(
         reasons.append("non-positive-base-lower-cagr")
     if not math.isfinite(stress_lower_cagr) or stress_lower_cagr <= 0.0:
         reasons.append("non-positive-stress-lower-cagr")
-    if mdd > settings.max_drawdown:
+    effective_max_drawdown = max_drawdown if max_drawdown is not None else settings.max_drawdown
+    if mdd > effective_max_drawdown:
         reasons.append("max-drawdown-exceeded")
+    if math.isfinite(minimum_lower_cagr) and minimum_lower_cagr > 0.0:
+        if not math.isfinite(base_lower_cagr) or base_lower_cagr < minimum_lower_cagr:
+            reasons.append("base-lower-cagr-below-target")
+        if not math.isfinite(stress_lower_cagr) or stress_lower_cagr < minimum_lower_cagr:
+            reasons.append("stress-lower-cagr-below-target")
 
     matched_lower_excess: float | None = None
     if benchmark_log.size != base_log.size or benchmark_log.size == 0:

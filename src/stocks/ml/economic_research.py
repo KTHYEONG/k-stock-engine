@@ -1305,9 +1305,17 @@ class _FamilyState:
                 if route.selected_policies and route.selected_policies[-1] is not None
                 else self.evidence[0].horizon_sessions
             )
-            certified = certify_growth_route(route, primary, request.compounding)
+            _acct = request.account_certification
+            # Wiring: certify_growth_route - certified = certify_growth_route(route, primary, request.compounding) - family-study certificate uses the same account minimum_lower_cagr and max_drawdown resolved from the request
+            certified = certify_growth_route(
+                route,
+                primary,
+                request.compounding,
+                minimum_lower_cagr=float(_acct.minimum_lower_cagr) if _acct is not None else 0.0,
+                max_drawdown=float(_acct.max_drawdown) if _acct is not None else None,
+            )
             certificate = dict(certified)
-            projection = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary, capital_plan_settings=request.capital_plan)  # noqa: E501
+            projection = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary, capital_plan_settings=request.capital_plan, account_certification=request.account_certification)  # noqa: E501
         qualified = bool(
             self.any_tail_ok
             and certificate is not None
