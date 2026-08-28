@@ -454,6 +454,8 @@ def publish_partitioned_net_alpha_label_dataset(
         "generated_time": generated_time.isoformat(),
         "label_algorithm_version": NET_ALPHA_ALGORITHM_VERSION,
     }
+    if reference_notional is not None:
+        content_manifest["reference_notional"] = reference_notional
     if corporate_actions_hash is not None:
         content_manifest["corporate_actions_hash"] = corporate_actions_hash
     store = ParquetDatasetStore(Path(destination_root))
