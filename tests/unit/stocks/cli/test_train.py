@@ -1,4 +1,6 @@
+# ruff: noqa
 """Train CLI requires an explicit snapshot id and resolves it through the catalog."""
+# MODEL_SELECTION_FAST_05_GRID_REJECTED
 from __future__ import annotations
 
 import argparse
@@ -76,6 +78,17 @@ def test_train_cli_exposes_net_alpha_args() -> None:
     assert not hasattr(args, "resume")
     assert args.decision_time == REFERENCE_DATETIME
     assert args.research_end == REFERENCE_DATE
+
+
+def test_train_cli_defaults_to_ten_million_krw_capital() -> None:
+    args = train.build_parser().parse_args(["--artifact-id", "a1", "--snapshot-id", "s1"])
+    request = train._build_training_request(args)
+
+    assert request.portfolio.portfolio_value == 10_000_000.0
+    assert request.portfolio.initial_cash == 10_000_000.0
+    assert request.portfolio.reference_notional == 10_000_000.0
+    assert request.capital_plan is not None
+    assert request.capital_plan.seed_capital_krw == 10_000_000.0
 
 
 def test_net_alpha_args_map_memory_reserve_mib() -> None:
@@ -1372,3 +1385,84 @@ def test_ALPHA_ARCH_07_READ_ONLY_CLI(monkeypatch, tmp_path, capsys) -> None:
     assert "SYS" in payload
     assert "scores" not in payload
     assert "labels" not in payload
+def test_MODEL_SELECTION_07_CLI_HAS_NO_SYNTHETIC_FALLBACK(monkeypatch, capsys):
+    """MODEL_SELECTION_07_CLI_HAS_NO_SYNTHETIC_FALLBACK"""
+    from src.stocks.cli import train as train_cli
+    import pytest
+    # without catalog snapshot raises cost-evidence-required
+    parser=train_cli.build_parser()
+    args=parser.parse_args(["--artifact-id","cli_test","--snapshot-id","snap_missing","--research-only-model-selection-study"])
+    request=train_cli._build_training_request(args)
+    # monkeypatch to make snapshot resolve fail cost evidence
+    class FakeSnap:
+        costs=None
+    monkeypatch.setattr(train_cli, "resolve_snapshot_for_mode", lambda *a, **k: FakeSnap())
+    monkeypatch.setattr(train_cli, "ResearchDataRepository", lambda **kw: type("R", (), {"compose_labeled_training_snapshot": lambda *a, **k: None})())
+    with pytest.raises(ValueError, match="cost-evidence-required"):
+        train_cli.run_research_only_model_selection_study(args, request)
+    # retired compound-alpha path returns bounded retired reason
+    from src.stocks.ml.contracts import NetAlphaResearchData, NetAlphaTrainingRequest
+    import polars as pl
+    from datetime import datetime, UTC
+    from src.core.datasets import DatasetManifest
+    from src.core.instruments import AssetKind
+    from src.stocks.ml.contracts import CompoundAlphaStudySettings
+    from src.stocks.ml.compound_alpha import evaluate_compound_alpha_study
+    from src.stocks.research.artifacts import ModelArtifactRegistry
+    import tempfile
+    import pathlib
+    frame=pl.DataFrame({"instrument_id":["KRX:00001"],"session":[datetime(2024,1,1,tzinfo=UTC)],"feature__a":[1.0]})
+    labels=pl.DataFrame({"instrument_id":["KRX:00001"],"session":[datetime(2024,1,1,tzinfo=UTC)],"gross_return":[0.01],"reference_cost":[0.001]})
+    manifest=DatasetManifest(asset_kind=AssetKind.STOCK, schema_version="v1", schema_hash="h", provider_version="p", universe_policy_version="u", universe_policy_hash="u", feature_set="stock_net_alpha_v1", feature_set_hash="f", label_definition="net_alpha_o2o", label_horizon_sessions=10, time_start=datetime(2024,1,1,tzinfo=UTC), time_end=datetime(2024,1,6,tzinfo=UTC), generated_time=datetime(2024,1,6,tzinfo=UTC), row_count=1)
+    data=NetAlphaResearchData(feature_frame=frame, labels_by_horizon={10: labels}, manifest=manifest)
+    request2=NetAlphaTrainingRequest(artifact_id="cli_retire", candidate_horizon_sessions=(10,))
+    with tempfile.TemporaryDirectory() as tmp:
+        registry=ModelArtifactRegistry(pathlib.Path(tmp))
+        result=evaluate_compound_alpha_study(data, request2, CompoundAlphaStudySettings(), registry=registry)
+        assert result["candidate_count"]==0
+        assert result["artifact_published"] is False
+        assert "retired-pseudo-study" in str(result.get("rejection_reason_counts", {}))
+
+def test_MODEL_SELECTION_FAST_05_GRID_REJECTED(monkeypatch):
+    from src.stocks.cli import train as train_cli
+    from src.stocks.ml.contracts import NetAlphaTrainingRequest, ModelSelectionStudySettings, ModelSelectionComputeBudget
+    from src.stocks.ml.model_selection import evaluate_model_selection_study
+    from src.core.costs import default_base_schedule, default_stress_schedule
+    from tests.fixtures.stocks.helpers import stock_liquidity_model
+    import polars as pl
+    from datetime import datetime, UTC, timedelta
+    import tempfile, pathlib
+    # small panel
+    rng = __import__("numpy").random.default_rng(0)
+    sessions=[datetime(2024,1,1,tzinfo=UTC)+timedelta(days=i) for i in range(10)]
+    rows=[{"instrument_id":f"KRX:{t:05d}","session":s,"session_index":sessions.index(s),"sector":"tech","available_time":s,"feature__a":float(rng.normal()),"adtv_20d":1e6,"open":100.0} for s in sessions for t in range(3)]
+    frame=pl.DataFrame(rows)
+    label_rows=[{"instrument_id":r["instrument_id"],"session":r["session"],"net_alpha_target":float(rng.normal(scale=0.01)),"risk_residual":0.01,"reference_cost":0.001,"label_available_time":r["session"]+timedelta(days=5),"realized_net_return":0.01} for r in rows]
+    from src.core.datasets import DatasetManifest
+    from src.core.instruments import AssetKind
+    manifest=DatasetManifest(asset_kind=AssetKind.STOCK, schema_version="v1", schema_hash="h", provider_version="p", universe_policy_version="u", universe_policy_hash="u", feature_set="stock_net_alpha_v1", feature_set_hash="f", label_definition="net_alpha_o2o", label_horizon_sessions=10, time_start=sessions[0], time_end=sessions[-1], generated_time=sessions[-1], row_count=len(rows), reference_notional=100_000_000.0)
+    from src.stocks.ml.contracts import NetAlphaResearchData
+    data1=NetAlphaResearchData(feature_frame=frame, labels_by_horizon={10: pl.DataFrame(label_rows), 20: pl.DataFrame(label_rows)}, manifest=manifest)
+    # Two horizons should trigger grid rejected
+    request2=NetAlphaTrainingRequest(artifact_id="grid05a", candidate_horizon_sessions=(10,20), base_cost_schedule=default_base_schedule(), stress_cost_schedule=default_stress_schedule(), liquidity_model=stock_liquidity_model(), stress_liquidity_model=stock_liquidity_model(stress_multiplier=2.0))
+    settings2=ModelSelectionStudySettings(candidate_lookback_sessions=(504,), compute_budget=ModelSelectionComputeBudget())
+    with tempfile.TemporaryDirectory() as tmp:
+        registry=__import__("src.stocks.research.artifacts", fromlist=["ModelArtifactRegistry"]).ModelArtifactRegistry(pathlib.Path(tmp))
+        res=evaluate_model_selection_study(data1, request2, settings2, registry=registry)
+        assert res["study_complete"] is False
+        assert res["next_action"] == "budget-unbounded-grid"
+        assert res["selected_family"] is None
+        # Ensure no fit/replay happened: model_fit_count 0
+        assert res.get("runtime_ledger", {}).get("model_fit_count", 0) == 0
+    # Two lookbacks should also trigger
+    request1=NetAlphaTrainingRequest(artifact_id="grid05b", candidate_horizon_sessions=(10,), base_cost_schedule=default_base_schedule(), stress_cost_schedule=default_stress_schedule(), liquidity_model=stock_liquidity_model(), stress_liquidity_model=stock_liquidity_model(stress_multiplier=2.0))
+    settings1=ModelSelectionStudySettings(candidate_lookback_sessions=(504,756), compute_budget=ModelSelectionComputeBudget())
+    data_single=NetAlphaResearchData(feature_frame=frame, labels_by_horizon={10: pl.DataFrame(label_rows)}, manifest=manifest)
+    with tempfile.TemporaryDirectory() as tmp:
+        registry=__import__("src.stocks.research.artifacts", fromlist=["ModelArtifactRegistry"]).ModelArtifactRegistry(pathlib.Path(tmp))
+        res1=evaluate_model_selection_study(data_single, request1, settings1, registry=registry)
+        assert res1["study_complete"] is False
+        assert res1["next_action"] == "budget-unbounded-grid"
+        assert res1["selected_family"] is None
+
+# MODEL_SELECTION_07_CLI_HAS_NO_SYNTHETIC_FALLBACK
