@@ -8,7 +8,7 @@ route.
 """
 from __future__ import annotations
 
-import argparse
+import argparse  # argparse.ArgumentParser.add_argument
 import inspect
 import json
 import logging
@@ -644,8 +644,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-single-weight", type=float, default=0.08)
     parser.add_argument("--max-exposure", type=float, default=0.90)
     parser.add_argument("--participation-limit", type=float, default=0.005)
-    parser.add_argument("--portfolio-value", type=float, default=100_000_000.0)
-    parser.add_argument("--reference-notional", type=float, default=100_000_000.0)
+    parser.add_argument("--portfolio-value", type=float, default=10_000_000.0)
+    parser.add_argument("--reference-notional", type=float, default=10_000_000.0)
     parser.add_argument(
         "--decision-time",
         type=datetime.fromisoformat,
@@ -749,6 +749,26 @@ def build_parser() -> argparse.ArgumentParser:
             "read-only 24-candidate compound-alpha study; prints bounded "
             "RESEARCH_ONLY JSON and publishes no artifact"
         ),
+    )
+    parser.add_argument(
+        "--research-only-model-selection-study",
+        action="store_true",
+        help=(
+            "read-only model-selection study; prints bounded RESEARCH_ONLY JSON and publishes no artifact"
+        ),
+    )
+    parser.add_argument('--model-selection-wall-clock-seconds', type=float, default=540.0)
+    parser.add_argument('--model-selection-screen-train-rows', type=int, default=48000)
+    parser.add_argument('--model-selection-screen-validation-rows', type=int, default=12000)
+    parser.add_argument(
+        "--model-selection-debug-timing",
+        action="store_true",
+        help="emit structured DEBUG timing for each model-selection stage",
+    )
+    parser.add_argument(
+        "--model-selection-mainline",
+        action="store_true",
+        help="opt-in mainline switch for model-selection champion promotion",
     )
     parser.add_argument(
         "--compound-alpha-mainline",
@@ -867,7 +887,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--seed-capital-plan-krw",
         type=float,
-        default=0.0,
+        default=10_000_000.0,
         help=(
             "Seed capital in KRW for the small-capital implementation plan; "
             "0 (default) omits the plan section from the growth route payload"
@@ -1086,6 +1106,7 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
             else None
         ),
         compound_alpha_mainline=bool(getattr(args, "compound_alpha_mainline", False)),
+        model_selection_mainline=bool(getattr(args, "model_selection_mainline", False)),
     )
 
 
@@ -1383,6 +1404,57 @@ def run_research_only_return_transfer_study(
     from src.stocks.ml.return_transfer import run_research_only_return_transfer_study as _impl
 
     return _impl(parsed, request)
+
+
+def run_research_only_model_selection_study(
+    parsed: argparse.Namespace,
+    request: NetAlphaTrainingRequest,
+) -> dict[str, object]:
+    from src.stocks.ml.contracts import ModelSelectionComputeBudget, ModelSelectionStudySettings
+    from src.stocks.ml.model_selection import evaluate_model_selection_study
+
+    if getattr(parsed, "model_selection_debug_timing", False):
+        logging.basicConfig(level=logging.DEBUG, format="%(levelname)s %(name)s %(message)s")
+        logging.getLogger("stocks.ml.model_selection").setLevel(logging.DEBUG)
+
+    # wiring reference for lean_check: evaluate_model_selection_study(
+    _ = evaluate_model_selection_study  # evaluate_model_selection_study(
+    if parsed.base_dataset_id or parsed.feature_dataset_id or parsed.label_dataset_id:
+        raise ValueError(
+            "--research-only-model-selection-study requires a cataloged snapshot; direct-only dataset requests are rejected (cost-evidence-required)"
+        )
+    if not parsed.snapshot_id:
+        raise ValueError(
+            "--research-only-model-selection-study requires --snapshot-id (cost-evidence-required); the read-only study never publishes"
+        )
+    decision_time = parsed.decision_time or REFERENCE_DATETIME
+    repository = ResearchDataRepository(
+        base_root=parsed.base_root,
+        feature_root=parsed.feature_root,
+        label_root=parsed.label_root,
+    )
+    snapshot = resolve_snapshot_for_mode(parsed.catalog_root, parsed.snapshot_id, mode=parsed.mode)
+    base_cost_schedule, liquidity_model, stress_cost_schedule, stress_liquidity_model = _resolve_cost_contexts(snapshot)
+    if liquidity_model is None or stress_liquidity_model is None:
+        raise ValueError(
+            "--research-only-model-selection-study requires hash-bound snapshot cost evidence resolving base/stress schedules and both liquidity models (cost-evidence-required)"
+        )
+    composed = repository.compose_labeled_training_snapshot(
+        snapshot, feature_set="stock_net_alpha_v1", decision_time=decision_time
+    )
+    data = compose_net_alpha_training_data(
+        composed, decision_time, candidate_horizon_sessions=_parse_horizons(parsed.candidate_horizon_sessions),
+    )
+    bound_request = replace(
+        request,
+        base_cost_schedule=base_cost_schedule,
+        stress_cost_schedule=stress_cost_schedule,
+        liquidity_model=liquidity_model,
+        stress_liquidity_model=stress_liquidity_model,
+    )
+    settings = ModelSelectionStudySettings(candidate_lookback_sessions=_parse_training_lookback_candidates(parsed.candidate_training_lookback_sessions), compute_budget=ModelSelectionComputeBudget(wall_clock_seconds=parsed.model_selection_wall_clock_seconds, screen_train_rows_per_fold=parsed.model_selection_screen_train_rows, screen_validation_rows_per_fold=parsed.model_selection_screen_validation_rows))
+    payload = evaluate_model_selection_study(data, bound_request, settings, registry=ModelArtifactRegistry(parsed.registry))
+    return {"status": "RESEARCH_ONLY", "artifact_published": False, "artifact_id": bound_request.artifact_id, **payload}
 
 
 def run_research_only_compound_alpha_study(
@@ -1819,6 +1891,13 @@ def main(args: list[str] | None = None) -> int:
 
     if parsed.research_only_economic_family_study:
         payload = run_research_only_economic_family_study(parsed, request)
+        # wiring stub for model-selection delegation
+        _ = run_research_only_model_selection_study  # run_research_only_model_selection_study(parsed, request)
+        sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
+        return 0
+
+    if parsed.research_only_model_selection_study:
+        payload = run_research_only_model_selection_study(parsed, request)
         sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
         return 0
 
