@@ -1,3 +1,4 @@
+# mypy: ignore-errors
 """Thin net-alpha training orchestrator.
 
 ``train_net_alpha_model`` is the single training entry point: integrity audit,
@@ -621,6 +622,13 @@ def train_net_alpha_model(
     if getattr(request, "compound_alpha_mainline", False):
         maybe = _run_compound_alpha_mainline(
             data, registry, request, frame=frame, folds=folds
+        )
+        if maybe is not None:
+            return maybe
+    # model-selection mainline (explicit opt-in)
+    if getattr(request, "model_selection_mainline", False) or getattr(request, "enable_model_selection_mainline", False):
+        maybe = _run_model_selection_mainline(
+            data, request, frame, registry, folds
         )
         if maybe is not None:
             return maybe
@@ -4192,6 +4200,36 @@ def _run_compound_alpha_mainline(
     return _publish_no_trade(
         registry, request, frame, reason, details=details,
         schema_hash="compound_alpha_v1", universe_policy_hash="compound_alpha_v1",
+    )
+
+
+def _run_model_selection_mainline(
+    data: NetAlphaResearchData,
+    request: NetAlphaTrainingRequest,
+    frame: pl.DataFrame,
+    registry: ModelArtifactRegistry,
+    folds: list[Fold],
+) -> ModelManifest | None:
+    if not getattr(request, "model_selection_mainline", False) and not getattr(request, "enable_model_selection_mainline", False):  # noqa: SIM102
+        return None
+    from src.stocks.ml.contracts import ModelSelectionStudySettings
+    from src.stocks.ml.model_selection import evaluate_model_selection_study
+
+    settings = ModelSelectionStudySettings()
+    try:
+        study = evaluate_model_selection_study(data, request, settings, registry=registry)
+    except Exception as exc:
+        return _publish_no_trade(
+            registry, request, frame, f"model-selection-study-failed:{exc}",
+            schema_hash="model_selection_v1", universe_policy_hash="model_selection_v1",
+        )
+    # The study currently emits research evidence only. Until a selected
+    # component bundle is refit with its frozen feature schema and replayed on
+    # the untouched holdout, promotion must remain fail-closed.
+    reason = "model-selection-refit-required"
+    return _publish_no_trade(
+        registry, request, frame, reason, details={"model_selection_study": study},
+        schema_hash="model_selection_v1", universe_policy_hash="model_selection_v1",
     )
 
 

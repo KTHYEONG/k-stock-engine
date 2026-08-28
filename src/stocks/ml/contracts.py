@@ -563,9 +563,9 @@ class PortfolioSettings:
     max_single_weight: float = 0.08
     max_exposure: float = 0.90
     participation_limit: float = 0.005
-    portfolio_value: float = 100_000_000.0
-    initial_cash: float = 100_000_000.0
-    reference_notional: float = 100_000_000.0
+    portfolio_value: float = 10_000_000.0
+    initial_cash: float = 10_000_000.0
+    reference_notional: float = 10_000_000.0
 
     def __post_init__(self) -> None:
         if self.top_k < 1:
@@ -875,6 +875,7 @@ class NetAlphaTrainingRequest:
     account_certification: AccountCertificationSettings | None = None
     route_objective: RouteObjective = field(default_factory=RouteObjective)
     compound_alpha_mainline: bool = False
+    model_selection_mainline: bool = False
 
     def __post_init__(self) -> None:
         if not self.artifact_id:
@@ -933,6 +934,8 @@ class NetAlphaTrainingRequest:
             )
         if not isinstance(self.compound_alpha_mainline, bool):
             raise ValueError("compound_alpha_mainline must be bool")
+        if not isinstance(self.model_selection_mainline, bool):
+            raise ValueError("model_selection_mainline must be bool")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1323,6 +1326,216 @@ class EconomicFamilyStudySettings:
                 f"unknown model families {unknown}; declared families are "
                 f"{DECLARED_ECONOMIC_FAMILIES}"
             )
+
+
+class ModelFamily(StrEnum):
+    elastic_net_v2 = "elastic_net_v2"
+    huber_linear_v1 = "huber_linear_v1"
+    extra_trees_v1 = "extra_trees_v1"
+    hist_gradient_quantile_v1 = "hist_gradient_quantile_v1"
+    rawnet_lgbm_v2 = "rawnet_lgbm_v2"
+    tail_lambdarank_v2 = "tail_lambdarank_v2"
+
+
+DECLARED_MODEL_SELECTION_FAMILIES: tuple[str, ...] = (
+    ModelFamily.elastic_net_v2.value,
+    ModelFamily.huber_linear_v1.value,
+    ModelFamily.extra_trees_v1.value,
+    ModelFamily.hist_gradient_quantile_v1.value,
+    ModelFamily.rawnet_lgbm_v2.value,
+    ModelFamily.tail_lambdarank_v2.value,
+)
+DEFAULT_MODEL_SELECTION_FAMILIES: tuple[ModelFamily, ...] = (
+    ModelFamily.elastic_net_v2,
+    ModelFamily.huber_linear_v1,
+    ModelFamily.extra_trees_v1,
+    ModelFamily.hist_gradient_quantile_v1,
+    ModelFamily.rawnet_lgbm_v2,
+    ModelFamily.tail_lambdarank_v2,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ModelSelectionComputeBudget:
+    wall_clock_seconds: float = 540.0
+    screen_phase_seconds: float = 180.0
+    screen_train_rows_per_fold: int = 48000
+    screen_validation_rows_per_fold: int = 12000
+    max_full_replay_families: int = 2
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(float(self.wall_clock_seconds)) or float(self.wall_clock_seconds) <= 0:
+            raise ValueError("wall_clock_seconds must be finite positive")
+        if not math.isfinite(float(self.screen_phase_seconds)) or float(self.screen_phase_seconds) <= 0:
+            raise ValueError("screen_phase_seconds must be finite positive")
+        if float(self.screen_phase_seconds) > float(self.wall_clock_seconds):
+            object.__setattr__(self, "screen_phase_seconds", float(self.wall_clock_seconds))
+        if self.screen_train_rows_per_fold < 1:
+            raise ValueError("screen_train_rows_per_fold must be positive")
+        if self.screen_validation_rows_per_fold < 1:
+            raise ValueError("screen_validation_rows_per_fold must be positive")
+        if self.max_full_replay_families < 1:
+            raise ValueError("max_full_replay_families must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class FamilyScreenEvidence:
+    family: ModelFamily
+    screen_lower_bound: float
+    screen_se: float
+    attribution: FeatureAttributionEvidence
+    qualified_for_full_oof: bool = False
+    selected_family: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.family, ModelFamily):
+            try:
+                object.__setattr__(self, "family", ModelFamily(str(self.family)))
+            except ValueError as exc:
+                raise ValueError(f"unknown ModelFamily {self.family!r}") from exc
+        if not math.isfinite(float(self.screen_lower_bound)):
+            raise ValueError("screen_lower_bound must be finite")
+        if not math.isfinite(float(self.screen_se)) or float(self.screen_se) < 0:
+            raise ValueError("screen_se must be finite non-negative")
+        if not isinstance(self.attribution, FeatureAttributionEvidence):
+            raise ValueError("attribution must be FeatureAttributionEvidence")
+        if not isinstance(self.qualified_for_full_oof, bool):
+            raise ValueError("qualified_for_full_oof must be bool")
+        if not isinstance(self.selected_family, bool):
+            raise ValueError("selected_family must be bool")
+
+
+@dataclass(frozen=True, slots=True)
+class ModelSelectionStudySettings:
+    candidate_families: tuple[ModelFamily, ...] = DEFAULT_MODEL_SELECTION_FAMILIES
+    candidate_lookback_sessions: tuple[int | None, ...] = (504, 756, 1260, None)
+    common_min_train_sessions: int = 1260
+    min_validation_segment_sessions: int = 126
+    allow_ensemble: bool = True
+    compute_budget: ModelSelectionComputeBudget = field(default_factory=ModelSelectionComputeBudget)
+
+    def __post_init__(self) -> None:
+        if not self.candidate_families:
+            raise ValueError("candidate_families must be non-empty")
+        if len(set(self.candidate_families)) != len(self.candidate_families):
+            raise ValueError("candidate_families must be unique")
+        # exactly six in deterministic order; reject duplicate boosters and xgboost aliases
+        if tuple(self.candidate_families) != DEFAULT_MODEL_SELECTION_FAMILIES:
+            # check for unknown / xgboost alias
+            for fam in self.candidate_families:
+                # normalize to string for alias detection
+                val = str(fam).lower()
+                if "xgboost" in val or "xgb" in val:
+                    raise ValueError(f"xgboost family {fam!r} is not permitted: no independent boosted-tree hypothesis")
+                if fam not in DEFAULT_MODEL_SELECTION_FAMILIES:
+                    raise ValueError(f"unknown model family {fam!r}; declared families are {DECLARED_MODEL_SELECTION_FAMILIES}")
+            raise ValueError(
+                f"candidate_families must be exactly {DECLARED_MODEL_SELECTION_FAMILIES} in order; got {tuple(str(v) for v in self.candidate_families)}"
+            )
+        if not self.candidate_lookback_sessions:
+            raise ValueError("candidate_lookback_sessions must be non-empty")
+        finite = [v for v in self.candidate_lookback_sessions if v is not None]
+        if any(v is not None and v < 1 for v in self.candidate_lookback_sessions):
+            raise ValueError("finite candidate lookbacks must be positive sessions")
+        if len(set(finite)) != len(finite) or list(finite) != sorted(finite):
+            raise ValueError("finite candidate lookbacks must be strictly ascending and unique")
+        if any(v is None for v in tuple(self.candidate_lookback_sessions)[:-1]):
+            raise ValueError("expanding (None) is only permitted in the final position")
+        if self.common_min_train_sessions < 1:
+            raise ValueError("common_min_train_sessions must be positive")
+        if self.min_validation_segment_sessions < 1:
+            raise ValueError("min_validation_segment_sessions must be positive")
+        if finite and self.common_min_train_sessions < max(finite):
+            raise ValueError(
+                "common_min_train_sessions must be at least the maximum finite candidate lookback"
+            )
+        if not isinstance(self.allow_ensemble, bool):
+            raise ValueError("allow_ensemble must be bool")
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureAttributionEvidence:
+    family: ModelFamily
+    fold_id: int
+    source_group_scores: tuple[tuple[str, float], ...]
+    selected_source_groups: tuple[str, ...]
+    schema_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.family, ModelFamily):
+            try:
+                object.__setattr__(self, "family", ModelFamily(str(self.family)))
+            except ValueError as exc:
+                raise ValueError(f"unknown ModelFamily {self.family!r}") from exc
+        if self.fold_id < 0:
+            raise ValueError("fold_id must be non-negative")
+        if not self.schema_fingerprint:
+            raise ValueError("schema_fingerprint must be non-empty")
+        # scores must be finite
+        for name, score in self.source_group_scores:
+            if not name:
+                raise ValueError("source group name must be non-empty")
+            if not math.isfinite(float(score)):
+                raise ValueError(f"source group score for {name!r} must be finite")
+        # selected must be subset of declared groups and non-empty when scores non-empty
+        score_names = {n for n, _ in self.source_group_scores}
+        for sel in self.selected_source_groups:
+            if sel not in score_names:
+                raise ValueError(f"selected group {sel!r} not in source_group_scores")
+        if len(set(self.selected_source_groups)) != len(self.selected_source_groups):
+            raise ValueError("selected_source_groups must be unique")
+
+
+@dataclass(frozen=True, slots=True)
+class ModelSelectionCandidate:
+    candidate_id: str
+    family: ModelFamily
+    horizon_sessions: int
+    selected_source_groups: tuple[str, ...]
+    oof_fingerprint: str
+    attribution: tuple[FeatureAttributionEvidence, ...]
+
+    def __post_init__(self) -> None:
+        if not self.candidate_id:
+            raise ValueError("candidate_id must be non-empty")
+        if not isinstance(self.family, ModelFamily):
+            try:
+                object.__setattr__(self, "family", ModelFamily(str(self.family)))
+            except ValueError as exc:
+                raise ValueError(f"unknown ModelFamily {self.family!r}") from exc
+        if self.horizon_sessions < 1:
+            raise ValueError("horizon_sessions must be positive")
+        if not self.oof_fingerprint:
+            raise ValueError("oof_fingerprint must be non-empty")
+        if not self.attribution:
+            raise ValueError("attribution must be non-empty")
+
+
+@dataclass(frozen=True, slots=True)
+class SelectedModelPolicy:
+    component_candidate_ids: tuple[str, ...]
+    weights: tuple[float, ...]
+    selection_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if not self.component_candidate_ids:
+            raise ValueError("component_candidate_ids must be non-empty")
+        if len(self.component_candidate_ids) != len(self.weights):
+            raise ValueError("component_candidate_ids and weights must be same length")
+        if len(set(self.component_candidate_ids)) != len(self.component_candidate_ids):
+            raise ValueError("component_candidate_ids must be unique")
+        if tuple(self.component_candidate_ids) != tuple(sorted(self.component_candidate_ids)):
+            raise ValueError("component_candidate_ids must be deterministically sorted")
+        for w in self.weights:
+            if not math.isfinite(float(w)) or float(w) < 0.0:
+                raise ValueError(f"ensemble weight {w!r} must be finite non-negative")
+        total = float(sum(float(w) for w in self.weights))
+        if not math.isfinite(total) or abs(total - 1.0) > 1e-9:
+            raise ValueError(f"ensemble weights must sum to 1.0, got {total!r}")
+        if not self.selection_fingerprint:
+            raise ValueError("selection_fingerprint must be non-empty")
+        if len(self.component_candidate_ids) < 2:
+            raise ValueError("ensemble must have at least two components")
 
 
 COMPOUND_ALPHA_EXPERIMENT_IDS: tuple[str, ...] = (

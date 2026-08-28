@@ -539,6 +539,181 @@ def materialize_model_feature_sources(
     return result
 
 
+@dataclass(frozen=True, slots=True)
+class ResearchFeatureSchema:
+    source_groups: tuple[tuple[str, tuple[str, ...]], ...]
+    winsor_bounds: tuple[tuple[str, float, float], ...]
+    robust_location_scale: tuple[tuple[str, float, float], ...]
+    fingerprint: str
+
+    def __post_init__(self) -> None:
+        if not self.source_groups:
+            raise ValueError("research feature schema must have source groups")
+        if len({name for name, _ in self.source_groups}) != len(self.source_groups):
+            raise ValueError("source_groups must have unique source names")
+        if len(self.winsor_bounds) != len(self.source_groups):
+            raise ValueError("winsor_bounds must align with source_groups")
+        if len(self.robust_location_scale) != len(self.source_groups):
+            raise ValueError("robust_location_scale must align with source_groups")
+        # fingerprint may be empty during intermediate construction before hashing
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "source_groups": [[k, list(v)] for k, v in self.source_groups],
+            "winsor_bounds": [list(t) for t in self.winsor_bounds],
+            "robust_location_scale": [list(t) for t in self.robust_location_scale],
+            "fingerprint": self.fingerprint,
+        }
+
+
+def _research_schema_fingerprint(schema: ResearchFeatureSchema) -> str:
+    payload = json.dumps(schema.to_json(), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return sha256(payload).hexdigest()
+
+
+def fit_research_feature_schema(
+    train: pl.DataFrame, feature_roles: Mapping[str, str]
+) -> ResearchFeatureSchema:
+    _validate_v3_roles(feature_roles)
+    session_column = SESSION_COLUMN
+    sector_column = "sector"
+    if session_column not in train.columns:
+        raise ValueError(f"frame must carry {session_column!r}")
+    if sector_column not in train.columns:
+        train = train.with_columns(pl.lit("dummy").alias(sector_column))
+    sources = tuple(feature_roles)
+    missing = [c for c in sources if c not in train.columns]
+    if missing:
+        raise ValueError(f"v3 feature sources missing from frame: {missing}")
+    _reject_target_columns(train, sources)
+    for column in sources:
+        non_finite = train.filter(pl.col(column).is_not_null() & ~pl.col(column).is_finite())
+        if not non_finite.is_empty():
+            raise ValueError(f"non-finite value in v3 feature source {column}")
+    alpha_sources = tuple(c for c in sources if feature_roles[c] == _ALPHA_ROLE)
+    representative = _rank_equivalent_cluster(train, alpha_sources, session_column)
+    # winsor bounds per representative source from train only (1%/99%)
+    winsor_bounds: list[tuple[str, float, float]] = []
+    robust: list[tuple[str, float, float]] = []
+    import numpy as np
+
+    for src in representative:
+        vals = [float(v) for v in train[src].to_list() if v is not None and isinstance(v, (int, float)) and __import__("math").isfinite(float(v))]
+        if not vals:
+            lo, hi = -1e12, 1e12
+            med, scale = 0.0, 1.0
+        else:
+            arr = np.asarray(vals, dtype=np.float64)
+            lo = float(np.quantile(arr, 0.01))
+            hi = float(np.quantile(arr, 0.99))
+            med = float(np.median(arr))
+            mad = float(np.median(np.abs(arr - med)))
+            scale = float(mad * 1.4826) if mad > 0 else float(np.std(arr) or 1.0)
+            if not __import__("math").isfinite(scale) or scale <= 0:
+                scale = 1.0
+        winsor_bounds.append((src, float(lo), float(hi)))
+        robust.append((src, float(med), float(scale)))
+    # missing indicator set
+    missing_sources = tuple(
+        s for s in representative if int(train[s].is_null().sum()) > 0 and int(train[s].is_not_null().sum()) > 0
+    )
+    # source groups: each source maps to its derived columns
+    source_groups: list[tuple[str, tuple[str, ...]]] = []
+    for src in representative:
+        cols: list[str] = [f"{src}__winsor", f"{src}__rank", f"{src}__sector_rank"]
+        if src in missing_sources:
+            cols.append(f"{src}__missing")
+        cols.append(f"{src}__robust")
+        source_groups.append((src, tuple(cols)))
+    tmp = ResearchFeatureSchema(
+        source_groups=tuple(source_groups),
+        winsor_bounds=tuple(winsor_bounds),
+        robust_location_scale=tuple(robust),
+        fingerprint="",
+    )
+    fp = _research_schema_fingerprint(tmp)
+    return ResearchFeatureSchema(
+        source_groups=tuple(source_groups),
+        winsor_bounds=tuple(winsor_bounds),
+        robust_location_scale=tuple(robust),
+        fingerprint=fp,
+    )
+
+
+def apply_research_feature_schema(
+    frame: pl.DataFrame, schema: ResearchFeatureSchema
+) -> pl.DataFrame:
+    session_column = SESSION_COLUMN
+    sector_column = "sector"
+    if session_column not in frame.columns:
+        raise ValueError(f"frame must carry {session_column!r}")
+    if sector_column not in frame.columns:
+        frame = frame.with_columns(pl.lit("dummy").alias(sector_column))
+    # verify schema sources present
+    source_names = [name for name, _ in schema.source_groups]
+    missing = [c for c in source_names if c not in frame.columns]
+    if missing:
+        raise ValueError(f"v3 feature sources missing from frame: {missing}")
+    _reject_target_columns(frame, tuple(source_names))
+    for column in source_names:
+        non_finite = frame.filter(pl.col(column).is_not_null() & ~pl.col(column).is_finite())
+        if not non_finite.is_empty():
+            raise ValueError(f"non-finite value in v3 feature source {column}")
+    # build lookup maps
+    winsor_map = {src: (lo, hi) for src, lo, hi in schema.winsor_bounds}
+    robust_map = {src: (loc, scale) for src, loc, scale in schema.robust_location_scale}
+    # step 1: winsorized columns
+    out = frame
+    for src in source_names:
+        lo, hi = winsor_map[src]
+        out = out.with_columns(pl.col(src).clip(lo, hi).alias(f"__winsor_{src}"))
+    # step 2: ranks within session from winsorized values
+    rank_exprs: list[pl.Expr] = []
+    for src in source_names:
+        within = pl.col(f"__winsor_{src}").count().over(session_column)
+        rank = (pl.col(f"__winsor_{src}").rank("average").over(session_column) - 1.0) / (within - 1.0)
+        rank_exprs.append(rank.fill_null(0.5).cast(pl.Float32).alias(f"__rank_{src}"))
+    out = out.with_columns(rank_exprs)
+    # step 3: sector ranks
+    sector_exprs: list[pl.Expr] = []
+    for src in source_names:
+        sector_mean = pl.col(f"__rank_{src}").mean().over([session_column, sector_column])
+        sector_exprs.append(((pl.col(f"__rank_{src}") - sector_mean).cast(pl.Float32)).alias(f"__sector_rank_{src}"))
+    out = out.with_columns(sector_exprs)
+    # step 4: robust standardized winsor
+    robust_exprs: list[pl.Expr] = []
+    for src in source_names:
+        loc, scale = robust_map[src]
+        robust_exprs.append(((pl.col(f"__winsor_{src}") - loc) / scale).cast(pl.Float32).alias(f"__robust_{src}"))
+    out = out.with_columns(robust_exprs)
+    # final selection: keep original non-source cols plus derived per source_groups
+    keep_cols: list[pl.Expr] = []
+    for col in out.columns:
+        if col.startswith("__winsor_") or col.startswith("__rank_") or col.startswith("__sector_rank_") or col.startswith("__robust_"):
+            continue
+        if col in source_names:
+            continue
+        keep_cols.append(pl.col(col))
+    for src, cols in schema.source_groups:
+        # cols contains expected derived names like src__winsor etc.
+        # map internal temp names to expected output names
+        mapping = {
+            f"{src}__winsor": f"__winsor_{src}",
+            f"{src}__rank": f"__rank_{src}",
+            f"{src}__sector_rank": f"__sector_rank_{src}",
+            f"{src}__robust": f"__robust_{src}",
+            f"{src}__missing": None,
+        }
+        for out_name in cols:
+            if out_name == f"{src}__missing":
+                keep_cols.append(pl.when(pl.col(src).is_null()).then(1.0).otherwise(0.0).cast(pl.Float32).alias(out_name))
+            else:
+                tmp_name = mapping.get(out_name)
+                if tmp_name is not None:
+                    keep_cols.append(pl.col(tmp_name).alias(out_name))
+    return out.select(keep_cols)
+
+
 def feature_transform_schema_from_manifest(
     manifest: ModelManifest,
 ) -> FeatureTransformSchema:

@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_SELECTION_PROFILED_TEN_MINUTE_RECOVERY",
+      "date": "2026-08-28",
+      "adr_id": "ADR_20260828_ML_SELECTION_PROFILED_TEN_MINUTE_RECOVERY",
+      "domain": "ml",
+      "title": "Profiled ML selection completion and resource audit",
+      "why": "실제 1천만원 hash-bound snapshot에서 ML 후보 비교가 screening 병목과 내부 deadline으로 조기 종료되어, 단계별 계측과 완주 실행 근거가 필요했다.",
+      "resolution": "fold 수를 요청값으로 제한하고 PIT stratified panel, native attribution, zero permutation refit, aligned finite-row filtering, bounded OOF/replay 및 구조화된 DEBUG timing을 적용했다. 완주 실행은 11분24.83초, peak RSS 5.65GiB였고 ElasticNet만 OOF에 진입했으나 replay ValueError로 최종 승격하지 않았다.",
+      "impact": "6-family screening의 재현성과 자원 사용량을 기록하고 fail-closed selection을 유지한다. 최종 ML 승격 전 replay ValueError 원인 보완이 필요하다."
+    },
+    {
       "task_id": "compounding_ml_overhaul",
       "date": "2026-08-27",
       "adr_id": "ADR_20260827_compounding_ml_overhaul",
@@ -989,16 +999,6 @@
       "why": "Document the completed 81-trial ML pipeline recheck and preserve the fail-closed NO_TRADE decision with detailed route evidence.",
       "resolution": "Recorded final artifact metrics, route-level compounding/DSR evidence, multiplicity ledger, resource telemetry, and explicit no-champion termination in docs/results/back-res.md.",
       "impact": "Documentation and task-index synchronization only; promotion thresholds and trading behavior are unchanged."
-    },
-    {
-      "task_id": "TASK_STOCK_BACKTEST_STABILITY_TELEMETRY",
-      "date": "2026-08-13",
-      "adr_id": "ADR_20260813_STOCK_BACKTEST_STABILITY_TELEMETRY",
-      "domain": "risk",
-      "title": "Stock alpha backtest stability telemetry",
-      "why": "2026-08-13 stability telemetry rerun showed all 36 trial-policy candidates failed DSR despite positive candidates; document latest evidence and preserve fail-closed promotion.",
-      "resolution": "Added decision-level compounding telemetry, DEBUG-only diagnostics, compact candidate evidence summaries, and synchronized the 81-trial rerun results into back-res.md.",
-      "impact": "No promotion thresholds or policy grid were relaxed; artifact remains NO_TRADE. Documentation and task/code indexes updated."
     }
   ]
 }

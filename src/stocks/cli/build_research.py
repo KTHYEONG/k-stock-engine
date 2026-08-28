@@ -90,7 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reference-notional",
         type=float,
-        default=100_000_000.0,
+        default=10_000_000.0,
         help="reference notional for the net-alpha round-trip cost",
     )
     return parser

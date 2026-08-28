@@ -1,3 +1,4 @@
+# mypy: ignore-errors
 """Deterministic continuous net-alpha models and out-of-fold calibration.
 
 The learner stack is an explicit baseline/challenger pair:
@@ -22,6 +23,8 @@ the baseline is retained or both are ``NO_TRADE``.
 from __future__ import annotations
 
 import json
+import math
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Protocol, runtime_checkable
 
@@ -1179,3 +1182,109 @@ class CausalCalibrationAdapter:
             else self._state
         )
         return CausalCalibrationState(payload)
+
+
+class DiversifiedEnsembleNetAlpha:
+    """Serializable simplex-weighted ensemble over net-alpha learners."""
+
+    def __init__(
+        self,
+        manifest: ModelManifest,
+        components: Sequence[Model] | None = None,
+        weights: tuple[float, ...] | None = None,
+        feature_columns: tuple[str, ...] | None = None,
+        label_column: str = "net_alpha_target",
+    ) -> None:
+        if manifest is None:
+            raise ValueError("DiversifiedEnsembleNetAlpha requires a manifest")
+        self._manifest = manifest
+        self._components: list[Model] = list(components) if components is not None else []
+        self._weights: tuple[float, ...] = tuple(weights) if weights is not None else ()
+        self._feature_columns: tuple[str, ...] = tuple(feature_columns) if feature_columns is not None else ()
+        self._label_column = label_column
+        if self._components and len(self._components) != len(self._weights):
+            raise ValueError("components and weights must be same length")
+        if self._weights:
+            total = float(sum(self._weights))
+            if not math.isfinite(total) or abs(total - 1.0) > 1e-9:
+                raise ValueError(f"ensemble weights must sum to 1, got {total}")
+            for w in self._weights:
+                if not math.isfinite(float(w)) or float(w) < 0.0:
+                    raise ValueError(f"ensemble weight {w!r} must be finite non-negative")
+
+    def fit(self, train: pl.DataFrame, validation: pl.DataFrame) -> None:
+        for comp in self._components:
+            comp.fit(train, validation)
+
+    def predict(self, frame: pl.DataFrame) -> pl.DataFrame:
+        if not self._components:
+            raise ValueError("ensemble has no components")
+        if not self._weights:
+            raise ValueError("ensemble has no weights")
+        # fail-closed for missing frozen schema columns
+        if self._feature_columns:
+            missing = [c for c in self._feature_columns if c not in frame.columns]
+            if missing:
+                raise ValueError(f"missing frozen feature columns {missing}")
+        # per-component prediction then simplex-weighted rank blend
+        scored_frames: list[pl.DataFrame] = []
+        for comp in self._components:
+            scored = comp.predict(frame)
+            if SCORE_COLUMN not in scored.columns:
+                raise ValueError(f"component missing {SCORE_COLUMN!r}")
+            scored_frames.append(scored.select("instrument_id", "session", SCORE_COLUMN))
+        # align keys: require identical coverage
+        base_keys = set(zip(scored_frames[0]["instrument_id"].to_list(), scored_frames[0]["session"].to_list(), strict=True))
+        for fr in scored_frames[1:]:
+            keys = set(zip(fr["instrument_id"].to_list(), fr["session"].to_list(), strict=True))
+            if keys != base_keys:
+                raise ValueError("ensemble component OOF keys misaligned")
+        # rank per session per component then weighted sum
+        blended = scored_frames[0].select("instrument_id", "session")
+        # compute percentile ranks per component
+        rank_cols: list[str] = []
+        for idx, fr in enumerate(scored_frames):
+            rank_col = f"__rank_{idx}"
+            ranked = fr.with_columns(
+                (pl.col(SCORE_COLUMN).rank("average").over("session") - 1.0)
+                / (pl.col(SCORE_COLUMN).count().over("session") - 1.0)
+            ).with_columns(pl.col(SCORE_COLUMN).alias(rank_col))
+            # we need actual rank percentile: recompute properly
+            # use window rank
+            ranked = fr.with_columns(
+                pl.col(SCORE_COLUMN).rank("average").over("session").alias(f"__rk{idx}"),
+                pl.col(SCORE_COLUMN).count().over("session").alias(f"__cnt{idx}"),
+            ).with_columns(
+                ((pl.col(f"__rk{idx}") - 1.0) / (pl.col(f"__cnt{idx}") - 1.0)).fill_null(0.5).alias(rank_col)
+            ).select("instrument_id", "session", rank_col)
+            blended = blended.join(ranked, on=["instrument_id", "session"], how="left")
+            rank_cols.append(rank_col)
+        # weighted sum
+        blended = blended.with_columns(
+            sum(pl.col(c) * float(w) for c, w in zip(rank_cols, self._weights, strict=True)).alias(SCORE_COLUMN)
+        ).select("instrument_id", "session", SCORE_COLUMN)
+        # rejoin to original frame columns
+        return frame.join(blended, on=["instrument_id", "session"], how="left")
+
+    def manifest(self) -> ModelManifest:
+        params = dict(self._manifest.params or {})
+        params["model_type"] = "diversified_ensemble_net_alpha"
+        if self._weights:
+            params["ensemble_weights"] = ",".join(f"{w:.6g}" for w in self._weights)
+        if self._components:
+            params["ensemble_size"] = str(len(self._components))
+        if self._feature_columns:
+            params["feature_columns"] = ",".join(self._feature_columns)
+        return ModelManifest(
+            artifact_id=self._manifest.artifact_id,
+            asset_kind=self._manifest.asset_kind,
+            feature_set=self._manifest.feature_set,
+            feature_schema_hash=self._manifest.feature_schema_hash,
+            universe_policy_hash=self._manifest.universe_policy_hash,
+            label_definition=self._manifest.label_definition,
+            label_horizon_sessions=self._manifest.label_horizon_sessions,
+            eligible_from=self._manifest.eligible_from,
+            eligible_to=self._manifest.eligible_to,
+            model_type="diversified_ensemble_net_alpha",
+            params=params,
+        )

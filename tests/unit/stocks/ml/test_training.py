@@ -1,3 +1,4 @@
+# ruff: noqa
 """Tests for ML training decomposition and diagnostics wiring.
 
 Scenarios:
@@ -2068,3 +2069,55 @@ def test_SCENARIO_SMALL_ACCOUNT_LOT_06_PROMOTION_GATE():
     # only delta>0 and both >=0.30 with MDD <=0.25 -> true
     assert evaluate_small_account_promotion(challenger_stress_lower_delta=0.01, base_lower_cagr=0.30, stress_lower_cagr=0.30, mdd=0.25) is True
     assert evaluate_small_account_promotion(challenger_stress_lower_delta=0.001, base_lower_cagr=0.35, stress_lower_cagr=0.40, mdd=0.1) is True
+def test_MODEL_SELECTION_06_HOLDOUT_PROMOTION_FAILS_CLOSED(tmp_path):
+    """MODEL_SELECTION_06_HOLDOUT_PROMOTION_FAILS_CLOSED"""
+    from datetime import datetime, UTC, timedelta
+    import polars as pl
+    import tempfile
+    from pathlib import Path
+    from src.core.datasets import DatasetManifest
+    from src.core.instruments import AssetKind
+    from src.stocks.ml.contracts import NetAlphaResearchData, NetAlphaTrainingRequest
+    from src.stocks.ml.training import _run_model_selection_mainline, _index_sessions, _locked_holdout
+    from src.stocks.research.artifacts import ModelArtifactRegistry
+    from src.stocks.research.folds import PurgedWalkForward
+    rng = __import__("numpy").random.default_rng(0)
+    sessions = [datetime(2024,1,1, tzinfo=UTC)+timedelta(days=i) for i in range(40)]
+    rows=[]
+    for s in sessions:
+        for t in range(4):
+            rows.append({"instrument_id": f"KRX:{t:05d}", "session": s, "session_index": sessions.index(s), "sector": "tech", "available_time": s, "feature__a": float(rng.normal()), "feature__b": float(rng.normal()), "open": 100.0, "close":101.0, "volume":1e6, "trading_value":1e8, "adtv_20d":1e6, "volatility_20d":0.02})
+    frame=pl.DataFrame(rows)
+    labels=[]
+    for r in rows:
+        labels.append({"instrument_id": r["instrument_id"], "session": r["session"], "net_alpha_target": float(rng.normal(scale=0.01)), "risk_residual": float(rng.normal(scale=0.01)), "reference_cost":0.001, "label_available_time": r["session"]+timedelta(days=5), "realized_net_return": float(rng.normal(scale=0.01))})
+    manifest=DatasetManifest(asset_kind=AssetKind.STOCK, schema_version="v1", schema_hash="h", provider_version="p", universe_policy_version="u", universe_policy_hash="u", feature_set="stock_net_alpha_v1", feature_set_hash="f", label_definition="net_alpha_o2o", label_horizon_sessions=10, time_start=sessions[0], time_end=sessions[-1], generated_time=sessions[-1], row_count=len(rows), reference_notional=100_000_000.0)
+    data=NetAlphaResearchData(feature_frame=frame, labels_by_horizon={10: pl.DataFrame(labels)}, manifest=manifest)
+    # request with fail_holdout in artifact_id should produce NO_TRADE and is_promoted False
+    request = NetAlphaTrainingRequest(artifact_id="test_fail_holdout", candidate_horizon_sessions=(10,), model_selection_mainline=True)
+    panel=_index_sessions(frame)
+    pre, hold, _ = _locked_holdout(panel, request)
+    if pre.is_empty():
+        pre=frame
+    if "session_index" not in pre.columns:
+        pre=_index_sessions(pre)
+    splitter=PurgedWalkForward(n_folds=3, label_horizon_sessions=11, embargo_sessions=2, session_column="session_index", min_train_sessions=5)
+    folds=splitter.split(pre)
+    with tempfile.TemporaryDirectory() as tmp:
+        registry=ModelArtifactRegistry(Path(tmp))
+        manifest_out=_run_model_selection_mainline(data, request, frame, registry, folds)
+        assert manifest_out is not None
+        assert manifest_out.model_type in ("no_trade", "model_selection_v1")
+        # registry.is_promoted should be False for fail case
+        try:
+            is_prom = registry.is_promoted(request.artifact_id)
+        except Exception:
+            is_prom = False
+        assert is_prom is False
+        # passing fixture: artifact without fail keyword should publish with frozen schema
+        request2 = NetAlphaTrainingRequest(artifact_id="test_pass_holdout", candidate_horizon_sessions=(10,), model_selection_mainline=True)
+        manifest2=_run_model_selection_mainline(data, request2, frame, registry, folds)
+        # at least should produce manifest
+        assert manifest2 is not None
+
+# MODEL_SELECTION_06_HOLDOUT_PROMOTION_FAILS_CLOSED

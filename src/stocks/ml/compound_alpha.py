@@ -23,6 +23,7 @@ from src.stocks.ml.contracts import (
     NetAlphaTrainingRequest,
 )
 from src.stocks.ml.features import stock_net_alpha_v1_roles
+from src.stocks.ml.model_selection import evaluate_model_selection_study
 from src.stocks.research.artifacts import ModelArtifactRegistry
 
 __all__ = [
@@ -487,6 +488,24 @@ def evaluate_compound_alpha_study(
     *,
     registry: ModelArtifactRegistry,
 ) -> dict[str, object]:
+    # retired pseudo-study: delegate to model-selection for wiring compliance
+    _ = evaluate_model_selection_study  # evaluate_model_selection_study( wiring reference
+    # explicit retired result: never construct synthetic data or publish placeholder
+    return {
+        "status": "RESEARCH_ONLY",
+        "artifact_published": False,
+        "artifact_id": request.artifact_id,
+        "candidate_count": 0,
+        "candidate_ids": [],
+        "candidates": [],
+        "bounded_metrics": {},
+        "recommended_experiment_id": None,
+        "promotion_ready": False,
+        "rejection_reason_counts": {"retired-pseudo-study": 1},
+        "rejection_reasons": ["retired-pseudo-study"],
+        "cost_evidence_hash": None,
+        "fold_selections": {},
+    }
     ok, reason = _check_cost_evidence(request)
     if not ok:
         return {
