@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -42,11 +44,67 @@ class LoadedModel:
     manifest: ModelManifest
 
 
+@dataclass(frozen=True, slots=True)
+class ArtifactRetentionCandidate:
+    """An artifact eligible for explicit, operator-approved pruning."""
+
+    artifact_id: str
+    reason: str
+
+
 class ModelArtifactRegistry:
     """Filesystem-backed immutable artifact store with fail-closed validation."""
 
     def __init__(self, root: Path):
         self.root = Path(root)
+
+    def list_artifact_ids(self) -> tuple[str, ...]:
+        """List immutable artifact directories with a manifest, deterministically."""
+        if not self.root.exists():
+            return ()
+        return tuple(
+            sorted(
+                path.name
+                for path in self.root.iterdir()
+                if path.is_dir() and (path / MANIFEST_FILENAME).is_file()
+            )
+        )
+
+    def retention_candidates(
+        self,
+        keep_ids: Iterable[str] = (),
+        *,
+        retain_promoted: bool = True,
+    ) -> tuple[ArtifactRetentionCandidate, ...]:
+        """Return candidates while protecting explicit and promoted artifacts."""
+        keep = frozenset(keep_ids)
+        candidates: list[ArtifactRetentionCandidate] = []
+        for artifact_id in self.list_artifact_ids():
+            if artifact_id in keep:
+                continue
+            if retain_promoted and self.is_promoted(artifact_id):
+                continue
+            metrics_path = self._artifact_dir(artifact_id) / METRICS_FILENAME
+            reason = "unpromoted" if metrics_path.is_file() else "missing-metrics"
+            candidates.append(ArtifactRetentionCandidate(artifact_id, reason))
+        return tuple(candidates)
+
+    def prune(
+        self,
+        candidates: Iterable[ArtifactRetentionCandidate],
+        *,
+        apply: bool = False,
+    ) -> int:
+        """Delete only supplied candidates when ``apply`` is explicitly true."""
+        if not apply:
+            return 0
+        deleted = 0
+        for candidate in candidates:
+            artifact_dir = self._artifact_dir(candidate.artifact_id)
+            if artifact_dir.is_dir():
+                shutil.rmtree(artifact_dir)
+                deleted += 1
+        return deleted
 
     def _artifact_dir(self, artifact_id: str) -> Path:
         if not ARTIFACT_ID_RE.match(artifact_id):
