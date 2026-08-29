@@ -29,6 +29,7 @@ class _SegmentTotals:
     base_exposure_weighted: float = 0.0
     stress_exposure_weighted: float = 0.0
     capacity_clipped_orders: int = 0
+    cold_start_economic_cash_decisions: int = 0
 
 
 @dataclass(slots=True)
@@ -43,6 +44,7 @@ class CandidateReplayAccumulator:
     stress_interval_exposure: list[float] = field(default_factory=list)
     interval_session_bounds: list[tuple[datetime, ...]] = field(default_factory=list)
     totals: _SegmentTotals = field(default_factory=_SegmentTotals)
+    cold_start_economic_cash_decisions: int = 0
 
     def add_segment(self, summary: SegmentExecutionSummary) -> None:
         """Append one executed segment's bounded evidence."""
@@ -88,6 +90,12 @@ class CandidateReplayAccumulator:
         totals.base_exposure_weighted += float(base_exposure) * weight
         totals.stress_exposure_weighted += float(stress_exposure) * weight
         totals.capacity_clipped_orders += int(summary.capacity_clipped_orders)
+        totals.cold_start_economic_cash_decisions += int(
+            summary.cold_start_economic_cash_decisions
+        )
+        self.cold_start_economic_cash_decisions += int(
+            summary.cold_start_economic_cash_decisions
+        )
         for reason, count in unfilled_reason_counts.items():
             key = str(reason)
             self.unfilled_reasons[key] = self.unfilled_reasons.get(key, 0) + int(count)
@@ -114,6 +122,11 @@ class CandidateReplayAccumulator:
         def weighted(value: float) -> float:
             return value / total_planned if total_planned > 0 else 0.0
 
+        cold_start = int(totals.cold_start_economic_cash_decisions or self.cold_start_economic_cash_decisions)
+        action_diagnostics: tuple[tuple[str, float | int], ...] = ()
+        if cold_start > 0:
+            action_diagnostics = (("cold_start_economic_cash_decisions", int(cold_start)),)
+
         return ExecutionReplayEvidence(
             base_log_growth=tuple(self.base_growth),
             stress_log_growth=tuple(self.stress_growth),
@@ -128,6 +141,7 @@ class CandidateReplayAccumulator:
             filled_cycle_count=int(totals.filled_cycles),
             unfilled_order_reason_counts=tuple(sorted(self.unfilled_reasons.items())),
             utility_transition_diagnostics=(),
+            action_diagnostics=action_diagnostics,
             base_cost_drag=weighted(totals.base_cost_drag_weighted),
             stress_cost_drag=weighted(totals.stress_cost_drag_weighted),
             base_exposure=weighted(totals.base_exposure_weighted),
@@ -161,3 +175,4 @@ class SegmentExecutionSummary:
     unfilled_reason_counts: dict[str, int]
     interval_session_bounds: tuple[datetime, ...] = ()
     capacity_clipped_orders: int = 0
+    cold_start_economic_cash_decisions: int = 0

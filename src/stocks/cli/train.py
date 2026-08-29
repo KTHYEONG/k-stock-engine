@@ -758,6 +758,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument('--model-selection-wall-clock-seconds', type=float, default=540.0)
+    parser.add_argument('--model-selection-screen-phase-seconds', type=float, default=180.0)
     parser.add_argument('--model-selection-screen-train-rows', type=int, default=48000)
     parser.add_argument('--model-selection-screen-validation-rows', type=int, default=12000)
     parser.add_argument(
@@ -1452,7 +1453,7 @@ def run_research_only_model_selection_study(
         liquidity_model=liquidity_model,
         stress_liquidity_model=stress_liquidity_model,
     )
-    settings = ModelSelectionStudySettings(candidate_lookback_sessions=_parse_training_lookback_candidates(parsed.candidate_training_lookback_sessions), compute_budget=ModelSelectionComputeBudget(wall_clock_seconds=parsed.model_selection_wall_clock_seconds, screen_train_rows_per_fold=parsed.model_selection_screen_train_rows, screen_validation_rows_per_fold=parsed.model_selection_screen_validation_rows))
+    settings = ModelSelectionStudySettings(candidate_lookback_sessions=_parse_training_lookback_candidates(parsed.candidate_training_lookback_sessions), compute_budget=ModelSelectionComputeBudget(wall_clock_seconds=parsed.model_selection_wall_clock_seconds, screen_phase_seconds=parsed.model_selection_screen_phase_seconds, screen_train_rows_per_fold=parsed.model_selection_screen_train_rows, screen_validation_rows_per_fold=parsed.model_selection_screen_validation_rows))
     payload = evaluate_model_selection_study(data, bound_request, settings, registry=ModelArtifactRegistry(parsed.registry))
     return {"status": "RESEARCH_ONLY", "artifact_published": False, "artifact_id": bound_request.artifact_id, **payload}
 
