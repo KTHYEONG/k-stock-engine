@@ -10,6 +10,7 @@ from src.stocks.ml.contracts import (
     PolicyProfile,
     policy_portfolio_fingerprint,
     validate_policy_profiles,
+    ModelSelectionComputeBudget,
 )
 
 
@@ -46,6 +47,12 @@ def test_default_policy_profiles_pin_sparse_frontier() -> None:
         "risk_balanced_waterfill_v2",
         "confidence_mean_variance_v1",
     )
+
+
+def test_compute_budget_clamps_default_screen_phase_to_wall_clock() -> None:
+    assert ModelSelectionComputeBudget().screen_phase_seconds == 720.0
+    short = ModelSelectionComputeBudget(wall_clock_seconds=540.0)
+    assert short.screen_phase_seconds == 540.0
 
 
 def test_policy_profile_validates_input_range() -> None:
