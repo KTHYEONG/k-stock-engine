@@ -56,6 +56,24 @@ def test_catalog_validate_readiness_requires_dataset_dir_and_feature() -> None:
         catalog.main(["validate-readiness", "--dataset-dir", "features"])
 
 
+def test_catalog_audit_reports_missing_paths(tmp_path, capsys) -> None:
+    catalog_root = tmp_path / "catalog"
+    store = CatalogStore(catalog_root)
+    store.register(
+        CatalogEntry(
+            kind=CatalogKind.FEATURES,
+            name="missing_features",
+            content_hash="hash",
+            schema_hash="schema",
+            registered_at=REGISTERED,
+            path=str(tmp_path / "gone"),
+        )
+    )
+    code = catalog.main(["--catalog-root", str(catalog_root), "audit"])
+    assert code == 1
+    assert "missing\tfeatures\tmissing_features" in capsys.readouterr().out
+
+
 def test_catalog_validate_readiness_fails_on_unusable_feature(tmp_path, capsys) -> None:
     dataset_dir = feature_readiness_dataset(tmp_path)
     code = catalog.main(

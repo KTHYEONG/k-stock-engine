@@ -14,6 +14,7 @@ from src.stocks.data.catalog import (
     CatalogEntry,
     CatalogKind,
     CatalogStore,
+    ActiveDatasetPolicy,
     EvidenceCompleteness,
     ResearchDataSnapshot,
     RetentionCandidate,
@@ -127,6 +128,43 @@ class TestCatalogStore:
         store.register(entry(CatalogKind.CALENDAR, "calendar_v1"))
         with pytest.raises(ValueError, match="already has"):
             store.register(entry(CatalogKind.CALENDAR, "calendar_v1"))
+
+    def test_active_policy_protects_catalog_entries(self, tmp_path) -> None:
+        store = CatalogStore(tmp_path)
+        store.register(entry(CatalogKind.FEATURES, "features_active"))
+        store.register(entry(CatalogKind.FEATURES, "features_old"))
+        store.save_active_policy(
+            ActiveDatasetPolicy(((CatalogKind.FEATURES, "features_active"),))
+        )
+        registry = RetentionRegistry(tmp_path)
+        registry.save(registry.rebuild(store))
+        candidates = retention_dry_run(store, registry)
+        assert [candidate.name for candidate in candidates] == ["features_old"]
+        active_record = next(
+            record for record in registry.load() if record.name == "features_active"
+        )
+        assert active_record.referenced_by == ("active-policy",)
+
+    def test_catalog_missing_entries_is_deterministic(self, tmp_path) -> None:
+        store = CatalogStore(tmp_path / "catalog")
+        missing_b = entry(CatalogKind.FEATURES, "b_missing")
+        missing_a = entry(CatalogKind.BASE_PANEL, "a_missing")
+        present_path = tmp_path / "present"
+        present_path.write_text("ok", encoding="utf-8")
+        present = CatalogEntry(
+            kind=CatalogKind.FEATURES,
+            name="present",
+            content_hash="present",
+            schema_hash="schema",
+            registered_at=REGISTERED,
+            path=str(present_path),
+        )
+        for item in (missing_b, present, missing_a):
+            store.register(item)
+        assert [(item.kind.value, item.name) for item in store.missing_entries()] == [
+            ("base_panel", "a_missing"),
+            ("features", "b_missing"),
+        ]
 
 
 class TestSnapshotManifestDeterminism:
