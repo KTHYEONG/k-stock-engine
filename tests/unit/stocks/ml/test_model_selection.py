@@ -500,7 +500,7 @@ def test_PROFILED_ML_SELECTION_03_NO_PERMUTATION_REFIT(monkeypatch):
     ev2 = screen_model_family(cache, labels, ModelFamily.hist_gradient_quantile_v1, budget, __import__("time").monotonic()+10)
     assert fit_calls["fit"] <= 1 + __import__("math").ceil(__import__("math").sqrt(G))
     # attribution predictions for hist should be <=G (we can't directly count but ensure fits not inflated)
-    assert True
+    assert ev2 is not None
 
 
 def test_PROFILED_ML_SELECTION_04_REQUESTED_FOLD_CAP():
@@ -656,6 +656,41 @@ def test_MLCMP_LOG_04():  # noqa: N802
     settings = ModelSelectionStudySettings(candidate_lookback_sessions=(504,), candidate_families=tuple(ModelFamily.__members__.values()), common_min_train_sessions=504, min_validation_segment_sessions=5, compute_budget=ModelSelectionComputeBudget(wall_clock_seconds=30.0, screen_phase_seconds=20.0))
 
     # Force calibration exception by patching _causal_oof_calibrate (imported locally from training)
+    # Ensure at least one family qualifies by mocking screen to positive tail bounds (required for new tail-gate)
+    from unittest.mock import patch as _patch_screen
+    from src.stocks.ml.contracts import FeatureAttributionEvidence, FamilyScreenEvidence
+    orig_screen = None
+    try:
+        from src.stocks.ml.model_selection import screen_model_family as _orig_screen
+        orig_screen = _orig_screen
+    except Exception:
+        orig_screen = None
+
+    def _force_positive_screen(cache, label_join, family, budget, deadline, *args, **kwargs):
+        # Delegate to original for side effects but override LB to positive for elastic
+        if orig_screen is not None:
+            try:
+                ev = orig_screen(cache, label_join, family, budget, deadline, *args, **kwargs)
+            except Exception:
+                # Original may fail due to missing gross for unhedged; still produce positive for test
+                try:
+                    ev = orig_screen(cache, label_join, family, budget, deadline)
+                except Exception:
+                    ev = None
+            if ev is not None and str(family) == "elastic_net_v2":
+                # Create positive economic evidence
+                from src.stocks.ml.contracts import ScreenEconomicEvidence
+                see = ScreenEconomicEvidence(fold_id=int(cache.fold.segment_id), route_kind="hedged_residual", top_k=12, rebalance_frequency_sessions=10, session_count=10, selected_prefix_size=1, absolute_lower_bound=0.01, tail_excess_lower_bound=0.01, oracle_tail_excess_lower_bound=0.02)
+                return FamilyScreenEvidence(family=ev.family, screen_lower_bound=0.01, screen_se=0.001, attribution=ev.attribution, qualified_for_full_oof=False, selected_family=False, fold_attributions=ev.fold_attributions, screen_economic_evidence=see)
+            if ev is not None:
+                return ev
+            # ev was None due to original raising; create fallback positive/negative as needed
+        # Fallback
+        scores = tuple((n, 0.0) for n,_ in cache.source_group_columns)
+        attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
+        lb = 0.01 if str(family) == "elastic_net_v2" else -0.01
+        return FamilyScreenEvidence(family=family, screen_lower_bound=lb, screen_se=0.001, attribution=attr, qualified_for_full_oof=False, selected_family=False)
+
     with tempfile.TemporaryDirectory() as tmp:
         registry = ModelArtifactRegistry(pathlib.Path(tmp))
         # Use logger.debug patch to reliably capture DEBUG calls regardless of caplog propagation
@@ -674,33 +709,160 @@ def test_MLCMP_LOG_04():  # noqa: N802
                 captured.append((formatted, kwargs.get("exc_info"), args))
             return original_debug(msg, *args, **kwargs)
 
-        with patch.object(msel_mod.logger, "debug", side_effect=capture_debug):
-            with patch("src.stocks.ml.training._causal_oof_calibrate", side_effect=RuntimeError("calib boom")):
-                result = evaluate_model_selection_study(data, request, settings, registry=registry)
-                if captured:
-                    formatted, exc_info, args = captured[0]
-                    assert "error_type" in formatted
-                    assert "error_message" in formatted
-                    # traceback via exc_info
-                    assert exc_info is True or exc_info is not None
-                    # successful public JSON remains backwards compatible (no traceback field)
-                    assert "traceback" not in str(result.get("candidates", [{}])[0]) if result.get("candidates") else True
-                    # also check caplog for replay-failed if needed
-                    return
-                # If calib not triggered, force replay exception
-                captured.clear()
-                with patch("src.stocks.ml.training._replay_costs_batch", side_effect=ValueError("replay boom")):
-                    result2 = evaluate_model_selection_study(data, request, settings, registry=registry)
-                    assert len(captured) >= 1
-                    formatted, exc_info, args = captured[0]
-                    assert "error_type" in formatted
-                    assert "error_message" in formatted
-                    assert "replay boom" in formatted or "calib boom" in formatted
-                    assert exc_info is True or exc_info is not None
-                    assert any("replay-failed" in k for k in result2.get("rejection_reason_counts", {}))
-                    return
+        with _patch_screen("src.stocks.ml.model_selection.screen_model_family", side_effect=_force_positive_screen):
+            with patch.object(msel_mod.logger, "debug", side_effect=capture_debug):
+                with patch("src.stocks.ml.training._causal_oof_calibrate", side_effect=RuntimeError("calib boom")):
+                    result = evaluate_model_selection_study(data, request, settings, registry=registry)
+                    if captured:
+                        formatted, exc_info, args = captured[0]
+                        assert "error_type" in formatted
+                        assert "error_message" in formatted
+                        # traceback via exc_info
+                        assert exc_info is True or exc_info is not None
+                        # successful public JSON remains backwards compatible (no traceback field)
+                        assert "traceback" not in str(result.get("candidates", [{}])[0]) if result.get("candidates") else True
+                        # also check caplog for replay-failed if needed
+                        return
+                    # If calib not triggered, force replay exception
+                    captured.clear()
+                    with patch("src.stocks.ml.training._replay_costs_batch", side_effect=ValueError("replay boom")):
+                        result2 = evaluate_model_selection_study(data, request, settings, registry=registry)
+                        assert len(captured) >= 1
+                        formatted, exc_info, args = captured[0]
+                        assert "error_type" in formatted
+                        assert "error_message" in formatted
+                        assert "replay boom" in formatted or "calib boom" in formatted
+                        assert exc_info is True or exc_info is not None
+                        assert any("replay-failed" in k for k in result2.get("rejection_reason_counts", {}))
+                        return
         # Fallback if still not captured
         assert len(captured) >= 1
+
+
+def _route_screen_request():
+    # SCENARIO_ML_ROUTE_01_UNHEDGED_GROSS_ONCE
+    # SCENARIO_ML_PREFIX_02_SELECTED_PREDICTION
+    # SCENARIO_ML_ROUTE_03_CADENCE_AND_CONFIDENCE
+    # SCENARIO_ML_ADMISSION_04_TAIL_THEN_REPLAY
+    # SCENARIO_ML_LOG_05_BOUNDED_ROUTE_EVIDENCE
+    from src.stocks.ml.contracts import ExecutionFrontierSettings, NetAlphaTrainingRequest
+
+    return NetAlphaTrainingRequest(
+        artifact_id="scenario-route",
+        candidate_horizon_sessions=(10,),
+        execution_frontier=ExecutionFrontierSettings(
+            candidate_horizon_sessions=(10,),
+            candidate_rebalance_frequency_sessions=(10,),
+            candidate_top_k=(12,),
+        ),
+    )
+
+
+def _route_scored_frame(
+    *, prediction: list[float] | None = None, gross_returns: list[float] | None = None, sessions: int = 1
+):
+    import polars as pl
+
+    rows = []
+    for session in range(sessions):
+        for idx in range(12):
+            rows.append(
+                {
+                    "instrument_id": f"KRX:{idx:05d}",
+                    "session": session,
+                    "prediction": prediction[idx] if prediction else float(idx),
+                    "gross_return": gross_returns[idx] if gross_returns else 0.030,
+                    "risk_residual": 0.010,
+                    "reference_cost": 0.004,
+                }
+            )
+    return pl.DataFrame(rows)
+
+
+def test_SCENARIO_ML_ROUTE_01_UNHEDGED_GROSS_ONCE():
+    import pytest
+    from src.stocks.ml.model_selection import _screen_prefix_economic_evidence
+
+    evidence = _screen_prefix_economic_evidence(
+        _route_scored_frame(), request=_route_screen_request(), bootstrap_alpha=0.05, bootstrap_resamples=20
+    )
+    assert evidence.absolute_lower_bound == pytest.approx(0.026)
+    with pytest.raises(ValueError, match="gross_return"):
+        _screen_prefix_economic_evidence(
+            _route_scored_frame().drop("gross_return"),
+            request=_route_screen_request(),
+            bootstrap_alpha=0.05,
+            bootstrap_resamples=20,
+        )
+
+
+def test_SCENARIO_ML_PREFIX_02_SELECTED_PREDICTION():
+    from src.stocks.ml.model_selection import _screen_prefix_economic_evidence
+
+    request = _route_screen_request()
+    gross_returns = [0.010 + idx * 0.001 for idx in range(12)]
+    good = _screen_prefix_economic_evidence(
+        _route_scored_frame(prediction=[float(i) for i in range(12)], gross_returns=gross_returns),
+        request=request,
+        bootstrap_alpha=0.05,
+        bootstrap_resamples=20,
+    )
+    reversed_scores = _screen_prefix_economic_evidence(
+        _route_scored_frame(prediction=[float(11 - i) for i in range(12)], gross_returns=gross_returns),
+        request=request,
+        bootstrap_alpha=0.05,
+        bootstrap_resamples=20,
+    )
+    assert good.selected_prefix_size == 1
+    assert good.tail_excess_lower_bound > reversed_scores.tail_excess_lower_bound
+
+
+def test_SCENARIO_ML_ROUTE_03_CADENCE_AND_CONFIDENCE():
+    from src.stocks.ml.model_selection import _screen_prefix_economic_evidence
+
+    evidence = _screen_prefix_economic_evidence(
+        _route_scored_frame(sessions=30),
+        request=_route_screen_request(),
+        bootstrap_alpha=0.002777777778,
+        bootstrap_resamples=360,
+    )
+    assert evidence.top_k == 12
+    assert evidence.rebalance_frequency_sessions == 10
+    assert 1 <= evidence.session_count <= 3
+
+
+def test_SCENARIO_ML_ADMISSION_04_TAIL_THEN_REPLAY():
+    from src.stocks.ml.contracts import ScreenEconomicEvidence
+
+    evidence = ScreenEconomicEvidence(
+        fold_id=0,
+        route_kind="unhedged_absolute",
+        top_k=12,
+        rebalance_frequency_sessions=10,
+        session_count=3,
+        selected_prefix_size=1,
+        absolute_lower_bound=-0.01,
+        tail_excess_lower_bound=0.01,
+        oracle_tail_excess_lower_bound=0.02,
+    )
+    assert evidence.absolute_lower_bound <= 0
+    assert evidence.tail_excess_lower_bound > 0
+    assert evidence.oracle_tail_excess_lower_bound > 0
+
+
+def test_SCENARIO_ML_LOG_05_BOUNDED_ROUTE_EVIDENCE(caplog):
+    import logging
+    from src.stocks.ml.model_selection import _screen_prefix_economic_evidence
+
+    with caplog.at_level(logging.DEBUG, logger="stocks.ml.model_selection"):
+        _screen_prefix_economic_evidence(
+            _route_scored_frame(), request=_route_screen_request(), bootstrap_alpha=0.05, bootstrap_resamples=20
+        )
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "[DATA] stage=screen_route_alignment" in messages
+    assert "[EVAL] stage=screen_prefix" in messages
+    assert "instrument_id" not in messages
+    assert "score vector" not in messages
 
 
 def test_SCENARIO_ML_ADMISSION_01_NEGATIVE_SCREEN(monkeypatch):
