@@ -2751,3 +2751,91 @@ def test_SCENARIO_SMALL_ACCOUNT_LOT_02_DISABLED_PARITY():
     allocs_prep = construct_target_allocations_prepared(market, len(market.sessions)-1, overlay, None, instruments, portfolio, policy)
     assert allocs == allocs_prep
     assert all(a.target_quantity is None for a in allocs_prep)
+
+
+# MLCMP-COLD-START-01 and MLCMP-MIXED-ECON-02
+
+def test_MLCMP_COLD_START_01():  # noqa: N802
+    """MLCMP-COLD-START-01: all-null economic cross-section returns no allocations."""
+    from src.stocks.trading.portfolio_constructor import (
+        PreparedAllocationMarket,
+        _construct_allocations_prepared,
+    )
+
+    panel = scored_panel(n_sessions=61, n_tickers=3, seed=101).drop("ret")
+    panel = panel.with_columns(
+        pl.lit(None, dtype=pl.Float64).alias("expected_active_alpha"),
+        pl.lit(None, dtype=pl.Float64).alias("expected_net_alpha"),
+        pl.lit(None, dtype=pl.Float64).alias("alpha_lower_bound"),
+        pl.lit(None, dtype=pl.Float64).alias("net_alpha_lower_bound"),
+        pl.lit(None, dtype=pl.Float64).alias("exit_cost_rate"),
+    )
+    market = PreparedAllocationMarket.build(panel)
+    overlay = panel.sort(["session", "instrument_id"])["pred_score"].to_numpy().astype(float)
+    policy = StockRiskPolicy(top_k=5, economic_ranking_mode="economic_net_v1")
+    instruments = instruments_for(3)
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    portfolio = empty_portfolio(as_of=start)
+    result = _construct_allocations_prepared(
+        market, len(market.sessions) - 1, overlay, None, instruments, portfolio, policy
+    )
+    assert result == ()
+
+
+def test_MLCMP_MIXED_ECON_02():  # noqa: N802
+    """MLCMP-MIXED-ECON-02: mixed finite/null rows preserve gates."""
+    from src.stocks.trading.portfolio_constructor import (
+        PreparedAllocationMarket,
+        _construct_allocations_prepared,
+    )
+
+    # Use 61 sessions to have valid volatility
+    panel = scored_panel(n_sessions=61, n_tickers=4, seed=99).drop("ret")
+    # Add economic columns: t=1 and 3 finite, 2 and 4 null
+    panel = panel.with_columns(
+        pl.when(pl.col("instrument_id") == "KRX:000001")
+        .then(pl.lit(0.02))
+        .when(pl.col("instrument_id") == "KRX:000003")
+        .then(pl.lit(0.02))
+        .otherwise(pl.lit(None, dtype=pl.Float64))
+        .alias("expected_active_alpha"),
+        pl.when(pl.col("instrument_id") == "KRX:000001")
+        .then(pl.lit(0.015))
+        .when(pl.col("instrument_id") == "KRX:000003")
+        .then(pl.lit(0.015))
+        .otherwise(pl.lit(None, dtype=pl.Float64))
+        .alias("expected_net_alpha"),
+        pl.when(pl.col("instrument_id") == "KRX:000001")
+        .then(pl.lit(0.005))
+        .when(pl.col("instrument_id") == "KRX:000003")
+        .then(pl.lit(0.005))
+        .otherwise(pl.lit(None, dtype=pl.Float64))
+        .alias("alpha_lower_bound"),
+        pl.when(pl.col("instrument_id") == "KRX:000001")
+        .then(pl.lit(0.003))
+        .when(pl.col("instrument_id") == "KRX:000003")
+        .then(pl.lit(0.003))
+        .otherwise(pl.lit(None, dtype=pl.Float64))
+        .alias("net_alpha_lower_bound"),
+        pl.when(pl.col("instrument_id").is_in(["KRX:000001", "KRX:000003"]))
+        .then(pl.lit(0.002))
+        .otherwise(pl.lit(None, dtype=pl.Float64))
+        .alias("exit_cost_rate"),
+    )
+    market = PreparedAllocationMarket.build(panel)
+    overlay = panel.sort(["session", "instrument_id"])["pred_score"].to_numpy().astype(float)
+    policy = StockRiskPolicy(top_k=5, economic_ranking_mode="economic_net_v1")
+    instruments = instruments_for(4)
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    portfolio = empty_portfolio(as_of=start)
+    result = _construct_allocations_prepared(
+        market, len(market.sessions) - 1, overlay, None, instruments, portfolio, policy
+    )
+    # null rows must not be selected
+    ids = {a.instrument.instrument_id for a in result}
+    assert "KRX:000002" not in ids
+    assert "KRX:000004" not in ids
+    # selected allocations must have finite positive economics (already gated) and not zero-filled
+    assert len(result) > 0
+    for alloc in result:
+        assert alloc.target_value > 0

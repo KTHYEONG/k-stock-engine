@@ -331,7 +331,7 @@ def test_MODEL_SELECTION_FAST_04_BUDGET_FAIL_CLOSED():
     data = NetAlphaResearchData(feature_frame=frame2, labels_by_horizon={10: pl.DataFrame(labels)}, manifest=manifest)
     request = NetAlphaTrainingRequest(artifact_id="fast04", candidate_horizon_sessions=(10,), base_cost_schedule=default_base_schedule(), stress_cost_schedule=default_stress_schedule(), liquidity_model=stock_liquidity_model(), stress_liquidity_model=stock_liquidity_model(stress_multiplier=2.0))
     # Force expired deadline via zero wall clock (or tiny)
-    settings = ModelSelectionStudySettings(candidate_lookback_sessions=(504,), candidate_families=tuple(ModelFamily.__members__.values()), common_min_train_sessions=504, min_validation_segment_sessions=5, compute_budget=ModelSelectionComputeBudget(wall_clock_seconds=0.0001, screen_train_rows_per_fold=10, screen_validation_rows_per_fold=5))
+    settings = ModelSelectionStudySettings(candidate_lookback_sessions=(504,), candidate_families=tuple(ModelFamily.__members__.values()), common_min_train_sessions=504, min_validation_segment_sessions=5, compute_budget=ModelSelectionComputeBudget(wall_clock_seconds=0.0001, screen_phase_seconds=0.00005, screen_train_rows_per_fold=10, screen_validation_rows_per_fold=5))
     # Small sleep to ensure deadline expired before evaluation starts (or set time monotonic past)
     time.sleep(0.01)
     with tempfile.TemporaryDirectory() as tmp:
@@ -615,3 +615,89 @@ def test_PROFILED_ML_SELECTION_05_BUDGET_FAIL_CLOSED():
         for c in result["candidates"]:
             assert c["selected_family"] is False
             assert c.get("screen_lower_bound", -1e12) <= -1e11 or c.get("qualified_for_full_oof") is False
+
+
+def test_MLCMP_LOG_04():  # noqa: N802
+    """MLCMP-LOG-04: calibration/replay fallback DEBUG logs contain required fields."""
+    import logging
+    from unittest.mock import patch
+    from src.stocks.ml.contracts import ModelFamily, ModelSelectionStudySettings, NetAlphaTrainingRequest, ModelSelectionComputeBudget
+    from src.stocks.ml.model_selection import evaluate_model_selection_study
+    from src.stocks.research.artifacts import ModelArtifactRegistry
+    from src.core.costs import default_base_schedule, default_stress_schedule
+    from tests.fixtures.stocks.helpers import stock_liquidity_model
+    import tempfile, pathlib
+    import traceback as tb
+
+    # Build larger panel to ensure at least one qualified family reaches calibration/replay
+    import numpy as np
+    import polars as pl
+    from datetime import datetime, UTC, timedelta
+    from src.stocks.ml.features import stock_net_alpha_v1_roles as _roles_fn
+    _roles = _roles_fn()
+    rng2 = np.random.default_rng(9)
+    sessions = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(800)]
+    rows2 = []
+    for s in sessions:
+        for tidx in range(3):
+            row = {"instrument_id": f"KRX:{tidx:05d}", "session": s, "session_index": sessions.index(s), "sector": "tech", "available_time": s, "open": 100.0, "adtv_20d": 1e6, "volatility_20d": 0.02}
+            for src in _roles:
+                row[src] = float(rng2.normal())
+                row[f"feature__{src}"] = row[src]
+            rows2.append(row)
+    frame_big = pl.DataFrame(rows2)
+    labels2 = [{"instrument_id": r["instrument_id"], "session": r["session"], "net_alpha_target": float(rng2.normal(scale=0.01)), "risk_residual": 0.01, "reference_cost": 0.001, "label_available_time": r["session"] + timedelta(days=5), "realized_net_return": float(rng2.normal(scale=0.01))} for r in rows2]
+    from src.core.datasets import DatasetManifest
+    from src.core.instruments import AssetKind
+    manifest2 = DatasetManifest(asset_kind=AssetKind.STOCK, schema_version="v1", schema_hash="h", provider_version="p", universe_policy_version="u", universe_policy_hash="u", feature_set="stock_net_alpha_v1", feature_set_hash="f", label_definition="net_alpha_o2o", label_horizon_sessions=10, time_start=sessions[0], time_end=sessions[-1], generated_time=sessions[-1], row_count=len(rows2), reference_notional=100_000_000.0)
+    from src.stocks.ml.contracts import NetAlphaResearchData
+    data = NetAlphaResearchData(feature_frame=frame_big, labels_by_horizon={10: pl.DataFrame(labels2)}, manifest=manifest2)
+    request = NetAlphaTrainingRequest(artifact_id="log04", candidate_horizon_sessions=(10,), base_cost_schedule=default_base_schedule(), stress_cost_schedule=default_stress_schedule(), liquidity_model=stock_liquidity_model(), stress_liquidity_model=stock_liquidity_model(stress_multiplier=2.0))
+    settings = ModelSelectionStudySettings(candidate_lookback_sessions=(504,), candidate_families=tuple(ModelFamily.__members__.values()), common_min_train_sessions=504, min_validation_segment_sessions=5, compute_budget=ModelSelectionComputeBudget(wall_clock_seconds=30.0, screen_phase_seconds=20.0))
+
+    # Force calibration exception by patching _causal_oof_calibrate (imported locally from training)
+    with tempfile.TemporaryDirectory() as tmp:
+        registry = ModelArtifactRegistry(pathlib.Path(tmp))
+        # Use logger.debug patch to reliably capture DEBUG calls regardless of caplog propagation
+        import src.stocks.ml.model_selection as msel_mod
+        original_debug = msel_mod.logger.debug
+        captured = []
+
+        def capture_debug(msg, *args, **kwargs):
+            # Format message similarly to logger
+            try:
+                formatted = msg % args if args else msg
+            except Exception:
+                formatted = msg
+            # Check if this is the fallback we care about
+            if "error_type" in formatted and "family" in formatted:
+                captured.append((formatted, kwargs.get("exc_info"), args))
+            return original_debug(msg, *args, **kwargs)
+
+        with patch.object(msel_mod.logger, "debug", side_effect=capture_debug):
+            with patch("src.stocks.ml.training._causal_oof_calibrate", side_effect=RuntimeError("calib boom")):
+                result = evaluate_model_selection_study(data, request, settings, registry=registry)
+                if captured:
+                    formatted, exc_info, args = captured[0]
+                    assert "error_type" in formatted
+                    assert "error_message" in formatted
+                    # traceback via exc_info
+                    assert exc_info is True or exc_info is not None
+                    # successful public JSON remains backwards compatible (no traceback field)
+                    assert "traceback" not in str(result.get("candidates", [{}])[0]) if result.get("candidates") else True
+                    # also check caplog for replay-failed if needed
+                    return
+                # If calib not triggered, force replay exception
+                captured.clear()
+                with patch("src.stocks.ml.training._replay_costs_batch", side_effect=ValueError("replay boom")):
+                    result2 = evaluate_model_selection_study(data, request, settings, registry=registry)
+                    assert len(captured) >= 1
+                    formatted, exc_info, args = captured[0]
+                    assert "error_type" in formatted
+                    assert "error_message" in formatted
+                    assert "replay boom" in formatted or "calib boom" in formatted
+                    assert exc_info is True or exc_info is not None
+                    assert any("replay-failed" in k for k in result2.get("rejection_reason_counts", {}))
+                    return
+        # Fallback if still not captured
+        assert len(captured) >= 1
