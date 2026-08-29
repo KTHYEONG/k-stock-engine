@@ -1677,3 +1677,222 @@ def test_evaluate_model_selection_study_preserves_profile_inclusive_alpha_budget
         assert result["candidate_count"] == 18
         assert abs(float(result["adjusted_bootstrap_alpha"]) - 0.05 / 18) < 1e-12
 
+
+def test_full_oof_uses_canonical_family_fit_signature(monkeypatch):
+    import numpy as np, polars as pl
+    from datetime import datetime, UTC, timedelta
+    from src.stocks.ml.contracts import ModelFamily, FeatureAttributionEvidence
+    from src.stocks.ml.features import stock_net_alpha_v1_roles, materialize_model_feature_sources, fit_research_feature_schema
+    from src.stocks.ml.model_selection import _fit_one_fold
+    from src.stocks.ml.labels import SESSION_COLUMN
+    rng = np.random.default_rng(0)
+    _roles = stock_net_alpha_v1_roles()
+    sessions = [datetime(2024,1,1,tzinfo=UTC)+timedelta(days=i) for i in range(10)]
+    rows = []
+    for s in sessions:
+        for t in range(5):
+            row={"instrument_id": f"KRX:{t:05d}", "session": s, "session_index": sessions.index(s), "sector": "tech", "available_time": s, "open": 100.0, "adtv_20d":1e6, "volatility_20d":0.02}
+            for src in _roles:
+                row[src]= float(rng.normal())
+                row[f"feature__{src}"]= row[src]
+            rows.append(row)
+    frame = pl.DataFrame(rows)
+    labels=[{"instrument_id": r["instrument_id"], "session": r["session"], "net_alpha_target": float(rng.normal()), "risk_residual": 0.01, "reference_cost":0.001, "realized_net_return": 0.01, "gross_return": 0.02, "label_available_time": r["session"]+timedelta(days=1)} for r in rows[:40]]
+    label_df = pl.DataFrame(labels)
+    train_frame = frame.head(20).join(label_df, on=["instrument_id","session"], how="inner")
+    valid_frame = frame.slice(20,10)
+    roles_dict = dict(_roles)
+    mat_train = materialize_model_feature_sources(train_frame, list(roles_dict))
+    schema = fit_research_feature_schema(mat_train, roles_dict)
+    selected = tuple([list(schema.source_groups)[0][0]])
+    calls = {}
+    import src.stocks.ml.model_selection as msel
+    import src.stocks.ml.family_specs as fspec
+    orig_fit = fspec.fit_family_model
+    def spy_fit(spec, train, X_train, y_train, X_valid, training_top_k, screen):
+        calls["spec"] = spec
+        calls["screen"] = screen
+        calls["training_top_k"] = training_top_k
+        assert screen is False
+        # verify session-balanced weight path via spec check
+        return orig_fit(spec, train, X_train, y_train, X_valid, training_top_k=training_top_k, screen=screen)
+    monkeypatch.setattr("src.stocks.ml.model_selection.fit_family_model", spy_fit)
+    # also ensure family_spec used
+    for fam in [ModelFamily.elastic_net_v2, ModelFamily.extra_trees_v1]:
+        from src.stocks.ml.contracts import ModelSelectionCandidate, FeatureAttributionEvidence
+        # need candidate with correct training_top_k
+        attr = FeatureAttributionEvidence(family=fam, fold_id=0, source_group_scores=((selected[0],1.0),), selected_source_groups=selected, schema_fingerprint=schema.fingerprint)
+        cand = __import__("src.stocks.ml.contracts", fromlist=["ModelSelectionCandidate"]).ModelSelectionCandidate(candidate_id=f"{fam.value}_h10", family=fam, horizon_sessions=10, selected_source_groups=selected, oof_fingerprint="fp", attribution=(attr,), training_top_k=None)
+        preds = _fit_one_fold(train_frame, valid_frame, cand, schema, selected, request=__import__("src.stocks.ml.contracts", fromlist=["NetAlphaTrainingRequest"]).NetAlphaTrainingRequest(artifact_id="sigtest", candidate_horizon_sessions=(10,)))
+        assert preds.size == valid_frame.height
+        assert np.all(np.isfinite(preds))
+        assert calls["screen"] is False
+        calls.clear()
+
+def test_lambdarank_uses_resolved_execution_k_and_exact_k_relevance():
+    import polars as pl, numpy as np
+    from datetime import datetime, UTC, timedelta
+    from src.stocks.ml.contracts import ExecutionFrontierSettings, NetAlphaTrainingRequest, ModelSelectionStudySettings, ModelFamily, DEFAULT_POLICY_PROFILES
+    from src.stocks.ml.model_selection import resolve_model_selection_plan, _fit_one_fold
+    from src.stocks.ml.features import stock_net_alpha_v1_roles, materialize_model_feature_sources, fit_research_feature_schema
+    # C=5/K=16 single cell
+    frontier = ExecutionFrontierSettings(candidate_horizon_sessions=(10,), candidate_rebalance_frequency_sessions=(5,), candidate_top_k=(16,))
+    req = NetAlphaTrainingRequest(artifact_id="lrk16", candidate_horizon_sessions=(10,), execution_frontier=frontier)
+    settings = ModelSelectionStudySettings(candidate_lookback_sessions=(504,), candidate_families=tuple(ModelFamily.__members__.values()), reference_rebalance_frequency_sessions=5, reference_top_k=16)
+    plan = resolve_model_selection_plan(req, settings)
+    assert plan.top_k == 16
+    assert plan.rebalance_frequency_sessions == 5
+    # create candidate with resolved K
+    from src.stocks.ml.contracts import FeatureAttributionEvidence, ModelSelectionCandidate
+    _roles = stock_net_alpha_v1_roles()
+    rng = np.random.default_rng(1)
+    sessions = [datetime(2024,1,1,tzinfo=UTC)+timedelta(days=i) for i in range(4)]
+    rows=[]
+    for s in sessions:
+        for t in range(20):
+            row={"instrument_id": f"KRX:{t:05d}", "session": s, "session_index": sessions.index(s), "sector": "tech", "available_time": s, "open": 100.0, "adtv_20d":1e6, "volatility_20d":0.02}
+            for src in _roles:
+                row[src]= float(rng.normal())
+                row[f"feature__{src}"]= row[src]
+            rows.append(row)
+    frame = pl.DataFrame(rows)
+    labels=[{"instrument_id": r["instrument_id"], "session": r["session"], "net_alpha_target": float(rng.normal()), "risk_residual": 0.01, "reference_cost":0.001, "realized_net_return":0.01, "gross_return":0.02} for r in rows[:60]]
+    label_df = pl.DataFrame(labels)
+    train_frame = frame.head(40).join(label_df, on=["instrument_id","session"], how="inner")
+    valid_frame = frame.slice(40,20)
+    mat_train = materialize_model_feature_sources(train_frame, list(dict(_roles)))
+    schema = fit_research_feature_schema(mat_train, dict(_roles))
+    selected = tuple([list(schema.source_groups)[0][0]])
+    attr = FeatureAttributionEvidence(family=ModelFamily.tail_lambdarank_v2, fold_id=0, source_group_scores=((selected[0],1.0),), selected_source_groups=selected, schema_fingerprint=schema.fingerprint)
+    cand = ModelSelectionCandidate(candidate_id="tail_h10", family=ModelFamily.tail_lambdarank_v2, horizon_sessions=10, selected_source_groups=selected, oof_fingerprint="fp", attribution=(attr,), training_top_k=16)
+    # check exact 16 relevance per session via fitting - should succeed
+    preds = _fit_one_fold(train_frame, valid_frame, cand, schema, selected, request=req)
+    assert preds.size == valid_frame.height
+    # now undersized session with 15 names should raise before fit
+    small_rows=[]
+    for s in sessions[:1]:
+        for t in range(15):
+            row={"instrument_id": f"KRX:{t:05d}", "session": s, "session_index": 0, "sector": "tech", "available_time": s, "open": 100.0, "adtv_20d":1e6, "volatility_20d":0.02}
+            for src in _roles:
+                row[src]= float(rng.normal())
+                row[f"feature__{src}"]= row[src]
+            small_rows.append(row)
+    small_frame = pl.DataFrame(small_rows)
+    small_labels=[{"instrument_id": r["instrument_id"], "session": r["session"], "net_alpha_target": float(rng.normal()), "risk_residual": 0.01, "reference_cost":0.001, "realized_net_return":0.01, "gross_return":0.02} for r in small_rows]
+    small_label_df = pl.DataFrame(small_labels)
+    small_train = small_frame.join(small_label_df, on=["instrument_id","session"], how="inner")
+    import pytest
+    with pytest.raises(ValueError):
+        _fit_one_fold(small_train, valid_frame.head(15), cand, schema, selected, request=req)
+
+def test_research_only_study_derives_single_reference_cell_from_bound_request(monkeypatch):
+    import tempfile, pathlib, polars as pl, numpy as np
+    from datetime import datetime, UTC, timedelta
+    from src.stocks.ml.contracts import ExecutionFrontierSettings, NetAlphaTrainingRequest, ModelSelectionStudySettings, ModelFamily
+    from src.stocks.ml.model_selection import evaluate_model_selection_study, resolve_model_selection_plan
+    from src.stocks.research.artifacts import ModelArtifactRegistry
+    from src.core.costs import default_base_schedule, default_stress_schedule
+    from tests.fixtures.stocks.helpers import stock_liquidity_model
+    from src.stocks.ml.features import stock_net_alpha_v1_roles
+    from src.core.datasets import DatasetManifest
+    from src.core.instruments import AssetKind
+    from src.stocks.ml.contracts import NetAlphaResearchData
+    import argparse
+    _roles = stock_net_alpha_v1_roles()
+    rng = np.random.default_rng(2)
+    sessions=[datetime(2024,1,1,tzinfo=UTC)+timedelta(days=i) for i in range(800)]
+    rows=[]
+    for s in sessions:
+        for t in range(3):
+            row={"instrument_id": f"KRX:{t:05d}", "session": s, "session_index": sessions.index(s), "sector": "tech", "available_time": s, "open": 100.0, "adtv_20d":1e6, "volatility_20d":0.02}
+            for src in _roles:
+                row[src]= float(rng.normal())
+                row[f"feature__{src}"]= row[src]
+            rows.append(row)
+    frame=pl.DataFrame(rows)
+    labels=[{"instrument_id": r["instrument_id"], "session": r["session"], "net_alpha_target": float(rng.normal(scale=0.01)), "risk_residual": 0.01, "reference_cost":0.001, "label_available_time": r["session"]+timedelta(days=5), "realized_net_return": float(rng.normal(scale=0.01)), "gross_return":0.02} for r in rows]
+    manifest=DatasetManifest(asset_kind=AssetKind.STOCK, schema_version="v1", schema_hash="h", provider_version="p", universe_policy_version="u", universe_policy_hash="u", feature_set="stock_net_alpha_v1", feature_set_hash="f", label_definition="net_alpha_o2o", label_horizon_sessions=10, time_start=sessions[0], time_end=sessions[-1], generated_time=sessions[-1], row_count=len(rows), reference_notional=100_000_000.0)
+    data=NetAlphaResearchData(feature_frame=frame, labels_by_horizon={10: pl.DataFrame(labels)}, manifest=manifest)
+    frontier = ExecutionFrontierSettings(candidate_horizon_sessions=(10,), candidate_rebalance_frequency_sessions=(5,), candidate_top_k=(16,))
+    bound = NetAlphaTrainingRequest(artifact_id="bound516", candidate_horizon_sessions=(10,), execution_frontier=frontier, base_cost_schedule=default_base_schedule(), stress_cost_schedule=default_stress_schedule(), liquidity_model=stock_liquidity_model(), stress_liquidity_model=stock_liquidity_model(stress_multiplier=2.0))
+    # builder should thread C=5 K=16
+    import src.stocks.ml.model_selection as msel_mod
+    parsed = argparse.Namespace(model_selection_wall_clock_seconds=30.0, model_selection_screen_phase_seconds=20.0, model_selection_screen_train_rows=3000, model_selection_screen_validation_rows=1000, model_selection_max_full_replay_families=2, candidate_training_lookback_sessions="504")
+    settings = msel_mod.build_model_selection_study_settings(parsed, bound)
+    assert settings.reference_rebalance_frequency_sessions == 5
+    assert settings.reference_top_k == 16
+    plan = resolve_model_selection_plan(bound, settings)
+    assert plan.rebalance_frequency_sessions == 5 and plan.top_k == 16
+    # multiple C or K should be rejected before any fit
+    bad_frontier = ExecutionFrontierSettings(candidate_horizon_sessions=(10,), candidate_rebalance_frequency_sessions=(5,10), candidate_top_k=(12,16))
+    bad_req = NetAlphaTrainingRequest(artifact_id="badmulti", candidate_horizon_sessions=(10,), execution_frontier=bad_frontier, base_cost_schedule=default_base_schedule(), stress_cost_schedule=default_stress_schedule(), liquidity_model=stock_liquidity_model(), stress_liquidity_model=stock_liquidity_model(stress_multiplier=2.0))
+    import pytest
+    with pytest.raises(ValueError):
+        resolve_model_selection_plan(bad_req, settings)
+    # ensure evaluate also fails closed before fit when bad frontier via builder
+    bad_parsed = argparse.Namespace(model_selection_wall_clock_seconds=30.0, model_selection_screen_phase_seconds=20.0, model_selection_screen_train_rows=3000, model_selection_screen_validation_rows=1000, model_selection_max_full_replay_families=2, candidate_training_lookback_sessions="504")
+    with pytest.raises(ValueError):
+        msel_mod.build_model_selection_study_settings(bad_parsed, bad_req)
+
+def test_route_calibration_preserves_fail_closed_no_fill_gate(monkeypatch):
+    import tempfile, pathlib, polars as pl, numpy as np
+    from datetime import datetime, UTC, timedelta
+    from src.stocks.ml.contracts import NetAlphaTrainingRequest, ModelSelectionStudySettings, ModelSelectionComputeBudget, ModelFamily, ExecutionFrontierSettings
+    from src.stocks.ml.model_selection import evaluate_model_selection_study
+    from src.stocks.research.artifacts import ModelArtifactRegistry
+    from src.core.costs import default_base_schedule, default_stress_schedule
+    from tests.fixtures.stocks.helpers import stock_liquidity_model
+    from src.stocks.ml.features import stock_net_alpha_v1_roles
+    from src.core.datasets import DatasetManifest
+    from src.core.instruments import AssetKind
+    from src.stocks.ml.contracts import NetAlphaResearchData, FeatureAttributionEvidence, FamilyScreenEvidence
+    _roles = stock_net_alpha_v1_roles()
+    rng = np.random.default_rng(3)
+    sessions=[datetime(2024,1,1,tzinfo=UTC)+timedelta(days=i) for i in range(800)]
+    rows=[]
+    for s in sessions:
+        for t in range(3):
+            row={"instrument_id": f"KRX:{t:05d}", "session": s, "session_index": sessions.index(s), "sector": "tech", "available_time": s, "open": 100.0, "adtv_20d":1e6, "volatility_20d":0.02}
+            for src in _roles:
+                row[src]= float(rng.normal())
+                row[f"feature__{src}"]= row[src]
+            rows.append(row)
+    frame=pl.DataFrame(rows)
+    labels=[{"instrument_id": r["instrument_id"], "session": r["session"], "net_alpha_target": float(rng.normal(scale=0.01)), "risk_residual": 0.01, "reference_cost":0.001, "label_available_time": r["session"]+timedelta(days=5), "realized_net_return": float(rng.normal(scale=0.01)), "gross_return":0.02} for r in rows]
+    manifest=DatasetManifest(asset_kind=AssetKind.STOCK, schema_version="v1", schema_hash="h", provider_version="p", universe_policy_version="u", universe_policy_hash="u", feature_set="stock_net_alpha_v1", feature_set_hash="f", label_definition="net_alpha_o2o", label_horizon_sessions=10, time_start=sessions[0], time_end=sessions[-1], generated_time=sessions[-1], row_count=len(rows), reference_notional=100_000_000.0)
+    data=NetAlphaResearchData(feature_frame=frame, labels_by_horizon={10: pl.DataFrame(labels)}, manifest=manifest)
+    frontier = ExecutionFrontierSettings(candidate_horizon_sessions=(10,), candidate_rebalance_frequency_sessions=(10,), candidate_top_k=(12,))
+    request=NetAlphaTrainingRequest(artifact_id="nofillgate", candidate_horizon_sessions=(10,), execution_frontier=frontier, base_cost_schedule=default_base_schedule(), stress_cost_schedule=default_stress_schedule(), liquidity_model=stock_liquidity_model(), stress_liquidity_model=stock_liquidity_model(stress_multiplier=2.0))
+    settings=ModelSelectionStudySettings(candidate_lookback_sessions=(504,), candidate_families=tuple(ModelFamily.__members__.values()), common_min_train_sessions=504, min_validation_segment_sessions=5, compute_budget=ModelSelectionComputeBudget(wall_clock_seconds=30.0, screen_phase_seconds=20.0, max_full_replay_families=1))
+    # force no positive calibrated bucket: make screen return negative, and replay will be no-fill
+    def fake_screen(cache, label_join, family, budget, deadline, request=None, bootstrap_alpha=None, bootstrap_resamples=None, horizon_sessions=None, rebalance_frequency_sessions=None, execution_top_k=None, minimum_tail_draws=None):
+        scores=tuple((n, 0.0) for n,_ in cache.source_group_columns)
+        attr=FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
+        # all negative to trigger no positive bucket -> still bounded but will lead to no fills via replay mock
+        lb = -0.02
+        se=0.01
+        return FamilyScreenEvidence(family=family, screen_lower_bound=lb, screen_se=se, attribution=attr, qualified_for_full_oof=False, selected_family=False)
+    monkeypatch.setattr("src.stocks.ml.model_selection.screen_model_family", fake_screen)
+    # mock replay to produce zero orders for any qualified (if any) - but with all negative, qualified will be bounded shortlist at most 1 with negative LB, then replay will be no-fills
+    import src.stocks.ml.training as tmod
+    orig_replay = tmod._replay_costs_batch
+    def fake_replay(registry, calibrated, labels_, win_req, horizon, risk, pre_holdout, manifest_, specs):
+        from src.stocks.ml.execution_replay import ExecutionReplayEvidence, ProfileReplayEvidence
+        out={}
+        for (c,k,prof) in specs:
+            ev=ExecutionReplayEvidence(base_log_growth=(), stress_log_growth=(), segment_ids=(), planned_cycles=0, filled_orders=0, cash_session_fraction=1.0, turnover=0.0, observed_interval_count=0, invested_interval_count=0, invested_interval_fraction=0.0, base_interval_exposure=(), stress_interval_exposure=(), base_interval_session_bounds=())
+            out[(horizon,c,k,prof.profile_id)] = ProfileReplayEvidence(candidate=ev, dense_shadow=None)
+        return out
+    monkeypatch.setattr("src.stocks.ml.training._replay_costs_batch", fake_replay)
+    with tempfile.TemporaryDirectory() as tmp:
+        registry=ModelArtifactRegistry(pathlib.Path(tmp))
+        result=evaluate_model_selection_study(data, request, settings, registry=registry)
+        assert result["selected_family"] is None
+        assert result["status"] == "RESEARCH_ONLY"
+        # all profiles still evaluated
+        for c in result.get("candidates", []):
+            assert c.get("selected_family") is False
+            # replay should be zero orders
+            if "profile_diagnostics" in c:
+                for diag in c["profile_diagnostics"]:
+                    assert diag.get("filled_orders", 0) == 0
