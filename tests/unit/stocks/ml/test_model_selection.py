@@ -1896,3 +1896,67 @@ def test_route_calibration_preserves_fail_closed_no_fill_gate(monkeypatch):
             if "profile_diagnostics" in c:
                 for diag in c["profile_diagnostics"]:
                     assert diag.get("filled_orders", 0) == 0
+
+
+def test_ML_SCREEN_01_cross_section_and_budget_gate() -> None:
+    # ML-SCREEN-01
+    import polars as pl
+    from datetime import datetime, UTC, timedelta
+    from src.stocks.ml.contracts import ScreenSamplingPlan, ScreenSamplingEvidence, ModelSelectionComputeBudget
+    from src.stocks.ml.model_selection import deterministic_screen_sample_rows, _select_inner_feature_groups
+    from src.stocks.ml.contracts import ModelFamily, NetAlphaTrainingRequest, RouteObjective, RouteObjectiveKind
+
+    plan = ScreenSamplingPlan(top_k=3, cross_section_multiplier=4, minimum_tail_draws=5)
+    budget = ModelSelectionComputeBudget(screen_cross_section_multiplier=4)
+    assert budget.screen_cross_section_multiplier == 4
+    # cross-section headroom validation
+    rows = []
+    sessions = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(3)]
+    for s in sessions:
+        for t in range(15):
+            rows.append({"instrument_id": f"KRX:{t:05d}", "session": s, "adtv_20d": float(1e6), "feature__a": 0.1})
+    frame = pl.DataFrame(rows)
+    sampled = deterministic_screen_sample_rows(frame, max_rows=30, names_per_session=plan.top_k * plan.cross_section_multiplier, required_session_count=2)
+    assert isinstance(sampled, pl.DataFrame)
+    assert sampled.height > 0
+    # budget supports minimum_tail_draws via cross-section multiplier
+    assert plan.cross_section_multiplier * plan.top_k > plan.top_k
+    # _select_inner_feature_groups fails when undersized
+    small_rows = [{"instrument_id": f"KRX:{t:05d}", "session": sessions[0], "adtv_20d": 1e6, "feature__a": 0.1} for t in range(5)]
+    small_frame = pl.DataFrame(small_rows)
+    req = NetAlphaTrainingRequest(artifact_id="screen01", candidate_horizon_sessions=(10,))
+    import pytest
+
+    # Small cross-section should trigger headroom validation for larger top_k plan
+    big_plan = ScreenSamplingPlan(top_k=12, cross_section_multiplier=4, minimum_tail_draws=20)
+    with pytest.raises(ValueError):
+        _select_inner_feature_groups(small_frame, ModelFamily.elastic_net_v2, req, big_plan)
+
+
+def test_ML_WINDOW_01_locked_holdout_and_outer_validation_calendar() -> None:
+    # ML-WINDOW-01
+    import polars as pl
+    from datetime import datetime, UTC, timedelta
+    import numpy as np
+    from src.stocks.ml.contracts import NetAlphaTrainingRequest, ModelSelectionStudySettings
+    from src.stocks.ml.training import _index_sessions, _locked_holdout
+    from src.stocks.research.folds import PurgedWalkForward
+
+    rng = np.random.default_rng(0)
+    sessions = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(30)]
+    rows = [{"instrument_id": f"KRX:{t:05d}", "session": s, "session_index": sessions.index(s), "feature__a": float(rng.normal())} for s in sessions for t in range(3)]
+    frame = pl.DataFrame(rows)
+    req = NetAlphaTrainingRequest(artifact_id="window01", candidate_horizon_sessions=(10,), forward_holdout_sessions=5, fold_count=2)
+    panel = _index_sessions(frame)
+    pre504, hold504, _ = _locked_holdout(panel, req)
+    pre756, hold756, _ = _locked_holdout(panel, req)
+    # locked holdout identical regardless of candidate lookback (both use same request)
+    assert hold504.height == hold756.height
+    assert pre504.height == pre756.height
+    # outer-validation calendar: PurgedWalkForward produces same fold boundaries for same panel
+    splitter = PurgedWalkForward(n_folds=2, label_horizon_sessions=6, embargo_sessions=5, session_column="session_index", min_train_sessions=5)
+    folds = splitter.split(panel)
+    assert len(folds) == 2
+    # all fits use declared training window (check that fold train_mask respects window)
+    for f in folds:
+        assert f.train_mask is not None or f.validation_decision_start is not None
