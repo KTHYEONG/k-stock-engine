@@ -13,12 +13,93 @@ from src.core.instruments import AssetKind
 from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.data.direct import (
     DirectDataRequest,
+    DirectInputReference,
+    DirectReadinessIssue,
+    DirectReadinessReport,
     DirectMarketDataLoader,
     MlMarketData,
 )
 from src.stocks.ml.data import validate_ml_market_data
 from src.stocks.research.models import ModelManifest
 from src.storage.parquet_datasets import ParquetDatasetStore
+
+
+def test_direct_readiness_blocks_causal_or_execution_invalid_data(tmp_path) -> None:
+    """Invalid ranges are rejected before any dataset scan or collect."""
+    loader = DirectMarketDataLoader(
+        base_root=tmp_path / "base",
+        feature_root=tmp_path / "features",
+        label_root=tmp_path / "labels",
+    )
+    request = DirectDataRequest(
+        base_dataset_id="base",
+        feature_dataset_id="features",
+        label_dataset_id="labels",
+        start=date(2024, 2, 1),
+        end=date(2024, 1, 1),
+    )
+    readiness = loader.assess_readiness(request, datetime(2024, 2, 1, tzinfo=UTC))
+    assert "invalid_range" in readiness.error_codes()
+    with pytest.raises(ValueError, match="direct readiness blocked"):
+        loader.load_training_data(request, datetime(2024, 2, 1, tzinfo=UTC), readiness=readiness)
+
+
+def test_direct_readiness_warns_and_excludes_unverifiable_optional_source() -> None:
+    """Optional timing gaps are represented as warnings, never fabricated data."""
+    reference = DirectInputReference(
+        base_dataset_id="base",
+        feature_dataset_id="features",
+        label_dataset_id="labels",
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 2),
+        feature_schema_hash="schema",
+        feature_content_hash=None,
+        cost_evidence_path=None,
+        cost_evidence_hash=None,
+    )
+    report = DirectReadinessReport(
+        input_reference=reference,
+        errors=(),
+        warnings=(DirectReadinessIssue("optional_source_unverifiable", "missing timestamp"),),
+    )
+    assert report.passed
+    assert report.warning_codes() == ("optional_source_unverifiable",)
+
+
+def test_direct_readiness_excludes_fundamentals_without_disclosure_lineage(
+    monkeypatch, tmp_path
+) -> None:
+    """PIT-unverifiable fundamental ratios are excluded, not re-timestamped."""
+    loader = DirectMarketDataLoader(
+        base_root=tmp_path / "base",
+        feature_root=tmp_path / "features",
+        label_root=tmp_path / "labels",
+    )
+    request = DirectDataRequest(
+        base_dataset_id="base",
+        feature_dataset_id="features",
+        label_dataset_id="labels",
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 2),
+    )
+    monkeypatch.setattr(
+        loader._base_store,
+        "content_columns",
+        lambda _: ["instrument_id", "session", "open", "close", "volume", "trading_value"],
+    )
+    monkeypatch.setattr(
+        loader._feature_store,
+        "content_columns",
+        lambda _: ["instrument_id", "session", "feature__bp_ratio", "feature__momentum_5d"],
+    )
+    monkeypatch.setattr(
+        loader._label_store,
+        "content_columns",
+        lambda _: ["instrument_id", "session", "horizon_sessions", "net_alpha_target", "label_available_time"],
+    )
+    report = loader.assess_readiness(request, datetime(2024, 1, 3, tzinfo=UTC))
+    assert "bp_ratio" in report.excluded_sources
+    assert "fundamental_lineage_unavailable" in report.warning_codes()
 
 
 class _PickleableDummy:
