@@ -288,6 +288,8 @@ def test_record_completed_projects_canonical_fields(tmp_path) -> None:
         tmp_path / "results", clock=lambda: datetime(2024, 1, 2, tzinfo=UTC)
     )
     ledger_inst.record_completed(context, _manifest(artifact_id), registry)
+
+
     latest = _latest(tmp_path / "results")
     assert latest["schema_version"] == SCHEMA_VERSION
     assert latest["artifact_id"] == artifact_id
@@ -346,6 +348,24 @@ def test_record_completed_projects_canonical_fields(tmp_path) -> None:
     assert latest["artifact"]["metrics_bytes"] == len(metrics_bytes)
     assert latest["artifact"]["manifest_sha256"] == hashlib.sha256(manifest_bytes).hexdigest()
     assert latest["artifact"]["metrics_sha256"] == hashlib.sha256(metrics_bytes).hexdigest()
+
+
+def test_result_ledger_records_direct_inputs_without_snapshot_id(tmp_path) -> None:
+    """Research records retain direct inputs while omitting snapshot identity."""
+    from datetime import UTC, datetime
+
+    ledger_inst = MlResultLedger(tmp_path / "results")
+    ledger_inst.record_research_outcome(
+        run_id="direct-study",
+        status="completed",
+        data_inputs={"base_dataset_id": "base", "feature_dataset_id": "features"},
+        readiness={"warnings": ["cost_evidence_absent"]},
+        outcome={"total_return": 0.1},
+        started_at=datetime(2024, 1, 1, tzinfo=UTC),
+    )
+    record = json.loads((tmp_path / "results" / "ml_runs" / "direct-study.json").read_text())
+    assert "snapshot_id" not in record["data_inputs"]
+    assert record["data_inputs"]["base_dataset_id"] == "base"
 
 
 def test_record_completed_no_trade(tmp_path) -> None:

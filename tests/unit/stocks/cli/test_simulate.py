@@ -37,6 +37,22 @@ def test_simulate_cli_rejects_missing_snapshot_id() -> None:
         simulate.main(["--artifact-id", "a1"])
 
 
+def test_simulate_direct_inputs_bypass_snapshot_resolution() -> None:
+    """Direct simulation arguments do not require a snapshot identifier."""
+    args = simulate.build_parser().parse_args(
+        [
+            "--artifact-id", "a1",
+            "--base-dataset-id", "base",
+            "--feature-dataset-id", "features",
+            "--label-dataset-id", "labels",
+            "--data-start", "2024-01-01",
+            "--data-end", "2024-03-31",
+        ]
+    )
+    assert args.snapshot_id is None
+    assert args.data_start.isoformat() == "2024-01-01"
+
+
 def test_simulate_cli_rejects_provisional_for_paper_mode(monkeypatch) -> None:
     def fake_resolve(catalog_root, snapshot_id, *, mode):
         raise ValueError(f"snapshot {snapshot_id} is provisional and cannot drive {mode} mode")
