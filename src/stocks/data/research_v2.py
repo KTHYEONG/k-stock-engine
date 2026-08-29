@@ -677,6 +677,8 @@ def _re_read_net_alpha_features(
     expected_columns = ["instrument_id", "session"] + [
         f"feature__{source}" for source, _role in allowlist
     ]
+    if "disclosure_date" in store.content_columns(request.feature_dataset_id):
+        expected_columns.append("disclosure_date")
     if store.content_columns(request.feature_dataset_id) != expected_columns:
         raise ValueError("net-alpha feature re-read column order mismatch")
     research = request.windows.research_range
