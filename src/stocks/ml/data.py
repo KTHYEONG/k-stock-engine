@@ -913,6 +913,10 @@ def compose_net_alpha_training_data(
                 label_select.append(
                     pl.col("reference_cost").alias(REFERENCE_COST_COLUMN)
                 )
+            if "gross_return" in subset.columns:
+                from src.stocks.ml.labels import GROSS_COLUMN as _GROSS_COL
+
+                label_select.append(pl.col("gross_return").alias(_GROSS_COL))
             label_frame = subset.select(label_select)
             feature_rows = frame.filter(pl.col("horizon_sessions") == horizon).height
         else:
@@ -934,6 +938,16 @@ def compose_net_alpha_training_data(
                 )
             if cost_column in frame.columns:
                 select_columns.append(pl.col(cost_column).alias(REFERENCE_COST_COLUMN))
+            # Wide gross column retention for unhedged route.
+            gross_wide = f"gross_o2o_{horizon}d"
+            if gross_wide in frame.columns:
+                from src.stocks.ml.labels import GROSS_COLUMN as _GROSS_COL2
+
+                select_columns.append(pl.col(gross_wide).alias(_GROSS_COL2))
+            elif "gross_return" in frame.columns:
+                from src.stocks.ml.labels import GROSS_COLUMN as _GROSS_COL3
+
+                select_columns.append(pl.col("gross_return").alias(_GROSS_COL3))
             label_frame = frame.select(select_columns)
             feature_rows = frame.height
         label_rows = int(
