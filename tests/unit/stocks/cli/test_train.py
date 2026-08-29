@@ -39,6 +39,29 @@ def test_train_cli_rejects_missing_snapshot_id() -> None:
         train.main(["--artifact-id", "a1"])
 
 
+def test_train_rejects_partial_direct_input_group() -> None:
+    """A partial direct dataset group fails before loader/catalog access."""
+    with pytest.raises(SystemExit):
+        train.main(["--artifact-id", "partial", "--base-dataset-id", "base"])
+
+
+def test_model_selection_direct_inputs_never_resolve_snapshot() -> None:
+    """The direct model-selection contract is represented by parser inputs."""
+    args = train.build_parser().parse_args(
+        [
+            "--artifact-id", "study",
+            "--research-only-model-selection-study",
+            "--base-dataset-id", "base",
+            "--feature-dataset-id", "features",
+            "--label-dataset-id", "labels",
+            "--data-start", "2024-01-01",
+            "--data-end", "2024-03-31",
+        ]
+    )
+    assert args.snapshot_id is None
+    assert args.base_dataset_id == "base"
+
+
 def test_train_cli_rejects_legacy_trial_flag() -> None:
     with pytest.raises(SystemExit):
         train.main(
