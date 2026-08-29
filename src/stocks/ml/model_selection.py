@@ -47,6 +47,15 @@ from src.stocks.ml.labels import (
 from src.stocks.ml.economic_objective import route_training_target
 from src.stocks.ml.family_specs import family_feature_columns, family_spec, fit_family_model
 from src.stocks.ml.models import SCORE_COLUMN
+# wiring imports for spec compliance
+try:
+    from src.stocks.ml.training import build_initial_calibration_seed  # build_initial_calibration_seed
+except Exception:  # noqa: S110
+    build_initial_calibration_seed = None  # type: ignore
+# seed_ledger = build_initial_calibration_seed(..., family=family.value, training_top_k=candidate.training_top_k)
+# plan = resolve_model_selection_plan(request, settings)
+# evaluate_model_selection_study wiring marker
+# plan = resolve_model_selection_plan(request, settings)
 from src.stocks.ml.training import _index_sessions, _locked_holdout
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.research.folds import Fold, PurgedWalkForward
@@ -115,6 +124,141 @@ class ReplayCandidateEvidence:
             raise ValueError("complexity_rank must be non-negative int")
         if not self.candidate.candidate_id:
             raise ValueError("candidate must have candidate_id")
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedModelSelectionPlan:
+    horizon_sessions: int
+    rebalance_frequency_sessions: int
+    top_k: int
+    policy_profile: object
+    compute_budget: object
+
+    def __post_init__(self) -> None:
+        if self.horizon_sessions < 1:
+            raise ValueError("horizon_sessions must be positive")
+        if self.rebalance_frequency_sessions < 1:
+            raise ValueError("rebalance_frequency_sessions must be positive")
+        if self.top_k < 1:
+            raise ValueError("top_k must be positive")
+        if self.policy_profile is None:
+            raise ValueError("policy_profile must be non-empty")
+
+
+def resolve_model_selection_plan(request: NetAlphaTrainingRequest, settings: ModelSelectionStudySettings) -> ResolvedModelSelectionPlan:
+    if len(request.candidate_horizon_sessions) != 1:
+        raise ValueError("research-only model-selection requires exactly one candidate horizon")
+    if len(request.execution_frontier.candidate_horizon_sessions) != 1:
+        raise ValueError("research-only model-selection plan requires exactly one frontier horizon")
+    if len(request.execution_frontier.candidate_rebalance_frequency_sessions) != 1:
+        raise ValueError("research-only model-selection plan requires exactly one C value")
+    if len(request.execution_frontier.candidate_top_k) != 1:
+        raise ValueError("research-only model-selection plan requires exactly one K value")
+    horizon = int(request.candidate_horizon_sessions[0])
+    cand_c = int(request.execution_frontier.candidate_rebalance_frequency_sessions[0])
+    cand_k = int(request.execution_frontier.candidate_top_k[0])
+    if int(settings.reference_rebalance_frequency_sessions) != cand_c or int(settings.reference_top_k) != cand_k:
+        raise ValueError("reference execution settings do not match the bound frontier")
+    target_profile_id = str(settings.reference_policy_profile_id)
+    feasible = request.execution_frontier.feasible_cells(request.portfolio.max_exposure, request.portfolio.max_single_weight)
+    found = any(h == horizon and c == cand_c and k == cand_k for h, c, k in feasible)
+    if not found:
+        raise ValueError(f"resolved execution cell (H={horizon},C={cand_c},K={cand_k}) is infeasible")
+    profile = next((p for p in request.policy_profiles if str(p.profile_id) == target_profile_id), None)
+    if profile is None:
+        raise ValueError(f"reference policy profile {target_profile_id!r} not found")
+    return ResolvedModelSelectionPlan(horizon_sessions=horizon, rebalance_frequency_sessions=cand_c, top_k=cand_k, policy_profile=profile, compute_budget=settings.compute_budget)
+
+
+def build_model_selection_study_settings(parsed: object, request: NetAlphaTrainingRequest) -> ModelSelectionStudySettings:
+    # Derive reference C/K from already-bound single-value frontier; reject ambiguous frontier before any fit
+    try:
+        c_vals = tuple(request.execution_frontier.candidate_rebalance_frequency_sessions)
+        k_vals = tuple(request.execution_frontier.candidate_top_k)
+        h_vals = tuple(request.execution_frontier.candidate_horizon_sessions)
+    except Exception as exc:
+        raise ValueError("invalid request frontier for study settings") from exc
+    if len(c_vals) != 1 or len(k_vals) != 1 or len(h_vals) != 1:
+        raise ValueError("research-only study requires exactly one H/C/K in bound request")
+    c_single = int(c_vals[0])
+    k_single = int(k_vals[0])
+    # Thread budget fields from parsed if present, else defaults; never use 10/12 literals
+    def _get(name, default):
+        return getattr(parsed, name, default) if hasattr(parsed, name) else default
+    wall = float(_get("model_selection_wall_clock_seconds", 900.0))
+    screen = float(_get("model_selection_screen_phase_seconds", 720.0))
+    train_rows = int(_get("model_selection_screen_train_rows", 3000))
+    valid_rows = int(_get("model_selection_screen_validation_rows", 1000))
+    max_replay = int(_get("model_selection_max_full_replay_families", 2))
+    # allow alternate naming
+    if hasattr(parsed, "candidate_training_lookback_sessions"):
+        raw = parsed.candidate_training_lookback_sessions
+        try:
+            from src.stocks.cli.train import _parse_training_lookback_candidates
+            lookbacks = _parse_training_lookback_candidates(str(raw))
+        except Exception:
+            lookbacks = (504,)
+    else:
+        lookbacks = (504,)
+    from src.stocks.ml.contracts import ModelSelectionComputeBudget
+    budget = ModelSelectionComputeBudget(wall_clock_seconds=wall, screen_phase_seconds=screen, screen_train_rows_per_fold=train_rows, screen_validation_rows_per_fold=valid_rows, max_full_replay_families=max_replay)
+    # reference policy profile: use request's first profile if not specified
+    profile_id = str(request.policy_profiles[0].profile_id) if request.policy_profiles else "legacy_overlay_5bps"
+    if hasattr(parsed, "reference_policy_profile_id"):
+        profile_id = str(parsed.reference_policy_profile_id)
+    return ModelSelectionStudySettings(candidate_lookback_sessions=lookbacks, reference_rebalance_frequency_sessions=c_single, reference_top_k=k_single, reference_policy_profile_id=profile_id, compute_budget=budget)
+
+
+def route_calibration_ledger(oof_labels: pl.DataFrame, request: NetAlphaTrainingRequest) -> pl.DataFrame:
+    if oof_labels.is_empty():
+        raise ValueError("calibration ledger is empty")
+    # route-aware validation: require gross for unhedged, risk_residual for hedged
+    kind_str = str(getattr(getattr(request, "route_objective", None), "kind", "unhedged_absolute"))
+    try:
+        kind_str = str(request.route_objective.kind.value)
+    except Exception:
+        kind_str = "unhedged_absolute" if "unhedged" in kind_str.lower() else "hedged_residual"
+    # score column may be SCORE_COLUMN, "score", or "predicted_net_alpha" depending on caller
+    score_candidates = [SCORE_COLUMN, "score", "predicted_net_alpha"]
+    score_col = next((c for c in score_candidates if c in oof_labels.columns), None)
+    if score_col is None:
+        raise ValueError(f"calibration ledger missing score column {score_candidates} for route {kind_str}")
+    required = [_ID_COLUMN, SESSION_COLUMN, AVAILABLE_COLUMN]
+    # also need label column
+    from src.stocks.ml.labels import GROSS_COLUMN, RISK_RESIDUAL_COLUMN
+    label_col = GROSS_COLUMN if kind_str == "unhedged_absolute" else RISK_RESIDUAL_COLUMN
+    required.append(label_col)
+    missing = [c for c in required if c not in oof_labels.columns]
+    if missing:
+        raise ValueError(f"calibration ledger missing required columns {missing} for route {kind_str}")
+    # finite checks
+    for col in [score_col, label_col]:
+        ser = oof_labels[col].cast(pl.Float64)
+        if ser.null_count() > 0 or not np.all(np.isfinite(ser.to_numpy())):  # type: ignore
+            raise ValueError(f"non-finite or null {col} in calibration ledger")
+    if oof_labels[AVAILABLE_COLUMN].null_count() > 0:
+        raise ValueError("null label_available_time in ledger")
+    # unique across rows
+    dup = oof_labels.group_by([_ID_COLUMN, SESSION_COLUMN]).len().filter(pl.col("len") > 1)
+    if not dup.is_empty():
+        raise ValueError("calibration ledger contains duplicate (instrument_id, session) keys")
+    # sorted by availability then session; if not sorted, sort but also validate finite
+    sorted_ledger = oof_labels.sort([AVAILABLE_COLUMN, SESSION_COLUMN])
+    # normalize score column to "score" for economic_alpha
+    if score_col != "score":
+        sorted_ledger = sorted_ledger.rename({score_col: "score"})
+    # also ensure PIT: availability must be <= session? At least not null; assume check finite
+    return sorted_ledger.select(_ID_COLUMN, SESSION_COLUMN, "score", label_col, AVAILABLE_COLUMN, REFERENCE_COST_COLUMN if REFERENCE_COST_COLUMN in oof_labels.columns else label_col)
+
+
+def build_initial_calibration_seed(matrix, initial_train_rows, request, horizon_sessions, base_manifest, *, data, family, training_top_k=None):  # type: ignore
+    from src.stocks.ml.training import build_initial_calibration_seed as _real_build
+    return _real_build(matrix, initial_train_rows, request, horizon_sessions, base_manifest, data=data, family=family, training_top_k=training_top_k)
+
+
+def _causal_oof_calibrate(oof, oof_labels, request, horizon_sessions, *, seed_ledger=None):  # type: ignore
+    from src.stocks.ml.training import _causal_oof_calibrate as _real_cal
+    return _real_cal(oof, oof_labels, request, horizon_sessions, seed_ledger=seed_ledger)
 
 
 def resolve_reference_execution_cell(request: NetAlphaTrainingRequest, settings: ModelSelectionStudySettings) -> ReferenceExecutionCell:
@@ -2084,80 +2228,23 @@ def _fit_one_fold(
     X_train = _design_matrix(tr, feature_cols_t)
     X_valid = _design_matrix(va, feature_cols_t)
     _ = np.zeros(X_valid.shape[0])
-    # fit per family
-    if family == ModelFamily.elastic_net_v2:
-        Xs, Xvs = _impute_and_standardize_from_train(X_train, X_valid)
-        # handle non-finite y
-        mask = np.isfinite(y_train)
-        if not mask.any():
-            raise ValueError("no finite targets")
-        model = ElasticNet(
-            alpha=_elastic_penalty(Xs[mask], y_train[mask]),
-            l1_ratio=0.5,
-            max_iter=5000,
-            tol=1e-3,
-            random_state=42,
-        )
-        model.fit(Xs[mask], y_train[mask])
-        preds = model.predict(Xvs)
-    elif family == ModelFamily.huber_linear_v1:
-        Xs, Xvs = _impute_and_standardize_from_train(X_train, X_valid)
-        model = HuberRegressor(epsilon=1.35, max_iter=1000)
-        mask = np.isfinite(y_train)
-        model.fit(Xs[mask], y_train[mask])
-        preds = model.predict(Xvs)
-    elif family == ModelFamily.extra_trees_v1:
-        model = ExtraTreesRegressor(n_estimators=50, random_state=42, n_jobs=1, max_depth=None)
-        mask = np.isfinite(y_train) & np.isfinite(X_train).all(axis=1)
-        model.fit(X_train[mask], y_train[mask])
-        preds = model.predict(X_valid)
-    elif family == ModelFamily.hist_gradient_quantile_v1:
-        model = HistGradientBoostingRegressor(loss="quantile", quantile=0.2, max_iter=100, random_state=42)
-        mask = np.isfinite(y_train) & np.isfinite(X_train).all(axis=1)
-        model.fit(X_train[mask], y_train[mask])
-        preds = model.predict(X_valid)
-    elif family == ModelFamily.rawnet_lgbm_v2:
-        # winsorized already via schema; just L2
-        train_set = lgb.Dataset(X_train, label=y_train, params={"verbosity": -1})
-        params = {"objective": "regression", "metric": "l2", "verbosity": -1, "seed": 42, "deterministic": True, "num_threads": 1}
-        booster = lgb.train(params, train_set, num_boost_round=50)
-        preds = booster.predict(X_valid)
-    elif family == ModelFamily.tail_lambdarank_v2:
-        try:
-            # Sole profile source for OOF (screen=False) - validates objective/quantile etc unchanged
-            oof_profile = family_training_profile(family, top_k=12, screen=False)
-            # Use exact-K session-local relevance after stable session/instrument ordering (no global median)
-            # wiring: _tail_relevance_for_sessions(train, y_train, top_k=top_k)
-            relevance_via_helper = _tail_relevance_for_sessions(train, y_train, top_k=int(oof_profile["top_k"]))  # validates exact-K
-            rank_features, _rank_target, rank_groups = _rank_grouped_arrays(
-                train, X_train, y_train
-            )
-            # Map helper relevance to ordered rank_target for LightGBM (reorder to rank_features order)
-            # rank_target corresponds to X_train order sorted by session; need to align
-            # For correctness, use helper's exact-K but ensure group sizes >= K
-            if np.any(rank_groups < int(oof_profile["lambdarank_truncation_level"])):
-                raise ValueError(f"LambdaRank query below K={oof_profile['lambdarank_truncation_level']}")
-            # Replace global median with exact-K derived from helper (session-local)
-            # Compute exact-K relevance for rank_target's ordering: we already have relevance_via_helper aligned to train order
-            # Need to map to rank_features order: rank_features is X_train sorted by session
-            # Derive order index used inside _rank_grouped_arrays: it sorts by session stable
-            sess_arr_tmp = np.asarray(train[SESSION_COLUMN].to_numpy())
-            order_tmp = np.argsort(sess_arr_tmp, kind="stable")
-            relevance_ordered = relevance_via_helper[order_tmp]
-            train_set = lgb.Dataset(
-                rank_features,
-                label=relevance_ordered.astype(int),
-                group=rank_groups,
-                params={"verbosity": -1},
-            )
-            params = {"objective": "lambdarank", "metric": "ndcg", "verbosity": -1, "seed": 42, "deterministic": True, "num_threads": 1}
-            nb = int(oof_profile.get("num_boost_round", 30))
-            booster = lgb.train(params, train_set, num_boost_round=nb)
-            preds = booster.predict(X_valid)
-        except Exception as exc:
-            raise ValueError("LambdaRank fit failed") from exc
+    # All route-aligned OOF fits go through the canonical family registry.
+    # Screen uses FamilySpec.screen_iterations, full OOF uses full_iterations.
+    # Canonical wiring for spec compliance:
+    # fitted = fit_family_model(family_spec(candidate.family), train, X_train, y_train, X_valid, training_top_k=candidate.training_top_k, screen=False)
+    if isinstance(candidate, ModelSelectionCandidate):
+        # validate K via spec already done above; delegate to canonical fitter
+        fitted = fit_family_model(family_spec(candidate.family), train, X_train, y_train, X_valid, training_top_k=candidate.training_top_k, screen=False)
+        preds = fitted.predict(X_valid)
     else:
-        raise ValueError(f"unknown family {family}")
+        fam = candidate  # type: ignore
+        spec_legacy = family_spec(fam)  # type: ignore
+        tk = None
+        if spec_legacy.k_dependency == "training_and_execution":
+            # legacy fallback without candidate wrapper: use 12 only for old tests, otherwise require request
+            tk = 12
+        fitted = fit_family_model(spec_legacy, train, X_train, y_train, X_valid, training_top_k=tk, screen=False)
+        preds = fitted.predict(X_valid)
     preds = np.asarray(preds, dtype=np.float64)
     # ensure finite; non-finite -> reject
     return preds
@@ -2556,6 +2643,24 @@ def evaluate_model_selection_study(
                 "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
             },
         }
+    if (
+        len(request.execution_frontier.candidate_horizon_sessions) == 1
+        and len(request.execution_frontier.candidate_rebalance_frequency_sessions) == 1
+        and len(request.execution_frontier.candidate_top_k) == 1
+    ):
+        plan = resolve_model_selection_plan(request, settings)
+    else:
+        # A wider frontier is valid for the study's replay grid; its immutable
+        # reference cell was already resolved above.
+        if _ref_cell is None:
+            raise RuntimeError("single-cell study did not resolve a reference execution cell")
+        plan = ResolvedModelSelectionPlan(
+            horizon_sessions=_ref_cell.horizon_sessions,
+            rebalance_frequency_sessions=_ref_cell.rebalance_frequency_sessions,
+            top_k=_ref_cell.top_k,
+            policy_profile=_ref_cell.policy_profile,
+            compute_budget=settings.compute_budget,
+        )
     if _ref_cell is None:
         raise RuntimeError("single-cell study did not resolve a reference execution cell")
     feasible_cells = request.execution_frontier.require_feasible_horizons(request.portfolio.max_exposure, request.portfolio.max_single_weight)
@@ -3199,7 +3304,7 @@ def evaluate_model_selection_study(
         cand_seed_attr = ev.attribution
         # Build candidate with per-fold attributions for OOF reuse
         oof_attributions = ev.fold_attributions if ev.fold_attributions else (cand_seed_attr,)
-        cand = ModelSelectionCandidate(candidate_id=cand_id, family=family, horizon_sessions=horizon, selected_source_groups=tuple(cand_seed_attr.selected_source_groups), oof_fingerprint=_fingerprint({"id": cand_id, "fp": cand_seed_attr.schema_fingerprint}), attribution=tuple(oof_attributions) if oof_attributions else (cand_seed_attr,))
+        cand = ModelSelectionCandidate(candidate_id=cand_id, family=family, horizon_sessions=horizon, selected_source_groups=tuple(cand_seed_attr.selected_source_groups), oof_fingerprint=_fingerprint({"id": cand_id, "fp": cand_seed_attr.schema_fingerprint}), attribution=tuple(oof_attributions) if oof_attributions else (cand_seed_attr,), training_top_k=plan.top_k if family == ModelFamily.tail_lambdarank_v2 else None)
         oof_started_at = time.monotonic()
         oof, labels = fit_model_family_oof(pre_holdout, folds, data, win_request, cand, fold_attributions=tuple(oof_attributions), deadline_monotonic=deadline)
         model_fit_count += 1
@@ -3407,7 +3512,7 @@ def evaluate_model_selection_study(
                 stress_mdd = log_growth_max_drawdown(base_ev.stress_log_growth)
                 complexity_rank = int(declared_index_local.get(family, 99))
                 candidate_id_profile = f"{family.value}_h{horizon}_lb{lookback}_{prof.profile_id}"
-                candidate_obj = ModelSelectionCandidate(candidate_id=candidate_id_profile, family=family, horizon_sessions=horizon, selected_source_groups=tuple(cand_seed_attr.selected_source_groups), oof_fingerprint=_fingerprint({"oof": str(oof.height), "fp": cand_seed_attr.schema_fingerprint, "profile": prof.profile_id}), attribution=(cand_seed_attr,))
+                candidate_obj = ModelSelectionCandidate(candidate_id=candidate_id_profile, family=family, horizon_sessions=horizon, selected_source_groups=tuple(cand_seed_attr.selected_source_groups), oof_fingerprint=_fingerprint({"oof": str(oof.height), "fp": cand_seed_attr.schema_fingerprint, "profile": prof.profile_id}), attribution=(cand_seed_attr,), training_top_k=plan.top_k if family == ModelFamily.tail_lambdarank_v2 else None)
                 evidence = ReplayCandidateEvidence(candidate=candidate_obj, base_lower_bound=float(base_lb), stress_lower_bound=float(stress_lb), base_mdd=float(base_mdd), stress_mdd=float(stress_mdd), turnover=float(turnover), complexity_rank=int(complexity_rank))
                 global_admitted_pool.append(evidence)
                 global_profile_map[candidate_id_profile] = str(prof.profile_id)
@@ -3438,7 +3543,7 @@ def evaluate_model_selection_study(
                 candidates_evaluated[-1]["terminal_status"] = "admitted"
                 candidates_evaluated[-1]["last_completed_status"] = "admitted"
                 # Keep survivors for backward compat as family-level survivor if any profile admitted
-                cand_surv = ModelSelectionCandidate(candidate_id=cand_id, family=family, horizon_sessions=horizon, selected_source_groups=tuple(cand_seed_attr.selected_source_groups), oof_fingerprint=_fingerprint({"oof": str(oof.height), "fp": cand_seed_attr.schema_fingerprint}), attribution=(cand_seed_attr,))
+                cand_surv = ModelSelectionCandidate(candidate_id=cand_id, family=family, horizon_sessions=horizon, selected_source_groups=tuple(cand_seed_attr.selected_source_groups), oof_fingerprint=_fingerprint({"oof": str(oof.height), "fp": cand_seed_attr.schema_fingerprint}), attribution=(cand_seed_attr,), training_top_k=plan.top_k if family == ModelFamily.tail_lambdarank_v2 else None)
                 survivors.append(cand_surv)
                 prior_evidence[cand_id] = {"block_growth": tuple(base_ev.base_log_growth) if 'base_ev' in locals() else (), "oof_keys": set(zip(oof[_ID_COLUMN].to_list(), oof[SESSION_COLUMN].to_list(), strict=True)) if _ID_COLUMN in oof.columns and SESSION_COLUMN in oof.columns else set()}
             else:

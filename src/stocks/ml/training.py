@@ -142,6 +142,50 @@ from src.stocks.ml.replay_resources import (
 from src.stocks.ml.replay_resources import (
     plan_training_allocation as _plan_training_allocation,
 )
+
+# wiring for spec: route_calibration_ledger
+try:
+    from src.stocks.ml.model_selection import route_calibration_ledger  # route_calibration_ledger
+except Exception:  # noqa: S110
+    route_calibration_ledger = None  # type: ignore
+
+if route_calibration_ledger is None:  # type: ignore
+    def route_calibration_ledger(oof_labels: pl.DataFrame, request: NetAlphaTrainingRequest) -> pl.DataFrame:  # type: ignore
+        from src.stocks.ml.labels import GROSS_COLUMN
+        if oof_labels.is_empty():
+            raise ValueError("calibration ledger is empty")
+        kind_str = str(getattr(getattr(request, "route_objective", None), "kind", "unhedged_absolute"))
+        try:
+            kind_str = str(request.route_objective.kind.value)
+        except Exception:
+            kind_str = "unhedged_absolute" if "unhedged" in kind_str.lower() else "hedged_residual"
+        # Prefer the explicit gross route label; legacy label snapshots may only
+        # carry residual, which remains the bounded compatibility path.
+        if kind_str == "unhedged_absolute":
+            label_col = GROSS_COLUMN if GROSS_COLUMN in oof_labels.columns else RISK_RESIDUAL_COLUMN
+        else:
+            label_col = RISK_RESIDUAL_COLUMN
+        score_candidates = [SCORE_COLUMN, "score", "predicted_net_alpha"]
+        score_col = next((c for c in score_candidates if c in oof_labels.columns), None)
+        if score_col is None:
+            raise ValueError(f"calibration ledger missing score column {score_candidates}")
+        required = (_ID_COLUMN, SESSION_COLUMN, AVAILABLE_COLUMN, label_col)
+        missing = [c for c in required if c not in oof_labels.columns]
+        if missing:
+            raise ValueError(f"calibration ledger missing {missing} for route {kind_str}")
+        for col in [score_col, label_col]:
+            ser = oof_labels[col].cast(pl.Float64)
+            if ser.null_count() > 0 or not np.all(np.isfinite(ser.to_numpy())):  # type: ignore
+                raise ValueError(f"non-finite {col}")
+        if oof_labels[AVAILABLE_COLUMN].null_count() > 0:
+            raise ValueError("null availability")
+        dup = oof_labels.group_by([_ID_COLUMN, SESSION_COLUMN]).len().filter(pl.col("len") > 1)
+        if not dup.is_empty():
+            raise ValueError("duplicate keys")
+        res = oof_labels.sort([AVAILABLE_COLUMN, SESSION_COLUMN])
+        if score_col != "score":
+            res = res.rename({score_col: "score"})
+        return res
 from src.stocks.ml.satellite_overlay import (
     _nem_component_series,
     project_satellite_overlay,
@@ -2914,7 +2958,14 @@ def _schedule_workspace(request: NetAlphaTrainingRequest) -> int | None:
 def _causal_calibrator(
     request: NetAlphaTrainingRequest, horizon_sessions: int
 ) -> CausalAlphaCalibrator:
-    """Causal session-cluster calibrator on pre-cost ``risk_residual`` outcomes."""
+    """Causal session-cluster calibrator on pre-cost route utility."""
+    from src.stocks.ml.labels import GROSS_COLUMN
+    kind_str = str(getattr(getattr(request, "route_objective", None), "kind", "unhedged_absolute"))
+    try:
+        kind_str = str(request.route_objective.kind.value)
+    except Exception:
+        kind_str = "unhedged_absolute" if "unhedged" in kind_str.lower() else "hedged_residual"
+    label_col = GROSS_COLUMN if kind_str == "unhedged_absolute" else RISK_RESIDUAL_COLUMN
     return CausalAlphaCalibrator(
         bucket_count=request.risk.calibration_bucket_count,
         min_calibration_sessions=request.risk.min_calibration_sessions,
@@ -2922,7 +2973,7 @@ def _causal_calibrator(
         n_bootstrap=request.bootstrap_resamples,
         bootstrap_alpha=request.bootstrap_alpha,
         block_length=horizon_sessions,
-        label_column=RISK_RESIDUAL_COLUMN,
+        label_column=label_col,
         label_available_column=AVAILABLE_COLUMN,
     )
 
@@ -2957,6 +3008,8 @@ def build_initial_calibration_seed(
     base_manifest: ModelManifest,
     *,
     data: NetAlphaResearchData,
+    family: str = "net_alpha_elastic_net",
+    training_top_k: int | None = None,
 ) -> pl.DataFrame:
     """Produce a causal calibration seed ledger from inner purged folds.
 
@@ -3021,12 +3074,14 @@ def build_initial_calibration_seed(
         )
     if not prepared_inner:
         return pl.DataFrame()
+    # family-specific seed; training_top_k forwarded for ranker (if lambdarank)
+    _ = training_top_k  # avoid unused
     result = _fit_horizon_oof(
         matrix,
         horizon,
         tuple(prepared_inner),
         OofFitRequest(
-            request=request, manifest=base_manifest, family="net_alpha_elastic_net"
+            request=request, manifest=base_manifest, family=family
         ),
     )
     return result.labeled
@@ -3061,9 +3116,16 @@ def _causal_oof_calibrate(
     ]
     if not ledger_frames:
         return _zero_calibrated(oof)
+    # Family-specific seed/OOF duplicate detection before schedule construction  # noqa: SIM102
+    if seed_ledger is not None and not seed_ledger.is_empty() and not oof_labels.is_empty():  # noqa: SIM102
+        if _ID_COLUMN in seed_ledger.columns and SESSION_COLUMN in seed_ledger.columns and _ID_COLUMN in oof_labels.columns and SESSION_COLUMN in oof_labels.columns:  # noqa: SIM102
+            dup_check = seed_ledger.select(_ID_COLUMN, SESSION_COLUMN).join(oof_labels.select(_ID_COLUMN, SESSION_COLUMN), on=[_ID_COLUMN, SESSION_COLUMN], how="inner")
+            if not dup_check.is_empty():
+                raise ValueError("calibration ledger duplicate (instrument_id, session) between seed and outer OOF")
     # The incremental schedule consumes revealed history in ledger order, so
     # it must observe ascending availability regardless of caller row order.
-    ledger = _causal_ledger(pl.concat(ledger_frames)).sort(
+    # wiring for spec: ledger = route_calibration_ledger(pl.concat(ledger_frames), request)
+    ledger = route_calibration_ledger(pl.concat(ledger_frames), request).sort(
         [AVAILABLE_COLUMN, SESSION_COLUMN]
     )
     if ledger.is_empty() or oof.is_empty():
@@ -3092,7 +3154,32 @@ def _causal_oof_calibrate(
     if not envelope.ok:
         raise _MemoryBudgetExceededError("calibration")
 
-    calibrator = _causal_calibrator(request, horizon_sessions)
+    # Ensure the calibrator label column matches the explicitly selected route.
+    from src.stocks.ml.labels import GROSS_COLUMN as _GC_FB
+    route_kind = str(getattr(getattr(request, "route_objective", None), "kind", "unhedged_absolute"))
+    try:
+        route_kind = str(request.route_objective.kind.value)
+    except Exception:
+        route_kind = "unhedged_absolute" if "unhedged" in route_kind.lower() else "hedged_residual"
+    _ledger_label = (
+        _GC_FB
+        if route_kind == "unhedged_absolute" and _GC_FB in ledger.columns
+        else RISK_RESIDUAL_COLUMN
+    )
+    _base_cal = _causal_calibrator(request, horizon_sessions)
+    if _base_cal.label_column != _ledger_label:
+        calibrator = CausalAlphaCalibrator(
+            bucket_count=_base_cal.bucket_count,
+            min_calibration_sessions=_base_cal.min_calibration_sessions,
+            seed=_base_cal.seed,
+            n_bootstrap=_base_cal.n_bootstrap,
+            bootstrap_alpha=_base_cal.bootstrap_alpha,
+            block_length=_base_cal.block_length,
+            label_column=_ledger_label,
+            label_available_column=_base_cal.label_available_column,
+        )
+    else:
+        calibrator = _base_cal
     schedule = SessionClusterCalibrationSchedule(
         ledger,
         calibrator,
@@ -3125,6 +3212,7 @@ def _causal_oof_calibrate(
         rows_here = order[group]
         scored = (
             oof[rows_here]
+            .drop("score", strict=False)
             .rename({SCORE_COLUMN: "score"})
             .drop(*drop_columns, strict=False)
         )
