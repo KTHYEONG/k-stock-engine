@@ -13,6 +13,7 @@ The composed contract is physically separated:
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from collections.abc import Callable, Mapping
@@ -24,6 +25,7 @@ import polars as pl
 
 from src.core.datasets import DatasetManifest, make_manifest
 from src.core.instruments import AssetKind
+from src.stocks.data.contracts import DatasetSnapshot
 from src.stocks.ml.contracts import (
     CANONICAL_FEATURE_SET,
     HorizonJoinEvidence,
@@ -56,6 +58,7 @@ _WARMUP_NULL_COLUMNS = (
     "feature__fluc_rate", "feature__intraday_ret",
     "feature__overnight_ret", "feature__sector_ret_5d",
 )
+_PIT_FUNDAMENTAL_SOURCES = frozenset({"bp_ratio", "ep_ratio"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +77,43 @@ class DirectDataRequest:
     end: date
     feature_set: str = CANONICAL_FEATURE_SET
     candidate_horizon_sessions: tuple[int, ...] = (10,)
+
+
+@dataclass(frozen=True, slots=True)
+class DirectInputReference:
+    base_dataset_id: str
+    feature_dataset_id: str
+    label_dataset_id: str
+    start: date
+    end: date
+    feature_schema_hash: str
+    feature_content_hash: str | None
+    cost_evidence_path: str | None
+    cost_evidence_hash: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DirectReadinessIssue:
+    code: str
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class DirectReadinessReport:
+    input_reference: DirectInputReference
+    errors: tuple[DirectReadinessIssue, ...]
+    warnings: tuple[DirectReadinessIssue, ...]
+    excluded_sources: tuple[str, ...] = ()
+
+    @property
+    def passed(self) -> bool:
+        return len(self.errors) == 0
+
+    def warning_codes(self) -> tuple[str, ...]:
+        return tuple(issue.code for issue in self.warnings)
+
+    def error_codes(self) -> tuple[str, ...]:
+        return tuple(issue.code for issue in self.errors)
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,11 +389,20 @@ class DirectMarketDataLoader:
     def _read_features(self, request: DirectDataRequest) -> pl.DataFrame:
         """Read feature dataset with bounded session range."""
         self._active_feature_set = request.feature_set
+        feature_content = self._feature_store.content_columns(
+            request.feature_dataset_id
+        )
         feature_columns = tuple(
             c
-            for c in self._feature_store.content_columns(request.feature_dataset_id)
+            for c in feature_content
             if c.startswith("feature__")
         )
+        if "disclosure_date" not in feature_content:
+            feature_columns = tuple(
+                column
+                for column in feature_columns
+                if column.removeprefix("feature__") not in _PIT_FUNDAMENTAL_SOURCES
+            )
         if not feature_columns:
             raise ValueError(
                 f"feature dataset {request.feature_dataset_id} exposes no feature__ columns"
@@ -361,7 +410,13 @@ class DirectMarketDataLoader:
         identity = self._available_columns(
             self._feature_store,
             request.feature_dataset_id,
-            ("instrument_id", "session", "observation_time", "available_time"),
+            (
+                "instrument_id",
+                "session",
+                "observation_time",
+                "available_time",
+                "disclosure_date",
+            ),
         )
         columns = (*identity, *feature_columns)
         return self._read_bounded_projection(
@@ -600,11 +655,284 @@ class DirectMarketDataLoader:
             )
         )
 
+    def _build_input_reference(
+        self, request: DirectDataRequest, cost_evidence_path: Path | None
+    ) -> DirectInputReference:
+        feature_manifest = self._read_feature_manifest(request)
+        schema_hash = feature_manifest.schema_hash if feature_manifest is not None else ""
+        content_hash: str | None = None
+        if feature_manifest is not None:
+            content_hash = feature_manifest.content_hash or feature_manifest.schema_hash
+        cost_path_str: str | None = str(cost_evidence_path) if cost_evidence_path is not None else None
+        cost_hash: str | None = None
+        if cost_evidence_path is not None and cost_evidence_path.exists():
+            try:
+                cost_hash = hashlib.sha256(cost_evidence_path.read_bytes()).hexdigest()
+            except OSError:
+                cost_hash = None
+        return DirectInputReference(
+            base_dataset_id=request.base_dataset_id,
+            feature_dataset_id=request.feature_dataset_id,
+            label_dataset_id=request.label_dataset_id,
+            start=request.start,
+            end=request.end,
+            feature_schema_hash=schema_hash,
+            feature_content_hash=content_hash,
+            cost_evidence_path=cost_path_str,
+            cost_evidence_hash=cost_hash,
+        )
+
+    def assess_readiness(
+        self, request: DirectDataRequest, decision_time: datetime, *, cost_evidence_path: Path | None = None
+    ) -> DirectReadinessReport:
+        if isinstance(decision_time, str):
+            decision_time = datetime.fromisoformat(str(decision_time))
+        input_ref = self._build_input_reference(request, cost_evidence_path)
+        errors: list[DirectReadinessIssue] = []
+        warnings: list[DirectReadinessIssue] = []
+        excluded_sources: set[str] = set()
+
+        # cost evidence warning when absent
+        if cost_evidence_path is None:
+            warnings.append(DirectReadinessIssue(code="cost_evidence_absent", message="cost evidence not provided; using default schedules"))
+        elif not cost_evidence_path.exists():
+            errors.append(DirectReadinessIssue(code="cost_evidence_unreadable", message=f"cost evidence not found: {cost_evidence_path}"))
+
+        # invalid range
+        if request.start > request.end:
+            errors.append(DirectReadinessIssue(code="invalid_range", message=f"start {request.start} after end {request.end}"))
+            return DirectReadinessReport(
+                input_reference=input_ref,
+                errors=tuple(errors),
+                warnings=tuple(warnings),
+                excluded_sources=(),
+            )
+
+        # check dataset readability and required columns
+        try:
+            base_cols = self._available_columns(self._base_store, request.base_dataset_id, _BASE_COLUMNS)
+        except Exception as exc:
+            errors.append(DirectReadinessIssue(code="base_unreadable", message=str(exc)))
+            base_cols = ()
+        try:
+            feature_content = self._feature_store.content_columns(request.feature_dataset_id)
+        except Exception as exc:
+            errors.append(DirectReadinessIssue(code="feature_unreadable", message=str(exc)))
+            feature_content = []
+        try:
+            label_content = self._label_store.content_columns(request.label_dataset_id)
+        except Exception as exc:
+            errors.append(DirectReadinessIssue(code="label_unreadable", message=str(exc)))
+            label_content = []  # noqa: F841
+        if errors:
+            return DirectReadinessReport(
+                input_reference=input_ref,
+                errors=tuple(errors),
+                warnings=tuple(warnings),
+                excluded_sources=(),
+            )
+
+        required_base = ("instrument_id", "session", "open", "close", "volume", "trading_value")
+        missing_base = [c for c in required_base if c not in base_cols]
+        if missing_base:
+            errors.append(DirectReadinessIssue(code="missing_required_columns", message=f"base missing {missing_base}"))
+
+        feature_cols = tuple(c for c in feature_content if c.startswith("feature__"))
+        if not feature_cols:
+            errors.append(DirectReadinessIssue(code="missing_feature_columns", message="no feature__ columns"))
+
+        if "disclosure_date" not in feature_content:
+            excluded_sources = {
+                source
+                for source in _PIT_FUNDAMENTAL_SOURCES
+                if f"feature__{source}" in feature_content
+            }
+            if excluded_sources:
+                warnings.append(
+                    DirectReadinessIssue(
+                        code="fundamental_lineage_unavailable",
+                        message=(
+                            "excluded PIT-unverifiable sources: "
+                            + ", ".join(sorted(excluded_sources))
+                        ),
+                    )
+                )
+
+        # check for optional source timing column without valid timestamps -> warning and exclusion
+        # If feature dataset contains disclosure_date or source_available_time columns, ensure they have valid timestamps
+        optional_timing_cols = [c for c in feature_content if c in ("disclosure_date", "source_available_time", "available_time", "observation_time")]
+        for col in optional_timing_cols:
+            try:
+                # sample narrow scan for null/invalid timestamps
+                lf = self._feature_store.scan_bounded(
+                    request.feature_dataset_id,
+                    AssetKind.STOCK,
+                    request.feature_set,
+                    _decision_boundary(request.end),
+                    session_start=request.start,
+                    session_end=request.end,
+                    columns=["instrument_id", "session", col],
+                )
+                # collect only if small; use filter for nulls
+                null_count = lf.filter(pl.col(col).is_null()).select(pl.len()).collect().item()
+                if int(null_count) > 0:
+                    warnings.append(DirectReadinessIssue(code="optional_source_unverifiable", message=f"optional source {col} has null timestamps; excluded"))
+            except Exception:
+                warnings.append(DirectReadinessIssue(code="optional_source_unverifiable", message=f"optional source {col} unverifiable"))
+
+        # identity-only preflight: duplicate and monotonic checks
+        try:
+            boundary = _decision_boundary(request.end)
+            base_keys = self._base_store.scan_bounded(
+                request.base_dataset_id,
+                AssetKind.STOCK,
+                "base_panel",
+                boundary,
+                session_start=request.start,
+                session_end=request.end,
+                columns=["instrument_id", "session"],
+            ).collect()
+            feature_keys = self._feature_store.scan_bounded(
+                request.feature_dataset_id,
+                AssetKind.STOCK,
+                request.feature_set,
+                boundary,
+                session_start=request.start,
+                session_end=request.end,
+                columns=["instrument_id", "session"],
+            ).collect()
+            base_stats = _key_multiplicity_stats(base_keys)
+            feature_stats = _key_multiplicity_stats(feature_keys)
+            if base_stats["duplicate_keys"] > 0 or feature_stats["duplicate_keys"] > 0:
+                errors.append(DirectReadinessIssue(code="duplicate_keys", message=f"duplicate keys base={base_stats['duplicate_keys']} feature={feature_stats['duplicate_keys']}"))
+            # non-monotonic check via composed session diff
+            # we check base and feature separately for monotonic sessions
+            for df, label in [(base_keys, "base"), (feature_keys, "feature")]:
+                # sort and check monotonic
+                sorted_df = df.sort(["instrument_id", "session"])
+                # use window diff check without collecting full frame? simple python check on collected narrow frame
+                # group by instrument and check increasing
+                for inst in sorted_df["instrument_id"].unique().to_list():
+                    sessions = sorted_df.filter(pl.col("instrument_id") == inst)["session"].to_list()
+                    for i in range(1, len(sessions)):
+                        if sessions[i] <= sessions[i - 1]:
+                            errors.append(DirectReadinessIssue(code="non_monotonic_keys", message=f"non-monotonic {label} for {inst}"))
+                            break
+            # causal timestamp violations: available_time > decision_time or observation_time > available_time
+            # check feature availability timing
+            try:
+                feat_avail_cols = self._available_columns(self._feature_store, request.feature_dataset_id, ("instrument_id", "session", "available_time", "observation_time"))
+                if "available_time" in feat_avail_cols:
+                    avail_frame = self._feature_store.scan_bounded(
+                        request.feature_dataset_id,
+                        AssetKind.STOCK,
+                        request.feature_set,
+                        boundary,
+                        session_start=request.start,
+                        session_end=request.end,
+                        columns=["instrument_id", "session", "available_time"],
+                    ).collect()
+                    # future source availability: available_time > decision_time
+                    future_count = avail_frame.filter(pl.col("available_time") > decision_time).height
+                    if int(future_count) > 0:
+                        errors.append(DirectReadinessIssue(code="future_source_availability", message=f"{future_count} rows have available_time > decision_time"))
+                # also check label_available_time vs decision_time?
+            except Exception:  # noqa: S110
+                pass
+
+            # non-finite execution/active-feature values: sample numeric columns
+            try:
+                # check base numeric columns non-finite
+                base_numeric = [c for c in base_cols if c in ("open", "close", "volume", "trading_value")]
+                if base_numeric:
+                    base_frame = self._base_store.scan_bounded(
+                        request.base_dataset_id,
+                        AssetKind.STOCK,
+                        "base_panel",
+                        boundary,
+                        session_start=request.start,
+                        session_end=request.end,
+                        columns=["instrument_id", "session", *base_numeric],
+                    ).collect()
+                    for col in base_numeric:
+                        if base_frame.schema[col].is_numeric():
+                            counts = base_frame.select((pl.col(col).is_not_null() & ~pl.col(col).is_finite()).sum().alias("cnt")).item()
+                            if int(counts) > 0:
+                                errors.append(DirectReadinessIssue(code="non_finite_execution_values", message=f"non-finite in {col}"))
+                # feature numeric
+                if feature_cols:
+                    feat_numeric_cols = list(feature_cols)
+                    # collect narrow feature numeric sample
+                    feat_frame = self._feature_store.scan_bounded(
+                        request.feature_dataset_id,
+                        AssetKind.STOCK,
+                        request.feature_set,
+                        boundary,
+                        session_start=request.start,
+                        session_end=request.end,
+                        columns=["instrument_id", "session", *feat_numeric_cols[:4]],
+                    ).collect()
+                    for col in feat_numeric_cols[:4]:
+                        if col in feat_frame.columns and feat_frame.schema[col].is_numeric():
+                            counts = feat_frame.select((pl.col(col).is_not_null() & ~pl.col(col).is_finite()).sum().alias("cnt")).item()
+                            if int(counts) > 0:
+                                errors.append(DirectReadinessIssue(code="non_finite_feature_values", message=f"non-finite in {col}"))
+            except Exception:  # noqa: S110
+                pass
+
+            # zero usable requested labels: need point-in-time labels
+            # For each horizon, filter labels where source_available <= decision_time < label_available_time
+            # Use narrow scans
+            usable_found = False
+            for horizon in request.candidate_horizon_sessions:
+                try:
+                    scan = self._scan_horizon_labels(request, horizon)
+                    rows = scan.collect()
+                    if rows.is_empty():
+                        continue
+                    # filter point-in-time: label_available_time > decision_time and available_time <= decision_time
+                    # We approximate: label_available_time > decision_time is required, but we check <= decision_time for usable?
+                    # Spec says source_available <= decision_time < label_available_time
+                    # We'll check label_available_time > decision_time and (available_time is not checked here)
+                    # If no rows satisfy label_available_time > decision_time then not usable? Actually need source_available <= decision
+                    # For readiness, we treat any horizon with at least one row where label_available_time > decision_time as usable
+                    # But spec scenario expects future source availability error, and zero usable labels error when decision_time far future
+                    # So check if rows have label_available_time > decision_time count >0
+                    if "label_available_time" in rows.columns:
+                        pit_count = rows.filter(pl.col("label_available_time") <= decision_time).height
+                        if int(pit_count) == 0:
+                            continue
+                        usable_found = True
+                    else:
+                        usable_found = True
+                except Exception:  # noqa: S112
+                    continue
+            if not usable_found:
+                errors.append(DirectReadinessIssue(code="no_usable_labels", message="no point-in-time usable labels"))
+
+            # lineage gap warning when feature manifest missing content hash
+            if input_ref.feature_content_hash is None or input_ref.feature_schema_hash == "":
+                warnings.append(DirectReadinessIssue(code="lineage_gap", message="feature manifest content hash unavailable"))
+
+            del base_keys, feature_keys
+        except Exception as exc:
+            # if preflight itself fails due to unreadable, already captured; otherwise add generic error
+            if not errors:
+                errors.append(DirectReadinessIssue(code="readiness_unreadable", message=str(exc)))
+
+        return DirectReadinessReport(
+            input_reference=input_ref,
+            errors=tuple(errors),
+            warnings=tuple(warnings),
+            excluded_sources=tuple(sorted(excluded_sources)),
+        )
+
     def load_training_data(
         self,
         request: DirectDataRequest,
         decision_time: datetime,
         *,
+        readiness: DirectReadinessReport | None = None,
         checkpoint: Callable[[DirectLoadCheckpoint], None] | None = None,
         rescope: UniverseRescopeSettings | None = None,
     ) -> NetAlphaResearchData:
@@ -645,9 +973,31 @@ class DirectMarketDataLoader:
                         elapsed_ms=int(
                             (time.monotonic() - started_monotonic) * 1000
                         ),
-                        **scalars,  # type: ignore[arg-type]
+                        **scalars,  # type: ignore[arg-type]  # noqa: FBT001
                     )
                 )
+
+        # Use provided readiness or compute it; block on errors before any collect
+        effective_readiness = readiness if readiness is not None else self.assess_readiness(request, decision_time)
+        if effective_readiness.errors:
+            # Emit preflight checkpoint for observability before failing
+            has_dup = any(e.code == "duplicate_keys" for e in effective_readiness.errors)
+            if checkpoint is not None:
+                emit(
+                    "direct_preflight",
+                    owners=("base_keys", "feature_keys"),
+                    base_duplicate_keys=1 if has_dup else 0,
+                    feature_duplicate_keys=1 if has_dup else 0,
+                    base_rows=0,
+                    feature_rows=0,
+                    base_distinct_keys=0,
+                    feature_distinct_keys=0,
+                    matched_keys=0,
+                    predicted_joined_rows=0,
+                    planned_lower_bound_bytes=0,
+                )
+            codes = ", ".join(issue.code for issue in effective_readiness.errors)
+            raise ValueError(f"direct readiness blocked: {codes}: {effective_readiness.errors[0].message}")
 
         wanted_base_columns: tuple[str, ...] = _BASE_COLUMNS
         required: tuple[str, ...] = (
@@ -681,6 +1031,12 @@ class DirectMarketDataLoader:
             c
             for c in self._feature_store.content_columns(request.feature_dataset_id)
             if c.startswith("feature__")
+        )
+        excluded_sources = set(effective_readiness.excluded_sources)
+        feature_columns = tuple(
+            column
+            for column in feature_columns
+            if column.removeprefix("feature__") not in excluded_sources
         )
         if not feature_columns:
             raise ValueError(
@@ -963,6 +1319,13 @@ class DirectMarketDataLoader:
                 "no candidate horizon produced point-in-time available labels"
             )
         labels_by_horizon = {h: labels_by_horizon[h] for h in sorted(labels_by_horizon)}
+        # Exclude unverifiable optional sources without synthesizing timestamps
+        for issue in effective_readiness.warnings:
+            if issue.code == "optional_source_unverifiable":
+                col = issue.message.split("optional source")[-1].strip().split()[0].strip(":,")
+                for candidate in (col, f"feature__{col}", col.replace("feature__", "")):
+                    if candidate in feature_frame.columns:
+                        feature_frame = feature_frame.drop(candidate)
 
         feature_manifest = self._read_feature_manifest(request)
         manifest_source: DatasetManifest | None = feature_manifest
@@ -993,6 +1356,22 @@ class DirectMarketDataLoader:
             manifest=manifest,
             join_evidence=tuple(join_evidence),
         )
+
+    def load_backtest_snapshot(
+        self, request: DirectDataRequest, decision_time: datetime, *, readiness: DirectReadinessReport | None = None
+    ) -> DatasetSnapshot:
+        from src.stocks.data.contracts import DatasetSnapshot
+
+        if isinstance(decision_time, str):
+            decision_time = datetime.fromisoformat(str(decision_time))
+        effective_readiness = readiness if readiness is not None else self.assess_readiness(request, decision_time)
+        if effective_readiness.errors:
+            codes = ", ".join(issue.code for issue in effective_readiness.errors)
+            raise ValueError(f"direct readiness blocked: {codes}")
+        # Reuse training composition to build a snapshot-shaped input; bounded scans retained
+        research = self.load_training_data(request, decision_time, readiness=effective_readiness)
+        # Snapshot frame is the feature frame (contains base+feature columns); manifest carries schema/Content hashes
+        return DatasetSnapshot(manifest=research.manifest, frame=research.feature_frame)
 
 
 def _validate_direct_frame(

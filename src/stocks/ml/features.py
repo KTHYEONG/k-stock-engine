@@ -22,7 +22,7 @@ learner matrix or schema fingerprint.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 
@@ -48,9 +48,12 @@ SESSION_COLUMN = "session"
 # total/flow duplicates (``net_purchase_total``) are excluded from the model
 # registry; they never appear in the v1 canonical role map.
 _RECIPROCAL_DUPLICATES = frozenset({"per", "pbr", "net_purchase_total"})
+_PIT_FUNDAMENTAL_SOURCES = frozenset({"bp_ratio", "ep_ratio"})
 
 
-def stock_net_alpha_v1_roles() -> dict[str, str]:
+def stock_net_alpha_v1_roles(
+    *, available_columns: Collection[str] | None = None
+) -> dict[str, str]:
     """Canonical ``(source -> role)`` map for ``stock_net_alpha_v1``.
 
     Inherits the semantic role declarations of the v3 experiment registry
@@ -58,39 +61,57 @@ def stock_net_alpha_v1_roles() -> dict[str, str]:
     totals so no two model columns are exact rank-equivalent or additive
     duplicates of the same economic flow.
     """
-    return {
+    roles = {
         source: role
         for source, role in STOCK_ALPHA_V3_ROLES.items()
         if source not in _RECIPROCAL_DUPLICATES
     }
+    if available_columns is not None and "disclosure_date" not in available_columns:
+        for source in _PIT_FUNDAMENTAL_SOURCES:
+            roles.pop(source, None)
+    return roles
 
 
-def stock_net_alpha_v1_role_allowlist() -> tuple[tuple[str, str], ...]:
+def stock_net_alpha_v1_role_allowlist(
+    *, available_columns: Collection[str] | None = None
+) -> tuple[tuple[str, str], ...]:
     """Ordered ``(source, role)`` pairs for the canonical v1 registry."""
     return tuple(
         (source, role)
         for source in STOCK_ALPHA_V2_ALLOWLIST
-        if (role := stock_net_alpha_v1_roles().get(source)) is not None
+        if (
+            role := stock_net_alpha_v1_roles(
+                available_columns=available_columns
+            ).get(source)
+        ) is not None
     )
 
 
-def stock_net_alpha_v1_allowlist() -> tuple[str, ...]:
+def stock_net_alpha_v1_allowlist(
+    *, available_columns: Collection[str] | None = None
+) -> tuple[str, ...]:
     """Ordered ALPHA source allowlist for the canonical v1 feature set."""
     return tuple(
         source
-        for source, role in stock_net_alpha_v1_role_allowlist()
+        for source, role in stock_net_alpha_v1_role_allowlist(
+            available_columns=available_columns
+        )
         if role == _ALPHA_ROLE
     )
 
 
-def stock_net_alpha_v1_semantic_contracts() -> tuple[dict[str, object], ...]:
+def stock_net_alpha_v1_semantic_contracts(
+    *, available_columns: Collection[str] | None = None
+) -> tuple[dict[str, object], ...]:
     """Semantic per-feature contract declarations for the v1 role allowlist."""
     from src.stocks.research.features import (
         _v3_lookback_sessions,
     )
 
     contracts: list[dict[str, object]] = []
-    for source, role in stock_net_alpha_v1_role_allowlist():
+    for source, role in stock_net_alpha_v1_role_allowlist(
+        available_columns=available_columns
+    ):
         formula_id = f"{STOCK_NET_ALPHA_V1_FEATURE_SET}:{source}:v1"
         contracts.append(
             {
@@ -115,12 +136,15 @@ def stock_net_alpha_v1_semantic_contracts() -> tuple[dict[str, object], ...]:
     return tuple(contracts)
 
 
-def stock_net_alpha_v1_contract_book() -> FeatureContractBook:
+def stock_net_alpha_v1_contract_book(
+    *, available_columns: Collection[str] | None = None
+) -> FeatureContractBook:
     """Feature contract book for the canonical v1 feature set."""
     from src.stocks.data.feature_contracts import semantic_feature_contract_book
 
     return semantic_feature_contract_book(
-        STOCK_NET_ALPHA_V1_FEATURE_SET, stock_net_alpha_v1_semantic_contracts()
+        STOCK_NET_ALPHA_V1_FEATURE_SET,
+        stock_net_alpha_v1_semantic_contracts(available_columns=available_columns),
     )
 
 
