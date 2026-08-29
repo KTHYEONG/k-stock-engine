@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_COMPARISON_DIAGNOSTICS",
+      "date": "2026-08-29",
+      "adr_id": "ADR_20260829_ML_COMPARISON_DIAGNOSTICS",
+      "domain": "execution",
+      "title": "ML comparison replay calibration recovery",
+      "why": "Model comparison replay stopped before economic evidence because causal cold-start rows lacked calibrated economic inputs, while diagnostics were too coarse.",
+      "resolution": "Prepared economic all-null decisions now fail closed as cash/no-trade; bounded cold-start diagnostics are propagated; calibration/replay failures emit structured DEBUG tracebacks; screen phase budget is explicitly configurable.",
+      "impact": "ML research-only replay completes eligible candidates without misclassifying liquidity/order failures as cold-start; no artifact publication or trading default changes."
+    },
+    {
       "task_id": "TASK_ML_SELECTION_PROFILED_TEN_MINUTE_RECOVERY",
       "date": "2026-08-28",
       "adr_id": "ADR_20260828_ML_SELECTION_PROFILED_TEN_MINUTE_RECOVERY",
@@ -989,16 +999,6 @@
       "why": "Replace Rank-IC-first selection with cost-aware multi-fold stability screening and correct missing-value/recency handling.",
       "resolution": "Implemented rank-stationary predictors, native missing-row retention, newest-anchored weights, three-fold economic proxy screening, global multiplicity 81, single-policy replay, active-IR Gate 3, and recorded the completed reference run as fail-closed NO_TRADE.",
       "impact": "Selection is more conservative and economically aligned; reference snapshot completed within the RSS budget but produced no promotable candidate."
-    },
-    {
-      "task_id": "backtest_performance_improvement",
-      "date": "2026-08-13",
-      "adr_id": "ADR_20260813_backtest_performance_improvement",
-      "domain": "stocks",
-      "title": "Backtest performance evidence ledger and pipeline recheck",
-      "why": "Document the completed 81-trial ML pipeline recheck and preserve the fail-closed NO_TRADE decision with detailed route evidence.",
-      "resolution": "Recorded final artifact metrics, route-level compounding/DSR evidence, multiplicity ledger, resource telemetry, and explicit no-champion termination in docs/results/back-res.md.",
-      "impact": "Documentation and task-index synchronization only; promotion thresholds and trading behavior are unchanged."
     }
   ]
 }
