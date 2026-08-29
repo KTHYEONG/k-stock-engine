@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_POLICY_FRONTIER_EVIDENCE_RECOVERY_20260829",
+      "date": "2026-08-29",
+      "adr_id": "ADR_20260829_ML_POLICY_FRONTIER_EVIDENCE_RECOVERY_20260829",
+      "domain": "stocks",
+      "title": "ML policy-frontier evidence recovery",
+      "why": "Model selection counted three execution profiles in the multiple-testing budget but replayed only the first 5-bps profile, so zero-band candidates were untested and no-fill evidence was ambiguous.",
+      "resolution": "Replayed every registered profile at the resolved reference execution cell, preserved strict base/stress lower-bound and fill gates, emitted bounded per-profile diagnostics, selected deterministically across admitted family-profile candidates, and moved the admitted pool to invocation-local state. The rerun completed without a qualified survivor: both shortlisted families had zero fills for all profiles.",
+      "impact": "Research-only ML selection now distinguishes policy no-fills from model failures and cannot mix concurrent study selections; the 2026-08-29 rerun remains unpublished with no survivor."
+    },
+    {
       "task_id": "TASK_ML_OBJECTIVE_ALIGNMENT_20260829",
       "date": "2026-08-29",
       "adr_id": "ADR_20260829_ML_OBJECTIVE_ALIGNMENT_20260829",
