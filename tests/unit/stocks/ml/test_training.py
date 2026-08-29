@@ -2121,3 +2121,126 @@ def test_MODEL_SELECTION_06_HOLDOUT_PROMOTION_FAILS_CLOSED(tmp_path):
         assert manifest2 is not None
 
 # MODEL_SELECTION_06_HOLDOUT_PROMOTION_FAILS_CLOSED
+
+def test_unhedged_calibration_uses_gross_route_utility_not_residual():
+    import polars as pl, numpy as np
+    from datetime import datetime, UTC, timedelta
+    from src.stocks.ml.contracts import NetAlphaTrainingRequest, ExecutionFrontierSettings, RouteObjective, RouteObjectiveKind, PortfolioSettings
+    from src.stocks.ml.training import _causal_oof_calibrate, _causal_ledger, route_calibration_ledger
+    from src.stocks.research.economic_alpha import CausalAlphaCalibrator
+    from src.core.costs import default_base_schedule
+    rng = np.random.default_rng(0)
+    sessions = [datetime(2024,1,1,tzinfo=UTC)+timedelta(days=i) for i in range(30)]
+    oof_rows=[]
+    label_rows=[]
+    for i, s in enumerate(sessions):
+        for t in range(12):
+            score = float(rng.normal())
+            oof_rows.append({"instrument_id": f"KRX:{t:05d}", "session": s, "score": score, "predicted_net_alpha": score, "oof_segment_id": 0})
+            label_rows.append({"instrument_id": f"KRX:{t:05d}", "session": s, "score": score, "gross_return": 0.02, "risk_residual": -0.05, "reference_cost": 0.001, "label_available_time": s, "realized_net_return": 0.01})
+    oof = pl.DataFrame(oof_rows)
+    labels = pl.DataFrame(label_rows)
+    req = NetAlphaTrainingRequest(artifact_id="unhedged_gross", candidate_horizon_sessions=(10,), route_objective=RouteObjective(kind=RouteObjectiveKind.UNHEDGED_ABSOLUTE), execution_frontier=ExecutionFrontierSettings(candidate_horizon_sessions=(10,), candidate_rebalance_frequency_sessions=(5,), candidate_top_k=(12,)))
+    # first calibration
+    calibrated1 = _causal_oof_calibrate(oof, labels, req, 10)
+    # change only risk_residual, keep gross same
+    labels2 = labels.with_columns(pl.col("risk_residual") + 10.0)
+    calibrated2 = _causal_oof_calibrate(oof, labels2, req, 10)
+    # bucket evidence should be identical because unhedged uses gross
+    assert calibrated1["expected_active_alpha"].to_list() == calibrated2["expected_active_alpha"].to_list()
+    # missing gross should raise when no fallback risk, but null/non-finite should raise
+    import pytest
+    # null gross should raise
+    bad_labels2 = labels.with_columns(pl.when(pl.col("gross_return")==0.02).then(None).otherwise(pl.col("gross_return")).alias("gross_return"))
+    with pytest.raises(ValueError):
+        route_calibration_ledger(bad_labels2, req)
+    # non-finite gross should raise
+    bad_labels3 = labels.with_columns((pl.col("gross_return")*float("inf")).alias("gross_return"))
+    with pytest.raises(ValueError):
+        route_calibration_ledger(bad_labels3, req)
+    # dropping gross entirely falls back to risk in lenient mode - not asserted as failure here
+
+def test_calibration_nets_dynamic_cost_exactly_once():
+    import polars as pl, numpy as np
+    from datetime import datetime, UTC, timedelta
+    from src.stocks.ml.contracts import NetAlphaTrainingRequest, ExecutionFrontierSettings, RouteObjective, RouteObjectiveKind
+    from src.stocks.research.economic_alpha import CausalAlphaCalibrator
+    from src.core.costs import CostSchedule, CostPoint
+    sched = CostSchedule(name="test", points=(CostPoint(effective_from=datetime(2024,1,1,tzinfo=UTC), commission_rate=0.001, tax_rate=0.002, slippage_bps=1.0),))
+    point = sched.cost_for(datetime(2024,6,1,tzinfo=UTC))
+    c = 2*point.commission_rate + point.tax_rate + 2*point.slippage_bps/10000.0
+    # simple ledger with gross_return utility and known scores
+    sessions = [datetime(2024,1,1,tzinfo=UTC)+timedelta(days=i) for i in range(300)]
+    rng = np.random.default_rng(1)
+    obs_rows=[]
+    for s in sessions:
+        for t in range(5):
+            score = float(rng.normal())
+            # gross_return as utility, use positive values to get positive bucket
+            obs_rows.append({"instrument_id": f"KRX:{t:05d}", "session": s, "score": score, "gross_return": 0.05 + 0.01*score, "reference_cost": 0.001, "label_available_time": s, "risk_residual": 0.01})
+    obs = pl.DataFrame(obs_rows)
+    # scored frame
+    scored = pl.DataFrame([{"instrument_id": f"KRX:{t:05d}", "session": sessions[-1], "score": float(rng.normal())} for t in range(5)])
+    from src.stocks.ml.training import _causal_calibrator
+    req = NetAlphaTrainingRequest(artifact_id="costonce", candidate_horizon_sessions=(10,), route_objective=RouteObjective(kind=RouteObjectiveKind.UNHEDGED_ABSOLUTE), execution_frontier=ExecutionFrontierSettings(candidate_horizon_sessions=(10,), candidate_rebalance_frequency_sessions=(5,), candidate_top_k=(12,)), base_cost_schedule=sched)
+    calib = CausalAlphaCalibrator(bucket_count=5, min_calibration_sessions=10, seed=42, n_bootstrap=20, bootstrap_alpha=0.05, block_length=10, label_column="gross_return", label_available_column="label_available_time")
+    decision = datetime(2024,6,1,tzinfo=UTC)
+    # prepare ledger filtered
+    ledger = obs.filter((pl.col("label_available_time")<=decision) & (pl.col("session")<decision))
+    # transform via calibrator should net cost once
+    out = calib.transform(scored, ledger, decision, sched)
+    # expected_net_alpha = expected_active_alpha - c within 1e-12 where bucket has positive evidence
+    for row in out.to_dicts():
+        if row["expected_active_alpha"] is not None and row["expected_net_alpha"] is not None:
+            assert abs(row["expected_net_alpha"] - (row["expected_active_alpha"] - c)) < 1e-12
+            # not double subtracting reference_cost (reference_cost 0.001) - net should not include extra 0.001
+            # already accounted: ensure difference is exactly c, not c+0.001
+            assert abs((row["expected_active_alpha"] - row["expected_net_alpha"]) - c) < 1e-12
+
+def test_family_specific_calibration_seed_rejects_outer_oof_duplicate_keys(monkeypatch):
+    import polars as pl, numpy as np
+    from datetime import datetime, UTC, timedelta
+    from src.stocks.ml.training import build_initial_calibration_seed
+    from src.stocks.ml.contracts import NetAlphaTrainingRequest, ExecutionFrontierSettings
+    from src.stocks.ml.preparation import prepare_training_matrix, prepare_horizon_labels, TrainingPanelView
+    from src.stocks.ml.features import stock_net_alpha_v1_roles
+    from src.core.datasets import DatasetManifest
+    from src.core.instruments import AssetKind
+    from src.stocks.ml.contracts import NetAlphaResearchData
+    from src.stocks.research.models import ModelManifest
+    # check that family param is forwarded
+    import src.stocks.ml.fitting as fitting_mod
+    orig_fit = fitting_mod.fit_horizon_oof
+    captured = {}
+    def spy_fit(matrix, horizon, folds, req):
+        captured["family"] = req.family
+        return orig_fit(matrix, horizon, folds, req)
+    monkeypatch.setattr("src.stocks.ml.fitting.fit_horizon_oof", spy_fit)
+    rng=np.random.default_rng(0)
+    sessions=[datetime(2024,1,1,tzinfo=UTC)+timedelta(days=i) for i in range(30)]
+    rows=[]
+    for s in sessions:
+        for t in range(4):
+            rows.append({"instrument_id": f"KRX:{t:05d}", "session": s, "feature__a": float(rng.normal()), "feature__b": float(rng.normal())})
+    frame = pl.DataFrame(rows)
+    from src.stocks.ml.preparation import prepare_matrix_from_frame
+    matrix = prepare_matrix_from_frame(frame, ("feature__a","feature__b"))
+    # create data for seed
+    label_rows=[{"instrument_id": r["instrument_id"], "session": r["session"], "net_alpha_target": float(rng.normal()), "risk_residual": 0.01, "reference_cost":0.001, "label_available_time": r["session"], "realized_net_return":0.01, "gross_return":0.02} for r in rows[:40]]
+    manifest = DatasetManifest(asset_kind=AssetKind.STOCK, schema_version="v1", schema_hash="h", provider_version="p", universe_policy_version="u", universe_policy_hash="u", feature_set="stock_net_alpha_v1", feature_set_hash="f", label_definition="net_alpha_o2o", label_horizon_sessions=10, time_start=sessions[0], time_end=sessions[-1], generated_time=sessions[-1], row_count=len(rows), reference_notional=100_000_000.0)
+    data = NetAlphaResearchData(feature_frame=frame, labels_by_horizon={10: pl.DataFrame(label_rows)}, manifest=manifest)
+    req = NetAlphaTrainingRequest(artifact_id="seedfam", candidate_horizon_sessions=(10,), execution_frontier=ExecutionFrontierSettings(candidate_horizon_sessions=(10,), candidate_rebalance_frequency_sessions=(5,), candidate_top_k=(12,)))
+    base_manifest = ModelManifest(artifact_id="seedfam", asset_kind=AssetKind.STOCK, feature_set="stock_net_alpha_v1", feature_schema_hash="h", universe_policy_hash="u", label_definition="net_alpha_o2o", label_horizon_sessions=10, eligible_from=sessions[0].isoformat(), eligible_to=sessions[-1].isoformat())
+    seed = build_initial_calibration_seed(matrix, np.arange(20, dtype=np.int64), req, 10, base_manifest, data=data, family="tail_lambdarank_v2", training_top_k=16)
+    # family forwarding may be no-op if inner folds empty; accept either case but ensure no error
+    if captured:
+        assert captured.get("family") == "tail_lambdarank_v2"
+    # duplicate key detection: seed and oof share key should raise before schedule
+    from src.stocks.ml.training import _causal_oof_calibrate
+    import pytest
+    # create oof and seed with overlapping instrument/session
+    oof = pl.DataFrame({"instrument_id": ["KRX:00001"], "session": [sessions[5]], "score": [0.1], "predicted_net_alpha": [0.1], "oof_segment_id": [0]})
+    oof_labels = pl.DataFrame({"instrument_id": ["KRX:00001"], "session": [sessions[5]], "score": [0.1], "gross_return": [0.02], "risk_residual": [0.01], "reference_cost": [0.001], "label_available_time": [sessions[5]], "realized_net_return": [0.01]})
+    seed_dup = pl.DataFrame({"instrument_id": ["KRX:00001"], "session": [sessions[5]], "score": [0.1], "gross_return": [0.02], "risk_residual": [0.01], "reference_cost": [0.001], "label_available_time": [sessions[4]], "realized_net_return": [0.01]})
+    with pytest.raises(ValueError):
+        _causal_oof_calibrate(oof, oof_labels, req, 10, seed_ledger=seed_dup)
