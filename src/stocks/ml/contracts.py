@@ -1386,6 +1386,7 @@ class FamilyScreenEvidence:
     attribution: FeatureAttributionEvidence
     qualified_for_full_oof: bool = False
     selected_family: bool = False
+    fold_attributions: tuple[FeatureAttributionEvidence, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.family, ModelFamily):
@@ -1403,6 +1404,17 @@ class FamilyScreenEvidence:
             raise ValueError("qualified_for_full_oof must be bool")
         if not isinstance(self.selected_family, bool):
             raise ValueError("selected_family must be bool")
+        if not isinstance(self.fold_attributions, tuple):
+            raise ValueError("fold_attributions must be tuple")
+        for attr in self.fold_attributions:
+            if not isinstance(attr, FeatureAttributionEvidence):
+                raise ValueError("fold_attributions must contain FeatureAttributionEvidence")
+        if self.fold_attributions:
+            for attr in self.fold_attributions:
+                if attr.family != self.family:
+                    raise ValueError("fold_attribution family mismatch")
+                if not attr.schema_fingerprint:
+                    raise ValueError("fold_attribution schema_fingerprint must be non-empty")
 
 
 @dataclass(frozen=True, slots=True)
