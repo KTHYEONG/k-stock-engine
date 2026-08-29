@@ -757,10 +757,10 @@ def build_parser() -> argparse.ArgumentParser:
             "read-only model-selection study; prints bounded RESEARCH_ONLY JSON and publishes no artifact"
         ),
     )
-    parser.add_argument('--model-selection-wall-clock-seconds', type=float, default=540.0)
-    parser.add_argument('--model-selection-screen-phase-seconds', type=float, default=180.0)
-    parser.add_argument('--model-selection-screen-train-rows', type=int, default=48000)
-    parser.add_argument('--model-selection-screen-validation-rows', type=int, default=12000)
+    parser.add_argument('--model-selection-wall-clock-seconds', type=float, default=900.0)
+    parser.add_argument('--model-selection-screen-phase-seconds', type=float, default=720.0)
+    parser.add_argument('--model-selection-screen-train-rows', type=int, default=3000)
+    parser.add_argument('--model-selection-screen-validation-rows', type=int, default=1000)
     parser.add_argument(
         "--model-selection-debug-timing",
         action="store_true",
