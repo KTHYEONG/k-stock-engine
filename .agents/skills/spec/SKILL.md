@@ -35,7 +35,7 @@ Produce an unambiguous implementation plan and precision contract (`contract.jso
      - `symbols` (or `changes`): Array of `{ name, signature, kind }` covering all modified/added symbols.
      - `wiring`: Array of `{ caller_file, anchor, import_symbol, invocation_expression }` to ensure caller integration and pipeline entry-point replacement.
      - `requirements`: Explicit fail-closed boundary rules, complexity, and immutable output rules.
-     - `scenarios`: Array of `{ scenario_id, target_test_file, execution_command, expected_behavior }` where `scenario_id` MUST be a valid, descriptive pytest function name (e.g. `test_<func>_<condition>`) and `expected_behavior` MUST include explicit predicates or quantitative thresholds (no vague descriptive phrases). Support multiple target_test_files where appropriate.
+     - `scenarios`: Array of `{ scenario_id, target_test_file, execution_command, expected_behavior }` grouped sequentially by `target_test_file`. `scenario_id` MUST be a valid pytest function name (e.g. `test_<func>_<condition>`), and `expected_behavior` MUST include concrete assertion conditions or predicates (no vague summaries) to enable direct, mechanical test writing without AI guesswork. Support multiple target_test_files where appropriate.
 
 5. **Self-Validation Gate**:
    - Validate contract schema, paths, and caller anchor existence before finishing:
