@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_COMPARISON_DIAGNOSTICS",
+      "date": "2026-08-29",
+      "adr_id": "ADR_20260829_ML_COMPARISON_DIAGNOSTICS",
+      "domain": "stocks_ml",
+      "title": "ML comparison route-aligned screen diagnosis",
+      "why": "최신 H10/C10/K12 ML 비교에서 6개 family가 screen 단계에서 모두 탈락해, 모델 실패와 route·비용·목적함수 정렬 문제를 분리한 실행 근거가 필요했다.",
+      "resolution": "gross_return 기반 unhedged screen, 단일 비용 차감, prefix별 경제 evidence 및 구조화 DEBUG 관측을 반영한 동일 snapshot 재실행을 완료했다. oracle tail 하한은 양수였으나 6개 모델 tail-excess 하한은 모두 음수여서 OOF/replay 없이 fail-closed 됐다.",
+      "impact": "artifact publish와 운용 기본값은 변경하지 않았다. 최신 실행은 372.96초, 18 screen fits, 108 prefix fits, OOF/replay 0이며 모델 ranking 일반화 실패와 unhedged 절대수익 경로 실패를 분리해 후속 튜닝 기준을 확정했다."
+    },
+    {
       "task_id": "ML_SELECTION_RUNTIME_ADMISSION",
       "date": "2026-08-29",
       "adr_id": "ADR_20260829_ML_SELECTION_RUNTIME_ADMISSION",
@@ -9,16 +19,6 @@
       "why": "The latest immutable-snapshot comparison previously exceeded the 900-second wall budget and could not distinguish economic rejection from incomplete execution.",
       "resolution": "Recorded the latest screen-only comparison in docs/results/ml-cmp.md and synchronized the fail-closed admission/runtime diagnostics decision.",
       "impact": "Current comparison completes without full OOF/replay when all six screen lower bounds are non-positive; no model is promoted."
-    },
-    {
-      "task_id": "TASK_ML_COMPARISON_DIAGNOSTICS",
-      "date": "2026-08-29",
-      "adr_id": "ADR_20260829_ML_COMPARISON_DIAGNOSTICS",
-      "domain": "execution",
-      "title": "ML comparison replay calibration recovery",
-      "why": "Model comparison replay stopped before economic evidence because causal cold-start rows lacked calibrated economic inputs, while diagnostics were too coarse.",
-      "resolution": "Prepared economic all-null decisions now fail closed as cash/no-trade; bounded cold-start diagnostics are propagated; calibration/replay failures emit structured DEBUG tracebacks; screen phase budget is explicitly configurable.",
-      "impact": "ML research-only replay completes eligible candidates without misclassifying liquidity/order failures as cold-start; no artifact publication or trading default changes."
     },
     {
       "task_id": "TASK_ML_SELECTION_PROFILED_TEN_MINUTE_RECOVERY",
