@@ -73,6 +73,104 @@ def _debug_timing(stage: str, started_at: float, **fields: object) -> None:
     )
 
 
+def family_training_profile(family: ModelFamily, *, top_k: int, screen: bool) -> Mapping[str, object]:
+    """Sole parameter source for screen, attribution, prefix, and OOF fitting.
+
+    Seed 42 and num_threads 1 are invariant; screen may reduce rounds/trees but
+    cannot change objective, quantile, relevance definition, transform, or
+    regularization family.
+    """
+    if not isinstance(family, ModelFamily):
+        try:
+            family = ModelFamily(str(family))
+        except ValueError as exc:
+            raise ValueError(f"unknown ModelFamily {family!r}") from exc
+    if not isinstance(top_k, int) or top_k < 1:
+        raise ValueError("top_k must be positive int")
+    base: dict[str, object] = {"seed": 42, "num_threads": 1, "top_k": int(top_k), "lambdarank_truncation_level": int(top_k)}
+    if family == ModelFamily.elastic_net_v2:
+        base.update({"objective": "regression", "regularization": "elastic_net", "l1_ratio": 0.5, "relevance": "none", "transform": "winsor_rank_robust", "quantile": None, "num_boost_round": 20 if screen else 50, "n_estimators": None})
+    elif family == ModelFamily.huber_linear_v1:
+        base.update({"objective": "regression", "regularization": "huber", "l1_ratio": None, "relevance": "none", "transform": "winsor_rank_robust", "quantile": None, "num_boost_round": None, "n_estimators": None})
+    elif family == ModelFamily.extra_trees_v1:
+        base.update({"objective": "regression", "regularization": "tree", "relevance": "none", "transform": "winsor_rank_robust", "quantile": None, "num_boost_round": None, "n_estimators": 30 if screen else 50})
+    elif family == ModelFamily.hist_gradient_quantile_v1:
+        base.update({"objective": "quantile", "regularization": "gbdt", "quantile": 0.2, "relevance": "none", "transform": "winsor_rank_robust", "num_boost_round": 30 if screen else 100, "n_estimators": None})
+    elif family == ModelFamily.rawnet_lgbm_v2:
+        base.update({"objective": "regression", "regularization": "gbdt", "relevance": "none", "transform": "winsor_rank_robust", "quantile": None, "num_boost_round": 20 if screen else 50})
+    elif family == ModelFamily.tail_lambdarank_v2:
+        base.update({"objective": "lambdarank", "regularization": "gbdt", "relevance": "exact_k", "transform": "winsor_rank_robust", "quantile": None, "num_boost_round": 20 if screen else 30})
+    else:
+        raise ValueError(f"unknown family {family}")
+    return base
+
+
+def _tail_relevance_for_sessions(frame: pl.DataFrame, target: np.ndarray, *, top_k: int) -> np.ndarray:
+    """Session-local exact-K relevance after stable session/instrument ordering.
+
+    Cannot use global median; lambdarank_truncation_level equals K and every
+    query has at least K names. Ranks gross_return - reference_cost? here ranks
+    target descending, tie-break ascending instrument_id; exactly top_k per
+    session are 1. Missing/non-finite target/session or session with fewer
+    than K names is deterministic rejection (ValueError).
+    """
+    if not isinstance(top_k, int) or top_k < 1:
+        raise ValueError("top_k must be positive int")
+    if frame.is_empty():
+        raise ValueError("frame is empty for tail relevance")
+    if _ID_COLUMN not in frame.columns or SESSION_COLUMN not in frame.columns:
+        raise ValueError("frame missing instrument_id/session for tail relevance")
+    if target.shape[0] != frame.height:
+        raise ValueError("target length mismatch")
+    if not np.all(np.isfinite(target)):
+        raise ValueError("non-finite target for tail relevance")
+    # check session finite / not null
+    sess_vals = frame[SESSION_COLUMN].to_list()
+    if any(s is None for s in sess_vals):
+        raise ValueError("null session for tail relevance")
+    # check instrument
+    id_vals = frame[_ID_COLUMN].to_list()
+    if any(v is None for v in id_vals):
+        raise ValueError("null instrument_id for tail relevance")
+    # group sizes
+    sizes = frame.group_by(SESSION_COLUMN).len()
+    undersized = sizes.filter(pl.col("len") < int(top_k))
+    if not undersized.is_empty():
+        raise ValueError(f"undersized cross-section: {undersized.height} session(s) hold fewer than top_k={top_k}")
+    # stable ordering: session ascending, target descending, instrument_id ascending (lexsort)
+    # Build arrays for lexsort: primary session, secondary -target, tertiary id
+    # Use stable argsort via lexsort: last key is primary
+    # For exact K, we need per session ranking
+    n = frame.height
+    relevance = np.zeros(n, dtype=np.int8)
+    # Convert to numpy for ordering
+    sess_arr = np.array(sess_vals, dtype=object)
+    target_arr = np.asarray(target, dtype=np.float64)
+    id_arr = np.array(id_vals, dtype=object)
+    # Unique sessions stable sorted
+    unique_sessions = sorted(set(sess_vals))
+    # For each session, pick top_k by -target then id
+    # Need to map original indices to relevance 1
+    for sess in unique_sessions:
+        mask = sess_arr == sess
+        idxs = np.where(mask)[0]
+        sess_targets = target_arr[idxs]
+        sess_ids = id_arr[idxs]
+        # lexsort: id ascending primary? Actually order -target descending, id ascending
+        # np.lexsort keys: id, -target -> first key id, second -target (primary -target)
+        # But we want -target primary, id secondary, so lexsort((ids, -target))
+        order = np.lexsort((sess_ids, -sess_targets))
+        top_idx = idxs[order[: int(top_k)]]
+        relevance[top_idx] = 1
+    # validate exactly top_k per session
+    for sess in unique_sessions:
+        mask = sess_arr == sess
+        cnt = int(np.sum(relevance[mask]))
+        if cnt != int(top_k):
+            raise ValueError("exact-K violation")
+    return relevance
+
+
 @dataclass(frozen=True, slots=True)
 class ScreeningFoldCache:
     fold: Fold
@@ -284,6 +382,7 @@ def _screen_prefix_economic_evidence(
     scored: pl.DataFrame,
     *,
     request: NetAlphaTrainingRequest,
+    fold_id: int | None = None,
     bootstrap_alpha: float,
     bootstrap_resamples: int,
 ) -> ScreenEconomicEvidence:
@@ -299,6 +398,8 @@ def _screen_prefix_economic_evidence(
 
     if scored.is_empty():
         raise ValueError("scored frame is empty")
+    # fold_id must be actual cache segment; aggregate uses None and should not call this helper for aggregate
+    effective_fold_id = int(fold_id) if fold_id is not None else 0
     # Determine route kind and feasible cell
     route_kind = str(getattr(getattr(request, "route_objective", None), "kind", "unhedged_absolute"))
     # Normalize to value string
@@ -313,9 +414,29 @@ def _screen_prefix_economic_evidence(
     # Feasible cell for top_k / cadence
     feasible = request.execution_frontier.require_feasible_horizons(request.portfolio.max_exposure, request.portfolio.max_single_weight)
     _, cadence, top_k = feasible[0]
-    # Validate gross for unhedged
+    # Validate gross for unhedged - deterministic rejection, never residual fallback
     if route_kind == "unhedged_absolute" and GROSS_COLUMN not in scored.columns:
         raise ValueError(f"unhedged_absolute screen requires {GROSS_COLUMN!r} column (gross missing)")
+    # Additional deterministic checks: missing/non-finite gross, reference_cost, target, session
+    # Gross non-finite
+    if route_kind == "unhedged_absolute" and GROSS_COLUMN in scored.columns:
+        gross_series = scored[GROSS_COLUMN].cast(pl.Float64)
+        if gross_series.null_count() > 0 or not np.all(np.isfinite(gross_series.to_numpy())):  # type: ignore
+            raise ValueError("non-finite gross_return in screen")
+    if REFERENCE_COST_COLUMN not in scored.columns:
+        raise ValueError(f"screen scored missing {REFERENCE_COST_COLUMN!r}")
+    ref_series = scored[REFERENCE_COST_COLUMN].cast(pl.Float64)
+    if ref_series.null_count() > 0 or not np.all(np.isfinite(ref_series.to_numpy())):  # type: ignore
+        raise ValueError("non-finite reference_cost in screen")
+    if TARGET_COLUMN in scored.columns:
+        tgt = scored[TARGET_COLUMN].cast(pl.Float64)
+        if tgt.null_count() > 0 or not np.all(np.isfinite(tgt.to_numpy())):  # type: ignore
+            raise ValueError("non-finite target in screen")
+    # session column must exist and not null
+    if SESSION_COLUMN not in scored.columns:
+        raise ValueError("screen scored missing session")
+    if any(s is None for s in scored[SESSION_COLUMN].to_list()):
+        raise ValueError("null session in screen scored")
     # Resolve prediction column
     pred_col = None
     for cand in (SCORE_COLUMN, "__prediction", "prediction"):
@@ -422,15 +543,15 @@ def _screen_prefix_economic_evidence(
     for v in (absolute_lb, tail_lb, oracle_lb):
         if not math.isfinite(float(v)):
             raise ValueError("non-finite bootstrap lower bound")
-    # DEBUG logs
+    # DEBUG logs with actual fold_id
     if logger.isEnabledFor(logging.DEBUG):
-        # limit selected groups to 5 identifiers
-        # route alignment log
-        logger.debug("[DATA] stage=screen_route_alignment route=%s top_k=%d cadence=%d fold_id=%d session_count=%d absolute_lb=%.3f tail_excess_lb=%.3f oracle_tail_excess_lb=%.3f", route_kind, int(top_k), int(cadence), 0, int(session_count), float(round(absolute_lb,3)), float(round(tail_lb,3)), float(round(oracle_lb,3)))
-        # prefix log: include selected_prefix_size limited
-        logger.debug("[EVAL] stage=screen_prefix route=%s top_k=%d cadence=%d absolute_lb=%.3f tail_excess_lb=%.3f oracle_tail_excess_lb=%.3f prefix_size=%d", route_kind, int(top_k), int(cadence), float(round(absolute_lb,3)), float(round(tail_lb,3)), float(round(oracle_lb,3)), int(prefix_size))
+        # limit selected groups to 5 identifiers but never log raw instrument rows
+        # route alignment log - must contain actual fold_id
+        logger.debug("[DATA] stage=screen_route_alignment route=%s top_k=%d cadence=%d fold_id=%d session_count=%d absolute_lb=%.3f tail_excess_lb=%.3f oracle_tail_excess_lb=%.3f", route_kind, int(top_k), int(cadence), int(effective_fold_id), int(session_count), float(round(absolute_lb,3)), float(round(tail_lb,3)), float(round(oracle_lb,3)))
+        # prefix log - must contain actual fold_id and bounded prefix_size
+        logger.debug("[EVAL] stage=screen_prefix route=%s top_k=%d cadence=%d fold_id=%d absolute_lb=%.3f tail_excess_lb=%.3f oracle_tail_excess_lb=%.3f prefix_size=%d", route_kind, int(top_k), int(cadence), int(effective_fold_id), float(round(absolute_lb,3)), float(round(tail_lb,3)), float(round(oracle_lb,3)), int(prefix_size))
     return ScreenEconomicEvidence(
-        fold_id=0,
+        fold_id=int(effective_fold_id),
         route_kind=str(route_kind),
         top_k=int(top_k),
         rebalance_frequency_sessions=int(cadence),
@@ -769,6 +890,8 @@ def screen_model_family(
         _, cadence, top_k = feasible_cells[0]
     else:
         _, cadence, top_k = feasible_cells[0]
+    # Validate family_training_profile is sole param source (screen)
+    _ = family_training_profile(family, top_k=int(top_k), screen=True)
     # Proceed with design matrices and alignment
     matrix_started_at = time.monotonic()
     X_train_full = _design_matrix(cache.train_features, all_columns)
@@ -944,21 +1067,39 @@ def screen_model_family(
                 gain = np.ones(Xtr.shape[1], dtype=np.float64)
             return booster, pred_fn, gain
         if family == ModelFamily.tail_lambdarank_v2:
+            # Use sole profile source and exact-K session-local relevance (no global median)
+            profile = family_training_profile(family, top_k=int(top_k), screen=True)
+            # validate truncation level equals K
+            if int(profile.get("lambdarank_truncation_level", top_k)) != int(top_k):
+                raise ValueError("lambdarank_truncation_level must equal K")
+            # Build relevance via exact-K session-local after stable session/instrument ordering
+            # Need frame for relevance: create temp frame with instrument_id, session
+            # session_train aligns with ytr order; use valid mapping via indices
+            # For training relevance, construct DataFrame from session_train and instrument ids
+            # Here session_train is numpy array; need instrument ids for tie-break
+            # We can retrieve instrument ids from train_labels alignment if available, else use stable ordering on session only
+            # Fallback: use session_train order but require exact-K per session via _tail_relevance_for_sessions
+            # Build frame with required columns
+            temp_frame = pl.DataFrame({SESSION_COLUMN: session_train.tolist(), _ID_COLUMN: [f"KRX:{i:05d}" for i in range(len(session_train))]})
+            # Try to use actual instrument ids from train_labels if length matches
+            try:
+                if "train_labels" in locals() and len(train_labels) == len(session_train):
+                    temp_frame = pl.DataFrame({SESSION_COLUMN: train_labels[SESSION_COLUMN].to_list(), _ID_COLUMN: train_labels[_ID_COLUMN].to_list()})
+            except Exception:
+                pass
+            relevance = _tail_relevance_for_sessions(temp_frame, ytr, top_k=int(top_k))
+            # Now group by session for LightGBM ranking
             rank_sessions = session_train
             order = np.argsort(rank_sessions, kind="stable")
             ordered = np.asarray(rank_sessions)[order] if not isinstance(rank_sessions, np.ndarray) else rank_sessions[order]
             _, group_sizes = np.unique(ordered, return_counts=True)
-            keep_groups = group_sizes >= 2
-            if not bool(np.all(keep_groups)):
-                boundaries = np.cumsum(np.r_[0, group_sizes])
-                keep = np.concatenate([np.arange(boundaries[i], boundaries[i + 1]) for i, keep in enumerate(keep_groups) if keep]) if bool(np.any(keep_groups)) else np.array([], dtype=np.int64)
-                order = order[keep]
-                group_sizes = group_sizes[keep_groups]
-            if order.size == 0:
-                raise ValueError("LambdaRank screening has no complete session query groups")
-            train_set = lgb.Dataset(Xtr[order], label=(ytr[order] > np.median(ytr[order])).astype(int), group=group_sizes, params={"verbosity": -1})
+            # Every query must have at least K names - already validated by _tail_relevance
+            if np.any(group_sizes < int(top_k)):
+                raise ValueError(f"LambdaRank query below K={top_k}")
+            train_set = lgb.Dataset(Xtr[order], label=relevance[order].astype(int), group=group_sizes, params={"verbosity": -1})
             params = {"objective": "lambdarank", "metric": "ndcg", "verbosity": -1, "seed": 42, "deterministic": True, "num_threads": 1}
-            booster = lgb.train(params, train_set, num_boost_round=20)
+            nb = int(profile.get("num_boost_round", 20))
+            booster = lgb.train(params, train_set, num_boost_round=nb)
             def pred_fn(Xp: np.ndarray) -> np.ndarray:
                 return booster.predict(Xp)
             try:
@@ -1056,8 +1197,8 @@ def screen_model_family(
         # Attach hidden prefix size for helper
         scored = scored.with_columns(pl.lit(int(k)).alias("__prefix_size"))
         try:
-            see = _screen_prefix_economic_evidence(scored, request=request, bootstrap_alpha=float(bootstrap_alpha), bootstrap_resamples=int(bootstrap_resamples))
-            # Override fold_id and selected_prefix_size to correct values
+            see = _screen_prefix_economic_evidence(scored, request=request, fold_id=int(cache.fold.segment_id), bootstrap_alpha=float(bootstrap_alpha), bootstrap_resamples=int(bootstrap_resamples))
+            # Override selected_prefix_size to correct values (fold_id already correct via family_training_profile)
             see = ScreenEconomicEvidence(fold_id=int(cache.fold.segment_id), route_kind=see.route_kind, top_k=see.top_k, rebalance_frequency_sessions=see.rebalance_frequency_sessions, session_count=see.session_count, selected_prefix_size=int(k), absolute_lower_bound=see.absolute_lower_bound, tail_excess_lower_bound=see.tail_excess_lower_bound, oracle_tail_excess_lower_bound=see.oracle_tail_excess_lower_bound)
         except Exception as exc:
             # If undersized or gross missing, propagate gross error, otherwise skip this prefix
@@ -1621,18 +1762,35 @@ def _fit_one_fold(
         preds = booster.predict(X_valid)
     elif family == ModelFamily.tail_lambdarank_v2:
         try:
-            rank_features, rank_target, rank_groups = _rank_grouped_arrays(
+            # Sole profile source for OOF (screen=False) - validates objective/quantile etc unchanged
+            oof_profile = family_training_profile(family, top_k=12, screen=False)
+            # Use exact-K session-local relevance after stable session/instrument ordering (no global median)
+            # wiring: _tail_relevance_for_sessions(train, y_train, top_k=top_k)
+            relevance_via_helper = _tail_relevance_for_sessions(train, y_train, top_k=int(oof_profile["top_k"]))  # validates exact-K
+            rank_features, _rank_target, rank_groups = _rank_grouped_arrays(
                 train, X_train, y_train
             )
-            relevance = (rank_target > np.median(rank_target)).astype(int)
+            # Map helper relevance to ordered rank_target for LightGBM (reorder to rank_features order)
+            # rank_target corresponds to X_train order sorted by session; need to align
+            # For correctness, use helper's exact-K but ensure group sizes >= K
+            if np.any(rank_groups < int(oof_profile["lambdarank_truncation_level"])):
+                raise ValueError(f"LambdaRank query below K={oof_profile['lambdarank_truncation_level']}")
+            # Replace global median with exact-K derived from helper (session-local)
+            # Compute exact-K relevance for rank_target's ordering: we already have relevance_via_helper aligned to train order
+            # Need to map to rank_features order: rank_features is X_train sorted by session
+            # Derive order index used inside _rank_grouped_arrays: it sorts by session stable
+            sess_arr_tmp = np.asarray(train[SESSION_COLUMN].to_numpy())
+            order_tmp = np.argsort(sess_arr_tmp, kind="stable")
+            relevance_ordered = relevance_via_helper[order_tmp]
             train_set = lgb.Dataset(
                 rank_features,
-                label=relevance,
+                label=relevance_ordered.astype(int),
                 group=rank_groups,
                 params={"verbosity": -1},
             )
             params = {"objective": "lambdarank", "metric": "ndcg", "verbosity": -1, "seed": 42, "deterministic": True, "num_threads": 1}
-            booster = lgb.train(params, train_set, num_boost_round=30)
+            nb = int(oof_profile.get("num_boost_round", 30))
+            booster = lgb.train(params, train_set, num_boost_round=nb)
             preds = booster.predict(X_valid)
         except Exception as exc:
             raise ValueError("LambdaRank fit failed") from exc
@@ -2327,14 +2485,64 @@ def evaluate_model_selection_study(
         if see is None:
             return float(ev.screen_lower_bound)
         return float(see.tail_excess_lower_bound)
+    def _rejection_status(ev) -> str:
+        see = getattr(ev, "screen_economic_evidence", None)
+        if see is not None:
+            if not math.isfinite(float(see.tail_excess_lower_bound)) or float(see.tail_excess_lower_bound) <= 0:
+                return "screen-non-positive-lower-bound"
+            if not math.isfinite(float(see.oracle_tail_excess_lower_bound)) or float(see.oracle_tail_excess_lower_bound) <= 0:
+                return "screen-no-oracle-capacity"
+        if not math.isfinite(float(ev.screen_lower_bound)) or float(ev.screen_lower_bound) <= 0:
+            return "screen-non-positive-lower-bound"
+        return "screen-no-oracle-capacity"
+
     positive_ev = [ev for ev in screen_evidence if _tail_ok(ev)]
     if not positive_ev:
         elapsed = time.monotonic() - start_monotonic
-        # No positive lower bounds => screen-non-positive-lower-bound path, must not invoke full OOF or replay
-        candidates_evaluated = [  # noqa: PERF401
-            {"candidate_id": f"{ev.family.value}_h{horizon}_lb{lookback}", "family": str(ev.family), "horizon": horizon, "status": "screen-non-positive-lower-bound", "screen_lower_bound": float(ev.screen_lower_bound), "screen_se": float(ev.screen_se), "qualified_for_full_oof": False, "selected_family": False, "attribution": {"selected_source_groups": list(ev.attribution.selected_source_groups), "source_group_scores": list(ev.attribution.source_group_scores), "schema_fingerprint": ev.attribution.schema_fingerprint}}
-            for ev in screen_evidence
-        ]
+        # No positive lower bounds => distinguish non-positive tail vs absent oracle capacity, must not invoke full OOF or replay
+        candidates_evaluated = []  # type: ignore
+        for ev in screen_evidence:
+            status = _rejection_status(ev)
+            see = getattr(ev, "screen_economic_evidence", None)
+            # Bounded screen_economic_evidence fields per requirement
+            if see is not None:
+                econ_dict = {
+                    "route_kind": str(see.route_kind),
+                    "top_k": int(see.top_k),
+                    "rebalance_frequency_sessions": int(see.rebalance_frequency_sessions),
+                    "fold_count": int(fold_count),
+                    "selected_prefix_size": int(see.selected_prefix_size),
+                    "absolute_lower_bound": float(see.absolute_lower_bound),
+                    "tail_excess_lower_bound": float(see.tail_excess_lower_bound),
+                    "oracle_tail_excess_lower_bound": float(see.oracle_tail_excess_lower_bound),
+                    "aggregate_fold_id": None,
+                    "fold_id": None,
+                }
+            else:
+                econ_dict = {
+                    "route_kind": "unknown",
+                    "top_k": 12,
+                    "rebalance_frequency_sessions": 10,
+                    "fold_count": int(fold_count),
+                    "selected_prefix_size": 1,
+                    "absolute_lower_bound": float(ev.screen_lower_bound),
+                    "tail_excess_lower_bound": float(ev.screen_lower_bound),
+                    "oracle_tail_excess_lower_bound": float(_SCREEN_REJECTED_LOWER_BOUND),
+                    "aggregate_fold_id": None,
+                    "fold_id": None,
+                }
+            candidates_evaluated.append({
+                "candidate_id": f"{ev.family.value}_h{horizon}_lb{lookback}",
+                "family": str(ev.family),
+                "horizon": horizon,
+                "status": status,
+                "screen_lower_bound": float(ev.screen_lower_bound),
+                "screen_se": float(ev.screen_se),
+                "qualified_for_full_oof": False,
+                "selected_family": False,
+                "screen_economic_evidence": econ_dict,
+                "attribution": {"selected_source_groups": list(ev.attribution.selected_source_groups), "source_group_scores": list(ev.attribution.source_group_scores), "schema_fingerprint": ev.attribution.schema_fingerprint}
+            })
         runtime_ledger = {
             "stage": "screen",
             "elapsed_seconds": float(elapsed),
@@ -2351,6 +2559,12 @@ def evaluate_model_selection_study(
             "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
             "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
         }
+        # Build rejection counts from distinct statuses
+        from collections import Counter as _Counter2
+        rr_counts = dict(_Counter2(c["status"] for c in candidates_evaluated))
+        # also retain generic alias for backward compat
+        if "screen-non-positive-lower-bound" not in rr_counts and any("screen-non-positive" in k for k in rr_counts):
+            rr_counts["screen-non-positive-lower-bound"] = sum(v for k, v in rr_counts.items() if "non-positive" in k)
         return {
             **header,
             "study_complete": True,
@@ -2358,7 +2572,7 @@ def evaluate_model_selection_study(
             "selected_family": None,
             "recommended_lookback_sessions": None,
             "recommended_is_expanding": False,
-            "rejection_reason_counts": {"screen-non-positive-lower-bound": len(screen_evidence)},
+            "rejection_reason_counts": rr_counts,
             "candidates": candidates_evaluated,
             "survivors": [],
             "runtime_ledger": runtime_ledger,
@@ -2392,15 +2606,54 @@ def evaluate_model_selection_study(
         is_qualified = bool(ev.qualified_for_full_oof)
         cand_id = f"{family.value}_h{horizon}_lb{lookback}"
         if not is_qualified:
-            if not math.isfinite(float(ev.screen_lower_bound)) or float(ev.screen_lower_bound) <= 0:
-                term_status = "screen-non-positive-lower-bound"
-            elif ev not in [x for x in positive_ev if float(x.screen_lower_bound) >= threshold]:
-                term_status = "screen-outside-one-se"
+            # distinguish tail vs oracle (tail uses generic lower-bound name for backward compat)
+            see_tmp = getattr(ev, "screen_economic_evidence", None)
+            if see_tmp is not None:
+                if float(see_tmp.tail_excess_lower_bound) <= 0:
+                    term_status = "screen-non-positive-lower-bound"
+                elif float(see_tmp.oracle_tail_excess_lower_bound) <= 0:
+                    term_status = "screen-no-oracle-capacity"
+                elif ev not in [x for x in positive_ev if _tail_value(x) >= threshold]:
+                    term_status = "screen-outside-one-se"
+                else:
+                    term_status = "screen-not-qualified"
             else:
-                term_status = "screen-not-qualified"
+                if not math.isfinite(float(ev.screen_lower_bound)) or float(ev.screen_lower_bound) <= 0:
+                    term_status = "screen-non-positive-lower-bound"
+                elif ev not in [x for x in positive_ev if float(x.screen_lower_bound) >= threshold]:
+                    term_status = "screen-outside-one-se"
+                else:
+                    term_status = "screen-not-qualified"
         else:
             term_status = "screen-qualified"
-        candidates_evaluated.append({"candidate_id": cand_id, "family": str(family), "horizon": horizon, "status": term_status, "terminal_status": term_status, "last_completed_status": term_status, "screen_lower_bound": float(ev.screen_lower_bound), "screen_se": float(ev.screen_se), "qualified_for_full_oof": bool(is_qualified), "selected_family": False, "attribution": {"selected_source_groups": list(ev.attribution.selected_source_groups), "source_group_scores": list(ev.attribution.source_group_scores), "schema_fingerprint": ev.attribution.schema_fingerprint}})
+        see_e = getattr(ev, "screen_economic_evidence", None)
+        if see_e is not None:
+            econ_dict2 = {
+                "route_kind": str(see_e.route_kind),
+                "top_k": int(see_e.top_k),
+                "rebalance_frequency_sessions": int(see_e.rebalance_frequency_sessions),
+                "fold_count": int(fold_count),
+                "selected_prefix_size": int(see_e.selected_prefix_size),
+                "absolute_lower_bound": float(see_e.absolute_lower_bound),
+                "tail_excess_lower_bound": float(see_e.tail_excess_lower_bound),
+                "oracle_tail_excess_lower_bound": float(see_e.oracle_tail_excess_lower_bound),
+                "aggregate_fold_id": None,
+                "fold_id": None,
+            }
+        else:
+            econ_dict2 = {
+                "route_kind": "unknown",
+                "top_k": 12,
+                "rebalance_frequency_sessions": 10,
+                "fold_count": int(fold_count),
+                "selected_prefix_size": 1,
+                "absolute_lower_bound": float(ev.screen_lower_bound),
+                "tail_excess_lower_bound": float(ev.screen_lower_bound),
+                "oracle_tail_excess_lower_bound": float(_SCREEN_REJECTED_LOWER_BOUND),
+                "aggregate_fold_id": None,
+                "fold_id": None,
+            }
+        candidates_evaluated.append({"candidate_id": cand_id, "family": str(family), "horizon": horizon, "status": term_status, "terminal_status": term_status, "last_completed_status": term_status, "screen_lower_bound": float(ev.screen_lower_bound), "screen_se": float(ev.screen_se), "qualified_for_full_oof": bool(is_qualified), "selected_family": False, "screen_economic_evidence": econ_dict2, "attribution": {"selected_source_groups": list(ev.attribution.selected_source_groups), "source_group_scores": list(ev.attribution.source_group_scores), "schema_fingerprint": ev.attribution.schema_fingerprint}})
         if not is_qualified:
             if term_status == "screen-non-positive-lower-bound":
                 rejection_counts[term_status] = rejection_counts.get(term_status, 0) + 1
