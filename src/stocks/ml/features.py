@@ -643,9 +643,8 @@ def fit_research_feature_schema(
             cols.append(f"{src}__missing")
         cols.append(f"{src}__robust")
         source_groups.append((src, tuple(cols)))
-    # linear-only interaction features: fold-local rank products, source-grouped, fingerprinted, unavailable if either source absent
-    # flow_intensity_20d x vol_regime and flow_consensus x relative_trend_score (only when both sources in representative)
-    interaction_pairs = [("flow_intensity_20d", "vol_regime"), ("flow_consensus", "relative_trend_score")]
+    # linear-only interaction: only ALPHA-by-ALPHA realizable pair
+    interaction_pairs = [("flow_consensus", "relative_trend_score")]
     for a, b in interaction_pairs:
         if a in representative and b in representative:
             name = f"{a}_x_{b}"

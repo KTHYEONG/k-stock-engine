@@ -1357,8 +1357,8 @@ DEFAULT_MODEL_SELECTION_FAMILIES: tuple[ModelFamily, ...] = (
 
 @dataclass(frozen=True, slots=True)
 class ModelSelectionComputeBudget:
-    wall_clock_seconds: float = 540.0
-    screen_phase_seconds: float = 180.0
+    wall_clock_seconds: float = 900.0
+    screen_phase_seconds: float = 720.0
     screen_train_rows_per_fold: int = 48000
     screen_validation_rows_per_fold: int = 12000
     max_full_replay_families: int = 2
@@ -1457,6 +1457,10 @@ class ModelSelectionStudySettings:
     min_validation_segment_sessions: int = 126
     allow_ensemble: bool = True
     compute_budget: ModelSelectionComputeBudget = field(default_factory=ModelSelectionComputeBudget)
+    reference_rebalance_frequency_sessions: int = 10
+    reference_top_k: int = 12
+    reference_policy_profile_id: str = LEGACY_OVERLAY_PROFILE_ID
+    minimum_tail_draws: int = 20
 
     def __post_init__(self) -> None:
         if not self.candidate_families:
@@ -1495,6 +1499,14 @@ class ModelSelectionStudySettings:
             )
         if not isinstance(self.allow_ensemble, bool):
             raise ValueError("allow_ensemble must be bool")
+        if not isinstance(self.reference_rebalance_frequency_sessions, int) or self.reference_rebalance_frequency_sessions < 1:
+            raise ValueError("reference_rebalance_frequency_sessions must be positive int")
+        if not isinstance(self.reference_top_k, int) or self.reference_top_k < 1:
+            raise ValueError("reference_top_k must be positive int")
+        if not self.reference_policy_profile_id:
+            raise ValueError("reference_policy_profile_id must be non-empty")
+        if not isinstance(self.minimum_tail_draws, int) or self.minimum_tail_draws < 1:
+            raise ValueError("minimum_tail_draws must be positive int")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1538,6 +1550,7 @@ class ModelSelectionCandidate:
     selected_source_groups: tuple[str, ...]
     oof_fingerprint: str
     attribution: tuple[FeatureAttributionEvidence, ...]
+    training_top_k: int | None = None
 
     def __post_init__(self) -> None:
         if not self.candidate_id:
@@ -1553,6 +1566,14 @@ class ModelSelectionCandidate:
             raise ValueError("oof_fingerprint must be non-empty")
         if not self.attribution:
             raise ValueError("attribution must be non-empty")
+        if self.family == ModelFamily.tail_lambdarank_v2:
+            if self.training_top_k is None:
+                raise ValueError("tail_lambdarank_v2 requires training_top_k equal to execution K")
+            if not isinstance(self.training_top_k, int) or self.training_top_k < 1:
+                raise ValueError("training_top_k must be positive int for tail_lambdarank_v2")
+        else:
+            if self.training_top_k is not None:
+                raise ValueError(f"family {self.family.value} requires training_top_k is None")
 
 
 @dataclass(frozen=True, slots=True)

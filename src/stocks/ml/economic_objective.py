@@ -36,6 +36,7 @@ __all__ = [
     "measure_tail_capture",
     "project_route_utility",
     "route_labels_for_capture",
+    "route_training_target",
 ]
 
 
@@ -118,6 +119,29 @@ def project_route_utility(
     if not np.all(np.isfinite(arr)):
         raise InvalidOofEconomicUtilityError("route utility must be finite")
     return series
+
+
+def route_training_target(frame: pl.DataFrame, route: object) -> pl.Series:
+    """Route-aligned training target: gross-cost or residual-cost minus reference cost exactly once."""
+    utility = project_route_utility(frame, route)
+    if REFERENCE_COST_COLUMN not in frame.columns:
+        raise ValueError(f"frame missing required column {REFERENCE_COST_COLUMN!r}")
+    cost_series = frame[REFERENCE_COST_COLUMN].cast(pl.Float64)
+    if cost_series.null_count() > 0:
+        raise ValueError("reference_cost has null rows")
+    cost_arr = cost_series.to_numpy()
+    if not np.all(np.isfinite(cost_arr)):
+        raise ValueError("reference_cost must be finite")
+    if np.any(cost_arr < 0):
+        raise ValueError("reference_cost must be non-negative")
+    util_arr = utility.cast(pl.Float64).to_numpy()
+    if not np.all(np.isfinite(util_arr)):
+        raise ValueError("route utility must be finite")
+    target_arr = util_arr - cost_arr
+    if not np.all(np.isfinite(target_arr)):
+        raise ValueError("route training target must be finite")
+    # Return as Series with same name util minus cost; name not critical but keep float
+    return pl.Series(target_arr)
 
 
 def route_labels_for_capture(frame: pl.DataFrame, route: object) -> pl.DataFrame:
