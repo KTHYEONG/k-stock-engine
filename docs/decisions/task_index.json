@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_FAMILY_CONFIG_SIGNAL_INTEGRITY_20260829",
+      "date": "2026-08-29",
+      "adr_id": "ADR_20260829_ML_FAMILY_CONFIG_SIGNAL_INTEGRITY_20260829",
+      "domain": "stocks_ml",
+      "title": "ML family configuration and route signal integrity",
+      "why": "수정된 H10/C10/K12 연구를 재실행한 결과, screen/OOF/calibration 설정을 정렬해도 두 후보 family가 세 profile 모두 0 fill이고 양의 tail lower bound가 없었다. 결과와 원인 분리를 최신 문서에 고정할 필요가 있다.",
+      "resolution": "canonical family fitting, resolved execution cell, route-aware calibration label, LambdaRank K 전달을 적용한 연구 결과를 docs/results/ml-cmp.md에 최신 실행 하나로 교체하고 RESEARCH_ONLY no-qualified-survivor 및 family/profile별 0-fill evidence를 기록했다.",
+      "impact": "artifact는 publish하지 않았고 기존 경제 gate를 완화하지 않았다. 향후 개선은 absolute-route label/feature signal과 Huber 수렴 경고를 별도 검증하는 기준으로 남는다."
+    },
+    {
       "task_id": "TASK_ML_POLICY_FRONTIER_EVIDENCE_RECOVERY_20260829",
       "date": "2026-08-29",
       "adr_id": "ADR_20260829_ML_POLICY_FRONTIER_EVIDENCE_RECOVERY_20260829",
@@ -989,26 +999,6 @@
       "why": "Backtest evidence did not directly test ML-only or provide a controlled family comparison.",
       "resolution": "Registered a balanced 90-trial five-family ablation, recorded the production NO_TRADE result, and preserved fail-closed promotion and exact economic comparison gates.",
       "impact": "Adds auditable family provenance and documents that no family reached confirmation; no production promotion or gate relaxation."
-    },
-    {
-      "task_id": "TASK_STOCK_V5_CANDIDATE_RECOVERY",
-      "date": "2026-08-13",
-      "adr_id": "ADR_20260813_STOCK_V5_CANDIDATE_RECOVERY",
-      "domain": "stocks",
-      "title": "V5 candidate recovery and blend search",
-      "why": "The latest V5 run produced 81 fold-none prunes despite fitted models and filled orders; a spec-defined recovery funnel is now implemented and independently verified.",
-      "resolution": "Registered the v6 confirmed-recovery policy, configurable LambdaRank blend weights, compact screen evidence, bounded fold confirmation, recovery shortlist, and reason-level telemetry while preserving final economic gates.",
-      "impact": "Negative screen evidence is no longer confused with hard-invalid failure; a bounded set of candidates can reach full economic validation without relaxing costs, bootstrap, DSR, holdout, or multiplicity controls."
-    },
-    {
-      "task_id": "TASK_STOCK_V5_THROUGHPUT_RESULT",
-      "date": "2026-08-13",
-      "adr_id": "ADR_20260813_STOCK_V5_THROUGHPUT_RESULT",
-      "domain": "stocks",
-      "title": "V5 throughput benchmark and no-trade evidence",
-      "why": "Latest V5 execution needed reproducible runtime, memory, ML screen telemetry, and explicit no-trade backtesting limits in the result record.",
-      "resolution": "Recorded artifact-level route metrics, stage timing aggregates, ML configuration, resource usage, and the distinction between unexecuted economic backtesting and zero performance.",
-      "impact": "Backtest result analysis can compare throughput and screening bottlenecks without treating no-trade fields as zero alpha; task indexes and code map are synchronized."
     }
   ]
 }
