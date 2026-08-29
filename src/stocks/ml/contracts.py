@@ -1356,12 +1356,46 @@ DEFAULT_MODEL_SELECTION_FAMILIES: tuple[ModelFamily, ...] = (
 
 
 @dataclass(frozen=True, slots=True)
+class ScreenSamplingPlan:
+    top_k: int
+    cross_section_multiplier: int
+    minimum_tail_draws: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.top_k, int) or self.top_k < 1:
+            raise ValueError("top_k must be positive int")
+        if not isinstance(self.cross_section_multiplier, int) or self.cross_section_multiplier < 2:
+            raise ValueError("cross_section_multiplier must be at least 2")
+        if not isinstance(self.minimum_tail_draws, int) or self.minimum_tail_draws < 1:
+            raise ValueError("minimum_tail_draws must be positive int")
+
+
+@dataclass(frozen=True, slots=True)
+class ScreenSamplingEvidence:
+    sampled_session_count: int
+    minimum_cross_section_count: int
+    maximum_cross_section_count: int
+    sessions_with_oracle_headroom: int
+
+    def __post_init__(self) -> None:
+        for name in ("sampled_session_count", "minimum_cross_section_count", "maximum_cross_section_count", "sessions_with_oracle_headroom"):
+            v = getattr(self, name)
+            if not isinstance(v, int) or v < 0:
+                raise ValueError(f"{name} must be non-negative int")
+        if self.sessions_with_oracle_headroom > self.sampled_session_count:
+            raise ValueError("sessions_with_oracle_headroom cannot exceed sampled_session_count")
+        if self.sampled_session_count > 0 and self.minimum_cross_section_count > self.maximum_cross_section_count:
+            raise ValueError("minimum_cross_section_count cannot exceed maximum_cross_section_count")
+
+
+@dataclass(frozen=True, slots=True)
 class ModelSelectionComputeBudget:
     wall_clock_seconds: float = 900.0
     screen_phase_seconds: float = 720.0
     screen_train_rows_per_fold: int = 48000
     screen_validation_rows_per_fold: int = 12000
     max_full_replay_families: int = 2
+    screen_cross_section_multiplier: int = 4
 
     def __post_init__(self) -> None:
         if not math.isfinite(float(self.wall_clock_seconds)) or float(self.wall_clock_seconds) <= 0:
@@ -1376,6 +1410,8 @@ class ModelSelectionComputeBudget:
             raise ValueError("screen_validation_rows_per_fold must be positive")
         if self.max_full_replay_families < 1:
             raise ValueError("max_full_replay_families must be positive")
+        if not isinstance(self.screen_cross_section_multiplier, int) or self.screen_cross_section_multiplier < 1:
+            raise ValueError("screen_cross_section_multiplier must be positive int")
 
 
 @dataclass(frozen=True, slots=True)
