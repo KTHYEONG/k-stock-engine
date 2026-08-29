@@ -34,6 +34,7 @@ from src.storage.parquet_datasets import file_sha256
 
 CATALOG_LOG_NAME = "catalog.jsonl"
 RETENTION_NAME = "retention.json"
+ACTIVE_DATASETS_NAME = "active_datasets.json"
 SNAPSHOT_MANIFEST_NAME = "snapshot_manifest.json"
 SNAPSHOT_MANIFEST_VERSION = 1
 
@@ -112,6 +113,52 @@ class CatalogEntry:
     @property
     def is_evidence(self) -> bool:
         return self.kind in _EVIDENCE_KIND_SET
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveDatasetPolicy:
+    """Explicit dataset versions that remain in the active research surface."""
+
+    entries: tuple[tuple[CatalogKind, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        if len(set(self.entries)) != len(self.entries):
+            raise ValueError("active dataset policy contains duplicate entries")
+        if any(not name for _kind, name in self.entries):
+            raise ValueError("active dataset policy names must be non-empty")
+
+    def contains(self, kind: CatalogKind, name: str) -> bool:
+        return (kind, name) in self.entries
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "active_datasets_version": 1,
+            "entries": [
+                {"kind": kind.value, "name": name}
+                for kind, name in sorted(self.entries, key=lambda item: (item[0].value, item[1]))
+            ],
+        }
+
+    @classmethod
+    def from_json(cls, payload: object) -> ActiveDatasetPolicy:
+        if not isinstance(payload, dict):
+            raise ValueError("active dataset policy must be an object")
+        version = payload.get("active_datasets_version", 1)
+        if int(version) != 1:
+            raise ValueError(f"unsupported active dataset policy version: {version}")
+        raw_entries = payload.get("entries", [])
+        if not isinstance(raw_entries, list):
+            raise ValueError("active dataset policy entries must be a list")
+        if any(not isinstance(item, dict) for item in raw_entries):
+            raise ValueError("active dataset policy entries must be objects")
+        try:
+            entries = tuple(
+                (CatalogKind(str(item["kind"])), str(item["name"]))
+                for item in raw_entries
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("active dataset policy entry requires kind and name") from exc
+        return cls(entries=entries)
 
 
 def entry_repr(entry: CatalogEntry) -> dict[str, object]:
@@ -210,6 +257,40 @@ class CatalogStore:
             if entry.name == name:
                 return entry
         return None
+
+    @property
+    def active_policy_path(self) -> Path:
+        return self.root / ACTIVE_DATASETS_NAME
+
+    def load_active_policy(self) -> ActiveDatasetPolicy:
+        """Load the optional active-version policy; absent means no override."""
+        if not self.active_policy_path.exists():
+            return ActiveDatasetPolicy()
+        try:
+            payload = json.loads(self.active_policy_path.read_text(encoding="utf-8"))
+            return ActiveDatasetPolicy.from_json(payload)
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"invalid active dataset policy: {self.active_policy_path}") from exc
+
+    def save_active_policy(self, policy: ActiveDatasetPolicy) -> None:
+        self.active_policy_path.write_text(
+            json.dumps(policy.to_json(), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    def missing_entries(self) -> tuple[CatalogEntry, ...]:
+        """Return registered entries whose declared path is absent on disk."""
+        project_root = self.root.parent.parent.parent
+        missing: list[CatalogEntry] = []
+        for entry in self.list():
+            if not entry.path:
+                continue
+            path = Path(entry.path)
+            if not path.is_absolute():
+                path = project_root / path
+            if not path.exists():
+                missing.append(entry)
+        return tuple(sorted(missing, key=lambda item: (item.kind.value, item.name)))
 
     def require(self, kind: CatalogKind, name: str) -> CatalogEntry:
         entry = self.get(kind, name)
@@ -611,6 +692,17 @@ class RetentionRegistry:
                         referenced_by=(*records[key].referenced_by, snapshot_id),
                         pinned=records[key].pinned,
                     )
+        # Direct training no longer requires snapshots; explicitly active
+        # dataset versions must therefore be retained independently.
+        for kind, name in store.load_active_policy().entries:
+            key = (kind, name)
+            if key in records and "active-policy" not in records[key].referenced_by:
+                records[key] = RetentionRecord(
+                    kind=kind,
+                    name=name,
+                    referenced_by=(*records[key].referenced_by, "active-policy"),
+                    pinned=records[key].pinned,
+                )
         return tuple(records.values())
 
     def _manifest_references(self, snapshot_id: str) -> tuple[tuple[CatalogKind, str], ...]:
@@ -660,6 +752,7 @@ class RetentionCandidate:
 def retention_dry_run(
     store: CatalogStore,
     registry: RetentionRegistry,
+    active_policy: ActiveDatasetPolicy | None = None,
 ) -> tuple[RetentionCandidate, ...]:
     """List deletion candidates without changing any file.
 
@@ -667,10 +760,13 @@ def retention_dry_run(
     evidence, and not an immutable published snapshot/legacy source. ``SNAPSHOT``
     entries are never eligible; evidence is never eligible.
     """
+    policy = active_policy if active_policy is not None else store.load_active_policy()
     records = {f"{r.kind.value}:{r.name}": r for r in registry.load()}
     candidates: list[RetentionCandidate] = []
     for entry in store.list():
         if entry.kind in IMMUTABLE_KINDS or entry.kind in _EVIDENCE_KIND_SET:
+            continue
+        if policy.contains(entry.kind, entry.name):
             continue
         record = records.get(f"{entry.kind.value}:{entry.name}")
         if record is not None and (record.pinned or record.referenced_by):
