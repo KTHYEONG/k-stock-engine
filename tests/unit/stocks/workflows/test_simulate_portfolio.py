@@ -22,6 +22,24 @@ from src.stocks.workflows.simulate_portfolio import (
     artifact_policy_profile,
     simulate_portfolio,
 )
+
+
+def test_schema_compatible_content_change_is_backtest_warning() -> None:
+    """Content drift warns while schema drift remains the blocking contract."""
+    from types import SimpleNamespace
+
+    from src.stocks.workflows.simulate_portfolio import _validate_artifact_input_lineage
+
+    snapshot = SimpleNamespace(
+        manifest=SimpleNamespace(schema_hash="schema", content_hash="new-content")
+    )
+    artifact = SimpleNamespace(
+        artifact_id="artifact",
+        params={"holm_gate_version": "v6", "feature_content_hash": "old-content"},
+    )
+    assert _validate_artifact_input_lineage(snapshot, artifact) == (
+        "feature_content_hash_mismatch",
+    )
 from src.stocks.workflows.train_model import train_model
 from tests.fixtures.stocks.helpers import (
     stock_net_alpha_composed_df,
