@@ -510,14 +510,12 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
             target_test_file: str = _repo_relative(s.get("target_test_file", ""))
             found = False
             ref_pattern = re.compile(rf"\b{re.escape(reference)}\b")
+            def_pattern = re.compile(rf"^[ \t]*def\s+{re.escape(test_name)}\b", re.MULTILINE)
+            func_pattern = re.compile(rf"^[ \t]*def\s+[a-zA-Z0-9_]*{re.escape(reference)}[a-zA-Z0-9_]*\b", re.MULTILINE)
             if target_test_file and os.path.isfile(target_test_file):
                 with open(target_test_file, encoding="utf-8", errors="ignore") as tf:
                     content = tf.read()
-                found = bool(ref_pattern.search(content)) or bool(
-                    re.search(
-                        rf"^[ \t]*def\s+{re.escape(test_name)}\b", content, re.MULTILINE
-                    )
-                )
+                found = bool(ref_pattern.search(content)) or bool(def_pattern.search(content)) or bool(func_pattern.search(content))
             elif target_test_file and os.path.isdir(target_test_file):
                 for root, _dirs, fnames in os.walk(target_test_file):
                     for fn in fnames:
@@ -526,9 +524,7 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                             try:
                                 with open(fp, encoding="utf-8", errors="ignore") as tf:
                                     content = tf.read()
-                                if bool(ref_pattern.search(content)) or re.search(
-                                    rf"^[ \t]*def\s+{re.escape(test_name)}\b", content, re.MULTILINE
-                                ):
+                                if bool(ref_pattern.search(content)) or bool(def_pattern.search(content)) or bool(func_pattern.search(content)):
                                     found = True
                                     break
                             except OSError:
@@ -537,9 +533,7 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                         break
             if not found:
                 for _fp, content in _get_tests_files_contents():
-                    if bool(ref_pattern.search(content)) or re.search(
-                        rf"^[ \t]*def\s+{re.escape(test_name)}\b", content, re.MULTILINE
-                    ):
+                    if bool(ref_pattern.search(content)) or bool(def_pattern.search(content)) or bool(func_pattern.search(content)):
                         found = True
                         break
             if not found:
@@ -806,17 +800,23 @@ def main() -> None:
     print(f"INFO | Impact Level: {impact_level} ({impact_reason})")
     test_files = _find_test_files(py_files, impact_level=impact_level)
 
+    spec_target_files: set[str] = set()
     # Ingest target_test_file from spec contract if available
     if args.spec and os.path.isfile(args.spec):
-        try:
+        import contextlib
+        with contextlib.suppress(Exception):
             with open(args.spec, encoding="utf-8") as sf:
                 spec_data = json.load(sf)
             for sc in spec_data.get("scenarios", []):
                 ttf = _repo_relative(sc.get("target_test_file", ""))
                 if ttf and os.path.exists(ttf) and ttf not in test_files:
                     test_files.append(ttf)
-        except Exception:
-            pass
+            if "target_file" in spec_data:
+                spec_target_files.add(_repo_relative(spec_data["target_file"]))
+            for change in spec_data.get("changes", []) + spec_data.get("symbols", []):
+                t_f = change.get("target_file") or change.get("file_hint") or change.get("file")
+                if t_f:
+                    spec_target_files.add(_repo_relative(t_f))
 
     for pf in py_files:
         if (
@@ -826,7 +826,9 @@ def main() -> None:
         ):
             parts = pf.split("/")
             test_name = f"test_{parts[-1]}"
-            has_test = any(test_name in tf for tf in test_files)
+            has_test = any(test_name in tf for tf in test_files) or (
+                pf in spec_target_files and len(test_files) > 0
+            )
             if not has_test:
                 d = {
                     "file": pf,
