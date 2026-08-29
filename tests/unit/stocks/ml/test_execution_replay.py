@@ -1079,3 +1079,41 @@ def test_SCENARIO_SMALL_ACCOUNT_LOT_05_CAUSAL_BUFFER():
     # cutoff before any gap can be computed (needs prev close)
     with pytest.raises(ValueError, match="no-causal-open-gap-buffer"):
         derive_causal_open_gap_buffer_bps(empty_frame, cutoff=base, quantile=0.95)
+
+
+def test_MLCMP_REPLAY_DIAG_03():  # noqa: N802
+    """MLCMP-REPLAY-DIAG-03: cold-start replay has equal lengths and cold_start >=1."""
+    from src.stocks.ml.replay_aggregation import CandidateReplayAccumulator, SegmentExecutionSummary
+
+    acc = CandidateReplayAccumulator()
+    # Simulate a cold-start segment with no fills but planned cycles
+    summary = SegmentExecutionSummary(
+        segment_id=0,
+        base_growth=(0.0, 0.0),
+        stress_growth=(0.0, 0.0),
+        base_interval_exposure=(0.0, 0.0),
+        stress_interval_exposure=(0.0, 0.0),
+        planned_cycles=2,
+        filled_orders=0,
+        filled_sessions=0,
+        invested_intervals=0,
+        filled_cycles=0,
+        turnover=0.0,
+        base_cost_drag=0.0,
+        stress_cost_drag=0.0,
+        base_exposure=0.0,
+        stress_exposure=0.0,
+        unfilled_reason_counts={},
+        interval_session_bounds=(datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC), datetime(2024, 1, 3, tzinfo=UTC)),
+        capacity_clipped_orders=0,
+        cold_start_economic_cash_decisions=2,
+    )
+    acc.add_segment(summary)
+    ev = acc.finalize()
+    assert isinstance(ev, ExecutionReplayEvidence)
+    assert len(ev.base_log_growth) == len(ev.stress_log_growth)
+    # action_diagnostics must contain cold_start_economic_cash_decisions >=1
+    diag = dict(ev.action_diagnostics)
+    assert diag.get("cold_start_economic_cash_decisions", 0) >= 1
+    # no replay-failed rejection: evidence is valid, not raising
+    assert ev.planned_cycles == 2

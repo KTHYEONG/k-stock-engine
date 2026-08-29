@@ -1466,3 +1466,19 @@ def test_MODEL_SELECTION_FAST_05_GRID_REJECTED(monkeypatch):
         assert res1["selected_family"] is None
 
 # MODEL_SELECTION_07_CLI_HAS_NO_SYNTHETIC_FALLBACK
+
+
+def test_MLCMP_CLI_BUDGET_05():  # noqa: N802
+    """MLCMP-CLI-BUDGET-05: CLI parsing forwards screen_phase_seconds."""
+    from src.stocks.cli.train import build_parser
+    from src.stocks.ml.contracts import ModelSelectionComputeBudget
+
+    parser = build_parser()
+    args = parser.parse_args(["--artifact-id", "test", "--model-selection-wall-clock-seconds", "900", "--model-selection-screen-phase-seconds", "720"])
+    # Validate budget constructed as in run_research_only_model_selection_study
+    budget = ModelSelectionComputeBudget(wall_clock_seconds=args.model_selection_wall_clock_seconds, screen_phase_seconds=args.model_selection_screen_phase_seconds)
+    assert budget.wall_clock_seconds == 900.0
+    assert budget.screen_phase_seconds == 720.0
+    # also ensure CLI forwards without changing other defaults
+    assert budget.screen_train_rows_per_fold == 48000
+    assert budget.screen_validation_rows_per_fold == 12000
