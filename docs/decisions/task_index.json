@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_FAMILY_RECOVERY_PLAN",
+      "date": "2026-08-29",
+      "adr_id": "ADR_20260829_ML_FAMILY_RECOVERY_PLAN",
+      "domain": "stocks_ml",
+      "title": "ML family recovery screen diagnostics",
+      "why": "최신 H10/C10/K12 ML 비교에서 oracle 기회는 양수였지만 6개 family가 모두 경제 screen gate를 통과하지 못했고 fold DEBUG 식별자 오류가 확인됨",
+      "resolution": "fold별 route-aligned DEBUG evidence와 bounded candidate JSON을 검증하고, train-only 결측 대체·rank interaction·family profile·session Top-K relevance 경로를 반영한 recovery 명세 및 실행 결과를 등록함. 최신 실행은 3-fold 6-family screen에서 모두 음수 tail-excess로 fail-closed됨",
+      "impact": "artifact publish 없음; OOF/replay 0회; H10 기준 elastic_net_v2가 -0.004583으로 최선이나 채택 기준 미달. oracle tail-excess 하한은 +0.134158로 opportunity set은 존재함"
+    },
+    {
       "task_id": "TASK_ML_COMPARISON_DIAGNOSTICS",
       "date": "2026-08-29",
       "adr_id": "ADR_20260829_ML_COMPARISON_DIAGNOSTICS",
@@ -989,16 +999,6 @@
       "why": "The v5 reference run fail-closed during fold preparation with no screen or replay trials, and DEBUG reproduction showed the proxy kernel could not resolve the third fold validation boundary.",
       "resolution": "Diagnosed Fold validation_mask row positions being queried as session_index values; added DEBUG diagnostics for full/proxy preparation and kernel construction failures, and registered a contract to bind kernels from row-position validation frames with explicit boundary and route-status validation.",
       "impact": "The v5 implementation remains fail-closed and unchanged in selection economics; future repair must prevent pre-validation kernel anchoring, distinguish no-prepared-fold from no-proxy-kernel, and preserve 81-trial multiplicity, causal replay, costs, fills, settlement, and NO_TRADE gates."
-    },
-    {
-      "task_id": "EXECUTION_MATCHED_ALPHA_ARCHITECTURE",
-      "date": "2026-08-13",
-      "adr_id": "ADR_20260813_EXECUTION_MATCHED_ALPHA_ARCHITECTURE",
-      "domain": "signal",
-      "title": "Execution-matched alpha architecture v5",
-      "why": "The v4 reference run showed proxy economic lower bounds turning negative under exact replay, with high turnover and cost drag despite honest global multiplicity.",
-      "resolution": "Added a canonical execution-matched replay kernel, causal costed hold/replace labels, stateful proxy tests, and v5 selection contracts while preserving costs, fills, settlement, thresholds, multiplicity, and NO_TRADE semantics.",
-      "impact": "Candidate selection is aligned with executable portfolio-state outcomes; the implementation can reject proxy sign flips before promotion and records the v5 architecture for future research runs."
     }
   ]
 }
