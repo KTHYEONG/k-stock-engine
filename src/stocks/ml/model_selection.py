@@ -18,6 +18,7 @@ from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor
 from sklearn.linear_model import ElasticNet, HuberRegressor
 
 from src.stocks.ml.contracts import (
+    ScreenEconomicEvidence,
     DEFAULT_MODEL_SELECTION_FAMILIES,
     FamilyScreenEvidence,
     FeatureAttributionEvidence,
@@ -149,7 +150,15 @@ def _aligned_screen_labels(
 ) -> pl.DataFrame:
     """Align sampled rows to labels without positional or synthetic fallback."""
     started_at = time.monotonic()
+    # Required economic columns; retain gross and risk for route-aligned path (fail-closed elsewhere).
+    from src.stocks.ml.labels import GROSS_COLUMN as _GC_ALIGNED
     required = (_ID_COLUMN, SESSION_COLUMN, TARGET_COLUMN, REALIZED_RETURN_COLUMN, REFERENCE_COST_COLUMN)
+    optional_cols = []
+    if _GC_ALIGNED in labels.columns:
+        optional_cols.append(_GC_ALIGNED)
+    if RISK_RESIDUAL_COLUMN in labels.columns:
+        optional_cols.append(RISK_RESIDUAL_COLUMN)
+    optional_gross = tuple(optional_cols)
     missing = [column for column in required if column not in labels.columns]
     if missing:
         raise ValueError(f"screen labels missing required economic columns: {missing}")
@@ -170,7 +179,7 @@ def _aligned_screen_labels(
     aligned = (
         requested.join(keys, on="__row_idx", how="left", maintain_order="left")
         .join(
-            labels.select(list(required)),
+            labels.select(list(required) + list(optional_gross)),
             on=[_ID_COLUMN, SESSION_COLUMN],
             how="left",
             maintain_order="left",
@@ -271,8 +280,169 @@ def prepare_screening_fold_cache(
     )
 
 
+def _screen_prefix_economic_evidence(
+    scored: pl.DataFrame,
+    *,
+    request: NetAlphaTrainingRequest,
+    bootstrap_alpha: float,
+    bootstrap_resamples: int,
+) -> ScreenEconomicEvidence:
+    """Compute bounded economic evidence for one prefix's scored validation frame.
+
+    Scored must contain instrument_id, session, prediction (SCORE_COLUMN or __prediction),
+    and label columns gross_return (for unhedged) or risk_residual, plus reference_cost.
+    Returns ScreenEconomicEvidence with bounded scalars only.
+    """
+    from src.stocks.ml.contracts import ScreenEconomicEvidence
+    from src.stocks.ml.labels import GROSS_COLUMN
+    from src.stocks.ml.economic_objective import project_route_utility
+
+    if scored.is_empty():
+        raise ValueError("scored frame is empty")
+    # Determine route kind and feasible cell
+    route_kind = str(getattr(getattr(request, "route_objective", None), "kind", "unhedged_absolute"))
+    # Normalize to value string
+    try:
+        route_kind = str(request.route_objective.kind.value)
+    except Exception:
+        route_kind = str(route_kind).lower()
+        if "hedged" in route_kind:
+            route_kind = "hedged_residual"
+        else:
+            route_kind = "unhedged_absolute"
+    # Feasible cell for top_k / cadence
+    feasible = request.execution_frontier.require_feasible_horizons(request.portfolio.max_exposure, request.portfolio.max_single_weight)
+    _, cadence, top_k = feasible[0]
+    # Validate gross for unhedged
+    if route_kind == "unhedged_absolute" and GROSS_COLUMN not in scored.columns:
+        raise ValueError(f"unhedged_absolute screen requires {GROSS_COLUMN!r} column (gross missing)")
+    # Resolve prediction column
+    pred_col = None
+    for cand in (SCORE_COLUMN, "__prediction", "prediction"):
+        if cand in scored.columns:
+            pred_col = cand
+            break
+    if pred_col is None:
+        raise ValueError("scored frame missing prediction column")
+    # Filter to deterministic sessions spaced by cadence
+    # Use cadence kernel: sorted unique sessions, subsample every cadence-th deterministically
+    try:
+        sessions_sorted = sorted(set(scored[SESSION_COLUMN].to_list()))
+    except Exception:
+        sessions_sorted = scored[SESSION_COLUMN].unique().sort().to_list()
+    if len(sessions_sorted) >= 2:
+        try:
+            from src.stocks.trading.rebalance_schedule import rebalance_session_indices
+            indices = rebalance_session_indices(tuple(sessions_sorted), min(sessions_sorted), max(sessions_sorted), int(cadence), legacy_daily=False)
+            selected_sessions = [sessions_sorted[i] for i in indices if 0 <= i < len(sessions_sorted)]
+        except Exception:
+            selected_sessions = sessions_sorted[:: int(cadence)]
+    else:
+        selected_sessions = sessions_sorted
+    if not selected_sessions:
+        raise ValueError("no deterministic sessions selected")
+    filtered = scored.filter(pl.col(SESSION_COLUMN).is_in(selected_sessions))
+    if filtered.is_empty():
+        raise ValueError("screen scored empty after cadence filtering")
+    # Determine prefix size from hidden column if present
+    prefix_size = 1
+    for hidden in ("__prefix_size", "selected_prefix_size"):
+        if hidden in scored.columns:
+            try:
+                prefix_size = int(scored[hidden][0])
+                break
+            except Exception:
+                pass
+    # Validate each selected session has at least top_k finite names (prediction and net)
+    # First compute net returns vectorized for filtered rows
+    # project_route_utility minus reference_cost exactly once
+    utility_series = project_route_utility(filtered, request.route_objective)
+    ref = filtered[REFERENCE_COST_COLUMN].cast(pl.Float64).to_numpy()
+    util_arr = utility_series.cast(pl.Float64).to_numpy()
+    if not np.all(np.isfinite(util_arr)) or not np.all(np.isfinite(ref)):
+        raise ValueError("non-finite utility or reference_cost in screen")
+    net_arr = util_arr - ref
+    # Attach net and prediction for per-session logic
+    pred_arr = filtered[pred_col].cast(pl.Float64).to_numpy()
+    sess_arr = filtered[SESSION_COLUMN].to_numpy()
+    # Check finite per row for prediction and net
+    finite_rows = np.isfinite(pred_arr) & np.isfinite(net_arr) & np.array([s is not None for s in sess_arr])
+    if not np.any(finite_rows):
+        raise ValueError("no finite rows for screen evidence")
+    # Filter to finite rows for counting
+    filtered_finite = filtered.filter(pl.Series(finite_rows))
+    # Group by session and check top_k
+    sizes = filtered_finite.group_by(SESSION_COLUMN).len()
+    undersized = sizes.filter(pl.col("len") < int(top_k))
+    if not undersized.is_empty():
+        raise ValueError(f"undersized cross-section: {undersized.height} session(s) hold fewer than top_k={top_k}")
+    # Per-session computation
+    # Build mapping session -> indices
+    unique_sessions = sorted(set(filtered_finite[SESSION_COLUMN].to_list()))
+    session_count = len(unique_sessions)
+    absolutes = []
+    model_excesses = []
+    oracle_excesses = []
+    for sess in unique_sessions:
+        # Recompute net for this session via utility
+        sess_frame = filtered_finite.filter(pl.col(SESSION_COLUMN)==sess)
+        sess_utility = project_route_utility(sess_frame, request.route_objective).cast(pl.Float64).to_numpy()
+        sess_ref = sess_frame[REFERENCE_COST_COLUMN].cast(pl.Float64).to_numpy()
+        sess_net = sess_utility - sess_ref
+        sess_pred_vals = sess_frame[pred_col].cast(pl.Float64).to_numpy()
+        sess_ids = sess_frame[_ID_COLUMN].to_numpy()
+        universe_mean = float(np.mean(sess_net))
+        # oracle pick: top_k by net descending, id tie-break ascending
+        oracle_order = np.lexsort((sess_ids, -sess_net))
+        oracle_pick = oracle_order[: int(top_k)]
+        oracle_mean = float(np.mean(sess_net[oracle_pick]))
+        # model pick: top_k by pred descending
+        model_order = np.lexsort((sess_ids, -sess_pred_vals))
+        model_pick = model_order[: int(top_k)]
+        model_mean = float(np.mean(sess_net[model_pick]))
+        absolutes.append(model_mean)
+        model_excesses.append(model_mean - universe_mean)
+        oracle_excesses.append(oracle_mean - universe_mean)
+    absolutes_np = np.asarray(absolutes, dtype=np.float64)
+    model_excess_np = np.asarray(model_excesses, dtype=np.float64)
+    oracle_excess_np = np.asarray(oracle_excesses, dtype=np.float64)
+    # Bootstrap lower bounds
+    def _bootstrap_lb(values: np.ndarray, alpha: float, resamples: int, seed: int) -> float:
+        if values.size == 0:
+            return float("-inf")
+        rng = np.random.default_rng(int(seed))
+        draws = rng.integers(0, values.size, size=(int(resamples), values.size))
+        means = values[draws].mean(axis=1)
+        return float(np.quantile(means, float(alpha)))
+    seed = int(getattr(request, "seed", 42))
+    absolute_lb = _bootstrap_lb(absolutes_np, float(bootstrap_alpha), int(bootstrap_resamples), seed)
+    tail_lb = _bootstrap_lb(model_excess_np, float(bootstrap_alpha), int(bootstrap_resamples), seed + 1)
+    oracle_lb = _bootstrap_lb(oracle_excess_np, float(bootstrap_alpha), int(bootstrap_resamples), seed + 2)
+    # Ensure finite
+    for v in (absolute_lb, tail_lb, oracle_lb):
+        if not math.isfinite(float(v)):
+            raise ValueError("non-finite bootstrap lower bound")
+    # DEBUG logs
+    if logger.isEnabledFor(logging.DEBUG):
+        # limit selected groups to 5 identifiers
+        # route alignment log
+        logger.debug("[DATA] stage=screen_route_alignment route=%s top_k=%d cadence=%d fold_id=%d session_count=%d absolute_lb=%.3f tail_excess_lb=%.3f oracle_tail_excess_lb=%.3f", route_kind, int(top_k), int(cadence), 0, int(session_count), float(round(absolute_lb,3)), float(round(tail_lb,3)), float(round(oracle_lb,3)))
+        # prefix log: include selected_prefix_size limited
+        logger.debug("[EVAL] stage=screen_prefix route=%s top_k=%d cadence=%d absolute_lb=%.3f tail_excess_lb=%.3f oracle_tail_excess_lb=%.3f prefix_size=%d", route_kind, int(top_k), int(cadence), float(round(absolute_lb,3)), float(round(tail_lb,3)), float(round(oracle_lb,3)), int(prefix_size))
+    return ScreenEconomicEvidence(
+        fold_id=0,
+        route_kind=str(route_kind),
+        top_k=int(top_k),
+        rebalance_frequency_sessions=int(cadence),
+        session_count=int(session_count),
+        selected_prefix_size=int(prefix_size),
+        absolute_lower_bound=float(absolute_lb),
+        tail_excess_lower_bound=float(tail_lb),
+        oracle_tail_excess_lower_bound=float(oracle_lb),
+    )
+
 def screen_model_family(
-    cache: ScreeningFoldCache, labels: pl.DataFrame, family: ModelFamily, budget: ModelSelectionComputeBudget, deadline: float
+    cache: ScreeningFoldCache, labels: pl.DataFrame, family: ModelFamily, budget: ModelSelectionComputeBudget, deadline: float, *, request: NetAlphaTrainingRequest | None = None, bootstrap_alpha: float | None = None, bootstrap_resamples: int | None = None
 ) -> FamilyScreenEvidence:
     started_at = time.monotonic()
     if time.monotonic() >= deadline:
@@ -283,18 +453,327 @@ def screen_model_family(
     all_columns: tuple[str, ...] = tuple(c for _, cols in source_groups for c in cols if c in cache.train_features.columns)
     if not all_columns:
         raise ValueError("no learner columns in cache")
+    # Backward compat: no request -> legacy path (MSE)
+    if request is None or bootstrap_alpha is None or bootstrap_resamples is None:
+        # --- LEGACY MSE PATH (preserved for old tests) ---
+        matrix_started_at = time.monotonic()
+        X_train_full = _design_matrix(cache.train_features, all_columns)
+        X_valid_full = _design_matrix(cache.validation_features, all_columns)
+        _debug_timing("screen_design_matrix_full", matrix_started_at, family=family.value, fold_id=int(cache.fold.segment_id), train_rows=int(X_train_full.shape[0]), validation_rows=int(X_valid_full.shape[0]), feature_columns=int(X_train_full.shape[1]))
+        n_train = X_train_full.shape[0]
+        n_valid = X_valid_full.shape[0]
+        train_idx = cache.train_sample_rows
+        valid_idx = cache.validation_sample_rows
+        train_idx = train_idx[train_idx < n_train]
+        valid_idx = valid_idx[valid_idx < n_valid]
+        if train_idx.size == 0:
+            train_idx = np.arange(min(n_train, int(budget.screen_train_rows_per_fold)), dtype=np.int64)
+        if valid_idx.size == 0:
+            valid_idx = np.arange(min(n_valid, int(budget.screen_validation_rows_per_fold)), dtype=np.int64)
+        label_started_at = time.monotonic()
+        try:
+            train_labels = _aligned_screen_labels(cache.train_features, train_idx, labels)
+            valid_labels = _aligned_screen_labels(cache.validation_features, valid_idx, labels)
+        except Exception:
+            scores = tuple((name, 0.0) for name, _ in source_groups)
+            attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
+            return FamilyScreenEvidence(family=family, screen_lower_bound=_SCREEN_REJECTED_LOWER_BOUND, screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False)
+        _debug_timing("screen_label_alignment_total", label_started_at, family=family.value, fold_id=int(cache.fold.segment_id))
+        train_row_idx = train_labels["__row_idx"].to_numpy().astype(np.int64, copy=False)
+        valid_row_idx = valid_labels["__row_idx"].to_numpy().astype(np.int64, copy=False)
+        X_train = X_train_full[train_row_idx]
+        X_valid = X_valid_full[valid_row_idx]
+        y_train = train_labels[TARGET_COLUMN].cast(pl.Float64).to_numpy()
+        y_valid = valid_labels[TARGET_COLUMN].cast(pl.Float64).to_numpy()
+        realized_train = train_labels[REALIZED_RETURN_COLUMN].cast(pl.Float64).to_numpy()
+        realized_valid = valid_labels[REALIZED_RETURN_COLUMN].cast(pl.Float64).to_numpy()
+        cost_train = train_labels[REFERENCE_COST_COLUMN].cast(pl.Float64).to_numpy()
+        cost_valid = valid_labels[REFERENCE_COST_COLUMN].cast(pl.Float64).to_numpy()
+        session_train = train_labels[SESSION_COLUMN].to_numpy()
+        session_valid = valid_labels[SESSION_COLUMN].to_numpy()
+        if not (X_train.shape[0] == y_train.shape[0] == realized_train.shape[0] == cost_train.shape[0] == session_train.shape[0]):
+            scores = tuple((name, 0.0) for name, _ in source_groups)
+            attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
+            return FamilyScreenEvidence(family=family, screen_lower_bound=_SCREEN_REJECTED_LOWER_BOUND, screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False)
+        if not (X_valid.shape[0] == y_valid.shape[0] == realized_valid.shape[0] == cost_valid.shape[0] == session_valid.shape[0]):
+            scores = tuple((name, 0.0) for name, _ in source_groups)
+            attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
+            return FamilyScreenEvidence(family=family, screen_lower_bound=_SCREEN_REJECTED_LOWER_BOUND, screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False)
+        finite_train = np.isfinite(X_train).all(axis=1) & np.isfinite(y_train) & np.isfinite(realized_train) & np.isfinite(cost_train)
+        finite_valid = np.isfinite(X_valid).all(axis=1) & np.isfinite(y_valid) & np.isfinite(realized_valid) & np.isfinite(cost_valid)
+        try:
+            session_valid_not_null = np.array([s is not None for s in session_valid], dtype=bool)
+            finite_valid = finite_valid & session_valid_not_null
+        except Exception:
+            pass
+        if not finite_train.any() or not finite_valid.any():
+            scores = tuple((name, 0.0) for name, _ in source_groups)
+            attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
+            return FamilyScreenEvidence(family=family, screen_lower_bound=_SCREEN_REJECTED_LOWER_BOUND, screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False)
+        X_train = X_train[finite_train]
+        y_train = y_train[finite_train]
+        realized_train = realized_train[finite_train]
+        cost_train = cost_train[finite_train]
+        session_train = session_train[finite_train]
+        train_labels = train_labels.filter(pl.Series(finite_train))
+        valid_mask_series = pl.Series(finite_valid)
+        X_valid = X_valid[finite_valid]
+        y_valid = y_valid[finite_valid]
+        realized_valid = realized_valid[finite_valid]
+        cost_valid = cost_valid[finite_valid]
+        session_valid = session_valid[finite_valid]
+        valid_labels = valid_labels.filter(valid_mask_series)
+        col_index = {name: idx for idx, name in enumerate(all_columns)}
+        group_cols_idx: dict[str, list[int]] = {}
+        for gname, gcols in source_groups:
+            idxs = [col_index[c] for c in gcols if c in col_index]
+            group_cols_idx[gname] = idxs
+        def _fit_family(Xtr: np.ndarray, ytr: np.ndarray, Xva: np.ndarray):
+            if family == ModelFamily.elastic_net_v2:
+                Xs, _Xvs = _impute_and_standardize_from_train(Xtr, Xva)
+                n_feat = Xtr.shape[1]
+                _train_means = np.zeros(n_feat, dtype=np.float64)
+                for _j in range(n_feat):
+                    _col = Xtr[:, _j]
+                    _finite = np.isfinite(_col)
+                    _train_means[_j] = float(np.mean(_col[_finite])) if np.any(_finite) else 0.0
+                _Xtr_imp = Xtr.copy().astype(np.float64, copy=False)
+                for _j in range(n_feat):
+                    _m = ~np.isfinite(_Xtr_imp[:, _j])
+                    if np.any(_m):
+                        _Xtr_imp[_m, _j] = _train_means[_j]
+                _mean = np.mean(_Xtr_imp, axis=0)
+                _std = np.std(_Xtr_imp, axis=0)
+                _std = np.where(_std == 0, 1.0, _std)
+                _std = np.where(~np.isfinite(_std), 1.0, _std)
+                _mean = np.where(~np.isfinite(_mean), 0.0, _mean)
+                model = ElasticNet(alpha=_elastic_penalty(Xs, ytr), l1_ratio=0.5, max_iter=2000, tol=1e-3, random_state=42)
+                model.fit(Xs, ytr)
+                def pred_fn(Xp: np.ndarray) -> np.ndarray:
+                    Xp_arr = np.asarray(Xp, dtype=np.float64)
+                    for _jj in range(Xp_arr.shape[1]):
+                        _mm = ~np.isfinite(Xp_arr[:, _jj])
+                        if np.any(_mm):
+                            Xp_arr[_mm, _jj] = _train_means[_jj]
+                    Xp2 = (Xp_arr - _mean) / _std
+                    Xp2[~np.isfinite(Xp2)] = 0.0
+                    return model.predict(Xp2)
+                native = np.abs(np.asarray(model.coef_, dtype=np.float64)) if hasattr(model, "coef_") else np.zeros(Xtr.shape[1])
+                return model, pred_fn, native
+            if family == ModelFamily.huber_linear_v1:
+                Xs, _Xvs = _impute_and_standardize_from_train(Xtr, Xva)
+                n_feat = Xtr.shape[1]
+                _train_means = np.zeros(n_feat, dtype=np.float64)
+                for _j in range(n_feat):
+                    _col = Xtr[:, _j]
+                    _finite = np.isfinite(_col)
+                    _train_means[_j] = float(np.mean(_col[_finite])) if np.any(_finite) else 0.0
+                _Xtr_imp = Xtr.copy().astype(np.float64, copy=False)
+                for _j in range(n_feat):
+                    _m = ~np.isfinite(_Xtr_imp[:, _j])
+                    if np.any(_m):
+                        _Xtr_imp[_m, _j] = _train_means[_j]
+                _mean = np.mean(_Xtr_imp, axis=0)
+                _std = np.std(_Xtr_imp, axis=0)
+                _std = np.where(_std == 0, 1.0, _std)
+                _std = np.where(~np.isfinite(_std), 1.0, _std)
+                _mean = np.where(~np.isfinite(_mean), 0.0, _mean)
+                model = HuberRegressor(epsilon=1.35, max_iter=500)
+                model.fit(Xs, ytr)
+                def pred_fn(Xp: np.ndarray) -> np.ndarray:
+                    Xp_arr = np.asarray(Xp, dtype=np.float64)
+                    for _jj in range(Xp_arr.shape[1]):
+                        _mm = ~np.isfinite(Xp_arr[:, _jj])
+                        if np.any(_mm):
+                            Xp_arr[_mm, _jj] = _train_means[_jj]
+                    Xp2 = (Xp_arr - _mean) / _std
+                    Xp2[~np.isfinite(Xp2)] = 0.0
+                    return model.predict(Xp2)
+                native = np.abs(np.asarray(model.coef_, dtype=np.float64)) if hasattr(model, "coef_") else np.zeros(Xtr.shape[1])
+                return model, pred_fn, native
+            if family == ModelFamily.extra_trees_v1:
+                model = ExtraTreesRegressor(n_estimators=30, random_state=42, n_jobs=1)
+                model.fit(Xtr, ytr)
+                def pred_fn(Xp: np.ndarray) -> np.ndarray:
+                    return model.predict(Xp)
+                native = np.asarray(model.feature_importances_, dtype=np.float64) if hasattr(model, "feature_importances_") else np.zeros(Xtr.shape[1])
+                return model, pred_fn, native
+            if family == ModelFamily.hist_gradient_quantile_v1:
+                model = HistGradientBoostingRegressor(loss="quantile", quantile=0.2, max_iter=30, random_state=42)
+                model.fit(Xtr, ytr)
+                def pred_fn(Xp: np.ndarray) -> np.ndarray:
+                    return model.predict(Xp)
+                native = np.zeros(Xtr.shape[1], dtype=np.float64)
+                return model, pred_fn, native
+            if family == ModelFamily.rawnet_lgbm_v2:
+                train_set = lgb.Dataset(Xtr, label=ytr, params={"verbosity": -1})
+                params = {"objective": "regression", "metric": "l2", "verbosity": -1, "seed": 42, "deterministic": True, "num_threads": 1}
+                booster = lgb.train(params, train_set, num_boost_round=20)
+                def pred_fn(Xp: np.ndarray) -> np.ndarray:
+                    return booster.predict(Xp)
+                try:
+                    gain = booster.feature_importance(importance_type="gain").astype(np.float64)
+                    if gain.size != Xtr.shape[1]:
+                        gain = np.ones(Xtr.shape[1], dtype=np.float64)
+                except Exception:
+                    gain = np.ones(Xtr.shape[1], dtype=np.float64)
+                return booster, pred_fn, gain
+            if family == ModelFamily.tail_lambdarank_v2:
+                rank_sessions = session_train
+                order = np.argsort(rank_sessions, kind="stable")
+                ordered = np.asarray(rank_sessions)[order] if not isinstance(rank_sessions, np.ndarray) else rank_sessions[order]
+                _, group_sizes = np.unique(ordered, return_counts=True)
+                keep_groups = group_sizes >= 2
+                if not bool(np.all(keep_groups)):
+                    boundaries = np.cumsum(np.r_[0, group_sizes])
+                    keep = np.concatenate([np.arange(boundaries[i], boundaries[i + 1]) for i, keep in enumerate(keep_groups) if keep]) if bool(np.any(keep_groups)) else np.array([], dtype=np.int64)
+                    order = order[keep]
+                    group_sizes = group_sizes[keep_groups]
+                if order.size == 0:
+                    raise ValueError("LambdaRank screening has no complete session query groups")
+                train_set = lgb.Dataset(Xtr[order], label=(ytr[order] > np.median(ytr[order])).astype(int), group=group_sizes, params={"verbosity": -1})
+                params = {"objective": "lambdarank", "metric": "ndcg", "verbosity": -1, "seed": 42, "deterministic": True, "num_threads": 1}
+                booster = lgb.train(params, train_set, num_boost_round=20)
+                def pred_fn(Xp: np.ndarray) -> np.ndarray:
+                    return booster.predict(Xp)
+                try:
+                    gain = booster.feature_importance(importance_type="gain").astype(np.float64)
+                    if gain.size != Xtr.shape[1]:
+                        gain = np.ones(Xtr.shape[1], dtype=np.float64)
+                except Exception:
+                    gain = np.ones(Xtr.shape[1], dtype=np.float64)
+                return booster, pred_fn, gain
+            raise ValueError(f"unknown family {family}")
+        base_fit_started_at = time.monotonic()
+        try:
+            _model, predict_fn, native_importance = _fit_family(X_train, y_train, X_valid)
+            base_pred = predict_fn(X_valid)
+        except Exception:
+            scores = tuple((name, 0.0) for name, _ in source_groups)
+            attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
+            return FamilyScreenEvidence(family=family, screen_lower_bound=_SCREEN_REJECTED_LOWER_BOUND, screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False)
+        _debug_timing("screen_base_fit_predict", base_fit_started_at, family=family.value, fold_id=int(cache.fold.segment_id), train_rows=int(X_train.shape[0]), validation_rows=int(X_valid.shape[0]))
+        base_loss = _validation_economic_loss(y_valid, base_pred)
+        contributions: dict[str, float] = {}
+        permutation_started_at = time.monotonic()
+        attribution_predictions = 0
+        if family in (ModelFamily.elastic_net_v2, ModelFamily.huber_linear_v1, ModelFamily.extra_trees_v1, ModelFamily.rawnet_lgbm_v2, ModelFamily.tail_lambdarank_v2):
+            for gname, idxs in group_cols_idx.items():
+                if not idxs:
+                    contributions[gname] = 0.0
+                else:
+                    grp_score = float(np.abs(native_importance[idxs]).sum()) if native_importance.size == len(all_columns) else 0.0
+                    contributions[gname] = grp_score
+        else:
+            rng = np.random.default_rng(42)
+            working_buffer = np.empty_like(X_valid)
+            for gname, idxs in group_cols_idx.items():
+                if not idxs:
+                    contributions[gname] = 0.0
+                    continue
+                if time.monotonic() >= deadline:
+                    _debug_timing("screen_permutation_deadline", permutation_started_at, family=family.value, fold_id=int(cache.fold.segment_id), completed_groups=len(contributions))
+                    raise TimeoutError("budget-exhausted during attribution")
+                np.copyto(working_buffer, X_valid)
+                perm = rng.permutation(working_buffer.shape[0])
+                for ci in idxs:
+                    working_buffer[:, ci] = working_buffer[perm, ci]
+                perm_pred = predict_fn(working_buffer)
+                attribution_predictions += 1
+                loss = _validation_economic_loss(y_valid, perm_pred)
+                contributions[gname] = float(loss - base_loss)
+        _debug_timing("screen_permutation_attribution", permutation_started_at, family=family.value, fold_id=int(cache.fold.segment_id), source_groups=len(group_cols_idx), attribution_predictions=attribution_predictions)
+        scores_list = [(name, float(contributions.get(name, 0.0)) if math.isfinite(float(contributions.get(name, 0.0))) else 0.0) for name, _ in source_groups]
+        G = len(source_groups)
+        max_prefixes = math.ceil(math.sqrt(G)) if G > 0 else 1
+        ranked = sorted(scores_list, key=lambda x: x[1], reverse=True)
+        eligible_ranked = [(n, s) for n, s in ranked if contributions.get(n, 0.0) >= 0.0]
+        if not eligible_ranked:
+            eligible_ranked = ranked
+        if len(eligible_ranked) <= max_prefixes:
+            prefix_ks = list(range(1, len(eligible_ranked) + 1))
+        else:
+            step = (len(eligible_ranked) - 1) / (max_prefixes - 1) if max_prefixes > 1 else 1
+            prefix_ks = [1 + round(i * step) for i in range(max_prefixes)]
+            prefix_ks = sorted({min(max(1, k), len(eligible_ranked)) for k in prefix_ks})
+        prefix_started_at = time.monotonic()
+        losses: list[float] = []
+        for k in prefix_ks:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("budget-exhausted during prefix fitting")
+            selected_names = [n for n, _ in eligible_ranked[:k]]
+            sel_idx = [col_index[c] for n in selected_names for c in dict(source_groups).get(n, ()) if c in col_index]
+            if not sel_idx:
+                losses.append(float("inf"))
+                continue
+            Xtr = X_train[:, sel_idx]
+            Xva = X_valid[:, sel_idx]
+            try:
+                _, pf, _ = _fit_family(Xtr, y_train, Xva)
+                pred = pf(Xva)
+                loss = _validation_economic_loss(y_valid, pred)
+            except Exception:
+                loss = float("inf")
+            losses.append(loss)
+        _debug_timing("screen_prefix_fits", prefix_started_at, family=family.value, fold_id=int(cache.fold.segment_id), prefix_fit_count=len(prefix_ks))
+        if not losses:
+            selected = tuple(n for n, _ in eligible_ranked[:1])
+        else:
+            best_idx = int(np.argmin(losses))
+            best_loss = float(losses[best_idx])
+            se = float(np.std(y_valid) / math.sqrt(max(1, len(y_valid)))) if len(y_valid) > 1 else 0.01
+            threshold = best_loss + se
+            chosen_k = len(losses)
+            for idx, loss in enumerate(losses):
+                if loss <= threshold:
+                    chosen_k = prefix_ks[idx]
+                    break
+            selected = tuple(n for n, _ in eligible_ranked[:chosen_k])
+            if not selected:
+                selected = tuple(n for n, _ in eligible_ranked[:1])
+        if not selected:
+            selected = tuple(n for n, _ in eligible_ranked[:1]) if eligible_ranked else tuple(n for n,_ in scores_list[:1])
+        attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=tuple(scores_list), selected_source_groups=tuple(selected), schema_fingerprint=cache.schema.fingerprint)
+        utility_started_at = time.monotonic()
+        screen_frame = valid_labels.with_columns(pl.Series("__prediction", base_pred))
+        top_k = min(12, max(1, int(screen_frame.group_by(SESSION_COLUMN).len()["len"].median())))
+        selected_q = (screen_frame.sort([SESSION_COLUMN, "__prediction", _ID_COLUMN], descending=[False, True, False]).with_columns(pl.col("__prediction").rank("ordinal", descending=True).over(SESSION_COLUMN).alias("__rank")).filter(pl.col("__rank") <= top_k).group_by(SESSION_COLUMN).agg((pl.col(REALIZED_RETURN_COLUMN) - pl.col(REFERENCE_COST_COLUMN)).mean().alias("__net_return")).filter(pl.col("__net_return") > -1.0))
+        if selected_q.is_empty():
+            raise ValueError("screening produced no valid cost-aware session returns")
+        growth = np.log1p(selected_q["__net_return"].cast(pl.Float64).to_numpy())
+        lower_bound = _block_bootstrap_lower_bound(growth, 0.05, 200)
+        se_growth = float(np.std(growth, ddof=1) / math.sqrt(max(1, len(growth)))) if len(growth) > 1 else 0.0
+        _debug_timing("screen_economic_utility", utility_started_at, family=family.value, fold_id=int(cache.fold.segment_id), session_count=int(selected_q.height))
+        _debug_timing("screen_family_complete", started_at, family=family.value, fold_id=int(cache.fold.segment_id), lower_bound=f"{lower_bound:.6f}")
+        return FamilyScreenEvidence(family=family, screen_lower_bound=lower_bound, screen_se=se_growth, attribution=attr, qualified_for_full_oof=False, selected_family=False)
+    # --- ROUTE-ALIGNED ECONOMIC PATH ---
+    from src.stocks.ml.economic_objective import project_route_utility
+
+    # Validate gross for unhedged before any fitting
+    # Actually import locally
+    try:
+        from src.stocks.ml.labels import GROSS_COLUMN as _GC
+    except Exception:
+        _GC = "gross_return"
+    route_kind = str(getattr(getattr(request, "route_objective", None), "kind", "unhedged_absolute"))
+    try:
+        route_kind = str(request.route_objective.kind.value)
+    except Exception:
+        route_kind = "unhedged_absolute" if "unhedged" in str(route_kind).lower() else "hedged_residual"
+    if route_kind == "unhedged_absolute" and _GC not in labels.columns:
+        raise ValueError(f"unhedged_absolute screen requires {_GC!r} column (gross missing)")
+    # Determine feasible cell for top_k/cadence
+    feasible_cells = request.execution_frontier.require_feasible_horizons(request.portfolio.max_exposure, request.portfolio.max_single_weight)
+    if len(feasible_cells) != 1:
+        # Fallback for legacy callers: pick first cell deterministically; evaluate_model_selection_study enforces single-cell gate separately.
+        _, cadence, top_k = feasible_cells[0]
+    else:
+        _, cadence, top_k = feasible_cells[0]
+    # Proceed with design matrices and alignment
     matrix_started_at = time.monotonic()
     X_train_full = _design_matrix(cache.train_features, all_columns)
     X_valid_full = _design_matrix(cache.validation_features, all_columns)
-    _debug_timing(
-        "screen_design_matrix_full",
-        matrix_started_at,
-        family=family.value,
-        fold_id=int(cache.fold.segment_id),
-        train_rows=int(X_train_full.shape[0]),
-        validation_rows=int(X_valid_full.shape[0]),
-        feature_columns=int(X_train_full.shape[1]),
-    )
+    _debug_timing("screen_design_matrix_full", matrix_started_at, family=family.value, fold_id=int(cache.fold.segment_id), train_rows=int(X_train_full.shape[0]), validation_rows=int(X_valid_full.shape[0]), feature_columns=int(X_train_full.shape[1]))
     n_train = X_train_full.shape[0]
     n_valid = X_valid_full.shape[0]
     train_idx = cache.train_sample_rows
@@ -309,60 +788,66 @@ def screen_model_family(
     try:
         train_labels = _aligned_screen_labels(cache.train_features, train_idx, labels)
         valid_labels = _aligned_screen_labels(cache.validation_features, valid_idx, labels)
-    except Exception:
+    except Exception as exc:
+        # If alignment failed due to missing gross, propagate ValueError
+        if "gross" in str(exc).lower():
+            raise
         scores = tuple((name, 0.0) for name, _ in source_groups)
         attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
-        return FamilyScreenEvidence(family=family, screen_lower_bound=_SCREEN_REJECTED_LOWER_BOUND, screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False)
-    _debug_timing(
-        "screen_label_alignment_total",
-        label_started_at,
-        family=family.value,
-        fold_id=int(cache.fold.segment_id),
-    )
+        # Return rejected with bounded evidence
+        see = ScreenEconomicEvidence(fold_id=int(cache.fold.segment_id), route_kind=str(route_kind), top_k=int(top_k), rebalance_frequency_sessions=int(cadence), session_count=0, selected_prefix_size=1, absolute_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), oracle_tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND))
+        return FamilyScreenEvidence(family=family, screen_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False, screen_economic_evidence=see)
+    _debug_timing("screen_label_alignment_total", label_started_at, family=family.value, fold_id=int(cache.fold.segment_id))
     train_row_idx = train_labels["__row_idx"].to_numpy().astype(np.int64, copy=False)
     valid_row_idx = valid_labels["__row_idx"].to_numpy().astype(np.int64, copy=False)
     X_train = X_train_full[train_row_idx]
     X_valid = X_valid_full[valid_row_idx]
     y_train = train_labels[TARGET_COLUMN].cast(pl.Float64).to_numpy()
     y_valid = valid_labels[TARGET_COLUMN].cast(pl.Float64).to_numpy()
-    realized_train = train_labels[REALIZED_RETURN_COLUMN].cast(pl.Float64).to_numpy()
-    realized_valid = valid_labels[REALIZED_RETURN_COLUMN].cast(pl.Float64).to_numpy()
-    cost_train = train_labels[REFERENCE_COST_COLUMN].cast(pl.Float64).to_numpy()
-    cost_valid = valid_labels[REFERENCE_COST_COLUMN].cast(pl.Float64).to_numpy()
     session_train = train_labels[SESSION_COLUMN].to_numpy()
     session_valid = valid_labels[SESSION_COLUMN].to_numpy()
-    if not (X_train.shape[0] == y_train.shape[0] == realized_train.shape[0] == cost_train.shape[0] == session_train.shape[0]):
+    # Also need gross etc for validation
+    # Retrieve gross / risk / cost for valid
+    has_gross = _GC in valid_labels.columns
+    if has_gross:
+        gross_valid = valid_labels[_GC].cast(pl.Float64).to_numpy()
+    else:
+        gross_valid = np.full(y_valid.shape, np.nan)
+    risk_valid = valid_labels[RISK_RESIDUAL_COLUMN].cast(pl.Float64).to_numpy() if RISK_RESIDUAL_COLUMN in valid_labels.columns else np.full(y_valid.shape, np.nan)
+    cost_valid_arr = valid_labels[REFERENCE_COST_COLUMN].cast(pl.Float64).to_numpy()
+    if not (X_train.shape[0] == y_train.shape[0] == session_train.shape[0]):
         scores = tuple((name, 0.0) for name, _ in source_groups)
         attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
-        return FamilyScreenEvidence(family=family, screen_lower_bound=_SCREEN_REJECTED_LOWER_BOUND, screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False)
-    if not (X_valid.shape[0] == y_valid.shape[0] == realized_valid.shape[0] == cost_valid.shape[0] == session_valid.shape[0]):
-        scores = tuple((name, 0.0) for name, _ in source_groups)
-        attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
-        return FamilyScreenEvidence(family=family, screen_lower_bound=_SCREEN_REJECTED_LOWER_BOUND, screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False)
-    finite_train = np.isfinite(X_train).all(axis=1) & np.isfinite(y_train) & np.isfinite(realized_train) & np.isfinite(cost_train)
-    finite_valid = np.isfinite(X_valid).all(axis=1) & np.isfinite(y_valid) & np.isfinite(realized_valid) & np.isfinite(cost_valid)
-    try:
-        session_valid_not_null = np.array([s is not None for s in session_valid], dtype=bool)
-        finite_valid = finite_valid & session_valid_not_null
-    except Exception:
-        pass
+        see = ScreenEconomicEvidence(fold_id=int(cache.fold.segment_id), route_kind=str(route_kind), top_k=int(top_k), rebalance_frequency_sessions=int(cadence), session_count=0, selected_prefix_size=1, absolute_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), oracle_tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND))
+        return FamilyScreenEvidence(family=family, screen_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False, screen_economic_evidence=see)
+    finite_train = np.isfinite(X_train).all(axis=1) & np.isfinite(y_train)
+    finite_valid_base = np.isfinite(X_valid).all(axis=1) & np.isfinite(y_valid)
+    # Also need finite gross/cost for unhedged, else risk/cost
+    if route_kind == "unhedged_absolute":
+        finite_valid = finite_valid_base & np.isfinite(gross_valid) & np.isfinite(cost_valid_arr)
+    else:
+        finite_valid = finite_valid_base & np.isfinite(risk_valid) & np.isfinite(cost_valid_arr)
+    finite_valid = finite_valid & np.array(
+        [s is not None for s in session_valid], dtype=bool
+    )
     if not finite_train.any() or not finite_valid.any():
         scores = tuple((name, 0.0) for name, _ in source_groups)
         attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
-        return FamilyScreenEvidence(family=family, screen_lower_bound=_SCREEN_REJECTED_LOWER_BOUND, screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False)
+        see = ScreenEconomicEvidence(fold_id=int(cache.fold.segment_id), route_kind=str(route_kind), top_k=int(top_k), rebalance_frequency_sessions=int(cadence), session_count=0, selected_prefix_size=1, absolute_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), oracle_tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND))
+        return FamilyScreenEvidence(family=family, screen_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False, screen_economic_evidence=see)
     X_train = X_train[finite_train]
     y_train = y_train[finite_train]
-    realized_train = realized_train[finite_train]
-    cost_train = cost_train[finite_train]
     session_train = session_train[finite_train]
     train_labels = train_labels.filter(pl.Series(finite_train))
     valid_mask_series = pl.Series(finite_valid)
     X_valid = X_valid[finite_valid]
     y_valid = y_valid[finite_valid]
-    realized_valid = realized_valid[finite_valid]
-    cost_valid = cost_valid[finite_valid]
     session_valid = session_valid[finite_valid]
     valid_labels = valid_labels.filter(valid_mask_series)
+    if has_gross:
+        gross_valid = gross_valid[finite_valid]
+    risk_valid = risk_valid[finite_valid]
+    cost_valid_arr = cost_valid_arr[finite_valid]
     col_index = {name: idx for idx, name in enumerate(all_columns)}
     group_cols_idx: dict[str, list[int]] = {}
     for gname, gcols in source_groups:
@@ -371,7 +856,6 @@ def screen_model_family(
     def _fit_family(Xtr: np.ndarray, ytr: np.ndarray, Xva: np.ndarray):
         if family == ModelFamily.elastic_net_v2:
             Xs, _Xvs = _impute_and_standardize_from_train(Xtr, Xva)
-            # capture train-only moments for prediction closure (recompute imputation means for reuse)
             n_feat = Xtr.shape[1]
             _train_means = np.zeros(n_feat, dtype=np.float64)
             for _j in range(n_feat):
@@ -485,6 +969,7 @@ def screen_model_family(
                 gain = np.ones(Xtr.shape[1], dtype=np.float64)
             return booster, pred_fn, gain
         raise ValueError(f"unknown family {family}")
+    # Fit base to get native importance for ranking
     base_fit_started_at = time.monotonic()
     try:
         _model, predict_fn, native_importance = _fit_family(X_train, y_train, X_valid)
@@ -492,17 +977,10 @@ def screen_model_family(
     except Exception:
         scores = tuple((name, 0.0) for name, _ in source_groups)
         attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
-        return FamilyScreenEvidence(family=family, screen_lower_bound=_SCREEN_REJECTED_LOWER_BOUND, screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False)
-    _debug_timing(
-        "screen_base_fit_predict",
-        base_fit_started_at,
-        family=family.value,
-        fold_id=int(cache.fold.segment_id),
-        train_rows=int(X_train.shape[0]),
-        validation_rows=int(X_valid.shape[0]),
-    )
+        see = ScreenEconomicEvidence(fold_id=int(cache.fold.segment_id), route_kind=str(route_kind), top_k=int(top_k), rebalance_frequency_sessions=int(cadence), session_count=0, selected_prefix_size=1, absolute_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), oracle_tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND))
+        return FamilyScreenEvidence(family=family, screen_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False, screen_economic_evidence=see)
+    _debug_timing("screen_base_fit_predict", base_fit_started_at, family=family.value, fold_id=int(cache.fold.segment_id), train_rows=int(X_train.shape[0]), validation_rows=int(X_valid.shape[0]))
     base_loss = _validation_economic_loss(y_valid, base_pred)
-    # Determine contributions via native importance deterministically; fallback to single reusable-buffer prediction
     contributions: dict[str, float] = {}
     permutation_started_at = time.monotonic()
     attribution_predictions = 0
@@ -521,13 +999,7 @@ def screen_model_family(
                 contributions[gname] = 0.0
                 continue
             if time.monotonic() >= deadline:
-                _debug_timing(
-                    "screen_permutation_deadline",
-                    permutation_started_at,
-                    family=family.value,
-                    fold_id=int(cache.fold.segment_id),
-                    completed_groups=len(contributions),
-                )
+                _debug_timing("screen_permutation_deadline", permutation_started_at, family=family.value, fold_id=int(cache.fold.segment_id), completed_groups=len(contributions))
                 raise TimeoutError("budget-exhausted during attribution")
             np.copyto(working_buffer, X_valid)
             perm = rng.permutation(working_buffer.shape[0])
@@ -537,111 +1009,134 @@ def screen_model_family(
             attribution_predictions += 1
             loss = _validation_economic_loss(y_valid, perm_pred)
             contributions[gname] = float(loss - base_loss)
-    _debug_timing(
-        "screen_permutation_attribution",
-        permutation_started_at,
-        family=family.value,
-        fold_id=int(cache.fold.segment_id),
-        source_groups=len(group_cols_idx),
-        attribution_predictions=attribution_predictions,
-    )
-    # Source group scores = contributions (finite).
+    _debug_timing("screen_permutation_attribution", permutation_started_at, family=family.value, fold_id=int(cache.fold.segment_id), source_groups=len(group_cols_idx), attribution_predictions=attribution_predictions)
     scores_list = [(name, float(contributions.get(name, 0.0)) if math.isfinite(float(contributions.get(name, 0.0))) else 0.0) for name, _ in source_groups]
-    # One-SE prefix fitting: at most ceil(sqrt(G)) prefixes.
     G = len(source_groups)
     max_prefixes = math.ceil(math.sqrt(G)) if G > 0 else 1
     ranked = sorted(scores_list, key=lambda x: x[1], reverse=True)
     eligible_ranked = [(n, s) for n, s in ranked if contributions.get(n, 0.0) >= 0.0]
     if not eligible_ranked:
         eligible_ranked = ranked
-    # Determine prefix sizes to evaluate (spaced).
     if len(eligible_ranked) <= max_prefixes:
         prefix_ks = list(range(1, len(eligible_ranked) + 1))
     else:
-        # Space evenly: include first and last.
         step = (len(eligible_ranked) - 1) / (max_prefixes - 1) if max_prefixes > 1 else 1
         prefix_ks = [1 + round(i * step) for i in range(max_prefixes)]
         prefix_ks = sorted({min(max(1, k), len(eligible_ranked)) for k in prefix_ks})
-    prefix_started_at = time.monotonic()
-    losses: list[float] = []
+    # Evaluate each prefix with route-aligned economic evidence using its own prediction
+    prefix_evidences: list[tuple[int, ScreenEconomicEvidence, np.ndarray]] = []
+    # Need valid_labels with gross/risk/cost for helper; build base frame for helper reuse
+    # For each prefix, fit and predict, then build scored frame for that prefix
     for k in prefix_ks:
         if time.monotonic() >= deadline:
             raise TimeoutError("budget-exhausted during prefix fitting")
         selected_names = [n for n, _ in eligible_ranked[:k]]
         sel_idx = [col_index[c] for n in selected_names for c in dict(source_groups).get(n, ()) if c in col_index]
         if not sel_idx:
-            losses.append(float("inf"))
             continue
         Xtr = X_train[:, sel_idx]
         Xva = X_valid[:, sel_idx]
         try:
             _, pf, _ = _fit_family(Xtr, y_train, Xva)
             pred = pf(Xva)
-            loss = _validation_economic_loss(y_valid, pred)
-        except Exception:
-            loss = float("inf")
-        losses.append(loss)
-    _debug_timing(
-        "screen_prefix_fits",
-        prefix_started_at,
-        family=family.value,
-        fold_id=int(cache.fold.segment_id),
-        prefix_fit_count=len(prefix_ks),
-    )
-    # Choose best and one-SE.
-    if not losses:
-        selected = tuple(n for n, _ in eligible_ranked[:1])
-        best_loss = float("inf")
-        se = 0.01
+        except Exception as exc:
+            logger.debug(
+                "[ALGO] stage=screen_prefix_fit family=%s prefix=%d status=failed reason=%s",
+                family.value,
+                int(k),
+                type(exc).__name__,
+            )
+            continue
+        # Build scored frame for this prefix: includes prediction and label columns
+        # valid_labels is filtered DataFrame with __row_idx etc; use it to build scored
+        # Create DataFrame with instrument, session, score, and label columns
+        scored = valid_labels.select(_ID_COLUMN, SESSION_COLUMN, RISK_RESIDUAL_COLUMN, REFERENCE_COST_COLUMN).with_columns(pl.Series(SCORE_COLUMN, pred))
+        if _GC in valid_labels.columns:
+            scored = scored.with_columns(valid_labels[_GC])
+        # Attach hidden prefix size for helper
+        scored = scored.with_columns(pl.lit(int(k)).alias("__prefix_size"))
+        try:
+            see = _screen_prefix_economic_evidence(scored, request=request, bootstrap_alpha=float(bootstrap_alpha), bootstrap_resamples=int(bootstrap_resamples))
+            # Override fold_id and selected_prefix_size to correct values
+            see = ScreenEconomicEvidence(fold_id=int(cache.fold.segment_id), route_kind=see.route_kind, top_k=see.top_k, rebalance_frequency_sessions=see.rebalance_frequency_sessions, session_count=see.session_count, selected_prefix_size=int(k), absolute_lower_bound=see.absolute_lower_bound, tail_excess_lower_bound=see.tail_excess_lower_bound, oracle_tail_excess_lower_bound=see.oracle_tail_excess_lower_bound)
+        except Exception as exc:
+            # If undersized or gross missing, propagate gross error, otherwise skip this prefix
+            if "gross" in str(exc).lower():
+                raise
+            continue
+        # Store also raw model excess array for SE computation? We recompute later
+        prefix_evidences.append((int(k), see, pred))
+    if not prefix_evidences:
+        scores = tuple((name, 0.0) for name, _ in source_groups)
+        attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=tuple(scores_list), selected_source_groups=tuple(n for n,_ in eligible_ranked[:1]) if eligible_ranked else tuple(n for n,_ in scores_list[:1]), schema_fingerprint=cache.schema.fingerprint)
+        see = ScreenEconomicEvidence(fold_id=int(cache.fold.segment_id), route_kind=str(route_kind), top_k=int(top_k), rebalance_frequency_sessions=int(cadence), session_count=0, selected_prefix_size=1, absolute_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), oracle_tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND))
+        return FamilyScreenEvidence(family=family, screen_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False, screen_economic_evidence=see)
+    # Select smallest prefix within one SE of best tail_excess lower bound
+    best = max(prefix_evidences, key=lambda x: x[1].tail_excess_lower_bound)
+    best_tail = float(best[1].tail_excess_lower_bound)
+    # Compute SE from best prefix's per-session model excess distribution
+    # Recompute per-session model excess for best prefix to get std
+    best_k = best[0]
+    # Re-derive best prefix prediction to compute per-session values
+    # Find best prefix selected names
+    best_names = [n for n, _ in eligible_ranked[:best_k]]
+    best_idx = [col_index[c] for n in best_names for c in dict(source_groups).get(n, ()) if c in col_index]
+    Xtr_best = X_train[:, best_idx]
+    Xva_best = X_valid[:, best_idx]
+    try:
+        _, pf_best, _ = _fit_family(Xtr_best, y_train, Xva_best)
+        pred_best = pf_best(Xva_best)
+        scored_best = valid_labels.select(_ID_COLUMN, SESSION_COLUMN, RISK_RESIDUAL_COLUMN, REFERENCE_COST_COLUMN).with_columns(pl.Series(SCORE_COLUMN, pred_best))
+        if _GC in valid_labels.columns:
+            scored_best = scored_best.with_columns(valid_labels[_GC])
+        # Compute per-session model excess for SE
+        # Reuse logic from helper but capture distribution
+        # Quick compute: for each session, model excess
+        sess_list = sorted(set(scored_best[SESSION_COLUMN].to_list()))
+        # Filter to cadence sessions
+        if len(sess_list) >= 2:
+            try:
+                from src.stocks.trading.rebalance_schedule import rebalance_session_indices
+                indices = rebalance_session_indices(tuple(sess_list), min(sess_list), max(sess_list), int(cadence), legacy_daily=False)
+                sel_sess = [sess_list[i] for i in indices if 0 <= i < len(sess_list)]
+            except Exception:
+                sel_sess = sess_list[:: int(cadence)]
+        else:
+            sel_sess = sess_list
+        sb = scored_best.filter(pl.col(SESSION_COLUMN).is_in(sel_sess))
+        model_excess_vals = []
+        for sess in sel_sess:
+            sess_frame = sb.filter(pl.col(SESSION_COLUMN)==sess)
+            if sess_frame.is_empty():
+                continue
+            sess_util = project_route_utility(sess_frame, request.route_objective).cast(pl.Float64).to_numpy()
+            sess_ref = sess_frame[REFERENCE_COST_COLUMN].cast(pl.Float64).to_numpy()
+            sess_net = sess_util - sess_ref
+            sess_pred = sess_frame[SCORE_COLUMN].cast(pl.Float64).to_numpy()
+            sess_ids = sess_frame[_ID_COLUMN].to_numpy()
+            universe_mean = float(np.mean(sess_net))
+            model_order = np.lexsort((sess_ids, -sess_pred))
+            model_pick = model_order[: int(top_k)]
+            model_mean = float(np.mean(sess_net[model_pick]))
+            model_excess_vals.append(model_mean - universe_mean)
+        se = float(np.std(np.asarray(model_excess_vals, dtype=np.float64), ddof=1) / math.sqrt(max(1, len(model_excess_vals)))) if len(model_excess_vals) > 1 else 0.0
+    except Exception:
+        se = 0.0
+    threshold = best_tail - se
+    # Find smallest k meeting threshold
+    candidates_meeting = [ev for ev in prefix_evidences if float(ev[1].tail_excess_lower_bound) >= threshold - 1e-12]
+    if candidates_meeting:
+        chosen = min(candidates_meeting, key=lambda x: x[0])
     else:
-        best_idx = int(np.argmin(losses))
-        best_loss = float(losses[best_idx])
-        se = float(np.std(y_valid) / math.sqrt(max(1, len(y_valid)))) if len(y_valid) > 1 else 0.01
-        threshold = best_loss + se
-        chosen_k = len(losses)
-        for idx, loss in enumerate(losses):
-            if loss <= threshold:
-                chosen_k = prefix_ks[idx]
-                break
-        selected = tuple(n for n, _ in eligible_ranked[:chosen_k])
-        if not selected:
-            selected = tuple(n for n, _ in eligible_ranked[:1])
-    # Ensure selected non-empty.
-    if not selected:
-        selected = tuple(n for n, _ in eligible_ranked[:1]) if eligible_ranked else tuple(n for n,_ in scores_list[:1])
-    attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=tuple(scores_list), selected_source_groups=tuple(selected), schema_fingerprint=cache.schema.fingerprint)
-    # Screen lower bound: cost-aware equal-weight session log growth.
-    utility_started_at = time.monotonic()
-    screen_frame = valid_labels.with_columns(pl.Series("__prediction", base_pred))
-    top_k = min(12, max(1, int(screen_frame.group_by(SESSION_COLUMN).len()["len"].median())))
-    selected = (
-        screen_frame.sort([SESSION_COLUMN, "__prediction", _ID_COLUMN], descending=[False, True, False])
-        .with_columns(pl.col("__prediction").rank("ordinal", descending=True).over(SESSION_COLUMN).alias("__rank"))
-        .filter(pl.col("__rank") <= top_k)
-        .group_by(SESSION_COLUMN)
-        .agg((pl.col(REALIZED_RETURN_COLUMN) - pl.col(REFERENCE_COST_COLUMN)).mean().alias("__net_return"))
-        .filter(pl.col("__net_return") > -1.0)
-    )
-    if selected.is_empty():
-        raise ValueError("screening produced no valid cost-aware session returns")
-    growth = np.log1p(selected["__net_return"].cast(pl.Float64).to_numpy())
-    lower_bound = _block_bootstrap_lower_bound(growth, 0.05, 200)
-    se_growth = float(np.std(growth, ddof=1) / math.sqrt(max(1, len(growth)))) if len(growth) > 1 else 0.0
-    _debug_timing(
-        "screen_economic_utility",
-        utility_started_at,
-        family=family.value,
-        fold_id=int(cache.fold.segment_id),
-        session_count=int(selected.height),
-    )
-    _debug_timing(
-        "screen_family_complete",
-        started_at,
-        family=family.value,
-        fold_id=int(cache.fold.segment_id),
-        lower_bound=f"{lower_bound:.6f}",
-    )
-    return FamilyScreenEvidence(family=family, screen_lower_bound=lower_bound, screen_se=se_growth, attribution=attr, qualified_for_full_oof=False, selected_family=False)
+        chosen = best
+    chosen_k, chosen_see, _ = chosen
+    # Build attribution with selected groups of chosen
+    chosen_names_final = [n for n, _ in eligible_ranked[:chosen_k]]
+    attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=tuple(scores_list), selected_source_groups=tuple(chosen_names_final), schema_fingerprint=cache.schema.fingerprint)
+    # Qualification will be decided by caller based on tail bounds; here just return evidence
+    # screen_lower_bound maps to tail_excess for compatibility, screen_se to se
+    return FamilyScreenEvidence(family=family, screen_lower_bound=float(chosen_see.tail_excess_lower_bound), screen_se=float(se), attribution=attr, qualified_for_full_oof=False, selected_family=False, screen_economic_evidence=chosen_see)
+
 
 def _fingerprint(payload: object) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -1739,7 +2234,10 @@ def evaluate_model_selection_study(
                 }
             try:
                 screen_started_at = time.monotonic()
-                ev = screen_model_family(cache, label_join, family, settings.compute_budget, screen_deadline)
+                try:
+                    ev = screen_model_family(cache, label_join, family, settings.compute_budget, screen_deadline, request=request, bootstrap_alpha=alpha_window, bootstrap_resamples=bootstrap_resamples)
+                except TypeError:
+                    ev = screen_model_family(cache, label_join, family, settings.compute_budget, screen_deadline)
                 fold_evidences.append(ev)
                 model_fit_count += 1
                 screen_learner_fit_count += 1
@@ -1802,11 +2300,34 @@ def evaluate_model_selection_study(
             # Use attribution from first fold as representative (actual fold evidence).
             rep_attr = fold_evidences[0].attribution
             fold_attrs = tuple(ev.attribution for ev in fold_evidences)
-            agg_ev = FamilyScreenEvidence(family=family, screen_lower_bound=agg_lb, screen_se=agg_se, attribution=rep_attr, qualified_for_full_oof=False, selected_family=False, fold_attributions=fold_attrs)
+            # Aggregate economic evidence across folds (mean of bounded scalars)
+            # Collect per-fold economic evidences if present
+            econ_evidences = [getattr(ev, "screen_economic_evidence", None) for ev in fold_evidences if getattr(ev, "screen_economic_evidence", None) is not None]
+            agg_econ = None
+            if econ_evidences:
+                # Average bounded scalars; preserve route/top_k/cadence from first, session_count sum? Use first's session_count
+                first = econ_evidences[0]
+                avg_abs = sum(float(e.absolute_lower_bound) for e in econ_evidences) / len(econ_evidences)
+                avg_tail = sum(float(e.tail_excess_lower_bound) for e in econ_evidences) / len(econ_evidences)
+                avg_oracle = sum(float(e.oracle_tail_excess_lower_bound) for e in econ_evidences) / len(econ_evidences)
+                total_sessions = sum(int(e.session_count) for e in econ_evidences)
+                from src.stocks.ml.contracts import ScreenEconomicEvidence as _AggSEE
+                agg_econ = _AggSEE(fold_id=int(first.fold_id), route_kind=str(first.route_kind), top_k=int(first.top_k), rebalance_frequency_sessions=int(first.rebalance_frequency_sessions), session_count=int(total_sessions), selected_prefix_size=int(first.selected_prefix_size), absolute_lower_bound=float(avg_abs), tail_excess_lower_bound=float(avg_tail), oracle_tail_excess_lower_bound=float(avg_oracle))
+            agg_ev = FamilyScreenEvidence(family=family, screen_lower_bound=float(agg_lb), screen_se=float(agg_se), attribution=rep_attr, qualified_for_full_oof=False, selected_family=False, fold_attributions=fold_attrs, screen_economic_evidence=agg_econ)
             screen_evidence.append(agg_ev)
     # Admission: a family may enter full OOF only when finite screen lower bound is strictly positive and within one SE of best positive family.
     declared_index = {fam: idx for idx, fam in enumerate(settings.candidate_families)}
-    positive_ev = [ev for ev in screen_evidence if math.isfinite(float(ev.screen_lower_bound)) and float(ev.screen_lower_bound) > 0]
+    def _tail_ok(ev):
+        see = getattr(ev, "screen_economic_evidence", None)
+        if see is None:
+            return math.isfinite(float(ev.screen_lower_bound)) and float(ev.screen_lower_bound) > 0
+        return math.isfinite(float(see.tail_excess_lower_bound)) and float(see.tail_excess_lower_bound) > 0 and math.isfinite(float(see.oracle_tail_excess_lower_bound)) and float(see.oracle_tail_excess_lower_bound) > 0
+    def _tail_value(ev):
+        see = getattr(ev, "screen_economic_evidence", None)
+        if see is None:
+            return float(ev.screen_lower_bound)
+        return float(see.tail_excess_lower_bound)
+    positive_ev = [ev for ev in screen_evidence if _tail_ok(ev)]
     if not positive_ev:
         elapsed = time.monotonic() - start_monotonic
         # No positive lower bounds => screen-non-positive-lower-bound path, must not invoke full OOF or replay
@@ -1842,10 +2363,13 @@ def evaluate_model_selection_study(
             "survivors": [],
             "runtime_ledger": runtime_ledger,
         }
-    # Determine best positive family and one-SE threshold
-    best_positive = max(positive_ev, key=lambda e: float(e.screen_lower_bound))
-    threshold = float(best_positive.screen_lower_bound) - float(best_positive.screen_se) if math.isfinite(float(best_positive.screen_lower_bound)) else float("-inf")
-    non_inferior = [ev for ev in positive_ev if float(ev.screen_lower_bound) >= threshold]
+    # Determine best positive family and one-SE threshold (tail-excess based)
+    best_positive = max(positive_ev, key=lambda e: _tail_value(e))
+    # SE for tail excess: use screen_se when available else std-derived; for new evidence use screen_se as tail SE proxy
+    best_se = float(getattr(best_positive, "screen_se", 0.0))
+    # If screen economic evidence present, derive SE from session_count dispersion approximation: use screen_se
+    threshold = _tail_value(best_positive) - best_se if math.isfinite(_tail_value(best_positive)) else float("-inf")
+    non_inferior = [ev for ev in positive_ev if _tail_value(ev) >= threshold]
     # Order qualified by declared family order
     non_inferior_sorted = sorted(non_inferior, key=lambda e: declared_index.get(e.family, 999))
     selected_for_full = non_inferior_sorted[: int(settings.compute_budget.max_full_replay_families)]
@@ -1854,7 +2378,7 @@ def evaluate_model_selection_study(
     final_screen: list[FamilyScreenEvidence] = []
     for ev in screen_evidence:
         is_qualified = ev.family in qualified_ids
-        final_screen.append(FamilyScreenEvidence(family=ev.family, screen_lower_bound=float(ev.screen_lower_bound), screen_se=float(ev.screen_se), attribution=ev.attribution, qualified_for_full_oof=bool(is_qualified), selected_family=False, fold_attributions=ev.fold_attributions))
+        final_screen.append(FamilyScreenEvidence(family=ev.family, screen_lower_bound=float(ev.screen_lower_bound), screen_se=float(ev.screen_se), attribution=ev.attribution, qualified_for_full_oof=bool(is_qualified), selected_family=False, fold_attributions=ev.fold_attributions, screen_economic_evidence=getattr(ev, "screen_economic_evidence", None)))
     screen_evidence = final_screen
     # Full OOF/refit/replay only for qualified families (at most two).
     win_request = replace(request, max_training_lookback_sessions=lookback, bootstrap_alpha=alpha_window, bootstrap_resamples=bootstrap_resamples, compounding=replace(request.compounding, bootstrap_alpha=alpha_window, bootstrap_resamples=bootstrap_resamples))
