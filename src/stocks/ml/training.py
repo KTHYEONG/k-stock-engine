@@ -543,7 +543,7 @@ def train_net_alpha_model(
     )
     audit = validate_ml_snapshot(
         frame,
-        stock_net_alpha_v1_contract_book(),
+        stock_net_alpha_v1_contract_book(available_columns=frame.columns),
         decision_time,
         calendar,
     )
@@ -617,7 +617,7 @@ def train_net_alpha_model(
             telemetry=telemetry,
         )
 
-    roles = dict(stock_net_alpha_v1_roles())
+    roles = dict(stock_net_alpha_v1_roles(available_columns=frame.columns))
     pre_holdout_raw = materialize_model_feature_sources(pre_holdout_raw, list(roles))
     holdout_raw = materialize_model_feature_sources(holdout_raw, list(roles))
     schema = fit_model_feature_schema(pre_holdout_raw, roles)
