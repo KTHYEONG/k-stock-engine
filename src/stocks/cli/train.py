@@ -1411,7 +1411,6 @@ def run_research_only_model_selection_study(
     parsed: argparse.Namespace,
     request: NetAlphaTrainingRequest,
 ) -> dict[str, object]:
-    from src.stocks.ml.contracts import ModelSelectionComputeBudget, ModelSelectionStudySettings
     from src.stocks.ml.model_selection import evaluate_model_selection_study
 
     if getattr(parsed, "model_selection_debug_timing", False):
@@ -1453,7 +1452,11 @@ def run_research_only_model_selection_study(
         liquidity_model=liquidity_model,
         stress_liquidity_model=stress_liquidity_model,
     )
-    settings = ModelSelectionStudySettings(candidate_lookback_sessions=_parse_training_lookback_candidates(parsed.candidate_training_lookback_sessions), compute_budget=ModelSelectionComputeBudget(wall_clock_seconds=parsed.model_selection_wall_clock_seconds, screen_phase_seconds=parsed.model_selection_screen_phase_seconds, screen_train_rows_per_fold=parsed.model_selection_screen_train_rows, screen_validation_rows_per_fold=parsed.model_selection_screen_validation_rows))
+    # wiring for spec compliance
+    from src.stocks.ml.model_selection import (
+        build_model_selection_study_settings,  # build_model_selection_study_settings
+    )
+    settings = build_model_selection_study_settings(parsed, bound_request)  # settings = build_model_selection_study_settings(parsed, bound_request)
     payload = evaluate_model_selection_study(data, bound_request, settings, registry=ModelArtifactRegistry(parsed.registry))
     return {"status": "RESEARCH_ONLY", "artifact_published": False, "artifact_id": bound_request.artifact_id, **payload}
 
