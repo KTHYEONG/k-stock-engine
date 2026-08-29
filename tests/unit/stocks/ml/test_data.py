@@ -30,8 +30,16 @@ def _decision_time() -> datetime:
 
 def _assert_narrow_labels_restored(data, horizon: int) -> None:
     label_frame = data.labels_by_horizon[horizon]
-    assert set(label_frame.columns) == _NARROW_LABEL_COLUMNS
+    assert set(label_frame.columns) >= _NARROW_LABEL_COLUMNS
+    # Long-format retention: gross_return must be finite when present (SCENARIO_ML_DATA_06)
+    if "gross_return" in label_frame.columns:
+        assert label_frame["gross_return"].is_not_null().all()
+        assert label_frame["gross_return"].is_finite().all()
     join = _build_label_join(data, horizon)
+    # _build_label_join must expose gross without altering realized_net_return
+    if "gross_return" in label_frame.columns:
+        assert "gross_return" in join.columns
+        assert join["gross_return"].is_not_null().all()
     assert {
         "instrument_id",
         "session",
@@ -108,6 +116,35 @@ def test_feature_frame_is_target_free() -> None:
             ("net_alpha_", "label_available_time_", "risk_residual_", "reference_cost_")
         )
         assert column not in ("horizon_sessions", "net_alpha_target", "risk_residual", "reference_cost")
+
+
+def test_SCENARIO_ML_DATA_06_GROSS_LABEL_RETENTION() -> None:
+    # SCENARIO_ML_DATA_06_GROSS_LABEL_RETENTION
+    import polars as pl
+    from src.stocks.data.contracts import DatasetSnapshot
+    from src.stocks.ml.data import compose_net_alpha_training_data
+
+    df = stock_net_alpha_composed_df(n_sessions=10, n_tickers=2, candidate_horizon_sessions=(3,))
+    df = df.with_columns(
+        pl.lit(3).alias("horizon_sessions"),
+        pl.lit(0.01).alias("net_alpha_target"),
+        pl.lit(_decision_time()).alias("label_available_time"),
+        pl.lit(0.010).alias("gross_return"),
+        pl.lit(0.006).alias("risk_residual"),
+        pl.lit(0.001).alias("reference_cost"),
+    )
+    snapshot = DatasetSnapshot(
+        manifest=stock_net_alpha_manifest(columns=df.columns), frame=df
+    )
+    data = compose_net_alpha_training_data(snapshot, _decision_time(), (3,))
+    labels = data.labels_by_horizon[3]
+    assert "gross_return" in labels.columns
+    assert labels["gross_return"].is_finite().all()
+    joined = _build_label_join(data, 3)
+    assert "gross_return" in joined.columns
+    assert joined["realized_net_return"].to_list() == pytest.approx(
+        (joined["risk_residual"] - joined["reference_cost"]).to_list()
+    )
 
 
 def test_horizon_universes_are_independent() -> None:
