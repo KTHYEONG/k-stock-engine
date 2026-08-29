@@ -898,6 +898,18 @@ def build_feature_panel(
         request.base_panel_id, AssetKind.STOCK, BASE_PANEL_FEATURE_SET, generated_time
     )
     projected = book.project(base_frame, source_prefix="raw__")
+    required_availability = sorted(
+        {
+            contract.source_available_time_field
+            for contract in book.contracts
+            if contract.source_available_time_field != "available_time"
+        }
+    )
+    for field in required_availability:
+        source_column = f"raw__{field}"
+        if source_column not in base_frame.columns:
+            continue
+        projected = projected.with_columns(base_frame[source_column].alias(field))
     if projected.is_empty():
         raise ValueError("feature projection produced no rows")
     if any(c.startswith(_TARGET_PREFIXES) for c in projected.columns):

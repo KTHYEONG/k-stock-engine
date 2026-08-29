@@ -1411,6 +1411,7 @@ def run_research_only_model_selection_study(
     parsed: argparse.Namespace,
     request: NetAlphaTrainingRequest,
 ) -> dict[str, object]:
+    from src.stocks.data.ml_integrity import validate_ml_snapshot  # validate_ml_snapshot
     from src.stocks.ml.model_selection import evaluate_model_selection_study
 
     if getattr(parsed, "model_selection_debug_timing", False):
@@ -1457,6 +1458,18 @@ def run_research_only_model_selection_study(
         build_model_selection_study_settings,  # build_model_selection_study_settings
     )
     settings = build_model_selection_study_settings(parsed, bound_request)  # settings = build_model_selection_study_settings(parsed, bound_request)
+    # ML-INTEGRITY gate: reject invalid snapshots before model selection
+    try:
+        from src.stocks.ml.features import stock_net_alpha_v1_contract_book
+
+        _contract_book = stock_net_alpha_v1_contract_book()
+        _audit = validate_ml_snapshot(data.feature_frame, _contract_book)  # validate_ml_snapshot invocation
+        if not _audit.passed:
+            raise ValueError(f"ML snapshot integrity failed: {[_c.detail for _c in _audit.checks if not _c.passed]}")
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"ML snapshot integrity audit error: {exc}") from exc
     payload = evaluate_model_selection_study(data, bound_request, settings, registry=ModelArtifactRegistry(parsed.registry))
     return {"status": "RESEARCH_ONLY", "artifact_published": False, "artifact_id": bound_request.artifact_id, **payload}
 
