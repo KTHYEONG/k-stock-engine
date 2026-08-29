@@ -107,6 +107,9 @@ def stock_net_alpha_v1_semantic_contracts() -> tuple[dict[str, object], ...]:
                 "null_policy": "retain_null",
                 "stale_after_sessions": 0,
                 "expected_frequency": "session",
+                "source_available_time_field": (
+                    "disclosure_date" if source in ("bp_ratio", "ep_ratio") else "available_time"
+                ),
             }
         )
     return tuple(contracts)
