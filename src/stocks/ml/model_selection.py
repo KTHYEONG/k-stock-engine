@@ -370,31 +370,64 @@ def screen_model_family(
         group_cols_idx[gname] = idxs
     def _fit_family(Xtr: np.ndarray, ytr: np.ndarray, Xva: np.ndarray):
         if family == ModelFamily.elastic_net_v2:
-            mean = Xtr.mean(axis=0)
-            std = Xtr.std(axis=0)
-            std[std == 0] = 1.0
-            Xs = (Xtr - mean) / std
-            Xvs = (Xva - mean) / std
-            Xvs[~np.isfinite(Xvs)] = 0.0
+            Xs, _Xvs = _impute_and_standardize_from_train(Xtr, Xva)
+            # capture train-only moments for prediction closure (recompute imputation means for reuse)
+            n_feat = Xtr.shape[1]
+            _train_means = np.zeros(n_feat, dtype=np.float64)
+            for _j in range(n_feat):
+                _col = Xtr[:, _j]
+                _finite = np.isfinite(_col)
+                _train_means[_j] = float(np.mean(_col[_finite])) if np.any(_finite) else 0.0
+            _Xtr_imp = Xtr.copy().astype(np.float64, copy=False)
+            for _j in range(n_feat):
+                _m = ~np.isfinite(_Xtr_imp[:, _j])
+                if np.any(_m):
+                    _Xtr_imp[_m, _j] = _train_means[_j]
+            _mean = np.mean(_Xtr_imp, axis=0)
+            _std = np.std(_Xtr_imp, axis=0)
+            _std = np.where(_std == 0, 1.0, _std)
+            _std = np.where(~np.isfinite(_std), 1.0, _std)
+            _mean = np.where(~np.isfinite(_mean), 0.0, _mean)
             model = ElasticNet(alpha=_elastic_penalty(Xs, ytr), l1_ratio=0.5, max_iter=2000, tol=1e-3, random_state=42)
             model.fit(Xs, ytr)
             def pred_fn(Xp: np.ndarray) -> np.ndarray:
-                Xp2 = (Xp - mean) / std
+                Xp_arr = np.asarray(Xp, dtype=np.float64)
+                for _jj in range(Xp_arr.shape[1]):
+                    _mm = ~np.isfinite(Xp_arr[:, _jj])
+                    if np.any(_mm):
+                        Xp_arr[_mm, _jj] = _train_means[_jj]
+                Xp2 = (Xp_arr - _mean) / _std
                 Xp2[~np.isfinite(Xp2)] = 0.0
                 return model.predict(Xp2)
             native = np.abs(np.asarray(model.coef_, dtype=np.float64)) if hasattr(model, "coef_") else np.zeros(Xtr.shape[1])
             return model, pred_fn, native
         if family == ModelFamily.huber_linear_v1:
-            mean = Xtr.mean(axis=0)
-            std = Xtr.std(axis=0)
-            std[std == 0] = 1.0
-            Xs = (Xtr - mean) / std
-            Xvs = (Xva - mean) / std
-            Xvs[~np.isfinite(Xvs)] = 0.0
+            Xs, _Xvs = _impute_and_standardize_from_train(Xtr, Xva)
+            n_feat = Xtr.shape[1]
+            _train_means = np.zeros(n_feat, dtype=np.float64)
+            for _j in range(n_feat):
+                _col = Xtr[:, _j]
+                _finite = np.isfinite(_col)
+                _train_means[_j] = float(np.mean(_col[_finite])) if np.any(_finite) else 0.0
+            _Xtr_imp = Xtr.copy().astype(np.float64, copy=False)
+            for _j in range(n_feat):
+                _m = ~np.isfinite(_Xtr_imp[:, _j])
+                if np.any(_m):
+                    _Xtr_imp[_m, _j] = _train_means[_j]
+            _mean = np.mean(_Xtr_imp, axis=0)
+            _std = np.std(_Xtr_imp, axis=0)
+            _std = np.where(_std == 0, 1.0, _std)
+            _std = np.where(~np.isfinite(_std), 1.0, _std)
+            _mean = np.where(~np.isfinite(_mean), 0.0, _mean)
             model = HuberRegressor(epsilon=1.35, max_iter=500)
             model.fit(Xs, ytr)
             def pred_fn(Xp: np.ndarray) -> np.ndarray:
-                Xp2 = (Xp - mean) / std
+                Xp_arr = np.asarray(Xp, dtype=np.float64)
+                for _jj in range(Xp_arr.shape[1]):
+                    _mm = ~np.isfinite(Xp_arr[:, _jj])
+                    if np.any(_mm):
+                        Xp_arr[_mm, _jj] = _train_means[_jj]
+                Xp2 = (Xp_arr - _mean) / _std
                 Xp2[~np.isfinite(Xp2)] = 0.0
                 return model.predict(Xp2)
             native = np.abs(np.asarray(model.coef_, dtype=np.float64)) if hasattr(model, "coef_") else np.zeros(Xtr.shape[1])
@@ -655,6 +688,43 @@ def _inner_folds_from_train(train: pl.DataFrame, n_inner: int = 2) -> list[Fold]
         min_train_sessions=2,
     )
     return splitter.split(train)
+
+def _impute_and_standardize_from_train(
+    X_train: np.ndarray, X_validation: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    X_tr = np.asarray(X_train, dtype=np.float64)
+    X_va = np.asarray(X_validation, dtype=np.float64)
+    if X_tr.ndim != 2 or X_va.ndim != 2 or X_tr.shape[1] != X_va.shape[1]:
+        raise ValueError("imputation requires 2-D matrices with matching feature count")
+    n_features = X_tr.shape[1]
+    train_means = np.zeros(n_features, dtype=np.float64)
+    for j in range(n_features):
+        col = X_tr[:, j]
+        finite = np.isfinite(col)
+        if np.any(finite):
+            train_means[j] = float(np.mean(col[finite]))
+        else:
+            train_means[j] = 0.0
+    X_tr_imp = X_tr.copy()
+    X_va_imp = X_va.copy()
+    for j in range(n_features):
+        tr_mask = ~np.isfinite(X_tr_imp[:, j])
+        if np.any(tr_mask):
+            X_tr_imp[tr_mask, j] = train_means[j]
+        va_mask = ~np.isfinite(X_va_imp[:, j])
+        if np.any(va_mask):
+            X_va_imp[va_mask, j] = train_means[j]
+    mean = np.mean(X_tr_imp, axis=0)
+    std = np.std(X_tr_imp, axis=0)
+    std = np.where(std == 0, 1.0, std)
+    std = np.where(~np.isfinite(std), 1.0, std)
+    mean = np.where(~np.isfinite(mean), 0.0, mean)
+    Xs = (X_tr_imp - mean) / std
+    Xvs = (X_va_imp - mean) / std
+    Xs[~np.isfinite(Xs)] = 0.0
+    Xvs[~np.isfinite(Xvs)] = 0.0
+    return Xs, Xvs
+
 
 def _validation_economic_loss(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     # use MSE as economic loss proxy
@@ -1018,12 +1088,7 @@ def _fit_one_fold(
     _ = np.zeros(X_valid.shape[0])
     # fit per family
     if family == ModelFamily.elastic_net_v2:
-        mean = X_train.mean(axis=0)
-        std = X_train.std(axis=0)
-        std[std == 0] = 1.0
-        Xs = (X_train - mean) / std
-        Xvs = (X_valid - mean) / std
-        Xvs[~np.isfinite(Xvs)] = 0.0
+        Xs, Xvs = _impute_and_standardize_from_train(X_train, X_valid)
         # handle non-finite y
         mask = np.isfinite(y_train)
         if not mask.any():
@@ -1038,12 +1103,7 @@ def _fit_one_fold(
         model.fit(Xs[mask], y_train[mask])
         preds = model.predict(Xvs)
     elif family == ModelFamily.huber_linear_v1:
-        mean = X_train.mean(axis=0)
-        std = X_train.std(axis=0)
-        std[std == 0] = 1.0
-        Xs = (X_train - mean) / std
-        Xvs = (X_valid - mean) / std
-        Xvs[~np.isfinite(Xvs)] = 0.0
+        Xs, Xvs = _impute_and_standardize_from_train(X_train, X_valid)
         model = HuberRegressor(epsilon=1.35, max_iter=1000)
         mask = np.isfinite(y_train)
         model.fit(Xs[mask], y_train[mask])
@@ -1088,11 +1148,19 @@ def _fit_one_fold(
     return preds
 
 def fit_model_family_oof(
-    pre_holdout: pl.DataFrame, folds: Sequence[Fold], data: NetAlphaResearchData, request: NetAlphaTrainingRequest, candidate: ModelSelectionCandidate
+    pre_holdout: pl.DataFrame,
+    folds: Sequence[Fold],
+    data: NetAlphaResearchData,
+    request: NetAlphaTrainingRequest,
+    candidate: ModelSelectionCandidate,
+    fold_attributions: tuple[FeatureAttributionEvidence, ...] = (),
+    deadline_monotonic: float | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     started_at = time.monotonic()
     if not folds:
         raise ValueError("folds must be non-empty")
+    if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+        return pl.DataFrame(), pl.DataFrame()
     # fail-closed readiness checks
     ok, _reason = _check_pit_label_cost_readiness(data, request)
     if not ok:
@@ -1106,10 +1174,29 @@ def fit_model_family_oof(
     # also reject xgboost alias via candidate.family string checked in contracts
     label_join = _build_label_join(data, horizon)
     roles = dict(stock_net_alpha_v1_roles())
+    # Validate fold-local attributions when supplied
+    attr_by_fold: dict[int, FeatureAttributionEvidence] = {}
+    if fold_attributions:
+        if len(fold_attributions) != len(folds):
+            return pl.DataFrame(), pl.DataFrame()
+        seen_ids: set[int] = set()
+        for attr in fold_attributions:
+            fid = int(attr.fold_id)
+            if fid in seen_ids:
+                return pl.DataFrame(), pl.DataFrame()
+            seen_ids.add(fid)
+            if attr.family != candidate.family:
+                return pl.DataFrame(), pl.DataFrame()
+            attr_by_fold[fid] = attr
+        requested_ids = {int(f.segment_id) for f in folds}
+        if set(attr_by_fold.keys()) != requested_ids:
+            return pl.DataFrame(), pl.DataFrame()
     oof_frames: list[pl.DataFrame] = []
     label_frames: list[pl.DataFrame] = []
-    attributions: list[FeatureAttributionEvidence] = []
+    seen_segment_ids: list[int] = []
     for fold in folds:
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            return pl.DataFrame(), pl.DataFrame()
         fold_started_at = time.monotonic()
         try:
             train = pre_holdout[fold.train_mask]
@@ -1118,50 +1205,70 @@ def fit_model_family_oof(
             train = pre_holdout.filter(pl.col(_SESSION_IDX) < fold.validation_decision_start)
             validation = pre_holdout.filter(pl.col(_SESSION_IDX) >= fold.validation_decision_start)
         if train.is_empty() or validation.is_empty():
-            continue
-        # join labels to train for schema fitting? schema fit should be label-free (only feature frame)
+            return pl.DataFrame(), pl.DataFrame()
         # Fit schema from outer-fold training partition only
         try:
-            # ensure train has needed columns; materialize sources
             from src.stocks.ml.features import materialize_model_feature_sources
             mat_train = materialize_model_feature_sources(train, list(roles))
             schema = fit_research_feature_schema(mat_train, roles)
         except Exception as exc:
             logger.info("[DATA] stage=feature_schema status=failed reason=%s", exc)
-            continue
-        # need to ensure train join has labels for target
-        train_labeled = train.join(label_join, on=[_ID_COLUMN, SESSION_COLUMN], how="inner")
-        if train_labeled.is_empty():
-            continue
-        # Attribution and feature selection consume labels only from the
-        # outer-fold training partition; validation remains target-free.
-        inner_evidence = select_feature_groups(
-            train_labeled, _inner_folds_from_train(train_labeled), candidate.family, schema
-        )
-        attributions.append(replace(inner_evidence, fold_id=int(fold.segment_id)))
-        selected = inner_evidence.selected_source_groups
+            return pl.DataFrame(), pl.DataFrame()
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            return pl.DataFrame(), pl.DataFrame()
+        # fingerprint and source-group validation when attributions supplied
+        if attr_by_fold:
+            attr = attr_by_fold.get(int(fold.segment_id))
+            if attr is None:
+                return pl.DataFrame(), pl.DataFrame()
+            if attr.schema_fingerprint != schema.fingerprint:
+                return pl.DataFrame(), pl.DataFrame()
+            schema_groups = {n for n, _ in schema.source_groups}
+            for g in attr.selected_source_groups:
+                if g not in schema_groups:
+                    return pl.DataFrame(), pl.DataFrame()
+            selected = tuple(attr.selected_source_groups)
+            # also need train_labeled for _fit_one_fold target
+            train_labeled = train.join(label_join, on=[_ID_COLUMN, SESSION_COLUMN], how="inner")
+            if train_labeled.is_empty():
+                return pl.DataFrame(), pl.DataFrame()
+        else:
+            # Legacy path: attribution and feature selection consume labels only from the outer-fold training partition
+            train_labeled = train.join(label_join, on=[_ID_COLUMN, SESSION_COLUMN], how="inner")
+            if train_labeled.is_empty():
+                return pl.DataFrame(), pl.DataFrame()
+            try:
+                inner_evidence = select_feature_groups(
+                    train_labeled, _inner_folds_from_train(train_labeled), candidate.family, schema
+                )
+            except Exception as exc:
+                logger.info("[DATA] stage=feature_selection status=failed reason=%s", exc)
+                return pl.DataFrame(), pl.DataFrame()
+            selected = inner_evidence.selected_source_groups
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            return pl.DataFrame(), pl.DataFrame()
         # Fit one fold learner with selected groups and predict validation
         try:
             preds = _fit_one_fold(train_labeled, validation, candidate.family, schema, selected)
         except Exception as exc:
             logger.info("[ALGO] stage=fit_model_family_oof family=%s status=failed reason=%s", candidate.family, exc)
-            continue
+            return pl.DataFrame(), pl.DataFrame()
         if preds.size != validation.height:
-            continue
+            return pl.DataFrame(), pl.DataFrame()
         if not np.all(np.isfinite(preds)):
-            continue
+            return pl.DataFrame(), pl.DataFrame()
         # uniqueness and constant check will be done after concatenation
         scored = validation.select(_ID_COLUMN, SESSION_COLUMN, _SESSION_IDX).with_columns(
             pl.Series(SCORE_COLUMN, preds),
             pl.lit(int(fold.segment_id), dtype=pl.Int64).alias(_OOF_SEGMENT),
         )
-        # validate score uniqueness per fold? will be global
         # Build labeled for this fold
         labeled = scored.join(label_join.select(_ID_COLUMN, SESSION_COLUMN, TARGET_COLUMN, AVAILABLE_COLUMN, RISK_RESIDUAL_COLUMN, REFERENCE_COST_COLUMN, REALIZED_RETURN_COLUMN), on=[_ID_COLUMN, SESSION_COLUMN], how="inner")
         if labeled.is_empty():
-            continue
+            return pl.DataFrame(), pl.DataFrame()
         oof_frames.append(scored)
         label_frames.append(labeled)
+        seen_segment_ids.append(int(fold.segment_id))
         _debug_timing(
             "full_oof_fold_complete",
             fold_started_at,
@@ -1169,7 +1276,13 @@ def fit_model_family_oof(
             fold_id=int(fold.segment_id),
             oof_rows=int(scored.height),
         )
-    if not oof_frames:
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            return pl.DataFrame(), pl.DataFrame()
+    if len(oof_frames) != len(folds):
+        return pl.DataFrame(), pl.DataFrame()
+    if len(set(seen_segment_ids)) != len(seen_segment_ids):
+        return pl.DataFrame(), pl.DataFrame()
+    if set(seen_segment_ids) != {int(f.segment_id) for f in folds}:
         return pl.DataFrame(), pl.DataFrame()
     oof = pl.concat(oof_frames).sort([SESSION_COLUMN, _ID_COLUMN])
     labels = pl.concat(label_frames).sort([SESSION_COLUMN, _ID_COLUMN]) if label_frames else pl.DataFrame()
@@ -1688,48 +1801,93 @@ def evaluate_model_selection_study(
             agg_se = float(sum(ses) / len(ses)) if ses else 0.0
             # Use attribution from first fold as representative (actual fold evidence).
             rep_attr = fold_evidences[0].attribution
-            agg_ev = FamilyScreenEvidence(family=family, screen_lower_bound=agg_lb, screen_se=agg_se, attribution=rep_attr, qualified_for_full_oof=False, selected_family=False)
+            fold_attrs = tuple(ev.attribution for ev in fold_evidences)
+            agg_ev = FamilyScreenEvidence(family=family, screen_lower_bound=agg_lb, screen_se=agg_se, attribution=rep_attr, qualified_for_full_oof=False, selected_family=False, fold_attributions=fold_attrs)
             screen_evidence.append(agg_ev)
-    # Deterministic top max_full_replay_families by lower bound with one-SE ties.
-    ordered = sorted(screen_evidence, key=lambda e: (float(e.screen_lower_bound), -list(settings.candidate_families).index(e.family)), reverse=True)
-    # Stable tie resolution: declared family order breaks equal lower bounds.
-    # Re-sort with declared order as secondary.
+    # Admission: a family may enter full OOF only when finite screen lower bound is strictly positive and within one SE of best positive family.
     declared_index = {fam: idx for idx, fam in enumerate(settings.candidate_families)}
-    ordered = sorted(screen_evidence, key=lambda e: (-float(e.screen_lower_bound) if math.isfinite(float(e.screen_lower_bound)) else float("inf"), declared_index.get(e.family, 999)))
-    if ordered:
-        best = ordered[0]
-        threshold = float(best.screen_lower_bound) - float(best.screen_se) if math.isfinite(float(best.screen_lower_bound)) else float("-inf")
-        non_inferior = [ev for ev in ordered if float(ev.screen_lower_bound) > _SCREEN_REJECTED_LOWER_BOUND and float(ev.screen_lower_bound) >= threshold]
-        # Limit to max_full_replay_families in declared order.
-        selected_for_full = non_inferior[: int(settings.compute_budget.max_full_replay_families)]
-        # Also ensure we never exceed max_full_replay_families even if more ties.
-        if len(selected_for_full) > int(settings.compute_budget.max_full_replay_families):
-            selected_for_full = selected_for_full[: int(settings.compute_budget.max_full_replay_families)]
-        qualified_ids = {ev.family for ev in selected_for_full}
-        # Mark qualified.
-        final_screen: list[FamilyScreenEvidence] = []
-        for ev in screen_evidence:
-            is_qualified = ev.family in qualified_ids
-            final_screen.append(FamilyScreenEvidence(family=ev.family, screen_lower_bound=float(ev.screen_lower_bound), screen_se=float(ev.screen_se), attribution=ev.attribution, qualified_for_full_oof=bool(is_qualified), selected_family=False))
-        screen_evidence = final_screen
-    else:
-        qualified_ids = set()
+    positive_ev = [ev for ev in screen_evidence if math.isfinite(float(ev.screen_lower_bound)) and float(ev.screen_lower_bound) > 0]
+    if not positive_ev:
+        elapsed = time.monotonic() - start_monotonic
+        # No positive lower bounds => screen-non-positive-lower-bound path, must not invoke full OOF or replay
+        candidates_evaluated = [  # noqa: PERF401
+            {"candidate_id": f"{ev.family.value}_h{horizon}_lb{lookback}", "family": str(ev.family), "horizon": horizon, "status": "screen-non-positive-lower-bound", "screen_lower_bound": float(ev.screen_lower_bound), "screen_se": float(ev.screen_se), "qualified_for_full_oof": False, "selected_family": False, "attribution": {"selected_source_groups": list(ev.attribution.selected_source_groups), "source_group_scores": list(ev.attribution.source_group_scores), "schema_fingerprint": ev.attribution.schema_fingerprint}}
+            for ev in screen_evidence
+        ]
+        runtime_ledger = {
+            "stage": "screen",
+            "elapsed_seconds": float(elapsed),
+            "screen_elapsed_seconds": float(elapsed),
+            "effective_fold_count": int(fold_count),
+            "screen_fold_count": int(fold_count),
+            "screen_learner_fit_count": int(screen_learner_fit_count),
+            "attribution_prediction_count": int(attribution_prediction_count),
+            "oof_fit_count": 0,
+            "replay_count": 0,
+            "row_count": row_count_global,
+            "cache_hits": int(cache_hits),
+            "model_fit_count": int(model_fit_count),
+            "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+            "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+        }
+        return {
+            **header,
+            "study_complete": True,
+            "next_action": "no-qualified-survivor",
+            "selected_family": None,
+            "recommended_lookback_sessions": None,
+            "recommended_is_expanding": False,
+            "rejection_reason_counts": {"screen-non-positive-lower-bound": len(screen_evidence)},
+            "candidates": candidates_evaluated,
+            "survivors": [],
+            "runtime_ledger": runtime_ledger,
+        }
+    # Determine best positive family and one-SE threshold
+    best_positive = max(positive_ev, key=lambda e: float(e.screen_lower_bound))
+    threshold = float(best_positive.screen_lower_bound) - float(best_positive.screen_se) if math.isfinite(float(best_positive.screen_lower_bound)) else float("-inf")
+    non_inferior = [ev for ev in positive_ev if float(ev.screen_lower_bound) >= threshold]
+    # Order qualified by declared family order
+    non_inferior_sorted = sorted(non_inferior, key=lambda e: declared_index.get(e.family, 999))
+    selected_for_full = non_inferior_sorted[: int(settings.compute_budget.max_full_replay_families)]
+    qualified_ids = {ev.family for ev in selected_for_full}
+    # Mark qualified while preserving fold_attributions
+    final_screen: list[FamilyScreenEvidence] = []
+    for ev in screen_evidence:
+        is_qualified = ev.family in qualified_ids
+        final_screen.append(FamilyScreenEvidence(family=ev.family, screen_lower_bound=float(ev.screen_lower_bound), screen_se=float(ev.screen_se), attribution=ev.attribution, qualified_for_full_oof=bool(is_qualified), selected_family=False, fold_attributions=ev.fold_attributions))
+    screen_evidence = final_screen
     # Full OOF/refit/replay only for qualified families (at most two).
     win_request = replace(request, max_training_lookback_sessions=lookback, bootstrap_alpha=alpha_window, bootstrap_resamples=bootstrap_resamples, compounding=replace(request.compounding, bootstrap_alpha=alpha_window, bootstrap_resamples=bootstrap_resamples))
     survivors: list[ModelSelectionCandidate] = []
     candidates_evaluated: list[dict[str, object]] = []
     rejection_counts: dict[str, int] = {}
     prior_evidence: dict[str, object] = {}
+    screen_elapsed = time.monotonic() - start_monotonic
     for ev in screen_evidence:
         family = ev.family
         is_qualified = bool(ev.qualified_for_full_oof)
         cand_id = f"{family.value}_h{horizon}_lb{lookback}"
-        # Record screening diagnostic for all families.
-        candidates_evaluated.append({"candidate_id": cand_id, "family": str(family), "horizon": horizon, "status": "screened", "screen_lower_bound": float(ev.screen_lower_bound), "screen_se": float(ev.screen_se), "qualified_for_full_oof": bool(is_qualified), "selected_family": False, "attribution": {"selected_source_groups": list(ev.attribution.selected_source_groups), "source_group_scores": list(ev.attribution.source_group_scores), "schema_fingerprint": ev.attribution.schema_fingerprint}})
         if not is_qualified:
+            if not math.isfinite(float(ev.screen_lower_bound)) or float(ev.screen_lower_bound) <= 0:
+                term_status = "screen-non-positive-lower-bound"
+            elif ev not in [x for x in positive_ev if float(x.screen_lower_bound) >= threshold]:
+                term_status = "screen-outside-one-se"
+            else:
+                term_status = "screen-not-qualified"
+        else:
+            term_status = "screen-qualified"
+        candidates_evaluated.append({"candidate_id": cand_id, "family": str(family), "horizon": horizon, "status": term_status, "terminal_status": term_status, "last_completed_status": term_status, "screen_lower_bound": float(ev.screen_lower_bound), "screen_se": float(ev.screen_se), "qualified_for_full_oof": bool(is_qualified), "selected_family": False, "attribution": {"selected_source_groups": list(ev.attribution.selected_source_groups), "source_group_scores": list(ev.attribution.source_group_scores), "schema_fingerprint": ev.attribution.schema_fingerprint}})
+        if not is_qualified:
+            if term_status == "screen-non-positive-lower-bound":
+                rejection_counts[term_status] = rejection_counts.get(term_status, 0) + 1
             continue
         if time.monotonic() >= deadline:
             elapsed = time.monotonic() - start_monotonic
+            # retain terminal status of current qualified candidate as budget-exhausted retains it
+            # update last candidate status to retain
+            candidates_evaluated[-1]["status"] = "budget-exhausted"
+            candidates_evaluated[-1]["terminal_status"] = "budget-exhausted"
+            candidates_evaluated[-1]["last_completed_status"] = term_status
             return {
                 **header,
                 "study_complete": False,
@@ -1740,6 +1898,8 @@ def evaluate_model_selection_study(
                 "runtime_ledger": {
                     "stage": "full_oof",
                     "elapsed_seconds": float(elapsed),
+                    "screen_elapsed_seconds": float(screen_elapsed),
+                    "oof_elapsed_seconds": float(elapsed - screen_elapsed) if elapsed >= screen_elapsed else 0.0,
                     "effective_fold_count": int(fold_count),
                     "screen_fold_count": int(fold_count),
                     "screen_learner_fit_count": int(screen_learner_fit_count),
@@ -1753,22 +1913,64 @@ def evaluate_model_selection_study(
                     "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
                 },
             }
-        # Full OOF using all eligible fold rows (not screen samples).
+        # Full OOF using all eligible fold rows (not screen samples) - reuse fold-local screen attribution
         cand_seed_attr = ev.attribution
-        cand = ModelSelectionCandidate(candidate_id=cand_id, family=family, horizon_sessions=horizon, selected_source_groups=tuple(cand_seed_attr.selected_source_groups), oof_fingerprint=_fingerprint({"id": cand_id, "fp": cand_seed_attr.schema_fingerprint}), attribution=(cand_seed_attr,))
+        # Build candidate with per-fold attributions for OOF reuse
+        oof_attributions = ev.fold_attributions if ev.fold_attributions else (cand_seed_attr,)
+        cand = ModelSelectionCandidate(candidate_id=cand_id, family=family, horizon_sessions=horizon, selected_source_groups=tuple(cand_seed_attr.selected_source_groups), oof_fingerprint=_fingerprint({"id": cand_id, "fp": cand_seed_attr.schema_fingerprint}), attribution=tuple(oof_attributions) if oof_attributions else (cand_seed_attr,))
         oof_started_at = time.monotonic()
-        oof, labels = fit_model_family_oof(pre_holdout, folds, data, win_request, cand)
+        oof, labels = fit_model_family_oof(pre_holdout, folds, data, win_request, cand, fold_attributions=tuple(oof_attributions), deadline_monotonic=deadline)
         model_fit_count += 1
         oof_fit_count += 1
+        oof_elapsed = time.monotonic() - oof_started_at
         _debug_timing(
             "study_full_oof_complete",
             oof_started_at,
             family=family.value,
             model_fit_count=model_fit_count,
         )
+        if time.monotonic() >= deadline:
+            elapsed = time.monotonic() - start_monotonic
+            candidates_evaluated[-1]["status"] = "budget-exhausted"
+            candidates_evaluated[-1]["oof_status"] = "oof-incomplete-folds" if (oof.is_empty() or labels.is_empty()) else "oof-complete"
+            candidates_evaluated[-1]["terminal_status"] = "budget-exhausted"
+            candidates_evaluated[-1]["last_completed_status"] = candidates_evaluated[-1]["oof_status"]
+            return {
+                **header,
+                "study_complete": False,
+                "next_action": "budget-exhausted",
+                "selected_family": None,
+                "rejection_reason_counts": {"budget-exhausted": 1},
+                "candidates": candidates_evaluated,
+                "runtime_ledger": {
+                    "stage": "full_oof",
+                    "elapsed_seconds": float(elapsed),
+                    "screen_elapsed_seconds": float(screen_elapsed),
+                    "oof_elapsed_seconds": float(oof_elapsed),
+                    "effective_fold_count": int(fold_count),
+                    "screen_fold_count": int(fold_count),
+                    "screen_learner_fit_count": int(screen_learner_fit_count),
+                    "attribution_prediction_count": int(attribution_prediction_count),
+                    "oof_fit_count": int(oof_fit_count),
+                    "replay_count": int(replay_count),
+                    "row_count": row_count_global,
+                    "cache_hits": int(cache_hits),
+                    "model_fit_count": int(model_fit_count),
+                    "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+                    "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+                },
+            }
         if oof.is_empty() or labels.is_empty():
-            rejection_counts["oof-rejected"] = rejection_counts.get("oof-rejected", 0) + 1
+            rejection_counts["oof-incomplete-folds"] = rejection_counts.get("oof-incomplete-folds", 0) + 1
+            candidates_evaluated[-1]["status"] = "oof-incomplete-folds"
+            candidates_evaluated[-1]["terminal_status"] = "oof-incomplete-folds"
+            candidates_evaluated[-1]["last_completed_status"] = "oof-incomplete-folds"
             continue
+        else:
+            candidates_evaluated[-1]["oof_status"] = "oof-complete"
+            candidates_evaluated[-1]["status"] = "oof-complete"
+            candidates_evaluated[-1]["terminal_status"] = "oof-complete"
+            candidates_evaluated[-1]["last_completed_status"] = "oof-complete"
         # Update candidate attribution to actual OOF evidence (avoid dummy).
         # Use the attribution from fit (first) if available; else keep screen.
         # fit_model_family_oof's internal attribution is not exposed, so we keep screen attribution which is actual.
@@ -1778,6 +1980,9 @@ def evaluate_model_selection_study(
 
             if not feasible_cells:
                 rejection_counts["no-feasible-cells"] = rejection_counts.get("no-feasible-cells", 0) + 1
+                candidates_evaluated[-1]["status"] = "no-feasible-cells"
+                candidates_evaluated[-1]["terminal_status"] = "no-feasible-cells"
+                candidates_evaluated[-1]["last_completed_status"] = "no-feasible-cells"
                 continue
             _, c, k = feasible_cells[0]
             profile = request.policy_profiles[0]
@@ -1807,17 +2012,30 @@ def evaluate_model_selection_study(
             pair = batch.get(key)
             if pair is None:
                 rejection_counts["replay-missing"] = rejection_counts.get("replay-missing", 0) + 1
+                candidates_evaluated[-1]["status"] = "replay-missing"
+                candidates_evaluated[-1]["terminal_status"] = "replay-missing"
+                candidates_evaluated[-1]["last_completed_status"] = "replay-missing"
                 continue
             base_ev = pair.candidate
+            candidates_evaluated[-1]["replay_status"] = "replay-complete"
+            candidates_evaluated[-1]["filled_orders"] = int(base_ev.filled_orders)
             if not base_ev.base_log_growth or base_ev.filled_orders == 0:
                 rejection_counts["no-fills"] = rejection_counts.get("no-fills", 0) + 1
+                candidates_evaluated[-1]["status"] = "replay-no-fills"
+                candidates_evaluated[-1]["terminal_status"] = "replay-no-fills"
+                candidates_evaluated[-1]["last_completed_status"] = "replay-no-fills"
                 continue
             # Coverage/MDD/account gates via existing logic: check filled_orders, coverage, MDD, bootstrap gates.
             # For brevity, use block-bootstrap lower bounds for base and stress.
             base_lb = _block_bootstrap_lower_bound(np.asarray(base_ev.base_log_growth), alpha_window, bootstrap_resamples)
             stress_lb = _block_bootstrap_lower_bound(np.asarray(base_ev.stress_log_growth), alpha_window, bootstrap_resamples)
+            candidates_evaluated[-1]["base_lower_bound"] = float(base_lb)
+            candidates_evaluated[-1]["stress_lower_bound"] = float(stress_lb)
             if not math.isfinite(base_lb) or not math.isfinite(stress_lb) or base_lb <= 0 or stress_lb <= 0:
                 rejection_counts["non-positive-lower-bound"] = rejection_counts.get("non-positive-lower-bound", 0) + 1
+                candidates_evaluated[-1]["status"] = "gate-non-positive-lower-bound"
+                candidates_evaluated[-1]["terminal_status"] = "gate-non-positive-lower-bound"
+                candidates_evaluated[-1]["last_completed_status"] = "gate-non-positive-lower-bound"
                 continue
             # Additional gates: coverage, MDD, account - use existing helpers if available; simplified check on base_ev.
             # If any gate fails, continue without survivor.
@@ -1825,8 +2043,16 @@ def evaluate_model_selection_study(
             cand_surv = ModelSelectionCandidate(candidate_id=cand_id, family=family, horizon_sessions=horizon, selected_source_groups=tuple(cand_seed_attr.selected_source_groups), oof_fingerprint=_fingerprint({"oof": str(oof.height), "fp": cand_seed_attr.schema_fingerprint}), attribution=(cand_seed_attr,))
             survivors.append(cand_surv)
             prior_evidence[cand_id] = {"block_growth": tuple(base_ev.base_log_growth), "oof_keys": set(zip(oof[_ID_COLUMN].to_list(), oof[SESSION_COLUMN].to_list(), strict=True)) if _ID_COLUMN in oof.columns and SESSION_COLUMN in oof.columns else set()}
+            candidates_evaluated[-1]["status"] = "admitted"
+            candidates_evaluated[-1]["terminal_status"] = "admitted"
+            candidates_evaluated[-1]["last_completed_status"] = "admitted"
         except TimeoutError:
             elapsed = time.monotonic() - start_monotonic
+            # retain current candidate terminal status
+            if candidates_evaluated:
+                candidates_evaluated[-1]["last_completed_status"] = candidates_evaluated[-1].get("terminal_status", "budget-exhausted")
+                candidates_evaluated[-1]["status"] = "budget-exhausted"
+                candidates_evaluated[-1]["terminal_status"] = "budget-exhausted"
             return {
                 **header,
                 "study_complete": False,
@@ -1837,6 +2063,9 @@ def evaluate_model_selection_study(
                 "runtime_ledger": {
                     "stage": "replay",
                     "elapsed_seconds": float(elapsed),
+                    "screen_elapsed_seconds": float(screen_elapsed),
+                    "oof_elapsed_seconds": float(oof_elapsed) if 'oof_elapsed' in locals() else 0.0,
+                    "replay_elapsed_seconds": float(time.monotonic() - replay_started_at) if 'replay_started_at' in locals() else 0.0,
                     "effective_fold_count": int(fold_count),
                     "screen_fold_count": int(fold_count),
                     "screen_learner_fit_count": int(screen_learner_fit_count),
@@ -1859,9 +2088,16 @@ def evaluate_model_selection_study(
                 exc_info=True,
             )
             rejection_counts[f"replay-failed:{type(exc).__name__}"] = rejection_counts.get(f"replay-failed:{type(exc).__name__}", 0) + 1
+            if candidates_evaluated:
+                candidates_evaluated[-1]["status"] = f"replay-failed:{type(exc).__name__}"
+                candidates_evaluated[-1]["terminal_status"] = f"replay-failed:{type(exc).__name__}"
             continue
         if time.monotonic() >= deadline:
             elapsed = time.monotonic() - start_monotonic
+            if candidates_evaluated:
+                candidates_evaluated[-1]["last_completed_status"] = candidates_evaluated[-1].get("terminal_status", candidates_evaluated[-1].get("status", "budget-exhausted"))
+                candidates_evaluated[-1]["status"] = "budget-exhausted"
+                candidates_evaluated[-1]["terminal_status"] = "budget-exhausted"
             return {
                 **header,
                 "study_complete": False,
@@ -1872,6 +2108,9 @@ def evaluate_model_selection_study(
                 "runtime_ledger": {
                     "stage": "deadline_after_replay",
                     "elapsed_seconds": float(elapsed),
+                    "screen_elapsed_seconds": float(screen_elapsed),
+                    "oof_elapsed_seconds": float(oof_elapsed) if 'oof_elapsed' in locals() else 0.0,
+                    "replay_elapsed_seconds": float(time.monotonic() - replay_started_at) if 'replay_started_at' in locals() else 0.0,
                     "effective_fold_count": int(fold_count),
                     "screen_fold_count": int(fold_count),
                     "screen_learner_fit_count": int(screen_learner_fit_count),
@@ -1895,11 +2134,16 @@ def evaluate_model_selection_study(
     elapsed = time.monotonic() - start_monotonic
     # If deadline exceeded before qualification, budget-exhausted without promotion (already handled).
     # Otherwise return complete or no-qualified-survivor.
-    is_complete = selected_family is not None
+    # Study is complete when it finishes without hitting the wall deadline, even with no qualified survivor.
+    next_action_val = "rerun-qualified-family" if selected_family is not None else "no-qualified-survivor"
+    study_complete_val = True
     # For integration benchmark: either complete with ledger or budget-exhausted before 600s.
     runtime_ledger = {
         "stage": "complete",
         "elapsed_seconds": float(elapsed),
+        "screen_elapsed_seconds": float(screen_elapsed),
+        "oof_elapsed_seconds": float(elapsed - screen_elapsed) if elapsed >= screen_elapsed else 0.0,
+        "replay_elapsed_seconds": 0.0,
         "effective_fold_count": int(fold_count),
         "screen_fold_count": int(fold_count),
         "screen_learner_fit_count": int(screen_learner_fit_count),
@@ -1919,8 +2163,8 @@ def evaluate_model_selection_study(
             rec["selected_family"] = True
     return {
         **header,
-        "study_complete": bool(is_complete),
-        "next_action": "rerun-qualified-family" if is_complete else ("no-qualified-survivor" if not survivors else "budget-exhausted"),
+        "study_complete": bool(study_complete_val),
+        "next_action": next_action_val,
         "selected_family": selected_family,
         "recommended_lookback_sessions": recommended_lookback,
         "recommended_is_expanding": recommended_lookback is None,
