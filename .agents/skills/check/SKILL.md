@@ -26,9 +26,9 @@ Independent audit gate completing the main development loop (`spec` -> `implemen
 
 3. **Tier 2: Silent Semantic Defect Scan (Targeted Code Review)**:
    - If Tier 1 passes, perform a silent, token-efficient scan of the modified changes (`git diff`) focused ONLY on critical defects:
-     1) **Test Realism**: Ensure tests are non-vacuous (no trivial `assert True`, no tautological checks, and mocks do not mask core logic).
+     1) **Test Realism & Exception Specificity**: Ensure tests are non-vacuous (no trivial `assert True`, mocks do not mask core logic, and `pytest.raises` specifies `match=` or precise exception types).
      2) **Contract & Invariant Integrity**: Verify core business invariants, division by zero / None handling, and boundary edge cases specified in requirements.
-     3) **No Ghost/Incomplete Paths**: Verify there are no unhandled branches, forgotten TODOs, or orphaned dead code.
+     3) **Production Wire-up & No Ghost Paths**: Verify new logic is actually invoked in the production pipeline/entry-point (replacing legacy callers) and no unhandled branches or orphaned dead code remain.
    - *Rule*: Do NOT nitpick purely subjective styling or propose cosmetic refactoring. Flag ONLY concrete bugs, spec omissions, or broken invariants.
 
 4. **Strict Audit Gate (No Code Mutation)**:

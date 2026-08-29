@@ -12,12 +12,12 @@ Fast-execution protocol for mechanical code implementation based strictly on fro
 1. **Zero Guesswork & Complete Implementation**:
    - Treat `contract.json` as absolute truth. Do not invent new parameters, change signatures, or create speculative abstraction layers.
    - **Anti-Stub Rule**: Never leave `pass`, `...`, `NotImplementedError`, `TODO`, or placeholder return values. Implement the full domain logic specified in `requirements`.
-   - **1:1 Test Mapping**: Every entry in `contract.json` -> `scenarios` MUST be explicitly implemented as a concrete test function in `target_test_file` (with the function name matching `scenario_id`).
+   - **1:1 Test Mapping**: Every entry in `contract.json` -> `scenarios` MUST be explicitly implemented as a concrete test function across all specified `target_test_file`s (matching `scenario_id`). When using `pytest.raises`, always specify `match=` or concrete exceptions (Ruff PT011).
    - **Zero-Search Context Loading**: Read only `target_file`, `target_test_file`, and files listed in `context_files` (if present) via targeted `view_file`. Do NOT run exploratory `rg` / `find` / `list_dir` commands across the repository.
 
 2. **Phased Mechanical Workflow**:
-   - **Phase A (TDD Scenarios - Test First)**: Translate ALL `scenarios` from `contract.json` into concrete `pytest` test functions in `target_test_file` (using `scenario_id` as the test function name) before writing source logic.
-     - *Quick TDD Check*: `uv run pytest <target_test_file> -k "<scenario_id>" -q --tb=short`
+   - **Phase A (TDD Scenarios - Test First)**: Translate ALL `scenarios` from `contract.json` into concrete `pytest` test functions in their respective `target_test_file`s (using `scenario_id` as the test function name) before writing source logic.
+     - *Quick TDD & Lint Check*: `uv run pytest <target_test_file> -k "<scenario_id>" -q --tb=short && uv run ruff check <target_test_file>`
    - **Phase B (Core Logic)**: Implement complete source logic in `target_file`.
      - *Quick Syntax/Lint Check*: `uv run ruff check <target_file>`
    - **Phase C (Integration Wiring)**: Wire logic into `caller_file` at `anchor` location using `import_symbol` and `invocation_expression`.
