@@ -903,7 +903,7 @@ def _construct_allocations_prepared(
     preds = scores[positions]
     id_strs = np.asarray([str(cs_ids[position]) for position in positions], dtype=object)
     if policy.economic_ranking_mode == "economic_net_v1" and econ is None:
-        raise ValueError("economic_net_v1 requires calibrated economic inputs")
+        return ()
     if policy.economic_ranking_mode == "economic_net_v1":
         assert econ is not None
         rank_values = _economic_rank_values(

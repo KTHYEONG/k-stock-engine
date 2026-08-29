@@ -1785,7 +1785,14 @@ def evaluate_model_selection_study(
             if "predicted_net_alpha" in oof.columns and "expected_net_alpha" not in oof.columns:
                 try:
                     calibrated = _causal_oof_calibrate(oof, labels, win_request, horizon)
-                except Exception:
+                except Exception as exc:
+                    logger.debug(
+                        "[ALGO] stage=study_oof_calibration status=fallback family=%s error_type=%s error_message=%r",
+                        family.value,
+                        type(exc).__name__,
+                        str(exc),
+                        exc_info=True,
+                    )
                     calibrated = oof
             replay_started_at = time.monotonic()
             batch = _replay_costs_batch(registry, calibrated, labels, win_request, horizon, RiskSettingsLocal(), pre_holdout, data.manifest, [(c, k, profile)])
@@ -1844,6 +1851,13 @@ def evaluate_model_selection_study(
                 },
             }
         except Exception as exc:
+            logger.debug(
+                "[EVAL] stage=study_replay status=failed family=%s error_type=%s error_message=%r",
+                family.value,
+                type(exc).__name__,
+                str(exc),
+                exc_info=True,
+            )
             rejection_counts[f"replay-failed:{type(exc).__name__}"] = rejection_counts.get(f"replay-failed:{type(exc).__name__}", 0) + 1
             continue
         if time.monotonic() >= deadline:
