@@ -457,6 +457,7 @@
     "testing": "tests/unit/stocks/ml/test_compound_alpha.py"
   },
   "src/stocks/ml/model_selection.py": {
-    "testing": "tests/unit/stocks/ml/test_model_selection.py"
+    "testing": "tests/unit/stocks/ml/test_model_selection.py",
+    "architecture": "docs/results/ml-cmp.md"
   }
 }
