@@ -46,7 +46,7 @@ from src.stocks.config.research import (
 from src.stocks.config.runtime import StockRuntimeSettings
 from src.stocks.data.contracts import CoverageRange, DatasetSnapshot
 from src.stocks.data.costs import load_cost_evidence
-from src.stocks.data.direct import DirectLoadCheckpoint
+from src.stocks.data.direct import DirectDataRequest, DirectLoadCheckpoint
 from src.stocks.data.lineage import ResearchDataBundle, ResolvedDataLineage
 from src.stocks.data.repositories import (
     ResearchDataRepository,
@@ -680,6 +680,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="end date for direct dataset loading (requires --base-dataset-id)",
     )
     parser.add_argument(
+        "--data-start",
+        type=date.fromisoformat,
+        default=None,
+        help="inclusive data start date for direct dataset loading",
+    )
+    parser.add_argument(
+        "--data-end",
+        type=date.fromisoformat,
+        default=None,
+        help="inclusive data end date for direct dataset loading",
+    )
+    parser.add_argument(
+        "--cost-evidence-path",
+        type=Path,
+        default=None,
+        help="optional direct cost evidence path; absent produces warning",
+    )
+    parser.add_argument(
         "--cost-snapshot-id",
         default=None,
         help=(
@@ -980,6 +998,29 @@ def _parse_horizons(raw: str) -> tuple[int, ...]:
     if not values:
         raise ValueError("candidate-horizon-sessions must be non-empty")
     return values
+
+
+def _build_direct_data_request(parsed: argparse.Namespace) -> DirectDataRequest:
+
+    base = getattr(parsed, "base_dataset_id", None)
+    feature = getattr(parsed, "feature_dataset_id", None)
+    label = getattr(parsed, "label_dataset_id", None)
+    # support both old and new naming
+    start = getattr(parsed, "data_start", None) or getattr(parsed, "research_start_direct", None)
+    end = getattr(parsed, "data_end", None) or getattr(parsed, "research_end_direct", None)
+    if not (base and feature and label):
+        raise ValueError("direct data requires --base-dataset-id, --feature-dataset-id, --label-dataset-id")
+    if start is None or end is None:
+        raise ValueError("direct data requires --data-start/--research-start-direct and --data-end/--research-end-direct")
+    horizons = _parse_horizons(getattr(parsed, "candidate_horizon_sessions", "10"))
+    return DirectDataRequest(
+        base_dataset_id=str(base),
+        feature_dataset_id=str(feature),
+        label_dataset_id=str(label),
+        start=start,
+        end=end,
+        candidate_horizon_sessions=horizons,
+    )
 
 
 def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest:
@@ -1411,8 +1452,10 @@ def run_research_only_model_selection_study(
     parsed: argparse.Namespace,
     request: NetAlphaTrainingRequest,
 ) -> dict[str, object]:
+    from src.stocks.data.direct import DirectMarketDataLoader
     from src.stocks.data.ml_integrity import validate_ml_snapshot  # validate_ml_snapshot
     from src.stocks.ml.model_selection import evaluate_model_selection_study
+    from src.stocks.ml.result_ledger import MlResultLedger
 
     if getattr(parsed, "model_selection_debug_timing", False):
         logging.basicConfig(level=logging.DEBUG, format="%(levelname)s %(name)s %(message)s")
@@ -1420,10 +1463,125 @@ def run_research_only_model_selection_study(
 
     # wiring reference for lean_check: evaluate_model_selection_study(
     _ = evaluate_model_selection_study  # evaluate_model_selection_study(
-    if parsed.base_dataset_id or parsed.feature_dataset_id or parsed.label_dataset_id:
-        raise ValueError(
-            "--research-only-model-selection-study requires a cataloged snapshot; direct-only dataset requests are rejected (cost-evidence-required)"
+    # Direct-input path: when all three IDs supplied, use DirectMarketDataLoader without snapshot resolution
+    has_direct = bool(getattr(parsed, "base_dataset_id", None) or getattr(parsed, "feature_dataset_id", None) or getattr(parsed, "label_dataset_id", None))
+    if has_direct:
+        # require complete group; partial group is parser validation (handled in main)
+        if not (parsed.base_dataset_id and parsed.feature_dataset_id and parsed.label_dataset_id):
+            raise ValueError("direct model selection requires --base-dataset-id, --feature-dataset-id, --label-dataset-id")
+
+        decision_time = parsed.decision_time or REFERENCE_DATETIME
+        direct_request = _build_direct_data_request(parsed)
+        loader = DirectMarketDataLoader(
+            base_root=parsed.base_root,
+            feature_root=parsed.feature_root,
+            label_root=parsed.label_root,
         )
+        cost_path = getattr(parsed, "cost_evidence_path", None)
+        readiness_report = loader.assess_readiness(direct_request, decision_time, cost_evidence_path=cost_path)
+        # record readiness regardless of outcome
+        data_inputs = {
+            "base_dataset_id": direct_request.base_dataset_id,
+            "feature_dataset_id": direct_request.feature_dataset_id,
+            "label_dataset_id": direct_request.label_dataset_id,
+            "start": direct_request.start.isoformat(),
+            "end": direct_request.end.isoformat(),
+            "feature_schema_hash": readiness_report.input_reference.feature_schema_hash,
+            "feature_content_hash": readiness_report.input_reference.feature_content_hash,
+            "cost_evidence_path": readiness_report.input_reference.cost_evidence_path,
+            "cost_evidence_hash": readiness_report.input_reference.cost_evidence_hash,
+        }
+        readiness_map = {
+            "errors": [e.code for e in readiness_report.errors],
+            "warnings": [w.code for w in readiness_report.warnings],
+            "passed": readiness_report.passed,
+        }
+        if readiness_report.errors:
+            # write failed research outcome and block
+            ledger = MlResultLedger(parsed.results_root)
+            try:
+                ledger.record_research_outcome(
+                    run_id=request.artifact_id,
+                    status="failed",
+                    data_inputs=data_inputs,
+                    readiness=readiness_map,
+                    outcome={},
+                    started_at=datetime.now(UTC),
+                    failure=ValueError(f"readiness blocked: {readiness_map['errors']}"),
+                )
+            except Exception as ledger_exc:  # noqa: BLE001
+                logger.warning("[SYS] stage=result_ledger status=write_failed error=%s", ledger_exc)
+            raise ValueError(f"direct readiness blocked: {readiness_map['errors']}")
+        data = loader.load_training_data(direct_request, decision_time, readiness=readiness_report)
+        # Bind the explicitly supplied direct evidence; absence keeps the
+        # canonical research schedules and is already represented as a warning.
+        base_cost_schedule: CostSchedule
+        stress_cost_schedule: CostSchedule
+        liquidity_model: LiquiditySlippageModel | None
+        stress_liquidity_model: LiquiditySlippageModel | None
+        if cost_path is not None:
+            try:
+                evidence = load_cost_evidence(
+                    Path(cost_path),
+                    CoverageRange(
+                        start=direct_request.start,
+                        end=direct_request.end,
+                    ),
+                )
+            except Exception as exc:
+                raise ValueError(
+                    f"direct cost evidence is invalid: {cost_path}"
+                ) from exc
+            base_cost_schedule = evidence.base_schedule()
+            stress_cost_schedule = evidence.stress_schedule()
+            liquidity_model = evidence.base_liquidity_model
+            stress_liquidity_model = evidence.stress_liquidity_model
+        else:
+            base_cost_schedule = request.base_cost_schedule  # type: ignore[assignment]
+            stress_cost_schedule = request.stress_cost_schedule  # type: ignore[assignment]
+            liquidity_model = request.liquidity_model
+            stress_liquidity_model = request.stress_liquidity_model
+        bound_request = replace(
+            request,
+            base_cost_schedule=base_cost_schedule,
+            stress_cost_schedule=stress_cost_schedule,
+            liquidity_model=liquidity_model,
+            stress_liquidity_model=stress_liquidity_model,
+        )
+        from src.stocks.ml.model_selection import (
+            build_model_selection_study_settings,  # build_model_selection_study_settings
+        )
+
+        settings = build_model_selection_study_settings(parsed, bound_request)  # settings = build_model_selection_study_settings(parsed, bound_request)
+        try:
+            from src.stocks.ml.features import stock_net_alpha_v1_contract_book
+
+            _contract_book = stock_net_alpha_v1_contract_book(
+                available_columns=data.feature_frame.columns
+            )
+            _audit = validate_ml_snapshot(data.feature_frame, _contract_book)  # validate_ml_snapshot invocation
+            if not _audit.passed:
+                raise ValueError(f"ML snapshot integrity failed: {[_c.detail for _c in _audit.checks if not _c.passed]}")
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"ML snapshot integrity audit error: {exc}") from exc
+        payload = evaluate_model_selection_study(data, bound_request, settings, registry=ModelArtifactRegistry(parsed.registry))
+        result_payload = {"status": "RESEARCH_ONLY", "artifact_published": False, "artifact_id": bound_request.artifact_id, **payload}
+        # emit bounded research outcome record
+        try:
+            ledger = MlResultLedger(parsed.results_root)
+            ledger.record_research_outcome(
+                run_id=request.artifact_id,
+                status="completed",
+                data_inputs=data_inputs,
+                readiness=readiness_map,
+                outcome={k: str(v)[:512] for k, v in payload.items()},
+                started_at=datetime.now(UTC),
+            )
+        except Exception as ledger_exc:  # noqa: BLE001
+            logger.warning("[SYS] stage=result_ledger status=write_failed error=%s", ledger_exc)
+        return result_payload
     if not parsed.snapshot_id:
         raise ValueError(
             "--research-only-model-selection-study requires --snapshot-id (cost-evidence-required); the read-only study never publishes"
@@ -1896,6 +2054,11 @@ def main(args: list[str] | None = None) -> int:
     request = _build_training_request(parsed)
     _validate_static_training_request(request)
 
+    # Direct-input completeness: partial group fails via parser validation before any loader/catalog call
+    direct_ids = [parsed.base_dataset_id, parsed.feature_dataset_id, parsed.label_dataset_id]
+    if any(direct_ids) and not all(direct_ids):
+        parser.error("direct data requires --base-dataset-id, --feature-dataset-id, --label-dataset-id together")
+
     if parsed.research_only_growth_route:
         payload = run_research_only_growth_route(parsed, request)
         sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
@@ -2142,7 +2305,7 @@ def _run_direct_training(
     boundary in :class:`TrainingRunGuard`. A predicted memory breach publishes
     the durable terminal failed ledger before a non-zero exit.
     """
-    from src.stocks.data.direct import DirectDataRequest, DirectMarketDataLoader
+    from src.stocks.data.direct import DirectMarketDataLoader
     from src.stocks.ml.replay_resources import (
         TrainingRunDeniedError,
         TrainingRunGuard,
@@ -2162,15 +2325,7 @@ def _run_direct_training(
         label_root=parsed.label_root,
     )
 
-    request_data = DirectDataRequest(
-        base_dataset_id=parsed.base_dataset_id,
-        feature_dataset_id=parsed.feature_dataset_id,
-        label_dataset_id=parsed.label_dataset_id,
-        start=parsed.research_start_direct,
-        end=parsed.research_end_direct,
-        feature_set="stock_net_alpha_v1",
-        candidate_horizon_sessions=_parse_horizons(parsed.candidate_horizon_sessions),
-    )
+    request_data = _build_direct_data_request(parsed)
 
     # Diagnostics open before any allocation so a guard denial leaves terminal
     # evidence instead of a vanished kernel.
