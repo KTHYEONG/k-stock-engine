@@ -398,7 +398,8 @@
   "src/stocks/ml/contracts.py": {
     "testing": [
       "tests/unit/stocks/ml/test_contracts.py",
-      "tests/unit/stocks/research/test_hedged_excess_certification.py"
+      "tests/unit/stocks/research/test_hedged_excess_certification.py",
+      "tests/unit/stocks/cli/test_train.py"
     ]
   },
   "src/stocks/data/lineage.py": {
