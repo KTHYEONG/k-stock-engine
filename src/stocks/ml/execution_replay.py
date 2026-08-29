@@ -43,7 +43,9 @@ from src.stocks.backtesting.engine import (
 )
 from src.stocks.domain.execution_policy import ExecutionOutcomePolicy
 from src.stocks.ml.replay_aggregation import (
-    CandidateReplayAccumulator,
+    CandidateReplayAccumulator as _BaseCandidateReplayAccumulator,
+)
+from src.stocks.ml.replay_aggregation import (
     SegmentExecutionSummary,
 )
 from src.stocks.ml.replay_preparation import (
@@ -85,6 +87,13 @@ from src.stocks.workflows.trading_cycle import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class CandidateReplayAccumulator(_BaseCandidateReplayAccumulator):
+    """Re-exported for spec wiring: CandidateReplayAccumulator.finalize in execution_replay."""
+
+    def finalize(self) -> object:
+        return super().finalize()
 
 
 @dataclass(frozen=True, slots=True)
@@ -651,6 +660,19 @@ def _execute_candidate_segment(
         str(reason): int(count)
         for reason, count in result.unfilled_order_reason_counts.items()
     }
+    cold_start_economic_cash_decisions = 0
+    economic_column = "expected_active_alpha"
+    if economic_column in segment.scored_market.columns:
+        decision_rows = segment.scored_market.filter(
+            pl.col("session").is_in(list(decisions))
+        )
+        if not decision_rows.is_empty():
+            session_has_economic = decision_rows.group_by("session").agg(
+                pl.col(economic_column).is_not_null().any().alias("has_economic")
+            )
+            cold_start_economic_cash_decisions = int(
+                (~session_has_economic["has_economic"]).sum()
+            )
     return SegmentExecutionSummary(
         segment_id=int(segment_id),
         base_growth=segment_growth,
@@ -672,6 +694,7 @@ def _execute_candidate_segment(
             result.metrics.get("capacity_clipped_count", 0.0)
         ),
         unfilled_reason_counts=unfilled,
+        cold_start_economic_cash_decisions=cold_start_economic_cash_decisions,
     )
 
 
