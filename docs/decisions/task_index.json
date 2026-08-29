@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "DATA_LAYOUT_RETENTION_V1",
+      "date": "2026-08-29",
+      "adr_id": "ADR_20260829_DATA_LAYOUT_RETENTION_V1",
+      "domain": "stocks",
+      "title": "Direct data layout and retention refactor",
+      "why": "Direct ML had canonical inputs but runtime result paths and snapshot-dependent retention still referenced retired layouts, causing stale metadata and artifact accumulation risk.",
+      "resolution": "Unified runtime results under docs/results; added active dataset policy, deterministic catalog audit, explicit artifact retention dry-run/apply APIs, retired-source manifest marking, and bounded model-selection screen budget. Verified direct ML execution and full test suite.",
+      "impact": "Direct training remains snapshot-independent and fail-closed; active datasets and promoted artifacts are protected, stale paths are observable, and research results remain auditable in docs/results."
+    },
+    {
       "task_id": "DIRECT_DATA_EXECUTION_RECORDS",
       "date": "2026-08-29",
       "adr_id": "ADR_20260829_DIRECT_DATA_EXECUTION_RECORDS",
@@ -989,16 +999,6 @@
       "why": "Post compounding-growth-v1, the 81-trial screen OOM'd after trial 26 because per-fold scored.join(tuning_panel.select(...)) re-materialized the full training-mask panel every fold/trial, leaving no traceback/artifact/final replay.",
       "resolution": "Added _fold_transfer_attribution(scored, context.labels, label_column, top_k) and switched _score_trial_fold to join only the compact validation-scoped PreparedCandidateContext.labels (the same source _median_rank_ic uses), removing the full-panel 3-column projection. Telemetry schema, pooling, gates, and Optuna objective unchanged.",
       "impact": "Removes the OOM regression; fold telemetry is now bounded by the fold validation rows (~25x smaller probe). Required for the 81-trial replay to produce CAGR/MDD/DSR/promotion artifacts."
-    },
-    {
-      "task_id": "STOCK_COMPOUNDING_BACKTEST_RECOVERY",
-      "date": "2026-08-14",
-      "adr_id": "ADR_20260814_STOCK_COMPOUNDING_BACKTEST_RECOVERY",
-      "domain": "stocks",
-      "title": "Cost-after compounding growth recovery",
-      "why": "Latest 81-trial ML runs showed positive Rank-IC and full screen fills but no confirmed economic candidate; finite fold evidence was discarded before pooled recovery and covariance/allocation cash dominated the transfer bottleneck.",
-      "resolution": "Registered the compounding-growth-v1 implementation: preserve finite negative fold evidence through three-fold pooling, add causal conservative covariance fallback with parity telemetry, and gate exact final replay on CAGR, stress CAGR, benchmark excess, MDD, Calmar, bootstrap, DSR, and forward holdout.",
-      "impact": "Improves diagnosis and avoids avoidable covariance cash without relaxing fail-closed statistical or forward gates; promotion remains disabled unless cost-after-growth and drawdown criteria pass."
     }
   ]
 }
