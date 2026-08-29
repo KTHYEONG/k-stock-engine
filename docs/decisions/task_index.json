@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ML_DATA_INTEGRITY_COMPOUNDING",
+      "date": "2026-08-29",
+      "adr_id": "ADR_20260829_ML_DATA_INTEGRITY_COMPOUNDING",
+      "domain": "stocks",
+      "title": "PIT data integrity and compound-growth ML audit",
+      "why": "The latest ML study had zero invested observations, while direct audit found K-sized screen samples and missing disclosure-date lineage.",
+      "resolution": "Registered the fail-closed PIT audit, cross-sectional screen headroom, deterministic nested selection, rolling-window comparison, and holdout certification design; the existing snapshot remains unpromotable because raw disclosure dates are absent.",
+      "impact": "Prevents false no-alpha and false compounding claims; requires an actual corp_code-to-stock_code and disclosure-date source before ML fitting can be certified."
+    },
+    {
       "task_id": "TASK_ML_FAMILY_CONFIG_SIGNAL_INTEGRITY_20260829",
       "date": "2026-08-29",
       "adr_id": "ADR_20260829_ML_FAMILY_CONFIG_SIGNAL_INTEGRITY_20260829",
@@ -989,16 +999,6 @@
       "why": "Rank-IC was positive but promotion failed after economic replay, requiring evidence-based documentation and contract registration.",
       "resolution": "Registered the diagnostic economic-transfer specification and preserved fail-closed promotion gates; documented ranking, allocation, execution, and compounding bottlenecks.",
       "impact": "Updates task/code indexes and removes temporary spec/scratch/tmp artifacts after the audit."
-    },
-    {
-      "task_id": "TASK_STOCK_ENSEMBLE_ABLATION_90",
-      "date": "2026-08-13",
-      "adr_id": "ADR_20260813_STOCK_ENSEMBLE_ABLATION_90",
-      "domain": "stocks",
-      "title": "90-trial ML-only and blend ablation",
-      "why": "Backtest evidence did not directly test ML-only or provide a controlled family comparison.",
-      "resolution": "Registered a balanced 90-trial five-family ablation, recorded the production NO_TRADE result, and preserved fail-closed promotion and exact economic comparison gates.",
-      "impact": "Adds auditable family provenance and documents that no family reached confirmation; no production promotion or gate relaxation."
     }
   ]
 }
