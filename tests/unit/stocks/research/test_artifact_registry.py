@@ -109,3 +109,19 @@ class TestArtifactRegistry:
         registry.publish(model, model.manifest())
         with pytest.raises(ValueError, match="already exists"):
             registry.publish(model, model.manifest())
+
+
+def test_artifact_retention_dry_run_keeps_promoted_and_active(tmp_path) -> None:
+    registry = ModelArtifactRegistry(tmp_path)
+    promoted = DeterministicBaseline(manifest=make_manifest("promoted_model_20240101"))
+    active = DeterministicBaseline(manifest=make_manifest("active_model_20240101"))
+    stale = DeterministicBaseline(manifest=make_manifest("stale_model_20240101"))
+    for model in (promoted, active, stale):
+        registry.publish(model, model.manifest())
+    registry.write_metrics("promoted_model_20240101", {"promoted": True})
+    registry.write_metrics("active_model_20240101", {"promoted": False})
+    registry.write_metrics("stale_model_20240101", {"promoted": False})
+    candidates = registry.retention_candidates(["active_model_20240101"])
+    assert [candidate.artifact_id for candidate in candidates] == ["stale_model_20240101"]
+    assert registry.prune(candidates) == 0
+    assert (tmp_path / "stale_model_20240101").exists()
