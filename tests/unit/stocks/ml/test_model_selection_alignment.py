@@ -1,4 +1,4 @@
-# ruff: noqa: PT011, S101, F401, PT018, E401
+# ruff: noqa: PT011, S101, F401, PT018, E401, PERF401
 import math
 import numpy as np
 import polars as pl
@@ -360,7 +360,7 @@ def test_linear_rank_interaction_is_hidden_from_tree_families():
     assert "flow_consensus" in roles and "relative_trend_score" in roles
     # Check schema contains interaction only when both present
     rng = np.random.default_rng(0)
-    sessions = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(5)]
+    sessions = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(20)]
     rows = []
     for s in sessions:
         for t in range(4):
@@ -393,6 +393,35 @@ def test_linear_rank_interaction_is_hidden_from_tree_families():
     frame2 = frame2.with_columns(pl.Series("instrument_id", [f"KRX:{i%2:05d}" for i in range(frame2.height)]))
     schema2 = fit_research_feature_schema(frame2, roles_missing)
     assert "flow_consensus_x_relative_trend_score" not in [n for n, _ in schema2.source_groups]
+
+
+def test_ML_SCREEN_02_deterministic_inner_selection() -> None:
+    # ML-SCREEN-02
+    import polars as pl
+    from datetime import datetime, UTC, timedelta
+    import numpy as np
+    from src.stocks.ml.contracts import ModelFamily, ScreenSamplingPlan, NetAlphaTrainingRequest
+    from src.stocks.ml.model_selection import _select_inner_feature_groups
+
+    rng = np.random.default_rng(0)
+    sessions = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(20)]
+    rows = []
+    for s in sessions:
+        for t in range(20):
+            rows.append({"instrument_id": f"KRX:{t:05d}", "session": s, "adtv_20d": float(1e6 + t), "feature__a": float(rng.normal()), "feature__b": float(rng.normal())})
+    outer = pl.DataFrame(rows)
+    req = NetAlphaTrainingRequest(artifact_id="align02", candidate_horizon_sessions=(10,))
+    plan = ScreenSamplingPlan(top_k=12, cross_section_multiplier=4, minimum_tail_draws=20)
+    ev1 = _select_inner_feature_groups(outer, ModelFamily.elastic_net_v2, req, plan)
+    # changing outer-validation labels cannot change selected groups (inner uses only outer_train)
+    # call again with same outer_train should be deterministic
+    ev2 = _select_inner_feature_groups(outer, ModelFamily.elastic_net_v2, req, plan)
+    assert ev1.selected_source_groups == ev2.selected_source_groups
+    assert ev1.source_group_scores == ev2.source_group_scores
+    # deterministic measured evidence rather than hash order: scores sorted by (score desc, name asc)
+    scores = list(ev1.source_group_scores)
+    # verify ordering is deterministic: sorted by (-score, name)
+    assert scores == sorted(scores, key=lambda x: (-x[1], x[0]))
 
 
 def test_study_payload_keeps_in_memory_series_private():
