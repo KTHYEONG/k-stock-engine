@@ -584,6 +584,8 @@ def _screen_prefix_economic_evidence(
     fold_id: int | None = None,
     bootstrap_alpha: float,
     bootstrap_resamples: int,
+    rebalance_frequency_sessions: int | None = None,
+    execution_top_k: int | None = None,
 ) -> ScreenEconomicEvidence:
     """Compute bounded economic evidence for one prefix's scored validation frame.
 
@@ -610,9 +612,21 @@ def _screen_prefix_economic_evidence(
             route_kind = "hedged_residual"
         else:
             route_kind = "unhedged_absolute"
-    # Feasible cell for top_k / cadence
-    feasible = request.execution_frontier.require_feasible_horizons(request.portfolio.max_exposure, request.portfolio.max_single_weight)
-    _, cadence, top_k = feasible[0]
+    # Feasible cell for top_k / cadence: prefer resolved cell when provided
+    if rebalance_frequency_sessions is not None and execution_top_k is not None:
+        cadence = int(rebalance_frequency_sessions)
+        top_k = int(execution_top_k)
+    elif rebalance_frequency_sessions is not None:
+        feasible_tmp = request.execution_frontier.require_feasible_horizons(request.portfolio.max_exposure, request.portfolio.max_single_weight)
+        _, _, top_k = feasible_tmp[0]
+        cadence = int(rebalance_frequency_sessions)
+    elif execution_top_k is not None:
+        feasible_tmp = request.execution_frontier.require_feasible_horizons(request.portfolio.max_exposure, request.portfolio.max_single_weight)
+        _, cadence, _ = feasible_tmp[0]
+        top_k = int(execution_top_k)
+    else:
+        feasible = request.execution_frontier.require_feasible_horizons(request.portfolio.max_exposure, request.portfolio.max_single_weight)
+        _, cadence, top_k = feasible[0]
     # Validate gross for unhedged - deterministic rejection, never residual fallback
     if route_kind == "unhedged_absolute" and GROSS_COLUMN not in scored.columns:
         raise ValueError(f"unhedged_absolute screen requires {GROSS_COLUMN!r} column (gross missing)")
@@ -1414,7 +1428,7 @@ def screen_model_family(
         # Attach hidden prefix size for helper
         scored = scored.with_columns(pl.lit(int(k)).alias("__prefix_size"))
         try:
-            see = _screen_prefix_economic_evidence(scored, request=request, fold_id=int(cache.fold.segment_id), bootstrap_alpha=float(bootstrap_alpha), bootstrap_resamples=int(bootstrap_resamples))
+            see = _screen_prefix_economic_evidence(scored, request=request, fold_id=int(cache.fold.segment_id), bootstrap_alpha=float(bootstrap_alpha), bootstrap_resamples=int(bootstrap_resamples), rebalance_frequency_sessions=int(cadence), execution_top_k=int(top_k))
             # Override selected_prefix_size to correct values (fold_id already correct via family_training_profile)
             see = ScreenEconomicEvidence(fold_id=int(cache.fold.segment_id), route_kind=see.route_kind, top_k=see.top_k, rebalance_frequency_sessions=see.rebalance_frequency_sessions, session_count=see.session_count, selected_prefix_size=int(k), absolute_lower_bound=see.absolute_lower_bound, tail_excess_lower_bound=see.tail_excess_lower_bound, oracle_tail_excess_lower_bound=see.oracle_tail_excess_lower_bound)
             # Materialize the fold-level contract and use segmented blocks for its tail bound.
@@ -2581,6 +2595,9 @@ def evaluate_model_selection_study(
         "recommended_lookback_sessions": None,
         "recommended_is_expanding": False,
     }
+    # Keep admitted evidence invocation-local so concurrent studies cannot mix selections.
+    global_admitted_pool: list[ReplayCandidateEvidence] = []
+    global_profile_map: dict[str, str] = {}
     start_monotonic = time.monotonic()
     deadline = start_monotonic + float(settings.compute_budget.wall_clock_seconds)
     screen_deadline = start_monotonic + float(settings.compute_budget.screen_phase_seconds)
@@ -3256,8 +3273,11 @@ def evaluate_model_selection_study(
                 candidates_evaluated[-1]["terminal_status"] = "no-feasible-cells"
                 candidates_evaluated[-1]["last_completed_status"] = "no-feasible-cells"
                 continue
-            _, c, k = feasible_cells[0]
-            profile = request.policy_profiles[0]
+            # Use resolved ReferenceExecutionCell horizon/C/K for every replay spec
+            ref_c = int(_ref_cell.rebalance_frequency_sessions)
+            ref_k = int(_ref_cell.top_k)
+            ref_horizon = int(_ref_cell.horizon_sessions)
+            specs = [(ref_c, ref_k, prof) for prof in request.policy_profiles]
             calibrated = oof
             if "predicted_net_alpha" in oof.columns and "expected_net_alpha" not in oof.columns:
                 try:
@@ -3272,7 +3292,42 @@ def evaluate_model_selection_study(
                     )
                     calibrated = oof
             replay_started_at = time.monotonic()
-            batch = _replay_costs_batch(registry, calibrated, labels, win_request, horizon, RiskSettingsLocal(), pre_holdout, data.manifest, [(c, k, profile)])
+            # Exactly one batched replay per family with one spec per registered profile
+            try:
+                batch = _replay_costs_batch(registry, calibrated, labels, win_request, horizon, RiskSettingsLocal(), pre_holdout, data.manifest, specs)
+            except Exception as exc:
+                # Replay failure: all profiles are replay-failed
+                logger.debug(
+                    "[EVAL] stage=study_replay status=failed family=%s error_type=%s error_message=%r",
+                    family.value,
+                    type(exc).__name__,
+                    str(exc),
+                    exc_info=True,
+                )
+                # Build per-profile replay-failed diagnostics
+                failed_diags: list[dict[str, object]] = []
+                for (_c, _k, prof) in specs:
+                    failed_diags.append({
+                        "profile_id": str(prof.profile_id),
+                        "status": f"replay-failed:{type(exc).__name__}",
+                        "filled_orders": 0,
+                        "filled_cycle_count": 0,
+                        "observed_interval_count": 0,
+                        "invested_interval_count": 0,
+                        "unfilled_order_reason_counts": {},
+                        "base_lower_bound": None,
+                        "stress_lower_bound": None,
+                    })
+                candidates_evaluated[-1]["profile_diagnostics"] = failed_diags
+                candidates_evaluated[-1]["profiles"] = failed_diags
+                candidates_evaluated[-1]["per_profile"] = failed_diags
+                candidates_evaluated[-1]["replay_diagnostics"] = failed_diags
+                candidates_evaluated[-1]["status"] = f"replay-failed:{type(exc).__name__}"
+                candidates_evaluated[-1]["terminal_status"] = f"replay-failed:{type(exc).__name__}"
+                candidates_evaluated[-1]["last_completed_status"] = f"replay-failed:{type(exc).__name__}"
+                rejection_counts[f"replay-failed:{type(exc).__name__}"] = rejection_counts.get(f"replay-failed:{type(exc).__name__}", 0) + 1
+                replay_count += 1
+                continue
             replay_count += 1
             _debug_timing(
                 "study_replay_complete",
@@ -3280,44 +3335,130 @@ def evaluate_model_selection_study(
                 family=family.value,
                 replay_count=replay_count,
             )
-            key = (horizon, c, k, profile.profile_id)
-            pair = batch.get(key)
-            if pair is None:
-                rejection_counts["replay-missing"] = rejection_counts.get("replay-missing", 0) + 1
-                candidates_evaluated[-1]["status"] = "replay-missing"
-                candidates_evaluated[-1]["terminal_status"] = "replay-missing"
-                candidates_evaluated[-1]["last_completed_status"] = "replay-missing"
-                continue
-            base_ev = pair.candidate
-            candidates_evaluated[-1]["replay_status"] = "replay-complete"
-            candidates_evaluated[-1]["filled_orders"] = int(base_ev.filled_orders)
-            if not base_ev.base_log_growth or base_ev.filled_orders == 0:
-                rejection_counts["no-fills"] = rejection_counts.get("no-fills", 0) + 1
-                candidates_evaluated[-1]["status"] = "replay-no-fills"
-                candidates_evaluated[-1]["terminal_status"] = "replay-no-fills"
-                candidates_evaluated[-1]["last_completed_status"] = "replay-no-fills"
-                continue
-            # Coverage/MDD/account gates via existing logic: check filled_orders, coverage, MDD, bootstrap gates.
-            # For brevity, use block-bootstrap lower bounds for base and stress.
-            base_lb = _block_bootstrap_lower_bound(np.asarray(base_ev.base_log_growth), alpha_window, bootstrap_resamples)
-            stress_lb = _block_bootstrap_lower_bound(np.asarray(base_ev.stress_log_growth), alpha_window, bootstrap_resamples)
-            candidates_evaluated[-1]["base_lower_bound"] = float(base_lb)
-            candidates_evaluated[-1]["stress_lower_bound"] = float(stress_lb)
-            if not math.isfinite(base_lb) or not math.isfinite(stress_lb) or base_lb <= 0 or stress_lb <= 0:
-                rejection_counts["non-positive-lower-bound"] = rejection_counts.get("non-positive-lower-bound", 0) + 1
-                candidates_evaluated[-1]["status"] = "gate-non-positive-lower-bound"
-                candidates_evaluated[-1]["terminal_status"] = "gate-non-positive-lower-bound"
-                candidates_evaluated[-1]["last_completed_status"] = "gate-non-positive-lower-bound"
-                continue
-            # Additional gates: coverage, MDD, account - use existing helpers if available; simplified check on base_ev.
-            # If any gate fails, continue without survivor.
-            # Survivor with actual attribution
-            cand_surv = ModelSelectionCandidate(candidate_id=cand_id, family=family, horizon_sessions=horizon, selected_source_groups=tuple(cand_seed_attr.selected_source_groups), oof_fingerprint=_fingerprint({"oof": str(oof.height), "fp": cand_seed_attr.schema_fingerprint}), attribution=(cand_seed_attr,))
-            survivors.append(cand_surv)
-            prior_evidence[cand_id] = {"block_growth": tuple(base_ev.base_log_growth), "oof_keys": set(zip(oof[_ID_COLUMN].to_list(), oof[SESSION_COLUMN].to_list(), strict=True)) if _ID_COLUMN in oof.columns and SESSION_COLUMN in oof.columns else set()}
-            candidates_evaluated[-1]["status"] = "admitted"
-            candidates_evaluated[-1]["terminal_status"] = "admitted"
-            candidates_evaluated[-1]["last_completed_status"] = "admitted"
+            # Build per-profile bounded diagnostics in declaration order
+            profile_diagnostics: list[dict[str, object]] = []
+            # Complexity rank mapping for champion selection
+            declared_index_local = {fam: idx for idx, fam in enumerate(DEFAULT_MODEL_SELECTION_FAMILIES)}
+            # For this family, collect admitted per-profile evidences
+            for (_c, _k, prof) in specs:
+                key = (horizon, _c, _k, prof.profile_id)
+                pair = batch.get(key)
+                if pair is None:
+                    diag = {
+                        "profile_id": str(prof.profile_id),
+                        "status": "replay-failed:missing",
+                        "filled_orders": 0,
+                        "filled_cycle_count": 0,
+                        "observed_interval_count": 0,
+                        "invested_interval_count": 0,
+                        "unfilled_order_reason_counts": {},
+                        "base_lower_bound": None,
+                        "stress_lower_bound": None,
+                    }
+                    profile_diagnostics.append(diag)
+                    continue
+                base_ev = pair.candidate
+                # Bounded per-profile scalars (aggregates only, never raw vectors)
+                filled_orders = int(base_ev.filled_orders)
+                filled_cycle_count = int(getattr(base_ev, "filled_cycle_count", 0))
+                observed_interval_count = int(getattr(base_ev, "observed_interval_count", 0))
+                invested_interval_count = int(getattr(base_ev, "invested_interval_count", 0))
+                unfilled_counts = {str(k): int(v) for k, v in getattr(base_ev, "unfilled_order_reason_counts", ())}
+                turnover = float(getattr(base_ev, "turnover", 0.0))
+                # Distinguish replay-no-fills vs replay failure; failure already handled
+                if filled_orders == 0 or not base_ev.base_log_growth:
+                    diag = {
+                        "profile_id": str(prof.profile_id),
+                        "status": "replay-no-fills",
+                        "filled_orders": filled_orders,
+                        "filled_cycle_count": filled_cycle_count,
+                        "observed_interval_count": observed_interval_count,
+                        "invested_interval_count": invested_interval_count,
+                        "unfilled_order_reason_counts": unfilled_counts,
+                        "base_lower_bound": None,
+                        "stress_lower_bound": None,
+                    }
+                    profile_diagnostics.append(diag)
+                    continue
+                # Compute bootstrap lower bounds under alpha_window
+                try:
+                    base_lb = _block_bootstrap_lower_bound(np.asarray(base_ev.base_log_growth, dtype=np.float64), alpha_window, bootstrap_resamples)
+                    stress_lb = _block_bootstrap_lower_bound(np.asarray(base_ev.stress_log_growth, dtype=np.float64), alpha_window, bootstrap_resamples)
+                except Exception:
+                    base_lb = float("nan")
+                    stress_lb = float("nan")
+                # Coverage/cost/risk gates: require finite strictly positive bounds
+                if not math.isfinite(float(base_lb)) or not math.isfinite(float(stress_lb)) or float(base_lb) <= 0 or float(stress_lb) <= 0:
+                    diag = {
+                        "profile_id": str(prof.profile_id),
+                        "status": "gate-non-positive-lower-bound",
+                        "filled_orders": filled_orders,
+                        "filled_cycle_count": filled_cycle_count,
+                        "observed_interval_count": observed_interval_count,
+                        "invested_interval_count": invested_interval_count,
+                        "unfilled_order_reason_counts": unfilled_counts,
+                        "base_lower_bound": float(base_lb) if math.isfinite(float(base_lb)) else None,
+                        "stress_lower_bound": float(stress_lb) if math.isfinite(float(stress_lb)) else None,
+                    }
+                    profile_diagnostics.append(diag)
+                    continue
+                # All gates passed: compute drawdowns and create ReplayCandidateEvidence
+                base_mdd = log_growth_max_drawdown(base_ev.base_log_growth)
+                stress_mdd = log_growth_max_drawdown(base_ev.stress_log_growth)
+                complexity_rank = int(declared_index_local.get(family, 99))
+                candidate_id_profile = f"{family.value}_h{horizon}_lb{lookback}_{prof.profile_id}"
+                candidate_obj = ModelSelectionCandidate(candidate_id=candidate_id_profile, family=family, horizon_sessions=horizon, selected_source_groups=tuple(cand_seed_attr.selected_source_groups), oof_fingerprint=_fingerprint({"oof": str(oof.height), "fp": cand_seed_attr.schema_fingerprint, "profile": prof.profile_id}), attribution=(cand_seed_attr,))
+                evidence = ReplayCandidateEvidence(candidate=candidate_obj, base_lower_bound=float(base_lb), stress_lower_bound=float(stress_lb), base_mdd=float(base_mdd), stress_mdd=float(stress_mdd), turnover=float(turnover), complexity_rank=int(complexity_rank))
+                global_admitted_pool.append(evidence)
+                global_profile_map[candidate_id_profile] = str(prof.profile_id)
+                diag = {
+                    "profile_id": str(prof.profile_id),
+                    "status": "admitted",
+                    "filled_orders": filled_orders,
+                    "filled_cycle_count": filled_cycle_count,
+                    "observed_interval_count": observed_interval_count,
+                    "invested_interval_count": invested_interval_count,
+                    "unfilled_order_reason_counts": unfilled_counts,
+                    "base_lower_bound": float(base_lb),
+                    "stress_lower_bound": float(stress_lb),
+                    "turnover": float(turnover),
+                    "base_mdd": float(base_mdd),
+                    "stress_mdd": float(stress_mdd),
+                }
+                profile_diagnostics.append(diag)
+            # Attach ordered diagnostics to candidate payload
+            candidates_evaluated[-1]["profile_diagnostics"] = profile_diagnostics
+            candidates_evaluated[-1]["profiles"] = profile_diagnostics
+            candidates_evaluated[-1]["per_profile"] = profile_diagnostics
+            candidates_evaluated[-1]["replay_diagnostics"] = profile_diagnostics
+            # Determine family-level status based on at least one admitted profile
+            admitted_count = sum(1 for d in profile_diagnostics if d.get("status") == "admitted")
+            if admitted_count > 0:
+                candidates_evaluated[-1]["status"] = "admitted"
+                candidates_evaluated[-1]["terminal_status"] = "admitted"
+                candidates_evaluated[-1]["last_completed_status"] = "admitted"
+                # Keep survivors for backward compat as family-level survivor if any profile admitted
+                cand_surv = ModelSelectionCandidate(candidate_id=cand_id, family=family, horizon_sessions=horizon, selected_source_groups=tuple(cand_seed_attr.selected_source_groups), oof_fingerprint=_fingerprint({"oof": str(oof.height), "fp": cand_seed_attr.schema_fingerprint}), attribution=(cand_seed_attr,))
+                survivors.append(cand_surv)
+                prior_evidence[cand_id] = {"block_growth": tuple(base_ev.base_log_growth) if 'base_ev' in locals() else (), "oof_keys": set(zip(oof[_ID_COLUMN].to_list(), oof[SESSION_COLUMN].to_list(), strict=True)) if _ID_COLUMN in oof.columns and SESSION_COLUMN in oof.columns else set()}
+            else:
+                # No admitted profiles: mark as best non-admitted status (e.g., replay-no-fills if any such, else gate)
+                # Prefer replay-no-fills over gate if present
+                statuses = [d.get("status") for d in profile_diagnostics]
+                if any(s == "replay-no-fills" for s in statuses):
+                    candidates_evaluated[-1]["status"] = "replay-no-fills"
+                    candidates_evaluated[-1]["terminal_status"] = "replay-no-fills"
+                    candidates_evaluated[-1]["last_completed_status"] = "replay-no-fills"
+                    rejection_counts["replay-no-fills"] = rejection_counts.get("replay-no-fills", 0) + 1
+                elif any("gate" in str(s) for s in statuses):
+                    candidates_evaluated[-1]["status"] = "gate-non-positive-lower-bound"
+                    candidates_evaluated[-1]["terminal_status"] = "gate-non-positive-lower-bound"
+                    candidates_evaluated[-1]["last_completed_status"] = "gate-non-positive-lower-bound"
+                    rejection_counts["gate-non-positive-lower-bound"] = rejection_counts.get("gate-non-positive-lower-bound", 0) + 1
+                else:
+                    candidates_evaluated[-1]["status"] = "replay-no-fills"
+                    candidates_evaluated[-1]["terminal_status"] = "replay-no-fills"
+                    candidates_evaluated[-1]["last_completed_status"] = "replay-no-fills"
         except TimeoutError:
             elapsed = time.monotonic() - start_monotonic
             # retain current candidate terminal status
@@ -3396,20 +3537,30 @@ def evaluate_model_selection_study(
                     "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
                 },
             }
-    # selected_family only when full-OOF passes both base and stress ledger gates.
+    # Select at most one research recommendation deterministically across admitted family-profile candidates
     selected_family = None
+    selected_profile_id = None
     recommended_lookback = None
-    if survivors:
-        # Deterministic: choose survivor with highest base lower bound? Use first in qualified order.
+    champion = None
+    if global_admitted_pool:
+        champion = select_model_selection_champion(global_admitted_pool)
+        if champion is not None:
+            selected_family = str(champion.candidate.family)
+            recommended_lookback = lookback
+            # profile_id is suffix after family_h_lb prefix
+            selected_profile_id = global_profile_map.get(champion.candidate.candidate_id)
+            if selected_profile_id is None:
+                # fallback: try to parse profile from candidate_id
+                for prof in request.policy_profiles:
+                    if champion.candidate.candidate_id.endswith(str(prof.profile_id)):
+                        selected_profile_id = str(prof.profile_id)
+                        break
+    elif survivors:
         selected_family = str(survivors[0].family)
         recommended_lookback = lookback
     elapsed = time.monotonic() - start_monotonic
-    # If deadline exceeded before qualification, budget-exhausted without promotion (already handled).
-    # Otherwise return complete or no-qualified-survivor.
-    # Study is complete when it finishes without hitting the wall deadline, even with no qualified survivor.
     next_action_val = "rerun-qualified-family" if selected_family is not None else "no-qualified-survivor"
     study_complete_val = True
-    # For integration benchmark: either complete with ledger or budget-exhausted before 600s.
     runtime_ledger = {
         "stage": "complete",
         "elapsed_seconds": float(elapsed),
@@ -3428,16 +3579,21 @@ def evaluate_model_selection_study(
         "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
         "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
     }
-    # Mark qualified selected flags in candidates
     for rec in candidates_evaluated:
         fam_str = str(rec.get("family"))
         if selected_family and fam_str == selected_family:
             rec["selected_family"] = True
-    return {
+            # mark admitted profile as selected within diagnostics
+            for diag in rec.get("profile_diagnostics", []) + rec.get("profiles", []) + rec.get("per_profile", []):
+                if isinstance(diag, dict) and diag.get("profile_id") == selected_profile_id:
+                    diag["selected"] = True
+    # Include selected_profile_id in additive read-only payload
+    result_payload: dict[str, object] = {
         **header,
         "study_complete": bool(study_complete_val),
         "next_action": next_action_val,
         "selected_family": selected_family,
+        "selected_profile_id": selected_profile_id,
         "recommended_lookback_sessions": recommended_lookback,
         "recommended_is_expanding": recommended_lookback is None,
         "rejection_reason_counts": dict(sorted(rejection_counts.items())) if rejection_counts else {},
@@ -3445,6 +3601,7 @@ def evaluate_model_selection_study(
         "survivors": [c.candidate_id for c in survivors],
         "runtime_ledger": runtime_ledger,
     }
+    return result_payload
 
 
 def run_research_only_model_selection_study(parsed, request):  # type: ignore[no-redef]
