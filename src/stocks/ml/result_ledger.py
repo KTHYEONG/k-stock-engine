@@ -594,6 +594,8 @@ class MlRunContext:
     )
     data_lineage: ResolvedDataLineage | None = None
     input_ids: Mapping[str, str] = field(default_factory=dict)
+    data_inputs: Mapping[str, object] = field(default_factory=dict)
+    readiness: Mapping[str, object] = field(default_factory=dict)
 
     @classmethod
     def from_cli(
@@ -1641,6 +1643,56 @@ class MlResultLedger:
         """Record a terminal failure without hiding the original exception."""
         record = _project_failed(context, phase, exc, telemetry, self._clock)
         self._write_record(context.artifact_id, record)
+
+    def record_research_outcome(
+        self,
+        *,
+        run_id: str,
+        status: str,
+        data_inputs: Mapping[str, object],
+        readiness: Mapping[str, object],
+        outcome: Mapping[str, object],
+        started_at: datetime,
+        failure: BaseException | None = None,
+    ) -> None:
+        finished_at = self._clock()
+        # sanitize and bound inputs: only scalar input reference fields
+        safe_inputs = _sanitize_deep(dict(data_inputs))
+        safe_readiness = _sanitize_deep(dict(readiness))
+        safe_outcome = _sanitize_deep(dict(outcome))
+        # ensure snapshot_id never appears
+        if isinstance(safe_inputs, dict) and "snapshot_id" in safe_inputs:
+            del safe_inputs["snapshot_id"]
+        record: dict[str, object] = {
+            "schema_version": SCHEMA_VERSION,
+            "run_id": _normalize_message(run_id),
+            "artifact_id": _normalize_message(run_id),
+            "status": _normalize_message(status),
+            "started_at": started_at.isoformat(),
+            "finished_at": finished_at.isoformat(),
+            "runtime": {"elapsed_ms": int((finished_at - started_at).total_seconds() * 1000), "peak_rss_mib": peak_rss_mib()},
+            "data_inputs": safe_inputs,
+            "readiness": safe_readiness,
+            "outcome": safe_outcome,
+            "input": {"data_inputs": safe_inputs, "readiness": safe_readiness},
+        }
+        if failure is not None:
+            record["failure"] = {"message": _normalize_message(str(failure) or type(failure).__name__)}
+        # omit raw rows, labels, scores, trades, credentials, stack traces by never copying them
+        # bound and atomic write
+        try:
+            fitted = _fit_record_to_limit(record) if len(_encode(record)) > MAX_RECORD_BYTES else record
+            _validate_size(fitted, MAX_RECORD_BYTES, "ledger record")
+            # atomic per-run file
+            per_run_path = _safe_resolve(self.runs_root, f"{run_id}.json")
+            _write_atomic(per_run_path, _encode(fitted))
+            # also update recent/latest for visibility
+            try:
+                self._write_record(run_id, fitted)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[SYS] stage=result_ledger status=write_failed run_id=%s error=%s", run_id, exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[SYS] stage=result_ledger status=write_failed run_id=%s error=%s", run_id, exc)
 
     def rebuild_from_registry(self, registry: ModelArtifactRegistry) -> dict[str, int]:
         """Rebuild the bounded cache from published artifact manifests/metrics.

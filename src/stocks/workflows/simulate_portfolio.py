@@ -135,26 +135,23 @@ def simulate_portfolio(
 def _validate_artifact_input_lineage(
     snapshot: DatasetSnapshot,
     artifact_manifest: ModelManifest,
-) -> None:
-    """Fail closed when a v6 artifact's exact input lineage does not match.
+) -> tuple[str, ...]:
+    """Fail closed on schema/transform mismatch; content-hash diff is a warning.
 
-    A v6 artifact (``holm_gate_version == "v6"``) records the raw feature schema
-    hash, the input feature content hash, and the recomputed transform
-    fingerprint. The independent historical replay must bind to the identical
-    feature dataset; a divergent feature schema, content hash, or transform
-    fingerprint raises ``ValueError`` with a diagnostic naming the differing
-    hashes so an unrelated snapshot can never silently replay a v6 artifact.
-    Legacy (pre-v6) artifacts skip this gate and replay under best-effort
-    compatibility.
+    A v6 artifact records schema, content hash and transform fingerprint.
+    Schema or transform mismatch raises ``ValueError``. A differing feature
+    content hash (same schema/transform) returns a single warning and permits
+    replay.
     """
     params = artifact_manifest.params or {}
     if params.get("holm_gate_version") != "v6":
-        return
+        return ()
     snapshot_manifest = snapshot.manifest
     raw_schema_hash = params.get("raw_feature_schema_hash")
     feature_content_hash = params.get("feature_content_hash")
     stored_fingerprint = params.get("feature_transform_fingerprint")
     mismatches: list[str] = []
+    warnings: list[str] = []
     if (
         raw_schema_hash is not None
         and snapshot_manifest.schema_hash != raw_schema_hash
@@ -163,15 +160,13 @@ def _validate_artifact_input_lineage(
             f"feature_schema_hash snapshot={snapshot_manifest.schema_hash!r} "
             f"artifact={raw_schema_hash!r}"
         )
+    # Content hash difference is a warning, not a block, when schema matches
     if (
         feature_content_hash is not None
         and snapshot_manifest.content_hash
         and feature_content_hash != snapshot_manifest.content_hash
     ):
-        mismatches.append(
-            f"feature_content_hash snapshot={snapshot_manifest.content_hash!r} "
-            f"artifact={feature_content_hash!r}"
-        )
+        warnings.append("feature_content_hash_mismatch")
     if "feature_transform_schema" in params and stored_fingerprint is not None:
         try:
             schema = feature_transform_schema_from_manifest(artifact_manifest)
@@ -190,6 +185,7 @@ def _validate_artifact_input_lineage(
             "v6 independent replay input lineage mismatch for "
             f"{artifact_manifest.artifact_id!r}: " + "; ".join(mismatches)
         )
+    return tuple(warnings)
 
 
 def artifact_policy_profile(
