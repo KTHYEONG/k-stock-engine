@@ -1379,6 +1379,37 @@ class ModelSelectionComputeBudget:
 
 
 @dataclass(frozen=True, slots=True)
+class ScreenEconomicEvidence:
+    fold_id: int
+    route_kind: str
+    top_k: int
+    rebalance_frequency_sessions: int
+    session_count: int
+    selected_prefix_size: int
+    absolute_lower_bound: float
+    tail_excess_lower_bound: float
+    oracle_tail_excess_lower_bound: float
+
+    def __post_init__(self) -> None:
+        if self.fold_id < 0:
+            raise ValueError("fold_id must be non-negative")
+        if not self.route_kind:
+            raise ValueError("route_kind must be non-empty")
+        if self.top_k < 1:
+            raise ValueError("top_k must be positive")
+        if self.rebalance_frequency_sessions < 1:
+            raise ValueError("rebalance_frequency_sessions must be positive")
+        if self.session_count < 0:
+            raise ValueError("session_count must be non-negative")
+        if self.selected_prefix_size < 1:
+            raise ValueError("selected_prefix_size must be positive")
+        for name in ("absolute_lower_bound", "tail_excess_lower_bound", "oracle_tail_excess_lower_bound"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
+
+
+@dataclass(frozen=True, slots=True)
 class FamilyScreenEvidence:
     family: ModelFamily
     screen_lower_bound: float
@@ -1387,6 +1418,7 @@ class FamilyScreenEvidence:
     qualified_for_full_oof: bool = False
     selected_family: bool = False
     fold_attributions: tuple[FeatureAttributionEvidence, ...] = ()
+    screen_economic_evidence: ScreenEconomicEvidence | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.family, ModelFamily):

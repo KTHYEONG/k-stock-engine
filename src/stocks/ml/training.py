@@ -1251,6 +1251,7 @@ def _build_label_join(data: NetAlphaResearchData, horizon_sessions: int) -> pl.D
             f"horizon {horizon_sessions} label frame is missing required "
             f"columns {missing}"
         )
+    has_gross = "gross_return" in label_frame.columns
     execution_columns = (
         _ID_COLUMN, SESSION_COLUMN, "open", "adtv_20d", "volatility_20d",
     )
@@ -1261,18 +1262,14 @@ def _build_label_join(data: NetAlphaResearchData, horizon_sessions: int) -> pl.D
         raise ValueError(
             f"feature frame is missing late-bound execution columns {missing_exec}"
         )
-    return (
-        data.feature_frame.select(*execution_columns)
-        .join(
-            label_frame.select(*label_columns),
-            on=[_ID_COLUMN, SESSION_COLUMN],
-            how="inner",
-        )
-        .with_columns(
-            (pl.col(RISK_RESIDUAL_COLUMN) - pl.col(REFERENCE_COST_COLUMN))
-            .alias(REALIZED_RETURN_COLUMN)
-        )
+    base = data.feature_frame.select(*execution_columns).join(
+        label_frame.select(*label_columns, *([pl.col("gross_return")] if has_gross else [])),
+        on=[_ID_COLUMN, SESSION_COLUMN],
+        how="inner",
+    ).with_columns(
+        (pl.col(RISK_RESIDUAL_COLUMN) - pl.col(REFERENCE_COST_COLUMN)).alias(REALIZED_RETURN_COLUMN)
     )
+    return base
 
 
 def _record_horizon_discovery(
@@ -1421,14 +1418,14 @@ def _risk_policy_for_profile(
     # Account mode starts with a zero placeholder; replay replaces it with a
     # buffer estimated strictly before each segment cutoff.
     account_lot_settings = SmallAccountLotSizingSettings(
-        enabled=request.account_certification is not None,
+        enabled=getattr(request, "account_certification", None) is not None,
     )
     lot_sizing_cfg = LotSizingConfig(
-        enabled=request.account_certification is not None,
+        enabled=getattr(request, "account_certification", None) is not None,
         entry_price_buffer_bps=(
             float(entry_price_buffer_bps)
             if entry_price_buffer_bps is not None
-            else (0.0 if request.account_certification is not None else None)
+            else (0.0 if getattr(request, "account_certification", None) is not None else None)
         ),
         opening_gap_quantile=account_lot_settings.opening_gap_quantile,
     )
