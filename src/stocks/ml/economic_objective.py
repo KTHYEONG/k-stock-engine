@@ -103,8 +103,10 @@ def project_route_utility(
         if not np.all(np.isfinite(arr)):
             raise InvalidOofEconomicUtilityError("hedged residual must be finite")
         return series
-    # Default unhedged_absolute: prefer gross_return when available, otherwise risk_residual
-    if GROSS_COLUMN in frame.columns:
+    # Unhedged absolute requires gross_return; never silently substitute residual.
+    if kind_str != "hedged_residual":
+        if GROSS_COLUMN not in frame.columns:
+            raise ValueError(f"unhedged_absolute route requires {GROSS_COLUMN!r} column (gross missing)")
         series = frame[GROSS_COLUMN].cast(pl.Float64)
     elif RISK_RESIDUAL_COLUMN in frame.columns:
         series = frame[RISK_RESIDUAL_COLUMN].cast(pl.Float64)
