@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "DIRECT_DATA_EXECUTION_RECORDS",
+      "date": "2026-08-29",
+      "adr_id": "ADR_20260829_DIRECT_DATA_EXECUTION_RECORDS",
+      "domain": "stocks",
+      "title": "Direct ML data readiness and PIT feature fallback",
+      "why": "Feature datasets lack disclosure_date, causing valid direct ML runs to fail integrity audit and produce no_trade before fitting.",
+      "resolution": "Added direct readiness classification, excluded bp_ratio and ep_ratio when disclosure lineage is unavailable, retained causal/execution hard gates, propagated available-column-aware feature contracts, and verified direct ML OOF training.",
+      "impact": "Direct research training can complete with available causal features; unverifiable fundamental features are explicitly warned and excluded. Artifact promotion remains gated by economic replay evidence."
+    },
+    {
       "task_id": "ML_DATA_INTEGRITY_COMPOUNDING",
       "date": "2026-08-29",
       "adr_id": "ADR_20260829_ML_DATA_INTEGRITY_COMPOUNDING",
@@ -989,16 +999,6 @@
       "why": "Latest 81-trial ML runs showed positive Rank-IC and full screen fills but no confirmed economic candidate; finite fold evidence was discarded before pooled recovery and covariance/allocation cash dominated the transfer bottleneck.",
       "resolution": "Registered the compounding-growth-v1 implementation: preserve finite negative fold evidence through three-fold pooling, add causal conservative covariance fallback with parity telemetry, and gate exact final replay on CAGR, stress CAGR, benchmark excess, MDD, Calmar, bootstrap, DSR, and forward holdout.",
       "impact": "Improves diagnosis and avoids avoidable covariance cash without relaxing fail-closed statistical or forward gates; promotion remains disabled unless cost-after-growth and drawdown criteria pass."
-    },
-    {
-      "task_id": "ML_BACKTEST_ECONOMIC_VALIDITY",
-      "date": "2026-08-14",
-      "adr_id": "ADR_20260814_ML_BACKTEST_ECONOMIC_VALIDITY",
-      "domain": "stocks",
-      "title": "ML ranking-to-compounding validity audit",
-      "why": "Rank-IC was positive but promotion failed after economic replay, requiring evidence-based documentation and contract registration.",
-      "resolution": "Registered the diagnostic economic-transfer specification and preserved fail-closed promotion gates; documented ranking, allocation, execution, and compounding bottlenecks.",
-      "impact": "Updates task/code indexes and removes temporary spec/scratch/tmp artifacts after the audit."
     }
   ]
 }
