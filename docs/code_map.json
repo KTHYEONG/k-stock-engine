@@ -235,7 +235,11 @@
     ]
   },
   "src/stocks/data/curation.py": {
-    "testing": "tests/unit/stocks/data/test_curation.py"
+    "testing": [
+      "tests/unit/stocks/data/test_curation.py",
+      "tests/unit/stocks/data/test_research_v2.py"
+    ],
+    "architecture": "docs/specs/ml_data_integrity_compounding.md"
   },
   "src/stocks/data/repositories.py": {
     "testing": "tests/unit/stocks/data/test_repositories.py"
