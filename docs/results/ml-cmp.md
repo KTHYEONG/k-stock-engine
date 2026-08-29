@@ -1,64 +1,137 @@
-# ML 모델 비교 결과
+# ML 모델 비교 결과 (최신 실행)
 
-실행일: 2026-08-28<br>
-실행 모드: `--research-only-model-selection-study`<br>
-초기자본/reference notional: **10,000,000 KRW**<br>
-artifact: `mlcmp_full_report_unbounded`<br>
+실행일: **2026-08-29**
+실행 모드: `--research-only-model-selection-study`
+artifact: `ml-selection-runtime-live` (read-only, publish 안 함)
 snapshot: `research_stock_net_alpha_v1_exec_20260828_10m`
+판정: **채택 모델 없음 (`no-qualified-survivor`)**
 
-## 실행 조건
+## 1. 재현 조건
 
-- 후보 family: 6개 (`elastic_net_v2`, `huber_linear_v1`, `extra_trees_v1`, `hist_gradient_quantile_v1`, `rawnet_lgbm_v2`, `tail_lambdarank_v2`)
-- horizon/lookback: H10 / 1260 sessions
-- rebalance/top-K: 10 sessions / 12
-- purged walk-forward: 3 folds, embargo 5 sessions
-- feature rows: 918,443
-- adjusted bootstrap alpha: `0.002777777778`
-- bootstrap resamples: 360
-- study는 read-only이며 artifact를 publish하지 않음
-
-## 실행 자원 및 단계 결과
-
-| 항목 | 결과 |
+| 항목 | 값 |
 |---|---:|
-| Wall-clock time | 11분 24.83초 |
-| model-selection runtime ledger | 680.67초 |
-| Peak RSS | 5,924,936KB (약 5.65GiB) |
-| Screen fold count | 3 |
-| Screen learner fits | 108 |
-| Attribution predictions | 60 |
-| Full OOF fits | 1 |
-| Replay count | 0 (1회 시도 후 오류) |
-| 최종 상태 | `RESEARCH_ONLY` |
-| 다음 조치 | `no-qualified-survivor` |
+| horizon | H10 |
+| rebalance frequency | 10 sessions |
+| top-K | 12 |
+| training lookback | 1,260 sessions |
+| purged walk-forward folds | 3 |
+| embargo | 5 sessions |
+| bootstrap resamples | 360 |
+| adjusted bootstrap alpha | 0.002777777778 |
+| global wall budget | 900.0초 |
+| screen phase budget | 720.0초 |
+| 후보 family | 6개 |
 
-## Screening 비교
+실행 명령:
 
-`screen_lower_bound`는 비용 차감 후 session log-growth의 bootstrap lower bound이며 CAGR이 아니다. 값이 클수록 screening 단계의 경제적 근거가 강하다.
+```bash
+uv run python src/stocks/cli/train.py --artifact-id ml-selection-runtime-live --snapshot-id research_stock_net_alpha_v1_exec_20260828_10m --mode research --research-only-model-selection-study --candidate-horizon-sessions 10 --candidate-rebalance-frequency-sessions 10 --candidate-top-k 12 --candidate-training-lookback-sessions 1260 --fold-count 3 --embargo-sessions 5 --bootstrap-resamples 360 --model-selection-wall-clock-seconds 900 --model-selection-screen-phase-seconds 720 --model-selection-debug-timing
+```
 
-| 순위 | Family | Screen lower bound | SE | Full OOF | 주요 선택 source group |
-|---:|---|---:|---:|---|---|
-| 1 | `elastic_net_v2` | -0.008468 | 0.001598 | 진입 | `flow_intensity_20d` |
-| 2 | `huber_linear_v1` | -0.010970 | 0.001341 | 미진입 | `flow_consensus` |
-| 3 | `extra_trees_v1` | -0.011387 | 0.001646 | 미진입 | 20개 group 전체 |
-| 4 | `hist_gradient_quantile_v1` | -0.011403 | 0.001077 | 미진입 | 8개 group |
-| 5 | `tail_lambdarank_v2` | -0.011775 | 0.001226 | 미진입 | `bp_ratio` |
-| 6 | `rawnet_lgbm_v2` | -0.012143 | 0.001642 | 미진입 | 15개 group |
+## 2. 데이터 규모 및 결측 현황
 
-Screening에서는 ElasticNet이 가장 높았고, one-SE/상위 family 제한에 따라 ElasticNet만 full OOF 대상으로 승격됐다. 각 family의 source-group attribution은 outer-fold training schema에서 계산됐으며 XGBoost는 독립 후보로 포함하지 않았다.
+| 지표 | 값 |
+|---|---:|
+| feature rows | 918,443 |
+| feature sessions | 2,479 |
+| instruments | 2,297 |
+| canonical feature columns | 29 |
+| H10 label rows | 797,987 |
+| H10 label sessions | 2,479 |
+| label available-after-session 비율 | 1.000000 (100%) |
+| target mean | 0.0876038048 |
+| target std | 2.2982172356 |
+| target positive fraction | 0.4992073806 (49.9207%) |
+| reference cost mean | 0.0043643416 |
 
-## Full OOF 및 replay 결과
+feature 결측률 상위 항목:
 
-ElasticNet에 대해 full OOF fit 1회가 수행됐으나, base/stress execution replay 단계에서 `ValueError`가 발생했다.
+| feature | null fraction |
+|---|---:|
+| `ret_21_60d` | 14.5840% |
+| `vol_regime` | 14.5840% |
+| `volatility_60d` | 14.5840% |
+| `bp_ratio` | 6.4456% |
+| `ep_ratio` | 6.4456% |
 
-- `study_complete`: `false`
-- `selected_family`: `null`
-- `survivors`: `[]`
-- `rejection_reason_counts`: `{ "replay-failed:ValueError": 1 }`
-- base/stress lower CAGR, MDD, fill rate: **산출되지 않음**
+## 3. 실행 자원 및 단계별 시간
 
-따라서 이번 실행은 6개 family의 screening 비교에는 성공했지만, 실제 거래 ledger를 통과한 최종 ML이나 복리자산증식 성과를 확정한 결과는 아니다. ElasticNet을 최종 모델로 채택하려면 replay `ValueError`의 원인을 해결한 뒤 동일 snapshot에서 base/stress ledger를 재실행해야 한다.
+`/usr/bin/time -v`와 study 내부 `runtime_ledger`를 함께 기록했다.
 
-## 판정
+| 지표 | 외부 측정 | 내부 ledger |
+|---|---:|---:|
+| wall-clock | 338.76초 (5분 38.76초) | 334.591986916초 |
+| 측정 차이 (CLI 초기화/정리 등) | 4.168013084초 | - |
+| user CPU | 1,028.35초 | - |
+| system CPU | 26.99초 | - |
+| peak RSS | 4,620,320 KiB | - |
+| peak RSS 환산 | 약 4.41 GiB (약 4.73 GB) | - |
+| screen/cache elapsed | - | 334.591986916초 |
+| screen fold count | - | 3 |
+| screen learner fit count | - | 108 |
+| attribution prediction count | - | 60 |
+| model fit count | - | 18 |
+| full OOF fit count | - | 0 |
+| replay count | - | 0 |
+| processed row count | - | 918,443 |
+| cache hits | - | 3 |
 
-현재 데이터로 확정 가능한 결론은 **screening 1위가 `elastic_net_v2`라는 것뿐**이다. Replay가 실패했으므로 운영 승격, CAGR 비교, 앙상블 채택은 보류한다. 모든 최종 선택은 비용·유동성·체결·MDD 조건을 포함한 full execution ledger가 생성된 경우에만 허용된다.
+이번 실행은 모든 후보가 screen admission에서 탈락했기 때문에 full OOF와 execution replay를 수행하지 않았다. 따라서 338.76초는 screen/cache 단계의 실제 비용이며, 900초 budget을 **561.24초 남겨 두고** 종료했다.
+
+## 4. 모델별 screen 비교
+
+`screen_lower_bound`는 비용을 차감한 session log-growth의 bootstrap lower bound이며 CAGR이 아니다. 최종 채택 기준과 동일하게 경제적 하한이 0보다 커야 full OOF에 진입할 수 있다.
+
+| 순위 | family | lower bound | SE | lower bound + SE | 주요 선택 source group | full OOF |
+|---:|---|---:|---:|---:|---|---|
+| 1 | `elastic_net_v2` | -0.0106266646 | 0.0018385571 | -0.0087881075 | `flow_intensity_20d` | 미진입 |
+| 2 | `huber_linear_v1` | -0.0123344078 | 0.0015930503 | -0.0107413575 | `flow_consensus` | 미진입 |
+| 3 | `hist_gradient_quantile_v1` | -0.0124632129 | 0.0011887430 | -0.0112744699 | `relative_trend_score` | 미진입 |
+| 4 | `rawnet_lgbm_v2` | -0.0125837819 | 0.0019730740 | -0.0106107079 | `ep_ratio`, `bp_ratio`, `flow_intensity_20d`, `disparity_120d`, `vpt_20d`, `ret_21_60d` | 미진입 |
+| 5 | `extra_trees_v1` | -0.0132277176 | 0.0019416342 | -0.0112860835 | 20개 source group | 미진입 |
+| 6 | `tail_lambdarank_v2` | -0.0132415453 | 0.0013347960 | -0.0119067494 | `bp_ratio` | 미진입 |
+
+핵심 수치:
+
+- 최선 후보는 ElasticNet이지만 lower bound가 **-0.0106266646**이다.
+- 최선 후보도 0 기준보다 **0.0106266646** 낮다.
+- 6개 모두 `screen_lower_bound <= 0`이며, 6개 전부 `screen-non-positive-lower-bound`로 기록됐다.
+- screen 단계에서 양수 lower bound 후보가 0개이므로 one-SE 비교 및 full OOF 승격 대상도 0개다.
+
+## 5. 최종 결과 JSON 판정
+
+```json
+{
+  "status": "RESEARCH_ONLY",
+  "study_complete": true,
+  "next_action": "no-qualified-survivor",
+  "selected_family": null,
+  "survivors": [],
+  "rejection_reason_counts": {
+    "screen-non-positive-lower-bound": 6
+  },
+  "oof_fit_count": 0,
+  "replay_count": 0,
+  "elapsed_seconds": 334.591986916,
+  "deadline_seconds": 900.0
+}
+```
+
+이는 실행 실패나 budget 초과가 아니다. 현재 snapshot의 비용 반영 경제 증거가 양수인 family가 없어서, 추가 full OOF/replay를 수행하지 않고 fail-closed로 종료한 결과다. 따라서 운영 모델 채택, CAGR 확정, 앙상블 구성은 모두 보류한다.
+
+## 6. 이전 900초 초과 원인과 최신 실행에서의 변화
+
+이전 동일 계열 실행은 총 **961.132초**, ElasticNet full OOF **453.539초**, replay **3.466초**로 900초를 **61.132초** 초과했다. 당시에는 음수 screen 후보가 full OOF로 승격됐고, OOF 내부 deadline 경계가 부족했다.
+
+이번 실행에서는 `screen_lower_bound > 0` admission gate가 먼저 적용돼:
+
+1. 음수 경제 증거 6개를 full OOF로 승격하지 않음
+2. `oof_fit_count=0`, `replay_count=0`
+3. screen/cache 334.592초에서 종료
+4. 외부 wall-clock 338.76초로 900초 이내 완료
+
+따라서 최신 결과에서 확인되는 결론은 **“ElasticNet이 1위”가 아니라 “ElasticNet을 포함한 모든 후보가 경제적 채택 하한을 충족하지 못함”**이다.
+
+## 7. 원본 산출물 보존 정책
+
+실행 직후 JSON·stderr·snapshot 분석 스크립트로 수치를 검증했다. `sync` 절차에 따라 임시 `scratch/` 산출물은 삭제했으며, 필요한 수치와 실행 조건은 이 문서에 고정 보존했다.

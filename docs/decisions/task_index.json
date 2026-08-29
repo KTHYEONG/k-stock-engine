@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ML_SELECTION_RUNTIME_ADMISSION",
+      "date": "2026-08-29",
+      "adr_id": "ADR_20260829_ML_SELECTION_RUNTIME_ADMISSION",
+      "domain": "signal",
+      "title": "ML selection admission and runtime evidence",
+      "why": "The latest immutable-snapshot comparison previously exceeded the 900-second wall budget and could not distinguish economic rejection from incomplete execution.",
+      "resolution": "Recorded the latest screen-only comparison in docs/results/ml-cmp.md and synchronized the fail-closed admission/runtime diagnostics decision.",
+      "impact": "Current comparison completes without full OOF/replay when all six screen lower bounds are non-positive; no model is promoted."
+    },
+    {
       "task_id": "TASK_ML_COMPARISON_DIAGNOSTICS",
       "date": "2026-08-29",
       "adr_id": "ADR_20260829_ML_COMPARISON_DIAGNOSTICS",
@@ -989,16 +999,6 @@
       "why": "The v4 reference run showed proxy economic lower bounds turning negative under exact replay, with high turnover and cost drag despite honest global multiplicity.",
       "resolution": "Added a canonical execution-matched replay kernel, causal costed hold/replace labels, stateful proxy tests, and v5 selection contracts while preserving costs, fills, settlement, thresholds, multiplicity, and NO_TRADE semantics.",
       "impact": "Candidate selection is aligned with executable portfolio-state outcomes; the implementation can reject proxy sign flips before promotion and records the v5 architecture for future research runs."
-    },
-    {
-      "task_id": "BACKTEST_ROBUSTNESS_OVERHAUL",
-      "date": "2026-08-13",
-      "adr_id": "ADR_20260813_BACKTEST_ROBUSTNESS_OVERHAUL",
-      "domain": "signal",
-      "title": "Backtest Robustness Overhaul v4",
-      "why": "Replace Rank-IC-first selection with cost-aware multi-fold stability screening and correct missing-value/recency handling.",
-      "resolution": "Implemented rank-stationary predictors, native missing-row retention, newest-anchored weights, three-fold economic proxy screening, global multiplicity 81, single-policy replay, active-IR Gate 3, and recorded the completed reference run as fail-closed NO_TRADE.",
-      "impact": "Selection is more conservative and economically aligned; reference snapshot completed within the RSS budget but produced no promotable candidate."
     }
   ]
 }
