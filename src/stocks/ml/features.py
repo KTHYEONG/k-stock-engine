@@ -545,6 +545,7 @@ class ResearchFeatureSchema:
     winsor_bounds: tuple[tuple[str, float, float], ...]
     robust_location_scale: tuple[tuple[str, float, float], ...]
     fingerprint: str
+    imputation_values: tuple[tuple[str, float], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.source_groups:
@@ -555,13 +556,24 @@ class ResearchFeatureSchema:
             raise ValueError("winsor_bounds must align with source_groups")
         if len(self.robust_location_scale) != len(self.source_groups):
             raise ValueError("robust_location_scale must align with source_groups")
+        # imputation_values may be empty during intermediate construction before hashing
         # fingerprint may be empty during intermediate construction before hashing
+        if self.imputation_values:
+            if len(self.imputation_values) != len(self.source_groups):
+                raise ValueError("imputation_values must align with source_groups")
+            names = {n for n, _ in self.imputation_values}
+            if len(names) != len(self.imputation_values):
+                raise ValueError("imputation_values must have unique source names")
+            group_names = {n for n, _ in self.source_groups}
+            if names != group_names:
+                raise ValueError("imputation_values names must match source_groups")
 
     def to_json(self) -> dict[str, object]:
         return {
             "source_groups": [[k, list(v)] for k, v in self.source_groups],
             "winsor_bounds": [list(t) for t in self.winsor_bounds],
             "robust_location_scale": [list(t) for t in self.robust_location_scale],
+            "imputation_values": [list(t) for t in self.imputation_values],
             "fingerprint": self.fingerprint,
         }
 
@@ -613,6 +625,12 @@ def fit_research_feature_schema(
                 scale = 1.0
         winsor_bounds.append((src, float(lo), float(hi)))
         robust.append((src, float(med), float(scale)))
+    # imputation median per source (train-only)
+    imputation_values: list[tuple[str, float]] = []
+    for src in representative:
+        vals = [float(v) for v in train[src].to_list() if v is not None and isinstance(v, (int, float)) and __import__("math").isfinite(float(v))]
+        median_val = 0.0 if not vals else float(np.median(np.asarray(vals, dtype=np.float64)))
+        imputation_values.append((src, float(median_val)))
     # missing indicator set
     missing_sources = tuple(
         s for s in representative if int(train[s].is_null().sum()) > 0 and int(train[s].is_not_null().sum()) > 0
@@ -625,10 +643,27 @@ def fit_research_feature_schema(
             cols.append(f"{src}__missing")
         cols.append(f"{src}__robust")
         source_groups.append((src, tuple(cols)))
+    # linear-only interaction features: fold-local rank products, source-grouped, fingerprinted, unavailable if either source absent
+    # flow_intensity_20d x vol_regime and flow_consensus x relative_trend_score (only when both sources in representative)
+    interaction_pairs = [("flow_intensity_20d", "vol_regime"), ("flow_consensus", "relative_trend_score")]
+    for a, b in interaction_pairs:
+        if a in representative and b in representative:
+            name = f"{a}_x_{b}"
+            # single derived column: rank product
+            interaction_cols: tuple[str, ...] = (f"{name}__rank_product",)
+            source_groups.append((name, interaction_cols))
+            # winsor/robust placeholders for interaction: use rank product stats (0-1 range)
+            # imputation for interaction is product of medians? but we finger print median rank product (0.25) as placeholder
+            # For consistency, add dummy winsor/robust/imputation entries aligned to source_groups order
+            # Use neutral bounds/scales
+            winsor_bounds.append((name, 0.0, 1.0))
+            robust.append((name, 0.25, 0.2))
+            imputation_values.append((name, 0.25))
     tmp = ResearchFeatureSchema(
         source_groups=tuple(source_groups),
         winsor_bounds=tuple(winsor_bounds),
         robust_location_scale=tuple(robust),
+        imputation_values=tuple(imputation_values),
         fingerprint="",
     )
     fp = _research_schema_fingerprint(tmp)
@@ -636,6 +671,7 @@ def fit_research_feature_schema(
         source_groups=tuple(source_groups),
         winsor_bounds=tuple(winsor_bounds),
         robust_location_scale=tuple(robust),
+        imputation_values=tuple(imputation_values),
         fingerprint=fp,
     )
 
@@ -649,68 +685,99 @@ def apply_research_feature_schema(
         raise ValueError(f"frame must carry {session_column!r}")
     if sector_column not in frame.columns:
         frame = frame.with_columns(pl.lit("dummy").alias(sector_column))
-    # verify schema sources present
+    # verify schema sources present - interaction groups are derived, not required as input columns
+    # Only check base sources (those with winsor/robust) that are not interaction products
     source_names = [name for name, _ in schema.source_groups]
-    missing = [c for c in source_names if c not in frame.columns]
+    input_source_names = [n for n in source_names if "_x_" not in n]
+    # For interactions, ensure constituents exist
+    for grp_name, _ in schema.source_groups:
+        if "_x_" in grp_name:
+            a, b = grp_name.split("_x_")
+            if a not in frame.columns or b not in frame.columns:
+                raise ValueError(f"v3 feature sources missing from frame: {grp_name} requires {a!r} and {b!r}")
+    missing = [c for c in input_source_names if c not in frame.columns]
     if missing:
         raise ValueError(f"v3 feature sources missing from frame: {missing}")
-    _reject_target_columns(frame, tuple(source_names))
-    for column in source_names:
+    _reject_target_columns(frame, tuple(input_source_names))
+    for column in input_source_names:
         non_finite = frame.filter(pl.col(column).is_not_null() & ~pl.col(column).is_finite())
         if not non_finite.is_empty():
             raise ValueError(f"non-finite value in v3 feature source {column}")
+    # impute missing values using train-only median BEFORE any derived numeric feature
+    # capture original missing indicator before imputation so 0/1 indicator is correct
+    missing_indicator_sources = {src for src, cols in schema.source_groups if f"{src}__missing" in cols}
+    out = frame
+    for src in missing_indicator_sources:
+        if src in input_source_names:
+            out = out.with_columns(pl.when(pl.col(src).is_null()).then(1.0).otherwise(0.0).cast(pl.Float32).alias(f"__missing_{src}"))
+    impute_map = {src: float(v) for src, v in schema.imputation_values} if schema.imputation_values else {}
+    for src in input_source_names:
+        if src in impute_map:
+            median_val = float(impute_map[src])
+            out = out.with_columns(pl.col(src).fill_null(median_val).alias(src))
+        # also fill any remaining nulls? already filled; ensure derived will be finite
     # build lookup maps
     winsor_map = {src: (lo, hi) for src, lo, hi in schema.winsor_bounds}
     robust_map = {src: (loc, scale) for src, loc, scale in schema.robust_location_scale}
-    # step 1: winsorized columns
-    out = frame
-    for src in source_names:
-        lo, hi = winsor_map[src]
+    # step 1: winsorized columns (for base sources only; interactions use rank product directly)
+    for src in input_source_names:
+        lo, hi = winsor_map.get(src, (-1e12, 1e12))
         out = out.with_columns(pl.col(src).clip(lo, hi).alias(f"__winsor_{src}"))
-    # step 2: ranks within session from winsorized values
+    # step 2: ranks within session from winsorized values (base sources only)
     rank_exprs: list[pl.Expr] = []
-    for src in source_names:
+    for src in input_source_names:
         within = pl.col(f"__winsor_{src}").count().over(session_column)
         rank = (pl.col(f"__winsor_{src}").rank("average").over(session_column) - 1.0) / (within - 1.0)
         rank_exprs.append(rank.fill_null(0.5).cast(pl.Float32).alias(f"__rank_{src}"))
     out = out.with_columns(rank_exprs)
-    # step 3: sector ranks
+    # step 2b: interaction rank products (fold-local)
+    for grp_name, _ in schema.source_groups:
+        if "_x_" in grp_name:
+            a, b = grp_name.split("_x_")
+            out = out.with_columns((pl.col(f"__rank_{a}") * pl.col(f"__rank_{b}")).cast(pl.Float32).alias(f"__rank_product_{grp_name}"))
+    # step 3: sector ranks (base only)
     sector_exprs: list[pl.Expr] = []
-    for src in source_names:
+    for src in input_source_names:
         sector_mean = pl.col(f"__rank_{src}").mean().over([session_column, sector_column])
         sector_exprs.append(((pl.col(f"__rank_{src}") - sector_mean).cast(pl.Float32)).alias(f"__sector_rank_{src}"))
     out = out.with_columns(sector_exprs)
-    # step 4: robust standardized winsor
+    # step 4: robust standardized winsor (base only)
     robust_exprs: list[pl.Expr] = []
-    for src in source_names:
-        loc, scale = robust_map[src]
+    for src in input_source_names:
+        loc, scale = robust_map.get(src, (0.0, 1.0))
         robust_exprs.append(((pl.col(f"__winsor_{src}") - loc) / scale).cast(pl.Float32).alias(f"__robust_{src}"))
     out = out.with_columns(robust_exprs)
     # final selection: keep original non-source cols plus derived per source_groups
     keep_cols: list[pl.Expr] = []
     for col in out.columns:
-        if col.startswith("__winsor_") or col.startswith("__rank_") or col.startswith("__sector_rank_") or col.startswith("__robust_"):
+        if col.startswith("__winsor_") or col.startswith("__rank_") or col.startswith("__rank_product_") or col.startswith("__sector_rank_") or col.startswith("__robust_") or col.startswith("__missing_"):
             continue
         if col in source_names:
             continue
         keep_cols.append(pl.col(col))
     for src, cols in schema.source_groups:
         # cols contains expected derived names like src__winsor etc.
-        # map internal temp names to expected output names
+        if "_x_" in src:
+            # interaction rank product
+            mapping = {
+                f"{src}__rank_product": f"__rank_product_{src}",
+            }
+            for out_name in cols:
+                tmp_name = mapping.get(out_name)
+                if tmp_name is not None:
+                    keep_cols.append(pl.col(tmp_name).alias(out_name))
+            continue
         mapping = {
             f"{src}__winsor": f"__winsor_{src}",
             f"{src}__rank": f"__rank_{src}",
             f"{src}__sector_rank": f"__sector_rank_{src}",
             f"{src}__robust": f"__robust_{src}",
-            f"{src}__missing": None,
+            f"{src}__missing": f"__missing_{src}",
         }
         for out_name in cols:
-            if out_name == f"{src}__missing":
-                keep_cols.append(pl.when(pl.col(src).is_null()).then(1.0).otherwise(0.0).cast(pl.Float32).alias(out_name))
-            else:
-                tmp_name = mapping.get(out_name)
-                if tmp_name is not None:
-                    keep_cols.append(pl.col(tmp_name).alias(out_name))
+            tmp_name = mapping.get(out_name)
+            if tmp_name is not None:
+                keep_cols.append(pl.col(tmp_name).alias(out_name))
     return out.select(keep_cols)
 
 
