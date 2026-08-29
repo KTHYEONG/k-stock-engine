@@ -18,6 +18,7 @@ from pathlib import Path
 
 from src.core.paths import DATA_ROOT, STOCK_CATALOG_ROOT
 from src.stocks.data.catalog import (
+    ActiveDatasetPolicy,
     CatalogKind,
     CatalogStore,
     RetentionRegistry,
@@ -43,6 +44,9 @@ def main(args: list[str] | None = None) -> int:
     readiness.add_argument("--dataset-dir", required=True, type=Path)
     readiness.add_argument("--feature", required=True, action="append")
     sub.add_parser("retention-dry-run", help="list GC candidates without changing files")
+    sub.add_parser("audit", help="report registered catalog paths missing on disk")
+    active = sub.add_parser("set-active", help="write the explicit active dataset policy")
+    active.add_argument("--entry", required=True, action="append", metavar="KIND:NAME")
     inventory = sub.add_parser(
         "inventory",
         help="classify every file under the data root (read-only, no apply)",
@@ -61,6 +65,10 @@ def main(args: list[str] | None = None) -> int:
         return _validate_readiness(parsed.dataset_dir, tuple(parsed.feature))
     if parsed.command == "inventory":
         return _inventory(store, parsed.data_root, parsed.format)
+    if parsed.command == "audit":
+        return _audit(store)
+    if parsed.command == "set-active":
+        return _set_active(store, tuple(parsed.entry))
     return _retention_dry_run(store)
 
 
@@ -103,6 +111,34 @@ def _retention_dry_run(store: CatalogStore) -> int:
         return 0
     for candidate in candidates:
         sys.stdout.write(f"{candidate.kind.value}\t{candidate.name}\t{candidate.reason}\n")
+    return 0
+
+
+def _audit(store: CatalogStore) -> int:
+    """Report stale catalog paths without changing data or catalog state."""
+    missing = store.missing_entries()
+    if not missing:
+        sys.stdout.write("catalog audit: OK\n")
+        return 0
+    for entry in missing:
+        sys.stdout.write(f"missing\t{entry.kind.value}\t{entry.name}\t{entry.path}\n")
+    sys.stdout.write(f"catalog audit: {len(missing)} missing path(s)\n")
+    return 1
+
+
+def _set_active(store: CatalogStore, raw_entries: tuple[str, ...]) -> int:
+    """Persist active versions after validating their ``kind:name`` syntax."""
+    entries: list[tuple[CatalogKind, str]] = []
+    try:
+        for raw in raw_entries:
+            kind_text, name = raw.split(":", 1)
+            entries.append((CatalogKind(kind_text), name))
+        policy = ActiveDatasetPolicy(tuple(entries))
+        store.save_active_policy(policy)
+    except (ValueError, TypeError) as exc:
+        sys.stdout.write(f"active policy failed: {exc}\n")
+        return 1
+    sys.stdout.write(f"active policy saved: {len(policy.entries)} entrie(s)\n")
     return 0
 
 

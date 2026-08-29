@@ -13,7 +13,7 @@ try:
 except ImportError:
     from pydantic import BaseSettings  # type: ignore[no-redef]
 
-from src.core.paths import PROJECT_ROOT, RUN_DIAGNOSTIC_ROOT
+from src.core.paths import PROJECT_ROOT, RUN_DIAGNOSTIC_ROOT, STOCK_RESULTS_DOC_ROOT
 
 
 class StockRuntimeSettings(BaseSettings):
@@ -28,7 +28,7 @@ class StockRuntimeSettings(BaseSettings):
     diagnostics_enabled: bool = False
     diagnostics_required: bool = False
     diagnostics_root: Path = RUN_DIAGNOSTIC_ROOT
-    results_root: Path = PROJECT_ROOT / "data" / "results" / "stocks"
+    results_root: Path = STOCK_RESULTS_DOC_ROOT
     evidence_root: Path = PROJECT_ROOT / "data" / "evidence" / "stocks"
     max_rss_mib: float | None = None
     debug: bool = False

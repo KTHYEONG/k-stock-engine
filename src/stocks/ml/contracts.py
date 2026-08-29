@@ -1403,7 +1403,9 @@ class ModelSelectionComputeBudget:
         if not math.isfinite(float(self.screen_phase_seconds)) or float(self.screen_phase_seconds) <= 0:
             raise ValueError("screen_phase_seconds must be finite positive")
         if float(self.screen_phase_seconds) > float(self.wall_clock_seconds):
-            raise ValueError("screen_phase_seconds cannot exceed wall_clock_seconds")
+            # Keep the default screen usable for short benchmark budgets while
+            # enforcing the invariant that screen work fits the wall budget.
+            object.__setattr__(self, "screen_phase_seconds", float(self.wall_clock_seconds))
         if self.screen_train_rows_per_fold < 1:
             raise ValueError("screen_train_rows_per_fold must be positive")
         if self.screen_validation_rows_per_fold < 1:
