@@ -2811,6 +2811,9 @@ def screen_model_family(cache: ScreeningFoldCache, *args, **kwargs) -> FamilyScr
             else:
                 raise ValueError("request required for new screen path")
         except Exception as exc:
+            # Unknown exceptions propagate distinctly; only declared rejections map to diagnostic
+            if isinstance(exc, RuntimeError):
+                raise
             # Map to diagnostic without extra fits
             scores = tuple((name, 0.0) for name, _ in cache.source_group_columns)
             attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
