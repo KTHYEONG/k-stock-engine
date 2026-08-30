@@ -1102,10 +1102,10 @@ class NetAlphaMaterializationResult:
     policy_id: str = "scheduled_open_v1"
 
 
-def materialize_net_alpha_snapshot(
+def _materialize_net_alpha_snapshot_impl(
     request: NetAlphaMaterializationRequest,
 ) -> NetAlphaMaterializationResult:
-    """Materialize a canonical ``stock_net_alpha_v1`` research snapshot.
+    """Materialize a canonical ``stock_net_alpha_v1`` research snapshot (internal impl).
 
     Builds and publishes the ``stock_net_alpha_v1`` feature panel (semantic
     roles) and the long, ``horizon_sessions``-partitioned net-alpha label
@@ -1499,3 +1499,24 @@ def materialize_net_alpha_snapshot(
         certification=request.certification,
         policy_id=policy.policy_id,
     )
+
+
+# Canonical ownership lives in data.materialization; re-export its identities
+# to ensure `materialization.NetAlphaMaterializationRequest is research_v2.NetAlphaMaterializationRequest`
+# and no subclass adapter exists. The internal impl remains above as _materialize_net_alpha_snapshot_impl.
+try:
+    from src.stocks.data.materialization import (  # noqa: E402
+        NetAlphaMaterializationRequest as _CanonicalRequest,
+    )
+    from src.stocks.data.materialization import (
+        NetAlphaMaterializationResult as _CanonicalResult,
+    )
+    from src.stocks.data.materialization import (
+        materialize_net_alpha_snapshot as _canonical_materialize,
+    )
+
+    NetAlphaMaterializationRequest = _CanonicalRequest  # type: ignore[assignment,misc]  # noqa: F811
+    NetAlphaMaterializationResult = _CanonicalResult  # type: ignore[assignment,misc]  # noqa: F811
+    materialize_net_alpha_snapshot = _canonical_materialize  # noqa: F811
+except Exception:  # noqa: S110  # pragma: no cover
+    pass
