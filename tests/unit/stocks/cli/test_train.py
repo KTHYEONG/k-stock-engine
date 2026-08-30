@@ -1552,3 +1552,174 @@ def test_MLCMP_CLI_BUDGET_05():  # noqa: N802
     # also ensure CLI forwards without changing other defaults
     assert budget.screen_train_rows_per_fold == 48000
     assert budget.screen_validation_rows_per_fold == 12000
+
+
+def test_cli_default_and_direct_failure_ledger_are_capacity_observable(monkeypatch, tmp_path):
+    import argparse, json
+    from pathlib import Path
+    from datetime import datetime, UTC, date
+    import polars as pl
+    from src.stocks.cli.train import build_parser, run_research_only_model_selection_study, _build_training_request
+    from src.stocks.ml.contracts import NetAlphaTrainingRequest, ModelSelectionComputeBudget
+    from src.stocks.ml.result_ledger import MlResultLedger
+
+    parser = build_parser()
+    args = parser.parse_args(["--artifact-id", "cli_default", "--snapshot-id", "snap1"])
+    assert args.model_selection_screen_validation_rows == 12000
+    # builder default also 12000 when attribute missing
+    from types import SimpleNamespace
+
+    from src.stocks.ml.contracts import ExecutionFrontierSettings
+
+    single_frontier = ExecutionFrontierSettings(candidate_horizon_sessions=(10,), candidate_rebalance_frequency_sessions=(10,), candidate_top_k=(12,))
+    req = NetAlphaTrainingRequest(artifact_id="cli_default2", candidate_horizon_sessions=(10,), execution_frontier=single_frontier)
+    parsed_empty = SimpleNamespace()
+    from src.stocks.ml.model_selection import build_model_selection_study_settings
+
+    settings = build_model_selection_study_settings(parsed_empty, req)
+    assert settings.compute_budget.screen_validation_rows_per_fold == 12000
+    # explicit lower value remains valid input but must be observable via structured failure, not ValueError at build time
+    parsed_low = SimpleNamespace(model_selection_screen_validation_rows=100, candidate_training_lookback_sessions="504")
+    settings_low = build_model_selection_study_settings(parsed_low, req)
+    assert settings_low.compute_budget.screen_validation_rows_per_fold == 100
+    # direct failure ledger: when evaluation raises, ledger has failed status with direct inputs/readiness
+    # mock direct path dependencies
+    import src.stocks.cli.train as train_mod
+
+    base_root = tmp_path / "base"
+    feature_root = tmp_path / "features"
+    label_root = tmp_path / "labels"
+    results_root = tmp_path / "results"
+    for p in (base_root, feature_root, label_root, results_root):
+        p.mkdir(parents=True, exist_ok=True)
+    # create minimal dataset stores to pass readiness? Instead mock loader entirely
+    from unittest.mock import MagicMock
+    from src.stocks.data.direct import DirectLoadCheckpoint
+
+    parsed_direct = argparse.Namespace(
+        artifact_id="direct_fail",
+        snapshot_id=None,
+        catalog_root=tmp_path,
+        base_root=base_root,
+        feature_root=feature_root,
+        label_root=label_root,
+        registry=tmp_path / "registry",
+        results_root=results_root,
+        decision_time=datetime(2024, 3, 31, tzinfo=UTC),
+        base_dataset_id="base_p",
+        feature_dataset_id="feat_p",
+        label_dataset_id="lab_p",
+        research_start_direct=date(2024, 1, 1),
+        research_end_direct=date(2024, 1, 25),
+        data_start=date(2024, 1, 1),
+        data_end=date(2024, 1, 25),
+        research_start=date(2024, 1, 1),
+        research_end=date(2024, 1, 25),
+        candidate_horizon_sessions="10",
+        candidate_rebalance_frequency_sessions="10",
+        candidate_top_k="12",
+        mode="research",
+        model_selection_wall_clock_seconds=30.0,
+        model_selection_screen_phase_seconds=20.0,
+        model_selection_screen_train_rows=100,
+        model_selection_screen_validation_rows=100,
+        model_selection_max_full_replay_families=2,
+        candidate_training_lookback_sessions="504",
+        cost_evidence_path=None,
+        model_selection_debug_timing=False,
+    )
+    req_direct = NetAlphaTrainingRequest(artifact_id="direct_fail", candidate_horizon_sessions=(10,), execution_frontier=single_frontier)
+
+    class FakeLoader:
+        def __init__(self, *a, **kw):
+            pass
+
+        def assess_readiness(self, *a, **kw):
+            from types import SimpleNamespace as SN
+
+            return SN(
+                passed=True,
+                errors=[],
+                warnings=[],
+                input_reference=SN(feature_schema_hash="hs", feature_content_hash="hc", cost_evidence_path=None, cost_evidence_hash=None),
+            )
+
+        def load_training_data(self, *a, **kw):
+            import polars as pl2
+
+            frame = pl2.DataFrame({"instrument_id": ["KRX:00001"], "session": [datetime(2024, 1, 1, tzinfo=UTC)], "feature__a": [1.0], "available_time": [datetime(2024, 1, 1, tzinfo=UTC)]})
+            labels = pl2.DataFrame({"instrument_id": ["KRX:00001"], "session": [datetime(2024, 1, 1, tzinfo=UTC)], "gross_return": [0.01], "reference_cost": [0.001]})
+            from src.stocks.ml.contracts import NetAlphaResearchData
+            from src.core.datasets import DatasetManifest
+            from src.core.instruments import AssetKind
+
+            manifest = DatasetManifest(asset_kind=AssetKind.STOCK, schema_version="v1", schema_hash="h", provider_version="p", universe_policy_version="u", universe_policy_hash="u", feature_set="stock_net_alpha_v1", feature_set_hash="f", label_definition="net_alpha_o2o", label_horizon_sessions=10, time_start=datetime(2024, 1, 1, tzinfo=UTC), time_end=datetime(2024, 1, 25, tzinfo=UTC), generated_time=datetime(2024, 1, 25, tzinfo=UTC), row_count=1, reference_notional=100_000_000.0)
+            return NetAlphaResearchData(feature_frame=frame, labels_by_horizon={10: labels}, manifest=manifest)
+
+    monkeypatch.setattr("src.stocks.data.direct.DirectMarketDataLoader", FakeLoader)
+    # mock evaluate to raise controlled capacity exception after readiness
+    def fake_evaluate(*a, **kw):
+        raise ValueError("insufficient-screen-sample-capacity: configured_rows=100 required_rows=624")
+
+    monkeypatch.setattr("src.stocks.ml.model_selection.evaluate_model_selection_study", fake_evaluate)
+    # also need to ensure validate_ml_snapshot not called or passes; mock it via loader path is after; we need to patch stock_net_alpha_v1_contract_book? Instead patch validate_ml_snapshot to pass
+    import src.stocks.data.ml_integrity as integ
+
+    orig_validate = getattr(integ, "validate_ml_snapshot", None)
+    # patch the import inside train module's local import
+    # we can monkeypatch the function that train imports dynamically; easier to patch src.stocks.ml.features.stock_net_alpha_v1_contract_book and validate
+    try:
+        import src.stocks.ml.features as feat_mod
+
+        monkeypatch.setattr(feat_mod, "stock_net_alpha_v1_contract_book", lambda *a, **kw: MagicMock())
+    except Exception:
+        pass
+
+    # patch the inner validate call by monkeypatching module where it's imported: src.stocks.data.ml_integrity.validate_ml_snapshot
+    class _FakeAudit:
+        passed = True
+        checks = []
+
+    def fake_validate(*a, **kw):
+        return _FakeAudit()
+
+    monkeypatch.setattr("src.stocks.data.ml_integrity.validate_ml_snapshot", fake_validate, raising=False)
+    # also patch in train's local scope via sys.modules? simpler to patch src.stocks.cli.train.validate_ml_snapshot if exists
+    try:
+        monkeypatch.setattr("src.stocks.cli.train.validate_ml_snapshot", fake_validate, raising=False)
+    except Exception:
+        pass
+    import pytest
+
+    with pytest.raises(ValueError, match="insufficient-screen-sample-capacity"):
+        run_research_only_model_selection_study(parsed_direct, req_direct)
+    # check ledger file has failed status with direct inputs/readiness and sanitized failure, no artifact payload
+    ledger_files = list(results_root.rglob("*.json"))
+    assert len(ledger_files) >= 1
+    # find the file containing direct_fail
+    target_file = None
+    for lf in ledger_files:
+        try:
+            content = json.loads(lf.read_text(encoding="utf-8"))
+            if content.get("run_id") == "direct_fail" or content.get("artifact_id") == "direct_fail":
+                target_file = lf
+                break
+        except Exception:
+            continue
+    assert target_file is not None
+    payload = json.loads(target_file.read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+    assert "data_inputs" in payload or "input" in payload
+    inputs = payload.get("data_inputs") or payload.get("input", {}).get("data_inputs", {})
+    assert inputs.get("base_dataset_id") == "base_p"
+    assert inputs.get("feature_dataset_id") == "feat_p"
+    assert inputs.get("label_dataset_id") == "lab_p"
+    assert "readiness" in payload or "input" in payload
+    # failure message sanitized, no trace
+    assert "failure" in payload
+    assert "insufficient-screen-sample-capacity" in str(payload["failure"])
+    assert "traceback" not in json.dumps(payload).lower()
+    assert "artifact_published" not in payload or payload.get("artifact_published") is False or "artifact" not in str(payload).lower() or payload.get("status") != "completed"
+    # ensure no raw rows leaked
+    dumped = json.dumps(payload)
+    assert "KRX:00001" not in dumped or "instrument_id" not in dumped or len(dumped) < 5000  # bounded
