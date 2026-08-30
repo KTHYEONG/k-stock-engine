@@ -22,6 +22,7 @@ from src.stocks.ml.contracts import NetAlphaResearchData, NetAlphaTrainingData
 from src.stocks.ml.features import FeatureTransformSchema
 from src.stocks.ml.labels import (
     AVAILABLE_COLUMN,
+    GROSS_COLUMN,
     REFERENCE_COST_COLUMN,
     RISK_RESIDUAL_COLUMN,
     SESSION_COLUMN,
@@ -238,6 +239,7 @@ class PreparedHorizonLabels:
     available_time_ns: np.ndarray
     risk_residual: np.ndarray
     reference_cost: np.ndarray
+    gross_return: np.ndarray
 
     def train_positions(self, train_rows: np.ndarray) -> np.ndarray:
         """Positions of labeled rows inside a sorted candidate row array."""
@@ -248,6 +250,8 @@ def prepare_horizon_labels(
     matrix: PreparedTrainingMatrix,
     data: NetAlphaResearchData,
     horizon_sessions: int,
+    *,
+    route_objective: object | None = None,
 ) -> PreparedHorizonLabels:
     """Align one horizon's narrow labels onto matrix rows fail-closed.
 
@@ -317,24 +321,72 @@ def prepare_horizon_labels(
 
     order = np.argsort(rows, kind="stable")
     rows_sorted = rows[order].astype(np.int64)
-    target = (
-        label_frame[TARGET_COLUMN].to_numpy().astype(np.float64)[order]
-    )
     available_ns = (
         label_frame[AVAILABLE_COLUMN].to_physical().to_numpy().astype(np.int64)
     )[order] * 1_000
-    if RISK_RESIDUAL_COLUMN in label_frame.columns and (
-        REFERENCE_COST_COLUMN in label_frame.columns
-    ):
-        residual = label_frame[RISK_RESIDUAL_COLUMN].to_numpy().astype(np.float64)
-        cost = label_frame[REFERENCE_COST_COLUMN].to_numpy().astype(np.float64)
-        realized = (residual - cost)[order]
-        risk_residual = residual[order]
-        reference_cost = cost[order]
+
+    # Determine route kind if supplied
+    route_kind = None
+    if route_objective is not None:
+        kind_val = getattr(route_objective, "kind", route_objective)
+        route_kind = str(getattr(kind_val, "value", kind_val)).lower()
+
+    # Gross column handling
+    if GROSS_COLUMN in label_frame.columns:
+        gross_raw = label_frame[GROSS_COLUMN].to_numpy().astype(np.float64)[order]
     else:
-        realized = np.full(rows_sorted.size, np.nan, dtype=np.float64)
-        risk_residual = np.full(rows_sorted.size, np.nan, dtype=np.float64)
-        reference_cost = np.full(rows_sorted.size, np.nan, dtype=np.float64)
+        gross_raw = np.full(rows_sorted.size, np.nan, dtype=np.float64)
+
+    if route_kind is not None and "unhedged" in route_kind:
+        if GROSS_COLUMN not in label_frame.columns:
+            raise ValueError(f"unhedged_absolute route requires {GROSS_COLUMN!r} column (gross missing)")
+        # validate gross and reference_cost present and finite
+        if REFERENCE_COST_COLUMN not in label_frame.columns:
+            raise ValueError(f"unhedged route missing {REFERENCE_COST_COLUMN!r}")
+        gross_series = label_frame[GROSS_COLUMN]
+        cost_series = label_frame[REFERENCE_COST_COLUMN]
+        if gross_series.null_count() > 0 or cost_series.null_count() > 0:
+            raise ValueError("gross_return/reference_cost has null rows")
+        gross_arr = gross_series.to_numpy().astype(np.float64)
+        cost_arr = cost_series.to_numpy().astype(np.float64)
+        if not np.all(np.isfinite(gross_arr)) or not np.all(np.isfinite(cost_arr)):
+            raise ValueError("gross_return/reference_cost must be finite")
+        if np.any(cost_arr < 0):
+            raise ValueError("reference_cost must be non-negative")
+        # project target/realized to gross - cost
+        gross = label_frame[GROSS_COLUMN].to_numpy().astype(np.float64)
+        cost = label_frame[REFERENCE_COST_COLUMN].to_numpy().astype(np.float64)
+        target = (gross - cost)[order]
+        realized = (gross - cost)[order]
+        risk_residual = label_frame[RISK_RESIDUAL_COLUMN].to_numpy().astype(np.float64)[order] if RISK_RESIDUAL_COLUMN in label_frame.columns else np.full(rows_sorted.size, np.nan)
+        reference_cost = cost[order]
+        gross_return = gross[order]
+    elif route_kind is not None and "hedged" in route_kind:
+        if RISK_RESIDUAL_COLUMN not in label_frame.columns or REFERENCE_COST_COLUMN not in label_frame.columns:
+            raise ValueError("hedged route missing risk_residual/reference_cost")
+        resid = label_frame[RISK_RESIDUAL_COLUMN].to_numpy().astype(np.float64)
+        cost = label_frame[REFERENCE_COST_COLUMN].to_numpy().astype(np.float64)
+        if not np.all(np.isfinite(resid)) or not np.all(np.isfinite(cost)):
+            raise ValueError("hedged route columns must be finite")
+        target = (resid - cost)[order]
+        realized = (resid - cost)[order]
+        risk_residual = resid[order]
+        reference_cost = cost[order]
+        gross_return = gross_raw
+    else:
+        # legacy path
+        target = label_frame[TARGET_COLUMN].to_numpy().astype(np.float64)[order]
+        if RISK_RESIDUAL_COLUMN in label_frame.columns and REFERENCE_COST_COLUMN in label_frame.columns:
+            residual = label_frame[RISK_RESIDUAL_COLUMN].to_numpy().astype(np.float64)
+            cost = label_frame[REFERENCE_COST_COLUMN].to_numpy().astype(np.float64)
+            realized = (residual - cost)[order]
+            risk_residual = residual[order]
+            reference_cost = cost[order]
+        else:
+            realized = np.full(rows_sorted.size, np.nan, dtype=np.float64)
+            risk_residual = np.full(rows_sorted.size, np.nan, dtype=np.float64)
+            reference_cost = np.full(rows_sorted.size, np.nan, dtype=np.float64)
+        gross_return = gross_raw
 
     return PreparedHorizonLabels(
         horizon_sessions=int(horizon_sessions),
@@ -344,4 +396,5 @@ def prepare_horizon_labels(
         available_time_ns=available_ns.astype(np.int64),
         risk_residual=risk_residual,
         reference_cost=reference_cost,
+        gross_return=gross_return,
     )
