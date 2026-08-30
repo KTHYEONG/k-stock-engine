@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ml_asset_growth_performance",
+      "date": "2026-08-30",
+      "adr_id": "ADR_20260830_ml_asset_growth_performance",
+      "domain": "stocks/ml",
+      "title": "ML 자산증식 성능 개선 실행",
+      "why": "docs/results/ml_runs의 기존 ML 실행에서 양의 Rank IC에도 불구하고 경제적 OOF·replay 증거와 승격 후보가 없었음",
+      "resolution": "route-aligned relevance와 OOF gross return 보존을 반영한 ML 경로를 검증하고 model-selection 연구를 재실행했으나 missing-sampled-label로 모든 후보가 탈락함",
+      "impact": "전략 승격은 보류하며, 샘플 라벨 무결성과 observability ledger 계약을 선행 보완해야 함"
+    },
+    {
       "task_id": "TASK_CODEBASE_STRUCTURE_AUDIT_20260830",
       "date": "2026-08-30",
       "adr_id": "ADR_20260830_CODEBASE_STRUCTURE_AUDIT_20260830",
@@ -989,16 +999,6 @@
       "why": "Full 6-horizon net-alpha run exceeded 20 minutes and aborted before artifact creation; to_dicts() row indexing posed a multi-GB transient RAM peak (OOM risk).",
       "resolution": "Vectorized PurgedWalkForward._row_index, reused the standardized ElasticNet design across penalty fractions, converted causal-calibration and replay loops to partition-based iteration, maintained incremental prefix sums for the session-cluster bootstrap, and raised the LightGBM CLI thread default to 4; all output is bit-identical.",
       "impact": "Estimated 15-25 min -> ~6-10 min and removal of the multi-GB to_dicts peak; determinism preserved and verified across thread counts."
-    },
-    {
-      "task_id": "TASK_STOCK_ML_RESULT_LEDGER_OBSERVABILITY",
-      "date": "2026-08-15",
-      "adr_id": "ADR_20260815_STOCK_ML_RESULT_LEDGER_OBSERVABILITY",
-      "domain": "stocks",
-      "title": "Bounded ML result ledger observability",
-      "why": "Repeated ML runs required manual result transcription and could grow docs/results without a bounded machine-readable history.",
-      "resolution": "Added automatic completed/failed run projections, bounded latest/recent/schema/meta files, atomic writes, reconciliation CLI, structured training telemetry, and generated back-res pointer while preserving artifact files as source of truth.",
-      "impact": "ML runs now leave compact AI-readable lineage, data-shape, economic-evidence, and failure records with 128-entry retention; ledger failures do not alter artifacts and reconciliation can recover derived caches."
     }
   ]
 }
