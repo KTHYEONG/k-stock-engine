@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ml_cmp_screening_reliability_performance",
+      "date": "2026-08-30",
+      "adr_id": "ADR_20260830_ml_cmp_screening_reliability_performance",
+      "domain": "stocks/ml",
+      "title": "ML CMP screening reliability and performance redesign",
+      "why": "ML CMP screening was prone to input/data failures and excessive runtime.",
+      "resolution": "Added deterministic preflight validation, aligned prepared samples, fold cache reuse, real route utility evidence, and bounded screening fit accounting.",
+      "impact": "Prevents invalid screening inputs from reaching learner fits and reduces repeated screening work while preserving research-only fail-closed behavior."
+    },
+    {
       "task_id": "TASK_ML_DIRECT_RUN_COMPLETION_20260830",
       "date": "2026-08-30",
       "adr_id": "ADR_20260830_ML_DIRECT_RUN_COMPLETION_20260830",
@@ -989,16 +999,6 @@
       "why": "The CLI still selected stock_alpha_v2, LambdaRank, Optuna, and fixed 5/10/15 routes; the recent net-alpha design was unreachable and legacy confirmation workers caused long runtime and opaque h5 identifiers.",
       "resolution": "Promoted stock_net_alpha_v1 as the sole ML mainline, introduced explicit horizon/model/data naming, removed LambdaRank and route-selection experiment modules, wired net-alpha snapshot/training CLIs, and preserved fail-closed economic and integrity gates.",
       "impact": "Training and tests use one deterministic net-alpha path with no legacy trial database or confirmation workers; old artifacts remain data-only and fail with an actionable migration error. Full audit passed: 650 tests, ruff, mypy, and contract compliance."
-    },
-    {
-      "task_id": "TASK_STOCK_ML_ECONOMIC_ALPHA_REDESIGN",
-      "date": "2026-08-14",
-      "adr_id": "ADR_20260814_STOCK_ML_ECONOMIC_ALPHA_REDESIGN",
-      "domain": "signal",
-      "title": "Stock ML economic alpha redesign",
-      "why": "Latest 81-trial backtest had positive Rank-IC but every exact route failed cost-aware bootstrap and DSR gates; 5/10/15 sessions were hard-coded and correlated while refit and RSS were costly.",
-      "resolution": "Registered the net-alpha redesign contract: horizon discovery, cost/risk-aware continuous labels, semantic feature lineage and role gating, common execution policy, constrained marginal sizing, and fold-cache resource budgets.",
-      "impact": "Future research can select at most one primary and one conditional secondary horizon from nested OOF economic evidence, reject invalid or semantically ambiguous data, reduce redundant predictors and memory, and preserve fail-closed NO_TRADE promotion."
     }
   ]
 }
