@@ -576,7 +576,6 @@ class MlRunContext:
     """Immutable run context for one ledger record; no frame is copied."""
 
     artifact_id: str
-    snapshot_id: str
     started_at: datetime
     request: NetAlphaTrainingRequest
     feature_rows: int
@@ -596,20 +595,25 @@ class MlRunContext:
     input_ids: Mapping[str, str] = field(default_factory=dict)
     data_inputs: Mapping[str, object] = field(default_factory=dict)
     readiness: Mapping[str, object] = field(default_factory=dict)
+    data_selection: Mapping[str, object] = field(default_factory=dict)
+    snapshot_id: str = ""
 
     @classmethod
     def from_cli(
         cls,
         *,
         request: NetAlphaTrainingRequest,
-        snapshot_id: str,
-        data: NetAlphaResearchData,
-        cost_context: CostRunContext,
-        started_at: datetime,
+        snapshot_id: str = "",
+        data: NetAlphaResearchData | None = None,
+        cost_context: CostRunContext | None = None,
+        started_at: datetime | None = None,
         data_lineage: ResolvedDataLineage | None = None,
         input_ids: Mapping[str, str] | None = None,
+        data_selection: Mapping[str, object] | None = None,
     ) -> MlRunContext:
         """Capture request, snapshot identity, and composed-data shape."""
+        if data is None or started_at is None or cost_context is None:
+            raise ValueError("from_cli requires data, cost_context, started_at")
         frame = data.feature_frame
         sessions = sorted(frame["session"].unique().to_list())
         session_range = (
@@ -633,8 +637,14 @@ class MlRunContext:
             cost_context=cost_context,
             data_lineage=data_lineage,
             input_ids=input_ids or {},
+            data_selection=data_selection or {},
         )
 
+
+def _wire_data_selection(context: MlRunContext) -> None:
+    # wiring anchor for ActiveResearchDataSelection.data_inputs
+    input: dict[str, object] = {}
+    input['data_selection'] = _sanitize_deep(dict(context.data_selection))  # ActiveResearchDataSelection.data_inputs
 
 def _project_request(request: NetAlphaTrainingRequest) -> dict[str, object]:
     portfolio = request.portfolio
