@@ -1,4 +1,5 @@
 # mypy: ignore-errors
+# wiring: prepare_horizon_labels(matrix, data, horizon_sessions, route_objective=request.route_objective)
 """Thin net-alpha training orchestrator.
 
 ``train_net_alpha_model`` is the single training entry point: integrity audit,
@@ -1271,6 +1272,7 @@ def _select_elastic_alpha(
         available_time_ns=np.zeros(fold_train.height, dtype=np.int64),
         risk_residual=np.full(fold_train.height, np.nan),
         reference_cost=np.full(fold_train.height, np.nan),
+        gross_return=np.full(fold_train.height, np.nan),
     )
     return _select_elastic_alpha_prepared(
         matrix, horizon_view, row_index, request, grid
@@ -3034,7 +3036,7 @@ def build_initial_calibration_seed(
     rows = np.asarray(initial_train_rows, dtype=np.int64)
     if rows.size == 0:
         return pl.DataFrame()
-    horizon = prepare_horizon_labels(matrix, data, horizon_sessions)
+    horizon = prepare_horizon_labels(matrix, data, horizon_sessions, route_objective=request.route_objective)
     left = np.searchsorted(horizon.row_index, rows)
     left = np.clip(left, 0, max(0, horizon.row_index.size - 1))
     if not bool((horizon.row_index[left] == rows).any()):
@@ -3496,7 +3498,7 @@ def _fit_oof(
             _on_demand_schema(learner_columns),
             tuple(folds),
         )
-    horizon_labels = prepare_horizon_labels(matrix, data, horizon_sessions)
+    horizon_labels = prepare_horizon_labels(matrix, data, horizon_sessions, route_objective=request.route_objective)
     result = _fit_horizon_oof(
         matrix,
         horizon_labels,

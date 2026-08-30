@@ -32,6 +32,7 @@ __all__ = [
     "InvalidOofEconomicUtilityError",
     "SegmentTailEvidence",
     "TailCaptureEvidence",
+    "build_route_tail_relevance",
     "build_tail_relevance",
     "measure_tail_capture",
     "project_route_utility",
@@ -151,6 +152,51 @@ def route_labels_for_capture(frame: pl.DataFrame, route: object) -> pl.DataFrame
         utility.alias(RISK_RESIDUAL_COLUMN),
         pl.lit(0.0).alias(REFERENCE_COST_COLUMN),
     )
+
+
+def build_route_tail_relevance(labels: pl.DataFrame, *, route: object, top_k: int) -> pl.DataFrame:
+    """Exact-K route relevance: gross-cost for unhedged, residual-cost for hedged."""
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 1:
+        raise ValueError("top_k must be a positive integer")
+    kind_value = getattr(route, "kind", route)
+    kind_str = str(getattr(kind_value, "value", kind_value)).lower()
+    is_unhedged = "unhedged" in kind_str
+    if is_unhedged:
+        _require_columns(labels, (ID_COLUMN, SESSION_COLUMN, GROSS_COLUMN, REFERENCE_COST_COLUMN), "labels")
+        # fail closed on missing/null/non-finite
+        gross = labels[GROSS_COLUMN].cast(pl.Float64)
+        cost = labels[REFERENCE_COST_COLUMN].cast(pl.Float64)
+        if gross.null_count() > 0 or cost.null_count() > 0:
+            raise ValueError("route relevance has null gross_return/reference_cost")
+        gross_arr = gross.to_numpy()
+        cost_arr = cost.to_numpy()
+        if not np.all(np.isfinite(gross_arr)) or not np.all(np.isfinite(cost_arr)):
+            raise ValueError("route relevance gross_return/reference_cost must be finite")
+        if np.any(cost_arr < 0):
+            raise ValueError("reference_cost must be non-negative")
+        utility = (gross - cost).alias("__utility")
+    else:
+        _require_columns(labels, (ID_COLUMN, SESSION_COLUMN, RISK_RESIDUAL_COLUMN, REFERENCE_COST_COLUMN), "labels")
+        resid = labels[RISK_RESIDUAL_COLUMN].cast(pl.Float64)
+        cost = labels[REFERENCE_COST_COLUMN].cast(pl.Float64)
+        if resid.null_count() > 0 or cost.null_count() > 0:
+            raise ValueError("route relevance has null risk_residual/reference_cost")
+        resid_arr = resid.to_numpy()
+        cost_arr = cost.to_numpy()
+        if not np.all(np.isfinite(resid_arr)) or not np.all(np.isfinite(cost_arr)):
+            raise ValueError("route relevance risk_residual/reference_cost must be finite")
+        utility = (resid - cost).alias("__utility")
+    # cast to Float64 and check again
+    work = labels.with_columns(labels.select(utility)["__utility"].cast(pl.Float64).alias("__utility"))
+    # validate finite utility
+    arr = work["__utility"].to_numpy()
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("route utility must be finite")
+    sizes = work.group_by(SESSION_COLUMN).len()
+    undersized = sizes.filter(pl.col("len") < top_k)
+    if not undersized.is_empty():
+        raise ValueError(f"undersized cross-sections: {undersized.height} session(s) hold fewer than top_k={top_k} labelled names")
+    return work.sort([SESSION_COLUMN, "__utility", ID_COLUMN], descending=[False, True, False], maintain_order=True).with_columns((pl.int_range(pl.len()).over(SESSION_COLUMN) < top_k).cast(pl.Int8).alias(_RELEVANCE_COLUMN)).sort([SESSION_COLUMN, ID_COLUMN], maintain_order=True)
 
 
 def build_tail_relevance(labels: pl.DataFrame, *, top_k: int) -> pl.DataFrame:
