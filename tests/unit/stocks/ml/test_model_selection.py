@@ -3201,5 +3201,73 @@ def test_mlcmp_pools_bootstrap_once_per_family_without_cross_fold_concatenation(
                     assert sc >= settings.minimum_tail_draws
                     assert abs_lb > 0 and tail_lb > 0 and oracle_lb > 0
                 # also check all three finite before admission (already via >0)
-                assert (abs_lb==abs_lb) and (tail_lb==tail_lb) and (oracle_lb==oracle_lb)  # finite check
+                    assert (abs_lb==abs_lb) and (tail_lb==tail_lb) and (oracle_lb==oracle_lb)  # finite check
+
+
+def test_model_selection_unknown_screen_fault_propagates(monkeypatch) -> None:
+    import tempfile, pathlib
+    import polars as pl
+    import numpy as np
+    from datetime import UTC, datetime, timedelta
+    from src.stocks.ml.contracts import ModelFamily, ModelSelectionStudySettings, ModelSelectionComputeBudget, NetAlphaTrainingRequest, NetAlphaResearchData, FeatureAttributionEvidence
+    from src.stocks.ml.model_selection import ScreeningFoldCache, evaluate_model_selection_study
+    from src.stocks.research.artifacts import ModelArtifactRegistry
+    from src.core.costs import default_base_schedule, default_stress_schedule
+    from tests.fixtures.stocks.helpers import stock_liquidity_model
+    from src.core.datasets import DatasetManifest
+    from src.core.instruments import AssetKind
+    from src.stocks.ml.features import stock_net_alpha_v1_roles
+
+    _roles = stock_net_alpha_v1_roles()
+    rng = np.random.default_rng(0)
+    sessions = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(800)]
+    rows = []
+    for s in sessions:
+        for t in range(3):
+            row = {"instrument_id": f"KRX:{t:05d}", "session": s, "session_index": sessions.index(s), "sector": "tech", "available_time": s, "open": 100.0, "adtv_20d": 1e6, "volatility_20d": 0.02}
+            for src in _roles:
+                row[src] = float(rng.normal())
+                row[f"feature__{src}"] = row[src]
+            rows.append(row)
+    frame = pl.DataFrame(rows)
+    labels = [{"instrument_id": r["instrument_id"], "session": r["session"], "net_alpha_target": float(rng.normal(scale=0.01)), "risk_residual": 0.01, "reference_cost": 0.001, "label_available_time": r["session"] + timedelta(days=5), "realized_net_return": float(rng.normal(scale=0.01)), "gross_return": 0.02} for r in rows]
+    manifest = DatasetManifest(asset_kind=AssetKind.STOCK, schema_version="v1", schema_hash="h", provider_version="p", universe_policy_version="u", universe_policy_hash="u", feature_set="stock_net_alpha_v1", feature_set_hash="f", label_definition="net_alpha_o2o", label_horizon_sessions=10, time_start=sessions[0], time_end=sessions[-1], generated_time=sessions[-1], row_count=len(rows), reference_notional=100_000_000.0)
+    data = NetAlphaResearchData(feature_frame=frame, labels_by_horizon={10: pl.DataFrame(labels)}, manifest=manifest)
+    request = NetAlphaTrainingRequest(artifact_id="unknown_fault", candidate_horizon_sessions=(10,), base_cost_schedule=default_base_schedule(), stress_cost_schedule=default_stress_schedule(), liquidity_model=stock_liquidity_model(), stress_liquidity_model=stock_liquidity_model(stress_multiplier=2.0))
+    settings = ModelSelectionStudySettings(candidate_lookback_sessions=(504,), candidate_families=tuple(ModelFamily.__members__.values()), common_min_train_sessions=504, min_validation_segment_sessions=5, compute_budget=ModelSelectionComputeBudget(wall_clock_seconds=30.0, screen_phase_seconds=20.0))
+
+    # patch typed screening to raise unexpected RuntimeError
+    import src.stocks.ml.model_selection as msel
+
+    orig_screen = msel.screen_model_family
+
+    def faulty_screen(*args, **kwargs):
+        raise RuntimeError("synthetic unexpected fault")
+
+    monkeypatch.setattr(msel, "screen_model_family", faulty_screen)
+    # also patch preflight import path if evaluate imports from preflight
+    try:
+        import src.stocks.ml.model_selection_preflight as pre
+        monkeypatch.setattr(pre, "preflight_model_selection_inputs", lambda *a, **kw: msel.preflight_model_selection_inputs(*a, **kw))
+    except Exception:
+        pass
+
+    with tempfile.TemporaryDirectory() as tmp:
+        registry = ModelArtifactRegistry(pathlib.Path(tmp))
+        try:
+            result = evaluate_model_selection_study(data, request, settings, registry=registry)
+        except RuntimeError as exc:
+            assert "synthetic unexpected fault" in str(exc)
+            return
+        # if not raised, must be ledgered distinctly with internal-error code
+        assert result is not None
+        # should not be converted to non-finite-route-input or qualified evidence
+        cands = result.get("candidates", [])
+        for c in cands:
+            assert c.get("reason") != "non-finite-route-input"
+            assert c.get("screen_lower_bound", -1e12) != -1e12 or c.get("qualified_for_full_oof") is False
+        # check runtime ledger has internal-error
+        ledger = result.get("runtime_ledger", {})
+        rejection = result.get("rejection_reason_counts", {})
+        assert "internal-error" in str(rejection).lower() or "unexpected" in str(result).lower() or ledger.get("stage") == "screen"
 

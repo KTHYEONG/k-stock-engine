@@ -10,7 +10,9 @@ class TestStockAlphaSettings:
         assert settings.feature_set == "stock_alpha_v1"
         assert settings.label_definition == "fwd_ret_5d"
         assert settings.n_folds == 3
-        assert settings.top_k == 5
+        assert settings.top_k == 20
+        assert settings.max_single_weight == 0.08
+        assert settings.max_exposure == 0.90
 
     def test_default_instance_is_frozen_default(self) -> None:
         assert StockAlphaSettings() == DEFAULT_STOCK_ALPHA
