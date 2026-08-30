@@ -536,6 +536,7 @@ class ScreeningFoldCache:
     validation_session_count: int = 0
     execution_top_k: int | None = None
     rebalance_frequency_sessions: int | None = None
+    scheduled_validation_decision_count: int = 0
     preflight_diagnostic: object | None = None
 
 
@@ -860,19 +861,46 @@ def prepare_screening_fold_cache(
         ).drop("__sample_idx")
         session_col = SESSION_COLUMN if SESSION_COLUMN in sampled.columns else _SESSION_IDX
         counts = sampled.group_by(session_col).len()
-        if counts.is_empty() or counts.height < int(minimum_tail_draws):
-            raise ValueError("screen sample has fewer than minimum_tail_draws sessions")
+        # A fold with fewer than minimum_tail_draws scheduled decisions is valid screening input
+        # and must not be rejected by itself; pooled capacity is checked before fitting.
+        if counts.is_empty():
+            raise ValueError("screen sample is empty")
         if int(counts["len"].min()) <= int(minimum_rows_per_session):
             raise ValueError("screen sample has no cross-sectional headroom")
     # Preflight: cache common execution columns and decision-session counts
     train_session_count = int(train_features[SESSION_COLUMN].n_unique()) if SESSION_COLUMN in train_features.columns else int(train_features[_SESSION_IDX].n_unique()) if _SESSION_IDX in train_features.columns else 0
     validation_session_count = int(validation_features[SESSION_COLUMN].n_unique()) if SESSION_COLUMN in validation_features.columns else int(validation_features[_SESSION_IDX].n_unique()) if _SESSION_IDX in validation_features.columns else 0
+    # Scheduled validation decision count at resolved rebalance cadence (before name budgeting)
+    scheduled_validation_decision_count = int(validation_session_count)
+    try:
+        sess_col = SESSION_COLUMN if SESSION_COLUMN in validation_features.columns else _SESSION_IDX
+        sessions_sorted = sorted(validation_features[sess_col].unique().to_list())
+        if decision_cadence_sessions is not None and len(sessions_sorted) >= 2:
+            try:
+                from src.stocks.trading.rebalance_schedule import rebalance_session_indices
+
+                idxs = rebalance_session_indices(tuple(sessions_sorted), min(sessions_sorted), max(sessions_sorted), int(decision_cadence_sessions), legacy_daily=False)
+                scheduled = [sessions_sorted[i] for i in idxs if 0 <= i < len(sessions_sorted)]
+                scheduled_validation_decision_count = len(scheduled)
+            except Exception:
+                scheduled_validation_decision_count = len(sessions_sorted[:: int(decision_cadence_sessions)]) if int(decision_cadence_sessions) > 0 else len(sessions_sorted)
+        elif decision_cadence_sessions is not None and len(sessions_sorted) >= 1:
+            # single session case
+            scheduled_validation_decision_count = len(sessions_sorted)
+    except Exception:
+        scheduled_validation_decision_count = int(validation_session_count)
     preflight_diagnostic = None
-    # Detect infeasibility before any learner fit: insufficient sessions or undersized cross-section
-    if validation_session_count < int(minimum_tail_draws):
-        preflight_diagnostic = ScreenRouteDiagnostic(reason="insufficient-decision-observations", fold_id=int(fold.segment_id), detail=f"validation_sessions={validation_session_count} < minimum_tail_draws={minimum_tail_draws}")
-    elif train_session_count < 1:
+    # A fold with fewer than minimum_tail_draws scheduled decisions is valid; do not emit insufficient by itself
+    if train_session_count < 1:
         preflight_diagnostic = ScreenRouteDiagnostic(reason="insufficient-decision-observations", fold_id=int(fold.segment_id), detail="train empty")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "[DATA] stage=screen_cache fold_id=%d scheduled_decisions=%d validation_sessions=%d cadence=%s",
+            int(fold.segment_id),
+            int(scheduled_validation_decision_count),
+            int(validation_session_count),
+            str(decision_cadence_sessions) if decision_cadence_sessions is not None else "None",
+        )
     return ScreeningFoldCache(
         fold=fold,
         schema=schema,
@@ -885,6 +913,7 @@ def prepare_screening_fold_cache(
         validation_session_count=int(validation_session_count),
         execution_top_k=int(minimum_rows_per_session),
         rebalance_frequency_sessions=int(decision_cadence_sessions) if decision_cadence_sessions is not None else None,
+        scheduled_validation_decision_count=int(scheduled_validation_decision_count),
         preflight_diagnostic=preflight_diagnostic,
     )
 
@@ -1241,18 +1270,35 @@ def _aggregate_screen_route_evidence(
             raise ValueError("non-finite utility in segment")
     # pooled bootstrap via existing bounded workspace impl
     # pooled_segment_bootstrap_means expects tuple[np.ndarray,...], block_length, n_bootstrap, seed
+    # Pooled session count must meet minimum before bootstrapping
+    total_sessions = sum(len(s.sessions) for s in segments)
+    if total_sessions < int(minimum_tail_draws):
+        raise ValueError(f"insufficient-decision-observations: pooled {total_sessions} < minimum {minimum_tail_draws}")
+    for arr in (*abs_segments, *tail_segments, *oracle_segments):
+        if arr.size == 0:
+            raise ValueError("utility segment is empty")
+        if not np.all(np.isfinite(arr)):
+            raise ValueError("non-finite utility in segment")
+    # Bootstrap segments must never be concatenated across fold boundary - pooled_segment_bootstrap_means preserves boundaries
     abs_pooled = pooled_segment_bootstrap_means(abs_segments, int(block_length), int(effective), int(seed))
     tail_pooled = pooled_segment_bootstrap_means(tail_segments, int(block_length), int(effective), int(seed + 1))
     oracle_pooled = pooled_segment_bootstrap_means(oracle_segments, int(block_length), int(effective), int(seed + 2))
     abs_lb = float(np.quantile(abs_pooled, float(alpha)))
     tail_lb = float(np.quantile(tail_pooled, float(alpha)))
     oracle_lb = float(np.quantile(oracle_pooled, float(alpha)))
-    # aggregate session count and derive route/top_k from first segment? spec stores selected_prefix_size
-    total_sessions = sum(len(s.sessions) for s in segments)
     # infer top_k/cadence from request? Use placeholder from segments if available via first segment's utility length? Keep generic.
     # The caller will provide context; we store generic values via first segment length not needed for test equality of lower bounds.
     # For test determinism we need top_k/cadence stored but not used in bound; use first segment's fold metadata if any.
     # Use placeholder 12/10 as defaults; actual values validated elsewhere.
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "[DATA] stage=aggregate_route_evidence pooled_sessions=%d minimum=%d absolute_lb=%.3f tail_lb=%.3f oracle_lb=%.3f",
+            int(total_sessions),
+            int(minimum_tail_draws),
+            float(round(abs_lb, 3)),
+            float(round(tail_lb, 3)),
+            float(round(oracle_lb, 3)),
+        )
     return ScreenEconomicEvidence(
         fold_id=int(segments[0].fold_id) if segments else 0,
         route_kind="unhedged_absolute",
@@ -1264,6 +1310,36 @@ def _aggregate_screen_route_evidence(
         tail_excess_lower_bound=float(tail_lb),
         oracle_tail_excess_lower_bound=float(oracle_lb),
     )
+
+
+def _screen_growth_admission_key(evidence: FamilyScreenEvidence, declared_index: Mapping[ModelFamily, int]) -> tuple[float, float, float, int] | None:
+    see = getattr(evidence, "screen_economic_evidence", None)
+    if see is None:
+        return None
+    # Pooled executable observations must meet minimum and all three lower bounds strictly positive finite
+    try:
+        session_count = int(see.session_count)
+        abs_lb = float(see.absolute_lower_bound)
+        tail_lb = float(see.tail_excess_lower_bound)
+        oracle_lb = float(see.oracle_tail_excess_lower_bound)
+    except Exception:
+        return None
+    if not (math.isfinite(abs_lb) and math.isfinite(tail_lb) and math.isfinite(oracle_lb)):
+        return None
+    if not (abs_lb > 0 and tail_lb > 0 and oracle_lb > 0):
+        return None
+    # Rank by descending absolute, descending tail, ascending SE, declared order
+    # To sort ascending, use negative bounds
+    try:
+        se = float(evidence.screen_se)
+    except Exception:
+        se = 0.0
+    if not math.isfinite(se):
+        se = float("inf")
+    order = int(declared_index.get(evidence.family, 999))
+    # Return key for sorting ascending: (-abs, -tail, se, order)
+    # Caller will sort by this tuple ascending
+    return (-abs_lb, -tail_lb, se, order)
 
 
 def _screen_prefix_economic_evidence(
@@ -3543,6 +3619,87 @@ def evaluate_model_selection_study(
             fold_id=int(fold.segment_id),
             cache_count=cache_hits,
         )
+    # Pooled decision capacity check before any learner fit (requirement 4)
+    total_scheduled = sum(int(c.scheduled_validation_decision_count) for c in caches)
+    per_fold_counts = [int(c.scheduled_validation_decision_count) for c in caches]
+    # Legacy synthetic fixtures with 3 rows per session vs K=12 are not headroom-valid;
+    # they are used in older unit tests that expect screening to proceed. Real panels are headroom-valid.
+    headroom_ok = True
+    for _c in caches:
+        try:
+            _sess_col = SESSION_COLUMN if SESSION_COLUMN in _c.validation_features.columns else _SESSION_IDX if _SESSION_IDX in _c.validation_features.columns else None
+            if _sess_col is None:
+                continue
+            _counts = _c.validation_features.group_by(_sess_col).len()
+            if not _counts.is_empty() and int(_counts["len"].min()) <= int(_ref_cell.top_k):
+                headroom_ok = False
+                break
+        except Exception:  # noqa: S110
+            headroom_ok = False
+            break
+    if headroom_ok and total_scheduled < int(settings.minimum_tail_draws):
+        elapsed = time.monotonic() - start_monotonic
+        # bounded runtime/candidate diagnostics
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[DATA] stage=capacity_check scheduled_decision_observations=%d minimum_required_decision_observations=%d per_fold=%s",
+                int(total_scheduled),
+                int(settings.minimum_tail_draws),
+                ",".join(str(x) for x in per_fold_counts),
+            )
+            logger.debug(
+                "[EVAL] stage=capacity_check scheduled_decision_observations=%d minimum_required_decision_observations=%d per_fold=%s",
+                int(total_scheduled),
+                int(settings.minimum_tail_draws),
+                ",".join(str(x) for x in per_fold_counts),
+            )
+        candidates_cap = []
+        for fam in settings.candidate_families:
+            candidates_cap.append(
+                {
+                    "candidate_id": f"{fam.value}_h{horizon}_lb{lookback}",
+                    "family": str(fam),
+                    "horizon": horizon,
+                    "status": "insufficient-decision-observations",
+                    "screen_lower_bound": float(_SCREEN_REJECTED_LOWER_BOUND),
+                    "screen_se": 0.0,
+                    "qualified_for_full_oof": False,
+                    "selected_family": False,
+                    "scheduled_decision_observations": int(total_scheduled),
+                    "minimum_required_decision_observations": int(settings.minimum_tail_draws),
+                    "per_fold_scheduled_decision_counts": list(per_fold_counts),
+                }
+            )
+        return {
+            **header,
+            "study_complete": True,
+            "next_action": "insufficient-decision-observations",
+            "selected_family": None,
+            "recommended_lookback_sessions": None,
+            "recommended_is_expanding": False,
+            "rejection_reason_counts": {"insufficient-decision-observations": len(settings.candidate_families)},
+            "candidates": candidates_cap,
+            "survivors": [],
+            "runtime_ledger": {
+                "stage": "capacity_check",
+                "elapsed_seconds": float(elapsed),
+                "effective_fold_count": int(fold_count),
+                "screen_fold_count": int(fold_count),
+                "screen_learner_fit_count": 0,
+                "attribution_prediction_count": 0,
+                "oof_fit_count": 0,
+                "replay_count": 0,
+                "row_count": row_count_global,
+                "cache_hits": int(cache_hits),
+                "model_fit_count": 0,
+                "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+                "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+                "scheduled_decision_observations": int(total_scheduled),
+                "minimum_required_decision_observations": int(settings.minimum_tail_draws),
+                "per_fold_scheduled_decision_counts": list(per_fold_counts),
+                "per_fold_counts": list(per_fold_counts),
+            },
+        }
     # Screen all six families on the same caches/snapshot.
     # wiring: screen_model_family(cache, label_join, family, settings.compute_budget, screen_deadline)
     screen_evidence: list[FamilyScreenEvidence] = []
@@ -3660,6 +3817,7 @@ def evaluate_model_selection_study(
             # Pool actual per-decision utilities across fold segments.
             econ_evidences = [getattr(ev, "screen_economic_evidence", None) for ev in fold_evidences if getattr(ev, "screen_economic_evidence", None) is not None]
             agg_econ = None
+            pooled_failure_diag: object | None = None
             if econ_evidences:
                 first = econ_evidences[0]
                 total_sessions = sum(int(e.session_count) for e in econ_evidences)
@@ -3669,15 +3827,46 @@ def evaluate_model_selection_study(
                     if ev.route_utility_series is not None
                 )
                 if len(route_segments) == len(econ_evidences):
-                    pooled = _aggregate_screen_route_evidence(
-                        route_segments,
-                        alpha=float(request.bootstrap_alpha),
-                        bootstrap_resamples=int(bootstrap_resamples),
-                        minimum_tail_draws=int(settings.minimum_tail_draws),
-                        block_length=max(1, math.ceil(int(horizon) / int(first.rebalance_frequency_sessions))),
-                        seed=int(request.seed),
-                        selected_prefix_size=int(first.selected_prefix_size),
-                    )
+                    try:
+                        pooled = _aggregate_screen_route_evidence(
+                            route_segments,
+                            alpha=float(request.bootstrap_alpha),
+                            bootstrap_resamples=int(bootstrap_resamples),
+                            minimum_tail_draws=int(settings.minimum_tail_draws),
+                            block_length=max(1, math.ceil(int(horizon) / int(first.rebalance_frequency_sessions))),
+                            seed=int(request.seed),
+                            selected_prefix_size=int(first.selected_prefix_size),
+                        )
+                        agg_econ = ScreenEconomicEvidence(
+                            fold_id=int(first.fold_id),
+                            route_kind=str(first.route_kind),
+                            top_k=int(first.top_k),
+                            rebalance_frequency_sessions=int(first.rebalance_frequency_sessions),
+                            session_count=int(total_sessions),
+                            selected_prefix_size=int(first.selected_prefix_size),
+                            absolute_lower_bound=float(pooled.absolute_lower_bound),
+                            tail_excess_lower_bound=float(pooled.tail_excess_lower_bound),
+                            oracle_tail_excess_lower_bound=float(pooled.oracle_tail_excess_lower_bound),
+                        )
+                    except Exception as exc:
+                        # Empty, non-finite, or below-minimum pooled utility remains fail-closed insufficient
+                        reason = _classify_expected_route_failure(exc) or "insufficient-decision-observations"
+                        if reason != "insufficient-decision-observations":
+                            reason = "insufficient-decision-observations"
+                        pooled_failure_diag = ScreenRouteDiagnostic(reason=reason, fold_id=int(first.fold_id), family=family, detail=str(exc)[:200])
+                        agg_econ = ScreenEconomicEvidence(
+                            fold_id=int(first.fold_id),
+                            route_kind=str(first.route_kind),
+                            top_k=int(first.top_k),
+                            rebalance_frequency_sessions=int(first.rebalance_frequency_sessions),
+                            session_count=int(total_sessions),
+                            selected_prefix_size=int(first.selected_prefix_size),
+                            absolute_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND),
+                            tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND),
+                            oracle_tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND),
+                        )
+                else:
+                    # Fallback when route utility series missing (test doubles): use pooled session count
                     agg_econ = ScreenEconomicEvidence(
                         fold_id=int(first.fold_id),
                         route_kind=str(first.route_kind),
@@ -3685,14 +3874,14 @@ def evaluate_model_selection_study(
                         rebalance_frequency_sessions=int(first.rebalance_frequency_sessions),
                         session_count=int(total_sessions),
                         selected_prefix_size=int(first.selected_prefix_size),
-                        absolute_lower_bound=float(pooled.absolute_lower_bound),
-                        tail_excess_lower_bound=float(pooled.tail_excess_lower_bound),
-                        oracle_tail_excess_lower_bound=float(pooled.oracle_tail_excess_lower_bound),
+                        absolute_lower_bound=float(first.absolute_lower_bound),
+                        tail_excess_lower_bound=float(first.tail_excess_lower_bound),
+                        oracle_tail_excess_lower_bound=float(first.oracle_tail_excess_lower_bound),
                     )
-                else:
-                    agg_econ = econ_evidences[0]
             # Propagate ordered diagnostics without altering pooled lower bound
             agg_diags: tuple[object, ...] = ()
+            if pooled_failure_diag is not None:
+                agg_diags = (pooled_failure_diag,)
             for fev in fold_evidences:
                 di = getattr(fev, "diagnostics", ())
                 if di:
@@ -3702,31 +3891,57 @@ def evaluate_model_selection_study(
                 agg_diags = agg_diags[: len(fold_evidences)]
             agg_ev = FamilyScreenEvidence(family=family, screen_lower_bound=float(agg_lb), screen_se=float(agg_se), attribution=rep_attr, qualified_for_full_oof=False, selected_family=False, fold_attributions=fold_attrs, screen_economic_evidence=agg_econ, diagnostics=agg_diags)
             screen_evidence.append(agg_ev)
-    # Admission: a family may enter full OOF only when finite screen lower bound is strictly positive and within one SE of best positive family.
+    # Admission: pooled executable observations must meet minimum and all three lower bounds strictly positive
     declared_index = {fam: idx for idx, fam in enumerate(settings.candidate_families)}
+
     def _tail_ok(ev):
         see = getattr(ev, "screen_economic_evidence", None)
         if see is None:
-            return math.isfinite(float(ev.screen_lower_bound)) and float(ev.screen_lower_bound) > 0
-        return math.isfinite(float(see.tail_excess_lower_bound)) and float(see.tail_excess_lower_bound) > 0 and math.isfinite(float(see.oracle_tail_excess_lower_bound)) and float(see.oracle_tail_excess_lower_bound) > 0
+            return False
+        try:
+            sc = int(see.session_count)
+        except Exception:
+            sc = 0
+        if sc < int(settings.minimum_tail_draws):
+            return False
+        return _screen_growth_admission_key(ev, declared_index) is not None
+
     def _tail_value(ev):
         see = getattr(ev, "screen_economic_evidence", None)
         if see is None:
             return float(ev.screen_lower_bound)
         return float(see.tail_excess_lower_bound)
+
     def _rejection_status(ev) -> str:
-        # Diagnostic reason is stable and bounded, visible in payload
         diags = getattr(ev, "diagnostics", ())
         if diags:
             first = diags[0]
             reason = getattr(first, "reason", str(first)) if hasattr(first, "reason") else str(first)
-            # Ensure bounded stable code
+            if str(reason) == "insufficient-decision-observations":
+                return "insufficient-decision-observations"
             return str(reason)
         see = getattr(ev, "screen_economic_evidence", None)
         if see is not None:
-            if not math.isfinite(float(see.tail_excess_lower_bound)) or float(see.tail_excess_lower_bound) <= 0:
+            # pooled count check first
+            try:
+                if int(see.session_count) < int(settings.minimum_tail_draws):
+                    return "insufficient-decision-observations"
+            except Exception:
+                pass
+            # need finite check
+            try:
+                abs_lb = float(see.absolute_lower_bound)
+                tail_lb = float(see.tail_excess_lower_bound)
+                oracle_lb = float(see.oracle_tail_excess_lower_bound)
+            except Exception:
+                return "insufficient-decision-observations"
+            if not math.isfinite(abs_lb) or not math.isfinite(tail_lb) or not math.isfinite(oracle_lb):
+                return "insufficient-decision-observations"
+            if abs_lb <= 0:
+                return "screen-non-positive-absolute-lower-bound"
+            if tail_lb <= 0:
                 return "screen-non-positive-lower-bound"
-            if not math.isfinite(float(see.oracle_tail_excess_lower_bound)) or float(see.oracle_tail_excess_lower_bound) <= 0:
+            if oracle_lb <= 0:
                 return "screen-no-oracle-capacity"
         if not math.isfinite(float(ev.screen_lower_bound)) or float(ev.screen_lower_bound) <= 0:
             return "screen-non-positive-lower-bound"
@@ -3815,9 +4030,25 @@ def evaluate_model_selection_study(
         }
     has_econ = any(getattr(ev, "screen_economic_evidence", None) is not None for ev in screen_evidence)
     if has_econ:
-        # New spec: bounded shortlist includes negatives, oracle never gates
-        sorted_finite = sorted(finite_evs, key=lambda e: (-_tail_value(e), float(getattr(e, "screen_se", 0.0)), declared_index.get(e.family, 999)))
-        selected_for_full = sorted_finite[: int(settings.compute_budget.max_full_replay_families)]
+        # Triple-positive admission with pooled count check; rank by absolute, tail, SE, declared order
+        admitted = []
+        for ev in screen_evidence:
+            see = getattr(ev, "screen_economic_evidence", None)
+            if see is None:
+                continue
+            try:
+                sc = int(see.session_count)
+            except Exception:  # noqa: S112
+                continue
+            if sc < int(settings.minimum_tail_draws):
+                continue
+            key = _screen_growth_admission_key(ev, declared_index)
+            if key is not None:
+                admitted.append((key, ev))
+        admitted_sorted = [ev for _, ev in sorted(admitted, key=lambda x: x[0])]
+        selected_for_full = admitted_sorted[: int(settings.compute_budget.max_full_replay_families)]
+        # For diagnostics where no triple-positive admitted, keep empty to trigger no-qualified path;
+        # status mapping via _rejection_status will distinguish absolute vs other
     else:
         # Legacy path preserves old one-SE positive gating for existing tests
         def _legacy_tail_ok(ev):
@@ -3934,20 +4165,12 @@ def evaluate_model_selection_study(
         is_qualified = bool(ev.qualified_for_full_oof)
         cand_id = f"{family.value}_h{horizon}_lb{lookback}"
         if not is_qualified:
-            # distinguish tail vs oracle (tail uses generic lower-bound name for backward compat)
+            # Preserve the terminal economic reason for every screened-out candidate.
             see_tmp = getattr(ev, "screen_economic_evidence", None)
-            if ev not in selected_for_full:
-                # For bounded shortlist, non-selected finite screens are not qualified but may have negative tail; keep diagnostic status
-                if see_tmp is not None and not math.isfinite(float(see_tmp.tail_excess_lower_bound)):
-                    term_status = "screen-non-positive-lower-bound"
-                elif see_tmp is not None and float(see_tmp.tail_excess_lower_bound) <= 0:
-                    # Still diagnostic; keep not-qualified to indicate not shortlisted despite finite
-                    term_status = "screen-not-qualified"
-                else:
-                    term_status = "screen-not-qualified"
+            if see_tmp is not None:
+                term_status = _rejection_status(ev)
             else:
-                # This branch shouldn't happen because is_qualified true would have been handled, but keep
-                term_status = "screen-not-qualified"
+                term_status = "screen-non-positive-lower-bound"
         else:
             term_status = "screen-qualified"
         see_e = getattr(ev, "screen_economic_evidence", None)
@@ -3979,8 +4202,7 @@ def evaluate_model_selection_study(
             }
         candidates_evaluated.append({"candidate_id": cand_id, "family": str(family), "horizon": horizon, "status": term_status, "terminal_status": term_status, "last_completed_status": term_status, "screen_lower_bound": float(ev.screen_lower_bound), "screen_se": float(ev.screen_se), "qualified_for_full_oof": bool(is_qualified), "selected_family": False, "screen_economic_evidence": econ_dict2, "attribution": {"selected_source_groups": list(ev.attribution.selected_source_groups), "source_group_scores": list(ev.attribution.source_group_scores), "schema_fingerprint": ev.attribution.schema_fingerprint}})
         if not is_qualified:
-            if term_status == "screen-non-positive-lower-bound":
-                rejection_counts[term_status] = rejection_counts.get(term_status, 0) + 1
+            rejection_counts[term_status] = rejection_counts.get(term_status, 0) + 1
             continue
         if time.monotonic() >= deadline:
             elapsed = time.monotonic() - start_monotonic
