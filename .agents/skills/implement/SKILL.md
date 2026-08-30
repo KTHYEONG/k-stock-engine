@@ -16,14 +16,14 @@ Fast-execution protocol for mechanical code implementation based strictly on fro
    - **Zero-Search Context Loading**: Read only `target_file`, `target_test_file`, and files listed in `context_files` (if present) via targeted `view_file`. Do NOT run exploratory `rg` / `find` / `list_dir` commands across the repository.
 
 2. **Phased Mechanical Workflow**:
-   - **Phase A (TDD Scenarios - Per-File Sequential Implementation)**:
+   - **Phase A (TDD Scenarios Placement - Mandatory Gate)**:
      - Group `scenarios` by unique `target_test_file`.
-     - Iterate through each `target_test_file` one by one:
+     - Count total scenarios ($N$). Iterate through each `target_test_file`:
        1. View `target_test_file`.
-       2. Append/update all test functions for the scenarios belonging to that specific file (matching `scenario_id` 1:1).
-       3. Run verification immediately: `uv run pytest <target_test_file> -k "<scenario_id>" -q --tb=short && uv run ruff check <target_test_file>`.
-     - DO NOT proceed to Phase B until all test scenarios across all `target_test_file`s are written and failing/passing as expected.
-   - **Phase B (Core Logic)**: Implement complete source logic in `target_file`.
+       2. Append/update all $N$ test functions using `scenario_id` and `test_skeleton` directly from `contract.json`. Do NOT redesign test fixtures or invent complex test scaffolding; insert the provided skeletons faithfully.
+       3. Run pinpoint verification: `uv run pytest <target_test_file> -k "<scenario_id>" -q --tb=short && uv run ruff check <target_test_file>`.
+     - **Gate Check**: DO NOT touch or modify `target_file` (Phase B) until ALL $N$ scenario test functions are physically present in their `target_test_file`s.
+   - **Phase B (Core Logic)**: Implement complete source logic in `target_file` to satisfy tests.
      - *Quick Syntax/Lint Check*: `uv run ruff check <target_file>`
    - **Phase C (Integration Wiring)**: Wire logic into `caller_file` at `anchor` location using `import_symbol` and `invocation_expression`.
      - *Quick Syntax/Lint Check*: `uv run ruff check <caller_file>`

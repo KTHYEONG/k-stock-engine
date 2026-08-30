@@ -19,11 +19,24 @@ from src.core.paths import (
 from src.stocks.cli import train
 
 
-def test_train_parser_exposes_no_snapshot_or_dataset_override_flags() -> None:
+def test_train_parser_exposes_direct_dataset_flags_but_no_snapshot_flags() -> None:
     parser = train.build_parser()
-    for flag in ["--snapshot-id", "--as-of", "--base-dataset-id", "--feature-dataset-id", "--label-dataset-id", "--cost-snapshot-id"]:
+    for flag in ["--snapshot-id", "--as-of"]:
         with pytest.raises(SystemExit):
             parser.parse_args(["--artifact-id", "a1", flag, "val"])
+    direct = parser.parse_args(
+        [
+            "--artifact-id", "a1",
+            "--base-dataset-id", "base",
+            "--feature-dataset-id", "features",
+            "--label-dataset-id", "labels",
+            "--research-start-direct", "2024-01-01",
+            "--research-end-direct", "2024-02-01",
+        ]
+    )
+    assert direct.base_dataset_id == "base"
+    assert direct.feature_dataset_id == "features"
+    assert direct.label_dataset_id == "labels"
     # research start/end remain accepted
     args = parser.parse_args(["--artifact-id", "a1", "--research-start", "2024-01-01", "--research-end", "2024-02-01"])
     assert args.research_start == date(2024, 1, 1)
