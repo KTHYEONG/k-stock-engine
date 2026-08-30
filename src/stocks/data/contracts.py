@@ -18,11 +18,14 @@ from src.core.datasets import DatasetManifest
 
 
 @dataclass(frozen=True, slots=True)
-class DatasetSnapshot:
+class DatasetFrame:
     """A validated stock dataset: manifest plus the frame it describes."""
 
     manifest: DatasetManifest
     frame: pl.DataFrame
+
+
+DatasetSnapshot = DatasetFrame
 
 
 class TimingConvention(StrEnum):
