@@ -19,6 +19,9 @@ import polars as pl
 
 from src.core.paths import PROJECT_ROOT
 
+# wiring: PreparedHorizonLabels.gross_return
+# wiring: pl.Series(GROSS_COLUMN, horizon.gross_return[val_positions].astype(np.float64))
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -525,6 +528,7 @@ def fit_horizon_oof(
     )
     from src.stocks.ml.labels import (
         AVAILABLE_COLUMN,
+        GROSS_COLUMN,
         REALIZED_RETURN_COLUMN,
         REFERENCE_COST_COLUMN,
         RISK_RESIDUAL_COLUMN,
@@ -689,6 +693,9 @@ def fit_horizon_oof(
                         horizon.reference_cost[val_positions].astype(np.float64)
                     ),
                     REALIZED_RETURN_COLUMN: pl.Series(realized_va.astype(np.float64)),
+                    GROSS_COLUMN: pl.Series(
+                        horizon.gross_return[val_positions].astype(np.float64)
+                    ),
                 }
             )
         )

@@ -30,9 +30,13 @@ from src.stocks.ml.contracts import (
     NetAlphaTrainingRequest,
     PolicyProfile,
 )
+
+# wiring: build_route_tail_relevance(frame, route=request.route_objective, top_k=top_k)
+# wiring: _lambda_rank_matrices(train, learner_columns, top_k, route=request.route_objective)
 from src.stocks.ml.economic_objective import (
     InvalidOofEconomicUtilityError,
     TailCaptureEvidence,
+    build_route_tail_relevance,
     build_tail_relevance,
     measure_tail_capture,
     route_labels_for_capture,
@@ -50,6 +54,7 @@ from src.stocks.ml.horizons import (
 )
 from src.stocks.ml.labels import (
     AVAILABLE_COLUMN,
+    GROSS_COLUMN,
     ID_COLUMN,
     REALIZED_RETURN_COLUMN,
     REFERENCE_COST_COLUMN,
@@ -755,7 +760,7 @@ def fit_tail_lambdarank_oof(
         if train.is_empty():
             continue
         best = _inner_lambda_rank_iteration(
-            train, learner_columns, top_k, config, request.model_threads
+            train, learner_columns, top_k, config, request.model_threads, route=request.route_objective
         )
         if best is not None:
             inner_iterations.append(best)
@@ -767,7 +772,8 @@ def fit_tail_lambdarank_oof(
     label_frames: list[pl.DataFrame] = []
     label_subset = label_join.select(
         _ID_COLUMN, SESSION_COLUMN, TARGET_COLUMN, AVAILABLE_COLUMN,
-        RISK_RESIDUAL_COLUMN, REFERENCE_COST_COLUMN, REALIZED_RETURN_COLUMN,
+        GROSS_COLUMN, RISK_RESIDUAL_COLUMN, REFERENCE_COST_COLUMN,
+        REALIZED_RETURN_COLUMN,
     )
     for _fold_index, fold in enumerate(folds):
         train = pre_holdout[fold.train_mask].join(
@@ -777,7 +783,7 @@ def fit_tail_lambdarank_oof(
         if train.is_empty() or validation.is_empty():
             continue
         features, relevance, groups = _lambda_rank_matrices(
-            train, learner_columns, top_k
+            train, learner_columns, top_k, route=request.route_objective
         )
         if features.shape[0] == 0 or groups.size == 0:
             continue
@@ -1158,6 +1164,8 @@ def _inner_lambda_rank_iteration(
     top_k: int,
     config: NetAlphaModelConfig,
     num_threads: int,
+    *,
+    route: object | None = None,
 ) -> int | None:
     """Median-style inner early-stopped round count on a chronological split."""
     sessions = train[SESSION_COLUMN].unique().sort().to_list()
@@ -1168,10 +1176,10 @@ def _inner_lambda_rank_iteration(
     inner_valid = train.filter(pl.col(SESSION_COLUMN).is_in(list(valid_sessions)))
     inner_train = train.filter(~pl.col(SESSION_COLUMN).is_in(list(valid_sessions)))
     train_features, train_relevance, train_groups = _lambda_rank_matrices(
-        inner_train, learner_columns, top_k
+        inner_train, learner_columns, top_k, route=route
     )
     valid_features, valid_relevance, valid_groups = _lambda_rank_matrices(
-        inner_valid, learner_columns, top_k
+        inner_valid, learner_columns, top_k, route=route
     )
     if train_groups.size == 0 or valid_groups.size == 0:
         return None
@@ -1208,12 +1216,17 @@ def _lambda_rank_matrices(
     frame: pl.DataFrame,
     learner_columns: tuple[str, ...],
     top_k: int,
+    *,
+    route: object | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Feature matrix, exact-K relevance targets, and session group sizes."""
-    relevance = build_tail_relevance(
-        frame.select(_ID_COLUMN, SESSION_COLUMN, RISK_RESIDUAL_COLUMN, REFERENCE_COST_COLUMN),
-        top_k=top_k,
-    ).select(_ID_COLUMN, SESSION_COLUMN, "relevance")
+    if route is not None:
+        relevance = build_route_tail_relevance(frame, route=route, top_k=top_k).select(_ID_COLUMN, SESSION_COLUMN, "relevance")
+    else:
+        relevance = build_tail_relevance(
+            frame.select(_ID_COLUMN, SESSION_COLUMN, RISK_RESIDUAL_COLUMN, REFERENCE_COST_COLUMN),
+            top_k=top_k,
+        ).select(_ID_COLUMN, SESSION_COLUMN, "relevance")
     aligned = frame.join(relevance, on=[_ID_COLUMN, SESSION_COLUMN], how="inner")
     aligned = aligned.sort([SESSION_COLUMN, _ID_COLUMN], maintain_order=True)
     features = _design_matrix(aligned, learner_columns)
