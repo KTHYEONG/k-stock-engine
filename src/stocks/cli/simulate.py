@@ -14,13 +14,14 @@ from src.core.paths import (
     STOCK_FEATURE_PANEL_ROOT,
     STOCK_LABEL_ROOT,
 )
-from src.stocks.config.research import resolve_simulation_request
-from src.stocks.data.active import ActiveResearchDataRequest, resolve_active_research_data
+from src.stocks.cli.contracts import parse_simulation_command
+from src.stocks.config.research import CanonicalResearchProfile, resolve_simulation_request
+from src.stocks.data.active import resolve_active_research_data
 from src.stocks.data.direct import DirectMarketDataLoader
 from src.stocks.observability.contracts import RunIdentity
 from src.stocks.observability.recorder import open_run_diagnostics
 from src.stocks.research.artifacts import ModelArtifactRegistry
-from src.stocks.settings import DEFAULT_STOCK_ALPHA, REFERENCE_DATETIME
+from src.stocks.settings import REFERENCE_DATETIME
 from src.stocks.workflows.contracts import SimulationRequest
 from src.stocks.workflows.simulate_portfolio import (
     artifact_policy_profile,
@@ -60,14 +61,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(args: list[str] | None = None) -> int:
     parser = build_parser()
     parsed = parser.parse_args(args)
+    command = parse_simulation_command(parsed)
 
-    settings = DEFAULT_STOCK_ALPHA
+    settings = CanonicalResearchProfile()
     decision_time = parsed.decision_time or REFERENCE_DATETIME
 
     # wiring: resolve_active_research_data and DirectMarketDataLoader.load_training_data
     # selection = resolve_active_research_data(...); data = DirectMarketDataLoader(...).load_training_data(selection.direct_request, decision_time, readiness=readiness_report)
-    _horizons = tuple(int(x) for x in str(getattr(parsed, "candidate_horizon_sessions", "10")).split(",") if x.strip())
-    selection = resolve_active_research_data(catalog_root=parsed.catalog_root, base_root=parsed.base_root, feature_root=parsed.feature_root, label_root=parsed.label_root, request=ActiveResearchDataRequest(start=parsed.research_start, end=parsed.research_end, candidate_horizon_sessions=_horizons))
+    selection = resolve_active_research_data(catalog_root=parsed.catalog_root, base_root=parsed.base_root, feature_root=parsed.feature_root, label_root=parsed.label_root, request=command.active_request)
     loader = DirectMarketDataLoader(base_root=parsed.base_root, feature_root=parsed.feature_root, label_root=parsed.label_root)
     readiness_report = loader.assess_readiness(selection.direct_request, decision_time, cost_evidence_path=selection.cost_evidence_path)
     # data = DirectMarketDataLoader(...).load_training_data(selection.direct_request, decision_time, readiness=readiness_report)
@@ -113,6 +114,7 @@ def main(args: list[str] | None = None) -> int:
             top_k=settings.top_k,
             max_single_weight=settings.max_single_weight,
             max_exposure=settings.max_exposure,
+            participation_limit=settings.participation_limit,
         )
     cost_evidence = None
     try:

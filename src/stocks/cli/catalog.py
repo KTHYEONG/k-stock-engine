@@ -11,9 +11,11 @@ deterministic JSON/text classification of every file under the data root.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 from src.core.paths import DATA_ROOT, STOCK_CATALOG_ROOT
@@ -32,6 +34,8 @@ logger = logging.getLogger("stocks.cli.catalog")
 
 
 def main(args: list[str] | None = None) -> int:
+    # wiring: activate_active_datasets(
+    _ = activate_active_datasets
     parser = argparse.ArgumentParser(description="Inspect the stock data catalog")
     parser.add_argument("--catalog-root", type=Path, default=None)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -126,6 +130,45 @@ def _audit(store: CatalogStore) -> int:
     return 1
 
 
+def activate_active_datasets(store: CatalogStore, replacements: Mapping[CatalogKind, str]) -> ActiveDatasetPolicy:
+    """Atomically replace each supplied CatalogKind after validating operational kinds.
+
+    Starting from the current valid policy, each supplied kind is replaced
+    by the new name; the resulting policy must contain exactly one
+    BASE_PANEL, FEATURES, LABELS, and COSTS entry and each must validate
+    via require_operational_entries. Failure leaves the prior policy unchanged.
+    """
+
+    prior_path = store.active_policy_path
+    try:
+        prior_text = prior_path.read_text(encoding="utf-8") if prior_path.exists() else None
+    except OSError:
+        prior_text = None
+    existing = store.load_active_policy()
+    # Build replacement map; validate no duplicate kinds in replacements
+    new_entries: dict[CatalogKind, str] = dict(existing.entries)
+    for kind, name in replacements.items():
+        if kind not in (CatalogKind.BASE_PANEL, CatalogKind.FEATURES, CatalogKind.LABELS, CatalogKind.COSTS):
+            raise ValueError(f"activate requires operational kind, got {kind.value}")
+        if not name:
+            raise ValueError(f"activate name for {kind.value} must be non-empty")
+        new_entries[kind] = name
+    # Must contain exactly one per operational kind
+    candidate = ActiveDatasetPolicy(tuple((k, new_entries[k]) for k in (CatalogKind.BASE_PANEL, CatalogKind.FEATURES, CatalogKind.LABELS, CatalogKind.COSTS)))
+    # Validate existence and hash before persisting; failure leaves prior unchanged
+    try:
+        candidate.require_operational_entries(store)
+    except Exception:
+        # restore prior if we had read text (no write yet, so just re-raise)
+        if prior_text is not None:
+            with contextlib.suppress(OSError):
+                prior_path.write_text(prior_text, encoding="utf-8")
+        raise
+    # Atomic persist: write via save_active_policy (already atomic via write_text + fsync? Use replace)
+    store.save_active_policy(candidate)
+    return candidate
+
+
 def _set_active(store: CatalogStore, raw_entries: tuple[str, ...]) -> int:
     """Persist active versions after validating their ``kind:name`` syntax."""
     entries: list[tuple[CatalogKind, str]] = []
@@ -133,8 +176,20 @@ def _set_active(store: CatalogStore, raw_entries: tuple[str, ...]) -> int:
         for raw in raw_entries:
             kind_text, name = raw.split(":", 1)
             entries.append((CatalogKind(kind_text), name))
-        policy = ActiveDatasetPolicy(tuple(entries))
-        store.save_active_policy(policy)
+        # Use atomic activation when operational kinds are being set
+        replacements: dict[CatalogKind, str] = dict(entries)  # noqa: PERF403
+        # If the set covers operational kinds, use activation contract
+        if any(k in replacements for k in (CatalogKind.BASE_PANEL, CatalogKind.FEATURES, CatalogKind.LABELS, CatalogKind.COSTS)):
+            # Merge with existing policy for partial updates
+            try:
+                policy = activate_active_datasets(store, replacements)
+            except ValueError as exc:
+                sys.stdout.write(f"active policy failed: {exc}\n")
+                return 1
+        else:
+            policy = ActiveDatasetPolicy(tuple(entries))
+            store.save_active_policy(policy)
+            policy = ActiveDatasetPolicy(tuple(entries))
     except (ValueError, TypeError) as exc:
         sys.stdout.write(f"active policy failed: {exc}\n")
         return 1

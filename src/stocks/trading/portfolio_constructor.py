@@ -27,6 +27,18 @@ import polars as pl
 from src.core.instruments import Instrument
 from src.core.portfolio import Allocation, PortfolioSnapshot
 from src.stocks.trading.allocation_policy import rank_stock_candidate_indices
+from src.stocks.trading.policy import (  # canonical ownership
+    CompoundingPolicyConfig as _PolicyCompoundingConfig,
+)
+from src.stocks.trading.policy import (
+    LotSizingConfig as _PolicyLotSizingConfig,
+)
+from src.stocks.trading.policy import (
+    StockRiskPolicy as _PolicyStockRiskPolicy,
+)
+from src.stocks.trading.policy import (
+    stock_risk_policy_fingerprint as _policy_fingerprint,
+)
 
 logger = logging.getLogger("stocks.trading.portfolio_constructor")
 
@@ -1256,8 +1268,15 @@ def stock_risk_policy_fingerprint(policy: StockRiskPolicy) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+# Canonical ownership is in policy.py; alias for compatibility and identity equality  # noqa: F811
+CompoundingPolicyConfig = _PolicyCompoundingConfig  # type: ignore  # noqa: F811
+LotSizingConfig = _PolicyLotSizingConfig  # type: ignore  # noqa: F811
+StockRiskPolicy = _PolicyStockRiskPolicy  # type: ignore  # noqa: F811
+stock_risk_policy_fingerprint = _policy_fingerprint  # type: ignore  # noqa: F811
+
+
 def construct_target_allocations(
-    scores: pl.DataFrame,
+    panel: pl.DataFrame,
     instruments: Mapping[str, Instrument],
     portfolio: PortfolioSnapshot,
     policy: StockRiskPolicy,
@@ -1267,9 +1286,9 @@ def construct_target_allocations(
     Returns allocations sorted by ``instrument_id``. When no input is eligible,
     returns an empty tuple rather than synthetic weights.
     """
-    _validate_scores_frame(scores, instruments)
+    _validate_scores_frame(panel, instruments)
 
-    panel = scores.sort([_SESSION_COLUMN, "instrument_id"])
+    panel = panel.sort([_SESSION_COLUMN, "instrument_id"])
     if "__vol" not in panel.columns:
         returns = _returns_column(panel)
         panel = panel.with_columns(
