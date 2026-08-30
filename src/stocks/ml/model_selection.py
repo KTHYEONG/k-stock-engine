@@ -73,6 +73,52 @@ _SCREEN_REJECTED_LOWER_BOUND = -1.0e12
 
 
 @dataclass(frozen=True, slots=True)
+class ScreenCalendarCapacity:
+    scheduled_decision_count: int
+    names_per_session: int
+    required_rows: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.scheduled_decision_count, int) or self.scheduled_decision_count < 0:
+            raise ValueError("scheduled_decision_count must be non-negative int")
+        if not isinstance(self.names_per_session, int) or self.names_per_session < 1:
+            raise ValueError("names_per_session must be positive int")
+        if not isinstance(self.required_rows, int) or self.required_rows < 0:
+            raise ValueError("required_rows must be non-negative int")
+        if int(self.required_rows) != int(self.scheduled_decision_count) * int(self.names_per_session):
+            raise ValueError("required_rows must equal scheduled_decision_count * names_per_session")
+
+
+def resolve_screen_calendar_capacity(frame: pl.DataFrame, *, decision_cadence_sessions: int, names_per_session: int) -> ScreenCalendarCapacity:
+    if not isinstance(decision_cadence_sessions, int) or decision_cadence_sessions < 1:
+        raise ValueError("decision_cadence_sessions must be positive int")
+    if not isinstance(names_per_session, int) or names_per_session < 1:
+        raise ValueError("names_per_session must be positive int")
+    session_col = SESSION_COLUMN if SESSION_COLUMN in frame.columns else (_SESSION_IDX if _SESSION_IDX in frame.columns else None)
+    if session_col is None:
+        raise ValueError("frame must carry session for calendar capacity")
+    try:
+        sessions_sorted = sorted(frame[session_col].unique().to_list())
+    except Exception:
+        sessions_sorted = frame[session_col].unique().sort().to_list()
+    if not sessions_sorted:
+        scheduled: list[object] = []
+    elif len(sessions_sorted) >= 2:
+        try:
+            from src.stocks.trading.rebalance_schedule import rebalance_session_indices
+
+            idxs = rebalance_session_indices(tuple(sessions_sorted), min(sessions_sorted), max(sessions_sorted), int(decision_cadence_sessions), legacy_daily=False)
+            scheduled = [sessions_sorted[i] for i in idxs if 0 <= i < len(sessions_sorted)]
+        except Exception:
+            scheduled = sessions_sorted[:: int(decision_cadence_sessions)]
+    else:
+        scheduled = sessions_sorted
+    scheduled_count = len(scheduled)
+    required = int(scheduled_count) * int(names_per_session)
+    return ScreenCalendarCapacity(scheduled_decision_count=int(scheduled_count), names_per_session=int(names_per_session), required_rows=int(required))
+
+
+@dataclass(frozen=True, slots=True)
 class ScreenRouteDiagnostic:
     reason: str
     fold_id: int = 0
@@ -223,7 +269,7 @@ def build_model_selection_study_settings(parsed: object, request: NetAlphaTraini
     wall = float(_get("model_selection_wall_clock_seconds", 900.0))
     screen = float(_get("model_selection_screen_phase_seconds", 720.0))
     train_rows = int(_get("model_selection_screen_train_rows", 3000))
-    valid_rows = int(_get("model_selection_screen_validation_rows", 1000))
+    valid_rows = int(_get("model_selection_screen_validation_rows", 12000))  # valid_rows = int(_get('model_selection_screen_validation_rows', 12000))
     max_replay = int(_get("model_selection_max_full_replay_families", 2))
     # allow alternate naming
     if hasattr(parsed, "candidate_training_lookback_sessions"):
@@ -563,7 +609,9 @@ def deterministic_screen_sample_rows(
             sessions_sorted = sorted(frame[session_col].unique().to_list())
         except Exception:
             sessions_sorted = frame[session_col].unique().sort().to_list()
-        # scheduled decisions via rebalance scheduler
+        # scheduled decisions via rebalance scheduler - reuse shared capacity helper for boundary
+        capacity = resolve_screen_calendar_capacity(frame, decision_cadence_sessions=int(decision_cadence_sessions), names_per_session=int(nps))  # capacity = resolve_screen_calendar_capacity(frame, decision_cadence_sessions=..., names_per_session=...)
+        required_rows = int(capacity.required_rows)
         if len(sessions_sorted) >= 2:
             try:
                 from src.stocks.trading.rebalance_schedule import rebalance_session_indices
@@ -573,7 +621,6 @@ def deterministic_screen_sample_rows(
                 scheduled = sessions_sorted[:: int(decision_cadence_sessions)]
         else:
             scheduled = sessions_sorted
-        required_rows = len(scheduled) * int(nps)
         if int(max_rows) < int(required_rows):
             raise ValueError(f"insufficient screen rows: required_rows={required_rows} max_rows={max_rows}")
         # PIT ordering per scheduled session
@@ -3558,6 +3605,79 @@ def evaluate_model_selection_study(
                 "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
             },
         }
+    # resolve capacity for every outer validation fold before prepare_screening_fold_cache or any learner fit
+    if _ref_cell is not None:
+        _cadence = int(_ref_cell.rebalance_frequency_sessions)
+        _top_k = int(_ref_cell.top_k)
+        _multiplier = int(settings.compute_budget.screen_cross_section_multiplier)
+        _names = int(_top_k) * int(_multiplier)
+        _configured = int(settings.compute_budget.screen_validation_rows_per_fold)
+        _per_fold_decisions: list[int] = []
+        _per_fold_required: list[int] = []
+        _max_required = 0
+        _headroom_ok = True
+        for _fold in folds:
+            try:
+                _val = pre_holdout[_fold.validation_mask]
+            except Exception:
+                try:
+                    _val = pre_holdout.filter(pl.col(_SESSION_IDX) >= _fold.validation_decision_start)
+                except Exception:
+                    _val = pre_holdout
+            try:
+                cap = resolve_screen_calendar_capacity(_val, decision_cadence_sessions=int(_cadence), names_per_session=int(_names))
+                _per_fold_decisions.append(int(cap.scheduled_decision_count))
+                _per_fold_required.append(int(cap.required_rows))
+                if int(cap.required_rows) > _max_required:
+                    _max_required = int(cap.required_rows)
+                # headroom: check per-session row count vs names
+                _sess_col = SESSION_COLUMN if SESSION_COLUMN in _val.columns else _SESSION_IDX if _SESSION_IDX in _val.columns else None
+                if _sess_col is not None:
+                    try:
+                        _counts = _val.group_by(_sess_col).len()
+                        if not _counts.is_empty() and int(_counts["len"].min()) < int(_names):
+                            _headroom_ok = False
+                    except Exception:
+                        _headroom_ok = False
+            except Exception:
+                _per_fold_decisions.append(0)
+                _per_fold_required.append(0)
+                _headroom_ok = False
+        # Preserve the existing terminal budget gate if preflight itself crosses the deadline.
+        if time.monotonic() < deadline and _max_required > 0 and _configured < _max_required:
+            elapsed = time.monotonic() - start_monotonic
+            return {
+                **header,
+                "study_complete": False,
+                "next_action": "insufficient-screen-sample-capacity",
+                "selected_family": None,
+                "recommended_lookback_sessions": None,
+                "recommended_is_expanding": False,
+                "rejection_reason_counts": {"insufficient-screen-sample-capacity": 1},
+                "candidates": [],
+                "survivors": [],
+                "runtime_ledger": {
+                    "stage": "screen_sample_capacity",
+                    "elapsed_seconds": float(elapsed),
+                    "effective_fold_count": int(fold_count),
+                    "screen_fold_count": int(fold_count),
+                    "screen_learner_fit_count": 0,
+                    "attribution_prediction_count": 0,
+                    "oof_fit_count": 0,
+                    "replay_count": 0,
+                    "row_count": row_count_global,
+                    "cache_hits": 0,
+                    "model_fit_count": 0,
+                    "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+                    "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+                    "configured_rows": int(_configured),
+                    "required_rows": int(_max_required),
+                    "headroom_ok": bool(_headroom_ok),
+                    "per_fold_scheduled_decision_counts": list(_per_fold_decisions),
+                    "per_fold_decision_counts": list(_per_fold_decisions),
+                    "per_fold_required_rows": list(_per_fold_required),
+                },
+            }
     # Prepare immutable screening caches once per fold (shared across families).
     all_roles = stock_net_alpha_v1_roles()
     roles = {
