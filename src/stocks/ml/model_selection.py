@@ -73,6 +73,20 @@ _SCREEN_REJECTED_LOWER_BOUND = -1.0e12
 
 
 @dataclass(frozen=True, slots=True)
+class ScreenRouteDiagnostic:
+    reason: str
+    fold_id: int = 0
+    family: object | None = None
+    detail: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.reason:
+            raise ValueError("reason must be non-empty")
+        if not isinstance(self.fold_id, int) or self.fold_id < 0:
+            raise ValueError("fold_id must be non-negative int")
+
+
+@dataclass(frozen=True, slots=True)
 class ReferenceExecutionCell:
     horizon_sessions: int
     rebalance_frequency_sessions: int
@@ -518,6 +532,11 @@ class ScreeningFoldCache:
     train_sample_rows: np.ndarray
     validation_sample_rows: np.ndarray
     source_group_columns: tuple[tuple[str, tuple[str, ...]], ...]
+    train_session_count: int = 0
+    validation_session_count: int = 0
+    execution_top_k: int | None = None
+    rebalance_frequency_sessions: int | None = None
+    preflight_diagnostic: object | None = None
 
 
 def deterministic_screen_sample_rows(
@@ -845,6 +864,15 @@ def prepare_screening_fold_cache(
             raise ValueError("screen sample has fewer than minimum_tail_draws sessions")
         if int(counts["len"].min()) <= int(minimum_rows_per_session):
             raise ValueError("screen sample has no cross-sectional headroom")
+    # Preflight: cache common execution columns and decision-session counts
+    train_session_count = int(train_features[SESSION_COLUMN].n_unique()) if SESSION_COLUMN in train_features.columns else int(train_features[_SESSION_IDX].n_unique()) if _SESSION_IDX in train_features.columns else 0
+    validation_session_count = int(validation_features[SESSION_COLUMN].n_unique()) if SESSION_COLUMN in validation_features.columns else int(validation_features[_SESSION_IDX].n_unique()) if _SESSION_IDX in validation_features.columns else 0
+    preflight_diagnostic = None
+    # Detect infeasibility before any learner fit: insufficient sessions or undersized cross-section
+    if validation_session_count < int(minimum_tail_draws):
+        preflight_diagnostic = ScreenRouteDiagnostic(reason="insufficient-decision-observations", fold_id=int(fold.segment_id), detail=f"validation_sessions={validation_session_count} < minimum_tail_draws={minimum_tail_draws}")
+    elif train_session_count < 1:
+        preflight_diagnostic = ScreenRouteDiagnostic(reason="insufficient-decision-observations", fold_id=int(fold.segment_id), detail="train empty")
     return ScreeningFoldCache(
         fold=fold,
         schema=schema,
@@ -853,6 +881,11 @@ def prepare_screening_fold_cache(
         train_sample_rows=train_sample_rows,
         validation_sample_rows=validation_sample_rows,
         source_group_columns=source_group_columns,
+        train_session_count=int(train_session_count),
+        validation_session_count=int(validation_session_count),
+        execution_top_k=int(minimum_rows_per_session),
+        rebalance_frequency_sessions=int(decision_cadence_sessions) if decision_cadence_sessions is not None else None,
+        preflight_diagnostic=preflight_diagnostic,
     )
 
 
@@ -1431,6 +1464,27 @@ def _screen_prefix_economic_evidence(
         oracle_tail_excess_lower_bound=float(oracle_lb),
     )
 
+def _classify_expected_route_failure(exc: Exception) -> str | None:
+    if isinstance(exc, TimeoutError):
+        return None
+    msg = str(exc).lower()
+    if "gross" in msg:
+        return "missing-gross-return"
+    if "cross-section" in msg or "undersized" in msg or "top_k" in msg or "headroom" in msg:
+        return "undersized-cross-section"
+    if ("insufficient" in msg or "tail" in msg or "session" in msg) and ("decision" in msg or "session" in msg):
+        return "insufficient-decision-observations"
+    if "reference_cost" in msg or "reference cost" in msg:
+        return "missing-reference-cost"
+    if "non-finite" in msg or "finite" in msg:
+        return "non-finite-route-input"
+    if "empty" in msg:
+        return "insufficient-decision-observations"
+    if "no valid" in msg or "no qualifying" in msg or "prefix" in msg:
+        return "no-qualifying-prefix"
+    return None
+
+
 def screen_model_family(
     cache: ScreeningFoldCache, labels: pl.DataFrame, family: ModelFamily, budget: ModelSelectionComputeBudget, deadline: float, *, request: NetAlphaTrainingRequest | None = None, bootstrap_alpha: float | None = None, bootstrap_resamples: int | None = None,
     horizon_sessions: int | None = None, rebalance_frequency_sessions: int | None = None, execution_top_k: int | None = None, minimum_tail_draws: int | None = None,
@@ -1438,6 +1492,13 @@ def screen_model_family(
     started_at = time.monotonic()
     if time.monotonic() >= deadline:
         raise TimeoutError("budget-exhausted before screening")
+    # Preflight infeasibility must avoid learner fit
+    pre = getattr(cache, "preflight_diagnostic", None)
+    if pre is not None:
+        scores = tuple((name, 0.0) for name, _ in cache.source_group_columns)
+        attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
+        diag = ScreenRouteDiagnostic(reason=str(pre.reason), fold_id=int(cache.fold.segment_id), family=family, detail=str(getattr(pre, "detail", "")))
+        return FamilyScreenEvidence(family=family, screen_lower_bound=_SCREEN_REJECTED_LOWER_BOUND, screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False, diagnostics=(diag,))
     source_groups = cache.source_group_columns
     if not source_groups:
         raise ValueError("cache has no source groups")
@@ -1463,12 +1524,22 @@ def screen_model_family(
     else:
         labeled_train = cache.train_features
     if request is not None and TARGET_COLUMN in labeled_train.columns:
-        plan = ScreenSamplingPlan(
-            top_k=int(execution_top_k or 1),
-            cross_section_multiplier=int(budget.screen_cross_section_multiplier),
-            minimum_tail_draws=int(minimum_tail_draws or 1),
-        )
-        inner_evidence = _select_inner_feature_groups(labeled_train, family, request, plan)
+        try:
+            plan = ScreenSamplingPlan(
+                top_k=int(execution_top_k or 1),
+                cross_section_multiplier=int(budget.screen_cross_section_multiplier),
+                minimum_tail_draws=int(minimum_tail_draws or 1),
+            )
+            inner_evidence = _select_inner_feature_groups(labeled_train, family, request, plan)
+        except Exception as exc:
+            reason = _classify_expected_route_failure(exc)
+            if reason is None:
+                raise
+            scores = tuple((name, 0.0) for name, _ in source_groups)
+            attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
+            diag = ScreenRouteDiagnostic(reason=reason, fold_id=int(cache.fold.segment_id), family=family, detail=str(exc)[:200])
+            # Preserve sentinel lower bound regardless of diagnostic detail
+            return FamilyScreenEvidence(family=family, screen_lower_bound=_SCREEN_REJECTED_LOWER_BOUND, screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False, diagnostics=(diag,))
         selected_groups = set(inner_evidence.selected_source_groups)
         selected_columns = tuple(
             column
@@ -1500,10 +1571,14 @@ def screen_model_family(
         try:
             train_labels = _aligned_screen_labels(cache.train_features, train_idx, labels)
             valid_labels = _aligned_screen_labels(cache.validation_features, valid_idx, labels)
-        except Exception:
+        except Exception as exc:
+            reason = _classify_expected_route_failure(exc)
+            if reason is None:
+                raise
             scores = tuple((name, 0.0) for name, _ in source_groups)
             attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
-            return FamilyScreenEvidence(family=family, screen_lower_bound=_SCREEN_REJECTED_LOWER_BOUND, screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False)
+            diag = ScreenRouteDiagnostic(reason=reason, fold_id=int(cache.fold.segment_id), family=family, detail=str(exc)[:200])
+            return FamilyScreenEvidence(family=family, screen_lower_bound=_SCREEN_REJECTED_LOWER_BOUND, screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False, diagnostics=(diag,))
         _debug_timing("screen_label_alignment_total", label_started_at, family=family.value, fold_id=int(cache.fold.segment_id))
         train_row_idx = train_labels["__row_idx"].to_numpy().astype(np.int64, copy=False)
         valid_row_idx = valid_labels["__row_idx"].to_numpy().astype(np.int64, copy=False)
@@ -1787,7 +1862,13 @@ def screen_model_family(
     except Exception:
         route_kind = "unhedged_absolute" if "unhedged" in str(route_kind).lower() else "hedged_residual"
     if route_kind == "unhedged_absolute" and _GC not in labels.columns:
-        raise ValueError(f"unhedged_absolute screen requires {_GC!r} column (gross missing)")
+        scores = tuple((name, 0.0) for name, _ in source_groups)
+        attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
+        diag = ScreenRouteDiagnostic(reason="missing-gross-return", fold_id=int(cache.fold.segment_id), family=family, detail=f"missing {_GC}")
+        eff_top_k = int(execution_top_k) if execution_top_k is not None else 12
+        eff_cadence = int(rebalance_frequency_sessions) if rebalance_frequency_sessions is not None else 10
+        see = ScreenEconomicEvidence(fold_id=int(cache.fold.segment_id), route_kind=str(route_kind), top_k=int(eff_top_k), rebalance_frequency_sessions=int(eff_cadence), session_count=0, selected_prefix_size=1, absolute_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), oracle_tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND))
+        return FamilyScreenEvidence(family=family, screen_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False, screen_economic_evidence=see, diagnostics=(diag,))
     # The caller supplies the single reference cell selected before any fitting.
     feasible_cells = request.execution_frontier.require_feasible_horizons(request.portfolio.max_exposure, request.portfolio.max_single_weight)
     _, cadence, top_k = feasible_cells[0]
@@ -1817,14 +1898,14 @@ def screen_model_family(
         train_labels = _aligned_screen_labels(cache.train_features, train_idx, labels)
         valid_labels = _aligned_screen_labels(cache.validation_features, valid_idx, labels)
     except Exception as exc:
-        # If alignment failed due to missing gross, propagate ValueError
-        if "gross" in str(exc).lower():
+        reason = _classify_expected_route_failure(exc)
+        if reason is None:
             raise
         scores = tuple((name, 0.0) for name, _ in source_groups)
         attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
-        # Return rejected with bounded evidence
         see = ScreenEconomicEvidence(fold_id=int(cache.fold.segment_id), route_kind=str(route_kind), top_k=int(top_k), rebalance_frequency_sessions=int(cadence), session_count=0, selected_prefix_size=1, absolute_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), oracle_tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND))
-        return FamilyScreenEvidence(family=family, screen_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False, screen_economic_evidence=see)
+        diag = ScreenRouteDiagnostic(reason=reason, fold_id=int(cache.fold.segment_id), family=family, detail=str(exc)[:200])
+        return FamilyScreenEvidence(family=family, screen_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False, screen_economic_evidence=see, diagnostics=(diag,))
     _debug_timing("screen_label_alignment_total", label_started_at, family=family.value, fold_id=int(cache.fold.segment_id))
     train_row_idx = train_labels["__row_idx"].to_numpy().astype(np.int64, copy=False)
     valid_row_idx = valid_labels["__row_idx"].to_numpy().astype(np.int64, copy=False)
@@ -1847,7 +1928,8 @@ def screen_model_family(
         scores = tuple((name, 0.0) for name, _ in source_groups)
         attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
         see = ScreenEconomicEvidence(fold_id=int(cache.fold.segment_id), route_kind=str(route_kind), top_k=int(top_k), rebalance_frequency_sessions=int(cadence), session_count=0, selected_prefix_size=1, absolute_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), oracle_tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND))
-        return FamilyScreenEvidence(family=family, screen_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False, screen_economic_evidence=see)
+        diag = ScreenRouteDiagnostic(reason="route-infeasible", fold_id=int(cache.fold.segment_id), family=family, detail="misaligned training matrix")
+        return FamilyScreenEvidence(family=family, screen_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False, screen_economic_evidence=see, diagnostics=(diag,))
     finite_train = np.isfinite(X_train).all(axis=1) & np.isfinite(y_train)
     finite_valid_base = np.isfinite(X_valid).all(axis=1) & np.isfinite(y_valid)
     # Also need finite gross/cost for unhedged, else risk/cost
@@ -1862,7 +1944,8 @@ def screen_model_family(
         scores = tuple((name, 0.0) for name, _ in source_groups)
         attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
         see = ScreenEconomicEvidence(fold_id=int(cache.fold.segment_id), route_kind=str(route_kind), top_k=int(top_k), rebalance_frequency_sessions=int(cadence), session_count=0, selected_prefix_size=1, absolute_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), oracle_tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND))
-        return FamilyScreenEvidence(family=family, screen_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False, screen_economic_evidence=see)
+        diag = ScreenRouteDiagnostic(reason="non-finite-route-input", fold_id=int(cache.fold.segment_id), family=family, detail="no finite rows")
+        return FamilyScreenEvidence(family=family, screen_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False, screen_economic_evidence=see, diagnostics=(diag,))
     X_train = X_train[finite_train]
     y_train = y_train[finite_train]
     session_train = session_train[finite_train]
@@ -2032,16 +2115,20 @@ def screen_model_family(
                 gain = np.ones(Xtr.shape[1], dtype=np.float64)
             return booster, pred_fn, gain
         raise ValueError(f"unknown family {family}")
-    # Fit base to get native importance for ranking
+    # Fit base to get native importance for ranking - preflight already avoided infeasible fit
     base_fit_started_at = time.monotonic()
     try:
         _model, predict_fn, native_importance = _fit_family(X_train, y_train, X_valid)
         base_pred = predict_fn(X_valid)
-    except Exception:
+    except Exception as exc:
+        reason = _classify_expected_route_failure(exc)
+        if reason is None:
+            raise
         scores = tuple((name, 0.0) for name, _ in source_groups)
         attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
         see = ScreenEconomicEvidence(fold_id=int(cache.fold.segment_id), route_kind=str(route_kind), top_k=int(top_k), rebalance_frequency_sessions=int(cadence), session_count=0, selected_prefix_size=1, absolute_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), oracle_tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND))
-        return FamilyScreenEvidence(family=family, screen_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False, screen_economic_evidence=see)
+        diag = ScreenRouteDiagnostic(reason=reason, fold_id=int(cache.fold.segment_id), family=family, detail=str(exc)[:200])
+        return FamilyScreenEvidence(family=family, screen_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False, screen_economic_evidence=see, diagnostics=(diag,))
     _debug_timing("screen_base_fit_predict", base_fit_started_at, family=family.value, fold_id=int(cache.fold.segment_id), train_rows=int(X_train.shape[0]), validation_rows=int(X_valid.shape[0]))
     base_loss = _validation_economic_loss(y_valid, base_pred)
     contributions: dict[str, float] = {}
@@ -2103,12 +2190,19 @@ def screen_model_family(
             _, pf, _ = _fit_family(Xtr, y_train, Xva)
             pred = pf(Xva)
         except Exception as exc:
+            reason = _classify_expected_route_failure(exc)
+            if reason is None:
+                raise
             logger.debug(
                 "[ALGO] stage=screen_prefix_fit family=%s prefix=%d status=failed reason=%s",
                 family.value,
                 int(k),
                 type(exc).__name__,
             )
+            diag_tmp = ScreenRouteDiagnostic(reason=reason, fold_id=int(cache.fold.segment_id), family=family, detail=str(exc)[:200])
+            if 'prefix_diag_list' not in locals():
+                prefix_diag_list = []  # type: ignore
+            prefix_diag_list.append(diag_tmp)  # type: ignore
             continue
         # Build scored frame for this prefix: includes prediction and label columns
         # valid_labels is filtered DataFrame with __row_idx etc; use it to build scored
@@ -2147,9 +2241,15 @@ def screen_model_family(
                 oracle_tail_excess_lower_bound=see_raw.oracle_tail_excess_lower_bound,
             )
         except Exception as exc:
-            # If undersized or gross missing, propagate gross error, otherwise skip this prefix
-            if "gross" in str(exc).lower():
+            reason = _classify_expected_route_failure(exc)
+            if reason is None:
                 raise
+            # Track diagnostic for this prefix failure without synthesizing utility
+            diag_tmp = ScreenRouteDiagnostic(reason=reason, fold_id=int(cache.fold.segment_id), family=family, detail=str(exc)[:200])
+            # Store for final sentinel if no prefix survives
+            if 'prefix_diag_list' not in locals():
+                prefix_diag_list = []  # type: ignore
+            prefix_diag_list.append(diag_tmp)  # type: ignore
             continue
         # Store also raw model excess array for SE computation? We recompute later
         prefix_evidences.append((int(k), see, pred, series))
@@ -2157,7 +2257,8 @@ def screen_model_family(
         scores = tuple((name, 0.0) for name, _ in source_groups)
         attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=tuple(scores_list), selected_source_groups=tuple(n for n,_ in eligible_ranked[:1]) if eligible_ranked else tuple(n for n,_ in scores_list[:1]), schema_fingerprint=cache.schema.fingerprint)
         see = ScreenEconomicEvidence(fold_id=int(cache.fold.segment_id), route_kind=str(route_kind), top_k=int(top_k), rebalance_frequency_sessions=int(cadence), session_count=0, selected_prefix_size=1, absolute_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), oracle_tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND))
-        return FamilyScreenEvidence(family=family, screen_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False, screen_economic_evidence=see)
+        diags = tuple(prefix_diag_list) if 'prefix_diag_list' in locals() and prefix_diag_list else (ScreenRouteDiagnostic(reason="no-qualifying-prefix", fold_id=int(cache.fold.segment_id), family=family, detail="no prefix survived"),)
+        return FamilyScreenEvidence(family=family, screen_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND), screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False, screen_economic_evidence=see, diagnostics=diags)
     # Select smallest prefix within one SE of best tail_excess lower bound
     best = max(prefix_evidences, key=lambda x: x[1].tail_excess_lower_bound)
     best_tail = float(best[1].tail_excess_lower_bound)
@@ -2221,8 +2322,9 @@ def screen_model_family(
     chosen_names_final = [n for n, _ in eligible_ranked[:chosen_k]]
     attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=tuple(scores_list), selected_source_groups=tuple(chosen_names_final), schema_fingerprint=cache.schema.fingerprint)
     # Qualification will be decided by caller based on tail bounds; here just return evidence
-    # screen_lower_bound maps to tail_excess for compatibility, screen_se to se
-    return FamilyScreenEvidence(family=family, screen_lower_bound=float(chosen_see.tail_excess_lower_bound), screen_se=float(se), attribution=attr, qualified_for_full_oof=False, selected_family=False, screen_economic_evidence=chosen_see, route_utility_series=chosen_series)
+    # screen_lower_bound maps to tail_excess for compatibility, screen_se to se - pooled utility is sole admission
+    diags_final = tuple(prefix_diag_list) if 'prefix_diag_list' in locals() and prefix_diag_list else ()
+    return FamilyScreenEvidence(family=family, screen_lower_bound=float(chosen_see.tail_excess_lower_bound), screen_se=float(se), attribution=attr, qualified_for_full_oof=False, selected_family=False, screen_economic_evidence=chosen_see, route_utility_series=chosen_series, diagnostics=diags_final)
 
 
 def _fingerprint(payload: object) -> str:
@@ -3442,6 +3544,7 @@ def evaluate_model_selection_study(
             cache_count=cache_hits,
         )
     # Screen all six families on the same caches/snapshot.
+    # wiring: screen_model_family(cache, label_join, family, settings.compute_budget, screen_deadline)
     screen_evidence: list[FamilyScreenEvidence] = []
     for family in settings.candidate_families:
         # Aggregate lower bounds across folds for deterministic ranking.
@@ -3588,7 +3691,16 @@ def evaluate_model_selection_study(
                     )
                 else:
                     agg_econ = econ_evidences[0]
-            agg_ev = FamilyScreenEvidence(family=family, screen_lower_bound=float(agg_lb), screen_se=float(agg_se), attribution=rep_attr, qualified_for_full_oof=False, selected_family=False, fold_attributions=fold_attrs, screen_economic_evidence=agg_econ)
+            # Propagate ordered diagnostics without altering pooled lower bound
+            agg_diags: tuple[object, ...] = ()
+            for fev in fold_evidences:
+                di = getattr(fev, "diagnostics", ())
+                if di:
+                    agg_diags = agg_diags + tuple(di)  # preserve order
+            # Keep bounded: at most one per fold
+            if len(agg_diags) > len(fold_evidences):
+                agg_diags = agg_diags[: len(fold_evidences)]
+            agg_ev = FamilyScreenEvidence(family=family, screen_lower_bound=float(agg_lb), screen_se=float(agg_se), attribution=rep_attr, qualified_for_full_oof=False, selected_family=False, fold_attributions=fold_attrs, screen_economic_evidence=agg_econ, diagnostics=agg_diags)
             screen_evidence.append(agg_ev)
     # Admission: a family may enter full OOF only when finite screen lower bound is strictly positive and within one SE of best positive family.
     declared_index = {fam: idx for idx, fam in enumerate(settings.candidate_families)}
@@ -3603,6 +3715,13 @@ def evaluate_model_selection_study(
             return float(ev.screen_lower_bound)
         return float(see.tail_excess_lower_bound)
     def _rejection_status(ev) -> str:
+        # Diagnostic reason is stable and bounded, visible in payload
+        diags = getattr(ev, "diagnostics", ())
+        if diags:
+            first = diags[0]
+            reason = getattr(first, "reason", str(first)) if hasattr(first, "reason") else str(first)
+            # Ensure bounded stable code
+            return str(reason)
         see = getattr(ev, "screen_economic_evidence", None)
         if see is not None:
             if not math.isfinite(float(see.tail_excess_lower_bound)) or float(see.tail_excess_lower_bound) <= 0:
