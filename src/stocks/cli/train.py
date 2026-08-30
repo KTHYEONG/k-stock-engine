@@ -895,6 +895,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--enable-continuous-uncertainty-rung",
+        action="store_true",
+        help="Opt in to the continuous_uncertainty_v1 frontier profile (finite-mean gate and uncertainty-weighted sizing)",
+    )
+    parser.add_argument(
         "--hedge-leverage-grid",
         type=str,
         default=None,
@@ -1049,6 +1054,10 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
         from src.stocks.config.research import policy_profiles_with_unhedged_stack
 
         policy_profiles = policy_profiles_with_unhedged_stack()
+    if bool(getattr(args, 'enable_continuous_uncertainty_rung', False)):
+        from src.stocks.config.research import policy_profiles_with_continuous_uncertainty
+
+        policy_profiles = policy_profiles_with_continuous_uncertainty()
     return NetAlphaTrainingRequest(
         artifact_id=args.artifact_id,
         candidate_horizon_sessions=horizons,

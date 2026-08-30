@@ -323,6 +323,15 @@ class DirectMarketDataLoader:
         except FileNotFoundError:
             return None
 
+    def _read_label_manifest(
+        self, request: DirectDataRequest
+    ) -> DatasetManifest | None:
+        """Read the label manifest for account-level reference metadata."""
+        try:
+            return self._label_store.read_manifest(request.label_dataset_id)
+        except FileNotFoundError:
+            return None
+
     def _read_bounded_projection(
         self,
         dataset_id: str,
@@ -1328,6 +1337,7 @@ class DirectMarketDataLoader:
                         feature_frame = feature_frame.drop(candidate)
 
         feature_manifest = self._read_feature_manifest(request)
+        label_manifest = self._read_label_manifest(request)
         manifest_source: DatasetManifest | None = feature_manifest
         if manifest_source is None:
             sessions = sorted(decision_keys["session"].unique().to_list())
@@ -1349,6 +1359,11 @@ class DirectMarketDataLoader:
             feature_set=CANONICAL_FEATURE_SET,
             feature_set_hash=manifest_source.feature_set_hash or "net-alpha-v1",
             row_count=feature_frame.height,
+            reference_notional=(
+                manifest_source.reference_notional
+                if manifest_source.reference_notional is not None
+                else (label_manifest.reference_notional if label_manifest is not None else None)
+            ),
         )
         return NetAlphaResearchData(
             feature_frame=feature_frame,
