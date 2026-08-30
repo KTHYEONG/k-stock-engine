@@ -1550,6 +1550,7 @@ class FamilyScreenEvidence:
     fold_attributions: tuple[FeatureAttributionEvidence, ...] = ()
     screen_economic_evidence: ScreenEconomicEvidence | None = None
     route_utility_series: ScreenRouteUtilitySeries | None = None
+    diagnostics: tuple[object, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.family, ModelFamily):
