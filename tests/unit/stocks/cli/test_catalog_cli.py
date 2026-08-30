@@ -49,6 +49,45 @@ def _tree_state(root) -> dict[str, tuple[int, int]]:
     }
 
 
+def test_catalog_activation_replaces_each_operational_kind_atomically(tmp_path) -> None:
+    from src.stocks.cli.catalog import activate_active_datasets
+    from src.stocks.data.catalog import ActiveDatasetPolicy, CatalogEntry, CatalogKind, CatalogStore, EvidenceCompleteness
+    from src.stocks.data.contracts import CoverageRange
+    from datetime import UTC, datetime, date
+
+    catalog_root = tmp_path / "catalog"
+    store = CatalogStore(catalog_root)
+    rng = CoverageRange(start=date(2024, 1, 1), end=date(2024, 3, 31))
+    # register initial operational entries
+    for name in ["base_v1", "feat_v1", "label_v1", "costs_v1"]:
+        kind = {"base_v1": CatalogKind.BASE_PANEL, "feat_v1": CatalogKind.FEATURES, "label_v1": CatalogKind.LABELS, "costs_v1": CatalogKind.COSTS}[name]
+        store.register(CatalogEntry(kind=kind, name=name, content_hash="h_"+name, schema_hash="s", registered_at=datetime(2024, 1, 1, tzinfo=UTC), coverage=rng, completeness=EvidenceCompleteness.COMPLETE, path=str(tmp_path / name)))
+    # also register new feature/label variants
+    for name in ["feat_v2", "label_v2"]:
+        kind = CatalogKind.FEATURES if "feat" in name else CatalogKind.LABELS
+        store.register(CatalogEntry(kind=kind, name=name, content_hash="h_"+name, schema_hash="s", registered_at=datetime(2024, 1, 1, tzinfo=UTC), coverage=rng, completeness=EvidenceCompleteness.COMPLETE, path=str(tmp_path / name)))
+    store.save_active_policy(ActiveDatasetPolicy(entries=((CatalogKind.BASE_PANEL, "base_v1"), (CatalogKind.FEATURES, "feat_v1"), (CatalogKind.LABELS, "label_v1"), (CatalogKind.COSTS, "costs_v1"))))
+    prior_text = (catalog_root / "active_datasets.json").read_text(encoding="utf-8")
+    # activate new FEATURES and LABELS
+    policy = activate_active_datasets(store, {CatalogKind.FEATURES: "feat_v2", CatalogKind.LABELS: "label_v2"})
+    # exactly one per kind
+    assert len([k for k, _ in policy.entries if k == CatalogKind.BASE_PANEL]) == 1
+    assert len([k for k, _ in policy.entries if k == CatalogKind.FEATURES]) == 1
+    assert len([k for k, _ in policy.entries if k == CatalogKind.LABELS]) == 1
+    assert len([k for k, _ in policy.entries if k == CatalogKind.COSTS]) == 1
+    assert dict(policy.entries)[CatalogKind.FEATURES] == "feat_v2"
+    assert dict(policy.entries)[CatalogKind.LABELS] == "label_v2"
+    assert dict(policy.entries)[CatalogKind.BASE_PANEL] == "base_v1"
+    assert dict(policy.entries)[CatalogKind.COSTS] == "costs_v1"
+    # failed validation leaves prior byte-identical
+    before = (catalog_root / "active_datasets.json").read_bytes()
+    with pytest.raises(ValueError, match="nonexistent"):  # noqa: PT011
+        activate_active_datasets(store, {CatalogKind.FEATURES: "nonexistent_feat"})
+    after = (catalog_root / "active_datasets.json").read_bytes()
+    assert before == after
+    assert prior_text != after.decode()  # we did update once, so prior_text differs from after (but failed second leaves unchanged)
+
+
 def test_catalog_validate_readiness_requires_dataset_dir_and_feature() -> None:
     with pytest.raises(SystemExit):
         catalog.main(["validate-readiness"])
