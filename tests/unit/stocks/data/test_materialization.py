@@ -34,3 +34,15 @@ class TestResearchV2BackwardCompatibility:
 
     def test_materialize_function_exists(self) -> None:
         assert callable(research_v2_materialize)
+
+
+def test_materialization_uses_one_request_type() -> None:  # noqa: N802
+    from src.stocks.data.materialization import NetAlphaMaterializationRequest as MatRequest  # noqa: N812
+    from src.stocks.data.research_v2 import NetAlphaMaterializationRequest as V2Request  # noqa: N812
+    from src.stocks.data.materialization import materialize_net_alpha_snapshot as MatFunc  # noqa: N812
+    from src.stocks.data.research_v2 import materialize_net_alpha_snapshot as V2Func  # noqa: N812
+
+    assert MatRequest is V2Request
+    assert MatFunc is V2Func
+    # no subclass-only behavior: MatRequest should not be subclass of V2Request separately
+    assert not (issubclass(MatRequest, V2Request) and MatRequest is not V2Request)
