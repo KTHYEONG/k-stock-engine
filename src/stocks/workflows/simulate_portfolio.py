@@ -440,6 +440,7 @@ def _profile_sizing_mode(
     "alpha_vol_squared_v1",
     "risk_balanced_waterfill_v2",
     "confidence_mean_variance_v1",
+    "continuous_uncertainty_v1",
 ]:
     """Extract sizing_mode from a policy profile, defaulting to alpha_vol_squared_v1.
 
@@ -458,16 +459,19 @@ def _profile_sizing_mode(
         "alpha_vol_squared_v1",
         "risk_balanced_waterfill_v2",
         "confidence_mean_variance_v1",
+        "continuous_uncertainty_v1",
     ):
         raise ValueError(
             f"sizing_mode must be 'alpha_vol_squared_v1', "
-            f"'risk_balanced_waterfill_v2', or 'confidence_mean_variance_v1', got {raw!r}"
+            f"'risk_balanced_waterfill_v2', 'confidence_mean_variance_v1', "
+            f"or 'continuous_uncertainty_v1', got {raw!r}"
         )
     return cast(
         Literal[
             "alpha_vol_squared_v1",
             "risk_balanced_waterfill_v2",
             "confidence_mean_variance_v1",
+            "continuous_uncertainty_v1",
         ],
         raw,
     )
@@ -548,7 +552,8 @@ def _profile_retained_sizing_mode(
             f"got {raw!r}"
         )
     return cast(
-        Literal["freeze_v1", "band_limited_rewaterfill_v1"], raw
+        Literal["freeze_v1", "band_limited_rewaterfill_v1"],
+        raw,
     )
 
 
@@ -599,6 +604,10 @@ def _policy_from_artifact(
         economic_ranking_mode=ranking_mode,
         execution_utility_mode=mode,
         sizing_mode=sizing,
+        economic_gate_mode=cast(
+            Literal["lower_bound_v1", "finite_mean_v1"],
+            profile.get("economic_gate_mode", "lower_bound_v1"),
+        ),
         retained_sizing_mode=_profile_retained_sizing_mode(profile),
         **policy_kwargs,  # type: ignore[arg-type]
     )

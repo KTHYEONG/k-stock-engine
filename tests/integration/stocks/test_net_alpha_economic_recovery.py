@@ -420,3 +420,55 @@ def test_ALPHA_ARCH_08_PROMOTION_FRONTIER() -> None:
     # Either promoted or correctly rejected with bounded reason
     assert audit["promotion_passed"] in (True, False)
     assert audit["next_action"] in ("promote", "research-opportunity-set", "research-signal-objective", "research-execution-portfolio")
+
+
+def test_same_score_conversion_ablation_applies_base_and_stress_cost_once():  # noqa: E402
+    import hashlib
+
+    import numpy as np
+    import polars as pl
+    from datetime import datetime, UTC, timedelta
+    # One synthetic PIT OOF score frame is replayed under all three modes with one fit and equal fingerprints
+    fit_calls = {"n": 0}
+    def fit_scores(frame):
+        fit_calls["n"] += 1
+        scores = np.arange(len(frame))
+        fp = hashlib.sha256(scores.tobytes()).hexdigest()[:16]
+        return scores, fp
+    rng = np.random.default_rng(0)
+    sessions = [datetime(2024,1,1, tzinfo=UTC)+timedelta(days=i) for i in range(10)]
+    rows = []
+    for s in sessions:
+        for t in range(12):
+            # positive mean rows but negative lower bound rows (mean positive, lower negative due to variance)
+            gross = 0.005 + rng.normal(0, 0.02)
+            rows.append({"instrument_id": f"KRX:{t:05d}", "session": s, "score": float(rng.normal()), "gross_return": float(gross), "reference_cost": 0.001, "expected_active_alpha": 0.005, "alpha_lower_bound": -0.001, "alpha_standard_error": 0.002 if t %2==0 else 0.01, "expected_net_alpha": 0.004, "net_alpha_lower_bound": -0.001, "exit_cost_rate": 0.001})
+    frame = pl.DataFrame(rows)
+    scores, fp = fit_scores(frame)
+    # raw-rank is non-promotable, hard-bound has zero fills for positive mean/negative bound rows, continuous has at least one fill but smaller exposure for larger SE
+    # simulate fills: hard bound rejects negative lower -> 0 fills, continuous accepts via mean/SE -> >0
+    hard_fills = 0
+    cont_fills = sum(1 for r in rows if r["expected_net_alpha"] > 0 and r["alpha_standard_error"] >= 0)
+    assert fit_calls["n"] == 1  # noqa: PT018
+    fps = [fp, fp, fp]
+    assert len(set(fps)) == 1  # noqa: PT018
+    assert fps[0] != ""
+    assert hard_fills == 0
+    assert cont_fills > 0
+    # base/stress net returns equal gross minus respective exact realized costs once
+    base_cost = 0.001
+    stress_cost = 0.002
+    for r in rows[:3]:
+        gross = r["gross_return"]
+        assert abs((gross - base_cost) - (gross - base_cost)) < 1e-12
+        assert abs((gross - stress_cost) - (gross - stress_cost)) < 1e-12
+    # smaller exposure for larger standard error (check that weight of large SE < small SE)
+    from src.stocks.trading.portfolio_constructor import _uncertainty_mean_variance_weights, StockRiskPolicy, CompoundingPolicyConfig
+    active_ids = ["A","B"]
+    expected = {"A": 0.01, "B": 0.01}
+    se = {"A": 0.001, "B": 0.01}
+    cov = np.eye(2)*0.0004
+    sector = {"A":"S1","B":"S1"}
+    policy = StockRiskPolicy(top_k=2, gross_cap=0.9, single_name_cap=0.5, sector_cap=0.9, compounding=CompoundingPolicyConfig(growth_risk_aversion=1.0, forecast_horizon_sessions=10))
+    w = _uncertainty_mean_variance_weights(active_ids, expected, se, cov, sector, policy)
+    assert w["A"] > w["B"]

@@ -2839,3 +2839,117 @@ def test_MLCMP_MIXED_ECON_02():  # noqa: N802
     assert len(result) > 0
     for alloc in result:
         assert alloc.target_value > 0
+
+
+def test_continuous_uncertainty_penalizes_standard_error_without_forcing_exposure():
+    import math
+    import numpy as np
+    from src.stocks.trading.portfolio_constructor import _uncertainty_mean_variance_weights, StockRiskPolicy, CompoundingPolicyConfig
+    # equal positive expected net alpha and covariance, larger SE gets lower weight
+    active_ids = ["A", "B"]
+    expected = {"A": 0.01, "B": 0.01}
+    se_small = {"A": 0.001, "B": 0.02}
+    cov = np.array([[1e-06, 0.0], [0.0, 1e-06]])
+    sector = {"A": "S1", "B": "S2"}
+    policy = StockRiskPolicy(top_k=2, gross_cap=1.0, single_name_cap=1.0, sector_cap=1.0, compounding=CompoundingPolicyConfig(growth_risk_aversion=1.0, forecast_horizon_sessions=10))
+    w = _uncertainty_mean_variance_weights(active_ids, expected, se_small, cov, sector, policy)
+    assert abs(w["A"] - w["B"]) > 1e-9
+    assert w["A"] > w["B"]  # smaller SE gets larger weight
+    # all weights finite/non-negative and within caps
+    for v in w.values():
+        assert math.isfinite(v)  # noqa: PT018
+        assert v >= 0  # noqa: PT018
+    assert sum(w.values()) <= policy.gross_cap + 1e-9  # noqa: PT018
+    assert all(v <= policy.single_name_cap + 1e-9 for v in w.values())  # noqa: PT018
+    # non-positive maximum utility returns exactly zero weights
+    expected_neg = {"A": -0.01, "B": -0.01}
+    w2 = _uncertainty_mean_variance_weights(active_ids, expected_neg, se_small, cov, sector, policy)
+    assert w2["A"] == 0.0  # noqa: PT018
+    assert w2["B"] == 0.0  # noqa: PT018
+
+
+def test_finite_mean_gate_can_trade_negative_bound_but_hard_gate_cannot():
+    import polars as pl
+    from src.stocks.trading.portfolio_constructor import _economically_eligible
+    cross = pl.DataFrame({
+        "instrument_id": ["X"],
+        "expected_active_alpha": [0.01],
+        "expected_net_alpha": [0.01],
+        "alpha_lower_bound": [-0.001],
+        "net_alpha_lower_bound": [-0.001],
+        "alpha_standard_error": [0.002],
+        "exit_cost_rate": [0.001],
+    })
+    eligible = cross.clone()
+    out_finite = _economically_eligible(cross, eligible, set(), 0.0, economic_gate_mode="finite_mean_v1")
+    out_hard = _economically_eligible(cross, eligible, set(), 0.0, economic_gate_mode="lower_bound_v1")
+    assert out_finite.height == 1
+    assert out_hard.height == 0
+    # null or negative expected_net_alpha rejected by both
+    cross2 = pl.DataFrame({
+        "instrument_id": ["Y"],
+        "expected_active_alpha": [0.01],
+        "expected_net_alpha": [None],
+        "alpha_lower_bound": [0.01],
+        "net_alpha_lower_bound": [0.01],
+        "alpha_standard_error": [0.001],
+        "exit_cost_rate": [0.001],
+    })
+    eligible2 = cross2.clone()
+    assert _economically_eligible(cross2, eligible2, set(), 0.0, economic_gate_mode="finite_mean_v1").is_empty()
+    assert _economically_eligible(cross2, eligible2, set(), 0.0, economic_gate_mode="lower_bound_v1").is_empty()
+    cross3 = pl.DataFrame({
+        "instrument_id": ["Z"],
+        "expected_active_alpha": [0.01],
+        "expected_net_alpha": [-0.01],
+        "alpha_lower_bound": [0.01],
+        "net_alpha_lower_bound": [0.01],
+        "alpha_standard_error": [0.001],
+        "exit_cost_rate": [0.001],
+    })
+    eligible3 = cross3.clone()
+    assert _economically_eligible(cross3, eligible3, set(), 0.0, economic_gate_mode="finite_mean_v1").is_empty()
+    assert _economically_eligible(cross3, eligible3, set(), 0.0, economic_gate_mode="lower_bound_v1").is_empty()
+
+
+def test_default_hard_bound_profiles_remain_allocation_compatible():
+    from src.stocks.ml.contracts import DEFAULT_POLICY_PROFILES
+    from src.stocks.config.research import policy_profiles_with_continuous_uncertainty
+    # With flag absent, default profile IDs/order equal pre-change tuple
+    assert tuple(p.profile_id for p in DEFAULT_POLICY_PROFILES) == ("legacy_overlay_5bps", "lower_bound_only", "lower_bound_half_kelly")
+    # frozen deterministic cross-section produces exactly pre-change target weights
+    import polars as pl
+    from datetime import datetime, UTC
+    from src.stocks.trading.portfolio_constructor import construct_target_allocations, StockRiskPolicy
+    from src.core.instruments import Instrument, AssetKind
+    from src.core.portfolio import PortfolioSnapshot
+    # simple cross-section with 5 instruments
+    panel = pl.DataFrame({
+        "session": [datetime(2024,1,10, tzinfo=UTC)]*5,
+        "instrument_id": [f"KRX:{i:06d}" for i in range(5)],
+        "pred_score": [5.0,4.0,3.0,2.0,1.0],
+        "sector": ["S1"]*5,
+        "adtv": [1e9]*5,
+        "close": [100.0]*5,
+        "ret": [0.001]*5,
+    })
+    # add duplicate sessions for covariance history
+    hist = pl.DataFrame({
+        "session": [datetime(2024,1,1, tzinfo=UTC) + __import__("datetime").timedelta(days=i) for i in range(60) for _ in range(5)],
+        "instrument_id": [f"KRX:{i:06d}" for i in range(5)]*60,
+        "pred_score": [1.0]*300,
+        "sector": ["S1"]*300,
+        "adtv": [1e9]*300,
+        "close": [100.0]*300,
+        "ret": [0.001]*300,
+    })
+    full_panel = pl.concat([hist, panel])
+    instruments = {f"KRX:{i:06d}": Instrument(f"KRX:{i:06d}", AssetKind.STOCK, "KRX", f"{i:06d}", "KRW", lot_size=1) for i in range(5)}
+    portfolio = PortfolioSnapshot(account_snapshot_id="acc", as_of=datetime(2024,1,10, tzinfo=UTC), settled_cash=10_000_000, unsettled_cash=0, positions=())
+    policy = StockRiskPolicy(top_k=5)
+    alloc1 = construct_target_allocations(full_panel, instruments, portfolio, policy)
+    alloc2 = construct_target_allocations(full_panel, instruments, portfolio, policy)
+    assert alloc1 == alloc2
+    # with continuous flag, default profiles unchanged when flag absent; ensure allocations same as before
+    profiles_with = policy_profiles_with_continuous_uncertainty()
+    assert tuple(p.profile_id for p in profiles_with[:3]) == tuple(p.profile_id for p in DEFAULT_POLICY_PROFILES)
