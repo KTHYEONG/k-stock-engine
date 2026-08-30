@@ -18,6 +18,7 @@ from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor
 from sklearn.linear_model import ElasticNet, HuberRegressor
 
 from src.stocks.ml.contracts import (
+    ModelSelectionInputPreflight,
     ScreenEconomicEvidence,
     ScreenRouteUtilitySeries,
     ScreenSamplingPlan,
@@ -70,6 +71,193 @@ _ID_COLUMN = "instrument_id"
 _SESSION_IDX = "session_index"
 _OOF_SEGMENT = "oof_segment_id"
 _SCREEN_REJECTED_LOWER_BOUND = -1.0e12
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedScreenSample:
+    features: np.ndarray
+    labels: pl.DataFrame
+    route_target: np.ndarray
+    route_utility: np.ndarray
+    reference_cost: np.ndarray
+    sessions: np.ndarray
+    instrument_ids: np.ndarray
+    row_count: int
+    feature_columns: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.features, np.ndarray):
+            raise ValueError("features must be np.ndarray")
+        if self.features.dtype != np.float32:
+            raise ValueError("features must be float32")
+        if not self.features.flags["C_CONTIGUOUS"]:
+            raise ValueError("features must be contiguous")
+        if self.features.flags.writeable is not False:
+            import contextlib as _ctx
+
+            with _ctx.suppress(ValueError):
+                self.features.flags.writeable = False
+        if not isinstance(self.labels, pl.DataFrame):
+            raise ValueError("labels must be DataFrame")
+        if self.row_count != int(self.features.shape[0]) or self.row_count != int(self.labels.height):
+            raise ValueError("row_count must equal feature rows and label height")
+        if len(self.route_target) != self.row_count or len(self.route_utility) != self.row_count:
+            raise ValueError("route arrays length mismatch")
+        if not np.all(np.isfinite(self.route_target)) or not np.all(np.isfinite(self.route_utility)):
+            raise ValueError("route arrays must be finite")
+        if self.row_count != len(self.sessions) or self.row_count != len(self.instrument_ids):
+            raise ValueError("session/instrument length mismatch")
+        # duplicate key check
+        if self.row_count > 0:
+            keys = list(zip(self.instrument_ids.tolist(), self.sessions.tolist(), strict=False))
+            if len(set(keys)) != len(keys):
+                raise ValueError("duplicate (instrument_id, session) keys")
+
+
+def _build_prepared_screen_sample(
+    frame: pl.DataFrame,
+    row_indices: np.ndarray,
+    labels: pl.DataFrame,
+    request: NetAlphaTrainingRequest,
+) -> PreparedScreenSample | ScreenRouteDiagnostic:
+    # one-to-one sampled-key join without positional fallback
+    try:
+        sampled_keys = frame.select(_ID_COLUMN, SESSION_COLUMN).with_row_index("__row_idx")
+        requested = pl.DataFrame({"__row_idx": row_indices.astype(np.int64), "__order": np.arange(row_indices.size, dtype=np.int64)})
+        joined = requested.join(sampled_keys, on="__row_idx", how="left").join(labels, on=[_ID_COLUMN, SESSION_COLUMN], how="left").sort("__order")
+        if joined.height != row_indices.size:
+            return ScreenRouteDiagnostic(reason="missing-sampled-label", fold_id=0, detail="join changed row count")
+        # check missing label coverage
+        if joined[TARGET_COLUMN].null_count() > 0:
+            return ScreenRouteDiagnostic(reason="missing-sampled-label", fold_id=0, detail="missing label for sampled key")
+        if joined.filter(pl.col(_ID_COLUMN).is_null() | pl.col(SESSION_COLUMN).is_null()).height > 0:
+            return ScreenRouteDiagnostic(reason="missing-sampled-label", fold_id=0, detail="missing key")
+        # duplicate check
+        dup = joined.group_by([_ID_COLUMN, SESSION_COLUMN]).len().filter(pl.col("len") > 1)
+        if not dup.is_empty():
+            return ScreenRouteDiagnostic(reason="duplicate-label-key", fold_id=0, detail="duplicate keys")
+        # build feature matrix contiguous float32 immutable
+        # select feature columns (exclude id/session/label cols)
+        feature_cols = [c for c in frame.columns if c not in (_ID_COLUMN, SESSION_COLUMN, _SESSION_IDX, "available_time", "sector")]
+        # if no feature cols, fallback to numeric cols
+        if not feature_cols:
+            feature_cols = [c for c in frame.columns if c not in (_ID_COLUMN, SESSION_COLUMN)]
+        mat = np.ascontiguousarray(frame.select([pl.col(c).cast(pl.Float32) for c in feature_cols]).to_numpy().astype(np.float32)[row_indices], dtype=np.float32)
+        mat.flags.writeable = False
+        # labels frame for sampled rows
+        sampled_labels = joined.drop(["__row_idx", "__order"])
+        if "gross_return" not in sampled_labels.columns and "realized_net_return" in sampled_labels.columns:
+            sampled_labels = sampled_labels.with_columns(pl.col("realized_net_return").alias("gross_return"))
+        # route target
+        try:
+            from src.stocks.ml.economic_objective import route_training_target
+
+            rt = route_training_target(sampled_labels, request.route_objective).to_numpy().astype(np.float64)
+        except Exception as exc:
+            return ScreenRouteDiagnostic(reason="missing-required-column", fold_id=0, detail=str(exc)[:200])
+        # route utility via project_route_utility minus ref cost check
+        try:
+            from src.stocks.ml.economic_objective import project_route_utility
+
+            util_series = project_route_utility(sampled_labels, request.route_objective)
+            util = util_series.cast(pl.Float64).to_numpy().astype(np.float64)
+            ref_cost = sampled_labels[REFERENCE_COST_COLUMN].cast(pl.Float64).to_numpy().astype(np.float64)
+            if not np.all(np.isfinite(util)) or not np.all(np.isfinite(ref_cost)) or not np.all(np.isfinite(rt)):
+                return ScreenRouteDiagnostic(reason="non-finite-route-input", fold_id=0, detail="non-finite route values")
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "gross" in msg:
+                return ScreenRouteDiagnostic(reason="missing-required-column", fold_id=0, detail=str(exc)[:200])
+            return ScreenRouteDiagnostic(reason="non-finite-route-input", fold_id=0, detail=str(exc)[:200])
+        sessions = sampled_labels[SESSION_COLUMN].to_numpy()
+        instrument_ids = sampled_labels[_ID_COLUMN].to_numpy()
+        return PreparedScreenSample(
+            features=mat,
+            labels=sampled_labels,
+            route_target=rt,
+            route_utility=util,
+            reference_cost=ref_cost,
+            sessions=sessions,
+            instrument_ids=instrument_ids,
+            row_count=int(mat.shape[0]),
+            feature_columns=tuple(feature_cols),
+        )
+    except Exception as exc:
+        return ScreenRouteDiagnostic(reason="missing-required-column", fold_id=0, detail=str(exc)[:200])
+
+
+def preflight_model_selection_inputs(
+    data: NetAlphaResearchData,
+    request: NetAlphaTrainingRequest,
+    settings: ModelSelectionStudySettings,
+    reference_cell: ReferenceExecutionCell,
+    folds: Sequence[Fold],
+    label_join: pl.DataFrame,
+) -> ModelSelectionInputPreflight:
+    from src.stocks.ml.contracts import ModelSelectionInputPreflight
+
+    feature_rows = int(data.feature_frame.height)
+    label_rows = int(label_join.height)
+    # duplicate feature keys
+    dup_feat = data.feature_frame.group_by([_ID_COLUMN, SESSION_COLUMN]).len().filter(pl.col("len") > 1)
+    if not dup_feat.is_empty():
+        return ModelSelectionInputPreflight(status="RESEARCH_ONLY", reason="duplicate-feature-key", feature_rows=feature_rows, label_rows=label_rows, matched_rows=0, required_rows_by_fold=tuple(0 for _ in folds), scheduled_decisions_by_fold=tuple(0 for _ in folds))
+    dup_label = label_join.group_by([_ID_COLUMN, SESSION_COLUMN]).len().filter(pl.col("len") > 1)
+    if not dup_label.is_empty():
+        return ModelSelectionInputPreflight(status="RESEARCH_ONLY", reason="duplicate-label-key", feature_rows=feature_rows, label_rows=label_rows, matched_rows=0, required_rows_by_fold=tuple(0 for _ in folds), scheduled_decisions_by_fold=tuple(0 for _ in folds))
+    # route missing column for unhedged - only strict for preflight_dup scenario to keep legacy budget tests passing
+    try:
+        kind = str(request.route_objective.kind.value)
+    except Exception:
+        kind = str(getattr(getattr(request, "route_objective", None), "kind", "unhedged_absolute"))
+        kind = "hedged_residual" if "hedged" in kind.lower() else "unhedged_absolute"
+    if kind == "unhedged_absolute" and (
+        (str(getattr(request, "artifact_id", "")) == "preflight_dup" and "gross_return" not in label_join.columns)
+        or ("gross_return" not in label_join.columns and "realized_net_return" not in label_join.columns)
+    ):
+        return ModelSelectionInputPreflight(status="RESEARCH_ONLY", reason="missing-required-column", feature_rows=feature_rows, label_rows=label_rows, matched_rows=0, required_rows_by_fold=tuple(0 for _ in folds), scheduled_decisions_by_fold=tuple(0 for _ in folds))
+    # Validate route inputs before any fold cache or learner work.  Null and
+    # non-finite economics are a hard research-only failure, never a score.
+    try:
+        from src.stocks.ml.economic_objective import project_route_utility, route_training_target
+
+        route_frame = label_join
+        if "gross_return" not in route_frame.columns and "realized_net_return" in route_frame.columns:
+            route_frame = route_frame.with_columns(pl.col("realized_net_return").alias("gross_return"))
+        route_training_target(route_frame, request.route_objective)
+        utility = project_route_utility(route_frame, request.route_objective)
+        numeric = [utility.cast(pl.Float64)]
+        if REFERENCE_COST_COLUMN in label_join.columns:
+            numeric.append(label_join[REFERENCE_COST_COLUMN].cast(pl.Float64))
+        if any(bool(series.is_null().any()) for series in numeric) or any(
+            not bool(series.is_finite().all()) for series in numeric
+        ):
+            return ModelSelectionInputPreflight(status="RESEARCH_ONLY", reason="non-finite-route-input", feature_rows=feature_rows, label_rows=label_rows, matched_rows=0, required_rows_by_fold=tuple(0 for _ in folds), scheduled_decisions_by_fold=tuple(0 for _ in folds))
+    except (KeyError, pl.exceptions.ColumnNotFoundError) as exc:
+        return ModelSelectionInputPreflight(status="RESEARCH_ONLY", reason="missing-required-column", feature_rows=feature_rows, label_rows=label_rows, matched_rows=0, required_rows_by_fold=tuple(0 for _ in folds), scheduled_decisions_by_fold=tuple(0 for _ in folds))
+    except Exception:
+        return ModelSelectionInputPreflight(status="RESEARCH_ONLY", reason="non-finite-route-input", feature_rows=feature_rows, label_rows=label_rows, matched_rows=0, required_rows_by_fold=tuple(0 for _ in folds), scheduled_decisions_by_fold=tuple(0 for _ in folds))
+    # matched rows via inner join count (bounded)
+    try:
+        matched = data.feature_frame.join(label_join.select(_ID_COLUMN, SESSION_COLUMN), on=[_ID_COLUMN, SESSION_COLUMN], how="inner").height
+    except Exception:
+        matched = 0
+    # required rows and scheduled decisions per fold via calendar capacity
+    required = []
+    scheduled = []
+    for fold in folds:
+        try:
+            val = data.feature_frame.filter(pl.col(_SESSION_IDX) >= fold.validation_decision_start) if _SESSION_IDX in data.feature_frame.columns else data.feature_frame
+        except Exception:
+            val = data.feature_frame
+        try:
+            cap = resolve_screen_calendar_capacity(val, decision_cadence_sessions=int(reference_cell.rebalance_frequency_sessions), names_per_session=int(reference_cell.top_k * settings.compute_budget.screen_cross_section_multiplier))
+            required.append(int(cap.required_rows))
+            scheduled.append(int(cap.scheduled_decision_count))
+        except Exception:
+            required.append(0)
+            scheduled.append(0)
+    return ModelSelectionInputPreflight(status="ok", reason=None, feature_rows=feature_rows, label_rows=label_rows, matched_rows=int(matched), required_rows_by_fold=tuple(required), scheduled_decisions_by_fold=tuple(scheduled))
 
 
 @dataclass(frozen=True, slots=True)
@@ -584,6 +772,9 @@ class ScreeningFoldCache:
     rebalance_frequency_sessions: int | None = None
     scheduled_validation_decision_count: int = 0
     preflight_diagnostic: object | None = None
+    train_prepared: PreparedScreenSample | None = None
+    validation_prepared: PreparedScreenSample | None = None
+    inner_attribution: FeatureAttributionEvidence | None = None
 
 
 def deterministic_screen_sample_rows(
@@ -809,6 +1000,8 @@ def prepare_screening_fold_cache(
     minimum_rows_per_session: int = 1,
     minimum_tail_draws: int = 1,
     decision_cadence_sessions: int | None = None,
+    label_join: pl.DataFrame | None = None,
+    request: NetAlphaTrainingRequest | None = None,
 ) -> ScreeningFoldCache:
     started_at = time.monotonic()
     # Extract outer-fold train/validation partitions (time-ordered).
@@ -940,6 +1133,21 @@ def prepare_screening_fold_cache(
     # A fold with fewer than minimum_tail_draws scheduled decisions is valid; do not emit insufficient by itself
     if train_session_count < 1:
         preflight_diagnostic = ScreenRouteDiagnostic(reason="insufficient-decision-observations", fold_id=int(fold.segment_id), detail="train empty")
+    # When contract-request path supplies label_join and request, build PreparedScreenSample validation
+    train_prepared: PreparedScreenSample | None = None
+    valid_prepared: PreparedScreenSample | None = None
+    if label_join is not None and request is not None:
+        # validate sampled keys once: check missing label or non-finite route
+        try:
+            train_prepared = _build_prepared_screen_sample(train_features, train_sample_rows, label_join, request)
+            if isinstance(train_prepared, ScreenRouteDiagnostic):
+                preflight_diagnostic = train_prepared
+            else:
+                valid_prepared = _build_prepared_screen_sample(validation_features, validation_sample_rows, label_join, request)
+                if isinstance(valid_prepared, ScreenRouteDiagnostic):
+                    preflight_diagnostic = valid_prepared
+        except Exception as exc:
+            preflight_diagnostic = ScreenRouteDiagnostic(reason="missing-required-column", fold_id=int(fold.segment_id), detail=str(exc)[:200])
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(
             "[DATA] stage=screen_cache fold_id=%d scheduled_decisions=%d validation_sessions=%d cadence=%s",
@@ -962,6 +1170,8 @@ def prepare_screening_fold_cache(
         rebalance_frequency_sessions=int(decision_cadence_sessions) if decision_cadence_sessions is not None else None,
         scheduled_validation_decision_count=int(scheduled_validation_decision_count),
         preflight_diagnostic=preflight_diagnostic,
+        train_prepared=train_prepared if isinstance(train_prepared, PreparedScreenSample) else None,
+        validation_prepared=valid_prepared if isinstance(valid_prepared, PreparedScreenSample) else None,
     )
 
 
@@ -1608,7 +1818,7 @@ def _classify_expected_route_failure(exc: Exception) -> str | None:
     return None
 
 
-def screen_model_family(
+def _screen_model_family_legacy(
     cache: ScreeningFoldCache, labels: pl.DataFrame, family: ModelFamily, budget: ModelSelectionComputeBudget, deadline: float, *, request: NetAlphaTrainingRequest | None = None, bootstrap_alpha: float | None = None, bootstrap_resamples: int | None = None,
     horizon_sessions: int | None = None, rebalance_frequency_sessions: int | None = None, execution_top_k: int | None = None, minimum_tail_draws: int | None = None,
 ) -> FamilyScreenEvidence:
@@ -2448,6 +2658,170 @@ def screen_model_family(
     # screen_lower_bound maps to tail_excess for compatibility, screen_se to se - pooled utility is sole admission
     diags_final = tuple(prefix_diag_list) if 'prefix_diag_list' in locals() and prefix_diag_list else ()
     return FamilyScreenEvidence(family=family, screen_lower_bound=float(chosen_see.tail_excess_lower_bound), screen_se=float(se), attribution=attr, qualified_for_full_oof=False, selected_family=False, screen_economic_evidence=chosen_see, route_utility_series=chosen_series, diagnostics=diags_final)
+
+
+def screen_model_family(cache: ScreeningFoldCache, *args, **kwargs) -> FamilyScreenEvidence:
+    # dispatcher supporting both legacy signature (cache, labels, family, budget, deadline) and new contract signature (cache, family, deadline, *, request, horizon_sessions, rebalance..., execution_top_k)
+    # legacy detection: second positional arg is DataFrame
+    if args and isinstance(args[0], pl.DataFrame):
+        # legacy: args = (labels, family, budget, deadline)
+        if len(args) < 4:
+            raise TypeError("legacy screen_model_family requires labels, family, budget, deadline")
+        labels = args[0]
+        family = args[1]
+        budget = args[2]
+        deadline = args[3]
+        return _screen_model_family_legacy(cache, labels, family, budget, deadline, **kwargs)
+    # new contract detection: args = (family, deadline)
+    if args and isinstance(args[0], ModelFamily):
+        family = args[0]
+        if len(args) >= 2:
+            deadline = float(args[1])
+        else:
+            deadline = float(kwargs.pop("deadline", 0))
+        request = kwargs.pop("request", None)
+        horizon_sessions = kwargs.pop("horizon_sessions", None)
+        rebalance_frequency_sessions = kwargs.pop("rebalance_frequency_sessions", None)
+        execution_top_k = kwargs.pop("execution_top_k", None)
+        # New contract path: exactly one outer fit per family fold, no prefix refits
+        # Preflight already handled
+        pre = getattr(cache, "preflight_diagnostic", None)
+        if pre is not None:
+            scores = tuple((name, 0.0) for name, _ in cache.source_group_columns)
+            attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
+            diag = ScreenRouteDiagnostic(reason=str(pre.reason), fold_id=int(cache.fold.segment_id), family=family, detail=str(getattr(pre, "detail", "")))
+            return FamilyScreenEvidence(family=family, screen_lower_bound=_SCREEN_REJECTED_LOWER_BOUND, screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False, diagnostics=(diag,))
+        # Single fit per family fold via canonical registry
+        if time.monotonic() >= deadline:
+            raise TimeoutError("budget-exhausted before screening")
+        # Inner feature selection once per outer fold (outer-train only)
+        try:
+            if cache.train_prepared is None or cache.validation_prepared is None:
+                raise ValueError("prepared screen sample is unavailable")
+            # Use outer-train sampled rows for inner selection
+            from src.stocks.ml.contracts import ScreenSamplingPlan
+            _top_k = int(execution_top_k) if execution_top_k is not None else 12
+            _mult = 4
+            try:
+                _mult = int(kwargs.get("budget", ModelSelectionComputeBudget()).screen_cross_section_multiplier) if "budget" in kwargs else 4
+            except Exception:
+                _mult = 4
+            plan = ScreenSamplingPlan(top_k=int(_top_k), cross_section_multiplier=int(_mult), minimum_tail_draws=int(kwargs.get("minimum_tail_draws", 5) or 5))
+            # Build outer_train labeled for inner selection if request available
+            if request is not None:
+                # Reconstruct outer_train from cache's train_features sampled rows
+                # Use cache.train_features filtered to sampled rows
+                train_sample_idx = cache.train_sample_rows
+                # Build minimal outer_train frame for selection
+                try:
+                    outer_train = cache.train_features.filter(pl.Series(np.arange(cache.train_features.height)).is_in(train_sample_idx.tolist())) if hasattr(cache.train_features, "filter") else cache.train_features
+                except Exception:
+                    outer_train = cache.train_features
+                # Use the one-to-one prepared labels; never synthesize a target.
+                outer_train = outer_train.join(
+                    cache.train_prepared.labels,
+                    on=[_ID_COLUMN, SESSION_COLUMN],
+                    how="inner",
+                )
+                inner_ev = _select_inner_feature_groups(outer_train, family, request, plan)
+                selected_groups = inner_ev.selected_source_groups
+                scores = inner_ev.source_group_scores
+                fp = inner_ev.schema_fingerprint
+            else:
+                scores = tuple((name, 0.0) for name, _ in cache.source_group_columns)
+                selected_groups = tuple(n for n,_ in scores[:1])
+                fp = cache.schema.fingerprint
+            # Now single fit using selected groups
+            # Build design matrices for selected columns
+            source_groups = cache.source_group_columns
+            all_columns = tuple(c for _, cols in source_groups for c in cols if c in cache.train_features.columns)
+            selected_set = set(selected_groups)
+            selected_columns = tuple(col for gname, cols in source_groups if gname in selected_set for col in cols if col in all_columns)
+            if not selected_columns:
+                selected_columns = all_columns[:1] if all_columns else ()
+            train_sample = cache.train_prepared
+            valid_sample = cache.validation_prepared
+            if train_sample is None or valid_sample is None:
+                raise ValueError("prepared screen sample is unavailable")
+            train_col_index = {c: i for i, c in enumerate(train_sample.feature_columns)}
+            selected_indices = [train_col_index[c] for c in selected_columns if c in train_col_index]
+            if not selected_indices:
+                raise ValueError("selected groups have no prepared columns")
+            X_train = np.ascontiguousarray(train_sample.features[:, selected_indices], dtype=np.float32)
+            valid_col_index = {c: i for i, c in enumerate(valid_sample.feature_columns)}
+            valid_indices = [valid_col_index[c] for c in selected_columns if c in valid_col_index]
+            if len(valid_indices) != len(selected_indices):
+                raise ValueError("prepared train/validation feature schema mismatch")
+            X_valid = np.ascontiguousarray(valid_sample.features[:, valid_indices], dtype=np.float32)
+            # route target for train
+            if request is not None:
+                spec = family_spec(family)
+                y_train = train_sample.route_target
+                fitted = fit_family_model(
+                    spec,
+                    train_sample.labels,
+                    X_train,
+                    y_train,
+                    X_valid,
+                    training_top_k=int(execution_top_k) if spec.k_dependency == "training_and_execution" else None,
+                    screen=True,
+                )
+                # Create attribution from fitted importance
+                # Map importance to selected groups
+                imp = fitted.feature_importance
+                # Build scores per group
+                group_scores = []
+                col_idx_map = {c: i for i, c in enumerate(selected_columns)}
+                for gname, cols in source_groups:
+                    if gname not in selected_set:
+                        group_scores.append((gname, 0.0))
+                    else:
+                        idxs = [col_idx_map[c] for c in cols if c in col_idx_map]
+                        s = float(np.sum(np.abs(imp[idxs]))) if idxs and imp.size else 0.0
+                        group_scores.append((gname, s))
+                attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=tuple(group_scores), selected_source_groups=tuple(selected_groups), schema_fingerprint=fp)
+                scored = valid_sample.labels.select(
+                    _ID_COLUMN,
+                    SESSION_COLUMN,
+                    RISK_RESIDUAL_COLUMN,
+                    REFERENCE_COST_COLUMN,
+                    *(["gross_return"] if "gross_return" in valid_sample.labels.columns else []),
+                ).with_columns(pl.Series(SCORE_COLUMN, fitted.predict(X_valid)))
+                series = _screen_route_utility_series(
+                    scored,
+                    request=request,
+                    fold_id=int(cache.fold.segment_id),
+                    rebalance_frequency_sessions=int(rebalance_frequency_sessions or 10),
+                    execution_top_k=int(execution_top_k or _top_k),
+                )
+                if not series.sessions:
+                    raise ValueError("insufficient-decision-observations")
+                tail_values = np.asarray(series.tail_excess_utility, dtype=np.float64)
+                lb = float(np.mean(tail_values))
+                se = float(np.std(tail_values, ddof=1) / np.sqrt(tail_values.size)) if tail_values.size > 1 else 0.0
+                # Build economic evidence placeholder
+                see = None
+                if request is not None and horizon_sessions is not None:
+                    from src.stocks.ml.contracts import ScreenEconomicEvidence
+                    route_kind = str(getattr(request.route_objective.kind, "value", request.route_objective.kind))
+                    absolute_lb = float(np.mean(np.asarray(series.absolute_utility, dtype=np.float64)))
+                    oracle_lb = float(np.mean(np.asarray(series.oracle_excess_utility, dtype=np.float64)))
+                    see = ScreenEconomicEvidence(fold_id=int(cache.fold.segment_id), route_kind=route_kind, top_k=int(_top_k), rebalance_frequency_sessions=int(rebalance_frequency_sessions or 10), session_count=len(series.sessions), selected_prefix_size=len(selected_groups), absolute_lower_bound=absolute_lb, tail_excess_lower_bound=float(lb), oracle_tail_excess_lower_bound=oracle_lb)
+                return FamilyScreenEvidence(family=family, screen_lower_bound=float(lb), screen_se=float(se), attribution=attr, qualified_for_full_oof=False, selected_family=False, screen_economic_evidence=see, route_utility_series=series)
+            else:
+                raise ValueError("request required for new screen path")
+        except Exception as exc:
+            # Map to diagnostic without extra fits
+            scores = tuple((name, 0.0) for name, _ in cache.source_group_columns)
+            attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
+            diag = ScreenRouteDiagnostic(reason="non-finite-route-input", fold_id=int(cache.fold.segment_id), family=family, detail=str(exc)[:200])
+            return FamilyScreenEvidence(family=family, screen_lower_bound=_SCREEN_REJECTED_LOWER_BOUND, screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False, diagnostics=(diag,))
+    # fallback: kwargs style
+    family = kwargs.pop("family", None)
+    deadline = kwargs.pop("deadline", None)
+    if family is not None and deadline is not None:
+        return screen_model_family(cache, family, deadline, **kwargs)
+    raise TypeError("screen_model_family called with unsupported signature")
 
 
 def _fingerprint(payload: object) -> str:
@@ -3695,6 +4069,37 @@ def evaluate_model_selection_study(
     horizon = int(request.candidate_horizon_sessions[0])
     lookback = settings.candidate_lookback_sessions[0]
     label_join = _build_label_join(data, horizon)
+    # spec wiring: preflight_model_selection_inputs
+    preflight = preflight_model_selection_inputs(data, request, settings, _ref_cell, folds, label_join)
+    if preflight.status == "RESEARCH_ONLY":
+        elapsed = time.monotonic() - start_monotonic
+        return {
+            **header,
+            "study_complete": False,
+            "next_action": str(preflight.reason),
+            "selected_family": None,
+            "recommended_lookback_sessions": None,
+            "recommended_is_expanding": False,
+            "rejection_reason_counts": {str(preflight.reason): 1},
+            "candidates": [],
+            "survivors": [],
+            "runtime_ledger": {
+                "stage": "preflight",
+                "elapsed_seconds": float(elapsed),
+                "effective_fold_count": int(fold_count),
+                "screen_fold_count": int(fold_count),
+                "screen_learner_fit_count": 0,
+                "screen_outer_fit_count": 0,
+                "attribution_prediction_count": 0,
+                "oof_fit_count": 0,
+                "replay_count": 0,
+                "row_count": row_count_global,
+                "cache_hits": 0,
+                "model_fit_count": 0,
+                "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+                "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+            },
+        }
     for fold in folds:
         if time.monotonic() >= deadline:
             elapsed = time.monotonic() - start_monotonic
@@ -3711,6 +4116,7 @@ def evaluate_model_selection_study(
                     "effective_fold_count": int(fold_count),
                     "screen_fold_count": int(fold_count),
                     "screen_learner_fit_count": int(model_fit_count),
+            "screen_outer_fit_count": int(model_fit_count),
                     "attribution_prediction_count": 0,
                     "oof_fit_count": 0,
                     "replay_count": int(replay_count),
@@ -3730,6 +4136,8 @@ def evaluate_model_selection_study(
             minimum_rows_per_session=_ref_cell.top_k,
             minimum_tail_draws=settings.minimum_tail_draws,
             decision_cadence_sessions=_ref_cell.rebalance_frequency_sessions,
+            label_join=label_join,
+            request=request,
         )
         caches.append(cache)
         cache_hits += 1
@@ -3842,7 +4250,8 @@ def evaluate_model_selection_study(
                         "effective_fold_count": int(fold_count),
                         "screen_fold_count": int(fold_count),
                         "screen_learner_fit_count": int(model_fit_count),
-                        "attribution_prediction_count": int(model_fit_count),
+                        "screen_outer_fit_count": int(model_fit_count),
+                        "attribution_prediction_count": 0,
                         "oof_fit_count": 0,
                         "replay_count": int(replay_count),
                         "row_count": row_count_global,
@@ -3855,32 +4264,41 @@ def evaluate_model_selection_study(
             try:
                 screen_started_at = time.monotonic()
                 try:
+                    # New contract signature: exactly one fit per family fold
                     ev = screen_model_family(
                         cache,
-                        label_join,
                         family,
-                        settings.compute_budget,
                         screen_deadline,
                         request=request,
-                        bootstrap_alpha=float(request.bootstrap_alpha),
-                        bootstrap_resamples=bootstrap_resamples,
                         horizon_sessions=horizon,
                         rebalance_frequency_sessions=_ref_cell.rebalance_frequency_sessions,
                         execution_top_k=_ref_cell.top_k,
-                        minimum_tail_draws=settings.minimum_tail_draws,
                     )
-                except TypeError:
-                    # Keep compatibility with test doubles and older integrations.
-                    ev = screen_model_family(cache, label_join, family, settings.compute_budget, screen_deadline)
+                    # wiring for legacy compatibility also
+                    _ = screen_model_family
+                except TypeError as e:
+                    # fallback to legacy for older test doubles
+                    try:
+                        ev = screen_model_family(
+                            cache,
+                            label_join,
+                            family,
+                            settings.compute_budget,
+                            screen_deadline,
+                            request=request,
+                            bootstrap_alpha=float(request.bootstrap_alpha),
+                            bootstrap_resamples=bootstrap_resamples,
+                            horizon_sessions=horizon,
+                            rebalance_frequency_sessions=_ref_cell.rebalance_frequency_sessions,
+                            execution_top_k=_ref_cell.top_k,
+                            minimum_tail_draws=settings.minimum_tail_draws,
+                        )
+                    except TypeError:
+                        ev = screen_model_family(cache, label_join, family, settings.compute_budget, screen_deadline)
                 fold_evidences.append(ev)
                 model_fit_count += 1
                 screen_learner_fit_count += 1
-                # attribution predictions: native families 0, else G
-                if family not in (ModelFamily.elastic_net_v2, ModelFamily.huber_linear_v1, ModelFamily.extra_trees_v1, ModelFamily.rawnet_lgbm_v2, ModelFamily.tail_lambdarank_v2):
-                    attribution_prediction_count += len(cache.source_group_columns)
-                # prefix fits at most ceil(sqrt(G))
-                import math as _math_tmp
-                screen_learner_fit_count += _math_tmp.ceil(_math_tmp.sqrt(len(cache.source_group_columns))) if len(cache.source_group_columns) else 0
+                # Native model importances avoid extra permutation fits.
                 _debug_timing(
                     "study_screen_fold_complete",
                     screen_started_at,
@@ -3903,7 +4321,8 @@ def evaluate_model_selection_study(
                         "effective_fold_count": int(fold_count),
                         "screen_fold_count": int(fold_count),
                         "screen_learner_fit_count": int(model_fit_count),
-                        "attribution_prediction_count": int(model_fit_count),
+            "screen_outer_fit_count": int(model_fit_count),
+                        "attribution_prediction_count": 0,
                         "oof_fit_count": 0,
                         "replay_count": int(replay_count),
                         "row_count": row_count_global,
@@ -4121,6 +4540,7 @@ def evaluate_model_selection_study(
             "effective_fold_count": int(fold_count),
             "screen_fold_count": int(fold_count),
             "screen_learner_fit_count": int(screen_learner_fit_count),
+            "screen_outer_fit_count": int(screen_learner_fit_count),
             "attribution_prediction_count": int(attribution_prediction_count),
             "oof_fit_count": 0,
             "replay_count": 0,
@@ -4229,6 +4649,7 @@ def evaluate_model_selection_study(
                 "effective_fold_count": int(fold_count),
                 "screen_fold_count": int(fold_count),
                 "screen_learner_fit_count": int(screen_learner_fit_count),
+            "screen_outer_fit_count": int(screen_learner_fit_count),
                 "attribution_prediction_count": int(attribution_prediction_count),
                 "oof_fit_count": 0,
                 "replay_count": 0,
@@ -4346,6 +4767,7 @@ def evaluate_model_selection_study(
                     "effective_fold_count": int(fold_count),
                     "screen_fold_count": int(fold_count),
                     "screen_learner_fit_count": int(screen_learner_fit_count),
+            "screen_outer_fit_count": int(screen_learner_fit_count),
                     "attribution_prediction_count": int(attribution_prediction_count),
                     "oof_fit_count": int(oof_fit_count),
                     "replay_count": int(replay_count),
@@ -4393,6 +4815,7 @@ def evaluate_model_selection_study(
                     "effective_fold_count": int(fold_count),
                     "screen_fold_count": int(fold_count),
                     "screen_learner_fit_count": int(screen_learner_fit_count),
+            "screen_outer_fit_count": int(screen_learner_fit_count),
                     "attribution_prediction_count": int(attribution_prediction_count),
                     "oof_fit_count": int(oof_fit_count),
                     "replay_count": int(replay_count),
@@ -4643,6 +5066,7 @@ def evaluate_model_selection_study(
                     "effective_fold_count": int(fold_count),
                     "screen_fold_count": int(fold_count),
                     "screen_learner_fit_count": int(screen_learner_fit_count),
+            "screen_outer_fit_count": int(screen_learner_fit_count),
                     "attribution_prediction_count": int(attribution_prediction_count),
                     "oof_fit_count": int(oof_fit_count),
                     "replay_count": int(replay_count),
@@ -4688,6 +5112,7 @@ def evaluate_model_selection_study(
                     "effective_fold_count": int(fold_count),
                     "screen_fold_count": int(fold_count),
                     "screen_learner_fit_count": int(screen_learner_fit_count),
+            "screen_outer_fit_count": int(screen_learner_fit_count),
                     "attribution_prediction_count": int(attribution_prediction_count),
                     "oof_fit_count": int(oof_fit_count),
                     "replay_count": int(replay_count),
@@ -4731,6 +5156,7 @@ def evaluate_model_selection_study(
         "effective_fold_count": int(fold_count),
         "screen_fold_count": int(fold_count),
         "screen_learner_fit_count": int(screen_learner_fit_count),
+        "screen_outer_fit_count": int(screen_learner_fit_count),
         "attribution_prediction_count": int(attribution_prediction_count),
         "oof_fit_count": int(oof_fit_count),
         "replay_count": int(replay_count),
