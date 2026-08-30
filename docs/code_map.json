@@ -403,8 +403,10 @@
     "testing": [
       "tests/unit/stocks/ml/test_contracts.py",
       "tests/unit/stocks/research/test_hedged_excess_certification.py",
-      "tests/unit/stocks/cli/test_train.py"
-    ]
+      "tests/unit/stocks/cli/test_train.py",
+      "tests/unit/stocks/ml/test_model_selection.py"
+    ],
+    "architecture": "docs/results/ml_runs/ml-compound-growth-20260830-finalcheck.json"
   },
   "src/stocks/data/lineage.py": {
     "testing": "tests/unit/stocks/data/test_lineage.py"

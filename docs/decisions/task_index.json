@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_SCREENING_EVIDENCE_FINALCHECK_20260830",
+      "date": "2026-08-30",
+      "adr_id": "ADR_20260830_ML_SCREENING_EVIDENCE_FINALCHECK_20260830",
+      "domain": "stocks_ml",
+      "title": "Extended ML screening completion and bottleneck evidence",
+      "why": "The extended H10/C10/K12 study needed confirmation that time budget was sufficient and that any remaining failure was a genuine data or route bottleneck.",
+      "resolution": "Re-ran the direct-data study with 2,400-second wall-clock and 1,800-second screen budgets; all six families completed screening in 1,346.09 seconds, with study_complete=true and explicit insufficient-decision-observations diagnostics, but no OOF/replay survivor.",
+      "impact": "Confirms compute budget is no longer the blocker; promotion remains fail-closed until executable decision observations are available. Diagnostic evidence is registered for the next optimization cycle."
+    },
+    {
       "task_id": "TASK_ML_DIRECT_TRAINING_WIRING_20260830",
       "date": "2026-08-30",
       "adr_id": "ADR_20260830_ML_DIRECT_TRAINING_WIRING_20260830",
@@ -989,16 +999,6 @@
       "why": "Repeated 81-trial stock ML runs completed the h5 screen but ended before h10 confirmation and final metrics were published, with no durable evidence of the termination cause.",
       "resolution": "Added explicit LightGBM resource cleanup, isolated confirmation-candidate execution, per-cell confirmation checkpoints and resume state, and phase RSS telemetry while preserving economic selection gates and deterministic ranking contracts.",
       "impact": "Confirmation progress survives worker termination and native-memory peaks; final artifacts can be resumed and audited without changing CAGR/MDD or promotion semantics."
-    },
-    {
-      "task_id": "TASK_STOCK_SELECTION_MEMORY_FIX",
-      "date": "2026-08-14",
-      "adr_id": "ADR_20260814_STOCK_SELECTION_MEMORY_FIX",
-      "domain": "stocks",
-      "title": "Selection-phase full-panel join OOM recovery",
-      "why": "Post compounding-growth-v1, the 81-trial run died silently after trial 26 (h5 screen) inside _select_economic_champion. study_h5.db showed confirmation attrs written but selection/guard attrs absent; sync_run succeeded only because all_positive_finalists=0 skipped the finalist path. The 8fe74d4 _economic_transfer_evidence still did the full-panel join/group_by that ADR_20260814_STOCK_COMPOUNDING_TELEMETRY_OPT blamed for the screen-phase OOM.",
-      "resolution": "Added _transfer_label_frame(panel, label_column) that projects to the four label columns before any duplicate-key check, so the full tuning panel is never group_by'd or re-materialized per finalist. Wired it into _economic_transfer_evidence (replacing _reject_duplicate_keys(panel) + inline panel.select) and into _select_economic_champion (compact frame built once, passed as panel= instead of tuning_panel). Output is byte-identical (projection preserves (session, instrument_id) 1:1).",
-      "impact": "Removes the selection-phase OOM anti-pattern; the 81-trial run can now reach phase_selection and publish CAGR/MDD/DSR artifacts. Diagnostic parity preserved; gates/objectives/DSR multiplicity unchanged."
     }
   ]
 }
