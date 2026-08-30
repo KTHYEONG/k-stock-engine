@@ -468,5 +468,6 @@
       "tests/integration/stocks/test_net_alpha_economic_recovery.py"
     ],
     "architecture": "docs/results/ml-cmp.md"
-  }
+  },
+  "src/stocks/data/active.py": {}
 }
