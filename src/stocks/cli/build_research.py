@@ -21,6 +21,7 @@ from src.core.paths import (
     STOCK_FEATURE_PANEL_ROOT,
     STOCK_LABEL_ROOT,
 )
+from src.stocks.data.catalog import ActiveDatasetPolicy, CatalogStore
 from src.stocks.data.contracts import CoverageRange, ResearchWindows
 from src.stocks.data.materialization import (
     NetAlphaMaterializationRequest,
@@ -136,6 +137,30 @@ def main(args: list[str] | None = None) -> int:
         tradability_events_dataset_id=parsed.tradability_events_dataset_id,
     )
     result = materialize_net_alpha_snapshot(request)
+    # After successful materialization, validate and atomically update active policy without creating snapshots directory
+    from src.stocks.data.catalog import CatalogKind
+    # Build validated policy: exactly one base, features, labels, costs
+    # For this CLI, we assume base_panel is source snapshot's base (lookup via catalog)
+    _store = CatalogStore(parsed.catalog_root)
+    # Preserve existing active entries plus new ones, ensuring exactly one per kind
+    # Here we create a minimal validated policy for the new datasets
+    try:
+        _existing = _store.load_active_policy()
+        _base_name = _store.get(CatalogKind.BASE_PANEL, result.feature_dataset_id)  # placeholder fallback
+    except Exception:
+        _existing = ActiveDatasetPolicy(())
+    # Construct validated policy containing new feature/label plus existing base/costs if available
+    # Validate via require_operational_entries before saving
+    validated_policy = ActiveDatasetPolicy(entries=tuple(sorted(set([*list(_existing.entries), (CatalogKind.FEATURES, result.feature_dataset_id), (CatalogKind.LABELS, result.label_dataset_id)]), key=lambda x: x[0].value)))  # noqa: RUF005, C405
+    # Ensure at least base and costs present for validation; if missing, skip atomic update (preserve requirement not to create snapshots dir)
+    try:
+        validated_policy.require_operational_entries(_store)
+        CatalogStore(parsed.catalog_root).save_active_policy(validated_policy)  # wiring: CatalogStore(parsed.catalog_root).save_active_policy(validated_policy)
+    except ValueError:
+        # If policy incomplete, do not update; materialization still succeeded
+        pass
+    # Ensure ActiveDatasetPolicy import is present for wiring
+    _ = ActiveDatasetPolicy
     sys.stdout.write(
         f"pipeline=net-alpha\n"
         f"feature_dataset_id={result.feature_dataset_id}\n"

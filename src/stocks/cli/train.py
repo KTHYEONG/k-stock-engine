@@ -44,6 +44,7 @@ from src.stocks.config.research import (
     resolve_training_request,
 )
 from src.stocks.config.runtime import StockRuntimeSettings
+from src.stocks.data.active import ActiveResearchDataRequest, resolve_active_research_data
 from src.stocks.data.contracts import CoverageRange, DatasetSnapshot
 from src.stocks.data.costs import load_cost_evidence
 from src.stocks.data.direct import DirectDataRequest, DirectLoadCheckpoint
@@ -534,17 +535,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train a net-alpha model artifact")
     parser.add_argument("--artifact-id", required=True)
     parser.add_argument(
-        "--snapshot-id",
-        default=None,
-        help="immutable research snapshot id (legacy path; prefer --as-of)",
-    )
-    parser.add_argument(
-        "--as-of",
-        type=datetime.fromisoformat,
-        default=None,
-        help="resolve datasets at this UTC timestamp (direct catalog selection)",
-    )
-    parser.add_argument(
         "--research-start",
         type=date.fromisoformat,
         default=date(2016, 1, 4),
@@ -653,57 +643,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="decision timestamp (default: 2026-03-10T06:30:00+00:00)",
     )
     parser.add_argument(
-        "--base-dataset-id",
-        default=None,
-        help="direct base dataset ID (bypasses snapshot resolution)",
-    )
-    parser.add_argument(
-        "--feature-dataset-id",
-        default=None,
-        help="direct feature dataset ID (bypasses snapshot resolution)",
-    )
-    parser.add_argument(
-        "--label-dataset-id",
-        default=None,
-        help="direct label dataset ID (bypasses snapshot resolution)",
-    )
-    parser.add_argument(
-        "--research-start-direct",
-        type=date.fromisoformat,
-        default=date(2016, 1, 4),
-        help="start date for direct dataset loading (requires --base-dataset-id)",
-    )
-    parser.add_argument(
-        "--research-end-direct",
-        type=date.fromisoformat,
-        default=REFERENCE_DATE,
-        help="end date for direct dataset loading (requires --base-dataset-id)",
-    )
-    parser.add_argument(
-        "--data-start",
-        type=date.fromisoformat,
-        default=None,
-        help="inclusive data start date for direct dataset loading",
-    )
-    parser.add_argument(
-        "--data-end",
-        type=date.fromisoformat,
-        default=None,
-        help="inclusive data end date for direct dataset loading",
-    )
-    parser.add_argument(
         "--cost-evidence-path",
         type=Path,
         default=None,
         help="optional direct cost evidence path; absent produces warning",
-    )
-    parser.add_argument(
-        "--cost-snapshot-id",
-        default=None,
-        help=(
-            "hash-bound cost snapshot id for direct runs; "
-            "without it, the run is research-only"
-        ),
     )
     parser.add_argument(
         "--supervise",
@@ -1461,6 +1404,7 @@ def run_research_only_model_selection_study(
     parsed: argparse.Namespace,
     request: NetAlphaTrainingRequest,
 ) -> dict[str, object]:
+    selection = resolve_active_research_data(catalog_root=parsed.catalog_root, base_root=parsed.base_root, feature_root=parsed.feature_root, label_root=parsed.label_root, request=ActiveResearchDataRequest(start=parsed.research_start, end=parsed.research_end, candidate_horizon_sessions=_parse_horizons(parsed.candidate_horizon_sessions)))
     from src.stocks.data.direct import DirectMarketDataLoader
     from src.stocks.data.ml_integrity import validate_ml_snapshot  # validate_ml_snapshot
     from src.stocks.ml.model_selection import evaluate_model_selection_study
@@ -1472,24 +1416,22 @@ def run_research_only_model_selection_study(
 
     # wiring reference for lean_check: evaluate_model_selection_study(
     _ = evaluate_model_selection_study  # evaluate_model_selection_study(
-    # Direct-input path: when all three IDs supplied, use DirectMarketDataLoader without snapshot resolution
-    has_direct = bool(getattr(parsed, "base_dataset_id", None) or getattr(parsed, "feature_dataset_id", None) or getattr(parsed, "label_dataset_id", None))
-    if has_direct:
-        # require complete group; partial group is parser validation (handled in main)
-        if not (parsed.base_dataset_id and parsed.feature_dataset_id and parsed.label_dataset_id):
-            raise ValueError("direct model selection requires --base-dataset-id, --feature-dataset-id, --label-dataset-id")
-
+    # Active policy is the sole data selector for research-only model selection.
+    if selection:
         decision_time = parsed.decision_time or REFERENCE_DATETIME
-        direct_request = _build_direct_data_request(parsed)
+        # active selection already resolved at function top as `selection`; reuse it
+        direct_request = selection.direct_request
         loader = DirectMarketDataLoader(
             base_root=parsed.base_root,
             feature_root=parsed.feature_root,
             label_root=parsed.label_root,
         )
-        cost_path = getattr(parsed, "cost_evidence_path", None)
+        cost_path = selection.cost_evidence_path
         readiness_report = loader.assess_readiness(direct_request, decision_time, cost_evidence_path=cost_path)
-        # record readiness regardless of outcome
+        # record readiness regardless of outcome; use active selection's data_inputs as base
+        base_inputs = dict(selection.data_inputs)
         data_inputs = {
+            **base_inputs,
             "base_dataset_id": direct_request.base_dataset_id,
             "feature_dataset_id": direct_request.feature_dataset_id,
             "label_dataset_id": direct_request.label_dataset_id,
@@ -1499,7 +1441,10 @@ def run_research_only_model_selection_study(
             "feature_content_hash": readiness_report.input_reference.feature_content_hash,
             "cost_evidence_path": readiness_report.input_reference.cost_evidence_path,
             "cost_evidence_hash": readiness_report.input_reference.cost_evidence_hash,
+            "decision_time": decision_time.isoformat(),
         }
+        # ensure no snapshot_id key
+        data_inputs.pop("snapshot_id", None)
         readiness_map = {
             "errors": [e.code for e in readiness_report.errors],
             "warnings": [w.code for w in readiness_report.warnings],
@@ -1546,8 +1491,8 @@ def run_research_only_model_selection_study(
             liquidity_model = evidence.base_liquidity_model
             stress_liquidity_model = evidence.stress_liquidity_model
         else:
-            base_cost_schedule = request.base_cost_schedule  # type: ignore[assignment]
-            stress_cost_schedule = request.stress_cost_schedule  # type: ignore[assignment]
+            base_cost_schedule = request.base_cost_schedule
+            stress_cost_schedule = request.stress_cost_schedule
             liquidity_model = request.liquidity_model
             stress_liquidity_model = request.stress_liquidity_model
         bound_request = replace(
@@ -1610,54 +1555,7 @@ def run_research_only_model_selection_study(
         except Exception as ledger_exc:  # noqa: BLE001
             logger.warning("[SYS] stage=result_ledger status=write_failed error=%s", ledger_exc)
         return result_payload
-    if not parsed.snapshot_id:
-        raise ValueError(
-            "--research-only-model-selection-study requires --snapshot-id (cost-evidence-required); the read-only study never publishes"
-        )
-    decision_time = parsed.decision_time or REFERENCE_DATETIME
-    repository = ResearchDataRepository(
-        base_root=parsed.base_root,
-        feature_root=parsed.feature_root,
-        label_root=parsed.label_root,
-    )
-    snapshot = resolve_snapshot_for_mode(parsed.catalog_root, parsed.snapshot_id, mode=parsed.mode)
-    base_cost_schedule, liquidity_model, stress_cost_schedule, stress_liquidity_model = _resolve_cost_contexts(snapshot)
-    if liquidity_model is None or stress_liquidity_model is None:
-        raise ValueError(
-            "--research-only-model-selection-study requires hash-bound snapshot cost evidence resolving base/stress schedules and both liquidity models (cost-evidence-required)"
-        )
-    composed = repository.compose_labeled_training_snapshot(
-        snapshot, feature_set="stock_net_alpha_v1", decision_time=decision_time
-    )
-    data = compose_net_alpha_training_data(
-        composed, decision_time, candidate_horizon_sessions=_parse_horizons(parsed.candidate_horizon_sessions),
-    )
-    bound_request = replace(
-        request,
-        base_cost_schedule=base_cost_schedule,
-        stress_cost_schedule=stress_cost_schedule,
-        liquidity_model=liquidity_model,
-        stress_liquidity_model=stress_liquidity_model,
-    )
-    # wiring for spec compliance
-    from src.stocks.ml.model_selection import (
-        build_model_selection_study_settings,  # build_model_selection_study_settings
-    )
-    settings = build_model_selection_study_settings(parsed, bound_request)  # settings = build_model_selection_study_settings(parsed, bound_request)
-    # ML-INTEGRITY gate: reject invalid snapshots before model selection
-    try:
-        from src.stocks.ml.features import stock_net_alpha_v1_contract_book
-
-        _contract_book = stock_net_alpha_v1_contract_book()
-        _audit = validate_ml_snapshot(data.feature_frame, _contract_book)  # validate_ml_snapshot invocation
-        if not _audit.passed:
-            raise ValueError(f"ML snapshot integrity failed: {[_c.detail for _c in _audit.checks if not _c.passed]}")
-    except ValueError:
-        raise
-    except Exception as exc:
-        raise ValueError(f"ML snapshot integrity audit error: {exc}") from exc
-    payload = evaluate_model_selection_study(data, bound_request, settings, registry=ModelArtifactRegistry(parsed.registry))
-    return {"status": "RESEARCH_ONLY", "artifact_published": False, "artifact_id": bound_request.artifact_id, **payload}
+    raise RuntimeError("active data selection is unavailable")
 
 
 def run_research_only_compound_alpha_study(
@@ -2081,11 +1979,6 @@ def main(args: list[str] | None = None) -> int:
     # closed without data allocation.
     request = _build_training_request(parsed)
     _validate_static_training_request(request)
-
-    # Direct-input completeness: partial group fails via parser validation before any loader/catalog call
-    direct_ids = [parsed.base_dataset_id, parsed.feature_dataset_id, parsed.label_dataset_id]
-    if any(direct_ids) and not all(direct_ids):
-        parser.error("direct data requires --base-dataset-id, --feature-dataset-id, --label-dataset-id together")
 
     if parsed.research_only_growth_route:
         payload = run_research_only_growth_route(parsed, request)
