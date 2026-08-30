@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_CODEBASE_STRUCTURE_AUDIT_20260830",
+      "date": "2026-08-30",
+      "adr_id": "ADR_20260830_CODEBASE_STRUCTURE_AUDIT_20260830",
+      "domain": "architecture",
+      "title": "Large-module structure audit and safe-refactor deferral",
+      "why": "The proposed multi-thousand-line module refactor produced placeholder delegates and vacuous budget tests, which could hide financial behavior regressions.",
+      "resolution": "Removed the unsafe placeholder extraction artifacts and retained the existing production implementation unchanged; recorded the audit decision and deferred a behavior-preserving refactor until each slice has real logic and parity tests.",
+      "impact": "Working tree is clean and check passes; no trading, CLI, artifact, ledger, or data behavior changed. A future refactor must be implemented in bounded slices with causal and allocation parity coverage."
+    },
+    {
       "task_id": "TASK_ARCHITECTURE_REFACTORING_20260830",
       "date": "2026-08-30",
       "adr_id": "ADR_20260830_ARCHITECTURE_REFACTORING_20260830",
@@ -989,16 +999,6 @@
       "why": "Repeated ML runs required manual result transcription and could grow docs/results without a bounded machine-readable history.",
       "resolution": "Added automatic completed/failed run projections, bounded latest/recent/schema/meta files, atomic writes, reconciliation CLI, structured training telemetry, and generated back-res pointer while preserving artifact files as source of truth.",
       "impact": "ML runs now leave compact AI-readable lineage, data-shape, economic-evidence, and failure records with 128-entry retention; ledger failures do not alter artifacts and reconciliation can recover derived caches."
-    },
-    {
-      "task_id": "TASK_STOCK_NET_ALPHA_OOF_SIGNAL_RECOVERY",
-      "date": "2026-08-15",
-      "adr_id": "ADR_20260815_STOCK_NET_ALPHA_OOF_SIGNAL_RECOVERY",
-      "domain": "stocks",
-      "title": "Stock net-alpha OOF signal recovery",
-      "why": "OOF evidence was empty because the fixed ElasticNet penalty produced constant predictions, LightGBM target-free early stopping failed, and replay ValueErrors were hidden.",
-      "resolution": "Added fold-local scale-invariant regularization, target-free LightGBM training, causal session-cluster calibration, structural fallback routing, and typed OOF/replay diagnostics; preserved economic gates.",
-      "impact": "Replay failures are observable and fail closed; causal OOF and holdout evidence remain required. Ruff, mypy, spec compliance, and 692 tests pass."
     }
   ]
 }
