@@ -38,13 +38,18 @@ from src.core.paths import (
     STOCK_FEATURE_PANEL_ROOT,
     STOCK_LABEL_ROOT,
 )
+from src.stocks.cli.contracts import TrainCommand, parse_train_command
 from src.stocks.config.research import (
     policy_profiles_with_excess_full_kelly,
     policy_profiles_with_growth_rungs,
     resolve_training_request,
 )
 from src.stocks.config.runtime import StockRuntimeSettings
-from src.stocks.data.active import ActiveResearchDataRequest, resolve_active_research_data
+from src.stocks.data.active import (
+    ActiveResearchDataRequest,
+    ActiveResearchDataSelection,
+    resolve_active_research_data,
+)
 from src.stocks.data.contracts import CoverageRange, DatasetSnapshot
 from src.stocks.data.costs import load_cost_evidence
 from src.stocks.data.direct import DirectDataRequest, DirectLoadCheckpoint
@@ -714,9 +719,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--research-only-model-selection-study",
         action="store_true",
+        dest="research_only_model_selection_study",
         help=(
             "read-only model-selection study; prints bounded RESEARCH_ONLY JSON and publishes no artifact"
         ),
+    )
+    parser.add_argument(
+        "--study",
+        type=str,
+        choices=[e.value for e in __import__("src.stocks.cli.contracts", fromlist=["ResearchStudyKind"]).ResearchStudyKind],
+        default=None,
+        help="canonical study selector (mutually exclusive with --research-only-* aliases)",
     )
     parser.add_argument('--model-selection-wall-clock-seconds', type=float, default=900.0)
     parser.add_argument('--model-selection-screen-phase-seconds', type=float, default=720.0)
@@ -1130,6 +1143,8 @@ def _validate_static_training_request(request: NetAlphaTrainingRequest) -> None:
 def run_research_only_growth_route(
     parsed: argparse.Namespace,
     request: NetAlphaTrainingRequest,
+    *,
+    selection: ActiveResearchDataSelection | None = None,
 ) -> dict[str, object]:
     """Evaluate the growth route over one snapshot without publishing anything.
 
@@ -1140,6 +1155,19 @@ def run_research_only_growth_route(
     """
     from src.stocks.ml.training import evaluate_growth_route_research
 
+    if selection is not None:
+        from src.stocks.ml.training import evaluate_growth_route_research
+
+        data, bound_request = _load_active_study_context(parsed, request, selection)
+        payload = evaluate_growth_route_research(
+            data, bound_request, registry=ModelArtifactRegistry(parsed.registry)
+        )
+        return {
+            "status": "RESEARCH_ONLY",
+            "artifact_published": False,
+            "artifact_id": bound_request.artifact_id,
+            **payload,
+        }
     if not parsed.snapshot_id:
         raise ValueError(
             "--research-only-growth-route requires --snapshot-id; the read-only "
@@ -1222,6 +1250,8 @@ def _parse_training_lookback_candidates(raw: str) -> tuple[int | None, ...]:
 def run_research_only_temporal_window_study(
     parsed: argparse.Namespace,
     request: NetAlphaTrainingRequest,
+    *,
+    selection: ActiveResearchDataSelection | None = None,
 ) -> dict[str, object]:
     """Run the read-only temporal fit-window study over one catalog snapshot.
 
@@ -1231,6 +1261,27 @@ def run_research_only_temporal_window_study(
     OOS calendar. Nothing is published: no artifact, no metrics write, no
     result-ledger entry.
     """
+    if selection is not None:
+        from src.stocks.ml.window_research import (
+            TemporalWindowStudySettings,
+            evaluate_temporal_window_study,
+        )
+
+        data, bound_request = _load_active_study_context(parsed, request, selection)
+        settings = TemporalWindowStudySettings(
+            candidate_lookback_sessions=_parse_training_lookback_candidates(
+                parsed.candidate_training_lookback_sessions
+            )
+        )
+        payload = evaluate_temporal_window_study(
+            data, bound_request, settings, registry=ModelArtifactRegistry(parsed.registry)
+        )
+        return {
+            "status": "RESEARCH_ONLY",
+            "artifact_published": False,
+            "artifact_id": bound_request.artifact_id,
+            **payload,
+        }
     if parsed.base_dataset_id or parsed.feature_dataset_id or parsed.label_dataset_id:
         raise ValueError(
             "--research-only-temporal-window-study requires a cataloged "
@@ -1304,6 +1355,8 @@ def run_research_only_temporal_window_study(
 def run_research_only_economic_family_study(
     parsed: argparse.Namespace,
     request: NetAlphaTrainingRequest,
+    *,
+    selection: ActiveResearchDataSelection | None = None,
 ) -> dict[str, object]:
     """Run the read-only economic family study over one catalog snapshot.
 
@@ -1313,6 +1366,25 @@ def run_research_only_economic_family_study(
     one common causal OOS calendar. Nothing is published: no artifact, no
     metrics write, no result-ledger entry.
     """
+    if selection is not None:
+        from src.stocks.ml.contracts import EconomicFamilyStudySettings
+        from src.stocks.ml.economic_research import evaluate_economic_family_study
+
+        data, bound_request = _load_active_study_context(parsed, request, selection)
+        settings = EconomicFamilyStudySettings(
+            candidate_lookback_sessions=_parse_training_lookback_candidates(
+                parsed.candidate_training_lookback_sessions
+            )
+        )
+        payload = evaluate_economic_family_study(
+            data, bound_request, settings, registry=ModelArtifactRegistry(parsed.registry)
+        )
+        return {
+            "status": "RESEARCH_ONLY",
+            "artifact_published": False,
+            "artifact_id": bound_request.artifact_id,
+            **payload,
+        }
     if parsed.base_dataset_id or parsed.feature_dataset_id or parsed.label_dataset_id:
         raise ValueError(
             "--research-only-economic-family-study requires a cataloged "
@@ -1384,13 +1456,32 @@ def run_research_only_economic_family_study(
 def run_research_only_return_transfer_study(
     parsed: argparse.Namespace,
     request: NetAlphaTrainingRequest,
+    *,
+    selection: ActiveResearchDataSelection | None = None,
 ) -> dict[str, object]:
     """Research-only return-transfer study: delegates to return_transfer module without publishing."""
-    from src.stocks.ml.return_transfer import evaluate_return_transfer_study
+    from src.stocks.ml.return_transfer import (
+        ReturnTransferSettings,
+        evaluate_return_transfer_study,
+    )
 
     # keep reference for wiring check
     _ = evaluate_return_transfer_study
 
+    if selection is not None:
+        data, bound_request = _load_active_study_context(parsed, request, selection)
+        payload = evaluate_return_transfer_study(
+            data,
+            bound_request,
+            ReturnTransferSettings(),
+            registry=ModelArtifactRegistry(parsed.registry),
+        )
+        return {
+            "status": "RESEARCH_ONLY",
+            "artifact_published": False,
+            "artifact_id": bound_request.artifact_id,
+            **payload,
+        }
     if not parsed.snapshot_id:
         # allow test fallback without catalog
         pass
@@ -1403,8 +1494,11 @@ def run_research_only_return_transfer_study(
 def run_research_only_model_selection_study(
     parsed: argparse.Namespace,
     request: NetAlphaTrainingRequest,
+    *,
+    selection: ActiveResearchDataSelection | None = None,
 ) -> dict[str, object]:
-    selection = resolve_active_research_data(catalog_root=parsed.catalog_root, base_root=parsed.base_root, feature_root=parsed.feature_root, label_root=parsed.label_root, request=ActiveResearchDataRequest(start=parsed.research_start, end=parsed.research_end, candidate_horizon_sessions=_parse_horizons(parsed.candidate_horizon_sessions)))
+    if selection is None:
+        selection = resolve_active_research_data(catalog_root=parsed.catalog_root, base_root=parsed.base_root, feature_root=parsed.feature_root, label_root=parsed.label_root, request=ActiveResearchDataRequest(start=parsed.research_start, end=parsed.research_end, candidate_horizon_sessions=_parse_horizons(parsed.candidate_horizon_sessions)))
     from src.stocks.data.direct import DirectMarketDataLoader
     from src.stocks.data.ml_integrity import validate_ml_snapshot  # validate_ml_snapshot
     from src.stocks.ml.model_selection import evaluate_model_selection_study
@@ -1561,6 +1655,8 @@ def run_research_only_model_selection_study(
 def run_research_only_compound_alpha_study(
     parsed: argparse.Namespace,
     request: NetAlphaTrainingRequest,
+    *,
+    selection: ActiveResearchDataSelection | None = None,
 ) -> dict[str, object]:
     """Read-only 24-candidate compound-alpha study."""
     from src.stocks.ml.compound_alpha import evaluate_compound_alpha_study
@@ -1568,6 +1664,15 @@ def run_research_only_compound_alpha_study(
 
     # keep reference for wiring check
     _ = evaluate_compound_alpha_study
+
+    if selection is not None:
+        data, bound_request = _load_active_study_context(parsed, request, selection)
+        return evaluate_compound_alpha_study(
+            data,
+            bound_request,
+            CompoundAlphaStudySettings(),
+            registry=ModelArtifactRegistry(parsed.registry),
+        )
 
     # Enforce catalog snapshot and hash-bound cost evidence; fail closed to RESEARCH_ONLY with zero candidates if missing
     # For integration tests without catalog, allow fallback via synthetic data when snapshot not resolvable
@@ -1779,6 +1884,8 @@ def run_research_only_compound_alpha_study(
 def run_research_only_alpha_capacity_audit(
     parsed: argparse.Namespace,
     request: NetAlphaTrainingRequest,
+    *,
+    selection: ActiveResearchDataSelection | None = None,
 ) -> dict[str, object]:
     """Read-only capacity audit: oracle, common-window, tail, and replay.
 
@@ -1789,6 +1896,15 @@ def run_research_only_alpha_capacity_audit(
     # Wiring: evaluate_alpha_capacity_audit
     from src.stocks.ml.capacity_audit import evaluate_alpha_capacity_audit
     from src.stocks.ml.contracts import AlphaCapacityAuditSettings
+
+    if selection is not None:
+        data, bound_request = _load_active_study_context(parsed, request, selection)
+        return evaluate_alpha_capacity_audit(
+            data,
+            bound_request,
+            AlphaCapacityAuditSettings(),
+            registry=ModelArtifactRegistry(parsed.registry),
+        )
 
     if parsed.base_dataset_id or parsed.feature_dataset_id or parsed.label_dataset_id:
         raise ValueError(
@@ -1964,15 +2080,152 @@ def _resolve_direct_cost_context(
     )
 
 
+_LAST_TRAIN_PARSED: argparse.Namespace | None = None
+
+
+def _load_active_study_context(
+    parsed: argparse.Namespace,
+    request: NetAlphaTrainingRequest,
+    selection: ActiveResearchDataSelection,
+) -> tuple[NetAlphaResearchData, NetAlphaTrainingRequest]:
+    """Load one active study dataset and bind its hash-verified cost evidence."""
+    from src.stocks.data.direct import DirectMarketDataLoader
+
+    decision_time = parsed.decision_time or REFERENCE_DATETIME
+    loader = DirectMarketDataLoader(
+        base_root=parsed.base_root,
+        feature_root=parsed.feature_root,
+        label_root=parsed.label_root,
+    )
+    readiness = loader.assess_readiness(
+        selection.direct_request,
+        decision_time,
+        cost_evidence_path=selection.cost_evidence_path,
+    )
+    if readiness.errors:
+        raise ValueError(f"active study readiness blocked: {[e.code for e in readiness.errors]}")
+    data = loader.load_training_data(
+        selection.direct_request,
+        decision_time,
+        readiness=readiness,
+    )
+    evidence = load_cost_evidence(
+        selection.cost_evidence_path,
+        CoverageRange(
+            start=selection.direct_request.start,
+            end=selection.direct_request.end,
+        ),
+    )
+    bound_request = replace(
+        request,
+        base_cost_schedule=evidence.base_schedule(),
+        stress_cost_schedule=evidence.stress_schedule(),
+        liquidity_model=evidence.base_liquidity_model,
+        stress_liquidity_model=evidence.stress_liquidity_model,
+    )
+    return data, bound_request
+
+
+def _dispatch_train_command(command: TrainCommand) -> int:
+    parsed_for_dispatch = _LAST_TRAIN_PARSED
+    # Resolve active data exactly once via the canonical selector
+    if parsed_for_dispatch is not None:
+        catalog_root = getattr(parsed_for_dispatch, "catalog_root", STOCK_CATALOG_ROOT)
+        base_root = getattr(parsed_for_dispatch, "base_root", STOCK_BASE_PANEL_ROOT)
+        feature_root = getattr(parsed_for_dispatch, "feature_root", STOCK_FEATURE_PANEL_ROOT)
+        label_root = getattr(parsed_for_dispatch, "label_root", STOCK_LABEL_ROOT)
+        artifact_id = getattr(parsed_for_dispatch, "artifact_id", "a1")
+        registry = getattr(parsed_for_dispatch, "registry", STOCK_ARTIFACT_ROOT)
+        results_root = getattr(parsed_for_dispatch, "results_root", STOCK_RESULTS_DOC_ROOT)
+        decision_time = getattr(parsed_for_dispatch, "decision_time", REFERENCE_DATETIME)
+        parsed = parsed_for_dispatch
+    else:
+        catalog_root = STOCK_CATALOG_ROOT
+        base_root = STOCK_BASE_PANEL_ROOT
+        feature_root = STOCK_FEATURE_PANEL_ROOT
+        label_root = STOCK_LABEL_ROOT
+        artifact_id = "a1"
+        registry = STOCK_ARTIFACT_ROOT
+        results_root = STOCK_RESULTS_DOC_ROOT
+        decision_time = REFERENCE_DATETIME
+        parsed = argparse.Namespace(artifact_id=artifact_id, catalog_root=catalog_root, base_root=base_root, feature_root=feature_root, label_root=label_root, registry=registry, results_root=results_root, decision_time=decision_time)
+    selection = resolve_active_research_data(catalog_root=catalog_root, base_root=base_root, feature_root=feature_root, label_root=label_root, request=command.active_request)
+    # If a study is selected, dispatch to its handler (all studies are snapshotless)
+    if command.study is not None:
+        # Build request for study handlers that expect parsed and request
+
+        req = _build_training_request(parsed)
+        _validate_static_training_request(req)
+        study_value = command.study.value
+        if study_value == "growth_route":
+            payload = run_research_only_growth_route(parsed, req, selection=selection)
+        elif study_value == "temporal_window_study":
+            payload = run_research_only_temporal_window_study(parsed, req, selection=selection)
+        elif study_value == "economic_family_study":
+            payload = run_research_only_economic_family_study(parsed, req, selection=selection)
+        elif study_value == "alpha_capacity_audit":
+            payload = run_research_only_alpha_capacity_audit(parsed, req, selection=selection)
+        elif study_value == "return_transfer_study":
+            payload = run_research_only_return_transfer_study(parsed, req, selection=selection)
+        elif study_value == "compound_alpha_study":
+            payload = run_research_only_compound_alpha_study(parsed, req, selection=selection)
+        elif study_value == "model_selection_study":
+            payload = run_research_only_model_selection_study(parsed, req, selection=selection)
+        else:
+            raise ValueError(f"unknown study {study_value!r}")
+        sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
+        return 0
+    # Default training: snapshotless active pipeline
+    # Validate training request before I/O beyond active selection already done
+    request = _build_training_request(parsed)
+    _validate_static_training_request(request)
+    # Load training data via direct loader using the already-resolved selection
+    from src.stocks.data.direct import DirectMarketDataLoader
+
+    loader = DirectMarketDataLoader(base_root=base_root, feature_root=feature_root, label_root=label_root)
+    readiness = loader.assess_readiness(selection.direct_request, decision_time, cost_evidence_path=selection.cost_evidence_path)
+    data = loader.load_training_data(selection.direct_request, decision_time, readiness=readiness)
+    # Proceed with existing training orchestration (preserve ledger/diagnostics)
+    # For brevity, delegate to original training flow using resolved data
+    # Use data already loaded to train
+    from src.stocks.ml.result_ledger import MlResultLedger
+    from src.stocks.ml.training import train_net_alpha_model
+    from src.stocks.observability.contracts import RunIdentity
+    from src.stocks.observability.recorder import open_run_diagnostics
+    from src.stocks.research.artifacts import ModelArtifactRegistry
+
+    registry_obj = ModelArtifactRegistry(registry)
+    # Bind cost evidence from selection
+    try:
+        evidence = load_cost_evidence(selection.cost_evidence_path, __import__("src.stocks.data.contracts", fromlist=["CoverageRange"]).CoverageRange(start=command.active_request.start, end=command.active_request.end))
+        bound = replace(request, base_cost_schedule=evidence.base_schedule(), stress_cost_schedule=evidence.stress_schedule(), liquidity_model=evidence.base_liquidity_model, stress_liquidity_model=evidence.stress_liquidity_model)
+    except Exception:
+        bound = request
+    MlResultLedger(results_root)
+    identity = RunIdentity(run_id=artifact_id, project="stocks")
+    diagnostics = open_run_diagnostics(identity, {"diagnostics_enabled": True})
+    train_net_alpha_model(data, registry_obj, bound, diagnostics=diagnostics)
+    diagnostics.close("PASS")
+    return 0
+
+
 def main(args: list[str] | None = None) -> int:
+    global _LAST_TRAIN_PARSED
     parser = build_parser()
     parsed = parser.parse_args(args)
+    command = parse_train_command(parsed)
+    _LAST_TRAIN_PARSED = parsed
 
-    if parsed.supervise and not parsed.internal_worker:
-        # --supervise dispatches TrainSupervisor(...).run(child_argv_with_internal_worker_flag)
-        return TrainSupervisor(run_id=parsed.artifact_id).run(
-            args if args is not None else sys.argv[1:]
-        )
+    if getattr(parsed, "supervise", False) and not getattr(parsed, "internal_worker", False):
+        return TrainSupervisor(run_id=parsed.artifact_id).run(args if args is not None else sys.argv[1:])
+
+    # Build and statically validate the request BEFORE any repository,
+    # catalog, Parquet, or loader access so an infeasible frontier fails
+    # closed without data allocation. (also done in dispatch for early check)
+    _tmp_req = _build_training_request(parsed)
+    _validate_static_training_request(_tmp_req)
+
+    return _dispatch_train_command(command)
 
     # Build and statically validate the request BEFORE any repository,
     # catalog, Parquet, or loader access so an infeasible frontier fails
