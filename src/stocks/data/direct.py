@@ -25,7 +25,7 @@ import polars as pl
 
 from src.core.datasets import DatasetManifest, make_manifest
 from src.core.instruments import AssetKind
-from src.stocks.data.contracts import DatasetSnapshot
+from src.stocks.data.contracts import DatasetSnapshot  # noqa: F401
 from src.stocks.ml.contracts import (
     CANONICAL_FEATURE_SET,
     HorizonJoinEvidence,
@@ -87,9 +87,12 @@ class DirectInputReference:
     start: date
     end: date
     feature_schema_hash: str
-    feature_content_hash: str | None
-    cost_evidence_path: str | None
-    cost_evidence_hash: str | None
+    base_content_hash: str = ""
+    feature_content_hash: str = ""
+    label_content_hash: str = ""
+    label_schema_hash: str = ""
+    cost_evidence_path: str | None = None
+    cost_evidence_hash: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -668,28 +671,40 @@ class DirectMarketDataLoader:
         self, request: DirectDataRequest, cost_evidence_path: Path | None
     ) -> DirectInputReference:
         feature_manifest = self._read_feature_manifest(request)
+        base_manifest = self._read_manifest_safe(self._base_store, request.base_dataset_id)
+        label_manifest = self._read_label_manifest(request)
         schema_hash = feature_manifest.schema_hash if feature_manifest is not None else ""
-        content_hash: str | None = None
-        if feature_manifest is not None:
-            content_hash = feature_manifest.content_hash or feature_manifest.schema_hash
-        cost_path_str: str | None = str(cost_evidence_path) if cost_evidence_path is not None else None
-        cost_hash: str | None = None
+        feature_content_hash = feature_manifest.content_hash if feature_manifest is not None else ""
+        base_content_hash = base_manifest.content_hash if base_manifest is not None else ""
+        label_content_hash = label_manifest.content_hash if label_manifest is not None else ""
+        label_schema_hash = label_manifest.schema_hash if label_manifest is not None else ""
+        cost_path_str: str = str(cost_evidence_path) if cost_evidence_path is not None else ""
+        cost_hash: str = ""
         if cost_evidence_path is not None and cost_evidence_path.exists():
             try:
                 cost_hash = hashlib.sha256(cost_evidence_path.read_bytes()).hexdigest()
             except OSError:
-                cost_hash = None
+                cost_hash = ""
         return DirectInputReference(
             base_dataset_id=request.base_dataset_id,
+            base_content_hash=base_content_hash,
             feature_dataset_id=request.feature_dataset_id,
+            feature_content_hash=feature_content_hash,
+            feature_schema_hash=schema_hash,
             label_dataset_id=request.label_dataset_id,
+            label_content_hash=label_content_hash,
+            label_schema_hash=label_schema_hash,
             start=request.start,
             end=request.end,
-            feature_schema_hash=schema_hash,
-            feature_content_hash=content_hash,
             cost_evidence_path=cost_path_str,
             cost_evidence_hash=cost_hash,
         )
+
+    def _read_manifest_safe(self, store: ParquetDatasetStore, dataset_id: str):  # type: ignore[no-untyped-def]
+        try:
+            return store.read_manifest(dataset_id)
+        except FileNotFoundError:
+            return None
 
     def assess_readiness(
         self, request: DirectDataRequest, decision_time: datetime, *, cost_evidence_path: Path | None = None
