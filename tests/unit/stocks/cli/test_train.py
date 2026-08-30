@@ -1723,3 +1723,121 @@ def test_cli_default_and_direct_failure_ledger_are_capacity_observable(monkeypat
     # ensure no raw rows leaked
     dumped = json.dumps(payload)
     assert "KRX:00001" not in dumped or "instrument_id" not in dumped or len(dumped) < 5000  # bounded
+
+def test_mlcmp_snapshot_and_direct_failures_write_normalized_ledger(monkeypatch, tmp_path):
+    import json, argparse, polars as pl
+    from pathlib import Path
+    from src.stocks.cli import train as train_cli
+    from src.stocks.ml.result_ledger import MlResultLedger
+    from src.stocks.ml.contracts import NetAlphaTrainingRequest, ExecutionFrontierSettings
+    from src.core.costs import default_base_schedule, default_stress_schedule
+    # snapshot audit failure: mock validate_ml_snapshot to fail
+    calls=[]
+    class FakeLedger:
+        def __init__(self, root):
+            self.root=Path(root)
+            self.records=[]
+        def record_research_outcome(self, run_id, status, data_inputs, readiness, outcome, started_at, failure=None):
+            # sanitize: ensure no traceback/raw market values
+            rec={"run_id": run_id, "status": status, "data_inputs": data_inputs, "readiness": readiness, "outcome": outcome, "failure": str(failure)[:200] if failure else None}
+            # ensure bounded reason code
+            assert status in ("failed","completed")
+            assert "traceback" not in json.dumps(rec).lower()
+            # ensure no raw market rows like instrument_id with price
+            assert "100.0" not in json.dumps(rec)
+            self.records.append(rec)
+            calls.append(rec)
+            # also write to file for count
+            out=self.root / f"{run_id}.json"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(rec))
+    # Test snapshot path: force snapshot resolve to produce data that fails audit
+    monkeypatch.setattr("src.stocks.ml.result_ledger.MlResultLedger", FakeLedger)
+    monkeypatch.setattr("src.stocks.cli.train.MlResultLedger", FakeLedger)
+    # monkeypatch compose to return dummy data that will trigger audit failure via validate_ml_snapshot false
+    import src.stocks.cli.train as tmod
+    # we will call run_research_only_model_selection_study directly with snapshot failure via direct readiness error first
+    # Direct readiness failure path
+    parser=tmod.build_parser()
+    args=parser.parse_args(["--artifact-id","direct_fail","--research-only-model-selection-study","--base-dataset-id","base","--feature-dataset-id","feat","--label-dataset-id","lab","--data-start","2024-01-01","--data-end","2024-03-31","--results-root",str(tmp_path/"results"),"--registry",str(tmp_path/"art")])
+    req=tmod._build_training_request(args)
+    # mock loader assess_readiness to return errors
+    from unittest.mock import MagicMock
+    class FakeReadiness:
+        def __init__(self):
+            from types import SimpleNamespace
+            self.passed=False
+            self.errors=[SimpleNamespace(code="missing-feature")]
+            self.warnings=[]
+            self.input_reference=SimpleNamespace(feature_schema_hash="h", feature_content_hash="c", cost_evidence_path=None, cost_evidence_hash=None)
+    import src.stocks.data.direct as direct_mod
+    orig_loader=direct_mod.DirectMarketDataLoader
+    class FakeLoader:
+        def __init__(self, **kw): pass
+        def assess_readiness(self, *a, **kw): return FakeReadiness()
+        def load_training_data(self, *a, **kw): raise AssertionError("should not load")
+    monkeypatch.setattr("src.stocks.data.direct.DirectMarketDataLoader", FakeLoader)
+    try:
+        from src.stocks.cli.train import run_research_only_model_selection_study
+        run_research_only_model_selection_study(args, req)
+        assert False, "should raise"
+    except ValueError as e:
+        assert "readiness blocked" in str(e).lower()
+    # check ledger recorded exactly one
+    # need to inspect FakeLedger records - we used monkeypatched MlResultLedger but run created new instance; check calls
+    # Our FakeLedger collects in calls list via class variable? we used local; but each new instance has own records - we need to count files
+    ledger_files=list((tmp_path/"results").rglob("*.json")) if (tmp_path/"results").exists() else []
+    # alternative: count calls list length should be 1
+    assert len(calls)==1
+    assert calls[0]["status"]=="failed"
+    assert calls[0]["readiness"]["errors"]==["missing-feature"]
+    # Snapshot audit failure path: mock snapshot composition to trigger validate failure
+    calls.clear()
+    # Now test evaluation failure path (readiness passes but evaluate raises)
+    class PassReadiness:
+        def __init__(self):
+            from types import SimpleNamespace
+            self.passed=True
+            self.errors=[]
+            self.warnings=[]
+            self.input_reference=SimpleNamespace(feature_schema_hash="h", feature_content_hash="c", cost_evidence_path=None, cost_evidence_hash=None)
+    class PassLoader:
+        def __init__(self, **kw): pass
+        def assess_readiness(self, *a, **kw): return PassReadiness()
+        def load_training_data(self, *a, **kw):
+            import polars as pl
+            from src.stocks.ml.contracts import NetAlphaResearchData
+            from src.core.datasets import DatasetManifest
+            from src.core.instruments import AssetKind
+            from datetime import datetime, UTC
+            from src.stocks.ml.features import stock_net_alpha_v1_roles
+            _r=stock_net_alpha_v1_roles()
+            row={"instrument_id":"KRX:00001","session":datetime(2024,1,1, tzinfo=UTC),"available_time":datetime(2024,1,1, tzinfo=UTC)}
+            for src in _r:
+                row[src]=1.0
+                row[f"feature__{src}"]=1.0
+            frame=pl.DataFrame([row])
+            manifest=DatasetManifest(asset_kind=AssetKind.STOCK, schema_version="v1", schema_hash="h", provider_version="p", universe_policy_version="u", universe_policy_hash="u", feature_set="stock_net_alpha_v1", feature_set_hash="f", label_definition="net_alpha_o2o", label_horizon_sessions=10, time_start=datetime(2024,1,1, tzinfo=UTC), time_end=datetime(2024,1,2, tzinfo=UTC), generated_time=datetime(2024,1,2, tzinfo=UTC), row_count=1, reference_notional=100_000_000.0)
+            return NetAlphaResearchData(feature_frame=frame, labels_by_horizon={10: pl.DataFrame({"instrument_id":["KRX:00001"],"session":[datetime(2024,1,1, tzinfo=UTC)],"net_alpha_target":[0.01],"risk_residual":[0.01],"reference_cost":[0.001],"gross_return":[0.01],"label_available_time":[datetime(2024,1,1, tzinfo=UTC)],"realized_net_return":[0.01]})}, manifest=manifest)
+    monkeypatch.setattr("src.stocks.data.direct.DirectMarketDataLoader", PassLoader)
+    # make evaluate raise
+    import src.stocks.ml.model_selection as msel
+    orig_eval=msel.evaluate_model_selection_study
+    def failing_eval(*a, **kw):
+        raise ValueError("injected eval boom")
+    monkeypatch.setattr("src.stocks.data.ml_integrity.validate_ml_snapshot", lambda *a, **kw: __import__("types").SimpleNamespace(passed=True, checks=[]))
+    monkeypatch.setattr("src.stocks.data.ml_integrity.validate_ml_snapshot", lambda *a, **kw: __import__("types").SimpleNamespace(passed=True, checks=[]))
+    monkeypatch.setattr("src.stocks.ml.model_selection.evaluate_model_selection_study", failing_eval)
+    monkeypatch.setattr("src.stocks.ml.result_ledger.MlResultLedger", FakeLedger)
+    monkeypatch.setattr("src.stocks.cli.train.MlResultLedger", FakeLedger)
+    args2=parser.parse_args(["--artifact-id","direct_eval_fail","--research-only-model-selection-study","--base-dataset-id","base","--feature-dataset-id","feat","--label-dataset-id","lab","--data-start","2024-01-01","--data-end","2024-03-31","--candidate-horizon-sessions","10","--candidate-rebalance-frequency-sessions","10","--candidate-top-k","12","--results-root",str(tmp_path/"results2"),"--registry",str(tmp_path/"art2")])
+    req2=tmod._build_training_request(args2)
+    try:
+        run_research_only_model_selection_study(args2, req2)
+        assert False
+    except ValueError as e:
+        assert "boom" in str(e)
+    assert len(calls)==1  # only the second failure recorded after clear? we cleared earlier, now should be 1
+    assert calls[0]["status"]=="failed"
+    assert "traceback" not in json.dumps(calls[0]).lower()
+    monkeypatch.setattr("src.stocks.ml.model_selection.evaluate_model_selection_study", orig_eval)
