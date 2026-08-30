@@ -1104,8 +1104,9 @@ class StockRiskPolicy:
     economic_ranking_mode: Literal["raw_score_v1", "economic_net_v1"] = "raw_score_v1"
     execution_utility_mode: Literal["legacy_target_interpolation_v1", "delta_cost_aware_v1", "sparse_hold_replace_v2"] = "legacy_target_interpolation_v1"
     sizing_mode: Literal[
-        "alpha_vol_squared_v1", "risk_balanced_waterfill_v2", "confidence_mean_variance_v1"
+        "alpha_vol_squared_v1", "risk_balanced_waterfill_v2", "confidence_mean_variance_v1", "continuous_uncertainty_v1"
     ] = "alpha_vol_squared_v1"
+    economic_gate_mode: Literal["lower_bound_v1", "finite_mean_v1"] = "lower_bound_v1"
     retained_sizing_mode: Literal["freeze_v1", "band_limited_rewaterfill_v1"] = "freeze_v1"
     net_exposure_gate_mode: Literal["off_v1", "trend_vol_v1"] = "off_v1"
     gate_trend_lookback_sessions: int = 60
@@ -1136,6 +1137,10 @@ class StockRiskPolicy:
             raise ValueError("target_annual_volatility must be positive")
         if self.turnover_budget < 0:
             raise ValueError("turnover_budget must be non-negative")
+        if self.economic_gate_mode not in ("lower_bound_v1", "finite_mean_v1"):
+            raise ValueError("economic_gate_mode must be 'lower_bound_v1' or 'finite_mean_v1'")
+        if self.economic_gate_mode == "finite_mean_v1" and self.sizing_mode != "continuous_uncertainty_v1":
+            raise ValueError("finite_mean_v1 requires continuous_uncertainty_v1 sizing")
         if (
             self.volatility_lookback_sessions <= 0
             or self.covariance_lookback_sessions <= 0
@@ -1221,6 +1226,7 @@ def stock_risk_policy_fingerprint(policy: StockRiskPolicy) -> str:
             "economic_ranking_mode": str(policy.economic_ranking_mode),
             "execution_utility_mode": str(policy.execution_utility_mode),
             "sizing_mode": str(policy.sizing_mode),
+            "economic_gate_mode": str(policy.economic_gate_mode),
             "retained_sizing_mode": str(policy.retained_sizing_mode),
             **(
                 {}
@@ -1295,6 +1301,7 @@ def construct_target_allocations(
         eligible = _economically_eligible(
             cross_section, eligible, incumbent_ids,
             no_trade_band_bps=policy.no_trade_band_bps,
+            economic_gate_mode=policy.economic_gate_mode,
         )
 
     raw_scores = np.asarray(eligible["pred_score"].to_list(), dtype=np.float64)
@@ -1343,7 +1350,11 @@ def construct_target_allocations(
     candidate_count = eligible.height
     selected_count = len(ids)
     net_lower_bound_of: dict[str, float] = {}
-    if policy.compounding.enabled and "net_alpha_lower_bound" in cross_section.columns:
+    if (
+        policy.compounding.enabled
+        and policy.sizing_mode != "continuous_uncertainty_v1"
+        and "net_alpha_lower_bound" in cross_section.columns
+    ):
         net_lower_bound_of = {
             str(instrument_id): float(value)
             for instrument_id, value in zip(
@@ -1398,6 +1409,24 @@ def construct_target_allocations(
     priority_alpha_of = _priority_alpha_of(
         ranked, incumbent_ids, cross_section
     )
+    expected_net_alpha_of = {
+        str(instrument_id): float(value)
+        for instrument_id, value in zip(
+            cross_section["instrument_id"].to_list(),
+            cross_section["expected_net_alpha"].to_list(),
+            strict=True,
+        )
+        if value is not None and math.isfinite(float(value))
+    } if "expected_net_alpha" in cross_section.columns else {}
+    alpha_standard_error_of = {
+        str(instrument_id): float(value)
+        for instrument_id, value in zip(
+            cross_section["instrument_id"].to_list(),
+            cross_section["alpha_standard_error"].to_list(),
+            strict=True,
+        )
+        if value is not None and math.isfinite(float(value)) and float(value) >= 0.0
+    } if "alpha_standard_error" in cross_section.columns else {}
 
     feasible = _portfolio_is_feasible(current_weights, sector_of, equity, policy)
     if feasible:
@@ -1424,6 +1453,8 @@ def construct_target_allocations(
             policy,
             priority_alpha_of=priority_alpha_of,
             net_lower_bound_of=net_lower_bound_of,
+            expected_net_alpha_of=expected_net_alpha_of,
+            alpha_standard_error_of=alpha_standard_error_of,
             decision_session=decision_session,
             candidate_count=candidate_count,
             ranked_count=ranked_count,
@@ -1534,6 +1565,8 @@ def _economically_eligible(
     eligible: pl.DataFrame,
     incumbent_ids: set[str],
     no_trade_band_bps: float = 0.0,
+    *,
+    economic_gate_mode: Literal["lower_bound_v1", "finite_mean_v1"] = "lower_bound_v1",
 ) -> pl.DataFrame:
     """Gate entries and holdings on cost-adjusted expected net alpha.
 
@@ -1551,6 +1584,31 @@ def _economically_eligible(
         return eligible
     band = no_trade_band_bps / 10_000.0
     incumbent = pl.col("instrument_id").is_in(incumbent_ids)
+    if economic_gate_mode == "finite_mean_v1":
+        # finite_mean_v1 requires finite positive expected net alpha and finite se >=0
+        has_se = "alpha_standard_error" in cross_section.columns
+        if not has_se:
+            return eligible.filter(pl.lit(False))
+        keep_ok = (
+            (pl.col("expected_active_alpha") > 0.0)
+            & pl.col("expected_active_alpha").is_finite()
+            & pl.col("alpha_standard_error").is_finite()
+            & (pl.col("alpha_standard_error") >= 0.0)
+            & (pl.col("expected_net_alpha") > 0.0)
+            & pl.col("expected_net_alpha").is_finite()
+        )
+        enter_ok = (
+            pl.col("expected_net_alpha").is_finite()
+            & (pl.col("expected_net_alpha") > 0.0)
+            & pl.col("expected_active_alpha").is_finite()
+            & (pl.col("expected_active_alpha") > 0.0)
+            & pl.col("alpha_standard_error").is_finite()
+            & (pl.col("alpha_standard_error") >= 0.0)
+        )
+        gate = pl.when(incumbent).then(keep_ok).otherwise(enter_ok)
+        return eligible.filter(gate.fill_null(False))
+    if economic_gate_mode == "lower_bound_v1":
+        pass
     keep_ok = (
         (pl.col("expected_active_alpha") - pl.col("exit_cost_rate") > 0.0)
         & (pl.col("expected_active_alpha") > 0.0)
@@ -1632,6 +1690,8 @@ def _build_allocations(
     *,
     priority_alpha_of: dict[str, float] | None = None,
     net_lower_bound_of: dict[str, float] | None = None,
+    expected_net_alpha_of: dict[str, float] | None = None,
+    alpha_standard_error_of: dict[str, float] | None = None,
     decision_session: object = "",
     candidate_count: int = 0,
     ranked_count: int = 0,
@@ -1681,6 +1741,21 @@ def _build_allocations(
             instrument_id: confidence_weights.get(instrument_id, 0.0)
             for instrument_id in ids
         }
+    elif (
+        policy.sizing_mode == "continuous_uncertainty_v1"
+        and expected_net_alpha_of is not None
+        and alpha_standard_error_of is not None
+        and covariance is not None
+    ):
+        uncertainty_weights = _uncertainty_mean_variance_weights(
+            ids,
+            expected_net_alpha_of,
+            alpha_standard_error_of,
+            covariance,
+            sector_of,
+            policy,
+        )
+        raw_scores = {instrument_id: uncertainty_weights.get(instrument_id, 0.0) for instrument_id in ids}
     elif policy.sizing_mode == "risk_balanced_waterfill_v2" and sparse_plan is not None:
         active_ids = list(
             dict.fromkeys(
@@ -2927,6 +3002,63 @@ def _confidence_mean_variance_weights(
     if util <= 0.0:
         return zero
     return {i: float(weight) for i, weight in zip(ids, w, strict=True)}
+
+
+def _uncertainty_mean_variance_weights(
+    active_ids: Sequence[str],
+    expected_net_alpha_of: Mapping[str, float],
+    alpha_standard_error_of: Mapping[str, float],
+    covariance: np.ndarray,
+    sector_of: Mapping[str, object],
+    policy: StockRiskPolicy,
+) -> dict[str, float]:
+    ids = [str(i) for i in active_ids if i in expected_net_alpha_of and math.isfinite(expected_net_alpha_of[i]) and i in alpha_standard_error_of and math.isfinite(alpha_standard_error_of[i]) and float(alpha_standard_error_of[i]) >= 0.0]
+    zero: dict[str, float] = {str(i): 0.0 for i in active_ids}
+    n = len(ids)
+    if n == 0:
+        return zero
+    mu = np.asarray([float(expected_net_alpha_of[i]) for i in ids], dtype=np.float64)
+    se = np.asarray([float(alpha_standard_error_of[i]) for i in ids], dtype=np.float64)
+    sigma = np.asarray(covariance, dtype=np.float64)
+    if sigma.shape != (n, n) or not np.all(np.isfinite(sigma)):
+        return zero
+    horizon = max(
+        1,
+        int(
+            policy.compounding.forecast_horizon_sessions
+            if policy.compounding.forecast_horizon_sessions is not None
+            else policy.rebalance_frequency_sessions
+        ),
+    )
+    gamma = float(policy.compounding.growth_risk_aversion) if math.isfinite(float(policy.compounding.growth_risk_aversion)) and float(policy.compounding.growth_risk_aversion) > 0 else 1.0
+    # add diag((se/H)^2) to covariance
+    diag_add = (se / float(horizon)) ** 2
+    sigma_adj = sigma.copy()
+    # keep symmetry
+    for idx in range(n):
+        sigma_adj[idx, idx] += float(diag_add[idx])
+    positive = np.clip(mu, 0.0, None)
+    if float(positive.sum()) <= 0.0:
+        return zero
+    # variance-adjusted proportional allocation ensures larger SE gets lower weight
+    diag_var = np.diag(sigma_adj)
+    # avoid division by zero
+    inv_var = np.where(diag_var > 0, 1.0 / np.maximum(diag_var, 1e-12), 0.0)
+    raw = positive * inv_var
+    if float(raw.sum()) <= 0.0:
+        raw = positive
+    w = raw / float(raw.sum()) * float(policy.gross_cap)
+    w = _project_confidence_weights(w, ids, sector_of, float(policy.gross_cap), float(policy.single_name_cap), float(policy.sector_cap))
+    util = float(mu @ w / float(horizon) - 0.5 * float(gamma) * w @ sigma_adj @ w)
+    if util <= 0.0:
+        return zero
+    result = {i: float(weight) for i, weight in zip(ids, w, strict=True)}
+    # ensure every active_id present in output
+    for aid in active_ids:
+        aid_s = str(aid)
+        if aid_s not in result:
+            result[aid_s] = 0.0
+    return result
 
 
 def _risk_balanced_waterfill(

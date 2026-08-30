@@ -1486,6 +1486,7 @@ def _risk_policy_for_profile(
         economic_ranking_mode="economic_net_v1",
         execution_utility_mode=profile.execution_utility_mode,
         sizing_mode=profile.sizing_mode,
+        economic_gate_mode=profile.economic_gate_mode,
         retained_sizing_mode=(
             "band_limited_rewaterfill_v1" if request.enable_sparse_retained_rewaterfill else "freeze_v1"
         ),
@@ -2975,6 +2976,10 @@ def _causal_calibrator(
         block_length=horizon_sessions,
         label_column=label_col,
         label_available_column=AVAILABLE_COLUMN,
+        preserve_negative_bound_null=not any(
+            profile.sizing_mode == "continuous_uncertainty_v1"
+            for profile in request.policy_profiles
+        ),
     )
 
 
@@ -4377,6 +4382,7 @@ def _policy_profile_params(
             "economic_ranking_mode": policy.economic_ranking_mode,
             "execution_utility_mode": profile.execution_utility_mode,
             "sizing_mode": profile.sizing_mode,
+            "economic_gate_mode": profile.economic_gate_mode,
             "retained_sizing_mode": policy.retained_sizing_mode,
             "vol_target_override": profile.vol_target_override,
             "participation_limit_override": profile.participation_limit_override,

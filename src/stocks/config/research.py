@@ -20,6 +20,7 @@ from src.stocks.compatibility import (
     parse_sizing_method,
 )
 from src.stocks.ml.contracts import (
+    CONTINUOUS_UNCERTAINTY_PROFILE_ID,
     DEFAULT_POLICY_PROFILES,
     EXCESS_FULL_KELLY_PROFILE_ID,
     GROWTH_FULL_UTILIZATION_PROFILE_ID,
@@ -174,6 +175,20 @@ def policy_profiles_with_unhedged_nem() -> tuple[PolicyProfile, ...]:
             participation_limit_override=_GROWTH_FULL_UTILIZATION_PARTICIPATION,
             turnover_budget_override=_GROWTH_FULL_UTILIZATION_TURNOVER_BUDGET,
             net_exposure_gate_mode="trend_vol_v1",
+        ),
+    )
+
+
+def policy_profiles_with_continuous_uncertainty() -> tuple[PolicyProfile, ...]:
+    return (
+        *DEFAULT_POLICY_PROFILES,
+        PolicyProfile(
+            profile_id=CONTINUOUS_UNCERTAINTY_PROFILE_ID,
+            no_trade_band_bps=0.0,
+            growth_risk_aversion=1.0,
+            execution_utility_mode="sparse_hold_replace_v2",
+            sizing_mode="continuous_uncertainty_v1",
+            economic_gate_mode="finite_mean_v1",
         ),
     )
 
