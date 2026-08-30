@@ -1927,3 +1927,30 @@ class CompoundChampion:
     experiment_id: str
     evidence: CompoundCandidateEvidence
     baseline_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ModelSelectionInputPreflight:
+    status: str
+    reason: str | None
+    feature_rows: int
+    label_rows: int
+    matched_rows: int
+    required_rows_by_fold: tuple[int, ...]
+    scheduled_decisions_by_fold: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if self.status not in ("ok", "RESEARCH_ONLY"):
+            raise ValueError(f"status must be 'ok' or 'RESEARCH_ONLY', got {self.status!r}")
+        if self.reason is not None and not isinstance(self.reason, str):
+            raise ValueError("reason must be str or None")
+        if not isinstance(self.feature_rows, int) or self.feature_rows < 0:
+            raise ValueError("feature_rows must be non-negative int")
+        if not isinstance(self.label_rows, int) or self.label_rows < 0:
+            raise ValueError("label_rows must be non-negative int")
+        if not isinstance(self.matched_rows, int) or self.matched_rows < 0:
+            raise ValueError("matched_rows must be non-negative int")
+        if not isinstance(self.required_rows_by_fold, tuple):
+            raise ValueError("required_rows_by_fold must be tuple")
+        if not isinstance(self.scheduled_decisions_by_fold, tuple):
+            raise ValueError("scheduled_decisions_by_fold must be tuple")
