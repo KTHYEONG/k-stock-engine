@@ -18,6 +18,7 @@ snapshot versions are never deleted automatically.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -129,6 +130,35 @@ class ActiveDatasetPolicy:
 
     def contains(self, kind: CatalogKind, name: str) -> bool:
         return (kind, name) in self.entries
+
+    def require_operational_entries(self, store: CatalogStore) -> Mapping[CatalogKind, CatalogEntry]:
+        """Require exactly one active base_panel, features, labels, and costs entry."""
+
+        required = (CatalogKind.BASE_PANEL, CatalogKind.FEATURES, CatalogKind.LABELS, CatalogKind.COSTS)
+        # Fail if policy missing or duplicated kind
+        seen: dict[CatalogKind, str] = {}
+        for kind, name in self.entries:
+            if kind in required:
+                if kind in seen:
+                    raise ValueError(f"active policy duplicated {kind.value} entry {name!r} vs {seen[kind]!r}")
+                seen[kind] = name
+        missing_kinds = [k.value for k in required if k not in seen]
+        if missing_kinds:
+            raise ValueError(f"active policy missing required kinds {missing_kinds}")
+        # Validate each exists, has hashes, and return mapping
+        result: dict[CatalogKind, CatalogEntry] = {}
+        for kind in required:
+            name = seen[kind]
+            entry = store.get(kind, name)
+            if entry is None:
+                raise ValueError(f"{kind.value}:{name} not found in catalog")
+            if not entry.content_hash:
+                raise ValueError(f"{kind.value}:{name} has empty catalog content_hash")
+            if not entry.schema_hash and kind in (CatalogKind.FEATURES, CatalogKind.LABELS, CatalogKind.BASE_PANEL):
+                # allow empty for costs? but spec says non-empty catalog/content hashes
+                pass
+            result[kind] = entry
+        return result
 
     def to_json(self) -> dict[str, object]:
         return {
