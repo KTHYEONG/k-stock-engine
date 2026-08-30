@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ARCHITECTURE_REFACTORING_20260830",
+      "date": "2026-08-30",
+      "adr_id": "ADR_20260830_ARCHITECTURE_REFACTORING_20260830",
+      "domain": "stocks",
+      "title": "Active stock pipeline contract consolidation",
+      "why": "Training and research CLI paths referenced removed snapshot/direct parser fields, while runtime defaults and active-data promotion contracts were split across incompatible owners.",
+      "resolution": "Unified train studies behind one ActiveResearchDataSelection, added typed CLI command contracts, aligned simulation defaults with CanonicalResearchProfile, separated materialization from active policy activation, and preserved risk/model invariants with targeted regression coverage.",
+      "impact": "Modern stock training and study commands now fail closed on conflicting inputs and reuse one validated active selection; no portfolio or promotion mathematics changed. Legacy sources remain quarantined."
+    },
+    {
       "task_id": "snapshotless_research_data_pipeline",
       "date": "2026-08-30",
       "adr_id": "ADR_20260830_snapshotless_research_data_pipeline",
@@ -989,16 +999,6 @@
       "why": "OOF evidence was empty because the fixed ElasticNet penalty produced constant predictions, LightGBM target-free early stopping failed, and replay ValueErrors were hidden.",
       "resolution": "Added fold-local scale-invariant regularization, target-free LightGBM training, causal session-cluster calibration, structural fallback routing, and typed OOF/replay diagnostics; preserved economic gates.",
       "impact": "Replay failures are observable and fail closed; causal OOF and holdout evidence remain required. Ruff, mypy, spec compliance, and 692 tests pass."
-    },
-    {
-      "task_id": "TASK_STOCK_NET_ALPHA_DATA_VALIDATION_AUDIT",
-      "date": "2026-08-14",
-      "adr_id": "ADR_20260814_STOCK_NET_ALPHA_DATA_VALIDATION_AUDIT",
-      "domain": "stocks",
-      "title": "Stock net-alpha data validation and replay integrity",
-      "why": "Full inspection of the latest NO_TRADE result found healthy source data but replay produced zero realized blocks because the canonical net_alpha_target label was disconnected from replay; additional causal OOF, holdout, direction, and cost-unit defects could also reject or misuse valid data.",
-      "resolution": "Implemented canonical target/outcome wiring, causal horizon evidence and holdout handling, deterministic descending replay with zero-order suppression, decimal dynamic cost/calibration handling, request-controlled bootstrap evidence, and fail-closed nullable cost coverage validation.",
-      "impact": "Valid stock source rows remain auditable and independent by horizon; training and replay now fail closed on malformed provenance while NO_TRADE reflects economic evidence rather than silent schema mismatch. Ruff, mypy, contract checks, and the full test suite pass."
     }
   ]
 }
