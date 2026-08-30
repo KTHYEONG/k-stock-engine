@@ -551,6 +551,38 @@ def build_parser() -> argparse.ArgumentParser:
         default=REFERENCE_DATE,
         help="inclusive research data end date for direct selection",
     )
+    parser.add_argument(
+        "--base-dataset-id",
+        default=None,
+        help="direct base-panel dataset identifier (bypasses active catalog selection)",
+    )
+    parser.add_argument(
+        "--feature-dataset-id",
+        default=None,
+        help="direct feature dataset identifier (bypasses active catalog selection)",
+    )
+    parser.add_argument(
+        "--label-dataset-id",
+        default=None,
+        help="direct label dataset identifier (bypasses active catalog selection)",
+    )
+    parser.add_argument(
+        "--research-start-direct",
+        type=date.fromisoformat,
+        default=None,
+        help="inclusive start date for direct dataset loading",
+    )
+    parser.add_argument(
+        "--research-end-direct",
+        type=date.fromisoformat,
+        default=None,
+        help="inclusive end date for direct dataset loading",
+    )
+    parser.add_argument(
+        "--cost-snapshot-id",
+        default=None,
+        help="optional hash-bound cost evidence identifier for direct loading",
+    )
     parser.add_argument("--catalog-root", type=Path, default=STOCK_CATALOG_ROOT)
     parser.add_argument("--base-root", type=Path, default=STOCK_BASE_PANEL_ROOT)
     parser.add_argument("--feature-root", type=Path, default=STOCK_FEATURE_PANEL_ROOT)
@@ -2224,6 +2256,19 @@ def main(args: list[str] | None = None) -> int:
     # closed without data allocation. (also done in dispatch for early check)
     _tmp_req = _build_training_request(parsed)
     _validate_static_training_request(_tmp_req)
+
+    direct_ids = (
+        parsed.base_dataset_id,
+        parsed.feature_dataset_id,
+        parsed.label_dataset_id,
+    )
+    if any(value is not None for value in direct_ids):
+        if not all(value is not None for value in direct_ids):
+            parser.error(
+                "direct dataset loading requires --base-dataset-id, "
+                "--feature-dataset-id, and --label-dataset-id"
+            )
+        return _run_direct_training(parsed, parser, _tmp_req)
 
     return _dispatch_train_command(command)
 
