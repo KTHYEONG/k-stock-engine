@@ -13,7 +13,7 @@ from src.stocks.ml.contracts import (
     EconomicFamilyStudySettings,
     NetAlphaTrainingRequest,
 )
-from src.stocks.ml.economic_objective import InvalidOofEconomicUtilityError, measure_tail_capture
+from src.stocks.ml.economic_objective import InvalidOofEconomicUtilityError, build_route_tail_relevance, measure_tail_capture
 from src.stocks.ml.economic_research import (
     evaluate_economic_family_study,
     evaluate_economic_window_candidate,
@@ -668,6 +668,109 @@ def test_economic_family_study_folds_fail_closed(monkeypatch) -> None:
     assert payload["rejection_reason_counts"].get(
         "insufficient-common-window-calendar"
     ) == 1
+
+
+def _tail_route_fixture():
+    from datetime import UTC, datetime, timedelta
+
+    from src.core.datasets import DatasetManifest
+    from src.core.instruments import AssetKind
+    from src.stocks.ml.contracts import ExecutionFrontierSettings, NetAlphaResearchData, NetAlphaTrainingRequest
+    from src.stocks.research.folds import Fold
+
+    n_sessions = 60
+    per_session = 8
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    rows = []  # noqa: PERF401
+    for s in range(n_sessions):
+        session = start + timedelta(days=s)
+        # first 3 instruments are gross winners, rest are others
+        for t in range(per_session):
+            rows.append(  # noqa: PERF401
+                {
+                    "instrument_id": chr(ord("A") + t) if t < 8 else f"X{t}",
+                    "session": session,
+                    "feature__a": float(t),
+                    "feature__b": float(s),
+                    "open": 10000.0,
+                    "adtv_20d": 1e9,
+                    "volatility_20d": 0.02,
+                }
+            )
+    frame = pl.DataFrame(rows).sort(["session", "instrument_id"]).with_columns(
+        pl.col("session").rank("dense").cast(pl.Int64).alias("session_index")
+    )
+    # labels: A,B gross high, C residual high but gross low
+    # We craft per-instrument gross and residual such that gross ranking A/B top, residual ranking B/C top
+    # For each session, A: gross 0.06 residual -0.02, B: gross 0.04 residual 0.03, C: gross 0.01 residual 0.02, others: gross 0.0 residual 0.0
+    label_rows = []
+    gross_map = {"A": 0.06, "B": 0.04, "C": 0.01, "D": 0.0, "E": 0.0, "F": 0.0, "G": 0.0, "H": 0.0}
+    resid_map = {"A": -0.02, "B": 0.03, "C": 0.02, "D": 0.0, "E": 0.0, "F": 0.0, "G": 0.0, "H": 0.0}
+    for row in frame.iter_rows(named=True):
+        iid = row["instrument_id"]
+        label_rows.append(
+            {
+                "instrument_id": iid,
+                "session": row["session"],
+                "net_alpha_target": gross_map.get(iid, 0.0) - 0.0,
+                "label_available_time": row["session"] + timedelta(days=10),
+                "gross_return": gross_map.get(iid, 0.0),
+                "risk_residual": resid_map.get(iid, 0.0),
+                "reference_cost": 0.0,
+            }
+        )
+    manifest = DatasetManifest(
+        asset_kind=AssetKind.STOCK,
+        schema_version="v1",
+        schema_hash="h",
+        provider_version="p",
+        universe_policy_version="u",
+        universe_policy_hash="u",
+        feature_set="stock_net_alpha_v1",
+        feature_set_hash="f",
+        label_definition="net_alpha_o2o",
+        label_horizon_sessions=10,
+        time_start=start,
+        time_end=start + timedelta(days=n_sessions),
+        generated_time=start,
+        row_count=frame.height,
+    )
+    data = NetAlphaResearchData(feature_frame=frame, labels_by_horizon={10: pl.DataFrame(label_rows)}, manifest=manifest)
+    request = NetAlphaTrainingRequest(
+        artifact_id="tail_route",
+        candidate_horizon_sessions=(10,),
+        execution_frontier=ExecutionFrontierSettings(candidate_horizon_sessions=(10,), candidate_rebalance_frequency_sessions=(5,), candidate_top_k=(2,)),
+        route_objective=SimpleNamespace(kind="unhedged_absolute"),
+    )
+
+    folds = []
+    for i in range(4):
+        val_start = 30 + i * 5
+        train_mask = [int(idx) for idx in range(frame.height) if frame["session_index"][idx] < val_start - 2]
+        val_mask = [int(idx) for idx in range(frame.height) if val_start <= frame["session_index"][idx] < val_start + 5]
+        folds.append(Fold(train_mask=train_mask, validation_mask=val_mask, train_label_end=val_start - 2, validation_decision_start=val_start, segment_id=i))
+    pre_holdout = frame
+    learner_columns = ("feature__a", "feature__b")
+    return pre_holdout, folds, data, request, learner_columns
+
+
+def test_fit_tail_lambdarank_oof_unhedged_uses_route_relevance(monkeypatch) -> None:
+    # Given
+    pre_holdout, folds, data, request, learner_columns = _tail_route_fixture()
+    captured: dict[str, object] = {}
+    original = economic_research._lambda_rank_matrices
+    def spy(frame, columns, top_k, *, route):
+        captured["selected"] = set(build_route_tail_relevance(frame, route=route, top_k=top_k).filter(pl.col("relevance") == 1)["instrument_id"].to_list())
+        return original(frame, columns, top_k, route=route)
+    monkeypatch.setattr(economic_research, "_lambda_rank_matrices", spy)
+    # When
+    _oof, labeled = economic_research.fit_tail_lambdarank_oof(
+        pre_holdout, folds, data, request, learner_columns, 10, 2
+    )
+    # Then
+    assert captured["selected"] == {"A", "B"}
+    assert "gross_return" in labeled.columns
+    assert labeled["gross_return"].null_count() == 0
 
 
 def test_settings_reject_invalid_configuration() -> None:
