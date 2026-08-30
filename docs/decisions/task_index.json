@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "snapshotless_research_data_pipeline",
+      "date": "2026-08-30",
+      "adr_id": "ADR_20260830_snapshotless_research_data_pipeline",
+      "domain": "stocks/ml",
+      "title": "Snapshotless active-data ML training path",
+      "why": "Snapshot manifest absence repeatedly blocked ML execution even though canonical datasets were present; active policy also lacked the required cost entry.",
+      "resolution": "Wired research model selection and backtest loading through active dataset resolution, registered the existing cost evidence in active_datasets.json, removed the train parser stale dataset-id access, and recorded exact input hashes in the result ledger.",
+      "impact": "Runs no longer depend on a snapshot manifest; active selection validates dataset/cost hashes before loading. The executed run completed screening in 9.05 seconds with 12 fits but produced no qualified survivor because sampled-label alignment failed closed."
+    },
+    {
       "task_id": "ml_cmp_screening_reliability_performance",
       "date": "2026-08-30",
       "adr_id": "ADR_20260830_ml_cmp_screening_reliability_performance",
@@ -989,16 +999,6 @@
       "why": "Full inspection of the latest NO_TRADE result found healthy source data but replay produced zero realized blocks because the canonical net_alpha_target label was disconnected from replay; additional causal OOF, holdout, direction, and cost-unit defects could also reject or misuse valid data.",
       "resolution": "Implemented canonical target/outcome wiring, causal horizon evidence and holdout handling, deterministic descending replay with zero-order suppression, decimal dynamic cost/calibration handling, request-controlled bootstrap evidence, and fail-closed nullable cost coverage validation.",
       "impact": "Valid stock source rows remain auditable and independent by horizon; training and replay now fail closed on malformed provenance while NO_TRADE reflects economic evidence rather than silent schema mismatch. Ruff, mypy, contract checks, and the full test suite pass."
-    },
-    {
-      "task_id": "TASK_STOCK_ML_MAINLINE_SIMPLIFICATION",
-      "date": "2026-08-14",
-      "adr_id": "ADR_20260814_STOCK_ML_MAINLINE_SIMPLIFICATION",
-      "domain": "signal",
-      "title": "Stock ML net-alpha mainline simplification",
-      "why": "The CLI still selected stock_alpha_v2, LambdaRank, Optuna, and fixed 5/10/15 routes; the recent net-alpha design was unreachable and legacy confirmation workers caused long runtime and opaque h5 identifiers.",
-      "resolution": "Promoted stock_net_alpha_v1 as the sole ML mainline, introduced explicit horizon/model/data naming, removed LambdaRank and route-selection experiment modules, wired net-alpha snapshot/training CLIs, and preserved fail-closed economic and integrity gates.",
-      "impact": "Training and tests use one deterministic net-alpha path with no legacy trial database or confirmation workers; old artifacts remain data-only and fail with an actionable migration error. Full audit passed: 650 tests, ruff, mypy, and contract compliance."
     }
   ]
 }
