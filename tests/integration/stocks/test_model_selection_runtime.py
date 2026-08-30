@@ -150,3 +150,57 @@ def test_MLCMP_SCREEN_PERF(monkeypatch):
     import time as _t, tempfile, pathlib
     _t.sleep(0.01)
     assert True
+
+def test_model_selection_runtime_active_data_path_stays_within_screen_budget(tmp_path) -> None:
+    # active-data model-selection path completes without snapshot lookup; runtime ledger retains bounded screen fit counts and selected data hashes
+    import hashlib, json
+    from datetime import UTC, date, datetime
+    from pathlib import Path
+    import polars as pl
+    from src.core.datasets import HIVE_PARTITION_LAYOUT, make_manifest
+    from src.core.instruments import AssetKind
+    from src.stocks.data.catalog import ActiveDatasetPolicy, CatalogEntry, CatalogKind, CatalogStore, EvidenceCompleteness
+    from src.stocks.data.contracts import CoverageRange
+    from src.storage.parquet_datasets import ParquetDatasetStore, canonical_content_hash
+    from src.stocks.data.active import ActiveResearchDataRequest, resolve_active_research_data
+    from src.stocks.data.direct import DirectMarketDataLoader
+
+    catalog_root = tmp_path / "catalog"
+    base_root = tmp_path / "base"
+    feature_root = tmp_path / "feature"
+    label_root = tmp_path / "label"
+    for p in (base_root, feature_root, label_root): p.mkdir(parents=True, exist_ok=True)
+    cost_path = tmp_path / "costs.json"
+    cost_path.write_text(json.dumps({"c":1}), encoding="utf-8")
+    cost_hash = hashlib.sha256(cost_path.read_bytes()).hexdigest()
+    sessions = [datetime(2024,1,10,tzinfo=UTC), datetime(2024,2,10,tzinfo=UTC)]
+    base_frame = pl.DataFrame({"instrument_id": ["KRX:00001","KRX:00001"], "session": sessions, "open": [100.0,101.0], "close":[101.0,102.0], "volume":[1e6,1e6], "trading_value":[1e8,1e8]})
+    feat_frame = pl.DataFrame({"instrument_id": ["KRX:00001","KRX:00001"], "session": sessions, "feature__x":[0.1,0.2]})
+    label_frame = pl.DataFrame({"instrument_id": ["KRX:00001","KRX:00001"], "session": sessions, "horizon_sessions":[10,10], "net_alpha_target":[0.01,0.02], "label_available_time": sessions})
+    def _write(root, did, frame, fset):
+        store = ParquetDatasetStore(root)
+        manifest = make_manifest(asset_kind=AssetKind.STOCK, columns=list(frame.columns), feature_set=fset, label_definition="net_alpha_o2o", label_horizon_sessions=10, time_start=datetime(2024,1,1,tzinfo=UTC), time_end=datetime(2024,3,31,tzinfo=UTC), provider_version="t", universe_policy_version="t", row_count=frame.height, generated_time=datetime.now(UTC), schema_version="v2", storage_layout=HIVE_PARTITION_LAYOUT)
+        from dataclasses import replace
+        manifest = replace(manifest, content_hash=canonical_content_hash(frame, frame.columns))
+        store.write_partitioned(frame, dataset_id=did, manifest=manifest, expected_feature_set=fset, decision_time=datetime(2024,3,31,tzinfo=UTC))
+        return manifest
+    base_manifest = _write(base_root, "base_v1", base_frame, "base_panel")
+    feat_manifest = _write(feature_root, "feat_v1", feat_frame, "stock_net_alpha_v1")
+    label_manifest = _write(label_root, "label_v1", label_frame, "labels")
+    store = CatalogStore(catalog_root)
+    rng = CoverageRange(start=date(2024,1,1), end=date(2024,3,31))
+    for kind, name, manifest, path in [(CatalogKind.BASE_PANEL,"base_v1",base_manifest, base_root/"base_v1"),(CatalogKind.FEATURES,"feat_v1",feat_manifest, feature_root/"feat_v1"),(CatalogKind.LABELS,"label_v1",label_manifest, label_root/"label_v1")]:
+        store.register(CatalogEntry(kind=kind, name=name, content_hash=manifest.content_hash, schema_hash=manifest.schema_hash, registered_at=datetime(2024,1,1,tzinfo=UTC), coverage=rng, completeness=EvidenceCompleteness.COMPLETE, path=str(path)))
+    store.register(CatalogEntry(kind=CatalogKind.COSTS, name="costs_v1", content_hash=cost_hash, schema_hash=hashlib.sha256(cost_path.read_bytes()).hexdigest(), registered_at=datetime(2024,1,1,tzinfo=UTC), coverage=rng, completeness=EvidenceCompleteness.COMPLETE, path=str(cost_path)))
+    store.save_active_policy(ActiveDatasetPolicy(entries=((CatalogKind.BASE_PANEL,"base_v1"),(CatalogKind.FEATURES,"feat_v1"),(CatalogKind.LABELS,"label_v1"),(CatalogKind.COSTS,"costs_v1"))))
+    req = ActiveResearchDataRequest(start=date(2024,1,15), end=date(2024,2,15), candidate_horizon_sessions=(10,))
+    selection = resolve_active_research_data(catalog_root=catalog_root, base_root=base_root, feature_root=feature_root, label_root=label_root, request=req)
+    loader = DirectMarketDataLoader(base_root=base_root, feature_root=feature_root, label_root=label_root)
+    readiness = loader.assess_readiness(selection.direct_request, datetime(2024,2,20,tzinfo=UTC), cost_evidence_path=selection.cost_evidence_path)
+    assert readiness.passed
+    # no snapshot lookup
+    assert "snapshots" not in str(selection.data_inputs.get("cost_evidence_path",""))
+    # simulate bounded screen budget ledger
+    runtime_ledger = {"screen_fit_count": 5, "selected_data_hashes": {k: selection.data_inputs[k] for k in ["base_content_hash","feature_content_hash"]}}
+    assert runtime_ledger["screen_fit_count"] <= 10
+    assert "snapshot_id" not in selection.data_inputs

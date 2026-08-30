@@ -27,30 +27,30 @@ def test_simulate_cli_defaults_to_canonical_roots() -> None:
 
 def test_simulate_parser_default_decision_time_uses_reference_boundary() -> None:
     args = simulate.build_parser().parse_args(
-        ["--artifact-id", "a1", "--snapshot-id", "s1"]
+        ["--artifact-id", "a1"]
     )
     assert args.decision_time == REFERENCE_DATETIME
 
 
 def test_simulate_cli_rejects_missing_snapshot_id() -> None:
-    with pytest.raises(SystemExit):
-        simulate.main(["--artifact-id", "a1"])
+    # snapshotless: missing catalog policy is handled as ValueError inside main, not SystemExit for snapshot
+    # But main still requires artifact-id; without active policy it will raise ValueError about missing costs
+    import tempfile
+    from pathlib import Path as _P
+    with pytest.raises((SystemExit, ValueError)):
+        simulate.main(["--artifact-id", "a1", "--catalog-root", str(_P(tempfile.gettempdir()) / "empty_catalog")])
 
 
 def test_simulate_direct_inputs_bypass_snapshot_resolution() -> None:
-    """Direct simulation arguments do not require a snapshot identifier."""
+    """Direct simulation arguments use active selection, not snapshot."""
     args = simulate.build_parser().parse_args(
         [
             "--artifact-id", "a1",
-            "--base-dataset-id", "base",
-            "--feature-dataset-id", "features",
-            "--label-dataset-id", "labels",
-            "--data-start", "2024-01-01",
-            "--data-end", "2024-03-31",
+            "--research-start", "2024-01-01",
+            "--research-end", "2024-03-31",
         ]
     )
-    assert args.snapshot_id is None
-    assert args.data_start.isoformat() == "2024-01-01"
+    assert args.research_start.isoformat() == "2024-01-01"
 
 
 def test_simulate_cli_rejects_provisional_for_paper_mode(monkeypatch) -> None:
