@@ -2786,3 +2786,86 @@ def test_pooled_decision_bootstrap_preserves_fold_boundaries():
     expected_pooled = orig((arr1, arr2), 5, 100, 42)
     expected_lb = float(np.quantile(expected_pooled, 0.05))
     assert abs(ev.absolute_lower_bound - expected_lb) < 1e-12
+
+
+def test_resolve_screen_calendar_capacity_uses_rebalance_calendar():
+    import polars as pl
+    from datetime import datetime, UTC, timedelta
+    from src.stocks.ml.model_selection import resolve_screen_calendar_capacity, deterministic_screen_sample_rows
+
+    sessions = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(126)]
+    rows = []
+    for s in sessions:
+        for t in range(60):
+            rows.append({"instrument_id": f"KRX:{t:05d}", "session": s, "adtv_20d": float(1000 - t), "feature__a": 1.0})
+    frame = pl.DataFrame(rows)
+    cap = resolve_screen_calendar_capacity(frame, decision_cadence_sessions=10, names_per_session=48)
+    assert cap.scheduled_decision_count == 13
+    assert cap.required_rows == 624
+    assert cap.names_per_session == 48
+    import pytest
+
+    with pytest.raises(ValueError, match="required_rows=624") as excinfo:
+        deterministic_screen_sample_rows(frame, max_rows=623, decision_cadence_sessions=10, names_per_session=48)
+    assert "max_rows=623" in str(excinfo.value)
+    import numpy as np
+
+    result = deterministic_screen_sample_rows(frame, max_rows=624, decision_cadence_sessions=10, names_per_session=48)
+    assert isinstance(result, np.ndarray)
+    assert result.size == 624
+
+
+def test_study_returns_structured_sample_capacity_failure_before_fit(monkeypatch):
+    import tempfile, pathlib, polars as pl, numpy as np
+    from datetime import datetime, UTC, timedelta
+    from src.stocks.ml.contracts import ExecutionFrontierSettings, ModelSelectionComputeBudget, ModelSelectionStudySettings, NetAlphaTrainingRequest
+    from src.stocks.ml.model_selection import evaluate_model_selection_study
+    from src.stocks.research.artifacts import ModelArtifactRegistry
+    from src.core.costs import default_base_schedule, default_stress_schedule
+    from tests.fixtures.stocks.helpers import stock_liquidity_model
+    from src.stocks.ml.features import stock_net_alpha_v1_roles
+    from src.core.datasets import DatasetManifest
+    from src.core.instruments import AssetKind
+    from src.stocks.ml.contracts import NetAlphaResearchData
+
+    _roles = stock_net_alpha_v1_roles()
+    rng = np.random.default_rng(99)
+    sessions = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(800)]
+    rows = []
+    for s in sessions:
+        # Deliberately below K*multiplier: capacity failure must still be structured.
+        for t in range(3):
+            row = {"instrument_id": f"KRX:{t:05d}", "session": s, "session_index": sessions.index(s), "sector": "tech", "available_time": s, "open": 100.0, "adtv_20d": 1e6, "volatility_20d": 0.02}
+            for src in _roles:
+                row[src] = float(rng.normal())
+                row[f"feature__{src}"] = row[src]
+            rows.append(row)
+    frame = pl.DataFrame(rows)
+    labels = [{"instrument_id": r["instrument_id"], "session": r["session"], "net_alpha_target": float(rng.normal(scale=0.01)), "risk_residual": 0.01, "reference_cost": 0.001, "label_available_time": r["session"] + timedelta(days=5), "realized_net_return": float(rng.normal(scale=0.01))} for r in rows]
+    manifest = DatasetManifest(asset_kind=AssetKind.STOCK, schema_version="v1", schema_hash="h", provider_version="p", universe_policy_version="u", universe_policy_hash="u", feature_set="stock_net_alpha_v1", feature_set_hash="f", label_definition="net_alpha_o2o", label_horizon_sessions=10, time_start=sessions[0], time_end=sessions[-1], generated_time=sessions[-1], row_count=len(rows), reference_notional=100_000_000.0)
+    data = NetAlphaResearchData(feature_frame=frame, labels_by_horizon={10: pl.DataFrame(labels)}, manifest=manifest)
+    frontier = ExecutionFrontierSettings(candidate_horizon_sessions=(10,), candidate_rebalance_frequency_sessions=(10,), candidate_top_k=(12,))
+    request = NetAlphaTrainingRequest(artifact_id="capfail", candidate_horizon_sessions=(10,), execution_frontier=frontier, base_cost_schedule=default_base_schedule(), stress_cost_schedule=default_stress_schedule(), liquidity_model=stock_liquidity_model(), stress_liquidity_model=stock_liquidity_model(stress_multiplier=2.0))
+    settings = ModelSelectionStudySettings(candidate_lookback_sessions=(504,), common_min_train_sessions=504, min_validation_segment_sessions=5, compute_budget=ModelSelectionComputeBudget(wall_clock_seconds=30.0, screen_phase_seconds=20.0, screen_train_rows_per_fold=3000, screen_validation_rows_per_fold=100, max_full_replay_families=1))
+    called = {"fit": 0}
+
+    def fake_cache(*a, **kw):
+        called["fit"] += 1
+        raise AssertionError("prepare_screening_fold_cache must not be called on capacity failure")
+
+    monkeypatch.setattr("src.stocks.ml.model_selection.prepare_screening_fold_cache", fake_cache)
+    with tempfile.TemporaryDirectory() as tmp:
+        registry = ModelArtifactRegistry(pathlib.Path(tmp))
+        result = evaluate_model_selection_study(data, request, settings, registry=registry)
+        assert result["status"] == "RESEARCH_ONLY"
+        assert result["study_complete"] is False
+        assert result["next_action"] == "insufficient-screen-sample-capacity"
+        assert result["rejection_reason_counts"].get("insufficient-screen-sample-capacity") == 1
+        ledger = result["runtime_ledger"]
+        assert ledger["model_fit_count"] == 0
+        assert ledger["oof_fit_count"] == 0
+        assert ledger["replay_count"] == 0
+        assert ledger["configured_rows"] == 100
+        assert ledger["required_rows"] > 100
+        assert "per_fold_scheduled_decision_counts" in ledger or "per_fold_decision_counts" in ledger
+        assert called["fit"] == 0
