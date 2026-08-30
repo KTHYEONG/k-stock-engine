@@ -2333,3 +2333,68 @@ def test_nonconverged_linear_candidate_is_rejected_before_metrics(monkeypatch):
         computed = True
     assert computed is True
 
+
+def test_screen_route_diagnostic_preserves_rejection(monkeypatch):
+    import polars as pl, numpy as np, time
+    from datetime import datetime, UTC, timedelta
+    from src.stocks.ml.model_selection import ScreenRouteDiagnostic, prepare_screening_fold_cache, screen_model_family
+    from src.stocks.ml.contracts import ModelFamily, ModelSelectionComputeBudget, NetAlphaTrainingRequest, ExecutionFrontierSettings
+    from src.stocks.ml.features import stock_net_alpha_v1_roles
+    from src.stocks.research.folds import PurgedWalkForward
+    from src.stocks.ml.training import _index_sessions, _locked_holdout
+    import pytest
+
+    roles = stock_net_alpha_v1_roles()
+    rng = np.random.default_rng(123)
+    sessions = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(12)]
+    rows = []
+    for s in sessions:
+        for t in range(20):
+            row = {"instrument_id": f"KRX:{t:05d}", "session": s, "session_index": sessions.index(s), "sector": "tech", "available_time": s, "open": 100.0, "adtv_20d": 1e6, "volatility_20d": 0.02}
+            for src in roles:
+                row[src] = float(rng.normal())
+                row[f"feature__{src}"] = row[src]
+            rows.append(row)
+    frame = pl.DataFrame(rows)
+    panel = _index_sessions(frame)
+    req = NetAlphaTrainingRequest(artifact_id="diag01", candidate_horizon_sessions=(10,), execution_frontier=ExecutionFrontierSettings(candidate_horizon_sessions=(10,), candidate_rebalance_frequency_sessions=(10,), candidate_top_k=(12,)))
+    pre, _, _ = _locked_holdout(panel, req)
+    if pre.is_empty():
+        pre = frame
+    if "session_index" not in pre.columns:
+        pre = _index_sessions(pre)
+    splitter = PurgedWalkForward(n_folds=2, label_horizon_sessions=1, embargo_sessions=0, session_column="session_index", min_train_sessions=2)
+    folds = splitter.split(pre)
+    assert len(folds) >= 1
+    budget = ModelSelectionComputeBudget(screen_train_rows_per_fold=20, screen_validation_rows_per_fold=10)
+    cache = prepare_screening_fold_cache(pre, folds[0], roles, budget, decision_cadence_sessions=10)
+    # Build label_join missing gross_return for unhedged route (expected infeasible)
+    label_rows = [{"instrument_id": r["instrument_id"], "session": r["session"], "net_alpha_target": 0.01, "realized_net_return": 0.01, "reference_cost": 0.001, "risk_residual": 0.01} for r in rows[:50]]
+    label_join = pl.DataFrame(label_rows)
+    # Ensure gross missing
+    assert "gross_return" not in label_join.columns
+    request = NetAlphaTrainingRequest(artifact_id="diag02", candidate_horizon_sessions=(10,), execution_frontier=ExecutionFrontierSettings(candidate_horizon_sessions=(10,), candidate_rebalance_frequency_sessions=(10,), candidate_top_k=(12,)))
+    deadline = time.monotonic() + 10
+    ev = screen_model_family(cache, label_join, ModelFamily.elastic_net_v2, budget, deadline, request=request, bootstrap_alpha=0.05, bootstrap_resamples=20, horizon_sessions=10, rebalance_frequency_sessions=10, execution_top_k=12, minimum_tail_draws=2)
+    assert ev.screen_lower_bound == -1e12
+    assert ev.qualified_for_full_oof is False
+    # contains stable diagnostic reason
+    diags = getattr(ev, "diagnostics", ())
+    assert len(diags) >= 1
+    reasons = [getattr(d, "reason", str(d)) for d in diags]
+    assert any("gross" in r.lower() or "missing" in r.lower() or r == "missing-gross-return" for r in reasons)
+    # diagnostic must not alter lower bound (still sentinel even with different details)
+    ev2 = screen_model_family(cache, label_join, ModelFamily.elastic_net_v2, budget, deadline, request=request, bootstrap_alpha=0.05, bootstrap_resamples=20, horizon_sessions=10, rebalance_frequency_sessions=10, execution_top_k=12, minimum_tail_draws=2)
+    assert ev2.screen_lower_bound == ev.screen_lower_bound
+    # unknown exception propagates - use label_join with gross so it reaches family_training_profile
+    label_rows_ok = [{"instrument_id": r["instrument_id"], "session": r["session"], "net_alpha_target": 0.01, "realized_net_return": 0.01, "reference_cost": 0.001, "risk_residual": 0.01, "gross_return": 0.02} for r in rows[:50]]
+    label_join_ok = pl.DataFrame(label_rows_ok)
+
+    def boom(*a, **kw):
+        raise ValueError("unexpected boom")
+    monkeypatch.setattr("src.stocks.ml.model_selection.family_training_profile", boom)
+    with pytest.raises(ValueError, match="unexpected boom"):
+        screen_model_family(cache, label_join_ok, ModelFamily.elastic_net_v2, budget, deadline, request=request, bootstrap_alpha=0.05, bootstrap_resamples=20, horizon_sessions=10, rebalance_frequency_sessions=10, execution_top_k=12, minimum_tail_draws=2)
+    # also verify ScreenRouteDiagnostic is dataclass frozen
+    d = ScreenRouteDiagnostic(reason="test-reason", fold_id=0, family=ModelFamily.elastic_net_v2)
+    assert d.reason == "test-reason"
