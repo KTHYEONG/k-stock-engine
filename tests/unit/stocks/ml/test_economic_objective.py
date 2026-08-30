@@ -5,8 +5,11 @@ import numpy as np
 import polars as pl
 import pytest
 
+from types import SimpleNamespace
+
 from src.stocks.ml.economic_objective import (
     InvalidOofEconomicUtilityError,
+    build_route_tail_relevance,
     build_tail_relevance,
     measure_tail_capture,
 )
@@ -315,3 +318,14 @@ def test_ALPHA_ARCH_01_ORDER_INVARIANCE() -> None:
     assert ev_sm.oracle_excess_utility == ev_im.oracle_excess_utility == ev_sh.oracle_excess_utility
     assert ev_sm.tail_excess_lower_bound == ev_im.tail_excess_lower_bound == ev_sh.tail_excess_lower_bound
     assert ev_sm.oracle_excess_utility > 0.0
+
+
+def test_build_route_tail_relevance_unhedged_matches_route_target() -> None:
+    # Given
+    labels = pl.DataFrame({"instrument_id": ["A", "B", "C"], "session": [1, 1, 1], "gross_return": [0.06, 0.04, 0.01], "risk_residual": [-0.02, 0.03, 0.02], "reference_cost": [0.0, 0.0, 0.0]})
+    route = SimpleNamespace(kind="unhedged_absolute")
+    # When
+    result = build_route_tail_relevance(labels, route=route, top_k=2)
+    # Then
+    assert set(result.filter(pl.col("relevance") == 1)["instrument_id"].to_list()) == {"A", "B"}
+    assert result.filter(pl.col("relevance") == 1).height == 2
