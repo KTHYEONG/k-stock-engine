@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_DECISION_OBSERVATION_CAPITAL_GROWTH_20260830",
+      "date": "2026-08-30",
+      "adr_id": "ADR_20260830_ML_DECISION_OBSERVATION_CAPITAL_GROWTH_20260830",
+      "domain": "stocks_ml",
+      "title": "Pooled decision-observation capacity and capital-growth admission",
+      "why": "The latest direct ML screening completed within budget but all six families were rejected as insufficient-decision-observations before OOF/replay because C10 validation decisions were gated per fold.",
+      "resolution": "Moved decision-capacity validation to pooled executable OOS observations while preserving fold boundaries and minimum_tail_draws, added bounded capacity diagnostics, required positive absolute/tail/oracle screen lower bounds, and preserved account-coherent promotion gates.",
+      "impact": "Subminimum individual folds can contribute to pooled screening evidence without lowering the statistical minimum; negative absolute routes cannot enter OOF/replay; all promotion and holdout gates remain fail-closed."
+    },
+    {
       "task_id": "TASK_ML_SCREENING_EVIDENCE_FINALCHECK_20260830",
       "date": "2026-08-30",
       "adr_id": "ADR_20260830_ML_SCREENING_EVIDENCE_FINALCHECK_20260830",
@@ -989,16 +999,6 @@
       "why": "Legacy ML/backtest execution was too slow and produced economically unreliable results.",
       "resolution": "Applied shared deterministic ranking, vectorized economic screening, bounded confirmation/finalist selection, delta-based participation sizing, and synchronized latest execution results.",
       "impact": "Improves search runtime and memory control while failing closed when bootstrap/DSR evidence does not support deployment."
-    },
-    {
-      "task_id": "TASK_STOCK_ML_RUN_COMPLETION",
-      "date": "2026-08-14",
-      "adr_id": "ADR_20260814_STOCK_ML_RUN_COMPLETION",
-      "domain": "stocks",
-      "title": "Durable ML run completion under memory peaks",
-      "why": "Repeated 81-trial stock ML runs completed the h5 screen but ended before h10 confirmation and final metrics were published, with no durable evidence of the termination cause.",
-      "resolution": "Added explicit LightGBM resource cleanup, isolated confirmation-candidate execution, per-cell confirmation checkpoints and resume state, and phase RSS telemetry while preserving economic selection gates and deterministic ranking contracts.",
-      "impact": "Confirmation progress survives worker termination and native-memory peaks; final artifacts can be resumed and audited without changing CAGR/MDD or promotion semantics."
     }
   ]
 }
