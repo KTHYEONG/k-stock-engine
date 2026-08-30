@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import cast
+from typing import Final, cast
 
 import numpy as np
 import polars as pl
@@ -40,6 +40,7 @@ NET_ALPHA_COLUMN = "expected_net_alpha"
 LOWER_BOUND_COLUMN = "alpha_lower_bound"
 NET_LOWER_BOUND_COLUMN = "net_alpha_lower_bound"
 EXIT_COST_COLUMN = "exit_cost_rate"
+ALPHA_STANDARD_ERROR_COLUMN: Final[str] = "alpha_standard_error"
 
 _MIN_BUCKET_OBSERVATIONS = 5
 _SHRINKAGE_THRESHOLD = 20.0
@@ -58,6 +59,7 @@ class BucketEvidence:
     sample_size: int
     expected_active_alpha: float | None
     alpha_lower_bound: float | None
+    alpha_standard_error: float | None = None
 
     def to_json_safe(self) -> dict[str, object]:
         return {
@@ -72,6 +74,11 @@ class BucketEvidence:
                 None
                 if self.alpha_lower_bound is None
                 else round(float(self.alpha_lower_bound), 10)
+            ),
+            "alpha_standard_error": (
+                None
+                if self.alpha_standard_error is None
+                else round(float(self.alpha_standard_error), 10)
             ),
         }
 
@@ -95,6 +102,7 @@ class CausalAlphaCalibrator:
         participation_limit: float = _DEFAULT_PARTICIPATION_LIMIT,
         label_column: str = LABEL_COLUMN,
         label_available_column: str = LABEL_AVAILABLE_COLUMN,
+        preserve_negative_bound_null: bool = True,
     ) -> None:
         if bucket_count < 2:
             raise ValueError("bucket_count must be at least 2")
@@ -121,6 +129,7 @@ class CausalAlphaCalibrator:
         self.participation_limit = participation_limit
         self.label_column = label_column
         self.label_available_column = label_available_column
+        self.preserve_negative_bound_null = bool(preserve_negative_bound_null)
         self._last_evidence: tuple[BucketEvidence, ...] = ()
         self._last_history_sessions = 0
         self._last_round_trip_cost = 0.0
@@ -207,6 +216,7 @@ class CausalAlphaCalibrator:
             n_bootstrap=self.n_bootstrap,
             bootstrap_alpha=self.bootstrap_alpha,
             block_length=self.block_length,
+            preserve_negative_bound_null=self.preserve_negative_bound_null,
         )
         self._last_evidence = tuple(
             sorted(
@@ -223,6 +233,11 @@ class CausalAlphaCalibrator:
                             None
                             if row[LOWER_BOUND_COLUMN] is None
                             else float(row[LOWER_BOUND_COLUMN])
+                        ),
+                        alpha_standard_error=(
+                            None
+                            if row.get(ALPHA_STANDARD_ERROR_COLUMN) is None
+                            else float(row[ALPHA_STANDARD_ERROR_COLUMN])
                         ),
                     )
                     for row in stats.to_dicts()
@@ -298,6 +313,7 @@ class CausalAlphaCalibrator:
             bootstrap_alpha=self.bootstrap_alpha,
             block_length=self.block_length,
             max_bootstrap_workspace_bytes=max_bootstrap_workspace_bytes,
+            preserve_negative_bound_null=self.preserve_negative_bound_null,
         )
         self._last_evidence = tuple(
             sorted(
@@ -314,6 +330,11 @@ class CausalAlphaCalibrator:
                             None
                             if row[LOWER_BOUND_COLUMN] is None
                             else float(row[LOWER_BOUND_COLUMN])
+                        ),
+                        alpha_standard_error=(
+                            None
+                            if row.get(ALPHA_STANDARD_ERROR_COLUMN) is None
+                            else float(row[ALPHA_STANDARD_ERROR_COLUMN])
                         ),
                     )
                     for row in stats.to_dicts()
@@ -332,6 +353,7 @@ class CausalAlphaCalibrator:
                     "sample_size": int(evidence.sample_size),
                     "expected_active_alpha": evidence.expected_active_alpha,
                     "alpha_lower_bound": evidence.alpha_lower_bound,
+                    "alpha_standard_error": evidence.alpha_standard_error,
                 }
                 for evidence in self._last_evidence
             ],
@@ -368,6 +390,9 @@ class CausalAlphaCalibrator:
                     LOWER_BOUND_COLUMN: [
                         b.get("alpha_lower_bound") for b in buckets
                     ],
+                    ALPHA_STANDARD_ERROR_COLUMN: [
+                        b.get("alpha_standard_error") for b in buckets
+                    ],
                 }
             )
         return _augment(
@@ -392,6 +417,7 @@ class CausalAlphaCalibrator:
             "participation_limit": float(self.participation_limit),
             "label_column": str(self.label_column),
             "label_available_column": str(self.label_available_column),
+            "preserve_negative_bound_null": bool(self.preserve_negative_bound_null),
             "history_sessions": int(self._last_history_sessions),
             "round_trip_cost": round(float(self._last_round_trip_cost), 12),
             "exit_cost_rate": round(float(self._last_exit_cost), 12),
@@ -413,6 +439,7 @@ class CausalAlphaCalibrator:
             label_available_column=cast(
                 str, state.get("label_available_column", LABEL_AVAILABLE_COLUMN)
             ),
+            preserve_negative_bound_null=bool(state.get("preserve_negative_bound_null", True)),
         )
         calibrator._last_history_sessions = cast(int, state["history_sessions"])
         calibrator._last_round_trip_cost = cast(float, state["round_trip_cost"])
@@ -431,6 +458,11 @@ class CausalAlphaCalibrator:
                     if row["alpha_lower_bound"] is None
                     else cast(float, row["alpha_lower_bound"])
                 ),
+                alpha_standard_error=(
+                    None
+                    if row.get("alpha_standard_error") is None
+                    else cast(float, row["alpha_standard_error"])
+                ),
             )
             for row in cast(list[dict[str, object]], state["buckets"])
         )
@@ -448,6 +480,9 @@ class CausalAlphaCalibrator:
                 ],
                 LOWER_BOUND_COLUMN: [
                     e.alpha_lower_bound for e in self._last_evidence
+                ],
+                ALPHA_STANDARD_ERROR_COLUMN: [
+                    e.alpha_standard_error for e in self._last_evidence
                 ],
             }
         )
@@ -535,6 +570,47 @@ def _shrink_lower_bound(lower: float, location: float, sample_size: int) -> floa
     return location + (lower - location) * weight
 
 
+def _block_bootstrap_statistics(
+    residuals: np.ndarray,
+    block_length: int,
+    n_bootstrap: int,
+    seed: int,
+    bootstrap_alpha: float,
+    *,
+    max_bootstrap_workspace_bytes: int | None,
+) -> tuple[float, float]:
+    arr = np.asarray(residuals, dtype=float)
+    if arr.size == 0:
+        return 0.0, 0.0
+    # use helper to get means via exact block bootstrap
+    # reuse _block_bootstrap_lower_bound helpers but also compute SE
+    n = arr.size
+    block = max(int(block_length), 1)
+    n_blocks = int(np.ceil(n / block))
+    max_start = max(1, n - block + 1)
+    rng = np.random.default_rng(int(seed))
+    offsets = np.arange(block)
+    if max_bootstrap_workspace_bytes is None:
+        starts = rng.integers(0, max_start, size=(int(n_bootstrap), n_blocks))
+        index = (starts[:, :, None] + offsets[None, None, :]).reshape(int(n_bootstrap), n_blocks * block)[:, :n]
+        means = arr[index].mean(axis=1)
+    else:
+        batch_draws = max_bootstrap_workspace_bytes // (n * 24) if n > 0 else int(n_bootstrap)
+        batch_draws = max(1, min(int(batch_draws), int(n_bootstrap)))
+        means = np.empty(int(n_bootstrap), dtype=float)
+        for offset in range(0, int(n_bootstrap), batch_draws):
+            stop = min(offset + batch_draws, int(n_bootstrap))
+            count = stop - offset
+            starts = rng.integers(0, max_start, size=(count, n_blocks))
+            index = (starts[:, :, None] + offsets[None, None, :]).reshape(count, n_blocks * block)[:, :n]
+            means[offset:stop] = arr[index].mean(axis=1)
+    lower = float(np.quantile(means, float(bootstrap_alpha)))
+    se = float(np.std(means, ddof=1)) if means.size > 1 else 0.0
+    if not np.isfinite(se):
+        se = 0.0
+    return lower, max(0.0, se)
+
+
 def _bucket_expression(score_column: str, bucket_count: int) -> pl.Expr:
     within = pl.col(score_column).count().over(SESSION_COLUMN)
     pct_rank = pl.when(within > 1).then(
@@ -556,6 +632,7 @@ def _bucket_statistics(
     block_length: int = _DEFAULT_BLOCK_LENGTH,
     *,
     max_bootstrap_workspace_bytes: int | None = None,
+    preserve_negative_bound_null: bool = False,
 ) -> pl.DataFrame:
     """Per-bucket shrunk expected alpha and bootstrap lower bound.
 
@@ -590,6 +667,7 @@ def _bucket_statistics(
                 "sample_size": [],
                 ALPHA_COLUMN: [],
                 LOWER_BOUND_COLUMN: [],
+                ALPHA_STANDARD_ERROR_COLUMN: [],
             }
         )
     global_mean = float(global_mean_value)
@@ -605,10 +683,11 @@ def _bucket_statistics(
                     "sample_size": sample_size,
                     ALPHA_COLUMN: None,
                     LOWER_BOUND_COLUMN: None,
+                    ALPHA_STANDARD_ERROR_COLUMN: None,
                 }
             )
             continue
-        lower_bound = _block_bootstrap_lower_bound(
+        lower_raw, se_raw = _block_bootstrap_statistics(
             residuals,
             block_length,
             n_bootstrap,
@@ -616,28 +695,42 @@ def _bucket_statistics(
             bootstrap_alpha,
             max_bootstrap_workspace_bytes=max_bootstrap_workspace_bytes,
         )
-        lower_bound = _shrink_lower_bound(
-            lower_bound, float(np.mean(residuals)), sample_size
-        )
-        if lower_bound <= 0.0:
+        lower_bound = _shrink_lower_bound(lower_raw, float(np.mean(residuals)), sample_size)
+        se = float(se_raw)
+        if not np.isfinite(se) or se < 0:
+            se = 0.0
+        shrink = min(1.0, _SHRINKAGE_THRESHOLD / sample_size)
+        bucket_mean = float(row["bucket_mean"])
+        shrunk = global_mean + (1.0 - shrink) * (bucket_mean - global_mean)
+        if not np.isfinite(shrunk) or not np.isfinite(lower_bound):
             rows.append(
                 {
                     "__bucket": bucket,
                     "sample_size": sample_size,
                     ALPHA_COLUMN: None,
                     LOWER_BOUND_COLUMN: None,
+                    ALPHA_STANDARD_ERROR_COLUMN: None,
                 }
             )
             continue
-        shrink = min(1.0, _SHRINKAGE_THRESHOLD / sample_size)
-        bucket_mean = float(row["bucket_mean"])
-        shrunk = global_mean + (1.0 - shrink) * (bucket_mean - global_mean)
+        if preserve_negative_bound_null and lower_bound <= 0.0:
+            rows.append(
+                {
+                    "__bucket": bucket,
+                    "sample_size": sample_size,
+                    ALPHA_COLUMN: None,
+                    LOWER_BOUND_COLUMN: None,
+                    ALPHA_STANDARD_ERROR_COLUMN: None,
+                }
+            )
+            continue
         rows.append(
             {
                 "__bucket": bucket,
                 "sample_size": sample_size,
                 ALPHA_COLUMN: float(shrunk),
                 LOWER_BOUND_COLUMN: float(lower_bound),
+                ALPHA_STANDARD_ERROR_COLUMN: float(se),
             }
         )
     return pl.DataFrame(rows)
@@ -660,10 +753,14 @@ def _augment(
                 "__bucket": [0],
                 ALPHA_COLUMN: [None],
                 LOWER_BOUND_COLUMN: [None],
+                ALPHA_STANDARD_ERROR_COLUMN: [None],
             }
         )
     else:
-        stats = bucket_stats.select("__bucket", ALPHA_COLUMN, LOWER_BOUND_COLUMN)
+        cols = ["__bucket", ALPHA_COLUMN, LOWER_BOUND_COLUMN]
+        if ALPHA_STANDARD_ERROR_COLUMN in bucket_stats.columns:
+            cols.append(ALPHA_STANDARD_ERROR_COLUMN)
+        stats = bucket_stats.select(*cols)
     out = scored.with_columns(_bucket_expression(score_column, bucket_count)).join(
         stats, on="__bucket", how="left"
     )

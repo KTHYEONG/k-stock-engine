@@ -12,8 +12,9 @@ import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Final, Literal
 
 import numpy as np
 import polars as pl
@@ -161,11 +162,13 @@ LOWER_BOUND_HALF_KELLY_PROFILE_ID = "lower_bound_half_kelly"
 DEFAULT_POLICY_PROFILE_IDS = (LEGACY_OVERLAY_PROFILE_ID, LOWER_BOUND_ONLY_PROFILE_ID, LOWER_BOUND_HALF_KELLY_PROFILE_ID)
 EXCESS_FULL_KELLY_PROFILE_ID = "excess_full_kelly"
 GROWTH_FULL_UTILIZATION_PROFILE_ID = "growth_full_utilization"
+CONTINUOUS_UNCERTAINTY_PROFILE_ID: Final[str] = "continuous_uncertainty_v1"
 ALLOWED_EXTRA_PROFILE_IDS = (
     EXCESS_FULL_KELLY_PROFILE_ID,
     GROWTH_FULL_UTILIZATION_PROFILE_ID,
     "unhedged_nem_v1",
     "unhedged_stack_v1",
+    CONTINUOUS_UNCERTAINTY_PROFILE_ID,
 )
 
 
@@ -244,7 +247,7 @@ class PolicyProfile:
     no_trade_band_bps: float = 0.0
     growth_risk_aversion: float = 1.0
     execution_utility_mode: Literal["legacy_target_interpolation_v1", "delta_cost_aware_v1", "sparse_hold_replace_v2"] = "delta_cost_aware_v1"
-    sizing_mode: Literal["alpha_vol_squared_v1", "risk_balanced_waterfill_v2", "confidence_mean_variance_v1"] = "alpha_vol_squared_v1"
+    sizing_mode: Literal["alpha_vol_squared_v1", "risk_balanced_waterfill_v2", "confidence_mean_variance_v1", "continuous_uncertainty_v1"] = "alpha_vol_squared_v1"
     single_name_cap_override: float | None = None
     gross_utilization_target: float | None = None
     vol_target_override: float | None = None
@@ -253,6 +256,7 @@ class PolicyProfile:
     net_exposure_gate_mode: Literal["off_v1", "trend_vol_v1"] = "off_v1"
     gate_trend_lookback_sessions: int | None = None
     gate_floor: float | None = None
+    economic_gate_mode: Literal["lower_bound_v1", "finite_mean_v1"] = "lower_bound_v1"
 
     def __post_init__(self) -> None:
         if not self.profile_id:
@@ -322,12 +326,18 @@ class PolicyProfile:
             "alpha_vol_squared_v1",
             "risk_balanced_waterfill_v2",
             "confidence_mean_variance_v1",
+            "continuous_uncertainty_v1",
         ):
             raise ValueError(
                 f"sizing_mode must be 'alpha_vol_squared_v1', "
-                f"'risk_balanced_waterfill_v2', or "
-                f"'confidence_mean_variance_v1', got {self.sizing_mode!r}"
+                f"'risk_balanced_waterfill_v2', 'confidence_mean_variance_v1', or 'continuous_uncertainty_v1', got {self.sizing_mode!r}"
             )
+        if self.economic_gate_mode not in ("lower_bound_v1", "finite_mean_v1"):
+            raise ValueError(f"economic_gate_mode must be 'lower_bound_v1' or 'finite_mean_v1', got {self.economic_gate_mode!r}")
+        if self.economic_gate_mode == "finite_mean_v1" and self.profile_id != CONTINUOUS_UNCERTAINTY_PROFILE_ID:
+            raise ValueError("finite_mean_v1 gate is available only to continuous_uncertainty_v1 profile")
+        if self.sizing_mode == "continuous_uncertainty_v1" and self.profile_id != CONTINUOUS_UNCERTAINTY_PROFILE_ID:
+            raise ValueError("continuous_uncertainty_v1 sizing is available only to continuous_uncertainty_v1 profile")
 
 
 @dataclass(frozen=True, slots=True)
@@ -812,6 +822,88 @@ class UniverseRescopeSettings:
             ]
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class StudyConfidencePlan:
+    calibration_alpha: float
+    selection_alpha: float
+    promotable_hypothesis_count: int
+    minimum_tail_draws: int
+
+    def __post_init__(self) -> None:
+        if not 0.0 < float(self.calibration_alpha) < 1.0:
+            raise ValueError("calibration_alpha must be in (0, 1)")
+        if not 0.0 < float(self.selection_alpha) < 1.0:
+            raise ValueError("selection_alpha must be in (0, 1)")
+        if float(self.selection_alpha) > float(self.calibration_alpha) + 1e-12:
+            raise ValueError("selection_alpha must not exceed calibration_alpha")
+        if not isinstance(self.promotable_hypothesis_count, int) or self.promotable_hypothesis_count < 1:
+            raise ValueError("promotable_hypothesis_count must be positive int")
+        if not isinstance(self.minimum_tail_draws, int) or self.minimum_tail_draws < 1:
+            raise ValueError("minimum_tail_draws must be positive int")
+
+
+@dataclass(frozen=True, slots=True)
+class ScreenRouteUtilitySeries:
+    fold_id: int
+    sessions: tuple[datetime, ...]
+    absolute_utility: tuple[float, ...]
+    tail_excess_utility: tuple[float, ...]
+    oracle_excess_utility: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.fold_id, int) or self.fold_id < 0:
+            raise ValueError("fold_id must be non-negative int")
+        n = len(self.sessions)
+        if not (len(self.absolute_utility) == len(self.tail_excess_utility) == len(self.oracle_excess_utility) == n):
+            raise ValueError("utility tuple lengths must match sessions length")
+        for name in ("absolute_utility", "tail_excess_utility", "oracle_excess_utility"):
+            for v in getattr(self, name):
+                if not math.isfinite(float(v)):
+                    raise ValueError(f"{name} must be finite")
+
+
+@dataclass(frozen=True, slots=True)
+class ConversionWaterfallEvidence:
+    mode_id: str
+    score_frame_fingerprint: str
+    finite_score_rows: int
+    calibrated_rows: int
+    positive_mean_rows: int
+    eligible_rows: int
+    target_positions: int
+    submitted_orders: int
+    filled_orders: int
+    observed_intervals: int
+    invested_intervals: int
+    drop_reasons: tuple[tuple[str, int], ...]
+
+    def __post_init__(self) -> None:
+        if not self.mode_id:
+            raise ValueError("mode_id must be non-empty")
+        if not self.score_frame_fingerprint:
+            raise ValueError("score_frame_fingerprint must be non-empty")
+        for name in ("finite_score_rows", "calibrated_rows", "positive_mean_rows", "eligible_rows", "target_positions", "submitted_orders", "filled_orders", "observed_intervals", "invested_intervals"):
+            v = getattr(self, name)
+            if not isinstance(v, int) or v < 0:
+                raise ValueError(f"{name} must be non-negative int")
+        if not (self.finite_score_rows >= self.calibrated_rows >= self.positive_mean_rows >= self.eligible_rows >= self.target_positions):
+            raise ValueError("ConversionWaterfallEvidence counts must satisfy finite>=calibrated>=positive_mean>=eligible>=target_positions")
+        if not (self.submitted_orders >= self.filled_orders):
+            raise ValueError("submitted_orders must be >= filled_orders")
+        if self.invested_intervals > self.observed_intervals:
+            raise ValueError("invested_intervals must be <= observed_intervals")
+        vocab = {"insufficient_history", "non_finite_bucket", "negative_mean", "lower_bound_gate", "no_trade_band", "capacity_cap", "turnover_cap", "sector_cap", "model-nonconverged", "missing_alpha_se"}
+        for reason, count in self.drop_reasons:
+            if reason not in vocab:
+                raise ValueError(f"unknown drop reason {reason!r}")
+            if not isinstance(count, int) or count < 0:
+                raise ValueError("drop count must be non-negative int")
+        if tuple(self.drop_reasons) != tuple(sorted(self.drop_reasons)):
+            raise ValueError("drop_reasons must be sorted")
+        if len({r for r, _ in self.drop_reasons}) != len(self.drop_reasons):
+            raise ValueError("drop_reasons must have unique reasons")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1457,6 +1549,7 @@ class FamilyScreenEvidence:
     selected_family: bool = False
     fold_attributions: tuple[FeatureAttributionEvidence, ...] = ()
     screen_economic_evidence: ScreenEconomicEvidence | None = None
+    route_utility_series: ScreenRouteUtilitySeries | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.family, ModelFamily):
@@ -1485,6 +1578,10 @@ class FamilyScreenEvidence:
                     raise ValueError("fold_attribution family mismatch")
                 if not attr.schema_fingerprint:
                     raise ValueError("fold_attribution schema_fingerprint must be non-empty")
+        if self.route_utility_series is not None and not isinstance(
+            self.route_utility_series, ScreenRouteUtilitySeries
+        ):
+            raise ValueError("route_utility_series must be ScreenRouteUtilitySeries")
 
 
 @dataclass(frozen=True, slots=True)
