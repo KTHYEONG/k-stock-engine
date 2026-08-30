@@ -811,6 +811,7 @@ def _seed04_fixture(
             "net_alpha_target": float(rng.normal(scale=0.5)),
             "risk_residual": float(rng.normal(scale=0.003)),
             "reference_cost": 0.001,
+            "gross_return": float(rng.normal(scale=0.003)) + 0.001,
             "label_available_time": row["session"]
             + timedelta(days=horizon_sessions),
         }
@@ -1063,6 +1064,8 @@ def _blend_market_fixture(
                     "risk_residual": 0.02 * float(row["feature__a"])
                     + float(rng.normal(scale=0.001)),
                     "reference_cost": 0.001,
+                    "gross_return": 0.02 * float(row["feature__a"])
+                    + float(rng.normal(scale=0.001)) + 0.001,
                     "label_available_time": row["session"]
                     + timedelta(days=horizon),
                 }
