@@ -778,7 +778,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--model-selection-wall-clock-seconds', type=float, default=900.0)
     parser.add_argument('--model-selection-screen-phase-seconds', type=float, default=720.0)
     parser.add_argument('--model-selection-screen-train-rows', type=int, default=3000)
-    parser.add_argument('--model-selection-screen-validation-rows', type=int, default=1000)
+    parser.add_argument('--model-selection-screen-validation-rows', type=int, default=12000)  # ModelSelectionComputeBudget.screen_validation_rows_per_fold default=12000
     parser.add_argument(
         "--model-selection-debug-timing",
         action="store_true",
@@ -1575,7 +1575,26 @@ def run_research_only_model_selection_study(
             raise
         except Exception as exc:
             raise ValueError(f"ML snapshot integrity audit error: {exc}") from exc
-        payload = evaluate_model_selection_study(data, bound_request, settings, registry=ModelArtifactRegistry(parsed.registry))
+        # MlResultLedger.record_research_outcome
+        try:
+            payload = evaluate_model_selection_study(data, bound_request, settings, registry=ModelArtifactRegistry(parsed.registry))
+        except Exception as exc:  # noqa: BLE001
+            # on evaluation exception, record status='failed', bounded phase/outcome, readiness, direct inputs, and failure before re-raising
+            try:
+                _failed_ledger = MlResultLedger(parsed.results_root)
+                _failed_msg = str(exc)[:512] if str(exc) else type(exc).__name__
+                _failed_ledger.record_research_outcome(
+                    run_id=request.artifact_id,
+                    status="failed",
+                    data_inputs=data_inputs,
+                    readiness=readiness_map,
+                    outcome={},
+                    started_at=datetime.now(UTC),
+                    failure=ValueError(_failed_msg),
+                )
+            except Exception as _ledger_exc:  # noqa: BLE001
+                logger.warning("[SYS] stage=result_ledger status=write_failed error=%s", _ledger_exc)
+            raise
         result_payload = {"status": "RESEARCH_ONLY", "artifact_published": False, "artifact_id": bound_request.artifact_id, **payload}
         # emit bounded research outcome record
         try:
