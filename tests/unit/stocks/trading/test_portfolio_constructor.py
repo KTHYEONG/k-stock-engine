@@ -2963,3 +2963,25 @@ def test_economic_gate_masks_distinguish_finite_mean_from_lower_bound() -> None:
     _, lower_entries = economic_gate_masks(**values, economic_gate_mode="lower_bound_v1")
     assert finite_entries.tolist() == [True, False]
     assert lower_entries.tolist() == [False, False]
+
+
+def test_portfolio_constructor_reexports_real_allocation_owner() -> None:
+    from src.stocks.trading import portfolio_constructor
+    from src.stocks.trading.portfolio_allocation import construct_target_allocations
+
+    assert portfolio_constructor.construct_target_allocations is construct_target_allocations
+    assert construct_target_allocations.__module__ == 'src.stocks.trading.portfolio_allocation'
+
+
+def test_extracted_economic_gate_preserves_mode_specific_masks() -> None:
+    import numpy as np
+
+    from src.stocks.trading.portfolio_economic_gates import economic_gate_masks
+
+    values = dict(expected_active_alpha=np.array([0.02, -0.01]), expected_net_alpha=np.array([0.01, 0.01]), alpha_lower_bound=np.array([-0.001, -0.001]), net_alpha_lower_bound=np.array([-0.001, -0.001]), alpha_standard_error=np.array([0.01, 0.01]), exit_cost_rate=np.array([0.001, 0.001]), incumbent_mask=np.array([False, False]), no_trade_band_bps=0.0)  # noqa: C408
+    lower_keep, lower_enter = economic_gate_masks(**values, economic_gate_mode='lower_bound_v1')
+    _, mean_enter = economic_gate_masks(**values, economic_gate_mode='finite_mean_v1')
+
+    assert lower_keep.dtype == np.dtype(bool)
+    assert lower_enter.tolist() == [False, False]
+    assert mean_enter.tolist() == [True, False]
