@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_PERSONAL_CAPITAL_HEDGE_VIABILITY",
+      "date": "2026-08-31",
+      "adr_id": "ADR_20260831_ML_PERSONAL_CAPITAL_HEDGE_VIABILITY",
+      "domain": "ml",
+      "title": "ML personal-capital hedge viability",
+      "why": "Latest ML runs had positive Rank-IC and relative excess but negative absolute lower CAGR; the hedge projection also omitted discrete lot co-funding and family-level failure attribution.",
+      "resolution": "Added cash-reserve and joint stock-margin checks, executable hedge evidence contracts with discrete variation-margin paths, explicit research-only hedge status, and family gate waterfall retention across terminal model-selection outcomes.",
+      "impact": "Prevents 10M KRW routes from being labeled implementable when stock cash plus futures margin exceeds seed capital, and makes six-family ML diagnosis reproducible without exposing raw scores or instrument data."
+    },
+    {
       "task_id": "TASK_ML_UNHEDGED_GROWTH_EVIDENCE_20260831",
       "date": "2026-08-31",
       "adr_id": "ADR_20260831_ML_UNHEDGED_GROWTH_EVIDENCE_20260831",
@@ -989,16 +999,6 @@
       "why": "Run8 outcome labels lack a snapshot-pinned status sidecar, so missing exits cannot be distinguished between recoverable bars, terminal events, tails, and construction failures.",
       "resolution": "Registered a fail-closed plan that pins outcome status in the snapshot, adds immutable KRX bar reconciliation, requires verified corporate-action settlement, and keeps unresolved outcomes out of realized arithmetic.",
       "impact": "Future ML/backtest runs can separate actual data collection gaps from non-recoverable or structural label failures; legacy snapshots remain diagnostic-only and all new artifacts retain hash-bound lineage."
-    },
-    {
-      "task_id": "TASK_ML_REALIZED_OUTCOME_INTEGRITY",
-      "date": "2026-08-15",
-      "adr_id": "ADR_20260815_ML_REALIZED_OUTCOME_INTEGRITY",
-      "domain": "stocks",
-      "title": "ML realized-outcome integrity",
-      "why": "Full production OOF replay showed positive Rank IC but every horizon was rejected because selected vintages lacked horizon-specific realized keys; the score universe was a label-derived cross-horizon union with no typed omission reason.",
-      "resolution": "Registered the evidence-based integrity specification: preserve the decision-time feature universe, separate future outcome status from eligibility, classify unresolved and partial-tail outcomes, keep replay fail-closed, and persist bounded policy-frontier diagnostics.",
-      "impact": "Prevents future-label selection bias and false cash/zero-fill evidence; enables future implementation to distinguish data coverage, evaluation structure, and replay logic while retaining auditable NO_TRADE results."
     }
   ]
 }
