@@ -701,6 +701,41 @@ class AccountCertificationSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class HedgeDeploymentEvidence:
+    tradable_proxy_id: str
+    beta: float
+    hedge_base_log_growth: tuple[float, ...]
+    hedge_stress_log_growth: tuple[float, ...]
+    base_cost_drag: float
+    stress_cost_drag: float
+    initial_margin_fraction: float
+
+    def __post_init__(self) -> None:
+        if not self.tradable_proxy_id or not isinstance(self.tradable_proxy_id, str):
+            raise ValueError("tradable_proxy_id must be non-empty str")
+        if not math.isfinite(self.beta) or self.beta <= 0:
+            raise ValueError("beta must be finite positive")
+        if (
+            not math.isfinite(self.base_cost_drag)
+            or not math.isfinite(self.stress_cost_drag)
+            or self.base_cost_drag < 0.0
+            or self.stress_cost_drag < 0.0
+        ):
+            raise ValueError("cost_drag must be finite and non-negative")
+        if not math.isfinite(self.initial_margin_fraction) or not 0.0 < self.initial_margin_fraction <= 1.0:
+            raise ValueError("initial_margin_fraction must be finite in (0,1]")
+        for name in ("hedge_base_log_growth", "hedge_stress_log_growth"):
+            vals = getattr(self, name)
+            if not isinstance(vals, tuple):
+                raise ValueError(f"{name} must be tuple")
+            for v in vals:
+                if not math.isfinite(float(v)):
+                    raise ValueError(f"{name} must be finite")
+        if len(self.hedge_base_log_growth) != len(self.hedge_stress_log_growth):
+            raise ValueError("hedge growth series must be parallel")
+
+
+@dataclass(frozen=True, slots=True)
 class SmallCapitalPlanSettings:
     """Pre-registered absolute-capital implementation plan inputs.
 
@@ -725,6 +760,7 @@ class SmallCapitalPlanSettings:
     unhedged_leverage_grid: tuple[float, ...] = (0.25, 0.5, 0.75, 1.0)
     max_projected_mdd: float = 0.35
     annualization_sessions: int = 252
+    cash_reserve_fraction: float = 0.0
 
     def __post_init__(self) -> None:
         if self.seed_capital_krw <= 0 or not math.isfinite(self.seed_capital_krw):
@@ -774,6 +810,8 @@ class SmallCapitalPlanSettings:
                 "unhedged_leverage_grid values must be strictly ascending "
                 "and unique"
             )
+        if not math.isfinite(self.cash_reserve_fraction) or not 0.0 <= self.cash_reserve_fraction < 1.0:
+            raise ValueError("cash_reserve_fraction must be finite in [0,1)")
 
 
 @dataclass(frozen=True, slots=True)
