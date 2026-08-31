@@ -34,6 +34,7 @@ from src.stocks.ml.contracts import (
     NetAlphaTrainingRequest,
     SelectedModelPolicy,
 )
+from src.stocks.ml.wealth_transfer import WealthEvidenceKind, evaluate_wealth_candidate
 from src.stocks.ml.features import (
     ResearchFeatureSchema,
     apply_research_feature_schema,
@@ -5191,6 +5192,19 @@ def evaluate_model_selection_study(
         "survivors": [c.candidate_id for c in survivors],
         "runtime_ledger": runtime_ledger,
     }
+    for candidate in candidates_evaluated:
+        waterfall = candidate.get("conversion_waterfall")
+        if waterfall is not None and hasattr(waterfall, "filled_orders"):
+            verdict = evaluate_wealth_candidate(
+                route_kind=request.route_objective.kind,
+                evidence_kind=WealthEvidenceKind.EXECUTABLE_UNHEDGED,
+                waterfall=waterfall,
+                certificate_passed=False,
+                hashes_reconciled=False,
+                absolute_lower_cagr=None,
+                matched_excess_lower_cagr=None,
+            )
+            candidate["promotion_status"] = verdict.promotion_status
     return result_payload
 
 

@@ -837,6 +837,8 @@ class GrowthRouteEvidence:
     route_version: str = GROWTH_ROUTE_VERSION
     seed_policy: PolicyKey | None = None
     benchmark_reconcile_failure: str = ""
+    evidence_kind: object = "executable_unhedged"
+    route_objective_kind: object = "unhedged_absolute"
 
     def __post_init__(self) -> None:
         count = len(self.base_log_growth)

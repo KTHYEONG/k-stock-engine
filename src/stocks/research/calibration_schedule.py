@@ -314,6 +314,11 @@ class CausalCalibrationSchedule:
                     if row["alpha_lower_bound"] is None
                     else float(cast(float, row["alpha_lower_bound"]))
                 ),
+                alpha_standard_error=(
+                    None
+                    if row.get("alpha_standard_error") is None
+                    else float(cast(float, row["alpha_standard_error"]))
+                ),
             )
             for row in cast(list[dict[str, object]], state["buckets"])
         )
@@ -738,7 +743,9 @@ class SessionClusterCalibrationSchedule:
                 )
                 continue
             lower_bound = self._bucket_lower_bound(bucket, bucket_state)
-            if lower_bound <= 0.0:
+            # Preserve signed negative bound when requested; only null on <=0 if preserve_negative_bound_null is true
+            preserve = bool(getattr(self._calibrator, "preserve_negative_bound_null", True))
+            if lower_bound <= 0.0 and preserve:
                 bucket_rows.append(
                     {
                         "bucket": int(bucket),
@@ -751,12 +758,35 @@ class SessionClusterCalibrationSchedule:
             shrink = min(1.0, _SHRINKAGE_THRESHOLD / bucket_state.row_count)
             bucket_mean = bucket_state.row_sum / bucket_state.row_count
             shrunk = global_mean + (1.0 - shrink) * (bucket_mean - global_mean)
+            # Compute SE from bootstrap means for evidence parity
+            try:
+                n = bucket_state.session_sums.size
+                block = max(self._block_length, 1)
+                n_blocks = int(np.ceil(n / block))
+                max_start = max(1, n - block + 1)
+                _means = _session_cluster_bootstrap_means(
+                    bucket_state.session_sums,
+                    bucket_state.session_counts,
+                    block=block,
+                    n_blocks=n_blocks,
+                    max_start=max_start,
+                    n_bootstrap=self._calibrator.n_bootstrap,
+                    seed=self._calibrator.seed + bucket,
+                    csum_sums=bucket_state.csum_sums,
+                    csum_counts=bucket_state.csum_counts,
+                )
+                se = float(np.std(_means, ddof=1)) if _means.size > 1 else 0.0
+                if not np.isfinite(se) or se < 0:
+                    se = 0.0
+            except Exception:
+                se = 0.0
             bucket_rows.append(
                 {
                     "bucket": int(bucket),
                     "sample_size": int(bucket_state.row_count),
                     "expected_active_alpha": float(shrunk),
                     "alpha_lower_bound": float(lower_bound),
+                    "alpha_standard_error": float(se),
                 }
             )
         return bucket_rows
@@ -810,6 +840,11 @@ class SessionClusterCalibrationSchedule:
                     None
                     if row["alpha_lower_bound"] is None
                     else float(cast(float, row["alpha_lower_bound"]))
+                ),
+                alpha_standard_error=(
+                    None
+                    if row.get("alpha_standard_error") is None
+                    else float(cast(float, row["alpha_standard_error"]))
                 ),
             )
             for row in cast(list[dict[str, object]], state["buckets"])
