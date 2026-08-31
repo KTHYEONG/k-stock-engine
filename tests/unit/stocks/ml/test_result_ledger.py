@@ -366,6 +366,10 @@ def test_result_ledger_records_direct_inputs_without_snapshot_id(tmp_path) -> No
     record = json.loads((tmp_path / "results" / "ml_runs" / "direct-study.json").read_text())
     assert "snapshot_id" not in record["data_inputs"]
     assert record["data_inputs"]["base_dataset_id"] == "base"
+    assert record["observability"] == {"phases": [], "horizons": [], "summary": {}}
+    assert record["artifact"] == {}
+    latest = _latest(tmp_path / "results")
+    assert latest["artifact_id"] == "direct-study"
 
 
 def test_record_completed_no_trade(tmp_path) -> None:
