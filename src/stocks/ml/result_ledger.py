@@ -1024,6 +1024,7 @@ def _compact_policy_frontier(metrics: Mapping[str, object]) -> dict[str, object]
 
 
 def _compact_growth_route(metrics: Mapping[str, object]) -> dict[str, object]:
+    # wealth_evidence: Mapping[str, float | bool]  # bounded terminal-wealth diagnostic
     """Bounded growth-route index: scalars plus normalized rejection counts.
 
     Wiring: account_certification - project account basis, target, lower-CAGR gate verdict, and MDD only
@@ -1099,6 +1100,17 @@ def _compact_growth_route(metrics: Mapping[str, object]) -> dict[str, object]:
     # Preserve conversion waterfall if present
     if "conversion_waterfall" in outcome:
         summary["conversion_waterfall"] = outcome["conversion_waterfall"] if isinstance(outcome["conversion_waterfall"], dict) else {"first_zero_stage": str(outcome["conversion_waterfall"])}
+    wealth = route.get("wealth_evidence")
+    if isinstance(wealth, Mapping):
+        we_summary: dict[str, object] = {}
+        for _k in ("initial_cash_krw", "base_terminal_wealth_krw", "stress_terminal_wealth_krw", "base_observed_return", "stress_observed_return"):
+            _v = _as_float(wealth.get(_k))
+            if _v is not None:
+                we_summary[_k] = _v
+        if "observed_base_growth_positive" in wealth:
+            we_summary["observed_base_growth_positive"] = bool(wealth["observed_base_growth_positive"])
+        if we_summary:
+            summary['wealth_evidence'] = we_summary
     summary['hedge_sleeve'] = _compact_hedge_sleeve(route)
     plan = route.get("small_capital_route_plan")
     if isinstance(plan, Mapping):

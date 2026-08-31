@@ -528,7 +528,7 @@ def _run_discovery_and_publish(
         and route.selected_policies[-1] is not None
         else ()
     )
-    growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary, capital_plan_settings=request.capital_plan, satellite_settings=request.satellite_settings, nem_component_records=satellite_nem_records, account_certification=request.account_certification)  # noqa: E501
+    growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary, capital_plan_settings=request.capital_plan, satellite_settings=request.satellite_settings, nem_component_records=satellite_nem_records, account_certification=request.account_certification, initial_cash=request.portfolio.initial_cash)  # noqa: E501
     _attach_frozen_compound_track(growth_route, discovery.evidence, request)
     growth_route = _attach_excess_route_certificate(
         growth_route, discovery, request, pre_holdout, primary
@@ -4360,6 +4360,7 @@ def _growth_route_projection(
     satellite_settings: SatelliteOverlaySettings | None = None,
     nem_component_records: Sequence[Mapping[str, object]] = (),
     account_certification: AccountCertificationSettings | None = None,
+    initial_cash: float | None = None,
 ) -> dict[str, object]:
     """Bounded ``growth_route`` projection shared by metrics and the ledger.
 
@@ -4559,6 +4560,41 @@ def _growth_route_projection(
         "hedge_sleeve_projection": hedge_projection,
         "rejection_reason_counts": dict(sorted(rejection_counts.items())),
     }
+    # wealth_evidence: exact replay terminal-wealth diagnostic (log-space, no projections)
+    if initial_cash is not None:
+        try:
+            _cash = float(initial_cash)
+        except (TypeError, ValueError):
+            _cash = None
+        if _cash is not None and math.isfinite(_cash) and _cash > 0:
+            try:
+                _base_sum = math.fsum(float(v) for v in route.base_log_growth)
+                _stress_sum = math.fsum(float(v) for v in route.stress_log_growth)
+            except (TypeError, ValueError):
+                _base_sum = float("nan")
+                _stress_sum = float("nan")
+            if math.isfinite(_base_sum) and math.isfinite(_stress_sum):
+                try:
+                    _base_exp = math.exp(_base_sum)
+                    _stress_exp = math.exp(_stress_sum)
+                except (OverflowError, ValueError):
+                    _base_exp = float("inf")
+                    _stress_exp = float("inf")
+                if math.isfinite(_base_exp) and math.isfinite(_stress_exp):
+                    _base_wealth = _cash * _base_exp
+                    _stress_wealth = _cash * _stress_exp
+                    if math.isfinite(_base_wealth) and math.isfinite(_stress_wealth):
+                        _base_ret = (_base_wealth / _cash) - 1.0 if _cash != 0 else float("nan")
+                        _stress_ret = (_stress_wealth / _cash) - 1.0 if _cash != 0 else float("nan")
+                        if math.isfinite(_base_ret) and math.isfinite(_stress_ret):
+                            projection["wealth_evidence"] = {
+                                "initial_cash_krw": round(float(_cash), 12),
+                                "base_terminal_wealth_krw": round(float(_base_wealth), 12),
+                                "stress_terminal_wealth_krw": round(float(_stress_wealth), 12),
+                                "base_observed_return": round(float(_base_ret), 12),
+                                "stress_observed_return": round(float(_stress_ret), 12),
+                                "observed_base_growth_positive": bool(_base_wealth > _cash),
+                            }
     if sleeve_certificate is not None:
         projection["hedged_excess_certificate"] = sleeve_certificate
     if capital_plan_settings is not None:
@@ -5006,7 +5042,7 @@ def _growth_route_research_payload(
         and route.selected_policies[-1] is not None
         else ()
     )
-    growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary, capital_plan_settings=request.capital_plan, satellite_settings=request.satellite_settings, nem_component_records=satellite_nem_records, account_certification=request.account_certification)  # noqa: E501
+    growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary, capital_plan_settings=request.capital_plan, satellite_settings=request.satellite_settings, nem_component_records=satellite_nem_records, account_certification=request.account_certification, initial_cash=request.portfolio.initial_cash)  # noqa: E501
     _attach_frozen_compound_track(growth_route, discovery.evidence, request)
     growth_route = _attach_excess_route_certificate(
         growth_route, discovery, request, panel, primary

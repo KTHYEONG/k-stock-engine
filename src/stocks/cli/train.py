@@ -33,7 +33,6 @@ from src.core.costs import (
 from src.core.datasets import DatasetCertification
 from src.core.paths import (
     PROJECT_ROOT,
-    STOCK_ARTIFACT_ROOT,
     STOCK_BASE_PANEL_ROOT,
     STOCK_CATALOG_ROOT,
     STOCK_FEATURE_PANEL_ROOT,
@@ -59,6 +58,7 @@ from src.stocks.data.repositories import (
     ResearchDataRepository,
     resolve_snapshot_for_mode,
 )
+from src.stocks.ml.comparison_report import MlComparisonReport
 from src.stocks.ml.contracts import (
     DECLARED_ECONOMIC_FAMILIES,
     DEFAULT_CANDIDATE_HORIZON_SESSIONS,
@@ -85,7 +85,6 @@ from src.stocks.ml.replay_resources import (
 from src.stocks.ml.replay_resources import read_host_mem_available_bytes
 from src.stocks.ml.result_ledger import (
     CostRunContext,
-    MlResultLedger,
     MlRunContext,
 )
 from src.stocks.ml.training import TrainingOrchestrator, train_net_alpha_model
@@ -96,6 +95,11 @@ from src.stocks.research.models import ModelManifest
 from src.stocks.settings import REFERENCE_DATE, REFERENCE_DATETIME
 
 logger = logging.getLogger("stocks.cli.train")
+
+
+def _runtime_registry() -> ModelArtifactRegistry:
+    """Return the process-local registry used by every CLI training mode."""
+    return ModelArtifactRegistry.in_memory()
 
 
 def _invoke_training(
@@ -588,7 +592,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-root", type=Path, default=STOCK_BASE_PANEL_ROOT)
     parser.add_argument("--feature-root", type=Path, default=STOCK_FEATURE_PANEL_ROOT)
     parser.add_argument("--label-root", type=Path, default=STOCK_LABEL_ROOT)
-    parser.add_argument("--registry", type=Path, default=STOCK_ARTIFACT_ROOT)
+    parser.add_argument(
+        "--registry",
+        type=Path,
+        default=None,
+        help="deprecated and ignored; CLI runs keep artifacts in memory",
+    )
     parser.add_argument(
         "--results-root",
         type=Path,
@@ -1193,7 +1202,7 @@ def run_research_only_growth_route(
 
         data, bound_request = _load_active_study_context(parsed, request, selection)
         payload = evaluate_growth_route_research(
-            data, bound_request, registry=ModelArtifactRegistry(parsed.registry)
+            data, bound_request, registry=_runtime_registry()
         )
         return {
             "status": "RESEARCH_ONLY",
@@ -1226,7 +1235,7 @@ def run_research_only_growth_route(
         candidate_horizon_sessions=_parse_horizons(parsed.candidate_horizon_sessions),
     )
     payload = evaluate_growth_route_research(
-        data, request, registry=ModelArtifactRegistry(parsed.registry)
+        data, request, registry=_runtime_registry()
     )
     return {
         "status": "RESEARCH_ONLY",
@@ -1307,7 +1316,7 @@ def run_research_only_temporal_window_study(
             )
         )
         payload = evaluate_temporal_window_study(
-            data, bound_request, settings, registry=ModelArtifactRegistry(parsed.registry)
+            data, bound_request, settings, registry=_runtime_registry()
         )
         return {
             "status": "RESEARCH_ONLY",
@@ -1375,7 +1384,7 @@ def run_research_only_temporal_window_study(
         )
     )
     payload = evaluate_temporal_window_study(
-        data, bound_request, settings, registry=ModelArtifactRegistry(parsed.registry)
+        data, bound_request, settings, registry=_runtime_registry()
     )
     return {
         "status": "RESEARCH_ONLY",
@@ -1410,7 +1419,7 @@ def run_research_only_economic_family_study(
             )
         )
         payload = evaluate_economic_family_study(
-            data, bound_request, settings, registry=ModelArtifactRegistry(parsed.registry)
+            data, bound_request, settings, registry=_runtime_registry()
         )
         return {
             "status": "RESEARCH_ONLY",
@@ -1476,7 +1485,7 @@ def run_research_only_economic_family_study(
         )
     )
     payload = evaluate_economic_family_study(
-        data, bound_request, settings, registry=ModelArtifactRegistry(parsed.registry)
+        data, bound_request, settings, registry=_runtime_registry()
     )
     return {
         "status": "RESEARCH_ONLY",
@@ -1507,7 +1516,7 @@ def run_research_only_return_transfer_study(
             data,
             bound_request,
             ReturnTransferSettings(),
-            registry=ModelArtifactRegistry(parsed.registry),
+            registry=_runtime_registry(),
         )
         return {
             "status": "RESEARCH_ONLY",
@@ -1642,7 +1651,6 @@ def run_research_only_model_selection_study(
     from src.stocks.data.direct import DirectMarketDataLoader
     from src.stocks.data.ml_integrity import validate_ml_snapshot  # validate_ml_snapshot
     from src.stocks.ml.model_selection import evaluate_model_selection_study
-    from src.stocks.ml.result_ledger import MlResultLedger
 
     if getattr(parsed, "model_selection_debug_timing", False):
         logging.basicConfig(level=logging.DEBUG, format="%(levelname)s %(name)s %(message)s")
@@ -1686,7 +1694,7 @@ def run_research_only_model_selection_study(
         }
         if readiness_report.errors:
             # write failed research outcome and block
-            ledger = MlResultLedger(parsed.results_root)
+            ledger = MlComparisonReport(parsed.results_root)
             try:
                 ledger.record_research_outcome(
                     run_id=request.artifact_id,
@@ -1758,13 +1766,13 @@ def run_research_only_model_selection_study(
             raise
         except Exception as exc:
             raise ValueError(f"ML snapshot integrity audit error: {exc}") from exc
-        # MlResultLedger.record_research_outcome
+        # Markdown report records one bounded terminal research outcome.
         try:
-            payload = evaluate_model_selection_study(data, bound_request, settings, registry=ModelArtifactRegistry(parsed.registry))
+            payload = evaluate_model_selection_study(data, bound_request, settings, registry=_runtime_registry())
         except Exception as exc:  # noqa: BLE001
             # on evaluation exception, record status='failed', bounded phase/outcome, readiness, direct inputs, and failure before re-raising
             try:
-                _failed_ledger = MlResultLedger(parsed.results_root)
+                _failed_ledger = MlComparisonReport(parsed.results_root)
                 _failed_msg = str(exc)[:512] if str(exc) else type(exc).__name__
                 _failed_ledger.record_research_outcome(
                     run_id=request.artifact_id,
@@ -1791,7 +1799,7 @@ def run_research_only_model_selection_study(
         # emit bounded research outcome record
         # wiring: ledger.record_research_outcome(run_id=request.artifact_id, status='completed', data_inputs=data_inputs, readiness=readiness_map, outcome=project_model_selection_ledger_outcome(payload), started_at=datetime.now(UTC))
         try:
-            ledger = MlResultLedger(parsed.results_root)
+            ledger = MlComparisonReport(parsed.results_root)
             ledger.record_research_outcome(
                 run_id=request.artifact_id,
                 status="completed",
@@ -1825,7 +1833,7 @@ def run_research_only_compound_alpha_study(
             data,
             bound_request,
             CompoundAlphaStudySettings(),
-            registry=ModelArtifactRegistry(parsed.registry),
+            registry=_runtime_registry(),
         )
 
     # Enforce catalog snapshot and hash-bound cost evidence; fail closed to RESEARCH_ONLY with zero candidates if missing
@@ -1885,7 +1893,7 @@ def run_research_only_compound_alpha_study(
             )
             settings = CompoundAlphaStudySettings()
             payload = evaluate_compound_alpha_study(
-                data, bound_request, settings, registry=ModelArtifactRegistry(parsed.registry)
+                data, bound_request, settings, registry=_runtime_registry()
             )
             # Ensure research-only envelope
             payload["status"] = "RESEARCH_ONLY"
@@ -2057,7 +2065,7 @@ def run_research_only_alpha_capacity_audit(
             data,
             bound_request,
             AlphaCapacityAuditSettings(),
-            registry=ModelArtifactRegistry(parsed.registry),
+            registry=_runtime_registry(),
         )
 
     if parsed.base_dataset_id or parsed.feature_dataset_id or parsed.label_dataset_id:
@@ -2117,7 +2125,7 @@ def run_research_only_alpha_capacity_audit(
     # Bounded evidence envelope
     t0 = time.monotonic()
     payload = evaluate_alpha_capacity_audit(
-        data, bound_request, settings, registry=ModelArtifactRegistry(parsed.registry)
+        data, bound_request, settings, registry=_runtime_registry()
     )
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     # Add bounded DATA/ALGO/EVAL/SYS scalars without dumping raw rows
@@ -2289,7 +2297,6 @@ def _dispatch_train_command(command: TrainCommand) -> int:
         feature_root = getattr(parsed_for_dispatch, "feature_root", STOCK_FEATURE_PANEL_ROOT)
         label_root = getattr(parsed_for_dispatch, "label_root", STOCK_LABEL_ROOT)
         artifact_id = getattr(parsed_for_dispatch, "artifact_id", "a1")
-        registry = getattr(parsed_for_dispatch, "registry", STOCK_ARTIFACT_ROOT)
         results_root = getattr(parsed_for_dispatch, "results_root", STOCK_RESULTS_DOC_ROOT)
         decision_time = getattr(parsed_for_dispatch, "decision_time", REFERENCE_DATETIME)
         parsed = parsed_for_dispatch
@@ -2299,34 +2306,55 @@ def _dispatch_train_command(command: TrainCommand) -> int:
         feature_root = STOCK_FEATURE_PANEL_ROOT
         label_root = STOCK_LABEL_ROOT
         artifact_id = "a1"
-        registry = STOCK_ARTIFACT_ROOT
         results_root = STOCK_RESULTS_DOC_ROOT
         decision_time = REFERENCE_DATETIME
-        parsed = argparse.Namespace(artifact_id=artifact_id, catalog_root=catalog_root, base_root=base_root, feature_root=feature_root, label_root=label_root, registry=registry, results_root=results_root, decision_time=decision_time)
+        parsed = argparse.Namespace(artifact_id=artifact_id, catalog_root=catalog_root, base_root=base_root, feature_root=feature_root, label_root=label_root, results_root=results_root, decision_time=decision_time)
     selection = resolve_active_research_data(catalog_root=catalog_root, base_root=base_root, feature_root=feature_root, label_root=label_root, request=command.active_request)
     # If a study is selected, dispatch to its handler (all studies are snapshotless)
     if command.study is not None:
         # Build request for study handlers that expect parsed and request
-
+        started_at = datetime.now(UTC)
+        report = MlComparisonReport(results_root)
+        data_inputs = dict(getattr(selection, "data_inputs", {}))
         req = _build_training_request(parsed)
         _validate_static_training_request(req)
-        study_value = command.study.value
-        if study_value == "growth_route":
-            payload = run_research_only_growth_route(parsed, req, selection=selection)
-        elif study_value == "temporal_window_study":
-            payload = run_research_only_temporal_window_study(parsed, req, selection=selection)
-        elif study_value == "economic_family_study":
-            payload = run_research_only_economic_family_study(parsed, req, selection=selection)
-        elif study_value == "alpha_capacity_audit":
-            payload = run_research_only_alpha_capacity_audit(parsed, req, selection=selection)
-        elif study_value == "return_transfer_study":
-            payload = run_research_only_return_transfer_study(parsed, req, selection=selection)
-        elif study_value == "compound_alpha_study":
-            payload = run_research_only_compound_alpha_study(parsed, req, selection=selection)
-        elif study_value == "model_selection_study":
-            payload = run_research_only_model_selection_study(parsed, req, selection=selection)
-        else:
-            raise ValueError(f"unknown study {study_value!r}")
+        try:
+            study_value = command.study.value
+            if study_value == "growth_route":
+                payload = run_research_only_growth_route(parsed, req, selection=selection)
+            elif study_value == "temporal_window_study":
+                payload = run_research_only_temporal_window_study(parsed, req, selection=selection)
+            elif study_value == "economic_family_study":
+                payload = run_research_only_economic_family_study(parsed, req, selection=selection)
+            elif study_value == "alpha_capacity_audit":
+                payload = run_research_only_alpha_capacity_audit(parsed, req, selection=selection)
+            elif study_value == "return_transfer_study":
+                payload = run_research_only_return_transfer_study(parsed, req, selection=selection)
+            elif study_value == "compound_alpha_study":
+                payload = run_research_only_compound_alpha_study(parsed, req, selection=selection)
+            elif study_value == "model_selection_study":
+                payload = run_research_only_model_selection_study(parsed, req, selection=selection)
+            else:
+                raise ValueError(f"unknown study {study_value!r}")
+        except Exception as exc:
+            report.record_research_outcome(
+                run_id=artifact_id,
+                status="failed",
+                data_inputs=data_inputs,
+                readiness={"passed": False},
+                outcome={},
+                started_at=started_at,
+                failure=exc,
+            )
+            raise
+        report.record_research_outcome(
+            run_id=artifact_id,
+            status=str(payload.get("status", "RESEARCH_ONLY")),
+            data_inputs=data_inputs,
+            readiness={"passed": True},
+            outcome=payload,
+            started_at=started_at,
+        )
         sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
         return 0
     # Default training: snapshotless active pipeline
@@ -2342,23 +2370,35 @@ def _dispatch_train_command(command: TrainCommand) -> int:
     # Proceed with existing training orchestration (preserve ledger/diagnostics)
     # For brevity, delegate to original training flow using resolved data
     # Use data already loaded to train
-    from src.stocks.ml.result_ledger import MlResultLedger
     from src.stocks.ml.training import train_net_alpha_model
     from src.stocks.observability.contracts import RunIdentity
     from src.stocks.observability.recorder import open_run_diagnostics
-    from src.stocks.research.artifacts import ModelArtifactRegistry
 
-    registry_obj = ModelArtifactRegistry(registry)
+    registry_obj = _runtime_registry()
+    started_at = datetime.now(UTC)
     # Bind cost evidence from selection
     try:
         evidence = load_cost_evidence(selection.cost_evidence_path, __import__("src.stocks.data.contracts", fromlist=["CoverageRange"]).CoverageRange(start=command.active_request.start, end=command.active_request.end))
         bound = replace(request, base_cost_schedule=evidence.base_schedule(), stress_cost_schedule=evidence.stress_schedule(), liquidity_model=evidence.base_liquidity_model, stress_liquidity_model=evidence.stress_liquidity_model)
     except Exception:
         bound = request
-    MlResultLedger(results_root)
+    report = MlComparisonReport(results_root)
+    context = MlRunContext.from_cli(
+        request=bound,
+        snapshot_id="active-policy",
+        data=data,
+        cost_context=CostRunContext(cost_schedule_kind="base"),
+        started_at=started_at,
+    )
     identity = RunIdentity(run_id=artifact_id, project="stocks")
     diagnostics = open_run_diagnostics(identity, {"diagnostics_enabled": True})
-    train_net_alpha_model(data, registry_obj, bound, diagnostics=diagnostics)
+    try:
+        manifest = train_net_alpha_model(data, registry_obj, bound, diagnostics=diagnostics)
+    except Exception as exc:
+        report.record_failed(context, "train_net_alpha_model", exc)
+        diagnostics.close("FAIL")
+        raise
+    report.record_completed(context, manifest, registry_obj)
     diagnostics.close("PASS")
     return 0
 
@@ -2539,7 +2579,7 @@ def main(args: list[str] | None = None) -> int:
         stress_cost_schedule,
         stress_liquidity_model,
     ) = _resolve_cost_contexts(snapshot)
-    registry = ModelArtifactRegistry(parsed.registry)
+    registry = _runtime_registry()
     request = replace(
         request,
         base_cost_schedule=base_cost_schedule,
@@ -2568,7 +2608,7 @@ def main(args: list[str] | None = None) -> int:
         started_at=started_at,
         data_lineage=resolved_lineage,
     )
-    ledger = MlResultLedger(parsed.results_root)
+    ledger = MlComparisonReport(parsed.results_root)
     identity = RunIdentity(run_id=request.artifact_id, project="stocks")
     runtime_settings = StockRuntimeSettings(diagnostics_enabled=True).model_dump()
     resolve_training_request(request.artifact_id, overrides={})
@@ -2670,7 +2710,7 @@ def _run_direct_training(
 
     # Diagnostics open before any allocation so a guard denial leaves terminal
     # evidence instead of a vanished kernel.
-    ledger = MlResultLedger(parsed.results_root)
+    ledger = MlComparisonReport(parsed.results_root)
     identity = RunIdentity(run_id=request.artifact_id, project="stocks")
     runtime_settings = StockRuntimeSettings(diagnostics_enabled=True).model_dump()
     resolve_training_request(request.artifact_id, overrides={})
@@ -2804,7 +2844,7 @@ def _run_direct_training(
         len(input_ids),
     )
 
-    registry = ModelArtifactRegistry(parsed.registry)
+    registry = _runtime_registry()
     request = replace(
         request,
         base_cost_schedule=base_cost_schedule,
