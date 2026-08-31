@@ -1703,6 +1703,8 @@ class MlResultLedger:
             "readiness": safe_readiness,
             "outcome": safe_outcome,
             "input": {"data_inputs": safe_inputs, "readiness": safe_readiness},
+            "observability": {"phases": [], "horizons": [], "summary": {}},
+            "artifact": {},
         }
         if failure is not None:
             record["failure"] = {"message": _normalize_message(str(failure) or type(failure).__name__)}

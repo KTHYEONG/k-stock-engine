@@ -1610,6 +1610,30 @@ class ScreenEconomicEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class ScreenMlEvidence:
+    fold_id: int
+    validation_sessions: int
+    validation_rows: int
+    rank_ic: float
+    loss: float
+    confidence: Literal["ok", "low"]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.fold_id, int) or self.fold_id < 0:
+            raise ValueError("fold_id must be non-negative int")
+        if not isinstance(self.validation_sessions, int) or self.validation_sessions < 0:
+            raise ValueError("validation_sessions must be non-negative int")
+        if not isinstance(self.validation_rows, int) or self.validation_rows < 0:
+            raise ValueError("validation_rows must be non-negative int")
+        if not math.isfinite(float(self.rank_ic)):
+            raise ValueError("rank_ic must be finite")
+        if not math.isfinite(float(self.loss)):
+            raise ValueError("loss must be finite")
+        if self.confidence not in ("ok", "low"):
+            raise ValueError("confidence must be 'ok' or 'low'")
+
+
+@dataclass(frozen=True, slots=True)
 class FamilyScreenEvidence:
     family: ModelFamily
     screen_lower_bound: float
@@ -1620,6 +1644,7 @@ class FamilyScreenEvidence:
     fold_attributions: tuple[FeatureAttributionEvidence, ...] = ()
     screen_economic_evidence: ScreenEconomicEvidence | None = None
     route_utility_series: ScreenRouteUtilitySeries | None = None
+    ml_evidence: ScreenMlEvidence | None = None
     diagnostics: tuple[object, ...] = ()
 
     def __post_init__(self) -> None:
@@ -1653,6 +1678,8 @@ class FamilyScreenEvidence:
             self.route_utility_series, ScreenRouteUtilitySeries
         ):
             raise ValueError("route_utility_series must be ScreenRouteUtilitySeries")
+        if self.ml_evidence is not None and not isinstance(self.ml_evidence, ScreenMlEvidence):
+            raise ValueError("ml_evidence must be ScreenMlEvidence")
 
 
 @dataclass(frozen=True, slots=True)
