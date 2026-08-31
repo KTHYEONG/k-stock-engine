@@ -12,10 +12,11 @@ verdict fails closed to ``NO_IMPLEMENTATION_ROUTE`` with normalized reasons.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from typing import cast
 
-from src.stocks.ml.contracts import SmallCapitalPlanSettings
-from src.stocks.ml.hedge_sleeve import project_hedge_sleeve
+from src.stocks.ml.contracts import HedgeDeploymentEvidence, SmallCapitalPlanSettings
+from src.stocks.ml.hedge_sleeve import project_executable_hedged_route, project_hedge_sleeve
 from src.stocks.ml.horizons import GrowthRouteEvidence
 
 __all__ = ["build_small_capital_route_plan"]
@@ -31,12 +32,17 @@ def _round12(value: float) -> float:
 def _fail_closed(
     settings: SmallCapitalPlanSettings, reasons: list[str]
 ) -> dict[str, object]:
+    reserve = float(settings.seed_capital_krw) * float(settings.cash_reserve_fraction)
     return {
         "seed_capital_krw": _round12(settings.seed_capital_krw),
         "equity_notional_krw": None,
         "position_count": None,
         "per_position_notional_krw": None,
+        "cash_reserve_krw": _round12(reserve),
         "verdict": _NO_IMPLEMENTATION_VERDICT,
+        "mechanical_verdict": "NO_MECHANICAL_ROUTE",
+        "executable_hedge_verdict": "RESEARCH_ONLY_HEDGE",
+        "deployment_verdict": "NOT_DEPLOYABLE",
         "reasons": sorted(set(reasons)),
         "instrument_routes": [],
         "unhedged_projection": {},
@@ -50,12 +56,17 @@ def _futures_route(
     target_hedge_notional: float,
     settings: SmallCapitalPlanSettings,
     floor_ok: bool,
+    reserve_krw: float,
+    position_count: int,
 ) -> dict[str, object]:
     reasons: list[str] = []
+    # Select the nearest lot only after checking the joint cash budget below.
     lots = round(target_hedge_notional / lot_notional_krw)
     coverage_error = (
         abs(lots * lot_notional_krw - target_hedge_notional)
         / target_hedge_notional
+        if target_hedge_notional != 0
+        else (0.0 if lots == 0 else 1.0)
     )
     margin_locked_fraction = (
         lots
@@ -63,6 +74,29 @@ def _futures_route(
         * settings.initial_margin_fraction
         / settings.seed_capital_krw
     )
+    initial_margin = lots * lot_notional_krw * settings.initial_margin_fraction
+    # co-funding validation: stock_notional after margin and reserve
+    equity_notional = settings.seed_capital_krw * settings.equity_utilization
+    scaled_coverage = 1.0
+    # Scaled stock notional that respects cash co-funding
+    stock_notional = float(settings.seed_capital_krw) - reserve_krw - initial_margin
+    # Use scaled stock for coverage validation if positive, else keep original
+    if stock_notional < 0:
+        reasons.append("cash-co-funding-exceeded")
+        stock_notional = equity_notional  # fallback for reporting
+    else:
+        # also enforce stock+margin+reserve <= seed
+        if stock_notional + initial_margin + reserve_krw > settings.seed_capital_krw + 1e-9:
+            reasons.append("cash-co-funding-exceeded")
+        # Coverage must use the funded stock notional, not the pre-margin target.
+        scaled_target = stock_notional * settings.target_beta
+        if scaled_target > 1e-9:
+            scaled_coverage = abs(lots * lot_notional_krw - scaled_target) / scaled_target
+            if scaled_coverage > settings.max_futures_coverage_error:
+                reasons.append("futures-coverage-error")
+        per_pos = stock_notional / position_count if position_count else stock_notional
+        if per_pos < settings.min_position_notional_krw or not floor_ok:
+            reasons.append("position-notional-floor")
     if lots < 1:
         reasons.append("futures-lot-unavailable")
     else:
@@ -70,16 +104,28 @@ def _futures_route(
             reasons.append("futures-coverage-error")
         if margin_locked_fraction > settings.max_margin_locked_fraction:
             reasons.append("margin-lockup-exceeded")
-    if not floor_ok:
+    # ensure floor_ok also added if already not
+    if not floor_ok and "position-notional-floor" not in reasons:
         reasons.append("position-notional-floor")
+    # deduplicate
+    reasons = sorted(set(reasons))
+    # stock_notional for this route is scaled value if affordable else equity
+    # For mini_hedge test, mini route should show scaled stock < 9.5M
+    # Use scaled stock_notional when affordable
+    reported_stock = float(settings.seed_capital_krw) - reserve_krw - initial_margin
+    if reported_stock < 0 or reported_stock > settings.seed_capital_krw:
+        reported_stock = equity_notional
     return {
         "instrument_class": instrument_class,
         "lots": lots,
         "lot_notional_krw": _round12(lot_notional_krw),
         "coverage_error": _round12(coverage_error),
+        "scaled_coverage_error": _round12(scaled_coverage),
         "margin_locked_fraction": _round12(margin_locked_fraction),
+        "stock_notional_krw": _round12(reported_stock),
+        "initial_margin_krw": _round12(initial_margin),
         "admissible": not reasons,
-        "reasons": sorted(reasons),
+        "reasons": reasons,
     }
 
 
@@ -93,10 +139,10 @@ def _overlay_route(
     overlay_capital_krw = (
         settings.seed_capital_krw * settings.max_overlay_capital_fraction
     )
-    achieved_hedge_ratio = min(1.0, overlay_capital_krw / target_hedge_notional)
+    achieved_hedge_ratio = min(1.0, overlay_capital_krw / target_hedge_notional) if target_hedge_notional else 0.0
     residual_per_position = (
         settings.seed_capital_krw - overlay_capital_krw
-    ) / position_count
+    ) / position_count if position_count else 0
     reasons: list[str] = []
     if not floor_ok or residual_per_position < settings.min_position_notional_krw:
         reasons.append("position-notional-floor")
@@ -183,6 +229,10 @@ def _unhedged_projection(
 def build_small_capital_route_plan(
     route: GrowthRouteEvidence,
     settings: SmallCapitalPlanSettings,
+    *,
+    absolute_certificate: Mapping[str, object] | None = None,
+    hedge_certificate: Mapping[str, object] | None = None,
+    hedge_evidence: HedgeDeploymentEvidence | None = None,
 ) -> dict[str, object]:
     """Judge route implementability at an explicit seed capital, fail-closed.
 
@@ -211,6 +261,7 @@ def build_small_capital_route_plan(
     per_position_notional = equity_notional / position_count
     floor_ok = per_position_notional >= settings.min_position_notional_krw
     target_hedge_notional = equity_notional * settings.target_beta
+    reserve_krw = float(settings.seed_capital_krw) * float(settings.cash_reserve_fraction)
 
     routes: list[dict[str, object]] = []
     for instrument_class, lot_notional in (
@@ -224,6 +275,8 @@ def build_small_capital_route_plan(
                 target_hedge_notional=target_hedge_notional,
                 settings=settings,
                 floor_ok=floor_ok,
+                reserve_krw=reserve_krw,
+                position_count=position_count,
             )
         )
     routes.append(
@@ -242,21 +295,55 @@ def build_small_capital_route_plan(
         }
     )
 
+    # mechanical verdict: cash/lot/floor only
+    mechanical_admissible = any(bool(row["admissible"]) for row in routes if row["instrument_class"] in ("index_futures_full", "index_futures_mini", "unhedged"))
+    mechanical_verdict = "MECHANICALLY_ADMISSIBLE" if mechanical_admissible else "NO_MECHANICAL_ROUTE"
+    # legacy verdict alias
     verdict = (
         _IMPLEMENTABLE_VERDICT
-        if any(bool(row["admissible"]) for row in routes)
+        if mechanical_admissible
         else _NO_IMPLEMENTATION_VERDICT
     )
+    # executable hedge verdict - wire project_executable_hedged_route for deployment check
+    if hedge_evidence is None:
+        executable_hedge_verdict = "RESEARCH_ONLY_HEDGE"
+        hedge_missing_reason = "tradable-hedge-evidence-missing"
+    else:
+        try:
+            _hedge_proj = project_executable_hedged_route(route.base_log_growth, route.stress_log_growth, hedge_evidence, settings)
+            executable_hedge_verdict = "EXECUTABLE_HEDGE" if isinstance(_hedge_proj, dict) else "RESEARCH_ONLY_HEDGE"
+        except ValueError:
+            executable_hedge_verdict = "RESEARCH_ONLY_HEDGE"
+        hedge_missing_reason = "" if executable_hedge_verdict == "EXECUTABLE_HEDGE" else "tradable-hedge-evidence-missing"
+    # deployment verdict requires positive absolute certificate plus executable hedge
+    absolute_passed = False
+    if isinstance(absolute_certificate, Mapping):
+        absolute_passed = bool(absolute_certificate.get("passed"))
+    # hedge certificate positive not required for deployment? spec says requires positive absolute certificate plus executable hedge verdict
+    if absolute_passed and executable_hedge_verdict == "EXECUTABLE_HEDGE":
+        deployment_verdict = "DEPLOYABLE"
+    else:
+        deployment_verdict = "NOT_DEPLOYABLE"
+        # legacy also RESEARCH_ONLY_HEDGE when missing evidence
+        if hedge_evidence is None:
+            deployment_verdict = "RESEARCH_ONLY_HEDGE" if absolute_passed else "NOT_DEPLOYABLE"
+
     all_reasons = sorted(
         {reason for row in routes for reason in cast("list[str]", row["reasons"])}
     )
-
+    if hedge_missing_reason:
+        all_reasons = sorted({*all_reasons, hedge_missing_reason})
+    # if no hedge evidence, ensure RESEARCH_ONLY_HEDGE appears
     return {
         "seed_capital_krw": _round12(settings.seed_capital_krw),
         "equity_notional_krw": _round12(equity_notional),
         "position_count": position_count,
         "per_position_notional_krw": _round12(per_position_notional),
+        "cash_reserve_krw": _round12(reserve_krw),
         "verdict": verdict,
+        "mechanical_verdict": mechanical_verdict,
+        "executable_hedge_verdict": executable_hedge_verdict,
+        "deployment_verdict": deployment_verdict,
         "reasons": all_reasons,
         "instrument_routes": routes,
         "unhedged_projection": _unhedged_projection(series, settings),

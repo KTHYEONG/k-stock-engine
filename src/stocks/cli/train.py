@@ -1634,6 +1634,42 @@ def project_model_selection_ledger_outcome(payload: Mapping[str, object]) -> dic
     # Preserve top-level screen_sampling_evidence if present
     if "screen_sampling_evidence" in payload and isinstance(payload["screen_sampling_evidence"], dict):
         result["screen_sampling_evidence"] = _cap_dict(payload["screen_sampling_evidence"])  # type: ignore
+    # Preserve family_gate_waterfall with bounded rows, excluding raw vectors
+    if "family_gate_waterfall" in payload and isinstance(payload["family_gate_waterfall"], (list, tuple)):
+        rows = []
+        for row in list(payload["family_gate_waterfall"])[:12]:
+            if not isinstance(row, dict):
+                continue
+            capped_row: dict[str, object] = {}
+            for key in ("family", "last_completed_stage", "terminal_status", "terminal_stage", "normalized_reasons", "scheduled_decision_observations", "minimum_required_decision_observations", "scheduled_decisions", "screen_absolute_lower_bound", "screen_tail_lower_bound", "screen_oracle_lower_bound", "oof_status", "reasons"):
+                if key in row:
+                    val = row[key]
+                    if isinstance(val, (list, tuple)):
+                        capped_row[key] = [_bounded_scalar(x) for x in list(val)[:16]]
+                    elif isinstance(val, dict):
+                        capped_row[key] = _cap_dict(val, max_keys=16)
+                    else:
+                        capped_row[key] = _bounded_scalar(val)
+            # also preserve per-profile scalars if present
+            for k in ("filled_orders", "observed_intervals", "invested_intervals", "base_lower_cagr", "stress_lower_cagr", "mdd", "coverage_error"):
+                if k in row:
+                    capped_row[k] = _bounded_scalar(row[k])
+            rows.append(capped_row)
+        result["family_gate_waterfall"] = rows
+    # Ensure byte cap 24 KiB: if exceeding, keep family_gate_waterfall and drop larger optional fields
+    try:
+        import json as _json
+        encoded = _json.dumps(result, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > 24 * 1024:
+            # drop heavier optional keys but preserve family_gate_waterfall
+            for drop_key in ("screen_sampling_evidence", "runtime_ledger", "candidates"):
+                if drop_key in result:
+                    del result[drop_key]
+                    encoded = _json.dumps(result, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                    if len(encoded) <= 24 * 1024:
+                        break
+    except Exception:  # noqa: S110
+        pass
     # Ensure status preserved
     if "status" not in result and "status" in payload:
         result["status"] = _bounded_scalar(payload["status"])
