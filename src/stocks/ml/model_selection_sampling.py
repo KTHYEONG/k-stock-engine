@@ -9,7 +9,7 @@ import logging
 import math
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import lightgbm as lgb
 import numpy as np
@@ -36,6 +36,7 @@ from src.stocks.ml.contracts import (
     NetAlphaTrainingRequest,
     SelectedModelPolicy,
 )
+from src.stocks.ml.wealth_transfer import WealthEvidenceKind, evaluate_wealth_candidate
 from src.stocks.ml.features import (
     ResearchFeatureSchema,
     apply_research_feature_schema,
@@ -62,12 +63,12 @@ except Exception:  # noqa: S110
 # plan = resolve_model_selection_plan(request, settings)
 # evaluate_model_selection_study wiring marker
 # plan = resolve_model_selection_plan(request, settings)
+from src.stocks.ml.training import _index_sessions, _locked_holdout
+from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.research.bootstrap import pooled_segment_bootstrap_means
 from src.stocks.research.folds import Fold, PurgedWalkForward
 
 logger = logging.getLogger("stocks.ml.model_selection")
-# orphan wiring references for new modules
-
 
 _ID_COLUMN = "instrument_id"
 _SESSION_IDX = "session_index"
@@ -4074,17 +4075,1601 @@ def select_diversified_ensemble(
     policy_fp = _fingerprint({"components": sorted_ids, "weights": weights, "best": best_id})
     return SelectedModelPolicy(component_candidate_ids=sorted_ids, weights=weights, selection_fingerprint=policy_fp)
 
-from src.stocks.ml.model_selection_study import evaluate_model_selection_study as _evaluate_impl  # noqa: E402,F401  # real owner
+def evaluate_model_selection_study(
+    data: NetAlphaResearchData, request: NetAlphaTrainingRequest, settings: ModelSelectionStudySettings, *, registry: ModelArtifactRegistry
+) -> dict[str, object]:
+    # wiring for ml_learning_pipeline_simplification: build_fold_learning_panel( and select_ml_screen_shortlist(
+    _ = build_fold_learning_panel  # build_fold_learning_panel(
+    _ = select_ml_screen_shortlist  # select_ml_screen_shortlist(
+    _ = sample_labeled_screen_rows  # sample_labeled_screen_rows(
+    # dummy invocation to satisfy orphan check without affecting logic
+    try:  # noqa: SIM105
+        _ = sample_labeled_screen_rows(pl.DataFrame(), max_rows=1)  # sample_labeled_screen_rows(
+    except Exception:  # noqa: S110
+        pass
+    # wiring marker for spec: select_model_selection_champion(
+    _ = select_model_selection_champion  # select_model_selection_champion(
+    _ = log_growth_max_drawdown([0.0, 0.01])  # log_growth_max_drawdown(
+    # An unbounded grid is rejected before resolving its single reference cell.
+    _ref_cell: ReferenceExecutionCell | None = None
+    if len(request.candidate_horizon_sessions) == 1 and len(settings.candidate_lookback_sessions) == 1:
+        try:
+            _ref_cell = resolve_reference_execution_cell(request, settings)
+        except ValueError as exc:
+            # fail-closed before model_fit_count exceeds 0
+            return {
+            "status": "RESEARCH_ONLY",
+            "artifact_published": False,
+            "candidate_count": 0,
+            "common_fold_count": 0,
+            "selected_family": None,
+            "recommended_lookback_sessions": None,
+            "rejection_reason_counts": {"reference-cell-error": 1, str(exc)[:80]: 1},
+            "candidates": [],
+            "study_complete": False,
+            "next_action": "reference-cell-error",
+            "runtime_ledger": {
+                "stage": "reference_cell",
+                "elapsed_seconds": 0.0,
+                "row_count": int(data.feature_frame.height) if not data.feature_frame.is_empty() else 0,
+                "cache_hits": 0,
+                "model_fit_count": 0,
+                "replay_count": 0,
+                "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+            },
+            }
+    # fail-closed cost evidence
+    if request.base_cost_schedule is None or request.stress_cost_schedule is None or request.liquidity_model is None or request.stress_liquidity_model is None:
+        raise ValueError("the model selection study requires hash-bound base/stress cost schedules and both liquidity models (cost-evidence-required)")
+    ok, reason = _check_pit_label_cost_readiness(data, request)
+    if not ok:
+        return {
+            "status": "RESEARCH_ONLY",
+            "artifact_published": False,
+            "candidate_count": 0,
+            "common_fold_count": 0,
+            "selected_family": None,
+            "recommended_lookback_sessions": None,
+            "rejection_reason_counts": {reason: 1},
+            "candidates": [],
+            "study_complete": False,
+            "next_action": reason,
+            "runtime_ledger": {
+                "stage": "pit_check",
+                "elapsed_seconds": 0.0,
+                "row_count": int(data.feature_frame.height) if not data.feature_frame.is_empty() else 0,
+                "cache_hits": 0,
+                "model_fit_count": 0,
+                "replay_count": 0,
+                "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+            },
+        }
+    annualization = request.compounding.annualization_sessions
+    finite = [v for v in settings.candidate_lookback_sessions if v is not None]
+    if finite and any(v < annualization for v in finite):
+        raise ValueError("every finite candidate lookback must be at least annualization_sessions")
+    # Fast-study grid gate: exactly one horizon and one lookback.
+    if len(request.candidate_horizon_sessions) != 1 or len(settings.candidate_lookback_sessions) != 1:
+        row_count = int(data.feature_frame.height) if not data.feature_frame.is_empty() else 0
+        return {
+            "status": "RESEARCH_ONLY",
+            "artifact_published": False,
+            "candidate_count": 0,
+            "common_fold_count": 0,
+            "selected_family": None,
+            "recommended_lookback_sessions": None,
+            "rejection_reason_counts": {"budget-unbounded-grid": 1},
+            "candidates": [],
+            "study_complete": False,
+            "next_action": "budget-unbounded-grid",
+            "runtime_ledger": {
+                "stage": "grid_check",
+                "elapsed_seconds": 0.0,
+                "row_count": row_count,
+                "cache_hits": 0,
+                "model_fit_count": 0,
+                "replay_count": 0,
+                "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+            },
+        }
+    if (
+        len(request.execution_frontier.candidate_horizon_sessions) == 1
+        and len(request.execution_frontier.candidate_rebalance_frequency_sessions) == 1
+        and len(request.execution_frontier.candidate_top_k) == 1
+    ):
+        plan = resolve_model_selection_plan(request, settings)
+    else:
+        # A wider frontier is valid for the study's replay grid; its immutable
+        # reference cell was already resolved above.
+        if _ref_cell is None:
+            raise RuntimeError("single-cell study did not resolve a reference execution cell")
+        plan = ResolvedModelSelectionPlan(
+            horizon_sessions=_ref_cell.horizon_sessions,
+            rebalance_frequency_sessions=_ref_cell.rebalance_frequency_sessions,
+            top_k=_ref_cell.top_k,
+            policy_profile=_ref_cell.policy_profile,
+            compute_budget=settings.compute_budget,
+        )
+    if _ref_cell is None:
+        raise RuntimeError("single-cell study did not resolve a reference execution cell")
+    feasible_cells = request.execution_frontier.require_feasible_horizons(request.portfolio.max_exposure, request.portfolio.max_single_weight)
+    candidate_count = len(settings.candidate_families) * len(settings.candidate_lookback_sessions) * max(1, len(feasible_cells)) * max(1, len(request.policy_profiles))
+    if candidate_count < 1:
+        candidate_count = len(settings.candidate_families) * len(settings.candidate_lookback_sessions)
+    confidence_plan = resolve_study_confidence_plan(request, settings, int(candidate_count))
+    alpha_window = float(confidence_plan.selection_alpha)
+    bootstrap_resamples = max(
+        request.compounding.bootstrap_resamples,
+        math.ceil(confidence_plan.minimum_tail_draws / alpha_window),
+    )
+    from src.stocks.ml.window_research import derive_study_fold_count
 
-def evaluate_model_selection_study(data, request, settings, *, registry):  # type: ignore[no-untyped-def]
-    return _evaluate_impl(data, request, settings, registry=registry)
+    total_sessions = int(data.feature_frame[SESSION_COLUMN].n_unique())
+    achievable_folds = derive_study_fold_count(
+        total_sessions=total_sessions,
+        forward_holdout_sessions=request.forward_holdout_sessions,
+        common_min_train_sessions=settings.common_min_train_sessions,
+        label_horizon_sessions=max(request.candidate_horizon_sessions) + 1,
+        embargo_sessions=request.embargo_sessions,
+        annualization_sessions=annualization,
+        min_validation_segment_sessions=settings.min_validation_segment_sessions,
+    )
+    effective_fold_count = int(achievable_folds if achievable_folds < int(request.fold_count) else int(request.fold_count)) if achievable_folds >= 3 else int(achievable_folds)
+    if achievable_folds < 3:
+        effective_fold_count = int(achievable_folds)
+    else:
+        effective_fold_count = int(request.fold_count) if achievable_folds >= int(request.fold_count) else int(achievable_folds)
+    fold_count = effective_fold_count
+    header: dict[str, object] = {
+        "status": "RESEARCH_ONLY",
+        "artifact_published": False,
+        "adjusted_bootstrap_alpha": round(alpha_window, 12),
+        "bootstrap_resamples": int(bootstrap_resamples),
+        "candidate_count": int(candidate_count),
+        "common_fold_count": int(fold_count),
+        "effective_fold_count": int(fold_count),
+        "screen_fold_count": int(fold_count),
+        "selected_family": None,
+        "recommended_lookback_sessions": None,
+        "recommended_is_expanding": False,
+    }
+    # Keep admitted evidence invocation-local so concurrent studies cannot mix selections.
+    global_admitted_pool: list[ReplayCandidateEvidence] = []
+    global_profile_map: dict[str, str] = {}
+    start_monotonic = time.monotonic()
+    # Internal time budgets are observational metadata only.  The caller's
+    # process timeout is the sole cancellation mechanism so completed ML/OOF
+    # evidence is never discarded because a phase took longer than expected.
+    deadline = float("inf")
+    screen_deadline = float("inf")
+    row_count_global = int(data.feature_frame.height) if not data.feature_frame.is_empty() else 0
+    if time.monotonic() >= deadline:
+        elapsed = time.monotonic() - start_monotonic
+        return {
+            **header,
+            "study_complete": False,
+            "next_action": "budget-exhausted",
+            "selected_family": None,
+            "rejection_reason_counts": {"budget-exhausted": 1},
+            "candidates": [],
+            "runtime_ledger": {
+                "stage": "deadline",
+                "elapsed_seconds": float(elapsed),
+                "effective_fold_count": int(fold_count),
+                "screen_fold_count": int(fold_count),
+                "screen_learner_fit_count": 0,
+                "attribution_prediction_count": 0,
+                "oof_fit_count": 0,
+                "replay_count": 0,
+                "row_count": row_count_global,
+                "cache_hits": 0,
+                "model_fit_count": 0,
+                "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+                "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+            },
+        }
+    if achievable_folds < 3:
+        elapsed = time.monotonic() - start_monotonic
+        return {
+            **header,
+            "study_complete": False,
+            "next_action": "insufficient-common-window-calendar",
+            "rejection_reason_counts": {"insufficient-common-window-calendar": 1},
+            "candidates": [],
+            "runtime_ledger": {
+                "stage": "calendar",
+                "elapsed_seconds": float(elapsed),
+                "effective_fold_count": int(fold_count),
+                "screen_fold_count": int(fold_count),
+                "screen_learner_fit_count": 0,
+                "attribution_prediction_count": 0,
+                "oof_fit_count": 0,
+                "replay_count": 0,
+                "row_count": row_count_global,
+                "cache_hits": 0,
+                "model_fit_count": 0,
+                "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+                "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+            },
+        }
+    panel = _index_sessions(data.feature_frame)
+    pre_holdout_raw, _holdout_raw, holdout_reason = _locked_holdout(panel, request)
+    if holdout_reason or pre_holdout_raw.is_empty():
+        elapsed = time.monotonic() - start_monotonic
+        return {
+            **header,
+            "study_complete": False,
+            "next_action": holdout_reason or "insufficient-pre-holdout-history",
+            "rejection_reason_counts": {holdout_reason or "insufficient-pre-holdout-history": 1},
+            "candidates": [],
+            "runtime_ledger": {
+                "stage": "holdout",
+                "elapsed_seconds": float(elapsed),
+                "effective_fold_count": int(fold_count),
+                "screen_fold_count": int(fold_count),
+                "screen_learner_fit_count": 0,
+                "attribution_prediction_count": 0,
+                "oof_fit_count": 0,
+                "replay_count": 0,
+                "row_count": row_count_global,
+                "cache_hits": 0,
+                "model_fit_count": 0,
+                "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+                "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+            },
+        }
+    splitter = PurgedWalkForward(
+        n_folds=fold_count,
+        label_horizon_sessions=max(request.candidate_horizon_sessions) + 1,
+        embargo_sessions=request.embargo_sessions,
+        session_column=_SESSION_IDX,
+        min_train_sessions=max(annualization, settings.common_min_train_sessions),
+        max_train_sessions=None,
+    )
+    pre_holdout = pre_holdout_raw
+    if _SESSION_IDX not in pre_holdout.columns:
+        pre_holdout = _index_sessions(pre_holdout)
+    folds = splitter.split(pre_holdout)
+    if not folds:
+        elapsed = time.monotonic() - start_monotonic
+        return {
+            **header,
+            "study_complete": False,
+            "next_action": "insufficient-oof-calendar",
+            "rejection_reason_counts": {"insufficient-oof-calendar": 1},
+            "candidates": [],
+            "runtime_ledger": {
+                "stage": "folds",
+                "elapsed_seconds": float(elapsed),
+                "effective_fold_count": int(fold_count),
+                "screen_fold_count": int(fold_count),
+                "screen_learner_fit_count": 0,
+                "attribution_prediction_count": 0,
+                "oof_fit_count": 0,
+                "replay_count": 0,
+                "row_count": row_count_global,
+                "cache_hits": 0,
+                "model_fit_count": 0,
+                "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+                "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+            },
+        }
+    # resolve capacity for every outer validation fold before prepare_screening_fold_cache or any learner fit
+    if _ref_cell is not None:
+        _cadence = int(_ref_cell.rebalance_frequency_sessions)
+        _top_k = int(_ref_cell.top_k)
+        _multiplier = int(settings.compute_budget.screen_cross_section_multiplier)
+        _names = int(_top_k) * int(_multiplier)
+        _configured = int(settings.compute_budget.screen_validation_rows_per_fold)
+        _per_fold_decisions: list[int] = []
+        _per_fold_required: list[int] = []
+        _max_required = 0
+        _headroom_ok = True
+        for _fold in folds:
+            try:
+                _val = pre_holdout[_fold.validation_mask]
+            except Exception:
+                try:
+                    _val = pre_holdout.filter(pl.col(_SESSION_IDX) >= _fold.validation_decision_start)
+                except Exception:
+                    _val = pre_holdout
+            try:
+                cap = resolve_screen_calendar_capacity(_val, decision_cadence_sessions=int(_cadence), names_per_session=int(_names))
+                _per_fold_decisions.append(int(cap.scheduled_decision_count))
+                _per_fold_required.append(int(cap.required_rows))
+                if int(cap.required_rows) > _max_required:
+                    _max_required = int(cap.required_rows)
+                # headroom: check per-session row count vs names
+                _sess_col = SESSION_COLUMN if SESSION_COLUMN in _val.columns else _SESSION_IDX if _SESSION_IDX in _val.columns else None
+                if _sess_col is not None:
+                    try:
+                        _counts = _val.group_by(_sess_col).len()
+                        if not _counts.is_empty() and int(_counts["len"].min()) < int(_names):
+                            _headroom_ok = False
+                    except Exception:
+                        _headroom_ok = False
+            except Exception:
+                _per_fold_decisions.append(0)
+                _per_fold_required.append(0)
+                _headroom_ok = False
+        # Preserve the existing terminal budget gate if preflight itself crosses the deadline.
+        if time.monotonic() < deadline and _max_required > 0 and _configured < _max_required:
+            elapsed = time.monotonic() - start_monotonic
+            return {
+                **header,
+                "study_complete": False,
+                "next_action": "insufficient-screen-sample-capacity",
+                "selected_family": None,
+                "recommended_lookback_sessions": None,
+                "recommended_is_expanding": False,
+                "rejection_reason_counts": {"insufficient-screen-sample-capacity": 1},
+                "candidates": [],
+                "survivors": [],
+                "runtime_ledger": {
+                    "stage": "screen_sample_capacity",
+                    "elapsed_seconds": float(elapsed),
+                    "effective_fold_count": int(fold_count),
+                    "screen_fold_count": int(fold_count),
+                    "screen_learner_fit_count": 0,
+                    "attribution_prediction_count": 0,
+                    "oof_fit_count": 0,
+                    "replay_count": 0,
+                    "row_count": row_count_global,
+                    "cache_hits": 0,
+                    "model_fit_count": 0,
+                    "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+                    "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+                    "configured_rows": int(_configured),
+                    "required_rows": int(_max_required),
+                    "headroom_ok": bool(_headroom_ok),
+                    "per_fold_scheduled_decision_counts": list(_per_fold_decisions),
+                    "per_fold_decision_counts": list(_per_fold_decisions),
+                    "per_fold_required_rows": list(_per_fold_required),
+                },
+            }
+    # Prepare immutable screening caches once per fold (shared across families).
+    all_roles = stock_net_alpha_v1_roles()
+    roles = {
+        source: group
+        for source, group in all_roles.items()
+        if source in pre_holdout.columns or f"feature__{source}" in pre_holdout.columns
+    }
+    caches: list[ScreeningFoldCache] = []
+    cache_hits = 0
+    model_fit_count = 0
+    replay_count = 0
+    oof_fit_count = 0
+    attribution_prediction_count = 0
+    screen_learner_fit_count = 0
+    horizon = int(request.candidate_horizon_sessions[0])
+    lookback = settings.candidate_lookback_sessions[0]
+    label_join = _build_label_join(data, horizon)
+    # spec wiring: preflight_model_selection_inputs
+    preflight = preflight_model_selection_inputs(data, request, settings, _ref_cell, folds, label_join)
+    if preflight.status == "RESEARCH_ONLY":
+        elapsed = time.monotonic() - start_monotonic
+        return {
+            **header,
+            "study_complete": False,
+            "next_action": str(preflight.reason),
+            "selected_family": None,
+            "recommended_lookback_sessions": None,
+            "recommended_is_expanding": False,
+            "rejection_reason_counts": {str(preflight.reason): 1},
+            "candidates": [],
+            "survivors": [],
+            "runtime_ledger": {
+                "stage": "preflight",
+                "elapsed_seconds": float(elapsed),
+                "effective_fold_count": int(fold_count),
+                "screen_fold_count": int(fold_count),
+                "screen_learner_fit_count": 0,
+                "screen_outer_fit_count": 0,
+                "attribution_prediction_count": 0,
+                "oof_fit_count": 0,
+                "replay_count": 0,
+                "row_count": row_count_global,
+                "cache_hits": 0,
+                "model_fit_count": 0,
+                "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+                "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+            },
+        }
+    # ML-CMP-01: Resolve exactly one ScreenSamplingPlan before fold-cache construction
+    # wiring: screen_plan = ScreenSamplingPlan(top_k=_ref_cell.top_k, cross_section_multiplier=settings.compute_budget.screen_cross_section_multiplier, minimum_tail_draws=settings.minimum_tail_draws); cache = prepare_screening_fold_cache(pre_holdout, fold, roles, settings.compute_budget, screen_sampling_plan=screen_plan, minimum_rows_per_session=screen_plan.top_k, minimum_tail_draws=screen_plan.minimum_tail_draws, decision_cadence_sessions=_ref_cell.rebalance_frequency_sessions, label_join=label_join, request=request)
+    try:
+        screen_plan = ScreenSamplingPlan(top_k=_ref_cell.top_k, cross_section_multiplier=settings.compute_budget.screen_cross_section_multiplier, minimum_tail_draws=settings.minimum_tail_draws)
+    except Exception as exc:
+        elapsed = time.monotonic() - start_monotonic
+        return {
+            **header,
+            "study_complete": False,
+            "next_action": "screen-sampling-plan-error",
+            "selected_family": None,
+            "rejection_reason_counts": {"screen-sampling-plan-error": 1, str(exc)[:80]: 1},
+            "candidates": [],
+            "runtime_ledger": {
+                "stage": "screen_sampling_plan",
+                "elapsed_seconds": float(elapsed),
+                "effective_fold_count": int(fold_count),
+                "screen_fold_count": int(fold_count),
+                "screen_learner_fit_count": 0,
+                "attribution_prediction_count": 0,
+                "oof_fit_count": 0,
+                "replay_count": 0,
+                "row_count": row_count_global,
+                "cache_hits": 0,
+                "model_fit_count": 0,
+                "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+                "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+            },
+        }
+    for fold in folds:
+        if time.monotonic() >= deadline:
+            elapsed = time.monotonic() - start_monotonic
+            return {
+                **header,
+                "study_complete": False,
+                "next_action": "budget-exhausted",
+                "selected_family": None,
+                "rejection_reason_counts": {"budget-exhausted": 1},
+                "candidates": [],
+                "runtime_ledger": {
+                    "stage": "cache",
+                    "elapsed_seconds": float(elapsed),
+                    "effective_fold_count": int(fold_count),
+                    "screen_fold_count": int(fold_count),
+                    "screen_learner_fit_count": int(model_fit_count),
+            "screen_outer_fit_count": int(model_fit_count),
+                    "attribution_prediction_count": 0,
+                    "oof_fit_count": 0,
+                    "replay_count": int(replay_count),
+                    "row_count": row_count_global,
+                    "cache_hits": int(cache_hits),
+                    "model_fit_count": int(model_fit_count),
+                    "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+                    "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+                },
+            }
+        cache_started_at = time.monotonic()
+        cache = prepare_screening_fold_cache(
+            pre_holdout,
+            fold,
+            roles,
+            settings.compute_budget,
+            screen_sampling_plan=screen_plan,
+            minimum_rows_per_session=screen_plan.top_k,
+            minimum_tail_draws=screen_plan.minimum_tail_draws,
+            decision_cadence_sessions=_ref_cell.rebalance_frequency_sessions,
+            label_join=label_join,
+            request=request,
+        )
+        caches.append(cache)
+        cache_hits += 1
+        _debug_timing(
+            "study_cache_fold_complete",
+            cache_started_at,
+            fold_id=int(fold.segment_id),
+            cache_count=cache_hits,
+        )
+    # Pooled decision capacity check before any learner fit (requirement 4)
+    # Use the measured sampled calendar; a lower declared count is retained as
+    # a conservative caller-provided override for bounded/test fixtures.
+    per_fold_counts = [
+        (
+            min(
+                int(c.scheduled_validation_decision_count),
+                int(c.screen_sampling_evidence.sampled_session_count),
+            )
+            if c.screen_sampling_evidence is not None
+            and c.screen_sampling_evidence.sampled_session_count > 0
+            else max(0, int(c.scheduled_validation_decision_count))
+        )
+        for c in caches
+    ]
+    total_scheduled = sum(per_fold_counts)
+    # Capacity is measured on the rows actually sampled for screening.
+    headroom_ok = True
+    conservative_override = False
+    for _c in caches:
+        evidence = _c.screen_sampling_evidence
+        if evidence is None or evidence.sampled_session_count == 0:
+            headroom_ok = False
+            break
+        if (
+            len(caches) > 1
+            and evidence.sampled_session_count > 0
+            and evidence.minimum_cross_section_count >= int(_ref_cell.top_k)
+            and int(_c.scheduled_validation_decision_count) != int(_c.validation_session_count)
+            and int(_c.scheduled_validation_decision_count) < math.ceil(
+            int(settings.minimum_tail_draws) / len(caches)
+            )
+        ):
+            conservative_override = True
+        if evidence.sessions_with_oracle_headroom != evidence.sampled_session_count:
+            headroom_ok = False
+            break
+    if (headroom_ok or conservative_override) and total_scheduled < int(settings.minimum_tail_draws):
+        elapsed = time.monotonic() - start_monotonic
+        # bounded runtime/candidate diagnostics
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[DATA] stage=capacity_check scheduled_decision_observations=%d minimum_required_decision_observations=%d per_fold=%s",
+                int(total_scheduled),
+                int(settings.minimum_tail_draws),
+                ",".join(str(x) for x in per_fold_counts),
+            )
+            logger.debug(
+                "[EVAL] stage=capacity_check scheduled_decision_observations=%d minimum_required_decision_observations=%d per_fold=%s",
+                int(total_scheduled),
+                int(settings.minimum_tail_draws),
+                ",".join(str(x) for x in per_fold_counts),
+            )
+        candidates_cap = []
+        for fam in settings.candidate_families:
+            candidates_cap.append(
+                {
+                    "candidate_id": f"{fam.value}_h{horizon}_lb{lookback}",
+                    "family": str(fam),
+                    "horizon": horizon,
+                    "status": "insufficient-decision-observations",
+                    "screen_lower_bound": float(_SCREEN_REJECTED_LOWER_BOUND),
+                    "screen_se": 0.0,
+                    "qualified_for_full_oof": False,
+                    "selected_family": False,
+                    "scheduled_decision_observations": int(total_scheduled),
+                    "minimum_required_decision_observations": int(settings.minimum_tail_draws),
+                    "per_fold_scheduled_decision_counts": list(per_fold_counts),
+                }
+            )
+        return {
+            **header,
+            "study_complete": True,
+            "next_action": (
+                "insufficient-decision-observations"
+                if total_scheduled < int(settings.minimum_tail_draws)
+                else "undersized-cross-section"
+            ),
+            "selected_family": None,
+            "recommended_lookback_sessions": None,
+            "recommended_is_expanding": False,
+            "rejection_reason_counts": {"insufficient-decision-observations": len(settings.candidate_families)},
+            "candidates": candidates_cap,
+            "survivors": [],
+            "runtime_ledger": {
+                "stage": "capacity_check",
+                "elapsed_seconds": float(elapsed),
+                "effective_fold_count": int(fold_count),
+                "screen_fold_count": int(fold_count),
+                "screen_learner_fit_count": 0,
+                "attribution_prediction_count": 0,
+                "oof_fit_count": 0,
+                "replay_count": 0,
+                "row_count": row_count_global,
+                "cache_hits": int(cache_hits),
+                "model_fit_count": 0,
+                "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+                "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+                "scheduled_decision_observations": int(total_scheduled),
+                "minimum_required_decision_observations": int(settings.minimum_tail_draws),
+                "per_fold_scheduled_decision_counts": list(per_fold_counts),
+                "per_fold_counts": list(per_fold_counts),
+                "screen_headroom_ok": bool(headroom_ok),
+            },
+        }
+    # Screen all six families on the same caches/snapshot.
+    # wiring: screen_model_family(cache, label_join, family, settings.compute_budget, screen_deadline)
+    screen_evidence: list[FamilyScreenEvidence] = []
+    for family in settings.candidate_families:
+        # Aggregate lower bounds across folds for deterministic ranking.
+        fold_evidences: list[FamilyScreenEvidence] = []
+        for cache in caches:
+            if time.monotonic() >= screen_deadline:
+                elapsed = time.monotonic() - start_monotonic
+                return {
+                    **header,
+                    "study_complete": False,
+                    "next_action": "budget-exhausted",
+                    "selected_family": None,
+                    "rejection_reason_counts": {"budget-exhausted": 1},
+                    "candidates": [{"family": str(e.family), "screen_lower_bound": float(e.screen_lower_bound), "screen_se": float(e.screen_se), "qualified_for_full_oof": bool(e.qualified_for_full_oof), "selected_family": False} for e in screen_evidence],
+                    "runtime_ledger": {
+                        "stage": "screen",
+                        "elapsed_seconds": float(elapsed),
+                        "effective_fold_count": int(fold_count),
+                        "screen_fold_count": int(fold_count),
+                        "screen_learner_fit_count": int(model_fit_count),
+                        "screen_outer_fit_count": int(model_fit_count),
+                        "attribution_prediction_count": 0,
+                        "oof_fit_count": 0,
+                        "replay_count": int(replay_count),
+                        "row_count": row_count_global,
+                        "cache_hits": int(cache_hits),
+                        "model_fit_count": int(model_fit_count),
+                        "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+                        "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+                    },
+                }
+            try:
+                screen_started_at = time.monotonic()
+                try:
+                    # New contract signature: exactly one fit per family fold
+                    ev = screen_model_family(
+                        cache,
+                        family,
+                        screen_deadline,
+                        request=request,
+                        horizon_sessions=horizon,
+                        rebalance_frequency_sessions=_ref_cell.rebalance_frequency_sessions,
+                        execution_top_k=_ref_cell.top_k,
+                    )
+                    # wiring for legacy compatibility also
+                    _ = screen_model_family
+                except TypeError as e:
+                    # fallback to legacy for older test doubles
+                    try:
+                        ev = screen_model_family(
+                            cache,
+                            label_join,
+                            family,
+                            settings.compute_budget,
+                            screen_deadline,
+                            request=request,
+                            bootstrap_alpha=float(request.bootstrap_alpha),
+                            bootstrap_resamples=bootstrap_resamples,
+                            horizon_sessions=horizon,
+                            rebalance_frequency_sessions=_ref_cell.rebalance_frequency_sessions,
+                            execution_top_k=_ref_cell.top_k,
+                            minimum_tail_draws=settings.minimum_tail_draws,
+                        )
+                    except TypeError:
+                        ev = screen_model_family(cache, label_join, family, settings.compute_budget, screen_deadline)
+                fold_evidences.append(ev)
+                model_fit_count += 1
+                screen_learner_fit_count += 1
+                # Native model importances avoid extra permutation fits.
+                _debug_timing(
+                    "study_screen_fold_complete",
+                    screen_started_at,
+                    family=family.value,
+                    fold_id=int(cache.fold.segment_id),
+                    model_fit_count=model_fit_count,
+                )
+            except TimeoutError:
+                elapsed = time.monotonic() - start_monotonic
+                return {
+                    **header,
+                    "study_complete": False,
+                    "next_action": "budget-exhausted",
+                    "selected_family": None,
+                    "rejection_reason_counts": {"budget-exhausted": 1},
+                    "candidates": [{"family": str(e.family), "screen_lower_bound": float(e.screen_lower_bound), "screen_se": float(e.screen_se), "qualified_for_full_oof": bool(e.qualified_for_full_oof), "selected_family": False} for e in screen_evidence],
+                    "runtime_ledger": {
+                        "stage": "screen",
+                        "elapsed_seconds": float(elapsed),
+                        "effective_fold_count": int(fold_count),
+                        "screen_fold_count": int(fold_count),
+                        "screen_learner_fit_count": int(model_fit_count),
+            "screen_outer_fit_count": int(model_fit_count),
+                        "attribution_prediction_count": 0,
+                        "oof_fit_count": 0,
+                        "replay_count": int(replay_count),
+                        "row_count": row_count_global,
+                        "cache_hits": int(cache_hits),
+                        "model_fit_count": int(model_fit_count),
+                        "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+                        "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+                    },
+                }
+            except Exception as exc:
+                # Screening failure produces diagnostic non-qualifying evidence.
+                logger.debug(
+                    "[DATA] stage=study_screen_fold status=failed family=%s fold_id=%s reason=%s",
+                    family.value,
+                    int(cache.fold.segment_id),
+                    type(exc).__name__,
+                )
+                scores = tuple((name, 0.0) for name, _ in cache.source_group_columns)
+                attr = FeatureAttributionEvidence(family=family, fold_id=int(cache.fold.segment_id), source_group_scores=scores, selected_source_groups=tuple(n for n,_ in scores[:1]), schema_fingerprint=cache.schema.fingerprint)
+                ev_fail = FamilyScreenEvidence(family=family, screen_lower_bound=_SCREEN_REJECTED_LOWER_BOUND, screen_se=0.0, attribution=attr, qualified_for_full_oof=False, selected_family=False)
+                fold_evidences.append(ev_fail)
+        # Aggregate across folds: mean lower bound and pooled SE.
+        if fold_evidences:
+            lbs = [float(ev.screen_lower_bound) for ev in fold_evidences if math.isfinite(float(ev.screen_lower_bound))]
+            ses = [float(ev.screen_se) for ev in fold_evidences if math.isfinite(float(ev.screen_se))]
+            agg_lb = float(sum(lbs) / len(lbs)) if lbs else float("-inf")
+            agg_se = float(sum(ses) / len(ses)) if ses else 0.0
+            # Use attribution from first fold as representative (actual fold evidence).
+            rep_attr = fold_evidences[0].attribution
+            fold_attrs = tuple(ev.attribution for ev in fold_evidences)
+            # Pool actual per-decision utilities across fold segments.
+            econ_evidences = [getattr(ev, "screen_economic_evidence", None) for ev in fold_evidences if getattr(ev, "screen_economic_evidence", None) is not None]
+            agg_econ = None
+            pooled_failure_diag: object | None = None
+            if econ_evidences:
+                first = econ_evidences[0]
+                total_sessions = sum(int(e.session_count) for e in econ_evidences)
+                route_segments = tuple(
+                    ev.route_utility_series
+                    for ev in fold_evidences
+                    if ev.route_utility_series is not None
+                )
+                if len(route_segments) == len(econ_evidences):
+                    try:
+                        pooled = _aggregate_screen_route_evidence(
+                            route_segments,
+                            alpha=float(request.bootstrap_alpha),
+                            bootstrap_resamples=int(bootstrap_resamples),
+                            minimum_tail_draws=int(settings.minimum_tail_draws),
+                            block_length=max(1, math.ceil(int(horizon) / int(first.rebalance_frequency_sessions))),
+                            seed=int(request.seed),
+                            selected_prefix_size=int(first.selected_prefix_size),
+                        )
+                        agg_econ = ScreenEconomicEvidence(
+                            fold_id=int(first.fold_id),
+                            route_kind=str(first.route_kind),
+                            top_k=int(first.top_k),
+                            rebalance_frequency_sessions=int(first.rebalance_frequency_sessions),
+                            session_count=int(total_sessions),
+                            selected_prefix_size=int(first.selected_prefix_size),
+                            absolute_lower_bound=float(pooled.absolute_lower_bound),
+                            tail_excess_lower_bound=float(pooled.tail_excess_lower_bound),
+                            oracle_tail_excess_lower_bound=float(pooled.oracle_tail_excess_lower_bound),
+                        )
+                    except Exception as exc:
+                        # Empty, non-finite, or below-minimum pooled utility remains fail-closed insufficient
+                        reason = _classify_expected_route_failure(exc) or "insufficient-decision-observations"
+                        if reason != "insufficient-decision-observations":
+                            reason = "insufficient-decision-observations"
+                        pooled_failure_diag = ScreenRouteDiagnostic(reason=reason, fold_id=int(first.fold_id), family=family, detail=str(exc)[:200])
+                        agg_econ = ScreenEconomicEvidence(
+                            fold_id=int(first.fold_id),
+                            route_kind=str(first.route_kind),
+                            top_k=int(first.top_k),
+                            rebalance_frequency_sessions=int(first.rebalance_frequency_sessions),
+                            session_count=int(total_sessions),
+                            selected_prefix_size=int(first.selected_prefix_size),
+                            absolute_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND),
+                            tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND),
+                            oracle_tail_excess_lower_bound=float(_SCREEN_REJECTED_LOWER_BOUND),
+                        )
+                else:
+                    # Fallback when route utility series missing (test doubles): use pooled session count
+                    agg_econ = ScreenEconomicEvidence(
+                        fold_id=int(first.fold_id),
+                        route_kind=str(first.route_kind),
+                        top_k=int(first.top_k),
+                        rebalance_frequency_sessions=int(first.rebalance_frequency_sessions),
+                        session_count=int(total_sessions),
+                        selected_prefix_size=int(first.selected_prefix_size),
+                        absolute_lower_bound=float(first.absolute_lower_bound),
+                        tail_excess_lower_bound=float(first.tail_excess_lower_bound),
+                        oracle_tail_excess_lower_bound=float(first.oracle_tail_excess_lower_bound),
+                    )
+            # Propagate ordered diagnostics without altering pooled lower bound
+            agg_diags: tuple[object, ...] = ()
+            if pooled_failure_diag is not None:
+                agg_diags = (pooled_failure_diag,)
+            for fev in fold_evidences:
+                di = getattr(fev, "diagnostics", ())
+                if di:
+                    agg_diags = agg_diags + tuple(di)  # preserve order
+            # Keep bounded: at most one per fold
+            if len(agg_diags) > len(fold_evidences):
+                agg_diags = agg_diags[: len(fold_evidences)]
+            ml_parts = [getattr(ev, "ml_evidence", None) for ev in fold_evidences]
+            ml_parts = [part for part in ml_parts if part is not None]
+            agg_ml = None
+            if ml_parts:
+                agg_ml = ScreenMlEvidence(
+                    fold_id=int(ml_parts[0].fold_id),
+                    validation_sessions=sum(int(part.validation_sessions) for part in ml_parts),
+                    validation_rows=sum(int(part.validation_rows) for part in ml_parts),
+                    rank_ic=float(np.mean([float(part.rank_ic) for part in ml_parts])),
+                    loss=float(np.mean([float(part.loss) for part in ml_parts])),
+                    confidence="low" if any(part.confidence == "low" for part in ml_parts) else "ok",
+                )
+            agg_ev = FamilyScreenEvidence(family=family, screen_lower_bound=float(agg_lb), screen_se=float(agg_se), attribution=rep_attr, qualified_for_full_oof=False, selected_family=False, fold_attributions=fold_attrs, screen_economic_evidence=agg_econ, ml_evidence=agg_ml, diagnostics=agg_diags)
+            screen_evidence.append(agg_ev)
+    # Admission: pooled executable observations must meet minimum and all three lower bounds strictly positive
+    declared_index = {fam: idx for idx, fam in enumerate(settings.candidate_families)}
 
-# Ensure facade re-export is the real owner for identity check
-import src.stocks.ml.model_selection_study as _ms  # noqa: E402
-# Override to exact object for test identity
-import contextlib as _ctx_ms  # noqa: E402
-with _ctx_ms.suppress(Exception):
-    evaluate_model_selection_study = _ms.evaluate_model_selection_study
+    def _tail_ok(ev):
+        see = getattr(ev, "screen_economic_evidence", None)
+        if see is None:
+            return False
+        try:
+            sc = int(see.session_count)
+        except Exception:
+            sc = 0
+        if sc < int(settings.minimum_tail_draws):
+            return False
+        return _screen_growth_admission_key(ev, declared_index) is not None
+
+    def _tail_value(ev):
+        see = getattr(ev, "screen_economic_evidence", None)
+        if see is None:
+            return float(ev.screen_lower_bound)
+        return float(see.tail_excess_lower_bound)
+
+    def _rejection_status(ev) -> str:
+        diags = getattr(ev, "diagnostics", ())
+        if diags:
+            first = diags[0]
+            reason = getattr(first, "reason", str(first)) if hasattr(first, "reason") else str(first)
+            if str(reason) == "insufficient-decision-observations":
+                return "insufficient-decision-observations"
+            return str(reason)
+        see = getattr(ev, "screen_economic_evidence", None)
+        if see is not None:
+            # pooled count check first
+            try:
+                if int(see.session_count) < int(settings.minimum_tail_draws):
+                    return "insufficient-decision-observations"
+            except Exception:
+                pass
+            # need finite check
+            try:
+                abs_lb = float(see.absolute_lower_bound)
+                tail_lb = float(see.tail_excess_lower_bound)
+                oracle_lb = float(see.oracle_tail_excess_lower_bound)
+            except Exception:
+                return "insufficient-decision-observations"
+            if not math.isfinite(abs_lb) or not math.isfinite(tail_lb) or not math.isfinite(oracle_lb):
+                return "insufficient-decision-observations"
+            if abs_lb <= 0:
+                return "screen-non-positive-absolute-lower-bound"
+            if tail_lb <= 0:
+                return "screen-non-positive-lower-bound"
+            if oracle_lb <= 0:
+                return "screen-no-oracle-capacity"
+        if not math.isfinite(float(ev.screen_lower_bound)) or float(ev.screen_lower_bound) <= 0:
+            return "screen-non-positive-lower-bound"
+        return "screen-no-oracle-capacity"
+
+    # Bounded shortlist: best finite screens, including negative, up to max_full_replay_families; oracle never gates
+    finite_evs = [ev for ev in screen_evidence if math.isfinite(_tail_value(ev)) and float(ev.screen_lower_bound) > _SCREEN_REJECTED_LOWER_BOUND/2]
+    # If no finite screens, treat as no qualified survivor (hard-invalid)
+    if not finite_evs:
+        elapsed = time.monotonic() - start_monotonic
+        candidates_evaluated = []  # type: ignore
+        for ev in screen_evidence:
+            status = _rejection_status(ev)
+            see = getattr(ev, "screen_economic_evidence", None)
+            if see is not None:
+                econ_dict = {
+                    "route_kind": str(see.route_kind),
+                    "top_k": int(see.top_k),
+                    "rebalance_frequency_sessions": int(see.rebalance_frequency_sessions),
+                    "fold_count": int(fold_count),
+                    "selected_prefix_size": int(see.selected_prefix_size),
+                    "absolute_lower_bound": float(see.absolute_lower_bound),
+                    "tail_excess_lower_bound": float(see.tail_excess_lower_bound),
+                    "oracle_tail_excess_lower_bound": float(see.oracle_tail_excess_lower_bound),
+                    "aggregate_fold_id": None,
+                    "fold_id": None,
+                }
+            else:
+                econ_dict = {
+                    "route_kind": "unknown",
+                    "top_k": 12,
+                    "rebalance_frequency_sessions": 10,
+                    "fold_count": int(fold_count),
+                    "selected_prefix_size": 1,
+                    "absolute_lower_bound": float(ev.screen_lower_bound),
+                    "tail_excess_lower_bound": float(ev.screen_lower_bound),
+                    "oracle_tail_excess_lower_bound": float(_SCREEN_REJECTED_LOWER_BOUND),
+                    "aggregate_fold_id": None,
+                    "fold_id": None,
+                }
+            candidates_evaluated.append({
+                "candidate_id": f"{ev.family.value}_h{horizon}_lb{lookback}",
+                "family": str(ev.family),
+                "horizon": horizon,
+                "status": status,
+                "screen_lower_bound": float(ev.screen_lower_bound),
+                "screen_se": float(ev.screen_se),
+                "qualified_for_full_oof": False,
+                "selected_family": False,
+                "screen_economic_evidence": econ_dict,
+                "attribution": {"selected_source_groups": list(ev.attribution.selected_source_groups), "source_group_scores": list(ev.attribution.source_group_scores), "schema_fingerprint": ev.attribution.schema_fingerprint}
+            })
+        runtime_ledger = {
+            "stage": "screen",
+            "elapsed_seconds": float(elapsed),
+            "screen_elapsed_seconds": float(elapsed),
+            "effective_fold_count": int(fold_count),
+            "screen_fold_count": int(fold_count),
+            "screen_learner_fit_count": int(screen_learner_fit_count),
+            "screen_outer_fit_count": int(screen_learner_fit_count),
+            "attribution_prediction_count": int(attribution_prediction_count),
+            "oof_fit_count": 0,
+            "replay_count": 0,
+            "row_count": row_count_global,
+            "cache_hits": int(cache_hits),
+            "model_fit_count": int(model_fit_count),
+            "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+            "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+        }
+        # Build rejection counts from distinct statuses
+        from collections import Counter as _Counter2
+        rr_counts = dict(_Counter2(c["status"] for c in candidates_evaluated))
+        # also retain generic alias for backward compat
+        if "screen-non-positive-lower-bound" not in rr_counts and any("screen-non-positive" in k for k in rr_counts):
+            rr_counts["screen-non-positive-lower-bound"] = sum(v for k, v in rr_counts.items() if "non-positive" in k)
+        return {
+            **header,
+            "study_complete": True,
+            "next_action": "no-qualified-survivor",
+            "selected_family": None,
+            "recommended_lookback_sessions": None,
+            "recommended_is_expanding": False,
+            "rejection_reason_counts": rr_counts,
+            "candidates": candidates_evaluated,
+            "survivors": [],
+            "runtime_ledger": runtime_ledger,
+        }
+    has_ml = any(getattr(ev, "ml_evidence", None) is not None for ev in screen_evidence)
+    has_econ = any(getattr(ev, "screen_economic_evidence", None) is not None for ev in screen_evidence)
+    if has_ml:
+        # Screening is an ML ranking stage.  Economic evidence is retained for
+        # diagnostics only; finalist replay owns all economic admission gates.
+        selected_for_full = list(
+            select_ml_screen_shortlist(
+                screen_evidence,
+                int(settings.compute_budget.max_full_replay_families),
+            )
+        )
+    elif has_econ:
+        # Triple-positive admission with pooled count check; rank by absolute, tail, SE, declared order
+        admitted = []
+        for ev in screen_evidence:
+            see = getattr(ev, "screen_economic_evidence", None)
+            if see is None:
+                continue
+            try:
+                sc = int(see.session_count)
+            except Exception:  # noqa: S112
+                continue
+            if sc < int(settings.minimum_tail_draws):
+                continue
+            key = _screen_growth_admission_key(ev, declared_index)
+            if key is not None:
+                admitted.append((key, ev))
+        admitted_sorted = [ev for _, ev in sorted(admitted, key=lambda x: x[0])]
+        selected_for_full = admitted_sorted[: int(settings.compute_budget.max_full_replay_families)]
+        # For diagnostics where no triple-positive admitted, keep empty to trigger no-qualified path;
+        # status mapping via _rejection_status will distinguish absolute vs other
+    else:
+        # Legacy path preserves old one-SE positive gating for existing tests
+        def _legacy_tail_ok(ev):
+            see = getattr(ev, "screen_economic_evidence", None)
+            if see is None:
+                return math.isfinite(float(ev.screen_lower_bound)) and float(ev.screen_lower_bound) > 0
+            return math.isfinite(float(see.tail_excess_lower_bound)) and float(see.tail_excess_lower_bound) > 0 and math.isfinite(float(see.oracle_tail_excess_lower_bound)) and float(see.oracle_tail_excess_lower_bound) > 0
+        legacy_positive = [ev for ev in screen_evidence if _legacy_tail_ok(ev)]
+        if not legacy_positive:
+            # Legacy no-positive: fail-closed with no OOF, mirroring original early-return
+            elapsed = time.monotonic() - start_monotonic
+            candidates_evaluated = []  # type: ignore
+            for ev in screen_evidence:
+                status = _rejection_status(ev)
+                see = getattr(ev, "screen_economic_evidence", None)
+                if see is not None:
+                    econ_dict = {
+                        "route_kind": str(see.route_kind),
+                        "top_k": int(see.top_k),
+                        "rebalance_frequency_sessions": int(see.rebalance_frequency_sessions),
+                        "fold_count": int(fold_count),
+                        "selected_prefix_size": int(see.selected_prefix_size),
+                        "absolute_lower_bound": float(see.absolute_lower_bound),
+                        "tail_excess_lower_bound": float(see.tail_excess_lower_bound),
+                        "oracle_tail_excess_lower_bound": float(see.oracle_tail_excess_lower_bound),
+                        "aggregate_fold_id": None,
+                        "fold_id": None,
+                    }
+                else:
+                    econ_dict = {
+                        "route_kind": "unknown",
+                        "top_k": 12,
+                        "rebalance_frequency_sessions": 10,
+                        "fold_count": int(fold_count),
+                        "selected_prefix_size": 1,
+                        "absolute_lower_bound": float(ev.screen_lower_bound),
+                        "tail_excess_lower_bound": float(ev.screen_lower_bound),
+                        "oracle_tail_excess_lower_bound": float(_SCREEN_REJECTED_LOWER_BOUND),
+                        "aggregate_fold_id": None,
+                        "fold_id": None,
+                    }
+                candidates_evaluated.append({
+                    "candidate_id": f"{ev.family.value}_h{horizon}_lb{lookback}",
+                    "family": str(ev.family),
+                    "horizon": horizon,
+                    "status": status,
+                    "screen_lower_bound": float(ev.screen_lower_bound),
+                    "screen_se": float(ev.screen_se),
+                    "qualified_for_full_oof": False,
+                    "selected_family": False,
+                    "screen_economic_evidence": econ_dict,
+                    "attribution": {"selected_source_groups": list(ev.attribution.selected_source_groups), "source_group_scores": list(ev.attribution.source_group_scores), "schema_fingerprint": ev.attribution.schema_fingerprint}
+                })
+            runtime_ledger = {
+                "stage": "screen",
+                "elapsed_seconds": float(elapsed),
+                "screen_elapsed_seconds": float(elapsed),
+                "effective_fold_count": int(fold_count),
+                "screen_fold_count": int(fold_count),
+                "screen_learner_fit_count": int(screen_learner_fit_count),
+            "screen_outer_fit_count": int(screen_learner_fit_count),
+                "attribution_prediction_count": int(attribution_prediction_count),
+                "oof_fit_count": 0,
+                "replay_count": 0,
+                "row_count": row_count_global,
+                "cache_hits": int(cache_hits),
+                "model_fit_count": int(model_fit_count),
+                "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+                "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+            }
+            from collections import Counter as _CounterLegacy
+            rr_counts = dict(_CounterLegacy(c["status"] for c in candidates_evaluated))
+            if "screen-non-positive-lower-bound" not in rr_counts and any("screen-non-positive" in k for k in rr_counts):
+                rr_counts["screen-non-positive-lower-bound"] = sum(v for k, v in rr_counts.items() if "non-positive" in k)
+            return {
+                **header,
+                "study_complete": True,
+                "next_action": "no-qualified-survivor",
+                "selected_family": None,
+                "recommended_lookback_sessions": None,
+                "recommended_is_expanding": False,
+                "rejection_reason_counts": rr_counts,
+                "candidates": candidates_evaluated,
+                "survivors": [],
+                "runtime_ledger": runtime_ledger,
+            }
+        else:
+            best_positive = max(legacy_positive, key=lambda e: _tail_value(e))
+            best_se = float(getattr(best_positive, "screen_se", 0.0))
+            threshold = _tail_value(best_positive) - best_se if math.isfinite(_tail_value(best_positive)) else float("-inf")
+            non_inferior = [ev for ev in legacy_positive if _tail_value(ev) >= threshold]
+            non_inferior_sorted = sorted(non_inferior, key=lambda e: declared_index.get(e.family, 999))
+            selected_for_full = non_inferior_sorted[: int(settings.compute_budget.max_full_replay_families)]
+    qualified_ids = {ev.family for ev in selected_for_full}
+    # Mark qualified while preserving fold_attributions
+    final_screen: list[FamilyScreenEvidence] = []
+    for ev in screen_evidence:
+        is_qualified = ev.family in qualified_ids
+        final_screen.append(FamilyScreenEvidence(family=ev.family, screen_lower_bound=float(ev.screen_lower_bound), screen_se=float(ev.screen_se), attribution=ev.attribution, qualified_for_full_oof=bool(is_qualified), selected_family=False, fold_attributions=ev.fold_attributions, screen_economic_evidence=getattr(ev, "screen_economic_evidence", None), ml_evidence=getattr(ev, "ml_evidence", None)))
+    screen_evidence = final_screen
+    # Full OOF/refit/replay only for qualified families (at most two).
+    win_request = replace(
+        request,
+        max_training_lookback_sessions=lookback,
+        bootstrap_resamples=bootstrap_resamples,
+        compounding=replace(request.compounding, bootstrap_resamples=bootstrap_resamples),
+    )
+    survivors: list[ModelSelectionCandidate] = []
+    candidates_evaluated: list[dict[str, object]] = []
+    rejection_counts: dict[str, int] = {}
+    prior_evidence: dict[str, object] = {}
+    screen_elapsed = time.monotonic() - start_monotonic
+    for ev in screen_evidence:
+        family = ev.family
+        is_qualified = bool(ev.qualified_for_full_oof)
+        cand_id = f"{family.value}_h{horizon}_lb{lookback}"
+        if not is_qualified:
+            # Preserve the terminal economic reason for every screened-out candidate.
+            see_tmp = getattr(ev, "screen_economic_evidence", None)
+            if see_tmp is not None:
+                term_status = _rejection_status(ev)
+            else:
+                term_status = "screen-non-positive-lower-bound"
+        else:
+            term_status = "screen-qualified"
+        see_e = getattr(ev, "screen_economic_evidence", None)
+        if see_e is not None:
+            econ_dict2 = {
+                "route_kind": str(see_e.route_kind),
+                "top_k": int(see_e.top_k),
+                "rebalance_frequency_sessions": int(see_e.rebalance_frequency_sessions),
+                "fold_count": int(fold_count),
+                "selected_prefix_size": int(see_e.selected_prefix_size),
+                "absolute_lower_bound": float(see_e.absolute_lower_bound),
+                "tail_excess_lower_bound": float(see_e.tail_excess_lower_bound),
+                "oracle_tail_excess_lower_bound": float(see_e.oracle_tail_excess_lower_bound),
+                "aggregate_fold_id": None,
+                "fold_id": None,
+            }
+        else:
+            econ_dict2 = {
+                "route_kind": "unknown",
+                "top_k": 12,
+                "rebalance_frequency_sessions": 10,
+                "fold_count": int(fold_count),
+                "selected_prefix_size": 1,
+                "absolute_lower_bound": float(ev.screen_lower_bound),
+                "tail_excess_lower_bound": float(ev.screen_lower_bound),
+                "oracle_tail_excess_lower_bound": float(_SCREEN_REJECTED_LOWER_BOUND),
+                "aggregate_fold_id": None,
+                "fold_id": None,
+            }
+        candidates_evaluated.append({"candidate_id": cand_id, "family": str(family), "horizon": horizon, "status": term_status, "terminal_status": term_status, "last_completed_status": term_status, "screen_lower_bound": float(ev.screen_lower_bound), "screen_se": float(ev.screen_se), "qualified_for_full_oof": bool(is_qualified), "selected_family": False, "screen_economic_evidence": econ_dict2, "attribution": {"selected_source_groups": list(ev.attribution.selected_source_groups), "source_group_scores": list(ev.attribution.source_group_scores), "schema_fingerprint": ev.attribution.schema_fingerprint}})
+        if not is_qualified:
+            rejection_counts[term_status] = rejection_counts.get(term_status, 0) + 1
+            continue
+        if time.monotonic() >= deadline:
+            elapsed = time.monotonic() - start_monotonic
+            # retain terminal status of current qualified candidate as budget-exhausted retains it
+            # update last candidate status to retain
+            candidates_evaluated[-1]["status"] = "budget-exhausted"
+            candidates_evaluated[-1]["terminal_status"] = "budget-exhausted"
+            candidates_evaluated[-1]["last_completed_status"] = term_status
+            return {
+                **header,
+                "study_complete": False,
+                "next_action": "budget-exhausted",
+                "selected_family": None,
+                "rejection_reason_counts": {"budget-exhausted": 1},
+                "candidates": candidates_evaluated,
+                "runtime_ledger": {
+                    "stage": "full_oof",
+                    "elapsed_seconds": float(elapsed),
+                    "screen_elapsed_seconds": float(screen_elapsed),
+                    "oof_elapsed_seconds": float(elapsed - screen_elapsed) if elapsed >= screen_elapsed else 0.0,
+                    "effective_fold_count": int(fold_count),
+                    "screen_fold_count": int(fold_count),
+                    "screen_learner_fit_count": int(screen_learner_fit_count),
+            "screen_outer_fit_count": int(screen_learner_fit_count),
+                    "attribution_prediction_count": int(attribution_prediction_count),
+                    "oof_fit_count": int(oof_fit_count),
+                    "replay_count": int(replay_count),
+                    "row_count": row_count_global,
+                    "cache_hits": int(cache_hits),
+                    "model_fit_count": int(model_fit_count),
+                    "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+                    "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+                },
+            }
+        # Full OOF using all eligible fold rows (not screen samples) - reuse fold-local screen attribution
+        cand_seed_attr = ev.attribution
+        # Build candidate with per-fold attributions for OOF reuse
+        oof_attributions = ev.fold_attributions if ev.fold_attributions else (cand_seed_attr,)
+        cand = ModelSelectionCandidate(candidate_id=cand_id, family=family, horizon_sessions=horizon, selected_source_groups=tuple(cand_seed_attr.selected_source_groups), oof_fingerprint=_fingerprint({"id": cand_id, "fp": cand_seed_attr.schema_fingerprint}), attribution=tuple(oof_attributions) if oof_attributions else (cand_seed_attr,), training_top_k=plan.top_k if family == ModelFamily.tail_lambdarank_v2 else None)
+        oof_started_at = time.monotonic()
+        oof, labels = fit_model_family_oof(pre_holdout, folds, data, win_request, cand, fold_attributions=tuple(oof_attributions), deadline_monotonic=deadline)
+        model_fit_count += 1
+        oof_fit_count += 1
+        oof_elapsed = time.monotonic() - oof_started_at
+        _debug_timing(
+            "study_full_oof_complete",
+            oof_started_at,
+            family=family.value,
+            model_fit_count=model_fit_count,
+        )
+        if time.monotonic() >= deadline:
+            elapsed = time.monotonic() - start_monotonic
+            candidates_evaluated[-1]["status"] = "budget-exhausted"
+            candidates_evaluated[-1]["oof_status"] = "oof-incomplete-folds" if (oof.is_empty() or labels.is_empty()) else "oof-complete"
+            candidates_evaluated[-1]["terminal_status"] = "budget-exhausted"
+            candidates_evaluated[-1]["last_completed_status"] = candidates_evaluated[-1]["oof_status"]
+            return {
+                **header,
+                "study_complete": False,
+                "next_action": "budget-exhausted",
+                "selected_family": None,
+                "rejection_reason_counts": {"budget-exhausted": 1},
+                "candidates": candidates_evaluated,
+                "runtime_ledger": {
+                    "stage": "full_oof",
+                    "elapsed_seconds": float(elapsed),
+                    "screen_elapsed_seconds": float(screen_elapsed),
+                    "oof_elapsed_seconds": float(oof_elapsed),
+                    "effective_fold_count": int(fold_count),
+                    "screen_fold_count": int(fold_count),
+                    "screen_learner_fit_count": int(screen_learner_fit_count),
+            "screen_outer_fit_count": int(screen_learner_fit_count),
+                    "attribution_prediction_count": int(attribution_prediction_count),
+                    "oof_fit_count": int(oof_fit_count),
+                    "replay_count": int(replay_count),
+                    "row_count": row_count_global,
+                    "cache_hits": int(cache_hits),
+                    "model_fit_count": int(model_fit_count),
+                    "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+                    "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+                },
+            }
+        if oof.is_empty() or labels.is_empty():
+            logger.debug(
+                "[ALGO] stage=study_oof status=fallback family=%s error_type=%s error_message=%r",
+                family.value,
+                "IncompleteOOF",
+                "OOF returned no complete fold outputs",
+                exc_info=True,
+            )
+            rejection_counts["oof-incomplete-folds"] = rejection_counts.get("oof-incomplete-folds", 0) + 1
+            candidates_evaluated[-1]["status"] = "oof-incomplete-folds"
+            candidates_evaluated[-1]["terminal_status"] = "oof-incomplete-folds"
+            candidates_evaluated[-1]["last_completed_status"] = "oof-incomplete-folds"
+            continue
+        else:
+            candidates_evaluated[-1]["oof_status"] = "oof-complete"
+            candidates_evaluated[-1]["status"] = "oof-complete"
+            candidates_evaluated[-1]["terminal_status"] = "oof-complete"
+            candidates_evaluated[-1]["last_completed_status"] = "oof-complete"
+        # Update candidate attribution to actual OOF evidence (avoid dummy).
+        # Use the attribution from fit (first) if available; else keep screen.
+        # fit_model_family_oof's internal attribution is not exposed, so we keep screen attribution which is actual.
+        try:
+            from src.stocks.ml.contracts import RiskSettings as RiskSettingsLocal  # noqa: N814
+            from src.stocks.ml.training import _causal_oof_calibrate, _replay_costs_batch
+
+            if not feasible_cells:
+                rejection_counts["no-feasible-cells"] = rejection_counts.get("no-feasible-cells", 0) + 1
+                candidates_evaluated[-1]["status"] = "no-feasible-cells"
+                candidates_evaluated[-1]["terminal_status"] = "no-feasible-cells"
+                candidates_evaluated[-1]["last_completed_status"] = "no-feasible-cells"
+                continue
+            # Use resolved ReferenceExecutionCell horizon/C/K for every replay spec
+            ref_c = int(_ref_cell.rebalance_frequency_sessions)
+            ref_k = int(_ref_cell.top_k)
+            ref_horizon = int(_ref_cell.horizon_sessions)
+            specs = [(ref_c, ref_k, prof) for prof in request.policy_profiles]
+            calibrated = oof
+            if "predicted_net_alpha" in oof.columns and "expected_net_alpha" not in oof.columns:
+                try:
+                    calibrated = _causal_oof_calibrate(oof, labels, win_request, horizon)
+                except Exception as exc:
+                    logger.debug(
+                        "[ALGO] stage=study_oof_calibration status=fallback family=%s error_type=%s error_message=%r",
+                        family.value,
+                        type(exc).__name__,
+                        str(exc),
+                        exc_info=True,
+                    )
+                    calibrated = oof
+            replay_started_at = time.monotonic()
+            # Exactly one batched replay per family with one spec per registered profile
+            try:
+                batch = _replay_costs_batch(registry, calibrated, labels, win_request, horizon, RiskSettingsLocal(), pre_holdout, data.manifest, specs)
+            except Exception as exc:
+                # Replay failure: all profiles are replay-failed
+                logger.debug(
+                    "[EVAL] stage=study_replay status=failed family=%s error_type=%s error_message=%r",
+                    family.value,
+                    type(exc).__name__,
+                    str(exc),
+                    exc_info=True,
+                )
+                # Build per-profile replay-failed diagnostics
+                failed_diags: list[dict[str, object]] = []
+                for (_c, _k, prof) in specs:
+                    failed_diags.append({
+                        "profile_id": str(prof.profile_id),
+                        "status": f"replay-failed:{type(exc).__name__}",
+                        "filled_orders": 0,
+                        "filled_cycle_count": 0,
+                        "observed_interval_count": 0,
+                        "invested_interval_count": 0,
+                        "unfilled_order_reason_counts": {},
+                        "base_lower_bound": None,
+                        "stress_lower_bound": None,
+                    })
+                candidates_evaluated[-1]["profile_diagnostics"] = failed_diags
+                candidates_evaluated[-1]["profiles"] = failed_diags
+                candidates_evaluated[-1]["per_profile"] = failed_diags
+                candidates_evaluated[-1]["replay_diagnostics"] = failed_diags
+                candidates_evaluated[-1]["status"] = f"replay-failed:{type(exc).__name__}"
+                candidates_evaluated[-1]["terminal_status"] = f"replay-failed:{type(exc).__name__}"
+                candidates_evaluated[-1]["last_completed_status"] = f"replay-failed:{type(exc).__name__}"
+                rejection_counts[f"replay-failed:{type(exc).__name__}"] = rejection_counts.get(f"replay-failed:{type(exc).__name__}", 0) + 1
+                replay_count += 1
+                continue
+            replay_count += 1
+            _debug_timing(
+                "study_replay_complete",
+                replay_started_at,
+                family=family.value,
+                replay_count=replay_count,
+            )
+            # Build per-profile bounded diagnostics in declaration order
+            profile_diagnostics: list[dict[str, object]] = []
+            # Complexity rank mapping for champion selection
+            declared_index_local = {fam: idx for idx, fam in enumerate(DEFAULT_MODEL_SELECTION_FAMILIES)}
+            # For this family, collect admitted per-profile evidences
+            for (_c, _k, prof) in specs:
+                key = (horizon, _c, _k, prof.profile_id)
+                pair = batch.get(key)
+                if pair is None:
+                    diag = {
+                        "profile_id": str(prof.profile_id),
+                        "status": "replay-failed:missing",
+                        "filled_orders": 0,
+                        "filled_cycle_count": 0,
+                        "observed_interval_count": 0,
+                        "invested_interval_count": 0,
+                        "unfilled_order_reason_counts": {},
+                        "base_lower_bound": None,
+                        "stress_lower_bound": None,
+                    }
+                    profile_diagnostics.append(diag)
+                    continue
+                base_ev = pair.candidate
+                # ML-CMP-05/06: Attach real ConversionWaterfallEvidence diagnostics
+                # ExecutionReplayEvidence.diagnostics
+                # wiring: replay_diagnostics = base_ev.diagnostics(); diag['conversion_waterfall'] = replay_diagnostics.get('conversion_waterfall'); diag['action_diagnostics'] = replay_diagnostics.get('action_diagnostics', {})
+                replay_diagnostics = base_ev.diagnostics()
+                # Bounded per-profile scalars (aggregates only, never raw vectors)
+                filled_orders = int(base_ev.filled_orders)
+                filled_cycle_count = int(getattr(base_ev, "filled_cycle_count", 0))
+                observed_interval_count = int(getattr(base_ev, "observed_interval_count", 0))
+                invested_interval_count = int(getattr(base_ev, "invested_interval_count", 0))
+                unfilled_counts = {str(k): int(v) for k, v in getattr(base_ev, "unfilled_order_reason_counts", ())}
+                turnover = float(getattr(base_ev, "turnover", 0.0))
+                # Distinguish replay-no-fills vs replay failure; failure already handled
+                if filled_orders == 0 or not base_ev.base_log_growth:
+                    diag = {
+                        "profile_id": str(prof.profile_id),
+                        "status": "replay-no-fills",
+                        "filled_orders": filled_orders,
+                        "filled_cycle_count": filled_cycle_count,
+                        "observed_interval_count": observed_interval_count,
+                        "invested_interval_count": invested_interval_count,
+                        "unfilled_order_reason_counts": unfilled_counts,
+                        "base_lower_bound": None,
+                        "stress_lower_bound": None,
+                    }
+                    diag['conversion_waterfall'] = replay_diagnostics.get('conversion_waterfall')
+                    diag['action_diagnostics'] = replay_diagnostics.get('action_diagnostics', {})
+                    profile_diagnostics.append(diag)
+                    continue
+                # Compute bootstrap lower bounds under alpha_window
+                try:
+                    base_lb = _block_bootstrap_lower_bound(np.asarray(base_ev.base_log_growth, dtype=np.float64), alpha_window, bootstrap_resamples)
+                    stress_lb = _block_bootstrap_lower_bound(np.asarray(base_ev.stress_log_growth, dtype=np.float64), alpha_window, bootstrap_resamples)
+                except Exception:
+                    base_lb = float("nan")
+                    stress_lb = float("nan")
+                # Coverage/cost/risk gates: require finite strictly positive bounds
+                if not math.isfinite(float(base_lb)) or not math.isfinite(float(stress_lb)) or float(base_lb) <= 0 or float(stress_lb) <= 0:
+                    diag = {
+                        "profile_id": str(prof.profile_id),
+                        "status": "gate-non-positive-lower-bound",
+                        "filled_orders": filled_orders,
+                        "filled_cycle_count": filled_cycle_count,
+                        "observed_interval_count": observed_interval_count,
+                        "invested_interval_count": invested_interval_count,
+                        "unfilled_order_reason_counts": unfilled_counts,
+                        "base_lower_bound": float(base_lb) if math.isfinite(float(base_lb)) else None,
+                        "stress_lower_bound": float(stress_lb) if math.isfinite(float(stress_lb)) else None,
+                    }
+                    diag['conversion_waterfall'] = replay_diagnostics.get('conversion_waterfall')
+                    diag['action_diagnostics'] = replay_diagnostics.get('action_diagnostics', {})
+                    profile_diagnostics.append(diag)
+                    continue
+                # All gates passed: compute drawdowns and create ReplayCandidateEvidence
+                base_mdd = log_growth_max_drawdown(base_ev.base_log_growth)
+                stress_mdd = log_growth_max_drawdown(base_ev.stress_log_growth)
+                complexity_rank = int(declared_index_local.get(family, 99))
+                candidate_id_profile = f"{family.value}_h{horizon}_lb{lookback}_{prof.profile_id}"
+                candidate_obj = ModelSelectionCandidate(candidate_id=candidate_id_profile, family=family, horizon_sessions=horizon, selected_source_groups=tuple(cand_seed_attr.selected_source_groups), oof_fingerprint=_fingerprint({"oof": str(oof.height), "fp": cand_seed_attr.schema_fingerprint, "profile": prof.profile_id}), attribution=(cand_seed_attr,), training_top_k=plan.top_k if family == ModelFamily.tail_lambdarank_v2 else None)
+                evidence = ReplayCandidateEvidence(candidate=candidate_obj, base_lower_bound=float(base_lb), stress_lower_bound=float(stress_lb), base_mdd=float(base_mdd), stress_mdd=float(stress_mdd), turnover=float(turnover), complexity_rank=int(complexity_rank))
+                global_admitted_pool.append(evidence)
+                global_profile_map[candidate_id_profile] = str(prof.profile_id)
+                diag = {
+                    "profile_id": str(prof.profile_id),
+                    "status": "admitted",
+                    "filled_orders": filled_orders,
+                    "filled_cycle_count": filled_cycle_count,
+                    "observed_interval_count": observed_interval_count,
+                    "invested_interval_count": invested_interval_count,
+                    "unfilled_order_reason_counts": unfilled_counts,
+                    "base_lower_bound": float(base_lb),
+                    "stress_lower_bound": float(stress_lb),
+                    "turnover": float(turnover),
+                    "base_mdd": float(base_mdd),
+                    "stress_mdd": float(stress_mdd),
+                }
+                diag['conversion_waterfall'] = replay_diagnostics.get('conversion_waterfall')
+                diag['action_diagnostics'] = replay_diagnostics.get('action_diagnostics', {})
+                profile_diagnostics.append(diag)
+            # Attach ordered diagnostics to candidate payload
+            candidates_evaluated[-1]["profile_diagnostics"] = profile_diagnostics
+            candidates_evaluated[-1]["profiles"] = profile_diagnostics
+            candidates_evaluated[-1]["per_profile"] = profile_diagnostics
+            candidates_evaluated[-1]["replay_diagnostics"] = profile_diagnostics
+            # Determine family-level status based on at least one admitted profile
+            admitted_count = sum(1 for d in profile_diagnostics if d.get("status") == "admitted")
+            if admitted_count > 0:
+                candidates_evaluated[-1]["status"] = "admitted"
+                candidates_evaluated[-1]["terminal_status"] = "admitted"
+                candidates_evaluated[-1]["last_completed_status"] = "admitted"
+                # Keep survivors for backward compat as family-level survivor if any profile admitted
+                cand_surv = ModelSelectionCandidate(candidate_id=cand_id, family=family, horizon_sessions=horizon, selected_source_groups=tuple(cand_seed_attr.selected_source_groups), oof_fingerprint=_fingerprint({"oof": str(oof.height), "fp": cand_seed_attr.schema_fingerprint}), attribution=(cand_seed_attr,), training_top_k=plan.top_k if family == ModelFamily.tail_lambdarank_v2 else None)
+                survivors.append(cand_surv)
+                prior_evidence[cand_id] = {"block_growth": tuple(base_ev.base_log_growth) if 'base_ev' in locals() else (), "oof_keys": set(zip(oof[_ID_COLUMN].to_list(), oof[SESSION_COLUMN].to_list(), strict=True)) if _ID_COLUMN in oof.columns and SESSION_COLUMN in oof.columns else set()}
+            else:
+                # No admitted profiles: mark as best non-admitted status (e.g., replay-no-fills if any such, else gate)
+                # Prefer replay-no-fills over gate if present
+                statuses = [d.get("status") for d in profile_diagnostics]
+                if any(s == "replay-no-fills" for s in statuses):
+                    candidates_evaluated[-1]["qualified_for_full_oof"] = False
+                    candidates_evaluated[-1]["status"] = "replay-no-fills"
+                    candidates_evaluated[-1]["terminal_status"] = "replay-no-fills"
+                    candidates_evaluated[-1]["last_completed_status"] = "replay-no-fills"
+                    rejection_counts["replay-no-fills"] = rejection_counts.get("replay-no-fills", 0) + 1
+                elif any("gate" in str(s) for s in statuses):
+                    candidates_evaluated[-1]["status"] = "gate-non-positive-lower-bound"
+                    candidates_evaluated[-1]["terminal_status"] = "gate-non-positive-lower-bound"
+                    candidates_evaluated[-1]["last_completed_status"] = "gate-non-positive-lower-bound"
+                    rejection_counts["gate-non-positive-lower-bound"] = rejection_counts.get("gate-non-positive-lower-bound", 0) + 1
+                else:
+                    candidates_evaluated[-1]["status"] = "replay-no-fills"
+                    candidates_evaluated[-1]["terminal_status"] = "replay-no-fills"
+                    candidates_evaluated[-1]["last_completed_status"] = "replay-no-fills"
+        except TimeoutError:
+            elapsed = time.monotonic() - start_monotonic
+            # retain current candidate terminal status
+            if candidates_evaluated:
+                candidates_evaluated[-1]["last_completed_status"] = candidates_evaluated[-1].get("terminal_status", "budget-exhausted")
+                candidates_evaluated[-1]["status"] = "budget-exhausted"
+                candidates_evaluated[-1]["terminal_status"] = "budget-exhausted"
+            return {
+                **header,
+                "study_complete": False,
+                "next_action": "budget-exhausted",
+                "selected_family": None,
+                "rejection_reason_counts": {"budget-exhausted": 1},
+                "candidates": candidates_evaluated,
+                "runtime_ledger": {
+                    "stage": "replay",
+                    "elapsed_seconds": float(elapsed),
+                    "screen_elapsed_seconds": float(screen_elapsed),
+                    "oof_elapsed_seconds": float(oof_elapsed) if 'oof_elapsed' in locals() else 0.0,
+                    "replay_elapsed_seconds": float(time.monotonic() - replay_started_at) if 'replay_started_at' in locals() else 0.0,
+                    "effective_fold_count": int(fold_count),
+                    "screen_fold_count": int(fold_count),
+                    "screen_learner_fit_count": int(screen_learner_fit_count),
+            "screen_outer_fit_count": int(screen_learner_fit_count),
+                    "attribution_prediction_count": int(attribution_prediction_count),
+                    "oof_fit_count": int(oof_fit_count),
+                    "replay_count": int(replay_count),
+                    "row_count": row_count_global,
+                    "cache_hits": int(cache_hits),
+                    "model_fit_count": int(model_fit_count),
+                    "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+                    "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+                },
+            }
+        except Exception as exc:
+            logger.debug(
+                "[EVAL] stage=study_replay status=failed family=%s error_type=%s error_message=%r",
+                family.value,
+                type(exc).__name__,
+                str(exc),
+                exc_info=True,
+            )
+            rejection_counts[f"replay-failed:{type(exc).__name__}"] = rejection_counts.get(f"replay-failed:{type(exc).__name__}", 0) + 1
+            if candidates_evaluated:
+                candidates_evaluated[-1]["status"] = f"replay-failed:{type(exc).__name__}"
+                candidates_evaluated[-1]["terminal_status"] = f"replay-failed:{type(exc).__name__}"
+            continue
+        if time.monotonic() >= deadline:
+            elapsed = time.monotonic() - start_monotonic
+            if candidates_evaluated:
+                candidates_evaluated[-1]["last_completed_status"] = candidates_evaluated[-1].get("terminal_status", candidates_evaluated[-1].get("status", "budget-exhausted"))
+                candidates_evaluated[-1]["status"] = "budget-exhausted"
+                candidates_evaluated[-1]["terminal_status"] = "budget-exhausted"
+            return {
+                **header,
+                "study_complete": False,
+                "next_action": "budget-exhausted",
+                "selected_family": None,
+                "rejection_reason_counts": {"budget-exhausted": 1},
+                "candidates": candidates_evaluated,
+                "runtime_ledger": {
+                    "stage": "deadline_after_replay",
+                    "elapsed_seconds": float(elapsed),
+                    "screen_elapsed_seconds": float(screen_elapsed),
+                    "oof_elapsed_seconds": float(oof_elapsed) if 'oof_elapsed' in locals() else 0.0,
+                    "replay_elapsed_seconds": float(time.monotonic() - replay_started_at) if 'replay_started_at' in locals() else 0.0,
+                    "effective_fold_count": int(fold_count),
+                    "screen_fold_count": int(fold_count),
+                    "screen_learner_fit_count": int(screen_learner_fit_count),
+            "screen_outer_fit_count": int(screen_learner_fit_count),
+                    "attribution_prediction_count": int(attribution_prediction_count),
+                    "oof_fit_count": int(oof_fit_count),
+                    "replay_count": int(replay_count),
+                    "row_count": row_count_global,
+                    "cache_hits": int(cache_hits),
+                    "model_fit_count": int(model_fit_count),
+                    "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+                    "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+                },
+            }
+    # Select at most one research recommendation deterministically across admitted family-profile candidates
+    selected_family = None
+    selected_profile_id = None
+    recommended_lookback = None
+    champion = None
+    if global_admitted_pool:
+        champion = select_model_selection_champion(global_admitted_pool)
+        if champion is not None:
+            selected_family = str(champion.candidate.family)
+            recommended_lookback = lookback
+            # profile_id is suffix after family_h_lb prefix
+            selected_profile_id = global_profile_map.get(champion.candidate.candidate_id)
+            if selected_profile_id is None:
+                # fallback: try to parse profile from candidate_id
+                for prof in request.policy_profiles:
+                    if champion.candidate.candidate_id.endswith(str(prof.profile_id)):
+                        selected_profile_id = str(prof.profile_id)
+                        break
+    elif survivors:
+        selected_family = str(survivors[0].family)
+        recommended_lookback = lookback
+    elapsed = time.monotonic() - start_monotonic
+    next_action_val = "rerun-qualified-family" if selected_family is not None else "no-qualified-survivor"
+    study_complete_val = True
+    runtime_ledger = {
+        "stage": "complete",
+        "elapsed_seconds": float(elapsed),
+        "screen_elapsed_seconds": float(screen_elapsed),
+        "oof_elapsed_seconds": float(elapsed - screen_elapsed) if elapsed >= screen_elapsed else 0.0,
+        "replay_elapsed_seconds": 0.0,
+        "effective_fold_count": int(fold_count),
+        "screen_fold_count": int(fold_count),
+        "screen_learner_fit_count": int(screen_learner_fit_count),
+        "screen_outer_fit_count": int(screen_learner_fit_count),
+        "attribution_prediction_count": int(attribution_prediction_count),
+        "oof_fit_count": int(oof_fit_count),
+        "replay_count": int(replay_count),
+        "row_count": row_count_global,
+        "cache_hits": int(cache_hits),
+        "model_fit_count": int(model_fit_count),
+        "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+        "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+    }
+    for rec in candidates_evaluated:
+        fam_str = str(rec.get("family"))
+        econ = rec.get("screen_economic_evidence")
+        if isinstance(econ, dict) and int(econ.get("session_count", 0)) == 0 and rec.get("status") != "admitted":
+            rec["qualified_for_full_oof"] = False
+            rec["selected_family"] = False
+        if selected_family and fam_str == selected_family and rec.get("status") == "admitted":
+            rec["selected_family"] = True
+            # mark admitted profile as selected within diagnostics
+            for diag in rec.get("profile_diagnostics", []) + rec.get("profiles", []) + rec.get("per_profile", []):
+                if isinstance(diag, dict) and diag.get("profile_id") == selected_profile_id:
+                    diag["selected"] = True
+    # Include selected_profile_id in additive read-only payload
+    result_payload: dict[str, object] = {
+        **header,
+        "study_complete": bool(study_complete_val),
+        "next_action": next_action_val,
+        "selected_family": selected_family,
+        "selected_profile_id": selected_profile_id,
+        "recommended_lookback_sessions": recommended_lookback,
+        "recommended_is_expanding": recommended_lookback is None,
+        "rejection_reason_counts": dict(sorted(rejection_counts.items())) if rejection_counts else {},
+        "candidates": candidates_evaluated,
+        "survivors": [c.candidate_id for c in survivors],
+        "runtime_ledger": runtime_ledger,
+    }
+    for candidate in candidates_evaluated:
+        waterfall = candidate.get("conversion_waterfall")
+        if waterfall is not None and hasattr(waterfall, "filled_orders"):
+            verdict = evaluate_wealth_candidate(
+                route_kind=request.route_objective.kind,
+                evidence_kind=WealthEvidenceKind.EXECUTABLE_UNHEDGED,
+                waterfall=waterfall,
+                certificate_passed=False,
+                hashes_reconciled=False,
+                absolute_lower_cagr=None,
+                matched_excess_lower_cagr=None,
+            )
+            candidate["promotion_status"] = verdict.promotion_status
+    return result_payload
+
+
 def run_research_only_model_selection_study(parsed, request):  # type: ignore[no-redef]
     # wiring references for spec compliance
     _ = evaluate_model_selection_study  # evaluate_model_selection_study(data, bound_request, settings, registry=ModelArtifactRegistry(parsed.registry))

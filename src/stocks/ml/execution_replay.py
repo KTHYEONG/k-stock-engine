@@ -852,9 +852,16 @@ def _execute_candidate_segment(
             score_frame_fingerprint="0" * 64,
             scored_rows=scored_rows,
             finite_score_rows=finite_score_rows,
-            calibrated_rows=int(np.isfinite(expected).sum()),
-            positive_mean_rows=int(np.sum(np.isfinite(expected) & (expected > 0.0))),
-            positive_lower_bound_rows=int(np.sum(np.isfinite(lower) & (lower > 0.0))),
+            calibrated_rows=min(scored_rows, int(np.isfinite(expected).sum())),
+            positive_mean_rows=min(
+                min(scored_rows, int(np.isfinite(expected).sum())),
+                int(np.sum(np.isfinite(expected) & (expected > 0.0))),
+            ),
+            positive_lower_bound_rows=min(
+                min(scored_rows, int(np.isfinite(expected).sum())),
+                int(np.sum(np.isfinite(expected) & (expected > 0.0))),
+                int(np.sum(np.isfinite(lower) & (lower > 0.0))),
+            ),
             eligible_rows=0,
             target_positions=0,
             scheduled_decisions=len(decisions),
@@ -864,7 +871,12 @@ def _execute_candidate_segment(
             filled_orders=int(result.filled_orders),
             observed_intervals=len(segment_growth),
             invested_intervals=int(segment_invested),
-            decision_drop_reasons=(("allocation_evidence_unavailable", len(decisions)),),
+            row_drop_reasons=(
+                (("market_ineligible", scored_rows),)
+                if scored_rows
+                else ()
+            ),
+            decision_drop_reasons=(("no_allocation_ready", len(decisions)),),
         )
     return SegmentExecutionSummary(
         segment_id=int(segment_id),

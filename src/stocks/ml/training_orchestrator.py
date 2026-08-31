@@ -43,8 +43,8 @@ from src.core.costs import default_base_schedule, default_stress_schedule
 from src.core.datasets import DatasetManifest
 from src.core.instruments import AssetKind
 from src.core.portfolio import PortfolioSnapshot
-from src.stocks.data.ml_integrity import validate_ml_snapshot  # noqa: F401
-from src.stocks.data.quality import KRXSessionCalendar  # noqa: F401
+from src.stocks.data.ml_integrity import validate_ml_snapshot
+from src.stocks.data.quality import KRXSessionCalendar
 from src.stocks.domain.execution_policy import SCHEDULED_OPEN_V1
 from src.stocks.ml.capital_plan import build_small_capital_route_plan
 
@@ -72,8 +72,8 @@ from src.stocks.ml.contracts import (
     SmallCapitalPlanSettings,
     policy_portfolio_fingerprint,
 )
-from src.stocks.ml.data import assess_snapshot_outcome_readiness  # noqa: F401
-from src.stocks.ml.discovery import discover_horizons  # noqa: F401
+from src.stocks.ml.data import assess_snapshot_outcome_readiness
+from src.stocks.ml.discovery import discover_horizons
 from src.stocks.ml.execution_replay import (
     ExecutionEquivalentReplayRequest,
     ExecutionReplayContext,
@@ -90,7 +90,7 @@ from src.stocks.ml.features import (
     apply_model_feature_schema,
     fit_model_feature_schema,
     materialize_model_feature_sources,
-    stock_net_alpha_v1_contract_book,  # noqa: F401
+    stock_net_alpha_v1_contract_book,
     stock_net_alpha_v1_roles,
 )
 from src.stocks.ml.fitting import (
@@ -202,18 +202,18 @@ from src.stocks.ml.telemetry import (
 )
 from src.stocks.ml.telemetry import peak_rss_mib as _peak_rss_mib
 from src.stocks.ml.telemetry import (
-    set_active_telemetry as _set_active_telemetry,  # noqa: F401
+    set_active_telemetry as _set_active_telemetry,
 )
 
 __all__ = ["TrainingTelemetry", "train_net_alpha_model"]
 
-from src.stocks.observability.contracts import (  # noqa: F401
+from src.stocks.observability.contracts import (
     DiagnosticCategory,
     DiagnosticStage,
     DiagnosticStatus,
     emit_checkpoint,
 )
-from src.stocks.observability.contracts import (  # noqa: F401
+from src.stocks.observability.contracts import (
     RunDiagnostics as _RunDiagnostics,
 )
 from src.stocks.research.artifacts import ModelArtifactRegistry
@@ -448,15 +448,309 @@ class TrainingOrchestrator:
         return manifest
 
 
-from src.stocks.ml.training_orchestrator import train_net_alpha_model as _train_impl  # noqa: E402,I001,F401  # real owner
+def train_net_alpha_model(
+    data: NetAlphaResearchData,
+    registry: ModelArtifactRegistry,
+    request: NetAlphaTrainingRequest,
+    *,
+    diagnostics: _RunDiagnostics | None = None,
+    progress: Callable[[str, Mapping[str, object] | None], None] | None = None,
+) -> ModelManifest:
+    """Train the net-alpha mainline and publish a champion or complete ``NO_TRADE``.
 
-def train_net_alpha_model(data, registry, request, *, diagnostics=None, progress=None):  # type: ignore[no-untyped-def]
-    return _train_impl(data, registry, request, diagnostics=diagnostics, progress=progress)
+    Wiring: validate_account_capital_coherence - validate_account_capital_coherence(data, request) before horizon discovery
 
-import src.stocks.ml.training_orchestrator as _to  # noqa: E402,I001
-import contextlib as _ctx_train  # noqa: E402
-with _ctx_train.suppress(Exception):
-    train_net_alpha_model = _to.train_net_alpha_model
+    Args:
+        data: the composed net-alpha research data (feature frame plus
+            per-horizon label frames).
+        registry: the immutable artifact registry.
+        request: the net-alpha training request.
+        diagnostics: optional run diagnostics sink for checkpoint emission.
+        progress: optional scalar-only progress callback (stage name plus a
+            bounded payload); callback failures never alter results.
+
+    Returns:
+        The published ``ModelManifest`` with ``model_type`` in
+        ``net_alpha_elastic_net``, ``net_alpha_lightgbm_l1``, or ``no_trade``.
+
+    Raises:
+        ValueError: when the snapshot is not a canonical net-alpha snapshot.
+    """
+    run_id = request.artifact_id
+    emit_checkpoint(
+        diagnostics,
+        run_id=run_id,
+        category=DiagnosticCategory.DATA,
+        component="ml.training",
+        stage=DiagnosticStage.INPUT,
+        event="training_input",
+        status=DiagnosticStatus.START,
+        payload={"feature_set": data.manifest.feature_set},
+    )
+    if data.manifest.feature_set != CANONICAL_FEATURE_SET:
+        raise ValueError(
+            f"train_net_alpha_model requires a net-alpha snapshot "
+            f"(feature_set={CANONICAL_FEATURE_SET!r}); got "
+            f"{data.manifest.feature_set!r}. Materialize a net-alpha snapshot "
+            "via `python -m src.stocks.cli.build_research --pipeline net-alpha`."
+        )
+
+    telemetry = TrainingTelemetry()
+    # Wire discover_horizons for diagnostic checkpoint emission
+    discovery_context = type("DiscoveryContext", (), {
+        "pre_holdout": None, "folds": None, "data": data,
+        "request": request, "learner_columns": (), "oof_cache": None,
+        "registry": registry,
+    })()
+    emit_checkpoint(
+        diagnostics,
+        run_id=run_id,
+        category=DiagnosticCategory.DATA,
+        component="ml.training",
+        stage=DiagnosticStage.DATA,
+        event="training_data_ready",
+        status=DiagnosticStatus.PASS,
+        payload={
+            "rows": data.feature_frame.height,
+            "columns": len(data.feature_frame.columns),
+            "candidate_horizons": len(request.candidate_horizon_sessions),
+        },
+    )
+    emit_checkpoint(
+        diagnostics,
+        run_id=run_id,
+        category=DiagnosticCategory.ALGO,
+        component="ml.training",
+        stage=DiagnosticStage.SPLIT_FIT,
+        event="horizon_discovery",
+        status=DiagnosticStatus.START,
+    )
+    discover_horizons(discovery_context, diagnostics)  # noqa: F841
+    emit_checkpoint(
+        diagnostics,
+        run_id=run_id,
+        category=DiagnosticCategory.ALGO,
+        component="ml.training",
+        stage=DiagnosticStage.CALIBRATION,
+        event="calibration_ready",
+        status=DiagnosticStatus.PASS,
+    )
+    frame = data.feature_frame
+    schema_hash = data.manifest.schema_hash or "net-alpha-v1"
+    universe_policy_hash = data.manifest.universe_policy_hash or "net-alpha-v1"
+    decision_time = _decision_time(frame)
+    calendar = KRXSessionCalendar(
+        version="derived-net-alpha",
+        sessions=tuple(sorted(set(frame["session"].to_list()))),
+        generated_time=decision_time,
+    )
+    audit = validate_ml_snapshot(
+        frame,
+        stock_net_alpha_v1_contract_book(available_columns=frame.columns),
+        decision_time,
+        calendar,
+    )
+    telemetry.phase(
+        "integrity_audit",
+        {
+            "passed": audit.passed,
+            "audit_reason_count": sum(1 for check in audit.checks if not check.passed),
+            "row_count": int(audit.row_count),
+        },
+    )
+    if not audit.passed:
+        return _publish_no_trade(
+            registry, request, frame, "integrity-audit-failed",
+            details=audit.to_json(),
+            schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+            telemetry=telemetry,
+        )
+
+    if request.enforce_snapshot_outcome_readiness:
+        readiness = assess_snapshot_outcome_readiness(
+            data, request.candidate_horizon_sessions
+        )
+        telemetry.phase(
+            "snapshot_outcome_readiness",
+            {
+                "passed": readiness.passed,
+                "horizon_count": len(readiness.horizon_results),
+                "unresolved_horizons": [
+                    result.horizon_sessions
+                    for result in readiness.horizon_results
+                    if not result.passed
+                ],
+            },
+        )
+        if not readiness.passed:
+            reason = readiness.reason or "snapshot-outcome-readiness-failed"
+            return _publish_no_trade(
+                registry, request, frame, reason,
+                details={"snapshot_outcome_readiness": readiness.to_json()},
+                schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+                telemetry=telemetry,
+            )
+    else:
+        telemetry.phase("snapshot_outcome_readiness", {"passed": True, "skipped": True})
+
+    raw_panel = _index_sessions(frame)
+    pre_holdout_raw, holdout_raw, holdout_reason = _locked_holdout(raw_panel, request)
+    telemetry.phase(
+        "holdout_lock",
+        {
+            "pre_holdout_rows": int(pre_holdout_raw.height),
+            "pre_holdout_sessions": (
+                int(pre_holdout_raw["session"].n_unique())
+                if not pre_holdout_raw.is_empty()
+                else 0
+            ),
+            "holdout_rows": int(holdout_raw.height),
+            "holdout_sessions": (
+                int(holdout_raw["session"].n_unique())
+                if not holdout_raw.is_empty()
+                else 0
+            ),
+            "reason": holdout_reason,
+        },
+    )
+    if holdout_reason:
+        return _publish_no_trade(
+            registry, request, frame, holdout_reason,
+            schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+            telemetry=telemetry,
+        )
+
+    roles = dict(stock_net_alpha_v1_roles(available_columns=frame.columns))
+    pre_holdout_raw = materialize_model_feature_sources(pre_holdout_raw, list(roles))
+    holdout_raw = materialize_model_feature_sources(holdout_raw, list(roles))
+    schema = fit_model_feature_schema(pre_holdout_raw, roles)
+    pre_holdout = apply_model_feature_schema(pre_holdout_raw, schema)
+    holdout = apply_model_feature_schema(holdout_raw, schema)
+    learner_columns = schema.learner_columns
+    telemetry.phase(
+        "feature_transform",
+        {
+            "learner_feature_count": len(learner_columns),
+            "panel_rows": int(pre_holdout.height),
+            "panel_sessions": (
+                int(pre_holdout["session"].n_unique())
+                if not pre_holdout.is_empty()
+                else 0
+            ),
+            "schema_fingerprint": schema.fingerprint,
+        },
+    )
+    if not learner_columns:
+        return _publish_no_trade(
+            registry, request, frame, "no-alpha-learner-columns",
+            schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+            telemetry=telemetry,
+        )
+
+    validate_account_capital_coherence(data, request)
+    max_horizon = max(request.candidate_horizon_sessions)
+    # PurgedWalkForward.max_train_sessions bounds each fold's fitting memory
+    # to the newest eligible sessions after purge and embargo.
+    splitter = PurgedWalkForward(
+        n_folds=request.fold_count,
+        label_horizon_sessions=max_horizon + 1,
+        embargo_sessions=request.embargo_sessions,
+        session_column=_SESSION_IDX,
+        min_train_sessions=request.compounding.annualization_sessions,
+        max_train_sessions=request.max_training_lookback_sessions,
+    )
+    folds = splitter.split(pre_holdout)
+    if not folds:
+        return _publish_no_trade(
+            registry, request, frame, "insufficient-oof-calendar",
+            schema_hash=schema_hash, universe_policy_hash=universe_policy_hash,
+            telemetry=telemetry,
+        )
+    if getattr(request, "compound_alpha_mainline", False):
+        maybe = _run_compound_alpha_mainline(
+            data, registry, request, frame=frame, folds=folds
+        )
+        if maybe is not None:
+            return maybe
+    # model-selection mainline (explicit opt-in)
+    if getattr(request, "model_selection_mainline", False) or getattr(request, "enable_model_selection_mainline", False):
+        maybe = _run_model_selection_mainline(
+            data, request, frame, registry, folds
+        )
+        if maybe is not None:
+            return maybe
+
+    # One run-scoped tmp/training TemporaryDirectory owns all OOF spill files
+    # and is removed on normal close; the registry root stays publish-only.
+    cache = _OofCache(_default_oof_cache_base())
+    try:
+        _set_active_telemetry(telemetry)
+        _emit_progress(
+            progress,
+            "fitting_started",
+            {
+                "fold_count": len(folds),
+                "fold_train_rows": int(
+                    sum(len(fold.train_mask) for fold in folds)
+                ),
+                "fold_validation_rows": int(
+                    sum(len(fold.validation_mask) for fold in folds)
+                ),
+            },
+        )
+        manifest = _run_discovery_and_publish(
+            registry=registry,
+            data=data,
+            request=request,
+            frame=frame,
+            pre_holdout=pre_holdout,
+            holdout=holdout,
+            folds=folds,
+            learner_columns=learner_columns,
+            schema=schema,
+            telemetry=telemetry,
+            schema_hash=schema_hash,
+            universe_policy_hash=universe_policy_hash,
+            oof_cache=cache,
+        )
+        _emit_progress(
+            progress,
+            "fitting_complete",
+            {
+                "model_type": str(manifest.model_type),
+                "promoted": bool(manifest.model_type != "no_trade"),
+            },
+        )
+        emit_checkpoint(
+            diagnostics,
+            run_id=run_id,
+            category=DiagnosticCategory.EVAL,
+            component="ml.training",
+            stage=DiagnosticStage.SELECTION,
+            event="artifact_selection",
+            status=DiagnosticStatus.PASS,
+            payload={
+                "model_type": manifest.model_type,
+                "promoted": manifest.model_type != "no_trade",
+                "no_trade": manifest.model_type == "no_trade",
+            },
+        )
+        emit_checkpoint(
+            diagnostics,
+            run_id=run_id,
+            category=DiagnosticCategory.SYS,
+            component="ml.training",
+            stage=DiagnosticStage.TERMINAL,
+            event="training_terminal",
+            status=DiagnosticStatus.PASS,
+        )
+        return manifest
+    finally:
+        _set_active_telemetry(None)
+        _NEM_EVIDENCE_REGISTRY.pop(id(request), None)
+        cache.close()
+
+
 def _run_discovery_and_publish(
     *,
     registry: ModelArtifactRegistry,
