@@ -1282,3 +1282,13 @@ def test_SCENARIO_SMALL_ACCOUNT_CAGR_05_LEDGER_BOUNDED(tmp_path):
     assert "stress_log_growth" not in dumped
     assert "orders" not in dumped.lower() or "filled_orders" in dumped  # filled_orders is allowed scalar
     assert "returns" not in dumped or "period_net_returns" not in dumped
+
+def test_result_ledger_never_projects_promoted_status_for_synthetic_route() -> None:
+    from src.stocks.ml.result_ledger import _compact_growth_route
+
+    metrics = {"promoted": False, "no_trade": True, "growth_route": {"promotion_status": "RESEARCH_EDGE_ONLY", "evidence_kind": "synthetic_projection", "executable": False, "matched_lower_excess_cagr": 0.06, "conversion_waterfall": {"first_zero_stage": "certificate"}}}
+    compact = _compact_growth_route(metrics)
+    assert compact["promotion_status"] == "RESEARCH_EDGE_ONLY"
+    assert compact["executable"] is False
+    assert compact["conversion_waterfall"]["first_zero_stage"] == "certificate"
+    assert "PROMOTED_EXCESS_SLEEVE" not in repr(compact)
