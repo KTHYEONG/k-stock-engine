@@ -315,7 +315,11 @@
     ]
   },
   "src/stocks/workflows/trading_cycle.py": {
-    "testing": "tests/unit/stocks/workflows/test_trading_cycle.py"
+    "testing": [
+      "tests/unit/stocks/workflows/test_trading_cycle.py",
+      "tests/unit/stocks/trading/test_portfolio_constructor.py"
+    ],
+    "architecture": "docs/specs/ml_wealth_edge_recovery.md"
   },
   "src/stocks/workflows/train_model.py": {
     "testing": [
@@ -470,5 +474,9 @@
     ],
     "architecture": "docs/results/ml-cmp.md"
   },
-  "src/stocks/data/active.py": {}
+  "src/stocks/data/active.py": {},
+  "src/stocks/ml/wealth_transfer.py": {
+    "architecture": "docs/specs/ml_wealth_edge_recovery.md",
+    "testing": "tests/unit/stocks/ml/test_wealth_transfer.py"
+  }
 }
