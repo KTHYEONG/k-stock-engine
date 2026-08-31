@@ -4361,6 +4361,9 @@ def _growth_route_projection(
     nem_component_records: Sequence[Mapping[str, object]] = (),
     account_certification: AccountCertificationSettings | None = None,
     initial_cash: float | None = None,
+    hedge_evidence: object | None = None,
+    absolute_certificate: Mapping[str, object] | None = None,
+    hedge_certificate: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Bounded ``growth_route`` projection shared by metrics and the ledger.
 
@@ -4599,11 +4602,22 @@ def _growth_route_projection(
         projection["hedged_excess_certificate"] = sleeve_certificate
     if capital_plan_settings is not None:
         try:
+            # Pass absolute certificate and executable hedge evidence; fallback to legacy certificate
+            _abs_cert = absolute_certificate if absolute_certificate is not None else certificate
             projection["small_capital_route_plan"] = build_small_capital_route_plan(
-                route, capital_plan_settings
+                route, capital_plan_settings, absolute_certificate=_abs_cert, hedge_certificate=hedge_certificate, hedge_evidence=hedge_evidence  # type: ignore[arg-type]
             )
         except ValueError:
             projection["small_capital_route_plan"] = {}
+        # RESEARCH_ONLY_HEDGE when tradable evidence missing
+        try:
+            plan = projection.get("small_capital_route_plan")
+            if isinstance(plan, dict) and hedge_evidence is None and plan.get("executable_hedge_verdict") != "RESEARCH_ONLY_HEDGE":
+                    plan["executable_hedge_verdict"] = "RESEARCH_ONLY_HEDGE"
+                    if "tradable-hedge-evidence-missing" not in plan.get("reasons", []):
+                        plan["reasons"] = sorted({*plan.get("reasons", []), "tradable-hedge-evidence-missing"})
+        except Exception:  # noqa: S110
+            pass
     if (
         satellite_settings is not None
         and satellite_settings.enabled
