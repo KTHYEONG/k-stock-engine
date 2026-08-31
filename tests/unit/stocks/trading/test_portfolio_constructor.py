@@ -2953,3 +2953,13 @@ def test_default_hard_bound_profiles_remain_allocation_compatible():
     # with continuous flag, default profiles unchanged when flag absent; ensure allocations same as before
     profiles_with = policy_profiles_with_continuous_uncertainty()
     assert tuple(p.profile_id for p in profiles_with[:3]) == tuple(p.profile_id for p in DEFAULT_POLICY_PROFILES)
+
+def test_economic_gate_masks_distinguish_finite_mean_from_lower_bound() -> None:
+    import numpy as np
+    from src.stocks.trading.portfolio_constructor import economic_gate_masks
+
+    values = dict(expected_active_alpha=np.array([0.02, 0.01]), expected_net_alpha=np.array([0.01, -0.01]), alpha_lower_bound=np.array([-0.02, -0.02]), net_alpha_lower_bound=np.array([-0.03, -0.03]), alpha_standard_error=np.array([0.01, 0.01]), exit_cost_rate=np.array([0.001, 0.001]), incumbent_mask=np.array([False, False]), no_trade_band_bps=0.0)  # noqa: C408
+    _, finite_entries = economic_gate_masks(**values, economic_gate_mode="finite_mean_v1")
+    _, lower_entries = economic_gate_masks(**values, economic_gate_mode="lower_bound_v1")
+    assert finite_entries.tolist() == [True, False]
+    assert lower_entries.tolist() == [False, False]

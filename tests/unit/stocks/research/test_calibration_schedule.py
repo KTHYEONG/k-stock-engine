@@ -271,3 +271,34 @@ def test_session_cluster_bootstrap_precomputed_cumsum_is_identical() -> None:
         sums, counts, csum_sums=csum_sums, csum_counts=csum_counts, **kwargs
     )
     assert np.array_equal(reference, incremental)
+
+
+def test_session_cluster_schedule_preserves_signed_negative_bound_when_requested() -> None:
+    from datetime import UTC, datetime, timedelta
+    import polars as pl
+    from src.core.costs import default_base_schedule
+    from src.stocks.research.calibration_schedule import SessionClusterCalibrationSchedule
+    from src.stocks.research.economic_alpha import CausalAlphaCalibrator
+
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    rows = []
+    for day in range(4):
+        session = start + timedelta(days=day)
+        for instrument in range(20):
+            rows.append({"instrument_id": f"KRX:{instrument:06d}", "session": session, "score": float(instrument), "gross_return": -0.01, "label_available_time": session + timedelta(hours=1)})  # noqa: PERF401
+    observations = pl.DataFrame(rows)
+    decision = start + timedelta(days=5)
+
+    def state(preserve: bool) -> dict[str, object]:
+        calibrator = CausalAlphaCalibrator(bucket_count=2, min_calibration_sessions=2, n_bootstrap=20, block_length=1, label_column="gross_return", preserve_negative_bound_null=preserve)
+        schedule = SessionClusterCalibrationSchedule(observations, calibrator, default_base_schedule(), block_length=1, max_workspace_bytes=1_000_000)
+        return schedule.state_at(decision)
+
+    signed = state(False)["buckets"]
+    assert signed
+    assert all(row["expected_active_alpha"] is not None for row in signed)
+    assert all(float(row["alpha_lower_bound"]) < 0.0 for row in signed)
+    nulled = state(True)["buckets"]
+    assert nulled
+    assert all(row["expected_active_alpha"] is None for row in nulled)
+    assert all(row["alpha_lower_bound"] is None for row in nulled)
