@@ -212,15 +212,17 @@ def _clean_specs(remove_specs: list[str] | None = None) -> int:
     target_prefixes: set[str] = set()
     if remove_specs:
         for item in remove_specs:
-            base = item.replace(".md", "").replace("_contract.json", "").replace("docs/specs/", "").strip()
+            base = item.replace(".md", "").replace("_contract.json", "").replace("contract.json", "").replace("docs/specs/", "").strip()
             if base:
                 target_prefixes.add(base.lower())
 
     count = 0
     for fname in os.listdir(specs_dir):
-        if fname.endswith((".md", "_contract.json")):
+        if fname.endswith((".md", "_contract.json", "contract.json")):
+            if fname == "00_architecture.md":
+                continue
             if target_prefixes:
-                fname_base = fname.replace(".md", "").replace("_contract.json", "").lower()
+                fname_base = fname.replace(".md", "").replace("_contract.json", "").replace("contract.json", "").lower()
                 if fname_base not in target_prefixes and fname.lower() not in target_prefixes:
                     continue
 

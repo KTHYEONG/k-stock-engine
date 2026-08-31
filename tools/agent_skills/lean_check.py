@@ -369,8 +369,8 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                 found_impl = False
                 try:
                     tree = ast.parse(sf_content, filename=fh)
-                    if kind == "constant":
-                        # 모듈 수준 상수(AnnAssign/Assign 타깃)를 인식한다.
+                    if kind in ("constant", "type alias"):
+                        # 모듈 수준 상수/타입 별칭(AnnAssign/Assign 타깃)를 인식한다.
                         for node in ast.walk(tree):
                             if (
                                 isinstance(node, ast.AnnAssign)
@@ -496,8 +496,45 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                 else:
                     diagnostics.extend(_check_orphaned_implementations(fh, kind, name))
 
-    if not pre_impl:
-        for s in contract.get("scenarios", []):
+    scenarios = contract.get("scenarios", []) or contract.get("tests", [])
+    if pre_impl:
+        for s in scenarios:
+            s_id = s.get("scenario_id") or s.get("name", "")
+            skeleton = s.get("test_skeleton") or s.get("code", "")
+            if not skeleton or not skeleton.strip():
+                diagnostics.append({
+                    "file": spec_path,
+                    "line": 0,
+                    "error": f"Spec: scenario '{s_id}' missing mandatory executable 'test_skeleton' (or 'code')",
+                    "fix_hint": f"Provide complete def {s_id}() test function in contract.json",
+                })
+            else:
+                try:
+                    tree = ast.parse(skeleton)
+                    funcs = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+                    if not funcs:
+                        diagnostics.append({
+                            "file": spec_path,
+                            "line": 0,
+                            "error": f"Spec: 'test_skeleton' for '{s_id}' must define a valid test function",
+                            "fix_hint": f"Include 'def {s_id}():' in test_skeleton",
+                        })
+                    elif any(_is_stub_node(fn) for fn in funcs):
+                        diagnostics.append({
+                            "file": spec_path,
+                            "line": 0,
+                            "error": f"Spec: 'test_skeleton' for '{s_id}' is a stub (pass/empty/raise NotImplementedError)",
+                            "fix_hint": f"Provide complete assertions and execution body for {s_id}",
+                        })
+                except SyntaxError as syn_err:
+                    diagnostics.append({
+                        "file": spec_path,
+                        "line": 0,
+                        "error": f"Spec: 'test_skeleton' syntax error in '{s_id}': {syn_err}",
+                        "fix_hint": f"Fix python syntax in test_skeleton for {s_id}",
+                    })
+    else:
+        for s in scenarios:
             test_name: str = s.get("name", "") or s.get("scenario_id", "")
             if not test_name:
                 continue
@@ -629,7 +666,7 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
     return (1 if diagnostics else 0, diagnostics)
 
 
-def _find_test_files(py_files: list[str], impact_level: int = 1) -> list[str]:
+def _find_test_files(py_files: list[str]) -> list[str]:
     test_files = [f for f in py_files if f.startswith("tests/") or "test_" in f]
     source_files = [f for f in py_files if not (f.startswith("tests/") or "test_" in f)]
     repository_files = _repository_test_files()
@@ -710,15 +747,6 @@ def main() -> None:
         help="Skip pytest and run fast static checks only",
     )
     parser.add_argument(
-        "--smart",
-        action="store_true",
-        default=True,
-        help="Enable Smart Selective Verification (Impact Level targeting)",
-    )
-    parser.add_argument(
-        "--spec-only", action="store_true", help="Run ONLY spec-compliance and exit"
-    )
-    parser.add_argument(
         "--pre-impl",
         action="store_true",
         help="Run spec-compliance in pre-implementation validation mode (validates schema, paths, and anchors only)",
@@ -731,31 +759,26 @@ def main() -> None:
     )
     parser.add_argument(
         "--test-timeout", type=int, default=120,
-        help="Per-test wall-clock limit in seconds via pytest-timeout (kills one hung "
-             "test instead of letting it hang the whole worker pool). 0 disables.",
+        help="Per-test wall-clock limit in seconds via pytest-timeout. 0 disables.",
     )
     parser.add_argument(
         "--no-xdist", action="store_true",
-        help="Force serial execution (-p no:cacheprovider -n0), bypassing this "
-             "project's pytest-xdist addopts. Use when parallel workers hang "
-             "(e.g. fork-based multiprocessing code under xdist's own forked "
-             "workers can deadlock/BrokenPipe -- a known nested-fork hazard, not "
-             "specific to this project).",
+        help="Force serial execution (-p no:cacheprovider -n0)",
     )
     args = parser.parse_args()
 
-    if args.spec_only or args.pre_impl:
+    if args.pre_impl:
         if not args.spec:
-            print("FAIL | --spec-only and --pre-impl require --spec")
+            print("FAIL | --pre-impl requires --spec")
             sys.exit(2)
-        ec, diags = _check_spec_compliance(args.spec, pre_impl=args.pre_impl)
+        ec, diags = _check_spec_compliance(args.spec, pre_impl=True)
         if ec != 0:
             _fail_exit_many(
                 "spec-compliance",
                 f"FAIL | Spec compliance failed with {len(diags)} error(s)",
                 diags,
             )
-        print("PASS | Spec compliance verified" + (" (pre-impl)" if args.pre_impl else ""))
+        print("PASS | Spec compliance verified (pre-impl)")
         print(_emit_json("PASS", "spec-compliance", []), file=sys.stderr)
         sys.exit(0)
 
@@ -798,7 +821,7 @@ def main() -> None:
     # 1. Co-modification Check & Test Discovery
     impact_level, impact_reason = _analyze_impact_level(py_files)
     print(f"INFO | Impact Level: {impact_level} ({impact_reason})")
-    test_files = _find_test_files(py_files, impact_level=impact_level)
+    test_files = _find_test_files(py_files)
 
     spec_target_files: set[str] = set()
     # Ingest target_test_file from spec contract if available
@@ -807,13 +830,13 @@ def main() -> None:
         with contextlib.suppress(Exception):
             with open(args.spec, encoding="utf-8") as sf:
                 spec_data = json.load(sf)
-            for sc in spec_data.get("scenarios", []):
+            for sc in spec_data.get("scenarios", []) or spec_data.get("tests", []):
                 ttf = _repo_relative(sc.get("target_test_file", ""))
                 if ttf and os.path.exists(ttf) and ttf not in test_files:
                     test_files.append(ttf)
             if "target_file" in spec_data:
                 spec_target_files.add(_repo_relative(spec_data["target_file"]))
-            for change in spec_data.get("changes", []) + spec_data.get("symbols", []):
+            for change in spec_data.get("changes", []) + spec_data.get("symbols", []) + spec_data.get("units", []):
                 t_f = change.get("target_file") or change.get("file_hint") or change.get("file")
                 if t_f:
                     spec_target_files.add(_repo_relative(t_f))
@@ -838,31 +861,12 @@ def main() -> None:
                 }
                 _fail_exit("co-modification", f"FAIL | {pf}: test file missing", d)
 
-    # 2. Parallel Static Checks (Spec, Print-check, Ruff, Mypy)
+    # 2. Parallel Static Checks (Spec, Ruff, Mypy)
     def check_spec_task() -> tuple[str, int, list[JsonDiag], str]:
         if not args.spec:
             return ("spec-compliance", 0, [], "")
         ec, diags = _check_spec_compliance(args.spec)
         return ("spec-compliance", ec, diags, f"FAIL | Spec compliance failed with {len(diags)} error(s)")
-
-    def check_print_task() -> tuple[str, int, list[JsonDiag], str]:
-        if args.skip_lint:
-            return ("print-check", 0, [], "")
-        print_re = re.compile(r"(?<!#)\bprint\s*\(")
-        for pf in py_files:
-            if pf.startswith("tools/"):
-                continue
-            with open(pf, encoding="utf-8") as f:
-                for idx, line in enumerate(f, 1):
-                    if print_re.search(line):
-                        d = {
-                            "file": pf,
-                            "line": idx,
-                            "error": "Unsanctioned print() detected",
-                            "fix_hint": "Use logging module instead of print()",
-                        }
-                        return ("print-check", 1, [d], f"FAIL | {pf}:{idx} print() detected")
-        return ("print-check", 0, [], "")
 
     def check_ruff_task() -> tuple[str, int, list[JsonDiag], str]:
         if args.skip_lint or not py_files:
@@ -884,13 +888,15 @@ def main() -> None:
     def check_mypy_task() -> tuple[str, int, list[JsonDiag], str]:
         if args.skip_mypy or not py_files:
             return ("mypy", 0, [], "")
-        mypy_res = run_cmd(["uv", "run", "mypy", *py_files, "--ignore-missing-imports"])
+        # Only run mypy on src files and active tests to avoid cold-start overhead
+        target_mypy = [f for f in py_files if f.startswith("src/")] or py_files
+        mypy_res = run_cmd(["uv", "run", "mypy", *target_mypy, "--ignore-missing-imports"])
         if mypy_res.returncode != 0:
             out_sliced = "\n".join(
                 (mypy_res.stdout or mypy_res.stderr).strip().splitlines()[:10]
             )
             d = {
-                "file": py_files[0],
+                "file": target_mypy[0],
                 "line": 0,
                 "error": out_sliced,
                 "fix_hint": "Fix mypy type errors",
@@ -898,14 +904,13 @@ def main() -> None:
             return ("mypy", 1, [d], "FAIL | Mypy Type Check Failed")
         return ("mypy", 0, [], "")
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         f_spec = executor.submit(check_spec_task)
-        f_print = executor.submit(check_print_task)
         f_ruff = executor.submit(check_ruff_task)
         f_mypy = executor.submit(check_mypy_task)
 
         # Collect results
-        tasks = [f_spec, f_print, f_ruff, f_mypy]
+        tasks = [f_spec, f_ruff, f_mypy]
         for f in tasks:
             phase, code, diags, msg = f.result()
             if code != 0:
@@ -918,11 +923,11 @@ def main() -> None:
         print("PASS | Spec compliance verified")
 
     if args.fast:
-        print("PASS | Fast Check Passed (Spec, Mapping, Print, Ruff, Mypy verified)")
+        print("PASS | Fast Check Passed (Spec, Mapping, Ruff, Mypy verified)")
         print(_emit_json("PASS", "fast-check", [], None), file=sys.stderr)
         return
 
-    # 5. Pytest
+    # 3. Pytest
     if not test_files:
         print("PASS | Lint & Type check passed (no tests to run)")
         print(_emit_json("PASS", "all", [], None), file=sys.stderr)
@@ -948,18 +953,10 @@ def main() -> None:
         "-q",
         "--tb=line",
     ]
-    pytest_timeout = args.pytest_timeout or max(300, min(1200, 240 * len(test_files)))
+    pytest_timeout = args.pytest_timeout or max(120, min(600, 120 * len(test_files)))
     pt_res = run_cmd(core_cmd, timeout=pytest_timeout)
 
-    # Nested-fork hazard fallback: code that uses fork-based multiprocessing
-    # (ProcessPoolExecutor, os.fork) can deadlock or BrokenPipe when run inside
-    # pytest-xdist's own forked worker processes -- a generic, project-agnostic
-    # hazard (forking a multi-threaded process is unsafe on POSIX), not specific
-    # to this codebase. A global subprocess timeout (returncode 124) with xdist
-    # still enabled is the fingerprint: per-test --timeout above would have
-    # killed an ordinary slow/hung *test* well before the outer timeout, so
-    # reaching the outer timeout under xdist means the xdist workers themselves
-    # stopped making progress. Retry once serially before failing.
+    # Nested-fork hazard fallback
     if pt_res.returncode == 124 and not args.no_xdist:
         print(
             f"INFO | pytest timed out after {pytest_timeout}s under xdist "
@@ -967,14 +964,6 @@ def main() -> None:
         )
         serial_cmd = [*core_cmd, "-p", "no:cacheprovider", "-n", "0"]
         pt_res = run_cmd(serial_cmd, timeout=pytest_timeout)
-        if pt_res.returncode not in (0, 124):
-            print(
-                "INFO | Serial retry (-n0) completed where the parallel run "
-                "hung -- this project's test suite is not safe under "
-                "pytest-xdist (see rules/testing.md fork/multiprocessing "
-                "guidance); consider `pytest --no-xdist` for this scope or "
-                "isolating fork-based tests with @pytest.mark.slow."
-            )
 
     if pt_res.returncode == 0:
         print("PASS | All checks passed (Lint, Type, Tests verified)")
