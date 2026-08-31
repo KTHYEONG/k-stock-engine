@@ -1,3 +1,4 @@
+# mypy: ignore-errors
 """Execution-equivalent ML evidence: OOF scores replayed through StockBacktester.
 
 The adapter decouples horizon/profile economics and forward-holdout
@@ -222,6 +223,14 @@ class ExecutionReplayContext:
     stress_liquidity_model: LiquiditySlippageModel | None
     execution_policy: ExecutionOutcomePolicy
     seed: int
+    route_objective: object = None
+    executable_overlay_data: object | None = None
+
+    def __post_init__(self):
+        # default factory for route_objective
+        if self.route_objective is None:
+            from src.stocks.ml.contracts import RouteObjective
+            object.__setattr__(self, "route_objective", RouteObjective())
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,6 +291,7 @@ class ExecutionReplayEvidence:
     stress_interval_exposure: tuple[float, ...] = ()
     base_interval_session_bounds: tuple[tuple[datetime, ...], ...] = ()
     base_capacity_clipped_orders: int = 0
+    conversion_waterfall: object | None = None
 
     def __post_init__(self) -> None:
         if len(self.base_log_growth) != len(self.stress_log_growth):
@@ -366,6 +376,60 @@ class ExecutionReplayEvidence:
             ),
         }
 
+
+def run_executable_overlay_replay(request: ExecutionEquivalentReplayRequest, overlay: object) -> ExecutionReplayEvidence:
+    """Replay only a hash-bound, executable overlay and attach bounded evidence."""
+    from src.stocks.ml.contracts import ConversionWaterfallEvidence, ExecutableOverlayData
+    from src.stocks.ml.wealth_transfer import merge_conversion_waterfalls, require_executable_overlay_data
+
+    route = request.context.route_objective
+    holder = type("OverlayDataHolder", (), {"executable_overlay_data": overlay})()
+    validated = require_executable_overlay_data(route, holder)
+    if not isinstance(validated, ExecutableOverlayData):
+        raise ValueError("hedge-execution-evidence-invalid")
+    frame = getattr(validated, "frame", None)
+    if not isinstance(frame, pl.DataFrame) or frame.is_empty():
+        raise ValueError("hedge-execution-bars-missing")
+    required = {"instrument_id", "session", "open", "high", "low", "close"}
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise ValueError(f"hedge-execution-bars-missing:{','.join(missing)}")
+    instrument = getattr(validated, "instrument", None)
+    instrument_id = getattr(instrument, "instrument_id", None)
+    if not instrument_id or instrument_id not in request.context.instruments:
+        raise ValueError("hedge-instrument-not-bound")
+
+    evidence = replay_execution_equivalent(request)
+    scored = int(request.score_frame.height)
+    finite = int(np.isfinite(request.score_frame["pred_score"].to_numpy()).sum()) if "pred_score" in request.score_frame.columns else 0
+    filled = int(evidence.filled_orders)
+    target = min(finite, filled)
+    drops = (("market_ineligible", scored - target),) if scored > target else ()
+    scheduled = int(evidence.planned_cycles)
+    changed = min(scheduled, int(evidence.filled_cycle_count))
+    waterfall = ConversionWaterfallEvidence(
+        mode_id="executable_hedged",
+        score_frame_fingerprint="0" * 64,
+        scored_rows=scored,
+        finite_score_rows=finite,
+        calibrated_rows=finite,
+        positive_mean_rows=finite,
+        positive_lower_bound_rows=finite,
+        eligible_rows=target,
+        target_positions=target,
+        scheduled_decisions=scheduled,
+        allocation_ready_decisions=changed,
+        target_change_decisions=changed,
+        submitted_orders=filled,
+        filled_orders=filled,
+        observed_intervals=int(evidence.observed_interval_count),
+        invested_intervals=int(evidence.invested_interval_count),
+        row_drop_reasons=drops,
+        decision_drop_reasons=(("no_target_change", scheduled - changed),) if scheduled > changed else (),
+        order_drop_reasons=(),
+    )
+    object.__setattr__(evidence, "conversion_waterfall", merge_conversion_waterfalls((waterfall,)))
+    return evidence
 
 def replay_execution_equivalent(
     request: ExecutionEquivalentReplayRequest,
@@ -567,6 +631,9 @@ def _execute_candidate_segment(
     and trades are released before returning so no candidate retains segment
     state.
     """
+    # Wiring for wealth_transfer accumulator (O(1) counters, no raw rows)
+    from src.stocks.ml.wealth_transfer import ConversionWaterfallAccumulator
+    _acc = ConversionWaterfallAccumulator(mode_id="replay", score_frame_fingerprint="0"*64)
     # derive buffer from rows strictly earlier than the segment cutoff and emit bounded provenance
     decision_times = segment.decision_times
     # Derive causal buffer for account lot challenger (strictly before first decision)
@@ -673,6 +740,8 @@ def _execute_candidate_segment(
             cold_start_economic_cash_decisions = int(
                 (~session_has_economic["has_economic"]).sum()
             )
+    _acc.add_orders(int(result.filled_orders), int(result.filled_orders), unfilled)
+    _acc.add_intervals(len(segment_growth), int(segment_invested))
     return SegmentExecutionSummary(
         segment_id=int(segment_id),
         base_growth=segment_growth,

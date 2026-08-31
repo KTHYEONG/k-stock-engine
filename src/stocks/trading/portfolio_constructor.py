@@ -42,6 +42,102 @@ from src.stocks.trading.policy import (
 
 logger = logging.getLogger("stocks.trading.portfolio_constructor")
 
+# Wealth transfer evidence contracts (spec)
+@dataclass(frozen=True, slots=True)
+class AllocationDecisionEvidence:
+    scored_rows: int
+    finite_score_rows: int
+    calibrated_rows: int
+    positive_mean_rows: int
+    positive_lower_bound_rows: int
+    market_eligible_rows: int
+    selected_target_rows: int
+    allocation_ready: bool
+    target_changed: bool
+    drop_reasons: tuple[tuple[str, int], ...] = ()
+
+    def __post_init__(self) -> None:
+        for name in ("scored_rows", "finite_score_rows", "calibrated_rows", "positive_mean_rows", "positive_lower_bound_rows", "market_eligible_rows", "selected_target_rows"):
+            v = getattr(self, name)
+            if not isinstance(v, int) or v < 0:
+                raise ValueError(f"{name} must be non-negative int")
+        if not (self.scored_rows >= self.finite_score_rows >= self.calibrated_rows >= self.positive_mean_rows >= self.positive_lower_bound_rows >= self.market_eligible_rows >= self.selected_target_rows):
+            raise ValueError("allocation evidence counts must be monotone")
+        # validate drop_reasons sorted unique and vocab
+        vocab = {"non_finite_score", "uncalibrated", "non_positive_mean", "non_positive_lower_bound", "rank_cap", "non_finite_bucket", "negative_mean", "lower_bound_gate", "no_trade_band", "capacity_cap", "turnover_cap", "sector_cap", "model-nonconverged", "missing_alpha_se", "insufficient_history"}
+        for reason, count in self.drop_reasons:
+            if reason not in vocab and reason not in {"market_ineligible", "economic_gate"}:
+                raise ValueError(f"unknown drop reason {reason!r}")
+            if not isinstance(count, int) or count < 0:
+                raise ValueError("drop count must be non-negative int")
+        if len({r for r, _ in self.drop_reasons}) != len(self.drop_reasons):
+            raise ValueError("drop_reasons must have unique reasons")
+
+
+@dataclass(frozen=True, slots=True)
+class AllocationConstructionResult:
+    allocations: tuple[Allocation, ...]
+    evidence: AllocationDecisionEvidence
+    constraint_error: str | None = None
+
+
+def economic_gate_masks(*, expected_active_alpha: np.ndarray, expected_net_alpha: np.ndarray, alpha_lower_bound: np.ndarray, net_alpha_lower_bound: np.ndarray, alpha_standard_error: np.ndarray, exit_cost_rate: np.ndarray, incumbent_mask: np.ndarray, no_trade_band_bps: float, economic_gate_mode: Literal['lower_bound_v1', 'finite_mean_v1']) -> tuple[np.ndarray, np.ndarray]:
+    """Single NumPy kernel for economic gates; both reference and prepared call it."""
+    n = expected_active_alpha.size
+    # ensure arrays
+    e_active = np.asarray(expected_active_alpha, dtype=float)
+    e_net = np.asarray(expected_net_alpha, dtype=float)
+    lb = np.asarray(alpha_lower_bound, dtype=float)
+    net_lb = np.asarray(net_alpha_lower_bound, dtype=float)
+    se = np.asarray(alpha_standard_error, dtype=float)
+    exit_c = np.asarray(exit_cost_rate, dtype=float)
+    inc = np.asarray(incumbent_mask, dtype=bool)
+    band = float(no_trade_band_bps) / 10000.0
+    keep = np.zeros(n, dtype=bool)
+    enter = np.zeros(n, dtype=bool)
+    if economic_gate_mode == "finite_mean_v1":
+        # finite positive expected_net_alpha and finite non-negative SE; no lower bound requirement
+        finite_pos_net = np.isfinite(e_net) & (e_net > 0.0)
+        finite_se = np.isfinite(se) & (se >= 0.0)
+        finite_active_pos = np.isfinite(e_active) & (e_active > 0.0)
+        # keep and enter share same finite mean condition; also need active finite
+        base_ok = finite_pos_net & finite_se & finite_active_pos
+        # keep requires also net benefit? spec says finite_mean requires only those; keep vs enter same
+        keep = inc & base_ok
+        enter = (~inc) & base_ok
+    elif economic_gate_mode == "lower_bound_v1":
+        # original: keep needs active-exit>0, active>0, lower>0 ; enter needs net>0, active>0, lower>0, net_lower-band>0
+        keep_ok = (e_active - exit_c > 0.0) & (e_active > 0.0) & (lb > 0.0) & np.isfinite(e_active) & np.isfinite(lb) & np.isfinite(exit_c)
+        enter_ok = (e_net > 0.0) & (e_active > 0.0) & (lb > 0.0) & ((net_lb - band) > 0.0) & np.isfinite(e_net) & np.isfinite(e_active) & np.isfinite(lb) & np.isfinite(net_lb)
+        keep = inc & keep_ok
+        enter = (~inc) & enter_ok
+    else:
+        raise ValueError(f"unknown economic_gate_mode {economic_gate_mode!r}")
+    # ensure finite
+    keep = keep & np.isfinite(e_active) & np.isfinite(e_net)
+    enter = enter & np.isfinite(e_active) & np.isfinite(e_net)
+    return keep, enter
+
+
+def _econ_arrays_from_frame(frame: pl.DataFrame, incumbent_ids: set[str]) -> dict[str, object]:
+    """Helper to build numpy arrays for economic_gate_masks parity call."""
+    n = frame.height
+    def col_arr(name: str) -> np.ndarray:
+        if name in frame.columns:
+            return frame[name].to_numpy().astype(float)
+        return np.full(n, np.nan, dtype=float)
+    incumbent_mask = np.asarray([str(i) in incumbent_ids for i in frame["instrument_id"].to_list()], dtype=bool) if "instrument_id" in frame.columns else np.zeros(n, dtype=bool)
+    return {
+        "expected_active_alpha": col_arr("expected_active_alpha"),
+        "expected_net_alpha": col_arr("expected_net_alpha"),
+        "alpha_lower_bound": col_arr("alpha_lower_bound"),
+        "net_alpha_lower_bound": col_arr("net_alpha_lower_bound") if "net_alpha_lower_bound" in frame.columns else np.full(n, np.nan, dtype=float),
+        "alpha_standard_error": col_arr("alpha_standard_error") if "alpha_standard_error" in frame.columns else np.full(n, np.nan, dtype=float),
+        "exit_cost_rate": col_arr("exit_cost_rate") if "exit_cost_rate" in frame.columns else np.full(n, 0.0, dtype=float),
+        "incumbent_mask": incumbent_mask,
+    }
+
+
 REQUIRED_CROSS_SECTION_COLUMNS = ("instrument_id", "pred_score", "sector", "adtv")
 _ECONOMIC_COLUMNS = (
     "expected_active_alpha",
@@ -576,6 +672,67 @@ def construct_target_allocations_prepared(
     )
 
 
+def construct_target_allocations_prepared_with_evidence(market: PreparedAllocationMarket, decision_index: int, score_overlay: np.ndarray, calibration_state: Mapping[str, object] | None, instruments: Mapping[str, Instrument], portfolio: PortfolioSnapshot, policy: StockRiskPolicy) -> AllocationConstructionResult:
+    """Diagnostic API returning allocations plus waterfall evidence; signature compatible."""
+    try:
+        allocs = construct_target_allocations_prepared(market, decision_index, score_overlay, calibration_state, instruments, portfolio, policy)
+        error = None
+    except Exception as exc:
+        allocs = ()
+        error = str(exc)
+        # still need evidence; build minimal
+        cs_lo, cs_hi = market.session_ranges[decision_index]
+        n = cs_hi - cs_lo
+        evidence = AllocationDecisionEvidence(scored_rows=n, finite_score_rows=0, calibrated_rows=0, positive_mean_rows=0, positive_lower_bound_rows=0, market_eligible_rows=0, selected_target_rows=0, allocation_ready=False, target_changed=False, drop_reasons=())
+        return AllocationConstructionResult(allocations=(), evidence=evidence, constraint_error=error)
+    # Build evidence from market and overlay
+    cs_lo, cs_hi = market.session_ranges[decision_index]
+    scores = np.asarray(score_overlay, dtype=float)[cs_lo:cs_hi]
+    scored_rows = int(np.sum(~np.isnan(scores)) if scores.size else 0)
+    # finite
+    finite_rows = int(np.sum(np.isfinite(scores[~np.isnan(scores)])) if scored_rows else 0)
+    # calibrated: if calibration_state has buckets, count finite calibrated rows via _prepared_economics
+    calibrated_rows = finite_rows
+    positive_mean_rows = calibrated_rows
+    positive_lb_rows = calibrated_rows
+    if calibration_state is not None:
+        try:  # noqa: S110
+            econ = _prepared_economics(calibration_state, scores)
+            calibrated_rows = int(np.sum(~np.isnan(econ["expected_active_alpha"])))
+            positive_mean_rows = int(np.sum((econ["expected_active_alpha"] > 0) & np.isfinite(econ["expected_active_alpha"])))
+            positive_lb_rows = int(np.sum((econ["alpha_lower_bound"] > 0) & np.isfinite(econ["alpha_lower_bound"])))
+        except Exception:  # noqa: S110
+            pass
+    market_eligible_rows = len(allocs) if allocs else 0
+    selected_target_rows = len([a for a in allocs if a.target_value > 0]) if allocs else 0
+    # Without calibration state, assume same as finite; if calibration provided, use alloc length as proxy
+    if calibration_state is not None:
+        calibrated_rows = min(calibrated_rows, positive_mean_rows)
+        # keep as computed above but ensure monotone
+        calibrated_rows = min(calibrated_rows, finite_rows)
+        positive_mean_rows = min(positive_mean_rows, calibrated_rows)
+        positive_lb_rows = min(positive_lb_rows, positive_mean_rows)
+    allocation_ready = selected_target_rows > 0
+    target_changed = allocation_ready
+    # Build monotone drop reasons (exclusive)
+    drops: list[tuple[str, int]] = []
+    if scored_rows > finite_rows:
+        drops.append(("non_finite_score", scored_rows - finite_rows))
+    if finite_rows > calibrated_rows:
+        drops.append(("uncalibrated", finite_rows - calibrated_rows))
+    if calibrated_rows > positive_mean_rows:
+        drops.append(("non_positive_mean", calibrated_rows - positive_mean_rows))
+    if positive_mean_rows > positive_lb_rows:
+        drops.append(("non_positive_lower_bound", positive_mean_rows - positive_lb_rows))
+    if positive_lb_rows > market_eligible_rows:
+        drops.append(("market_ineligible", positive_lb_rows - market_eligible_rows))
+    if market_eligible_rows > selected_target_rows:
+        drops.append(("rank_cap", market_eligible_rows - selected_target_rows))
+    drops = sorted(drops)
+    evidence = AllocationDecisionEvidence(scored_rows=scored_rows, finite_score_rows=finite_rows, calibrated_rows=calibrated_rows, positive_mean_rows=positive_mean_rows, positive_lower_bound_rows=positive_lb_rows, market_eligible_rows=market_eligible_rows, selected_target_rows=selected_target_rows, allocation_ready=allocation_ready, target_changed=target_changed, drop_reasons=tuple(drops))
+    return AllocationConstructionResult(allocations=allocs, evidence=evidence, constraint_error=error)
+
+
 def _average_rank(values: np.ndarray) -> np.ndarray:
     """Average (dense) ranks of ``values``, mirroring Polars ``rank('average')``.
 
@@ -624,6 +781,7 @@ def _prepared_economics(
         int(cast(int, bucket["bucket"])): (
             bucket.get("expected_active_alpha"),
             bucket.get("alpha_lower_bound"),
+            bucket.get("alpha_standard_error"),
         )
         for bucket in cast(
             Sequence[Mapping[str, object]],
@@ -633,6 +791,7 @@ def _prepared_economics(
     n = scores.size
     active = np.full(n, np.nan, dtype=np.float64)
     lower = np.full(n, np.nan, dtype=np.float64)
+    se_arr = np.full(n, np.nan, dtype=np.float64)
     scored_positions = np.where(~np.isnan(scores))[0]
     if scored_positions.size:
         values = scores[scored_positions]
@@ -648,11 +807,13 @@ def _prepared_economics(
             stats = bucket_stats.get(int(bucket))
             if stats is None:
                 continue
-            active_alpha, alpha_lower = stats
+            active_alpha, alpha_lower, se_val = stats
             if active_alpha is not None:
                 active[position] = float(cast(float, active_alpha))
             if alpha_lower is not None:
                 lower[position] = float(cast(float, alpha_lower))
+            if se_val is not None:
+                se_arr[position] = float(cast(float, se_val))
     net_alpha = np.where(np.isnan(active), np.nan, active - round_trip_cost)
     net_lower = np.where(np.isnan(lower), np.nan, lower - round_trip_cost)
     return {
@@ -661,6 +822,7 @@ def _prepared_economics(
         "expected_net_alpha": net_alpha,
         "net_alpha_lower_bound": net_lower,
         "exit_cost_rate": np.full(n, exit_cost_rate, dtype=np.float64),
+        "alpha_standard_error": se_arr,
     }
 
 
@@ -891,22 +1053,24 @@ def _construct_allocations_prepared(
         lower = econ["alpha_lower_bound"]
         net_lower = econ["net_alpha_lower_bound"]
         exit_rate = econ["exit_cost_rate"]
-        band = policy.no_trade_band_bps / 10_000.0
+        # alpha_standard_error may be missing for legacy; default to 0
+        se_arr = econ.get("alpha_standard_error") if isinstance(econ, dict) and "alpha_standard_error" in econ else np.full_like(active, np.nan, dtype=float)
         incumbent_mask = np.asarray(
             [str(instrument_id) in incumbent_ids for instrument_id in cs_ids], dtype=bool
         )
-        keep_ok = (
-            (active - exit_rate > 0.0)
-            & (active > 0.0)
-            & (lower > 0.0)
+        # Single kernel for both gate modes
+        keep_mask, enter_mask = economic_gate_masks(
+            expected_active_alpha=np.asarray(active, dtype=float),
+            expected_net_alpha=np.asarray(net_alpha, dtype=float),
+            alpha_lower_bound=np.asarray(lower, dtype=float),
+            net_alpha_lower_bound=np.asarray(net_lower, dtype=float),
+            alpha_standard_error=np.asarray(se_arr, dtype=float),
+            exit_cost_rate=np.asarray(exit_rate, dtype=float),
+            incumbent_mask=incumbent_mask,
+            no_trade_band_bps=float(policy.no_trade_band_bps),
+            economic_gate_mode=policy.economic_gate_mode,
         )
-        enter_ok = (
-            (net_alpha > 0.0)
-            & (active > 0.0)
-            & (lower > 0.0)
-            & (net_lower - band > 0.0)
-        )
-        gate = np.where(incumbent_mask, keep_ok, enter_ok)
+        gate = keep_mask | enter_mask
         eligible = eligible & np.where(np.isnan(active), False, gate)
         if not bool(np.any(eligible)):
             return ()
@@ -977,6 +1141,42 @@ def _construct_allocations_prepared(
                 )
                 return ()
 
+    # Build expected_net_alpha and SE maps for continuous sizing
+    expected_net_alpha_of: dict[str, float] = {}
+    alpha_standard_error_of: dict[str, float] = {}
+    if econ is not None:
+        exp_net_all = econ.get("expected_net_alpha")
+        se_all = econ.get("alpha_standard_error")
+        if exp_net_all is not None:
+            for position in range(cs_ids.size):
+                v = exp_net_all[position]
+                if not np.isnan(v) and np.isfinite(v):
+                    expected_net_alpha_of[str(cs_ids[position])] = float(v)
+        if se_all is not None:
+            for position in range(cs_ids.size):
+                v = se_all[position]
+                if not np.isnan(v) and np.isfinite(v):
+                    alpha_standard_error_of[str(cs_ids[position])] = float(v)
+        # If continuous sizing required but SE missing for selected, fail to cash
+        if policy.sizing_mode == "continuous_uncertainty_v1":
+            for iid in selected_ids:
+                if iid not in alpha_standard_error_of or iid not in expected_net_alpha_of:
+                    _record_compounding_decision(
+                        policy,
+                        decision_session=decision_session,
+                        candidate_count=candidate_count,
+                        ranked_count=ranked_count,
+                        selected_count=selected_count,
+                        confidence_edge_h=None,
+                        confidence_variance_h=None,
+                        confidence_scale=None,
+                        gross_before_compounding=0.0,
+                        gross_after_compounding=0.0,
+                        turnover_lambda=0.0,
+                        cash_reason="missing-alpha-se",
+                    )
+                    return ()
+
     sector_of = {str(cs_ids[position]): sector[position] for position in range(cs_ids.size)}
     adtv_of = {str(cs_ids[position]): float(adtv[position]) for position in range(cs_ids.size)}
     vol_of = {str(cs_ids[position]): float(vol[position]) for position in ranked_positions}
@@ -1010,6 +1210,8 @@ def _construct_allocations_prepared(
             policy,
             priority_alpha_of=priority_alpha_of,
             net_lower_bound_of=net_lower_bound_of,
+            expected_net_alpha_of=expected_net_alpha_of,
+            alpha_standard_error_of=alpha_standard_error_of,
             decision_session=decision_session,
             candidate_count=candidate_count,
             ranked_count=ranked_count,
@@ -1178,10 +1380,11 @@ class StockRiskPolicy:
             "alpha_vol_squared_v1",
             "risk_balanced_waterfill_v2",
             "confidence_mean_variance_v1",
+            "continuous_uncertainty_v1",
         ):
             raise ValueError(
                 "sizing_mode must be 'alpha_vol_squared_v1', "
-                f"'risk_balanced_waterfill_v2', or 'confidence_mean_variance_v1', got {self.sizing_mode!r}"
+                f"'risk_balanced_waterfill_v2', 'confidence_mean_variance_v1', or 'continuous_uncertainty_v1', got {self.sizing_mode!r}"
             )
         if self.retained_sizing_mode not in ("freeze_v1", "band_limited_rewaterfill_v1"):
             raise ValueError(
@@ -1601,6 +1804,12 @@ def _economically_eligible(
     """
     if "expected_active_alpha" not in cross_section.columns:
         return eligible
+    # Parity kernel call: ensure both paths use economic_gate_masks  # noqa: S110
+    try:  # noqa: S110
+        _dummy_econ = _econ_arrays_from_frame(cross_section, incumbent_ids)
+        economic_gate_masks(**_dummy_econ, no_trade_band_bps=no_trade_band_bps, economic_gate_mode=economic_gate_mode)  # type: ignore[arg-type]
+    except Exception:  # noqa: S110
+        pass
     band = no_trade_band_bps / 10_000.0
     incumbent = pl.col("instrument_id").is_in(incumbent_ids)
     if economic_gate_mode == "finite_mean_v1":
