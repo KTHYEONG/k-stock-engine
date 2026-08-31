@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_LARGE_MODULE_REFACTORING_20260831",
+      "date": "2026-08-31",
+      "adr_id": "ADR_20260831_LARGE_MODULE_REFACTORING_20260831",
+      "domain": "architecture",
+      "title": "행위 보존형 대형 ML·Trading·CLI 모듈 리팩터링",
+      "why": "대형 모듈의 책임 혼재와 facade 추출 과정의 legacy seam 단절로 AI 유지보수성과 회귀 안정성이 저하됨",
+      "resolution": "ML model-selection/training 추출 모듈의 legacy monkeypatch/import 호환성을 복구하고, replay waterfall row-drop reconciliation 및 portfolio exception identity를 보존했다. 대상 학습·선정·포트폴리오·CLI 테스트를 검증했다.",
+      "impact": "기존 public import, PIT/OOF 경계, 포트폴리오 제약, RESEARCH_ONLY 비발행, CLI 진입점 동작을 유지하면서 책임별 확장 기반을 마련했다."
+    },
+    {
       "task_id": "TASK_STOCKS_ML_COMPOUND_GROWTH_20260831",
       "date": "2026-08-31",
       "adr_id": "ADR_20260831_STOCKS_ML_COMPOUND_GROWTH_20260831",
@@ -989,16 +999,6 @@
       "why": "Positive OOF Rank-IC did not translate into promoted economic results; batch-style holding semantics and opaque segment coverage blocked reliable diagnosis.",
       "resolution": "Added vintage-based replay evidence, two pre-registered policy profiles, Holm-corrected horizon/profile selection, artifact policy parity checks, and bounded segment diagnostics.",
       "impact": "ML and backtest decisions now share overlapping-vintage execution semantics and fail closed on missing coverage, while selected policy metadata is synchronized into the operational simulator."
-    },
-    {
-      "task_id": "TASK_STOCK_ML_HORIZON_EFFICIENCY_REDESIGN",
-      "date": "2026-08-15",
-      "adr_id": "ADR_20260815_STOCK_ML_HORIZON_EFFICIENCY_REDESIGN",
-      "domain": "stocks",
-      "title": "Stock ML horizon evidence and training efficiency redesign",
-      "why": "The six-candidate net-alpha run spent 95.76% of 136.6 seconds in horizon discovery, used severely imbalanced OOF folds, and produced a false positive h20 bootstrap lower bound because seven 20-session cohorts were resampled as one block; strict replay then rejected all horizons.",
-      "resolution": "Implemented holdout-safe feature schema handling, balanced maximum-horizon purged folds, segment-local complete cohorts, annualized base/stress cohort-unit bootstrap with Holm-Bonferroni admission, session-balanced weighted learning, vectorized ElasticNet paths, baseline OOF reuse, and one rankability-gated challenger with bounded observability.",
-      "impact": "OOF evidence and compound-growth claims are now calendar-, cost-, and multiplicity-valid; discovery optimizer invocations are bounded from 234 fits to 72 path evaluations for the current request, while invalid evidence remains explicit NO_TRADE."
     }
   ]
 }
