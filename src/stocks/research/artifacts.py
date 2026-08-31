@@ -55,11 +55,23 @@ class ArtifactRetentionCandidate:
 class ModelArtifactRegistry:
     """Filesystem-backed immutable artifact store with fail-closed validation."""
 
-    def __init__(self, root: Path):
-        self.root = Path(root)
+    def __init__(self, root: Path | None = None, *, in_memory: bool = False):
+        self.root = Path(root) if root is not None else Path("in-memory")
+        self._in_memory = in_memory
+        self._models: dict[str, Model] = {}
+        self._manifests: dict[str, ModelManifest] = {}
+        self._metrics: dict[str, dict[str, object]] = {}
+        self._forward_holdouts: dict[str, dict[str, object]] = {}
+
+    @classmethod
+    def in_memory(cls) -> ModelArtifactRegistry:
+        """Create a process-local registry that never writes model artifacts."""
+        return cls(in_memory=True)
 
     def list_artifact_ids(self) -> tuple[str, ...]:
         """List immutable artifact directories with a manifest, deterministically."""
+        if self._in_memory:
+            return tuple(sorted(self._manifests))
         if not self.root.exists():
             return ()
         return tuple(
@@ -84,6 +96,10 @@ class ModelArtifactRegistry:
                 continue
             if retain_promoted and self.is_promoted(artifact_id):
                 continue
+            if self._in_memory:
+                reason = "unpromoted" if artifact_id in self._metrics else "missing-metrics"
+                candidates.append(ArtifactRetentionCandidate(artifact_id, reason))
+                continue
             metrics_path = self._artifact_dir(artifact_id) / METRICS_FILENAME
             reason = "unpromoted" if metrics_path.is_file() else "missing-metrics"
             candidates.append(ArtifactRetentionCandidate(artifact_id, reason))
@@ -100,6 +116,14 @@ class ModelArtifactRegistry:
             return 0
         deleted = 0
         for candidate in candidates:
+            if self._in_memory:
+                if candidate.artifact_id in self._manifests:
+                    self._models.pop(candidate.artifact_id, None)
+                    self._manifests.pop(candidate.artifact_id, None)
+                    self._metrics.pop(candidate.artifact_id, None)
+                    self._forward_holdouts.pop(candidate.artifact_id, None)
+                    deleted += 1
+                continue
             artifact_dir = self._artifact_dir(candidate.artifact_id)
             if artifact_dir.is_dir():
                 shutil.rmtree(artifact_dir)
@@ -112,6 +136,12 @@ class ModelArtifactRegistry:
         return self.root / artifact_id
 
     def publish(self, model: Model, manifest: ModelManifest) -> str:
+        if self._in_memory:
+            if manifest.artifact_id in self._manifests:
+                raise ValueError(f"artifact already exists: {manifest.artifact_id}")
+            self._models[manifest.artifact_id] = model
+            self._manifests[manifest.artifact_id] = manifest
+            return manifest.artifact_id
         artifact_dir = self._artifact_dir(manifest.artifact_id)
         artifact_dir.mkdir(parents=True, exist_ok=True)
         manifest_path = artifact_dir / MANIFEST_FILENAME
@@ -123,6 +153,10 @@ class ModelArtifactRegistry:
         return manifest.artifact_id
 
     def load(self, artifact_id: str, request: PredictionRequest) -> LoadedModel:
+        if self._in_memory:
+            manifest = self.read_manifest(artifact_id)
+            self._validate_manifest(manifest, request)
+            return LoadedModel(model=self._models[artifact_id], manifest=manifest)
         artifact_dir = self._artifact_dir(artifact_id)
         if not artifact_dir.exists():
             raise FileNotFoundError(f"artifact {artifact_id!r} not found at {artifact_dir}")
@@ -143,6 +177,12 @@ class ModelArtifactRegistry:
         used by replay and scheduling code that must inspect the eligibility
         window before binding a decision time.
         """
+        if self._in_memory:
+            self._artifact_dir(artifact_id)
+            try:
+                return self._manifests[artifact_id]
+            except KeyError as exc:
+                raise FileNotFoundError(f"artifact {artifact_id!r} not found") from exc
         artifact_dir = self._artifact_dir(artifact_id)
         if not artifact_dir.exists():
             raise FileNotFoundError(f"artifact {artifact_id!r} not found at {artifact_dir}")
@@ -176,14 +216,35 @@ class ModelArtifactRegistry:
             )
 
     def write_metrics(self, artifact_id: str, metrics: dict[str, object]) -> None:
+        if self._in_memory:
+            self.read_manifest(artifact_id)
+            self._metrics[artifact_id] = dict(metrics)
+            return
         artifact_dir = self._artifact_dir(artifact_id)
         if not artifact_dir.exists():
             raise FileNotFoundError(f"artifact {artifact_id!r} not found")
         with (artifact_dir / METRICS_FILENAME).open("w", encoding="utf-8") as fh:
             json.dump(metrics, fh, indent=2, default=str)
 
+    def read_metrics(self, artifact_id: str) -> dict[str, object]:
+        """Return the metrics stored for an artifact."""
+        if self._in_memory:
+            self.read_manifest(artifact_id)
+            try:
+                return dict(self._metrics[artifact_id])
+            except KeyError as exc:
+                raise FileNotFoundError(f"artifact {artifact_id!r} has no metrics") from exc
+        artifact_dir = self._artifact_dir(artifact_id)
+        path = artifact_dir / METRICS_FILENAME
+        if not path.exists():
+            raise FileNotFoundError(f"artifact {artifact_id!r} has no metrics")
+        with path.open("r", encoding="utf-8") as fh:
+            return cast(dict[str, object], json.load(fh))
+
     def is_promoted(self, artifact_id: str) -> bool:
         """Return whether immutable promotion evidence marks an artifact promoted."""
+        if self._in_memory:
+            return self._metrics.get(artifact_id, {}).get("promoted") is True
         artifact_dir = self._artifact_dir(artifact_id)
         metrics_path = artifact_dir / METRICS_FILENAME
         if not metrics_path.exists():
@@ -203,6 +264,19 @@ class ModelArtifactRegistry:
         A candidate fingerprint may be inspected once; writing a second
         evaluation for the same fingerprint is rejected with ``ValueError``.
         """
+        if self._in_memory:
+            self.read_manifest(artifact_id)
+            memory_existing = self._forward_holdouts.get(artifact_id, {})
+            if memory_existing.get("fingerprint") == fingerprint:
+                raise ValueError(
+                    f"forward holdout for candidate fingerprint {fingerprint!r} "
+                    f"was already inspected for {artifact_id!r}"
+                )
+            self._forward_holdouts[artifact_id] = {
+                "fingerprint": fingerprint,
+                "evidence": evidence,
+            }
+            return fingerprint
         artifact_dir = self._artifact_dir(artifact_id)
         artifact_dir.mkdir(parents=True, exist_ok=True)
         path = artifact_dir / FORWARD_HOLDOUT_FILENAME
@@ -224,6 +298,9 @@ class ModelArtifactRegistry:
 
     def read_forward_holdout(self, artifact_id: str) -> dict[str, object] | None:
         """Return the persisted forward-holdout evidence for ``artifact_id``."""
+        if self._in_memory:
+            record = self._forward_holdouts.get(artifact_id)
+            return dict(record) if record is not None else None
         path = self._artifact_dir(artifact_id) / FORWARD_HOLDOUT_FILENAME
         if not path.exists():
             return None
