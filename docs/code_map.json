@@ -479,5 +479,8 @@
   "src/stocks/ml/wealth_transfer.py": {
     "architecture": "docs/specs/ml_wealth_edge_recovery.md",
     "testing": "tests/unit/stocks/ml/test_wealth_transfer.py"
+  },
+  "src/stocks/ml/comparison_report.py": {
+    "testing": "tests/unit/stocks/ml/test_comparison_report.py"
   }
 }
