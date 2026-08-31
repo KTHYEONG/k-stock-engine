@@ -241,7 +241,7 @@ def test_model_selection_uses_active_selection_once_and_records_reproducible_inp
         return orig_resolve_fn(**kwargs)
     monkeypatch.setattr(train, "resolve_active_research_data", counting_resolve)
 
-    # mock MlResultLedger to capture data_selection without snapshot_id - use simple pass-through
+    # Mock the Markdown report to capture data_selection without snapshot_id.
     class FakeLedger:
         def __init__(self, root): pass
         def record_research_outcome(self, **kwargs):
@@ -251,9 +251,7 @@ def test_model_selection_uses_active_selection_once_and_records_reproducible_inp
                 raise AssertionError("snapshot_id should not be in data_inputs")
             FakeLedger.captured = data_inputs
 
-    monkeypatch.setattr("src.stocks.cli.train.MlResultLedger", FakeLedger)
-    monkeypatch.setattr("src.stocks.ml.result_ledger.MlResultLedger", FakeLedger)
-    monkeypatch.setattr(train, "MlResultLedger", FakeLedger)
+    monkeypatch.setattr("src.stocks.cli.train.MlComparisonReport", FakeLedger)
 
     # mock load_cost_evidence to avoid needing real cost file
     def fake_load_cost(path, rng):
