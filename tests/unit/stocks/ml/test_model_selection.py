@@ -3390,3 +3390,29 @@ def test_screen_cache_uses_plan_width_and_reports_actual_capacity() -> None:
 
     assert counts == [12, 12, 12]
     assert min(counts) > plan.top_k
+
+
+def test_model_selection_facade_reexports_real_study_owner() -> None:
+    from src.stocks.ml import model_selection
+    from src.stocks.ml.model_selection_study import evaluate_model_selection_study
+
+    assert model_selection.evaluate_model_selection_study is evaluate_model_selection_study
+    assert evaluate_model_selection_study.__module__ == 'src.stocks.ml.model_selection_study'
+
+
+def test_model_selection_panel_rejects_duplicate_feature_keys() -> None:
+    from datetime import UTC, datetime
+
+    import polars as pl
+    import pytest
+
+    from src.stocks.ml.model_selection_panel import build_fold_learning_panel
+    from src.stocks.research.folds import Fold
+
+    session = datetime(2024, 1, 2, tzinfo=UTC)
+    features = pl.DataFrame({'instrument_id': ['KRX:000001', 'KRX:000001'], 'session': [session, session], 'session_index': [0, 0]})
+    labels = pl.DataFrame({'instrument_id': ['KRX:000001'], 'session': [session], 'net_alpha_target': [0.01]})
+    fold = Fold(train_mask=[0], validation_mask=[1], train_label_end=0, validation_decision_start=1)
+
+    with pytest.raises(ValueError, match='duplicate feature keys'):
+        build_fold_learning_panel(feature_frame=features, label_join=labels, fold=fold)
