@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_ML_LEARNING_PIPELINE_SIMPLIFICATION",
+      "date": "2026-08-31",
+      "adr_id": "ADR_20260831_STOCK_ML_LEARNING_PIPELINE_SIMPLIFICATION",
+      "domain": "stocks",
+      "title": "ML learning pipeline simplification and result observability",
+      "why": "ML screening was poisoned by missing-sampled-label all-or-nothing joins, internal time budgets truncated OOF evidence, and research-only results failed ledger validation because observability was missing.",
+      "resolution": "Added labeled fold panels with sparse-row accounting, ML rank-IC shortlist wiring, removed internal deadline cancellation from the main study path, and completed research ledger payloads with required observability and artifact keys.",
+      "impact": "ML runs now continue until caller timeout, sparse labels no longer abort valid folds, OOF/replay evidence is retained, and research results are durably written to latest/recent ledger files."
+    },
+    {
       "task_id": "TASK_ML_WEALTH_EDGE_RECOVERY",
       "date": "2026-08-31",
       "adr_id": "ADR_20260831_ML_WEALTH_EDGE_RECOVERY",
@@ -989,16 +999,6 @@
       "why": "Clean temp and log files",
       "resolution": "Removed tmp and logs files",
       "impact": "Freed up disk space"
-    },
-    {
-      "task_id": "TASK_STOCK_ML_COMPOUNDING_VALIDATION",
-      "date": "2026-08-15",
-      "adr_id": "ADR_20260815_STOCK_ML_COMPOUNDING_VALIDATION",
-      "domain": "stocks",
-      "title": "Forward-holdout compound-growth certification",
-      "why": "The net-alpha run had unstable OOF evidence and no forward-holdout orders, while artifact eligibility could expose an in-sample backtest and replay return fields were mislabeled as logarithmic.",
-      "resolution": "Added strict arithmetic-return replay semantics, base/stress geometric holdout certification with seeded bootstrap and coverage/drawdown gates, explicit no-trade diagnostics, forward-holdout artifact eligibility, bounded ledger projections, and executed a fresh run that failed closed as NO_TRADE.",
-      "impact": "Compound-growth claims now require complete costed forward evidence and cannot use training-period replay; the fresh 2026-08-15 run produced no promoted artifact because all horizons had no nonzero complete OOF blocks."
     }
   ]
 }
