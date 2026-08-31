@@ -352,7 +352,7 @@ class ExecutionReplayEvidence:
 
     def diagnostics(self) -> dict[str, object]:
         """Bounded execution evidence projection; never raw score/price vectors."""
-        return {
+        result: dict[str, object] = {
             "planned_cycles": int(self.planned_cycles),
             "filled_orders": int(self.filled_orders),
             "filled_cycle_count": int(self.filled_cycle_count),
@@ -375,6 +375,82 @@ class ExecutionReplayEvidence:
                 self.base_capacity_clipped_orders
             ),
         }
+        wf = self.conversion_waterfall
+        if wf is not None:
+            try:
+                # Build bounded waterfall projection with first_zero_stage
+                # Extract fields from ConversionWaterfallEvidence or dict-like
+                def _get(name: str, default: int = 0) -> int:
+                    if isinstance(wf, dict):
+                        return int(wf.get(name, default))  # type: ignore
+                    return int(getattr(wf, name, default))
+
+                def _get_str(name: str, default: str = "") -> str:
+                    if isinstance(wf, dict):
+                        return str(wf.get(name, default))  # type: ignore
+                    return str(getattr(wf, name, default))
+
+                # Order for first zero detection
+                ordered = [
+                    "scored_rows",
+                    "finite_score_rows",
+                    "calibrated_rows",
+                    "positive_mean_rows",
+                    "positive_lower_bound_rows",
+                    "eligible_rows",
+                    "target_positions",
+                    "scheduled_decisions",
+                    "allocation_ready_decisions",
+                    "target_change_decisions",
+                    "submitted_orders",
+                    "filled_orders",
+                    "observed_intervals",
+                    "invested_intervals",
+                ]
+                first_zero = "none"
+                for key in ordered:
+                    try:
+                        if _get(key, 0) == 0:
+                            first_zero = key
+                            break
+                    except Exception:  # noqa: S112
+                        continue
+                # Build projection dict with bounded scalars
+                proj: dict[str, object] = {
+                    "mode_id": _get_str("mode_id", "replay"),
+                    "score_frame_fingerprint": _get_str("score_frame_fingerprint", "0" * 64)[:64],
+                    "scored_rows": _get("scored_rows"),
+                    "finite_score_rows": _get("finite_score_rows"),
+                    "calibrated_rows": _get("calibrated_rows"),
+                    "positive_mean_rows": _get("positive_mean_rows"),
+                    "positive_lower_bound_rows": _get("positive_lower_bound_rows"),
+                    "eligible_rows": _get("eligible_rows"),
+                    "target_positions": _get("target_positions"),
+                    "scheduled_decisions": _get("scheduled_decisions"),
+                    "allocation_ready_decisions": _get("allocation_ready_decisions"),
+                    "target_change_decisions": _get("target_change_decisions"),
+                    "submitted_orders": _get("submitted_orders"),
+                    "filled_orders": _get("filled_orders"),
+                    "observed_intervals": _get("observed_intervals"),
+                    "invested_intervals": _get("invested_intervals"),
+                    "first_zero_stage": first_zero,
+                }
+                # Add bounded drop reasons as dicts (up to 16 entries each)
+                try:
+                    if isinstance(wf, dict):
+                        proj["row_drop_reasons"] = dict(wf.get("row_drop_reasons", {}))  # type: ignore
+                        proj["decision_drop_reasons"] = dict(wf.get("decision_drop_reasons", {}))  # type: ignore
+                        proj["order_drop_reasons"] = dict(wf.get("order_drop_reasons", {}))  # type: ignore
+                    else:
+                        proj["row_drop_reasons"] = {str(k): int(v) for k, v in getattr(wf, "row_drop_reasons", ())}
+                        proj["decision_drop_reasons"] = {str(k): int(v) for k, v in getattr(wf, "decision_drop_reasons", ())}
+                        proj["order_drop_reasons"] = {str(k): int(v) for k, v in getattr(wf, "order_drop_reasons", ())}
+                except Exception:  # noqa: S110
+                    pass
+                result["conversion_waterfall"] = proj
+            except Exception:  # noqa: S110
+                result["conversion_waterfall"] = {"first_zero_stage": "unknown"}
+        return result
 
 
 def run_executable_overlay_replay(request: ExecutionEquivalentReplayRequest, overlay: object) -> ExecutionReplayEvidence:
@@ -632,8 +708,10 @@ def _execute_candidate_segment(
     state.
     """
     # Wiring for wealth_transfer accumulator (O(1) counters, no raw rows)
+    from src.stocks.ml.contracts import ConversionWaterfallEvidence
     from src.stocks.ml.wealth_transfer import ConversionWaterfallAccumulator
     _acc = ConversionWaterfallAccumulator(mode_id="replay", score_frame_fingerprint="0"*64)
+    allocation_evidence: list[object] = []
     # derive buffer from rows strictly earlier than the segment cutoff and emit bounded provenance
     decision_times = segment.decision_times
     # Derive causal buffer for account lot challenger (strictly before first decision)
@@ -692,6 +770,15 @@ def _execute_candidate_segment(
         planner = _scenario_planner(new_context, segment.dataset_hash, cycle_cache)
     else:
         planner = _scenario_planner(context, segment.dataset_hash, cycle_cache)
+    base_planner = planner
+
+    def capturing_planner(prepared, portfolio, cycle_request):
+        cycle = base_planner(prepared, portfolio, cycle_request)
+        evidence = getattr(cycle, "allocation_evidence", None)
+        if evidence is not None:
+            allocation_evidence.append(evidence)
+        return cycle
+
     backtester = StockBacktester(
         registry=context.registry,
         instruments=context.instruments,
@@ -708,7 +795,7 @@ def _execute_candidate_segment(
             PreparedAllocationMarket.build(segment.scored_market),
             segment.score_overlay,
         ),
-        scenario_planner=planner,
+        scenario_planner=capturing_planner,
     )
     result = backtester.run_prepared(bt_request, segment.prepared_market, segment.score_overlay)
 
@@ -740,8 +827,45 @@ def _execute_candidate_segment(
             cold_start_economic_cash_decisions = int(
                 (~session_has_economic["has_economic"]).sum()
             )
-    _acc.add_orders(int(result.filled_orders), int(result.filled_orders), unfilled)
+    for evidence in allocation_evidence:
+        _acc.add_decision(evidence)
+    _acc.add_orders(int(result.attempted_orders), int(result.filled_orders), unfilled)
     _acc.add_intervals(len(segment_growth), int(segment_invested))
+    if allocation_evidence:
+        waterfall = _acc.finalize()
+    else:
+        score_values = np.asarray(segment.score_overlay, dtype=np.float64)
+        scored_rows = int(score_values.size)
+        finite_score_rows = int(np.isfinite(score_values).sum())
+        expected = (
+            np.asarray(segment.scored_market["expected_active_alpha"].to_numpy(), dtype=np.float64)
+            if "expected_active_alpha" in segment.scored_market.columns
+            else np.full(scored_rows, np.nan, dtype=np.float64)
+        )
+        lower = (
+            np.asarray(segment.scored_market["alpha_lower_bound"].to_numpy(), dtype=np.float64)
+            if "alpha_lower_bound" in segment.scored_market.columns
+            else np.full(scored_rows, np.nan, dtype=np.float64)
+        )
+        waterfall = ConversionWaterfallEvidence(
+            mode_id="replay",
+            score_frame_fingerprint="0" * 64,
+            scored_rows=scored_rows,
+            finite_score_rows=finite_score_rows,
+            calibrated_rows=int(np.isfinite(expected).sum()),
+            positive_mean_rows=int(np.sum(np.isfinite(expected) & (expected > 0.0))),
+            positive_lower_bound_rows=int(np.sum(np.isfinite(lower) & (lower > 0.0))),
+            eligible_rows=0,
+            target_positions=0,
+            scheduled_decisions=len(decisions),
+            allocation_ready_decisions=0,
+            target_change_decisions=0,
+            submitted_orders=int(result.attempted_orders),
+            filled_orders=int(result.filled_orders),
+            observed_intervals=len(segment_growth),
+            invested_intervals=int(segment_invested),
+            decision_drop_reasons=(("allocation_evidence_unavailable", len(decisions)),),
+        )
     return SegmentExecutionSummary(
         segment_id=int(segment_id),
         base_growth=segment_growth,
@@ -764,6 +888,7 @@ def _execute_candidate_segment(
         ),
         unfilled_reason_counts=unfilled,
         cold_start_economic_cash_decisions=cold_start_economic_cash_decisions,
+        conversion_waterfall=waterfall,
     )
 
 

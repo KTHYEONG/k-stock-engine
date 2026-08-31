@@ -14,6 +14,8 @@ from datetime import datetime
 
 import numpy as np
 
+from src.stocks.ml.contracts import ConversionWaterfallEvidence
+
 
 @dataclass(slots=True)
 class _SegmentTotals:
@@ -30,6 +32,7 @@ class _SegmentTotals:
     stress_exposure_weighted: float = 0.0
     capacity_clipped_orders: int = 0
     cold_start_economic_cash_decisions: int = 0
+    conversion_waterfalls: list[ConversionWaterfallEvidence] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -93,6 +96,8 @@ class CandidateReplayAccumulator:
         totals.cold_start_economic_cash_decisions += int(
             summary.cold_start_economic_cash_decisions
         )
+        if isinstance(summary.conversion_waterfall, ConversionWaterfallEvidence):
+            totals.conversion_waterfalls.append(summary.conversion_waterfall)
         self.cold_start_economic_cash_decisions += int(
             summary.cold_start_economic_cash_decisions
         )
@@ -127,6 +132,13 @@ class CandidateReplayAccumulator:
         if cold_start > 0:
             action_diagnostics = (("cold_start_economic_cash_decisions", int(cold_start)),)
 
+        conversion_waterfall = None
+        if totals.conversion_waterfalls:
+            from src.stocks.ml.wealth_transfer import merge_conversion_waterfalls
+
+            conversion_waterfall = merge_conversion_waterfalls(
+                tuple(totals.conversion_waterfalls)
+            )
         return ExecutionReplayEvidence(
             base_log_growth=tuple(self.base_growth),
             stress_log_growth=tuple(self.stress_growth),
@@ -150,6 +162,7 @@ class CandidateReplayAccumulator:
             stress_interval_exposure=tuple(self.stress_interval_exposure),
             base_interval_session_bounds=tuple(self.interval_session_bounds),
             base_capacity_clipped_orders=int(totals.capacity_clipped_orders),
+            conversion_waterfall=conversion_waterfall,
         )
 
 
@@ -176,3 +189,4 @@ class SegmentExecutionSummary:
     interval_session_bounds: tuple[datetime, ...] = ()
     capacity_clipped_orders: int = 0
     cold_start_economic_cash_decisions: int = 0
+    conversion_waterfall: object | None = None

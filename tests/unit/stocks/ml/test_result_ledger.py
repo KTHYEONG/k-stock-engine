@@ -1296,3 +1296,58 @@ def test_result_ledger_never_projects_promoted_status_for_synthetic_route() -> N
     assert compact["executable"] is False
     assert compact["conversion_waterfall"]["first_zero_stage"] == "certificate"
     assert "PROMOTED_EXCESS_SLEEVE" not in repr(compact)
+
+def test_zero_fill_replay_waterfall_survives_ledger_projection() -> None:
+    from src.stocks.cli.train import project_model_selection_ledger_outcome
+    from src.stocks.ml.contracts import ConversionWaterfallEvidence
+    from src.stocks.ml.execution_replay import ExecutionReplayEvidence
+
+    waterfall = ConversionWaterfallEvidence(
+        mode_id='replay',
+        score_frame_fingerprint='a' * 64,
+        scored_rows=12,
+        finite_score_rows=12,
+        calibrated_rows=12,
+        positive_mean_rows=0,
+        positive_lower_bound_rows=0,
+        eligible_rows=0,
+        target_positions=0,
+        scheduled_decisions=3,
+        allocation_ready_decisions=0,
+        target_change_decisions=0,
+        submitted_orders=0,
+        filled_orders=0,
+        observed_intervals=2,
+        invested_intervals=0,
+        row_drop_reasons=(('non_positive_expected_net_alpha', 12),),
+        decision_drop_reasons=(('no_allocation_ready', 3),),
+    )
+    evidence = ExecutionReplayEvidence(
+        base_log_growth=(0.0, 0.0),
+        stress_log_growth=(0.0, 0.0),
+        segment_ids=(0, 0),
+        planned_cycles=3,
+        filled_orders=0,
+        cash_session_fraction=0.0,
+        turnover=0.0,
+        observed_interval_count=2,
+        invested_interval_count=0,
+        conversion_waterfall=waterfall,
+    )
+
+    outcome = project_model_selection_ledger_outcome({
+        'status': 'RESEARCH_ONLY',
+        'runtime_ledger': {'screen_learner_fit_count': 18},
+        'candidates': [{
+            'family': 'extra_trees_v1',
+            'profile_diagnostics': [{
+                'profile_id': 'continuous_uncertainty_v1',
+                'status': 'replay-no-fills',
+                **evidence.diagnostics(),
+            }],
+        }],
+    })
+
+    diagnostic = outcome['candidates'][0]['profile_diagnostics'][0]
+    assert diagnostic['filled_orders'] == 0
+    assert diagnostic['conversion_waterfall']['first_zero_stage'] == 'positive_mean_rows'

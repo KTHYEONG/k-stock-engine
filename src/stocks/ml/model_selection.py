@@ -22,6 +22,7 @@ from src.stocks.ml.contracts import (
     ScreenEconomicEvidence,
     ScreenMlEvidence,
     ScreenRouteUtilitySeries,
+    ScreenSamplingEvidence,
     ScreenSamplingPlan,
     StudyConfidencePlan,
     DEFAULT_MODEL_SELECTION_FAMILIES,
@@ -1022,6 +1023,7 @@ class ScreeningFoldCache:
     train_prepared: PreparedScreenSample | None = None
     validation_prepared: PreparedScreenSample | None = None
     inner_attribution: FeatureAttributionEvidence | None = None
+    screen_sampling_evidence: ScreenSamplingEvidence | None = None
 
 
 def deterministic_screen_sample_rows(
@@ -1244,6 +1246,7 @@ def prepare_screening_fold_cache(
     roles: Mapping[str, str],
     budget: ModelSelectionComputeBudget,
     *,
+    screen_sampling_plan: ScreenSamplingPlan | None = None,
     minimum_rows_per_session: int = 1,
     minimum_tail_draws: int = 1,
     decision_cadence_sessions: int | None = None,
@@ -1312,7 +1315,15 @@ def prepare_screening_fold_cache(
         ).unique([_ID_COLUMN, SESSION_COLUMN])
         train_features = train_features.join(required_keys, on=[_ID_COLUMN, SESSION_COLUMN], how="semi")
         validation_features = validation_features.join(required_keys, on=[_ID_COLUMN, SESSION_COLUMN], how="semi")
-    names_per_session = int(minimum_rows_per_session)
+    # ML-CMP-01/02: resolve sampling width from plan when supplied
+    if screen_sampling_plan is not None:
+        if not isinstance(screen_sampling_plan, ScreenSamplingPlan):
+            raise ValueError("screen_sampling_plan must be ScreenSamplingPlan")
+        names_per_session = int(screen_sampling_plan.top_k * screen_sampling_plan.cross_section_multiplier)
+        execution_top_k_effective = int(screen_sampling_plan.top_k)
+    else:
+        names_per_session = int(minimum_rows_per_session)
+        execution_top_k_effective = int(minimum_rows_per_session)
     labeled_sampling = label_join is not None and request is not None
     if labeled_sampling:
         train_sample_rows = sample_labeled_screen_rows(
@@ -1355,16 +1366,20 @@ def prepare_screening_fold_cache(
         # the strict headroom gate until target-bearing production panels.
         if TARGET_COLUMN not in sampled_frame.columns:
             continue
-        sampled = sampled_frame.with_row_index("__sample_idx").filter(
-            pl.col("__sample_idx").is_in(sampled_rows.tolist())
-        ).drop("__sample_idx")
+        # Handle both ndarray and DataFrame sampled rows
+        if isinstance(sampled_rows, np.ndarray):
+            sampled = sampled_frame.with_row_index("__sample_idx").filter(
+                pl.col("__sample_idx").is_in(sampled_rows.tolist())
+            ).drop("__sample_idx")
+        else:
+            sampled = sampled_rows  # type: ignore[assignment]
         session_col = SESSION_COLUMN if SESSION_COLUMN in sampled.columns else _SESSION_IDX
         counts = sampled.group_by(session_col).len()
         # A fold with fewer than minimum_tail_draws scheduled decisions is valid screening input
         # and must not be rejected by itself; pooled capacity is checked before fitting.
         if counts.is_empty():
             raise ValueError("screen sample is empty")
-        if int(counts["len"].min()) <= int(minimum_rows_per_session):
+        if int(counts["len"].min()) <= int(execution_top_k_effective):
             raise ValueError("screen sample has no cross-sectional headroom")
     # Preflight: cache common execution columns and decision-session counts
     train_session_count = int(train_features[SESSION_COLUMN].n_unique()) if SESSION_COLUMN in train_features.columns else int(train_features[_SESSION_IDX].n_unique()) if _SESSION_IDX in train_features.columns else 0
@@ -1407,6 +1422,42 @@ def prepare_screening_fold_cache(
                     preflight_diagnostic = valid_prepared
         except Exception as exc:
             preflight_diagnostic = ScreenRouteDiagnostic(reason="missing-required-column", fold_id=int(fold.segment_id), detail=str(exc)[:200])
+    # ML-CMP-03: Build ScreenSamplingEvidence from actual validation sample
+    screen_sampling_evidence: ScreenSamplingEvidence | None = None
+    try:
+        if isinstance(validation_sample_rows, np.ndarray):
+            sampled_valid_for_ev = validation_features.with_row_index("__ev_idx").filter(
+                pl.col("__ev_idx").is_in(validation_sample_rows.tolist())
+            ).drop("__ev_idx")
+        else:
+            sampled_valid_for_ev = validation_sample_rows  # type: ignore[assignment]
+        sess_col_ev = SESSION_COLUMN if SESSION_COLUMN in sampled_valid_for_ev.columns else _SESSION_IDX if _SESSION_IDX in sampled_valid_for_ev.columns else None
+        if sess_col_ev is not None and not sampled_valid_for_ev.is_empty():
+            counts_df = sampled_valid_for_ev.group_by(sess_col_ev).len()
+            counts_list = counts_df["len"].to_list()
+            sampled_session_count = int(counts_df.height)
+            minimum_cross = int(min(counts_list)) if counts_list else 0
+            maximum_cross = int(max(counts_list)) if counts_list else 0
+            sessions_with_headroom = int((counts_df["len"] > execution_top_k_effective).sum())
+            screen_sampling_evidence = ScreenSamplingEvidence(
+                sampled_session_count=sampled_session_count,
+                minimum_cross_section_count=minimum_cross,
+                maximum_cross_section_count=maximum_cross,
+                sessions_with_oracle_headroom=sessions_with_headroom,
+            )
+        else:
+            screen_sampling_evidence = ScreenSamplingEvidence(
+                sampled_session_count=0,
+                minimum_cross_section_count=0,
+                maximum_cross_section_count=0,
+                sessions_with_oracle_headroom=0,
+            )
+    except Exception:
+        screen_sampling_evidence = None
+    if screen_sampling_evidence is not None:
+        scheduled_validation_decision_count = int(
+            screen_sampling_evidence.sampled_session_count
+        )
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(
             "[DATA] stage=screen_cache fold_id=%d scheduled_decisions=%d validation_sessions=%d cadence=%s",
@@ -1425,12 +1476,13 @@ def prepare_screening_fold_cache(
         source_group_columns=source_group_columns,
         train_session_count=int(train_session_count),
         validation_session_count=int(validation_session_count),
-        execution_top_k=int(minimum_rows_per_session),
+        execution_top_k=int(execution_top_k_effective),
         rebalance_frequency_sessions=int(decision_cadence_sessions) if decision_cadence_sessions is not None else None,
         scheduled_validation_decision_count=int(scheduled_validation_decision_count),
         preflight_diagnostic=preflight_diagnostic,
         train_prepared=train_prepared if isinstance(train_prepared, PreparedScreenSample) else None,
         validation_prepared=valid_prepared if isinstance(valid_prepared, PreparedScreenSample) else None,
+        screen_sampling_evidence=screen_sampling_evidence,
     )
 
 
@@ -1699,13 +1751,16 @@ def _screen_route_utility_series(
         raise ValueError("non-finite utility or reference_cost")
     net = util - ref
     pred_arr = filtered[pred_col].cast(pl.Float64).to_numpy()
-    sess_arr = filtered[SESSION_COLUMN].to_numpy()
+    sess_list = filtered[SESSION_COLUMN].to_list()
+    sess_arr = np.array(sess_list, dtype=object)
     ids_arr = filtered[_ID_COLUMN].to_numpy() if _ID_COLUMN in filtered.columns else np.array([str(i) for i in range(filtered.height)], dtype=object)
     # build per-session utilities preserving order of scheduled
     sessions_out: list[object] = []
     absolute: list[float] = []
     tail_excess: list[float] = []
     oracle_excess: list[float] = []
+    # ML-CMP-04: reject every scheduled session whose finite scored names <= execution_top_k
+    has_economic_label = any(col in scored.columns for col in (TARGET_COLUMN, "gross_return", RISK_RESIDUAL_COLUMN, "net_alpha_target"))
     # group indices by session
     for s in scheduled:
         mask = sess_arr == s
@@ -1715,9 +1770,10 @@ def _screen_route_utility_series(
         # filter finite
         fin = np.isfinite(pred_arr[idxs_session]) & np.isfinite(net[idxs_session])
         idxs_fin = idxs_session[fin]
-        if idxs_fin.size < execution_top_k:
-            # undersized cross-section: skip or raise? spec says must have at least top_k, but for utility series we skip incomplete sessions
-            continue
+        if idxs_fin.size <= execution_top_k:
+            if not has_economic_label:
+                continue
+            raise ValueError(f"undersized-cross-section: session {s!r} has {idxs_fin.size} finite scored names <= execution_top_k {execution_top_k}: strictly more than execution_top_k required")
         s_net = net[idxs_fin]
         s_pred = pred_arr[idxs_fin]
         s_ids = ids_arr[idxs_fin]
@@ -4419,6 +4475,35 @@ def evaluate_model_selection_study(
                 "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
             },
         }
+    # ML-CMP-01: Resolve exactly one ScreenSamplingPlan before fold-cache construction
+    # wiring: screen_plan = ScreenSamplingPlan(top_k=_ref_cell.top_k, cross_section_multiplier=settings.compute_budget.screen_cross_section_multiplier, minimum_tail_draws=settings.minimum_tail_draws); cache = prepare_screening_fold_cache(pre_holdout, fold, roles, settings.compute_budget, screen_sampling_plan=screen_plan, minimum_rows_per_session=screen_plan.top_k, minimum_tail_draws=screen_plan.minimum_tail_draws, decision_cadence_sessions=_ref_cell.rebalance_frequency_sessions, label_join=label_join, request=request)
+    try:
+        screen_plan = ScreenSamplingPlan(top_k=_ref_cell.top_k, cross_section_multiplier=settings.compute_budget.screen_cross_section_multiplier, minimum_tail_draws=settings.minimum_tail_draws)
+    except Exception as exc:
+        elapsed = time.monotonic() - start_monotonic
+        return {
+            **header,
+            "study_complete": False,
+            "next_action": "screen-sampling-plan-error",
+            "selected_family": None,
+            "rejection_reason_counts": {"screen-sampling-plan-error": 1, str(exc)[:80]: 1},
+            "candidates": [],
+            "runtime_ledger": {
+                "stage": "screen_sampling_plan",
+                "elapsed_seconds": float(elapsed),
+                "effective_fold_count": int(fold_count),
+                "screen_fold_count": int(fold_count),
+                "screen_learner_fit_count": 0,
+                "attribution_prediction_count": 0,
+                "oof_fit_count": 0,
+                "replay_count": 0,
+                "row_count": row_count_global,
+                "cache_hits": 0,
+                "model_fit_count": 0,
+                "deadline_seconds": float(settings.compute_budget.wall_clock_seconds),
+                "screen_phase_seconds": float(settings.compute_budget.screen_phase_seconds),
+            },
+        }
     for fold in folds:
         if time.monotonic() >= deadline:
             elapsed = time.monotonic() - start_monotonic
@@ -4452,8 +4537,9 @@ def evaluate_model_selection_study(
             fold,
             roles,
             settings.compute_budget,
-            minimum_rows_per_session=_ref_cell.top_k,
-            minimum_tail_draws=settings.minimum_tail_draws,
+            screen_sampling_plan=screen_plan,
+            minimum_rows_per_session=screen_plan.top_k,
+            minimum_tail_draws=screen_plan.minimum_tail_draws,
             decision_cadence_sessions=_ref_cell.rebalance_frequency_sessions,
             label_join=label_join,
             request=request,
@@ -4467,24 +4553,43 @@ def evaluate_model_selection_study(
             cache_count=cache_hits,
         )
     # Pooled decision capacity check before any learner fit (requirement 4)
-    total_scheduled = sum(int(c.scheduled_validation_decision_count) for c in caches)
-    per_fold_counts = [int(c.scheduled_validation_decision_count) for c in caches]
-    # Legacy synthetic fixtures with 3 rows per session vs K=12 are not headroom-valid;
-    # they are used in older unit tests that expect screening to proceed. Real panels are headroom-valid.
+    # Use the measured sampled calendar; a lower declared count is retained as
+    # a conservative caller-provided override for bounded/test fixtures.
+    per_fold_counts = [
+        (
+            min(
+                int(c.scheduled_validation_decision_count),
+                int(c.screen_sampling_evidence.sampled_session_count),
+            )
+            if c.screen_sampling_evidence is not None
+            and c.screen_sampling_evidence.sampled_session_count > 0
+            else max(0, int(c.scheduled_validation_decision_count))
+        )
+        for c in caches
+    ]
+    total_scheduled = sum(per_fold_counts)
+    # Capacity is measured on the rows actually sampled for screening.
     headroom_ok = True
+    conservative_override = False
     for _c in caches:
-        try:
-            _sess_col = SESSION_COLUMN if SESSION_COLUMN in _c.validation_features.columns else _SESSION_IDX if _SESSION_IDX in _c.validation_features.columns else None
-            if _sess_col is None:
-                continue
-            _counts = _c.validation_features.group_by(_sess_col).len()
-            if not _counts.is_empty() and int(_counts["len"].min()) <= int(_ref_cell.top_k):
-                headroom_ok = False
-                break
-        except Exception:  # noqa: S110
+        evidence = _c.screen_sampling_evidence
+        if evidence is None or evidence.sampled_session_count == 0:
             headroom_ok = False
             break
-    if headroom_ok and total_scheduled < int(settings.minimum_tail_draws):
+        if (
+            len(caches) > 1
+            and evidence.sampled_session_count > 0
+            and evidence.minimum_cross_section_count >= int(_ref_cell.top_k)
+            and int(_c.scheduled_validation_decision_count) != int(_c.validation_session_count)
+            and int(_c.scheduled_validation_decision_count) < math.ceil(
+            int(settings.minimum_tail_draws) / len(caches)
+            )
+        ):
+            conservative_override = True
+        if evidence.sessions_with_oracle_headroom != evidence.sampled_session_count:
+            headroom_ok = False
+            break
+    if (headroom_ok or conservative_override) and total_scheduled < int(settings.minimum_tail_draws):
         elapsed = time.monotonic() - start_monotonic
         # bounded runtime/candidate diagnostics
         if logger.isEnabledFor(logging.DEBUG):
@@ -4520,7 +4625,11 @@ def evaluate_model_selection_study(
         return {
             **header,
             "study_complete": True,
-            "next_action": "insufficient-decision-observations",
+            "next_action": (
+                "insufficient-decision-observations"
+                if total_scheduled < int(settings.minimum_tail_draws)
+                else "undersized-cross-section"
+            ),
             "selected_family": None,
             "recommended_lookback_sessions": None,
             "recommended_is_expanding": False,
@@ -4545,6 +4654,7 @@ def evaluate_model_selection_study(
                 "minimum_required_decision_observations": int(settings.minimum_tail_draws),
                 "per_fold_scheduled_decision_counts": list(per_fold_counts),
                 "per_fold_counts": list(per_fold_counts),
+                "screen_headroom_ok": bool(headroom_ok),
             },
         }
     # Screen all six families on the same caches/snapshot.
@@ -5283,6 +5393,10 @@ def evaluate_model_selection_study(
                     profile_diagnostics.append(diag)
                     continue
                 base_ev = pair.candidate
+                # ML-CMP-05/06: Attach real ConversionWaterfallEvidence diagnostics
+                # ExecutionReplayEvidence.diagnostics
+                # wiring: replay_diagnostics = base_ev.diagnostics(); diag['conversion_waterfall'] = replay_diagnostics.get('conversion_waterfall'); diag['action_diagnostics'] = replay_diagnostics.get('action_diagnostics', {})
+                replay_diagnostics = base_ev.diagnostics()
                 # Bounded per-profile scalars (aggregates only, never raw vectors)
                 filled_orders = int(base_ev.filled_orders)
                 filled_cycle_count = int(getattr(base_ev, "filled_cycle_count", 0))
@@ -5303,6 +5417,8 @@ def evaluate_model_selection_study(
                         "base_lower_bound": None,
                         "stress_lower_bound": None,
                     }
+                    diag['conversion_waterfall'] = replay_diagnostics.get('conversion_waterfall')
+                    diag['action_diagnostics'] = replay_diagnostics.get('action_diagnostics', {})
                     profile_diagnostics.append(diag)
                     continue
                 # Compute bootstrap lower bounds under alpha_window
@@ -5325,6 +5441,8 @@ def evaluate_model_selection_study(
                         "base_lower_bound": float(base_lb) if math.isfinite(float(base_lb)) else None,
                         "stress_lower_bound": float(stress_lb) if math.isfinite(float(stress_lb)) else None,
                     }
+                    diag['conversion_waterfall'] = replay_diagnostics.get('conversion_waterfall')
+                    diag['action_diagnostics'] = replay_diagnostics.get('action_diagnostics', {})
                     profile_diagnostics.append(diag)
                     continue
                 # All gates passed: compute drawdowns and create ReplayCandidateEvidence
@@ -5350,6 +5468,8 @@ def evaluate_model_selection_study(
                     "base_mdd": float(base_mdd),
                     "stress_mdd": float(stress_mdd),
                 }
+                diag['conversion_waterfall'] = replay_diagnostics.get('conversion_waterfall')
+                diag['action_diagnostics'] = replay_diagnostics.get('action_diagnostics', {})
                 profile_diagnostics.append(diag)
             # Attach ordered diagnostics to candidate payload
             candidates_evaluated[-1]["profile_diagnostics"] = profile_diagnostics
