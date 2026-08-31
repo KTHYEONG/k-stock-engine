@@ -108,3 +108,18 @@ def test_flag_off_profile_grid_unchanged() -> None:
     )
     assert DEFAULT_CANDIDATE_REBALANCE_FREQUENCY_SESSIONS == (5, 10, 20)
     assert EXCESS_FULL_KELLY_PROFILE_ID == "excess_full_kelly"
+
+
+def test_executable_hedge_requires_parallel_cash_safe_proxy_series() -> None:
+    import pytest
+
+    from src.stocks.ml.contracts import HedgeDeploymentEvidence, SmallCapitalPlanSettings
+    from src.stocks.ml.hedge_sleeve import project_executable_hedged_route
+
+    hedge = HedgeDeploymentEvidence(
+        tradable_proxy_id="KOSPI200_PROXY", beta=1.0, hedge_base_log_growth=(0.001,),
+        hedge_stress_log_growth=(0.001,), base_cost_drag=0.0, stress_cost_drag=0.0,
+        initial_margin_fraction=0.15,
+    )
+    with pytest.raises(ValueError, match="parallel"):
+        project_executable_hedged_route((0.001, 0.002), (0.001, 0.002), hedge, SmallCapitalPlanSettings(seed_capital_krw=10_000_000.0))

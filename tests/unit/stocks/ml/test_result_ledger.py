@@ -1351,3 +1351,21 @@ def test_zero_fill_replay_waterfall_survives_ledger_projection() -> None:
     diagnostic = outcome['candidates'][0]['profile_diagnostics'][0]
     assert diagnostic['filled_orders'] == 0
     assert diagnostic['conversion_waterfall']['first_zero_stage'] == 'positive_mean_rows'
+
+
+def test_model_selection_ledger_preserves_each_family_gate_waterfall() -> None:
+    from src.stocks.cli.train import project_model_selection_ledger_outcome
+
+    families = ["elastic_net_v2", "huber_linear_v1", "extra_trees_v1", "hist_gradient_quantile_v1", "rawnet_lgbm_v2", "tail_lambdarank_v2"]
+    payload = {
+        "status": "RESEARCH_ONLY",
+        "family_gate_waterfall": [
+            {"family": family, "terminal_status": "insufficient-decision-observations", "scheduled_decision_observations": 12, "minimum_required_decision_observations": 20}
+            for family in families
+        ],
+    }
+    projected = project_model_selection_ledger_outcome(payload)
+    rows = projected["family_gate_waterfall"]
+    assert [row["family"] for row in rows] == families
+    assert all(row["terminal_status"] == "insufficient-decision-observations" for row in rows)
+    assert all(row["scheduled_decision_observations"] == 12 for row in rows)

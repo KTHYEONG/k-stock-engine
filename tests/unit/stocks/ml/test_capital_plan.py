@@ -236,3 +236,31 @@ def test_all_scalars_rounded_to_twelve_places() -> None:
             assert value == round(value, 12)
 
     _walk(plan)
+
+
+def test_small_capital_mini_hedge_requires_stock_margin_and_reserve_funding() -> None:
+    from src.stocks.ml.capital_plan import build_small_capital_route_plan
+    from src.stocks.ml.contracts import SmallCapitalPlanSettings
+    from tests.unit.stocks.ml.test_capital_plan import _route, _positive_drift_series, _route_by_class
+
+    settings = SmallCapitalPlanSettings(seed_capital_krw=10_000_000.0, cash_reserve_fraction=0.05)
+    plan = build_small_capital_route_plan(_route(_positive_drift_series()), settings)
+    mini = _route_by_class(plan, "index_futures_mini")
+    assert float(mini["stock_notional_krw"]) + float(mini["initial_margin_krw"]) + float(plan["cash_reserve_krw"]) <= 10_000_000.0
+    assert float(mini["stock_notional_krw"]) < 9_500_000.0
+
+
+def test_hedge_deployment_rejects_research_residual_without_tradable_evidence() -> None:
+    from src.stocks.ml.capital_plan import build_small_capital_route_plan
+    from src.stocks.ml.contracts import SmallCapitalPlanSettings
+    from tests.unit.stocks.ml.test_capital_plan import _route, _positive_drift_series
+
+    plan = build_small_capital_route_plan(
+        _route(_positive_drift_series()),
+        SmallCapitalPlanSettings(seed_capital_krw=10_000_000.0),
+        absolute_certificate={"passed": True},
+        hedge_certificate={"passed": True},
+    )
+    assert plan["executable_hedge_verdict"] == "RESEARCH_ONLY_HEDGE"
+    assert "tradable-hedge-evidence-missing" in plan["reasons"]
+    assert plan["deployment_verdict"] != "DEPLOYABLE"
