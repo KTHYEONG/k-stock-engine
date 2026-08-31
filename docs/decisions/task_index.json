@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_WEALTH_EDGE_RECOVERY",
+      "date": "2026-08-31",
+      "adr_id": "ADR_20260831_ML_WEALTH_EDGE_RECOVERY",
+      "domain": "stocks_ml",
+      "title": "ML wealth edge recovery contract and evidence wiring",
+      "why": "Repeated ML changes showed positive relative signals but no asset-growth effect; calibration/allocation parity and executable conversion evidence were not trustworthy.",
+      "resolution": "Aligned signed calibration and economic gates, added bounded score-to-order waterfall evidence, wired prepared allocation evidence into trading cycles, enforced executable ETF overlay validation, and blocked synthetic promotion.",
+      "impact": "Candidates now fail with explicit conversion stages, synthetic hedge projections cannot promote, and only hash-bound executable evidence can reach wealth promotion; active data smoke still reports missing-sampled-label instead of claiming a champion."
+    },
+    {
       "task_id": "ml_asset_growth_performance",
       "date": "2026-08-30",
       "adr_id": "ADR_20260830_ml_asset_growth_performance",
@@ -989,16 +999,6 @@
       "why": "The net-alpha run had unstable OOF evidence and no forward-holdout orders, while artifact eligibility could expose an in-sample backtest and replay return fields were mislabeled as logarithmic.",
       "resolution": "Added strict arithmetic-return replay semantics, base/stress geometric holdout certification with seeded bootstrap and coverage/drawdown gates, explicit no-trade diagnostics, forward-holdout artifact eligibility, bounded ledger projections, and executed a fresh run that failed closed as NO_TRADE.",
       "impact": "Compound-growth claims now require complete costed forward evidence and cannot use training-period replay; the fresh 2026-08-15 run produced no promoted artifact because all horizons had no nonzero complete OOF blocks."
-    },
-    {
-      "task_id": "TASK_STOCK_NET_ALPHA_PERF",
-      "date": "2026-08-15",
-      "adr_id": "ADR_20260815_STOCK_NET_ALPHA_PERF",
-      "domain": "stocks",
-      "title": "Net-alpha training runtime & RAM peak optimization",
-      "why": "Full 6-horizon net-alpha run exceeded 20 minutes and aborted before artifact creation; to_dicts() row indexing posed a multi-GB transient RAM peak (OOM risk).",
-      "resolution": "Vectorized PurgedWalkForward._row_index, reused the standardized ElasticNet design across penalty fractions, converted causal-calibration and replay loops to partition-based iteration, maintained incremental prefix sums for the session-cluster bootstrap, and raised the LightGBM CLI thread default to 4; all output is bit-identical.",
-      "impact": "Estimated 15-25 min -> ~6-10 min and removal of the multi-GB to_dicts peak; determinism preserved and verified across thread counts."
     }
   ]
 }
