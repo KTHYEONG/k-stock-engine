@@ -470,7 +470,8 @@
   "src/stocks/ml/model_selection.py": {
     "testing": [
       "tests/unit/stocks/ml/test_model_selection.py",
-      "tests/integration/stocks/test_net_alpha_economic_recovery.py"
+      "tests/integration/stocks/test_net_alpha_economic_recovery.py",
+      "tests/unit/stocks/cli/test_train.py"
     ],
     "architecture": "docs/results/ml-cmp.md"
   },

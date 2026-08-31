@@ -940,7 +940,7 @@ class ConversionWaterfallEvidence:
         decision_vocab = {"no_allocation_ready", "no_target_change"}
         order_vocab = {"no-session-row", "capacity_clipped", "lot_rejected"}
         # allow test vocab as well
-        vocab_all = row_vocab | decision_vocab | order_vocab | {"insufficient_history", "non_finite_bucket", "negative_mean", "lower_bound_gate", "no_trade_band", "capacity_cap", "turnover_cap", "sector_cap", "model-nonconverged", "missing_alpha_se"}
+        vocab_all = row_vocab | decision_vocab | order_vocab | {"insufficient_history", "non_finite_bucket", "negative_mean", "lower_bound_gate", "no_trade_band", "capacity_cap", "turnover_cap", "sector_cap", "model-nonconverged", "missing_alpha_se", "non_positive_expected_net_alpha", "no_allocation_ready"}
         for col_name, _voc in [("row_drop_reasons", row_vocab), ("decision_drop_reasons", decision_vocab), ("order_drop_reasons", order_vocab)]:
             reasons = getattr(self, col_name)
             for reason, count in reasons:
