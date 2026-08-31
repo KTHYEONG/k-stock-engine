@@ -1,5 +1,4 @@
 # mypy: ignore-errors
-# ruff: noqa: I001
 """Deterministic capped inverse-return-volatility target construction.
 
 The constructor consumes a *scored panel* (one row per instrument per session
@@ -13,7 +12,6 @@ All frame-level transforms are vectorized Polars/NumPy; per-row filtering,
 ``map_rows``, and ``pandas.apply`` are prohibited on this path.
 """
 from __future__ import annotations
-from typing import Any  # noqa: E402,I001
 
 import hashlib
 import json
@@ -44,8 +42,6 @@ from src.stocks.trading.policy import (
 )
 
 logger = logging.getLogger("stocks.trading.portfolio_constructor")
-from src.stocks.trading.portfolio_economic_gates import economic_gate_masks as _economic_gate_ref  # noqa: E402,F401
-
 
 # Wealth transfer evidence contracts (spec)
 @dataclass(frozen=True, slots=True)
@@ -1483,17 +1479,242 @@ StockRiskPolicy = _PolicyStockRiskPolicy  # type: ignore  # noqa: F811
 stock_risk_policy_fingerprint = _policy_fingerprint  # type: ignore  # noqa: F811
 
 
-from src.stocks.trading.portfolio_allocation import construct_target_allocations as _alloc_impl  # noqa: E402,I001,F401  # real owner
+def construct_target_allocations(
+    panel: pl.DataFrame,
+    instruments: Mapping[str, Instrument],
+    portfolio: PortfolioSnapshot,
+    policy: StockRiskPolicy,
+) -> tuple[Allocation, ...]:
+    """Build constrained long-only target allocations from a scored panel.
 
-def construct_target_allocations(panel: Any, instruments: Any, portfolio: Any, policy: Any) -> Any:  # type: ignore[no-untyped-def]
-    return _alloc_impl(panel, instruments, portfolio, policy)  # type: ignore[no-untyped-call]
+    Returns allocations sorted by ``instrument_id``. When no input is eligible,
+    returns an empty tuple rather than synthetic weights.
+    """
+    _validate_scores_frame(panel, instruments)
 
-import src.stocks.trading.portfolio_allocation as _pa  # noqa: E402,I001
-import contextlib as _ctx_alloc  # noqa: E402
-with _ctx_alloc.suppress(Exception):
-    construct_target_allocations = _pa.construct_target_allocations
-    # Keep exception identity stable for callers importing the legacy facade.
-    _pa.PortfolioConstraintError = PortfolioConstraintError
+    panel = panel.sort([_SESSION_COLUMN, "instrument_id"])
+    if "__vol" not in panel.columns:
+        returns = _returns_column(panel)
+        panel = panel.with_columns(
+            returns.rolling_std(
+                window_size=policy.volatility_lookback_sessions,
+                min_samples=2,
+            )
+            .over("instrument_id")
+            .alias("__vol"),
+        )
+
+    cross_section = _latest_cross_section(panel)
+    eligible = cross_section.filter(
+        pl.col("pred_score").is_not_null()
+        & pl.col("__vol").is_not_null()
+        & (pl.col("__vol") > 0)
+        & (pl.col("adtv") > 0)
+        & (pl.col("sector").is_not_null())
+    )
+    if eligible.is_empty():
+        return ()
+
+    equity = _portfolio_equity(portfolio, cross_section)
+    price_map = _price_map(cross_section)
+    current_weights = _current_weights(portfolio, price_map, equity)
+    incumbent_ids = set(current_weights)
+
+    if all(column in cross_section.columns for column in _ECONOMIC_COLUMNS):
+        eligible = _economically_eligible(
+            cross_section, eligible, incumbent_ids,
+            no_trade_band_bps=policy.no_trade_band_bps,
+            economic_gate_mode=policy.economic_gate_mode,
+        )
+
+    raw_scores = np.asarray(eligible["pred_score"].to_list(), dtype=np.float64)
+    eligible_ids = np.asarray(eligible["instrument_id"].to_list(), dtype=object)
+    if policy.economic_ranking_mode == "economic_net_v1" and not all(
+        column in eligible.columns for column in _ECONOMIC_COLUMNS
+    ):
+        raise ValueError("economic_net_v1 requires calibrated economic inputs")
+    if policy.economic_ranking_mode == "economic_net_v1":
+        rank_values = _economic_rank_values(
+            raw_scores=raw_scores,
+            expected_active_alpha=np.asarray(
+                eligible["expected_active_alpha"].to_list(), dtype=np.float64
+            ),
+            expected_net_alpha=np.asarray(
+                eligible["expected_net_alpha"].to_list(), dtype=np.float64
+            ),
+            exit_cost_rate=np.asarray(
+                eligible["exit_cost_rate"].to_list(), dtype=np.float64
+            ),
+            instrument_ids=eligible_ids,
+            incumbent_ids=incumbent_ids,
+            ranking_mode=policy.economic_ranking_mode,
+        )
+    else:
+        rank_values = raw_scores
+    order = rank_stock_candidate_indices(rank_values, eligible_ids)
+    ranked = (
+        eligible.gather(order)
+        .with_row_index("__rank", offset=1)
+        .filter(
+            (pl.col("__rank") <= policy.enter_rank)
+            | (
+                pl.col("instrument_id").is_in(incumbent_ids)
+                & (pl.col("__rank") <= policy.keep_rank)
+            )
+        )
+    )
+    ranked_count = ranked.height
+    ranked = ranked.head(policy.top_k).drop("__rank")
+    if ranked.is_empty():
+        return ()
+
+    ids = [str(r) for r in ranked["instrument_id"].to_list()]
+    decision_session = cross_section[_SESSION_COLUMN][0]
+    candidate_count = eligible.height
+    selected_count = len(ids)
+    net_lower_bound_of: dict[str, float] = {}
+    if (
+        policy.compounding.enabled
+        and policy.sizing_mode != "continuous_uncertainty_v1"
+        and "net_alpha_lower_bound" in cross_section.columns
+    ):
+        net_lower_bound_of = {
+            str(instrument_id): float(value)
+            for instrument_id, value in zip(
+                cross_section["instrument_id"].to_list(),
+                cross_section["net_alpha_lower_bound"].to_list(),
+                strict=True,
+            )
+            if value is not None
+        }
+        for instrument_id in ids:
+            if instrument_id not in net_lower_bound_of or not math.isfinite(
+                net_lower_bound_of[instrument_id]
+            ):
+                _record_compounding_decision(
+                    policy,
+                    decision_session=decision_session,
+                    candidate_count=candidate_count,
+                    ranked_count=ranked_count,
+                    selected_count=selected_count,
+                    confidence_edge_h=None,
+                    confidence_variance_h=None,
+                    confidence_scale=None,
+                    gross_before_compounding=0.0,
+                    gross_after_compounding=0.0,
+                    turnover_lambda=0.0,
+                    cash_reason="invalid-confidence-variance",
+                )
+                return ()
+    sector_of = dict(
+        zip(
+            (str(i) for i in cross_section["instrument_id"].to_list()),
+            cross_section["sector"].to_list(),
+            strict=True,
+        )
+    )
+    adtv_of = {
+        str(instrument_id): float(value)
+        for instrument_id, value in zip(
+            cross_section["instrument_id"].to_list(),
+            cross_section["adtv"].to_list(),
+            strict=True,
+        )
+    }
+    vol_of = {
+        str(instrument_id): float(value)
+        for instrument_id, value in zip(
+            ranked["instrument_id"].to_list(),
+            ranked["__vol"].to_list(),
+            strict=True,
+        )
+    }
+    priority_alpha_of = _priority_alpha_of(
+        ranked, incumbent_ids, cross_section
+    )
+    expected_net_alpha_of = {
+        str(instrument_id): float(value)
+        for instrument_id, value in zip(
+            cross_section["instrument_id"].to_list(),
+            cross_section["expected_net_alpha"].to_list(),
+            strict=True,
+        )
+        if value is not None and math.isfinite(float(value))
+    } if "expected_net_alpha" in cross_section.columns else {}
+    alpha_standard_error_of = {
+        str(instrument_id): float(value)
+        for instrument_id, value in zip(
+            cross_section["instrument_id"].to_list(),
+            cross_section["alpha_standard_error"].to_list(),
+            strict=True,
+        )
+        if value is not None and math.isfinite(float(value)) and float(value) >= 0.0
+    } if "alpha_standard_error" in cross_section.columns else {}
+
+    feasible = _portfolio_is_feasible(current_weights, sector_of, equity, policy)
+    if feasible:
+        economic_inputs = None
+        if policy.execution_utility_mode == "sparse_hold_replace_v2" and all(
+            column in cross_section.columns for column in _ECONOMIC_COLUMNS
+        ):
+            selected = cross_section.filter(pl.col("instrument_id").is_in(ids)).sort("instrument_id")
+            economic_inputs, _ = _economic_transition_inputs(
+                [str(value) for value in selected["instrument_id"].to_list()],
+                [float(value) for value in selected["alpha_lower_bound"].to_list()],
+                [float(value) for value in selected["net_alpha_lower_bound"].to_list()],
+                [float(value) for value in selected["exit_cost_rate"].to_list()],
+            )
+        allocations = _build_allocations(
+            ids,
+            sector_of,
+            adtv_of,
+            vol_of,
+            current_weights,
+            equity,
+            panel,
+            instruments,
+            policy,
+            priority_alpha_of=priority_alpha_of,
+            net_lower_bound_of=net_lower_bound_of,
+            expected_net_alpha_of=expected_net_alpha_of,
+            alpha_standard_error_of=alpha_standard_error_of,
+            decision_session=decision_session,
+            candidate_count=candidate_count,
+            ranked_count=ranked_count,
+            selected_count=selected_count,
+            economic_inputs=economic_inputs,
+            net_exposure_proxy=(
+                _panel_market_proxy(panel, decision_session)
+                if policy.net_exposure_gate_mode != "off_v1"
+                else None
+            ),
+        )
+    else:
+        allocations = _de_risk_allocations(
+            current_weights, sector_of, equity, instruments, policy
+        )
+
+    # project_allocations_to_lots(continuous_allocations, price_by_instrument=..., volatility_by_instrument=..., net_alpha_lower_bound_by_instrument=..., equity=equity, policy=policy)
+    # Lot-aware projection (disabled parity preserves legacy target_value-only)
+    if getattr(policy, "lot_sizing", None) is not None and getattr(policy.lot_sizing, "enabled", False):
+        price_map_lot = _price_map(cross_section)
+        # Build volatility map for selected names; fallback to vol_of
+        allocations = project_allocations_to_lots(
+            allocations,
+            price_by_instrument=price_map_lot,
+            volatility_by_instrument=vol_of,
+            net_alpha_lower_bound_by_instrument=net_lower_bound_of,
+            equity=equity,
+            policy=policy,
+            sector_by_instrument=sector_of,
+            adtv_by_instrument=adtv_of,
+        )
+
+    _post_validate(
+        allocations, equity, policy, sector_of, adtv_of, panel,
+        current_weights=current_weights,
+    )
+    return tuple(sorted(allocations, key=lambda a: a.instrument.instrument_id))
 
 
 def _validate_scores_frame(scores: pl.DataFrame, instruments: Mapping[str, Instrument]) -> None:
