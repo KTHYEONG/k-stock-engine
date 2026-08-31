@@ -181,6 +181,7 @@ class TestReplayBatchBenchmark:
         assert spec.loader is not None
 
 
+@pytest.mark.slow
 class TestReplayBatchWiring:
     """REPLAY_BATCH_03_FULL_FRONTIER_WIRING; TRAIN_COMPLETION_04_CADENCE_WIRING."""
 
@@ -291,6 +292,7 @@ class TestReplayBatchWiring:
 PARALLEL_COMPLETION_02_MIXED_PROFILE_SCHEDULE = "PARALLEL_COMPLETION_02_MIXED_PROFILE_SCHEDULE"
 
 
+@pytest.mark.slow
 class TestParallelCompletionMixedProfileSchedule:
     """PARALLEL_COMPLETION_02_MIXED_PROFILE_SCHEDULE.
 
@@ -422,6 +424,7 @@ class TestParallelCompletionMixedProfileSchedule:
 PERF_MEASURE_01 = "PERF-MEASURE-01"
 
 
+@pytest.mark.slow
 class TestPerfMeasure01:
     """PERF-MEASURE-01: disjoint replay timers and observed build/cache stats."""
 
@@ -1312,6 +1315,7 @@ class TestHorizonBlendFrontier:
             if key[3].endswith(":blend"):
                 assert reason == "", key
 
+    @pytest.mark.slow
     def test_base_evidence_unchanged_when_flag_off(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2247,3 +2251,11 @@ def test_family_specific_calibration_seed_rejects_outer_oof_duplicate_keys(monke
     seed_dup = pl.DataFrame({"instrument_id": ["KRX:00001"], "session": [sessions[5]], "score": [0.1], "gross_return": [0.02], "risk_residual": [0.01], "reference_cost": [0.001], "label_available_time": [sessions[4]], "realized_net_return": [0.01]})
     with pytest.raises(ValueError):
         _causal_oof_calibrate(oof, oof_labels, req, 10, seed_ledger=seed_dup)
+
+
+def test_training_facade_reexports_real_orchestrator_owner() -> None:
+    from src.stocks.ml import training
+    from src.stocks.ml.training_orchestrator import train_net_alpha_model
+
+    assert training.train_net_alpha_model is train_net_alpha_model
+    assert train_net_alpha_model.__module__ == 'src.stocks.ml.training_orchestrator'
