@@ -77,9 +77,11 @@ def main() -> None:
             "python_assertion": f"assert calc_{feature_slug}(1.0) == 1.0",
             "scenarios": [
                 {
-                    "scenario_id": f"SCENARIO_{feature_slug.upper()}_01",
+                    "scenario_id": f"test_{feature_slug}_executes_correctly",
                     "target_test_file": f"tests/unit/{args.domain}/test_{feature_slug}.py",
-                    "expected_behavior": "Handles normal input correctly"
+                    "execution_command": f"uv run pytest tests/unit/{args.domain}/test_{feature_slug}.py -k test_{feature_slug}_executes_correctly -q",
+                    "expected_behavior": "Handles normal input and returns expected result",
+                    "test_skeleton": f"def test_{feature_slug}_executes_correctly() -> None:\n    from src.{args.domain}.{feature_slug} import calc_{feature_slug}\n\n    result = calc_{feature_slug}(1.0)\n    assert result == 1.0\n"
                 }
             ],
             "wiring": {
