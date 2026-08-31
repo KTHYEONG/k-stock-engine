@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCKS_ML_COMPOUND_GROWTH_20260831",
+      "date": "2026-08-31",
+      "adr_id": "ADR_20260831_STOCKS_ML_COMPOUND_GROWTH_20260831",
+      "domain": "signal",
+      "title": "ML screen capacity and execution waterfall evidence",
+      "why": "K×4 capacity preflight diverged from K-name screen sampling, while ordinary execution replay dropped zero-fill conversion causes and research ledger truncated candidate diagnostics.",
+      "resolution": "Bind one ScreenSamplingPlan to actual fold sampling, reject economically undersized screen sessions, propagate point-in-time rescope, attach allocation/replay waterfall evidence, and persist bounded structured diagnostics.",
+      "impact": "Research-only ML selection now measures real cross-sectional headroom and exposes the first zero stage; promotion and live policy remain fail-closed."
+    },
+    {
       "task_id": "TASK_STOCK_ML_LEARNING_PIPELINE_SIMPLIFICATION",
       "date": "2026-08-31",
       "adr_id": "ADR_20260831_STOCK_ML_LEARNING_PIPELINE_SIMPLIFICATION",
@@ -989,16 +999,6 @@
       "why": "The six-candidate net-alpha run spent 95.76% of 136.6 seconds in horizon discovery, used severely imbalanced OOF folds, and produced a false positive h20 bootstrap lower bound because seven 20-session cohorts were resampled as one block; strict replay then rejected all horizons.",
       "resolution": "Implemented holdout-safe feature schema handling, balanced maximum-horizon purged folds, segment-local complete cohorts, annualized base/stress cohort-unit bootstrap with Holm-Bonferroni admission, session-balanced weighted learning, vectorized ElasticNet paths, baseline OOF reuse, and one rankability-gated challenger with bounded observability.",
       "impact": "OOF evidence and compound-growth claims are now calendar-, cost-, and multiplicity-valid; discovery optimizer invocations are bounded from 234 fits to 72 path evaluations for the current request, while invalid evidence remains explicit NO_TRADE."
-    },
-    {
-      "task_id": "TASK_CLEANUP_TMP_LOGS",
-      "date": "2026-08-15",
-      "adr_id": "ADR_20260815_CLEANUP_TMP_LOGS",
-      "domain": "general",
-      "title": "Clean tmp and logs",
-      "why": "Clean temp and log files",
-      "resolution": "Removed tmp and logs files",
-      "impact": "Freed up disk space"
     }
   ]
 }

@@ -298,3 +298,23 @@ def test_model_selection_uses_active_selection_once_and_records_reproducible_inp
     assert call_count["resolve"] == 1
     assert hasattr(FakeLedger,"captured")
     assert "snapshot_id" not in FakeLedger.captured
+
+def test_research_request_preserves_low_mcap_rescope_policy(monkeypatch, tmp_path) -> None:
+    from src.stocks.cli import train
+    from src.stocks.ml.contracts import UniverseRescopeSettings
+
+    parser = train.build_parser()
+    parsed = parser.parse_args([
+        '--artifact-id', 'rescope-probe',
+        '--enable-universe-rescope',
+        '--rescope-mcap-quantile-lo', '0.0',
+        '--rescope-mcap-quantile-hi', '0.25',
+    ])
+    request = train._build_training_request(parsed)
+    expected = UniverseRescopeSettings(
+        market_cap_quantile_lo=0.0,
+        market_cap_quantile_hi=0.25,
+    )
+
+    assert request.universe_rescope == expected
+    assert request.universe_rescope.fingerprint == expected.fingerprint
