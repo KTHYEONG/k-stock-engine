@@ -45,7 +45,7 @@ from src.stocks.trading.portfolio_constructor import (
     PreparedAllocationMarket,
     StockRiskPolicy,
     construct_target_allocations,
-    construct_target_allocations_prepared,
+    construct_target_allocations_prepared,  # noqa: F401
     stock_risk_policy_fingerprint,
 )
 
@@ -130,6 +130,7 @@ class TradingCycleResult:
     label_hash: str = ""
     cost_hash: str = ""
     risk_policy_hash: str = ""
+    allocation_evidence: object | None = None
 
     @property
     def no_intents(self) -> bool:
@@ -406,13 +407,16 @@ def plan_prepared_scored_cycle(
                 request, portfolio, dataset_hash, "empty-latest-cross-section"
             )
 
+    allocation_evidence = None
+    from src.stocks.trading.portfolio_constructor import construct_target_allocations_prepared_with_evidence
     use_prepared = _prepared_cross_section_matches(prepared, cross_section)
     try:
         if use_prepared:
             assert isinstance(prepared.allocation_market, PreparedAllocationMarket)
             assert prepared.allocation_decision_index is not None
             assert prepared.score_overlay is not None
-            allocations = construct_target_allocations_prepared(
+            # Call evidence API for waterfall (bounded counters)
+            _ev = construct_target_allocations_prepared_with_evidence(
                 prepared.allocation_market,
                 prepared.allocation_decision_index,
                 prepared.score_overlay,
@@ -421,6 +425,8 @@ def plan_prepared_scored_cycle(
                 portfolio,
                 request.risk_policy,
             )
+            allocations = _ev.allocations
+            allocation_evidence = _ev.evidence
         else:
             allocations = construct_target_allocations(
                 scored, instruments, portfolio, request.risk_policy
@@ -464,6 +470,7 @@ def plan_prepared_scored_cycle(
         label_hash=fingerprints["label_hash"],
         cost_hash=fingerprints["cost_hash"],
         risk_policy_hash=fingerprints["risk_policy_hash"],
+        allocation_evidence=allocation_evidence,
     )
 
 

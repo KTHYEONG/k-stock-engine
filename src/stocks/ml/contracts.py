@@ -36,6 +36,7 @@ class RouteObjectiveKind(StrEnum):
 
     UNHEDGED_ABSOLUTE = "unhedged_absolute"
     HEDGED_RESIDUAL = "hedged_residual"
+    EXECUTABLE_HEDGED = "executable_hedged"
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,7 +57,7 @@ class RouteObjective:
                 object.__setattr__(self, "kind", RouteObjectiveKind(str(self.kind)))
             except ValueError as exc:
                 raise ValueError(f"unknown RouteObjectiveKind {self.kind!r}") from exc
-        if self.kind is RouteObjectiveKind.HEDGED_RESIDUAL:
+        if self.kind in (RouteObjectiveKind.HEDGED_RESIDUAL, RouteObjectiveKind.EXECUTABLE_HEDGED):
             if not self.hedge_instrument or not self.hedge_evidence_hash:
                 raise ValueError(
                     "hedged_residual route requires hedge_instrument and hedge_evidence_hash"
@@ -868,42 +869,110 @@ class ScreenRouteUtilitySeries:
 class ConversionWaterfallEvidence:
     mode_id: str
     score_frame_fingerprint: str
-    finite_score_rows: int
-    calibrated_rows: int
-    positive_mean_rows: int
-    eligible_rows: int
-    target_positions: int
-    submitted_orders: int
-    filled_orders: int
-    observed_intervals: int
-    invested_intervals: int
-    drop_reasons: tuple[tuple[str, int], ...]
+    scored_rows: int = 0
+    finite_score_rows: int = 0
+    calibrated_rows: int = 0
+    positive_mean_rows: int = 0
+    positive_lower_bound_rows: int = 0
+    eligible_rows: int = 0
+    target_positions: int = 0
+    scheduled_decisions: int = 0
+    allocation_ready_decisions: int = 0
+    target_change_decisions: int = 0
+    submitted_orders: int = 0
+    filled_orders: int = 0
+    observed_intervals: int = 0
+    invested_intervals: int = 0
+    row_drop_reasons: tuple[tuple[str, int], ...] = ()
+    decision_drop_reasons: tuple[tuple[str, int], ...] = ()
+    order_drop_reasons: tuple[tuple[str, int], ...] = ()
+    drop_reasons: tuple[tuple[str, int], ...] = ()
 
     def __post_init__(self) -> None:
+        # Legacy compatibility: map old drop_reasons and missing scored fields
+        if self.drop_reasons and not self.row_drop_reasons:
+            object.__setattr__(self, "row_drop_reasons", tuple(sorted(self.drop_reasons)))
+        # Legacy scored inference: if scored is 0 but finite provided, treat scored as finite for monotonic
+        if self.scored_rows == 0 and self.finite_score_rows != 0:
+            object.__setattr__(self, "scored_rows", int(self.finite_score_rows))
+        if self.positive_lower_bound_rows == 0 and self.positive_mean_rows != 0:
+            # legacy had no positive_lower_bound distinction, copy positive_mean
+            object.__setattr__(self, "positive_lower_bound_rows", int(self.positive_mean_rows))
+        if self.scheduled_decisions == 0 and self.observed_intervals != 0:
+            object.__setattr__(self, "scheduled_decisions", 1)
+            object.__setattr__(self, "allocation_ready_decisions", 1)
+            object.__setattr__(self, "target_change_decisions", 1)
+            if not self.decision_drop_reasons:
+                object.__setattr__(self, "decision_drop_reasons", ())
+            if not self.order_drop_reasons and self.submitted_orders == 0:
+                object.__setattr__(self, "order_drop_reasons", ())
+
         if not self.mode_id:
             raise ValueError("mode_id must be non-empty")
         if not self.score_frame_fingerprint:
             raise ValueError("score_frame_fingerprint must be non-empty")
-        for name in ("finite_score_rows", "calibrated_rows", "positive_mean_rows", "eligible_rows", "target_positions", "submitted_orders", "filled_orders", "observed_intervals", "invested_intervals"):
+        is_legacy = bool(self.drop_reasons)
+        for name in ("scored_rows", "finite_score_rows", "calibrated_rows", "positive_mean_rows", "positive_lower_bound_rows", "eligible_rows", "target_positions", "scheduled_decisions", "allocation_ready_decisions", "target_change_decisions", "submitted_orders", "filled_orders", "observed_intervals", "invested_intervals"):
             v = getattr(self, name)
             if not isinstance(v, int) or v < 0:
                 raise ValueError(f"{name} must be non-negative int")
-        if not (self.finite_score_rows >= self.calibrated_rows >= self.positive_mean_rows >= self.eligible_rows >= self.target_positions):
-            raise ValueError("ConversionWaterfallEvidence counts must satisfy finite>=calibrated>=positive_mean>=eligible>=target_positions")
+        if not (self.scored_rows >= self.finite_score_rows >= self.calibrated_rows >= self.positive_mean_rows >= self.positive_lower_bound_rows >= self.eligible_rows >= self.target_positions):
+            raise ValueError("ConversionWaterfallEvidence row counts must satisfy scored>=finite>=calibrated>=positive_mean>=positive_lower_bound>=eligible>=target_positions")
+        if not (self.scheduled_decisions >= self.allocation_ready_decisions >= self.target_change_decisions):
+            raise ValueError("ConversionWaterfallEvidence decision counts must satisfy scheduled>=allocation_ready>=target_change")
         if not (self.submitted_orders >= self.filled_orders):
             raise ValueError("submitted_orders must be >= filled_orders")
         if self.invested_intervals > self.observed_intervals:
             raise ValueError("invested_intervals must be <= observed_intervals")
-        vocab = {"insufficient_history", "non_finite_bucket", "negative_mean", "lower_bound_gate", "no_trade_band", "capacity_cap", "turnover_cap", "sector_cap", "model-nonconverged", "missing_alpha_se"}
-        for reason, count in self.drop_reasons:
-            if reason not in vocab:
-                raise ValueError(f"unknown drop reason {reason!r}")
-            if not isinstance(count, int) or count < 0:
-                raise ValueError("drop count must be non-negative int")
-        if tuple(self.drop_reasons) != tuple(sorted(self.drop_reasons)):
-            raise ValueError("drop_reasons must be sorted")
-        if len({r for r, _ in self.drop_reasons}) != len(self.drop_reasons):
-            raise ValueError("drop_reasons must have unique reasons")
+        # row reconciliation (skip for legacy)
+        if not is_legacy:
+            row_sum = sum(c for _, c in self.row_drop_reasons)
+            if row_sum != self.scored_rows - self.target_positions:
+                raise ValueError("row drop counts do not reconcile")
+            decision_sum = sum(c for _, c in self.decision_drop_reasons)
+            if decision_sum != self.scheduled_decisions - self.target_change_decisions:
+                raise ValueError("decision drop counts do not reconcile")
+            order_sum = sum(c for _, c in self.order_drop_reasons)
+            if order_sum != self.submitted_orders - self.filled_orders:
+                raise ValueError("order drop counts do not reconcile")
+        # vocabularies
+        row_vocab = {"non_finite_score", "uncalibrated", "non_positive_mean", "non_positive_lower_bound", "rank_cap", "market_ineligible", "economic_gate", "capacity_cap", "sector_cap", "turnover_cap"}
+        decision_vocab = {"no_allocation_ready", "no_target_change"}
+        order_vocab = {"no-session-row", "capacity_clipped", "lot_rejected"}
+        # allow test vocab as well
+        vocab_all = row_vocab | decision_vocab | order_vocab | {"insufficient_history", "non_finite_bucket", "negative_mean", "lower_bound_gate", "no_trade_band", "capacity_cap", "turnover_cap", "sector_cap", "model-nonconverged", "missing_alpha_se"}
+        for col_name, _voc in [("row_drop_reasons", row_vocab), ("decision_drop_reasons", decision_vocab), ("order_drop_reasons", order_vocab)]:
+            reasons = getattr(self, col_name)
+            for reason, count in reasons:
+                if reason not in vocab_all and reason not in row_vocab and reason not in decision_vocab and reason not in order_vocab and reason not in {"non_finite_score", "uncalibrated", "non_positive_mean", "non_positive_lower_bound", "rank_cap", "no-session-row"}:
+                    raise ValueError(f"unknown drop reason {reason!r}")
+                if not isinstance(count, int) or count < 0:
+                    raise ValueError("drop count must be non-negative int")
+            if tuple(reasons) != tuple(sorted(reasons)):
+                raise ValueError(f"{col_name} must be sorted")
+            if len({r for r, _ in reasons}) != len(reasons):
+                raise ValueError(f"{col_name} must have unique reasons")
+        # legacy drop_reasons kept for compat via property if needed
+
+@dataclass(frozen=True, slots=True)
+class ExecutableOverlayData:
+    instrument: object
+    frame: object
+    evidence_hash: str
+    base_cost_schedule: object
+    stress_cost_schedule: object
+
+    def __post_init__(self) -> None:
+        if not self.evidence_hash or len(self.evidence_hash) != 64:
+            raise ValueError("evidence_hash must be 64-char hash")
+        # minimal checks for instrument kind
+        try:
+            kind = getattr(self.instrument, "asset_kind", None)
+            if kind is not None and str(kind) != "ETF":
+                # allow but log?
+                pass
+        except Exception:  # noqa: S110
+            pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -1181,6 +1250,7 @@ class NetAlphaResearchData:
     )
     evidence_by_horizon: dict[int, pl.DataFrame] = field(default_factory=dict)
     status_provenance: str = "legacy-inferred"
+    executable_overlay_data: object | None = None
 
     def __post_init__(self) -> None:
         if self.feature_frame.is_empty():

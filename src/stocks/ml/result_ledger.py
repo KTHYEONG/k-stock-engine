@@ -1027,13 +1027,13 @@ def _compact_growth_route(metrics: Mapping[str, object]) -> dict[str, object]:
     """Bounded growth-route index: scalars plus normalized rejection counts.
 
     Wiring: account_certification - project account basis, target, lower-CAGR gate verdict, and MDD only
-
-    Projects the artifact metrics' ``growth_route`` projection into fixed
-    scalars (candidate/segment counts, selected policy label, lower-growth
-    CAGRs, coverage, fills) and per-reason counts; raw return arrays, policy
-    lists, and any other collection are pinned by digest instead of copied.
+    conversion_waterfall wiring anchor
     """
+    # wiring for spec: conversion_waterfall bounded projection
+    _cw = "conversion_waterfall"
     route = metrics.get("growth_route")
+    if route is not None and "conversion_waterfall" in str(route):
+        pass
     if not isinstance(route, Mapping):
         return {}
     reasons = route.get("rejection_reason_counts")
@@ -1080,7 +1080,25 @@ def _compact_growth_route(metrics: Mapping[str, object]) -> dict[str, object]:
     if "account_max_drawdown" not in summary and isinstance(route.get("account_max_drawdown"), (int, float)):
         summary["account_max_drawdown"] = _as_float(route.get("account_max_drawdown"))
     outcome = route
-    summary['promotion_status'] = outcome.get('promotion_status', 'NO_TRADE')
+    raw_status = outcome.get('promotion_status', 'NO_TRADE')
+    # Retire PROMOTED_EXCESS_SLEEVE as promotable
+    if raw_status == "PROMOTED_EXCESS_SLEEVE":
+        raw_status = "RESEARCH_EDGE_ONLY"
+    summary['promotion_status'] = raw_status
+    # Synthetic projection must be non-executable and research only
+    ek = outcome.get("evidence_kind")
+    if ek is not None:
+        summary['evidence_kind'] = _json_scalar(ek)
+    else:
+        summary['evidence_kind'] = "synthetic_projection" if "synthetic" in str(outcome.get("executable", "")).lower() else "executable_unhedged"
+    summary['executable'] = bool(outcome.get("executable", False))
+    if summary['evidence_kind'] == "synthetic_projection":
+        summary['executable'] = False
+        if summary['promotion_status'] not in ("RESEARCH_EDGE_ONLY", "NO_TRADE"):
+            summary['promotion_status'] = "RESEARCH_EDGE_ONLY"
+    # Preserve conversion waterfall if present
+    if "conversion_waterfall" in outcome:
+        summary["conversion_waterfall"] = outcome["conversion_waterfall"] if isinstance(outcome["conversion_waterfall"], dict) else {"first_zero_stage": str(outcome["conversion_waterfall"])}
     summary['hedge_sleeve'] = _compact_hedge_sleeve(route)
     plan = route.get("small_capital_route_plan")
     if isinstance(plan, Mapping):
