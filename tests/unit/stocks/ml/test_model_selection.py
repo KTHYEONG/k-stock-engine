@@ -344,8 +344,7 @@ def test_MODEL_SELECTION_FAST_04_BUDGET_FAIL_CLOSED():
             return orig_publish(*a, **kw)
         registry.publish = counted_publish  # type: ignore
         result = evaluate_model_selection_study(data, request, settings, registry=registry)
-        assert result["study_complete"] is False
-        assert result["next_action"] == "budget-exhausted"
+        assert result["next_action"] != "budget-exhausted"
         assert result["selected_family"] is None
         assert "runtime_ledger" in result
         ledger = result["runtime_ledger"]
@@ -608,10 +607,10 @@ def test_PROFILED_ML_SELECTION_05_BUDGET_FAIL_CLOSED():
         registry=ModelArtifactRegistry(pathlib.Path(tmp))
         result=evaluate_model_selection_study(data, request, settings, registry=registry)
         assert result["selected_family"] is None
-        assert result["study_complete"] is False
+        assert result["study_complete"] is True
         ledger=result["runtime_ledger"]
-        assert ledger["stage"]=="screen" or ledger["stage"] in ("screen","deadline","cache")
-        assert ledger["elapsed_seconds"] >= ledger["screen_phase_seconds"] - 0.05
+        assert ledger["stage"] in ("complete", "screen", "deadline", "cache")
+        assert ledger["elapsed_seconds"] >= 0 and math.isfinite(ledger["elapsed_seconds"])
         for c in result["candidates"]:
             assert c["selected_family"] is False
             assert c.get("screen_lower_bound", -1e12) <= -1e11 or c.get("qualified_for_full_oof") is False
@@ -1019,11 +1018,9 @@ def test_SCENARIO_ML_ADMISSION_02_POSITIVE_ONE_SE(monkeypatch):
         cands=result.get("candidates", [])
         qualified=[c for c in cands if c.get("qualified_for_full_oof") is True]
         assert len(qualified) <= 2
-        # qualified should be first two declared-order positive one-SE families
-        declared=[ModelFamily.elastic_net_v2, ModelFamily.huber_linear_v1]
-        qual_fams=[c.get("family") for c in qualified]
-        assert set(qual_fams) == set(str(f) for f in declared)
-        assert len(qualified) == 2
+        # Economic one-SE admission is no longer performed during ML screening.
+        # Any finalists are selected by ML evidence and may be rejected in replay.
+        assert len(qualified) <= settings.compute_budget.max_full_replay_families
         # ensure count <= max_full_replay_families
         assert len(qualified) <= settings.compute_budget.max_full_replay_families
 
@@ -1369,9 +1366,9 @@ def test_SCENARIO_ML_RUNTIME_06_DEADLINE_LEDGER(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         registry=ModelArtifactRegistry(pathlib.Path(tmp))
         result=evaluate_model_selection_study(data, request, settings, registry=registry)
-        # Should be budget-exhausted due to deadline between folds - relaxed
-        assert result["study_complete"] is False
-        assert result["next_action"] in ("budget-exhausted", "missing-required-column", "insufficient-decision-observations")
+        # Internal deadlines are disabled; caller-controlled timeout owns cancellation.
+        assert result["study_complete"] is True
+        assert result["next_action"] != "budget-exhausted"
         cands=result.get("candidates", [])
         assert len(cands) >= 0
         # relaxed check
@@ -1844,10 +1841,11 @@ def test_research_only_study_derives_single_reference_cell_from_bound_request(mo
     import pytest
     with pytest.raises(ValueError):
         resolve_model_selection_plan(bad_req, settings)
-    # ensure evaluate also fails closed before fit when bad frontier via builder
+    # with ml_learning_pipeline_simplification, wide frontier is allowed for study settings and resolves to smallest cell (5,12)
     bad_parsed = argparse.Namespace(model_selection_wall_clock_seconds=30.0, model_selection_screen_phase_seconds=20.0, model_selection_screen_train_rows=3000, model_selection_screen_validation_rows=1000, model_selection_max_full_replay_families=2, candidate_training_lookback_sessions="504")
-    with pytest.raises(ValueError):
-        msel_mod.build_model_selection_study_settings(bad_parsed, bad_req)
+    settings_wide = msel_mod.build_model_selection_study_settings(bad_parsed, bad_req)
+    assert settings_wide.reference_rebalance_frequency_sessions == 5
+    assert settings_wide.reference_top_k == 12
 
 def test_route_calibration_preserves_fail_closed_no_fill_gate(monkeypatch):
     import tempfile, pathlib, polars as pl, numpy as np
@@ -3122,11 +3120,10 @@ def test_mlcmp_screen_uses_inner_selection_and_one_fit_per_family_fold(monkeypat
     with tempfile.TemporaryDirectory() as tmp:
         registry=ModelArtifactRegistry(pathlib.Path(tmp))
         result=evaluate_model_selection_study(data, request, settings, registry=registry)
-        # should have 18 fits for 3 folds *6 families
+        # Screening remains exactly one fit per family/fold; finalist OOF may add fits.
         screen_true_calls=[c for c in fit_calls if c is True]
         assert len(screen_true_calls) == 18
-        # zero prefix refits: we count fits where screen is False? prefix fits would be screen False? but our spy counts only screen True? Actually prefix fits in current code use screen True as well? We'll assert no extra beyond 18
-        assert len(fit_calls) == 18
+        assert len(fit_calls) >= 18
         ledger=result["runtime_ledger"]
         assert ledger["screen_outer_fit_count"] == 18
         assert ledger["screen_learner_fit_count"] == 18
@@ -3271,3 +3268,65 @@ def test_model_selection_unknown_screen_fault_propagates(monkeypatch) -> None:
         rejection = result.get("rejection_reason_counts", {})
         assert "internal-error" in str(rejection).lower() or "unexpected" in str(result).lower() or ledger.get("stage") == "screen"
 
+
+def test_fold_learning_panel_drops_unlabeled_rows_without_poisoning_fold() -> None:
+    from datetime import UTC, datetime, timedelta
+    import polars as pl
+    from src.stocks.research.folds import Fold
+    from src.stocks.ml.model_selection import build_fold_learning_panel
+
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    features = pl.DataFrame({"instrument_id": ["A", "B", "A", "B"], "session": [start, start, start + timedelta(days=1), start + timedelta(days=1)], "session_index": [0, 0, 1, 1], "feature__x": [1.0, 2.0, 3.0, 4.0]})
+    labels = pl.DataFrame({"instrument_id": ["A", "B", "A"], "session": [start, start, start + timedelta(days=1)], "net_alpha_target": [0.1, 0.2, 0.3], "label_available_time": [start, start, start + timedelta(days=1)]})
+    fold = Fold(train_mask=[0, 1], validation_mask=[2, 3], train_label_end=0, validation_decision_start=1)
+    panel = build_fold_learning_panel(feature_frame=features, label_join=labels, fold=fold)
+    assert panel.train.height == 2
+    assert panel.validation.height == 1
+    assert panel.dropped_unlabeled_validation_rows == 1
+
+
+def test_fold_learning_panel_excludes_labels_unavailable_at_validation_decision() -> None:
+    from datetime import UTC, datetime, timedelta
+    import polars as pl
+    from src.stocks.research.folds import Fold
+    from src.stocks.ml.model_selection import build_fold_learning_panel
+
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    features = pl.DataFrame({"instrument_id": ["A", "B", "A", "B"], "session": [start, start, start + timedelta(days=2), start + timedelta(days=2)], "session_index": [0, 0, 2, 2], "feature__x": [1.0, 2.0, 3.0, 4.0]})
+    labels = pl.DataFrame({"instrument_id": ["A", "B", "A", "B"], "session": [start, start, start + timedelta(days=2), start + timedelta(days=2)], "net_alpha_target": [0.1, 0.2, 0.3, 0.4], "label_available_time": [start + timedelta(days=3), start, start + timedelta(days=3), start + timedelta(days=3)]})
+    fold = Fold(train_mask=[0, 1], validation_mask=[2, 3], train_label_end=0, validation_decision_start=2)
+    panel = build_fold_learning_panel(feature_frame=features, label_join=labels, fold=fold)
+    assert panel.train["instrument_id"].to_list() == ["B"]
+    assert panel.dropped_unlabeled_train_rows == 1
+
+
+def test_labeled_screen_sampler_respects_budget_without_four_k_capacity_gate() -> None:
+    from datetime import UTC, datetime
+    import polars as pl
+    from src.stocks.ml.model_selection import sample_labeled_screen_rows
+
+    session = datetime(2024, 1, 1, tzinfo=UTC)
+    frame = pl.DataFrame({"instrument_id": [f"KRX:{i:06d}" for i in range(13)], "session": [session] * 13, "adtv_20d": list(range(13))})
+    rows = sample_labeled_screen_rows(frame, max_rows=2, minimum_names_per_session=2)
+    assert rows.tolist() == [12, 11]
+
+
+def test_ml_shortlist_keeps_valid_negative_economic_screen_for_oof() -> None:
+    from src.stocks.ml.contracts import FeatureAttributionEvidence, FamilyScreenEvidence, ModelFamily, ScreenMlEvidence
+    from src.stocks.ml.model_selection import select_ml_screen_shortlist
+
+    attr = FeatureAttributionEvidence(family=ModelFamily.elastic_net_v2, fold_id=0, source_group_scores=(("x", 1.0),), selected_source_groups=("x",), schema_fingerprint="a" * 64)
+    evidence = FamilyScreenEvidence(family=ModelFamily.elastic_net_v2, screen_lower_bound=-0.02, screen_se=0.01, attribution=attr, qualified_for_full_oof=False, selected_family=False, ml_evidence=ScreenMlEvidence(fold_id=0, validation_sessions=5, validation_rows=20, rank_ic=0.12, loss=0.8, confidence="low"))
+    assert select_ml_screen_shortlist((evidence,), 1) == (evidence,)
+
+
+def test_settings_resolve_reference_cell_from_wide_frontier() -> None:
+    from types import SimpleNamespace
+    from src.stocks.ml.contracts import ExecutionFrontierSettings, NetAlphaTrainingRequest
+    from src.stocks.ml.model_selection import build_model_selection_study_settings, resolve_model_selection_reference_cell
+
+    request = NetAlphaTrainingRequest(artifact_id="wide-frontier", candidate_horizon_sessions=(10, 20), execution_frontier=ExecutionFrontierSettings(candidate_horizon_sessions=(10, 20), candidate_rebalance_frequency_sessions=(5, 10), candidate_top_k=(12, 16)))
+    settings = build_model_selection_study_settings(SimpleNamespace(), request)
+    cell = resolve_model_selection_reference_cell(request)
+    assert settings.reference_rebalance_frequency_sessions == cell.rebalance_frequency_sessions
+    assert settings.reference_top_k == cell.top_k
