@@ -46,3 +46,16 @@ class TestReadManifest:
         registry = ModelArtifactRegistry(tmp_path)
         with pytest.raises(ValueError, match="invalid artifact_id"):
             registry.read_manifest("no spaces here")
+
+
+def test_in_memory_registry_keeps_artifacts_off_disk(tmp_path) -> None:
+    root = tmp_path / "artifacts"
+    registry = ModelArtifactRegistry.in_memory()
+    model = DeterministicBaseline(manifest=make_manifest())
+
+    registry.publish(model, model.manifest())
+    registry.write_metrics("a001", {"promoted": False})
+
+    assert registry.list_artifact_ids() == ("a001",)
+    assert registry.read_metrics("a001") == {"promoted": False}
+    assert not root.exists()

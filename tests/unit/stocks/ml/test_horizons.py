@@ -1341,3 +1341,39 @@ def test_excess_route_failclosed_nonpositive_lb() -> None:
     )
     assert all(key is None for key in cash_route.selected_policies)
     assert cash_route.invested_interval_count == 0
+
+
+def test_growth_route_wealth_evidence_reports_observed_gain_without_promotion() -> None:
+    from math import exp
+
+    from src.stocks.ml.horizons import GrowthRouteEvidence
+    from src.stocks.ml.training import _growth_route_projection
+
+    policy = (10, 10, 12, 'lower_bound_only')
+    route = GrowthRouteEvidence(base_log_growth=(0.10, -0.02), stress_log_growth=(0.03, -0.04), segment_ids=(0, 0), selected_policies=(policy,), interval_policies=(policy, policy), observed_interval_count=2, invested_interval_count=2, filled_orders=2)
+    certificate = {'passed': False, 'reasons': ['non-positive-base-lower-cagr'], 'base_lower_cagr': -0.01, 'stress_lower_cagr': 0.01, 'matched_lower_excess_cagr': None, 'mdd': 0.10}
+
+    projection = _growth_route_projection(route, certificate, initial_cash=10_000_000.0)
+
+    wealth = projection['wealth_evidence']
+    assert wealth['initial_cash_krw'] == 10_000_000.0
+    assert wealth['base_terminal_wealth_krw'] == round(10_000_000.0 * exp(0.08), 12)
+    assert wealth['stress_terminal_wealth_krw'] == round(10_000_000.0 * exp(-0.01), 12)
+    assert wealth['observed_base_growth_positive'] is True
+    assert projection['promotion_status'] == 'NO_TRADE'
+
+
+def test_growth_route_wealth_evidence_omits_invalid_initial_cash() -> None:
+    from math import inf
+
+    from src.stocks.ml.horizons import GrowthRouteEvidence
+    from src.stocks.ml.training import _growth_route_projection
+
+    policy = (10, 10, 12, 'lower_bound_only')
+    route = GrowthRouteEvidence(base_log_growth=(0.01,), stress_log_growth=(0.01,), segment_ids=(0,), selected_policies=(policy,), interval_policies=(policy,), observed_interval_count=1, invested_interval_count=1, filled_orders=1)
+    certificate = {'passed': False, 'reasons': ['non-positive-base-lower-cagr']}
+
+    for initial_cash in (None, 0.0, inf):
+        projection = _growth_route_projection(route, certificate, initial_cash=initial_cash)
+        assert 'wealth_evidence' not in projection
+        assert projection['promotion_status'] == 'NO_TRADE'
