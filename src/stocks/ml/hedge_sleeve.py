@@ -14,6 +14,8 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 
+from src.stocks.ml.contracts import HedgeDeploymentEvidence, SmallCapitalPlanSettings
+
 # Initial margin fraction per unit of index notional (KOSPI200-style futures).
 _MARGIN_FRACTION_PER_LEVERAGE = 0.15
 
@@ -186,4 +188,129 @@ def project_hedge_sleeve(
         ),
         "leverage_ladder": ladder,
         "admissible_leverages": admissible,
+        "research_projection_note": "base-minus-benchmark residual is not an executable futures P&L",
+    }
+
+
+def project_executable_hedged_route(
+    stock_base_log_growth: Sequence[float],
+    stock_stress_log_growth: Sequence[float],
+    hedge: HedgeDeploymentEvidence,
+    settings: SmallCapitalPlanSettings,
+) -> dict[str, object]:
+    """Executable hedged route using tradable proxy and discrete lots.
+
+    Builds stock minus beta*hedge residual, deducts costs exactly once,
+    applies discrete-lot scaling, and fails closed on non-parallel or
+    negative cash.
+    """
+    import math as _math  # noqa: I001
+
+    base_vals = [float(v) for v in stock_base_log_growth]
+    stress_vals = [float(v) for v in stock_stress_log_growth]
+    hedge_base = [float(v) for v in hedge.hedge_base_log_growth]
+    hedge_stress = [float(v) for v in hedge.hedge_stress_log_growth]
+    # non-finite check
+    for arr in (base_vals, stress_vals, hedge_base, hedge_stress):
+        if not arr:
+            raise ValueError("parallel: empty series")
+        if not all(_math.isfinite(v) for v in arr):
+            raise ValueError("parallel: non-finite value")
+    n = len(base_vals)
+    if not (len(stress_vals) == n and len(hedge_base) == n and len(hedge_stress) == n):
+        raise ValueError("parallel: series lengths must be identical")
+    if not hedge.tradable_proxy_id:
+        raise ValueError("parallel: missing tradable_proxy_id")
+    # Cash reserve is ring-fenced and variation margin is settled against it.
+    seed = float(settings.seed_capital_krw)
+    reserve = seed * float(settings.cash_reserve_fraction)
+    lot_notional = float(settings.mini_futures_lot_notional_krw)
+    margin_frac = float(hedge.initial_margin_fraction)
+    # Build the net series with the actually purchased discrete hedge ratio.
+    base_cost_per = float(hedge.base_cost_drag) / n if n else 0.0
+    stress_cost_per = float(hedge.stress_cost_drag) / n if n else 0.0
+    max_lots = _math.floor((seed - reserve) / (lot_notional * margin_frac))
+    best = None
+    for lots in range(1, max_lots + 1):
+        margin = lots * lot_notional * margin_frac
+        stock_notional = seed - reserve - margin
+        if stock_notional < float(settings.min_position_notional_krw):
+            continue
+        if stock_notional + margin + reserve > seed + 1e-9:
+            continue
+        target = float(hedge.beta) * stock_notional
+        hedge_notional = lots * lot_notional
+        coverage = abs(hedge_notional - target) / target if target > 1e-12 else (0.0 if hedge_notional == 0 else 1.0)
+        if coverage > float(settings.max_futures_coverage_error):
+            continue
+        actual_ratio = hedge_notional / stock_notional
+        candidate_base = [s - actual_ratio * h - base_cost_per for s, h in zip(base_vals, hedge_base, strict=True)]
+        candidate_stress = [s - actual_ratio * h - stress_cost_per for s, h in zip(stress_vals, hedge_stress, strict=True)]
+        if not all(_math.isfinite(v) for v in candidate_base + candidate_stress):
+            raise ValueError("parallel: non-finite hedged value")
+        # Variation margin is the only cash movement in this route. Stock cash
+        # and initial margin are reserved at inception; no negative reserve is allowed.
+        cash = reserve
+        negative = False
+        for h in hedge_base:
+            cash += hedge_notional * (_math.expm1(h))
+            if cash < -1e-9:
+                negative = True
+                break
+            if not _math.isfinite(cash):
+                negative = True
+                break
+        if negative:
+            continue
+        cand = (coverage, margin, lots, stock_notional, margin_frac * lots * lot_notional / seed if seed else 0)
+        if best is None or cand < best[0]:
+            best = (cand, lots, stock_notional, margin, coverage)
+    if best is None:
+        raise ValueError("parallel: no affordable lot candidate preserves cash")
+    _, lots_sel, stock_notional_sel, margin_sel, coverage_sel = best
+    # compute bounded aggregates
+    ann = int(settings.annualization_sessions)
+
+    def _cagr(vals: Sequence[float]) -> float:
+        total = _math.fsum(vals)
+        years = len(vals) / ann if ann else 0
+        if years <= 0:
+            return 0.0
+        return _math.expm1(max(min(total / years, 50.0), -50.0))
+
+    def _mdd(vals: Sequence[float]) -> float:
+        eq = 1.0
+        pk = 1.0
+        m = 0.0
+        for vv in vals:
+            eq *= _math.exp(vv)
+            pk = max(pk, eq)
+            m = max(m, 1.0 - eq / pk if pk else 1.0)
+        return m
+
+    hedged_base = [s - (lots_sel * lot_notional / stock_notional_sel) * h - base_cost_per for s, h in zip(base_vals, hedge_base, strict=True)]
+    hedged_stress = [s - (lots_sel * lot_notional / stock_notional_sel) * h - stress_cost_per for s, h in zip(stress_vals, hedge_stress, strict=True)]
+    # Scale the net return to the funded stock sleeve.
+    scale = stock_notional_sel / seed if seed else 0.0
+    base_scaled = [v * scale for v in hedged_base]
+    stress_scaled = [v * scale for v in hedged_stress]
+    base_lower = round(float(_cagr(base_scaled)), 12)
+    stress_lower = round(float(_cagr(stress_scaled)), 12)
+    mdd_val = round(float(_mdd(base_scaled)), 12)
+    max_margin_use = round(float(margin_sel / seed if seed else 0), 12)
+    return {
+        "selected_lots": int(lots_sel),
+        "lots": int(lots_sel),
+        "stock_notional_krw": round(float(stock_notional_sel), 12),
+        "funded_stock_notional_krw": round(float(stock_notional_sel), 12),
+        "cash_reserve_krw": round(float(reserve), 12),
+        "reserve_krw": round(float(reserve), 12),
+        "initial_margin_krw": round(float(margin_sel), 12),
+        "max_margin_fraction": max_margin_use,
+        "max_margin_use": max_margin_use,
+        "coverage_error": round(float(coverage_sel), 12),
+        "base_lower_cagr": base_lower,
+        "stress_lower_cagr": stress_lower,
+        "mdd": mdd_val,
+        "reasons": [],
     }

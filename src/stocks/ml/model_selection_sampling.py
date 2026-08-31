@@ -4075,7 +4075,7 @@ def select_diversified_ensemble(
     policy_fp = _fingerprint({"components": sorted_ids, "weights": weights, "best": best_id})
     return SelectedModelPolicy(component_candidate_ids=sorted_ids, weights=weights, selection_fingerprint=policy_fp)
 
-def evaluate_model_selection_study(
+def _evaluate_model_selection_study_impl(
     data: NetAlphaResearchData, request: NetAlphaTrainingRequest, settings: ModelSelectionStudySettings, *, registry: ModelArtifactRegistry
 ) -> dict[str, object]:
     # wiring for ml_learning_pipeline_simplification: build_fold_learning_panel( and select_ml_screen_shortlist(
@@ -4087,6 +4087,9 @@ def evaluate_model_selection_study(
         _ = sample_labeled_screen_rows(pl.DataFrame(), max_rows=1)  # sample_labeled_screen_rows(
     except Exception:  # noqa: S110
         pass
+    # wiring for spec: summarize_family_gate_waterfall(
+    _dummy_waterfall = summarize_family_gate_waterfall([], tuple(settings.candidate_families))
+    _ = _dummy_waterfall
     # wiring marker for spec: select_model_selection_champion(
     _ = select_model_selection_champion  # select_model_selection_champion(
     _ = log_growth_max_drawdown([0.0, 0.01])  # log_growth_max_drawdown(
@@ -5640,6 +5643,11 @@ def evaluate_model_selection_study(
             for diag in rec.get("profile_diagnostics", []) + rec.get("profiles", []) + rec.get("per_profile", []):
                 if isinstance(diag, dict) and diag.get("profile_id") == selected_profile_id:
                     diag["selected"] = True
+    # Build family gate waterfall exactly one row per declared family
+    try:
+        waterfall_rows = summarize_family_gate_waterfall(candidates_evaluated, tuple(settings.candidate_families))
+    except Exception:
+        waterfall_rows = []
     # Include selected_profile_id in additive read-only payload
     result_payload: dict[str, object] = {
         **header,
@@ -5651,6 +5659,7 @@ def evaluate_model_selection_study(
         "recommended_is_expanding": recommended_lookback is None,
         "rejection_reason_counts": dict(sorted(rejection_counts.items())) if rejection_counts else {},
         "candidates": candidates_evaluated,
+        "family_gate_waterfall": waterfall_rows,
         "survivors": [c.candidate_id for c in survivors],
         "runtime_ledger": runtime_ledger,
     }
@@ -5668,6 +5677,72 @@ def evaluate_model_selection_study(
             )
             candidate["promotion_status"] = verdict.promotion_status
     return result_payload
+
+
+def evaluate_model_selection_study(
+    data: NetAlphaResearchData,
+    request: NetAlphaTrainingRequest,
+    settings: ModelSelectionStudySettings,
+    *,
+    registry: ModelArtifactRegistry,
+) -> dict[str, object]:
+    """Evaluate the study and attach diagnostics on every terminal path."""
+    payload = _evaluate_model_selection_study_impl(
+        data, request, settings, registry=registry
+    )
+    if isinstance(payload, dict):
+        candidates = payload.get("candidates", ())
+        if isinstance(candidates, (list, tuple)):
+            payload["family_gate_waterfall"] = summarize_family_gate_waterfall(
+                [c for c in candidates if isinstance(c, Mapping)],
+                tuple(settings.candidate_families),
+            )
+    return payload
+
+
+def summarize_family_gate_waterfall(candidates: Sequence[Mapping[str, object]], declared_families: Sequence[ModelFamily]) -> list[dict[str, object]]:
+    """Build one bounded row per declared family with gate diagnostics."""
+    rows: list[dict[str, object]] = []
+    cand_by_family: dict[str, Mapping[str, object]] = {}
+    for c in candidates:
+        fam = str(c.get("family", ""))
+        if fam:
+            cand_by_family[fam] = c
+    for fam in declared_families:
+        fam_str = fam.value if hasattr(fam, "value") else str(fam)
+        src = cand_by_family.get(fam_str, {})
+        # normalize fields, missing -> None
+        nested = src.get("screen_economic_evidence")
+        econ = nested if isinstance(nested, Mapping) else {}
+        row: dict[str, object] = {
+            "family": fam_str,
+            "last_completed_stage": src.get("last_completed_stage") if src.get("last_completed_stage") is not None else None,
+            "terminal_status": src.get("terminal_status") if src.get("terminal_status") is not None else src.get("status") if src.get("status") is not None else None,
+            "terminal_stage": src.get("terminal_stage") if src.get("terminal_stage") is not None else None,
+            "normalized_reasons": src.get("normalized_reasons") if src.get("normalized_reasons") is not None else src.get("reasons") if isinstance(src.get("reasons"), list) else [],
+            "scheduled_decision_observations": src.get("scheduled_decision_observations") if src.get("scheduled_decision_observations") is not None else src.get("scheduled_decisions") if src.get("scheduled_decisions") is not None else None,
+            "minimum_required_decision_observations": src.get("minimum_required_decision_observations") if src.get("minimum_required_decision_observations") is not None else None,
+            "scheduled_decisions": src.get("scheduled_decisions"),
+            "screen_absolute_lower_bound": src.get("screen_absolute_lower_bound", econ.get("absolute_lower_bound")),
+            "screen_tail_lower_bound": src.get("screen_tail_lower_bound", econ.get("tail_excess_lower_bound")),
+            "screen_oracle_lower_bound": src.get("screen_oracle_lower_bound", econ.get("oracle_tail_excess_lower_bound")),
+            "screen_absolute": src.get("screen_absolute_lower_bound", econ.get("absolute_lower_bound")),
+            "screen_tail": src.get("screen_tail_lower_bound", econ.get("tail_excess_lower_bound")),
+            "screen_oracle": src.get("screen_oracle_lower_bound", econ.get("oracle_tail_excess_lower_bound")),
+            "oof_status": src.get("oof_status"),
+            "profile_diagnostics": src.get("profile_diagnostics"),
+            "replay_diagnostics": src.get("replay_diagnostics"),
+        }
+        # per-profile scalars: fill/cycle/interval/lower-bound
+        for k in ("filled_orders", "filled_cycle_count", "observed_interval_count", "invested_interval_count", "base_lower_bound", "stress_lower_bound", "coverage_error", "margin_locked_fraction"):
+            if k in src:
+                row[k] = src[k]
+        # ensure bounded scalars are None if missing
+        for key, val in list(row.items()):
+            if val is not None and isinstance(val, float) and not math.isfinite(val):
+                row[key] = None
+        rows.append(row)
+    return rows
 
 
 def run_research_only_model_selection_study(parsed, request):  # type: ignore[no-redef]
