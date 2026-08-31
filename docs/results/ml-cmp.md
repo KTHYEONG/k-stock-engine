@@ -2,15 +2,12 @@
 
 | 항목 | 값 |
 |---|---:|
-| 실행 ID | ml-training-rerun-t1-20260831 |
-| 상태 | NO_TRADE |
-| 모델 | no_trade |
-| 입력 | 918,443 rows / 2,297 instruments / 2,479 sessions |
-| 레이블 horizon | 1 |
-| 승격 | false |
-| 실행 시간 | 102.436 sec |
-| Peak RSS | 2072.141 MiB |
-| Base lower CAGR | -0.015 |
-| Stress lower CAGR | 0.002 |
-| MDD | 0.214 |
-| 사유 | growth-route-rejected:non-positive-base-lower-cagr |
+| 실행 ID | ml-check-20260831-r2 |
+| 상태 | RESEARCH_ONLY |
+| 결과 | budget-unbounded-grid |
+| 후보 수 | - |
+| 입력 dataset | krx_features_stock_net_alpha_v1_exec_20260828_10m |
+| Readiness | True |
+| 실행 시간 | 12.980 sec |
+| 사유 | budget-unbounded-grid=1 |
+| 오류 | - |
