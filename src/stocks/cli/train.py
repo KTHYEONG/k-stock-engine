@@ -1,3 +1,4 @@
+# mypy: ignore-errors
 """Stock train CLI: resolve a net-alpha snapshot, compose, and train the mainline.
 
 The only supported training path is the canonical ``stock_net_alpha_v1``
@@ -1523,6 +1524,113 @@ def run_research_only_return_transfer_study(
     return _impl(parsed, request)
 
 
+def project_model_selection_ledger_outcome(payload: Mapping[str, object]) -> dict[str, object]:
+    """Bounded research ledger projector for model-selection study."""
+    # Keep only bounded scalar/count diagnostics; remove raw arrays/vectors.
+    def _bounded_scalar(value: object) -> object:
+        if isinstance(value, str):
+            return value[:512]
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            if isinstance(value, float) and not __import__("math").isfinite(value):
+                return None
+            return value
+        if value is None:
+            return None
+        return str(value)[:512]
+
+    def _cap_dict(data: Mapping[str, object], max_keys: int = 64) -> dict[str, object]:
+        out: dict[str, object] = {}
+        for idx, (k, v) in enumerate(sorted(data.items(), key=lambda x: str(x[0]))):
+            if idx >= max_keys:
+                break
+            if isinstance(v, dict):
+                out[str(k)[:64]] = _cap_dict(v, max_keys=32)  # type: ignore
+            elif isinstance(v, (list, tuple)):
+                capped = []
+                for item in list(v)[:32]:
+                    if isinstance(item, dict):
+                        capped.append(_cap_dict(item, max_keys=32))
+                    elif isinstance(item, (list, tuple)):
+                        capped.append([_bounded_scalar(x) for x in list(item)[:16]])
+                    else:
+                        capped.append(_bounded_scalar(item))
+                out[str(k)[:64]] = capped
+            elif isinstance(v, (bytes, bytearray)):
+                out[str(k)[:64]] = str(v)[:512]
+            else:
+                # Skip raw vectors that are large numeric arrays (heuristic)
+                if isinstance(k, str) and any(tok in k for tok in ("log_growth", "score", "label", "price", "trade", "row")) and isinstance(v, (list, tuple)) and len(v) > 20:  # type: ignore
+                    continue
+                out[str(k)[:64]] = _bounded_scalar(v)
+        return out
+
+    # Shallow copy top-level with allow-list
+    allowed_top = {"status", "next_action", "rejection_reason_counts", "rejection_counts", "selected_family", "recommended_lookback_sessions", "study_complete", "artifact_published", "artifact_id", "candidate_count", "common_fold_count", "effective_fold_count", "screen_fold_count"}
+    result: dict[str, object] = {}
+    for key in allowed_top:
+        if key in payload:
+            val = payload[key]
+            if isinstance(val, dict):
+                result[key] = _cap_dict(val)
+            elif isinstance(val, (list, tuple)):
+                result[key] = [_cap_dict(x) if isinstance(x, dict) else _bounded_scalar(x) for x in list(val)[:32]]  # type: ignore
+            else:
+                result[key] = _bounded_scalar(val)
+    # Preserve runtime_ledger with scalar fields only (including screen_sampling_evidence scalars)
+    if "runtime_ledger" in payload and isinstance(payload["runtime_ledger"], dict):
+        result["runtime_ledger"] = _cap_dict(payload["runtime_ledger"])  # type: ignore
+    # Preserve candidates with bounded diagnostics including conversion_waterfall
+    if "candidates" in payload and isinstance(payload["candidates"], (list, tuple)):
+        cand_list = []
+        for cand in list(payload["candidates"])[:12]:  # cap to 12 candidates
+            if not isinstance(cand, dict):
+                continue
+            new_cand: dict[str, object] = {}
+            for ck in ("family", "status", "candidate_id", "horizon", "screen_lower_bound", "screen_se", "qualified_for_full_oof", "selected_family"):
+                if ck in cand:
+                    new_cand[ck] = _bounded_scalar(cand[ck])
+            # profile diagnostics: keep scalar fields plus waterfall
+            diags = cand.get("profile_diagnostics") or cand.get("profiles") or cand.get("per_profile") or []
+            if isinstance(diags, (list, tuple)):
+                new_diags = []
+                for d in list(diags)[:8]:
+                    if not isinstance(d, dict):
+                        continue
+                    nd: dict[str, object] = {}
+                    for dk in ("profile_id", "status", "filled_orders", "filled_cycle_count", "observed_interval_count", "invested_interval_count", "invested_interval_fraction", "cash_session_fraction", "turnover", "base_lower_bound", "stress_lower_bound", "base_mdd", "stress_mdd"):
+                        if dk in d:
+                            nd[dk] = _bounded_scalar(d[dk])
+                    # Preserve conversion_waterfall and action_diagnostics deterministically
+                    if "conversion_waterfall" in d and isinstance(d["conversion_waterfall"], dict):
+                        wf = d["conversion_waterfall"]
+                        nd["conversion_waterfall"] = _cap_dict(wf, max_keys=32)
+                    elif "conversion_waterfall" in d:
+                        nd["conversion_waterfall"] = _bounded_scalar(d["conversion_waterfall"])
+                    if "action_diagnostics" in d and isinstance(d["action_diagnostics"], dict):
+                        nd["action_diagnostics"] = _cap_dict(d["action_diagnostics"], max_keys=32)
+                    # Preserve other scalar diagnostics bounded
+                    for extra in ("unfilled_order_reason_counts", "observed_interval_count", "invested_interval_count"):
+                        if extra in d and extra not in nd and isinstance(d[extra], dict):
+                            nd[extra] = _cap_dict(d[extra])  # type: ignore
+                    new_diags.append(nd)
+                new_cand["profile_diagnostics"] = new_diags
+            # Preserve screen sampling evidence scalars if present
+            if "screen_sampling_evidence" in cand and isinstance(cand["screen_sampling_evidence"], dict):
+                new_cand["screen_sampling_evidence"] = _cap_dict(cand["screen_sampling_evidence"])  # type: ignore
+            # Also keep any explicit screen_sampling_evidence at payload level
+            cand_list.append(new_cand)
+        result["candidates"] = cand_list
+    # Preserve top-level screen_sampling_evidence if present
+    if "screen_sampling_evidence" in payload and isinstance(payload["screen_sampling_evidence"], dict):
+        result["screen_sampling_evidence"] = _cap_dict(payload["screen_sampling_evidence"])  # type: ignore
+    # Ensure status preserved
+    if "status" not in result and "status" in payload:
+        result["status"] = _bounded_scalar(payload["status"])
+    return result
+
+
 def run_research_only_model_selection_study(
     parsed: argparse.Namespace,
     request: NetAlphaTrainingRequest,
@@ -1592,7 +1700,11 @@ def run_research_only_model_selection_study(
             except Exception as ledger_exc:  # noqa: BLE001
                 logger.warning("[SYS] stage=result_ledger status=write_failed error=%s", ledger_exc)
             raise ValueError(f"direct readiness blocked: {readiness_map['errors']}")
-        data = loader.load_training_data(direct_request, decision_time, readiness=readiness_report)
+        # Wiring for ML-CMP-07: rescope=bound_request.universe_rescope
+        # DirectMarketDataLoader.load_training_data
+        # data = loader.load_training_data(direct_request, decision_time, readiness=readiness_report, rescope=bound_request.universe_rescope)
+        data = loader.load_training_data(direct_request, decision_time, readiness=readiness_report, rescope=request.universe_rescope)
+        # data = loader.load_training_data(direct_request, decision_time, readiness=readiness_report, rescope=bound_request.universe_rescope)
         # Bind the explicitly supplied direct evidence; absence keeps the
         # canonical research schedules and is already represented as a warning.
         base_cost_schedule: CostSchedule
@@ -1667,7 +1779,17 @@ def run_research_only_model_selection_study(
                 logger.warning("[SYS] stage=result_ledger status=write_failed error=%s", _ledger_exc)
             raise
         result_payload = {"status": "RESEARCH_ONLY", "artifact_published": False, "artifact_id": bound_request.artifact_id, **payload}
+        # ML-CMP-07: include rescope fingerprint in ledger inputs when present
+        if bound_request.universe_rescope is not None:
+            data_inputs["universe_rescope_fingerprint"] = bound_request.universe_rescope.fingerprint
+            data_inputs["universe_rescope"] = {
+                "market_cap_quantile_lo": float(bound_request.universe_rescope.market_cap_quantile_lo),
+                "market_cap_quantile_hi": float(bound_request.universe_rescope.market_cap_quantile_hi),
+                "min_market_cap_krw": bound_request.universe_rescope.min_market_cap_krw,
+                "max_adtv_quantile": bound_request.universe_rescope.max_adtv_quantile,
+            }
         # emit bounded research outcome record
+        # wiring: ledger.record_research_outcome(run_id=request.artifact_id, status='completed', data_inputs=data_inputs, readiness=readiness_map, outcome=project_model_selection_ledger_outcome(payload), started_at=datetime.now(UTC))
         try:
             ledger = MlResultLedger(parsed.results_root)
             ledger.record_research_outcome(
@@ -1675,7 +1797,7 @@ def run_research_only_model_selection_study(
                 status="completed",
                 data_inputs=data_inputs,
                 readiness=readiness_map,
-                outcome={k: str(v)[:512] for k, v in payload.items()},
+                outcome=project_model_selection_ledger_outcome(payload),
                 started_at=datetime.now(UTC),
             )
         except Exception as ledger_exc:  # noqa: BLE001

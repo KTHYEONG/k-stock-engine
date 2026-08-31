@@ -3330,3 +3330,63 @@ def test_settings_resolve_reference_cell_from_wide_frontier() -> None:
     cell = resolve_model_selection_reference_cell(request)
     assert settings.reference_rebalance_frequency_sessions == cell.rebalance_frequency_sessions
     assert settings.reference_top_k == cell.top_k
+
+def test_screen_route_rejects_equal_top_k_cross_section() -> None:
+    from datetime import UTC, datetime
+
+    import polars as pl
+    import pytest
+
+    from src.stocks.ml.contracts import NetAlphaTrainingRequest
+    from src.stocks.ml.model_selection import _screen_route_utility_series
+
+    session = datetime(2024, 1, 2, tzinfo=UTC)
+    scored = pl.DataFrame({
+        'instrument_id': ['KRX:000001', 'KRX:000002'],
+        'session': [session, session],
+        'gross_return': [0.02, -0.01],
+        'reference_cost': [0.001, 0.001],
+        'predicted_net_alpha': [0.02, 0.01],
+    })
+    request = NetAlphaTrainingRequest(artifact_id='equal-k', candidate_horizon_sessions=(10,))
+
+    with pytest.raises(ValueError, match='strictly more than execution_top_k'):
+        _screen_route_utility_series(
+            scored,
+            request=request,
+            fold_id=0,
+            rebalance_frequency_sessions=10,
+            execution_top_k=2,
+        )
+
+def test_screen_cache_uses_plan_width_and_reports_actual_capacity() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    import polars as pl
+
+    from src.stocks.ml.contracts import ScreenSamplingPlan
+    from src.stocks.ml.model_selection import deterministic_screen_sample_rows
+
+    sessions = [datetime(2024, 1, 2, tzinfo=UTC) + timedelta(days=index) for index in range(3)]
+    frame = pl.DataFrame([
+        {'instrument_id': f'KRX:{name:06d}', 'session': session, 'feature__signal': float(name)}
+        for session in sessions
+        for name in range(12)
+    ])
+    plan = ScreenSamplingPlan(top_k=3, cross_section_multiplier=4, minimum_tail_draws=3)
+
+    sampled = deterministic_screen_sample_rows(
+        frame,
+        max_rows=36,
+        decision_cadence_sessions=1,
+        names_per_session=plan.top_k * plan.cross_section_multiplier,
+    )
+    if isinstance(sampled, pl.DataFrame):
+        sampled_frame = sampled
+    else:
+        # deterministic_screen_sample_rows returns ndarray row indices
+        sampled_frame = frame.with_row_index("__idx_tmp").filter(pl.col("__idx_tmp").is_in(sampled.tolist())).drop("__idx_tmp")
+    counts = sampled_frame.group_by('session').len()['len'].to_list()
+
+    assert counts == [12, 12, 12]
+    assert min(counts) > plan.top_k
