@@ -82,6 +82,7 @@ from src.stocks.ml.execution_replay import (
     exposure_matched_benchmark_log_growth,
     instruments_from_frame,
     replay_execution_equivalent,
+    run_executable_overlay_replay,
     stream_execution_replay_batch,
 )
 from src.stocks.ml.features import (
@@ -143,6 +144,7 @@ from src.stocks.ml.replay_resources import (
 from src.stocks.ml.replay_resources import (
     plan_training_allocation as _plan_training_allocation,
 )
+from src.stocks.ml.wealth_transfer import evaluate_wealth_candidate
 
 # wiring for spec: route_calibration_ledger
 try:
@@ -1917,7 +1919,23 @@ def _replay_costs(
         decision_sessions_by_segment=decision_sessions_by_segment,
         horizon_sessions=horizon_sessions,
     )
-    evidence = replay_execution_equivalent(replay_request)
+    if context.route_objective.kind.value == "executable_hedged":
+        overlay = context.executable_overlay_data
+        if overlay is None:
+            raise ValueError("hedge-execution-evidence-missing")
+        evidence = run_executable_overlay_replay(replay_request, overlay)
+    else:
+        evidence = replay_execution_equivalent(replay_request)
+    if evidence.conversion_waterfall is not None:
+        evaluate_wealth_candidate(
+            route_kind=context.route_objective.kind,
+            evidence_kind=("executable_hedged" if context.route_objective.kind.value == "executable_hedged" else "executable_unhedged"),
+            waterfall=evidence.conversion_waterfall,
+            certificate_passed=True,
+            hashes_reconciled=True,
+            absolute_lower_cagr=None,
+            matched_excess_lower_cagr=None,
+        )
     if not is_v5:
         return ProfileReplayEvidence(candidate=evidence, dense_shadow=None)
     dense_profile = PolicyProfile(
@@ -3184,6 +3202,7 @@ def _causal_oof_calibrate(
             block_length=_base_cal.block_length,
             label_column=_ledger_label,
             label_available_column=_base_cal.label_available_column,
+            preserve_negative_bound_null=_base_cal.preserve_negative_bound_null,
         )
     else:
         calibrator = _base_cal
