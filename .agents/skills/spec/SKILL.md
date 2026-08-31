@@ -23,33 +23,39 @@ Produce an unambiguous implementation plan and precision contract (`contract.jso
 3. **Selective Empirical Proof**:
    - If algorithm correctness, numeric edge cases, or vectorization is uncertain, verify via a minimal script in `scratch/test_<topic>.py` using `uv run`.
 
-4. **Deliverables**:
-   - **Blueprint (`docs/specs/<feature>.md`)**:
-     - **Diagnosis & Invariants**: Mathematical logic, structural invariants, and time/space complexity constraints.
-     - **Architecture & Mitigation**: Layer separation, fail-closed handling, and caller wiring strategy.
-     - **Execution Target**: Exact reproduction command (e.g., `uv run pytest <target_test_file> -k <scenario_id>`).
-   
-   - **Precision Contract (`docs/specs/<feature>_contract.json`)**:
-     - `target_file`: Relative path to modify or create (e.g., `src/core/...`).
-     - `context_files`: Array of prerequisite paths for direct zero-search context loading.
-     - `symbols` (or `changes`): Array of `{ name, signature, kind }` covering all modified/added symbols.
-     - `wiring`: Array of `{ caller_file, anchor, import_symbol, invocation_expression }` to ensure caller integration and pipeline entry-point replacement.
-     - `requirements`: Explicit fail-closed boundary rules, complexity, and immutable output rules.
-     - `scenarios`: Array of `{ scenario_id, target_test_file, execution_command, expected_behavior, test_skeleton }` grouped sequentially by `target_test_file`. `scenario_id` MUST be a valid pytest function name (e.g. `test_<func>_<condition>`). `expected_behavior` MUST include concrete assertion predicates, and `test_skeleton` MUST provide the exact Python test function code/assertion body (Given/When/Then, inputs, expected returns, exception matchers) so downstream execution (`implement` under low-reasoning models) can paste and wire tests 100% mechanically without inventing test structures. Support multiple target_test_files where appropriate.
+4. **Deliverables (Single Source of Truth)**:
+   - **Precision Contract (`docs/specs/<feature>_contract.json`) ONLY**:
+     - *No separate `.md` file*: All implementation specifications, boundary requirements, and tests live directly in `contract.json`.
+     - `target_file`: Relative path to modify or create.
+     - `context_files`: Minimal prerequisite paths for zero-search context loading.
+     - `changes` (or `symbols`): Array of `{ name, signature, kind, target_file }`.
+     - `wiring`: Array of `{ caller_file, anchor, import_symbol, invocation_expression }` ensuring entry-point hookup.
+     - `requirements`: Explicit fail-closed boundary rules, invariant constraints, and complexity requirements.
+     - `scenarios`: Array of `{ scenario_id, target_test_file, execution_command, expected_behavior, test_skeleton }`.
+       - `scenario_id`: Valid pytest function name (e.g. `test_<func>_<condition>`).
+       - `test_skeleton`: **Mandatory 100% executable Python test function** (Given/When/Then, imports, actual call, concrete assertions). NEVER leave `pass`, `...`, or empty body. This enables 0-reasoning mechanical pasting by downstream low-cost models.
 
 5. **Self-Validation Gate**:
-   - Validate contract schema, paths, and caller anchor existence before finishing:
+   - Validate contract schema, test_skeleton AST syntax, and caller anchors:
      ```bash
      uv run python tools/agent_skills/lean_check.py --spec docs/specs/<feature>_contract.json --pre-impl
      ```
 
 ## Chat Output Format
 
-Keep chat response concise and provide copy-pasteable execution command:
+Keep chat response concise, intuitive, and provide copy-pasteable execution command:
 
 ### 📐 [SPEC] <Task Title>
-- **Goal**: <1-line objective>
-- **Diagnosis**: `[Component]` -> <1-line root cause or bottleneck>
-- **Core Invariant**: <1-line mathematical or structural rule>
-- **Artifacts**: [`<feature>.md`](file:///docs/specs/<feature>.md), [`<feature>_contract.json`](file:///docs/specs/<feature>_contract.json)
-- **Next Command**: `/implement docs/specs/<feature>_contract.json`
+> **목표**: <1-line objective>
+
+* **Before (현재)**
+  * <현재 문제점 / 원인 또는 한계점 1-2줄>
+
+* **After (개선)**
+  * <개선 후 동작 / 해결 방식 및 기대효과 1-2줄>
+
+* **Guards (방어 기준 & 불변식)**
+  * <반드시 지켜져야 할 핵심 비즈니스 불변식 / Fail-closed 원칙>
+
+---
+👉 `/implement docs/specs/<feature>_contract.json`
