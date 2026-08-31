@@ -775,3 +775,16 @@ def test_SPARSE_REWATERFILL_05_REQUEST_CLI_THREADING() -> None:
         flagged_projection["request_fingerprint"]
         != default_projection["request_fingerprint"]
     )
+
+
+def test_train_main_keeps_single_typed_dispatch_boundary(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from src.stocks.cli import train
+
+    parsed = SimpleNamespace(supervise=True, internal_worker=False, artifact_id='run-1')
+    monkeypatch.setattr(train, 'build_parser', lambda: SimpleNamespace(parse_args=lambda args: parsed))
+    monkeypatch.setattr(train, 'parse_train_command', lambda value: 'command')
+    monkeypatch.setattr(train, 'TrainSupervisor', lambda run_id: SimpleNamespace(run=lambda args: 17))
+
+    assert train.main(['--supervise']) == 17
