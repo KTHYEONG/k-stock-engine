@@ -340,3 +340,16 @@ def test_executable_hedge_cli_conflicts_with_stock_only() -> None:
 
     with pytest.raises(ValueError, match="stock-only.*executable hedge|executable hedge.*stock-only"):
         _build_training_request(parsed)
+
+
+def test_train_cli_exposes_stock_only_factor_study_and_conflicts_fail_before_io() -> None:
+    import pytest
+    from src.stocks.cli.contracts import ResearchStudyKind, parse_train_command
+    from src.stocks.cli.train import build_parser
+
+    parser = build_parser()
+    parsed = parser.parse_args(["--artifact-id", "stock-only", "--study", "stock_only_factor_study"])
+    assert parse_train_command(parsed).study is ResearchStudyKind.stock_only_factor_study
+    conflict = parser.parse_args(["--artifact-id", "stock-only", "--research-only-stock-only-factor-study", "--research-only-growth-route"])
+    with pytest.raises(ValueError, match="conflicting"):
+        parse_train_command(conflict)
