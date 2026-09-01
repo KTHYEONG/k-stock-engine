@@ -2054,7 +2054,7 @@ def test_SCENARIO_SMALL_ACCOUNT_CAGR_02_COHERENCE_FAIL_CLOSED():
     with pytest.raises(ValueError):  # noqa: PT011
         validate_account_capital_coherence(data_missing, req_ok)
     with pytest.raises(ValueError):  # noqa: PT011
-        AccountCertificationSettings(account_capital_krw=6_000_000.0)
+        AccountCertificationSettings(account_capital_krw=11_000_000.0)
     req_bad_port = NetAlphaTrainingRequest(artifact_id="bad", candidate_horizon_sessions=(10,), portfolio=PortfolioSettings(portfolio_value=100_000_000.0, initial_cash=100_000_000.0, reference_notional=100_000_000.0), capital_plan=SmallCapitalPlanSettings(seed_capital_krw=5_000_000.0), account_certification=acct)
     with pytest.raises(ValueError):  # noqa: PT011
         validate_account_capital_coherence(data_ok, req_bad_port)

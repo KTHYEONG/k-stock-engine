@@ -1117,3 +1117,20 @@ def test_MLCMP_REPLAY_DIAG_03():  # noqa: N802
     assert diag.get("cold_start_economic_cash_decisions", 0) >= 1
     # no replay-failed rejection: evidence is valid, not raising
     assert ev.planned_cycles == 2
+
+
+def test_stock_only_profile_uses_existing_tax_bound_lot_replay() -> None:
+    from src.stocks.config.research import policy_profiles_with_stock_only_small_capital
+    from src.stocks.ml.contracts import AccountCertificationSettings
+    from src.stocks.ml.training import _risk_policy_for_profile
+
+    profile = policy_profiles_with_stock_only_small_capital()[-1]
+    request = __import__('src.stocks.ml.contracts', fromlist=['NetAlphaTrainingRequest']).NetAlphaTrainingRequest(
+        artifact_id='stock-only-account',
+        account_certification=AccountCertificationSettings(account_capital_krw=10_000_000.0),
+    )
+    policy = _risk_policy_for_profile(request, profile, 10, rebalance_frequency_sessions=5, top_k=8)
+    assert policy.lot_sizing.enabled is True
+    assert policy.net_exposure_gate_mode == 'trend_vol_v1'
+    assert policy.gate_floor == 0.0
+    assert policy.gate_history_mode == 'cash_on_insufficient_v1'

@@ -128,3 +128,24 @@ def test_profile_plumbing_fingerprint() -> None:
         )
     )
     assert params_on["net_exposure_gate_mode"] == "trend_vol_v1"
+
+
+def test_stock_only_gate_moves_to_cash_when_proxy_history_is_insufficient() -> None:
+    from src.stocks.trading.portfolio_constructor import StockRiskPolicy, apply_net_exposure_gate, net_exposure_gate_scale
+
+    policy = StockRiskPolicy(
+        net_exposure_gate_mode='trend_vol_v1', gate_floor=0.0,
+        gate_history_mode='cash_on_insufficient_v1',
+    )
+    scale, detail = net_exposure_gate_scale([0.001] * 20, policy)
+    weights, applied = apply_net_exposure_gate({'KRX:000001': 0.5}, [0.001] * 20, policy)
+    assert scale == 0.0
+    assert detail == {'reason': 'gate-history-insufficient-cash'}
+    assert weights == {'KRX:000001': 0.0}
+    assert applied['nem_scale'] == 0.0
+
+    from src.stocks.trading.portfolio_allocation import net_exposure_gate_scale as prepared_gate_scale
+
+    prepared_scale, prepared_detail = prepared_gate_scale([0.001] * 20, policy)
+    assert prepared_scale == 0.0
+    assert prepared_detail == {'reason': 'gate-history-insufficient-cash'}
