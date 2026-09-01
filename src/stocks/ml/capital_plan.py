@@ -1,4 +1,5 @@
 """Absolute-capital implementation planning over certified growth routes.
+# wiring: certify_small_capital_hedge_execution combined_certificate
 
 Converts one certified growth route plus an explicit seed-capital plan into a
 bounded, deterministic implementation verdict: per-instrument-class

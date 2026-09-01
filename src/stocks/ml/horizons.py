@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from hashlib import sha256
 from math import ceil
 
@@ -74,6 +75,7 @@ class HorizonOOFEvidence:
     reasons: tuple[str, ...] = ()
     unresolved_outcome_counts: tuple[tuple[str, int], ...] = ()
     blocked_vintage_count: int = 0
+    interval_session_pairs: tuple[tuple[datetime, datetime], ...] = ()
 
     def __post_init__(self) -> None:
         if self.horizon_sessions < 1:
@@ -839,6 +841,7 @@ class GrowthRouteEvidence:
     benchmark_reconcile_failure: str = ""
     evidence_kind: object = "executable_unhedged"
     route_objective_kind: object = "unhedged_absolute"
+    interval_session_pairs: tuple[tuple[datetime, datetime], ...] = ()
 
     def __post_init__(self) -> None:
         count = len(self.base_log_growth)
@@ -1026,6 +1029,7 @@ def stitch_prequential_growth_route(
     benchmark_out: list[float] = []
     segment_out: list[int] = []
     interval_policy_out: list[PolicyKey | None] = []
+    interval_pairs_out: list[tuple[datetime, datetime]] = []
     selected_policies: list[PolicyKey | None] = []
     paired_deltas: list[float] = []
     turnover_ratios: list[float] = []
@@ -1144,6 +1148,7 @@ def stitch_prequential_growth_route(
                 benchmark_out.extend(0.0 for _ in range(cash_length))
             segment_out.extend([segment] * cash_length)
             interval_policy_out.extend([None] * cash_length)
+            interval_pairs_out.extend((datetime.min, datetime.min) for _ in range(cash_length))
             continue
 
         key: PolicyKey = (
@@ -1166,6 +1171,8 @@ def stitch_prequential_growth_route(
             benchmark_out.extend(bench[index] for index in current_indices)
         segment_out.extend([segment] * len(current_indices))
         interval_policy_out.extend([key] * len(current_indices))
+        if len(chosen.interval_session_pairs) == len(chosen.base_log_growth):
+            interval_pairs_out.extend(chosen.interval_session_pairs[index] for index in current_indices)
 
         if chosen.paired_stress_log_growth:
             paired_boot = _cohort_bootstrap(
@@ -1217,4 +1224,9 @@ def stitch_prequential_growth_route(
         ),
         route_version=route_version,
         seed_policy=seed_policy,
+        interval_session_pairs=(
+            tuple(interval_pairs_out)
+            if len(interval_pairs_out) == len(base_out) and all(pair[0] != datetime.min for pair in interval_pairs_out)
+            else ()
+        ),
     )

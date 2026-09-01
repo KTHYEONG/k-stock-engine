@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -996,6 +997,17 @@ def build_parser() -> argparse.ArgumentParser:
             "omits the ceiling"
         ),
     )
+    parser.add_argument(
+        "--route-objective",
+        choices=("unhedged_absolute", "executable_hedged"),
+        default="unhedged_absolute",
+        help="Route objective: unhedged absolute vs executable hedged",
+    )
+    parser.add_argument("--hedge-dataset-root", type=Path, default=None, help="Hedge ETF dataset root")
+    parser.add_argument("--hedge-dataset-id", type=str, default=None, help="Hedge ETF dataset id")
+    parser.add_argument("--hedge-instrument-id", type=str, default=None, help="Hedge instrument id KRX:NNNNNN")
+    parser.add_argument("--hedge-beta", type=float, default=None, help="Hedge beta negative float")
+    parser.add_argument("--hedge-content-hash", type=str, default=None, help="Hedge content hash SHA256")
     return parser
 
 
@@ -1072,6 +1084,47 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
         from src.stocks.config.research import policy_profiles_with_continuous_uncertainty
 
         policy_profiles = policy_profiles_with_continuous_uncertainty()
+    # Route objective and hedge wiring (R1,R2)
+    from src.stocks.ml.contracts import RouteObjective, RouteObjectiveKind
+
+    route_obj_str = str(getattr(args, "route_objective", "unhedged_absolute") or "unhedged_absolute")
+    hedge_root = getattr(args, "hedge_dataset_root", None)
+    hedge_id = getattr(args, "hedge_dataset_id", None)
+    hedge_instr = getattr(args, "hedge_instrument_id", None)
+    hedge_beta = getattr(args, "hedge_beta", None)
+    hedge_hash = getattr(args, "hedge_content_hash", None)
+    hedge_params = [hedge_root, hedge_id, hedge_instr, hedge_beta, hedge_hash]
+    any_hedge = any(v is not None for v in hedge_params)
+    all_hedge = all(v is not None for v in hedge_params)
+    # Stock-only vs executable hedge conflict before data loading
+    if stock_only and (route_obj_str == "executable_hedged" or any_hedge):
+        raise ValueError("stock-only and executable hedge are mutually exclusive")
+    if route_obj_str == "executable_hedged":
+        if not all_hedge:
+            raise ValueError("executable_hedged requires hedge dataset root/id, instrument id, finite negative beta, explicit 64-hex content hash")
+        # Validate beta negative finite
+        try:
+            beta_f = float(hedge_beta)  # type: ignore[arg-type]
+        except Exception as exc:
+            raise ValueError("hedge-beta-invalid") from exc
+        import math as _math
+
+        if not _math.isfinite(beta_f) or beta_f >= 0:
+            raise ValueError("hedge-beta-invalid")
+        if not isinstance(hedge_hash, str) or not re.match(r"^[0-9a-fA-F]{64}$", hedge_hash):
+            raise ValueError("hedge-content-hash-invalid")
+        if not isinstance(hedge_instr, str) or ":" not in hedge_instr:
+            raise ValueError("hedge-instrument-id-invalid")
+        # Require account and capital plan
+        has_acct = getattr(args, "account_capital_krw", None) is not None
+        has_cap = float(getattr(args, "seed_capital_plan_krw", 0.0) or 0) > 0
+        if not has_acct or not has_cap:
+            raise ValueError("executable_hedged requires account certification and capital plan")
+        route_objective = RouteObjective(kind=RouteObjectiveKind.EXECUTABLE_HEDGED, hedge_instrument=str(hedge_instr), hedge_evidence_hash=str(hedge_hash))
+    else:
+        if any_hedge:
+            raise ValueError("hedge inputs require --route-objective executable_hedged")
+        route_objective = RouteObjective(kind=RouteObjectiveKind.UNHEDGED_ABSOLUTE)
     return NetAlphaTrainingRequest(
         artifact_id=args.artifact_id,
         candidate_horizon_sessions=horizons,
@@ -1170,6 +1223,7 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
             if getattr(args, "account_capital_krw", None) is not None
             else None
         ),
+        route_objective=route_objective,
         compound_alpha_mainline=bool(getattr(args, "compound_alpha_mainline", False)),
         model_selection_mainline=bool(getattr(args, "model_selection_mainline", False)),
     )
@@ -2337,6 +2391,37 @@ def _load_active_study_context(
         liquidity_model=evidence.base_liquidity_model,
         stress_liquidity_model=evidence.stress_liquidity_model,
     )
+    # Wiring: executable_overlay_data for executable_hedged objective
+    route_kind = str(getattr(request.route_objective, "kind", "unhedged_absolute")) if hasattr(request, "route_objective") else "unhedged_absolute"
+    if route_kind == "executable_hedged":
+        from src.stocks.data.hedge import load_executable_overlay_data
+
+        hedge_root = getattr(parsed, "hedge_dataset_root", None)
+        hedge_id = getattr(parsed, "hedge_dataset_id", None)
+        hedge_instr = getattr(parsed, "hedge_instrument_id", None)
+        hedge_beta = getattr(parsed, "hedge_beta", None)
+        hedge_hash = getattr(parsed, "hedge_content_hash", None)
+        if hedge_root is None or hedge_id is None or hedge_instr is None or hedge_beta is None or hedge_hash is None:
+            raise ValueError("executable_hedged requires hedge dataset inputs")
+        overlay = load_executable_overlay_data(
+            root=Path(hedge_root),
+            dataset_id=str(hedge_id),
+            instrument_id=str(hedge_instr),
+            beta=float(hedge_beta),
+            decision_time=decision_time,
+            expected_content_hash=str(hedge_hash),
+            base_cost_schedule=bound_request.base_cost_schedule or evidence.base_schedule(),
+            stress_cost_schedule=bound_request.stress_cost_schedule or evidence.stress_schedule(),
+        )
+        # Attach to data (frozen dataclass replace)
+        from dataclasses import replace as _replace
+
+        try:
+            data = _replace(data, executable_overlay_data=overlay)
+        except Exception:
+            object.__setattr__(data, "executable_overlay_data", overlay)  # fallback
+        # Also ensure request carries route objective hash for ledger
+        # No additional mutation needed; overlay is in data
     return data, bound_request
 
 
