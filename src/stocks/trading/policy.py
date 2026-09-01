@@ -107,6 +107,7 @@ class StockRiskPolicy:
     net_exposure_gate_mode: Literal["off_v1", "trend_vol_v1"] = "off_v1"
     gate_trend_lookback_sessions: int = 60
     gate_floor: float = 0.25
+    gate_history_mode: Literal["fail_open_v1", "cash_on_insufficient_v1"] = "fail_open_v1"
     lot_sizing: LotSizingConfig = field(default_factory=LotSizingConfig)
 
     def __post_init__(self) -> None:
@@ -182,6 +183,11 @@ class StockRiskPolicy:
             raise ValueError("gate_trend_lookback_sessions must be positive")
         if not math.isfinite(self.gate_floor) or not 0.0 <= self.gate_floor < 1.0:
             raise ValueError("gate_floor must be a finite fraction in [0, 1)")
+        if self.gate_history_mode not in ("fail_open_v1", "cash_on_insufficient_v1"):
+            raise ValueError(
+                "gate_history_mode must be 'fail_open_v1' or 'cash_on_insufficient_v1', "
+                f"got {self.gate_history_mode!r}"
+            )
 
 
 def stock_risk_policy_fingerprint(policy: StockRiskPolicy) -> str:
@@ -227,6 +233,7 @@ def stock_risk_policy_fingerprint(policy: StockRiskPolicy) -> str:
                     "gate_trend_lookback_sessions": int(
                         policy.gate_trend_lookback_sessions
                     ),
+                    "gate_history_mode": str(policy.gate_history_mode),
                 }
             ),
             **(
