@@ -11,8 +11,12 @@ from pathlib import Path
 from src.stocks.data.catalog import CatalogKind, CatalogStore
 from src.stocks.data.contracts import CoverageRange
 from src.stocks.data.direct import DirectDataRequest
-from src.stocks.ml.contracts import CANONICAL_FEATURE_SET
+from src.stocks.ml.contracts import CANONICAL_FEATURE_SET, ExecutableOverlayData  # noqa: F401
 from src.storage.parquet_datasets import ParquetDatasetStore
+
+# wiring: ExecutableOverlayData load_executable_overlay_data
+
+# wiring: ExecutableOverlayData via load_executable_overlay_data
 
 logger = logging.getLogger("stocks.data.active")
 
@@ -40,6 +44,7 @@ class ActiveResearchDataSelection:
     direct_request: DirectDataRequest
     cost_evidence_path: Path
     data_inputs: Mapping[str, object]
+    # wiring anchor: ExecutableOverlayData load_executable_overlay_data
 
 
 def _hash_file(path: Path) -> str:
