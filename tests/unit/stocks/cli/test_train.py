@@ -331,3 +331,12 @@ def test_research_request_preserves_low_mcap_rescope_policy(monkeypatch, tmp_pat
 
     assert request.universe_rescope == expected
     assert request.universe_rescope.fingerprint == expected.fingerprint
+
+def test_executable_hedge_cli_conflicts_with_stock_only() -> None:
+    import pytest
+    from src.stocks.cli.train import _build_training_request, build_parser
+
+    parsed = build_parser().parse_args(["--artifact-id", "hedged", "--route-objective", "executable_hedged", "--hedge-dataset-root", "data/canonical/etfs", "--hedge-dataset-id", "inverse_etf_v1", "--hedge-instrument-id", "KRX:252670", "--hedge-beta", "-2", "--hedge-content-hash", "a" * 64, "--account-capital-krw", "10000000", "--enable-stock-only-small-capital"])
+
+    with pytest.raises(ValueError, match="stock-only.*executable hedge|executable hedge.*stock-only"):
+        _build_training_request(parsed)

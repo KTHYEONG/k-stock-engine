@@ -487,6 +487,10 @@
     "testing": "tests/unit/stocks/ml/test_comparison_report.py"
   },
   "src/stocks/ml/training_orchestrator.py": {
-    "testing": "tests/unit/stocks/ml/test_research_feature_schema.py"
+    "testing": [
+      "tests/unit/stocks/ml/test_research_feature_schema.py",
+      "tests/unit/stocks/ml/test_executable_hedged_growth.py"
+    ],
+    "architecture": "docs/architecture/project_goals.md"
   }
 }
