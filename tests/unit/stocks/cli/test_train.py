@@ -42,6 +42,21 @@ def test_train_parser_exposes_direct_dataset_flags_but_no_snapshot_flags() -> No
     assert args.research_start == date(2024, 1, 1)
 
 
+def test_stock_only_cli_requires_small_account_and_rejects_etf_satellite() -> None:
+    from src.stocks.cli.train import _build_training_request, build_parser
+
+    parser = build_parser()
+    missing_account = parser.parse_args(['--artifact-id', 'stock-only', '--enable-stock-only-small-capital'])
+    with pytest.raises(ValueError, match='account-capital-krw'):
+        _build_training_request(missing_account)
+    mixed_instruments = parser.parse_args([
+        '--artifact-id', 'stock-only', '--enable-stock-only-small-capital',
+        '--account-capital-krw', '10000000', '--enable-etf-satellite',
+    ])
+    with pytest.raises(ValueError, match='enable-etf-satellite'):
+        _build_training_request(mixed_instruments)
+
+
 def test_train_main_resolves_active_selection_once(monkeypatch, tmp_path) -> None:
     from datetime import UTC, date, datetime
     import hashlib, json as _json
