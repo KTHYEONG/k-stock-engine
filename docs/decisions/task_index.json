@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STOCK_ONLY_FACTOR_COMPOUNDING_20260901",
+      "date": "2026-09-01",
+      "adr_id": "ADR_20260901_STOCK_ONLY_FACTOR_COMPOUNDING_20260901",
+      "domain": "stocks",
+      "title": "국내주식 only factor 복리성장 연구 및 실행 검증",
+      "why": "인버스 ETF·헤지 없이 국내주식 포트폴리오만으로 유의미한 알파와 복리자산증식이 가능한지 실제 production replay로 검증할 필요가 있었다.",
+      "resolution": "주식 only factor study를 CLI에 연결하고, 실제 StockSimulator 비용·체결·bootstrap replay를 적용했다. 2016-01-05~2021-12-30 축소 실험에서 defensive_liquidity H10/C10/K12를 선택했으나 point CAGR -0.22%, lower CAGR -7.90%, MDD 49.54%로 RESEARCH_ONLY를 유지했다. DART·KRX PIT 데이터 보강 필요성을 기록했다.",
+      "impact": "ETF·인버스·헤지에 의존하지 않는 국내주식 연구 경로와 fail-closed 성과 게이트를 제공한다. 현재 결과는 실거래 승격 기준을 충족하지 않으며 후속 데이터 수집 및 저 turnover factor 검증이 필요하다."
+    },
+    {
       "task_id": "TASK_EXECUTABLE_HEDGE_GROWTH",
       "date": "2026-09-01",
       "adr_id": "ADR_20260901_EXECUTABLE_HEDGE_GROWTH",
@@ -989,16 +999,6 @@
       "why": "Six-horizon net-alpha discovery retains full per-horizon labels and calibrated OOF frames, driving measured peak RSS to 9648.812 MiB.",
       "resolution": "Register a sequential optimization blueprint: narrow horizon labels, temporary admitted-OOF Parquet spooling, deterministic cleanup, and max-RSS guardrails with unchanged fold/data contracts.",
       "impact": "Implementation target is lower peak RSS with bounded runtime overhead; no snapshot schema, label, fold, or model-selection contract changes."
-    },
-    {
-      "task_id": "TASK_LIGHTWEIGHT_ML_EXECUTION_MANIFEST",
-      "date": "2026-08-16",
-      "adr_id": "ADR_20260816_LIGHTWEIGHT_ML_EXECUTION_MANIFEST",
-      "domain": "stocks",
-      "title": "Lightweight ML execution range",
-      "why": "Research snapshot resolution rejected usable local ML/backtest data because unrelated evidence and costs ended before the feature window.",
-      "resolution": "Added execution-mode snapshot resolution using the hash-bound base/features/labels overlap, bounded repository composition and cost loading to execution_range, and preserved strict full validation for paper/live modes.",
-      "impact": "Local research ML and historical backtests no longer require excessive evidence coverage; point-in-time labels and no-imputation rules remain intact, while operational modes stay fail-closed."
     }
   ]
 }
