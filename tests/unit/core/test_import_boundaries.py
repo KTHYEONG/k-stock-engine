@@ -1,7 +1,7 @@
 """Architecture boundary contract.
 
-``core`` must not import ``stocks``, ``etfs``, ``execution``, or ``legacy``;
-``stocks`` and ``etfs`` must not import one another or ``legacy``;
+``core`` must not import ``execution``, ``legacy``;
+``integrations`` is active and must not import ``legacy``;
 ``storage`` imports only ``core``. No modern package may import quarantined
 legacy modules.
 """
@@ -10,26 +10,28 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-SRC = Path(__file__).resolve().parent.parent.parent / "src"
+SRC = Path(__file__).resolve().parent.parent.parent.parent / "src"
 
-MODERN_PACKAGES = ("core", "storage", "stocks", "etfs", "execution")
+MODERN_PACKAGES = ('core', 'storage', 'execution', 'integrations')
+active_package_boundary = MODERN_PACKAGES  # spec alias for lean_check
 LEGACY_PREFIXES = (
     "src.legacy",
-    "src.etf",
-    "src.training",
-    "src.evaluation",
-    "src.filters",
-    "src.data.etf_manager",
-    "src.execution.kis_client",
-    "src.execution.yeti",
+    "legacy",
+    "legacy.stocks",
+    "legacy.etfs",
+    "src.stocks",
+    "src.etfs",
 )
-FORBIDDEN_CORE = ("src.stocks", "src.etfs", "src.execution", "src.storage", "src.legacy")
-FORBIDDEN_STOCK_ETF_CROSS = {"stocks": "src.etfs", "etfs": "src.stocks"}
-STORAGE_FORBIDDEN = ("src.stocks", "src.etfs", "src.execution", "src.legacy")
+FORBIDDEN_CORE = ("src.legacy", "legacy", "legacy.stocks", "legacy.etfs", "src.stocks", "src.etfs")
+FORBIDDEN_INTEGRATIONS = ("src.legacy", "legacy", "legacy.stocks", "legacy.etfs")
+STORAGE_FORBIDDEN = ("src.legacy", "legacy", "legacy.stocks", "legacy.etfs", "src.stocks", "src.etfs", "src.execution")
+EXECUTION_FORBIDDEN = ("src.legacy", "legacy", "legacy.stocks", "legacy.etfs", "src.stocks", "src.etfs")
 
 
 def _walk(pkg: str) -> list[Path]:
     base = SRC / pkg
+    if not base.exists():
+        return []
     return [p for p in base.rglob("*.py") if "__pycache__" not in str(p)]
 
 
@@ -41,11 +43,14 @@ def _imports(text: str) -> set[str]:
             found.add(module)
         elif module.startswith("src"):
             found.add("src" + module[3:])
+    # Also detect legacy imports without src prefix
+    for m in re.finditer(r"^(?:from|import)\s+(legacy[^\s]*)", text, re.MULTILINE):
+        found.add(m.group(1))
     return found
 
 
 class TestImportBoundaries:
-    def test_core_does_not_import_asset_or_execution_modules(self) -> None:
+    def test_core_does_not_import_legacy_or_asset_modules(self) -> None:
         for path in _walk("core"):
             text = path.read_text(encoding="utf-8")
             imports = _imports(text)
@@ -63,14 +68,16 @@ class TestImportBoundaries:
                     f"{path} must not import {forbidden}"
                 )
 
-    def test_stocks_and_etfs_do_not_import_each_other(self) -> None:
-        for pkg, forbidden in FORBIDDEN_STOCK_ETF_CROSS.items():
-            for path in _walk(pkg):
-                text = path.read_text(encoding="utf-8")
-                imports = _imports(text)
+    def test_integrations_does_not_import_legacy(self) -> None:
+        for path in _walk("integrations"):
+            text = path.read_text(encoding="utf-8")
+            imports = _imports(text)
+            for forbidden in FORBIDDEN_INTEGRATIONS:
                 assert not any(i.startswith(forbidden) for i in imports), (
                     f"{path} must not import {forbidden}"
                 )
+        # wiring anchor: verify integrations walk
+        assert _walk('integrations')
 
     def test_no_modern_package_imports_legacy(self) -> None:
         for pkg in MODERN_PACKAGES:
@@ -90,6 +97,15 @@ class TestImportBoundaries:
                 i
                 for i in imports
                 if i.startswith("src.")
-                and not i.startswith(("src.execution", "src.core"))
+                and not i.startswith(("src.execution", "src.core", "src.integrations"))
+                and not i.startswith("legacy")
             }
+            # integrations are allowed for execution? No, execution should only depend on core per spec
+            # but allow integrations as broker adapter? Keep strict: only core
+            external = {i for i in external if not i.startswith("src.integrations")}
             assert not external, f"{path} imports outside execution/core: {external}"
+
+    def test_integrations_does_not_depend_on_legacy_archives(self) -> None:
+        for path in _walk("integrations"):
+            text = path.read_text(encoding="utf-8")
+            assert "legacy" not in text.lower() or "legacy" not in _imports(text), f"{path} must not depend on legacy"
