@@ -371,16 +371,24 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                     tree = ast.parse(sf_content, filename=fh)
                     if kind in ("constant", "type alias"):
                         # 모듈 수준 상수/타입 별칭(AnnAssign/Assign 타깃)를 인식한다.
+                        # For logical names where signature defines actual symbol, also accept signature LHS
+                        sig_names: list[str] = []
+                        c_sig = c.get("signature", "") or ""
+                        if c_sig and "=" in c_sig:
+                            lhs = c_sig.split("=")[0].strip()
+                            # handle 'MODERN_PACKAGES = ...' or 'PROJECT_ROOT: Path'
+                            sig_names.append(lhs.split(":")[0].strip().split()[0])
+                        candidates = {name, *sig_names}
                         for node in ast.walk(tree):
                             if (
                                 isinstance(node, ast.AnnAssign)
                                 and isinstance(node.target, ast.Name)
-                                and node.target.id == name
+                                and node.target.id in candidates
                             ):
                                 found_impl = True
                                 break
                             if isinstance(node, ast.Assign) and any(
-                                isinstance(t, ast.Name) and t.id == name
+                                isinstance(t, ast.Name) and t.id in candidates
                                 for t in node.targets
                             ):
                                 found_impl = True
@@ -612,6 +620,11 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
         wf: str = _repo_relative(
             w.get("file", "") or w.get("target", "") or w.get("caller_file", "")
         )
+        # Support post_migration_caller_file for hard-cut relocations
+        if wf and not os.path.exists(wf):
+            alt = _repo_relative(w.get("post_migration_caller_file", "") or w.get("post_migration_file", "") or "")
+            if alt and os.path.exists(alt):
+                wf = alt
         anchor: str = w.get("anchor", "")
         import_symbol: str = w.get("import_symbol", "") or w.get("callee", "") or w.get("symbol", "")
         invocation_expr: str = w.get("invocation_expression", "") or w.get("invocation_symbol", "")

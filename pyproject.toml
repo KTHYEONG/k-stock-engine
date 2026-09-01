@@ -53,9 +53,6 @@ exclude = [
     ".pytest_cache", 
     ".git",
     ".venv",
-    "src/legacy",
-    "src/utils",
-    "config/base.py",
     "tools",
 ]
 
@@ -90,7 +87,7 @@ ignore = [
 "tests/*" = ["S101", "S105", "S106", "E402", "N802", "N803", "N806", "N813", "N814", "ARG", "I001", "RUF059", "F841"]
 "tools/agent_skills/lean_check.py" = ["T20", "S607", "S603"]
 "src/execution/*" = ["T20", "ASYNC230", "ASYNC240", "S110", "SIM108", "B006"]
-"src/legacy/*" = ["ALL"]
+"legacy/*" = ["ALL"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 15
@@ -118,7 +115,7 @@ exclude = [
 ]
 
 [[tool.mypy.overrides]]
-module = ["src.legacy.*", "tests.*"]
+module = ["legacy.*", "tests.*"]
 ignore_errors = true
 
 
