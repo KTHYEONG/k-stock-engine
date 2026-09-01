@@ -482,5 +482,8 @@
   },
   "src/stocks/ml/comparison_report.py": {
     "testing": "tests/unit/stocks/ml/test_comparison_report.py"
+  },
+  "src/stocks/ml/training_orchestrator.py": {
+    "testing": "tests/unit/stocks/ml/test_research_feature_schema.py"
   }
 }

@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_FEATURE_SCHEMA_LINEAGE_FIX_20260901",
+      "date": "2026-09-01",
+      "adr_id": "ADR_20260901_ML_FEATURE_SCHEMA_LINEAGE_FIX_20260901",
+      "domain": "ml",
+      "title": "활성 feature frame의 PIT fundamental schema lineage 보정",
+      "why": "직접 활성 feature frame에 disclosure_date가 없어 ep_ratio 및 feature__ep_ratio가 존재하지 않는데 research-only ML 경로가 해당 source를 필수로 검증해 feature-schema-failed로 종료됨",
+      "resolution": "research-only 평가 경로에서 활성 pre-holdout frame의 가용 컬럼을 stock_net_alpha_v1_roles에 전달하고 disclosure lineage 부재 시 bp_ratio/ep_ratio를 결정적으로 제외했다. 동일 계약을 orchestrator 경로에도 적용하고 회귀 테스트를 추가했다.",
+      "impact": "스키마 단계가 정상 통과해 OOF 성장경로 평가가 수행된다. 재실행은 후보 7개를 생성했으나 base lower CAGR -5.28%, stress lower CAGR -4.70%, MDD 43.00%로 인증 실패 및 NO_TRADE이며 artifact는 publish되지 않았다."
+    },
+    {
       "task_id": "TASK_ML_PERSONAL_CAPITAL_HEDGE_VIABILITY",
       "date": "2026-08-31",
       "adr_id": "ADR_20260831_ML_PERSONAL_CAPITAL_HEDGE_VIABILITY",
@@ -989,16 +999,6 @@
       "why": "Multi-horizon label and outcome-status datasets failed closed because row ordering made stored and read-time content hashes disagree; every read also rehashed all decoded rows.",
       "resolution": "Canonical row hashing now uses a total ordered representation, partitioned reads compare declared manifest hashes and verify per-partition digests without a redundant full-table rehash, and identity output ordering includes horizon_sessions.",
       "impact": "Existing canonical ML label and status datasets are readable and tamper detection remains fail-closed with lower read overhead."
-    },
-    {
-      "task_id": "TASK_STOCK_OUTCOME_BACKFILL_PLAN",
-      "date": "2026-08-15",
-      "adr_id": "ADR_20260815_STOCK_OUTCOME_BACKFILL_PLAN",
-      "domain": "stocks",
-      "title": "Stock outcome backfill and correct-use plan",
-      "why": "Run8 outcome labels lack a snapshot-pinned status sidecar, so missing exits cannot be distinguished between recoverable bars, terminal events, tails, and construction failures.",
-      "resolution": "Registered a fail-closed plan that pins outcome status in the snapshot, adds immutable KRX bar reconciliation, requires verified corporate-action settlement, and keeps unresolved outcomes out of realized arithmetic.",
-      "impact": "Future ML/backtest runs can separate actual data collection gaps from non-recoverable or structural label failures; legacy snapshots remain diagnostic-only and all new artifacts retain hash-bound lineage."
     }
   ]
 }
