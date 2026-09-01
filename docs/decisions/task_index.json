@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_EXECUTABLE_HEDGE_GROWTH",
+      "date": "2026-09-01",
+      "adr_id": "ADR_20260901_EXECUTABLE_HEDGE_GROWTH",
+      "domain": "risk",
+      "title": "Hash-bound executable hedge certification",
+      "why": "ML route had positive relative excess but no executable account-level hedge evidence or route wiring.",
+      "resolution": "Added ETF-only hash-bound overlay loading, exact interval propagation, combined account certification, and executable overlay replay wiring across standard and batch paths.",
+      "impact": "Enables reproducible deployability gating for sub-10M KRW routes while preserving synthetic-hedge and unhedged safety gates."
+    },
+    {
       "task_id": "TASK_LARGE_MODULE_RESPONSIBILITY_SPLIT_20260901",
       "date": "2026-09-01",
       "adr_id": "ADR_20260901_LARGE_MODULE_RESPONSIBILITY_SPLIT_20260901",
@@ -989,16 +999,6 @@
       "why": "Research snapshot resolution rejected usable local ML/backtest data because unrelated evidence and costs ended before the feature window.",
       "resolution": "Added execution-mode snapshot resolution using the hash-bound base/features/labels overlap, bounded repository composition and cost loading to execution_range, and preserved strict full validation for paper/live modes.",
       "impact": "Local research ML and historical backtests no longer require excessive evidence coverage; point-in-time labels and no-imputation rules remain intact, while operational modes stay fail-closed."
-    },
-    {
-      "task_id": "TASK_STOCK_OUTCOME_BACKFILL_EXECUTION",
-      "date": "2026-08-16",
-      "adr_id": "ADR_20260816_STOCK_OUTCOME_BACKFILL_EXECUTION",
-      "domain": "stocks",
-      "title": "Outcome backfill and unresolved-data handling",
-      "why": "MISSING_EXIT_PRICE rows mixed recoverable API gaps with historical source-unavailable or no-bar outcomes, making ML and backtest readiness ambiguous.",
-      "resolution": "Backfilled 2026-03-11 KRX opens, published immutable outcome evidence with SOURCE_UNAVAILABLE and CONFIRMED_NO_BAR distinctions, pinned evidence in snapshots, excluded unresolved outcomes from realized label arithmetic, and changed ML admission to use observed/active coverage gates.",
-      "impact": "Recoverable exits are restored without imputation; non-recoverable history remains auditable and excluded from return arithmetic, while ML and replay avoid zero-fill and retain coverage diagnostics."
     }
   ]
 }

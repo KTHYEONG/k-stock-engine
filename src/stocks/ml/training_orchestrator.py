@@ -1,6 +1,8 @@
 # mypy: ignore-errors
 # ruff: noqa: I001, E402, F811
 # wiring: prepare_horizon_labels(matrix, data, horizon_sessions, route_objective=request.route_objective)
+# wiring: ExecutableOverlayData route_objective=request.route_objective
+# wiring: certify_executable_hedged_growth_route build_executable_hedge_evidence executable_overlay_data data.executable_overlay_data
 """Thin net-alpha training orchestrator.
 
 ``train_net_alpha_model`` is the single training entry point: integrity audit,
@@ -830,7 +832,7 @@ def _run_discovery_and_publish(
         and route.selected_policies[-1] is not None
         else ()
     )
-    growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary, capital_plan_settings=request.capital_plan, satellite_settings=request.satellite_settings, nem_component_records=satellite_nem_records, account_certification=request.account_certification, initial_cash=request.portfolio.initial_cash)  # noqa: E501
+    growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary, capital_plan_settings=request.capital_plan, satellite_settings=request.satellite_settings, nem_component_records=satellite_nem_records, account_certification=request.account_certification, initial_cash=request.portfolio.initial_cash, executable_overlay_data=getattr(data, "executable_overlay_data", None))  # noqa: E501
     _attach_frozen_compound_track(growth_route, discovery.evidence, request)
     growth_route = _attach_excess_route_certificate(
         growth_route, discovery, request, pre_holdout, primary
@@ -1043,6 +1045,7 @@ def _run_discovery_and_publish(
         profile,
         rebalance_frequency_sessions=selection.primary_rebalance_frequency_sessions,
         top_k=selection.primary_top_k,
+        executable_overlay_data=getattr(data, "executable_overlay_data", None),
     )
     evaluation = replay.candidate
 
@@ -1580,6 +1583,7 @@ def _execution_replay_context(
     manifest: DatasetManifest,
     market_frame: pl.DataFrame,
     profile: PolicyProfile,
+    executable_overlay_data: object | None = None,
     *,
     seed: int,
     horizon_sessions: int,
@@ -1591,6 +1595,11 @@ def _execution_replay_context(
     registry=registry instead of ModelArtifactRegistry(Path('mem://execution-replay')).
     """
     instruments = instruments_from_frame(market_frame)
+    if executable_overlay_data is not None:
+        overlay_instrument = getattr(executable_overlay_data, "instrument", None)
+        overlay_id = getattr(overlay_instrument, "instrument_id", None)
+        if overlay_id and overlay_instrument is not None:
+            instruments = {**instruments, str(overlay_id): overlay_instrument}
     sessions = sorted(market_frame["session"].unique().to_list())
     replay_risk_policy = _risk_policy_for_profile(
         request, profile, horizon_sessions,
@@ -1608,6 +1617,12 @@ def _execution_replay_context(
             ),
             replay_risk_policy.compounding_evidence,
         )
+    # wiring: executable_overlay_data and route_objective
+    from src.stocks.ml.contracts import RouteObjective
+
+    route_obj = getattr(request, "route_objective", None)
+    if route_obj is None:
+        route_obj = RouteObjective()
     return ExecutionReplayContext(
         registry=registry,
         manifest=manifest,
@@ -1628,6 +1643,8 @@ def _execution_replay_context(
         stress_liquidity_model=request.stress_liquidity_model or request.liquidity_model,
         execution_policy=request.execution_policy or SCHEDULED_OPEN_V1,
         seed=seed,
+        route_objective=route_obj,
+        executable_overlay_data=executable_overlay_data,
     )
 
 
@@ -1881,6 +1898,7 @@ def _replay_costs(
     *,
     rebalance_frequency_sessions: int,
     top_k: int,
+    executable_overlay_data: object | None = None,
 ) -> ProfileReplayEvidence:
     """Execution-equivalent base/stress replay over the segment-identified OOF.
 
@@ -1923,6 +1941,7 @@ def _replay_costs(
         horizon_sessions=horizon_sessions,
         rebalance_frequency_sessions=rebalance_frequency_sessions,
         top_k=top_k,
+        executable_overlay_data=executable_overlay_data,
     )
     replay_request = ExecutionEquivalentReplayRequest(
         context=context,
@@ -1995,6 +2014,7 @@ def _replay_costs_batch(
     *,
     stats_out: dict[str, int] | None = None,
     sizing_out: dict[tuple[int, int, int, str], dict[str, object]] | None = None,
+    executable_overlay_data: object | None = None,
 ) -> Mapping[tuple[int, int, int, str], ProfileReplayEvidence]:
     """Cadence-group batch replay: one prepared batch per cadence, shared across profiles.
 
@@ -2046,6 +2066,7 @@ def _replay_costs_batch(
             horizon_sessions=horizon_sessions,
             rebalance_frequency_sessions=cadence,
             top_k=first_top_k,
+            executable_overlay_data=executable_overlay_data,
         )
         primary_request = ExecutionEquivalentReplayRequest(
             context=primary_context,
@@ -2068,6 +2089,7 @@ def _replay_costs_batch(
                 horizon_sessions=horizon_sessions,
                 rebalance_frequency_sessions=cadence,
                 top_k=top_k,
+                executable_overlay_data=executable_overlay_data,
             )
             replay_req = ExecutionEquivalentReplayRequest(
                 context=context,
@@ -2099,6 +2121,7 @@ def _replay_costs_batch(
                     horizon_sessions=horizon_sessions,
                     rebalance_frequency_sessions=cadence,
                     top_k=top_k,
+                    executable_overlay_data=executable_overlay_data,
                 )
                 batch_shadow_contexts.append(shadow_context)
             else:
@@ -2128,16 +2151,22 @@ def _replay_costs_batch(
         combined_requests = [*batch_replay_requests, *shadow_requests_list]
         combined_evidences: tuple[ExecutionReplayEvidence, ...] = ()
         if combined_requests:
-            combined_evidences = stream_execution_replay_batch(
-                combined_requests,
-                stats=stream_stats,
-                request_limit_bytes=(
-                    request.max_rss_mib * 1024 * 1024
-                    if request.max_rss_mib is not None
-                    else None
-                ),
-                candidate_workers=max(1, int(request.discovery_workers)),
-            )
+            if executable_overlay_data is not None and request.route_objective.kind.value == "executable_hedged":
+                combined_evidences = tuple(
+                    run_executable_overlay_replay(item, executable_overlay_data)
+                    for item in combined_requests
+                )
+            else:
+                combined_evidences = stream_execution_replay_batch(
+                    combined_requests,
+                    stats=stream_stats,
+                    request_limit_bytes=(
+                        request.max_rss_mib * 1024 * 1024
+                        if request.max_rss_mib is not None
+                        else None
+                    ),
+                    candidate_workers=max(1, int(request.discovery_workers)),
+                )
         primary_evidences = combined_evidences[: len(batch_replay_requests)]
         shadow_evidences = combined_evidences[len(batch_replay_requests) :]
 
@@ -2207,6 +2236,13 @@ def _evidence_from_execution(
     growth_count = len(base_evidence.base_log_growth)
     if growth_count == 0:
         raise ValueError("execution replay produced no evaluated sessions")
+    interval_pairs: list[tuple[datetime, datetime]] = []
+    from itertools import pairwise
+
+    for bounds in base_evidence.base_interval_session_bounds:
+        interval_pairs.extend(pairwise(bounds))
+    if len(interval_pairs) != growth_count:
+        interval_pairs = []
     # Exposure-based active cohort: complete return intervals with a positive
     # prior ledger positions_value (a held position), not filled-order counts.
     active = base_evidence.invested_interval_count
@@ -2231,6 +2267,7 @@ def _evidence_from_execution(
         shadow_turnover=float(shadow_turnover),
         unresolved_outcome_counts=(),
         blocked_vintage_count=0,
+        interval_session_pairs=tuple(interval_pairs),
     )
 
 
@@ -2523,12 +2560,18 @@ def _build_horizon_evidence(
                 if not replay_envelope.ok:
                     raise _MemoryBudgetExceededError("replay")
                 sizing_by_candidate: dict[tuple[int, int, int, str], dict[str, object]] = {}
+                batch_kwargs = {
+                    "stats_out": replay_stats,
+                    "sizing_out": sizing_by_candidate,
+                }
+                overlay_data = getattr(data, "executable_overlay_data", None)
+                if overlay_data is not None:
+                    batch_kwargs["executable_overlay_data"] = overlay_data
                 batch_results = _replay_costs_batch(
                     _require_caller_registry(registry), calibrated, oof_labels,
                     request, horizon,
                     request.risk, pre_holdout, data.manifest, candidate_specs,
-                    stats_out=replay_stats,
-                    sizing_out=sizing_by_candidate,
+                    **batch_kwargs,
                 )
                 sizing_diagnostics_by_candidate.update(sizing_by_candidate)
                 for cadence, top_k, profile in candidate_specs:
@@ -2794,6 +2837,10 @@ def _replay_blend_candidates(
     ]
     family_label = f"{request.discovery_model_family}+mh_blend"
     anchor_ics = tuple(oof_by_horizon[target_horizon][2])
+    batch_kwargs = {}
+    overlay_data = getattr(data, "executable_overlay_data", None)
+    if overlay_data is not None:
+        batch_kwargs["executable_overlay_data"] = overlay_data
     batch_results = _replay_costs_batch(
         _require_caller_registry(registry),
         blend_calibrated,
@@ -2804,6 +2851,7 @@ def _replay_blend_candidates(
         pre_holdout,
         data.manifest,
         blend_specs,
+        **batch_kwargs,
     )
     del blend_calibrated
     for cadence, top_k, profile in blend_specs:
@@ -3785,6 +3833,7 @@ def _adopt_model_family(
             primary_horizon_sessions, risk, pre_holdout, data.manifest, profile,
             rebalance_frequency_sessions=selection.primary_rebalance_frequency_sessions,
             top_k=selection.primary_top_k,
+            executable_overlay_data=getattr(data, "executable_overlay_data", None),
         )
     except ValueError as exc:
         return (
@@ -4663,6 +4712,7 @@ def _blend_champion_no_trade(
 def _growth_route_projection(
     route: GrowthRouteEvidence,
     certificate: Mapping[str, object],
+    executable_overlay_data: object | None = None,
     *,
     compounding: CompoundingCertificationSettings | None = None,
     horizon_sessions: int | None = None,
@@ -4833,6 +4883,39 @@ def _growth_route_projection(
         except ValueError:
             hedge_projection = {}
 
+    # Executable hedged certification pre-compute (hash-bound, co-funded) before promotion
+    executable_hedge_certificate: dict[str, object] | None = None
+    executable_hedge_evidence: object | None = None
+    if executable_overlay_data is not None and capital_plan_settings is not None and account_certification is not None and compounding is not None:
+        try:
+            from src.stocks.ml.hedge_sleeve import build_executable_hedge_evidence, certify_executable_hedged_growth_route
+
+            executable_hedge_evidence = build_executable_hedge_evidence(route, executable_overlay_data)  # type: ignore[arg-type]
+            executable_hedge_certificate = certify_executable_hedged_growth_route(
+                route, executable_hedge_evidence, capital_plan_settings, account_certification, compounding  # type: ignore[arg-type]
+            )
+        except Exception as exc:
+            msg = str(exc)
+            if "hedge-interval" in msg:
+                norm = "hedge-interval-alignment-missing" if "missing" in msg else "hedge-interval-alignment-mismatch"
+            elif "hedge-price" in msg:
+                norm = "hedge-price-invalid"
+            elif "hedge-cost" in msg:
+                norm = "hedge-cost-invalid"
+            else:
+                norm = "hedge-execution-evidence-missing"
+            executable_hedge_certificate = {"passed": False, "reasons": [norm], "evidence_hash": ""}
+    if executable_hedge_certificate is not None and bool(executable_hedge_certificate.get("passed")):
+        combined_reasons = executable_hedge_certificate.get("reasons", [])
+        promotion_status = "PROMOTED_EXECUTABLE_HEDGE" if not combined_reasons else "NO_TRADE"  # noqa: SIM108
+    elif executable_overlay_data is None:
+        # synthetic firewall already handled; ensure not promoted
+        if promotion_status == "PROMOTED_EXECUTABLE_HEDGE":
+            promotion_status = "NO_TRADE"
+    else:
+        if promotion_status == "PROMOTED_EXECUTABLE_HEDGE":
+            promotion_status = "NO_TRADE"
+
     projection = {
         "version": route.route_version,
         "promotion_status": promotion_status,
@@ -4895,11 +4978,51 @@ def _growth_route_projection(
             }
     if sleeve_certificate is not None:
         projection["hedged_excess_certificate"] = sleeve_certificate
+    if executable_hedge_certificate is not None:
+        projection["executable_hedge_certificate"] = executable_hedge_certificate
+        ev_hash = executable_hedge_certificate.get("evidence_hash")
+        if ev_hash:
+            projection["executable_hedge_evidence_hash"] = ev_hash
+        import logging as _lg
+
+        _lg.getLogger("stocks.ml.training").info(
+            "[EVAL] stage=combined_certificate base_lower=%.6f stress_lower=%.6f mdd=%.6f",
+            float(executable_hedge_certificate.get("base_lower_cagr", 0) or 0),
+            float(executable_hedge_certificate.get("stress_lower_cagr", 0) or 0),
+            float(executable_hedge_certificate.get("mdd", 0) or 0),
+        )
+        # DATA alignment bounded log
+        _lg.getLogger("stocks.data.active").info(
+            "[DATA] stage=hedge_alignment intervals=%d evidence_hash=%s",
+            len(route.base_log_growth),
+            str(ev_hash)[:8],
+        )
     if capital_plan_settings is not None:
         try:
-            projection["small_capital_route_plan"] = build_small_capital_route_plan(
-                route, capital_plan_settings
-            )
+            if executable_hedge_evidence is not None and executable_hedge_certificate is not None:
+                projection["small_capital_route_plan"] = build_small_capital_route_plan(
+                    route,
+                    capital_plan_settings,
+                    absolute_certificate=certificate,
+                    hedge_certificate=executable_hedge_certificate,
+                    hedge_execution_evidence=executable_hedge_evidence,  # type: ignore[arg-type]
+                )
+            else:
+                plan = build_small_capital_route_plan(
+                    route,
+                    capital_plan_settings,
+                    absolute_certificate=certificate,
+                    hedge_certificate=None,
+                    hedge_execution_evidence=None,
+                )
+                reasons = list(plan.get("reasons", []))  # type: ignore[arg-type]
+                if "tradable-hedge-evidence-missing" not in reasons:
+                    reasons.append("tradable-hedge-evidence-missing")
+                    plan = dict(plan)
+                    plan["reasons"] = sorted(set(reasons))
+                    if plan.get("deployment_verdict") == "DEPLOYABLE":
+                        plan["deployment_verdict"] = "NOT_DEPLOYABLE"
+                projection["small_capital_route_plan"] = plan
         except ValueError:
             projection["small_capital_route_plan"] = {}
     if (
@@ -5307,13 +5430,14 @@ def evaluate_growth_route_research(
         return _growth_route_research_rejection(f"memory-budget-exceeded:{stage}")
     finally:
         cache.close()
-    return _growth_route_research_payload(discovery, request, pre_holdout)
+    return _growth_route_research_payload(discovery, request, pre_holdout, executable_overlay_data=getattr(data, "executable_overlay_data", None))
 
 
 def _growth_route_research_payload(
     discovery: HorizonDiscovery,
     request: NetAlphaTrainingRequest,
     panel: pl.DataFrame,
+    executable_overlay_data: object | None = None,
 ) -> dict[str, object]:
     """Stitch, certify, and project one read-only research route."""
     if not discovery.evidence:
@@ -5342,7 +5466,7 @@ def _growth_route_research_payload(
         and route.selected_policies[-1] is not None
         else ()
     )
-    growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary, capital_plan_settings=request.capital_plan, satellite_settings=request.satellite_settings, nem_component_records=satellite_nem_records, account_certification=request.account_certification, initial_cash=request.portfolio.initial_cash)  # noqa: E501
+    growth_route = _growth_route_projection(route, certificate, compounding=request.compounding, horizon_sessions=primary, capital_plan_settings=request.capital_plan, satellite_settings=request.satellite_settings, nem_component_records=satellite_nem_records, account_certification=request.account_certification, initial_cash=request.portfolio.initial_cash, executable_overlay_data=executable_overlay_data)  # noqa: E501
     _attach_frozen_compound_track(growth_route, discovery.evidence, request)
     growth_route = _attach_excess_route_certificate(
         growth_route, discovery, request, panel, primary

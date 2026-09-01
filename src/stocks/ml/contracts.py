@@ -835,6 +835,8 @@ class HedgeExecutionEvidence:
     tax_model: Mapping[str, object]
     base_log_growth: tuple[float, ...]
     stress_log_growth: tuple[float, ...]
+    interval_session_pairs: tuple[tuple[datetime, datetime], ...] = ()
+    stress_per_side_cost_rate: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1022,10 +1024,13 @@ class ExecutableOverlayData:
     evidence_hash: str
     base_cost_schedule: object
     stress_cost_schedule: object
+    beta: float = -1.0
 
     def __post_init__(self) -> None:
         if not self.evidence_hash or len(self.evidence_hash) != 64:
             raise ValueError("evidence_hash must be 64-char hash")
+        if not math.isfinite(float(self.beta)) or float(self.beta) >= 0.0:
+            raise ValueError("beta must be finite negative")
         # minimal checks for instrument kind
         try:
             kind = getattr(self.instrument, "asset_kind", None)
