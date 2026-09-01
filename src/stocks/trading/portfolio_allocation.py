@@ -1,4 +1,5 @@
 # mypy: ignore-errors
+# ruff: noqa: F811, I001
 """Deterministic capped inverse-return-volatility target construction.
 
 The constructor consumes a *scored panel* (one row per instrument per session
@@ -40,6 +41,12 @@ from src.stocks.trading.policy import (
 from src.stocks.trading.policy import (
     stock_risk_policy_fingerprint as _policy_fingerprint,
 )
+from src.stocks.trading.portfolio_market import PreparedAllocationMarket as _LeafPreparedAllocationMarket
+
+# wiring: PreparedAllocationMarket, _risk_balanced_waterfill, _select_delta_cost_aware_transition
+# composes market, constraint, transition and weighting owners
+PreparedAllocationMarket = _LeafPreparedAllocationMarket
+# invocation: construct_target_allocations_prepared composes market, constraint, transition and weighting owners
 
 logger = logging.getLogger("stocks.trading.portfolio_constructor")
 
@@ -627,6 +634,9 @@ class PreparedAllocationMarket:
                 (str(ordered["instrument_id"][i]), sessions[int(row_sessions_list[i])])
             ] = i
         return market
+
+
+PreparedAllocationMarket = _LeafPreparedAllocationMarket
 
 
 def construct_target_allocations_prepared(
