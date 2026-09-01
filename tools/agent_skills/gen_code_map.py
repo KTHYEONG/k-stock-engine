@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import pathlib
 import os
 import sys
 
@@ -54,10 +55,21 @@ def main() -> None:
             entry["testing"] = matched[0] if len(matched) == 1 else matched
         code_map[source_file] = entry
 
-    with open("docs/code_map.json", "w", encoding="utf-8") as handle:
-        json.dump(code_map, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    print(f"regenerated docs/code_map.json with {len(code_map)} canonical sources")
+    # Tolerate absent active code_map.json; do not recreate archived records under docs/
+    # Only active src files are mapped; legacy sources remain in legacy/docs/code_map.json
+    import contextlib
+    docs_path = pathlib.Path("docs/code_map.json")
+    # If active docs/code_map.json is absent, still generate active-only map without archived entries
+    with contextlib.suppress(FileNotFoundError):
+        if not docs_path.parent.exists():
+            docs_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(docs_path, "w", encoding="utf-8") as handle:
+            json.dump(code_map, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        print(f"regenerated docs/code_map.json with {len(code_map)} canonical sources")
+    except FileNotFoundError:
+        print("active docs/code_map.json absent, skipped regeneration (archived map remains in legacy/docs)")
 
 
 if __name__ == "__main__":
