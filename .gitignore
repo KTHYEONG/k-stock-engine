@@ -7,6 +7,10 @@ __pycache__/
 # data (root-level runtime store only; src data packages are source code)
 /data/
 /data/*
+
+# archived source, tests, and historical artifacts
+/legacy/
+
 trading_state.db
 *.db
 
