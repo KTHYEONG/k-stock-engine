@@ -219,7 +219,10 @@
     "testing": "tests/unit/stocks/cli/test_simulate.py"
   },
   "src/stocks/cli/train.py": {
-    "testing": "tests/unit/stocks/cli/test_train.py",
+    "testing": [
+      "tests/unit/stocks/cli/test_train.py",
+      "tests/unit/stocks/trading/test_portfolio_constructor.py"
+    ],
     "architecture": "docs/specs/economic_ml_rebuild.md"
   },
   "src/stocks/data/contracts.py": {
