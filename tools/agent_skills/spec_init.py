@@ -10,6 +10,7 @@ from typing import Any
 
 
 def _read_json(path: str) -> dict[str, Any]:
+    # Tolerate absent active code_map.json and task_index.json; do not recreate archived records under docs/
     if not os.path.exists(path):
         return {}
     try:
@@ -50,6 +51,7 @@ def main() -> None:
         print(f"  - Resolution: {adr.get('resolution')}")
 
     # 2. Search code map entries from code_map.json
+    # Tolerate absent active code_map.json
     code_map = _read_json("docs/code_map.json")
     relevant_code = {}
     if args.query:

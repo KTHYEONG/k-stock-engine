@@ -55,6 +55,13 @@ def _update_decisions_json(
     failed_hypothesis: str | None = None,
     failure_reason: str | None = None,
 ) -> str:
+    # Tolerate absent active task_index.json; do not recreate archived records under docs/
+    # Archived decisions remain in legacy/docs/decisions
+    if os.path.exists("legacy/docs/decisions/task_index.json") and not os.path.exists("docs/decisions"):
+        # Active decisions are archived; skip recreation
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        adr_date = datetime.now().strftime("%Y%m%d")
+        return f"ADR_{adr_date}_{task.replace('TASK_', '')}"
     date_str = datetime.now().strftime("%Y-%m-%d")
     adr_date = datetime.now().strftime("%Y%m%d")
     adr_id = f"ADR_{adr_date}_{task.replace('TASK_', '')}"
@@ -90,6 +97,9 @@ def _update_decisions_json(
 
 
 def _update_index(source_file: str, test_file: str | None, doc_file: str | None) -> None:
+    # Tolerate absent active code_map.json; do not recreate archived records under docs/
+    if os.path.exists("legacy/docs/code_map.json") and not os.path.exists("docs/code_map.json"):
+        return
     code_map_path = "docs/code_map.json"
     data: dict[str, dict[str, str | list[str]]] = {}
 
