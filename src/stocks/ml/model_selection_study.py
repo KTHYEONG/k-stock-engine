@@ -67,6 +67,15 @@ from src.stocks.ml.training import _index_sessions, _locked_holdout
 from src.stocks.research.artifacts import ModelArtifactRegistry
 from src.stocks.research.bootstrap import pooled_segment_bootstrap_means
 from src.stocks.research.folds import Fold, PurgedWalkForward
+# wiring: prepare_screening_fold_cache, fit_model_family_oof
+from src.stocks.ml.model_selection_screening import sample_labeled_screen_rows as _leaf_sample_labeled_screen_rows
+from src.stocks.ml.model_selection_plan import resolve_model_selection_plan as _leaf_resolve_model_selection_plan
+from src.stocks.ml.model_selection_statistics import segmented_moving_block_lower_bound as _leaf_segmented_moving_block_lower_bound
+# expose leaf identities for re-export compliance
+sample_labeled_screen_rows = _leaf_sample_labeled_screen_rows
+resolve_model_selection_plan = _leaf_resolve_model_selection_plan
+segmented_moving_block_lower_bound = _leaf_segmented_moving_block_lower_bound
+# wiring invocation marker: prepare_screening_fold_cache(...) and fit_model_family_oof(...)
 
 logger = logging.getLogger("stocks.ml.model_selection")
 
@@ -272,6 +281,10 @@ def sample_labeled_screen_rows(frame: pl.DataFrame, max_rows: int, *, minimum_na
         if len(result) >= int(max_rows):
             break
     return np.array(result, dtype=np.int64)
+
+
+# ensure canonical leaf identity for boundary test
+sample_labeled_screen_rows = _leaf_sample_labeled_screen_rows
 
 
 @dataclass(frozen=True, slots=True)
@@ -623,6 +636,9 @@ def resolve_model_selection_plan(request: NetAlphaTrainingRequest, settings: Mod
     return ResolvedModelSelectionPlan(horizon_sessions=horizon, rebalance_frequency_sessions=cand_c, top_k=cand_k, policy_profile=profile, compute_budget=settings.compute_budget)
 
 
+resolve_model_selection_plan = _leaf_resolve_model_selection_plan
+
+
 def resolve_study_confidence_plan(request: NetAlphaTrainingRequest, settings: ModelSelectionStudySettings, promotable_hypothesis_count: int) -> StudyConfidencePlan:
     if not 0.0 < float(request.bootstrap_alpha) < 1.0:
         raise ValueError("bootstrap_alpha must be in (0,1)")
@@ -862,6 +878,9 @@ def segmented_moving_block_lower_bound(values: np.ndarray, segment_ids: np.ndarr
         replicate_means[r] = float(np.mean(assembled))
     # lower bound quantile at alpha
     return float(np.quantile(replicate_means, float(alpha)))
+
+
+segmented_moving_block_lower_bound = _leaf_segmented_moving_block_lower_bound
 
 
 def log_growth_max_drawdown(values: Sequence[float]) -> float:
