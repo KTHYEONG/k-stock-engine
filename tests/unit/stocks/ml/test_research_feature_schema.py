@@ -4,6 +4,22 @@
 import polars as pl
 import numpy as np
 
+
+def test_stock_net_alpha_roles_exclude_pit_fundamentals_without_lineage():
+    from src.stocks.ml.features import stock_net_alpha_v1_roles
+
+    roles = stock_net_alpha_v1_roles(
+        available_columns=("instrument_id", "session", "feature__momentum_5d")
+    )
+    assert "ep_ratio" not in roles
+    assert "bp_ratio" not in roles
+
+    with_lineage = stock_net_alpha_v1_roles(
+        available_columns=("instrument_id", "session", "disclosure_date")
+    )
+    assert "ep_ratio" in with_lineage
+    assert "bp_ratio" in with_lineage
+
 def test_MODEL_SELECTION_02_FOLD_LOCAL_ATTRIBUTION():
     from src.stocks.ml.features import fit_research_feature_schema
     from src.stocks.ml.model_selection import select_feature_groups
