@@ -382,6 +382,12 @@ def _profile_net_exposure_params(
     if raw_mode == "off_v1":
         return params
     params["net_exposure_gate_mode"] = str(raw_mode)
+    raw_history_mode = profile.get("gate_history_mode", "fail_open_v1")
+    if raw_history_mode not in ("fail_open_v1", "cash_on_insufficient_v1"):
+        raise ValueError(
+            "gate_history_mode must be 'fail_open_v1' or 'cash_on_insufficient_v1'"
+        )
+    params["gate_history_mode"] = str(raw_history_mode)
     raw_floor = profile.get("gate_floor")
     if raw_floor is not None:
         if isinstance(raw_floor, bool) or not isinstance(raw_floor, (int, float)):
