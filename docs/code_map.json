@@ -492,5 +492,8 @@
       "tests/unit/stocks/ml/test_executable_hedged_growth.py"
     ],
     "architecture": "docs/architecture/project_goals.md"
+  },
+  "src/stocks/research/stock_only_factor_study.py": {
+    "testing": "tests/unit/stocks/research/test_stock_only_factor_study.py"
   }
 }
