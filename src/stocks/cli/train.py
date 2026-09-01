@@ -771,6 +771,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--research-only-stock-only-factor-study",
+        action="store_true",
+        dest="research_only_stock_only_factor_study",
+        help=(
+            "read-only stock-only factor study; prints bounded RESEARCH_ONLY JSON and publishes no artifact"
+        ),
+    )
+    parser.add_argument(
         "--study",
         type=str,
         choices=[e.value for e in __import__("src.stocks.cli.contracts", fromlist=["ResearchStudyKind"]).ResearchStudyKind],
@@ -2149,6 +2157,55 @@ def run_research_only_compound_alpha_study(
     return payload
 
 
+def run_research_only_stock_only_factor_study(
+    parsed: argparse.Namespace,
+    request: NetAlphaTrainingRequest,
+    *,
+    selection: ActiveResearchDataSelection | None = None,
+) -> dict[str, object]:
+    """Read-only stock-only factor study: bounded RESEARCH_ONLY payload.
+
+    Uses the active direct snapshot and hash-bound base/stress cost evidence.
+    Never publishes a model artifact, ledger record, order, or external request.
+    """
+    from src.stocks.research.stock_only_factor_study import (
+        StockOnlyFactorStudySettings,
+        run_stock_only_factor_study,
+    )
+
+    # Reference for wiring check
+    _ = run_stock_only_factor_study
+    if selection is not None:
+        data, bound_request = _load_active_study_context(parsed, request, selection)
+        # Build panel from active data: feature_frame plus required execution columns
+        panel = data.feature_frame
+        # Ensure required execution columns exist; fallback to base values if missing
+        labels_by_horizon: dict[int, object] = {}
+        for horizon, label_frame in data.labels_by_horizon.items():
+            labels_by_horizon[int(horizon)] = label_frame
+        # Derive settings from CLI or defaults
+        horizons = _parse_horizons(getattr(parsed, "candidate_horizon_sessions", "5"))
+        cadences = _parse_horizons(getattr(parsed, "candidate_rebalance_frequency_sessions", "5"))
+        top_ks = _parse_horizons(getattr(parsed, "candidate_top_k", "3"))
+        settings = StockOnlyFactorStudySettings(
+            candidate_horizon_sessions=tuple(int(h) for h in horizons),
+            candidate_rebalance_frequency_sessions=tuple(int(c) for c in cadences),
+            candidate_top_k=tuple(int(k) for k in top_ks),
+            account_capital_krw=float(getattr(parsed, "account_capital_krw", 10_000_000.0) or 10_000_000.0),
+            fold_count=int(getattr(parsed, "fold_count", 3)),
+            embargo_sessions=int(getattr(parsed, "embargo_sessions", 5)),
+            forward_holdout_sessions=int(getattr(parsed, "forward_holdout_sessions", 252)),
+        )
+        # Use hash-bound schedules
+        base_sched: CostSchedule = bound_request.base_cost_schedule  # type: ignore[assignment]
+        stress_sched: CostSchedule = bound_request.stress_cost_schedule  # type: ignore[assignment]
+        result = run_stock_only_factor_study(panel, labels_by_horizon, settings, base_sched, stress_sched)
+        payload = result.to_payload()
+        return {"status": "RESEARCH_ONLY", "artifact_published": False, "artifact_id": bound_request.artifact_id, **payload}
+    # Selection absent: resolve via active snapshot not allowed to publish artifact; still return RESEARCH_ONLY with no data
+    raise ValueError("active data selection is unavailable for stock-only factor study")
+
+
 def run_research_only_alpha_capacity_audit(
     parsed: argparse.Namespace,
     request: NetAlphaTrainingRequest,
@@ -2471,6 +2528,8 @@ def _dispatch_train_command(command: TrainCommand) -> int:
                 payload = run_research_only_compound_alpha_study(parsed, req, selection=selection)
             elif study_value == "model_selection_study":
                 payload = run_research_only_model_selection_study(parsed, req, selection=selection)
+            elif study_value == "stock_only_factor_study":
+                payload = run_research_only_stock_only_factor_study(parsed, req, selection=selection)
             else:
                 raise ValueError(f"unknown study {study_value!r}")
         except Exception as exc:

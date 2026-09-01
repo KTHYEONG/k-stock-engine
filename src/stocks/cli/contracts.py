@@ -22,6 +22,7 @@ class ResearchStudyKind(StrEnum):
     return_transfer_study = "return_transfer_study"
     compound_alpha_study = "compound_alpha_study"
     model_selection_study = "model_selection_study"
+    stock_only_factor_study = "stock_only_factor_study"
 
 
 _ALIAS_TO_KIND: dict[str, ResearchStudyKind] = {
@@ -32,6 +33,7 @@ _ALIAS_TO_KIND: dict[str, ResearchStudyKind] = {
     "research_only_return_transfer_study": ResearchStudyKind.return_transfer_study,
     "research_only_compound_alpha_study": ResearchStudyKind.compound_alpha_study,
     "research_only_model_selection_study": ResearchStudyKind.model_selection_study,
+    "research_only_stock_only_factor_study": ResearchStudyKind.stock_only_factor_study,
 }
 
 
