@@ -87,6 +87,7 @@ from src.stocks.ml.replay_resources import (
 from src.stocks.ml.replay_resources import read_host_mem_available_bytes
 from src.stocks.ml.result_ledger import (
     CostRunContext,
+    MlResultLedger,
     MlRunContext,
 )
 from src.stocks.ml.training import TrainingOrchestrator, train_net_alpha_model
@@ -2454,6 +2455,8 @@ def _dispatch_train_command(command: TrainCommand) -> int:
     return 0
 
 
+# wiring: build_parser, _dispatch_train_command
+# parsed = build_parser().parse_args(args); return _dispatch_train_command(parsed)
 def main(args: list[str] | None = None) -> int:
     global _LAST_TRAIN_PARSED
     parser = build_parser()
@@ -2761,7 +2764,7 @@ def _run_direct_training(
 
     # Diagnostics open before any allocation so a guard denial leaves terminal
     # evidence instead of a vanished kernel.
-    ledger = MlComparisonReport(parsed.results_root)
+    ledger = MlResultLedger(parsed.results_root)
     identity = RunIdentity(run_id=request.artifact_id, project="stocks")
     runtime_settings = StockRuntimeSettings(diagnostics_enabled=True).model_dump()
     resolve_training_request(request.artifact_id, overrides={})
