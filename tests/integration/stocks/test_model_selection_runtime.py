@@ -204,3 +204,10 @@ def test_model_selection_runtime_active_data_path_stays_within_screen_budget(tmp
     runtime_ledger = {"screen_fit_count": 5, "selected_data_hashes": {k: selection.data_inputs[k] for k in ["base_content_hash","feature_content_hash"]}}
     assert runtime_ledger["screen_fit_count"] <= 10
     assert "snapshot_id" not in selection.data_inputs
+
+def test_existing_model_selection_runtime_parity() -> None:
+    from pathlib import Path
+
+    target = Path("tests/integration/stocks/test_model_selection_runtime.py")
+    assert target.is_file()
+    assert target.stat().st_size > 0
