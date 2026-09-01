@@ -26,14 +26,21 @@ from src.stocks.ml.contracts import (
     GROWTH_FULL_UTILIZATION_PROFILE_ID,
     PolicyProfile,
 )
+from src.stocks.ml.contracts import (
+    STOCK_ONLY_SMALL_CAPITAL_PROFILE_ID as _STOCK_ONLY_SMALL_CAPITAL_PROFILE_ID,
+)
 
 __all__ = [
     "EXCESS_FULL_KELLY_PROFILE_ID",
     "GROWTH_FULL_UTILIZATION_PROFILE_ID",
+    "STOCK_ONLY_SMALL_CAPITAL_PROFILE_ID",
     "UNHEDGED_NEM_PROFILE_ID",
     "UNHEDGED_STACK_PROFILE_ID",
     "CanonicalResearchProfile",
+    "policy_profiles_with_stock_only_small_capital",
 ]
+
+STOCK_ONLY_SMALL_CAPITAL_PROFILE_ID = _STOCK_ONLY_SMALL_CAPITAL_PROFILE_ID
 
 
 class ParameterSource(StrEnum):
@@ -175,6 +182,28 @@ def policy_profiles_with_unhedged_nem() -> tuple[PolicyProfile, ...]:
             participation_limit_override=_GROWTH_FULL_UTILIZATION_PARTICIPATION,
             turnover_budget_override=_GROWTH_FULL_UTILIZATION_TURNOVER_BUDGET,
             net_exposure_gate_mode="trend_vol_v1",
+        ),
+    )
+
+
+def policy_profiles_with_stock_only_small_capital() -> tuple[PolicyProfile, ...]:
+    """Opt-in stock-only account ladder with cash fail-closed NEM behavior."""
+    return (
+        *policy_profiles_with_unhedged_nem(),
+        PolicyProfile(
+            profile_id=STOCK_ONLY_SMALL_CAPITAL_PROFILE_ID,
+            no_trade_band_bps=0.0,
+            growth_risk_aversion=1.0,
+            execution_utility_mode="sparse_hold_replace_v2",
+            sizing_mode="risk_balanced_waterfill_v2",
+            single_name_cap_override=_EXCESS_FULL_KELLY_SINGLE_NAME_CEILING,
+            gross_utilization_target=_GROWTH_FULL_UTILIZATION_GROSS_UTILIZATION,
+            vol_target_override=_GROWTH_FULL_UTILIZATION_VOL_TARGET,
+            participation_limit_override=_GROWTH_FULL_UTILIZATION_PARTICIPATION,
+            turnover_budget_override=_GROWTH_FULL_UTILIZATION_TURNOVER_BUDGET,
+            net_exposure_gate_mode="trend_vol_v1",
+            gate_floor=0.0,
+            gate_history_mode="cash_on_insufficient_v1",
         ),
     )
 
