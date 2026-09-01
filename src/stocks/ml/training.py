@@ -62,6 +62,7 @@ from src.stocks.ml.contracts import (
     AccountCertificationSettings,
     CompoundingCertificationSettings,
     FoldScoreDiagnostic,
+    HedgeExecutionEvidence,
     HorizonOOFDiagnostic,
     NetAlphaResearchData,
     NetAlphaTrainingRequest,
@@ -265,8 +266,8 @@ def validate_account_capital_coherence(
         raise ValueError("account_capital_krw must be finite")
     if not 0 < cap <= max_cap:
         raise ValueError(f"account_capital_krw must be in (0, {max_cap}] got {cap}")
-    if cap > 5_000_000.0:
-        raise ValueError(f"account_capital_krw {cap} exceeds 5_000_000")
+    if cap > 10_000_000.0:
+        raise ValueError(f"account_capital_krw {cap} exceeds 10_000_000")
     manifest_notional = data.manifest.reference_notional
     if manifest_notional is None:
         raise ValueError("label manifest reference_notional missing in account mode")
@@ -1211,6 +1212,7 @@ def _risk_policy_for_profile(
             if gate_lookback_override is not None
             else StockRiskPolicy().gate_trend_lookback_sessions
         ),
+        gate_history_mode=profile.gate_history_mode,
         lot_sizing=lot_sizing_cfg,
         **policy_kwargs,  # type: ignore[arg-type]
     )
@@ -1653,6 +1655,7 @@ def _replay_costs(
         net_exposure_gate_mode=profile.net_exposure_gate_mode,
         gate_trend_lookback_sessions=profile.gate_trend_lookback_sessions,
         gate_floor=profile.gate_floor,
+        gate_history_mode=profile.gate_history_mode,
     )
     shadow_context = _execution_replay_context(
         registry,
@@ -1782,6 +1785,7 @@ def _replay_costs_batch(
                     net_exposure_gate_mode=profile.net_exposure_gate_mode,
                     gate_trend_lookback_sessions=profile.gate_trend_lookback_sessions,
                     gate_floor=profile.gate_floor,
+                    gate_history_mode=profile.gate_history_mode,
                 )
                 shadow_context = _execution_replay_context(
                     registry,
@@ -4131,6 +4135,7 @@ def _policy_profile_params(
                         if profile.gate_trend_lookback_sessions is not None
                         else {}
                     ),
+                    "gate_history_mode": profile.gate_history_mode,
                 }
             ),
         },
@@ -4364,6 +4369,7 @@ def _growth_route_projection(
     hedge_evidence: object | None = None,
     absolute_certificate: Mapping[str, object] | None = None,
     hedge_certificate: Mapping[str, object] | None = None,
+    hedge_execution_evidence: HedgeExecutionEvidence | None = None,
 ) -> dict[str, object]:
     """Bounded ``growth_route`` projection shared by metrics and the ledger.
 
@@ -4604,9 +4610,23 @@ def _growth_route_projection(
         try:
             # Pass absolute certificate and executable hedge evidence; fallback to legacy certificate
             _abs_cert = absolute_certificate if absolute_certificate is not None else certificate
-            projection["small_capital_route_plan"] = build_small_capital_route_plan(
-                route, capital_plan_settings, absolute_certificate=_abs_cert, hedge_certificate=hedge_certificate, hedge_evidence=hedge_evidence  # type: ignore[arg-type]
-            )
+            # wiring: HedgeExecutionEvidence
+            # need to support legacy hedge_evidence fallback
+            _heff = hedge_execution_evidence  # type: ignore
+            if _heff is None and isinstance(hedge_evidence, HedgeExecutionEvidence):  # type: ignore
+                _heff = hedge_evidence  # type: ignore
+            projection["small_capital_route_plan"] = build_small_capital_route_plan(route, capital_plan_settings, absolute_certificate=_abs_cert, hedge_execution_evidence=hedge_execution_evidence)
+            # if hedge_certificate was supplied, re-invoke with it for deployment gating (preserve wiring)
+            if hedge_certificate is not None and isinstance(projection.get("small_capital_route_plan"), dict):
+                # merge hedge_certificate result if not deployable due to missing cert pass
+                _plan = projection["small_capital_route_plan"]
+                if isinstance(_plan, dict) and _plan.get("deployment_verdict") != "DEPLOYABLE" and hedge_certificate.get("passed"):
+                    # attempt with certificate-aware call
+                    try:
+                        _plan2 = build_small_capital_route_plan(route, capital_plan_settings, absolute_certificate=_abs_cert, hedge_certificate=hedge_certificate, hedge_execution_evidence=hedge_execution_evidence)
+                        projection["small_capital_route_plan"] = _plan2
+                    except Exception:  # noqa: S110
+                        pass
         except ValueError:
             projection["small_capital_route_plan"] = {}
         # RESEARCH_ONLY_HEDGE when tradable evidence missing
@@ -4986,7 +5006,11 @@ def evaluate_growth_route_research(
         return _growth_route_research_rejection(
             holdout_reason or "insufficient-pre-holdout-history"
         )
-    roles = dict(stock_net_alpha_v1_roles())
+    # Direct feature snapshots may omit disclosure lineage.  In that case the
+    # PIT-dependent fundamental sources are intentionally not part of the
+    # active role map (see ``stock_net_alpha_v1_roles``), so schema materialization
+    # cannot fail on absent ``ep_ratio``/``bp_ratio`` columns.
+    roles = dict(stock_net_alpha_v1_roles(available_columns=pre_holdout_raw.columns))
     try:
         materialized = materialize_model_feature_sources(pre_holdout_raw, list(roles))
         schema = fit_model_feature_schema(materialized, roles)

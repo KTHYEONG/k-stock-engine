@@ -13,6 +13,7 @@ import argparse  # argparse.ArgumentParser.add_argument
 import inspect
 import json
 import logging
+import math
 import os
 import signal
 import subprocess
@@ -42,6 +43,7 @@ from src.stocks.cli.contracts import TrainCommand, parse_train_command
 from src.stocks.config.research import (
     policy_profiles_with_excess_full_kelly,
     policy_profiles_with_growth_rungs,
+    policy_profiles_with_stock_only_small_capital,
     resolve_training_request,
 )
 from src.stocks.config.runtime import StockRuntimeSettings
@@ -856,6 +858,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--enable-stock-only-small-capital",
+        action="store_true",
+        help="Opt in to the <=10M KRW stock-only account profile; ETF/futures overlays are rejected",
+    )
+    parser.add_argument(
         "--enable-etf-satellite",
         action="store_true",
         help=(
@@ -930,12 +937,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--account-capital-krw",
         type=float,
         default=None,
-        help="Account capital in KRW for small-account certification (<=5M); absent disables account mode",
+        help="Account capital in KRW for small-account certification (<=10M); absent disables account mode",
     )
     parser.add_argument(
         "--account-max-capital-krw",
         type=float,
-        default=5_000_000.0,
+        default=10_000_000.0,
         help="Maximum admissible account capital in KRW",
     )
     parser.add_argument(
@@ -1040,7 +1047,15 @@ def _build_training_request(args: argparse.Namespace) -> NetAlphaTrainingRequest
     cadences = _parse_horizons(args.candidate_rebalance_frequency_sessions)
     top_k = _parse_horizons(args.candidate_top_k)
     policy_profiles: tuple[PolicyProfile, ...] = DEFAULT_POLICY_PROFILES
-    if bool(getattr(args, 'enable_excess_full_kelly', False)):
+    stock_only = bool(getattr(args, "enable_stock_only_small_capital", False))
+    if stock_only:
+        account_capital = getattr(args, "account_capital_krw", None)
+        if account_capital is None or not math.isfinite(float(account_capital)) or not 0.0 < float(account_capital) <= 10_000_000.0:
+            raise ValueError("account-capital-krw must be in (0, 10000000] for stock-only account mode")
+        if bool(getattr(args, "enable_etf_satellite", False)):
+            raise ValueError("enable-etf-satellite conflicts with stock-only account mode")
+        policy_profiles = policy_profiles_with_stock_only_small_capital()
+    elif bool(getattr(args, 'enable_excess_full_kelly', False)):
         policy_profiles = policy_profiles_with_excess_full_kelly()
     if bool(getattr(args, 'enable_growth_utilization_rung', False)):
         policy_profiles = policy_profiles_with_growth_rungs()

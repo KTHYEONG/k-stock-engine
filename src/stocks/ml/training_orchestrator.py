@@ -1947,6 +1947,7 @@ def _replay_costs(
         net_exposure_gate_mode=profile.net_exposure_gate_mode,
         gate_trend_lookback_sessions=profile.gate_trend_lookback_sessions,
         gate_floor=profile.gate_floor,
+        gate_history_mode=profile.gate_history_mode,
     )
     shadow_context = _execution_replay_context(
         registry,
@@ -2076,6 +2077,7 @@ def _replay_costs_batch(
                     net_exposure_gate_mode=profile.net_exposure_gate_mode,
                     gate_trend_lookback_sessions=profile.gate_trend_lookback_sessions,
                     gate_floor=profile.gate_floor,
+                    gate_history_mode=profile.gate_history_mode,
                 )
                 shadow_context = _execution_replay_context(
                     registry,
@@ -4425,6 +4427,7 @@ def _policy_profile_params(
                         if profile.gate_trend_lookback_sessions is not None
                         else {}
                     ),
+                    "gate_history_mode": profile.gate_history_mode,
                 }
             ),
         },
@@ -5230,7 +5233,9 @@ def evaluate_growth_route_research(
         return _growth_route_research_rejection(
             holdout_reason or "insufficient-pre-holdout-history"
         )
-    roles = dict(stock_net_alpha_v1_roles())
+    # Keep the research-only path consistent with direct loading: without
+    # disclosure lineage, PIT fundamental sources are excluded deterministically.
+    roles = dict(stock_net_alpha_v1_roles(available_columns=pre_holdout_raw.columns))
     try:
         materialized = materialize_model_feature_sources(pre_holdout_raw, list(roles))
         schema = fit_model_feature_schema(materialized, roles)
