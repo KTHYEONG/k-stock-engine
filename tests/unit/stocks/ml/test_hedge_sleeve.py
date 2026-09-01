@@ -123,3 +123,42 @@ def test_executable_hedge_requires_parallel_cash_safe_proxy_series() -> None:
     )
     with pytest.raises(ValueError, match="parallel"):
         project_executable_hedged_route((0.001, 0.002), (0.001, 0.002), hedge, SmallCapitalPlanSettings(seed_capital_krw=10_000_000.0))
+
+
+def test_hedge_execution_evidence_rejects_static_lot_and_missing_tax_model() -> None:
+    from datetime import UTC, datetime
+
+    from src.stocks.ml.contracts import HedgeExecutionEvidence, SmallCapitalPlanSettings
+    from src.stocks.ml.hedge_sleeve import certify_small_capital_hedge_execution
+
+    evidence = HedgeExecutionEvidence(
+        tradable_proxy_id='MINI_KOSPI200', asset_class='index_futures',
+        observed_at=datetime(2026, 9, 1, tzinfo=UTC), evidence_hash='a' * 64,
+        contract_multiplier=None, decision_price=0.0, initial_margin_fraction=0.15,
+        per_side_cost_rate=0.0, tax_model={}, base_log_growth=(0.0,), stress_log_growth=(0.0,),
+    )
+    verdict = certify_small_capital_hedge_execution(
+        (0.0,), (0.0,), evidence, SmallCapitalPlanSettings(seed_capital_krw=10_000_000.0)
+    )
+    assert verdict['passed'] is False
+    assert set(verdict['reasons']) >= {'hedge-price-invalid', 'hedge-multiplier-missing', 'hedge-tax-model-missing'}
+
+
+def test_hedge_execution_evidence_rejects_stress_variation_margin_cash_breach() -> None:
+    from datetime import UTC, datetime
+
+    from src.stocks.ml.contracts import HedgeExecutionEvidence, SmallCapitalPlanSettings
+    from src.stocks.ml.hedge_sleeve import certify_small_capital_hedge_execution
+
+    evidence = HedgeExecutionEvidence(
+        tradable_proxy_id='MINI_KOSPI200', asset_class='index_futures',
+        observed_at=datetime(2026, 9, 1, tzinfo=UTC), evidence_hash='b' * 64,
+        contract_multiplier=50_000.0, decision_price=200.0, initial_margin_fraction=0.10,
+        per_side_cost_rate=0.0001, tax_model={'kind': 'futures', 'timing': 'per_fill'},
+        base_log_growth=(0.0, 0.0), stress_log_growth=(1.0, 1.0),
+    )
+    verdict = certify_small_capital_hedge_execution(
+        (0.0, 0.0), (0.0, 0.0), evidence, SmallCapitalPlanSettings(seed_capital_krw=10_000_000.0, cash_reserve_fraction=0.05)
+    )
+    assert verdict['passed'] is False
+    assert 'stress-variation-margin-cash-breach' in verdict['reasons']
