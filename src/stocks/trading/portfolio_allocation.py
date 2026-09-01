@@ -1326,6 +1326,7 @@ class StockRiskPolicy:
     net_exposure_gate_mode: Literal["off_v1", "trend_vol_v1"] = "off_v1"
     gate_trend_lookback_sessions: int = 60
     gate_floor: float = 0.25
+    gate_history_mode: Literal["fail_open_v1", "cash_on_insufficient_v1"] = "fail_open_v1"
     lot_sizing: LotSizingConfig = field(default_factory=LotSizingConfig)
 
     def __post_init__(self) -> None:
@@ -1401,6 +1402,8 @@ class StockRiskPolicy:
             raise ValueError("gate_trend_lookback_sessions must be positive")
         if not math.isfinite(self.gate_floor) or not 0.0 <= self.gate_floor < 1.0:
             raise ValueError("gate_floor must be a finite fraction in [0, 1)")
+        if self.gate_history_mode not in ("fail_open_v1", "cash_on_insufficient_v1"):
+            raise ValueError("gate_history_mode must be 'fail_open_v1' or 'cash_on_insufficient_v1'")
 
 
 def stock_risk_policy_fingerprint(policy: StockRiskPolicy) -> str:
@@ -2376,6 +2379,8 @@ def net_exposure_gate_scale(
         policy.gate_trend_lookback_sessions, policy.volatility_lookback_sessions
     )
     if values.size < required:
+        if policy.gate_history_mode == "cash_on_insufficient_v1":
+            return 0.0, {"reason": "gate-history-insufficient-cash"}
         return 1.0, {"reason": "gate-history-insufficient"}
     trend_mean = float(values[-policy.gate_trend_lookback_sessions :].mean())
     vol_window = values[-policy.volatility_lookback_sessions :]
@@ -2407,6 +2412,11 @@ def apply_net_exposure_gate(
     if policy.net_exposure_gate_mode != "trend_vol_v1":
         return weights, {}
     if proxy_returns is None:
+        if policy.gate_history_mode == "cash_on_insufficient_v1":
+            return dict.fromkeys(weights, 0.0), {
+                "reason": "gate-proxy-unavailable-cash",
+                "nem_scale": 0.0,
+            }
         return weights, {"reason": "gate-proxy-unavailable"}
     scale, components = net_exposure_gate_scale(proxy_returns, policy)
     scaled = {instrument_id: weight * scale for instrument_id, weight in weights.items()}

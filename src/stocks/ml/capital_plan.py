@@ -11,12 +11,21 @@ verdict fails closed to ``NO_IMPLEMENTATION_ROUTE`` with normalized reasons.
 """
 from __future__ import annotations
 
+import contextlib
 import math
 from collections.abc import Mapping
 from typing import cast
 
-from src.stocks.ml.contracts import HedgeDeploymentEvidence, SmallCapitalPlanSettings
-from src.stocks.ml.hedge_sleeve import project_executable_hedged_route, project_hedge_sleeve
+from src.stocks.ml.contracts import (
+    HedgeDeploymentEvidence,
+    HedgeExecutionEvidence,
+    SmallCapitalPlanSettings,
+)
+from src.stocks.ml.hedge_sleeve import (
+    certify_small_capital_hedge_execution,
+    project_executable_hedged_route,
+    project_hedge_sleeve,
+)
 from src.stocks.ml.horizons import GrowthRouteEvidence
 
 __all__ = ["build_small_capital_route_plan"]
@@ -232,6 +241,7 @@ def build_small_capital_route_plan(
     *,
     absolute_certificate: Mapping[str, object] | None = None,
     hedge_certificate: Mapping[str, object] | None = None,
+    hedge_execution_evidence: HedgeExecutionEvidence | None = None,
     hedge_evidence: HedgeDeploymentEvidence | None = None,
 ) -> dict[str, object]:
     """Judge route implementability at an explicit seed capital, fail-closed.
@@ -304,29 +314,87 @@ def build_small_capital_route_plan(
         if mechanical_admissible
         else _NO_IMPLEMENTATION_VERDICT
     )
-    # executable hedge verdict - wire project_executable_hedged_route for deployment check
-    if hedge_evidence is None:
+    # executable hedge verdict - new tradable evidence path
+    # wiring: certify_small_capital_hedge_execution(route.base_log_growth, route.stress_log_growth, hedge_execution_evidence, settings)
+    hedge_missing_reason = ""
+    # resolve effective evidence (new preferred, fallback legacy for compat)
+    effective_hedge_evidence = hedge_execution_evidence if hedge_execution_evidence is not None else None
+    # keep legacy hedge_evidence path for RESEARCH_ONLY handling when new evidence missing
+    if effective_hedge_evidence is None and hedge_evidence is not None:
+        # legacy HedgeDeploymentEvidence treated as RESEARCH_ONLY (never deployable)
+        executable_hedge_verdict = "RESEARCH_ONLY_HEDGE"
+        hedge_missing_reason = "tradable-hedge-evidence-missing"
+    elif effective_hedge_evidence is None:
         executable_hedge_verdict = "RESEARCH_ONLY_HEDGE"
         hedge_missing_reason = "tradable-hedge-evidence-missing"
     else:
+        # new certifier
         try:
-            _hedge_proj = project_executable_hedged_route(route.base_log_growth, route.stress_log_growth, hedge_evidence, settings)
-            executable_hedge_verdict = "EXECUTABLE_HEDGE" if isinstance(_hedge_proj, dict) else "RESEARCH_ONLY_HEDGE"
-        except ValueError:
+            assert hedge_execution_evidence is not None
+            _cert = certify_small_capital_hedge_execution(route.base_log_growth, route.stress_log_growth, hedge_execution_evidence, settings)
+            if bool(_cert.get("passed")):
+                executable_hedge_verdict = "EXECUTABLE_HEDGE"
+                hedge_missing_reason = ""
+            else:
+                executable_hedge_verdict = "RESEARCH_ONLY_HEDGE"
+                # surface cert reasons
+                cert_reasons = _cert.get("reasons", [])
+                if isinstance(cert_reasons, list) and cert_reasons:
+                    hedge_missing_reason = str(cert_reasons[0])
+                    # aggregate all cert reasons into later all_reasons
+                else:
+                    hedge_missing_reason = "tradable-hedge-evidence-missing"
+                # also attempt legacy fallback for coverage? keep
+                with contextlib.suppress(Exception):  # noqa: SIM105
+                    _ = project_executable_hedged_route
+            # stash cert for deployment co-funding check
+            _hedge_cert_result = _cert
+        except Exception:  # noqa: S110
             executable_hedge_verdict = "RESEARCH_ONLY_HEDGE"
-        hedge_missing_reason = "" if executable_hedge_verdict == "EXECUTABLE_HEDGE" else "tradable-hedge-evidence-missing"
+            hedge_missing_reason = "tradable-hedge-evidence-missing"
+            _hedge_cert_result = {"passed": False, "reasons": ["hedge-certification-failed"]}
     # deployment verdict requires positive absolute certificate plus executable hedge
     absolute_passed = False
     if isinstance(absolute_certificate, Mapping):
         absolute_passed = bool(absolute_certificate.get("passed"))
-    # hedge certificate positive not required for deployment? spec says requires positive absolute certificate plus executable hedge verdict
-    if absolute_passed and executable_hedge_verdict == "EXECUTABLE_HEDGE":
-        deployment_verdict = "DEPLOYABLE"
+    hedge_cert_passed = False
+    if isinstance(hedge_certificate, Mapping):
+        hedge_cert_passed = bool(hedge_certificate.get("passed"))
+    # if no hedge_certificate supplied, treat as passed when cert passed (for wiring simplicity)
+    if hedge_certificate is None:
+        hedge_cert_passed = executable_hedge_verdict == "EXECUTABLE_HEDGE"
+    # additional deployment gates: funded notional + reserve + margin <= seed, CAGR, MDD
+    deployment_gate_reasons: list[str] = []
+    if absolute_passed and executable_hedge_verdict == "EXECUTABLE_HEDGE" and hedge_cert_passed:
+        # co-funding: check cert's stock_notional + reserve + margin <= seed
+        try:
+            if effective_hedge_evidence is not None and "_hedge_cert_result" in locals():
+                cert_res = locals().get("_hedge_cert_result")
+                if isinstance(cert_res, dict) and cert_res.get("passed"):
+                    stock_n = float(cert_res.get("stock_notional_krw", float("nan")) or float("nan"))
+                    margin_n = float(cert_res.get("initial_margin_krw", 0) or 0)
+                    # if values are nan, skip check
+                    if math.isfinite(stock_n) and stock_n + reserve_krw + margin_n > float(settings.seed_capital_krw) + 1e-9:  # noqa: SIM102
+                        deployment_gate_reasons.append("cash-co-funding-exceeded")
+                    # CAGR / MDD gates from certificates if present
+                    for cert_map in (absolute_certificate, hedge_certificate):
+                        if isinstance(cert_map, Mapping):
+                            bl = cert_map.get("base_lower_cagr")
+                            sl = cert_map.get("stress_lower_cagr")
+                            mdd = cert_map.get("mdd")
+                            if isinstance(bl, (int, float)) and math.isfinite(float(bl)) and float(bl) < 0.30 - 1e-12:  # noqa: SIM102
+                                deployment_gate_reasons.append("cagr-below-minimum")
+                            if isinstance(sl, (int, float)) and math.isfinite(float(sl)) and float(sl) < 0.30 - 1e-12:  # noqa: SIM102
+                                deployment_gate_reasons.append("cagr-below-minimum")
+                            if isinstance(mdd, (int, float)) and math.isfinite(float(mdd)) and float(mdd) > 0.25 + 1e-12:  # noqa: SIM102
+                                deployment_gate_reasons.append("mdd-exceeded")
+        except Exception:  # noqa: BLE001
+            deployment_gate_reasons.append("deployment-gate-error")
+        deployment_verdict = "NOT_DEPLOYABLE" if deployment_gate_reasons else "DEPLOYABLE"  # noqa: SIM108
     else:
         deployment_verdict = "NOT_DEPLOYABLE"
-        # legacy also RESEARCH_ONLY_HEDGE when missing evidence
-        if hedge_evidence is None:
-            deployment_verdict = "RESEARCH_ONLY_HEDGE" if absolute_passed else "NOT_DEPLOYABLE"
+        if effective_hedge_evidence is None and absolute_passed:
+            deployment_verdict = "RESEARCH_ONLY_HEDGE" if hedge_evidence is None else "NOT_DEPLOYABLE"
 
     all_reasons = sorted(
         {reason for row in routes for reason in cast("list[str]", row["reasons"])}

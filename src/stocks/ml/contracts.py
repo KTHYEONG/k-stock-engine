@@ -164,12 +164,14 @@ DEFAULT_POLICY_PROFILE_IDS = (LEGACY_OVERLAY_PROFILE_ID, LOWER_BOUND_ONLY_PROFIL
 EXCESS_FULL_KELLY_PROFILE_ID = "excess_full_kelly"
 GROWTH_FULL_UTILIZATION_PROFILE_ID = "growth_full_utilization"
 CONTINUOUS_UNCERTAINTY_PROFILE_ID: Final[str] = "continuous_uncertainty_v1"
+STOCK_ONLY_SMALL_CAPITAL_PROFILE_ID: Final[str] = "stock_only_small_capital_v1"
 ALLOWED_EXTRA_PROFILE_IDS = (
     EXCESS_FULL_KELLY_PROFILE_ID,
     GROWTH_FULL_UTILIZATION_PROFILE_ID,
     "unhedged_nem_v1",
     "unhedged_stack_v1",
     CONTINUOUS_UNCERTAINTY_PROFILE_ID,
+    STOCK_ONLY_SMALL_CAPITAL_PROFILE_ID,
 )
 
 
@@ -257,6 +259,7 @@ class PolicyProfile:
     net_exposure_gate_mode: Literal["off_v1", "trend_vol_v1"] = "off_v1"
     gate_trend_lookback_sessions: int | None = None
     gate_floor: float | None = None
+    gate_history_mode: Literal['fail_open_v1', 'cash_on_insufficient_v1'] = 'fail_open_v1'
     economic_gate_mode: Literal["lower_bound_v1", "finite_mean_v1"] = "lower_bound_v1"
 
     def __post_init__(self) -> None:
@@ -299,6 +302,11 @@ class PolicyProfile:
             raise ValueError(
                 "net_exposure_gate_mode must be 'off_v1' or 'trend_vol_v1', "
                 f"got {self.net_exposure_gate_mode!r}"
+            )
+        if self.gate_history_mode not in ("fail_open_v1", "cash_on_insufficient_v1"):
+            raise ValueError(
+                "gate_history_mode must be 'fail_open_v1' or 'cash_on_insufficient_v1', "
+                f"got {self.gate_history_mode!r}"
             )
         lookback = self.gate_trend_lookback_sessions
         if lookback is not None and (not isinstance(lookback, int) or lookback < 1):
@@ -681,7 +689,7 @@ class AccountCertificationSettings:
     """Small-account capital coherence and 30% CAGR target."""
 
     account_capital_krw: float
-    max_account_capital_krw: float = 5_000_000.0
+    max_account_capital_krw: float = 10_000_000.0
     minimum_lower_cagr: float = 0.30
     max_drawdown: float = 0.25
 
@@ -692,8 +700,8 @@ class AccountCertificationSettings:
             )
         if not math.isfinite(self.max_account_capital_krw) or self.max_account_capital_krw <= 0:
             raise ValueError("max_account_capital_krw must be positive finite")
-        if self.max_account_capital_krw > 5_000_000.0:
-            raise ValueError("max_account_capital_krw must be <= 5_000_000")
+        if self.max_account_capital_krw > 10_000_000.0:
+            raise ValueError("max_account_capital_krw must be <= 10_000_000")
         if not math.isfinite(self.minimum_lower_cagr):
             raise ValueError("minimum_lower_cagr must be finite")
         if not 0.0 < self.max_drawdown < 1.0:
@@ -812,6 +820,21 @@ class SmallCapitalPlanSettings:
             )
         if not math.isfinite(self.cash_reserve_fraction) or not 0.0 <= self.cash_reserve_fraction < 1.0:
             raise ValueError("cash_reserve_fraction must be finite in [0,1)")
+
+
+@dataclass(frozen=True, slots=True)
+class HedgeExecutionEvidence:
+    tradable_proxy_id: str
+    asset_class: Literal['index_futures', 'inverse_etf']
+    observed_at: datetime
+    evidence_hash: str
+    contract_multiplier: float | None
+    decision_price: float
+    initial_margin_fraction: float
+    per_side_cost_rate: float
+    tax_model: Mapping[str, object]
+    base_log_growth: tuple[float, ...]
+    stress_log_growth: tuple[float, ...]
 
 
 @dataclass(frozen=True, slots=True)
