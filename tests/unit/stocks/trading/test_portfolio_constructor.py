@@ -2985,3 +2985,14 @@ def test_extracted_economic_gate_preserves_mode_specific_masks() -> None:
     assert lower_keep.dtype == np.dtype(bool)
     assert lower_enter.tolist() == [False, False]
     assert mean_enter.tolist() == [True, False]
+
+def test_portfolio_constructor_keeps_typed_legacy_entrypoint() -> None:
+    import inspect
+
+    from src.stocks.trading import portfolio_constructor
+    from src.stocks.trading.portfolio_allocation import construct_target_allocations
+
+    parameters = tuple(inspect.signature(portfolio_constructor.construct_target_allocations).parameters)
+
+    assert portfolio_constructor.construct_target_allocations is construct_target_allocations
+    assert parameters == ('panel', 'instruments', 'portfolio', 'policy')

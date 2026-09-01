@@ -3416,3 +3416,13 @@ def test_model_selection_panel_rejects_duplicate_feature_keys() -> None:
 
     with pytest.raises(ValueError, match='duplicate feature keys'):
         build_fold_learning_panel(feature_frame=features, label_join=labels, fold=fold)
+
+def test_model_selection_facade_monkeypatch_seam_reaches_canonical_study(monkeypatch) -> None:
+    from src.stocks.ml import model_selection
+    from src.stocks.ml import model_selection_study
+
+    sentinel = object()
+    monkeypatch.setattr(model_selection, 'prepare_screening_fold_cache', sentinel)
+    model_selection_study._sync_legacy_selection_hooks()
+
+    assert model_selection_study.prepare_screening_fold_cache is sentinel
