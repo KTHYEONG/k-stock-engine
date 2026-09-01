@@ -121,7 +121,7 @@ k-stock-engine/
 │   ├── evidence/               # 거래대금, 수수료, 가용시간 증거
 │   └── market_index/           # KOSPI/KOSDAQ 및 VIX 일별 데이터
 ├── docs/                       # 아키텍처 명세서, ADR, 백테스트 결과 리포트
-│   ├── architecture/           # 시스템 아키텍처 상세 문서 (stock-explain.md 등)
+│   ├── architecture/           # 시스템 아키텍처 및 핵심 목표 문서 (project_goals.md 등)
 │   └── results/                # Walk-Forward 백테스트 및 ML 실험 결과
 ├── src/                        # 핵심 소스코드 루트
 │   ├── core/                   # 전역 공통 도메인/데이터 계약 (포트폴리오, 시간, 데이터셋)
