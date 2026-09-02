@@ -115,5 +115,9 @@
   },
   "src/features/contracts.py": {
     "architecture": "docs/architecture/04_champion_strategy.md"
+  },
+  "src/strategy/scoring.py": {
+    "architecture": "docs/architecture/04_champion_strategy.md",
+    "testing": "tests/unit/strategy/test_scoring.py"
   }
 }
