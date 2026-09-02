@@ -126,5 +126,8 @@
   "src/strategy/portfolio.py": {
     "architecture": "docs/architecture/05_portfolio_and_risk.md",
     "testing": "tests/unit/strategy/test_portfolio.py"
+  },
+  "src/strategy/pipeline.py": {
+    "testing": "tests/unit/strategy/test_pipeline.py"
   }
 }
