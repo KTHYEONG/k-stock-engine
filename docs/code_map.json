@@ -129,5 +129,18 @@
   },
   "src/strategy/pipeline.py": {
     "testing": "tests/unit/strategy/test_pipeline.py"
+  },
+  "src/engine/backtest.py": {
+    "architecture": "docs/architecture/06_execution_and_ledger.md",
+    "testing": "tests/unit/engine/test_backtest.py"
+  },
+  "src/engine/fill_model.py": {
+    "testing": "tests/unit/engine/test_fill_model.py"
+  },
+  "src/engine/decision.py": {
+    "testing": "tests/unit/engine/test_backtest.py"
+  },
+  "src/engine/runner.py": {
+    "testing": "tests/unit/engine/test_runner.py"
   }
 }
