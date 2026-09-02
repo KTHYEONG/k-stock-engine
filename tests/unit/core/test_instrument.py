@@ -99,3 +99,20 @@ class TestSession:
             datetime(2024, 1, 3, tzinfo=KRX_TZ), datetime(2024, 1, 4, tzinfo=KRX_TZ)
         )
         assert len(got) == 1
+
+
+def test_session_calendar_advance_skips_non_sessions() -> None:
+    from datetime import datetime
+    import pytest
+    from src.core.time import KRX_TZ, SessionCalendar
+
+    friday = datetime(2024, 1, 5, tzinfo=KRX_TZ)
+    monday = datetime(2024, 1, 8, tzinfo=KRX_TZ)
+    tuesday = datetime(2024, 1, 9, tzinfo=KRX_TZ)
+    calendar = SessionCalendar((friday, monday, tuesday))
+
+    assert calendar.advance(datetime(2024, 1, 5, 10, tzinfo=KRX_TZ), 2) == tuesday
+    with pytest.raises(ValueError, match="session"):
+        calendar.advance(datetime(2024, 1, 6, 10, tzinfo=KRX_TZ), 1)
+    with pytest.raises(ValueError, match="coverage"):
+        calendar.advance(monday, 2)
