@@ -119,5 +119,8 @@
   "src/strategy/scoring.py": {
     "architecture": "docs/architecture/04_champion_strategy.md",
     "testing": "tests/unit/strategy/test_scoring.py"
+  },
+  "src/strategy/selection.py": {
+    "testing": "tests/unit/strategy/test_selection.py"
   }
 }
