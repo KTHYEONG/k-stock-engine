@@ -170,7 +170,7 @@ def _test_references_source(test_file: str, source_file: str) -> bool:
 
 
 def _check_orphaned_implementations(fh: str, kind: str, name: str) -> list[JsonDiag]:
-    if kind in ("field", "cli_argument") or not fh.startswith("src"):
+    if kind in ("field", "cli_argument", "module_export") or not fh.startswith("src"):
         # field는 정의 자체가 사용처가 아니고, cli_argument 플래그 리터럴은
         # 선행 하이픈 때문에 \b 단어경계 참조 스캔과 구조적으로 불규합이다.
         return []
@@ -297,6 +297,7 @@ def _iter_contract_entries(contract: dict[str, Any]) -> list[dict[str, Any]]:
                 "kind": change.get("kind")
                 or ("class" if symbol and symbol[0].isupper() else "function"),
                 "name": symbol,
+                "signature": change.get("signature", "") or "",
             }
         )
     return entries
@@ -451,6 +452,17 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                                     sf_content,
                                 )
                             )
+                    elif kind == "module_export":
+                        sig = c.get("signature", "") or ""
+                        expected = []
+                        if "exports" in sig:
+                            export_part = sig.split("exports", 1)[1]
+                            tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", export_part)
+                            expected = [t for t in tokens if t != "and"]
+                        if expected:
+                            found_impl = all(sym in sf_content for sym in expected)
+                        else:
+                            found_impl = name in sf_content
                     elif owner:
                         for node in ast.walk(tree):
                             if isinstance(node, ast.ClassDef) and node.name == owner:
