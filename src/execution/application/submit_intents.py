@@ -6,12 +6,15 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from src.core.costs import CostSchedule
 from src.core.instruments import Instrument
+from src.core.ledger import Ledger, LedgerFill, LedgerSide
 from src.core.portfolio import PortfolioSnapshot
+from src.core.time import SessionCalendar
 from src.execution.application.readiness import SubmissionGate, SubmissionRequest
 from src.execution.application.validate_intents import IntentValidator
 from src.execution.domain.intents import TradeIntent  # TradeIntent.target_quantity
-from src.execution.domain.orders import OrderRequest, OrderSide, OrderStateRecord
+from src.execution.domain.orders import OrderRequest, OrderSide, OrderState, OrderStateRecord
 from src.execution.ports.broker import BrokerPort, PriceProvider
 from src.execution.ports.state_store import StateStorePort
 from src.execution.settings import ExecutionSettings
@@ -32,6 +35,9 @@ class ExecutionContext:
     now: datetime | None = None
     positions: PortfolioSnapshot | None = None
     instruments: Mapping[str, Instrument] = field(default_factory=dict)
+    ledger: Ledger | None = None
+    cost_schedule: CostSchedule | None = None
+    calendar: SessionCalendar | None = None
 
 
 def plan_order_request(
@@ -107,6 +113,8 @@ def submit_intents(
     and recorded in the state store. Sells are planned before buys.
     """
     now = context.now or datetime.now(UTC)
+    if context.ledger is not None and (context.cost_schedule is None or context.calendar is None):
+        raise ValueError("cost_schedule and calendar required when ledger is supplied")
     validator = IntentValidator(context.state_store)
     submitted: list[OrderStateRecord] = []
     positions = context.positions or PortfolioSnapshot(
@@ -116,6 +124,129 @@ def submit_intents(
         unsettled_cash=0.0,
         positions=(),
     )
+
+    # Ledger path uses holdings for reconciliation and records confirmed fills.
+    # Sells are planned before buys.
+    if context.ledger is not None:
+        # classify sells before buys using initial holdings
+        ledger = context.ledger
+        calendar = context.calendar
+        cost_schedule = context.cost_schedule
+        assert ledger is not None
+        assert calendar is not None
+        assert cost_schedule is not None
+        intents_sorted = sorted(intents, key=lambda i: (i.instrument_id, i.intent_id))
+        # determine side for ordering
+        def _side_key(intent: TradeIntent) -> int:
+            price = context.price_provider.price_of(intent.instrument_id)
+            instrument = context.instruments.get(intent.instrument_id)
+            lot_size = instrument.lot_size if instrument is not None else 1
+            current_qty = ledger.quantity_of(intent.instrument_id)
+            if intent.target_quantity is not None:
+                tq = intent.target_quantity
+                target_quantity = int(tq)
+            else:
+                target_quantity = int(intent.target_value / price / lot_size) * lot_size
+            delta = target_quantity - current_qty
+            if delta < 0:
+                return 0
+            if delta > 0:
+                return 1
+            return 2
+
+        intents_sorted.sort(key=_side_key)
+        for intent in intents_sorted:
+            validator.validate(intent, now)
+            price = context.price_provider.price_of(intent.instrument_id)
+            instrument = context.instruments.get(intent.instrument_id)
+            lot_size = instrument.lot_size if instrument is not None else 1
+            current_qty = ledger.quantity_of(intent.instrument_id)
+            order = plan_order_request(
+                intent,
+                order_id=f"order:{intent.intent_id}",
+                request_time=now,
+                reference_price=price,
+                current_quantity=current_qty,
+                lot_size=lot_size,
+            )
+            if order is None:
+                context.gate.authorize(
+                    SubmissionRequest(
+                        intent=intent,
+                        mode=context.settings.default_mode,
+                        account=context.account,
+                    )
+                )
+                logger.info("intent %s at target; no order", intent.intent_id)
+                continue
+
+            cost_point = cost_schedule.cost_for(now)
+            expected_quantity = int(order.quantity)
+            expected_price = float(order.price or price)
+            expected_tax = (
+                expected_quantity * expected_price * float(cost_point.tax_rate)
+                if order.side is OrderSide.SELL
+                else 0.0
+            )
+            expected_fill = LedgerFill(
+                fill_id=order.order_id,
+                instrument_id=order.instrument_id,
+                side=LedgerSide.BUY if order.side is OrderSide.BUY else LedgerSide.SELL,
+                quantity=expected_quantity,
+                price=expected_price,
+                commission=expected_quantity * expected_price * float(cost_point.commission_rate),
+                tax=expected_tax,
+                slippage_cost=0.0,
+                trade_time=now,
+                settlement_time=calendar.advance(now, int(cost_point.settlement_days)),
+            )
+            # Reject unaffordable orders before they reach a broker.
+            ledger.validate_fill(expected_fill)
+            context.gate.authorize(
+                SubmissionRequest(
+                    intent=intent,
+                    mode=context.settings.default_mode,
+                    account=context.account,
+                )
+            )
+            record = context.broker.submit(order)
+            logger.info("order %s -> %s", order.order_id, record.state.value)
+            if record.state is OrderState.FILLED:
+                if (
+                    isinstance(record.filled_quantity, bool)
+                    or not float(record.filled_quantity).is_integer()
+                    or record.filled_quantity <= 0
+                    or record.filled_price is None
+                    or record.filled_price <= 0
+                ):
+                    raise ValueError("broker returned invalid filled quantity or price")
+                filled_qty = int(record.filled_quantity)
+                filled_price = float(record.filled_price)
+                commission = filled_qty * filled_price * float(cost_point.commission_rate)
+                tax = 0.0
+                if record.side is OrderSide.SELL:
+                    tax = filled_qty * filled_price * float(cost_point.tax_rate)
+                slippage_cost = abs(filled_price - float(price)) * filled_qty
+                settlement_time = calendar.advance(now, int(cost_point.settlement_days))
+                side = LedgerSide.BUY if record.side is OrderSide.BUY else LedgerSide.SELL
+                ledger.record_fill(
+                    LedgerFill(
+                        fill_id=record.order_id,
+                        instrument_id=record.instrument_id,
+                        side=side,
+                        quantity=filled_qty,
+                        price=filled_price,
+                        commission=commission,
+                        tax=tax,
+                        slippage_cost=slippage_cost,
+                        trade_time=now,
+                        settlement_time=settlement_time,
+                    )
+                )
+            context.state_store.save(record)
+            context.state_store.mark_intent(intent.idempotency_key)
+            submitted.append(record)
+        return submitted
 
     for intent in sorted(intents, key=lambda i: (i.instrument_id, i.intent_id)):
         validator.validate(intent, now)
