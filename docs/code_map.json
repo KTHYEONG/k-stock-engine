@@ -97,5 +97,9 @@
   "src/data/silver.py": {
     "architecture": "docs/architecture/03_point_in_time_data.md",
     "testing": "tests/unit/data/test_silver.py"
+  },
+  "src/strategy/universe.py": {
+    "architecture": "docs/architecture/04_champion_strategy.md",
+    "testing": "tests/unit/strategy/test_universe.py"
   }
 }
