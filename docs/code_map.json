@@ -101,5 +101,19 @@
   "src/strategy/universe.py": {
     "architecture": "docs/architecture/04_champion_strategy.md",
     "testing": "tests/unit/strategy/test_universe.py"
+  },
+  "src/features/qvef.py": {
+    "architecture": "docs/architecture/04_champion_strategy.md",
+    "testing": "tests/unit/features/test_qvef.py"
+  },
+  "src/features/preprocessing.py": {
+    "architecture": "docs/architecture/04_champion_strategy.md",
+    "testing": "tests/unit/features/test_preprocessing.py"
+  },
+  "src/features/materialize.py": {
+    "architecture": "docs/architecture/04_champion_strategy.md"
+  },
+  "src/features/contracts.py": {
+    "architecture": "docs/architecture/04_champion_strategy.md"
   }
 }
