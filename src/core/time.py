@@ -55,6 +55,23 @@ class SessionCalendar:
         hi = self.index_of(end)
         return self.sessions[lo:hi]
 
+    def advance(self, when: datetime, count: int) -> datetime:
+        if when.tzinfo is None:
+            raise ValueError("when must be aware datetime")
+        if isinstance(count, bool) or not isinstance(count, int):
+            raise ValueError("count must be non-negative integer")
+        if count < 0:
+            raise ValueError("count must be non-negative")
+        local_date = when.astimezone(KRX_TZ).date()
+        session_dates = [s.astimezone(KRX_TZ).date() for s in self.sessions]
+        try:
+            idx = session_dates.index(local_date)
+        except ValueError as exc:
+            raise ValueError(f"session not found for {when.isoformat()}") from exc
+        if idx + count >= len(self.sessions):
+            raise ValueError("coverage exhausted: not enough future sessions")
+        return self.sessions[idx + count]
+
 
 @dataclass(frozen=True, slots=True)
 class PointInTime:
