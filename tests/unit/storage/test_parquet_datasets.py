@@ -269,3 +269,19 @@ class TestPartitionedRoundTrip:
                 frame, dataset_id="d3", manifest=v1,
                 expected_feature_set=FEATURE_SET, decision_time=DECISION,
             )
+
+
+def test_partitioned_silver_master_uses_valid_from_partition_column(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    import polars as pl
+
+    from src.core.datasets import HIVE_PARTITION_LAYOUT, make_manifest
+    from src.core.instruments import AssetKind
+    from src.storage.parquet_datasets import ParquetDatasetStore, canonical_content_hash
+
+    frame = pl.DataFrame({'instrument_id': ['KRX:000020'], 'valid_from': [datetime(2024, 1, 2, tzinfo=UTC)], 'available_at': [datetime(2024, 1, 2, tzinfo=UTC)]})
+    manifest = make_manifest(asset_kind=AssetKind.STOCK, columns=frame.columns, feature_set='stock_pit_security_master_v1', label_definition='none', label_horizon_sessions=1, time_start=datetime(2024, 1, 2, tzinfo=UTC), time_end=datetime(2024, 1, 2, tzinfo=UTC), provider_version='fixture', universe_policy_version='v1', row_count=1, schema_version='v2', content_hash=canonical_content_hash(frame, frame.columns), storage_layout=HIVE_PARTITION_LAYOUT)
+
+    path = ParquetDatasetStore(tmp_path).write_partitioned(frame, dataset_id='master', manifest=manifest, expected_feature_set='stock_pit_security_master_v1', decision_time=datetime(2024, 1, 3, tzinfo=UTC))
+    assert (path / 'partitions' / 'year=2024' / 'month=01' / 'part-00000.parquet').exists()
