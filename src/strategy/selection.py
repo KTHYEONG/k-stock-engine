@@ -64,6 +64,7 @@ class ChampionSelectionResult:
     selected_instrument_ids: tuple[str, ...]
     decisions: tuple[SelectionDecision, ...]
     unfilled_slots: int
+    selection_policy_version: str
 
 
 def select_champion_targets(
@@ -208,4 +209,5 @@ def select_champion_targets(
         selected_instrument_ids=selected_instrument_ids,
         decisions=all_decisions_sorted,
         unfilled_slots=unfilled_slots,
+        selection_policy_version=policy.version,
     )
