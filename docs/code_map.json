@@ -1,0 +1,97 @@
+{
+  "src/core/costs.py": {
+    "testing": "tests/unit/core/test_costs.py"
+  },
+  "src/core/datasets.py": {
+    "testing": "tests/unit/core/test_datasets.py"
+  },
+  "src/core/instruments.py": {
+    "testing": "tests/unit/core/test_instruments.py"
+  },
+  "src/core/ledger.py": {
+    "testing": "tests/unit/core/test_ledger.py"
+  },
+  "src/core/market_data.py": {},
+  "src/core/paths.py": {
+    "testing": "tests/unit/core/test_paths.py"
+  },
+  "src/core/portfolio.py": {
+    "testing": "tests/unit/core/test_portfolio.py"
+  },
+  "src/core/time.py": {
+    "testing": [
+      "tests/unit/core/test_instrument.py",
+      "tests/unit/execution/test_submit_intents.py"
+    ]
+  },
+  "src/execution/adapters/in_memory_state_store.py": {
+    "testing": [
+      "tests/integration/execution/test_submission_gate.py",
+      "tests/unit/execution/test_state_store.py",
+      "tests/unit/execution/test_submit_intents.py",
+      "tests/unit/execution/test_validate_intents.py"
+    ]
+  },
+  "src/execution/adapters/paper_broker.py": {
+    "testing": [
+      "tests/integration/execution/test_submission_gate.py",
+      "tests/unit/execution/test_broker.py",
+      "tests/unit/execution/test_submit_intents.py"
+    ]
+  },
+  "src/execution/application/readiness.py": {
+    "testing": [
+      "tests/integration/execution/test_submission_gate.py",
+      "tests/unit/execution/test_readiness.py",
+      "tests/unit/execution/test_submit_intents.py"
+    ]
+  },
+  "src/execution/application/submit_intents.py": {
+    "testing": [
+      "tests/integration/execution/test_submission_gate.py",
+      "tests/unit/execution/test_submit_intents.py"
+    ]
+  },
+  "src/execution/application/validate_intents.py": {
+    "testing": "tests/unit/execution/test_validate_intents.py"
+  },
+  "src/execution/domain/intents.py": {
+    "testing": [
+      "tests/integration/execution/test_submission_gate.py",
+      "tests/unit/execution/test_intents.py",
+      "tests/unit/execution/test_submit_intents.py"
+    ]
+  },
+  "src/execution/domain/orders.py": {
+    "testing": [
+      "tests/integration/execution/test_submission_gate.py",
+      "tests/unit/execution/test_broker.py",
+      "tests/unit/execution/test_orders.py",
+      "tests/unit/execution/test_submit_intents.py"
+    ]
+  },
+  "src/execution/ports/broker.py": {
+    "testing": "tests/unit/execution/test_broker.py"
+  },
+  "src/execution/ports/state_store.py": {
+    "testing": "tests/unit/execution/test_state_store.py"
+  },
+  "src/execution/settings.py": {
+    "testing": "tests/unit/execution/test_settings.py"
+  },
+  "src/integrations/dart/client.py": {
+    "testing": [
+      "tests/unit/integrations/test_client.py",
+      "tests/unit/integrations/test_dart_client.py"
+    ]
+  },
+  "src/integrations/kis/client.py": {
+    "testing": "tests/unit/integrations/test_kis_client.py"
+  },
+  "src/integrations/krx/client.py": {
+    "testing": "tests/unit/integrations/test_krx_client.py"
+  },
+  "src/storage/parquet_datasets.py": {
+    "testing": "tests/unit/storage/test_parquet_datasets.py"
+  }
+}
