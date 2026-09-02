@@ -180,6 +180,88 @@ def paper_positions(quantity: float):
         positions=(Position(instrument=instrument, quantity=quantity, average_cost=5_000.0),),
     )
 
+def test_submit_intents_records_confirmed_fill_in_ledger() -> None:
+    from datetime import UTC, datetime
+    import pytest
+    from src.core.costs import CostPoint, CostSchedule
+    from src.core.instruments import AssetKind, Instrument
+    from src.core.ledger import Ledger
+    from src.core.time import KRX_TZ, SessionCalendar
+    from src.execution.adapters.in_memory_state_store import InMemoryStateStore
+    from src.execution.adapters.paper_broker import ConstantPriceProvider, PaperBroker
+    from src.execution.application.readiness import SubmissionGate
+    from src.execution.application.submit_intents import ExecutionContext, submit_intents
+    from src.execution.domain.intents import TradeIntent
+    from src.execution.settings import DEFAULT_EXECUTION
+
+    now = datetime(2024, 6, 3, 1, 15, tzinfo=UTC)
+    instrument = Instrument("KRX:005930", AssetKind.STOCK, "KRX", "005930", "KRW")
+    ledger = Ledger("account-a", 2_000_000.0, datetime(2024, 6, 3, tzinfo=UTC))
+    calendar = SessionCalendar((datetime(2024, 6, 3, tzinfo=KRX_TZ), datetime(2024, 6, 4, tzinfo=KRX_TZ), datetime(2024, 6, 5, tzinfo=KRX_TZ)))
+    costs = CostSchedule("fixture", (CostPoint(datetime(2024, 1, 1, tzinfo=UTC), 0.001, 0.002, 0.0, 2),))
+    intent = TradeIntent("intent-a", AssetKind.STOCK, instrument.instrument_id, 1_000_000.0, datetime(2024, 6, 3, 1, tzinfo=UTC), now, "champion-v1", "rank", "key-a", "account-a")
+    context = ExecutionContext(settings=DEFAULT_EXECUTION, gate=SubmissionGate(), broker=PaperBroker(), state_store=InMemoryStateStore(), price_provider=ConstantPriceProvider(5_000.0), now=now, instruments={instrument.instrument_id: instrument}, ledger=ledger, cost_schedule=costs, calendar=calendar)
+
+    records = submit_intents([intent], context)
+    snapshot = ledger.snapshot(now)
+
+    assert records[0].filled_quantity == 200
+    assert snapshot.positions[0].quantity == 200
+    assert snapshot.settled_cash == pytest.approx(999_000.0)
+    assert snapshot.commission == pytest.approx(1_000.0)
+    assert snapshot.tax == pytest.approx(0.0)
+
+
+def test_submit_intents_requires_complete_ledger_wiring_before_submission() -> None:
+    from datetime import UTC, datetime
+    import pytest
+    from src.core.ledger import Ledger
+    from src.execution.adapters.in_memory_state_store import InMemoryStateStore
+    from src.execution.adapters.paper_broker import ConstantPriceProvider, PaperBroker
+    from src.execution.application.readiness import SubmissionGate
+    from src.execution.application.submit_intents import ExecutionContext, submit_intents
+    from src.execution.settings import DEFAULT_EXECUTION
+    from tests.unit.execution.test_intents import make_intent
+
+    now = datetime(2024, 6, 3, 1, 15, tzinfo=UTC)
+    broker = PaperBroker()
+    store = InMemoryStateStore()
+    context = ExecutionContext(settings=DEFAULT_EXECUTION, gate=SubmissionGate(), broker=broker, state_store=store, price_provider=ConstantPriceProvider(5_000.0), now=now, ledger=Ledger("account-a", 2_000_000.0, datetime(2024, 6, 3, tzinfo=UTC)))
+
+    with pytest.raises(ValueError, match=r"cost_schedule.*calendar"):
+        submit_intents([make_intent("ledger-incomplete")], context)
+
+    assert broker.reconcile("paper") == []
+    assert store.get("order:intent-ledger-incomplete") is None
+
+
+def test_submit_intents_preflights_ledger_before_broker_submission() -> None:
+    from datetime import UTC, datetime
+    import pytest
+    from src.core.costs import CostPoint, CostSchedule
+    from src.core.ledger import Ledger
+    from src.core.time import KRX_TZ, SessionCalendar
+    from src.execution.adapters.in_memory_state_store import InMemoryStateStore
+    from src.execution.adapters.paper_broker import ConstantPriceProvider, PaperBroker
+    from src.execution.application.readiness import SubmissionGate
+    from src.execution.application.submit_intents import ExecutionContext, submit_intents
+    from src.execution.settings import DEFAULT_EXECUTION
+    from tests.unit.execution.test_intents import make_intent
+
+    now = datetime(2024, 6, 3, 1, 15, tzinfo=UTC)
+    broker = PaperBroker()
+    store = InMemoryStateStore()
+    calendar = SessionCalendar((datetime(2024, 6, 3, tzinfo=KRX_TZ), datetime(2024, 6, 4, tzinfo=KRX_TZ), datetime(2024, 6, 5, tzinfo=KRX_TZ)))
+    costs = CostSchedule("fixture", (CostPoint(datetime(2024, 1, 1, tzinfo=UTC), 0.001, 0.002, 0.0, 2),))
+    context = ExecutionContext(settings=DEFAULT_EXECUTION, gate=SubmissionGate(), broker=broker, state_store=store, price_provider=ConstantPriceProvider(5_000.0), now=now, ledger=Ledger("account-a", 500_000.0, datetime(2024, 6, 3, tzinfo=UTC)), cost_schedule=costs, calendar=calendar)
+
+    with pytest.raises(ValueError, match="settled cash"):
+        submit_intents([make_intent("ledger-no-cash")], context)
+
+    assert broker.reconcile("paper") == []
+    assert store.get("order:intent-ledger-no-cash") is None
+
+
 def test_SCENARIO_SMALL_ACCOUNT_LOT_04_LIVE_LOT_REJECTION():
     """SCENARIO_SMALL_ACCOUNT_LOT_04_LIVE_LOT_REJECTION"""
     from src.execution.domain.intents import TradeIntent
