@@ -65,3 +65,40 @@ def test_ledger_buy_average_cost_includes_commission() -> None:
     ledger.record_fill(LedgerFill("buy-2", "KRX:005930", LedgerSide.BUY, 10, 1_100.0, 20.0, 0.0, 0.0, now, now))
 
     assert ledger.snapshot(now).positions[0].average_cost == 1_051.5
+
+
+def test_ledger_applies_dps_from_opening_quantity_and_split_cash_in_lieu() -> None:
+    from datetime import UTC, datetime
+
+    import pytest
+
+    from src.core.ledger import Ledger, LedgerActionType, LedgerCorporateAction, LedgerFill, LedgerSide
+
+    opened = datetime(2024, 1, 2, tzinfo=UTC)
+    action_open = datetime(2024, 1, 3, tzinfo=UTC)
+    ledger = Ledger("account-a", 100.0, opened)
+    ledger.record_fill(LedgerFill("buy", "KRX:005930", LedgerSide.BUY, 3, 10.0, 0.0, 0.0, 0.0, opened, opened))
+    ledger.apply_corporate_actions((LedgerCorporateAction("dividend-1", "KRX:005930", LedgerActionType.DIVIDEND, action_open, 1.0, 2.0), LedgerCorporateAction("split-1", "KRX:005930", LedgerActionType.SPLIT, action_open, 1.5, 0.0)), session_open=action_open, cash_in_lieu_prices={"KRX:005930": 100.0})
+
+    snapshot = ledger.snapshot(action_open)
+    assert snapshot.positions[0].quantity == 4
+    assert snapshot.settled_cash == pytest.approx(126.0)
+
+
+def test_ledger_mark_nav_is_exact_and_does_not_mutate_balances() -> None:
+    from datetime import UTC, datetime
+
+    import pytest
+
+    from src.core.ledger import Ledger, LedgerFill, LedgerMark, LedgerSide
+
+    now = datetime(2024, 1, 2, tzinfo=UTC)
+    ledger = Ledger("account-a", 100.0, now)
+    ledger.record_fill(LedgerFill("buy", "KRX:005930", LedgerSide.BUY, 3, 10.0, 0.0, 0.0, 0.0, now, now))
+    before = ledger.snapshot(now)
+    nav = ledger.record_mark(LedgerMark("mark-1", now, (("KRX:005930", 12.0),)))
+    after = ledger.snapshot(now)
+
+    assert nav.nav == pytest.approx(106.0)
+    assert after.settled_cash == before.settled_cash
+    assert after.positions == before.positions
