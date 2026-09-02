@@ -156,13 +156,18 @@ class ParquetDatasetStore:
         partitions_dir.mkdir(parents=True)
 
         year_col, month_col = _PARTITION_COLUMNS
-        session_column = (
-            "session" if "session" in frame.columns else "decision_session"
-            if "decision_session" in frame.columns else "price_date"
+        _partition_candidates = (
+            "session",
+            "decision_session",
+            "price_date",
+            "valid_from",
+            "effective_date",
+            "available_at",
         )
-        if session_column not in frame.columns:
+        session_column = next((c for c in _partition_candidates if c in frame.columns), None)
+        if session_column is None:
             raise ValueError(
-                "partitioned write requires a session, decision_session, or price_date column"
+                "partitioned write requires a session, decision_session, price_date, valid_from, effective_date, or available_at column"
             )
         partitioned = frame.with_columns(
             pl.col(session_column).dt.strftime("%Y").alias(year_col),
