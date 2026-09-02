@@ -93,5 +93,9 @@
   },
   "src/storage/parquet_datasets.py": {
     "testing": "tests/unit/storage/test_parquet_datasets.py"
+  },
+  "src/data/silver.py": {
+    "architecture": "docs/architecture/03_point_in_time_data.md",
+    "testing": "tests/unit/data/test_silver.py"
   }
 }
