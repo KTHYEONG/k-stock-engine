@@ -3,6 +3,7 @@
 from src.strategy.portfolio import ChampionPortfolioPolicy  # noqa: I001
 from src.strategy.portfolio import PortfolioSecurityInput  # noqa: I001
 from src.strategy.portfolio import construct_champion_portfolio  # noqa: I001
+from src.strategy.pipeline import build_champion_portfolio  # noqa: I001
 from src.strategy.scoring import ChampionScorePolicy  # noqa: I001
 from src.strategy.scoring import materialize_champion_scores  # noqa: I001
 from src.strategy.scoring import score_champion_rows  # noqa: I001
@@ -15,6 +16,7 @@ __all__ = [
     "ChampionScorePolicy",
     "ChampionSelectionPolicy",
     "PortfolioSecurityInput",
+    "build_champion_portfolio",
     "build_historical_universe",
     "construct_champion_portfolio",
     "materialize_champion_scores",
