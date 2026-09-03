@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 from src.data.schemas import BronzeReceipt, EvidenceKind
 
@@ -123,9 +126,37 @@ def _has_symlink(path: Path) -> bool:
     return False
 
 
+def _validate_certified_report(report: Any) -> None:
+    cert = getattr(report, "certification", None)
+    cert_value = getattr(cert, "value", cert)
+    if cert_value not in ("research", "production"):
+        raise ValueError("purge requires certified Silver report with RESEARCH-or-higher certification")
+    source_hashes = getattr(report, "source_hashes", None)
+    if not isinstance(source_hashes, Mapping) or not source_hashes:
+        raise ValueError("purge requires certified Silver report spanning backtest coverage")
+    missing = [k.value for k in EvidenceKind if k not in source_hashes]
+    if missing:
+        raise ValueError(f"purge requires certified Silver report with all EvidenceKind hashes, missing: {missing}")
+    if not getattr(report, "report_hash", ""):
+        raise ValueError("purge requires certified Silver report with report_hash")
+
+
+_UNSET: Any = object()
+
+
 def purge_legacy_data(
-    data_root: Path, migration: MigrationArtifact, *, confirm_purge: bool
+    data_root: Path,
+    migration: MigrationArtifact,
+    *,
+    certified_silver_report: Any = _UNSET,
+    confirm_purge: bool = False,
 ) -> tuple[Path, ...]:
+    if certified_silver_report is _UNSET:
+        pass
+    elif certified_silver_report is None:
+        raise ValueError("purge requires certified Silver report spanning backtest coverage")
+    else:
+        _validate_certified_report(certified_silver_report)
     if not confirm_purge:
         raise ValueError("confirm_purge must be True to delete legacy outputs")
     if not migration.verified or not migration.content_hash:
@@ -157,3 +188,100 @@ def purge_legacy_data(
             target.unlink()
         removed.append(target)
     return tuple(sorted(removed, key=lambda p: p.as_posix()))
+
+
+def _receipt_to_json(receipt: BronzeReceipt) -> dict[str, str]:
+    return {
+        "kind": receipt.kind.value,
+        "content_hash": receipt.content_hash,
+        "source_path": str(receipt.source_path),
+        "retrieved_at": receipt.retrieved_at.isoformat(),
+        "ingested_at": receipt.ingested_at.isoformat(),
+        "payload_path": str(receipt.payload_path),
+        "metadata_path": str(receipt.metadata_path),
+    }
+
+
+def _receipt_from_json(data: dict[str, Any]) -> BronzeReceipt:
+    return BronzeReceipt(
+        kind=EvidenceKind(str(data["kind"])),
+        content_hash=str(data["content_hash"]),
+        source_path=str(data["source_path"]),
+        retrieved_at=datetime.fromisoformat(str(data["retrieved_at"])),
+        ingested_at=datetime.fromisoformat(str(data["ingested_at"])),
+        payload_path=Path(str(data["payload_path"])),
+        metadata_path=Path(str(data["metadata_path"])),
+    )
+
+
+class MigrationArtifactStore:
+    def __init__(self, root: Path) -> None:
+        self.root = Path(root)
+
+    def write(self, artifact: MigrationArtifact) -> Path:
+        base = self.root / "migrations"
+        base.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "content_hash": artifact.content_hash,
+            "verified": bool(artifact.verified),
+            "receipts": {k.value: _receipt_to_json(v) for k, v in artifact.receipts.items()},
+            "entries": [
+                {
+                    "source_path": e.source_path,
+                    "source_hash": e.source_hash,
+                    "receipt_path": e.receipt_path,
+                    "coverage": e.coverage,
+                    "decision": e.decision,
+                }
+                for e in artifact.entries
+            ],
+        }
+        path = base / f"{artifact.content_hash}.json"
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        return path
+
+    def read_verified(self, artifact_path: Path) -> MigrationArtifact:
+        path = Path(artifact_path)
+        if not path.exists():
+            raise ValueError(f"migration artifact not found: {path}")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        receipts: dict[EvidenceKind, BronzeReceipt] = {}
+        for item in dict(raw.get("receipts", {})).values():
+            receipt = _receipt_from_json(item)
+            if not receipt.payload_path.exists() or not receipt.metadata_path.exists():
+                raise ValueError(f"missing migration receipt payload: {receipt.payload_path}")
+            actual = hashlib.sha256(receipt.payload_path.read_bytes()).hexdigest()
+            if actual != receipt.content_hash:
+                raise ValueError(f"hash mismatch for migrated payload {receipt.payload_path}")
+            try:
+                meta = json.loads(receipt.metadata_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"unreadable receipt metadata: {receipt.metadata_path}") from exc
+            if str(meta.get("content_hash", "")) != receipt.content_hash:
+                raise ValueError(f"hash mismatch in receipt {receipt.metadata_path}")
+            receipts[receipt.kind] = receipt
+        entries = tuple(
+            MigrationEntry(
+                source_path=str(e["source_path"]),
+                source_hash=str(e["source_hash"]),
+                receipt_path=str(e["receipt_path"]),
+                coverage=str(e["coverage"]),
+                decision=str(e["decision"]),
+            )
+            for e in raw.get("entries", [])
+        )
+        digest = hashlib.sha256()
+        for kind in sorted(receipts, key=lambda k: k.value):
+            digest.update(kind.value.encode("utf-8"))
+            digest.update(b"\x00")
+            digest.update(receipts[kind].content_hash.encode("utf-8"))
+            digest.update(b"\x00")
+        content_hash = str(raw.get("content_hash", ""))
+        if digest.hexdigest() != content_hash:
+            raise ValueError("migration artifact content_hash mismatch")
+        return MigrationArtifact(
+            receipts=receipts,
+            entries=entries,
+            content_hash=content_hash,
+            verified=True,
+        )
