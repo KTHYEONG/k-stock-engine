@@ -150,5 +150,6 @@
   "src/validation/robustness.py": {
     "architecture": "docs/specs/10_stress_and_promotion_gates.md",
     "testing": "tests/integration/validation/test_promotion.py"
-  }
+  },
+  "src/data/cli.py": {}
 }
