@@ -2,13 +2,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
-from datetime import UTC, datetime
-from math import inf
+from dataclasses import dataclass, replace
+from datetime import datetime
 
-from src.core.costs import CostPoint, CostSchedule, LiquiditySlippageModel, TickSizeRule, TickSizeSchedule
+from src.core.costs import CostSchedule
 from src.core.instruments import Instrument
-from src.core.ledger import Ledger, LedgerJournalEntry, LedgerMark, LedgerNav
+from src.core.ledger import Ledger, LedgerCorporateAction, LedgerJournalEntry, LedgerMark, LedgerNav
 from src.core.portfolio import PortfolioSnapshot, Position
 from src.core.time import SessionCalendar
 from src.engine.decision import DecisionContext, StrategyDecisionPort
@@ -71,6 +70,14 @@ class BacktestResult:
     scenario: ExecutionScenario
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingTarget:
+    intent: TradeIntent
+    target_qty: int
+    instrument: Instrument
+    decision_session_open: datetime
+
+
 class EventBacktester:
     def __init__(self, config: BacktestConfig) -> None:
         self._config = config
@@ -78,76 +85,63 @@ class EventBacktester:
     def run(self, sessions: tuple[BacktestSession, ...], strategy: StrategyDecisionPort) -> BacktestResult:
         if not sessions:
             raise BacktestIntegrityError("no sessions")
-        # validate sessions strictly increasing
         for i in range(len(sessions) - 1):
             if sessions[i].session_open >= sessions[i + 1].session_open:
                 raise BacktestIntegrityError("sessions must be strictly increasing")
-        # defaults for cost schedule and fill model
         cost_schedule = self._config.cost_schedule
-        if cost_schedule is None:
-            cost_schedule = CostSchedule(
-                "default",
-                (CostPoint(datetime(2000, 1, 1, tzinfo=UTC), 0.0, 0.0, 0.0, 2),),
-            )
         calendar = self._config.calendar
-        if calendar is None:
-            calendar = SessionCalendar(tuple(s.session_open for s in sessions))
         fill_model = self._config.fill_model
-        if fill_model is None:
-            # default tick schedule with tick 1
-            ticks = TickSizeSchedule((TickSizeRule("all", datetime(2000, 1, 1, tzinfo=UTC), 0.0, inf, 1.0),))
-            # default slippage model - impact 0.1 as used in fill tests
-            slippage = LiquiditySlippageModel(0.1, ticks)
-            fill_model = HistoricalFillModel(cost_schedule, slippage, self._config.scenario, target_participation_cap=0.1, hard_participation_cap=0.2)
-        # ledger
+        if not isinstance(cost_schedule, CostSchedule):
+            raise BacktestIntegrityError("cost_schedule must be explicit CostSchedule")
+        if not isinstance(calendar, SessionCalendar):
+            raise BacktestIntegrityError("calendar must be explicit SessionCalendar")
+        if not isinstance(fill_model, HistoricalFillModel):
+            raise BacktestIntegrityError("fill_model must be explicit HistoricalFillModel")
+        if fill_model.scenario is not self._config.scenario:
+            raise BacktestIntegrityError(
+                f"fill_model scenario {fill_model.scenario} mismatches config scenario {self._config.scenario}"
+            )
         ledger = Ledger(self._config.ledger_id, float(self._config.initial_cash), sessions[0].session_open)
         fills: list[object] = []
         rejects: list[BacktestReject] = []
         daily_nav: list[LedgerNav] = []
         capacity_diagnostics: list[CapacityDiagnostic] = []
-        # pending orders awaiting next session execution
-        pending_orders: list[BacktestOrder] = []
+        pending_targets: list[_PendingTarget] = []
 
-        # helper to create portfolio snapshot from ledger
         def _make_snapshot(as_of: datetime) -> PortfolioSnapshot:
             snap = ledger.snapshot(as_of)
-            positions = tuple(
-                Position(
-                    instrument=self._config.instruments[pos.instrument_id],
-                    quantity=float(pos.quantity),
-                    average_cost=pos.average_cost,
-                )
-                for pos in snap.positions
-                if pos.instrument_id in self._config.instruments
-            )
-            # handle instruments not in mapping? create generic instrument
+            positions = []
             for pos in snap.positions:
-                if pos.instrument_id not in self._config.instruments:
-                    # fallback instrument
-                    from src.core.instruments import AssetKind
-
-                    instr = Instrument(pos.instrument_id, AssetKind.STOCK, "KRX", pos.instrument_id, "KRW")
-                    positions = (*positions, Position(instrument=instr, quantity=float(pos.quantity), average_cost=pos.average_cost))
+                instr = self._config.instruments.get(pos.instrument_id)
+                if instr is None:
+                    raise BacktestIntegrityError(f"unknown instrument {pos.instrument_id!r} in ledger snapshot")
+                positions.append(Position(instrument=instr, quantity=float(pos.quantity), average_cost=pos.average_cost))
             return PortfolioSnapshot(
                 account_snapshot_id=f"{self._config.ledger_id}:{as_of.isoformat()}",
                 as_of=as_of,
                 settled_cash=snap.settled_cash,
                 unsettled_cash=snap.unsettled_cash,
-                positions=positions,
-                open_order_ids=tuple(o.order_id for o in pending_orders),
+                positions=tuple(positions),
+                open_order_ids=tuple(f"order:{p.intent.intent_id}:{p.decision_session_open.isoformat()}" for p in pending_targets),
             )
 
         try:
             for idx, session in enumerate(sessions):
-                # per-session order: settle, actions, pending fills, raw-close mark/NAV, reconciliation, then decision
-                # 1. settle
+                seen_ids: set[str] = set()
+                for b in session.bars:
+                    if b.instrument_id in seen_ids:
+                        raise BacktestIntegrityError(f"duplicate bar for {b.instrument_id!r}")
+                    seen_ids.add(b.instrument_id)
+                    if b.session_open != session.session_open:
+                        raise BacktestIntegrityError(f"bar session_open {b.session_open} mismatches session {session.session_open}")
+                for act in session.actions:
+                    if not isinstance(act, LedgerCorporateAction):
+                        raise BacktestIntegrityError(f"unknown action {act!r}")
                 try:
                     ledger.settle(session.session_open)
                 except ValueError as exc:
                     raise BacktestIntegrityError(str(exc)) from exc
-                # 2. actions
                 if session.actions:
-                    # build cash_in_lieu prices from bars raw_open
                     cash_prices: dict[str, float] = {b.instrument_id: float(b.raw_open) for b in session.bars}
                     try:
                         ledger.apply_corporate_actions(
@@ -157,21 +151,37 @@ class EventBacktester:
                         )
                     except ValueError as exc:
                         raise BacktestIntegrityError(str(exc)) from exc
-                # 3. pending fills (orders decided previous session, executing this session)
-                if pending_orders:
-                    # sells before buys
-                    pending_orders = sorted(pending_orders, key=lambda o: 0 if o.side == OrderSide.SELL else 1)
+                if pending_targets:
+                    # determine side for sorting sells before buys using post-action holdings
+                    def _delta(pt: _PendingTarget) -> int:
+                        return int(pt.target_qty) - int(ledger.quantity_of(pt.instrument.instrument_id))
+
+                    pending_targets = sorted(pending_targets, key=lambda pt: 0 if _delta(pt) < 0 else 1)
                     bar_map: dict[str, HistoricalBar] = {b.instrument_id: b for b in session.bars}
-                    # O(P log P) for sorting, O(B+A+P) overall
-                    next_pending: list[BacktestOrder] = []
-                    for order in pending_orders:
-                        bar = bar_map.get(order.instrument.instrument_id)
+                    next_pending: list[_PendingTarget] = []
+                    for pt in pending_targets:
+                        bar = bar_map.get(pt.instrument.instrument_id)
                         if bar is None:
-                            raise BacktestIntegrityError(f"missing bar for {order.instrument.instrument_id!r} at {session.session_open}")
-                        # missing price etc will be raised inside execute as fatal
+                            raise BacktestIntegrityError(f"missing bar for {pt.instrument.instrument_id!r} at {session.session_open}")
+                        current_qty = ledger.quantity_of(pt.instrument.instrument_id)
+                        delta = int(pt.target_qty) - int(current_qty)
+                        if delta == 0:
+                            continue
+                        side = OrderSide.BUY if delta > 0 else OrderSide.SELL
+                        qty = abs(delta)
+                        if qty % int(pt.instrument.lot_size) != 0:
+                            raise BacktestIntegrityError("order quantity not multiple of lot")
+                        order = BacktestOrder(
+                            order_id=f"order:{pt.intent.intent_id}:{pt.decision_session_open.isoformat()}",
+                            intent_id=pt.intent.intent_id,
+                            instrument=pt.instrument,
+                            side=side,
+                            quantity=int(qty),
+                            decision_time=pt.intent.decision_time,
+                            execution_time=pt.intent.execution_time,
+                        )
                         result = fill_model.execute(order, bar)
                         if isinstance(result, FillOutcome):
-                            # 결제일은 달력일이 아니라 KRX 세션 기준으로 산출한다.
                             try:
                                 settlement_time = calendar.advance(
                                     result.fill.trade_time,
@@ -179,10 +189,7 @@ class EventBacktester:
                                 )
                             except ValueError as exc:
                                 raise BacktestIntegrityError(str(exc)) from exc
-                            from dataclasses import replace
-
                             fill = replace(result.fill, settlement_time=settlement_time)
-                            # record fill in ledger
                             try:
                                 ledger.record_fill(fill)
                             except ValueError as exc:
@@ -201,10 +208,17 @@ class EventBacktester:
                                     scenario=self._config.scenario,
                                 )
                             )
+                            if result.unfilled_quantity > 0:
+                                reject = BacktestReject(
+                                    reject_id=f"reject:{order.order_id}:remainder",
+                                    order_id=order.order_id,
+                                    reason="target cap partial fill remainder",
+                                    rejected_quantity=int(result.unfilled_quantity),
+                                    event_time=bar.session_open,
+                                )
+                                rejects.append(reject)
                         else:
-                            # reject
                             rejects.append(result)
-                            # diagnostic for reject with zero filled
                             capacity_diagnostics.append(
                                 CapacityDiagnostic(
                                     order_id=order.order_id,
@@ -218,9 +232,7 @@ class EventBacktester:
                                     scenario=self._config.scenario,
                                 )
                             )
-                    pending_orders = next_pending
-                # 4. raw-close mark/NAV and ledger reconciliation
-                # build prices for all open positions from bars raw_close
+                    pending_targets = next_pending
                 snap_before_mark = ledger.snapshot(session.session_open)
                 if snap_before_mark.positions:
                     bar_close_map: dict[str, float] = {b.instrument_id: float(b.raw_close) for b in session.bars}
@@ -229,13 +241,13 @@ class EventBacktester:
                         if pos.instrument_id not in bar_close_map:
                             raise BacktestIntegrityError(f"missing raw close for {pos.instrument_id!r}")
                         price = bar_close_map[pos.instrument_id]
-                        if not price or not isinstance(price, float) or price <= 0:
-                            # allow int
+                        if not isinstance(price, float):
                             price = float(price)
-                        if price <= 0:
+                        import math
+
+                        if not math.isfinite(float(price)) or float(price) <= 0:
                             raise BacktestIntegrityError("missing/non-positive raw close")
                         prices.append((pos.instrument_id, price))
-                    # need to ensure mark covers exactly once - already
                     mark_id = f"mark:{session.session_open.isoformat()}:{idx}"
                     mark = LedgerMark(mark_id, session.session_open, tuple(prices))
                     try:
@@ -244,7 +256,6 @@ class EventBacktester:
                         raise BacktestIntegrityError(str(exc)) from exc
                     daily_nav.append(nav)
                 else:
-                    # no positions: create empty mark
                     mark_id = f"mark:{session.session_open.isoformat()}:{idx}"
                     mark = LedgerMark(mark_id, session.session_open, ())
                     try:
@@ -252,84 +263,55 @@ class EventBacktester:
                     except ValueError as exc:
                         raise BacktestIntegrityError(str(exc)) from exc
                     daily_nav.append(nav)
-                # 5. reconciliation and decision
                 portfolio = _make_snapshot(session.decision_time)
-                # validate portfolio as_of <= decision_time (already)
                 context = DecisionContext(
                     decision_time=session.decision_time,
                     portfolio=portfolio,
                     market_snapshot=session.market_snapshot,
                 )
-                # invoke strategy via port - wiring requires strategy.decide(
                 intents = strategy.decide(context)
                 if intents is None:
                     intents = ()
-                # validate no backtest-mode branch - ensure each intent execution_time is next session open
                 next_open = sessions[idx + 1].session_open if idx + 1 < len(sessions) else None
-                # prepare orders for next session
-                new_orders: list[BacktestOrder] = []
+                new_targets: list[_PendingTarget] = []
                 for intent in intents:
                     if not isinstance(intent, TradeIntent):
                         raise BacktestIntegrityError("intent must be TradeIntent")
-                    # execution_time must be next session open if not last
+                    if intent.decision_time != session.decision_time:
+                        raise BacktestIntegrityError(f"intent decision_time {intent.decision_time} must equal current decision_time {session.decision_time}")
                     if next_open is not None:
                         if intent.execution_time != next_open:
                             raise BacktestIntegrityError(f"T-close intent execution_time must be next session open: {intent.execution_time} != {next_open}")
                     else:
-                        # last session intents are ignored (no future execution)
                         continue
-                    # resolve instrument
                     instr = self._config.instruments.get(intent.instrument_id)
                     if instr is None:
-                        # create fallback
-
-                        instr = Instrument(intent.instrument_id, intent.asset_kind, "KRX", intent.instrument_id, "KRW")
+                        raise BacktestIntegrityError(f"unknown instrument {intent.instrument_id!r}")
                     lot = int(instr.lot_size)
-                    # reference price for quantity calc: use current session raw_close
+                    if lot < 1:
+                        raise BacktestIntegrityError("lot_size must be positive")
                     bar_map_ref: dict[str, HistoricalBar] = {b.instrument_id: b for b in session.bars}
                     ref_bar = bar_map_ref.get(intent.instrument_id)
-                    if ref_bar is None:
-                        # if no bar for this instrument, use execution bar raw_open next session? Fallback to 1
-                        ref_price = 1.0
-                    else:
-                        ref_price = float(ref_bar.raw_close) if ref_bar.raw_close > 0 else float(ref_bar.raw_open)
-                    if ref_price <= 0:
-                        raise BacktestIntegrityError("missing/non-positive reference price")
-                    current_qty = ledger.quantity_of(instr.instrument_id)
                     if intent.target_quantity is not None:
                         target_qty = int(intent.target_quantity)
                         if target_qty % lot != 0:
                             raise BacktestIntegrityError("target_quantity not multiple of lot")
                     else:
-                        # floor to lot
+                        if ref_bar is None:
+                            raise BacktestIntegrityError(f"missing bar for target_value conversion {intent.instrument_id!r}")
+                        ref_price = float(ref_bar.raw_close) if float(ref_bar.raw_close) > 0 else float(ref_bar.raw_open)
+                        import math as _math
+
+                        if not _math.isfinite(ref_price) or ref_price <= 0:
+                            raise BacktestIntegrityError("missing/non-positive reference price")
                         target_qty = int(intent.target_value / ref_price / lot) * lot
-                    delta = int(target_qty) - int(current_qty)
-                    if delta == 0:
-                        continue
-                    side = OrderSide.BUY if delta > 0 else OrderSide.SELL
-                    qty = abs(delta)
-                    if qty % lot != 0:
-                        raise BacktestIntegrityError("order quantity not multiple of lot")
-                    # validate holdings insufficient for sell will be caught at fill time
-                    order = BacktestOrder(
-                        order_id=f"order:{intent.intent_id}:{session.session_open.isoformat()}",
-                        intent_id=intent.intent_id,
-                        instrument=instr,
-                        side=side,
-                        quantity=int(qty),
-                        decision_time=intent.decision_time,
-                        execution_time=intent.execution_time,
-                    )
-                    new_orders.append(order)
-                # plan sells before buys for next execution
-                new_orders = sorted(new_orders, key=lambda o: 0 if o.side == OrderSide.SELL else 1)
-                pending_orders = new_orders
+                    # validate target lot (already)
+                    new_targets.append(_PendingTarget(intent=intent, target_qty=target_qty, instrument=instr, decision_session_open=session.session_open))
+                pending_targets = new_targets
         except BacktestIntegrityError:
             raise
         except ValueError as exc:
-            # convert any invariant failure to BacktestIntegrityError
             raise BacktestIntegrityError(str(exc)) from exc
-        # collect journal
         journal = ledger.journal()
         return BacktestResult(
             fills=tuple(fills),
