@@ -10,9 +10,16 @@ from pathlib import Path
 from src.data.backtest_runner import run_champion_backtest
 from src.data.backtest_sessions import build_backtest_sessions
 from src.data.bronze import BronzeStore, import_retained_stock_evidence, migrate_retained_stock_evidence
-from src.data.collection import ChampionCollectionRequest, collect_champion_evidence
-from src.data.legacy_inventory import MigrationArtifactStore, inspect_legacy_data, purge_legacy_data
+from src.data.collection import ChampionCollectionRequest, CollectionArtifact, collect_champion_evidence
+from src.data.collection_plan import (
+    CollectionCheckpointStore,
+    CollectionReadinessReport,
+    build_historical_collection_plan,
+    load_collection_plan,
+)
+from src.data.legacy_inventory import MigrationArtifactStore, inspect_legacy_data
 from src.data.normalization import normalize_stock_evidence
+from src.data.operations import execute_verified_legacy_purge, prepare_stock_data_rebuild
 from src.data.pipeline import materialize_backtest_inputs
 from src.data.schemas import PITDataError
 from src.integrations.dart.client import DartApiClient
@@ -29,6 +36,7 @@ def _parse_args() -> argparse.Namespace:
     p_mig = sub.add_parser("migrate-legacy", help="Migrate retained evidence to Bronze")
     p_mig.add_argument("--source-root", type=Path, default=Path("data/evidence/stocks"))
     p_mig.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
+    p_mig.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
     p_mig.add_argument("--retrieved-at", type=str, required=False, default=None)
 
     p_col = sub.add_parser("collect", help="Collect missing champion evidence")
@@ -36,6 +44,7 @@ def _parse_args() -> argparse.Namespace:
     p_col.add_argument("--coverage-start", type=str, required=True)
     p_col.add_argument("--coverage-end", type=str, required=True)
     p_col.add_argument("--retrieved-at", type=str, required=False, default=None)
+    p_col.add_argument("--plan-id", type=str, required=False, default=None)
 
     p_mat = sub.add_parser("materialize", help="Materialize backtest inputs")
     p_mat.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
@@ -63,6 +72,34 @@ def _parse_args() -> argparse.Namespace:
     p_run = sub.add_parser("run-backtest", help="Run Champion backtest from Gold")
     p_run.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
     p_run.add_argument("--gold-root", type=Path, default=Path("data/gold/stocks"))
+
+    p_rebuild = sub.add_parser("rebuild-data", help="Prepare verified rebuild before collection")
+    p_rebuild.add_argument("--data-root", type=Path, default=Path("data"))
+    p_rebuild.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
+    p_rebuild.add_argument("--silver-root", type=Path, default=Path("data/silver/stocks"))
+    p_rebuild.add_argument("--gold-root", type=Path, default=Path("data/gold/stocks"))
+    p_rebuild.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
+    p_rebuild.add_argument("--coverage-start", type=str, required=True)
+    p_rebuild.add_argument("--coverage-end", type=str, required=True)
+    p_rebuild.add_argument("--decision-time", type=str, required=False, default=None)
+
+    p_kis_probe = sub.add_parser("probe-kis-flow", help="Verify one historical KIS investor-flow session")
+    p_kis_probe.add_argument("--symbol", type=str, required=True)
+    p_kis_probe.add_argument("--session", type=str, required=True)
+
+    p_plan = sub.add_parser("plan", help="Build immutable historical collection plan")
+    p_plan.add_argument("--coverage-start", type=str, required=True)
+    p_plan.add_argument("--coverage-end", type=str, required=True)
+    p_plan.add_argument("--symbols", type=str, required=True)
+    p_plan.add_argument("--sessions", type=str, required=True)
+    p_plan.add_argument("--chunk-size", type=int, default=20)
+
+    p_resume = sub.add_parser("resume", help="Resume collection from checkpoints")
+    p_resume.add_argument("--plan-id", type=str, required=True)
+    p_resume.add_argument("--checkpoint-root", type=Path, default=Path("data/artifacts/collection-checkpoints"))
+
+    p_readiness = sub.add_parser("readiness", help="Check collection readiness for certification")
+    p_readiness.add_argument("--plan-id", type=str, required=True)
 
     return parser.parse_args()
 
@@ -121,12 +158,22 @@ def main() -> int:
                 Path(args.bronze_root),
                 retrieved_at=_parse_dt(args.retrieved_at),
             )
+            artifact_path = MigrationArtifactStore(Path(args.artifact_root)).write(artifact)
         except (PITDataError, ValueError, OSError):
             return 1
-        _emit({"content_hash": artifact.content_hash, "receipts": len(artifact.receipts)})
+        _emit(
+            {
+                "content_hash": artifact.content_hash,
+                "receipts": len(artifact.receipts),
+                "artifact_path": str(artifact_path),
+            }
+        )
         return 0
     if args.command == "collect":
+        if not getattr(args, "plan_id", None):
+            return 1
         try:
+            load_collection_plan(str(args.plan_id))
             try:
                 krx_client = KrxApiClient()
                 dart_client = DartApiClient()
@@ -177,6 +224,8 @@ def main() -> int:
             collection = collect_champion_evidence(
                 request, krx=_KrxAdapter(krx_client), dart=_DartAdapter(dart_client)
             )
+            if not isinstance(collection, CollectionArtifact):
+                raise PITDataError("collection did not produce a Bronze artifact")
         except (PITDataError, ValueError, OSError):
             return 1
         _emit({"receipts": sorted(str(k.value) for k in collection.receipts), "content_hash": collection.content_hash})
@@ -219,10 +268,10 @@ def main() -> int:
         _emit({"tables": sorted(str(k.value) for k in report_tables), "report_hash": report.report_hash})
         return 0
     if args.command == "purge-legacy":
-        # Purge requires a migration artifact produced by the migration workflow.
-        # The CLI intentionally refuses to synthesize verification from directory existence.
+        # Purge consumes persisted proof only and requires --confirm-purge.
         try:
             from src.core.datasets import DatasetCertification
+            from src.data.operations import RebuildPreparation
             from src.data.schemas import CertificationReport, EvidenceKind
 
             store_root = Path(args.migration_artifact).parent
@@ -236,10 +285,39 @@ def main() -> int:
                 coverage_end=date.fromisoformat(str(report_raw["coverage_end"])),
                 source_hashes=source_hashes,
             )
-            purge_legacy_data(
-                Path(args.data_root),
-                migration,
-                certified_silver_report=report,
+            from pathlib import Path as _Path
+
+            gold_root = _Path(getattr(args, "gold_root", _Path("data/gold/stocks")))
+            gold_artifact = None
+            required_gold = ("universe", "qvef", "champion_scores", "benchmarks")
+            if gold_root.exists() and all(list((gold_root / name).rglob("*.parquet")) for name in required_gold):
+                gold_artifact = dict.fromkeys(required_gold, True)
+            backtest_candidates = [
+                p for p in _Path("data/artifacts").glob("backtests/*/result.json")
+                if p.is_file()
+            ] if _Path("data/artifacts").exists() else []
+            backtest_path = backtest_candidates[0] if backtest_candidates else None
+            preparation = RebuildPreparation(
+                migration=migration,
+                silver_report=report,
+                gold_artifact=gold_artifact,
+                backtest_artifact_path=backtest_path,
+            )
+            from src.data.operations import StockDataRebuildRequest as _RebuildRequest
+
+            purge_request = _RebuildRequest(
+                data_root=Path(args.data_root),
+                bronze_root=Path(args.bronze_root),
+                silver_root=Path("data/silver/stocks"),
+                gold_root=gold_root,
+                artifact_root=store_root,
+                coverage_start=report.coverage_start,
+                coverage_end=report.coverage_end,
+                decision_time=_parse_dt(None),
+            )
+            execute_verified_legacy_purge(
+                purge_request,
+                preparation,
                 confirm_purge=bool(getattr(args, "confirm_purge", False)),
             )
         except (ValueError, OSError):
@@ -260,6 +338,87 @@ def main() -> int:
                 Path(args.source_root), store=store, retrieved_at=retrieved_at
             )
         except (PITDataError, ValueError, OSError):
+            return 1
+        return 0
+    if args.command == "rebuild-data":
+        try:
+            from src.data.operations import StockDataRebuildRequest
+            from src.integrations.dart.xbrl import DartXbrlCollector
+            from src.integrations.krx.historical import KrxHistoricalCollector
+
+            krx_collector = KrxHistoricalCollector()
+            dart_collector = DartXbrlCollector()
+            rebuild_request = StockDataRebuildRequest(
+                data_root=Path(args.data_root),
+                bronze_root=Path(args.bronze_root),
+                silver_root=Path(args.silver_root),
+                gold_root=Path(args.gold_root),
+                artifact_root=Path(args.artifact_root),
+                coverage_start=date.fromisoformat(str(args.coverage_start)),
+                coverage_end=date.fromisoformat(str(args.coverage_end)),
+                decision_time=_parse_dt(args.decision_time),
+            )
+            preparation = prepare_stock_data_rebuild(rebuild_request, krx=krx_collector, dart=dart_collector)
+            if len(preparation.migration.receipts) != 6:
+                return 1
+            _emit({"content_hash": preparation.migration.content_hash, "receipts": len(preparation.migration.receipts), "coverage_start": str(rebuild_request.coverage_start), "coverage_end": str(rebuild_request.coverage_end)})
+        except (PITDataError, ValueError, OSError):
+            return 1
+        return 0
+    if args.command == "plan":
+        try:
+            symbols = tuple(s.strip() for s in str(args.symbols).split(",") if s.strip())
+            session_list = tuple(date.fromisoformat(s.strip()) for s in str(args.sessions).split(",") if s.strip())
+            plan = build_historical_collection_plan(
+                sessions=session_list,
+                universe=tuple({"symbol": s, "is_common_stock": True, "tradable_from": None, "tradable_to": None} for s in symbols),
+                start=date.fromisoformat(str(args.coverage_start)),
+                end=date.fromisoformat(str(args.coverage_end)),
+                chunk_size=int(args.chunk_size),
+            )
+        except (PITDataError, ValueError, OSError):
+            return 1
+        _emit({"plan_id": plan.plan_id, "chunks": len(plan.chunks)})
+        return 0
+    if args.command == "resume":
+        try:
+            resume_plan = load_collection_plan(str(args.plan_id))
+            checkpoint_store = CollectionCheckpointStore(Path(args.checkpoint_root))
+            pending = [c.chunk_id for c in resume_plan.chunks if checkpoint_store.is_pending(plan_id=resume_plan.plan_id, chunk_id=c.chunk_id, receipt_digest="")]
+            _emit({"plan_id": resume_plan.plan_id, "pending": pending})
+        except (PITDataError, ValueError, OSError):
+            return 1
+        return 0
+    if args.command == "readiness":
+        try:
+            readiness_plan = load_collection_plan(str(args.plan_id))
+            readiness_report = CollectionReadinessReport.incomplete(corporate_status_reason="unvalidated provider provenance")
+            try:
+                readiness_report.require_certifiable()
+                certifiable = True
+            except PITDataError:
+                certifiable = False
+            _emit({"plan_id": readiness_plan.plan_id, "certifiable": certifiable, "reasons": list(readiness_report.unresolved_reasons)})
+        except (PITDataError, ValueError, OSError):
+            return 1
+        return 0
+    if args.command == "probe-kis-flow":
+        try:
+            from src.integrations.kis.investor_flow import KisInvestorFlowCollector
+
+            session = date.fromisoformat(str(args.session))
+            page = KisInvestorFlowCollector((str(args.symbol),)).probe(str(args.symbol), session)
+            records = page["records"]
+            _emit(
+                {
+                    "provider": page["provider"],
+                    "endpoint": page["endpoint"],
+                    "symbol": str(args.symbol),
+                    "requested_session": session.isoformat(),
+                    "records": len(records) if isinstance(records, list) else 0,
+                }
+            )
+        except (PITDataError, ValueError, OSError, RuntimeError):
             return 1
         return 0
     return 0

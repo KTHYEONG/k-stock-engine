@@ -5,7 +5,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +80,8 @@ class KisClient:
         if not self._token_cache_path.exists():
             return
         try:
+            if self._token_cache_path.stat().st_mode & 0o077:
+                return
             payload = json.loads(self._token_cache_path.read_text(encoding="utf-8"))
             token = payload.get("access_token")
             expire_at = payload.get("expire_at")
@@ -99,7 +101,16 @@ class KisClient:
             "access_token": token,
             "expire_at": expire_at.isoformat(),
         }
-        self._token_cache_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        temp_path = self._token_cache_path.with_suffix(".tmp")
+        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(data, ensure_ascii=False))
+            os.replace(temp_path, self._token_cache_path)
+            self._token_cache_path.chmod(0o600)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
 
     def _request_new_token(self) -> str:
         url = f"{self.base_url}/oauth2/tokenP"
@@ -225,6 +236,30 @@ class KisClient:
         if not isinstance(out, dict):
             raise RuntimeError(f"KIS inquire_price malformed output: {payload}")
         return out
+
+    def inquire_investor_trade_by_stock_daily(
+        self, symbol: str, anchor: date
+    ) -> tuple[dict[str, Any], ...]:
+        if not symbol or not symbol.strip():
+            raise ValueError("symbol is required")
+        if not isinstance(anchor, date):
+            raise ValueError("anchor must be a date")
+        payload = self._call(
+            method="GET",
+            path="/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily",
+            tr_id="FHPTJ04160001",
+            params={
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": symbol.strip(),
+                "FID_INPUT_DATE_1": anchor.strftime("%Y%m%d"),
+                "FID_ORG_ADJ_PRC": "",
+                "FID_ETC_CLS_CODE": "",
+            },
+        )
+        raw = payload.get("output2", [])
+        if not isinstance(raw, list):
+            raise RuntimeError("KIS investor flow output2 must be a list")
+        return tuple(item for item in raw if isinstance(item, dict))
 
     def inquire_balance(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         tr_id = "VTTC8434R" if self.creds.env.startswith("demo") or self.creds.env.startswith("v") else "TTTC8434R"
