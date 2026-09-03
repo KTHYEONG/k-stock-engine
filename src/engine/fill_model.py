@@ -132,6 +132,11 @@ class HistoricalFillModel:
         self.target_cap = self._target_cap
         self.hard_cap = self._hard_cap
 
+    @property
+    def scenario(self) -> ExecutionScenario:
+        """Execution scenario bound to this immutable fill model."""
+        return self._scenario
+
     def execute(self, order: BacktestOrder, bar: HistoricalBar) -> FillOutcome | BacktestReject:
         # fatal validations
         if bar.instrument_id != order.instrument.instrument_id:
