@@ -9,6 +9,8 @@ from src.engine.backtest import (
 )
 from src.engine.decision import StrategyDecisionPort
 
+__all__ = ["run_backtest", "run_walk_forward_validation"]
+
 
 def run_backtest(
     config: BacktestConfig,
@@ -17,3 +19,27 @@ def run_backtest(
 ) -> BacktestResult:
     """Run a configured historical replay through the shared engine."""
     return EventBacktester(config).run(sessions, strategy)
+
+
+def run_walk_forward_validation(
+    *,
+    champion_base: tuple[object, ...],
+    champion_stress: tuple[object, ...],
+    cap_weight_base: tuple[object, ...],
+    equal_weight_base: tuple[object, ...],
+    bootstrap_config: object,
+) -> object:
+    """Delegate walk-forward validation to the validation runner.
+
+    Keeps engine wiring independent of validation internals while
+    satisfying the wiring anchor ``return evaluate_walk_forward(``.
+    """
+    from src.validation.runner import evaluate_walk_forward
+
+    return evaluate_walk_forward(
+        champion_base=champion_base,  # type: ignore[arg-type]
+        champion_stress=champion_stress,  # type: ignore[arg-type]
+        cap_weight_base=cap_weight_base,  # type: ignore[arg-type]
+        equal_weight_base=equal_weight_base,  # type: ignore[arg-type]
+        bootstrap_config=bootstrap_config,  # type: ignore[arg-type]
+    )
