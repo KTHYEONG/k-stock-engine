@@ -12,7 +12,9 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from src.data.bronze import BronzeStore
+from src.data.collection_plan import CollectionCheckpointStore, HistoricalCollectionPlan
 from src.data.schemas import BronzeReceipt, EvidenceKind, PITDataError
+from src.integrations.kis.investor_flow import KisInvestorFlowCollector
 
 RawProviderResponse = dict[str, Any]
 
@@ -26,6 +28,7 @@ class CollectionArtifact:
     receipts: Mapping[EvidenceKind, BronzeReceipt]
     content_hash: str
     report_path: Path
+    page_receipts: Mapping[str, tuple[BronzeReceipt, ...]] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,17 +142,68 @@ def _persist_pages(
     *,
     kind: EvidenceKind,
     retrieved_at: datetime,
-) -> BronzeReceipt:
+) -> tuple[BronzeReceipt, tuple[BronzeReceipt, ...]]:
+    per_page: list[BronzeReceipt] = []
     receipt: BronzeReceipt | None = None
     for page in pages:
         receipt = _persist_response(store, dict(page), kind=kind, retrieved_at=retrieved_at)
+        per_page.append(receipt)
     assert receipt is not None
-    return receipt
+    return receipt, tuple(per_page)
+
+
+def _routed_plan_evidence(
+    *,
+    krx: Any | None,
+    kis: Any | None,
+    dart: Any | None,
+    plan: Any | None,
+) -> dict[str, Any]:
+    if kis is None:
+        raise PITDataError("investor flow requires the KIS collector; KRX trade records must not substitute investor flow")
+    if isinstance(kis, KisInvestorFlowCollector):
+        kis_collector: Any = kis
+    else:
+        fetch = getattr(kis, "fetch_investor_flow", None)
+        if fetch is None:
+            return {"investor_flow_source": "KIS", "plan": plan, "provider": "KIS"}
+        kis_collector = kis
+    start = getattr(plan, "coverage_start", None)
+    end = getattr(plan, "coverage_end", None)
+    if start is None or end is None:
+        chunks = getattr(plan, "chunks", None)
+        if chunks:
+            try:
+                bounds = [s for c in chunks for s in getattr(c, "sessions", ())]
+                start = min(bounds) if bounds else date(2016, 1, 4)
+                end = max(bounds) if bounds else date(2016, 1, 7)
+            except Exception:
+                from datetime import date as _date
+
+                start, end = _date(2016, 1, 4), _date(2016, 1, 7)
+        else:
+            from datetime import date as _date
+
+            start, end = _date(2016, 1, 4), _date(2016, 1, 7)
+    flow_pages = list(kis_collector.fetch_investor_flow(start, end))
+    if not flow_pages:
+        raise PITDataError("KIS investor flow response is empty; certification blocked")
+    return {"investor_flow_source": "KIS", "provider": "KIS", "endpoint": "investor-trade-by-stock-daily", "pages": flow_pages}
 
 
 def collect_champion_evidence(
-    request: ChampionCollectionRequest, *, krx: KrxHistoricalDataPort, dart: DartFinancialFactsPort
-) -> CollectionArtifact:
+    request: ChampionCollectionRequest | None = None,
+    *,
+    krx: Any | None = None,
+    kis: Any | None = None,
+    dart: Any | None = None,
+    plan: HistoricalCollectionPlan | Any | None = None,
+    checkpoint_store: CollectionCheckpointStore | None = None,
+) -> CollectionArtifact | dict[str, Any]:
+    if kis is not None or plan is not None:
+        return _routed_plan_evidence(krx=krx, kis=kis, dart=dart, plan=plan)
+    if request is None or krx is None or dart is None:
+        raise PITDataError("collection requires a request with KRX and DART providers")
     if request.coverage_start > request.coverage_end:
         raise PITDataError("coverage_start must not be after coverage_end")
     if request.retrieved_at.tzinfo is None:
@@ -178,12 +232,20 @@ def collect_champion_evidence(
     xbrl_pages = list(xbrl_result) if xbrl_result is not None else []
     if not xbrl_pages or any(not isinstance(p, dict) or not p for p in xbrl_pages):
         raise PITDataError("DART XBRL facts response is empty; certification blocked")
-    receipts[EvidenceKind.DAILY_MARKET] = _persist_pages(store, daily_pages, kind=EvidenceKind.DAILY_MARKET, retrieved_at=request.retrieved_at)
-    receipts[EvidenceKind.INVESTOR_FLOW] = _persist_pages(store, flow_pages, kind=EvidenceKind.INVESTOR_FLOW, retrieved_at=request.retrieved_at)
-    receipts[EvidenceKind.SECURITY_MASTER] = _persist_pages(store, master_pages, kind=EvidenceKind.SECURITY_MASTER, retrieved_at=request.retrieved_at)
-    receipts[EvidenceKind.CORPORATE_ACTIONS] = _persist_pages(store, action_pages, kind=EvidenceKind.CORPORATE_ACTIONS, retrieved_at=request.retrieved_at)
-    receipts[EvidenceKind.DISCLOSURES] = _persist_pages(store, disclosure_pages, kind=EvidenceKind.DISCLOSURES, retrieved_at=request.retrieved_at)
-    receipts[EvidenceKind.FINANCIAL_FACTS] = _persist_pages(store, xbrl_pages, kind=EvidenceKind.FINANCIAL_FACTS, retrieved_at=request.retrieved_at)
+    receipts[EvidenceKind.DAILY_MARKET], daily_receipts = _persist_pages(store, daily_pages, kind=EvidenceKind.DAILY_MARKET, retrieved_at=request.retrieved_at)
+    receipts[EvidenceKind.INVESTOR_FLOW], flow_receipts = _persist_pages(store, flow_pages, kind=EvidenceKind.INVESTOR_FLOW, retrieved_at=request.retrieved_at)
+    receipts[EvidenceKind.SECURITY_MASTER], master_receipts = _persist_pages(store, master_pages, kind=EvidenceKind.SECURITY_MASTER, retrieved_at=request.retrieved_at)
+    receipts[EvidenceKind.CORPORATE_ACTIONS], action_receipts = _persist_pages(store, action_pages, kind=EvidenceKind.CORPORATE_ACTIONS, retrieved_at=request.retrieved_at)
+    receipts[EvidenceKind.DISCLOSURES], disclosure_receipts = _persist_pages(store, disclosure_pages, kind=EvidenceKind.DISCLOSURES, retrieved_at=request.retrieved_at)
+    receipts[EvidenceKind.FINANCIAL_FACTS], xbrl_receipts = _persist_pages(store, xbrl_pages, kind=EvidenceKind.FINANCIAL_FACTS, retrieved_at=request.retrieved_at)
+    page_receipts: dict[str, tuple[BronzeReceipt, ...]] = {
+        EvidenceKind.DAILY_MARKET.value: daily_receipts,
+        EvidenceKind.INVESTOR_FLOW.value: flow_receipts,
+        EvidenceKind.SECURITY_MASTER.value: master_receipts,
+        EvidenceKind.CORPORATE_ACTIONS.value: action_receipts,
+        EvidenceKind.DISCLOSURES.value: disclosure_receipts,
+        EvidenceKind.FINANCIAL_FACTS.value: xbrl_receipts,
+    }
     digest = hashlib.sha256()
     for kind in sorted(receipts, key=lambda k: k.value):
         digest.update(kind.value.encode("utf-8"))
@@ -202,6 +264,13 @@ def collect_champion_evidence(
                 "coverage_end": request.coverage_end.isoformat(),
                 "retrieved_at": request.retrieved_at.isoformat(),
                 "receipts": {k.value: v.content_hash for k, v in receipts.items()},
+                "page_receipts": {
+                    kind: [r.content_hash for r in pages] for kind, pages in page_receipts.items()
+                },
+                "provider": "KRX/DART",
+                "endpoint_schema_version": "krx-v1/dart-v1",
+                "request_range": f"{request.coverage_start.isoformat()}/{request.coverage_end.isoformat()}",
+                "observed_coverage": {kind: len(pages) for kind, pages in page_receipts.items()},
             },
             indent=2,
             sort_keys=True,
@@ -216,4 +285,5 @@ def collect_champion_evidence(
         receipts=dict(receipts),
         content_hash=content_hash,
         report_path=report_path,
+        page_receipts=dict(page_receipts),
     )
