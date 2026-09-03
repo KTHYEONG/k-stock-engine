@@ -151,5 +151,8 @@
     "architecture": "docs/specs/10_stress_and_promotion_gates.md",
     "testing": "tests/integration/validation/test_promotion.py"
   },
-  "src/data/cli.py": {}
+  "src/data/cli.py": {},
+  "src/data/collection_plan.py": {
+    "testing": "tests/unit/data/test_collection_plan.py"
+  }
 }
