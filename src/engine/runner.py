@@ -1,6 +1,9 @@
 """Application entry point for the unified event-driven backtester."""
 from __future__ import annotations
 
+from pathlib import Path
+from typing import TYPE_CHECKING
+
 from src.engine.backtest import (
     BacktestConfig,
     BacktestResult,
@@ -9,7 +12,10 @@ from src.engine.backtest import (
 )
 from src.engine.decision import StrategyDecisionPort
 
-__all__ = ["run_backtest", "run_walk_forward_validation"]
+if TYPE_CHECKING:
+    from src.validation.robustness import PromotionEvidence, PromotionVerdict
+
+__all__ = ["run_backtest", "run_promotion_evaluation", "run_walk_forward_validation"]
 
 
 def run_backtest(
@@ -43,3 +49,16 @@ def run_walk_forward_validation(
         equal_weight_base=equal_weight_base,  # type: ignore[arg-type]
         bootstrap_config=bootstrap_config,  # type: ignore[arg-type]
     )
+
+
+def run_promotion_evaluation(
+    *,
+    evidence: PromotionEvidence,
+    registry_path: Path,
+) -> PromotionVerdict:
+    """Evaluate promotion gates then append the immutable verdict."""
+    from src.validation.robustness import append_promotion_verdict, evaluate_promotion
+
+    verdict = evaluate_promotion(evidence)
+    append_promotion_verdict(registry_path, verdict)
+    return verdict
