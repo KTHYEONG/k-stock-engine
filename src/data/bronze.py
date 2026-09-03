@@ -6,6 +6,7 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+from src.data.legacy_inventory import MigrationArtifact, MigrationEntry
 from src.data.schemas import BronzeReceipt, EvidenceKind, PITDataError
 
 # Fixed registry mapping kind to expected filename relative to source_root
@@ -132,3 +133,38 @@ def import_retained_stock_evidence(
             raise PITDataError(f"hash mismatch for {rel}")
         result[kind] = receipt
     return result
+
+
+def migrate_retained_stock_evidence(
+    source_root: Path, bronze_root: Path, *, retrieved_at: datetime
+) -> MigrationArtifact:
+    store = BronzeStore(Path(bronze_root))
+    receipts = import_retained_stock_evidence(
+        Path(source_root), store=store, retrieved_at=retrieved_at
+    )
+    entries: list[MigrationEntry] = []
+    for kind in sorted(receipts, key=lambda k: k.value):
+        receipt = receipts[kind]
+        rel = _RETAINED_REGISTRY[kind]
+        source_path = Path(source_root) / rel
+        entries.append(
+            MigrationEntry(
+                source_path=str(source_path),
+                source_hash=receipt.content_hash,
+                receipt_path=str(receipt.metadata_path),
+                coverage=rel,
+                decision="imported",
+            )
+        )
+    digest = hashlib.sha256()
+    for kind in sorted(receipts, key=lambda k: k.value):
+        digest.update(kind.value.encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(receipts[kind].content_hash.encode("utf-8"))
+        digest.update(b"\x00")
+    return MigrationArtifact(
+        receipts=dict(receipts),
+        entries=tuple(entries),
+        content_hash=digest.hexdigest(),
+        verified=True,
+    )
