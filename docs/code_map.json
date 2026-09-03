@@ -142,5 +142,9 @@
   },
   "src/engine/runner.py": {
     "testing": "tests/unit/engine/test_runner.py"
+  },
+  "src/validation/walk_forward.py": {
+    "architecture": "docs/architecture/07_validation_and_promotion.md",
+    "testing": "tests/unit/validation/test_walk_forward.py"
   }
 }
