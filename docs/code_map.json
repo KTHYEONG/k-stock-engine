@@ -169,5 +169,8 @@
   "src/data/streaming_normalization.py": {
     "architecture": "docs/next.md",
     "testing": "tests/unit/data/test_streaming_stock_normalization.py"
+  },
+  "src/integrations/dart/xbrl.py": {
+    "testing": "tests/unit/integrations/dart/test_xbrl_standard.py"
   }
 }
