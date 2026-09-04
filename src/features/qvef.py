@@ -170,7 +170,7 @@ def build_qvef_features(
         if len(cands) != 1:
             continue
         chosen = cands[0]
-        sector = chosen.get("sector")
+        sector = chosen.get("sector") or "__GLOBAL__"
         company_id = chosen.get("company_id")
         if sector is None or company_id is None:
             continue
