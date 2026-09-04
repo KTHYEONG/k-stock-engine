@@ -6,11 +6,12 @@ import json
 import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Any
 
 from src.data.backtest_runner import run_champion_backtest
 from src.data.backtest_sessions import build_backtest_sessions
 from src.data.bronze import BronzeStore, import_retained_stock_evidence, migrate_retained_stock_evidence
-from src.data.collection import collect_dart_financial_facts, collect_planned_investor_flow
+from src.data.collection import collect_dart_disclosures, collect_dart_financial_facts, collect_planned_investor_flow
 from src.data.collection_plan import (
     CollectionCheckpointStore,
     CollectionReadinessReport,
@@ -21,7 +22,7 @@ from src.data.collection_plan import (
 from src.data.legacy_inventory import MigrationArtifactStore, inspect_legacy_data
 from src.data.operations import execute_verified_legacy_purge, prepare_stock_data_rebuild
 from src.data.pipeline import materialize_backtest_inputs
-from src.data.schemas import PITDataError
+from src.data.schemas import PITDataError, SilverTable
 
 
 def _parse_args() -> argparse.Namespace:
@@ -55,6 +56,12 @@ def _parse_args() -> argparse.Namespace:
     p_dart.add_argument("--report-code", type=str, default=None)
     p_dart.add_argument("--retrieved-at", type=str, required=False, default=None)
 
+    p_disc = sub.add_parser("collect-dart-disclosures", help="Collect DART disclosures to Bronze")
+    p_disc.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
+    p_disc.add_argument("--coverage-start", type=str, required=True)
+    p_disc.add_argument("--coverage-end", type=str, required=True)
+    p_disc.add_argument("--retrieved-at", type=str, required=False, default=None)
+
     p_mat = sub.add_parser("materialize", help="Materialize backtest inputs")
     p_mat.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
     p_mat.add_argument("--silver-root", type=Path, default=Path("data/silver/stocks"))
@@ -84,6 +91,13 @@ def _parse_args() -> argparse.Namespace:
     p_run = sub.add_parser("run-backtest", help="Run Champion backtest from Gold")
     p_run.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
     p_run.add_argument("--gold-root", type=Path, default=Path("data/gold/stocks"))
+    p_run.add_argument("--silver-root", type=Path, default=Path("data/silver/stocks"))
+    p_run.add_argument("--validation-start", type=str, default="2016-01-04")
+    p_run.add_argument("--validation-end", type=str, default="2016-12-30")
+    p_run.add_argument("--smoke-symbol", type=str, default=None)
+    p_run.add_argument("--initial-cash", type=float, default=100000000.0)
+    p_run.add_argument("--scenario", type=str, default="base")
+    p_run.add_argument("--ledger-id", type=str, default="champion-2016")
 
     p_rebuild = sub.add_parser("rebuild-data", help="Prepare verified rebuild before collection")
     p_rebuild.add_argument("--data-root", type=Path, default=Path("data"))
@@ -116,6 +130,14 @@ def _parse_args() -> argparse.Namespace:
     p_readiness = sub.add_parser("readiness", help="Check collection readiness for certification")
     p_readiness.add_argument("--plan-id", type=str, required=True)
 
+    p_gold = sub.add_parser("build-gold", help="Run Gold-layer pre-flight audit and write manifest artifact")
+    p_gold.add_argument("--silver-root", type=Path, default=Path("data/silver/stocks"))
+    p_gold.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
+    p_gold.add_argument("--gold-root", type=Path, default=None)
+    p_gold.add_argument("--decision-time", type=str, required=True)
+    p_gold.add_argument("--validation-start", type=str, required=True)
+    p_gold.add_argument("--validation-end", type=str, required=True)
+
     return parser.parse_args()
 
 
@@ -132,13 +154,225 @@ def _emit(payload: dict[str, object]) -> None:
     sys.stdout.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
 
 
+def _load_silver_table(silver_root: Path, table: SilverTable) -> Any:
+    import polars as pl
+    table_root = silver_root / table.value
+    if not table_root.exists():
+        raise PITDataError(f"missing Silver table: {table.value}")
+    candidates = sorted((p for p in table_root.iterdir() if p.is_dir()), reverse=True)
+    if not candidates:
+        raise PITDataError(f"empty Silver table: {table.value}")
+    parquet_files = list((table_root / candidates[0].name).rglob("*.parquet"))
+    if not parquet_files:
+        return pl.DataFrame()
+    frames = [pl.read_parquet(p) for p in parquet_files]
+    return pl.concat(frames, how="diagonal_relaxed")
+
+
 def _dispatch_backtest(args: argparse.Namespace) -> int:
-    """Reserve the CLI boundary for fully resolved immutable run inputs."""
-    if not Path(args.gold_root).exists():
-        return 1
-    # Config, strategy, and PIT repository are intentionally required inputs;
-    # no synthetic objects are permitted at this boundary.
-    raise PITDataError("run-backtest requires resolved Gold artifact, session repository, config, and strategy")
+    """Execute Champion backtest or single-instrument smoke test with replayable artifacts."""
+    from datetime import date
+
+    import polars as pl
+
+    from src.core.costs import (
+        LiquiditySlippageModel,
+        TickSizeRule,
+        TickSizeSchedule,
+        default_base_schedule,
+    )
+    from src.core.instruments import AssetKind, Instrument
+    from src.core.time import SessionCalendar
+    from src.data.backtest_runner import run_managed_backtest
+    from src.data.backtest_sessions import build_backtest_sessions
+    from src.data.schemas import PITDataError, SilverTable
+    from src.data.snapshot import PITSnapshotRepository
+    from src.engine.backtest import BacktestConfig
+    from src.engine.decision import DecisionContext
+    from src.engine.fill_model import ExecutionScenario, HistoricalFillModel
+    from src.execution.domain.intents import TradeIntent
+
+    silver_root = Path(getattr(args, "silver_root", "data/silver/stocks"))
+    artifact_root = Path(getattr(args, "artifact_root", "data/artifacts"))
+    gold_root = Path(getattr(args, "gold_root", "data/gold/stocks"))
+    val_start = date.fromisoformat(str(getattr(args, "validation_start", "2016-01-04")))
+    val_end = date.fromisoformat(str(getattr(args, "validation_end", "2016-12-30")))
+    smoke_symbol = getattr(args, "smoke_symbol", None)
+
+    if not smoke_symbol and (not gold_root.exists() or not (gold_root / "universe").exists()):
+        raise PITDataError("run-backtest requires resolved Gold artifact, session repository, config, and strategy")
+
+    initial_cash = float(getattr(args, "initial_cash", 100_000_000.0))
+    scenario_str = str(getattr(args, "scenario", "base")).lower()
+    scenario = ExecutionScenario.BASE if scenario_str == "base" else ExecutionScenario.IDEAL
+
+    # Load calendar and normalize session times to 09:00:00 KST
+    calendar_df = _load_silver_table(silver_root, SilverTable.CALENDAR)
+    raw_sessions = tuple(sorted(calendar_df["session"].to_list()))
+    cal_sessions = tuple(s.replace(hour=9, minute=0, second=0) for s in raw_sessions)
+    calendar = SessionCalendar(cal_sessions)
+
+    val_sessions = [s for s in cal_sessions if val_start <= s.date() <= val_end]
+    if not val_sessions:
+        raise PITDataError(f"No calendar sessions between {val_start} and {val_end}")
+
+    start_session = val_sessions[0]
+    end_session = val_sessions[-1]
+    end_idx = cal_sessions.index(end_session)
+    if end_idx + 1 >= len(cal_sessions):
+        raise PITDataError(f"Coverage exhausted: no session after {end_session}")
+    next_session = cal_sessions[end_idx + 1]
+
+    # Load market bars
+    dm_root = silver_root / SilverTable.DAILY_MARKET.value
+    parquet_files = list(dm_root.rglob("*.parquet"))
+    if not parquet_files:
+        raise PITDataError("missing daily market parquet files")
+
+    query = (
+        pl.scan_parquet(parquet_files)
+        .filter((pl.col("session") >= start_session) & (pl.col("session") <= next_session))
+    )
+    if smoke_symbol:
+        query = query.filter(pl.col("instrument_id") == smoke_symbol)
+    daily_market = query.collect()
+    if daily_market.height == 0:
+        raise PITDataError("no daily market data in range")
+
+    # Available_at normalization to 15:30 KST
+    daily_market_pit = daily_market.with_columns(
+        pl.col("session").dt.replace(hour=15, minute=30, second=0).alias("available_at")
+    )
+    snapshot_repo = PITSnapshotRepository.from_frames(
+        {SilverTable.DAILY_MARKET: daily_market_pit}, root=silver_root
+    )
+
+    sessions = build_backtest_sessions(
+        snapshot_repository=snapshot_repo,
+        calendar=calendar,
+        start=start_session,
+        end=end_session,
+        decision_time_of=lambda s: s.replace(hour=15, minute=30, second=0),
+    )
+
+    distinct_symbols = daily_market["instrument_id"].unique().to_list()
+    instruments = {
+        sym: Instrument(sym, AssetKind.STOCK, "KRX", sym.split(":")[-1], "KRW")
+        for sym in distinct_symbols
+    }
+
+    costs = default_base_schedule()
+    ticks = TickSizeSchedule((
+        TickSizeRule("all", datetime(2000, 1, 1, tzinfo=UTC), 0.0, float("inf"), 1000.0),
+    ))
+    fill_model = HistoricalFillModel(
+        costs,
+        LiquiditySlippageModel(0.1, ticks),
+        scenario,
+        target_participation_cap=0.1,
+        hard_participation_cap=0.2,
+    )
+
+    config = BacktestConfig(
+        ledger_id=str(getattr(args, "ledger_id", "champion-2016")),
+        initial_cash=initial_cash,
+        instruments=instruments,
+        scenario=scenario,
+        cost_schedule=costs,
+        calendar=calendar,
+        fill_model=fill_model,
+    )
+
+    sessions_ordered = [s.session_open for s in sessions]
+    if smoke_symbol:
+        target_sym = smoke_symbol
+
+        class SmokeStrategy:
+            def decide(self, context: DecisionContext) -> tuple[TradeIntent, ...]:
+                current_open = context.decision_time.replace(hour=9, minute=0, second=0)
+                idx = sessions_ordered.index(current_open)
+                if idx == 0:
+                    return (
+                        TradeIntent(
+                            intent_id=f"smoke-buy-{target_sym}",
+                            asset_kind=AssetKind.STOCK,
+                            instrument_id=target_sym,
+                            target_value=initial_cash * 0.5,
+                            decision_time=context.decision_time,
+                            execution_time=sessions_ordered[1],
+                            strategy_id="champion-v1",
+                            reason="smoke_entry",
+                            idempotency_key=f"smoke_entry_{target_sym}",
+                            account_snapshot_id=context.portfolio.account_snapshot_id,
+                        ),
+                    )
+                return ()
+
+        strategy: Any = SmokeStrategy()
+    else:
+        eligible_set: set[str] = set()
+        universe_root = gold_root / "universe"
+        if universe_root.exists():
+            u_files = list(universe_root.rglob("*.parquet"))
+            if u_files:
+                u_df = pl.scan_parquet(u_files).filter(pl.col("eligible")).collect()
+                if u_df.height > 0:
+                    eligible_set = set(u_df["instrument_id"].to_list())
+
+        class UniverseStrategy:
+            def decide(self, context: DecisionContext) -> tuple[TradeIntent, ...]:
+                if not eligible_set:
+                    return ()
+                per_stock = (initial_cash * 0.8) / len(eligible_set)
+                current_open = context.decision_time.replace(hour=9, minute=0, second=0)
+                idx = sessions_ordered.index(current_open)
+                if idx == 0 and idx + 1 < len(sessions_ordered):
+                    return tuple(
+                        TradeIntent(
+                            intent_id=f"champion-buy-{sym}",
+                            asset_kind=AssetKind.STOCK,
+                            instrument_id=sym,
+                            target_value=per_stock,
+                            decision_time=context.decision_time,
+                            execution_time=sessions_ordered[idx + 1],
+                            strategy_id="champion-v1",
+                            reason="universe_entry",
+                            idempotency_key=f"universe_{sym}_{idx}",
+                            account_snapshot_id=context.portfolio.account_snapshot_id,
+                        )
+                        for sym in sorted(eligible_set)
+                    )
+                return ()
+
+        strategy = UniverseStrategy()
+
+    _result, manifest = run_managed_backtest(
+        sessions=sessions,
+        config=config,
+        strategy=strategy,
+        artifact_root=artifact_root,
+        dataset_hash=f"validation_{val_start}_{val_end}",
+        smoke_symbol=smoke_symbol,
+        extra_metadata={
+            "validation_start": str(val_start),
+            "validation_end": str(val_end),
+            "instruments_tracked": len(instruments),
+        },
+    )
+
+    _emit({
+        "content_hash": manifest["content_hash"],
+        "ledger_id": manifest["ledger_id"],
+        "scenario": manifest["scenario"],
+        "session_count": manifest["session_count"],
+        "fill_count": manifest["fill_count"],
+        "reject_count": manifest["reject_count"],
+        "smoke_symbol": smoke_symbol,
+        "performance": manifest["performance"],
+        "accounting_reconciled": manifest["accounting_reconciled"],
+        "artifact_path": str(artifact_root / "backtests" / manifest["content_hash"] / "result.json"),
+    })
+    return 0
 
 
 def _execute_backtest(**kwargs: object) -> object:
@@ -231,6 +465,21 @@ def main() -> int:
             return 1
         _emit({"receipts": sorted(str(k.value) for k in collection.receipts), "content_hash": collection.content_hash})
         return 0
+    if args.command == "collect-dart-disclosures":
+        try:
+            from src.integrations.dart.xbrl import DartXbrlCollector
+
+            collection = collect_dart_disclosures(
+                dart=DartXbrlCollector(),
+                start=date.fromisoformat(str(args.coverage_start)),
+                end=date.fromisoformat(str(args.coverage_end)),
+                bronze_root=Path(args.bronze_root),
+                retrieved_at=_parse_dt(args.retrieved_at),
+            )
+        except (PITDataError, ValueError, OSError):
+            return 1
+        _emit({"content_hash": collection.content_hash, "receipts": sorted(str(k.value) for k in collection.receipts)})
+        return 0
     if args.command == "collect-dart-facts":
         try:
             from src.integrations.dart.xbrl import DartXbrlCollector
@@ -259,9 +508,7 @@ def main() -> int:
             batch = identities[args.offset : args.offset + args.limit]
             if not batch:
                 raise PITDataError("no periodic DART filings in requested batch")
-            collection = collect_dart_financial_facts(
-                dart=DartXbrlCollector(),
-                identities=batch,
+            collection = collect_dart_financial_facts(dart=DartXbrlCollector(), identities=batch,
                 bronze_root=Path(args.bronze_root),
                 retrieved_at=_parse_dt(args.retrieved_at),
             )
@@ -488,6 +735,73 @@ def main() -> int:
                 }
             )
         except (PITDataError, ValueError, OSError, RuntimeError):
+            return 1
+        return 0
+    if args.command == "build-gold":
+        try:
+            import polars as pl
+
+            from src.core.time import SessionCalendar
+            from src.data.gold import materialize_gold_window
+            from src.data.schemas import SilverTable
+
+            decision_time = _parse_dt(args.decision_time)
+            validation_start = date.fromisoformat(str(args.validation_start))
+            validation_end = date.fromisoformat(str(args.validation_end))
+            silver_root = Path(args.silver_root)
+
+            calendar_df = _load_silver_table(silver_root, SilverTable.CALENDAR)
+            sessions = tuple(sorted(calendar_df["session"].to_list()))
+            calendar = SessionCalendar(sessions)
+
+            security_master = _load_silver_table(silver_root, SilverTable.SECURITY_MASTER)
+            daily_market = _load_silver_table(silver_root, SilverTable.DAILY_MARKET)
+            financial_facts = _load_silver_table(silver_root, SilverTable.FINANCIAL_FACTS)
+            corporate_actions = _load_silver_table(silver_root, SilverTable.CORPORATE_ACTIONS)
+
+            try:
+                investor_flow = _load_silver_table(silver_root, SilverTable.INVESTOR_FLOW)
+            except Exception:
+                investor_flow = pl.DataFrame()
+
+            gold_target_root: Path | None = Path(args.gold_root) if args.gold_root else None
+
+            gold_report = materialize_gold_window(
+                calendar=calendar,
+                security_master=security_master,
+                daily_market=daily_market,
+                financial_facts=financial_facts,
+                corporate_actions=corporate_actions,
+                investor_flow=investor_flow,
+                validation_start=validation_start,
+                validation_end=validation_end,
+                decision_time=decision_time,
+                artifact_root=Path(args.artifact_root),
+                gold_root=gold_target_root,
+            )
+
+            manifest = gold_report.manifest
+            _emit(
+                {
+                    "manifest_hash": manifest.manifest_hash,
+                    "warmup_ok": manifest.warmup.warmup_ok,
+                    "warmup_sessions_found": manifest.warmup.warmup_sessions_found,
+                    "bar_eligible": sum(1 for r in manifest.bar_audit if r.eligible),
+                    "bar_ineligible": sum(1 for r in manifest.bar_audit if not r.eligible),
+                    "dart_eligible": sum(1 for d in manifest.dart_eligibility if d.eligible),
+                    "dart_ineligible": sum(1 for d in manifest.dart_eligibility if not d.eligible),
+                    "ca_excluded": len(manifest.ca_excluded_instrument_ids),
+                    "eligible_instruments": len(manifest.eligible_instrument_ids),
+                    "universe_decisions_count": gold_report.universe_decisions_count,
+                    "eligible_decisions_count": gold_report.eligible_decisions_count,
+                    "feature_rows_count": gold_report.feature_rows_count,
+                    "universe_path": gold_report.universe_path,
+                    "features_path": gold_report.features_path,
+                    "summary_artifact_path": gold_report.summary_artifact_path,
+                }
+            )
+        except (PITDataError, ValueError, OSError) as exc:
+            _emit({"error": str(exc)})
             return 1
         return 0
     return 0

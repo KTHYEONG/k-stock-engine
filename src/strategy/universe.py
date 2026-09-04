@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import math
+import zoneinfo
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,7 @@ from src.core.datasets import (
     make_manifest,
 )
 from src.core.instruments import AssetKind
-from src.core.time import SessionCalendar
+from src.core.time import KRX_TZ, SessionCalendar
 from src.storage.parquet_datasets import ParquetDatasetStore, canonical_content_hash
 
 
@@ -40,8 +41,17 @@ class ExclusionReason(StrEnum):
     LIQUIDITY_BELOW_THRESHOLD = "liquidity_below_threshold"
     MISSING_MASTER = "missing_master"
     MISSING_SECTOR = "missing_sector"
+    NO_VALID_CORPORATE_ACTION = "no_valid_corporate_action"
     NON_COMMON_SHARE_CLASS = "non_common_share_class"
     NOT_LISTED = "not_listed"
+
+
+def _session_date(value: Any) -> date | None:
+    if isinstance(value, datetime):
+        return value.astimezone(KRX_TZ).date() if value.tzinfo is not None else value.date()
+    if isinstance(value, date):
+        return value
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +95,10 @@ def _pit_filter(frame: pl.DataFrame, decision_time: datetime) -> pl.DataFrame:
         return frame.clear()
     # Filter rows where available_at <= decision_time
     try:
+        col_tz = getattr(frame["available_at"].dtype, "time_zone", None)
+        if col_tz is not None and decision_time.tzinfo is not None:
+            target_tz = zoneinfo.ZoneInfo(col_tz)
+            return frame.filter(pl.col("available_at") <= decision_time.astimezone(target_tz))
         return frame.filter(pl.col("available_at") <= decision_time)
     except Exception:
         # Fallback python filter if dtype mismatch
@@ -102,6 +116,7 @@ def build_historical_universe(
     calendar: SessionCalendar,
     security_master: pl.DataFrame,
     daily_market: pl.DataFrame,
+    corporate_actions: pl.DataFrame | None = None,
     policy: UniversePolicy = UniversePolicy(),  # noqa: B008
 ) -> tuple[UniverseDecision, ...]:
     _validate_build_inputs(
@@ -174,7 +189,13 @@ def build_historical_universe(
             if vf is None:
                 continue
             try:
-                if vf <= decision_session and (vt is None or decision_session <= vt):
+                vf_d = _session_date(vf)
+                ds_d = _session_date(decision_session)
+                vt_d = _session_date(vt)
+                if vf_d is not None and ds_d is not None:
+                    if vf_d <= ds_d and (vt_d is None or ds_d <= vt_d):
+                        active.append(r)
+                elif vf <= decision_session and (vt is None or decision_session <= vt):
                     active.append(r)
             except TypeError:
                 continue
@@ -228,7 +249,10 @@ def build_historical_universe(
                 listing_age = None
             else:
                 try:
-                    if listing_date > decision_session:
+                    ld_d = _session_date(listing_date)
+                    ds_d = _session_date(decision_session)
+                    is_after = ld_d > ds_d if (ld_d is not None and ds_d is not None) else listing_date > decision_session
+                    if is_after:
                         reasons.append(ExclusionReason.NOT_LISTED)
                         listing_age = 0
                         if listing_age < policy.minimum_listing_sessions:  # noqa: SIM102
@@ -238,7 +262,12 @@ def build_historical_universe(
                         lo = None
                         for idx, s in enumerate(calendar.sessions):
                             try:
-                                if s >= listing_date:
+                                s_d = _session_date(s)
+                                if ld_d is not None and s_d is not None:
+                                    if s_d >= ld_d:
+                                        lo = idx
+                                        break
+                                elif s >= listing_date:
                                     lo = idx
                                     break
                             except TypeError:
@@ -256,7 +285,10 @@ def build_historical_universe(
             # Delisting
             if delisting_date is not None and not (isinstance(delisting_date, float) and math.isnan(delisting_date)):
                 try:
-                    if delisting_date <= decision_session:  # noqa: SIM102
+                    dd_d = _session_date(delisting_date)
+                    ds_d = _session_date(decision_session)
+                    is_delisted = dd_d <= ds_d if (dd_d is not None and ds_d is not None) else delisting_date <= decision_session
+                    if is_delisted:  # noqa: SIM102
                         if ExclusionReason.DELISTED not in reasons:
                             reasons.append(ExclusionReason.DELISTED)
                 except TypeError:
@@ -271,6 +303,9 @@ def build_historical_universe(
             median_val = None
         else:
             expected_sessions = calendar.sessions[hi_idx - window + 1 : hi_idx + 1]
+            date_to_expected = {
+                _session_date(s): s for s in expected_sessions if _session_date(s) is not None
+            }
             # Build session -> values for this instrument
             daily_rows = daily_by_instrument.get(instrument_id, [])
             # Map expected session to list
@@ -278,7 +313,8 @@ def build_historical_universe(
             invalid_liquidity = False
             for r in daily_rows:
                 sess = r.get("session")
-                if sess not in sess_to_vals:
+                can_sess = date_to_expected.get(_session_date(sess)) if sess is not None else None
+                if can_sess is None:
                     continue
                 tv = r.get("trading_value")
                 try:
@@ -289,7 +325,7 @@ def build_historical_universe(
                     if not math.isfinite(tv_f) or tv_f < 0:
                         invalid_liquidity = True
                         break
-                    sess_to_vals[sess].append(tv_f)
+                    sess_to_vals[can_sess].append(tv_f)
                 except Exception:
                     invalid_liquidity = True
                     break
@@ -316,6 +352,15 @@ def build_historical_universe(
                     median_val = (float(sorted_vals[n // 2 - 1]) + float(sorted_vals[n // 2])) / 2.0
                 if median_val < policy.minimum_median_trading_value_krw:
                     reasons.append(ExclusionReason.LIQUIDITY_BELOW_THRESHOLD)
+
+        # Corporate action check if corporate_actions table is provided
+        if corporate_actions is not None and not corporate_actions.is_empty():
+            from src.data.gold import exclude_sentinel_corporate_actions
+            ca_excluded = exclude_sentinel_corporate_actions(
+                corporate_actions, frozenset([instrument_id])
+            )
+            if instrument_id in ca_excluded:
+                reasons.append(ExclusionReason.NO_VALID_CORPORATE_ACTION)
 
         # Deduplicate and sort reasons for stability
         unique_reasons = sorted(set(reasons), key=lambda r: r.value)
