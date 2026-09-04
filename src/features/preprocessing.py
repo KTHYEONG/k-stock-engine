@@ -84,10 +84,12 @@ def normalize_component_scores(rows: pl.DataFrame, *, policy: QvefFeaturePolicy)
                 fv = upper
         winsorized.append(float(fv))
 
-    # Group by sector
+    # If any industry classification is missing, use one global cohort. This
+    # preserves deterministic scores without inventing a sector label.
+    has_missing_sector = any(not str(r.get("sector") or "").strip() or str(r.get("sector")) == "__GLOBAL__" for r in records)
     sector_to_indices: dict[str, list[int]] = {}
     for idx, r in enumerate(records):
-        sec = str(r.get("sector"))
+        sec = "__GLOBAL__" if has_missing_sector else str(r.get("sector"))
         sector_to_indices.setdefault(sec, []).append(idx)
 
     normalized: list[float | None] = [None] * len(records)

@@ -215,10 +215,10 @@ def build_historical_universe(
             if share_class != "common":
                 reasons.append(ExclusionReason.NON_COMMON_SHARE_CLASS)
             # Sector
-            if sector is None or (isinstance(sector, float) and math.isnan(sector)):
-                reasons.append(ExclusionReason.MISSING_SECTOR)
-            elif sector == "Financials":
+            if sector == "Financials":
                 reasons.append(ExclusionReason.FINANCIAL_SECTOR)
+            # Sector is optional for universe eligibility; QVEF handles an
+            # absent industry classification with a global cross-section.
             # Status
             if status != "listed":
                 reasons.append(ExclusionReason.INELIGIBLE_STATUS)
