@@ -10,20 +10,18 @@ from pathlib import Path
 from src.data.backtest_runner import run_champion_backtest
 from src.data.backtest_sessions import build_backtest_sessions
 from src.data.bronze import BronzeStore, import_retained_stock_evidence, migrate_retained_stock_evidence
-from src.data.collection import ChampionCollectionRequest, CollectionArtifact, collect_champion_evidence
+from src.data.collection import collect_dart_financial_facts, collect_planned_investor_flow
 from src.data.collection_plan import (
     CollectionCheckpointStore,
     CollectionReadinessReport,
     build_historical_collection_plan,
+    build_historical_collection_plan_from_bronze,
     load_collection_plan,
 )
 from src.data.legacy_inventory import MigrationArtifactStore, inspect_legacy_data
-from src.data.normalization import normalize_stock_evidence
 from src.data.operations import execute_verified_legacy_purge, prepare_stock_data_rebuild
 from src.data.pipeline import materialize_backtest_inputs
 from src.data.schemas import PITDataError
-from src.integrations.dart.client import DartApiClient
-from src.integrations.krx.client import KrxApiClient
 
 
 def _parse_args() -> argparse.Namespace:
@@ -41,10 +39,21 @@ def _parse_args() -> argparse.Namespace:
 
     p_col = sub.add_parser("collect", help="Collect missing champion evidence")
     p_col.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
-    p_col.add_argument("--coverage-start", type=str, required=True)
-    p_col.add_argument("--coverage-end", type=str, required=True)
     p_col.add_argument("--retrieved-at", type=str, required=False, default=None)
-    p_col.add_argument("--plan-id", type=str, required=False, default=None)
+    p_col.add_argument("--plan-id", type=str, required=True)
+    p_col.add_argument("--checkpoint-root", type=Path, default=Path("data/artifacts/collection-checkpoints"))
+
+    p_dart = sub.add_parser("collect-dart-facts", help="Collect periodic OpenDART full statements from retained disclosures")
+    p_dart.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
+    p_dart.add_argument("--coverage-start", type=str, required=True)
+    p_dart.add_argument("--coverage-end", type=str, required=True)
+    p_dart.add_argument("--offset", type=int, default=0)
+    p_dart.add_argument("--limit", type=int, default=20)
+    p_dart.add_argument("--corp-code", type=str, default=None)
+    p_dart.add_argument("--filing-id", type=str, default=None)
+    p_dart.add_argument("--biz-year", type=str, default=None)
+    p_dart.add_argument("--report-code", type=str, default=None)
+    p_dart.add_argument("--retrieved-at", type=str, required=False, default=None)
 
     p_mat = sub.add_parser("materialize", help="Materialize backtest inputs")
     p_mat.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
@@ -55,7 +64,10 @@ def _parse_args() -> argparse.Namespace:
 
     p_norm = sub.add_parser("normalize", help="Validate/normalize Bronze evidence")
     p_norm.add_argument("--bronze-root", type=Path, required=True)
+    p_norm.add_argument("--silver-root", type=Path, default=Path("data/silver/stocks"))
+    p_norm.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
     p_norm.add_argument("--decision-time", type=str, required=True)
+    p_norm.add_argument("--batch-size", type=int, default=50000)
 
     p_purge = sub.add_parser("purge-legacy", help="Purge legacy outputs after verification")
     p_purge.add_argument("--data-root", type=Path, default=Path("data"))
@@ -88,15 +100,18 @@ def _parse_args() -> argparse.Namespace:
     p_kis_probe.add_argument("--session", type=str, required=True)
 
     p_plan = sub.add_parser("plan", help="Build immutable historical collection plan")
+    p_plan.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
+    p_plan.add_argument("--artifact-root", type=Path, default=Path("data/artifacts/collection-plans"))
     p_plan.add_argument("--coverage-start", type=str, required=True)
     p_plan.add_argument("--coverage-end", type=str, required=True)
-    p_plan.add_argument("--symbols", type=str, required=True)
-    p_plan.add_argument("--sessions", type=str, required=True)
+    p_plan.add_argument("--symbols", type=str, required=False, default=None)
+    p_plan.add_argument("--sessions", type=str, required=False, default=None)
     p_plan.add_argument("--chunk-size", type=int, default=20)
 
     p_resume = sub.add_parser("resume", help="Resume collection from checkpoints")
     p_resume.add_argument("--plan-id", type=str, required=True)
     p_resume.add_argument("--checkpoint-root", type=Path, default=Path("data/artifacts/collection-checkpoints"))
+    p_resume.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
 
     p_readiness = sub.add_parser("readiness", help="Check collection readiness for certification")
     p_readiness.add_argument("--plan-id", type=str, required=True)
@@ -129,6 +144,36 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
 def _execute_backtest(**kwargs: object) -> object:
     """Typed adapter used once CLI input loaders provide concrete objects."""
     return run_champion_backtest(**kwargs)  # type: ignore[arg-type]
+
+
+def _row_counts_for_report(artifact_root: Path) -> dict[str, int]:
+    summary_path = Path(artifact_root) / "streaming_report.json"
+    try:
+        raw = json.loads(summary_path.read_text(encoding="utf-8"))
+        counts = raw.get("row_counts", {})
+        return {str(k): int(v) for k, v in dict(counts).items()}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def normalize(
+    bronze_root: Path,
+    silver_root: Path,
+    artifact_root: Path,
+    decision_time: datetime,
+    batch_size: int = 50000,
+) -> dict[str, object]:
+    """Streaming normalize entry point used by the CLI normalize command."""
+    from src.data.streaming_normalization import stream_normalize_stock_evidence
+
+    report = stream_normalize_stock_evidence(
+        bronze_root=Path(bronze_root),
+        silver_root=Path(silver_root),
+        artifact_root=Path(artifact_root),
+        decision_time=decision_time,
+        batch_size=int(batch_size),
+    )
+    return {"report_hash": report.report_hash, "source_hashes": dict(report.source_hashes)}
 
 
 def _build_sessions(**kwargs: object) -> object:
@@ -170,65 +215,59 @@ def main() -> int:
         )
         return 0
     if args.command == "collect":
-        if not getattr(args, "plan_id", None):
-            return 1
         try:
-            load_collection_plan(str(args.plan_id))
-            try:
-                krx_client = KrxApiClient()
-                dart_client = DartApiClient()
-            except ValueError:
-                return 1
+            from src.integrations.kis.investor_flow import KisInvestorFlowCollector
 
-            class _KrxAdapter:
-                def __init__(self, client: KrxApiClient) -> None:
-                    self._client = client
-
-                def fetch_market_snapshot(self, as_of: date) -> dict[str, object]:
-                    return {"records": self._client.fetch_trade_records(as_of)}
-
-                def fetch_flow_snapshot(self, as_of: date) -> dict[str, object]:
-                    raise PITDataError("KRX investor-flow endpoint is not configured")
-
-                def fetch_daily_market(self, start: date, end: date) -> tuple[dict[str, object], ...]:
-                    return ({"records": self._client.fetch_trade_records(end)},)
-
-                def fetch_investor_flow(self, start: date, end: date) -> tuple[dict[str, object], ...]:
-                    raise PITDataError("KRX investor flow endpoint is not configured")
-
-                def fetch_master_lineage(self, start: date, end: date) -> tuple[dict[str, object], ...]:
-                    return ({"records": self._client.fetch_master_records(end)},)
-
-                def fetch_status_and_actions(self, start: date, end: date) -> tuple[dict[str, object], ...]:
-                    return ({"records": []},)
-
-            class _DartAdapter:
-                def __init__(self, client: DartApiClient) -> None:
-                    self._client = client
-
-                def fetch_fact_snapshot(self, start: date, end: date) -> dict[str, object]:
-                    return {"records": self._client.list_disclosures(start, end)}
-
-                def fetch_disclosures(self, start: date, end: date) -> tuple[dict[str, object], ...]:
-                    return ({"records": self._client.list_disclosures(start, end)},)
-
-                def fetch_xbrl_facts(self, filing_ids: tuple[str, ...]) -> tuple[dict[str, object], ...]:
-                    raise PITDataError("DART XBRL facts endpoint is not configured")
-
-            request = ChampionCollectionRequest(
+            plan = load_collection_plan(str(args.plan_id))
+            collector = KisInvestorFlowCollector(tuple(sorted({chunk.symbol for chunk in plan.chunks})))
+            collection = collect_planned_investor_flow(
+                plan=plan,
+                kis=collector,
                 bronze_root=Path(args.bronze_root),
-                coverage_start=date.fromisoformat(str(args.coverage_start)),
-                coverage_end=date.fromisoformat(str(args.coverage_end)),
                 retrieved_at=_parse_dt(args.retrieved_at),
+                checkpoint_store=CollectionCheckpointStore(Path(args.checkpoint_root)),
             )
-            collection = collect_champion_evidence(
-                request, krx=_KrxAdapter(krx_client), dart=_DartAdapter(dart_client)
-            )
-            if not isinstance(collection, CollectionArtifact):
-                raise PITDataError("collection did not produce a Bronze artifact")
         except (PITDataError, ValueError, OSError):
             return 1
         _emit({"receipts": sorted(str(k.value) for k in collection.receipts), "content_hash": collection.content_hash})
+        return 0
+    if args.command == "collect-dart-facts":
+        try:
+            from src.integrations.dart.xbrl import DartXbrlCollector
+
+            identities: tuple[dict[str, str], ...]
+            if any(getattr(args, name) for name in ("corp_code", "filing_id", "biz_year", "report_code")):
+                if not all(getattr(args, name) for name in ("corp_code", "filing_id", "biz_year", "report_code")):
+                    raise PITDataError("corp-code, filing-id, biz-year, and report-code must be supplied together")
+                identities = (
+                    {
+                        "corp_code": str(args.corp_code),
+                        "filing_id": str(args.filing_id),
+                        "biz_year": str(args.biz_year),
+                        "reprt_code": str(args.report_code),
+                        "fs_div": "CFS",
+                    },
+                )
+            else:
+                identities = DartXbrlCollector.filing_identities_from_bronze(
+                    Path(args.bronze_root),
+                    start=date.fromisoformat(str(args.coverage_start)),
+                    end=date.fromisoformat(str(args.coverage_end)),
+                )
+            if args.offset < 0 or args.limit < 1:
+                raise PITDataError("offset must be nonnegative and limit must be positive")
+            batch = identities[args.offset : args.offset + args.limit]
+            if not batch:
+                raise PITDataError("no periodic DART filings in requested batch")
+            collection = collect_dart_financial_facts(
+                dart=DartXbrlCollector(),
+                identities=batch,
+                bronze_root=Path(args.bronze_root),
+                retrieved_at=_parse_dt(args.retrieved_at),
+            )
+        except (PITDataError, ValueError, OSError):
+            return 1
+        _emit({"filings": len(batch), "content_hash": collection.content_hash})
         return 0
     if args.command == "materialize":
         try:
@@ -257,15 +296,21 @@ def main() -> int:
         return 0
     if args.command == "normalize":
         try:
-            from src.data.pipeline import _load_bronze_receipts
+            from src.data.streaming_normalization import stream_normalize_stock_evidence
 
-            receipts = _load_bronze_receipts(Path(args.bronze_root))
-            report_tables, report = normalize_stock_evidence(
-                receipts, decision_time=_parse_dt(args.decision_time)
+            report = stream_normalize_stock_evidence(
+                bronze_root=Path(args.bronze_root),
+                silver_root=Path(getattr(args, "silver_root", Path("data/silver/stocks"))),
+                artifact_root=Path(getattr(args, "artifact_root", Path("data/artifacts"))),
+                decision_time=_parse_dt(args.decision_time),
+                batch_size=int(getattr(args, "batch_size", 50000)),
+            )
+            row_counts = _row_counts_for_report(
+                Path(getattr(args, "artifact_root", Path("data/artifacts"))),
             )
         except (PITDataError, ValueError, OSError):
             return 1
-        _emit({"tables": sorted(str(k.value) for k in report_tables), "report_hash": report.report_hash})
+        _emit({"report_hash": report.report_hash, "row_counts": row_counts})
         return 0
     if args.command == "purge-legacy":
         # Purge consumes persisted proof only and requires --confirm-purge.
@@ -367,15 +412,33 @@ def main() -> int:
         return 0
     if args.command == "plan":
         try:
-            symbols = tuple(s.strip() for s in str(args.symbols).split(",") if s.strip())
-            session_list = tuple(date.fromisoformat(s.strip()) for s in str(args.sessions).split(",") if s.strip())
-            plan = build_historical_collection_plan(
-                sessions=session_list,
-                universe=tuple({"symbol": s, "is_common_stock": True, "tradable_from": None, "tradable_to": None} for s in symbols),
-                start=date.fromisoformat(str(args.coverage_start)),
-                end=date.fromisoformat(str(args.coverage_end)),
-                chunk_size=int(args.chunk_size),
+            symbols = (
+                tuple(s.strip() for s in str(args.symbols).split(",") if s.strip())
+                if args.symbols
+                else None
             )
+            if args.sessions:
+                session_list = tuple(date.fromisoformat(s.strip()) for s in str(args.sessions).split(",") if s.strip())
+                plan = build_historical_collection_plan(
+                    sessions=session_list,
+                    universe=tuple(
+                        {"symbol": symbol, "is_common_stock": True, "tradable_from": None, "tradable_to": None}
+                        for symbol in symbols or ()
+                    ),
+                    start=date.fromisoformat(str(args.coverage_start)),
+                    end=date.fromisoformat(str(args.coverage_end)),
+                    chunk_size=int(args.chunk_size),
+                    artifact_root=Path(args.artifact_root),
+                )
+            else:
+                plan = build_historical_collection_plan_from_bronze(
+                    bronze_root=Path(args.bronze_root),
+                    start=date.fromisoformat(str(args.coverage_start)),
+                    end=date.fromisoformat(str(args.coverage_end)),
+                    chunk_size=int(args.chunk_size),
+                    symbols=symbols,
+                    artifact_root=Path(args.artifact_root),
+                )
         except (PITDataError, ValueError, OSError):
             return 1
         _emit({"plan_id": plan.plan_id, "chunks": len(plan.chunks)})
@@ -384,7 +447,13 @@ def main() -> int:
         try:
             resume_plan = load_collection_plan(str(args.plan_id))
             checkpoint_store = CollectionCheckpointStore(Path(args.checkpoint_root))
-            pending = [c.chunk_id for c in resume_plan.chunks if checkpoint_store.is_pending(plan_id=resume_plan.plan_id, chunk_id=c.chunk_id, receipt_digest="")]
+            pending = [
+                chunk.chunk_id
+                for chunk in resume_plan.chunks
+                if not checkpoint_store.has_verified_receipt(
+                    plan=resume_plan, chunk=chunk, bronze_root=Path(args.bronze_root)
+                )
+            ]
             _emit({"plan_id": resume_plan.plan_id, "pending": pending})
         except (PITDataError, ValueError, OSError):
             return 1
