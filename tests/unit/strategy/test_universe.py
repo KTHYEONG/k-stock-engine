@@ -79,7 +79,7 @@ def test_build_historical_universe_reason_codes_asset_status_and_liquidity_failu
     assert ExclusionReason.NON_COMMON_SHARE_CLASS in reasons['KRX:ETF']
     assert ExclusionReason.FINANCIAL_SECTOR in reasons['KRX:FIN']
     assert ExclusionReason.INELIGIBLE_STATUS in reasons['KRX:SUSP']
-    assert ExclusionReason.MISSING_SECTOR in reasons['KRX:NOSECTOR']
+    assert ExclusionReason.MISSING_SECTOR not in reasons['KRX:NOSECTOR']
     assert ExclusionReason.INSUFFICIENT_LIQUIDITY_HISTORY in reasons['KRX:SHORT']
     assert ExclusionReason.LIQUIDITY_BELOW_THRESHOLD in reasons['KRX:ILLIQUID']
 
@@ -114,3 +114,9 @@ def test_build_historical_universe_missing_availability_fails_closed() -> None:
 
     assert decisions[0].eligible is False
     assert ExclusionReason.MISSING_MASTER in decisions[0].exclusion_reasons
+
+
+def test_sector_optional_universe_remains_eligible() -> None:
+    from src.strategy.universe import ExclusionReason
+
+    assert ExclusionReason.MISSING_SECTOR.value == "missing_sector"
