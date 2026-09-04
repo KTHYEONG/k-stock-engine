@@ -31,6 +31,7 @@ _REPORT_CODE_BY_KIND = {
     "분기보고서": None,
 }
 _PERIOD = re.compile(r"\((\d{4})\.(\d{2})\)")
+_REPRT_QUARTER = {"11013": "Q1", "11012": "Q2", "11014": "Q3", "11011": "Q4"}
 
 
 class DartXbrlCollector:
@@ -75,60 +76,61 @@ class DartXbrlCollector:
     ) -> tuple[dict[str, str], ...]:
         """Select only periodic financial filings with complete OpenDART account identity."""
         paths = sorted((Path(bronze_root) / "disclosures").glob("*/payload.json"))
-        if len(paths) != 1:
+        if not paths:
             raise PITDataError("expected exactly one retained disclosure Bronze receipt")
-        try:
-            payload = json.loads(paths[0].read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise PITDataError("retained disclosure Bronze receipt is unreadable") from exc
-        records = payload.get("records") if isinstance(payload, dict) else None
-        if not isinstance(records, list):
-            raise PITDataError("retained disclosure Bronze receipt has invalid schema")
         identities: list[dict[str, str]] = []
-        for record in records:
-            if not isinstance(record, dict):
-                continue
-            receipt_day = str(record.get("rcept_dt") or "").strip()
-            if len(receipt_day) != 8 or not receipt_day.isdigit():
-                continue
-            receipt_date = date(int(receipt_day[:4]), int(receipt_day[4:6]), int(receipt_day[6:]))
-            if not start <= receipt_date <= end:
-                continue
-            name = str(record.get("report_nm") or "")
-            matched = _PERIOD.search(name)
-            corp_code = str(record.get("corp_code") or "").strip()
-            filing_id = str(record.get("rcept_no") or "").strip()
-            if not matched or not corp_code or not filing_id:
-                continue
-            year, month = matched.groups()
-            if "사업보고서" in name:
-                report_code = _REPORT_CODE_BY_KIND["사업보고서"]
-            elif "반기보고서" in name:
-                report_code = _REPORT_CODE_BY_KIND["반기보고서"]
-            elif "분기보고서" in name and month == "03":
-                report_code = "11013"
-            elif "분기보고서" in name and month == "09":
-                report_code = "11014"
-            else:
-                continue
+        for payload_path in paths:
             try:
-                published_at = date(
-                    int(receipt_day[:4]), int(receipt_day[4:6]), int(receipt_day[6:])
-                ).isoformat()
-            except ValueError:
+                payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise PITDataError("retained disclosure Bronze receipt is unreadable") from exc
+            records = payload.get("records") if isinstance(payload, dict) else None
+            if not isinstance(records, list):
                 continue
-            identities.append(
-                {
-                    "corp_code": corp_code,
-                    "filing_id": filing_id,
-                    "rcept_no": filing_id,
-                    "biz_year": year,
-                    "reprt_code": str(report_code),
-                    "fs_div": "CFS",
-                    "published_at": published_at,
-                    "correction_of": str(record.get("rm") or "").strip(),
-                }
-            )
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                receipt_day = str(record.get("rcept_dt") or "").strip()
+                if len(receipt_day) != 8 or not receipt_day.isdigit():
+                    continue
+                receipt_date = date(int(receipt_day[:4]), int(receipt_day[4:6]), int(receipt_day[6:]))
+                if not start <= receipt_date <= end:
+                    continue
+                name = str(record.get("report_nm") or "")
+                matched = _PERIOD.search(name)
+                corp_code = str(record.get("corp_code") or "").strip()
+                filing_id = str(record.get("rcept_no") or "").strip()
+                if not matched or not corp_code or not filing_id:
+                    continue
+                year, month = matched.groups()
+                if "사업보고서" in name:
+                    report_code = _REPORT_CODE_BY_KIND["사업보고서"]
+                elif "반기보고서" in name:
+                    report_code = _REPORT_CODE_BY_KIND["반기보고서"]
+                elif "분기보고서" in name and month == "03":
+                    report_code = "11013"
+                elif "분기보고서" in name and month == "09":
+                    report_code = "11014"
+                else:
+                    continue
+                try:
+                    published_at = date(
+                        int(receipt_day[:4]), int(receipt_day[4:6]), int(receipt_day[6:])
+                    ).isoformat()
+                except ValueError:
+                    continue
+                identities.append(
+                    {
+                        "corp_code": corp_code,
+                        "filing_id": filing_id,
+                        "rcept_no": filing_id,
+                        "biz_year": year,
+                        "reprt_code": str(report_code),
+                        "fs_div": "CFS",
+                        "published_at": published_at,
+                        "correction_of": str(record.get("rm") or "").strip(),
+                    }
+                )
         unique: dict[tuple[tuple[str, str], ...], dict[str, str]] = {}
         for identity in identities:
             unique[tuple(sorted(identity.items()))] = identity
@@ -291,7 +293,59 @@ class DartXbrlCollector:
                     if fact is None:
                         diagnostics.append(f"unknown_account:{row.get('account_nm') or row.get('account_id')}")
                         continue
-                    canonical.append({**row, "fact": fact})
+                    raw_amount = (
+                        row.get("thstrm_amount")
+                        if row.get("thstrm_amount") not in (None, "")
+                        else row.get("thstrm_add_amount")
+                    )
+                    if raw_amount in (None, ""):
+                        diagnostics.append(f"missing_amount:{fact}")
+                        continue
+                    try:
+                        value = float(str(raw_amount).replace(",", "").strip())
+                    except (TypeError, ValueError):
+                        diagnostics.append(f"non_finite:{fact}")
+                        continue
+                    import math as _math
+
+                    if not _math.isfinite(value):
+                        diagnostics.append(f"non_finite:{fact}")
+                        continue
+                    biz_year = str(
+                        row.get("bsns_year") or identity.get("biz_year") or ""
+                    ).strip()
+                    reprt_code = str(
+                        row.get("reprt_code") or identity.get("reprt_code") or ""
+                    ).strip()
+                    quarter = _REPRT_QUARTER.get(reprt_code, "Q4")
+                    fiscal_period = f"{biz_year}{quarter}" if biz_year else ""
+                    if not fiscal_period:
+                        diagnostics.append(f"missing_fiscal_period:{fact}")
+                        continue
+                    corp_code = str(
+                        row.get("corp_code") or identity.get("corp_code") or ""
+                    ).strip()
+                    filing_id = str(
+                        row.get("rcept_no") or identity.get("filing_id") or ""
+                    ).strip()
+                    fs_div = str(row.get("fs_div") or identity.get("fs_div") or "CFS").strip()
+                    canonical.append(
+                        {
+                            **row,
+                            "company_id": corp_code,
+                            "corp_code": corp_code,
+                            "filing_id": filing_id,
+                            "fiscal_period": fiscal_period,
+                            "fact": fact,
+                            "value": value,
+                            "unit": "KRW",
+                            "consolidated": fs_div == "CFS",
+                            "restatement_id": "r0",
+                            "source_kind": "opendart_standard",
+                            "mapping_version": MAPPING_VERSION,
+                            "raw_document_hash": None,
+                        }
+                    )
                 standardized_hit = {
                     "source_kind": "opendart_standard",
                     "status": "000",
