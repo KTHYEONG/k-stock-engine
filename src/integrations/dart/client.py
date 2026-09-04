@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import os
+import time
 import zipfile
 from collections.abc import Callable
 from datetime import date
@@ -43,39 +44,67 @@ class DartApiClient:
         *,
         request_json: JsonRequest | None = None,
         raw_request_json: JsonRequest | None = None,
+        request_bytes: Callable[[str, dict[str, str]], bytes] | None = None,
     ) -> None:
         self.api_key = api_key or os.getenv("OPENDART_API_KEY")
-        if not self.api_key and request_json is None and raw_request_json is None:
+        if not self.api_key and request_json is None and raw_request_json is None and request_bytes is None:
             raise ValueError("OPENDART_API_KEY not found in environment variables")
         self._request_json = request_json
         self._raw_request_json = raw_request_json
+        self._request_bytes = request_bytes
         self._session = requests.Session()
 
     def _request(self, endpoint: str, params: dict[str, str]) -> dict[str, Any]:
+        request_params = dict(params)
+        if self.api_key and "crtfc_key" not in request_params:
+            request_params["crtfc_key"] = str(self.api_key)
         if self._raw_request_json is not None:
-            payload = self._raw_request_json(endpoint, params)
+            payload = self._raw_request_json(endpoint, request_params)
             if not isinstance(payload, dict):
                 raise DartTerminalError("DART response must be an object")
             return payload
         if self._request_json is not None:
             # When only validated request is supplied, use it directly for transport
             # but still allow status handling in caller.
-            payload = self._request_json(endpoint, params)
+            payload = self._request_json(endpoint, request_params)
             if not isinstance(payload, dict):
                 raise DartTerminalError("DART response must be an object")
             return payload
-        response = self._session.get(f"{self.BASE_URL}/{endpoint}", params=params, timeout=30)
-        if response.status_code != 200:
-            if response.status_code in (408, 429) or 500 <= response.status_code < 600:
-                raise DartRetryableError(f"DART HTTP {response.status_code} for {endpoint}")
-            raise DartTerminalError(f"DART HTTP {response.status_code} for {endpoint}")
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise DartTerminalError(f"DART returned invalid JSON for {endpoint}") from exc
-        if not isinstance(payload, dict):
-            raise DartTerminalError(f"DART response must be an object for {endpoint}")
-        return payload
+        for attempt in range(3):
+            response = self._session.get(f"{self.BASE_URL}/{endpoint}", params=request_params, timeout=30)
+            if response.status_code != 200:
+                if response.status_code in (408, 429) or 500 <= response.status_code < 600:
+                    if attempt < 2:
+                        time.sleep(0.25 * (attempt + 1))
+                        continue
+                    raise DartRetryableError(f"DART HTTP {response.status_code} for {endpoint}")
+                raise DartTerminalError(f"DART HTTP {response.status_code} for {endpoint}")
+            try:
+                payload = response.json()
+            except ValueError:
+                if attempt < 2:
+                    time.sleep(0.25 * (attempt + 1))
+                    continue
+                # Some OpenDART edges return an empty 200 response on a reused
+                # connection; retry once with a fresh connection before failing.
+                try:
+                    fresh = requests.get(
+                        f"{self.BASE_URL}/{endpoint}", params=request_params, timeout=30
+                    )
+                    payload = fresh.json()
+                except (requests.RequestException, ValueError) as fresh_exc:
+                    raise DartRetryableError(
+                        f"DART returned transient invalid JSON for {endpoint}"
+                    ) from fresh_exc
+                if not isinstance(payload, dict):
+                    raise DartTerminalError(
+                        f"DART response must be an object for {endpoint}"
+                    ) from None
+                return payload
+            if not isinstance(payload, dict):
+                raise DartTerminalError(f"DART response must be an object for {endpoint}")
+            return payload
+        raise DartRetryableError(f"DART request exhausted retries for {endpoint}")
 
     def _request_validated(self, endpoint: str, params: dict[str, str]) -> dict[str, Any]:
         payload = self._request(endpoint, params)
@@ -147,6 +176,65 @@ class DartApiClient:
                 }
             )
         return sorted(records, key=lambda x: (x["rcept_dt"], x["rcept_no"]))
+
+    def fetch_multi_accounts(
+        self, corp_codes: tuple[str, ...], *, biz_year: str, reprt_code: str
+    ) -> list[dict[str, Any]]:
+        """Fetch up to 100 companies' major accounts in one official request."""
+        codes = tuple(dict.fromkeys(code.strip() for code in corp_codes if code.strip()))
+        if not 1 <= len(codes) <= 100:
+            raise ValueError("corp_codes must contain between 1 and 100 companies")
+        if len(str(biz_year)) != 4 or str(reprt_code) not in {"11011", "11012", "11013", "11014"}:
+            raise ValueError("invalid business year or report code")
+        payload = self._request_validated(
+            "fnlttMultiAcnt.json",
+            {
+                "corp_code": ",".join(codes),
+                "bsns_year": str(biz_year),
+                "reprt_code": str(reprt_code),
+            },
+        )
+        records = payload.get("list", [])
+        if not isinstance(records, list):
+            raise DartApiError("DART multi-account list must be a list")
+        return [dict(record) for record in records if isinstance(record, dict)]
+
+    def fetch_document_archive(self, rcept_no: str) -> bytes:
+        """Fetch document.xml ZIP archive for a 14-digit receipt number."""
+        receipt = str(rcept_no or "").strip()
+        if len(receipt) != 14 or not receipt.isdigit():
+            raise ValueError("rcept_no must be a 14-digit receipt number")
+        params = {"rcept_no": receipt}
+        if self.api_key:
+            params["crtfc_key"] = str(self.api_key)
+        if self._request_bytes is not None:
+            payload = self._request_bytes("document.xml", dict(params))
+            if not isinstance(payload, (bytes, bytearray)) or len(payload) == 0:
+                raise DartTerminalError("DART document archive is empty")
+            raw = bytes(payload)
+            stripped = raw.lstrip()[:1]
+            if stripped == b"{":
+                raise DartTerminalError("DART document archive returned an error payload")
+            return raw
+        for attempt in range(3):
+            response = self._session.get(f"{self.BASE_URL}/document.xml", params=params, timeout=30)
+            if response.status_code != 200:
+                if response.status_code in (408, 429) or 500 <= response.status_code < 600:
+                    if attempt < 2:
+                        time.sleep(0.25 * (attempt + 1))
+                        continue
+                    raise DartRetryableError(f"DART HTTP {response.status_code} for document.xml")
+                raise DartTerminalError(f"DART HTTP {response.status_code} for document.xml")
+            content = response.content
+            if not content:
+                if attempt < 2:
+                    time.sleep(0.25 * (attempt + 1))
+                    continue
+                raise DartTerminalError("DART document archive is empty")
+            if content.lstrip()[:1] == b"{":
+                raise DartTerminalError("DART document archive returned an error payload")
+            return content
+        raise DartRetryableError("DART request exhausted retries for document.xml")
 
     def load_corp_codes(self) -> dict[str, str]:
         if not self.api_key:

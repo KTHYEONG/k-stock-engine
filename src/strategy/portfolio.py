@@ -308,6 +308,8 @@ def construct_champion_portfolio(
 
     # To handle sector frozen sums including already frozen
     def frozen_sector_sum(sector_name: str) -> float:
+        if sector_name == "__GLOBAL__":
+            return 0.0
         s = 0.0
         for idx in range(n):
             if frozen[idx] and sectors[idx] == sector_name:
@@ -336,12 +338,15 @@ def construct_champion_portfolio(
                 frozen_sum += sec_cap
             active_indices = [i for i in active_indices if not frozen[i]]
             continue
-        # Check sector cap violations
+        # Industry cap is unavailable for global-cohort rows; security and
+        # total exposure caps remain active.
         # Compute sector sums for tentative
         sector_tentative_sums: dict[str, float] = {}
         sector_members_active: dict[str, list[int]] = {}
         for i in active_indices:
             s = sectors[i]
+            if s == "__GLOBAL__":
+                continue
             sector_tentative_sums[s] = sector_tentative_sums.get(s, 0.0) + tentative[i]
             sector_members_active.setdefault(s, []).append(i)
         viol_sectors: list[str] = []

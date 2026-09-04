@@ -2,7 +2,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+import shutil
+import uuid
 from collections.abc import Mapping
+from dataclasses import asdict as _asdict
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 
@@ -12,6 +17,7 @@ from src.core.datasets import (
     HIVE_PARTITION_LAYOUT,
     DatasetCertification,
     make_manifest,
+    schema_hash,
     validate_production_manifest,
 )
 from src.core.instruments import AssetKind
@@ -88,6 +94,9 @@ _SCHEMAS: dict[SilverTable, dict[str, list[str]]] = {
             "consolidated",
             "restatement_id",
             "source_hash",
+            "source_kind",
+            "mapping_version",
+            "raw_document_hash",
         ],
     },
     SilverTable.CORPORATE_ACTIONS: {
@@ -231,6 +240,21 @@ def validate_table(table: SilverTable, frame: pl.DataFrame, *, decision_time: da
         if unknown.height > 0:
             raise PITDataError(f"unknown action type in {table.value}")
 
+    if table is SilverTable.FINANCIAL_FACTS and frame.height > 0:
+        allowed_kinds = {"opendart_standard", "legacy_document"}
+        bad_kind = frame.filter(~pl.col("source_kind").is_in(list(allowed_kinds)))
+        if bad_kind.height > 0:
+            raise PITDataError(f"unknown source_kind in {table.value}")
+        if frame["mapping_version"].null_count() > 0:
+            raise PITDataError(f"null mapping_version in {table.value}")
+        for row in frame.to_dicts():
+            kind = str(row.get("source_kind") or "")
+            raw_hash = row.get("raw_document_hash")
+            if kind == "opendart_standard" and raw_hash is not None:
+                raise PITDataError(f"raw_document_hash must be null for standardized facts in {table.value}")
+            if kind == "legacy_document" and not raw_hash:
+                raise PITDataError(f"raw_document_hash is required for legacy facts in {table.value}")
+
 
 def _deterministic_hash(parts: list[str]) -> str:
     h = hashlib.sha256()
@@ -247,6 +271,7 @@ def certify_silver(
     coverage_start: date,
     coverage_end: date,
     certification: DatasetCertification,
+    decision_time: datetime | None = None,
 ) -> CertificationReport:
     if coverage_start > coverage_end:
         raise PITDataError("coverage_start must not be after coverage_end")
@@ -261,9 +286,9 @@ def certify_silver(
         raise PITDataError(msg)
 
     # Validate each table
-    decision_time = datetime.combine(coverage_end, time(23, 59, 59), tzinfo=UTC)
+    validation_time = decision_time or datetime.combine(coverage_end, time(23, 59, 59), tzinfo=UTC)
     for t, frame in tables.items():
-        validate_table(t, frame, decision_time=decision_time)
+        validate_table(t, frame, decision_time=validation_time)
 
     # Check coverage completeness - at least check that calendar table covers range
     # For minimal fixture, we don't enforce detailed session gaps; RESEARCH just needs tables present.
@@ -413,6 +438,9 @@ def complete_minimal_fixture(
             "consolidated": [True],
             "restatement_id": ["r0"],
             "source_hash": [source_hash],
+            "source_kind": ["opendart_standard"],
+            "mapping_version": ["dart-fact-map-v1"],
+            "raw_document_hash": [None],
         }
     )
 
@@ -483,6 +511,162 @@ class SilverStore:
 
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
+
+    def publish_streamed_table(
+        self,
+        *,
+        table: SilverTable,
+        staging_root: Path,
+        report: CertificationReport,
+        decision_time: datetime,
+    ) -> Path:
+        """Atomically publish a fully verified streamed staging manifest."""
+        if decision_time.tzinfo is None:
+            raise PITDataError("decision_time must be timezone-aware")
+        if not report.report_hash:
+            raise PITDataError("report_hash must not be empty")
+        staging_dir = Path(staging_root) / table.value
+        manifest_path = staging_dir / "staging_manifest.json"
+        if not manifest_path.exists():
+            raise PITDataError(f"staging manifest missing for {table.value}; certification blocked")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise PITDataError(f"invalid staging manifest for {table.value}") from exc
+        if not isinstance(manifest, dict) or manifest.get("verified") is not True:
+            raise PITDataError(f"staging manifest not fully verified for {table.value}")
+        if str(manifest.get("table", "")) != table.value:
+            raise PITDataError(f"staging manifest table mismatch for {table.value}")
+        parts = manifest.get("parts")
+        if not isinstance(parts, dict) or not parts:
+            raise PITDataError(f"incomplete month for {table.value}; certification blocked")
+        entries: list[dict[str, object]] = []
+        total_rows = 0
+        for month in sorted(parts):
+            items = parts[month]
+            if not isinstance(items, list) or not items:
+                raise PITDataError(f"incomplete month for {table.value}; certification blocked")
+            year, _, mon = str(month).partition("-")
+            for item in items:
+                if not isinstance(item, dict):
+                    raise PITDataError("partition digest missing; certification blocked")
+                digest = str(item.get("part_digest", ""))
+                count = int(item.get("row_count", 0))
+                idx = int(item.get("part_index", 0))
+                if not digest or count <= 0:
+                    raise PITDataError("partition digest missing; certification blocked")
+                part_path = staging_dir / f"year={year}" / f"month={mon}" / f"part-{idx:05d}.parquet"
+                if not part_path.exists():
+                    raise PITDataError(f"incomplete month for {table.value}; certification blocked")
+                actual = hashlib.sha256(part_path.read_bytes()).hexdigest()
+                if actual != digest:
+                    raise PITDataError(f"tampered partition for {table.value} {month}; certification blocked")
+                total_rows += count
+                entries.append(
+                    {
+                        "year": year,
+                        "month": mon,
+                        "part_index": idx,
+                        "row_count": count,
+                        "part_digest": digest,
+                        "path": str(part_path.relative_to(staging_dir)),
+                    }
+                )
+        recomputed = self._streamed_root_hash(entries)
+        if str(manifest.get("root_hash", "")) != recomputed:
+            raise PITDataError(f"streamed root hash mismatch for {table.value}")
+        dataset_id = recomputed
+        dataset_dir = self.root / table.value / dataset_id
+        if dataset_dir.exists():
+            return dataset_dir
+        probe: list[Path] = []
+        for e in entries:
+            probe.extend(
+                sorted((staging_dir / f"year={e['year']}" / f"month={e['month']}").glob("part-*.parquet"))
+            )
+        first_part = probe[0] if probe else None
+        if first_part is None:
+            raise PITDataError(f"incomplete month for {table.value}; certification blocked")
+        columns = pl.read_parquet(first_part).columns
+        content_hash = recomputed
+        time_start = datetime.combine(report.coverage_start, time.min, tzinfo=UTC)
+        time_end = datetime.combine(report.coverage_end, time.min, tzinfo=UTC)
+        dataset_manifest = make_manifest(
+            asset_kind=AssetKind.STOCK,
+            columns=columns,
+            feature_set=f"stock_pit_{table.value}_v1",
+            label_definition="none",
+            label_horizon_sessions=1,
+            time_start=time_start,
+            time_end=time_end,
+            provider_version="fixture",
+            universe_policy_version="v1",
+            row_count=total_rows,
+            schema_version="v2",
+            content_hash=content_hash,
+            storage_layout=HIVE_PARTITION_LAYOUT,
+            certification=report.certification,  # type: ignore[arg-type]
+            quality_report_hash=report.report_hash,
+            calendar_hash=report.source_hashes.get(EvidenceKind.CALENDAR, ""),
+            corporate_action_hash=report.source_hashes.get(EvidenceKind.CORPORATE_ACTIONS, ""),
+            cost_source_hash=report.source_hashes.get(EvidenceKind.HISTORICAL_COSTS, ""),
+        )
+        staging_tmp = self.root / f".{table.value}.{dataset_id}.{uuid.uuid4().hex}.staging"
+        partitions_tmp = staging_tmp / "partitions"
+        partitions_tmp.mkdir(parents=True)
+        content_entries: list[dict[str, object]] = []
+        for entry in sorted(
+            entries, key=lambda e: (str(e["year"]), str(e["month"]), int(str(e["part_index"])))
+        ):
+            src = staging_dir / str(entry["path"])
+            rel = Path(str(entry["path"]))
+            dest = staging_tmp / "partitions" / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dest)
+            content_entries.append(
+                {
+                    "path": str(Path("partitions") / rel),
+                    "row_count": entry["row_count"],
+                    "sha256": entry["part_digest"],
+                }
+            )
+        content_manifest = {
+            "content_manifest_version": 1,
+            "streamed_root_hash": recomputed,
+            "report_hash": report.report_hash,
+            "output": {
+                "row_count": total_rows,
+                "content_hash": content_hash,
+                "column_order": columns,
+                "schema_hash": schema_hash(columns),
+            },
+            "partitions": content_entries,
+        }
+        with (staging_tmp / "content_manifest.json").open("w", encoding="utf-8") as handle:
+            json.dump(content_manifest, handle, indent=2, default=str)
+        manifest_dict = _asdict(dataset_manifest)
+        manifest_dict["asset_kind"] = dataset_manifest.asset_kind.value
+        with (staging_tmp / "dataset_manifest.json").open("w", encoding="utf-8") as handle:
+            json.dump(manifest_dict, handle, indent=2, default=str)
+        dataset_dir.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.replace(staging_tmp, dataset_dir)
+        except Exception:
+            shutil.rmtree(staging_tmp, ignore_errors=True)
+            raise
+        return dataset_dir
+
+    @staticmethod
+    def _streamed_root_hash(entries: list[dict[str, object]]) -> str:
+        digest = hashlib.sha256()
+        flat = sorted(
+            f"{e.get('year')}/{e.get('month')}/{e.get('part_index')}/{e.get('row_count')}/{e.get('part_digest')}"
+            for e in entries
+        )
+        for part in flat:
+            digest.update(part.encode("utf-8"))
+            digest.update(b"\x00")
+        return digest.hexdigest()
 
     def materialize_all(
         self,

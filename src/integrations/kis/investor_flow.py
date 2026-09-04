@@ -1,14 +1,13 @@
 """KIS investor-flow evidence mapped without inferred values."""
 from __future__ import annotations
 
-import hashlib
 import json
 from collections.abc import Iterable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from src.data.schemas import PITDataError
+from src.data.schemas import BronzeReceipt, PITDataError
 from src.integrations.kis.client import KisClient, KisCredentials
 
 
@@ -67,7 +66,7 @@ class KisInvestorFlowCollector:
         *,
         bronze_root: Path | str,
         retrieved_at: datetime | None,
-    ) -> Path:
+    ) -> BronzeReceipt:
         from src.data.bronze import BronzeStore
         from src.data.schemas import EvidenceKind
 
@@ -78,25 +77,17 @@ class KisInvestorFlowCollector:
             "anchor": anchor.isoformat(),
             "query": {"symbol": symbol, "anchor": anchor.isoformat()},
             "rows": [dict(row) for row in raw_rows],
+            "records": self._map_rows(symbol, raw_rows),
         }
         text = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
         moment = retrieved_at if retrieved_at is not None and retrieved_at.tzinfo is not None else datetime.now(UTC)
         store = BronzeStore(Path(bronze_root))
-        import contextlib
-        import tempfile
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as tmp:
-            tmp.write(text)
-            tmp_path = Path(tmp.name)
-        try:
-            stored = store.import_json(tmp_path, kind=EvidenceKind.INVESTOR_FLOW, retrieved_at=moment)
-        finally:
-            with contextlib.suppress(OSError):
-                tmp_path.unlink(missing_ok=True)
-        if stored.content_hash != digest:
-            raise PITDataError("KIS Bronze receipt digest mismatch")
-        return stored.payload_path
+        return store.import_bytes(
+            text.encode("utf-8"),
+            kind=EvidenceKind.INVESTOR_FLOW,
+            retrieved_at=moment,
+            source_label=f"KIS:investor-trade-by-stock-daily:{symbol}:{anchor.isoformat()}",
+        )
 
     def probe(self, symbol: str, session: date) -> dict[str, object]:
         rows = self._map_rows(symbol, self._client.inquire_investor_trade_by_stock_daily(symbol, session))
@@ -111,10 +102,14 @@ class KisInvestorFlowCollector:
         *,
         bronze_root: Path | str | None = None,
         retrieved_at: datetime | None = None,
+        symbols: tuple[str, ...] | None = None,
     ) -> Iterable[dict[str, object]]:
         if start > end:
             raise PITDataError("coverage_start must not be after coverage_end")
-        for symbol in self._symbols:
+        requested_symbols = self._symbols if symbols is None else tuple(symbols)
+        if not requested_symbols or any(symbol not in self._symbols for symbol in requested_symbols):
+            raise PITDataError("KIS investor flow requested symbol is outside collector universe")
+        for symbol in requested_symbols:
             anchor = end
             seen: set[str] = set()
             while anchor >= start:
@@ -122,8 +117,11 @@ class KisInvestorFlowCollector:
                     raw_rows = self._client.inquire_investor_trade_by_stock_daily(symbol, anchor)
                 except Exception as exc:
                     raise PITDataError("KIS investor flow collection failed") from exc
+                receipt = None
                 if bronze_root is not None:
-                    self._persist_raw_page(symbol, anchor, raw_rows, bronze_root=bronze_root, retrieved_at=retrieved_at)
+                    receipt = self._persist_raw_page(
+                        symbol, anchor, raw_rows, bronze_root=bronze_root, retrieved_at=retrieved_at
+                    )
                 rows = self._map_rows(symbol, raw_rows)
                 selected = [row for row in rows if start.isoformat() <= str(row["session"]) <= end.isoformat()]
                 if not selected:
@@ -131,13 +129,17 @@ class KisInvestorFlowCollector:
                 unique = [row for row in selected if str(row["session"]) not in seen]
                 seen.update(str(row["session"]) for row in unique)
                 if unique:
-                    yield {
+                    page: dict[str, object] = {
                         "provider": "KIS",
                         "endpoint": "investor-trade-by-stock-daily",
                         "symbol": symbol,
                         "anchor": anchor.isoformat(),
                         "records": unique,
                     }
+                    if receipt is not None:
+                        page["bronze_receipt_hash"] = receipt.content_hash
+                        page["bronze_receipt"] = receipt
+                    yield page
                 earliest = min(date.fromisoformat(str(row["session"])) for row in rows)
                 if earliest <= start:
                     break

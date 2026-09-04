@@ -1,10 +1,8 @@
 """Official KRX/DART/KIS collection persisted to Bronze before parsing."""
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
-import tempfile
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -68,16 +66,245 @@ def _persist_response(
     retrieved_at: datetime,
 ) -> BronzeReceipt:
     text = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", delete=False, encoding="utf-8"
-    ) as tmp:
-        tmp.write(text)
-        tmp_path = Path(tmp.name)
-    try:
-        return store.import_json(tmp_path, kind=kind, retrieved_at=retrieved_at)
-    finally:
-        with contextlib.suppress(OSError):
-            tmp_path.unlink(missing_ok=True)
+    return store.import_bytes(
+        text.encode("utf-8"),
+        kind=kind,
+        retrieved_at=retrieved_at,
+        source_label=f"normalized-provider-page:{kind.value}",
+    )
+
+
+def collect_planned_investor_flow(
+    *,
+    plan: HistoricalCollectionPlan,
+    kis: KisInvestorFlowCollector,
+    bronze_root: Path,
+    retrieved_at: datetime,
+    checkpoint_store: CollectionCheckpointStore,
+) -> CollectionArtifact:
+    """Collect only verified KIS investor-flow chunks and make each completion resumable."""
+    if retrieved_at.tzinfo is None:
+        raise PITDataError("retrieved_at must be timezone-aware")
+    store = BronzeStore(bronze_root)
+    receipts: list[BronzeReceipt] = []
+    page_receipts: list[BronzeReceipt] = []
+    for chunk in plan.chunks:
+        if checkpoint_store.has_verified_receipt(plan=plan, chunk=chunk, bronze_root=bronze_root):
+            continue
+        try:
+            pages = tuple(
+                kis.fetch_investor_flow(
+                    min(chunk.sessions),
+                    max(chunk.sessions),
+                    bronze_root=bronze_root,
+                    retrieved_at=retrieved_at,
+                    symbols=(chunk.symbol,),
+                )
+            )
+        except PITDataError as exc:
+            if "missing requested session" not in str(exc):
+                raise
+            negative = json.dumps(
+                {
+                    "provider": "KIS",
+                    "endpoint": "investor-trade-by-stock-daily",
+                    "symbol": chunk.symbol,
+                    "sessions": [value.isoformat() for value in chunk.sessions],
+                    "status": "source_unavailable",
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+            receipt = store.import_bytes(
+                negative,
+                kind=EvidenceKind.INVESTOR_FLOW,
+                retrieved_at=retrieved_at,
+                source_label=f"KIS:source-unavailable:{chunk.symbol}:{chunk.chunk_id}",
+            )
+            checkpoint_store.mark_complete(
+                plan_id=plan.plan_id,
+                chunk_id=chunk.chunk_id,
+                receipt_digest=receipt.content_hash,
+                plan_digest=plan.content_hash,
+                receipt_hashes=(receipt.content_hash,),
+            )
+            page_receipts.append(receipt)
+            continue
+        expected_sessions = {value.isoformat() for value in chunk.sessions}
+        observed_sessions: set[str] = set()
+        for page in pages:
+            records = page.get("records", [])
+            if not isinstance(records, list):
+                continue
+            for record in records:
+                if isinstance(record, dict) and str(record.get("ticker")) == chunk.symbol:
+                    observed_sessions.add(str(record.get("session")))
+        if not expected_sessions.issubset(observed_sessions):
+            missing = ",".join(sorted(expected_sessions - observed_sessions))
+            raise PITDataError(f"KIS investor flow missing requested sessions for {chunk.symbol}: {missing}")
+        raw_receipts: list[BronzeReceipt] = []
+        for page in pages:
+            page_receipt = page.get("bronze_receipt")
+            if isinstance(page_receipt, BronzeReceipt):
+                raw_receipts.append(page_receipt)
+        if not raw_receipts:
+            raise PITDataError("KIS investor flow raw Bronze receipt is missing")
+        digest = hashlib.sha256()
+        for receipt in sorted(raw_receipts, key=lambda value: value.content_hash):
+            digest.update(receipt.content_hash.encode("utf-8"))
+            digest.update(b"\x00")
+            page_receipts.append(receipt)
+        receipt_digest = digest.hexdigest()
+        checkpoint_store.mark_complete(
+            plan_id=plan.plan_id,
+            chunk_id=chunk.chunk_id,
+            receipt_digest=receipt_digest,
+            plan_digest=plan.content_hash,
+            receipt_hashes=tuple(receipt.content_hash for receipt in raw_receipts),
+        )
+        receipts.extend(raw_receipts)
+    digest = hashlib.sha256()
+    for receipt in sorted(page_receipts, key=lambda value: value.content_hash):
+        digest.update(receipt.content_hash.encode("utf-8"))
+        digest.update(b"\x00")
+    content_hash = digest.hexdigest()
+    artifact_dir = bronze_root.parent / "artifacts" / "collections"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    report_path = artifact_dir / f"{content_hash}.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "plan_id": plan.plan_id,
+                "content_hash": content_hash,
+                "provider": "KIS",
+                "endpoint": "investor-trade-by-stock-daily",
+                "coverage_start": plan.coverage_start.isoformat(),
+                "coverage_end": plan.coverage_end.isoformat(),
+                "completed_chunks": len(plan.chunks),
+                "page_receipts": [receipt.content_hash for receipt in page_receipts],
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    latest = receipts[-1] if receipts else None
+    return CollectionArtifact(
+        bronze_root=bronze_root,
+        coverage_start=plan.coverage_start,
+        coverage_end=plan.coverage_end,
+        retrieved_at=retrieved_at,
+        receipts={EvidenceKind.INVESTOR_FLOW: latest} if latest is not None else {},
+        content_hash=content_hash,
+        report_path=report_path,
+        page_receipts={EvidenceKind.INVESTOR_FLOW.value: tuple(page_receipts)},
+    )
+
+
+def collect_dart_financial_facts(
+    *,
+    dart: Any,
+    identities: tuple[dict[str, str], ...],
+    bronze_root: Path,
+    retrieved_at: datetime,
+) -> CollectionArtifact:
+    """Persist full-statement DART responses before downstream fact normalization."""
+    from src.data.dart_documents import DartDocumentStore
+
+    if retrieved_at.tzinfo is None:
+        raise PITDataError("retrieved_at must be timezone-aware")
+    if not identities:
+        raise PITDataError("DART financial facts require filing identities")
+    fetch = getattr(dart, "fetch_financial_fact_sources", None)
+    if fetch is None:
+        fetch = dart.fetch_xbrl_facts
+        raw_pages = _collect_pages(fetch, identities, kind_name="DART full statements")
+    else:
+        try:
+            result = dart.fetch_financial_fact_sources(identities)
+        except Exception as exc:
+            raise PITDataError(f"DART full statements collection failed: {exc}") from exc
+        if result is None:
+            raise PITDataError("DART full statements response is empty; certification blocked")
+        raw_pages = list(result)
+        if not raw_pages:
+            raise PITDataError("DART full statements response is empty; certification blocked")
+        for page in raw_pages:
+            if not isinstance(page, dict) or not page:
+                raise PITDataError("DART full statements page is empty; certification blocked")
+    store = BronzeStore(bronze_root)
+    document_store = DartDocumentStore(bronze_root)
+    persisted: list[dict[str, Any]] = []
+    for page in raw_pages:
+        serializable = {k: v for k, v in dict(page).items() if k != "raw_archive"}
+        archive = page.get("raw_archive")
+        if isinstance(archive, (bytes, bytearray)) and len(archive) > 0:
+            from collections.abc import Mapping as _Mapping
+
+            raw_identity = page.get("identity")
+            identity: _Mapping[str, Any] = raw_identity if isinstance(raw_identity, dict) else {}
+            rcept_no = str(
+                identity.get("rcept_no") or identity.get("filing_id") or page.get("rcept_no") or page.get("filing_id") or ""
+            ).strip()
+            if len(rcept_no) == 14 and rcept_no.isdigit():
+                receipt_doc = document_store.store_archive(
+                    bytes(archive), rcept_no=rcept_no, retrieved_at=retrieved_at
+                )
+                serializable["document_receipt"] = str(receipt_doc.metadata_path)
+                if not serializable.get("raw_document_hash"):
+                    serializable["raw_document_hash"] = receipt_doc.content_hash
+        persisted.append(serializable)
+    receipt, page_receipts = _persist_pages(
+        store, persisted, kind=EvidenceKind.FINANCIAL_FACTS, retrieved_at=retrieved_at
+    )
+    standardized = sum(1 for p in persisted if p.get("source_kind") == "opendart_standard")
+    legacy_document = sum(
+        1
+        for p in persisted
+        if p.get("source_kind") == "legacy_document" and p.get("status") != "extraction_failed"
+    )
+    unavailable = sum(1 for p in persisted if p.get("source_kind") == "unavailable")
+    extraction_failed = sum(1 for p in persisted if p.get("status") == "extraction_failed")
+    filing_ids = [
+        str(p.get("filing_id") or (p.get("identity") or {}).get("filing_id") or "").strip()
+        for p in persisted
+    ]
+    digest = hashlib.sha256()
+    for page_receipt in page_receipts:
+        digest.update(page_receipt.content_hash.encode("utf-8"))
+        digest.update(b"\x00")
+    content_hash = digest.hexdigest()
+    artifact_dir = bronze_root.parent / "artifacts" / "collections"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    report_path = artifact_dir / f"{content_hash}.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "content_hash": content_hash,
+                "provider": "OpenDART",
+                "endpoint": "fnlttSinglAcntAll",
+                "filing_count": len(identities),
+                "standardized": standardized,
+                "legacy_document": legacy_document,
+                "unavailable": unavailable,
+                "extraction_failed": extraction_failed,
+                "filing_ids": filing_ids,
+                "page_receipts": [item.content_hash for item in page_receipts],
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return CollectionArtifact(
+        bronze_root=bronze_root,
+        coverage_start=retrieved_at.date(),
+        coverage_end=retrieved_at.date(),
+        retrieved_at=retrieved_at,
+        receipts={EvidenceKind.FINANCIAL_FACTS: receipt},
+        content_hash=content_hash,
+        report_path=report_path,
+        page_receipts={EvidenceKind.FINANCIAL_FACTS.value: page_receipts},
+    )
 
 
 def collect_missing_champion_evidence(
@@ -226,7 +453,12 @@ def collect_champion_evidence(
                     filing_ids.append(fid.strip())
     filing_tuple = tuple(dict.fromkeys(filing_ids)) or ("unknown",)
     try:
-        xbrl_result = dart.fetch_xbrl_facts(filing_tuple)
+        if hasattr(dart, "fetch_financial_fact_sources"):
+            xbrl_result = dart.fetch_financial_fact_sources(
+                tuple({"filing_id": fid} for fid in filing_tuple)
+            )
+        else:
+            xbrl_result = dart.fetch_xbrl_facts(filing_tuple)
     except Exception as exc:
         raise PITDataError(f"DART XBRL facts collection failed: {exc}") from exc
     xbrl_pages = list(xbrl_result) if xbrl_result is not None else []
