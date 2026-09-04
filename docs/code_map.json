@@ -151,8 +151,23 @@
     "architecture": "docs/specs/10_stress_and_promotion_gates.md",
     "testing": "tests/integration/validation/test_promotion.py"
   },
-  "src/data/cli.py": {},
+  "src/data/cli.py": {
+    "testing": [
+      "tests/unit/data/test_streaming_stock_normalization.py",
+      "tests/unit/data/test_cli.py"
+    ]
+  },
   "src/data/collection_plan.py": {
     "testing": "tests/unit/data/test_collection_plan.py"
+  },
+  "src/data/collection.py": {
+    "testing": "tests/integration/data/test_collection.py"
+  },
+  "src/data/bronze_aggregation.py": {
+    "testing": "tests/unit/data/test_bronze_aggregation.py"
+  },
+  "src/data/streaming_normalization.py": {
+    "architecture": "docs/next.md",
+    "testing": "tests/unit/data/test_streaming_stock_normalization.py"
   }
 }
