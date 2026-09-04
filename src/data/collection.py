@@ -12,6 +12,7 @@ from typing import Any, Protocol
 from src.data.bronze import BronzeStore
 from src.data.collection_plan import CollectionCheckpointStore, HistoricalCollectionPlan
 from src.data.schemas import BronzeReceipt, EvidenceKind, PITDataError
+from src.integrations.dart.xbrl import DartXbrlCollector  # noqa: F401
 from src.integrations.kis.investor_flow import KisInvestorFlowCollector
 
 RawProviderResponse = dict[str, Any]
@@ -197,6 +198,59 @@ def collect_planned_investor_flow(
         content_hash=content_hash,
         report_path=report_path,
         page_receipts={EvidenceKind.INVESTOR_FLOW.value: tuple(page_receipts)},
+    )
+
+
+def collect_dart_disclosures(
+    *,
+    dart: Any,
+    start: date,
+    end: date,
+    bronze_root: Path,
+    retrieved_at: datetime,
+) -> CollectionArtifact:
+    """Persist DART disclosure records to Bronze disclosures before filing resolution."""
+    if retrieved_at.tzinfo is None:
+        raise PITDataError("retrieved_at must be timezone-aware")
+    if start > end:
+        raise PITDataError("coverage_start must not be after coverage_end")
+    raw_pages = _collect_pages(dart.fetch_disclosures, start, end, kind_name="DART disclosures")
+    store = BronzeStore(bronze_root)
+    receipt, page_receipts = _persist_pages(
+        store, raw_pages, kind=EvidenceKind.DISCLOSURES, retrieved_at=retrieved_at
+    )
+    digest = hashlib.sha256()
+    for page_receipt in page_receipts:
+        digest.update(page_receipt.content_hash.encode("utf-8"))
+        digest.update(b"\x00")
+    content_hash = digest.hexdigest()
+    artifact_dir = bronze_root.parent / "artifacts" / "collections"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    report_path = artifact_dir / f"{content_hash}.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "content_hash": content_hash,
+                "provider": "OpenDART",
+                "endpoint": "list",
+                "coverage_start": start.isoformat(),
+                "coverage_end": end.isoformat(),
+                "page_receipts": [item.content_hash for item in page_receipts],
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return CollectionArtifact(
+        bronze_root=bronze_root,
+        coverage_start=start,
+        coverage_end=end,
+        retrieved_at=retrieved_at,
+        receipts={EvidenceKind.DISCLOSURES: receipt},
+        content_hash=content_hash,
+        report_path=report_path,
+        page_receipts={EvidenceKind.DISCLOSURES.value: page_receipts},
     )
 
 
@@ -442,23 +496,69 @@ def collect_champion_evidence(
     master_pages = _collect_pages(krx.fetch_master_lineage, request.coverage_start, request.coverage_end, kind_name="KRX master lineage")
     action_pages = _collect_pages(krx.fetch_status_and_actions, request.coverage_start, request.coverage_end, kind_name="KRX status and actions")
     disclosure_pages = _collect_pages(dart.fetch_disclosures, request.coverage_start, request.coverage_end, kind_name="DART disclosures")
-    filing_ids: list[str] = []
+    import re as _re
+
+    _period = _re.compile(r"\((\d{4})\.(\d{2})\)")
+    _code_by_month = {"03": "11013", "06": "11012", "09": "11014", "12": "11011"}
+    identities: list[dict[str, str]] = []
+    seen_fids: set[str] = set()
+    fallback_fids: list[str] = []
     for page in disclosure_pages:
         records = page.get("records", page)
         items = records if isinstance(records, list) else [page]
         for item in items:
-            if isinstance(item, dict):
-                fid = item.get("filing_id") or item.get("rcept_no") or item.get("filingId")
-                if isinstance(fid, str) and fid.strip():
-                    filing_ids.append(fid.strip())
-    filing_tuple = tuple(dict.fromkeys(filing_ids)) or ("unknown",)
-    try:
-        if hasattr(dart, "fetch_financial_fact_sources"):
-            xbrl_result = dart.fetch_financial_fact_sources(
-                tuple({"filing_id": fid} for fid in filing_tuple)
+            if not isinstance(item, dict):
+                continue
+            fid = str(item.get("filing_id") or item.get("rcept_no") or item.get("filingId") or "").strip()
+            if not fid or fid in seen_fids:
+                continue
+            seen_fids.add(fid)
+            fallback_fids.append(fid)
+            corp = str(item.get("corp_code") or item.get("company_id") or "").strip()
+            report_nm = str(item.get("report_nm") or item.get("filing_type") or "")
+            matched = _period.search(report_nm)
+            biz_year = str(item.get("biz_year") or item.get("bsns_year") or "").strip()
+            reprt_code = str(item.get("reprt_code") or item.get("report_code") or "").strip()
+            if matched:
+                year, month = matched.groups()
+                if not biz_year:
+                    biz_year = year
+                if not reprt_code:
+                    if "사업보고서" in report_nm:
+                        reprt_code = "11011"
+                    elif "반기보고서" in report_nm:
+                        reprt_code = "11012"
+                    elif "분기보고서" in report_nm:
+                        reprt_code = _code_by_month.get(month, "")
+                    else:
+                        reprt_code = _code_by_month.get(month, "")
+            if not corp or not biz_year or not reprt_code:
+                continue
+            identities.append(
+                {
+                    "corp_code": corp,
+                    "filing_id": fid,
+                    "biz_year": biz_year,
+                    "reprt_code": reprt_code,
+                    "fs_div": "CFS",
+                }
             )
+    if not fallback_fids:
+        raise PITDataError("DART disclosures contain no filing identities")
+    filing_tuple = tuple(identities) if identities else tuple(dict.fromkeys(fallback_fids))
+    if not filing_tuple:
+        raise PITDataError("DART disclosures contain no periodic filing identities")
+    try:
+        if identities and hasattr(dart, "fetch_financial_fact_sources"):
+            xbrl_result = dart.fetch_financial_fact_sources(tuple(identities))
+        elif hasattr(dart, "fetch_xbrl_facts"):
+            xbrl_result = dart.fetch_xbrl_facts(
+                tuple(d["filing_id"] if isinstance(d, dict) else d for d in filing_tuple)
+            )
+        elif identities:
+            xbrl_result = dart.fetch_financial_fact_sources(tuple(identities))
         else:
-            xbrl_result = dart.fetch_xbrl_facts(filing_tuple)
+            raise PITDataError("DART disclosures contain no periodic filing identities")
     except Exception as exc:
         raise PITDataError(f"DART XBRL facts collection failed: {exc}") from exc
     xbrl_pages = list(xbrl_result) if xbrl_result is not None else []
