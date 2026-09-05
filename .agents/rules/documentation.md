@@ -10,7 +10,7 @@ priority: 8
 ## 1. Core Principles
 1. **Explain "Why", Not "What":** Omit obvious code behavior comments. Explain only business context, mathematical rationale, domain constraints, or non-obvious optimizations.
 2. **Token & Patch Efficiency:** Keep comments to a single line (max 2 lines). Explain only immediate domain invariants or mathematical reasons. Avoid verbose multi-line explanations or storytelling.
-3. **No Ephemeral Spec References:** NEVER reference temporary `docs/specs/*.md` or `contract.json` paths in code, docstrings, CLI help texts, or comments. Specs are temporary artifacts purged during the sync phase. If external reference is necessary, use persistent `ADR-XXXX` identifiers or self-contained domain rationale.
+3. **No Ephemeral Spec References:** NEVER reference temporary `docs/specs/*.md` or `contract.json` paths in code, docstrings, CLI help texts, or comments. Specs are ephemeral working files — `.md` scratch files are purged and `contract.json` is relocated to `docs/decisions/archive/<task_id>/` during the sync phase, so any path reference goes stale. If external reference is necessary, use persistent `ADR-XXXX` identifiers or self-contained domain rationale.
 4. **Language Policy:**
    - **Docstrings & External Docs:** English only (maintains compatibility with standard Python IDE tools and global conventions).
    - **In-line Comments (`#`):** Korean preferred (ensures fast intuition and readability for Korean maintainers).
@@ -34,34 +34,7 @@ priority: 8
 
 ## 4. Architecture Documentation (`docs/architecture/`)
 - **Purpose:** "AI-First Structured Constraints". Contains system boundary, LaTeX mathematical formalisms, strict I/O tables, and Mermaid topology.
-- **Line Limit:** Keep each document strictly under 300 lines.
+- **Scope Limit:** Split a document when it grows to cover more than one system boundary/topology unit — not by a fixed line count.
 - **Surgical Update Only:** Never append raw text to architecture files. Edit existing tables, schemas, or Mermaid nodes inline.
 - **Prohibitions:** Omit procedural logic, code optimization details, logging policies, conversational prose, temporal examples, change history, and `[ADR_...]` tags.
 - **Contract Priority:** In case of mismatch, in-code Type/Protocol definitions strictly supersede external markdown files.
-
-## 5. Canonical Code Example
-
-```python
-def calculate_position_size(
-    account_balance: float, 
-    risk_ratio: float, 
-    volatility: float
-) -> float:
-    """Calculates optimal position size based on fixed fractional volatility sizing.
-
-    Args:
-        account_balance: Total available trading capital in USDT.
-        risk_ratio: Maximum account risk fraction per trade (e.g. 0.02).
-        volatility: Asset daily volatility (ATR percentage).
-
-    Returns:
-        Calculated position size in base currency.
-    """
-    if volatility <= 0:
-        # 변동성이 0 이하인 경우 디폴트 최소 위험값 적용 (Zero-division 방지)
-        return 0.0
-
-    # 켈리 공식 변형: 앙상블 리스크 스케일링 적용
-    raw_size = (account_balance * risk_ratio) / volatility
-    return round(raw_size, 4)
-```

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
 import functools
 import json
 import os
@@ -691,7 +692,7 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
     return (1 if diagnostics else 0, diagnostics)
 
 
-def _find_test_files(py_files: list[str]) -> list[str]:
+def _find_test_files(py_files: list[str], impact_level: int = 1) -> list[str]:
     test_files = [f for f in py_files if f.startswith("tests/") or "test_" in f]
     source_files = [f for f in py_files if not (f.startswith("tests/") or "test_" in f)]
     repository_files = _repository_test_files()
@@ -712,8 +713,13 @@ def _find_test_files(py_files: list[str]) -> list[str]:
                     test_files.append(tp)
                     found_direct = True
                     break
-            # Wider AST reverse lookup is only used if NO direct test exists for this module
-            if not found_direct:
+            # Wider AST reverse lookup: always for impact_level >= 2 (this
+            # module is either a core/config/schema file or the change spans
+            # 5+ files -- a direct test alone doesn't prove call sites are
+            # covered), otherwise only as a fallback when no direct test exists.
+            # Without this, impact_level was computed and logged but never
+            # actually changed which tests ran.
+            if not found_direct or impact_level >= 2:
                 for tp in repository_files:
                     if tp not in test_files and _test_references_source(tp, sf):
                         test_files.append(tp)
@@ -756,6 +762,85 @@ def _analyze_impact_level(py_files: list[str]) -> tuple[int, str]:
     return (1, "Leaf/isolated module change")
 
 
+def _git_diff_added_lines(file: str) -> set[int] | None:
+    """1-indexed line numbers this working-tree diff adds to `file`.
+
+    Returns None for an untracked (new) file -- caller treats every
+    coverage-measured line as "added" in that case.
+    """
+    status_res = subprocess.run(
+        ["git", "status", "--porcelain", "--", file],
+        capture_output=True, text=True, timeout=10,
+    )
+    if status_res.stdout.strip().startswith("??"):
+        return None
+    diff_res = subprocess.run(
+        ["git", "diff", "--unified=0", "HEAD", "--", file],
+        capture_output=True, text=True, timeout=10,
+    )
+    added: set[int] = set()
+    cur_line = 0
+    for line in diff_res.stdout.splitlines():
+        if line.startswith("@@"):
+            m = re.search(r"\+(\d+)", line)
+            if m:
+                cur_line = int(m.group(1))
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            added.add(cur_line)
+            cur_line += 1
+        elif not line.startswith("-"):
+            cur_line += 1
+    return added
+
+
+def _check_diff_coverage(
+    src_files: list[str], cov_json_path: str
+) -> tuple[list[JsonDiag], int | None]:
+    """Fail-closed check: every line this diff *adds* to a touched src file
+    must actually execute during the test run. Deliberately diff-scoped
+    (not a flat % threshold) -- a magic coverage percentage can pass while
+    the exact lines this change introduced sit untested; this can't.
+    """
+    if not os.path.exists(cov_json_path):
+        return ([], None)
+    try:
+        with open(cov_json_path, encoding="utf-8") as f:
+            cov_data = json.load(f)
+    except Exception:
+        return ([], None)
+
+    files_data = cov_data.get("files", {})
+    diags: list[JsonDiag] = []
+    total_added = 0
+    total_covered = 0
+    for sf in src_files:
+        entry = files_data.get(sf) or files_data.get(sf.replace("/", os.sep))
+        if not entry:
+            continue
+        missing = set(entry.get("missing_lines", []))
+        executed = set(entry.get("executed_lines", []))
+        added = _git_diff_added_lines(sf)
+        if added is None:
+            added = executed | missing
+        added &= executed | missing  # only lines coverage.py actually measured
+        if not added:
+            continue
+        total_added += len(added)
+        total_covered += len(added - missing)
+        uncovered_new = sorted(added & missing)
+        if uncovered_new:
+            shown = uncovered_new[:10]
+            diags.append({
+                "file": sf,
+                "line": shown[0],
+                "error": f"{len(uncovered_new)} newly-added line(s) not executed by any test: {shown}",
+                "fix_hint": "Add/extend a scenario test exercising these lines, or simplify if genuinely unreachable",
+            })
+    pct = round(100 * total_covered / total_added) if total_added else None
+    return (diags, pct)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Smart Selective Lean Check with JSON diagnostics."
@@ -785,6 +870,11 @@ def main() -> None:
     parser.add_argument(
         "--test-timeout", type=int, default=120,
         help="Per-test wall-clock limit in seconds via pytest-timeout. 0 disables.",
+    )
+    parser.add_argument(
+        "--no-cov", action="store_true",
+        help="Disable the diff-coverage gate (every line this diff adds to a "
+             "touched src/ file must execute during the test run)",
     )
     parser.add_argument(
         "--no-xdist", action="store_true",
@@ -843,15 +933,26 @@ def main() -> None:
         print("ALLCHECKS:PASS | No modified .py files detected")
         sys.exit(0)
 
+    # 0. Self-heal code_map.json before test_code_map.py can see it stale.
+    # Regenerating here (idempotent, index-only) means a genuinely broken
+    # registration surfaces as a real Tier 1 failure instead of requiring
+    # `check` to special-case "only test_code_map.py failed" as a soft pass.
+    if py_files:
+        try:
+            from tools.agent_skills import gen_code_map
+
+            gen_code_map.main()
+        except Exception as e:
+            print(f"INFO | code_map self-heal skipped: {e}")
+
     # 1. Co-modification Check & Test Discovery
     impact_level, impact_reason = _analyze_impact_level(py_files)
     print(f"INFO | Impact Level: {impact_level} ({impact_reason})")
-    test_files = _find_test_files(py_files)
+    test_files = _find_test_files(py_files, impact_level=impact_level)
 
     spec_target_files: set[str] = set()
     # Ingest target_test_file from spec contract if available
     if args.spec and os.path.isfile(args.spec):
-        import contextlib
         with contextlib.suppress(Exception):
             with open(args.spec, encoding="utf-8") as sf:
                 spec_data = json.load(sf)
@@ -965,6 +1066,31 @@ def main() -> None:
         else []
     )
     xdist_args = ["-p", "no:cacheprovider", "-n", "0"] if args.no_xdist else []
+    src_files = [f for f in py_files if f.startswith("src/")]
+    # An explicit contract owns its declared implementation targets. Wiring
+    # callers and unrelated co-modified workstreams remain linted/typed/tested
+    # but do not block this contract's diff-coverage gate.
+    if args.spec and spec_target_files:
+        src_files = [f for f in src_files if f in spec_target_files]
+    cov_json_path = "tmp/lean_check_coverage.json"
+    cov_args: list[str] = []
+    if src_files and not args.no_cov:
+        os.makedirs("tmp", exist_ok=True)
+        # Remove any stale report from a prior run before invoking pytest-cov.
+        # If pytest-cov silently fails to write a fresh one (seen with a bad
+        # --cov form, or any other collection error), _check_diff_coverage
+        # must see "file absent" and skip the gate -- not read old data whose
+        # line numbers no longer match this file's current content.
+        with contextlib.suppress(OSError):
+            os.remove(cov_json_path)
+        # pytest-cov's --cov silently collects nothing for a bare file path
+        # (coverage.py resolves it as a source, not a measured module) --
+        # the dotted module form is what actually attaches instrumentation.
+        cov_modules = [f[:-3].replace("/", ".") for f in src_files]
+        cov_args = [
+            *[f"--cov={m}" for m in cov_modules],
+            f"--cov-report=json:{cov_json_path}",
+        ]
     core_cmd = [
         "uv",
         "run",
@@ -975,6 +1101,7 @@ def main() -> None:
         *deselect_args,
         *timeout_args,
         *xdist_args,
+        *cov_args,
         "-q",
         "--tb=line",
     ]
@@ -991,8 +1118,18 @@ def main() -> None:
         pt_res = run_cmd(serial_cmd, timeout=pytest_timeout)
 
     if pt_res.returncode == 0:
-        print("PASS | All checks passed (Lint, Type, Tests verified)")
-        print(_emit_json("PASS", "all", [], None), file=sys.stderr)
+        cov_diags, cov_pct = (
+            _check_diff_coverage(src_files, cov_json_path) if cov_args else ([], None)
+        )
+        if cov_diags:
+            _fail_exit_many(
+                "coverage",
+                f"FAIL | Diff Coverage: {len(cov_diags)} file(s) with untested new lines",
+                cov_diags,
+            )
+        cov_suffix = f", Diff-Coverage {cov_pct}%" if cov_pct is not None else ""
+        print(f"PASS | All checks passed (Lint, Type, Tests{cov_suffix} verified)")
+        print(_emit_json("PASS", "all", [], cov_pct), file=sys.stderr)
     else:
         last_err = [
             line
