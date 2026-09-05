@@ -20,9 +20,125 @@
   },
   "src/core/time.py": {
     "testing": [
+      "tests/integration/engine/test_unified_event_backtester.py",
+      "tests/integration/strategy/test_historical_universe.py",
       "tests/unit/core/test_instrument.py",
-      "tests/unit/execution/test_submit_intents.py"
+      "tests/unit/data/test_backtest_runner.py",
+      "tests/unit/data/test_backtest_sessions.py",
+      "tests/unit/data/test_gold.py",
+      "tests/unit/data/test_incremental_normalization.py",
+      "tests/unit/data/test_normalization.py",
+      "tests/unit/data/test_silver.py",
+      "tests/unit/engine/test_backtest.py",
+      "tests/unit/engine/test_runner.py",
+      "tests/unit/execution/test_submit_intents.py",
+      "tests/unit/features/test_qvef.py",
+      "tests/unit/integrations/dart/test_xbrl_standard.py",
+      "tests/unit/strategy/test_universe.py"
     ]
+  },
+  "src/data/backtest_runner.py": {
+    "testing": "tests/unit/data/test_backtest_runner.py"
+  },
+  "src/data/backtest_sessions.py": {
+    "testing": "tests/unit/data/test_backtest_sessions.py"
+  },
+  "src/data/bronze.py": {
+    "testing": "tests/unit/data/test_bronze.py"
+  },
+  "src/data/bronze_aggregation.py": {
+    "testing": "tests/unit/data/test_bronze_aggregation.py"
+  },
+  "src/data/cli.py": {
+    "testing": "tests/unit/data/test_cli.py"
+  },
+  "src/data/collection.py": {
+    "testing": "tests/integration/data/test_collection.py"
+  },
+  "src/data/collection_plan.py": {
+    "testing": "tests/unit/data/test_collection_plan.py"
+  },
+  "src/data/dart_backfill.py": {
+    "testing": "tests/unit/data/test_dart_backfill.py"
+  },
+  "src/data/dart_documents.py": {
+    "testing": "tests/unit/data/test_dart_documents.py"
+  },
+  "src/data/gold.py": {
+    "testing": "tests/unit/data/test_gold.py"
+  },
+  "src/data/gold_loader.py": {
+    "testing": "tests/unit/data/test_gold_loader.py"
+  },
+  "src/data/incremental_normalization.py": {
+    "testing": "tests/unit/data/test_incremental_normalization.py"
+  },
+  "src/data/legacy_inventory.py": {
+    "testing": "tests/unit/data/test_legacy_inventory.py"
+  },
+  "src/data/normalization.py": {
+    "testing": "tests/unit/data/test_normalization.py"
+  },
+  "src/data/operations.py": {
+    "testing": "tests/integration/data/test_operations.py"
+  },
+  "src/data/pipeline.py": {
+    "testing": "tests/unit/data/test_pipeline.py"
+  },
+  "src/data/schemas.py": {
+    "testing": [
+      "tests/integration/data/test_backtest_data_pipeline.py",
+      "tests/integration/data/test_collection.py",
+      "tests/integration/data/test_pit_dataset_foundation.py",
+      "tests/unit/data/test_backtest_runner.py",
+      "tests/unit/data/test_backtest_sessions.py",
+      "tests/unit/data/test_bronze.py",
+      "tests/unit/data/test_bronze_aggregation.py",
+      "tests/unit/data/test_cli.py",
+      "tests/unit/data/test_gold_loader.py",
+      "tests/unit/data/test_incremental_normalization.py",
+      "tests/unit/data/test_pipeline.py",
+      "tests/unit/data/test_silver.py",
+      "tests/unit/data/test_streaming_stock_normalization.py",
+      "tests/unit/integrations/dart/test_xbrl_standard.py",
+      "tests/unit/integrations/krx/test_historical.py",
+      "tests/unit/integrations/test_kis_investor_flow.py"
+    ]
+  },
+  "src/data/silver.py": {
+    "testing": "tests/unit/data/test_silver.py"
+  },
+  "src/data/snapshot.py": {
+    "testing": [
+      "tests/integration/data/test_pit_dataset_foundation.py",
+      "tests/unit/data/test_backtest_runner.py",
+      "tests/unit/data/test_backtest_sessions.py"
+    ]
+  },
+  "src/data/streaming_normalization.py": {
+    "testing": "tests/unit/data/test_streaming_normalization.py"
+  },
+  "src/domain/stock_data.py": {
+    "testing": [
+      "tests/unit/data/test_collection_readiness.py",
+      "tests/unit/integrations/test_dart_xbrl_identity.py"
+    ]
+  },
+  "src/engine/backtest.py": {
+    "testing": "tests/unit/engine/test_backtest.py"
+  },
+  "src/engine/decision.py": {
+    "testing": [
+      "tests/integration/engine/test_unified_event_backtester.py",
+      "tests/unit/data/test_backtest_runner.py",
+      "tests/unit/engine/test_backtest.py"
+    ]
+  },
+  "src/engine/fill_model.py": {
+    "testing": "tests/unit/engine/test_fill_model.py"
+  },
+  "src/engine/runner.py": {
+    "testing": "tests/unit/engine/test_runner.py"
   },
   "src/execution/adapters/in_memory_state_store.py": {
     "testing": [
@@ -57,7 +173,10 @@
   },
   "src/execution/domain/intents.py": {
     "testing": [
+      "tests/integration/engine/test_unified_event_backtester.py",
       "tests/integration/execution/test_submission_gate.py",
+      "tests/unit/data/test_backtest_runner.py",
+      "tests/unit/engine/test_backtest.py",
       "tests/unit/execution/test_intents.py",
       "tests/unit/execution/test_submit_intents.py"
     ]
@@ -65,6 +184,7 @@
   "src/execution/domain/orders.py": {
     "testing": [
       "tests/integration/execution/test_submission_gate.py",
+      "tests/unit/engine/test_fill_model.py",
       "tests/unit/execution/test_broker.py",
       "tests/unit/execution/test_orders.py",
       "tests/unit/execution/test_submit_intents.py"
@@ -79,98 +199,79 @@
   "src/execution/settings.py": {
     "testing": "tests/unit/execution/test_settings.py"
   },
+  "src/features/contracts.py": {
+    "testing": [
+      "tests/integration/features/test_materialize_qvef.py",
+      "tests/integration/strategy/test_champion_scores.py",
+      "tests/unit/features/test_preprocessing.py",
+      "tests/unit/strategy/test_scoring.py"
+    ]
+  },
+  "src/features/materialize.py": {
+    "testing": "tests/integration/features/test_materialize_qvef.py"
+  },
+  "src/features/preprocessing.py": {
+    "testing": "tests/unit/features/test_preprocessing.py"
+  },
+  "src/features/qvef.py": {
+    "testing": "tests/unit/features/test_qvef.py"
+  },
   "src/integrations/dart/client.py": {
     "testing": [
+      "tests/unit/data/test_dart_backfill.py",
       "tests/unit/integrations/test_client.py",
       "tests/unit/integrations/test_dart_client.py"
     ]
   },
+  "src/integrations/dart/legacy_filing.py": {
+    "testing": "tests/unit/integrations/dart/test_legacy_filing.py"
+  },
+  "src/integrations/dart/xbrl.py": {
+    "testing": "tests/unit/integrations/dart/test_xbrl.py"
+  },
   "src/integrations/kis/client.py": {
-    "testing": "tests/unit/integrations/test_kis_client.py"
+    "testing": "tests/unit/integrations/kis/test_client.py"
+  },
+  "src/integrations/kis/investor_flow.py": {
+    "testing": "tests/unit/integrations/kis/test_investor_flow.py"
   },
   "src/integrations/krx/client.py": {
     "testing": "tests/unit/integrations/test_krx_client.py"
   },
+  "src/integrations/krx/historical.py": {
+    "testing": "tests/unit/integrations/krx/test_historical.py"
+  },
   "src/storage/parquet_datasets.py": {
     "testing": "tests/unit/storage/test_parquet_datasets.py"
   },
-  "src/data/silver.py": {
-    "architecture": "docs/architecture/03_point_in_time_data.md",
-    "testing": "tests/unit/data/test_silver.py"
+  "src/strategy/pipeline.py": {
+    "testing": "tests/unit/strategy/test_pipeline.py"
   },
-  "src/strategy/universe.py": {
-    "architecture": "docs/architecture/04_champion_strategy.md",
-    "testing": "tests/unit/strategy/test_universe.py"
-  },
-  "src/features/qvef.py": {
-    "architecture": "docs/architecture/04_champion_strategy.md",
-    "testing": "tests/unit/features/test_qvef.py"
-  },
-  "src/features/preprocessing.py": {
-    "architecture": "docs/architecture/04_champion_strategy.md",
-    "testing": "tests/unit/features/test_preprocessing.py"
-  },
-  "src/features/materialize.py": {
-    "architecture": "docs/architecture/04_champion_strategy.md"
-  },
-  "src/features/contracts.py": {
-    "architecture": "docs/architecture/04_champion_strategy.md"
+  "src/strategy/portfolio.py": {
+    "testing": "tests/unit/strategy/test_portfolio.py"
   },
   "src/strategy/scoring.py": {
-    "architecture": "docs/architecture/04_champion_strategy.md",
     "testing": "tests/unit/strategy/test_scoring.py"
   },
   "src/strategy/selection.py": {
     "testing": "tests/unit/strategy/test_selection.py"
   },
-  "src/strategy/portfolio.py": {
-    "architecture": "docs/architecture/05_portfolio_and_risk.md",
-    "testing": "tests/unit/strategy/test_portfolio.py"
+  "src/strategy/universe.py": {
+    "testing": "tests/unit/strategy/test_universe.py"
   },
-  "src/strategy/pipeline.py": {
-    "testing": "tests/unit/strategy/test_pipeline.py"
+  "src/validation/bootstrap.py": {
+    "testing": "tests/unit/validation/test_bootstrap.py"
   },
-  "src/engine/backtest.py": {
-    "architecture": "docs/architecture/06_execution_and_ledger.md",
-    "testing": "tests/unit/engine/test_backtest.py"
-  },
-  "src/engine/fill_model.py": {
-    "testing": "tests/unit/engine/test_fill_model.py"
-  },
-  "src/engine/decision.py": {
-    "testing": "tests/unit/engine/test_backtest.py"
-  },
-  "src/engine/runner.py": {
-    "testing": "tests/unit/engine/test_runner.py"
-  },
-  "src/validation/walk_forward.py": {
-    "architecture": "docs/architecture/07_validation_and_promotion.md",
-    "testing": "tests/unit/validation/test_walk_forward.py"
+  "src/validation/metrics.py": {
+    "testing": "tests/unit/validation/test_metrics.py"
   },
   "src/validation/robustness.py": {
-    "architecture": "docs/specs/10_stress_and_promotion_gates.md",
-    "testing": "tests/integration/validation/test_promotion.py"
+    "testing": "tests/unit/validation/test_robustness.py"
   },
-  "src/data/cli.py": {
-    "testing": [
-      "tests/unit/data/test_streaming_stock_normalization.py",
-      "tests/unit/data/test_cli.py"
-    ]
+  "src/validation/runner.py": {
+    "testing": "tests/integration/validation/test_walk_forward_runner.py"
   },
-  "src/data/collection_plan.py": {
-    "testing": "tests/unit/data/test_collection_plan.py"
-  },
-  "src/data/collection.py": {
-    "testing": "tests/integration/data/test_collection.py"
-  },
-  "src/data/bronze_aggregation.py": {
-    "testing": "tests/unit/data/test_bronze_aggregation.py"
-  },
-  "src/data/streaming_normalization.py": {
-    "architecture": "docs/next.md",
-    "testing": "tests/unit/data/test_streaming_stock_normalization.py"
-  },
-  "src/integrations/dart/xbrl.py": {
-    "testing": "tests/unit/integrations/dart/test_xbrl_standard.py"
+  "src/validation/walk_forward.py": {
+    "testing": "tests/unit/validation/test_walk_forward.py"
   }
 }
