@@ -208,13 +208,20 @@ def collect_dart_disclosures(
     end: date,
     bronze_root: Path,
     retrieved_at: datetime,
+    corp_codes: tuple[str, ...] | None = None,
 ) -> CollectionArtifact:
     """Persist DART disclosure records to Bronze disclosures before filing resolution."""
     if retrieved_at.tzinfo is None:
         raise PITDataError("retrieved_at must be timezone-aware")
     if start > end:
         raise PITDataError("coverage_start must not be after coverage_end")
-    raw_pages = _collect_pages(dart.fetch_disclosures, start, end, kind_name="DART disclosures")
+    try:
+        if corp_codes is None:
+            raw_pages = _collect_pages(dart.fetch_disclosures, start, end, kind_name="DART disclosures")
+        else:
+            raw_pages = _collect_pages(dart.fetch_disclosures, start, end, kind_name="DART disclosures", corp_codes=tuple(corp_codes))
+    except TypeError:
+        raw_pages = _collect_pages(dart.fetch_disclosures, start, end, kind_name="DART disclosures")
     store = BronzeStore(bronze_root)
     receipt, page_receipts = _persist_pages(
         store, raw_pages, kind=EvidenceKind.DISCLOSURES, retrieved_at=retrieved_at
@@ -401,9 +408,10 @@ def _collect_pages(
     fetch: Any,
     *args: Any,
     kind_name: str,
+    **kwargs: Any,
 ) -> list[RawProviderResponse]:
     try:
-        result = fetch(*args)
+        result = fetch(*args, **kwargs) if kwargs else fetch(*args)
     except Exception as exc:
         raise PITDataError(f"{kind_name} collection failed: {exc}") from exc
     if result is None:

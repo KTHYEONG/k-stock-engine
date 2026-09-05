@@ -21,8 +21,9 @@ import os
 import shutil
 import uuid
 from dataclasses import asdict
-from datetime import UTC, date, datetime
+from datetime import date, datetime, time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
@@ -45,6 +46,17 @@ _PARTITION_COLUMNS = ("year", "month")
 # a given physical dataset; the cache is never persisted across processes (spec
 # serving rule: keyed only for a single process).
 _VERIFIED_PARTITIONS: dict[tuple[str, str], frozenset[str]] = {}
+
+
+def _session_bounds(scan: pl.LazyFrame, session_start: date, session_end: date) -> tuple[datetime, datetime]:
+    """Build date bounds in the stored session timezone."""
+    session_dtype = scan.collect_schema().get("session")
+    timezone = getattr(session_dtype, "time_zone", None)
+    tzinfo = ZoneInfo(timezone) if timezone else None
+    return (
+        datetime.combine(session_start, datetime.min.time(), tzinfo),
+        datetime.combine(session_end, time.max, tzinfo),
+    )
 
 
 def canonical_content_hash(frame: pl.DataFrame, ordered_columns: list[str]) -> str:
@@ -363,11 +375,13 @@ class ParquetDatasetStore:
         self._verify_entries(dataset_dir, entries, manifest.content_hash)
 
         paths = [dataset_dir / str(entry["path"]) for entry in entries]
+        scan = pl.scan_parquet(paths)
+        session_lower, session_upper = _session_bounds(scan, session_start, session_end)
         scan = (
-            pl.scan_parquet(paths)
+            scan
             .filter(
-                (pl.col("session") >= datetime.combine(session_start, datetime.min.time(), UTC))
-                & (pl.col("session") <= datetime.combine(session_end, datetime.min.time(), UTC))
+                (pl.col("session") >= session_lower)
+                & (pl.col("session") <= session_upper)
             )
             .select(columns)
         )
@@ -411,11 +425,13 @@ class ParquetDatasetStore:
         self._verify_entries(dataset_dir, entries, manifest.content_hash)
 
         paths = [dataset_dir / str(entry["path"]) for entry in entries]
+        scan = pl.scan_parquet(paths)
+        session_lower, session_upper = _session_bounds(scan, session_start, session_end)
         return (
-            pl.scan_parquet(paths)
+            scan
             .filter(
-                (pl.col("session") >= datetime.combine(session_start, datetime.min.time(), UTC))
-                & (pl.col("session") <= datetime.combine(session_end, datetime.min.time(), UTC))
+                (pl.col("session") >= session_lower)
+                & (pl.col("session") <= session_upper)
             )
             .select(columns)
         )

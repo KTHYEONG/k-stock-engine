@@ -6,12 +6,15 @@ import json
 import os
 import re
 import zipfile
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from src.data.schemas import PITDataError
+
+if TYPE_CHECKING:  # pragma: no cover
+    from src.integrations.dart.client import DartCorpCodeRecord
 
 _REQUIRED_FACTS: tuple[str, ...] = (
     "sales",
@@ -60,19 +63,40 @@ class DartXbrlCollector:
 
             self._client = DartApiClient(api_key=key, request_bytes=request_bytes)
 
-    def fetch_disclosures(self, start: date, end: date) -> Iterable[dict[str, Any]]:
+    def fetch_corp_code_records(self) -> tuple[DartCorpCodeRecord, ...]:
+        from src.integrations.dart.client import DartApiClient, DartCorpCodeRecord  # noqa: F401
+
+        if self._client is not None:
+            loader = getattr(self._client, "load_corp_code_records", None)
+            if loader is not None:
+                return tuple(loader())
+        client = DartApiClient(api_key=self._api_key)
+        return tuple(client.load_corp_code_records())
+
+    def fetch_disclosures(self, start: date, end: date, *, corp_codes: tuple[str, ...] | None = None) -> Iterable[dict[str, Any]]:
         if start > end:
             raise PITDataError("coverage_start must not be after coverage_end")
         if self._client is None:
             raise PITDataError("DART disclosures endpoint is not configured")
-        records = self._client.list_disclosures(start, end)
-        if not records:
+        if corp_codes is None:
+            records = self._client.list_disclosures(start, end)
+            if not records:
+                raise PITDataError("DART disclosures response is empty; certification blocked")
+            return ({"records": records, "start": start.isoformat(), "end": end.isoformat()},)
+        codes = tuple(dict.fromkeys(c.strip() for c in corp_codes if c and c.strip()))
+        if not codes:
             raise PITDataError("DART disclosures response is empty; certification blocked")
-        return ({"records": records, "start": start.isoformat(), "end": end.isoformat()},)
+        pages: list[dict[str, Any]] = []
+        for code in codes:
+            records = self._client.list_disclosures(start, end, corp_code=code)
+            pages.append({"records": list(records), "corp_code": code, "start": start.isoformat(), "end": end.isoformat()})
+        if not pages:
+            raise PITDataError("DART disclosures response is empty; certification blocked")
+        return tuple(pages)
 
     @staticmethod
     def filing_identities_from_bronze(
-        bronze_root: Path | str, *, start: date, end: date
+        bronze_root: Path | str, *, start: date, end: date, ticker_by_corp_code: Mapping[str, str] | None = None, required_periods: frozenset[str] | None = None
     ) -> tuple[dict[str, str], ...]:
         """Select only periodic financial filings with complete OpenDART account identity."""
         paths = sorted((Path(bronze_root) / "disclosures").glob("*/payload.json"))
@@ -119,18 +143,28 @@ class DartXbrlCollector:
                     ).isoformat()
                 except ValueError:
                     continue
-                identities.append(
-                    {
-                        "corp_code": corp_code,
-                        "filing_id": filing_id,
-                        "rcept_no": filing_id,
-                        "biz_year": year,
-                        "reprt_code": str(report_code),
-                        "fs_div": "CFS",
-                        "published_at": published_at,
-                        "correction_of": str(record.get("rm") or "").strip(),
-                    }
-                )
+                quarter = _REPRT_QUARTER.get(str(report_code), "")
+                fiscal_period = f"{year}{quarter}" if quarter else ""
+                if required_periods is not None and fiscal_period not in required_periods:
+                    continue
+                entry: dict[str, str] = {
+                    "corp_code": corp_code,
+                    "filing_id": filing_id,
+                    "rcept_no": filing_id,
+                    "biz_year": year,
+                    "reprt_code": str(report_code),
+                    "fs_div": "CFS",
+                    "published_at": published_at,
+                    "correction_of": str(record.get("rm") or "").strip(),
+                }
+                if fiscal_period:
+                    entry["fiscal_period"] = fiscal_period
+                if ticker_by_corp_code is not None:
+                    ticker = ticker_by_corp_code.get(corp_code)
+                    if ticker is None:
+                        continue
+                    entry["ticker"] = str(ticker)
+                identities.append(entry)
         unique: dict[tuple[tuple[str, str], ...], dict[str, str]] = {}
         for identity in identities:
             unique[tuple(sorted(identity.items()))] = identity
@@ -234,6 +268,7 @@ class DartXbrlCollector:
                     "reprt_code": reprt_code,
                     "fs_div": fs_div,
                     "published_at": str(item.get("published_at") or "").strip(),
+                    "ticker": str(item.get("ticker") or "").strip(),
                 }
             )
         pages: list[dict[str, Any]] = []
@@ -329,11 +364,13 @@ class DartXbrlCollector:
                         row.get("rcept_no") or identity.get("filing_id") or ""
                     ).strip()
                     fs_div = str(row.get("fs_div") or identity.get("fs_div") or "CFS").strip()
+                    ticker = str(row.get("ticker") or identity.get("ticker") or "").strip()
                     canonical.append(
                         {
                             **row,
                             "company_id": corp_code,
                             "corp_code": corp_code,
+                            "ticker": ticker,
                             "filing_id": filing_id,
                             "fiscal_period": fiscal_period,
                             "fact": fact,
