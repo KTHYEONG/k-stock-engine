@@ -1,0 +1,182 @@
+{
+  "feature": "dart_historical_fact_backfill",
+  "title": "2016 PIT DART fact backfill 및 KRX-DART 식별자 연결",
+  "domain": "data",
+  "target_file": "src/data/dart_backfill.py",
+  "context_files": [
+    "src/integrations/dart/client.py",
+    "src/integrations/dart/xbrl.py",
+    "src/data/collection.py",
+    "src/data/normalization.py",
+    "src/data/gold.py",
+    "src/data/cli.py",
+    "tests/unit/integrations/test_dart_client.py",
+    "tests/unit/integrations/dart/test_xbrl_standard.py",
+    "tests/unit/data/test_normalization.py",
+    "data/artifacts/gold_audit/4a6336ccb98e1792.json"
+  ],
+  "evidence": {
+    "gold_audit": "bar-eligible 1,774; DART-eligible 0; insufficient_quarters 845; missing_required_facts 519",
+    "silver_join_audit": "security_master company_id 3,220 values; financial_facts company_id 845 values; intersection 0",
+    "root_cause": "security_master uses KRX ticker as company_id while DART facts use corp_code, and the earliest 2016 decision lacks a complete 2014Q4--2015Q3 fact chain"
+  },
+  "objective": "2016 검증 시작일에 필요한 2014Q4~2015Q3 분기 fact를 PIT-safe하게 보강하고, 검증된 ticker↔corp_code bridge를 통해 Silver/Gold 조인이 실제로 성립하게 한다.",
+  "assumptions": [
+    "2016-01-04의 최신 가능한 4분기 체인은 2014Q4, 2015Q1, 2015Q2, 2015Q3이다.",
+    "corpCode.xml은 식별자 증거일 뿐 미래 재무정보가 아니다. exact six-digit ticker 일치만 허용하고 회사명 유추는 금지한다.",
+    "corpCode.xml raw receipt와 backfill plan은 immutable Bronze/artifact로 저장하며 재시도는 같은 plan_id와 검증된 receipt만 재사용한다."
+  ],
+  "changes": [
+    {
+      "name": "DartCorpCodeRecord",
+      "signature": "@dataclass(frozen=True, slots=True) class DartCorpCodeRecord: ticker: str; corp_code: str; corp_name: str",
+      "kind": "class",
+      "target_file": "src/integrations/dart/client.py"
+    },
+    {
+      "name": "DartApiClient.load_corp_code_records",
+      "signature": "def load_corp_code_records(self) -> tuple[DartCorpCodeRecord, ...]",
+      "kind": "function",
+      "target_file": "src/integrations/dart/client.py"
+    },
+    {
+      "name": "DartApiClient.list_disclosures",
+      "signature": "def list_disclosures(self, start: date, end: date, *, corp_code: str | None = None, page_count: int = 100) -> list[dict[str, str]]",
+      "kind": "function",
+      "target_file": "src/integrations/dart/client.py"
+    },
+    {
+      "name": "DartXbrlCollector.fetch_corp_code_records",
+      "signature": "def fetch_corp_code_records(self) -> tuple[DartCorpCodeRecord, ...]",
+      "kind": "function",
+      "target_file": "src/integrations/dart/xbrl.py"
+    },
+    {
+      "name": "DartXbrlCollector.fetch_disclosures",
+      "signature": "def fetch_disclosures(self, start: date, end: date, *, corp_codes: tuple[str, ...] | None = None) -> Iterable[dict[str, Any]]",
+      "kind": "function",
+      "target_file": "src/integrations/dart/xbrl.py"
+    },
+    {
+      "name": "collect_dart_disclosures",
+      "signature": "def collect_dart_disclosures(*, dart: Any, start: date, end: date, bronze_root: Path, retrieved_at: datetime, corp_codes: tuple[str, ...] | None = None) -> CollectionArtifact",
+      "kind": "function",
+      "target_file": "src/data/collection.py"
+    },
+    {
+      "name": "DartXbrlCollector.filing_identities_from_bronze",
+      "signature": "def filing_identities_from_bronze(bronze_root: Path | str, *, start: date, end: date, ticker_by_corp_code: Mapping[str, str] | None = None, required_periods: frozenset[str] | None = None) -> tuple[dict[str, str], ...]",
+      "kind": "function",
+      "target_file": "src/integrations/dart/xbrl.py"
+    },
+    {
+      "name": "DartHistoricalBackfillRequest",
+      "signature": "@dataclass(frozen=True, slots=True) class DartHistoricalBackfillRequest: bronze_root: Path; artifact_root: Path; silver_root: Path; validation_start: date; validation_end: date; retrieved_at: datetime; offset: int; limit: int",
+      "kind": "class",
+      "target_file": "src/data/dart_backfill.py"
+    },
+    {
+      "name": "DartHistoricalBackfillPlan",
+      "signature": "@dataclass(frozen=True, slots=True) class DartHistoricalBackfillPlan: plan_id: str; required_periods: tuple[str, ...]; ticker_by_corp_code: Mapping[str, str]; unresolved_tickers: tuple[str, ...]; identities: tuple[Mapping[str, str], ...]; corp_code_receipt_hash: str",
+      "kind": "class",
+      "target_file": "src/data/dart_backfill.py"
+    },
+    {
+      "name": "build_dart_historical_backfill_plan",
+      "signature": "def build_dart_historical_backfill_plan(*, security_master: pl.DataFrame, corp_code_records: tuple[DartCorpCodeRecord, ...], validation_start: date, validation_end: date, corp_code_receipt_hash: str) -> DartHistoricalBackfillPlan",
+      "kind": "function",
+      "target_file": "src/data/dart_backfill.py"
+    },
+    {
+      "name": "run_dart_historical_backfill_batch",
+      "signature": "def run_dart_historical_backfill_batch(*, request: DartHistoricalBackfillRequest, dart: DartXbrlCollector) -> DartHistoricalBackfillPlan",
+      "kind": "function",
+      "target_file": "src/data/dart_backfill.py"
+    },
+    {
+      "name": "normalize_dart_financial_facts",
+      "signature": "def normalize_dart_financial_facts(*, pages: Any, disclosure_rows: Any, source_hash: str, calendar: SessionCalendar, decision_time: datetime) -> pl.DataFrame",
+      "kind": "function",
+      "target_file": "src/data/normalization.py"
+    },
+    {
+      "name": "--backfill-dart-facts",
+      "signature": "subcommand arguments: --silver-root --bronze-root --artifact-root --validation-start --validation-end --offset --limit --retrieved-at",
+      "kind": "cli_argument",
+      "target_file": "src/data/cli.py"
+    }
+  ],
+  "wiring": [
+    {
+      "caller_file": "src/data/cli.py",
+      "anchor": "def _parse_args",
+      "import_symbol": "run_dart_historical_backfill_batch",
+      "invocation_expression": "run_dart_historical_backfill_batch("
+    },
+    {
+      "caller_file": "src/data/cli.py",
+      "anchor": "if args.command == \"collect-dart-facts\"",
+      "import_symbol": "DartHistoricalBackfillRequest",
+      "invocation_expression": "DartHistoricalBackfillRequest("
+    },
+    {
+      "caller_file": "src/integrations/dart/xbrl.py",
+      "anchor": "def fetch_financial_fact_sources",
+      "import_symbol": "ticker",
+      "invocation_expression": "identity.get(\"ticker\")"
+    }
+  ],
+  "requirements": [
+    "list_disclosures retrieves all pages in ascending page_no order, deduplicates by rcept_no, rejects invalid/contradictory pagination metadata and never equates page 1 with complete coverage.",
+    "The corpCode.xml raw payload is persisted before use. Reject unsafe XML, blank or non-six-digit tickers, blank corp codes, and one ticker mapped to multiple corp codes. load_corp_codes remains a backward-compatible projection.",
+    "The plan includes only common-share instruments available at validation_start, exact ticker mappings, and four fiscal periods ending with the latest quarter that can legally be available before validation_start. For 2016-01-04 the result is exactly 2014Q4..2015Q3.",
+    "The runner supplies only the sorted mapped corp_codes for its batch to collect_dart_disclosures; the collector requests each corp code through paginated list_disclosures and never falls back to an all-corporation range query. A filing is selected only if periodic, in required_periods, mapped by the frozen bridge, and published no later than its decision cutoff. Corrections remain distinct identities and existing available_at selection decides their PIT use.",
+    "Fact identities and canonical records preserve ticker plus corp_code. Silver normalizes company_id to verified ticker, preserves dart_corp_code and ticker provenance (including empty schema), and drops unmapped/mismatched records fail-closed. next_krx_session_open behavior is unchanged.",
+    "The runner writes artifact_root/dart_backfill/<plan_id>.json before fact requests. It contains canonical-input SHA-256 plan_id, required periods, mapping receipt hash, sorted mappings/unresolved tickers, selected identities, offset/limit, Bronze receipt hashes, source counts, and ticker-period coverage.",
+    "The runner fails before collection if master/map is absent, bridge has zero mappings, or batch is empty. Incomplete coverage is reported per ticker and never promoted to Gold eligibility.",
+    "No network tests. Complexity is O(DART pages + disclosures + fact rows), with no KRX×disclosure cartesian product."
+  ],
+  "scenarios": [
+    {
+      "scenario_id": "test_list_disclosures_collects_all_pages_deduplicates_and_orders",
+      "target_test_file": "tests/unit/integrations/test_dart_client.py",
+      "execution_command": "uv run pytest tests/unit/integrations/test_dart_client.py -k list_disclosures_collects_all_pages_deduplicates_and_orders -q",
+      "expected_behavior": "All paginated receipts are returned once in deterministic order.",
+      "test_skeleton": "def test_list_disclosures_collects_all_pages_deduplicates_and_orders() -> None:\n    from datetime import date\n    from src.integrations.dart.client import DartApiClient\n\n    pages = {\"1\": {\"status\": \"000\", \"total_page\": \"2\", \"list\": [{\"rcept_no\": \"20150515000002\", \"rcept_dt\": \"20150515\", \"corp_code\": \"001\", \"corp_name\": \"A\", \"report_nm\": \"분기보고서 (2015.03)\", \"rm\": \"\"}]}, \"2\": {\"status\": \"000\", \"total_page\": \"2\", \"list\": [{\"rcept_no\": \"20150515000001\", \"rcept_dt\": \"20150515\", \"corp_code\": \"001\", \"corp_name\": \"A\", \"report_nm\": \"분기보고서 (2015.03)\", \"rm\": \"\"}]}}\n    client = DartApiClient(api_key=\"key\", request_json=lambda _endpoint, p: pages[p[\"page_no\"]])\n\n    rows = client.list_disclosures(date(2015, 1, 1), date(2015, 12, 31))\n\n    assert [row[\"rcept_no\"] for row in rows] == [\"20150515000001\", \"20150515000002\"]\n"
+    },
+    {
+      "scenario_id": "test_backfill_plan_requires_exact_ticker_to_corp_code_bridge",
+      "target_test_file": "tests/unit/data/test_dart_backfill.py",
+      "execution_command": "uv run pytest tests/unit/data/test_dart_backfill.py -k backfill_plan_requires_exact_ticker_to_corp_code_bridge -q",
+      "expected_behavior": "Only exact mappings enter the plan and unmapped tickers are explicit.",
+      "test_skeleton": "def test_backfill_plan_requires_exact_ticker_to_corp_code_bridge() -> None:\n    from datetime import UTC, date, datetime\n    import polars as pl\n    from src.data.dart_backfill import build_dart_historical_backfill_plan\n    from src.integrations.dart.client import DartCorpCodeRecord\n\n    master = pl.DataFrame({\"instrument_id\": [\"KRX:005930\", \"KRX:000001\"], \"ticker\": [\"005930\", \"000001\"], \"share_class\": [\"common\", \"common\"], \"valid_from\": [datetime(2010, 1, 1, tzinfo=UTC)] * 2, \"valid_to\": [None, None], \"available_at\": [datetime(2010, 1, 1, tzinfo=UTC)] * 2})\n    records = (DartCorpCodeRecord(ticker=\"005930\", corp_code=\"00126380\", corp_name=\"A\"),)\n\n    plan = build_dart_historical_backfill_plan(security_master=master, corp_code_records=records, validation_start=date(2016, 1, 4), validation_end=date(2016, 12, 29), corp_code_receipt_hash=\"a\" * 64)\n\n    assert plan.required_periods == (\"2014Q4\", \"2015Q1\", \"2015Q2\", \"2015Q3\")\n    assert dict(plan.ticker_by_corp_code) == {\"00126380\": \"005930\"}\n    assert plan.unresolved_tickers == (\"000001\",)\n"
+    },
+    {
+      "scenario_id": "test_filing_identities_attach_frozen_ticker_and_required_period_only",
+      "target_test_file": "tests/unit/integrations/dart/test_xbrl_standard.py",
+      "execution_command": "uv run pytest tests/unit/integrations/dart/test_xbrl_standard.py -k filing_identities_attach_frozen_ticker_and_required_period_only -q",
+      "expected_behavior": "Only mapped, requested-period filings become fact identities.",
+      "test_skeleton": "def test_filing_identities_attach_frozen_ticker_and_required_period_only(tmp_path) -> None:\n    import json\n    from datetime import date\n    from src.integrations.dart.xbrl import DartXbrlCollector\n\n    path = tmp_path / \"bronze\" / \"disclosures\" / \"r1\"\n    path.mkdir(parents=True)\n    path.joinpath(\"payload.json\").write_text(json.dumps({\"records\": [{\"rcept_no\": \"20150515000001\", \"corp_code\": \"00126380\", \"report_nm\": \"분기보고서 (2015.03)\", \"rcept_dt\": \"20150515\"}, {\"rcept_no\": \"20151115000002\", \"corp_code\": \"00126380\", \"report_nm\": \"분기보고서 (2015.09)\", \"rcept_dt\": \"20151115\"}]}), encoding=\"utf-8\")\n\n    rows = DartXbrlCollector.filing_identities_from_bronze(tmp_path / \"bronze\", start=date(2015, 1, 1), end=date(2015, 12, 31), ticker_by_corp_code={\"00126380\": \"005930\"}, required_periods=frozenset({\"2015Q1\"}))\n\n    assert len(rows) == 1\n    assert rows[0][\"ticker\"] == \"005930\"\n    assert rows[0][\"reprt_code\"] == \"11013\"\n"
+    },
+    {
+      "scenario_id": "test_normalize_dart_facts_uses_frozen_ticker_and_rejects_unmapped_corp_code",
+      "target_test_file": "tests/unit/data/test_normalization.py",
+      "execution_command": "uv run pytest tests/unit/data/test_normalization.py -k normalize_dart_facts_uses_frozen_ticker_and_rejects_unmapped_corp_code -q",
+      "expected_behavior": "Only facts with a verified ticker bridge are normalized for KRX joins.",
+      "test_skeleton": "def test_normalize_dart_facts_uses_frozen_ticker_and_rejects_unmapped_corp_code() -> None:\n    from datetime import UTC, datetime\n    from src.core.time import SessionCalendar\n    from src.data.normalization import normalize_dart_financial_facts\n\n    pages = [{\"records\": [{\"corp_code\": \"00126380\", \"ticker\": \"005930\", \"fiscal_period\": \"2015Q3\", \"filing_id\": \"F1\", \"fact\": \"sales\", \"published_at\": datetime(2015, 11, 16, 9, tzinfo=UTC), \"value\": 1.0, \"unit\": \"KRW\", \"consolidated\": True}, {\"corp_code\": \"00999999\", \"fiscal_period\": \"2015Q3\", \"filing_id\": \"F2\", \"fact\": \"sales\", \"published_at\": datetime(2015, 11, 16, 9, tzinfo=UTC), \"value\": 2.0, \"unit\": \"KRW\", \"consolidated\": True}]}]\n    frame = normalize_dart_financial_facts(pages=pages, disclosure_rows=(), source_hash=\"b\" * 64, calendar=SessionCalendar((datetime(2015, 11, 17, 9, tzinfo=UTC),)), decision_time=datetime(2016, 1, 4, 9, tzinfo=UTC))\n\n    assert frame.select([\"company_id\", \"dart_corp_code\", \"ticker\"]).to_dicts() == [{\"company_id\": \"005930\", \"dart_corp_code\": \"00126380\", \"ticker\": \"005930\"}]\n"
+    },
+    {
+      "scenario_id": "test_backfill_batch_writes_deterministic_plan_artifact_before_fact_collection",
+      "target_test_file": "tests/unit/data/test_dart_backfill.py",
+      "execution_command": "uv run pytest tests/unit/data/test_dart_backfill.py -k backfill_batch_writes_deterministic_plan_artifact_before_fact_collection -q",
+      "expected_behavior": "A plan artifact exists before collection and freezes mapping plus required periods.",
+      "test_skeleton": "def test_backfill_batch_writes_deterministic_plan_artifact_before_fact_collection(tmp_path, monkeypatch) -> None:\n    from datetime import UTC, date, datetime\n    import json\n    import polars as pl\n    from src.data.dart_backfill import DartHistoricalBackfillRequest, run_dart_historical_backfill_batch\n    from src.integrations.dart.client import DartCorpCodeRecord\n\n    class Collector:\n        def fetch_corp_code_records(self):\n            return (DartCorpCodeRecord(ticker=\"005930\", corp_code=\"00126380\", corp_name=\"A\"),)\n    master = pl.DataFrame({\"instrument_id\": [\"KRX:005930\"], \"ticker\": [\"005930\"], \"share_class\": [\"common\"], \"valid_from\": [datetime(2010, 1, 1, tzinfo=UTC)], \"valid_to\": [None], \"available_at\": [datetime(2010, 1, 1, tzinfo=UTC)]})\n    monkeypatch.setattr(\"src.data.dart_backfill._load_security_master\", lambda _root: master)\n    monkeypatch.setattr(\"src.data.dart_backfill._persist_corp_code_receipt\", lambda **_kwargs: \"c\" * 64)\n    monkeypatch.setattr(\"src.data.dart_backfill.collect_dart_disclosures\", lambda **_kwargs: None)\n    monkeypatch.setattr(\"src.data.dart_backfill.DartXbrlCollector.filing_identities_from_bronze\", lambda *_args, **_kwargs: ())\n\n    request = DartHistoricalBackfillRequest(bronze_root=tmp_path / \"bronze\", artifact_root=tmp_path / \"artifacts\", silver_root=tmp_path / \"silver\", validation_start=date(2016, 1, 4), validation_end=date(2016, 12, 29), retrieved_at=datetime(2016, 1, 4, tzinfo=UTC), offset=0, limit=1)\n    plan = run_dart_historical_backfill_batch(request=request, dart=Collector())\n\n    payload = json.loads((tmp_path / \"artifacts\" / \"dart_backfill\" / f\"{plan.plan_id}.json\").read_text())\n    assert payload[\"ticker_by_corp_code\"] == {\"00126380\": \"005930\"}\n    assert payload[\"required_periods\"] == [\"2014Q4\", \"2015Q1\", \"2015Q2\", \"2015Q3\"]\n"
+    }
+  ],
+  "acceptance_commands": [
+    "uv run python tools/agent_skills/lean_check.py --spec docs/specs/dart_historical_fact_backfill_contract.json --pre-impl",
+    "uv run pytest tests/unit/integrations/test_dart_client.py tests/unit/integrations/dart/test_xbrl_standard.py tests/unit/data/test_dart_backfill.py tests/unit/data/test_normalization.py tests/unit/data/test_gold.py -q",
+    "uv run ruff check src/integrations/dart/client.py src/integrations/dart/xbrl.py src/data/dart_backfill.py src/data/normalization.py src/data/cli.py tests/unit/integrations/test_dart_client.py tests/unit/integrations/dart/test_xbrl_standard.py tests/unit/data/test_dart_backfill.py tests/unit/data/test_normalization.py",
+    "uv run python -m src.data.cli backfill-dart-facts --silver-root data/silver/stocks --bronze-root data/bronze/stocks --artifact-root data/artifacts --validation-start 2016-01-04 --validation-end 2016-12-29 --offset 0 --limit 100 --retrieved-at 2016-12-30T00:00:00+00:00"
+  ]
+}

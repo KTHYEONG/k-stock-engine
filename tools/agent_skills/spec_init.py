@@ -49,6 +49,11 @@ def main() -> None:
     for adr in relevant_adrs:
         print(f"• [{adr.get('adr_id')}] {adr.get('title')} ({adr.get('date')})")
         print(f"  - Resolution: {adr.get('resolution')}")
+        archive_path = adr.get("archive_path")
+        if archive_path:
+            # Pointer only -- Read this file if the prior design_rationale/
+            # performance_budget is actually relevant to this spec.
+            print(f"  - Full contract archive: {archive_path}")
 
     # 2. Search code map entries from code_map.json
     # Tolerate absent active code_map.json
@@ -90,7 +95,13 @@ def main() -> None:
                 "file": f"src/{args.domain}/pipeline.py",
                 "anchor": "def run_pipeline",
                 "invocation_expression": f"calc_{feature_slug}(val)"
-            }
+            },
+            "design_rationale": {
+                "alternatives_considered": "",
+                "chosen_reason": "",
+                "failure_modes": []
+            },
+            "performance_budget": None
         }
         with open(output_contract, "w", encoding="utf-8") as f:
             json.dump(boilerplate_contract, f, indent=2)
