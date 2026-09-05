@@ -40,3 +40,38 @@ def test_normalize_dart_facts_preserves_all_filings_and_pit_excludes_later_corre
     assert frame.height == 2
     assert set(frame["filing_id"].to_list()) == {"Q1", "Q2"}
     assert set(frame["source_kind"].to_list()) == {"legacy_document"}
+
+
+def test_normalize_dart_facts_uses_frozen_ticker_and_rejects_unmapped_corp_code() -> None:
+    from datetime import UTC, datetime
+    from src.core.time import SessionCalendar
+    from src.data.normalization import normalize_dart_financial_facts
+
+    pages = [{"records": [{"corp_code": "00126380", "ticker": "005930", "fiscal_period": "2015Q3", "filing_id": "F1", "fact": "sales", "published_at": datetime(2015, 11, 16, 9, tzinfo=UTC), "value": 1.0, "unit": "KRW", "consolidated": True}, {"corp_code": "00999999", "fiscal_period": "2015Q3", "filing_id": "F2", "fact": "sales", "published_at": datetime(2015, 11, 16, 9, tzinfo=UTC), "value": 2.0, "unit": "KRW", "consolidated": True}]}]
+    frame = normalize_dart_financial_facts(pages=pages, disclosure_rows=(), source_hash="b" * 64, calendar=SessionCalendar((datetime(2015, 11, 17, 9, tzinfo=UTC),)), decision_time=datetime(2016, 1, 4, 9, tzinfo=UTC))
+
+    assert frame.select(["company_id", "dart_corp_code", "ticker"]).to_dicts() == [{"company_id": "005930", "dart_corp_code": "00126380", "ticker": "005930"}]
+
+
+def test_normalize_dart_facts_inherits_frozen_page_ticker_bridge() -> None:
+    from datetime import UTC, datetime
+    from src.core.time import SessionCalendar
+    from src.data.normalization import normalize_dart_financial_facts
+
+    page = {
+        "corp_code": "00126380",
+        "ticker": "005930",
+        "records": [{
+            "company_id": "00126380", "fiscal_period": "2015Q3", "filing_id": "F1",
+            "fact": "sales", "published_at": datetime(2015, 11, 16, 9, tzinfo=UTC),
+            "value": 1.0, "unit": "KRW", "consolidated": True,
+        }],
+    }
+    frame = normalize_dart_financial_facts(
+        pages=[page], disclosure_rows=(), source_hash="d" * 64,
+        calendar=SessionCalendar((datetime(2015, 11, 17, 9, tzinfo=UTC),)),
+        decision_time=datetime(2016, 1, 4, 9, tzinfo=UTC),
+    )
+    assert frame.select(["company_id", "dart_corp_code", "ticker"]).to_dicts() == [
+        {"company_id": "005930", "dart_corp_code": "00126380", "ticker": "005930"}
+    ]
