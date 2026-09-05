@@ -211,3 +211,19 @@ def test_filing_identities_from_bronze_multi_receipt(tmp_path: Any) -> None:
     assert fids == {"20150515001111", "20150817002222"}
     reprt_codes = {item["reprt_code"] for item in identities}
     assert reprt_codes == {"11013", "11012"}
+
+
+def test_filing_identities_attach_frozen_ticker_and_required_period_only(tmp_path) -> None:
+    import json
+    from datetime import date
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    path = tmp_path / "bronze" / "disclosures" / "r1"
+    path.mkdir(parents=True)
+    path.joinpath("payload.json").write_text(json.dumps({"records": [{"rcept_no": "20150515000001", "corp_code": "00126380", "report_nm": "분기보고서 (2015.03)", "rcept_dt": "20150515"}, {"rcept_no": "20151115000002", "corp_code": "00126380", "report_nm": "분기보고서 (2015.09)", "rcept_dt": "20151115"}]}), encoding="utf-8")
+
+    rows = DartXbrlCollector.filing_identities_from_bronze(tmp_path / "bronze", start=date(2015, 1, 1), end=date(2015, 12, 31), ticker_by_corp_code={"00126380": "005930"}, required_periods=frozenset({"2015Q1"}))
+
+    assert len(rows) == 1
+    assert rows[0]["ticker"] == "005930"
+    assert rows[0]["reprt_code"] == "11013"
