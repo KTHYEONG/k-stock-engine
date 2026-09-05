@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
+from zoneinfo import ZoneInfo
 
 import polars as pl
 import pytest
@@ -122,6 +123,43 @@ class TestBoundedRead:
             columns=["instrument_id", "close", "feature__c"],
         )
         assert set(bounded.columns) == {"instrument_id", "close", "feature__c"}
+
+    def test_accepts_session_partitions_stored_in_krx_timezone(self, tmp_path) -> None:
+        store = ParquetDatasetStore(tmp_path / "krx")
+        krx = ZoneInfo("Asia/Seoul")
+        data = frame().with_columns(pl.col("session").dt.convert_time_zone("Asia/Seoul"))
+        store.write_partitioned(
+            data,
+            dataset_id="krx_features_v1",
+            manifest=manifest(data),
+            expected_feature_set=FEATURE_SET,
+            decision_time=DECISION,
+        )
+        bounded = store.read_bounded(
+            "krx_features_v1",
+            AssetKind.STOCK,
+            FEATURE_SET,
+            DECISION,
+            session_start=date(2024, 1, 1),
+            session_end=date(2024, 1, 31),
+            columns=["instrument_id", "session", "close"],
+        )
+        assert bounded.height == 3
+        assert bounded["session"][0] == datetime(2024, 1, 2, 9, tzinfo=krx)
+
+    def test_includes_intraday_session_on_requested_end_date(self, tmp_path) -> None:
+        store = ParquetDatasetStore(tmp_path / "intraday")
+        data = frame().with_columns(pl.col("session").dt.offset_by("9h"))
+        store.write_partitioned(
+            data, dataset_id="intraday_features_v1", manifest=manifest(data),
+            expected_feature_set=FEATURE_SET, decision_time=DECISION,
+        )
+        bounded = store.read_bounded(
+            "intraday_features_v1", AssetKind.STOCK, FEATURE_SET, DECISION,
+            session_start=date(2024, 2, 1), session_end=date(2024, 2, 1),
+            columns=["instrument_id", "session", "close"],
+        )
+        assert bounded.height == 1
 
     def test_requested_column_absent_from_dataset_is_rejected(self, store) -> None:
         with pytest.raises(ValueError, match="absent from dataset"):
