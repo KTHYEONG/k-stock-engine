@@ -74,6 +74,11 @@ def normalize_dart_financial_facts(
                     for k in ("company_id", "filing_id", "fiscal_period", "published_at"):
                         if (not merged.get(k)) and page.get(k) is not None:
                             merged[k] = page[k]
+                    page_ticker = str(page.get("ticker") or "").strip()
+                    if page_ticker and not merged.get("ticker"):
+                        merged["ticker"] = page_ticker
+                    if page_ticker and not merged.get("corp_code") and page.get("corp_code"):
+                        merged["corp_code"] = page["corp_code"]
                     if (not merged.get("filing_id")) and page_identity.get("filing_id"):
                         merged["filing_id"] = page_identity["filing_id"]
                     if (not merged.get("company_id")) and page_identity.get("corp_code"):
@@ -85,11 +90,45 @@ def normalize_dart_financial_facts(
     seen: set[tuple[str, str, str, str, str]] = set()
     for rec in flat:
         try:
-            company_id = str(rec.get("company_id") or "").strip()
+            import re as _re
+
+            raw_company = str(rec.get("company_id") or "").strip()
+            raw_ticker = str(rec.get("ticker") or "").strip()
+            raw_corp = str(rec.get("corp_code") or rec.get("dart_corp_code") or "").strip()
             fiscal_period = str(rec.get("fiscal_period") or "").strip()
             filing_id = str(rec.get("filing_id") or rec.get("rcept_no") or "").strip()
             fact = str(rec.get("fact") or rec.get("account") or "").strip()
-            if not company_id or not fiscal_period or not filing_id or not fact:
+            if not fiscal_period or not filing_id or not fact:
+                continue
+            ticker_ok = bool(_re.match(r"^\d{6}$", raw_ticker)) if raw_ticker else False
+            if raw_ticker and not ticker_ok:
+                continue
+            if raw_ticker:
+                if not raw_corp:
+                    continue
+                company_id = raw_ticker
+                dart_corp_code = raw_corp
+                ticker = raw_ticker
+            elif raw_company:
+                if raw_corp:
+                    # A corp_code without the frozen ticker bridge is not joinable PIT evidence.
+                    if not _re.match(r"^\d{6}$", raw_company):
+                        continue
+                    continue
+                elif _re.match(r"^\d{6}$", raw_company):
+                    company_id = raw_company
+                    dart_corp_code = ""
+                    ticker = raw_company
+                else:
+                    company_id = raw_company
+                    dart_corp_code = raw_corp
+                    ticker = str(rec.get("ticker") or "").strip()
+            else:
+                continue
+            # Fail-closed: ticker-bridged records require six-digit ticker plus corp code.
+            if raw_corp and raw_ticker == "" and not raw_company:
+                continue
+            if not company_id:
                 continue
             restatement_id = str(rec.get("restatement_id") or rec.get("restatement") or "r0").strip() or "r0"
             key = (company_id, fiscal_period, filing_id, fact, restatement_id)
@@ -132,6 +171,8 @@ def normalize_dart_financial_facts(
             rows.append(
                 {
                     "company_id": company_id,
+                    "dart_corp_code": dart_corp_code,
+                    "ticker": ticker,
                     "fiscal_period": fiscal_period,
                     "filing_id": filing_id,
                     "fact": fact,
@@ -153,6 +194,8 @@ def normalize_dart_financial_facts(
         return pl.DataFrame(
             {
                 "company_id": pl.Series([], dtype=pl.String),
+                "dart_corp_code": pl.Series([], dtype=pl.String),
+                "ticker": pl.Series([], dtype=pl.String),
                 "fiscal_period": pl.Series([], dtype=pl.String),
                 "filing_id": pl.Series([], dtype=pl.String),
                 "fact": pl.Series([], dtype=pl.String),
