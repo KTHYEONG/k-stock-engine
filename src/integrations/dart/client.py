@@ -6,11 +6,19 @@ import os
 import time
 import zipfile
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import date
 from typing import Any
 from xml.etree import ElementTree
 
 import requests
+
+
+@dataclass(frozen=True, slots=True)
+class DartCorpCodeRecord:
+    ticker: str
+    corp_code: str
+    corp_name: str
 
 
 class DartApiError(RuntimeError):
@@ -126,47 +134,61 @@ class DartApiClient:
         end: date,
         *,
         corp_code: str | None = None,
-        page_no: int = 1,
         page_count: int = 100,
     ) -> list[dict[str, str]]:
         if start > end:
             raise ValueError("start must not be after end")
         if not 1 <= page_count <= 100:
             raise ValueError("page_count must be within [1, 100]")
-        params: dict[str, str] = {
-            "crtfc_key": str(self.api_key),
-            "bgn_de": start.strftime("%Y%m%d"),
-            "end_de": end.strftime("%Y%m%d"),
-            "page_no": str(page_no),
-            "page_count": str(page_count),
-        }
-        if corp_code:
-            params["corp_code"] = corp_code
-        # Use validated request if injection was for validated path
-        if self._request_json is not None and self._raw_request_json is None:
-            # raw injection path: caller supplied request_json that returns raw payload
-            payload = self._request_json(self.DISCLOSURE_ENDPOINT, params)
-            if not isinstance(payload, dict):
-                raise DartTerminalError("DART response must be an object")
-            status = payload.get("status")
-            if status != OK_DART_STATUS:
-                raise DartApiError(f"DART status {status}: {payload}")
-            raw = payload.get("list", [])
-        else:
-            payload = self._request_validated(self.DISCLOSURE_ENDPOINT, params)
-            raw = payload.get("list", [])
-        if not isinstance(raw, list):
-            raise DartApiError("DART disclosure list must be a list")
-        records: list[dict[str, str]] = []
-        for item in raw:
-            if not isinstance(item, dict):
-                continue
-            rcept_no = str(item.get("rcept_no") or "").strip()
-            rcept_dt = str(item.get("rcept_dt") or "").strip()
-            if not rcept_no or not rcept_dt:
-                raise DartApiError("DART disclosure lacks receipt identity")
-            records.append(
-                {
+        by_receipt: dict[str, dict[str, str]] = {}
+        expected_total: int | None = None
+        page_no = 1
+        while True:
+            params: dict[str, str] = {
+                "crtfc_key": str(self.api_key),
+                "bgn_de": start.strftime("%Y%m%d"),
+                "end_de": end.strftime("%Y%m%d"),
+                "page_no": str(page_no),
+                "page_count": str(page_count),
+            }
+            if corp_code:
+                params["corp_code"] = corp_code
+            if self._request_json is not None and self._raw_request_json is None:
+                payload = self._request_json(self.DISCLOSURE_ENDPOINT, params)
+                if not isinstance(payload, dict):
+                    raise DartTerminalError("DART response must be an object")
+                status = payload.get("status")
+                if status != OK_DART_STATUS:
+                    raise DartApiError(f"DART status {status}: {payload}")
+                raw = payload.get("list", [])
+            else:
+                payload = self._request_validated(self.DISCLOSURE_ENDPOINT, params)
+                raw = payload.get("list", [])
+            if not isinstance(raw, list):
+                raise DartApiError("DART disclosure list must be a list")
+            total_raw = payload.get("total_page", payload.get("totalPage"))
+            if total_raw is None:
+                total_page = 1
+            else:
+                try:
+                    total_page = int(str(total_raw).strip())
+                except (TypeError, ValueError) as exc:
+                    raise DartApiError("DART disclosure pagination metadata is invalid") from exc
+                if total_page < 1:
+                    raise DartApiError("DART disclosure pagination metadata is invalid")
+            if expected_total is not None and total_page != expected_total:
+                raise DartApiError("DART disclosure pagination metadata is contradictory")
+            expected_total = total_page
+            if page_no > total_page:
+                raise DartApiError("DART disclosure pagination metadata is contradictory")
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                rcept_no = str(item.get("rcept_no") or "").strip()
+                rcept_dt = str(item.get("rcept_dt") or "").strip()
+                if not rcept_no or not rcept_dt:
+                    raise DartApiError("DART disclosure lacks receipt identity")
+                candidate = {
                     "rcept_no": rcept_no,
                     "rcept_dt": rcept_dt,
                     "corp_code": str(item.get("corp_code") or "").strip(),
@@ -174,8 +196,20 @@ class DartApiClient:
                     "report_nm": str(item.get("report_nm") or "").strip(),
                     "rm": str(item.get("rm") or "").strip(),
                 }
-            )
-        return sorted(records, key=lambda x: (x["rcept_dt"], x["rcept_no"]))
+                previous = by_receipt.get(rcept_no)
+                if previous is not None:
+                    if previous != candidate:
+                        raise DartApiError(
+                            f"DART disclosure receipt {rcept_no} has contradictory records"
+                        )
+                    continue
+                by_receipt[rcept_no] = candidate
+            if page_no >= total_page:
+                break
+            page_no += 1
+            if page_no > 10000:
+                raise DartApiError("DART disclosure pagination exceeded safe bounds")
+        return sorted(by_receipt.values(), key=lambda x: (x["rcept_dt"], x["rcept_no"]))
 
     def fetch_multi_accounts(
         self, corp_codes: tuple[str, ...], *, biz_year: str, reprt_code: str
@@ -236,32 +270,55 @@ class DartApiClient:
             return content
         raise DartRetryableError("DART request exhausted retries for document.xml")
 
-    def load_corp_codes(self) -> dict[str, str]:
-        if not self.api_key:
-            raise ValueError("api_key is required for corpCode")
-        response = requests.get(
-            f"{self.BASE_URL}/corpCode.xml",
-            params={"crtfc_key": str(self.api_key)},
-            timeout=30,
-        )
-        if response.status_code != 200:
-            raise DartApiError(f"DART corpCode HTTP {response.status_code}")
+    def load_corp_code_records(self) -> tuple[DartCorpCodeRecord, ...]:
+        import re as _re
+
+        raw: bytes
+        if self._request_bytes is not None:
+            payload = self._request_bytes("corpCode.xml", {"crtfc_key": str(self.api_key)})
+            if not isinstance(payload, (bytes, bytearray)) or len(payload) == 0:
+                raise DartApiError("DART corpCode.xml is empty")
+            raw = bytes(payload)
+        else:
+            if not self.api_key:
+                raise ValueError("api_key is required for corpCode")
+            response = requests.get(
+                f"{self.BASE_URL}/corpCode.xml",
+                params={"crtfc_key": str(self.api_key)},
+                timeout=30,
+            )
+            if response.status_code != 200:
+                raise DartApiError(f"DART corpCode HTTP {response.status_code}")
+            raw = response.content
         try:
-            with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            with zipfile.ZipFile(io.BytesIO(raw)) as archive:
                 xml_bytes = archive.read("CORPCODE.xml")
-            if b"<!DOCTYPE" in xml_bytes or b"<!ENTITY" in xml_bytes:
-                raise DartApiError("DART corpCode.xml contains unsafe XML declarations")
+        except (zipfile.BadZipFile, OSError, KeyError) as exc:
+            raise DartApiError("DART corpCode.xml could not be parsed") from exc
+        if b"<!DOCTYPE" in xml_bytes or b"<!ENTITY" in xml_bytes:
+            raise DartApiError("DART corpCode.xml contains unsafe XML declarations")
+        try:
             root = ElementTree.fromstring(xml_bytes)  # noqa: S314
-        except zipfile.BadZipFile as exc:
+        except ElementTree.ParseError as exc:
             raise DartApiError("DART corpCode.xml could not be parsed") from exc
-        except (OSError, KeyError, ElementTree.ParseError) as exc:
-            raise DartApiError("DART corpCode.xml could not be parsed") from exc
-        mapping: dict[str, str] = {}
+        ticker_re = _re.compile(r"^\d{6}$")
+        seen: dict[str, DartCorpCodeRecord] = {}
         for item in root.findall("list"):
             ticker = (item.findtext("stock_code") or "").strip()
             corp_code = (item.findtext("corp_code") or "").strip()
-            if ticker and corp_code:
-                mapping[ticker] = corp_code
-        if not mapping:
+            corp_name = (item.findtext("corp_name") or "").strip()
+            if not ticker or not ticker_re.match(ticker):
+                continue
+            if not corp_code:
+                continue
+            prev = seen.get(ticker)
+            if prev is not None and prev.corp_code != corp_code:
+                raise DartApiError(f"DART corpCode.xml maps ticker {ticker} to multiple corp codes")
+            if prev is None:
+                seen[ticker] = DartCorpCodeRecord(ticker=ticker, corp_code=corp_code, corp_name=corp_name)
+        if not seen:
             raise DartApiError("DART corpCode.xml contained no listed tickers")
-        return mapping
+        return tuple(seen[t] for t in sorted(seen))
+
+    def load_corp_codes(self) -> dict[str, str]:
+        return {rec.ticker: rec.corp_code for rec in self.load_corp_code_records()}

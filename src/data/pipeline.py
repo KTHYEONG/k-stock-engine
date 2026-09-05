@@ -10,15 +10,14 @@ from pathlib import Path
 import polars as pl
 
 from src.core.datasets import DatasetCertification
-from src.core.instruments import AssetKind
 from src.core.time import SessionCalendar
 from src.data.bronze import BronzeStore
 from src.data.schemas import BronzeReceipt, EvidenceKind, PITDataError, SilverTable
-from src.data.silver import certify_silver
+from src.data.silver import certify_silver, load_latest_silver_table
 from src.features.contracts import QvefFeaturePolicy, QvefFeatureRow
 from src.features.materialize import materialize_qvef_features
 from src.features.qvef import build_qvef_features
-from src.storage.parquet_datasets import ParquetDatasetStore, canonical_content_hash
+from src.storage.parquet_datasets import canonical_content_hash
 from src.strategy.scoring import ChampionScorePolicy, ChampionScoreRow, materialize_champion_scores, score_champion_rows
 from src.strategy.universe import (
     UniverseDecision,
@@ -155,12 +154,8 @@ def materialize_backtest_inputs(
 def _load_silver_tables(root: Path, decision_time: datetime) -> dict[SilverTable, pl.DataFrame]:
     result: dict[SilverTable, pl.DataFrame] = {}
     for table in SilverTable:
-        table_root = root / table.value
-        candidates = sorted((p for p in table_root.iterdir() if p.is_dir()), reverse=True) if table_root.exists() else []
-        if not candidates:
-            raise PITDataError(f"missing certified Silver table: {table.value}")
         try:
-            result[table] = ParquetDatasetStore(table_root).read(candidates[0].name, AssetKind.STOCK, f"stock_pit_{table.value}_v1", decision_time)
+            result[table] = load_latest_silver_table(root=root, table=table, decision_time=decision_time)
         except (FileNotFoundError, ValueError) as exc:
             raise PITDataError(f"invalid certified Silver table: {table.value}") from exc
     return result

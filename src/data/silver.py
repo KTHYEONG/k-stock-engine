@@ -506,6 +506,43 @@ def complete_minimal_fixture(
     return tables, receipts, report
 
 
+def load_latest_silver_table(*, root: Path, table: SilverTable, decision_time: datetime) -> pl.DataFrame:
+    """Select the latest Silver dataset by manifest generated_time."""
+    if decision_time.tzinfo is None:
+        raise PITDataError("decision_time must be timezone-aware")
+    table_root = Path(root) / table.value
+    if not table_root.exists():
+        raise PITDataError(f"missing certified Silver table: {table.value}")
+    candidates = [p for p in table_root.iterdir() if p.is_dir() and not p.name.startswith(".")]
+    if not candidates:
+        raise PITDataError(f"missing certified Silver table: {table.value}")
+    store = ParquetDatasetStore(table_root)
+    best_id: str | None = None
+    best_key: tuple[datetime, str] | None = None
+    for cand in candidates:
+        ident = cand.name
+        try:
+            manifest = store.read_manifest(ident)
+        except (FileNotFoundError, ValueError, OSError):
+            continue
+        generated = getattr(manifest, "generated_time", None)
+        if not isinstance(generated, datetime):
+            continue
+        if generated.tzinfo is None:
+            continue
+        content_hash = getattr(manifest, "content_hash", "") or ident
+        key = (generated, str(content_hash))
+        if best_key is None or key > best_key:
+            best_key = key
+            best_id = ident
+    if best_id is None:
+        raise PITDataError(f"missing certified Silver table: {table.value}")
+    try:
+        return store.read(best_id, AssetKind.STOCK, f"stock_pit_{table.value}_v1", decision_time)
+    except (FileNotFoundError, ValueError) as exc:
+        raise PITDataError(f"invalid certified Silver table: {table.value}") from exc
+
+
 class SilverStore:
     """Immutable Parquet materialization for Silver tables."""
 

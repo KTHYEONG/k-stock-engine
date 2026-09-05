@@ -24,6 +24,7 @@ from typing import Any
 import polars as pl
 
 from src.core.time import KRX_TZ, SessionCalendar
+from src.data.schemas import PITDataError
 
 # ──────────────────────────────────────────────────────────────────
 # Domain types
@@ -698,35 +699,40 @@ def materialize_gold_window(
 
     if gold_root is not None and all_universe:
         from src.core.datasets import DatasetCertification
+        from src.storage.parquet_datasets import ParquetDatasetStore
 
         dataset_id = manifest.manifest_hash[:32]
-        u_path = materialize_historical_universe(
-            tuple(all_universe),
-            root=Path(gold_root) / "universe",
-            dataset_id=dataset_id,
-            decision_time=decision_time,
-            policy=u_policy,
-            provider_version="official-pit-v1",
-            calendar_hash=manifest.manifest_hash[:16],
-            master_hash=manifest.manifest_hash[16:32],
-            quality_report_hash=manifest.manifest_hash,
-            certification=DatasetCertification.RESEARCH,
-        )
+        universe_root = Path(gold_root) / "universe"
+        existing_universe = universe_root / dataset_id
+        if existing_universe.exists():
+            stored = ParquetDatasetStore(universe_root).read_manifest(dataset_id)
+            if stored.quality_report_hash != manifest.manifest_hash:
+                raise PITDataError("existing Gold universe has a different audit manifest")
+            u_path = existing_universe
+        else:
+            u_path = materialize_historical_universe(
+                tuple(all_universe), root=universe_root, dataset_id=dataset_id,
+                decision_time=decision_time, policy=u_policy, provider_version="official-pit-v1",
+                calendar_hash=manifest.manifest_hash[:16], master_hash=manifest.manifest_hash[16:32],
+                quality_report_hash=manifest.manifest_hash, certification=DatasetCertification.RESEARCH,
+            )
         u_path_str = str(u_path)
 
         if all_features:
-            f_path = materialize_qvef_features(
-                tuple(all_features),
-                root=Path(gold_root) / "qvef",
-                dataset_id=dataset_id,
-                decision_time=decision_time,
-                policy=f_policy,
-                provider_version="official-pit-v1",
-                calendar_hash=manifest.manifest_hash[:16],
-                master_hash=manifest.manifest_hash[16:32],
-                quality_report_hash=manifest.manifest_hash,
-                certification=DatasetCertification.RESEARCH,
-            )
+            feature_root = Path(gold_root) / "qvef"
+            existing_features = feature_root / dataset_id
+            if existing_features.exists():
+                stored = ParquetDatasetStore(feature_root).read_manifest(dataset_id)
+                if stored.quality_report_hash != manifest.manifest_hash:
+                    raise PITDataError("existing Gold features have a different audit manifest")
+                f_path = existing_features
+            else:
+                f_path = materialize_qvef_features(
+                    tuple(all_features), root=feature_root, dataset_id=dataset_id,
+                    decision_time=decision_time, policy=f_policy, provider_version="official-pit-v1",
+                    calendar_hash=manifest.manifest_hash[:16], master_hash=manifest.manifest_hash[16:32],
+                    quality_report_hash=manifest.manifest_hash, certification=DatasetCertification.RESEARCH,
+                )
             f_path_str = str(f_path)
 
     # Write summary artifact
