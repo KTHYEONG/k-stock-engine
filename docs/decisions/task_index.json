@@ -1,0 +1,15 @@
+{
+  "tasks": [
+    {
+      "task_id": "gold_window_partition_loading",
+      "date": "2026-09-05",
+      "adr_id": "ADR_20260905_gold_window_partition_loading",
+      "domain": "gold",
+      "title": "Gold bounded window loading and PIT artifact generation",
+      "why": "Historical Gold execution was blocked by inefficient full reads, timezone boundary mismatches, and identifier joins.",
+      "resolution": "Implemented bounded certified Silver loading, timezone-aware session bounds, DART ticker bridge normalization, master snapshot compaction, and idempotent Gold artifact publication.",
+      "impact": "Gold audit now completes with 1,774 bar-eligible and 1,298 DART-eligible entities, while corporate-action evidence remains the explicit blocker for non-empty features.",
+      "archive_path": "docs/decisions/archive/gold_window_partition_loading/dart_historical_fact_backfill_contract.json"
+    }
+  ]
+}
