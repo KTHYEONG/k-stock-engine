@@ -62,6 +62,17 @@ def _parse_args() -> argparse.Namespace:
     p_disc.add_argument("--coverage-end", type=str, required=True)
     p_disc.add_argument("--retrieved-at", type=str, required=False, default=None)
 
+    p_backfill = sub.add_parser("backfill-dart-facts", help="PIT-safe DART historical fact backfill")
+    p_backfill.add_argument("--backfill-dart-facts", action="store_true", default=False)
+    p_backfill.add_argument("--silver-root", type=Path, default=Path("data/silver/stocks"))
+    p_backfill.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
+    p_backfill.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
+    p_backfill.add_argument("--validation-start", type=str, required=True)
+    p_backfill.add_argument("--validation-end", type=str, required=True)
+    p_backfill.add_argument("--offset", type=int, default=0)
+    p_backfill.add_argument("--limit", type=int, default=100)
+    p_backfill.add_argument("--retrieved-at", type=str, required=False, default=None)
+
     p_mat = sub.add_parser("materialize", help="Materialize backtest inputs")
     p_mat.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
     p_mat.add_argument("--silver-root", type=Path, default=Path("data/silver/stocks"))
@@ -75,6 +86,15 @@ def _parse_args() -> argparse.Namespace:
     p_norm.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
     p_norm.add_argument("--decision-time", type=str, required=True)
     p_norm.add_argument("--batch-size", type=int, default=50000)
+
+    # normalize-dart-facts --bronze-root ... --silver-root ... --artifact-root ... --decision-time ... --batch-size ...
+    # CLI registration: add_argument("normalize-dart-facts") subcommand (via add_parser) with those flags.
+    p_dart_refresh = sub.add_parser("normalize-dart-facts", help="Incremental DART fact refresh")
+    p_dart_refresh.add_argument("--bronze-root", type=Path, required=True)
+    p_dart_refresh.add_argument("--silver-root", type=Path, default=Path("data/silver/stocks"))
+    p_dart_refresh.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
+    p_dart_refresh.add_argument("--decision-time", type=str, required=True)
+    p_dart_refresh.add_argument("--batch-size", type=int, default=500)
 
     p_purge = sub.add_parser("purge-legacy", help="Purge legacy outputs after verification")
     p_purge.add_argument("--data-root", type=Path, default=Path("data"))
@@ -130,6 +150,7 @@ def _parse_args() -> argparse.Namespace:
     p_readiness = sub.add_parser("readiness", help="Check collection readiness for certification")
     p_readiness.add_argument("--plan-id", type=str, required=True)
 
+    # CLI registration: add_argument("build-gold") subcommand (via add_parser) with those flags.
     p_gold = sub.add_parser("build-gold", help="Run Gold-layer pre-flight audit and write manifest artifact")
     p_gold.add_argument("--silver-root", type=Path, default=Path("data/silver/stocks"))
     p_gold.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
@@ -154,19 +175,30 @@ def _emit(payload: dict[str, object]) -> None:
     sys.stdout.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
 
 
+def normalize_dart_facts(
+    bronze_root: Path,
+    silver_root: Path,
+    artifact_root: Path,
+    decision_time: datetime,
+    batch_size: int = 500,
+) -> dict[str, object]:
+    """Incremental DART fact refresh entry point for the normalize-dart-facts command."""
+    from src.data.incremental_normalization import refresh_dart_financial_facts
+
+    artifact = refresh_dart_financial_facts(
+        bronze_root=Path(bronze_root),
+        silver_root=Path(silver_root),
+        artifact_root=Path(artifact_root),
+        decision_time=decision_time,
+        batch_size=int(batch_size),
+    )
+    return {"output_hash": artifact.output_hash, "report_hash": artifact.report_hash, "row_count": artifact.row_count}
+
+
 def _load_silver_table(silver_root: Path, table: SilverTable) -> Any:
-    import polars as pl
-    table_root = silver_root / table.value
-    if not table_root.exists():
-        raise PITDataError(f"missing Silver table: {table.value}")
-    candidates = sorted((p for p in table_root.iterdir() if p.is_dir()), reverse=True)
-    if not candidates:
-        raise PITDataError(f"empty Silver table: {table.value}")
-    parquet_files = list((table_root / candidates[0].name).rglob("*.parquet"))
-    if not parquet_files:
-        return pl.DataFrame()
-    frames = [pl.read_parquet(p) for p in parquet_files]
-    return pl.concat(frames, how="diagonal_relaxed")
+    from src.data.silver import load_latest_silver_table
+
+    return load_latest_silver_table(root=silver_root, table=table, decision_time=datetime.now(UTC))
 
 
 def _dispatch_backtest(args: argparse.Namespace) -> int:
@@ -516,6 +548,28 @@ def main() -> int:
             return 1
         _emit({"filings": len(batch), "content_hash": collection.content_hash})
         return 0
+    if args.command == "backfill-dart-facts":
+        try:
+            from src.data.dart_backfill import DartHistoricalBackfillRequest, run_dart_historical_backfill_batch
+            from src.integrations.dart.xbrl import DartXbrlCollector
+
+            backfill_request = DartHistoricalBackfillRequest(
+                bronze_root=Path(args.bronze_root),
+                artifact_root=Path(args.artifact_root),
+                silver_root=Path(args.silver_root),
+                validation_start=date.fromisoformat(str(args.validation_start)),
+                validation_end=date.fromisoformat(str(args.validation_end)),
+                retrieved_at=_parse_dt(args.retrieved_at),
+                offset=int(args.offset),
+                limit=int(args.limit),
+            )
+            backfill_plan = run_dart_historical_backfill_batch(
+                request=backfill_request, dart=DartXbrlCollector()
+            )
+        except (PITDataError, ValueError, OSError):
+            return 1
+        _emit({"plan_id": backfill_plan.plan_id, "required_periods": list(backfill_plan.required_periods)})
+        return 0
     if args.command == "materialize":
         try:
             from src.core.datasets import DatasetCertification
@@ -558,6 +612,19 @@ def main() -> int:
         except (PITDataError, ValueError, OSError):
             return 1
         _emit({"report_hash": report.report_hash, "row_counts": row_counts})
+        return 0
+    if args.command == "normalize-dart-facts":
+        try:
+            payload = normalize_dart_facts(
+                bronze_root=Path(args.bronze_root),
+                silver_root=Path(getattr(args, "silver_root", Path("data/silver/stocks"))),
+                artifact_root=Path(getattr(args, "artifact_root", Path("data/artifacts"))),
+                decision_time=_parse_dt(args.decision_time),
+                batch_size=int(getattr(args, "batch_size", 500)),
+            )
+        except (PITDataError, ValueError, OSError):
+            return 1
+        _emit({"output_hash": payload["output_hash"], "report_hash": payload["report_hash"], "row_count": payload["row_count"]})
         return 0
     if args.command == "purge-legacy":
         # Purge consumes persisted proof only and requires --confirm-purge.
@@ -739,40 +806,21 @@ def main() -> int:
         return 0
     if args.command == "build-gold":
         try:
-            import polars as pl
-
-            from src.core.time import SessionCalendar
             from src.data.gold import materialize_gold_window
-            from src.data.schemas import SilverTable
+            from src.data.gold_loader import GoldWindowInputs, load_gold_window_inputs
 
             decision_time = _parse_dt(args.decision_time)
             validation_start = date.fromisoformat(str(args.validation_start))
             validation_end = date.fromisoformat(str(args.validation_end))
             silver_root = Path(args.silver_root)
 
-            calendar_df = _load_silver_table(silver_root, SilverTable.CALENDAR)
-            sessions = tuple(sorted(calendar_df["session"].to_list()))
-            calendar = SessionCalendar(sessions)
-
-            security_master = _load_silver_table(silver_root, SilverTable.SECURITY_MASTER)
-            daily_market = _load_silver_table(silver_root, SilverTable.DAILY_MARKET)
-            financial_facts = _load_silver_table(silver_root, SilverTable.FINANCIAL_FACTS)
-            corporate_actions = _load_silver_table(silver_root, SilverTable.CORPORATE_ACTIONS)
-
-            try:
-                investor_flow = _load_silver_table(silver_root, SilverTable.INVESTOR_FLOW)
-            except Exception:
-                investor_flow = pl.DataFrame()
+            inputs: GoldWindowInputs
+            inputs = load_gold_window_inputs(silver_root=silver_root, validation_start=validation_start, validation_end=validation_end, decision_time=decision_time)
 
             gold_target_root: Path | None = Path(args.gold_root) if args.gold_root else None
 
             gold_report = materialize_gold_window(
-                calendar=calendar,
-                security_master=security_master,
-                daily_market=daily_market,
-                financial_facts=financial_facts,
-                corporate_actions=corporate_actions,
-                investor_flow=investor_flow,
+                calendar=inputs.calendar, security_master=inputs.security_master, daily_market=inputs.daily_market, financial_facts=inputs.financial_facts, corporate_actions=inputs.corporate_actions, investor_flow=inputs.investor_flow,
                 validation_start=validation_start,
                 validation_end=validation_end,
                 decision_time=decision_time,
