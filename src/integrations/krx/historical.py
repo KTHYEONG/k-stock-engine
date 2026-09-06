@@ -7,6 +7,7 @@ from datetime import date, datetime
 from typing import Any
 
 from src.data.schemas import PITDataError
+from src.integrations.quota import ProviderQuotaStateStore
 
 
 def _validate_daily_market_records(records: list[dict[str, Any]], *, session: date) -> None:
@@ -26,8 +27,16 @@ def _validate_daily_market_records(records: list[dict[str, Any]], *, session: da
 class KrxHistoricalCollector:
     """Bounded historical KRX evidence; trade flow never maps to investor flow."""
 
-    def __init__(self, api_key: str | None = None, *, request_json: Any | None = None) -> None:
-        key = api_key or os.getenv("KRX_OPENAPI_KEY")
+    def __init__(
+        self,
+        api_key: str | None = None,
+        *,
+        request_json: Any | None = None,
+        quota_store: ProviderQuotaStateStore | None = None,
+        min_interval: float | None = None,
+    ) -> None:
+        raw_key = api_key or os.getenv("KRX_OPENAPI_KEY")
+        key = raw_key.strip().strip("\"'") if raw_key else raw_key
         if not key and request_json is None:
             raise ValueError("KRX_OPENAPI_KEY not found in environment variables")
         self._api_key = key
@@ -36,7 +45,11 @@ class KrxHistoricalCollector:
         if request_json is None and key is not None:
             from src.integrations.krx.client import KrxApiClient
 
-            self._client = KrxApiClient(api_key=key)
+            self._client = KrxApiClient(
+                api_key=key,
+                quota_store=quota_store,
+                min_interval=min_interval,
+            )
 
     def _check_range(self, start: date, end: date) -> None:
         if start > end:
@@ -60,14 +73,12 @@ class KrxHistoricalCollector:
             while current_all <= end:
                 targets += (current_all,)
                 current_all = date.fromordinal(current_all.toordinal() + 1)
-        pages: list[dict[str, Any]] = []
         for current in targets:
             records = self._client.fetch_trade_records(current)
             if not records:
                 raise PITDataError(f"KRX daily market is empty for {current}; refusing to fabricate facts")
             _validate_daily_market_records(records, session=current)
-            pages.append({"records": records, "session": current.isoformat(), "retrieved_at": datetime.now().isoformat()})
-        return tuple(pages)
+            yield {"records": records, "session": current.isoformat(), "retrieved_at": datetime.now().isoformat()}
 
     def fetch_investor_flow(self, start: date, end: date) -> Iterable[dict[str, Any]]:
         self._check_range(start, end)

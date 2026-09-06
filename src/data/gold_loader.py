@@ -378,3 +378,94 @@ def load_gold_window_inputs(
         corporate_actions=corporate_actions,
         investor_flow=investor_flow,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class DailyMarketBackfillPlan:
+    history_start: date
+    validation_end: date
+    covered_sessions: tuple[date, ...]
+    missing_sessions: tuple[date, ...]
+
+
+def plan_daily_market_backfill(
+    *,
+    silver_root: Path,
+    validation_start: date,
+    validation_end: date,
+    decision_time: datetime,
+    universe_policy: UniversePolicy | None = None,
+) -> DailyMarketBackfillPlan:
+    """Plan PIT-safe daily-market coverage from calendar and availability cutoffs."""
+    from datetime import time as _time
+
+    if decision_time.tzinfo is None:
+        raise PITDataError("invalid certified Silver table: decision_time must be aware")
+    if validation_start > validation_end:
+        raise PITDataError("invalid certified Silver table: validation range inverted")
+    u_policy = universe_policy if universe_policy is not None else UniversePolicy()
+    lookback = max(int(WARMUP_SESSIONS), int(u_policy.liquidity_window_sessions), 20)
+    try:
+        calendar_df = load_latest_silver_table(
+            root=Path(silver_root), table=SilverTable.CALENDAR, decision_time=decision_time
+        )
+    except (PITDataError, ValueError, OSError) as exc:
+        raise PITDataError("invalid certified Silver table: calendar") from exc
+    if calendar_df.is_empty() or "session" not in calendar_df.columns:
+        raise PITDataError("invalid certified Silver table: calendar")
+    try:
+        sessions = tuple(sorted(calendar_df["session"].to_list()))
+    except Exception as exc:
+        raise PITDataError("invalid certified Silver table: calendar") from exc
+    if not sessions:
+        raise PITDataError("invalid certified Silver table: calendar")
+    session_dates = [_to_krx_date(s) for s in sessions]
+    val_indices = [i for i, d in enumerate(session_dates) if d >= validation_start]
+    if not val_indices:
+        raise PITDataError("invalid certified Silver table: calendar")
+    first_val_idx = val_indices[0]
+    if first_val_idx < lookback:
+        raise PITDataError("invalid certified Silver table: calendar lacks warmup history")
+    last_indices = [i for i, d in enumerate(session_dates) if d <= validation_end]
+    if not last_indices:
+        raise PITDataError("invalid certified Silver table: calendar")
+    last_idx = max(last_indices)
+    if session_dates[last_idx] != validation_end:
+        raise PITDataError("invalid certified Silver table: calendar")
+    history_start = _to_krx_date(sessions[first_val_idx - lookback])
+    required = tuple(session_dates[first_val_idx - lookback : last_idx + 1])
+    try:
+        frame = _read_bounded_table(
+            silver_root=Path(silver_root),
+            table=SilverTable.DAILY_MARKET,
+            decision_time=decision_time,
+            session_start=history_start,
+            session_end=validation_end,
+            columns=["session", "available_at"],
+        )
+    except PITDataError:
+        frame = pl.DataFrame({"session": [], "available_at": []})
+    timely: dict[date, bool] = {}
+    if not frame.is_empty() and "session" in frame.columns and "available_at" in frame.columns:
+        for sess_val, avail_val in zip(frame["session"].to_list(), frame["available_at"].to_list(), strict=False):
+            try:
+                sess_date = _to_krx_date(sess_val)
+            except PITDataError:
+                continue
+            if sess_date not in required:
+                continue
+            if not isinstance(avail_val, datetime) or avail_val.tzinfo is None:
+                continue
+            # Guard: a later-retrieved historical snapshot (e.g. 2026
+            # available_at for a 2016 session) must never count as covered.
+            cutoff = datetime.combine(sess_date, _time(15, 30), tzinfo=KRX_TZ)
+            if avail_val <= cutoff:
+                timely[sess_date] = True
+    covered = tuple(d for d in required if timely.get(d, False))
+    missing = tuple(d for d in required if not timely.get(d, False))
+    return DailyMarketBackfillPlan(
+        history_start=history_start,
+        validation_end=validation_end,
+        covered_sessions=covered,
+        missing_sessions=missing,
+    )
