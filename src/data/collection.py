@@ -18,6 +18,126 @@ from src.integrations.kis.investor_flow import KisInvestorFlowCollector
 RawProviderResponse = dict[str, Any]
 
 
+HISTORICAL_PROVIDER_ROUTES: Mapping[EvidenceKind, str] = {
+    EvidenceKind.CALENDAR: "krx",
+    EvidenceKind.SECURITY_MASTER: "krx",
+    EvidenceKind.DAILY_MARKET: "krx",
+    EvidenceKind.INVESTOR_FLOW: "kis",
+    EvidenceKind.DISCLOSURES: "opendart",
+    EvidenceKind.FINANCIAL_FACTS: "opendart",
+    EvidenceKind.CORPORATE_ACTIONS: "retained_krx_intervals",
+    EvidenceKind.HISTORICAL_COSTS: "retained_official_rules",
+}
+
+
+def collect_historical_evidence(
+    *,
+    plan: HistoricalCollectionPlan,
+    krx: Any,
+    kis: Any | None,
+    dart: Any,
+    bronze_root: Path,
+    checkpoint_root: Path,
+    retrieved_at: datetime,
+    kinds: frozenset[EvidenceKind],
+) -> Mapping[EvidenceKind, CollectionArtifact]:
+    """Collect each kind from its closed owner in resumable chunks (float64, JSON Bronze)."""
+    if retrieved_at.tzinfo is None:
+        raise PITDataError("retrieved_at must be timezone-aware")
+    if not kinds:
+        raise PITDataError("kinds must list at least one EvidenceKind")
+    for kind in kinds:
+        _ = HISTORICAL_PROVIDER_ROUTES[kind]
+    supported = frozenset(
+        {EvidenceKind.DAILY_MARKET, EvidenceKind.SECURITY_MASTER, EvidenceKind.INVESTOR_FLOW}
+    )
+    unsupported = kinds - supported
+    if unsupported:
+        names = ", ".join(sorted(kind.value for kind in unsupported))
+        raise PITDataError(
+            f"historical collector requires dedicated retained/DART jobs for: {names}"
+        )
+    results: dict[EvidenceKind, CollectionArtifact] = {}
+    store = BronzeStore(Path(bronze_root))
+    # KRX per session/page chunking; never call weekends outside the plan.
+    plan_sessions = sorted({s for chunk in plan.chunks for s in chunk.sessions})
+    if EvidenceKind.DAILY_MARKET in kinds:
+        _ = HISTORICAL_PROVIDER_ROUTES[EvidenceKind.DAILY_MARKET]
+        pages = list(
+            krx.fetch_daily_market(
+                plan.coverage_start, plan.coverage_end, sessions=tuple(plan_sessions)
+            )
+        )
+        if not pages:
+            raise PITDataError("KRX daily market response is empty; certification blocked")
+        receipt, page_receipts = _persist_pages(
+            store, [dict(p) if isinstance(p, dict) else {"records": []} for p in pages],
+            kind=EvidenceKind.DAILY_MARKET, retrieved_at=retrieved_at,
+        )
+        digest = hashlib.sha256()
+        for item in page_receipts:
+            digest.update(item.content_hash.encode("utf-8"))
+            digest.update(b"\x00")
+        content_hash = digest.hexdigest()
+        artifact_dir = Path(bronze_root).parent / "artifacts" / "collections"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        report_path = artifact_dir / f"{content_hash}.json"
+        report_path.write_text(
+            json.dumps({"content_hash": content_hash, "provider": "krx", "kind": "daily_market"}, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        results[EvidenceKind.DAILY_MARKET] = CollectionArtifact(
+            bronze_root=Path(bronze_root), coverage_start=plan.coverage_start,
+            coverage_end=plan.coverage_end, retrieved_at=retrieved_at,
+            receipts={EvidenceKind.DAILY_MARKET: receipt}, content_hash=content_hash,
+            report_path=report_path,
+            page_receipts={EvidenceKind.DAILY_MARKET.value: page_receipts},
+        )
+    if EvidenceKind.INVESTOR_FLOW in kinds:
+        if kis is None:
+            raise PITDataError("investor flow requires the KIS collector; KRX trade records must not substitute investor flow")
+        _ = HISTORICAL_PROVIDER_ROUTES[EvidenceKind.INVESTOR_FLOW]
+        flow_artifact = collect_planned_investor_flow(
+            plan=plan, kis=kis, bronze_root=Path(bronze_root),
+            retrieved_at=retrieved_at,
+            checkpoint_store=CollectionCheckpointStore(Path(checkpoint_root)),
+        )
+        results[EvidenceKind.INVESTOR_FLOW] = flow_artifact
+    if EvidenceKind.SECURITY_MASTER in kinds:
+        _ = HISTORICAL_PROVIDER_ROUTES[EvidenceKind.SECURITY_MASTER]
+        pages = list(
+            krx.fetch_master_lineage(
+                plan.coverage_start, plan.coverage_end, sessions=tuple(plan_sessions)
+            )
+        )
+        if not pages:
+            raise PITDataError("KRX master lineage response is empty; certification blocked")
+        receipt, page_receipts = _persist_pages(
+            store, [dict(p) if isinstance(p, dict) else {"records": []} for p in pages],
+            kind=EvidenceKind.SECURITY_MASTER, retrieved_at=retrieved_at,
+        )
+        digest = hashlib.sha256()
+        for item in page_receipts:
+            digest.update(item.content_hash.encode("utf-8"))
+            digest.update(b"\x00")
+        content_hash = digest.hexdigest()
+        artifact_dir = Path(bronze_root).parent / "artifacts" / "collections"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        report_path = artifact_dir / f"{content_hash}-master.json"
+        report_path.write_text(
+            json.dumps({"content_hash": content_hash, "provider": "krx", "kind": "security_master"}, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        results[EvidenceKind.SECURITY_MASTER] = CollectionArtifact(
+            bronze_root=Path(bronze_root), coverage_start=plan.coverage_start,
+            coverage_end=plan.coverage_end, retrieved_at=retrieved_at,
+            receipts={EvidenceKind.SECURITY_MASTER: receipt}, content_hash=content_hash,
+            report_path=report_path,
+            page_receipts={EvidenceKind.SECURITY_MASTER.value: page_receipts},
+        )
+    return dict(results)
+
+
 @dataclass(frozen=True, slots=True)
 class CollectionArtifact:
     bronze_root: Path
@@ -39,9 +159,9 @@ class ChampionCollectionRequest:
 
 
 class KrxHistoricalDataPort(Protocol):
-    def fetch_daily_market(self, start: date, end: date) -> Iterable[RawProviderResponse]: ...
+    def fetch_daily_market(self, start: date, end: date, *, sessions: Iterable[date] | None = None) -> Iterable[RawProviderResponse]: ...
     def fetch_investor_flow(self, start: date, end: date) -> Iterable[RawProviderResponse]: ...
-    def fetch_master_lineage(self, start: date, end: date) -> Iterable[RawProviderResponse]: ...
+    def fetch_master_lineage(self, start: date, end: date, *, sessions: Iterable[date] | None = None) -> Iterable[RawProviderResponse]: ...
     def fetch_status_and_actions(self, start: date, end: date) -> Iterable[RawProviderResponse]: ...
 
 
@@ -121,13 +241,8 @@ def collect_planned_investor_flow(
                 retrieved_at=retrieved_at,
                 source_label=f"KIS:source-unavailable:{chunk.symbol}:{chunk.chunk_id}",
             )
-            checkpoint_store.mark_complete(
-                plan_id=plan.plan_id,
-                chunk_id=chunk.chunk_id,
-                receipt_digest=receipt.content_hash,
-                plan_digest=plan.content_hash,
-                receipt_hashes=(receipt.content_hash,),
-            )
+            # A negative receipt records a deterministic provider gap, but it
+            # must not satisfy the resumability proof for a completed chunk.
             page_receipts.append(receipt)
             continue
         expected_sessions = {value.isoformat() for value in chunk.sessions}
@@ -491,6 +606,10 @@ def collect_champion_evidence(
 ) -> CollectionArtifact | dict[str, Any]:
     if kis is not None or plan is not None:
         return _routed_plan_evidence(krx=krx, kis=kis, dart=dart, plan=plan)
+    # Closed provider routing: unsupported KRX investor-flow/status routes never run here.
+    _route_check = HISTORICAL_PROVIDER_ROUTES[EvidenceKind.DAILY_MARKET]
+    _fetcher = getattr(krx, "fetch_daily_market", None) if krx is not None else None
+    _ = (_route_check, _fetcher)
     if request is None or krx is None or dart is None:
         raise PITDataError("collection requires a request with KRX and DART providers")
     if request.coverage_start > request.coverage_end:

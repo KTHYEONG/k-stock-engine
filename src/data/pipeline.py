@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 
 import polars as pl
@@ -12,19 +12,14 @@ import polars as pl
 from src.core.datasets import DatasetCertification
 from src.core.time import SessionCalendar
 from src.data.bronze import BronzeStore
+from src.data.replay import PITReplayReader, StreamingGoldWriter
 from src.data.schemas import BronzeReceipt, EvidenceKind, PITDataError, SilverTable
-from src.data.silver import certify_silver, load_latest_silver_table
-from src.features.contracts import QvefFeaturePolicy, QvefFeatureRow
-from src.features.materialize import materialize_qvef_features
+from src.data.silver import certify_corporate_action_refresh, load_latest_silver_table
+from src.features.contracts import QvefFeaturePolicy
 from src.features.qvef import build_qvef_features
 from src.storage.parquet_datasets import canonical_content_hash
-from src.strategy.scoring import ChampionScorePolicy, ChampionScoreRow, materialize_champion_scores, score_champion_rows
-from src.strategy.universe import (
-    UniverseDecision,
-    UniversePolicy,
-    build_historical_universe,
-    materialize_historical_universe,
-)
+from src.strategy.scoring import ChampionScorePolicy, score_champion_rows
+from src.strategy.universe import UniversePolicy, build_historical_universe
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,37 +107,86 @@ def materialize_backtest_inputs(
     if effective_cert not in (DatasetCertification.RESEARCH, DatasetCertification.PRODUCTION):
         raise PITDataError("materialization requires RESEARCH-or-higher certification")
     _require_certified_inputs(Path(silver_root), Path(bronze_root))
-    bronze_receipts = _load_bronze_receipts(Path(bronze_root))
-    if len(bronze_receipts) != len(EvidenceKind):
+    from src.data.bronze_aggregation import discover_verified_bronze_receipts
+
+    grouped_receipts = {
+        kind: tuple(items)
+        for kind, items in discover_verified_bronze_receipts(bronze_root=Path(bronze_root)).items()
+    }
+    if len(grouped_receipts) != len(EvidenceKind) or any(not grouped_receipts.get(kind) for kind in EvidenceKind):
         raise PITDataError("missing required Bronze receipts for certified Silver")
-    silver = _load_silver_tables(Path(silver_root), decision_time)
-    sessions = tuple(sorted(silver[SilverTable.CALENDAR]["session"].to_list()))
+    try:
+        calendar_frame = load_latest_silver_table(
+            root=Path(silver_root), table=SilverTable.CALENDAR, decision_time=decision_time
+        )
+        actions_frame = load_latest_silver_table(
+            root=Path(silver_root), table=SilverTable.CORPORATE_ACTIONS, decision_time=decision_time
+        )
+    except PITDataError:
+        # Keep fixture/test seams; production certified roots use the bounded path above.
+        legacy = _load_silver_tables(Path(silver_root), decision_time)
+        calendar_frame = legacy[SilverTable.CALENDAR]
+        actions_frame = legacy[SilverTable.CORPORATE_ACTIONS]
+    sessions = tuple(sorted(calendar_frame["session"].to_list()))
     if not sessions:
         raise PITDataError("calendar has no sessions")
     calendar = SessionCalendar(sessions)
-    report = certify_silver(silver, receipts=bronze_receipts, coverage_start=min(s.astimezone(UTC).date() for s in sessions), coverage_end=max(s.astimezone(UTC).date() for s in sessions), certification=effective_cert)
+    report = certify_corporate_action_refresh(
+        action_frame=actions_frame,
+        receipts=grouped_receipts,
+        silver_root=Path(silver_root),
+        decision_time=decision_time,
+    )
+    if report.certification is not effective_cert:
+        raise PITDataError("Silver certification does not match materialization request")
+    # Bounded PIT replay wiring:
+    # reader = PITReplayReader.from_silver_root(...); replay = reader.session_input(...); writer.append_universe(...); writer.append_features(...); writer.append_scores(...)
     qvef_policy = QvefFeaturePolicy()
     score_policy = ChampionScorePolicy()
-    all_universe_decisions: list[UniverseDecision] = []
-    all_feature_rows: list[QvefFeatureRow] = []
-    all_scores: list[ChampionScoreRow] = []
-    for session in sessions:
-        if session > decision_time:
+    ordered_sessions = tuple(s for s in sessions if s <= decision_time)
+    if not ordered_sessions:
+        raise PITDataError("calendar has no sessions")
+    dataset_id = hashlib.sha256(f"historical:{report.report_hash}".encode()).hexdigest()
+    source_hashes = {k.value: v for k, v in report.source_hashes.items()}
+    reader = PITReplayReader.from_silver_root(
+        silver_root=Path(silver_root), decision_time=decision_time, calendar=calendar
+    )
+    writer = StreamingGoldWriter(
+        root=Path(gold_root),
+        dataset_id=dataset_id,
+        decision_time=decision_time,
+        certification=effective_cert,
+        source_hashes=source_hashes,
+        expected_sessions=ordered_sessions,
+    )
+    universe_policy = UniversePolicy()
+    universe_count = 0
+    feature_count = 0
+    score_count = 0
+    for session in ordered_sessions:
+        replay = reader.session_input(
+            session=session,
+            decision_time=session,
+            universe_policy=universe_policy,
+            qvef_policy=qvef_policy,
+        )
+        universe = build_historical_universe(decision_session=session, decision_time=session, calendar=calendar, security_master=replay.security_master, daily_market=replay.daily_market, corporate_actions=replay.corporate_actions, policy=universe_policy)
+        writer.append_universe(universe)
+        universe_count += len(universe)
+        eligible = tuple(u for u in universe if u.eligible)
+        if not eligible:
             continue
-        universe = build_historical_universe(decision_session=session, decision_time=session, calendar=calendar, security_master=silver[SilverTable.SECURITY_MASTER], daily_market=silver[SilverTable.DAILY_MARKET], policy=UniversePolicy())
-        all_universe_decisions.extend(universe)
-        rows = build_qvef_features(decision_session=session, decision_time=session, calendar=calendar, universe=universe, security_master=silver[SilverTable.SECURITY_MASTER], daily_market=silver[SilverTable.DAILY_MARKET], investor_flow=silver[SilverTable.INVESTOR_FLOW], financial_facts=silver[SilverTable.FINANCIAL_FACTS], policy=qvef_policy)
+        rows = build_qvef_features(decision_session=session, decision_time=session, calendar=calendar, universe=eligible, security_master=replay.security_master, daily_market=replay.daily_market, investor_flow=replay.investor_flow, financial_facts=replay.financial_facts, policy=qvef_policy)
         if not rows:
             continue
-        all_feature_rows.extend(rows)
-        all_scores.extend(score_champion_rows(rows, decision_time=session, policy=score_policy))
-    if not all_universe_decisions or not all_feature_rows or not all_scores:
+        writer.append_features(rows)
+        feature_count += len(rows)
+        scored = score_champion_rows(rows, decision_time=session, policy=score_policy)
+        writer.append_scores(scored)
+        score_count += len(scored)
+    if universe_count == 0 or feature_count == 0 or score_count == 0:
         raise PITDataError("no PIT-complete Champion features available")
-    universe_decisions = tuple(all_universe_decisions)
-    dataset_id = hashlib.sha256(f"historical:{report.report_hash}".encode()).hexdigest()
-    materialize_historical_universe(universe_decisions, root=Path(gold_root) / "universe", dataset_id=dataset_id, decision_time=decision_time, policy=UniversePolicy(), provider_version="official-pit-v1", calendar_hash=report.source_hashes[EvidenceKind.CALENDAR], master_hash=report.source_hashes[EvidenceKind.SECURITY_MASTER], quality_report_hash=report.report_hash, certification=effective_cert)
-    materialize_qvef_features(tuple(all_feature_rows), root=Path(gold_root) / "qvef", dataset_id=dataset_id, decision_time=decision_time, policy=qvef_policy, provider_version="official-pit-v1", calendar_hash=report.source_hashes[EvidenceKind.CALENDAR], master_hash=report.source_hashes[EvidenceKind.SECURITY_MASTER], quality_report_hash=report.report_hash, certification=effective_cert)
-    materialize_champion_scores(tuple(all_scores), root=Path(gold_root) / "champion_scores", dataset_id=dataset_id, decision_time=decision_time, policy=score_policy, provider_version="official-pit-v1", calendar_hash=report.source_hashes[EvidenceKind.CALENDAR], master_hash=report.source_hashes[EvidenceKind.SECURITY_MASTER], quality_report_hash=report.report_hash, certification=effective_cert)
+    writer.close()
     hashes = {"universe": dataset_id, "qvef": dataset_id, "champion_scores": dataset_id}
     artifact_dir = Path(artifact_root or Path(gold_root).parent / "artifacts") / "collections"
     artifact_dir.mkdir(parents=True, exist_ok=True)

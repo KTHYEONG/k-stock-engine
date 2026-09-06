@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from src.data.schemas import EvidenceKind, PITDataError
 from src.strategy.universe import UniverseDecision
@@ -703,10 +704,129 @@ __all__ = [
     "CollectionCheckpointStore",
     "CollectionPlanReceipt",
     "CollectionReadinessReport",
+    "EvidenceCoverage",
     "HistoricalCollectionPlan",
+    "HistoricalCollectionWindow",
     "PlanChunk",
+    "audit_historical_readiness",
     "build_historical_collection_plan",
     "build_historical_collection_plan_from_bronze",
     "build_historical_collection_plan_from_universe_decisions",
+    "derive_historical_collection_window",
     "load_collection_plan",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalCollectionWindow:
+    history_start: date
+    validation_start: date
+    validation_end: date
+    execution_end: date
+    sessions: tuple[date, ...]
+
+
+def derive_historical_collection_window(
+    *,
+    sessions: Iterable[date],
+    validation_start: date,
+    validation_end: date,
+    warmup_sessions: int,
+) -> HistoricalCollectionWindow:
+    ordered = tuple(sessions)
+    if not ordered or any(not isinstance(s, date) for s in ordered):
+        raise PITDataError("sessions must be a non-empty date tuple")
+    if tuple(sorted(ordered)) != ordered:
+        raise PITDataError("sessions must be strictly increasing")
+    if len(set(ordered)) != len(ordered):
+        raise PITDataError("sessions must be strictly increasing")
+    if not isinstance(warmup_sessions, int) or isinstance(warmup_sessions, bool) or warmup_sessions < 0:
+        raise PITDataError("warmup_sessions must be a non-negative integer")
+    if validation_start > validation_end:
+        raise PITDataError("validation_start must not be after validation_end")
+    try:
+        start_idx = ordered.index(validation_start)
+        end_idx = ordered.index(validation_end)
+    except ValueError as exc:
+        raise PITDataError("validation window must be within sessions") from exc
+    if start_idx - warmup_sessions < 0:
+        raise PITDataError("insufficient warmup sessions before validation_start")
+    if end_idx + 1 >= len(ordered):
+        raise PITDataError("missing next execution session after validation_end")
+    # Never shorten validation; history/execution derive from calendar.
+    return HistoricalCollectionWindow(
+        history_start=ordered[start_idx - warmup_sessions],
+        validation_start=validation_start,
+        validation_end=validation_end,
+        execution_end=ordered[end_idx + 1],
+        sessions=ordered,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceCoverage:
+    kind: EvidenceKind
+    instrument_id: str | None
+    session: date | None
+    state: Literal["complete", "source_unavailable", "retryable_failure", "invalid"]
+    receipt_hash: str | None
+    reason: str
+
+
+def audit_historical_readiness(
+    *,
+    plan: HistoricalCollectionPlan,
+    coverage: Iterable[EvidenceCoverage],
+    usable_feature_count_by_session: Mapping[date, int],
+    minimum_cohort: int,
+) -> CollectionReadinessReport:
+    if not isinstance(minimum_cohort, int) or isinstance(minimum_cohort, bool) or minimum_cohort < 1:
+        raise PITDataError("minimum_cohort must be a positive integer")
+    items = tuple(coverage)
+    for entry in items:
+        if entry.state not in ("complete", "source_unavailable", "retryable_failure", "invalid"):
+            raise PITDataError(f"unknown coverage state {entry.state!r}")
+    gaps: list[str] = []
+    unresolved: list[str] = []
+    for entry in items:
+        if entry.state == "complete":
+            continue
+        label = f"{entry.kind.value}:{entry.instrument_id or '*'}:{entry.session.isoformat() if entry.session else '*'}:{entry.state}:{entry.reason}"
+        gaps.append(label)
+        if entry.state in ("retryable_failure", "invalid"):
+            unresolved.append(f"global {entry.state} blocks certification: {label}")
+    # Global hash/schema/time-order failures block; local gaps need cohort.
+    plan_sessions: set[date] = set()
+    for chunk in plan.chunks:
+        plan_sessions.update(chunk.sessions)
+    # The feature map is authoritative for validation sessions.  During
+    # warmup, zero rows are expected and must not make an otherwise complete
+    # validation cohort fail; an empty map still fails closed against plan.
+    check_sessions = set(usable_feature_count_by_session.keys()) or plan_sessions
+    for entry in items:
+        if entry.session is not None:
+            check_sessions.add(entry.session)
+    for session in sorted(check_sessions):
+        count = int(usable_feature_count_by_session.get(session, 0))
+        # Zero-row Gold fails; sub-threshold session fails.
+        if count < minimum_cohort:
+            unresolved.append(
+                f"usable cohort {count} below minimum {minimum_cohort} on {session.isoformat()}"
+            )
+    if unresolved:
+        return CollectionReadinessReport(
+            certifiable=False,
+            unresolved_reasons=tuple(unresolved),
+            coverage_gaps=tuple(gaps),
+            pit_lineage_ok=False,
+            action_provenance_ok=True,
+            status_provenance_ok=True,
+        )
+    return CollectionReadinessReport(
+        certifiable=True,
+        unresolved_reasons=(),
+        coverage_gaps=tuple(gaps),
+        pit_lineage_ok=True,
+        action_provenance_ok=True,
+        status_provenance_ok=True,
+    )
