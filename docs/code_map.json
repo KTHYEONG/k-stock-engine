@@ -27,6 +27,7 @@
       "tests/unit/data/test_backtest_runner.py",
       "tests/unit/data/test_backtest_sessions.py",
       "tests/unit/data/test_gold.py",
+      "tests/unit/data/test_gold_loader.py",
       "tests/unit/data/test_incremental_normalization.py",
       "tests/unit/data/test_normalization.py",
       "tests/unit/data/test_replay.py",
@@ -83,7 +84,10 @@
     "testing": "tests/unit/data/test_normalization.py"
   },
   "src/data/operations.py": {
-    "testing": "tests/integration/data/test_operations.py"
+    "testing": [
+      "tests/integration/data/test_operations.py",
+      "tests/unit/data/test_operations.py"
+    ]
   },
   "src/data/pipeline.py": {
     "testing": "tests/unit/data/test_pipeline.py"
@@ -107,6 +111,7 @@
       "tests/unit/data/test_gold_loader.py",
       "tests/unit/data/test_historical_data_pipeline.py",
       "tests/unit/data/test_incremental_normalization.py",
+      "tests/unit/data/test_operations.py",
       "tests/unit/data/test_pipeline.py",
       "tests/unit/data/test_replay.py",
       "tests/unit/data/test_silver.py",
@@ -249,10 +254,19 @@
     "testing": "tests/unit/integrations/kis/test_investor_flow.py"
   },
   "src/integrations/krx/client.py": {
-    "testing": "tests/unit/integrations/test_krx_client.py"
+    "testing": [
+      "tests/unit/integrations/krx/test_historical.py",
+      "tests/unit/integrations/test_krx_client.py"
+    ]
   },
   "src/integrations/krx/historical.py": {
     "testing": "tests/unit/integrations/krx/test_historical.py"
+  },
+  "src/integrations/quota.py": {
+    "testing": [
+      "tests/unit/integrations/krx/test_historical.py",
+      "tests/unit/integrations/test_krx_client.py"
+    ]
   },
   "src/storage/parquet_datasets.py": {
     "testing": "tests/unit/storage/test_parquet_datasets.py"
@@ -270,10 +284,7 @@
     "testing": "tests/unit/strategy/test_selection.py"
   },
   "src/strategy/universe.py": {
-    "testing": [
-      "tests/unit/strategy/test_universe.py",
-      "tests/integration/strategy/test_historical_universe.py"
-    ]
+    "testing": "tests/unit/strategy/test_universe.py"
   },
   "src/validation/bootstrap.py": {
     "testing": "tests/unit/validation/test_bootstrap.py"
