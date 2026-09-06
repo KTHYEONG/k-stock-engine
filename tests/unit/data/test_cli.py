@@ -12,6 +12,27 @@ def test_collect_command_requires_immutable_plan_id(monkeypatch) -> None:
     assert args.plan_id == "plan-a"
 
 
+def test_rebuild_data_requires_certified_master_before_kis_collection(tmp_path, monkeypatch) -> None:
+    from src.data import cli as cli_module
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stock-data", "rebuild-data",
+            "--data-root", str(tmp_path / "data"),
+            "--bronze-root", str(tmp_path / "bronze"),
+            "--silver-root", str(tmp_path / "silver"),
+            "--gold-root", str(tmp_path / "gold"),
+            "--artifact-root", str(tmp_path / "artifacts"),
+            "--validation-start", "2016-01-04",
+            "--validation-end", "2016-12-29",
+            "--certification-time", "2026-09-05T00:00:00+00:00",
+        ],
+    )
+    assert cli_module.main() == 1
+
+
 def test_run_backtest_refuses_without_resolved_execution_components(tmp_path) -> None:
     from argparse import Namespace
 
