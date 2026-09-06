@@ -456,3 +456,43 @@ def test_materialize_gold_window_silver_root_eligible_branch(tmp_path) -> None:
     out = materialize_gold_window(silver_root=tmp_path / 'silver', validation_start=first_date, validation_end=last_date, decision_time=datetime.now(UTC), artifact_root=tmp_path / 'artifacts', gold_root=None)
     assert out.eligible_decisions_count > 0
     assert out.feature_rows_count > 0
+
+
+def test_frame_replay_index_returns_exact_windows_without_future_rows() -> None:
+    from datetime import UTC, datetime, timedelta
+    import polars as pl
+    from src.core.time import SessionCalendar
+    from src.data.replay import PITReplayReader
+    from src.features.contracts import QvefFeaturePolicy
+    from src.strategy.universe import UniversePolicy
+
+    sessions = tuple(datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=index) for index in range(70))
+    decision = sessions[-1]
+    daily = pl.DataFrame([{'instrument_id': 'KRX:1', 'session': item, 'available_at': item, 'trading_value': 1.0} for item in sessions] + [{'instrument_id': 'KRX:future', 'session': decision, 'available_at': decision + timedelta(days=1), 'trading_value': 1.0}])
+    flow = pl.DataFrame([{'instrument_id': 'KRX:1', 'session': item, 'available_at': item, 'foreign_net_value': 1.0} for item in sessions])
+    reader = PITReplayReader.from_frames(calendar=SessionCalendar(sessions), security_master=pl.DataFrame(), daily_market=daily, investor_flow=flow, financial_facts=pl.DataFrame(), corporate_actions=pl.DataFrame())
+
+    replay = reader.session_input(session=decision, decision_time=decision, universe_policy=UniversePolicy(), qvef_policy=QvefFeaturePolicy())
+
+    assert replay.daily_market.filter(pl.col('instrument_id') == 'KRX:1').height == 60
+    assert replay.daily_market.filter(pl.col('instrument_id') == 'KRX:future').height == 0
+    assert replay.investor_flow['session'].to_list() == list(sessions[-21:-1])
+
+
+def test_streaming_gold_writer_uses_private_staging_without_legacy_mix(tmp_path) -> None:
+    from datetime import UTC, datetime
+    from src.core.datasets import DatasetCertification
+    from src.data.replay import StreamingGoldWriter
+    from src.strategy.universe import ExclusionReason, UniverseDecision
+
+    session = datetime(2024, 1, 2, tzinfo=UTC)
+    legacy = tmp_path / 'gold' / '.staging-c'
+    legacy.mkdir(parents=True)
+    legacy.joinpath('batch-00000.pkl').write_bytes(b'legacy')
+    writer = StreamingGoldWriter(root=tmp_path / 'gold', dataset_id='c' * 64, decision_time=session, certification=DatasetCertification.RESEARCH, source_hashes={'calendar': 'c', 'security_master': 'm'}, expected_sessions=(session,), require_scores=False)
+
+    writer.append_universe((UniverseDecision(session, 'KRX:1', False, (ExclusionReason.MISSING_MASTER,), 0, None),))
+
+    assert legacy.joinpath('batch-00000.pkl').read_bytes() == b'legacy'
+    assert writer._universe_batches[0].parent != legacy
+    assert writer._universe_batches[0].name == 'batch-00000.pkl'
