@@ -1,0 +1,26 @@
+{
+  "feature": "krx_daily_market_cap_fields",
+  "domain": "data",
+  "target_file": "src/integrations/krx/historical.py",
+  "context_files": ["src/integrations/krx/client.py", "src/data/streaming_normalization.py", "tests/unit/integrations/krx/test_historical.py", "tests/unit/data/test_streaming_stock_normalization.py"],
+  "changes": [
+    {"name": "_validate_daily_market_records", "signature": "def _validate_daily_market_records(records: list[dict[str, Any]], *, session: date) -> None", "kind": "function", "target_file": "src/integrations/krx/historical.py"},
+    {"name": "_parse_krx_number", "signature": "def _parse_krx_number(value: Any, *, field: str) -> float", "kind": "function", "target_file": "src/data/streaming_normalization.py"}
+  ],
+  "wiring": [
+    {"caller_file": "src/integrations/krx/historical.py", "anchor": "records = self._client.fetch_trade_records(current)", "import_symbol": "_validate_daily_market_records", "invocation_expression": "_validate_daily_market_records(records, session=current)"},
+    {"caller_file": "src/data/streaming_normalization.py", "anchor": "def _canonical_daily_row", "import_symbol": "_parse_krx_number", "invocation_expression": "_parse_krx_number(raw_market_cap, field=\"market_cap\")"}
+  ],
+  "requirements": [
+    "Each non-empty KRX daily-market response must contain a non-empty MKTCAP and LIST_SHRS (or canonical aliases) for every record; otherwise fail before Bronze persistence with the session and missing field names.",
+    "Accept only positive finite numeric values after removing presentation commas. Reject booleans, blanks, non-numeric, zero, negative, and non-finite values.",
+    "Preserve the KRX response fields verbatim in Bronze; normalization alone converts them to float64 values.",
+    "Do not infer market_cap or shares_outstanding from unrelated dates or current snapshots."
+  ],
+  "design_rationale": {"alternatives_considered": "Estimating shares from another date or silently emitting zero market cap was rejected because corporate actions change share counts and would contaminate PIT value factors.", "chosen_reason": "The official daily-market response is the provenance boundary. Validating its two required fields before persistence makes incomplete backfills explicit and keeps Silver deterministic.", "failure_modes": ["A legacy response missing both fields reaches Silver and fails after expensive streaming work", "Comma-formatted official numbers fail float conversion", "A non-finite or zero capitalisation is silently admitted"]},
+  "performance_budget": {"expected_data_scale": "One page per KRX session, roughly 2,000 instruments per page", "memory_target_mb": 64, "storage_format": "Bronze JSON and Silver Parquet", "dtype_precision": "float64", "chunking_strategy": "validate one daily response page before Bronze persistence", "acceleration_candidate": null},
+  "scenarios": [
+    {"scenario_id": "test_krx_daily_market_rejects_missing_capitalisation_fields", "target_test_file": "tests/unit/integrations/krx/test_historical.py", "execution_command": "uv run pytest tests/unit/integrations/krx/test_historical.py -q", "expected_behavior": "A daily response without either required field is rejected before it becomes a page.", "test_skeleton": "def test_krx_daily_market_rejects_missing_capitalisation_fields() -> None:\n    from datetime import date\n    from types import SimpleNamespace\n\n    import pytest\n\n    from src.data.schemas import PITDataError\n    from src.integrations.krx.historical import KrxHistoricalCollector\n\n    collector = KrxHistoricalCollector(api_key='key', request_json=lambda *_: {})\n    collector._client = SimpleNamespace(fetch_trade_records=lambda _day: [{'ISU_SRT_CD': '005930'}])\n\n    with pytest.raises(PITDataError, match='MKTCAP.*LIST_SHRS'):\n        tuple(collector.fetch_daily_market(date(2016, 1, 4), date(2016, 1, 4)))\n"},
+    {"scenario_id": "test_streaming_normalization_parses_comma_formatted_krx_capitalisation", "target_test_file": "tests/unit/data/test_streaming_stock_normalization.py", "execution_command": "uv run pytest tests/unit/data/test_streaming_stock_normalization.py -q", "expected_behavior": "Comma-formatted MKTCAP and LIST_SHRS normalize to exact floats.", "test_skeleton": "def test_streaming_normalization_parses_comma_formatted_krx_capitalisation() -> None:\n    from datetime import UTC, datetime\n\n    from src.data.streaming_normalization import _canonical_daily_row\n\n    row = _canonical_daily_row({'BAS_DD': '20160104', 'ISU_SRT_CD': '000020', 'TDD_OPNPRC': '10', 'TDD_HGPRC': '12', 'TDD_LWPRC': '9', 'TDD_CLSPRC': '11', 'ACC_TRDVOL': '100', 'ACC_TRDVAL': '1,100', 'MKTCAP': '10,000', 'LIST_SHRS': '900'}, available_at=datetime(2016, 1, 5, tzinfo=UTC), source_hash='a')\n\n    assert row['market_cap'] == 10_000.0\n    assert row['shares_outstanding'] == 900.0\n"}
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "feature": "corporate_action_pit_coverage",
+  "domain": "data",
+  "target_file": "src/data/gold.py",
+  "context_files": ["src/data/streaming_normalization.py", "src/data/normalization.py", "src/data/gold_loader.py", "src/strategy/universe.py", "tests/unit/data/test_gold.py", "tests/unit/data/test_streaming_stock_normalization.py"],
+  "changes": [
+    {"name": "compact_corporate_action_intervals", "signature": "def compact_corporate_action_intervals(records: Iterable[dict[str, Any]], *, decision_time: datetime) -> list[dict[str, Any]]", "kind": "function", "target_file": "src/data/streaming_normalization.py"},
+    {"name": "exclude_sentinel_corporate_actions", "signature": "def exclude_sentinel_corporate_actions(corporate_actions: pl.DataFrame, candidate_instrument_ids: frozenset[str], *, window_start: date | None = None, window_end: date | None = None) -> frozenset[str]", "kind": "function", "target_file": "src/data/gold.py"}
+  ],
+  "scenarios": [
+    {
+      "scenario_id": "test_compact_corporate_action_intervals_preserves_gap_and_action_boundaries",
+      "target_test_file": "tests/unit/data/test_streaming_stock_normalization.py",
+      "execution_command": "uv run pytest tests/unit/data/test_streaming_stock_normalization.py -q",
+      "expected_behavior": "Contiguous no_action records compact, while a gap and a split remain separate evidence rows.",
+      "test_skeleton": "def test_compact_corporate_action_intervals_preserves_gap_and_action_boundaries() -> None:\n    from datetime import datetime\n\n    from src.core.time import KRX_TZ\n    from src.data.streaming_normalization import compact_corporate_action_intervals\n\n    rows = [\n        {'instrument_id': 'KRX:000001', 'previous_session': '2016-01-03', 'session': '2016-01-04', 'action_code': 'no_action', 'adjustment_factor': 1.0},\n        {'instrument_id': 'KRX:000001', 'previous_session': '2016-01-04', 'session': '2016-01-05', 'action_code': 'no_action', 'adjustment_factor': 1.0},\n        {'instrument_id': 'KRX:000001', 'previous_session': '2016-01-05', 'session': '2016-01-06', 'action_code': 'split', 'adjustment_factor': 2.0},\n        {'instrument_id': 'KRX:000001', 'previous_session': '2016-01-08', 'session': '2016-01-09', 'action_code': 'no_action', 'adjustment_factor': 1.0},\n    ]\n\n    result = compact_corporate_action_intervals(rows, decision_time=datetime(2016, 1, 9, 15, 30, tzinfo=KRX_TZ))\n\n    assert [(row['type'], row['effective_date'].date().isoformat(), row['coverage_end'].date().isoformat()) for row in result] == [('no_action', '2016-01-04', '2016-01-05'), ('split', '2016-01-06', '2016-01-06'), ('no_action', '2016-01-09', '2016-01-09')]\n"
+    }
+  ],
+  "wiring": [
+    {"caller_file": "src/data/streaming_normalization.py", "anchor": "streamed_actions: list[dict[str, Any]]", "import_symbol": "compact_corporate_action_intervals", "invocation_expression": "compact_corporate_action_intervals("},
+    {"caller_file": "src/data/gold.py", "anchor": "ca_excluded = exclude_sentinel_corporate_actions", "import_symbol": "exclude_sentinel_corporate_actions", "invocation_expression": "window_start=validation_start, window_end=validation_end"},
+    {"caller_file": "src/strategy/universe.py", "anchor": "ca_excluded = exclude_sentinel_corporate_actions", "import_symbol": "exclude_sentinel_corporate_actions", "invocation_expression": "window_start=decision_session.astimezone(KRX_TZ).date()"}
+  ],
+  "design_rationale": {
+    "alternatives_considered": "Retaining all daily no_action rows was rejected because the 1GB source creates millions of Silver rows. Treating any one event or a global sentinel as proof was rejected because it accepts uncovered dates.",
+    "chosen_reason": "Contiguous per-instrument coverage intervals retain the evidence necessary for the Gold gate while bounding memory and Parquet size. The user explicitly approved the KRX interval source as session-open PIT evidence.",
+    "failure_modes": ["A source gap is merged into a valid range and admits an uncovered session", "A global sentinel is mistaken for instrument-level evidence", "A future or malformed timestamp becomes available at an earlier decision time", "Millions of no_action rows are accumulated in memory"]
+  },
+  "requirements": ["The approved KRX interval source is treated as a session-open PIT status source; each retained interval must carry its own session timestamp as available_at.", "Compact only contiguous no_action intervals for the same instrument; a real action or a previous_session discontinuity must terminate coverage. Retain real actions as single-session evidence.", "A candidate is eligible only if the union of its coverage intervals and real-action sessions covers every calendar date in the requested inclusive window. Missing table rows, global KRX:__NO_ACTION__ rows, gaps, invalid timestamps, or rows unavailable by the window end exclude it.", "The compacted representation must preserve coverage_end and all existing corporate-action fields. Older input rows without coverage_end are interpreted as a single effective_date only.", "Streaming normalization must remain bounded by source batch processing plus O(number of instruments plus compact output) state; it must not retain every no_action source interval.", "Do not alter price-adjustment or ledger behavior in this change; existing protection for real events remains fail-closed."],
+  "performance_budget": {"expected_data_scale": "1.0GB KRX interval JSON with millions of daily intervals across roughly 2,000 instruments", "memory_target_mb": 256, "storage_format": "manifest-verified Hive Parquet with compact corporate-action ranges", "dtype_precision": "preserve stored float64 factor and cash_amount", "chunking_strategy": "jq item streaming and per-instrument active-range state", "acceleration_candidate": null}
+}

@@ -1,6 +1,27 @@
 {
   "tasks": [
     {
+      "task_id": "krx_enriched_pit_streaming",
+      "date": "2026-09-06",
+      "adr_id": "ADR_20260906_krx_enriched_pit_streaming",
+      "domain": "gold",
+      "title": "KRX enriched PIT streaming normalization",
+      "why": "The retained daily-market receipt lacked official market-cap and share-count fields, preventing valid 2016 PIT Gold generation.",
+      "resolution": "Collected official KRX enriched sessions, isolated large-table workers, deduplicated disclosures, normalized zero O/H/L no-trade rows, and blocked incomplete market-value receipts fail-closed.",
+      "impact": "Silver now contains 674053 enriched daily rows for 2015-09 through 2016-12, while Gold remains unpublished until the slow replay is completed."
+    },
+    {
+      "task_id": "historical_gold_bounded_replay",
+      "date": "2026-09-05",
+      "adr_id": "ADR_20260905_historical_gold_bounded_replay",
+      "domain": "gold",
+      "title": "Bounded PIT replay and streaming Gold publication",
+      "why": "Historical Gold replay repeatedly converted 5.8M daily and 6.0M master rows and accumulated outputs, causing WSL memory pressure.",
+      "resolution": "Added lazy predicate-pushed PIT session slices, eligible-company fact filtering, staging-backed Gold writes, and fail-closed completion checks while preserving the full replay range.",
+      "impact": "Gold processing no longer reconstructs unrelated Bronze aggregates or repeats unbounded source conversion, and the contract audit passes with full diff coverage.",
+      "archive_path": "docs/decisions/archive/historical_gold_bounded_replay/corporate_action_streaming_memory_contract.json"
+    },
+    {
       "task_id": "gold_window_partition_loading",
       "date": "2026-09-05",
       "adr_id": "ADR_20260905_gold_window_partition_loading",

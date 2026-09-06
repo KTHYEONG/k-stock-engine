@@ -20,6 +20,7 @@
   },
   "src/core/time.py": {
     "testing": [
+      "tests/integration/data/test_bounded_gold_replay.py",
       "tests/integration/engine/test_unified_event_backtester.py",
       "tests/integration/strategy/test_historical_universe.py",
       "tests/unit/core/test_instrument.py",
@@ -28,7 +29,9 @@
       "tests/unit/data/test_gold.py",
       "tests/unit/data/test_incremental_normalization.py",
       "tests/unit/data/test_normalization.py",
+      "tests/unit/data/test_replay.py",
       "tests/unit/data/test_silver.py",
+      "tests/unit/data/test_streaming_stock_normalization.py",
       "tests/unit/engine/test_backtest.py",
       "tests/unit/engine/test_runner.py",
       "tests/unit/execution/test_submit_intents.py",
@@ -85,19 +88,27 @@
   "src/data/pipeline.py": {
     "testing": "tests/unit/data/test_pipeline.py"
   },
+  "src/data/replay.py": {
+    "testing": "tests/unit/data/test_replay.py"
+  },
   "src/data/schemas.py": {
     "testing": [
       "tests/integration/data/test_backtest_data_pipeline.py",
       "tests/integration/data/test_collection.py",
+      "tests/integration/data/test_collection_provider_routing.py",
       "tests/integration/data/test_pit_dataset_foundation.py",
       "tests/unit/data/test_backtest_runner.py",
       "tests/unit/data/test_backtest_sessions.py",
       "tests/unit/data/test_bronze.py",
       "tests/unit/data/test_bronze_aggregation.py",
       "tests/unit/data/test_cli.py",
+      "tests/unit/data/test_collection_readiness.py",
+      "tests/unit/data/test_gold.py",
       "tests/unit/data/test_gold_loader.py",
+      "tests/unit/data/test_historical_data_pipeline.py",
       "tests/unit/data/test_incremental_normalization.py",
       "tests/unit/data/test_pipeline.py",
+      "tests/unit/data/test_replay.py",
       "tests/unit/data/test_silver.py",
       "tests/unit/data/test_streaming_stock_normalization.py",
       "tests/unit/integrations/dart/test_xbrl_standard.py",
@@ -201,8 +212,10 @@
   },
   "src/features/contracts.py": {
     "testing": [
+      "tests/integration/data/test_bounded_gold_replay.py",
       "tests/integration/features/test_materialize_qvef.py",
       "tests/integration/strategy/test_champion_scores.py",
+      "tests/unit/data/test_replay.py",
       "tests/unit/features/test_preprocessing.py",
       "tests/unit/strategy/test_scoring.py"
     ]
