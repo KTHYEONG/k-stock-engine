@@ -1,6 +1,28 @@
 {
   "tasks": [
     {
+      "task_id": "gold_replay_universe_hotpath",
+      "date": "2026-09-06",
+      "adr_id": "ADR_20260906_gold_replay_universe_hotpath",
+      "domain": "gold",
+      "title": "Gold replay universe hot-path optimization",
+      "why": "Per-session corporate-action scans and linear listing-age searches dominated historical Gold replay runtime.",
+      "resolution": "Hoisted corporate-action exclusion to session scope, indexed calendar lookups with bisect, and fixed nullable universe materialization schemas.",
+      "impact": "Full 2497-session replay completed and Gold universe publication is deterministic without changing PIT eligibility semantics.",
+      "archive_path": "docs/decisions/archive/gold_replay_universe_hotpath/gold_replay_universe_hotpath_contract.json"
+    },
+    {
+      "task_id": "gold_replay_frame_performance",
+      "date": "2026-09-06",
+      "adr_id": "ADR_20260906_gold_replay_frame_performance",
+      "domain": "gold",
+      "title": "Gold replay frame reuse and session indexing",
+      "why": "Gold replay rescanned large Silver history per session even after validated GoldWindowInputs frames were loaded.",
+      "resolution": "Routed complete frame inputs through indexed PIT replay and isolated writer staging while preserving full-range semantics and fail-closed publication.",
+      "impact": "Replay avoids repeated market and flow scans, stale staging cannot mix into a new run, and Gold remains unpublished until all requested sessions complete.",
+      "archive_path": "docs/decisions/archive/gold_replay_frame_performance/gold_replay_frame_performance_contract.json"
+    },
+    {
       "task_id": "krx_enriched_pit_streaming",
       "date": "2026-09-06",
       "adr_id": "ADR_20260906_krx_enriched_pit_streaming",
