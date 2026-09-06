@@ -73,7 +73,7 @@ def test_rebuild_cli_fails_closed_without_security_master(tmp_path, monkeypatch)
     import src.integrations.kis.investor_flow as kis_module
 
     monkeypatch.setattr(dart_module, 'DartXbrlCollector', lambda: object())
-    monkeypatch.setattr(krx_module, 'KrxHistoricalCollector', lambda: object())
+    monkeypatch.setattr(krx_module, 'KrxHistoricalCollector', lambda **_kwargs: object())
     monkeypatch.setattr(kis_module, 'KisInvestorFlowCollector', lambda symbols: object())
 
     monkeypatch.setattr(
@@ -108,7 +108,7 @@ def test_rebuild_cli_dispatches_with_all_master_symbols(tmp_path, monkeypatch, c
     import src.integrations.kis.investor_flow as kis_module
 
     monkeypatch.setattr(dart_module, 'DartXbrlCollector', lambda: object())
-    monkeypatch.setattr(krx_module, 'KrxHistoricalCollector', lambda: object())
+    monkeypatch.setattr(krx_module, 'KrxHistoricalCollector', lambda **_kwargs: object())
     captured: dict[str, tuple[str, ...]] = {}
     monkeypatch.setattr(kis_module, 'KisInvestorFlowCollector', lambda symbols: captured.setdefault('symbols', symbols) or object())
     monkeypatch.setattr(cli_module, '_load_silver_table', lambda root, table: pl.DataFrame({'instrument_id': ['KRX:005930', 'KRX:000660']}))

@@ -204,3 +204,11 @@ def test_normalize_dart_facts_dispatch_reports_failure(tmp_path, monkeypatch, ca
 
     assert cli_module.main() == 1
     assert not (tmp_path / "silver" / "financial_facts").exists()
+
+
+def test_cli_plan_defaults_to_kis_page_capacity(monkeypatch) -> None:
+    import sys
+    from src.data.cli import _parse_args
+
+    monkeypatch.setattr(sys, 'argv', ['stock-data', 'plan', '--coverage-start', '2024-01-02', '--coverage-end', '2024-01-03', '--symbols', '005930'])
+    assert _parse_args().chunk_size == 30
