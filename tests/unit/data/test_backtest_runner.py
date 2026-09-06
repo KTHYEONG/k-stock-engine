@@ -43,12 +43,16 @@ def samsung_2016_january_sessions(tmp_path: Path) -> tuple[tuple[BacktestSession
         pytest.skip("No parquet files in daily_market")
 
     df_market = (
-        pl.scan_parquet(files)
+        pl.scan_parquet(
+            files,
+            cast_options=pl.ScanCastOptions(datetime_cast="convert-timezone"),
+        )
         .filter(
             (pl.col("instrument_id") == "KRX:005930")
             & (pl.col("session") >= datetime(2016, 1, 1, tzinfo=KST))
             & (pl.col("session") <= datetime(2016, 2, 5, tzinfo=KST))
         )
+        .unique(subset=["session"], keep="first", maintain_order=True)
         .sort("session")
         .collect()
     )
