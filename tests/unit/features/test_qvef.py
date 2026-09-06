@@ -12,8 +12,8 @@ def test_build_qvef_features_uses_ttm_and_ignores_future_correction() -> None:
     identifiers = [f'KRX:{i:06d}' for i in range(10)]
     universe = tuple(UniverseDecision(decision, instrument_id, True, (), 252, 2_000_000_000.0) for instrument_id in identifiers)
     master = pl.DataFrame({'instrument_id': identifiers, 'company_id': identifiers, 'sector': ['Technology'] * 10, 'valid_from': [sessions[0]] * 10, 'valid_to': [None] * 10, 'available_at': [sessions[0]] * 10})
-    market = pl.DataFrame([{'session': session, 'instrument_id': instrument_id, 'trading_value': 100.0 + index, 'market_cap': 200.0 + index, 'available_at': session} for index, instrument_id in enumerate(identifiers) for session in sessions[-20:]])
-    flow = pl.DataFrame([{'session': session, 'instrument_id': instrument_id, 'foreign_net_value': float(index + 1), 'available_at': session} for index, instrument_id in enumerate(identifiers) for session in sessions[-20:]])
+    market = pl.DataFrame([{'session': session, 'instrument_id': instrument_id, 'trading_value': 100.0 + index, 'market_cap': 200.0 + index, 'available_at': session} for index, instrument_id in enumerate(identifiers) for session in sessions[-21:]])
+    flow = pl.DataFrame([{'session': session, 'instrument_id': instrument_id, 'foreign_net_value': float(index + 1), 'available_at': session} for index, instrument_id in enumerate(identifiers) for session in sessions[-21:-1]])
     facts = []
     for index, company_id in enumerate(identifiers):
         for quarter in range(1, 5):
@@ -53,8 +53,8 @@ def test_build_qvef_features_neutralizes_negative_earnings_and_rejects_incomplet
     identifiers = [f'KRX:{i:06d}' for i in range(10)]
     universe = tuple(UniverseDecision(decision, instrument_id, True, (), 252, 2_000_000_000.0) for instrument_id in identifiers)
     master = pl.DataFrame({'instrument_id': identifiers, 'company_id': identifiers, 'sector': ['Technology'] * 10, 'valid_from': [sessions[0]] * 10, 'valid_to': [None] * 10, 'available_at': [sessions[0]] * 10})
-    market = pl.DataFrame([{'session': session, 'instrument_id': instrument_id, 'trading_value': 100.0, 'market_cap': 200.0, 'available_at': session} for instrument_id in identifiers for session in sessions[-20:]])
-    flow = pl.DataFrame([{'session': session, 'instrument_id': instrument_id, 'foreign_net_value': 1.0, 'available_at': session} for instrument_id in identifiers for session in sessions[-20:] if not (instrument_id == identifiers[1] and session == sessions[-2])])
+    market = pl.DataFrame([{'session': session, 'instrument_id': instrument_id, 'trading_value': 100.0, 'market_cap': 200.0, 'available_at': session} for instrument_id in identifiers for session in sessions[-21:]])
+    flow = pl.DataFrame([{'session': session, 'instrument_id': instrument_id, 'foreign_net_value': 1.0, 'available_at': session} for instrument_id in identifiers for session in sessions[-21:-1] if not (instrument_id == identifiers[1] and session == sessions[-2])])
     facts = []
     for index, company_id in enumerate(identifiers):
         for quarter in range(1, 5):
@@ -70,3 +70,30 @@ def test_build_qvef_features_neutralizes_negative_earnings_and_rejects_incomplet
     assert 'earnings_to_price_neutral' in negative_earnings.component_presence
     assert incomplete_flow.foreign_flow_score is None
     assert 'foreign_flow_incomplete' in incomplete_flow.component_presence
+
+
+def test_qvef_flow_lookback_excludes_same_session_unpublished_flow() -> None:
+    from datetime import datetime, timedelta
+    from src.core.time import KRX_TZ, SessionCalendar
+    from src.features.qvef import _eligible_flow_sessions
+
+    sessions = tuple(datetime(2016, 1, 1, 9, tzinfo=KRX_TZ) + timedelta(days=i) for i in range(21))
+    result = _eligible_flow_sessions(calendar=SessionCalendar(sessions), decision_session=sessions[-1], lookback=20)
+
+    assert result == sessions[:-1]
+    assert sessions[-1] not in result
+
+
+def test_qvef_flow_lookback_rejects_invalid_requests() -> None:
+    from datetime import datetime
+    import pytest
+    from src.core.time import KRX_TZ, SessionCalendar
+    from src.features.qvef import _eligible_flow_sessions
+
+    session = datetime(2016, 1, 1, 9, tzinfo=KRX_TZ)
+    calendar = SessionCalendar((session,))
+    with pytest.raises(ValueError, match='positive'):
+        _eligible_flow_sessions(calendar=calendar, decision_session=session, lookback=0)
+    with pytest.raises(ValueError, match='does not contain'):
+        _eligible_flow_sessions(calendar=calendar, decision_session=datetime(2016, 1, 2, 9, tzinfo=KRX_TZ), lookback=1)
+    assert _eligible_flow_sessions(calendar=calendar, decision_session=session, lookback=2) == ()

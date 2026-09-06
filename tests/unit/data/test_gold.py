@@ -414,6 +414,20 @@ def test_exclude_sentinel_ca_mixed() -> None:
     assert "KRX:REAL" not in excluded
 
 
+def test_exclude_sentinel_ca_rejects_invalid_and_gapped_coverage() -> None:
+    rows = [
+        {"instrument_id": "KRX:GAP", "effective_date": datetime(2016, 1, 4, 9, 0, tzinfo=KRX_TZ), "coverage_end": datetime(2016, 1, 4, 9, 0, tzinfo=KRX_TZ), "action_id": "gap", "type": "no_action", "factor": 1.0, "cash_amount": 0.0, "source": "test", "available_at": datetime(2016, 1, 4, 9, 0, tzinfo=KRX_TZ), "source_hash": "x"},
+        {"instrument_id": "KRX:GAP", "effective_date": datetime(2016, 1, 6, 9, 0, tzinfo=KRX_TZ), "coverage_end": datetime(2016, 1, 6, 9, 0, tzinfo=KRX_TZ), "action_id": "gap2", "type": "no_action", "factor": 1.0, "cash_amount": 0.0, "source": "test", "available_at": datetime(2016, 1, 6, 9, 0, tzinfo=KRX_TZ), "source_hash": "x"},
+        {"instrument_id": "KRX:GOOD", "effective_date": datetime(2016, 1, 4, 9, 0, tzinfo=KRX_TZ), "coverage_end": datetime(2016, 1, 6, 9, 0, tzinfo=KRX_TZ), "action_id": "good", "type": "no_action", "factor": 1.0, "cash_amount": 0.0, "source": "test", "available_at": datetime(2016, 1, 4, 9, 0, tzinfo=KRX_TZ), "source_hash": "x"},
+    ]
+    excluded = exclude_sentinel_corporate_actions(pl.DataFrame(rows), frozenset({"KRX:GAP", "KRX:GOOD"}), window_start=date(2016, 1, 4), window_end=date(2016, 1, 6))
+    assert excluded == frozenset({"KRX:GAP"})
+    malformed = pl.DataFrame({"instrument_id": ["KRX:BAD"], "effective_date": [None], "coverage_end": [None], "type": ["no_action"]})
+    assert exclude_sentinel_corporate_actions(malformed, frozenset({"KRX:BAD"}), window_start=date(2016, 1, 4), window_end=date(2016, 1, 6)) == frozenset({"KRX:BAD"})
+    sentinel = pl.DataFrame({"instrument_id": ["KRX:__NO_ACTION__"], "effective_date": [datetime(2016, 1, 4, 9, 0, tzinfo=KRX_TZ)], "coverage_end": [datetime(2016, 1, 6, 9, 0, tzinfo=KRX_TZ)], "type": ["no_action"]})
+    assert exclude_sentinel_corporate_actions(sentinel, frozenset({"KRX:__NO_ACTION__"}), window_start=date(2016, 1, 4), window_end=date(2016, 1, 6)) == frozenset({"KRX:__NO_ACTION__"})
+
+
 # ──────────────────────────────────────────────────────────────────
 # 5. Composite manifest
 # ──────────────────────────────────────────────────────────────────
@@ -450,7 +464,9 @@ def test_build_gold_audit_manifest_basic() -> None:
         "available_at": [datetime(2016, 1, 1, 9, 0, tzinfo=KRX_TZ)],
         "source_hash": ["abc"],
     })
-    ca = _make_corporate_actions(["KRX:000001"], "split")  # real action → not excluded
+    ca = _make_corporate_actions(["KRX:000001"], "no_action").with_columns(
+        pl.lit(datetime(2016, 4, 5, 9, 0, tzinfo=KRX_TZ)).alias("coverage_end")
+    )
 
     manifest = build_gold_audit_manifest(
         calendar=cal,
@@ -599,3 +615,34 @@ def test_materialize_gold_window(tmp_path: Path) -> None:
     summary = json.loads(Path(report.summary_artifact_path).read_text(encoding="utf-8"))
     assert summary["manifest_hash"] == report.manifest.manifest_hash
     assert summary["sessions_evaluated"] > 0
+
+
+def test_gold_rejects_future_availability_instead_of_rewriting_it() -> None:
+    from datetime import UTC, datetime
+    import polars as pl
+    import pytest
+    from src.data.gold import _assert_no_availability_repair
+    from src.data.schemas import PITDataError
+
+    future = datetime(2026, 9, 5, tzinfo=UTC)
+    frame = pl.DataFrame({'available_at': [future]})
+    with pytest.raises(PITDataError, match=r'daily_market.*available_at'):
+        _assert_no_availability_repair(table_name='daily_market', frame=frame, final_decision_time=datetime(2016, 12, 29, 6, 30, tzinfo=UTC))
+    assert frame.item(0, 'available_at') == future
+
+
+def test_gold_availability_guard_rejects_naive_and_invalid_timestamp_columns() -> None:
+    import pytest
+    from src.data.gold import _assert_no_availability_repair
+    from src.data.schemas import PITDataError
+
+    with pytest.raises(PITDataError, match='timezone-aware'):
+        _assert_no_availability_repair(
+            table_name='daily_market', frame=pl.DataFrame(), final_decision_time=datetime(2016, 1, 1)
+        )
+    with pytest.raises(PITDataError, match='comparison failed'):
+        _assert_no_availability_repair(
+            table_name='daily_market',
+            frame=pl.DataFrame({'available_at': ['not-a-time']}),
+            final_decision_time=datetime(2016, 1, 1, tzinfo=KRX_TZ),
+        )
