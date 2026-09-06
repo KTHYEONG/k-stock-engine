@@ -270,7 +270,10 @@
     "testing": "tests/unit/strategy/test_selection.py"
   },
   "src/strategy/universe.py": {
-    "testing": "tests/unit/strategy/test_universe.py"
+    "testing": [
+      "tests/unit/strategy/test_universe.py",
+      "tests/integration/strategy/test_historical_universe.py"
+    ]
   },
   "src/validation/bootstrap.py": {
     "testing": "tests/unit/validation/test_bootstrap.py"
