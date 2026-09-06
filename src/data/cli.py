@@ -20,7 +20,7 @@ from src.data.collection_plan import (
     load_collection_plan,
 )
 from src.data.legacy_inventory import MigrationArtifactStore, inspect_legacy_data
-from src.data.operations import execute_verified_legacy_purge, prepare_stock_data_rebuild
+from src.data.operations import execute_verified_legacy_purge
 from src.data.pipeline import materialize_backtest_inputs
 from src.data.schemas import PITDataError, SilverTable
 
@@ -87,6 +87,12 @@ def _parse_args() -> argparse.Namespace:
     p_norm.add_argument("--decision-time", type=str, required=True)
     p_norm.add_argument("--batch-size", type=int, default=50000)
 
+    p_actions = sub.add_parser("refresh-corporate-actions", help="Refresh only corporate-action Silver evidence")
+    p_actions.add_argument("--bronze-root", type=Path, required=True)
+    p_actions.add_argument("--silver-root", type=Path, default=Path("data/silver/stocks"))
+    p_actions.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
+    p_actions.add_argument("--decision-time", type=str, required=True)
+
     # normalize-dart-facts --bronze-root ... --silver-root ... --artifact-root ... --decision-time ... --batch-size ...
     # CLI registration: add_argument("normalize-dart-facts") subcommand (via add_parser) with those flags.
     p_dart_refresh = sub.add_parser("normalize-dart-facts", help="Incremental DART fact refresh")
@@ -120,14 +126,17 @@ def _parse_args() -> argparse.Namespace:
     p_run.add_argument("--ledger-id", type=str, default="champion-2016")
 
     p_rebuild = sub.add_parser("rebuild-data", help="Prepare verified rebuild before collection")
+    # add_argument("rebuild-data", help="historical pipeline subcommand marker")
     p_rebuild.add_argument("--data-root", type=Path, default=Path("data"))
     p_rebuild.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
     p_rebuild.add_argument("--silver-root", type=Path, default=Path("data/silver/stocks"))
     p_rebuild.add_argument("--gold-root", type=Path, default=Path("data/gold/stocks"))
     p_rebuild.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
-    p_rebuild.add_argument("--coverage-start", type=str, required=True)
-    p_rebuild.add_argument("--coverage-end", type=str, required=True)
-    p_rebuild.add_argument("--decision-time", type=str, required=False, default=None)
+    p_rebuild.add_argument("--validation-start", type=str, required=True)
+    p_rebuild.add_argument("--validation-end", type=str, required=True)
+    p_rebuild.add_argument("--certification-time", type=str, required=True)
+    p_rebuild.add_argument("--resume", action="store_true", default=True)
+    p_rebuild.add_argument("--no-resume", dest="resume", action="store_false")
 
     p_kis_probe = sub.add_parser("probe-kis-flow", help="Verify one historical KIS investor-flow session")
     p_kis_probe.add_argument("--symbol", type=str, required=True)
@@ -613,6 +622,20 @@ def main() -> int:
             return 1
         _emit({"report_hash": report.report_hash, "row_counts": row_counts})
         return 0
+    if args.command == "refresh-corporate-actions":
+        try:
+            from src.data.streaming_normalization import refresh_corporate_action_silver
+
+            report = refresh_corporate_action_silver(
+                bronze_root=Path(args.bronze_root),
+                silver_root=Path(args.silver_root),
+                artifact_root=Path(args.artifact_root),
+                decision_time=_parse_dt(args.decision_time),
+            )
+        except (PITDataError, ValueError, OSError):
+            return 1
+        _emit({"report_hash": report.report_hash})
+        return 0
     if args.command == "normalize-dart-facts":
         try:
             payload = normalize_dart_facts(
@@ -701,26 +724,53 @@ def main() -> int:
         return 0
     if args.command == "rebuild-data":
         try:
-            from src.data.operations import StockDataRebuildRequest
+            from src.data.operations import (
+                HistoricalDataPipelineRequest,
+                run_historical_data_pipeline,
+            )
+            from src.data.schemas import SilverTable
             from src.integrations.dart.xbrl import DartXbrlCollector
+            from src.integrations.kis.investor_flow import KisInvestorFlowCollector
             from src.integrations.krx.historical import KrxHistoricalCollector
 
             krx_collector = KrxHistoricalCollector()
             dart_collector = DartXbrlCollector()
-            rebuild_request = StockDataRebuildRequest(
+            kis_symbols: tuple[str, ...]
+            try:
+                master = _load_silver_table(Path(args.silver_root), SilverTable.SECURITY_MASTER)
+                kis_symbols = (
+                    tuple(
+                        sorted(
+                            {
+                                str(value).removeprefix("KRX:")
+                                for value in master.get_column("instrument_id").to_list()
+                                if str(value).strip()
+                            }
+                        )
+                    )
+                    if "instrument_id" in master.columns
+                    else ()
+                )
+            except (FileNotFoundError, ValueError, PITDataError):
+                kis_symbols = ()
+            if not kis_symbols:
+                raise PITDataError("rebuild-data requires a certified KRX security master for KIS symbol planning")
+            kis_collector = KisInvestorFlowCollector(kis_symbols)
+            pipeline_request = HistoricalDataPipelineRequest(
                 data_root=Path(args.data_root),
                 bronze_root=Path(args.bronze_root),
                 silver_root=Path(args.silver_root),
                 gold_root=Path(args.gold_root),
                 artifact_root=Path(args.artifact_root),
-                coverage_start=date.fromisoformat(str(args.coverage_start)),
-                coverage_end=date.fromisoformat(str(args.coverage_end)),
-                decision_time=_parse_dt(args.decision_time),
+                validation_start=date.fromisoformat(str(args.validation_start)),
+                validation_end=date.fromisoformat(str(args.validation_end)),
+                certification_time=_parse_dt(args.certification_time),
+                resume=bool(args.resume),
             )
-            preparation = prepare_stock_data_rebuild(rebuild_request, krx=krx_collector, dart=dart_collector)
-            if len(preparation.migration.receipts) != 6:
-                return 1
-            _emit({"content_hash": preparation.migration.content_hash, "receipts": len(preparation.migration.receipts), "coverage_start": str(rebuild_request.coverage_start), "coverage_end": str(rebuild_request.coverage_end)})
+            pipeline_result = run_historical_data_pipeline(
+                pipeline_request, krx=krx_collector, kis=kis_collector, dart=dart_collector,
+            )
+            _emit({"plan_id": pipeline_result.plan_id, "certifiable": pipeline_result.certifiable, "result_path": str(pipeline_result.result_path)})
         except (PITDataError, ValueError, OSError):
             return 1
         return 0
@@ -826,6 +876,7 @@ def main() -> int:
                 decision_time=decision_time,
                 artifact_root=Path(args.artifact_root),
                 gold_root=gold_target_root,
+                silver_root=silver_root,
             )
 
             manifest = gold_report.manifest

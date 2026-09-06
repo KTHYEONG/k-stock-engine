@@ -7,6 +7,7 @@ from pathlib import Path
 
 import polars as pl
 
+from src.core.datasets import validate_dataset_manifest
 from src.core.instruments import AssetKind
 from src.core.time import KRX_TZ, SessionCalendar
 from src.data.gold import WARMUP_SESSIONS
@@ -79,6 +80,7 @@ _FINANCIAL_FACTS_COLUMNS = [
 _CORPORATE_ACTIONS_COLUMNS = [
     "instrument_id",
     "effective_date",
+    "coverage_end",
     "action_id",
     "type",
     "factor",
@@ -202,10 +204,32 @@ def _read_full_projected(
     table: SilverTable,
     decision_time: datetime,
     columns: list[str],
+    valid_from_end: date | None = None,
 ) -> pl.DataFrame:
     dataset_id, store = _resolve_latest_dataset(silver_root, table)
     try:
-        frame = store.read(dataset_id, AssetKind.STOCK, _feature_set(table), decision_time)
+        if valid_from_end is None:
+            frame = store.read(dataset_id, AssetKind.STOCK, _feature_set(table), decision_time)
+        else:
+            # Reference tables can be large (security master is multi-million
+            # rows).  Verify the manifest/partition digests, then scan only
+            # buckets that can contain valid_from <= validation_end.
+            manifest = store.read_manifest(dataset_id)
+            validate_dataset_manifest(
+                manifest, AssetKind.STOCK, _feature_set(table), decision_time
+            )
+            paths = store.bounded_partition_paths(
+                dataset_id,
+                session_start=date(1900, 1, 1),
+                session_end=valid_from_end,
+            )
+            if not paths:
+                frame = pl.DataFrame({column: [] for column in columns})
+            else:
+                scan = pl.scan_parquet([str(path) for path in paths]).select(columns)
+                if "valid_from" in columns:
+                    scan = scan.filter(pl.col("valid_from").dt.date() <= valid_from_end)
+                frame = scan.collect()
     except (ValueError, FileNotFoundError, OSError) as exc:
         raise PITDataError(f"invalid certified Silver table: {table.value}") from exc
     missing = [c for c in columns if c not in frame.columns]
@@ -305,6 +329,7 @@ def load_gold_window_inputs(
         table=SilverTable.SECURITY_MASTER,
         decision_time=certification_time,
         columns=_SECURITY_MASTER_COLUMNS,
+        valid_from_end=validation_end,
     )
     financial_facts_full = _read_full_projected(
         silver_root=silver_root,
