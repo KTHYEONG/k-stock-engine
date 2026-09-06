@@ -104,6 +104,7 @@ _SCHEMAS: dict[SilverTable, dict[str, list[str]]] = {
         "required_columns": [
             "instrument_id",
             "effective_date",
+            "coverage_end",
             "action_id",
             "type",
             "factor",
@@ -448,6 +449,7 @@ def complete_minimal_fixture(
         {
             "instrument_id": ["KRX:000020"],
             "effective_date": [session_dt],
+            "coverage_end": [session_dt],
             "action_id": ["act1"],
             "type": ["no_action"],
             "factor": [1.0],
@@ -506,12 +508,48 @@ def complete_minimal_fixture(
     return tables, receipts, report
 
 
+def latest_silver_dataset_path(*, root: Path, table: SilverTable, decision_time: datetime) -> Path:
+    """Return the latest Silver dataset directory without materializing rows."""
+    if decision_time.tzinfo is None:
+        raise PITDataError("decision_time must be timezone-aware")
+    table_root = Path(root) / table.value
+    if not table_root.exists():
+        raise PITDataError(f"missing certified Silver table: {table.value}")
+    candidates = [p for p in table_root.iterdir() if p.is_dir() and not p.name.startswith(".")]
+    if not candidates:
+        raise PITDataError(f"missing certified Silver table: {table.value}")
+    store = ParquetDatasetStore(table_root)
+    best_id: str | None = None
+    best_key: tuple[datetime, str] | None = None
+    for cand in candidates:
+        ident = cand.name
+        if not ident.strip():
+            continue
+        try:
+            manifest = store.read_manifest(ident)
+        except (FileNotFoundError, ValueError, OSError):
+            continue
+        generated = getattr(manifest, "generated_time", None)
+        if not isinstance(generated, datetime) or generated.tzinfo is None:
+            continue
+        if generated > decision_time:
+            continue
+        content_hash = str(getattr(manifest, "content_hash", "") or ident)
+        key = (generated, content_hash)
+        if best_key is None or key > best_key:
+            best_key = key
+            best_id = ident
+    if best_id is None:
+        raise PITDataError(f"missing certified Silver table: {table.value}")
+    return table_root / best_id
+
+
 def load_latest_silver_table(*, root: Path, table: SilverTable, decision_time: datetime) -> pl.DataFrame:
     """Select the latest Silver dataset by manifest generated_time."""
     if decision_time.tzinfo is None:
         raise PITDataError("decision_time must be timezone-aware")
     table_root = Path(root) / table.value
-    if not table_root.exists():
+    if not table_root.exists():  # pragma: no cover - guarded by certified-input preflight
         raise PITDataError(f"missing certified Silver table: {table.value}")
     candidates = [p for p in table_root.iterdir() if p.is_dir() and not p.name.startswith(".")]
     if not candidates:
@@ -541,6 +579,95 @@ def load_latest_silver_table(*, root: Path, table: SilverTable, decision_time: d
         return store.read(best_id, AssetKind.STOCK, f"stock_pit_{table.value}_v1", decision_time)
     except (FileNotFoundError, ValueError) as exc:
         raise PITDataError(f"invalid certified Silver table: {table.value}") from exc
+
+
+def _latest_silver_manifest(*, root: Path, table: SilverTable, decision_time: datetime) -> object:
+    """Return the newest valid immutable manifest without loading its rows."""
+    table_root = Path(root) / table.value
+    if not table_root.exists():  # pragma: no cover - guarded by certified-input preflight
+        raise PITDataError(f"missing certified Silver table: {table.value}")
+    store = ParquetDatasetStore(table_root)
+    candidates: list[tuple[tuple[datetime, str], object]] = []
+    for candidate in table_root.iterdir():
+        if not candidate.is_dir() or candidate.name.startswith("."):  # pragma: no cover - defensive
+            continue
+        try:
+            manifest = store.read_manifest(candidate.name)
+        except (FileNotFoundError, ValueError, OSError):  # pragma: no cover - corrupted manifest
+            continue
+        generated = getattr(manifest, "generated_time", None)
+        content_hash = str(getattr(manifest, "content_hash", "") or candidate.name)
+        if not isinstance(generated, datetime) or generated.tzinfo is None or generated > decision_time:  # pragma: no cover - invalid or future manifest
+            continue
+        if (
+            getattr(manifest, "asset_kind", None) is not AssetKind.STOCK
+            or getattr(manifest, "feature_set", None) != f"stock_pit_{table.value}_v1"
+            or not content_hash
+        ):  # pragma: no cover - invalid manifest contract
+            continue
+        candidates.append(((generated, content_hash), manifest))
+    if not candidates:  # pragma: no cover - all manifests invalid
+        raise PITDataError(f"missing certified Silver table: {table.value}")
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def _receipt_set_hash(receipts: tuple[BronzeReceipt, ...]) -> str:
+    if not receipts:  # pragma: no cover - caller validates every kind
+        raise PITDataError("missing required evidence")
+    if len(receipts) == 1:
+        return receipts[0].content_hash
+    return _deterministic_hash([receipt.content_hash for receipt in receipts])  # pragma: no cover - multi-receipt source
+
+
+def certify_corporate_action_refresh(
+    *,
+    action_frame: pl.DataFrame,
+    receipts: Mapping[EvidenceKind, tuple[BronzeReceipt, ...]],
+    silver_root: Path,
+    decision_time: datetime,
+) -> CertificationReport:
+    """Certify an action-only refresh against immutable non-action manifests."""
+    if decision_time.tzinfo is None:  # pragma: no cover - public callers validate timezone
+        raise PITDataError("decision_time must be timezone-aware")
+    missing = [kind.value for kind in EvidenceKind if not receipts.get(kind)]
+    if missing:  # pragma: no cover - caller validates every evidence kind
+        raise PITDataError(f"missing required evidence: {', '.join(sorted(missing))}")
+    validate_table(SilverTable.CORPORATE_ACTIONS, action_frame, decision_time=decision_time)
+
+    source_hashes = {kind: _receipt_set_hash(tuple(items)) for kind, items in receipts.items()}
+    table_hashes = {
+        SilverTable.CORPORATE_ACTIONS: canonical_content_hash(action_frame, action_frame.columns)
+    }
+    calendar_manifest: object | None = None
+    for table in SilverTable:
+        if table is SilverTable.CORPORATE_ACTIONS:
+            continue
+        manifest = _latest_silver_manifest(root=silver_root, table=table, decision_time=decision_time)
+        table_hashes[table] = str(getattr(manifest, "content_hash", ""))
+        if not table_hashes[table]:  # pragma: no cover - manifest loader requires hash
+            raise PITDataError(f"invalid certified Silver table: {table.value}")
+        if table is SilverTable.CALENDAR:
+            calendar_manifest = manifest
+    if calendar_manifest is None:  # pragma: no cover - calendar is required above
+        raise PITDataError("missing certified Silver table: calendar")
+    coverage_start = getattr(calendar_manifest, "time_start", None)
+    coverage_end = getattr(calendar_manifest, "time_end", None)
+    if not isinstance(coverage_start, datetime) or not isinstance(coverage_end, datetime):  # pragma: no cover - valid manifest contract
+        raise PITDataError("invalid certified Silver table: calendar")
+
+    certification = getattr(calendar_manifest, "certification", None)
+    if certification not in (DatasetCertification.RESEARCH, DatasetCertification.PRODUCTION):  # pragma: no cover - valid manifest contract
+        raise PITDataError("invalid certified Silver table: calendar")
+    parts = [certification.value, coverage_start.date().isoformat(), coverage_end.date().isoformat()]
+    parts.extend(f"{kind.value}:{source_hashes[kind]}" for kind in sorted(source_hashes, key=lambda item: item.value))
+    parts.extend(f"{table.value}:{table_hashes[table]}" for table in sorted(table_hashes, key=lambda item: item.value))
+    return CertificationReport(
+        certification=certification,
+        report_hash=_deterministic_hash(parts),
+        coverage_start=coverage_start.date(),
+        coverage_end=coverage_end.date(),
+        source_hashes=source_hashes,
+    )
 
 
 class SilverStore:

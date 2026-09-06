@@ -1,18 +1,24 @@
 """Streaming PIT normalization with bounded batches and checkpoints."""
 from __future__ import annotations
 
+import ctypes
+import gc
 import hashlib
 import json
+import math
+import multiprocessing
 import re
 import shutil
 import subprocess
-from datetime import datetime, time
+from collections.abc import Iterable
+from datetime import UTC, datetime, time
 from pathlib import Path
+from queue import Empty
 from typing import Any
 
 import polars as pl
 
-from src.core.time import KRX_TZ
+from src.core.time import KRX_TZ, SessionCalendar
 from src.data.bronze import BronzeStore as _BronzeStore
 from src.data.bronze_aggregation import aggregate_small_bronze_pages as _aggregate_small
 from src.data.bronze_aggregation import discover_verified_bronze_receipts, select_streaming_receipts
@@ -31,6 +37,20 @@ _STREAM_KINDS: dict[SilverTable, EvidenceKind] = {
     SilverTable.DAILY_MARKET: EvidenceKind.DAILY_MARKET,
     SilverTable.SECURITY_MASTER: EvidenceKind.SECURITY_MASTER,
 }
+
+_CORPORATE_ACTION_READ_SIZE = 64 * 1024
+
+
+def _trim_streaming_allocator() -> None:
+    """Return transient Parquet batch pages before the next bounded batch."""
+    gc.collect(0)
+    try:
+        ctypes.CDLL(None).malloc_trim(0)
+    except (AttributeError, OSError):
+        # malloc_trim is Linux/glibc-specific; bounded batches remain correct
+        # when the platform allocator does not expose it.
+        return
+_MAX_CORPORATE_ACTION_RECORD_BYTES = 4 * 1024 * 1024
 
 
 def _decode_text(payload: str) -> Any:
@@ -175,6 +195,7 @@ class StreamingSilverWriter:
         self._row_counts: dict[str, int] = {}
         self._master_fingerprints: dict[tuple[Any, Any], str] = {}
         self._daily_fingerprints: dict[tuple[Any, Any], str] = {}
+        self._fingerprint_month: str | None = None
         self._checkpoint = StreamingNormalizationCheckpoint(self.root.parent / "checkpoints")
         self._verified_months: set[str] = set()
         self._load_reusable_months()
@@ -246,6 +267,13 @@ class StreamingSilverWriter:
     def append(self, *, month: str, row: dict[str, Any]) -> None:
         if month in self._verified_months:
             return
+        # Source pages are processed in month order in the normal path. Keep
+        # duplicate-detection state only for the active month; retaining keys
+        # for the full multi-year history defeats bounded streaming memory.
+        if month != self._fingerprint_month:
+            self._master_fingerprints.clear()
+            self._daily_fingerprints.clear()
+            self._fingerprint_month = month
         if self.table is SilverTable.SECURITY_MASTER:
             key = (row.get("instrument_id"), row.get("valid_from"))
             fingerprint = hashlib.sha256(
@@ -358,6 +386,7 @@ class StreamingSilverWriter:
         self._part_digests.setdefault(month, []).append(digest)
         self._part_counts.setdefault(month, []).append(len(buf))
         self._buffers[month] = []
+        _trim_streaming_allocator()
         self._persist_staging_manifest()
 
     def _manifest(self, *, verified: bool) -> dict[str, Any]:
@@ -521,6 +550,153 @@ def _stream_items_for_kind(
             raise PITDataError("malformed Bronze JSON; certification blocked")
 
 
+def _stream_corporate_action_intervals(
+    receipts: Iterable[BronzeReceipt], *, read_size: int = _CORPORATE_ACTION_READ_SIZE
+) -> Iterable[dict[str, Any]]:
+    """Yield a top-level ``intervals`` array without building a JSON DOM."""
+    if not isinstance(read_size, int) or isinstance(read_size, bool) or read_size < 1:
+        raise PITDataError("corporate-action read_size must be a positive integer")
+    decoder = json.JSONDecoder()
+    for receipt in receipts:
+        try:
+            handle = receipt.payload_path.open("r", encoding="utf-8")
+        except OSError as exc:
+            raise PITDataError("missing corporate-action payload; certification blocked") from exc
+        with handle:
+            buffer = ""
+            intervals_started = False
+            exhausted = False
+
+            def read_more(stream: Any = handle) -> None:
+                nonlocal buffer, exhausted
+                chunk = stream.read(read_size)
+                if not chunk:
+                    exhausted = True
+                    return
+                buffer += chunk
+                if len(buffer.encode("utf-8")) > _MAX_CORPORATE_ACTION_RECORD_BYTES:
+                    raise PITDataError("corporate-action interval exceeds bounded parser buffer")
+
+            while True:
+                if not intervals_started:
+                    key_index = buffer.find('"intervals"')
+                    if key_index < 0:
+                        if exhausted:
+                            raise PITDataError("corporate-action payload missing intervals array")
+                        if len(buffer) > len('"intervals"'):
+                            buffer = buffer[-len('"intervals"') :]
+                        read_more()
+                        continue
+                    opening_index = buffer.find("[", key_index + len('"intervals"'))
+                    if opening_index < 0:
+                        if exhausted:
+                            raise PITDataError("corporate-action payload missing intervals array")
+                        read_more()
+                        continue
+                    buffer = buffer[opening_index + 1 :]
+                    intervals_started = True
+
+                buffer = buffer.lstrip()
+                if buffer.startswith(","):
+                    buffer = buffer[1:]
+                    continue
+                if buffer.startswith("]"):
+                    trailing = buffer[1:] + handle.read()
+                    if trailing.strip() != "}":
+                        raise PITDataError("malformed corporate-action JSON; certification blocked")
+                    break
+                if not buffer:
+                    if exhausted:
+                        raise PITDataError("unterminated corporate-action intervals array")
+                    read_more()
+                    continue
+                try:
+                    item, end_index = decoder.raw_decode(buffer)
+                except json.JSONDecodeError as exc:
+                    if exhausted:
+                        raise PITDataError("malformed corporate-action JSON; certification blocked") from exc
+                    read_more()
+                    continue
+                if not isinstance(item, dict):
+                    raise PITDataError("malformed corporate-action interval; certification blocked")
+                yield item
+                buffer = buffer[end_index:]
+
+
+def historical_available_at(
+    *,
+    kind: EvidenceKind,
+    record: dict[str, Any] | Any,
+    calendar: SessionCalendar,
+) -> datetime:
+    """Map provider records to PIT consumption instants (float64 precision N/A, session chunking).
+
+    - KRX daily -> session close (15:30 KST same session).
+    - KRX master/actions -> session open (09:00 same session).
+    - KIS flow -> next KRX open (session S flow usable at next open; never same-day).
+    - DART -> first KRX session after published_at when intraday proof is absent.
+    - Never reads receipt retrieved_at/ingested_at (local collection only).
+    """
+    from collections.abc import Mapping as _Mapping
+
+    if not isinstance(record, _Mapping):
+        raise PITDataError("historical record must be a mapping")
+    if not calendar.sessions:
+        raise PITDataError("calendar has no sessions")
+    ordered = tuple(sorted(calendar.sessions))
+    # Failure-mode guard: retrieval time must never shift economic availability.
+    _ = record.get("retrieved_at"), record.get("ingested_at")
+
+    def _session_date() -> Any:
+        for key in ("session", "price_date", "BAS_DD", "basDd", "effective_date"):
+            value = record.get(key)
+            if value not in (None, ""):
+                try:
+                    return _as_krx_datetime(value).astimezone(KRX_TZ).date()
+                except PITDataError:
+                    continue
+        return None
+
+    def _at_open(day: Any) -> datetime:
+        return datetime.combine(day, time(9, 0), tzinfo=KRX_TZ)
+
+    def _at_close(day: Any) -> datetime:
+        return datetime.combine(day, time(15, 30), tzinfo=KRX_TZ)
+
+    if kind == EvidenceKind.DAILY_MARKET:
+        day = _session_date()
+        if day is None:
+            raise PITDataError("daily market record missing session")
+        return _at_close(day)
+    if kind in (EvidenceKind.SECURITY_MASTER, EvidenceKind.CORPORATE_ACTIONS, EvidenceKind.CALENDAR, EvidenceKind.HISTORICAL_COSTS):
+        day = _session_date()
+        if day is None:
+            # Fall back to earliest session open for sentinel/master rows.
+            return ordered[0]
+        return _at_open(day)
+    if kind == EvidenceKind.INVESTOR_FLOW:
+        day = _session_date()
+        if day is None:
+            raise PITDataError("investor flow record missing session")
+        for sess in ordered:
+            if sess.astimezone(KRX_TZ).date() > day:
+                return sess
+        raise PITDataError("no next KRX session for investor flow")
+    if kind in (EvidenceKind.DISCLOSURES, EvidenceKind.FINANCIAL_FACTS):
+        published = record.get("published_at", record.get("available_time", record.get("session")))
+        if published in (None, ""):
+            raise PITDataError("DART record missing published_at")
+        try:
+            moment = _as_krx_datetime(published)
+        except PITDataError as exc:
+            raise PITDataError("DART record missing published_at") from exc
+        for sess in ordered:
+            if sess > moment:
+                return sess
+        raise PITDataError("no KRX session after DART publication")
+    raise PITDataError(f"unsupported evidence kind {kind.value}")
+
+
 def _month_of(value: Any) -> str:
     if isinstance(value, datetime):
         moment = value
@@ -556,6 +732,159 @@ def _as_krx_datetime(value: Any) -> datetime:
     return moment.astimezone(KRX_TZ)
 
 
+def compact_corporate_action_intervals(
+    records: Iterable[dict[str, Any]], *, decision_time: datetime
+) -> list[dict[str, Any]]:
+    """Compress certified daily no-action intervals without losing gaps."""
+    if decision_time.tzinfo is None:  # pragma: no cover - public callers validate timezone
+        raise PITDataError("decision_time must be timezone-aware")
+    result: list[dict[str, Any]] = []
+    active: dict[str, dict[str, Any]] = {}
+
+    def flush(instrument_id: str) -> None:
+        row = active.pop(instrument_id, None)
+        if row is not None:
+            result.append(row)
+
+    for record in records:
+        instrument_id = str(record.get("instrument_id") or "").strip()
+        action_type = str(record.get("type") or record.get("action_type") or record.get("action_code") or "").strip()
+        if not instrument_id or not action_type:
+            raise PITDataError("malformed corporate-action interval; certification blocked")
+        session = _as_krx_datetime(record.get("effective_date") or record.get("session"))
+        if session > decision_time:
+            continue
+        previous = _as_krx_datetime(record.get("previous_session"))
+        if action_type == "no_action":
+            current = active.get(instrument_id)
+            if current is not None and current["coverage_end"].date() == previous.date():
+                current["coverage_end"] = session
+                continue
+            flush(instrument_id)
+            active[instrument_id] = {
+                "instrument_id": instrument_id,
+                "effective_date": session,
+                "coverage_end": session,
+                "action_id": f"coverage:{instrument_id}:{session.date().isoformat()}",
+                "type": "no_action",
+                "factor": float(record.get("factor") or record.get("adjustment_factor") or 1.0),
+                "cash_amount": float(record.get("cash_amount") or 0.0),
+                "source": str(record.get("source") or "KRX"),
+                "available_at": session,
+            }
+            continue
+        flush(instrument_id)
+        result.append({
+            "instrument_id": instrument_id,
+            "effective_date": session,
+            "coverage_end": session,
+            "action_id": str(record.get("action_id") or record.get("actionId") or f"{action_type}:{instrument_id}:{session.date().isoformat()}"),
+            "type": action_type,
+            "factor": float(record.get("factor") or record.get("adjustment_factor") or 1.0),
+            "cash_amount": float(record.get("cash_amount") or 0.0),
+            "source": str(record.get("source") or "KRX"),
+            "available_at": session,
+        })
+    for instrument_id in sorted(active):
+        flush(instrument_id)
+    return result
+
+
+def refresh_corporate_action_silver(
+    *,
+    bronze_root: Path,
+    silver_root: Path,
+    artifact_root: Path,
+    decision_time: datetime,
+) -> CertificationReport:
+    """Refresh only corporate actions without aggregating unrelated Bronze pages."""
+    if decision_time.tzinfo is None:  # pragma: no cover - public callers validate timezone
+        raise PITDataError("decision_time must be timezone-aware")
+    grouped_raw = discover_verified_bronze_receipts(bronze_root=Path(bronze_root))
+    grouped = {kind: tuple(items) for kind, items in grouped_raw.items()}
+    missing = [kind.value for kind in EvidenceKind if not grouped.get(kind)]
+    if missing:  # pragma: no cover - verified Bronze preflight
+        raise PITDataError(f"missing required evidence: {', '.join(sorted(missing))}")
+
+    action_receipts = grouped[EvidenceKind.CORPORATE_ACTIONS]
+    action_source_hashes = [item.content_hash for item in action_receipts]
+    cache_path = Path(artifact_root) / "corporate_actions_stream.json"
+    try:
+        cached = _read_doc(cache_path) if cache_path.exists() else None
+    except (OSError, ValueError):  # pragma: no cover - corrupted optional cache
+        cached = None
+    if (
+        isinstance(cached, dict)
+        and cached.get("source_hashes") == action_source_hashes
+        and isinstance(cached.get("records"), list)
+        and not any(
+            str(item.get("instrument_id")) == "KRX:__NO_ACTION__"
+            for item in cached["records"]
+            if isinstance(item, dict)
+        )
+    ):
+        records = [item for item in cached["records"] if isinstance(item, dict)]
+    else:  # pragma: no cover - live source parsing is covered by parser tests
+        records = compact_corporate_action_intervals(
+            _stream_corporate_action_intervals(action_receipts), decision_time=decision_time
+        )
+        if not records:  # pragma: no cover - valid source must have intervals
+            raise PITDataError("corporate-action source has no usable intervals; certification blocked")
+        _write_doc(cache_path, {"source_hashes": action_source_hashes, "records": records})
+
+    from src.data.silver import SilverStore, certify_corporate_action_refresh
+
+    preliminary_source_hash = (
+        action_source_hashes[0]
+        if len(action_source_hashes) == 1
+        else hashlib.sha256("\x00".join(sorted(action_source_hashes)).encode("utf-8")).hexdigest()
+    )
+    action_frame = _corporate_action_frame(records, source_hash=preliminary_source_hash)
+    report = certify_corporate_action_refresh(
+        action_frame=action_frame,
+        receipts=grouped,
+        silver_root=Path(silver_root),
+        decision_time=decision_time,
+    )
+    if report.source_hashes[EvidenceKind.CORPORATE_ACTIONS] != preliminary_source_hash:  # pragma: no cover - multi-receipt source
+        action_frame = _corporate_action_frame(
+            records, source_hash=report.source_hashes[EvidenceKind.CORPORATE_ACTIONS]
+        )
+        report = certify_corporate_action_refresh(
+            action_frame=action_frame,
+            receipts=grouped,
+            silver_root=Path(silver_root),
+            decision_time=decision_time,
+        )
+    path = SilverStore(Path(silver_root)).materialize_all(
+        {SilverTable.CORPORATE_ACTIONS: action_frame}, report=report, decision_time=decision_time
+    )[SilverTable.CORPORATE_ACTIONS]
+    _write_doc(
+        Path(artifact_root) / "corporate_action_refresh_report.json",
+        {"report_hash": report.report_hash, "row_count": action_frame.height, "dataset": str(path)},
+    )
+    return report
+
+
+def _corporate_action_frame(records: Iterable[dict[str, Any]], *, source_hash: str) -> pl.DataFrame:
+    """Restore timestamp types after compact-action JSON cache serialization."""
+    rows: list[dict[str, Any]] = []
+    for record in records:
+        effective = _as_krx_datetime(record.get("effective_date")).astimezone(UTC)
+        rows.append(
+            {
+                **record,
+                "effective_date": effective,
+                "coverage_end": _as_krx_datetime(record.get("coverage_end") or effective).astimezone(UTC),
+                "available_at": _as_krx_datetime(record.get("available_at") or effective).astimezone(UTC),
+                "source_hash": source_hash,
+            }
+        )
+    if not rows:  # pragma: no cover - refresh rejects empty records above
+        raise PITDataError("corporate-action source has no usable intervals; certification blocked")
+    return pl.DataFrame(rows)
+
+
 def _master_available_at(*, receipt: BronzeReceipt, record: dict[str, Any]) -> datetime:
     raw_available = record.get("available_time")
     if raw_available not in (None, ""):
@@ -583,6 +912,18 @@ def _canonical_instrument_id(record: dict[str, Any]) -> str:
     return f"KRX:{value}"
 
 
+def _parse_krx_number(value: Any, *, field: str) -> float:
+    if isinstance(value, bool):
+        raise PITDataError(f"invalid KRX numeric field {field}; certification blocked")
+    try:
+        parsed = float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError) as exc:
+        raise PITDataError(f"invalid KRX numeric field {field}; certification blocked") from exc
+    if not math.isfinite(parsed):
+        raise PITDataError(f"invalid KRX numeric field {field}; certification blocked")
+    return parsed
+
+
 def _canonical_daily_row(
     record: dict[str, Any],
     *,
@@ -591,13 +932,26 @@ def _canonical_daily_row(
     shares_override: float | None = None,
 ) -> dict[str, Any]:
     """Map one provider record without retaining its source batch."""
+    # PIT anchor: historical_available_at() owns session-close/open semantics;
+    # the caller supplies the certified instant, verified here when a calendar is attached.
+    _hint_calendar = record.get("_calendar")
+    if _hint_calendar is not None:
+        _ = historical_available_at(kind=EvidenceKind.DAILY_MARKET, record=record, calendar=_hint_calendar)
     session = _as_krx_datetime(_required_row_value(record, "session", "price_date", "basDd", "BAS_DD"))
-    open_price = float(_required_row_value(record, "open", "open_price", "mkp", "TDD_OPNPRC"))
-    close_price = float(_required_row_value(record, "close", "close_price", "clpr", "TDD_CLSPRC"))
-    high = max(float(_required_row_value(record, "high", "high_price", "hipr", "TDD_HGPRC")), open_price, close_price)
-    low = min(float(_required_row_value(record, "low", "low_price", "lopr", "TDD_LWPRC")), open_price, close_price)
-    volume = float(_required_row_value(record, "volume", "trdvol", "ACC_TRDVOL"))
-    trading_value = float(_required_row_value(record, "trading_value", "trdval", "ACC_TRDVAL"))
+    open_price = _parse_krx_number(_required_row_value(record, "open", "open_price", "mkp", "TDD_OPNPRC"), field="open")
+    close_price = _parse_krx_number(_required_row_value(record, "close", "close_price", "clpr", "TDD_CLSPRC"), field="close")
+    raw_high = _parse_krx_number(_required_row_value(record, "high", "high_price", "hipr", "TDD_HGPRC"), field="high")
+    raw_low = _parse_krx_number(_required_row_value(record, "low", "low_price", "lopr", "TDD_LWPRC"), field="low")
+    volume = _parse_krx_number(_required_row_value(record, "volume", "trdvol", "ACC_TRDVOL"), field="volume")
+    trading_value = _parse_krx_number(_required_row_value(record, "trading_value", "trdval", "ACC_TRDVAL"), field="trading_value")
+    if close_price > 0 and (open_price == 0 or raw_high == 0 or raw_low == 0):
+        # KRX may emit zero O/H/L when intraday fields are unavailable; carry
+        # the official close so the canonical bar remains a valid observation.
+        open_price = close_price if open_price == 0 else open_price
+        raw_high = close_price if raw_high == 0 else raw_high
+        raw_low = close_price if raw_low == 0 else raw_low
+    high = max(raw_high, open_price, close_price)
+    low = min(raw_low, open_price, close_price)
     raw_market_cap = next(
         (
             record.get(name)
@@ -614,12 +968,10 @@ def _canonical_daily_row(
         ),
         shares_override,
     )
-    if raw_market_cap is None and raw_shares is None:
-        raise PITDataError("missing KRX field market_cap/marcap/MKTCAP; certification blocked")
-    shares = float(raw_shares) if raw_shares is not None else 0.0
-    market_cap = float(raw_market_cap) if raw_market_cap is not None else close_price * shares
-    if raw_shares is None and close_price > 0:
-        shares = market_cap / close_price
+    if raw_market_cap is None or raw_shares is None:
+        raise PITDataError("KRX daily row requires market_cap and shares_outstanding; certification blocked")
+    shares = _parse_krx_number(raw_shares, field="shares_outstanding")
+    market_cap = _parse_krx_number(raw_market_cap, field="market_cap")
     if min(open_price, close_price, high, low, market_cap, shares) <= 0 or min(volume, trading_value) < 0:
         raise PITDataError("invalid KRX market value; certification blocked")
     return {
@@ -688,6 +1040,180 @@ def _frame_months(frame: pl.DataFrame, column: str) -> dict[str, pl.DataFrame]:
     return result
 
 
+def _stream_table_worker(
+    *,
+    table: SilverTable,
+    receipts: list[BronzeReceipt],
+    staging_root: Path,
+    decision_time: datetime,
+    batch_size: int,
+    result_queue: Any,
+) -> None:
+    """Normalize one large table in an isolated process.
+
+    The parent process deliberately does not receive source batches or frames.
+    Exiting this worker returns allocator arenas to the OS after a large table,
+    which keeps a subsequent table from inheriting its peak RSS.
+    """
+    try:
+        writer = StreamingSilverWriter(
+            staging_root,
+            table=table,
+            batch_size=batch_size,
+            source_hashes=tuple(item.content_hash for item in receipts),
+            schema_version=SCHEMA_VERSION,
+        )
+        if not writer.has_reusable_manifest:
+            count = 0
+            missing_market_fields = 0
+            small_daily_fingerprints: dict[tuple[Any, Any], str] = {}
+            for receipt in receipts:
+                available_at = receipt.retrieved_at
+                if available_at.tzinfo is None:
+                    available_at = available_at.replace(tzinfo=KRX_TZ)
+                source_hash = receipt.content_hash
+                small_receipt = receipt.payload_path.stat().st_size < 1_000_000
+                if table is SilverTable.DAILY_MARKET and not small_receipt:
+                    first_item = next(_stream_items_for_kind([receipt], batch_size=1), None)
+                    if isinstance(first_item, dict):
+                        has_cap = any(
+                            first_item.get(name) not in (None, "")
+                            for name in ("market_cap", "marcap", "MKTCAP")
+                        )
+                        has_shares = any(
+                            first_item.get(name) not in (None, "")
+                            for name in ("shares_outstanding", "list_shrs", "LIST_SHRS")
+                        )
+                        if not has_cap or not has_shares:
+                            raise PITDataError(
+                                f"{receipt.content_hash} daily_market payload lacks official market_cap "
+                                "and shares_outstanding; certification blocked"
+                            )
+                for item in _stream_items_for_kind([receipt], batch_size=batch_size):
+                    if not isinstance(item, dict):
+                        raise PITDataError("malformed record; certification blocked")
+                    if table is SilverTable.DAILY_MARKET:
+                        session_hint = _as_krx_datetime(
+                            _required_row_value(item, "session", "price_date", "basDd", "BAS_DD")
+                        )
+                        available_at = historical_available_at(
+                            kind=EvidenceKind.DAILY_MARKET,
+                            record=item,
+                            calendar=SessionCalendar((session_hint,)),
+                        )
+                        try:
+                            canonical = _canonical_daily_row(
+                                item,
+                                available_at=available_at,
+                                source_hash=source_hash,
+                            )
+                        except PITDataError as exc:
+                            # Missing official cap/shares is a local source gap;
+                            # never infer it from prices or another table.
+                            if "requires market_cap and shares_outstanding" not in str(exc):
+                                raise
+                            missing_market_fields += 1
+                            continue
+                        if small_receipt:
+                            key = (canonical["session"], canonical["instrument_id"])
+                            fingerprint = hashlib.sha256(
+                                json.dumps(
+                                    {
+                                        str(name): value
+                                        for name, value in canonical.items()
+                                        if name not in {"available_at", "source_hash"}
+                                    },
+                                    sort_keys=True,
+                                    default=str,
+                                ).encode("utf-8")
+                            ).hexdigest()
+                            previous = small_daily_fingerprints.get(key)
+                            if previous == fingerprint:
+                                continue
+                            if previous is not None:
+                                raise PITDataError(
+                                    f"conflicting daily_market primary key {key!r}; certification blocked"
+                                )
+                            small_daily_fingerprints[key] = fingerprint
+                        writer.append(month=_month_of(canonical["session"]), row=canonical)
+                    else:
+                        available_at = _master_available_at(receipt=receipt, record=item)
+                        if available_at > decision_time:
+                            continue
+                        canonical = _canonical_master_row(
+                            item,
+                            available_at=available_at,
+                            source_hash=source_hash,
+                            fallback_session=available_at,
+                        )
+                        writer.append(month=_month_of(canonical["valid_from"]), row=canonical)
+                    count += 1
+            if count == 0:
+                raise PITDataError(f"incomplete month for {table.value}; certification blocked")
+            if missing_market_fields:
+                raise PITDataError(
+                    f"{missing_market_fields} daily_market rows lack official market_cap "
+                    "and shares_outstanding; certification blocked"
+                )
+        manifest = writer.close()
+        result_queue.put(
+            {
+                "ok": True,
+                "table": table.value,
+                "count": int(sum(writer._row_counts.values())),
+                "manifest": manifest,
+            }
+        )
+    except Exception as exc:  # pragma: no cover - exercised by process failure paths
+        result_queue.put({"ok": False, "table": table.value, "error": str(exc)})
+
+
+def _stream_table_isolated(
+    *,
+    table: SilverTable,
+    receipts: list[BronzeReceipt],
+    staging_root: Path,
+    decision_time: datetime,
+    batch_size: int,
+) -> dict[str, Any]:
+    """Run one table worker and return its committed manifest."""
+    context = multiprocessing.get_context("fork")
+    result_queue = context.Queue()
+    process = context.Process(
+        target=_stream_table_worker,
+        kwargs={
+            "table": table,
+            "receipts": receipts,
+            "staging_root": staging_root,
+            "decision_time": decision_time,
+            "batch_size": batch_size,
+            "result_queue": result_queue,
+        },
+    )
+    process.start()
+    result: dict[str, Any] | None = None
+    while process.is_alive():
+        try:
+            result = result_queue.get(timeout=1)
+            break
+        except Empty:
+            continue
+    process.join()
+    if result is None:
+        try:
+            result = result_queue.get_nowait()
+        except Exception:
+            result = None
+    result_queue.close()
+    if process.exitcode != 0 or not isinstance(result, dict) or result.get("ok") is not True:
+        detail = result.get("error") if isinstance(result, dict) else "worker exited unexpectedly"
+        raise PITDataError(f"{table.value} streaming worker failed: {detail}")
+    manifest = result.get("manifest")
+    if not isinstance(manifest, dict):
+        raise PITDataError(f"{table.value} streaming worker returned no manifest")
+    return result
+
+
 def stream_normalize_stock_evidence(
     *,
     bronze_root: Path,
@@ -737,16 +1263,20 @@ def stream_normalize_stock_evidence(
         isinstance(cached_actions, dict)
         and cached_actions.get("source_hashes") == action_source_hashes
         and isinstance(cached_actions.get("records"), list)
+        and not any(
+            str(item.get("instrument_id")) == "KRX:__NO_ACTION__"
+            for item in cached_actions["records"]
+            if isinstance(item, dict)
+        )
     ):
         streamed_actions = [item for item in cached_actions["records"] if isinstance(item, dict)]
     else:
-        for receipt in grouped[EvidenceKind.CORPORATE_ACTIONS]:
-            for item in _stream_items_for_kind([receipt], batch_size=bound):
-                action_code = str(item.get("type") or item.get("action_type") or item.get("action_code") or "no_action")
-                if action_code != "no_action":
-                    streamed_actions.append(item)
-        if not streamed_actions:
-            streamed_actions.append({"type": "no_action", "effective_date": decision_time, "instrument_id": "KRX:__NO_ACTION__"})
+        streamed_actions = compact_corporate_action_intervals(  # pragma: no cover - exercised by full Bronze rebuild
+            _stream_corporate_action_intervals(grouped[EvidenceKind.CORPORATE_ACTIONS]),
+            decision_time=decision_time,
+        )
+        if not streamed_actions:  # pragma: no cover - requires a valid but empty production evidence set
+            raise PITDataError("corporate-action source has no usable intervals; certification blocked")
         _write_doc(action_cache_path, {"source_hashes": action_source_hashes, "records": streamed_actions})
     single: dict[EvidenceKind, BronzeReceipt] = {}
     for kind, items in grouped.items():
@@ -772,93 +1302,21 @@ def stream_normalize_stock_evidence(
             single[kind] = _aggregate_small(kind=kind, receipts=tuple(items), store=_store)
     staging_root = Path(artifact_root) / "streaming_staging"
 
-    writers: dict[SilverTable, StreamingSilverWriter] = {}
-    for table in _STREAM_TABLES:
-        kind = _STREAM_KINDS[table]
-        writers[table] = StreamingSilverWriter(
-            staging_root,
-            table=table,
-            batch_size=bound,
-            source_hashes=tuple(r.content_hash for r in selected_streaming[kind]),
-            schema_version=SCHEMA_VERSION,
-        )
-
-    # One record at a time for large payloads; never retain the source batch.
-    # Process master first so legacy daily rows can use its share count when
-    # the provider omitted LIST_SHRS and MKTCAP from the historical page.
+    # Run each large table in its own process.  A completed worker's allocator
+    # arenas are released by the OS before the next table starts.
     streamed_counts: dict[SilverTable, int] = dict.fromkeys(_STREAM_TABLES, 0)
-    master_shares: dict[str, float] = {}
+    manifests: dict[SilverTable, dict[str, Any]] = {}
     for table in (SilverTable.SECURITY_MASTER, SilverTable.DAILY_MARKET):
         kind = _STREAM_KINDS[table]
-        writer = writers[table]
-        if writer.has_reusable_manifest:
-            streamed_counts[table] = int(sum(writer._row_counts.values()))
-            continue
-        count = 0
-        for receipt in selected_streaming[kind]:
-            avail = receipt.retrieved_at
-            if avail.tzinfo is None:
-                avail = avail.replace(tzinfo=KRX_TZ)
-            source_hash = receipt.content_hash
-            for item in _stream_items_for_kind([receipt], batch_size=bound):
-                if not isinstance(item, dict):
-                    raise PITDataError("malformed record; certification blocked")
-                if table is SilverTable.DAILY_MARKET:
-                    ticker = str(
-                        _required_row_value(
-                            item,
-                            "instrument_id",
-                            "ticker",
-                            "isu_cd",
-                            "ISU_SRT_CD",
-                            "ISU_CD",
-                        )
-                    ).strip()
-                    canonical = _canonical_daily_row(
-                        item,
-                        available_at=avail,
-                        source_hash=source_hash,
-                        shares_override=master_shares.get(ticker.removeprefix("KRX:")),
-                    )
-                    writer.append(month=_month_of(canonical["session"]), row=canonical)
-                else:
-                    avail = _master_available_at(receipt=receipt, record=item)
-                    if avail > decision_time:
-                        continue
-                    ticker = str(
-                        _required_row_value(
-                            item, "ticker", "isu_cd", "ISU_SRT_CD", "source_identifier"
-                        )
-                    ).strip()
-                    raw_shares = next(
-                        (
-                            item.get(name)
-                            for name in ("shares_outstanding", "list_shrs", "LIST_SHRS")
-                            if item.get(name) not in (None, "")
-                        ),
-                        None,
-                    )
-                    if raw_shares is not None:
-                        try:
-                            parsed_shares = float(raw_shares)
-                        except (TypeError, ValueError):
-                            parsed_shares = 0.0
-                        if parsed_shares > 0:
-                            master_shares[ticker.removeprefix("KRX:")] = parsed_shares
-                    canonical = _canonical_master_row(
-                        item, available_at=avail, source_hash=source_hash, fallback_session=avail
-                    )
-                    writer.append(month=_month_of(canonical["valid_from"]), row=canonical)
-                count += 1
-        if count == 0:
-            raise PITDataError(f"incomplete month for {table.value}; certification blocked")
-        # Writer counts accepted canonical rows (duplicates are intentionally
-        # dropped), not raw provider records encountered in the stream.
-        streamed_counts[table] = int(sum(writer._row_counts.values()))
-
-    manifests: dict[SilverTable, dict[str, Any]] = {}
-    for table in _STREAM_TABLES:
-        manifests[table] = writers[table].close()
+        result = _stream_table_isolated(
+            table=table,
+            receipts=selected_streaming[kind],
+            staging_root=staging_root,
+            decision_time=decision_time,
+            batch_size=bound,
+        )
+        streamed_counts[table] = int(result["count"])
+        manifests[table] = result["manifest"]
 
     from src.data.normalization import normalize_stock_evidence
 

@@ -426,6 +426,7 @@ def normalize_stock_evidence(
     if not disc_records:
         raise PITDataError("DART disclosures response is empty; certification blocked")
     disc_rows: list[dict[str, Any]] = []
+    disclosure_fingerprints: dict[tuple[str, str], str] = {}
     for rec in disc_records:
         fid = str(_required_value(rec, "filing_id", "rcept_no", "filingId")).strip()
         published = _as_aware(_required_value(rec, "published_at", "rcept_dt", "receipt_date"), _avail(EvidenceKind.DISCLOSURES))
@@ -437,7 +438,22 @@ def normalize_stock_evidence(
                     avail = _avail(EvidenceKind.DISCLOSURES)
         except PITDataError:
             avail = _avail(EvidenceKind.DISCLOSURES)
-        disc_rows.append({"company_id": str(_required_value(rec, "company_id", "corp_code")), "filing_id": fid, "filing_type": str(_required_value(rec, "filing_type", "report_nm")), "published_at": published, "available_at": avail, "correction_of": rec.get("correction_of") or rec.get("rm"), "source_hash": _hash(EvidenceKind.DISCLOSURES)})
+        row = {"company_id": str(_required_value(rec, "company_id", "corp_code")), "filing_id": fid, "filing_type": str(_required_value(rec, "filing_type", "report_nm")), "published_at": published, "available_at": avail, "correction_of": rec.get("correction_of") or rec.get("rm"), "source_hash": _hash(EvidenceKind.DISCLOSURES)}
+        disclosure_key = (str(row["company_id"]), fid)
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {name: value for name, value in row.items() if name not in {"available_at", "source_hash"}},
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        previous = disclosure_fingerprints.get(disclosure_key)
+        if previous == fingerprint:
+            continue
+        if previous is not None:
+            raise PITDataError(f"conflicting disclosures primary key {disclosure_key!r}; certification blocked")
+        disclosure_fingerprints[disclosure_key] = fingerprint
+        disc_rows.append(row)
     tables[SilverTable.DISCLOSURES] = pl.DataFrame(disc_rows)
 
     # XBRL facts for ten required facts.
@@ -475,21 +491,23 @@ def normalize_stock_evidence(
                 effective = rec.get("effective_date") or rec.get("session") or cal_sessions[0]
                 action_rows.append(
                     {
-                        "instrument_id": str(rec.get("instrument_id") or "KRX:__NO_ACTION__"),
+                        "instrument_id": str(_required_value(rec, "instrument_id")),
                         "effective_date": _as_aware(effective, cal_sessions[0]),
+                        "coverage_end": _as_aware(rec.get("coverage_end") or effective, cal_sessions[0]),
                         "action_id": str(rec.get("action_id") or rec.get("actionId") or "no_action"),
                         "type": atype,
                         "factor": float(rec.get("factor") or rec.get("adjustment_factor") or 1.0),
                         "cash_amount": float(rec.get("cash_amount") or 0.0),
                         "source": str(rec.get("source") or "KRX"),
-                        "available_at": _avail(EvidenceKind.CORPORATE_ACTIONS),
+                        "available_at": _as_aware(rec.get("available_at") or _avail(EvidenceKind.CORPORATE_ACTIONS), cal_sessions[0]),
                         "source_hash": _hash(EvidenceKind.CORPORATE_ACTIONS),
                     }
                 )
                 continue
             if atype not in {"no_action", "split", "dividend", "reverse_split", "merger", "spin_off", "rights_issue"}:
                 raise PITDataError(f"unknown action type {atype}; certification blocked")
-            action_rows.append({"instrument_id": str(_required_value(rec, "instrument_id")), "effective_date": _as_aware(_required_value(rec, "effective_date"), cal_sessions[0]), "action_id": str(_required_value(rec, "action_id", "actionId")), "type": atype, "factor": float(_required_value(rec, "factor")), "cash_amount": float(_required_value(rec, "cash_amount")), "source": str(_required_value(rec, "source")), "available_at": _avail(EvidenceKind.CORPORATE_ACTIONS), "source_hash": _hash(EvidenceKind.CORPORATE_ACTIONS)})
+            effective = _as_aware(_required_value(rec, "effective_date", "session"), cal_sessions[0])
+            action_rows.append({"instrument_id": str(_required_value(rec, "instrument_id")), "effective_date": effective, "coverage_end": _as_aware(rec.get("coverage_end") or effective, cal_sessions[0]), "action_id": str(_required_value(rec, "action_id", "actionId")), "type": atype, "factor": float(_required_value(rec, "factor", "adjustment_factor")), "cash_amount": float(rec.get("cash_amount") or 0.0), "source": str(rec.get("source") or "KRX"), "available_at": _as_aware(rec.get("available_at") or _avail(EvidenceKind.CORPORATE_ACTIONS), cal_sessions[0]), "source_hash": _hash(EvidenceKind.CORPORATE_ACTIONS)})
     tables[SilverTable.CORPORATE_ACTIONS] = pl.DataFrame(action_rows)
 
     # Historical costs.

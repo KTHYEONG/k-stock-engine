@@ -89,6 +89,28 @@ def _validate_inputs(
         raise ValueError("minimum_sector_cohort must be >=2")
 
 
+def _eligible_flow_sessions(
+    *,
+    calendar: SessionCalendar,
+    decision_session: datetime,
+    lookback: int,
+) -> tuple[datetime, ...]:
+    """Return the latest `lookback` sessions with KIS data available at decision time.
+
+    Same-day unpublished flow is excluded: for session S close the window ends at S-1.
+    """
+    if not isinstance(lookback, int) or isinstance(lookback, bool) or lookback < 1:
+        raise ValueError("lookback must be a positive integer")
+    try:
+        idx = calendar.sessions.index(decision_session)
+    except ValueError as exc:
+        raise ValueError("calendar does not contain decision_session") from exc
+    if idx < lookback:
+        return ()
+    # Exclude the decision session itself (unpublished same-day flow).
+    return tuple(calendar.sessions[idx - lookback : idx])
+
+
 def build_qvef_features(
     *,
     decision_session: datetime,
@@ -309,7 +331,7 @@ def build_qvef_features(
         sess_idx = calendar.sessions.index(decision_session)
     except ValueError:
         raise ValueError("calendar does not contain decision_session")  # noqa: B904
-    trailing_20: tuple[datetime, ...] = (calendar.sessions[sess_idx - 19 : sess_idx + 1] if sess_idx >= 19 else ())  # noqa: SIM108
+    trailing_20: tuple[datetime, ...] = _eligible_flow_sessions(calendar=calendar, decision_session=decision_session, lookback=20) if sess_idx >= 20 else ()
 
     # For each instrument, compute raws deterministically sorted
     sorted_iids = sorted(resolved.keys())

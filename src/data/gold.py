@@ -23,6 +23,7 @@ from typing import Any
 
 import polars as pl
 
+from src.core.datasets import DatasetCertification
 from src.core.time import KRX_TZ, SessionCalendar
 from src.data.schemas import PITDataError
 
@@ -155,8 +156,6 @@ def audit_bar_continuity(
 
     expected_count = len(window_sessions)
     # Compare by KRX local date — calendar stores 00:00, daily_market 09:00 for the same session
-    expected_dates: set[str] = {s.astimezone(KRX_TZ).date().isoformat() for s in window_sessions}
-
     # Filter daily_market to window using Polars
     try:
         in_window = daily_market.filter(
@@ -172,64 +171,64 @@ def audit_bar_continuity(
     if in_window.is_empty():
         return ()
 
-    by_instrument: dict[str, list[dict[str, Any]]] = {}
-    for row in in_window.to_dicts():
-        iid = str(row.get("instrument_id") or "")
-        if iid:
-            by_instrument.setdefault(iid, []).append(row)
+    # Aggregate in Polars instead of converting hundreds of thousands of bars
+    # into Python dictionaries; this is the measured Gold OOM hotspot.
+    iid = pl.col("instrument_id").cast(pl.String, strict=False)
+    o = pl.col("open").cast(pl.Float64, strict=False)
+    h = pl.col("high").cast(pl.Float64, strict=False)
+    lo = pl.col("low").cast(pl.Float64, strict=False)
+    c = pl.col("close").cast(pl.Float64, strict=False)
+    invalid_ohlc = (
+        o.is_null() | h.is_null() | lo.is_null() | c.is_null()
+        | o.is_nan() | h.is_nan() | lo.is_nan() | c.is_nan()
+        | (lo > o) | (o > h) | (lo > c) | (c > h)
+    )
+    volume = pl.col("volume").cast(pl.Float64, strict=False)
+    trading_value = pl.col("trading_value").cast(pl.Float64, strict=False)
+    aggregates = (
+        in_window.with_columns(iid.alias("_instrument_id"))
+        .filter(pl.col("_instrument_id").is_not_null() & (pl.col("_instrument_id") != ""))
+        .with_columns(
+            pl.col("session").dt.date().alias("_session_date"),
+            invalid_ohlc.alias("_invalid_ohlc"),
+            (volume < 0).fill_null(False).alias("_negative_volume"),
+            (trading_value < 0).fill_null(False).alias("_negative_trading_value"),
+        )
+        .group_by("_instrument_id")
+        .agg(
+            pl.col("_session_date").count().alias("_session_row_count"),
+            pl.col("_session_date").n_unique().alias("_session_count"),
+            pl.col("_invalid_ohlc").any().alias("_invalid_ohlc_any"),
+            pl.col("_negative_volume").any().alias("_negative_volume_any"),
+            pl.col("_negative_trading_value").any().alias("_negative_trading_value_any"),
+        )
+        .sort("_instrument_id")
+    )
 
     results: list[BarAuditResult] = []
-    for iid, rows in sorted(by_instrument.items()):
+    for row in aggregates.iter_rows(named=True):
         reasons: set[BarExclusionReason] = set()
-
-        # Convert each observed session to its KRX local date string for comparison
-        sessions_seen_dates: list[str] = []
-        for r in rows:
-            s = r.get("session")
-            if s is not None:
-                try:
-                    sessions_seen_dates.append(_to_date(s).isoformat())
-                except TypeError:
-                    sessions_seen_dates.append(str(s))
-
-        # Duplicate session check (by date)
-        if len(sessions_seen_dates) != len(set(sessions_seen_dates)):
+        if int(row["_session_row_count"]) != int(row["_session_count"]):
             reasons.add(BarExclusionReason.DUPLICATE_SESSIONS)
-
-        # Missing session check (by date)
-        if set(sessions_seen_dates) != expected_dates:
+        if int(row["_session_count"]) != expected_count:
             reasons.add(BarExclusionReason.MISSING_SESSIONS)
-
-        # OHLC + negative checks (per-row)
-        for row in rows:
-            o = _safe_float(row.get("open"))
-            h = _safe_float(row.get("high"))
-            lo = _safe_float(row.get("low"))
-            c = _safe_float(row.get("close"))
-            if None in (o, h, lo, c):
-                reasons.add(BarExclusionReason.OHLC_VIOLATION)
-                continue
-            if lo > o or o > h or lo > c or c > h:  # type: ignore[operator]
-                reasons.add(BarExclusionReason.OHLC_VIOLATION)
-            vol = _safe_float(row.get("volume"))
-            tv = _safe_float(row.get("trading_value"))
-            if vol is not None and vol < 0:
-                reasons.add(BarExclusionReason.NEGATIVE_VOLUME)
-            if tv is not None and tv < 0:
-                reasons.add(BarExclusionReason.NEGATIVE_TRADING_VALUE)
-
-        unique_reasons = tuple(sorted(reasons, key=lambda r: r.value))
+        if bool(row["_invalid_ohlc_any"]):
+            reasons.add(BarExclusionReason.OHLC_VIOLATION)
+        if bool(row["_negative_volume_any"]):
+            reasons.add(BarExclusionReason.NEGATIVE_VOLUME)
+        if bool(row["_negative_trading_value_any"]):
+            reasons.add(BarExclusionReason.NEGATIVE_TRADING_VALUE)
+        unique_reasons = tuple(sorted(reasons, key=lambda reason: reason.value))
         results.append(
             BarAuditResult(
-                instrument_id=iid,
+                instrument_id=str(row["_instrument_id"]),
                 eligible=len(unique_reasons) == 0,
                 exclusion_reasons=unique_reasons,
-                sessions_found=len(sessions_seen_dates),
+                sessions_found=int(row["_session_count"]),
                 sessions_expected=expected_count,
             )
         )
-
-    return tuple(sorted(results, key=lambda r: r.instrument_id))
+    return tuple(results)
 
 
 
@@ -376,6 +375,9 @@ def _parse_fiscal_key(period: str) -> tuple[int, int]:
 def exclude_sentinel_corporate_actions(
     corporate_actions: pl.DataFrame,
     candidate_instrument_ids: frozenset[str],
+    *,
+    window_start: date | None = None,
+    window_end: date | None = None,
 ) -> frozenset[str]:
     """Return instrument IDs excluded due to sentinel-only CA data.
 
@@ -385,17 +387,44 @@ def exclude_sentinel_corporate_actions(
     if corporate_actions.is_empty():
         return candidate_instrument_ids
 
-    by_instrument: dict[str, set[str]] = {}
+    by_instrument: dict[str, list[tuple[date, date]]] = {}
     for row in corporate_actions.to_dicts():
         iid = str(row.get("instrument_id") or "")
-        action_type = str(row.get("type") or "")
-        if iid:
-            by_instrument.setdefault(iid, set()).add(action_type)
+        if not iid or iid == "KRX:__NO_ACTION__":
+            continue
+        try:
+            start = row["effective_date"].astimezone(KRX_TZ).date()
+            end = (row.get("coverage_end") or row["effective_date"]).astimezone(KRX_TZ).date()
+        except (AttributeError, TypeError):
+            continue
+        if end >= start:
+            by_instrument.setdefault(iid, []).append((start, end))
 
     excluded: set[str] = set()
     for iid in candidate_instrument_ids:
-        types = by_instrument.get(iid)
-        if types is None or types == {"no_action"}:
+        ranges = sorted(by_instrument.get(iid, []))
+        if not ranges:
+            excluded.add(iid)
+            continue
+        if window_start is None or window_end is None:
+            types = {
+                str(row.get("type") or "")
+                for row in corporate_actions.to_dicts()
+                if str(row.get("instrument_id") or "") == iid
+            }
+            if types == {"no_action"}:
+                excluded.add(iid)
+            continue
+        cursor = window_start
+        for start, end in ranges:
+            if end < cursor:
+                continue
+            if start > cursor:
+                break
+            cursor = max(cursor, end)
+            if cursor >= window_end:
+                break
+        if cursor < window_end:
             excluded.add(iid)
 
     return frozenset(excluded)
@@ -461,7 +490,9 @@ def build_gold_audit_manifest(
     )
 
     candidate_ids = bar_eligible_instruments & dart_eligible_instruments
-    ca_excluded = exclude_sentinel_corporate_actions(corporate_actions, candidate_ids)
+    ca_excluded = exclude_sentinel_corporate_actions(
+        corporate_actions, candidate_ids, window_start=validation_start, window_end=validation_end
+    )
     eligible = candidate_ids - ca_excluded
 
     hash_parts = [
@@ -548,6 +579,37 @@ def write_gold_audit_artifact(manifest: GoldAuditManifest, artifact_path: Path) 
     )
     return artifact_path
 
+def _assert_no_availability_repair(
+    *,
+    table_name: str,
+    frame: pl.DataFrame,
+    final_decision_time: datetime,
+) -> None:
+    """Reject future availability instead of rewriting it (fail-closed PIT).
+
+    Rows with available_at after the consuming decision remain unavailable;
+    downstream repair is forbidden, so the frame is left unchanged on success
+    and raises before any mutation on failure.
+    """
+    if final_decision_time.tzinfo is None:
+        raise PITDataError(f"{table_name} final_decision_time must be timezone-aware")
+    if frame.is_empty() or "available_at" not in frame.columns:
+        return
+    try:
+        # Silver partitions may preserve their source timezone (e.g. KRX) while
+        # the caller supplies an UTC decision instant; compare like-for-like.
+        from src.data.replay import _literal_in_column_tz
+
+        literal = _literal_in_column_tz(frame["available_at"].dtype, final_decision_time)
+        future = frame.filter(pl.col("available_at") > literal)
+    except Exception as exc:
+        raise PITDataError(f"{table_name} available_at comparison failed") from exc
+    if future.height > 0:
+        raise PITDataError(
+            f"{table_name} has {future.height} rows with future available_at after {final_decision_time.isoformat()}"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class GoldRunReport:
     manifest: GoldAuditManifest
@@ -561,11 +623,11 @@ class GoldRunReport:
 
 def materialize_gold_window(
     *,
-    calendar: SessionCalendar,
-    security_master: pl.DataFrame,
-    daily_market: pl.DataFrame,
-    financial_facts: pl.DataFrame,
-    corporate_actions: pl.DataFrame,
+    calendar: SessionCalendar | None = None,
+    security_master: pl.DataFrame | None = None,
+    daily_market: pl.DataFrame | None = None,
+    financial_facts: pl.DataFrame | None = None,
+    corporate_actions: pl.DataFrame | None = None,
     investor_flow: pl.DataFrame | None = None,
     validation_start: date,
     validation_end: date,
@@ -574,6 +636,7 @@ def materialize_gold_window(
     gold_root: Path | None = None,
     universe_policy: Any | None = None,
     qvef_policy: Any | None = None,
+    silver_root: Path | None = None,
 ) -> GoldRunReport:
     """Run Gold-layer audit, generate daily historical universe decisions, and build QVEF features.
 
@@ -585,6 +648,7 @@ def materialize_gold_window(
     """
     from datetime import time as dt_time
 
+    from src.data.replay import PITReplayReader, StreamingGoldWriter
     from src.features.contracts import QvefFeaturePolicy, QvefFeatureRow
     from src.features.materialize import materialize_qvef_features
     from src.features.qvef import build_qvef_features
@@ -597,45 +661,55 @@ def materialize_gold_window(
 
     u_policy = universe_policy if universe_policy is not None else UniversePolicy()
     f_policy = qvef_policy if qvef_policy is not None else QvefFeaturePolicy()
+    reader: Any | None = None
+    stream_writer: StreamingGoldWriter | None = None
+    if silver_root is not None:
+        from src.data.gold_loader import load_gold_window_inputs as _load_inputs
+
+        _inputs = _load_inputs(
+            silver_root=Path(silver_root),
+            validation_start=validation_start,
+            validation_end=validation_end,
+            decision_time=decision_time,
+            universe_policy=u_policy if isinstance(u_policy, UniversePolicy) else None,
+            qvef_policy=f_policy if isinstance(f_policy, QvefFeaturePolicy) else None,
+        )
+        calendar = _inputs.calendar
+        security_master = _inputs.security_master
+        daily_market = _inputs.daily_market
+        financial_facts = _inputs.financial_facts
+        corporate_actions = _inputs.corporate_actions
+        investor_flow = _inputs.investor_flow
+        assert calendar is not None
+        reader = PITReplayReader.from_silver_root(
+            silver_root=Path(silver_root), decision_time=decision_time, calendar=calendar
+        )
+    if (
+        calendar is None
+        or security_master is None
+        or daily_market is None
+        or financial_facts is None
+        or corporate_actions is None
+    ):
+        raise PITDataError("materialize_gold_window requires calendar and Silver frames")
     flow_df = investor_flow if investor_flow is not None else pl.DataFrame()
 
-    import zoneinfo
-
     # Align batch-ingestion available_at timestamps if present
-    if not daily_market.is_empty() and "session" in daily_market.columns and "available_at" in daily_market.columns:
-        av_tz = getattr(daily_market["available_at"].dtype, "time_zone", None)
-        sess_col = pl.col("session")
-        if av_tz:
-            sess_col = sess_col.dt.convert_time_zone(av_tz)
-        dt_tz = decision_time.astimezone(zoneinfo.ZoneInfo(av_tz)) if av_tz and decision_time.tzinfo else decision_time
-        daily_market = daily_market.with_columns(
-            pl.when(pl.col("available_at") > dt_tz)
-            .then(sess_col)
-            .otherwise(pl.col("available_at"))
-            .alias("available_at")
-        )
+    # PIT fail-closed: future availability is rejected, never rewritten.
+    _assert_no_availability_repair(table_name="daily_market", frame=daily_market, final_decision_time=decision_time)
+    _assert_no_availability_repair(table_name="security_master", frame=security_master, final_decision_time=decision_time)
+    _assert_no_availability_repair(table_name="financial_facts", frame=financial_facts, final_decision_time=decision_time)
+    _assert_no_availability_repair(table_name="corporate_actions", frame=corporate_actions, final_decision_time=decision_time)
+    _assert_no_availability_repair(table_name="investor_flow", frame=flow_df, final_decision_time=decision_time)
 
-    if not security_master.is_empty() and "valid_from" in security_master.columns:
-        if "available_at" in security_master.columns:
-            av_tz = getattr(security_master["available_at"].dtype, "time_zone", None)
-            vf_col = pl.col("valid_from")
-            if av_tz:
-                vf_col = vf_col.dt.convert_time_zone(av_tz)
-            dt_tz = decision_time.astimezone(zoneinfo.ZoneInfo(av_tz)) if av_tz and decision_time.tzinfo else decision_time
-            security_master = security_master.with_columns(
-                pl.when(pl.col("available_at") > dt_tz)
-                .then(vf_col)
-                .otherwise(pl.col("available_at"))
-                .alias("available_at")
-            )
-        if "listing_date" in security_master.columns:
-            earliest_vf = security_master.group_by("instrument_id").agg(pl.col("valid_from").min().alias("_min_vf"))
-            security_master = security_master.join(earliest_vf, on="instrument_id").with_columns(
-                pl.when(pl.col("listing_date") == pl.col("valid_from"))
-                .then(pl.col("_min_vf"))
-                .otherwise(pl.col("listing_date"))
-                .alias("listing_date")
-            ).drop("_min_vf")
+    if not security_master.is_empty() and "valid_from" in security_master.columns and "listing_date" in security_master.columns:
+        earliest_vf = security_master.group_by("instrument_id").agg(pl.col("valid_from").min().alias("_min_vf"))
+        security_master = security_master.join(earliest_vf, on="instrument_id").with_columns(
+            pl.when(pl.col("listing_date") == pl.col("valid_from"))
+            .then(pl.col("_min_vf"))
+            .otherwise(pl.col("listing_date"))
+            .alias("listing_date")
+        ).drop("_min_vf")
 
     # 1-3. Pre-flight audit manifest
     manifest = build_gold_audit_manifest(
@@ -657,8 +731,42 @@ def materialize_gold_window(
         if validation_start <= s.astimezone(KRX_TZ).date() <= validation_end
     ]
 
+    if reader is not None and val_sessions and "available_at" in daily_market.columns:
+        # Avoid replaying hundreds of sessions when the source has no PIT-valid
+        # market bars at the first decision (typically a retrieval-time leak).
+        from src.data.replay import _literal_in_column_tz
+
+        first_decision = datetime.combine(
+            val_sessions[0].astimezone(KRX_TZ).date(), dt_time(15, 30), tzinfo=KRX_TZ
+        )
+        available_min = daily_market["available_at"].min()
+        if isinstance(available_min, datetime):
+            literal = _literal_in_column_tz(daily_market["available_at"].dtype, first_decision)
+            if available_min > literal:
+                raise PITDataError(
+                    "daily_market has no PIT-available rows at validation start"
+                )
+
+    if reader is not None and gold_root is not None:
+        stream_writer = StreamingGoldWriter(
+            root=Path(gold_root),
+            dataset_id=manifest.manifest_hash[:32],
+            decision_time=decision_time,
+            certification=DatasetCertification.RESEARCH,
+            source_hashes={
+                "calendar": manifest.manifest_hash[:16],
+                "security_master": manifest.manifest_hash[16:32],
+                "quality_report": manifest.manifest_hash,
+            },
+            expected_sessions=tuple(s for s in val_sessions if s <= decision_time),
+            require_scores=False,
+        )
+
     all_universe: list[UniverseDecision] = []
     all_features: list[QvefFeatureRow] = []
+    universe_count = 0
+    eligible_count = 0
+    feature_count = 0
 
     for session in val_sessions:
         # Market close of session for end-of-day daily decisions
@@ -668,37 +776,81 @@ def materialize_gold_window(
         if sess_dt > decision_time:
             continue
 
-        u_decisions = build_historical_universe(
-            decision_session=session,
-            decision_time=sess_dt,
-            calendar=calendar,
-            security_master=security_master,
-            daily_market=daily_market,
-            corporate_actions=corporate_actions,
-            policy=u_policy,
-        )
-        all_universe.extend(u_decisions)
-
-        eligible = tuple(u for u in u_decisions if u.eligible)
-        if eligible:
-            f_rows = build_qvef_features(
+        replay = None
+        if reader is not None:
+            replay = reader.session_input(
+                session=session,
+                decision_time=sess_dt,
+                universe_policy=u_policy,
+                qvef_policy=f_policy,
+            )
+            u_decisions = build_historical_universe(
                 decision_session=session,
                 decision_time=sess_dt,
                 calendar=calendar,
-                universe=eligible,
+                security_master=replay.security_master,
+                daily_market=replay.daily_market,
+                corporate_actions=replay.corporate_actions,
+                policy=u_policy,
+            )
+        else:
+            u_decisions = build_historical_universe(
+                decision_session=session,
+                decision_time=sess_dt,
+                calendar=calendar,
                 security_master=security_master,
                 daily_market=daily_market,
-                investor_flow=flow_df,
-                financial_facts=financial_facts,
-                policy=f_policy,
+                corporate_actions=corporate_actions,
+                policy=u_policy,
             )
-            all_features.extend(f_rows)
+        if stream_writer is not None:
+            stream_writer.append_universe(u_decisions)
+        else:
+            all_universe.extend(u_decisions)
+        universe_count += len(u_decisions)
+        eligible_count += sum(1 for item in u_decisions if item.eligible)
+
+        eligible = tuple(u for u in u_decisions if u.eligible)
+        if eligible:
+            if reader is not None:
+                assert replay is not None
+                f_rows = build_qvef_features(
+                    decision_session=session,
+                    decision_time=sess_dt,
+                    calendar=calendar,
+                    universe=eligible,
+                    security_master=replay.security_master,
+                    daily_market=replay.daily_market,
+                    investor_flow=replay.investor_flow,
+                    financial_facts=replay.financial_facts,
+                    policy=f_policy,
+                )
+            else:
+                f_rows = build_qvef_features(
+                    decision_session=session,
+                    decision_time=sess_dt,
+                    calendar=calendar,
+                    universe=eligible,
+                    security_master=security_master,
+                    daily_market=daily_market,
+                    investor_flow=flow_df,
+                    financial_facts=financial_facts,
+                    policy=f_policy,
+                )
+            if stream_writer is not None:
+                stream_writer.append_features(f_rows)
+            else:
+                all_features.extend(f_rows)
+            feature_count += len(f_rows)
 
     u_path_str: str | None = None
     f_path_str: str | None = None
 
-    if gold_root is not None and all_universe:
-        from src.core.datasets import DatasetCertification
+    if stream_writer is not None:
+        published = stream_writer.close()
+        u_path_str = str(published["universe"])
+        f_path_str = str(published["qvef"]) if "qvef" in published else None
+    elif gold_root is not None and all_universe:
         from src.storage.parquet_datasets import ParquetDatasetStore
 
         dataset_id = manifest.manifest_hash[:32]
@@ -743,9 +895,9 @@ def materialize_gold_window(
         "validation_start": validation_start.isoformat(),
         "validation_end": validation_end.isoformat(),
         "sessions_evaluated": len(val_sessions),
-        "total_universe_decisions": len(all_universe),
-        "eligible_universe_decisions": sum(1 for u in all_universe if u.eligible),
-        "total_feature_rows": len(all_features),
+        "total_universe_decisions": universe_count,
+        "eligible_universe_decisions": eligible_count,
+        "total_feature_rows": feature_count,
         "universe_path": u_path_str,
         "features_path": f_path_str,
         "audit_artifact_path": str(audit_path),
@@ -757,9 +909,9 @@ def materialize_gold_window(
 
     return GoldRunReport(
         manifest=manifest,
-        universe_decisions_count=len(all_universe),
-        eligible_decisions_count=sum(1 for u in all_universe if u.eligible),
-        feature_rows_count=len(all_features),
+        universe_decisions_count=universe_count,
+        eligible_decisions_count=eligible_count,
+        feature_rows_count=feature_count,
         universe_path=u_path_str,
         features_path=f_path_str,
         summary_artifact_path=str(summary_path),
