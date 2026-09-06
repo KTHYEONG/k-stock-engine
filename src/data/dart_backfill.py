@@ -275,14 +275,7 @@ def run_dart_historical_backfill_batch(
         raise PITDataError("requested backfill batch is empty")
     coverage_start = date(request.validation_start.year - 2, 1, 1)
     coverage_end = request.validation_start
-    collect_dart_disclosures(
-        dart=dart,
-        start=coverage_start,
-        end=coverage_end,
-        bronze_root=Path(request.bronze_root),
-        retrieved_at=request.retrieved_at,
-        corp_codes=tuple(sorted(batch_codes)),
-    )
+    collect_dart_disclosures(dart=dart, start=coverage_start, end=coverage_end, bronze_root=Path(request.bronze_root), retrieved_at=request.retrieved_at, corp_codes=tuple(sorted(batch_codes)))
     all_identities = DartXbrlCollector.filing_identities_from_bronze(
         Path(request.bronze_root),
         start=coverage_start,

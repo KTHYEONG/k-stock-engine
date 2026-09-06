@@ -149,7 +149,7 @@ def _parse_args() -> argparse.Namespace:
     p_plan.add_argument("--coverage-end", type=str, required=True)
     p_plan.add_argument("--symbols", type=str, required=False, default=None)
     p_plan.add_argument("--sessions", type=str, required=False, default=None)
-    p_plan.add_argument("--chunk-size", type=int, default=20)
+    p_plan.add_argument("--chunk-size", type=int, default=30)
 
     p_resume = sub.add_parser("resume", help="Resume collection from checkpoints")
     p_resume.add_argument("--plan-id", type=str, required=True)
@@ -167,6 +167,14 @@ def _parse_args() -> argparse.Namespace:
     p_gold.add_argument("--decision-time", type=str, required=True)
     p_gold.add_argument("--validation-start", type=str, required=True)
     p_gold.add_argument("--validation-end", type=str, required=True)
+
+    p_bdm = sub.add_parser("backfill-daily-market", help="PIT-safe Silver daily-market coverage backfill")
+    p_bdm.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
+    p_bdm.add_argument("--silver-root", type=Path, default=Path("data/silver/stocks"))
+    p_bdm.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
+    p_bdm.add_argument("--validation-start", type=str, required=True)
+    p_bdm.add_argument("--validation-end", type=str, required=True)
+    p_bdm.add_argument("--decision-time", type=str, required=True)
 
     return parser.parse_args()
 
@@ -732,8 +740,10 @@ def main() -> int:
             from src.integrations.dart.xbrl import DartXbrlCollector
             from src.integrations.kis.investor_flow import KisInvestorFlowCollector
             from src.integrations.krx.historical import KrxHistoricalCollector
+            from src.integrations.quota import ProviderQuotaStateStore
 
-            krx_collector = KrxHistoricalCollector()
+            quota_store = ProviderQuotaStateStore(Path(args.artifact_root) / "quota")
+            krx_collector = KrxHistoricalCollector(quota_store=quota_store)
             dart_collector = DartXbrlCollector()
             kis_symbols: tuple[str, ...]
             try:
@@ -902,6 +912,40 @@ def main() -> int:
         except (PITDataError, ValueError, OSError) as exc:
             _emit({"error": str(exc)})
             return 1
+        return 0
+    if args.command == "backfill-daily-market":
+        try:
+            from src.data.operations import DailyMarketBackfillRequest, backfill_daily_market_coverage
+            from src.integrations.krx.historical import KrxHistoricalCollector
+            from src.integrations.quota import ProviderQuotaStateStore
+
+            request = DailyMarketBackfillRequest(
+                bronze_root=Path(args.bronze_root),
+                silver_root=Path(args.silver_root),
+                artifact_root=Path(args.artifact_root),
+                validation_start=date.fromisoformat(str(args.validation_start)),
+                validation_end=date.fromisoformat(str(args.validation_end)),
+                decision_time=_parse_dt(args.decision_time),
+            )
+            quota_store = ProviderQuotaStateStore(Path(args.artifact_root) / "quota")
+            result = backfill_daily_market_coverage(
+                request,
+                krx=KrxHistoricalCollector(quota_store=quota_store),
+            )
+        except (PITDataError, ValueError, OSError) as exc:
+            _emit({"error": str(exc)})
+            return 1
+        _emit(
+            {
+                "history_start": result.history_start.isoformat(),
+                "validation_start": result.validation_start.isoformat(),
+                "validation_end": result.validation_end.isoformat(),
+                "required_count": result.required_count,
+                "covered_count": result.covered_count,
+                "backfilled_count": len(result.backfilled_sessions),
+                "missing_count": len(result.missing_sessions),
+            }
+        )
         return 0
     return 0
 

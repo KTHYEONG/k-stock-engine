@@ -4,11 +4,13 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Callable
-from datetime import date
+from datetime import UTC, date, datetime
 from enum import Enum
 from typing import Any, ClassVar
 
 import requests
+
+from src.integrations.quota import ProviderQuotaStateStore
 
 
 class KrxApiError(RuntimeError):
@@ -38,25 +40,37 @@ class KrxApiClient:
         api_key: str | None = None,
         *,
         request_json: JsonRequest | None = None,
+        quota_store: ProviderQuotaStateStore | None = None,
+        now: Callable[[], datetime] | None = None,
+        min_interval: float | None = None,
     ) -> None:
-        self.api_key = api_key or os.getenv("KRX_OPENAPI_KEY")
+        raw_key = api_key or os.getenv("KRX_OPENAPI_KEY")
+        self.api_key = raw_key.strip().strip("\"'") if raw_key else raw_key
         if not self.api_key and request_json is None:
             raise ValueError("KRX_OPENAPI_KEY not found in environment variables")
         self._request_json = request_json or self._request
         self._session = requests.Session()
         self._last_request_time = 0.0
         self._request_count = 0
+        self._quota_store = quota_store
+        self._now = now or (lambda: datetime.now(UTC))
+        raw_interval = os.getenv("KRX_REQUEST_MIN_INTERVAL_SECONDS")
+        self._min_interval = float(min_interval) if min_interval is not None else (float(raw_interval) if raw_interval is not None else 1.0)
 
     def _request(self, endpoint: str, params: dict[str, str]) -> dict[str, Any]:
+        if self._quota_store is not None:
+            self._quota_store.acquire(provider="KRX", endpoint=endpoint, now=self._now())
         if self._request_count >= 10_000:
             raise KrxApiError("KRX daily request limit reached")
         last_error = "unknown KRX response error"
         for attempt in range(3):
             elapsed = time.monotonic() - self._last_request_time
-            if elapsed < 0.2:
-                time.sleep(0.2 - elapsed)
+            if elapsed < self._min_interval:
+                time.sleep(self._min_interval - elapsed)
             self._last_request_time = time.monotonic()
             self._request_count += 1
+            if self._quota_store is not None:
+                self._quota_store.record_attempt(provider="KRX", endpoint=endpoint, now=self._now())
             response = self._session.get(
                 f"{self.BASE_URL}/{endpoint}",
                 params=params,
@@ -65,6 +79,19 @@ class KrxApiClient:
             )
             if response.status_code != 200:
                 last_error = f"KRX HTTP {response.status_code} for {endpoint}"
+                if response.status_code == 429 and self._quota_store is not None:
+                    raw = response.headers.get("Retry-After")
+                    retry_after = float(raw) if (isinstance(raw, str) and raw.strip().replace(".", "", 1).isdigit()) else None
+                    self._quota_store.record_rate_limit(provider="KRX", endpoint=endpoint, now=self._now(), retry_after=retry_after)
+                    raise KrxApiError(last_error)
+                if response.status_code == 429 and attempt < 2:
+                    retry_after_raw = response.headers.get("Retry-After")
+                    try:
+                        delay = max(1.0, float(retry_after_raw)) if retry_after_raw is not None else 5.0 * (2**attempt)
+                    except ValueError:
+                        delay = 5.0 * (2**attempt)
+                    time.sleep(delay)
+                    continue
             else:
                 try:
                     payload = response.json()

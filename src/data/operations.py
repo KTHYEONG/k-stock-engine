@@ -14,11 +14,14 @@ from src.data.collection import (
     ChampionCollectionRequest,
     CollectionArtifact,
     collect_champion_evidence,
+    collect_daily_market_sessions,
     collect_historical_evidence,
 )
 from src.data.collection_plan import CollectionReadinessReport
+from src.data.gold_loader import plan_daily_market_backfill
 from src.data.legacy_inventory import MigrationArtifact, purge_legacy_data
 from src.data.schemas import EvidenceKind, PITDataError, SilverTable
+from src.data.streaming_normalization import stream_normalize_stock_evidence
 
 logger = logging.getLogger(__name__)
 
@@ -418,3 +421,77 @@ def run_historical_data_pipeline(
         gold_feature_id=gold_artifact.qvef_hash,
         backtest_artifact_path=backtest_path, certifiable=True,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class DailyMarketBackfillRequest:
+    bronze_root: Path
+    silver_root: Path
+    artifact_root: Path
+    validation_start: date
+    validation_end: date
+    decision_time: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class DailyMarketBackfillResult:
+    history_start: date
+    validation_start: date
+    validation_end: date
+    required_count: int
+    covered_count: int
+    backfilled_sessions: tuple[date, ...]
+    missing_sessions: tuple[date, ...]
+
+
+def _write_backfill_artifact(request: DailyMarketBackfillRequest, result: DailyMarketBackfillResult) -> Path:
+    root = Path(request.artifact_root)
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / "daily_market_backfill.json"
+    path.write_text(
+        json.dumps(
+            {
+                "history_start": result.history_start.isoformat(),
+                "validation_start": result.validation_start.isoformat(),
+                "validation_end": result.validation_end.isoformat(),
+                "required_count": result.required_count,
+                "covered_count": result.covered_count,
+                "backfilled_count": len(result.backfilled_sessions),
+                "missing_count": len(result.missing_sessions),
+                "backfilled_sessions": [day.isoformat() for day in result.backfilled_sessions],
+                "missing_sessions": [day.isoformat() for day in result.missing_sessions],
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def backfill_daily_market_coverage(request: DailyMarketBackfillRequest, *, krx: Any) -> DailyMarketBackfillResult:
+    """Collect missing KRX sessions, normalize once, and require zero gaps before success."""
+    if request.decision_time.tzinfo is None:
+        raise PITDataError("decision_time must be timezone-aware")
+    if request.validation_start > request.validation_end:
+        raise PITDataError("validation window is inverted")
+    if krx is None:
+        raise PITDataError("official KRX collector is required")
+    plan = plan_daily_market_backfill(silver_root=request.silver_root, validation_start=request.validation_start, validation_end=request.validation_end, decision_time=request.decision_time)
+    required_count = len(plan.covered_sessions) + len(plan.missing_sessions)
+    if not plan.missing_sessions:
+        result = DailyMarketBackfillResult(history_start=plan.history_start, validation_start=request.validation_start, validation_end=plan.validation_end, required_count=required_count, covered_count=len(plan.covered_sessions), backfilled_sessions=(), missing_sessions=())
+        _write_backfill_artifact(request, result)
+        _pipeline_log("daily-market-backfill", required=required_count, covered=len(plan.covered_sessions), backfilled=0, missing=0)
+        return result
+    collect_daily_market_sessions(sessions=plan.missing_sessions, krx=krx, bronze_root=request.bronze_root, retrieved_at=request.decision_time)
+    stream_normalize_stock_evidence(bronze_root=Path(request.bronze_root), silver_root=Path(request.silver_root), artifact_root=Path(request.artifact_root), decision_time=request.decision_time, batch_size=50_000)
+    reverified = plan_daily_market_backfill(silver_root=request.silver_root, validation_start=request.validation_start, validation_end=request.validation_end, decision_time=request.decision_time)
+    # Guard: an interrupted run may leave resumable Bronze pages, but a
+    # partial Silver replacement must never be reported as success.
+    if reverified.missing_sessions:
+        raise PITDataError(f"daily market backfill incomplete: {len(reverified.missing_sessions)} sessions still missing; certification blocked")
+    result = DailyMarketBackfillResult(history_start=reverified.history_start, validation_start=request.validation_start, validation_end=reverified.validation_end, required_count=len(reverified.covered_sessions) + len(reverified.missing_sessions), covered_count=len(reverified.covered_sessions), backfilled_sessions=tuple(plan.missing_sessions), missing_sessions=tuple(reverified.missing_sessions))
+    _write_backfill_artifact(request, result)
+    _pipeline_log("daily-market-backfill", required=result.required_count, covered=result.covered_count, backfilled=len(result.backfilled_sessions), missing=0)
+    return result
