@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "api_quota_efficiency",
+      "date": "2026-09-06",
+      "adr_id": "ADR_20260906_api_quota_efficiency",
+      "domain": "data",
+      "title": "API quota efficiency and fixture stability",
+      "why": "Provider quota exhaustion and mixed historical fixture schemas blocked reliable collection and verification.",
+      "resolution": "Wired durable KRX quota state through production CLI paths, reused verified KIS Bronze pages by earliest cursor, and normalized test fixture timezone and PIT manifest timestamps.",
+      "impact": "All 429 tests and the full 429-test suite now pass while quota-blocked retries and fixture PIT checks remain fail-closed.",
+      "archive_path": "docs/decisions/archive/api_quota_efficiency/api_quota_efficiency_contract.json"
+    },
+    {
       "task_id": "gold_replay_universe_hotpath",
       "date": "2026-09-06",
       "adr_id": "ADR_20260906_gold_replay_universe_hotpath",
