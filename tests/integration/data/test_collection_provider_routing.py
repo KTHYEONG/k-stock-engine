@@ -126,3 +126,239 @@ def test_collect_historical_evidence_rejects_invalid_request(tmp_path) -> None:
         collect_historical_evidence(plan=plan, krx=EmptyKrx(), kis=None, dart=object(), bronze_root=tmp_path / 'b', checkpoint_root=tmp_path / 'c', retrieved_at=datetime(2026, 1, 1, tzinfo=UTC), kinds=frozenset({EvidenceKind.DAILY_MARKET}))
     with pytest.raises(PITDataError, match='master lineage response'):
         collect_historical_evidence(plan=plan, krx=EmptyKrx(), kis=None, dart=object(), bronze_root=tmp_path / 'b', checkpoint_root=tmp_path / 'c', retrieved_at=datetime(2026, 1, 1, tzinfo=UTC), kinds=frozenset({EvidenceKind.SECURITY_MASTER}))
+
+
+def test_collect_daily_market_sessions_persists_only_requested_krx_pages(tmp_path) -> None:
+    from datetime import UTC, date, datetime
+    from src.data.collection import collect_daily_market_sessions
+
+    requested = (date(2024, 1, 2), date(2024, 1, 4))
+    class Krx:
+        def __init__(self) -> None:
+            self.called = ()
+        def fetch_daily_market(self, start, end, *, sessions):
+            self.called = tuple(sessions)
+            return tuple({'session': day.isoformat(), 'records': [{'BAS_DD': day.strftime('%Y%m%d'), 'ISU_SRT_CD': '005930', 'TDD_OPNPRC': '10', 'TDD_HGPRC': '11', 'TDD_LWPRC': '9', 'TDD_CLSPRC': '10', 'ACC_TRDVOL': '1', 'ACC_TRDVAL': '10', 'MKTCAP': '100', 'LIST_SHRS': '10'}]} for day in sessions)
+
+    krx = Krx()
+    artifact = collect_daily_market_sessions(sessions=requested, krx=krx, bronze_root=tmp_path / 'bronze', retrieved_at=datetime(2026, 9, 6, tzinfo=UTC))
+
+    assert krx.called == requested
+    assert len(artifact.page_receipts['daily_market']) == 2
+    assert artifact.coverage_start == requested[0]
+    assert artifact.coverage_end == requested[-1]
+
+
+def test_collect_daily_market_sessions_rejects_invalid_or_incomplete_pages(tmp_path) -> None:
+    import pytest
+    from src.data.collection import collect_daily_market_sessions
+    from src.data.schemas import PITDataError
+
+    class EmptyKrx:
+        def fetch_daily_market(self, *_args, **_kwargs):
+            return ()
+
+    with pytest.raises(PITDataError, match="at least one"):
+        collect_daily_market_sessions(sessions=(), krx=EmptyKrx(), bronze_root=tmp_path / "bronze", retrieved_at=datetime(2026, 9, 6, tzinfo=UTC))
+    with pytest.raises(PITDataError, match="timezone-aware"):
+        collect_daily_market_sessions(sessions=(date(2024, 1, 2),), krx=EmptyKrx(), bronze_root=tmp_path / "bronze", retrieved_at=datetime(2026, 9, 6))
+    with pytest.raises(PITDataError, match="response is empty"):
+        collect_daily_market_sessions(sessions=(date(2024, 1, 2),), krx=EmptyKrx(), bronze_root=tmp_path / "bronze", retrieved_at=datetime(2026, 9, 6, tzinfo=UTC))
+
+
+def test_daily_market_page_validation_rejects_malformed_facts() -> None:
+    import pytest
+    from src.data.collection import _daily_market_page_session, _validate_daily_market_page
+    from src.data.schemas import PITDataError
+
+    assert _daily_market_page_session({"records": [{"BAS_DD": "20240102"}]}) == date(2024, 1, 2)
+    assert _daily_market_page_session({"records": [None, {"session": "2024-01-02"}]}) == date(2024, 1, 2)
+    with pytest.raises(PITDataError, match="malformed"):
+        _daily_market_page_session({"session": "not-a-date"})
+    with pytest.raises(PITDataError, match="missing its trading session"):
+        _daily_market_page_session({"records": [{}]})
+    with pytest.raises(PITDataError, match="malformed"):
+        _daily_market_page_session({"records": [{"BAS_DD": "bad"}]})
+    valid = {"records": [{"MKTCAP": "1", "LIST_SHRS": "1", "ISU_SRT_CD": "005930"}]}
+    _validate_daily_market_page(valid, session=date(2024, 1, 2))
+    for page in ({"records": []}, {"records": [None]}, {"records": [{"LIST_SHRS": "1", "ISU_SRT_CD": "1"}]}, {"records": [{"MKTCAP": "1", "ISU_SRT_CD": "1"}]}, {"records": [{"MKTCAP": "1", "LIST_SHRS": "1"}]}, {"records": [{"MKTCAP": "1", "LIST_SHRS": "1", "ISU_SRT_CD": "1"}, {"MKTCAP": "1", "LIST_SHRS": "1", "ISU_SRT_CD": "1"}]}):
+        with pytest.raises(PITDataError):
+            _validate_daily_market_page(page, session=date(2024, 1, 2))
+
+
+def test_collect_daily_market_sessions_rejects_page_assignment_errors(tmp_path) -> None:
+    import pytest
+    from src.data.collection import collect_daily_market_sessions
+    from src.data.schemas import PITDataError
+
+    day = date(2024, 1, 2)
+    row = {"BAS_DD": "20240102", "ISU_SRT_CD": "1", "MKTCAP": "1", "LIST_SHRS": "1"}
+    class Krx:
+        def __init__(self, pages): self.pages = pages
+        def fetch_daily_market(self, *_args, **_kwargs): return self.pages
+
+    for pages, match in (([{"session": "2024-01-03", "records": [row]}], "non-requested"), ([{"session": day.isoformat(), "records": [row]}, {"session": day.isoformat(), "records": [row]}], "duplicate pages")):
+        with pytest.raises(PITDataError, match=match):
+            collect_daily_market_sessions(sessions=(day,), krx=Krx(pages), bronze_root=tmp_path / match, retrieved_at=datetime(2026, 9, 6, tzinfo=UTC))
+
+
+def test_collect_daily_market_sessions_resumes_after_provider_failure(tmp_path) -> None:
+    import pytest
+    from src.data.collection import collect_daily_market_sessions
+    from src.data.schemas import PITDataError
+
+    days = (date(2024, 1, 2), date(2024, 1, 3))
+
+    def page(day: date) -> dict[str, object]:
+        return {'session': day.isoformat(), 'records': [{'BAS_DD': day.strftime('%Y%m%d'), 'ISU_SRT_CD': '005930', 'MKTCAP': '1', 'LIST_SHRS': '1'}]}
+
+    class Interrupted:
+        def fetch_daily_market(self, *_args, **_kwargs):
+            yield page(days[0])
+            raise RuntimeError('network dropped')
+
+    with pytest.raises(PITDataError, match='collection failed'):
+        collect_daily_market_sessions(sessions=days, krx=Interrupted(), bronze_root=tmp_path / 'bronze', retrieved_at=datetime(2026, 9, 6, tzinfo=UTC))
+
+    class Retry:
+        def __init__(self) -> None:
+            self.requested = ()
+
+        def fetch_daily_market(self, _start, _end, *, sessions):
+            self.requested = tuple(sessions)
+            return iter([page(days[1])])
+
+    retry = Retry()
+    artifact = collect_daily_market_sessions(sessions=days, krx=retry, bronze_root=tmp_path / 'bronze', retrieved_at=datetime(2026, 9, 6, tzinfo=UTC))
+    assert retry.requested == (days[1],)
+    assert len(artifact.page_receipts['daily_market']) == 2
+
+
+def test_collect_daily_market_sessions_rejects_invalid_requests_and_receipts(tmp_path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    import pytest
+    from src.data.collection import collect_daily_market_sessions
+    from src.data.schemas import EvidenceKind, PITDataError
+
+    class Krx:
+        def fetch_daily_market(self, *_args, **_kwargs):
+            return ()
+
+    retrieved_at = datetime(2026, 9, 6, tzinfo=UTC)
+    with pytest.raises(PITDataError, match='dates only'):
+        collect_daily_market_sessions(sessions=(datetime(2024, 1, 2, tzinfo=UTC),), krx=Krx(), bronze_root=tmp_path / 'bronze', retrieved_at=retrieved_at)
+    with pytest.raises(PITDataError, match='duplicates'):
+        collect_daily_market_sessions(sessions=(date(2024, 1, 2), date(2024, 1, 2)), krx=Krx(), bronze_root=tmp_path / 'bronze', retrieved_at=retrieved_at)
+    receipt = SimpleNamespace(payload_path=tmp_path / 'missing.json', metadata_path=tmp_path / 'receipt.json')
+    monkeypatch.setattr('src.data.bronze_aggregation.discover_verified_bronze_receipts', lambda **_kwargs: {EvidenceKind.DAILY_MARKET: (receipt,)})
+    with pytest.raises(PITDataError, match='malformed Bronze receipt'):
+        collect_daily_market_sessions(sessions=(date(2024, 1, 2),), krx=Krx(), bronze_root=tmp_path / 'bronze', retrieved_at=retrieved_at)
+
+
+def test_collect_daily_market_sessions_fails_closed_for_unusable_pages(tmp_path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    import pytest
+    from src.data.collection import collect_daily_market_sessions
+    from src.data.schemas import EvidenceKind, PITDataError
+
+    day = date(2024, 1, 2)
+    retrieved_at = datetime(2026, 9, 6, tzinfo=UTC)
+    payload = tmp_path / 'payload.json'
+    payload.write_text('[]', encoding='utf-8')
+    receipt = SimpleNamespace(payload_path=payload, metadata_path=tmp_path / 'receipt.json')
+    monkeypatch.setattr('src.data.bronze_aggregation.discover_verified_bronze_receipts', lambda **_kwargs: {EvidenceKind.DAILY_MARKET: (receipt,)})
+
+    class Invalid:
+        def fetch_daily_market(self, *_args, **_kwargs):
+            return (None,)
+
+    with pytest.raises(PITDataError, match='page is empty'):
+        collect_daily_market_sessions(sessions=(day,), krx=Invalid(), bronze_root=tmp_path / 'bronze', retrieved_at=retrieved_at)
+    payload.write_text('{}', encoding='utf-8')
+    with pytest.raises(PITDataError, match='page is empty'):
+        collect_daily_market_sessions(sessions=(day,), krx=Invalid(), bronze_root=tmp_path / 'bronze', retrieved_at=retrieved_at)
+    monkeypatch.setattr('src.data.bronze_aggregation.discover_verified_bronze_receipts', lambda **_kwargs: (_ for _ in ()).throw(OSError('bad root')))
+    with pytest.raises(PITDataError, match='invalid Bronze root'):
+        collect_daily_market_sessions(sessions=(day,), krx=Invalid(), bronze_root=tmp_path / 'bronze', retrieved_at=retrieved_at)
+
+    class Partial:
+        def fetch_daily_market(self, *_args, **_kwargs):
+            return ({'session': day.isoformat(), 'records': [{'BAS_DD': '20240102', 'ISU_SRT_CD': '1', 'MKTCAP': '1', 'LIST_SHRS': '1'}]},)
+
+    monkeypatch.setattr('src.data.bronze_aggregation.discover_verified_bronze_receipts', lambda **_kwargs: {})
+    with pytest.raises(PITDataError, match='missing requested sessions'):
+        collect_daily_market_sessions(sessions=(day, date(2024, 1, 3)), krx=Partial(), bronze_root=tmp_path / 'other', retrieved_at=retrieved_at)
+
+
+def test_kis_flow_reuses_verified_anchor_page_after_interruption(tmp_path) -> None:
+    from datetime import UTC, date, datetime
+    from src.integrations.kis.investor_flow import KisInvestorFlowCollector
+
+    class Client:
+        def __init__(self) -> None: self.calls = 0
+        def inquire_investor_trade_by_stock_daily(self, symbol, anchor):
+            self.calls += 1
+            return ({'stck_bsop_date': anchor.strftime('%Y%m%d'), 'frgn_shnu_tr_pbmn': '1', 'frgn_seln_tr_pbmn': '0', 'frgn_ntby_tr_pbmn': '1', 'orgn_ntby_tr_pbmn': '0', 'prsn_ntby_tr_pbmn': '-1'},)
+    client = Client()
+    collector = KisInvestorFlowCollector(('005930',), client=client)
+    first = tuple(collector.fetch_investor_flow(date(2024, 1, 2), date(2024, 1, 2), bronze_root=tmp_path / 'bronze', retrieved_at=datetime(2026, 9, 6, tzinfo=UTC)))
+    second = tuple(collector.fetch_investor_flow(date(2024, 1, 2), date(2024, 1, 2), bronze_root=tmp_path / 'bronze', retrieved_at=datetime(2026, 9, 6, tzinfo=UTC)))
+    assert client.calls == 1
+    assert first[0]['records'] == second[0]['records']
+
+
+def test_kis_flow_rejects_unusable_verified_receipts(tmp_path, monkeypatch) -> None:
+    import json
+    from types import SimpleNamespace
+    import pytest
+    from src.data.schemas import PITDataError
+
+    collector = KisInvestorFlowCollector(('005930',), client=object())
+    payload = tmp_path / 'payload.json'
+    receipt = SimpleNamespace(payload_path=payload)
+
+    payload.write_text('{', encoding='utf-8')
+    monkeypatch.setattr(
+        'src.data.bronze_aggregation.discover_verified_bronze_receipts',
+        lambda **_kwargs: {EvidenceKind.INVESTOR_FLOW: (receipt,)},
+    )
+    with pytest.raises(PITDataError, match='invalid verified KIS Bronze payload'):
+        collector._find_verified_anchor_page('005930', date(2024, 1, 2), tmp_path)
+
+    payload.write_text(json.dumps(['not-a-page']), encoding='utf-8')
+    with pytest.raises(PITDataError, match='invalid verified KIS Bronze payload'):
+        collector._find_verified_anchor_page('005930', date(2024, 1, 2), tmp_path)
+
+    payload.write_text(json.dumps({'symbol': '005930', 'anchor': '2024-01-02', 'records': []}), encoding='utf-8')
+    assert collector._find_verified_anchor_page('005930', date(2024, 1, 2), tmp_path) is None
+
+
+def test_kis_flow_reused_page_advances_by_earliest_session(tmp_path) -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def inquire_investor_trade_by_stock_daily(self, _symbol, anchor):
+            self.calls.append(anchor)
+            return ({
+                'stck_bsop_date': anchor.strftime('%Y%m%d'),
+                'frgn_shnu_tr_pbmn': '1', 'frgn_seln_tr_pbmn': '0',
+                'frgn_ntby_tr_pbmn': '1', 'orgn_ntby_tr_pbmn': '0',
+                'prsn_ntby_tr_pbmn': '-1',
+            },)
+
+    client = Client()
+    collector = KisInvestorFlowCollector(('005930',), client=client)
+    collector._persist_raw_page(
+        '005930', date(2024, 1, 5),
+        (
+            {'stck_bsop_date': '20240105', 'frgn_shnu_tr_pbmn': '1', 'frgn_seln_tr_pbmn': '0', 'frgn_ntby_tr_pbmn': '1', 'orgn_ntby_tr_pbmn': '0', 'prsn_ntby_tr_pbmn': '-1'},
+            {'stck_bsop_date': '20240104', 'frgn_shnu_tr_pbmn': '1', 'frgn_seln_tr_pbmn': '0', 'frgn_ntby_tr_pbmn': '1', 'orgn_ntby_tr_pbmn': '0', 'prsn_ntby_tr_pbmn': '-1'},
+        ),
+        bronze_root=tmp_path, retrieved_at=datetime(2026, 9, 6, tzinfo=UTC),
+    )
+
+    pages = tuple(collector.fetch_investor_flow(date(2024, 1, 2), date(2024, 1, 5), bronze_root=tmp_path))
+
+    assert client.calls == [date(2024, 1, 3), date(2024, 1, 2)]
+    assert {row['session'] for page in pages for row in page['records']} == {'2024-01-02', '2024-01-03', '2024-01-04', '2024-01-05'}

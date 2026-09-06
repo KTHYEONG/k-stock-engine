@@ -337,3 +337,51 @@ def test_gold_loader_rejects_empty_master_and_missing_market_columns(tmp_path, m
     monkeypatch.setattr(module, "_read_full_projected", lambda **kwargs: pl.DataFrame({"wrong": [1]}) if kwargs["table"] is SilverTable.SECURITY_MASTER else pl.DataFrame({c: [sessions[0]] for c in kwargs["columns"]}))
     with pytest.raises(PITDataError, match="security_master"):
         module.load_gold_window_inputs(silver_root=tmp_path, validation_start=date(2016, 1, 4), validation_end=date(2016, 1, 8), decision_time=datetime(2016, 1, 10, tzinfo=UTC))
+
+
+def test_daily_market_backfill_plan_marks_missing_and_late_sessions(monkeypatch, tmp_path) -> None:
+    from datetime import UTC, datetime, time, timedelta
+    import polars as pl
+    import src.data.gold_loader as module
+    from src.core.time import KRX_TZ
+
+    sessions = tuple(datetime(2024, 1, 1, tzinfo=KRX_TZ) + timedelta(days=index) for index in range(65))
+    monkeypatch.setattr(module, 'load_latest_silver_table', lambda **_kwargs: pl.DataFrame({'session': sessions}))
+    rows = [{'session': session, 'instrument_id': 'KRX:1', 'available_at': datetime.combine(session.date(), time(15, 30), tzinfo=KRX_TZ)} for session in sessions[:-1]]
+    rows[-1]['available_at'] = datetime.combine(sessions[-2].date(), time(15, 31), tzinfo=KRX_TZ)
+    monkeypatch.setattr(module, '_read_bounded_table', lambda **_kwargs: pl.DataFrame(rows))
+
+    plan = module.plan_daily_market_backfill(silver_root=tmp_path, validation_start=sessions[60].date(), validation_end=sessions[-1].date(), decision_time=datetime(2024, 12, 31, tzinfo=UTC))
+
+    assert plan.history_start == sessions[0].date()
+    assert plan.validation_end == sessions[-1].date()
+    assert plan.missing_sessions == (sessions[-2].date(), sessions[-1].date())
+
+
+def test_daily_market_backfill_plan_rejects_invalid_calendar_inputs(monkeypatch, tmp_path) -> None:
+    from datetime import UTC, date, datetime, timedelta
+    import polars as pl
+    import pytest
+    import src.data.gold_loader as module
+    from src.data.schemas import PITDataError
+
+    with pytest.raises(PITDataError, match="decision_time"):
+        module.plan_daily_market_backfill(silver_root=tmp_path, validation_start=date(2024, 1, 1), validation_end=date(2024, 1, 2), decision_time=datetime(2024, 1, 2))
+    with pytest.raises(PITDataError, match="range inverted"):
+        module.plan_daily_market_backfill(silver_root=tmp_path, validation_start=date(2024, 1, 2), validation_end=date(2024, 1, 1), decision_time=datetime(2024, 1, 2, tzinfo=UTC))
+    monkeypatch.setattr(module, "load_latest_silver_table", lambda **_kwargs: pl.DataFrame({"session": []}))
+    with pytest.raises(PITDataError, match="calendar"):
+        module.plan_daily_market_backfill(silver_root=tmp_path, validation_start=date(2024, 1, 1), validation_end=date(2024, 1, 2), decision_time=datetime(2024, 1, 2, tzinfo=UTC))
+
+    sessions = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=index) for index in range(65)]
+    monkeypatch.setattr(module, "load_latest_silver_table", lambda **_kwargs: pl.DataFrame({"session": sessions}))
+    with pytest.raises(PITDataError, match="lacks warmup"):
+        module.plan_daily_market_backfill(silver_root=tmp_path, validation_start=sessions[0].date(), validation_end=sessions[-1].date(), decision_time=datetime(2024, 12, 31, tzinfo=UTC))
+    with pytest.raises(PITDataError, match="calendar"):
+        module.plan_daily_market_backfill(silver_root=tmp_path, validation_start=sessions[60].date(), validation_end=date(2024, 12, 31), decision_time=datetime(2024, 12, 31, tzinfo=UTC))
+    monkeypatch.setattr(module, "_read_bounded_table", lambda **_kwargs: (_ for _ in ()).throw(PITDataError("bad")))
+    plan = module.plan_daily_market_backfill(silver_root=tmp_path, validation_start=sessions[60].date(), validation_end=sessions[-1].date(), decision_time=datetime(2024, 12, 31, tzinfo=UTC))
+    assert len(plan.missing_sessions) == 65
+    monkeypatch.setattr(module, "load_latest_silver_table", lambda **_kwargs: (_ for _ in ()).throw(OSError("bad")))
+    with pytest.raises(PITDataError, match="calendar"):
+        module.plan_daily_market_backfill(silver_root=tmp_path, validation_start=date(2024, 1, 1), validation_end=date(2024, 1, 2), decision_time=datetime(2024, 1, 2, tzinfo=UTC))
