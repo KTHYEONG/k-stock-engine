@@ -1,8 +1,10 @@
 """Bounded point-in-time replay with streaming Gold publication."""
 from __future__ import annotations
 
+import logging
 import pickle
 import re
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,6 +21,8 @@ from src.strategy.scoring import ChampionScoreRow
 from src.strategy.universe import UniverseDecision, UniversePolicy
 
 _FLOW_LOOKBACK = 20
+
+_LOGGER = logging.getLogger(__name__)
 
 _FLOAT64_COLUMNS = frozenset(
     {
@@ -93,6 +97,31 @@ def _session_window(
     return tuple(calendar.sessions[idx - window : idx])
 
 
+def _build_session_index(frame: pl.DataFrame) -> dict[datetime, pl.DataFrame]:
+    """Group rows once by exact session key for O(window) per-session concat."""
+    if frame.is_empty() or "session" not in frame.columns:
+        return {}
+    parts = frame.partition_by("session", maintain_order=True, as_dict=True)
+    index: dict[datetime, pl.DataFrame] = {}
+    for key, part in parts.items():
+        sess = key[0] if isinstance(key, tuple) else key
+        if isinstance(sess, datetime):
+            index[sess] = part
+    return index
+
+
+def _concat_window(
+    index: dict[datetime, pl.DataFrame], sessions: tuple[datetime, ...], *, schema: pl.DataFrame
+) -> pl.DataFrame:
+    """Concatenate only the requested session partitions (no full-frame scan)."""
+    if not sessions:
+        return schema.clear()
+    parts = [index[item] for item in sessions if item in index]
+    if not parts:
+        return schema.clear()
+    return pl.concat(parts, how="diagonal")
+
+
 @dataclass(frozen=True, slots=True)
 class PITReplaySession:
     session: datetime
@@ -127,6 +156,8 @@ class PITReplayReader:
         self._facts = financial_facts
         self._actions = corporate_actions
         self._dataset_files = dict(dataset_files or {})
+        self._daily_index = _build_session_index(daily_market) if daily_market is not None else {}
+        self._flow_index = _build_session_index(investor_flow) if investor_flow is not None else {}
 
     @classmethod
     def from_silver_root(
@@ -150,6 +181,26 @@ class PITReplayReader:
             paths = tuple(sorted(dataset.rglob("*.parquet")))
             files[table] = paths
         return cls(calendar=calendar, silver_root=root, decision_time=decision_time, dataset_files=files)
+
+    @classmethod
+    def from_frames(
+        cls,
+        *,
+        calendar: SessionCalendar,
+        security_master: pl.DataFrame,
+        daily_market: pl.DataFrame,
+        investor_flow: pl.DataFrame,
+        financial_facts: pl.DataFrame,
+        corporate_actions: pl.DataFrame,
+    ) -> PITReplayReader:
+        return cls(
+            calendar=calendar,
+            security_master=security_master,
+            daily_market=daily_market,
+            investor_flow=investor_flow,
+            financial_facts=financial_facts,
+            corporate_actions=corporate_actions,
+        )
 
     @classmethod
     def from_frames_for_test(
@@ -216,23 +267,19 @@ class PITReplayReader:
         facts_src = self._facts if self._facts is not None else pl.DataFrame()
         actions_src = self._actions if self._actions is not None else pl.DataFrame()
 
-        daily_pit = _pit_available(daily_src, decision_time)
-        if not daily_pit.is_empty() and "session" in daily_pit.columns and daily_window:
+        daily_index = self._daily_index if hasattr(self, "_daily_index") else _build_session_index(daily_src)
+        flow_index = self._flow_index if hasattr(self, "_flow_index") else _build_session_index(flow_src)
+        daily_window_frame = _concat_window(daily_index, daily_window, schema=daily_src)
+        daily_slice = _pit_available(daily_window_frame, decision_time)
+        if not daily_slice.is_empty() and "session" in daily_slice.columns and daily_window:
             allowed = set(daily_window)
-            daily_slice = daily_pit.filter(pl.col("session").is_in(list(allowed)))
-        elif not daily_pit.is_empty():
-            daily_slice = daily_pit.clear()
-        else:
-            daily_slice = daily_pit
+            daily_slice = daily_slice.filter(pl.col("session").is_in(list(allowed)))
 
-        flow_pit = _pit_available(flow_src, decision_time)
-        if not flow_pit.is_empty() and "session" in flow_pit.columns and flow_window:
+        flow_window_frame = _concat_window(flow_index, flow_window, schema=flow_src)
+        flow_slice = _pit_available(flow_window_frame, decision_time)
+        if not flow_slice.is_empty() and "session" in flow_slice.columns and flow_window:
             allowed_f = set(flow_window)
-            flow_slice = flow_pit.filter(pl.col("session").is_in(list(allowed_f)))
-        elif not flow_pit.is_empty():
-            flow_slice = flow_pit.clear()
-        else:
-            flow_slice = flow_pit
+            flow_slice = flow_slice.filter(pl.col("session").is_in(list(allowed_f)))
 
         master_pit = _pit_available(master_src, decision_time)
         if not master_pit.is_empty() and "valid_from" in master_pit.columns:
@@ -439,6 +486,8 @@ class StreamingGoldWriter:
         self._source_hashes = dict(source_hashes)
         self._expected = tuple(expected_sessions)
         self._require_scores = bool(require_scores)
+        self._staging_root = Path(root) / f".staging-{dataset_id}-{uuid.uuid4().hex[:8]}"
+        self._batch_counters: dict[str, int] = {"universe": 0, "features": 0, "scores": 0}
         self._universe_batches: list[Path] = []
         self._feature_batches: list[Path] = []
         self._score_batches: list[Path] = []
@@ -469,11 +518,12 @@ class StreamingGoldWriter:
         self._score_batches.append(self._write_batch("scores", rows))
 
     def _write_batch(self, kind: str, rows: object) -> Path:
-        staging = self._root / f".staging-{self._dataset_id}" / kind
-        staging.mkdir(parents=True, exist_ok=True)
-        marker = staging / f"batch-{len(list(staging.glob('batch-*.pkl'))):05d}.pkl"
         if not isinstance(rows, tuple):  # pragma: no cover - typed append APIs only
             raise PITDataError("invalid Gold staging batch")
+        staging = self._staging_root / kind
+        staging.mkdir(parents=True, exist_ok=True)
+        marker = staging / f"batch-{self._batch_counters.get(kind, 0):05d}.pkl"
+        self._batch_counters[kind] = self._batch_counters.get(kind, 0) + 1
         with marker.open("wb") as handle:
             pickle.dump(rows, handle, protocol=pickle.HIGHEST_PROTOCOL)
         return marker
@@ -560,7 +610,7 @@ class StreamingGoldWriter:
                 quality_report_hash=quality_hash,
                 certification=self._certification,
             )
-        staging_root = self._root / f".staging-{self._dataset_id}"
+        staging_root = self._staging_root
         if staging_root.exists():
             import shutil
 
