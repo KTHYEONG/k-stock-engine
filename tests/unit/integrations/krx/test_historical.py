@@ -4,6 +4,7 @@ import pytest
 
 from src.data.schemas import PITDataError
 from src.integrations.krx.historical import KrxHistoricalCollector
+from src.integrations.quota import ProviderQuotaStateStore
 
 
 def test_krx_investor_flow_does_not_fallback_to_trade_client() -> None:
@@ -67,3 +68,38 @@ def test_krx_historical_collector_validates_ranges_and_master_plans() -> None:
     assert [page['session'] for page in pages] == ['2016-01-04', '2016-01-05']
     pages = tuple(collector.fetch_master_lineage(date(2016, 1, 4), date(2016, 1, 4)))
     assert pages[0]['session'] == '2016-01-04'
+
+
+def test_krx_daily_market_yields_pages_lazily() -> None:
+    from datetime import date
+    from types import SimpleNamespace
+    from src.integrations.krx.historical import KrxHistoricalCollector
+
+    called: list[date] = []
+
+    def fetch(day: date) -> list[dict[str, str]]:
+        called.append(day)
+        return [{'BAS_DD': day.strftime('%Y%m%d'), 'ISU_SRT_CD': '005930', 'MKTCAP': '1', 'LIST_SHRS': '1'}]
+
+    collector = KrxHistoricalCollector(api_key='key', request_json=lambda *_: {})
+    collector._client = SimpleNamespace(fetch_trade_records=fetch)
+    pages = collector.fetch_daily_market(date(2024, 1, 2), date(2024, 1, 3))
+    assert next(iter(pages))['session'] == '2024-01-02'
+    assert called == [date(2024, 1, 2)]
+
+
+def test_krx_historical_wires_quota_store_into_production_client(monkeypatch, tmp_path) -> None:
+    import src.integrations.krx.client as client_module
+
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(client_module, "KrxApiClient", FakeClient)
+    store = ProviderQuotaStateStore(tmp_path / "quota")
+    KrxHistoricalCollector(api_key="key", quota_store=store, min_interval=0.0)
+
+    assert captured["quota_store"] is store
+    assert captured["min_interval"] == 0.0
