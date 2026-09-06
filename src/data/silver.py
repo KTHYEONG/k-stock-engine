@@ -862,6 +862,7 @@ class SilverStore:
                 label_horizon_sessions=1,
                 time_start=time_start,
                 time_end=time_end,
+                generated_time=decision_time,
                 provider_version="fixture",
                 universe_policy_version="v1",
                 row_count=frame.height,

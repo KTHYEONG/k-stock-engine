@@ -95,6 +95,31 @@ class KisInvestorFlowCollector:
             raise PITDataError("KIS investor flow missing requested session")
         return {"provider": "KIS", "endpoint": "investor-trade-by-stock-daily", "records": rows}
 
+    def _find_verified_anchor_page(self, symbol: str, anchor: date, bronze_root: Path | str) -> dict[str, object] | None:
+        from src.data.bronze_aggregation import discover_verified_bronze_receipts
+        from src.data.schemas import EvidenceKind
+
+        grouped = discover_verified_bronze_receipts(bronze_root=Path(bronze_root))
+        for receipt in grouped.get(EvidenceKind.INVESTOR_FLOW, ()):
+            try:
+                payload = json.loads(receipt.payload_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise PITDataError(f"invalid verified KIS Bronze payload {receipt.payload_path}") from exc
+            if not isinstance(payload, dict):
+                raise PITDataError(f"invalid verified KIS Bronze payload {receipt.payload_path}")
+            if str(payload.get("symbol")) == symbol and str(payload.get("anchor")) == anchor.isoformat():
+                records = payload.get("records")
+                if not isinstance(records, list) or not records:
+                    return None
+                return {
+                    "provider": "KIS",
+                    "endpoint": "investor-trade-by-stock-daily",
+                    "symbol": symbol,
+                    "anchor": anchor.isoformat(),
+                    "records": records,
+                }
+        return None
+
     def fetch_investor_flow(
         self,
         start: date,
@@ -113,6 +138,20 @@ class KisInvestorFlowCollector:
             anchor = end
             seen: set[str] = set()
             while anchor >= start:
+                reused = self._find_verified_anchor_page(symbol, anchor, bronze_root) if bronze_root is not None else None
+                if reused is not None:
+                    reused_records: Any = reused["records"]
+                    rows = [dict(r) for r in reused_records if isinstance(r, dict)]
+                    selected = [row for row in rows if start.isoformat() <= str(row["session"]) <= end.isoformat()]
+                    unique = [row for row in selected if str(row["session"]) not in seen]
+                    seen.update(str(row["session"]) for row in unique)
+                    if unique:
+                        yield {"provider": "KIS", "endpoint": "investor-trade-by-stock-daily", "symbol": symbol, "anchor": anchor.isoformat(), "records": unique}
+                    earliest = min(date.fromisoformat(str(row["session"])) for row in rows)
+                    if earliest <= start:
+                        break
+                    anchor = earliest - timedelta(days=1)
+                    continue
                 try:
                     raw_rows = self._client.inquire_investor_trade_by_stock_daily(symbol, anchor)
                 except Exception as exc:

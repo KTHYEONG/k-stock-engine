@@ -67,7 +67,7 @@ def build_historical_collection_plan(
     universe: Any = (),
     start: date | None = None,
     end: date | None = None,
-    chunk_size: int = 20,
+    chunk_size: int = 30,
     *,
     artifact_root: Path | str | None = None,
     input_receipt_digest: str | None = None,

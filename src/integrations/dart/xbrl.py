@@ -46,15 +46,16 @@ class DartXbrlCollector:
         *,
         request_json: Any | None = None,
         request_bytes: Any | None = None,
+        client: Any | None = None,
     ) -> None:
         key = api_key or os.getenv("OPENDART_API_KEY")
-        if not key and request_json is None and request_bytes is None:
+        if not key and request_json is None and request_bytes is None and client is None:
             raise ValueError("OPENDART_API_KEY not found in environment variables")
         self._api_key = key
         self._request_json = request_json
         self._request_bytes = request_bytes
-        self._client: Any | None = None
-        if request_json is None and request_bytes is None and key is not None:
+        self._client: Any | None = client
+        if request_json is None and request_bytes is None and key is not None and self._client is None:
             from src.integrations.dart.client import DartApiClient
 
             self._client = DartApiClient(api_key=key)
@@ -86,10 +87,19 @@ class DartXbrlCollector:
         codes = tuple(dict.fromkeys(c.strip() for c in corp_codes if c and c.strip()))
         if not codes:
             raise PITDataError("DART disclosures response is empty; certification blocked")
+        import calendar as _calendar
+
+        wanted = set(codes)
         pages: list[dict[str, Any]] = []
-        for code in codes:
-            records = self._client.list_disclosures(start, end, corp_code=code)
-            pages.append({"records": list(records), "corp_code": code, "start": start.isoformat(), "end": end.isoformat()})
+        cursor = date(start.year, start.month, 1)
+        while cursor <= end:
+            month_last = _calendar.monthrange(cursor.year, cursor.month)[1]
+            month_start = max(cursor, start)
+            month_end = min(date(cursor.year, cursor.month, month_last), end)
+            records = self._client.list_disclosures(month_start, month_end)
+            filtered = [r for r in records if str(r.get("corp_code")) in wanted]
+            pages.append({"records": filtered, "start": month_start.isoformat(), "end": month_end.isoformat()})
+            cursor = date(cursor.year + (1 if cursor.month == 12 else 0), (cursor.month % 12) + 1, 1)
         if not pages:
             raise PITDataError("DART disclosures response is empty; certification blocked")
         return tuple(pages)
