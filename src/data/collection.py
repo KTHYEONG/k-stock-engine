@@ -213,15 +213,7 @@ def collect_planned_investor_flow(
         if checkpoint_store.has_verified_receipt(plan=plan, chunk=chunk, bronze_root=bronze_root):
             continue
         try:
-            pages = tuple(
-                kis.fetch_investor_flow(
-                    min(chunk.sessions),
-                    max(chunk.sessions),
-                    bronze_root=bronze_root,
-                    retrieved_at=retrieved_at,
-                    symbols=(chunk.symbol,),
-                )
-            )
+            pages = tuple(kis.fetch_investor_flow(min(chunk.sessions), max(chunk.sessions), bronze_root=bronze_root, retrieved_at=retrieved_at, symbols=(chunk.symbol,)))
         except PITDataError as exc:
             if "missing requested session" not in str(exc):
                 raise
@@ -554,6 +546,158 @@ def _persist_pages(
         per_page.append(receipt)
     assert receipt is not None
     return receipt, tuple(per_page)
+
+
+def _daily_market_page_session(page: RawProviderResponse) -> date:
+    raw_session = page.get("session")
+    if isinstance(raw_session, str) and raw_session.strip():
+        text = raw_session.strip()
+        try:
+            return date.fromisoformat(text[:10])
+        except ValueError as exc:
+            raise PITDataError(f"malformed KRX daily market session timestamp: {text}") from exc
+    records = page.get("records")
+    if isinstance(records, list):
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            for key in ("BAS_DD", "bas_dd", "session"):
+                raw = record.get(key)
+                if isinstance(raw, str) and raw.strip():
+                    text = raw.strip()
+                    try:
+                        if len(text) == 8 and text.isdigit():
+                            return date(int(text[:4]), int(text[4:6]), int(text[6:8]))
+                        return date.fromisoformat(text[:10])
+                    except ValueError as exc:
+                        raise PITDataError(f"malformed KRX daily market session timestamp: {text}") from exc
+    raise PITDataError("KRX daily market page is missing its trading session; certification blocked")
+
+
+def _validate_daily_market_page(page: RawProviderResponse, *, session: date) -> None:
+    records = page.get("records")
+    if not isinstance(records, list) or not records:
+        raise PITDataError(f"KRX daily market is empty for {session}; refusing to fabricate facts")
+    seen: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict) or not record:
+            raise PITDataError(f"KRX daily market page is empty for {session}; certification blocked")
+        if not any(record.get(name) not in (None, "") for name in ("market_cap", "marcap", "MKTCAP")):
+            raise PITDataError(f"KRX daily market missing MKTCAP for {session}; certification blocked")
+        if not any(record.get(name) not in (None, "") for name in ("shares_outstanding", "list_shrs", "LIST_SHRS")):
+            raise PITDataError(f"KRX daily market missing LIST_SHRS for {session}; certification blocked")
+        key = str(
+            record.get("ISU_SRT_CD") or record.get("instrument_id") or record.get("ticker") or record.get("ISU_CD") or ""
+        ).strip()
+        if not key:
+            raise PITDataError(f"KRX daily market record is missing instrument identity for {session}; certification blocked")
+        if key in seen:
+            raise PITDataError(f"KRX daily market has duplicate rows for {session}; certification blocked")
+        seen.add(key)
+
+
+def collect_daily_market_sessions(
+    *,
+    sessions: tuple[date, ...],
+    krx: Any,
+    bronze_root: Path,
+    retrieved_at: datetime,
+) -> CollectionArtifact:
+    """Collect missing KRX daily-market sessions as per-session Bronze receipts (float64, JSON Bronze)."""
+    if retrieved_at.tzinfo is None:
+        raise PITDataError("retrieved_at must be timezone-aware")
+    requested = tuple(sessions)
+    if not requested:
+        raise PITDataError("sessions must list at least one trading session")
+    for day in requested:
+        if not isinstance(day, date) or isinstance(day, datetime):
+            raise PITDataError("sessions must contain dates only")
+    if len(set(requested)) != len(requested):
+        raise PITDataError("sessions must not contain duplicates")
+    bronze_path = Path(bronze_root)
+    # Retry reuse: verified per-session Bronze receipts are never refetched.
+    existing: dict[date, BronzeReceipt] = {}
+    try:
+        from src.data.bronze_aggregation import discover_verified_bronze_receipts
+
+        grouped = discover_verified_bronze_receipts(bronze_root=bronze_path)
+        for receipt in grouped.get(EvidenceKind.DAILY_MARKET, ()):
+            try:
+                payload = json.loads(receipt.payload_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise PITDataError(f"malformed Bronze receipt {receipt.metadata_path}") from exc
+            if not isinstance(payload, dict):
+                continue
+            try:
+                sess = _daily_market_page_session(payload)
+            except PITDataError:
+                continue
+            if sess in requested and sess not in existing:
+                existing[sess] = receipt
+    except PITDataError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise PITDataError(f"invalid Bronze root for daily market backfill: {exc}") from exc
+    # Missing bronze_root simply means no reusable evidence yet.
+    to_fetch = tuple(day for day in requested if day not in existing)
+    store = BronzeStore(bronze_path)
+    fresh: dict[date, BronzeReceipt] = {}
+    if to_fetch:
+        start, end = min(to_fetch), max(to_fetch)
+        seen_pages: set[date] = set()
+        wanted = set(to_fetch)
+        try:
+            raw_pages = krx.fetch_daily_market(start, end, sessions=tuple(to_fetch))
+            for raw in raw_pages:
+                if not isinstance(raw, dict) or not raw:
+                    raise PITDataError("KRX daily market page is empty; certification blocked")
+                sess = _daily_market_page_session(raw)
+                # Guard: a KRX page assigned to a non-requested session is rejected.
+                if sess not in wanted:
+                    raise PITDataError(f"KRX daily market page for non-requested session {sess}; certification blocked")
+                if sess in seen_pages:
+                    raise PITDataError(f"KRX daily market has duplicate pages for {sess}; certification blocked")
+                seen_pages.add(sess)
+                _validate_daily_market_page(raw, session=sess)
+                text = json.dumps(dict(raw), sort_keys=True, ensure_ascii=False)
+                fresh[sess] = store.import_bytes(
+                    text.encode("utf-8"),
+                    kind=EvidenceKind.DAILY_MARKET,
+                    retrieved_at=retrieved_at,
+                    source_label=f"krx:daily-market:{sess.isoformat()}",
+                )
+        except PITDataError:
+            raise
+        except Exception as exc:
+            raise PITDataError(f"KRX daily market collection failed: {exc}") from exc
+        if not seen_pages:
+            raise PITDataError("KRX daily market response is empty; certification blocked")
+        missing_pages = sorted(wanted - seen_pages)
+        if missing_pages:
+            raise PITDataError(f"KRX daily market missing requested sessions: {missing_pages[0]}; certification blocked")
+    ordered = tuple({**existing, **fresh}[day] for day in requested)
+    digest = hashlib.sha256()
+    for item in sorted(ordered, key=lambda value: value.content_hash):
+        digest.update(item.content_hash.encode("utf-8"))
+        digest.update(b"\x00")
+    content_hash = digest.hexdigest()
+    artifact_dir = bronze_path.parent / "artifacts" / "collections"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    report_path = artifact_dir / f"{content_hash}.json"
+    report_path.write_text(
+        json.dumps({"content_hash": content_hash, "provider": "krx", "kind": "daily_market", "sessions": [day.isoformat() for day in requested]}, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return CollectionArtifact(
+        bronze_root=bronze_path,
+        coverage_start=min(requested),
+        coverage_end=max(requested),
+        retrieved_at=retrieved_at,
+        receipts={EvidenceKind.DAILY_MARKET: ordered[-1]},
+        content_hash=content_hash,
+        report_path=report_path,
+        page_receipts={EvidenceKind.DAILY_MARKET.value: ordered},
+    )
 
 
 def _routed_plan_evidence(
