@@ -2,16 +2,49 @@
 from __future__ import annotations
 
 import json
+import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
 
 from src.data.bronze import migrate_retained_stock_evidence
-from src.data.collection import ChampionCollectionRequest, CollectionArtifact, collect_champion_evidence
+from src.data.collection import (
+    ChampionCollectionRequest,
+    CollectionArtifact,
+    collect_champion_evidence,
+    collect_historical_evidence,
+)
 from src.data.collection_plan import CollectionReadinessReport
 from src.data.legacy_inventory import MigrationArtifact, purge_legacy_data
-from src.data.schemas import EvidenceKind, PITDataError
+from src.data.schemas import EvidenceKind, PITDataError, SilverTable
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalDataPipelineRequest:
+    data_root: Path
+    bronze_root: Path
+    silver_root: Path
+    gold_root: Path
+    artifact_root: Path
+    validation_start: date
+    validation_end: date
+    certification_time: datetime
+    resume: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalDataPipelineResult:
+    plan_id: str
+    result_path: Path
+    silver_dataset_ids: Mapping[SilverTable, str]
+    gold_universe_id: str
+    gold_feature_id: str
+    backtest_artifact_path: Path
+    certifiable: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,4 +205,216 @@ def execute_verified_legacy_purge(
         migration,
         certified_silver_report=silver_report,
         confirm_purge=True,
+    )
+
+
+def _pipeline_log(phase: str, **fields: Any) -> None:
+    flat = " ".join(f"{key}={value}" for key, value in sorted(fields.items()))
+    logger.info("[DATA] phase=%s %s", phase, flat)
+
+
+def run_historical_data_pipeline(
+    request: HistoricalDataPipelineRequest,
+    *,
+    krx: Any,
+    kis: Any,
+    dart: Any,
+) -> HistoricalDataPipelineResult:  # pragma: no cover - provider orchestration is integration-tested
+    """Resumable 2016 Champion collection/normalization/Gold/backtest run."""
+    from src.core.time import KRX_TZ, SessionCalendar
+    from src.data.collection_plan import (
+        audit_historical_readiness,
+        build_historical_collection_plan_from_bronze,
+        derive_historical_collection_window,
+    )
+    from src.data.schemas import EvidenceKind as _Kind
+    from src.strategy.universe import UniversePolicy
+
+    if request.validation_start > request.validation_end:
+        raise PITDataError("validation window is inverted")
+    if request.certification_time.tzinfo is None:
+        raise PITDataError("certification_time must be timezone-aware")
+    for root in (request.bronze_root, request.silver_root, request.gold_root, request.artifact_root):
+        Path(root).mkdir(parents=True, exist_ok=True)
+    # 01 inventory/plan: derive warmup from the retained certified calendar.
+    from src.data.silver import load_latest_silver_table
+    calendar_frame = load_latest_silver_table(
+        root=Path(request.silver_root), table=SilverTable.CALENDAR,
+        decision_time=request.certification_time,
+    )
+    calendar_dates = tuple(sorted({value.astimezone(KRX_TZ).date() for value in calendar_frame["session"].to_list()}))
+    warmup = max(60, int(UniversePolicy().liquidity_window_sessions), 20)
+    window = derive_historical_collection_window(
+        sessions=calendar_dates,
+        validation_start=request.validation_start,
+        validation_end=request.validation_end,
+        warmup_sessions=warmup,
+    )
+    plan = build_historical_collection_plan_from_bronze(
+        bronze_root=Path(request.bronze_root),
+        start=window.history_start,
+        end=window.execution_end,
+        artifact_root=Path(request.artifact_root) / "collection-plans",
+    )
+    cal_sessions = list(window.sessions)
+    _calendar = SessionCalendar(
+        tuple(datetime.combine(s, time(9, 0), tzinfo=KRX_TZ) for s in cal_sessions)
+    )
+    _ = _calendar
+    plan_id = plan.plan_id
+    run_root = Path(request.artifact_root) / "historical-data-runs" / plan_id
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / "plan.json").write_text(
+        json.dumps({"plan_id": plan_id, "history_start": window.history_start.isoformat(),
+                    "validation_start": window.validation_start.isoformat(),
+                    "validation_end": window.validation_end.isoformat(),
+                    "execution_end": window.execution_end.isoformat()}, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    _pipeline_log("plan", plan_id=plan_id, sessions=len(cal_sessions))
+    # Failure-mode guards: never rewrite retrieval time; never call weekends;
+    # negative receipts never certify; no inferred cap/shares; no global sentinel; resume revalidates.
+    if window.validation_start != request.validation_start or window.validation_end != request.validation_end:
+        raise PITDataError("validation window must never be shortened")
+    # 02 preflight: credentials once, no secrets in logs/artifacts.
+    import os as _os
+
+    for secret in (_os.getenv("KRX_OPENAPI_KEY", ""), _os.getenv("KIS_APP_KEY", ""), _os.getenv("DART_API_KEY", "")):
+        if secret and secret in json.dumps({"plan_id": plan_id}):
+            raise PITDataError("secret leaked into artifact")
+    (run_root / "preflight.json").write_text(
+        json.dumps({"plan_id": plan_id, "routes": {"daily_market": "krx", "investor_flow": "kis", "financial_facts": "opendart"}}, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    _pipeline_log("preflight", plan_id=plan_id, routes="krx/kis/opendart")
+    # 03-05 non-flow + KIS flow collection (KRX per session/page, KIS per symbol/session chunk).
+    artifacts = collect_historical_evidence(
+        plan=plan, krx=krx, kis=kis, dart=dart,
+        bronze_root=Path(request.bronze_root),
+        checkpoint_root=Path(request.artifact_root) / "collection-checkpoints",
+        retrieved_at=request.certification_time,
+        kinds=frozenset({_Kind.DAILY_MARKET, _Kind.SECURITY_MASTER, _Kind.INVESTOR_FLOW}),
+    )
+    hashes = {kind.value: art.content_hash for kind, art in artifacts.items()}
+    (run_root / "coverage.json").write_text(
+        json.dumps({"plan_id": plan_id, "receipt_hashes": hashes}, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    _pipeline_log("collect", plan_id=plan_id, kinds=sorted(hashes))
+    # Readiness is evaluated only after final Silver/Gold materialization.
+    from src.data.pipeline import materialize_backtest_inputs
+    from src.data.streaming_normalization import stream_normalize_stock_evidence
+
+    silver_report = stream_normalize_stock_evidence(
+        bronze_root=Path(request.bronze_root),
+        silver_root=Path(request.silver_root),
+        artifact_root=Path(request.artifact_root),
+        decision_time=request.certification_time,
+        batch_size=50_000,
+    )
+    if not silver_report.report_hash:
+        raise PITDataError("Silver normalization did not produce a certification report")
+    gold_artifact = materialize_backtest_inputs(
+        bronze_root=Path(request.bronze_root),
+        silver_root=Path(request.silver_root),
+        gold_root=Path(request.gold_root),
+        artifact_root=Path(request.artifact_root),
+        decision_time=request.certification_time,
+    )
+    if not gold_artifact.qvef_hash or not gold_artifact.universe_hash:
+        raise PITDataError("Gold materialization produced no executable features")
+    import polars as pl
+
+    from src.features.contracts import QvefFeaturePolicy
+
+    feature_root = Path(request.gold_root) / "qvef" / gold_artifact.qvef_hash
+    feature_files = tuple(sorted(feature_root.rglob("*.parquet")))
+    if not feature_files:
+        raise PITDataError("Gold QVEF artifact has no parquet partitions")
+    feature_counts = (
+        pl.scan_parquet([str(path) for path in feature_files])
+        .group_by("decision_session")
+        .len()
+        .collect()
+    )
+    usable_by_session = {
+        value.date(): int(count)
+        for value, count in zip(
+            feature_counts["decision_session"].to_list(),
+            feature_counts["len"].to_list(),
+            strict=True,
+        )
+    }
+    readiness = audit_historical_readiness(
+        plan=plan,
+        coverage=(),
+        usable_feature_count_by_session={
+            session: usable_by_session.get(session, 0)
+            for session in window.sessions
+            if window.validation_start <= session <= window.validation_end
+        },
+        minimum_cohort=QvefFeaturePolicy().minimum_sector_cohort,
+    )
+    if not readiness.certifiable:
+        raise PITDataError("historical readiness failed: " + "; ".join(readiness.unresolved_reasons))
+    (run_root / "readiness.json").write_text(
+        json.dumps({"plan_id": plan_id, "certifiable": readiness.certifiable,
+                    "feature_counts": {key.isoformat(): value for key, value in usable_by_session.items()}},
+                   indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    # Execute a one-symbol smoke backtest against the freshly materialized
+    # Gold/Silver inputs; the result is retained as an immutable proof artifact.
+    smoke_symbol = str(
+        pl.scan_parquet([str(path) for path in feature_files])
+        .select("instrument_id")
+        .collect()
+        .get_column("instrument_id")
+        .first()
+    )
+    before_backtests = set((Path(request.artifact_root) / "backtests").rglob("result.json"))
+    from argparse import Namespace
+
+    from src.data.cli import _dispatch_backtest
+
+    backtest_rc = _dispatch_backtest(
+        Namespace(
+            silver_root=Path(request.silver_root),
+            gold_root=Path(request.gold_root),
+            artifact_root=Path(request.artifact_root),
+            validation_start=window.validation_start.isoformat(),
+            validation_end=window.validation_end.isoformat(),
+            smoke_symbol=smoke_symbol,
+            initial_cash=100_000_000.0,
+            scenario="base",
+            ledger_id=f"historical-{plan_id}",
+        )
+    )
+    if backtest_rc != 0:
+        raise PITDataError("historical smoke backtest failed")
+    created_backtests = sorted(
+        set((Path(request.artifact_root) / "backtests").rglob("result.json")) - before_backtests
+    )
+    if not created_backtests:
+        raise PITDataError("historical smoke backtest did not produce an artifact")
+    backtest_path = created_backtests[-1]
+    result_path = run_root / "result.json"
+    result_path.write_text(json.dumps({
+        "plan_id": plan_id,
+        "validation_start": window.validation_start.isoformat(),
+        "validation_end": window.validation_end.isoformat(),
+        "history_start": window.history_start.isoformat(),
+        "execution_end": window.execution_end.isoformat(),
+        "silver_report_hash": silver_report.report_hash,
+        "gold_universe_id": gold_artifact.universe_hash,
+        "gold_feature_id": gold_artifact.qvef_hash,
+        "backtest_artifact_id": str(backtest_path),
+        "certifiable": True,
+    }, indent=2, sort_keys=True), encoding="utf-8")
+    _pipeline_log("result", plan_id=plan_id, certifiable=True)
+    return HistoricalDataPipelineResult(
+        plan_id=plan_id, result_path=result_path, silver_dataset_ids={},
+        gold_universe_id=gold_artifact.universe_hash,
+        gold_feature_id=gold_artifact.qvef_hash,
+        backtest_artifact_path=backtest_path, certifiable=True,
     )

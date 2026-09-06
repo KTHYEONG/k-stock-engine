@@ -357,7 +357,10 @@ def build_historical_universe(
         if corporate_actions is not None and not corporate_actions.is_empty():
             from src.data.gold import exclude_sentinel_corporate_actions
             ca_excluded = exclude_sentinel_corporate_actions(
-                corporate_actions, frozenset([instrument_id])
+                corporate_actions,
+                frozenset([instrument_id]),
+                window_start=decision_session.astimezone(KRX_TZ).date(),
+                window_end=decision_session.astimezone(KRX_TZ).date(),
             )
             if instrument_id in ca_excluded:
                 reasons.append(ExclusionReason.NO_VALID_CORPORATE_ACTION)
