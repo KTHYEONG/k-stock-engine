@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import math
 import zoneinfo
+from bisect import bisect_left
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import polars as pl
 
@@ -167,6 +168,27 @@ def build_historical_universe(
     # Precompute calendar index for decision_session
     hi_idx = calendar.sessions.index(decision_session)
     window = policy.liquidity_window_sessions
+    calendar_dates = tuple(cast(date, _session_date(item)) for item in calendar.sessions)
+    expected_sessions = (
+        calendar.sessions[hi_idx - window + 1 : hi_idx + 1]
+        if hi_idx - window + 1 >= 0
+        else ()
+    )
+    date_to_expected = {
+        _session_date(item): item for item in expected_sessions if _session_date(item) is not None
+    }
+
+    ca_excluded: frozenset[str] = frozenset()
+    if corporate_actions is not None and not corporate_actions.is_empty():
+        from src.data.gold import exclude_sentinel_corporate_actions
+
+        decision_date = decision_session.astimezone(KRX_TZ).date()
+        ca_excluded = exclude_sentinel_corporate_actions(
+            corporate_actions,
+            frozenset(sorted_ids),
+            window_start=decision_date,
+            window_end=decision_date,
+        )
 
     decisions: list[UniverseDecision] = []
     seen: set[str] = set()
@@ -259,19 +281,7 @@ def build_historical_universe(
                             if ExclusionReason.INSUFFICIENT_LISTING_AGE not in reasons:
                                 reasons.append(ExclusionReason.INSUFFICIENT_LISTING_AGE)
                     else:
-                        lo = None
-                        for idx, s in enumerate(calendar.sessions):
-                            try:
-                                s_d = _session_date(s)
-                                if ld_d is not None and s_d is not None:
-                                    if s_d >= ld_d:
-                                        lo = idx
-                                        break
-                                elif s >= listing_date:
-                                    lo = idx
-                                    break
-                            except TypeError:
-                                continue
+                        lo = bisect_left(calendar_dates, ld_d) if ld_d is not None else None
                         if lo is None or lo > hi_idx:  # noqa: SIM108
                             listing_age = 0
                         else:
@@ -302,10 +312,6 @@ def build_historical_universe(
             reasons.append(ExclusionReason.INSUFFICIENT_LIQUIDITY_HISTORY)
             median_val = None
         else:
-            expected_sessions = calendar.sessions[hi_idx - window + 1 : hi_idx + 1]
-            date_to_expected = {
-                _session_date(s): s for s in expected_sessions if _session_date(s) is not None
-            }
             # Build session -> values for this instrument
             daily_rows = daily_by_instrument.get(instrument_id, [])
             # Map expected session to list
@@ -354,16 +360,8 @@ def build_historical_universe(
                     reasons.append(ExclusionReason.LIQUIDITY_BELOW_THRESHOLD)
 
         # Corporate action check if corporate_actions table is provided
-        if corporate_actions is not None and not corporate_actions.is_empty():
-            from src.data.gold import exclude_sentinel_corporate_actions
-            ca_excluded = exclude_sentinel_corporate_actions(
-                corporate_actions,
-                frozenset([instrument_id]),
-                window_start=decision_session.astimezone(KRX_TZ).date(),
-                window_end=decision_session.astimezone(KRX_TZ).date(),
-            )
-            if instrument_id in ca_excluded:
-                reasons.append(ExclusionReason.NO_VALID_CORPORATE_ACTION)
+        if instrument_id in ca_excluded:
+            reasons.append(ExclusionReason.NO_VALID_CORPORATE_ACTION)
 
         # Deduplicate and sort reasons for stability
         unique_reasons = sorted(set(reasons), key=lambda r: r.value)
@@ -460,7 +458,15 @@ def materialize_historical_universe(
             }
         )
 
-    frame = pl.DataFrame(rows)
+    # Explicit nullable numeric types avoid Polars inferring Null from the
+    # first batch when early sessions have no listing/liquidity history.
+    frame = pl.DataFrame(
+        rows,
+        schema_overrides={
+            "listing_age_sessions": pl.Int64,
+            "median_trading_value_60": pl.Float64,
+        },
+    )
     # Ensure types: decision_session datetime, generated_at datetime
     ordered_columns = [
         "decision_session",

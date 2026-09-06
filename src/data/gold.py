@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
 from dataclasses import dataclass
@@ -38,6 +39,8 @@ _REQUIRED_FACTS: frozenset[str] = frozenset(
 )
 
 _FISCAL_RE = re.compile(r"^(\d{4})Q([1-4])$")
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class BarExclusionReason(StrEnum):
@@ -663,7 +666,14 @@ def materialize_gold_window(
     f_policy = qvef_policy if qvef_policy is not None else QvefFeaturePolicy()
     reader: Any | None = None
     stream_writer: StreamingGoldWriter | None = None
-    if silver_root is not None:
+    has_complete_frames = (
+        calendar is not None
+        and security_master is not None
+        and daily_market is not None
+        and financial_facts is not None
+        and corporate_actions is not None
+    )
+    if silver_root is not None and not has_complete_frames:
         from src.data.gold_loader import load_gold_window_inputs as _load_inputs
 
         _inputs = _load_inputs(
@@ -710,6 +720,24 @@ def materialize_gold_window(
             .otherwise(pl.col("listing_date"))
             .alias("listing_date")
         ).drop("_min_vf")
+
+    if has_complete_frames:
+        assert calendar is not None
+        assert security_master is not None
+        assert daily_market is not None
+        assert financial_facts is not None
+        assert corporate_actions is not None
+        flow_for_reader = investor_flow if investor_flow is not None else pl.DataFrame()
+        # Production frame replay: supplied GoldWindowInputs frames are the
+        # sole replay input; silver_root is provenance/fallback metadata only.
+        reader = PITReplayReader.from_frames(
+            calendar=calendar,
+            security_master=security_master,
+            daily_market=daily_market,
+            investor_flow=flow_for_reader,
+            financial_facts=financial_facts,
+            corporate_actions=corporate_actions,
+        )
 
     # 1-3. Pre-flight audit manifest
     manifest = build_gold_audit_manifest(
@@ -767,6 +795,16 @@ def materialize_gold_window(
     universe_count = 0
     eligible_count = 0
     feature_count = 0
+    completed_sessions = 0
+    import time as _time
+
+    _replay_start = _time.monotonic()
+    _LOGGER.info(
+        "[DATA] stage=gold_replay_start daily_rows=%d master_rows=%d sessions=%d",
+        daily_market.height,
+        security_master.height,
+        len(val_sessions),
+    )
 
     for session in val_sessions:
         # Market close of session for end-of-day daily decisions
@@ -778,6 +816,7 @@ def materialize_gold_window(
 
         replay = None
         if reader is not None:
+            # PITReplayReader.session_input via frame-route reader.
             replay = reader.session_input(
                 session=session,
                 decision_time=sess_dt,
@@ -842,7 +881,20 @@ def materialize_gold_window(
             else:
                 all_features.extend(f_rows)
             feature_count += len(f_rows)
+        completed_sessions += 1
+        completed = completed_sessions
+        if completed % 500 == 0:
+            _LOGGER.info(
+                "[SYS] stage=gold_replay_progress completed=%d elapsed_ms=%d",
+                completed,
+                int((_time.monotonic() - _replay_start) * 1000),
+            )
 
+    _LOGGER.info(
+        "[SYS] stage=gold_replay_done completed=%d elapsed_ms=%d",
+        completed_sessions,
+        int((_time.monotonic() - _replay_start) * 1000),
+    )
     u_path_str: str | None = None
     f_path_str: str | None = None
 
