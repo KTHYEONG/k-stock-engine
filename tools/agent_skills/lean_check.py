@@ -1084,9 +1084,17 @@ def main() -> None:
         with contextlib.suppress(OSError):
             os.remove(cov_json_path)
         # pytest-cov's --cov silently collects nothing for a bare file path
-        # (coverage.py resolves it as a source, not a measured module) --
-        # the dotted module form is what actually attaches instrumentation.
-        cov_modules = [f[:-3].replace("/", ".") for f in src_files]
+        # (coverage.py resolves it as a source, not a measured module).  A
+        # leaf module source can import its package while coverage initializes,
+        # which double-loads extension modules under pytest importlib mode.
+        # Measure the immediate package instead; the JSON gate below still
+        # checks only added lines in the requested source files.
+        cov_modules = sorted(
+            {
+                module.rpartition(".")[0] or module
+                for module in (f[:-3].replace("/", ".") for f in src_files)
+            }
+        )
         cov_args = [
             *[f"--cov={m}" for m in cov_modules],
             f"--cov-report=json:{cov_json_path}",
