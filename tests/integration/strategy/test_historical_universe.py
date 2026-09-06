@@ -58,6 +58,7 @@ def test_materialize_historical_universe_writes_immutable_reason_coded_gold_data
     decision_time = datetime(2024, 1, 3, tzinfo=UTC)
     policy = UniversePolicy()
     decisions = (
+        UniverseDecision(decision_time, 'KRX:EARLY_NULL', False, (ExclusionReason.INSUFFICIENT_LISTING_AGE,), None, None),
         UniverseDecision(decision_time, 'KRX:ELIGIBLE', True, (), 252, 2_000_000_000.0),
         UniverseDecision(decision_time, 'KRX:EXCLUDED', False, (ExclusionReason.FINANCIAL_SECTOR,), 252, 3_000_000_000.0),
     )

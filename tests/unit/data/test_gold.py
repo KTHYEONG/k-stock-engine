@@ -646,3 +646,24 @@ def test_gold_availability_guard_rejects_naive_and_invalid_timestamp_columns() -
             frame=pl.DataFrame({'available_at': ['not-a-time']}),
             final_decision_time=datetime(2016, 1, 1, tzinfo=KRX_TZ),
         )
+
+
+def test_materialize_gold_window_uses_supplied_frames_with_silver_provenance(tmp_path, monkeypatch) -> None:
+    from datetime import UTC, date, datetime, timedelta
+    import polars as pl
+    import src.data.gold as module
+    from src.core.time import SessionCalendar
+    from src.data.replay import PITReplayReader
+
+    sessions = tuple(datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=index) for index in range(501))
+    frames = {'calendar': SessionCalendar(sessions), 'security_master': pl.DataFrame(), 'daily_market': pl.DataFrame(), 'financial_facts': pl.DataFrame(), 'corporate_actions': pl.DataFrame(), 'investor_flow': pl.DataFrame()}
+    called = []
+    monkeypatch.setattr(PITReplayReader, 'from_silver_root', classmethod(lambda cls, **_kwargs: (_ for _ in ()).throw(AssertionError('root replay must not run'))))
+    monkeypatch.setattr(PITReplayReader, 'from_frames', classmethod(lambda cls, **kwargs: called.append(kwargs) or PITReplayReader.from_frames_for_test(**kwargs)))
+    monkeypatch.setattr(module, 'build_gold_audit_manifest', lambda **_kwargs: type('Manifest', (), {'manifest_hash': 'a' * 64})())
+    monkeypatch.setattr(module, 'write_gold_audit_artifact', lambda *_args, **_kwargs: None)
+
+    report = module.materialize_gold_window(**frames, validation_start=date(2024, 1, 1), validation_end=sessions[-1].date(), decision_time=sessions[-1], artifact_root=tmp_path, silver_root=tmp_path / 'silver')
+
+    assert len(called) == 1
+    assert report.universe_decisions_count == 0
