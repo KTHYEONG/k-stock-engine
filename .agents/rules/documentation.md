@@ -10,7 +10,7 @@ priority: 8
 ## 1. Core Principles
 1. **Explain "Why", Not "What":** Omit obvious code behavior comments. Explain only business context, mathematical rationale, domain constraints, or non-obvious optimizations.
 2. **Token & Patch Efficiency:** Keep comments to a single line (max 2 lines). Explain only immediate domain invariants or mathematical reasons. Avoid verbose multi-line explanations or storytelling.
-3. **No Ephemeral Spec References:** NEVER reference temporary `docs/specs/*.md` or `contract.json` paths in code, docstrings, CLI help texts, or comments. Specs are ephemeral working files — `.md` scratch files are purged and `contract.json` is relocated to `docs/decisions/archive/<task_id>/` during the sync phase, so any path reference goes stale. If external reference is necessary, use persistent `ADR-XXXX` identifiers or self-contained domain rationale.
+3. **No Ephemeral Spec References:** NEVER reference temporary `docs/specs/*.md` or `contract.json` paths in code, docstrings, CLI help texts, or comments. Specs are ephemeral working files — `.md` scratch files and `contract.json` are purged during the sync phase, so any path reference goes stale. If external reference is necessary, use persistent `ADR-XXXX` identifiers or self-contained domain rationale.
 4. **Language Policy:**
    - **Docstrings & External Docs:** English only (maintains compatibility with standard Python IDE tools and global conventions).
    - **In-line Comments (`#`):** Korean preferred (ensures fast intuition and readability for Korean maintainers).
