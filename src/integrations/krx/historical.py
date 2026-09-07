@@ -126,17 +126,6 @@ class KrxHistoricalCollector:
             pages.append({"records": records, "session": current.isoformat()})
         return tuple(pages)
 
-    def fetch_status_and_actions(self, start: date, end: date) -> Iterable[dict[str, Any]]:
+    def fetch_corporate_actions(self, start: date, end: date) -> Iterable[dict[str, Any]]:
         self._check_range(start, end)
-        if self._client is None:
-            raise PITDataError("KRX status-and-actions endpoint is not configured")
-        pages: list[dict[str, Any]] = []
-        current = start
-        while current <= end:
-            records = self._client.fetch_master_records(current)
-            actions = [r for r in records if isinstance(r, dict) and (r.get("action_id") or r.get("status") or r.get("halt"))]
-            if not actions:
-                raise PITDataError(f"KRX status-and-actions response is empty for {current}; refusing to invent empty actions")
-            pages.append({"records": actions, "session": current.isoformat()})
-            current = date.fromordinal(current.toordinal() + 1)
-        return tuple(pages)
+        raise PITDataError("KRX corporate-action endpoint is not configured")

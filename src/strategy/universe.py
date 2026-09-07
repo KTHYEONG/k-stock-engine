@@ -44,6 +44,7 @@ class ExclusionReason(StrEnum):
     MISSING_SECTOR = "missing_sector"
     NO_VALID_CORPORATE_ACTION = "no_valid_corporate_action"
     NON_COMMON_SHARE_CLASS = "non_common_share_class"
+    NON_TRADABLE_BAR = "non_tradable_bar"
     NOT_LISTED = "not_listed"
 
 
@@ -312,7 +313,6 @@ def build_historical_universe(
             reasons.append(ExclusionReason.INSUFFICIENT_LIQUIDITY_HISTORY)
             median_val = None
         else:
-            # Build session -> values for this instrument
             daily_rows = daily_by_instrument.get(instrument_id, [])
             # Map expected session to list
             sess_to_vals: dict[datetime, list[float]] = {s: [] for s in expected_sessions}
@@ -322,17 +322,13 @@ def build_historical_universe(
                 can_sess = date_to_expected.get(_session_date(sess)) if sess is not None else None
                 if can_sess is None:
                     continue
-                tv = r.get("trading_value")
                 try:
-                    if tv is None or (isinstance(tv, float) and (math.isnan(tv) or math.isinf(tv))):
-                        invalid_liquidity = True
-                        break
-                    tv_f = float(tv)
+                    tv_f = float(r["trading_value"])
                     if not math.isfinite(tv_f) or tv_f < 0:
                         invalid_liquidity = True
                         break
                     sess_to_vals[can_sess].append(tv_f)
-                except Exception:
+                except (KeyError, TypeError, ValueError):
                     invalid_liquidity = True
                     break
 
@@ -346,6 +342,8 @@ def build_historical_universe(
                     values.append(lst[0])
 
             if invalid_liquidity or len(values) != window:
+                if invalid_liquidity:
+                    reasons.append(ExclusionReason.NON_TRADABLE_BAR)
                 if ExclusionReason.INSUFFICIENT_LIQUIDITY_HISTORY not in reasons:
                     reasons.append(ExclusionReason.INSUFFICIENT_LIQUIDITY_HISTORY)
                 median_val = None
@@ -358,6 +356,22 @@ def build_historical_universe(
                     median_val = (float(sorted_vals[n // 2 - 1]) + float(sorted_vals[n // 2])) / 2.0
                 if median_val < policy.minimum_median_trading_value_krw:
                     reasons.append(ExclusionReason.LIQUIDITY_BELOW_THRESHOLD)
+
+            decision_market_rows = [
+                row for row in daily_rows
+                if _session_date(row.get("session")) == _session_date(decision_session)
+            ]
+            try:
+                fill_values = tuple(
+                    float(decision_market_rows[0][field])
+                    for field in ("open", "close", "volume", "trading_value")
+                )
+                if len(decision_market_rows) != 1 or not all(
+                    math.isfinite(value) and value > 0 for value in fill_values
+                ):
+                    reasons.append(ExclusionReason.NON_TRADABLE_BAR)
+            except (IndexError, KeyError, TypeError, ValueError):
+                reasons.append(ExclusionReason.NON_TRADABLE_BAR)
 
         # Corporate action check if corporate_actions table is provided
         if instrument_id in ca_excluded:

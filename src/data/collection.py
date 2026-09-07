@@ -162,7 +162,7 @@ class KrxHistoricalDataPort(Protocol):
     def fetch_daily_market(self, start: date, end: date, *, sessions: Iterable[date] | None = None) -> Iterable[RawProviderResponse]: ...
     def fetch_investor_flow(self, start: date, end: date) -> Iterable[RawProviderResponse]: ...
     def fetch_master_lineage(self, start: date, end: date, *, sessions: Iterable[date] | None = None) -> Iterable[RawProviderResponse]: ...
-    def fetch_status_and_actions(self, start: date, end: date) -> Iterable[RawProviderResponse]: ...
+    def fetch_corporate_actions(self, start: date, end: date) -> Iterable[RawProviderResponse]: ...
 
 
 class DartFinancialFactsPort(Protocol):
@@ -765,7 +765,7 @@ def collect_champion_evidence(
     daily_pages = _collect_pages(krx.fetch_daily_market, request.coverage_start, request.coverage_end, kind_name="KRX daily market")
     flow_pages = _collect_pages(krx.fetch_investor_flow, request.coverage_start, request.coverage_end, kind_name="KRX investor flow")
     master_pages = _collect_pages(krx.fetch_master_lineage, request.coverage_start, request.coverage_end, kind_name="KRX master lineage")
-    action_pages = _collect_pages(krx.fetch_status_and_actions, request.coverage_start, request.coverage_end, kind_name="KRX status and actions")
+    action_pages = _collect_pages(krx.fetch_corporate_actions, request.coverage_start, request.coverage_end, kind_name="KRX corporate actions")
     disclosure_pages = _collect_pages(dart.fetch_disclosures, request.coverage_start, request.coverage_end, kind_name="DART disclosures")
     import re as _re
 
