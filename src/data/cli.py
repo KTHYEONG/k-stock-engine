@@ -121,6 +121,7 @@ def _parse_args() -> argparse.Namespace:
     p_run.add_argument("--validation-start", type=str, default="2016-01-04")
     p_run.add_argument("--validation-end", type=str, default="2016-12-30")
     p_run.add_argument("--smoke-symbol", type=str, default=None)
+    p_run.add_argument("--gold-dataset-id", type=str, default=None)
     p_run.add_argument("--initial-cash", type=float, default=100000000.0)
     p_run.add_argument("--scenario", type=str, default="base")
     p_run.add_argument("--ledger-id", type=str, default="champion-2016")
@@ -248,6 +249,22 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     val_start = date.fromisoformat(str(getattr(args, "validation_start", "2016-01-04")))
     val_end = date.fromisoformat(str(getattr(args, "validation_end", "2016-12-30")))
     smoke_symbol = getattr(args, "smoke_symbol", None)
+    gold_dataset_id = getattr(args, "gold_dataset_id", None)
+
+    if not smoke_symbol:
+        _gid = str(gold_dataset_id) if gold_dataset_id is not None else ""
+        if not _gid.strip() or "/" in _gid or "\\" in _gid or ".." in _gid:
+            raise PITDataError("run-backtest requires resolved Gold artifact; missing --gold-dataset-id")
+        from src.data.gold_artifacts import load_gold_artifact_frames, resolve_gold_artifact_bundle
+
+        gold_decision_time = datetime(val_end.year, val_end.month, val_end.day, 23, 59, 59, tzinfo=UTC)
+        bundle = resolve_gold_artifact_bundle(
+            gold_root=gold_root,
+            dataset_id=_gid,
+            decision_time=gold_decision_time,
+        )
+        load_gold_artifact_frames(bundle=bundle, decision_time=gold_decision_time)
+        raise PITDataError("session-driven Champion strategy is not wired")
 
     if not smoke_symbol and (not gold_root.exists() or not (gold_root / "universe").exists()):
         raise PITDataError("run-backtest requires resolved Gold artifact, session repository, config, and strategy")

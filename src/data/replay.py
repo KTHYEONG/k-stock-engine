@@ -51,6 +51,35 @@ def _require_aware(value: datetime, name: str) -> None:
         raise PITDataError(f"{name} must be timezone-aware")
 
 
+def resolve_latest_master_snapshot(
+    master: pl.DataFrame, *, session: datetime, decision_time: datetime
+) -> pl.DataFrame:
+    _require_aware(session, "session")
+    _require_aware(decision_time, "decision_time")
+    pit = _pit_available(master, decision_time)
+    rows: list[dict[str, object]] = []
+    for r in pit.to_dicts():
+        try:
+            vf = r.get("valid_from")
+            vt = r.get("valid_to")
+            if vf is None or not (vf <= session) or (vt is not None and not (session <= vt)):
+                continue
+        except TypeError:
+            continue
+        rows.append(r)
+    by_id: dict[str, list[dict[str, object]]] = {}
+    for r in rows:
+        by_id.setdefault(str(r.get("instrument_id")), []).append(r)
+    latest: list[dict[str, object]] = []
+    for group in by_id.values():
+        top = max(str(r.get("valid_from")) for r in group)
+        cands = [r for r in group if str(r.get("valid_from")) == top]
+        latest.append(cands[0])
+    if not latest:
+        return pit.clear()
+    return pl.DataFrame(latest)
+
+
 def _as_float64(frame: pl.DataFrame) -> pl.DataFrame:
     present = [c for c in _FLOAT64_COLUMNS if c in frame.columns]
     if not present:
@@ -283,18 +312,7 @@ class PITReplayReader:
 
         master_pit = _pit_available(master_src, decision_time)
         if not master_pit.is_empty() and "valid_from" in master_pit.columns:
-            kept_rows: list[dict[str, object]] = []
-            for row in master_pit.to_dicts():
-                vf = row.get("valid_from")
-                vt = row.get("valid_to")
-                if vf is None:
-                    continue
-                try:
-                    if vf <= session and (vt is None or session <= vt):
-                        kept_rows.append(row)
-                except TypeError:
-                    continue
-            master_slice = pl.DataFrame(kept_rows) if kept_rows else master_pit.clear()
+            master_slice = resolve_latest_master_snapshot(master_pit, session=session, decision_time=decision_time)
         else:
             master_slice = master_pit
 

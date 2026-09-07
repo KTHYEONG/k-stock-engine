@@ -1,6 +1,7 @@
 """PIT backtest session builder from certified Silver snapshots."""
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any
@@ -87,15 +88,13 @@ def build_backtest_sessions(
             iid = str(row["instrument_id"])
             raw_open = float(row["open"])
             raw_close = float(row["close"])
-            tv = row.get("trading_value", 1_000_000.0)
             try:
-                adtv = float(tv) if tv is not None else 1_000_000.0
-            except (TypeError, ValueError):
-                adtv = 1_000_000.0
-            if adtv <= 0:
-                raise PITDataError(f"missing/non-positive adtv for {iid}")
-            if raw_open <= 0 or raw_close <= 0:
-                raise PITDataError(f"missing/non-positive raw open/close for {iid}")
+                volume = float(row["volume"])
+                adtv = float(row["trading_value"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise PITDataError(f"missing execution fields for {iid}") from exc
+            if not all(math.isfinite(value) and value > 0 for value in (raw_open, raw_close, volume, adtv)):
+                raise PITDataError(f"non-positive execution bar for {iid}")
             bars.append(HistoricalBar(session_open, iid, raw_open, raw_close, adtv, 0.02))
         if not bars:
             raise PITDataError(f"missing bar for decision session {session_open}")
