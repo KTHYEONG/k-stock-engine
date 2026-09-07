@@ -235,6 +235,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     from src.data.backtest_runner import run_managed_backtest
     from src.data.backtest_sessions import build_backtest_sessions
     from src.data.schemas import PITDataError, SilverTable
+    from src.data.silver import latest_silver_dataset_path
     from src.data.snapshot import PITSnapshotRepository
     from src.engine.backtest import BacktestConfig
     from src.engine.decision import DecisionContext
@@ -273,17 +274,42 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     next_session = cal_sessions[end_idx + 1]
 
     # Load market bars
-    dm_root = silver_root / SilverTable.DAILY_MARKET.value
+    dm_root = latest_silver_dataset_path(
+        root=silver_root,
+        table=SilverTable.DAILY_MARKET,
+        decision_time=datetime.now(UTC),
+    )
     parquet_files = list(dm_root.rglob("*.parquet"))
     if not parquet_files:
         raise PITDataError("missing daily market parquet files")
 
-    query = (
-        pl.scan_parquet(parquet_files)
+    # Silver partitions may carry legacy ``available_at`` timezone metadata.
+    # Select only the columns consumed by the backtest before concatenating so
+    # that an unused metadata column cannot make the lazy scan fail schema
+    # resolution (UTC vs Asia/Seoul).
+    market_columns = [
+        "session",
+        "instrument_id",
+        "open",
+        "close",
+        "trading_value",
+    ]
+    scans = [
+        pl.scan_parquet(path)
+        .select(market_columns)
         .filter((pl.col("session") >= start_session) & (pl.col("session") <= next_session))
-    )
+        for path in parquet_files
+    ]
+    query = pl.concat(scans, how="vertical_relaxed")
     if smoke_symbol:
         query = query.filter(pl.col("instrument_id") == smoke_symbol)
+    # Zero-value/zero-price rows are non-tradable placeholders (for example,
+    # suspended or not-yet-listed instruments) and cannot produce a valid fill.
+    query = query.filter(
+        (pl.col("trading_value") > 0)
+        & (pl.col("open") > 0)
+        & (pl.col("close") > 0)
+    )
     daily_market = query.collect()
     if daily_market.height == 0:
         raise PITDataError("no daily market data in range")
