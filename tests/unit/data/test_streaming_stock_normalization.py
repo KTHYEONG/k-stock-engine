@@ -397,3 +397,20 @@ def test_corporate_action_interval_parser_rejects_truncation_and_unbounded_recor
     monkeypatch.setattr(module, '_MAX_CORPORATE_ACTION_RECORD_BYTES', 20)
     with pytest.raises(PITDataError, match='bounded parser buffer'):
         list(module._stream_corporate_action_intervals((receipt_for('large.json', '{"intervals": [{"instrument_id": "KRX:000001"}]}'),)))
+
+
+def test_canonical_master_row_preserves_provider_listing_date_and_unknown_status() -> None:
+    from datetime import UTC, datetime
+
+    from src.data.streaming_normalization import _canonical_master_row
+
+    row = _canonical_master_row(
+        {'ticker': '005930', 'market': 'KOSPI', 'listing_date': '1975-06-11'},
+        available_at=datetime(2016, 1, 4, tzinfo=UTC),
+        source_hash='a' * 64,
+        fallback_session=datetime(2016, 1, 4, tzinfo=UTC),
+    )
+
+    assert row['listing_date'].date().isoformat() == '1975-06-11'
+    assert row['valid_from'] == datetime(2016, 1, 4, tzinfo=UTC)
+    assert row['status'] == '__UNKNOWN__'

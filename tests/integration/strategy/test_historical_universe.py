@@ -27,6 +27,9 @@ def test_build_historical_universe_preserves_delisted_historical_membership_with
         'session': list(sessions[-61:]),
         'instrument_id': ['KRX:DELISTED'] * 61,
         'trading_value': [3_000_000_000.0] * 61,
+        'open': [100.0] * 61,
+        'close': [100.0] * 61,
+        'volume': [1_000.0] * 61,
         'available_at': list(sessions[-61:]),
     })
 

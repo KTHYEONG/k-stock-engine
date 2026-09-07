@@ -139,6 +139,40 @@ def test_refresh_publishes_new_facts_and_returns_artifact(tmp_path) -> None:
     assert published.item(0, "filing_id") == "F1"
 
 
+def test_refresh_uses_retained_dart_ticker_bridge(tmp_path) -> None:
+    from datetime import UTC, datetime
+    import hashlib
+    import json
+
+    import polars as pl
+
+    from src.data.incremental_normalization import refresh_dart_financial_facts
+
+    decision_time = datetime(2016, 12, 30, tzinfo=UTC)
+    _write_fact_receipt(tmp_path / "bronze", "ok", _FACT_PAGE)
+    _write_reference_silver(tmp_path / "silver", decision_time)
+    payload = json.dumps(
+        [{"corp_code": "00126380", "ticker": "005930"}],
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    bridge_path = tmp_path / "bronze" / "dart_corp_codes" / digest / "payload.json"
+    bridge_path.parent.mkdir(parents=True)
+    bridge_path.write_text(payload, encoding="utf-8")
+
+    artifact = refresh_dart_financial_facts(
+        bronze_root=tmp_path / "bronze",
+        silver_root=tmp_path / "silver",
+        artifact_root=tmp_path / "artifacts",
+        decision_time=decision_time,
+    )
+
+    published = pl.read_parquet(
+        tmp_path / "silver" / "financial_facts" / artifact.output_hash / "partitions"
+    )
+    assert published.item(0, "mapping_version").endswith(f"+bridge:{digest}")
+
+
 def test_refresh_is_idempotent_for_same_receipts(tmp_path) -> None:
     from datetime import UTC, datetime
 
@@ -525,3 +559,47 @@ def test_merge_replaces_unbridged_legacy_rows_for_refreshed_filings() -> None:
     }]).with_columns(pl.col("available_at").str.to_datetime(time_zone="UTC"))
     merged = _merge_fact_frames(existing, refreshed)
     assert merged.select("company_id").to_series().to_list() == ["005930"]
+
+
+def test_refresh_dart_facts_rejects_future_or_missing_frozen_bridge(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    import pytest
+
+    from src.data.incremental_normalization import load_frozen_dart_ticker_bridge
+    from src.data.schemas import PITDataError
+
+    with pytest.raises(PITDataError, match='ticker bridge'):
+        load_frozen_dart_ticker_bridge(
+            bronze_root=tmp_path,
+            decision_time=datetime(2016, 12, 30, tzinfo=UTC),
+        )
+
+
+def test_load_frozen_dart_ticker_bridge_returns_retained_receipt_mapping(tmp_path) -> None:
+    from datetime import UTC, datetime
+    import hashlib
+    import json
+
+    from src.data.incremental_normalization import load_frozen_dart_ticker_bridge
+
+    payload = json.dumps(
+        [
+            {'corp_code': '00126380', 'ticker': '005930'},
+            {'corp_code': '00266961', 'ticker': '000660'},
+        ],
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    receipt_hash = hashlib.sha256(payload.encode('utf-8')).hexdigest()
+    payload_path = tmp_path / 'dart_corp_codes' / receipt_hash / 'payload.json'
+    payload_path.parent.mkdir(parents=True)
+    payload_path.write_text(payload, encoding='utf-8')
+
+    mapping, actual_hash = load_frozen_dart_ticker_bridge(
+        bronze_root=tmp_path,
+        decision_time=datetime(2016, 12, 30, tzinfo=UTC),
+    )
+
+    assert mapping == {'00126380': '005930', '00266961': '000660'}
+    assert actual_hash == receipt_hash
