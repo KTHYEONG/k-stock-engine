@@ -1,6 +1,26 @@
 {
   "tasks": [
     {
+      "task_id": "equity_universe_data_reassessment",
+      "date": "2026-09-07",
+      "adr_id": "ADR_20260907_equity_universe_data_reassessment",
+      "domain": "equity",
+      "title": "Remove hard-to-collect market status verification",
+      "why": "KRX trading-halt, management-issue, and investment-caution status evidence is difficult to collect reliably and was unjustly acting as a certification gate.",
+      "resolution": "Removed market-status collection and validation paths and replaced status gating with positive execution-bar validation for price, volume, and trading value.",
+      "impact": "Historical universe selection no longer depends on unavailable status feeds while actual buy/sell bars reject non-positive or non-finite execution fields."
+    },
+    {
+      "task_id": "TASK_EQUITY_UNIVERSE_DATA_REASSESSMENT",
+      "date": "2026-09-07",
+      "adr_id": "ADR_20260907_EQUITY_UNIVERSE_DATA_REASSESSMENT",
+      "domain": "equity",
+      "title": "Equity universe data reassessment",
+      "why": "2016 results mixed Gold periods and lost DART/master/status provenance.",
+      "resolution": "Bound Gold execution to one manifest set, preserve master listing dates, wire DART identity bridges, and fail closed without official status evidence.",
+      "impact": "Prevents look-ahead and false eligibility while requiring a future KRX/KIND status pilot before certified Gold materialization."
+    },
+    {
       "task_id": "krx_daily_market_backfill_completion",
       "date": "2026-09-07",
       "adr_id": "ADR_20260907_krx_daily_market_backfill_completion",
