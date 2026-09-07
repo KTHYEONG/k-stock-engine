@@ -71,6 +71,9 @@
   "src/data/gold.py": {
     "testing": "tests/unit/data/test_gold.py"
   },
+  "src/data/gold_artifacts.py": {
+    "testing": "tests/unit/data/test_gold_artifacts.py"
+  },
   "src/data/gold_loader.py": {
     "testing": "tests/unit/data/test_gold_loader.py"
   },
@@ -108,6 +111,7 @@
       "tests/unit/data/test_cli.py",
       "tests/unit/data/test_collection_readiness.py",
       "tests/unit/data/test_gold.py",
+      "tests/unit/data/test_gold_artifacts.py",
       "tests/unit/data/test_gold_loader.py",
       "tests/unit/data/test_historical_data_pipeline.py",
       "tests/unit/data/test_incremental_normalization.py",
