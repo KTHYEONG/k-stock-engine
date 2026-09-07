@@ -18,8 +18,7 @@
       "title": "API quota efficiency and fixture stability",
       "why": "Provider quota exhaustion and mixed historical fixture schemas blocked reliable collection and verification.",
       "resolution": "Wired durable KRX quota state through production CLI paths, reused verified KIS Bronze pages by earliest cursor, and normalized test fixture timezone and PIT manifest timestamps.",
-      "impact": "All 429 tests and the full 429-test suite now pass while quota-blocked retries and fixture PIT checks remain fail-closed.",
-      "archive_path": "docs/decisions/archive/api_quota_efficiency/api_quota_efficiency_contract.json"
+      "impact": "All 429 tests and the full 429-test suite now pass while quota-blocked retries and fixture PIT checks remain fail-closed."
     },
     {
       "task_id": "gold_replay_universe_hotpath",
@@ -29,8 +28,7 @@
       "title": "Gold replay universe hot-path optimization",
       "why": "Per-session corporate-action scans and linear listing-age searches dominated historical Gold replay runtime.",
       "resolution": "Hoisted corporate-action exclusion to session scope, indexed calendar lookups with bisect, and fixed nullable universe materialization schemas.",
-      "impact": "Full 2497-session replay completed and Gold universe publication is deterministic without changing PIT eligibility semantics.",
-      "archive_path": "docs/decisions/archive/gold_replay_universe_hotpath/gold_replay_universe_hotpath_contract.json"
+      "impact": "Full 2497-session replay completed and Gold universe publication is deterministic without changing PIT eligibility semantics."
     },
     {
       "task_id": "gold_replay_frame_performance",
@@ -40,8 +38,7 @@
       "title": "Gold replay frame reuse and session indexing",
       "why": "Gold replay rescanned large Silver history per session even after validated GoldWindowInputs frames were loaded.",
       "resolution": "Routed complete frame inputs through indexed PIT replay and isolated writer staging while preserving full-range semantics and fail-closed publication.",
-      "impact": "Replay avoids repeated market and flow scans, stale staging cannot mix into a new run, and Gold remains unpublished until all requested sessions complete.",
-      "archive_path": "docs/decisions/archive/gold_replay_frame_performance/gold_replay_frame_performance_contract.json"
+      "impact": "Replay avoids repeated market and flow scans, stale staging cannot mix into a new run, and Gold remains unpublished until all requested sessions complete."
     },
     {
       "task_id": "krx_enriched_pit_streaming",
@@ -61,8 +58,7 @@
       "title": "Bounded PIT replay and streaming Gold publication",
       "why": "Historical Gold replay repeatedly converted 5.8M daily and 6.0M master rows and accumulated outputs, causing WSL memory pressure.",
       "resolution": "Added lazy predicate-pushed PIT session slices, eligible-company fact filtering, staging-backed Gold writes, and fail-closed completion checks while preserving the full replay range.",
-      "impact": "Gold processing no longer reconstructs unrelated Bronze aggregates or repeats unbounded source conversion, and the contract audit passes with full diff coverage.",
-      "archive_path": "docs/decisions/archive/historical_gold_bounded_replay/corporate_action_streaming_memory_contract.json"
+      "impact": "Gold processing no longer reconstructs unrelated Bronze aggregates or repeats unbounded source conversion, and the contract audit passes with full diff coverage."
     },
     {
       "task_id": "gold_window_partition_loading",
@@ -72,8 +68,7 @@
       "title": "Gold bounded window loading and PIT artifact generation",
       "why": "Historical Gold execution was blocked by inefficient full reads, timezone boundary mismatches, and identifier joins.",
       "resolution": "Implemented bounded certified Silver loading, timezone-aware session bounds, DART ticker bridge normalization, master snapshot compaction, and idempotent Gold artifact publication.",
-      "impact": "Gold audit now completes with 1,774 bar-eligible and 1,298 DART-eligible entities, while corporate-action evidence remains the explicit blocker for non-empty features.",
-      "archive_path": "docs/decisions/archive/gold_window_partition_loading/dart_historical_fact_backfill_contract.json"
+      "impact": "Gold audit now completes with 1,774 bar-eligible and 1,298 DART-eligible entities, while corporate-action evidence remains the explicit blocker for non-empty features."
     }
   ]
 }
