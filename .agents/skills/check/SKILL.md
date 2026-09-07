@@ -5,7 +5,7 @@ description: Independently audit contract compliance, typing, regressions, cover
 
 # Check Protocol
 
-Independent audit gate completing the main development loop (`spec` -> `implement` -> `check`). Performs code review, strict quality checks, and regression verification without mutating source code.
+Independent audit gate completing the main development loop (`probe` -> `spec` -> `implement` -> `check`). Performs code review, strict quality checks, and regression verification without mutating source code.
 
 ## Directives
 
@@ -36,14 +36,14 @@ Independent audit gate completing the main development loop (`spec` -> `implemen
    - **Triage and Route Failures Cleanly**:
      - **Route to `/implement`**: Defect is purely implementation execution (unrequested dead defensive branch, broken syntax, failing assertion, incomplete wiring). Command: Provide exact root cause and instruction to simplify/fix.
      - **Route to `/spec`**: Defect is architectural or missing specification (missing wiring test scenario in contract, wrong invariant, contract signature mismatch, performance budget breach). Command: Provide exact contract amendment required.
+     - **Route to `/probe`**: Defect is fundamental hypothesis invalidation, unexpected mathematical instability, or algorithmic failure under real data that requires re-experimentation before re-contracting.
 
 ## Output
 
-Do NOT add any intro, preamble, sub-bullet checks, breakdown items, or extra explanations. Print EXACTLY one line for PASS:
+Do NOT add any intro, preamble, sub-bullet checks, breakdown items, or conversational commentary.
 
-- **PASS** (Strict 1-Line ONLY, No sub-bullets or details):
+- **PASS** (Strict 1-Line ONLY):
   ✅ PASS: <Audit Target>
 
-- **FAIL** (Compact format):
-  ❌ FAIL: <Audit Target> | Root: <Cause> | Impact: <Scope> | Fix: <Action> → `/implement` or `/spec`
-
+- **FAIL** (Compact 1-2 Lines format):
+  ❌ FAIL: <Audit Target> | Root: <Cause> | Impact: <Scope> | Fix: <Action> → `/implement`, `/spec`, or `/probe`

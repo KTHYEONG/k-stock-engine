@@ -16,7 +16,7 @@
 - **Language Policy:** Respond primarily in Korean as the user is Korean. Use English ONLY for technical terminology.
 - **Question:** Direct technical analysis first, then concise answer. Include key reasoning path (2-4 lines) when complexity warrants it.
 - **Bug Fix / Triage:** State root cause first. Suggest fix that addresses root cause — minimal only when scope-limited, holistic when systemic.
-- **Feature Request:** Follow active skill flow (Spec -> Implement -> Check).
+- **Feature Request:** Follow active skill flow (Probe -> Spec -> Implement -> Check).
 - **Audit / Check Result:** Provide concise findings. PASS = 1 line. FAIL = root cause + impact + suggested fix (up to 5 lines).
 
 ## 4. Execution & Environment Rules
