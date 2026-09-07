@@ -75,3 +75,34 @@ def test_normalize_dart_facts_inherits_frozen_page_ticker_bridge() -> None:
     assert frame.select(["company_id", "dart_corp_code", "ticker"]).to_dicts() == [
         {"company_id": "005930", "dart_corp_code": "00126380", "ticker": "005930"}
     ]
+
+
+def test_normalize_dart_facts_maps_corp_code_only_record_with_frozen_bridge() -> None:
+    from datetime import UTC, datetime
+
+    from src.core.time import SessionCalendar
+    from src.data.normalization import normalize_dart_financial_facts
+
+    frame = normalize_dart_financial_facts(
+        pages=[{'records': [{
+            'company_id': '00126380',
+            'corp_code': '00126380',
+            'fiscal_period': '2015Q3',
+            'filing_id': 'F1',
+            'fact': 'sales',
+            'published_at': datetime(2015, 11, 16, tzinfo=UTC),
+            'value': 1.0,
+            'unit': 'KRW',
+        }]}],
+        disclosure_rows=(),
+        source_hash='b' * 64,
+        calendar=SessionCalendar((datetime(2015, 11, 17, tzinfo=UTC),)),
+        decision_time=datetime(2016, 1, 4, tzinfo=UTC),
+        ticker_by_corp_code={'00126380': '005930'},
+        bridge_receipt_hash='c' * 64,
+    )
+
+    assert frame.select(['company_id', 'ticker', 'dart_corp_code']).to_dicts() == [
+        {'company_id': '005930', 'ticker': '005930', 'dart_corp_code': '00126380'}
+    ]
+    assert frame.item(0, 'mapping_version').endswith('bridge:' + ('c' * 64))

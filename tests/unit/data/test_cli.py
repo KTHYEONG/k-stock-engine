@@ -45,6 +45,43 @@ def test_run_backtest_refuses_without_resolved_execution_components(tmp_path) ->
         _dispatch_backtest(Namespace(gold_root=tmp_path))
 
 
+def test_run_backtest_validates_selected_bundle_before_execution(tmp_path, monkeypatch) -> None:
+    from argparse import Namespace
+
+    import pytest
+    import src.data.gold_artifacts as gold_artifacts
+    from src.data.cli import _dispatch_backtest
+    from src.data.schemas import PITDataError
+
+    calls: list[tuple[str, str]] = []
+
+    def fake_resolve(*, gold_root, dataset_id, decision_time):
+        calls.append(("resolve", dataset_id))
+        return object()
+
+    def fake_load(*, bundle, decision_time):
+        calls.append(("load", "gold-2016"))
+        return (object(), object(), object())
+
+    monkeypatch.setattr(gold_artifacts, "resolve_gold_artifact_bundle", fake_resolve)
+    monkeypatch.setattr(gold_artifacts, "load_gold_artifact_frames", fake_load)
+
+    with pytest.raises(PITDataError, match="session-driven Champion strategy"):
+        _dispatch_backtest(
+            Namespace(
+                gold_root=tmp_path,
+                silver_root=tmp_path / "silver",
+                artifact_root=tmp_path / "artifacts",
+                validation_start="2016-01-04",
+                validation_end="2016-12-30",
+                smoke_symbol=None,
+                gold_dataset_id="gold-2016",
+            )
+        )
+
+    assert calls == [("resolve", "gold-2016"), ("load", "gold-2016")]
+
+
 def _write_cli_fact_receipt(bronze_root, payload_text) -> None:
     import hashlib
     import json
@@ -212,3 +249,42 @@ def test_cli_plan_defaults_to_kis_page_capacity(monkeypatch) -> None:
 
     monkeypatch.setattr(sys, 'argv', ['stock-data', 'plan', '--coverage-start', '2024-01-02', '--coverage-end', '2024-01-03', '--symbols', '005930'])
     assert _parse_args().chunk_size == 30
+
+
+def test_run_backtest_requires_selected_gold_dataset_id(tmp_path) -> None:
+    from argparse import Namespace
+
+    import pytest
+
+    from src.data.cli import _dispatch_backtest
+    from src.data.schemas import PITDataError
+
+    with pytest.raises(PITDataError, match='gold-dataset-id'):
+        _dispatch_backtest(
+            Namespace(
+                gold_root=tmp_path,
+                silver_root=tmp_path / 'silver',
+                artifact_root=tmp_path / 'artifacts',
+                validation_start='2016-01-04',
+                validation_end='2016-12-30',
+                smoke_symbol=None,
+                gold_dataset_id=None,
+            )
+        )
+
+
+def test_run_backtest_parser_accepts_gold_dataset_id(monkeypatch) -> None:
+    import sys
+
+    from src.data.cli import _parse_args
+
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        ['stock-data', 'run-backtest', '--gold-dataset-id', 'gold-2016-verified'],
+    )
+
+    args = _parse_args()
+
+    assert args.command == 'run-backtest'
+    assert args.gold_dataset_id == 'gold-2016-verified'
