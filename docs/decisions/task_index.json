@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "krx_daily_market_backfill_completion",
+      "date": "2026-09-07",
+      "adr_id": "ADR_20260907_krx_daily_market_backfill_completion",
+      "domain": "data",
+      "title": "KRX daily-market backfill completion",
+      "why": "KRX quota reset 이후 Bronze 수집은 완료됐지만 대용량 Silver normalization이 중단 지점으로 남아 있었습니다.",
+      "resolution": "기존 Bronze receipt에서 normalization을 재개해 2,580세션을 Silver로 반영하고 daily-market coverage gap을 0으로 검증했습니다.",
+      "impact": "Silver daily-market 6,165,860행과 2,557개 검증 세션이 완성되어 후속 Gold materialization을 진행할 수 있습니다."
+    },
+    {
       "task_id": "api_quota_efficiency",
       "date": "2026-09-06",
       "adr_id": "ADR_20260906_api_quota_efficiency",
