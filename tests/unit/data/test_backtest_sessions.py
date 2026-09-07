@@ -15,3 +15,23 @@ def test_backtest_session_builder_rejects_missing_next_open_bar(tmp_path) -> Non
 
     with pytest.raises(PITDataError, match=r'next.session.*bar'):
         build_backtest_sessions(snapshot_repository=repository, calendar=calendar, start=day, end=day, decision_time_of=lambda session: session)
+
+
+def test_backtest_session_builder_rejects_zero_volume_execution_bar(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    import polars as pl
+    import pytest
+
+    from src.core.time import SessionCalendar
+    from src.data.backtest_sessions import build_backtest_sessions
+    from src.data.schemas import PITDataError, SilverTable
+    from src.data.snapshot import PITSnapshotRepository
+
+    day = datetime(2024, 1, 2, tzinfo=UTC)
+    next_day = datetime(2024, 1, 3, tzinfo=UTC)
+    frame = pl.DataFrame({'session': [day, next_day], 'instrument_id': ['KRX:1', 'KRX:1'], 'open': [1.0, 1.0], 'high': [1.0, 1.0], 'low': [1.0, 1.0], 'close': [1.0, 1.0], 'volume': [0.0, 1.0], 'trading_value': [1.0, 1.0], 'market_cap': [1.0, 1.0], 'shares_outstanding': [1.0, 1.0], 'available_at': [day, next_day]})
+    repository = PITSnapshotRepository.from_frames({SilverTable.DAILY_MARKET: frame}, root=tmp_path)
+
+    with pytest.raises(PITDataError, match='non-positive execution bar'):
+        build_backtest_sessions(snapshot_repository=repository, calendar=SessionCalendar((day, next_day)), start=day, end=day, decision_time_of=lambda session: session)

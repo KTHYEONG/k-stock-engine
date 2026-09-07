@@ -496,3 +496,30 @@ def test_streaming_gold_writer_uses_private_staging_without_legacy_mix(tmp_path)
     assert legacy.joinpath('batch-00000.pkl').read_bytes() == b'legacy'
     assert writer._universe_batches[0].parent != legacy
     assert writer._universe_batches[0].name == 'batch-00000.pkl'
+
+
+def test_resolve_latest_master_snapshot_uses_latest_pit_row_only() -> None:
+    from datetime import UTC, datetime
+
+    import polars as pl
+
+    from src.data.replay import resolve_latest_master_snapshot
+
+    session = datetime(2016, 1, 5, tzinfo=UTC)
+    master = pl.DataFrame({
+        'instrument_id': ['KRX:005930', 'KRX:005930'],
+        'market': ['__UNKNOWN__', 'KOSPI'],
+        'valid_from': [datetime(2016, 1, 4, tzinfo=UTC), session],
+        'valid_to': [None, None],
+        'available_at': [datetime(2016, 1, 4, tzinfo=UTC), session],
+    })
+
+    actual = resolve_latest_master_snapshot(
+        master,
+        session=session,
+        decision_time=session,
+    )
+
+    assert actual.select(['instrument_id', 'market']).to_dicts() == [
+        {'instrument_id': 'KRX:005930', 'market': 'KOSPI'}
+    ]

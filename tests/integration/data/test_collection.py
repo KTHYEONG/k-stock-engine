@@ -11,7 +11,7 @@ def test_collection_rejects_missing_investor_flow_without_partial_certification(
     krx.fetch_daily_market.return_value = ({'records': [{'session': '2024-01-02'}]},)
     krx.fetch_investor_flow.return_value = ()
     krx.fetch_master_lineage.return_value = ({'records': [{'ticker': '000001'}]},)
-    krx.fetch_status_and_actions.return_value = ({'records': [{'action_id': 'none'}]},)
+    krx.fetch_corporate_actions.return_value = ({'records': [{'action_id': 'none'}]},)
     dart = Mock()
     dart.fetch_disclosures.return_value = ({'records': [{'filing_id': 'F1'}]},)
     dart.fetch_xbrl_facts.return_value = ({'records': [{'fact': 'sales'}]},)
@@ -31,7 +31,7 @@ def test_collection_artifact_keeps_each_page_receipt(tmp_path) -> None:
         def fetch_daily_market(self, start, end): return ({'records': [{'session': '2024-01-02'}]}, {'records': [{'session': '2024-01-03'}]})
         def fetch_investor_flow(self, start, end): return ({'records': [{'session': '2024-01-02'}]},)
         def fetch_master_lineage(self, start, end): return ({'records': [{'ticker': '000001'}]},)
-        def fetch_status_and_actions(self, start, end): return ({'records': [{'action_id': 'A'}]},)
+        def fetch_corporate_actions(self, start, end): return ({'records': [{'action_id': 'A'}]},)
 
     class DART:
         def fetch_disclosures(self, start, end): return ({'records': [{'filing_id': 'F1'}]},)

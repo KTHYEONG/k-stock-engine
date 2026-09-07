@@ -27,6 +27,9 @@ def test_build_historical_universe_accepts_exact_listing_and_liquidity_boundarie
         'session': list(sessions[-60:]) * 2,
         'instrument_id': ['KRX:BOUNDARY'] * 60 + ['KRX:YOUNG'] * 60,
         'trading_value': [2_000_000_000.0] * 120,
+        'open': [100.0] * 120,
+        'close': [100.0] * 120,
+        'volume': [1_000.0] * 120,
         'available_at': list(sessions[-60:]) * 2,
     })
 
@@ -67,7 +70,7 @@ def test_build_historical_universe_reason_codes_asset_status_and_liquidity_failu
         count = 59 if instrument_id == 'KRX:SHORT' else 60
         value = 1_999_999_999.0 if instrument_id == 'KRX:ILLIQUID' else 3_000_000_000.0
         for session in sessions[-count:]:
-            daily_rows.append({'session': session, 'instrument_id': instrument_id, 'trading_value': value, 'available_at': session})  # noqa: PERF401
+            daily_rows.append({'session': session, 'instrument_id': instrument_id, 'open': 100.0, 'close': 100.0, 'volume': 1_000.0, 'trading_value': value, 'available_at': session})  # noqa: PERF401
     daily = pl.DataFrame(daily_rows)
 
     decisions = build_historical_universe(
@@ -104,6 +107,9 @@ def test_build_historical_universe_missing_availability_fails_closed() -> None:
         'session': list(sessions[-60:]),
         'instrument_id': ['KRX:MISSING_AVAILABILITY'] * 60,
         'trading_value': [2_000_000_000.0] * 60,
+        'open': [100.0] * 60,
+        'close': [100.0] * 60,
+        'volume': [1_000.0] * 60,
         'available_at': list(sessions[-60:]),
     })
 
@@ -131,7 +137,7 @@ def test_universe_calls_corporate_action_exclusion_once_per_session(monkeypatch)
 
     sessions = tuple(datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=index) for index in range(60))
     master = pl.DataFrame([{'instrument_id': iid, 'company_id': iid, 'market': 'KOSPI', 'sector': 'Technology', 'share_class': 'common', 'status': 'listed', 'listing_date': sessions[0], 'valid_from': sessions[0], 'valid_to': None, 'available_at': sessions[0]} for iid in ('KRX:1', 'KRX:2')])
-    daily = pl.DataFrame([{'instrument_id': iid, 'session': session, 'trading_value': 10.0, 'available_at': session} for iid in ('KRX:1', 'KRX:2') for session in sessions])
+    daily = pl.DataFrame([{'instrument_id': iid, 'session': session, 'open': 10.0, 'close': 10.0, 'volume': 1.0, 'trading_value': 10.0, 'available_at': session} for iid in ('KRX:1', 'KRX:2') for session in sessions])
     actions = pl.DataFrame({'instrument_id': ['KRX:1'], 'effective_date': [sessions[0]], 'coverage_end': [sessions[-2]], 'type': ['split']})
     calls = []
     def wrapped(*args, **kwargs):
@@ -154,10 +160,27 @@ def test_universe_preserves_listing_and_liquidity_boundaries_after_indexing() ->
 
     sessions = tuple(datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=index) for index in range(60))
     master = pl.DataFrame([{'instrument_id': 'KRX:edge', 'company_id': 'C1', 'market': 'KOSPI', 'sector': 'Technology', 'share_class': 'common', 'status': 'listed', 'listing_date': sessions[0], 'valid_from': sessions[0], 'valid_to': None, 'available_at': sessions[0]}])
-    daily = pl.DataFrame([{'instrument_id': 'KRX:edge', 'session': session, 'trading_value': 100.0, 'available_at': session} for session in sessions])
+    daily = pl.DataFrame([{'instrument_id': 'KRX:edge', 'session': session, 'open': 10.0, 'close': 10.0, 'volume': 1.0, 'trading_value': 100.0, 'available_at': session} for session in sessions])
 
     result = build_historical_universe(decision_session=sessions[-1], decision_time=sessions[-1], calendar=SessionCalendar(sessions), security_master=master, daily_market=daily, policy=UniversePolicy(minimum_listing_sessions=60, minimum_median_trading_value_krw=100.0))
 
     assert result[0].eligible is True
     assert result[0].median_trading_value_60 == 100.0
     assert ExclusionReason.INSUFFICIENT_LISTING_AGE not in result[0].exclusion_reasons
+
+
+def test_universe_excludes_zero_value_bars_as_non_tradable() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    import polars as pl
+
+    from src.core.time import SessionCalendar
+    from src.strategy.universe import ExclusionReason, UniversePolicy, build_historical_universe
+
+    sessions = tuple(datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=index) for index in range(60))
+    master = pl.DataFrame([{'instrument_id': 'KRX:halted', 'company_id': 'C1', 'market': 'KOSPI', 'sector': 'Technology', 'share_class': 'common', 'status': 'listed', 'listing_date': sessions[0], 'valid_from': sessions[0], 'valid_to': None, 'available_at': sessions[0]}])
+    daily = pl.DataFrame([{'instrument_id': 'KRX:halted', 'session': session, 'open': 10.0, 'close': 10.0, 'volume': 1.0, 'trading_value': 100.0, 'available_at': session} for session in sessions]).with_columns(pl.when(pl.col('session') == sessions[-1]).then(0.0).otherwise(pl.col('volume')).alias('volume'))
+
+    result = build_historical_universe(decision_session=sessions[-1], decision_time=sessions[-1], calendar=SessionCalendar(sessions), security_master=master, daily_market=daily, policy=UniversePolicy(minimum_listing_sessions=60, minimum_median_trading_value_krw=1.0))
+
+    assert ExclusionReason.NON_TRADABLE_BAR in result[0].exclusion_reasons
