@@ -16,11 +16,13 @@ Downstream `implement` models have low reasoning capacity and cannot extrapolate
 ## Directives
 
 1. **Prerequisite & Context Alignment**:
-   - Input from `/probe`: Consume the chosen architecture, invariants, failure modes, and performance budget established in the probe phase.
+   - **Input from `/probe` (`scratch/probe_<feature>.json`)**:
+     - Check if `scratch/probe_<feature>.json` exists. If present, load it as primary input.
+     - Carry over `alternatives_considered`, `chosen_reason`, `failure_modes`, `invariants`, and `performance_budget` directly without re-probing or guessing.
    - Inspect target files and immediate callers (1-depth call-sites) to ensure signatures, imports, and AST anchors are exact.
 
 2. **Ambiguity Gate & Invariant Specification**:
-   - Translate probed invariants into explicit fail-closed requirements.
+   - Translate probed invariants (`scratch/probe_<feature>.json` -> `invariants`) into explicit fail-closed requirements.
    - Forbid open-ended fallback catches (`try-except Exception`) or silent `None` swallows that create unreachable branches downstream.
    - **No Silent Scope-Shrinking**: Ensure full date ranges and required scales are preserved.
 
@@ -30,8 +32,8 @@ Downstream `implement` models have low reasoning capacity and cannot extrapolate
    - `changes` (or `symbols`): Array of `{ name, signature, kind, target_file }`.
    - `wiring`: Array of `{ caller_file, anchor, import_symbol, invocation_expression }` ensuring entry-point hookup.
    - `requirements`: Explicit fail-closed boundary rules, invariant constraints, and complexity requirements.
-   - `design_rationale`: `{ alternatives_considered, chosen_reason, failure_modes }` — carry over directly from `/probe`.
-   - `performance_budget` (required when `target_file` touches backtesting, ML training, or bulk data I/O): `{ expected_data_scale, memory_target_mb, storage_format, dtype_precision, chunking_strategy, acceleration_candidate }`.
+   - `design_rationale`: `{ alternatives_considered, chosen_reason, failure_modes }` — carry over directly from `/probe` (`scratch/probe_<feature>.json`).
+   - `performance_budget` (required when `target_file` touches backtesting, ML training, or bulk data I/O): `{ expected_data_scale, memory_target_mb, storage_format, dtype_precision, chunking_strategy, acceleration_candidate }` — carry over from `scratch/probe_<feature>.json` if present.
    - `scenarios`: Array of `{ scenario_id, target_test_file, execution_command, expected_behavior, test_skeleton }`.
      - **Dual-Scope Coverage Mandate (Unit + Wiring)**:
        1) **Unit Scenarios**: Scenarios exercising new symbols/functions in `target_file`.

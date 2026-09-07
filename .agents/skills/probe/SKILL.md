@@ -39,8 +39,25 @@ Focus on: *Is the hypothesis sound? What does the real data/runtime look like? W
      - `{ expected_data_scale, memory_target_mb, storage_format, dtype_precision, chunking_strategy }`
      - Do NOT introduce artificial truncation or shortened windows.
 
-5. **Transition Gate to `/spec`**:
-   - Once the design choice and empirical proof are established, summarize the findings compactly and hand off directly to `/spec` to generate the formal `contract.json`.
+5. **Probe Summary Persistence & Transition Gate to `/spec`**:
+   - To prevent context loss across agent sessions or token budget limits, **always persist probe conclusions** to `scratch/probe_<topic>.json`:
+     ```json
+     {
+       "feature": "<feature_name>",
+       "domain": "<domain>",
+       "hypothesis": "<validated core hypothesis>",
+       "empirical_proof": {
+         "script": "scratch/probe_<topic>.py",
+         "summary": "<real measurement/benchmark result>"
+       },
+       "alternatives_considered": ["<alt 1>", "<alt 2>"],
+       "chosen_reason": "<why the selected architecture was chosen>",
+       "failure_modes": ["<failure mode 1>", "<failure mode 2>"],
+       "invariants": ["<fail-closed rule 1>", "<invariant rule 2>"],
+       "performance_budget": null
+     }
+     ```
+   - Once persisted, hand off directly to `/spec` which will consume `scratch/probe_<topic>.json` as input.
 
 ## Chat Output Format
 
@@ -49,7 +66,7 @@ Keep chat response strictly minimal, token-efficient, and evidence-focused (max 
 ### 🔬 [PROBE] <Feature/Topic Title>
 
 - **가설 & 결론**: <검증된 핵심 가설 및 채택된 설계 접근법 1줄>
-- **실측 증거 (Proof)**: `scratch/probe_<topic>.py` → <실측 수치/성능/데이터 정합성 결과 1줄>
+- **실측 증거 (Proof)**: `scratch/probe_<topic>.py` (`scratch/probe_<topic>.json` 기록 완료) → <실측 수치/성능/데이터 정합성 결과 1줄>
 - **핵심 불변식**: <반드시 지켜야 할 Fail-closed 규칙 및 주요 방어 실패 모드 1줄>
 
 ---
