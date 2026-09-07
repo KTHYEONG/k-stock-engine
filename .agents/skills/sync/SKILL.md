@@ -17,9 +17,8 @@ Post-development protocol for task finalization, ADR registration, index updatin
    - Automatically updates `docs/decisions/task_index.json` and `docs/code_map.json`.
    - **Keep `--why`/`--what`/`--impact` to 1 sentence each.** These fields are echoed verbatim into every future `spec_init.py` match on this `domain`/keyword — a verbose entry today taxes every later spec run's context, not just this one. The script hard-caps each field at 300 chars as a backstop, but that's a truncation, not a substitute for writing tight in the first place.
 
-2. **Artifact Cleanup & Memory Linkage**:
-   - `sync_task.py` archives `docs/specs/*_contract.json` files to `docs/decisions/archive/<task_id>/` (preserving `design_rationale`/`performance_budget` for future `spec` reuse and audit traceability) and purges `scratch/` scripts, `tmp/` test roots, and logs. Persistent architecture documents (`docs/architecture/`, `00_architecture.md`) are safely preserved.
-   - The archived contract's path is written back into the matching `task_index.json` entry as `archive_path`, and `spec_init.py` surfaces that path (not its content) on a future domain/keyword match — so a later `spec` run can `Read` the full prior design rationale on demand, without every retrieval paying for it upfront.
+2. **Artifact Cleanup**:
+   - `sync_task.py` deletes `docs/specs/*_contract.json` files (design rationale already summarized into the `--why`/`--what`/`--impact` fields written to `task_index.json`) and purges `scratch/` scripts, `tmp/` test roots, and logs. Persistent architecture documents (`docs/architecture/`, `00_architecture.md`) are safely preserved.
 
 ## Output
 
