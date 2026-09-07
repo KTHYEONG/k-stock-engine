@@ -36,7 +36,7 @@ Independent audit gate completing the main development loop (`probe` -> `spec` -
    - **Triage and Route Failures Cleanly**:
      - **Route to `/implement`**: Defect is purely implementation execution (unrequested dead defensive branch, broken syntax, failing assertion, incomplete wiring). Command: Provide exact root cause and instruction to simplify/fix.
      - **Route to `/spec`**: Defect is architectural or missing specification (missing wiring test scenario in contract, wrong invariant, contract signature mismatch, performance budget breach). Command: Provide exact contract amendment required.
-     - **Route to `/probe`**: Defect is fundamental hypothesis invalidation, unexpected mathematical instability, or algorithmic failure under real data that requires re-experimentation before re-contracting.
+     - **Route to `/probe`**: Defect is fundamental hypothesis invalidation, unexpected mathematical instability, or algorithmic failure under real data that requires re-experimentation before re-contracting (results to be updated in `scratch/probe_<feature>.json`).
 
 ## Output
 
