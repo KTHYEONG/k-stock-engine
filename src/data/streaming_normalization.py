@@ -1000,13 +1000,16 @@ def _canonical_master_row(
     if not ticker:
         raise PITDataError("missing KRX instrument; certification blocked")
     instrument_id = f"KRX:{ticker}"
-    # A historical master snapshot becomes effective when it is observed.
-    # Keep listing_date as descriptive metadata; using it as valid_from would
-    # collapse distinct PIT snapshots onto one primary key.
     valid_from = available_at
     for key in ("valid_from",):
         if record.get(key) not in (None, ""):
             valid_from = _as_krx_datetime(record.get(key))
+            break
+    listing_date = None
+    for key in ("listing_date", "listed_from", "LIST_DD"):
+        raw = record.get(key)
+        if raw not in (None, ""):
+            listing_date = _as_krx_datetime(raw)
             break
     return {
         "instrument_id": instrument_id,
@@ -1016,10 +1019,10 @@ def _canonical_master_row(
         # the row with an explicit sentinel rather than dropping its PIT dates.
         "market": str(record.get("market") or record.get("MKT_TP_NM") or "__UNKNOWN__"),
         "sector": str(record.get("sector") or record.get("sector_name") or "__GLOBAL__"),
-        "listing_date": valid_from,
+        "listing_date": listing_date,
         "delisting_date": record.get("delisting_date") or record.get("delisted_on"),
         "share_class": str(record.get("share_class") or "common"),
-        "status": str(record.get("status") or "listed"),
+        "status": str(record.get("status") or "__UNKNOWN__"),
         "valid_from": valid_from,
         "valid_to": record.get("valid_to"),
         "available_at": available_at,
@@ -1252,7 +1255,8 @@ def stream_normalize_stock_evidence(
     }
 
     _store = _BronzeStore(Path(bronze_root))
-    action_source_hashes = [item.content_hash for item in grouped[EvidenceKind.CORPORATE_ACTIONS]]
+    action_receipts = tuple(grouped[EvidenceKind.CORPORATE_ACTIONS])
+    action_source_hashes = [item.content_hash for item in action_receipts]
     action_cache_path = Path(artifact_root) / "corporate_actions_stream.json"
     streamed_actions: list[dict[str, Any]] = []
     try:
@@ -1272,7 +1276,7 @@ def stream_normalize_stock_evidence(
         streamed_actions = [item for item in cached_actions["records"] if isinstance(item, dict)]
     else:
         streamed_actions = compact_corporate_action_intervals(  # pragma: no cover - exercised by full Bronze rebuild
-            _stream_corporate_action_intervals(grouped[EvidenceKind.CORPORATE_ACTIONS]),
+            _stream_corporate_action_intervals(action_receipts),
             decision_time=decision_time,
         )
         if not streamed_actions:  # pragma: no cover - requires a valid but empty production evidence set

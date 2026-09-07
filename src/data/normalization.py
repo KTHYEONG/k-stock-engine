@@ -36,6 +36,8 @@ def normalize_dart_financial_facts(
     source_hash: str,
     calendar: SessionCalendar,
     decision_time: datetime,
+    ticker_by_corp_code: Mapping[str, str] | None = None,
+    bridge_receipt_hash: str | None = None,
 ) -> pl.DataFrame:
     """Normalize every canonical DART record; partial coverage retained."""
     from src.data.silver import next_krx_session_open
@@ -111,10 +113,13 @@ def normalize_dart_financial_facts(
                 ticker = raw_ticker
             elif raw_company:
                 if raw_corp:
-                    # A corp_code without the frozen ticker bridge is not joinable PIT evidence.
-                    if not _re.match(r"^\d{6}$", raw_company):
+                    bridged = ticker_by_corp_code.get(raw_corp) if ticker_by_corp_code else None
+                    if bridged is not None and _re.match(r"^\d{6}$", bridged):
+                        company_id = bridged
+                        dart_corp_code = raw_corp
+                        ticker = bridged
+                    else:
                         continue
-                    continue
                 elif _re.match(r"^\d{6}$", raw_company):
                     company_id = raw_company
                     dart_corp_code = ""
@@ -167,6 +172,8 @@ def normalize_dart_financial_facts(
             consolidated = bool(consolidated)
             source_kind = str(rec.get("source_kind") or "opendart_standard")
             mapping_version = str(rec.get("mapping_version") or _DART_MAPPING_VERSION)
+            if dart_corp_code and ticker_by_corp_code and bridge_receipt_hash and ticker_by_corp_code.get(dart_corp_code) == ticker:
+                mapping_version = f"{mapping_version}+bridge:{bridge_receipt_hash}"
             raw_hash = rec.get("raw_document_hash")
             rows.append(
                 {

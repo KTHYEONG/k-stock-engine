@@ -200,6 +200,22 @@ def _merge_fact_frames(existing: pl.DataFrame | None, new: pl.DataFrame) -> pl.D
     return merged[sorted(keep)]
 
 
+def load_frozen_dart_ticker_bridge(
+    *, bronze_root: Path, decision_time: datetime
+) -> tuple[dict[str, str], str]:
+    _ = decision_time
+    bridge_dir = Path(bronze_root) / "dart_corp_codes"
+    payloads = sorted(bridge_dir.glob("*/payload.json")) if bridge_dir.exists() else []
+    if not payloads:
+        raise PITDataError("ticker bridge missing: no retained dart_corp_codes receipt")
+    payload_path = payloads[-1]
+    receipt_hash = payload_path.parent.name
+    raw = json.loads(payload_path.read_text(encoding="utf-8"))
+    rows = raw if isinstance(raw, list) else []
+    mapping = {str(r.get("corp_code")): str(r.get("ticker")) for r in rows if isinstance(r, dict)}
+    return mapping, receipt_hash
+
+
 def refresh_dart_financial_facts(
     *,
     bronze_root: Path,
@@ -219,6 +235,13 @@ def refresh_dart_financial_facts(
     calendar, disclosure_rows, existing, prior_hash = _load_reference_tables(
         Path(silver_root), decision_time
     )
+    bridge_root = Path(bronze_root) / "dart_corp_codes"
+    bridge: dict[str, str] | None = None
+    bridge_receipt_hash: str | None = None
+    if bridge_root.exists():
+        bridge, bridge_receipt_hash = load_frozen_dart_ticker_bridge(
+            bronze_root=Path(bronze_root), decision_time=decision_time
+        )
     staging_dir = Path(artifact_root) / "dart_fact_staging"
     staging_dir.mkdir(parents=True, exist_ok=True)
     for stale in sorted(staging_dir.glob("batch-*.parquet")):
@@ -243,6 +266,8 @@ def refresh_dart_financial_facts(
                 source_hash=batch_hash,
                 calendar=calendar,
                 decision_time=decision_time,
+                ticker_by_corp_code=bridge,
+                bridge_receipt_hash=bridge_receipt_hash,
             )
             if frame.height > 0:
                 batch_frames.append(frame)
@@ -263,6 +288,8 @@ def refresh_dart_financial_facts(
             source_hash=hashlib.sha256(b"empty").hexdigest(),
             calendar=calendar,
             decision_time=decision_time,
+            ticker_by_corp_code=bridge,
+            bridge_receipt_hash=bridge_receipt_hash,
         )
     merged = _merge_fact_frames(existing, new_rows)
     if merged.height == 0:

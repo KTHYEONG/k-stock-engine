@@ -33,7 +33,6 @@ class SilverTable(StrEnum):
     DISCLOSURES = "disclosures"
     HISTORICAL_COSTS = "historical_costs"
 
-
 @dataclass(frozen=True, slots=True)
 class BronzeReceipt:
     kind: EvidenceKind
