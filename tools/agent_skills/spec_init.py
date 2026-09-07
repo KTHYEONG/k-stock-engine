@@ -71,6 +71,17 @@ def main() -> None:
     # 3. Create Contract Boilerplate if not exists
     os.makedirs("docs/specs", exist_ok=True)
     if not os.path.exists(output_contract):
+        # Auto-load probe summary if exists from scratch/probe_<feature>.json
+        probe_summary_path = f"scratch/probe_{feature_slug}.json"
+        probe_data = _read_json(probe_summary_path)
+
+        design_rationale = {
+            "alternatives_considered": probe_data.get("alternatives_considered", ""),
+            "chosen_reason": probe_data.get("chosen_reason", ""),
+            "failure_modes": probe_data.get("failure_modes", []),
+        }
+        performance_budget = probe_data.get("performance_budget")
+
         boilerplate_contract = {
             "feature": feature_slug,
             "domain": args.domain,
@@ -84,25 +95,23 @@ def main() -> None:
                     "target_test_file": f"tests/unit/{args.domain}/test_{feature_slug}.py",
                     "execution_command": f"uv run pytest tests/unit/{args.domain}/test_{feature_slug}.py -k test_{feature_slug}_executes_correctly -q",
                     "expected_behavior": "Handles normal input and returns expected result",
-                    "test_skeleton": f"def test_{feature_slug}_executes_correctly() -> None:\n    from src.{args.domain}.{feature_slug} import calc_{feature_slug}\n\n    result = calc_{feature_slug}(1.0)\n    assert result == 1.0\n"
+                    "test_skeleton": f"def test_{feature_slug}_executes_correctly() -> None:\n    from src.{args.domain}.{feature_slug} import calc_{feature_slug}\n\n    result = calc_{feature_slug}(1.0)\n    assert result == 1.0\n",
                 }
             ],
             "wiring": {
                 "file": f"src/{args.domain}/pipeline.py",
                 "anchor": "def run_pipeline",
-                "invocation_expression": f"calc_{feature_slug}(val)"
+                "invocation_expression": f"calc_{feature_slug}(val)",
             },
-            "design_rationale": {
-                "alternatives_considered": "",
-                "chosen_reason": "",
-                "failure_modes": []
-            },
-            "performance_budget": None
+            "design_rationale": design_rationale,
+            "performance_budget": performance_budget,
         }
         with open(output_contract, "w", encoding="utf-8") as f:
             json.dump(boilerplate_contract, f, indent=2)
             f.write("\n")
         print(f"\n✅ Created contract boilerplate: {output_contract}")
+        if probe_data:
+            print(f"   (Auto-populated design_rationale from {probe_summary_path})")
     else:
         print(f"\n[i] Contract file already exists: {output_contract}")
 
