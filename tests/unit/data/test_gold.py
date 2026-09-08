@@ -667,3 +667,100 @@ def test_materialize_gold_window_uses_supplied_frames_with_silver_provenance(tmp
 
     assert len(called) == 1
     assert report.universe_decisions_count == 0
+
+
+def test_materialize_gold_window_uses_in_memory_reader_and_patches_listing_date(tmp_path: Path, monkeypatch) -> None:
+    from datetime import UTC, datetime, timedelta
+    import polars as pl
+    from src.core.time import KRX_TZ
+    from src.data.gold import materialize_gold_window
+    from src.data.replay import PITReplayReader
+    from src.data.schemas import EvidenceKind, SilverTable
+    from src.data.silver import SilverStore, certify_silver
+    from src.data.schemas import BronzeReceipt
+    from src.core.datasets import DatasetCertification
+    from src.strategy.universe import UniversePolicy
+
+    sessions = tuple(datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(70))
+    src_hash = 'h' * 64
+    tables = {
+        SilverTable.CALENDAR: pl.DataFrame({'session': list(sessions), 'available_at': list(sessions), 'source_hash': [src_hash] * 70}),
+        SilverTable.SECURITY_MASTER: pl.DataFrame({'instrument_id': ['KRX:1'], 'ticker': ['1'], 'company_id': ['C1'], 'market': ['KOSPI'], 'sector': ['Technology'], 'listing_date': [sessions[0]], 'delisting_date': [None], 'share_class': ['common'], 'status': ['listed'], 'valid_from': [sessions[0]], 'valid_to': [None], 'available_at': [sessions[0]], 'source_hash': [src_hash]}),
+        SilverTable.DAILY_MARKET: pl.DataFrame({'session': list(sessions), 'instrument_id': ['KRX:1'] * 70, 'open': [100.0] * 70, 'high': [110.0] * 70, 'low': [90.0] * 70, 'close': [105.0] * 70, 'volume': [1000.0] * 70, 'trading_value': [1e8] * 70, 'market_cap': [1e10] * 70, 'shares_outstanding': [1e8] * 70, 'available_at': list(sessions), 'source_hash': [src_hash] * 70}),
+        SilverTable.INVESTOR_FLOW: pl.DataFrame({'session': list(sessions), 'instrument_id': ['KRX:1'] * 70, 'foreign_buy_value': [1e6] * 70, 'foreign_sell_value': [5e5] * 70, 'foreign_net_value': [5e5] * 70, 'institution_net_value': [1e5] * 70, 'retail_net_value': [-6e5] * 70, 'available_at': list(sessions), 'source_hash': [src_hash] * 70}),
+        SilverTable.FINANCIAL_FACTS: pl.DataFrame({'company_id': ['C1'], 'fiscal_period': ['2023Q4'], 'filing_id': ['f1'], 'fact': ['sales'], 'published_at': [sessions[0]], 'available_at': [sessions[0]], 'value': [1e9], 'unit': ['KRW'], 'consolidated': [True], 'restatement_id': ['r0'], 'source_hash': [src_hash], 'source_kind': ['opendart_standard'], 'mapping_version': ['v1'], 'raw_document_hash': [None]}),
+        SilverTable.CORPORATE_ACTIONS: pl.DataFrame({'instrument_id': ['KRX:1'], 'effective_date': [sessions[0]], 'coverage_end': [sessions[0]], 'action_id': ['a1'], 'type': ['no_action'], 'factor': [1.0], 'cash_amount': [0.0], 'source': ['KRX'], 'available_at': [sessions[0]], 'source_hash': [src_hash]}),
+        SilverTable.DISCLOSURES: pl.DataFrame({'company_id': ['C1'], 'filing_id': ['f1'], 'filing_type': ['annual'], 'published_at': [sessions[0]], 'available_at': [sessions[0]], 'correction_of': [None], 'source_hash': [src_hash]}),
+        SilverTable.HISTORICAL_COSTS: pl.DataFrame({'market': ['KOSPI'], 'effective_date': [sessions[0]], 'cost_kind': ['commission'], 'rule_id': ['r1'], 'value': [0.00015], 'available_at': [sessions[0]], 'source_hash': [src_hash]}),
+    }
+    now = datetime.now(UTC)
+    receipts = {k: BronzeReceipt(kind=k, content_hash=src_hash, source_path='p', retrieved_at=now, ingested_at=now, payload_path=Path('p'), metadata_path=Path('m')) for k in EvidenceKind}
+    report = certify_silver(tables, receipts=receipts, coverage_start=sessions[0].date(), coverage_end=sessions[-1].date(), certification=DatasetCertification.RESEARCH)
+    SilverStore(tmp_path / 'silver').materialize_all(tables, report=report, decision_time=now)
+
+    # Fail-closed guard: from_silver_root must NEVER be called when silver_root is provided
+    def _forbid_root_replay(*args, **kwargs):
+        raise AssertionError('PITReplayReader.from_silver_root must not be called')
+    monkeypatch.setattr(PITReplayReader, 'from_silver_root', _forbid_root_replay)
+
+    last_date = sessions[-1].astimezone(KRX_TZ).date()
+    first_date = sessions[-5].astimezone(KRX_TZ).date()
+    decision_time = datetime.now(UTC)
+    out = materialize_gold_window(
+        silver_root=tmp_path / 'silver',
+        validation_start=first_date,
+        validation_end=last_date,
+        decision_time=decision_time,
+        artifact_root=tmp_path / 'artifacts',
+        gold_root=tmp_path / 'gold',
+        universe_policy=UniversePolicy(minimum_listing_sessions=1, minimum_median_trading_value_krw=1.0),
+    )
+    assert out.manifest is not None
+    assert out.universe_decisions_count > 0
+    assert out.eligible_decisions_count > 0
+
+
+def test_materialize_gold_window_with_empty_flow_frame_fails_soft(tmp_path: Path) -> None:
+    from datetime import UTC, datetime, timedelta
+    import polars as pl
+    from src.core.time import KRX_TZ
+    from src.data.gold import materialize_gold_window
+    from src.data.schemas import EvidenceKind, SilverTable
+    from src.data.silver import SilverStore, certify_silver
+    from src.data.schemas import BronzeReceipt
+    from src.core.datasets import DatasetCertification
+    from src.strategy.universe import UniversePolicy
+
+    sessions = tuple(datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(70))
+    src_hash = 'h' * 64
+    # Empty investor flow
+    tables = {
+        SilverTable.CALENDAR: pl.DataFrame({'session': list(sessions), 'available_at': list(sessions), 'source_hash': [src_hash] * 70}),
+        SilverTable.SECURITY_MASTER: pl.DataFrame({'instrument_id': ['KRX:1'], 'ticker': ['1'], 'company_id': ['C1'], 'market': ['KOSPI'], 'sector': ['Technology'], 'listing_date': [sessions[0]], 'delisting_date': [None], 'share_class': ['common'], 'status': ['listed'], 'valid_from': [sessions[0]], 'valid_to': [None], 'available_at': [sessions[0]], 'source_hash': [src_hash]}),
+        SilverTable.DAILY_MARKET: pl.DataFrame({'session': list(sessions), 'instrument_id': ['KRX:1'] * 70, 'open': [100.0] * 70, 'high': [110.0] * 70, 'low': [90.0] * 70, 'close': [105.0] * 70, 'volume': [1000.0] * 70, 'trading_value': [1e8] * 70, 'market_cap': [1e10] * 70, 'shares_outstanding': [1e8] * 70, 'available_at': list(sessions), 'source_hash': [src_hash] * 70}),
+        SilverTable.INVESTOR_FLOW: pl.DataFrame(schema={'session': pl.Datetime(time_zone='UTC'), 'instrument_id': pl.String, 'foreign_buy_value': pl.Float64, 'foreign_sell_value': pl.Float64, 'foreign_net_value': pl.Float64, 'institution_net_value': pl.Float64, 'retail_net_value': pl.Float64, 'available_at': pl.Datetime(time_zone='UTC'), 'source_hash': pl.String}),
+        SilverTable.FINANCIAL_FACTS: pl.DataFrame({'company_id': ['C1'], 'fiscal_period': ['2023Q4'], 'filing_id': ['f1'], 'fact': ['sales'], 'published_at': [sessions[0]], 'available_at': [sessions[0]], 'value': [1e9], 'unit': ['KRW'], 'consolidated': [True], 'restatement_id': ['r0'], 'source_hash': [src_hash], 'source_kind': ['opendart_standard'], 'mapping_version': ['v1'], 'raw_document_hash': [None]}),
+        SilverTable.CORPORATE_ACTIONS: pl.DataFrame({'instrument_id': ['KRX:1'], 'effective_date': [sessions[0]], 'coverage_end': [sessions[0]], 'action_id': ['a1'], 'type': ['no_action'], 'factor': [1.0], 'cash_amount': [0.0], 'source': ['KRX'], 'available_at': [sessions[0]], 'source_hash': [src_hash]}),
+        SilverTable.DISCLOSURES: pl.DataFrame({'company_id': ['C1'], 'filing_id': ['f1'], 'filing_type': ['annual'], 'published_at': [sessions[0]], 'available_at': [sessions[0]], 'correction_of': [None], 'source_hash': [src_hash]}),
+        SilverTable.HISTORICAL_COSTS: pl.DataFrame({'market': ['KOSPI'], 'effective_date': [sessions[0]], 'cost_kind': ['commission'], 'rule_id': ['r1'], 'value': [0.00015], 'available_at': [sessions[0]], 'source_hash': [src_hash]}),
+    }
+    now = datetime.now(UTC)
+    receipts = {k: BronzeReceipt(kind=k, content_hash=src_hash, source_path='p', retrieved_at=now, ingested_at=now, payload_path=Path('p'), metadata_path=Path('m')) for k in EvidenceKind}
+    report = certify_silver(tables, receipts=receipts, coverage_start=sessions[0].date(), coverage_end=sessions[-1].date(), certification=DatasetCertification.RESEARCH)
+    SilverStore(tmp_path / 'silver').materialize_all(tables, report=report, decision_time=now)
+
+    last_date = sessions[-1].astimezone(KRX_TZ).date()
+    first_date = sessions[-5].astimezone(KRX_TZ).date()
+    decision_time = datetime.now(UTC)
+    out = materialize_gold_window(
+        silver_root=tmp_path / 'silver',
+        validation_start=first_date,
+        validation_end=last_date,
+        decision_time=decision_time,
+        artifact_root=tmp_path / 'artifacts',
+        gold_root=tmp_path / 'gold',
+        universe_policy=UniversePolicy(minimum_listing_sessions=1, minimum_median_trading_value_krw=1.0),
+    )
+    assert out.manifest is not None
+    assert out.universe_decisions_count > 0
+
