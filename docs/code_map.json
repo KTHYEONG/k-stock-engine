@@ -59,6 +59,9 @@
   "src/data/collection.py": {
     "testing": "tests/integration/data/test_collection.py"
   },
+  "src/data/collection_checkpoint.py": {
+    "testing": "tests/unit/data/test_collection_checkpoint.py"
+  },
   "src/data/collection_plan.py": {
     "testing": "tests/unit/data/test_collection_plan.py"
   },
@@ -122,6 +125,7 @@
       "tests/unit/data/test_streaming_stock_normalization.py",
       "tests/unit/integrations/dart/test_xbrl_standard.py",
       "tests/unit/integrations/krx/test_historical.py",
+      "tests/unit/integrations/test_investor_flow_router.py",
       "tests/unit/integrations/test_kis_investor_flow.py"
     ]
   },
@@ -225,12 +229,13 @@
       "tests/integration/features/test_materialize_qvef.py",
       "tests/integration/strategy/test_champion_scores.py",
       "tests/unit/data/test_replay.py",
+      "tests/unit/features/test_materialize.py",
       "tests/unit/features/test_preprocessing.py",
       "tests/unit/strategy/test_scoring.py"
     ]
   },
   "src/features/materialize.py": {
-    "testing": "tests/integration/features/test_materialize_qvef.py"
+    "testing": "tests/unit/features/test_materialize.py"
   },
   "src/features/preprocessing.py": {
     "testing": "tests/unit/features/test_preprocessing.py"
@@ -251,11 +256,18 @@
   "src/integrations/dart/xbrl.py": {
     "testing": "tests/unit/integrations/dart/test_xbrl.py"
   },
+  "src/integrations/investor_flow_router.py": {
+    "testing": "tests/unit/integrations/test_investor_flow_router.py"
+  },
   "src/integrations/kis/client.py": {
     "testing": "tests/unit/integrations/kis/test_client.py"
   },
   "src/integrations/kis/investor_flow.py": {
     "testing": "tests/unit/integrations/kis/test_investor_flow.py"
+  },
+  "src/integrations/kiwoom/client.py": {},
+  "src/integrations/kiwoom/investor_flow.py": {
+    "testing": "tests/unit/integrations/kiwoom/test_investor_flow.py"
   },
   "src/integrations/krx/client.py": {
     "testing": [
@@ -265,6 +277,10 @@
   },
   "src/integrations/krx/historical.py": {
     "testing": "tests/unit/integrations/krx/test_historical.py"
+  },
+  "src/integrations/ls/client.py": {},
+  "src/integrations/ls/investor_flow.py": {
+    "testing": "tests/unit/integrations/ls/test_investor_flow.py"
   },
   "src/integrations/quota.py": {
     "testing": [
@@ -304,5 +320,6 @@
   },
   "src/validation/walk_forward.py": {
     "testing": "tests/unit/validation/test_walk_forward.py"
-  }
+  },
+  "tools/backfill_investor_flow_parallel.py": {}
 }

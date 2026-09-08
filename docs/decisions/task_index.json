@@ -1,6 +1,36 @@
 {
   "tasks": [
     {
+      "task_id": "ADR_20260908_parallel_investor_flow_backfill",
+      "date": "2026-09-08",
+      "adr_id": "ADR_20260908_ADR_20260908_parallel_investor_flow_backfill",
+      "domain": "data",
+      "title": "Dual-Broker Parallel Backfill and Silver Flow Dataset Completion",
+      "why": "10-year investor flow backfill suffered from single-worker latency bottleneck requiring multi-broker concurrency.",
+      "resolution": "Engineered high-speed dual-broker parallel backfill combining Kiwoom REST and LS OpenAPI with streaming Silver commits.",
+      "impact": "Completed 2016-2026 10-year investor flow backfill (2.25M rows) in 56 minutes with 0 duplicates and unified Silver schema."
+    },
+    {
+      "task_id": "multi_broker_clients",
+      "date": "2026-09-08",
+      "adr_id": "ADR_20260908_multi_broker_clients",
+      "domain": "data",
+      "title": "Multi-Broker Clients and Unified Investor Flow Router",
+      "why": "KIS-only investor flow collection required 168k API calls taking over 5 hours with severe rate limits.",
+      "resolution": "Implemented LS OpenAPI and Kiwoom REST clients with standard investor flow collectors and unified provider router.",
+      "impact": "Reduced required investor flow API calls by 95% down to ~8k calls while maintaining 100% Silver schema compatibility."
+    },
+    {
+      "task_id": "ADR-0044",
+      "date": "2026-09-07",
+      "adr_id": "ADR_20260907_ADR-0044",
+      "domain": "data",
+      "title": "Optimize Gold Replay and Bridge Financial Facts",
+      "why": "DART company_id mismatch caused 0 financial factor coverage and repeated disk scans bottlenecked replay.",
+      "resolution": "Bridged company_id to 6-digit tickers, added fail-soft investor_flow fallback, and optimized in-memory replay.",
+      "impact": "Expanded DART eligible universe from 15 to 1310 firms and accelerated session replay by 78x."
+    },
+    {
       "task_id": "equity_universe_data_reassessment",
       "date": "2026-09-07",
       "adr_id": "ADR_20260907_equity_universe_data_reassessment",
