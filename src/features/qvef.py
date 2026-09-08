@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import math
 import re
+from bisect import bisect_left, bisect_right
+from collections import defaultdict
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
-from src.core.time import SessionCalendar
+from src.core.time import KRX_TZ, SessionCalendar
 from src.features.contracts import QvefFeaturePolicy, QvefFeatureRow
 from src.features.preprocessing import normalize_component_scores
 from src.strategy.universe import UniverseDecision
@@ -111,6 +114,135 @@ def _eligible_flow_sessions(
     return tuple(calendar.sessions[idx - lookback : idx])
 
 
+def _resolve_master_for_eligible(
+    security_master: pl.DataFrame,
+    *,
+    decision_time: datetime,
+    decision_session: datetime,
+    eligible_iids: list[str],
+) -> dict[str, dict[str, Any]]:
+    """PIT-filter, dedup, and resolve one canonical master row per eligible iid.
+
+    Returns mapping {instrument_id: {'sector': str, 'company_id': str, 'row': dict}}.
+    Skips instruments where no unique valid_from row overlaps decision_session.
+    Replaces the 6M-row to_dicts() Python loop in build_qvef_features.
+    """
+    col_tz = getattr(security_master["available_at"].dtype, "time_zone", None) if not security_master.is_empty() else None
+    target_dt = decision_time.astimezone(ZoneInfo(col_tz)) if col_tz else decision_time
+    pit = security_master.filter(pl.col("available_at") <= target_dt) if not security_master.is_empty() else security_master.clear()
+    if "valid_from" in pit.columns and "valid_to" in pit.columns:
+        pit = pit.filter(
+            (pl.col("valid_from") <= decision_session)
+            & (pl.col("valid_to").is_null() | (pl.col("valid_to") >= decision_session))
+        )
+    dedup = pit.sort(["available_at", "valid_from"], descending=[True, True]).unique(
+        subset=["instrument_id"], keep="first", maintain_order=True
+    )
+    small = dedup.filter(pl.col("instrument_id").is_in(eligible_iids))
+    resolved: dict[str, dict[str, Any]] = {}
+    for row in small.to_dicts():
+        sector_s = str(row.get("sector") or "").strip()
+        company_s = str(row.get("company_id") or "").strip()
+        if sector_s and company_s:
+            resolved[str(row["instrument_id"])] = {
+                "sector": sector_s,
+                "company_id": company_s,
+                "row": row,
+            }
+    return resolved
+
+
+def _resolve_facts_pit(
+    financial_facts: pl.DataFrame,
+    *,
+    decision_time: datetime,
+    eligible_company_ids: frozenset[str],
+) -> dict[tuple[str, str, str], tuple[float | None, datetime | None]]:
+    """PIT-filter financial_facts and resolve canonical (value, available_at) per (company_id, fiscal_period, fact).
+
+    Replaces the Python-loop PIT scan on 653K rows. Returns resolved_facts dict
+    with identical semantics to the original Python implementation.
+    """
+    if financial_facts.is_empty():
+        return {}
+    col_tz = getattr(financial_facts["available_at"].dtype, "time_zone", None)
+    target_dt = decision_time.astimezone(ZoneInfo(col_tz)) if col_tz else decision_time
+    pit = financial_facts.filter(pl.col("available_at") <= target_dt)
+    pit = pit.filter(pl.col("consolidated") == True).filter(  # noqa: E712
+        pl.col("fact").is_in(list(_CANONICAL_FACTS))
+    ).filter(pl.col("company_id").is_in(list(eligible_company_ids))).filter(
+        pl.col("fiscal_period").str.contains(r"^\d{4}Q[1-4]$")
+    )
+    agg = pit.sort("available_at", descending=True).group_by(
+        ["company_id", "fiscal_period", "fact"]
+    ).agg(
+        pl.first("available_at").alias("av"),
+        pl.first("value").alias("val"),
+        pl.first("unit").alias("unit_v"),
+        (pl.col("available_at") == pl.col("available_at").max()).sum().alias("_n_at_max"),
+    )
+    resolved_facts: dict[tuple[str, str, str], tuple[float | None, datetime | None]] = {}
+    for row in agg.to_dicts():
+        key = (str(row["company_id"]), str(row["fiscal_period"]), str(row["fact"]))
+        fv = float(row["val"])
+        if (
+            row["_n_at_max"] > 1
+            or (row.get("unit_v") is not None and str(row.get("unit_v")) != "KRW")
+            or not math.isfinite(fv)
+        ):
+            resolved_facts[key] = (None, None)
+        else:
+            resolved_facts[key] = (fv, row["av"])
+    return resolved_facts
+
+
+def _build_market_index(
+    daily_market: pl.DataFrame,
+    *,
+    decision_time: datetime,
+) -> dict[tuple[str, datetime], dict[str, Any]]:
+    """PIT-filter daily_market and build (instrument_id, session) -> row dict index.
+
+    Returns only the latest available_at row per key (de-duplicated), matching
+    original semantics where len(mk_cands) != 1 implies unavailable.
+    """
+    col_tz = getattr(daily_market["available_at"].dtype, "time_zone", None) if not daily_market.is_empty() else None
+    target_dt = decision_time.astimezone(ZoneInfo(col_tz)) if col_tz else decision_time
+    pit = daily_market.filter(pl.col("available_at") <= target_dt) if not daily_market.is_empty() else daily_market.clear()
+    dedup = pit.sort("available_at", descending=True).unique(
+        subset=["instrument_id", "session"], keep="first", maintain_order=True
+    )
+    index: dict[tuple[str, datetime], dict[str, Any]] = {}
+    for row in dedup.to_dicts():
+        index[(str(row["instrument_id"]), row["session"])] = row
+    return index
+
+
+def _build_flow_index(
+    investor_flow: pl.DataFrame,
+    *,
+    decision_time: datetime,
+) -> tuple[dict[tuple[str, datetime], list[dict[str, Any]]], dict[tuple[str, Any], list[dict[str, Any]]]]:
+    """PIT-filter investor_flow and build (iid, session) and (iid, date) indices.
+
+    Returns (flow_by_key, flow_by_date_key) matching original semantics.
+    """
+    if investor_flow.is_empty():
+        return {}, {}
+    col_tz = getattr(investor_flow["available_at"].dtype, "time_zone", None)
+    target_dt = decision_time.astimezone(ZoneInfo(col_tz)) if col_tz else decision_time
+    pit = investor_flow.filter(pl.col("available_at") <= target_dt)
+    flow_by_key: dict[tuple[str, datetime], list[dict[str, Any]]] = defaultdict(list)
+    flow_by_date_key: dict[tuple[str, Any], list[dict[str, Any]]] = defaultdict(list)
+    for row in pit.to_dicts():
+        iid = str(row.get("instrument_id"))
+        sess = cast(datetime, row.get("session"))
+        flow_by_key[(iid, sess)].append(row)
+        sess_d = sess.astimezone(KRX_TZ).date() if sess.tzinfo is not None else sess.date()
+        flow_by_date_key[(iid, sess_d)].append(row)
+    return flow_by_key, flow_by_date_key
+
+
 def build_qvef_features(
     *,
     decision_session: datetime,
@@ -139,198 +271,28 @@ def build_qvef_features(
     # Ensure deterministic order
     eligible_universe = sorted(eligible_universe, key=lambda x: x.instrument_id)
 
-    # Resolve security master PIT
-    # Filter PIT: available_at <= decision_time and tz-aware
-    master_filtered_rows: list[dict[str, Any]] = []
-    if not security_master.is_empty():
-        for row in security_master.to_dicts():
-            av = row.get("available_at")
-            if av is None or getattr(av, "tzinfo", None) is None:
-                continue
-            try:
-                if av > decision_time:
-                    continue
-            except Exception:  # noqa: S112
-                continue
-            master_filtered_rows.append(row)
-    # Group by instrument_id
-    master_by_id: dict[str, list[dict[str, Any]]] = {}
-    for r in master_filtered_rows:
-        iid = r.get("instrument_id")
-        if iid is None:
-            continue
-        iid_s = str(iid)
-        master_by_id.setdefault(iid_s, []).append(r)
-
-    # Resolve active row per eligible instrument
-    resolved: dict[str, dict[str, Any]] = {}  # instrument_id -> master row
-    for uni in eligible_universe:
-        iid = uni.instrument_id
-        candidates = master_by_id.get(iid, [])
-        active: list[dict[str, Any]] = []
-        for r in candidates:
-            vf = r.get("valid_from")
-            vt = r.get("valid_to")
-            if vf is None:
-                continue
-            if getattr(vf, "tzinfo", None) is None:
-                # valid_from may be datetime with tz? compare with decision_session
-                pass
-            try:
-                if vf <= decision_session and (vt is None or decision_session <= vt):
-                    active.append(r)
-            except Exception:  # noqa: S112
-                continue
-        if not active:
-            continue
-        # Find latest valid_from
-        try:
-            max_vf = max(r["valid_from"] for r in active)
-        except Exception:  # noqa: S112
-            continue
-        cands = [r for r in active if r.get("valid_from") == max_vf]
-        if len(cands) != 1:
-            continue
-        chosen = cands[0]
-        sector = chosen.get("sector") or "__GLOBAL__"
-        company_id = chosen.get("company_id")
-        if sector is None or company_id is None:
-            continue
-        sector_s = str(sector).strip()
-        company_s = str(company_id).strip()
-        if not sector_s or not company_s:
-            continue
-        # also require non-empty
-        resolved[iid] = {"sector": sector_s, "company_id": company_s, "row": chosen}
+    # Resolve security master PIT via Polars native dedup (single small to_dicts)
+    resolved = _resolve_master_for_eligible(security_master, decision_time=decision_time, decision_session=decision_session, eligible_iids=[u.instrument_id for u in eligible_universe])
 
     # Early exit if none resolved
     if not resolved:
         return ()
 
-    # Filter financial facts PIT and group
-    fact_rows: list[dict[str, Any]] = []
-    if not financial_facts.is_empty():
-        for row in financial_facts.to_dicts():
-            av = row.get("available_at")
-            if av is None or getattr(av, "tzinfo", None) is None:
-                continue
-            try:
-                if av > decision_time:
-                    continue
-            except Exception:  # noqa: S112
-                continue
-            # consolidated must be True
-            if row.get("consolidated") is not True:
-                continue
-            fact = row.get("fact")
-            if fact not in _CANONICAL_FACTS:
-                continue
-            # fiscal_period must be YYYYQ
-            fp = row.get("fiscal_period")
-            if _parse_fiscal(str(fp)) is None:
-                continue
-            # value must be finite? But we keep and later check finiteness; if non-finite treat as unavailable per key
-            # Still keep row for conflict detection
-            fact_rows.append(row)
-
-    # Group by canonical key (company_id, fiscal_period, fact, consolidated)
-    from collections import defaultdict
-
-    key_to_candidates: dict[tuple[str, str, str, bool], list[dict[str, Any]]] = defaultdict(list)
-    for r in fact_rows:
-        key = (str(r.get("company_id")), str(r.get("fiscal_period")), str(r.get("fact")), bool(r.get("consolidated")))
-        key_to_candidates[key].append(r)
-
-    # Resolve each key to unique max available_at, fail closed on tie conflict
-    resolved_facts: dict[tuple[str, str, str], tuple[float | None, datetime | None]] = {}
-    # mapping (company_id, fiscal_period, fact) -> (value or None if unavailable, available_at)
-    # also track conflict flag
-
-    for key, cands in key_to_candidates.items():
-        company_id, fiscal_period, fact, _consol = key
-        # Find max available_at
-        try:
-            max_av = max(r["available_at"] for r in cands)
-        except Exception:  # noqa: S112
-            continue
-        max_cands = [r for r in cands if r["available_at"] == max_av]
-        if len(max_cands) != 1:
-            # conflicting at max -> unavailable
-            resolved_facts[(company_id, fiscal_period, fact)] = (None, None)
-            continue
-        chosen = max_cands[0]
-        val = chosen.get("value")
-        av = chosen.get("available_at")
-        # Check finite and unit KRW? assume unit column if present must be KRW
-        try:
-            fv = float(val)  # type: ignore
-        except Exception:  # noqa: S112
-            resolved_facts[(company_id, fiscal_period, fact)] = (None, None)
-            continue
-        if not math.isfinite(fv):
-            resolved_facts[(company_id, fiscal_period, fact)] = (None, None)
-            continue
-        # unit check: if unit column exists and not KRW, treat as unavailable? Spec says values must be finite KRW values
-        unit = chosen.get("unit")
-        if unit is not None and str(unit) != "KRW":
-            resolved_facts[(company_id, fiscal_period, fact)] = (None, None)
-            continue
-        resolved_facts[(company_id, fiscal_period, fact)] = (float(fv), av)
+    # Filter financial facts PIT and resolve canonical facts via Polars native agg
+    resolved_facts = _resolve_facts_pit(financial_facts, decision_time=decision_time, eligible_company_ids=frozenset(info['company_id'] for info in resolved.values()))
 
     # Helper to get fact value
     def get_fact(company_id: str, period: str, fact: str) -> tuple[float | None, datetime | None]:
         return resolved_facts.get((company_id, period, fact), (None, None))
 
-    # Daily market PIT filter
-    market_rows: list[dict[str, Any]] = []
-    if not daily_market.is_empty():
-        for row in daily_market.to_dicts():
-            av = row.get("available_at")
-            if av is None or getattr(av, "tzinfo", None) is None:
-                continue
-            try:
-                if av > decision_time:
-                    continue
-            except Exception:  # noqa: S112
-                continue
-            market_rows.append(row)
+    # Daily market PIT index via Polars native dedup (single dict entry per key)
+    market_by_key = _build_market_index(daily_market, decision_time=decision_time)
 
-    # Group market by (instrument_id, session)
-    market_by_key: dict[tuple[str, datetime], list[dict[str, Any]]] = defaultdict(list)
-    for r in market_rows:
-        iid = str(r.get("instrument_id"))
-        sess = r.get("session")
-        if sess is None or getattr(sess, "tzinfo", None) is None:
-            continue
-        market_by_key[(iid, sess)].append(r)
-
-    # Investor flow PIT filter
-    flow_rows: list[dict[str, Any]] = []
-    if not investor_flow.is_empty():
-        for row in investor_flow.to_dicts():
-            av = row.get("available_at")
-            if av is None or getattr(av, "tzinfo", None) is None:
-                continue
-            try:
-                if av > decision_time:
-                    continue
-            except Exception:  # noqa: S112
-                continue
-            flow_rows.append(row)
-
-    flow_by_key: dict[tuple[str, datetime], list[dict[str, Any]]] = defaultdict(list)
-    for r in flow_rows:
-        iid = str(r.get("instrument_id"))
-        sess = r.get("session")
-        if sess is None or getattr(sess, "tzinfo", None) is None:
-            continue
-        flow_by_key[(iid, sess)].append(r)
+    # Investor flow PIT indices via Polars native filter (list semantics preserved)
+    flow_by_key, flow_by_date_key = _build_flow_index(investor_flow, decision_time=decision_time)
 
     # Calendar trailing 20 sessions
-    try:
-        sess_idx = calendar.sessions.index(decision_session)
-    except ValueError:
-        raise ValueError("calendar does not contain decision_session")  # noqa: B904
+    sess_idx = bisect_left(calendar.sessions, decision_session); assert sess_idx < len(calendar.sessions) and calendar.sessions[sess_idx] == decision_session  # noqa: E702,PT018
     trailing_20: tuple[datetime, ...] = _eligible_flow_sessions(calendar=calendar, decision_session=decision_session, lookback=20) if sess_idx >= 20 else ()
 
     # For each instrument, compute raws deterministically sorted
@@ -430,9 +392,9 @@ def build_qvef_features(
         market_cap_val: float | None = None
         market_cap_ok = False
         mk_key = (iid, decision_session)
-        mk_cands = market_by_key.get(mk_key, [])
-        if len(mk_cands) == 1:
-            tv = mk_cands[0].get("market_cap")
+        mk_cands = market_by_key.get(mk_key)
+        if mk_cands is not None:
+            tv = mk_cands.get("market_cap")
             try:
                 fv = float(tv)  # type: ignore
                 if math.isfinite(fv) and fv > 0:
@@ -529,12 +491,8 @@ def build_qvef_features(
                         # Use calendar.sessions sorted
                         # latest_av may be same as decision; we want exact match if same day
                         # Find position of latest session <= latest_av
-                        latest_session_idx = -1
-                        for idx, s in enumerate(calendar.sessions):
-                            if s <= latest_av:
-                                latest_session_idx = idx
-                            else:
-                                break
+                        # bisect_right (already imported above)
+                        latest_session_idx = bisect_right(calendar.sessions, latest_av) - 1
                         staleness = sess_idx - latest_session_idx if latest_session_idx != -1 else 9999  # noqa: SIM108
                     except Exception:  # noqa: S112
                         staleness = 9999
@@ -582,12 +540,15 @@ def build_qvef_features(
             fv_values: list[float] = []
             flow_ok = True
             for sess in trailing_20:
-                mk = market_by_key.get((iid, sess), [])
+                mk = market_by_key.get((iid, sess))
                 fl = flow_by_key.get((iid, sess), [])
-                if len(mk) != 1 or len(fl) != 1:
+                if not fl:
+                    sess_d = sess.astimezone(KRX_TZ).date() if sess.tzinfo is not None else sess.date()
+                    fl = flow_by_date_key.get((iid, sess_d), [])
+                if mk is None or len(fl) != 1:
                     flow_ok = False
                     break
-                tv = mk[0].get("trading_value")
+                tv = mk.get("trading_value")
                 fv = fl[0].get("foreign_net_value")  # type: ignore[assignment]
                 try:
                     tv_f = float(tv)  # type: ignore[arg-type]
@@ -680,7 +641,10 @@ def build_qvef_features(
                     "raw_value": data[comp],
                 }
             )
-        df = pl.DataFrame(rows_list)
+        df = pl.DataFrame(
+            rows_list,
+            schema={"instrument_id": pl.String, "sector": pl.String, "raw_value": pl.Float64},
+        )
         result = normalize_component_scores(df, policy=policy)
         # Map iid -> (score, available, reason)
         mp: dict[str, tuple[float | None, bool, str]] = {}

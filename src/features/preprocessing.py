@@ -153,8 +153,15 @@ def normalize_component_scores(rows: pl.DataFrame, *, policy: QvefFeaturePolicy)
                 "score_reason": reason[idx],
             }
         )
-    # Ensure extra original columns preserved? For test only these matter, but preserve winsorized?
-    result = pl.DataFrame(out_records)
+    schema = {
+        "instrument_id": pl.String,
+        "sector": pl.String,
+        "raw_value": pl.Float64,
+        "normalized_score": pl.Float64,
+        "score_available": pl.Boolean,
+        "score_reason": pl.String,
+    }
+    result = pl.DataFrame(out_records, schema=schema)
     # Preserve column order as instrument_id, sector, raw_value, normalized_score, score_available, score_reason
     result = result.select(["instrument_id", "sector", "raw_value", "normalized_score", "score_available", "score_reason"])
     return result
