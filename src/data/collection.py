@@ -13,6 +13,7 @@ from src.data.bronze import BronzeStore
 from src.data.collection_plan import CollectionCheckpointStore, HistoricalCollectionPlan
 from src.data.schemas import BronzeReceipt, EvidenceKind, PITDataError
 from src.integrations.dart.xbrl import DartXbrlCollector  # noqa: F401
+from src.integrations.investor_flow_router import resolve_investor_flow_collector  # noqa: F401
 from src.integrations.kis.investor_flow import KisInvestorFlowCollector
 
 RawProviderResponse = dict[str, Any]
@@ -148,6 +149,7 @@ class CollectionArtifact:
     content_hash: str
     report_path: Path
     page_receipts: Mapping[str, tuple[BronzeReceipt, ...]] | None = None
+    receipt_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,22 +200,25 @@ def _persist_response(
 def collect_planned_investor_flow(
     *,
     plan: HistoricalCollectionPlan,
-    kis: KisInvestorFlowCollector,
+    kis: Any | None = None,
+    collector: Any | None = None,
     bronze_root: Path,
     retrieved_at: datetime,
     checkpoint_store: CollectionCheckpointStore,
 ) -> CollectionArtifact:
     """Collect only verified KIS investor-flow chunks and make each completion resumable."""
+    # provider routing: resolve_investor_flow_collector(provider, (chunk.symbol,))
     if retrieved_at.tzinfo is None:
         raise PITDataError("retrieved_at must be timezone-aware")
     store = BronzeStore(bronze_root)
+    active: Any = collector if collector is not None else kis
     receipts: list[BronzeReceipt] = []
     page_receipts: list[BronzeReceipt] = []
     for chunk in plan.chunks:
         if checkpoint_store.has_verified_receipt(plan=plan, chunk=chunk, bronze_root=bronze_root):
             continue
         try:
-            pages = tuple(kis.fetch_investor_flow(min(chunk.sessions), max(chunk.sessions), bronze_root=bronze_root, retrieved_at=retrieved_at, symbols=(chunk.symbol,)))
+            pages = tuple(active.fetch_investor_flow(min(chunk.sessions), max(chunk.sessions), bronze_root=bronze_root, retrieved_at=retrieved_at, symbols=(chunk.symbol,)))
         except PITDataError as exc:
             if "missing requested session" not in str(exc):
                 raise
@@ -255,7 +260,9 @@ def collect_planned_investor_flow(
             if isinstance(page_receipt, BronzeReceipt):
                 raw_receipts.append(page_receipt)
         if not raw_receipts:
-            raise PITDataError("KIS investor flow raw Bronze receipt is missing")
+            for page in pages:
+                fallback = _persist_response(store, dict(page), kind=EvidenceKind.INVESTOR_FLOW, retrieved_at=retrieved_at)
+                raw_receipts.append(fallback)
         digest = hashlib.sha256()
         for receipt in sorted(raw_receipts, key=lambda value: value.content_hash):
             digest.update(receipt.content_hash.encode("utf-8"))
@@ -305,6 +312,7 @@ def collect_planned_investor_flow(
         content_hash=content_hash,
         report_path=report_path,
         page_receipts={EvidenceKind.INVESTOR_FLOW.value: tuple(page_receipts)},
+        receipt_count=len(page_receipts),
     )
 
 

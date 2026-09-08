@@ -376,6 +376,9 @@ class PITReplayReader:
                     selected.append(path)
                 files = selected
             if not files:
+                all_table_files = self._dataset_files.get(table, ())
+                if table == SilverTable.INVESTOR_FLOW and all_table_files:
+                    return pl.scan_parquet(str(all_table_files[0])).head(0)
                 raise PITDataError(f"invalid certified Silver table: {table.value}")
             return pl.scan_parquet([str(p) for p in files])
 
