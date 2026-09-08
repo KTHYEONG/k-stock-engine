@@ -5,6 +5,9 @@ import argparse
 import json
 import sys
 from datetime import UTC, date, datetime
+from dotenv import load_dotenv
+
+load_dotenv()
 from pathlib import Path
 from typing import Any
 

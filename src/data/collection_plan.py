@@ -5,7 +5,7 @@ import hashlib
 import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -34,11 +34,16 @@ class PlanChunk:
 @dataclass(frozen=True, slots=True)
 class HistoricalCollectionPlan:
     plan_id: str
-    coverage_start: date
-    coverage_end: date
-    chunk_size: int
-    chunks: tuple[PlanChunk, ...]
+    coverage_start: date = date(2026, 3, 1)
+    coverage_end: date = date(2026, 3, 6)
+    chunk_size: int = 1
+    chunks: tuple[PlanChunk, ...] = ()
     content_hash: str = ""
+    dataset_name: str = ""
+    created_at: datetime | None = None
+
+
+CollectionChunk = PlanChunk
 
 
 def _canonical_universe(universe: Any) -> list[dict[str, Any]]:
