@@ -242,19 +242,24 @@ def validate_table(table: SilverTable, frame: pl.DataFrame, *, decision_time: da
             raise PITDataError(f"unknown action type in {table.value}")
 
     if table is SilverTable.FINANCIAL_FACTS and frame.height > 0:
-        allowed_kinds = {"opendart_standard", "legacy_document"}
+        allowed_kinds = {"opendart_standard", "opendart_multi_account", "legacy_document"}
         bad_kind = frame.filter(~pl.col("source_kind").is_in(list(allowed_kinds)))
         if bad_kind.height > 0:
             raise PITDataError(f"unknown source_kind in {table.value}")
         if frame["mapping_version"].null_count() > 0:
             raise PITDataError(f"null mapping_version in {table.value}")
-        for row in frame.to_dicts():
-            kind = str(row.get("source_kind") or "")
-            raw_hash = row.get("raw_document_hash")
-            if kind == "opendart_standard" and raw_hash is not None:
-                raise PITDataError(f"raw_document_hash must be null for standardized facts in {table.value}")
-            if kind == "legacy_document" and not raw_hash:
-                raise PITDataError(f"raw_document_hash is required for legacy facts in {table.value}")
+        bad_standard = frame.filter(
+            (pl.col("source_kind") == "opendart_standard")
+            & pl.col("raw_document_hash").is_not_null()
+        )
+        if bad_standard.height > 0:
+            raise PITDataError(f"raw_document_hash must be null for standardized facts in {table.value}")
+        bad_legacy = frame.filter(
+            (pl.col("source_kind") == "legacy_document")
+            & (pl.col("raw_document_hash").is_null() | (pl.col("raw_document_hash") == ""))
+        )
+        if bad_legacy.height > 0:
+            raise PITDataError(f"raw_document_hash is required for legacy facts in {table.value}")
 
 
 def _deterministic_hash(parts: list[str]) -> str:

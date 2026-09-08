@@ -294,7 +294,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
             raise PITDataError("run-backtest requires resolved Gold artifact; missing --gold-dataset-id")
         from src.data.gold_artifacts import load_gold_artifact_frames, resolve_gold_artifact_bundle
 
-        gold_decision_time = datetime(val_end.year, val_end.month, val_end.day, 23, 59, 59, tzinfo=UTC)
+        gold_decision_time = datetime.now(UTC)
         bundle = resolve_gold_artifact_bundle(
             gold_root=gold_root,
             dataset_id=_gid,
@@ -378,13 +378,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         {SilverTable.DAILY_MARKET: daily_market_pit}, root=silver_root
     )
 
-    sessions = build_backtest_sessions(
-        snapshot_repository=snapshot_repo,
-        calendar=calendar,
-        start=start_session,
-        end=end_session,
-        decision_time_of=lambda s: s.replace(hour=15, minute=30, second=0),
-    )
+    sessions = build_backtest_sessions(snapshot_repository=snapshot_repo, calendar=calendar, start=start_session, end=end_session, decision_time_of=lambda s: s.replace(hour=15, minute=30, second=0))
 
     distinct_symbols = daily_market["instrument_id"].unique().to_list()
     instruments = {
@@ -960,6 +954,9 @@ def main() -> int:
             inputs = load_gold_window_inputs(silver_root=silver_root, validation_start=validation_start, validation_end=validation_end, decision_time=decision_time)
 
             gold_target_root: Path | None = Path(args.gold_root) if args.gold_root else None
+            from src.strategy.scoring import ChampionScorePolicy
+
+            score_policy = ChampionScorePolicy(min_required_factors=2)
 
             gold_report = materialize_gold_window(
                 calendar=inputs.calendar, security_master=inputs.security_master, daily_market=inputs.daily_market, financial_facts=inputs.financial_facts, corporate_actions=inputs.corporate_actions, investor_flow=inputs.investor_flow,
@@ -969,6 +966,7 @@ def main() -> int:
                 artifact_root=Path(args.artifact_root),
                 gold_root=gold_target_root,
                 silver_root=silver_root,
+                score_policy=score_policy,
             )
 
             manifest = gold_report.manifest

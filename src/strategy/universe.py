@@ -111,6 +111,23 @@ def _pit_filter(frame: pl.DataFrame, decision_time: datetime) -> pl.DataFrame:
         return pl.DataFrame(kept)
 
 
+def _dedup_master_frame(frame: pl.DataFrame) -> pl.DataFrame:
+    """Collapse security_master to one canonical row per instrument_id.
+
+    Selects the row with the greatest (available_at, valid_from) without
+    calling .to_dicts() on the full frame. The result contains the same
+    columns as the input; empty inputs are returned unchanged.
+    """
+    if frame.is_empty():
+        return frame
+    sort_cols = [c for c in ["available_at", "valid_from"] if c in frame.columns]
+    if len(sort_cols) < 2:
+        return frame
+    return frame.sort(sort_cols, descending=[True] * len(sort_cols)).unique(
+        subset=["instrument_id"], keep="first", maintain_order=True
+    )
+
+
 def build_historical_universe(
     *,
     decision_session: datetime,
@@ -129,6 +146,7 @@ def build_historical_universe(
     )
 
     master_filtered = _pit_filter(security_master, decision_time)
+    master_filtered = _dedup_master_frame(master_filtered)
     daily_filtered = _pit_filter(daily_market, decision_time)
 
     # Group master rows by instrument_id
