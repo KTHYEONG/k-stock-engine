@@ -1,8 +1,8 @@
 ---
 trigger:
   - on_label: ["quant"]
-  - on_file_path_regex: "src/.*(etf|filters|execution|data|validation|training|evaluation).*"
-  - on_file_path_glob: ["src/**/etf/**/*.py", "src/**/filters/**/*.py", "src/**/execution/**/*.py", "src/**/data/**/*.py", "src/**/validation/**/*.py"]
+  - on_file_path_regex: "src/.*(core|strategy|execution|data|engine|features|validation).*"
+  - on_file_path_glob: ["src/**/strategy/**/*.py", "src/**/execution/**/*.py", "src/**/data/**/*.py", "src/**/engine/**/*.py", "src/**/features/**/*.py", "src/**/validation/**/*.py"]
 priority: 10
 ---
 
@@ -30,7 +30,7 @@ This document provides quantitative and financial directives for building robust
 
 ## 3. Microstructure & Financial Realism
 - **Trading Costs:** Model transaction fees, securities transaction tax (국내주식 거래세), bid-ask spread, tick size constraints, and execution slippage.
-- **Settlement & Cash Drag:** Account for T+2 settlement cycles and cash margin/capital allocation when evaluating short-term holding and closing-price (종가매매) strategies.
+- **Settlement & Cash Drag:** Account for T+2 settlement cycles, cash drag, and shared-Ledger NAV accounting when evaluating long-only cash-equity portfolio rebalancing and execution.
 
 ## 4. Machine Learning & Labeling
 - **Objective-Driven Metrics:** Select classification/regression labels and evaluation metrics (IC, Sharpe, Accuracy, R²) directly from the economic decision objective.
