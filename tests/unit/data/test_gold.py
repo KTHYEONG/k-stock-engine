@@ -764,3 +764,136 @@ def test_materialize_gold_window_with_empty_flow_frame_fails_soft(tmp_path: Path
     assert out.manifest is not None
     assert out.universe_decisions_count > 0
 
+
+def test_exclude_sentinel_ca_single_todicts_call() -> None:
+    """Verifies correctness of the optimized ca_types_by_iid path."""
+    from datetime import date, datetime  # noqa: F401
+    import polars as pl
+    from src.core.time import KRX_TZ
+    from src.data.gold import exclude_sentinel_corporate_actions
+
+    # Build a CA frame: iid_A has a real action, iid_B has only no_action, iid_C is absent
+    effective = datetime(2024, 6, 1, tzinfo=KRX_TZ)
+    coverage_end = datetime(2024, 6, 30, tzinfo=KRX_TZ)
+    ca = pl.DataFrame([
+        {'instrument_id': 'KRX:A', 'effective_date': effective, 'coverage_end': coverage_end, 'type': 'split'},
+        {'instrument_id': 'KRX:B', 'effective_date': effective, 'coverage_end': coverage_end, 'type': 'no_action'},
+    ])
+    candidate_ids = frozenset(['KRX:A', 'KRX:B', 'KRX:C'])
+
+    # window=None branch triggers ca_types_by_iid lookup (the previously buggy per-iid to_dicts path)
+    excluded = exclude_sentinel_corporate_actions(ca, candidate_ids, window_start=None, window_end=None)
+
+    # KRX:A has a real action -> NOT excluded
+    assert 'KRX:A' not in excluded
+    # KRX:B has only no_action -> excluded
+    assert 'KRX:B' in excluded
+    # KRX:C absent from CA table -> excluded
+    assert 'KRX:C' in excluded
+
+
+def test_exclude_sentinel_ca_large_candidate_set_no_regression() -> None:
+    from datetime import datetime
+    import polars as pl
+    from src.core.time import KRX_TZ
+    from src.data.gold import exclude_sentinel_corporate_actions
+
+    effective = datetime(2024, 6, 1, tzinfo=KRX_TZ)
+    coverage_end = datetime(2024, 6, 30, tzinfo=KRX_TZ)
+    # 500 real-action instruments, 500 sentinel-only
+    real_rows = [{'instrument_id': f'KRX:{i:05d}', 'effective_date': effective, 'coverage_end': coverage_end, 'type': 'split'} for i in range(500)]
+    sentinel_rows = [{'instrument_id': f'KRX:{i:05d}', 'effective_date': effective, 'coverage_end': coverage_end, 'type': 'no_action'} for i in range(500, 1000)]
+    ca = pl.DataFrame(real_rows + sentinel_rows)
+    candidate_ids = frozenset(f'KRX:{i:05d}' for i in range(1000))
+
+    excluded = exclude_sentinel_corporate_actions(ca, candidate_ids, window_start=None, window_end=None)
+
+    # Real-action instruments (0-499) must NOT be excluded
+    for i in range(500):
+        assert f'KRX:{i:05d}' not in excluded, f'KRX:{i:05d} should not be excluded'
+    # Sentinel-only instruments (500-999) must be excluded
+    for i in range(500, 1000):
+        assert f'KRX:{i:05d}' in excluded, f'KRX:{i:05d} should be excluded'
+
+
+def test_materialize_gold_window_with_score_policy(tmp_path: Path) -> None:
+    """materialize_gold_window with score_policy produces scores via stream_writer."""
+    from src.strategy.scoring import ChampionScorePolicy
+    from src.strategy.universe import UniversePolicy
+
+    val_start = date(2016, 4, 1)
+    val_end = date(2016, 4, 3)
+    cal = _make_calendar(date(2016, 1, 1), 100)
+    decision_time = datetime(2016, 4, 30, 15, 30, tzinfo=KRX_TZ)
+
+    dm = _make_daily_market(["KRX:000001"], list(cal.sessions))
+    ff = pl.DataFrame({
+        "company_id": ["C1"] * 7,
+        "fiscal_period": ["2015Q1", "2015Q2", "2015Q3", "2015Q4", "2016Q1", "2016Q2", "2016Q3"],
+        "filing_id": [f"F_{i}" for i in range(7)],
+        "fact": ["sales", "operating_profit", "net_income", "assets", "equity", "operating_cash_flow", "gross_profit"],
+        "published_at": [cal.sessions[0]] * 7,
+        "available_at": [cal.sessions[0]] * 7,
+        "value": [100.0] * 7,
+        "unit": ["KRW"] * 7,
+        "consolidated": [True] * 7,
+        "restatement_id": ["r0"] * 7,
+        "source_hash": ["abc"] * 7,
+        "source_kind": ["test"] * 7,
+        "mapping_version": ["1"] * 7,
+        "raw_document_hash": ["abc"] * 7,
+    })
+    sm = pl.DataFrame({
+        "instrument_id": ["KRX:000001"],
+        "company_id": ["C1"],
+        "ticker": ["000001"],
+        "market": ["KOSPI"],
+        "sector": ["Technology"],
+        "listing_date": [cal.sessions[0]],
+        "delisting_date": [None],
+        "share_class": ["common"],
+        "status": ["listed"],
+        "valid_from": [cal.sessions[0]],
+        "valid_to": [None],
+        "available_at": [cal.sessions[0]],
+        "source_hash": ["abc"],
+    })
+    ca = pl.DataFrame({
+        "instrument_id": ["KRX:000001"],
+        "effective_date": [cal.sessions[0]],
+        "coverage_end": [cal.sessions[-1]],
+        "action_id": ["A1"],
+        "type": ["split"],
+        "factor": [1.0],
+        "cash_amount": [0.0],
+        "source": ["test"],
+        "available_at": [cal.sessions[0]],
+        "source_hash": ["abc"],
+    })
+
+    artifact_root = tmp_path / "artifacts"
+    gold_root = tmp_path / "gold"
+
+    report = materialize_gold_window(
+        calendar=cal,
+        security_master=sm,
+        daily_market=dm,
+        financial_facts=ff,
+        corporate_actions=ca,
+        validation_start=val_start,
+        validation_end=val_end,
+        decision_time=decision_time,
+        artifact_root=artifact_root,
+        gold_root=gold_root,
+        universe_policy=UniversePolicy(
+            minimum_listing_sessions=10,
+            liquidity_window_sessions=10,
+            minimum_median_trading_value_krw=100.0,
+        ),
+        score_policy=ChampionScorePolicy(),
+    )
+
+    assert report.universe_decisions_count > 0
+    assert report.summary_artifact_path != ""
+
+

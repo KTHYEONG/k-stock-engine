@@ -80,3 +80,62 @@ def test_score_champion_rows_rejects_future_or_wrong_version_feature_rows() -> N
         score_champion_rows((replace(row, source_available_at=(('financial_facts', decision + timedelta(seconds=1)),)),), decision_time=decision)
     with pytest.raises(ValueError, match='policy'):
         score_champion_rows((replace(row, policy_version='other-strategy-v1'),), decision_time=decision)
+
+
+def test_score_champion_rows_allows_partial_factors_when_configured() -> None:
+    from datetime import UTC, datetime
+
+    from src.features.contracts import QvefFeatureRow
+    from src.strategy.scoring import ChampionScorePolicy, score_champion_rows
+
+    decision = datetime(2024, 1, 3, tzinfo=UTC)
+    common = {
+        "decision_session": decision,
+        "sector": "Technology",
+        "gross_profitability": None,
+        "roe": None,
+        "cfo_to_assets": None,
+        "book_to_price": None,
+        "earnings_to_price": None,
+        "operating_income_change": None,
+        "sales_growth": None,
+        "operating_margin_change": None,
+        "foreign_flow_5": None,
+        "foreign_flow_20": None,
+        "component_presence": ("all_components_present",),
+        "source_available_at": (("financial_facts", decision),),
+        "policy_version": "champion-v1-qvef-v1",
+    }
+    rows = (
+        QvefFeatureRow(
+            instrument_id="KRX:PARTIAL",
+            quality_score=None,
+            value_score=0.4,
+            earnings_score=None,
+            foreign_flow_score=0.8,
+            **common,
+        ),
+        QvefFeatureRow(
+            instrument_id="KRX:ONE",
+            quality_score=None,
+            value_score=0.5,
+            earnings_score=None,
+            foreign_flow_score=None,
+            **common,
+        ),
+    )
+
+    policy = ChampionScorePolicy(min_required_factors=2)
+    scores = {row.instrument_id: row for row in score_champion_rows(rows, decision_time=decision, policy=policy)}
+
+    import pytest
+
+    assert scores["KRX:PARTIAL"].eligible is True
+    assert scores["KRX:PARTIAL"].champion_score == pytest.approx(0.6)
+    assert scores["KRX:PARTIAL"].rank == 1
+    assert scores["KRX:PARTIAL"].exclusion_reasons == ()
+
+    assert scores["KRX:ONE"].eligible is False
+    assert scores["KRX:ONE"].champion_score is None
+    assert scores["KRX:ONE"].rank is None
+
