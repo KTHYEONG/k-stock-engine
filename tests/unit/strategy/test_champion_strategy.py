@@ -122,3 +122,65 @@ def test_champion_strategy_decide_emits_exit_intents() -> None:
     exit_intent = next((it for it in intents if it.instrument_id == old_inst.instrument_id), None)
     assert exit_intent is not None
     assert exit_intent.target_value == 0.0
+
+
+def test_champion_strategy_receives_complete_market_snapshot_from_session(tmp_path) -> None:
+    from datetime import UTC, datetime
+    import polars as pl
+    from src.core.portfolio import PortfolioSnapshot
+    from src.core.time import SessionCalendar
+    from src.data.backtest_sessions import build_backtest_sessions
+    from src.data.schemas import SilverTable
+    from src.data.snapshot import PITSnapshotRepository
+    from src.engine.decision import DecisionContext
+    from src.strategy.champion_strategy import ChampionStrategy
+    from src.strategy.scoring import ChampionScoreRow
+
+    d1 = datetime(2024, 1, 2, 9, 0, tzinfo=UTC)
+    d2 = datetime(2024, 1, 3, 9, 0, tzinfo=UTC)
+    frame = pl.DataFrame({
+        'session': [d1, d2],
+        'instrument_id': ['KRX:005930', 'KRX:005930'],
+        'open': [70000.0, 71000.0],
+        'high': [71000.0, 72000.0],
+        'low': [69500.0, 70500.0],
+        'close': [70500.0, 71500.0],
+        'volume': [1000000.0, 1100000.0],
+        'trading_value': [70500000000.0, 78650000000.0],
+        'available_at': [
+            d1.replace(hour=15, minute=30),
+            d2.replace(hour=15, minute=30),
+        ],
+    })
+    repo = PITSnapshotRepository.from_frames({SilverTable.DAILY_MARKET: frame}, root=tmp_path)
+    calendar = SessionCalendar((d1, d2))
+    sessions = build_backtest_sessions(
+        snapshot_repository=repo,
+        calendar=calendar,
+        start=d1,
+        end=d1,
+        decision_time_of=lambda s: s.replace(hour=15, minute=30),
+    )
+    assert len(sessions) == 1
+    session = sessions[0]
+    scores = (
+        ChampionScoreRow(
+            decision_session=d1,
+            instrument_id='KRX:005930',
+            eligible=True,
+            champion_score=0.95,
+            rank=1,
+            exclusion_reasons=(),
+            feature_policy_version='champion-v1-qvef-v1',
+            score_policy_version='champion-v1-scoring-v1',
+        ),
+    )
+    strategy = ChampionStrategy(scores_by_session={d1.date(): scores})
+    context = DecisionContext(
+        decision_time=session.decision_time,
+        portfolio=PortfolioSnapshot('test-acc', session.decision_time, 100_000_000.0, 0.0, ()),
+        market_snapshot=session.market_snapshot,
+    )
+    intents = strategy.decide(context)
+    assert len(intents) == 1
+    assert intents[0].instrument_id == 'KRX:005930'
