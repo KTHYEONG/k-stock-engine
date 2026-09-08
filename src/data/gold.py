@@ -391,8 +391,11 @@ def exclude_sentinel_corporate_actions(
         return candidate_instrument_ids
 
     by_instrument: dict[str, list[tuple[date, date]]] = {}
+    ca_types_by_iid: dict[str, set[str]] = {}
     for row in corporate_actions.to_dicts():
         iid = str(row.get("instrument_id") or "")
+        if iid:
+            ca_types_by_iid.setdefault(iid, set()).add(str(row.get("type") or ""))
         if not iid or iid == "KRX:__NO_ACTION__":
             continue
         try:
@@ -410,12 +413,7 @@ def exclude_sentinel_corporate_actions(
             excluded.add(iid)
             continue
         if window_start is None or window_end is None:
-            types = {
-                str(row.get("type") or "")
-                for row in corporate_actions.to_dicts()
-                if str(row.get("instrument_id") or "") == iid
-            }
-            if types == {"no_action"}:
+            if ca_types_by_iid.get(iid, set()) == {"no_action"}:
                 excluded.add(iid)
             continue
         cursor = window_start
@@ -641,6 +639,7 @@ def materialize_gold_window(
     gold_root: Path | None = None,
     universe_policy: Any | None = None,
     qvef_policy: Any | None = None,
+    score_policy: Any | None = None,
     silver_root: Path | None = None,
 ) -> GoldRunReport:
     """Run Gold-layer audit, generate daily historical universe decisions, and build QVEF features.
@@ -780,6 +779,7 @@ def materialize_gold_window(
             require_scores=False,
         )
 
+    s_policy = score_policy
     all_universe: list[UniverseDecision] = []
     all_features: list[QvefFeatureRow] = []
     universe_count = 0
@@ -868,6 +868,11 @@ def materialize_gold_window(
                 )
             if stream_writer is not None:
                 stream_writer.append_features(f_rows)
+                if s_policy is not None:
+                    from src.strategy.scoring import score_champion_rows
+
+                    score_rows = score_champion_rows(f_rows, decision_time=sess_dt, policy=s_policy)
+                    stream_writer.append_scores(score_rows)
             else:
                 all_features.extend(f_rows)
             feature_count += len(f_rows)
