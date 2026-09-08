@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ADR_20260908_champion_strategy_wiring",
+      "date": "2026-09-08",
+      "adr_id": "ADR_20260908_ADR_20260908_champion_strategy_wiring",
+      "domain": "strategy",
+      "title": "Champion Strategy Orchestration and Backtest Wiring",
+      "why": "Backtest CLI raised unwired error for full champion runs despite underlying selection and portfolio policies being implemented.",
+      "resolution": "Implemented ChampionStrategy adapter satisfying StrategyDecisionPort with monthly rebalancing, risk caps, and CLI backtest wiring.",
+      "impact": "Enabled end-to-end 10-year multi-stock backtests with portfolio construction, 7.5% security caps, and 25% sector caps."
+    },
+    {
       "task_id": "ADR_20260908_parallel_investor_flow_backfill",
       "date": "2026-09-08",
       "adr_id": "ADR_20260908_ADR_20260908_parallel_investor_flow_backfill",

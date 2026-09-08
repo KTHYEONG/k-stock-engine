@@ -155,7 +155,8 @@
     "testing": [
       "tests/integration/engine/test_unified_event_backtester.py",
       "tests/unit/data/test_backtest_runner.py",
-      "tests/unit/engine/test_backtest.py"
+      "tests/unit/engine/test_backtest.py",
+      "tests/unit/strategy/test_champion_strategy.py"
     ]
   },
   "src/engine/fill_model.py": {
@@ -202,7 +203,8 @@
       "tests/unit/data/test_backtest_runner.py",
       "tests/unit/engine/test_backtest.py",
       "tests/unit/execution/test_intents.py",
-      "tests/unit/execution/test_submit_intents.py"
+      "tests/unit/execution/test_submit_intents.py",
+      "tests/unit/strategy/test_champion_strategy.py"
     ]
   },
   "src/execution/domain/orders.py": {
@@ -291,6 +293,9 @@
   "src/storage/parquet_datasets.py": {
     "testing": "tests/unit/storage/test_parquet_datasets.py"
   },
+  "src/strategy/champion_strategy.py": {
+    "testing": "tests/unit/strategy/test_champion_strategy.py"
+  },
   "src/strategy/pipeline.py": {
     "testing": "tests/unit/strategy/test_pipeline.py"
   },
@@ -320,6 +325,5 @@
   },
   "src/validation/walk_forward.py": {
     "testing": "tests/unit/validation/test_walk_forward.py"
-  },
-  "tools/backfill_investor_flow_parallel.py": {}
+  }
 }
