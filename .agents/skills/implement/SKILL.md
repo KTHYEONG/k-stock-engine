@@ -17,6 +17,10 @@ Operate as a deterministic compiler translating `contract.json` into code and pa
    - Treat `contract.json` as absolute truth. Do not invent new parameters, change signatures, or create speculative abstraction layers.
    - **Anti-Stub Rule**: Never leave `pass`, `...`, `NotImplementedError`, `TODO`, or placeholder return values. Implement the full domain logic specified in `requirements`.
    - **Anti-Defensive-Sprawl Rule (CRITICAL)**: Do NOT add speculative `try-except` blocks, silent `except Exception: return None`, or unrequested `if x is None:` checks unless explicitly mandated by `requirements`. Untested defensive branches will instantly fail `lean_check` diff coverage. Code should be clean, deterministic, and fail-fast.
+   - **Anti-Cheat Directives (Strict Boundaries)**:
+     1) **No Tool/Governance Tampering**: NEVER edit files under `tools/`, `.agents/`, `AGENTS.md`, or test runners to bypass checks.
+     2) **No Production Contortion for Tests**: NEVER mutate module globals (`globals()[...] = ...`), inject dynamic monkeypatches in production paths, or add dead code/comments solely to satisfy tests or literal checker matches. Tests must adapt to production interfaces, not vice versa.
+     3) **No Silent Invariant Alteration**: When a contract requirement and an accompanying test fixture contradict each other, NEVER alter domain logic or slice inputs (e.g. `calendar[:-1]`) to force tests green. Escalate immediately to `/spec`.
    - **1:1 Test Mapping**: Every entry in `contract.json` -> `scenarios` (both unit and wiring scenarios) MUST be pasted faithfully across all specified `target_test_file`s (matching `scenario_id`). When using `pytest.raises`, always specify `match=` or concrete exceptions (Ruff PT011).
    - **Zero-Search Context Loading**: Read only `target_file`, `target_test_file`, and files listed in `context_files` (if present) via targeted `view_file`. Do NOT run exploratory `rg` / `find` / `list_dir` commands across the repository.
    - **Translate `design_rationale` & `performance_budget` Into Code, Not Just `requirements`**:

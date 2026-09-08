@@ -34,7 +34,7 @@ Focus on: *Is the hypothesis sound? What does the real data/runtime look like? W
      - Never rely on speculative assumptions when an empirical command can prove or falsify them.
 
 4. **Invariants & Performance Budget Formulation**:
-   - Define strict Fail-Closed invariants and domain boundaries (.agents/rules/quant.md, performance.md, python.md).
+   - Define strict Fail-Closed invariants and domain boundaries (.agents/rules/quant.md, performance.md, code-style.md).
    - If touching backtest, training, or bulk I/O, draft a realistic `performance_budget`:
      - `{ expected_data_scale, memory_target_mb, storage_format, dtype_precision, chunking_strategy }`
      - Do NOT introduce artificial truncation or shortened windows.

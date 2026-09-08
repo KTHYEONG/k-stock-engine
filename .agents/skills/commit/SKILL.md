@@ -3,9 +3,9 @@ name: commit
 description: Execute fast, automated git commits with 1-line rationale and optional multi-commit splitting.
 ---
 
-# Fast-Track Commit Protocol (Option B)
+# Fast-Track Commit Protocol (Option B - Production Standard)
 
-Ultra-fast automated git execution protocol. Includes a concise 1-line rationale (`Why:`) while avoiding heavy code verification loops and token waste.
+Ultra-fast automated git execution protocol. Enforces atomic commits, bisect-safe change grouping, and a concise 1-line rationale (`Why:`) while avoiding heavy code verification loops.
 
 ## Directives
 
@@ -15,25 +15,26 @@ Ultra-fast automated git execution protocol. Includes a concise 1-line rationale
    - NEVER execute commands that alter the working tree state (e.g., `git restore`, `git checkout`, `git reset`, `git clean`, file writes/deletions).
    - Stage deleted (`D`), modified (`M`), and untracked (`??`) files exactly as they currently exist.
 
-2. **Fast Inspection (No Full Diff / No Verification)**:
-   - Inspect status using `git status --short`.
-   - Do NOT read full diff or run linters (`ruff`), type checkers (`mypy`), or unit tests (`pytest`).
+2. **Exclusion of Ephemeral Paths (Zero Scratch/Tmp Commit)**:
+   - NEVER stage ephemeral artifacts: `scratch/`, `tmp/`, `.pytest_cache/`, `*.pyc`, logs, or scratch dumps.
+   - Stage by explicit paths or directories. Do NOT use blind `git add -A` when `scratch/` or `tmp/` files are present in `git status --short`.
 
-3. **Chained Execution & Atomicity**:
-   - **Atomic Principle**: A commit should represent one independently understandable and reasonably reversible logical change.
-   - **Single Layer / Small Changes**: Stage and commit in a single chained shell command:
+3. **Atomic & Bisect-Safe Commit Grouping**:
+   - **Bisect-Safe Invariant**: Code changes (`src/`) and their associated unit/integration tests (`tests/`) MUST be committed together in the same `feat:` or `fix:` commit so tests never break at checkout.
+   - **Boundary Separation**:
+     - `feat:` / `fix:` / `refactor:`: Core logic (`src/`) + relevant test updates (`tests/`).
+     - `docs:`: Documentation only (`docs/`, `*.md`, task indexes).
+     - `chore:`: Tooling, configs, dependencies (`pyproject.toml`, `.github/`, `.agents/`).
+     - `test:`: Pure test additions/refactoring without functional production code change.
+   - **Chained Multi-Commit**:
      ```bash
-     git add -A && git commit -m "<type>: <Korean summary <= 50 chars>" -m "- **Why:** <Concise reason ending with 함.>" && git log -n 1 --oneline
+     git add src/ tests/ && git commit -m "<type>: <Korean summary <= 50 chars>" -m "- **Why:** <Problem or concrete objective solved, ending with ~함.>" && git add docs/ && git commit -m "docs: <summary>" -m "- **Why:** <reason>" && git log -n 2 --oneline
      ```
-   - **Multi-Layer / Large Changes**: If file paths cross distinct logical boundaries (e.g. `src/` vs `docs/` vs `tests/`), split by path boundaries and chain consecutive commits in one command:
-     ```bash
-     git add <files1> && git commit -m "<type1>: <summary1>" -m "- **Why:** <reason1>" && git add <files2> && git commit -m "<type2>: <summary2>" -m "- **Why:** <reason2>"
-     ```
-   - Do NOT output markdown approval drafts or lengthy reasoning.
 
-4. **Message Standard**:
-   - Subject: `<type>: <Korean summary <= 50 chars>`
-   - Body: `- **Why:** <Concise 1-line reason ending with ~함.>`
+4. **Message Standard (Anti-Tautology & High-Signal Rationale)**:
+   - **Subject**: `<type>: <Korean summary <= 50 chars>` (Imperative, clear target)
+   - **Body**: `- **Why:** <Specific business/technical reason ending with ~함.>`
+   - **Prohibited Tautologies**: Avoid generic tautologies like "정합성을 확보함", "구조를 반영함", "회귀 방지 범위를 확보함". State **what problem was solved** or **what business requirement was met** (e.g., "동시호가 체결가 괴리율 완화 및 슬리피지 과소평가 보정을 위함.").
 
 ## Output
 
