@@ -1,5 +1,6 @@
 """Strategy domain contracts and deterministic decision policies."""
 
+from src.strategy.champion_strategy import ChampionStrategy  # noqa: I001
 from src.strategy.portfolio import ChampionPortfolioPolicy  # noqa: I001
 from src.strategy.portfolio import PortfolioSecurityInput  # noqa: I001
 from src.strategy.portfolio import construct_champion_portfolio  # noqa: I001
@@ -15,6 +16,7 @@ __all__ = [
     "ChampionPortfolioPolicy",
     "ChampionScorePolicy",
     "ChampionSelectionPolicy",
+    "ChampionStrategy",
     "PortfolioSecurityInput",
     "build_champion_portfolio",
     "build_historical_universe",

@@ -5,11 +5,10 @@ import argparse
 import json
 import sys
 from datetime import UTC, date, datetime
-from dotenv import load_dotenv
-
-load_dotenv()
 from pathlib import Path
 from typing import Any
+
+from dotenv import load_dotenv
 
 from src.data.backtest_runner import run_champion_backtest
 from src.data.backtest_sessions import build_backtest_sessions
@@ -26,6 +25,9 @@ from src.data.legacy_inventory import MigrationArtifactStore, inspect_legacy_dat
 from src.data.operations import execute_verified_legacy_purge
 from src.data.pipeline import materialize_backtest_inputs
 from src.data.schemas import PITDataError, SilverTable
+from src.strategy.champion_strategy import ChampionStrategy
+
+load_dotenv()
 
 
 def _parse_args() -> argparse.Namespace:
@@ -222,6 +224,36 @@ def _load_silver_table(silver_root: Path, table: SilverTable) -> Any:
     return load_latest_silver_table(root=silver_root, table=table, decision_time=datetime.now(UTC))
 
 
+def _champion_scores_by_session(scores_frame: Any) -> dict[date, tuple[Any, ...]]:
+    """Build the in-memory session index consumed by ChampionStrategy."""
+    from src.strategy.scoring import ChampionScoreReason, ChampionScoreRow
+
+    grouped: dict[date, list[ChampionScoreRow]] = {}
+    for row in scores_frame.to_dicts():
+        raw_session = row["decision_session"]
+        session_dt = raw_session if isinstance(raw_session, datetime) else datetime.fromisoformat(str(raw_session))
+        if session_dt.tzinfo is None:
+            session_dt = session_dt.replace(tzinfo=UTC)
+        raw_reasons = row.get("exclusion_reasons")
+        if isinstance(raw_reasons, str):
+            parts = [p.strip() for p in raw_reasons.split(",")]
+        else:
+            parts = [str(p).strip() for p in (raw_reasons or ())]
+        reasons = tuple(ChampionScoreReason(p) for p in parts if p)
+        score_row = ChampionScoreRow(
+            decision_session=session_dt,
+            instrument_id=str(row["instrument_id"]),
+            eligible=bool(row["eligible"]),
+            champion_score=None if row.get("champion_score") is None else float(row["champion_score"]),
+            rank=None if row.get("rank") is None else int(row["rank"]),
+            exclusion_reasons=reasons,
+            feature_policy_version=str(row["feature_policy_version"]),
+            score_policy_version=str(row["score_policy_version"]),
+        )
+        grouped.setdefault(session_dt.date(), []).append(score_row)
+    return {session: tuple(rows) for session, rows in grouped.items()}
+
+
 def _dispatch_backtest(args: argparse.Namespace) -> int:
     """Execute Champion backtest or single-instrument smoke test with replayable artifacts."""
     from datetime import date
@@ -253,6 +285,8 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     val_end = date.fromisoformat(str(getattr(args, "validation_end", "2016-12-30")))
     smoke_symbol = getattr(args, "smoke_symbol", None)
     gold_dataset_id = getattr(args, "gold_dataset_id", None)
+    scores_by_session: dict[date, tuple[Any, ...]] | None = None
+    strategy: Any = None
 
     if not smoke_symbol:
         _gid = str(gold_dataset_id) if gold_dataset_id is not None else ""
@@ -266,8 +300,9 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
             dataset_id=_gid,
             decision_time=gold_decision_time,
         )
-        load_gold_artifact_frames(bundle=bundle, decision_time=gold_decision_time)
-        raise PITDataError("session-driven Champion strategy is not wired")
+        scores_frame = load_gold_artifact_frames(bundle=bundle, decision_time=gold_decision_time)[2]
+        scores_by_session = _champion_scores_by_session(scores_frame)
+        strategy = ChampionStrategy(scores_by_session=scores_by_session)
 
     if not smoke_symbol and (not gold_root.exists() or not (gold_root / "universe").exists()):
         raise PITDataError("run-backtest requires resolved Gold artifact, session repository, config, and strategy")
@@ -312,6 +347,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         "instrument_id",
         "open",
         "close",
+        "volume",
         "trading_value",
     ]
     scans = [
@@ -403,8 +439,8 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
                     )
                 return ()
 
-        strategy: Any = SmokeStrategy()
-    else:
+        strategy = SmokeStrategy()
+    elif strategy is None:
         eligible_set: set[str] = set()
         universe_root = gold_root / "universe"
         if universe_root.exists():
