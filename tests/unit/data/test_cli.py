@@ -47,8 +47,11 @@ def test_run_backtest_refuses_without_resolved_execution_components(tmp_path) ->
 
 def test_run_backtest_validates_selected_bundle_before_execution(tmp_path, monkeypatch) -> None:
     from argparse import Namespace
+    from datetime import UTC, date, datetime
 
+    import polars as pl
     import pytest
+    import src.data.cli as cli_mod
     import src.data.gold_artifacts as gold_artifacts
     from src.data.cli import _dispatch_backtest
     from src.data.schemas import PITDataError
@@ -61,12 +64,35 @@ def test_run_backtest_validates_selected_bundle_before_execution(tmp_path, monke
 
     def fake_load(*, bundle, decision_time):
         calls.append(("load", "gold-2016"))
-        return (object(), object(), object())
+        scores = pl.DataFrame(
+            [
+                {
+                    "decision_session": datetime(2016, 1, 4, 15, 30, tzinfo=UTC),
+                    "instrument_id": "KRX:000001",
+                    "eligible": True,
+                    "champion_score": 1.0,
+                    "rank": 1,
+                    "exclusion_reasons": "",
+                    "feature_policy_version": "champion-v1-qvef-v1",
+                    "score_policy_version": "champion-v1-scoring-v1",
+                }
+            ]
+        )
+        return (object(), object(), scores)
 
     monkeypatch.setattr(gold_artifacts, "resolve_gold_artifact_bundle", fake_resolve)
     monkeypatch.setattr(gold_artifacts, "load_gold_artifact_frames", fake_load)
 
-    with pytest.raises(PITDataError, match="session-driven Champion strategy"):
+    created: dict[str, object] = {}
+    real_strategy = cli_mod.ChampionStrategy
+
+    def spy_strategy(*args, **kwargs):  # type: ignore[no-untyped-def]
+        created.update(kwargs)
+        return real_strategy(*args, **kwargs)
+
+    monkeypatch.setattr(cli_mod, "ChampionStrategy", spy_strategy)
+
+    with pytest.raises(PITDataError, match="requires resolved Gold artifact"):
         _dispatch_backtest(
             Namespace(
                 gold_root=tmp_path,
@@ -80,6 +106,7 @@ def test_run_backtest_validates_selected_bundle_before_execution(tmp_path, monke
         )
 
     assert calls == [("resolve", "gold-2016"), ("load", "gold-2016")]
+    assert list(created["scores_by_session"].keys()) == [date(2016, 1, 4)]  # type: ignore[union-attr]
 
 
 def _write_cli_fact_receipt(bronze_root, payload_text) -> None:
