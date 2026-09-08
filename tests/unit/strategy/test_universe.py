@@ -184,3 +184,105 @@ def test_universe_excludes_zero_value_bars_as_non_tradable() -> None:
     result = build_historical_universe(decision_session=sessions[-1], decision_time=sessions[-1], calendar=SessionCalendar(sessions), security_master=master, daily_market=daily, policy=UniversePolicy(minimum_listing_sessions=60, minimum_median_trading_value_krw=1.0))
 
     assert ExclusionReason.NON_TRADABLE_BAR in result[0].exclusion_reasons
+
+
+def test_dedup_master_frame_returns_latest_per_instrument() -> None:
+    from datetime import datetime, timedelta, timezone
+    import polars as pl
+    from src.strategy.universe import _dedup_master_frame
+
+    base = datetime(2024, 1, 1, tzinfo=timezone.utc)  # noqa: UP017
+    # 3 instruments, each with 2 snapshots at different available_at
+    frame = pl.DataFrame({
+        'instrument_id': ['A', 'A', 'B', 'B', 'C', 'C'],
+        'valid_from': [base, base + timedelta(days=10), base, base + timedelta(days=5), base, base],
+        'valid_to': [None, None, None, None, None, None],
+        'available_at': [base, base + timedelta(days=10), base, base + timedelta(days=5), base, base + timedelta(days=1)],
+        'sector': ['X', 'X_new', 'Y', 'Y_new', 'Z', 'Z_new'],
+    })
+
+    result = _dedup_master_frame(frame)
+
+    # Must have exactly 1 row per instrument
+    assert result.height == 3
+    by_id = {row['instrument_id']: row for row in result.to_dicts()}
+    # A: latest available_at is base+10 -> sector='X_new'
+    assert by_id['A']['sector'] == 'X_new'
+    # B: latest available_at is base+5 -> sector='Y_new'
+    assert by_id['B']['sector'] == 'Y_new'
+    # C: latest available_at is base+1 -> sector='Z_new'
+    assert by_id['C']['sector'] == 'Z_new'
+
+
+def test_dedup_master_frame_empty_returns_empty() -> None:
+    import polars as pl
+    from src.strategy.universe import _dedup_master_frame
+
+    frame = pl.DataFrame({'instrument_id': [], 'available_at': [], 'valid_from': []},
+                         schema={'instrument_id': pl.String, 'available_at': pl.Datetime('us','UTC'), 'valid_from': pl.Datetime('us','UTC')})
+    result = _dedup_master_frame(frame)
+    assert result.is_empty()
+    assert 'instrument_id' in result.columns
+
+
+def test_dedup_master_frame_missing_sort_columns_returns_unchanged() -> None:
+    import polars as pl
+    from src.strategy.universe import _dedup_master_frame
+
+    # Frame with no available_at or valid_from columns
+    frame = pl.DataFrame({'instrument_id': ['A', 'B'], 'sector': ['X', 'Y']})
+    result = _dedup_master_frame(frame)
+    # Must not crash and must return the full frame unchanged
+    assert result.height == frame.height
+    assert set(result.columns) == set(frame.columns)
+
+
+def test_build_historical_universe_perf_dedup_applied_before_groupby() -> None:
+    from datetime import UTC, datetime, timedelta
+    import polars as pl
+    from src.core.time import SessionCalendar
+    from src.strategy.universe import build_historical_universe
+
+    N_SESSIONS = 252
+    sessions = tuple(datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(N_SESSIONS))
+    calendar = SessionCalendar(sessions)
+    decision_session = sessions[-1]
+    base_available_at = sessions[0]
+
+    # Build master with 6 duplicate snapshots per instrument (simulating Silver bloat)
+    iid = 'KRX:000001'
+    master_rows = []
+    for j in range(6):
+        master_rows.append({  # noqa: PERF401
+            'instrument_id': iid,
+            'ticker': 'TEST',
+            'company_id': 'C1',
+            'market': 'KOSPI',
+            'sector': 'Industrials',
+            'listing_date': sessions[0],
+            'delisting_date': None,
+            'share_class': 'common',
+            'status': 'listed',
+            'valid_from': sessions[0],
+            'valid_to': None,
+            'available_at': base_available_at + timedelta(days=j),
+        })
+    master = pl.DataFrame(master_rows)
+    assert master.height == 6  # Confirm 6x bloat
+
+    daily = pl.DataFrame([
+        {'session': s, 'instrument_id': iid, 'trading_value': 5_000_000_000.0,
+         'open': 100.0, 'close': 100.0, 'volume': 1_000.0, 'available_at': s}
+        for s in sessions[-60:]
+    ])
+
+    decisions = build_historical_universe(
+        decision_session=decision_session,
+        decision_time=decision_session,
+        calendar=calendar,
+        security_master=master,
+        daily_market=daily,
+    )
+    assert len(decisions) == 1
+    assert decisions[0].instrument_id == iid
+    assert decisions[0].eligible is True, f'Expected eligible, got reasons: {decisions[0].exclusion_reasons}'
