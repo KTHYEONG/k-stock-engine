@@ -20,12 +20,15 @@ from src.storage.parquet_datasets import ParquetDatasetStore, canonical_content_
 class ChampionScorePolicy:
     version: str = "champion-v1-scoring-v1"
     required_feature_policy_version: str = "champion-v1-qvef-v1"
+    min_required_factors: int = 4
 
     def __post_init__(self) -> None:
         if not self.version or not self.version.strip():
             raise ValueError("policy version must be non-empty")
         if not self.required_feature_policy_version or not self.required_feature_policy_version.strip():
             raise ValueError("required_feature_policy_version must be non-empty")
+        if self.min_required_factors < 1 or self.min_required_factors > 4:
+            raise ValueError("min_required_factors must be between 1 and 4")
 
 
 class ChampionScoreReason(StrEnum):
@@ -128,31 +131,38 @@ def score_champion_rows(
     interim: list[_Interim] = []
     for row in rows:
         reasons: list[ChampionScoreReason] = []
+        factors: list[float] = []
         if row.quality_score is None:
             reasons.append(ChampionScoreReason.MISSING_QUALITY)
+        else:
+            factors.append(float(row.quality_score))
         if row.value_score is None:
             reasons.append(ChampionScoreReason.MISSING_VALUE)
+        else:
+            factors.append(float(row.value_score))
         if row.earnings_score is None:
             reasons.append(ChampionScoreReason.MISSING_EARNINGS)
+        else:
+            factors.append(float(row.earnings_score))
         if row.foreign_flow_score is None:
             reasons.append(ChampionScoreReason.MISSING_FOREIGN_FLOW)
-        reasons_sorted = tuple(sorted(reasons, key=lambda r: r.value))
-        if reasons_sorted:
-            eligible = False
-            champion_score: float | None = None
         else:
+            factors.append(float(row.foreign_flow_score))
+        reasons_sorted = tuple(sorted(reasons, key=lambda r: r.value))
+        if len(factors) >= policy.min_required_factors:
             eligible = True
-            qs = float(row.quality_score)  # type: ignore[arg-type]
-            vs = float(row.value_score)  # type: ignore[arg-type]
-            es = float(row.earnings_score)  # type: ignore[arg-type]
-            fs = float(row.foreign_flow_score)  # type: ignore[arg-type]
-            champion_score = (qs + vs + es + fs) / 4.0
+            champion_score = sum(factors) / float(len(factors))
+            effective_reasons: tuple[ChampionScoreReason, ...] = ()
+        else:
+            eligible = False
+            champion_score = None
+            effective_reasons = reasons_sorted
         interim.append(
             _Interim(
                 row=row,
                 eligible=eligible,
                 champion_score=champion_score,
-                reasons=reasons_sorted,
+                reasons=effective_reasons,
             )
         )
 
@@ -329,7 +339,10 @@ def materialize_champion_scores(
             }
         )
 
-    frame = pl.DataFrame(records).select(ordered_columns)
+    frame = pl.DataFrame(
+        records,
+        schema_overrides={"champion_score": pl.Float64, "rank": pl.Int64},
+    ).select(ordered_columns)
 
     sessions = [s.decision_session for s in sorted_scores]
     time_start = min(sessions)

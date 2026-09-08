@@ -1,6 +1,7 @@
 """Gold 검증 구간 bounded Parquet loading."""
 from __future__ import annotations
 
+import zoneinfo
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -344,6 +345,14 @@ def load_gold_window_inputs(
         columns=_CORPORATE_ACTIONS_COLUMNS,
     )
     # Guard: prior master/fact records needed for PIT eligibility must be kept.
+    if (
+        "market" in security_master_full.columns
+        and not security_master_full.is_empty()
+        and security_master_full["market"].dtype in (pl.String, pl.Categorical)
+    ):
+        known = security_master_full.filter((pl.col("market") != "__UNKNOWN__").fill_null(True))
+        if not known.is_empty():
+            security_master_full = known
     if "valid_from" in security_master_full.columns and not security_master_full.is_empty():
         try:
             security_master = security_master_full.filter(
@@ -354,8 +363,26 @@ def load_gold_window_inputs(
     else:
         security_master = security_master_full
     security_master = _compact_master_snapshots(security_master)
+    if (
+        not security_master.is_empty()
+        and "valid_from" in security_master.columns
+        and "listing_date" in security_master.columns
+        and security_master["listing_date"].dtype == security_master["valid_from"].dtype
+    ):
+        earliest_vf = security_master.group_by("instrument_id").agg(pl.col("valid_from").min().alias("_min_vf"))
+        security_master = security_master.join(earliest_vf, on="instrument_id").with_columns(
+            pl.when(pl.col("listing_date") == pl.col("valid_from"))
+            .then(pl.col("_min_vf"))
+            .otherwise(pl.col("listing_date"))
+            .alias("listing_date")
+        ).drop("_min_vf")
     try:
-        financial_facts = financial_facts_full.filter(pl.col("available_at") <= decision_time)
+        if "available_at" in financial_facts_full.columns and financial_facts_full["available_at"].dtype == pl.Datetime:
+            dt_tz = getattr(financial_facts_full["available_at"].dtype, "time_zone", None)
+            target_dt = decision_time.astimezone(zoneinfo.ZoneInfo(dt_tz)) if dt_tz else decision_time
+            financial_facts = financial_facts_full.filter(pl.col("available_at") <= target_dt)
+        else:
+            financial_facts = financial_facts_full.filter(pl.col("available_at") <= decision_time)
     except Exception as exc:
         raise PITDataError("invalid certified Silver table: financial_facts") from exc
     # Guard: invalid manifest or missing projected column never becomes empty frame.
