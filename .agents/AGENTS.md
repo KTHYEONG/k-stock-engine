@@ -16,18 +16,18 @@
 - **Question:** Direct technical analysis first, then concise answer. Include key reasoning path (2-4 lines) when complexity warrants it.
 - **Bug Fix / Triage:** State root cause first. Suggest fix that addresses root cause — minimal only when scope-limited, holistic when systemic.
 - **Feature Request:** Follow active skill flow (Probe -> Spec -> Implement -> Check).
-- **Audit / Check Result:** Provide concise findings. PASS = 1 line. FAIL = root cause + impact + suggested fix (up to 5 lines).
+- **Audit / Check Result:** Provide concise findings. PASS = 1 line (includes resolution summary if surgically remediated). FAIL = root cause + impact + suggested fix (up to 5 lines) only when unresolvable without user/architectural decision.
 
 ## 4. Execution & Environment Rules
 - **Environment Tooling:** All execution, linting, typing, and tests MUST use `uv run` prefix (`uv run ruff check`, `uv run mypy`, `uv run pytest`).
+- **Language Pragmatism & Equivalence of Rigor:** Default to Python. For critical hot-paths (latency, stateful loops, SIMD), evaluate and choose the optimal language/runtime autonomously. Any non-Python component must establish equivalent quality gates (strict typing/compiler checks, linter, tests) and provide typed bindings to Python.
 - **Project-Only Temp (No External /tmp):** All temporary artifacts MUST stay inside the repository. Scripts & command output logs go to `scratch/`; tool scratch roots go to `tmp/`. Never write to `/tmp`, `/tmp/opencode`, `%TEMP%`, or any external temp path. Tools that default to an external temp root (pytest `tmp_path`, `tempfile`, `TMPDIR`) are pinned to the project via `tests/conftest.py`. The sync skill purges `scratch/` and `tmp/`.
 - **File Modification Policy:** Use available patch/edit tools for existing files. Create a new file only when it does not exist.
 - **Context Control:** Omit unchanged lines with `# ... existing code ...`. Specify line ranges when viewing large files over 300 lines.
 - **Concise In-Code Comments & No Ephemeral Spec Refs:** In-line comments must be 1-2 lines maximum, explaining only immediate "Why" or domain constraints without multi-line storytelling. NEVER cite temporary `docs/specs/*.md` or `contract.json` paths in code, docstrings, CLI help, or comments (use persistent `ADR-XXXX` IDs or self-contained logic).
 
 ## 5. Domain & Skill Rule Routing
-- **Project Mission & Goals (소액 시드 복리 목표):** [project_goals.md](file:///docs/architecture/project_goals.md)
-- **Python Architecture & Standards:** [python.md](file:///.agents/rules/python.md)
+- **Code Style & Standards:** [code-style.md](file:///.agents/rules/code-style.md)
 - **Financial & Quant Engineering:** [quant.md](file:///.agents/rules/quant.md)
 - **Testing & Coverage Directives:** [testing.md](file:///.agents/rules/testing.md)
 - **Logging & Traceability Standards:** [logging.md](file:///.agents/rules/logging.md)

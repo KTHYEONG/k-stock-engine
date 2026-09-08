@@ -38,6 +38,7 @@
       "tests/unit/execution/test_submit_intents.py",
       "tests/unit/features/test_qvef.py",
       "tests/unit/integrations/dart/test_xbrl_standard.py",
+      "tests/unit/strategy/test_champion_strategy.py",
       "tests/unit/strategy/test_universe.py"
     ]
   },
@@ -126,7 +127,8 @@
       "tests/unit/integrations/dart/test_xbrl_standard.py",
       "tests/unit/integrations/krx/test_historical.py",
       "tests/unit/integrations/test_investor_flow_router.py",
-      "tests/unit/integrations/test_kis_investor_flow.py"
+      "tests/unit/integrations/test_kis_investor_flow.py",
+      "tests/unit/strategy/test_champion_strategy.py"
     ]
   },
   "src/data/silver.py": {
@@ -136,7 +138,8 @@
     "testing": [
       "tests/integration/data/test_pit_dataset_foundation.py",
       "tests/unit/data/test_backtest_runner.py",
-      "tests/unit/data/test_backtest_sessions.py"
+      "tests/unit/data/test_backtest_sessions.py",
+      "tests/unit/strategy/test_champion_strategy.py"
     ]
   },
   "src/data/streaming_normalization.py": {
