@@ -28,22 +28,29 @@ Independent audit gate completing the main development loop (`probe` -> `spec` -
      2) **Contract & Invariant Integrity**: Verify core business invariants, division by zero / None handling, and boundary edge cases specified in `requirements`. Verify each entry in `design_rationale.failure_modes` has a corresponding guard in the diff.
      3) **No Dead Defensive Code (Defensive Sprawl Audit)**: Flag unrequested `try-except Exception` catches, silent `except: return None`, or speculative null checks that hide bugs or skirt coverage.
      4) **Performance Budget Honored**: Confirm actual use of `dtype_precision`/`storage_format`/`chunking_strategy`, and flag any `timeout`, `max_iterations`/`n_epochs` cap, sample-size reduction, or shortened date-range introduced without technical justification (`.agents/rules/performance.md` §0).
-     5) **Domain Principle Compliance**: Cross-check against `.agents/rules/quant.md`, `.agents/rules/performance.md`, and `.agents/rules/python.md`.
+     5) **Domain Principle Compliance**: Cross-check against `.agents/rules/quant.md`, `.agents/rules/performance.md`, and `.agents/rules/code-style.md`.
      6) **Production Wire-up & No Ghost Paths**: Verify new logic is actually invoked in the production pipeline/entry-point and no unhandled branches or orphaned dead code remain.
 
-4. **Strict Audit Gate (Strictly No Code Mutation & Clean Routing)**:
-   - **Zero Code Modification**: Perform auditing independently. **Do NOT edit code or tests during the check pass.** Modifying code in `check` causes workflow leakage and destroys accountability.
-   - **Triage and Route Failures Cleanly**:
-     - **Route to `/implement`**: Defect is purely implementation execution (unrequested dead defensive branch, broken syntax, failing assertion, incomplete wiring). Command: Provide exact root cause and instruction to simplify/fix.
-     - **Route to `/spec`**: Defect is architectural or missing specification (missing wiring test scenario in contract, wrong invariant, contract signature mismatch, performance budget breach). Command: Provide exact contract amendment required.
-     - **Route to `/probe`**: Defect is fundamental hypothesis invalidation, unexpected mathematical instability, or algorithmic failure under real data that requires re-experimentation before re-contracting (results to be updated in `scratch/probe_<feature>.json`).
+4. **Strict Audit Gate & Surgical Remediation Authority (Zero Human-Pingpong)**:
+   - **Full Surgical Remediation Authority**:
+     - The high-reasoning auditor (`check`) has full authority to perform pinpoint surgical patches when the diagnosis is 100% deterministic:
+       1) **Contract/Fixture Contradictions**: When the spec contract requirement contradicts its own test fixture (e.g. denominator counting, conflicting assertion constants, missing sentinel import handling), the auditor directly amends `contract.json` and the corresponding test fixture.
+       2) **Production Contortion Cleanup**: When the implementer introduced artificial hacks (e.g. `globals()[...]`, dead comments to appease matchers), the auditor cleanly reverts the hack and redirects the test mock/fixture appropriately.
+       3) **Mechanical Wiring/Lint Defects**: Fix simple imports, wiring anchors, or missing scenarios directly.
+     - Immediately re-run `lean_check.py` to confirm the fix is green and sound.
+     - When verified, emit ✅ **PASS** with a 1-line resolution summary. Do NOT bounce back to user or call subagents.
+   - **Escalation Boundary (When to FAIL)**:
+     - Stop immediately and output `FAIL` ONLY when:
+       1) Fundamental business hypothesis invalidation or mathematical instability under real market data (`/probe`).
+       2) Deep architectural conflicts requiring trade-off decisions beyond the original spec scope (`/spec`).
+       3) Destructive actions or unresolvable financial correctness ambiguity affecting production money.
 
 ## Output
 
 Do NOT add any intro, preamble, sub-bullet checks, breakdown items, or conversational commentary.
 
 - **PASS** (Strict 1-Line ONLY):
-  ✅ PASS: <Audit Target>
+  ✅ PASS: <Audit Target> [Optional: (Resolved: <1-line surgical fix summary>)]
 
 - **FAIL** (Compact 1-2 Lines format):
   ❌ FAIL: <Audit Target> | Root: <Cause> | Impact: <Scope> | Fix: <Action> → `/implement`, `/spec`, or `/probe`
