@@ -471,7 +471,9 @@ def build_gold_audit_manifest(
     # PIT-safe company_id → instrument_id mapping
     company_to_instruments: dict[str, set[str]] = {}
     if not security_master.is_empty():
-        for row in security_master.to_dicts():
+        cols = [c for c in ("company_id", "instrument_id", "available_at") if c in security_master.columns]
+        sm_subset = security_master.select(cols).unique() if len(cols) == 3 else security_master
+        for row in sm_subset.to_dicts():
             av = row.get("available_at")
             try:
                 if av is not None and av <= decision_time:
@@ -691,9 +693,6 @@ def materialize_gold_window(
         corporate_actions = _inputs.corporate_actions
         investor_flow = _inputs.investor_flow
         assert calendar is not None
-        reader = PITReplayReader.from_silver_root(
-            silver_root=Path(silver_root), decision_time=decision_time, calendar=calendar
-        )
     if (
         calendar is None
         or security_master is None
@@ -721,23 +720,14 @@ def materialize_gold_window(
             .alias("listing_date")
         ).drop("_min_vf")
 
-    if has_complete_frames:
+    if has_complete_frames or silver_root is not None:
         assert calendar is not None
         assert security_master is not None
         assert daily_market is not None
         assert financial_facts is not None
         assert corporate_actions is not None
         flow_for_reader = investor_flow if investor_flow is not None else pl.DataFrame()
-        # Production frame replay: supplied GoldWindowInputs frames are the
-        # sole replay input; silver_root is provenance/fallback metadata only.
-        reader = PITReplayReader.from_frames(
-            calendar=calendar,
-            security_master=security_master,
-            daily_market=daily_market,
-            investor_flow=flow_for_reader,
-            financial_facts=financial_facts,
-            corporate_actions=corporate_actions,
-        )
+        reader = PITReplayReader.from_frames(calendar=calendar, security_master=security_master, daily_market=daily_market, investor_flow=flow_for_reader, financial_facts=financial_facts, corporate_actions=corporate_actions)
 
     # 1-3. Pre-flight audit manifest
     manifest = build_gold_audit_manifest(

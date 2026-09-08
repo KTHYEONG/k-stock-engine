@@ -142,7 +142,8 @@ def materialize_qvef_features(
             }
         )
 
-    frame = pl.DataFrame(records).select(ordered_columns)
+    numeric_overrides = dict.fromkeys(["gross_profitability", "roe", "cfo_to_assets", "book_to_price", "earnings_to_price", "operating_income_change", "sales_growth", "operating_margin_change", "foreign_flow_5", "foreign_flow_20", "quality_score", "value_score", "earnings_score", "foreign_flow_score"], pl.Float64)
+    frame = pl.DataFrame(records, schema_overrides=numeric_overrides).select(ordered_columns)
 
     # Time bounds
     sessions = [r.decision_session for r in sorted_rows]

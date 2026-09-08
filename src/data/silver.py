@@ -850,6 +850,8 @@ class SilverStore:
         output: dict[SilverTable, Path] = {}
         for table, frame in tables.items():
             validate_table(table, frame, decision_time=decision_time)
+            if table == SilverTable.INVESTOR_FLOW and frame.is_empty():
+                continue
             content_hash = canonical_content_hash(frame, frame.columns)
             # Build manifest
             time_start = datetime.combine(report.coverage_start, time.min, tzinfo=UTC)
