@@ -67,12 +67,10 @@ Keep chat response structured, scannable, and actionable using tables and clear 
 #### 2. 핵심 요구사항 (Key Requirements)
 - <Core domain constraints, invariants, or performance criteria in Korean>
 
-#### 3. 검증 시나리오 (Test Scenarios: Total <N>)
-- **Unit (<N>):**
-  - `<test_scenario_1>`: <Condition and expected behavior in Korean>
-  - `<test_scenario_2>`: <Boundary and edge case handling in Korean>
-- **Wiring (<N>):**
-  - `<test_scenario_wiring>`: <Caller and pipeline integration behavior in Korean>
+#### 3. 검증 시나리오 요약 (Test Verification Summary)
+- **Unit (<N>개)**: <High-level summary of covered units and core invariants in Korean>
+- **Wiring (<N>개)**: <High-level summary of caller/pipeline integration in Korean>
+- **사전 검증 게이트**: `lean_check --pre-impl` 통과 (<N>/<N> skeleton AST valid)
 
 ---
 👉 다음 단계: `/implement docs/specs/<feature>_contract.json`
