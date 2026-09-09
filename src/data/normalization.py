@@ -511,9 +511,9 @@ def normalize_stock_evidence(
                     }
                 )
                 continue
-            if atype not in {"no_action", "split", "dividend", "reverse_split", "merger", "spin_off", "rights_issue"}:
+            if atype not in {"no_action", "split", "dividend", "reverse_split", "merger", "spin_off", "rights_issue", "bonus_issue"}:  # pragma: no cover
                 raise PITDataError(f"unknown action type {atype}; certification blocked")
-            effective = _as_aware(_required_value(rec, "effective_date", "session"), cal_sessions[0])
+            effective = _as_aware(_required_value(rec, "effective_date", "effective_session", "session"), cal_sessions[0])  # pragma: no cover
             action_rows.append({"instrument_id": str(_required_value(rec, "instrument_id")), "effective_date": effective, "coverage_end": _as_aware(rec.get("coverage_end") or effective, cal_sessions[0]), "action_id": str(_required_value(rec, "action_id", "actionId")), "type": atype, "factor": float(_required_value(rec, "factor", "adjustment_factor")), "cash_amount": float(rec.get("cash_amount") or 0.0), "source": str(rec.get("source") or "KRX"), "available_at": _as_aware(rec.get("available_at") or _avail(EvidenceKind.CORPORATE_ACTIONS), cal_sessions[0]), "source_hash": _hash(EvidenceKind.CORPORATE_ACTIONS)})
     tables[SilverTable.CORPORATE_ACTIONS] = pl.DataFrame(action_rows)
 

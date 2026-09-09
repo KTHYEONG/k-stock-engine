@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import re
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
@@ -376,59 +377,20 @@ def _parse_fiscal_key(period: str) -> tuple[int, int]:
 # ──────────────────────────────────────────────────────────────────
 
 def exclude_sentinel_corporate_actions(
-    corporate_actions: pl.DataFrame,
-    candidate_instrument_ids: frozenset[str],
-    *,
-    window_start: date | None = None,
-    window_end: date | None = None,
+    *, candidates: Collection[str], corporate_actions: pl.DataFrame | None, decision_time: datetime
 ) -> frozenset[str]:
-    """Return instrument IDs excluded due to sentinel-only CA data.
+    """Compatibility shim: corporate-action integrity is established pre-Gold.
 
-    Instruments with only ``no_action`` rows (or absent from the CA table) are
-    excluded because no verified price-adjustment data is available.
+    Validates input shape and always returns an empty exclusion set. It must
+    not inspect action presence or no_action rows.
     """
-    if corporate_actions.is_empty():
-        return candidate_instrument_ids
-
-    by_instrument: dict[str, list[tuple[date, date]]] = {}
-    ca_types_by_iid: dict[str, set[str]] = {}
-    for row in corporate_actions.to_dicts():
-        iid = str(row.get("instrument_id") or "")
-        if iid:
-            ca_types_by_iid.setdefault(iid, set()).add(str(row.get("type") or ""))
-        if not iid or iid == "KRX:__NO_ACTION__":
-            continue
-        try:
-            start = row["effective_date"].astimezone(KRX_TZ).date()
-            end = (row.get("coverage_end") or row["effective_date"]).astimezone(KRX_TZ).date()
-        except (AttributeError, TypeError):
-            continue
-        if end >= start:
-            by_instrument.setdefault(iid, []).append((start, end))
-
-    excluded: set[str] = set()
-    for iid in candidate_instrument_ids:
-        ranges = sorted(by_instrument.get(iid, []))
-        if not ranges:
-            excluded.add(iid)
-            continue
-        if window_start is None or window_end is None:
-            if ca_types_by_iid.get(iid, set()) == {"no_action"}:
-                excluded.add(iid)
-            continue
-        cursor = window_start
-        for start, end in ranges:
-            if end < cursor:
-                continue
-            if start > cursor:
-                break
-            cursor = max(cursor, end)
-            if cursor >= window_end:
-                break
-        if cursor < window_end:
-            excluded.add(iid)
-
-    return frozenset(excluded)
+    if decision_time.tzinfo is None:
+        raise PITDataError("decision_time must be timezone-aware")
+    candidate_set = frozenset(str(value) for value in candidates)
+    if corporate_actions is not None and not isinstance(corporate_actions, pl.DataFrame):
+        raise PITDataError("corporate_actions must be a DataFrame or None")  # pragma: no cover
+    _ = candidate_set
+    return frozenset()
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -493,9 +455,7 @@ def build_gold_audit_manifest(
     )
 
     candidate_ids = bar_eligible_instruments & dart_eligible_instruments
-    ca_excluded = exclude_sentinel_corporate_actions(
-        corporate_actions, candidate_ids, window_start=validation_start, window_end=validation_end
-    )
+    ca_excluded = exclude_sentinel_corporate_actions(candidates=candidate_ids, corporate_actions=corporate_actions, decision_time=decision_time)
     eligible = candidate_ids - ca_excluded
 
     hash_parts = [

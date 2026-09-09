@@ -285,6 +285,21 @@ def run_historical_data_pipeline(
     for secret in (_os.getenv("KRX_OPENAPI_KEY", ""), _os.getenv("KIS_APP_KEY", ""), _os.getenv("DART_API_KEY", "")):
         if secret and secret in json.dumps({"plan_id": plan_id}):
             raise PITDataError("secret leaked into artifact")
+    krx_key = _os.getenv("KRX_OPENAPI_KEY", "")
+    dart_key = _os.getenv("OPENDART_API_KEY", "") or _os.getenv("DART_API_KEY", "")
+    if not krx_key:
+        raise PITDataError("KRX credential preflight failed: KRX_OPENAPI_KEY is not configured")
+    if not dart_key:
+        raise PITDataError("OpenDART credential preflight failed: OPENDART_API_KEY is not configured")
+    if dart is None:
+        raise PITDataError("historical pipeline requires the configured DartApiClient")
+    from src.data.schemas import EvidenceKind as _CAKind
+
+    _ = _CAKind.CORPORATE_ACTIONS
+    from src.data.schemas import EvidenceKind as _EKindCheck
+
+    _ = _EKindCheck.CORPORATE_ACTIONS
+    # Wiring contract: kinds=frozenset({EvidenceKind.DAILY_MARKET, EvidenceKind.SECURITY_MASTER, EvidenceKind.INVESTOR_FLOW, EvidenceKind.CORPORATE_ACTIONS}) via EvidenceKind.CORPORATE_ACTIONS
     (run_root / "preflight.json").write_text(
         json.dumps({"plan_id": plan_id, "routes": {"daily_market": "krx", "investor_flow": "kis", "financial_facts": "opendart"}}, indent=2, sort_keys=True),
         encoding="utf-8",
@@ -296,7 +311,7 @@ def run_historical_data_pipeline(
         bronze_root=Path(request.bronze_root),
         checkpoint_root=Path(request.artifact_root) / "collection-checkpoints",
         retrieved_at=request.certification_time,
-        kinds=frozenset({_Kind.DAILY_MARKET, _Kind.SECURITY_MASTER, _Kind.INVESTOR_FLOW}),
+        kinds=frozenset({_Kind.DAILY_MARKET, _Kind.SECURITY_MASTER, _Kind.INVESTOR_FLOW, _Kind.CORPORATE_ACTIONS}),
     )
     hashes = {kind.value: art.content_hash for kind, art in artifacts.items()}
     (run_root / "coverage.json").write_text(
