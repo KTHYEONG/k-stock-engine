@@ -8,31 +8,20 @@ priority: 10
 
 # Quant & Financial Engineering Principles
 
-This document provides quantitative and financial directives for building robust, evidence-based trading systems.
+> **Never leak future information, preserve the reality of capital flows and execution viability, guard against validation leakage and overfitting, and prioritize economic correctness over specific implementation mechanics.**
 
-## 0. Priority Hierarchy
-1. **Logic Robustness Over Metrics:** Prioritize sound financial reasoning and statistical validity over metric overfitting.
-2. **Data Integrity & Realism:** Enforce strict temporal availability and cost accounting.
-3. **Numerical Stability:** Handle division by zero and floating-point edge cases safely.
+## 1. Temporal Integrity & Information Availability (PIT & Leakage)
+- **Information Availability:** Use strictly data that was realistically known and released at the decision timestamp. Never apply `.shift(1)` blindly without causal verification.
+- **Point-in-Time (PIT) & Survivorship:** Ensure universes, index constituents, and financial/filing disclosures contain no look-ahead restatements or survivorship bias.
+- **ML & Validation Leakage:** Prevent feature/label overlap across splits. Apply purging/embargoing for overlapping windows, and fit all learned preprocessing (scalers, encoders, feature selection) strictly on train folds.
 
-## 1. Safe Division & Numerical Stability
-- **Safe Vectorized Division:** Use `np.divide` with explicit `out` initialization and `where` masks to avoid uninitialized memory or zero-division warnings.
-  ```python
-  result = np.zeros_like(numerator, dtype=float)
-  np.divide(numerator, denominator, out=result, where=denominator != 0)
-  ```
-- **Log-space Operations:** Use `np.log1p()` and `np.expm1()` for compounding returns or small rates to avoid numerical underflow.
-
-## 2. Information Availability & Pipeline Timestamps
-- **Explicit Timestamp Semantics:** Define `observation_time` (event occurrence), `decision_time` (signal calculation), and `execution_time` (order fill).
-- **Information Availability:** Enforce that all data used at `decision_time` was available in reality. Do not prescribe `.shift(1)` blindly unless required by pipeline semantics.
-- **Data Alignment (`merge_asof`):** Align datasets using release timestamps and verified monotonic time ordering to prevent look-ahead bias.
-
-## 3. Microstructure & Financial Realism
-- **Trading Costs:** Model transaction fees, securities transaction tax (국내주식 거래세), bid-ask spread, tick size constraints, and execution slippage.
+## 2. Cash-Equity Realism & Ledger Accounting
+- **Execution Viability & Friction:** Differentiate signal prices from realistically executable fill prices (spread, tick size constraints, auction dynamics, slippage). Account for transaction taxes (국내주식 거래세), brokerage commissions, and exchange fees.
 - **Settlement & Cash Drag:** Account for T+2 settlement cycles, cash drag, and shared-Ledger NAV accounting when evaluating long-only cash-equity portfolio rebalancing and execution.
+- **Portfolio Accounting Consistency:** Accurately reconcile cash, positions, fees, P&L, and external cash flows to avoid misrepresenting portfolio performance metrics (TWR, MWR, CAGR).
+- **Research-to-Production Parity:** Maintain consistent universe definitions, sizing logic, timing semantics, and feature engineering across research/backtesting and live execution.
 
-## 4. Machine Learning & Labeling
-- **Objective-Driven Metrics:** Select classification/regression labels and evaluation metrics (IC, Sharpe, Accuracy, R²) directly from the economic decision objective.
-- **Purging & Embargoing:** Apply purged/embargoed validation when using overlapping label windows to prevent leakage between train and test sets.
-- **Scaler Isolation:** Fit scalers strictly on training folds; transform validation and test folds independently.
+## 3. Numerical Integrity & Economic Correctness
+- **Numerical Edge Cases:** Handle division by zero, NaNs, and infinities according to their genuine market meaning (e.g., halted trading, zero volume, unfillable orders) rather than silently coercing them into arbitrary normal values.
+- **Metric Significance vs. Overfitting:** Avoid blindly tuning parameters against isolated metrics (Sharpe, Accuracy); guard against selection bias and evaluate economic viability aligned with the investment objective.
+- **Principles Over Mechanics:** Prioritize sound financial and statistical meaning over rigid dogma around specific functions or recipes.

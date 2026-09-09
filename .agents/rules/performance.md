@@ -1,46 +1,31 @@
 ---
 trigger:
   - on_label: ["performance"]
-  - on_file_path_regex: "src/.*(engine|data|features|strategy|validation|execution).*"
-  - on_file_path_glob: ["src/engine/**/*.py", "src/data/**/*.py", "src/features/**/*.py", "src/strategy/**/*.py"]
+  - on_file_path_regex: "src/.*(engine|data|features|strategy|validation|execution|portfolio).*"
+  - on_file_path_glob: ["src/engine/**/*.py", "src/data/**/*.py", "src/features/**/*.py", "src/strategy/**/*.py", "src/execution/**/*.py"]
 priority: 10
 ---
 
 # Performance & Optimization Directives (Measurement-Driven)
 
-This document defines performance optimization guidelines focused on empirical benchmarks rather than static hardware mandates.
+> **Never reduce workload scope to hide performance issues. Preserve correctness first. Profile and benchmark to find actual bottlenecks. Apply targeted optimizations suited to the bottleneck shape and verify gains before and after.**
 
----
+## 1. Workload Semantics & Completion Integrity
+- **Preserve Workload Semantics:** Never silently reduce the requested date range, dataset, iterations, epochs, or simulation scope merely for convenience or speed.
+- **Distinguish Heavy Runs from Hangs:** Long runtime alone is not a bug; distinguish legitimate computation from hangs, deadlocks, or pathological scaling using observable progress, heartbeats, and profiling. Do not rely on arbitrary hardcoded timeouts.
+- **Inference Over Interruption:** Derive reasonable execution parameters from existing configurations, schemas, and conventions; clarify with the user only when an ambiguity fundamentally alters requirements or performance guarantees.
 
-## 0. Completion Integrity (Non-Negotiable)
-- **No Self-Imposed Timeouts:** Never attach an arbitrary `timeout`, `max_iterations`/`n_epochs` cap, or a shrunk sample/date-range to a backtest or ML training run just to finish faster or save tokens/turns. Use the caller-specified stopping criterion (full date range, convergence, epoch budget stated in the spec's `requirements`); if none is stated, ask rather than silently truncating.
-- **Long-Running Is the Correct Outcome, Not a Bug:** A multi-hour backtest or training run completing in full is success, not something to optimize away. Only act on measured bottlenecks (section 1) — never by cutting scope or duration.
-- **Hang Detection ≠ Time Limit:** A watchdog/timeout is only for detecting a genuine hang (no progress, deadlock). Set it as a generous multiple (5-10x) of the measured or estimated full-run duration, and treat a trip as an infrastructure bug to report — never as "partial results are good enough, ship it."
+## 2. Measurement-Driven Optimization
+- **Correctness First:** Maintain algorithmic correctness, readability, and numerical stability; optimize measured bottlenecks only.
+- **Empirical Benchmarking:** Establish repeatable before-and-after benchmarks with realistic variance tolerances to justify optimizations.
+- **Measured Resource Scaling:** Dynamically size worker pools, thread concurrency, and batch sizes based on measured CPU, memory, and I/O scaling rather than static assumptions.
 
----
+## 3. Storage, Memory & I/O Semantics
+- **Efficient I/O:** Leverage column pruning, predicate pushdown, and stream/chunked reads to avoid loading unnecessary data into memory.
+- **Pragmatic Memory Management:** Consider views, in-place modifications, or chunking only when memory is a measured bottleneck, ensuring copy/view semantics and code clarity are not compromised.
+- **Precision Validation:** Downcast types (e.g., to `float32` or compact integers) only after verifying that numerical drift does not impact financial/statistical correctness.
 
-## 1. Measurement & Bottleneck Philosophy
-- **Correctness First:** Prioritize code correctness and algorithmic soundness; optimize measured bottlenecks only.
-- **Benchmark Driven:** Establish a benchmark before and after optimization to prove gains.
-- **Hardware & System Resource Scaling:** Determine worker counts, process pools, and batch sizes dynamically based on system resource availability (`psutil`), workload footprint, and measured scaling.
-- **Data I/O & Storage Format:** Utilize Parquet with PyArrow backend (`pyarrow`) for optimized columnar data reading and memory-mapped dataset access.
-
----
-
-## 2. Memory & Precision Optimization
-- **Precision Validation:** Use `float32` for large arrays or intermediate feature matrices only after numerical-error validation. Retain `float64` for sensitive matrix inversions or compounding returns.
-- **Memory Footprint Management:** Prefer in-place operations or view slices for large arrays (`numpy`, `pandas`). Avoid unnecessary deep copying.
-- **Targeted Memory Releases:** Invoke explicit garbage collection (`gc.collect()`) or GPU cache clearing (e.g., `torch.cuda.empty_cache()` if PyTorch is used) only when profiling indicates retained-memory pressure.
-
----
-
-## 3. High-Performance Execution & Parallelism
-- **Vectorization vs Loops:** Prefer vectorization (NumPy / Pandas, or Polars if introduced) for large hot-path computations. Allow standard Python loops for control-flow or lightweight tasks where vectorization overhead exceeds benefits.
-- **Autonomous Engine Selection & Equivalence of Rigor:** When a measured bottleneck resists vectorization (e.g. sequential state-dependent loops, latency-critical matching), autonomously select the best-fit language or execution engine (compiled/JIT/native extensions). Any introduced non-Python component must establish its own rigorous quality baseline (strict type/compiler checks, linter, tests) and expose typed bindings to Python.
-- **JIT Strategy (If Numba/JAX used):** Pass memory-contiguous arrays to JIT functions (`np.ascontiguousarray`). Use JIT caching when functions are repeatedly compiled across runs.
-- **Measured Parallelization:** Restrict process pool or thread execution to heavy tasks where task computation time significantly outweighs inter-process/inter-thread communication overhead.
-
----
-
-## 4. Performance Regression & Stability
-- **Variance Tolerance:** Evaluate performance regressions using stable, repeatable benchmarks with realistic variance tolerances.
+## 4. Execution Escalation & Parallelism
+- **Vectorization vs. Loops:** Prefer vectorized operations where array semantics naturally apply. Retain straightforward loops for control flow or lightweight logic where vectorization adds needless complexity.
+- **Escalate When Justified:** If a measured hot path cannot be efficiently handled with standard vectorization (e.g., sequential order matching, ledger replay), evaluate JIT compilation, native code, out-of-core engines, or parallelism based on the bottleneck shape. Adopt added complexity only when benchmarks demonstrate meaningful gains.
+- **Parallelism Overhead:** Restrict multi-processing or multi-threading to workloads where computational gains significantly outweigh process spawning and IPC/serialization overhead.

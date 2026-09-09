@@ -53,13 +53,29 @@ Downstream `implement` models have low reasoning capacity and cannot extrapolate
 
 ## Chat Output Format
 
-Keep chat response strictly minimal, zero-redundancy, and actionable (do not repeat spec details contained inside the JSON):
+Keep chat response structured, scannable, and actionable using tables and clear bullet points (avoid dense wall-of-text paragraphs).
+**Language Requirement:** All instructions and template fields below are written in English, but the actual rendered chat response to the user MUST be translated and presented in Korean (한국어) for intuitive review.
 
 ### 📐 [SPEC] <Feature Name>
 
-- **계약 파일**: `docs/specs/<feature>_contract.json` (Pre-impl check: ✅ PASS)
-- **대상 파일**: `<target_file>` (+ wiring: `<caller_file>`)
-- **테스트 시나리오**: 총 <N>개 (<Unit N개> + <Wiring N개> executable skeletons)
+#### 1. 변경 요약 (Changes & Wiring)
+| 구분 (Category) | 대상 파일 / 심볼 (Target / Symbol) | 변경 핵심 (Core Logic) |
+| :--- | :--- | :--- |
+| **Target** | `<target_file>` / `<symbol_name>` | <Summary of role and behavior in Korean> |
+| **Wiring** | `<caller_file>` / `<anchor_location>` | <Summary of caller hookup in Korean> |
+
+#### 2. 핵심 요구사항 (Key Requirements)
+- <Core domain constraints, invariants, or performance criteria in Korean>
+
+#### 3. 검증 시나리오 (Test Scenarios: Total <N>)
+- **Unit (<N>):**
+  - `<test_scenario_1>`: <Condition and expected behavior in Korean>
+  - `<test_scenario_2>`: <Boundary and edge case handling in Korean>
+- **Wiring (<N>):**
+  - `<test_scenario_wiring>`: <Caller and pipeline integration behavior in Korean>
 
 ---
-👉 `/implement docs/specs/<feature>_contract.json`
+👉 다음 단계: `/implement docs/specs/<feature>_contract.json`
+
+
+
