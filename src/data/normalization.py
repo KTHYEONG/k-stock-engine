@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 from typing import Any
@@ -278,6 +278,19 @@ def _required_value(record: dict[str, Any], *keys: str) -> Any:
     raise PITDataError(f"missing required provider field: {'/'.join(keys)}")
 
 
+def normalize_corporate_action_records(*, action_records: Sequence[Mapping[str, Any]], calendar_sessions: tuple[datetime, ...], corporate_action_available_at: datetime, corporate_action_source_hash: str) -> pl.DataFrame:
+    fallback_session = calendar_sessions[0]
+    rows: list[dict[str, Any]] = []
+    for record in action_records:
+        rec = dict(record)
+        atype = str(rec.get("type") or rec.get("action_type") or rec.get("action_code") or "no_action").strip()
+        if (atype == "bonus_issue" and (rec.get("share_listing_date") is None or rec.get("share_delta") is None)) or atype not in {"no_action", "split", "dividend", "reverse_split", "merger", "spin_off", "rights_issue", "bonus_issue"}:
+            raise PITDataError(f"unsupported legacy corporate action {atype!r} requires rebuild from raw OpenDART Bronze; certification blocked")
+        effective = _as_aware(rec.get("effective_date") or rec.get("effective_session") or rec.get("session") or fallback_session, fallback_session)
+        rows.append({"instrument_id": str(_required_value(rec, "instrument_id")), "effective_date": effective, "coverage_end": _as_aware(rec.get("coverage_end") or effective, fallback_session), "action_id": str(rec.get("action_id") or rec.get("actionId") or "no_action"), "type": atype, "factor": float(rec.get("factor") or rec.get("adjustment_factor") or 1.0), "cash_amount": float(rec.get("cash_amount") or 0.0), "source": str(rec.get("source") or "KRX"), "share_listing_date": rec.get("share_listing_date"), "share_delta": rec.get("share_delta"), "available_at": _as_aware(rec.get("available_at") or corporate_action_available_at, fallback_session), "source_hash": corporate_action_source_hash})
+    return pl.DataFrame(rows)
+
+
 def normalize_stock_evidence(
     receipts: Mapping[EvidenceKind, BronzeReceipt],
     *,
@@ -486,36 +499,9 @@ def normalize_stock_evidence(
         if streamed_corporate_actions is not None
         else _records_from(payloads[EvidenceKind.CORPORATE_ACTIONS])
     )
-    action_rows: list[dict[str, Any]] = []
     if not action_records:
         raise PITDataError("corporate-action/status response is empty; certification blocked")
-    else:
-        for rec in action_records:
-            atype = str(
-                rec.get("type") or rec.get("action_type") or rec.get("action_code") or "no_action"
-            ).strip()
-            if atype == "no_action":
-                effective = rec.get("effective_date") or rec.get("session") or cal_sessions[0]
-                action_rows.append(
-                    {
-                        "instrument_id": str(_required_value(rec, "instrument_id")),
-                        "effective_date": _as_aware(effective, cal_sessions[0]),
-                        "coverage_end": _as_aware(rec.get("coverage_end") or effective, cal_sessions[0]),
-                        "action_id": str(rec.get("action_id") or rec.get("actionId") or "no_action"),
-                        "type": atype,
-                        "factor": float(rec.get("factor") or rec.get("adjustment_factor") or 1.0),
-                        "cash_amount": float(rec.get("cash_amount") or 0.0),
-                        "source": str(rec.get("source") or "KRX"),
-                        "available_at": _as_aware(rec.get("available_at") or _avail(EvidenceKind.CORPORATE_ACTIONS), cal_sessions[0]),
-                        "source_hash": _hash(EvidenceKind.CORPORATE_ACTIONS),
-                    }
-                )
-                continue
-            if atype not in {"no_action", "split", "dividend", "reverse_split", "merger", "spin_off", "rights_issue", "bonus_issue"}:  # pragma: no cover
-                raise PITDataError(f"unknown action type {atype}; certification blocked")
-            effective = _as_aware(_required_value(rec, "effective_date", "effective_session", "session"), cal_sessions[0])  # pragma: no cover
-            action_rows.append({"instrument_id": str(_required_value(rec, "instrument_id")), "effective_date": effective, "coverage_end": _as_aware(rec.get("coverage_end") or effective, cal_sessions[0]), "action_id": str(_required_value(rec, "action_id", "actionId")), "type": atype, "factor": float(_required_value(rec, "factor", "adjustment_factor")), "cash_amount": float(rec.get("cash_amount") or 0.0), "source": str(rec.get("source") or "KRX"), "available_at": _as_aware(rec.get("available_at") or _avail(EvidenceKind.CORPORATE_ACTIONS), cal_sessions[0]), "source_hash": _hash(EvidenceKind.CORPORATE_ACTIONS)})
-    tables[SilverTable.CORPORATE_ACTIONS] = pl.DataFrame(action_rows)
+    tables[SilverTable.CORPORATE_ACTIONS] = normalize_corporate_action_records(action_records=action_records, calendar_sessions=tuple(cal_sessions), corporate_action_available_at=_avail(EvidenceKind.CORPORATE_ACTIONS), corporate_action_source_hash=_hash(EvidenceKind.CORPORATE_ACTIONS))
 
     # Historical costs.
     cost_payload = payloads[EvidenceKind.HISTORICAL_COSTS]
@@ -540,7 +526,7 @@ def normalize_stock_evidence(
         cov_start = min(s.astimezone(UTC).date() for s in cal_sessions)
         cov_end = max(s.astimezone(UTC).date() for s in cal_sessions)
     report = certify_silver(
-        tables,
+        tables=tables,
         receipts=receipts,
         coverage_start=cov_start,
         coverage_end=cov_end,

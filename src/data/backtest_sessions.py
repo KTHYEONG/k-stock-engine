@@ -148,6 +148,14 @@ def validate_corporate_action_coverage(
         iid = str(row["instrument_id"])
         by_instrument.setdefault(iid, []).append(row)
     research_returns: dict[tuple[datetime, str], float] = {}
+    bonus_rows = [
+        row
+        for row in action_rows
+        if str(row.get("action_type", row.get("type", ""))) == "bonus_issue"
+    ]
+    has_settlement = "share_listing_date" in corporate_actions.columns and "share_delta" in corporate_actions.columns
+    if bonus_rows and not has_settlement:
+        raise PITDataError("legacy bonus_issue corporate-action evidence requires rebuild")
     for iid, rows in by_instrument.items():
         ordered = sorted(rows, key=lambda r: _coerce_session(r["session"]))
         for prev_row, curr_row in pairwise(ordered):
@@ -172,7 +180,7 @@ def validate_corporate_action_coverage(
                     if abs(adjusted) > threshold:
                         raise PITDataError(f"unreconciled corporate action factor for {iid!r}")  # pragma: no cover
                     research_returns[(curr_session, iid)] = adjusted
-                if has_shares and raw_type in ("split", "reverse_split", "bonus_issue"):
+                if has_shares and raw_type in ("split", "reverse_split"):
                     prev_shares = _require_finite_positive(prev_row.get("shares_outstanding"), field="shares_outstanding")
                     curr_shares = _require_finite_positive(curr_row.get("shares_outstanding"), field="shares_outstanding")
                     curr_cap = _require_finite_positive(curr_row.get("market_cap"), field="market_cap")
@@ -189,7 +197,7 @@ def validate_corporate_action_coverage(
                         if abs(adjusted) > threshold:
                             raise PITDataError(f"unreconciled corporate action factor for {iid!r}")
                         research_returns[(curr_session, iid)] = adjusted
-                        if has_shares:
+                        if has_shares and raw_type in ("split", "reverse_split"):
                             prev_shares = _require_finite_positive(prev_row.get("shares_outstanding"), field="shares_outstanding")
                             curr_shares = _require_finite_positive(curr_row.get("shares_outstanding"), field="shares_outstanding")
                             curr_cap = _require_finite_positive(curr_row.get("market_cap"), field="market_cap")
@@ -201,6 +209,65 @@ def validate_corporate_action_coverage(
                         research_returns[(curr_session, iid)] = (curr_close + float(meta["cash"])) / prev_close - 1.0
                 else:
                     research_returns[(curr_session, iid)] = raw_return
+    bonus_settlement = bonus_rows if has_settlement else []
+    sessions_by_instrument: dict[str, list[datetime]] = {}
+    bars_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for brow in bar_rows:
+        biid = str(brow.get("instrument_id"))
+        bsess = _coerce_session(brow.get("session"))
+        sessions_by_instrument.setdefault(biid, []).append(bsess)
+        bars_by_key[(biid, bsess.isoformat())] = brow
+    for biid in sessions_by_instrument:
+        sessions_by_instrument[biid] = sorted(sessions_by_instrument[biid])
+    seen_settlement_ids: set[str] = set()
+    has_duplicate_settlement_id = False
+    all_rows_ok = True
+    settlement_by_key: dict[tuple[str, str], list[Any]] = {}
+    for row in bonus_settlement:
+        riid = str(row.get("instrument_id", ""))
+        aid = str(row.get("action_id", ""))
+        has_duplicate_settlement_id = has_duplicate_settlement_id or (aid in seen_settlement_ids)
+        seen_settlement_ids.add(aid)
+        raw_delta = row.get("share_delta")
+        delta = raw_delta if isinstance(raw_delta, int) and not isinstance(raw_delta, bool) and raw_delta > 0 else 0
+        raw_listing = row.get("share_listing_date")
+        listing_sess = raw_listing if isinstance(raw_listing, datetime) else None
+        eff_session = _coerce_session(row.get("effective_session", row.get("effective_date")))
+        row_ok = delta > 0 and listing_sess is not None and listing_sess.tzinfo is not None and listing_sess >= eff_session
+        all_rows_ok = all_rows_ok and row_ok
+        list_key = (riid, listing_sess.isoformat() if isinstance(listing_sess, datetime) else "")
+        prev_entry = settlement_by_key.get(list_key)
+        prev_total = prev_entry[2] if prev_entry is not None else 0
+        prev_eff = prev_entry[1] if prev_entry is not None else eff_session
+        merged_eff = prev_eff if prev_eff <= eff_session else eff_session
+        merged_sess = prev_entry[0] if prev_entry is not None else listing_sess
+        settlement_by_key[list_key] = [merged_sess, merged_eff, prev_total + delta]
+    settlement_failed = False
+    for (liid, liso), (lsess, min_eff, total_delta) in settlement_by_key.items():
+        current_bar = bars_by_key.get((liid, liso))
+        ordered_iid = sessions_by_instrument.get(liid, [])
+        earlier = [s for s in ordered_iid if lsess is not None and s < lsess]
+        previous_session = earlier[-1] if earlier else None
+        previous_bar = bars_by_key.get((liid, previous_session.isoformat())) if previous_session is not None else None
+        current_close = _require_finite_positive(current_bar.get("close"), field="close") if current_bar is not None else float("nan")
+        current_shares = _require_finite_positive(current_bar.get("shares_outstanding"), field="shares_outstanding") if current_bar is not None else float("nan")
+        current_cap = _require_finite_positive(current_bar.get("market_cap"), field="market_cap") if current_bar is not None else float("nan")
+        previous_shares = _require_finite_positive(previous_bar.get("shares_outstanding"), field="shares_outstanding") if previous_bar is not None else float("nan")
+        if (
+            not all_rows_ok
+            or has_duplicate_settlement_id
+            or total_delta <= 0
+            or current_bar is None
+            or previous_bar is None
+            or lsess is None
+            or lsess.tzinfo is None
+            or lsess < min_eff
+            or current_shares != previous_shares + total_delta
+            or not _close_enough(current_cap, current_close * current_shares)
+        ):
+            settlement_failed = True
+    if settlement_failed:
+        raise PITDataError("unreconciled corporate action listed shares at listing session; certification blocked")
     actions_map = {session: tuple(sorted(actions, key=lambda a: (a.instrument_id, a.action_id))) for session, actions in by_session.items()}
     return CorporateActionCoverage(actions_by_session=actions_map, research_returns_by_key=research_returns)
 

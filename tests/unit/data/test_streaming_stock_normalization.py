@@ -177,7 +177,7 @@ def test_resolve_opendart_records_rejects_malformed_page_and_receipt() -> None:
     with pytest.raises(PITDataError, match="invalid OpenDART records"):
         resolve_opendart_corporate_action_records(pages=[{"endpoint": "fricDecsn.json", "corp_code": "1", "status": "000", "records": {}}], daily_market=daily, calendar=calendar)
     with pytest.raises(PITDataError, match="invalid OpenDART receipt"):
-        resolve_opendart_corporate_action_records(pages=[{"endpoint": "fricDecsn.json", "corp_code": "1", "status": "000", "records": [{"rcept_no": "bad", "corp_code": "1", "bfic_tisstk_ostk": "1", "nstk_ostk_cnt": "1", "nstk_ascnt_ps_ostk": "1", "nstk_asstd": "2024-01-02"}]}], daily_market=daily, calendar=calendar)
+        resolve_opendart_corporate_action_records(pages=[{"endpoint": "fricDecsn.json", "corp_code": "1", "status": "000", "records": [{"rcept_no": "bad", "corp_code": "1", "bfic_tisstk_ostk": "1", "nstk_ostk_cnt": "1", "nstk_ascnt_ps_ostk": "1", "nstk_asstd": "2024-01-02", "nstk_lstprd": "2024-01-02"}]}], daily_market=daily, calendar=calendar)
 
 
 def test_streaming_normalization_rejects_invalid_krx_numeric_values() -> None:
@@ -448,7 +448,7 @@ def test_resolve_bonus_issue_027410_style_event() -> None:
     krx = ZoneInfo('Asia/Seoul')
     sessions = tuple(datetime(2016, 11, day, 9, tzinfo=krx) for day in (8, 22, 23, 24))
     daily = pl.DataFrame({'session': sessions, 'instrument_id': ['KRX:027410'] * 4, 'close': [165000.0, 168500.0, 82600.0, 83000.0], 'shares_outstanding': [24773964.0, 24773964.0, 24773964.0, 24773964.0], 'market_cap': [1.0, 1.0, 1.0, 1.0]})
-    pages = [{'endpoint': 'fricDecsn.json', 'corp_code': '00219097', 'status': '000', 'records': [{'rcept_no': '20161107000214', 'corp_code': '00219097', 'bfic_tisstk_ostk': '24,773,964', 'nstk_ostk_cnt': '24,773,661', 'nstk_ascnt_ps_ostk': '1', 'nstk_asstd': '2016년 11월 24일'}]}]
+    pages = [{'endpoint': 'fricDecsn.json', 'corp_code': '00219097', 'status': '000', 'records': [{'rcept_no': '20161107000214', 'corp_code': '00219097', 'bfic_tisstk_ostk': '24,773,964', 'nstk_ostk_cnt': '24,773,661', 'nstk_ascnt_ps_ostk': '1', 'nstk_asstd': '2016년 11월 24일', 'nstk_lstprd': '2016년 11월 24일'}]}]
 
     records = resolve_opendart_corporate_action_records(pages=pages, daily_market=daily, calendar=SessionCalendar(sessions))
 
@@ -475,3 +475,77 @@ def test_resolve_opendart_records_rejects_unmodelled_merger() -> None:
     daily = pl.DataFrame({'session': [session], 'instrument_id': ['KRX:A'], 'close': [100.0], 'shares_outstanding': [1.0], 'market_cap': [100.0]})
     with pytest.raises(PITDataError, match='unsupported OpenDART corporate action.*cmpMgDecsn.json'):  # noqa: RUF043
         resolve_opendart_corporate_action_records(pages=[{'endpoint': 'cmpMgDecsn.json', 'corp_code': '00123456', 'status': '000', 'records': [{'rcept_no': '20240101000001'}]}], daily_market=daily, calendar=SessionCalendar((session,)))
+
+
+def test_resolve_bonus_issue_emits_distinct_price_and_listing_sessions() -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import polars as pl
+
+    from src.core.time import SessionCalendar
+    from src.data.streaming_normalization import resolve_opendart_corporate_action_records
+
+    tz = ZoneInfo('Asia/Seoul')
+    sessions = tuple(datetime(2016, month, day, 9, tzinfo=tz) for month, day in ((11, 8), (11, 22), (11, 23), (11, 24), (12, 13), (12, 14)))
+    daily = pl.DataFrame({'session': sessions, 'instrument_id': ['KRX:027410'] * 6, 'close': [165000.0, 168500.0, 82600.0, 79500.0, 86200.0, 88000.0], 'shares_outstanding': [24773964.0, 24773964.0, 24773964.0, 24773964.0, 24773964.0, 49547625.0], 'market_cap': [4087704060000.0, 4174412934000.0, 2046329426400.0, 1969530138000.0, 2135515696800.0, 4360191000000.0]})
+    pages = [{'endpoint': 'fricDecsn.json', 'corp_code': '00219097', 'status': '000', 'records': [{'rcept_no': '20161107000214', 'corp_code': '00219097', 'bfic_tisstk_ostk': '24,773,964', 'nstk_ostk_cnt': '24,773,661', 'nstk_ascnt_ps_ostk': '1', 'nstk_asstd': '2016년 11월 24일', 'nstk_lstprd': '2016년 12월 14일'}]}]
+
+    action = resolve_opendart_corporate_action_records(pages=pages, daily_market=daily, calendar=SessionCalendar(sessions))[0]
+
+    assert action['effective_session'].date().isoformat() == '2016-11-23'
+    assert action['share_listing_date'].date().isoformat() == '2016-12-14'
+    assert action['factor'] == 2.0
+    assert action['share_delta'] == 24773661
+
+
+def test_resolve_bonus_issue_requires_listing_date_and_preserves_settlement_fields() -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import polars as pl
+    import pytest
+
+    from src.core.time import SessionCalendar
+    from src.data.schemas import PITDataError
+    from src.data.streaming_normalization import resolve_opendart_corporate_action_records
+
+    tz = ZoneInfo('Asia/Seoul')
+    first = datetime(2024, 1, 2, 9, tzinfo=tz)
+    second = datetime(2024, 1, 3, 9, tzinfo=tz)
+    daily = pl.DataFrame({'session': [first, second], 'instrument_id': ['KRX:A', 'KRX:A'], 'close': [100.0, 49.0], 'shares_outstanding': [10.0, 10.0], 'market_cap': [1000.0, 490.0]})
+    record = {'rcept_no': '20240101000001', 'corp_code': '1', 'instrument_id': 'KRX:A', 'bfic_tisstk_ostk': '10', 'nstk_ostk_cnt': '10', 'nstk_ascnt_ps_ostk': '1', 'nstk_asstd': '2024-01-03'}
+
+    with pytest.raises(PITDataError, match='nstk_lstprd'):
+        resolve_opendart_corporate_action_records(pages=[{'endpoint': 'fricDecsn.json', 'corp_code': '1', 'status': '000', 'records': [record]}], daily_market=daily, calendar=SessionCalendar((first, second)))
+
+
+def test_corporate_action_silver_schema_requires_settlement_fields() -> None:
+    from src.data.schemas import SilverTable
+    from src.data.silver import SCHEMA_REGISTRY
+
+    required = SCHEMA_REGISTRY[SilverTable.CORPORATE_ACTIONS]['required_columns']
+
+    assert 'share_listing_date' in required
+    assert 'share_delta' in required
+
+
+def test_resolve_bonus_issue_rejects_out_of_calendar_listing_date() -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import polars as pl
+    import pytest
+
+    from src.core.time import SessionCalendar
+    from src.data.schemas import PITDataError
+    from src.data.streaming_normalization import resolve_opendart_corporate_action_records
+
+    tz = ZoneInfo('Asia/Seoul')
+    first = datetime(2024, 1, 2, 9, tzinfo=tz)
+    second = datetime(2024, 1, 3, 9, tzinfo=tz)
+    daily = pl.DataFrame({'session': [first, second], 'instrument_id': ['KRX:A', 'KRX:A'], 'close': [100.0, 49.0], 'shares_outstanding': [10.0, 10.0], 'market_cap': [1000.0, 490.0]})
+    record = {'rcept_no': '20240101000001', 'corp_code': '1', 'instrument_id': 'KRX:A', 'bfic_tisstk_ostk': '10', 'nstk_ostk_cnt': '10', 'nstk_ascnt_ps_ostk': '1', 'nstk_asstd': '2024-01-03', 'nstk_lstprd': '2024-02-01'}
+
+    with pytest.raises(PITDataError, match='listing'):
+        resolve_opendart_corporate_action_records(pages=[{'endpoint': 'fricDecsn.json', 'corp_code': '1', 'status': '000', 'records': [record]}], daily_market=daily, calendar=SessionCalendar((first, second)))
