@@ -149,8 +149,17 @@ class HistoricalFillModel:
         for name, val in (("raw_open", bar.raw_open), ("raw_close", bar.raw_close)):
             if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(float(val)) or float(val) <= 0:
                 raise BacktestIntegrityError(f"missing/non-positive {name}: {val!r}")
-        if isinstance(bar.adtv_20d, bool) or not isinstance(bar.adtv_20d, (int, float)) or not math.isfinite(float(bar.adtv_20d)) or float(bar.adtv_20d) <= 0:
-            raise BacktestIntegrityError(f"missing/non-positive adtv_20d: {bar.adtv_20d!r}")
+        if isinstance(bar.adtv_20d, bool) or not isinstance(bar.adtv_20d, (int, float)) or not math.isfinite(float(bar.adtv_20d)):
+            raise BacktestIntegrityError(f"missing/non-finite adtv_20d: {bar.adtv_20d!r}")
+        if float(bar.adtv_20d) <= 0:
+            # Suspended/halted bar — reject order; valid for mark-to-market only.
+            return BacktestReject(
+                reject_id=f"reject:{order.order_id}",
+                order_id=order.order_id,
+                reason="suspended: adtv_20d is zero",
+                rejected_quantity=int(order.quantity),
+                event_time=bar.session_open,
+            )
         if isinstance(bar.daily_volatility, bool) or not isinstance(bar.daily_volatility, (int, float)) or not math.isfinite(float(bar.daily_volatility)) or float(bar.daily_volatility) <= 0:
             raise BacktestIntegrityError(f"missing/non-positive daily_volatility: {bar.daily_volatility!r}")
         # cost coverage

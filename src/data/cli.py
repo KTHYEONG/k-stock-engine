@@ -262,9 +262,8 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
 
     from src.core.costs import (
         LiquiditySlippageModel,
-        TickSizeRule,
-        TickSizeSchedule,
         default_base_schedule,
+        default_krx_tick_schedule,
     )
     from src.core.instruments import AssetKind, Instrument
     from src.core.time import SessionCalendar
@@ -286,6 +285,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     smoke_symbol = getattr(args, "smoke_symbol", None)
     gold_dataset_id = getattr(args, "gold_dataset_id", None)
     scores_by_session: dict[date, tuple[Any, ...]] | None = None
+    scores_frame: Any = None
     strategy: Any = None
 
     if not smoke_symbol:
@@ -301,9 +301,6 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
             decision_time=gold_decision_time,
         )
         scores_frame = load_gold_artifact_frames(bundle=bundle, decision_time=gold_decision_time)[2]
-        scores_by_session = _champion_scores_by_session(scores_frame)
-        strategy = ChampionStrategy(scores_by_session=scores_by_session)
-
     if not smoke_symbol and (not gold_root.exists() or not (gold_root / "universe").exists()):
         raise PITDataError("run-backtest requires resolved Gold artifact, session repository, config, and strategy")
 
@@ -316,6 +313,10 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     raw_sessions = tuple(sorted(calendar_df["session"].to_list()))
     cal_sessions = tuple(s.replace(hour=9, minute=0, second=0) for s in raw_sessions)
     calendar = SessionCalendar(cal_sessions)
+
+    if strategy is None and scores_frame is not None:
+        scores_by_session = _champion_scores_by_session(scores_frame)
+        strategy = ChampionStrategy(scores_by_session=scores_by_session, calendar=calendar)
 
     val_sessions = [s for s in cal_sessions if val_start <= s.date() <= val_end]
     if not val_sessions:
@@ -359,11 +360,11 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     query = pl.concat(scans, how="vertical_relaxed")
     if smoke_symbol:
         query = query.filter(pl.col("instrument_id") == smoke_symbol)
-    # Zero-value/zero-price rows are non-tradable placeholders (for example,
-    # suspended or not-yet-listed instruments) and cannot produce a valid fill.
+    # Rows with zero/negative open or close are structurally invalid (no mark price).
+    # Suspended bars (trading_value=0, volume=0) retain a valid close for mark-to-market;
+    # execution on them will be rejected by the fill model via adtv_20d check.
     query = query.filter(
-        (pl.col("trading_value") > 0)
-        & (pl.col("open") > 0)
+        (pl.col("open") > 0)
         & (pl.col("close") > 0)
     )
     daily_market = query.collect()
@@ -387,9 +388,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     }
 
     costs = default_base_schedule()
-    ticks = TickSizeSchedule((
-        TickSizeRule("all", datetime(2000, 1, 1, tzinfo=UTC), 0.0, float("inf"), 1000.0),
-    ))
+    ticks = default_krx_tick_schedule()
     fill_model = HistoricalFillModel(
         costs,
         LiquiditySlippageModel(0.1, ticks),
