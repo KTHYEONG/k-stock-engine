@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_KOREAN_EQUITY_COMPOUNDING_STRATEGY",
+      "date": "2026-09-09",
+      "adr_id": "ADR_20260909_KOREAN_EQUITY_COMPOUNDING_STRATEGY",
+      "domain": "quant",
+      "title": "Korean Equity Compounding Core Strategy",
+      "why": "The prior backtest used placeholder liquidity, volatility, sector, and corporate-action inputs that made negative performance and exposure constraints uncertifiable.",
+      "resolution": "Implemented a fail-closed PIT session builder with rolling ADTV20/volatility60/market-volatility60, real sector and corporate-action validation, and a deterministic 20-stock large-cap/inverse-volatility core strategy wired as the CLI default.",
+      "impact": "Backtests now refuse uncertifiable market data, preserve T-close to next-open execution and portfolio caps, and record strategy/input provenance; ML and live deployment remain out of scope."
+    },
+    {
       "task_id": "TASK_ARCHITECTURE_REFACTOR_PIT_CONTRACT",
       "date": "2026-09-09",
       "adr_id": "ADR_20260909_ARCHITECTURE_REFACTOR_PIT_CONTRACT",

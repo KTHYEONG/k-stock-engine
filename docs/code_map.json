@@ -41,7 +41,7 @@
       "tests/unit/execution/test_submit_intents.py",
       "tests/unit/features/test_qvef.py",
       "tests/unit/integrations/dart/test_xbrl_standard.py",
-      "tests/unit/strategy/test_champion_strategy.py",
+      "tests/unit/strategy/test_core_strategy.py",
       "tests/unit/strategy/test_universe.py"
     ]
   },
@@ -115,8 +115,7 @@
     "testing": [
       "tests/integration/data/test_pit_dataset_foundation.py",
       "tests/unit/data/test_backtest_runner.py",
-      "tests/unit/data/test_backtest_sessions.py",
-      "tests/unit/strategy/test_champion_strategy.py"
+      "tests/unit/data/test_backtest_sessions.py"
     ]
   },
   "src/data/streaming_normalization.py": {
@@ -136,7 +135,8 @@
       "tests/integration/engine/test_unified_event_backtester.py",
       "tests/unit/data/test_backtest_runner.py",
       "tests/unit/engine/test_backtest.py",
-      "tests/unit/strategy/test_champion_strategy.py"
+      "tests/unit/strategy/test_champion_strategy.py",
+      "tests/unit/strategy/test_core_strategy.py"
     ]
   },
   "src/engine/fill_model.py": {
@@ -278,6 +278,9 @@
   "src/strategy/champion_strategy.py": {
     "testing": "tests/unit/strategy/test_champion_strategy.py"
   },
+  "src/strategy/core_strategy.py": {
+    "testing": "tests/unit/strategy/test_core_strategy.py"
+  },
   "src/strategy/pipeline.py": {
     "testing": "tests/unit/strategy/test_pipeline.py"
   },
@@ -285,7 +288,10 @@
     "testing": "tests/unit/strategy/test_portfolio.py"
   },
   "src/strategy/scoring.py": {
-    "testing": "tests/unit/strategy/test_scoring.py"
+    "testing": [
+      "tests/unit/strategy/test_scoring.py",
+      "tests/unit/data/test_cli.py"
+    ]
   },
   "src/strategy/selection.py": {
     "testing": "tests/unit/strategy/test_selection.py"
