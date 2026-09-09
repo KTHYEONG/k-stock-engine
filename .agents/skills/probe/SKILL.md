@@ -61,13 +61,30 @@ Focus on: *Is the hypothesis sound? What does the real data/runtime look like? W
 
 ## Chat Output Format
 
-Keep chat response strictly minimal, token-efficient, and evidence-focused (max 4 lines):
+Keep chat response structured, scannable, and evidence-focused using tables and clear bullet points (avoid dense wall-of-text paragraphs).
+**Language Requirement:** All instructions and template fields below are written in English, but the actual rendered chat response to the user MUST be translated and presented in Korean (한국어) for intuitive review.
 
 ### 🔬 [PROBE] <Feature/Topic Title>
 
-- **가설 & 결론**: <검증된 핵심 가설 및 채택된 설계 접근법 1줄>
-- **실측 증거 (Proof)**: `scratch/probe_<topic>.py` (`scratch/probe_<topic>.json` 기록 완료) → <실측 수치/성능/데이터 정합성 결과 1줄>
-- **핵심 불변식**: <반드시 지켜야 할 Fail-closed 규칙 및 주요 방어 실패 모드 1줄>
+#### 1. 설계 결정 (Architecture)
+| 구분 (Category) | 내용 (Details) |
+| :--- | :--- |
+| **채택 설계 (Chosen Architecture)** | <Summary of the selected approach in Korean> |
+| **격리/범위 (Scope & Isolation)** | <Preservation of existing hot-paths or scope boundary in Korean> |
+| **선택 이유 (Rationale)** | <Core rationale for choosing this approach over alternatives in Korean> |
+
+#### 2. 실측 검증 (Empirical Benchmark)
+- **스크립트 (Script)**: `scratch/probe_<topic>.py` (`.json` recorded)
+- **실측 성능/처리량 (Throughput & Latency)**: <Observed benchmark figures in Korean>
+- **검증 & 결함 검출 (Verification)**: <Tested edge cases and defect detection in Korean>
+- **발견된 버그 & 사전 수정 (Preempted Bugs)**: <Bugs identified and fixed during probing in Korean>
+
+#### 3. 핵심 불변식 & 주의점 (Invariants & Risks)
+- **핵심 불변식 (Invariants)**: <Fail-closed rules, conservation laws, or critical boundaries in Korean>
+- **다운스트림 주의 (Downstream Risks)**: <Dependencies, edge cases, or out-of-scope notes for spec/implement in Korean>
 
 ---
-👉 `/spec --feature <feature_name> --domain <domain>`
+👉 다음 단계: `/spec --feature <feature_name> --domain <domain>`
+
+
+
