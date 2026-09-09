@@ -5,36 +5,26 @@ trigger:
 priority: 8
 ---
 
-# Code Documentation & Commenting Rules
+# Documentation & Code Commenting Directives
 
-## 1. Core Principles
-1. **Explain "Why", Not "What":** Omit obvious code behavior comments. Explain only business context, mathematical rationale, domain constraints, or non-obvious optimizations.
-2. **Token & Patch Efficiency:** Keep comments to a single line (max 2 lines). Explain only immediate domain invariants or mathematical reasons. Avoid verbose multi-line explanations or storytelling.
-3. **No Ephemeral Spec References:** NEVER reference temporary `docs/specs/*.md` or `contract.json` paths in code, docstrings, CLI help texts, or comments. Specs are ephemeral working files — `.md` scratch files and `contract.json` are purged during the sync phase, so any path reference goes stale. If external reference is necessary, use persistent `ADR-XXXX` identifiers or self-contained domain rationale.
-4. **Language Policy:**
-   - **Docstrings & External Docs:** English only (maintains compatibility with standard Python IDE tools and global conventions).
-   - **In-line Comments (`#`):** Korean preferred (ensures fast intuition and readability for Korean maintainers).
-5. **Chat Notification Conciseness:** Keep chat responses and skill status notifications strictly under 5 bullet points (under 80 tokens). Move detailed rationale, experiment logs, and failure histories into markdown files in `docs/` or artifact files.
+> **Explain the non-obvious "Why" behind domain logic, math, and constraints, not the mechanical "What" visible in code. Keep comments and docs focused on stable architecture, invariants, and trade-offs. Never embed ephemeral spec paths or AI session logs into persistent code.**
 
-## 2. Docstring Rules
-- **Standard Format:** Apply Google Style Docstrings (`Args:`, `Returns:`, `Raises:`) for all public classes, functions, and methods.
-- **Conciseness:** Keep descriptions brief and focused on contract and behavior constraints. Do NOT include temporary spec links or historical design journals.
-- **Private Symbols (`_foo`):** Omit docstrings for internal/private helper functions unless logic is highly complex.
+## 1. Commenting Principles: Explain "Why", Not "What"
+- **Focus on Rationale:** Document business context, mathematical derivations, domain constraints, timing semantics, units, and non-obvious trade-offs. Omit comments that merely paraphrase readable code.
+- **Conciseness with Clarity:** Keep comments focused and compact. Use extended explanations only when the rationale cannot be clearly expressed briefly.
+- **No Ephemeral Spec References:** NEVER reference temporary `docs/specs/*.md` or `contract.json` paths in code, docstrings, or comments. Specs are transient working files that get purged. Use persistent `ADR-XXXX` IDs or self-contained domain rationale.
+- **No Diagnostic or Session Artifacts:** Never leave AI task logs, revision chronicles, or linter fix annotations (e.g., `# fix mypy error`) in production code or comments.
 
-## 3. In-line Comment Rules (`#`)
-- **Prohibited:**
-  - **Ephemeral Spec References:** Citing temporary spec paths/sections (e.g. `# docs/specs/foo.md §2.1`).
-  - **Conversational & Historical Prose:** Multi-line narratives, task progress chronicles, or AI decision logs.
-  - **Lint / Fix Annotations:** Explanatory comments next to fixes during linter or type-checking cycles (e.g. `x: int = 1  # type fix for mypy`, `import sys  # fixed ruff F401`).
-  - **Code Restatement:** Restating obvious code in prose (e.g., `i += 1  # increment counter`, `return result  # return result`).
-- **Required / Recommended (Strictly 1-2 lines max):**
-  - **Quant & Mathematical Formulae:** Rationale for formula derivations, slippage, or fee adjustments.
-  - **Domain & Exchange Limits:** Reasons for rate limit handling, boundary caps, or API workarounds.
-  - **Performance Trade-offs:** Rationale for choosing specific data structures or algorithmic shortcuts.
+## 2. Docstring Standards
+- **Contract-Driven Documentation:** Document public interfaces when behavior, side effects, units, timing assumptions, or failure conditions are not self-evident from type signatures and function names.
+- **Consistent Convention:** When a structured docstring is required, follow the repository's Google-style convention (`Args:`, `Returns:`, `Raises:`). Avoid conversational prose or historical journaling.
+- **Private Helpers:** Omit docstrings for private helper functions unless the algorithmic logic or mathematical derivation is non-trivial.
 
-## 4. Architecture Documentation (`docs/architecture/`)
-- **Purpose:** "AI-First Structured Constraints". Contains system boundary, LaTeX mathematical formalisms, strict I/O tables, and Mermaid topology.
-- **Scope Limit:** Split a document when it grows to cover more than one system boundary/topology unit — not by a fixed line count.
-- **Surgical Update Only:** Never append raw text to architecture files. Edit existing tables, schemas, or Mermaid nodes inline.
-- **Prohibitions:** Omit procedural logic, code optimization details, logging policies, conversational prose, temporal examples, change history, and `[ADR_...]` tags.
-- **Contract Priority:** In case of mismatch, in-code Type/Protocol definitions strictly supersede external markdown files.
+## 3. Architecture & Domain Documentation (`docs/architecture/`)
+- **Stable Boundaries & Semantics:** Keep architecture documents focused on stable system boundaries, data flows, formal mathematical models, and domain semantics. Avoid cluttering with transient implementation details.
+- **Coherent Structure:** Update existing tables, schemas, and topology diagrams coherently rather than accumulating disconnected append-only notes.
+- **Contract & Spec Reconciliation:** Treat discrepancies between code contracts and architecture documentation as issues to investigate and resolve; never silently assume either side is automatically correct.
+
+## 4. Repository Language Conventions
+- **Docstrings & External Documentation:** Written in English for toolchain and global standard compatibility.
+- **In-line Comments (`#`):** Korean preferred for immediate intuition and clarity among local maintainers.
