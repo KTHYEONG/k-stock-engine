@@ -102,6 +102,7 @@ def test_run_backtest_validates_selected_bundle_before_execution(tmp_path, monke
                 validation_end="2016-12-30",
                 smoke_symbol=None,
                 gold_dataset_id="gold-2016",
+                strategy_id="champion-v1",
             )
         )
 
@@ -296,8 +297,251 @@ def test_run_backtest_requires_selected_gold_dataset_id(tmp_path) -> None:
                 validation_end='2016-12-30',
                 smoke_symbol=None,
                 gold_dataset_id=None,
+                strategy_id='champion-v1',
             )
         )
+
+
+def test_run_backtest_core_v1_end_to_end_with_pit_inputs(tmp_path, monkeypatch) -> None:
+    from argparse import Namespace
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    import polars as pl
+
+    import src.data.cli as cli_mod
+    import src.data.silver as silver_mod
+    from src.data.cli import _dispatch_backtest
+    from src.data.schemas import SilverTable
+
+    kst = ZoneInfo('Asia/Seoul')
+    all_days = tuple(datetime(2016, 1, 4, 9, tzinfo=kst) + timedelta(days=index) for index in range(70))
+    calendar_df = pl.DataFrame({'session': list(all_days)})
+    start, end = all_days[60].date().isoformat(), all_days[64].date().isoformat()
+    warmup_days = all_days[0:68]
+    closes_a = [10000.0 + index * 10.0 for index in range(len(warmup_days))]
+    closes_b = [20000.0 + index * 5.0 for index in range(len(warmup_days))]
+    market_df = pl.DataFrame({
+        'session': [day for day in warmup_days for _ in ('KRX:A', 'KRX:B')],
+        'instrument_id': ['KRX:A', 'KRX:B'] * len(warmup_days),
+        'open': [c - 5.0 for pair in zip(closes_a, closes_b, strict=True) for c in pair],
+        'close': [c for pair in zip(closes_a, closes_b, strict=True) for c in pair],
+        'volume': [1000.0] * (2 * len(warmup_days)),
+        'trading_value': [c * 1000.0 for pair in zip(closes_a, closes_b, strict=True) for c in pair],
+        'market_cap': [1e12, 5e11] * len(warmup_days),
+        'available_at': [day.replace(hour=15, minute=30) for day in warmup_days for _ in ('KRX:A', 'KRX:B')],
+    })
+    dm_dir = tmp_path / 'dm'
+    dm_dir.mkdir()
+    market_df.write_parquet(dm_dir / 'daily.parquet')
+    master_df = pl.DataFrame({
+        'instrument_id': ['KRX:A', 'KRX:B'],
+        'sector': ['Technology', 'Healthcare'],
+        'valid_from': [all_days[0], all_days[0]],
+        'valid_to': [all_days[69], all_days[69]],
+        'available_at': [all_days[0], all_days[0]],
+    })
+
+    def fake_load_table(silver_root, table):
+        if table == SilverTable.CALENDAR:
+            return calendar_df
+        if table == SilverTable.SECURITY_MASTER:
+            return master_df
+        return pl.DataFrame(schema={'effective_session': pl.Datetime(time_zone='Asia/Seoul'), 'instrument_id': pl.String, 'action_type': pl.String, 'available_at': pl.Datetime(time_zone='Asia/Seoul')})
+
+    monkeypatch.setattr(cli_mod, '_load_silver_table', fake_load_table)
+    monkeypatch.setattr(silver_mod, 'latest_silver_dataset_path', lambda *, root, table, decision_time: dm_dir)
+    universe_dir = tmp_path / 'gold' / 'universe'
+    universe_dir.mkdir(parents=True)
+    universe_df = pl.DataFrame({
+        'decision_session': [day.replace(hour=15, minute=30) for day in all_days[60:65] for _ in ('KRX:A', 'KRX:B')],
+        'instrument_id': ['KRX:A', 'KRX:B'] * 5,
+        'eligible': [True] * 10,
+    })
+    universe_df.write_parquet(universe_dir / 'universe.parquet')
+
+    code = _dispatch_backtest(
+        Namespace(
+            silver_root=tmp_path / 'silver',
+            artifact_root=tmp_path / 'artifacts',
+            gold_root=tmp_path / 'gold',
+            validation_start=start,
+            validation_end=end,
+            smoke_symbol=None,
+            gold_dataset_id=None,
+            strategy_id='core-v1',
+            initial_cash=100_000_000.0,
+            scenario='base',
+            ledger_id='core-test-2016',
+        )
+    )
+    assert code == 0
+    manifests = list((tmp_path / 'artifacts' / 'backtests').rglob('result.json'))
+    assert len(manifests) == 1
+    import json
+
+    payload = json.loads(manifests[0].read_text(encoding='utf-8'))
+    assert payload['metadata']['strategy_id'] == 'core-v1'
+    assert payload['metadata']['market_input_policy_version'] == 'korean-equity-market-inputs-v1'
+    assert payload['metadata']['warmup_sessions'] == 60
+
+
+def test_run_backtest_rejects_market_without_certified_columns(tmp_path, monkeypatch) -> None:
+    from argparse import Namespace
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    import polars as pl
+    import pytest
+
+    import src.data.cli as cli_mod
+    import src.data.silver as silver_mod
+    from src.data.cli import _dispatch_backtest
+    from src.data.schemas import PITDataError, SilverTable
+
+    kst = ZoneInfo('Asia/Seoul')
+    days = tuple(datetime(2016, 1, 4, 9, tzinfo=kst) + timedelta(days=index) for index in range(3))
+    master = pl.DataFrame({'instrument_id': ['KRX:A'], 'sector': ['Technology'], 'valid_from': [days[0]], 'valid_to': [days[-1]], 'available_at': [days[0]]})
+    actions = pl.DataFrame(schema={'effective_session': pl.Datetime(time_zone='Asia/Seoul'), 'instrument_id': pl.String, 'action_type': pl.String, 'available_at': pl.Datetime(time_zone='Asia/Seoul')})
+    monkeypatch.setattr(cli_mod, '_load_silver_table', lambda silver_root, table: pl.DataFrame({'session': list(days)}) if table == SilverTable.CALENDAR else master if table == SilverTable.SECURITY_MASTER else actions)
+    universe_dir = tmp_path / 'gold' / 'universe'
+    universe_dir.mkdir(parents=True)
+    pl.DataFrame({'decision_session': [days[0]], 'instrument_id': ['KRX:A'], 'eligible': [True]}).write_parquet(universe_dir / 'u.parquet')
+
+    def _run_without(columns: list[str], match: str) -> None:
+        dm_dir = tmp_path / f"dm_{'_'.join(columns)}"
+        dm_dir.mkdir(exist_ok=True)
+        base = {
+            'session': list(days),
+            'instrument_id': ['KRX:A'] * 3,
+            'open': [100.0] * 3,
+            'close': [101.0] * 3,
+            'volume': [10.0] * 3,
+            'trading_value': [1010.0] * 3,
+            'market_cap': [1e10] * 3,
+            'available_at': [day.replace(hour=15, minute=30) for day in days],
+        }
+        pl.DataFrame({key: base[key] for key in columns}).write_parquet(dm_dir / 'daily.parquet')
+        monkeypatch.setattr(silver_mod, 'latest_silver_dataset_path', lambda *, root, table, decision_time: dm_dir)
+        with pytest.raises(PITDataError, match=match):
+            _dispatch_backtest(
+                Namespace(
+                    silver_root=tmp_path / 'silver',
+                    artifact_root=tmp_path / 'artifacts',
+                    gold_root=tmp_path / 'gold',
+                    validation_start=days[0].date().isoformat(),
+                    validation_end=days[1].date().isoformat(),
+                    smoke_symbol=None,
+                    gold_dataset_id=None,
+                    strategy_id='core-v1',
+                )
+            )
+
+    _run_without(['session', 'instrument_id', 'open', 'close', 'volume', 'trading_value', 'market_cap'], 'certified available_at')
+    _run_without(['session', 'instrument_id', 'open', 'close', 'volume', 'trading_value', 'available_at'], 'market_cap')
+
+
+def test_run_backtest_smoke_symbol_completes_with_empty_pit_frames(tmp_path, monkeypatch) -> None:
+    from argparse import Namespace
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    import polars as pl
+
+    import src.data.cli as cli_mod
+    import src.data.silver as silver_mod
+    from src.data.cli import _dispatch_backtest
+    from src.data.schemas import SilverTable
+
+    kst = ZoneInfo('Asia/Seoul')
+    days = tuple(datetime(2016, 1, 4, 9, tzinfo=kst) + timedelta(days=index) for index in range(64))
+    master = pl.DataFrame({'instrument_id': ['KRX:A'], 'sector': ['Technology'], 'valid_from': [days[0]], 'valid_to': [days[-1]], 'available_at': [days[0]]})
+    actions = pl.DataFrame(schema={'effective_session': pl.Datetime(time_zone='Asia/Seoul'), 'instrument_id': pl.String, 'action_type': pl.String, 'available_at': pl.Datetime(time_zone='Asia/Seoul')})
+    monkeypatch.setattr(cli_mod, '_load_silver_table', lambda silver_root, table: pl.DataFrame({'session': list(days)}) if table == SilverTable.CALENDAR else master if table == SilverTable.SECURITY_MASTER else actions)
+    dm_dir = tmp_path / 'dm_smoke'
+    dm_dir.mkdir()
+    pl.DataFrame({
+        'session': list(days),
+        'instrument_id': ['KRX:A'] * len(days),
+        'open': [10000.0 + index for index in range(len(days))],
+        'close': [10050.0 + index + (index % 3) * 0.1 for index in range(len(days))],
+        'volume': [1000000.0] * len(days),
+        'trading_value': [10050000000.0] * len(days),
+        'market_cap': [1e12] * len(days),
+        'available_at': [day.replace(hour=15, minute=30) for day in days],
+    }).write_parquet(dm_dir / 'daily.parquet')
+    monkeypatch.setattr(silver_mod, 'latest_silver_dataset_path', lambda *, root, table, decision_time: dm_dir)
+    code = _dispatch_backtest(
+        Namespace(
+            silver_root=tmp_path / 'silver',
+            artifact_root=tmp_path / 'artifacts',
+            gold_root=tmp_path / 'gold',
+            validation_start=days[60].date().isoformat(),
+            validation_end=days[60].date().isoformat(),
+            smoke_symbol='KRX:A',
+            gold_dataset_id=None,
+            strategy_id='core-v1',
+            initial_cash=100_000_000.0,
+            scenario='base',
+            ledger_id='smoke-test',
+        )
+    )
+    assert code == 0
+
+
+def test_build_gold_uses_four_factor_default_policy(tmp_path, monkeypatch, capsys) -> None:
+    import sys
+    from types import SimpleNamespace
+
+    import src.data.gold as gold_mod
+    import src.data.gold_loader as loader_mod
+    from src.data.cli import main
+
+    captured: dict[str, object] = {}
+
+    def fake_load(**kwargs):  # type: ignore[no-untyped-def]
+        return SimpleNamespace(
+            calendar=object(),
+            security_master=object(),
+            daily_market=object(),
+            financial_facts=object(),
+            corporate_actions=object(),
+            investor_flow=object(),
+        )
+
+    def fake_materialize(**kwargs):  # type: ignore[no-untyped-def]
+        captured['score_policy'] = kwargs['score_policy']
+        manifest = SimpleNamespace(
+            manifest_hash='hash',
+            warmup=SimpleNamespace(warmup_ok=True, warmup_sessions_found=60),
+            bar_audit=[],
+            dart_eligibility=[],
+            ca_excluded_instrument_ids=[],
+            eligible_instrument_ids=[],
+        )
+        return SimpleNamespace(
+            manifest=manifest,
+            universe_decisions_count=0,
+            eligible_decisions_count=0,
+            feature_rows_count=0,
+            universe_path='u',
+            features_path='f',
+            summary_artifact_path='s',
+        )
+
+    monkeypatch.setattr(loader_mod, 'load_gold_window_inputs', fake_load)
+    monkeypatch.setattr(gold_mod, 'materialize_gold_window', fake_materialize)
+    monkeypatch.setattr(sys, 'argv', [
+        'stock-data', 'build-gold',
+        '--silver-root', str(tmp_path),
+        '--artifact-root', str(tmp_path),
+        '--decision-time', '2024-01-03T00:00:00+00:00',
+        '--validation-start', '2016-01-04',
+        '--validation-end', '2016-12-30',
+    ])
+    assert main() == 0
+    assert captured['score_policy'].min_required_factors == 4
+    capsys.readouterr()
 
 
 def test_run_backtest_parser_accepts_gold_dataset_id(monkeypatch) -> None:

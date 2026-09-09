@@ -143,3 +143,14 @@ def test_select_champion_targets_rejects_wrong_policy_and_future_score_rows() ->
         select_champion_targets((wrong_policy,), portfolio, decision_time=now)
     with pytest.raises(ValueError, match='decision_session'):
         select_champion_targets((future,), portfolio, decision_time=now)
+
+
+def test_selection_policy_accepts_core_pair_and_rejects_mixed() -> None:
+    import pytest
+
+    from src.strategy.selection import ChampionSelectionPolicy
+
+    core = ChampionSelectionPolicy(version='korean-core-v1-selection-v1', required_score_policy_version='korean-core-v1-scoring-v1')
+    assert core.max_positions == 20
+    with pytest.raises(ValueError, match='version'):
+        ChampionSelectionPolicy(version='champion-v1-selection-v1', required_score_policy_version='korean-core-v1-scoring-v1')

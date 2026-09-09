@@ -24,10 +24,12 @@ class ChampionSelectionPolicy:
             raise ValueError("version must be non-empty")
         if not self.required_score_policy_version or not self.required_score_policy_version.strip():
             raise ValueError("required_score_policy_version must be non-empty")
-        if self.version != "champion-v1-selection-v1":
-            raise ValueError("version must be champion-v1-selection-v1")
-        if self.required_score_policy_version != "champion-v1-scoring-v1":
-            raise ValueError("required_score_policy_version must be champion-v1-scoring-v1")
+        valid_pairs = {
+            ("champion-v1-selection-v1", "champion-v1-scoring-v1"),
+            ("korean-core-v1-selection-v1", "korean-core-v1-scoring-v1"),
+        }
+        if (self.version, self.required_score_policy_version) not in valid_pairs:
+            raise ValueError("version must be champion-v1-selection-v1 or korean-core-v1-selection-v1")
         if not isinstance(self.max_positions, int) or isinstance(self.max_positions, bool) or self.max_positions <= 0:
             raise ValueError("max_positions must be positive integer")
         if not isinstance(self.entry_rank, int) or isinstance(self.entry_rank, bool) or self.entry_rank <= 0:

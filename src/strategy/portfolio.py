@@ -30,8 +30,8 @@ class ChampionPortfolioPolicy:
             raise ValueError("version must be champion-v1-portfolio-v1")
         if not self.required_selection_policy_version or not self.required_selection_policy_version.strip():
             raise ValueError("required_selection_policy_version must be non-empty")
-        if self.required_selection_policy_version != "champion-v1-selection-v1":
-            raise ValueError("required_selection_policy_version must be champion-v1-selection-v1")
+        if self.required_selection_policy_version not in ("champion-v1-selection-v1", "korean-core-v1-selection-v1"):
+            raise ValueError("required_selection_policy_version must be champion-v1-selection-v1 or korean-core-v1-selection-v1")
         for name in ("security_weight_cap", "sector_weight_cap", "target_market_volatility", "target_participation_cap", "hard_participation_cap"):
             val = getattr(self, name)
             if not isinstance(val, (int, float)) or isinstance(val, bool):
