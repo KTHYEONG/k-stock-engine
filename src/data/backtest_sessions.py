@@ -56,6 +56,116 @@ class CorporateActionCoverage:
     research_returns_by_key: Mapping[tuple[datetime, str], float]
 
 
+@dataclass(frozen=True, slots=True)
+class CorporateActionEvidenceResolution:
+    eligible_daily_market: pl.DataFrame
+    verified_corporate_actions: pl.DataFrame
+    excluded_instruments: frozenset[str]
+    exclusion_reasons: Mapping[str, tuple[str, ...]]
+
+
+def find_unexplained_price_discontinuities(
+    *, daily_market: pl.DataFrame, verified_actions: pl.DataFrame, threshold: float
+) -> pl.DataFrame:
+    """Collect compact jump sessions lacking verified cover with a lazy scan."""
+    windowed = (
+        daily_market.lazy()
+        .select(
+            pl.col("session"),
+            pl.col("instrument_id").cast(pl.String),
+            pl.col("close").cast(pl.Float64),
+        )
+        .sort(["instrument_id", "session"])
+    )
+    invalid = (
+        windowed.filter(~pl.col("close").is_finite() | (pl.col("close") <= 0))
+        .select("instrument_id")
+        .limit(1)
+        .collect()
+    )
+    if invalid.height > 0:
+        raise PITDataError("invalid corporate-action market value; certification blocked")
+    jumps = (
+        windowed.with_columns(
+            (pl.col("close") / pl.col("close").shift(1).over("instrument_id") - 1.0).alias("_raw_return")
+        )
+        .filter(pl.col("_raw_return").is_finite() & (pl.col("_raw_return").abs() > float(threshold)))
+        .select("instrument_id", "session")
+    )
+    if verified_actions.height == 0:
+        return jumps.collect()
+    if "effective_session" in verified_actions.columns:
+        key_col = "effective_session"
+    elif "effective_date" in verified_actions.columns:
+        key_col = "effective_date"
+    else:
+        raise PITDataError("verified corporate actions lack effective session; certification blocked")
+    keys = verified_actions.lazy().select(
+        pl.col("instrument_id").cast(pl.String).alias("instrument_id"),
+        pl.col(key_col).alias("session"),
+    )
+    return jumps.join(keys, on=["instrument_id", "session"], how="anti").collect()
+
+
+def resolve_backtest_corporate_action_evidence(
+    *,
+    daily_market: pl.DataFrame,
+    corporate_actions: pl.DataFrame,
+    calendar: SessionCalendar,
+    policy: BacktestMarketInputsPolicy,
+) -> CorporateActionEvidenceResolution:
+    threshold = float(policy.unexplained_price_jump_threshold)
+    action_rows: list[dict[str, Any]] = corporate_actions.to_dicts() if corporate_actions.height > 0 else []
+    unresolved_reasons: dict[str, set[str]] = {}
+    for row in action_rows:
+        iid = str(row.get("instrument_id", ""))
+        if "evidence_status" not in row or "evidence_reason" not in row:
+            raise PITDataError(
+                f"legacy corporate-action evidence status missing for {iid!r}; certification blocked"
+            )
+        status = str(row["evidence_status"] or "")
+        atype = str(row.get("action_type", row.get("type", "")))
+        if status != "verified" or atype == "unresolved":
+            reason = row.get("evidence_reason")
+            label = str(reason).strip() if isinstance(reason, str) and reason.strip() else "unresolved_evidence"
+            unresolved_reasons.setdefault(iid, set()).add(label)
+    if "evidence_status" in corporate_actions.columns:
+        verified = corporate_actions.filter(pl.col("evidence_status") == "verified")
+    else:
+        verified = corporate_actions
+    jumps = find_unexplained_price_discontinuities(daily_market=daily_market, verified_actions=verified, threshold=threshold)
+    jump_reasons: dict[str, set[str]] = {
+        iid: {"unexplained_price_discontinuity"}
+        for iid in jumps.get_column("instrument_id").unique().to_list()
+        if iid not in unresolved_reasons
+    }
+    excluded: set[str] = set(unresolved_reasons) | set(jump_reasons)
+    exclusion_reasons: dict[str, tuple[str, ...]] = {}
+    for iid in excluded:
+        merged = sorted(unresolved_reasons.get(iid, set()) | jump_reasons.get(iid, set()))
+        exclusion_reasons[iid] = tuple(merged)
+    if excluded:
+        eligible = daily_market.filter(~pl.col("instrument_id").is_in(sorted(excluded)))
+        if "evidence_status" in corporate_actions.columns:
+            verified = corporate_actions.filter(
+                (pl.col("evidence_status") == "verified") & (~pl.col("instrument_id").is_in(sorted(excluded)))
+            )
+        else:
+            verified = corporate_actions.filter(~pl.col("instrument_id").is_in(sorted(excluded)))
+    else:
+        eligible = daily_market
+        if "evidence_status" in corporate_actions.columns:
+            verified = corporate_actions.filter(pl.col("evidence_status") == "verified")
+        else:
+            verified = corporate_actions
+    return CorporateActionEvidenceResolution(
+        eligible_daily_market=eligible,
+        verified_corporate_actions=verified,
+        excluded_instruments=frozenset(excluded),
+        exclusion_reasons=dict(exclusion_reasons),
+    )
+
+
 def _coerce_session(value: Any) -> datetime:
     if isinstance(value, datetime):
         return value
@@ -82,6 +192,12 @@ def validate_corporate_action_coverage(
 ) -> CorporateActionCoverage:
     threshold = float(policy.unexplained_price_jump_threshold)
     action_rows: list[dict[str, Any]] = corporate_actions.to_dicts() if corporate_actions.height > 0 else []
+    for row in action_rows:
+        if str(row.get("evidence_status", "verified") or "verified") != "verified":
+            raise PITDataError(f"unresolved corporate-action evidence for {row.get('instrument_id')!r}; certification blocked")
+        raw_type = str(row.get("action_type", row.get("type", "")))
+        if raw_type == "unresolved":
+            raise PITDataError(f"unresolved corporate-action evidence for {row.get('instrument_id')!r}; certification blocked")
     for row in action_rows:
         raw_type = str(row.get("action_type", row.get("type", "")))
         if raw_type == "no_action":
@@ -463,6 +579,11 @@ def build_backtest_sessions(
         raise PITDataError("missing PIT security master")
     if corporate_actions is None:
         raise PITDataError("missing PIT corporate actions")
+    resolution = resolve_backtest_corporate_action_evidence(daily_market=full, corporate_actions=corporate_actions, calendar=calendar, policy=policy)
+    full = resolution.eligible_daily_market
+    corporate_actions = resolution.verified_corporate_actions
+    partitioned = full.partition_by("session", as_dict=True)
+    by_session = {k[0] if isinstance(k, tuple) else k: v for k, v in partitioned.items()}
     coverage = validate_corporate_action_coverage(daily_market=full, corporate_actions=corporate_actions, calendar=calendar, decision_time_of=decision_time_of, policy=policy)
     adtv_map, vol_map, market_vol_map = _rolling_inputs(full, policy, ordered, coverage.research_returns_by_key)
     for session_open in decisions:

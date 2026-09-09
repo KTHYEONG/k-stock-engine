@@ -8,52 +8,77 @@ def test_streaming_normalization_resumes_only_verified_months(tmp_path) -> None:
 
 
 def test_corporate_action_only_refresh_does_not_aggregate_other_bronze_pages(monkeypatch, tmp_path) -> None:
+    import json
     from datetime import UTC, date, datetime
+    from zoneinfo import ZoneInfo
 
+    import polars as pl
     import pytest
 
     import src.data.silver as silver
     import src.data.streaming_normalization as streaming
     from src.core.datasets import DatasetCertification
+    from src.core.time import SessionCalendar
     from src.data.schemas import BronzeReceipt, CertificationReport, EvidenceKind, SilverTable
 
+    tz = ZoneInfo('Asia/Seoul')
+    first = datetime(2016, 11, 22, 9, tzinfo=tz)
+    second = datetime(2016, 11, 23, 9, tzinfo=tz)
+    listing = datetime(2016, 12, 14, 9, tzinfo=tz)
     decision = datetime(2026, 9, 5, tzinfo=UTC)
     receipts = {
         kind: (
             BronzeReceipt(
                 kind=kind,
-                content_hash=kind.value.ljust(64, "0"),
-                source_path="fixture",
+                content_hash=kind.value.ljust(64, '0'),
+                source_path='fixture',
                 retrieved_at=decision,
                 ingested_at=decision,
-                payload_path=tmp_path / f"{kind.value}.json",
-                metadata_path=tmp_path / f"{kind.value}.receipt.json",
+                payload_path=tmp_path / f'{kind.value}.json',
+                metadata_path=tmp_path / f'{kind.value}.receipt.json',
             ),
         )
         for kind in EvidenceKind
     }
-    action_hash = receipts[EvidenceKind.CORPORATE_ACTIONS][0].content_hash
-    cache = tmp_path / "artifacts" / "corporate_actions_stream.json"
-    cache.parent.mkdir()
-    cache.write_text(
-        '{"source_hashes": ["' + action_hash + '"], "records": ['
-        '{"instrument_id":"KRX:000020","effective_date":"2016-01-04T09:00:00+09:00",'
-        '"coverage_end":"2016-01-04T09:00:00+09:00","action_id":"coverage:one",'
-        '"type":"no_action","factor":1.0,"cash_amount":0.0,"source":"KRX",'
-        '"available_at":"2016-01-04T09:00:00+09:00"}]}',
-        encoding="utf-8",
-    )
+    payload = {
+        'endpoint': 'fricDecsn.json',
+        'corp_code': '00219097',
+        'status': '000',
+        'requested_instrument_id': 'KRX:027410',
+        'instrument_mapping_provenance': 'opendart_corp_code_direct',
+        'records': [
+            {
+                'rcept_no': '20161107000214',
+                'corp_code': '00219097',
+                'bfic_tisstk_ostk': '24773964',
+                'nstk_ostk_cnt': '24773661',
+                'nstk_ascnt_ps_ostk': '1',
+                'nstk_asstd': '2016-11-24',
+                'nstk_lstprd': '2016-12-14',
+            }
+        ],
+    }
+    (tmp_path / f'{EvidenceKind.CORPORATE_ACTIONS.value}.json').write_text(json.dumps(payload), encoding='utf-8')
+    daily = pl.DataFrame(
+        {
+            'session': [first, second, listing],
+            'instrument_id': ['KRX:027410'] * 3,
+            'close': [168500.0, 82600.0, 88000.0],
+            'shares_outstanding': [24773964.0, 24773964.0, 49547625.0],
+            'market_cap': [4174412934000.0, 2046329426400.0, 4360191000000.0],
+        }
+    ).lazy()
     report = CertificationReport(
         certification=DatasetCertification.RESEARCH,
-        report_hash="report",
-        coverage_start=date(2016, 1, 4),
-        coverage_end=date(2026, 3, 10),
+        report_hash='report',
+        coverage_start=date(2016, 11, 22),
+        coverage_end=date(2016, 12, 14),
         source_hashes={kind: items[0].content_hash for kind, items in receipts.items()},
     )
 
-    monkeypatch.setattr(streaming, "discover_verified_bronze_receipts", lambda **_: receipts)
-    monkeypatch.setattr(streaming, "_aggregate_small", lambda **_: pytest.fail("must not aggregate"))
-    monkeypatch.setattr(silver, "certify_corporate_action_refresh", lambda **_: report)
+    monkeypatch.setattr(streaming, 'discover_verified_bronze_receipts', lambda **_: receipts)
+    monkeypatch.setattr(streaming, '_aggregate_small', lambda **_: pytest.fail('must not aggregate'))
+    monkeypatch.setattr(silver, 'certify_corporate_action_refresh', lambda **_: report)
 
     class FakeStore:
         def __init__(self, root) -> None:
@@ -61,15 +86,18 @@ def test_corporate_action_only_refresh_does_not_aggregate_other_bronze_pages(mon
 
         def materialize_all(self, tables, **kwargs):
             assert set(tables) == {SilverTable.CORPORATE_ACTIONS}
-            return {SilverTable.CORPORATE_ACTIONS: tmp_path / "silver"}
+            assert tables[SilverTable.CORPORATE_ACTIONS]['evidence_status'].to_list() == ['verified']
+            return {SilverTable.CORPORATE_ACTIONS: tmp_path / 'silver'}
 
-    monkeypatch.setattr(silver, "SilverStore", FakeStore)
+    monkeypatch.setattr(silver, 'SilverStore', FakeStore)
 
     result = streaming.refresh_corporate_action_silver(
-        bronze_root=tmp_path / "bronze",
-        silver_root=tmp_path / "silver",
-        artifact_root=tmp_path / "artifacts",
-        decision_time=decision,
+        bronze_root=tmp_path / 'bronze',
+        silver_root=tmp_path / 'silver',
+        artifact_root=tmp_path / 'artifacts',
+        decision_time=listing,
+        daily_market=daily,
+        calendar=SessionCalendar((first, second, listing)),
     )
 
     assert result is report
@@ -447,7 +475,7 @@ def test_resolve_bonus_issue_027410_style_event() -> None:
 
     krx = ZoneInfo('Asia/Seoul')
     sessions = tuple(datetime(2016, 11, day, 9, tzinfo=krx) for day in (8, 22, 23, 24))
-    daily = pl.DataFrame({'session': sessions, 'instrument_id': ['KRX:027410'] * 4, 'close': [165000.0, 168500.0, 82600.0, 83000.0], 'shares_outstanding': [24773964.0, 24773964.0, 24773964.0, 24773964.0], 'market_cap': [1.0, 1.0, 1.0, 1.0]})
+    daily = pl.DataFrame({'session': sessions, 'instrument_id': ['KRX:027410'] * 4, 'close': [165000.0, 168500.0, 82600.0, 83000.0], 'shares_outstanding': [24773964.0, 24773964.0, 24773964.0, 49547625.0], 'market_cap': [4087704060000.0, 4174412934000.0, 2046329426400.0, 4112452875000.0]})
     pages = [{'endpoint': 'fricDecsn.json', 'corp_code': '00219097', 'status': '000', 'records': [{'rcept_no': '20161107000214', 'corp_code': '00219097', 'bfic_tisstk_ostk': '24,773,964', 'nstk_ostk_cnt': '24,773,661', 'nstk_ascnt_ps_ostk': '1', 'nstk_asstd': '2016년 11월 24일', 'nstk_lstprd': '2016년 11월 24일'}]}]
 
     records = resolve_opendart_corporate_action_records(pages=pages, daily_market=daily, calendar=SessionCalendar(sessions))
@@ -457,6 +485,7 @@ def test_resolve_bonus_issue_027410_style_event() -> None:
     assert records[0]['factor'] == 2.0
     assert records[0]['effective_session'].date().isoformat() == '2016-11-23'
     assert records[0]['available_at'].date().isoformat() == '2016-11-08'
+    assert records[0]['evidence_status'] == 'verified'
 
 
 # test_stream_normalization_rejects_unmodelled_event_and_unexplained_jump
@@ -465,16 +494,16 @@ def test_resolve_opendart_records_rejects_unmodelled_merger() -> None:
     from zoneinfo import ZoneInfo
 
     import polars as pl
-    import pytest
 
     from src.core.time import SessionCalendar
-    from src.data.schemas import PITDataError
     from src.data.streaming_normalization import resolve_opendart_corporate_action_records
 
     session = datetime(2024, 1, 2, 9, tzinfo=ZoneInfo('Asia/Seoul'))
     daily = pl.DataFrame({'session': [session], 'instrument_id': ['KRX:A'], 'close': [100.0], 'shares_outstanding': [1.0], 'market_cap': [100.0]})
-    with pytest.raises(PITDataError, match='unsupported OpenDART corporate action.*cmpMgDecsn.json'):  # noqa: RUF043
-        resolve_opendart_corporate_action_records(pages=[{'endpoint': 'cmpMgDecsn.json', 'corp_code': '00123456', 'status': '000', 'records': [{'rcept_no': '20240101000001'}]}], daily_market=daily, calendar=SessionCalendar((session,)))
+    resolved = resolve_opendart_corporate_action_records(pages=[{'endpoint': 'cmpMgDecsn.json', 'corp_code': '00123456', 'status': '000', 'records': [{'rcept_no': '20240101000001'}]}], daily_market=daily, calendar=SessionCalendar((session,)))
+    assert resolved[0]['evidence_status'] == 'unresolved'
+    assert resolved[0]['evidence_reason'] == 'unsupported_merger'
+    assert resolved[0]['factor'] == 1.0
 
 
 def test_resolve_bonus_issue_emits_distinct_price_and_listing_sessions() -> None:
@@ -549,3 +578,66 @@ def test_resolve_bonus_issue_rejects_out_of_calendar_listing_date() -> None:
 
     with pytest.raises(PITDataError, match='listing'):
         resolve_opendart_corporate_action_records(pages=[{'endpoint': 'fricDecsn.json', 'corp_code': '1', 'status': '000', 'records': [record]}], daily_market=daily, calendar=SessionCalendar((first, second)))
+
+
+def test_resolve_opendart_bonus_requires_all_four_krx_proofs() -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    import polars as pl
+    from src.core.time import SessionCalendar
+    from src.data.streaming_normalization import resolve_opendart_corporate_action_records
+
+    tz = ZoneInfo('Asia/Seoul')
+    sessions = (datetime(2016, 11, 8, 9, tzinfo=tz), datetime(2016, 11, 22, 9, tzinfo=tz), datetime(2016, 11, 23, 9, tzinfo=tz), datetime(2016, 12, 13, 9, tzinfo=tz), datetime(2016, 12, 14, 9, tzinfo=tz))
+    daily = pl.DataFrame({'session': sessions, 'instrument_id': ['KRX:027410'] * 5, 'close': [165000.0, 168500.0, 82600.0, 86200.0, 88000.0], 'shares_outstanding': [24773964.0, 24773964.0, 24773964.0, 24773964.0, 49547625.0], 'market_cap': [4087704060000.0, 4174412934000.0, 2046329426400.0, 2135515696800.0, 4360191000000.0]})
+    record = {'rcept_no': '20161107000214', 'corp_code': '00219097', 'bfic_tisstk_ostk': '24,773,964', 'nstk_ostk_cnt': '24,773,661', 'nstk_ascnt_ps_ostk': '1', 'nstk_asstd': '2016년 11월 24일', 'nstk_lstprd': '2016년 12월 14일'}
+    page = {'endpoint': 'fricDecsn.json', 'corp_code': '00219097', 'status': '000', 'requested_instrument_id': 'KRX:027410', 'instrument_mapping_provenance': 'opendart_corp_code_direct', 'records': [record]}
+    verified = resolve_opendart_corporate_action_records(pages=[page], daily_market=daily, calendar=SessionCalendar(sessions))[0]
+    assert verified['evidence_status'] == 'verified'
+    assert verified['factor'] == 2.0
+    assert verified['share_listing_date'] == sessions[-1]
+    bad_daily = daily.with_columns(pl.when(pl.col('session') == sessions[-1]).then(1.0).otherwise(pl.col('market_cap')).alias('market_cap'))
+    unresolved = resolve_opendart_corporate_action_records(pages=[page], daily_market=bad_daily, calendar=SessionCalendar(sessions))[0]
+    assert unresolved['evidence_status'] == 'unresolved'
+    assert unresolved['action_type'] == 'unresolved'
+    assert unresolved['factor'] == 1.0
+    assert unresolved['evidence_reason'] == 'krx_listing_market_cap_mismatch'
+
+
+def test_mapped_action_instruments_rejects_issuer_inference() -> None:
+    from src.data.streaming_normalization import mapped_action_instruments
+
+    pages = [
+        {'endpoint': 'fricDecsn.json', 'requested_instrument_id': 'KRX:005930', 'instrument_mapping_provenance': 'opendart_corp_code_direct', 'records': []},
+        {'endpoint': 'fricDecsn.json', 'corp_code': '00126380', 'records': [{'ticker': '005935'}]},
+        {'endpoint': 'fricDecsn.json', 'corp_code': '00126380', 'records': []},
+    ]
+    assert mapped_action_instruments(pages=pages) == frozenset({'KRX:005930', 'KRX:005935'})
+
+
+def test_refresh_corporate_action_silver_uses_structured_evidence_not_legacy_intervals(monkeypatch, tmp_path) -> None:
+    from datetime import date, datetime
+    from zoneinfo import ZoneInfo
+    import polars as pl
+    import src.data.streaming_normalization as module
+    from src.core.datasets import DatasetCertification
+    from src.core.time import SessionCalendar
+    from src.data.schemas import CertificationReport, EvidenceKind
+
+    tz = ZoneInfo('Asia/Seoul')
+    first = datetime(2016, 11, 22, 9, tzinfo=tz)
+    second = datetime(2016, 11, 23, 9, tzinfo=tz)
+    listing = datetime(2016, 12, 14, 9, tzinfo=tz)
+    daily = pl.DataFrame({'session': [first, second, listing], 'instrument_id': ['KRX:027410'] * 3, 'close': [168500.0, 82600.0, 88000.0], 'shares_outstanding': [24773964.0, 24773964.0, 49547625.0], 'market_cap': [4174412934000.0, 2046329426400.0, 4360191000000.0]}).lazy()
+    page = {'endpoint': 'fricDecsn.json', 'corp_code': '00219097', 'status': '000', 'requested_instrument_id': 'KRX:027410', 'instrument_mapping_provenance': 'opendart_corp_code_direct', 'records': [{'rcept_no': '20161107000214', 'corp_code': '00219097', 'bfic_tisstk_ostk': '24773964', 'nstk_ostk_cnt': '24773661', 'nstk_ascnt_ps_ostk': '1', 'nstk_asstd': '2016-11-24', 'nstk_lstprd': '2016-12-14'}]}
+    captured = {}
+    report = CertificationReport(certification=DatasetCertification.RESEARCH, report_hash='refresh', coverage_start=date(2016, 11, 22), coverage_end=date(2016, 12, 14), source_hashes={EvidenceKind.CORPORATE_ACTIONS: 'h'})
+    monkeypatch.setattr(module, 'load_structured_corporate_action_pages', lambda **_: [page])
+    monkeypatch.setattr(module, 'compact_corporate_action_intervals', lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError('legacy interval path')) )
+    def persist(**kwargs):
+        captured['frame'] = kwargs['action_frame']
+        return report
+    monkeypatch.setattr(module, '_persist_corporate_action_refresh', persist)
+    actual = module.refresh_corporate_action_silver(bronze_root=tmp_path / 'bronze', silver_root=tmp_path / 'silver', artifact_root=tmp_path / 'artifacts', decision_time=listing, daily_market=daily, calendar=SessionCalendar((first, second, listing)))
+    assert actual is report
+    assert captured['frame'].select('evidence_status').to_series().to_list() == ['verified']

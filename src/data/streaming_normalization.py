@@ -10,7 +10,7 @@ import multiprocessing
 import re
 import shutil
 import subprocess
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 from queue import Empty
@@ -782,13 +782,100 @@ def _resolve_listing_session(*, listing_date: date, calendar: SessionCalendar, i
     raise PITDataError(f"no KRX listing session for {instrument_id!r} action {action_id!r} field nstk_lstprd; certification blocked")
 
 
+def mapped_action_instruments(*, pages: Iterable[dict[str, Any]]) -> frozenset[str]:
+    """Collect explicitly mapped KRX instruments without issuer inference."""
+    explicit: set[str] = set()
+    for page in pages:
+        requested = page.get("requested_instrument_id")
+        if (
+            isinstance(requested, str)
+            and requested.strip()
+            and page.get("instrument_mapping_provenance") == "opendart_corp_code_direct"
+        ):
+            explicit.add(requested.strip())
+        for record in page.get("records", []) or []:
+            if not isinstance(record, dict):
+                raise PITDataError("invalid OpenDART record; certification blocked")
+            for key in ("instrument_id", "ticker"):
+                raw = record.get(key)
+                if isinstance(raw, str) and raw.strip():
+                    text = raw.strip()
+                    explicit.add(text if text.startswith("KRX:") else f"KRX:{text}")
+                    break
+    return frozenset(explicit)
+
+
+def load_structured_corporate_action_pages(
+    *, action_receipts: tuple[BronzeReceipt, ...]
+) -> list[dict[str, Any]]:
+    """Read OpenDART structured-decision payloads without legacy interval parsing."""
+    pages: list[dict[str, Any]] = []
+    for receipt in action_receipts:
+        try:
+            payload = _read_doc(receipt.payload_path)
+        except (OSError, ValueError) as exc:
+            raise PITDataError("missing corporate-action payload; certification blocked") from exc
+        if not isinstance(payload, dict) or "endpoint" not in payload:
+            raise PITDataError("invalid corporate-action payload; certification blocked")
+        pages.append(payload)
+    return pages
+
+
+def _resolve_instrument_with_page(
+    *, corp_code: str, daily_market: pl.DataFrame, record: dict[str, Any], page: dict[str, Any]
+) -> tuple[str, str | None]:
+    for key in ("instrument_id", "ticker"):
+        raw = record.get(key)
+        if isinstance(raw, str) and raw.strip():
+            text = raw.strip()
+            return (text if text.startswith("KRX:") else f"KRX:{text}", None)
+    requested = page.get("requested_instrument_id")
+    provenance = page.get("instrument_mapping_provenance")
+    if isinstance(requested, str) and requested.strip() and provenance == "opendart_corp_code_direct":
+        return (requested.strip(), str(provenance))
+    instruments = sorted({str(value) for value in daily_market["instrument_id"].to_list()})
+    if len(instruments) == 1:
+        return (instruments[0], None)
+    raise PITDataError(f"missing OpenDART corp_code mapping for {corp_code!r}")
+
+
+def _event_session_from_record(
+    *, record: dict[str, Any], available_at: datetime, calendar: SessionCalendar, rcept_no: str = ""
+) -> datetime:
+    for key in ("crsc_nstkdlprd", "event_date", "ex_date", "record_date", "mgsc_mgdt", "dvdt", "nstk_asstd", "asstd"):
+        raw = record.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            parsed = _parse_opendart_date(raw)
+        except PITDataError:
+            continue
+        for session in sorted(calendar.sessions):
+            if session.astimezone(KRX_TZ).date() >= parsed:
+                return session
+    ordered = tuple(sorted(calendar.sessions))
+    digits = re.sub(r"\D", "", str(rcept_no))[:8]
+    receipt_day = date(int(digits[:4]), int(digits[4:6]), int(digits[6:8]))
+    return next(
+        (session for session in ordered if session.astimezone(KRX_TZ).date() > receipt_day),
+        available_at,
+    )
+
+
+_UNRESOLVED_REASON_BY_ENDPOINT: dict[str, str] = {
+    "piicDecsn.json": "unsupported_paid_in_capital",
+    "cmpMgDecsn.json": "unsupported_merger",
+    "cmpDvDecsn.json": "unsupported_division",
+    "crDecsn.json": "unsupported_capital_reduction",
+}
+
+
 def resolve_opendart_corporate_action_records(
     *, pages: Iterable[dict[str, Any]], daily_market: pl.DataFrame, calendar: SessionCalendar
 ) -> list[dict[str, Any]]:
     from src.data.backtest_sessions import BacktestMarketInputsPolicy
 
     threshold = float(BacktestMarketInputsPolicy().unexplained_price_jump_threshold)
-    ordered_sessions = tuple(sorted(calendar.sessions))
     page_list: list[dict[str, Any]] = []
     for page in pages:
         item = dict(page) if isinstance(page, dict) else {
@@ -799,133 +886,241 @@ def resolve_opendart_corporate_action_records(
         }
         page_list.append(item)
     page_list.sort(key=lambda p: (str(p.get("corp_code", "")), str(p.get("endpoint", ""))))
-    daily_rows = daily_market.to_dicts()
-    closes_by_iid: dict[str, list[tuple[datetime, float]]] = {}
-    for row in daily_rows:
+    available = set(daily_market.columns)
+    select_exprs: list[pl.Expr] = [
+        pl.col("session"),
+        pl.col("instrument_id").cast(pl.String),
+        pl.col("close").cast(pl.Float64),
+    ]
+    if "shares_outstanding" in available:
+        select_exprs.append(pl.col("shares_outstanding").cast(pl.Float64))
+    else:
+        select_exprs.append(pl.lit(float("nan")).alias("shares_outstanding"))
+    if "market_cap" in available:
+        select_exprs.append(pl.col("market_cap").cast(pl.Float64))
+    else:
+        select_exprs.append(pl.lit(float("nan")).alias("market_cap"))
+    projected = daily_market.lazy().select(select_exprs).collect()
+    bars_by_iid: dict[str, list[dict[str, Any]]] = {}
+    for row in projected.to_dicts():
         iid = str(row.get("instrument_id", ""))
         session = row.get("session")
         if not isinstance(session, datetime):
-            raise PITDataError("invalid KRX session; certification blocked")  # pragma: no cover
+            raise PITDataError("invalid KRX session; certification blocked")
         try:
             close = float(row.get("close", float("nan")))
-        except (TypeError, ValueError) as exc:  # pragma: no cover
+        except (TypeError, ValueError) as exc:
             raise PITDataError("invalid KRX market value; certification blocked") from exc
         if not math.isfinite(close) or close <= 0:
-            raise PITDataError("invalid KRX market value; certification blocked")  # pragma: no cover
-        closes_by_iid.setdefault(iid, []).append((session, close))
-    for iid in closes_by_iid:
-        closes_by_iid[iid].sort(key=lambda pair: pair[0])
+            raise PITDataError("invalid KRX market value; certification blocked")
+        try:
+            shares = float(row.get("shares_outstanding", float("nan")))
+        except (TypeError, ValueError):
+            shares = float("nan")
+        try:
+            cap = float(row.get("market_cap", float("nan")))
+        except (TypeError, ValueError):
+            cap = float("nan")
+        bars_by_iid.setdefault(iid, []).append(
+            {"session": session, "close": close, "shares_outstanding": shares, "market_cap": cap}
+        )
+    for iid in bars_by_iid:
+        bars_by_iid[iid].sort(key=lambda entry: entry["session"])
+
+    def _unresolved(
+        *, instrument_id: str, action_id: str, available_at: datetime,
+        effective_session: datetime, reason: str, page: dict[str, Any],
+    ) -> dict[str, Any]:
+        row: dict[str, Any] = {
+            "instrument_id": instrument_id,
+            "action_type": "unresolved",
+            "type": "unresolved",
+            "factor": 1.0,
+            "cash_amount": 0.0,
+            "effective_session": effective_session,
+            "effective_date": effective_session,
+            "share_listing_date": None,
+            "share_delta": None,
+            "available_at": available_at,
+            "action_id": action_id,
+            "evidence_status": "unresolved",
+            "evidence_reason": reason,
+        }
+        provenance = page.get("instrument_mapping_provenance")
+        if provenance is not None:
+            row["instrument_mapping_provenance"] = provenance
+        requested = page.get("requested_instrument_id")
+        if requested is not None:
+            row["requested_instrument_id"] = requested
+        return row
+
     resolved: list[dict[str, Any]] = []
     for page in page_list:
         endpoint = str(page.get("endpoint", ""))
         corp_code = str(page.get("corp_code", ""))
         status = str(page.get("status", ""))
         if status == "013":
-            continue  # pragma: no cover
+            continue
         if status != "000":
-            raise PITDataError(f"unexpected OpenDART status {status!r} for {endpoint} {corp_code}")  # pragma: no cover
+            raise PITDataError(f"unexpected OpenDART status {status!r} for {endpoint} {corp_code}")
         records = page.get("records", [])
         if not isinstance(records, list):
             raise PITDataError(f"invalid OpenDART records for {endpoint} {corp_code}")
         for record in records:
             if not isinstance(record, dict):
-                raise PITDataError(f"invalid OpenDART record for {endpoint} {corp_code}")  # pragma: no cover
+                raise PITDataError(f"invalid OpenDART record for {endpoint} {corp_code}")
             rcept_no = str(record.get("rcept_no", "") or "").strip()
             if endpoint == "fricDecsn.json":
                 for field in ("rcept_no", "corp_code", "bfic_tisstk_ostk", "nstk_ostk_cnt", "nstk_ascnt_ps_ostk", "nstk_asstd", "nstk_lstprd"):
                     if str(record.get(field, "") or "").strip() == "":
-                        raise PITDataError(f"missing OpenDART field {field} for {endpoint} {rcept_no}")  # pragma: no cover
-                basis = _parse_exact_int(record.get("bfic_tisstk_ostk"), field="bfic_tisstk_ostk")
-                existing = _parse_exact_int(record.get("nstk_ostk_cnt"), field="nstk_ostk_cnt")
-                if abs(basis - existing) > 1000:
-                    raise PITDataError(  # pragma: no cover
-                        f"ambiguous OpenDART share basis for {endpoint} {rcept_no}; certification blocked"
-                    )
-                alloc = _parse_exact_int(record.get("nstk_ascnt_ps_ostk"), field="nstk_ascnt_ps_ostk")
-                if alloc <= 0:
-                    raise PITDataError(f"invalid OpenDART allocation for {endpoint} {rcept_no}")  # pragma: no cover
-                factor = 1.0 + float(alloc)
-                if not math.isfinite(factor) or factor <= 1.0:
-                    raise PITDataError(f"invalid OpenDART factor for {endpoint} {rcept_no}")  # pragma: no cover
-                asstd = _parse_opendart_date(record.get("nstk_asstd"))
-                instrument_id = _resolve_instrument(corp_code=corp_code or str(record.get("corp_code", "")), daily_market=daily_market, record=record)
+                        raise PITDataError(f"missing OpenDART field {field} for {endpoint} {rcept_no}")
+                try:
+                    basis = _parse_exact_int(record.get("bfic_tisstk_ostk"), field="bfic_tisstk_ostk")
+                    existing = _parse_exact_int(record.get("nstk_ostk_cnt"), field="nstk_ostk_cnt")
+                    alloc = _parse_exact_int(record.get("nstk_ascnt_ps_ostk"), field="nstk_ascnt_ps_ostk")
+                except PITDataError:
+                    raise
+                instrument_id, provenance = _resolve_instrument_with_page(
+                    corp_code=corp_code or str(record.get("corp_code", "")),
+                    daily_market=daily_market, record=record, page=page,
+                )
                 available_at = _receipt_available_at(rcept_no=rcept_no, calendar=calendar)
+                if alloc <= 0:
+                    resolved.append(_unresolved(
+                        instrument_id=instrument_id, action_id=rcept_no,
+                        available_at=available_at,
+                        effective_session=_event_session_from_record(
+                            record=record, available_at=available_at, calendar=calendar, rcept_no=rcept_no),
+                        reason="ambiguous_or_missing_dart_share_basis", page=page,
+                    ))
+                    continue
+                if abs(basis - existing) > 1000:
+                    resolved.append(_unresolved(
+                        instrument_id=instrument_id, action_id=rcept_no,
+                        available_at=available_at,
+                        effective_session=_event_session_from_record(
+                            record=record, available_at=available_at, calendar=calendar, rcept_no=rcept_no),
+                        reason="ambiguous_or_missing_dart_share_basis", page=page,
+                    ))
+                    continue
+                factor = 1.0 + float(alloc)
+                asstd = _parse_opendart_date(record.get("nstk_asstd"))
                 listing_date = _parse_opendart_date(record.get("nstk_lstprd"))
                 listing_session = _resolve_listing_session(listing_date=listing_date, calendar=calendar, instrument_id=instrument_id, action_id=rcept_no)
-                bars = closes_by_iid.get(instrument_id, [])
+                bars = bars_by_iid.get(instrument_id, [])
                 if len(bars) < 2:
-                    raise PITDataError(f"missing KRX bars for {endpoint} {rcept_no}")  # pragma: no cover
-                first_ge = next((idx for idx, (sess, _) in enumerate(bars) if sess.astimezone(KRX_TZ).date() >= asstd), None)
+                    raise PITDataError(f"missing KRX bars for {endpoint} {rcept_no}")
+                first_ge = next((idx for idx, entry in enumerate(bars) if entry["session"].astimezone(KRX_TZ).date() >= asstd), None)
                 if first_ge is None or first_ge < 1:
-                    raise PITDataError(f"missing KRX bars for {endpoint} {rcept_no}")  # pragma: no cover
+                    resolved.append(_unresolved(
+                        instrument_id=instrument_id, action_id=rcept_no,
+                        available_at=available_at,
+                        effective_session=_event_session_from_record(
+                            record=record, available_at=available_at, calendar=calendar, rcept_no=rcept_no),
+                        reason="expected_one_price_candidate_got_0", page=page,
+                    ))
+                    continue
                 candidates: list[datetime] = []
                 for curr_idx in (first_ge - 1, first_ge):
                     if curr_idx < 1 or curr_idx >= len(bars):
-                        continue  # pragma: no cover
-                    prev_close = bars[curr_idx - 1][1]
-                    curr_close = bars[curr_idx][1]
-                    if not math.isfinite(prev_close) or not math.isfinite(curr_close) or prev_close <= 0 or curr_close <= 0:
-                        raise PITDataError(f"invalid KRX market value for {endpoint} {rcept_no}")  # pragma: no cover
+                        continue
+                    prev_close = bars[curr_idx - 1]["close"]
+                    curr_close = bars[curr_idx]["close"]
                     raw_return = abs(curr_close / prev_close - 1.0)
                     adjusted = abs(factor * curr_close / prev_close - 1.0)
                     if raw_return > threshold and adjusted <= threshold:
-                        candidates.append(bars[curr_idx][0])
-                if len(candidates) != 1 or listing_session < candidates[0]:  # pragma: no cover
-                    raise PITDataError(
-                        f"unreconciled OpenDART bonus issue for {endpoint} {rcept_no}; certification blocked"
-                    )
+                        candidates.append(bars[curr_idx]["session"])
+                if len(candidates) != 1:
+                    resolved.append(_unresolved(
+                        instrument_id=instrument_id, action_id=rcept_no,
+                        available_at=available_at,
+                        effective_session=_event_session_from_record(
+                            record=record, available_at=available_at, calendar=calendar, rcept_no=rcept_no),
+                        reason=f"expected_one_price_candidate_got_{len(candidates)}", page=page,
+                    ))
+                    continue
                 effective_session = candidates[0]
                 decision_time = effective_session.replace(hour=15, minute=30)
-                if not available_at < decision_time:  # pragma: no cover
-                    raise PITDataError(f"late corporate action for {instrument_id!r}")
-                resolved.append({
+                if not available_at < decision_time:
+                    resolved.append(_unresolved(
+                        instrument_id=instrument_id, action_id=rcept_no,
+                        available_at=available_at, effective_session=effective_session,
+                        reason="late_corporate_action_receipt", page=page,
+                    ))
+                    continue
+                if listing_session < effective_session:
+                    resolved.append(_unresolved(
+                        instrument_id=instrument_id, action_id=rcept_no,
+                        available_at=available_at, effective_session=effective_session,
+                        reason="listing_before_effective_session", page=page,
+                    ))
+                    continue
+                listed_bar = next((entry for entry in bars if entry["session"] == listing_session), None)
+                listed_idx = next((idx for idx, entry in enumerate(bars) if entry["session"] == listing_session), None)
+                if listed_bar is None or listed_idx is None or listed_idx < 1:
+                    raise PITDataError(f"missing KRX bars for {endpoint} {rcept_no}")
+                prev_bar = bars[listed_idx - 1]
+                for field in ("shares_outstanding", "market_cap"):
+                    for bar in (listed_bar, prev_bar):
+                        value = bar[field]
+                        if not math.isfinite(value) or value <= 0:
+                            raise PITDataError(f"invalid KRX market value for {endpoint} {rcept_no}")
+                krx_delta = listed_bar["shares_outstanding"] - prev_bar["shares_outstanding"]
+                if krx_delta != float(existing):
+                    resolved.append(_unresolved(
+                        instrument_id=instrument_id, action_id=rcept_no,
+                        available_at=available_at, effective_session=effective_session,
+                        reason="krx_listing_share_delta_mismatch", page=page,
+                    ))
+                    continue
+                expected_cap = listed_bar["close"] * listed_bar["shares_outstanding"]
+                listed_cap = listed_bar["market_cap"]
+                tol = max(1e-6, 1e-6 * max(abs(expected_cap), abs(listed_cap)))
+                if abs(listed_cap - expected_cap) > tol:
+                    resolved.append(_unresolved(
+                        instrument_id=instrument_id, action_id=rcept_no,
+                        available_at=available_at, effective_session=effective_session,
+                        reason="krx_listing_market_cap_mismatch", page=page,
+                    ))
+                    continue
+                row = {
                     "instrument_id": instrument_id,
                     "action_type": "bonus_issue",
+                    "type": "bonus_issue",
                     "factor": float(factor),
                     "cash_amount": 0.0,
                     "effective_session": effective_session,
+                    "effective_date": effective_session,
                     "share_listing_date": listing_session,
                     "share_delta": int(existing),
                     "available_at": available_at,
                     "action_id": rcept_no,
-                })
-            elif endpoint == "crDecsn.json":  # pragma: no cover
-                cr_mth = str(record.get("cr_mth", "") or "").strip()
-                if cr_mth and cr_mth not in ("consolidation", "stock_consolidation", "주식병합"):
-                    raise PITDataError(
-                        f"unsupported OpenDART corporate action consolidation in {endpoint} rcept {rcept_no} category {cr_mth}"
-                    )
-                pre_raw = next((record.get(k) for k in ("bf_ostk_cnt", "bfic_tisstk_ostk", "pre_shares") if record.get(k) not in (None, "")), None)
-                post_raw = next((record.get(k) for k in ("af_ostk_cnt", "aft_ostk_cnt", "post_shares") if record.get(k) not in (None, "")), None)
-                if pre_raw is None or post_raw is None:
-                    raise PITDataError(
-                        f"unsupported OpenDART corporate action consolidation in {endpoint} rcept {rcept_no} category capital_reduction"
-                    )
-                pre = _parse_exact_int(pre_raw, field="pre_shares")
-                post = _parse_exact_int(post_raw, field="post_shares")
-                if pre <= 0 or post <= 0 or post >= pre:
-                    raise PITDataError(f"invalid OpenDART consolidation factor for {endpoint} {rcept_no}")
-                factor = float(post) / float(pre)
-                if not math.isfinite(factor) or not 0.0 < factor < 1.0:
-                    raise PITDataError(f"invalid OpenDART consolidation factor for {endpoint} {rcept_no}")
-                instrument_id = _resolve_instrument(corp_code=corp_code or str(record.get("corp_code", "")), daily_market=daily_market, record=record)
-                available_at = _receipt_available_at(rcept_no=rcept_no, calendar=calendar)
-                resolved.append({
-                    "instrument_id": instrument_id,
-                    "action_type": "reverse_split",
-                    "factor": float(factor),
-                    "cash_amount": 0.0,
-                    "effective_session": ordered_sessions[0],
-                    "share_listing_date": None,
-                    "share_delta": None,
-                    "available_at": available_at,
-                    "action_id": rcept_no,
-                })
+                    "evidence_status": "verified",
+                    "evidence_reason": None,
+                }
+                if provenance is not None:
+                    row["instrument_mapping_provenance"] = provenance
+                requested = page.get("requested_instrument_id")
+                if requested is not None:
+                    row["requested_instrument_id"] = requested
+                resolved.append(row)
             else:
-                category = {"piicDecsn.json": "paid-in-capital", "cmpDvDecsn.json": "division", "cmpMgDecsn.json": "merger"}.get(endpoint, "unrecognised")
-                raise PITDataError(
-                    f"unsupported OpenDART corporate action {category} in {endpoint} rcept {rcept_no} category {category}"
+                instrument_id, _prov = _resolve_instrument_with_page(
+                    corp_code=corp_code or str(record.get("corp_code", "")),
+                    daily_market=daily_market, record=record, page=page,
                 )
+                available_at = _receipt_available_at(rcept_no=rcept_no, calendar=calendar)
+                effective_session = _event_session_from_record(
+                    record=record, available_at=available_at, calendar=calendar, rcept_no=rcept_no)
+                if endpoint == "crDecsn.json":
+                    reason = "unresolved_reverse_split"
+                else:
+                    reason = _UNRESOLVED_REASON_BY_ENDPOINT.get(endpoint, f"unsupported_{endpoint.replace('.json', '')}")
+                resolved.append(_unresolved(
+                    instrument_id=instrument_id, action_id=rcept_no,
+                    available_at=available_at, effective_session=effective_session,
+                    reason=reason, page=page,
+                ))
     resolved.sort(key=lambda r: (str(r["instrument_id"]), r["effective_session"].isoformat(), str(r["action_id"])))
     return resolved
 
@@ -988,72 +1183,23 @@ def compact_corporate_action_intervals(
     return result
 
 
-def refresh_corporate_action_silver(
+def _persist_corporate_action_refresh(
     *,
-    bronze_root: Path,
+    action_frame: pl.DataFrame,
+    receipts: Mapping[EvidenceKind, tuple[BronzeReceipt, ...]],
     silver_root: Path,
     artifact_root: Path,
     decision_time: datetime,
 ) -> CertificationReport:
-    """Refresh only corporate actions without aggregating unrelated Bronze pages."""
-    if decision_time.tzinfo is None:  # pragma: no cover - public callers validate timezone
-        raise PITDataError("decision_time must be timezone-aware")
-    grouped_raw = discover_verified_bronze_receipts(bronze_root=Path(bronze_root))
-    grouped = {kind: tuple(items) for kind, items in grouped_raw.items()}
-    missing = [kind.value for kind in EvidenceKind if not grouped.get(kind)]
-    if missing:  # pragma: no cover - verified Bronze preflight
-        raise PITDataError(f"missing required evidence: {', '.join(sorted(missing))}")
-
-    action_receipts = grouped[EvidenceKind.CORPORATE_ACTIONS]
-    action_source_hashes = [item.content_hash for item in action_receipts]
-    cache_path = Path(artifact_root) / "corporate_actions_stream.json"
-    try:
-        cached = _read_doc(cache_path) if cache_path.exists() else None
-    except (OSError, ValueError):  # pragma: no cover - corrupted optional cache
-        cached = None
-    if (
-        isinstance(cached, dict)
-        and cached.get("source_hashes") == action_source_hashes
-        and isinstance(cached.get("records"), list)
-        and not any(
-            str(item.get("instrument_id")) == "KRX:__NO_ACTION__"
-            for item in cached["records"]
-            if isinstance(item, dict)
-        )
-    ):
-        records = [item for item in cached["records"] if isinstance(item, dict)]
-    else:  # pragma: no cover - live source parsing is covered by parser tests
-        records = compact_corporate_action_intervals(
-            _stream_corporate_action_intervals(action_receipts), decision_time=decision_time
-        )
-        if not records:  # pragma: no cover - valid source must have intervals
-            raise PITDataError("corporate-action source has no usable intervals; certification blocked")
-        _write_doc(cache_path, {"source_hashes": action_source_hashes, "records": records})
-
+    """Certify and materialize an action-only refresh without touching inputs on failure."""
     from src.data.silver import SilverStore, certify_corporate_action_refresh
 
-    preliminary_source_hash = (
-        action_source_hashes[0]
-        if len(action_source_hashes) == 1
-        else hashlib.sha256("\x00".join(sorted(action_source_hashes)).encode("utf-8")).hexdigest()
-    )
-    action_frame = _corporate_action_frame(records, source_hash=preliminary_source_hash)
     report = certify_corporate_action_refresh(
         action_frame=action_frame,
-        receipts=grouped,
+        receipts=receipts,
         silver_root=Path(silver_root),
         decision_time=decision_time,
     )
-    if report.source_hashes[EvidenceKind.CORPORATE_ACTIONS] != preliminary_source_hash:  # pragma: no cover - multi-receipt source
-        action_frame = _corporate_action_frame(
-            records, source_hash=report.source_hashes[EvidenceKind.CORPORATE_ACTIONS]
-        )
-        report = certify_corporate_action_refresh(
-            action_frame=action_frame,
-            receipts=grouped,
-            silver_root=Path(silver_root),
-            decision_time=decision_time,
-        )
     path = SilverStore(Path(silver_root)).materialize_all(
         {SilverTable.CORPORATE_ACTIONS: action_frame}, report=report, decision_time=decision_time
     )[SilverTable.CORPORATE_ACTIONS]
@@ -1062,6 +1208,68 @@ def refresh_corporate_action_silver(
         {"report_hash": report.report_hash, "row_count": action_frame.height, "dataset": str(path)},
     )
     return report
+
+
+def refresh_corporate_action_silver(
+    *,
+    bronze_root: Path,
+    silver_root: Path,
+    artifact_root: Path,
+    decision_time: datetime,
+    daily_market: pl.LazyFrame,
+    calendar: SessionCalendar,
+) -> CertificationReport:
+    """Refresh corporate actions from structured OpenDART evidence with a lazy KRX scan."""
+    if decision_time.tzinfo is None:
+        raise PITDataError("decision_time must be timezone-aware")
+    if not calendar.sessions:
+        raise PITDataError("corporate-action refresh requires a certified KRX calendar")
+    if not isinstance(daily_market, pl.LazyFrame):
+        raise PITDataError("corporate-action refresh requires a lazy daily-market scan")
+    missing_scan = [
+        column
+        for column in ("session", "instrument_id", "close", "shares_outstanding", "market_cap")
+        if column not in daily_market.collect_schema().names()
+    ]
+    if missing_scan:
+        raise PITDataError(f"corporate-action refresh daily scan is missing columns: {missing_scan}")
+    grouped = {kind: tuple(items) for kind, items in discover_verified_bronze_receipts(bronze_root=Path(bronze_root)).items()}
+    pages = load_structured_corporate_action_pages(
+        action_receipts=tuple(grouped.get(EvidenceKind.CORPORATE_ACTIONS, ()))
+    )
+    if not pages:
+        raise PITDataError("corporate-action source has no structured pages; certification blocked")
+    mapped = mapped_action_instruments(pages=pages)
+    if not mapped:
+        raise PITDataError("unmapped corporate-action page; certification blocked")
+    preview = (
+        daily_market.filter(pl.col("instrument_id").is_in(sorted(mapped)))
+        .select("session", "instrument_id", "close", "shares_outstanding", "market_cap")
+        .collect()
+    )
+    if preview.height == 0:
+        raise PITDataError("corporate-action preview has no mapped bars; certification blocked")
+    resolved = resolve_opendart_corporate_action_records(pages=pages, daily_market=preview, calendar=calendar)
+    for row in resolved:
+        if "evidence_status" not in row or "evidence_reason" not in row:
+            raise PITDataError("corporate-action cache row lacks evidence_status/evidence_reason; certification blocked")
+    action_hashes = [item.content_hash for item in grouped.get(EvidenceKind.CORPORATE_ACTIONS, ())]
+    source_hash = action_hashes[0] if len(action_hashes) == 1 else hashlib.sha256("\x00".join(sorted(action_hashes)).encode("utf-8")).hexdigest()
+    from src.data.normalization import normalize_corporate_action_records
+
+    action_frame = normalize_corporate_action_records(
+        action_records=resolved,
+        calendar_sessions=tuple(sorted(calendar.sessions)),
+        corporate_action_available_at=decision_time,
+        corporate_action_source_hash=source_hash,
+    )
+    return _persist_corporate_action_refresh(
+        action_frame=action_frame,
+        receipts=grouped,
+        silver_root=Path(silver_root),
+        artifact_root=Path(artifact_root),
+        decision_time=decision_time,
+    )
 
 
 def _corporate_action_frame(records: Iterable[dict[str, Any]], *, source_hash: str) -> pl.DataFrame:
@@ -1473,18 +1681,17 @@ def stream_normalize_stock_evidence(
     ):
         streamed_actions = [item for item in cached_actions["records"] if isinstance(item, dict)]
     else:  # pragma: no cover - exercised by full Bronze rebuild
-        corporate_action_pages: list[dict[str, Any]] = []
-        for _receipt in action_receipts:
-            try:
-                _payload = _read_doc(_receipt.payload_path)
-            except (OSError, ValueError):
-                continue
-            if isinstance(_payload, dict) and "endpoint" in _payload:
-                corporate_action_pages.append(_payload)
+        corporate_action_pages = load_structured_corporate_action_pages(action_receipts=tuple(action_receipts))
         if corporate_action_pages:
+            _mapped = mapped_action_instruments(pages=corporate_action_pages)
+            if not _mapped:
+                raise PITDataError("unmapped corporate-action page; certification blocked")
             _daily_preview: list[dict[str, Any]] = []
             for _item in _stream_items_for_kind(list(selected_streaming[EvidenceKind.DAILY_MARKET]), batch_size=bound):
                 try:
+                    _instrument_preview = _canonical_instrument_id(_item)
+                    if _instrument_preview not in _mapped:
+                        continue
                     _cal_hint = _as_krx_datetime(_required_row_value(_item, "session", "price_date", "basDd", "BAS_DD"))
                     _avail_preview = historical_available_at(
                         kind=EvidenceKind.DAILY_MARKET,
@@ -1496,7 +1703,7 @@ def stream_normalize_stock_evidence(
                         "session": _canon["session"],
                         "instrument_id": _canon["instrument_id"],
                         "close": _canon["close"],
-                        "shares_outstanding": _canon["shares"],
+                        "shares_outstanding": _canon["shares_outstanding"],
                         "market_cap": _canon["market_cap"],
                     })
                 except PITDataError:
@@ -1522,6 +1729,8 @@ def stream_normalize_stock_evidence(
                     "cash_amount": _r["cash_amount"],
                     "source": "opendart_structured_decisions",
                     "available_at": _r["available_at"],
+                    "evidence_status": _r["evidence_status"],
+                    "evidence_reason": _r["evidence_reason"],
                 }
                 for _r in _resolved
             ]
@@ -1606,7 +1815,7 @@ def stream_normalize_stock_evidence(
                     _h = _as_krx_datetime(_required_row_value(_item, "session", "price_date", "basDd", "BAS_DD"))
                     _av = historical_available_at(kind=EvidenceKind.DAILY_MARKET, record=_item, calendar=_StreamCalendar((_h,)))
                     _c = _canonical_daily_row(_item, available_at=_av, source_hash="audit")
-                    _audit_rows.append({"session": _c["session"], "instrument_id": _c["instrument_id"], "close": _c["close"], "shares_outstanding": _c["shares"], "market_cap": _c["market_cap"], "available_at": _c["available_at"]})
+                    _audit_rows.append({"session": _c["session"], "instrument_id": _c["instrument_id"], "close": _c["close"], "shares_outstanding": _c["shares_outstanding"], "market_cap": _c["market_cap"], "available_at": _c["available_at"]})
                 except PITDataError:
                     continue
             daily_market = _plaudit.DataFrame(_audit_rows) if _audit_rows else _plaudit.DataFrame(schema={"session": _plaudit.Datetime(time_zone="Asia/Seoul"), "instrument_id": _plaudit.String, "close": _plaudit.Float64, "shares_outstanding": _plaudit.Float64, "market_cap": _plaudit.Float64, "available_at": _plaudit.Datetime(time_zone="Asia/Seoul")})
