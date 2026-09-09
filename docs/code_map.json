@@ -288,10 +288,7 @@
     "testing": "tests/unit/strategy/test_portfolio.py"
   },
   "src/strategy/scoring.py": {
-    "testing": [
-      "tests/unit/strategy/test_scoring.py",
-      "tests/unit/data/test_cli.py"
-    ]
+    "testing": "tests/unit/strategy/test_scoring.py"
   },
   "src/strategy/selection.py": {
     "testing": "tests/unit/strategy/test_selection.py"
