@@ -15,6 +15,9 @@
   "src/core/paths.py": {
     "testing": "tests/unit/core/test_paths.py"
   },
+  "src/core/pit.py": {
+    "testing": "tests/unit/core/test_pit.py"
+  },
   "src/core/portfolio.py": {
     "testing": "tests/unit/core/test_portfolio.py"
   },
@@ -103,33 +106,7 @@
     "testing": "tests/unit/data/test_replay.py"
   },
   "src/data/schemas.py": {
-    "testing": [
-      "tests/integration/data/test_backtest_data_pipeline.py",
-      "tests/integration/data/test_collection.py",
-      "tests/integration/data/test_collection_provider_routing.py",
-      "tests/integration/data/test_pit_dataset_foundation.py",
-      "tests/unit/data/test_backtest_runner.py",
-      "tests/unit/data/test_backtest_sessions.py",
-      "tests/unit/data/test_bronze.py",
-      "tests/unit/data/test_bronze_aggregation.py",
-      "tests/unit/data/test_cli.py",
-      "tests/unit/data/test_collection_readiness.py",
-      "tests/unit/data/test_gold.py",
-      "tests/unit/data/test_gold_artifacts.py",
-      "tests/unit/data/test_gold_loader.py",
-      "tests/unit/data/test_historical_data_pipeline.py",
-      "tests/unit/data/test_incremental_normalization.py",
-      "tests/unit/data/test_operations.py",
-      "tests/unit/data/test_pipeline.py",
-      "tests/unit/data/test_replay.py",
-      "tests/unit/data/test_silver.py",
-      "tests/unit/data/test_streaming_stock_normalization.py",
-      "tests/unit/integrations/dart/test_xbrl_standard.py",
-      "tests/unit/integrations/krx/test_historical.py",
-      "tests/unit/integrations/test_investor_flow_router.py",
-      "tests/unit/integrations/test_kis_investor_flow.py",
-      "tests/unit/strategy/test_champion_strategy.py"
-    ]
+    "testing": "tests/unit/data/test_schemas.py"
   },
   "src/data/silver.py": {
     "testing": "tests/unit/data/test_silver.py"
@@ -270,7 +247,9 @@
   "src/integrations/kis/investor_flow.py": {
     "testing": "tests/unit/integrations/kis/test_investor_flow.py"
   },
-  "src/integrations/kiwoom/client.py": {},
+  "src/integrations/kiwoom/client.py": {
+    "testing": "tests/unit/integrations/kiwoom/test_client.py"
+  },
   "src/integrations/kiwoom/investor_flow.py": {
     "testing": "tests/unit/integrations/kiwoom/test_investor_flow.py"
   },

@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ARCHITECTURE_REFACTOR_PIT_CONTRACT",
+      "date": "2026-09-09",
+      "adr_id": "ADR_20260909_ARCHITECTURE_REFACTOR_PIT_CONTRACT",
+      "domain": "system",
+      "title": "Extract PIT contracts to core",
+      "why": "Provider and domain adapters depended on data-owned PIT contracts, increasing reverse dependencies and refactor risk.",
+      "resolution": "Moved PIT contract ownership to src.core.pit, retained an identity-preserving data.schemas facade, migrated provider/domain imports, and fixed the incompatible CLI ordering assertion.",
+      "impact": "Core now owns shared PIT contracts while existing imports remain compatible, with lint, typing, regression, and 100% diff-coverage gates passing."
+    },
+    {
       "task_id": "TASK_GOLD_PERF_OPT",
       "date": "2026-09-08",
       "adr_id": "ADR_20260908_GOLD_PERF_OPT",
