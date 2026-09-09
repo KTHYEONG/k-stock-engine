@@ -120,7 +120,7 @@ def test_normalize_corporate_action_records_preserves_settlement_and_rejects_leg
     tz = ZoneInfo('Asia/Seoul')
     price_session = datetime(2016, 11, 23, 9, tzinfo=tz)
     listing_session = datetime(2016, 12, 14, 9, tzinfo=tz)
-    record = {'instrument_id': 'KRX:027410', 'effective_session': price_session, 'share_listing_date': listing_session, 'share_delta': 24773661, 'action_id': '20161107000214', 'type': 'bonus_issue', 'factor': 2.0, 'cash_amount': 0.0, 'source': 'opendart_structured_decisions', 'available_at': datetime(2016, 11, 8, 9, tzinfo=tz)}
+    record = {'instrument_id': 'KRX:027410', 'effective_session': price_session, 'share_listing_date': listing_session, 'share_delta': 24773661, 'action_id': '20161107000214', 'type': 'bonus_issue', 'factor': 2.0, 'cash_amount': 0.0, 'source': 'opendart_structured_decisions', 'available_at': datetime(2016, 11, 8, 9, tzinfo=tz), 'evidence_status': 'verified', 'evidence_reason': None}
 
     frame = normalize_corporate_action_records(action_records=[record], calendar_sessions=(price_session, listing_session), corporate_action_available_at=price_session, corporate_action_source_hash='a' * 64)
 
@@ -161,8 +161,22 @@ def test_normalize_stock_evidence_wires_bonus_settlement_normalizer(monkeypatch,
     monkeypatch.setattr(module, '_load_payload', lambda receipt, kind: payloads[kind])
     monkeypatch.setattr(module, 'normalize_dart_financial_facts', lambda **_kwargs: pl.DataFrame({'company_id': ['027410'], 'fiscal_period': ['2024Q1'], 'filing_id': ['f1'], 'fact': ['sales'], 'published_at': [session], 'available_at': [session], 'value': [1.0], 'unit': ['KRW'], 'consolidated': [True], 'restatement_id': ['r0'], 'source_hash': ['f' * 64], 'source_kind': ['fixture'], 'mapping_version': ['fixture'], 'raw_document_hash': [None]}))
     monkeypatch.setattr(silver, 'certify_silver', lambda **_kwargs: object())
-    action = {'instrument_id': 'KRX:027410', 'effective_session': session, 'share_listing_date': session, 'share_delta': 10, 'action_id': 'a1', 'type': 'bonus_issue', 'factor': 2.0, 'cash_amount': 0.0, 'source': 'opendart', 'available_at': session}
+    action = {'instrument_id': 'KRX:027410', 'effective_session': session, 'share_listing_date': session, 'share_delta': 10, 'action_id': 'a1', 'type': 'bonus_issue', 'factor': 2.0, 'cash_amount': 0.0, 'source': 'opendart', 'available_at': session, 'evidence_status': 'verified', 'evidence_reason': None}
 
     tables, _report = module.normalize_stock_evidence(receipts, decision_time=session, streamed_corporate_actions=[action])
 
     assert tables[SilverTable.CORPORATE_ACTIONS].select(['share_listing_date', 'share_delta']).to_dicts() == [{'share_listing_date': session, 'share_delta': 10}]
+
+
+def test_normalize_corporate_action_records_requires_evidence_status_migration() -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    import pytest
+    from src.data.normalization import normalize_corporate_action_records
+    from src.data.schemas import PITDataError
+
+    session = datetime(2024, 1, 2, 9, tzinfo=ZoneInfo('Asia/Seoul'))
+    with pytest.raises(PITDataError, match=r'evidence status.*rebuild'):
+        normalize_corporate_action_records(action_records=[{'instrument_id': 'KRX:A', 'action_id': 'legacy', 'type': 'no_action'}], calendar_sessions=(session,), corporate_action_available_at=session, corporate_action_source_hash='h')
+    frame = normalize_corporate_action_records(action_records=[{'instrument_id': 'KRX:A', 'action_id': 'u1', 'type': 'unresolved', 'effective_session': session, 'factor': 1.0, 'cash_amount': 0.0, 'available_at': session, 'evidence_status': 'unresolved', 'evidence_reason': 'unsupported_merger'}], calendar_sessions=(session,), corporate_action_available_at=session, corporate_action_source_hash='h')
+    assert frame.row(0, named=True)['evidence_reason'] == 'unsupported_merger'
