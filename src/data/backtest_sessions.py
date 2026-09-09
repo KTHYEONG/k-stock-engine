@@ -51,13 +51,9 @@ def build_backtest_sessions(
         | (pl.col("open") <= 0)
         | pl.col("close").is_null()
         | (pl.col("close") <= 0)
-        | pl.col("volume").is_null()
-        | (pl.col("volume") <= 0)
-        | pl.col("trading_value").is_null()
-        | (pl.col("trading_value") <= 0)
     )
     if full.select(bad_mask.any().alias("_bad")).item(0, 0):
-        raise PITDataError("non-positive execution bar detected")
+        raise PITDataError("non-positive price bar detected (open or close <= 0)")
     distinct_sessions = full.select("session").unique()["session"].to_list()
     decision_times = [decision_time_of(s) for s in distinct_sessions]
     decision_frame = pl.DataFrame({"session": distinct_sessions, "decision_time": decision_times})

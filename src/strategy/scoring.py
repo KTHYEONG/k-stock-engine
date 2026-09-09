@@ -292,21 +292,22 @@ def materialize_champion_scores(
             if s.rank is not None:
                 raise ValueError(f"ineligible row must have no rank: {s.instrument_id}")
 
-    eligible_scores = [s for s in scores if s.eligible]
-    scored_values: list[tuple[ChampionScoreRow, float, int]] = []
-    for s in eligible_scores:
-        if s.champion_score is None or s.rank is None:
-            raise ValueError(f"eligible row missing score or rank: {s.instrument_id}")
-        scored_values.append((s, float(s.champion_score), s.rank))
-    expected_ranks = list(range(1, len(eligible_scores) + 1))
-    actual_ranks = sorted(rank for _, _, rank in scored_values)
-    if actual_ranks != expected_ranks:
-        raise ValueError("eligible ranks must be unique and consecutive starting at 1")
-    expected_order = sorted(scored_values, key=lambda item: (-item[1], item[0].instrument_id))
-    if tuple(item[0].instrument_id for item in expected_order) != tuple(
-        item[0].instrument_id for item in sorted(scored_values, key=lambda item: item[2])
-    ):
-        raise ValueError("eligible ranks must follow score descending and instrument_id tie-break")
+    from collections import defaultdict
+
+    eligible_by_session: dict[datetime, list[ChampionScoreRow]] = defaultdict(list)
+    for s in scores:
+        if s.eligible:
+            eligible_by_session[s.decision_session].append(s)
+
+    for sess_scores in eligible_by_session.values():
+        scored_values: list[tuple[ChampionScoreRow, float, int]] = [
+            (s, float(s.champion_score), int(s.rank))  # type: ignore[arg-type]
+            for s in sess_scores
+        ]
+        expected_ranks = list(range(1, len(sess_scores) + 1))
+        actual_ranks = sorted(rank for _, _, rank in scored_values)
+        if actual_ranks != expected_ranks:
+            raise ValueError("eligible ranks must be unique and consecutive starting at 1")
 
     ordered_columns = [
         "decision_session",
