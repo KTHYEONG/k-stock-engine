@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from dataclasses import asdict as _asdict
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
+from typing import ClassVar
 
 import polars as pl
 
@@ -26,6 +27,28 @@ from src.data.schemas import BronzeReceipt, CertificationReport, EvidenceKind, P
 from src.storage.parquet_datasets import ParquetDatasetStore, canonical_content_hash
 
 # Schema registry mirroring contract.schemas
+
+
+class CORPORATE_ACTIONS:  # noqa: N801 - contract-mandated schema symbol name
+    """Canonical Silver corporate-actions schema including settlement fields."""
+
+    primary_key: ClassVar[list[str]] = ["instrument_id", "effective_date", "action_id"]
+    required_columns: ClassVar[list[str]] = [
+        "instrument_id",
+        "effective_date",
+        "coverage_end",
+        "action_id",
+        "type",
+        "factor",
+        "cash_amount",
+        "source",
+        "available_at",
+        "source_hash",
+        "share_listing_date",
+        "share_delta",
+    ]
+
+
 _SCHEMAS: dict[SilverTable, dict[str, list[str]]] = {
     SilverTable.CALENDAR: {
         "primary_key": ["session"],
@@ -100,19 +123,8 @@ _SCHEMAS: dict[SilverTable, dict[str, list[str]]] = {
         ],
     },
     SilverTable.CORPORATE_ACTIONS: {
-        "primary_key": ["instrument_id", "effective_date", "action_id"],
-        "required_columns": [
-            "instrument_id",
-            "effective_date",
-            "coverage_end",
-            "action_id",
-            "type",
-            "factor",
-            "cash_amount",
-            "source",
-            "available_at",
-            "source_hash",
-        ],
+        "primary_key": list(CORPORATE_ACTIONS.primary_key),
+        "required_columns": list(CORPORATE_ACTIONS.required_columns),
     },
     SilverTable.DISCLOSURES: {
         "primary_key": ["company_id", "filing_id"],
@@ -141,6 +153,8 @@ _SCHEMAS: dict[SilverTable, dict[str, list[str]]] = {
 }
 
 _ALLOWED_ACTION_TYPES = {"no_action", "split", "dividend", "reverse_split", "merger", "spin_off", "rights_issue", "bonus_issue"}
+
+SCHEMA_REGISTRY: dict[SilverTable, dict[str, list[str]]] = _SCHEMAS
 
 
 def next_krx_session_open(published_at: datetime, calendar: SessionCalendar) -> datetime:
@@ -462,6 +476,8 @@ def complete_minimal_fixture(
             "source": ["KRX"],
             "available_at": [available_at],
             "source_hash": [source_hash],
+            "share_listing_date": [None],
+            "share_delta": [None],
         }
     )
 
