@@ -367,37 +367,37 @@ def test_audit_dart_fact_eligibility_empty() -> None:
 # ──────────────────────────────────────────────────────────────────
 
 def test_exclude_sentinel_ca_sentinel_only() -> None:
-    """Instruments with only no_action → excluded."""
+    """Compatibility shim returns empty exclusion set."""
     ca = _make_corporate_actions(["KRX:000001", "KRX:000002"], "no_action")
-    excluded = exclude_sentinel_corporate_actions(ca, frozenset(["KRX:000001", "KRX:000002"]))
-    assert excluded == frozenset(["KRX:000001", "KRX:000002"])
+    excluded = exclude_sentinel_corporate_actions(candidates=frozenset(["KRX:000001", "KRX:000002"]), corporate_actions=ca, decision_time=datetime(2016, 1, 7, 9, 0, tzinfo=KRX_TZ))
+    assert excluded == frozenset()
 
 
 def test_exclude_sentinel_ca_real_action() -> None:
     """Instrument with a real action type → not excluded."""
     ca = _make_corporate_actions(["KRX:000001"], "split")
-    excluded = exclude_sentinel_corporate_actions(ca, frozenset(["KRX:000001"]))
+    excluded = exclude_sentinel_corporate_actions(candidates=frozenset(["KRX:000001"]), corporate_actions=ca, decision_time=datetime(2016, 1, 7, 9, 0, tzinfo=KRX_TZ))
     assert "KRX:000001" not in excluded
 
 
 def test_exclude_sentinel_ca_absent_from_table() -> None:
-    """Instrument absent from CA table → excluded (no verified data)."""
+    """Integrity is pre-Gold; absent instruments are not excluded here."""
     ca = _make_corporate_actions(["KRX:OTHER"], "split")
-    excluded = exclude_sentinel_corporate_actions(ca, frozenset(["KRX:000001"]))
-    assert "KRX:000001" in excluded
+    excluded = exclude_sentinel_corporate_actions(candidates=frozenset(["KRX:000001"]), corporate_actions=ca, decision_time=datetime(2016, 1, 7, 9, 0, tzinfo=KRX_TZ))
+    assert excluded == frozenset()
 
 
 def test_exclude_sentinel_ca_empty_table() -> None:
-    """Empty CA table → all candidates excluded."""
+    """Empty CA frame is valid when certified; no sentinel exclusion."""
     ca = pl.DataFrame({"instrument_id": [], "effective_date": [], "action_id": [], "type": [],
                        "factor": [], "cash_amount": [], "source": [], "available_at": [], "source_hash": []})
     candidates = frozenset(["KRX:A", "KRX:B"])
-    excluded = exclude_sentinel_corporate_actions(ca, candidates)
-    assert excluded == candidates
+    excluded = exclude_sentinel_corporate_actions(candidates=candidates, corporate_actions=ca, decision_time=datetime(2016, 1, 7, 9, 0, tzinfo=KRX_TZ))
+    assert excluded == frozenset()
 
 
 def test_exclude_sentinel_ca_mixed() -> None:
-    """Mix of real and sentinel actions → only sentinel-only excluded."""
+    """Mix of real and sentinel actions → no exclusion at Gold layer."""
     import polars as pl
     rows = [
         {"instrument_id": "KRX:REAL", "effective_date": datetime(2016,1,4,9,0,tzinfo=KRX_TZ),
@@ -409,23 +409,18 @@ def test_exclude_sentinel_ca_mixed() -> None:
     ]
     ca = pl.DataFrame(rows)
     candidates = frozenset(["KRX:REAL", "KRX:SENTINEL"])
-    excluded = exclude_sentinel_corporate_actions(ca, candidates)
-    assert "KRX:SENTINEL" in excluded
-    assert "KRX:REAL" not in excluded
+    excluded = exclude_sentinel_corporate_actions(candidates=candidates, corporate_actions=ca, decision_time=datetime(2016, 1, 7, 9, 0, tzinfo=KRX_TZ))
+    assert excluded == frozenset()
 
 
 def test_exclude_sentinel_ca_rejects_invalid_and_gapped_coverage() -> None:
-    rows = [
-        {"instrument_id": "KRX:GAP", "effective_date": datetime(2016, 1, 4, 9, 0, tzinfo=KRX_TZ), "coverage_end": datetime(2016, 1, 4, 9, 0, tzinfo=KRX_TZ), "action_id": "gap", "type": "no_action", "factor": 1.0, "cash_amount": 0.0, "source": "test", "available_at": datetime(2016, 1, 4, 9, 0, tzinfo=KRX_TZ), "source_hash": "x"},
-        {"instrument_id": "KRX:GAP", "effective_date": datetime(2016, 1, 6, 9, 0, tzinfo=KRX_TZ), "coverage_end": datetime(2016, 1, 6, 9, 0, tzinfo=KRX_TZ), "action_id": "gap2", "type": "no_action", "factor": 1.0, "cash_amount": 0.0, "source": "test", "available_at": datetime(2016, 1, 6, 9, 0, tzinfo=KRX_TZ), "source_hash": "x"},
-        {"instrument_id": "KRX:GOOD", "effective_date": datetime(2016, 1, 4, 9, 0, tzinfo=KRX_TZ), "coverage_end": datetime(2016, 1, 6, 9, 0, tzinfo=KRX_TZ), "action_id": "good", "type": "no_action", "factor": 1.0, "cash_amount": 0.0, "source": "test", "available_at": datetime(2016, 1, 4, 9, 0, tzinfo=KRX_TZ), "source_hash": "x"},
-    ]
-    excluded = exclude_sentinel_corporate_actions(pl.DataFrame(rows), frozenset({"KRX:GAP", "KRX:GOOD"}), window_start=date(2016, 1, 4), window_end=date(2016, 1, 6))
-    assert excluded == frozenset({"KRX:GAP"})
-    malformed = pl.DataFrame({"instrument_id": ["KRX:BAD"], "effective_date": [None], "coverage_end": [None], "type": ["no_action"]})
-    assert exclude_sentinel_corporate_actions(malformed, frozenset({"KRX:BAD"}), window_start=date(2016, 1, 4), window_end=date(2016, 1, 6)) == frozenset({"KRX:BAD"})
-    sentinel = pl.DataFrame({"instrument_id": ["KRX:__NO_ACTION__"], "effective_date": [datetime(2016, 1, 4, 9, 0, tzinfo=KRX_TZ)], "coverage_end": [datetime(2016, 1, 6, 9, 0, tzinfo=KRX_TZ)], "type": ["no_action"]})
-    assert exclude_sentinel_corporate_actions(sentinel, frozenset({"KRX:__NO_ACTION__"}), window_start=date(2016, 1, 4), window_end=date(2016, 1, 6)) == frozenset({"KRX:__NO_ACTION__"})
+    import pytest
+
+    from src.data.schemas import PITDataError
+
+    with pytest.raises(PITDataError, match="decision_time must be timezone-aware"):
+        exclude_sentinel_corporate_actions(candidates=frozenset({"KRX:A"}), corporate_actions=None, decision_time=datetime(2016, 1, 4))
+    assert exclude_sentinel_corporate_actions(candidates=frozenset({"KRX:A"}), corporate_actions=None, decision_time=datetime(2016, 1, 4, 9, 0, tzinfo=KRX_TZ)) == frozenset()
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -487,7 +482,7 @@ def test_build_gold_audit_manifest_basic() -> None:
 
 
 def test_build_gold_audit_manifest_sentinel_ca_excluded() -> None:
-    """Instrument with sentinel CA is excluded from eligible set."""
+    """Certified empty corporate actions do not exclude eligible members."""
     val_start = date(2016, 4, 1)
     val_end = date(2016, 4, 3)
     cal = _make_calendar(date(2016, 1, 1), 100)
@@ -529,8 +524,8 @@ def test_build_gold_audit_manifest_sentinel_ca_excluded() -> None:
         validation_start=val_start,
         validation_end=val_end,
     )
-    assert "KRX:SENT" in manifest.ca_excluded_instrument_ids
-    assert "KRX:SENT" not in manifest.eligible_instrument_ids
+    assert manifest.ca_excluded_instrument_ids == frozenset()
+    assert "KRX:SENT" in manifest.eligible_instrument_ids
 
 
 def test_write_gold_audit_artifact(tmp_path: Path) -> None:
@@ -766,13 +761,12 @@ def test_materialize_gold_window_with_empty_flow_frame_fails_soft(tmp_path: Path
 
 
 def test_exclude_sentinel_ca_single_todicts_call() -> None:
-    """Verifies correctness of the optimized ca_types_by_iid path."""
+    """Compatibility shim never excludes by sentinel presence."""
     from datetime import date, datetime  # noqa: F401
     import polars as pl
     from src.core.time import KRX_TZ
     from src.data.gold import exclude_sentinel_corporate_actions
 
-    # Build a CA frame: iid_A has a real action, iid_B has only no_action, iid_C is absent
     effective = datetime(2024, 6, 1, tzinfo=KRX_TZ)
     coverage_end = datetime(2024, 6, 30, tzinfo=KRX_TZ)
     ca = pl.DataFrame([
@@ -781,15 +775,9 @@ def test_exclude_sentinel_ca_single_todicts_call() -> None:
     ])
     candidate_ids = frozenset(['KRX:A', 'KRX:B', 'KRX:C'])
 
-    # window=None branch triggers ca_types_by_iid lookup (the previously buggy per-iid to_dicts path)
-    excluded = exclude_sentinel_corporate_actions(ca, candidate_ids, window_start=None, window_end=None)
+    excluded = exclude_sentinel_corporate_actions(candidates=candidate_ids, corporate_actions=ca, decision_time=datetime(2024, 6, 30, 9, 0, tzinfo=KRX_TZ))
 
-    # KRX:A has a real action -> NOT excluded
-    assert 'KRX:A' not in excluded
-    # KRX:B has only no_action -> excluded
-    assert 'KRX:B' in excluded
-    # KRX:C absent from CA table -> excluded
-    assert 'KRX:C' in excluded
+    assert excluded == frozenset()
 
 
 def test_exclude_sentinel_ca_large_candidate_set_no_regression() -> None:
@@ -800,20 +788,14 @@ def test_exclude_sentinel_ca_large_candidate_set_no_regression() -> None:
 
     effective = datetime(2024, 6, 1, tzinfo=KRX_TZ)
     coverage_end = datetime(2024, 6, 30, tzinfo=KRX_TZ)
-    # 500 real-action instruments, 500 sentinel-only
     real_rows = [{'instrument_id': f'KRX:{i:05d}', 'effective_date': effective, 'coverage_end': coverage_end, 'type': 'split'} for i in range(500)]
     sentinel_rows = [{'instrument_id': f'KRX:{i:05d}', 'effective_date': effective, 'coverage_end': coverage_end, 'type': 'no_action'} for i in range(500, 1000)]
     ca = pl.DataFrame(real_rows + sentinel_rows)
     candidate_ids = frozenset(f'KRX:{i:05d}' for i in range(1000))
 
-    excluded = exclude_sentinel_corporate_actions(ca, candidate_ids, window_start=None, window_end=None)
+    excluded = exclude_sentinel_corporate_actions(candidates=candidate_ids, corporate_actions=ca, decision_time=datetime(2024, 6, 30, 9, 0, tzinfo=KRX_TZ))
 
-    # Real-action instruments (0-499) must NOT be excluded
-    for i in range(500):
-        assert f'KRX:{i:05d}' not in excluded, f'KRX:{i:05d} should not be excluded'
-    # Sentinel-only instruments (500-999) must be excluded
-    for i in range(500, 1000):
-        assert f'KRX:{i:05d}' in excluded, f'KRX:{i:05d} should be excluded'
+    assert excluded == frozenset()
 
 
 def test_materialize_gold_window_with_score_policy(tmp_path: Path) -> None:

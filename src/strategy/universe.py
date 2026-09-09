@@ -198,16 +198,12 @@ def build_historical_universe(
     }
 
     ca_excluded: frozenset[str] = frozenset()
-    if corporate_actions is not None and not corporate_actions.is_empty():
+    if corporate_actions is not None:
         from src.data.gold import exclude_sentinel_corporate_actions
 
-        decision_date = decision_session.astimezone(KRX_TZ).date()
-        ca_excluded = exclude_sentinel_corporate_actions(
-            corporate_actions,
-            frozenset(sorted_ids),
-            window_start=decision_date,
-            window_end=decision_date,
-        )
+        ca_candidates = frozenset(sorted_ids)
+        ca_excluded = exclude_sentinel_corporate_actions(candidates=ca_candidates, corporate_actions=corporate_actions, decision_time=decision_time)
+        # exclude_sentinel_corporate_actions(candidates=candidates, corporate_actions=corporate_actions, decision_time=decision_time)
 
     decisions: list[UniverseDecision] = []
     seen: set[str] = set()

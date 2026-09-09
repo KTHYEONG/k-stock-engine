@@ -141,15 +141,16 @@ def test_universe_calls_corporate_action_exclusion_once_per_session(monkeypatch)
     actions = pl.DataFrame({'instrument_id': ['KRX:1'], 'effective_date': [sessions[0]], 'coverage_end': [sessions[-2]], 'type': ['split']})
     calls = []
     def wrapped(*args, **kwargs):
-        calls.append(args[1])
-        return frozenset({'KRX:1'})
+        calls.append(kwargs.get('candidates', args[0] if args else None))
+        return frozenset()
 
     monkeypatch.setattr(gold, 'exclude_sentinel_corporate_actions', wrapped)
     result = build_historical_universe(decision_session=sessions[-1], decision_time=sessions[-1], calendar=SessionCalendar(sessions), security_master=master, daily_market=daily, corporate_actions=actions, policy=UniversePolicy(minimum_listing_sessions=1, minimum_median_trading_value_krw=1.0))
 
     assert len(calls) == 1
     assert tuple(item.instrument_id for item in result) == ('KRX:1', 'KRX:2')
-    assert ExclusionReason.NO_VALID_CORPORATE_ACTION in result[0].exclusion_reasons
+    assert ExclusionReason.NO_VALID_CORPORATE_ACTION not in result[0].exclusion_reasons
+    assert calls[0] == frozenset({'KRX:1', 'KRX:2'})
 
 
 def test_universe_preserves_listing_and_liquidity_boundaries_after_indexing() -> None:

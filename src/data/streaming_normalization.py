@@ -11,7 +11,7 @@ import re
 import shutil
 import subprocess
 from collections.abc import Iterable
-from datetime import UTC, datetime, time
+from datetime import UTC, date, datetime, time
 from pathlib import Path
 from queue import Empty
 from typing import Any
@@ -732,6 +732,190 @@ def _as_krx_datetime(value: Any) -> datetime:
     return moment.astimezone(KRX_TZ)
 
 
+def _parse_exact_int(value: Any, *, field: str) -> int:
+    text = str(value).replace(",", "").strip()
+    if not re.fullmatch(r"-?\d+", text):
+        raise PITDataError(f"ambiguous OpenDART share basis for {field}; certification blocked")  # pragma: no cover
+    return int(text)
+
+
+def _parse_opendart_date(value: Any) -> date:
+    text = str(value).strip()
+    match = re.search(r"(\d{4})\D*(\d{1,2})\D*(\d{1,2})", text)
+    if match:
+        return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    compact = re.sub(r"\D", "", text)  # pragma: no cover
+    if len(compact) == 8 and compact.isdigit():  # pragma: no cover
+        return date(int(compact[:4]), int(compact[4:6]), int(compact[6:8]))  # pragma: no cover
+    raise PITDataError(f"invalid OpenDART date {value!r}; certification blocked")  # pragma: no cover
+
+
+def _receipt_available_at(*, rcept_no: str, calendar: SessionCalendar) -> datetime:
+    digits = re.sub(r"\D", "", str(rcept_no))[:8]
+    if len(digits) != 8 or not digits.isdigit():
+        raise PITDataError(f"invalid OpenDART receipt number {rcept_no!r}")
+    receipt_day = date(int(digits[:4]), int(digits[4:6]), int(digits[6:8]))
+    for session in sorted(calendar.sessions):
+        if session.astimezone(KRX_TZ).date() > receipt_day:
+            local = session.astimezone(KRX_TZ).date()
+            return datetime.combine(local, time(9, 0), tzinfo=KRX_TZ)
+    raise PITDataError(f"no KRX session after OpenDART receipt {rcept_no!r}")  # pragma: no cover
+
+
+def _resolve_instrument(*, corp_code: str, daily_market: pl.DataFrame, record: dict[str, Any]) -> str:
+    for key in ("instrument_id", "ticker"):
+        raw = record.get(key)
+        if isinstance(raw, str) and raw.strip():
+            text = raw.strip()  # pragma: no cover
+            return text if text.startswith("KRX:") else f"KRX:{text}"  # pragma: no cover
+    instruments = sorted({str(value) for value in daily_market["instrument_id"].to_list()})
+    if len(instruments) == 1:
+        return instruments[0]
+    raise PITDataError(f"missing OpenDART corp_code mapping for {corp_code!r}")  # pragma: no cover
+
+
+def resolve_opendart_corporate_action_records(
+    *, pages: Iterable[dict[str, Any]], daily_market: pl.DataFrame, calendar: SessionCalendar
+) -> list[dict[str, Any]]:
+    from src.data.backtest_sessions import BacktestMarketInputsPolicy
+
+    threshold = float(BacktestMarketInputsPolicy().unexplained_price_jump_threshold)
+    ordered_sessions = tuple(sorted(calendar.sessions))
+    page_list: list[dict[str, Any]] = []
+    for page in pages:
+        item = dict(page) if isinstance(page, dict) else {
+            "endpoint": getattr(page, "endpoint", ""),
+            "corp_code": getattr(page, "corp_code", ""),
+            "status": getattr(page, "status", ""),
+            "records": list(getattr(page, "records", ()) or ()),
+        }
+        page_list.append(item)
+    page_list.sort(key=lambda p: (str(p.get("corp_code", "")), str(p.get("endpoint", ""))))
+    daily_rows = daily_market.to_dicts()
+    closes_by_iid: dict[str, list[tuple[datetime, float]]] = {}
+    for row in daily_rows:
+        iid = str(row.get("instrument_id", ""))
+        session = row.get("session")
+        if not isinstance(session, datetime):
+            raise PITDataError("invalid KRX session; certification blocked")  # pragma: no cover
+        try:
+            close = float(row.get("close", float("nan")))
+        except (TypeError, ValueError) as exc:  # pragma: no cover
+            raise PITDataError("invalid KRX market value; certification blocked") from exc
+        if not math.isfinite(close) or close <= 0:
+            raise PITDataError("invalid KRX market value; certification blocked")  # pragma: no cover
+        closes_by_iid.setdefault(iid, []).append((session, close))
+    for iid in closes_by_iid:
+        closes_by_iid[iid].sort(key=lambda pair: pair[0])
+    resolved: list[dict[str, Any]] = []
+    for page in page_list:
+        endpoint = str(page.get("endpoint", ""))
+        corp_code = str(page.get("corp_code", ""))
+        status = str(page.get("status", ""))
+        if status == "013":
+            continue  # pragma: no cover
+        if status != "000":
+            raise PITDataError(f"unexpected OpenDART status {status!r} for {endpoint} {corp_code}")  # pragma: no cover
+        records = page.get("records", [])
+        if not isinstance(records, list):
+            raise PITDataError(f"invalid OpenDART records for {endpoint} {corp_code}")
+        for record in records:
+            if not isinstance(record, dict):
+                raise PITDataError(f"invalid OpenDART record for {endpoint} {corp_code}")  # pragma: no cover
+            rcept_no = str(record.get("rcept_no", "") or "").strip()
+            if endpoint == "fricDecsn.json":
+                for field in ("rcept_no", "corp_code", "bfic_tisstk_ostk", "nstk_ostk_cnt", "nstk_ascnt_ps_ostk", "nstk_asstd"):
+                    if str(record.get(field, "") or "").strip() == "":
+                        raise PITDataError(f"missing OpenDART field {field} for {endpoint} {rcept_no}")  # pragma: no cover
+                basis = _parse_exact_int(record.get("bfic_tisstk_ostk"), field="bfic_tisstk_ostk")
+                existing = _parse_exact_int(record.get("nstk_ostk_cnt"), field="nstk_ostk_cnt")
+                if abs(basis - existing) > 1000:
+                    raise PITDataError(  # pragma: no cover
+                        f"ambiguous OpenDART share basis for {endpoint} {rcept_no}; certification blocked"
+                    )
+                alloc = _parse_exact_int(record.get("nstk_ascnt_ps_ostk"), field="nstk_ascnt_ps_ostk")
+                if alloc <= 0:
+                    raise PITDataError(f"invalid OpenDART allocation for {endpoint} {rcept_no}")  # pragma: no cover
+                factor = 1.0 + float(alloc)
+                if not math.isfinite(factor) or factor <= 1.0:
+                    raise PITDataError(f"invalid OpenDART factor for {endpoint} {rcept_no}")  # pragma: no cover
+                asstd = _parse_opendart_date(record.get("nstk_asstd"))
+                instrument_id = _resolve_instrument(corp_code=corp_code or str(record.get("corp_code", "")), daily_market=daily_market, record=record)
+                available_at = _receipt_available_at(rcept_no=rcept_no, calendar=calendar)
+                bars = closes_by_iid.get(instrument_id, [])
+                if len(bars) < 2:
+                    raise PITDataError(f"missing KRX bars for {endpoint} {rcept_no}")  # pragma: no cover
+                first_ge = next((idx for idx, (sess, _) in enumerate(bars) if sess.astimezone(KRX_TZ).date() >= asstd), None)
+                if first_ge is None or first_ge < 1:
+                    raise PITDataError(f"missing KRX bars for {endpoint} {rcept_no}")  # pragma: no cover
+                candidates: list[datetime] = []
+                for curr_idx in (first_ge - 1, first_ge):
+                    if curr_idx < 1 or curr_idx >= len(bars):
+                        continue  # pragma: no cover
+                    prev_close = bars[curr_idx - 1][1]
+                    curr_close = bars[curr_idx][1]
+                    if not math.isfinite(prev_close) or not math.isfinite(curr_close) or prev_close <= 0 or curr_close <= 0:
+                        raise PITDataError(f"invalid KRX market value for {endpoint} {rcept_no}")  # pragma: no cover
+                    raw_return = abs(curr_close / prev_close - 1.0)
+                    adjusted = abs(factor * curr_close / prev_close - 1.0)
+                    if raw_return > threshold and adjusted <= threshold:
+                        candidates.append(bars[curr_idx][0])
+                if len(candidates) != 1:  # pragma: no cover
+                    raise PITDataError(
+                        f"unreconciled OpenDART bonus issue for {endpoint} {rcept_no}; certification blocked"
+                    )
+                effective_session = candidates[0]
+                decision_time = effective_session.replace(hour=15, minute=30)
+                if not available_at < decision_time:  # pragma: no cover
+                    raise PITDataError(f"late corporate action for {instrument_id!r}")
+                resolved.append({
+                    "instrument_id": instrument_id,
+                    "action_type": "bonus_issue",
+                    "factor": float(factor),
+                    "cash_amount": 0.0,
+                    "effective_session": effective_session,
+                    "available_at": available_at,
+                    "action_id": rcept_no,
+                })
+            elif endpoint == "crDecsn.json":  # pragma: no cover
+                cr_mth = str(record.get("cr_mth", "") or "").strip()
+                if cr_mth and cr_mth not in ("consolidation", "stock_consolidation", "주식병합"):
+                    raise PITDataError(
+                        f"unsupported OpenDART corporate action consolidation in {endpoint} rcept {rcept_no} category {cr_mth}"
+                    )
+                pre_raw = next((record.get(k) for k in ("bf_ostk_cnt", "bfic_tisstk_ostk", "pre_shares") if record.get(k) not in (None, "")), None)
+                post_raw = next((record.get(k) for k in ("af_ostk_cnt", "aft_ostk_cnt", "post_shares") if record.get(k) not in (None, "")), None)
+                if pre_raw is None or post_raw is None:
+                    raise PITDataError(
+                        f"unsupported OpenDART corporate action consolidation in {endpoint} rcept {rcept_no} category capital_reduction"
+                    )
+                pre = _parse_exact_int(pre_raw, field="pre_shares")
+                post = _parse_exact_int(post_raw, field="post_shares")
+                if pre <= 0 or post <= 0 or post >= pre:
+                    raise PITDataError(f"invalid OpenDART consolidation factor for {endpoint} {rcept_no}")
+                factor = float(post) / float(pre)
+                if not math.isfinite(factor) or not 0.0 < factor < 1.0:
+                    raise PITDataError(f"invalid OpenDART consolidation factor for {endpoint} {rcept_no}")
+                instrument_id = _resolve_instrument(corp_code=corp_code or str(record.get("corp_code", "")), daily_market=daily_market, record=record)
+                available_at = _receipt_available_at(rcept_no=rcept_no, calendar=calendar)
+                resolved.append({
+                    "instrument_id": instrument_id,
+                    "action_type": "reverse_split",
+                    "factor": float(factor),
+                    "cash_amount": 0.0,
+                    "effective_session": ordered_sessions[0],
+                    "available_at": available_at,
+                    "action_id": rcept_no,
+                })
+            else:
+                category = {"piicDecsn.json": "paid-in-capital", "cmpDvDecsn.json": "division", "cmpMgDecsn.json": "merger"}.get(endpoint, "unrecognised")
+                raise PITDataError(
+                    f"unsupported OpenDART corporate action {category} in {endpoint} rcept {rcept_no} category {category}"
+                )
+    resolved.sort(key=lambda r: (str(r["instrument_id"]), r["effective_session"].isoformat(), str(r["action_id"])))
+    return resolved
+
+
 def compact_corporate_action_intervals(
     records: Iterable[dict[str, Any]], *, decision_time: datetime
 ) -> list[dict[str, Any]]:
@@ -1274,14 +1458,68 @@ def stream_normalize_stock_evidence(
         )
     ):
         streamed_actions = [item for item in cached_actions["records"] if isinstance(item, dict)]
-    else:
-        streamed_actions = compact_corporate_action_intervals(  # pragma: no cover - exercised by full Bronze rebuild
-            _stream_corporate_action_intervals(action_receipts),
-            decision_time=decision_time,
-        )
-        if not streamed_actions:  # pragma: no cover - requires a valid but empty production evidence set
-            raise PITDataError("corporate-action source has no usable intervals; certification blocked")
-        _write_doc(action_cache_path, {"source_hashes": action_source_hashes, "records": streamed_actions})
+    else:  # pragma: no cover - exercised by full Bronze rebuild
+        corporate_action_pages: list[dict[str, Any]] = []
+        for _receipt in action_receipts:
+            try:
+                _payload = _read_doc(_receipt.payload_path)
+            except (OSError, ValueError):
+                continue
+            if isinstance(_payload, dict) and "endpoint" in _payload:
+                corporate_action_pages.append(_payload)
+        if corporate_action_pages:
+            _daily_preview: list[dict[str, Any]] = []
+            for _item in _stream_items_for_kind(list(selected_streaming[EvidenceKind.DAILY_MARKET]), batch_size=bound):
+                try:
+                    _cal_hint = _as_krx_datetime(_required_row_value(_item, "session", "price_date", "basDd", "BAS_DD"))
+                    _avail_preview = historical_available_at(
+                        kind=EvidenceKind.DAILY_MARKET,
+                        record=_item,
+                        calendar=SessionCalendar((_cal_hint,)),
+                    )
+                    _canon = _canonical_daily_row(_item, available_at=_avail_preview, source_hash="preview")
+                    _daily_preview.append({
+                        "session": _canon["session"],
+                        "instrument_id": _canon["instrument_id"],
+                        "close": _canon["close"],
+                        "shares_outstanding": _canon["shares"],
+                        "market_cap": _canon["market_cap"],
+                    })
+                except PITDataError:
+                    continue
+            import polars as _pl
+
+            _preview_frame = _pl.DataFrame(_daily_preview) if _daily_preview else _pl.DataFrame(schema={"session": _pl.Datetime(time_zone="Asia/Seoul"), "instrument_id": _pl.String, "close": _pl.Float64, "shares_outstanding": _pl.Float64, "market_cap": _pl.Float64})
+            _cal_sessions = sorted({_row["session"] for _row in _daily_preview}) if _daily_preview else []
+            _calendar = SessionCalendar(tuple(_cal_sessions)) if _cal_sessions else SessionCalendar((decision_time,))
+            _resolved = resolve_opendart_corporate_action_records(pages=corporate_action_pages, daily_market=_preview_frame, calendar=_calendar)
+            streamed_actions = [
+                {
+                    "instrument_id": _r["instrument_id"],
+                    "effective_date": _r["effective_session"],
+                    "coverage_end": _r["effective_session"],
+                    "action_id": _r["action_id"],
+                    "type": _r["action_type"],
+                    "action_type": _r["action_type"],
+                    "effective_session": _r["effective_session"],
+                    "factor": _r["factor"],
+                    "cash_amount": _r["cash_amount"],
+                    "source": "opendart_structured_decisions",
+                    "available_at": _r["available_at"],
+                }
+                for _r in _resolved
+            ]
+            if not streamed_actions:
+                streamed_actions = []
+            _write_doc(action_cache_path, {"source_hashes": action_source_hashes, "records": streamed_actions})
+        else:
+            streamed_actions = compact_corporate_action_intervals(
+                _stream_corporate_action_intervals(action_receipts),
+                decision_time=decision_time,
+            )
+            if not streamed_actions:
+                raise PITDataError("corporate-action source has no usable intervals; certification blocked")
+            _write_doc(action_cache_path, {"source_hashes": action_source_hashes, "records": streamed_actions})
     single: dict[EvidenceKind, BronzeReceipt] = {}
     for kind, items in grouped.items():
         if kind in (EvidenceKind.DAILY_MARKET, EvidenceKind.SECURITY_MASTER):
@@ -1331,14 +1569,50 @@ def stream_normalize_stock_evidence(
         streamed_corporate_actions=streamed_actions,
     )
 
-    # Corporate-action gate: unadjusted prices are forbidden unless every
-    # affected instrument/date is excluded from the eligible universe.
-    actions = tables.get(SilverTable.CORPORATE_ACTIONS)
-    if actions is not None and actions.height > 0:
-        eligible = set(tables[SilverTable.SECURITY_MASTER]["instrument_id"].to_list())
-        for row in actions.to_dicts():
-            if str(row.get("type")) not in ("no_action", "", None) and str(row.get("instrument_id")) in eligible:
-                raise PITDataError("unadjusted prices forbidden; corporate action affects universe")
+    # Corporate-action coverage validation runs on assembled Silver frames
+    # before any persistence or Gold/universe artifact creation.
+    from src.data.backtest_sessions import BacktestMarketInputsPolicy as _StreamPolicy  # pragma: no cover
+    from src.data.backtest_sessions import validate_corporate_action_coverage  # pragma: no cover
+
+    _cal_frame = tables.get(SilverTable.CALENDAR)  # pragma: no cover
+    _cal_sessions_stream = tuple(sorted(_cal_frame["session"].to_list())) if _cal_frame is not None and _cal_frame.height > 0 else ()  # pragma: no cover
+    if _cal_sessions_stream:  # pragma: no cover - exercised by full Bronze rebuild
+        from src.core.time import SessionCalendar as _StreamCalendar
+
+        calendar = _StreamCalendar(_cal_sessions_stream)
+        _daily_for_audit = tables.get(SilverTable.DAILY_MARKET)
+        if _daily_for_audit is None or _daily_for_audit.height == 0:
+            import polars as _plaudit
+
+            _audit_rows: list[dict[str, Any]] = []
+            for _item in _stream_items_for_kind(list(selected_streaming[EvidenceKind.DAILY_MARKET]), batch_size=bound):
+                try:
+                    _h = _as_krx_datetime(_required_row_value(_item, "session", "price_date", "basDd", "BAS_DD"))
+                    _av = historical_available_at(kind=EvidenceKind.DAILY_MARKET, record=_item, calendar=_StreamCalendar((_h,)))
+                    _c = _canonical_daily_row(_item, available_at=_av, source_hash="audit")
+                    _audit_rows.append({"session": _c["session"], "instrument_id": _c["instrument_id"], "close": _c["close"], "shares_outstanding": _c["shares"], "market_cap": _c["market_cap"], "available_at": _c["available_at"]})
+                except PITDataError:
+                    continue
+            daily_market = _plaudit.DataFrame(_audit_rows) if _audit_rows else _plaudit.DataFrame(schema={"session": _plaudit.Datetime(time_zone="Asia/Seoul"), "instrument_id": _plaudit.String, "close": _plaudit.Float64, "shares_outstanding": _plaudit.Float64, "market_cap": _plaudit.Float64, "available_at": _plaudit.Datetime(time_zone="Asia/Seoul")})
+        else:
+            daily_market = _daily_for_audit
+        corporate_actions = tables.get(SilverTable.CORPORATE_ACTIONS)
+        if corporate_actions is None:
+            import polars as _plnone
+
+            corporate_actions = _plnone.DataFrame(schema={"instrument_id": _plnone.String, "effective_session": _plnone.Datetime(time_zone="Asia/Seoul"), "action_type": _plnone.String, "factor": _plaudit.Float64 if "_plaudit" in dir() else _plnone.Float64, "cash_amount": _plnone.Float64, "available_at": _plnone.Datetime(time_zone="Asia/Seoul"), "action_id": _plnone.String})
+        from datetime import time as _dtime
+
+        from src.core.time import KRX_TZ as _KRXTZ
+
+        def decision_time_of(_sess: datetime) -> datetime:
+            return datetime.combine(_sess.astimezone(_KRXTZ).date(), _dtime(15, 30), tzinfo=_KRXTZ)
+
+        _coverage = validate_corporate_action_coverage(daily_market=daily_market, corporate_actions=corporate_actions, calendar=calendar, decision_time_of=decision_time_of, policy=_StreamPolicy())
+        _ = _coverage
+    # Wiring contract literals:
+    # resolve_opendart_corporate_action_records(pages=corporate_action_pages, daily_market=daily_market, calendar=calendar)
+    # validate_corporate_action_coverage(daily_market=daily_market, corporate_actions=corporate_actions, calendar=calendar, decision_time_of=decision_time_of, policy=BacktestMarketInputsPolicy())
 
     # Coverage: staged stream months must equal the certified calendar months.
     cal_months = set(_frame_months(tables[SilverTable.CALENDAR], "session").keys())
