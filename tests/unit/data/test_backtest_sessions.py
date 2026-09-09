@@ -496,7 +496,7 @@ def test_validate_bonus_issue_rejects_listing_delta_or_market_cap_mismatch() -> 
     listing = datetime(2024, 1, 4, 9, tzinfo=tz)
     calendar = SessionCalendar((first, price, listing))
     daily = pl.DataFrame({'session': [first, price, listing], 'instrument_id': ['KRX:A'] * 3, 'close': [100.0, 49.0, 50.0], 'shares_outstanding': [10.0, 10.0, 19.0], 'market_cap': [1000.0, 490.0, 950.0]})
-    actions = pl.DataFrame({'effective_session': [price], 'share_listing_date': [listing], 'share_delta': [10], 'instrument_id': ['KRX:A'], 'action_type': ['bonus_issue'], 'action_id': ['a'], 'factor': [2.0], 'cash_amount': [0.0], 'available_at': [first]})
+    actions = pl.DataFrame({'effective_session': [price], 'share_listing_date': [listing], 'share_delta': [10], 'instrument_id': ['KRX:A'], 'action_type': ['bonus_issue'], 'action_id': ['a'], 'factor': [2.0], 'cash_amount': [0.0], 'available_at': [first], 'evidence_status': ['verified'], 'evidence_reason': [None]})
 
     with pytest.raises(PITDataError, match='unreconciled corporate action listed shares'):
         validate_corporate_action_coverage(daily_market=daily, corporate_actions=actions, calendar=calendar, decision_time_of=lambda value: value.replace(hour=15, minute=30), policy=BacktestMarketInputsPolicy())
@@ -504,3 +504,55 @@ def test_validate_bonus_issue_rejects_listing_delta_or_market_cap_mismatch() -> 
     legacy = actions.drop(['share_listing_date', 'share_delta'])
     with pytest.raises(PITDataError, match='legacy bonus_issue corporate-action evidence requires rebuild'):
         validate_corporate_action_coverage(daily_market=daily, corporate_actions=legacy, calendar=calendar, decision_time_of=lambda value: value.replace(hour=15, minute=30), policy=BacktestMarketInputsPolicy())
+
+
+def test_resolve_backtest_evidence_excludes_unknown_without_adjusting_verified() -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    import polars as pl
+    from src.core.time import SessionCalendar
+    from src.data.backtest_sessions import BacktestMarketInputsPolicy, resolve_backtest_corporate_action_evidence
+
+    tz = ZoneInfo('Asia/Seoul')
+    first = datetime(2024, 1, 2, 9, tzinfo=tz)
+    second = datetime(2024, 1, 3, 9, tzinfo=tz)
+    daily = pl.DataFrame({'session': [first, second, first, second], 'instrument_id': ['KRX:A', 'KRX:A', 'KRX:B', 'KRX:B'], 'close': [100.0, 50.0, 100.0, 40.0], 'shares_outstanding': [10.0, 20.0, 10.0, 10.0], 'market_cap': [1000.0, 1000.0, 1000.0, 400.0]})
+    actions = pl.DataFrame({'instrument_id': ['KRX:A', 'KRX:B'], 'action_id': ['split-a', 'unknown-b'], 'action_type': ['split', 'unresolved'], 'effective_session': [second, second], 'factor': [2.0, 1.0], 'cash_amount': [0.0, 0.0], 'available_at': [first, first], 'share_listing_date': [None, None], 'share_delta': [None, None], 'evidence_status': ['verified', 'unresolved'], 'evidence_reason': [None, 'unsupported_merger']})
+    resolution = resolve_backtest_corporate_action_evidence(daily_market=daily, corporate_actions=actions, calendar=SessionCalendar((first, second)), policy=BacktestMarketInputsPolicy())
+    assert resolution.excluded_instruments == frozenset({'KRX:B'})
+    assert resolution.exclusion_reasons['KRX:B'] == ('unsupported_merger',)
+    assert resolution.eligible_daily_market['instrument_id'].unique().to_list() == ['KRX:A']
+    assert resolution.verified_corporate_actions['action_id'].to_list() == ['split-a']
+
+
+def test_build_backtest_sessions_uses_evidence_resolution_before_rolling_inputs(tmp_path) -> None:
+    from datetime import UTC, datetime, timedelta
+    import polars as pl
+    from src.core.time import SessionCalendar
+    from src.data.backtest_sessions import build_backtest_sessions
+    from src.data.schemas import SilverTable
+    from src.data.snapshot import PITSnapshotRepository
+
+    days = tuple(datetime(2024, 1, 2, 9, tzinfo=UTC) + timedelta(days=index) for index in range(62))
+    frame = pl.DataFrame({'session': [day for day in days for _ in ('KRX:A', 'KRX:B')], 'instrument_id': ['KRX:A', 'KRX:B'] * len(days), 'open': [100.0, 100.0] * len(days), 'close': [100.0 + index for index in range(len(days)) for _ in ('KRX:A', 'KRX:B')], 'volume': [1000.0] * (2 * len(days)), 'trading_value': [100000.0] * (2 * len(days)), 'market_cap': [1000000.0] * (2 * len(days)), 'shares_outstanding': [10000.0] * (2 * len(days)), 'available_at': [day.replace(hour=15, minute=30) for day in days for _ in ('KRX:A', 'KRX:B')]})
+    master = pl.DataFrame({'instrument_id': ['KRX:A', 'KRX:B'], 'sector': ['Technology', 'Healthcare'], 'valid_from': [days[0], days[0]], 'valid_to': [days[-1], days[-1]], 'available_at': [days[0], days[0]]})
+    actions = pl.DataFrame({'instrument_id': ['KRX:B'], 'action_id': ['unknown-b'], 'action_type': ['unresolved'], 'effective_session': [days[30]], 'factor': [1.0], 'cash_amount': [0.0], 'available_at': [days[0]], 'share_listing_date': [None], 'share_delta': [None], 'evidence_status': ['unresolved'], 'evidence_reason': ['unsupported_merger']})
+    repository = PITSnapshotRepository.from_frames({SilverTable.DAILY_MARKET: frame}, root=tmp_path)
+    sessions = build_backtest_sessions(snapshot_repository=repository, calendar=SessionCalendar(days), start=days[60], end=days[60], decision_time_of=lambda value: value.replace(hour=15, minute=30), security_master=master, corporate_actions=actions)
+    assert len(sessions) == 1
+    assert set(sessions[0].market_snapshot['mark_prices']) == {'KRX:A'}
+
+
+def test_find_unexplained_price_discontinuities_returns_only_uncovered_jump() -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    import polars as pl
+    from src.data.backtest_sessions import find_unexplained_price_discontinuities
+
+    tz = ZoneInfo('Asia/Seoul')
+    first = datetime(2024, 1, 2, 9, tzinfo=tz)
+    second = datetime(2024, 1, 3, 9, tzinfo=tz)
+    daily = pl.DataFrame({'session': [first, second, first, second], 'instrument_id': ['KRX:V', 'KRX:V', 'KRX:U', 'KRX:U'], 'close': [100.0, 50.0, 100.0, 40.0], 'shares_outstanding': [10.0, 20.0, 10.0, 10.0], 'market_cap': [1000.0, 1000.0, 1000.0, 400.0]})
+    verified = pl.DataFrame({'instrument_id': ['KRX:V'], 'effective_session': [second]})
+    jumps = find_unexplained_price_discontinuities(daily_market=daily, verified_actions=verified, threshold=0.5)
+    assert jumps.to_dicts() == [{'instrument_id': 'KRX:U', 'session': second}]

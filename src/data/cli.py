@@ -4,12 +4,14 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 
+from src.core.time import SessionCalendar
 from src.data.backtest_runner import run_champion_backtest
 from src.data.backtest_sessions import BacktestMarketInputsPolicy, build_backtest_sessions
 from src.data.bronze import BronzeStore, import_retained_stock_evidence, migrate_retained_stock_evidence
@@ -25,13 +27,15 @@ from src.data.legacy_inventory import MigrationArtifactStore, inspect_legacy_dat
 from src.data.operations import execute_verified_legacy_purge
 from src.data.pipeline import materialize_backtest_inputs
 from src.data.schemas import PITDataError, SilverTable
+from src.data.silver import load_latest_silver_market_scan, load_latest_silver_table
+from src.data.streaming_normalization import refresh_corporate_action_silver
 from src.strategy.champion_strategy import ChampionStrategy
 from src.strategy.core_strategy import CoreStrategy
 
 load_dotenv()
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PIT dataset foundation CLI")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -184,7 +188,7 @@ def _parse_args() -> argparse.Namespace:
     p_bdm.add_argument("--validation-end", type=str, required=True)
     p_bdm.add_argument("--decision-time", type=str, required=True)
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def _parse_dt(value: str | None) -> datetime:
@@ -582,8 +586,8 @@ def _build_sessions(**kwargs: object) -> object:
     return build_backtest_sessions(**kwargs)  # type: ignore[arg-type]
 
 
-def main() -> int:
-    args = _parse_args()
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parse_args(argv)
     if args.command == "inventory":
         try:
             inventory = inspect_legacy_data(Path(args.data_root))
@@ -751,14 +755,11 @@ def main() -> int:
         return 0
     if args.command == "refresh-corporate-actions":
         try:
-            from src.data.streaming_normalization import refresh_corporate_action_silver
-
-            report = refresh_corporate_action_silver(
-                bronze_root=Path(args.bronze_root),
-                silver_root=Path(args.silver_root),
-                artifact_root=Path(args.artifact_root),
-                decision_time=_parse_dt(args.decision_time),
-            )
+            decision_time = _parse_dt(args.decision_time)
+            calendar_frame = load_latest_silver_table(root=Path(args.silver_root), table=SilverTable.CALENDAR, decision_time=decision_time)
+            calendar = SessionCalendar(tuple(sorted(calendar_frame["session"].to_list())))
+            daily_market = load_latest_silver_market_scan(root=Path(args.silver_root), decision_time=decision_time, columns=("session", "instrument_id", "close", "shares_outstanding", "market_cap"))
+            report = refresh_corporate_action_silver(bronze_root=Path(args.bronze_root), silver_root=Path(args.silver_root), artifact_root=Path(args.artifact_root), decision_time=decision_time, daily_market=daily_market, calendar=calendar)
         except (PITDataError, ValueError, OSError):
             return 1
         _emit({"report_hash": report.report_hash})
@@ -855,7 +856,6 @@ def main() -> int:
                 HistoricalDataPipelineRequest,
                 run_historical_data_pipeline,
             )
-            from src.data.schemas import SilverTable
             from src.integrations.dart.xbrl import DartXbrlCollector
             from src.integrations.kis.investor_flow import KisInvestorFlowCollector
             from src.integrations.krx.historical import KrxHistoricalCollector

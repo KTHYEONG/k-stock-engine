@@ -559,3 +559,26 @@ def test_run_backtest_parser_accepts_gold_dataset_id(monkeypatch) -> None:
 
     assert args.command == 'run-backtest'
     assert args.gold_dataset_id == 'gold-2016-verified'
+
+
+def test_cli_refresh_corporate_actions_wires_certified_scan(monkeypatch, tmp_path, capsys) -> None:
+    from datetime import UTC, datetime
+    import polars as pl
+    import src.data.cli as cli
+    from src.core.time import SessionCalendar
+
+    decision = datetime(2026, 9, 9, tzinfo=UTC)
+    calendar_frame = pl.DataFrame({'session': [decision]})
+    captured = {}
+    monkeypatch.setattr(cli, '_parse_dt', lambda _value: decision)
+    monkeypatch.setattr(cli, 'load_latest_silver_table', lambda **kwargs: calendar_frame)
+    monkeypatch.setattr(cli, 'load_latest_silver_market_scan', lambda **kwargs: pl.DataFrame({'session': [decision], 'instrument_id': ['KRX:A'], 'close': [1.0], 'shares_outstanding': [1.0], 'market_cap': [1.0]}).lazy())
+    def refresh(**kwargs):
+        captured['kwargs'] = kwargs
+        return type('Report', (), {'report_hash': 'refresh-hash'})()
+    monkeypatch.setattr(cli, 'refresh_corporate_action_silver', refresh)
+    code = cli.main(['refresh-corporate-actions', '--bronze-root', str(tmp_path / 'bronze'), '--silver-root', str(tmp_path / 'silver'), '--artifact-root', str(tmp_path / 'artifacts'), '--decision-time', decision.isoformat()])
+    assert code == 0
+    assert isinstance(captured['kwargs']['calendar'], SessionCalendar)
+    assert captured['kwargs']['daily_market'].collect().columns == ['session', 'instrument_id', 'close', 'shares_outstanding', 'market_cap']
+    assert 'refresh-hash' in capsys.readouterr().out

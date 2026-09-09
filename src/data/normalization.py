@@ -284,10 +284,21 @@ def normalize_corporate_action_records(*, action_records: Sequence[Mapping[str, 
     for record in action_records:
         rec = dict(record)
         atype = str(rec.get("type") or rec.get("action_type") or rec.get("action_code") or "no_action").strip()
-        if (atype == "bonus_issue" and (rec.get("share_listing_date") is None or rec.get("share_delta") is None)) or atype not in {"no_action", "split", "dividend", "reverse_split", "merger", "spin_off", "rights_issue", "bonus_issue"}:
+        if (atype == "bonus_issue" and (rec.get("share_listing_date") is None or rec.get("share_delta") is None)) or atype not in {"no_action", "split", "dividend", "reverse_split", "merger", "spin_off", "rights_issue", "bonus_issue", "unresolved"}:
             raise PITDataError(f"unsupported legacy corporate action {atype!r} requires rebuild from raw OpenDART Bronze; certification blocked")
+        if atype == "no_action" or "evidence_status" not in rec or "evidence_reason" not in rec:
+            raise PITDataError(f"legacy {atype!r} corporate-action evidence status missing; requires rebuild from raw OpenDART Bronze")
+        status = str(rec.get("evidence_status") or "").strip()
+        reason = rec.get("evidence_reason")
+        if status not in {"verified", "unresolved"}:
+            raise PITDataError(f"invalid corporate-action evidence status {status!r}; requires rebuild from raw OpenDART Bronze")
+        if status == "verified":
+            if reason not in (None, ""):
+                raise PITDataError(f"verified corporate-action evidence reason must be null for {rec.get('action_id')!r}; certification blocked")
+        elif not isinstance(reason, str) or not reason.strip():
+            raise PITDataError(f"unresolved corporate-action evidence reason missing for {rec.get('action_id')!r}; requires rebuild from raw OpenDART Bronze")
         effective = _as_aware(rec.get("effective_date") or rec.get("effective_session") or rec.get("session") or fallback_session, fallback_session)
-        rows.append({"instrument_id": str(_required_value(rec, "instrument_id")), "effective_date": effective, "coverage_end": _as_aware(rec.get("coverage_end") or effective, fallback_session), "action_id": str(rec.get("action_id") or rec.get("actionId") or "no_action"), "type": atype, "factor": float(rec.get("factor") or rec.get("adjustment_factor") or 1.0), "cash_amount": float(rec.get("cash_amount") or 0.0), "source": str(rec.get("source") or "KRX"), "share_listing_date": rec.get("share_listing_date"), "share_delta": rec.get("share_delta"), "available_at": _as_aware(rec.get("available_at") or corporate_action_available_at, fallback_session), "source_hash": corporate_action_source_hash})
+        rows.append({"instrument_id": str(_required_value(rec, "instrument_id")), "effective_date": effective, "coverage_end": _as_aware(rec.get("coverage_end") or effective, fallback_session), "action_id": str(rec.get("action_id") or rec.get("actionId") or "no_action"), "type": atype, "factor": float(rec.get("factor") or rec.get("adjustment_factor") or 1.0), "cash_amount": float(rec.get("cash_amount") or 0.0), "source": str(rec.get("source") or "KRX"), "share_listing_date": rec.get("share_listing_date"), "share_delta": rec.get("share_delta"), "available_at": _as_aware(rec.get("available_at") or corporate_action_available_at, fallback_session), "source_hash": corporate_action_source_hash, "evidence_status": status, "evidence_reason": reason})
     return pl.DataFrame(rows)
 
 
