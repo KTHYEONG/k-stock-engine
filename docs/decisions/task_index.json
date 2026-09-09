@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "krx-corporate-action-integrity",
+      "date": "2026-09-09",
+      "adr_id": "ADR_20260909_krx-corporate-action-integrity",
+      "domain": "backtest",
+      "title": "KRX corporate-action integrity",
+      "why": "구성된 OpenDART 이벤트 API와 KRX 일별 재인증으로 027410 가격 불연속의 공식 원인을 확인하고 sentinel 의존을 제거했다.",
+      "resolution": "OpenDART 구조화 이벤트를 Bronze 원천으로 수집하고 KRX 가격·주식수·시총을 재인증하며 bonus issue를 fail-closed 검증하는 백테스트 계약과 구현을 반영했다.",
+      "impact": "정상 이벤트는 백테스트를 진행하고 미모델링·불일치 이벤트는 Silver·Gold·성과 산출 전에 차단하여 성과 왜곡을 방지한다."
+    },
+    {
       "task_id": "TASK_KOREAN_EQUITY_COMPOUNDING_STRATEGY",
       "date": "2026-09-09",
       "adr_id": "ADR_20260909_KOREAN_EQUITY_COMPOUNDING_STRATEGY",
