@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "krx-corporate-action-evidence-policy-remediation",
+      "date": "2026-09-09",
+      "adr_id": "ADR_20260909_krx-corporate-action-evidence-policy-remediation",
+      "domain": "backtest",
+      "title": "KRX 기업행동 증거 정책 및 refresh 경로 보완",
+      "why": "미확정 기업행동을 임의 보정하지 않고 종목 단위로 격리하는 정책과 action-only refresh의 legacy 경로 문제를 정리했다.",
+      "resolution": "OpenDART 직접 매핑과 verified/unresolved 증거 상태를 보존하고, KRX lazy scan 및 구조화 기업행동 refresh로 fail-closed 검증을 일원화했다.",
+      "impact": "대규모 백테스트의 가격·주식수·시총·PIT 무결성을 유지하면서 정상 종목은 계속 분석하고 legacy refresh 산출물은 차단한다."
+    },
+    {
       "task_id": "krx-corporate-action-settlement-timing",
       "date": "2026-09-09",
       "adr_id": "ADR_20260909_krx-corporate-action-settlement-timing",
