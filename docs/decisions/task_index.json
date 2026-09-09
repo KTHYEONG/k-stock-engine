@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "krx-corporate-action-settlement-timing",
+      "date": "2026-09-09",
+      "adr_id": "ADR_20260909_krx-corporate-action-settlement-timing",
+      "domain": "backtest",
+      "title": "Corporate-action settlement timing",
+      "why": "027410 실측에서 가격 권리락일과 상장주식수 반영일이 분리됨을 확인했다.",
+      "resolution": "OpenDART 신규주식수 증분과 KRX 상장일 주식수를 별도 검증하고 가격 Ledger action은 권리락일에만 적용하도록 계약·구현·테스트를 보정했다.",
+      "impact": "정상 무상증자를 차단하지 않으면서 상장주식수·시총 불일치와 ledger 중복 적용을 fail-closed로 방지한다."
+    },
+    {
       "task_id": "krx-corporate-action-integrity",
       "date": "2026-09-09",
       "adr_id": "ADR_20260909_krx-corporate-action-integrity",
