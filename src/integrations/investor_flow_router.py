@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from src.data.schemas import PITDataError
+from src.core.pit import PITDataError
 from src.integrations.kis.investor_flow import KisInvestorFlowCollector
 from src.integrations.kiwoom.investor_flow import KiwoomInvestorFlowCollector
 from src.integrations.ls.investor_flow import LsInvestorFlowCollector

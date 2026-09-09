@@ -7,7 +7,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
-from src.data.schemas import BronzeReceipt, PITDataError
+from src.core.pit import BronzeReceipt, PITDataError
 from src.integrations.ls.client import LsClient, LsCredentials
 
 
@@ -79,8 +79,8 @@ class LsInvestorFlowCollector:
         bronze_root: Path | str,
         retrieved_at: datetime | None,
     ) -> BronzeReceipt:
+        from src.core.pit import EvidenceKind
         from src.data.bronze import BronzeStore
-        from src.data.schemas import EvidenceKind
 
         payload = {
             "provider": "LS",

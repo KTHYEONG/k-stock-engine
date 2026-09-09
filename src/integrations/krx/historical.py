@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from datetime import date, datetime
 from typing import Any
 
-from src.data.schemas import PITDataError
+from src.core.pit import PITDataError
 from src.integrations.quota import ProviderQuotaStateStore
 
 

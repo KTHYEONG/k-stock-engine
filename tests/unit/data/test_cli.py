@@ -47,7 +47,7 @@ def test_run_backtest_refuses_without_resolved_execution_components(tmp_path) ->
 
 def test_run_backtest_validates_selected_bundle_before_execution(tmp_path, monkeypatch) -> None:
     from argparse import Namespace
-    from datetime import UTC, date, datetime
+    from datetime import UTC, datetime
 
     import polars as pl
     import pytest
@@ -106,7 +106,7 @@ def test_run_backtest_validates_selected_bundle_before_execution(tmp_path, monke
         )
 
     assert calls == [("resolve", "gold-2016"), ("load", "gold-2016")]
-    assert list(created["scores_by_session"].keys()) == [date(2016, 1, 4)]  # type: ignore[union-attr]
+    assert created == {}
 
 
 def _write_cli_fact_receipt(bronze_root, payload_text) -> None:
