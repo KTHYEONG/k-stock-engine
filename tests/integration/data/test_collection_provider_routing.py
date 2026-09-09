@@ -394,3 +394,30 @@ def test_historical_pipeline_routes_corporate_actions_to_opendart() -> None:
 
     assert HISTORICAL_PROVIDER_ROUTES[EvidenceKind.CORPORATE_ACTIONS] == 'opendart_structured_decisions'
     assert 'retained_krx_intervals' not in HISTORICAL_PROVIDER_ROUTES.values()
+
+
+def test_collect_opendart_actions_persists_direct_mapping_provenance(tmp_path) -> None:
+    import json
+    from datetime import date
+    from src.data.bronze import BronzeStore
+    from src.data.collection import collect_opendart_corporate_action_evidence
+
+    class Page:
+        endpoint = 'fricDecsn.json'
+        corp_code = '00123456'
+        status = '013'
+        records = ()
+
+    class Dart:
+        def load_corp_codes(self):
+            return {'005930': '00123456'}
+
+        def fetch_corporate_action_decisions(self, **_kwargs):
+            return (Page(),)
+
+    receipt = collect_opendart_corporate_action_evidence(
+        dart=Dart(), tickers=('KRX:005930',), start=date(2024, 1, 1), end=date(2024, 1, 2), bronze=BronzeStore(tmp_path / 'bronze'),
+    )[0]
+    payload = json.loads(receipt.payload_path.read_text(encoding='utf-8'))
+    assert payload['requested_instrument_id'] == 'KRX:005930'
+    assert payload['instrument_mapping_provenance'] == 'opendart_corp_code_direct'

@@ -49,18 +49,23 @@ def collect_opendart_corporate_action_evidence(
         records = dart.load_corp_code_records()  # pragma: no cover
         ticker_to_corp = {str(r.ticker): str(r.corp_code) for r in records}  # pragma: no cover
     corp_codes: list[str] = []
+    requested_corp: dict[str, str] = {}
     for ticker in names:
         short = ticker[4:] if ticker.startswith("KRX:") else ticker
         mapped = ticker_to_corp.get(ticker) or ticker_to_corp.get(short)
         if not mapped:
             raise PITDataError(f"missing OpenDART corp_code mapping for {ticker!r}")  # pragma: no cover
         corp_codes.append(mapped)
+        requested_corp[ticker] = mapped
+    corp_to_requested: dict[str, list[str]] = {}
+    for ticker, corp in requested_corp.items():
+        corp_to_requested.setdefault(corp, []).append(ticker)
     pages = dart.fetch_corporate_action_decisions(corp_codes=corp_codes, start=start, end=end)
     retrieved_at = _datetime.now(_UTC)
     receipts: list[BronzeReceipt] = []
     for page in pages:
         endpoint = str(getattr(page, "endpoint", "") or page.get("endpoint", ""))
-        corp_code = str(getattr(page, "corp_code", "") or page.get("corp_code", ""))
+        corp_code = str(getattr(page, "corp_code", "") or (page.get("corp_code", "") if isinstance(page, dict) else ""))
         status = str(getattr(page, "status", "") or page.get("status", ""))
         raw_records = getattr(page, "records", None)
         if raw_records is None and isinstance(page, dict):  # pragma: no cover
@@ -73,6 +78,10 @@ def collect_opendart_corporate_action_evidence(
             "status": status,
             "records": list(raw_records) if raw_records is not None else [],
         }
+        candidates = corp_to_requested.get(corp_code, [])
+        if len(candidates) == 1:
+            payload["requested_instrument_id"] = candidates[0]
+            payload["instrument_mapping_provenance"] = "opendart_corp_code_direct"
         text = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         receipts.append(
             bronze.import_bytes(

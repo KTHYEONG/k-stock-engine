@@ -10,7 +10,7 @@ from collections.abc import Mapping
 from dataclasses import asdict as _asdict
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar, cast
 
 import polars as pl
 
@@ -46,6 +46,8 @@ class CORPORATE_ACTIONS:  # noqa: N801 - contract-mandated schema symbol name
         "source_hash",
         "share_listing_date",
         "share_delta",
+        "evidence_status",
+        "evidence_reason",
     ]
 
 
@@ -250,10 +252,34 @@ def validate_table(table: SilverTable, frame: pl.DataFrame, *, decision_time: da
         bad_factor = frame.filter((pl.col("factor") <= 0) | pl.col("factor").is_null())
         if bad_factor.height > 0:
             raise PITDataError(f"non-positive factor in {table.value}")
-        # unknown action type
-        unknown = frame.filter(~pl.col("type").is_in(list(_ALLOWED_ACTION_TYPES)))
+        # unresolved is retained as exclusion evidence, never a ledger action.
+        unknown = frame.filter(
+            ~pl.col("type").is_in(list(_ALLOWED_ACTION_TYPES | {"unresolved"}))
+        )
         if unknown.height > 0:
             raise PITDataError(f"unknown action type in {table.value}")
+        if frame.filter(pl.col("type") == "no_action").height > 0:
+            raise PITDataError(f"legacy no_action corporate-action evidence in {table.value}; rebuild required")
+        bad_status = frame.filter(~pl.col("evidence_status").is_in(["verified", "unresolved"]))
+        if bad_status.height > 0:
+            raise PITDataError(f"invalid evidence status in {table.value}")
+        invalid_unresolved = frame.filter(
+            ((pl.col("evidence_status") == "unresolved") & (pl.col("type") != "unresolved"))
+            | ((pl.col("evidence_status") == "verified") & (pl.col("type") == "unresolved"))
+        )
+        if invalid_unresolved.height > 0:
+            raise PITDataError(f"invalid evidence status/type pairing in {table.value}")
+        bad_verified = frame.filter(
+            (pl.col("evidence_status") == "verified") & pl.col("evidence_reason").is_not_null()
+        )
+        if bad_verified.height > 0:
+            raise PITDataError(f"verified corporate-action evidence reason must be null in {table.value}")
+        bad_unresolved = frame.filter(
+            (pl.col("evidence_status") == "unresolved")
+            & (pl.col("evidence_reason").is_null() | (pl.col("evidence_reason").cast(pl.String).str.strip_chars() == ""))
+        )
+        if bad_unresolved.height > 0:
+            raise PITDataError(f"unresolved corporate-action evidence reason missing in {table.value}")
 
     if table is SilverTable.FINANCIAL_FACTS and frame.height > 0:
         allowed_kinds = {"opendart_standard", "opendart_multi_account", "legacy_document"}
@@ -470,7 +496,7 @@ def complete_minimal_fixture(
             "effective_date": [session_dt],
             "coverage_end": [session_dt],
             "action_id": ["act1"],
-            "type": ["no_action"],
+            "type": ["dividend"],
             "factor": [1.0],
             "cash_amount": [0.0],
             "source": ["KRX"],
@@ -478,6 +504,8 @@ def complete_minimal_fixture(
             "source_hash": [source_hash],
             "share_listing_date": [None],
             "share_delta": [None],
+            "evidence_status": ["verified"],
+            "evidence_reason": [None],
         }
     )
 
@@ -600,6 +628,34 @@ def load_latest_silver_table(*, root: Path, table: SilverTable, decision_time: d
         return store.read(best_id, AssetKind.STOCK, f"stock_pit_{table.value}_v1", decision_time)
     except (FileNotFoundError, ValueError) as exc:
         raise PITDataError(f"invalid certified Silver table: {table.value}") from exc
+
+
+_MARKET_SCAN_COLUMNS: tuple[str, ...] = ("session", "instrument_id", "close", "shares_outstanding", "market_cap")
+
+
+def load_latest_silver_market_scan(
+    *, root: Path, decision_time: datetime, columns: tuple[str, ...]
+) -> pl.LazyFrame:
+    """Return a lazy daily-market scan over the latest immutable dataset."""
+    if decision_time.tzinfo is None:
+        raise PITDataError("decision_time must be timezone-aware")
+    requested = tuple(columns)
+    if list(requested) != list(_MARKET_SCAN_COLUMNS):
+        raise PITDataError(f"market scan must project exactly {list(_MARKET_SCAN_COLUMNS)}")
+    manifest = cast(Any, _latest_silver_manifest(root=root, table=SilverTable.DAILY_MARKET, decision_time=decision_time))
+    store = ParquetDatasetStore(Path(root) / SilverTable.DAILY_MARKET.value)
+    try:
+        return store.scan_bounded(
+            str(manifest.content_hash),
+            AssetKind.STOCK,
+            f"stock_pit_{SilverTable.DAILY_MARKET.value}_v1",
+            decision_time,
+            session_start=manifest.time_start.date(),
+            session_end=manifest.time_end.date(),
+            columns=list(requested),
+        )
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        raise PITDataError("invalid certified Silver table: daily_market") from exc
 
 
 def _latest_silver_manifest(*, root: Path, table: SilverTable, decision_time: datetime) -> object:
