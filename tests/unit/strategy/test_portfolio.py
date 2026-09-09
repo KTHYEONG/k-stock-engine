@@ -191,3 +191,14 @@ def test_construct_champion_portfolio_excluded_held_security_emits_exit_target()
 
     held_target = next(target for target in result.targets if target.allocation.instrument.instrument_id == held.instrument_id)
     assert held_target.allocation.target_value == 0.0
+
+
+def test_portfolio_policy_accepts_core_selection_and_rejects_unknown() -> None:
+    import pytest
+
+    from src.strategy.portfolio import ChampionPortfolioPolicy
+
+    core = ChampionPortfolioPolicy(required_selection_policy_version='korean-core-v1-selection-v1')
+    assert core.target_participation_cap == 0.0025
+    with pytest.raises(ValueError, match='required_selection_policy_version'):
+        ChampionPortfolioPolicy(required_selection_policy_version='unknown-v1')
