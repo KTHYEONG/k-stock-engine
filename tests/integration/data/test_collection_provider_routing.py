@@ -58,7 +58,31 @@ def test_collect_historical_evidence_routes_each_kind_to_its_owner() -> None:
     assert HISTORICAL_PROVIDER_ROUTES[EvidenceKind.SECURITY_MASTER] == 'krx'
     assert HISTORICAL_PROVIDER_ROUTES[EvidenceKind.INVESTOR_FLOW] == 'kis'
     assert HISTORICAL_PROVIDER_ROUTES[EvidenceKind.FINANCIAL_FACTS] == 'opendart'
-    assert HISTORICAL_PROVIDER_ROUTES[EvidenceKind.CORPORATE_ACTIONS] == 'retained_krx_intervals'
+    assert HISTORICAL_PROVIDER_ROUTES[EvidenceKind.CORPORATE_ACTIONS] == 'opendart_structured_decisions'
+
+
+def test_collect_opendart_corporate_action_evidence_persists_pages(tmp_path) -> None:
+    from src.data.bronze import BronzeStore
+    from src.data.collection import collect_opendart_corporate_action_evidence
+
+    class Page:
+        endpoint = "fricDecsn.json"
+        corp_code = "00123456"
+        status = "013"
+        records = ()
+
+    class Dart:
+        def load_corp_codes(self):
+            return {"005930": "00123456"}
+
+        def fetch_corporate_action_decisions(self, **_kwargs):
+            return (Page(),)
+
+    receipts = collect_opendart_corporate_action_evidence(
+        dart=Dart(), tickers=("KRX:005930",), start=date(2024, 1, 1), end=date(2024, 1, 2),
+        bronze=BronzeStore(tmp_path / "bronze"),
+    )
+    assert len(receipts) == 1
 
 
 def test_collect_historical_evidence_collects_krx_and_kis_pages(tmp_path) -> None:
@@ -362,3 +386,11 @@ def test_kis_flow_reused_page_advances_by_earliest_session(tmp_path) -> None:
 
     assert client.calls == [date(2024, 1, 3), date(2024, 1, 2)]
     assert {row['session'] for page in pages for row in page['records']} == {'2024-01-02', '2024-01-03', '2024-01-04', '2024-01-05'}
+
+
+# test_historical_pipeline_collects_opendart_actions_and_gold_does_not_exclude_by_sentinel
+def test_historical_pipeline_routes_corporate_actions_to_opendart() -> None:
+    from src.data.collection import HISTORICAL_PROVIDER_ROUTES, EvidenceKind
+
+    assert HISTORICAL_PROVIDER_ROUTES[EvidenceKind.CORPORATE_ACTIONS] == 'opendart_structured_decisions'
+    assert 'retained_krx_intervals' not in HISTORICAL_PROVIDER_ROUTES.values()

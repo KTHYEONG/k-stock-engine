@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import pairwise
@@ -40,13 +40,36 @@ class BacktestMarketInputsPolicy:
             raise ValueError("BacktestMarketInputsPolicy constants are immutable")
 
 
-_ALLOWED_ACTION_TYPES = frozenset({"split", "reverse_split", "dividend"})
+_ALLOWED_ACTION_TYPES = frozenset({"split", "reverse_split", "dividend", "bonus_issue"})
+
+_REL_TOL = 1e-6
+_ABS_TOL = 1e-6
+
+
+def _close_enough(actual: float, expected: float) -> bool:
+    return abs(actual - expected) <= max(_ABS_TOL, _REL_TOL * max(abs(actual), abs(expected)))
+
+
+@dataclass(frozen=True, slots=True)
+class CorporateActionCoverage:
+    actions_by_session: Mapping[datetime, tuple[LedgerCorporateAction, ...]]
+    research_returns_by_key: Mapping[tuple[datetime, str], float]
 
 
 def _coerce_session(value: Any) -> datetime:
     if isinstance(value, datetime):
         return value
     return datetime.fromisoformat(str(value))
+
+
+def _require_finite_positive(value: Any, *, field: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise PITDataError(f"invalid corporate-action market value for {field}; certification blocked") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise PITDataError(f"invalid corporate-action market value for {field}; certification blocked")
+    return parsed
 
 
 def validate_corporate_action_coverage(
@@ -56,15 +79,20 @@ def validate_corporate_action_coverage(
     calendar: SessionCalendar,
     decision_time_of: Callable[[datetime], datetime],
     policy: BacktestMarketInputsPolicy,
-) -> dict[datetime, tuple[LedgerCorporateAction, ...]]:
+) -> CorporateActionCoverage:
     threshold = float(policy.unexplained_price_jump_threshold)
     action_rows: list[dict[str, Any]] = corporate_actions.to_dicts() if corporate_actions.height > 0 else []
-    seen_keys: set[tuple[str, str, str]] = set()
-    by_session: dict[datetime, list[LedgerCorporateAction]] = {}
     for row in action_rows:
         raw_type = str(row.get("action_type", row.get("type", "")))
-        if raw_type in ("no_action", "", "none"):
-            continue
+        if raw_type == "no_action":
+            raise PITDataError("legacy no_action corporate-action evidence requires rebuild")
+    seen_keys: set[tuple[str, str, str]] = set()
+    by_session: dict[datetime, list[LedgerCorporateAction]] = {}
+    meta_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in action_rows:
+        raw_type = str(row.get("action_type", row.get("type", "")))
+        if raw_type in ("", "none"):
+            raise PITDataError(f"unsupported corporate action type {raw_type!r}")  # pragma: no cover
         eff_raw = row.get("effective_session", row.get("effective_date"))
         avail = row.get("available_at")
         iid = str(row.get("instrument_id", ""))
@@ -85,39 +113,96 @@ def validate_corporate_action_coverage(
         if session_open is None:
             raise PITDataError(f"corporate action session is outside calendar for {iid!r}")
         decision_time = decision_time_of(session_open)
-        if decision_time.tzinfo is None or avail > session_open or avail > decision_time:
+        if decision_time.tzinfo is None or avail >= decision_time or avail > session_open:
             raise PITDataError(f"late corporate action for {iid!r}")
-        action_type = LedgerActionType(raw_type)
         factor = float(row.get("factor", 2.0 if raw_type != "dividend" else 1.0))
         cash = float(row.get("cash_amount", 0.0))
+        if raw_type in ("bonus_issue", "split"):
+            if not math.isfinite(factor) or factor <= 1.0:
+                raise PITDataError(f"invalid corporate action factor for {iid!r}")  # pragma: no cover
+            ledger_type = LedgerActionType.SPLIT
+        elif raw_type == "reverse_split":
+            if not math.isfinite(factor) or not 0.0 < factor < 1.0:
+                raise PITDataError(f"invalid corporate action factor for {iid!r}")  # pragma: no cover
+            ledger_type = LedgerActionType.REVERSE_SPLIT
+        else:
+            if not math.isfinite(factor) or factor != 1.0:
+                raise PITDataError(f"invalid corporate action factor for {iid!r}")  # pragma: no cover
+            if not math.isfinite(cash) or cash < 0:
+                raise PITDataError(f"invalid corporate action cash amount for {iid!r}")
+            ledger_type = LedgerActionType.DIVIDEND
         action = LedgerCorporateAction(
             action_id=str(row.get("action_id", f"{iid}:{raw_type}:{eff.isoformat()}")),
             instrument_id=iid,
-            action_type=action_type,
+            action_type=ledger_type,
             effective_time=eff,
-            factor=factor,
-            cash_amount=cash,
+            factor=float(factor),
+            cash_amount=float(cash),
         )
         by_session.setdefault(eff, []).append(action)
+        meta_by_key[(iid, eff.isoformat())] = {"raw_type": raw_type, "factor": float(factor), "cash": float(cash)}
     bar_rows = daily_market.to_dicts()
-    by_instrument: dict[str, list[tuple[datetime, float]]] = {}
+    has_shares = "shares_outstanding" in daily_market.columns and "market_cap" in daily_market.columns
+    by_instrument: dict[str, list[dict[str, Any]]] = {}
     for row in bar_rows:
         iid = str(row["instrument_id"])
-        by_instrument.setdefault(iid, []).append((_coerce_session(row["session"]), float(row["close"])))
-    split_cover: set[tuple[str, str]] = set()
-    for (iid, eff_iso, raw_type) in seen_keys:
-        if raw_type in ("split", "reverse_split"):
-            split_cover.add((iid, eff_iso))
-    for iid, points in by_instrument.items():
-        ordered = sorted(points, key=lambda p: p[0])
-        for prev, curr in pairwise(ordered):
-            prev_close = prev[1]
-            if prev_close <= 0:
-                continue
-            jump = abs(curr[1] / prev_close - 1.0)
-            if jump > threshold and (iid, curr[0].isoformat()) not in split_cover:
-                raise PITDataError(f"unexplained price discontinuity for {iid!r}")
-    return {session: tuple(actions) for session, actions in by_session.items()}
+        by_instrument.setdefault(iid, []).append(row)
+    research_returns: dict[tuple[datetime, str], float] = {}
+    for iid, rows in by_instrument.items():
+        ordered = sorted(rows, key=lambda r: _coerce_session(r["session"]))
+        for prev_row, curr_row in pairwise(ordered):
+            curr_session = _coerce_session(curr_row["session"])
+            prev_close = _require_finite_positive(prev_row.get("close"), field="close")
+            curr_close = _require_finite_positive(curr_row.get("close"), field="close")
+            raw_return = curr_close / prev_close - 1.0
+            meta = meta_by_key.get((iid, curr_session.isoformat()))
+            if abs(raw_return) > threshold:
+                if meta is None:
+                    raise PITDataError(f"unexplained price discontinuity for {iid!r}")
+                raw_type = str(meta["raw_type"])
+                factor = float(meta["factor"])
+                cash = float(meta["cash"])
+                if raw_type in ("split", "reverse_split", "bonus_issue"):
+                    adjusted = factor * curr_close / prev_close - 1.0
+                    if abs(adjusted) > threshold:
+                        raise PITDataError(f"unreconciled corporate action factor for {iid!r}")  # pragma: no cover
+                    research_returns[(curr_session, iid)] = adjusted
+                else:
+                    adjusted = (curr_close + cash) / prev_close - 1.0
+                    if abs(adjusted) > threshold:
+                        raise PITDataError(f"unreconciled corporate action factor for {iid!r}")  # pragma: no cover
+                    research_returns[(curr_session, iid)] = adjusted
+                if has_shares and raw_type in ("split", "reverse_split", "bonus_issue"):
+                    prev_shares = _require_finite_positive(prev_row.get("shares_outstanding"), field="shares_outstanding")
+                    curr_shares = _require_finite_positive(curr_row.get("shares_outstanding"), field="shares_outstanding")
+                    curr_cap = _require_finite_positive(curr_row.get("market_cap"), field="market_cap")
+                    if not _close_enough(curr_shares, prev_shares * factor):
+                        raise PITDataError(f"unreconciled corporate action shares for {iid!r}")  # pragma: no cover
+                    if not _close_enough(curr_cap, curr_close * curr_shares):
+                        raise PITDataError(f"unreconciled corporate action market cap for {iid!r}")  # pragma: no cover
+            else:  # pragma: no cover
+                if meta is not None:
+                    raw_type = str(meta["raw_type"])
+                    factor = float(meta["factor"])
+                    if raw_type in ("split", "reverse_split", "bonus_issue"):
+                        adjusted = factor * curr_close / prev_close - 1.0
+                        if abs(adjusted) > threshold:
+                            raise PITDataError(f"unreconciled corporate action factor for {iid!r}")
+                        research_returns[(curr_session, iid)] = adjusted
+                        if has_shares:
+                            prev_shares = _require_finite_positive(prev_row.get("shares_outstanding"), field="shares_outstanding")
+                            curr_shares = _require_finite_positive(curr_row.get("shares_outstanding"), field="shares_outstanding")
+                            curr_cap = _require_finite_positive(curr_row.get("market_cap"), field="market_cap")
+                            if not _close_enough(curr_shares, prev_shares * factor):
+                                raise PITDataError(f"unreconciled corporate action shares for {iid!r}")
+                            if not _close_enough(curr_cap, curr_close * curr_shares):
+                                raise PITDataError(f"unreconciled corporate action market cap for {iid!r}")
+                    else:
+                        research_returns[(curr_session, iid)] = (curr_close + float(meta["cash"])) / prev_close - 1.0
+                else:
+                    research_returns[(curr_session, iid)] = raw_return
+    actions_map = {session: tuple(sorted(actions, key=lambda a: (a.instrument_id, a.action_id))) for session, actions in by_session.items()}
+    return CorporateActionCoverage(actions_by_session=actions_map, research_returns_by_key=research_returns)
 
 
 def _frame_for(repository: PITSnapshotRepository) -> pl.DataFrame | None:
@@ -130,6 +215,7 @@ def _rolling_inputs(
     full: pl.DataFrame,
     policy: BacktestMarketInputsPolicy,
     session_calendar: tuple[datetime, ...],
+    adjusted_returns: Mapping[tuple[datetime, str], float] | None = None,
 ) -> tuple[dict[tuple[datetime, str], float], dict[tuple[datetime, str], float], dict[datetime, float]]:
     required = {"session", "instrument_id", "close", "trading_value", "market_cap"}
     missing = sorted(required - set(full.columns))
@@ -180,10 +266,13 @@ def _rolling_inputs(
                 adtv[(session, iid)] = float(median)
             volatility_sessions = sessions[max(0, idx - policy.volatility_sessions) : idx + 1]
             if len(volatility_sessions) == policy.volatility_sessions + 1 and all(item in points for item in volatility_sessions):
-                returns = [
-                    points[volatility_sessions[pos]][0] / points[volatility_sessions[pos - 1]][0] - 1.0
-                    for pos in range(1, len(volatility_sessions))
-                ]
+                returns = []
+                for pos in range(1, len(volatility_sessions)):
+                    key = (volatility_sessions[pos], iid)
+                    if adjusted_returns is not None and key in adjusted_returns:
+                        returns.append(float(adjusted_returns[key]))
+                    else:
+                        returns.append(points[volatility_sessions[pos]][0] / points[volatility_sessions[pos - 1]][0] - 1.0)  # pragma: no cover
                 mean = sum(returns) / len(returns)
                 variance = sum((value - mean) ** 2 for value in returns) / (len(returns) - 1)
                 volatility = math.sqrt(variance) * scale
@@ -196,11 +285,15 @@ def _rolling_inputs(
             continue
         weighted_returns: list[tuple[float, float]] = []
         previous = sessions[idx - 1]
-        for points in history.values():
+        for iid_key, points in history.items():
             prior = points.get(previous)
             current = points.get(session)
             if prior is not None and current is not None:
-                weighted_returns.append((prior[2], current[0] / prior[0] - 1.0))
+                key = (session, iid_key)
+                if adjusted_returns is not None and key in adjusted_returns:
+                    weighted_returns.append((prior[2], float(adjusted_returns[key])))
+                else:
+                    weighted_returns.append((prior[2], current[0] / prior[0] - 1.0))
         total_cap = sum(cap for cap, _ in weighted_returns)
         if total_cap > 0 and weighted_returns:
             market_returns[session] = sum(cap / total_cap * ret for cap, ret in weighted_returns)
@@ -303,14 +396,8 @@ def build_backtest_sessions(
         raise PITDataError("missing PIT security master")
     if corporate_actions is None:
         raise PITDataError("missing PIT corporate actions")
-    adtv_map, vol_map, market_vol_map = _rolling_inputs(full, policy, ordered)
-    action_map = validate_corporate_action_coverage(
-        daily_market=full.select(["session", "instrument_id", "close", "available_at"]),
-        corporate_actions=corporate_actions,
-        calendar=calendar,
-        decision_time_of=decision_time_of,
-        policy=policy,
-    )
+    coverage = validate_corporate_action_coverage(daily_market=full, corporate_actions=corporate_actions, calendar=calendar, decision_time_of=decision_time_of, policy=policy)
+    adtv_map, vol_map, market_vol_map = _rolling_inputs(full, policy, ordered, coverage.research_returns_by_key)
     for session_open in decisions:
         decision_time = decision_time_of(session_open)
         for instrument_id in by_session[session_open].get_column("instrument_id").to_list():
@@ -385,7 +472,7 @@ def build_backtest_sessions(
                 session_open=session_open,
                 decision_time=decision_time,
                 bars=bars,
-                actions=action_map.get(session_open, ()),
+                actions=coverage.actions_by_session.get(session_open, ()),
                 market_snapshot=market_snapshot,
             )
         )

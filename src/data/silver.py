@@ -140,7 +140,7 @@ _SCHEMAS: dict[SilverTable, dict[str, list[str]]] = {
     },
 }
 
-_ALLOWED_ACTION_TYPES = {"no_action", "split", "dividend", "reverse_split", "merger", "spin_off", "rights_issue"}
+_ALLOWED_ACTION_TYPES = {"no_action", "split", "dividend", "reverse_split", "merger", "spin_off", "rights_issue", "bonus_issue"}
 
 
 def next_krx_session_open(published_at: datetime, calendar: SessionCalendar) -> datetime:

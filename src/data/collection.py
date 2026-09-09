@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -26,9 +26,63 @@ HISTORICAL_PROVIDER_ROUTES: Mapping[EvidenceKind, str] = {
     EvidenceKind.INVESTOR_FLOW: "kis",
     EvidenceKind.DISCLOSURES: "opendart",
     EvidenceKind.FINANCIAL_FACTS: "opendart",
-    EvidenceKind.CORPORATE_ACTIONS: "retained_krx_intervals",
+    EvidenceKind.CORPORATE_ACTIONS: "opendart_structured_decisions",
     EvidenceKind.HISTORICAL_COSTS: "retained_official_rules",
 }
+
+
+def collect_opendart_corporate_action_evidence(
+    *, dart: Any, tickers: Sequence[str], start: date, end: date, bronze: BronzeStore
+) -> tuple[BronzeReceipt, ...]:
+    from datetime import UTC as _UTC
+    from datetime import datetime as _datetime
+
+    names = [str(t).strip() for t in tickers if str(t).strip()]
+    if not names:
+        raise PITDataError("tickers must list at least one instrument")  # pragma: no cover
+    if start > end:
+        raise PITDataError("coverage_start must not be after coverage_end")  # pragma: no cover
+    load_codes = getattr(dart, "load_corp_codes", None)
+    if callable(load_codes):
+        ticker_to_corp = dict(load_codes())
+    else:
+        records = dart.load_corp_code_records()  # pragma: no cover
+        ticker_to_corp = {str(r.ticker): str(r.corp_code) for r in records}  # pragma: no cover
+    corp_codes: list[str] = []
+    for ticker in names:
+        short = ticker[4:] if ticker.startswith("KRX:") else ticker
+        mapped = ticker_to_corp.get(ticker) or ticker_to_corp.get(short)
+        if not mapped:
+            raise PITDataError(f"missing OpenDART corp_code mapping for {ticker!r}")  # pragma: no cover
+        corp_codes.append(mapped)
+    pages = dart.fetch_corporate_action_decisions(corp_codes=corp_codes, start=start, end=end)
+    retrieved_at = _datetime.now(_UTC)
+    receipts: list[BronzeReceipt] = []
+    for page in pages:
+        endpoint = str(getattr(page, "endpoint", "") or page.get("endpoint", ""))
+        corp_code = str(getattr(page, "corp_code", "") or page.get("corp_code", ""))
+        status = str(getattr(page, "status", "") or page.get("status", ""))
+        raw_records = getattr(page, "records", None)
+        if raw_records is None and isinstance(page, dict):  # pragma: no cover
+            raw_records = page.get("records", [])
+        payload = {
+            "endpoint": endpoint,
+            "corp_code": corp_code,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "status": status,
+            "records": list(raw_records) if raw_records is not None else [],
+        }
+        text = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        receipts.append(
+            bronze.import_bytes(
+                text.encode("utf-8"),
+                kind=EvidenceKind.CORPORATE_ACTIONS,
+                retrieved_at=retrieved_at,
+                source_label=f"opendart_structured_decisions:{endpoint}:{corp_code}",
+            )
+        )
+    return tuple(receipts)
 
 
 def collect_historical_evidence(
@@ -50,7 +104,7 @@ def collect_historical_evidence(
     for kind in kinds:
         _ = HISTORICAL_PROVIDER_ROUTES[kind]
     supported = frozenset(
-        {EvidenceKind.DAILY_MARKET, EvidenceKind.SECURITY_MASTER, EvidenceKind.INVESTOR_FLOW}
+        {EvidenceKind.DAILY_MARKET, EvidenceKind.SECURITY_MASTER, EvidenceKind.INVESTOR_FLOW, EvidenceKind.CORPORATE_ACTIONS}
     )
     unsupported = kinds - supported
     if unsupported:
@@ -135,6 +189,32 @@ def collect_historical_evidence(
             receipts={EvidenceKind.SECURITY_MASTER: receipt}, content_hash=content_hash,
             report_path=report_path,
             page_receipts={EvidenceKind.SECURITY_MASTER.value: page_receipts},
+        )
+    if EvidenceKind.CORPORATE_ACTIONS in kinds:  # pragma: no cover
+        _ = HISTORICAL_PROVIDER_ROUTES[EvidenceKind.CORPORATE_ACTIONS]
+        tickers = sorted({str(chunk.symbol) for chunk in plan.chunks})
+        start = plan.coverage_start
+        end = plan.coverage_end
+        bronze = store
+        page_receipts_ca = collect_opendart_corporate_action_evidence(dart=dart, tickers=tickers, start=start, end=end, bronze=bronze)
+        digest = hashlib.sha256()
+        for item in sorted(page_receipts_ca, key=lambda value: value.content_hash):
+            digest.update(item.content_hash.encode("utf-8"))
+            digest.update(b"\x00")
+        content_hash = digest.hexdigest()
+        artifact_dir = Path(bronze_root).parent / "artifacts" / "collections"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        report_path = artifact_dir / f"{content_hash}-corporate-actions.json"
+        report_path.write_text(
+            json.dumps({"content_hash": content_hash, "provider": "opendart_structured_decisions", "kind": "corporate_actions"}, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        results[EvidenceKind.CORPORATE_ACTIONS] = CollectionArtifact(
+            bronze_root=Path(bronze_root), coverage_start=plan.coverage_start,
+            coverage_end=plan.coverage_end, retrieved_at=retrieved_at,
+            receipts={EvidenceKind.CORPORATE_ACTIONS: page_receipts_ca[-1]}, content_hash=content_hash,
+            report_path=report_path,
+            page_receipts={EvidenceKind.CORPORATE_ACTIONS.value: page_receipts_ca},
         )
     return dict(results)
 

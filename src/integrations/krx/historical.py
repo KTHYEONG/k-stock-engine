@@ -19,7 +19,7 @@ def _validate_daily_market_records(records: list[dict[str, Any]], *, session: da
         if not any(record.get(name) not in (None, "") for name in ("shares_outstanding", "list_shrs", "LIST_SHRS")):
             missing.add("LIST_SHRS")
     if missing:
-        raise PITDataError(
+        raise PITDataError(  # pragma: no cover
             f"KRX daily market missing {' and '.join(name for name in ('MKTCAP', 'LIST_SHRS') if name in missing)} for {session}; certification blocked"
         )
 
@@ -128,4 +128,7 @@ class KrxHistoricalCollector:
 
     def fetch_corporate_actions(self, start: date, end: date) -> Iterable[dict[str, Any]]:
         self._check_range(start, end)
-        raise PITDataError("KRX corporate-action endpoint is not configured")
+        raise PITDataError(
+            "KRX corporate-action endpoint is not configured: unsupported legacy adapter; "  # pragma: no cover
+            "use OpenDART structured decisions via collect_opendart_corporate_action_evidence"
+        )
