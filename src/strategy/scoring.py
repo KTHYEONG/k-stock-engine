@@ -27,8 +27,12 @@ class ChampionScorePolicy:
             raise ValueError("policy version must be non-empty")
         if not self.required_feature_policy_version or not self.required_feature_policy_version.strip():
             raise ValueError("required_feature_policy_version must be non-empty")
-        if self.min_required_factors < 1 or self.min_required_factors > 4:
-            raise ValueError("min_required_factors must be between 1 and 4")
+        expected_factors = {
+            "champion-v1-scoring-v1": 4,
+            "champion-v1-partial-factor-scoring-v1": 2,
+        }.get(self.version)
+        if expected_factors is None or self.min_required_factors != expected_factors:
+            raise ValueError("score policy version must encode its exact factor count")
 
 
 class ChampionScoreReason(StrEnum):

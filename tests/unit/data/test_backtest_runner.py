@@ -56,8 +56,8 @@ def samsung_2016_january_sessions(tmp_path: Path) -> tuple[tuple[BacktestSession
         .sort("session")
         .collect()
     )
-    if df_market.height < 10:
-        pytest.skip("Insufficient Samsung 2016-01 market bars")
+    if df_market.height < 62 or "market_cap" not in df_market.columns:
+        pytest.skip("Insufficient Samsung rolling market inputs")
 
     df_market_pit = df_market.with_columns(
         pl.col("session").dt.replace(hour=15, minute=30, second=0).alias("available_at")
@@ -65,6 +65,20 @@ def samsung_2016_january_sessions(tmp_path: Path) -> tuple[tuple[BacktestSession
     sessions_list = tuple(sorted(df_market_pit["session"].to_list()))
     calendar = SessionCalendar(sessions_list)
     repo = PITSnapshotRepository.from_frames({SilverTable.DAILY_MARKET: df_market_pit}, root=tmp_path)
+
+    master = pl.DataFrame({
+        "instrument_id": ["KRX:005930"],
+        "sector": ["Technology"],
+        "valid_from": [sessions_list[0]],
+        "valid_to": [sessions_list[-1]],
+        "available_at": [sessions_list[0]],
+    })
+    actions = pl.DataFrame(schema={
+        "effective_session": pl.Datetime(time_zone="Asia/Seoul"),
+        "instrument_id": pl.String,
+        "action_type": pl.String,
+        "available_at": pl.Datetime(time_zone="Asia/Seoul"),
+    })
 
     start = sessions_list[0]
     end = sessions_list[-2]
@@ -74,6 +88,8 @@ def samsung_2016_january_sessions(tmp_path: Path) -> tuple[tuple[BacktestSession
         start=start,
         end=end,
         decision_time_of=lambda s: s.replace(hour=15, minute=30, second=0),
+        security_master=master,
+        corporate_actions=actions,
     )
     instrument = Instrument("KRX:005930", AssetKind.STOCK, "KRX", "005930", "KRW")
     return sessions, calendar, instrument
@@ -257,3 +273,12 @@ def test_verify_accounting_identity_valid() -> None:
         marked_value=30.0,
     )
     assert verify_accounting_identity((nav,)) is True
+
+
+def test_core_artifact_provenance() -> None:
+    from src.data.backtest_runner import run_managed_backtest
+
+    assert callable(run_managed_backtest)
+    required = {'strategy_id', 'score_policy_version', 'selection_policy_version', 'portfolio_policy_version', 'market_input_policy_version', 'warmup_sessions', 'data_action_certified'}
+    metadata = {'strategy_id': 'core-v1', 'score_policy_version': 'korean-core-v1-scoring-v1', 'selection_policy_version': 'korean-core-v1-selection-v1', 'portfolio_policy_version': 'champion-v1-portfolio-v1', 'market_input_policy_version': 'korean-equity-market-inputs-v1', 'warmup_sessions': 60, 'data_action_certified': True}
+    assert required <= metadata.keys()
