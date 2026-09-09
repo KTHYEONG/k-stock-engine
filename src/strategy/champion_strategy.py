@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from datetime import date
 from typing import Any, cast
 
+from src.core.time import SessionCalendar
 from src.engine.decision import DecisionContext
 from src.execution.domain.intents import TradeIntent
 from src.strategy.portfolio import (
@@ -27,11 +28,13 @@ class ChampionStrategy:
         selection_policy: ChampionSelectionPolicy | None = None,
         portfolio_policy: ChampionPortfolioPolicy | None = None,
         rebalance_frequency: str = 'monthly',
+        calendar: SessionCalendar | None = None,
     ) -> None:
         self._scores_by_session: dict[date, tuple[ChampionScoreRow, ...]] = dict(scores_by_session)
         self._selection_policy = selection_policy if selection_policy is not None else ChampionSelectionPolicy()
         self._portfolio_policy = portfolio_policy if portfolio_policy is not None else ChampionPortfolioPolicy()
         self.rebalance_frequency = rebalance_frequency
+        self._calendar = calendar
         self._last_rebalance_month: tuple[int, int] | None = None
 
     def decide(self, context: DecisionContext) -> tuple[TradeIntent, ...]:
@@ -75,6 +78,10 @@ class ChampionStrategy:
         )
         account_id = context.portfolio.account_snapshot_id
         session_tag = decision_time.date().isoformat()
+        if self._calendar is not None:
+            execution_time = self._calendar.advance(decision_time, 1).replace(hour=9, minute=0, second=0)
+        else:
+            execution_time = decision_time
         intents = tuple(
             TradeIntent(
                 intent_id=f'champion-{target.allocation.instrument.instrument_id}-{session_tag}',
@@ -82,7 +89,7 @@ class ChampionStrategy:
                 instrument_id=target.allocation.instrument.instrument_id,
                 target_value=float(target.allocation.target_value),
                 decision_time=decision_time,
-                execution_time=decision_time,
+                execution_time=execution_time,
                 strategy_id='champion-v1',
                 reason=target.allocation.reason,
                 idempotency_key=f'champion_{target.allocation.instrument.instrument_id}_{session_tag}',

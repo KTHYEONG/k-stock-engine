@@ -109,6 +109,21 @@ def default_stress_schedule() -> CostSchedule:
     )
 
 
+def default_krx_tick_schedule() -> TickSizeSchedule:
+    """Standard KRX equity tick-size schedule covering [0, inf)."""
+    return TickSizeSchedule(
+        rules=(
+            TickSizeRule("krx_r0", datetime(2000, 1, 1, tzinfo=UTC), 0.0, 1000.0, 1.0),
+            TickSizeRule("krx_r1", datetime(2000, 1, 1, tzinfo=UTC), 1000.0, 5000.0, 5.0),
+            TickSizeRule("krx_r2", datetime(2000, 1, 1, tzinfo=UTC), 5000.0, 10000.0, 10.0),
+            TickSizeRule("krx_r3", datetime(2000, 1, 1, tzinfo=UTC), 10000.0, 50000.0, 50.0),
+            TickSizeRule("krx_r4", datetime(2000, 1, 1, tzinfo=UTC), 50000.0, 100000.0, 100.0),
+            TickSizeRule("krx_r5", datetime(2000, 1, 1, tzinfo=UTC), 100000.0, 500000.0, 500.0),
+            TickSizeRule("krx_r6", datetime(2000, 1, 1, tzinfo=UTC), 500000.0, inf, 1000.0),
+        )
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class CostModel:
     """Fee/tax/slippage assumptions as typed inputs, not strategy constants.
