@@ -8,7 +8,7 @@ from typing import Any
 
 import requests
 
-from src.data.schemas import PITDataError
+from src.core.pit import PITDataError
 
 
 @dataclass(frozen=True, slots=True)
