@@ -774,6 +774,14 @@ def _resolve_instrument(*, corp_code: str, daily_market: pl.DataFrame, record: d
     raise PITDataError(f"missing OpenDART corp_code mapping for {corp_code!r}")  # pragma: no cover
 
 
+def _resolve_listing_session(*, listing_date: date, calendar: SessionCalendar, instrument_id: str, action_id: str) -> datetime:
+    ordered = tuple(sorted(calendar.sessions))
+    for session in ordered:
+        if session.astimezone(KRX_TZ).date() >= listing_date:
+            return session
+    raise PITDataError(f"no KRX listing session for {instrument_id!r} action {action_id!r} field nstk_lstprd; certification blocked")
+
+
 def resolve_opendart_corporate_action_records(
     *, pages: Iterable[dict[str, Any]], daily_market: pl.DataFrame, calendar: SessionCalendar
 ) -> list[dict[str, Any]]:
@@ -824,7 +832,7 @@ def resolve_opendart_corporate_action_records(
                 raise PITDataError(f"invalid OpenDART record for {endpoint} {corp_code}")  # pragma: no cover
             rcept_no = str(record.get("rcept_no", "") or "").strip()
             if endpoint == "fricDecsn.json":
-                for field in ("rcept_no", "corp_code", "bfic_tisstk_ostk", "nstk_ostk_cnt", "nstk_ascnt_ps_ostk", "nstk_asstd"):
+                for field in ("rcept_no", "corp_code", "bfic_tisstk_ostk", "nstk_ostk_cnt", "nstk_ascnt_ps_ostk", "nstk_asstd", "nstk_lstprd"):
                     if str(record.get(field, "") or "").strip() == "":
                         raise PITDataError(f"missing OpenDART field {field} for {endpoint} {rcept_no}")  # pragma: no cover
                 basis = _parse_exact_int(record.get("bfic_tisstk_ostk"), field="bfic_tisstk_ostk")
@@ -842,6 +850,8 @@ def resolve_opendart_corporate_action_records(
                 asstd = _parse_opendart_date(record.get("nstk_asstd"))
                 instrument_id = _resolve_instrument(corp_code=corp_code or str(record.get("corp_code", "")), daily_market=daily_market, record=record)
                 available_at = _receipt_available_at(rcept_no=rcept_no, calendar=calendar)
+                listing_date = _parse_opendart_date(record.get("nstk_lstprd"))
+                listing_session = _resolve_listing_session(listing_date=listing_date, calendar=calendar, instrument_id=instrument_id, action_id=rcept_no)
                 bars = closes_by_iid.get(instrument_id, [])
                 if len(bars) < 2:
                     raise PITDataError(f"missing KRX bars for {endpoint} {rcept_no}")  # pragma: no cover
@@ -860,7 +870,7 @@ def resolve_opendart_corporate_action_records(
                     adjusted = abs(factor * curr_close / prev_close - 1.0)
                     if raw_return > threshold and adjusted <= threshold:
                         candidates.append(bars[curr_idx][0])
-                if len(candidates) != 1:  # pragma: no cover
+                if len(candidates) != 1 or listing_session < candidates[0]:  # pragma: no cover
                     raise PITDataError(
                         f"unreconciled OpenDART bonus issue for {endpoint} {rcept_no}; certification blocked"
                     )
@@ -874,6 +884,8 @@ def resolve_opendart_corporate_action_records(
                     "factor": float(factor),
                     "cash_amount": 0.0,
                     "effective_session": effective_session,
+                    "share_listing_date": listing_session,
+                    "share_delta": int(existing),
                     "available_at": available_at,
                     "action_id": rcept_no,
                 })
@@ -904,6 +916,8 @@ def resolve_opendart_corporate_action_records(
                     "factor": float(factor),
                     "cash_amount": 0.0,
                     "effective_session": ordered_sessions[0],
+                    "share_listing_date": None,
+                    "share_delta": None,
                     "available_at": available_at,
                     "action_id": rcept_no,
                 })
@@ -1502,6 +1516,8 @@ def stream_normalize_stock_evidence(
                     "type": _r["action_type"],
                     "action_type": _r["action_type"],
                     "effective_session": _r["effective_session"],
+                    'share_listing_date': _r['share_listing_date'],
+                    "share_delta": _r.get("share_delta"),
                     "factor": _r["factor"],
                     "cash_amount": _r["cash_amount"],
                     "source": "opendart_structured_decisions",

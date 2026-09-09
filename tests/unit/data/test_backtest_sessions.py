@@ -393,7 +393,7 @@ def test_validate_corporate_action_coverage_reconciles_bonus_and_uses_adjusted_r
     previous = datetime(2016, 11, 22, 9, tzinfo=krx)
     current = datetime(2016, 11, 23, 9, tzinfo=krx)
     daily = pl.DataFrame({'session': [previous, current], 'instrument_id': ['KRX:027410', 'KRX:027410'], 'close': [168500.0, 82600.0], 'shares_outstanding': [24773964.0, 49547928.0], 'market_cap': [4174406934000.0, 4092658852800.0]})
-    actions = pl.DataFrame({'effective_session': [current], 'instrument_id': ['KRX:027410'], 'action_type': ['bonus_issue'], 'action_id': ['20161107000214'], 'factor': [2.0], 'cash_amount': [0.0], 'available_at': [datetime(2016, 11, 8, 9, tzinfo=krx)]})
+    actions = pl.DataFrame({'effective_session': [current], 'share_listing_date': [current], 'share_delta': [24773964], 'instrument_id': ['KRX:027410'], 'action_type': ['bonus_issue'], 'action_id': ['20161107000214'], 'factor': [2.0], 'cash_amount': [0.0], 'available_at': [datetime(2016, 11, 8, 9, tzinfo=krx)]})
 
     coverage = validate_corporate_action_coverage(daily_market=daily, corporate_actions=actions, calendar=SessionCalendar((previous, current)), decision_time_of=lambda value: value.replace(hour=15, minute=30), policy=BacktestMarketInputsPolicy())
 
@@ -453,3 +453,54 @@ def test_validate_corporate_action_coverage_exercises_factor_and_value_guards() 
     dividend_daily = pl.DataFrame({"session": [first, second], "instrument_id": ["KRX:D", "KRX:D"], "close": [100.0, 40.0], "shares_outstanding": [10.0, 10.0], "market_cap": [1000.0, 400.0]})
     dividend = pl.DataFrame({**base, "instrument_id": ["KRX:D"], "action_type": ["dividend"], "factor": [1.0], "cash_amount": [60.0]})
     assert validate_corporate_action_coverage(daily_market=dividend_daily, corporate_actions=dividend, calendar=SessionCalendar((first, second)), decision_time_of=lambda value: value.replace(hour=15, minute=30), policy=BacktestMarketInputsPolicy()).research_returns_by_key
+
+
+def test_validate_bonus_issue_accepts_delayed_listing_share_delta() -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import polars as pl
+
+    from src.core.time import SessionCalendar
+    from src.data.backtest_sessions import BacktestMarketInputsPolicy, validate_corporate_action_coverage
+
+    tz = ZoneInfo('Asia/Seoul')
+    price_previous = datetime(2016, 11, 22, 9, tzinfo=tz)
+    price_session = datetime(2016, 11, 23, 9, tzinfo=tz)
+    listing_previous = datetime(2016, 12, 13, 9, tzinfo=tz)
+    listing_session = datetime(2016, 12, 14, 9, tzinfo=tz)
+    calendar = SessionCalendar((price_previous, price_session, listing_previous, listing_session))
+    daily = pl.DataFrame({'session': list(calendar.sessions), 'instrument_id': ['KRX:027410'] * 4, 'close': [168500.0, 82600.0, 86200.0, 88000.0], 'shares_outstanding': [24773964.0, 24773964.0, 24773964.0, 49547625.0], 'market_cap': [4174412934000.0, 2046329426400.0, 2135515696800.0, 4360191000000.0]})
+    actions = pl.DataFrame({'effective_session': [price_session], 'share_listing_date': [listing_session], 'share_delta': [24773661], 'instrument_id': ['KRX:027410'], 'action_type': ['bonus_issue'], 'action_id': ['20161107000214'], 'factor': [2.0], 'cash_amount': [0.0], 'available_at': [datetime(2016, 11, 8, 9, tzinfo=tz)]})
+
+    coverage = validate_corporate_action_coverage(daily_market=daily, corporate_actions=actions, calendar=calendar, decision_time_of=lambda value: value.replace(hour=15, minute=30), policy=BacktestMarketInputsPolicy())
+
+    assert tuple(coverage.actions_by_session) == (price_session,)
+    assert coverage.research_returns_by_key[(listing_session, 'KRX:027410')] == 88000.0 / 86200.0 - 1.0
+
+
+def test_validate_bonus_issue_rejects_listing_delta_or_market_cap_mismatch() -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import polars as pl
+    import pytest
+
+    from src.core.time import SessionCalendar
+    from src.data.backtest_sessions import BacktestMarketInputsPolicy, validate_corporate_action_coverage
+    from src.data.schemas import PITDataError
+
+    tz = ZoneInfo('Asia/Seoul')
+    first = datetime(2024, 1, 2, 9, tzinfo=tz)
+    price = datetime(2024, 1, 3, 9, tzinfo=tz)
+    listing = datetime(2024, 1, 4, 9, tzinfo=tz)
+    calendar = SessionCalendar((first, price, listing))
+    daily = pl.DataFrame({'session': [first, price, listing], 'instrument_id': ['KRX:A'] * 3, 'close': [100.0, 49.0, 50.0], 'shares_outstanding': [10.0, 10.0, 19.0], 'market_cap': [1000.0, 490.0, 950.0]})
+    actions = pl.DataFrame({'effective_session': [price], 'share_listing_date': [listing], 'share_delta': [10], 'instrument_id': ['KRX:A'], 'action_type': ['bonus_issue'], 'action_id': ['a'], 'factor': [2.0], 'cash_amount': [0.0], 'available_at': [first]})
+
+    with pytest.raises(PITDataError, match='unreconciled corporate action listed shares'):
+        validate_corporate_action_coverage(daily_market=daily, corporate_actions=actions, calendar=calendar, decision_time_of=lambda value: value.replace(hour=15, minute=30), policy=BacktestMarketInputsPolicy())
+
+    legacy = actions.drop(['share_listing_date', 'share_delta'])
+    with pytest.raises(PITDataError, match='legacy bonus_issue corporate-action evidence requires rebuild'):
+        validate_corporate_action_coverage(daily_market=daily, corporate_actions=legacy, calendar=calendar, decision_time_of=lambda value: value.replace(hour=15, minute=30), policy=BacktestMarketInputsPolicy())
