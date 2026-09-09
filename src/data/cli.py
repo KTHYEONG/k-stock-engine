@@ -11,7 +11,7 @@ from typing import Any
 from dotenv import load_dotenv
 
 from src.data.backtest_runner import run_champion_backtest
-from src.data.backtest_sessions import build_backtest_sessions
+from src.data.backtest_sessions import BacktestMarketInputsPolicy, build_backtest_sessions
 from src.data.bronze import BronzeStore, import_retained_stock_evidence, migrate_retained_stock_evidence
 from src.data.collection import collect_dart_disclosures, collect_dart_financial_facts, collect_planned_investor_flow
 from src.data.collection_plan import (
@@ -26,6 +26,7 @@ from src.data.operations import execute_verified_legacy_purge
 from src.data.pipeline import materialize_backtest_inputs
 from src.data.schemas import PITDataError, SilverTable
 from src.strategy.champion_strategy import ChampionStrategy
+from src.strategy.core_strategy import CoreStrategy
 
 load_dotenv()
 
@@ -130,6 +131,7 @@ def _parse_args() -> argparse.Namespace:
     p_run.add_argument("--initial-cash", type=float, default=100000000.0)
     p_run.add_argument("--scenario", type=str, default="base")
     p_run.add_argument("--ledger-id", type=str, default="champion-2016")
+    p_run.add_argument("--strategy-id", choices=("core-v1", "champion-v1"), default="core-v1")
 
     p_rebuild = sub.add_parser("rebuild-data", help="Prepare verified rebuild before collection")
     # add_argument("rebuild-data", help="historical pipeline subcommand marker")
@@ -254,6 +256,25 @@ def _champion_scores_by_session(scores_frame: Any) -> dict[date, tuple[Any, ...]
     return {session: tuple(rows) for session, rows in grouped.items()}
 
 
+def _eligible_universe_by_session(universe_frame: Any) -> dict[date, tuple[str, ...]]:
+    seen: set[tuple[str, str]] = set()
+    grouped: dict[date, list[str]] = {}
+    for row in universe_frame.to_dicts():
+        raw_session = row.get("decision_session", row.get("session"))
+        session_dt = raw_session if isinstance(raw_session, datetime) else datetime.fromisoformat(str(raw_session))
+        if session_dt.tzinfo is None:
+            session_dt = session_dt.replace(tzinfo=UTC)
+        if not row.get("eligible", False):
+            continue
+        iid = str(row["instrument_id"])
+        key = (session_dt.date().isoformat(), iid)
+        if key in seen:
+            raise PITDataError(f"duplicate universe row for {key!r}")
+        seen.add(key)
+        grouped.setdefault(session_dt.date(), []).append(iid)
+    return {session: tuple(sorted(ids)) for session, ids in grouped.items()}
+
+
 def _dispatch_backtest(args: argparse.Namespace) -> int:
     """Execute Champion backtest or single-instrument smoke test with replayable artifacts."""
     from datetime import date
@@ -288,7 +309,8 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     scores_frame: Any = None
     strategy: Any = None
 
-    if not smoke_symbol:
+    strategy_id = str(getattr(args, "strategy_id", "core-v1"))
+    if not smoke_symbol and strategy_id != "core-v1":
         _gid = str(gold_dataset_id) if gold_dataset_id is not None else ""
         if not _gid.strip() or "/" in _gid or "\\" in _gid or ".." in _gid:
             raise PITDataError("run-backtest requires resolved Gold artifact; missing --gold-dataset-id")
@@ -328,6 +350,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     if end_idx + 1 >= len(cal_sessions):
         raise PITDataError(f"Coverage exhausted: no session after {end_session}")
     next_session = cal_sessions[end_idx + 1]
+    coverage_end = cal_sessions[end_idx + 2] if end_idx + 2 < len(cal_sessions) else next_session
 
     # Load market bars
     dm_root = latest_silver_dataset_path(
@@ -339,10 +362,9 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     if not parquet_files:
         raise PITDataError("missing daily market parquet files")
 
-    # Silver partitions may carry legacy ``available_at`` timezone metadata.
-    # Select only the columns consumed by the backtest before concatenating so
-    # that an unused metadata column cannot make the lazy scan fail schema
-    # resolution (UTC vs Asia/Seoul).
+    # Calendar-aligned warm-up window for rolling PIT inputs (ADTV20/vol60).
+    start_idx = cal_sessions.index(start_session)
+    warmup_start = cal_sessions[max(0, start_idx - 60)]
     market_columns = [
         "session",
         "instrument_id",
@@ -350,19 +372,18 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         "close",
         "volume",
         "trading_value",
+        "market_cap",
+        "available_at",
     ]
     scans = [
         pl.scan_parquet(path)
-        .select(market_columns)
-        .filter((pl.col("session") >= start_session) & (pl.col("session") <= next_session))
+        .select([c for c in market_columns if c in pl.scan_parquet(path).collect_schema().names()])
+        .filter((pl.col("session") >= warmup_start) & (pl.col("session") <= coverage_end))
         for path in parquet_files
     ]
     query = pl.concat(scans, how="vertical_relaxed")
     if smoke_symbol:
         query = query.filter(pl.col("instrument_id") == smoke_symbol)
-    # Rows with zero/negative open or close are structurally invalid (no mark price).
-    # Suspended bars (trading_value=0, volume=0) retain a valid close for mark-to-market;
-    # execution on them will be rejected by the fill model via adtv_20d check.
     query = query.filter(
         (pl.col("open") > 0)
         & (pl.col("close") > 0)
@@ -370,16 +391,19 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     daily_market = query.collect()
     if daily_market.height == 0:
         raise PITDataError("no daily market data in range")
-
-    # Available_at normalization to 15:30 KST
-    daily_market_pit = daily_market.with_columns(
-        pl.col("session").dt.replace(hour=15, minute=30, second=0).alias("available_at")
-    )
+    if "available_at" not in daily_market.columns:
+        raise PITDataError("daily market missing certified available_at")
+    if "market_cap" not in daily_market.columns:
+        raise PITDataError("daily market missing market_cap")
+    daily_market_pit = daily_market
     snapshot_repo = PITSnapshotRepository.from_frames(
         {SilverTable.DAILY_MARKET: daily_market_pit}, root=silver_root
     )
 
-    sessions = build_backtest_sessions(snapshot_repository=snapshot_repo, calendar=calendar, start=start_session, end=end_session, decision_time_of=lambda s: s.replace(hour=15, minute=30, second=0))
+    security_master = _load_silver_table(silver_root, SilverTable.SECURITY_MASTER)
+    corporate_actions = _load_silver_table(silver_root, SilverTable.CORPORATE_ACTIONS)
+
+    sessions = build_backtest_sessions(snapshot_repository=snapshot_repo, calendar=calendar, start=start_session, end=next_session, decision_time_of=lambda s: s.replace(hour=15, minute=30, second=0), security_master=security_master, corporate_actions=corporate_actions)
 
     distinct_symbols = daily_market["instrument_id"].unique().to_list()
     instruments = {
@@ -393,8 +417,8 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         costs,
         LiquiditySlippageModel(0.1, ticks),
         scenario,
-        target_participation_cap=0.1,
-        hard_participation_cap=0.2,
+        target_participation_cap=0.0025,
+        hard_participation_cap=0.005,
     )
 
     config = BacktestConfig(
@@ -433,6 +457,15 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
                 return ()
 
         strategy = SmokeStrategy()
+    elif strategy is None and strategy_id == 'core-v1' and not smoke_symbol:
+        eligible_by_session: dict[date, tuple[str, ...]] = {}
+        universe_root = gold_root / "universe"
+        if universe_root.exists():
+            u_files = list(universe_root.rglob("*.parquet"))
+            if u_files:
+                u_frame = pl.scan_parquet(u_files).collect()
+                eligible_by_session = _eligible_universe_by_session(u_frame)
+        strategy = CoreStrategy(eligible_by_session=eligible_by_session, calendar=calendar)
     elif strategy is None:
         eligible_set: set[str] = set()
         universe_root = gold_root / "universe"
@@ -470,6 +503,21 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
 
         strategy = UniverseStrategy()
 
+    from src.strategy.core_strategy import CoreStrategyPolicy
+
+    _core_policy = CoreStrategyPolicy()
+    metadata = {
+        "validation_start": str(val_start),
+        "validation_end": str(val_end),
+        "instruments_tracked": len(instruments),
+        "strategy_id": strategy_id,
+        "score_policy_version": _core_policy.score_policy_version if strategy_id == "core-v1" else "champion-v1-scoring-v1",
+        "selection_policy_version": _core_policy.selection_policy_version if strategy_id == "core-v1" else "champion-v1-selection-v1",
+        "portfolio_policy_version": "champion-v1-portfolio-v1",
+        "market_input_policy_version": BacktestMarketInputsPolicy().version,
+        "warmup_sessions": 60,
+        "data_action_certified": True,
+    }
     _result, manifest = run_managed_backtest(
         sessions=sessions,
         config=config,
@@ -477,11 +525,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         artifact_root=artifact_root,
         dataset_hash=f"validation_{val_start}_{val_end}",
         smoke_symbol=smoke_symbol,
-        extra_metadata={
-            "validation_start": str(val_start),
-            "validation_end": str(val_end),
-            "instruments_tracked": len(instruments),
-        },
+        extra_metadata=metadata,
     )
 
     _emit({
@@ -955,7 +999,7 @@ def main() -> int:
             gold_target_root: Path | None = Path(args.gold_root) if args.gold_root else None
             from src.strategy.scoring import ChampionScorePolicy
 
-            score_policy = ChampionScorePolicy(min_required_factors=2)
+            score_policy = ChampionScorePolicy()
 
             gold_report = materialize_gold_window(
                 calendar=inputs.calendar, security_master=inputs.security_master, daily_market=inputs.daily_market, financial_facts=inputs.financial_facts, corporate_actions=inputs.corporate_actions, investor_flow=inputs.investor_flow,

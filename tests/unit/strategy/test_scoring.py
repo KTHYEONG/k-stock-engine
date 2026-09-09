@@ -125,7 +125,7 @@ def test_score_champion_rows_allows_partial_factors_when_configured() -> None:
         ),
     )
 
-    policy = ChampionScorePolicy(min_required_factors=2)
+    policy = ChampionScorePolicy(version="champion-v1-partial-factor-scoring-v1", min_required_factors=2)
     scores = {row.instrument_id: row for row in score_champion_rows(rows, decision_time=decision, policy=policy)}
 
     import pytest
@@ -138,4 +138,15 @@ def test_score_champion_rows_allows_partial_factors_when_configured() -> None:
     assert scores["KRX:ONE"].eligible is False
     assert scores["KRX:ONE"].champion_score is None
     assert scores["KRX:ONE"].rank is None
+
+
+def test_champion_factor_version_bound() -> None:
+    import pytest
+
+    from src.strategy.scoring import ChampionScorePolicy
+
+    assert ChampionScorePolicy().min_required_factors == 4
+    with pytest.raises(ValueError, match='version'):
+        ChampionScorePolicy(version='champion-v1-scoring-v1', min_required_factors=2)
+    assert ChampionScorePolicy(version='champion-v1-partial-factor-scoring-v1', min_required_factors=2).min_required_factors == 2
 

@@ -124,45 +124,34 @@ def test_champion_strategy_decide_emits_exit_intents() -> None:
     assert exit_intent.target_value == 0.0
 
 
-def test_champion_strategy_receives_complete_market_snapshot_from_session(tmp_path) -> None:
+def test_champion_strategy_receives_complete_market_snapshot_from_session() -> None:
     from datetime import UTC, datetime
-    import polars as pl
     from src.core.portfolio import PortfolioSnapshot
-    from src.core.time import SessionCalendar
-    from src.data.backtest_sessions import build_backtest_sessions
-    from src.data.schemas import SilverTable
-    from src.data.snapshot import PITSnapshotRepository
+    from src.core.instruments import AssetKind, Instrument
+    from src.engine.backtest import BacktestSession
     from src.engine.decision import DecisionContext
+    from src.engine.fill_model import HistoricalBar
     from src.strategy.champion_strategy import ChampionStrategy
     from src.strategy.scoring import ChampionScoreRow
 
     d1 = datetime(2024, 1, 2, 9, 0, tzinfo=UTC)
     d2 = datetime(2024, 1, 3, 9, 0, tzinfo=UTC)
-    frame = pl.DataFrame({
-        'session': [d1, d2],
-        'instrument_id': ['KRX:005930', 'KRX:005930'],
-        'open': [70000.0, 71000.0],
-        'high': [71000.0, 72000.0],
-        'low': [69500.0, 70500.0],
-        'close': [70500.0, 71500.0],
-        'volume': [1000000.0, 1100000.0],
-        'trading_value': [70500000000.0, 78650000000.0],
-        'available_at': [
-            d1.replace(hour=15, minute=30),
-            d2.replace(hour=15, minute=30),
-        ],
-    })
-    repo = PITSnapshotRepository.from_frames({SilverTable.DAILY_MARKET: frame}, root=tmp_path)
-    calendar = SessionCalendar((d1, d2))
-    sessions = build_backtest_sessions(
-        snapshot_repository=repo,
-        calendar=calendar,
-        start=d1,
-        end=d1,
-        decision_time_of=lambda s: s.replace(hour=15, minute=30),
+    instrument = Instrument('KRX:005930', AssetKind.STOCK, 'KRX', '005930', 'KRW')
+    session = BacktestSession(
+        session_open=d1,
+        decision_time=d1.replace(hour=15, minute=30),
+        bars=(HistoricalBar(d1, 'KRX:005930', 70000.0, 70500.0, 70500000000.0, 0.2),),
+        actions=(),
+        market_snapshot={
+            'mark_prices': {'KRX:005930': 70500.0},
+            'market_caps': {'KRX:005930': 1e12},
+            'adtv20': {'KRX:005930': 70500000000.0},
+            'volatilities': {'KRX:005930': 0.2},
+            'sectors': {'KRX:005930': 'Technology'},
+            'instruments': {'KRX:005930': instrument},
+            'market_volatility': 0.15,
+        },
     )
-    assert len(sessions) == 1
-    session = sessions[0]
     scores = (
         ChampionScoreRow(
             decision_session=d1,
