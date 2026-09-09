@@ -11,7 +11,7 @@ from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from src.data.schemas import PITDataError
+from src.core.pit import PITDataError
 
 if TYPE_CHECKING:  # pragma: no cover
     from src.integrations.dart.client import DartCorpCodeRecord

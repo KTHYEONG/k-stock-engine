@@ -7,7 +7,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from src.data.schemas import BronzeReceipt, PITDataError
+from src.core.pit import BronzeReceipt, PITDataError
 from src.integrations.kis.client import KisClient, KisCredentials
 
 
@@ -67,8 +67,8 @@ class KisInvestorFlowCollector:
         bronze_root: Path | str,
         retrieved_at: datetime | None,
     ) -> BronzeReceipt:
+        from src.core.pit import EvidenceKind
         from src.data.bronze import BronzeStore
-        from src.data.schemas import EvidenceKind
 
         payload = {
             "provider": "KIS",
@@ -96,8 +96,8 @@ class KisInvestorFlowCollector:
         return {"provider": "KIS", "endpoint": "investor-trade-by-stock-daily", "records": rows}
 
     def _find_verified_anchor_page(self, symbol: str, anchor: date, bronze_root: Path | str) -> dict[str, object] | None:
+        from src.core.pit import EvidenceKind
         from src.data.bronze_aggregation import discover_verified_bronze_receipts
-        from src.data.schemas import EvidenceKind
 
         grouped = discover_verified_bronze_receipts(bronze_root=Path(bronze_root))
         for receipt in grouped.get(EvidenceKind.INVESTOR_FLOW, ()):

@@ -774,7 +774,7 @@ class SilverStore:
             schema_version="v2",
             content_hash=content_hash,
             storage_layout=HIVE_PARTITION_LAYOUT,
-            certification=report.certification,  # type: ignore[arg-type]
+            certification=report.certification,
             quality_report_hash=report.report_hash,
             calendar_hash=report.source_hashes.get(EvidenceKind.CALENDAR, ""),
             corporate_action_hash=report.source_hashes.get(EvidenceKind.CORPORATE_ACTIONS, ""),
@@ -876,7 +876,7 @@ class SilverStore:
                 schema_version="v2",
                 content_hash=content_hash,
                 storage_layout=HIVE_PARTITION_LAYOUT,
-                certification=report.certification,  # type: ignore[arg-type]
+                certification=report.certification,
                 quality_report_hash=report.report_hash,
                 calendar_hash=report.source_hashes.get(EvidenceKind.CALENDAR, ""),
                 corporate_action_hash=report.source_hashes.get(EvidenceKind.CORPORATE_ACTIONS, ""),
