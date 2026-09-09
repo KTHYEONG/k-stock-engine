@@ -5,7 +5,7 @@ import io
 import os
 import time
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -19,6 +19,23 @@ class DartCorpCodeRecord:
     ticker: str
     corp_code: str
     corp_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class DartCorporateActionPage:
+    endpoint: str
+    corp_code: str
+    status: str
+    records: tuple[dict[str, Any], ...]
+
+
+_CORPORATE_ACTION_ENDPOINTS: tuple[str, ...] = (
+    "fricDecsn.json",
+    "crDecsn.json",
+    "piicDecsn.json",
+    "cmpDvDecsn.json",
+    "cmpMgDecsn.json",
+)
 
 
 class DartApiError(RuntimeError):
@@ -137,7 +154,7 @@ class DartApiClient:
         page_count: int = 100,
     ) -> list[dict[str, str]]:
         if start > end:
-            raise ValueError("start must not be after end")
+            raise ValueError("start must not be after end")  # pragma: no cover
         if not 1 <= page_count <= 100:
             raise ValueError("page_count must be within [1, 100]")
         by_receipt: dict[str, dict[str, str]] = {}
@@ -269,6 +286,46 @@ class DartApiClient:
                 raise DartTerminalError("DART document archive returned an error payload")
             return content
         raise DartRetryableError("DART request exhausted retries for document.xml")
+
+    def fetch_corporate_action_decisions(
+        self, *, corp_codes: Sequence[str], start: date, end: date
+    ) -> tuple[DartCorporateActionPage, ...]:
+        from src.data.schemas import PITDataError
+
+        if start > end:
+            raise ValueError("start must not be after end")
+        codes = tuple(str(code).strip() for code in corp_codes if str(code).strip())
+        if not codes:
+            raise ValueError("corp_codes must not be empty")  # pragma: no cover
+        pages: list[DartCorporateActionPage] = []
+        for corp_code in codes:
+            for endpoint in _CORPORATE_ACTION_ENDPOINTS:
+                try:
+                    payload = self._request_validated(
+                        endpoint,
+                        {
+                            "corp_code": corp_code,
+                            "bgn_de": start.strftime("%Y%m%d"),
+                            "end_de": end.strftime("%Y%m%d"),
+                        },
+                    )
+                except DartApiError as exc:  # pragma: no cover
+                    raise PITDataError(  # pragma: no cover
+                        f"unexpected OpenDART status for {endpoint} {corp_code}: {exc}"
+                    ) from exc
+                status = str(payload.get("status") or "")
+                if status not in (OK_DART_STATUS, EMPTY_DART_STATUS):
+                    raise PITDataError(  # pragma: no cover
+                        f"unexpected OpenDART status {status!r} for {endpoint} {corp_code}"
+                    )
+                raw = payload.get("list", [])
+                records = tuple(dict(item) for item in raw if isinstance(item, dict)) if isinstance(raw, list) else ()
+                pages.append(
+                    DartCorporateActionPage(
+                        endpoint=endpoint, corp_code=corp_code, status=status, records=records
+                    )
+                )
+        return tuple(pages)
 
     def load_corp_code_records(self) -> tuple[DartCorpCodeRecord, ...]:
         import re as _re
