@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -29,6 +30,82 @@ class LegacyInventoryItem:
 @dataclass(frozen=True, slots=True)
 class LegacyInventory:
     entries: tuple[LegacyInventoryItem, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class BronzeRetentionPlan:
+    receipt_count: int
+    total_payload_bytes: int
+    referenced_payload_bytes: int
+    unreferenced_payload_bytes: int
+    referenced_hashes: tuple[str, ...]
+    unreferenced_hashes: tuple[str, ...]
+    deletion_eligible: bool
+    blocking_reasons: tuple[str, ...]
+
+
+def plan_bronze_retention(
+    *, bronze_root: Path, provenance_roots: tuple[Path, ...], read_size: int = 65536
+) -> BronzeRetentionPlan:
+    if not isinstance(read_size, int) or isinstance(read_size, bool) or read_size < 1:
+        raise ValueError("read_size must be a positive integer")
+    bronze = Path(bronze_root)
+    sizes: dict[str, int] = {}
+    if bronze.exists():
+        for receipt_path in sorted(bronze.rglob("receipt.json")):
+            meta = json.loads(receipt_path.read_text(encoding="utf-8"))
+            content_hash = str(meta.get("content_hash", ""))
+            payload_path = receipt_path.parent / "payload.json"
+            size = payload_path.stat().st_size if payload_path.exists() else 0
+            sizes.setdefault(content_hash, size)
+    candidates = tuple(sorted(sizes))
+    candidate_pattern = (
+        re.compile(
+            r"(?<![0-9a-fA-F])(?:" + "|".join(re.escape(candidate) for candidate in candidates if candidate) + r")(?![0-9a-fA-F])"
+        )
+        if any(candidates)
+        else None
+    )
+    found: set[str] = set()
+    blocking: list[str] = ["generation_gc_not_certified"]
+    for root in provenance_roots:
+        base = Path(root)
+        if not base.exists():
+            continue
+        for provenance_path in sorted(base.rglob("*.json")):
+            try:
+                handle = provenance_path.open("r", encoding="utf-8")
+            except OSError:
+                blocking.append(f"unreadable_provenance:{provenance_path.as_posix()}")
+                continue
+            with handle:
+                tail = ""
+                while True:
+                    try:
+                        chunk = handle.read(read_size)
+                    except (OSError, ValueError):
+                        blocking.append(f"unreadable_provenance:{provenance_path.as_posix()}")
+                        break
+                    if not chunk:
+                        break
+                    window = tail + chunk
+                    if candidate_pattern is not None:
+                        found.update(candidate_pattern.findall(window))
+                    tail = window[-63:] if len(window) >= 63 else window
+    referenced = tuple(h for h in candidates if h in found)
+    unreferenced = tuple(h for h in candidates if h not in found)
+    referenced_bytes = sum(sizes[h] for h in referenced)
+    unreferenced_bytes = sum(sizes[h] for h in unreferenced)
+    return BronzeRetentionPlan(
+        receipt_count=len(candidates),
+        total_payload_bytes=referenced_bytes + unreferenced_bytes,
+        referenced_payload_bytes=referenced_bytes,
+        unreferenced_payload_bytes=unreferenced_bytes,
+        referenced_hashes=referenced,
+        unreferenced_hashes=unreferenced,
+        deletion_eligible=False,
+        blocking_reasons=tuple(blocking),
+    )
 
 
 @dataclass(frozen=True, slots=True)
