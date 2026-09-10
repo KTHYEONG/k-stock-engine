@@ -31,6 +31,7 @@
       "tests/unit/data/test_backtest_runner.py",
       "tests/unit/data/test_backtest_sessions.py",
       "tests/unit/data/test_cli.py",
+      "tests/unit/data/test_collection.py",
       "tests/unit/data/test_corporate_action_evidence_diffcover.py",
       "tests/unit/data/test_gold.py",
       "tests/unit/data/test_gold_loader.py",
@@ -45,6 +46,8 @@
       "tests/unit/execution/test_submit_intents.py",
       "tests/unit/features/test_qvef.py",
       "tests/unit/integrations/dart/test_xbrl_standard.py",
+      "tests/unit/integrations/test_dart_client.py",
+      "tests/unit/integrations/test_dart_lifecycle.py",
       "tests/unit/strategy/test_core_strategy.py",
       "tests/unit/strategy/test_universe.py"
     ]
@@ -68,7 +71,10 @@
     "testing": "tests/unit/data/test_cli.py"
   },
   "src/data/collection.py": {
-    "testing": "tests/integration/data/test_collection.py"
+    "testing": [
+      "tests/integration/data/test_collection.py",
+      "tests/unit/data/test_collection.py"
+    ]
   },
   "src/data/collection_checkpoint.py": {
     "testing": "tests/unit/data/test_collection_checkpoint.py"
@@ -239,11 +245,18 @@
     "testing": [
       "tests/unit/data/test_dart_backfill.py",
       "tests/unit/integrations/test_client.py",
-      "tests/unit/integrations/test_dart_client.py"
+      "tests/unit/integrations/test_dart_client.py",
+      "tests/unit/integrations/test_dart_lifecycle.py"
     ]
   },
   "src/integrations/dart/legacy_filing.py": {
     "testing": "tests/unit/integrations/dart/test_legacy_filing.py"
+  },
+  "src/integrations/dart/lifecycle.py": {
+    "testing": [
+      "tests/unit/integrations/test_dart_client.py",
+      "tests/unit/integrations/test_dart_lifecycle.py"
+    ]
   },
   "src/integrations/dart/xbrl.py": {
     "testing": "tests/unit/integrations/dart/test_xbrl.py"
