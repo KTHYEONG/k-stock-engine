@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "BACKTEST_DATA_LIFECYCLE_EFFICIENCY",
+      "date": "2026-09-10",
+      "adr_id": "ADR_20260910_BACKTEST_DATA_LIFECYCLE_EFFICIENCY",
+      "domain": "data_backtest",
+      "title": "Backtest data lifecycle efficiency",
+      "why": "Versioned data roots and global corporate-action exclusion made reproducible 2016 backtests unnecessarily sparse and expensive.",
+      "resolution": "Bind each run to exact Silver and Gold dataset IDs through a manifest and apply event-scoped quarantine while registering the lifecycle decision.",
+      "impact": "Manifest-driven runs preserve reproducibility, reuse clean historical rows, and reduce storage and validation overhead without deleting existing data."
+    },
+    {
       "task_id": "backtest-preparation-20260910",
       "date": "2026-09-10",
       "adr_id": "ADR_20260910_backtest-preparation-20260910",

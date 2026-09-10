@@ -47,6 +47,9 @@
       "tests/unit/strategy/test_universe.py"
     ]
   },
+  "src/data/backtest_run_manifest.py": {
+    "testing": "tests/unit/data/test_backtest_run_manifest.py"
+  },
   "src/data/backtest_runner.py": {
     "testing": "tests/unit/data/test_backtest_runner.py"
   },
@@ -121,10 +124,7 @@
     ]
   },
   "src/data/streaming_normalization.py": {
-    "testing": [
-      "tests/unit/data/test_streaming_normalization.py",
-      "tests/unit/data/test_streaming_stock_normalization.py"
-    ]
+    "testing": "tests/unit/data/test_streaming_normalization.py"
   },
   "src/domain/stock_data.py": {
     "testing": [
