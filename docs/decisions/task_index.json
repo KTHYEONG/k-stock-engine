@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "delisting_lifecycle_data_collection",
+      "date": "2026-09-10",
+      "adr_id": "ADR_20260910_delisting_lifecycle_data_collection",
+      "domain": "data_backtest",
+      "title": "Delisting lifecycle data collection",
+      "why": "2016 KRX 마스터에는 종목 소멸 전이가 있으나 기존 Gold 경로가 PIT lifecycle 정보를 버렸다.",
+      "resolution": "연속 KRX 전이 후보를 KIND 공시로 검증하고 Silver lifecycle 이벤트와 상장폐지 현금화 처리를 백테스트에 연결했다.",
+      "impact": "상장폐지·정리매매 종목을 미래정보 누수 없이 처리하며 2016 백테스트의 불필요한 fail-closed를 줄인다."
+    },
+    {
       "task_id": "BACKTEST_DATA_LIFECYCLE_EFFICIENCY",
       "date": "2026-09-10",
       "adr_id": "ADR_20260910_BACKTEST_DATA_LIFECYCLE_EFFICIENCY",
