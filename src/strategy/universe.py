@@ -111,7 +111,7 @@ def _pit_filter(frame: pl.DataFrame, decision_time: datetime) -> pl.DataFrame:
         return pl.DataFrame(kept)
 
 
-def _dedup_master_frame(frame: pl.DataFrame) -> pl.DataFrame:
+def _dedup_master_frame(frame: pl.DataFrame, *, preserve_pit: bool = False) -> pl.DataFrame:
     """Collapse security_master to one canonical row per instrument_id.
 
     Selects the row with the greatest (available_at, valid_from) without
@@ -123,6 +123,13 @@ def _dedup_master_frame(frame: pl.DataFrame) -> pl.DataFrame:
     sort_cols = [c for c in ["available_at", "valid_from"] if c in frame.columns]
     if len(sort_cols) < 2:
         return frame
+    if preserve_pit:
+        # Daily KRX master snapshots must remain available for historical PIT
+        # resolution; collapse only exact snapshot duplicates, not an entire
+        # instrument's history to the newest row.
+        return frame.sort(sort_cols).unique(
+            subset=["instrument_id", "valid_from"], keep="last", maintain_order=True
+        )
     return frame.sort(sort_cols, descending=[True] * len(sort_cols)).unique(
         subset=["instrument_id"], keep="first", maintain_order=True
     )
@@ -146,7 +153,7 @@ def build_historical_universe(
     )
 
     master_filtered = _pit_filter(security_master, decision_time)
-    master_filtered = _dedup_master_frame(master_filtered)
+    master_filtered = _dedup_master_frame(master_filtered, preserve_pit=True)
     daily_filtered = _pit_filter(daily_market, decision_time)
 
     # Group master rows by instrument_id
