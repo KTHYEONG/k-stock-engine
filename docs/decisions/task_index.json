@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "backtest_lifecycle_completion",
+      "date": "2026-09-10",
+      "adr_id": "ADR_20260910_backtest_lifecycle_completion",
+      "domain": "data_backtest",
+      "title": "Backtest lifecycle completion",
+      "why": "2016 persistent KRX master removals were not source-typed, persisted, or applied before price-discontinuity validation.",
+      "resolution": "Added DART-primary lifecycle evidence collection with immutable Bronze archives, mandatory Silver manifest binding, exact cleanup exemptions, and no-invented-cash delisting handling.",
+      "impact": "2016 backtests retain PIT integrity while lifecycle candidates are auditable and unresolved settlement or merger terms fail closed."
+    },
+    {
       "task_id": "delisting_lifecycle_data_collection",
       "date": "2026-09-10",
       "adr_id": "ADR_20260910_delisting_lifecycle_data_collection",
