@@ -91,6 +91,23 @@ _CORPORATE_ACTIONS_COLUMNS = [
     "source_hash",
 ]
 
+_LIFECYCLE_EVENTS_COLUMNS = [
+    "instrument_id",
+    "ticker",
+    "event_type",
+    "published_at",
+    "available_at",
+    "cleanup_start",
+    "cleanup_end",
+    "last_tradable_session",
+    "delisting_date",
+    "cash_settlement_per_share",
+    "source_url",
+    "source_hash",
+    "evidence_status",
+    "evidence_reason",
+]
+
 
 @dataclass(frozen=True, slots=True)
 class GoldWindowInputs:
@@ -100,6 +117,31 @@ class GoldWindowInputs:
     financial_facts: pl.DataFrame
     corporate_actions: pl.DataFrame
     investor_flow: pl.DataFrame
+
+
+def apply_lifecycle_master_overlay(
+    *, security_master: pl.DataFrame, lifecycle_events: pl.DataFrame
+) -> pl.DataFrame:
+    """Overlay verified lifecycle delisting dates onto known-market master rows.
+
+    The unknown derived row cannot replace market, sector, listing_date, or
+    ordinary availability fields and is never a PIT admission source.
+    """
+    if security_master.is_empty() or lifecycle_events.is_empty():
+        return security_master
+    if "instrument_id" not in set(security_master.columns):
+        return security_master
+    available = set(lifecycle_events.columns)
+    scoped = lifecycle_events
+    if "evidence_status" in available and lifecycle_events.schema.get("evidence_status") == pl.String:
+        scoped = scoped.filter(pl.col("evidence_status") == "verified")
+    if scoped.is_empty():
+        return security_master
+    keys = scoped.select("instrument_id", "delisting_date").unique(maintain_order=True)
+    joined = security_master.join(keys, on="instrument_id", how="left")
+    return joined.with_columns(
+        pl.coalesce(pl.col("delisting_date_right"), pl.col("delisting_date")).alias("delisting_date")
+    ).drop("delisting_date_right")
 
 
 def _compact_master_snapshots(frame: pl.DataFrame) -> pl.DataFrame:
@@ -344,6 +386,17 @@ def load_gold_window_inputs(
         decision_time=certification_time,
         columns=_CORPORATE_ACTIONS_COLUMNS,
     )
+    try:
+        lifecycle_events = _read_full_projected(
+            silver_root=silver_root,
+            table=SilverTable.LIFECYCLE_EVENTS,
+            decision_time=certification_time,
+            columns=_LIFECYCLE_EVENTS_COLUMNS,
+        )
+    except PITDataError:
+        lifecycle_events = pl.DataFrame()
+    # Wiring: apply_lifecycle_master_overlay(security_master=security_master_full, lifecycle_events=lifecycle_events) before __UNKNOWN__ filtering and _compact_master_snapshots
+    security_master_full = apply_lifecycle_master_overlay(security_master=security_master_full, lifecycle_events=lifecycle_events)
     # Guard: prior master/fact records needed for PIT eligibility must be kept.
     if (
         "market" in security_master_full.columns
