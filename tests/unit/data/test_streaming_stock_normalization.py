@@ -641,3 +641,219 @@ def test_refresh_corporate_action_silver_uses_structured_evidence_not_legacy_int
     actual = module.refresh_corporate_action_silver(bronze_root=tmp_path / 'bronze', silver_root=tmp_path / 'silver', artifact_root=tmp_path / 'artifacts', decision_time=listing, daily_market=daily, calendar=SessionCalendar((first, second, listing)))
     assert actual is report
     assert captured['frame'].select('evidence_status').to_series().to_list() == ['verified']
+
+
+def test_stream_items_uses_eager_parser_below_bound(tmp_path, monkeypatch) -> None:
+    from datetime import UTC, datetime
+    import json
+    import src.data.streaming_normalization as mod
+    from src.data.schemas import BronzeReceipt, EvidenceKind
+
+    payload = tmp_path / 'payload.json'
+    payload.write_text(json.dumps({'records': [{'id': 1}, {'id': 2}]}), encoding='utf-8')
+    receipt = BronzeReceipt(EvidenceKind.DAILY_MARKET, 'a' * 64, 'krx:daily-market:2016-01-04', datetime(2016, 1, 5, tzinfo=UTC), datetime(2016, 1, 5, tzinfo=UTC), payload, tmp_path / 'receipt.json')
+    monkeypatch.setattr(mod.shutil, 'which', lambda _name: None)
+
+    assert list(mod._stream_items_for_kind([receipt], batch_size=50000)) == [{'id': 1}, {'id': 2}]
+
+
+def test_stream_items_keeps_jq_for_payload_at_bound(tmp_path, monkeypatch) -> None:
+    from datetime import UTC, datetime
+    import json
+    import src.data.streaming_normalization as mod
+    from src.data.schemas import BronzeReceipt, EvidenceKind
+
+    payload = tmp_path / 'payload.json'
+    payload.write_text(json.dumps({'records': [{'id': 1}], 'padding': 'x' * mod.STREAMING_EAGER_JSON_MAX_BYTES}), encoding='utf-8')
+    receipt = BronzeReceipt(EvidenceKind.DAILY_MARKET, 'b' * 64, 'krx:daily-market:2016-01-04', datetime(2016, 1, 5, tzinfo=UTC), datetime(2016, 1, 5, tzinfo=UTC), payload, tmp_path / 'receipt.json')
+    monkeypatch.setattr(mod, '_read_doc', lambda _path: (_ for _ in ()).throw(AssertionError('large payload was eagerly read')))
+
+    assert list(mod._stream_items_for_kind([receipt], batch_size=1)) == [{'id': 1}]
+
+
+def test_order_streaming_receipts_sorts_known_labels_and_rejects_unbounded_fallback(tmp_path) -> None:
+    from datetime import UTC, datetime
+    import json
+    import pytest
+    from src.data.schemas import BronzeReceipt, EvidenceKind, PITDataError, SilverTable
+    from src.data.streaming_normalization import STREAMING_EAGER_JSON_MAX_BYTES, order_streaming_receipts
+
+    def receipt(name: str, label: str, body: dict[str, object]) -> BronzeReceipt:
+        path = tmp_path / name
+        path.write_text(json.dumps(body), encoding='utf-8')
+        return BronzeReceipt(EvidenceKind.DAILY_MARKET, name[0] * 64, label, datetime(2016, 2, 1, tzinfo=UTC), datetime(2016, 2, 1, tzinfo=UTC), path, tmp_path / (name + '.receipt'))
+
+    later = receipt('b.json', 'krx:daily-market:2016-02-01', {'records': []})
+    earlier = receipt('a.json', 'krx:daily-market:2016-01-04', {'records': []})
+    assert order_streaming_receipts(table=SilverTable.DAILY_MARKET, receipts=(later, earlier)) == (earlier, later)
+    large = receipt('c.json', 'unknown', {'padding': 'x' * STREAMING_EAGER_JSON_MAX_BYTES})
+    with pytest.raises(PITDataError, match='event date'):
+        order_streaming_receipts(table=SilverTable.DAILY_MARKET, receipts=(large,))
+
+
+def test_streaming_writer_flushes_month_tail_and_rejects_regression(tmp_path) -> None:
+    from datetime import UTC, datetime
+    import pytest
+    from src.data.schemas import PITDataError, SilverTable
+    from src.data.streaming_normalization import StreamingSilverWriter
+
+    def row(day: int) -> dict[str, object]:
+        stamp = datetime(2020, 1, day, tzinfo=UTC)
+        return {'session': stamp, 'instrument_id': f'KRX:{day:06d}', 'open': 1.0, 'high': 1.0, 'low': 1.0, 'close': 1.0, 'volume': 1.0, 'trading_value': 1.0, 'market_cap': 1.0, 'shares_outstanding': 1.0, 'available_at': stamp, 'source_hash': 'source'}
+
+    writer = StreamingSilverWriter(tmp_path / 'staging', table=SilverTable.DAILY_MARKET, batch_size=3, source_hashes=('source',))
+    writer.append(month='2020-01', row=row(2))
+    writer.append(month='2020-02', row=row(3))
+    assert (tmp_path / 'staging' / 'daily_market' / 'year=2020' / 'month=01' / 'part-00000.parquet').exists()
+    with pytest.raises(PITDataError, match='month order'):
+        writer.append(month='2020-01', row=row(4))
+
+
+def test_streaming_writer_reuses_digest_checked_sealed_month_only(tmp_path) -> None:
+    from datetime import UTC, datetime
+    import json
+    from src.data.schemas import SilverTable
+    from src.data.streaming_normalization import StreamingSilverWriter
+
+    def row(month: int, day: int) -> dict[str, object]:
+        stamp = datetime(2020, month, day, tzinfo=UTC)
+        return {'session': stamp, 'instrument_id': 'KRX:000001', 'open': 1.0, 'high': 1.0, 'low': 1.0, 'close': 1.0, 'volume': 1.0, 'trading_value': 1.0, 'market_cap': 1.0, 'shares_outstanding': 1.0, 'available_at': stamp, 'source_hash': 'source'}
+
+    root = tmp_path / 'staging'
+    first = StreamingSilverWriter(root, table=SilverTable.DAILY_MARKET, batch_size=2, source_hashes=('source',))
+    first.append(month='2020-01', row=row(1, 2))
+    first.append(month='2020-02', row=row(2, 3))
+    manifest = json.loads((root / 'daily_market' / 'staging_manifest.json').read_text())
+    assert manifest['verified'] is False
+    assert manifest['sealed_months'] == ['2020-01']
+    resumed = StreamingSilverWriter(root, table=SilverTable.DAILY_MARKET, batch_size=2, source_hashes=('source',))
+    assert resumed.has_reusable_manifest is True
+    changed = StreamingSilverWriter(root, table=SilverTable.DAILY_MARKET, batch_size=2, source_hashes=('changed',))
+    assert changed.has_reusable_manifest is False
+
+
+def test_order_streaming_receipts_uses_small_payload_event_date_fallback(tmp_path) -> None:
+    from datetime import UTC, datetime
+    import json
+    from src.data.schemas import BronzeReceipt, EvidenceKind, SilverTable
+    from src.data.streaming_normalization import order_streaming_receipts
+
+    fallback_payload = tmp_path / 'fallback.json'
+    fallback_payload.write_text(json.dumps({'session': '2016-01-04'}), encoding='utf-8')
+    known_payload = tmp_path / 'known.json'
+    known_payload.write_text(json.dumps({'records': []}), encoding='utf-8')
+    stamp = datetime(2016, 2, 1, tzinfo=UTC)
+    known = BronzeReceipt(EvidenceKind.DAILY_MARKET, 'd' * 64, 'krx:daily-market:2016-01-05', stamp, stamp, known_payload, tmp_path / 'known.receipt')
+    fallback = BronzeReceipt(EvidenceKind.DAILY_MARKET, 'e' * 64, 'unlabelled-source', stamp, stamp, fallback_payload, tmp_path / 'fallback.receipt')
+
+    assert order_streaming_receipts(table=SilverTable.DAILY_MARKET, receipts=(known, fallback)) == (fallback, known)
+    alternate_payload = tmp_path / 'alternate.json'
+    alternate_payload.write_text(json.dumps({'session': 'not-a-date', 'date': '2016-01-03'}), encoding='utf-8')
+    alternate = BronzeReceipt(EvidenceKind.DAILY_MARKET, 'f' * 64, 'unlabelled-source', stamp, stamp, alternate_payload, tmp_path / 'alternate.receipt')
+    assert order_streaming_receipts(table=SilverTable.DAILY_MARKET, receipts=(fallback, alternate)) == (alternate, fallback)
+
+
+def test_order_streaming_receipts_rejects_missing_malformed_and_dateless_fallback(tmp_path) -> None:
+    from datetime import UTC, datetime
+    import pytest
+    from src.data.schemas import BronzeReceipt, EvidenceKind, PITDataError, SilverTable
+    from src.data.streaming_normalization import order_streaming_receipts
+
+    stamp = datetime(2016, 2, 1, tzinfo=UTC)
+    def receipt(name: str) -> BronzeReceipt:
+        return BronzeReceipt(EvidenceKind.DAILY_MARKET, name[0] * 64, 'unknown', stamp, stamp, tmp_path / name, tmp_path / (name + '.receipt'))
+
+    missing = receipt('missing.json')
+    with pytest.raises(PITDataError, match='missing event date'):
+        order_streaming_receipts(table=SilverTable.DAILY_MARKET, receipts=(missing,))
+    malformed = receipt('malformed.json')
+    malformed.payload_path.write_text('{not-json', encoding='utf-8')
+    with pytest.raises(PITDataError, match='missing event date'):
+        order_streaming_receipts(table=SilverTable.DAILY_MARKET, receipts=(malformed,))
+    dateless = receipt('dateless.json')
+    dateless.payload_path.write_text('{}', encoding='utf-8')
+    with pytest.raises(PITDataError, match='missing event date'):
+        order_streaming_receipts(table=SilverTable.DAILY_MARKET, receipts=(dateless,))
+
+
+def test_streaming_writer_does_not_reuse_active_month_batch_before_boundary(tmp_path) -> None:
+    from datetime import UTC, datetime
+    import json
+    from src.data.schemas import SilverTable
+    from src.data.streaming_normalization import StreamingSilverWriter
+
+    def row(month: int, day: int) -> dict[str, object]:
+        stamp = datetime(2020, month, day, tzinfo=UTC)
+        return {'session': stamp, 'instrument_id': f'KRX:{month:02d}{day:04d}', 'open': 1.0, 'high': 1.0, 'low': 1.0, 'close': 1.0, 'volume': 1.0, 'trading_value': 1.0, 'market_cap': 1.0, 'shares_outstanding': 1.0, 'available_at': stamp, 'source_hash': 'source'}
+
+    root = tmp_path / 'staging'
+    writer = StreamingSilverWriter(root, table=SilverTable.DAILY_MARKET, batch_size=1, source_hashes=('source',))
+    writer.append(month='2020-01', row=row(1, 2))
+    manifest = json.loads((root / 'daily_market' / 'staging_manifest.json').read_text())
+    assert manifest['sealed_months'] == []
+    assert StreamingSilverWriter(root, table=SilverTable.DAILY_MARKET, batch_size=1, source_hashes=('source',)).has_reusable_manifest is False
+    writer.append(month='2020-02', row=row(2, 3))
+    manifest = json.loads((root / 'daily_market' / 'staging_manifest.json').read_text())
+    assert manifest['sealed_months'] == ['2020-01']
+    assert StreamingSilverWriter(root, table=SilverTable.DAILY_MARKET, batch_size=1, source_hashes=('source',)).has_reusable_manifest is True
+    writer.close()
+    manifest = json.loads((root / 'daily_market' / 'staging_manifest.json').read_text())
+    assert manifest['sealed_months'] == ['2020-01', '2020-02']
+
+
+def test_stream_items_fail_closed_for_missing_malformed_and_scalar_records(tmp_path) -> None:
+    from datetime import UTC, datetime
+    import pytest
+    from src.data.schemas import BronzeReceipt, EvidenceKind, PITDataError
+    from src.data.streaming_normalization import _stream_items_for_kind
+
+    stamp = datetime(2016, 1, 5, tzinfo=UTC)
+    def receipt(name: str) -> BronzeReceipt:
+        payload = tmp_path / name
+        return BronzeReceipt(EvidenceKind.DAILY_MARKET, name[0] * 64, 'krx:daily-market:2016-01-04', stamp, stamp, payload, tmp_path / (name + '.receipt'))
+
+    missing = receipt('missing.json')
+    with pytest.raises(PITDataError, match='malformed Bronze JSON'):
+        list(_stream_items_for_kind([missing], batch_size=1))
+    malformed = receipt('malformed.json')
+    malformed.payload_path.write_text('{not-json', encoding='utf-8')
+    with pytest.raises(PITDataError, match='malformed Bronze JSON'):
+        list(_stream_items_for_kind([malformed], batch_size=1))
+    scalar = receipt('scalar.json')
+    scalar.payload_path.write_text('{"records":[1]}', encoding='utf-8')
+    with pytest.raises(PITDataError, match='malformed record'):
+        list(_stream_items_for_kind([scalar], batch_size=1))
+
+
+def test_stream_normalize_wires_ordering_for_both_stream_tables(tmp_path, monkeypatch) -> None:
+    from datetime import UTC, datetime
+    import pytest
+    import src.data.streaming_normalization as mod
+    from src.data.schemas import BronzeReceipt, EvidenceKind, PITDataError, SilverTable
+
+    stamp = datetime(2016, 1, 5, tzinfo=UTC)
+    grouped: dict[EvidenceKind, tuple[BronzeReceipt, ...]] = {}
+    for index, kind in enumerate(EvidenceKind):
+        payload = tmp_path / f'{kind.value}.json'
+        if kind is EvidenceKind.DAILY_MARKET:
+            payload.write_text('{"records": []}', encoding='utf-8')
+            label = 'krx:daily-market:2016-01-04'
+        elif kind is EvidenceKind.SECURITY_MASTER:
+            payload.write_text('{"records": []}', encoding='utf-8')
+            label = 'KRX:historical-master:2016-01-04'
+        else:
+            payload.write_text('{}', encoding='utf-8')
+            label = f'fixture:{kind.value}'
+        grouped[kind] = (BronzeReceipt(kind, f'{index:064x}', label, stamp, stamp, payload, tmp_path / f'{kind.value}.receipt'),)
+    calls: list[SilverTable] = []
+    def stop_after_second_order(*, table: SilverTable, receipts: tuple[BronzeReceipt, ...]) -> tuple[BronzeReceipt, ...]:
+        calls.append(table)
+        if len(calls) == 2:
+            raise PITDataError('ordering-wiring-stop')
+        return receipts
+    monkeypatch.setattr(mod, 'discover_verified_bronze_receipts', lambda **_kwargs: grouped)
+    monkeypatch.setattr(mod, 'order_streaming_receipts', stop_after_second_order)
+
+    with pytest.raises(PITDataError, match='ordering-wiring-stop'):
+        mod.stream_normalize_stock_evidence(bronze_root=tmp_path / 'bronze', silver_root=tmp_path / 'silver', artifact_root=tmp_path / 'artifacts', decision_time=stamp)
+    assert calls == [SilverTable.DAILY_MARKET, SilverTable.SECURITY_MASTER]

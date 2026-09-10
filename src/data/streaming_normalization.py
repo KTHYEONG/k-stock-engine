@@ -10,11 +10,12 @@ import multiprocessing
 import re
 import shutil
 import subprocess
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from datetime import UTC, date, datetime, time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from queue import Empty
-from typing import Any
+from typing import Any, Final
 
 import polars as pl
 
@@ -39,6 +40,8 @@ _STREAM_KINDS: dict[SilverTable, EvidenceKind] = {
 }
 
 _CORPORATE_ACTION_READ_SIZE = 64 * 1024
+
+STREAMING_EAGER_JSON_MAX_BYTES: Final[int] = 1_000_000
 
 
 def _trim_streaming_allocator() -> None:
@@ -198,6 +201,7 @@ class StreamingSilverWriter:
         self._fingerprint_month: str | None = None
         self._checkpoint = StreamingNormalizationCheckpoint(self.root.parent / "checkpoints")
         self._verified_months: set[str] = set()
+        self._sealed_months: set[str] = set()
         self._load_reusable_months()
 
     def _load_reusable_months(self) -> None:
@@ -211,14 +215,16 @@ class StreamingSilverWriter:
         if (
             not isinstance(manifest, dict)
             or manifest.get("schema_version") != self.schema_version
-            or manifest.get("verified") is not True
             or list(manifest.get("source_hashes", [])) != list(self.source_hashes)
         ):
             return
         parts = manifest.get("parts")
         if not isinstance(parts, dict):
             return
-        for month, entries in parts.items():
+        sealed = manifest.get("sealed_months")
+        months = list(sealed) if isinstance(sealed, list) else sorted(parts)
+        for month in months:
+            entries = parts[str(month)]
             checkpoint_verified = self._checkpoint.is_verified(
                 table=self.table.value,
                 month=str(month),
@@ -255,6 +261,7 @@ class StreamingSilverWriter:
                 self._part_counts[key] = counts
                 self._row_counts[key] = sum(counts)
                 self._verified_months.add(key)
+                self._sealed_months.add(key)
 
     @property
     def has_reusable_manifest(self) -> bool:
@@ -265,12 +272,19 @@ class StreamingSilverWriter:
         return self.root / self.table.value / f"year={year}" / f"month={mon}"
 
     def append(self, *, month: str, row: dict[str, Any]) -> None:
+        if self._fingerprint_month is not None and month < self._fingerprint_month:
+            raise PITDataError(f"month order regression {self._fingerprint_month} -> {month}; certification blocked")
         if month in self._verified_months:
             return
         # Source pages are processed in month order in the normal path. Keep
         # duplicate-detection state only for the active month; retaining keys
         # for the full multi-year history defeats bounded streaming memory.
         if month != self._fingerprint_month:
+            if self._fingerprint_month is not None and self._buffers.get(self._fingerprint_month):
+                self._flush_month(self._fingerprint_month)
+            if self._fingerprint_month is not None:
+                self._sealed_months.add(self._fingerprint_month)
+                self._persist_staging_manifest()
             self._master_fingerprints.clear()
             self._daily_fingerprints.clear()
             self._fingerprint_month = month
@@ -404,6 +418,7 @@ class StreamingSilverWriter:
             "schema_version": self.schema_version,
             "source_hashes": list(self.source_hashes),
             "months": sorted(self._part_digests),
+            "sealed_months": sorted(self._sealed_months),
             "parts": {month: [{"part_index": idx, "row_count": count, "part_digest": digest} for idx, (digest, count) in enumerate(zip(self._part_digests[month], self._part_counts[month], strict=True))] for month in sorted(self._part_digests)},
             "row_counts": dict(self._row_counts),
             "root_hash": streamed_dataset_root_hash(entries),
@@ -418,6 +433,8 @@ class StreamingSilverWriter:
         for month in sorted(self._buffers):
             if self._buffers[month]:
                 self._flush_month(month)
+            if month == self._fingerprint_month:
+                self._sealed_months.add(month)
         if not self._part_digests:
             raise PITDataError(f"incomplete month for {self.table.value}; certification blocked")
         manifest = self._manifest(verified=True)
@@ -505,23 +522,62 @@ def _discover_receipts(bronze_root: Path) -> dict[EvidenceKind, list[BronzeRecei
     return found
 
 
+_LABEL_DATE_SUFFIX = re.compile(r"(\d{4}-\d{2}-\d{2})\s*$")
+
+
+def _receipt_event_date(receipt: BronzeReceipt) -> date:
+    matched = _LABEL_DATE_SUFFIX.search(str(receipt.source_path))
+    if matched:
+        return date.fromisoformat(matched.group(1))
+    try:
+        size = receipt.payload_path.stat().st_size
+    except OSError as exc:
+        raise PITDataError(f"missing event date for {receipt.source_path}; certification blocked") from exc
+    if size >= STREAMING_EAGER_JSON_MAX_BYTES:
+        raise PITDataError(f"missing event date for {receipt.source_path}; certification blocked")
+    try:
+        payload = _read_doc(receipt.payload_path)
+    except (OSError, ValueError) as exc:
+        raise PITDataError(f"missing event date for {receipt.source_path}; certification blocked") from exc
+    if isinstance(payload, dict):
+        for key in ("session", "date", "as_of", "price_date", "valid_from", "BAS_DD", "basDd"):
+            value = payload.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                return _as_krx_datetime(value).date()
+            except PITDataError:
+                continue
+    raise PITDataError(f"missing event date for {receipt.source_path}; certification blocked")
+
+
+def order_streaming_receipts(
+    *, table: SilverTable, receipts: tuple[BronzeReceipt, ...]
+) -> tuple[BronzeReceipt, ...]:
+    _ = table
+    keyed = [(_receipt_event_date(item), item.retrieved_at, item.content_hash, item) for item in receipts]
+    keyed.sort(key=lambda entry: (entry[0], entry[1], entry[2]))
+    return tuple(entry[3] for entry in keyed)
+
+
 def _stream_items_for_kind(
     receipts: list[BronzeReceipt], *, batch_size: int
-) -> Any:
+) -> Iterator[dict[str, Any]]:
     for receipt in receipts:
-        # Aggregated manifests are intentionally row-free.  Avoid spawning a
-        # jq process for each small manifest while preserving true streaming
-        # for large source payloads.
         try:
-            if receipt.payload_path.stat().st_size < 1_000_000:
-                small_payload = _read_doc(receipt.payload_path)
-                if isinstance(small_payload, dict) and not any(
-                    isinstance(small_payload.get(key), list)
-                    for key in ("records", "intervals", "list")
-                ):
-                    continue
-        except (OSError, ValueError) as exc:
+            payload_size = receipt.payload_path.stat().st_size
+        except OSError as exc:
             raise PITDataError("malformed Bronze JSON; certification blocked") from exc
+        if payload_size < STREAMING_EAGER_JSON_MAX_BYTES:
+            try:
+                small_payload = _read_doc(receipt.payload_path)
+            except (OSError, ValueError) as exc:
+                raise PITDataError("malformed Bronze JSON; certification blocked") from exc
+            for item in _extract_items(small_payload):
+                if not isinstance(item, dict):
+                    raise PITDataError("malformed record; certification blocked")
+                yield item
+            continue
         # jq emits one array element per line without materializing the JSON
         # document; the Python side retains only the configured batch.
         try:
@@ -737,6 +793,20 @@ def _parse_exact_int(value: Any, *, field: str) -> int:
     if not re.fullmatch(r"-?\d+", text):
         raise PITDataError(f"ambiguous OpenDART share basis for {field}; certification blocked")  # pragma: no cover
     return int(text)
+
+
+def _parse_exact_decimal(value: Any, *, field: str) -> Decimal:
+    """Parse DART allocation ratios, which may be fractional (e.g. ``0.5``)."""
+    text = str(value).replace(",", "").strip()
+    if not re.fullmatch(r"-?(?:\d+(?:\.\d+)?|\.\d+)", text):
+        raise PITDataError(f"ambiguous OpenDART share basis for {field}; certification blocked")  # pragma: no cover
+    try:
+        parsed = Decimal(text)
+    except InvalidOperation as exc:  # pragma: no cover
+        raise PITDataError(f"ambiguous OpenDART share basis for {field}; certification blocked") from exc
+    if not parsed.is_finite():  # pragma: no cover
+        raise PITDataError(f"ambiguous OpenDART share basis for {field}; certification blocked")
+    return parsed
 
 
 def _parse_opendart_date(value: Any) -> date:
@@ -977,7 +1047,7 @@ def resolve_opendart_corporate_action_records(
                 try:
                     basis = _parse_exact_int(record.get("bfic_tisstk_ostk"), field="bfic_tisstk_ostk")
                     existing = _parse_exact_int(record.get("nstk_ostk_cnt"), field="nstk_ostk_cnt")
-                    alloc = _parse_exact_int(record.get("nstk_ascnt_ps_ostk"), field="nstk_ascnt_ps_ostk")
+                    alloc = _parse_exact_decimal(record.get("nstk_ascnt_ps_ostk"), field="nstk_ascnt_ps_ostk")
                 except PITDataError:
                     raise
                 instrument_id, provenance = _resolve_instrument_with_page(
@@ -1645,19 +1715,11 @@ def stream_normalize_stock_evidence(
     if missing:
         names = sorted(kind.value for kind in missing)
         raise PITDataError(f"missing required evidence: {', '.join(names)} (investor_flow, financial_facts)")
+    daily_selected = select_streaming_receipts(kind=EvidenceKind.DAILY_MARKET, receipts=tuple(grouped[EvidenceKind.DAILY_MARKET]))
+    master_selected = select_streaming_receipts(kind=EvidenceKind.SECURITY_MASTER, receipts=tuple(grouped[EvidenceKind.SECURITY_MASTER]))
     selected_streaming: dict[EvidenceKind, list[BronzeReceipt]] = {
-        EvidenceKind.DAILY_MARKET: list(
-            select_streaming_receipts(
-                kind=EvidenceKind.DAILY_MARKET,
-                receipts=tuple(grouped[EvidenceKind.DAILY_MARKET]),
-            )
-        ),
-        EvidenceKind.SECURITY_MASTER: list(
-            select_streaming_receipts(
-                kind=EvidenceKind.SECURITY_MASTER,
-                receipts=tuple(grouped[EvidenceKind.SECURITY_MASTER]),
-            )
-        ),
+        EvidenceKind.DAILY_MARKET: list(order_streaming_receipts(table=SilverTable.DAILY_MARKET, receipts=tuple(daily_selected))),
+        EvidenceKind.SECURITY_MASTER: list(order_streaming_receipts(table=SilverTable.SECURITY_MASTER, receipts=tuple(master_selected))),
     }
 
     _store = _BronzeStore(Path(bronze_root))
