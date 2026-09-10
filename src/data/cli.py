@@ -131,16 +131,17 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     p_run = sub.add_parser("run-backtest", help="Run Champion backtest from Gold")
     p_run.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
-    p_run.add_argument("--gold-root", type=Path, default=Path("data/gold/stocks"))
-    p_run.add_argument("--silver-root", type=Path, default=Path("data/silver/stocks"))
-    p_run.add_argument("--validation-start", type=str, default="2016-01-04")
-    p_run.add_argument("--validation-end", type=str, default="2016-12-30")
+    p_run.add_argument("--gold-root", type=Path, default=None)
+    p_run.add_argument("--silver-root", type=Path, default=None)
+    p_run.add_argument("--validation-start", type=str, default=None)
+    p_run.add_argument("--validation-end", type=str, default=None)
     p_run.add_argument("--smoke-symbol", type=str, default=None)
     p_run.add_argument("--gold-dataset-id", type=str, default=None)
+    p_run.add_argument("--backtest-run-manifest", type=Path, default=None)
     p_run.add_argument("--initial-cash", type=float, default=100000000.0)
     p_run.add_argument("--scenario", type=str, default="base")
     p_run.add_argument("--ledger-id", type=str, default="champion-2016")
-    p_run.add_argument("--strategy-id", choices=("core-v1", "champion-v1"), default="core-v1")
+    p_run.add_argument("--strategy-id", choices=("core-v1", "champion-v1"), default=None)
 
     p_rebuild = sub.add_parser("rebuild-data", help="Prepare verified rebuild before collection")
     # add_argument("rebuild-data", help="historical pipeline subcommand marker")
@@ -332,29 +333,71 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     )
     from src.core.instruments import AssetKind, Instrument
     from src.core.time import SessionCalendar
+    from src.data.backtest_run_manifest import load_backtest_run_manifest
     from src.data.backtest_runner import run_managed_backtest
     from src.data.backtest_sessions import build_backtest_sessions
     from src.data.schemas import PITDataError, SilverTable
-    from src.data.silver import latest_silver_dataset_path
+    from src.data.silver import latest_silver_dataset_path, load_silver_table_by_dataset_id, silver_dataset_path_by_id
     from src.data.snapshot import PITSnapshotRepository
     from src.engine.backtest import BacktestConfig
     from src.engine.decision import DecisionContext
     from src.engine.fill_model import ExecutionScenario, HistoricalFillModel
     from src.execution.domain.intents import TradeIntent
 
-    silver_root = Path(getattr(args, "silver_root", "data/silver/stocks"))
+    selected_silver_root = getattr(args, "silver_root", None)
+    selected_gold_root = getattr(args, "gold_root", None)
+    selected_validation_start = getattr(args, "validation_start", None)
+    selected_validation_end = getattr(args, "validation_end", None)
+    selected_strategy_id = getattr(args, "strategy_id", None)
+    silver_root = Path(selected_silver_root or "data/silver/stocks")
     artifact_root = Path(getattr(args, "artifact_root", "data/artifacts"))
-    gold_root = Path(getattr(args, "gold_root", "data/gold/stocks"))
-    val_start = date.fromisoformat(str(getattr(args, "validation_start", "2016-01-04")))
-    val_end = date.fromisoformat(str(getattr(args, "validation_end", "2016-12-30")))
+    gold_root = Path(selected_gold_root or "data/gold/stocks")
+    val_start = date.fromisoformat(str(selected_validation_start or "2016-01-04"))
+    val_end = date.fromisoformat(str(selected_validation_end or "2016-12-30"))
     smoke_symbol = getattr(args, "smoke_symbol", None)
     gold_dataset_id = getattr(args, "gold_dataset_id", None)
+    manifest_arg = getattr(args, "backtest_run_manifest", None)
     scores_by_session: dict[date, tuple[Any, ...]] | None = None
     scores_frame: Any = None
+    universe_frame: Any = None
     strategy: Any = None
+    run_manifest: Any = None
 
-    strategy_id = str(getattr(args, "strategy_id", "core-v1"))
-    if not smoke_symbol and strategy_id != "core-v1":
+    strategy_id = str(selected_strategy_id or "core-v1")
+    if not smoke_symbol:
+        if manifest_arg is None:
+            raise PITDataError("run-backtest requires --backtest-run-manifest for manifest-bound backtest")
+        run_manifest = load_backtest_run_manifest(Path(manifest_arg))
+        if selected_silver_root is not None and str(Path(selected_silver_root)) != run_manifest.silver_root:
+            raise PITDataError("--silver-root conflicts with --backtest-run-manifest selection")
+        if selected_gold_root is not None and str(Path(selected_gold_root)) != run_manifest.gold_root:
+            raise PITDataError("--gold-root conflicts with --backtest-run-manifest selection")
+        if gold_dataset_id is not None and str(gold_dataset_id) != run_manifest.gold_dataset_id:
+            raise PITDataError("--gold-dataset-id conflicts with --backtest-run-manifest selection")
+        if selected_validation_start is not None and val_start != run_manifest.validation_start:
+            raise PITDataError("--validation-start conflicts with --backtest-run-manifest selection")
+        if selected_validation_end is not None and val_end != run_manifest.validation_end:
+            raise PITDataError("--validation-end conflicts with --backtest-run-manifest selection")
+        if selected_strategy_id is not None and strategy_id != run_manifest.strategy_id:
+            raise PITDataError("--strategy-id conflicts with --backtest-run-manifest selection")
+        silver_root = Path(run_manifest.silver_root)
+        gold_root = Path(run_manifest.gold_root)
+        gold_dataset_id = run_manifest.gold_dataset_id
+        val_start = run_manifest.validation_start
+        val_end = run_manifest.validation_end
+        strategy_id = run_manifest.strategy_id
+        from src.data.gold_artifacts import load_gold_artifact_frames, resolve_gold_artifact_bundle
+
+        gold_decision_time = datetime.now(UTC)
+        bundle = resolve_gold_artifact_bundle(
+            gold_root=gold_root,
+            dataset_id=str(gold_dataset_id),
+            decision_time=gold_decision_time,
+        )
+        universe_frame, _qvef_frame, scores_frame = load_gold_artifact_frames(
+            bundle=bundle, decision_time=gold_decision_time
+        )
+    if not smoke_symbol and strategy_id != "core-v1" and scores_frame is None:
         _gid = str(gold_dataset_id) if gold_dataset_id is not None else ""
         if not _gid.strip() or "/" in _gid or "\\" in _gid or ".." in _gid:
             raise PITDataError("run-backtest requires resolved Gold artifact; missing --gold-dataset-id")
@@ -367,7 +410,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
             decision_time=gold_decision_time,
         )
         scores_frame = load_gold_artifact_frames(bundle=bundle, decision_time=gold_decision_time)[2]
-    if not smoke_symbol and (not gold_root.exists() or not (gold_root / "universe").exists()):
+    if not smoke_symbol and run_manifest is None and (not gold_root.exists() or not (gold_root / "universe").exists()):
         raise PITDataError("run-backtest requires resolved Gold artifact, session repository, config, and strategy")
 
     initial_cash = float(getattr(args, "initial_cash", 100_000_000.0))
@@ -375,12 +418,20 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     scenario = ExecutionScenario.BASE if scenario_str == "base" else ExecutionScenario.IDEAL
 
     # Load calendar and normalize session times to 09:00:00 KST
-    calendar_df = _load_silver_table(silver_root, SilverTable.CALENDAR)
+    if run_manifest is not None:
+        calendar_df = load_silver_table_by_dataset_id(
+            root=silver_root,
+            table=SilverTable.CALENDAR,
+            dataset_id=str(run_manifest.silver_dataset_ids["calendar"]),
+            decision_time=datetime.now(UTC),
+        )
+    else:
+        calendar_df = _load_silver_table(silver_root, SilverTable.CALENDAR)
     raw_sessions = tuple(sorted(calendar_df["session"].to_list()))
     cal_sessions = tuple(s.replace(hour=9, minute=0, second=0) for s in raw_sessions)
     calendar = SessionCalendar(cal_sessions)
 
-    if strategy is None and scores_frame is not None:
+    if strategy is None and scores_frame is not None and strategy_id != "core-v1":
         scores_by_session = _champion_scores_by_session(scores_frame)
         strategy = ChampionStrategy(scores_by_session=scores_by_session, calendar=calendar)
 
@@ -397,11 +448,19 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     coverage_end = cal_sessions[end_idx + 2] if end_idx + 2 < len(cal_sessions) else next_session
 
     # Load market bars
-    dm_root = latest_silver_dataset_path(
-        root=silver_root,
-        table=SilverTable.DAILY_MARKET,
-        decision_time=datetime.now(UTC),
-    )
+    if run_manifest is not None:
+        dm_root = silver_dataset_path_by_id(
+            root=silver_root,
+            table=SilverTable.DAILY_MARKET,
+            dataset_id=str(run_manifest.silver_dataset_ids["daily_market"]),
+            decision_time=datetime.now(UTC),
+        )
+    else:
+        dm_root = latest_silver_dataset_path(
+            root=silver_root,
+            table=SilverTable.DAILY_MARKET,
+            decision_time=datetime.now(UTC),
+        )
     parquet_files = list(dm_root.rglob("*.parquet"))
     if not parquet_files:
         raise PITDataError("missing daily market parquet files")
@@ -445,7 +504,21 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         {SilverTable.DAILY_MARKET: daily_market_pit}, root=silver_root
     )
 
-    if smoke_symbol:
+    if run_manifest is not None:
+        manifest_time = datetime.now(UTC)
+        security_master = load_silver_table_by_dataset_id(
+            root=silver_root,
+            table=SilverTable.SECURITY_MASTER,
+            dataset_id=str(run_manifest.silver_dataset_ids["security_master"]),
+            decision_time=manifest_time,
+        )
+        corporate_actions = load_silver_table_by_dataset_id(
+            root=silver_root,
+            table=SilverTable.CORPORATE_ACTIONS,
+            dataset_id=str(run_manifest.silver_dataset_ids["corporate_actions"]),
+            decision_time=manifest_time,
+        )
+    elif smoke_symbol:
         # Keep the production smoke path bounded even when the historical
         # Silver tables contain all instruments.  Unit fixtures often expose
         # only a daily-market directory, so retain the regular loader as a
@@ -523,13 +596,12 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
 
         strategy = SmokeStrategy()
     elif strategy is None and strategy_id == 'core-v1' and not smoke_symbol:
-        eligible_by_session: dict[date, tuple[str, ...]] = {}
-        universe_root = gold_root / "universe"
-        if universe_root.exists():
-            u_files = list(universe_root.rglob("*.parquet"))
-            if u_files:
-                u_frame = pl.scan_parquet(u_files).collect()
-                eligible_by_session = _eligible_universe_by_session(u_frame)
+        from src.data.gold_artifacts import load_gold_artifact_frames, resolve_gold_artifact_bundle
+
+        _ = (resolve_gold_artifact_bundle, load_gold_artifact_frames)
+        if universe_frame is None:
+            raise PITDataError("run-backtest requires selected Gold universe for core-v1")
+        eligible_by_session = _eligible_universe_by_session(universe_frame)
         # The Gold universe is built before the final corporate-action and
         # PIT-master resolution.  Intersect it with the actually materialized
         # session bars so excluded/temporarily unavailable symbols cannot
@@ -544,41 +616,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         }
         strategy = CoreStrategy(eligible_by_session=eligible_by_session, calendar=calendar)
     elif strategy is None:
-        eligible_set: set[str] = set()
-        universe_root = gold_root / "universe"
-        if universe_root.exists():
-            u_files = list(universe_root.rglob("*.parquet"))
-            if u_files:
-                u_df = pl.scan_parquet(u_files).filter(pl.col("eligible")).collect()
-                if u_df.height > 0:
-                    eligible_set = set(u_df["instrument_id"].to_list())
-
-        class UniverseStrategy:
-            def decide(self, context: DecisionContext) -> tuple[TradeIntent, ...]:
-                if not eligible_set:
-                    return ()
-                per_stock = (initial_cash * 0.8) / len(eligible_set)
-                current_open = context.decision_time.replace(hour=9, minute=0, second=0)
-                idx = sessions_ordered.index(current_open)
-                if idx == 0 and idx + 1 < len(sessions_ordered):
-                    return tuple(
-                        TradeIntent(
-                            intent_id=f"champion-buy-{sym}",
-                            asset_kind=AssetKind.STOCK,
-                            instrument_id=sym,
-                            target_value=per_stock,
-                            decision_time=context.decision_time,
-                            execution_time=sessions_ordered[idx + 1],
-                            strategy_id="champion-v1",
-                            reason="universe_entry",
-                            idempotency_key=f"universe_{sym}_{idx}",
-                            account_snapshot_id=context.portfolio.account_snapshot_id,
-                        )
-                        for sym in sorted(eligible_set)
-                    )
-                return ()
-
-        strategy = UniverseStrategy()
+        raise PITDataError("run-backtest requires a resolved strategy for the selected bundle")
 
     from src.strategy.core_strategy import CoreStrategyPolicy
 
@@ -595,15 +633,54 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         "warmup_sessions": 60,
         "data_action_certified": True,
     }
-    _result, manifest = run_managed_backtest(
-        sessions=sessions,
-        config=config,
-        strategy=strategy,
-        artifact_root=artifact_root,
-        dataset_hash=f"validation_{val_start}_{val_end}",
-        smoke_symbol=smoke_symbol,
-        extra_metadata=metadata,
-    )
+    if run_manifest is not None:
+        from collections import Counter
+
+        from src.data.backtest_sessions import resolve_backtest_corporate_action_evidence
+
+        _resolution = resolve_backtest_corporate_action_evidence(
+            daily_market=daily_market,
+            corporate_actions=corporate_actions,
+            calendar=calendar,
+            policy=BacktestMarketInputsPolicy(),
+        )
+        _eligible_count = int(_resolution.eligible_daily_market.height)
+        _blocked_count = int(daily_market.height - _eligible_count)
+        _reason_counter: Counter[str] = Counter()
+        for _reasons in _resolution.exclusion_reasons.values():
+            _reason_counter.update(_reasons)
+        metadata = {
+            **metadata,
+            "run_manifest_hash": run_manifest.content_hash,
+            "eligible_instrument_sessions": _eligible_count,
+            "blocked_instrument_sessions": _blocked_count,
+            "excluded_instruments": sorted(_resolution.excluded_instruments),
+            "exclusion_reason_counts": dict(_reason_counter),
+            "quarantined_instrument_sessions": sum(
+                len(slots) for slots in _resolution.quarantine_sessions_by_instrument.values()
+            ),
+        }
+    if run_manifest is not None:
+        _result, manifest = run_managed_backtest(
+            sessions=sessions,
+            config=config,
+            strategy=strategy,
+            artifact_root=artifact_root,
+            dataset_hash=run_manifest.content_hash,
+            manifest_hash=run_manifest.content_hash,
+            smoke_symbol=smoke_symbol,
+            extra_metadata=metadata,
+        )
+    else:
+        _result, manifest = run_managed_backtest(
+            sessions=sessions,
+            config=config,
+            strategy=strategy,
+            artifact_root=artifact_root,
+            dataset_hash=f"validation_{val_start}_{val_end}",
+            smoke_symbol=smoke_symbol,
+            extra_metadata=metadata,
+        )
 
     _emit({
         "content_hash": manifest["content_hash"],

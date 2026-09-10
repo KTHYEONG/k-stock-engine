@@ -21,21 +21,23 @@ from src.engine.fill_model import HistoricalBar
 
 @dataclass(frozen=True, slots=True)
 class BacktestMarketInputsPolicy:
-    version: str = "korean-equity-market-inputs-v1"
+    version: str = "korean-equity-market-inputs-v2"
     adtv_sessions: int = 20
     volatility_sessions: int = 60
     market_volatility_sessions: int = 60
     annualization_sessions: int = 252
     unexplained_price_jump_threshold: float = 0.5
+    corporate_action_quarantine_sessions: int = 60
 
     def __post_init__(self) -> None:
         if (
-            self.version != "korean-equity-market-inputs-v1"
+            self.version != "korean-equity-market-inputs-v2"
             or self.adtv_sessions != 20
             or self.volatility_sessions != 60
             or self.market_volatility_sessions != 60
             or self.annualization_sessions != 252
             or self.unexplained_price_jump_threshold != 0.5
+            or self.corporate_action_quarantine_sessions != 60
         ):
             raise ValueError("BacktestMarketInputsPolicy constants are immutable")
 
@@ -62,6 +64,7 @@ class CorporateActionEvidenceResolution:
     verified_corporate_actions: pl.DataFrame
     excluded_instruments: frozenset[str]
     exclusion_reasons: Mapping[str, tuple[str, ...]]
+    quarantine_sessions_by_instrument: Mapping[str, tuple[datetime, ...]]
 
 
 def find_unexplained_price_discontinuities(
@@ -107,6 +110,21 @@ def find_unexplained_price_discontinuities(
     return jumps.join(keys, on=["instrument_id", "session"], how="anti").collect()
 
 
+def _coerce_event_session(value: Any, *, instrument_id: str) -> datetime:
+    if isinstance(value, datetime):
+        eff = value
+    elif value is None:
+        raise PITDataError(f"unresolved corporate-action effective session missing for {instrument_id!r}")
+    else:
+        try:
+            eff = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError) as exc:
+            raise PITDataError(f"unresolved corporate-action effective session invalid for {instrument_id!r}") from exc
+    if eff.tzinfo is None:
+        raise PITDataError(f"unresolved corporate-action effective session must be timezone-aware for {instrument_id!r}")
+    return eff
+
+
 def resolve_backtest_corporate_action_evidence(
     *,
     daily_market: pl.DataFrame,
@@ -115,8 +133,11 @@ def resolve_backtest_corporate_action_evidence(
     policy: BacktestMarketInputsPolicy,
 ) -> CorporateActionEvidenceResolution:
     threshold = float(policy.unexplained_price_jump_threshold)
+    quarantine_window = int(policy.corporate_action_quarantine_sessions)
+    sessions = tuple(calendar.sessions)
+    session_index = {session: index for index, session in enumerate(sessions)}
     action_rows: list[dict[str, Any]] = corporate_actions.to_dicts() if corporate_actions.height > 0 else []
-    unresolved_reasons: dict[str, set[str]] = {}
+    events: list[tuple[str, datetime, str]] = []
     for row in action_rows:
         iid = str(row.get("instrument_id", ""))
         if "evidence_status" not in row or "evidence_reason" not in row:
@@ -128,41 +149,74 @@ def resolve_backtest_corporate_action_evidence(
         if status != "verified" or atype == "unresolved":
             reason = row.get("evidence_reason")
             label = str(reason).strip() if isinstance(reason, str) and reason.strip() else "unresolved_evidence"
-            unresolved_reasons.setdefault(iid, set()).add(label)
+            eff_raw = row.get("effective_session", row.get("effective_date"))
+            eff = _coerce_event_session(eff_raw, instrument_id=iid)
+            if eff not in session_index:
+                raise PITDataError(
+                    f"unresolved corporate-action effective session is outside calendar for {iid!r}"
+                )
+            events.append((iid, eff, label))
     if "evidence_status" in corporate_actions.columns:
         verified = corporate_actions.filter(pl.col("evidence_status") == "verified")
     else:
         verified = corporate_actions
     jumps = find_unexplained_price_discontinuities(daily_market=daily_market, verified_actions=verified, threshold=threshold)
-    jump_reasons: dict[str, set[str]] = {
-        iid: {"unexplained_price_discontinuity"}
-        for iid in jumps.get_column("instrument_id").unique().to_list()
-        if iid not in unresolved_reasons
+    if jumps.height > 0:
+        for jump_row in jumps.to_dicts():
+            iid = str(jump_row["instrument_id"])
+            if iid in {iid_event for iid_event, _, _ in events}:
+                continue
+            jump_session = _coerce_session(jump_row["session"])
+            if jump_session not in session_index:
+                raise PITDataError(f"price discontinuity session is outside calendar for {iid!r}")
+            events.append((iid, jump_session, "unexplained_price_discontinuity"))
+    quarantine: dict[str, set[datetime]] = {}
+    reasons: dict[str, set[str]] = {}
+    for iid, event_session, label in events:
+        index = session_index[event_session]
+        window = sessions[index : index + quarantine_window + 1]
+        quarantine.setdefault(iid, set()).update(window)
+        reasons.setdefault(iid, set()).add(label)
+    quarantine_tuples: dict[str, tuple[datetime, ...]] = {
+        iid: tuple(sorted(slots)) for iid, slots in quarantine.items()
     }
-    excluded: set[str] = set(unresolved_reasons) | set(jump_reasons)
-    exclusion_reasons: dict[str, tuple[str, ...]] = {}
-    for iid in excluded:
-        merged = sorted(unresolved_reasons.get(iid, set()) | jump_reasons.get(iid, set()))
-        exclusion_reasons[iid] = tuple(merged)
-    if excluded:
-        eligible = daily_market.filter(~pl.col("instrument_id").is_in(sorted(excluded)))
-        if "evidence_status" in corporate_actions.columns:
-            verified = corporate_actions.filter(
-                (pl.col("evidence_status") == "verified") & (~pl.col("instrument_id").is_in(sorted(excluded)))
-            )
-        else:
-            verified = corporate_actions.filter(~pl.col("instrument_id").is_in(sorted(excluded)))
+    exclusion_reasons: dict[str, tuple[str, ...]] = {
+        iid: tuple(sorted(labels)) for iid, labels in reasons.items()
+    }
+    if quarantine:
+        quarantined_pairs = [
+            (iid, session) for iid, slots in quarantine.items() for session in slots
+        ]
+        block = pl.DataFrame(
+            {"instrument_id": [iid for iid, _ in quarantined_pairs], "session": [s for _, s in quarantined_pairs]}
+        )
+        eligible = daily_market.join(block, on=["instrument_id", "session"], how="anti")
+        if verified.height > 0:
+            key_col: str | None = None
+            if "effective_session" in verified.columns:
+                key_col = "effective_session"
+            elif "effective_date" in verified.columns:
+                key_col = "effective_date"
+            if key_col is not None:
+                renamed = block.rename({"session": key_col})
+                verified = verified.join(renamed, on=["instrument_id", key_col], how="anti")
     else:
         eligible = daily_market
-        if "evidence_status" in corporate_actions.columns:
-            verified = corporate_actions.filter(pl.col("evidence_status") == "verified")
-        else:
-            verified = corporate_actions
+    if daily_market.height > 0 and "instrument_id" in daily_market.columns and "session" in daily_market.columns:
+        supplied: dict[str, set[datetime]] = {}
+        for row in daily_market.select("instrument_id", "session").to_dicts():
+            supplied.setdefault(str(row["instrument_id"]), set()).add(_coerce_session(row["session"]))
+        excluded = frozenset(
+            iid for iid, slots in supplied.items() if slots and slots <= quarantine.get(iid, set())
+        )
+    else:
+        excluded = frozenset()
     return CorporateActionEvidenceResolution(
         eligible_daily_market=eligible,
         verified_corporate_actions=verified,
-        excluded_instruments=frozenset(excluded),
+        excluded_instruments=excluded,
         exclusion_reasons=dict(exclusion_reasons),
+        quarantine_sessions_by_instrument=dict(quarantine_tuples),
     )
 
 

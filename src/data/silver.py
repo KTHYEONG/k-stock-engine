@@ -970,3 +970,53 @@ class SilverStore:
             )
             output[table] = path
         return output
+
+
+def _check_immutable_dataset_id(dataset_id: str) -> str:
+    if not isinstance(dataset_id, str) or not dataset_id.strip():
+        raise PITDataError("invalid dataset id: must be non-empty")
+    if "/" in dataset_id or "\\" in dataset_id or dataset_id in (".", ".."):
+        raise PITDataError(f"invalid dataset id {dataset_id!r}: must be a single path component")
+    if dataset_id.strip() != dataset_id:
+        raise PITDataError(f"invalid dataset id {dataset_id!r}: must be a single path component")
+    return dataset_id
+
+
+def silver_dataset_path_by_id(
+    *, root: Path, table: SilverTable, dataset_id: str, decision_time: datetime
+) -> Path:
+    """Resolve an immutable Silver dataset directory without latest selection."""
+    if decision_time.tzinfo is None:
+        raise PITDataError("decision_time must be timezone-aware")
+    ident = _check_immutable_dataset_id(dataset_id)
+    table_root = Path(root) / table.value
+    dataset_dir = table_root / ident
+    if not dataset_dir.is_dir():
+        raise PITDataError(f"missing certified Silver table: {table.value}/{ident}")
+    store = ParquetDatasetStore(table_root)
+    try:
+        manifest = store.read_manifest(ident)
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        raise PITDataError(f"invalid certified Silver table: {table.value}") from exc
+    from src.core.datasets import validate_dataset_manifest
+
+    try:
+        validate_dataset_manifest(manifest, AssetKind.STOCK, f"stock_pit_{table.value}_v1", decision_time)
+    except ValueError as exc:
+        raise PITDataError(f"invalid certified Silver table: {table.value}") from exc
+    return dataset_dir
+
+
+def load_silver_table_by_dataset_id(
+    *, root: Path, table: SilverTable, dataset_id: str, decision_time: datetime
+) -> pl.DataFrame:
+    """Load an immutable Silver dataset selected explicitly by content id."""
+    if decision_time.tzinfo is None:
+        raise PITDataError("decision_time must be timezone-aware")
+    ident = _check_immutable_dataset_id(dataset_id)
+    silver_dataset_path_by_id(root=root, table=table, dataset_id=ident, decision_time=decision_time)
+    store = ParquetDatasetStore(Path(root) / table.value)
+    try:
+        return store.read(ident, AssetKind.STOCK, f"stock_pit_{table.value}_v1", decision_time)
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        raise PITDataError(f"invalid certified Silver table: {table.value}") from exc

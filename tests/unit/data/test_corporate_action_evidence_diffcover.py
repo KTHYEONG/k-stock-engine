@@ -538,8 +538,10 @@ def test_backtest_resolver_excludes_unexplained_jump_without_evidence_columns() 
         calendar=SessionCalendar(sessions),
         policy=BacktestMarketInputsPolicy(),
     )
-    assert resolution.excluded_instruments == frozenset({"KRX:A"})
+    assert resolution.excluded_instruments == frozenset()
     assert resolution.exclusion_reasons["KRX:A"] == ("unexplained_price_discontinuity",)
+    assert resolution.quarantine_sessions_by_instrument["KRX:A"] == (sessions[1],)
+    assert resolution.eligible_daily_market["session"].to_list() == [sessions[0]]
 
 
 def test_backtest_resolver_keeps_verified_only_actions() -> None:
