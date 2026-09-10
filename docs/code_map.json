@@ -27,6 +27,7 @@
       "tests/integration/engine/test_unified_event_backtester.py",
       "tests/integration/strategy/test_historical_universe.py",
       "tests/unit/core/test_instrument.py",
+      "tests/unit/core/test_ledger.py",
       "tests/unit/data/test_backtest_runner.py",
       "tests/unit/data/test_backtest_sessions.py",
       "tests/unit/data/test_cli.py",
@@ -34,6 +35,7 @@
       "tests/unit/data/test_gold.py",
       "tests/unit/data/test_gold_loader.py",
       "tests/unit/data/test_incremental_normalization.py",
+      "tests/unit/data/test_lifecycle.py",
       "tests/unit/data/test_normalization.py",
       "tests/unit/data/test_replay.py",
       "tests/unit/data/test_silver.py",
@@ -94,6 +96,9 @@
   },
   "src/data/legacy_inventory.py": {
     "testing": "tests/unit/data/test_legacy_inventory.py"
+  },
+  "src/data/lifecycle.py": {
+    "testing": "tests/unit/data/test_lifecycle.py"
   },
   "src/data/normalization.py": {
     "testing": "tests/unit/data/test_normalization.py"
@@ -267,6 +272,7 @@
   "src/integrations/krx/historical.py": {
     "testing": "tests/unit/integrations/krx/test_historical.py"
   },
+  "src/integrations/krx/kind.py": {},
   "src/integrations/ls/client.py": {},
   "src/integrations/ls/investor_flow.py": {
     "testing": "tests/unit/integrations/ls/test_investor_flow.py"
