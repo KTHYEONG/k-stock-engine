@@ -1026,3 +1026,19 @@ def test_run_backtest_rejects_champion_without_selected_scores(tmp_path, monkeyp
                 strategy_id='champion-v1',
             )
         )
+
+
+def test_cli_backtest_loads_lifecycle_table(monkeypatch, tmp_path) -> None:
+    import polars as pl
+    import src.data.cli as module
+    from src.data.schemas import SilverTable
+
+    loaded = []
+    def fake_load(root, table):
+        loaded.append(table)
+        return pl.DataFrame()
+    monkeypatch.setattr(module, '_load_silver_table', fake_load)
+    monkeypatch.setattr(module, 'build_backtest_sessions', lambda **kwargs: ())
+    monkeypatch.setattr(module, '_execute_backtest', lambda **kwargs: {'final_nav': 1.0})
+    module._run_backtest_from_silver(silver_root=tmp_path,strategy_id='core-v1',validation_start='2016-01-04',validation_end='2016-01-04',artifact_root=tmp_path,smoke_symbol=None)
+    assert SilverTable.LIFECYCLE_EVENTS in loaded
