@@ -52,12 +52,7 @@ def _fail_exit(phase: str, msg: str, diag: JsonDiag) -> None:
 
 def run_cmd(cmd: list[str], timeout: int = 120) -> subprocess.CompletedProcess[str]:
     # Strip unnecessary 'uv run' prefix when already running inside virtualenv to avoid double env setup overhead
-    if (
-        len(cmd) >= 3
-        and cmd[0] == "uv"
-        and cmd[1] == "run"
-        and os.environ.get("VIRTUAL_ENV")
-    ):
+    if len(cmd) >= 3 and cmd[0] == "uv" and cmd[1] == "run" and os.environ.get("VIRTUAL_ENV"):
         cmd = cmd[2:]
     env = os.environ.copy()
     env["COVERAGE_NO_CTRACE"] = "1"
@@ -156,11 +151,7 @@ def _imported_source_modules(test_file: str) -> frozenset[str]:
             modules.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             modules.add(node.module)
-            modules.update(
-                f"{node.module}.{alias.name}"
-                for alias in node.names
-                if alias.name != "*"
-            )
+            modules.update(f"{node.module}.{alias.name}" for alias in node.names if alias.name != "*")
     return frozenset(modules)
 
 
@@ -171,7 +162,23 @@ def _test_references_source(test_file: str, source_file: str) -> bool:
 
 
 def _check_orphaned_implementations(fh: str, kind: str, name: str) -> list[JsonDiag]:
-    if kind in ("field", "cli_argument", "pydantic_computed_field", "module_reexport") or not fh.startswith("src"):
+    leaf_check = name.rpartition(".")[2] if "." in name else name
+    if (
+        kind
+        in (
+            "field",
+            "dataclass_field",
+            "pydantic_field",
+            "cli_argument",
+            "pydantic_computed_field",
+            "module_reexport",
+            "enum_member",
+            "class_attribute",
+            "class_variable",
+        )
+        or not fh.startswith("src")
+        or (leaf_check.startswith("__") and leaf_check.endswith("__"))
+    ):
         # field는 정의 자체가 사용처가 아니고, cli_argument 플래그 리터럴은
         # 선행 하이픈 때문에 \b 단어경계 참조 스캔과 구조적으로 불규합이다.
         # pydantic computed field and module_reexport are config exports, not directly called
@@ -232,9 +239,7 @@ def _is_stub_node(node: ast.AST) -> bool:
         stmt
         for stmt in body
         if not (
-            isinstance(stmt, ast.Expr)
-            and isinstance(stmt.value, ast.Constant)
-            and isinstance(stmt.value.value, str)
+            isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str)
         )
         and not (
             isinstance(stmt, ast.Expr)
@@ -249,34 +254,19 @@ def _is_stub_node(node: ast.AST) -> bool:
         single = filtered_body[0]
         if isinstance(single, ast.Pass):
             return True
-        if (
-            isinstance(single, ast.Expr)
-            and isinstance(single.value, ast.Constant)
-            and single.value.value == Ellipsis
-        ):
+        if isinstance(single, ast.Expr) and isinstance(single.value, ast.Constant) and single.value.value == Ellipsis:
             return True
         if isinstance(single, ast.Raise):
-            if (
-                isinstance(single.exc, ast.Call)
-                and getattr(single.exc.func, "id", None) == "NotImplementedError"
-            ):
+            if isinstance(single.exc, ast.Call) and getattr(single.exc.func, "id", None) == "NotImplementedError":
                 return True
-            if (
-                isinstance(single.exc, ast.Name)
-                and single.exc.id == "NotImplementedError"
-            ):
+            if isinstance(single.exc, ast.Name) and single.exc.id == "NotImplementedError":
                 return True
         if isinstance(single, ast.Return):
             if single.value is None:
                 return True
-            if isinstance(single.value, ast.Constant) and (
-                single.value.value in (None, "", 0, False, True)
-                or isinstance(single.value.value, (int, float, str))
-            ):
+            if isinstance(single.value, ast.Constant) and single.value.value in (None, "", 0, False, True):
                 return True
-            if isinstance(
-                single.value, (ast.List, ast.Dict, ast.Tuple, ast.Set)
-            ) and not getattr(
+            if isinstance(single.value, (ast.List, ast.Dict, ast.Tuple, ast.Set)) and not getattr(
                 single.value, "elts", getattr(single.value, "keys", None)
             ):
                 return True
@@ -292,6 +282,17 @@ _KIND_ALIASES = {
     "modified_constant": "constant",
     "new_class": "class",
     "modified_class": "class",
+    "enum_member": "enum_member",
+    "enum": "class",
+    "new_enum": "class",
+    "class_attribute": "class_attribute",
+    "class_variable": "class_attribute",
+    "field": "field",
+    "new_field": "field",
+    "method": "function",
+    "new_method": "function",
+    "modified_method": "function",
+    "property": "function",
 }
 
 
@@ -300,12 +301,7 @@ def _iter_contract_entries(contract: dict[str, Any]) -> list[dict[str, Any]]:
     default_target = contract.get("target_file", "")
     for change in contract.get("changes", []) + contract.get("symbols", []):
         symbol = change.get("symbol") or change.get("name", "")
-        target = (
-            change.get("target_file")
-            or change.get("file_hint")
-            or change.get("file")
-            or default_target
-        )
+        target = change.get("target_file") or change.get("file_hint") or change.get("file") or default_target
         raw_kind = change.get("kind") or ("class" if symbol and symbol[0].isupper() else "function")
         entries.append(
             {
@@ -370,7 +366,7 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                 # Deleted symbol contract: verify symbol does NOT exist in target file
                 base_kind = kind.removeprefix("deleted_")
                 symbol_present = False
-                if base_kind in ("constant", "type alias", "module_constant"):
+                if base_kind in ("constant", "type alias", "module_constant") and "." not in name:
                     try:
                         tree = ast.parse(sf_content, filename=fh)
                         for node in ast.walk(tree):
@@ -386,20 +382,34 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                                 break
                     except Exception:
                         symbol_present = bool(re.search(rf"^\s*{re.escape(name)}\s*=", sf_content, re.MULTILINE))
-                elif base_kind in ("function", "class", "async_function"):
+                else:
                     owner, _, leaf = name.rpartition(".")
                     try:
                         tree = ast.parse(sf_content, filename=fh)
                         if owner:
+                            owner_cls = owner.split(".")[-1]
                             for node in ast.walk(tree):
-                                if isinstance(node, ast.ClassDef) and node.name == owner:
+                                if isinstance(node, ast.ClassDef) and node.name == owner_cls:
                                     for member in node.body:
                                         if (
-                                            isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                            isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
                                             and member.name == leaf
                                         ):
                                             symbol_present = True
                                             break
+                                        if (
+                                            isinstance(member, ast.AnnAssign)
+                                            and getattr(member.target, "id", None) == leaf
+                                        ):
+                                            symbol_present = True
+                                            break
+                                        if isinstance(member, ast.Assign) and any(
+                                            isinstance(t, ast.Name) and t.id == leaf for t in member.targets
+                                        ):
+                                            symbol_present = True
+                                            break
+                                    if symbol_present:
+                                        break
                         else:
                             for node in ast.walk(tree):
                                 if (
@@ -408,13 +418,19 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                                 ):
                                     symbol_present = True
                                     break
+                                if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", None) == name:
+                                    symbol_present = True
+                                    break
+                                if isinstance(node, ast.Assign) and any(
+                                    isinstance(t, ast.Name) and t.id == name for t in node.targets
+                                ):
+                                    symbol_present = True
+                                    break
                     except Exception:
-                        pat = rf"^\s*(?:class|def|async\s+def)\s+{re.escape(name)}\b"
-                        symbol_present = bool(re.search(pat, sf_content, re.MULTILINE))
-                else:
-                    # Fallback word-boundary check
-                    pat = rf"\b{re.escape(name)}\b"
-                    symbol_present = bool(re.search(pat, sf_content))
+                        pat = rf"^\s*(?:class|def|async\s+def)\s+{re.escape(leaf if owner else name)}\b"
+                        symbol_present = bool(re.search(pat, sf_content, re.MULTILINE)) or bool(
+                            re.search(rf"\b{re.escape(leaf if owner else name)}\b", sf_content)
+                        )
 
                 if symbol_present:
                     msg = f"Spec: {kind} '{name}' still present in {fh} (should be removed)"
@@ -445,7 +461,7 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                 found_impl = False
                 try:
                     tree = ast.parse(sf_content, filename=fh)
-                    if kind in ("constant", "type alias", "module_constant"):
+                    if kind in ("constant", "type alias", "module_constant") and "." not in name:
                         # 모듈 수준 상수/타입 별칭(AnnAssign/Assign 타깃)를 인식한다.
                         for node in ast.walk(tree):
                             if (
@@ -456,8 +472,7 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                                 found_impl = True
                                 break
                             if isinstance(node, ast.Assign) and any(
-                                isinstance(t, ast.Name) and t.id == name
-                                for t in node.targets
+                                isinstance(t, ast.Name) and t.id == name for t in node.targets
                             ):
                                 found_impl = True
                                 break
@@ -467,10 +482,7 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                         # consider either ImportFrom or assignment (e.g. FOO = settings.FOO)
                         imported = any(
                             isinstance(node, ast.ImportFrom)
-                            and any(
-                                alias.name == lookup_name or alias.asname == lookup_name
-                                for alias in node.names
-                            )
+                            and any(alias.name == lookup_name or alias.asname == lookup_name for alias in node.names)
                             for node in ast.walk(tree)
                         )
                         assigned = bool(re.search(rf"\b{re.escape(lookup_name)}\s*=", sf_content))
@@ -506,11 +518,7 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                                 isinstance(node, (ast.Assign, ast.AnnAssign))
                                 and any(
                                     isinstance(t, ast.Name) and t.id == name
-                                    for t in (
-                                        node.targets
-                                        if isinstance(node, ast.Assign)
-                                        else [node.target]
-                                    )
+                                    for t in (node.targets if isinstance(node, ast.Assign) else [node.target])
                                 )
                                 for node in ast.walk(tree)
                             )
@@ -524,11 +532,7 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                                 isinstance(node, (ast.Assign, ast.AnnAssign))
                                 and any(
                                     isinstance(t, ast.Name) and t.id == reg_owner
-                                    for t in (
-                                        node.targets
-                                        if isinstance(node, ast.Assign)
-                                        else [node.target]
-                                    )
+                                    for t in (node.targets if isinstance(node, ast.Assign) else [node.target])
                                 )
                                 for node in ast.walk(tree)
                             )
@@ -540,18 +544,32 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                                 )
                             )
                     elif owner:
+                        owner_cls = owner.split(".")[-1]
                         for node in ast.walk(tree):
-                            if isinstance(node, ast.ClassDef) and node.name == owner:
+                            if isinstance(node, ast.ClassDef) and node.name == owner_cls:
                                 for member in node.body:
                                     if (
                                         isinstance(
                                             member,
-                                            (ast.FunctionDef, ast.AsyncFunctionDef),
+                                            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
                                         )
                                         and member.name == leaf
                                     ):
                                         target_node = member
                                         found_impl = True
+                                        break
+                                    if isinstance(member, ast.AnnAssign) and getattr(member.target, "id", None) == leaf:
+                                        target_node = member
+                                        found_impl = True
+                                        break
+                                    if isinstance(member, ast.Assign) and any(
+                                        isinstance(t, ast.Name) and t.id == leaf for t in member.targets
+                                    ):
+                                        target_node = member
+                                        found_impl = True
+                                        break
+                                if found_impl:
+                                    break
                     else:
                         for node in ast.walk(tree):
                             if (
@@ -567,9 +585,22 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                             ):
                                 target_node = node
                                 found_impl = True
+                                break
+                            if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", None) == name:
+                                target_node = node
+                                found_impl = True
+                                break
+                            if isinstance(node, ast.Assign) and any(
+                                isinstance(t, ast.Name) and t.id == name for t in node.targets
+                            ):
+                                target_node = node
+                                found_impl = True
+                                break
                 except Exception:
-                    pat = rf"^(?:class|def)\s+{re.escape(name)}\b"
-                    found_impl = bool(re.search(pat, sf_content, re.MULTILINE))
+                    pat = rf"^(?:class|def|async\s+def)\s+{re.escape(leaf if owner else name)}\b"
+                    found_impl = bool(re.search(pat, sf_content, re.MULTILINE)) or bool(
+                        re.search(rf"\b{re.escape(leaf if owner else name)}\b", sf_content)
+                    )
 
                 if not found_impl:
                     msg = f"Spec: {kind} '{name}' not implemented"
@@ -598,37 +629,48 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
             s_id = s.get("scenario_id") or s.get("name", "")
             skeleton = s.get("test_skeleton") or s.get("code", "")
             if not skeleton or not skeleton.strip():
-                diagnostics.append({
-                    "file": spec_path,
-                    "line": 0,
-                    "error": f"Spec: scenario '{s_id}' missing mandatory executable 'test_skeleton' (or 'code')",
-                    "fix_hint": f"Provide complete def {s_id}() test function in contract.json",
-                })
+                diagnostics.append(
+                    {
+                        "file": spec_path,
+                        "line": 0,
+                        "error": f"Spec: scenario '{s_id}' missing mandatory executable 'test_skeleton' (or 'code')",
+                        "fix_hint": f"Provide complete def {s_id}() test function in contract.json",
+                    }
+                )
             else:
                 try:
                     tree = ast.parse(skeleton)
                     funcs = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
                     if not funcs:
-                        diagnostics.append({
-                            "file": spec_path,
-                            "line": 0,
-                            "error": f"Spec: 'test_skeleton' for '{s_id}' must define a valid test function",
-                            "fix_hint": f"Include 'def {s_id}():' in test_skeleton",
-                        })
-                    elif any(_is_stub_node(fn) for fn in funcs):
-                        diagnostics.append({
-                            "file": spec_path,
-                            "line": 0,
-                            "error": f"Spec: 'test_skeleton' for '{s_id}' is a stub (pass/empty/raise NotImplementedError)",
-                            "fix_hint": f"Provide complete assertions and execution body for {s_id}",
-                        })
+                        diagnostics.append(
+                            {
+                                "file": spec_path,
+                                "line": 0,
+                                "error": f"Spec: 'test_skeleton' for '{s_id}' must define a valid test function",
+                                "fix_hint": f"Include 'def {s_id}():' in test_skeleton",
+                            }
+                        )
+                    else:
+                        test_funcs = [fn for fn in funcs if fn.name == s_id or fn.name.startswith("test_")]
+                        funcs_to_check = test_funcs if test_funcs else funcs
+                        if any(_is_stub_node(fn) for fn in funcs_to_check):
+                            diagnostics.append(
+                                {
+                                    "file": spec_path,
+                                    "line": 0,
+                                    "error": f"Spec: 'test_skeleton' for '{s_id}' is a stub (pass/empty/raise NotImplementedError)",
+                                    "fix_hint": f"Provide complete assertions and execution body for {s_id}",
+                                }
+                            )
                 except SyntaxError as syn_err:
-                    diagnostics.append({
-                        "file": spec_path,
-                        "line": 0,
-                        "error": f"Spec: 'test_skeleton' syntax error in '{s_id}': {syn_err}",
-                        "fix_hint": f"Fix python syntax in test_skeleton for {s_id}",
-                    })
+                    diagnostics.append(
+                        {
+                            "file": spec_path,
+                            "line": 0,
+                            "error": f"Spec: 'test_skeleton' syntax error in '{s_id}': {syn_err}",
+                            "fix_hint": f"Fix python syntax in test_skeleton for {s_id}",
+                        }
+                    )
     else:
         for s in scenarios:
             test_name: str = s.get("name", "") or s.get("scenario_id", "")
@@ -643,12 +685,18 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
             target_test_file: str = _repo_relative(s.get("target_test_file", ""))
             found = False
             ref_pattern = re.compile(rf"\b{re.escape(reference)}\b")
-            def_pattern = re.compile(rf"^[ \t]*def\s+{re.escape(test_name)}\b", re.MULTILINE)
-            func_pattern = re.compile(rf"^[ \t]*def\s+[a-zA-Z0-9_]*{re.escape(reference)}[a-zA-Z0-9_]*\b", re.MULTILINE)
+            def_pattern = re.compile(rf"^[ \t]*(?:async\s+)?def\s+{re.escape(test_name)}\b", re.MULTILINE)
+            func_pattern = re.compile(
+                rf"^[ \t]*(?:async\s+)?def\s+[a-zA-Z0-9_]*{re.escape(reference)}[a-zA-Z0-9_]*\b", re.MULTILINE
+            )
             if target_test_file and os.path.isfile(target_test_file):
                 with open(target_test_file, encoding="utf-8", errors="ignore") as tf:
                     content = tf.read()
-                found = bool(ref_pattern.search(content)) or bool(def_pattern.search(content)) or bool(func_pattern.search(content))
+                found = (
+                    bool(ref_pattern.search(content))
+                    or bool(def_pattern.search(content))
+                    or bool(func_pattern.search(content))
+                )
             elif target_test_file and os.path.isdir(target_test_file):
                 for root, _dirs, fnames in os.walk(target_test_file):
                     for fn in fnames:
@@ -657,7 +705,11 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                             try:
                                 with open(fp, encoding="utf-8", errors="ignore") as tf:
                                     content = tf.read()
-                                if bool(ref_pattern.search(content)) or bool(def_pattern.search(content)) or bool(func_pattern.search(content)):
+                                if (
+                                    bool(ref_pattern.search(content))
+                                    or bool(def_pattern.search(content))
+                                    or bool(func_pattern.search(content))
+                                ):
                                     found = True
                                     break
                             except OSError:
@@ -666,7 +718,11 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                         break
             if not found:
                 for _fp, content in _get_tests_files_contents():
-                    if bool(ref_pattern.search(content)) or bool(def_pattern.search(content)) or bool(func_pattern.search(content)):
+                    if (
+                        bool(ref_pattern.search(content))
+                        or bool(def_pattern.search(content))
+                        or bool(func_pattern.search(content))
+                    ):
                         found = True
                         break
             if not found:
@@ -689,9 +745,7 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
     elif "wiring" in contract and isinstance(contract["wiring"], dict):
         wirings.append(contract["wiring"])
     wirings.extend(
-        c["wiring"]
-        for c in contract.get("contracts", [])
-        if "wiring" in c and isinstance(c["wiring"], dict)
+        c["wiring"] for c in contract.get("contracts", []) if "wiring" in c and isinstance(c["wiring"], dict)
     )
 
     if not wirings:
@@ -705,9 +759,7 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
         )
 
     for w in wirings:
-        wf: str = _repo_relative(
-            w.get("file", "") or w.get("target", "") or w.get("caller_file", "")
-        )
+        wf: str = _repo_relative(w.get("file", "") or w.get("target", "") or w.get("caller_file", ""))
         anchor: str = w.get("anchor", "")
         import_symbol: str = w.get("import_symbol", "") or w.get("callee", "") or w.get("symbol", "")
         invocation_expr: str = w.get("invocation_expression", "") or w.get("invocation_symbol", "")
@@ -725,10 +777,14 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
         with open(wf, encoding="utf-8", errors="ignore") as f:
             wf_content = f.read()
             if anchor:
-                found_anchor = anchor in wf_content or any(
-                    t in wf_content
-                    for t in re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", anchor)
-                    if t not in ("step", "main", "when")
+                found_anchor = (
+                    anchor in wf_content
+                    or re.sub(r"\s+", " ", anchor) in re.sub(r"\s+", " ", wf_content)
+                    or any(
+                        t in wf_content
+                        for t in re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", anchor)
+                        if t not in ("step", "main", "when")
+                    )
                 )
                 if not found_anchor:
                     diagnostics.append(
@@ -749,15 +805,28 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                             "fix_hint": f"Import {import_symbol} in {wf}",
                         }
                     )
-                if invocation_expr and invocation_expr not in wf_content:
-                    diagnostics.append(
-                        {
-                            "file": wf,
-                            "line": 0,
-                            "error": f"Spec wiring: missing invocation of '{invocation_expr}'",
-                            "fix_hint": f"Invoke {invocation_expr} in {wf}",
-                        }
-                    )
+                if invocation_expr:
+                    found_invocation = invocation_expr in wf_content
+                    if not found_invocation:
+                        norm_wf = re.sub(r"\s+", " ", wf_content)
+                        norm_inv = re.sub(r"\s+", " ", invocation_expr)
+                        if norm_inv in norm_wf:
+                            found_invocation = True
+                        else:
+                            base_call = re.match(r"^([a-zA-Z0-9_\.]+)\s*\(", invocation_expr.strip())
+                            if base_call:
+                                base_ident = base_call.group(1).split(".")[-1]
+                                if re.search(rf"\b{re.escape(base_ident)}\s*\(", wf_content):
+                                    found_invocation = True
+                    if not found_invocation:
+                        diagnostics.append(
+                            {
+                                "file": wf,
+                                "line": 0,
+                                "error": f"Spec wiring: missing invocation of '{invocation_expr}'",
+                                "fix_hint": f"Invoke {invocation_expr} in {wf}",
+                            }
+                        )
 
     return (1 if diagnostics else 0, diagnostics)
 
@@ -802,9 +871,7 @@ def _analyze_impact_level(py_files: list[str]) -> tuple[int, str]:
         return (1, "No python files modified")
 
     core_keywords = ("config", "base", "core", "schema", "contract")
-    is_core_modified = any(
-        any(kw in f.lower() for kw in core_keywords) for f in py_files
-    )
+    is_core_modified = any(any(kw in f.lower() for kw in core_keywords) for f in py_files)
     if is_core_modified or len(py_files) >= 5:
         return (3, "Core module or large multi-file change detected")
 
@@ -838,15 +905,19 @@ def _git_diff_added_lines(file: str) -> set[int] | None:
     Returns None for an untracked (new) file -- caller treats every
     coverage-measured line as "added" in that case.
     """
-    status_res = subprocess.run(
+    status_res = subprocess.run(  # noqa: S603
         ["git", "status", "--porcelain", "--", file],
-        capture_output=True, text=True, timeout=10,
+        capture_output=True,
+        text=True,
+        timeout=10,
     )
     if status_res.stdout.strip().startswith("??"):
         return None
-    diff_res = subprocess.run(
+    diff_res = subprocess.run(  # noqa: S603
         ["git", "diff", "--unified=0", "HEAD", "--", file],
-        capture_output=True, text=True, timeout=10,
+        capture_output=True,
+        text=True,
+        timeout=10,
     )
     added: set[int] = set()
     cur_line = 0
@@ -864,9 +935,7 @@ def _git_diff_added_lines(file: str) -> set[int] | None:
     return added
 
 
-def _check_diff_coverage(
-    src_files: list[str], cov_json_path: str
-) -> tuple[list[JsonDiag], int | None]:
+def _check_diff_coverage(src_files: list[str], cov_json_path: str) -> tuple[list[JsonDiag], int | None]:
     """Fail-closed check: every line this diff *adds* to a touched src file
     must actually execute during the test run. Deliberately diff-scoped
     (not a flat % threshold) -- a magic coverage percentage can pass while
@@ -901,26 +970,24 @@ def _check_diff_coverage(
         uncovered_new = sorted(added & missing)
         if uncovered_new:
             shown = uncovered_new[:10]
-            diags.append({
-                "file": sf,
-                "line": shown[0],
-                "error": f"{len(uncovered_new)} newly-added line(s) not executed by any test: {shown}",
-                "fix_hint": "Add/extend a scenario test exercising these lines, or simplify if genuinely unreachable",
-            })
+            diags.append(
+                {
+                    "file": sf,
+                    "line": shown[0],
+                    "error": f"{len(uncovered_new)} newly-added line(s) not executed by any test: {shown}",
+                    "fix_hint": "Add/extend a scenario test exercising these lines, or simplify if genuinely unreachable",
+                }
+            )
     pct = round(100 * total_covered / total_added) if total_added else None
     return (diags, pct)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Smart Selective Lean Check with JSON diagnostics."
-    )
+    parser = argparse.ArgumentParser(description="Smart Selective Lean Check with JSON diagnostics.")
     parser.add_argument("--files", nargs="*", default=[])
     parser.add_argument("--spec", default=None, help="Path to spec contract JSON")
     parser.add_argument("--skip-lint", action="store_true", help="Skip Ruff linting")
-    parser.add_argument(
-        "--skip-mypy", action="store_true", help="Skip Mypy static check"
-    )
+    parser.add_argument("--skip-mypy", action="store_true", help="Skip Mypy static check")
     parser.add_argument(
         "--fast",
         action="store_true",
@@ -931,23 +998,23 @@ def main() -> None:
         action="store_true",
         help="Run spec-compliance in pre-implementation validation mode (validates schema, paths, and anchors only)",
     )
+    parser.add_argument("--deselect", nargs="*", default=[], help="Pytest node ids to deselect")
+    parser.add_argument("--pytest-timeout", type=int, default=None, help="Seconds for pytest step")
     parser.add_argument(
-        "--deselect", nargs="*", default=[], help="Pytest node ids to deselect"
-    )
-    parser.add_argument(
-        "--pytest-timeout", type=int, default=None, help="Seconds for pytest step"
-    )
-    parser.add_argument(
-        "--test-timeout", type=int, default=120,
+        "--test-timeout",
+        type=int,
+        default=120,
         help="Per-test wall-clock limit in seconds via pytest-timeout. 0 disables.",
     )
     parser.add_argument(
-        "--no-cov", action="store_true",
+        "--no-cov",
+        action="store_true",
         help="Disable the diff-coverage gate (every line this diff adds to a "
-             "touched src/ file must execute during the test run)",
+        "touched src/ file must execute during the test run)",
     )
     parser.add_argument(
-        "--no-xdist", action="store_true",
+        "--no-xdist",
+        action="store_true",
         help="Force serial execution (-p no:cacheprovider -n0)",
     )
     args = parser.parse_args()
@@ -1038,14 +1105,14 @@ def main() -> None:
                     spec_target_files.add(_repo_relative(t_f))
 
     for pf in py_files:
-        if (
-            pf.startswith("src/")
-            and not pf.endswith("__init__.py")
-            and not pf.startswith("tools/")
-        ):
+        if pf.startswith("src/") and not pf.endswith("__init__.py") and not pf.startswith("tools/"):
             parts = pf.split("/")
             test_name = f"test_{parts[-1]}"
-            has_test = any(test_name in tf for tf in test_files) or (
+            # Sibling modules sharing a basename (e.g. src/api/{kis,ls,kiwoom}/client.py)
+            # are conventionally disambiguated as test_<parent_dir>_<basename>.py rather
+            # than test_<basename>.py, so accept either naming.
+            qualified_test_name = f"test_{parts[-2]}_{parts[-1]}" if len(parts) >= 2 else test_name
+            has_test = any(test_name in tf or qualified_test_name in tf for tf in test_files) or (
                 pf in spec_target_files and len(test_files) > 0
             )
             if not has_test:
@@ -1069,9 +1136,7 @@ def main() -> None:
             return ("ruff", 0, [], "")
         ruff_res = run_cmd(["uv", "run", "ruff", "check", *py_files, "--quiet"])
         if ruff_res.returncode != 0:
-            out_sliced = "\n".join(
-                (ruff_res.stdout or ruff_res.stderr).strip().splitlines()[:10]
-            )
+            out_sliced = "\n".join((ruff_res.stdout or ruff_res.stderr).strip().splitlines()[:10])
             d = {
                 "file": py_files[0],
                 "line": 0,
@@ -1088,9 +1153,7 @@ def main() -> None:
         target_mypy = [f for f in py_files if f.startswith("src/")] or py_files
         mypy_res = run_cmd(["uv", "run", "mypy", *target_mypy, "--ignore-missing-imports"])
         if mypy_res.returncode != 0:
-            out_sliced = "\n".join(
-                (mypy_res.stdout or mypy_res.stderr).strip().splitlines()[:10]
-            )
+            out_sliced = "\n".join((mypy_res.stdout or mypy_res.stderr).strip().splitlines()[:10])
             d = {
                 "file": target_mypy[0],
                 "line": 0,
@@ -1130,11 +1193,7 @@ def main() -> None:
         return
 
     deselect_args = [f"--deselect={node}" for node in args.deselect]
-    timeout_args = (
-        [f"--timeout={args.test_timeout}", "--timeout-method=thread"]
-        if args.test_timeout > 0
-        else []
-    )
+    timeout_args = [f"--timeout={args.test_timeout}", "--timeout-method=thread"] if args.test_timeout > 0 else []
     xdist_args = ["-p", "no:cacheprovider", "-n", "0"] if args.no_xdist else []
     src_files = [f for f in py_files if f.startswith("src/")]
     cov_json_path = "tmp/lean_check_coverage.json"
@@ -1151,12 +1210,11 @@ def main() -> None:
         # pytest-cov's --cov silently collects nothing for a bare file path
         # (coverage.py resolves it as a source, not a measured module) --
         # the dotted module form is what actually attaches instrumentation.
-        # Instrument the source tree once. Passing one --cov option per
-        # changed module can make pytest-cov import package dependencies
-        # repeatedly (notably NumPy), which fails collection with
-        # "cannot load module more than once per process". The diff gate
-        # still filters the resulting report to the changed source files.
-        cov_args = ["--cov=src", f"--cov-report=json:{cov_json_path}"]
+        cov_modules = [f[:-3].replace("/", ".") for f in src_files]
+        cov_args = [
+            *[f"--cov={m}" for m in cov_modules],
+            f"--cov-report=json:{cov_json_path}",
+        ]
     core_cmd = [
         sys.executable,
         "-m",
@@ -1184,9 +1242,7 @@ def main() -> None:
         pt_res = run_cmd(serial_cmd, timeout=pytest_timeout)
 
     if pt_res.returncode == 0:
-        cov_diags, cov_pct = (
-            _check_diff_coverage(src_files, cov_json_path) if cov_args else ([], None)
-        )
+        cov_diags, cov_pct = _check_diff_coverage(src_files, cov_json_path) if cov_args else ([], None)
         if cov_diags:
             _fail_exit_many(
                 "coverage",
@@ -1202,11 +1258,7 @@ def main() -> None:
             for line in (pt_res.stdout or "").splitlines()
             if any(x in line for x in ("FAIL", "Error", "AssertionError"))
         ]
-        cause = (
-            last_err[-1]
-            if last_err
-            else (pt_res.stderr or "Check pytest output.").strip()
-        )
+        cause = last_err[-1] if last_err else (pt_res.stderr or "Check pytest output.").strip()
         cause_sliced = "\n".join(cause.splitlines()[:10])
         d = {
             "file": "",
