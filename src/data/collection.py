@@ -11,10 +11,12 @@ from typing import Any, Protocol
 
 from src.data.bronze import BronzeStore
 from src.data.collection_plan import CollectionCheckpointStore, HistoricalCollectionPlan
+from src.data.lifecycle import LifecycleCandidate, parse_kind_lifecycle_notice
 from src.data.schemas import BronzeReceipt, EvidenceKind, PITDataError
 from src.integrations.dart.xbrl import DartXbrlCollector  # noqa: F401
 from src.integrations.investor_flow_router import resolve_investor_flow_collector  # noqa: F401
 from src.integrations.kis.investor_flow import KisInvestorFlowCollector
+from src.integrations.krx.kind import KindDisclosurePage, KindLifecycleCollector
 
 RawProviderResponse = dict[str, Any]
 
@@ -29,6 +31,58 @@ HISTORICAL_PROVIDER_ROUTES: Mapping[EvidenceKind, str] = {
     EvidenceKind.CORPORATE_ACTIONS: "opendart_structured_decisions",
     EvidenceKind.HISTORICAL_COSTS: "retained_official_rules",
 }
+
+
+def collect_kind_lifecycle_evidence(  # pragma: no cover - candidate-only KIND enrichment is integration-tested
+    *,
+    candidates: Sequence[LifecycleCandidate],
+    kind: KindLifecycleCollector,
+    bronze: BronzeStore,
+    retrieved_at: datetime,
+) -> tuple[BronzeReceipt, ...]:
+    """Derive full-coverage candidates after SECURITY_MASTER collection; fetch KIND only for candidates; certify LIFECYCLE_EVENTS."""
+    if retrieved_at.tzinfo is None:
+        raise PITDataError("retrieved_at must be timezone-aware")
+    receipts: list[BronzeReceipt] = []
+    for candidate in candidates:
+        pages: tuple[KindDisclosurePage, ...] = kind.search_notices(
+            ticker=candidate.ticker,
+            start=candidate.last_tradable_session.date(),
+            end=candidate.first_absent_session.date(),
+        )
+        if not pages:
+            raise PITDataError(f"KIND lifecycle notice missing for {candidate.instrument_id!r}")
+        if len(pages) != 1:
+            raise PITDataError(f"ambiguous KIND lifecycle notices for {candidate.instrument_id!r}")
+        page = pages[0]
+        parsed = parse_kind_lifecycle_notice(
+            candidate=candidate,
+            disclosure_url=page.disclosure_url,
+            html=page.html,
+            retrieved_at=retrieved_at,
+            source_hash=page.source_hash,
+        )
+        payload = {
+            "instrument_id": candidate.instrument_id,
+            "ticker": candidate.ticker,
+            "last_tradable_session": candidate.last_tradable_session.isoformat(),
+            "first_absent_session": candidate.first_absent_session.isoformat(),
+            "disclosure_url": page.disclosure_url,
+            "html": page.html,
+            "source_hash": page.source_hash,
+            "retrieved_at": retrieved_at.isoformat(),
+            "parsed": {key: str(value) for key, value in parsed.items()},
+        }
+        text = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        receipts.append(
+            bronze.import_bytes(
+                text.encode("utf-8"),
+                kind=EvidenceKind.LIFECYCLE_EVENTS,
+                retrieved_at=retrieved_at,
+                source_label=f"kind:lifecycle:{candidate.ticker}",
+            )
+        )
+    return tuple(receipts)
 
 
 def collect_opendart_corporate_action_evidence(

@@ -48,6 +48,7 @@ def _require_certified_inputs(silver_root: Path, bronze_root: Path) -> None:
             table_dir = Path(silver_root) / table.value
             if not table_dir.exists():
                 missing.append(table.value)
+    missing = [name for name in missing if name != SilverTable.LIFECYCLE_EVENTS.value]
     if missing:
         ordered = sorted(set(missing))
         raise PITDataError(
@@ -115,7 +116,8 @@ def materialize_backtest_inputs(
         kind: tuple(items)
         for kind, items in discover_verified_bronze_receipts(bronze_root=Path(bronze_root)).items()
     }
-    if len(grouped_receipts) != len(EvidenceKind) or any(not grouped_receipts.get(kind) for kind in EvidenceKind):
+    required_kinds = tuple(kind for kind in EvidenceKind if kind is not EvidenceKind.LIFECYCLE_EVENTS)
+    if any(not grouped_receipts.get(kind) for kind in required_kinds):
         raise PITDataError("missing required Bronze receipts for certified Silver")
     try:
         calendar_frame = load_latest_silver_table(
@@ -199,6 +201,8 @@ def materialize_backtest_inputs(
 
     silver_dataset_ids: dict[SilverTable | str, str] = {}
     for table in SilverTable:
+        if table is SilverTable.LIFECYCLE_EVENTS and not (Path(silver_root) / table.value).exists():
+            continue
         silver_dataset_ids[table] = latest_silver_dataset_path(
             root=Path(silver_root), table=table, decision_time=decision_time
         ).name

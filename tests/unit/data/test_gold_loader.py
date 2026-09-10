@@ -385,3 +385,18 @@ def test_daily_market_backfill_plan_rejects_invalid_calendar_inputs(monkeypatch,
     monkeypatch.setattr(module, "load_latest_silver_table", lambda **_kwargs: (_ for _ in ()).throw(OSError("bad")))
     with pytest.raises(PITDataError, match="calendar"):
         module.plan_daily_market_backfill(silver_root=tmp_path, validation_start=date(2024, 1, 1), validation_end=date(2024, 1, 2), decision_time=datetime(2024, 1, 2, tzinfo=UTC))
+
+
+def test_load_gold_window_inputs_overlays_lifecycle_without_replacing_known_master_fields() -> None:
+    from datetime import datetime
+    import polars as pl
+    from src.core.time import KRX_TZ
+    from src.data.gold_loader import apply_lifecycle_master_overlay
+
+    session = datetime(2016,5,18,tzinfo=KRX_TZ)
+    master = pl.DataFrame({'instrument_id':['KRX:008020'],'ticker':['008020'],'market':['KOSPI'],'sector':['Industrial'],'listing_date':[session],'delisting_date':[None],'share_class':['common'],'status':['listed'],'valid_from':[session],'valid_to':[session],'available_at':[session],'source_hash':['m']})
+    life = pl.DataFrame({'instrument_id':['KRX:008020'],'delisting_date':[session.date()],'evidence_status':['verified'],'available_at':[session]})
+    out = apply_lifecycle_master_overlay(security_master=master,lifecycle_events=life)
+    assert out.row(0,named=True)['market'] == 'KOSPI'
+    assert out.row(0,named=True)['sector'] == 'Industrial'
+    assert out.row(0,named=True)['delisting_date'] == session.date()

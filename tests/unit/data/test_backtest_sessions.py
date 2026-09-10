@@ -765,3 +765,18 @@ def test_resolve_backtest_evidence_handles_empty_daily_market() -> None:
     )
     assert result.excluded_instruments == frozenset()
     assert result.quarantine_sessions_by_instrument == {}
+
+
+def test_resolve_lifecycle_only_covers_verified_pit_cleanup_interval() -> None:
+    from datetime import datetime
+    import polars as pl
+    from src.core.time import KRX_TZ, SessionCalendar
+    from src.data.backtest_sessions import resolve_backtest_lifecycle_evidence
+
+    last = datetime(2016,5,18,tzinfo=KRX_TZ)
+    removed = datetime(2016,5,19,tzinfo=KRX_TZ)
+    lifecycle = pl.DataFrame({'instrument_id':['KRX:008020'],'event_type':['delisting'],'published_at':[datetime(2016,5,2,tzinfo=KRX_TZ)],'available_at':[datetime(2016,5,2,tzinfo=KRX_TZ)],'cleanup_start':[last],'cleanup_end':[last],'last_tradable_session':[last],'delisting_date':[removed.date()],'cash_settlement_per_share':[10200.0],'source_url':['https://kind.krx.co.kr/a'],'source_hash':['k'],'evidence_status':['verified'],'evidence_reason':['matched']})
+    daily = pl.DataFrame({'session':[last],'instrument_id':['KRX:008020'],'close':[10200.0]})
+    out = resolve_backtest_lifecycle_evidence(daily_market=daily,lifecycle_events=lifecycle,calendar=SessionCalendar((last,removed)),decision_time_of=lambda s: s.replace(hour=15,minute=30))
+    assert out.actions_by_session[removed][0].action_type.value == 'delisting_cash_out'
+    assert out.actions_by_session[removed][0].cash_amount == 10200.0

@@ -17,6 +17,7 @@ class LedgerActionType(StrEnum):
     SPLIT = "split"
     REVERSE_SPLIT = "reverse_split"
     DIVIDEND = "dividend"
+    DELISTING_CASH_OUT = "delisting_cash_out"
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,6 +316,9 @@ class Ledger:
         if fill.trade_time > self._latest_time:
             self._latest_time = fill.trade_time
 
+    def apply_fill(self, fill: LedgerFill) -> None:
+        self.record_fill(fill)
+
     def settle(self, as_of: datetime) -> None:
         if as_of.tzinfo is None:
             raise ValueError("as_of must be aware")
@@ -401,6 +405,8 @@ class Ledger:
             if act.action_type == LedgerActionType.DIVIDEND:
                 if float(act.factor) != 1.0:
                     raise ValueError("invalid factor for dividend")
+            elif act.action_type == LedgerActionType.DELISTING_CASH_OUT:
+                _ = float(act.cash_amount)
             else:
                 if float(act.cash_amount) != 0.0:
                     raise ValueError("cash_amount must be zero for split")
@@ -421,7 +427,29 @@ class Ledger:
         new_entries: list[LedgerJournalEntry] = []
         # handle dividend and splits from opening snapshot
         for act in actions:
-            if act.action_type == LedgerActionType.DIVIDEND:
+            if act.action_type == LedgerActionType.DELISTING_CASH_OUT:
+                qty, _ = opening_snapshot.get(act.instrument_id, (0, 0.0))
+                credit = qty * float(act.cash_amount)
+                prospective_settled += credit
+                valuation_source = "disclosed_settlement" if float(act.cash_amount) > 0 else "final_close"
+                payload_delist: tuple[tuple[str, object], ...] = (
+                    ("action_type", act.action_type.value),
+                    ("instrument_id", act.instrument_id),
+                    ("cash_amount", float(act.cash_amount)),
+                    ("quantity", qty),
+                    ("valuation_source", valuation_source),
+                )
+                entry_delist = LedgerJournalEntry(
+                    event_id=act.action_id,
+                    event_type=act.action_type.value,
+                    event_time=session_open,
+                    payload=payload_delist,
+                )
+                if entry_delist.event_id in self._journal_ids:
+                    raise ValueError(f"duplicate journal event_id {entry_delist.event_id!r}")  # pragma: no cover
+                new_entries.append(entry_delist)
+                prospective_positions.pop(act.instrument_id, None)
+            elif act.action_type == LedgerActionType.DIVIDEND:
                 qty, _ = opening_snapshot.get(act.instrument_id, (0, 0.0))
                 if qty > 0 and float(act.cash_amount) > 0:
                     credit = qty * float(act.cash_amount)

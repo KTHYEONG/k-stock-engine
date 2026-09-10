@@ -102,3 +102,20 @@ def test_ledger_mark_nav_is_exact_and_does_not_mutate_balances() -> None:
     assert nav.nav == pytest.approx(106.0)
     assert after.settled_cash == before.settled_cash
     assert after.positions == before.positions
+
+
+def test_lifecycle_cash_out_removes_position_without_invented_cost() -> None:
+    from datetime import datetime
+    from src.core.ledger import Ledger, LedgerActionType, LedgerCorporateAction, LedgerFill, LedgerSide
+    from src.core.time import KRX_TZ
+
+    last = datetime(2016,5,18,9,tzinfo=KRX_TZ)
+    removed = datetime(2016,5,19,9,tzinfo=KRX_TZ)
+    ledger = Ledger('x', 10000.0, last)
+    ledger.apply_fill(LedgerFill('buy','KRX:008020',LedgerSide.BUY,2,100.0,0.0,0.0,0.0,last,last))
+    entries = ledger.apply_corporate_actions((LedgerCorporateAction('delist','KRX:008020',LedgerActionType.DELISTING_CASH_OUT,removed,1.0,10200.0),), session_open=removed, cash_in_lieu_prices={})
+    snap = ledger.snapshot(removed)
+    assert ledger.quantity_of('KRX:008020') == 0
+    assert snap.settled_cash == 30200.0
+    assert dict(entries[0].payload)['valuation_source'] == 'disclosed_settlement'
+    assert snap.commission == snap.tax == snap.slippage_cost == 0.0

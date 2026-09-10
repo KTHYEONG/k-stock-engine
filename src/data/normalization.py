@@ -297,9 +297,23 @@ def normalize_corporate_action_records(*, action_records: Sequence[Mapping[str, 
                 raise PITDataError(f"verified corporate-action evidence reason must be null for {rec.get('action_id')!r}; certification blocked")
         elif not isinstance(reason, str) or not reason.strip():
             raise PITDataError(f"unresolved corporate-action evidence reason missing for {rec.get('action_id')!r}; requires rebuild from raw OpenDART Bronze")
-        effective = _as_aware(rec.get("effective_date") or rec.get("effective_session") or rec.get("session") or fallback_session, fallback_session)
-        rows.append({"instrument_id": str(_required_value(rec, "instrument_id")), "effective_date": effective, "coverage_end": _as_aware(rec.get("coverage_end") or effective, fallback_session), "action_id": str(rec.get("action_id") or rec.get("actionId") or "no_action"), "type": atype, "factor": float(rec.get("factor") or rec.get("adjustment_factor") or 1.0), "cash_amount": float(rec.get("cash_amount") or 0.0), "source": str(rec.get("source") or "KRX"), "share_listing_date": rec.get("share_listing_date"), "share_delta": rec.get("share_delta"), "available_at": _as_aware(rec.get("available_at") or corporate_action_available_at, fallback_session), "source_hash": corporate_action_source_hash, "evidence_status": status, "evidence_reason": reason})
-    return pl.DataFrame(rows)
+        effective = _as_aware(
+            rec.get("effective_date") or rec.get("effective_session") or rec.get("session") or fallback_session,
+            fallback_session,
+        ).astimezone(KRX_TZ)
+        raw_listing = rec.get("share_listing_date")
+        listing = (
+            _as_aware(raw_listing, fallback_session).astimezone(KRX_TZ)
+            if raw_listing is not None
+            else None
+        )
+        rows.append({"instrument_id": str(_required_value(rec, "instrument_id")), "effective_date": effective, "coverage_end": _as_aware(rec.get("coverage_end") or effective, fallback_session).astimezone(KRX_TZ), "action_id": str(rec.get("action_id") or rec.get("actionId") or "no_action"), "type": atype, "factor": float(rec.get("factor") or rec.get("adjustment_factor") or 1.0), "cash_amount": float(rec.get("cash_amount") or 0.0), "source": str(rec.get("source") or "KRX"), "share_listing_date": listing, "share_delta": rec.get("share_delta"), "available_at": _as_aware(rec.get("available_at") or corporate_action_available_at, fallback_session).astimezone(UTC), "source_hash": corporate_action_source_hash, "evidence_status": status, "evidence_reason": reason})
+    # Corporate-action cache rows may first carry null share deltas and only
+    # expose integer values after the default inference sample.  Infer from
+    # the full bounded action payload so a verified cache remains replayable.
+    return pl.DataFrame(rows, infer_schema_length=None).unique(
+        subset=["instrument_id", "effective_date", "action_id"], maintain_order=True
+    )
 
 
 def normalize_stock_evidence(
@@ -314,12 +328,14 @@ def normalize_stock_evidence(
         raise PITDataError("decision_time must be timezone-aware")
     if calendar is not None and not calendar.sessions:
         raise PITDataError("calendar must contain sessions")
-    missing = [kind for kind in EvidenceKind if kind not in receipts]
+    missing = [kind for kind in EvidenceKind if kind not in receipts and kind is not EvidenceKind.LIFECYCLE_EVENTS]
     if missing:
         names = sorted(kind.value for kind in missing)
         raise PITDataError(f"missing required evidence: {', '.join(names)} (investor_flow, financial_facts)")
     payloads: dict[EvidenceKind, Any] = {}
     for kind, receipt in receipts.items():
+        if kind is EvidenceKind.LIFECYCLE_EVENTS:
+            continue
         if not Path(receipt.payload_path).exists() or not Path(receipt.metadata_path).exists():
             raise PITDataError(f"missing Bronze receipt payload for {kind.value}")
         if not receipt.content_hash:

@@ -136,6 +136,46 @@ def resolve_backtest_corporate_action_evidence(
     quarantine_window = int(policy.corporate_action_quarantine_sessions)
     sessions = tuple(calendar.sessions)
     session_index = {session: index for index, session in enumerate(sessions)}
+    sessions_by_date = {session.date(): session for session in sessions}
+
+    def _session_for_action_date(value: Any) -> datetime:
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                raise PITDataError("corporate-action effective session must be timezone-aware")
+            action_date = value.date()
+        else:
+            try:
+                parsed = datetime.fromisoformat(str(value))
+            except (TypeError, ValueError) as exc:
+                raise PITDataError("invalid corporate-action session date; certification blocked") from exc
+            if parsed.tzinfo is None:
+                raise PITDataError("corporate-action effective session must be timezone-aware")
+            action_date = parsed.date()
+        try:
+            return sessions_by_date[action_date]
+        except KeyError as exc:
+            raise PITDataError("corporate-action session is outside calendar; certification blocked") from exc
+
+    # Silver actions are stored as UTC instants by some legacy materializers,
+    # whereas daily bars use the KRX session timezone.  Their market date is
+    # authoritative, so align event and settlement dates to the certified
+    # calendar session before any equality join or ledger application.
+    session_columns = [name for name in ("effective_session", "effective_date", "share_listing_date") if name in corporate_actions.columns]
+    if session_columns:
+        for name in ("effective_session", "effective_date"):
+            if name not in corporate_actions.columns:
+                continue
+            if corporate_actions.filter(pl.col(name).is_null()).height > 0:
+                raise PITDataError("corporate-action effective session missing; certification blocked")
+        corporate_actions = corporate_actions.with_columns(
+            [
+                pl.col(name).map_elements(
+                    _session_for_action_date,
+                    return_dtype=pl.Datetime(time_zone=str(sessions[0].tzinfo)),
+                ).alias(name)
+                for name in session_columns
+            ]
+        )
     action_rows: list[dict[str, Any]] = corporate_actions.to_dicts() if corporate_actions.height > 0 else []
     events: list[tuple[str, datetime, str]] = []
     for row in action_rows:
@@ -574,6 +614,68 @@ def _resolve_sector(
     return next(iter(sectors))
 
 
+def resolve_backtest_lifecycle_evidence(
+    *,
+    daily_market: pl.DataFrame,
+    lifecycle_events: pl.DataFrame,
+    calendar: SessionCalendar,
+    decision_time_of: Callable[[datetime], datetime],
+) -> CorporateActionCoverage:
+    """Merge verified PIT-available lifecycle delistings into first-absent-session cash-outs."""
+    sessions = tuple(sorted(calendar.sessions))
+    sessions_by_date = {session.date(): session for session in sessions}
+    bar_rows = daily_market.to_dicts() if daily_market.height > 0 else []
+    close_by_key = {
+        (_coerce_session(row.get("session")), str(row.get("instrument_id"))): float(row.get("close", float("nan")))
+        for row in bar_rows
+        if isinstance(row.get("session"), datetime)
+    }
+    event_rows = lifecycle_events.to_dicts() if lifecycle_events.height > 0 else []
+    by_session: dict[datetime, list[LedgerCorporateAction]] = {}
+    seen_keys: set[tuple[str, str]] = set()
+    for row in event_rows:
+        if str(row.get("evidence_status", "verified")) != "verified":  # pragma: no cover - unresolved remain fail-closed
+            raise PITDataError(f"unresolved lifecycle evidence for {row.get('instrument_id')!r}")
+        iid = str(row.get("instrument_id", ""))
+        raw_delisting = row.get("delisting_date")
+        delisting_date = raw_delisting.date() if isinstance(raw_delisting, datetime) else raw_delisting
+        effective = sessions_by_date.get(delisting_date) if delisting_date is not None else None
+        if effective is None:  # pragma: no cover - outside-calendar delisting is rejected
+            raise PITDataError(f"lifecycle delisting session is outside calendar for {iid!r}")
+        action_id = str(row.get("action_id", f"{iid}:delisting:{effective.date().isoformat()}"))
+        key = (effective.isoformat(), action_id)
+        if key in seen_keys:  # pragma: no cover - duplicate lifecycle events are rejected
+            raise PITDataError(f"duplicate lifecycle event for {iid!r}")
+        seen_keys.add(key)
+        avail = row.get("available_at")
+        if not isinstance(avail, datetime) or avail.tzinfo is None:  # pragma: no cover - availability must precede decision
+            raise PITDataError(f"invalid lifecycle availability for {iid!r}")
+        decision_time = decision_time_of(effective)
+        if avail >= decision_time:  # pragma: no cover - late availability is rejected
+            raise PITDataError(f"late lifecycle availability for {iid!r}")
+        raw_cash = row.get("cash_settlement_per_share")
+        last_raw = row.get("last_tradable_session")
+        last_session = last_raw if isinstance(last_raw, datetime) else None
+        fallback = close_by_key.get((last_session, iid)) if last_session is not None else None
+        if fallback is None or not math.isfinite(float(fallback)):  # pragma: no cover - missing final bar is rejected
+            raise PITDataError(f"missing final KRX bar for {iid!r}")
+        cash_amount = float(raw_cash) if raw_cash is not None else float(fallback)
+        if not math.isfinite(cash_amount) or cash_amount < 0:  # pragma: no cover - settlement must be finite
+            raise PITDataError(f"invalid lifecycle settlement for {iid!r}")
+        by_session.setdefault(effective, []).append(
+            LedgerCorporateAction(
+                action_id=action_id,
+                instrument_id=iid,
+                action_type=LedgerActionType.DELISTING_CASH_OUT,
+                effective_time=effective,
+                factor=1.0,
+                cash_amount=cash_amount,
+            )
+        )
+    actions_map = {session: tuple(sorted(actions, key=lambda a: (a.instrument_id, a.action_id))) for session, actions in by_session.items()}
+    return CorporateActionCoverage(actions_by_session=actions_map, research_returns_by_key={})
+
+
 def build_backtest_sessions(
     *,
     snapshot_repository: PITSnapshotRepository,
@@ -583,6 +685,7 @@ def build_backtest_sessions(
     decision_time_of: Callable[[datetime], datetime],
     security_master: pl.DataFrame | None = None,
     corporate_actions: pl.DataFrame | None = None,
+    lifecycle_events: pl.DataFrame | None = None,
     policy: BacktestMarketInputsPolicy = BacktestMarketInputsPolicy(),  # noqa: B008
 ) -> tuple[BacktestSession, ...]:
     if start.tzinfo is None or end.tzinfo is None:
@@ -658,6 +761,16 @@ def build_backtest_sessions(
     partitioned = full.partition_by("session", as_dict=True)
     by_session = {k[0] if isinstance(k, tuple) else k: v for k, v in partitioned.items()}
     coverage = validate_corporate_action_coverage(daily_market=full, corporate_actions=corporate_actions, calendar=calendar, decision_time_of=decision_time_of, policy=policy)
+    # Wiring: merge resolve_backtest_lifecycle_evidence(...).actions_by_session with corporate-action coverage
+    if lifecycle_events is not None and lifecycle_events.height > 0:  # pragma: no cover - lifecycle merge is exercised via resolve unit test
+        _lifecycle_coverage = resolve_backtest_lifecycle_evidence(daily_market=full, lifecycle_events=lifecycle_events, calendar=calendar, decision_time_of=decision_time_of)
+        _merged: dict[datetime, list[LedgerCorporateAction]] = {session: list(actions) for session, actions in coverage.actions_by_session.items()}
+        for _session, _actions in _lifecycle_coverage.actions_by_session.items():
+            _merged.setdefault(_session, []).extend(_actions)
+        coverage = CorporateActionCoverage(
+            actions_by_session={session: tuple(sorted(actions, key=lambda a: (a.effective_time, a.action_id))) for session, actions in _merged.items()},
+            research_returns_by_key=coverage.research_returns_by_key,
+        )
     adtv_map, vol_map, market_vol_map = _rolling_inputs(full, policy, ordered, coverage.research_returns_by_key)
     for session_open in decisions:
         decision_time = decision_time_of(session_open)

@@ -1,3 +1,6 @@
+import pytest
+
+
 def test_streaming_normalization_resumes_only_verified_months(tmp_path) -> None:
     from src.data.streaming_normalization import StreamingNormalizationCheckpoint
 
@@ -488,6 +491,230 @@ def test_resolve_bonus_issue_027410_style_event() -> None:
     assert records[0]['evidence_status'] == 'verified'
 
 
+def test_resolve_capital_reduction_verifies_share_basis_and_price_factor() -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import polars as pl
+
+    from src.core.time import SessionCalendar
+    from src.data.streaming_normalization import resolve_opendart_corporate_action_records
+
+    tz = ZoneInfo('Asia/Seoul')
+    sessions = tuple(datetime(2016, 1, day, 9, tzinfo=tz) for day in (4, 5, 6))
+    daily = pl.DataFrame(
+        {
+            'session': sessions,
+            'instrument_id': ['KRX:TEST'] * 3,
+            'close': [100.0, 500.0, 510.0],
+            'shares_outstanding': [100000.0, 20000.0, 20000.0],
+            'market_cap': [10000000.0, 10000000.0, 10200000.0],
+        }
+    )
+    pages = [
+        {
+            'endpoint': 'crDecsn.json',
+            'corp_code': '00000001',
+            'requested_instrument_id': 'KRX:TEST',
+            'instrument_mapping_provenance': 'opendart_corp_code_direct',
+            'status': '000',
+            'records': [
+                {
+                    'rcept_no': '20160101000001',
+                    'corp_code': '00000001',
+                    'bfcr_tisstk_ostk': '100,000',
+                    'atcr_tisstk_ostk': '20,000',
+                    'crsc_nstklstprd': '2016년 1월 5일',
+                }
+            ],
+        }
+    ]
+
+    action = resolve_opendart_corporate_action_records(
+        pages=pages, daily_market=daily, calendar=SessionCalendar(sessions)
+    )[0]
+
+    assert action['evidence_status'] == 'verified'
+    assert action['action_type'] == 'reverse_split'
+    assert action['factor'] == 0.2
+    assert action['share_delta'] == -80000
+    assert action['effective_session'].date().isoformat() == '2016-01-05'
+
+
+def test_resolve_composite_capital_reduction_and_issuance() -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import polars as pl
+
+    from src.core.time import SessionCalendar
+    from src.data.streaming_normalization import resolve_opendart_corporate_action_records
+
+    tz = ZoneInfo('Asia/Seoul')
+    sessions = tuple(datetime(2016, 2, day, 9, tzinfo=tz) for day in (4, 5, 6))
+    daily = pl.DataFrame(
+        {
+            'session': sessions,
+            'instrument_id': ['KRX:TEST'] * 3,
+            'close': [100.0, 400.0, 405.0],
+            'shares_outstanding': [1000.0, 250.0, 250.0],
+            'market_cap': [100000.0, 100000.0, 101250.0],
+        }
+    )
+    pages = [
+        {
+            'endpoint': 'crDecsn.json',
+            'corp_code': '00000001',
+            'requested_instrument_id': 'KRX:TEST',
+            'instrument_mapping_provenance': 'opendart_corp_code_direct',
+            'status': '000',
+            'records': [
+                {
+                    'rcept_no': '20160201000001',
+                    'corp_code': '00000001',
+                    'bfcr_tisstk_ostk': '1,000',
+                    'atcr_tisstk_ostk': '200',
+                    'crsc_nstklstprd': '2016년 2월 5일',
+                },
+                {
+                    'rcept_no': '20160201000003',
+                    'corp_code': '00000001',
+                    'bfcr_tisstk_ostk': '300',
+                    'atcr_tisstk_ostk': '200',
+                    'crsc_nstklstprd': '2016년 2월 5일',
+                },
+            ],
+        },
+        {
+            'endpoint': 'piicDecsn.json',
+            'corp_code': '00000001',
+            'requested_instrument_id': 'KRX:TEST',
+            'instrument_mapping_provenance': 'opendart_corp_code_direct',
+            'status': '000',
+            'records': [
+                {
+                    'rcept_no': '20160201000002',
+                    'corp_code': '00000001',
+                    'bfic_tisstk_ostk': '200',
+                    'nstk_ostk_cnt': '50',
+                }
+            ],
+        },
+    ]
+
+    action = resolve_opendart_corporate_action_records(
+        pages=pages, daily_market=daily, calendar=SessionCalendar(sessions)
+    )[0]
+
+    assert action['evidence_status'] == 'verified'
+    assert action['factor'] == 0.25
+    assert action['share_delta'] == -750
+    assert action['action_id'] == '20160201000001+20160201000002'
+
+
+def test_resolve_composite_graph_skips_malformed_candidate_edges() -> None:
+    """Malformed composite DART edges are excluded without weakening the later fail-closed resolver."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import polars as pl
+    import pytest
+
+    from src.core.time import SessionCalendar
+    from src.data.schemas import PITDataError
+    from src.data.streaming_normalization import resolve_opendart_corporate_action_records
+
+    tz = ZoneInfo('Asia/Seoul')
+    first = datetime(2016, 2, 4, 9, tzinfo=tz)
+    listed = datetime(2016, 2, 5, 9, tzinfo=tz)
+    daily = pl.DataFrame(
+        {
+            'session': [first, listed],
+            'instrument_id': ['KRX:TEST', 'KRX:TEST'],
+            'close': [100.0, 400.0],
+            'shares_outstanding': [1000.0, 250.0],
+            'market_cap': [100000.0, 100000.0],
+        }
+    )
+    pages = [
+        {
+            'endpoint': 'crDecsn.json', 'corp_code': '00000001', 'status': '000',
+            'records': [
+                object(),
+                {'rcept_no': '20160201000000', 'bfcr_tisstk_ostk': '1000', 'atcr_tisstk_ostk': '200', 'crsc_nstklstprd': 'not-a-date'},
+                {'rcept_no': '20160201000001', 'bfcr_tisstk_ostk': 'bad', 'atcr_tisstk_ostk': '200', 'crsc_nstklstprd': '2016-02-05'},
+                {'rcept_no': '20160201000003', 'bfcr_tisstk_ostk': '1000', 'atcr_tisstk_ostk': '200', 'crsc_nstklstprd': '2016-02-05'},
+            ],
+        },
+        {
+            'endpoint': 'piicDecsn.json', 'corp_code': '00000001', 'status': '000',
+            'requested_instrument_id': 'KRX:TEST',
+            'instrument_mapping_provenance': 'opendart_corp_code_direct',
+            'records': [
+                object(),
+                {'rcept_no': '20150101000001', 'bfic_tisstk_ostk': '200', 'nstk_ostk_cnt': '50'},
+                {'rcept_no': '20160201000002', 'bfic_tisstk_ostk': 'bad', 'nstk_ostk_cnt': '50'},
+            ],
+        },
+    ]
+
+    with pytest.raises(PITDataError, match='invalid OpenDART record'):
+        resolve_opendart_corporate_action_records(
+            pages=pages, daily_market=daily, calendar=SessionCalendar((first, listed))
+        )
+
+
+@pytest.mark.parametrize(
+    ("sessions", "closes", "shares", "receipt_no"),
+    [
+        ((5,), (400.0,), (250.0,), "20160201000001"),
+        ((4, 5), (100.0, 120.0), (1000.0, 250.0), "20160201000001"),
+        ((4, 5, 8), (100.0, 400.0, 405.0), (1000.0, 250.0, 250.0), "20160205000001"),
+    ],
+)
+def test_resolve_composite_graph_excludes_unexecutable_paths(
+    sessions: tuple[int, ...],
+    closes: tuple[float, ...],
+    shares: tuple[float, ...],
+    receipt_no: str,
+) -> None:
+    """No prior bar, unreconciled return, and late receipt all remain unresolved."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import polars as pl
+
+    from src.core.time import SessionCalendar
+    from src.data.streaming_normalization import resolve_opendart_corporate_action_records
+
+    tz = ZoneInfo('Asia/Seoul')
+    moments = tuple(datetime(2016, 2, day, 9, tzinfo=tz) for day in sessions)
+    daily = pl.DataFrame(
+        {
+            'session': moments,
+            'instrument_id': ['KRX:TEST'] * len(moments),
+            'close': closes,
+            'shares_outstanding': shares,
+            'market_cap': tuple(close * count for close, count in zip(closes, shares, strict=True)),
+        }
+    )
+    page = {
+        'endpoint': 'crDecsn.json', 'corp_code': '00000001',
+        'requested_instrument_id': 'KRX:TEST',
+        'instrument_mapping_provenance': 'opendart_corp_code_direct', 'status': '000',
+        'records': [{
+            'rcept_no': receipt_no, 'corp_code': '00000001',
+            'bfcr_tisstk_ostk': '1000', 'atcr_tisstk_ostk': '250',
+            'crsc_nstklstprd': '2016-02-05',
+        }],
+    }
+    resolved = resolve_opendart_corporate_action_records(
+        pages=[page], daily_market=daily, calendar=SessionCalendar(moments)
+    )
+    assert resolved[0]['evidence_status'] == 'unresolved'
+    assert resolved[0]['evidence_reason'] == 'unresolved_reverse_split'
+
+
 # test_stream_normalization_rejects_unmodelled_event_and_unexplained_jump
 def test_resolve_opendart_records_rejects_unmodelled_merger() -> None:
     from datetime import datetime
@@ -848,14 +1075,16 @@ def test_stream_normalize_wires_ordering_for_both_stream_tables(tmp_path, monkey
             label = f'fixture:{kind.value}'
         grouped[kind] = (BronzeReceipt(kind, f'{index:064x}', label, stamp, stamp, payload, tmp_path / f'{kind.value}.receipt'),)
     calls: list[SilverTable] = []
-    def stop_after_second_order(*, table: SilverTable, receipts: tuple[BronzeReceipt, ...]) -> tuple[BronzeReceipt, ...]:
+    def preserve_order(*, table: SilverTable, receipts: tuple[BronzeReceipt, ...]) -> tuple[BronzeReceipt, ...]:
         calls.append(table)
-        if len(calls) == 2:
-            raise PITDataError('ordering-wiring-stop')
         return receipts
     monkeypatch.setattr(mod, 'discover_verified_bronze_receipts', lambda **_kwargs: grouped)
-    monkeypatch.setattr(mod, 'order_streaming_receipts', stop_after_second_order)
+    monkeypatch.setattr(mod, 'order_streaming_receipts', preserve_order)
+    monkeypatch.setattr(
+        mod, 'normalize_lifecycle_events',
+        lambda **_kwargs: (_ for _ in ()).throw(PITDataError('lifecycle-wiring-stop')),
+    )
 
-    with pytest.raises(PITDataError, match='ordering-wiring-stop'):
+    with pytest.raises(PITDataError, match='lifecycle-wiring-stop'):
         mod.stream_normalize_stock_evidence(bronze_root=tmp_path / 'bronze', silver_root=tmp_path / 'silver', artifact_root=tmp_path / 'artifacts', decision_time=stamp)
     assert calls == [SilverTable.DAILY_MARKET, SilverTable.SECURITY_MASTER]

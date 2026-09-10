@@ -78,6 +78,47 @@ def test_backtest_rejects_legacy_evidence_status() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("effective_session", "message"),
+    [
+        (None, "effective session missing"),
+        (datetime(2024, 1, 3, 9), "timezone-aware"),
+        ("not-an-iso-date", "invalid corporate-action session date"),
+        ("2024-01-03T09:00:00", "timezone-aware"),
+        ("2024-02-01T09:00:00+09:00", "outside calendar"),
+    ],
+)
+def test_backtest_action_session_alignment_rejects_invalid_dates(
+    effective_session: object, message: str
+) -> None:
+    """Legacy materialized dates must be aligned or fail closed before joins."""
+    from src.data.backtest_sessions import (
+        BacktestMarketInputsPolicy,
+        resolve_backtest_corporate_action_evidence,
+    )
+
+    sessions = _sessions(2, 3)
+    daily = pl.DataFrame(
+        {"session": list(sessions), "instrument_id": ["KRX:A"] * 2, "close": [100.0, 100.0]}
+    )
+    actions = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:A"],
+            "action_type": ["split"],
+            "effective_session": [effective_session],
+            "evidence_status": ["verified"],
+            "evidence_reason": [None],
+        }
+    )
+    with pytest.raises(PITDataError, match=message):
+        resolve_backtest_corporate_action_evidence(
+            daily_market=daily,
+            corporate_actions=actions,
+            calendar=SessionCalendar(sessions),
+            policy=BacktestMarketInputsPolicy(),
+        )
+
+
 def test_streaming_rejects_non_dict_record() -> None:
     from src.data.streaming_normalization import resolve_opendart_corporate_action_records
 
