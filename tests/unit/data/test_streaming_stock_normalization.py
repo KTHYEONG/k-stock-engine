@@ -1100,3 +1100,26 @@ def test_stream_normalize_stock_evidence_materializes_empty_or_unresolved_lifecy
     assert frame.schema['instrument_id'] == pl.String
     assert 'resolution_kind' in frame.columns
     assert SilverTable.LIFECYCLE_EVENTS.value == 'lifecycle_events'
+
+
+def test_normalize_lifecycle_events_preserves_verified_exchange_over_generic_unresolved(tmp_path) -> None:
+    from datetime import datetime
+    import json
+    import polars as pl
+    from src.core.time import KRX_TZ, SessionCalendar
+    from src.data.schemas import BronzeReceipt, EvidenceKind
+    from src.data.streaming_normalization import normalize_lifecycle_events
+
+    common = {'lifecycle_event_id': 'evt-003450', 'instrument_id': 'KRX:003450', 'source_security_id': 'KR7003450004', 'delisting_date': '2016-11-01', 'available_at': '2016-10-20T09:00:00+09:00'}
+    generic = tmp_path / 'generic.json'
+    generic.write_text(json.dumps({**common, 'evidence_status': 'unresolved', 'resolution_kind': 'unresolved'}), encoding='utf-8')
+    verified = tmp_path / 'verified.json'
+    verified.write_text(json.dumps({**common, 'evidence_status': 'verified', 'resolution_kind': 'merger_or_exchange', 'successor_delivery_date': '2016-11-02', 'successor_allocations_json': '[{"successor_security_id":"KR7105560007","successor_instrument_id":"KRX:105560","ratio":"0.1907312","cost_basis_weight":"1"}]', 'source_provider': 'kind', 'document_receipt_no': 'kind-1', 'document_sha256': 'a' * 64}), encoding='utf-8')
+    stamp = datetime(2016, 10, 21, tzinfo=KRX_TZ)
+    receipts = (BronzeReceipt(EvidenceKind.LIFECYCLE_EVENTS, '0' * 64, 'generic', stamp, stamp, generic, generic), BronzeReceipt(EvidenceKind.LIFECYCLE_EVENTS, '1' * 64, 'verified', stamp, stamp, verified, verified))
+    frame = normalize_lifecycle_events(receipts=receipts, calendar=SessionCalendar((stamp,)))
+    assert frame.height == 1
+    assert frame.item(0, 'resolution_kind') == 'merger_or_exchange'
+    assert frame.item(0, 'successor_delivery_date').isoformat() == '2016-11-02'
+    assert 'document_sha256' in frame.columns
+    assert frame.schema['successor_allocations_json'] == pl.String

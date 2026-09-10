@@ -1,22 +1,87 @@
 """PIT backtest session builder from certified Silver snapshots."""
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from itertools import pairwise
 from typing import Any
 
 import polars as pl
 
 from src.core.instruments import AssetKind, Instrument
-from src.core.ledger import LedgerActionType, LedgerCorporateAction
+from src.core.ledger import LedgerActionType, LedgerCorporateAction, LedgerSuccessorAllocation
 from src.core.time import SessionCalendar
 from src.data.schemas import PITDataError, SilverTable
 from src.data.snapshot import PITSnapshotRepository
 from src.engine.backtest import BacktestSession
 from src.engine.fill_model import HistoricalBar
+
+_SUCCESSOR_ALLOCATION_KEYS = frozenset(
+    {"successor_security_id", "successor_instrument_id", "ratio", "cost_basis_weight"}
+)
+
+
+def _decode_decimal_string(value: object, *, field: str, lifecycle_event_id: str) -> Decimal:
+    if not isinstance(value, str) or not value.strip():
+        raise PITDataError(f"lifecycle {lifecycle_event_id!r} successor {field} must be a Decimal string")
+    try:
+        number = Decimal(value.strip())
+    except (InvalidOperation, ValueError, AttributeError, TypeError) as exc:
+        raise PITDataError(f"lifecycle {lifecycle_event_id!r} successor {field} is malformed") from exc
+    if not number.is_finite() or number <= 0:
+        raise PITDataError(f"lifecycle {lifecycle_event_id!r} successor {field} must be positive finite")
+    return number
+
+
+def decode_successor_allocations(*, raw: object, lifecycle_event_id: str) -> tuple[LedgerSuccessorAllocation, ...]:
+    """Decode canonical successor allocation JSON into Decimal ledger allocations.
+
+    Expects a JSON array of objects with exactly the keys
+    ``successor_security_id``, ``successor_instrument_id``, ``ratio`` and
+    ``cost_basis_weight``. Ratios and weights must be Decimal strings so no
+    binary-float rounding enters the ledger entitlement math.
+    """
+    if not lifecycle_event_id:
+        raise PITDataError("lifecycle successor allocations require lifecycle_event_id")
+    if raw is None:
+        raise PITDataError(f"lifecycle {lifecycle_event_id!r} successor allocations are missing")
+    if isinstance(raw, str):
+        try:
+            parsed: object = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise PITDataError(f"lifecycle {lifecycle_event_id!r} successor allocations are malformed") from exc
+    else:
+        parsed = raw
+    if not isinstance(parsed, list) or not parsed:
+        raise PITDataError(f"lifecycle {lifecycle_event_id!r} successor allocations must be a non-empty array")
+    allocations: list[LedgerSuccessorAllocation] = []
+    seen_security_ids: set[str] = set()
+    for item in parsed:
+        if not isinstance(item, dict):
+            raise PITDataError(f"lifecycle {lifecycle_event_id!r} successor allocation must be an object")
+        if set(item) - _SUCCESSOR_ALLOCATION_KEYS:
+            raise PITDataError(f"lifecycle {lifecycle_event_id!r} successor allocation has unknown keys")
+        security_id = item.get("successor_security_id")
+        instrument_id = item.get("successor_instrument_id")
+        if not isinstance(security_id, str) or not security_id:
+            raise PITDataError(f"lifecycle {lifecycle_event_id!r} successor identity must not be empty")
+        if not isinstance(instrument_id, str) or not instrument_id:
+            raise PITDataError(f"lifecycle {lifecycle_event_id!r} successor identity must not be empty")
+        if security_id == instrument_id:
+            raise PITDataError(f"lifecycle {lifecycle_event_id!r} successor identity must not be equal")
+        if security_id in seen_security_ids:
+            raise PITDataError(f"lifecycle {lifecycle_event_id!r} successor_security_id must be unique")
+        seen_security_ids.add(security_id)
+        ratio = _decode_decimal_string(item.get("ratio"), field="ratio", lifecycle_event_id=lifecycle_event_id)
+        weight = _decode_decimal_string(
+            item.get("cost_basis_weight"), field="cost_basis_weight", lifecycle_event_id=lifecycle_event_id
+        )
+        allocations.append(LedgerSuccessorAllocation(instrument_id, ratio, weight))
+    return tuple(allocations)
 
 
 @dataclass(frozen=True, slots=True)
@@ -656,6 +721,50 @@ def resolve_backtest_lifecycle_evidence(
         if not kind_text:
             raw_cash_hint = row.get("cash_settlement_per_share")
             kind_text = "cash_settlement" if raw_cash_hint is not None else "unsettled_delisting"
+        if kind_text == "merger_or_exchange":
+            lifecycle_event_id = row.get("lifecycle_event_id")
+            if not isinstance(lifecycle_event_id, str) or not lifecycle_event_id:
+                raise PITDataError(f"lifecycle merger event requires lifecycle_event_id for {iid!r}")
+            raw_delivery = row.get("successor_delivery_date")
+            delivery_day = raw_delivery.date() if isinstance(raw_delivery, datetime) else raw_delivery
+            delivery_session = sessions_by_date.get(delivery_day) if delivery_day is not None else None
+            if delivery_session is None:
+                raise PITDataError(f"lifecycle {lifecycle_event_id!r} successor delivery is outside calendar")
+            raw_allocations = row.get("successor_allocations_json")
+            allocations = decode_successor_allocations(raw=raw_allocations, lifecycle_event_id=lifecycle_event_id)
+            source_security_id = row.get("source_security_id")
+            if not isinstance(source_security_id, str) or not source_security_id:
+                raise PITDataError(f"lifecycle {lifecycle_event_id!r} requires source_security_id")
+            if avail >= decision_time_of(delivery_session):
+                raise PITDataError(f"lifecycle {lifecycle_event_id!r} successor delivery is not PIT-available")
+            entitlement_action = LedgerCorporateAction(
+                action_id=f"{lifecycle_event_id}:exchange_entitlement",
+                instrument_id=iid,
+                action_type=LedgerActionType.EXCHANGE_ENTITLEMENT,
+                effective_time=effective,
+                factor=1.0,
+                cash_amount=0.0,
+                successor_allocations=allocations,
+                lifecycle_event_id=lifecycle_event_id,
+            )
+            delivery_action = LedgerCorporateAction(
+                action_id=f"{lifecycle_event_id}:successor_delivery",
+                instrument_id=iid,
+                action_type=LedgerActionType.SUCCESSOR_DELIVERY,
+                effective_time=delivery_session,
+                factor=1.0,
+                cash_amount=0.0,
+                successor_allocations=allocations,
+                lifecycle_event_id=lifecycle_event_id,
+            )
+            for action_session, action in ((effective, entitlement_action), (delivery_session, delivery_action)):
+                action_key = (action_session.isoformat(), action.action_id)
+                if action_key in seen_keys:
+                    raise PITDataError(f"duplicate lifecycle event for {iid!r}")
+                seen_keys.add(action_key)
+            by_session.setdefault(effective, []).append(entitlement_action)
+            by_session.setdefault(delivery_session, []).append(delivery_action)
+            continue
         if kind_text == "cash_settlement":
             raw_cash = row.get("cash_settlement_per_share")
             if raw_cash is None:  # pragma: no cover
