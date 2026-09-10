@@ -835,3 +835,121 @@ def test_ledger_delisting_unsettled_records_no_cash_and_rejects_open_position():
     ledger2.record_fill(LedgerFill(fill_id="f1", instrument_id="KRX:074150", side=LedgerSide.BUY, quantity=1, price=9000.0, commission=0.0, tax=0.0, slippage_cost=0.0, trade_time=datetime(2016, 5, 18, 9, tzinfo=KRX_TZ), settlement_time=datetime(2016, 5, 18, 9, tzinfo=KRX_TZ)))
     with pytest.raises(PITDataError, match="unsettled"):
         ledger2.apply_corporate_actions((action,), session_open=session, cash_in_lieu_prices={})
+
+
+def test_resolve_lifecycle_exchange_emits_entitlement_and_delivery_with_pit_terms() -> None:
+    from datetime import date, datetime
+    import json
+    import polars as pl
+    from src.core.ledger import LedgerActionType
+    from src.core.time import KRX_TZ, SessionCalendar
+    from src.data.backtest_sessions import resolve_backtest_lifecycle_evidence
+
+    delisting = datetime(2016, 11, 1, 9, tzinfo=KRX_TZ)
+    delivery = datetime(2016, 11, 2, 9, tzinfo=KRX_TZ)
+    allocations = json.dumps([{'successor_security_id': 'KR7105560007', 'successor_instrument_id': 'KRX:105560', 'ratio': '0.1907312', 'cost_basis_weight': '1'}])
+    events = pl.DataFrame({'lifecycle_event_id': ['evt-003450'], 'instrument_id': ['KRX:003450'], 'source_security_id': ['KR7003450004'], 'evidence_status': ['verified'], 'resolution_kind': ['merger_or_exchange'], 'available_at': [datetime(2016, 10, 20, 9, tzinfo=KRX_TZ)], 'delisting_date': [date(2016, 11, 1)], 'successor_delivery_date': [date(2016, 11, 2)], 'successor_allocations_json': [allocations], 'cash_settlement_per_share': [None]})
+    out = resolve_backtest_lifecycle_evidence(daily_market=pl.DataFrame(), lifecycle_events=events, calendar=SessionCalendar((delisting, delivery)), decision_time_of=lambda value: value.replace(hour=15, minute=30))
+    assert out.actions_by_session[delisting][0].action_type is LedgerActionType.EXCHANGE_ENTITLEMENT
+    assert out.actions_by_session[delivery][0].action_type is LedgerActionType.SUCCESSOR_DELIVERY
+    assert out.actions_by_session[delivery][0].successor_allocations[0].successor_instrument_id == 'KRX:105560'
+
+
+def test_resolve_lifecycle_exchange_rejects_missing_or_late_terms() -> None:
+    from datetime import date, datetime
+    import polars as pl
+    import pytest
+    from src.core.time import KRX_TZ, SessionCalendar
+    from src.data.backtest_sessions import resolve_backtest_lifecycle_evidence
+    from src.data.schemas import PITDataError
+
+    session = datetime(2016, 11, 1, 9, tzinfo=KRX_TZ)
+    events = pl.DataFrame({'lifecycle_event_id': ['evt-bad'], 'instrument_id': ['KRX:003450'], 'source_security_id': ['KR7003450004'], 'evidence_status': ['verified'], 'resolution_kind': ['merger_or_exchange'], 'available_at': [datetime(2016, 11, 1, 16, tzinfo=KRX_TZ)], 'delisting_date': [date(2016, 11, 1)], 'successor_delivery_date': [None], 'successor_allocations_json': [None]})
+    with pytest.raises(PITDataError, match='lifecycle'):
+        resolve_backtest_lifecycle_evidence(daily_market=pl.DataFrame(), lifecycle_events=events, calendar=SessionCalendar((session,)), decision_time_of=lambda value: value.replace(hour=15, minute=30))
+    timely = events.with_columns(pl.lit(datetime(2016, 10, 20, 9, tzinfo=KRX_TZ)).alias('available_at'))
+    missing_event = timely.with_columns(pl.lit(None).alias('lifecycle_event_id'))
+    with pytest.raises(PITDataError, match='lifecycle_event_id'):
+        resolve_backtest_lifecycle_evidence(daily_market=pl.DataFrame(), lifecycle_events=missing_event, calendar=SessionCalendar((session,)), decision_time_of=lambda value: value.replace(hour=15, minute=30))
+    outside_delivery = timely.with_columns(pl.lit('evt-outside').alias('lifecycle_event_id'), pl.lit(date(2016, 11, 2)).alias('successor_delivery_date'))
+    with pytest.raises(PITDataError, match='outside calendar'):
+        resolve_backtest_lifecycle_evidence(daily_market=pl.DataFrame(), lifecycle_events=outside_delivery, calendar=SessionCalendar((session,)), decision_time_of=lambda value: value.replace(hour=15, minute=30))
+
+
+def test_build_backtest_sessions_wires_successor_lifecycle_actions(monkeypatch, tmp_path) -> None:
+    from datetime import datetime
+    from decimal import Decimal
+    import polars as pl
+    import src.data.backtest_sessions as mod
+    from src.core.ledger import LedgerActionType, LedgerCorporateAction, LedgerSuccessorAllocation
+    from src.core.time import KRX_TZ, SessionCalendar
+    from src.data.snapshot import PITSnapshotRepository
+    from src.data.schemas import SilverTable
+
+    first = datetime(2016, 10, 31, 9, tzinfo=KRX_TZ)
+    second = datetime(2016, 11, 1, 9, tzinfo=KRX_TZ)
+    third = datetime(2016, 11, 2, 9, tzinfo=KRX_TZ)
+    calendar = SessionCalendar((first, second, third))
+    bars = pl.DataFrame({'session': [first, second, third], 'instrument_id': ['KRX:003450'] * 3, 'open': [100.0] * 3, 'close': [100.0] * 3, 'volume': [1000.0] * 3, 'trading_value': [100000.0] * 3, 'market_cap': [1000000.0] * 3, 'available_at': [first, first, first]})
+    master = pl.DataFrame({'instrument_id': ['KRX:003450'], 'sector': ['finance'], 'valid_from': [first], 'valid_to': [third], 'available_at': [first]})
+    repository = PITSnapshotRepository.from_frames({SilverTable.DAILY_MARKET: bars}, root=tmp_path)
+    allocation = LedgerSuccessorAllocation('KRX:105560', Decimal('0.5'), Decimal('1'))
+    successor = LedgerCorporateAction('evt:wired', 'KRX:003450', LedgerActionType.EXCHANGE_ENTITLEMENT, second, 1.0, 0.0, lifecycle_event_id='evt', successor_allocations=(allocation,))
+    resolution = mod.CorporateActionEvidenceResolution(bars, pl.DataFrame(), frozenset(), {}, {})
+    monkeypatch.setattr(mod, 'resolve_backtest_corporate_action_evidence', lambda **_: resolution)
+    monkeypatch.setattr(mod, 'resolve_backtest_lifecycle_evidence', lambda **_: mod.CorporateActionCoverage({second: (successor,)}, {}))
+    monkeypatch.setattr(mod, 'validate_corporate_action_coverage', lambda **_: mod.CorporateActionCoverage({}, {}))
+    monkeypatch.setattr(mod, '_rolling_inputs', lambda *_args: ({(s, 'KRX:003450'): 1.0 for s in (first, second)}, {(s, 'KRX:003450'): 0.1 for s in (first, second)}, {first: 0.1, second: 0.1}))
+    built = mod.build_backtest_sessions(snapshot_repository=repository, calendar=calendar, start=first, end=second, decision_time_of=lambda value: value.replace(hour=15, minute=30), security_master=master, corporate_actions=pl.DataFrame(), lifecycle_events=pl.DataFrame({'instrument_id': ['KRX:003450']}))
+    assert built[1].actions == (successor,)
+
+
+def test_decode_successor_allocations_rejects_noncanonical_terms() -> None:
+    import pytest
+
+    from src.data.backtest_sessions import decode_successor_allocations
+    from src.data.schemas import PITDataError
+
+    bad_values = (
+        (None, 'missing'),
+        ('not-json', 'malformed'),
+        ('[]', 'non-empty'),
+        ([{'successor_security_id': 'KR7105560007', 'successor_instrument_id': 'KRX:105560', 'ratio': 0.5, 'cost_basis_weight': '1'}], 'Decimal string'),
+        ([{'successor_security_id': 'KR7105560007', 'successor_instrument_id': 'KRX:105560', 'ratio': '0', 'cost_basis_weight': '1'}], 'positive finite'),
+        ('[{"successor_security_id":"KR7105560007","successor_instrument_id":"KRX:105560","ratio":"bad","cost_basis_weight":"1"}]', 'malformed'),
+        ([None], 'object'),
+        ([{'successor_security_id': 'KR7105560007', 'successor_instrument_id': 'KRX:105560', 'ratio': '1', 'cost_basis_weight': '1', 'extra': 'x'}], 'unknown keys'),
+        ([{'successor_security_id': '', 'successor_instrument_id': 'KRX:105560', 'ratio': '1', 'cost_basis_weight': '1'}], 'identity'),
+        ([{'successor_security_id': 'KR7105560007', 'successor_instrument_id': '', 'ratio': '1', 'cost_basis_weight': '1'}], 'identity'),
+        ([{'successor_security_id': 'SAME', 'successor_instrument_id': 'SAME', 'ratio': '1', 'cost_basis_weight': '1'}], 'equal'),
+        ([{'successor_security_id': 'KR7105560007', 'successor_instrument_id': 'KRX:105560', 'ratio': '1', 'cost_basis_weight': '1'}, {'successor_security_id': 'KR7105560007', 'successor_instrument_id': 'KRX:000001', 'ratio': '1', 'cost_basis_weight': '1'}], 'unique'),
+    )
+    for raw, message in bad_values:
+        with pytest.raises(PITDataError, match=message):
+            decode_successor_allocations(raw=raw, lifecycle_event_id='evt-invalid')
+    with pytest.raises(PITDataError, match='lifecycle_event_id'):
+        decode_successor_allocations(raw='[]', lifecycle_event_id='')
+
+
+def test_resolve_lifecycle_exchange_rejects_identity_delivery_pit_and_duplicates() -> None:
+    from datetime import date, datetime
+
+    import json
+    import polars as pl
+    import pytest
+
+    from src.core.time import KRX_TZ, SessionCalendar
+    from src.data.backtest_sessions import resolve_backtest_lifecycle_evidence
+    from src.data.schemas import PITDataError
+
+    first = datetime(2016, 11, 1, 9, tzinfo=KRX_TZ)
+    second = datetime(2016, 11, 2, 9, tzinfo=KRX_TZ)
+    allocations = json.dumps([{'successor_security_id': 'KR7105560007', 'successor_instrument_id': 'KRX:105560', 'ratio': '1', 'cost_basis_weight': '1'}])
+    base = {'lifecycle_event_id': 'evt-identity', 'instrument_id': 'KRX:003450', 'evidence_status': 'verified', 'resolution_kind': 'merger_or_exchange', 'available_at': datetime(2016, 10, 20, 9, tzinfo=KRX_TZ), 'delisting_date': date(2016, 11, 2), 'successor_delivery_date': date(2016, 11, 2), 'successor_allocations_json': allocations, 'source_security_id': 'KR7003450004'}
+    with pytest.raises(PITDataError, match='source_security_id'):
+        resolve_backtest_lifecycle_evidence(daily_market=pl.DataFrame(), lifecycle_events=pl.DataFrame([{**base, 'source_security_id': ''}]), calendar=SessionCalendar((first, second)), decision_time_of=lambda value: value.replace(hour=15, minute=30))
+    late_delivery = {**base, 'lifecycle_event_id': 'evt-late', 'delisting_date': date(2016, 11, 2), 'successor_delivery_date': date(2016, 11, 1), 'available_at': datetime(2016, 11, 1, 16, tzinfo=KRX_TZ)}
+    with pytest.raises(PITDataError, match='delivery is not PIT'):
+        resolve_backtest_lifecycle_evidence(daily_market=pl.DataFrame(), lifecycle_events=pl.DataFrame([late_delivery]), calendar=SessionCalendar((first, second)), decision_time_of=lambda value: value.replace(hour=15, minute=30))
+    with pytest.raises(PITDataError, match='duplicate lifecycle'):
+        resolve_backtest_lifecycle_evidence(daily_market=pl.DataFrame(), lifecycle_events=pl.DataFrame([{**base, 'action_id': 'source-a'}, {**base, 'action_id': 'source-b'}]), calendar=SessionCalendar((first, second)), decision_time_of=lambda value: value.replace(hour=15, minute=30))

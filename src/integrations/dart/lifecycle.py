@@ -14,7 +14,7 @@ from src.data.lifecycle import (
     parse_dart_lifecycle_notice,
 )
 from src.data.schemas import PITDataError
-from src.integrations.dart.client import DartApiError
+from src.integrations.dart.client import DartApiError, DartTerminalError
 
 _PRECEDENCE_KEYWORDS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (0, ("정리매매", "상장폐지")),
@@ -102,36 +102,84 @@ class DartLifecycleCollector:
                 document_receipt_no=None,
                 document_sha256=None,
             )
-        ranked.sort(key=lambda entry: (entry[0], str(entry[1].get("rcept_dt", "")), str(entry[1].get("rcept_no", ""))))
-        best_rank = ranked[0][0]
-        best = [item for rank, item in ranked if rank == best_rank]
-        if len(best) != 1:  # pragma: no cover - ambiguous same-precedence filings
-            raise PITDataError(f"ambiguous DART lifecycle notices for {candidate.instrument_id!r}")
-        selected = best[0]
-        receipt_no = str(selected.get("rcept_no", "")).strip()
-        receipt_dt = str(selected.get("rcept_dt", "")).strip()
-        if len(receipt_no) != 14 or not receipt_no.isdigit():  # pragma: no cover
-            raise PITDataError(f"malformed DART lifecycle receipt for {candidate.instrument_id!r}")
-        try:
-            published_at = datetime(int(receipt_dt[:4]), int(receipt_dt[4:6]), int(receipt_dt[6:8]), tzinfo=__import__("src.core.time", fromlist=["KRX_TZ"]).KRX_TZ)
-        except (ValueError, IndexError) as exc:  # pragma: no cover
-            raise PITDataError(f"malformed DART lifecycle receipt date for {candidate.instrument_id!r}") from exc
-        disclosure_url = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={receipt_no}"
-        try:
-            archive = self._dart.fetch_document_archive(receipt_no)  # type: ignore[attr-defined]
-        except (DartApiError, OSError, ValueError, TypeError) as exc:  # pragma: no cover - transport failures are fail-closed
-            raise PITDataError(f"DART lifecycle archive failed for {candidate.instrument_id!r}: {exc}") from exc
-        if not isinstance(archive, (bytes, bytearray)) or len(archive) == 0:  # pragma: no cover
-            raise PITDataError(f"malformed DART lifecycle archive for {candidate.instrument_id!r}")
-        archive_bytes = bytes(archive)
-        source_hash = hashlib.sha256(archive_bytes).hexdigest()
-        evidence = parse_dart_lifecycle_notice(
-            candidate=candidate,
-            receipt_no=receipt_no,
-            disclosure_url=disclosure_url,
-            published_at=published_at,
-            archive=archive_bytes,
-            calendar=self._calendar,
-            source_hash=source_hash,
+        best_rank = min(rank for rank, _item in ranked)
+        candidates = sorted(
+            (item for rank, item in ranked if rank == best_rank),
+            key=lambda item: (str(item.get("rcept_dt", "")), str(item.get("rcept_no", ""))),
+            reverse=True,
         )
-        return replace(evidence, archive_b64=base64.b64encode(archive_bytes).decode("ascii"))
+        fallback: LifecycleEvidence | None = None
+        verified_fallback: LifecycleEvidence | None = None
+        for selected in candidates:
+            receipt_no = str(selected.get("rcept_no", "")).strip()
+            receipt_dt = str(selected.get("rcept_dt", "")).strip()
+            if len(receipt_no) != 14 or not receipt_no.isdigit():  # pragma: no cover
+                raise PITDataError(f"malformed DART lifecycle receipt for {candidate.instrument_id!r}")
+            try:
+                published_at = datetime(int(receipt_dt[:4]), int(receipt_dt[4:6]), int(receipt_dt[6:8]), tzinfo=__import__("src.core.time", fromlist=["KRX_TZ"]).KRX_TZ)
+            except (ValueError, IndexError) as exc:  # pragma: no cover
+                raise PITDataError(f"malformed DART lifecycle receipt date for {candidate.instrument_id!r}") from exc
+            disclosure_url = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={receipt_no}"
+            try:
+                archive = self._dart.fetch_document_archive(receipt_no)  # type: ignore[attr-defined]
+            except DartTerminalError:
+                continue
+            except (DartApiError, OSError, ValueError, TypeError) as exc:  # pragma: no cover
+                raise PITDataError(f"DART lifecycle archive failed for {candidate.instrument_id!r}: {exc}") from exc
+            if not isinstance(archive, (bytes, bytearray)) or len(archive) == 0:  # pragma: no cover
+                raise PITDataError(f"malformed DART lifecycle archive for {candidate.instrument_id!r}")
+            archive_bytes = bytes(archive)
+            source_hash = hashlib.sha256(archive_bytes).hexdigest()
+            try:
+                evidence = parse_dart_lifecycle_notice(
+                    candidate=candidate,
+                    receipt_no=receipt_no,
+                    disclosure_url=disclosure_url,
+                    published_at=published_at,
+                    archive=archive_bytes,
+                    calendar=self._calendar,
+                    source_hash=source_hash,
+                )
+            except PITDataError as exc:
+                evidence = LifecycleEvidence(
+                    candidate=candidate,
+                    resolution_kind=LifecycleResolutionKind.UNRESOLVED,
+                    evidence_status="unresolved",
+                    evidence_reason=f"document_validation:{exc}",
+                    published_at=published_at,
+                    available_at=None,
+                    cleanup_start=None,
+                    cleanup_end=None,
+                    cash_settlement_per_share=None,
+                    successor_instrument_id=None,
+                    source_provider="opendart",
+                    source_url=disclosure_url,
+                    document_receipt_no=receipt_no,
+                    document_sha256=source_hash,
+                )
+            evidence = replace(evidence, archive_b64=base64.b64encode(archive_bytes).decode("ascii"))
+            fallback = fallback or evidence
+            if evidence.evidence_status == "verified":
+                verified_fallback = verified_fallback or evidence
+                if evidence.resolution_kind is LifecycleResolutionKind.CASH_SETTLEMENT:
+                    return evidence
+        if verified_fallback is not None:
+            return verified_fallback
+        if fallback is not None:
+            return fallback
+        return LifecycleEvidence(
+            candidate=candidate,
+            resolution_kind=LifecycleResolutionKind.UNRESOLVED,
+            evidence_status="unresolved",
+            evidence_reason="document_unavailable",
+            published_at=None,
+            available_at=None,
+            cleanup_start=None,
+            cleanup_end=None,
+            cash_settlement_per_share=None,
+            successor_instrument_id=None,
+            source_provider="opendart",
+            source_url=None,
+            document_receipt_no=None,
+            document_sha256=None,
+        )

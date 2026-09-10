@@ -5,6 +5,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from enum import StrEnum
 
 
@@ -19,6 +20,26 @@ class LedgerActionType(StrEnum):
     DIVIDEND = "dividend"
     DELISTING_CASH_OUT = "delisting_cash_out"
     DELISTING_UNSETTLED = "delisting_unsettled"
+    EXCHANGE_ENTITLEMENT = "exchange_entitlement"
+    SUCCESSOR_DELIVERY = "successor_delivery"
+    CASH_IN_LIEU_SETTLEMENT = "cash_in_lieu_settlement"
+
+
+_SUCCESSOR_ACTION_TYPES = frozenset(
+    {
+        LedgerActionType.EXCHANGE_ENTITLEMENT,
+        LedgerActionType.SUCCESSOR_DELIVERY,
+        LedgerActionType.CASH_IN_LIEU_SETTLEMENT,
+    }
+)
+
+
+_DELISTING_ACTION_TYPES = frozenset(
+    {
+        LedgerActionType.DELISTING_CASH_OUT,
+        LedgerActionType.DELISTING_UNSETTLED,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +109,22 @@ class LedgerSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class LedgerSuccessorAllocation:
+    successor_instrument_id: str
+    ratio: Decimal
+    cost_basis_weight: Decimal
+
+    def __post_init__(self) -> None:
+        if not self.successor_instrument_id:
+            raise ValueError("successor_instrument_id must be non-empty")
+        for name, value in (("ratio", self.ratio), ("cost_basis_weight", self.cost_basis_weight)):
+            if isinstance(value, bool) or not isinstance(value, Decimal):
+                raise ValueError(f"{name} must be Decimal")
+            if not value.is_finite() or value <= 0:
+                raise ValueError(f"{name} must be positive finite")
+
+
+@dataclass(frozen=True, slots=True)
 class LedgerCorporateAction:
     action_id: str
     instrument_id: str
@@ -95,6 +132,10 @@ class LedgerCorporateAction:
     effective_time: datetime
     factor: float
     cash_amount: float
+    successor_allocations: tuple[LedgerSuccessorAllocation, ...] = ()
+    lifecycle_event_id: str | None = None
+    settlement_instrument_id: str | None = None
+    cash_settlement_per_entitlement_unit: Decimal | None = None
 
     def __post_init__(self) -> None:
         if not self.action_id:
@@ -182,6 +223,11 @@ class Ledger:
         self._journal_ids: set[str] = set()
         self._action_ids: set[str] = set()
         self._mark_ids: set[str] = set()
+        self._entitlements: dict[tuple[str, str], Decimal] = {}
+        self._entitlement_costs: dict[tuple[str, str], Decimal] = {}
+        self._entitlement_allocations: dict[str, tuple[LedgerSuccessorAllocation, ...]] = {}
+        self._lifecycle_successor_ids: set[str] = set()
+        self._lifecycle_delisting_ids: set[str] = set()
 
     def _settle_due(self, as_of: datetime) -> None:
         for p in self._pendings:
@@ -403,7 +449,40 @@ class Ledger:
                 raise ValueError("factor must be positive finite")
             if not math.isfinite(float(act.cash_amount)) or float(act.cash_amount) < 0:
                 raise ValueError("cash_amount must be non-negative finite")
-            if act.action_type == LedgerActionType.DIVIDEND:
+            if act.action_type in _SUCCESSOR_ACTION_TYPES:
+                from src.core.pit import PITDataError as _PITDataError
+
+                if not act.lifecycle_event_id:
+                    raise _PITDataError(f"successor action requires lifecycle_event_id for {act.instrument_id!r}")
+                if float(act.factor) != 1.0:
+                    raise ValueError("factor must be 1.0 for successor action")
+                if float(act.cash_amount) != 0.0:
+                    raise ValueError("cash_amount must be zero for successor action")
+                if act.action_type in (
+                    LedgerActionType.EXCHANGE_ENTITLEMENT,
+                    LedgerActionType.SUCCESSOR_DELIVERY,
+                ):
+                    if act.settlement_instrument_id is not None:
+                        raise _PITDataError(f"successor exchange must not carry settlement fields for {act.instrument_id!r}")
+                    if act.cash_settlement_per_entitlement_unit is not None:
+                        raise _PITDataError(f"successor exchange must not carry settlement fields for {act.instrument_id!r}")
+                    if not act.successor_allocations:
+                        raise _PITDataError(f"successor exchange requires allocations for {act.instrument_id!r}")
+                    weight_total = sum((alloc.cost_basis_weight for alloc in act.successor_allocations), Decimal("0"))
+                    if weight_total != Decimal("1"):
+                        raise _PITDataError(f"successor cost_basis_weight must sum to 1 for {act.instrument_id!r}")
+                else:
+                    if not act.settlement_instrument_id:
+                        raise _PITDataError(f"cash-in-lieu requires settlement_instrument_id for {act.instrument_id!r}")
+                    per_unit = act.cash_settlement_per_entitlement_unit
+                    if (
+                        isinstance(per_unit, bool)
+                        or not isinstance(per_unit, Decimal)
+                        or not per_unit.is_finite()
+                        or per_unit <= 0
+                    ):
+                        raise _PITDataError(f"cash-in-lieu requires disclosed per-unit cash for {act.instrument_id!r}")
+            elif act.action_type == LedgerActionType.DIVIDEND:
                 if float(act.factor) != 1.0:
                     raise ValueError("invalid factor for dividend")
             elif act.action_type == LedgerActionType.DELISTING_CASH_OUT:
@@ -430,10 +509,140 @@ class Ledger:
         opening_snapshot: dict[str, tuple[int, float]] = dict(self._positions)
         prospective_settled = float(self._settled_cash)
         prospective_positions: dict[str, tuple[int, float]] = dict(self._positions)
+        prospective_entitlements: dict[tuple[str, str], Decimal] = dict(self._entitlements)
+        prospective_costs: dict[tuple[str, str], Decimal] = dict(self._entitlement_costs)
+        prospective_allocs: dict[str, tuple[LedgerSuccessorAllocation, ...]] = dict(self._entitlement_allocations)
+        prospective_successor_ids: set[str] = set(self._lifecycle_successor_ids)
+        prospective_delisting_ids: set[str] = set(self._lifecycle_delisting_ids)
         new_entries: list[LedgerJournalEntry] = []
+        # Successor lifecycle consistency is validated before any mutation.
+        from src.core.pit import PITDataError as _SuccessorPITDataError
+
+        batch_delisting: set[str] = set()
+        batch_successor: set[str] = set()
+        for act in actions:
+            if act.lifecycle_event_id:
+                if act.action_type in _SUCCESSOR_ACTION_TYPES:
+                    batch_successor.add(act.lifecycle_event_id)
+                elif act.action_type in _DELISTING_ACTION_TYPES:
+                    batch_delisting.add(act.lifecycle_event_id)
+        for lifecycle_id in sorted(batch_successor & (batch_delisting | self._lifecycle_delisting_ids)):
+            raise _SuccessorPITDataError(f"conflicting lifecycle {lifecycle_id!r} mixes delisting and successor actions")
+        for lifecycle_id in sorted(batch_delisting & self._lifecycle_successor_ids):
+            raise _SuccessorPITDataError(f"conflicting lifecycle {lifecycle_id!r} mixes delisting and successor actions")
+        for act in actions:
+            if act.action_type == LedgerActionType.EXCHANGE_ENTITLEMENT:
+                assert act.lifecycle_event_id is not None
+                opening_qty, _ = opening_snapshot.get(act.instrument_id, (0, 0.0))
+                if opening_qty <= 0:
+                    raise _SuccessorPITDataError(f"exchange entitlement requires opening position for {act.instrument_id!r}")
+                for alloc in act.successor_allocations:
+                    if (act.lifecycle_event_id, alloc.successor_instrument_id) in self._entitlements:
+                        raise ValueError(f"duplicate entitlement for {act.lifecycle_event_id!r}")
+            elif act.action_type == LedgerActionType.SUCCESSOR_DELIVERY:
+                assert act.lifecycle_event_id is not None
+                expected = self._entitlement_allocations.get(act.lifecycle_event_id)
+                if expected is None:
+                    raise _SuccessorPITDataError(f"successor delivery without entitlement for {act.lifecycle_event_id!r}")
+                if tuple(expected) != tuple(act.successor_allocations):
+                    raise _SuccessorPITDataError(f"successor delivery allocations mismatch for {act.lifecycle_event_id!r}")
+            elif act.action_type == LedgerActionType.CASH_IN_LIEU_SETTLEMENT:
+                assert act.lifecycle_event_id is not None
+                assert act.settlement_instrument_id is not None
+                residual_key = (act.lifecycle_event_id, act.settlement_instrument_id)
+                residual = self._entitlements.get(residual_key)
+                if residual is None:
+                    raise _SuccessorPITDataError(f"cash-in-lieu without residual entitlement for {act.lifecycle_event_id!r}")
+                if residual <= 0 or residual == residual.to_integral_value():
+                    raise _SuccessorPITDataError("cash-in-lieu requires a fractional residual entitlement")
         # handle dividend and splits from opening snapshot
         for act in actions:
-            if act.action_type == LedgerActionType.DELISTING_UNSETTLED:
+            if act.action_type == LedgerActionType.EXCHANGE_ENTITLEMENT:
+                assert act.lifecycle_event_id is not None
+                ent_qty, ent_avg = opening_snapshot.get(act.instrument_id, (0, 0.0))
+                ent_total = Decimal(str(ent_avg)) * Decimal(ent_qty)
+                prospective_positions.pop(act.instrument_id, None)
+                for alloc in act.successor_allocations:
+                    ent_key = (act.lifecycle_event_id, alloc.successor_instrument_id)
+                    prospective_entitlements[ent_key] = Decimal(ent_qty) * alloc.ratio
+                    prospective_costs[ent_key] = ent_total * alloc.cost_basis_weight
+                prospective_allocs[act.lifecycle_event_id] = act.successor_allocations
+                prospective_successor_ids.add(act.lifecycle_event_id)
+                payload_entitlement: tuple[tuple[str, object], ...] = (
+                    ("action_type", act.action_type.value),
+                    ("instrument_id", act.instrument_id),
+                    ("lifecycle_event_id", act.lifecycle_event_id),
+                    ("quantity", ent_qty),
+                )
+                new_entries.append(
+                    LedgerJournalEntry(
+                        event_id=act.action_id,
+                        event_type=act.action_type.value,
+                        event_time=session_open,
+                        payload=payload_entitlement,
+                    )
+                )
+            elif act.action_type == LedgerActionType.SUCCESSOR_DELIVERY:
+                assert act.lifecycle_event_id is not None
+                for alloc in act.successor_allocations:
+                    delivery_key = (act.lifecycle_event_id, alloc.successor_instrument_id)
+                    entitled_qty = prospective_entitlements.get(delivery_key, Decimal("0"))
+                    carried_cost = prospective_costs.get(delivery_key, Decimal("0"))
+                    integral_qty = int(entitled_qty)
+                    residual_qty = entitled_qty - Decimal(integral_qty)
+                    if integral_qty > 0 and entitled_qty > 0:
+                        unit_cost = carried_cost / entitled_qty
+                        prev_qty, prev_avg = prospective_positions.get(alloc.successor_instrument_id, (0, 0.0))
+                        combined_qty = prev_qty + integral_qty
+                        combined_cost = Decimal(str(prev_avg)) * Decimal(prev_qty) + unit_cost * Decimal(integral_qty)
+                        prospective_positions[alloc.successor_instrument_id] = (combined_qty, float(combined_cost / Decimal(combined_qty)))
+                    prospective_entitlements[delivery_key] = residual_qty
+                    if entitled_qty > 0:
+                        prospective_costs[delivery_key] = carried_cost / entitled_qty * residual_qty
+                    else:  # pragma: no cover - entitlement prevalidation requires a positive ratio
+                        prospective_costs[delivery_key] = Decimal("0")
+                prospective_successor_ids.add(act.lifecycle_event_id)
+                payload_delivery: tuple[tuple[str, object], ...] = (
+                    ("action_type", act.action_type.value),
+                    ("instrument_id", act.instrument_id),
+                    ("lifecycle_event_id", act.lifecycle_event_id),
+                )
+                new_entries.append(
+                    LedgerJournalEntry(
+                        event_id=act.action_id,
+                        event_type=act.action_type.value,
+                        event_time=session_open,
+                        payload=payload_delivery,
+                    )
+                )
+            elif act.action_type == LedgerActionType.CASH_IN_LIEU_SETTLEMENT:
+                assert act.lifecycle_event_id is not None
+                assert act.settlement_instrument_id is not None
+                per_unit = act.cash_settlement_per_entitlement_unit
+                assert isinstance(per_unit, Decimal)
+                residual_key = (act.lifecycle_event_id, act.settlement_instrument_id)
+                residual_qty = prospective_entitlements.get(residual_key, Decimal("0"))
+                cash_credit = float(residual_qty * per_unit)
+                prospective_settled += cash_credit
+                prospective_entitlements.pop(residual_key, None)
+                prospective_costs.pop(residual_key, None)
+                prospective_successor_ids.add(act.lifecycle_event_id)
+                payload_settlement: tuple[tuple[str, object], ...] = (
+                    ("action_type", act.action_type.value),
+                    ("instrument_id", act.instrument_id),
+                    ("lifecycle_event_id", act.lifecycle_event_id),
+                    ("settlement_instrument_id", act.settlement_instrument_id),
+                    ("cash", float(cash_credit)),
+                )
+                new_entries.append(
+                    LedgerJournalEntry(
+                        event_id=act.action_id,
+                        event_type=act.action_type.value,
+                        event_time=session_open,
+                        payload=payload_settlement,
+                    )
+                )
+            elif act.action_type == LedgerActionType.DELISTING_UNSETTLED:
                 from src.core.pit import PITDataError as _PITDataError
 
                 qty, _ = opening_snapshot.get(act.instrument_id, (0, 0.0))
@@ -455,6 +664,8 @@ class Ledger:
                     raise ValueError(f"duplicate journal event_id {entry_unsettled.event_id!r}")  # pragma: no cover
                 new_entries.append(entry_unsettled)
                 prospective_positions.pop(act.instrument_id, None)
+                if act.lifecycle_event_id:
+                    prospective_delisting_ids.add(act.lifecycle_event_id)
             elif act.action_type == LedgerActionType.DELISTING_CASH_OUT:
                 qty, _ = opening_snapshot.get(act.instrument_id, (0, 0.0))
                 credit = qty * float(act.cash_amount)
@@ -477,6 +688,8 @@ class Ledger:
                     raise ValueError(f"duplicate journal event_id {entry_delist.event_id!r}")  # pragma: no cover
                 new_entries.append(entry_delist)
                 prospective_positions.pop(act.instrument_id, None)
+                if act.lifecycle_event_id:
+                    prospective_delisting_ids.add(act.lifecycle_event_id)
             elif act.action_type == LedgerActionType.DIVIDEND:
                 qty, _ = opening_snapshot.get(act.instrument_id, (0, 0.0))
                 if qty > 0 and float(act.cash_amount) > 0:
@@ -571,6 +784,11 @@ class Ledger:
         # commit
         self._settled_cash = prospective_settled
         self._positions = prospective_positions
+        self._entitlements = prospective_entitlements
+        self._entitlement_costs = prospective_costs
+        self._entitlement_allocations = prospective_allocs
+        self._lifecycle_successor_ids = prospective_successor_ids
+        self._lifecycle_delisting_ids = prospective_delisting_ids
         for e in new_entries:
             if e.event_id in self._journal_ids:
                 raise ValueError(f"duplicate journal event_id {e.event_id!r}")

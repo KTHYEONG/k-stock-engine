@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import zoneinfo
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -106,7 +107,62 @@ _LIFECYCLE_EVENTS_COLUMNS = [
     "source_hash",
     "evidence_status",
     "evidence_reason",
+    "lifecycle_event_id",
+    "source_security_id",
+    "successor_allocations_json",
+    "successor_delivery_date",
+    "source_provider",
+    "document_receipt_no",
+    "document_sha256",
+    "resolution_kind",
 ]
+
+
+def assert_common_silver_coverage(
+    *,
+    coverage_ends: Mapping[SilverTable, date],
+    required_tables: frozenset[SilverTable],
+    required_end: date,
+) -> date:
+    """Assert every required Silver table shares certified coverage at or after ``required_end``.
+
+    Every required table must carry a selected immutable manifest end. Returns
+    the common (minimum) coverage end.
+    """
+    common: date | None = None
+    for table in sorted(required_tables, key=lambda item: item.value):
+        end = coverage_ends.get(table)
+        if end is None:
+            raise PITDataError(f"missing certified Silver coverage for {table.value}")
+        if common is None or end < common:
+            common = end
+    if common is None:
+        return required_end
+    for table in sorted(required_tables, key=lambda item: item.value):
+        end = coverage_ends.get(table)
+        if end is None:  # pragma: no cover - rejected in the complete first pass
+            raise PITDataError(f"missing certified Silver coverage for {table.value}")
+        if end < required_end:
+            raise PITDataError(
+                f"insufficient certified Silver coverage for {table.value}: "
+                f"ends {end.isoformat()}, required {required_end.isoformat()}"
+            )
+    return common
+
+
+def _selected_manifest_time_end(
+    *, silver_root: Path, table: SilverTable, decision_time: datetime
+) -> date:
+    """Return the selected immutable manifest coverage end without scanning rows."""
+    dataset_id, store = _resolve_latest_dataset(silver_root, table)
+    try:
+        manifest = store.read_manifest(dataset_id)
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        raise PITDataError(f"invalid certified Silver table: {table.value}") from exc
+    time_end = getattr(manifest, "time_end", None)
+    if not isinstance(time_end, datetime) or time_end.tzinfo is None:
+        raise PITDataError(f"invalid certified Silver table: {table.value}")
+    return _to_krx_date(time_end)
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,6 +410,29 @@ def load_gold_window_inputs(
         raise PITDataError("invalid certified Silver table: calendar")
     if session_end != validation_end:  # pragma: no cover - direct assignment invariant
         raise PITDataError("invalid certified Silver table: calendar")
+    # Common-coverage gate over selected immutable manifests (manifest reads
+    # only; no Bronze scan and no row materialization for this check).
+    required_tables = frozenset(SilverTable) - {SilverTable.INVESTOR_FLOW}
+    coverage_ends: dict[SilverTable, date] = {}
+    for table in sorted(required_tables, key=lambda item: item.value):
+        try:
+            coverage_ends[table] = _selected_manifest_time_end(
+                silver_root=silver_root, table=table, decision_time=certification_time
+            )
+        except (PITDataError, OSError, ValueError) as exc:
+            raise PITDataError(f"invalid certified Silver table: {table.value}") from exc
+    try:
+        coverage_ends[SilverTable.INVESTOR_FLOW] = _selected_manifest_time_end(
+            silver_root=silver_root,
+            table=SilverTable.INVESTOR_FLOW,
+            decision_time=certification_time,
+        )
+    except (PITDataError, OSError, ValueError) as exc:
+        flow_root = silver_root / SilverTable.INVESTOR_FLOW.value
+        if flow_root.exists() and any(path.is_dir() and not path.name.startswith(".") for path in flow_root.iterdir()):
+            raise PITDataError("invalid certified Silver table: investor_flow") from exc
+    coverage_tables = required_tables | frozenset(coverage_ends.keys() & {SilverTable.INVESTOR_FLOW})
+    assert_common_silver_coverage(coverage_ends=coverage_ends, required_tables=coverage_tables, required_end=validation_end)
     # Monthly partition pruning plus column projection; one final collect per table.
     daily_market = _read_bounded_table(
         silver_root=silver_root,
