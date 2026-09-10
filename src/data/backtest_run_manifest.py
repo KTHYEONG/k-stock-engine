@@ -13,7 +13,7 @@ from typing import Any
 
 from src.data.schemas import PITDataError, SilverTable
 
-SCHEMA_VERSION = "backtest-run-v1"
+SCHEMA_VERSION = "backtest-run-v2"
 
 
 def _check_dataset_id(value: str, *, field: str) -> str:
@@ -47,10 +47,7 @@ def _normalize_silver_ids(
             raise PITDataError(f"silver_dataset_ids must contain exactly every SilverTable value once: unknown {name!r}") from exc
         normalized[table.value] = _check_dataset_id(value, field=f"silver_dataset_ids[{table.value}]")
     expected = sorted(t.value for t in SilverTable)
-    optional = {SilverTable.LIFECYCLE_EVENTS.value}
-    if any(name not in normalized for name in expected if name not in optional) or any(
-        name not in expected for name in normalized
-    ):
+    if sorted(normalized) != expected:
         raise PITDataError("silver_dataset_ids must contain exactly every SilverTable value once")
     return normalized
 
@@ -224,6 +221,8 @@ def load_backtest_run_manifest(path: Path) -> BacktestRunManifest:
     if set(data) != expected_fields:
         raise PITDataError("invalid backtest run manifest: unknown/missing fields")
     if data["schema_version"] != SCHEMA_VERSION:
+        if data["schema_version"] == "backtest-run-v1":
+            raise PITDataError("invalid backtest run manifest: backtest-run-v1 requires rebuild-required")
         raise PITDataError("invalid backtest run manifest: wrong schema_version")
     for field in (
         "content_hash",

@@ -87,3 +87,13 @@ def test_require_silver_report_accepts_core_kinds_without_lifecycle_hash(tmp_pat
         date(2016, 1, 4), date(2016, 12, 30), decision,
     )
     assert module._require_silver_report(report, request) is report
+
+
+import inspect
+
+import src.data.operations as operations
+
+def test_historical_pipeline_collects_lifecycle_before_stream_normalization():
+    source = inspect.getsource(operations.run_historical_data_pipeline)
+    assert source.index('collect_dart_lifecycle_evidence(') < source.index('stream_normalize_stock_evidence(')
+    assert 'KindLifecycleCollector' not in source

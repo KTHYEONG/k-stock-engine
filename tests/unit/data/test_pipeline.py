@@ -37,3 +37,13 @@ def test_load_silver_tables_selects_latest_manifest_per_table(tmp_path, monkeypa
     assert len(seen) == len(SilverTable)
     assert {name for _, name, _ in seen} == {t.value for t in SilverTable}
     assert all(root == tmp_path and at == decision_time for root, _, at in seen)
+
+
+import inspect
+
+import src.data.pipeline as pipeline
+
+def test_pipeline_requires_lifecycle_dataset_id():
+    source = inspect.getsource(pipeline.materialize_backtest_inputs)
+    assert 'not (Path(silver_root) / table.value).exists()' not in source
+    assert 'SilverTable.LIFECYCLE_EVENTS' in source

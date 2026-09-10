@@ -1042,3 +1042,13 @@ def test_cli_backtest_loads_lifecycle_table(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(module, '_execute_backtest', lambda **kwargs: {'final_nav': 1.0})
     module._run_backtest_from_silver(silver_root=tmp_path,strategy_id='core-v1',validation_start='2016-01-04',validation_end='2016-01-04',artifact_root=tmp_path,smoke_symbol=None)
     assert SilverTable.LIFECYCLE_EVENTS in loaded
+
+
+import inspect
+
+import src.data.cli as cli
+
+def test_cli_loads_manifest_bound_lifecycle_without_optional_swallow():
+    source = inspect.getsource(cli)
+    assert '_load_manifest_silver_table' in source
+    assert 'lifecycle_events = None' not in source
