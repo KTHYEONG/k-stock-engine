@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "successor_instrument_lifecycle",
+      "date": "2026-09-10",
+      "adr_id": "ADR_20260910_successor_instrument_lifecycle",
+      "domain": "data_backtest",
+      "title": "Successor instrument lifecycle ledger",
+      "why": "합병·주식교환 후계증권을 단순 현금청산으로 처리하면 PIT 원장과 후속 수익률이 왜곡된다.",
+      "resolution": "불변 증권식별자와 Decimal entitlement·delivery·cash-in-lieu 액션을 Bronze-Silver-Gold 및 백테스트 원장에 연결하고 공통 Silver 범위 검증을 추가했다.",
+      "impact": "후계주식·단주·지연교부를 추정 없이 종목 단위로 fail-closed 처리하며 2026 범위 부족도 Gold 단계에서 조기에 차단한다."
+    },
+    {
       "task_id": "backtest_lifecycle_completion",
       "date": "2026-09-10",
       "adr_id": "ADR_20260910_backtest_lifecycle_completion",
