@@ -1088,3 +1088,15 @@ def test_stream_normalize_wires_ordering_for_both_stream_tables(tmp_path, monkey
     with pytest.raises(PITDataError, match='lifecycle-wiring-stop'):
         mod.stream_normalize_stock_evidence(bronze_root=tmp_path / 'bronze', silver_root=tmp_path / 'silver', artifact_root=tmp_path / 'artifacts', decision_time=stamp)
     assert calls == [SilverTable.DAILY_MARKET, SilverTable.SECURITY_MASTER]
+
+
+import polars as pl
+
+from src.core.pit import SilverTable
+from src.data.streaming_normalization import normalize_lifecycle_events
+
+def test_stream_normalize_stock_evidence_materializes_empty_or_unresolved_lifecycle_table():
+    frame = normalize_lifecycle_events(receipts=(), calendar=__import__('src.core.time', fromlist=['SessionCalendar']).SessionCalendar(()))
+    assert frame.schema['instrument_id'] == pl.String
+    assert 'resolution_kind' in frame.columns
+    assert SilverTable.LIFECYCLE_EVENTS.value == 'lifecycle_events'

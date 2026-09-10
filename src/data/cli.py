@@ -271,6 +271,17 @@ def _load_silver_table(silver_root: Path, table: SilverTable) -> Any:
     return load_latest_silver_table(root=silver_root, table=table, decision_time=datetime.now(UTC))
 
 
+def _load_manifest_silver_table(silver_root: Path, table: SilverTable, dataset_id: str | None = None) -> Any:
+    """Load a manifest-bound Silver table without optional swallows."""
+    from src.data.silver import load_silver_table_by_dataset_id
+
+    if dataset_id is not None:
+        return load_silver_table_by_dataset_id(
+            root=Path(silver_root), table=table, dataset_id=str(dataset_id), decision_time=datetime.now(UTC)
+        )
+    return _load_silver_table(Path(silver_root), table)
+
+
 def _load_silver_table_for_symbol(silver_root: Path, table: SilverTable, instrument_id: str) -> Any:
     """Load only rows for one instrument from a latest Silver dataset.
 
@@ -574,22 +585,12 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         security_master = _load_silver_table(silver_root, SilverTable.SECURITY_MASTER)
         corporate_actions = _load_silver_table(silver_root, SilverTable.CORPORATE_ACTIONS)
 
-    # Wiring: load lifecycle_events and pass lifecycle_events=lifecycle_events to build_backtest_sessions and evidence reporting
-    lifecycle_events = None
-    try:
-        if run_manifest is not None:
-            _lifecycle_frame = load_silver_table_by_dataset_id(
-                root=silver_root,
-                table=SilverTable.LIFECYCLE_EVENTS,
-                dataset_id=str(run_manifest.silver_dataset_ids.get("lifecycle_events", "lifecycle_events")),
-                decision_time=datetime.now(UTC),
-            )
-        else:
-            _lifecycle_frame = _load_silver_table(silver_root, SilverTable.LIFECYCLE_EVENTS)
-        if {"instrument_id", "delisting_date", "evidence_status"}.issubset(set(_lifecycle_frame.columns)):
-            lifecycle_events = _lifecycle_frame  # pragma: no cover - certified lifecycle dataset is integration-provisioned
-    except (PITDataError, KeyError, AttributeError, ValueError):  # pragma: no cover - lifecycle silver is optional until certified
-        lifecycle_events = None
+    if run_manifest is not None:
+        lifecycle_events = _load_manifest_silver_table(
+            silver_root, SilverTable.LIFECYCLE_EVENTS, dataset_id=str(run_manifest.silver_dataset_ids["lifecycle_events"])
+        )
+    else:
+        lifecycle_events = _load_manifest_silver_table(silver_root, SilverTable.LIFECYCLE_EVENTS)
 
     sessions = build_backtest_sessions(snapshot_repository=snapshot_repo, calendar=calendar, start=start_session, end=next_session, decision_time_of=lambda s: s.replace(hour=15, minute=30, second=0), security_master=security_master, corporate_actions=corporate_actions, lifecycle_events=lifecycle_events)
 

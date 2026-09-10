@@ -213,6 +213,22 @@ def _feature_set(table: SilverTable) -> str:
     return f"stock_pit_{table.value}_v1"
 
 
+def _load_manifest_silver_table(
+    *,
+    silver_root: Path,
+    table: SilverTable,
+    decision_time: datetime,
+    columns: list[str],
+) -> pl.DataFrame:
+    """Load a manifest-bound Silver table without optional skips."""
+    return _read_full_projected(
+        silver_root=Path(silver_root),
+        table=table,
+        decision_time=decision_time,
+        columns=columns,
+    )
+
+
 def _read_bounded_table(
     *,
     silver_root: Path,
@@ -386,15 +402,12 @@ def load_gold_window_inputs(
         decision_time=certification_time,
         columns=_CORPORATE_ACTIONS_COLUMNS,
     )
-    try:
-        lifecycle_events = _read_full_projected(
-            silver_root=silver_root,
-            table=SilverTable.LIFECYCLE_EVENTS,
-            decision_time=certification_time,
-            columns=_LIFECYCLE_EVENTS_COLUMNS,
-        )
-    except PITDataError:
-        lifecycle_events = pl.DataFrame()
+    lifecycle_events = _load_manifest_silver_table(
+        silver_root=silver_root,
+        table=SilverTable.LIFECYCLE_EVENTS,
+        decision_time=certification_time,
+        columns=_LIFECYCLE_EVENTS_COLUMNS,
+    )
     # Wiring: apply_lifecycle_master_overlay(security_master=security_master_full, lifecycle_events=lifecycle_events) before __UNKNOWN__ filtering and _compact_master_snapshots
     security_master_full = apply_lifecycle_master_overlay(security_master=security_master_full, lifecycle_events=lifecycle_events)
     # Guard: prior master/fact records needed for PIT eligibility must be kept.

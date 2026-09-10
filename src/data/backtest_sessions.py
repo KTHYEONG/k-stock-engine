@@ -277,12 +277,12 @@ def _require_finite_positive(value: Any, *, field: str) -> float:
 
 
 def validate_corporate_action_coverage(
-    *,
     daily_market: pl.DataFrame,
     corporate_actions: pl.DataFrame,
     calendar: SessionCalendar,
     decision_time_of: Callable[[datetime], datetime],
     policy: BacktestMarketInputsPolicy,
+    lifecycle_cleanup_keys: frozenset[tuple[str, datetime]] = frozenset(),
 ) -> CorporateActionCoverage:
     threshold = float(policy.unexplained_price_jump_threshold)
     action_rows: list[dict[str, Any]] = corporate_actions.to_dicts() if corporate_actions.height > 0 else []
@@ -376,6 +376,9 @@ def validate_corporate_action_coverage(
             meta = meta_by_key.get((iid, curr_session.isoformat()))
             if abs(raw_return) > threshold:
                 if meta is None:
+                    if (iid, curr_session) in lifecycle_cleanup_keys:
+                        research_returns[(curr_session, iid)] = raw_return
+                        continue
                     raise PITDataError(f"unexplained price discontinuity for {iid!r}")
                 raw_type = str(meta["raw_type"])
                 factor = float(meta["factor"])
@@ -621,57 +624,68 @@ def resolve_backtest_lifecycle_evidence(
     calendar: SessionCalendar,
     decision_time_of: Callable[[datetime], datetime],
 ) -> CorporateActionCoverage:
-    """Merge verified PIT-available lifecycle delistings into first-absent-session cash-outs."""
+    """Resolve verified lifecycle evidence into deterministic delisting actions without invented settlement."""
     sessions = tuple(sorted(calendar.sessions))
     sessions_by_date = {session.date(): session for session in sessions}
-    bar_rows = daily_market.to_dicts() if daily_market.height > 0 else []
-    close_by_key = {
-        (_coerce_session(row.get("session")), str(row.get("instrument_id"))): float(row.get("close", float("nan")))
-        for row in bar_rows
-        if isinstance(row.get("session"), datetime)
-    }
+    _ = daily_market
     event_rows = lifecycle_events.to_dicts() if lifecycle_events.height > 0 else []
     by_session: dict[datetime, list[LedgerCorporateAction]] = {}
     seen_keys: set[tuple[str, str]] = set()
     for row in event_rows:
-        if str(row.get("evidence_status", "verified")) != "verified":  # pragma: no cover - unresolved remain fail-closed
+        if str(row.get("evidence_status", "verified")) != "verified":  # pragma: no cover
             raise PITDataError(f"unresolved lifecycle evidence for {row.get('instrument_id')!r}")
         iid = str(row.get("instrument_id", ""))
         raw_delisting = row.get("delisting_date")
         delisting_date = raw_delisting.date() if isinstance(raw_delisting, datetime) else raw_delisting
         effective = sessions_by_date.get(delisting_date) if delisting_date is not None else None
-        if effective is None:  # pragma: no cover - outside-calendar delisting is rejected
+        if effective is None:  # pragma: no cover
             raise PITDataError(f"lifecycle delisting session is outside calendar for {iid!r}")
         action_id = str(row.get("action_id", f"{iid}:delisting:{effective.date().isoformat()}"))
         key = (effective.isoformat(), action_id)
-        if key in seen_keys:  # pragma: no cover - duplicate lifecycle events are rejected
+        if key in seen_keys:  # pragma: no cover
             raise PITDataError(f"duplicate lifecycle event for {iid!r}")
         seen_keys.add(key)
         avail = row.get("available_at")
-        if not isinstance(avail, datetime) or avail.tzinfo is None:  # pragma: no cover - availability must precede decision
+        if not isinstance(avail, datetime) or avail.tzinfo is None:  # pragma: no cover
             raise PITDataError(f"invalid lifecycle availability for {iid!r}")
         decision_time = decision_time_of(effective)
-        if avail >= decision_time:  # pragma: no cover - late availability is rejected
+        if avail >= decision_time:  # pragma: no cover
             raise PITDataError(f"late lifecycle availability for {iid!r}")
-        raw_cash = row.get("cash_settlement_per_share")
-        last_raw = row.get("last_tradable_session")
-        last_session = last_raw if isinstance(last_raw, datetime) else None
-        fallback = close_by_key.get((last_session, iid)) if last_session is not None else None
-        if fallback is None or not math.isfinite(float(fallback)):  # pragma: no cover - missing final bar is rejected
-            raise PITDataError(f"missing final KRX bar for {iid!r}")
-        cash_amount = float(raw_cash) if raw_cash is not None else float(fallback)
-        if not math.isfinite(cash_amount) or cash_amount < 0:  # pragma: no cover - settlement must be finite
-            raise PITDataError(f"invalid lifecycle settlement for {iid!r}")
-        by_session.setdefault(effective, []).append(
-            LedgerCorporateAction(
-                action_id=action_id,
-                instrument_id=iid,
-                action_type=LedgerActionType.DELISTING_CASH_OUT,
-                effective_time=effective,
-                factor=1.0,
-                cash_amount=cash_amount,
+        raw_kind = row.get("resolution_kind")
+        kind_text = str(raw_kind or "").strip()
+        if not kind_text:
+            raw_cash_hint = row.get("cash_settlement_per_share")
+            kind_text = "cash_settlement" if raw_cash_hint is not None else "unsettled_delisting"
+        if kind_text == "cash_settlement":
+            raw_cash = row.get("cash_settlement_per_share")
+            if raw_cash is None:  # pragma: no cover
+                raise PITDataError(f"invalid lifecycle settlement for {iid!r}")
+            cash_amount = float(raw_cash)
+            if not math.isfinite(cash_amount) or cash_amount < 0:  # pragma: no cover
+                raise PITDataError(f"invalid lifecycle settlement for {iid!r}")
+            by_session.setdefault(effective, []).append(
+                LedgerCorporateAction(
+                    action_id=action_id,
+                    instrument_id=iid,
+                    action_type=LedgerActionType.DELISTING_CASH_OUT,
+                    effective_time=effective,
+                    factor=1.0,
+                    cash_amount=cash_amount,
+                )
             )
-        )
+        elif kind_text == "unsettled_delisting":
+            by_session.setdefault(effective, []).append(
+                LedgerCorporateAction(
+                    action_id=action_id,
+                    instrument_id=iid,
+                    action_type=LedgerActionType.DELISTING_UNSETTLED,
+                    effective_time=effective,
+                    factor=1.0,
+                    cash_amount=0.0,
+                )
+            )
+        else:  # pragma: no cover
+            raise PITDataError(f"unresolved lifecycle evidence for {iid!r}")
     actions_map = {session: tuple(sorted(actions, key=lambda a: (a.instrument_id, a.action_id))) for session, actions in by_session.items()}
     return CorporateActionCoverage(actions_by_session=actions_map, research_returns_by_key={})
 
@@ -760,16 +774,34 @@ def build_backtest_sessions(
     corporate_actions = resolution.verified_corporate_actions
     partitioned = full.partition_by("session", as_dict=True)
     by_session = {k[0] if isinstance(k, tuple) else k: v for k, v in partitioned.items()}
-    coverage = validate_corporate_action_coverage(daily_market=full, corporate_actions=corporate_actions, calendar=calendar, decision_time_of=decision_time_of, policy=policy)
-    # Wiring: merge resolve_backtest_lifecycle_evidence(...).actions_by_session with corporate-action coverage
+    lifecycle_cleanup_keys: frozenset[tuple[str, datetime]] = frozenset()
+    lifecycle_coverage: CorporateActionCoverage | None = None
     if lifecycle_events is not None and lifecycle_events.height > 0:  # pragma: no cover - lifecycle merge is exercised via resolve unit test
-        _lifecycle_coverage = resolve_backtest_lifecycle_evidence(daily_market=full, lifecycle_events=lifecycle_events, calendar=calendar, decision_time_of=decision_time_of)
+        lifecycle_coverage = resolve_backtest_lifecycle_evidence(daily_market=full, lifecycle_events=lifecycle_events, calendar=calendar, decision_time_of=decision_time_of)
+        cleanup_keys: set[tuple[str, datetime]] = set()
+        for lifecycle_row in lifecycle_events.to_dicts():
+            if str(lifecycle_row.get("evidence_status", "")) != "verified":
+                continue
+            iid_key = str(lifecycle_row.get("instrument_id", ""))
+            start_raw = lifecycle_row.get("cleanup_start")
+            end_raw = lifecycle_row.get("cleanup_end")
+            avail_raw = lifecycle_row.get("available_at")
+            if not isinstance(start_raw, datetime) or not isinstance(end_raw, datetime):
+                continue
+            if not isinstance(avail_raw, datetime) or avail_raw.tzinfo is None:
+                continue
+            for candidate_session in calendar.sessions:
+                if start_raw <= candidate_session <= end_raw and avail_raw < decision_time_of(candidate_session):
+                    cleanup_keys.add((iid_key, candidate_session))
+        lifecycle_cleanup_keys = frozenset(cleanup_keys)
+    coverage = validate_corporate_action_coverage(daily_market=full, corporate_actions=corporate_actions, calendar=calendar, decision_time_of=decision_time_of, policy=policy, lifecycle_cleanup_keys=lifecycle_cleanup_keys)
+    if lifecycle_coverage is not None:  # pragma: no cover - lifecycle merge is exercised via resolve unit test
         _merged: dict[datetime, list[LedgerCorporateAction]] = {session: list(actions) for session, actions in coverage.actions_by_session.items()}
-        for _session, _actions in _lifecycle_coverage.actions_by_session.items():
+        for _session, _actions in lifecycle_coverage.actions_by_session.items():
             _merged.setdefault(_session, []).extend(_actions)
         coverage = CorporateActionCoverage(
             actions_by_session={session: tuple(sorted(actions, key=lambda a: (a.effective_time, a.action_id))) for session, actions in _merged.items()},
-            research_returns_by_key=coverage.research_returns_by_key,
+            research_returns_by_key={**coverage.research_returns_by_key, **lifecycle_coverage.research_returns_by_key},
         )
     adtv_map, vol_map, market_vol_map = _rolling_inputs(full, policy, ordered, coverage.research_returns_by_key)
     for session_open in decisions:

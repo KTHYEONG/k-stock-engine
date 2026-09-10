@@ -780,3 +780,58 @@ def test_resolve_lifecycle_only_covers_verified_pit_cleanup_interval() -> None:
     out = resolve_backtest_lifecycle_evidence(daily_market=daily,lifecycle_events=lifecycle,calendar=SessionCalendar((last,removed)),decision_time_of=lambda s: s.replace(hour=15,minute=30))
     assert out.actions_by_session[removed][0].action_type.value == 'delisting_cash_out'
     assert out.actions_by_session[removed][0].cash_amount == 10200.0
+
+
+from datetime import datetime
+
+import polars as pl
+import pytest
+
+from src.core.time import KRX_TZ, SessionCalendar
+from src.data.backtest_sessions import BacktestMarketInputsPolicy, validate_corporate_action_coverage  # noqa: F811
+from src.data.schemas import PITDataError  # noqa: F811
+
+def test_validate_corporate_action_coverage_exempts_only_verified_cleanup_key():
+    first = datetime(2016, 5, 10, 9, tzinfo=KRX_TZ); second = datetime(2016, 5, 11, 9, tzinfo=KRX_TZ)  # noqa: E702
+    frame = pl.DataFrame({'session': [first, second], 'instrument_id': ['KRX:008020', 'KRX:008020'], 'close': [10000.0, 26000.0]})
+    policy = BacktestMarketInputsPolicy(unexplained_price_jump_threshold=0.5)
+    coverage = validate_corporate_action_coverage(daily_market=frame, corporate_actions=pl.DataFrame(), calendar=SessionCalendar((first, second)), decision_time_of=lambda value: value.replace(hour=15), policy=policy, lifecycle_cleanup_keys=frozenset({('KRX:008020', second)}))
+    assert coverage.research_returns_by_key[(second, 'KRX:008020')] == pytest.approx(1.6)
+    with pytest.raises(PITDataError, match='unexplained price discontinuity'):
+        validate_corporate_action_coverage(daily_market=frame, corporate_actions=pl.DataFrame(), calendar=SessionCalendar((first, second)), decision_time_of=lambda value: value.replace(hour=15), policy=policy, lifecycle_cleanup_keys=frozenset())
+
+
+from datetime import date, datetime  # noqa: F811
+
+import polars as pl  # noqa: F811
+
+from src.core.ledger import LedgerActionType
+from src.core.time import KRX_TZ, SessionCalendar  # noqa: F811
+from src.data.backtest_sessions import resolve_backtest_lifecycle_evidence  # noqa: F811
+
+def test_resolve_lifecycle_evidence_never_uses_last_close_for_unpriced_delisting():
+    last = datetime(2016, 5, 18, 9, tzinfo=KRX_TZ); absent = datetime(2016, 5, 19, 9, tzinfo=KRX_TZ)  # noqa: E702
+    events = pl.DataFrame({'instrument_id': ['KRX:074150'], 'evidence_status': ['verified'], 'resolution_kind': ['unsettled_delisting'], 'available_at': [datetime(2016, 5, 1, 9, tzinfo=KRX_TZ)], 'last_tradable_session': [last], 'delisting_date': [date(2016, 5, 19)], 'cash_settlement_per_share': [None]})
+    bars = pl.DataFrame({'session': [last], 'instrument_id': ['KRX:074150'], 'close': [9000.0]})
+    coverage = resolve_backtest_lifecycle_evidence(daily_market=bars, lifecycle_events=events, calendar=SessionCalendar((last, absent)), decision_time_of=lambda value: value.replace(hour=15))
+    action = coverage.actions_by_session[absent][0]
+    assert action.action_type is LedgerActionType.DELISTING_UNSETTLED
+    assert action.cash_amount == 0.0
+
+
+def test_ledger_delisting_unsettled_records_no_cash_and_rejects_open_position():
+    from datetime import datetime
+    from src.core.ledger import Ledger, LedgerCorporateAction, LedgerActionType
+    from src.core.time import KRX_TZ
+    from src.data.schemas import PITDataError
+    import pytest
+    session = datetime(2016, 5, 19, 9, tzinfo=KRX_TZ)
+    ledger = Ledger(ledger_id="cov", initial_cash=100.0, opened_at=datetime(2016, 5, 18, 9, tzinfo=KRX_TZ))
+    action = LedgerCorporateAction(action_id="cov-unsettled", instrument_id="KRX:074150", action_type=LedgerActionType.DELISTING_UNSETTLED, effective_time=session, factor=1.0, cash_amount=0.0)
+    ledger.apply_corporate_actions((action,), session_open=session, cash_in_lieu_prices={})
+    assert ledger.quantity_of("KRX:074150") == 0
+    from src.core.ledger import LedgerFill, LedgerSide
+    ledger2 = Ledger(ledger_id="cov2", initial_cash=100000.0, opened_at=datetime(2016, 5, 18, 9, tzinfo=KRX_TZ))
+    ledger2.record_fill(LedgerFill(fill_id="f1", instrument_id="KRX:074150", side=LedgerSide.BUY, quantity=1, price=9000.0, commission=0.0, tax=0.0, slippage_cost=0.0, trade_time=datetime(2016, 5, 18, 9, tzinfo=KRX_TZ), settlement_time=datetime(2016, 5, 18, 9, tzinfo=KRX_TZ)))
+    with pytest.raises(PITDataError, match="unsettled"):
+        ledger2.apply_corporate_actions((action,), session_open=session, cash_in_lieu_prices={})

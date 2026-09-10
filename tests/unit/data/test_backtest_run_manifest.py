@@ -208,8 +208,10 @@ def test_backtest_run_manifest_write_rejects_tampered_existing_bytes(tmp_path) -
 def test_backtest_run_manifest_treats_lifecycle_events_as_optional(tmp_path) -> None:
     from datetime import date
 
+    import pytest
+
     from src.data.backtest_run_manifest import build_backtest_run_manifest
-    from src.data.schemas import SilverTable
+    from src.data.schemas import PITDataError, SilverTable
 
     base = {
         "silver_root": tmp_path / "silver",
@@ -226,5 +228,35 @@ def test_backtest_run_manifest_treats_lifecycle_events_as_optional(tmp_path) -> 
     without_lifecycle = {
         table: f"{table.value}-hash" for table in SilverTable if table is not SilverTable.LIFECYCLE_EVENTS
     }
-    legacy = build_backtest_run_manifest(silver_dataset_ids=without_lifecycle, **base)
-    assert SilverTable.LIFECYCLE_EVENTS.value not in legacy.silver_dataset_ids
+    with pytest.raises(PITDataError, match="exactly every SilverTable"):
+        build_backtest_run_manifest(silver_dataset_ids=without_lifecycle, **base)
+
+
+from datetime import date
+
+import pytest
+
+from src.data.backtest_run_manifest import build_backtest_run_manifest
+from src.data.schemas import PITDataError, SilverTable
+
+def test_manifest_v2_rejects_missing_lifecycle_dataset(tmp_path):
+    ids = {table: 'dataset' for table in SilverTable if table is not SilverTable.LIFECYCLE_EVENTS}
+    with pytest.raises(PITDataError, match='exactly every SilverTable'):
+        build_backtest_run_manifest(silver_root=tmp_path / 'silver', gold_root=tmp_path / 'gold', silver_dataset_ids=ids, gold_dataset_id='gold', validation_start=date(2016, 1, 4), validation_end=date(2016, 12, 29), strategy_id='core-v1', policy_versions={'pit': 'v1'})
+
+
+def test_manifest_v1_fails_with_rebuild_required(tmp_path):
+    import json
+    from datetime import date
+    import pytest
+    from src.data.backtest_run_manifest import build_backtest_run_manifest, load_backtest_run_manifest, write_backtest_run_manifest
+    from src.data.schemas import SilverTable
+    ids = {table: f"{table.value}-hash" for table in SilverTable}
+    manifest = build_backtest_run_manifest(silver_root=tmp_path / "silver", gold_root=tmp_path / "gold", silver_dataset_ids=ids, gold_dataset_id="gold", validation_start=date(2016, 1, 4), validation_end=date(2016, 12, 29), strategy_id="core-v1", policy_versions={"pit": "v1"})
+    path = write_backtest_run_manifest(manifest=manifest, artifact_root=tmp_path / "artifacts")
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["schema_version"] = "backtest-run-v1"
+    v1_path = tmp_path / "v1.json"
+    v1_path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(Exception, match="rebuild-required"):
+        load_backtest_run_manifest(v1_path)
