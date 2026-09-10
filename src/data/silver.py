@@ -174,6 +174,10 @@ _SCHEMAS: dict[SilverTable, dict[str, list[str]]] = {
             "document_sha256",
             "resolution_kind",
             "successor_instrument_id",
+            "lifecycle_event_id",
+            "source_security_id",
+            "successor_allocations_json",
+            "successor_delivery_date",
         ],
     },
 }
@@ -579,6 +583,10 @@ def complete_minimal_fixture(
             "document_sha256": [source_hash],
             "resolution_kind": ["cash_settlement"],
             "successor_instrument_id": [None],
+            "lifecycle_event_id": ["evt-fixture-000020"],
+            "source_security_id": ["KR7000020000"],
+            "successor_allocations_json": [None],
+            "successor_delivery_date": [None],
         }
     )
 

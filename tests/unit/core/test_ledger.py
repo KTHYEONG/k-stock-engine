@@ -119,3 +119,155 @@ def test_lifecycle_cash_out_removes_position_without_invented_cost() -> None:
     assert snap.settled_cash == 30200.0
     assert dict(entries[0].payload)['valuation_source'] == 'disclosed_settlement'
     assert snap.commission == snap.tax == snap.slippage_cost == 0.0
+
+
+def test_ledger_exchange_entitlement_then_successor_delivery_preserves_quantity_and_cost() -> None:
+    from datetime import datetime
+    from decimal import Decimal
+    from src.core.ledger import Ledger, LedgerActionType, LedgerCorporateAction, LedgerFill, LedgerSide, LedgerSuccessorAllocation
+    from src.core.time import KRX_TZ
+
+    source_day = datetime(2016, 10, 31, 9, tzinfo=KRX_TZ)
+    delivery_day = datetime(2016, 11, 1, 9, tzinfo=KRX_TZ)
+    allocation = LedgerSuccessorAllocation('KRX:105560', Decimal('0.5'), Decimal('1'))
+    ledger = Ledger('exchange', 10000.0, source_day)
+    ledger.record_fill(LedgerFill('buy-source', 'KRX:003450', LedgerSide.BUY, 10, 100.0, 0.0, 0.0, 0.0, source_day, source_day))
+    entitlement = LedgerCorporateAction('evt-1:entitlement', 'KRX:003450', LedgerActionType.EXCHANGE_ENTITLEMENT, source_day, 1.0, 0.0, lifecycle_event_id='evt-1', successor_allocations=(allocation,))
+    ledger.apply_corporate_actions((entitlement,), session_open=source_day, cash_in_lieu_prices={})
+    assert ledger.quantity_of('KRX:003450') == 0
+    assert ledger.quantity_of('KRX:105560') == 0
+    delivery = LedgerCorporateAction('evt-1:delivery', 'KRX:003450', LedgerActionType.SUCCESSOR_DELIVERY, delivery_day, 1.0, 0.0, lifecycle_event_id='evt-1', successor_allocations=(allocation,))
+    entries = ledger.apply_corporate_actions((delivery,), session_open=delivery_day, cash_in_lieu_prices={})
+    successor = ledger.snapshot(delivery_day).positions[0]
+    assert successor.instrument_id == 'KRX:105560'
+    assert successor.quantity == 5
+    assert successor.average_cost == 200.0
+    assert dict(entries[0].payload)['action_type'] == 'successor_delivery'
+    assert ledger.snapshot(delivery_day).settled_cash == 9000.0
+
+
+def test_ledger_successor_fraction_requires_disclosed_cash_in_lieu() -> None:
+    from datetime import datetime
+    from decimal import Decimal
+    import pytest
+    from src.core.ledger import Ledger, LedgerActionType, LedgerCorporateAction, LedgerFill, LedgerSide, LedgerSuccessorAllocation
+    from src.core.pit import PITDataError
+    from src.core.time import KRX_TZ
+
+    first = datetime(2016, 10, 31, 9, tzinfo=KRX_TZ)
+    second = datetime(2016, 11, 1, 9, tzinfo=KRX_TZ)
+    third = datetime(2016, 11, 2, 9, tzinfo=KRX_TZ)
+    allocation = LedgerSuccessorAllocation('KRX:105560', Decimal('0.5'), Decimal('1'))
+    ledger = Ledger('fraction', 1000.0, first)
+    ledger.record_fill(LedgerFill('buy', 'KRX:003450', LedgerSide.BUY, 3, 100.0, 0.0, 0.0, 0.0, first, first))
+    ledger.apply_corporate_actions((LedgerCorporateAction('evt-2:e', 'KRX:003450', LedgerActionType.EXCHANGE_ENTITLEMENT, first, 1.0, 0.0, lifecycle_event_id='evt-2', successor_allocations=(allocation,)),), session_open=first, cash_in_lieu_prices={})
+    ledger.apply_corporate_actions((LedgerCorporateAction('evt-2:d', 'KRX:003450', LedgerActionType.SUCCESSOR_DELIVERY, second, 1.0, 0.0, lifecycle_event_id='evt-2', successor_allocations=(allocation,)),), session_open=second, cash_in_lieu_prices={})
+    assert ledger.quantity_of('KRX:105560') == 1
+    with pytest.raises(PITDataError, match='cash-in-lieu'):
+        ledger.apply_corporate_actions((LedgerCorporateAction('evt-2:bad-cil', 'KRX:003450', LedgerActionType.CASH_IN_LIEU_SETTLEMENT, third, 1.0, 0.0, lifecycle_event_id='evt-2', settlement_instrument_id='KRX:105560'),), session_open=third, cash_in_lieu_prices={'KRX:105560': 99999.0})
+    entries = ledger.apply_corporate_actions((LedgerCorporateAction('evt-2:cil', 'KRX:003450', LedgerActionType.CASH_IN_LIEU_SETTLEMENT, third, 1.0, 0.0, lifecycle_event_id='evt-2', settlement_instrument_id='KRX:105560', cash_settlement_per_entitlement_unit=Decimal('20')),), session_open=third, cash_in_lieu_prices={})
+    assert ledger.snapshot(third).settled_cash == 710.0
+    assert dict(entries[0].payload)['cash'] == 10.0
+
+
+def test_ledger_rejects_unmatched_or_conflicting_successor_action_atomically() -> None:
+    from datetime import datetime
+    from decimal import Decimal
+    import pytest
+    from src.core.ledger import Ledger, LedgerActionType, LedgerCorporateAction, LedgerSuccessorAllocation
+    from src.core.pit import PITDataError
+    from src.core.time import KRX_TZ
+
+    now = datetime(2016, 11, 1, 9, tzinfo=KRX_TZ)
+    allocation = LedgerSuccessorAllocation('KRX:105560', Decimal('0.5'), Decimal('1'))
+    ledger = Ledger('reject', 100.0, now)
+    delivery = LedgerCorporateAction('evt-3:d', 'KRX:003450', LedgerActionType.SUCCESSOR_DELIVERY, now, 1.0, 0.0, lifecycle_event_id='evt-3', successor_allocations=(allocation,))
+    with pytest.raises(PITDataError, match='entitlement'):
+        ledger.apply_corporate_actions((delivery,), session_open=now, cash_in_lieu_prices={})
+    assert ledger.snapshot(now).settled_cash == 100.0
+    conflict = LedgerCorporateAction('evt-3:cash', 'KRX:003450', LedgerActionType.DELISTING_CASH_OUT, now, 1.0, 1.0, lifecycle_event_id='evt-3')
+    with pytest.raises(PITDataError, match='conflicting lifecycle'):
+        ledger.apply_corporate_actions((delivery, conflict), session_open=now, cash_in_lieu_prices={})
+    assert ledger.quantity_of('KRX:105560') == 0
+
+
+def test_ledger_successor_validation_rejects_invalid_terms_before_mutation() -> None:
+    from datetime import datetime
+    from decimal import Decimal
+
+    import pytest
+
+    from src.core.ledger import Ledger, LedgerActionType, LedgerCorporateAction, LedgerSuccessorAllocation
+    from src.core.pit import PITDataError
+    from src.core.time import KRX_TZ
+
+    now = datetime(2016, 11, 1, 9, tzinfo=KRX_TZ)
+    with pytest.raises(ValueError, match='non-empty'):
+        LedgerSuccessorAllocation('', Decimal('1'), Decimal('1'))
+    with pytest.raises(ValueError, match='Decimal'):
+        LedgerSuccessorAllocation('KRX:105560', Decimal('1'), 1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match='positive finite'):
+        LedgerSuccessorAllocation('KRX:105560', Decimal('0'), Decimal('1'))
+
+    valid = LedgerSuccessorAllocation('KRX:105560', Decimal('1'), Decimal('1'))
+    cases = (
+        (LedgerCorporateAction('missing-event', 'KRX:003450', LedgerActionType.EXCHANGE_ENTITLEMENT, now, 1.0, 0.0, successor_allocations=(valid,)), 'lifecycle_event_id'),
+        (LedgerCorporateAction('bad-factor', 'KRX:003450', LedgerActionType.EXCHANGE_ENTITLEMENT, now, 2.0, 0.0, lifecycle_event_id='evt', successor_allocations=(valid,)), 'factor'),
+        (LedgerCorporateAction('bad-cash', 'KRX:003450', LedgerActionType.EXCHANGE_ENTITLEMENT, now, 1.0, 1.0, lifecycle_event_id='evt', successor_allocations=(valid,)), 'cash_amount'),
+        (LedgerCorporateAction('bad-settlement-id', 'KRX:003450', LedgerActionType.EXCHANGE_ENTITLEMENT, now, 1.0, 0.0, lifecycle_event_id='evt', successor_allocations=(valid,), settlement_instrument_id='KRX:105560'), 'settlement fields'),
+        (LedgerCorporateAction('bad-settlement-cash', 'KRX:003450', LedgerActionType.EXCHANGE_ENTITLEMENT, now, 1.0, 0.0, lifecycle_event_id='evt', successor_allocations=(valid,), cash_settlement_per_entitlement_unit=Decimal('1')), 'settlement fields'),
+        (LedgerCorporateAction('missing-allocation', 'KRX:003450', LedgerActionType.EXCHANGE_ENTITLEMENT, now, 1.0, 0.0, lifecycle_event_id='evt'), 'allocations'),
+        (LedgerCorporateAction('bad-weight', 'KRX:003450', LedgerActionType.EXCHANGE_ENTITLEMENT, now, 1.0, 0.0, lifecycle_event_id='evt', successor_allocations=(LedgerSuccessorAllocation('KRX:105560', Decimal('1'), Decimal('0.5')),)), 'sum to 1'),
+        (LedgerCorporateAction('missing-cil-instrument', 'KRX:003450', LedgerActionType.CASH_IN_LIEU_SETTLEMENT, now, 1.0, 0.0, lifecycle_event_id='evt', cash_settlement_per_entitlement_unit=Decimal('1')), 'settlement_instrument_id'),
+    )
+    for action, message in cases:
+        ledger = Ledger(f'validate-{action.action_id}', 100.0, now)
+        with pytest.raises((PITDataError, ValueError), match=message):
+            ledger.apply_corporate_actions((action,), session_open=now, cash_in_lieu_prices={})
+        assert ledger.snapshot(now).settled_cash == 100.0
+
+
+def test_ledger_successor_preconditions_cover_claim_conflicts_and_residuals() -> None:
+    from datetime import datetime, timedelta
+    from decimal import Decimal
+
+    import pytest
+
+    from src.core.ledger import Ledger, LedgerActionType, LedgerCorporateAction, LedgerFill, LedgerSide, LedgerSuccessorAllocation
+    from src.core.pit import PITDataError
+    from src.core.time import KRX_TZ
+
+    first = datetime(2016, 11, 1, 9, tzinfo=KRX_TZ)
+    second = first + timedelta(days=1)
+    allocation = LedgerSuccessorAllocation('KRX:105560', Decimal('0.5'), Decimal('1'))
+    no_position = Ledger('no-position', 100.0, first)
+    action = LedgerCorporateAction('no-position:e', 'KRX:003450', LedgerActionType.EXCHANGE_ENTITLEMENT, first, 1.0, 0.0, lifecycle_event_id='no-position', successor_allocations=(allocation,))
+    with pytest.raises(PITDataError, match='opening position'):
+        no_position.apply_corporate_actions((action,), session_open=first, cash_in_lieu_prices={})
+
+    ledger = Ledger('claims', 1000.0, first)
+    ledger.record_fill(LedgerFill('buy-1', 'KRX:003450', LedgerSide.BUY, 2, 100.0, 0.0, 0.0, 0.0, first, first))
+    entitlement = LedgerCorporateAction('evt:e', 'KRX:003450', LedgerActionType.EXCHANGE_ENTITLEMENT, first, 1.0, 0.0, lifecycle_event_id='evt', successor_allocations=(allocation,))
+    ledger.apply_corporate_actions((entitlement,), session_open=first, cash_in_lieu_prices={})
+    mismatch = LedgerCorporateAction('evt:mismatch', 'KRX:003450', LedgerActionType.SUCCESSOR_DELIVERY, second, 1.0, 0.0, lifecycle_event_id='evt', successor_allocations=(LedgerSuccessorAllocation('KRX:005930', Decimal('0.5'), Decimal('1')),))
+    with pytest.raises(PITDataError, match='mismatch'):
+        ledger.apply_corporate_actions((mismatch,), session_open=second, cash_in_lieu_prices={})
+    ledger.apply_corporate_actions((LedgerCorporateAction('evt:d', 'KRX:003450', LedgerActionType.SUCCESSOR_DELIVERY, second, 1.0, 0.0, lifecycle_event_id='evt', successor_allocations=(allocation,)),), session_open=second, cash_in_lieu_prices={})
+    integral_cil = LedgerCorporateAction('evt:cil', 'KRX:003450', LedgerActionType.CASH_IN_LIEU_SETTLEMENT, second, 1.0, 0.0, lifecycle_event_id='evt', settlement_instrument_id='KRX:105560', cash_settlement_per_entitlement_unit=Decimal('1'))
+    with pytest.raises(PITDataError, match='fractional'):
+        ledger.apply_corporate_actions((integral_cil,), session_open=second, cash_in_lieu_prices={})
+    absent_cil = LedgerCorporateAction('absent:cil', 'KRX:003450', LedgerActionType.CASH_IN_LIEU_SETTLEMENT, second, 1.0, 0.0, lifecycle_event_id='absent', settlement_instrument_id='KRX:105560', cash_settlement_per_entitlement_unit=Decimal('1'))
+    with pytest.raises(PITDataError, match='without residual'):
+        ledger.apply_corporate_actions((absent_cil,), session_open=second, cash_in_lieu_prices={})
+    ledger.record_fill(LedgerFill('buy-2', 'KRX:003450', LedgerSide.BUY, 1, 100.0, 0.0, 0.0, 0.0, second, second))
+    duplicate = LedgerCorporateAction('evt:e2', 'KRX:003450', LedgerActionType.EXCHANGE_ENTITLEMENT, second, 1.0, 0.0, lifecycle_event_id='evt', successor_allocations=(allocation,))
+    with pytest.raises(ValueError, match='duplicate entitlement'):
+        ledger.apply_corporate_actions((duplicate,), session_open=second, cash_in_lieu_prices={})
+    conflict_time = second + timedelta(days=1)
+    conflicting_cash = LedgerCorporateAction('evt:cash', 'KRX:003450', LedgerActionType.DELISTING_CASH_OUT, conflict_time, 1.0, 1.0, lifecycle_event_id='evt')
+    with pytest.raises(PITDataError, match='conflicting lifecycle'):
+        ledger.apply_corporate_actions((conflicting_cash,), session_open=conflict_time, cash_in_lieu_prices={})
+
+    legacy = Ledger('legacy', 100.0, first)
+    legacy.apply_corporate_actions((LedgerCorporateAction('legacy:cash', 'KRX:999991', LedgerActionType.DELISTING_CASH_OUT, first, 1.0, 0.0, lifecycle_event_id='legacy-cash'),), session_open=first, cash_in_lieu_prices={})
+    legacy.apply_corporate_actions((LedgerCorporateAction('legacy:unsettled', 'KRX:999992', LedgerActionType.DELISTING_UNSETTLED, second, 1.0, 0.0, lifecycle_event_id='legacy-unsettled'),), session_open=second, cash_in_lieu_prices={})
