@@ -1912,16 +1912,25 @@ def _stream_table_isolated(
     return result
 
 
-def normalize_lifecycle_events(  # pragma: no cover - candidate-only lifecycle enrichment is integration-tested
+def normalize_lifecycle_events(
     *, receipts: Sequence[BronzeReceipt], calendar: SessionCalendar
 ) -> pl.DataFrame:
-    """Normalize DART lifecycle Bronze envelopes to Silver LIFECYCLE_EVENTS preserving verified and unresolved rows."""
+    """Normalize lifecycle Bronze envelopes to Silver LIFECYCLE_EVENTS.
+
+    Duplicate event versions are grouped through canonicalize_lifecycle_event_rows
+    so verified source-complete merger_or_exchange evidence wins over generic
+    unresolved rows while every Silver successor/provenance column is preserved.
+    """
     from decimal import Decimal as _Decimal
+
+    from src.data.lifecycle import canonicalize_lifecycle_event_rows
 
     _ = calendar
     empty_schema: dict[str, Any] = {
+        "lifecycle_event_id": pl.String,
         "instrument_id": pl.String,
         "ticker": pl.String,
+        "source_security_id": pl.String,
         "event_type": pl.String,
         "published_at": pl.Datetime(time_zone="Asia/Seoul"),
         "available_at": pl.Datetime(time_zone="Asia/Seoul"),
@@ -1929,6 +1938,8 @@ def normalize_lifecycle_events(  # pragma: no cover - candidate-only lifecycle e
         "cleanup_end": pl.Datetime(time_zone="Asia/Seoul"),
         "last_tradable_session": pl.Datetime(time_zone="Asia/Seoul"),
         "delisting_date": pl.Date,
+        "successor_delivery_date": pl.Date,
+        "successor_allocations_json": pl.String,
         "cash_settlement_per_share": pl.Float64,
         "source_url": pl.String,
         "source_hash": pl.String,
@@ -1978,10 +1989,13 @@ def normalize_lifecycle_events(  # pragma: no cover - candidate-only lifecycle e
         status = str(combined.get("evidence_status", "unresolved"))
         if status not in ("verified", "unresolved"):
             raise PITDataError("invalid lifecycle evidence status")
+        raw_allocations = combined.get("successor_allocations_json")
         rows.append(
             {
+                "lifecycle_event_id": combined.get("lifecycle_event_id"),
                 "instrument_id": str(combined.get("instrument_id", "")),
                 "ticker": str(combined.get("ticker", "")),
+                "source_security_id": combined.get("source_security_id"),
                 "event_type": str(combined.get("event_type", "delisting")),
                 "published_at": _as_moment(combined.get("published_at")),
                 "available_at": _as_moment(combined.get("available_at")),
@@ -1989,6 +2003,10 @@ def normalize_lifecycle_events(  # pragma: no cover - candidate-only lifecycle e
                 "cleanup_end": _as_moment(combined.get("cleanup_end")),
                 "last_tradable_session": _as_moment(combined.get("last_tradable_session")),
                 "delisting_date": _as_day(combined.get("delisting_date")),
+                "successor_delivery_date": _as_day(combined.get("successor_delivery_date")),
+                "successor_allocations_json": raw_allocations
+                if isinstance(raw_allocations, str)
+                else (json.dumps(raw_allocations, sort_keys=True, default=str) if raw_allocations is not None else None),
                 "cash_settlement_per_share": float(_Decimal(str(combined.get("cash_settlement_per_share")))) if combined.get("cash_settlement_per_share") is not None else None,
                 "source_url": combined.get("source_url") or combined.get("disclosure_url"),
                 "source_hash": str(combined.get("source_hash", combined.get("document_sha256", receipt.content_hash))),
@@ -2003,7 +2021,8 @@ def normalize_lifecycle_events(  # pragma: no cover - candidate-only lifecycle e
         )
     if not rows:
         return pl.DataFrame(schema=empty_schema)
-    frame = pl.DataFrame(rows, schema=empty_schema)
+    canonical = canonicalize_lifecycle_event_rows(rows)
+    frame = pl.DataFrame(canonical, schema=empty_schema)
     return frame
 
 

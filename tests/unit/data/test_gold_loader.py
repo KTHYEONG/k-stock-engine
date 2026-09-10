@@ -1,6 +1,24 @@
 """Gold window partition loading scenarios (contract skeletons)."""
 from __future__ import annotations
 
+from datetime import date
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _certified_manifest_ends(monkeypatch, request):
+    """Keep row-loader unit tests focused on their table-level failure paths."""
+    import src.data.gold_loader as module
+
+    if request.node.name == 'test_gold_selected_manifest_time_end_rejects_unreadable_or_naive_manifest':
+        return
+    monkeypatch.setattr(
+        module,
+        '_selected_manifest_time_end',
+        lambda **_kwargs: date(2026, 9, 10),
+    )
+
 
 def test_load_gold_window_inputs_reads_only_required_daily_partitions(tmp_path, monkeypatch) -> None:
     from datetime import UTC, date, datetime
@@ -400,3 +418,75 @@ def test_load_gold_window_inputs_overlays_lifecycle_without_replacing_known_mast
     assert out.row(0,named=True)['market'] == 'KOSPI'
     assert out.row(0,named=True)['sector'] == 'Industrial'
     assert out.row(0,named=True)['delisting_date'] == session.date()
+
+
+def test_gold_common_coverage_rejects_mixed_2026_manifest_ends() -> None:
+    from datetime import date
+    import pytest
+    from src.core.pit import SilverTable
+    from src.data.gold_loader import assert_common_silver_coverage
+    from src.data.schemas import PITDataError
+
+    required = frozenset(SilverTable)
+    ends = {table: date(2026, 9, 9) for table in required}
+    ends[SilverTable.LIFECYCLE_EVENTS] = date(2026, 3, 10)
+    with pytest.raises(PITDataError, match='lifecycle_events'):
+        assert_common_silver_coverage(coverage_ends=ends, required_tables=required, required_end=date(2026, 9, 9))
+    ends[SilverTable.LIFECYCLE_EVENTS] = date(2026, 9, 9)
+    assert assert_common_silver_coverage(coverage_ends=ends, required_tables=required, required_end=date(2026, 9, 9)) == date(2026, 9, 9)
+    with pytest.raises(PITDataError, match='calendar'):
+        assert_common_silver_coverage(coverage_ends={}, required_tables=frozenset({SilverTable.CALENDAR}), required_end=date(2026, 9, 9))
+    assert assert_common_silver_coverage(coverage_ends={}, required_tables=frozenset(), required_end=date(2026, 9, 9)) == date(2026, 9, 9)
+
+
+def test_gold_selected_manifest_time_end_rejects_unreadable_or_naive_manifest(monkeypatch, tmp_path) -> None:
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    import pytest
+
+    import src.data.gold_loader as mod
+    from src.core.pit import SilverTable
+    from src.data.schemas import PITDataError
+
+    class Store:
+        def read_manifest(self, _dataset_id):
+            raise OSError('unreadable')
+
+    monkeypatch.setattr(mod, '_resolve_latest_dataset', lambda *_args: ('id', Store()))
+    with pytest.raises(PITDataError, match='lifecycle_events'):
+        mod._selected_manifest_time_end(silver_root=tmp_path, table=SilverTable.LIFECYCLE_EVENTS, decision_time=datetime(2026, 9, 10, tzinfo=UTC))
+
+    class NaiveStore:
+        def read_manifest(self, _dataset_id):
+            return SimpleNamespace(time_end=datetime(2026, 9, 9))
+
+    monkeypatch.setattr(mod, '_resolve_latest_dataset', lambda *_args: ('id', NaiveStore()))
+    with pytest.raises(PITDataError, match='lifecycle_events'):
+        mod._selected_manifest_time_end(silver_root=tmp_path, table=SilverTable.LIFECYCLE_EVENTS, decision_time=datetime(2026, 9, 10, tzinfo=UTC))
+
+
+def test_gold_coverage_gate_rejects_missing_core_or_corrupt_optional_manifest(monkeypatch, tmp_path) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    import polars as pl
+
+    import src.data.gold_loader as mod
+    from src.core.pit import SilverTable
+    from src.data.schemas import PITDataError
+
+    sessions = [datetime(2015, 10, 1, tzinfo=UTC) + timedelta(days=index) for index in range(100)]
+    monkeypatch.setattr(mod, 'load_latest_silver_table', lambda **_kwargs: pl.DataFrame({'session': sessions}))
+    def core_missing(**kwargs):
+        if kwargs['table'] is SilverTable.CALENDAR:
+            raise PITDataError('missing manifest')
+        return sessions[-1].date()
+    monkeypatch.setattr(mod, '_selected_manifest_time_end', core_missing)
+    with pytest.raises(PITDataError, match='calendar'):
+        mod.load_gold_window_inputs(silver_root=tmp_path, validation_start=sessions[-5].date(), validation_end=sessions[-1].date(), decision_time=datetime(2026, 9, 10, tzinfo=UTC))
+
+    flow_dir = tmp_path / SilverTable.INVESTOR_FLOW.value / 'broken'
+    flow_dir.mkdir(parents=True)
+    monkeypatch.setattr(mod, '_selected_manifest_time_end', lambda **kwargs: (_ for _ in ()).throw(PITDataError('broken flow')) if kwargs['table'] is SilverTable.INVESTOR_FLOW else sessions[-1].date())
+    with pytest.raises(PITDataError, match='investor_flow'):
+        mod.load_gold_window_inputs(silver_root=tmp_path, validation_start=sessions[-5].date(), validation_end=sessions[-1].date(), decision_time=datetime(2026, 9, 10, tzinfo=UTC))
