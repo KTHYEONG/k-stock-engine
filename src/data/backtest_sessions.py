@@ -607,6 +607,26 @@ def build_backtest_sessions(
     adtv_map, vol_map, market_vol_map = _rolling_inputs(full, policy, ordered, coverage.research_returns_by_key)
     for session_open in decisions:
         decision_time = decision_time_of(session_open)
+        part = by_session[session_open]
+        master_ids: list[str] = []
+        for raw_iid in part.get_column("instrument_id").to_list():
+            iid = str(raw_iid)
+            rows = master_index.get(iid, ())
+            if any(
+                isinstance(row.get("available_at"), datetime)
+                and row["available_at"] <= decision_time
+                and _coerce_session(row.get("valid_from", session_open)) <= session_open
+                and session_open <= _coerce_session(row.get("valid_to", session_open))
+                for row in rows
+            ):
+                master_ids.append(iid)
+        by_session[session_open] = (
+            part.filter(pl.col("instrument_id").is_in(master_ids))
+            if master_ids
+            else part.clear()
+        )
+    for session_open in decisions:
+        decision_time = decision_time_of(session_open)
         for instrument_id in by_session[session_open].get_column("instrument_id").to_list():
             _resolve_sector(
                 security_master=security_master,
@@ -615,6 +635,22 @@ def build_backtest_sessions(
                 decision_time=decision_time,
                 master_index=master_index,
             )
+    # Warm-up is an instrument-level requirement.  A newly listed or sparse
+    # symbol must not invalidate otherwise usable symbols in the same session;
+    # retain only bars with complete rolling inputs and fail only when a
+    # requested session has no usable instruments at all.
+    for session_open in decisions:
+        part = by_session[session_open]
+        if part.is_empty():
+            continue
+        usable = [
+            iid
+            for iid in part.get_column("instrument_id").to_list()
+            if (session_open, str(iid)) in adtv_map and (session_open, str(iid)) in vol_map
+        ]
+        if not usable:
+            raise PITDataError("insufficient rolling PIT market history")
+        by_session[session_open] = part.filter(pl.col("instrument_id").is_in(usable))
     requested_keys = {
         (session_open, str(instrument_id))
         for session_open in decisions

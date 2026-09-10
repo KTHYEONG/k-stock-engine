@@ -673,11 +673,32 @@ def materialize_gold_window(
     if not security_master.is_empty() and "valid_from" in security_master.columns and "listing_date" in security_master.columns:
         earliest_vf = security_master.group_by("instrument_id").agg(pl.col("valid_from").min().alias("_min_vf"))
         security_master = security_master.join(earliest_vf, on="instrument_id").with_columns(
-            pl.when(pl.col("listing_date") == pl.col("valid_from"))
+            # Snapshot feeds may encode listing_date at market open while
+            # valid_from is midnight (or vice versa); compare local dates so
+            # the earliest historical listing is retained across timestamp
+            # precision differences.
+            pl.when(pl.col("listing_date").dt.date() == pl.col("valid_from").dt.date())
             .then(pl.col("_min_vf"))
             .otherwise(pl.col("listing_date"))
             .alias("listing_date")
         ).drop("_min_vf")
+    # A KRX master snapshot can carry a repeated snapshot date instead of the
+    # actual historical listing date.  The first certified daily bar is a
+    # conservative observable lower bound and prevents a stale listing date
+    # from suppressing otherwise valid historical liquidity decisions.
+    if "listing_date" in security_master.columns and not daily_market.is_empty():
+        first_bar = daily_market.group_by("instrument_id").agg(
+            pl.col("session").min().alias("_first_bar_session")
+        )
+        security_master = security_master.join(first_bar, on="instrument_id", how="left").with_columns(
+            pl.when(
+                pl.col("_first_bar_session").is_not_null()
+                & (pl.col("_first_bar_session").dt.date() < pl.col("listing_date").dt.date())
+            )
+            .then(pl.col("_first_bar_session"))
+            .otherwise(pl.col("listing_date"))
+            .alias("listing_date")
+        ).drop("_first_bar_session")
 
     if has_complete_frames or silver_root is not None:
         assert calendar is not None
