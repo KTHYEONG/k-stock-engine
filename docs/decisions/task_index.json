@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_BRONZE_RETENTION_STREAMING_PERFORMANCE",
+      "date": "2026-09-10",
+      "adr_id": "ADR_20260910_BRONZE_RETENTION_STREAMING_PERFORMANCE",
+      "domain": "backtest",
+      "title": "Bronze retention and bounded streaming performance",
+      "why": "Large daily and master receipts accumulated cross-month tails and legacy Bronze provenance prevented safe deletion.",
+      "resolution": "Added event-time receipt ordering, bounded eager parsing, month-sealed checkpoint reuse, and a read-only Bronze retention audit CLI.",
+      "impact": "Normalization retains full PIT scope with lower worker memory while Bronze deletion remains blocked until certified generation migration."
+    },
+    {
       "task_id": "krx-corporate-action-evidence-policy-remediation",
       "date": "2026-09-09",
       "adr_id": "ADR_20260909_krx-corporate-action-evidence-policy-remediation",
