@@ -169,6 +169,11 @@ _SCHEMAS: dict[SilverTable, dict[str, list[str]]] = {
             "source_hash",
             "evidence_status",
             "evidence_reason",
+            "source_provider",
+            "document_receipt_no",
+            "document_sha256",
+            "resolution_kind",
+            "successor_instrument_id",
         ],
     },
 }
@@ -569,6 +574,11 @@ def complete_minimal_fixture(
             "source_hash": [source_hash],
             "evidence_status": ["verified"],
             "evidence_reason": [None],
+            "source_provider": ["opendart"],
+            "document_receipt_no": [None],
+            "document_sha256": [source_hash],
+            "resolution_kind": ["cash_settlement"],
+            "successor_instrument_id": [None],
         }
     )
 

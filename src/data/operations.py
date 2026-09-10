@@ -15,16 +15,15 @@ from src.data.collection import (
     CollectionArtifact,
     collect_champion_evidence,
     collect_daily_market_sessions,
+    collect_dart_lifecycle_evidence,
     collect_historical_evidence,
-    collect_kind_lifecycle_evidence,
 )
 from src.data.collection_plan import CollectionReadinessReport
 from src.data.gold_loader import plan_daily_market_backfill
 from src.data.legacy_inventory import MigrationArtifact, purge_legacy_data
-from src.data.lifecycle import derive_lifecycle_candidates, parse_kind_lifecycle_notice
+from src.data.lifecycle import derive_lifecycle_candidates
 from src.data.schemas import EvidenceKind, PITDataError, SilverTable
 from src.data.streaming_normalization import stream_normalize_stock_evidence
-from src.integrations.krx.kind import KindLifecycleCollector
 
 logger = logging.getLogger(__name__)
 
@@ -322,9 +321,28 @@ def run_historical_data_pipeline(
         encoding="utf-8",
     )
     _pipeline_log("collect", plan_id=plan_id, kinds=sorted(hashes))
-    # Wiring: derive full-coverage candidates after SECURITY_MASTER collection; fetch KIND only for candidates; certify LIFECYCLE_EVENTS
-    _lifecycle_wiring = (derive_lifecycle_candidates, parse_kind_lifecycle_notice, KindLifecycleCollector, collect_kind_lifecycle_evidence)
-    _ = _lifecycle_wiring
+    from src.data.bronze import BronzeStore
+    from src.data.silver import load_latest_silver_table as _load_master_table
+    from src.integrations.dart.lifecycle import DartLifecycleCollector
+
+    _master_frame = _load_master_table(
+        root=Path(request.silver_root), table=SilverTable.SECURITY_MASTER, decision_time=request.certification_time
+    )
+    _calendar_frame = _load_master_table(
+        root=Path(request.silver_root), table=SilverTable.CALENDAR, decision_time=request.certification_time
+    )
+    _sessions = tuple(sorted(_calendar_frame["session"].to_list()))
+    from src.core.time import SessionCalendar as _OpsCalendar
+
+    _ops_calendar = _OpsCalendar(_sessions)
+    _candidates = derive_lifecycle_candidates(security_master=_master_frame, calendar=_ops_calendar)
+    _collector = DartLifecycleCollector(dart=dart, calendar=_ops_calendar, coverage_start=window.history_start)
+    collect_dart_lifecycle_evidence(
+        candidates=_candidates,
+        collector=_collector,
+        bronze=BronzeStore(Path(request.bronze_root)),
+        retrieved_at=request.certification_time,
+    )
     # Readiness is evaluated only after final Silver/Gold materialization.
     from src.data.pipeline import materialize_backtest_inputs
     from src.data.streaming_normalization import stream_normalize_stock_evidence
