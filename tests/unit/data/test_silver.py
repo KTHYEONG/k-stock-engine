@@ -217,3 +217,110 @@ def test_load_latest_silver_table_rejects_empty_or_undated_candidates(tmp_path, 
             table=SilverTable.FINANCIAL_FACTS,
             decision_time=datetime(2016, 12, 30, tzinfo=UTC),
         )
+
+
+def _materialized_silver_root_for_by_id(tmp_path):
+    from datetime import UTC, datetime
+
+    from src.data.silver import SilverStore, complete_minimal_fixture
+
+    decision = datetime(2026, 9, 6, tzinfo=UTC)
+    tables, _receipts, report = complete_minimal_fixture(decision_time=decision)
+    silver_root = tmp_path / "silver"
+    SilverStore(silver_root).materialize_all(tables, report=report, decision_time=decision)
+    return silver_root, decision
+
+
+def test_silver_dataset_path_and_load_by_id_round_trip(tmp_path) -> None:
+    from src.data.schemas import SilverTable
+    from src.data.silver import load_silver_table_by_dataset_id, silver_dataset_path_by_id
+
+    silver_root, decision = _materialized_silver_root_for_by_id(tmp_path)
+    dataset_id = next(p.name for p in (silver_root / "calendar").iterdir() if p.is_dir())
+
+    path = silver_dataset_path_by_id(
+        root=silver_root, table=SilverTable.CALENDAR, dataset_id=dataset_id, decision_time=decision
+    )
+
+    assert path == silver_root / "calendar" / dataset_id
+    frame = load_silver_table_by_dataset_id(
+        root=silver_root, table=SilverTable.CALENDAR, dataset_id=dataset_id, decision_time=decision
+    )
+    assert frame.height == 1
+
+
+def test_silver_by_id_rejects_invalid_and_missing(tmp_path) -> None:
+    from datetime import datetime
+
+    import pytest
+
+    from src.data.schemas import PITDataError, SilverTable
+    from src.data.silver import load_silver_table_by_dataset_id, silver_dataset_path_by_id
+
+    silver_root, decision = _materialized_silver_root_for_by_id(tmp_path)
+    with pytest.raises(PITDataError, match="timezone-aware"):
+        silver_dataset_path_by_id(
+            root=silver_root,
+            table=SilverTable.CALENDAR,
+            dataset_id="x",
+            decision_time=datetime(2024, 1, 2, 9),
+        )
+    for bad in ("a/b", "a\\b", ".", "..", "   ", "", " padded "):
+        with pytest.raises(PITDataError, match="dataset id"):
+            silver_dataset_path_by_id(
+                root=silver_root, table=SilverTable.CALENDAR, dataset_id=bad, decision_time=decision
+            )
+    with pytest.raises(PITDataError, match="missing certified"):
+        silver_dataset_path_by_id(
+            root=silver_root,
+            table=SilverTable.CALENDAR,
+            dataset_id="absent-id",
+            decision_time=decision,
+        )
+    (silver_root / "daily_market" / "empty-id").mkdir(parents=True, exist_ok=True)
+    with pytest.raises(PITDataError, match="invalid certified"):
+        silver_dataset_path_by_id(
+            root=silver_root, table=SilverTable.DAILY_MARKET, dataset_id="empty-id", decision_time=decision
+        )
+    with pytest.raises(PITDataError, match="missing certified"):
+        silver_dataset_path_by_id(
+            root=tmp_path / "absent-root",
+            table=SilverTable.CALENDAR,
+            dataset_id="x",
+            decision_time=decision,
+        )
+    import shutil as _shutil
+
+    calendar_id = next(p.name for p in (silver_root / "calendar").iterdir() if p.is_dir())
+    _shutil.copytree(silver_root / "calendar" / calendar_id, silver_root / "daily_market" / calendar_id)
+    with pytest.raises(PITDataError, match="invalid certified"):
+        silver_dataset_path_by_id(
+            root=silver_root, table=SilverTable.DAILY_MARKET, dataset_id=calendar_id, decision_time=decision
+        )
+    with pytest.raises(PITDataError, match="invalid certified"):
+        load_silver_table_by_dataset_id(
+            root=silver_root, table=SilverTable.DAILY_MARKET, dataset_id=calendar_id, decision_time=decision
+        )
+
+
+def test_silver_load_by_id_rejects_tampered_partitions(tmp_path) -> None:
+    import shutil
+
+    import pytest
+
+    from src.data.schemas import PITDataError, SilverTable
+    from src.data.silver import load_silver_table_by_dataset_id
+
+    from datetime import datetime as _dt
+
+    silver_root, decision = _materialized_silver_root_for_by_id(tmp_path)
+    dataset_id = next(p.name for p in (silver_root / "calendar").iterdir() if p.is_dir())
+    with pytest.raises(PITDataError, match="timezone-aware"):
+        load_silver_table_by_dataset_id(
+            root=silver_root, table=SilverTable.CALENDAR, dataset_id=dataset_id, decision_time=_dt(2024, 1, 2, 9)
+        )
+    shutil.rmtree(silver_root / "calendar" / dataset_id / "partitions", ignore_errors=True)
+    with pytest.raises(PITDataError, match="invalid certified"):
+        load_silver_table_by_dataset_id(
+            root=silver_root, table=SilverTable.CALENDAR, dataset_id=dataset_id, decision_time=decision
+        )

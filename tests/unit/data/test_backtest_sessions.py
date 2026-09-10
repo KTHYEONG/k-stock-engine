@@ -519,9 +519,11 @@ def test_resolve_backtest_evidence_excludes_unknown_without_adjusting_verified()
     daily = pl.DataFrame({'session': [first, second, first, second], 'instrument_id': ['KRX:A', 'KRX:A', 'KRX:B', 'KRX:B'], 'close': [100.0, 50.0, 100.0, 40.0], 'shares_outstanding': [10.0, 20.0, 10.0, 10.0], 'market_cap': [1000.0, 1000.0, 1000.0, 400.0]})
     actions = pl.DataFrame({'instrument_id': ['KRX:A', 'KRX:B'], 'action_id': ['split-a', 'unknown-b'], 'action_type': ['split', 'unresolved'], 'effective_session': [second, second], 'factor': [2.0, 1.0], 'cash_amount': [0.0, 0.0], 'available_at': [first, first], 'share_listing_date': [None, None], 'share_delta': [None, None], 'evidence_status': ['verified', 'unresolved'], 'evidence_reason': [None, 'unsupported_merger']})
     resolution = resolve_backtest_corporate_action_evidence(daily_market=daily, corporate_actions=actions, calendar=SessionCalendar((first, second)), policy=BacktestMarketInputsPolicy())
-    assert resolution.excluded_instruments == frozenset({'KRX:B'})
+    assert resolution.excluded_instruments == frozenset()
     assert resolution.exclusion_reasons['KRX:B'] == ('unsupported_merger',)
-    assert resolution.eligible_daily_market['instrument_id'].unique().to_list() == ['KRX:A']
+    assert set(resolution.eligible_daily_market['instrument_id'].unique().to_list()) == {'KRX:A', 'KRX:B'}
+    assert resolution.quarantine_sessions_by_instrument['KRX:B'] == (second,)
+    assert resolution.eligible_daily_market.filter(pl.col('instrument_id') == 'KRX:B')['session'].to_list() == [first]
     assert resolution.verified_corporate_actions['action_id'].to_list() == ['split-a']
 
 
@@ -556,3 +558,210 @@ def test_find_unexplained_price_discontinuities_returns_only_uncovered_jump() ->
     verified = pl.DataFrame({'instrument_id': ['KRX:V'], 'effective_session': [second]})
     jumps = find_unexplained_price_discontinuities(daily_market=daily, verified_actions=verified, threshold=0.5)
     assert jumps.to_dicts() == [{'instrument_id': 'KRX:U', 'session': second}]
+
+
+def test_resolve_backtest_evidence_quarantines_event_window_not_whole_instrument() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    import polars as pl
+
+    from src.core.time import SessionCalendar
+    from src.data.backtest_sessions import BacktestMarketInputsPolicy, resolve_backtest_corporate_action_evidence
+
+    days = tuple(datetime(2024, 1, 2, 9, tzinfo=UTC) + timedelta(days=index) for index in range(64))
+    daily = pl.DataFrame({
+        'session': [day for day in days for _ in ('KRX:A', 'KRX:B')],
+        'instrument_id': ['KRX:A', 'KRX:B'] * len(days),
+        'close': [100.0, 100.0] * len(days),
+    })
+    actions = pl.DataFrame({
+        'instrument_id': ['KRX:B'], 'action_id': ['unknown-b'], 'action_type': ['unresolved'],
+        'effective_session': [days[1]], 'factor': [1.0], 'cash_amount': [0.0],
+        'available_at': [days[0]], 'share_listing_date': [None], 'share_delta': [None],
+        'evidence_status': ['unresolved'], 'evidence_reason': ['unsupported_merger'],
+    })
+
+    result = resolve_backtest_corporate_action_evidence(
+        daily_market=daily, corporate_actions=actions, calendar=SessionCalendar(days),
+        policy=BacktestMarketInputsPolicy(),
+    )
+
+    kept_b = result.eligible_daily_market.filter(pl.col('instrument_id') == 'KRX:B')['session'].to_list()
+    assert days[0] in kept_b
+    assert days[1] not in kept_b
+    assert days[61] not in kept_b
+    assert days[62] in kept_b
+    assert result.quarantine_sessions_by_instrument['KRX:B'] == days[1:62]
+    assert 'KRX:B' not in result.excluded_instruments
+
+
+def test_resolve_backtest_evidence_rejects_unresolved_event_without_calendar_time() -> None:
+    from datetime import UTC, datetime
+
+    import polars as pl
+    import pytest
+
+    from src.core.time import SessionCalendar
+    from src.data.backtest_sessions import BacktestMarketInputsPolicy, resolve_backtest_corporate_action_evidence
+    from src.data.schemas import PITDataError
+
+    session = datetime(2024, 1, 2, 9, tzinfo=UTC)
+    daily = pl.DataFrame({'session': [session], 'instrument_id': ['KRX:B'], 'close': [100.0]})
+    actions = pl.DataFrame({
+        'instrument_id': ['KRX:B'], 'action_id': ['unknown-b'], 'action_type': ['unresolved'],
+        'effective_session': [None], 'factor': [1.0], 'cash_amount': [0.0],
+        'available_at': [session], 'evidence_status': ['unresolved'],
+        'evidence_reason': ['unsupported_merger'],
+    })
+
+    with pytest.raises(PITDataError, match='effective'):
+        resolve_backtest_corporate_action_evidence(
+            daily_market=daily, corporate_actions=actions, calendar=SessionCalendar((session,)),
+            policy=BacktestMarketInputsPolicy(),
+        )
+
+
+def test_resolve_backtest_evidence_accepts_iso_string_effective_session() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    import polars as pl
+
+    from src.core.time import SessionCalendar
+    from src.data.backtest_sessions import BacktestMarketInputsPolicy, resolve_backtest_corporate_action_evidence
+
+    days = tuple(datetime(2024, 1, 2, 9, tzinfo=UTC) + timedelta(days=index) for index in range(4))
+    daily = pl.DataFrame({
+        'session': list(days),
+        'instrument_id': ['KRX:B'] * len(days),
+        'close': [100.0] * len(days),
+    })
+    actions = pl.DataFrame({
+        'instrument_id': ['KRX:B'], 'action_id': ['unknown-b'], 'action_type': ['unresolved'],
+        'effective_session': [days[1].isoformat()], 'factor': [1.0], 'cash_amount': [0.0],
+        'available_at': [days[0]], 'share_listing_date': [None], 'share_delta': [None],
+        'evidence_status': ['unresolved'], 'evidence_reason': ['unsupported_merger'],
+    })
+    result = resolve_backtest_corporate_action_evidence(
+        daily_market=daily, corporate_actions=actions, calendar=SessionCalendar(days),
+        policy=BacktestMarketInputsPolicy(),
+    )
+    assert result.quarantine_sessions_by_instrument['KRX:B'] == days[1:]
+    assert result.eligible_daily_market['session'].to_list() == [days[0]]
+
+
+def test_resolve_backtest_evidence_rejects_bad_event_timing() -> None:
+    from datetime import UTC, datetime
+
+    import polars as pl
+    import pytest
+
+    from src.core.time import SessionCalendar
+    from src.data.backtest_sessions import BacktestMarketInputsPolicy, resolve_backtest_corporate_action_evidence
+    from src.data.schemas import PITDataError
+
+    session = datetime(2024, 1, 2, 9, tzinfo=UTC)
+    other = datetime(2024, 2, 1, 9, tzinfo=UTC)
+    daily = pl.DataFrame({'session': [session], 'instrument_id': ['KRX:B'], 'close': [100.0]})
+    base = {
+        'instrument_id': ['KRX:B'], 'action_id': ['unknown-b'], 'action_type': ['unresolved'],
+        'factor': [1.0], 'cash_amount': [0.0], 'available_at': [session],
+        'share_listing_date': [None], 'share_delta': [None],
+        'evidence_status': ['unresolved'], 'evidence_reason': ['unsupported_merger'],
+    }
+    naive = pl.DataFrame({**base, 'effective_session': [session.replace(tzinfo=None)]})
+    with pytest.raises(PITDataError, match='effective'):
+        resolve_backtest_corporate_action_evidence(
+            daily_market=daily, corporate_actions=naive, calendar=SessionCalendar((session,)),
+            policy=BacktestMarketInputsPolicy(),
+        )
+    garbage = pl.DataFrame({**base, 'effective_session': ['not-a-date']})
+    with pytest.raises(PITDataError, match='effective'):
+        resolve_backtest_corporate_action_evidence(
+            daily_market=daily, corporate_actions=garbage, calendar=SessionCalendar((session,)),
+            policy=BacktestMarketInputsPolicy(),
+        )
+    outside = pl.DataFrame({**base, 'effective_session': [other]})
+    with pytest.raises(PITDataError, match='outside calendar'):
+        resolve_backtest_corporate_action_evidence(
+            daily_market=daily, corporate_actions=outside, calendar=SessionCalendar((session,)),
+            policy=BacktestMarketInputsPolicy(),
+        )
+
+
+def test_resolve_backtest_evidence_filters_verified_on_effective_date() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    import polars as pl
+
+    from src.core.time import SessionCalendar
+    from src.data.backtest_sessions import BacktestMarketInputsPolicy, resolve_backtest_corporate_action_evidence
+
+    days = tuple(datetime(2024, 1, 2, 9, tzinfo=UTC) + timedelta(days=index) for index in range(4))
+    daily = pl.DataFrame({
+        'session': [day for day in days for _ in ('KRX:A', 'KRX:B')],
+        'instrument_id': ['KRX:A', 'KRX:B'] * len(days),
+        'close': [100.0, 100.0] * len(days),
+    })
+    actions = pl.DataFrame({
+        'instrument_id': ['KRX:A', 'KRX:B'],
+        'action_id': ['split-a', 'unknown-b'],
+        'action_type': ['split', 'unresolved'],
+        'effective_date': [days[1], days[1]],
+        'factor': [2.0, 1.0],
+        'cash_amount': [0.0, 0.0],
+        'available_at': [days[0], days[0]],
+        'evidence_status': ['verified', 'unresolved'],
+        'evidence_reason': [None, 'unsupported_merger'],
+    })
+    result = resolve_backtest_corporate_action_evidence(
+        daily_market=daily, corporate_actions=actions, calendar=SessionCalendar(days),
+        policy=BacktestMarketInputsPolicy(),
+    )
+    assert result.verified_corporate_actions['action_id'].to_list() == ['split-a']
+    assert result.quarantine_sessions_by_instrument['KRX:B'] == days[1:]
+    assert 'KRX:B' not in result.excluded_instruments
+
+
+def test_resolve_backtest_evidence_rejects_jump_outside_calendar() -> None:
+    from datetime import UTC, datetime
+
+    import polars as pl
+    import pytest
+
+    from src.core.time import SessionCalendar
+    from src.data.backtest_sessions import BacktestMarketInputsPolicy, resolve_backtest_corporate_action_evidence
+    from src.data.schemas import PITDataError
+
+    first = datetime(2024, 1, 2, 9, tzinfo=UTC)
+    second = datetime(2024, 1, 3, 9, tzinfo=UTC)
+    outsider = datetime(2024, 5, 5, 9, tzinfo=UTC)
+    daily = pl.DataFrame({
+        'session': [first, outsider],
+        'instrument_id': ['KRX:A', 'KRX:A'],
+        'close': [100.0, 10.0],
+    })
+    actions = pl.DataFrame({'instrument_id': [], 'action_id': []})
+    with pytest.raises(PITDataError, match='outside calendar'):
+        resolve_backtest_corporate_action_evidence(
+            daily_market=daily, corporate_actions=actions, calendar=SessionCalendar((first, second)),
+            policy=BacktestMarketInputsPolicy(),
+        )
+
+
+def test_resolve_backtest_evidence_handles_empty_daily_market() -> None:
+    import polars as pl
+
+    from datetime import UTC, datetime
+
+    from src.core.time import SessionCalendar
+    from src.data.backtest_sessions import BacktestMarketInputsPolicy, resolve_backtest_corporate_action_evidence
+
+    session = datetime(2024, 1, 2, 9, tzinfo=UTC)
+    daily = pl.DataFrame(schema={'session': pl.Datetime(time_zone='UTC'), 'instrument_id': pl.String, 'close': pl.Float64})
+    actions = pl.DataFrame({'instrument_id': [], 'action_id': []})
+    result = resolve_backtest_corporate_action_evidence(
+        daily_market=daily, corporate_actions=actions, calendar=SessionCalendar((session,)),
+        policy=BacktestMarketInputsPolicy(),
+    )
+    assert result.excluded_instruments == frozenset()
+    assert result.quarantine_sessions_by_instrument == {}
