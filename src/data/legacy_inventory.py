@@ -59,13 +59,8 @@ def plan_bronze_retention(
             size = payload_path.stat().st_size if payload_path.exists() else 0
             sizes.setdefault(content_hash, size)
     candidates = tuple(sorted(sizes))
-    candidate_pattern = (
-        re.compile(
-            r"(?<![0-9a-fA-F])(?:" + "|".join(re.escape(candidate) for candidate in candidates if candidate) + r")(?![0-9a-fA-F])"
-        )
-        if any(candidates)
-        else None
-    )
+    candidate_set = frozenset(candidate for candidate in candidates if candidate)
+    candidate_pattern = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{64})(?![0-9a-fA-F])")
     found: set[str] = set()
     blocking: list[str] = ["generation_gc_not_certified"]
     for root in provenance_roots:
@@ -89,8 +84,11 @@ def plan_bronze_retention(
                     if not chunk:
                         break
                     window = tail + chunk
-                    if candidate_pattern is not None:
-                        found.update(candidate_pattern.findall(window))
+                    found.update(
+                        token
+                        for token in candidate_pattern.findall(window)
+                        if token in candidate_set
+                    )
                     tail = window[-63:] if len(window) >= 63 else window
     referenced = tuple(h for h in candidates if h in found)
     unreferenced = tuple(h for h in candidates if h not in found)

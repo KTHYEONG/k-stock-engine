@@ -235,6 +235,41 @@ def _load_silver_table(silver_root: Path, table: SilverTable) -> Any:
     return load_latest_silver_table(root=silver_root, table=table, decision_time=datetime.now(UTC))
 
 
+def _load_silver_table_for_symbol(silver_root: Path, table: SilverTable, instrument_id: str) -> Any:
+    """Load only rows for one instrument from a latest Silver dataset.
+
+    Historical master/action partitions can be millions of rows and may have
+    compatible-but-not-identical schemas across years.  Reading each parquet
+    file independently keeps smoke/preflight runs bounded in memory while
+    ``diagonal_relaxed`` preserves nullable legacy columns.
+    """
+    import polars as pl
+
+    from src.data.silver import latest_silver_dataset_path
+
+    dataset_root = latest_silver_dataset_path(
+        root=silver_root, table=table, decision_time=datetime.now(UTC)
+    )
+    files = sorted(dataset_root.rglob("*.parquet"))
+    matches: list[Any] = []
+    required_columns = {
+        SilverTable.SECURITY_MASTER: {"valid_from"},
+        SilverTable.CORPORATE_ACTIONS: {"effective_date", "action_type"},
+    }.get(table, set())
+    for path in files:
+        frame = pl.read_parquet(path)
+        if required_columns and not required_columns.issubset(frame.columns):
+            continue
+        if "instrument_id" not in frame.columns:
+            continue
+        subset = frame.filter(pl.col("instrument_id") == instrument_id)
+        if subset.height:
+            matches.append(subset)
+    if not matches:
+        raise PITDataError(f"no {table.value} Silver rows for {instrument_id}")
+    return pl.concat(matches, how="diagonal_relaxed")
+
+
 def _champion_scores_by_session(scores_frame: Any) -> dict[date, tuple[Any, ...]]:
     """Build the in-memory session index consumed by ChampionStrategy."""
     from src.strategy.scoring import ChampionScoreReason, ChampionScoreRow
@@ -382,6 +417,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         "volume",
         "trading_value",
         "market_cap",
+        "shares_outstanding",
         "available_at",
     ]
     scans = [
@@ -409,8 +445,26 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         {SilverTable.DAILY_MARKET: daily_market_pit}, root=silver_root
     )
 
-    security_master = _load_silver_table(silver_root, SilverTable.SECURITY_MASTER)
-    corporate_actions = _load_silver_table(silver_root, SilverTable.CORPORATE_ACTIONS)
+    if smoke_symbol:
+        # Keep the production smoke path bounded even when the historical
+        # Silver tables contain all instruments.  Unit fixtures often expose
+        # only a daily-market directory, so retain the regular loader as a
+        # compatibility fallback when no filtered dataset is available.
+        try:
+            security_master = _load_silver_table_for_symbol(
+                silver_root, SilverTable.SECURITY_MASTER, smoke_symbol
+            )
+        except PITDataError:
+            security_master = _load_silver_table(silver_root, SilverTable.SECURITY_MASTER)
+        try:
+            corporate_actions = _load_silver_table_for_symbol(
+                silver_root, SilverTable.CORPORATE_ACTIONS, smoke_symbol
+            )
+        except PITDataError:
+            corporate_actions = _load_silver_table(silver_root, SilverTable.CORPORATE_ACTIONS)
+    else:
+        security_master = _load_silver_table(silver_root, SilverTable.SECURITY_MASTER)
+        corporate_actions = _load_silver_table(silver_root, SilverTable.CORPORATE_ACTIONS)
 
     sessions = build_backtest_sessions(snapshot_repository=snapshot_repo, calendar=calendar, start=start_session, end=next_session, decision_time_of=lambda s: s.replace(hour=15, minute=30, second=0), security_master=security_master, corporate_actions=corporate_actions)
 
@@ -454,7 +508,9 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
                             intent_id=f"smoke-buy-{target_sym}",
                             asset_kind=AssetKind.STOCK,
                             instrument_id=target_sym,
-                            target_value=initial_cash * 0.5,
+                            # Keep the smoke order below the historical hard
+                            # participation cap even on thin-volume sessions.
+                            target_value=initial_cash * 0.2,
                             decision_time=context.decision_time,
                             execution_time=sessions_ordered[1],
                             strategy_id="champion-v1",
