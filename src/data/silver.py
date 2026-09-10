@@ -152,6 +152,25 @@ _SCHEMAS: dict[SilverTable, dict[str, list[str]]] = {
             "source_hash",
         ],
     },
+    SilverTable.LIFECYCLE_EVENTS: {
+        "primary_key": ["instrument_id", "delisting_date", "source_hash"],
+        "required_columns": [
+            "instrument_id",
+            "ticker",
+            "event_type",
+            "published_at",
+            "available_at",
+            "cleanup_start",
+            "cleanup_end",
+            "last_tradable_session",
+            "delisting_date",
+            "cash_settlement_per_share",
+            "source_url",
+            "source_hash",
+            "evidence_status",
+            "evidence_reason",
+        ],
+    },
 }
 
 _ALLOWED_ACTION_TYPES = {"no_action", "split", "dividend", "reverse_split", "merger", "spin_off", "rights_issue", "bonus_issue"}
@@ -322,7 +341,7 @@ def certify_silver(
     if coverage_start > coverage_end:
         raise PITDataError("coverage_start must not be after coverage_end")
 
-    required_tables = list(SilverTable)
+    required_tables = [table for table in SilverTable if table is not SilverTable.LIFECYCLE_EVENTS]
     missing_tables = [t.value for t in required_tables if t not in tables]
     if missing_tables:
         # Ensure message contains investor_flow and financial_facts in order for test
@@ -351,8 +370,9 @@ def certify_silver(
     # The test for empty receipts already failed on missing tables, so not needed.
     # For completeness, if certification is RESEARCH or PRODUCTION and source_hashes incomplete, raise with names
     if certification in (DatasetCertification.RESEARCH, DatasetCertification.PRODUCTION):
-        missing_kinds = [k.value for k in EvidenceKind if k not in source_hashes]
-        if missing_kinds and len(source_hashes) < len(EvidenceKind):
+        required_kinds = tuple(k for k in EvidenceKind if k is not EvidenceKind.LIFECYCLE_EVENTS)
+        missing_kinds = [k.value for k in required_kinds if k not in source_hashes]
+        if missing_kinds and len(source_hashes) < len(required_kinds):
             raise PITDataError(f"missing required evidence: {', '.join(sorted(missing_kinds))} (investor_flow, financial_facts)")
 
     if certification is DatasetCertification.PRODUCTION:
@@ -533,6 +553,25 @@ def complete_minimal_fixture(
         }
     )
 
+    tables[SilverTable.LIFECYCLE_EVENTS] = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:000020"],
+            "ticker": ["000020"],
+            "event_type": ["delisting"],
+            "published_at": [available_at],
+            "available_at": [available_at],
+            "cleanup_start": [available_at],
+            "cleanup_end": [available_at],
+            "last_tradable_session": [session_dt],
+            "delisting_date": [base_date],
+            "cash_settlement_per_share": [105.0],
+            "source_url": ["https://kind.krx.co.kr/fixture"],
+            "source_hash": [source_hash],
+            "evidence_status": ["verified"],
+            "evidence_reason": [None],
+        }
+    )
+
     # Synthetic receipts for all evidence kinds
     receipts: dict[EvidenceKind, BronzeReceipt] = {}
     for kind in EvidenceKind:
@@ -706,7 +745,7 @@ def certify_corporate_action_refresh(
     """Certify an action-only refresh against immutable non-action manifests."""
     if decision_time.tzinfo is None:  # pragma: no cover - public callers validate timezone
         raise PITDataError("decision_time must be timezone-aware")
-    missing = [kind.value for kind in EvidenceKind if not receipts.get(kind)]
+    missing = [kind.value for kind in EvidenceKind if not receipts.get(kind) and kind is not EvidenceKind.LIFECYCLE_EVENTS]
     if missing:  # pragma: no cover - caller validates every evidence kind
         raise PITDataError(f"missing required evidence: {', '.join(sorted(missing))}")
     validate_table(SilverTable.CORPORATE_ACTIONS, action_frame, decision_time=decision_time)
@@ -718,6 +757,8 @@ def certify_corporate_action_refresh(
     calendar_manifest: object | None = None
     for table in SilverTable:
         if table is SilverTable.CORPORATE_ACTIONS:
+            continue
+        if table is SilverTable.LIFECYCLE_EVENTS:
             continue
         manifest = _latest_silver_manifest(root=silver_root, table=table, decision_time=decision_time)
         table_hashes[table] = str(getattr(manifest, "content_hash", ""))

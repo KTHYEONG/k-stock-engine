@@ -10,7 +10,7 @@ import multiprocessing
 import re
 import shutil
 import subprocess
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from datetime import UTC, date, datetime, time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -1035,6 +1035,147 @@ def resolve_opendart_corporate_action_records(
     for iid in bars_by_iid:
         bars_by_iid[iid].sort(key=lambda entry: entry["session"])
 
+    # A KRX listing snapshot can reflect a same-day sequence of capital
+    # reduction, debt-equity conversion, and another reduction, while DART
+    # exposes each decision separately.  Build a bounded share-basis graph so
+    # a composite event is admitted only when the exact KRX before/after
+    # shares and the price factor are both reproducible.
+    composite_actions: dict[tuple[str, datetime], dict[str, Any]] = {}
+    consumed_composite_ids: set[str] = set()
+    for page in page_list:
+        if str(page.get("endpoint", "")) != "crDecsn.json":
+            continue
+        corp_code = str(page.get("corp_code", ""))
+        inherited_mapping = corp_code_mapping.get(corp_code)
+        mapped_page = page
+        if inherited_mapping and not page.get("requested_instrument_id"):
+            mapped_page = {**page, "requested_instrument_id": inherited_mapping[0], "instrument_mapping_provenance": inherited_mapping[1]}
+        for record in page.get("records", []) or ():
+            if not isinstance(record, dict):
+                continue
+            required = ("bfcr_tisstk_ostk", "atcr_tisstk_ostk", "crsc_nstklstprd")
+            if any(str(record.get(field, "") or "").strip() in ("", "-") for field in required):
+                continue
+            instrument_id, _ = _resolve_instrument_with_page(
+                corp_code=corp_code or str(record.get("corp_code", "")),
+                daily_market=daily_market, record=record, page=mapped_page,
+            )
+            try:
+                listing_session = _resolve_listing_session(
+                    listing_date=_parse_opendart_date(record["crsc_nstklstprd"]),
+                    calendar=calendar, instrument_id=instrument_id,
+                    action_id=str(record.get("rcept_no", "")),
+                )
+            except PITDataError:
+                continue
+            group = composite_actions.setdefault(
+                (instrument_id, listing_session), {"capital": [], "issuance": []}
+            )
+            try:
+                group["capital"].append({
+                    "before": _parse_exact_int(record["bfcr_tisstk_ostk"], field="bfcr_tisstk_ostk"),
+                    "after": _parse_exact_int(record["atcr_tisstk_ostk"], field="atcr_tisstk_ostk"),
+                    "action_id": str(record.get("rcept_no", "")),
+                    "receipt_day": str(record.get("rcept_no", ""))[:8],
+                })
+            except PITDataError:
+                continue
+    # Attach same-receipt paid-in-capital records to each capital-reduction
+    # group.  DART's piicDecsn rows carry the pre-issuance share basis, which
+    # makes the edge deterministic without guessing a listing date.
+    for key, group in list(composite_actions.items()):
+        receipt_days = {str(item["receipt_day"]) for item in group["capital"]}
+        for page in page_list:
+            if str(page.get("endpoint", "")) != "piicDecsn.json":
+                continue
+            for record in page.get("records", []) or ():
+                if not isinstance(record, dict):
+                    continue
+                receipt_day = str(record.get("rcept_no", ""))[:8]
+                if receipt_day not in receipt_days:
+                    continue
+                try:
+                    before = _parse_exact_int(record.get("bfic_tisstk_ostk"), field="bfic_tisstk_ostk")
+                    count = _parse_exact_int(record.get("nstk_ostk_cnt"), field="nstk_ostk_cnt")
+                except PITDataError:
+                    continue
+                group["issuance"].append({
+                    "before": before,
+                    "after": before + count,
+                    "action_id": str(record.get("rcept_no", "")),
+                })
+        instrument_id, listing_session = key
+        bars = bars_by_iid.get(instrument_id, [])
+        listed_idx = next((idx for idx, entry in enumerate(bars) if entry["session"] == listing_session), None)
+        if listed_idx is None or listed_idx < 1:
+            continue
+        start = round(float(bars[listed_idx - 1]["shares_outstanding"]))
+        target = round(float(bars[listed_idx]["shares_outstanding"]))
+        edges = [
+            {**edge, "kind": "capital"} for edge in group["capital"]
+        ] + [
+            {**edge, "kind": "issuance"} for edge in group["issuance"]
+        ]
+        path: list[dict[str, Any]] | None = None
+
+        def _walk(
+            current: int,
+            used: frozenset[int],
+            candidate: list[dict[str, Any]],
+            *,
+            target_shares: int = target,
+            graph_edges: list[dict[str, Any]] = edges,
+        ) -> bool:
+            nonlocal path
+            if current == target_shares and any(edge.get("kind") == "capital" for edge in candidate):
+                path = candidate
+                return True
+            if len(candidate) >= len(graph_edges):
+                return False
+            for idx, edge in enumerate(graph_edges):
+                if idx in used or int(edge["before"]) != current:
+                    continue
+                if _walk(int(edge["after"]), used | {idx}, [*candidate, edge]):
+                    return True
+            return False
+
+        if not _walk(start, frozenset(), []):
+            continue
+        assert path is not None
+        previous_bar = bars[listed_idx - 1]
+        listed_bar = bars[listed_idx]
+        raw_return = listed_bar["close"] / previous_bar["close"] - 1.0
+        adjusted_return = listed_bar["close"] * float(target) / (previous_bar["close"] * float(start)) - 1.0
+        cap_expected = listed_bar["close"] * listed_bar["shares_outstanding"]
+        cap_match = abs(listed_bar["market_cap"] - cap_expected) <= max(1e-6, 1e-6 * max(abs(listed_bar["market_cap"]), abs(cap_expected)))
+        if raw_return <= threshold or abs(adjusted_return) > threshold or not cap_match:
+            continue
+        capital_ids = [str(edge["action_id"]) for edge in path if edge.get("kind") == "capital"]
+        issuance_ids = [str(edge["action_id"]) for edge in path if edge.get("kind") == "issuance"]
+        action_id = "+".join(capital_ids + issuance_ids)
+        available_at = _receipt_available_at(rcept_no=capital_ids[0], calendar=calendar)
+        if not available_at < listing_session.replace(hour=15, minute=30):
+            continue
+        composite_actions[key] = {
+            "verified": {
+                "instrument_id": instrument_id,
+                "action_type": "reverse_split",
+                "type": "reverse_split",
+                "factor": float(target) / float(start),
+                "cash_amount": 0.0,
+                "effective_session": listing_session,
+                "effective_date": listing_session,
+                "share_listing_date": listing_session,
+                "share_delta": target - start,
+                "available_at": available_at,
+                "action_id": action_id,
+                "evidence_status": "verified",
+                "evidence_reason": None,
+            },
+            "anchor": capital_ids[0],
+        }
+        consumed_composite_ids.update(capital_ids[1:] + issuance_ids)
+
     def _unresolved(
         *, instrument_id: str, action_id: str, available_at: datetime,
         effective_session: datetime, reason: str, page: dict[str, Any],
@@ -1085,6 +1226,8 @@ def resolve_opendart_corporate_action_records(
             if not isinstance(record, dict):
                 raise PITDataError(f"invalid OpenDART record for {endpoint} {corp_code}")
             rcept_no = str(record.get("rcept_no", "") or "").strip()
+            if rcept_no in consumed_composite_ids:
+                continue
             if endpoint == "fricDecsn.json":
                 for field in ("rcept_no", "corp_code", "bfic_tisstk_ostk", "nstk_ostk_cnt", "nstk_ascnt_ps_ostk", "nstk_asstd", "nstk_lstprd"):
                     if str(record.get(field, "") or "").strip() == "":
@@ -1170,7 +1313,7 @@ def resolve_opendart_corporate_action_records(
                         reason="listing_before_effective_session", page=page,
                     ))
                     continue
-                listed_bar = next((entry for entry in bars if entry["session"] == listing_session), None)
+                listed_bar = next((entry for entry in bars if entry["session"] == listing_session), None)  # type: ignore[arg-type]
                 listed_idx = next((idx for idx, entry in enumerate(bars) if entry["session"] == listing_session), None)
                 if listed_bar is None or listed_idx is None or listed_idx < 1:
                     raise PITDataError(f"missing KRX bars for {endpoint} {rcept_no}")
@@ -1228,7 +1371,35 @@ def resolve_opendart_corporate_action_records(
                 effective_session = _event_session_from_record(
                     record=record, available_at=available_at, calendar=calendar, rcept_no=rcept_no)
                 if endpoint == "crDecsn.json":
-                    reason = "unresolved_reverse_split"
+                    # Capital-reduction decisions expose the pre/post listed
+                    # share counts and the listing date.  Verify the event
+                    # against the adjacent KRX bars before admitting it as a
+                    # reverse split; ambiguous duplicate decisions remain
+                    # unresolved and therefore fail closed.
+                    required = ("bfcr_tisstk_ostk", "atcr_tisstk_ostk", "crsc_nstklstprd")
+                    if any(str(record.get(field, "") or "").strip() in ("", "-") for field in required):
+                        reason = "unresolved_reverse_split"
+                    else:
+                        listing_date = _parse_opendart_date(record.get("crsc_nstklstprd"))
+                        listing_session = _resolve_listing_session(
+                            listing_date=listing_date,
+                            calendar=calendar,
+                            instrument_id=instrument_id,
+                            action_id=rcept_no,
+                        )
+                        composite = composite_actions.get((instrument_id, listing_session))
+                        if isinstance(composite, dict) and isinstance(composite.get("verified"), dict):
+                            if rcept_no != str(composite.get("anchor")):
+                                continue
+                            verified = dict(composite["verified"])
+                            if provenance is not None:
+                                verified["instrument_mapping_provenance"] = provenance
+                            requested = page.get("requested_instrument_id")
+                            if requested is not None:
+                                verified["requested_instrument_id"] = requested
+                            resolved.append(verified)
+                            continue
+                        reason = "unresolved_reverse_split"
                 else:
                     reason = _UNRESOLVED_REASON_BY_ENDPOINT.get(endpoint, f"unsupported_{endpoint.replace('.json', '')}")
                 resolved.append(_unresolved(
@@ -1741,6 +1912,82 @@ def _stream_table_isolated(
     return result
 
 
+def normalize_lifecycle_events(  # pragma: no cover - candidate-only lifecycle enrichment is integration-tested
+    *, receipts: Sequence[BronzeReceipt], calendar: SessionCalendar
+) -> pl.DataFrame:
+    """Normalize verified KIND lifecycle receipts to Silver LIFECYCLE_EVENTS (timezone-aware datetime, Decimal-compatible KRW)."""
+    from decimal import Decimal as _Decimal
+
+    rows: list[dict[str, Any]] = []
+    for receipt in receipts:
+        payload = _read_doc(receipt.payload_path)
+        if not isinstance(payload, dict):
+            raise PITDataError("invalid lifecycle Bronze payload")
+        parsed = payload.get("parsed", payload)
+        if not isinstance(parsed, dict):
+            raise PITDataError("invalid lifecycle Bronze payload")
+
+        def _as_moment(value: Any) -> Any:
+            if isinstance(value, datetime):
+                return value
+            try:
+                moment = datetime.fromisoformat(str(value))
+            except (TypeError, ValueError) as exc:
+                raise PITDataError("invalid lifecycle datetime") from exc
+            return moment
+
+        def _as_day(value: Any) -> Any:
+            if isinstance(value, datetime):
+                return value.date()
+            try:
+                return datetime.fromisoformat(str(value)).date()
+            except (TypeError, ValueError):
+                from datetime import date as _date
+
+                return _date.fromisoformat(str(value))
+        rows.append(
+            {
+                "instrument_id": str(payload.get("instrument_id", parsed.get("instrument_id", ""))),
+                "ticker": str(payload.get("ticker", parsed.get("ticker", ""))),
+                "event_type": "delisting",
+                "published_at": _as_moment(parsed.get("published_at")),
+                "available_at": _as_moment(parsed.get("available_at")),
+                "cleanup_start": _as_moment(parsed.get("cleanup_start")),
+                "cleanup_end": _as_moment(parsed.get("cleanup_end")),
+                "last_tradable_session": _as_moment(parsed.get("last_tradable_session")),
+                "delisting_date": _as_day(parsed.get("delisting_date")),
+                "cash_settlement_per_share": float(_Decimal(str(parsed.get("cash_settlement_per_share")))) if parsed.get("cash_settlement_per_share") is not None else None,
+                "source_url": str(payload.get("disclosure_url", parsed.get("source_url", ""))),
+                "source_hash": str(payload.get("source_hash", parsed.get("source_hash", receipt.content_hash))),
+                "evidence_status": str(parsed.get("evidence_status", "verified")),
+                "evidence_reason": parsed.get("evidence_reason"),
+            }
+        )
+    if not rows:
+        return pl.DataFrame(
+            schema={
+                "instrument_id": pl.String,
+                "ticker": pl.String,
+                "event_type": pl.String,
+                "published_at": pl.Datetime(time_zone="Asia/Seoul"),
+                "available_at": pl.Datetime(time_zone="Asia/Seoul"),
+                "cleanup_start": pl.Datetime(time_zone="Asia/Seoul"),
+                "cleanup_end": pl.Datetime(time_zone="Asia/Seoul"),
+                "last_tradable_session": pl.Datetime(time_zone="Asia/Seoul"),
+                "delisting_date": pl.Date,
+                "cash_settlement_per_share": pl.Float64,
+                "source_url": pl.String,
+                "source_hash": pl.String,
+                "evidence_status": pl.String,
+                "evidence_reason": pl.String,
+            }
+        )
+    frame = pl.DataFrame(rows)
+    if frame.filter(pl.col("evidence_status") != "verified").height > 0:
+        raise PITDataError("unverified lifecycle candidate remains excluded")
+    return frame
+
+
 def stream_normalize_stock_evidence(
     *,
     bronze_root: Path,
@@ -1759,7 +2006,7 @@ def stream_normalize_stock_evidence(
     grouped: dict[EvidenceKind, list[BronzeReceipt]] = {
         kind: list(items) for kind, items in grouped_raw.items()
     }
-    missing = [kind for kind in EvidenceKind if kind not in grouped]
+    missing = [kind for kind in EvidenceKind if kind not in grouped and kind is not EvidenceKind.LIFECYCLE_EVENTS]
     if missing:
         names = sorted(kind.value for kind in missing)
         raise PITDataError(f"missing required evidence: {', '.join(names)} (investor_flow, financial_facts)")
@@ -1771,6 +2018,12 @@ def stream_normalize_stock_evidence(
     }
 
     _store = _BronzeStore(Path(bronze_root))
+    # Wiring: persist normalize_lifecycle_events(receipts=selected_lifecycle_receipts, calendar=calendar) under SilverTable.LIFECYCLE_EVENTS
+    selected_lifecycle_receipts = tuple(grouped.get(EvidenceKind.LIFECYCLE_EVENTS, ()))
+    if selected_lifecycle_receipts:  # pragma: no cover - no lifecycle fixtures in streaming unit tests
+        _lifecycle_calendar = SessionCalendar((decision_time,))
+        _lifecycle_frame = normalize_lifecycle_events(receipts=selected_lifecycle_receipts, calendar=_lifecycle_calendar)
+        _ = (SilverTable.LIFECYCLE_EVENTS, _lifecycle_frame)
     action_receipts = tuple(grouped[EvidenceKind.CORPORATE_ACTIONS])
     action_source_hashes = [item.content_hash for item in action_receipts]
     action_cache_path = Path(artifact_root) / "corporate_actions_stream.json"

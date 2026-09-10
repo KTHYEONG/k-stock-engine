@@ -203,3 +203,28 @@ def test_backtest_run_manifest_write_rejects_tampered_existing_bytes(tmp_path) -
     first.write_text(json.dumps(_manifest_to_json(different)), encoding="utf-8")
     with pytest.raises(PITDataError, match="differs"):
         write_backtest_run_manifest(manifest=manifest, artifact_root=tmp_path / "artifacts")
+
+
+def test_backtest_run_manifest_treats_lifecycle_events_as_optional(tmp_path) -> None:
+    from datetime import date
+
+    from src.data.backtest_run_manifest import build_backtest_run_manifest
+    from src.data.schemas import SilverTable
+
+    base = {
+        "silver_root": tmp_path / "silver",
+        "gold_root": tmp_path / "gold",
+        "gold_dataset_id": "gold-hash",
+        "validation_start": date(2016, 1, 4),
+        "validation_end": date(2016, 12, 29),
+        "strategy_id": "core-v1",
+        "policy_versions": {"market_inputs": "korean-equity-market-inputs-v2"},
+    }
+    full = {table: f"{table.value}-hash" for table in SilverTable}
+    manifest = build_backtest_run_manifest(silver_dataset_ids=full, **base)
+    assert manifest.silver_dataset_ids[SilverTable.LIFECYCLE_EVENTS.value] == "lifecycle_events-hash"
+    without_lifecycle = {
+        table: f"{table.value}-hash" for table in SilverTable if table is not SilverTable.LIFECYCLE_EVENTS
+    }
+    legacy = build_backtest_run_manifest(silver_dataset_ids=without_lifecycle, **base)
+    assert SilverTable.LIFECYCLE_EVENTS.value not in legacy.silver_dataset_ids

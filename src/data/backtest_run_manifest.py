@@ -47,7 +47,10 @@ def _normalize_silver_ids(
             raise PITDataError(f"silver_dataset_ids must contain exactly every SilverTable value once: unknown {name!r}") from exc
         normalized[table.value] = _check_dataset_id(value, field=f"silver_dataset_ids[{table.value}]")
     expected = sorted(t.value for t in SilverTable)
-    if sorted(normalized) != expected:
+    optional = {SilverTable.LIFECYCLE_EVENTS.value}
+    if any(name not in normalized for name in expected if name not in optional) or any(
+        name not in expected for name in normalized
+    ):
         raise PITDataError("silver_dataset_ids must contain exactly every SilverTable value once")
     return normalized
 

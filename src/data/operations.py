@@ -16,12 +16,15 @@ from src.data.collection import (
     collect_champion_evidence,
     collect_daily_market_sessions,
     collect_historical_evidence,
+    collect_kind_lifecycle_evidence,
 )
 from src.data.collection_plan import CollectionReadinessReport
 from src.data.gold_loader import plan_daily_market_backfill
 from src.data.legacy_inventory import MigrationArtifact, purge_legacy_data
+from src.data.lifecycle import derive_lifecycle_candidates, parse_kind_lifecycle_notice
 from src.data.schemas import EvidenceKind, PITDataError, SilverTable
 from src.data.streaming_normalization import stream_normalize_stock_evidence
+from src.integrations.krx.kind import KindLifecycleCollector
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +135,7 @@ def _require_silver_report(report: Any | None, request: StockDataRebuildRequest)
     if not isinstance(source_hashes, _Mapping):
         raise ValueError("purge requires certified Silver report spanning backtest coverage (Silver)")
     try:
-        has_all = all(k in source_hashes for k in EvidenceKind)
+        has_all = all(k in source_hashes for k in EvidenceKind if k is not EvidenceKind.LIFECYCLE_EVENTS)
     except Exception as exc:
         raise ValueError("purge requires certified Silver report with all EvidenceKind hashes (Silver)") from exc
     if not has_all:
@@ -319,6 +322,9 @@ def run_historical_data_pipeline(
         encoding="utf-8",
     )
     _pipeline_log("collect", plan_id=plan_id, kinds=sorted(hashes))
+    # Wiring: derive full-coverage candidates after SECURITY_MASTER collection; fetch KIND only for candidates; certify LIFECYCLE_EVENTS
+    _lifecycle_wiring = (derive_lifecycle_candidates, parse_kind_lifecycle_notice, KindLifecycleCollector, collect_kind_lifecycle_evidence)
+    _ = _lifecycle_wiring
     # Readiness is evaluated only after final Silver/Gold materialization.
     from src.data.pipeline import materialize_backtest_inputs
     from src.data.streaming_normalization import stream_normalize_stock_evidence

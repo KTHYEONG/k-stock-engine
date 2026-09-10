@@ -23,6 +23,7 @@ class EvidenceKind(StrEnum):
     CORPORATE_ACTIONS = "corporate_actions"
     DISCLOSURES = "disclosures"
     HISTORICAL_COSTS = "historical_costs"
+    LIFECYCLE_EVENTS = "lifecycle_events"
 
 
 class SilverTable(StrEnum):
@@ -34,6 +35,7 @@ class SilverTable(StrEnum):
     CORPORATE_ACTIONS = "corporate_actions"
     DISCLOSURES = "disclosures"
     HISTORICAL_COSTS = "historical_costs"
+    LIFECYCLE_EVENTS = "lifecycle_events"
 
 
 @dataclass(frozen=True, slots=True)
