@@ -530,6 +530,18 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
             if u_files:
                 u_frame = pl.scan_parquet(u_files).collect()
                 eligible_by_session = _eligible_universe_by_session(u_frame)
+        # The Gold universe is built before the final corporate-action and
+        # PIT-master resolution.  Intersect it with the actually materialized
+        # session bars so excluded/temporarily unavailable symbols cannot
+        # reach CoreStrategy as missing snapshot inputs.
+        session_symbols = {
+            session.session_open.date(): frozenset(bar.instrument_id for bar in session.bars)
+            for session in sessions
+        }
+        eligible_by_session = {
+            day: tuple(iid for iid in ids if iid in session_symbols.get(day, frozenset()))
+            for day, ids in eligible_by_session.items()
+        }
         strategy = CoreStrategy(eligible_by_session=eligible_by_session, calendar=calendar)
     elif strategy is None:
         eligible_set: set[str] = set()
