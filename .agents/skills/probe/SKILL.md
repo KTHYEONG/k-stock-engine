@@ -61,27 +61,32 @@ Focus on: *Is the hypothesis sound? What does the real data/runtime look like? W
 
 ## Chat Output Format
 
-Keep chat response structured, scannable, and evidence-focused using tables and clear bullet points (avoid dense wall-of-text paragraphs).
-**Language Requirement:** All instructions and template fields below are written in English, but the actual rendered chat response to the user MUST be translated and presented in Korean (한국어) for intuitive review.
+Keep chat response structured, scannable, and evidence-focused using progressive disclosure. Avoid narrative walls of text.
+**Language Requirement:** All instructions and template fields below are written in English, but the actual rendered chat response to the user MUST be translated and presented in Korean (한국어).
 
 ### 🔬 [PROBE] <Feature/Topic Title>
 
-#### 1. 설계 결정 (Architecture)
-| 구분 (Category) | 내용 (Details) |
-| :--- | :--- |
-| **채택 설계 (Chosen Architecture)** | <Summary of the selected approach in Korean> |
-| **격리/범위 (Scope & Isolation)** | <Preservation of existing hot-paths or scope boundary in Korean> |
-| **선택 이유 (Rationale)** | <Core rationale for choosing this approach over alternatives in Korean> |
+#### 1. Executive Summary
+- 🎯 **Core Problem & Findings**: <Key issue and empirical defect discovered>
+- 🏗️ **Chosen Architecture**: <Selected design approach and scope isolation>
+- ⚖️ **Key Trade-off & Rationale**: <Reason for choosing this approach over alternatives>
 
-#### 2. 실측 검증 (Empirical Benchmark)
-- **스크립트 (Script)**: `scratch/probe_<topic>.py` (`.json` recorded)
-- **실측 성능/처리량 (Throughput & Latency)**: <Observed benchmark figures in Korean>
-- **검증 & 결함 검출 (Verification)**: <Tested edge cases and defect detection in Korean>
-- **발견된 버그 & 사전 수정 (Preempted Bugs)**: <Bugs identified and fixed during probing in Korean>
+#### 2. Empirical Benchmarks & Verification Matrix
+- **Artifacts**: `scratch/probe_<topic>.py` · `scratch/probe_<topic>.json`
 
-#### 3. 핵심 불변식 & 주의점 (Invariants & Risks)
-- **핵심 불변식 (Invariants)**: <Fail-closed rules, conservation laws, or critical boundaries in Korean>
-- **다운스트림 주의 (Downstream Risks)**: <Dependencies, edge cases, or out-of-scope notes for spec/implement in Korean>
+| Verification Item | Empirical Measurement / Metric | Impact & Verdict |
+| :--- | :--- | :--- |
+| **<Verification Item>** | `<Observed metric / numbers>` | `<Impact or decision: Validated / Rejected>` |
+
+#### 3. Architecture & Core Invariants
+- 🛡️ **<Invariant / Rule>** (<Fail-Closed / Boundary>): <Condition and behavior>
+- 🧩 **<State & Schema Boundary>**: <Identity key, immutable vs updated fields>
+
+#### 4. Implementation Traps & Downstream Risks
+*Highlight critical risks, PIT integrity leaks, or runtime traps using relevant alert callouts ([!CRITICAL], [!WARNING], or [!NOTE]) as applicable.*
+
+> [!WARNING]
+> **<Trap / Risk Title>**: <Specific risk description, failure mode, or implementation caution>
 
 ---
 👉 다음 단계: `/spec --feature <feature_name> --domain <domain>`
