@@ -522,13 +522,16 @@ def _discover_receipts(bronze_root: Path) -> dict[EvidenceKind, list[BronzeRecei
     return found
 
 
-_LABEL_DATE_SUFFIX = re.compile(r"(\d{4}-\d{2}-\d{2})\s*$")
+_LABEL_DATE_TOKEN = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2}|\d{8})(?!\d)")
 
 
 def _receipt_event_date(receipt: BronzeReceipt) -> date:
-    matched = _LABEL_DATE_SUFFIX.search(str(receipt.source_path))
+    matched = _LABEL_DATE_TOKEN.search(str(receipt.source_path))
     if matched:
-        return date.fromisoformat(matched.group(1))
+        token = matched.group(1)
+        if len(token) == 8:
+            return datetime.strptime(token, "%Y%m%d").date()
+        return date.fromisoformat(token)
     try:
         size = receipt.payload_path.stat().st_size
     except OSError as exc:
@@ -879,8 +882,18 @@ def load_structured_corporate_action_pages(
     *, action_receipts: tuple[BronzeReceipt, ...]
 ) -> list[dict[str, Any]]:
     """Read OpenDART structured-decision payloads without legacy interval parsing."""
+    # A historical Bronze generation may contain both the old interval JSON
+    # and the newer OpenDART receipts.  The former has no endpoint envelope
+    # and must not make a valid structured refresh fail.  Once structured
+    # receipts are present they are the authoritative input for this loader.
+    structured_receipts = tuple(
+        receipt
+        for receipt in action_receipts
+        if str(receipt.source_path).startswith("opendart_structured_decisions:")
+    )
+    selected_receipts = structured_receipts or action_receipts
     pages: list[dict[str, Any]] = []
-    for receipt in action_receipts:
+    for receipt in selected_receipts:
         try:
             payload = _read_doc(receipt.payload_path)
         except (OSError, ValueError) as exc:
@@ -956,6 +969,31 @@ def resolve_opendart_corporate_action_records(
         }
         page_list.append(item)
     page_list.sort(key=lambda p: (str(p.get("corp_code", "")), str(p.get("endpoint", ""))))
+    # OpenDART may return one endpoint with an explicit corp-code mapping and
+    # another endpoint for the same corp code without the mapping envelope.
+    # Carry the certified mapping across those pages before resolving records.
+    corp_code_mapping: dict[str, tuple[str, str]] = {}
+    for page in page_list:
+        corp_code = str(page.get("corp_code", "")).strip()
+        requested = page.get("requested_instrument_id")
+        provenance = page.get("instrument_mapping_provenance")
+        if (
+            corp_code
+            and isinstance(requested, str)
+            and requested.strip()
+            and provenance == "opendart_corp_code_direct"
+        ):
+            corp_code_mapping[corp_code] = (requested.strip(), str(provenance))
+        for record in page.get("records", []) or ():
+            if not isinstance(record, dict):
+                continue
+            raw_instrument = record.get("instrument_id") or record.get("ticker")
+            if corp_code and isinstance(raw_instrument, str) and raw_instrument.strip():
+                instrument_id = raw_instrument.strip()
+                corp_code_mapping.setdefault(
+                    corp_code,
+                    (instrument_id if instrument_id.startswith("KRX:") else f"KRX:{instrument_id}", "record"),
+                )
     available = set(daily_market.columns)
     select_exprs: list[pl.Expr] = [
         pl.col("session"),
@@ -1028,6 +1066,13 @@ def resolve_opendart_corporate_action_records(
     for page in page_list:
         endpoint = str(page.get("endpoint", ""))
         corp_code = str(page.get("corp_code", ""))
+        inherited_mapping = corp_code_mapping.get(corp_code)
+        if inherited_mapping and not page.get("requested_instrument_id"):
+            page = {
+                **page,
+                "requested_instrument_id": inherited_mapping[0],
+                "instrument_mapping_provenance": inherited_mapping[1],
+            }
         status = str(page.get("status", ""))
         if status == "013":
             continue
@@ -1494,13 +1539,16 @@ def _canonical_master_row(
         # Historical planning snapshots may carry no exchange label; retain
         # the row with an explicit sentinel rather than dropping its PIT dates.
         "market": str(record.get("market") or record.get("MKT_TP_NM") or "__UNKNOWN__"),
-        "sector": str(record.get("sector") or record.get("sector_name") or "__GLOBAL__"),
+        "sector": str(record.get("sector") or record.get("sector_name") or "__UNKNOWN__"),
         "listing_date": listing_date,
         "delisting_date": record.get("delisting_date") or record.get("delisted_on"),
         "share_class": str(record.get("share_class") or "common"),
         "status": str(record.get("status") or "__UNKNOWN__"),
         "valid_from": valid_from,
-        "valid_to": record.get("valid_to"),
+        # KRX master feeds are daily snapshots, not open-ended intervals.
+        # Closing an omitted interval at the snapshot instant prevents every
+        # historical row from overlapping during PIT resolution.
+        "valid_to": record.get("valid_to") or valid_from,
         "available_at": available_at,
         "source_hash": source_hash,
     }
