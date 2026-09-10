@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "backtest-preparation-20260910",
+      "date": "2026-09-10",
+      "adr_id": "ADR_20260910_backtest-preparation-20260910",
+      "domain": "backtest",
+      "title": "Historical PIT backtest preparation",
+      "why": "Historical Bronze generations mixed legacy corporate-action payloads with structured receipts and snapshot timestamps, blocking valid PIT backtests.",
+      "resolution": "Separated structured action parsing, propagated corp mappings, normalized master intervals and listing dates, added timezone-safe and instrument-level warmup handling, and completed Silver/Gold/backtest preparation.",
+      "impact": "The 2016 core-v1 backtest now runs reproducibly with certified evidence while Bronze deletion remains blocked until generation GC is certified."
+    },
+    {
       "task_id": "TASK_BRONZE_RETENTION_STREAMING_PERFORMANCE",
       "date": "2026-09-10",
       "adr_id": "ADR_20260910_BRONZE_RETENTION_STREAMING_PERFORMANCE",
