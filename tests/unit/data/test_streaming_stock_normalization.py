@@ -686,6 +686,8 @@ def test_order_streaming_receipts_sorts_known_labels_and_rejects_unbounded_fallb
     later = receipt('b.json', 'krx:daily-market:2016-02-01', {'records': []})
     earlier = receipt('a.json', 'krx:daily-market:2016-01-04', {'records': []})
     assert order_streaming_receipts(table=SilverTable.DAILY_MARKET, receipts=(later, earlier)) == (earlier, later)
+    compact = receipt('compact.json', 'data/evidence/stocks/master_20160104_20260310_historical_v1.json', {'records': []})
+    assert order_streaming_receipts(table=SilverTable.SECURITY_MASTER, receipts=(later, compact)) == (compact, later)
     large = receipt('c.json', 'unknown', {'padding': 'x' * STREAMING_EAGER_JSON_MAX_BYTES})
     with pytest.raises(PITDataError, match='event date'):
         order_streaming_receipts(table=SilverTable.DAILY_MARKET, receipts=(large,))
