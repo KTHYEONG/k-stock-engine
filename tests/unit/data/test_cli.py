@@ -41,7 +41,7 @@ def test_run_backtest_refuses_without_resolved_execution_components(tmp_path) ->
     from src.data.cli import _dispatch_backtest
     from src.data.schemas import PITDataError
 
-    with pytest.raises(PITDataError, match="requires resolved Gold artifact"):
+    with pytest.raises(PITDataError, match="backtest-run-manifest"):
         _dispatch_backtest(Namespace(gold_root=tmp_path))
 
 
@@ -92,7 +92,24 @@ def test_run_backtest_validates_selected_bundle_before_execution(tmp_path, monke
 
     monkeypatch.setattr(cli_mod, "ChampionStrategy", spy_strategy)
 
-    with pytest.raises(PITDataError, match="requires resolved Gold artifact"):
+    from src.data.backtest_run_manifest import build_backtest_run_manifest, write_backtest_run_manifest
+    from src.data.schemas import SilverTable
+
+    run_manifest_obj = build_backtest_run_manifest(
+        silver_root=tmp_path / "silver",
+        gold_root=tmp_path,
+        silver_dataset_ids={table: f"{table.value}-id" for table in SilverTable},
+        gold_dataset_id="gold-2016",
+        validation_start=__import__("datetime").date(2016, 1, 4),
+        validation_end=__import__("datetime").date(2016, 12, 30),
+        strategy_id="champion-v1",
+        policy_versions={"market_inputs": "korean-equity-market-inputs-v2"},
+    )
+    manifest_path = write_backtest_run_manifest(
+        manifest=run_manifest_obj, artifact_root=tmp_path / "artifacts"
+    )
+
+    with pytest.raises(PITDataError, match="certified Silver table"):
         _dispatch_backtest(
             Namespace(
                 gold_root=tmp_path,
@@ -102,6 +119,7 @@ def test_run_backtest_validates_selected_bundle_before_execution(tmp_path, monke
                 validation_end="2016-12-30",
                 smoke_symbol=None,
                 gold_dataset_id="gold-2016",
+                backtest_run_manifest=manifest_path,
                 strategy_id="champion-v1",
             )
         )
@@ -287,7 +305,7 @@ def test_run_backtest_requires_selected_gold_dataset_id(tmp_path) -> None:
     from src.data.cli import _dispatch_backtest
     from src.data.schemas import PITDataError
 
-    with pytest.raises(PITDataError, match='gold-dataset-id'):
+    with pytest.raises(PITDataError, match='backtest-run-manifest'):
         _dispatch_backtest(
             Namespace(
                 gold_root=tmp_path,
@@ -309,7 +327,6 @@ def test_run_backtest_core_v1_end_to_end_with_pit_inputs(tmp_path, monkeypatch) 
 
     import polars as pl
 
-    import src.data.cli as cli_mod
     import src.data.silver as silver_mod
     from src.data.cli import _dispatch_backtest
     from src.data.schemas import SilverTable
@@ -349,16 +366,56 @@ def test_run_backtest_core_v1_end_to_end_with_pit_inputs(tmp_path, monkeypatch) 
             return master_df
         return pl.DataFrame(schema={'effective_session': pl.Datetime(time_zone='Asia/Seoul'), 'instrument_id': pl.String, 'action_type': pl.String, 'available_at': pl.Datetime(time_zone='Asia/Seoul')})
 
-    monkeypatch.setattr(cli_mod, '_load_silver_table', fake_load_table)
-    monkeypatch.setattr(silver_mod, 'latest_silver_dataset_path', lambda *, root, table, decision_time: dm_dir)
-    universe_dir = tmp_path / 'gold' / 'universe'
-    universe_dir.mkdir(parents=True)
+    import src.data.gold_artifacts as gold_artifacts_mod
+    from src.data.backtest_run_manifest import build_backtest_run_manifest, write_backtest_run_manifest
+
     universe_df = pl.DataFrame({
         'decision_session': [day.replace(hour=15, minute=30) for day in all_days[60:65] for _ in ('KRX:A', 'KRX:B')],
         'instrument_id': ['KRX:A', 'KRX:B'] * 5,
         'eligible': [True] * 10,
     })
-    universe_df.write_parquet(universe_dir / 'universe.parquet')
+
+    def fake_load_by_id(*, root, table, dataset_id, decision_time):
+        if table == SilverTable.CORPORATE_ACTIONS:
+            return pl.DataFrame({
+                'instrument_id': ['KRX:B'],
+                'action_id': ['unknown-b'],
+                'action_type': ['unresolved'],
+                'effective_session': [all_days[61]],
+                'factor': [1.0],
+                'cash_amount': [0.0],
+                'available_at': [all_days[60]],
+                'evidence_status': ['unresolved'],
+                'evidence_reason': ['unsupported_merger'],
+            })
+        return fake_load_table(root, table)
+
+    monkeypatch.setattr(silver_mod, 'load_silver_table_by_dataset_id', fake_load_by_id)
+    monkeypatch.setattr(silver_mod, 'silver_dataset_path_by_id', lambda *, root, table, dataset_id, decision_time: dm_dir)
+    monkeypatch.setattr(
+        gold_artifacts_mod,
+        'resolve_gold_artifact_bundle',
+        lambda *, gold_root, dataset_id, decision_time: object(),
+    )
+    monkeypatch.setattr(
+        gold_artifacts_mod,
+        'load_gold_artifact_frames',
+        lambda *, bundle, decision_time: (universe_df, pl.DataFrame(), pl.DataFrame()),
+    )
+
+    run_manifest_obj = build_backtest_run_manifest(
+        silver_root=tmp_path / 'silver',
+        gold_root=tmp_path / 'gold',
+        silver_dataset_ids={table: f"{table.value}-id" for table in SilverTable},
+        gold_dataset_id='gold-test',
+        validation_start=__import__('datetime').date.fromisoformat(start),
+        validation_end=__import__('datetime').date.fromisoformat(end),
+        strategy_id='core-v1',
+        policy_versions={'market_inputs': 'korean-equity-market-inputs-v2'},
+    )
+    manifest_path = write_backtest_run_manifest(
+        manifest=run_manifest_obj, artifact_root=tmp_path / 'artifacts'
+    )
 
     code = _dispatch_backtest(
         Namespace(
@@ -368,7 +425,8 @@ def test_run_backtest_core_v1_end_to_end_with_pit_inputs(tmp_path, monkeypatch) 
             validation_start=start,
             validation_end=end,
             smoke_symbol=None,
-            gold_dataset_id=None,
+            gold_dataset_id='gold-test',
+            backtest_run_manifest=manifest_path,
             strategy_id='core-v1',
             initial_cash=100_000_000.0,
             scenario='base',
@@ -382,8 +440,13 @@ def test_run_backtest_core_v1_end_to_end_with_pit_inputs(tmp_path, monkeypatch) 
 
     payload = json.loads(manifests[0].read_text(encoding='utf-8'))
     assert payload['metadata']['strategy_id'] == 'core-v1'
-    assert payload['metadata']['market_input_policy_version'] == 'korean-equity-market-inputs-v1'
+    assert payload['metadata']['market_input_policy_version'] == 'korean-equity-market-inputs-v2'
     assert payload['metadata']['warmup_sessions'] == 60
+    assert payload['metadata']['run_manifest_hash'] == run_manifest_obj.content_hash
+    assert payload['dataset_hash'] == run_manifest_obj.content_hash
+    assert payload['metadata']['blocked_instrument_sessions'] >= 1
+    assert payload['metadata']['exclusion_reason_counts'] == {'unsupported_merger': 1}
+    assert payload['manifest_hash'] == run_manifest_obj.content_hash
 
 
 def test_run_backtest_rejects_market_without_certified_columns(tmp_path, monkeypatch) -> None:
@@ -394,8 +457,9 @@ def test_run_backtest_rejects_market_without_certified_columns(tmp_path, monkeyp
     import polars as pl
     import pytest
 
-    import src.data.cli as cli_mod
+    import src.data.gold_artifacts as gold_artifacts_mod
     import src.data.silver as silver_mod
+    from src.data.backtest_run_manifest import build_backtest_run_manifest, write_backtest_run_manifest
     from src.data.cli import _dispatch_backtest
     from src.data.schemas import PITDataError, SilverTable
 
@@ -403,10 +467,41 @@ def test_run_backtest_rejects_market_without_certified_columns(tmp_path, monkeyp
     days = tuple(datetime(2016, 1, 4, 9, tzinfo=kst) + timedelta(days=index) for index in range(3))
     master = pl.DataFrame({'instrument_id': ['KRX:A'], 'sector': ['Technology'], 'valid_from': [days[0]], 'valid_to': [days[-1]], 'available_at': [days[0]]})
     actions = pl.DataFrame(schema={'effective_session': pl.Datetime(time_zone='Asia/Seoul'), 'instrument_id': pl.String, 'action_type': pl.String, 'available_at': pl.Datetime(time_zone='Asia/Seoul')})
-    monkeypatch.setattr(cli_mod, '_load_silver_table', lambda silver_root, table: pl.DataFrame({'session': list(days)}) if table == SilverTable.CALENDAR else master if table == SilverTable.SECURITY_MASTER else actions)
-    universe_dir = tmp_path / 'gold' / 'universe'
-    universe_dir.mkdir(parents=True)
-    pl.DataFrame({'decision_session': [days[0]], 'instrument_id': ['KRX:A'], 'eligible': [True]}).write_parquet(universe_dir / 'u.parquet')
+    calendar_df = pl.DataFrame({'session': list(days)})
+    universe_df = pl.DataFrame({'decision_session': [days[0]], 'instrument_id': ['KRX:A'], 'eligible': [True]})
+
+    def fake_load_by_id(*, root, table, dataset_id, decision_time):
+        if table == SilverTable.CALENDAR:
+            return calendar_df
+        if table == SilverTable.SECURITY_MASTER:
+            return master
+        return actions
+
+    monkeypatch.setattr(silver_mod, 'load_silver_table_by_dataset_id', fake_load_by_id)
+    monkeypatch.setattr(
+        gold_artifacts_mod,
+        'resolve_gold_artifact_bundle',
+        lambda *, gold_root, dataset_id, decision_time: object(),
+    )
+    monkeypatch.setattr(
+        gold_artifacts_mod,
+        'load_gold_artifact_frames',
+        lambda *, bundle, decision_time: (universe_df, pl.DataFrame(), pl.DataFrame()),
+    )
+
+    run_manifest_obj = build_backtest_run_manifest(
+        silver_root=tmp_path / 'silver',
+        gold_root=tmp_path / 'gold',
+        silver_dataset_ids={table: f"{table.value}-id" for table in SilverTable},
+        gold_dataset_id='gold-test',
+        validation_start=days[0].date(),
+        validation_end=days[1].date(),
+        strategy_id='core-v1',
+        policy_versions={'market_inputs': 'korean-equity-market-inputs-v2'},
+    )
+    manifest_path = write_backtest_run_manifest(
+        manifest=run_manifest_obj, artifact_root=tmp_path / 'artifacts'
+    )
 
     def _run_without(columns: list[str], match: str) -> None:
         dm_dir = tmp_path / f"dm_{'_'.join(columns)}"
@@ -422,7 +517,7 @@ def test_run_backtest_rejects_market_without_certified_columns(tmp_path, monkeyp
             'available_at': [day.replace(hour=15, minute=30) for day in days],
         }
         pl.DataFrame({key: base[key] for key in columns}).write_parquet(dm_dir / 'daily.parquet')
-        monkeypatch.setattr(silver_mod, 'latest_silver_dataset_path', lambda *, root, table, decision_time: dm_dir)
+        monkeypatch.setattr(silver_mod, 'silver_dataset_path_by_id', lambda *, root, table, dataset_id, decision_time: dm_dir)
         with pytest.raises(PITDataError, match=match):
             _dispatch_backtest(
                 Namespace(
@@ -432,7 +527,8 @@ def test_run_backtest_rejects_market_without_certified_columns(tmp_path, monkeyp
                     validation_start=days[0].date().isoformat(),
                     validation_end=days[1].date().isoformat(),
                     smoke_symbol=None,
-                    gold_dataset_id=None,
+                    gold_dataset_id='gold-test',
+                    backtest_run_manifest=manifest_path,
                     strategy_id='core-v1',
                 )
             )
@@ -599,3 +695,334 @@ def test_cli_bronze_retention_plan_wires_read_only_audit(tmp_path, monkeypatch, 
     assert code == 0
     assert captured['provenance_roots'] == (tmp_path / 'silver', tmp_path / 'artifacts')
     assert 'deletion_eligible' in capsys.readouterr().out
+
+
+def test_run_backtest_core_requires_backtest_run_manifest(tmp_path) -> None:
+    from argparse import Namespace
+
+    import pytest
+
+    from src.data.cli import _dispatch_backtest
+    from src.data.schemas import PITDataError
+
+    args = Namespace(
+        silver_root=tmp_path / 'silver', gold_root=tmp_path / 'gold', artifact_root=tmp_path / 'artifacts',
+        validation_start='2016-01-04', validation_end='2016-12-29', smoke_symbol=None,
+        gold_dataset_id=None, backtest_run_manifest=None, initial_cash=100000000.0, scenario='base',
+        ledger_id='test', strategy_id='core-v1',
+    )
+
+    with pytest.raises(PITDataError, match='backtest-run-manifest'):
+        _dispatch_backtest(args)
+
+
+def test_run_backtest_parser_accepts_backtest_run_manifest() -> None:
+    from pathlib import Path
+
+    from src.data.cli import _parse_args
+
+    args = _parse_args(['run-backtest', '--backtest-run-manifest', 'data/artifacts/runs/a.json'])
+
+    assert args.command == 'run-backtest'
+    assert args.backtest_run_manifest == Path('data/artifacts/runs/a.json')
+
+
+def _manifest_bound_namespace(tmp_path, monkeypatch, **overrides):
+    from argparse import Namespace
+    from datetime import date
+
+    import polars as pl
+
+    import src.data.gold_artifacts as gold_artifacts_mod
+    import src.data.silver as silver_mod
+    from src.data.backtest_run_manifest import build_backtest_run_manifest, write_backtest_run_manifest
+    from src.data.schemas import SilverTable
+
+    calendar_df = pl.DataFrame({'session': [__import__('datetime').datetime(2016, 1, 4, 9, tzinfo=__import__('datetime').UTC)]})
+    universe_df = pl.DataFrame(
+        {
+            'decision_session': [__import__('datetime').datetime(2016, 1, 4, 15, 30, tzinfo=__import__('datetime').UTC)],
+            'instrument_id': ['KRX:A'],
+            'eligible': [True],
+        }
+    )
+    monkeypatch.setattr(
+        silver_mod, 'load_silver_table_by_dataset_id', lambda *, root, table, dataset_id, decision_time: calendar_df
+    )
+    monkeypatch.setattr(
+        silver_mod, 'silver_dataset_path_by_id', lambda *, root, table, dataset_id, decision_time: tmp_path / 'dm'
+    )
+    monkeypatch.setattr(
+        gold_artifacts_mod, 'resolve_gold_artifact_bundle', lambda *, gold_root, dataset_id, decision_time: object()
+    )
+    monkeypatch.setattr(
+        gold_artifacts_mod,
+        'load_gold_artifact_frames',
+        lambda *, bundle, decision_time: (universe_df, pl.DataFrame(), pl.DataFrame()),
+    )
+    manifest = build_backtest_run_manifest(
+        silver_root=tmp_path / 'silver',
+        gold_root=tmp_path / 'gold',
+        silver_dataset_ids={table: f"{table.value}-id" for table in SilverTable},
+        gold_dataset_id='gold-test',
+        validation_start=date(2016, 1, 4),
+        validation_end=date(2016, 12, 29),
+        strategy_id='core-v1',
+        policy_versions={'market_inputs': 'korean-equity-market-inputs-v2'},
+    )
+    path = write_backtest_run_manifest(manifest=manifest, artifact_root=tmp_path / 'artifacts')
+    base = {
+        'silver_root': tmp_path / 'silver',
+        'artifact_root': tmp_path / 'artifacts',
+        'gold_root': tmp_path / 'gold',
+        'validation_start': '2016-01-04',
+        'validation_end': '2016-12-29',
+        'smoke_symbol': None,
+        'gold_dataset_id': 'gold-test',
+        'backtest_run_manifest': path,
+        'strategy_id': 'core-v1',
+    }
+    base.update(overrides)
+    return Namespace(**base)
+
+
+def test_run_backtest_rejects_silver_root_conflict(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    from src.data.cli import _dispatch_backtest
+    from src.data.schemas import PITDataError
+
+    with pytest.raises(PITDataError, match='conflicts'):
+        _dispatch_backtest(_manifest_bound_namespace(tmp_path, monkeypatch, silver_root=tmp_path / 'other'))
+
+
+def test_run_backtest_rejects_gold_root_conflict(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    from src.data.cli import _dispatch_backtest
+    from src.data.schemas import PITDataError
+
+    with pytest.raises(PITDataError, match='conflicts'):
+        _dispatch_backtest(_manifest_bound_namespace(tmp_path, monkeypatch, gold_root=tmp_path / 'other'))
+
+
+def test_run_backtest_rejects_gold_dataset_conflict(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    from src.data.cli import _dispatch_backtest
+    from src.data.schemas import PITDataError
+
+    with pytest.raises(PITDataError, match='conflicts'):
+        _dispatch_backtest(_manifest_bound_namespace(tmp_path, monkeypatch, gold_dataset_id='other-gold'))
+
+
+def test_run_backtest_rejects_validation_range_conflict(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    from src.data.cli import _dispatch_backtest
+    from src.data.schemas import PITDataError
+
+    with pytest.raises(PITDataError, match='conflicts'):
+        _dispatch_backtest(_manifest_bound_namespace(tmp_path, monkeypatch, validation_start='2016-02-01'))
+    with pytest.raises(PITDataError, match='conflicts'):
+        _dispatch_backtest(_manifest_bound_namespace(tmp_path, monkeypatch, validation_end='2016-11-30'))
+
+
+def test_run_backtest_rejects_strategy_conflict(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    from src.data.cli import _dispatch_backtest
+    from src.data.schemas import PITDataError
+
+    with pytest.raises(PITDataError, match='conflicts'):
+        _dispatch_backtest(_manifest_bound_namespace(tmp_path, monkeypatch, strategy_id='champion-v1'))
+
+
+def test_run_backtest_rejects_core_without_selected_universe(tmp_path, monkeypatch) -> None:
+    from argparse import Namespace
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    import polars as pl
+    import pytest
+
+    import src.data.gold_artifacts as gold_artifacts_mod
+    import src.data.silver as silver_mod
+    from src.data.backtest_run_manifest import build_backtest_run_manifest, write_backtest_run_manifest
+    from src.data.cli import _dispatch_backtest
+    from src.data.schemas import PITDataError, SilverTable
+
+    kst = ZoneInfo('Asia/Seoul')
+    all_days = tuple(datetime(2016, 1, 4, 9, tzinfo=kst) + timedelta(days=index) for index in range(70))
+    calendar_df = pl.DataFrame({'session': list(all_days)})
+    start, end = all_days[60].date().isoformat(), all_days[64].date().isoformat()
+    warmup_days = all_days[0:68]
+    closes = [10000.0 + index * 10.0 + (index % 3) * 0.1 for index in range(len(warmup_days))]
+    market_df = pl.DataFrame({
+        'session': list(warmup_days),
+        'instrument_id': ['KRX:A'] * len(warmup_days),
+        'open': [c - 5.0 for c in closes],
+        'close': closes,
+        'volume': [1000.0] * len(warmup_days),
+        'trading_value': [c * 1000.0 for c in closes],
+        'market_cap': [1e12] * len(warmup_days),
+        'available_at': [day.replace(hour=15, minute=30) for day in warmup_days],
+    })
+    dm_dir = tmp_path / 'dm_none'
+    dm_dir.mkdir()
+    market_df.write_parquet(dm_dir / 'daily.parquet')
+    master_df = pl.DataFrame({
+        'instrument_id': ['KRX:A'],
+        'sector': ['Technology'],
+        'valid_from': [all_days[0]],
+        'valid_to': [all_days[69]],
+        'available_at': [all_days[0]],
+    })
+    actions_df = pl.DataFrame(
+        schema={
+            'effective_session': pl.Datetime(time_zone='Asia/Seoul'),
+            'instrument_id': pl.String,
+            'action_type': pl.String,
+            'available_at': pl.Datetime(time_zone='Asia/Seoul'),
+        }
+    )
+
+    def fake_load_by_id(*, root, table, dataset_id, decision_time):
+        if table == SilverTable.CALENDAR:
+            return calendar_df
+        if table == SilverTable.SECURITY_MASTER:
+            return master_df
+        return actions_df
+
+    monkeypatch.setattr(silver_mod, 'load_silver_table_by_dataset_id', fake_load_by_id)
+    monkeypatch.setattr(
+        silver_mod, 'silver_dataset_path_by_id', lambda *, root, table, dataset_id, decision_time: dm_dir
+    )
+    monkeypatch.setattr(
+        gold_artifacts_mod, 'resolve_gold_artifact_bundle', lambda *, gold_root, dataset_id, decision_time: object()
+    )
+    monkeypatch.setattr(
+        gold_artifacts_mod,
+        'load_gold_artifact_frames',
+        lambda *, bundle, decision_time: (None, pl.DataFrame(), pl.DataFrame()),
+    )
+    manifest = build_backtest_run_manifest(
+        silver_root=tmp_path / 'silver',
+        gold_root=tmp_path / 'gold',
+        silver_dataset_ids={table: f"{table.value}-id" for table in SilverTable},
+        gold_dataset_id='gold-test',
+        validation_start=__import__('datetime').date.fromisoformat(start),
+        validation_end=__import__('datetime').date.fromisoformat(end),
+        strategy_id='core-v1',
+        policy_versions={'market_inputs': 'korean-equity-market-inputs-v2'},
+    )
+    path = write_backtest_run_manifest(manifest=manifest, artifact_root=tmp_path / 'artifacts')
+    with pytest.raises(PITDataError, match='selected Gold universe'):
+        _dispatch_backtest(
+            Namespace(
+                silver_root=tmp_path / 'silver',
+                artifact_root=tmp_path / 'artifacts',
+                gold_root=tmp_path / 'gold',
+                validation_start=start,
+                validation_end=end,
+                smoke_symbol=None,
+                gold_dataset_id='gold-test',
+                backtest_run_manifest=path,
+                strategy_id='core-v1',
+            )
+        )
+
+
+def test_run_backtest_rejects_champion_without_selected_scores(tmp_path, monkeypatch) -> None:
+    from argparse import Namespace
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    import polars as pl
+    import pytest
+
+    import src.data.gold_artifacts as gold_artifacts_mod
+    import src.data.silver as silver_mod
+    from src.data.backtest_run_manifest import build_backtest_run_manifest, write_backtest_run_manifest
+    from src.data.cli import _dispatch_backtest
+    from src.data.schemas import PITDataError, SilverTable
+
+    kst = ZoneInfo('Asia/Seoul')
+    all_days = tuple(datetime(2016, 1, 4, 9, tzinfo=kst) + timedelta(days=index) for index in range(70))
+    calendar_df = pl.DataFrame({'session': list(all_days)})
+    start, end = all_days[60].date().isoformat(), all_days[64].date().isoformat()
+    warmup_days = all_days[0:68]
+    closes = [10000.0 + index * 10.0 + (index % 3) * 0.1 for index in range(len(warmup_days))]
+    market_df = pl.DataFrame({
+        'session': list(warmup_days),
+        'instrument_id': ['KRX:A'] * len(warmup_days),
+        'open': [c - 5.0 for c in closes],
+        'close': closes,
+        'volume': [1000.0] * len(warmup_days),
+        'trading_value': [c * 1000.0 for c in closes],
+        'market_cap': [1e12] * len(warmup_days),
+        'available_at': [day.replace(hour=15, minute=30) for day in warmup_days],
+    })
+    dm_dir = tmp_path / 'dm_no_scores'
+    dm_dir.mkdir()
+    market_df.write_parquet(dm_dir / 'daily.parquet')
+    master_df = pl.DataFrame({
+        'instrument_id': ['KRX:A'],
+        'sector': ['Technology'],
+        'valid_from': [all_days[0]],
+        'valid_to': [all_days[69]],
+        'available_at': [all_days[0]],
+    })
+    actions_df = pl.DataFrame(
+        schema={
+            'effective_session': pl.Datetime(time_zone='Asia/Seoul'),
+            'instrument_id': pl.String,
+            'action_type': pl.String,
+            'available_at': pl.Datetime(time_zone='Asia/Seoul'),
+        }
+    )
+
+    def fake_load_by_id(*, root, table, dataset_id, decision_time):
+        if table == SilverTable.CALENDAR:
+            return calendar_df
+        if table == SilverTable.SECURITY_MASTER:
+            return master_df
+        return actions_df
+
+    monkeypatch.setattr(silver_mod, 'load_silver_table_by_dataset_id', fake_load_by_id)
+    monkeypatch.setattr(
+        silver_mod, 'silver_dataset_path_by_id', lambda *, root, table, dataset_id, decision_time: dm_dir
+    )
+    monkeypatch.setattr(
+        gold_artifacts_mod, 'resolve_gold_artifact_bundle', lambda *, gold_root, dataset_id, decision_time: object()
+    )
+    monkeypatch.setattr(
+        gold_artifacts_mod,
+        'load_gold_artifact_frames',
+        lambda *, bundle, decision_time: (pl.DataFrame(), pl.DataFrame(), None),
+    )
+    manifest = build_backtest_run_manifest(
+        silver_root=tmp_path / 'silver',
+        gold_root=tmp_path / 'gold',
+        silver_dataset_ids={table: f"{table.value}-id" for table in SilverTable},
+        gold_dataset_id='gold-test',
+        validation_start=__import__('datetime').date.fromisoformat(start),
+        validation_end=__import__('datetime').date.fromisoformat(end),
+        strategy_id='champion-v1',
+        policy_versions={'market_inputs': 'korean-equity-market-inputs-v2'},
+    )
+    path = write_backtest_run_manifest(manifest=manifest, artifact_root=tmp_path / 'artifacts')
+    with pytest.raises(PITDataError, match='resolved strategy'):
+        _dispatch_backtest(
+            Namespace(
+                silver_root=tmp_path / 'silver',
+                artifact_root=tmp_path / 'artifacts',
+                gold_root=tmp_path / 'gold',
+                validation_start=start,
+                validation_end=end,
+                smoke_symbol=None,
+                gold_dataset_id='gold-test',
+                backtest_run_manifest=path,
+                strategy_id='champion-v1',
+            )
+        )

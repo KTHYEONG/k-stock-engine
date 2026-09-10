@@ -11,6 +11,7 @@ import polars as pl
 
 from src.core.datasets import DatasetCertification
 from src.core.time import SessionCalendar
+from src.data.backtest_run_manifest import build_backtest_run_manifest, write_backtest_run_manifest
 from src.data.bronze import BronzeStore
 from src.data.replay import PITReplayReader, StreamingGoldWriter
 from src.data.schemas import BronzeReceipt, EvidenceKind, PITDataError, SilverTable
@@ -31,6 +32,7 @@ class BacktestDataArtifact:
     benchmark_equal_hash: str
     silver_report_hash: str
     content_hash: str
+    run_manifest_hash: str = ""
 
 
 def _require_certified_inputs(silver_root: Path, bronze_root: Path) -> None:
@@ -192,7 +194,32 @@ def materialize_backtest_inputs(
     artifact_dir.mkdir(parents=True, exist_ok=True)
     artifact_dir.joinpath(f"{report.report_hash}.json").write_text(json.dumps({"report_hash": report.report_hash, "gold_hashes": hashes}, sort_keys=True), encoding="utf-8")
     content_hash = canonical_content_hash(pl.DataFrame({"kind": list(hashes), "hash": list(hashes.values())}), ["kind", "hash"])
-    return BacktestDataArtifact(hashes["universe"], hashes["qvef"], hashes["champion_scores"], "", "", report.report_hash, content_hash)
+    from src.data.backtest_sessions import BacktestMarketInputsPolicy
+    from src.data.silver import latest_silver_dataset_path
+
+    silver_dataset_ids: dict[SilverTable | str, str] = {}
+    for table in SilverTable:
+        silver_dataset_ids[table] = latest_silver_dataset_path(
+            root=Path(silver_root), table=table, decision_time=decision_time
+        ).name
+    run_manifest = build_backtest_run_manifest(
+        silver_root=Path(silver_root),
+        gold_root=Path(gold_root),
+        silver_dataset_ids=silver_dataset_ids,
+        gold_dataset_id=dataset_id,
+        validation_start=report.coverage_start,
+        validation_end=report.coverage_end,
+        strategy_id="core-v1",
+        policy_versions={
+            "market_inputs": BacktestMarketInputsPolicy().version,
+            "universe": universe_policy.version,
+            "qvef": qvef_policy.version,
+            "scoring": score_policy.version,
+        },
+    )
+    manifest_root = Path(artifact_root) if artifact_root is not None else Path(gold_root).parent / "artifacts"
+    write_backtest_run_manifest(manifest=run_manifest, artifact_root=manifest_root)
+    return BacktestDataArtifact(hashes["universe"], hashes["qvef"], hashes["champion_scores"], "", "", report.report_hash, content_hash, run_manifest.content_hash)
 
 
 def _load_silver_tables(root: Path, decision_time: datetime) -> dict[SilverTable, pl.DataFrame]:
