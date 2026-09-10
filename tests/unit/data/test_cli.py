@@ -582,3 +582,20 @@ def test_cli_refresh_corporate_actions_wires_certified_scan(monkeypatch, tmp_pat
     assert isinstance(captured['kwargs']['calendar'], SessionCalendar)
     assert captured['kwargs']['daily_market'].collect().columns == ['session', 'instrument_id', 'close', 'shares_outstanding', 'market_cap']
     assert 'refresh-hash' in capsys.readouterr().out
+
+
+def test_cli_bronze_retention_plan_wires_read_only_audit(tmp_path, monkeypatch, capsys) -> None:
+    from types import SimpleNamespace
+    import src.data.cli as cli
+
+    captured: dict[str, object] = {}
+    def fake_plan(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(receipt_count=0, total_payload_bytes=0, referenced_payload_bytes=0, unreferenced_payload_bytes=0, referenced_hashes=(), unreferenced_hashes=(), deletion_eligible=False, blocking_reasons=('generation_gc_not_certified',))
+    monkeypatch.setattr(cli, 'plan_bronze_retention', fake_plan)
+
+    code = cli.main(['bronze-retention-plan', '--bronze-root', str(tmp_path / 'bronze'), '--silver-root', str(tmp_path / 'silver'), '--artifact-root', str(tmp_path / 'artifacts')])
+
+    assert code == 0
+    assert captured['provenance_roots'] == (tmp_path / 'silver', tmp_path / 'artifacts')
+    assert 'deletion_eligible' in capsys.readouterr().out

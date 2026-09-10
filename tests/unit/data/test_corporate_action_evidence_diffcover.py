@@ -6,6 +6,7 @@ and backtest exclusion of unexplained discontinuities.
 """
 
 from datetime import datetime
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 import polars as pl
@@ -143,6 +144,12 @@ def test_streaming_reraises_ambiguous_share_basis() -> None:
             daily_market=daily,
             calendar=SessionCalendar(sessions),
         )
+
+
+def test_streaming_accepts_fractional_bonus_allocation_ratio() -> None:
+    from src.data.streaming_normalization import _parse_exact_decimal
+
+    assert _parse_exact_decimal("0.5", field="nstk_ascnt_ps_ostk") == Decimal("0.5")
 
 
 def test_streaming_zero_allocation_is_unresolved() -> None:

@@ -23,7 +23,7 @@ from src.data.collection_plan import (
     build_historical_collection_plan_from_bronze,
     load_collection_plan,
 )
-from src.data.legacy_inventory import MigrationArtifactStore, inspect_legacy_data
+from src.data.legacy_inventory import MigrationArtifactStore, inspect_legacy_data, plan_bronze_retention
 from src.data.operations import execute_verified_legacy_purge
 from src.data.pipeline import materialize_backtest_inputs
 from src.data.schemas import PITDataError, SilverTable
@@ -111,6 +111,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p_dart_refresh.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
     p_dart_refresh.add_argument("--decision-time", type=str, required=True)
     p_dart_refresh.add_argument("--batch-size", type=int, default=500)
+
+    p_retention = sub.add_parser("bronze-retention-plan", help="Audit Bronze retention without deletion")
+    p_retention.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
+    p_retention.add_argument("--silver-root", type=Path, default=Path("data/silver/stocks"))
+    p_retention.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
 
     p_purge = sub.add_parser("purge-legacy", help="Purge legacy outputs after verification")
     p_purge.add_argument("--data-root", type=Path, default=Path("data"))
@@ -776,6 +781,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (PITDataError, ValueError, OSError):
             return 1
         _emit({"output_hash": payload["output_hash"], "report_hash": payload["report_hash"], "row_count": payload["row_count"]})
+        return 0
+    if args.command == "bronze-retention-plan":
+        retention_plan = plan_bronze_retention(
+            bronze_root=Path(args.bronze_root),
+            provenance_roots=(Path(args.silver_root), Path(args.artifact_root)),
+        )
+        _emit(
+            {
+                "receipt_count": retention_plan.receipt_count,
+                "total_payload_bytes": retention_plan.total_payload_bytes,
+                "referenced_payload_bytes": retention_plan.referenced_payload_bytes,
+                "unreferenced_payload_bytes": retention_plan.unreferenced_payload_bytes,
+                "referenced_hashes": list(retention_plan.referenced_hashes),
+                "unreferenced_hashes": list(retention_plan.unreferenced_hashes),
+                "deletion_eligible": retention_plan.deletion_eligible,
+                "blocking_reasons": list(retention_plan.blocking_reasons),
+            }
+        )
         return 0
     if args.command == "purge-legacy":
         # Purge consumes persisted proof only and requires --confirm-purge.
