@@ -499,12 +499,14 @@ def _resolve_sector(
     instrument_id: str,
     session: datetime,
     decision_time: datetime,
+    master_index: Mapping[str, tuple[dict[str, Any], ...]] | None = None,
 ) -> str:
     if security_master is None or security_master.is_empty():
         raise PITDataError("missing PIT security master")
+    rows = master_index.get(instrument_id, ()) if master_index is not None else security_master.to_dicts()
     candidates = [
         row
-        for row in security_master.to_dicts()
+        for row in rows
         if str(row.get("instrument_id")) == instrument_id
         and isinstance(row.get("available_at"), datetime)
         and row["available_at"] <= decision_time
@@ -565,6 +567,17 @@ def build_backtest_sessions(
     distinct_sessions = full.select("session").unique()["session"].to_list()
     decision_times = [decision_time_of(s) for s in distinct_sessions]
     decision_frame = pl.DataFrame({"session": distinct_sessions, "decision_time": decision_times})
+    # Historical feeds use both KST and UTC timestamp annotations.  Compare
+    # instants in the bar's timezone so a valid receipt is not rejected (or a
+    # leak missed) merely because the two frames carry different tz labels.
+    available_dtype = full.schema.get("available_at")
+    available_tz = getattr(available_dtype, "time_zone", None)
+    decision_dtype = decision_frame.schema.get("decision_time")
+    decision_tz = getattr(decision_dtype, "time_zone", None)
+    if available_tz and decision_tz and available_tz != decision_tz:
+        decision_frame = decision_frame.with_columns(
+            pl.col("decision_time").dt.convert_time_zone(available_tz)
+        )
     joined = full.join(decision_frame, on="session", how="left")
     if joined.select((pl.col("available_at") > pl.col("decision_time")).any().alias("_leak")).item(0, 0):
         raise PITDataError("available_at after decision time detected")
@@ -579,6 +592,12 @@ def build_backtest_sessions(
         raise PITDataError("missing PIT security master")
     if corporate_actions is None:
         raise PITDataError("missing PIT corporate actions")
+    master_index: dict[str, tuple[dict[str, Any], ...]] = {}
+    if security_master is not None:
+        grouped_master: dict[str, list[dict[str, Any]]] = {}
+        for row in security_master.to_dicts():
+            grouped_master.setdefault(str(row.get("instrument_id")), []).append(row)
+        master_index = {iid: tuple(rows) for iid, rows in grouped_master.items()}
     resolution = resolve_backtest_corporate_action_evidence(daily_market=full, corporate_actions=corporate_actions, calendar=calendar, policy=policy)
     full = resolution.eligible_daily_market
     corporate_actions = resolution.verified_corporate_actions
@@ -594,6 +613,7 @@ def build_backtest_sessions(
                 instrument_id=str(instrument_id),
                 session=session_open,
                 decision_time=decision_time,
+                master_index=master_index,
             )
     requested_keys = {
         (session_open, str(instrument_id))
@@ -640,6 +660,7 @@ def build_backtest_sessions(
                 instrument_id=str(instrument_ids[i]),
                 session=session_open,
                 decision_time=decision_time,
+                master_index=master_index,
             )
             for i in range(len(instrument_ids))
         }
