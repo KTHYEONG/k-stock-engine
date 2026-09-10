@@ -201,11 +201,13 @@ def materialize_backtest_inputs(
 
     silver_dataset_ids: dict[SilverTable | str, str] = {}
     for table in SilverTable:
-        if table is SilverTable.LIFECYCLE_EVENTS and not (Path(silver_root) / table.value).exists():
-            continue
-        silver_dataset_ids[table] = latest_silver_dataset_path(
+        dataset_ids_path = latest_silver_dataset_path(
             root=Path(silver_root), table=table, decision_time=decision_time
-        ).name
+        )
+        silver_dataset_ids[table] = dataset_ids_path.name
+    dataset_ids = dict(silver_dataset_ids)
+    _ = dataset_ids.get(SilverTable.LIFECYCLE_EVENTS)
+    _ = dataset_ids[SilverTable.LIFECYCLE_EVENTS]
     run_manifest = build_backtest_run_manifest(
         silver_root=Path(silver_root),
         gold_root=Path(gold_root),

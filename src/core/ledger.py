@@ -18,6 +18,7 @@ class LedgerActionType(StrEnum):
     REVERSE_SPLIT = "reverse_split"
     DIVIDEND = "dividend"
     DELISTING_CASH_OUT = "delisting_cash_out"
+    DELISTING_UNSETTLED = "delisting_unsettled"
 
 
 @dataclass(frozen=True, slots=True)
@@ -407,6 +408,11 @@ class Ledger:
                     raise ValueError("invalid factor for dividend")
             elif act.action_type == LedgerActionType.DELISTING_CASH_OUT:
                 _ = float(act.cash_amount)
+            elif act.action_type == LedgerActionType.DELISTING_UNSETTLED:
+                if float(act.factor) != 1.0:  # pragma: no cover
+                    raise ValueError("invalid factor for delisting_unsettled")
+                if float(act.cash_amount) != 0.0:  # pragma: no cover
+                    raise ValueError("cash_amount must be zero for delisting_unsettled")
             else:
                 if float(act.cash_amount) != 0.0:
                     raise ValueError("cash_amount must be zero for split")
@@ -427,7 +433,29 @@ class Ledger:
         new_entries: list[LedgerJournalEntry] = []
         # handle dividend and splits from opening snapshot
         for act in actions:
-            if act.action_type == LedgerActionType.DELISTING_CASH_OUT:
+            if act.action_type == LedgerActionType.DELISTING_UNSETTLED:
+                from src.core.pit import PITDataError as _PITDataError
+
+                qty, _ = opening_snapshot.get(act.instrument_id, (0, 0.0))
+                if qty != 0:
+                    raise _PITDataError(f"unsettled delisting with open position for {act.instrument_id!r}")
+                payload_unsettled: tuple[tuple[str, object], ...] = (
+                    ("action_type", act.action_type.value),
+                    ("instrument_id", act.instrument_id),
+                    ("cash_amount", 0.0),
+                    ("quantity", qty),
+                )
+                entry_unsettled = LedgerJournalEntry(
+                    event_id=act.action_id,
+                    event_type=act.action_type.value,
+                    event_time=session_open,
+                    payload=payload_unsettled,
+                )
+                if entry_unsettled.event_id in self._journal_ids:
+                    raise ValueError(f"duplicate journal event_id {entry_unsettled.event_id!r}")  # pragma: no cover
+                new_entries.append(entry_unsettled)
+                prospective_positions.pop(act.instrument_id, None)
+            elif act.action_type == LedgerActionType.DELISTING_CASH_OUT:
                 qty, _ = opening_snapshot.get(act.instrument_id, (0, 0.0))
                 credit = qty * float(act.cash_amount)
                 prospective_settled += credit

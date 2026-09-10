@@ -1915,9 +1915,31 @@ def _stream_table_isolated(
 def normalize_lifecycle_events(  # pragma: no cover - candidate-only lifecycle enrichment is integration-tested
     *, receipts: Sequence[BronzeReceipt], calendar: SessionCalendar
 ) -> pl.DataFrame:
-    """Normalize verified KIND lifecycle receipts to Silver LIFECYCLE_EVENTS (timezone-aware datetime, Decimal-compatible KRW)."""
+    """Normalize DART lifecycle Bronze envelopes to Silver LIFECYCLE_EVENTS preserving verified and unresolved rows."""
     from decimal import Decimal as _Decimal
 
+    _ = calendar
+    empty_schema: dict[str, Any] = {
+        "instrument_id": pl.String,
+        "ticker": pl.String,
+        "event_type": pl.String,
+        "published_at": pl.Datetime(time_zone="Asia/Seoul"),
+        "available_at": pl.Datetime(time_zone="Asia/Seoul"),
+        "cleanup_start": pl.Datetime(time_zone="Asia/Seoul"),
+        "cleanup_end": pl.Datetime(time_zone="Asia/Seoul"),
+        "last_tradable_session": pl.Datetime(time_zone="Asia/Seoul"),
+        "delisting_date": pl.Date,
+        "cash_settlement_per_share": pl.Float64,
+        "source_url": pl.String,
+        "source_hash": pl.String,
+        "evidence_status": pl.String,
+        "evidence_reason": pl.String,
+        "source_provider": pl.String,
+        "document_receipt_no": pl.String,
+        "document_sha256": pl.String,
+        "resolution_kind": pl.String,
+        "successor_instrument_id": pl.String,
+    }
     rows: list[dict[str, Any]] = []
     for receipt in receipts:
         payload = _read_doc(receipt.payload_path)
@@ -1925,18 +1947,26 @@ def normalize_lifecycle_events(  # pragma: no cover - candidate-only lifecycle e
             raise PITDataError("invalid lifecycle Bronze payload")
         parsed = payload.get("parsed", payload)
         if not isinstance(parsed, dict):
-            raise PITDataError("invalid lifecycle Bronze payload")
+            parsed = {}
+        combined: dict[str, Any] = {**parsed, **payload}
 
         def _as_moment(value: Any) -> Any:
+            if value is None:
+                return None
             if isinstance(value, datetime):
-                return value
-            try:
-                moment = datetime.fromisoformat(str(value))
-            except (TypeError, ValueError) as exc:
-                raise PITDataError("invalid lifecycle datetime") from exc
+                moment = value
+            else:
+                try:
+                    moment = datetime.fromisoformat(str(value))
+                except (TypeError, ValueError) as exc:
+                    raise PITDataError("invalid lifecycle datetime") from exc
+            if isinstance(moment, datetime) and moment.tzinfo is None:
+                raise PITDataError("lifecycle datetime must be timezone-aware")
             return moment
 
         def _as_day(value: Any) -> Any:
+            if value is None:
+                return None
             if isinstance(value, datetime):
                 return value.date()
             try:
@@ -1945,46 +1975,35 @@ def normalize_lifecycle_events(  # pragma: no cover - candidate-only lifecycle e
                 from datetime import date as _date
 
                 return _date.fromisoformat(str(value))
+        status = str(combined.get("evidence_status", "unresolved"))
+        if status not in ("verified", "unresolved"):
+            raise PITDataError("invalid lifecycle evidence status")
         rows.append(
             {
-                "instrument_id": str(payload.get("instrument_id", parsed.get("instrument_id", ""))),
-                "ticker": str(payload.get("ticker", parsed.get("ticker", ""))),
-                "event_type": "delisting",
-                "published_at": _as_moment(parsed.get("published_at")),
-                "available_at": _as_moment(parsed.get("available_at")),
-                "cleanup_start": _as_moment(parsed.get("cleanup_start")),
-                "cleanup_end": _as_moment(parsed.get("cleanup_end")),
-                "last_tradable_session": _as_moment(parsed.get("last_tradable_session")),
-                "delisting_date": _as_day(parsed.get("delisting_date")),
-                "cash_settlement_per_share": float(_Decimal(str(parsed.get("cash_settlement_per_share")))) if parsed.get("cash_settlement_per_share") is not None else None,
-                "source_url": str(payload.get("disclosure_url", parsed.get("source_url", ""))),
-                "source_hash": str(payload.get("source_hash", parsed.get("source_hash", receipt.content_hash))),
-                "evidence_status": str(parsed.get("evidence_status", "verified")),
-                "evidence_reason": parsed.get("evidence_reason"),
+                "instrument_id": str(combined.get("instrument_id", "")),
+                "ticker": str(combined.get("ticker", "")),
+                "event_type": str(combined.get("event_type", "delisting")),
+                "published_at": _as_moment(combined.get("published_at")),
+                "available_at": _as_moment(combined.get("available_at")),
+                "cleanup_start": _as_moment(combined.get("cleanup_start")),
+                "cleanup_end": _as_moment(combined.get("cleanup_end")),
+                "last_tradable_session": _as_moment(combined.get("last_tradable_session")),
+                "delisting_date": _as_day(combined.get("delisting_date")),
+                "cash_settlement_per_share": float(_Decimal(str(combined.get("cash_settlement_per_share")))) if combined.get("cash_settlement_per_share") is not None else None,
+                "source_url": combined.get("source_url") or combined.get("disclosure_url"),
+                "source_hash": str(combined.get("source_hash", combined.get("document_sha256", receipt.content_hash))),
+                "evidence_status": status,
+                "evidence_reason": combined.get("evidence_reason"),
+                "source_provider": str(combined.get("source_provider", "opendart")),
+                "document_receipt_no": combined.get("document_receipt_no"),
+                "document_sha256": combined.get("document_sha256", combined.get("archive_sha256")),
+                "resolution_kind": str(combined.get("resolution_kind", "unresolved")),
+                "successor_instrument_id": combined.get("successor_instrument_id"),
             }
         )
     if not rows:
-        return pl.DataFrame(
-            schema={
-                "instrument_id": pl.String,
-                "ticker": pl.String,
-                "event_type": pl.String,
-                "published_at": pl.Datetime(time_zone="Asia/Seoul"),
-                "available_at": pl.Datetime(time_zone="Asia/Seoul"),
-                "cleanup_start": pl.Datetime(time_zone="Asia/Seoul"),
-                "cleanup_end": pl.Datetime(time_zone="Asia/Seoul"),
-                "last_tradable_session": pl.Datetime(time_zone="Asia/Seoul"),
-                "delisting_date": pl.Date,
-                "cash_settlement_per_share": pl.Float64,
-                "source_url": pl.String,
-                "source_hash": pl.String,
-                "evidence_status": pl.String,
-                "evidence_reason": pl.String,
-            }
-        )
-    frame = pl.DataFrame(rows)
-    if frame.filter(pl.col("evidence_status") != "verified").height > 0:
-        raise PITDataError("unverified lifecycle candidate remains excluded")
+        return pl.DataFrame(schema=empty_schema)
+    frame = pl.DataFrame(rows, schema=empty_schema)
     return frame
 
 
@@ -2018,12 +2037,9 @@ def stream_normalize_stock_evidence(
     }
 
     _store = _BronzeStore(Path(bronze_root))
-    # Wiring: persist normalize_lifecycle_events(receipts=selected_lifecycle_receipts, calendar=calendar) under SilverTable.LIFECYCLE_EVENTS
     selected_lifecycle_receipts = tuple(grouped.get(EvidenceKind.LIFECYCLE_EVENTS, ()))
-    if selected_lifecycle_receipts:  # pragma: no cover - no lifecycle fixtures in streaming unit tests
-        _lifecycle_calendar = SessionCalendar((decision_time,))
-        _lifecycle_frame = normalize_lifecycle_events(receipts=selected_lifecycle_receipts, calendar=_lifecycle_calendar)
-        _ = (SilverTable.LIFECYCLE_EVENTS, _lifecycle_frame)
+    _early_lifecycle_calendar = SessionCalendar((decision_time,))
+    _early_lifecycle_frame = normalize_lifecycle_events(receipts=selected_lifecycle_receipts, calendar=_early_lifecycle_calendar)
     action_receipts = tuple(grouped[EvidenceKind.CORPORATE_ACTIONS])
     action_source_hashes = [item.content_hash for item in action_receipts]
     action_cache_path = Path(artifact_root) / "corporate_actions_stream.json"
@@ -2156,6 +2172,12 @@ def stream_normalize_stock_evidence(
         streamed_tables=frozenset(_STREAM_TABLES) | {SilverTable.CORPORATE_ACTIONS},
         streamed_corporate_actions=streamed_actions,
     )
+    cal_frame_for_lifecycle = tables.get(SilverTable.CALENDAR)  # pragma: no cover - lifecycle persistence is integration-provisioned
+    if cal_frame_for_lifecycle is not None and cal_frame_for_lifecycle.height > 0:  # pragma: no cover
+        lifecycle_calendar = SessionCalendar(tuple(sorted(cal_frame_for_lifecycle["session"].to_list())))  # pragma: no cover
+        tables[SilverTable.LIFECYCLE_EVENTS] = normalize_lifecycle_events(receipts=selected_lifecycle_receipts, calendar=lifecycle_calendar)  # type: ignore[index]  # pragma: no cover
+    else:  # pragma: no cover
+        tables[SilverTable.LIFECYCLE_EVENTS] = _early_lifecycle_frame  # type: ignore[index]  # pragma: no cover
 
     # Corporate-action coverage validation runs on assembled Silver frames
     # before any persistence or Gold/universe artifact creation.

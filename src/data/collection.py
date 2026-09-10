@@ -85,6 +85,56 @@ def collect_kind_lifecycle_evidence(  # pragma: no cover - candidate-only KIND e
     return tuple(receipts)
 
 
+def collect_dart_lifecycle_evidence(
+    *,
+    candidates: Sequence[LifecycleCandidate],
+    collector: Any,
+    bronze: BronzeStore,
+    retrieved_at: datetime,
+) -> tuple[BronzeReceipt, ...]:
+    """Persist one canonical DART lifecycle JSON envelope per candidate before Silver normalization."""
+    if retrieved_at.tzinfo is None:  # pragma: no cover
+        raise PITDataError("retrieved_at must be timezone-aware")
+    receipts: list[BronzeReceipt] = []
+    for candidate in candidates:
+        evidence = collector.collect(candidate)
+        payload = {
+            "instrument_id": candidate.instrument_id,
+            "ticker": candidate.ticker,
+            "last_tradable_session": candidate.last_tradable_session.isoformat(),
+            "first_absent_session": candidate.first_absent_session.isoformat(),
+            "source_hashes": list(candidate.source_hashes),
+            "resolution_kind": evidence.resolution_kind.value,
+            "evidence_status": evidence.evidence_status,
+            "evidence_reason": evidence.evidence_reason,
+            "published_at": evidence.published_at.isoformat() if isinstance(evidence.published_at, datetime) else None,
+            "available_at": evidence.available_at.isoformat() if isinstance(evidence.available_at, datetime) else None,
+            "cleanup_start": evidence.cleanup_start.isoformat() if isinstance(evidence.cleanup_start, datetime) else None,
+            "cleanup_end": evidence.cleanup_end.isoformat() if isinstance(evidence.cleanup_end, datetime) else None,
+            "cash_settlement_per_share": evidence.cash_settlement_per_share,
+            "successor_instrument_id": evidence.successor_instrument_id,
+            "source_provider": evidence.source_provider,
+            "disclosure_url": evidence.source_url,
+            "source_url": evidence.source_url,
+            "document_receipt_no": evidence.document_receipt_no,
+            "document_sha256": evidence.document_sha256,
+            "archive_sha256": evidence.document_sha256,
+            "archive_b64": evidence.archive_b64,
+            "source_hash": evidence.document_sha256 or "",
+            "retrieved_at": retrieved_at.isoformat(),
+        }
+        text = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        receipts.append(
+            bronze.import_bytes(
+                text.encode("utf-8"),
+                kind=EvidenceKind.LIFECYCLE_EVENTS,
+                retrieved_at=retrieved_at,
+                source_label=f"opendart:lifecycle:{candidate.ticker}",
+            )
+        )
+    return tuple(receipts)
+
+
 def collect_opendart_corporate_action_evidence(
     *, dart: Any, tickers: Sequence[str], start: date, end: date, bronze: BronzeStore
 ) -> tuple[BronzeReceipt, ...]:
