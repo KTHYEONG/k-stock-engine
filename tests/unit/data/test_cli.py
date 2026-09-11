@@ -292,9 +292,10 @@ def test_normalize_dart_facts_dispatch_reports_failure(tmp_path, monkeypatch, ca
 def test_cli_plan_defaults_to_kis_page_capacity(monkeypatch) -> None:
     import sys
     from src.data.cli import _parse_args
+    from src.data.collection_plan import LS_MAX_SESSIONS_PER_REQUEST
 
     monkeypatch.setattr(sys, 'argv', ['stock-data', 'plan', '--coverage-start', '2024-01-02', '--coverage-end', '2024-01-03', '--symbols', '005930'])
-    assert _parse_args().chunk_size == 30
+    assert _parse_args().chunk_size == LS_MAX_SESSIONS_PER_REQUEST
 
 
 def test_run_backtest_requires_selected_gold_dataset_id(tmp_path) -> None:
@@ -1052,3 +1053,19 @@ def test_cli_loads_manifest_bound_lifecycle_without_optional_swallow():
     source = inspect.getsource(cli)
     assert '_load_manifest_silver_table' in source
     assert 'lifecycle_events = None' not in source
+
+
+def test_collect_cli_routes_selected_provider_without_kis_constructor(tmp_path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    from src.data import cli
+    from src.data.collection_plan import HistoricalCollectionPlan, PlanChunk
+
+    plan = HistoricalCollectionPlan(plan_id='p', chunks=(PlanChunk('p:005930:0000', '005930', ()),))
+    captured = {}
+    monkeypatch.setattr(cli, 'load_collection_plan', lambda _value: plan)
+    monkeypatch.setattr(cli, 'resolve_investor_flow_collector', lambda provider, symbols: captured.update(provider=provider, symbols=symbols) or 'collector')
+    monkeypatch.setattr(cli, 'collect_planned_investor_flow', lambda **kwargs: captured.update(kwargs) or SimpleNamespace(receipts={}, content_hash='c' * 64))
+    assert cli.main(['collect', '--plan-id', 'p', '--investor-flow-provider', 'kiwoom', '--bronze-root', str(tmp_path / 'bronze'), '--checkpoint-root', str(tmp_path / 'checkpoints'), '--retrieved-at', '2026-09-11T00:00:00+00:00']) == 0
+    assert captured['provider'] == 'kiwoom'
+    assert captured['symbols'] == ('005930',)
+    assert captured['collector'] == 'collector'

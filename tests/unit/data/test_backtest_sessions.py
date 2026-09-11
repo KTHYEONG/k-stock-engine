@@ -953,3 +953,109 @@ def test_resolve_lifecycle_exchange_rejects_identity_delivery_pit_and_duplicates
         resolve_backtest_lifecycle_evidence(daily_market=pl.DataFrame(), lifecycle_events=pl.DataFrame([late_delivery]), calendar=SessionCalendar((first, second)), decision_time_of=lambda value: value.replace(hour=15, minute=30))
     with pytest.raises(PITDataError, match='duplicate lifecycle'):
         resolve_backtest_lifecycle_evidence(daily_market=pl.DataFrame(), lifecycle_events=pl.DataFrame([{**base, 'action_id': 'source-a'}, {**base, 'action_id': 'source-b'}]), calendar=SessionCalendar((first, second)), decision_time_of=lambda value: value.replace(hour=15, minute=30))
+
+
+def test_resolve_backtest_evidence_joins_jump_by_market_date() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    import polars as pl
+
+    from src.core.time import SessionCalendar
+    from src.data.backtest_sessions import BacktestMarketInputsPolicy, resolve_backtest_corporate_action_evidence
+
+    opens = tuple(datetime(2024, 1, 2, 9, tzinfo=UTC) + timedelta(days=index) for index in range(4))
+    closes = tuple(day.replace(hour=15, minute=30) for day in opens)
+    daily = pl.DataFrame({
+        'session': list(closes),
+        'instrument_id': ['KRX:A'] * len(closes),
+        'close': [100.0, 100.0, 49.0, 49.0],
+        'shares_outstanding': [10.0, 10.0, 10.0, 10.0],
+        'market_cap': [1000.0, 1000.0, 490.0, 490.0],
+    })
+    actions = pl.DataFrame({'instrument_id': [], 'action_id': []})
+    result = resolve_backtest_corporate_action_evidence(
+        daily_market=daily, corporate_actions=actions, calendar=SessionCalendar(opens),
+        policy=BacktestMarketInputsPolicy(),
+    )
+    assert result.quarantine_sessions_by_instrument['KRX:A'] == opens[2:]
+    assert result.eligible_daily_market['session'].to_list() == [closes[0], closes[1]]
+    assert 'KRX:A' not in result.excluded_instruments
+
+
+def test_resolve_backtest_evidence_keeps_slot_without_matching_bar() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    import polars as pl
+
+    from src.core.time import SessionCalendar
+    from src.data.backtest_sessions import BacktestMarketInputsPolicy, resolve_backtest_corporate_action_evidence
+
+    days = tuple(datetime(2024, 1, 2, 9, tzinfo=UTC) + timedelta(days=index) for index in range(4))
+    bars = (days[0], days[1], days[3])
+    daily = pl.DataFrame({
+        'session': list(bars),
+        'instrument_id': ['KRX:B'] * len(bars),
+        'close': [100.0] * len(bars),
+    })
+    actions = pl.DataFrame({
+        'instrument_id': ['KRX:B'], 'action_id': ['unknown-b'], 'action_type': ['unresolved'],
+        'effective_session': [days[2]], 'factor': [1.0], 'cash_amount': [0.0],
+        'available_at': [days[0]], 'share_listing_date': [None], 'share_delta': [None],
+        'evidence_status': ['unresolved'], 'evidence_reason': ['unsupported_merger'],
+    })
+    result = resolve_backtest_corporate_action_evidence(
+        daily_market=daily, corporate_actions=actions, calendar=SessionCalendar(days),
+        policy=BacktestMarketInputsPolicy(),
+    )
+    assert result.quarantine_sessions_by_instrument['KRX:B'] == days[2:]
+    assert result.eligible_daily_market['session'].to_list() == [days[0], days[1]]
+
+
+def test_validate_corporate_action_coverage_ignores_out_of_window_legacy_rows() -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import polars as pl
+
+    from src.core.time import SessionCalendar
+    from src.data.backtest_sessions import BacktestMarketInputsPolicy, validate_corporate_action_coverage
+
+    krx = ZoneInfo('Asia/Seoul')
+    first = datetime(2024, 1, 2, 9, tzinfo=krx)
+    second = datetime(2024, 1, 3, 9, tzinfo=krx)
+    daily = pl.DataFrame({'session': [first, second], 'instrument_id': ['KRX:A', 'KRX:A'], 'close': [100.0, 100.0], 'shares_outstanding': [10.0, 10.0], 'market_cap': [1000.0, 1000.0]})
+    legacy = pl.DataFrame({
+        'effective_session': [datetime(2023, 12, 1, 9, tzinfo=krx), second],
+        'instrument_id': ['KRX:A', 'KRX:ZZZ'],
+        'action_type': ['no_action', 'no_action'],
+        'action_id': ['legacy-old', 'legacy-ghost'],
+        'factor': [1.0, 1.0],
+        'cash_amount': [0.0, 0.0],
+        'available_at': [first, first],
+    })
+    coverage = validate_corporate_action_coverage(daily_market=daily, corporate_actions=legacy, calendar=SessionCalendar((first, second)), decision_time_of=lambda value: value.replace(hour=15, minute=30), policy=BacktestMarketInputsPolicy())
+    assert coverage.actions_by_session == {}
+
+
+def test_validate_corporate_action_coverage_stays_fail_closed_on_unparseable_legacy_row() -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import polars as pl
+    import pytest
+
+    from src.core.time import SessionCalendar
+    from src.data.backtest_sessions import BacktestMarketInputsPolicy, validate_corporate_action_coverage
+    from src.data.schemas import PITDataError
+
+    krx = ZoneInfo('Asia/Seoul')
+    first = datetime(2024, 1, 2, 9, tzinfo=krx)
+    second = datetime(2024, 1, 3, 9, tzinfo=krx)
+    daily = pl.DataFrame({'session': [first, second], 'instrument_id': ['KRX:A', 'KRX:A'], 'close': [100.0, 100.0], 'shares_outstanding': [10.0, 10.0], 'market_cap': [1000.0, 1000.0]})
+    base = {'instrument_id': ['KRX:A'], 'action_type': ['no_action'], 'action_id': ['legacy-bad'], 'factor': [1.0], 'cash_amount': [0.0], 'available_at': [first]}
+    garbage = pl.DataFrame({**base, 'effective_session': ['not-a-date']})
+    with pytest.raises(PITDataError, match='legacy no_action'):
+        validate_corporate_action_coverage(daily_market=daily, corporate_actions=garbage, calendar=SessionCalendar((first, second)), decision_time_of=lambda value: value.replace(hour=15, minute=30), policy=BacktestMarketInputsPolicy())
+    naive = pl.DataFrame({**base, 'effective_session': [first.replace(tzinfo=None)]})
+    with pytest.raises(PITDataError, match='legacy no_action'):
+        validate_corporate_action_coverage(daily_market=daily, corporate_actions=naive, calendar=SessionCalendar((first, second)), decision_time_of=lambda value: value.replace(hour=15, minute=30), policy=BacktestMarketInputsPolicy())

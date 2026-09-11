@@ -162,7 +162,10 @@ def _selected_manifest_time_end(
     time_end = getattr(manifest, "time_end", None)
     if not isinstance(time_end, datetime) or time_end.tzinfo is None:
         raise PITDataError(f"invalid certified Silver table: {table.value}")
-    return _to_krx_date(time_end)
+    # Manifest boundaries are stored as UTC midnight for a market *date*.
+    # Converting that midnight to KST would move the boundary to the prior
+    # date (e.g. 2026-09-09T00:00Z -> 2026-09-08 KST).
+    return time_end.date()
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,7 +250,7 @@ def _resolve_latest_dataset(
         raise PITDataError(f"invalid certified Silver table: missing {table.value}")
     store = ParquetDatasetStore(table_root)
     best_id: str | None = None
-    best_key: tuple[datetime, str] | None = None
+    best_key: tuple[datetime, datetime, str] | None = None
     for cand in candidates:
         try:
             manifest = store.read_manifest(cand.name)
@@ -256,7 +259,15 @@ def _resolve_latest_dataset(
         generated = getattr(manifest, "generated_time", None)
         if not isinstance(generated, datetime) or generated.tzinfo is None:
             raise PITDataError(f"invalid certified Silver table: {table.value}")
-        key = (generated, str(getattr(manifest, "content_hash", "") or cand.name))
+        # Coverage-versioned immutable datasets intentionally retain the same
+        # row content hash.  Use the dataset id as a deterministic tie-breaker
+        # so the newer coverage publication is selected.
+        manifest_end = getattr(manifest, "time_end", None)
+        if not isinstance(manifest_end, datetime) or manifest_end.tzinfo is None:
+            # Minimal contract fixtures may omit coverage metadata; generated
+            # time remains a deterministic fallback for dataset selection.
+            manifest_end = generated
+        key = (generated, manifest_end, cand.name)
         if best_key is None or key > best_key:
             best_key = key
             best_id = cand.name

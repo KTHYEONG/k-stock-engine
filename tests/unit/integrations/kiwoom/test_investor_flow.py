@@ -23,6 +23,7 @@ def test_kiwoom_investor_flow_collector_maps_sessions() -> None:
     row = records[0]
     assert row["session"] == "2026-03-06"
     assert row["ticker"] == "005930"
+    assert row["_source_provider"] == "KIWOOM"
     assert row["retail_net_value"] == 8764447000000.0
     assert row["foreign_net_value"] == -6254129000000.0
     assert row["institution_net_value"] == -3014565000000.0

@@ -39,6 +39,7 @@ class HistoricalDataPipelineRequest:
     validation_end: date
     certification_time: datetime
     resume: bool = True
+    investor_flow_provider: str = "ls"
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,7 +223,7 @@ def run_historical_data_pipeline(
     request: HistoricalDataPipelineRequest,
     *,
     krx: Any,
-    kis: Any,
+    investor_flow: Any,
     dart: Any,
 ) -> HistoricalDataPipelineResult:  # pragma: no cover - provider orchestration is integration-tested
     """Resumable 2016 Champion collection/normalization/Gold/backtest run."""
@@ -303,13 +304,12 @@ def run_historical_data_pipeline(
     _ = _EKindCheck.CORPORATE_ACTIONS
     # Wiring contract: kinds=frozenset({EvidenceKind.DAILY_MARKET, EvidenceKind.SECURITY_MASTER, EvidenceKind.INVESTOR_FLOW, EvidenceKind.CORPORATE_ACTIONS}) via EvidenceKind.CORPORATE_ACTIONS
     (run_root / "preflight.json").write_text(
-        json.dumps({"plan_id": plan_id, "routes": {"daily_market": "krx", "investor_flow": "kis", "financial_facts": "opendart"}}, indent=2, sort_keys=True),
+        json.dumps({"plan_id": plan_id, "routes": {"daily_market": "krx", "investor_flow": request.investor_flow_provider, "financial_facts": "opendart"}}, indent=2, sort_keys=True),
         encoding="utf-8",
     )
-    _pipeline_log("preflight", plan_id=plan_id, routes="krx/kis/opendart")
-    # 03-05 non-flow + KIS flow collection (KRX per session/page, KIS per symbol/session chunk).
-    artifacts = collect_historical_evidence(
-        plan=plan, krx=krx, kis=kis, dart=dart,
+    _pipeline_log("preflight", plan_id=plan_id, routes=f"krx/{request.investor_flow_provider}/opendart")
+    # 03-05 non-flow + investor flow collection (KRX per session/page, provider per symbol/session chunk).
+    artifacts = collect_historical_evidence(plan=plan, krx=krx, investor_flow=investor_flow, investor_flow_provider=request.investor_flow_provider, dart=dart,
         bronze_root=Path(request.bronze_root),
         checkpoint_root=Path(request.artifact_root) / "collection-checkpoints",
         retrieved_at=request.certification_time,

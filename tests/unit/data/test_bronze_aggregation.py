@@ -58,3 +58,28 @@ def test_select_streaming_receipts_excludes_derived_merged_payload(tmp_path) -> 
     original = store.import_bytes(b'{"records": []}', kind=EvidenceKind.SECURITY_MASTER, retrieved_at=datetime(2020, 1, 1, tzinfo=UTC), source_label='KRX:historical-master:2020-01-01')
     derived = store.import_bytes(b'{"derived": true, "records": []}', kind=EvidenceKind.SECURITY_MASTER, retrieved_at=datetime(2020, 1, 2, tzinfo=UTC), source_label='merged:security_master')
     assert select_streaming_receipts(kind=EvidenceKind.SECURITY_MASTER, receipts=(original, derived)) == (original,)
+
+
+def test_aggregate_small_bronze_pages_tags_investor_flow_provider(tmp_path) -> None:
+    from datetime import UTC, datetime
+    import json
+    from src.data.bronze import BronzeStore
+    from src.data.bronze_aggregation import aggregate_small_bronze_pages
+    from src.data.schemas import EvidenceKind
+
+    store = BronzeStore(tmp_path / "bronze")
+    dict_page = store.import_bytes(
+        b'{"records": [{"session": "2016-12-29", "ticker": "000020"}, "stale"]}',
+        kind=EvidenceKind.INVESTOR_FLOW,
+        retrieved_at=datetime(2020, 1, 1, tzinfo=UTC),
+        source_label="LS:frgr-itt:000020:2016-12-29",
+    )
+    list_page = store.import_bytes(
+        b'[{"session": "2016-12-29", "ticker": "000020"}, "stale"]',
+        kind=EvidenceKind.INVESTOR_FLOW,
+        retrieved_at=datetime(2020, 1, 2, tzinfo=UTC),
+        source_label="KIWOOM:ka10059:000020:2016-12-29",
+    )
+    merged = aggregate_small_bronze_pages(kind=EvidenceKind.INVESTOR_FLOW, receipts=(dict_page, list_page), store=store)
+    payload = json.loads(merged.payload_path.read_text(encoding="utf-8"))
+    assert [row["_source_provider"] for row in payload["records"]] == ["LS", "KIWOOM"]
