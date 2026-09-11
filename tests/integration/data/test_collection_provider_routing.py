@@ -13,18 +13,25 @@ def test_collection_routes_investor_flow_to_kis_only() -> None:
 
 
 def test_planned_collection_persists_kis_raw_receipt_and_resumes(tmp_path) -> None:
-    class Client:
-        def inquire_investor_trade_by_stock_daily(self, symbol, anchor):
-            return (
-                {
-                    "stck_bsop_date": anchor.strftime("%Y%m%d"),
-                    "frgn_shnu_tr_pbmn": "100",
-                    "frgn_seln_tr_pbmn": "40",
-                    "frgn_ntby_tr_pbmn": "60",
-                    "orgn_ntby_tr_pbmn": "-20",
-                    "prsn_ntby_tr_pbmn": "-40",
-                },
-            )
+    class MockLsClient:
+        def inquire_investor_trend(self, symbol, start_date, end_date, unit="amount"):
+            from datetime import timedelta
+
+            rows = []
+            day = start_date
+            while day <= end_date:
+                rows.append(
+                    {
+                        "date": day.strftime("%Y%m%d"),
+                        "tjj0008": "-40",
+                        "tjj0009": "60",
+                        "tjj0018": "-20",
+                    }
+                )
+                day += timedelta(days=1)
+            return tuple(rows)
+
+    from src.integrations.ls.investor_flow import LsInvestorFlowCollector
 
     plan = build_historical_collection_plan(
         sessions=(date(2016, 1, 4), date(2016, 1, 5)),
@@ -37,7 +44,8 @@ def test_planned_collection_persists_kis_raw_receipt_and_resumes(tmp_path) -> No
     checkpoints = CollectionCheckpointStore(tmp_path / "checkpoints")
     artifact = collect_planned_investor_flow(
         plan=plan,
-        kis=KisInvestorFlowCollector(("005930",), client=Client()),
+        provider="ls",
+        collector=LsInvestorFlowCollector(("005930",), client=MockLsClient()),
         bronze_root=tmp_path / "bronze",
         retrieved_at=datetime(2026, 9, 3, tzinfo=UTC),
         checkpoint_store=checkpoints,
@@ -56,7 +64,7 @@ def test_collect_historical_evidence_routes_each_kind_to_its_owner() -> None:
 
     assert HISTORICAL_PROVIDER_ROUTES[EvidenceKind.DAILY_MARKET] == 'krx'
     assert HISTORICAL_PROVIDER_ROUTES[EvidenceKind.SECURITY_MASTER] == 'krx'
-    assert HISTORICAL_PROVIDER_ROUTES[EvidenceKind.INVESTOR_FLOW] == 'kis'
+    assert HISTORICAL_PROVIDER_ROUTES[EvidenceKind.INVESTOR_FLOW] == 'ls'
     assert HISTORICAL_PROVIDER_ROUTES[EvidenceKind.FINANCIAL_FACTS] == 'opendart'
     assert HISTORICAL_PROVIDER_ROUTES[EvidenceKind.CORPORATE_ACTIONS] == 'opendart_structured_decisions'
 
@@ -100,14 +108,14 @@ def test_collect_historical_evidence_collects_krx_and_kis_pages(tmp_path) -> Non
         def fetch_master_lineage(self, start, end, *, sessions):
             return ({'session': sessions[0].isoformat(), 'records': [{'ticker': '005930'}]},)
 
-    class Client:
-        def inquire_investor_trade_by_stock_daily(self, symbol, anchor):
+    class MockLsClient:
+        def inquire_investor_trend(self, symbol, start_date, end_date, unit="amount"):
             return ({
-                'stck_bsop_date': anchor.strftime('%Y%m%d'),
-                'frgn_shnu_tr_pbmn': '1', 'frgn_seln_tr_pbmn': '0',
-                'frgn_ntby_tr_pbmn': '1', 'orgn_ntby_tr_pbmn': '0',
-                'prsn_ntby_tr_pbmn': '-1',
+                'date': start_date.strftime('%Y%m%d'),
+                'tjj0008': '-1', 'tjj0009': '1', 'tjj0018': '0',
             },)
+
+    from src.integrations.ls.investor_flow import LsInvestorFlowCollector
 
     plan = build_historical_collection_plan(
         sessions=(date(2016, 1, 4),),
@@ -115,7 +123,7 @@ def test_collect_historical_evidence_collects_krx_and_kis_pages(tmp_path) -> Non
         start=date(2016, 1, 4), end=date(2016, 1, 4), artifact_root=tmp_path / 'plans',
     )
     result = collect_historical_evidence(
-        plan=plan, krx=Krx(), kis=KisInvestorFlowCollector(('005930',), client=Client()), dart=object(),
+        plan=plan, krx=Krx(), investor_flow=LsInvestorFlowCollector(('005930',), client=MockLsClient()), investor_flow_provider='ls', dart=object(),
         bronze_root=tmp_path / 'bronze', checkpoint_root=tmp_path / 'checkpoints',
         retrieved_at=datetime(2026, 9, 5, tzinfo=UTC),
         kinds=frozenset({EvidenceKind.DAILY_MARKET, EvidenceKind.SECURITY_MASTER, EvidenceKind.INVESTOR_FLOW}),
@@ -132,13 +140,13 @@ def test_collect_historical_evidence_rejects_invalid_request(tmp_path) -> None:
         start=date(2016, 1, 4), end=date(2016, 1, 4), artifact_root=tmp_path / 'plans',
     )
     with pytest.raises(PITDataError, match='timezone-aware'):
-        collect_historical_evidence(plan=plan, krx=object(), kis=None, dart=object(), bronze_root=tmp_path / 'b', checkpoint_root=tmp_path / 'c', retrieved_at=datetime(2026, 1, 1), kinds=frozenset({EvidenceKind.DAILY_MARKET}))
+        collect_historical_evidence(plan=plan, krx=object(), investor_flow=None, investor_flow_provider='ls', dart=object(), bronze_root=tmp_path / 'b', checkpoint_root=tmp_path / 'c', retrieved_at=datetime(2026, 1, 1), kinds=frozenset({EvidenceKind.DAILY_MARKET}))
     with pytest.raises(PITDataError, match='at least one'):
-        collect_historical_evidence(plan=plan, krx=object(), kis=None, dart=object(), bronze_root=tmp_path / 'b', checkpoint_root=tmp_path / 'c', retrieved_at=datetime(2026, 1, 1, tzinfo=UTC), kinds=frozenset())
+        collect_historical_evidence(plan=plan, krx=object(), investor_flow=None, investor_flow_provider='ls', dart=object(), bronze_root=tmp_path / 'b', checkpoint_root=tmp_path / 'c', retrieved_at=datetime(2026, 1, 1, tzinfo=UTC), kinds=frozenset())
     with pytest.raises(PITDataError, match='dedicated'):
-        collect_historical_evidence(plan=plan, krx=object(), kis=None, dart=object(), bronze_root=tmp_path / 'b', checkpoint_root=tmp_path / 'c', retrieved_at=datetime(2026, 1, 1, tzinfo=UTC), kinds=frozenset({EvidenceKind.FINANCIAL_FACTS}))
-    with pytest.raises(PITDataError, match='KIS collector'):
-        collect_historical_evidence(plan=plan, krx=object(), kis=None, dart=object(), bronze_root=tmp_path / 'b', checkpoint_root=tmp_path / 'c', retrieved_at=datetime(2026, 1, 1, tzinfo=UTC), kinds=frozenset({EvidenceKind.INVESTOR_FLOW}))
+        collect_historical_evidence(plan=plan, krx=object(), investor_flow=None, investor_flow_provider='ls', dart=object(), bronze_root=tmp_path / 'b', checkpoint_root=tmp_path / 'c', retrieved_at=datetime(2026, 1, 1, tzinfo=UTC), kinds=frozenset({EvidenceKind.FINANCIAL_FACTS}))
+    with pytest.raises(PITDataError, match='investor flow requires'):
+        collect_historical_evidence(plan=plan, krx=object(), investor_flow=None, investor_flow_provider='ls', dart=object(), bronze_root=tmp_path / 'b', checkpoint_root=tmp_path / 'c', retrieved_at=datetime(2026, 1, 1, tzinfo=UTC), kinds=frozenset({EvidenceKind.INVESTOR_FLOW}))
 
     class EmptyKrx:
         def fetch_daily_market(self, *args, **kwargs):
@@ -147,9 +155,9 @@ def test_collect_historical_evidence_rejects_invalid_request(tmp_path) -> None:
             return ()
 
     with pytest.raises(PITDataError, match='daily market response'):
-        collect_historical_evidence(plan=plan, krx=EmptyKrx(), kis=None, dart=object(), bronze_root=tmp_path / 'b', checkpoint_root=tmp_path / 'c', retrieved_at=datetime(2026, 1, 1, tzinfo=UTC), kinds=frozenset({EvidenceKind.DAILY_MARKET}))
+        collect_historical_evidence(plan=plan, krx=EmptyKrx(), investor_flow=None, investor_flow_provider='ls', dart=object(), bronze_root=tmp_path / 'b', checkpoint_root=tmp_path / 'c', retrieved_at=datetime(2026, 1, 1, tzinfo=UTC), kinds=frozenset({EvidenceKind.DAILY_MARKET}))
     with pytest.raises(PITDataError, match='master lineage response'):
-        collect_historical_evidence(plan=plan, krx=EmptyKrx(), kis=None, dart=object(), bronze_root=tmp_path / 'b', checkpoint_root=tmp_path / 'c', retrieved_at=datetime(2026, 1, 1, tzinfo=UTC), kinds=frozenset({EvidenceKind.SECURITY_MASTER}))
+        collect_historical_evidence(plan=plan, krx=EmptyKrx(), investor_flow=None, investor_flow_provider='ls', dart=object(), bronze_root=tmp_path / 'b', checkpoint_root=tmp_path / 'c', retrieved_at=datetime(2026, 1, 1, tzinfo=UTC), kinds=frozenset({EvidenceKind.SECURITY_MASTER}))
 
 
 def test_collect_daily_market_sessions_persists_only_requested_krx_pages(tmp_path) -> None:
@@ -421,3 +429,23 @@ def test_collect_opendart_actions_persists_direct_mapping_provenance(tmp_path) -
     payload = json.loads(receipt.payload_path.read_text(encoding='utf-8'))
     assert payload['requested_instrument_id'] == 'KRX:005930'
     assert payload['instrument_mapping_provenance'] == 'opendart_corp_code_direct'
+
+
+def test_collect_historical_evidence_propagates_selected_kiwoom_provider(tmp_path, monkeypatch) -> None:
+    from datetime import UTC, date, datetime
+    from src.data.collection import CollectionArtifact, collect_historical_evidence
+    from src.data.collection_plan import build_historical_collection_plan
+    from src.data.schemas import EvidenceKind
+
+    day = date(2016, 1, 4)
+    plan = build_historical_collection_plan(sessions=(day,), universe=({'symbol': '005930', 'is_common_stock': True},), start=day, end=day, artifact_root=tmp_path / 'plans')
+    captured = {}
+    def fake_collect(**kwargs):
+        captured.update(kwargs)
+        return CollectionArtifact(tmp_path / 'bronze', day, day, datetime(2026, 9, 11, tzinfo=UTC), {}, 'b' * 64, tmp_path / 'report.json')
+    monkeypatch.setattr('src.data.collection.collect_planned_investor_flow', fake_collect)
+    collector = object()
+    result = collect_historical_evidence(plan=plan, krx=object(), investor_flow=collector, investor_flow_provider='kiwoom', dart=object(), bronze_root=tmp_path / 'bronze', checkpoint_root=tmp_path / 'checkpoints', retrieved_at=datetime(2026, 9, 11, tzinfo=UTC), kinds=frozenset({EvidenceKind.INVESTOR_FLOW}))
+    assert result[EvidenceKind.INVESTOR_FLOW].content_hash == 'b' * 64
+    assert captured['provider'] == 'kiwoom'
+    assert captured['collector'] is collector

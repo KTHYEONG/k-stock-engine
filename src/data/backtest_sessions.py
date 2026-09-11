@@ -271,7 +271,13 @@ def resolve_backtest_corporate_action_evidence(
             iid = str(jump_row["instrument_id"])
             if iid in {iid_event for iid_event, _, _ in events}:
                 continue
-            jump_session = _coerce_session(jump_row["session"])
+            jump_raw = _coerce_session(jump_row["session"])
+            # Daily bars may carry the session close (15:30 KST) while the
+            # canonical calendar stores the same trading date at its open.
+            # Join by market date before applying the quarantine window.
+            jump_session = sessions_by_date.get(jump_raw.date())
+            if jump_session is None:
+                raise PITDataError(f"price discontinuity session is outside calendar for {iid!r}")
             if jump_session not in session_index:
                 raise PITDataError(f"price discontinuity session is outside calendar for {iid!r}")
             events.append((iid, jump_session, "unexplained_price_discontinuity"))
@@ -289,9 +295,25 @@ def resolve_backtest_corporate_action_evidence(
         iid: tuple(sorted(labels)) for iid, labels in reasons.items()
     }
     if quarantine:
-        quarantined_pairs = [
-            (iid, session) for iid, slots in quarantine.items() for session in slots
-        ]
+        # Daily bars commonly use a close/open instant while the canonical
+        # calendar uses a date anchor.  Materialize quarantine keys using the
+        # actual bar timestamp for each instrument/date so the anti-join does
+        # not silently miss the affected rows.
+        supplied_by_date: dict[tuple[str, Any], list[datetime]] = {}
+        if {"instrument_id", "session"}.issubset(daily_market.columns):
+            for market_row in daily_market.select("instrument_id", "session").to_dicts():
+                market_session = _coerce_session(market_row["session"])
+                supplied_by_date.setdefault(
+                    (str(market_row["instrument_id"]), market_session.date()), []
+                ).append(market_session)
+        quarantined_pairs: list[tuple[str, datetime]] = []
+        for iid, slots in quarantine.items():
+            for slot in slots:
+                matching = supplied_by_date.get((iid, slot.date()))
+                if matching:
+                    quarantined_pairs.extend((iid, value) for value in matching)
+                else:
+                    quarantined_pairs.append((iid, slot))
         block = pl.DataFrame(
             {"instrument_id": [iid for iid, _ in quarantined_pairs], "session": [s for _, s in quarantined_pairs]}
         )
@@ -312,7 +334,13 @@ def resolve_backtest_corporate_action_evidence(
         for row in daily_market.select("instrument_id", "session").to_dicts():
             supplied.setdefault(str(row["instrument_id"]), set()).add(_coerce_session(row["session"]))
         excluded = frozenset(
-            iid for iid, slots in supplied.items() if slots and slots <= quarantine.get(iid, set())
+            iid
+            for iid, slots in supplied.items()
+            if slots
+            and {
+                value.date() for value in slots
+            }
+            <= {value.date() for value in quarantine.get(iid, set())}
         )
     else:
         excluded = frozenset()
@@ -351,6 +379,41 @@ def validate_corporate_action_coverage(
 ) -> CorporateActionCoverage:
     threshold = float(policy.unexplained_price_jump_threshold)
     action_rows: list[dict[str, Any]] = corporate_actions.to_dicts() if corporate_actions.height > 0 else []
+    # Structured DART evidence may contain historical decisions predating the
+    # supplied market window.  They cannot affect this validation window and
+    # must not block a later, otherwise certified rebuild (the 001260 legacy
+    # no_action rows are an example).  Actions inside the observed instrument
+    # range remain fail-closed below.
+    market_bounds: dict[str, tuple[datetime, datetime]] = {}
+    if daily_market.height > 0 and {"instrument_id", "session"}.issubset(daily_market.columns):
+        for group_key, group in daily_market.group_by("instrument_id", maintain_order=True):
+            sessions = [_coerce_session(value) for value in group["session"].to_list()]
+            if sessions:
+                market_bounds[str(group_key[0])] = (min(sessions), max(sessions))
+    filtered_actions: list[dict[str, Any]] = []
+    for row in action_rows:
+        iid = str(row.get("instrument_id", ""))
+        raw_eff = row.get("effective_session", row.get("effective_date"))
+        raw_type = str(row.get("action_type", row.get("type", "")))
+        raw_status = str(row.get("evidence_status", "verified") or "verified")
+        if market_bounds and iid not in market_bounds:
+            # No market observation exists for this instrument in the
+            # certified window, so its action cannot explain or invalidate a
+            # price series that is not present.
+            continue
+        if iid in market_bounds and raw_eff is not None and (
+            raw_status != "verified" or raw_type == "no_action"
+        ):
+            try:
+                effective = _coerce_session(raw_eff)
+            except (TypeError, ValueError):
+                effective = None
+            if effective is not None and effective.tzinfo is not None:
+                first, last = market_bounds[iid]
+                if effective < first or effective > last:
+                    continue
+        filtered_actions.append(row)
+    action_rows = filtered_actions
     for row in action_rows:
         if str(row.get("evidence_status", "verified") or "verified") != "verified":
             raise PITDataError(f"unresolved corporate-action evidence for {row.get('instrument_id')!r}; certification blocked")

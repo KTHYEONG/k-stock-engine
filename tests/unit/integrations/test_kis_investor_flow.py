@@ -29,6 +29,7 @@ def test_kis_investor_flow_maps_transaction_values() -> None:
     assert rows[0]['records'][0] == {
         'session': '2016-01-29',
         'ticker': '005930',
+        '_source_provider': 'KIS',
         'foreign_buy_value': 100.0,
         'foreign_sell_value': 40.0,
         'foreign_net_value': 60.0,
