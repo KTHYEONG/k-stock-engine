@@ -591,7 +591,6 @@ def test_build_gold_uses_four_factor_default_policy(tmp_path, monkeypatch, capsy
     from types import SimpleNamespace
 
     import src.data.gold as gold_mod
-    import src.data.gold_loader as loader_mod
     from src.data.cli import main
 
     captured: dict[str, object] = {}
@@ -626,16 +625,25 @@ def test_build_gold_uses_four_factor_default_policy(tmp_path, monkeypatch, capsy
             summary_artifact_path='s',
         )
 
-    monkeypatch.setattr(loader_mod, 'load_gold_window_inputs', fake_load)
+    import src.data.cli as cli_mod
+    from src.data.schemas import SilverTable
+    _bindings = {table: f'id-{table.value}' for table in SilverTable}
+    monkeypatch.setattr(cli_mod, 'load_gold_window_inputs', fake_load)
+    monkeypatch.setattr(cli_mod, 'parse_silver_dataset_bindings', lambda _values: _bindings)
+    monkeypatch.setattr(cli_mod, 'resolve_gold_dataset_bindings', lambda **_kwargs: _bindings)
+    monkeypatch.setattr(cli_mod, 'write_gold_input_binding_artifact', lambda **_kwargs: tmp_path / 'binding.json')
     monkeypatch.setattr(gold_mod, 'materialize_gold_window', fake_materialize)
-    monkeypatch.setattr(sys, 'argv', [
+    _argv = [
         'stock-data', 'build-gold',
         '--silver-root', str(tmp_path),
         '--artifact-root', str(tmp_path),
         '--decision-time', '2024-01-03T00:00:00+00:00',
         '--validation-start', '2016-01-04',
         '--validation-end', '2016-12-30',
-    ])
+    ]
+    for _table, _dataset_id in _bindings.items():
+        _argv.extend(['--silver-dataset-id', f'{_table.value}={_dataset_id}'])
+    monkeypatch.setattr(sys, 'argv', _argv)
     assert main() == 0
     assert captured['score_policy'].min_required_factors == 4
     capsys.readouterr()
@@ -1069,3 +1077,27 @@ def test_collect_cli_routes_selected_provider_without_kis_constructor(tmp_path, 
     assert captured['provider'] == 'kiwoom'
     assert captured['symbols'] == ('005930',)
     assert captured['collector'] == 'collector'
+
+
+def test_cli_build_gold_wires_complete_explicit_dataset_binding(tmp_path, monkeypatch, capsys) -> None:
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+    import src.data.cli as cli
+    from src.data.schemas import SilverTable
+
+    captured = {}
+    bindings = {table: f'id-{table.value}' for table in SilverTable}
+    monkeypatch.setattr(cli, 'parse_silver_dataset_bindings', lambda _values: bindings)
+    monkeypatch.setattr(cli, 'resolve_gold_dataset_bindings', lambda **_kwargs: bindings)
+    monkeypatch.setattr(cli, 'write_gold_input_binding_artifact', lambda **_kwargs: captured.setdefault('artifact', tmp_path / 'binding.json'))
+    monkeypatch.setattr(cli, 'load_gold_window_inputs', lambda **kwargs: captured.update(load=kwargs) or SimpleNamespace(calendar=object(), security_master=object(), daily_market=object(), financial_facts=object(), corporate_actions=object(), investor_flow=object(), silver_dataset_ids=bindings))
+    manifest = SimpleNamespace(manifest_hash='h', warmup=SimpleNamespace(warmup_ok=True, warmup_sessions_found=60), bar_audit=(), dart_eligibility=(), ca_excluded_instrument_ids=frozenset(), eligible_instrument_ids=frozenset())
+    monkeypatch.setattr('src.data.gold.materialize_gold_window', lambda **_kwargs: SimpleNamespace(manifest=manifest, universe_decisions_count=1, eligible_decisions_count=1, feature_rows_count=1, universe_path='u', features_path='f', summary_artifact_path='s'))
+
+    args = ['build-gold', '--silver-root', str(tmp_path), '--artifact-root', str(tmp_path), '--decision-time', datetime(2026, 9, 11, tzinfo=UTC).isoformat(), '--validation-start', '2016-01-04', '--validation-end', '2016-12-29']
+    for table, dataset_id in bindings.items():
+        args.extend(['--silver-dataset-id', f'{table.value}={dataset_id}'])
+    assert cli.main(args) == 0
+    assert captured['load']['silver_dataset_ids'] == bindings
+    assert captured['artifact'] == tmp_path / 'binding.json'
+    assert 'eligible_instruments' in capsys.readouterr().out

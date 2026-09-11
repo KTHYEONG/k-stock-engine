@@ -490,3 +490,100 @@ def test_gold_coverage_gate_rejects_missing_core_or_corrupt_optional_manifest(mo
     monkeypatch.setattr(mod, '_selected_manifest_time_end', lambda **kwargs: (_ for _ in ()).throw(PITDataError('broken flow')) if kwargs['table'] is SilverTable.INVESTOR_FLOW else sessions[-1].date())
     with pytest.raises(PITDataError, match='investor_flow'):
         mod.load_gold_window_inputs(silver_root=tmp_path, validation_start=sessions[-5].date(), validation_end=sessions[-1].date(), decision_time=datetime(2026, 9, 10, tzinfo=UTC))
+
+
+def test_parse_silver_dataset_bindings_requires_complete_unique_known_tables() -> None:
+    import pytest
+    from src.data.gold_loader import parse_silver_dataset_bindings
+    from src.data.schemas import PITDataError, SilverTable
+
+    complete = [f'{table.value}=id-{table.value}' for table in SilverTable]
+    assert parse_silver_dataset_bindings(complete) == {table: f'id-{table.value}' for table in SilverTable}
+    with pytest.raises(PITDataError, match='duplicate'):
+        parse_silver_dataset_bindings([*complete, complete[0]])
+    with pytest.raises(PITDataError, match='unknown'):
+        parse_silver_dataset_bindings([*complete[:-1], 'unknown=id'])
+    with pytest.raises(PITDataError, match='missing'):
+        parse_silver_dataset_bindings(complete[:-1])
+    with pytest.raises(PITDataError, match='malformed'):
+        parse_silver_dataset_bindings(['daily_market'])
+
+
+def test_resolve_gold_dataset_bindings_rejects_fixture_and_missing_dataset(tmp_path, monkeypatch) -> None:
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+    import pytest
+    from src.data.gold_loader import resolve_gold_dataset_bindings
+    from src.data.schemas import PITDataError, SilverTable
+    from src.storage.parquet_datasets import ParquetDatasetStore
+
+    requested = {table: f'id-{table.value}' for table in SilverTable}
+    for table, dataset_id in requested.items():
+        (tmp_path / table.value / dataset_id).mkdir(parents=True)
+    monkeypatch.setattr(ParquetDatasetStore, 'read_manifest', lambda _self, _dataset_id: SimpleNamespace(provider_version='fixture', generated_time=datetime(2026, 9, 10, tzinfo=UTC), time_end=datetime(2026, 9, 10, tzinfo=UTC)))
+    with pytest.raises(PITDataError, match='fixture'):
+        resolve_gold_dataset_bindings(silver_root=tmp_path, requested=requested, decision_time=datetime(2026, 9, 11, tzinfo=UTC))
+    missing = dict(requested)
+    missing[SilverTable.DAILY_MARKET] = 'absent'
+    with pytest.raises(PITDataError, match='missing'):
+        resolve_gold_dataset_bindings(silver_root=tmp_path, requested=missing, decision_time=datetime(2026, 9, 11, tzinfo=UTC))
+    with pytest.raises(PITDataError, match='aware'):
+        resolve_gold_dataset_bindings(silver_root=tmp_path, requested=requested, decision_time=datetime(2026, 9, 11))
+
+
+def test_load_gold_window_inputs_resolves_explicit_bindings_before_scan(tmp_path, monkeypatch) -> None:
+    from datetime import UTC, date, datetime
+    import pytest
+    import src.data.gold_loader as module
+    from src.data.schemas import PITDataError, SilverTable
+
+    bindings = {table: f'id-{table.value}' for table in SilverTable}
+    monkeypatch.setattr(
+        module,
+        'resolve_gold_dataset_bindings',
+        lambda **_kwargs: (_ for _ in ()).throw(PITDataError('explicit binding rejected')),
+    )
+
+    with pytest.raises(PITDataError, match='explicit binding rejected'):
+        module.load_gold_window_inputs(
+            silver_root=tmp_path,
+            validation_start=date(2016, 1, 4),
+            validation_end=date(2016, 1, 4),
+            decision_time=datetime(2016, 12, 30, tzinfo=UTC),
+            silver_dataset_ids=bindings,
+        )
+
+
+def test_resolve_gold_dataset_bindings_accepts_production_manifests(tmp_path, monkeypatch) -> None:
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+    from src.data.gold_loader import resolve_gold_dataset_bindings
+    from src.data.schemas import SilverTable
+    from src.storage.parquet_datasets import ParquetDatasetStore
+
+    requested = {table: f'id-{table.value}' for table in SilverTable}
+    for table, dataset_id in requested.items():
+        (tmp_path / table.value / dataset_id).mkdir(parents=True)
+    monkeypatch.setattr(ParquetDatasetStore, 'read_manifest', lambda _self, _dataset_id: SimpleNamespace(provider_version='production', generated_time=datetime(2026, 9, 10, tzinfo=UTC), time_end=datetime(2026, 9, 10, tzinfo=UTC)))
+    assert resolve_gold_dataset_bindings(silver_root=tmp_path, requested=requested, decision_time=datetime(2026, 9, 11, tzinfo=UTC)) == requested
+
+
+def test_write_gold_input_binding_artifact_persists_sorted_binding(tmp_path) -> None:
+    from datetime import UTC, datetime
+    import json
+    import pytest
+    from src.data.gold_loader import write_gold_input_binding_artifact
+    from src.data.schemas import PITDataError, SilverTable
+
+    bindings = {table: f'id-{table.value}' for table in SilverTable}
+    out = write_gold_input_binding_artifact(artifact_root=tmp_path, dataset_ids=bindings, decision_time=datetime(2026, 9, 11, tzinfo=UTC), validation_start=datetime(2016, 1, 4).date(), validation_end=datetime(2016, 12, 29).date())
+    assert out.parent.name == 'gold_input_bindings'
+    payload = json.loads(out.read_text(encoding='utf-8'))
+    assert sorted(payload['dataset_ids']) == sorted(t.value for t in SilverTable)
+    assert payload['decision_time'] == datetime(2026, 9, 11, tzinfo=UTC).isoformat()
+    with pytest.raises(PITDataError, match='aware'):
+        write_gold_input_binding_artifact(artifact_root=tmp_path, dataset_ids=bindings, decision_time=datetime(2026, 9, 11), validation_start=datetime(2016, 1, 4).date(), validation_end=datetime(2016, 12, 29).date())
+    with pytest.raises(PITDataError, match='inverted'):
+        write_gold_input_binding_artifact(artifact_root=tmp_path, dataset_ids=bindings, decision_time=datetime(2026, 9, 11, tzinfo=UTC), validation_start=datetime(2016, 12, 29).date(), validation_end=datetime(2016, 1, 4).date())
+    with pytest.raises(PITDataError, match='missing'):
+        write_gold_input_binding_artifact(artifact_root=tmp_path, dataset_ids={}, decision_time=datetime(2026, 9, 11, tzinfo=UTC), validation_start=datetime(2016, 1, 4).date(), validation_end=datetime(2016, 12, 29).date())
