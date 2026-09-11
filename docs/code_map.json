@@ -286,7 +286,9 @@
     "testing": "tests/unit/integrations/krx/test_historical.py"
   },
   "src/integrations/krx/kind.py": {},
-  "src/integrations/ls/client.py": {},
+  "src/integrations/ls/client.py": {
+    "testing": "tests/unit/integrations/ls/test_client.py"
+  },
   "src/integrations/ls/investor_flow.py": {
     "testing": "tests/unit/integrations/ls/test_investor_flow.py"
   },
