@@ -133,3 +133,28 @@ def test_canonicalize_lifecycle_rows_rejects_conflicting_verified_versions() -> 
     }
     with pytest.raises(PITDataError, match='conflicting'):
         canonicalize_lifecycle_event_rows((base, {**base, 'successor_delivery_date': '2016-11-03'}))
+
+
+def test_canonicalize_lifecycle_rows_accepts_legacy_cash_receipt_without_resolution_kind() -> None:
+    from src.data.lifecycle import canonicalize_lifecycle_event_rows
+
+    base = {
+        "instrument_id": "KRX:019300",
+        "evidence_status": "verified",
+        "resolution_kind": "cash_settlement",
+        "cash_settlement_per_share": 3600.0,
+        "delisting_date": "2016-08-11",
+    }
+
+    result = canonicalize_lifecycle_event_rows((base, {**base, "resolution_kind": "unresolved"}))
+
+    assert len(result) == 1
+    assert result[0]["resolution_kind"] == "cash_settlement"
+
+
+def test_lifecycle_material_terms_defaults_unresolved_without_cash() -> None:
+    from src.data.lifecycle import _MATERIAL_LIFECYCLE_TERMS, _lifecycle_material_terms
+
+    row = {"instrument_id": "KRX:019300", "evidence_status": "verified", "delisting_date": "2016-08-11"}
+    terms = _lifecycle_material_terms(row)
+    assert terms[_MATERIAL_LIFECYCLE_TERMS.index("resolution_kind")] == "unresolved"

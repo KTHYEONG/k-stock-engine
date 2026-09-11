@@ -324,3 +324,125 @@ def test_silver_load_by_id_rejects_tampered_partitions(tmp_path) -> None:
         load_silver_table_by_dataset_id(
             root=silver_root, table=SilverTable.CALENDAR, dataset_id=dataset_id, decision_time=decision
         )
+
+
+def test_silver_materialize_all_reuses_identical_dataset(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    from src.data.silver import SilverStore, complete_minimal_fixture
+
+    decision = datetime(2026, 9, 6, tzinfo=UTC)
+    tables, _receipts, report = complete_minimal_fixture(decision_time=decision)
+    store = SilverStore(tmp_path / "silver")
+    first = store.materialize_all(tables, report=report, decision_time=decision)
+    second = store.materialize_all(tables, report=report, decision_time=decision)
+    assert first == second
+
+
+def test_silver_materialize_all_versions_coverage_when_boundary_advances(tmp_path) -> None:
+    import dataclasses
+    from datetime import UTC, datetime, timedelta
+
+    from src.data.schemas import SilverTable
+    from src.data.silver import SilverStore, complete_minimal_fixture
+
+    decision = datetime(2026, 9, 6, tzinfo=UTC)
+    tables, _receipts, report = complete_minimal_fixture(decision_time=decision)
+    store = SilverStore(tmp_path / "silver")
+    first = store.materialize_all(tables, report=report, decision_time=decision)
+    extended = dataclasses.replace(report, coverage_end=report.coverage_end + timedelta(days=1))
+    second = store.materialize_all(tables, report=extended, decision_time=decision)
+    assert second[SilverTable.CALENDAR] != first[SilverTable.CALENDAR]
+    assert second[SilverTable.CALENDAR].exists()
+    third = store.materialize_all(tables, report=extended, decision_time=decision)
+    assert third == second
+
+
+def test_silver_materialize_all_recomputes_when_manifest_unreadable(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    from src.data.schemas import SilverTable
+    from src.data.silver import SilverStore, complete_minimal_fixture
+
+    decision = datetime(2026, 9, 6, tzinfo=UTC)
+    tables, _receipts, report = complete_minimal_fixture(decision_time=decision)
+    store = SilverStore(tmp_path / "silver")
+    first = store.materialize_all(tables, report=report, decision_time=decision)
+    manifest_path = first[SilverTable.CALENDAR] / "dataset_manifest.json"
+    assert manifest_path.exists()
+    manifest_path.unlink()
+    second = store.materialize_all(tables, report=report, decision_time=decision)
+    assert second[SilverTable.CALENDAR] != first[SilverTable.CALENDAR]
+    assert second[SilverTable.CALENDAR].exists()
+
+
+def _staged_calendar_table(tmp_path, staging_root, rows) -> None:
+    import hashlib
+    import json
+
+    import polars as pl
+
+    from src.data.schemas import SilverTable
+    from src.data.silver import SilverStore
+
+    table_dir = staging_root / SilverTable.CALENDAR.value
+    part_dir = table_dir / "year=2024" / "month=01"
+    part_dir.mkdir(parents=True)
+    frame = pl.DataFrame(rows)
+    part_path = part_dir / "part-00000.parquet"
+    frame.write_parquet(part_path)
+    digest = hashlib.sha256(part_path.read_bytes()).hexdigest()
+    entries = [{
+        "year": "2024", "month": "01", "part_index": 0,
+        "row_count": frame.height, "part_digest": digest,
+    }]
+    manifest = {
+        "verified": True,
+        "table": SilverTable.CALENDAR.value,
+        "schema_version": "v2",
+        "source_hashes": ["a" * 64],
+        "root_hash": SilverStore._streamed_root_hash(entries),
+        "parts": {"2024-01": [{
+            "part_digest": digest, "row_count": frame.height, "part_index": 0,
+        }]},
+    }
+    (table_dir / "staging_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def test_silver_publish_streamed_table_reuses_and_versions_datasets(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    from src.data.schemas import SilverTable
+    from src.data.silver import SilverStore, complete_minimal_fixture
+
+    decision = datetime(2026, 9, 6, tzinfo=UTC)
+    _tables, _receipts, report = complete_minimal_fixture(decision_time=decision)
+    session = datetime(2024, 1, 2, 9, tzinfo=UTC)
+    rows = [{
+        "session": session, "available_at": session, "source_hash": "a" * 64,
+    }]
+    staging_root = tmp_path / "staging"
+    _staged_calendar_table(tmp_path, staging_root, rows)
+    store = SilverStore(tmp_path / "silver")
+    first = store.publish_streamed_table(
+        table=SilverTable.CALENDAR, staging_root=staging_root,
+        report=report, decision_time=decision,
+    )
+    assert first.exists()
+    second = store.publish_streamed_table(
+        table=SilverTable.CALENDAR, staging_root=staging_root,
+        report=report, decision_time=decision,
+    )
+    assert second == first
+    (first / "dataset_manifest.json").unlink()
+    third = store.publish_streamed_table(
+        table=SilverTable.CALENDAR, staging_root=staging_root,
+        report=report, decision_time=decision,
+    )
+    assert third != first
+    assert third.exists()
+    fourth = store.publish_streamed_table(
+        table=SilverTable.CALENDAR, staging_root=staging_root,
+        report=report, decision_time=decision,
+    )
+    assert fourth == third

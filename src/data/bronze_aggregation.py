@@ -148,7 +148,17 @@ def aggregate_small_bronze_pages(
             pages.append(page)
             records = payload.get("records")
             if isinstance(records, list):
-                merged_records.extend(records)
+                if kind is EvidenceKind.INVESTOR_FLOW:
+                    provider = str(receipt.source_path).split(":", 1)[0]
+                    merged_records.extend(
+                        [
+                            {**record, "_source_provider": provider}
+                            for record in records
+                            if isinstance(record, dict)
+                        ]
+                    )
+                else:
+                    merged_records.extend(records)
             sessions = payload.get("sessions")
             if isinstance(sessions, list):
                 merged_sessions.extend(sessions)
@@ -162,14 +172,22 @@ def aggregate_small_bronze_pages(
                 commission = payload.get("commission")
                 has_commission = True
         elif isinstance(payload, list):
+            records = list(payload)
+            if kind is EvidenceKind.INVESTOR_FLOW:
+                provider = str(receipt.source_path).split(":", 1)[0]
+                records = [
+                    {**record, "_source_provider": provider}
+                    for record in records
+                    if isinstance(record, dict)
+                ]
             pages.append(
                 {
-                    "records": list(payload),
+                    "records": records,
                     "source_receipt_hash": receipt.content_hash,
                     "retrieved_at": receipt.retrieved_at.isoformat(),
                 }
             )
-            merged_records.extend(payload)
+            merged_records.extend(records)
         else:
             raise PITDataError(f"invalid Bronze payload for {kind.value}")
     aggregate: dict[str, object] = {

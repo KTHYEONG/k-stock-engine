@@ -25,7 +25,7 @@ HISTORICAL_PROVIDER_ROUTES: Mapping[EvidenceKind, str] = {
     EvidenceKind.CALENDAR: "krx",
     EvidenceKind.SECURITY_MASTER: "krx",
     EvidenceKind.DAILY_MARKET: "krx",
-    EvidenceKind.INVESTOR_FLOW: "kis",
+    EvidenceKind.INVESTOR_FLOW: "ls",
     EvidenceKind.DISCLOSURES: "opendart",
     EvidenceKind.FINANCIAL_FACTS: "opendart",
     EvidenceKind.CORPORATE_ACTIONS: "opendart_structured_decisions",
@@ -202,7 +202,8 @@ def collect_historical_evidence(
     *,
     plan: HistoricalCollectionPlan,
     krx: Any,
-    kis: Any | None,
+    investor_flow: Any | None,
+    investor_flow_provider: str,
     dart: Any,
     bronze_root: Path,
     checkpoint_root: Path,
@@ -262,14 +263,10 @@ def collect_historical_evidence(
             page_receipts={EvidenceKind.DAILY_MARKET.value: page_receipts},
         )
     if EvidenceKind.INVESTOR_FLOW in kinds:
-        if kis is None:
-            raise PITDataError("investor flow requires the KIS collector; KRX trade records must not substitute investor flow")
+        if investor_flow is None:
+            raise PITDataError("investor flow requires the investor_flow collector; KRX trade records must not substitute investor flow")
         _ = HISTORICAL_PROVIDER_ROUTES[EvidenceKind.INVESTOR_FLOW]
-        flow_artifact = collect_planned_investor_flow(
-            plan=plan, kis=kis, bronze_root=Path(bronze_root),
-            retrieved_at=retrieved_at,
-            checkpoint_store=CollectionCheckpointStore(Path(checkpoint_root)),
-        )
+        flow_artifact = collect_planned_investor_flow(plan=plan, provider=investor_flow_provider, collector=investor_flow, bronze_root=Path(bronze_root), retrieved_at=retrieved_at, checkpoint_store=CollectionCheckpointStore(Path(checkpoint_root)))
         results[EvidenceKind.INVESTOR_FLOW] = flow_artifact
     if EvidenceKind.SECURITY_MASTER in kinds:
         _ = HISTORICAL_PROVIDER_ROUTES[EvidenceKind.SECURITY_MASTER]
@@ -393,18 +390,27 @@ def _persist_response(
 def collect_planned_investor_flow(
     *,
     plan: HistoricalCollectionPlan,
-    kis: Any | None = None,
-    collector: Any | None = None,
+    provider: str,
+    collector: Any,
     bronze_root: Path,
     retrieved_at: datetime,
     checkpoint_store: CollectionCheckpointStore,
 ) -> CollectionArtifact:
-    """Collect only verified KIS investor-flow chunks and make each completion resumable."""
+    """Collect only verified investor-flow chunks and make each completion resumable."""
     # provider routing: resolve_investor_flow_collector(provider, (chunk.symbol,))
+    norm_provider = str(provider).strip().lower()
+    if norm_provider not in ("ls", "kiwoom"):
+        raise PITDataError(f"unsupported investor flow provider: {provider!r}")
+    endpoints = {"ls": "frgr-itt", "kiwoom": "ka10059"}
+    endpoint = endpoints[norm_provider]
     if retrieved_at.tzinfo is None:
         raise PITDataError("retrieved_at must be timezone-aware")
+    if norm_provider == "ls":
+        for chunk in plan.chunks:
+            if len(chunk.sessions) < 1 or len(chunk.sessions) > 700:
+                raise PITDataError(f"LS investor flow chunk {chunk.chunk_id!r} has {len(chunk.sessions)} sessions; must be 1..700")
     store = BronzeStore(bronze_root)
-    active: Any = collector if collector is not None else kis
+    active: Any = collector
     receipts: list[BronzeReceipt] = []
     page_receipts: list[BronzeReceipt] = []
     for chunk in plan.chunks:
@@ -417,8 +423,8 @@ def collect_planned_investor_flow(
                 raise
             negative = json.dumps(
                 {
-                    "provider": "KIS",
-                    "endpoint": "investor-trade-by-stock-daily",
+                    "provider": norm_provider,
+                    "endpoint": endpoint,
                     "symbol": chunk.symbol,
                     "sessions": [value.isoformat() for value in chunk.sessions],
                     "status": "source_unavailable",
@@ -429,7 +435,7 @@ def collect_planned_investor_flow(
                 negative,
                 kind=EvidenceKind.INVESTOR_FLOW,
                 retrieved_at=retrieved_at,
-                source_label=f"KIS:source-unavailable:{chunk.symbol}:{chunk.chunk_id}",
+                source_label=f"{norm_provider}:source-unavailable:{chunk.symbol}:{chunk.chunk_id}",
             )
             # A negative receipt records a deterministic provider gap, but it
             # must not satisfy the resumability proof for a completed chunk.
@@ -446,7 +452,7 @@ def collect_planned_investor_flow(
                     observed_sessions.add(str(record.get("session")))
         if not expected_sessions.issubset(observed_sessions):
             missing = ",".join(sorted(expected_sessions - observed_sessions))
-            raise PITDataError(f"KIS investor flow missing requested sessions for {chunk.symbol}: {missing}")
+            raise PITDataError(f"{norm_provider} investor flow missing requested sessions for {chunk.symbol}: {missing}")
         raw_receipts: list[BronzeReceipt] = []
         for page in pages:
             page_receipt = page.get("bronze_receipt")
@@ -483,8 +489,8 @@ def collect_planned_investor_flow(
             {
                 "plan_id": plan.plan_id,
                 "content_hash": content_hash,
-                "provider": "KIS",
-                "endpoint": "investor-trade-by-stock-daily",
+                "provider": norm_provider,
+                "endpoint": endpoint,
                 "coverage_start": plan.coverage_start.isoformat(),
                 "coverage_end": plan.coverage_end.isoformat(),
                 "completed_chunks": len(plan.chunks),

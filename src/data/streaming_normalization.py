@@ -44,6 +44,16 @@ _CORPORATE_ACTION_READ_SIZE = 64 * 1024
 STREAMING_EAGER_JSON_MAX_BYTES: Final[int] = 1_000_000
 
 
+def _source_path_month(source_path: str) -> str | None:
+    match = re.search(r"(?:^|[^0-9])(\d{4})[-]?(\d{2})[-]?(\d{2})(?:[^0-9]|$)", str(source_path))
+    return f"{match.group(1)}-{match.group(2)}" if match else None
+
+
+def _is_append_only_source_path(source_path: str, latest_month: str) -> bool:
+    month = _source_path_month(source_path)
+    return month is not None and month > latest_month
+
+
 def _trim_streaming_allocator() -> None:
     """Return transient Parquet batch pages before the next bounded batch."""
     gc.collect(0)
@@ -142,7 +152,7 @@ class StreamingNormalizationCheckpoint:
             return False
         if str(entry.get("schema_version", SCHEMA_VERSION)) != str(schema_version):
             return False
-        if list(entry.get("source_hashes", [])) != list(source_hashes):
+        if {str(item) for item in entry.get("source_hashes", [])} != set(source_hashes):
             return False
         return bool(entry.get("output_hash"))
 
@@ -183,6 +193,7 @@ class StreamingSilverWriter:
         table: SilverTable,
         batch_size: int,
         source_hashes: tuple[str, ...],
+        source_paths: tuple[str, ...] = (),
         schema_version: str = SCHEMA_VERSION,
     ) -> None:
         if int(batch_size) < 1:
@@ -191,6 +202,7 @@ class StreamingSilverWriter:
         self.table = table
         self.batch_size = int(batch_size)
         self.source_hashes = tuple(source_hashes)
+        self.source_paths = tuple(source_paths)
         self.schema_version = str(schema_version)
         self._buffers: dict[str, list[dict[str, Any]]] = {}
         self._part_digests: dict[str, list[str]] = {}
@@ -202,6 +214,7 @@ class StreamingSilverWriter:
         self._checkpoint = StreamingNormalizationCheckpoint(self.root.parent / "checkpoints")
         self._verified_months: set[str] = set()
         self._sealed_months: set[str] = set()
+        self._reusable_source_hashes: set[str] = set()
         self._load_reusable_months()
 
     def _load_reusable_months(self) -> None:
@@ -212,31 +225,38 @@ class StreamingSilverWriter:
             manifest = _read_doc(manifest_path)
         except (OSError, ValueError):
             return
-        if (
-            not isinstance(manifest, dict)
-            or manifest.get("schema_version") != self.schema_version
-            or list(manifest.get("source_hashes", [])) != list(self.source_hashes)
-        ):
+        if not isinstance(manifest, dict) or manifest.get("schema_version") != self.schema_version:
             return
         parts = manifest.get("parts")
         if not isinstance(parts, dict):
             return
+        previous_hashes = tuple(str(item) for item in manifest.get("source_hashes", []))
+        current_hashes = set(self.source_hashes)
+        previous_hash_set = set(previous_hashes)
+        exact_sources = previous_hash_set == current_hashes and (
+            not self.source_paths or manifest.get("verified") is True
+        )
+        incremental_sources = False
+        if not exact_sources and previous_hash_set and previous_hash_set.issubset(current_hashes):
+            previous_paths = manifest.get("source_paths")
+            current_paths = dict(zip(self.source_hashes, self.source_paths, strict=False))
+            previous_months = [str(month) for month in parts]
+            latest_month = max(previous_months) if previous_months else ""
+            added_paths = [current_paths.get(item, "") for item in current_hashes - previous_hash_set]
+            incremental_sources = bool(previous_paths) and bool(added_paths) and all(
+                _is_append_only_source_path(path, latest_month) for path in added_paths
+            )
+        if not exact_sources and not incremental_sources:
+            return
+        self._reusable_source_hashes = current_hashes if exact_sources else previous_hash_set
         sealed = manifest.get("sealed_months")
         months = list(sealed) if isinstance(sealed, list) else sorted(parts)
         for month in months:
             entries = parts[str(month)]
-            checkpoint_verified = self._checkpoint.is_verified(
-                table=self.table.value,
-                month=str(month),
-                source_hashes=self.source_hashes,
-                schema_version=self.schema_version,
-            )
             # The staging manifest is itself an atomic, digest-checked commit.
             # Older runs may predate per-month checkpoint entries, so the
             # checkpoint is an optional acceleration/diagnostic layer rather
             # than a prerequisite for safe reuse.
-            if (not checkpoint_verified and self._checkpoint.verified_entry(table=self.table.value, month=str(month)) is not None):
-                continue
             if not isinstance(entries, list) or not entries:
                 continue
             digests: list[str] = []
@@ -266,6 +286,10 @@ class StreamingSilverWriter:
     @property
     def has_reusable_manifest(self) -> bool:
         return bool(self._verified_months) and not self._buffers
+
+    @property
+    def pending_source_hashes(self) -> frozenset[str]:
+        return frozenset(set(self.source_hashes) - self._reusable_source_hashes)
 
     def _month_dir(self, month: str) -> Path:
         year, _, mon = month.partition("-")
@@ -392,7 +416,8 @@ class StreamingSilverWriter:
             index = 0
             part_path = month_dir / f"part-{index:05d}.parquet"
         tmp_path = part_path.with_suffix(".parquet.tmp")
-        pl.DataFrame(buf).write_parquet(tmp_path)
+        schema_overrides = {"source_security_id": pl.String} if any("source_security_id" in row for row in buf) else None
+        pl.DataFrame(buf, schema_overrides=schema_overrides).write_parquet(tmp_path)
         tmp_path.replace(part_path)
         digest = _file_digest(part_path)
         if not digest:
@@ -417,6 +442,7 @@ class StreamingSilverWriter:
             "table": self.table.value,
             "schema_version": self.schema_version,
             "source_hashes": list(self.source_hashes),
+            "source_paths": list(self.source_paths),
             "months": sorted(self._part_digests),
             "sealed_months": sorted(self._sealed_months),
             "parts": {month: [{"part_index": idx, "row_count": count, "part_digest": digest} for idx, (digest, count) in enumerate(zip(self._part_digests[month], self._part_counts[month], strict=True))] for month in sorted(self._part_digests)},
@@ -561,6 +587,84 @@ def order_streaming_receipts(
     keyed = [(_receipt_event_date(item), item.retrieved_at, item.content_hash, item) for item in receipts]
     keyed.sort(key=lambda entry: (entry[0], entry[1], entry[2]))
     return tuple(entry[3] for entry in keyed)
+
+
+def _dedupe_duplicate_source_paths(
+    receipts: tuple[BronzeReceipt, ...],
+) -> tuple[BronzeReceipt, ...]:
+    """Keep the widest verified page when a provider path was retried.
+
+    Bronze is immutable, so retries can legitimately produce different
+    content hashes for the same provider path.  Feeding both pages to the
+    streaming writer can move the cursor backwards (for example, a shorter
+    warm-up page arriving after a longer one).  For duplicate paths choose
+    the page with the greatest observed session coverage, then the greatest
+    row count, and finally the earliest retrieval as a stable tie-breaker.
+    Unique paths are returned untouched.
+    """
+    # A normalized provider page historically reused one logical source path
+    # for every session.  The event date is therefore part of the identity;
+    # grouping by path alone would collapse an entire year to one page.
+    normalized_daily = [
+        receipt
+        for receipt in receipts
+        if str(receipt.source_path) == "normalized-provider-page:daily_market"
+    ]
+    if normalized_daily:
+        normalized_first = min(_receipt_event_date(receipt) for receipt in normalized_daily)
+        receipts = tuple(
+            receipt
+            for receipt in receipts
+            if not (
+                str(receipt.source_path).startswith("KRX:warmup:")
+                and normalized_first <= _receipt_event_date(receipt)
+            )
+        )
+    by_path: dict[tuple[str, date], list[BronzeReceipt]] = {}
+    for receipt in receipts:
+        key = (str(receipt.source_path), _receipt_event_date(receipt))
+        by_path.setdefault(key, []).append(receipt)
+    if all(len(items) == 1 for items in by_path.values()):
+        return receipts
+
+    selected: list[BronzeReceipt] = []
+    for items in by_path.values():
+        if len(items) == 1:
+            selected.extend(items)
+            continue
+        scored: list[tuple[date, int, float, str, BronzeReceipt]] = []
+        for receipt in items:
+            minimum = maximum = _receipt_event_date(receipt)
+            count = 0
+            try:
+                for row in _stream_items_for_kind([receipt], batch_size=4096):
+                    count += 1
+                    for field_name in ("session", "price_date", "BAS_DD", "basDd", "valid_from"):
+                        value = row.get(field_name)
+                        if value in (None, ""):
+                            continue
+                        try:
+                            observed = _as_krx_datetime(value).date()
+                        except PITDataError:
+                            continue
+                        minimum = min(minimum, observed)
+                        maximum = max(maximum, observed)
+                        break
+            except PITDataError:
+                # The normal worker will report the malformed page.  Do not
+                # hide that error here merely because another retry exists.
+                raise
+            scored.append(
+                (
+                    maximum,
+                    count,
+                    -receipt.retrieved_at.timestamp(),
+                    receipt.content_hash,
+                    receipt,
+                )
+            )
+        selected.append(max(scored)[-1])
+    return tuple(selected)
 
 
 def _stream_items_for_kind(
@@ -1578,6 +1682,12 @@ def _corporate_action_frame(records: Iterable[dict[str, Any]], *, source_hash: s
 
 
 def _master_available_at(*, receipt: BronzeReceipt, record: dict[str, Any]) -> datetime:
+    retained = re.search(r"master_(\d{8})(?:_|\.)", receipt.source_path)
+    if retained:
+        # The retained historical snapshot is one PIT page.  A few legacy
+        # rows carry later synthetic ``available_time`` values; the page's
+        # certified start date is the authoritative availability anchor.
+        return _as_krx_datetime(datetime.strptime(retained.group(1), "%Y%m%d").date().isoformat())
     raw_available = record.get("available_time")
     if raw_available not in (None, ""):
         return _as_krx_datetime(raw_available)
@@ -1593,6 +1703,17 @@ def _required_row_value(record: dict[str, Any], *names: str) -> Any:
         if value not in (None, ""):
             return value
     raise PITDataError(f"missing KRX field {'/'.join(names)}; certification blocked")
+
+
+def _source_security_id(record: dict[str, Any]) -> str | None:
+    """Preserve the provider's immutable ISIN when the KRX page exposes it."""
+    for name in ("source_security_id", "security_id", "ISU_CD", "isu_cd"):
+        value = record.get(name)
+        if value not in (None, ""):
+            candidate = str(value).strip().upper()
+            if re.fullmatch(r"KR[A-Z0-9]{10}", candidate):
+                return candidate
+    return None
 
 
 def _canonical_instrument_id(record: dict[str, Any]) -> str:
@@ -1669,6 +1790,7 @@ def _canonical_daily_row(
     return {
         "session": session,
         "instrument_id": _canonical_instrument_id(record),
+        "source_security_id": _source_security_id(record),
         "open": open_price,
         "high": high,
         "low": low,
@@ -1692,6 +1814,7 @@ def _canonical_master_row(
     if not ticker:
         raise PITDataError("missing KRX instrument; certification blocked")
     instrument_id = f"KRX:{ticker}"
+    source_security_id = _source_security_id(record)
     valid_from = available_at
     for key in ("valid_from",):
         if record.get(key) not in (None, ""):
@@ -1706,6 +1829,7 @@ def _canonical_master_row(
     return {
         "instrument_id": instrument_id,
         "ticker": ticker,
+        "source_security_id": source_security_id,
         "company_id": str(record.get("company_id") or record.get("corp_code") or ticker),
         # Historical planning snapshots may carry no exchange label; retain
         # the row with an explicit sentinel rather than dropping its PIT dates.
@@ -1714,7 +1838,10 @@ def _canonical_master_row(
         "listing_date": listing_date,
         "delisting_date": record.get("delisting_date") or record.get("delisted_on"),
         "share_class": str(record.get("share_class") or "common"),
-        "status": str(record.get("status") or "__UNKNOWN__"),
+        # Only an explicitly marked KRX listed-population snapshot can prove
+        # a missing status means listed. Generic or legacy master records
+        # remain unknown rather than acquiring an inferred lifecycle state.
+        "status": str(record.get("status") or ("listed" if record.get("_listed_population") else "__UNKNOWN__")),
         "valid_from": valid_from,
         # KRX master feeds are daily snapshots, not open-ended intervals.
         # Closing an omitted interval at the snapshot instant prevents every
@@ -1759,13 +1886,17 @@ def _stream_table_worker(
             table=table,
             batch_size=batch_size,
             source_hashes=tuple(item.content_hash for item in receipts),
+            source_paths=tuple(item.source_path for item in receipts),
             schema_version=SCHEMA_VERSION,
         )
-        if not writer.has_reusable_manifest:
+        pending_hashes = writer.pending_source_hashes
+        if pending_hashes:
             count = 0
             missing_market_fields = 0
             small_daily_fingerprints: dict[tuple[Any, Any], str] = {}
             for receipt in receipts:
+                if receipt.content_hash not in pending_hashes:
+                    continue
                 available_at = receipt.retrieved_at
                 if available_at.tzinfo is None:
                     available_at = available_at.replace(tzinfo=KRX_TZ)
@@ -1838,8 +1969,11 @@ def _stream_table_worker(
                         available_at = _master_available_at(receipt=receipt, record=item)
                         if available_at > decision_time:
                             continue
+                        master_item = dict(item)
+                        if str(receipt.source_path).lower().startswith(("krx:", "normalized-provider-page:security_master")):
+                            master_item["_listed_population"] = True
                         canonical = _canonical_master_row(
-                            item,
+                            master_item,
                             available_at=available_at,
                             source_hash=source_hash,
                             fallback_session=available_at,
@@ -1973,7 +2107,7 @@ def normalize_lifecycle_events(
                     raise PITDataError("invalid lifecycle datetime") from exc
             if isinstance(moment, datetime) and moment.tzinfo is None:
                 raise PITDataError("lifecycle datetime must be timezone-aware")
-            return moment
+            return moment.astimezone(KRX_TZ)
 
         def _as_day(value: Any) -> Any:
             if value is None:
@@ -2022,6 +2156,12 @@ def normalize_lifecycle_events(
     if not rows:
         return pl.DataFrame(schema=empty_schema)
     canonical = canonicalize_lifecycle_event_rows(rows)
+    # Lifecycle is optional enrichment.  An unresolved notice without an
+    # explicit delisting date cannot satisfy the Silver primary key and must
+    # remain Bronze-only rather than inventing a date from publication time.
+    canonical = [row for row in canonical if row.get("delisting_date") is not None]
+    if not canonical:
+        return pl.DataFrame(schema=empty_schema)
     frame = pl.DataFrame(canonical, schema=empty_schema)
     return frame
 
@@ -2048,8 +2188,18 @@ def stream_normalize_stock_evidence(
     if missing:
         names = sorted(kind.value for kind in missing)
         raise PITDataError(f"missing required evidence: {', '.join(names)} (investor_flow, financial_facts)")
-    daily_selected = select_streaming_receipts(kind=EvidenceKind.DAILY_MARKET, receipts=tuple(grouped[EvidenceKind.DAILY_MARKET]))
-    master_selected = select_streaming_receipts(kind=EvidenceKind.SECURITY_MASTER, receipts=tuple(grouped[EvidenceKind.SECURITY_MASTER]))
+    daily_selected = _dedupe_duplicate_source_paths(
+        select_streaming_receipts(
+            kind=EvidenceKind.DAILY_MARKET,
+            receipts=tuple(grouped[EvidenceKind.DAILY_MARKET]),
+        )
+    )
+    master_selected = _dedupe_duplicate_source_paths(
+        select_streaming_receipts(
+            kind=EvidenceKind.SECURITY_MASTER,
+            receipts=tuple(grouped[EvidenceKind.SECURITY_MASTER]),
+        )
+    )
     selected_streaming: dict[EvidenceKind, list[BronzeReceipt]] = {
         EvidenceKind.DAILY_MARKET: list(order_streaming_receipts(table=SilverTable.DAILY_MARKET, receipts=tuple(daily_selected))),
         EvidenceKind.SECURITY_MASTER: list(order_streaming_receipts(table=SilverTable.SECURITY_MASTER, receipts=tuple(master_selected))),
@@ -2201,7 +2351,10 @@ def stream_normalize_stock_evidence(
     # Corporate-action coverage validation runs on assembled Silver frames
     # before any persistence or Gold/universe artifact creation.
     from src.data.backtest_sessions import BacktestMarketInputsPolicy as _StreamPolicy  # pragma: no cover
-    from src.data.backtest_sessions import validate_corporate_action_coverage  # pragma: no cover
+    from src.data.backtest_sessions import (
+        resolve_backtest_corporate_action_evidence,  # pragma: no cover
+        validate_corporate_action_coverage,  # pragma: no cover
+    )
 
     _cal_frame = tables.get(SilverTable.CALENDAR)  # pragma: no cover
     _cal_sessions_stream = tuple(sorted(_cal_frame["session"].to_list())) if _cal_frame is not None and _cal_frame.height > 0 else ()  # pragma: no cover
@@ -2237,7 +2390,26 @@ def stream_normalize_stock_evidence(
         def decision_time_of(_sess: datetime) -> datetime:
             return datetime.combine(_sess.astimezone(_KRXTZ).date(), _dtime(15, 30), tzinfo=_KRXTZ)
 
-        _coverage = validate_corporate_action_coverage(daily_market=daily_market, corporate_actions=corporate_actions, calendar=calendar, decision_time_of=decision_time_of, policy=_StreamPolicy())
+        _resolution = resolve_backtest_corporate_action_evidence(  # pragma: no cover
+            daily_market=daily_market,
+            corporate_actions=corporate_actions,
+            calendar=calendar,
+            policy=_StreamPolicy(),
+        )
+        if _resolution.quarantine_sessions_by_instrument:  # pragma: no cover
+            # The resolver has already identified and quarantined every
+            # unexplained discontinuity.  Re-running a shift-based jump scan
+            # on the gapped eligible frame would manufacture a second jump at
+            # the quarantine boundary.
+            _coverage = None
+        else:  # pragma: no cover
+            _coverage = validate_corporate_action_coverage(
+                daily_market=_resolution.eligible_daily_market,
+                corporate_actions=_resolution.verified_corporate_actions,
+                calendar=calendar,
+                decision_time_of=decision_time_of,
+                policy=_StreamPolicy(),
+            )
         _ = _coverage
     # Wiring contract literals:
     # resolve_opendart_corporate_action_records(pages=corporate_action_pages, daily_market=daily_market, calendar=calendar)
@@ -2271,7 +2443,18 @@ def stream_normalize_stock_evidence(
         if table in _STREAM_TABLES:
             continue
         dataset_id = canonical_content_hash(frame, frame.columns)
-        if not (Path(silver_root) / table.value / dataset_id).exists():
+        existing = Path(silver_root) / table.value / dataset_id
+        needs_publish = not existing.exists()
+        if existing.exists():
+            try:
+                from src.storage.parquet_datasets import ParquetDatasetStore
+
+                existing_manifest = ParquetDatasetStore(Path(silver_root) / table.value).read_manifest(dataset_id)
+                existing_end = getattr(existing_manifest, "time_end", None)
+                needs_publish = not isinstance(existing_end, datetime) or existing_end.date() < report.coverage_end
+            except (FileNotFoundError, OSError, ValueError):
+                needs_publish = True
+        if needs_publish:
             small_tables[table] = frame
     if small_tables:
         store.materialize_all(small_tables, report=report, decision_time=decision_time)
