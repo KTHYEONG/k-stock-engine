@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "DATA_PROVENANCE_ANNUAL_20260911",
+      "date": "2026-09-11",
+      "adr_id": "ADR_20260911_DATA_PROVENANCE_ANNUAL_20260911",
+      "domain": "data",
+      "title": "Fixture-free Silver and annual Gold backtest pipeline",
+      "why": "Fixture Silver를 활성 연구 경로에서 분리하고 2018-2026 연도별 Gold 및 백테스트 산출물을 재현 가능하게 정리해야 했다.",
+      "resolution": "실제 KRX·KIS·DART 기반 provenance Silver 후보를 만들고 원천 부재를 명시적으로 기록했으며 2018-2026 Gold를 materialize하고 2018-2023 백테스트를 완료했다.",
+      "impact": "fixture_tables 0인 Silver 후보와 연도별 Gold가 남고 2024-2026 백테스트는 재개 가능한 상태로 기록된다."
+    },
+    {
       "task_id": "TASK_GOLD_ELIGIBILITY_DATA_BLOCKERS",
       "date": "2026-09-11",
       "adr_id": "ADR_20260911_GOLD_ELIGIBILITY_DATA_BLOCKERS",

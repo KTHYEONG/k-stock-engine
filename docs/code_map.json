@@ -118,6 +118,9 @@
   "src/data/pipeline.py": {
     "testing": "tests/unit/data/test_pipeline.py"
   },
+  "src/data/provenance_audit.py": {
+    "testing": "tests/unit/data/test_provenance_audit.py"
+  },
   "src/data/replay.py": {
     "testing": "tests/unit/data/test_replay.py"
   },
