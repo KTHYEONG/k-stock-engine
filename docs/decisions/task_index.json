@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_INVESTOR_FLOW_PROVIDER_ROUTING",
+      "date": "2026-09-11",
+      "adr_id": "ADR_20260911_INVESTOR_FLOW_PROVIDER_ROUTING",
+      "domain": "data_backtest",
+      "title": "Investor flow provider routing",
+      "why": "KIS investor-flow records conflicted with accepted LS/Kiwoom evidence and LS error handling was overly broad.",
+      "resolution": "Route LS as primary with Kiwoom fallback, ignore KIS when an accepted provider covers the key, fail closed for unsupported-only keys, and narrow LS exception handling.",
+      "impact": "Investor-flow normalization now preserves verified accepted-provider data while preventing unsupported or incomplete records from entering Silver."
+    },
+    {
       "task_id": "successor_instrument_lifecycle",
       "date": "2026-09-10",
       "adr_id": "ADR_20260910_successor_instrument_lifecycle",
