@@ -61,35 +61,38 @@ Focus on: *Is the hypothesis sound? What does the real data/runtime look like? W
 
 ## Chat Output Format
 
-Keep chat response structured, scannable, and evidence-focused using progressive disclosure. Avoid narrative walls of text.
-**Language Requirement:** All instructions and template fields below are written in English, but the actual rendered chat response to the user MUST be translated and presented in Korean (한국어).
+Keep chat response ultra-compact, scannable, and evidence-focused. Strictly avoid conversational prose and narrative walls of text.
+Detailed logs, benchmark payloads, and raw traces MUST be dumped to `scratch/probe_<topic>.json` and referenced via link, not pasted into chat.
 
-### 🔬 [PROBE] <Feature/Topic Title>
+**Output Directives:**
+- **Terminal-Safe Tables**: Never put multiline descriptions or long code snippets inside Markdown tables. Keep columns short (`검증 항목 / 대상`, `실증 측정치 / 근거`, `판정`).
+- **Concise Bullet Points**: Use concise, telegraphic bullets (명사형/종결형 축약, 최대 1-2줄).
+- **Zero Redundancy**: Do not repeat explanations across Summary, Matrix, and Traps.
+- **Language Requirement**: All output rendered to the user MUST be written in Korean (한국어). Template titles and labels below MUST be presented in Korean as shown.
 
-#### 1. Executive Summary
-- 🎯 **Core Problem & Findings**: <Key issue and empirical defect discovered>
-- 🏗️ **Chosen Architecture**: <Selected design approach and scope isolation>
-- ⚖️ **Key Trade-off & Rationale**: <Reason for choosing this approach over alternatives>
+---
 
-#### 2. Empirical Benchmarks & Verification Matrix
-- **Artifacts**: `scratch/probe_<topic>.py` · `scratch/probe_<topic>.json`
+### 🔬 [PROBE] <기능/토픽 제목>
 
-| Verification Item | Empirical Measurement / Metric | Impact & Verdict |
+#### 1. 판정 요약 (Triage)
+- 🎯 **핵심 결론**: <발견된 근본 원인 및 채택 방향 1줄 요약>
+- 📦 **작업 범위**: <포함 대상 및 제외/백로그 대상 명시>
+
+#### 2. 실증 검증 매트릭스 (Empirical Matrix)
+> 📁 상세 로그/페이로드: [`scratch/probe_<topic>.json`](file:///scratch/probe_<topic>.json)
+
+| 검증 항목 / 대상 | 실증 측정치 / 근거 | 판정 (Verdict) |
 | :--- | :--- | :--- |
-| **<Verification Item>** | `<Observed metric / numbers>` | `<Impact or decision: Validated / Rejected>` |
+| `<모듈 or 이슈>` | `<측정값, 실패 라인, exit code 등 컴팩트한 근거>` | `CONFIRMED / REJECTED / BUG` |
 
-#### 3. Architecture & Core Invariants
-- 🛡️ **<Invariant / Rule>** (<Fail-Closed / Boundary>): <Condition and behavior>
-- 🧩 **<State & Schema Boundary>**: <Identity key, immutable vs updated fields>
+#### 3. 핵심 불변식 (Invariants & Boundaries)
+- 🛡️ **<INV-NAME>**: <Fail-Closed 조건 또는 경계 규칙 1줄 요약>
+- 🧩 **<STATE-RULE>**: <상태 전이 또는 스키마 규약 1줄 요약>
 
-#### 4. Implementation Traps & Downstream Risks
-*Highlight critical risks, PIT integrity leaks, or runtime traps using relevant alert callouts ([!CRITICAL], [!WARNING], or [!NOTE]) as applicable.*
-
-> [!WARNING]
-> **<Trap / Risk Title>**: <Specific risk description, failure mode, or implementation caution>
+#### 4. 구현 함정 및 주의사항 (Traps)
+*필요한 경우에만 최대 2개 이하의 콜아웃 박스 사용. 요약/매트릭스에 적은 내용 중복 금지.*
+> [!CRITICAL]
+> **<핵심 위험/주의 제목>**: <구현 시 주의점 또는 회귀 경고 1줄 요약>
 
 ---
 👉 다음 단계: `/spec --feature <feature_name> --domain <domain>`
-
-
-
