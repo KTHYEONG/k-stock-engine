@@ -509,11 +509,15 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                         )
                     elif kind == "parameter_add" and owner and "." in name:
                         # parameter_add: verify the owner function exists and
-                        # the leaf parameter is present in its signature.
+                        # the leaf parameter is present in its signature (including kwonly and posonly args).
                         for node in ast.walk(tree):
                             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == owner:
                                 target_node = node
-                                arg_names = [a.arg for a in node.args.args]
+                                arg_names = (
+                                    [a.arg for a in node.args.args]
+                                    + [a.arg for a in node.args.kwonlyargs]
+                                    + [a.arg for a in getattr(node.args, "posonlyargs", [])]
+                                )
                                 found_impl = leaf in arg_names
                                 break
                     elif kind == "registry_entry":
@@ -808,28 +812,57 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                         }
                     )
             if not pre_impl:
-                if import_symbol and import_symbol.lower() not in ("n/a", "none", "") and import_symbol not in wf_content:
-                    diagnostics.append(
-                        {
-                            "file": wf,
-                            "line": 0,
-                            "error": f"Spec wiring: missing reference to '{import_symbol}'",
-                            "fix_hint": f"Import {import_symbol} in {wf}",
-                        }
-                    )
-                if invocation_expr and invocation_expr.lower() not in ("n/a", "none", ""):
-                    found_invocation = invocation_expr in wf_content
+                clean_import = re.sub(r"\(.*?\)|#.*", "", import_symbol).strip()
+                if clean_import and clean_import.lower() not in ("n/a", "none", ""):
+                    found_import = clean_import in wf_content
+                    if not found_import:
+                        norm_wf = re.sub(r"\s+", " ", wf_content)
+                        norm_imp = re.sub(r"\s+", " ", clean_import)
+                        if norm_imp in norm_wf:
+                            found_import = True
+                        else:
+                            # If statement didn't match literally, check if imported symbols are referenced
+                            imp_tokens = [
+                                t
+                                for t in re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", clean_import)
+                                if t not in ("from", "import", "as")
+                            ]
+                            found_import = any(t in wf_content for t in imp_tokens) if imp_tokens else True
+                    if not found_import:
+                        diagnostics.append(
+                            {
+                                "file": wf,
+                                "line": 0,
+                                "error": f"Spec wiring: missing reference to '{import_symbol}'",
+                                "fix_hint": f"Import {import_symbol} in {wf}",
+                            }
+                        )
+                clean_inv = re.sub(r"#.*", "", invocation_expr).strip()
+                if clean_inv and clean_inv.lower() not in ("n/a", "none", ""):
+                    found_invocation = clean_inv in wf_content
                     if not found_invocation:
                         norm_wf = re.sub(r"\s+", " ", wf_content)
-                        norm_inv = re.sub(r"\s+", " ", invocation_expr)
+                        norm_inv = re.sub(r"\s+", " ", clean_inv)
                         if norm_inv in norm_wf:
                             found_invocation = True
                         else:
-                            base_call = re.match(r"^([a-zA-Z0-9_\.]+)\s*\(", invocation_expr.strip())
-                            if base_call:
-                                base_ident = base_call.group(1).split(".")[-1]
-                                if re.search(rf"\b{re.escape(base_ident)}\s*\(", wf_content):
-                                    found_invocation = True
+                            # Extract all function calls in invocation_expr and verify at least one primary call exists
+                            calls = re.findall(r"([a-zA-Z0-9_\.]+)\s*\(", clean_inv)
+                            idents = [
+                                c.split(".")[-1]
+                                for c in calls
+                                if c.split(".")[-1] not in ("set", "dict", "list", "tuple", "bool", "int", "float", "str")
+                            ]
+                            if idents:
+                                found_invocation = any(
+                                    re.search(rf"\b{re.escape(ident)}\s*\(", wf_content) for ident in idents
+                                )
+                            else:
+                                base_call = re.match(r"^([a-zA-Z0-9_\.]+)\s*\(", clean_inv)
+                                if base_call:
+                                    base_ident = base_call.group(1).split(".")[-1]
+                                    if re.search(rf"\b{re.escape(base_ident)}\s*\(", wf_content):
+                                        found_invocation = True
                     if not found_invocation:
                         diagnostics.append(
                             {

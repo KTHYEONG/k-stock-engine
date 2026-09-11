@@ -31,6 +31,7 @@ Downstream `implement` models have low reasoning capacity and cannot extrapolate
    - `context_files`: Minimal prerequisite paths for zero-search context loading.
    - `changes` (or `symbols`): Array of `{ name, signature, kind, target_file }`.
    - `wiring`: Array of `{ caller_file, anchor, import_symbol, invocation_expression }` ensuring entry-point hookup.
+     - Keep `import_symbol` and `invocation_expression` syntactically valid Python code or clean identifier calls. Do NOT attach conversational or parenthetical annotations (e.g. avoid `(same module)` or `(function-local)`); put such notes in `requirements` or docstrings.
    - `requirements`: Explicit fail-closed boundary rules, invariant constraints, and complexity requirements.
    - `design_rationale`: `{ alternatives_considered, chosen_reason, failure_modes }` — carry over directly from `/probe` (`scratch/probe_<feature>.json`).
    - `performance_budget` (required when `target_file` touches backtesting, ML training, or bulk data I/O): `{ expected_data_scale, memory_target_mb, storage_format, dtype_precision, chunking_strategy, acceleration_candidate }` — carry over from `scratch/probe_<feature>.json` if present.
