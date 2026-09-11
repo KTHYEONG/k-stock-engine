@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, time
 from pathlib import Path
@@ -27,6 +28,16 @@ _REQUIRED_XBRL_FACTS: tuple[str, ...] = (
 )
 
 _DART_MAPPING_VERSION = "dart-fact-map-v1"
+
+
+def _raw_isin(record: Mapping[str, Any]) -> str | None:
+    for name in ("source_security_id", "security_id", "ISU_CD", "isu_cd"):
+        value = record.get(name)
+        if value not in (None, ""):
+            candidate = str(value).strip().upper()
+            if re.fullmatch(r"KR[A-Z0-9]{10}", candidate):
+                return candidate
+    return None
 
 
 def normalize_dart_financial_facts(
@@ -316,6 +327,57 @@ def normalize_corporate_action_records(*, action_records: Sequence[Mapping[str, 
     )
 
 
+def select_verified_investor_flow_records(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Accept LS/KIWOOM evidence only; deterministic LS win on equal overlap."""
+    _fields = ("foreign_buy_value", "foreign_sell_value", "foreign_net_value", "institution_net_value", "retail_net_value")
+    grouped: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    unsupported_keys: set[tuple[str, str]] = set()
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise PITDataError("unsupported investor-flow provider record; certification blocked")
+        raw_provider = record.get("_source_provider")
+        if raw_provider is None or str(raw_provider).strip() == "":
+            raise PITDataError("unsupported investor-flow provider missing; certification blocked")
+        provider = str(raw_provider).strip().upper()
+        if provider not in ("LS", "KIWOOM"):
+            session = str(record.get("session") or "").strip()
+            ticker = str(record.get("ticker") or record.get("instrument_id") or "").strip()
+            if session and ticker:
+                unsupported_keys.add((session, ticker))
+            continue
+        session = str(record.get("session") or "").strip()
+        ticker = str(record.get("ticker") or record.get("instrument_id") or "").strip()
+        if not session or not ticker:
+            raise PITDataError("investor flow record missing session/ticker; certification blocked")
+        grouped.setdefault((session, ticker), []).append(record)
+    unsupported_only = sorted(unsupported_keys.difference(grouped))
+    if unsupported_only:
+        raise PITDataError(
+            f"unsupported investor-flow provider for key {unsupported_only[0]!r}; certification blocked"
+        )
+    verified: list[dict[str, Any]] = []
+    for key in sorted(grouped):
+        candidates = grouped[key]
+        values: list[tuple[float, ...]] = []
+        for candidate in candidates:
+            try:
+                values.append(tuple(float(candidate[field]) for field in _fields))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise PITDataError(f"conflicting investor_flow primary key {key!r}; certification blocked") from exc
+        first = values[0]
+        if any(value != first for value in values[1:]):
+            raise PITDataError(f"conflicting investor_flow primary key {key!r}; certification blocked")
+        chosen = None
+        for candidate in candidates:
+            if str(candidate.get("_source_provider")).strip().upper() == "LS":
+                chosen = candidate
+                break
+        if chosen is None:
+            chosen = candidates[0]
+        verified.append(dict(chosen))
+    return verified
+
+
 def normalize_stock_evidence(
     receipts: Mapping[EvidenceKind, BronzeReceipt],
     *,
@@ -400,7 +462,7 @@ def normalize_stock_evidence(
             valid_from = datetime.combine(valid_from.date(), time(9, 0), tzinfo=KRX_TZ)
         seen_master.add(key)
         kind_name = str(rec.get("KIND_STKCERT_TP_NM") or "")
-        master_rows.append({"instrument_id": instrument_id, "ticker": ticker, "company_id": str(rec.get("company_id") or rec.get("corp_code") or ticker), "market": str(_required_value(rec, "market", "MKT_TP_NM")), "sector": str(rec.get("sector") or rec.get("sector_name") or "__UNKNOWN__"), "listing_date": valid_from, "delisting_date": rec.get("delisting_date") or rec.get("delisted_on"), "share_class": str(rec.get("share_class") or ("common" if kind_name == "보통주" or bool(rec.get("is_common_stock")) else "other")), "status": str(rec.get("status") or "listed"), "valid_from": valid_from, "valid_to": rec.get("valid_to") or valid_from, "available_at": _avail(EvidenceKind.SECURITY_MASTER), "source_hash": _hash(EvidenceKind.SECURITY_MASTER)})
+        master_rows.append({"instrument_id": instrument_id, "ticker": ticker, "source_security_id": _raw_isin(rec), "company_id": str(rec.get("company_id") or rec.get("corp_code") or ticker), "market": str(_required_value(rec, "market", "MKT_TP_NM")), "sector": str(rec.get("sector") or rec.get("sector_name") or "__UNKNOWN__"), "listing_date": valid_from, "delisting_date": rec.get("delisting_date") or rec.get("delisted_on"), "share_class": str(rec.get("share_class") or ("common" if kind_name == "보통주" or bool(rec.get("is_common_stock")) else "other")), "status": str(rec.get("status") or "listed"), "valid_from": valid_from, "valid_to": rec.get("valid_to") or valid_from, "available_at": _avail(EvidenceKind.SECURITY_MASTER), "source_hash": _hash(EvidenceKind.SECURITY_MASTER)})
     if SilverTable.SECURITY_MASTER not in streamed_tables:
         tables[SilverTable.SECURITY_MASTER] = pl.DataFrame(master_rows)
 
@@ -409,7 +471,7 @@ def normalize_stock_evidence(
         tables[SilverTable.DAILY_MARKET] = pl.DataFrame(
             {column: pl.Series([], dtype=pl.String) for column in (
                 "session", "instrument_id", "open", "high", "low", "close", "volume",
-                "trading_value", "market_cap", "shares_outstanding", "available_at", "source_hash"
+                "trading_value", "market_cap", "shares_outstanding", "source_security_id", "available_at", "source_hash"
             )}
         )
         market_records = []
@@ -428,7 +490,7 @@ def normalize_stock_evidence(
             c = float(_required_value(rec, "close", "close_price"))
             h = max(h, o, c)
             low = min(low, o, c)
-            market_rows.append({"session": sess, "instrument_id": f"KRX:{ticker}", "open": o, "high": h, "low": low, "close": c, "volume": float(_required_value(rec, "volume", "trdvol")), "trading_value": float(_required_value(rec, "trading_value", "trdval")), "market_cap": float(_required_value(rec, "market_cap", "marcap")), "shares_outstanding": float(_required_value(rec, "shares_outstanding", "list_shrs")), "available_at": _avail(EvidenceKind.DAILY_MARKET), "source_hash": _hash(EvidenceKind.DAILY_MARKET)})
+            market_rows.append({"session": sess, "instrument_id": f"KRX:{ticker}", "open": o, "high": h, "low": low, "close": c, "volume": float(_required_value(rec, "volume", "trdvol")), "trading_value": float(_required_value(rec, "trading_value", "trdval")), "market_cap": float(_required_value(rec, "market_cap", "marcap")), "shares_outstanding": float(_required_value(rec, "shares_outstanding", "list_shrs")), "source_security_id": _raw_isin(rec), "available_at": _avail(EvidenceKind.DAILY_MARKET), "source_hash": _hash(EvidenceKind.DAILY_MARKET)})
     if SilverTable.DAILY_MARKET not in streamed_tables:
         tables[SilverTable.DAILY_MARKET] = pl.DataFrame(market_rows)
 
@@ -437,13 +499,26 @@ def normalize_stock_evidence(
     if not flow_records:
         raise PITDataError("KRX investor-flow response is empty; certification blocked (investor_flow, financial_facts)")
     flow_rows: list[dict[str, Any]] = []
-    flow_fingerprints: dict[tuple[datetime, str], str] = {}
-    for rec in flow_records:
+    from src.data.streaming_normalization import historical_available_at
+
+    flow_calendar = SessionCalendar(tuple(cal_sessions))
+    verified_flow_records = select_verified_investor_flow_records(flow_records)
+    for rec in verified_flow_records:
         sess = _as_aware(rec.get("session") or cal_sessions[0], cal_sessions[0])
         ticker = str(_required_value(rec, "ticker", "instrument_id")).strip()
         buy = float(_required_value(rec, "foreign_buy_value", "frg_buy"))
         sell = float(_required_value(rec, "foreign_sell_value", "frg_sell"))
         instrument_id = f"KRX:{ticker}" if not ticker.startswith("KRX:") else ticker
+        try:
+            flow_available_at = historical_available_at(
+                kind=EvidenceKind.INVESTOR_FLOW,
+                record=rec,
+                calendar=flow_calendar,
+            )
+        except PITDataError:
+            # The final covered session has no later certified opening yet;
+            # it remains Bronze evidence until the calendar advances.
+            continue
         row = {
             "session": sess,
             "instrument_id": instrument_id,
@@ -452,19 +527,9 @@ def normalize_stock_evidence(
             "foreign_net_value": float(_required_value(rec, "foreign_net_value")),
             "institution_net_value": float(_required_value(rec, "institution_net_value", "inst_net")),
             "retail_net_value": float(_required_value(rec, "retail_net_value", "retail_net")),
-            "available_at": _avail(EvidenceKind.INVESTOR_FLOW),
+            "available_at": flow_available_at,
             "source_hash": _hash(EvidenceKind.INVESTOR_FLOW),
         }
-        flow_key = (sess, instrument_id)
-        fingerprint = hashlib.sha256(
-            json.dumps({k: v for k, v in row.items() if k not in {"available_at", "source_hash"}}, sort_keys=True, default=str).encode("utf-8")
-        ).hexdigest()
-        previous = flow_fingerprints.get(flow_key)
-        if previous == fingerprint:
-            continue
-        if previous is not None:
-            raise PITDataError(f"conflicting investor_flow primary key {flow_key!r}; certification blocked")
-        flow_fingerprints[flow_key] = fingerprint
         flow_rows.append(row)
     tables[SilverTable.INVESTOR_FLOW] = pl.DataFrame(flow_rows)
 
@@ -494,10 +559,10 @@ def normalize_stock_evidence(
                 default=str,
             ).encode("utf-8")
         ).hexdigest()
-        previous = disclosure_fingerprints.get(disclosure_key)
-        if previous == fingerprint:
+        previous_disclosure = disclosure_fingerprints.get(disclosure_key)
+        if previous_disclosure == fingerprint:
             continue
-        if previous is not None:
+        if previous_disclosure is not None:
             raise PITDataError(f"conflicting disclosures primary key {disclosure_key!r}; certification blocked")
         disclosure_fingerprints[disclosure_key] = fingerprint
         disc_rows.append(row)
@@ -547,11 +612,11 @@ def normalize_stock_evidence(
     tables[SilverTable.HISTORICAL_COSTS] = pl.DataFrame([{"market": "KOSPI", "effective_date": cal_sessions[0], "cost_kind": "commission", "rule_id": "rule1", "value": cost_val, "available_at": _avail(EvidenceKind.HISTORICAL_COSTS), "source_hash": _hash(EvidenceKind.HISTORICAL_COSTS)}])
 
     if calendar is not None:
-        cov_start = min(s.astimezone(UTC).date() for s in calendar.sessions)
-        cov_end = max(s.astimezone(UTC).date() for s in calendar.sessions)
+        cov_start = min(s.astimezone(KRX_TZ).date() for s in calendar.sessions)
+        cov_end = max(s.astimezone(KRX_TZ).date() for s in calendar.sessions)
     else:
-        cov_start = min(s.astimezone(UTC).date() for s in cal_sessions)
-        cov_end = max(s.astimezone(UTC).date() for s in cal_sessions)
+        cov_start = min(s.astimezone(KRX_TZ).date() for s in cal_sessions)
+        cov_end = max(s.astimezone(KRX_TZ).date() for s in cal_sessions)
     report = certify_silver(
         tables=tables,
         receipts=receipts,

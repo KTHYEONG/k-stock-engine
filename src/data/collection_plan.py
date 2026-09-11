@@ -7,13 +7,15 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 from src.data.schemas import EvidenceKind, PITDataError
 from src.strategy.universe import UniverseDecision
 
 PLAN_ARTIFACT_DIR = Path("data/artifacts/collection-plans")
 CHECKPOINT_ARTIFACT_DIR = Path("data/artifacts/collection-checkpoints")
+
+LS_MAX_SESSIONS_PER_REQUEST: Final[int] = 700
 
 
 def _redact_message(message: str) -> str:
@@ -224,7 +226,7 @@ def build_historical_collection_plan_from_bronze(
     bronze_root: Path | str,
     start: date,
     end: date,
-    chunk_size: int = 20,
+    chunk_size: int = LS_MAX_SESSIONS_PER_REQUEST,
     symbols: tuple[str, ...] | None = None,
     artifact_root: Path | str | None = None,
 ) -> HistoricalCollectionPlan:

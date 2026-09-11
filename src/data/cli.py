@@ -17,6 +17,7 @@ from src.data.backtest_sessions import BacktestMarketInputsPolicy, build_backtes
 from src.data.bronze import BronzeStore, import_retained_stock_evidence, migrate_retained_stock_evidence
 from src.data.collection import collect_dart_disclosures, collect_dart_financial_facts, collect_planned_investor_flow
 from src.data.collection_plan import (
+    LS_MAX_SESSIONS_PER_REQUEST,
     CollectionCheckpointStore,
     CollectionReadinessReport,
     build_historical_collection_plan,
@@ -29,6 +30,7 @@ from src.data.pipeline import materialize_backtest_inputs
 from src.data.schemas import PITDataError, SilverTable
 from src.data.silver import load_latest_silver_market_scan, load_latest_silver_table
 from src.data.streaming_normalization import refresh_corporate_action_silver
+from src.integrations.investor_flow_router import resolve_investor_flow_collector
 from src.strategy.champion_strategy import ChampionStrategy
 from src.strategy.core_strategy import CoreStrategy
 
@@ -53,6 +55,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p_col.add_argument("--retrieved-at", type=str, required=False, default=None)
     p_col.add_argument("--plan-id", type=str, required=True)
     p_col.add_argument("--checkpoint-root", type=Path, default=Path("data/artifacts/collection-checkpoints"))
+    p_col.add_argument("--investor-flow-provider", choices=("ls", "kiwoom"), default="ls")
 
     p_dart = sub.add_parser("collect-dart-facts", help="Collect periodic OpenDART full statements from retained disclosures")
     p_dart.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
@@ -155,6 +158,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p_rebuild.add_argument("--certification-time", type=str, required=True)
     p_rebuild.add_argument("--resume", action="store_true", default=True)
     p_rebuild.add_argument("--no-resume", dest="resume", action="store_false")
+    p_rebuild.add_argument("--investor-flow-provider", choices=("ls", "kiwoom"), default="ls")
 
     p_kis_probe = sub.add_parser("probe-kis-flow", help="Verify one historical KIS investor-flow session")
     p_kis_probe.add_argument("--symbol", type=str, required=True)
@@ -167,7 +171,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p_plan.add_argument("--coverage-end", type=str, required=True)
     p_plan.add_argument("--symbols", type=str, required=False, default=None)
     p_plan.add_argument("--sessions", type=str, required=False, default=None)
-    p_plan.add_argument("--chunk-size", type=int, default=30)
+    p_plan.add_argument("--chunk-size", type=int, default=LS_MAX_SESSIONS_PER_REQUEST)
 
     p_resume = sub.add_parser("resume", help="Resume collection from checkpoints")
     p_resume.add_argument("--plan-id", type=str, required=True)
@@ -825,13 +829,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "collect":
         try:
-            from src.integrations.kis.investor_flow import KisInvestorFlowCollector
-
             plan = load_collection_plan(str(args.plan_id))
-            collector = KisInvestorFlowCollector(tuple(sorted({chunk.symbol for chunk in plan.chunks})))
+            collect_symbols = tuple(sorted({chunk.symbol for chunk in plan.chunks}))
+            collector = resolve_investor_flow_collector(str(args.investor_flow_provider), collect_symbols)
             collection = collect_planned_investor_flow(
                 plan=plan,
-                kis=collector,
+                provider=str(args.investor_flow_provider),
+                collector=collector,
                 bronze_root=Path(args.bronze_root),
                 retrieved_at=_parse_dt(args.retrieved_at),
                 checkpoint_store=CollectionCheckpointStore(Path(args.checkpoint_root)),
@@ -1085,10 +1089,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             quota_store = ProviderQuotaStateStore(Path(args.artifact_root) / "quota")
             krx_collector = KrxHistoricalCollector(quota_store=quota_store)
             dart_collector = DartXbrlCollector()
-            kis_symbols: tuple[str, ...]
+            flow_symbols: tuple[str, ...]
             try:
                 master = _load_silver_table(Path(args.silver_root), SilverTable.SECURITY_MASTER)
-                kis_symbols = (
+                flow_symbols = (
                     tuple(
                         sorted(
                             {
@@ -1102,10 +1106,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     else ()
                 )
             except (FileNotFoundError, ValueError, PITDataError):
-                kis_symbols = ()
-            if not kis_symbols:
-                raise PITDataError("rebuild-data requires a certified KRX security master for KIS symbol planning")
-            kis_collector = KisInvestorFlowCollector(kis_symbols)
+                flow_symbols = ()
+            if not flow_symbols:
+                raise PITDataError("rebuild-data requires a certified KRX security master for investor flow symbol planning")
+            flow_collector = resolve_investor_flow_collector(str(args.investor_flow_provider), flow_symbols)
             pipeline_request = HistoricalDataPipelineRequest(
                 data_root=Path(args.data_root),
                 bronze_root=Path(args.bronze_root),
@@ -1116,9 +1120,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 validation_end=date.fromisoformat(str(args.validation_end)),
                 certification_time=_parse_dt(args.certification_time),
                 resume=bool(args.resume),
+                investor_flow_provider=str(args.investor_flow_provider),
             )
             pipeline_result = run_historical_data_pipeline(
-                pipeline_request, krx=krx_collector, kis=kis_collector, dart=dart_collector,
+                pipeline_request, krx=krx_collector, investor_flow=flow_collector, dart=dart_collector,
             )
             _emit({"plan_id": pipeline_result.plan_id, "certifiable": pipeline_result.certifiable, "result_path": str(pipeline_result.result_path)})
         except (PITDataError, ValueError, OSError):

@@ -46,6 +46,7 @@ class KisInvestorFlowCollector:
             {
                 "session": self._session(row.get("stck_bsop_date")).isoformat(),
                 "ticker": symbol,
+                "_source_provider": "KIS",
                 "foreign_buy_value": self._value(row, "frgn_shnu_tr_pbmn"),
                 "foreign_sell_value": self._value(row, "frgn_seln_tr_pbmn"),
                 "foreign_net_value": self._value(row, "frgn_ntby_tr_pbmn"),

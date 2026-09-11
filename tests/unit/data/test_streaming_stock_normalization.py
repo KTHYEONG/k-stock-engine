@@ -172,6 +172,25 @@ def test_streaming_normalization_parses_comma_formatted_krx_capitalisation() -> 
     assert row['shares_outstanding'] == 900.0
 
 
+def test_streaming_normalization_preserves_krx_isin_as_source_security_id() -> None:
+    from datetime import UTC, datetime
+
+    from src.data.streaming_normalization import _canonical_daily_row
+
+    row = _canonical_daily_row(
+        {
+            'BAS_DD': '20160104', 'ISU_CD': 'KR7000020000', 'ISU_SRT_CD': '000020',
+            'TDD_OPNPRC': '10', 'TDD_HGPRC': '12', 'TDD_LWPRC': '9',
+            'TDD_CLSPRC': '11', 'ACC_TRDVOL': '100', 'ACC_TRDVAL': '1,100',
+            'MKTCAP': '10,000', 'LIST_SHRS': '900',
+        },
+        available_at=datetime(2016, 1, 5, tzinfo=UTC),
+        source_hash='a',
+    )
+
+    assert row['source_security_id'] == 'KR7000020000'
+
+
 def test_streaming_normalization_carries_close_for_untouched_krx_session() -> None:
     from datetime import UTC, datetime
 
@@ -961,6 +980,64 @@ def test_streaming_writer_reuses_digest_checked_sealed_month_only(tmp_path) -> N
     assert changed.has_reusable_manifest is False
 
 
+def test_streaming_writer_reuses_prior_months_for_append_only_receipts(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    from src.data.schemas import SilverTable
+    from src.data.streaming_normalization import StreamingSilverWriter
+
+    def row(stamp: datetime, symbol: str) -> dict[str, object]:
+        return {
+            'session': stamp,
+            'instrument_id': symbol,
+            'open': 1.0,
+            'high': 1.0,
+            'low': 1.0,
+            'close': 1.0,
+            'volume': 1.0,
+            'trading_value': 1.0,
+            'market_cap': 1.0,
+            'shares_outstanding': 1.0,
+            'available_at': stamp,
+            'source_hash': 'source',
+        }
+
+    root = tmp_path / 'staging'
+    first = StreamingSilverWriter(
+        root,
+        table=SilverTable.DAILY_MARKET,
+        batch_size=1,
+        source_hashes=('old',),
+        source_paths=('krx:daily-market:2020-01-02',),
+    )
+    first.append(month='2020-01', row=row(datetime(2020, 1, 2, tzinfo=UTC), 'KRX:000001'))
+    first.close()
+
+    resumed = StreamingSilverWriter(
+        root,
+        table=SilverTable.DAILY_MARKET,
+        batch_size=1,
+        source_hashes=('old', 'new'),
+        source_paths=('krx:daily-market:2020-01-02', 'krx:daily-market:2020-02-03'),
+    )
+    assert resumed.has_reusable_manifest is True
+    assert resumed.pending_source_hashes == frozenset({'new'})
+    resumed.append(month='2020-02', row=row(datetime(2020, 2, 3, tzinfo=UTC), 'KRX:000002'))
+    manifest = resumed.close()
+
+    assert manifest['months'] == ['2020-01', '2020-02']
+
+    correction = StreamingSilverWriter(
+        root,
+        table=SilverTable.DAILY_MARKET,
+        batch_size=1,
+        source_hashes=('old', 'correction'),
+        source_paths=('krx:daily-market:2020-01-02', 'krx:daily-market:2020-01-03'),
+    )
+    assert correction.has_reusable_manifest is False
+    assert correction.pending_source_hashes == frozenset({'old', 'correction'})
+
+
 def test_order_streaming_receipts_uses_small_payload_event_date_fallback(tmp_path) -> None:
     from datetime import UTC, datetime
     import json
@@ -1123,3 +1200,395 @@ def test_normalize_lifecycle_events_preserves_verified_exchange_over_generic_unr
     assert frame.item(0, 'successor_delivery_date').isoformat() == '2016-11-02'
     assert 'document_sha256' in frame.columns
     assert frame.schema['successor_allocations_json'] == pl.String
+
+
+def _flow_receipt(tmp_path, name, source_path, payload_bytes, retrieved_at):
+    from src.data.schemas import BronzeReceipt, EvidenceKind
+
+    payload_path = tmp_path / f"{name}.payload.json"
+    metadata_path = tmp_path / f"{name}.receipt.json"
+    payload_path.write_bytes(payload_bytes)
+    metadata_path.write_bytes(b"{}")
+    return BronzeReceipt(
+        kind=EvidenceKind.INVESTOR_FLOW,
+        content_hash=name.ljust(64, "0"),
+        source_path=source_path,
+        retrieved_at=retrieved_at,
+        ingested_at=retrieved_at,
+        payload_path=payload_path,
+        metadata_path=metadata_path,
+    )
+
+
+def test_dedupe_duplicate_source_paths_keeps_unique_pages_untouched(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    from src.data.streaming_normalization import _dedupe_duplicate_source_paths
+
+    moment = datetime(2020, 1, 1, tzinfo=UTC)
+    first = _flow_receipt(tmp_path, "a", "LS:frgr-itt:000020:20161229", b"{}", moment)
+    second = _flow_receipt(tmp_path, "b", "KIWOOM:ka10059:000020:20161229", b"{}", moment)
+    assert _dedupe_duplicate_source_paths((first, second)) == (first, second)
+
+
+def test_dedupe_duplicate_source_paths_filters_shadowed_warmup_pages(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    from src.data.streaming_normalization import _dedupe_duplicate_source_paths
+
+    moment = datetime(2020, 1, 1, tzinfo=UTC)
+    normalized = _flow_receipt(
+        tmp_path, "n", "normalized-provider-page:daily_market",
+        b'{"session": "2024-01-03", "records": []}', moment,
+    )
+    shadowed = _flow_receipt(tmp_path, "w1", "KRX:warmup:20240105", b"{}", moment)
+    earlier = _flow_receipt(tmp_path, "w2", "KRX:warmup:20240101", b"{}", moment)
+    result = _dedupe_duplicate_source_paths((normalized, shadowed, earlier))
+    assert [item.source_path for item in result] == [
+        "normalized-provider-page:daily_market", "KRX:warmup:20240101",
+    ]
+
+
+def test_dedupe_duplicate_source_paths_keeps_widest_retry_page(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    from src.data.streaming_normalization import _dedupe_duplicate_source_paths
+
+    moment = datetime(2020, 1, 1, tzinfo=UTC)
+    narrow = _flow_receipt(
+        tmp_path, "narrow", "KIS:flow:20240102",
+        b'{"records": [{"session": "2024-01-02"}]}', moment,
+    )
+    wide = _flow_receipt(
+        tmp_path, "wide", "KIS:flow:20240102",
+        b'{"records": [{"session": "2024-01-01"}, {"session": "2024-01-03"}]}', moment,
+    )
+    assert _dedupe_duplicate_source_paths((narrow, wide)) == (wide,)
+
+
+def test_dedupe_duplicate_source_paths_breaks_ties_by_earliest_retrieval(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    from src.data.streaming_normalization import _dedupe_duplicate_source_paths
+
+    early = _flow_receipt(
+        tmp_path, "early", "KIS:flow:20240102",
+        b'{"records": [{"session": "2024-01-02", "note": "a"}]}',
+        datetime(2020, 1, 1, tzinfo=UTC),
+    )
+    late = _flow_receipt(
+        tmp_path, "late", "KIS:flow:20240102",
+        b'{"records": [{"session": "2024-01-02", "note": "b"}]}',
+        datetime(2020, 1, 2, tzinfo=UTC),
+    )
+    assert _dedupe_duplicate_source_paths((late, early)) == (early,)
+
+
+def test_dedupe_duplicate_source_paths_reports_malformed_retry_page(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    import pytest
+
+    from src.data.schemas import PITDataError
+    from src.data.streaming_normalization import _dedupe_duplicate_source_paths
+
+    moment = datetime(2020, 1, 1, tzinfo=UTC)
+    good = _flow_receipt(
+        tmp_path, "good", "KIS:flow:20240102",
+        b'{"records": [{"session": "2024-01-02"}]}', moment,
+    )
+    broken = _flow_receipt(tmp_path, "broken", "KIS:flow:20240102", b"{}", moment)
+    broken.payload_path.write_bytes(b"not json{")
+    with pytest.raises(PITDataError, match="malformed"):
+        _dedupe_duplicate_source_paths((good, broken))
+
+
+def test_source_path_month_helpers_classify_append_only_paths() -> None:
+    from src.data.streaming_normalization import _is_append_only_source_path, _source_path_month
+
+    assert _source_path_month("KRX:warmup:20240105") == "2024-01"
+    assert _source_path_month("no-date-here") is None
+    assert _is_append_only_source_path("KRX:warmup:20240105", "2023-12") is True
+    assert _is_append_only_source_path("KRX:warmup:20240105", "2024-01") is False
+    assert _is_append_only_source_path("no-date-here", "2024-01") is False
+
+
+def test_dedupe_duplicate_source_paths_handles_mixed_unique_and_duplicate_keys(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    from src.data.streaming_normalization import _dedupe_duplicate_source_paths
+
+    moment = datetime(2020, 1, 1, tzinfo=UTC)
+    solo = _flow_receipt(tmp_path, "solo", "LS:frgr-itt:000020:20161229", b"{}", moment)
+    narrow = _flow_receipt(
+        tmp_path, "narrow2", "KIS:flow:20240102",
+        b'{"records": [{"session": "2024-01-02"}, {"note": "no-session"}, {"session": "not-a-date"}]}',
+        moment,
+    )
+    wide = _flow_receipt(
+        tmp_path, "wide2", "KIS:flow:20240102",
+        b'{"records": [{"session": "2024-01-01"}, {"session": "2024-01-03"}]}', moment,
+    )
+    assert _dedupe_duplicate_source_paths((solo, narrow, wide)) == (solo, wide)
+
+
+def test_master_available_at_prefers_retained_snapshot_date(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    from src.core.time import KRX_TZ
+    from src.data.streaming_normalization import _master_available_at
+
+    moment = datetime(2020, 1, 1, tzinfo=UTC)
+    receipt = _flow_receipt(tmp_path, "m", "retained/master_20240102.json", b"{}", moment)
+    available = _master_available_at(receipt=receipt, record={"available_time": "2099-01-01"})
+    assert available.astimezone(KRX_TZ).date().isoformat() == "2024-01-02"
+
+
+def test_normalize_lifecycle_events_returns_empty_when_no_delisting_date(tmp_path) -> None:
+    from datetime import datetime
+    import json
+
+    from src.core.time import KRX_TZ, SessionCalendar
+    from src.data.schemas import BronzeReceipt, EvidenceKind
+    from src.data.streaming_normalization import normalize_lifecycle_events
+
+    stamp = datetime(2016, 10, 21, tzinfo=KRX_TZ)
+    path = tmp_path / "nodate.json"
+    path.write_text(json.dumps({
+        "lifecycle_event_id": "evt-x", "instrument_id": "KRX:000001",
+        "source_security_id": "KR7000010000", "available_at": "2016-10-20T09:00:00+09:00",
+        "evidence_status": "unresolved", "resolution_kind": "unresolved",
+    }), encoding="utf-8")
+    receipts = (BronzeReceipt(EvidenceKind.LIFECYCLE_EVENTS, "2" * 64, "nodate", stamp, stamp, path, path),)
+    assert normalize_lifecycle_events(receipts=receipts, calendar=SessionCalendar((stamp,))).height == 0
+
+
+def test_stream_table_worker_materializes_daily_table_in_process(tmp_path) -> None:
+    import queue
+    from datetime import UTC, datetime
+
+    from src.data.schemas import BronzeReceipt, EvidenceKind, SilverTable
+    from src.data.streaming_normalization import _stream_table_worker
+
+    stamp = datetime(2024, 6, 1, tzinfo=UTC)
+    payload_path = tmp_path / "daily.payload.json"
+    payload_path.write_bytes(
+        b'{"records": [{"session": "2024-01-02", "ticker": "000020", "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1000.0, "trading_value": 100500.0, "market_cap": 1000000.0, "shares_outstanding": 10000.0}]}'
+    )
+    receipt = BronzeReceipt(
+        EvidenceKind.DAILY_MARKET, "d" * 64, "KRX:daily-market:2024-01-02",
+        stamp, stamp, payload_path, tmp_path / "daily.receipt.json",
+    )
+    results: queue.Queue = queue.Queue()
+    _stream_table_worker(
+        table=SilverTable.DAILY_MARKET, receipts=[receipt],
+        staging_root=tmp_path / "staging", decision_time=stamp,
+        batch_size=10, result_queue=results,
+    )
+    result = results.get_nowait()
+    assert result["ok"] is True
+    assert result["count"] == 1
+
+
+def test_stream_table_worker_materializes_master_table_in_process(tmp_path) -> None:
+    import queue
+    from datetime import UTC, datetime
+
+    from src.data.schemas import BronzeReceipt, EvidenceKind, SilverTable
+    from src.data.streaming_normalization import _stream_table_worker
+
+    stamp = datetime(2024, 6, 1, tzinfo=UTC)
+    payload_path = tmp_path / "master.payload.json"
+    payload_path.write_bytes(
+        b'{"records": [{"ticker": "000020", "market": "KOSPI", "listing_date": "2024-01-02"}]}'
+    )
+    receipt = BronzeReceipt(
+        EvidenceKind.SECURITY_MASTER, "e" * 64, "KRX:historical-master:2024-01-02",
+        stamp, stamp, payload_path, tmp_path / "master.receipt.json",
+    )
+    results: queue.Queue = queue.Queue()
+    _stream_table_worker(
+        table=SilverTable.SECURITY_MASTER, receipts=[receipt],
+        staging_root=tmp_path / "staging", decision_time=stamp,
+        batch_size=10, result_queue=results,
+    )
+    result = results.get_nowait()
+    assert result["ok"] is True
+    assert result["count"] == 1
+
+
+def _mocked_stream_grouped(tmp_path, stamp):
+    from datetime import UTC, datetime
+
+    from src.data.schemas import BronzeReceipt, EvidenceKind
+
+    labels = {
+        EvidenceKind.CALENDAR: "calendar:2016-01-04",
+        EvidenceKind.SECURITY_MASTER: "KRX:historical-master:2016-01-04",
+        EvidenceKind.DAILY_MARKET: "krx:daily-market:2016-01-04",
+        EvidenceKind.INVESTOR_FLOW: "LS:frgr-itt:000020:20160104",
+        EvidenceKind.FINANCIAL_FACTS: "opendart:fnltt:2016-01-04",
+        EvidenceKind.CORPORATE_ACTIONS: "opendart:fricDecsn:2016-01-04",
+        EvidenceKind.DISCLOSURES: "opendart:list:2016-01-04",
+        EvidenceKind.HISTORICAL_COSTS: "retained:costs:2016-01-04",
+        EvidenceKind.LIFECYCLE_EVENTS: "dart:lifecycle:2016-01-04",
+    }
+    common_envelope = {
+        "lifecycle_event_id": "evt-003450", "instrument_id": "KRX:003450",
+        "source_security_id": "KR7003450004", "delisting_date": "2016-11-01",
+        "available_at": "2016-10-20T09:00:00+09:00",
+    }
+    generic_envelope = {
+        **common_envelope, "evidence_status": "unresolved", "resolution_kind": "unresolved",
+    }
+    verified_envelope = {
+        **common_envelope, "evidence_status": "verified", "resolution_kind": "merger_or_exchange",
+        "successor_delivery_date": "2016-11-02",
+        "successor_allocations_json": '[{"successor_security_id":"KR7105560007","successor_instrument_id":"KRX:105560","ratio":"0.1907312","cost_basis_weight":"1"}]',
+        "source_provider": "kind", "document_receipt_no": "kind-1",
+        "document_sha256": "a" * 64,
+    }
+    grouped = {}
+    for index, kind in enumerate(EvidenceKind):
+        payload = tmp_path / f"full-{kind.value}.json"
+        payload.write_bytes(b'{"records": []}')
+        grouped[kind] = (BronzeReceipt(
+            kind, f"{index:064x}", labels[kind], stamp, stamp,
+            payload, tmp_path / f"full-{kind.value}.receipt.json",
+        ),)
+    import json as _json
+
+    (tmp_path / "full-lifecycle_events.generic.json").write_bytes(
+        _json.dumps(generic_envelope).encode("utf-8")
+    )
+    (tmp_path / "full-lifecycle_events.verified.json").write_bytes(
+        _json.dumps(verified_envelope).encode("utf-8")
+    )
+    _stamp = datetime(2026, 9, 6, tzinfo=UTC)
+    grouped[EvidenceKind.LIFECYCLE_EVENTS] = (
+        BronzeReceipt(
+            EvidenceKind.LIFECYCLE_EVENTS, "e0" * 32, "dart:lifecycle:2016-11-01",
+            _stamp, _stamp, tmp_path / "full-lifecycle_events.generic.json",
+            tmp_path / "full-lifecycle_events.generic.json",
+        ),
+        BronzeReceipt(
+            EvidenceKind.LIFECYCLE_EVENTS, "e1" * 32, "dart:lifecycle:2016-11-01",
+            _stamp, _stamp, tmp_path / "full-lifecycle_events.verified.json",
+            tmp_path / "full-lifecycle_events.verified.json",
+        ),
+    )
+    return grouped
+
+
+def test_stream_normalize_publishes_small_tables_idempotently(tmp_path, monkeypatch) -> None:
+    import json
+    from datetime import UTC, datetime
+
+    import src.data.normalization as normalization_module
+    import src.data.silver as silver_module
+    import src.data.streaming_normalization as streaming
+    from src.data.schemas import SilverTable
+    from src.data.silver import SilverStore, complete_minimal_fixture
+    from src.data.streaming_normalization import _frame_months, stream_normalize_stock_evidence
+
+    decision = datetime(2026, 9, 6, tzinfo=UTC)
+    fixture_tables, _receipts, report = complete_minimal_fixture(decision_time=decision)
+    small_tables = {
+        table: frame for table, frame in fixture_tables.items()
+        if table not in streaming._STREAM_TABLES
+        and table is not SilverTable.CORPORATE_ACTIONS
+        and table is not SilverTable.LIFECYCLE_EVENTS
+        and frame.height > 0
+    }
+    assert SilverTable.CALENDAR in small_tables
+    month = next(iter(_frame_months(small_tables[SilverTable.CALENDAR], "session").keys()))
+    manifest = {"months": [month], "row_counts": {month: 1}, "parts": {}, "root_hash": "r" * 64}
+    grouped = _mocked_stream_grouped(tmp_path, decision)
+    action_hash = grouped[streaming.EvidenceKind.CORPORATE_ACTIONS][0].content_hash
+    cache_path = tmp_path / "artifacts" / "corporate_actions_stream.json"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text(json.dumps({"source_hashes": [action_hash], "records": []}), encoding="utf-8")
+
+    monkeypatch.setattr(streaming, "discover_verified_bronze_receipts", lambda **_kwargs: grouped)
+    monkeypatch.setattr(streaming, "select_streaming_receipts", lambda *, kind, receipts: receipts)
+    monkeypatch.setattr(streaming, "order_streaming_receipts", lambda *, table, receipts: receipts)
+    monkeypatch.setattr(
+        streaming, "_stream_table_isolated",
+        lambda **_kwargs: {"count": 1, "manifest": dict(manifest)},
+    )
+    monkeypatch.setattr(
+        normalization_module, "normalize_stock_evidence",
+        lambda _receipts, **_kwargs: (dict(small_tables), report),
+    )
+    monkeypatch.setattr(
+        SilverStore, "publish_streamed_table",
+        lambda self, **_kwargs: tmp_path / "published",
+    )
+
+    first = stream_normalize_stock_evidence(
+        bronze_root=tmp_path / "bronze", silver_root=tmp_path / "silver",
+        artifact_root=tmp_path / "artifacts", decision_time=decision, batch_size=10,
+    )
+    assert first.report_hash == report.report_hash
+    second = stream_normalize_stock_evidence(
+        bronze_root=tmp_path / "bronze", silver_root=tmp_path / "silver",
+        artifact_root=tmp_path / "artifacts", decision_time=decision, batch_size=10,
+    )
+    assert second.report_hash == report.report_hash
+    manifest_path = next((tmp_path / "silver" / "calendar").rglob("dataset_manifest.json"))
+    manifest_path.unlink()
+    third = stream_normalize_stock_evidence(
+        bronze_root=tmp_path / "bronze", silver_root=tmp_path / "silver",
+        artifact_root=tmp_path / "artifacts", decision_time=decision, batch_size=10,
+    )
+    assert third.report_hash == report.report_hash
+    assert silver_module.SilverStore is SilverStore
+
+
+def test_stream_table_worker_skips_already_staged_receipts(tmp_path) -> None:
+    import queue
+    from datetime import UTC, datetime
+
+    from src.data.schemas import BronzeReceipt, EvidenceKind, SilverTable
+    from src.data.streaming_normalization import _stream_table_worker
+
+    stamp = datetime(2024, 6, 1, tzinfo=UTC)
+
+    def daily_receipt(name, session, close, retrieved):
+        import json as _json
+
+        payload_path = tmp_path / f"{name}.payload.json"
+        payload_path.write_bytes(_json.dumps({"records": [{
+            "session": session, "ticker": "000020", "open": 100.0,
+            "high": 101.0, "low": 99.0, "close": float(close),
+            "volume": 1000.0, "trading_value": 100500.0,
+            "market_cap": 1000000.0, "shares_outstanding": 10000.0,
+        }]}).encode("utf-8"))
+        return BronzeReceipt(
+            EvidenceKind.DAILY_MARKET, name.ljust(64, "0"),
+            f"KRX:daily-market:{session}", retrieved, retrieved,
+            payload_path, tmp_path / f"{name}.receipt.json",
+        )
+
+    january = daily_receipt("jan31", "2024-01-02", "100.5", stamp)
+    february = daily_receipt("feb31", "2024-02-01", "101.5", stamp)
+    staging_root = tmp_path / "staging"
+    first_results: queue.Queue = queue.Queue()
+    _stream_table_worker(
+        table=SilverTable.DAILY_MARKET, receipts=[january],
+        staging_root=staging_root, decision_time=stamp,
+        batch_size=10, result_queue=first_results,
+    )
+    assert first_results.get_nowait()["ok"] is True
+    # Corrupt the staged receipt's Bronze payload: the resume must skip it
+    # without reading, so only the new month is processed.
+    january.payload_path.write_bytes(b"corrupted{")
+    second_results: queue.Queue = queue.Queue()
+    _stream_table_worker(
+        table=SilverTable.DAILY_MARKET, receipts=[january, february],
+        staging_root=staging_root, decision_time=stamp,
+        batch_size=10, result_queue=second_results,
+    )
+    resumed = second_results.get_nowait()
+    assert resumed["ok"] is True
+    assert resumed["count"] == 2

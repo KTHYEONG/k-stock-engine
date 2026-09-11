@@ -11,6 +11,7 @@ from dataclasses import asdict as _asdict
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, ClassVar, cast
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
@@ -247,7 +248,12 @@ def validate_table(table: SilverTable, frame: pl.DataFrame, *, decision_time: da
     if "available_at" in frame.columns:
         _ensure_aware(frame["available_at"], "available_at")
         # Polars expression for multi-million rows
-        late = frame.filter(pl.col("available_at") > decision_time)
+        compare_time = decision_time
+        available_dtype = frame["available_at"].dtype
+        available_zone = getattr(available_dtype, "time_zone", None)
+        if available_zone:
+            compare_time = decision_time.astimezone(ZoneInfo(str(available_zone)))
+        late = frame.filter(pl.col("available_at") > compare_time)
         if late.height > 0:
             raise PITDataError(f"available_at after decision_time in {table.value}")
 
@@ -878,7 +884,19 @@ class SilverStore:
         dataset_id = recomputed
         dataset_dir = self.root / table.value / dataset_id
         if dataset_dir.exists():
-            return dataset_dir
+            try:
+                existing_manifest = ParquetDatasetStore(self.root / table.value).read_manifest(dataset_id)
+                existing_end = getattr(existing_manifest, "time_end", None)
+                if isinstance(existing_end, datetime) and existing_end.date() >= report.coverage_end:
+                    return dataset_dir
+            except (FileNotFoundError, OSError, ValueError):
+                pass
+            dataset_id = hashlib.sha256(
+                f"{recomputed}|coverage:{report.coverage_end.isoformat()}".encode()
+            ).hexdigest()
+            dataset_dir = self.root / table.value / dataset_id
+            if dataset_dir.exists():
+                return dataset_dir
         probe: list[Path] = []
         for e in entries:
             probe.extend(
@@ -1018,6 +1036,26 @@ class SilverStore:
             sub_root.mkdir(parents=True, exist_ok=True)
             store = ParquetDatasetStore(sub_root)
             dataset_id = content_hash
+            existing = sub_root / dataset_id
+            if existing.exists():
+                # The row content can stay byte-identical while the certified
+                # calendar boundary advances (e.g. a new trading session).
+                # Preserve immutability by publishing a coverage-versioned
+                # id instead of attempting to overwrite the old dataset.
+                try:
+                    existing_manifest = store.read_manifest(dataset_id)
+                    existing_end = getattr(existing_manifest, "time_end", None)
+                    if isinstance(existing_end, datetime) and existing_end.date() < report.coverage_end:
+                        dataset_id = hashlib.sha256(
+                            f"{content_hash}|coverage:{report.coverage_end.isoformat()}".encode()
+                        ).hexdigest()
+                except (FileNotFoundError, OSError, ValueError):
+                    dataset_id = hashlib.sha256(
+                        f"{content_hash}|coverage:{report.coverage_end.isoformat()}".encode()
+                    ).hexdigest()
+            if (sub_root / dataset_id).exists():
+                output[table] = sub_root / dataset_id
+                continue
             # Include content_manifest with report hash
             path = store.write_partitioned(
                 frame,

@@ -105,12 +105,17 @@ def test_rebuild_cli_dispatches_with_all_master_symbols(tmp_path, monkeypatch, c
     import src.data.operations as operations
     import src.integrations.dart.xbrl as dart_module
     import src.integrations.krx.historical as krx_module
-    import src.integrations.kis.investor_flow as kis_module
+    import src.integrations.investor_flow_router as router_module
 
     monkeypatch.setattr(dart_module, 'DartXbrlCollector', lambda: object())
     monkeypatch.setattr(krx_module, 'KrxHistoricalCollector', lambda **_kwargs: object())
     captured: dict[str, tuple[str, ...]] = {}
-    monkeypatch.setattr(kis_module, 'KisInvestorFlowCollector', lambda symbols: captured.setdefault('symbols', symbols) or object())
+    def fake_resolve(provider, symbols, **_kwargs):
+        captured.setdefault('symbols', symbols)
+        captured.setdefault('provider', provider)
+        return object()
+    monkeypatch.setattr(router_module, 'resolve_investor_flow_collector', fake_resolve)
+    monkeypatch.setattr(cli_module, 'resolve_investor_flow_collector', fake_resolve)
     monkeypatch.setattr(cli_module, '_load_silver_table', lambda root, table: pl.DataFrame({'instrument_id': ['KRX:005930', 'KRX:000660']}))
     monkeypatch.setattr(
         operations,
@@ -121,3 +126,38 @@ def test_rebuild_cli_dispatches_with_all_master_symbols(tmp_path, monkeypatch, c
     assert cli_module.main() == 0
     assert captured['symbols'] == ('000660', '005930')
     assert '"plan_id": "p"' in capsys.readouterr().out
+
+
+def test_historical_pipeline_propagates_request_flow_provider(tmp_path, monkeypatch) -> None:
+    from datetime import UTC, date, datetime, timedelta
+    import polars as pl
+    import pytest
+    import src.data.collection_plan as plans
+    import src.data.operations as operations
+    import src.data.silver as silver
+    from src.data.collection_plan import HistoricalCollectionPlan, PlanChunk
+
+    class StopAfterCollectionError(Exception):
+        pass
+    day = date(2016, 1, 4)
+    plan = HistoricalCollectionPlan('p', day, day, 1, (PlanChunk('p:005930:0000', '005930', (day,)),), 'd' * 64)
+    # The certified calendar must carry the full warmup plus the next
+    # execution session; a single-session fixture would fail closed in
+    # derive_historical_collection_window before collection is reached.
+    calendar_days = (*(day - timedelta(days=offset) for offset in range(60, 0, -1)), day, day + timedelta(days=1))
+    monkeypatch.setenv('KRX_OPENAPI_KEY', 'krx')
+    monkeypatch.setenv('OPENDART_API_KEY', 'dart')
+    monkeypatch.setattr(silver, 'load_latest_silver_table', lambda **_kwargs: pl.DataFrame({'session': [datetime.combine(item, datetime.min.time(), tzinfo=UTC) for item in calendar_days]}))
+    monkeypatch.setattr(plans, 'build_historical_collection_plan_from_bronze', lambda **_kwargs: plan)
+    captured = {}
+
+    def stop(**kwargs):
+        captured.update(kwargs)
+        raise StopAfterCollectionError
+
+    monkeypatch.setattr(operations, 'collect_historical_evidence', stop)
+    request = operations.HistoricalDataPipelineRequest(tmp_path / 'data', tmp_path / 'bronze', tmp_path / 'silver', tmp_path / 'gold', tmp_path / 'artifacts', day, day, datetime(2026, 9, 11, tzinfo=UTC), investor_flow_provider='kiwoom')
+    with pytest.raises(StopAfterCollectionError):
+        operations.run_historical_data_pipeline(request, krx=object(), investor_flow='kiwoom-collector', dart=object())
+    assert captured['investor_flow_provider'] == 'kiwoom'
+    assert captured['investor_flow'] == 'kiwoom-collector'

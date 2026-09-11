@@ -60,6 +60,7 @@ class LsInvestorFlowCollector:
                 {
                     "session": sess,
                     "ticker": symbol,
+                    "_source_provider": "LS",
                     "foreign_buy_value": max(foreign_net, 0.0),
                     "foreign_sell_value": max(-foreign_net, 0.0),
                     "foreign_net_value": foreign_net,

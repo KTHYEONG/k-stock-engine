@@ -89,9 +89,6 @@ def derive_lifecycle_candidates(
         nxt_set = by_session.get(nxt, set())
         if not prev_set or not nxt_set:
             raise PITDataError(f"consecutive KRX master coverage missing for {prev} -> {nxt}")
-        prev_frame = security_master.filter(pl.col("instrument_id").is_in(sorted(prev_set)))
-        nxt_frame = security_master.filter(pl.col("instrument_id").is_in(sorted(nxt_set)))
-        _ = (prev_frame.height, nxt_frame.height)
         removed = prev_set - nxt_set
         for iid in sorted(removed):
             first_removal.setdefault(iid, (prev, nxt))
@@ -440,7 +437,19 @@ _SOURCE_COMPLETE_KEYS: tuple[str, ...] = (
 
 
 def _lifecycle_material_terms(row: dict[str, Any]) -> tuple[str, ...]:
-    return tuple(str(row.get(key)) for key in _MATERIAL_LIFECYCLE_TERMS)
+    # Older KIND receipts predate ``resolution_kind``.  A verified receipt
+    # with a disclosed per-share cash settlement has the same economic terms
+    # as the later explicit ``cash_settlement`` representation; do not turn
+    # that schema evolution into a conflicting event.
+    resolution_kind = row.get("resolution_kind")
+    if resolution_kind in (None, "", "None", "unresolved") and row.get("cash_settlement_per_share") is not None:
+        resolution_kind = "cash_settlement"
+    elif resolution_kind in (None, "", "None"):
+        resolution_kind = "cash_settlement" if row.get("cash_settlement_per_share") is not None else "unresolved"
+    return tuple(
+        str(resolution_kind) if key == "resolution_kind" else str(row.get(key))
+        for key in _MATERIAL_LIFECYCLE_TERMS
+    )
 
 
 def _lifecycle_event_rank(row: dict[str, Any]) -> tuple[int, int, int, int, int, str]:
