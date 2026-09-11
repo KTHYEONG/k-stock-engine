@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_GOLD_ELIGIBILITY_DATA_BLOCKERS",
+      "date": "2026-09-11",
+      "adr_id": "ADR_20260911_GOLD_ELIGIBILITY_DATA_BLOCKERS",
+      "domain": "data_backtest",
+      "title": "Gold input lineage and DART identity binding",
+      "why": "Latest-generated Silver fixture manifests used incompatible DART corp_code identities and sparse flow, collapsing the Gold intersection to zero.",
+      "resolution": "Require explicit non-fixture Silver dataset bindings, persist the immutable Gold input family, and fail closed on unbridged eight-digit DART corp codes.",
+      "impact": "Gold runs can no longer silently mix fixture generations, while PIT-safe DART ticker mapping and reproducible input provenance are enforced."
+    },
+    {
       "task_id": "TASK_INVESTOR_FLOW_PROVIDER_ROUTING",
       "date": "2026-09-11",
       "adr_id": "ADR_20260911_INVESTOR_FLOW_PROVIDER_ROUTING",
