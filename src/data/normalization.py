@@ -123,7 +123,16 @@ def normalize_dart_financial_facts(
                 dart_corp_code = raw_corp
                 ticker = raw_ticker
             elif raw_company:
-                if raw_corp:
+                if _re.match(r"^\d{8}$", raw_company) and not ticker_ok:
+                    _corp_candidate = raw_corp or raw_company
+                    _bridged = ticker_by_corp_code.get(_corp_candidate) if ticker_by_corp_code else None
+                    if _bridged is not None and _re.match(r"^\d{6}$", _bridged) and bridge_receipt_hash:
+                        company_id = _bridged
+                        dart_corp_code = _corp_candidate
+                        ticker = _bridged
+                    else:
+                        continue
+                elif raw_corp:
                     bridged = ticker_by_corp_code.get(raw_corp) if ticker_by_corp_code else None
                     if bridged is not None and _re.match(r"^\d{6}$", bridged):
                         company_id = bridged

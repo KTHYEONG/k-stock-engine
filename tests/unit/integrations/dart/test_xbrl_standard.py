@@ -124,10 +124,14 @@ def test_normalize_dart_financial_facts_accepts_opendart_standard_records() -> N
         source_hash="a" * 64,
         calendar=calendar,
         decision_time=decision_time,
+        ticker_by_corp_code={"00126380": "005930"},
+        bridge_receipt_hash="b" * 64,
     )
     assert df.height == 2
     assert set(df["fact"].to_list()) == {"sales", "operating_profit"}
-    assert df["company_id"].to_list() == ["00126380", "00126380"]
+    assert df["company_id"].to_list() == ["005930", "005930"]
+    assert df["ticker"].to_list() == ["005930", "005930"]
+    assert df["dart_corp_code"].to_list() == ["00126380", "00126380"]
     assert df["fiscal_period"].to_list() == ["2015Q1", "2015Q1"]
     assert df["value"].to_list() == [47117896000000.0, 5979343000000.0]
 
