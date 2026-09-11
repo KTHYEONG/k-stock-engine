@@ -160,6 +160,30 @@ def test_gold_loader_validates_latest_manifest_and_projected_reads(tmp_path, mon
     ).height == 1
 
 
+def test_gold_loader_prefers_bridged_dart_facts_over_newer_fixture(tmp_path, monkeypatch) -> None:
+    from datetime import UTC, datetime
+    import src.data.gold_loader as module
+    from src.data.schemas import SilverTable
+
+    table_root = tmp_path / SilverTable.FINANCIAL_FACTS.value
+    (table_root / "bridged").mkdir(parents=True)
+    (table_root / "fixture").mkdir()
+
+    class Manifest:
+        def __init__(self, generated_time, provider_version):
+            self.generated_time = generated_time
+            self.provider_version = provider_version
+
+    def read_manifest(_store, ident):
+        if ident == "fixture":
+            return Manifest(datetime(2026, 9, 1, tzinfo=UTC), "fixture")
+        return Manifest(datetime(2025, 1, 1, tzinfo=UTC), "dart-facts-v1")
+
+    monkeypatch.setattr(module.ParquetDatasetStore, "read_manifest", read_manifest)
+    ident, _store = module._resolve_latest_dataset(tmp_path, SilverTable.FINANCIAL_FACTS)
+    assert ident == "bridged"
+
+
 def test_gold_loader_fail_closed_dataset_and_read_errors(tmp_path, monkeypatch) -> None:
     from datetime import UTC, datetime
     import polars as pl

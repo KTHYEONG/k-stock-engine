@@ -336,7 +336,7 @@ def _resolve_latest_dataset(
         raise PITDataError(f"invalid certified Silver table: missing {table.value}")
     store = ParquetDatasetStore(table_root)
     best_id: str | None = None
-    best_key: tuple[datetime, datetime, str] | None = None
+    best_key: tuple[int, datetime, datetime, str] | None = None
     for cand in candidates:
         try:
             manifest = store.read_manifest(cand.name)
@@ -353,7 +353,19 @@ def _resolve_latest_dataset(
             # Minimal contract fixtures may omit coverage metadata; generated
             # time remains a deterministic fallback for dataset selection.
             manifest_end = generated
-        key = (generated, manifest_end, cand.name)
+        # Financial facts have two materially different lineages in the
+        # repository: the historical bridged DART facts (for example
+        # ``dart-facts-v1``) use the six-digit ticker/company mapping consumed
+        # by the stock master, while the newer fixture facts use eight-digit
+        # DART corporation codes.  Selecting the fixture solely because it
+        # was generated later makes the PIT join appear empty even though a
+        # valid bridged source is present.  Prefer a non-fixture provider for
+        # this table, then retain the normal coverage/generation ordering.
+        provider = getattr(manifest, "provider_version", None)
+        provider_rank = 0
+        if table is SilverTable.FINANCIAL_FACTS and isinstance(provider, str):
+            provider_rank = 2 if provider == "dart-facts-v1" else int(provider != "fixture")
+        key = (provider_rank, generated, manifest_end, cand.name)
         if best_key is None or key > best_key:
             best_key = key
             best_id = cand.name
