@@ -846,6 +846,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 bronze_root=Path(args.bronze_root),
                 retrieved_at=_parse_dt(args.retrieved_at),
                 checkpoint_store=CollectionCheckpointStore(Path(args.checkpoint_root)),
+                allow_source_unavailable=True,
             )
         except (PITDataError, ValueError, OSError):
             return 1
