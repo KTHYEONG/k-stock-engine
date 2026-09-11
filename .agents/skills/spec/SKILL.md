@@ -53,41 +53,41 @@ Downstream `implement` models have low reasoning capacity and cannot extrapolate
 
 ## Chat Output Format
 
-Keep chat response structured, scannable, and hierarchical using progressive disclosure (Executive Summary -> Invariants -> Changes & Wiring -> Verification). Avoid flat symbol-by-symbol tables or text walls.
-**Language Requirement:** All instructions and template fields below are written in English, but the actual rendered chat response to the user MUST be translated and presented in Korean (한국어).
+Keep chat response ultra-compact, scannable, and contract-focused. Strictly avoid narrative walls of text, multi-line table cells (`<br>`), or repeating full code skeletons that already exist in `contract.json`.
 
-### 📐 [SPEC] <Feature Name>
-> 📄 **Contract**: `docs/specs/<feature>_contract.json`  
-> 📊 **Scale**: <N> files · <N> changes · <N> wiring · <N> scenarios
-
-#### 1. Executive Summary
-- **Purpose**: <Summary of core problem and why this change is necessary>
-- **Key Changes**: <Core architectural and logic changes (1~3 concise points)>
-- ⚠️ **Breaking Changes & Impact**: <Schema/API incompatibilities, or "None">
-
-#### 2. Core Invariants & Guardrails
-- 🛡️ **<Invariant Name>** (<Fail-Closed / Rule>): <Boundary condition and behavior>
-- 🚪 **<Chokepoint / Contract>**: <Parameter rules, signature constraints>
-- 🚫 **<Gate / Rejection Rule>**: <Early-abort criteria>
-
-#### 3. Changes & Wiring Summary
-| Category | Target Module / File | Core Logic & Wiring Details |
-| :--- | :--- | :--- |
-| **Target** | `[<target_file>](file:///<target_file>)` | • `<symbol_1>`: <Core logic change><br>• `<symbol_2>`: <Core logic change> |
-| **Wiring** | `[<caller_file>](file:///<caller_file>)` | • `<anchor>`: <Caller wiring and parameter pass-through> |
-
-#### 4. Verification Plan
-| Scope | Count | Key Test Cases | Success Criteria |
-| :--- | :---: | :--- | :--- |
-| **Unit** | <N> | • <Normal / boundary cases><br>• <Error / fail-closed cases> | <Assertion or exception criterion> |
-| **Wiring** | <N> | • <Caller / pipeline integration cases><br>• <CLI / option routing validation> | <Pipeline run / zero unhandled exception> |
-| **Gate** | - | `lean_check --pre-impl` AST & Static Verification | **PASS** (<N>/<N> skeleton AST valid, 0 diagnostics) |
-
-#### 5. Out of Scope
-- <Deferred items and rationale, or "None">
+**Output Directives:**
+- **Terminal-Safe Tables**: Keep table cells to single-line values (no `<br>` or nested bullets).
+- **Single Source of Truth**: Point directly to `docs/specs/<feature>_contract.json` for full skeletons and AST anchors.
+- **Telegraphic Bullets**: Use concise, telegraphic bullets (명사형/종결형 축약, 최대 1-2줄).
+- **Language Requirement**: All output rendered to the user MUST be written in Korean (한국어). Template titles and labels below MUST be presented in Korean as shown.
 
 ---
-👉 Next Step: `/implement docs/specs/<feature>_contract.json`
 
+### 📐 [SPEC] <기능명>
+> 📄 **계약 문서**: [`docs/specs/<feature>_contract.json`](file:///docs/specs/<feature>_contract.json)  
+> 📊 **작업 규모**: <N>개 파일 · <N>개 변경점 · <N>개 배선 · <N>개 시나리오 (단위: <U>, 배선: <W>)  
+> 🚦 **게이트 검증**: `lean_check --pre-impl` **PASS** (<N>/<N> AST 유효)
 
+#### 1. 계획 요약 (Plan Summary)
+- 🎯 **목표**: <구체화 대상 1줄 요약>
+- ⚠️ **영향도/파괴적 변경**: <없음 또는 핵심 영향 1줄>
+- 🚫 **범위 제외 (Out of Scope)**: <제외 또는 이연 항목 1줄>
 
+#### 2. 변경 및 배선 매트릭스 (Changes & Wiring)
+| 파일 경로 | 유형 | 대상 심볼 / 앵커 |
+| :--- | :--- | :--- |
+| `[<target_file>](file:///<target_file>)` | Target | `<symbol_1>`, `<symbol_2>` |
+| `[<caller_file>](file:///<caller_file>)` | Wiring | `<anchor_symbol>` (호출부 주입) |
+
+#### 3. 핵심 불변식 및 가드레일 (Invariants & Guardrails)
+- 🛡️ **<INV-NAME>**: <Fail-Closed 조건 또는 경계 규칙 1줄 요약>
+- 🚪 **<GATE-RULE>**: <파라미터 검증 또는 조기 중단 기준 1줄 요약>
+
+#### 4. 검증 시나리오 (Verification Scenarios)
+| 구분 | 건수 | 대상 테스트 스위트 | 주요 검증 초점 |
+| :--- | :---: | :--- | :--- |
+| **단위 (Unit)** | <U> | `[<test_unit_file>](file:///<test_unit_file>)` | `<정상 + 경계 + fail-closed 케이스>` |
+| **배선 (Wiring)** | <W> | `[<test_caller_file>](file:///<test_caller_file>)` | `<호출부 통합 + 옵션 전달 케이스>` |
+
+---
+👉 다음 단계: `/implement docs/specs/<feature>_contract.json`

@@ -351,11 +351,23 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                 diagnostics.append(d)
             continue
         if not os.path.exists(fh):
+            if kind in ("deleted_file", "deleted_module", "deleted_path"):
+                continue
             d = {
                 "file": fh,
                 "line": 0,
                 "error": f"Spec: file not found ({kind} {name})",
                 "fix_hint": f"Create {fh}",
+            }
+            diagnostics.append(d)
+            continue
+
+        if kind in ("deleted_file", "deleted_module", "deleted_path"):
+            d = {
+                "file": fh,
+                "line": 0,
+                "error": f"Spec: {kind} '{fh}' still exists (should be deleted)",
+                "fix_hint": f"Delete {fh}",
             }
             diagnostics.append(d)
             continue
@@ -796,7 +808,7 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                         }
                     )
             if not pre_impl:
-                if import_symbol and import_symbol not in wf_content:
+                if import_symbol and import_symbol.lower() not in ("n/a", "none", "") and import_symbol not in wf_content:
                     diagnostics.append(
                         {
                             "file": wf,
@@ -805,7 +817,7 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                             "fix_hint": f"Import {import_symbol} in {wf}",
                         }
                     )
-                if invocation_expr:
+                if invocation_expr and invocation_expr.lower() not in ("n/a", "none", ""):
                     found_invocation = invocation_expr in wf_content
                     if not found_invocation:
                         norm_wf = re.sub(r"\s+", " ", wf_content)
