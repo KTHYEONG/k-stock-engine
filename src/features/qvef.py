@@ -131,10 +131,15 @@ def _resolve_master_for_eligible(
     target_dt = decision_time.astimezone(ZoneInfo(col_tz)) if col_tz else decision_time
     pit = security_master.filter(pl.col("available_at") <= target_dt) if not security_master.is_empty() else security_master.clear()
     if "valid_from" in pit.columns and "valid_to" in pit.columns:
-        pit = pit.filter(
-            (pl.col("valid_from") <= decision_session)
-            & (pl.col("valid_to").is_null() | (pl.col("valid_to") >= decision_session))
-        )
+        session_date = decision_session.astimezone(KRX_TZ).date()
+        predicate = pl.col("valid_from").dt.date() <= session_date
+        valid_to_dtype = pit.schema.get("valid_to")
+        if valid_to_dtype in (pl.Date, pl.Datetime):
+            predicate = predicate & (
+                pl.col("valid_to").is_null()
+                | (pl.col("valid_to").dt.date() >= session_date)
+            )
+        pit = pit.filter(predicate)
     dedup = pit.sort(["available_at", "valid_from"], descending=[True, True]).unique(
         subset=["instrument_id"], keep="first", maintain_order=True
     )
