@@ -601,6 +601,7 @@ def materialize_gold_window(
     qvef_policy: Any | None = None,
     score_policy: Any | None = None,
     silver_root: Path | None = None,
+    replay_from_silver: bool = False,
 ) -> GoldRunReport:
     """Run Gold-layer audit, generate daily historical universe decisions, and build QVEF features.
 
@@ -707,7 +708,12 @@ def materialize_gold_window(
         assert financial_facts is not None
         assert corporate_actions is not None
         flow_for_reader = investor_flow if investor_flow is not None else pl.DataFrame()
-        reader = PITReplayReader.from_frames(calendar=calendar, security_master=security_master, daily_market=daily_market, investor_flow=flow_for_reader, financial_facts=financial_facts, corporate_actions=corporate_actions)
+        if replay_from_silver and silver_root is not None:
+            reader = PITReplayReader.from_silver_root(
+                silver_root=Path(silver_root), decision_time=decision_time, calendar=calendar
+            )
+        else:
+            reader = PITReplayReader.from_frames(calendar=calendar, security_master=security_master, daily_market=daily_market, investor_flow=flow_for_reader, financial_facts=financial_facts, corporate_actions=corporate_actions)
 
     # 1-3. Pre-flight audit manifest
     manifest = build_gold_audit_manifest(
