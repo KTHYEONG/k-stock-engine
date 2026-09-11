@@ -1711,7 +1711,10 @@ def _source_security_id(record: dict[str, Any]) -> str | None:
         value = record.get(name)
         if value not in (None, ""):
             candidate = str(value).strip().upper()
-            if re.fullmatch(r"KR[A-Z0-9]{10}", candidate):
+            # KRX pages also expose foreign-listed issuers (for example
+            # KYG/HK ISINs for 900xxx tickers); retain any structurally
+            # valid 12-character ISIN rather than silently dropping them.
+            if re.fullmatch(r"[A-Z]{2}[A-Z0-9]{10}", candidate):
                 return candidate
     return None
 
