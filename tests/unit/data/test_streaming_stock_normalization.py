@@ -190,6 +190,18 @@ def test_streaming_normalization_preserves_krx_isin_as_source_security_id() -> N
 
     assert row['source_security_id'] == 'KR7000020000'
 
+    foreign = _canonical_daily_row(
+        {
+            'BAS_DD': '20160104', 'ISU_CD': 'KYG210AT1036', 'ISU_SRT_CD': '900040',
+            'TDD_OPNPRC': '10', 'TDD_HGPRC': '12', 'TDD_LWPRC': '9',
+            'TDD_CLSPRC': '11', 'ACC_TRDVOL': '100', 'ACC_TRDVAL': '1,100',
+            'MKTCAP': '10,000', 'LIST_SHRS': '900',
+        },
+        available_at=datetime(2016, 1, 5, tzinfo=UTC),
+        source_hash='a',
+    )
+    assert foreign['source_security_id'] == 'KYG210AT1036'
+
 
 def test_streaming_normalization_carries_close_for_untouched_krx_session() -> None:
     from datetime import UTC, datetime
