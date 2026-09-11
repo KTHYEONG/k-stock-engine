@@ -1101,3 +1101,33 @@ def test_cli_build_gold_wires_complete_explicit_dataset_binding(tmp_path, monkey
     assert captured['load']['silver_dataset_ids'] == bindings
     assert captured['artifact'] == tmp_path / 'binding.json'
     assert 'eligible_instruments' in capsys.readouterr().out
+def test_cli_audit_provenance_emits_counts(tmp_path, capsys) -> None:
+    from src.data import cli
+
+    assert cli.main(['audit-provenance', '--bronze-root', str(tmp_path / 'bronze'), '--silver-root', str(tmp_path / 'silver'), '--artifact-root', str(tmp_path / 'artifacts')]) == 0
+    assert 'artifact_path' in capsys.readouterr().out
+
+
+def test_cli_audit_provenance_rejects_malformed_evidence(tmp_path) -> None:
+    from src.data import cli
+
+    evidence = tmp_path / 'bronze' / 'investor_flow' / 'bad'
+    evidence.mkdir(parents=True)
+    (evidence / 'payload.json').write_text('{')
+    assert cli.main(['audit-provenance', '--bronze-root', str(tmp_path / 'bronze'), '--silver-root', str(tmp_path / 'silver'), '--artifact-root', str(tmp_path / 'artifacts')]) == 1
+
+
+def test_filter_unresolved_lifecycle_events_preserves_only_verified_receipts() -> None:
+    import polars as pl
+
+    from src.data.cli import _filter_unresolved_lifecycle_events
+
+    frame = pl.DataFrame(
+        {
+            'instrument_id': ['KRX:A', 'KRX:B', 'KRX:B'],
+            'evidence_status': ['verified', 'unresolved', 'unresolved'],
+        }
+    )
+    filtered, excluded = _filter_unresolved_lifecycle_events(frame)
+    assert filtered['instrument_id'].to_list() == ['KRX:A']
+    assert excluded == ('KRX:B',)

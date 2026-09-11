@@ -11,7 +11,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-from src.core.time import SessionCalendar
+from src.core.time import KRX_TZ, SessionCalendar
 from src.data.backtest_runner import run_champion_backtest
 from src.data.backtest_sessions import BacktestMarketInputsPolicy, build_backtest_sessions
 from src.data.bronze import BronzeStore, import_retained_stock_evidence, migrate_retained_stock_evidence
@@ -205,6 +205,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p_bdm.add_argument("--validation-end", type=str, required=True)
     p_bdm.add_argument("--decision-time", type=str, required=True)
 
+    p_audit = sub.add_parser("audit-provenance", help="Classify retry and production-provenance blockers")
+    p_audit.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
+    p_audit.add_argument("--silver-root", type=Path, default=Path("data/silver/stocks"))
+    p_audit.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
+
     return parser.parse_args(argv)
 
 
@@ -291,6 +296,23 @@ def _load_manifest_silver_table(silver_root: Path, table: SilverTable, dataset_i
             root=Path(silver_root), table=table, dataset_id=str(dataset_id), decision_time=datetime.now(UTC)
         )
     return _load_silver_table(Path(silver_root), table)
+
+
+def _filter_unresolved_lifecycle_events(frame: Any) -> tuple[Any, tuple[str, ...]]:
+    """Keep only verified lifecycle evidence and report excluded instruments.
+
+    An unresolved lifecycle receipt is evidence that must remain visible, but
+    it cannot be converted into a ledger action.  Excluding that event from a
+    run is therefore safer than aborting an otherwise usable backtest or
+    inventing a settlement.
+    """
+    if "evidence_status" not in getattr(frame, "columns", ()):
+        return frame, ()
+    import polars as pl
+
+    unresolved = frame.filter(pl.col("evidence_status") != "verified")
+    excluded = tuple(sorted({str(value) for value in unresolved["instrument_id"].drop_nulls().to_list()}))
+    return frame.filter(pl.col("evidence_status") == "verified"), excluded
 
 
 def _load_silver_table_for_symbol(silver_root: Path, table: SilverTable, instrument_id: str) -> Any:
@@ -596,14 +618,118 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         security_master = _load_silver_table(silver_root, SilverTable.SECURITY_MASTER)
         corporate_actions = _load_silver_table(silver_root, SilverTable.CORPORATE_ACTIONS)
 
+    # KRX bridge refreshes can retain byte-identical master snapshots from
+    # multiple source partitions.  They do not represent distinct PIT states
+    # and would otherwise make sector resolution fail closed as ambiguous.
+    if hasattr(security_master, "unique"):
+        security_master = security_master.unique(maintain_order=True)
+
     if run_manifest is not None:
         lifecycle_events = _load_manifest_silver_table(
             silver_root, SilverTable.LIFECYCLE_EVENTS, dataset_id=str(run_manifest.silver_dataset_ids["lifecycle_events"])
         )
     else:
         lifecycle_events = _load_manifest_silver_table(silver_root, SilverTable.LIFECYCLE_EVENTS)
+    lifecycle_events, excluded_lifecycle_instruments = _filter_unresolved_lifecycle_events(lifecycle_events)
 
-    sessions = build_backtest_sessions(snapshot_repository=snapshot_repo, calendar=calendar, start=start_session, end=next_session, decision_time_of=lambda s: s.replace(hour=15, minute=30, second=0), security_master=security_master, corporate_actions=corporate_actions, lifecycle_events=lifecycle_events)
+    # Resolve all known corporate-action gaps once before constructing the
+    # session repository.  Re-running the full validator after every raised
+    # instrument is prohibitively expensive on the multi-million-row market
+    # frame, and this resolution already carries the explicit exclusion
+    # reasons needed for the research ledger.
+    excluded_unexplained_action_instruments: set[str] = set()
+    excluded_missing_market_close_instruments: set[str] = set()
+    coverage_daily_market = daily_market
+    if run_manifest is not None:
+        from src.data.backtest_sessions import resolve_backtest_corporate_action_evidence
+
+        pre_resolution = resolve_backtest_corporate_action_evidence(
+            daily_market=daily_market,
+            corporate_actions=corporate_actions,
+            calendar=calendar,
+            policy=BacktestMarketInputsPolicy(),
+        )
+        excluded_unexplained_action_instruments.update(pre_resolution.exclusion_reasons)
+        if excluded_unexplained_action_instruments:
+            # Keep the original frame for the exclusion ledger, but remove
+            # each affected instrument from the build frame.  Multiple jumps
+            # for one symbol must not be allowed to leak past a single
+            # quarantine window.
+            daily_market = pre_resolution.eligible_daily_market.filter(
+                ~pl.col("instrument_id").is_in(list(excluded_unexplained_action_instruments))
+            )
+            snapshot_repo = PITSnapshotRepository.from_frames(
+                {SilverTable.DAILY_MARKET: daily_market}, root=silver_root
+            )
+
+    # A missing corporate-action record is a source gap, not a reason to
+    # fabricate an adjustment.  Quarantine only the instrument named by the
+    # fail-closed coverage validator, retain the rest of the window, and make
+    # the exclusion explicit in result metadata.
+    import re
+
+    while True:
+        try:
+            sessions = build_backtest_sessions(snapshot_repository=snapshot_repo, calendar=calendar, start=start_session, end=next_session, decision_time_of=lambda s: s.replace(hour=15, minute=30, second=0), security_master=security_master, corporate_actions=corporate_actions, lifecycle_events=lifecycle_events)
+            break
+        except PITDataError as exc:
+            match = re.fullmatch(r"unexplained price discontinuity for '([^']+)'", str(exc))
+            if match is None:
+                match = re.fullmatch(
+                    r"unreconciled corporate action listed shares at listing session; "
+                    r"certification blocked for (.+)",
+                    str(exc),
+                )
+            if match is None:
+                raise
+            instrument_ids = [value.strip() for value in match.group(1).split(",") if value.strip()]
+            if not instrument_ids or any(
+                value in excluded_unexplained_action_instruments for value in instrument_ids
+            ):
+                raise
+            excluded_unexplained_action_instruments.update(instrument_ids)
+            daily_market = daily_market.filter(~pl.col("instrument_id").is_in(instrument_ids))
+            security_master = security_master.filter(~pl.col("instrument_id").is_in(instrument_ids))
+            corporate_actions = corporate_actions.filter(~pl.col("instrument_id").is_in(instrument_ids))
+            snapshot_repo = PITSnapshotRepository.from_frames(
+                {SilverTable.DAILY_MARKET: daily_market}, root=silver_root
+            )
+
+    # A symbol whose last retained bar predates the validation end cannot
+    # supply a close for an open position.  This is common for delisted
+    # instruments when lifecycle settlement evidence is unavailable.  Remove
+    # those symbols before strategy construction and record the exclusion;
+    # never synthesize a terminal close.
+    expected_end_date = next_session.astimezone(KRX_TZ).date()
+    last_bar_dates = daily_market.group_by("instrument_id").agg(
+        pl.col("session").dt.date().max().alias("_last_bar_date")
+    )
+    excluded_missing_market_close_instruments.update(
+        last_bar_dates.filter(pl.col("_last_bar_date") < expected_end_date)["instrument_id"].to_list()
+    )
+    if excluded_missing_market_close_instruments:
+        daily_market = daily_market.filter(
+            ~pl.col("instrument_id").is_in(list(excluded_missing_market_close_instruments))
+        )
+        security_master = security_master.filter(
+            ~pl.col("instrument_id").is_in(list(excluded_missing_market_close_instruments))
+        )
+        corporate_actions = corporate_actions.filter(
+            ~pl.col("instrument_id").is_in(list(excluded_missing_market_close_instruments))
+        )
+        snapshot_repo = PITSnapshotRepository.from_frames(
+            {SilverTable.DAILY_MARKET: daily_market}, root=silver_root
+        )
+        sessions = build_backtest_sessions(
+            snapshot_repository=snapshot_repo,
+            calendar=calendar,
+            start=start_session,
+            end=next_session,
+            decision_time_of=lambda s: s.replace(hour=15, minute=30, second=0),
+            security_master=security_master,
+            corporate_actions=corporate_actions,
+            lifecycle_events=lifecycle_events,
+        )
 
     distinct_symbols = daily_market["instrument_id"].unique().to_list()
     instruments = {
@@ -696,6 +822,20 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         "market_input_policy_version": BacktestMarketInputsPolicy().version,
         "warmup_sessions": 60,
         "data_action_certified": True,
+        "provenance_mode": (
+            "research_source_candidate_with_explicit_unavailable"
+            if run_manifest is not None and "provenance" in str(silver_root)
+            else "research_fixture_inputs"
+        ),
+        "investor_flow_policy": "optional_no_imputation",
+        "unresolved_lifecycle_event_policy": "exclude_unresolved_keep_receipt",
+        "excluded_unresolved_lifecycle_instruments": list(excluded_lifecycle_instruments),
+        "excluded_missing_market_close_instruments": sorted(
+            excluded_missing_market_close_instruments
+        ),
+        "excluded_unexplained_corporate_action_instruments": sorted(
+            excluded_unexplained_action_instruments
+        ),
     }
     if run_manifest is not None:
         from collections import Counter
@@ -703,13 +843,13 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         from src.data.backtest_sessions import resolve_backtest_corporate_action_evidence
 
         _resolution = resolve_backtest_corporate_action_evidence(
-            daily_market=daily_market,
+            daily_market=coverage_daily_market,
             corporate_actions=corporate_actions,
             calendar=calendar,
             policy=BacktestMarketInputsPolicy(),
         )
         _eligible_count = int(_resolution.eligible_daily_market.height)
-        _blocked_count = int(daily_market.height - _eligible_count)
+        _blocked_count = int(coverage_daily_market.height - _eligible_count)
         _reason_counter: Counter[str] = Counter()
         for _reasons in _resolution.exclusion_reasons.values():
             _reason_counter.update(_reasons)
@@ -718,7 +858,10 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
             "run_manifest_hash": run_manifest.content_hash,
             "eligible_instrument_sessions": _eligible_count,
             "blocked_instrument_sessions": _blocked_count,
-            "excluded_instruments": sorted(_resolution.excluded_instruments),
+            "excluded_instruments": sorted(
+                set(_resolution.excluded_instruments)
+                | excluded_unexplained_action_instruments
+            ),
             "exclusion_reason_counts": dict(_reason_counter),
             "quarantined_instrument_sessions": sum(
                 len(slots) for slots in _resolution.quarantine_sessions_by_instrument.values()
@@ -802,6 +945,26 @@ def _build_sessions(**kwargs: object) -> object:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.command == "audit-provenance":
+        try:
+            from src.data.provenance_audit import audit_production_provenance
+
+            audit = audit_production_provenance(
+                bronze_root=Path(args.bronze_root),
+                silver_root=Path(args.silver_root),
+                artifact_root=Path(args.artifact_root),
+            )
+        except (ValueError, OSError, json.JSONDecodeError):
+            return 1
+        _emit(
+            {
+                "artifact_path": str(audit.artifact_path),
+                "unverified_empty_response": sum(item.state == "unverified_empty_response" for item in audit.investor_flow),
+                "retry_required": sum(item.state == "retry_required" for item in audit.investor_flow),
+                "fixture_tables": list(audit.fixture_tables),
+            }
+        )
+        return 0
     if args.command == "inventory":
         try:
             inventory = inspect_legacy_data(Path(args.data_root))

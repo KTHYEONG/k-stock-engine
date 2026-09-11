@@ -136,6 +136,37 @@ def test_resolve_master_for_eligible_pit_dedup_correct() -> None:
     assert 'KRX:C' not in result
 
 
+def test_resolve_master_for_eligible_accepts_same_krx_date_open_snapshot() -> None:
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    import polars as pl
+
+    from src.features.qvef import _resolve_master_for_eligible
+
+    kst = ZoneInfo("Asia/Seoul")
+    session = datetime(2017, 12, 28, tzinfo=kst)
+    master = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:005930"],
+            "company_id": ["005930"],
+            "sector": ["Technology"],
+            "valid_from": [datetime(2017, 12, 28, 9, tzinfo=kst)],
+            "valid_to": [datetime(2017, 12, 28, 9, tzinfo=kst)],
+            "available_at": [datetime(2017, 12, 28, 9, tzinfo=kst)],
+        }
+    )
+
+    result = _resolve_master_for_eligible(
+        master,
+        decision_time=datetime(2017, 12, 28, 15, 30, tzinfo=UTC),
+        decision_session=session,
+        eligible_iids=["KRX:005930"],
+    )
+
+    assert result["KRX:005930"]["company_id"] == "005930"
+
+
 def test_resolve_facts_pit_conflict_returns_none() -> None:
     from datetime import UTC, datetime
     import polars as pl

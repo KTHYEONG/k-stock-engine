@@ -584,6 +584,7 @@ def validate_corporate_action_coverage(
         merged_sess = prev_entry[0] if prev_entry is not None else listing_sess
         settlement_by_key[list_key] = [merged_sess, merged_eff, prev_total + delta]
     settlement_failed = False
+    failed_settlement_instruments: set[str] = set()
     for (liid, liso), (lsess, min_eff, total_delta) in settlement_by_key.items():
         current_bar = bars_by_key.get((liid, liso))
         ordered_iid = sessions_by_instrument.get(liid, [])
@@ -607,8 +608,13 @@ def validate_corporate_action_coverage(
             or not _close_enough(current_cap, current_close * current_shares)
         ):
             settlement_failed = True
+            failed_settlement_instruments.add(liid)
     if settlement_failed:
-        raise PITDataError("unreconciled corporate action listed shares at listing session; certification blocked")
+        listed = ", ".join(sorted(failed_settlement_instruments))
+        raise PITDataError(
+            "unreconciled corporate action listed shares at listing session; "
+            f"certification blocked for {listed}"
+        )
     actions_map = {session: tuple(sorted(actions, key=lambda a: (a.instrument_id, a.action_id))) for session, actions in by_session.items()}
     return CorporateActionCoverage(actions_by_session=actions_map, research_returns_by_key=research_returns)
 
@@ -740,7 +746,10 @@ def _resolve_sector(
     ]
     sectors = {str(row.get("sector", "")) for row in candidates}
     sectors = {s for s in sectors if s and s != "__GLOBAL__"}
-    if len(sectors) != 1 or len(candidates) != 1:
+    # Multiple source snapshots can describe the same PIT sector (for
+    # example, a bridge row with a different status).  They are equivalent
+    # for sector resolution; only conflicting sectors are ambiguous.
+    if len(sectors) != 1 or not candidates:
         raise PITDataError(f"invalid PIT sector for {instrument_id!r}")
     return next(iter(sectors))
 

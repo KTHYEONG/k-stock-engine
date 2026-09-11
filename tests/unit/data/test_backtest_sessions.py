@@ -819,6 +819,27 @@ def test_resolve_lifecycle_evidence_never_uses_last_close_for_unpriced_delisting
     assert action.cash_amount == 0.0
 
 
+def test_resolve_sector_accepts_duplicate_snapshots_with_same_sector() -> None:
+    from datetime import datetime
+
+    import polars as pl
+
+    from src.data.backtest_sessions import _resolve_sector
+
+    session = datetime(2016, 1, 4, 9, tzinfo=KRX_TZ)
+    decision = datetime(2016, 1, 4, 15, 30, tzinfo=KRX_TZ)
+    rows = pl.DataFrame(
+        {
+            'instrument_id': ['KRX:A', 'KRX:A'],
+            'sector': ['__UNKNOWN__', '__UNKNOWN__'],
+            'available_at': [session, session],
+            'valid_from': [session, session],
+            'valid_to': [session, session],
+        }
+    )
+    assert _resolve_sector(security_master=rows, instrument_id='KRX:A', session=session, decision_time=decision) == '__UNKNOWN__'
+
+
 def test_ledger_delisting_unsettled_records_no_cash_and_rejects_open_position():
     from datetime import datetime
     from src.core.ledger import Ledger, LedgerCorporateAction, LedgerActionType

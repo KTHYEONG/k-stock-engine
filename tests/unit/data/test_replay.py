@@ -525,3 +525,32 @@ def test_resolve_latest_master_snapshot_uses_latest_pit_row_only() -> None:
     assert actual.select(['instrument_id', 'market']).to_dicts() == [
         {'instrument_id': 'KRX:005930', 'market': 'KOSPI'}
     ]
+
+
+def test_resolve_latest_master_snapshot_matches_same_krx_date_open_snapshot() -> None:
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    import polars as pl
+
+    from src.data.replay import resolve_latest_master_snapshot
+
+    kst = ZoneInfo("Asia/Seoul")
+    session = datetime(2017, 12, 28, tzinfo=kst)
+    master = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:005930"],
+            "market": ["KOSPI"],
+            "valid_from": [datetime(2017, 12, 28, 9, tzinfo=kst)],
+            "valid_to": [datetime(2017, 12, 28, 9, tzinfo=kst)],
+            "available_at": [datetime(2017, 12, 28, 9, tzinfo=kst)],
+        }
+    )
+
+    actual = resolve_latest_master_snapshot(
+        master,
+        session=session,
+        decision_time=datetime(2017, 12, 28, 15, 30, tzinfo=UTC),
+    )
+
+    assert actual.select("instrument_id").to_series().to_list() == ["KRX:005930"]

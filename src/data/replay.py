@@ -7,14 +7,14 @@ import re
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import cast
 
 import polars as pl
 
 from src.core.datasets import DatasetCertification
-from src.core.time import SessionCalendar
+from src.core.time import KRX_TZ, SessionCalendar
 from src.data.schemas import PITDataError, SilverTable
 from src.features.contracts import QvefFeaturePolicy, QvefFeatureRow
 from src.strategy.scoring import ChampionScoreRow
@@ -62,7 +62,19 @@ def resolve_latest_master_snapshot(
         try:
             vf = r.get("valid_from")
             vt = r.get("valid_to")
-            if vf is None or not (vf <= session) or (vt is not None and not (session <= vt)):
+            # Master snapshots are keyed by KRX trading *date*, but ingestion
+            # timestamps commonly use the market-open hour (09:00 KST).  A
+            # session is represented at midnight, so comparing raw datetimes
+            # incorrectly drops the snapshot from that same trading day.
+            def _krx_date(value: object) -> date | None:
+                if not isinstance(value, datetime):
+                    return None
+                return value.astimezone(KRX_TZ).date() if value.tzinfo is not None else value.date()
+
+            session_date = session.astimezone(KRX_TZ).date()
+            vf_date = _krx_date(vf)
+            vt_date = _krx_date(vt)
+            if vf_date is None or vf_date > session_date or (vt_date is not None and session_date > vt_date):
                 continue
         except TypeError:
             continue
