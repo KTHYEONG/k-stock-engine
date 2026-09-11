@@ -395,6 +395,7 @@ def collect_planned_investor_flow(
     bronze_root: Path,
     retrieved_at: datetime,
     checkpoint_store: CollectionCheckpointStore,
+    allow_source_unavailable: bool = False,
 ) -> CollectionArtifact:
     """Collect only verified investor-flow chunks and make each completion resumable."""
     # provider routing: resolve_investor_flow_collector(provider, (chunk.symbol,))
@@ -419,15 +420,17 @@ def collect_planned_investor_flow(
         try:
             pages = tuple(active.fetch_investor_flow(min(chunk.sessions), max(chunk.sessions), bronze_root=bronze_root, retrieved_at=retrieved_at, symbols=(chunk.symbol,)))
         except PITDataError as exc:
-            if "missing requested session" not in str(exc):
+            if not allow_source_unavailable:
                 raise
+            reason = str(exc)
             negative = json.dumps(
                 {
                     "provider": norm_provider,
                     "endpoint": endpoint,
                     "symbol": chunk.symbol,
                     "sessions": [value.isoformat() for value in chunk.sessions],
-                    "status": "source_unavailable",
+                    "status": "source_unavailable" if "missing requested session" in reason else "provider_error",
+                    "reason": reason,
                 },
                 sort_keys=True,
             ).encode("utf-8")
@@ -452,6 +455,27 @@ def collect_planned_investor_flow(
                     observed_sessions.add(str(record.get("session")))
         if not expected_sessions.issubset(observed_sessions):
             missing = ",".join(sorted(expected_sessions - observed_sessions))
+            if allow_source_unavailable:
+                negative = json.dumps(
+                    {
+                        "provider": norm_provider,
+                        "endpoint": endpoint,
+                        "symbol": chunk.symbol,
+                        "sessions": [value.isoformat() for value in chunk.sessions],
+                        "status": "source_unavailable",
+                        "missing_sessions": missing.split(","),
+                    },
+                    sort_keys=True,
+                ).encode("utf-8")
+                page_receipts.append(
+                    store.import_bytes(
+                        negative,
+                        kind=EvidenceKind.INVESTOR_FLOW,
+                        retrieved_at=retrieved_at,
+                        source_label=f"{norm_provider}:source-unavailable:{chunk.symbol}:{chunk.chunk_id}",
+                    )
+                )
+                continue
             raise PITDataError(f"{norm_provider} investor flow missing requested sessions for {chunk.symbol}: {missing}")
         raw_receipts: list[BronzeReceipt] = []
         for page in pages:

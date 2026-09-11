@@ -201,6 +201,7 @@ def test_verified_flow_selection_edge_cases() -> None:
     from src.data.schemas import PITDataError
 
     assert _raw_isin({"ISU_CD": "KR1234567890"}) == "KR1234567890"
+    assert _raw_isin({"ISU_CD": "KYG210AT1036"}) == "KYG210AT1036"
     assert _raw_isin({"ISU_CD": "nope"}) is None
 
     base = {
