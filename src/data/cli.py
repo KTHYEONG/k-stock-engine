@@ -24,6 +24,12 @@ from src.data.collection_plan import (
     build_historical_collection_plan_from_bronze,
     load_collection_plan,
 )
+from src.data.gold_loader import (
+    load_gold_window_inputs,
+    parse_silver_dataset_bindings,
+    resolve_gold_dataset_bindings,
+    write_gold_input_binding_artifact,
+)
 from src.data.legacy_inventory import MigrationArtifactStore, inspect_legacy_data, plan_bronze_retention
 from src.data.operations import execute_verified_legacy_purge
 from src.data.pipeline import materialize_backtest_inputs
@@ -189,6 +195,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p_gold.add_argument("--decision-time", type=str, required=True)
     p_gold.add_argument("--validation-start", type=str, required=True)
     p_gold.add_argument("--validation-end", type=str, required=True)
+    p_gold.add_argument("--silver-dataset-id", action="append", metavar="TABLE=DATASET_ID", required=True)
 
     p_bdm = sub.add_parser("backfill-daily-market", help="PIT-safe Silver daily-market coverage backfill")
     p_bdm.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
@@ -1212,20 +1219,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "build-gold":
         try:
             from src.data.gold import materialize_gold_window
-            from src.data.gold_loader import GoldWindowInputs, load_gold_window_inputs
+            from src.data.gold_loader import GoldWindowInputs
 
             decision_time = _parse_dt(args.decision_time)
             validation_start = date.fromisoformat(str(args.validation_start))
             validation_end = date.fromisoformat(str(args.validation_end))
             silver_root = Path(args.silver_root)
+            dataset_ids = parse_silver_dataset_bindings(args.silver_dataset_id)
+            dataset_ids = resolve_gold_dataset_bindings(silver_root=silver_root, requested=dataset_ids, decision_time=decision_time)
 
             inputs: GoldWindowInputs
-            inputs = load_gold_window_inputs(silver_root=silver_root, validation_start=validation_start, validation_end=validation_end, decision_time=decision_time)
+            inputs = load_gold_window_inputs(silver_root=silver_root, validation_start=validation_start, validation_end=validation_end, decision_time=decision_time, silver_dataset_ids=dataset_ids)
 
             gold_target_root: Path | None = Path(args.gold_root) if args.gold_root else None
             from src.strategy.scoring import ChampionScorePolicy
 
             score_policy = ChampionScorePolicy()
+            write_gold_input_binding_artifact(
+                artifact_root=Path(args.artifact_root),
+                dataset_ids=dataset_ids,
+                decision_time=decision_time,
+                validation_start=validation_start,
+                validation_end=validation_end,
+            )
 
             gold_report = materialize_gold_window(
                 calendar=inputs.calendar, security_master=inputs.security_master, daily_market=inputs.daily_market, financial_facts=inputs.financial_facts, corporate_actions=inputs.corporate_actions, investor_flow=inputs.investor_flow,
