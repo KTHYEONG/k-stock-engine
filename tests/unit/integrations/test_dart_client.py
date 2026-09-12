@@ -55,6 +55,42 @@ def test_fetch_corporate_action_decisions_rejects_invalid_arguments() -> None:
         client.fetch_corporate_action_decisions(corp_codes=(), start=date(2024, 1, 1), end=date(2024, 1, 2))
 
 
+def test_fetch_dividend_disclosures_queries_every_report_code(monkeypatch) -> None:
+    from src.integrations.dart.client import DartApiClient
+
+    client = DartApiClient(api_key="test-key")
+    seen: list[dict[str, str]] = []
+
+    def fake_request_validated(endpoint, params):
+        seen.append(dict(params))
+        if params["reprt_code"] == "11011":
+            return {"status": "000", "list": [{"se": "주당 현금배당금(원)", "stock_knd": "보통주", "thstrm": "1,444"}]}
+        return {"status": "013", "list": []}
+
+    monkeypatch.setattr(client, "_request_validated", fake_request_validated)
+
+    pages = client.fetch_dividend_disclosures(corp_codes=["00126380"], bsns_years=["2022"])
+
+    assert len(pages) == 4
+    assert {page.reprt_code for page in pages} == {"11011", "11012", "11013", "11014"}
+    assert all(page.corp_code == "00126380" and page.bsns_year == "2022" for page in pages)
+    annual = next(page for page in pages if page.reprt_code == "11011")
+    assert annual.status == "000"
+    assert annual.records == ({"se": "주당 현금배당금(원)", "stock_knd": "보통주", "thstrm": "1,444"},)
+    assert {call["reprt_code"] for call in seen} == {"11011", "11012", "11013", "11014"}
+
+
+def test_fetch_dividend_disclosures_rejects_invalid_arguments() -> None:
+    import pytest
+    from src.integrations.dart.client import DartApiClient
+
+    client = DartApiClient(api_key="test-key")
+    with pytest.raises(ValueError, match="corp_codes"):
+        client.fetch_dividend_disclosures(corp_codes=(), bsns_years=("2022",))
+    with pytest.raises(ValueError, match="bsns_years"):
+        client.fetch_dividend_disclosures(corp_codes=("00126380",), bsns_years=())
+
+
 from datetime import date, datetime
 
 from src.core.time import KRX_TZ, SessionCalendar

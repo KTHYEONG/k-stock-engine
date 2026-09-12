@@ -38,6 +38,19 @@ _CORPORATE_ACTION_ENDPOINTS: tuple[str, ...] = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class DartDividendPage:
+    corp_code: str
+    bsns_year: str
+    reprt_code: str
+    status: str
+    records: tuple[dict[str, Any], ...]
+
+
+_DIVIDEND_ENDPOINT = "alotMatter.json"
+_DIVIDEND_REPORT_CODES: tuple[str, ...] = ("11011", "11012", "11013", "11014")
+
+
 class DartApiError(RuntimeError):
     """Base DART API failure."""
 
@@ -325,6 +338,44 @@ class DartApiClient:
                         endpoint=endpoint, corp_code=corp_code, status=status, records=records
                     )
                 )
+        return tuple(pages)
+
+    def fetch_dividend_disclosures(
+        self, *, corp_codes: Sequence[str], bsns_years: Sequence[str]
+    ) -> tuple[DartDividendPage, ...]:
+        from src.data.schemas import PITDataError
+
+        codes = tuple(str(code).strip() for code in corp_codes if str(code).strip())
+        if not codes:
+            raise ValueError("corp_codes must not be empty")
+        years = tuple(str(year).strip() for year in bsns_years if str(year).strip())
+        if not years:
+            raise ValueError("bsns_years must not be empty")
+        pages: list[DartDividendPage] = []
+        for corp_code in codes:
+            for year in years:
+                for reprt_code in _DIVIDEND_REPORT_CODES:
+                    try:
+                        payload = self._request_validated(
+                            _DIVIDEND_ENDPOINT,
+                            {"corp_code": corp_code, "bsns_year": year, "reprt_code": reprt_code},
+                        )
+                    except DartApiError as exc:  # pragma: no cover
+                        raise PITDataError(  # pragma: no cover
+                            f"unexpected OpenDART status for {_DIVIDEND_ENDPOINT} {corp_code}/{year}/{reprt_code}: {exc}"
+                        ) from exc
+                    status = str(payload.get("status") or "")
+                    if status not in (OK_DART_STATUS, EMPTY_DART_STATUS):
+                        raise PITDataError(  # pragma: no cover
+                            f"unexpected OpenDART status {status!r} for {_DIVIDEND_ENDPOINT} {corp_code}/{year}/{reprt_code}"
+                        )
+                    raw = payload.get("list", [])
+                    records = tuple(dict(item) for item in raw if isinstance(item, dict)) if isinstance(raw, list) else ()
+                    pages.append(
+                        DartDividendPage(
+                            corp_code=corp_code, bsns_year=year, reprt_code=reprt_code, status=status, records=records
+                        )
+                    )
         return tuple(pages)
 
     def load_corp_code_records(self) -> tuple[DartCorpCodeRecord, ...]:

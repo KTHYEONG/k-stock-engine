@@ -1629,7 +1629,15 @@ def refresh_corporate_action_silver(
     )
     if not pages:
         raise PITDataError("corporate-action source has no structured pages; certification blocked")
-    mapped = mapped_action_instruments(pages=pages)
+    from src.data.dividend_adjustment import (
+        load_dividend_corporate_action_pages,
+        resolve_dividend_corporate_action_records,
+    )
+
+    dividend_pages = load_dividend_corporate_action_pages(
+        action_receipts=tuple(grouped.get(EvidenceKind.CORPORATE_ACTIONS, ()))
+    )
+    mapped = mapped_action_instruments(pages=(*pages, *dividend_pages))
     if not mapped:
         raise PITDataError("unmapped corporate-action page; certification blocked")
     preview = (
@@ -1640,6 +1648,10 @@ def refresh_corporate_action_silver(
     if preview.height == 0:
         raise PITDataError("corporate-action preview has no mapped bars; certification blocked")
     resolved = resolve_opendart_corporate_action_records(pages=pages, daily_market=preview, calendar=calendar)
+    if dividend_pages:
+        resolved = resolved + resolve_dividend_corporate_action_records(
+            pages=dividend_pages, daily_market=preview, sessions=tuple(sorted(calendar.sessions))
+        )
     for row in resolved:
         if "evidence_status" not in row or "evidence_reason" not in row:
             raise PITDataError("corporate-action cache row lacks evidence_status/evidence_reason; certification blocked")

@@ -350,5 +350,8 @@
   },
   "src/validation/walk_forward.py": {
     "testing": "tests/unit/validation/test_walk_forward.py"
+  },
+  "src/data/dividend_adjustment.py": {
+    "testing": "tests/unit/data/test_dividend_adjustment.py"
   }
 }
