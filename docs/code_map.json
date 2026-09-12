@@ -44,6 +44,7 @@
       "tests/unit/data/test_silver.py",
       "tests/unit/data/test_streaming_stock_normalization.py",
       "tests/unit/engine/test_backtest.py",
+      "tests/unit/engine/test_backtest_affordable_buy.py",
       "tests/unit/engine/test_runner.py",
       "tests/unit/execution/test_submit_intents.py",
       "tests/unit/features/test_qvef.py",
@@ -51,6 +52,7 @@
       "tests/unit/integrations/test_dart_client.py",
       "tests/unit/integrations/test_dart_lifecycle.py",
       "tests/unit/strategy/test_compounding_strategy.py",
+      "tests/unit/strategy/test_compounding_v2_strategy.py",
       "tests/unit/strategy/test_core_strategy.py",
       "tests/unit/strategy/test_universe.py"
     ]
@@ -101,10 +103,7 @@
     "testing": "tests/unit/data/test_gold.py"
   },
   "src/data/gold_artifacts.py": {
-    "testing": [
-      "tests/unit/data/test_gold_artifacts.py",
-      "tests/unit/data/test_cli.py"
-    ]
+    "testing": "tests/unit/data/test_gold_artifacts.py"
   },
   "src/data/gold_informativeness.py": {
     "testing": "tests/unit/data/test_gold_informativeness.py"
@@ -177,8 +176,10 @@
       "tests/integration/engine/test_unified_event_backtester.py",
       "tests/unit/data/test_backtest_runner.py",
       "tests/unit/engine/test_backtest.py",
+      "tests/unit/engine/test_backtest_affordable_buy.py",
       "tests/unit/strategy/test_champion_strategy.py",
       "tests/unit/strategy/test_compounding_strategy.py",
+      "tests/unit/strategy/test_compounding_v2_strategy.py",
       "tests/unit/strategy/test_core_strategy.py"
     ]
   },
@@ -225,6 +226,7 @@
       "tests/integration/execution/test_submission_gate.py",
       "tests/unit/data/test_backtest_runner.py",
       "tests/unit/engine/test_backtest.py",
+      "tests/unit/engine/test_backtest_affordable_buy.py",
       "tests/unit/execution/test_intents.py",
       "tests/unit/execution/test_submit_intents.py",
       "tests/unit/strategy/test_champion_strategy.py"
@@ -233,6 +235,7 @@
   "src/execution/domain/orders.py": {
     "testing": [
       "tests/integration/execution/test_submission_gate.py",
+      "tests/unit/engine/test_backtest_affordable_buy.py",
       "tests/unit/engine/test_fill_model.py",
       "tests/unit/execution/test_broker.py",
       "tests/unit/execution/test_orders.py",
@@ -333,6 +336,9 @@
   },
   "src/strategy/compounding_strategy.py": {
     "testing": "tests/unit/strategy/test_compounding_strategy.py"
+  },
+  "src/strategy/compounding_v2_strategy.py": {
+    "testing": "tests/unit/strategy/test_compounding_v2_strategy.py"
   },
   "src/strategy/core_strategy.py": {
     "testing": "tests/unit/strategy/test_core_strategy.py"

@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_KR_EQUITY_COMPOUNDING_STRATEGY_V2",
+      "date": "2026-09-12",
+      "adr_id": "ADR_20260912_KR_EQUITY_COMPOUNDING_STRATEGY_V2",
+      "domain": "backtest",
+      "title": "Korean Equity Compounding Strategy v2",
+      "why": "현행 전략은 대형주 역변동성·고정 현금 버퍼로 수익이 희석되고 T+2 결제 중 매수 과다 위험이 있었습니다.",
+      "resolution": "PIT Champion score 기반 12종목 복합선정과 추세·변동성 게이트를 추가하고 실제 settled cash 기준 매수 수량 제한을 원장에 배선했습니다.",
+      "impact": "계약·구현·테스트 검증은 통과했지만 CAGR 30%·MDD 20% 달성은 별도 walk-forward Ledger 검증 게이트로 남겼습니다."
+    },
+    {
       "task_id": "TASK_KR_EQUITY_COMPOUNDING_FULL_BACKTEST",
       "date": "2026-09-12",
       "adr_id": "ADR_20260912_KR_EQUITY_COMPOUNDING_FULL_BACKTEST",
