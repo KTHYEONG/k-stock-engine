@@ -81,13 +81,13 @@ def test_compounding_v2_dispatch_end_to_end_with_pit_inputs(tmp_path, monkeypatc
     })
 
     def fake_resolve(*, gold_root, dataset_id, decision_time, required_kinds):
-        assert required_kinds == ('universe', 'champion_scores')
+        assert required_kinds == ('universe', 'qvef', 'champion_scores')
         return SimpleNamespace(dataset_id=dataset_id, universe_manifest_hash='uni-hash', champion_scores_manifest_hash='scores-hash')
 
     monkeypatch.setattr(silver_mod, 'load_silver_table_by_dataset_id', lambda *, root, table, dataset_id, decision_time: fake_load_table(root, table))
     monkeypatch.setattr(silver_mod, 'silver_dataset_path_by_id', lambda *, root, table, dataset_id, decision_time: dm_dir)
     monkeypatch.setattr(gold_artifacts_mod, 'resolve_gold_artifact_bundle', fake_resolve)
-    monkeypatch.setattr(gold_artifacts_mod, 'load_gold_universe_and_scores', lambda *, bundle, decision_time: (universe_df, scores_df))
+    monkeypatch.setattr(gold_artifacts_mod, 'load_gold_artifact_frames', lambda *, bundle, decision_time: (universe_df, universe_df, scores_df))
 
     run_manifest_obj = build_backtest_run_manifest(
         silver_root=tmp_path / 'silver',
@@ -178,3 +178,17 @@ def test_compounding_v2_dispatch_emits_selection_shortfall_summary(capsys, monke
         'no_score_rows': 0,
         'below_min_positions': 1,
     }
+
+
+def test_cli_compounding_v2_loads_qvef_for_certification() -> None:
+    import inspect
+
+    import src.data.cli as cli
+
+    # Given
+    source = inspect.getsource(cli._dispatch_backtest)
+
+    # Then: qvef is part of the compounding-v2 bundle and the certified loader is used.
+    assert '"universe", "qvef", "champion_scores"' in source or "'universe', 'qvef', 'champion_scores'" in source
+    assert 'load_gold_artifact_frames(bundle=bundle, decision_time=gold_decision_time)' in source
+    assert 'required_kinds=("universe", "champion_scores")' not in source
