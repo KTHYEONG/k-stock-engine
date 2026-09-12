@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_DART_BACKFILL_ADAPTIVE_COLLECTION",
+      "date": "2026-09-13",
+      "adr_id": "ADR_20260913_DART_BACKFILL_ADAPTIVE_COLLECTION",
+      "domain": "data",
+      "title": "DART 재무제표 수집 동시성 적용",
+      "why": "fetch_financial_fact_sources가 identity당 순차 HTTP 호출만 수행해 실측 안전한 200+req/s 여력을 전혀 활용 못함 (적응형 CFS/OFS 폴백은 이미 구현되어 있었음)",
+      "resolution": "_fetch_one_financial_fact_source로 로직 추출 후 ThreadPoolExecutor(max_workers=20 기본)로 identity간 동시 fetch, 순서·예외 동작 완전 보존",
+      "impact": "실측 18배 벽시계 단축(20건 2.01s->0.11s), lean_check 100% diff-coverage PASS, 관련 스위트 30건 통과"
+    },
+    {
       "task_id": "TASK_CHAMPION_FACTOR_DATA_GAP_FIX",
       "date": "2026-09-12",
       "adr_id": "ADR_20260912_CHAMPION_FACTOR_DATA_GAP_FIX",
