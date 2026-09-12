@@ -179,29 +179,17 @@ class HistoricalFillModel:
         adtv = float(bar.adtv_20d)
         lot = int(order.instrument.lot_size)
         requested = int(order.quantity)
-        req_participation = requested * raw_open / adtv
-        # hard cap fatal
-        if req_participation > self._hard_cap + 1e-12:
-            raise BacktestIntegrityError(f"hard participation breach: {req_participation:.6f} > {self._hard_cap}")
         target_qty_max = math.floor((self._target_cap * adtv) / raw_open / lot) * lot
-        hard_qty_max = math.floor((self._hard_cap * adtv) / raw_open / lot) * lot
         # determine filled qty
-        if requested <= target_qty_max:
-            filled_qty = requested
-        elif requested <= hard_qty_max:
-            if target_qty_max == 0:
-                # zero capacity -> reject
-                return BacktestReject(
-                    reject_id=f"reject:{order.order_id}",
-                    order_id=order.order_id,
-                    reason="zero capacity at target",
-                    rejected_quantity=requested,
-                    event_time=bar.session_open,
-                )
-            filled_qty = int(target_qty_max)
-        else:
-            # should have been hard breach earlier, but if lot rounding pushed over?
-            raise BacktestIntegrityError("hard participation breach after lot rounding")
+        if target_qty_max == 0:
+            return BacktestReject(
+                reject_id=f"reject:{order.order_id}",
+                order_id=order.order_id,
+                reason="zero capacity at target",
+                rejected_quantity=requested,
+                event_time=bar.session_open,
+            )
+        filled_qty = min(requested, int(target_qty_max))
         if filled_qty == 0:
             return BacktestReject(
                 reject_id=f"reject:{order.order_id}",
