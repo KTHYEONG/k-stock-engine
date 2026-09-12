@@ -36,7 +36,7 @@ def resolve_sentinel_master_conflicts(master: pl.DataFrame) -> pl.DataFrame:
         return master
     sentinel_count = pl.lit(0, dtype=pl.Int32)
     for name in present:
-        sentinel_count = sentinel_count + (pl.col(name) == MASTER_SENTINEL_VALUE).cast(pl.Int32)
+        sentinel_count = sentinel_count + (pl.col(name) == MASTER_SENTINEL_VALUE).fill_null(False).cast(pl.Int32)
     counted = master.with_columns(sentinel_count.alias("_sentinel_count"))
     minimal = pl.col("_sentinel_count").min().over(["instrument_id", "valid_from"])
     return counted.filter(pl.col("_sentinel_count") == minimal).select(master.columns)

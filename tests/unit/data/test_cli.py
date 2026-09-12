@@ -706,6 +706,34 @@ def test_cli_bronze_retention_plan_wires_read_only_audit(tmp_path, monkeypatch, 
     assert 'deletion_eligible' in capsys.readouterr().out
 
 
+def test_cli_silver_gold_retention_plan_wires_read_only_audit(tmp_path, monkeypatch, capsys) -> None:
+    from types import SimpleNamespace
+    import src.data.cli as cli
+
+    captured: dict[str, object] = {}
+
+    def fake_plan(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            retained_silver_roots=('stocks',),
+            reclaimable_silver_roots=('stocks_prepared_20260910_v5',),
+            retained_gold_roots=('stocks',),
+            reclaimable_gold_roots=(),
+            orphaned_staging_paths=(),
+            blocking_reasons=(),
+            deletion_eligible=True,
+        )
+    monkeypatch.setattr(cli, 'plan_storage_root_retention', fake_plan)
+
+    code = cli.main(['silver-gold-retention-plan', '--silver-base', str(tmp_path / 'silver'), '--gold-base', str(tmp_path / 'gold'), '--artifact-root', str(tmp_path / 'artifacts')])
+
+    assert code == 0
+    assert captured['silver_base'] == tmp_path / 'silver'
+    assert captured['gold_base'] == tmp_path / 'gold'
+    assert captured['artifact_root'] == tmp_path / 'artifacts'
+    assert 'deletion_eligible' in capsys.readouterr().out
+
+
 def test_run_backtest_core_requires_backtest_run_manifest(tmp_path) -> None:
     from argparse import Namespace
 

@@ -392,6 +392,36 @@ def test_resolve_sentinel_master_conflicts_drops_dominated_placeholder_row() -> 
     assert result.to_dicts()[0]["source_hash"] == "krx"
 
 
+def test_resolve_sentinel_master_conflicts_keeps_row_with_null_sentinel_columns() -> None:
+    """market/status/sector 가 null 인 정상 행이 null==null 전파로 조용히 삭제되지 않는다."""
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+
+    import polars as pl
+
+    from src.data.master_intervals import resolve_sentinel_master_conflicts
+
+    kst = ZoneInfo("Asia/Seoul")
+    day = dt.datetime(2016, 1, 4, 9, tzinfo=kst)
+    master = pl.DataFrame(
+        {
+            "instrument_id": ["KRX:005930"],
+            "market": [None],
+            "status": [None],
+            "sector": [None],
+            "valid_from": [day],
+            "valid_to": [day],
+            "available_at": [day],
+            "source_hash": ["krx"],
+        }
+    )
+
+    result = resolve_sentinel_master_conflicts(master)
+
+    assert result.height == 1
+    assert result.to_dicts()[0]["source_hash"] == "krx"
+
+
 def test_resolve_sentinel_master_conflicts_keeps_equal_evidence_tie_for_primary_key_gate() -> None:
     """센티넬 밀도가 같은 상충은 진짜 모호성이므로 행 순서로 임의 해소하지 않는다."""
     import datetime as dt
