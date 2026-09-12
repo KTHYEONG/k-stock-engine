@@ -24,6 +24,7 @@ from src.data.collection_plan import (
     build_historical_collection_plan_from_bronze,
     load_collection_plan,
 )
+from src.data.gold_informativeness import CHAMPION_SCORE_COVERAGE_FLOORS, certify_informative_gold
 from src.data.gold_loader import (
     load_gold_window_inputs,
     parse_silver_dataset_bindings,
@@ -31,6 +32,7 @@ from src.data.gold_loader import (
     write_gold_input_binding_artifact,
 )
 from src.data.legacy_inventory import MigrationArtifactStore, inspect_legacy_data, plan_bronze_retention
+from src.data.master_intervals import compact_security_master_intervals
 from src.data.operations import execute_verified_legacy_purge
 from src.data.pipeline import materialize_backtest_inputs
 from src.data.schemas import PITDataError, SilverTable
@@ -511,6 +513,8 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     calendar = SessionCalendar(cal_sessions)
 
     if strategy is None and scores_frame is not None and strategy_id != "core-v1":
+        # 정보량 미달 Gold 가 전략 구성·원장 실행에 도달하지 못하게 먼저 차단한다.
+        certify_informative_gold(frame=scores_frame, floors=CHAMPION_SCORE_COVERAGE_FLOORS, dataset_label=f"champion_scores/{gold_dataset_id}")
         scores_by_session = _champion_scores_by_session(scores_frame)
         strategy = ChampionStrategy(scores_by_session=scores_by_session, calendar=calendar)
 
@@ -618,11 +622,8 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         security_master = _load_silver_table(silver_root, SilverTable.SECURITY_MASTER)
         corporate_actions = _load_silver_table(silver_root, SilverTable.CORPORATE_ACTIONS)
 
-    # KRX bridge refreshes can retain byte-identical master snapshots from
-    # multiple source partitions.  They do not represent distinct PIT states
-    # and would otherwise make sector resolution fail closed as ambiguous.
-    if hasattr(security_master, "unique"):
-        security_master = security_master.unique(maintain_order=True)
+    # 일자 스냅샷 중복은 SCD2 구간 압축으로 제거한다 (unique 는 0행도 줄이지 못하는 순손실).
+    security_master = compact_security_master_intervals(security_master, sessions=cal_sessions)
 
     if run_manifest is not None:
         lifecycle_events = _load_manifest_silver_table(
