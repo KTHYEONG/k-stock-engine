@@ -5,7 +5,7 @@ import json
 import math
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from itertools import pairwise
 from typing import Any
@@ -902,6 +902,57 @@ def resolve_backtest_lifecycle_evidence(
     return CorporateActionCoverage(actions_by_session=actions_map, research_returns_by_key={})
 
 
+@dataclass(frozen=True, slots=True)
+class EligibleMarketTrendPoint:
+    index_level: float
+    sma100: float | None
+    sma200: float | None
+
+
+def build_eligible_cap_weighted_market_trend(
+    *,
+    daily_market: pl.DataFrame,
+    calendar: SessionCalendar,
+    eligible_by_session: Mapping[date, tuple[str, ...]],
+    adjusted_returns: Mapping[tuple[datetime, str], float],
+    short_window: int = 100,
+    long_window: int = 200,
+) -> Mapping[datetime, EligibleMarketTrendPoint]:
+    sessions = tuple(calendar.sessions)
+    caps: dict[tuple[datetime, str], float] = {}
+    for row in daily_market.select("session", "instrument_id", "market_cap").to_dicts():
+        caps[(_coerce_session(row["session"]), str(row["instrument_id"]))] = float(row["market_cap"])
+    trend: dict[datetime, EligibleMarketTrendPoint] = {}
+    levels: list[float] = []
+    level_sessions: list[datetime] = []
+    level = 1.0
+    for index, session in enumerate(sessions):
+        previous = sessions[index - 1] if index > 0 else None
+        eligible = eligible_by_session.get(session.date(), ())
+        total_cap = 0.0
+        weighted = 0.0
+        for iid in eligible:
+            lag_cap = caps.get((previous, iid), float("nan")) if previous is not None else float("nan")
+            adj = float(adjusted_returns.get((session, iid), float("nan")))
+            if math.isfinite(lag_cap) and lag_cap > 0 and math.isfinite(adj) and (session, iid) in caps:
+                total_cap += lag_cap
+                weighted += lag_cap * adj
+        if total_cap > 0 or index == 0:
+            if total_cap > 0:
+                level = level * (1.0 + weighted / total_cap)
+            levels.append(level)
+            level_sessions.append(session)
+            sma_short = float(sum(levels[-short_window:]) / short_window) if len(levels) >= short_window and level_sessions[-short_window] == sessions[index - short_window + 1] else None
+            sma_long = float(sum(levels[-long_window:]) / long_window) if len(levels) >= long_window and level_sessions[-long_window] == sessions[index - long_window + 1] else None
+            trend[session] = EligibleMarketTrendPoint(index_level=float(level), sma100=sma_short, sma200=sma_long)
+    return trend
+
+
+def with_market_trend_snapshot(*, market_snapshot: Mapping[str, Any], point: EligibleMarketTrendPoint | None) -> dict[str, Any]:
+    if point is None:
+        return dict(market_snapshot)
+    return {**dict(market_snapshot), "market_index_level": float(point.index_level), "market_index_sma100": None if point.sma100 is None else float(point.sma100), "market_index_sma200": None if point.sma200 is None else float(point.sma200)}
+
 def build_backtest_sessions(
     *,
     snapshot_repository: PITSnapshotRepository,
@@ -912,6 +963,7 @@ def build_backtest_sessions(
     security_master: pl.DataFrame | None = None,
     corporate_actions: pl.DataFrame | None = None,
     lifecycle_events: pl.DataFrame | None = None,
+    market_index_eligible_by_session: Mapping[date, tuple[str, ...]] | None = None,
     policy: BacktestMarketInputsPolicy = BacktestMarketInputsPolicy(),  # noqa: B008
 ) -> tuple[BacktestSession, ...]:
     if start.tzinfo is None or end.tzinfo is None:
@@ -1007,6 +1059,8 @@ def build_backtest_sessions(
                     cleanup_keys.add((iid_key, candidate_session))
         lifecycle_cleanup_keys = frozenset(cleanup_keys)
     coverage = validate_corporate_action_coverage(daily_market=full, corporate_actions=corporate_actions, calendar=calendar, decision_time_of=decision_time_of, policy=policy, lifecycle_cleanup_keys=lifecycle_cleanup_keys)
+    trend_eligible = market_index_eligible_by_session if market_index_eligible_by_session is not None else {}
+    market_trend = build_eligible_cap_weighted_market_trend(daily_market=full, calendar=calendar, eligible_by_session=trend_eligible, adjusted_returns=coverage.research_returns_by_key) if trend_eligible else {}
     if lifecycle_coverage is not None:  # pragma: no cover - lifecycle merge is exercised via resolve unit test
         _merged: dict[datetime, list[LedgerCorporateAction]] = {session: list(actions) for session, actions in coverage.actions_by_session.items()}
         for _session, _actions in lifecycle_coverage.actions_by_session.items():
@@ -1123,6 +1177,7 @@ def build_backtest_sessions(
             "market_volatility": float(market_vol_map[session_open]),
             "market_caps": market_caps,
         }
+        market_snapshot = with_market_trend_snapshot(market_snapshot=market_snapshot, point=market_trend.get(session_open))
         sessions.append(
             BacktestSession(
                 session_open=session_open,
