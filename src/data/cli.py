@@ -476,18 +476,34 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         val_start = run_manifest.validation_start
         val_end = run_manifest.validation_end
         strategy_id = run_manifest.strategy_id
-        from src.data.gold_artifacts import load_gold_artifact_frames, resolve_gold_artifact_bundle
+        from src.data.gold_artifacts import (
+            load_gold_artifact_frames,
+            load_gold_universe_frame,
+            resolve_gold_artifact_bundle,
+        )
 
         gold_decision_time = datetime.now(UTC)
-        bundle = resolve_gold_artifact_bundle(
-            gold_root=gold_root,
-            dataset_id=str(gold_dataset_id),
-            decision_time=gold_decision_time,
-        )
-        universe_frame, _qvef_frame, scores_frame = load_gold_artifact_frames(
-            bundle=bundle, decision_time=gold_decision_time
-        )
-    if not smoke_symbol and strategy_id != "core-v1" and scores_frame is None:
+        if strategy_id == "compounding-v1":
+            bundle = resolve_gold_artifact_bundle(
+                gold_root=gold_root,
+                dataset_id=str(gold_dataset_id),
+                decision_time=gold_decision_time,
+                required_kinds=("universe",),
+            )
+        else:
+            bundle = resolve_gold_artifact_bundle(
+                gold_root=gold_root,
+                dataset_id=str(gold_dataset_id),
+                decision_time=gold_decision_time,
+            )
+        if strategy_id == "compounding-v1":
+            universe_frame = load_gold_universe_frame(bundle=bundle, decision_time=gold_decision_time)
+            scores_frame = None
+        else:
+            universe_frame, _qvef_frame, scores_frame = load_gold_artifact_frames(
+                bundle=bundle, decision_time=gold_decision_time
+            )
+    if not smoke_symbol and strategy_id not in ("core-v1", "compounding-v1") and scores_frame is None:
         _gid = str(gold_dataset_id) if gold_dataset_id is not None else ""
         if not _gid.strip() or "/" in _gid or "\\" in _gid or ".." in _gid:
             raise PITDataError("run-backtest requires resolved Gold artifact; missing --gold-dataset-id")

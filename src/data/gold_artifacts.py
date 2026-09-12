@@ -34,12 +34,19 @@ def _check_dataset_id(dataset_id: str) -> None:
 
 
 def resolve_gold_artifact_bundle(
-    *, gold_root: Path, dataset_id: str, decision_time: datetime
+    *,
+    gold_root: Path,
+    dataset_id: str,
+    decision_time: datetime,
+    required_kinds: tuple[str, ...] | None = None,
 ) -> GoldArtifactBundle:
     _check_dataset_id(dataset_id)
     root = Path(gold_root)
     kinds = ("universe", "qvef", "champion_scores")
-    for kind in kinds:
+    required = kinds if required_kinds is None else required_kinds
+    if not required or any(kind not in kinds for kind in required):
+        raise PITDataError(f"invalid required Gold components: {required!r}")
+    for kind in required:
         if not (root / kind / dataset_id).is_dir():
             raise PITDataError(f"missing {kind}/{dataset_id}: selected Gold component is absent")
     expected = {
@@ -48,7 +55,7 @@ def resolve_gold_artifact_bundle(
         "champion_scores": _SCORES_FEATURE_SET,
     }
     hashes: dict[str, str] = {}
-    for kind in kinds:
+    for kind in required:
         manifest = ParquetDatasetStore(root / kind).read_manifest(dataset_id)
         validate_dataset_manifest(manifest, AssetKind.STOCK, expected[kind], decision_time)
         hashes[kind] = manifest.content_hash
@@ -58,8 +65,15 @@ def resolve_gold_artifact_bundle(
         qvef_path=root / "qvef" / dataset_id,
         champion_scores_path=root / "champion_scores" / dataset_id,
         universe_manifest_hash=hashes["universe"],
-        qvef_manifest_hash=hashes["qvef"],
-        champion_scores_manifest_hash=hashes["champion_scores"],
+        qvef_manifest_hash=hashes.get("qvef", ""),
+        champion_scores_manifest_hash=hashes.get("champion_scores", ""),
+    )
+
+
+def load_gold_universe_frame(*, bundle: GoldArtifactBundle, decision_time: datetime) -> pl.DataFrame:
+    """Load only the PIT universe component for strategies without factor scores."""
+    return ParquetDatasetStore(bundle.universe_path.parent).read(
+        bundle.dataset_id, AssetKind.STOCK, _UNIVERSE_FEATURE_SET, decision_time
     )
 
 
