@@ -28,6 +28,43 @@ from src.execution.domain.orders import OrderSide
 _BUILD_CHAMPION_PORTFOLIO_ANCHOR = "build_champion_portfolio"
 
 
+def constrain_buy_to_settled_cash(
+    *,
+    ledger: Ledger,
+    fill_model: HistoricalFillModel,
+    order: BacktestOrder,
+    bar: HistoricalBar,
+) -> tuple[FillOutcome | BacktestReject, int]:
+    base = fill_model.execute(order, bar)
+    if isinstance(base, BacktestReject): return base, int(base.rejected_quantity)  # noqa: E701
+    affordable: FillOutcome | None = None
+    try:
+        ledger.validate_fill(base.fill)
+        affordable = base
+    except ValueError:
+        affordable = None
+    if affordable is None:
+        lot = int(order.instrument.lot_size)
+        total_lots = int(order.quantity) // lot
+        low = 0
+        high = total_lots
+        while low < high:
+            mid = (low + high + 1) // 2
+            trial = replace(order, quantity=mid * lot)
+            trial_result = fill_model.execute(trial, bar)
+            assert isinstance(trial_result, FillOutcome), "scaled buy must stay within fill-model capacity"
+            try:
+                ledger.validate_fill(trial_result.fill)
+                affordable = trial_result
+                low = mid
+            except ValueError:
+                high = mid - 1
+    if affordable is None:
+        reject = BacktestReject(reject_id=f"reject:{order.order_id}:settled-cash", order_id=order.order_id, reason="insufficient settled cash", rejected_quantity=int(order.quantity), event_time=bar.session_open)
+        return reject, int(order.quantity)
+    return affordable, int(order.quantity) - int(affordable.fill.quantity)
+
+
 @dataclass(frozen=True, slots=True)
 class BacktestConfig:
     ledger_id: str
@@ -181,6 +218,11 @@ class EventBacktester:
                             execution_time=pt.intent.execution_time,
                         )
                         result = fill_model.execute(order, bar)
+                        if side is OrderSide.BUY and isinstance(result, FillOutcome):
+                            scaled, cash_remainder = constrain_buy_to_settled_cash(ledger=ledger, fill_model=fill_model, order=order, bar=bar)
+                            if not isinstance(scaled, BacktestReject) and cash_remainder > scaled.unfilled_quantity:
+                                rejects.append(BacktestReject(reject_id=f"reject:{order.order_id}:settled-cash", order_id=order.order_id, reason="insufficient settled cash remainder", rejected_quantity=int(cash_remainder - scaled.unfilled_quantity), event_time=bar.session_open))
+                            result = scaled
                         if isinstance(result, FillOutcome):
                             try:
                                 settlement_time = calendar.advance(
