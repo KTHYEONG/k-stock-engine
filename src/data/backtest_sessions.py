@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -625,6 +625,35 @@ def _frame_for(repository: PITSnapshotRepository) -> pl.DataFrame | None:
     return frame
 
 
+def bound_calendar_to_market_window(
+    sessions: tuple[datetime, ...], market_sessions: Collection[datetime]
+) -> tuple[datetime, ...]:
+    """Trim calendar padding outside the market-data span.
+
+    Interior sessions absent from the market are preserved for rolling-window
+    continuity; only sessions outside [min(market), max(market)] are dropped.
+
+    Args:
+        sessions: Ordered calendar sessions, padding allowed.
+        market_sessions: Sessions actually present in market history.
+
+    Returns:
+        Calendar sessions within the market span, in original order.
+
+    Raises:
+        PITDataError: If the calendar or the market sessions are empty.
+    """
+    if len(sessions) == 0:
+        raise PITDataError("calendar must be non-empty")
+    market_span = tuple(market_sessions)
+    if len(market_span) == 0:
+        raise PITDataError("rolling inputs require at least one market session")
+    start = min(market_span)
+    end = max(market_span)
+    # 경계 밖 세션만 제거하고 내부는 원래 순서대로 유지한다.
+    return tuple(session for session in sessions if start <= session <= end)
+
+
 def _rolling_inputs(
     full: pl.DataFrame,
     policy: BacktestMarketInputsPolicy,
@@ -666,6 +695,8 @@ def _rolling_inputs(
         if not all(math.isfinite(value) for value in values) or values[0] <= 0 or values[2] <= 0:
             raise PITDataError(f"invalid rolling market input for {row['instrument_id']!r}")
         history.setdefault(str(row["instrument_id"]), {})[sess] = values
+    # history 구축 직후 무거운 이중 루프 진입 전에 캘린더를 시장 구간으로 바운딩한다.
+    sessions = bound_calendar_to_market_window(sessions, {key for points in history.values() for key in points})
     scale = math.sqrt(float(policy.annualization_sessions))
     for iid, points in history.items():
         for idx, session in enumerate(sessions):
