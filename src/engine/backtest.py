@@ -144,6 +144,8 @@ class EventBacktester:
         daily_nav: list[LedgerNav] = []
         capacity_diagnostics: list[CapacityDiagnostic] = []
         pending_targets: list[_PendingTarget] = []
+        # 거래정지 세션 평가용 최종 관측 종가 (PIT: 과거 관측치만 이월한다).
+        last_known_close: dict[str, float] = {}
 
         def _make_snapshot(as_of: datetime) -> PortfolioSnapshot:
             snap = ledger.snapshot(as_of)
@@ -171,6 +173,7 @@ class EventBacktester:
                     seen_ids.add(b.instrument_id)
                     if b.session_open != session.session_open:
                         raise BacktestIntegrityError(f"bar session_open {b.session_open} mismatches session {session.session_open}")
+                    last_known_close[b.instrument_id] = float(b.raw_close)
                 for act in session.actions:
                     if not isinstance(act, LedgerCorporateAction):
                         raise BacktestIntegrityError(f"unknown action {act!r}")
@@ -198,11 +201,22 @@ class EventBacktester:
                     next_pending: list[_PendingTarget] = []
                     for pt in pending_targets:
                         bar = bar_map.get(pt.instrument.instrument_id)
-                        if bar is None:
-                            raise BacktestIntegrityError(f"missing bar for {pt.instrument.instrument_id!r} at {session.session_open}")
                         current_qty = ledger.quantity_of(pt.instrument.instrument_id)
                         delta = int(pt.target_qty) - int(current_qty)
                         if delta == 0:
+                            continue
+                        if bar is None:
+                            # 체결 세션에 바가 없으면 거래정지·상장폐지로 주문이 소멸한다.
+                            # 체결 불가를 치명 중단이 아니라 취소 영수증으로 남긴다.
+                            rejects.append(
+                                BacktestReject(
+                                    reject_id=f"order:{pt.intent.intent_id}:{pt.decision_session_open.isoformat()}:missing-bar",
+                                    order_id=f"order:{pt.intent.intent_id}:{pt.decision_session_open.isoformat()}",
+                                    reason="missing execution bar",
+                                    rejected_quantity=abs(delta),
+                                    event_time=session.session_open,
+                                )
+                            )
                             continue
                         side = OrderSide.BUY if delta > 0 else OrderSide.SELL
                         qty = abs(delta)
@@ -281,7 +295,11 @@ class EventBacktester:
                     prices: list[tuple[str, float]] = []
                     for pos in snap_before_mark.positions:
                         if pos.instrument_id not in bar_close_map:
-                            raise BacktestIntegrityError(f"missing raw close for {pos.instrument_id!r}")
+                            # 거래정지 세션에는 신규 종가가 없다. 마지막으로 관측된
+                            # 종가를 이월해 평가한다 (임의값 대입·포지션 소각 금지).
+                            if pos.instrument_id not in last_known_close:
+                                raise BacktestIntegrityError(f"missing raw close for {pos.instrument_id!r}")
+                            bar_close_map[pos.instrument_id] = last_known_close[pos.instrument_id]
                         price = bar_close_map[pos.instrument_id]
                         if not isinstance(price, float):
                             price = float(price)
@@ -306,10 +324,23 @@ class EventBacktester:
                         raise BacktestIntegrityError(str(exc)) from exc
                     daily_nav.append(nav)
                 portfolio = _make_snapshot(session.decision_time)
+                market_snapshot = session.market_snapshot
+                if isinstance(market_snapshot, dict) and isinstance(market_snapshot.get("mark_prices"), dict):
+                    # 거래정지 보유 종목은 당일 호가가 없다. 전략이 NAV 를 평가할 수 있도록
+                    # 마지막 관측 종가를 이월해 채운다 (과거 관측치만 사용, 미래 정보 없음).
+                    session_marks: dict[str, float] = market_snapshot["mark_prices"]
+                    stale_marks = {
+                        position.instrument.instrument_id: last_known_close[position.instrument.instrument_id]
+                        for position in portfolio.positions
+                        if position.instrument.instrument_id not in session_marks
+                        and position.instrument.instrument_id in last_known_close
+                    }
+                    if stale_marks:
+                        market_snapshot = {**market_snapshot, "mark_prices": {**session_marks, **stale_marks}}
                 context = DecisionContext(
                     decision_time=session.decision_time,
                     portfolio=portfolio,
-                    market_snapshot=session.market_snapshot,
+                    market_snapshot=market_snapshot,
                 )
                 intents = strategy.decide(context)
                 if intents is None:
@@ -340,7 +371,18 @@ class EventBacktester:
                             raise BacktestIntegrityError("target_quantity not multiple of lot")
                     else:
                         if ref_bar is None:
-                            raise BacktestIntegrityError(f"missing bar for target_value conversion {intent.instrument_id!r}")
+                            # 결정 세션에 바가 없으면 수량 환산 기준가가 없다. 거래정지 종목의
+                            # 의도를 치명 중단이 아니라 미집행 영수증으로 남기고 건너뛴다.
+                            rejects.append(
+                                BacktestReject(
+                                    reject_id=f"intent:{intent.intent_id}:{session.session_open.isoformat()}:missing-decision-bar",
+                                    order_id=f"order:{intent.intent_id}:{session.session_open.isoformat()}",
+                                    reason="missing decision bar for sizing",
+                                    rejected_quantity=0,
+                                    event_time=session.session_open,
+                                )
+                            )
+                            continue
                         ref_price = float(ref_bar.raw_close) if float(ref_bar.raw_close) > 0 else float(ref_bar.raw_open)
                         import math as _math
 
