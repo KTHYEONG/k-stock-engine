@@ -122,8 +122,59 @@ def test_compounding_v2_dispatch_end_to_end_with_pit_inputs(tmp_path, monkeypatc
     assert len(manifests) == 1
     payload = json.loads(manifests[0].read_text(encoding='utf-8'))
     assert payload['metadata']['strategy_id'] == 'compounding-v2'
-    assert payload['metadata']['selection_policy_version'] == 'compounding-v2-selection-v1'
+    assert payload['metadata']['selection_policy_version'] == 'compounding-v2-selection-v2'
     assert payload['metadata']['portfolio_policy_version'] == 'compounding-v2-portfolio-v1'
     assert payload['metadata']['warmup_sessions'] == 200
     assert payload['metadata']['universe_manifest_hash'] == 'uni-hash'
     assert payload['metadata']['champion_scores_manifest_hash'] == 'scores-hash'
+
+
+def test_cli_wires_compounding_v2_selection_policy_version_and_shortfall_emit() -> None:
+    import inspect
+
+    import src.data.cli as cli
+    from src.strategy.compounding_v2_strategy import (
+        CompoundingV2Policy,
+        summarize_compounding_v2_selection_shortfalls,
+    )
+
+    # Given
+    source = inspect.getsource(cli._dispatch_backtest)
+
+    # Then: policy version is derived, not hardcoded.
+    assert cli.CompoundingV2Policy is CompoundingV2Policy
+    assert 'CompoundingV2Policy().selection_policy_version' in source
+    assert 'compounding-v2-selection-v1' not in source
+
+    # And: the zero-fill cause is emitted on stdout.
+    assert cli.summarize_compounding_v2_selection_shortfalls is summarize_compounding_v2_selection_shortfalls
+    assert 'summarize_compounding_v2_selection_shortfalls(strategy.selection_diagnostics)' in source
+    assert 'compounding_v2_selection' in source
+
+
+def test_compounding_v2_dispatch_emits_selection_shortfall_summary(capsys, monkeypatch) -> None:
+    import json
+
+    import src.data.cli as cli
+    from src.strategy.compounding_v2_strategy import CompoundingV2SelectionDiagnostic
+
+    # Given: a strategy stub exposing the diagnostics contract the CLI reads.
+    class _StubStrategy:
+        selection_diagnostics = (
+            CompoundingV2SelectionDiagnostic(__import__('datetime').date(2024, 3, 4), 500, 5, 5, 0, 'below_min_positions'),
+            CompoundingV2SelectionDiagnostic(__import__('datetime').date(2024, 4, 2), 500, 30, 22, 12, None),
+        )
+
+    summary = cli.summarize_compounding_v2_selection_shortfalls(_StubStrategy.selection_diagnostics)
+
+    # When
+    cli._emit({'compounding_v2_selection': summary})
+    payload = json.loads(capsys.readouterr().out.strip())
+
+    # Then
+    assert payload['compounding_v2_selection'] == {
+        'selection_sessions': 2,
+        'invested_sessions': 1,
+        'no_score_rows': 0,
+        'below_min_positions': 1,
+    }
