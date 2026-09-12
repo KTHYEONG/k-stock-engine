@@ -103,7 +103,7 @@ def normalize_dart_financial_facts(
         elif isinstance(page, Mapping):
             flat.append(page)
     rows: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str, str, str]] = set()
+    seen: set[tuple[str, str, str, str, str, bool]] = set()
     for rec in flat:
         try:
             import re as _re
@@ -159,7 +159,11 @@ def normalize_dart_financial_facts(
             if not company_id:
                 continue
             restatement_id = str(rec.get("restatement_id") or rec.get("restatement") or "r0").strip() or "r0"
-            key = (company_id, fiscal_period, filing_id, fact, restatement_id)
+            consolidated = rec.get("consolidated")
+            if consolidated is None:
+                consolidated = True
+            consolidated = bool(consolidated)
+            key = (company_id, fiscal_period, filing_id, fact, restatement_id, consolidated)
             if key in seen:
                 continue
             seen.add(key)
@@ -189,10 +193,6 @@ def normalize_dart_financial_facts(
             unit = str(rec.get("unit") or "").strip()
             if not unit:
                 continue
-            consolidated = rec.get("consolidated")
-            if consolidated is None:
-                consolidated = True
-            consolidated = bool(consolidated)
             source_kind = str(rec.get("source_kind") or "opendart_standard")
             mapping_version = str(rec.get("mapping_version") or _DART_MAPPING_VERSION)
             if dart_corp_code and ticker_by_corp_code and bridge_receipt_hash and ticker_by_corp_code.get(dart_corp_code) == ticker:

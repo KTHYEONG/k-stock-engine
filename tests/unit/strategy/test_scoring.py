@@ -150,3 +150,128 @@ def test_champion_factor_version_bound() -> None:
         ChampionScorePolicy(version='champion-v1-scoring-v1', min_required_factors=2)
     assert ChampionScorePolicy(version='champion-v1-partial-factor-scoring-v1', min_required_factors=2).min_required_factors == 2
 
+
+
+def test_certify_champion_score_factor_integrity_rejects_stale_artifact() -> None:
+    from datetime import UTC, datetime
+
+    import polars as pl
+    import pytest
+
+    from src.strategy.scoring import (
+        ChampionScoreFactorIntegrityError,
+        ChampionScorePolicy,
+        certify_champion_score_factor_integrity,
+    )
+
+    # Given: one eligible row backed by only 2 of the 4 required factors.
+    session = datetime(2024, 6, 3, tzinfo=UTC)
+    scores = pl.DataFrame(
+        {'decision_session': [session], 'instrument_id': ['KRX:000001'], 'eligible': [True]}
+    )
+    stale_qvef = pl.DataFrame(
+        {
+            'decision_session': [session],
+            'instrument_id': ['KRX:000001'],
+            'quality_score': [0.5],
+            'value_score': [0.5],
+            'earnings_score': [None],
+            'foreign_flow_score': [None],
+        }
+    )
+    policy = ChampionScorePolicy()
+
+    # When/Then: the artifact fails closed.
+    with pytest.raises(ChampionScoreFactorIntegrityError, match='champion-v1-scoring-v1'):
+        certify_champion_score_factor_integrity(scores=scores, qvef=stale_qvef, policy=policy)
+
+    # And: a complete artifact certifies without raising.
+    good_qvef = stale_qvef.with_columns(
+        pl.lit(0.5).alias('earnings_score'), pl.lit(0.5).alias('foreign_flow_score')
+    )
+    certify_champion_score_factor_integrity(scores=scores, qvef=good_qvef, policy=policy)
+
+    # And: empty frames are a no-op rather than a failure.
+    certify_champion_score_factor_integrity(scores=pl.DataFrame(), qvef=pl.DataFrame(), policy=policy)
+
+
+def test_certify_champion_score_factor_integrity_rejects_unmatched_qvef_row() -> None:
+    from datetime import UTC, datetime
+
+    import polars as pl
+    import pytest
+
+    from src.strategy.scoring import (
+        ChampionScoreFactorIntegrityError,
+        ChampionScorePolicy,
+        certify_champion_score_factor_integrity,
+    )
+
+    # Given: an eligible row that the qvef artifact does not contain.
+    session = datetime(2024, 6, 3, tzinfo=UTC)
+    scores = pl.DataFrame(
+        {
+            'decision_session': [session, session],
+            'instrument_id': ['KRX:000001', 'KRX:000002'],
+            'eligible': [True, False],
+        }
+    )
+    qvef = pl.DataFrame(
+        {
+            'decision_session': [session],
+            'instrument_id': ['KRX:000002'],
+            'quality_score': [0.5],
+            'value_score': [0.5],
+            'earnings_score': [0.5],
+            'foreign_flow_score': [0.5],
+        }
+    )
+
+    # When/Then
+    with pytest.raises(ChampionScoreFactorIntegrityError, match='KRX:000001'):
+        certify_champion_score_factor_integrity(
+            scores=scores, qvef=qvef, policy=ChampionScorePolicy()
+        )
+
+
+def test_certify_champion_score_factor_integrity_requires_certification_schema() -> None:
+    """A frame that cannot be certified must fail closed, never certify by omission."""
+    from datetime import UTC, datetime
+
+    import polars as pl
+    import pytest
+
+    from src.strategy.scoring import (
+        ChampionScoreFactorIntegrityError,
+        ChampionScorePolicy,
+        certify_champion_score_factor_integrity,
+    )
+
+    # Given: non-empty frames that lack the columns certification reads.
+    session = datetime(2024, 6, 3, tzinfo=UTC)
+    bare_scores = pl.DataFrame(
+        {"decision_session": [session], "instrument_id": ["KRX:000001"], "other": [1.0]}
+    )
+    full_qvef = pl.DataFrame(
+        {
+            "decision_session": [session],
+            "instrument_id": ["KRX:000001"],
+            "quality_score": [0.5],
+            "value_score": [0.5],
+            "earnings_score": [0.5],
+            "foreign_flow_score": [0.5],
+        }
+    )
+    policy = ChampionScorePolicy()
+
+    # When/Then: a missing eligible column is a certification failure, not a pass.
+    with pytest.raises(ChampionScoreFactorIntegrityError, match="missing columns"):
+        certify_champion_score_factor_integrity(scores=bare_scores, qvef=full_qvef, policy=policy)
+
+    # And: a qvef frame missing a factor column fails the same way.
+    with pytest.raises(ChampionScoreFactorIntegrityError, match="foreign_flow_score"):
+        certify_champion_score_factor_integrity(
+            scores=bare_scores.with_columns(pl.lit(True).alias("eligible")),
+            qvef=full_qvef.drop("foreign_flow_score"),
+            policy=policy,
+        )

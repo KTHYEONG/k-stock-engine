@@ -50,3 +50,104 @@ def test_dedupe_endpoint_identities_keeps_latest_correction() -> None:
     result = _dedupe_endpoint_identities(identities)
 
     assert [item["filing_id"] for item in result] == ["F3", "F2"]
+
+
+def test_build_single_account_request_plan_batches_under_quota() -> None:
+    from src.data.dart_backfill import build_single_account_request_plan
+
+    # Given: 2 distinct corp codes (one duplicated) across 2 fiscal years.
+    batches = build_single_account_request_plan(
+        corp_codes=('00126380', '00413046', '00126380'),
+        first_fiscal_year=2016,
+        last_fiscal_year=2017,
+        daily_call_budget=10,
+    )
+
+    # Then: 2 corps x 2 years x 4 reports x 2 bases = 32 calls in batches of 10.
+    flat = [request for batch in batches for request in batch]
+    assert len(flat) == 32
+    assert all(len(batch) <= 10 for batch in batches)
+    assert [len(batch) for batch in batches] == [10, 10, 10, 2]
+    assert flat[0].corp_code == '00126380'
+    assert flat[0].biz_year == 2016
+    assert flat[0].reprt_code == '11013'
+    assert flat[0].fs_div == 'CFS'
+    assert flat[1].fs_div == 'OFS'
+    assert {request.fs_div for request in flat} == {'CFS', 'OFS'}
+
+    # And: the plan is deterministic for identical inputs.
+    assert build_single_account_request_plan(
+        corp_codes=('00413046', '00126380'),
+        first_fiscal_year=2016,
+        last_fiscal_year=2017,
+        daily_call_budget=10,
+    ) == batches
+
+
+def test_build_single_account_request_plan_validates_inputs() -> None:
+    import pytest
+
+    from src.data.dart_backfill import (
+        SingleAccountBackfillRequest,
+        build_single_account_request_plan,
+    )
+
+    # When/Then: every malformed input fails closed.
+    with pytest.raises(ValueError, match='corp_codes'):
+        build_single_account_request_plan(
+            corp_codes=(), first_fiscal_year=2016, last_fiscal_year=2016
+        )
+    with pytest.raises(ValueError, match='corp_code'):
+        build_single_account_request_plan(
+            corp_codes=('123',), first_fiscal_year=2016, last_fiscal_year=2016
+        )
+    with pytest.raises(ValueError, match='fiscal_year'):
+        build_single_account_request_plan(
+            corp_codes=('00126380',), first_fiscal_year=2018, last_fiscal_year=2016
+        )
+    with pytest.raises(ValueError, match='daily_call_budget'):
+        build_single_account_request_plan(
+            corp_codes=('00126380',),
+            first_fiscal_year=2016,
+            last_fiscal_year=2016,
+            daily_call_budget=0,
+        )
+
+    # And: CFS-only planning halves the call count.
+    only_cfs = build_single_account_request_plan(
+        corp_codes=('00126380',),
+        first_fiscal_year=2016,
+        last_fiscal_year=2016,
+        include_separate_fallback=False,
+    )
+    flat = [request for batch in only_cfs for request in batch]
+    assert len(flat) == 4
+    assert {request.fs_div for request in flat} == {'CFS'}
+
+    # And: the request itself rejects an invalid accounting basis.
+    with pytest.raises(ValueError, match='fs_div'):
+        SingleAccountBackfillRequest(
+            corp_code='00126380', biz_year=2016, reprt_code='11011', fs_div='XXX'
+        )
+
+
+def test_single_account_backfill_request_rejects_each_malformed_field() -> None:
+    import pytest
+
+    from src.data.dart_backfill import SingleAccountBackfillRequest
+
+    # Given: one valid request shape to mutate a single field at a time.
+    valid = {"corp_code": "00126380", "biz_year": 2016, "reprt_code": "11011", "fs_div": "CFS"}
+
+    # When/Then: every identity field fails closed on its own.
+    with pytest.raises(ValueError, match="corp_code"):
+        SingleAccountBackfillRequest(**{**valid, "corp_code": "126380"})
+    with pytest.raises(ValueError, match="fiscal_year"):
+        SingleAccountBackfillRequest(**{**valid, "biz_year": 1999})
+    with pytest.raises(ValueError, match="reprt_code"):
+        SingleAccountBackfillRequest(**{**valid, "reprt_code": "11015"})
+    with pytest.raises(ValueError, match="fs_div"):
+        SingleAccountBackfillRequest(**{**valid, "fs_div": "cfs"})
+
+    # And: the valid shape constructs.
+    assert SingleAccountBackfillRequest(**valid).fs_div == "CFS"
