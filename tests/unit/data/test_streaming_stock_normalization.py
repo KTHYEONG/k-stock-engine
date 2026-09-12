@@ -901,6 +901,42 @@ def test_refresh_corporate_action_silver_uses_structured_evidence_not_legacy_int
     assert captured['frame'].select('evidence_status').to_series().to_list() == ['verified']
 
 
+def test_refresh_corporate_action_silver_merges_dividend_pages_additively(monkeypatch, tmp_path) -> None:
+    from datetime import date, datetime
+    from zoneinfo import ZoneInfo
+    import polars as pl
+    import src.data.dividend_adjustment as dividend_module
+    import src.data.streaming_normalization as module
+    from src.core.datasets import DatasetCertification
+    from src.core.time import SessionCalendar
+    from src.data.schemas import CertificationReport, EvidenceKind
+
+    tz = ZoneInfo('Asia/Seoul')
+    first = datetime(2016, 11, 22, 9, tzinfo=tz)
+    second = datetime(2016, 11, 23, 9, tzinfo=tz)
+    listing = datetime(2016, 12, 14, 9, tzinfo=tz)
+    daily = pl.DataFrame({'session': [first, second, listing], 'instrument_id': ['KRX:027410'] * 3, 'close': [168500.0, 82600.0, 88000.0], 'shares_outstanding': [24773964.0] * 3, 'market_cap': [1.0] * 3}).lazy()
+    page = {'endpoint': 'fricDecsn.json', 'corp_code': '00219097', 'status': '000', 'requested_instrument_id': 'KRX:027410', 'instrument_mapping_provenance': 'opendart_corp_code_direct', 'records': []}
+    dividend_record = {'instrument_id': 'KRX:027410', 'effective_date': second, 'coverage_end': second, 'action_id': 'dividend:x', 'type': 'dividend', 'factor': 0.98, 'cash_amount': 100.0, 'source': 'opendart', 'available_at': second, 'evidence_status': 'verified', 'evidence_reason': None}
+    monkeypatch.setattr(module, 'load_structured_corporate_action_pages', lambda **_: [page])
+    monkeypatch.setattr(module, 'resolve_opendart_corporate_action_records', lambda **_: [])
+    monkeypatch.setattr(dividend_module, 'load_dividend_corporate_action_pages', lambda **_: [{'corp_code': '00219097'}])
+    monkeypatch.setattr(dividend_module, 'resolve_dividend_corporate_action_records', lambda **_: [dict(dividend_record)])
+    report = CertificationReport(certification=DatasetCertification.RESEARCH, report_hash='refresh-dividend', coverage_start=date(2016, 11, 22), coverage_end=date(2016, 12, 14), source_hashes={EvidenceKind.CORPORATE_ACTIONS: 'h'})
+    captured = {}
+
+    def persist(**kwargs):
+        captured['frame'] = kwargs['action_frame']
+        return report
+    monkeypatch.setattr(module, '_persist_corporate_action_refresh', persist)
+
+    actual = module.refresh_corporate_action_silver(bronze_root=tmp_path / 'bronze', silver_root=tmp_path / 'silver', artifact_root=tmp_path / 'artifacts', decision_time=listing, daily_market=daily, calendar=SessionCalendar((first, second, listing)))
+
+    assert actual is report
+    assert captured['frame']['type'].to_list() == ['dividend']
+    assert captured['frame']['evidence_status'].to_list() == ['verified']
+
+
 def test_stream_items_uses_eager_parser_below_bound(tmp_path, monkeypatch) -> None:
     from datetime import UTC, datetime
     import json
