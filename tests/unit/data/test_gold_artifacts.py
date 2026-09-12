@@ -87,3 +87,27 @@ def test_gold_artifact_bundle_loads_three_verified_selected_components(tmp_path)
 
     assert bundle.dataset_id == dataset_id
     assert (universe.item(0, 'fixture_value'), qvef.item(0, 'fixture_value'), scores.item(0, 'fixture_value')) == (1.0, 2.0, 3.0)
+
+
+def test_load_gold_universe_and_scores_requires_exact_pair(tmp_path, monkeypatch) -> None:
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+    import polars as pl
+    import pytest
+    import src.data.gold_artifacts as gold
+    from src.data.schemas import PITDataError
+
+    dataset_id = 'dataset'
+    for kind in ('universe', 'champion_scores'):
+        (tmp_path / kind / dataset_id).mkdir(parents=True)
+    class FakeStore:
+        def __init__(self, root): self.root = root
+        def read_manifest(self, dataset_id): return SimpleNamespace(content_hash=str(self.root))
+        def read(self, dataset_id, asset_kind, feature_set, decision_time): return pl.DataFrame({'kind': [str(self.root)]})
+    monkeypatch.setattr(gold, 'ParquetDatasetStore', FakeStore)
+    monkeypatch.setattr(gold, 'validate_dataset_manifest', lambda *args: None)
+    bundle = gold.resolve_gold_artifact_bundle(gold_root=tmp_path, dataset_id=dataset_id, decision_time=datetime.now(UTC), required_kinds=('universe', 'champion_scores'))
+    universe, scores = gold.load_gold_universe_and_scores(bundle=bundle, decision_time=datetime.now(UTC))
+    assert universe.height == scores.height == 1
+    with pytest.raises(PITDataError, match='missing'):
+        gold.resolve_gold_artifact_bundle(gold_root=tmp_path, dataset_id='missing', decision_time=datetime.now(UTC), required_kinds=('universe', 'champion_scores'))
