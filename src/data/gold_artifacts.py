@@ -90,6 +90,8 @@ def load_gold_universe_and_scores(*, bundle: GoldArtifactBundle, decision_time: 
 def load_gold_artifact_frames(
     *, bundle: GoldArtifactBundle, decision_time: datetime
 ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    from src.strategy.scoring import ChampionScorePolicy, certify_champion_score_factor_integrity
+
     universe = ParquetDatasetStore(bundle.universe_path.parent).read(
         bundle.dataset_id, AssetKind.STOCK, _UNIVERSE_FEATURE_SET, decision_time
     )
@@ -99,4 +101,5 @@ def load_gold_artifact_frames(
     scores = ParquetDatasetStore(bundle.champion_scores_path.parent).read(
         bundle.dataset_id, AssetKind.STOCK, _SCORES_FEATURE_SET, decision_time
     )
+    certify_champion_score_factor_integrity(scores=scores, qvef=qvef, policy=ChampionScorePolicy())
     return universe, qvef, scores
