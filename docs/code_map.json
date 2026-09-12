@@ -30,9 +30,11 @@
       "tests/unit/core/test_ledger.py",
       "tests/unit/data/test_backtest_exclusions.py",
       "tests/unit/data/test_backtest_runner.py",
+      "tests/unit/data/test_backtest_sessions.py",
       "tests/unit/data/test_cli.py",
       "tests/unit/data/test_collection.py",
       "tests/unit/data/test_corporate_action_evidence_diffcover.py",
+      "tests/unit/data/test_dividend_adjustment.py",
       "tests/unit/data/test_gold.py",
       "tests/unit/data/test_gold_loader.py",
       "tests/unit/data/test_incremental_normalization.py",
@@ -48,6 +50,7 @@
       "tests/unit/integrations/dart/test_xbrl_standard.py",
       "tests/unit/integrations/test_dart_client.py",
       "tests/unit/integrations/test_dart_lifecycle.py",
+      "tests/unit/strategy/test_compounding_strategy.py",
       "tests/unit/strategy/test_core_strategy.py",
       "tests/unit/strategy/test_universe.py"
     ]
@@ -90,6 +93,9 @@
   },
   "src/data/dart_documents.py": {
     "testing": "tests/unit/data/test_dart_documents.py"
+  },
+  "src/data/dividend_adjustment.py": {
+    "testing": "tests/unit/data/test_dividend_adjustment.py"
   },
   "src/data/gold.py": {
     "testing": "tests/unit/data/test_gold.py"
@@ -148,6 +154,9 @@
       "tests/unit/data/test_backtest_runner.py"
     ]
   },
+  "src/data/storage_gc.py": {
+    "testing": "tests/unit/data/test_storage_gc.py"
+  },
   "src/data/streaming_normalization.py": {
     "testing": "tests/unit/data/test_streaming_normalization.py"
   },
@@ -166,6 +175,7 @@
       "tests/unit/data/test_backtest_runner.py",
       "tests/unit/engine/test_backtest.py",
       "tests/unit/strategy/test_champion_strategy.py",
+      "tests/unit/strategy/test_compounding_strategy.py",
       "tests/unit/strategy/test_core_strategy.py"
     ]
   },
@@ -318,6 +328,9 @@
   "src/strategy/champion_strategy.py": {
     "testing": "tests/unit/strategy/test_champion_strategy.py"
   },
+  "src/strategy/compounding_strategy.py": {
+    "testing": "tests/unit/strategy/test_compounding_strategy.py"
+  },
   "src/strategy/core_strategy.py": {
     "testing": "tests/unit/strategy/test_core_strategy.py"
   },
@@ -350,8 +363,5 @@
   },
   "src/validation/walk_forward.py": {
     "testing": "tests/unit/validation/test_walk_forward.py"
-  },
-  "src/data/dividend_adjustment.py": {
-    "testing": "tests/unit/data/test_dividend_adjustment.py"
   }
 }
