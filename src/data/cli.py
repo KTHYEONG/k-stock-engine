@@ -39,6 +39,7 @@ from src.data.pipeline import materialize_backtest_inputs
 from src.data.schemas import PITDataError, SilverTable
 from src.data.silver import load_latest_silver_market_scan, load_latest_silver_table
 from src.data.silver_schema import canonicalize_session_keys, observe_time_semantics
+from src.data.storage_gc import plan_storage_root_retention
 from src.data.streaming_normalization import refresh_corporate_action_silver
 from src.integrations.investor_flow_router import resolve_investor_flow_collector
 from src.strategy.champion_strategy import ChampionStrategy
@@ -129,6 +130,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p_retention.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
     p_retention.add_argument("--silver-root", type=Path, default=Path("data/silver/stocks"))
     p_retention.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
+
+    p_sg_retention = sub.add_parser("silver-gold-retention-plan", help="Audit Silver/Gold storage-root retention without deletion")
+    p_sg_retention.add_argument("--silver-base", type=Path, default=Path("data/silver"))
+    p_sg_retention.add_argument("--gold-base", type=Path, default=Path("data/gold"))
+    p_sg_retention.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
 
     p_purge = sub.add_parser("purge-legacy", help="Purge legacy outputs after verification")
     p_purge.add_argument("--data-root", type=Path, default=Path("data"))
@@ -1092,6 +1098,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "unreferenced_hashes": list(retention_plan.unreferenced_hashes),
                 "deletion_eligible": retention_plan.deletion_eligible,
                 "blocking_reasons": list(retention_plan.blocking_reasons),
+            }
+        )
+        return 0
+    if args.command == "silver-gold-retention-plan":
+        sg_plan = plan_storage_root_retention(
+            silver_base=Path(args.silver_base),
+            gold_base=Path(args.gold_base),
+            artifact_root=Path(args.artifact_root),
+        )
+        _emit(
+            {
+                "retained_silver_roots": list(sg_plan.retained_silver_roots),
+                "reclaimable_silver_roots": list(sg_plan.reclaimable_silver_roots),
+                "retained_gold_roots": list(sg_plan.retained_gold_roots),
+                "reclaimable_gold_roots": list(sg_plan.reclaimable_gold_roots),
+                "orphaned_staging_paths": list(sg_plan.orphaned_staging_paths),
+                "blocking_reasons": list(sg_plan.blocking_reasons),
+                "deletion_eligible": sg_plan.deletion_eligible,
             }
         )
         return 0
