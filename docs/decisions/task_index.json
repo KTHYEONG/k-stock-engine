@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "data_layer_overhaul_phase2",
+      "date": "2026-09-12",
+      "adr_id": "ADR_20260912_data_layer_overhaul_phase2",
+      "domain": "data",
+      "title": "세션키 정규화 및 단일 제외전처리로 백테스트 재빌드 제거",
+      "why": "18종 세션키 인코딩 산재와 CA·terminal-close 제외 중복 재빌드(83% 낭비)로 정규식 재시도 루프까지 존재했다.",
+      "resolution": "canonicalize_session_keys/observe_time_semantics 와 resolve_backtest_exclusion_plan 으로 세션키 단일화·제외결정 1회화를 구현했다.",
+      "impact": "2024/2023 백테스트가 59초→34초로 단축되고 content_hash 는 Phase1과 완전 동일하며 시간의미 드리프트가 metadata 에 기록된다."
+    },
+    {
       "task_id": "data_layer_overhaul_phase1",
       "date": "2026-09-12",
       "adr_id": "ADR_20260912_data_layer_overhaul_phase1",
