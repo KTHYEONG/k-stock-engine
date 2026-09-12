@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_KR_EQUITY_COMPOUNDING_FULL_BACKTEST",
+      "date": "2026-09-12",
+      "adr_id": "ADR_20260912_KR_EQUITY_COMPOUNDING_FULL_BACKTEST",
+      "domain": "backtest",
+      "title": "Integrated Korean Equity Compounding Backtest",
+      "why": "연도별 Gold artifact만으로는 자산곡선이 매년 초기화되어 2018~2026 복리성과를 측정할 수 없었습니다.",
+      "resolution": "2018~2026 universe 4,994,994행을 단일 검증 Gold dataset으로 병합하고 compounding-v1을 하나의 Ledger에서 BASE·IDEAL 재생했습니다.",
+      "impact": "BASE CAGR 4.43%, MDD 31.12%, Sharpe 0.479로 연구 결과보다 실행 현실성이 낮아 실전 승격을 보류합니다."
+    },
+    {
       "task_id": "TASK_KR_EQUITY_COMPOUNDING_STRATEGY",
       "date": "2026-09-12",
       "adr_id": "ADR_20260912_KR_EQUITY_COMPOUNDING_STRATEGY",
