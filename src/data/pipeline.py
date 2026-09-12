@@ -57,7 +57,11 @@ def _require_certified_inputs(silver_root: Path, bronze_root: Path) -> None:
 
 
 def _load_bronze_receipts(bronze_root: Path) -> dict[EvidenceKind, BronzeReceipt]:
-    from src.data.bronze_aggregation import aggregate_small_bronze_pages, discover_verified_bronze_receipts
+    from src.data.bronze_aggregation import (
+        aggregate_small_bronze_pages,
+        discover_verified_bronze_receipts,
+        gc_superseded_bronze_aggregates,
+    )
 
     receipts: dict[EvidenceKind, BronzeReceipt] = {}
     root = Path(bronze_root)
@@ -92,6 +96,11 @@ def _load_bronze_receipts(bronze_root: Path) -> dict[EvidenceKind, BronzeReceipt
             receipts[kind] = aggregate_small_bronze_pages(
                 kind=kind, receipts=tuple(found), store=store
             )
+    # 매 실행마다 새 aggregate blob이 하나씩 쌓이던 것을 여기서 정리한다: 원본
+    # 영수증은 절대 건드리지 않고, kind별로 가장 최근 aggregated: blob 1개만
+    # 남긴다(select_streaming_receipts가 애초에 최신 것만 읽으므로 나머지는
+    # 재생성 가능한 죽은 사본이다).
+    gc_superseded_bronze_aggregates(bronze_root=root)
     return receipts
 
 

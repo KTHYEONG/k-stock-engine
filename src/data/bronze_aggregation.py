@@ -213,3 +213,58 @@ def aggregate_small_bronze_pages(
         retrieved_at=latest,
         source_label=f"aggregated:{kind.value}:{len(ordered)}",
     )
+
+
+def gc_superseded_bronze_aggregates(
+    *, bronze_root: Path, dry_run: bool = False
+) -> dict[EvidenceKind, dict[str, int]]:
+    """Delete every ``aggregated:<kind>:*`` blob except the newest per kind.
+
+    ``select_streaming_receipts`` only ever reads the last aggregate (by
+    ``(retrieved_at, content_hash)``) for a given kind, and each aggregate is
+    deterministically reproducible from the still-present original receipts —
+    so every older aggregate becomes dead weight the instant a newer one is
+    written. This never touches an original (non-``aggregated:``) receipt.
+    """
+    root = Path(bronze_root)
+    report: dict[EvidenceKind, dict[str, int]] = {}
+    for kind in EvidenceKind:
+        kind_dir = root / kind.value
+        if not kind_dir.exists():
+            continue
+        candidates: list[tuple[datetime, str, Path]] = []
+        for receipt_path in sorted(kind_dir.rglob("receipt.json")):
+            try:
+                meta = json.loads(receipt_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            source_path = str(meta.get("source_path", ""))
+            if not source_path.startswith("aggregated:"):
+                continue
+            content_hash = str(meta.get("content_hash", ""))
+            try:
+                retrieved_at = datetime.fromisoformat(str(meta["retrieved_at"]))
+            except (KeyError, ValueError):
+                continue
+            candidates.append((retrieved_at, content_hash, receipt_path.parent))
+        if len(candidates) <= 1:
+            continue
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        keep_dir = candidates[-1][2]
+        keep_hash = candidates[-1][1]
+        keep_payload = keep_dir / "payload.json"
+        if sha256_file(keep_payload) != keep_hash:
+            raise PITDataError(f"refusing to GC {kind.value}: retained payload {keep_payload} failed hash check")
+        deleted = 0
+        freed = 0
+        for _, _, payload_dir in candidates[:-1]:
+            files = list(payload_dir.glob("*"))
+            size = sum(f.stat().st_size for f in files if f.is_file())
+            if not dry_run:
+                for f in files:
+                    f.unlink()
+                payload_dir.rmdir()
+            deleted += 1
+            freed += size
+        report[kind] = {"deleted": deleted, "kept": 1, "bytes_freed": freed}
+    return report
