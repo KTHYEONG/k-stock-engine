@@ -11,7 +11,8 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-from src.core.time import KRX_TZ, SessionCalendar
+from src.core.time import SessionCalendar
+from src.data.backtest_exclusions import resolve_backtest_exclusion_plan
 from src.data.backtest_runner import run_champion_backtest
 from src.data.backtest_sessions import BacktestMarketInputsPolicy, build_backtest_sessions
 from src.data.bronze import BronzeStore, import_retained_stock_evidence, migrate_retained_stock_evidence
@@ -37,6 +38,7 @@ from src.data.operations import execute_verified_legacy_purge
 from src.data.pipeline import materialize_backtest_inputs
 from src.data.schemas import PITDataError, SilverTable
 from src.data.silver import load_latest_silver_market_scan, load_latest_silver_table
+from src.data.silver_schema import canonicalize_session_keys, observe_time_semantics
 from src.data.streaming_normalization import refresh_corporate_action_silver
 from src.integrations.investor_flow_router import resolve_investor_flow_collector
 from src.strategy.champion_strategy import ChampionStrategy
@@ -416,7 +418,6 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     from src.core.time import SessionCalendar
     from src.data.backtest_run_manifest import load_backtest_run_manifest
     from src.data.backtest_runner import run_managed_backtest
-    from src.data.backtest_sessions import build_backtest_sessions
     from src.data.schemas import PITDataError, SilverTable
     from src.data.silver import latest_silver_dataset_path, load_silver_table_by_dataset_id, silver_dataset_path_by_id
     from src.data.snapshot import PITSnapshotRepository
@@ -498,7 +499,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     scenario_str = str(getattr(args, "scenario", "base")).lower()
     scenario = ExecutionScenario.BASE if scenario_str == "base" else ExecutionScenario.IDEAL
 
-    # Load calendar and normalize session times to 09:00:00 KST
+    # 캘린더 세션키는 Silver 정규형(Asia/Seoul@09:00)으로 단일화한다.
     if run_manifest is not None:
         calendar_df = load_silver_table_by_dataset_id(
             root=silver_root,
@@ -508,8 +509,8 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         )
     else:
         calendar_df = _load_silver_table(silver_root, SilverTable.CALENDAR)
-    raw_sessions = tuple(sorted(calendar_df["session"].to_list()))
-    cal_sessions = tuple(s.replace(hour=9, minute=0, second=0) for s in raw_sessions)
+    # 캘린더 세션키는 Silver 정규형(Asia/Seoul@09:00)으로 단일화한다.
+    cal_sessions = tuple(sorted(canonicalize_session_keys(calendar_df)["session"].to_list()))
     calendar = SessionCalendar(cal_sessions)
 
     if strategy is None and scores_frame is not None and strategy_id != "core-v1":
@@ -633,104 +634,21 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         lifecycle_events = _load_manifest_silver_table(silver_root, SilverTable.LIFECYCLE_EVENTS)
     lifecycle_events, excluded_lifecycle_instruments = _filter_unresolved_lifecycle_events(lifecycle_events)
 
-    # Resolve all known corporate-action gaps once before constructing the
-    # session repository.  Re-running the full validator after every raised
-    # instrument is prohibitively expensive on the multi-million-row market
-    # frame, and this resolution already carries the explicit exclusion
-    # reasons needed for the research ledger.
-    excluded_unexplained_action_instruments: set[str] = set()
-    excluded_missing_market_close_instruments: set[str] = set()
+    # 제외 결정은 1회 전처리로 확정하고 단일 빌드로 실행한다 (중복 재빌드 제거).
     coverage_daily_market = daily_market
-    if run_manifest is not None:
-        from src.data.backtest_sessions import resolve_backtest_corporate_action_evidence
-
-        pre_resolution = resolve_backtest_corporate_action_evidence(
-            daily_market=daily_market,
-            corporate_actions=corporate_actions,
-            calendar=calendar,
-            policy=BacktestMarketInputsPolicy(),
-        )
-        excluded_unexplained_action_instruments.update(pre_resolution.exclusion_reasons)
-        if excluded_unexplained_action_instruments:
-            # Keep the original frame for the exclusion ledger, but remove
-            # each affected instrument from the build frame.  Multiple jumps
-            # for one symbol must not be allowed to leak past a single
-            # quarantine window.
-            daily_market = pre_resolution.eligible_daily_market.filter(
-                ~pl.col("instrument_id").is_in(list(excluded_unexplained_action_instruments))
-            )
-            snapshot_repo = PITSnapshotRepository.from_frames(
-                {SilverTable.DAILY_MARKET: daily_market}, root=silver_root
-            )
-
-    # A missing corporate-action record is a source gap, not a reason to
-    # fabricate an adjustment.  Quarantine only the instrument named by the
-    # fail-closed coverage validator, retain the rest of the window, and make
-    # the exclusion explicit in result metadata.
-    import re
-
-    while True:
-        try:
-            sessions = build_backtest_sessions(snapshot_repository=snapshot_repo, calendar=calendar, start=start_session, end=next_session, decision_time_of=lambda s: s.replace(hour=15, minute=30, second=0), security_master=security_master, corporate_actions=corporate_actions, lifecycle_events=lifecycle_events)
-            break
-        except PITDataError as exc:
-            match = re.fullmatch(r"unexplained price discontinuity for '([^']+)'", str(exc))
-            if match is None:
-                match = re.fullmatch(
-                    r"unreconciled corporate action listed shares at listing session; "
-                    r"certification blocked for (.+)",
-                    str(exc),
-                )
-            if match is None:
-                raise
-            instrument_ids = [value.strip() for value in match.group(1).split(",") if value.strip()]
-            if not instrument_ids or any(
-                value in excluded_unexplained_action_instruments for value in instrument_ids
-            ):
-                raise
-            excluded_unexplained_action_instruments.update(instrument_ids)
-            daily_market = daily_market.filter(~pl.col("instrument_id").is_in(instrument_ids))
-            security_master = security_master.filter(~pl.col("instrument_id").is_in(instrument_ids))
-            corporate_actions = corporate_actions.filter(~pl.col("instrument_id").is_in(instrument_ids))
-            snapshot_repo = PITSnapshotRepository.from_frames(
-                {SilverTable.DAILY_MARKET: daily_market}, root=silver_root
-            )
-
-    # A symbol whose last retained bar predates the validation end cannot
-    # supply a close for an open position.  This is common for delisted
-    # instruments when lifecycle settlement evidence is unavailable.  Remove
-    # those symbols before strategy construction and record the exclusion;
-    # never synthesize a terminal close.
-    expected_end_date = next_session.astimezone(KRX_TZ).date()
-    last_bar_dates = daily_market.group_by("instrument_id").agg(
-        pl.col("session").dt.date().max().alias("_last_bar_date")
+    exclusion_plan = resolve_backtest_exclusion_plan(daily_market=daily_market, corporate_actions=corporate_actions, calendar=calendar, policy=BacktestMarketInputsPolicy(), terminal_session=next_session)
+    excluded_unexplained_action_instruments: set[str] = set(exclusion_plan.corporate_action_instruments)
+    excluded_missing_market_close_instruments: set[str] = set(exclusion_plan.missing_terminal_close_instruments)
+    daily_market = exclusion_plan.eligible_daily_market
+    # security_master·corporate_actions 에는 종가 결측 제외만 적용한다 (현행 산출물 등가).
+    missing_close_list = sorted(excluded_missing_market_close_instruments)
+    security_master = security_master.filter(~pl.col("instrument_id").is_in(missing_close_list))
+    corporate_actions = corporate_actions.filter(~pl.col("instrument_id").is_in(missing_close_list))
+    snapshot_repo = PITSnapshotRepository.from_frames(
+        {SilverTable.DAILY_MARKET: daily_market}, root=silver_root
     )
-    excluded_missing_market_close_instruments.update(
-        last_bar_dates.filter(pl.col("_last_bar_date") < expected_end_date)["instrument_id"].to_list()
-    )
-    if excluded_missing_market_close_instruments:
-        daily_market = daily_market.filter(
-            ~pl.col("instrument_id").is_in(list(excluded_missing_market_close_instruments))
-        )
-        security_master = security_master.filter(
-            ~pl.col("instrument_id").is_in(list(excluded_missing_market_close_instruments))
-        )
-        corporate_actions = corporate_actions.filter(
-            ~pl.col("instrument_id").is_in(list(excluded_missing_market_close_instruments))
-        )
-        snapshot_repo = PITSnapshotRepository.from_frames(
-            {SilverTable.DAILY_MARKET: daily_market}, root=silver_root
-        )
-        sessions = build_backtest_sessions(
-            snapshot_repository=snapshot_repo,
-            calendar=calendar,
-            start=start_session,
-            end=next_session,
-            decision_time_of=lambda s: s.replace(hour=15, minute=30, second=0),
-            security_master=security_master,
-            corporate_actions=corporate_actions,
-            lifecycle_events=lifecycle_events,
-        )
+    # 빌드 실패는 재시도 없이 전파한다 (메시지 정규식 제어 금지).
+    sessions = build_backtest_sessions(snapshot_repository=snapshot_repo, calendar=calendar, start=start_session, end=next_session, decision_time_of=lambda s: s.replace(hour=15, minute=30, second=0), security_master=security_master, corporate_actions=corporate_actions, lifecycle_events=lifecycle_events)
 
     distinct_symbols = daily_market["instrument_id"].unique().to_list()
     instruments = {
@@ -812,6 +730,23 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     from src.strategy.core_strategy import CoreStrategyPolicy
 
     _core_policy = CoreStrategyPolicy()
+    # 관측된 시간 의미를 런 메타데이터에 기록한다 (드리프트 추적).
+    silver_time_semantics: list[dict[str, object]] = []
+    for _table_name, _table_frame in (
+        ("calendar", calendar_df),
+        ("daily_market", daily_market),
+        ("security_master", security_master),
+    ):
+        for _observation in observe_time_semantics(_table_frame):
+            silver_time_semantics.append(  # noqa: PERF401 -- 계약이 append 조립을 명시한다.
+                {
+                    "table": _table_name,
+                    "column": _observation.column,
+                    "time_zone": _observation.time_zone,
+                    "hour_anchors": list(_observation.hour_anchors),
+                    "canonical": _observation.canonical,
+                }
+            )
     metadata = {
         "validation_start": str(val_start),
         "validation_end": str(val_end),
@@ -837,35 +772,21 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         "excluded_unexplained_corporate_action_instruments": sorted(
             excluded_unexplained_action_instruments
         ),
+        "exclusion_reason_counts": exclusion_plan.reason_counts(),
+        "silver_time_semantics": silver_time_semantics,
     }
     if run_manifest is not None:
-        from collections import Counter
-
-        from src.data.backtest_sessions import resolve_backtest_corporate_action_evidence
-
-        _resolution = resolve_backtest_corporate_action_evidence(
-            daily_market=coverage_daily_market,
-            corporate_actions=corporate_actions,
-            calendar=calendar,
-            policy=BacktestMarketInputsPolicy(),
-        )
-        _eligible_count = int(_resolution.eligible_daily_market.height)
+        _eligible_count = int(exclusion_plan.eligible_daily_market.height)
         _blocked_count = int(coverage_daily_market.height - _eligible_count)
-        _reason_counter: Counter[str] = Counter()
-        for _reasons in _resolution.exclusion_reasons.values():
-            _reason_counter.update(_reasons)
         metadata = {
             **metadata,
             "run_manifest_hash": run_manifest.content_hash,
             "eligible_instrument_sessions": _eligible_count,
             "blocked_instrument_sessions": _blocked_count,
-            "excluded_instruments": sorted(
-                set(_resolution.excluded_instruments)
-                | excluded_unexplained_action_instruments
-            ),
-            "exclusion_reason_counts": dict(_reason_counter),
+            "excluded_instruments": sorted(exclusion_plan.excluded_instruments),
+            "exclusion_reason_counts": exclusion_plan.reason_counts(),
             "quarantined_instrument_sessions": sum(
-                len(slots) for slots in _resolution.quarantine_sessions_by_instrument.values()
+                len(slots) for slots in exclusion_plan.quarantine_sessions_by_instrument.values()
             ),
         }
     if run_manifest is not None:
