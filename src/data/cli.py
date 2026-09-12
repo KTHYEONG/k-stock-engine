@@ -44,7 +44,11 @@ from src.data.streaming_normalization import refresh_corporate_action_silver
 from src.integrations.investor_flow_router import resolve_investor_flow_collector
 from src.strategy.champion_strategy import ChampionStrategy
 from src.strategy.compounding_strategy import CompoundingStrategy
-from src.strategy.compounding_v2_strategy import CompoundingV2Strategy
+from src.strategy.compounding_v2_strategy import (
+    CompoundingV2Policy,
+    CompoundingV2Strategy,
+    summarize_compounding_v2_selection_shortfalls,
+)
 from src.strategy.core_strategy import CoreStrategy
 
 load_dotenv()
@@ -549,6 +553,20 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     cal_sessions = tuple(sorted(canonicalize_session_keys(calendar_df)["session"].to_list()))
     calendar = SessionCalendar(cal_sessions)
 
+    if strategy_id == "compounding-v2" and scores_frame is not None:
+        # v2 consumes scores only on its deterministic 20-session selection
+        # cadence.  Predicate-filter before converting rows to Python objects;
+        # the full PIT date range remains represented by the calendar and the
+        # strategy's latest-prior-score lookup.
+        selection_dates = tuple(
+            session.date()
+            for index, session in enumerate(cal_sessions)
+            if index % 20 == 0
+        )
+        scores_frame = scores_frame.filter(
+            pl.col("decision_session").dt.date().is_in(selection_dates)
+        )
+
     if strategy is None and scores_frame is not None and strategy_id not in ("core-v1", "compounding-v1", "compounding-v2"):
         # 정보량 미달 Gold 가 전략 구성·원장 실행에 도달하지 못하게 먼저 차단한다.
         certify_informative_gold(frame=scores_frame, floors=CHAMPION_SCORE_COVERAGE_FLOORS, dataset_label=f"champion_scores/{gold_dataset_id}")
@@ -557,6 +575,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
 
     if strategy is None and scores_frame is not None and strategy_id == "compounding-v2":
         scores_by_session = _champion_scores_by_session(scores_frame)
+        scores_frame = None
         strategy = CompoundingV2Strategy(scores_by_session=scores_by_session, calendar=calendar)
 
     val_sessions = [s for s in cal_sessions if val_start <= s.date() <= val_end]
@@ -689,8 +708,21 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     snapshot_repo = PITSnapshotRepository.from_frames(
         {SilverTable.DAILY_MARKET: daily_market}, root=silver_root
     )
-    market_keys = {(session.date(), iid) for session, iid in zip(daily_market["session"].to_list(), daily_market["instrument_id"].to_list(), strict=True)} if strategy_id == "compounding-v1" else set()
-    if strategy_id == "compounding-v1" and universe_frame is not None: eligible_by_session = {day: tuple(iid for iid in ids if (day, iid) in market_keys) for day, ids in _eligible_universe_by_session(universe_frame).items()}  # noqa: E701
+    market_keys = (
+        {
+            (session.date(), iid)
+            for session, iid in zip(
+                daily_market["session"].to_list(),
+                daily_market["instrument_id"].to_list(),
+                strict=True,
+            )
+        }
+        if strategy_id in ("compounding-v1", "compounding-v2")
+        else set()
+    )
+    if strategy_id in ("compounding-v1", "compounding-v2") and universe_frame is not None:  # noqa: E701
+        eligible_by_session = {day: tuple(iid for iid in ids if (day, iid) in market_keys) for day, ids in _eligible_universe_by_session(universe_frame).items()}
+        universe_frame = None
     # 빌드 실패는 재시도 없이 전파한다 (메시지 정규식 제어 금지).
     sessions = build_backtest_sessions(snapshot_repository=snapshot_repo, calendar=calendar, start=start_session, end=next_session, decision_time_of=lambda s: s.replace(hour=15, minute=30, second=0), security_master=security_master, corporate_actions=corporate_actions, lifecycle_events=lifecycle_events, market_index_eligible_by_session=eligible_by_session)
 
@@ -798,7 +830,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         "instruments_tracked": len(instruments),
         "strategy_id": strategy_id,
         "score_policy_version": _core_policy.score_policy_version if strategy_id == "core-v1" else "champion-v1-scoring-v1",
-        "selection_policy_version": "compounding-v2-selection-v1" if strategy_id == "compounding-v2" else ("compounding-v1-selection-v1" if strategy_id == "compounding-v1" else (_core_policy.selection_policy_version if strategy_id == "core-v1" else "champion-v1-selection-v1")),
+        "selection_policy_version": CompoundingV2Policy().selection_policy_version if strategy_id == "compounding-v2" else ("compounding-v1-selection-v1" if strategy_id == "compounding-v1" else (_core_policy.selection_policy_version if strategy_id == "core-v1" else "champion-v1-selection-v1")),
         "portfolio_policy_version": "compounding-v2-portfolio-v1" if strategy_id == "compounding-v2" else ("compounding-v1-portfolio-v1" if strategy_id == "compounding-v1" else "champion-v1-portfolio-v1"),
         "universe_manifest_hash": getattr(bundle, "universe_manifest_hash", None) if bundle is not None else None,
         "champion_scores_manifest_hash": getattr(bundle, "champion_scores_manifest_hash", None) if bundle is not None else None,
@@ -859,6 +891,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         )
 
     _emit({
+        "compounding_v2_selection": summarize_compounding_v2_selection_shortfalls(strategy.selection_diagnostics) if strategy_id == "compounding-v2" else {},
         "content_hash": manifest["content_hash"],
         "ledger_id": manifest["ledger_id"],
         "scenario": manifest["scenario"],

@@ -17,7 +17,9 @@ from src.strategy.scoring import ChampionScoreRow
 @dataclass(frozen=True, slots=True)
 class CompoundingV2Policy:
     version: str = "compounding-v2"
+    selection_policy_version: str = "compounding-v2-selection-v2"
     max_positions: int = 12
+    min_positions: int = 8
     entry_rank: int = 12
     retention_rank: int = 24
     volatility_sessions: int = 60
@@ -31,7 +33,9 @@ class CompoundingV2Policy:
     def __post_init__(self) -> None:
         if (
             self.version != "compounding-v2"
+            or self.selection_policy_version != "compounding-v2-selection-v2"
             or self.max_positions != 12
+            or self.min_positions != 8
             or self.entry_rank != 12
             or self.retention_rank != 24
             or self.volatility_sessions != 60
@@ -43,6 +47,33 @@ class CompoundingV2Policy:
             or self.target_market_volatility != 0.15
         ):
             raise ValueError("CompoundingV2Policy constants are immutable")
+
+
+def tradable_score_rows(
+    *,
+    scores: tuple[ChampionScoreRow, ...],
+    marks: Mapping[str, float],
+    volatilities: Mapping[str, float],
+    instruments: Mapping[str, Instrument],
+) -> tuple[ChampionScoreRow, ...]:
+    valid = [
+        row
+        for row in scores
+        if row.eligible
+        and row.instrument_id in marks
+        and math.isfinite(float(marks[row.instrument_id]))
+        and float(marks[row.instrument_id]) > 0
+        and row.instrument_id in volatilities
+        and math.isfinite(float(volatilities[row.instrument_id]))
+        and float(volatilities[row.instrument_id]) > 0
+        and row.instrument_id in instruments
+        and instruments[row.instrument_id].asset_kind == AssetKind.STOCK
+    ]
+    return tuple(sorted(valid, key=lambda row: (cast(int, row.rank), row.instrument_id)))
+
+
+def dense_decision_ranks(rows: tuple[ChampionScoreRow, ...]) -> dict[str, int]:
+    return {row.instrument_id: index for index, row in enumerate(rows, start=1)}
 
 
 def select_compounding_v2_weights(
@@ -69,35 +100,76 @@ def select_compounding_v2_weights(
         raise ValueError("invalid score/rank state for eligible row")
     if any(not row.eligible and (row.champion_score is not None or row.rank is not None) for row in scores): raise ValueError("invalid score/rank state for ineligible row")  # noqa: E701
     held_set = set(held_ids)
-    valid = [
-        row
-        for row in scores
-        if row.eligible
-        and row.instrument_id in marks
-        and math.isfinite(float(marks[row.instrument_id]))
-        and float(marks[row.instrument_id]) > 0
-        and row.instrument_id in volatilities
-        and math.isfinite(float(volatilities[row.instrument_id]))
-        and float(volatilities[row.instrument_id]) > 0
-        and row.instrument_id in instruments
-        and instruments[row.instrument_id].asset_kind == AssetKind.STOCK
-    ]
+    valid = tradable_score_rows(scores=scores, marks=marks, volatilities=volatilities, instruments=instruments)
+    ranks = dense_decision_ranks(valid)
     retained = sorted(
-        (row for row in valid if row.instrument_id in held_set and cast(int, row.rank) <= policy.retention_rank),
-        key=lambda row: (cast(int, row.rank), row.instrument_id),
+        (row for row in valid if row.instrument_id in held_set and ranks[row.instrument_id] <= policy.retention_rank),
+        key=lambda row: (ranks[row.instrument_id], row.instrument_id),
     )
     newcomers = sorted(
-        (row for row in valid if row.instrument_id not in held_set and cast(int, row.rank) <= policy.entry_rank),
-        key=lambda row: (cast(int, row.rank), row.instrument_id),
+        (row for row in valid if row.instrument_id not in held_set and ranks[row.instrument_id] <= policy.entry_rank),
+        key=lambda row: (ranks[row.instrument_id], row.instrument_id),
     )
     selected = sorted(
         (*retained, *newcomers[: max(0, policy.max_positions - len(retained))]),
-        key=lambda row: (cast(int, row.rank), row.instrument_id),
+        key=lambda row: (ranks[row.instrument_id], row.instrument_id),
     )[: policy.max_positions]
-    if len(selected) < policy.max_positions:
+    if len(selected) < policy.min_positions:
         return {}
-    weight = 1.0 / float(len(selected))
+    weight = min(1.0 / float(len(selected)), policy.security_weight_cap)
     return {row.instrument_id: weight for row in selected}
+
+
+@dataclass(frozen=True, slots=True)
+class CompoundingV2SelectionDiagnostic:
+    decision_session: date
+    scored_rows: int
+    eligible_rows: int
+    tradable_rows: int
+    selected_positions: int
+    shortfall_reason: str | None
+
+
+def build_compounding_v2_selection_diagnostic(
+    *,
+    decision_session: date,
+    scores: tuple[ChampionScoreRow, ...],
+    marks: Mapping[str, float],
+    volatilities: Mapping[str, float],
+    instruments: Mapping[str, Instrument],
+    weights: Mapping[str, float],
+    policy: CompoundingV2Policy,
+) -> CompoundingV2SelectionDiagnostic:
+    _ = policy
+    scored_rows = len(scores)
+    eligible_rows = sum(1 for row in scores if row.eligible)
+    tradable_rows = len(tradable_score_rows(scores=scores, marks=marks, volatilities=volatilities, instruments=instruments))
+    selected_positions = len(weights)
+    if not scores:
+        shortfall_reason: str | None = "no_score_rows"
+    elif not weights:
+        shortfall_reason = "below_min_positions"
+    else:
+        shortfall_reason = None
+    return CompoundingV2SelectionDiagnostic(
+        decision_session=decision_session,
+        scored_rows=scored_rows,
+        eligible_rows=eligible_rows,
+        tradable_rows=tradable_rows,
+        selected_positions=selected_positions,
+        shortfall_reason=shortfall_reason,
+    )
+
+
+def summarize_compounding_v2_selection_shortfalls(
+    diagnostics: tuple[CompoundingV2SelectionDiagnostic, ...],
+) -> dict[str, int]:
+    return {
+        "selection_sessions": len(diagnostics),
+        "invested_sessions": sum(1 for item in diagnostics if item.shortfall_reason is None),
+        "no_score_rows": sum(1 for item in diagnostics if item.shortfall_reason == "no_score_rows"),
+        "below_min_positions": sum(1 for item in diagnostics if item.shortfall_reason == "below_min_positions"),
+    }
 
 
 class CompoundingV2Strategy:
@@ -113,6 +185,11 @@ class CompoundingV2Strategy:
         self._policy = policy if policy is not None else CompoundingV2Policy()
         self._frozen_weights: dict[str, float] = {}
         self._entries_deferred = False
+        self._selection_diagnostics: list[CompoundingV2SelectionDiagnostic] = []
+
+    @property
+    def selection_diagnostics(self) -> tuple[CompoundingV2SelectionDiagnostic, ...]:
+        return tuple(self._selection_diagnostics)
 
     @staticmethod
     def _is_positive_finite(value: Any) -> bool:
@@ -140,6 +217,17 @@ class CompoundingV2Strategy:
                         rows = batch
                         break
             updated = select_compounding_v2_weights(scores=rows, held_ids=held_ids, marks=marks, volatilities=vols, instruments=instruments, decision_time=decision_time, policy=policy) if rows else {}
+            self._selection_diagnostics.append(
+                build_compounding_v2_selection_diagnostic(
+                    decision_session=decision_time.date(),
+                    scores=rows,
+                    marks=marks,
+                    volatilities=vols,
+                    instruments=instruments,
+                    weights=updated,
+                    policy=policy,
+                )
+            )
             if updated != self._frozen_weights:
                 self._frozen_weights = updated
                 self._entries_deferred = True
