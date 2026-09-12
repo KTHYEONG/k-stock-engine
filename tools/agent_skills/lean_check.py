@@ -877,7 +877,11 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
 
 
 def _find_test_files(py_files: list[str], impact_level: int = 1) -> list[str]:
-    test_files = [f for f in py_files if f.startswith("tests/") or "test_" in f]
+    # Only repository test paths belong in pytest's collection list.  A source
+    # module such as ``src/data/backtest_sessions.py`` contains the substring
+    # ``test_`` but passing it explicitly alongside pytest-cov can import the
+    # module under two names and trigger duplicate native-module loading.
+    test_files = [f for f in py_files if f.startswith("tests/")]
     source_files = [f for f in py_files if not (f.startswith("tests/") or "test_" in f)]
     repository_files = _repository_test_files()
     for sf in source_files:
