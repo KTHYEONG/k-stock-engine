@@ -43,6 +43,7 @@ from src.data.storage_gc import plan_storage_root_retention
 from src.data.streaming_normalization import refresh_corporate_action_silver
 from src.integrations.investor_flow_router import resolve_investor_flow_collector
 from src.strategy.champion_strategy import ChampionStrategy
+from src.strategy.compounding_strategy import CompoundingStrategy
 from src.strategy.core_strategy import CoreStrategy
 
 load_dotenv()
@@ -160,7 +161,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p_run.add_argument("--initial-cash", type=float, default=100000000.0)
     p_run.add_argument("--scenario", type=str, default="base")
     p_run.add_argument("--ledger-id", type=str, default="champion-2016")
-    p_run.add_argument("--strategy-id", choices=("core-v1", "champion-v1"), default=None)
+    p_run.add_argument("--strategy-id", choices=("core-v1", "champion-v1", "compounding-v1"), default=None)
 
     p_rebuild = sub.add_parser("rebuild-data", help="Prepare verified rebuild before collection")
     # add_argument("rebuild-data", help="historical pipeline subcommand marker")
@@ -448,6 +449,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     scores_by_session: dict[date, tuple[Any, ...]] | None = None
     scores_frame: Any = None
     universe_frame: Any = None
+    eligible_by_session: dict[date, tuple[str, ...]] | None = None
     strategy: Any = None
     run_manifest: Any = None
 
@@ -519,7 +521,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     cal_sessions = tuple(sorted(canonicalize_session_keys(calendar_df)["session"].to_list()))
     calendar = SessionCalendar(cal_sessions)
 
-    if strategy is None and scores_frame is not None and strategy_id != "core-v1":
+    if strategy is None and scores_frame is not None and strategy_id not in ("core-v1", "compounding-v1"):
         # 정보량 미달 Gold 가 전략 구성·원장 실행에 도달하지 못하게 먼저 차단한다.
         certify_informative_gold(frame=scores_frame, floors=CHAMPION_SCORE_COVERAGE_FLOORS, dataset_label=f"champion_scores/{gold_dataset_id}")
         scores_by_session = _champion_scores_by_session(scores_frame)
@@ -557,7 +559,9 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
 
     # Calendar-aligned warm-up window for rolling PIT inputs (ADTV20/vol60).
     start_idx = cal_sessions.index(start_session)
-    warmup_start = cal_sessions[max(0, start_idx - 60)]
+    warmup_sessions = 200 if strategy_id == "compounding-v1" else 60
+    warmup_start = cal_sessions[max(0, start_idx - warmup_sessions)]
+    if strategy_id == "compounding-v1" and start_idx < 200: raise PITDataError("compounding-v1 requires 200 pre-validation calendar sessions")  # noqa: E701
     market_columns = [
         "session",
         "instrument_id",
@@ -653,8 +657,10 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     snapshot_repo = PITSnapshotRepository.from_frames(
         {SilverTable.DAILY_MARKET: daily_market}, root=silver_root
     )
+    market_keys = {(session.date(), iid) for session, iid in zip(daily_market["session"].to_list(), daily_market["instrument_id"].to_list(), strict=True)} if strategy_id == "compounding-v1" else set()
+    if strategy_id == "compounding-v1" and universe_frame is not None: eligible_by_session = {day: tuple(iid for iid in ids if (day, iid) in market_keys) for day, ids in _eligible_universe_by_session(universe_frame).items()}  # noqa: E701
     # 빌드 실패는 재시도 없이 전파한다 (메시지 정규식 제어 금지).
-    sessions = build_backtest_sessions(snapshot_repository=snapshot_repo, calendar=calendar, start=start_session, end=next_session, decision_time_of=lambda s: s.replace(hour=15, minute=30, second=0), security_master=security_master, corporate_actions=corporate_actions, lifecycle_events=lifecycle_events)
+    sessions = build_backtest_sessions(snapshot_repository=snapshot_repo, calendar=calendar, start=start_session, end=next_session, decision_time_of=lambda s: s.replace(hour=15, minute=30, second=0), security_master=security_master, corporate_actions=corporate_actions, lifecycle_events=lifecycle_events, market_index_eligible_by_session=eligible_by_session)
 
     distinct_symbols = daily_market["instrument_id"].unique().to_list()
     instruments = {
@@ -730,6 +736,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
             for day, ids in eligible_by_session.items()
         }
         strategy = CoreStrategy(eligible_by_session=eligible_by_session, calendar=calendar)
+    elif strategy is None and strategy_id == "compounding-v1" and eligible_by_session is not None and not smoke_symbol: strategy = CompoundingStrategy(eligible_by_session=eligible_by_session, calendar=calendar)  # noqa: E701
     elif strategy is None:
         raise PITDataError("run-backtest requires a resolved strategy for the selected bundle")
 
@@ -759,10 +766,10 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         "instruments_tracked": len(instruments),
         "strategy_id": strategy_id,
         "score_policy_version": _core_policy.score_policy_version if strategy_id == "core-v1" else "champion-v1-scoring-v1",
-        "selection_policy_version": _core_policy.selection_policy_version if strategy_id == "core-v1" else "champion-v1-selection-v1",
-        "portfolio_policy_version": "champion-v1-portfolio-v1",
+        "selection_policy_version": "compounding-v1-selection-v1" if strategy_id == "compounding-v1" else (_core_policy.selection_policy_version if strategy_id == "core-v1" else "champion-v1-selection-v1"),
+        "portfolio_policy_version": "compounding-v1-portfolio-v1" if strategy_id == "compounding-v1" else "champion-v1-portfolio-v1",
         "market_input_policy_version": BacktestMarketInputsPolicy().version,
-        "warmup_sessions": 60,
+        "warmup_sessions": warmup_sessions,
         "data_action_certified": True,
         "provenance_mode": (
             "research_source_candidate_with_explicit_unavailable"
