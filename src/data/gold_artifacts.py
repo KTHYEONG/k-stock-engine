@@ -77,6 +77,16 @@ def load_gold_universe_frame(*, bundle: GoldArtifactBundle, decision_time: datet
     )
 
 
+def load_gold_universe_and_scores(*, bundle: GoldArtifactBundle, decision_time: datetime) -> tuple[pl.DataFrame, pl.DataFrame]:
+    universe = ParquetDatasetStore(bundle.universe_path.parent).read(
+        bundle.dataset_id, AssetKind.STOCK, _UNIVERSE_FEATURE_SET, decision_time
+    )
+    scores = ParquetDatasetStore(bundle.champion_scores_path.parent).read(
+        bundle.dataset_id, AssetKind.STOCK, _SCORES_FEATURE_SET, decision_time
+    )
+    return universe, scores
+
+
 def load_gold_artifact_frames(
     *, bundle: GoldArtifactBundle, decision_time: datetime
 ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
