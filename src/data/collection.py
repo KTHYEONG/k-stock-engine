@@ -198,6 +198,71 @@ def collect_opendart_corporate_action_evidence(
     return tuple(receipts)
 
 
+def collect_opendart_dividend_evidence(
+    *, dart: Any, tickers: Sequence[str], bsns_years: Sequence[str], bronze: BronzeStore
+) -> tuple[BronzeReceipt, ...]:
+    from datetime import UTC as _UTC
+    from datetime import datetime as _datetime
+
+    names = [str(t).strip() for t in tickers if str(t).strip()]
+    if not names:
+        raise PITDataError("tickers must list at least one instrument")  # pragma: no cover
+    years = [str(y).strip() for y in bsns_years if str(y).strip()]
+    if not years:
+        raise PITDataError("bsns_years must list at least one fiscal year")  # pragma: no cover
+    load_codes = getattr(dart, "load_corp_codes", None)
+    if callable(load_codes):
+        ticker_to_corp = dict(load_codes())
+    else:
+        records = dart.load_corp_code_records()  # pragma: no cover
+        ticker_to_corp = {str(r.ticker): str(r.corp_code) for r in records}  # pragma: no cover
+    corp_codes: list[str] = []
+    requested_corp: dict[str, str] = {}
+    for ticker in names:
+        short = ticker[4:] if ticker.startswith("KRX:") else ticker
+        mapped = ticker_to_corp.get(ticker) or ticker_to_corp.get(short)
+        if not mapped:
+            raise PITDataError(f"missing OpenDART corp_code mapping for {ticker!r}")  # pragma: no cover
+        corp_codes.append(mapped)
+        requested_corp[ticker] = mapped
+    corp_to_requested: dict[str, list[str]] = {}
+    for ticker, corp in requested_corp.items():
+        corp_to_requested.setdefault(corp, []).append(ticker)
+    pages = dart.fetch_dividend_disclosures(corp_codes=corp_codes, bsns_years=years)
+    retrieved_at = _datetime.now(_UTC)
+    receipts: list[BronzeReceipt] = []
+    for page in pages:
+        corp_code = str(getattr(page, "corp_code", "") or (page.get("corp_code", "") if isinstance(page, dict) else ""))
+        bsns_year = str(getattr(page, "bsns_year", "") or (page.get("bsns_year", "") if isinstance(page, dict) else ""))
+        reprt_code = str(getattr(page, "reprt_code", "") or (page.get("reprt_code", "") if isinstance(page, dict) else ""))
+        status = str(getattr(page, "status", "") or page.get("status", ""))
+        raw_records = getattr(page, "records", None)
+        if raw_records is None and isinstance(page, dict):  # pragma: no cover
+            raw_records = page.get("records", [])
+        payload = {
+            "endpoint": "alotMatter.json",
+            "corp_code": corp_code,
+            "bsns_year": bsns_year,
+            "reprt_code": reprt_code,
+            "status": status,
+            "records": list(raw_records) if raw_records is not None else [],
+        }
+        candidates = corp_to_requested.get(corp_code, [])
+        if len(candidates) == 1:
+            payload["requested_instrument_id"] = candidates[0]
+            payload["instrument_mapping_provenance"] = "opendart_corp_code_direct"
+        text = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        receipts.append(
+            bronze.import_bytes(
+                text.encode("utf-8"),
+                kind=EvidenceKind.CORPORATE_ACTIONS,
+                retrieved_at=retrieved_at,
+                source_label=f"opendart_dividend:alotMatter.json:{corp_code}:{bsns_year}:{reprt_code}",
+            )
+        )
+    return tuple(receipts)
+
+
 def collect_historical_evidence(
     *,
     plan: HistoricalCollectionPlan,
@@ -307,6 +372,10 @@ def collect_historical_evidence(
         end = plan.coverage_end
         bronze = store
         page_receipts_ca = collect_opendart_corporate_action_evidence(dart=dart, tickers=tickers, start=start, end=end, bronze=bronze)
+        bsns_years = sorted({str(year) for year in range(start.year, end.year + 1)})
+        page_receipts_ca = page_receipts_ca + collect_opendart_dividend_evidence(
+            dart=dart, tickers=tickers, bsns_years=bsns_years, bronze=bronze
+        )
         digest = hashlib.sha256()
         for item in sorted(page_receipts_ca, key=lambda value: value.content_hash):
             digest.update(item.content_hash.encode("utf-8"))

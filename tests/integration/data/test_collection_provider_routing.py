@@ -93,6 +93,63 @@ def test_collect_opendart_corporate_action_evidence_persists_pages(tmp_path) -> 
     assert len(receipts) == 1
 
 
+def test_collect_opendart_dividend_evidence_persists_pages_with_direct_mapping(tmp_path) -> None:
+    import json
+
+    from src.data.bronze import BronzeStore
+    from src.data.collection import collect_opendart_dividend_evidence
+
+    class Page:
+        corp_code = "00126380"
+        bsns_year = "2022"
+        reprt_code = "11011"
+        status = "000"
+        records = ({"se": "주당 현금배당금(원)", "stock_knd": "보통주", "thstrm": "1,444"},)
+
+    class Dart:
+        def load_corp_codes(self):
+            return {"005930": "00126380"}
+
+        def fetch_dividend_disclosures(self, **_kwargs):
+            return (Page(),)
+
+    receipts = collect_opendart_dividend_evidence(
+        dart=Dart(), tickers=("KRX:005930",), bsns_years=("2022",),
+        bronze=BronzeStore(tmp_path / "bronze"),
+    )
+
+    assert len(receipts) == 1
+    payload = json.loads(receipts[0].payload_path.read_text(encoding="utf-8"))
+    assert payload["endpoint"] == "alotMatter.json"
+    assert payload["corp_code"] == "00126380"
+    assert payload["bsns_year"] == "2022"
+    assert payload["reprt_code"] == "11011"
+    assert payload["requested_instrument_id"] == "KRX:005930"
+    assert payload["instrument_mapping_provenance"] == "opendart_corp_code_direct"
+    assert payload["records"] == [{"se": "주당 현금배당금(원)", "stock_knd": "보통주", "thstrm": "1,444"}]
+
+
+def test_collect_opendart_dividend_evidence_rejects_empty_arguments(tmp_path) -> None:
+    import pytest
+
+    from src.data.bronze import BronzeStore
+    from src.data.collection import collect_opendart_dividend_evidence
+    from src.data.schemas import PITDataError
+
+    class Dart:
+        def load_corp_codes(self):
+            return {"005930": "00126380"}
+
+    with pytest.raises(PITDataError, match="tickers"):
+        collect_opendart_dividend_evidence(
+            dart=Dart(), tickers=(), bsns_years=("2022",), bronze=BronzeStore(tmp_path / "bronze"),
+        )
+    with pytest.raises(PITDataError, match="bsns_years"):
+        collect_opendart_dividend_evidence(
+            dart=Dart(), tickers=("KRX:005930",), bsns_years=(), bronze=BronzeStore(tmp_path / "bronze"),
+        )
+
+
 def test_collect_historical_evidence_collects_krx_and_kis_pages(tmp_path) -> None:
     class Krx:
         def fetch_daily_market(self, start, end, *, sessions):
