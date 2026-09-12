@@ -78,24 +78,6 @@ def test_gold_loader_certifies_silver_at_load_time_and_keeps_historical_pit(tmp_
     assert seen[0] > historical_time
 
 
-def test_gold_loader_compacts_repeated_master_snapshots() -> None:
-    from datetime import UTC, datetime, timedelta
-    import polars as pl
-    from src.data.gold_loader import _compact_master_snapshots
-
-    start = datetime(2016, 1, 4, tzinfo=UTC)
-    rows = [{
-        "instrument_id": "KRX:005930", "ticker": "005930", "company_id": "005930",
-        "market": "KOSPI", "sector": "IT", "listing_date": start,
-        "delisting_date": None, "share_class": "common", "status": "listed", "valid_to": None,
-        "valid_from": start + timedelta(days=offset), "available_at": start + timedelta(days=offset),
-        "source_hash": str(offset),
-    } for offset in range(3)]
-    compacted = _compact_master_snapshots(pl.DataFrame(rows))
-    assert compacted.height == 1
-    assert compacted["valid_from"][0] == start
-
-
 def test_gold_loader_aligns_intraday_bar_timestamp_to_krx_session_date() -> None:
     from datetime import datetime
     from zoneinfo import ZoneInfo
@@ -299,6 +281,8 @@ def test_load_gold_window_inputs_collects_bounded_and_reference_tables(tmp_path,
         values = {c: [None] for c in kwargs["columns"]}
         if "valid_from" in values:
             values["valid_from"] = [sessions[0]]
+        if "valid_to" in values:
+            values["valid_to"] = [sessions[0]]
         if "available_at" in values:
             values["available_at"] = [sessions[0]]
         return pl.DataFrame(values)
@@ -354,8 +338,19 @@ def test_gold_loader_rejects_missing_fact_availability_column(tmp_path, monkeypa
     monkeypatch.setattr(module, "load_latest_silver_table", lambda **_kwargs: pl.DataFrame({"session": sessions}))
     monkeypatch.setattr(module, "_read_bounded_table", lambda **kwargs: pl.DataFrame({c: [sessions[-1]] for c in kwargs["columns"]}))
     def full(**kwargs):
-        if "available_at" in kwargs["columns"]:
+        if kwargs["table"].value == "financial_facts" and "available_at" in kwargs["columns"]:
             return pl.DataFrame({c: [sessions[0]] for c in kwargs["columns"] if c != "available_at"})
+        if kwargs["table"].value == "security_master":
+            values = {c: ["x"] for c in kwargs["columns"]}
+            for name in ("valid_from", "valid_to", "available_at"):
+                if name in values:
+                    values[name] = [sessions[0]]
+            return pl.DataFrame(values)
+        if kwargs["table"].value == "lifecycle_events":
+            values = {c: ["x"] for c in kwargs["columns"]}
+            if "available_at" in values:
+                values["available_at"] = [sessions[0]]
+            return pl.DataFrame(values)
         return pl.DataFrame({c: [sessions[0]] for c in kwargs["columns"]})
     monkeypatch.setattr(module, "_read_full_projected", full)
     with pytest.raises(PITDataError, match="financial_facts"):
@@ -611,3 +606,89 @@ def test_write_gold_input_binding_artifact_persists_sorted_binding(tmp_path) -> 
         write_gold_input_binding_artifact(artifact_root=tmp_path, dataset_ids=bindings, decision_time=datetime(2026, 9, 11, tzinfo=UTC), validation_start=datetime(2016, 12, 29).date(), validation_end=datetime(2016, 1, 4).date())
     with pytest.raises(PITDataError, match='missing'):
         write_gold_input_binding_artifact(artifact_root=tmp_path, dataset_ids={}, decision_time=datetime(2026, 9, 11, tzinfo=UTC), validation_start=datetime(2016, 1, 4).date(), validation_end=datetime(2016, 12, 29).date())
+
+
+def test_load_gold_window_inputs_compacts_security_master_via_scd2_intervals(tmp_path, monkeypatch) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    import polars as pl
+
+    import src.data.gold_loader as module
+    from src.data.gold_loader import (
+        _CORPORATE_ACTIONS_COLUMNS,
+        _INVESTOR_FLOW_COLUMNS,
+        _LIFECYCLE_EVENTS_COLUMNS,
+        load_gold_window_inputs,
+    )
+
+    start = datetime(2015, 10, 1, tzinfo=UTC)
+    sessions = [start + timedelta(days=offset) for offset in range(100)]
+    validation_start = (start + timedelta(days=90)).date()
+    validation_end = (start + timedelta(days=92)).date()
+    decision_time = datetime(2016, 6, 1, tzinfo=UTC)
+
+    master_rows = [
+        {
+            "instrument_id": "KRX:005930", "ticker": "005930", "company_id": "005930",
+            "market": "KOSPI", "sector": "IT", "listing_date": "2000-01-01",
+            "delisting_date": None, "share_class": "common", "status": "listed",
+            "valid_from": start + timedelta(days=offset), "valid_to": start + timedelta(days=offset),
+            "available_at": start + timedelta(days=offset), "source_hash": f"h{offset}",
+        }
+        for offset in (88, 89, 90)
+    ]
+    security_master_frame = pl.DataFrame(master_rows, schema_overrides={"delisting_date": pl.Utf8})
+
+    daily_market_frame = pl.DataFrame({
+        "session": [start + timedelta(days=90)], "instrument_id": ["KRX:005930"],
+        "open": [100.0], "high": [101.0], "low": [99.0], "close": [100.5],
+        "volume": [1000.0], "trading_value": [100500.0], "market_cap": [1.0e9],
+        "shares_outstanding": [1000.0], "available_at": [start + timedelta(days=90)],
+        "source_hash": ["dm1"],
+    })
+
+    financial_facts_frame = pl.DataFrame({
+        "company_id": ["005930"], "fiscal_period": ["2015Q4"], "filing_id": ["F1"],
+        "fact": ["revenue"], "published_at": [start], "available_at": [start],
+        "value": [100.0], "unit": ["KRW"], "consolidated": [True],
+        "restatement_id": ["0"], "source_hash": ["ff1"], "source_kind": ["opendart_standard"],
+        "mapping_version": ["v1"], "raw_document_hash": ["d1"],
+    })
+
+    corporate_actions_frame = pl.DataFrame({column: [] for column in _CORPORATE_ACTIONS_COLUMNS})
+    investor_flow_frame = pl.DataFrame({column: [] for column in _INVESTOR_FLOW_COLUMNS})
+    lifecycle_events_frame = pl.DataFrame({column: [] for column in _LIFECYCLE_EVENTS_COLUMNS})
+    calendar_frame = pl.DataFrame({"session": sessions})
+
+    def fake_read_full_projected(*, table, **_kwargs):
+        if table.value == "security_master":
+            return security_master_frame
+        if table.value == "financial_facts":
+            return financial_facts_frame
+        if table.value == "corporate_actions":
+            return corporate_actions_frame
+        raise AssertionError(f"unexpected table {table}")
+
+    def fake_read_bounded_table(*, table, **_kwargs):
+        if table.value == "daily_market":
+            return daily_market_frame
+        if table.value == "investor_flow":
+            return investor_flow_frame
+        raise AssertionError(f"unexpected table {table}")
+
+    monkeypatch.setattr(module, "load_latest_silver_table", lambda **_kwargs: calendar_frame)
+    monkeypatch.setattr(module, "_read_full_projected", fake_read_full_projected)
+    monkeypatch.setattr(module, "_read_bounded_table", fake_read_bounded_table)
+    monkeypatch.setattr(module, "_load_manifest_silver_table", lambda **_kwargs: lifecycle_events_frame)
+
+    inputs = load_gold_window_inputs(
+        silver_root=tmp_path,
+        validation_start=validation_start,
+        validation_end=validation_end,
+        decision_time=decision_time,
+    )
+
+    assert inputs.security_master.height == 1
+    assert inputs.security_master["valid_from"].to_list()[0] == start + timedelta(days=88)
+    assert inputs.security_master["valid_to"].to_list()[0] == start + timedelta(days=90)
+    assert not hasattr(module, "_compact_master_snapshots")

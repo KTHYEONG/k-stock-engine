@@ -15,6 +15,7 @@ from src.core.datasets import validate_dataset_manifest
 from src.core.instruments import AssetKind
 from src.core.time import KRX_TZ, SessionCalendar
 from src.data.gold import WARMUP_SESSIONS
+from src.data.master_intervals import MASTER_INTERVAL_KEY_COLUMNS, compact_security_master_intervals
 from src.data.schemas import PITDataError, SilverTable
 from src.data.silver import load_latest_silver_table
 from src.features.contracts import QvefFeaturePolicy
@@ -289,26 +290,6 @@ def apply_lifecycle_master_overlay(
     ).drop("delisting_date_right")
 
 
-def _compact_master_snapshots(frame: pl.DataFrame) -> pl.DataFrame:
-    """Retain one earliest PIT snapshot for each unchanged master state."""
-    semantic = [
-        "instrument_id", "ticker", "company_id", "market", "sector",
-        "delisting_date", "share_class", "status", "valid_to",
-    ]
-    aggregate_columns = {"listing_date", "valid_from", "available_at", "source_hash"}
-    if frame.is_empty() or any(
-        column not in frame.columns for column in [*semantic, *aggregate_columns]
-    ):
-        return frame
-    aggregates = [
-        pl.col("listing_date").min().alias("listing_date"),
-        pl.col("valid_from").min().alias("valid_from"),
-        pl.col("available_at").min().alias("available_at"),
-        pl.col("source_hash").first().alias("source_hash"),
-    ]
-    return frame.group_by(semantic, maintain_order=True).agg(aggregates).select(frame.columns)
-
-
 def _align_session_dates(frame: pl.DataFrame) -> pl.DataFrame:
     """Use the certified KRX trading-date key, not the bar publication hour."""
     if frame.is_empty() or "session" not in frame.columns:
@@ -569,7 +550,6 @@ def load_gold_window_inputs(
     financial_facts_full = _read_full_projected(silver_root=silver_root, table=SilverTable.FINANCIAL_FACTS, decision_time=certification_time, columns=_FINANCIAL_FACTS_COLUMNS, dataset_id=None if explicit_ids is None else explicit_ids.get(SilverTable.FINANCIAL_FACTS))
     corporate_actions = _read_full_projected(silver_root=silver_root, table=SilverTable.CORPORATE_ACTIONS, decision_time=certification_time, columns=_CORPORATE_ACTIONS_COLUMNS, dataset_id=None if explicit_ids is None else explicit_ids.get(SilverTable.CORPORATE_ACTIONS))
     lifecycle_events = _load_manifest_silver_table(silver_root=silver_root, table=SilverTable.LIFECYCLE_EVENTS, decision_time=certification_time, columns=_LIFECYCLE_EVENTS_COLUMNS, dataset_id=None if explicit_ids is None else explicit_ids.get(SilverTable.LIFECYCLE_EVENTS))
-    # Wiring: apply_lifecycle_master_overlay(security_master=security_master_full, lifecycle_events=lifecycle_events) before __UNKNOWN__ filtering and _compact_master_snapshots
     security_master_full = apply_lifecycle_master_overlay(security_master=security_master_full, lifecycle_events=lifecycle_events)
     # Guard: prior master/fact records needed for PIT eligibility must be kept.
     if (
@@ -589,7 +569,10 @@ def load_gold_window_inputs(
             raise PITDataError("invalid certified Silver table: security_master") from exc
     else:
         security_master = security_master_full
-    security_master = _compact_master_snapshots(security_master)
+    # 필수 키 컬럼이 없는 입력은 압축을 건너뛰고 아래 통합 게이트에서 일관된
+    # "invalid certified Silver table: security_master" 형식으로 fail-closed 한다.
+    if all(name in security_master.columns for name in MASTER_INTERVAL_KEY_COLUMNS):
+        security_master = compact_security_master_intervals(security_master, sessions=sessions)
     if (
         not security_master.is_empty()
         and "valid_from" in security_master.columns
