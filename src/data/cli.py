@@ -44,6 +44,7 @@ from src.data.streaming_normalization import refresh_corporate_action_silver
 from src.integrations.investor_flow_router import resolve_investor_flow_collector
 from src.strategy.champion_strategy import ChampionStrategy
 from src.strategy.compounding_strategy import CompoundingStrategy
+from src.strategy.compounding_v2_strategy import CompoundingV2Strategy
 from src.strategy.core_strategy import CoreStrategy
 
 load_dotenv()
@@ -161,7 +162,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p_run.add_argument("--initial-cash", type=float, default=100000000.0)
     p_run.add_argument("--scenario", type=str, default="base")
     p_run.add_argument("--ledger-id", type=str, default="champion-2016")
-    p_run.add_argument("--strategy-id", choices=("core-v1", "champion-v1", "compounding-v1"), default=None)
+    p_run.add_argument("--strategy-id", choices=("core-v1", "champion-v1", "compounding-v1", "compounding-v2"), default=None)
 
     p_rebuild = sub.add_parser("rebuild-data", help="Prepare verified rebuild before collection")
     # add_argument("rebuild-data", help="historical pipeline subcommand marker")
@@ -452,6 +453,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     eligible_by_session: dict[date, tuple[str, ...]] | None = None
     strategy: Any = None
     run_manifest: Any = None
+    bundle: Any = None
 
     strategy_id = str(selected_strategy_id or "core-v1")
     if not smoke_symbol:
@@ -478,6 +480,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         strategy_id = run_manifest.strategy_id
         from src.data.gold_artifacts import (
             load_gold_artifact_frames,
+            load_gold_universe_and_scores,
             load_gold_universe_frame,
             resolve_gold_artifact_bundle,
         )
@@ -490,6 +493,13 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
                 decision_time=gold_decision_time,
                 required_kinds=("universe",),
             )
+        elif strategy_id == "compounding-v2":
+            bundle = resolve_gold_artifact_bundle(
+                gold_root=gold_root,
+                dataset_id=str(gold_dataset_id),
+                decision_time=gold_decision_time,
+                required_kinds=("universe", "champion_scores"),
+            )
         else:
             bundle = resolve_gold_artifact_bundle(
                 gold_root=gold_root,
@@ -499,6 +509,8 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         if strategy_id == "compounding-v1":
             universe_frame = load_gold_universe_frame(bundle=bundle, decision_time=gold_decision_time)
             scores_frame = None
+        elif strategy_id == "compounding-v2":
+            universe_frame, scores_frame = load_gold_universe_and_scores(bundle=bundle, decision_time=gold_decision_time)
         else:
             universe_frame, _qvef_frame, scores_frame = load_gold_artifact_frames(
                 bundle=bundle, decision_time=gold_decision_time
@@ -537,11 +549,15 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     cal_sessions = tuple(sorted(canonicalize_session_keys(calendar_df)["session"].to_list()))
     calendar = SessionCalendar(cal_sessions)
 
-    if strategy is None and scores_frame is not None and strategy_id not in ("core-v1", "compounding-v1"):
+    if strategy is None and scores_frame is not None and strategy_id not in ("core-v1", "compounding-v1", "compounding-v2"):
         # 정보량 미달 Gold 가 전략 구성·원장 실행에 도달하지 못하게 먼저 차단한다.
         certify_informative_gold(frame=scores_frame, floors=CHAMPION_SCORE_COVERAGE_FLOORS, dataset_label=f"champion_scores/{gold_dataset_id}")
         scores_by_session = _champion_scores_by_session(scores_frame)
         strategy = ChampionStrategy(scores_by_session=scores_by_session, calendar=calendar)
+
+    if strategy is None and scores_frame is not None and strategy_id == "compounding-v2":
+        scores_by_session = _champion_scores_by_session(scores_frame)
+        strategy = CompoundingV2Strategy(scores_by_session=scores_by_session, calendar=calendar)
 
     val_sessions = [s for s in cal_sessions if val_start <= s.date() <= val_end]
     if not val_sessions:
@@ -575,9 +591,9 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
 
     # Calendar-aligned warm-up window for rolling PIT inputs (ADTV20/vol60).
     start_idx = cal_sessions.index(start_session)
-    warmup_sessions = 200 if strategy_id == "compounding-v1" else 60
+    warmup_sessions = 200 if strategy_id in ("compounding-v1", "compounding-v2") else 60
     warmup_start = cal_sessions[max(0, start_idx - warmup_sessions)]
-    if strategy_id == "compounding-v1" and start_idx < 200: raise PITDataError("compounding-v1 requires 200 pre-validation calendar sessions")  # noqa: E701
+    if strategy_id in ("compounding-v1", "compounding-v2") and start_idx < 200: raise PITDataError("compounding-v1 requires 200 pre-validation calendar sessions")  # noqa: E701
     market_columns = [
         "session",
         "instrument_id",
@@ -782,8 +798,10 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         "instruments_tracked": len(instruments),
         "strategy_id": strategy_id,
         "score_policy_version": _core_policy.score_policy_version if strategy_id == "core-v1" else "champion-v1-scoring-v1",
-        "selection_policy_version": "compounding-v1-selection-v1" if strategy_id == "compounding-v1" else (_core_policy.selection_policy_version if strategy_id == "core-v1" else "champion-v1-selection-v1"),
-        "portfolio_policy_version": "compounding-v1-portfolio-v1" if strategy_id == "compounding-v1" else "champion-v1-portfolio-v1",
+        "selection_policy_version": "compounding-v2-selection-v1" if strategy_id == "compounding-v2" else ("compounding-v1-selection-v1" if strategy_id == "compounding-v1" else (_core_policy.selection_policy_version if strategy_id == "core-v1" else "champion-v1-selection-v1")),
+        "portfolio_policy_version": "compounding-v2-portfolio-v1" if strategy_id == "compounding-v2" else ("compounding-v1-portfolio-v1" if strategy_id == "compounding-v1" else "champion-v1-portfolio-v1"),
+        "universe_manifest_hash": getattr(bundle, "universe_manifest_hash", None) if bundle is not None else None,
+        "champion_scores_manifest_hash": getattr(bundle, "champion_scores_manifest_hash", None) if bundle is not None else None,
         "market_input_policy_version": BacktestMarketInputsPolicy().version,
         "warmup_sessions": warmup_sessions,
         "data_action_certified": True,
