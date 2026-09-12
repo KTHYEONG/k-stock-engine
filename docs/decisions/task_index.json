@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_COMPOUNDING_V2_ZERO_FILL_FIX",
+      "date": "2026-09-12",
+      "adr_id": "ADR_20260912_COMPOUNDING_V2_ZERO_FILL_FIX",
+      "domain": "backtest_execution",
+      "title": "compounding-v2 무거래(0건) 근본원인 수정",
+      "why": "Gold 원본 랭크 기준 진입밴드가 체결가능집합 감쇠로 12명 미달, 전량-불가 플로어가 전 구간 빈 선정을 반환했고 참여율/체결바 결측 예외가 런을 중단시킴",
+      "resolution": "체결가능 집합 조밀 재랭킹+min_positions=8 플로어 도입, 참여율 초과/체결바 결측/거래정지 평가를 비치명 영수증·이월 처리로 전환",
+      "impact": "2018-2026 전 구간 백테스트 완주, fill_count 0->645, reject_count 259, total_return +8.15%"
+    },
+    {
       "task_id": "TASK_KR_EQUITY_COMPOUNDING_STRATEGY_V2",
       "date": "2026-09-12",
       "adr_id": "ADR_20260912_KR_EQUITY_COMPOUNDING_STRATEGY_V2",
