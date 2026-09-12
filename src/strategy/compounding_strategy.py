@@ -23,6 +23,7 @@ class CompoundingStrategyPolicy:
     risk_rebalance_sessions: int = 10
     short_sma_sessions: int = 100
     long_sma_sessions: int = 200
+    execution_cash_buffer: float = 0.30
 
     def __post_init__(self) -> None:
         if (
@@ -34,6 +35,7 @@ class CompoundingStrategyPolicy:
             or self.risk_rebalance_sessions != 10
             or self.short_sma_sessions != 100
             or self.long_sma_sessions != 200
+            or self.execution_cash_buffer != 0.30
         ):
             raise ValueError("CompoundingStrategyPolicy constants are immutable")
 
@@ -85,6 +87,7 @@ class CompoundingStrategy:
         self._calendar = calendar
         self._policy = policy if policy is not None else CompoundingStrategyPolicy()
         self._frozen_weights: dict[str, float] = {}
+        self._entries_deferred = False
 
     @staticmethod
     def _is_positive_finite(value: Any) -> bool:
@@ -137,7 +140,27 @@ class CompoundingStrategy:
         risk_on = self._is_positive_finite(level) and self._is_positive_finite(sma_short) and self._is_positive_finite(sma_long) and float(cast(Any, level)) >= float(cast(Any, sma_short)) and float(cast(Any, level)) >= float(cast(Any, sma_long))
         held = {position.instrument.instrument_id: position.instrument for position in context.portfolio.positions}
         frozen = self._frozen_weights
-        targets = dict.fromkeys(held, 0.0) if not risk_on or not frozen else {iid: frozen.get(iid, 0.0) * context.portfolio.equity(marks) for iid in sorted(set(frozen) | set(held))}
+        nav = context.portfolio.equity(marks) if risk_on and frozen else 0.0
+        investable_nav = nav * (1.0 - self._policy.execution_cash_buffer)
+        selection_event = index % policy.selection_rebalance_sessions == 0
+        if selection_event and held:
+            self._entries_deferred = True
+        if not risk_on or not frozen:
+            targets = dict.fromkeys(held, 0.0)
+        elif self._entries_deferred:
+            targets = {
+                iid: float(context.portfolio.quantity_of(iid)) * marks[iid]
+                if iid in frozen
+                else 0.0
+                for iid in sorted(held)
+            }
+            if not selection_event:
+                self._entries_deferred = False
+        else:
+            targets = {
+                iid: frozen.get(iid, 0.0) * investable_nav
+                for iid in sorted(set(frozen) | set(held))
+            }
         execution_time = self._calendar.advance(decision_time, 1)
         account_id = context.portfolio.account_snapshot_id
         tag = decision_time.date().isoformat()
