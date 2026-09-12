@@ -1,16 +1,35 @@
-"""Strategy domain contracts and deterministic decision policies."""
+"""Strategy domain contracts and deterministic decision policies.
 
-from src.strategy.champion_strategy import ChampionStrategy  # noqa: I001
-from src.strategy.portfolio import ChampionPortfolioPolicy  # noqa: I001
-from src.strategy.portfolio import PortfolioSecurityInput  # noqa: I001
-from src.strategy.portfolio import construct_champion_portfolio  # noqa: I001
-from src.strategy.pipeline import build_champion_portfolio  # noqa: I001
-from src.strategy.scoring import ChampionScorePolicy  # noqa: I001
-from src.strategy.scoring import materialize_champion_scores  # noqa: I001
-from src.strategy.scoring import score_champion_rows  # noqa: I001
-from src.strategy.selection import ChampionSelectionPolicy  # noqa: I001
-from src.strategy.selection import select_champion_targets  # noqa: I001
-from src.strategy.universe import build_historical_universe, materialize_historical_universe  # noqa: I001
+The public names remain re-exported lazily so importing a lightweight strategy
+does not eagerly initialize the feature/NumPy dependency tree.
+"""
+
+from importlib import import_module
+from typing import Any
+
+_EXPORT_MODULES = {
+    "ChampionPortfolioPolicy": "src.strategy.portfolio",
+    "ChampionScorePolicy": "src.strategy.scoring",
+    "ChampionSelectionPolicy": "src.strategy.selection",
+    "ChampionStrategy": "src.strategy.champion_strategy",
+    "PortfolioSecurityInput": "src.strategy.portfolio",
+    "build_champion_portfolio": "src.strategy.pipeline",
+    "build_historical_universe": "src.strategy.universe",
+    "construct_champion_portfolio": "src.strategy.portfolio",
+    "materialize_champion_scores": "src.strategy.scoring",
+    "materialize_historical_universe": "src.strategy.universe",
+    "score_champion_rows": "src.strategy.scoring",
+    "select_champion_targets": "src.strategy.selection",
+}
+
+
+def __getattr__(name: str) -> Any:
+    module_name = _EXPORT_MODULES.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(module_name), name)
+    globals()[name] = value
+    return value
 
 __all__ = [
     "ChampionPortfolioPolicy",

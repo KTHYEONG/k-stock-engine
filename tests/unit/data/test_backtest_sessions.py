@@ -91,3 +91,40 @@ def test_rolling_inputs_result_is_invariant_to_calendar_padding() -> None:
     assert narrow[2] == wide[2]
     assert narrow[0]
 
+
+def test_eligible_market_trend_uses_lagged_caps_and_exact_windows() -> None:
+    from datetime import date, datetime, timedelta
+    import polars as pl
+    import pytest
+    from src.core.time import KRX_TZ, SessionCalendar
+    from src.data.backtest_sessions import build_eligible_cap_weighted_market_trend
+
+    sessions = tuple(datetime(2020, 1, 1, 9, tzinfo=KRX_TZ) + timedelta(days=i) for i in range(201))
+    rows = [{"session": session, "instrument_id": iid, "market_cap": cap} for session in sessions for iid, cap in (("KRX:A", 3.0), ("KRX:B", 1.0))]
+    frame = pl.DataFrame(rows)
+    eligible: dict[date, tuple[str, ...]] = {session.date(): ("KRX:A", "KRX:B") for session in sessions}
+    adjusted = {(session, "KRX:A"): 0.01 for session in sessions[1:]} | {(session, "KRX:B"): -0.01 for session in sessions[1:]}
+    trend = build_eligible_cap_weighted_market_trend(daily_market=frame, calendar=SessionCalendar(sessions), eligible_by_session=eligible, adjusted_returns=adjusted)
+    assert trend[sessions[0]].index_level == pytest.approx(1.0)
+    assert trend[sessions[98]].sma100 is None
+    assert trend[sessions[99]].sma100 is not None
+    assert trend[sessions[198]].sma200 is None
+    assert trend[sessions[199]].sma200 is not None
+    assert trend[sessions[1]].index_level == pytest.approx(1.005)
+
+
+def test_market_trend_snapshot_adapter_is_explicitly_wired() -> None:
+    import inspect
+    import src.data.backtest_sessions as module
+
+    base = {"mark_prices": {"KRX:A": 10000.0}}
+    point = module.EligibleMarketTrendPoint(index_level=1.2, sma100=1.1, sma200=1.0)
+    enriched = module.with_market_trend_snapshot(market_snapshot=base, point=point)
+    assert base == {"mark_prices": {"KRX:A": 10000.0}}
+    assert enriched["market_index_level"] == 1.2
+    assert enriched["market_index_sma100"] == 1.1
+    assert enriched["market_index_sma200"] == 1.0
+    assert module.with_market_trend_snapshot(market_snapshot=base, point=None) == base
+    source = inspect.getsource(module.build_backtest_sessions)
+    assert "with_market_trend_snapshot(" in source
+    assert "market_index_eligible_by_session" in source
