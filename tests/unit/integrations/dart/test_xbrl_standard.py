@@ -231,3 +231,308 @@ def test_filing_identities_attach_frozen_ticker_and_required_period_only(tmp_pat
     assert len(rows) == 1
     assert rows[0]["ticker"] == "005930"
     assert rows[0]["reprt_code"] == "11013"
+
+def test_fetch_one_financial_fact_source_matches_original_per_identity_behavior() -> None:
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    # Given: the same fixture as the pre-existing CFS-success test.
+    mock_raw = {
+        "status": "000",
+        "list": [
+            {
+                "rcept_no": "20150515001111",
+                "bsns_year": "2015",
+                "corp_code": "00126380",
+                "reprt_code": "11013",
+                "account_id": "ifrs-full_Revenue",
+                "account_nm": "매출액",
+                "fs_div": "CFS",
+                "thstrm_amount": "47,117,896,000,000",
+            }
+        ],
+    }
+    collector = DartXbrlCollector(api_key="fixture-key", request_json=lambda _e, _p: mock_raw)
+    identity = {
+        "corp_code": "00126380",
+        "filing_id": "20150515001111",
+        "rcept_no": "20150515001111",
+        "biz_year": "2015",
+        "reprt_code": "11013",
+        "fs_div": "CFS",
+        "published_at": "2015-05-15",
+        "ticker": "",
+    }
+
+    # When
+    page = collector._fetch_one_financial_fact_source(identity)
+
+    # Then
+    assert page["source_kind"] == "opendart_standard"
+    assert page["status"] == "000"
+    sales_rec = next(r for r in page["records"] if r["fact"] == "sales")
+    assert sales_rec["value"] == 47117896000000.0
+    assert sales_rec["consolidated"] is True
+
+
+def test_fetch_one_financial_fact_source_client_transport_success_and_error_wrapping() -> None:
+    import pytest
+
+    from src.core.pit import PITDataError
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    identity = {
+        "corp_code": "00000001",
+        "filing_id": "F1",
+        "rcept_no": "F1",
+        "biz_year": "2020",
+        "reprt_code": "11011",
+        "fs_div": "CFS",
+    }
+
+    # Given/When/Then: client transport succeeds (status 013, no request_json set).
+    class FakeClientOK:
+        def _request_validated(self, endpoint: str, params: dict[str, str]) -> dict[str, object]:
+            return {"status": "013", "list": []}
+
+        def fetch_document_archive(self, rcept_no: str) -> bytes:
+            return b""
+
+    collector_ok = DartXbrlCollector(api_key="k", client=FakeClientOK())
+    page = collector_ok._fetch_one_financial_fact_source(identity)
+    assert page["source_kind"] == "unavailable"
+
+    # Given/When/Then: client raises a DART-specific exception -> wrapped.
+    class FakeClientDartError:
+        def _request_validated(self, endpoint: str, params: dict[str, str]) -> dict[str, object]:
+            from src.integrations.dart.client import DartApiError
+
+            raise DartApiError("boom")
+
+        def fetch_document_archive(self, rcept_no: str) -> bytes:
+            return b""
+
+    collector_dart_err = DartXbrlCollector(api_key="k", client=FakeClientDartError())
+    with pytest.raises(PITDataError, match="F1"):
+        collector_dart_err._fetch_one_financial_fact_source(identity)
+
+    # Given/When/Then: client raises a generic exception -> also wrapped.
+    class FakeClientGeneric:
+        def _request_validated(self, endpoint: str, params: dict[str, str]) -> dict[str, object]:
+            raise RuntimeError("network blip")
+
+        def fetch_document_archive(self, rcept_no: str) -> bytes:
+            return b""
+
+    collector_generic = DartXbrlCollector(api_key="k", client=FakeClientGeneric())
+    with pytest.raises(PITDataError, match="F1"):
+        collector_generic._fetch_one_financial_fact_source(identity)
+
+
+def test_fetch_one_financial_fact_source_raises_when_no_transport_configured() -> None:
+    import pytest
+
+    from src.core.pit import PITDataError
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    identity = {
+        "corp_code": "00000001",
+        "filing_id": "F1",
+        "rcept_no": "F1",
+        "biz_year": "2020",
+        "reprt_code": "11011",
+        "fs_div": "CFS",
+    }
+
+    # Given: a constructed collector with both request transports cleared post-construction.
+    collector_no_request = DartXbrlCollector(api_key="k")
+    collector_no_request._client = None
+    collector_no_request._request_json = None
+
+    # When/Then: the request stage fails closed.
+    with pytest.raises(PITDataError, match="not configured"):
+        collector_no_request._fetch_one_financial_fact_source(identity)
+
+    # Given: a collector that can request but cannot fetch the archive fallback.
+    collector_no_archive = DartXbrlCollector(
+        api_key="k", request_json=lambda _e, _p: {"status": "013", "list": []}
+    )
+    collector_no_archive._client = None
+    collector_no_archive._request_bytes = None
+
+    # When/Then: the archive stage fails closed too.
+    with pytest.raises(PITDataError, match="not configured"):
+        collector_no_archive._fetch_one_financial_fact_source(identity)
+
+    # Given/When/Then: an empty (falsy) raw response also fails closed.
+    collector_empty_raw = DartXbrlCollector(api_key="k", request_json=lambda _e, _p: {})
+    with pytest.raises(PITDataError, match="F1"):
+        collector_empty_raw._fetch_one_financial_fact_source(identity)
+
+
+def test_fetch_one_financial_fact_source_records_every_row_diagnostic_kind() -> None:
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    # Given: one row per malformed shape, plus a valid row with no fiscal_period source.
+    rows: list[object] = [
+        "not-a-dict",
+        {"account_id": "unknown_xyz", "account_nm": "???", "bsns_year": "2020"},
+        {"account_id": "ifrs-full_Revenue", "account_nm": "매출액", "bsns_year": "2020"},
+        {"account_id": "ifrs-full_Revenue", "account_nm": "매출액", "thstrm_amount": "abc", "bsns_year": "2020"},
+        {"account_id": "ifrs-full_Revenue", "account_nm": "매출액", "thstrm_amount": "inf", "bsns_year": "2020"},
+        {"account_id": "ifrs-full_Revenue", "account_nm": "매출액", "thstrm_amount": "100"},
+    ]
+    collector = DartXbrlCollector(
+        api_key="k", request_json=lambda _e, _p: {"status": "000", "list": rows}
+    )
+    # identity.biz_year is empty so the last row (no row-level bsns_year) cannot resolve a period.
+    identity = {
+        "corp_code": "00000001",
+        "filing_id": "F1",
+        "rcept_no": "F1",
+        "biz_year": "",
+        "reprt_code": "11011",
+        "fs_div": "CFS",
+    }
+
+    # When
+    page = collector._fetch_one_financial_fact_source(identity)
+
+    # Then: every malformed row produced its own diagnostic and was skipped.
+    diagnostics = page["diagnostics"]
+    assert any(d.startswith("unknown_account") for d in diagnostics)
+    assert any(d.startswith("missing_amount") for d in diagnostics)
+    assert any(d.startswith("non_finite") for d in diagnostics)
+    assert any(d.startswith("missing_fiscal_period") for d in diagnostics)
+    assert page["records"] == []
+
+    # Given/When/Then: a status-000 response with an empty facts list falls through
+    # to the archive fallback rather than raising.
+    empty_collector = DartXbrlCollector(
+        api_key="k",
+        request_json=lambda _e, _p: {"status": "000", "list": []},
+        request_bytes=lambda _e, _p: b"",
+    )
+    ofs_identity = {**identity, "biz_year": "2020", "fs_div": "OFS"}
+    empty_page = empty_collector._fetch_one_financial_fact_source(ofs_identity)
+    assert empty_page["source_kind"] == "unavailable"
+
+
+def test_fetch_one_financial_fact_source_archive_fetch_error_handling() -> None:
+    import pytest
+
+    from src.core.pit import PITDataError
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    identity = {
+        "corp_code": "00000001",
+        "filing_id": "F1",
+        "rcept_no": "F1",
+        "biz_year": "2020",
+        "reprt_code": "11011",
+        "fs_div": "CFS",
+    }
+
+    # Given/When/Then: the client-based archive fetch path is used and succeeds.
+    class FakeClientArchiveOK:
+        def _request_validated(self, endpoint: str, params: dict[str, str]) -> dict[str, object]:
+            return {"status": "013", "list": []}
+
+        def fetch_document_archive(self, rcept_no: str) -> bytes:
+            return b""
+
+    collector_ok = DartXbrlCollector(api_key="k", client=FakeClientArchiveOK())
+    page = collector_ok._fetch_one_financial_fact_source(identity)
+    assert page["source_kind"] == "unavailable"
+
+    # Given/When/Then: a PITDataError from the client archive fetch propagates as-is.
+    class FakeClientArchiveRaisesPIT:
+        def _request_validated(self, endpoint: str, params: dict[str, str]) -> dict[str, object]:
+            return {"status": "013", "list": []}
+
+        def fetch_document_archive(self, rcept_no: str) -> bytes:
+            raise PITDataError("archive boom")
+
+    collector_pit = DartXbrlCollector(api_key="k", client=FakeClientArchiveRaisesPIT())
+    with pytest.raises(PITDataError, match="archive boom"):
+        collector_pit._fetch_one_financial_fact_source(identity)
+
+    # Given/When/Then: a generic exception from the client archive fetch is wrapped.
+    class FakeClientArchiveRaisesGeneric:
+        def _request_validated(self, endpoint: str, params: dict[str, str]) -> dict[str, object]:
+            return {"status": "013", "list": []}
+
+        def fetch_document_archive(self, rcept_no: str) -> bytes:
+            raise RuntimeError("archive network blip")
+
+    collector_generic = DartXbrlCollector(api_key="k", client=FakeClientArchiveRaisesGeneric())
+    with pytest.raises(PITDataError, match="F1"):
+        collector_generic._fetch_one_financial_fact_source(identity)
+
+
+def test_fetch_one_financial_fact_source_rejects_invalid_and_parses_valid_legacy_archive() -> None:
+    import io
+    import zipfile
+
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    def make_legacy_archive(files: dict[str, str]) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for name, content in files.items():
+                zf.writestr(name, content.encode("utf-8"))
+        return buf.getvalue()
+
+    identity = {
+        "corp_code": "001",
+        "filing_id": "F1",
+        "rcept_no": "F1",
+        "biz_year": "2020",
+        "reprt_code": "11011",
+        "fs_div": "CFS",
+    }
+
+    # Given/When/Then: a non-empty, non-zip archive is rejected explicitly.
+    collector_bad_zip = DartXbrlCollector(
+        api_key="k",
+        request_json=lambda _e, _p: {"status": "013", "list": []},
+        request_bytes=lambda _e, _p: b"not-a-zip-archive",
+    )
+    bad_zip_page = collector_bad_zip._fetch_one_financial_fact_source(identity)
+    assert bad_zip_page["diagnostics"] == ("invalid_document_archive",)
+
+    # Given/When/Then: a valid zip with a well-formed two-account statement parses successfully.
+    good_xml = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        "<document>"
+        "<account><account_nm>\ub9e4\ucd9c\uc561</account_nm><amount>100</amount><unit>KRW</unit></account>"
+        "<account><account_nm>\uc790\uc0b0\ucd1d\uacc4</account_nm><amount>1000</amount><unit>KRW</unit></account>"
+        "</document>"
+    )
+    good_archive = make_legacy_archive({"F1.xml": good_xml})
+    collector_good = DartXbrlCollector(
+        api_key="k",
+        request_json=lambda _e, _p: {"status": "013", "list": []},
+        request_bytes=lambda _e, _p: good_archive,
+    )
+    good_page = collector_good._fetch_one_financial_fact_source(identity)
+    assert good_page["source_kind"] == "legacy_document"
+    assert len(good_page["records"]) >= 1
+
+    # Given/When/Then: a valid zip with an ambiguous (duplicate) statement fails extraction.
+    ambiguous_xml = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        "<document>"
+        "<account><account_nm>\ub9e4\ucd9c\uc561</account_nm><amount>100</amount><unit>KRW</unit></account>"
+        "<account><account_nm>\ub9e4\ucd9c\uc561</account_nm><amount>200</amount><unit>KRW</unit></account>"
+        "</document>"
+    )
+    ambiguous_archive = make_legacy_archive({"F1.xml": ambiguous_xml})
+    collector_ambiguous = DartXbrlCollector(
+        api_key="k",
+        request_json=lambda _e, _p: {"status": "013", "list": []},
+        request_bytes=lambda _e, _p: ambiguous_archive,
+    )
+    ambiguous_page = collector_ambiguous._fetch_one_financial_fact_source(identity)
+    assert ambiguous_page["status"] == "extraction_failed"
+    assert ambiguous_page["records"] == []
+

@@ -41,3 +41,51 @@ def test_collection_artifact_keeps_each_page_receipt(tmp_path) -> None:
 
     assert len(artifact.page_receipts['daily_market']) == 2
     assert artifact.report_path.exists()
+
+def test_collect_dart_financial_facts_end_to_end_with_concurrent_collector(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    from src.data.collection import collect_dart_financial_facts
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    # Given: 6 distinct identities, each resolving on the first CFS attempt.
+    def ok_response(_endpoint: str, params: dict[str, str]) -> dict[str, object]:
+        return {
+            "status": "000",
+            "list": [
+                {
+                    "rcept_no": f"R{params['corp_code']}",
+                    "bsns_year": "2020",
+                    "corp_code": params["corp_code"],
+                    "reprt_code": "11011",
+                    "account_id": "ifrs-full_Revenue",
+                    "account_nm": "매출액",
+                    "fs_div": "CFS",
+                    "thstrm_amount": "1000",
+                }
+            ],
+        }
+
+    collector = DartXbrlCollector(api_key="k", request_json=ok_response, max_workers=6)
+    identities = tuple(
+        {
+            "corp_code": f"{i:08d}",
+            "filing_id": f"F{i}",
+            "rcept_no": f"R{i:08d}",
+            "biz_year": "2020",
+            "reprt_code": "11011",
+            "fs_div": "CFS",
+        }
+        for i in range(6)
+    )
+
+    # When
+    artifact = collect_dart_financial_facts(
+        dart=collector,
+        identities=identities,
+        bronze_root=tmp_path,
+        retrieved_at=datetime(2024, 1, 1, tzinfo=UTC),
+    )
+
+    # Then: every identity produced exactly one persisted page.
+    assert len(artifact.page_receipts["financial_facts"]) == 6

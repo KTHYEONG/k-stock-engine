@@ -7,6 +7,7 @@ import os
 import re
 import zipfile
 from collections.abc import Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -47,14 +48,18 @@ class DartXbrlCollector:
         request_json: Any | None = None,
         request_bytes: Any | None = None,
         client: Any | None = None,
+        max_workers: int = 20,
     ) -> None:
         key = api_key or os.getenv("OPENDART_API_KEY")
         if not key and request_json is None and request_bytes is None and client is None:
             raise ValueError("OPENDART_API_KEY not found in environment variables")
+        if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
+            raise ValueError(f"invalid max_workers {max_workers!r}: must be a positive integer")
         self._api_key = key
         self._request_json = request_json
         self._request_bytes = request_bytes
         self._client: Any | None = client
+        self._max_workers = max_workers
         if request_json is None and request_bytes is None and key is not None and self._client is None:
             from src.integrations.dart.client import DartApiClient
 
@@ -250,12 +255,6 @@ class DartXbrlCollector:
         self, identities: tuple[dict[str, str], ...]
     ) -> Iterable[dict[str, Any]]:
         """Fetch canonical fact sources; 013 alone never proves absence."""
-        from src.integrations.dart.legacy_filing import (
-            MAPPING_VERSION,
-            map_standardized_account,
-            parse_legacy_filing_archive,
-        )
-
         if not identities:
             raise PITDataError("DART financial facts require filing identities")
         normalized: list[dict[str, str]] = []
@@ -281,205 +280,214 @@ class DartXbrlCollector:
                     "ticker": str(item.get("ticker") or "").strip(),
                 }
             )
-        pages: list[dict[str, Any]] = []
-        for identity in normalized:
-            fid = identity["filing_id"]
-            divisions = (identity["fs_div"], "OFS") if identity["fs_div"] == "CFS" else (identity["fs_div"],)
-            standardized_hit: dict[str, Any] | None = None
-            last_status = ""
-            for fs_div in divisions:
-                request_identity = {**identity, "fs_div": fs_div}
-                if self._request_json is not None:
-                    raw = self._request_json("fnlttSinglAcntAll", dict(request_identity))
-                elif self._client is not None:
-                    try:
-                        raw = self._client._request_validated(
-                            "fnlttSinglAcntAll.json",
-                            {
-                                "corp_code": identity["corp_code"],
-                                "bsns_year": identity["biz_year"],
-                                "reprt_code": identity["reprt_code"],
-                                "fs_div": fs_div,
-                            },
-                        )
-                    except Exception as exc:
-                        from src.integrations.dart.client import (
-                            DartApiError,
-                            DartRetryableError,
-                            DartTerminalError,
-                        )
-
-                        if isinstance(exc, (DartRetryableError, DartTerminalError, DartApiError, PITDataError)):
-                            raise PITDataError(f"DART request failed for {fid}") from exc
-                        raise PITDataError(f"DART request failed for {fid}") from exc
-                else:
-                    raise PITDataError("DART XBRL facts endpoint is not configured")
-                if not isinstance(raw, dict) or not raw:
-                    raise PITDataError(f"DART request failed for {fid}")
-                status = str(raw.get("status") or "")
-                last_status = status or last_status
-                if status in {"013", "014"}:
-                    continue
-                if status != "000":
-                    raise PITDataError(f"DART request failed for {fid}: status {status}")
-                facts = raw.get("list", raw.get("records", []))
-                if not facts:
-                    continue
-                rows = facts if isinstance(facts, list) else [facts]
-                canonical: list[dict[str, Any]] = []
-                diagnostics: list[str] = []
-                for row in rows:
-                    if not isinstance(row, dict):
-                        continue
-                    fact = map_standardized_account(
-                        account_id=str(row.get("account_id") or row.get("accountId") or ""),
-                        account_nm=str(row.get("account_nm") or row.get("account") or ""),
-                    )
-                    if fact is None:
-                        diagnostics.append(f"unknown_account:{row.get('account_nm') or row.get('account_id')}")
-                        continue
-                    raw_amount = (
-                        row.get("thstrm_amount")
-                        if row.get("thstrm_amount") not in (None, "")
-                        else row.get("thstrm_add_amount")
-                    )
-                    if raw_amount in (None, ""):
-                        diagnostics.append(f"missing_amount:{fact}")
-                        continue
-                    try:
-                        value = float(str(raw_amount).replace(",", "").strip())
-                    except (TypeError, ValueError):
-                        diagnostics.append(f"non_finite:{fact}")
-                        continue
-                    import math as _math
-
-                    if not _math.isfinite(value):
-                        diagnostics.append(f"non_finite:{fact}")
-                        continue
-                    biz_year = str(
-                        row.get("bsns_year") or identity.get("biz_year") or ""
-                    ).strip()
-                    reprt_code = str(
-                        row.get("reprt_code") or identity.get("reprt_code") or ""
-                    ).strip()
-                    quarter = _REPRT_QUARTER.get(reprt_code, "Q4")
-                    fiscal_period = f"{biz_year}{quarter}" if biz_year else ""
-                    if not fiscal_period:
-                        diagnostics.append(f"missing_fiscal_period:{fact}")
-                        continue
-                    corp_code = str(
-                        row.get("corp_code") or identity.get("corp_code") or ""
-                    ).strip()
-                    filing_id = str(
-                        row.get("rcept_no") or identity.get("filing_id") or ""
-                    ).strip()
-                    fs_div = str(row.get("fs_div") or identity.get("fs_div") or "CFS").strip()
-                    ticker = str(row.get("ticker") or identity.get("ticker") or "").strip()
-                    canonical.append(
-                        {
-                            **row,
-                            "company_id": corp_code,
-                            "corp_code": corp_code,
-                            "ticker": ticker,
-                            "filing_id": filing_id,
-                            "fiscal_period": fiscal_period,
-                            "fact": fact,
-                            "value": value,
-                            "unit": "KRW",
-                            "consolidated": fs_div == "CFS",
-                            "restatement_id": "r0",
-                            "source_kind": "opendart_standard",
-                            "mapping_version": MAPPING_VERSION,
-                            "raw_document_hash": None,
-                        }
-                    )
-                standardized_hit = {
-                    "source_kind": "opendart_standard",
-                    "status": "000",
-                    "identity": dict(request_identity),
-                    "records": canonical,
-                    "mapping_version": MAPPING_VERSION,
-                    "diagnostics": tuple(diagnostics),
-                    "raw_document_hash": None,
-                    "raw_provenance": dict(raw),
-                    **request_identity,
-                }
-                break
-            if standardized_hit is not None:
-                pages.append(standardized_hit)
-                continue
-            rcept_no = identity.get("rcept_no") or fid
-            try:
-                if self._request_bytes is not None:
-                    archive = self._request_bytes("document.xml", {"rcept_no": rcept_no})
-                elif self._client is not None:
-                    archive = self._client.fetch_document_archive(rcept_no)
-                else:
-                    raise PITDataError("DART document archive endpoint is not configured")
-            except PITDataError:
-                raise
-            except Exception as exc:
-                raise PITDataError(f"DART document archive failed for {fid}") from exc
-            if not isinstance(archive, (bytes, bytearray)) or len(archive) == 0:
-                pages.append(
-                    {
-                        "source_kind": "unavailable",
-                        "status": last_status or "013",
-                        "identity": dict(identity),
-                        "records": [],
-                        "mapping_version": MAPPING_VERSION,
-                        "diagnostics": ("empty_archive",),
-                        "raw_document_hash": None,
-                        **identity,
-                    }
-                )
-                continue
-            if not zipfile.is_zipfile(io.BytesIO(bytes(archive))):
-                pages.append(
-                    {
-                        "source_kind": "unavailable",
-                        "status": last_status or "013",
-                        "identity": dict(identity),
-                        "records": [],
-                        "mapping_version": MAPPING_VERSION,
-                        "diagnostics": ("invalid_document_archive",),
-                        "raw_document_hash": None,
-                        **identity,
-                    }
-                )
-                continue
-            import hashlib
-
-            digest = hashlib.sha256(bytes(archive)).hexdigest()
-            parsed = parse_legacy_filing_archive(
-                archive_bytes=bytes(archive), identity=dict(identity), document_hash=digest
-            )
-            if parsed.status == "extraction_failed" and not parsed.records:
-                pages.append(
-                    {
-                        "source_kind": "legacy_document",
-                        "status": "extraction_failed",
-                        "identity": dict(identity),
-                        "records": [],
-                        "mapping_version": MAPPING_VERSION,
-                        "diagnostics": tuple(parsed.diagnostics),
-                        "raw_document_hash": digest,
-                        "raw_archive": bytes(archive),
-                        **identity,
-                    }
-                )
-                continue
-            pages.append(
-                {
-                    "source_kind": "legacy_document",
-                    "status": last_status or "013",
-                    "identity": dict(identity),
-                    "records": list(parsed.records),
-                    "mapping_version": MAPPING_VERSION,
-                    "diagnostics": tuple(parsed.diagnostics),
-                    "raw_document_hash": digest,
-                    "raw_archive": bytes(archive),
-                    **identity,
-                }
-            )
+        if len(normalized) <= 1 or self._max_workers <= 1:
+            pages = [self._fetch_one_financial_fact_source(identity) for identity in normalized]
+        else:
+            with ThreadPoolExecutor(max_workers=min(self._max_workers, len(normalized))) as pool:
+                pages = list(pool.map(self._fetch_one_financial_fact_source, normalized))
         return iter(tuple(pages))
+
+    def _fetch_one_financial_fact_source(self, identity: dict[str, str]) -> dict[str, Any]:
+        """Fetch and parse the full-statement source for one filing identity.
+
+        CFS is tried first; OFS is tried only when CFS returns status 013/014
+        (no consolidated filing) or an empty statement. A document.xml
+        legacy-parse fallback applies only when neither basis yields usable
+        facts. Runs inside a bounded thread pool from
+        fetch_financial_fact_sources; behavior per identity is unchanged from
+        the original sequential loop.
+        """
+        from src.integrations.dart.legacy_filing import (
+            MAPPING_VERSION,
+            map_standardized_account,
+            parse_legacy_filing_archive,
+        )
+
+        fid = identity["filing_id"]
+        divisions = (identity["fs_div"], "OFS") if identity["fs_div"] == "CFS" else (identity["fs_div"],)
+        standardized_hit: dict[str, Any] | None = None
+        last_status = ""
+        request_identity: dict[str, str] = {}
+        for fs_div in divisions:
+            request_identity = {**identity, "fs_div": fs_div}
+            if self._request_json is not None:
+                raw = self._request_json("fnlttSinglAcntAll", dict(request_identity))
+            elif self._client is not None:
+                try:
+                    raw = self._client._request_validated(
+                        "fnlttSinglAcntAll.json",
+                        {
+                            "corp_code": identity["corp_code"],
+                            "bsns_year": identity["biz_year"],
+                            "reprt_code": identity["reprt_code"],
+                            "fs_div": fs_div,
+                        },
+                    )
+                except Exception as exc:
+                    from src.integrations.dart.client import (
+                        DartApiError,
+                        DartRetryableError,
+                        DartTerminalError,
+                    )
+
+                    if isinstance(exc, (DartRetryableError, DartTerminalError, DartApiError, PITDataError)):
+                        raise PITDataError(f"DART request failed for {fid}") from exc
+                    raise PITDataError(f"DART request failed for {fid}") from exc
+            else:
+                raise PITDataError("DART XBRL facts endpoint is not configured")
+            if not isinstance(raw, dict) or not raw:
+                raise PITDataError(f"DART request failed for {fid}")
+            status = str(raw.get("status") or "")
+            last_status = status or last_status
+            if status in {"013", "014"}:
+                continue
+            if status != "000":
+                raise PITDataError(f"DART request failed for {fid}: status {status}")
+            facts = raw.get("list", raw.get("records", []))
+            if not facts:
+                continue
+            rows = facts if isinstance(facts, list) else [facts]
+            canonical: list[dict[str, Any]] = []
+            diagnostics: list[str] = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                fact = map_standardized_account(
+                    account_id=str(row.get("account_id") or row.get("accountId") or ""),
+                    account_nm=str(row.get("account_nm") or row.get("account") or ""),
+                )
+                if fact is None:
+                    diagnostics.append(f"unknown_account:{row.get('account_nm') or row.get('account_id')}")
+                    continue
+                raw_amount = (
+                    row.get("thstrm_amount")
+                    if row.get("thstrm_amount") not in (None, "")
+                    else row.get("thstrm_add_amount")
+                )
+                if raw_amount in (None, ""):
+                    diagnostics.append(f"missing_amount:{fact}")
+                    continue
+                try:
+                    value = float(str(raw_amount).replace(",", "").strip())
+                except (TypeError, ValueError):
+                    diagnostics.append(f"non_finite:{fact}")
+                    continue
+                import math as _math
+
+                if not _math.isfinite(value):
+                    diagnostics.append(f"non_finite:{fact}")
+                    continue
+                biz_year = str(
+                    row.get("bsns_year") or identity.get("biz_year") or ""
+                ).strip()
+                reprt_code = str(
+                    row.get("reprt_code") or identity.get("reprt_code") or ""
+                ).strip()
+                quarter = _REPRT_QUARTER.get(reprt_code, "Q4")
+                fiscal_period = f"{biz_year}{quarter}" if biz_year else ""
+                if not fiscal_period:
+                    diagnostics.append(f"missing_fiscal_period:{fact}")
+                    continue
+                corp_code = str(
+                    row.get("corp_code") or identity.get("corp_code") or ""
+                ).strip()
+                filing_id = str(
+                    row.get("rcept_no") or identity.get("filing_id") or ""
+                ).strip()
+                fs_div_value = str(row.get("fs_div") or identity.get("fs_div") or "CFS").strip()
+                ticker = str(row.get("ticker") or identity.get("ticker") or "").strip()
+                canonical.append(
+                    {
+                        **row,
+                        "company_id": corp_code,
+                        "corp_code": corp_code,
+                        "ticker": ticker,
+                        "filing_id": filing_id,
+                        "fiscal_period": fiscal_period,
+                        "fact": fact,
+                        "value": value,
+                        "unit": "KRW",
+                        "consolidated": fs_div_value == "CFS",
+                        "restatement_id": "r0",
+                        "source_kind": "opendart_standard",
+                        "mapping_version": MAPPING_VERSION,
+                        "raw_document_hash": None,
+                    }
+                )
+            standardized_hit = {
+                "source_kind": "opendart_standard",
+                "status": "000",
+                "identity": dict(request_identity),
+                "records": canonical,
+                "mapping_version": MAPPING_VERSION,
+                "diagnostics": tuple(diagnostics),
+                "raw_document_hash": None,
+                "raw_provenance": dict(raw),
+                **request_identity,
+            }
+            break
+        if standardized_hit is not None:
+            return standardized_hit
+        rcept_no = identity.get("rcept_no") or fid
+        try:
+            if self._request_bytes is not None:
+                archive = self._request_bytes("document.xml", {"rcept_no": rcept_no})
+            elif self._client is not None:
+                archive = self._client.fetch_document_archive(rcept_no)
+            else:
+                raise PITDataError("DART document archive endpoint is not configured")
+        except PITDataError:
+            raise
+        except Exception as exc:
+            raise PITDataError(f"DART document archive failed for {fid}") from exc
+        if not isinstance(archive, (bytes, bytearray)) or len(archive) == 0:
+            return {
+                "source_kind": "unavailable",
+                "status": last_status or "013",
+                "identity": dict(identity),
+                "records": [],
+                "mapping_version": MAPPING_VERSION,
+                "diagnostics": ("empty_archive",),
+                "raw_document_hash": None,
+                **identity,
+            }
+        if not zipfile.is_zipfile(io.BytesIO(bytes(archive))):
+            return {
+                "source_kind": "unavailable",
+                "status": last_status or "013",
+                "identity": dict(identity),
+                "records": [],
+                "mapping_version": MAPPING_VERSION,
+                "diagnostics": ("invalid_document_archive",),
+                "raw_document_hash": None,
+                **identity,
+            }
+        import hashlib
+
+        digest = hashlib.sha256(bytes(archive)).hexdigest()
+        parsed = parse_legacy_filing_archive(
+            archive_bytes=bytes(archive), identity=dict(identity), document_hash=digest
+        )
+        if parsed.status == "extraction_failed" and not parsed.records:
+            return {
+                "source_kind": "legacy_document",
+                "status": "extraction_failed",
+                "identity": dict(identity),
+                "records": [],
+                "mapping_version": MAPPING_VERSION,
+                "diagnostics": tuple(parsed.diagnostics),
+                "raw_document_hash": digest,
+                "raw_archive": bytes(archive),
+                **identity,
+            }
+        return {
+            "source_kind": "legacy_document",
+            "status": last_status or "013",
+            "identity": dict(identity),
+            "records": list(parsed.records),
+            "mapping_version": MAPPING_VERSION,
+            "diagnostics": tuple(parsed.diagnostics),
+            "raw_document_hash": digest,
+            "raw_archive": bytes(archive),
+            **identity,
+        }
