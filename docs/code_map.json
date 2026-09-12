@@ -29,7 +29,6 @@
       "tests/unit/core/test_instrument.py",
       "tests/unit/core/test_ledger.py",
       "tests/unit/data/test_backtest_runner.py",
-      "tests/unit/data/test_backtest_sessions.py",
       "tests/unit/data/test_cli.py",
       "tests/unit/data/test_collection.py",
       "tests/unit/data/test_corporate_action_evidence_diffcover.py",
@@ -94,6 +93,9 @@
   "src/data/gold_artifacts.py": {
     "testing": "tests/unit/data/test_gold_artifacts.py"
   },
+  "src/data/gold_informativeness.py": {
+    "testing": "tests/unit/data/test_gold_informativeness.py"
+  },
   "src/data/gold_loader.py": {
     "testing": "tests/unit/data/test_gold_loader.py"
   },
@@ -105,6 +107,9 @@
   },
   "src/data/lifecycle.py": {
     "testing": "tests/unit/data/test_lifecycle.py"
+  },
+  "src/data/master_intervals.py": {
+    "testing": "tests/unit/data/test_master_intervals.py"
   },
   "src/data/normalization.py": {
     "testing": "tests/unit/data/test_normalization.py"
@@ -133,8 +138,7 @@
   "src/data/snapshot.py": {
     "testing": [
       "tests/integration/data/test_pit_dataset_foundation.py",
-      "tests/unit/data/test_backtest_runner.py",
-      "tests/unit/data/test_backtest_sessions.py"
+      "tests/unit/data/test_backtest_runner.py"
     ]
   },
   "src/data/streaming_normalization.py": {

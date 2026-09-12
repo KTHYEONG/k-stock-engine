@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "data_layer_overhaul_phase1",
+      "date": "2026-09-12",
+      "adr_id": "ADR_20260912_data_layer_overhaul_phase1",
+      "domain": "data",
+      "title": "Silver 물리표현 정규화 및 백테스트 자원소진 해소",
+      "why": "security_master 일자 스냅샷 848배 중복과 PK 상충으로 2024 백테스트가 12.2GB/21분 소요 및 실패했다.",
+      "resolution": "SCD2 구간 압축(compact_security_master_intervals)과 센티넬 증거우세 PK 상충 해소, Gold 정보량 게이트(certify_informative_gold)를 추가했다.",
+      "impact": "2024 백테스트가 5.7GB/59초로 통과하고 결과는 기존과 비트 단위 동일하며, 정보량 미달 champion Gold는 fail-closed로 차단된다."
+    },
+    {
       "task_id": "DATA_PROVENANCE_ANNUAL_20260911",
       "date": "2026-09-11",
       "adr_id": "ADR_20260911_DATA_PROVENANCE_ANNUAL_20260911",
