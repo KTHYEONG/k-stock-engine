@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_CHAMPION_FACTOR_DATA_GAP_FIX",
+      "date": "2026-09-12",
+      "adr_id": "ADR_20260912_CHAMPION_FACTOR_DATA_GAP_FIX",
+      "domain": "data",
+      "title": "Champion 팩터 회계기준 일관성 및 아티팩트 인증 수정",
+      "why": "FY2016+ DART 백필이 주요계정 API를 써서 gross_profit/OCF가 없고 연결/별도 기준이 (종목,분기,팩트)당 한쪽만 저장되어 70.6% TTM 윈도우가 기준 혼합됨",
+      "resolution": "팩트 키에 회계기준 추가, 종목별 단일기준 선택기(select_company_basis), stale Gold 아티팩트 적재시 fail-closed 인증, FY2016+ 재수집용 순수 배치 플래너 추가",
+      "impact": "현재 Gold(070b2df1) eligible 45012행 전부 인증 거부로 백테스트 차단 확인, select_company_basis 세션당 3.26s->0.06s 최적화로 Gold 빌드 약 1.8h 단축"
+    },
+    {
       "task_id": "TASK_COMPOUNDING_V2_ZERO_FILL_FIX",
       "date": "2026-09-12",
       "adr_id": "ADR_20260912_COMPOUNDING_V2_ZERO_FILL_FIX",
