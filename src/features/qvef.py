@@ -6,6 +6,8 @@ import math
 import re
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, cast
 from zoneinfo import ZoneInfo
@@ -22,6 +24,15 @@ _CANONICAL_FACTS = frozenset(
 )
 
 _FISCAL_RE = re.compile(r"^(\d{4})Q([1-4])$")
+
+ACCOUNTING_BASIS_PREFERENCE: tuple[str, ...] = ("consolidated", "separate")
+
+
+@dataclass(frozen=True, slots=True)
+class CompanyBasisSelection:
+    basis: str
+    latest_period: str
+    covered_cells: int
 
 
 def _parse_fiscal(period: str) -> tuple[int, int] | None:
@@ -157,38 +168,44 @@ def _resolve_master_for_eligible(
     return resolved
 
 
-def _resolve_facts_pit(
+def resolve_facts_pit_by_basis(
     financial_facts: pl.DataFrame,
     *,
     decision_time: datetime,
     eligible_company_ids: frozenset[str],
-) -> dict[tuple[str, str, str], tuple[float | None, datetime | None]]:
-    """PIT-filter financial_facts and resolve canonical (value, available_at) per (company_id, fiscal_period, fact).
+) -> dict[tuple[str, str, str, str], tuple[float | None, datetime | None]]:
+    """PIT-filter financial_facts and resolve canonical (value, available_at) per (company_id, fiscal_period, fact, basis).
 
-    Replaces the Python-loop PIT scan on 653K rows. Returns resolved_facts dict
-    with identical semantics to the original Python implementation.
+    연결 and 별도 are distinct observations; the basis is part of the key so one
+    never overwrites the other. A window mixing bases is unavailable, not approximated.
     """
     if financial_facts.is_empty():
         return {}
     col_tz = getattr(financial_facts["available_at"].dtype, "time_zone", None)
     target_dt = decision_time.astimezone(ZoneInfo(col_tz)) if col_tz else decision_time
     pit = financial_facts.filter(pl.col("available_at") <= target_dt)
-    pit = pit.filter(pl.col("consolidated") == True).filter(  # noqa: E712
+    pit = pit.filter(
         pl.col("fact").is_in(list(_CANONICAL_FACTS))
     ).filter(pl.col("company_id").is_in(list(eligible_company_ids))).filter(
         pl.col("fiscal_period").str.contains(r"^\d{4}Q[1-4]$")
     )
+    pit = pit.with_columns(
+        pl.when(pl.col("consolidated") == True)  # noqa: E712
+        .then(pl.lit("consolidated"))
+        .otherwise(pl.lit("separate"))
+        .alias("basis")
+    )
     agg = pit.sort("available_at", descending=True).group_by(
-        ["company_id", "fiscal_period", "fact"]
+        ["company_id", "fiscal_period", "fact", "basis"]
     ).agg(
         pl.first("available_at").alias("av"),
         pl.first("value").alias("val"),
         pl.first("unit").alias("unit_v"),
         (pl.col("available_at") == pl.col("available_at").max()).sum().alias("_n_at_max"),
     )
-    resolved_facts: dict[tuple[str, str, str], tuple[float | None, datetime | None]] = {}
+    resolved_facts: dict[tuple[str, str, str, str], tuple[float | None, datetime | None]] = {}
     for row in agg.to_dicts():
-        key = (str(row["company_id"]), str(row["fiscal_period"]), str(row["fact"]))
+        key = (str(row["company_id"]), str(row["fiscal_period"]), str(row["fact"]), str(row["basis"]))
         fv = float(row["val"])
         if (
             row["_n_at_max"] > 1
@@ -199,6 +216,49 @@ def _resolve_facts_pit(
         else:
             resolved_facts[key] = (fv, row["av"])
     return resolved_facts
+
+
+def select_company_basis(
+    *,
+    facts_by_basis: Mapping[tuple[str, str, str, str], tuple[float | None, datetime | None]],
+    company_id: str,
+    window_quarters: int = 8,
+    facts: tuple[str, ...] = (),
+    preference: tuple[str, ...] = ACCOUNTING_BASIS_PREFERENCE,
+) -> CompanyBasisSelection | None:
+    """Choose one accounting basis for a company and report its latest period and window coverage.
+
+    Ties resolve by ACCOUNTING_BASIS_PREFERENCE index, never by dict iteration order.
+    A window the chosen basis cannot cover yields None rather than an approximation.
+    """
+    fact_list = facts if facts else tuple(sorted(_CANONICAL_FACTS))
+    fact_set = set(fact_list)
+    best: CompanyBasisSelection | None = None
+    best_cells = 0
+    for basis in preference:
+        periods: set[str] = set()
+        for (cid, per, fact, b), (val, _av) in facts_by_basis.items():
+            if cid == company_id and b == basis and fact in fact_set and val is not None:
+                periods.add(per)
+        if not periods:
+            continue
+        latest = max(periods, key=_fiscal_sort_key)
+        window: list[str] = []
+        for i in range(window_quarters):
+            p = _subtract_quarters(latest, i)
+            if p is None:
+                break
+            window.append(p)
+        covered = 0
+        for per in window:
+            for fact in fact_list:
+                val, _av = facts_by_basis.get((company_id, per, fact, basis), (None, None))
+                if val is not None:
+                    covered += 1
+        if covered > best_cells or (best is None and covered > 0):
+            best_cells = covered
+            best = CompanyBasisSelection(basis=basis, latest_period=latest, covered_cells=covered)
+    return best
 
 
 def _build_market_index(
@@ -284,11 +344,26 @@ def build_qvef_features(
         return ()
 
     # Filter financial facts PIT and resolve canonical facts via Polars native agg
-    resolved_facts = _resolve_facts_pit(financial_facts, decision_time=decision_time, eligible_company_ids=frozenset(info['company_id'] for info in resolved.values()))
+    resolved_facts = resolve_facts_pit_by_basis(financial_facts, decision_time=decision_time, eligible_company_ids=frozenset(info['company_id'] for info in resolved.values()))
 
-    # Helper to get fact value
+    # One accounting basis per company for the whole decision session.  Index the
+    # resolved keys by company in a single pass; scanning the whole mapping once
+    # per company costs O(companies x keys) and dominates the Gold build.
+    facts_by_company: dict[str, dict[tuple[str, str, str, str], tuple[float | None, datetime | None]]] = defaultdict(dict)
+    for fact_key, fact_value in resolved_facts.items():
+        facts_by_company[fact_key[0]][fact_key] = fact_value
+    basis_by_company: dict[str, CompanyBasisSelection] = {}
+    for cid in sorted({info['company_id'] for info in resolved.values()}):
+        selection = select_company_basis(facts_by_basis=facts_by_company.get(cid, {}), company_id=cid)
+        if selection is not None:
+            basis_by_company[cid] = selection
+
+    # Helper to get fact value from the single basis chosen for the company.
+    # Only reached under `latest_period is not None`, which implies a selection;
+    # indexing keeps a missing selection a loud KeyError instead of a silent None.
     def get_fact(company_id: str, period: str, fact: str) -> tuple[float | None, datetime | None]:
-        return resolved_facts.get((company_id, period, fact), (None, None))
+        basis = basis_by_company[company_id].basis
+        return resolved_facts.get((company_id, period, fact, basis), (None, None))
 
     # Daily market PIT index via Polars native dedup (single dict entry per key)
     market_by_key = _build_market_index(daily_market, decision_time=decision_time)
@@ -309,19 +384,10 @@ def build_qvef_features(
         company_id = info["company_id"]
         sector = info["sector"]
 
-        # Determine latest fiscal period for this company
-        periods_for_company = set()
-        for (cid, per, _fact) in resolved_facts:
-            if cid == company_id:
-                # only if the fact is not None? But we stored None for unavailable; still period exists but unavailable
-                # Consider period valid if any fact resolved (even if None, it's still a period attempted)
-                # However we should only consider periods where at least one fact has a value (not None)
-                val, _av = resolved_facts[(cid, per, _fact)]
-                if val is not None:
-                    periods_for_company.add(per)
-        # If no periods, then quality etc unavailable
-        sorted_periods: list[str] = sorted(periods_for_company, key=_fiscal_sort_key)
-        latest_period: str | None = sorted_periods[-1] if sorted_periods else None
+        # Determine latest fiscal period for this company from its chosen basis.
+        selection = basis_by_company.get(company_id)
+        # A window the chosen basis cannot cover stays unavailable, never approximated.
+        latest_period: str | None = selection.latest_period if selection is not None else None
 
         # Quality raws
         gross_profitability: float | None = None
@@ -583,7 +649,7 @@ def build_qvef_features(
         # Determine source_available_at tuple
         # For financial_facts, take max av among facts used for this instrument that were resolved and <= decision_time
         max_fact_av: datetime | None = None
-        for (cid, _per, _fact), (_val, av) in resolved_facts.items():
+        for (cid, _per, _fact, _basis), (_val, av) in resolved_facts.items():
             if cid == company_id and av is not None:  # noqa: SIM102
                 if max_fact_av is None or av > max_fact_av:  # noqa: SIM102
                     max_fact_av = av

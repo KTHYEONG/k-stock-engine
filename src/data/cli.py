@@ -484,7 +484,6 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         strategy_id = run_manifest.strategy_id
         from src.data.gold_artifacts import (
             load_gold_artifact_frames,
-            load_gold_universe_and_scores,
             load_gold_universe_frame,
             resolve_gold_artifact_bundle,
         )
@@ -502,7 +501,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
                 gold_root=gold_root,
                 dataset_id=str(gold_dataset_id),
                 decision_time=gold_decision_time,
-                required_kinds=("universe", "champion_scores"),
+                required_kinds=("universe", "qvef", "champion_scores"),
             )
         else:
             bundle = resolve_gold_artifact_bundle(
@@ -514,7 +513,9 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
             universe_frame = load_gold_universe_frame(bundle=bundle, decision_time=gold_decision_time)
             scores_frame = None
         elif strategy_id == "compounding-v2":
-            universe_frame, scores_frame = load_gold_universe_and_scores(bundle=bundle, decision_time=gold_decision_time)
+            # qvef is loaded only so load_gold_artifact_frames can certify the
+            # scores against the declared policy; it is not retained downstream.
+            universe_frame, _qvef_frame, scores_frame = load_gold_artifact_frames(bundle=bundle, decision_time=gold_decision_time)
         else:
             universe_frame, _qvef_frame, scores_frame = load_gold_artifact_frames(
                 bundle=bundle, decision_time=gold_decision_time

@@ -15,6 +15,81 @@ from src.data.schemas import PITDataError
 from src.integrations.dart.client import DartCorpCodeRecord
 from src.integrations.dart.xbrl import DartXbrlCollector
 
+__all__ = [
+    "DartHistoricalBackfillPlan",
+    "DartHistoricalBackfillRequest",
+    "SingleAccountBackfillRequest",
+    "build_dart_historical_backfill_plan",
+    "build_single_account_request_plan",
+    "run_dart_historical_backfill_batch",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class SingleAccountBackfillRequest:
+    corp_code: str
+    biz_year: int
+    reprt_code: str
+    fs_div: str
+
+    def __post_init__(self) -> None:
+        import re as _re
+
+        if not _re.fullmatch(r"\d{8}", str(self.corp_code)):
+            raise ValueError(f"invalid corp_code {self.corp_code!r}: must be 8 digits")
+        if not (2000 <= int(self.biz_year) <= 2100):
+            raise ValueError(f"invalid fiscal_year {self.biz_year!r}: must be within 2000..2100")
+        if str(self.reprt_code) not in ("11011", "11012", "11013", "11014"):
+            raise ValueError(f"invalid reprt_code {self.reprt_code!r}")
+        if str(self.fs_div) not in ("CFS", "OFS"):
+            raise ValueError(f"invalid fs_div {self.fs_div!r}: must be CFS or OFS")
+
+
+_REPRT_ORDER = ("11013", "11012", "11014", "11011")
+
+
+def build_single_account_request_plan(
+    *,
+    corp_codes: tuple[str, ...],
+    first_fiscal_year: int,
+    last_fiscal_year: int,
+    daily_call_budget: int = 20000,
+    include_separate_fallback: bool = True,
+) -> tuple[tuple[SingleAccountBackfillRequest, ...], ...]:
+    """Plan resumable fnlttSinglAcntAll batches under the OpenDART daily quota."""
+    import re as _re
+
+    if not corp_codes:
+        raise ValueError("corp_codes must be non-empty")
+    for code in corp_codes:
+        if not _re.fullmatch(r"\d{8}", str(code)):
+            raise ValueError(f"invalid corp_code {code!r}: must be 8 digits")
+    if first_fiscal_year > last_fiscal_year:
+        raise ValueError(f"invalid fiscal_year range {first_fiscal_year} > {last_fiscal_year}")
+    if daily_call_budget < 1:
+        raise ValueError(f"invalid daily_call_budget {daily_call_budget!r}: must be >= 1")
+    unique_codes = sorted(set(corp_codes))
+    flat: list[SingleAccountBackfillRequest] = []
+    for corp_code in unique_codes:
+        for biz_year in range(first_fiscal_year, last_fiscal_year + 1):
+            for reprt_code in _REPRT_ORDER:
+                flat.append(
+                    SingleAccountBackfillRequest(
+                        corp_code=corp_code, biz_year=biz_year, reprt_code=reprt_code, fs_div="CFS"
+                    )
+                )
+                if include_separate_fallback:
+                    flat.append(
+                        SingleAccountBackfillRequest(
+                            corp_code=corp_code, biz_year=biz_year, reprt_code=reprt_code, fs_div="OFS"
+                        )
+                    )
+    batches = [
+        tuple(flat[start : start + daily_call_budget])
+        for start in range(0, len(flat), daily_call_budget)
+    ]
+    return tuple(batches)
+
 
 @dataclass(frozen=True, slots=True)
 class DartHistoricalBackfillRequest:

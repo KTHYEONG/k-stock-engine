@@ -417,3 +417,52 @@ def test_normalize_dart_facts_maps_corp_code_only_company_id_with_bridge() -> No
 
     assert frame.select(['company_id', 'ticker', 'dart_corp_code']).to_dicts() == [{'company_id': '005930', 'ticker': '005930', 'dart_corp_code': '00126380'}]
     assert frame.item(0, 'mapping_version').endswith('bridge:' + ('b' * 64))
+
+
+def test_normalize_financial_facts_keeps_consolidated_and_separate_rows() -> None:
+    """One filing reporting both 연결 and 별도 must survive as two distinct rows."""
+    from datetime import UTC, datetime
+
+    from src.core.time import SessionCalendar
+    from src.data.normalization import normalize_dart_financial_facts
+
+    # Given: the same (company, period, filing, fact) reported on both bases.
+    base = {
+        'ticker': '005930',
+        'corp_code': '00126380',
+        'fiscal_period': '2015Q3',
+        'filing_id': 'F1',
+        'fact': 'sales',
+        'published_at': datetime(2015, 11, 16, tzinfo=UTC),
+        'unit': 'KRW',
+    }
+    pages = [
+        {**base, 'value': 100.0, 'consolidated': True},
+        {**base, 'value': 70.0, 'consolidated': False},
+    ]
+
+    # When
+    frame = normalize_dart_financial_facts(
+        pages=pages,
+        disclosure_rows=(),
+        source_hash='a' * 64,
+        calendar=SessionCalendar((datetime(2015, 11, 17, tzinfo=UTC),)),
+        decision_time=datetime(2016, 1, 4, tzinfo=UTC),
+    )
+
+    # Then: the accounting basis participates in the dedup key.
+    assert frame.height == 2
+    assert sorted(frame['consolidated'].to_list()) == [False, True]
+    by_basis = dict(zip(frame['consolidated'].to_list(), frame['value'].to_list(), strict=True))
+    assert by_basis[True] == 100.0
+    assert by_basis[False] == 70.0
+
+    # And: a genuine duplicate on the same basis is still collapsed.
+    deduped = normalize_dart_financial_facts(
+        pages=[pages[0], dict(pages[0])],
+        disclosure_rows=(),
+        source_hash='a' * 64,
+        calendar=SessionCalendar((datetime(2015, 11, 17, tzinfo=UTC),)),
+        decision_time=datetime(2016, 1, 4, tzinfo=UTC),
+    )
+    assert deduped.height == 1

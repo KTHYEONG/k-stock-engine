@@ -35,6 +35,56 @@ class ChampionScorePolicy:
             raise ValueError("score policy version must encode its exact factor count")
 
 
+class ChampionScoreFactorIntegrityError(ValueError):
+    """A stored champion_scores artifact contradicts its declared score policy.
+
+    The artifact must be rebuilt, not the policy relaxed.
+    """
+
+
+def certify_champion_score_factor_integrity(
+    *,
+    scores: pl.DataFrame,
+    qvef: pl.DataFrame,
+    policy: ChampionScorePolicy,
+) -> None:
+    """Fail closed when eligible score rows lack their declared qvef factors."""
+    if scores.is_empty() or qvef.is_empty():
+        return
+    factor_columns = ("quality_score", "value_score", "earnings_score", "foreign_flow_score")
+    missing = [
+        name
+        for name, frame in (("eligible", scores), *[(col, qvef) for col in factor_columns])
+        if name not in frame.columns
+    ]
+    if missing:
+        raise ChampionScoreFactorIntegrityError(
+            f"champion_scores artifact cannot be certified against {policy.version}: "
+            f"missing columns {missing}; rebuild Gold"
+        )
+    joined = scores.select(["decision_session", "instrument_id", "eligible"]).join(
+        qvef.select(["decision_session", "instrument_id", *factor_columns]),
+        on=["decision_session", "instrument_id"],
+        how="left",
+    )
+    violating: list[tuple[object, str]] = []
+    for row in joined.to_dicts():
+        if not row.get("eligible"):
+            continue
+        count = sum(1 for col in factor_columns if row.get(col) is not None)
+        if count < policy.min_required_factors:
+            violating.append((row.get("decision_session"), str(row.get("instrument_id"))))
+    if violating:
+        example_session, example_iid = violating[0]
+        raise ChampionScoreFactorIntegrityError(
+            f"champion_scores artifact violates {policy.version}: "
+            f"{len(violating)} eligible rows below "
+            f"min_required_factors={policy.min_required_factors}; "
+            f"example decision_session={example_session} instrument_id={example_iid}; "
+            "rebuild Gold"
+        )
+
+
 class ChampionScoreReason(StrEnum):
     MISSING_QUALITY = "missing_quality"
     MISSING_VALUE = "missing_value"
