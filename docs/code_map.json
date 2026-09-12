@@ -274,6 +274,7 @@
   "src/integrations/dart/client.py": {
     "testing": [
       "tests/unit/data/test_dart_backfill.py",
+      "tests/unit/integrations/dart/test_xbrl_standard.py",
       "tests/unit/integrations/test_client.py",
       "tests/unit/integrations/test_dart_client.py",
       "tests/unit/integrations/test_dart_lifecycle.py"
