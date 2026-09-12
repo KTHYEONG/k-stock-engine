@@ -60,6 +60,52 @@ def test_select_streaming_receipts_excludes_derived_merged_payload(tmp_path) -> 
     assert select_streaming_receipts(kind=EvidenceKind.SECURITY_MASTER, receipts=(original, derived)) == (original,)
 
 
+def test_gc_superseded_bronze_aggregates_keeps_only_newest_per_kind(tmp_path) -> None:
+    from datetime import UTC, datetime
+    from src.data.bronze import BronzeStore
+    from src.data.bronze_aggregation import gc_superseded_bronze_aggregates
+    from src.data.schemas import EvidenceKind
+
+    store = BronzeStore(tmp_path / "bronze")
+    original = store.import_bytes(
+        b'{"records": [{"a": 1}]}',
+        kind=EvidenceKind.INVESTOR_FLOW,
+        retrieved_at=datetime(2020, 1, 1, tzinfo=UTC),
+        source_label="KIS:frgr-itt:000020:2020-01-01",
+    )
+    old_agg = store.import_bytes(
+        b'{"records": [{"a": 1}], "input_receipt_hashes": ["x"]}',
+        kind=EvidenceKind.INVESTOR_FLOW,
+        retrieved_at=datetime(2020, 1, 2, tzinfo=UTC),
+        source_label="aggregated:investor_flow:1",
+    )
+    new_agg = store.import_bytes(
+        b'{"records": [{"a": 1}, {"a": 2}], "input_receipt_hashes": ["x", "y"]}',
+        kind=EvidenceKind.INVESTOR_FLOW,
+        retrieved_at=datetime(2020, 1, 3, tzinfo=UTC),
+        source_label="aggregated:investor_flow:2",
+    )
+
+    dry_report = gc_superseded_bronze_aggregates(bronze_root=tmp_path / "bronze", dry_run=True)
+    assert dry_report[EvidenceKind.INVESTOR_FLOW]["deleted"] == 1
+    assert old_agg.payload_path.exists()  # dry run touches nothing
+
+    report = gc_superseded_bronze_aggregates(bronze_root=tmp_path / "bronze")
+    assert report[EvidenceKind.INVESTOR_FLOW] == {
+        "deleted": 1,
+        "kept": 1,
+        "bytes_freed": report[EvidenceKind.INVESTOR_FLOW]["bytes_freed"],
+    }
+    assert not old_agg.payload_path.exists()
+    assert not old_agg.metadata_path.exists()
+    assert new_agg.payload_path.exists()
+    assert original.payload_path.exists()  # originals are never touched
+
+    # idempotent: nothing left to collect on a second pass
+    second = gc_superseded_bronze_aggregates(bronze_root=tmp_path / "bronze")
+    assert EvidenceKind.INVESTOR_FLOW not in second
+
+
 def test_aggregate_small_bronze_pages_tags_investor_flow_provider(tmp_path) -> None:
     from datetime import UTC, datetime
     import json
