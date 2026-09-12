@@ -28,6 +28,7 @@
       "tests/integration/strategy/test_historical_universe.py",
       "tests/unit/core/test_instrument.py",
       "tests/unit/core/test_ledger.py",
+      "tests/unit/data/test_backtest_exclusions.py",
       "tests/unit/data/test_backtest_runner.py",
       "tests/unit/data/test_cli.py",
       "tests/unit/data/test_collection.py",
@@ -50,6 +51,9 @@
       "tests/unit/strategy/test_core_strategy.py",
       "tests/unit/strategy/test_universe.py"
     ]
+  },
+  "src/data/backtest_exclusions.py": {
+    "testing": "tests/unit/data/test_backtest_exclusions.py"
   },
   "src/data/backtest_run_manifest.py": {
     "testing": "tests/unit/data/test_backtest_run_manifest.py"
@@ -134,6 +138,9 @@
   },
   "src/data/silver.py": {
     "testing": "tests/unit/data/test_silver.py"
+  },
+  "src/data/silver_schema.py": {
+    "testing": "tests/unit/data/test_silver_schema.py"
   },
   "src/data/snapshot.py": {
     "testing": [
