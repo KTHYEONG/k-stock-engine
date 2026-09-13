@@ -192,3 +192,15 @@ def test_cli_compounding_v2_loads_qvef_for_certification() -> None:
     assert '"universe", "qvef", "champion_scores"' in source or "'universe', 'qvef', 'champion_scores'" in source
     assert 'load_gold_artifact_frames(bundle=bundle, decision_time=gold_decision_time)' in source
     assert 'required_kinds=("universe", "champion_scores")' not in source
+
+
+def test_cli_emits_research_segments_from_managed_backtest() -> None:
+    import inspect
+
+    import src.data.cli as cli
+
+    # Given
+    source = inspect.getsource(cli._dispatch_backtest)
+
+    # Then: segment metrics reach the operator output, not only the artifact.
+    assert '"research_segments": manifest["research_segments"]' in source

@@ -282,3 +282,40 @@ def test_core_artifact_provenance() -> None:
     required = {'strategy_id', 'score_policy_version', 'selection_policy_version', 'portfolio_policy_version', 'market_input_policy_version', 'warmup_sessions', 'data_action_certified'}
     metadata = {'strategy_id': 'core-v1', 'score_policy_version': 'korean-core-v1-scoring-v1', 'selection_policy_version': 'korean-core-v1-selection-v1', 'portfolio_policy_version': 'champion-v1-portfolio-v1', 'market_input_policy_version': 'korean-equity-market-inputs-v1', 'warmup_sessions': 60, 'data_action_certified': True}
     assert required <= metadata.keys()
+
+
+def test_run_managed_backtest_emits_research_segments(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+    from datetime import date
+    from types import SimpleNamespace
+
+    from src.core.ledger import LedgerNav
+
+    def _nav(day: date, nav: float) -> LedgerNav:
+        return LedgerNav(
+            mark_id=f"m-{day.isoformat()}",
+            as_of=datetime(day.year, day.month, day.day, 15, 30, tzinfo=KST),
+            nav=nav, settled_cash=nav, unsettled_cash=0.0, marked_value=0.0,
+        )
+
+    # Given: an engine boundary stub spanning the development/holdout split.
+    navs = (_nav(date(2023, 12, 27), 100.0), _nav(date(2023, 12, 28), 105.0), _nav(date(2024, 1, 2), 115.5))
+    monkeypatch.setattr(
+        "src.engine.runner.run_backtest",
+        lambda config, sessions, strategy: SimpleNamespace(daily_nav=navs, fills=(), rejects=()),
+    )
+    config = SimpleNamespace(ledger_id="segments", scenario=SimpleNamespace(value="base"), initial_cash=100.0)
+
+    # When
+    _, payload = run_managed_backtest(
+        sessions=(object(),), config=config, strategy=object(),  # type: ignore[arg-type]
+        artifact_root=tmp_path / "artifacts", dataset_hash="segments",
+    )
+
+    # Then
+    segments = payload["research_segments"]
+    assert set(segments) == {"development", "holdout"}
+    assert segments["development"]["total_return"] == pytest.approx(0.05)
+    assert segments["holdout"]["total_return"] == pytest.approx(0.1)
+    written = json.loads((tmp_path / "artifacts" / "backtests" / payload["content_hash"] / "result.json").read_text())
+    assert written["research_segments"]["holdout"]["sessions"] == 1
