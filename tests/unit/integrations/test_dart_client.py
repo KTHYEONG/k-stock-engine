@@ -151,3 +151,127 @@ def test_dart_lifecycle_collector_unresolved_when_no_lifecycle_filings():
     evidence = DartLifecycleCollector(dart=FakeDart(), calendar=SessionCalendar((datetime(2016, 4, 14, 9, tzinfo=KRX_TZ), session)), coverage_start=date(2015, 1, 1)).collect(candidate)
     assert evidence.resolution_kind is LifecycleResolutionKind.UNRESOLVED
     assert evidence.evidence_reason == "missing_terms"
+
+
+def test_dart_client_retries_transport_errors_then_succeeds(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import requests
+
+    from src.integrations.dart.client import DartApiClient
+
+    attempts = {"n": 0}
+
+    def flaky_get(*_args, **_kwargs):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise requests.exceptions.ConnectionError("Connection aborted.")
+        return SimpleNamespace(status_code=200, json=lambda: {"status": "000", "list": []})
+
+    client = DartApiClient(api_key="key")
+    client._session = SimpleNamespace(get=flaky_get)
+    sleeps: list[float] = []
+    monkeypatch.setattr("src.integrations.dart.client.time.sleep", lambda seconds: sleeps.append(seconds))
+
+    result = client._request("list.json", {"bgn_de": "20240101", "end_de": "20240101"})
+
+    assert result == {"status": "000", "list": []}
+    assert attempts["n"] == 3
+    assert len(sleeps) == 2
+
+
+def test_dart_client_circuit_breaks_after_exhausting_transport_retries(tmp_path, monkeypatch) -> None:
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    import pytest
+    import requests
+
+    from src.integrations.dart.client import DartApiClient, DartRetryableError
+    from src.integrations.quota import ProviderQuotaBlocked, ProviderQuotaStateStore
+
+    calls = {"n": 0}
+
+    def always_fail(*_args, **_kwargs):
+        calls["n"] += 1
+        raise requests.exceptions.ConnectionError("Connection aborted.")
+
+    client = DartApiClient(
+        api_key="key",
+        quota_store=ProviderQuotaStateStore(tmp_path),
+        now=lambda: datetime(2026, 9, 13, tzinfo=UTC),
+    )
+    client._session = SimpleNamespace(get=always_fail)
+    monkeypatch.setattr("src.integrations.dart.client.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(DartRetryableError, match="transport failed"):
+        client._request("fnlttSinglAcntAll.json", {"corp_code": "00126380"})
+    assert calls["n"] == 3
+
+    with pytest.raises(ProviderQuotaBlocked):
+        client._request("fnlttSinglAcntAll.json", {"corp_code": "00126380"})
+    assert calls["n"] == 3
+
+
+def test_dart_client_circuit_breaks_on_quota_exceeded_status(tmp_path) -> None:
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    import pytest
+
+    from src.integrations.dart.client import DartApiClient, DartApiError
+    from src.integrations.quota import ProviderQuotaBlocked, ProviderQuotaStateStore
+
+    calls: list[object] = []
+    client = DartApiClient(
+        api_key="key",
+        quota_store=ProviderQuotaStateStore(tmp_path),
+        now=lambda: datetime(2026, 9, 13, tzinfo=UTC),
+    )
+    client._session = SimpleNamespace(
+        get=lambda *_a, **_kw: calls.append(object())
+        or SimpleNamespace(status_code=200, json=lambda: {"status": "020", "message": "quota exceeded"})
+    )
+
+    with pytest.raises(DartApiError, match="020"):
+        client._request_validated("list.json", {"bgn_de": "20240101", "end_de": "20240101"})
+    with pytest.raises(ProviderQuotaBlocked):
+        client._request_validated("list.json", {"bgn_de": "20240102", "end_de": "20240102"})
+
+    assert len(calls) == 1
+
+
+def test_dart_client_paces_consecutive_requests_by_min_interval(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import pytest
+
+    from src.integrations.dart.client import DartApiClient
+
+    monotonic_values = iter([1000.0, 1000.0, 1000.3, 1000.3])
+    monkeypatch.setattr("src.integrations.dart.client.time.monotonic", lambda: next(monotonic_values))
+    sleeps: list[float] = []
+    monkeypatch.setattr("src.integrations.dart.client.time.sleep", lambda seconds: sleeps.append(seconds))
+    client = DartApiClient(api_key="key", min_interval=1.0)
+    responses = iter([SimpleNamespace(status_code=200, json=lambda: {"status": "000", "list": []})] * 2)
+    client._session = SimpleNamespace(get=lambda *_a, **_kw: next(responses))
+
+    client._request("list.json", {"bgn_de": "20240101", "end_de": "20240101"})
+    client._request("list.json", {"bgn_de": "20240102", "end_de": "20240102"})
+
+    assert sleeps == [pytest.approx(0.7)]
+
+
+def test_dart_client_min_interval_reads_env_var_and_defaults_to_disabled(monkeypatch) -> None:
+    from src.integrations.dart.client import DartApiClient
+
+    monkeypatch.setenv("OPENDART_REQUEST_MIN_INTERVAL_SECONDS", "2.5")
+    client = DartApiClient(api_key="key")
+    assert client._min_interval == 2.5
+
+    monkeypatch.delenv("OPENDART_REQUEST_MIN_INTERVAL_SECONDS", raising=False)
+    client_default = DartApiClient(api_key="key")
+    assert client_default._min_interval == 0.0
+
+    client_explicit = DartApiClient(api_key="key", min_interval=3.0)
+    assert client_explicit._min_interval == 3.0
