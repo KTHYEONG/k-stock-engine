@@ -107,19 +107,10 @@ class DartXbrlCollector:
         codes = tuple(dict.fromkeys(c.strip() for c in corp_codes if c and c.strip()))
         if not codes:
             raise PITDataError("DART disclosures response is empty; certification blocked")
-        import calendar as _calendar
-
-        wanted = set(codes)
         pages: list[dict[str, Any]] = []
-        cursor = date(start.year, start.month, 1)
-        while cursor <= end:
-            month_last = _calendar.monthrange(cursor.year, cursor.month)[1]
-            month_start = max(cursor, start)
-            month_end = min(date(cursor.year, cursor.month, month_last), end)
-            records = self._client.list_disclosures(month_start, month_end)
-            filtered = [r for r in records if str(r.get("corp_code")) in wanted]
-            pages.append({"records": filtered, "start": month_start.isoformat(), "end": month_end.isoformat()})
-            cursor = date(cursor.year + (1 if cursor.month == 12 else 0), (cursor.month % 12) + 1, 1)
+        for corp_code in codes:
+            records = self._client.list_disclosures(start, end, corp_code=corp_code)
+            pages.append({"records": records, "start": start.isoformat(), "end": end.isoformat(), "corp_code": corp_code})
         if not pages:
             raise PITDataError("DART disclosures response is empty; certification blocked")
         return tuple(pages)
