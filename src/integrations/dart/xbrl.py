@@ -6,9 +6,9 @@ import json
 import os
 import re
 import zipfile
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -16,6 +16,7 @@ from src.core.pit import PITDataError
 
 if TYPE_CHECKING:  # pragma: no cover
     from src.integrations.dart.client import DartCorpCodeRecord
+    from src.integrations.quota import ProviderQuotaStateStore
 
 _REQUIRED_FACTS: tuple[str, ...] = (
     "sales",
@@ -49,6 +50,9 @@ class DartXbrlCollector:
         request_bytes: Any | None = None,
         client: Any | None = None,
         max_workers: int = 20,
+        quota_store: ProviderQuotaStateStore | None = None,
+        now: Callable[[], datetime] | None = None,
+        min_interval: float | None = None,
     ) -> None:
         key = api_key or os.getenv("OPENDART_API_KEY")
         if not key and request_json is None and request_bytes is None and client is None:
@@ -60,14 +64,25 @@ class DartXbrlCollector:
         self._request_bytes = request_bytes
         self._client: Any | None = client
         self._max_workers = max_workers
+        self._quota_store = quota_store
+        self._now = now
+        self._min_interval = min_interval
         if request_json is None and request_bytes is None and key is not None and self._client is None:
             from src.integrations.dart.client import DartApiClient
 
-            self._client = DartApiClient(api_key=key)
+            self._client = DartApiClient(
+                api_key=key, quota_store=quota_store, now=now, min_interval=min_interval
+            )
         if request_bytes is not None and key is not None and self._client is None:
             from src.integrations.dart.client import DartApiClient
 
-            self._client = DartApiClient(api_key=key, request_bytes=request_bytes)
+            self._client = DartApiClient(
+                api_key=key,
+                request_bytes=request_bytes,
+                quota_store=quota_store,
+                now=now,
+                min_interval=min_interval,
+            )
 
     def fetch_corp_code_records(self) -> tuple[DartCorpCodeRecord, ...]:
         from src.integrations.dart.client import DartApiClient, DartCorpCodeRecord  # noqa: F401
