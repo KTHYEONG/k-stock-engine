@@ -901,6 +901,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
         "reject_count": manifest["reject_count"],
         "smoke_symbol": smoke_symbol,
         "performance": manifest["performance"],
+        "research_segments": manifest["research_segments"],
         "accounting_reconciled": manifest["accounting_reconciled"],
         "artifact_path": str(artifact_root / "backtests" / manifest["content_hash"] / "result.json"),
     })

@@ -9,7 +9,7 @@ def test_backfill_plan_requires_exact_ticker_to_corp_code_bridge() -> None:
 
     plan = build_dart_historical_backfill_plan(security_master=master, corp_code_records=records, validation_start=date(2016, 1, 4), validation_end=date(2016, 12, 29), corp_code_receipt_hash="a" * 64)
 
-    assert plan.required_periods == ("2014Q4", "2015Q1", "2015Q2", "2015Q3")
+    assert plan.required_periods == ("2014Q3", "2014Q4", "2015Q1", "2015Q2", "2015Q3")
     assert dict(plan.ticker_by_corp_code) == {"00126380": "005930"}
     assert plan.unresolved_tickers == ("000001",)
 
@@ -35,7 +35,7 @@ def test_backfill_batch_writes_deterministic_plan_artifact_before_fact_collectio
 
     payload = json.loads((tmp_path / "artifacts" / "dart_backfill" / f"{plan.plan_id}.json").read_text())
     assert payload["ticker_by_corp_code"] == {"00126380": "005930"}
-    assert payload["required_periods"] == ["2014Q4", "2015Q1", "2015Q2", "2015Q3"]
+    assert payload["required_periods"] == ["2014Q3", "2014Q4", "2015Q1", "2015Q2", "2015Q3"]
 
 
 def test_dedupe_endpoint_identities_keeps_latest_correction() -> None:

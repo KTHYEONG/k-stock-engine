@@ -260,3 +260,33 @@ def test_manifest_v1_fails_with_rebuild_required(tmp_path):
     v1_path.write_text(json.dumps(raw), encoding="utf-8")
     with pytest.raises(Exception, match="rebuild-required"):
         load_backtest_run_manifest(v1_path)
+
+
+def test_backtest_run_manifest_rejects_compounding_v2_before_fundamental_floor(tmp_path) -> None:
+    from datetime import date
+
+    import pytest
+
+    from src.data.backtest_run_manifest import build_backtest_run_manifest
+    from src.data.schemas import PITDataError
+
+    # When/Then: QVEF lookback cannot be served before the FY2015 floor.
+    with pytest.raises(PITDataError, match="compounding-v2 validation_start"):
+        build_backtest_run_manifest(
+            **_manifest_kwargs(
+                tmp_path, strategy_id="compounding-v2",
+                validation_start=date(2016, 5, 15), validation_end=date(2016, 12, 29),
+            )
+        )
+
+    # And: the floor date itself is accepted.
+    accepted = build_backtest_run_manifest(
+        **_manifest_kwargs(
+            tmp_path, strategy_id="compounding-v2",
+            validation_start=date(2016, 5, 16), validation_end=date(2016, 12, 29),
+        )
+    )
+    assert accepted.validation_start == date(2016, 5, 16)
+
+    # And: strategies that do not consume QVEF keep their earlier windows.
+    assert build_backtest_run_manifest(**_manifest_kwargs(tmp_path)).strategy_id == "core-v1"

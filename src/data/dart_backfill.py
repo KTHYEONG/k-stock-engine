@@ -113,6 +113,10 @@ class DartHistoricalBackfillPlan:
     corp_code_receipt_hash: str
 
 
+# 4분기 TTM 윈도우에 전년동기 이익모멘텀 비교 분기(latest - 4)를 더한 5분기
+QVEF_FUNDAMENTAL_LOOKBACK_QUARTERS = 5
+
+
 def _prev_quarter(period: str) -> str:
     year = int(period[:4])
     q = int(period[5])
@@ -216,7 +220,7 @@ def build_dart_historical_backfill_plan(
         ticker_by_corp[mapped] = t
     unresolved = tuple(sorted(t for t in sorted(tickers) if t not in code_by_ticker))
     latest = _latest_available_quarter(validation_start)
-    required = _quarters_back(latest, 4)
+    required = _quarters_back(latest, QVEF_FUNDAMENTAL_LOOKBACK_QUARTERS)
     canonical = json.dumps(
         {
             "required_periods": list(required),
