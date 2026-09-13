@@ -28,18 +28,61 @@ def test_dart_falls_back_to_separate_statements_after_empty_consolidated_respons
     assert pages[0]["fs_div"] == "OFS"
 
 
-def test_dart_disclosure_batch_uses_monthly_global_pages_not_per_corp_calls() -> None:
+def test_dart_disclosure_batch_queries_per_company_corp_code_filter() -> None:
     from datetime import date
+
     from src.integrations.dart.xbrl import DartXbrlCollector
 
-    calls: list[object] = []
+    calls: list[tuple[object, object, object]] = []
+
     class Client:
         def list_disclosures(self, start, end, *, corp_code=None):
-            calls.append(corp_code)
-            return [{'rcept_no': '1', 'rcept_dt': '20240102', 'corp_code': 'A'}, {'rcept_no': '2', 'rcept_dt': '20240102', 'corp_code': 'B'}, {'rcept_no': '3', 'rcept_dt': '20240102', 'corp_code': 'Z'}]
-    pages = tuple(DartXbrlCollector(client=Client()).fetch_disclosures(date(2024, 1, 1), date(2024, 1, 31), corp_codes=('A', 'B')))
-    assert calls == [None]
-    assert {row['corp_code'] for row in pages[0]['records']} == {'A', 'B'}
+            calls.append((start, end, corp_code))
+            data = {
+                "A": [{"rcept_no": "1", "rcept_dt": "20240102", "corp_code": "A"}],
+                "B": [{"rcept_no": "2", "rcept_dt": "20240102", "corp_code": "B"}],
+            }
+            return data.get(corp_code, [])
+
+    pages = tuple(
+        DartXbrlCollector(client=Client()).fetch_disclosures(
+            date(2024, 1, 1), date(2024, 1, 31), corp_codes=("A", "B")
+        )
+    )
+
+    # Then: exactly one call per company, scoped to the full requested range (no month loop).
+    assert calls == [
+        (date(2024, 1, 1), date(2024, 1, 31), "A"),
+        (date(2024, 1, 1), date(2024, 1, 31), "B"),
+    ]
+    assert len(pages) == 2
+    assert pages[0]["records"] == [{"rcept_no": "1", "rcept_dt": "20240102", "corp_code": "A"}]
+    assert pages[1]["records"] == [{"rcept_no": "2", "rcept_dt": "20240102", "corp_code": "B"}]
+    assert pages[0]["corp_code"] == "A"
+    assert pages[1]["corp_code"] == "B"
+
+
+def test_dart_disclosure_batch_includes_empty_pages_without_raising() -> None:
+    from datetime import date
+
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    class Client:
+        def list_disclosures(self, start, end, *, corp_code=None):
+            if corp_code == "A":
+                return [{"rcept_no": "1", "rcept_dt": "20240102", "corp_code": "A"}]
+            return []
+
+    pages = tuple(
+        DartXbrlCollector(client=Client()).fetch_disclosures(
+            date(2024, 1, 1), date(2024, 1, 31), corp_codes=("A", "B")
+        )
+    )
+
+    assert len(pages) == 2
+    assert pages[0]["records"] != []
+    assert pages[1]["records"] == []
+    assert pages[1]["corp_code"] == "B"
 
 def test_dart_xbrl_collector_validates_max_workers() -> None:
     import pytest
