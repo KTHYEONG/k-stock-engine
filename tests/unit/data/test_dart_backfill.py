@@ -181,3 +181,60 @@ def test_load_security_master_selects_latest_dataset_only(tmp_path) -> None:
     # Then: exactly one version's rows are returned, never both concatenated.
     assert master.height == tables_2[SilverTable.SECURITY_MASTER].height
     assert master.height == 1
+
+
+def test_backfill_batch_uses_wide_fixed_disclosure_fetch_range_and_narrow_identity_range(tmp_path, monkeypatch) -> None:
+    from datetime import UTC, date, datetime
+    import polars as pl
+    from src.data.dart_backfill import DartHistoricalBackfillRequest, run_dart_historical_backfill_batch
+    from src.data.research_period import OPENDART_FIRST_FISCAL_YEAR
+    from src.integrations.dart.client import DartCorpCodeRecord
+
+    class Collector:
+        def fetch_corp_code_records(self):
+            return (DartCorpCodeRecord(ticker="005930", corp_code="00126380", corp_name="A"),)
+
+    master = pl.DataFrame({
+        "instrument_id": ["KRX:005930"], "ticker": ["005930"], "share_class": ["common"],
+        "valid_from": [datetime(2010, 1, 1, tzinfo=UTC)], "valid_to": [None],
+        "available_at": [datetime(2010, 1, 1, tzinfo=UTC)],
+    })
+    monkeypatch.setattr("src.data.dart_backfill._load_security_master", lambda _root, **_kwargs: master)
+    monkeypatch.setattr("src.data.dart_backfill._persist_corp_code_receipt", lambda **_kwargs: "c" * 64)
+
+    captured_disclosure: dict[str, object] = {}
+
+    def fake_collect_dart_disclosures(**kwargs):
+        captured_disclosure["start"] = kwargs["start"]
+        captured_disclosure["end"] = kwargs["end"]
+        return None
+
+    monkeypatch.setattr("src.data.dart_backfill.collect_dart_disclosures", fake_collect_dart_disclosures)
+
+    captured_identity: dict[str, object] = {}
+
+    def fake_filing_identities_from_bronze(*_args, **kwargs):
+        captured_identity["start"] = kwargs["start"]
+        captured_identity["end"] = kwargs["end"]
+        return ()
+
+    monkeypatch.setattr(
+        "src.data.dart_backfill.DartXbrlCollector.filing_identities_from_bronze",
+        fake_filing_identities_from_bronze,
+    )
+
+    validation_start = date(2017, 4, 4)
+    retrieved_at = datetime(2017, 4, 4, 9, 0, tzinfo=UTC)
+    request = DartHistoricalBackfillRequest(
+        bronze_root=tmp_path / "bronze", artifact_root=tmp_path / "artifacts", silver_root=tmp_path / "silver",
+        validation_start=validation_start, validation_end=validation_start, retrieved_at=retrieved_at,
+        offset=0, limit=1,
+    )
+    run_dart_historical_backfill_batch(request=request, dart=Collector())
+
+    # Then: disclosure FETCH range is the wide fixed floor..retrieved_at.date() (cache-friendly).
+    assert captured_disclosure["start"] == date(OPENDART_FIRST_FISCAL_YEAR - 1, 1, 1)
+    assert captured_disclosure["end"] == retrieved_at.date()
+    # And: identity EXTRACTION keeps the narrow, PIT-bounded per-window range unchanged.
+    assert captured_identity["start"] == date(validation_start.year - 2, 1, 1)
+    assert captured_identity["end"] == validation_start
