@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "DART_COLLECTION_HANG",
+      "date": "2026-09-13",
+      "adr_id": "ADR_20260913_DART_COLLECTION_HANG",
+      "domain": "data",
+      "title": "DART 공시 수집 회사 단위 전환",
+      "why": "월별 전체시장 페이지네이션이 배치 규모와 무관하게 수천 페이지를 순회해 행처럼 보일 만큼 느렸음",
+      "resolution": "fetch_disclosures를 회사별 corp_code 필터 조회로 교체함(list_disclosures 기존 파라미터 재사용)",
+      "impact": "실측 10~20배 속도 개선, 배치 간 재수집 중복도 부수적으로 해소됨"
+    },
+    {
       "task_id": "DART_RATE_LIMIT_EFFICIENCY",
       "date": "2026-09-13",
       "adr_id": "ADR_20260913_DART_RATE_LIMIT_EFFICIENCY",
