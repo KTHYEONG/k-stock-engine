@@ -327,12 +327,7 @@
     "testing": "tests/unit/integrations/ls/test_investor_flow.py"
   },
   "src/integrations/quota.py": {
-    "testing": [
-      "tests/unit/data/test_cli_dart_quota_wiring.py",
-      "tests/unit/integrations/krx/test_historical.py",
-      "tests/unit/integrations/test_dart_client.py",
-      "tests/unit/integrations/test_krx_client.py"
-    ]
+    "testing": "tests/unit/integrations/test_quota.py"
   },
   "src/storage/parquet_datasets.py": {
     "testing": "tests/unit/storage/test_parquet_datasets.py"
