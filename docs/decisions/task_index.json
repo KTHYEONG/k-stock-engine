@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "DART_API_EFFICIENCY",
+      "date": "2026-09-13",
+      "adr_id": "ADR_20260913_DART_API_EFFICIENCY",
+      "domain": "data",
+      "title": "OpenDART 공시 재조회 캐싱 및 조회범위 분리",
+      "why": "10개 회계 윈도우가 겹치지만 포함관계가 아니라 공시 조회가 매번 재실행되어 list.json 호출의 86%가 낭비됨",
+      "resolution": "corp_code별 bronze 커버리지 체크를 추가하고 공시 fetch 범위를 고정된 넓은 범위로, identity 추출 범위는 PIT-bounded 좁은 범위로 분리함",
+      "impact": "실측 21,607회에서 3,044회로 공시 호출 86% 절감, 룩어헤드 유입 없이 하루치 할당량 확보"
+    },
+    {
       "task_id": "DART_COLLECTION_HANG",
       "date": "2026-09-13",
       "adr_id": "ADR_20260913_DART_COLLECTION_HANG",
