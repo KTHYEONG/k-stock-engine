@@ -76,6 +76,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     p_dart = sub.add_parser("collect-dart-facts", help="Collect periodic OpenDART full statements from retained disclosures")
     p_dart.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
+    p_dart.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
     p_dart.add_argument("--coverage-start", type=str, required=True)
     p_dart.add_argument("--coverage-end", type=str, required=True)
     p_dart.add_argument("--offset", type=int, default=0)
@@ -88,6 +89,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     p_disc = sub.add_parser("collect-dart-disclosures", help="Collect DART disclosures to Bronze")
     p_disc.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
+    p_disc.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
     p_disc.add_argument("--coverage-start", type=str, required=True)
     p_disc.add_argument("--coverage-end", type=str, required=True)
     p_disc.add_argument("--retrieved-at", type=str, required=False, default=None)
@@ -1022,21 +1024,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "collect-dart-disclosures":
         try:
             from src.integrations.dart.xbrl import DartXbrlCollector
+            from src.integrations.quota import ProviderQuotaBlocked, ProviderQuotaStateStore
 
             collection = collect_dart_disclosures(
-                dart=DartXbrlCollector(),
+                dart=DartXbrlCollector(quota_store=ProviderQuotaStateStore(Path(args.artifact_root) / "quota")),
                 start=date.fromisoformat(str(args.coverage_start)),
                 end=date.fromisoformat(str(args.coverage_end)),
                 bronze_root=Path(args.bronze_root),
                 retrieved_at=_parse_dt(args.retrieved_at),
             )
-        except (PITDataError, ValueError, OSError):
+        except (PITDataError, ValueError, OSError, ProviderQuotaBlocked) as exc:
+            _emit({"error": str(exc)})
             return 1
         _emit({"content_hash": collection.content_hash, "receipts": sorted(str(k.value) for k in collection.receipts)})
         return 0
     if args.command == "collect-dart-facts":
         try:
             from src.integrations.dart.xbrl import DartXbrlCollector
+            from src.integrations.quota import ProviderQuotaBlocked, ProviderQuotaStateStore
 
             identities: tuple[dict[str, str], ...]
             if any(getattr(args, name) for name in ("corp_code", "filing_id", "biz_year", "report_code")):
@@ -1062,11 +1067,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             batch = identities[args.offset : args.offset + args.limit]
             if not batch:
                 raise PITDataError("no periodic DART filings in requested batch")
-            collection = collect_dart_financial_facts(dart=DartXbrlCollector(), identities=batch,
+            collection = collect_dart_financial_facts(dart=DartXbrlCollector(quota_store=ProviderQuotaStateStore(Path(args.artifact_root) / "quota")), identities=batch,
                 bronze_root=Path(args.bronze_root),
                 retrieved_at=_parse_dt(args.retrieved_at),
             )
-        except (PITDataError, ValueError, OSError):
+        except (PITDataError, ValueError, OSError, ProviderQuotaBlocked) as exc:
+            _emit({"error": str(exc)})
             return 1
         _emit({"filings": len(batch), "content_hash": collection.content_hash})
         return 0
@@ -1074,6 +1080,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             from src.data.dart_backfill import DartHistoricalBackfillRequest, run_dart_historical_backfill_batch
             from src.integrations.dart.xbrl import DartXbrlCollector
+            from src.integrations.quota import ProviderQuotaBlocked, ProviderQuotaStateStore
 
             backfill_request = DartHistoricalBackfillRequest(
                 bronze_root=Path(args.bronze_root),
@@ -1086,9 +1093,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 limit=int(args.limit),
             )
             backfill_plan = run_dart_historical_backfill_batch(
-                request=backfill_request, dart=DartXbrlCollector()
+                request=backfill_request, dart=DartXbrlCollector(quota_store=ProviderQuotaStateStore(Path(args.artifact_root) / "quota"))
             )
-        except (PITDataError, ValueError, OSError):
+        except (PITDataError, ValueError, OSError, ProviderQuotaBlocked) as exc:
+            _emit({"error": str(exc)})
             return 1
         _emit({"plan_id": backfill_plan.plan_id, "required_periods": list(backfill_plan.required_periods)})
         return 0

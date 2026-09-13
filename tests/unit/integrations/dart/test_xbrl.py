@@ -195,3 +195,24 @@ def test_fetch_financial_fact_sources_single_identity_skips_thread_pool(monkeypa
     # When/Then: no AssertionError means the thread pool was never touched.
     pages = list(collector.fetch_financial_fact_sources((identity,)))
     assert len(pages) == 1
+
+
+def test_dart_xbrl_collector_forwards_quota_store_and_pacing_to_api_client(monkeypatch) -> None:
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    captured: dict[str, object] = {}
+
+    class _FakeApiClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr("src.integrations.dart.client.DartApiClient", _FakeApiClient)
+    quota_store = object()
+    now = object()
+
+    collector = DartXbrlCollector(api_key="key", quota_store=quota_store, now=now, min_interval=2.0)
+
+    assert captured["quota_store"] is quota_store
+    assert captured["now"] is now
+    assert captured["min_interval"] == 2.0
+    assert collector._client is not None
