@@ -608,6 +608,22 @@ def collect_planned_investor_flow(
     )
 
 
+def _corp_code_disclosure_is_cached(bronze_root: Path, *, corp_code: str, start: date, end: date) -> bool:
+    target = str(corp_code).strip()
+    disclosures_dir = Path(bronze_root) / "disclosures"
+    for payload_path in sorted(disclosures_dir.glob("*/payload.json")):
+        try:
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            stored_code = str((payload.get("corp_code") if isinstance(payload, dict) else None) or "").strip()
+            stored_start = date.fromisoformat(str((payload.get("start") if isinstance(payload, dict) else None) or "").strip())
+            stored_end = date.fromisoformat(str((payload.get("end") if isinstance(payload, dict) else None) or "").strip())
+            if stored_code == target and stored_start <= start and stored_end >= end:
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
 def collect_dart_disclosures(
     *,
     dart: Any,
@@ -622,11 +638,48 @@ def collect_dart_disclosures(
         raise PITDataError("retrieved_at must be timezone-aware")
     if start > end:
         raise PITDataError("coverage_start must not be after coverage_end")
+    if corp_codes is not None:
+        normalized = tuple(str(c).strip() for c in corp_codes if str(c).strip())
+        to_fetch = tuple(
+            c
+            for c in normalized
+            if not _corp_code_disclosure_is_cached(bronze_root, corp_code=c, start=start, end=end)
+        )
+        if not to_fetch:
+            content_hash = hashlib.sha256().hexdigest()
+            artifact_dir = bronze_root.parent / "artifacts" / "collections"
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            report_path = artifact_dir / f"{content_hash}.json"
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "content_hash": content_hash,
+                        "provider": "OpenDART",
+                        "endpoint": "list",
+                        "coverage_start": start.isoformat(),
+                        "coverage_end": end.isoformat(),
+                        "page_receipts": [],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            return CollectionArtifact(
+                bronze_root=bronze_root,
+                coverage_start=start,
+                coverage_end=end,
+                retrieved_at=retrieved_at,
+                receipts={},
+                content_hash=content_hash,
+                report_path=report_path,
+                page_receipts={EvidenceKind.DISCLOSURES.value: ()},
+            )
     try:
         if corp_codes is None:
             raw_pages = _collect_pages(dart.fetch_disclosures, start, end, kind_name="DART disclosures")
         else:
-            raw_pages = _collect_pages(dart.fetch_disclosures, start, end, kind_name="DART disclosures", corp_codes=tuple(corp_codes))
+            raw_pages = _collect_pages(dart.fetch_disclosures, start, end, kind_name="DART disclosures", corp_codes=to_fetch)
     except TypeError:
         raw_pages = _collect_pages(dart.fetch_disclosures, start, end, kind_name="DART disclosures")
     store = BronzeStore(bronze_root)
