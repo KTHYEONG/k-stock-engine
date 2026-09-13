@@ -169,7 +169,12 @@ def build_dart_historical_backfill_plan(
         raise PITDataError("security master is absent; backfill blocked")
     ticker_re = _re.compile(r"^\d{6}$")
     # Only common-share instruments available at validation_start.
-    rows = security_master.to_dicts()
+    # security_master republishes identical dimension rows per session (one row per
+    # instrument per day); deduping on exactly the columns the loop below reads before
+    # materializing Python dicts collapses millions of duplicate daily rows to one per
+    # distinct (ticker, share_class, validity window) combination without changing which
+    # tickers pass the filter.
+    rows = security_master.select("ticker", "share_class", "available_at", "valid_from", "valid_to").unique().to_dicts()
     tickers: set[str] = set()
     for row in rows:
         share = str(row.get("share_class") or "").strip().lower()
@@ -244,16 +249,29 @@ def build_dart_historical_backfill_plan(
     )
 
 
-def _load_security_master(silver_root: Path) -> pl.DataFrame:
-    root = Path(silver_root) / "security_master"
-    if root.exists():
-        files = list(root.rglob("*.parquet"))
-        if files:
-            frames = [pl.read_parquet(p) for p in files]
-            import polars as _pl
+def _load_security_master(silver_root: Path, *, decision_time: datetime) -> pl.DataFrame:
+    """Load exactly the latest certified security_master dataset (PIT-safe, single version).
 
-            return _pl.concat(frames, how="diagonal_relaxed")
-    # Fallback: silver_root directly holds parquet files.
+    ``security_master`` accumulates one immutable dataset directory per publish; loading
+    every directory under the table root (as opposed to selecting one by id) silently
+    concatenates duplicate historical snapshots of the same reference data, multiplying
+    row count and memory use by the number of retained versions with no benefit.
+    """
+    from src.data.schemas import SilverTable
+    from src.data.silver import latest_silver_dataset_path, load_silver_table_by_dataset_id
+
+    root = Path(silver_root) / "security_master"
+    if root.exists() and any(root.iterdir()):
+        dataset_path = latest_silver_dataset_path(
+            root=Path(silver_root), table=SilverTable.SECURITY_MASTER, decision_time=decision_time
+        )
+        return load_silver_table_by_dataset_id(
+            root=Path(silver_root),
+            table=SilverTable.SECURITY_MASTER,
+            dataset_id=dataset_path.name,
+            decision_time=decision_time,
+        )
+    # Fallback: silver_root directly holds parquet files (used by tests with a flat layout).
     files = list(Path(silver_root).rglob("*.parquet"))
     if files:
         frames = [pl.read_parquet(p) for p in files]
@@ -312,7 +330,7 @@ def run_dart_historical_backfill_batch(
         raise PITDataError("retrieved_at must be timezone-aware")
     if request.offset < 0 or request.limit < 1:
         raise PITDataError("offset must be nonnegative and limit must be positive")
-    master = _load_security_master(request.silver_root)
+    master = _load_security_master(request.silver_root, decision_time=request.retrieved_at)
     if master.is_empty():
         raise PITDataError("security master is absent; backfill blocked")
     existing = sorted((Path(request.bronze_root) / "dart_corp_codes").glob("*/payload.json"))
