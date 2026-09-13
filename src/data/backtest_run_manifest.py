@@ -108,6 +108,14 @@ def build_backtest_run_manifest(
 ) -> BacktestRunManifest:
     if validation_start > validation_end:
         raise PITDataError("validation_start must be on or before validation_end")
+    if strategy_id == "compounding-v2":
+        from src.data.research_period import earliest_evaluable_decision_date
+
+        floor = earliest_evaluable_decision_date()
+        if validation_start < floor:
+            raise PITDataError(
+                f"compounding-v2 validation_start {validation_start} precedes fundamentals lookback floor {floor}"
+            )
     if not isinstance(strategy_id, str) or not strategy_id.strip():
         raise PITDataError("strategy_id must be non-empty")
     if not isinstance(policy_versions, Mapping) or not policy_versions:

@@ -162,6 +162,7 @@ def run_managed_backtest(
 
     perf = compute_backtest_performance(result.daily_nav)
     accounting_ok = verify_accounting_identity(result.daily_nav)
+    from src.data.research_period import summarize_research_segments
 
     fills_summary: list[dict[str, Any]] = []
     for i, f in enumerate(result.fills):
@@ -195,6 +196,7 @@ def run_managed_backtest(
         "reject_count": len(result.rejects),
         "nav_points": len(result.daily_nav),
         "performance": perf,
+        "research_segments": summarize_research_segments(result.daily_nav),
         "accounting_reconciled": accounting_ok,
         "fills": fills_summary,
         "metadata": extra_metadata or {},
