@@ -141,6 +141,9 @@
   "src/data/replay.py": {
     "testing": "tests/unit/data/test_replay.py"
   },
+  "src/data/research_period.py": {
+    "testing": "tests/unit/data/test_research_period.py"
+  },
   "src/data/schemas.py": {
     "testing": "tests/unit/data/test_schemas.py"
   },
