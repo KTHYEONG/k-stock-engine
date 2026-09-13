@@ -328,7 +328,9 @@
   },
   "src/integrations/quota.py": {
     "testing": [
+      "tests/unit/data/test_cli_dart_quota_wiring.py",
       "tests/unit/integrations/krx/test_historical.py",
+      "tests/unit/integrations/test_dart_client.py",
       "tests/unit/integrations/test_krx_client.py"
     ]
   },

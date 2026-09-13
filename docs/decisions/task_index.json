@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "DART_RATE_LIMIT_EFFICIENCY",
+      "date": "2026-09-13",
+      "adr_id": "ADR_20260913_DART_RATE_LIMIT_EFFICIENCY",
+      "domain": "data",
+      "title": "OpenDART 수집 rate-limit 안정성·효율화",
+      "why": "DartApiClient에 KRX와 달리 재시도/페이싱/서킷브레이커가 없어 연결 리셋 시 즉시 실패하고 반복 재시도가 차단을 자기악화시켰음",
+      "resolution": "연결오류 3회 백오프 재시도, min_interval 페이싱, ProviderQuotaStateStore 서킷브레이커를 client/collector/CLI 3곳에 배선함",
+      "impact": "차단·연결오류 시 즉시 ProviderQuotaBlocked로 헛요청을 막고 에러 메시지가 CLI에 노출됨"
+    },
+    {
       "task_id": "DART_BACKFILL_MEMORY_FIX",
       "date": "2026-09-13",
       "adr_id": "ADR_20260913_DART_BACKFILL_MEMORY_FIX",
