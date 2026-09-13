@@ -3,15 +3,18 @@ from __future__ import annotations
 
 import io
 import os
+import threading
 import time
 import zipfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Any
 from xml.etree import ElementTree
 
 import requests
+
+from src.integrations.quota import ProviderQuotaStateStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +74,11 @@ EMPTY_DART_STATUS = "013"
 BLOCKED_DART_STATUS = "020"
 RETRYABLE_DART_STATUSES = frozenset({"800", "900"})
 
+_PROVIDER = "OpenDART"
+# OpenDART는 raw 연결 리셋에 대한 공식 신호를 제공하지 않으므로(문서화된 020/429 계열 코드와 달리),
+# 실제 근거가 확보될 때까지 보수적인 고정 쿨다운을 적용한다.
+_CONNECTION_FAILURE_COOLDOWN_SECONDS = 300.0
+
 
 class DartApiClient:
     BASE_URL = "https://opendart.fss.or.kr/api"
@@ -83,6 +91,9 @@ class DartApiClient:
         request_json: JsonRequest | None = None,
         raw_request_json: JsonRequest | None = None,
         request_bytes: Callable[[str, dict[str, str]], bytes] | None = None,
+        quota_store: ProviderQuotaStateStore | None = None,
+        now: Callable[[], datetime] | None = None,
+        min_interval: float | None = None,
     ) -> None:
         self.api_key = api_key or os.getenv("OPENDART_API_KEY")
         if not self.api_key and request_json is None and raw_request_json is None and request_bytes is None:
@@ -91,6 +102,25 @@ class DartApiClient:
         self._raw_request_json = raw_request_json
         self._request_bytes = request_bytes
         self._session = requests.Session()
+        self._quota_store = quota_store
+        self._now = now or (lambda: datetime.now(UTC))
+        raw_interval = os.getenv("OPENDART_REQUEST_MIN_INTERVAL_SECONDS")
+        self._min_interval = (
+            float(min_interval)
+            if min_interval is not None
+            else (float(raw_interval) if raw_interval is not None else 0.0)
+        )
+        self._last_request_time = 0.0
+        self._pace_lock = threading.Lock()
+
+    def _pace(self) -> None:
+        if self._min_interval <= 0:
+            return
+        with self._pace_lock:
+            elapsed = time.monotonic() - self._last_request_time
+            if elapsed < self._min_interval:
+                time.sleep(self._min_interval - elapsed)
+            self._last_request_time = time.monotonic()
 
     def _request(self, endpoint: str, params: dict[str, str]) -> dict[str, Any]:
         request_params = dict(params)
@@ -108,8 +138,26 @@ class DartApiClient:
             if not isinstance(payload, dict):
                 raise DartTerminalError("DART response must be an object")
             return payload
+        if self._quota_store is not None:
+            self._quota_store.acquire(provider=_PROVIDER, endpoint=endpoint, now=self._now())
         for attempt in range(3):
-            response = self._session.get(f"{self.BASE_URL}/{endpoint}", params=request_params, timeout=30)
+            self._pace()
+            if self._quota_store is not None:
+                self._quota_store.record_attempt(provider=_PROVIDER, endpoint=endpoint, now=self._now())
+            try:
+                response = self._session.get(f"{self.BASE_URL}/{endpoint}", params=request_params, timeout=30)
+            except requests.exceptions.RequestException as exc:
+                if attempt < 2:
+                    time.sleep(0.5 * (2**attempt))
+                    continue
+                if self._quota_store is not None:
+                    self._quota_store.record_rate_limit(
+                        provider=_PROVIDER,
+                        endpoint=endpoint,
+                        now=self._now(),
+                        retry_after=_CONNECTION_FAILURE_COOLDOWN_SECONDS,
+                    )
+                raise DartRetryableError(f"DART transport failed for {endpoint}: {exc}") from exc
             if response.status_code != 200:
                 if response.status_code in (408, 429) or 500 <= response.status_code < 600:
                     if attempt < 2:
@@ -152,6 +200,10 @@ class DartApiClient:
         if status == EMPTY_DART_STATUS:
             return payload
         if status == BLOCKED_DART_STATUS:
+            if self._quota_store is not None:
+                self._quota_store.record_rate_limit(
+                    provider=_PROVIDER, endpoint=endpoint, now=self._now(), retry_after=None
+                )
             raise DartApiError(f"DART status {status}: {payload}")
         if status in RETRYABLE_DART_STATUSES:
             raise DartRetryableError(f"DART status {status}: {payload}")
