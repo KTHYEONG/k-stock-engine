@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "DART_BACKFILL_MEMORY_FIX",
+      "date": "2026-09-13",
+      "adr_id": "ADR_20260913_DART_BACKFILL_MEMORY_FIX",
+      "domain": "data",
+      "title": "DART 재백필 메모리 폭증 결함 수정",
+      "why": "재백필 실행 중 security_master 중복 버전 병합과 전체 to_dicts() 변환이 각각 3배·6.6GB 메모리를 낭비해 반복 OOM으로 죽었음",
+      "resolution": "security_master를 최신 1개 버전만 로드하고, 필터에 쓰는 5개 컬럼만 dedup 후 dict 변환하도록 수정함",
+      "impact": "재백필 배치의 피크 메모리가 약 14GB에서 약 5GB로 줄어 정상 완주 가능해짐"
+    },
+    {
       "task_id": "DATA_PERIOD_SELECTION",
       "date": "2026-09-13",
       "adr_id": "ADR_20260913_DATA_PERIOD_SELECTION",

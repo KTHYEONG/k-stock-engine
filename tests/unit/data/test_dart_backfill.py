@@ -25,7 +25,7 @@ def test_backfill_batch_writes_deterministic_plan_artifact_before_fact_collectio
         def fetch_corp_code_records(self):
             return (DartCorpCodeRecord(ticker="005930", corp_code="00126380", corp_name="A"),)
     master = pl.DataFrame({"instrument_id": ["KRX:005930"], "ticker": ["005930"], "share_class": ["common"], "valid_from": [datetime(2010, 1, 1, tzinfo=UTC)], "valid_to": [None], "available_at": [datetime(2010, 1, 1, tzinfo=UTC)]})
-    monkeypatch.setattr("src.data.dart_backfill._load_security_master", lambda _root: master)
+    monkeypatch.setattr("src.data.dart_backfill._load_security_master", lambda _root, **_kwargs: master)
     monkeypatch.setattr("src.data.dart_backfill._persist_corp_code_receipt", lambda **_kwargs: "c" * 64)
     monkeypatch.setattr("src.data.dart_backfill.collect_dart_disclosures", lambda **_kwargs: None)
     monkeypatch.setattr("src.data.dart_backfill.DartXbrlCollector.filing_identities_from_bronze", lambda *_args, **_kwargs: ())
@@ -151,3 +151,33 @@ def test_single_account_backfill_request_rejects_each_malformed_field() -> None:
 
     # And: the valid shape constructs.
     assert SingleAccountBackfillRequest(**valid).fs_div == "CFS"
+
+
+def test_load_security_master_selects_latest_dataset_only(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    from src.data.dart_backfill import _load_security_master
+    from src.data.schemas import SilverTable
+    from src.data.silver import SilverStore, complete_minimal_fixture
+
+    # Given: two certified security_master publishes at different decision times
+    # (distinct content, so distinct dataset directories under the table root).
+    store = SilverStore(tmp_path / "silver")
+    first_time = datetime(2024, 1, 3, tzinfo=UTC)
+    tables_1, _, report_1 = complete_minimal_fixture(decision_time=first_time)
+    store.materialize_all(tables_1, report=report_1, decision_time=first_time)
+
+    second_time = datetime(2024, 1, 10, tzinfo=UTC)
+    tables_2, _, report_2 = complete_minimal_fixture(decision_time=second_time)
+    store.materialize_all(tables_2, report=report_2, decision_time=second_time)
+
+    dataset_dirs = list((tmp_path / "silver" / "security_master").iterdir())
+    assert len(dataset_dirs) == 2, "fixture must produce two distinct dataset versions"
+
+    # When
+    read_time = datetime(2024, 2, 1, tzinfo=UTC)
+    master = _load_security_master(tmp_path / "silver", decision_time=read_time)
+
+    # Then: exactly one version's rows are returned, never both concatenated.
+    assert master.height == tables_2[SilverTable.SECURITY_MASTER].height
+    assert master.height == 1
