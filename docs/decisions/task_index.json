@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "DATA_PERIOD_SELECTION",
+      "date": "2026-09-13",
+      "adr_id": "ADR_20260913_DATA_PERIOD_SELECTION",
+      "domain": "data",
+      "title": "데이터 기간 정책 및 개발/홀드아웃 분리",
+      "why": "재백필 기간이 폐기 도구의 임의 하드코딩값을 승계해 근거가 불명확했음",
+      "resolution": "QVEF 룩백을 실증(5분기)으로 재산정하고 하한 게이트·정책 상수·구간별 성과 리포트를 추가함",
+      "impact": "compounding-v2 평가 시작이 데이터 가능성 하한 아래로 내려가면 즉시 차단되고 성과가 개발/홀드아웃으로 분리 보고됨"
+    },
+    {
       "task_id": "TASK_DART_BACKFILL_ADAPTIVE_COLLECTION",
       "date": "2026-09-13",
       "adr_id": "ADR_20260913_DART_BACKFILL_ADAPTIVE_COLLECTION",
