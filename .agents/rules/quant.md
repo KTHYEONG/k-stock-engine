@@ -1,27 +1,35 @@
 ---
 trigger:
   - on_label: ["quant"]
-  - on_file_path_regex: "src/.*(core|strategy|execution|data|engine|features|validation).*"
-  - on_file_path_glob: ["src/**/strategy/**/*.py", "src/**/execution/**/*.py", "src/**/data/**/*.py", "src/**/engine/**/*.py", "src/**/features/**/*.py", "src/**/validation/**/*.py"]
+  - on_file_path_regex: "src/.*"
+  - on_file_path_glob: ["src/**/*.py"]
 priority: 10
 ---
 
-# Quant & Financial Engineering Principles
+# Quantitative Engineering Core Directives
 
-> **Never leak future information, preserve the reality of capital flows and execution viability, guard against validation leakage and overfitting, and prioritize economic correctness over specific implementation mechanics.**
+> **The primary directive is maximizing net geometric compounding growth ($g = \mathbb{E}[\ln(1 + r_{\text{net}})]$) that is fully reproducible in live execution without phantom alpha. Maximize autonomous reasoning and algorithmic creativity within five non-negotiable constitutional pillars.**
 
-## 1. Temporal Integrity & Information Availability (PIT & Leakage)
-- **Information Availability:** Use strictly data that was realistically known and released at the decision timestamp. Never apply `.shift(1)` blindly without causal verification.
-- **Point-in-Time (PIT) & Survivorship:** Ensure universes, index constituents, and financial/filing disclosures contain no look-ahead restatements or survivorship bias.
-- **ML & Validation Leakage:** Prevent feature/label overlap across splits. Apply purging/embargoing for overlapping windows, and fit all learned preprocessing (scalers, encoders, feature selection) strictly on train folds.
+## 1. Temporal Causality (The Arrow of Time)
+- **Point-in-Time Availability:** Every signal, feature, universe selection, and portfolio decision at time $T$ must consume strictly data observable prior to or at time $T$.
+- **Zero Lookahead:** Executing on bar close $T$ using signals derived from the same bar's close, or referencing unreleased future data, is a fatal causality violation.
+- **Perturbation Invariance:** Verification must prove that corrupting or randomizing future data ($t > T$) alters historical decisions at or before time $T$ by zero.
 
-## 2. Cash-Equity Realism & Ledger Accounting
-- **Execution Viability & Friction:** Differentiate signal prices from realistically executable fill prices (spread, tick size constraints, auction dynamics, slippage). Account for transaction taxes (국내주식 거래세), brokerage commissions, and exchange fees.
-- **Settlement & Cash Drag:** Account for T+2 settlement cycles, cash drag, and shared-Ledger NAV accounting when evaluating long-only cash-equity portfolio rebalancing and execution.
-- **Portfolio Accounting Consistency:** Accurately reconcile cash, positions, fees, P&L, and external cash flows to avoid misrepresenting portfolio performance metrics (TWR, MWR, CAGR).
-- **Research-to-Production Parity:** Maintain consistent universe definitions, sizing logic, timing semantics, and feature engineering across research/backtesting and live execution.
+## 2. Universe & Selection Integrity (Point-in-Time Reality)
+- **Historical Universe Reconstruction:** Never evaluate strategies on historical windows using present-day survival criteria. The investable universe at time $T$ must reflect real-world constituents at time $T$, including subsequently delisted, bankrupt, or suspended assets.
+- **Selection Bias Elimination:** Screening filters and dynamic universe logic must only ingest information certified as known at rebalancing time $T$.
 
-## 3. Numerical Integrity & Economic Correctness
-- **Numerical Edge Cases:** Handle division by zero, NaNs, and infinities according to their genuine market meaning (e.g., halted trading, zero volume, unfillable orders) rather than silently coercing them into arbitrary normal values.
-- **Metric Significance vs. Overfitting:** Avoid blindly tuning parameters against isolated metrics (Sharpe, Accuracy); guard against selection bias and evaluate economic viability aligned with the investment objective.
-- **Principles Over Mechanics:** Prioritize sound financial and statistical meaning over rigid dogma around specific functions or recipes.
+## 3. Execution Friction & Capacity Realism
+- **Net Friction Integrity:** Never evaluate strategies under zero-friction illusions. All performance metrics must account for realistic execution drag: commissions, statutory taxes, bid-ask spreads, slippage, and financing/borrow costs.
+- **Market Impact & Capacity Constraints:** Never assume infinite liquidity or instant fills. Position sizing must respect market depth and Average Daily Volume (ADV) participation limits to prevent illusory alpha that collapses under scale.
+- **Zero Magic Numbers:** Never hardcode strategy thresholds, fee schedules, or filter cutoffs as numeric literals in business logic. Parameters must be declared as typed, configurable contracts (`Spec`/`Config`).
+
+## 4. Multiple Testing & Overfitting Resistance
+- **Statistical Humility:** Never present backtest metrics from repeated trial-and-error as independent discoveries without explicit statistical haircuts or adjustments for trial multiplicity.
+- **Parameter Surface Robustness:** Never rely on isolated parameter spikes ("knife-edge alpha"). Parameter sensitivity must demonstrate stable performance plateaus across neighboring regimes.
+- **Strict Out-of-Sample Isolation:** Maintain strict temporal separation between discovery/training and evaluation. Never leak validation statistics back into model formulation.
+
+## 5. Tail-Risk & Ruin Prevention (Deterministic Fail-Closed)
+- **Conservation Law:** Total portfolio equity and cash balance changes must reconcile exactly with realized transactions, fees, taxes, and financing cash flows with zero numerical leakage.
+- **Deterministic Fail-Closed:** On unrecoverable data anomalies or feed disruptions, never substitute arbitrary normal defaults. Safely abort execution (`NO_TRADE`), preserve capital, and protect against catastrophic ruin.
+- **Non-Gaussian Survival:** Never evaluate risk assuming pure Gaussian returns. Systems must survive fat-tailed drawdowns, liquidity freezes, and regime shifts.
