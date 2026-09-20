@@ -383,6 +383,7 @@ def run_dart_historical_backfill_batch(
         end=coverage_end,
         ticker_by_corp_code=dict(base.ticker_by_corp_code),
         required_periods=frozenset(base.required_periods),
+        corp_codes=frozenset(batch_codes),
     )
     batch_code_set = set(batch_codes)
     identities = tuple(
@@ -433,14 +434,12 @@ def run_dart_historical_backfill_batch(
         corp_code_receipt_hash=receipt_hash,
     )
     # Bronze receipt hashes for provenance.
-    receipt_hashes: list[str] = []
     disc_dir = Path(request.bronze_root) / "disclosures"
-    if disc_dir.exists():
-        for payload_path in sorted(disc_dir.glob("*/payload.json")):
-            try:
-                receipt_hashes.append(hashlib.sha256(payload_path.read_bytes()).hexdigest())
-            except OSError:
-                continue
+    receipt_hashes: list[str] = (
+        sorted(p.name for p in disc_dir.iterdir() if p.is_dir() and len(p.name) == 64)
+        if disc_dir.exists()
+        else []
+    )
     # Ticker-period coverage (incomplete coverage reported, never promoted).
     covered: dict[str, set[str]] = {}
     for ident in plan.identities:

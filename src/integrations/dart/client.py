@@ -102,6 +102,16 @@ class DartApiClient:
         self._raw_request_json = raw_request_json
         self._request_bytes = request_bytes
         self._session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=25,
+            pool_maxsize=25,
+        )
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
+        self._session.headers.update({
+            "User-Agent": "Mozilla/5.0 (compatible; KStockEngine/1.0; +https://github.com/KTHYEONG/k-stock-engine)",
+            "Accept": "application/json, text/plain, */*",
+        })
         self._quota_store = quota_store
         self._now = now or (lambda: datetime.now(UTC))
         raw_interval = os.getenv("OPENDART_REQUEST_MIN_INTERVAL_SECONDS")
