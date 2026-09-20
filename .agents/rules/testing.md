@@ -6,14 +6,17 @@ trigger:
 priority: 8
 ---
 
-# Testing Directives & Test Quality Standards
+# Testing Directives & Quality Standards
 
-> **Verify observable behavior and interface contracts, not implementation internals. Maintain fast feedback loops with small deterministic inputs while isolating heavy integration runs. Prioritize failure modes, boundaries, and financial invariants over vanity coverage metrics.**
+> **Verify observable behavior and interface contracts, not implementation internals. Maintain fast feedback loops with small deterministic inputs while isolating heavy runs. Enforce diff-coverage on new logic, isolate failures with pinpoint precision, and prioritize economic correctness over vanity metrics.**
 
-## 1. Test Architecture & Design
-- **Observable Behavior & Contracts:** Verify return contracts, state mutations, and error handling rather than private implementation details.
-- **Structure & Readability:** Keep tests readable with explicit setup, execution, and assertion phases (e.g., Given/When/Then, parametrized cases).
-- **In-Memory & Minimal Inputs:** Use the smallest deterministic synthetic data sufficient to test the target logic; avoid unnecessary disk I/O or massive fixtures in unit tests.
+## 1. Development Paradigm: Invariant-Driven Development (IDD)
+- **Contracts Over Premature Tests:** Prioritize strict typing (Pydantic, Enums, Mypy `strict`) and domain invariants over dogmatic test-first rituals. Define the interface and invariants before writing code; avoid premature test code that freezes internal APIs.
+- **Two-Track Workflow (Escape Ceremony Trap):**
+  - *Fast-Track (Surgical fixes, 1-2 files, bugfixes, config changes):* Direct implementation + Invariant Guard Test -> `lean_check.py` verification. Spec documents are not required for small localized changes.
+  - *Standard Track (New modules, complex algorithms, pipeline changes):* Probe (scratch experiment) -> Spec (contract & invariant scenarios) -> Implement (logic & guard tests) -> Check.
+- **Observable Behavior & Invariants:** Verify return contracts, state mutations, conservation laws, and error conditions rather than private implementation details or mock call-counts.
+- **In-Memory & Minimal Inputs:** Use the smallest deterministic synthetic data sufficient to test target logic (< 0.1s); never load multi-year disk datasets in unit tests.
 - **Do Not Test Profitability:** Unit and integration tests verify correctness, edge cases, and schema transformations—never long-horizon profitability, market alpha, or model convergence.
 
 ## 2. Quantitative & Financial Invariant Testing
@@ -21,16 +24,18 @@ priority: 8
 - **Temporal & Numerical Boundaries:** Stress-test boundary conditions rather than happy paths alone: zeros, NaNs, empty universes, missing bars, market holidays, duplicate timestamps, timezone transitions, and floating-point tolerances (`pytest.approx`, `rtol`/`atol`).
 - **No Look-Ahead Invariance:** Explicitly test that signal and execution calculations do not access future time steps or unreleased event timestamps.
 
-## 3. Execution, Isolation & Environment Strategy
-- **Fast Feedback Core Suite:** Default unit tests must run fast to maintain quick development cycles. Isolate heavy end-to-end simulations, full model retraining, or long-horizon replays into dedicated integration/slow suites.
-- **Pragmatic Fixtures & State Isolation:** Scope fixtures appropriately to balance performance and test isolation; avoid sharing mutable state across tests via excessive fixture caching.
-- **Boundary Mocking:** Mock external network boundaries, broker/exchange gateway APIs, hardware I/O, and non-deterministic clock/system interfaces. Never mock internal business logic or transform tests into meaningless mock-chains.
-- **Robust Failure Verification:** Verify exception types, error codes, or structured payload attributes. Avoid brittle assertions on human-readable error string messages unless message formatting is an explicit contract.
-- **Realistic Database & Storage Engines:** Use actual database engines or containerized equivalents when SQL dialect compatibility, query optimization, or transaction concurrency semantics are explicitly under test; use lightweight in-memory storage for pure repository logic.
+## 3. Execution, Latency Budgets & Failure Triage
+- **Latency Budgets:** Fast unit tests must execute in < 0.1s per test (in-memory only). Heavy end-to-end simulations, full model retraining, or multi-year backtests must be marked `@pytest.mark.slow` and isolated from the default run.
+- **Pinpoint Failure Isolation (No Full-Suite Retries):** During TDD and debugging, NEVER rerun entire test suites (e.g. 100+ tests) or perform blind sweeps. AI must test ONLY the specific modified file or test (`uv run pytest path/to/test.py -k <test_name> -q`) and inspect the direct traceback.
+- **Process-Isolated Temp Roots:** Never wipe shared temp directories globally. Each pytest run operates in its own partitioned `tmp/pytest/proc_{pid}_{uuid}/` directory to prevent race conditions and ghost crashes between concurrent agents and developer terminal commands.
+- **Hermetic Environment Invariant:** Unit tests must be 100% isolated from developer shell credentials and environment variables (`LIVE_*`, `BINANCE_*`, `UPBIT_*`). Tests requiring specific environment variables must configure them explicitly via `monkeypatch.setenv`.
+- **Tooling Artifact Awareness:** If tests pass alone but fail strictly under instrumentation (`--cov`), diagnose tracer overhead, timeout expiration, or multiprocessing/fork interference before assuming a domain code regression.
+- **Pragmatic Fixtures & Mocking:** Mock external boundaries (REST/WebSocket APIs, clock/system time, filesystem I/O). Never mock internal domain calculations or transform tests into meaningless mock-chains.
 
-## 4. Test Quality & Coverage Philosophy
-- **Quality Over Vanity Coverage:** Treat test coverage as a diagnostic signal rather than a quota. Prioritize:
-  1. Changed core execution paths
-  2. Edge cases, failure modes, and boundary transitions
-  3. High-risk regression paths
-- **Test Integrity:** Never weaken assertions, delete valid test cases, or skip failing checks merely to satisfy CI runs. Diagnose and fix the root cause.
+## 4. Diff-Coverage & Quality Philosophy
+- **Diff-Coverage Over Vanity Metrics:** Do not chase global percentage quotas across untouched legacy modules. Focus strictly on 100% diff-coverage for newly-added production logic (`src/`) to ensure zero untested code.
+- **Uncovered Line Resolution Protocol:** If new lines are reported as uncovered by diff-coverage, evaluate:
+  1. *Is it a genuine domain branch/exception?* -> Add a targeted scenario test exercising that boundary.
+  2. *Is it speculative defensive code (e.g. unrequested `try-except` or dead branches)?* -> **Do NOT write artificial tests; remove the defensive bloat and simplify the code.**
+- **Escape Hatch for Non-Measurable Lines:** Use `# pragma: no cover` sparingly for genuine infrastructure edge cases (e.g. OS signal exits, fatal crash loggers) rather than contorting tests with complex mocks.
+- **Test Integrity:** Never weaken assertions, delete valid tests, or skip failing checks to satisfy CI. Diagnose and fix the root cause.

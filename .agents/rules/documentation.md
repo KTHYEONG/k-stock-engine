@@ -12,7 +12,7 @@ priority: 8
 ## 1. Commenting Principles: Explain "Why", Not "What"
 - **Focus on Rationale:** Document business context, mathematical derivations, domain constraints, timing semantics, units, and non-obvious trade-offs. Omit comments that merely paraphrase readable code.
 - **Conciseness with Clarity:** Keep comments focused and compact. Use extended explanations only when the rationale cannot be clearly expressed briefly.
-- **No Ephemeral Spec References:** NEVER reference temporary `docs/specs/*.md` or `contract.json` paths in code, docstrings, or comments. Specs are transient working files that get purged. Use persistent `ADR-XXXX` IDs or self-contained domain rationale.
+- **No Ephemeral Spec References:** NEVER reference temporary `docs/specs/*.md` paths in code, docstrings, or comments. Specs are transient working files that get purged. Use persistent `ADR-XXXX` IDs or self-contained domain rationale.
 - **No Diagnostic or Session Artifacts:** Never leave AI task logs, revision chronicles, or linter fix annotations (e.g., `# fix mypy error`) in production code or comments.
 
 ## 2. Docstring Standards

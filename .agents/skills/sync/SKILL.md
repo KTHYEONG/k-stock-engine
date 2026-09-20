@@ -1,30 +1,32 @@
 ---
 name: sync
-description: Documentation Synchronization, ADR Logging, Cleanup.
+description: Documentation Synchronization, Compact Decision Logging, and Full Cleanup.
 ---
 
 # Sync Protocol
 
-Post-development protocol for task finalization, ADR registration, index updating, and temporary artifact cleanup.
+Post-development protocol for task finalization, compact decision recording, and complete temporary artifact cleanup.
 
 ## Directives
 
-1. **Task Sync & Index Registration**:
-   - Run task sync script:
+1. **Auto-Inference & Task Sync**:
+   - Do NOT ask the user to provide command arguments.
+   - Automatically extract `title`, `why`, `what`, `impact`, and `caveat` from the active spec (`docs/specs/*_spec.md`) or recent audit context.
+   - Run task sync:
      ```bash
-     uv run python tools/agent_skills/sync_task.py --task TASK_ID --title "<Title>" --why "<Context>" --what "<Resolution>" --impact "<Impact>" --source src/x.py --domain <domain>
+     uv run python tools/agent_skills/sync_task.py --task TASK_ID --title "<Title>" --why "<Why>" --what "<What>" --impact "<Impact>" --caveat "<Caveat>" --domain <domain>
      ```
-   - Automatically updates `docs/decisions/task_index.json` and `docs/code_map.json`.
-   - **Keep `--why`/`--what`/`--impact` to 1 sentence each.** These fields are echoed verbatim into every future `spec_init.py` match on this `domain`/keyword — a verbose entry today taxes every later spec run's context, not just this one. The script hard-caps each field at 300 chars as a backstop, but that's a truncation, not a substitute for writing tight in the first place.
+   - Automatically updates single ledger: `docs/decisions/task_index.json` and `docs/code_map.json`.
+   - Keep each field strictly to 1 concise sentence to preserve token efficiency for future sessions.
 
-2. **Artifact Cleanup**:
-   - `sync_task.py` deletes `docs/specs/*_contract.json` files (design rationale already summarized into the `--why`/`--what`/`--impact` fields written to `task_index.json`) and purges `scratch/` scripts, `tmp/` test roots, and logs. Persistent architecture documents (`docs/architecture/`, `00_architecture.md`) are safely preserved.
+2. **Complete Artifact Cleanup**:
+   - `sync_task.py` completely purges all temporary files: `docs/specs/*_spec.md`, `scratch/` probe files, `tmp/` test roots, and logs.
+   - Zero archive files are left behind, ensuring 100% clean Git history and zero file sprawl.
 
 ## Output
 
-Provide a clear, concise summary with emojis. Example:
+Keep chat output ultra-compact (1-2 lines). The user only needs confirmation that the record was committed and workspace is clean:
 
 ### 🧹 [SYNC] <Task Title>
-
-- **Status**: 🎉 COMPLETE
-- **ADR Index**: <Registered ADR_ID>
+- **기록 완료**: `task_index.json` (<ADR_ID>)
+- **정리 완료**: 임시 스펙 및 `scratch/`, `tmp/` 완전 소각

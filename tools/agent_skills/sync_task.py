@@ -49,11 +49,7 @@ _MEMORY_FIELD_CHAR_CAP = 300
 
 
 def _cap_field(text: str) -> str:
-    """Hard backstop on why/what/impact -- these get echoed into every future
-    spec_init.py match, so an unbounded field taxes every later spec run, not
-    just this one. Prompt guidance (sync/SKILL.md) is the first line; this is
-    the fail-closed script-level one.
-    """
+    """Hard backstop on why/what/impact to keep future context lookups token-efficient."""
     text = text.strip()
     if len(text) <= _MEMORY_FIELD_CHAR_CAP:
         return text
@@ -67,6 +63,7 @@ def _update_decisions_json(
     what: str,
     impact: str,
     domain: str,
+    caveat: str = "",
     failed_hypothesis: str | None = None,
     failure_reason: str | None = None,
 ) -> str:
@@ -101,6 +98,8 @@ def _update_decisions_json(
         "resolution": _cap_field(what),
         "impact": _cap_field(impact),
     }
+    if caveat:
+        new_task_entry["caveat"] = _cap_field(caveat)
 
     # Prepend new task entry
     index_data["tasks"] = [new_task_entry] + [t for t in index_data.get("tasks", []) if t.get("task_id") != task]
@@ -267,6 +266,7 @@ def main() -> None:
     parser.add_argument("--why", required=True, help="Context/Why")
     parser.add_argument("--what", required=True, help="Resolution/What")
     parser.add_argument("--impact", required=True, help="Impact")
+    parser.add_argument("--caveat", default="", help="Crucial assumption or boundary caveat to remember")
     parser.add_argument("--source", default=None, help="Modified source file path (auto-detected if omitted)")
     parser.add_argument("--domain", default="general", help="Domain category (e.g. signal, risk, execution)")
     parser.add_argument("--failed-hypothesis", default=None, help="Failed hypothesis if applicable")
@@ -315,6 +315,7 @@ def main() -> None:
             what=args.what,
             impact=args.impact,
             domain=args.domain,
+            caveat=args.caveat,
             failed_hypothesis=args.failed_hypothesis,
             failure_reason=args.failure_reason,
         )
