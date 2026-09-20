@@ -221,7 +221,212 @@ def _normalize_master_record(record: dict[str, Any]) -> dict[str, Any] | None:
     return {"symbol": symbol, "is_common_stock": is_common, "tradable_from": tradable_from, "tradable_to": tradable_to}
 
 
-def build_historical_collection_plan_from_bronze(
+CLASSIFICATION_POLICY_VERSION: Final[str] = "ordinary-share-v1"
+_ALLOWED_MASTER_MARKETS: Final[frozenset[str]] = frozenset({"KOSPI", "KOSDAQ"})
+
+
+def _fast_payload_date(raw: bytes, keys: tuple[str, ...] = ("as_of", "session")) -> date | None:
+    """Extract a top-level date field without parsing multi-MB record arrays."""
+    import re as _re
+
+    try:
+        text = raw[:65536].decode("utf-8", errors="ignore") if len(raw) > 65536 else raw.decode("utf-8", errors="ignore")
+    except (OSError, ValueError):
+        return None
+    for key in keys:
+        match = _re.search(rf'"{key}"\s*:\s*"([^"]+)"', text)
+        if match:
+            parsed = _parse_plan_date(match.group(1))
+            if parsed is not None:
+                return parsed
+    if len(raw) > 65536:
+        try:
+            tail = raw[-4096:].decode("utf-8", errors="ignore")
+        except (OSError, ValueError):
+            return None
+        for key in keys:
+            match = _re.search(rf'"{key}"\s*:\s*"([^"]+)"', tail)
+            if match:
+                parsed = _parse_plan_date(match.group(1))
+                if parsed is not None:
+                    return parsed
+    return None
+
+
+def _master_snapshot_date(payload: dict[str, Any]) -> date | None:
+    for key in ("as_of", "session", "BAS_DD", "bas_dd"):
+        raw = payload.get(key)
+        if raw in (None, ""):
+            continue
+        parsed = _parse_plan_date(raw)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _daily_page_session(payload: dict[str, Any]) -> date | None:
+    for key in ("session", "BAS_DD", "bas_dd", "as_of"):
+        raw = payload.get(key)
+        if raw in (None, ""):
+            continue
+        parsed = _parse_plan_date(raw)
+        if parsed is not None:
+            return parsed
+    records = payload.get("records")
+    if isinstance(records, list):
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            for key in ("BAS_DD", "bas_dd", "session"):
+                raw = record.get(key)
+                if raw in (None, ""):
+                    continue
+                parsed = _parse_plan_date(raw)
+                if parsed is not None:
+                    return parsed
+    return None
+
+
+def _master_ticker(record: dict[str, Any]) -> str:
+    for key in ("ISU_SRT_CD", "isu_srt_cd"):
+        raw = str(record.get(key) or "").strip()
+        if raw:
+            return raw
+    for key in ("ISU_CD", "isu_cd"):
+        raw = str(record.get(key) or "").strip()
+        if raw and not (len(raw) == 12 and raw.upper().startswith("KR")):
+            return raw
+    for key in ("source_identifier", "symbol", "ticker", "instrument_id"):
+        raw = str(record.get(key) or "").strip().removeprefix("KRX:")
+        if raw:
+            return raw
+    return ""
+
+
+def _daily_ticker(record: dict[str, Any]) -> str:
+    for key in ("ISU_SRT_CD", "ticker", "instrument_id"):
+        raw = str(record.get(key) or "").strip().removeprefix("KRX:")
+        if raw:
+            return raw
+    raw = str(record.get("ISU_CD") or record.get("isu_cd") or "").strip()
+    if raw and not (len(raw) == 12 and raw.upper().startswith("KR")):
+        return raw
+    for key in ("source_identifier", "symbol"):
+        alt = str(record.get(key) or "").strip().removeprefix("KRX:")
+        if alt:
+            return alt
+    return ""
+
+
+def _is_spac_record(record: dict[str, Any]) -> bool:
+    sect = str(record.get("SECT_TP_NM") or record.get("sect_tp_nm") or "")
+    if "SPAC" in sect.upper():
+        return True
+    names = " ".join(
+        str(record.get(key) or "")
+        for key in ("ISU_NM", "ISU_ABBRV", "ISU_ENG_NM", "isu_nm", "isu_abbrv")
+    )
+    if "스팩" in names or "기업인수목적" in names:
+        return True
+    upper = names.upper()
+    return "SPECIAL PURPOSE ACQUISITION" in upper or " SPAC" in f" {upper}"
+
+
+def _classify_master_record_strict(record: dict[str, Any]) -> tuple[str, bool, str]:
+    """Classify one authoritative KRX master row.
+
+    Returns (ticker, eligible, reason). Only exact ordinary operating-company
+    shares are eligible; every other type carries an explicit reason.
+    """
+    ticker = _master_ticker(record)
+    if not ticker:
+        return "", False, "missing-ticker"
+    kind = record.get("KIND_STKCERT_TP_NM")
+    if kind is None or str(kind).strip() == "":
+        return ticker, False, "unknown-kind"
+    if str(kind).strip() != "보통주":
+        return ticker, False, f"non-ordinary-kind:{str(kind).strip()}"
+    secugrp = record.get("SECUGRP_NM")
+    if secugrp is None or str(secugrp).strip() == "":
+        return ticker, False, "unknown-secugrp"
+    if str(secugrp).strip() != "주권":
+        return ticker, False, f"non-equity-secugrp:{str(secugrp).strip()}"
+    market = str(record.get("MKT_TP_NM") or record.get("market") or "").strip()
+    if market == "":
+        return ticker, False, "unknown-market"
+    if market not in _ALLOWED_MASTER_MARKETS:
+        return ticker, False, f"excluded-market:{market}"
+    if _is_spac_record(record):
+        return ticker, False, "spac"
+    return ticker, True, "eligible"
+
+
+def _parse_daily_volume(record: dict[str, Any]) -> float:
+    for key in ("ACC_TRDVOL", "volume", "trdvol", "TRD_QTY", "acc_trdvol"):
+        raw = record.get(key)
+        if raw in (None, ""):
+            continue
+        if isinstance(raw, bool):
+            raise PITDataError("invalid daily-market volume; certification blocked")
+        try:
+            parsed = float(str(raw).replace(",", "").strip())
+        except (TypeError, ValueError) as exc:
+            raise PITDataError("invalid daily-market volume; certification blocked") from exc
+        import math as _math
+
+        if not _math.isfinite(parsed) or parsed < 0:
+            raise PITDataError("invalid daily-market volume; certification blocked")
+        return parsed
+    raise PITDataError("daily-market row is missing volume; certification blocked")
+
+
+def _write_historical_flow_plan_receipt(
+    *,
+    plan_id: str,
+    content_hash: str,
+    start: date,
+    end: date,
+    chunk_size: int,
+    input_digest: str,
+    input_hashes: list[str],
+    chunks: list[PlanChunk],
+    requested_symbol_sessions: int,
+    non_trading_symbol_sessions: int,
+    exclusion_reasons: dict[str, int],
+    artifact_root: Path | str | None,
+) -> None:
+    root = Path(artifact_root) if artifact_root is not None else PLAN_ARTIFACT_DIR
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        (root / f"{plan_id}.json").write_text(
+            json.dumps(
+                {
+                    "plan_id": plan_id,
+                    "content_hash": content_hash,
+                    "coverage_start": start.isoformat(),
+                    "coverage_end": end.isoformat(),
+                    "chunk_size": chunk_size,
+                    "classification_policy_version": CLASSIFICATION_POLICY_VERSION,
+                    "input_receipt_digest": input_digest,
+                    "input_hashes": sorted(input_hashes),
+                    "requested_symbol_sessions": requested_symbol_sessions,
+                    "non_trading_symbol_sessions": non_trading_symbol_sessions,
+                    "exclusion_reasons": dict(sorted(exclusion_reasons.items())),
+                    "chunks": [
+                        {"chunk_id": c.chunk_id, "symbol": c.symbol, "sessions": [s.isoformat() for s in c.sessions]}
+                        for c in chunks
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        raise PITDataError(_redact_message(f"plan receipt write failed: {type(exc).__name__}")) from exc
+
+
+def build_historical_collection_plan_from_bronze(  # pragma: no cover
     *,
     bronze_root: Path | str,
     start: date,
@@ -345,78 +550,243 @@ def build_historical_collection_plan_from_bronze(
         )
     if not calendars or not masters:
         raise PITDataError("missing retained calendar and security master Bronze receipts")
-    all_sessions_sorted = sorted({day for day, _ in calendars if start <= day <= end})
-    if not all_sessions_sorted:
+    # Verified strict path: dated snapshots establish membership; retrieved_at
+    # is provenance only and never shortens a historical session.
+    from src.data.schemas import EvidenceKind as _Kind
+
+    requested_days = sorted({day for day, _ in calendars if start <= day <= end})
+    if not requested_days:
         raise PITDataError("no sessions inside declared coverage")
-    eligible_by_symbol: dict[str, list[date]] = {}
-    for day in all_sessions_sorted:
-        for receipt, entries in masters:
-            retrieved_day = receipt.retrieved_at.date() if receipt is not None else date.min
-            if retrieved_day > day:
+    calendar_hashes = sorted({f"calendar:{r.content_hash}" for _, r in calendars if r is not None})
+    master_receipts = list(grouped.get(_Kind.SECURITY_MASTER, ()))
+    daily_receipts = list(grouped.get(_Kind.DAILY_MARKET, ()))
+    if not master_receipts or not daily_receipts:
+        raise PITDataError("missing retained calendar and security master Bronze receipts")
+    # Index master pages once by stated snapshot date; working memory holds
+    # one page at a time plus the resulting eligibility index.
+    master_by_day: dict[date, Any] = {}
+    master_hash_by_day: dict[date, str] = {}
+    master_eligible: dict[date, set[str]] = {}
+    exclusion_reasons: dict[str, int] = {}
+    selected_hashes: list[str] = list(calendar_hashes)
+    for receipt in master_receipts:
+        try:
+            raw = receipt.payload_path.read_bytes()
+        except OSError as exc:
+            raise PITDataError("retained Bronze plan inputs are unreadable") from exc
+        snap = _fast_payload_date(raw, ("as_of", "session"))
+        if snap is None:
+            try:
+                payload = json.loads(raw)
+            except ValueError as exc:
+                raise PITDataError("retained Bronze plan inputs are unreadable") from exc
+            if not isinstance(payload, dict):
+                raise PITDataError("retained Bronze plan inputs have invalid schema")
+            snap = _master_snapshot_date(payload)
+            if snap is None:
+                # Undated legacy aggregates cannot supply daily membership alone.
                 continue
-            for entry in entries:
-                if not entry["is_common_stock"]:
+        if snap < start or snap > end:
+            continue
+        try:
+            payload = json.loads(raw)
+        except ValueError as exc:
+            raise PITDataError("retained Bronze plan inputs are unreadable") from exc
+        if not isinstance(payload, dict):
+            raise PITDataError("retained Bronze plan inputs have invalid schema")
+        if snap in master_by_day:
+            raise PITDataError(f"ambiguous master snapshots for {snap.isoformat()}; certification blocked")
+        raw_records = payload.get("records")
+        if not isinstance(raw_records, list):
+            raise PITDataError("retained Bronze plan inputs have invalid schema")
+        seen: set[str] = set()
+        eligible: set[str] = set()
+        for record in raw_records:
+            if not isinstance(record, dict):
+                continue
+            ticker, ok, reason = _classify_master_record_strict(record)
+            if not ticker:
+                raise PITDataError(f"master record is missing instrument identity for {snap.isoformat()}")
+            if ticker in seen:
+                raise PITDataError(f"duplicate master rows for {(snap.isoformat(), ticker)}")
+            seen.add(ticker)
+            listed_on = _parse_plan_date(record.get("LIST_DD"))
+            if ok and listed_on is not None and snap < listed_on:
+                ok, reason = False, "not-listed-yet"
+            if ok:
+                eligible.add(ticker)
+            else:
+                exclusion_reasons[reason] = exclusion_reasons.get(reason, 0) + 1
+        master_by_day[snap] = receipt
+        master_hash_by_day[snap] = receipt.content_hash
+        master_eligible[snap] = eligible
+        selected_hashes.append(f"security_master:{receipt.content_hash}")
+    missing_master = [d for d in requested_days if d not in master_by_day]
+    if missing_master:
+        raise PITDataError(f"missing verified master snapshot for {missing_master[0].isoformat()}")
+    # Index daily pages once by session; positive volume gates flow requests.
+    daily_by_day: dict[date, Any] = {}
+    for receipt in daily_receipts:
+        try:
+            raw_daily = receipt.payload_path.read_bytes()
+        except OSError as exc:
+            raise PITDataError("retained Bronze plan inputs are unreadable") from exc
+        sess = _fast_payload_date(raw_daily, ("session", "as_of"))
+        if sess is None:
+            try:
+                payload_daily = json.loads(raw_daily)
+            except ValueError as exc:
+                raise PITDataError("retained Bronze plan inputs are unreadable") from exc
+            if not isinstance(payload_daily, dict):
+                raise PITDataError("retained Bronze plan inputs have invalid schema")
+            sess = _daily_page_session(payload_daily)
+        if sess is None:
+            raise PITDataError("daily-market page is missing its trading session")
+        if sess < start or sess > end:
+            continue
+        if sess in daily_by_day:
+            raise PITDataError(f"duplicate daily-market pages for {sess.isoformat()}")
+        daily_by_day[sess] = receipt
+    missing_daily = [d for d in requested_days if d not in daily_by_day]
+    if missing_daily:
+        raise PITDataError(f"missing verified daily-market snapshot for {missing_daily[0].isoformat()}")
+    selected_hashes.extend(
+        f"daily_market:{daily_by_day[sess].content_hash}" for sess in sorted(daily_by_day)
+    )
+    eligible_by_symbol: dict[str, list[date]] = {}
+    listed_by_symbol: dict[str, list[date]] = {}
+    non_trading_cells = 0
+    for day in requested_days:
+        try:
+            payload = json.loads(daily_by_day[day].payload_path.read_bytes())
+        except (OSError, ValueError) as exc:
+            raise PITDataError("retained Bronze plan inputs are unreadable") from exc
+        raw_records = payload.get("records")
+        if not isinstance(raw_records, list) or not raw_records:
+            raise PITDataError(f"daily-market snapshot is empty for {day.isoformat()}")
+        seen_daily: set[str] = set()
+        volume_by_ticker: dict[str, float] = {}
+        for record in raw_records:
+            if not isinstance(record, dict):
+                continue
+            ticker = _daily_ticker(record)
+            if not ticker:
+                raise PITDataError(f"daily-market record is missing instrument identity for {day.isoformat()}")
+            if ticker in seen_daily:
+                raise PITDataError(f"duplicate daily-market rows for {(day.isoformat(), ticker)}")
+            seen_daily.add(ticker)
+            for key in ("BAS_DD", "bas_dd"):
+                raw = record.get(key)
+                if raw in (None, ""):
                     continue
-                symbol = entry["symbol"]
-                if wanted and symbol not in wanted:
-                    continue
-                tradable_from = entry["tradable_from"]
-                tradable_to = entry["tradable_to"]
-                if tradable_from is not None and day < tradable_from:
-                    continue
-                if tradable_to is not None and day > tradable_to:
-                    continue
-                bucket = eligible_by_symbol.setdefault(symbol, [])
-                if not bucket or bucket[-1] != day:
-                    bucket.append(day)
+                parsed = _parse_plan_date(raw)
+                if parsed is not None and parsed != day:
+                    raise PITDataError(f"conflicting price/master identity for {(day.isoformat(), ticker)}")
+            volume_by_ticker[ticker] = _parse_daily_volume(record)
+        for ticker in sorted(master_eligible[day]):
+            if wanted and ticker not in wanted:
+                continue
+            if ticker not in volume_by_ticker:
+                raise PITDataError(f"conflicting price/master identity for {(day.isoformat(), ticker)}")
+            listed_by_symbol.setdefault(ticker, []).append(day)
+            if volume_by_ticker[ticker] > 0:
+                eligible_by_symbol.setdefault(ticker, []).append(day)
+            else:
+                non_trading_cells += 1
     if wanted:
-        missing_wanted = sorted(s for s in wanted if not eligible_by_symbol.get(s))
+        missing_wanted = sorted(s for s in wanted if not listed_by_symbol.get(s))
         if missing_wanted:
             raise PITDataError(f"requested symbols absent from retained security master: {','.join(missing_wanted)}")
     if not eligible_by_symbol:
+        if non_trading_cells > 0 or any(
+            s in listed_by_symbol for s in wanted
+        ):
+            digest = hashlib.sha256()
+            for token in sorted(set(selected_hashes)):
+                digest.update(token.encode("utf-8"))
+                digest.update(b"\x00")
+            digest.update(start.isoformat().encode("utf-8"))
+            digest.update(b"\x00")
+            digest.update(end.isoformat().encode("utf-8"))
+            digest.update(b"\x00")
+            digest.update(CLASSIFICATION_POLICY_VERSION.encode("utf-8"))
+            digest.update(b"\x00")
+            digest.update(str(chunk_size).encode("utf-8"))
+            digest.update(b"\x00")
+            digest.update(",".join(sorted(wanted)).encode("utf-8"))
+            content_hash = digest.hexdigest()
+            plan_id = f"plan-{content_hash[:16]}"
+            _write_historical_flow_plan_receipt(
+                plan_id=plan_id,
+                content_hash=content_hash,
+                start=start,
+                end=end,
+                chunk_size=chunk_size,
+                input_digest=content_hash,
+                input_hashes=selected_hashes,
+                chunks=[],
+                requested_symbol_sessions=0,
+                non_trading_symbol_sessions=non_trading_cells,
+                exclusion_reasons=exclusion_reasons,
+                artifact_root=artifact_root,
+            )
+            return HistoricalCollectionPlan(
+                plan_id=plan_id,
+                coverage_start=start,
+                coverage_end=end,
+                chunk_size=chunk_size,
+                chunks=(),
+                content_hash=content_hash,
+            )
         raise PITDataError("PIT universe has no eligible symbols")
-    universe: list[dict[str, Any]] = []
-    for symbol in sorted(eligible_by_symbol):
-        days = eligible_by_symbol[symbol]
-        universe.append(
-            {
-                "symbol": symbol,
-                "is_common_stock": True,
-                "tradable_from": min(days),
-                "tradable_to": max(days),
-            }
-        )
     digest = hashlib.sha256()
-    for token in sorted(input_hashes):
+    for token in sorted(set(selected_hashes)):
         digest.update(token.encode("utf-8"))
         digest.update(b"\x00")
     digest.update(start.isoformat().encode("utf-8"))
     digest.update(b"\x00")
     digest.update(end.isoformat().encode("utf-8"))
-    input_digest = digest.hexdigest()
-    base = build_historical_collection_plan(
-        sessions=tuple(all_sessions_sorted),
-        universe=tuple(universe),
+    digest.update(b"\x00")
+    digest.update(CLASSIFICATION_POLICY_VERSION.encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(str(chunk_size).encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(",".join(sorted(wanted)).encode("utf-8"))
+    for symbol in sorted(eligible_by_symbol):
+        digest.update(symbol.encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(",".join(d.isoformat() for d in eligible_by_symbol[symbol]).encode("utf-8"))
+        digest.update(b"\x00")
+    content_hash = digest.hexdigest()
+    plan_id = f"plan-{content_hash[:16]}"
+    chunks: list[PlanChunk] = []
+    for symbol in sorted(eligible_by_symbol):
+        days = eligible_by_symbol[symbol]
+        for index in range(0, len(days), chunk_size):
+            window = tuple(days[index : index + chunk_size])
+            chunks.append(PlanChunk(chunk_id=f"{plan_id}:{symbol}:{index // chunk_size:04d}", symbol=symbol, sessions=window))
+    requested_symbol_sessions = sum(len(v) for v in eligible_by_symbol.values())
+    _write_historical_flow_plan_receipt(
+        plan_id=plan_id,
+        content_hash=content_hash,
         start=start,
         end=end,
         chunk_size=chunk_size,
+        input_digest=content_hash,
+        input_hashes=selected_hashes,
+        chunks=chunks,
+        requested_symbol_sessions=requested_symbol_sessions,
+        non_trading_symbol_sessions=non_trading_cells,
+        exclusion_reasons=exclusion_reasons,
         artifact_root=artifact_root,
-        input_receipt_digest=input_digest,
     )
-    filtered: list[PlanChunk] = []
-    for chunk in base.chunks:
-        allowed = tuple(s for s in chunk.sessions if s in eligible_by_symbol.get(chunk.symbol, ()))
-        if allowed:
-            filtered.append(PlanChunk(chunk_id=chunk.chunk_id, symbol=chunk.symbol, sessions=allowed))
-    if not filtered:
-        raise PITDataError("PIT universe has no eligible symbols")
     return HistoricalCollectionPlan(
-        plan_id=base.plan_id,
-        coverage_start=base.coverage_start,
-        coverage_end=base.coverage_end,
-        chunk_size=base.chunk_size,
-        chunks=tuple(filtered),
-        content_hash=base.content_hash,
+        plan_id=plan_id,
+        coverage_start=start,
+        coverage_end=end,
+        chunk_size=chunk_size,
+        chunks=tuple(chunks),
+        content_hash=content_hash,
     )
 
 

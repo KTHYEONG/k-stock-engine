@@ -59,6 +59,9 @@ class DartXbrlCollector:
             raise ValueError("OPENDART_API_KEY not found in environment variables")
         if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
             raise ValueError(f"invalid max_workers {max_workers!r}: must be a positive integer")
+        env_workers = os.getenv("OPENDART_MAX_WORKERS")
+        if max_workers == 20 and env_workers and env_workers.isdigit() and int(env_workers) >= 1:
+            max_workers = int(env_workers)
         self._api_key = key
         self._request_json = request_json
         self._request_bytes = request_bytes
@@ -117,18 +120,29 @@ class DartXbrlCollector:
 
     @staticmethod
     def filing_identities_from_bronze(
-        bronze_root: Path | str, *, start: date, end: date, ticker_by_corp_code: Mapping[str, str] | None = None, required_periods: frozenset[str] | None = None
+        bronze_root: Path | str,
+        *,
+        start: date,
+        end: date,
+        ticker_by_corp_code: Mapping[str, str] | None = None,
+        required_periods: frozenset[str] | None = None,
+        corp_codes: frozenset[str] | tuple[str, ...] | None = None,
     ) -> tuple[dict[str, str], ...]:
         """Select only periodic financial filings with complete OpenDART account identity."""
         paths = sorted((Path(bronze_root) / "disclosures").glob("*/payload.json"))
         if not paths:
             raise PITDataError("expected exactly one retained disclosure Bronze receipt")
+        target_codes = frozenset(corp_codes) if corp_codes is not None else None
         identities: list[dict[str, str]] = []
         for payload_path in paths:
             try:
                 payload = json.loads(payload_path.read_text(encoding="utf-8"))
             except (OSError, ValueError) as exc:
                 raise PITDataError("retained disclosure Bronze receipt is unreadable") from exc
+            if target_codes is not None:
+                p_corp = str((payload.get("corp_code") if isinstance(payload, dict) else None) or "").strip()
+                if p_corp and p_corp not in target_codes:
+                    continue
             records = payload.get("records") if isinstance(payload, dict) else None
             if not isinstance(records, list):
                 continue
