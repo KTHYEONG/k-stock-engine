@@ -21,7 +21,6 @@ from src.data.collection_plan import (
     LS_MAX_SESSIONS_PER_REQUEST,
     CollectionCheckpointStore,
     CollectionReadinessReport,
-    build_historical_collection_plan,
     build_historical_collection_plan_from_bronze,
     load_collection_plan,
 )
@@ -1019,7 +1018,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         except (PITDataError, ValueError, OSError):
             return 1
-        _emit({"receipts": sorted(str(k.value) for k in collection.receipts), "content_hash": collection.content_hash})
+        _emit(
+            {
+                "content_hash": collection.content_hash,
+                "planned_chunks": getattr(collection, "planned_chunks", 0) or len(plan.chunks),
+                "completed_chunks": getattr(collection, "completed_chunks", 0),
+                "previously_completed_chunks": getattr(collection, "previously_completed_chunks", 0),
+                "pending_chunks": getattr(collection, "pending_chunks", 0),
+                "provider_error_chunks": getattr(collection, "provider_error_chunks", 0),
+                "missing_session_chunks": getattr(collection, "missing_session_chunks", 0),
+                "receipts": sorted(str(k.value) for k in collection.receipts),
+                "report_path": str(getattr(collection, "report_path", "")),
+            }
+        )
         return 0
     if args.command == "collect-dart-disclosures":
         try:
@@ -1338,18 +1349,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else None
             )
             if args.sessions:
-                session_list = tuple(date.fromisoformat(s.strip()) for s in str(args.sessions).split(",") if s.strip())
-                plan = build_historical_collection_plan(
-                    sessions=session_list,
-                    universe=tuple(
-                        {"symbol": symbol, "is_common_stock": True, "tradable_from": None, "tradable_to": None}
-                        for symbol in symbols or ()
-                    ),
+                # Manual --sessions cannot bypass ordinary-share evidence. Route
+                # the caller-supplied sessions through the same verified
+                # master/market classifier; a preferred ticker is rejected here
+                # rather than accepted through a caller-supplied boolean.
+                if not symbols:
+                    raise PITDataError("manual --sessions planning requires --symbols for verified classification")
+                session_list = tuple(
+                    date.fromisoformat(s.strip()) for s in str(args.sessions).split(",") if s.strip()
+                )
+                if not session_list:
+                    raise PITDataError("manual --sessions list is empty")
+                verified = build_historical_collection_plan_from_bronze(
+                    bronze_root=Path(args.bronze_root),
                     start=date.fromisoformat(str(args.coverage_start)),
                     end=date.fromisoformat(str(args.coverage_end)),
                     chunk_size=int(args.chunk_size),
+                    symbols=symbols,
                     artifact_root=Path(args.artifact_root),
                 )
+                wanted_cells = {(s, session) for s in symbols for session in session_list}
+                covered = {(c.symbol, session) for c in verified.chunks for session in c.sessions}
+                missing_cells = sorted(wanted_cells - covered)
+                if missing_cells:
+                    raise PITDataError(
+                        f"manual sessions rejected by verified master classification: {missing_cells[0][0]}:{missing_cells[0][1].isoformat()}"
+                    )
+                plan = verified
             else:
                 plan = build_historical_collection_plan_from_bronze(
                     bronze_root=Path(args.bronze_root),
@@ -1361,7 +1387,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
         except (PITDataError, ValueError, OSError):
             return 1
-        _emit({"plan_id": plan.plan_id, "chunks": len(plan.chunks)})
+        try:
+            receipt_raw = json.loads((Path(args.artifact_root) / f"{plan.plan_id}.json").read_text(encoding="utf-8"))
+            requested_symbol_sessions = int(receipt_raw.get("requested_symbol_sessions", 0))
+            non_trading = int(receipt_raw.get("non_trading_symbol_sessions", 0))
+            plan_hash = str(receipt_raw.get("content_hash", plan.content_hash))
+        except (OSError, ValueError, KeyError):
+            requested_symbol_sessions = sum(len(c.sessions) for c in plan.chunks)
+            non_trading = 0
+            plan_hash = plan.content_hash
+        _emit(
+            {
+                "plan_id": plan.plan_id,
+                "chunks": len(plan.chunks),
+                "requested_symbols": sorted({c.symbol for c in plan.chunks}),
+                "requested_symbol_sessions": requested_symbol_sessions,
+                "non_trading_symbol_sessions": non_trading,
+                "plan_hash": plan_hash,
+            }
+        )
         return 0
     if args.command == "resume":
         try:
