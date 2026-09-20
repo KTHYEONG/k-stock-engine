@@ -409,6 +409,12 @@ class CollectionArtifact:
     report_path: Path
     page_receipts: Mapping[str, tuple[BronzeReceipt, ...]] | None = None
     receipt_count: int = 0
+    planned_chunks: int = 0
+    completed_chunks: int = 0
+    previously_completed_chunks: int = 0
+    pending_chunks: int = 0
+    provider_error_chunks: int = 0
+    missing_session_chunks: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -456,6 +462,93 @@ def _persist_response(
     )
 
 
+def _parse_flow_session(value: Any) -> date:
+    text = str(value or "").strip().replace("/", "-")
+    if len(text) == 8 and text.isdigit():
+        text = f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError as exc:
+        raise PITDataError(f"investor flow has malformed session: {value!r}") from exc
+
+
+def _flow_unit_value(record: dict[str, Any], field: str) -> float:
+    raw = record.get(field)
+    if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+        raise PITDataError(f"investor flow is missing KRW unit field {field}")
+    if isinstance(raw, bool):
+        raise PITDataError(f"investor flow has invalid KRW unit field {field}")
+    try:
+        parsed = float(str(raw).replace(",", "").strip())
+    except (TypeError, ValueError) as exc:
+        raise PITDataError(f"investor flow has invalid KRW unit field {field}") from exc
+    import math as _math
+
+    if not _math.isfinite(parsed):
+        raise PITDataError(f"investor flow has invalid KRW unit field {field}")
+    return parsed
+
+
+def _validate_flow_pages(
+    *, chunk_symbol: str, norm_provider: str, pages: tuple[dict[str, Any], ...]
+) -> dict[str, dict[str, float]]:
+    """Validate one chunk batch; extra symbols/dates are ignored for coverage.
+
+    Returns canonical {(session): values} for the requested symbol. Conflicting
+    duplicates raise instead of resolving by input order.
+    """
+    canonical: dict[str, dict[str, float]] = {}
+    for page in pages:
+        if not isinstance(page, dict):
+            raise PITDataError("investor flow page is empty; certification blocked")
+        page_provider = str(page.get("provider") or page.get("_source_provider") or "").strip().lower()
+        if page_provider and page_provider != norm_provider:
+            raise PITDataError(f"investor flow provider mismatch: {page_provider!r}")
+        records = page.get("records")
+        if records is None:
+            raise PITDataError("investor flow response is empty; certification blocked")
+        if not isinstance(records, list):
+            raise PITDataError("investor flow page is empty; certification blocked")
+        for record in records:
+            if not isinstance(record, dict):
+                raise PITDataError("investor flow page is empty; certification blocked")
+            rec_provider = str(record.get("_source_provider") or "").strip().lower()
+            if rec_provider and rec_provider != norm_provider:
+                raise PITDataError(f"investor flow provider mismatch: {rec_provider!r}")
+            ticker = str(record.get("ticker") or record.get("symbol") or "").strip()
+            if not ticker:
+                raise PITDataError("investor flow record is missing symbol")
+            if ticker != chunk_symbol:
+                continue
+            raw_session = record.get("session") or record.get("date") or record.get("dt") or record.get("stck_bsop_date")
+            if raw_session in (None, ""):
+                raise PITDataError("investor flow has malformed session: missing")
+            session = _parse_flow_session(raw_session).isoformat()
+            values = {
+                "foreign_net_value": _flow_unit_value(record, "foreign_net_value"),
+                "institution_net_value": _flow_unit_value(record, "institution_net_value"),
+                "retail_net_value": _flow_unit_value(record, "retail_net_value"),
+            }
+            if session in canonical and canonical[session] != values:
+                raise PITDataError(f"conflicting duplicate investor flow for {(chunk_symbol, session)}")
+            canonical.setdefault(session, values)
+    return canonical
+
+
+def _classify_provider_failure(exc: BaseException) -> tuple[str, str]:
+    message = str(exc) if str(exc).strip() else type(exc).__name__
+    lowered = message.lower()
+    if any(token in lowered for token in ("429", "rate limit", "throttl", "too many")):
+        return "provider_error", f"rate-limited: {message}"
+    if any(token in lowered for token in ("500", "502", "503", "504", "timeout", "timed out", "server error", "connection", "network", "transient")):
+        return "provider_error", message
+    if "malformed" in lowered or "invalid session" in lowered:
+        return "provider_error", message
+    if "empty" in lowered:
+        return "provider_error", message
+    return "provider_error", message
+
+
 def collect_planned_investor_flow(
     *,
     plan: HistoricalCollectionPlan,
@@ -466,7 +559,27 @@ def collect_planned_investor_flow(
     checkpoint_store: CollectionCheckpointStore,
     allow_source_unavailable: bool = False,
 ) -> CollectionArtifact:
-    """Collect only verified investor-flow chunks and make each completion resumable."""
+    """Collect and account for every planned flow chunk without false completion.
+
+    Raw provider responses and precise negative outcomes remain auditable.
+    Only a verified response covering every required positive-volume session
+    creates a completion checkpoint. Retryable errors remain pending.
+
+    Args:
+        plan: Immutable historically eligible symbol-session requests.
+        provider: Supported source identifier and unit contract.
+        collector: Provider adapter returning dated, mapped raw pages.
+        bronze_root: Immutable evidence destination.
+        retrieved_at: Time-aware acquisition timestamp.
+        checkpoint_store: Verified per-chunk completion state.
+        allow_source_unavailable: Whether gaps are recorded and execution continues.
+
+    Returns:
+        Collection artifact with exact completed, pending, and failed counts.
+
+    Raises:
+        PITDataError: Provider, response, timestamp, or evidence is invalid.
+    """
     # provider routing: resolve_investor_flow_collector(provider, (chunk.symbol,))
     norm_provider = str(provider).strip().lower()
     if norm_provider not in ("ls", "kiwoom"):
@@ -483,92 +596,171 @@ def collect_planned_investor_flow(
     active: Any = collector
     receipts: list[BronzeReceipt] = []
     page_receipts: list[BronzeReceipt] = []
-    for chunk in plan.chunks:
+    completed = 0
+    previously_completed = 0
+    provider_errors = 0
+    missing_sessions_count = 0
+    missing_cells: list[dict[str, str]] = []
+    failures: list[dict[str, str]] = []
+    import sys as _sys
+
+    for position, chunk in enumerate(plan.chunks):
+        # One provider batch plus its receipt bytes at a time; never scan the
+        # whole Bronze tree per symbol (checkpoint lookup is a single file).
         if checkpoint_store.has_verified_receipt(plan=plan, chunk=chunk, bronze_root=bronze_root):
+            previously_completed += 1
             continue
         try:
-            pages = tuple(active.fetch_investor_flow(min(chunk.sessions), max(chunk.sessions), bronze_root=bronze_root, retrieved_at=retrieved_at, symbols=(chunk.symbol,)))
-        except PITDataError as exc:
+            pages = tuple(
+                active.fetch_investor_flow(
+                    min(chunk.sessions),
+                    max(chunk.sessions),
+                    bronze_root=bronze_root,
+                    retrieved_at=retrieved_at,
+                    symbols=(chunk.symbol,),
+                )
+            )
+        except (PITDataError, OSError, TimeoutError, ValueError) as exc:
+            _status, reason = _classify_provider_failure(exc)
             if not allow_source_unavailable:
                 raise
-            reason = str(exc)
+            provider_errors += 1
+            failures.append(
+                {"chunk_id": chunk.chunk_id, "symbol": chunk.symbol, "status": _status, "reason": reason}
+            )
+            missing_cells.extend(
+                {"ticker": chunk.symbol, "session": day.isoformat(), "reason": _status}
+                for day in chunk.sessions
+            )
             negative = json.dumps(
                 {
                     "provider": norm_provider,
                     "endpoint": endpoint,
                     "symbol": chunk.symbol,
                     "sessions": [value.isoformat() for value in chunk.sessions],
-                    "status": "source_unavailable" if "missing requested session" in reason else "provider_error",
+                    "status": _status,
                     "reason": reason,
                 },
                 sort_keys=True,
             ).encode("utf-8")
-            receipt = store.import_bytes(
-                negative,
-                kind=EvidenceKind.INVESTOR_FLOW,
-                retrieved_at=retrieved_at,
-                source_label=f"{norm_provider}:source-unavailable:{chunk.symbol}:{chunk.chunk_id}",
-            )
-            # A negative receipt records a deterministic provider gap, but it
-            # must not satisfy the resumability proof for a completed chunk.
-            page_receipts.append(receipt)
-            continue
-        expected_sessions = {value.isoformat() for value in chunk.sessions}
-        observed_sessions: set[str] = set()
-        for page in pages:
-            records = page.get("records", [])
-            if not isinstance(records, list):
-                continue
-            for record in records:
-                if isinstance(record, dict) and str(record.get("ticker")) == chunk.symbol:
-                    observed_sessions.add(str(record.get("session")))
-        if not expected_sessions.issubset(observed_sessions):
-            missing = ",".join(sorted(expected_sessions - observed_sessions))
-            if allow_source_unavailable:
-                negative = json.dumps(
-                    {
-                        "provider": norm_provider,
-                        "endpoint": endpoint,
-                        "symbol": chunk.symbol,
-                        "sessions": [value.isoformat() for value in chunk.sessions],
-                        "status": "source_unavailable",
-                        "missing_sessions": missing.split(","),
-                    },
-                    sort_keys=True,
-                ).encode("utf-8")
-                page_receipts.append(
-                    store.import_bytes(
-                        negative,
-                        kind=EvidenceKind.INVESTOR_FLOW,
-                        retrieved_at=retrieved_at,
-                        source_label=f"{norm_provider}:source-unavailable:{chunk.symbol}:{chunk.chunk_id}",
-                    )
+            page_receipts.append(
+                store.import_bytes(
+                    negative,
+                    kind=EvidenceKind.INVESTOR_FLOW,
+                    retrieved_at=retrieved_at,
+                    source_label=f"{norm_provider}:{_status}:{chunk.symbol}:{chunk.chunk_id}",
                 )
-                continue
-            raise PITDataError(f"{norm_provider} investor flow missing requested sessions for {chunk.symbol}: {missing}")
+            )
+            continue
+        if not pages:
+            if not allow_source_unavailable:
+                raise PITDataError(f"{norm_provider} investor flow response is empty for {chunk.symbol}")
+            provider_errors += 1
+            failures.append(
+                {"chunk_id": chunk.chunk_id, "symbol": chunk.symbol, "status": "provider_error", "reason": "empty response"}
+            )
+            missing_cells.extend(
+                {"ticker": chunk.symbol, "session": day.isoformat(), "reason": "provider_error"}
+                for day in chunk.sessions
+            )
+            negative = json.dumps(
+                {
+                    "provider": norm_provider,
+                    "endpoint": endpoint,
+                    "symbol": chunk.symbol,
+                    "sessions": [value.isoformat() for value in chunk.sessions],
+                    "status": "provider_error",
+                    "reason": "empty response",
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+            page_receipts.append(
+                store.import_bytes(
+                    negative,
+                    kind=EvidenceKind.INVESTOR_FLOW,
+                    retrieved_at=retrieved_at,
+                    source_label=f"{norm_provider}:provider_error:{chunk.symbol}:{chunk.chunk_id}",
+                )
+            )
+            continue
+        try:
+            canonical = _validate_flow_pages(
+                chunk_symbol=chunk.symbol, norm_provider=norm_provider, pages=pages
+            )
+        except PITDataError:
+            raise
+        expected = {value.isoformat() for value in chunk.sessions}
+        observed = set(canonical)
+        if not expected.issubset(observed):
+            absent = sorted(expected - observed)
+            if not allow_source_unavailable:
+                raise PITDataError(
+                    f"{norm_provider} investor flow missing requested sessions for {chunk.symbol}: {','.join(absent)}"
+                )
+            missing_sessions_count += 1
+            failures.append(
+                {
+                    "chunk_id": chunk.chunk_id,
+                    "symbol": chunk.symbol,
+                    "status": "missing_sessions",
+                    "reason": f"missing {','.join(absent)}",
+                }
+            )
+            missing_cells.extend(
+                {"ticker": chunk.symbol, "session": day, "reason": "missing_sessions"}
+                for day in absent
+            )
+            negative = json.dumps(
+                {
+                    "provider": norm_provider,
+                    "endpoint": endpoint,
+                    "symbol": chunk.symbol,
+                    "sessions": [value.isoformat() for value in chunk.sessions],
+                    "status": "missing_sessions",
+                    "missing_sessions": absent,
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+            page_receipts.append(
+                store.import_bytes(
+                    negative,
+                    kind=EvidenceKind.INVESTOR_FLOW,
+                    retrieved_at=retrieved_at,
+                    source_label=f"{norm_provider}:missing_sessions:{chunk.symbol}:{chunk.chunk_id}",
+                )
+            )
+            continue
         raw_receipts: list[BronzeReceipt] = []
         for page in pages:
             page_receipt = page.get("bronze_receipt")
             if isinstance(page_receipt, BronzeReceipt):
                 raw_receipts.append(page_receipt)
         if not raw_receipts:
-            for page in pages:
-                fallback = _persist_response(store, dict(page), kind=EvidenceKind.INVESTOR_FLOW, retrieved_at=retrieved_at)
-                raw_receipts.append(fallback)
+            raw_receipts.extend(
+                _persist_response(store, dict(page), kind=EvidenceKind.INVESTOR_FLOW, retrieved_at=retrieved_at)
+                for page in pages
+            )
         digest = hashlib.sha256()
         for receipt in sorted(raw_receipts, key=lambda value: value.content_hash):
             digest.update(receipt.content_hash.encode("utf-8"))
             digest.update(b"\x00")
             page_receipts.append(receipt)
-        receipt_digest = digest.hexdigest()
         checkpoint_store.mark_complete(
             plan_id=plan.plan_id,
             chunk_id=chunk.chunk_id,
-            receipt_digest=receipt_digest,
+            receipt_digest=digest.hexdigest(),
             plan_digest=plan.content_hash,
             receipt_hashes=tuple(receipt.content_hash for receipt in raw_receipts),
         )
         receipts.extend(raw_receipts)
+        completed += 1
+        if (position + 1) % 100 == 0:
+            _sys.stderr.write(
+                f"investor_flow {position + 1}/{len(plan.chunks)} completed={completed} pending={provider_errors + missing_sessions_count}\n"
+            )
+    pending = provider_errors + missing_sessions_count
+    if completed + previously_completed + pending != len(plan.chunks):
+        raise PITDataError("collection report does not reconcile to the immutable plan")
     digest = hashlib.sha256()
     for receipt in sorted(page_receipts, key=lambda value: value.content_hash):
         digest.update(receipt.content_hash.encode("utf-8"))
@@ -581,12 +773,20 @@ def collect_planned_investor_flow(
         json.dumps(
             {
                 "plan_id": plan.plan_id,
+                "plan_digest": plan.content_hash,
                 "content_hash": content_hash,
                 "provider": norm_provider,
                 "endpoint": endpoint,
                 "coverage_start": plan.coverage_start.isoformat(),
                 "coverage_end": plan.coverage_end.isoformat(),
-                "completed_chunks": len(plan.chunks),
+                "planned_chunks": len(plan.chunks),
+                "completed_chunks": completed,
+                "previously_completed_chunks": previously_completed,
+                "pending_chunks": pending,
+                "provider_error_chunks": provider_errors,
+                "missing_session_chunks": missing_sessions_count,
+                "missing_cells": missing_cells,
+                "failures": failures,
                 "page_receipts": [receipt.content_hash for receipt in page_receipts],
             },
             indent=2,
@@ -605,23 +805,46 @@ def collect_planned_investor_flow(
         report_path=report_path,
         page_receipts={EvidenceKind.INVESTOR_FLOW.value: tuple(page_receipts)},
         receipt_count=len(page_receipts),
+        planned_chunks=len(plan.chunks),
+        completed_chunks=completed,
+        previously_completed_chunks=previously_completed,
+        pending_chunks=pending,
+        provider_error_chunks=provider_errors,
+        missing_session_chunks=missing_sessions_count,
     )
+
+
+def _find_uncached_corp_codes(
+    bronze_root: Path, *, corp_codes: tuple[str, ...], start: date, end: date
+) -> tuple[str, ...]:
+    needed = {str(c).strip() for c in corp_codes if str(c).strip()}
+    if not needed:
+        return ()
+    disclosures_dir = Path(bronze_root) / "disclosures"
+    if not disclosures_dir.exists():
+        return tuple(sorted(needed))
+    for payload_path in disclosures_dir.glob("*/payload.json"):
+        if not needed:
+            break
+        try:
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            stored_code = str((payload.get("corp_code") if isinstance(payload, dict) else None) or "").strip()
+            if stored_code in needed:
+                stored_start = date.fromisoformat(str((payload.get("start") if isinstance(payload, dict) else None) or "").strip())
+                stored_end = date.fromisoformat(str((payload.get("end") if isinstance(payload, dict) else None) or "").strip())
+                if stored_start <= start and stored_end >= end:
+                    needed.remove(stored_code)
+        except (OSError, ValueError):
+            continue
+    return tuple(sorted(needed))
 
 
 def _corp_code_disclosure_is_cached(bronze_root: Path, *, corp_code: str, start: date, end: date) -> bool:
     target = str(corp_code).strip()
-    disclosures_dir = Path(bronze_root) / "disclosures"
-    for payload_path in sorted(disclosures_dir.glob("*/payload.json")):
-        try:
-            payload = json.loads(payload_path.read_text(encoding="utf-8"))
-            stored_code = str((payload.get("corp_code") if isinstance(payload, dict) else None) or "").strip()
-            stored_start = date.fromisoformat(str((payload.get("start") if isinstance(payload, dict) else None) or "").strip())
-            stored_end = date.fromisoformat(str((payload.get("end") if isinstance(payload, dict) else None) or "").strip())
-            if stored_code == target and stored_start <= start and stored_end >= end:
-                return True
-        except (OSError, ValueError):
-            continue
-    return False
+    if not target:
+        return False
+    uncached = _find_uncached_corp_codes(bronze_root, corp_codes=(target,), start=start, end=end)
+    return len(uncached) == 0
 
 
 def collect_dart_disclosures(
@@ -640,11 +863,7 @@ def collect_dart_disclosures(
         raise PITDataError("coverage_start must not be after coverage_end")
     if corp_codes is not None:
         normalized = tuple(str(c).strip() for c in corp_codes if str(c).strip())
-        to_fetch = tuple(
-            c
-            for c in normalized
-            if not _corp_code_disclosure_is_cached(bronze_root, corp_code=c, start=start, end=end)
-        )
+        to_fetch = _find_uncached_corp_codes(bronze_root, corp_codes=normalized, start=start, end=end)
         if not to_fetch:
             content_hash = hashlib.sha256().hexdigest()
             artifact_dir = bronze_root.parent / "artifacts" / "collections"
