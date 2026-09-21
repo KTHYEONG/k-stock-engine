@@ -398,6 +398,8 @@ def normalize_stock_evidence(
     streamed_tables: frozenset[SilverTable] = frozenset(),
     streamed_corporate_actions: list[dict[str, Any]] | None = None,
 ) -> tuple[Mapping[SilverTable, pl.DataFrame], CertificationReport]:
+    from src.data.ordinary_universe import classify_krx_master_row
+
     if decision_time.tzinfo is None:
         raise PITDataError("decision_time must be timezone-aware")
     if calendar is not None and not calendar.sessions:
@@ -473,8 +475,8 @@ def normalize_stock_evidence(
         if key in seen_master:
             valid_from = datetime.combine(valid_from.date(), time(9, 0), tzinfo=KRX_TZ)
         seen_master.add(key)
-        kind_name = str(rec.get("KIND_STKCERT_TP_NM") or "")
-        master_rows.append({"instrument_id": instrument_id, "ticker": ticker, "source_security_id": _raw_isin(rec), "company_id": str(rec.get("company_id") or rec.get("corp_code") or ticker), "market": str(_required_value(rec, "market", "MKT_TP_NM")), "sector": str(rec.get("sector") or rec.get("sector_name") or "__UNKNOWN__"), "listing_date": valid_from, "delisting_date": rec.get("delisting_date") or rec.get("delisted_on"), "share_class": str(rec.get("share_class") or ("common" if kind_name == "보통주" or bool(rec.get("is_common_stock")) else "other")), "status": str(rec.get("status") or "listed"), "valid_from": valid_from, "valid_to": rec.get("valid_to") or valid_from, "available_at": _avail(EvidenceKind.SECURITY_MASTER), "source_hash": _hash(EvidenceKind.SECURITY_MASTER)})
+        eligible, exclusion_reason = classify_krx_master_row(rec)
+        master_rows.append({"instrument_id": instrument_id, "ticker": ticker, "source_security_id": _raw_isin(rec), "company_id": str(rec.get("company_id") or rec.get("corp_code") or ticker), "market": str(_required_value(rec, "market", "MKT_TP_NM")), "sector": str(rec.get("sector") or rec.get("sector_name") or "__UNKNOWN__"), "listing_date": valid_from, "delisting_date": rec.get("delisting_date") or rec.get("delisted_on"), "share_class": "common" if eligible else "other", "ordinary_equity_eligible": eligible, "ordinary_equity_exclusion_reason": exclusion_reason, "share_kind": str(rec.get("KIND_STKCERT_TP_NM") or ""), "security_group": str(rec.get("SECUGRP_NM") or ""), "status": str(rec.get("status") or "listed"), "valid_from": valid_from, "valid_to": rec.get("valid_to") or valid_from, "available_at": _avail(EvidenceKind.SECURITY_MASTER), "source_hash": _hash(EvidenceKind.SECURITY_MASTER)})
     if SilverTable.SECURITY_MASTER not in streamed_tables:
         tables[SilverTable.SECURITY_MASTER] = pl.DataFrame(master_rows)
 

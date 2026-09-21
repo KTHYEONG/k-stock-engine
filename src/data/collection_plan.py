@@ -9,7 +9,10 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Final, Literal
 
+from src.data.runtime import DataRuntime
 from src.data.schemas import EvidenceKind, PITDataError
+from src.data.scope_coverage import ScopeCoverageReport
+from src.data.scoped_ingestion import FLOW_SOURCE
 from src.strategy.universe import UniverseDecision
 
 PLAN_ARTIFACT_DIR = Path("data/artifacts/collection-plans")
@@ -1089,8 +1092,11 @@ __all__ = [
     "build_historical_collection_plan",
     "build_historical_collection_plan_from_bronze",
     "build_historical_collection_plan_from_universe_decisions",
+    "build_scoped_flow_plan",
     "derive_historical_collection_window",
     "load_collection_plan",
+    "scoped_checkpoint_dir",
+    "scoped_plan_dir",
 ]
 
 
@@ -1207,3 +1213,89 @@ def audit_historical_readiness(
         action_provenance_ok=True,
         status_provenance_ok=True,
     )
+
+
+def scoped_plan_dir(*, runtime: DataRuntime) -> Path:
+    """Collection plan artifacts namespaced under the workspace state root."""
+    return runtime.workspace.state_root / "collection-plans"
+
+
+def scoped_checkpoint_dir(*, runtime: DataRuntime) -> Path:
+    """Collection checkpoints namespaced under the workspace state root."""
+    return runtime.workspace.state_root / "collection-checkpoints"
+
+
+def build_scoped_flow_plan(
+    *, runtime: DataRuntime, report: ScopeCoverageReport, max_sessions_per_request: int
+) -> HistoricalCollectionPlan:
+    """Chunk missing investor-flow sessions from a coverage report with adapter session limits."""
+    if (
+        not isinstance(max_sessions_per_request, int)
+        or isinstance(max_sessions_per_request, bool)
+        or max_sessions_per_request < 1
+    ):
+        raise PITDataError("max_sessions_per_request must be a positive integer")
+    scope = runtime.scope
+    pending: dict[str, list[date]] = {}
+    for item in (*report.missing, *report.unresolved):
+        if item.source != FLOW_SOURCE:
+            continue
+        symbol, _, session_text = item.natural_key.partition(":")
+        if not symbol.strip() or not session_text.strip():
+            raise PITDataError(f"invalid investor flow natural key {item.natural_key!r}")
+        try:
+            session = date.fromisoformat(session_text)
+        except ValueError as exc:
+            raise PITDataError(f"invalid investor flow natural key {item.natural_key!r}") from exc
+        pending.setdefault(symbol, []).append(session)
+    chunks: list[PlanChunk] = []
+    for symbol in sorted(pending):
+        ordered_sessions = sorted(set(pending[symbol]))
+        for index in range(0, len(ordered_sessions), max_sessions_per_request):
+            window = tuple(ordered_sessions[index : index + max_sessions_per_request])
+            chunks.append(
+                PlanChunk(
+                    chunk_id=f"{symbol}-{index // max_sessions_per_request:04d}",
+                    symbol=symbol,
+                    sessions=window,
+                )
+            )
+    digest = hashlib.sha256()
+    digest.update(scope.content_hash.encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(
+        json.dumps([f"{chunk.symbol}:{day.isoformat()}" for chunk in chunks for day in chunk.sessions]).encode("utf-8")
+    )
+    digest.update(b"\x00")
+    digest.update(str(max_sessions_per_request).encode("utf-8"))
+    plan_id = f"scoped-flow-{digest.hexdigest()[:16]}"
+    plan = HistoricalCollectionPlan(
+        plan_id=plan_id,
+        coverage_start=scope.completed_start,
+        coverage_end=scope.completed_end,
+        chunk_size=max_sessions_per_request,
+        chunks=tuple(chunks),
+        content_hash=digest.hexdigest(),
+    )
+    root = scoped_plan_dir(runtime=runtime)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / f"{plan_id}.json").write_text(
+        json.dumps(
+            {
+                "plan_id": plan_id,
+                "content_hash": plan.content_hash,
+                "scope_hash": scope.content_hash,
+                "coverage_start": plan.coverage_start.isoformat(),
+                "coverage_end": plan.coverage_end.isoformat(),
+                "chunk_size": max_sessions_per_request,
+                "chunks": [
+                    {"chunk_id": chunk.chunk_id, "symbol": chunk.symbol, "sessions": [day.isoformat() for day in chunk.sessions]}
+                    for chunk in chunks
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return plan

@@ -61,7 +61,7 @@ def test_compounding_v2_dispatch_end_to_end_with_pit_inputs(tmp_path, monkeypatc
         return pl.DataFrame(schema={'instrument_id': pl.String, 'action_type': pl.String, 'effective_session': pl.Datetime(time_zone='Asia/Seoul'), 'available_at': pl.Datetime(time_zone='Asia/Seoul'), 'evidence_status': pl.String})
 
     import src.data.gold_artifacts as gold_artifacts_mod
-    from src.data.backtest_run_manifest import build_backtest_run_manifest, write_backtest_run_manifest
+    from src.data.backtest_run_manifest import build_legacy_backtest_run_manifest, write_legacy_backtest_run_manifest
 
     score_days = [day.replace(hour=15, minute=30) for day in all_days[200:205]]
     universe_df = pl.DataFrame({
@@ -89,7 +89,7 @@ def test_compounding_v2_dispatch_end_to_end_with_pit_inputs(tmp_path, monkeypatc
     monkeypatch.setattr(gold_artifacts_mod, 'resolve_gold_artifact_bundle', fake_resolve)
     monkeypatch.setattr(gold_artifacts_mod, 'load_gold_artifact_frames', lambda *, bundle, decision_time: (universe_df, universe_df, scores_df))
 
-    run_manifest_obj = build_backtest_run_manifest(
+    run_manifest_obj = build_legacy_backtest_run_manifest(
         silver_root=tmp_path / 'silver',
         gold_root=tmp_path / 'gold',
         silver_dataset_ids={table: f'{table.value}-id' for table in SilverTable},
@@ -99,7 +99,7 @@ def test_compounding_v2_dispatch_end_to_end_with_pit_inputs(tmp_path, monkeypatc
         strategy_id='compounding-v2',
         policy_versions={'market_inputs': 'korean-equity-market-inputs-v2'},
     )
-    manifest_path = write_backtest_run_manifest(manifest=run_manifest_obj, artifact_root=tmp_path / 'artifacts')
+    manifest_path = write_legacy_backtest_run_manifest(manifest=run_manifest_obj, artifact_root=tmp_path / 'artifacts')
 
     code = _dispatch_backtest(
         Namespace(

@@ -12,7 +12,9 @@ from typing import Any, Protocol
 from src.data.bronze import BronzeStore
 from src.data.collection_plan import CollectionCheckpointStore, HistoricalCollectionPlan
 from src.data.lifecycle import LifecycleCandidate, parse_kind_lifecycle_notice
+from src.data.receipt_catalog import EvidenceStatus
 from src.data.schemas import BronzeReceipt, EvidenceKind, PITDataError
+from src.data.scoped_ingestion import FACT_SOURCE, ScopedBronzeWriter, ScopedRawPayload, dart_fact_natural_key
 from src.integrations.dart.xbrl import DartXbrlCollector  # noqa: F401
 from src.integrations.investor_flow_router import resolve_investor_flow_collector  # noqa: F401
 from src.integrations.kis.investor_flow import KisInvestorFlowCollector
@@ -444,6 +446,65 @@ class KrxDataPort(Protocol):
 
 class DartFactPort(Protocol):
     def fetch_fact_snapshot(self, start: date, end: date) -> dict[str, Any]: ...
+
+
+def scoped_status_for_page(page: RawProviderResponse) -> EvidenceStatus:
+    """Map provider page markers to the retained evidence status."""
+    if str(page.get("status") or "").strip() == "extraction_failed":
+        return EvidenceStatus.EXTRACTION_FAILED
+    if str(page.get("source_kind") or "").strip() == "unavailable":
+        return EvidenceStatus.PROVIDER_UNAVAILABLE
+    records = page.get("records")
+    if isinstance(records, list) and records:
+        return EvidenceStatus.SUCCESS
+    return EvidenceStatus.EMPTY
+
+
+def dart_fact_scoped_payload(*, page: RawProviderResponse, retrieved_at: datetime) -> ScopedRawPayload:
+    """Convert one validated DART fact page to a scoped payload with its adapter natural key."""
+    identity = page.get("identity")
+    identity_map = identity if isinstance(identity, dict) else {}
+    corp_code = str(identity_map.get("corp_code") or page.get("corp_code") or "").strip()
+    biz_year = str(identity_map.get("biz_year") or page.get("biz_year") or "").strip()
+    reprt_code = str(identity_map.get("reprt_code") or page.get("reprt_code") or "").strip()
+    if not corp_code or not biz_year or not reprt_code:
+        raise PITDataError("DART fact page is missing its adapter natural key")
+    fiscal_period = str(identity_map.get("fiscal_period") or page.get("fiscal_period") or "").strip() or None
+    published = str(identity_map.get("published_at") or page.get("published_at") or "").strip()
+    as_of = date.fromisoformat(published[:10]) if published else retrieved_at.date()
+    natural_key = dart_fact_natural_key(corp_code=corp_code, biz_year=biz_year, reprt_code=reprt_code)
+    return ScopedRawPayload(
+        kind=EvidenceKind.FINANCIAL_FACTS,
+        source=FACT_SOURCE,
+        natural_key=natural_key,
+        as_of=as_of,
+        fiscal_period=fiscal_period,
+        status=scoped_status_for_page(page),
+        payload=json.dumps(dict(page), sort_keys=True, ensure_ascii=False).encode("utf-8"),
+        retrieved_at=retrieved_at,
+        source_label=f"opendart:fnlttSinglAcntAll:{natural_key}",
+    )
+
+
+def krx_market_scoped_payload(*, page: RawProviderResponse, session: date, retrieved_at: datetime) -> ScopedRawPayload:
+    """Convert one validated KRX daily-market page to a scoped payload."""
+    return ScopedRawPayload(
+        kind=EvidenceKind.DAILY_MARKET,
+        source="krx_daily_market",
+        natural_key=session.isoformat(),
+        as_of=session,
+        fiscal_period=None,
+        status=EvidenceStatus.SUCCESS,
+        payload=json.dumps(dict(page), sort_keys=True, ensure_ascii=False).encode("utf-8"),
+        retrieved_at=retrieved_at,
+        source_label=f"krx:daily-market:{session.isoformat()}",
+    )
+
+
+def persist_scoped_payload(*, scoped_writer: ScopedBronzeWriter, scoped_payload: ScopedRawPayload) -> BronzeReceipt:
+    """Persist one validated provider response through the scoped writer."""
+    receipt = scoped_writer.persist(scoped_payload)
+    return receipt.bronze_receipt
 
 
 def _persist_response(
@@ -946,6 +1007,7 @@ def collect_dart_financial_facts(
     identities: tuple[dict[str, str], ...],
     bronze_root: Path,
     retrieved_at: datetime,
+    scoped_writer: ScopedBronzeWriter | None = None,
 ) -> CollectionArtifact:
     """Persist full-statement DART responses before downstream fact normalization."""
     from src.data.dart_documents import DartDocumentStore
@@ -996,6 +1058,12 @@ def collect_dart_financial_facts(
     receipt, page_receipts = _persist_pages(
         store, persisted, kind=EvidenceKind.FINANCIAL_FACTS, retrieved_at=retrieved_at
     )
+    if scoped_writer is not None:
+        for scoped_page in persisted:
+            persist_scoped_payload(
+                scoped_writer=scoped_writer,
+                scoped_payload=dart_fact_scoped_payload(page=scoped_page, retrieved_at=retrieved_at),
+            )
     standardized = sum(1 for p in persisted if p.get("source_kind") == "opendart_standard")
     legacy_document = sum(
         1
@@ -1174,6 +1242,7 @@ def collect_daily_market_sessions(
     krx: Any,
     bronze_root: Path,
     retrieved_at: datetime,
+    scoped_writer: ScopedBronzeWriter | None = None,
 ) -> CollectionArtifact:
     """Collect missing KRX daily-market sessions as per-session Bronze receipts (float64, JSON Bronze)."""
     if retrieved_at.tzinfo is None:
@@ -1214,6 +1283,7 @@ def collect_daily_market_sessions(
     to_fetch = tuple(day for day in requested if day not in existing)
     store = BronzeStore(bronze_path)
     fresh: dict[date, BronzeReceipt] = {}
+    scoped_pages: dict[date, RawProviderResponse] = {}
     if to_fetch:
         start, end = min(to_fetch), max(to_fetch)
         seen_pages: set[date] = set()
@@ -1232,6 +1302,7 @@ def collect_daily_market_sessions(
                 seen_pages.add(sess)
                 _validate_daily_market_page(raw, session=sess)
                 text = json.dumps(dict(raw), sort_keys=True, ensure_ascii=False)
+                scoped_pages[sess] = dict(raw)
                 fresh[sess] = store.import_bytes(
                     text.encode("utf-8"),
                     kind=EvidenceKind.DAILY_MARKET,
@@ -1247,6 +1318,14 @@ def collect_daily_market_sessions(
         missing_pages = sorted(wanted - seen_pages)
         if missing_pages:
             raise PITDataError(f"KRX daily market missing requested sessions: {missing_pages[0]}; certification blocked")
+    if scoped_writer is not None:
+        for scoped_session in sorted(scoped_pages):
+            persist_scoped_payload(
+                scoped_writer=scoped_writer,
+                scoped_payload=krx_market_scoped_payload(
+                    page=scoped_pages[scoped_session], session=scoped_session, retrieved_at=retrieved_at
+                ),
+            )
     ordered = tuple({**existing, **fresh}[day] for day in requested)
     digest = hashlib.sha256()
     for item in sorted(ordered, key=lambda value: value.content_hash):

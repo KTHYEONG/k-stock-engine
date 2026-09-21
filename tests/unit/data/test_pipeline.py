@@ -43,6 +43,12 @@ import inspect
 
 import src.data.pipeline as pipeline
 
+
+def test_pipeline_materialization_executes_legacy_manifest_write_path(tmp_path, monkeypatch) -> None:
+    from tests.unit.data.test_replay import test_materialize_backtest_inputs_bounded_success
+
+    test_materialize_backtest_inputs_bounded_success(tmp_path, monkeypatch)
+
 def test_pipeline_requires_lifecycle_dataset_id():
     source = inspect.getsource(pipeline.materialize_backtest_inputs)
     assert 'not (Path(silver_root) / table.value).exists()' not in source

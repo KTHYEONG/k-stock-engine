@@ -1823,6 +1823,8 @@ def _canonical_master_row(
     record: dict[str, Any], *, available_at: datetime, source_hash: str, fallback_session: datetime
 ) -> dict[str, Any]:
     """Map one security-master record without retaining its source batch."""
+    from src.data.ordinary_universe import classify_krx_master_row
+
     ticker = str(
         _required_row_value(record, "ticker", "isu_cd", "ISU_SRT_CD", "source_identifier")
     ).strip()
@@ -1841,6 +1843,7 @@ def _canonical_master_row(
         if raw not in (None, ""):
             listing_date = _as_krx_datetime(raw)
             break
+    eligible, exclusion_reason = classify_krx_master_row(record)
     return {
         "instrument_id": instrument_id,
         "ticker": ticker,
@@ -1852,7 +1855,11 @@ def _canonical_master_row(
         "sector": str(record.get("sector") or record.get("sector_name") or "__UNKNOWN__"),
         "listing_date": listing_date,
         "delisting_date": record.get("delisting_date") or record.get("delisted_on"),
-        "share_class": str(record.get("share_class") or "common"),
+        "share_class": "common" if eligible else "other",
+        "ordinary_equity_eligible": eligible,
+        "ordinary_equity_exclusion_reason": exclusion_reason,
+        "share_kind": str(record.get("KIND_STKCERT_TP_NM") or ""),
+        "security_group": str(record.get("SECUGRP_NM") or ""),
         # Only an explicitly marked KRX listed-population snapshot can prove
         # a missing status means listed. Generic or legacy master records
         # remain unknown rather than acquiring an inferred lifecycle state.
