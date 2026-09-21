@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_DART_COLLECTION_POLICY_UNIFICATION",
+      "date": "2026-09-21",
+      "adr_id": "ADR_20260921_DART_COLLECTION_POLICY_UNIFICATION",
+      "domain": "data",
+      "title": "OpenDART 수집 정책 단일화",
+      "why": "분리된 quota·pace·worker 설정과 endpoint별 여유 계산이 수집 속도와 quota 안전성을 동시에 보장하지 못했습니다.",
+      "resolution": "Scope 설정을 단일 정책으로 삼고 provider 전체 호출 합산·예약선·1초 pace·단일 worker·quota bounded batch 실행을 연결했습니다.",
+      "impact": "DART 백필은 재시작 가능하고 quota 예약분을 보존하면서 기존보다 빠른 일관된 수집 경로를 사용합니다.",
+      "caveat": "현재 남은 DART filing identity는 별도 quota 일자에서 새 정책으로 수집해야 합니다."
+    },
+    {
       "task_id": "TASK_KR_SWING_2019_DATA_REBUILD",
       "date": "2026-09-21",
       "adr_id": "ADR_20260921_KR_SWING_2019_DATA_REBUILD",

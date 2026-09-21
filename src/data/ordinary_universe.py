@@ -16,6 +16,7 @@ from typing import Any
 import polars as pl
 
 from src.core.time import KRX_TZ
+from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog
 from src.data.schemas import BronzeReceipt, EvidenceKind, PITDataError
 
 POLICY_VERSION = "krx-ordinary-equity-v1"
@@ -195,6 +196,46 @@ def dated_master_receipts(bronze_root: Path, *, sessions: Iterable[date]) -> tup
     return tuple(sorted(receipts, key=lambda receipt: receipt.source_path))
 
 
+def catalog_master_receipts(
+    catalog: ReceiptCatalog, *, sessions: Iterable[date]
+) -> tuple[BronzeReceipt, ...]:
+    """Resolve one successful, dated master receipt per requested session.
+
+    Scope rebasing retains immutable raw bytes while assigning its own source
+    provenance.  The catalog carries the natural date key, so it is the
+    authoritative selector for that layout.
+    """
+    requested = frozenset(sessions)
+    if not requested:
+        raise PITDataError("ordinary universe requires requested sessions")
+    entries = catalog.latest(
+        source="krx_security_master",
+        natural_keys={session.isoformat() for session in requested},
+    )
+    receipts: list[BronzeReceipt] = []
+    for session in sorted(requested):
+        entry = entries.get(session.isoformat())
+        if entry is None or entry.status is not EvidenceStatus.SUCCESS:
+            raise PITDataError(f"missing security_master snapshot for {session}")
+        if entry.as_of != session:
+            raise PITDataError(f"security_master catalog date conflicts for {session}")
+        payload_path = Path(entry.payload_path)
+        if not payload_path.is_file():
+            raise PITDataError(f"security_master catalog payload is missing for {session}")
+        if hashlib.sha256(payload_path.read_bytes()).hexdigest() != entry.content_hash:
+            raise PITDataError(f"security_master catalog hash mismatch for {session}")
+        receipts.append(BronzeReceipt(
+            kind=EvidenceKind.SECURITY_MASTER,
+            content_hash=entry.content_hash,
+            source_path=f"KRX:historical-master:{session.isoformat()}",
+            retrieved_at=entry.retrieved_at,
+            ingested_at=entry.retrieved_at,
+            payload_path=payload_path,
+            metadata_path=payload_path.parent / "receipt.json",
+        ))
+    return tuple(receipts)
+
+
 def write_ordinary_universe_silver(
     snapshots: Iterable[OrdinaryUniverseSnapshot], *, root: Path
 ) -> Path:
@@ -256,6 +297,16 @@ def materialize_ordinary_universe_from_bronze(
     missing = requested - set(labels)
     if missing:
         raise PITDataError(f"missing security_master snapshot for {min(missing)}")
+    return write_ordinary_universe_silver(
+        (ordinary_universe_snapshot(receipt) for receipt in receipts), root=silver_root
+    )
+
+
+def materialize_ordinary_universe_from_catalog(
+    *, catalog: ReceiptCatalog, sessions: Iterable[date], silver_root: Path
+) -> Path:
+    """Materialize the ordinary-share Silver dataset from Scope receipt state."""
+    receipts = catalog_master_receipts(catalog, sessions=sessions)
     return write_ordinary_universe_silver(
         (ordinary_universe_snapshot(receipt) for receipt in receipts), root=silver_root
     )

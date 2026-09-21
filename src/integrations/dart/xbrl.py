@@ -53,6 +53,7 @@ class DartXbrlCollector:
         quota_store: ProviderQuotaStateStore | None = None,
         now: Callable[[], datetime] | None = None,
         min_interval: float | None = None,
+        daily_request_limit: int | None = None,
     ) -> None:
         key = api_key or os.getenv("OPENDART_API_KEY")
         if not key and request_json is None and request_bytes is None and client is None:
@@ -74,7 +75,11 @@ class DartXbrlCollector:
             from src.integrations.dart.client import DartApiClient
 
             self._client = DartApiClient(
-                api_key=key, quota_store=quota_store, now=now, min_interval=min_interval
+                api_key=key,
+                quota_store=quota_store,
+                now=now,
+                min_interval=min_interval,
+                daily_request_limit=daily_request_limit,
             )
         if request_bytes is not None and key is not None and self._client is None:
             from src.integrations.dart.client import DartApiClient
@@ -85,6 +90,7 @@ class DartXbrlCollector:
                 quota_store=quota_store,
                 now=now,
                 min_interval=min_interval,
+                daily_request_limit=daily_request_limit,
             )
 
     def fetch_corp_code_records(self) -> tuple[DartCorpCodeRecord, ...]:

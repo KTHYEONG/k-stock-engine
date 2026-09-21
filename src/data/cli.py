@@ -277,6 +277,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p_facts_scoped.add_argument("--filings", type=Path, required=True)
     p_facts_scoped.add_argument("--offset", type=int, default=0)
     p_facts_scoped.add_argument("--limit", type=int, default=20)
+    p_facts_scoped.add_argument("--execute", action="store_true")
+    p_facts_scoped.add_argument("--retrieved-at", type=str, required=False, default=None)
 
     p_missing_scoped = sub.add_parser(
         "collect-missing-dart-facts-scoped", help="Report scoped DART facts missing filing evidence"
@@ -437,7 +439,7 @@ def _build_scope_strategy(strategy_id: str, policy: Mapping[str, Any]) -> Any:
 def _build_dart_fact_batch_artifact(args: argparse.Namespace) -> dict[str, object]:
     """Plan one quota-bounded DART fact batch and persist its artifact under state."""
     from src.data.collection_plan import scoped_plan_dir
-    from src.data.dart_backfill import build_scoped_dart_fact_batch
+    from src.data.dart_backfill import build_scoped_dart_collector, build_scoped_dart_fact_batch
 
     runtime = _scoped_runtime(args)
     rows = _mapping_rows(_read_json_list(Path(args.filings), label="filings"), label="filings")
@@ -467,18 +469,29 @@ def _build_dart_fact_batch_artifact(args: argparse.Namespace) -> dict[str, objec
                     for item in batch.missing_without_filing
                 ],
                 "estimated_request_ceiling": batch.estimated_request_ceiling,
+                "available_request_headroom": batch.available_request_headroom,
             },
             indent=2,
             sort_keys=True,
         ),
         encoding="utf-8",
     )
-    return {
+    output: dict[str, object] = {
         "plan_id": batch.plan_id,
         "selected": len(batch.identities),
         "missing_without_filing": len(batch.missing_without_filing),
         "estimated_request_ceiling": batch.estimated_request_ceiling,
+        "available_request_headroom": batch.available_request_headroom,
     }
+    if bool(getattr(args, "execute", False)) and batch.identities:
+        collection = collect_dart_financial_facts(
+            dart=build_scoped_dart_collector(runtime=runtime),
+            identities=tuple(dict(item) for item in batch.identities),
+            bronze_root=runtime.workspace.bronze_root,
+            retrieved_at=_parse_dt(args.retrieved_at),
+        )
+        output["content_hash"] = collection.content_hash
+    return output
 
 
 def _parse_dt(value: str | None) -> datetime:

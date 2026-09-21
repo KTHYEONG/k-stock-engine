@@ -232,6 +232,19 @@ def test_verify_legacy_removal_rejects_undated_and_out_of_scope_entries(tmp_path
         verify_legacy_removal(runtime=runtime, rebase_report=stale, data_root=tmp_path / "data")
 
 
+def test_verify_legacy_removal_allows_completed_fiscal_fact_published_after_completion(tmp_path: Path) -> None:
+    runtime, report = _seed(tmp_path)
+    revision = _publish_entry(
+        runtime, tmp_path,
+        _entry(tmp_path, source="financial_facts", natural_key="annual", as_of=date(2026, 3, 31), fiscal="2025Q4"),
+    )
+    verification = verify_legacy_removal(
+        runtime=runtime, rebase_report=dataclasses.replace(report, catalog_revision_hash=revision),
+        data_root=tmp_path / "data",
+    )
+    assert verification.catalog_revision_hash == revision
+
+
 def test_verify_legacy_removal_blocks_claimed_but_missing_evidence(tmp_path: Path) -> None:
     runtime, report = _seed(tmp_path)
     bogus = RetentionDecision(

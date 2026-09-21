@@ -10,11 +10,14 @@ import pytest
 from src.data.bronze import BronzeStore
 from src.data.ordinary_universe import (
     build_ordinary_universe,
+    catalog_master_receipts,
     dated_master_receipts,
+    materialize_ordinary_universe_from_catalog,
     materialize_ordinary_universe_from_bronze,
     ordinary_universe_snapshot,
     write_ordinary_universe_silver,
 )
+from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog, ReceiptIndexEntry
 from src.data.schemas import EvidenceKind, PITDataError
 from src.data.streaming_normalization import _canonical_master_row
 
@@ -189,6 +192,61 @@ def test_full_materializer_requires_exact_days_and_streams_partitions(tmp_path) 
         materialize_ordinary_universe_from_bronze(
             bronze_root=tmp_path / "bronze", sessions=(first, second), silver_root=tmp_path / "silver-extra"
         )
+
+
+def test_catalog_materializer_uses_scope_natural_keys(tmp_path) -> None:
+    store = BronzeStore(tmp_path / "bronze")
+    first, second = date(2018, 1, 2), date(2018, 1, 3)
+    receipts = (
+        _master(store, first.isoformat(), [_row("A", "KR0000000001")]),
+        _master(store, second.isoformat(), [_row("B", "KR0000000002")]),
+    )
+    catalog = ReceiptCatalog(tmp_path / "catalog")
+    catalog.publish(tuple(
+        ReceiptIndexEntry(
+            source="krx_security_master", natural_key=day.isoformat(), as_of=day,
+            fiscal_period=None, status=EvidenceStatus.SUCCESS,
+            content_hash=receipt.content_hash, retrieved_at=receipt.retrieved_at,
+            payload_path=receipt.payload_path,
+        )
+        for day, receipt in zip((first, second), receipts, strict=True)
+    ))
+    selected = catalog_master_receipts(catalog, sessions=(second, first))
+    assert [receipt.source_path for receipt in selected] == [
+        "KRX:historical-master:2018-01-02", "KRX:historical-master:2018-01-03"
+    ]
+    output = materialize_ordinary_universe_from_catalog(
+        catalog=catalog, sessions=(first, second), silver_root=tmp_path / "silver"
+    )
+    assert (output / "session=2018-01-02" / "part.parquet").is_file()
+    with pytest.raises(PITDataError, match="missing security_master snapshot"):
+        catalog_master_receipts(catalog, sessions=(date(2018, 1, 4),))
+
+
+def test_catalog_master_receipts_rejects_empty_dates_and_tampered_entries(tmp_path) -> None:
+    store = BronzeStore(tmp_path / "bronze")
+    day = date(2018, 1, 2)
+    receipt = _master(store, day.isoformat(), [_row("A", "KR0000000001")])
+    catalog = ReceiptCatalog(tmp_path / "catalog")
+    entry = ReceiptIndexEntry(
+        source="krx_security_master", natural_key=day.isoformat(), as_of=day,
+        fiscal_period=None, status=EvidenceStatus.SUCCESS, content_hash=receipt.content_hash,
+        retrieved_at=receipt.retrieved_at, payload_path=receipt.payload_path,
+    )
+    catalog.publish((entry,))
+    with pytest.raises(PITDataError, match="requires requested sessions"):
+        catalog_master_receipts(catalog, sessions=())
+    catalog.publish((replace(entry, as_of=date(2018, 1, 3), retrieved_at=datetime(2026, 9, 21, tzinfo=UTC)),))
+    with pytest.raises(PITDataError, match="date conflicts"):
+        catalog_master_receipts(catalog, sessions=(day,))
+
+    catalog.publish((replace(entry, retrieved_at=datetime(2026, 9, 22, tzinfo=UTC)),))
+    receipt.payload_path.unlink()
+    with pytest.raises(PITDataError, match="payload is missing"):
+        catalog_master_receipts(catalog, sessions=(day,))
+    receipt.payload_path.write_bytes(b"tampered")
+    with pytest.raises(PITDataError, match="hash mismatch"):
+        catalog_master_receipts(catalog, sessions=(day,))
 
 
 def test_streaming_silver_mapping_does_not_infer_common_from_missing_fields() -> None:

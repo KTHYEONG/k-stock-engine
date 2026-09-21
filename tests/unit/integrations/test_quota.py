@@ -28,3 +28,37 @@ def test_record_attempt_under_concurrent_threads_never_crashes_and_counts_exactl
     assert errors == []
     state = store._load()
     assert state["OpenDART|fnlttSinglAcntAll.json"]["attempted_requests"] == 50
+
+
+def test_daily_limit_is_shared_across_endpoints_and_resets_by_kst_day(tmp_path) -> None:
+    import pytest
+
+    from src.integrations.quota import ProviderQuotaBlocked, ProviderQuotaStateStore
+
+    store = ProviderQuotaStateStore(tmp_path / "quota", daily_limit=2)
+    moment = datetime(2026, 9, 21, 14, 0, tzinfo=UTC)
+    store.record_attempt(provider="OpenDART", endpoint="list.json", now=moment)
+    store.record_attempt(provider="OpenDART", endpoint="fnlttSinglAcntAll.json", now=moment)
+    with pytest.raises(ProviderQuotaBlocked):
+        store.record_attempt(provider="OpenDART", endpoint="list.json", now=moment)
+    store.record_attempt(provider="OpenDART", endpoint="list.json", now=datetime(2026, 9, 21, 15, 0, tzinfo=UTC))
+
+
+def test_remaining_daily_attempts_sums_all_provider_endpoints(tmp_path) -> None:
+    import pytest
+    from src.integrations.quota import ProviderQuotaBlocked, ProviderQuotaStateStore
+
+    store = ProviderQuotaStateStore(tmp_path / "quota")
+    moment = datetime(2026, 9, 21, 14, 0, tzinfo=UTC)
+    store.record_attempt(provider="OpenDART", endpoint="list.json", now=moment)
+    store.record_attempt(provider="OpenDART", endpoint="fnlttSinglAcntAll.json", now=moment)
+
+    assert store.remaining_daily_attempts(provider="OpenDART", now=moment, daily_limit=10) == 8
+    with pytest.raises(ValueError, match="daily_limit"):
+        ProviderQuotaStateStore(tmp_path / "invalid", daily_limit=0)
+    with pytest.raises(ValueError, match="daily_limit"):
+        store.remaining_daily_attempts(provider="OpenDART", now=moment, daily_limit=0)
+    limited = ProviderQuotaStateStore(tmp_path / "limited")
+    limited.record_attempt(provider="OpenDART", endpoint="list.json", now=moment, daily_limit=1)
+    with pytest.raises(ProviderQuotaBlocked, match="daily quota"):
+        limited.acquire(provider="OpenDART", endpoint="fnlttSinglAcntAll.json", now=moment, daily_limit=1)

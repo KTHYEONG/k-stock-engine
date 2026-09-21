@@ -74,12 +74,18 @@ def _entry_out_of_bounds(entry: Mapping[str, Any], *, scope: ResearchScope) -> b
     source = str(entry.get("source") or "")
     as_of_raw = entry.get("as_of")
     as_of = date.fromisoformat(str(as_of_raw)) if isinstance(as_of_raw, str) and as_of_raw.strip() else None
+    fiscal_raw = entry.get("fiscal_period")
+    has_fiscal_period = fiscal_raw not in (None, "")
     if as_of is None:
         out_of_bounds = source != CORP_CODE_SOURCE
+    elif source == "financial_facts" and has_fiscal_period:
+        # FY2025 annual facts are ordinarily published in 2026.  The fiscal
+        # period, rather than publication date, bounds retained accounting
+        # evidence; publication date remains its PIT availability timestamp.
+        out_of_bounds = as_of < scope.evidence_start
     else:
         out_of_bounds = as_of < scope.evidence_start or as_of > scope.completed_end
-    fiscal_raw = entry.get("fiscal_period")
-    if fiscal_raw not in (None, ""):
+    if has_fiscal_period:
         fiscal_period = str(fiscal_raw)
         out_of_bounds = (
             out_of_bounds

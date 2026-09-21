@@ -136,6 +136,10 @@ def test_budget_headroom_is_validated() -> None:
         ResearchScope.model_validate(_scope_payload(**{"collection.dart_daily_budget": 20000}))
     with pytest.raises(ValidationError):
         ResearchScope.model_validate(_scope_payload(**{"collection.dart_daily_budget": 25000}))
+    with pytest.raises(ValidationError):
+        ResearchScope.model_validate(
+            _scope_payload(**{"collection.dart_daily_budget": 400, "collection.dart_daily_reserve": 400})
+        )
 
 
 def test_invalid_scope_id_fails() -> None:

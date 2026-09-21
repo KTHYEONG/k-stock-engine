@@ -90,6 +90,13 @@ def test_current_corp_map_is_allowed(tmp_path: Path) -> None:
     assert catalog.successful_keys(source="dart_corp_codes") == frozenset({"corp-map"})
 
 
+def test_empty_batch_does_not_create_bronze_state(tmp_path: Path) -> None:
+    writer, catalog = _writer(tmp_path)
+
+    assert writer.persist_many(()) == ()
+    assert catalog.successful_keys(source="krx_daily_market") == frozenset()
+
+
 def test_payload_before_catalog_visibility(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from src.data import scoped_ingestion
 
@@ -137,6 +144,22 @@ def test_repeat_payload_is_idempotent(tmp_path: Path) -> None:
     assert third.bronze_receipt.content_hash != first.bronze_receipt.content_hash
     assert Path(first.bronze_receipt.payload_path).is_file()
     assert catalog.latest(source="krx_daily_market", natural_keys=["2024-01-02"])["2024-01-02"].content_hash == third.bronze_receipt.content_hash
+
+
+def test_batched_payloads_publish_one_catalog_revision(tmp_path: Path) -> None:
+    writer, catalog = _writer(tmp_path)
+    receipts = writer.persist_many(
+        (
+            _payload(natural_key="2024-01-02", as_of=date(2024, 1, 2)),
+            _payload(natural_key="2024-01-03", as_of=date(2024, 1, 3)),
+        )
+    )
+
+    assert len(receipts) == 2
+    assert receipts[0].catalog_revision == receipts[1].catalog_revision
+    assert catalog.successful_keys(source="krx_daily_market") == frozenset(
+        {"2024-01-02", "2024-01-03"}
+    )
 
 
 def test_persist_rejects_malformed_payloads(tmp_path: Path) -> None:
