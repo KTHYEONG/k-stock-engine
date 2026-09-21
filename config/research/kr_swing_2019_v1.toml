@@ -1,0 +1,20 @@
+scope_id = "kr_swing_2019_v1"
+evidence_start = "2019-01-01"
+development_start = "2020-01-01"
+development_end = "2022-12-31"
+validation_start = "2023-01-01"
+validation_end = "2023-12-31"
+holdout_start = "2024-01-01"
+holdout_end = "2025-12-31"
+forward_start = "2026-01-01"
+
+[features]
+price_lookback_sessions = 252
+fundamental_lookback_quarters = 5
+fundamental_fiscal_start = "2019Q1"
+investor_flow_enabled = false
+industry_enabled = false
+
+[collection]
+dart_daily_budget = 16000
+dart_batch_identities = 500
