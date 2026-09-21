@@ -31,8 +31,11 @@ def _next_kst_midnight_utc(now: datetime) -> datetime:
 
 
 class ProviderQuotaStateStore:
-    def __init__(self, root: Path | str) -> None:
+    def __init__(self, root: Path | str, *, daily_limit: int | None = None) -> None:
         self._root = Path(root)
+        if daily_limit is not None and (isinstance(daily_limit, bool) or int(daily_limit) < 1):
+            raise ValueError("daily_limit must be a positive integer")
+        self._daily_limit = int(daily_limit) if daily_limit is not None else None
         # 동일 프로세스 내 여러 스레드(예: DartXbrlCollector의 ThreadPoolExecutor)가
         # 하나의 DartApiClient를 공유해 동시에 상태를 읽고-쓰면, 고정된 임시 파일명 위에서
         # os.replace가 서로의 임시 파일을 소비해 FileNotFoundError로 경합한다.
@@ -58,7 +61,28 @@ class ProviderQuotaStateStore:
     def _key(self, *, provider: str, endpoint: str) -> str:
         return f"{provider}|{endpoint}"
 
-    def acquire(self, *, provider: str, endpoint: str, now: datetime) -> None:
+    @staticmethod
+    def _kst_day(now: datetime) -> str:
+        moment = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+        return (moment + timedelta(hours=9)).date().isoformat()
+
+    def _daily_attempts(self, state: dict[str, dict[str, Any]], *, provider: str, day: str) -> int:
+        return sum(
+            int(entry.get("daily_attempted_requests", 0))
+            for key, entry in state.items()
+            if key.startswith(f"{provider}|") and entry.get("daily_attempt_day") == day
+        )
+
+    def remaining_daily_attempts(self, *, provider: str, now: datetime, daily_limit: int) -> int:
+        """Return provider-wide KST-day request headroom under one local limit."""
+        if daily_limit < 1:
+            raise ValueError("daily_limit must be positive")
+        with self._lock:
+            state = self._load()
+            used = self._daily_attempts(state, provider=provider, day=self._kst_day(now))
+            return max(0, int(daily_limit) - used)
+
+    def acquire(self, *, provider: str, endpoint: str, now: datetime, daily_limit: int | None = None) -> None:
         with self._lock:
             state = self._load()
             entry = state.get(self._key(provider=provider, endpoint=endpoint), {})
@@ -66,13 +90,28 @@ class ProviderQuotaStateStore:
             blocked_until = datetime.fromisoformat(str(raw_blocked)) if raw_blocked else None
             if blocked_until is not None and now < blocked_until:
                 raise ProviderQuotaBlocked(f"{provider} {endpoint} blocked until {blocked_until.isoformat()}")
+            limit = int(daily_limit) if daily_limit is not None else self._daily_limit
+            day = self._kst_day(now)
+            if limit is not None and self._daily_attempts(state, provider=provider, day=day) >= limit:
+                raise ProviderQuotaBlocked(f"{provider} daily quota safety limit reached ({limit})")
 
-    def record_attempt(self, *, provider: str, endpoint: str, now: datetime) -> None:
+    def record_attempt(self, *, provider: str, endpoint: str, now: datetime, daily_limit: int | None = None) -> None:
         with self._lock:
             state = self._load()
             key = self._key(provider=provider, endpoint=endpoint)
             entry = state.get(key, {})
+            limit = int(daily_limit) if daily_limit is not None else self._daily_limit
+            day = self._kst_day(now)
+            if limit is not None and self._daily_attempts(state, provider=provider, day=day) >= limit:
+                raise ProviderQuotaBlocked(f"{provider} daily quota safety limit reached ({limit})")
             entry["attempted_requests"] = int(entry.get("attempted_requests", 0)) + 1
+            previous_day = entry.get("daily_attempt_day")
+            entry["daily_attempt_day"] = day
+            entry["daily_attempted_requests"] = (
+                int(entry.get("daily_attempted_requests", 0)) + 1
+                if previous_day == day
+                else 1
+            )
             entry["updated_at"] = now.isoformat()
             state[key] = entry
             self._save(state)

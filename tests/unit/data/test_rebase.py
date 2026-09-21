@@ -80,6 +80,10 @@ def _corp_map() -> bytes:
     return json.dumps([{"corp_code": "00126380", "corp_name": "x", "ticker": "005930"}]).encode()
 
 
+def _master(session: str) -> bytes:
+    return json.dumps({"as_of": session, "records": [{"ISU_SRT_CD": "005930"}]}).encode()
+
+
 def _rebase(tmp_path: Path, legacy_root: Path, *, dry_run: bool = False) -> tuple[DataRuntime, RebaseReport]:
     runtime = _runtime(tmp_path)
     return runtime, materialize_scoped_bronze(runtime=runtime, legacy_data_root=legacy_root, dry_run=dry_run)
@@ -104,6 +108,65 @@ def test_materialize_scoped_bronze_retains_in_scope_daily_payload(tmp_path: Path
     assert (runtime.workspace.bronze_root / "daily_market").is_dir()
 
 
+def test_materialize_scoped_bronze_retains_in_scope_security_master(tmp_path: Path) -> None:
+    legacy = tmp_path / "legacy"
+    _write_legacy(legacy, kind="security_master", payload=_master("2019-06-03"))
+    runtime, report = _rebase(tmp_path, legacy)
+
+    assert report.retained_payload_count == 1
+    catalog = ReceiptCatalog(runtime.workspace.bronze_root / "catalog")
+    assert catalog.successful_keys(source="krx_security_master") == frozenset({"2019-06-03"})
+
+
+def test_materialize_scoped_bronze_rejects_security_master_without_provider_date(tmp_path: Path) -> None:
+    legacy = tmp_path / "legacy"
+    _write_legacy(legacy, kind="security_master", payload=json.dumps({"records": []}).encode())
+    _, report = _rebase(tmp_path, legacy)
+
+    assert report.retained_payload_count == 0
+    assert report.decisions[0].reason == "missing_provider_date"
+
+
+def test_materialize_scoped_bronze_rejects_out_of_scope_and_duplicate_security_master(tmp_path: Path) -> None:
+    legacy = tmp_path / "legacy"
+    _write_legacy(legacy, kind="security_master", payload=_master("2018-12-31"), dirname="old")
+    _write_legacy(legacy, kind="security_master", payload=_master("2019-06-03"), dirname="one")
+    _write_legacy(legacy, kind="security_master", payload=_master("2019-06-03"), dirname="two")
+    _write_legacy(legacy, kind="security_master", payload=json.dumps([1]).encode(), dirname="malformed")
+    _, report = _rebase(tmp_path, legacy)
+
+    assert sorted(item.reason for item in report.decisions) == [
+        "duplicate_receipt", "in_scope_verified", "malformed_legacy_payload", "out_of_scope_provider_date"
+    ]
+
+
+def test_materialize_scoped_bronze_flushes_full_batches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.data.rebase as rebase
+
+    legacy = tmp_path / "legacy"
+    _write_legacy(legacy, kind="daily_market", payload=_market("2019-06-03"))
+    _write_legacy(legacy, kind="daily_market", payload=_market("2019-06-04"))
+    monkeypatch.setattr(rebase, "_REBASE_CATALOG_BATCH_SIZE", 1)
+    _, report = _rebase(tmp_path, legacy)
+
+    assert report.retained_payload_count == 2
+
+
+def test_materialize_scoped_bronze_reads_historical_bronze_stocks_namespace(tmp_path: Path) -> None:
+    legacy = tmp_path / "legacy"
+    source = legacy / "bronze" / "stocks"
+    _write_legacy(source.parent.parent, kind="daily_market", payload=_market("2019-06-03"))
+    # Move the direct fixture into the on-disk layout used by the existing data root.
+    source.mkdir()
+    (legacy / "bronze" / "daily_market").rename(source / "daily_market")
+
+    runtime, report = _rebase(tmp_path, legacy)
+
+    assert report.retained_payload_count == 1
+    catalog = ReceiptCatalog(runtime.workspace.bronze_root / "catalog")
+    assert catalog.successful_keys(source="krx_daily_market") == frozenset({"2019-06-03"})
+
+
 def test_materialize_scoped_bronze_rejects_pre_2019_daily_payload(tmp_path: Path) -> None:
     legacy = tmp_path / "legacy"
     _write_legacy(legacy, kind="daily_market", payload=_market("2018-12-31"))
@@ -124,6 +187,15 @@ def test_materialize_scoped_bronze_applies_fiscal_floor_to_dart_facts(tmp_path: 
     assert _reasons(report) == {"00126380:2018:11011": "out_of_scope_fiscal_period", "00126380:2019:11013": "in_scope_verified"}
     catalog = ReceiptCatalog(runtime.workspace.bronze_root / "catalog")
     assert catalog.successful_keys(source="financial_facts", fiscal_start="2019Q1") == frozenset({"00126380:2019:11013"})
+
+
+def test_materialize_scoped_bronze_rejects_post_completed_fiscal_facts(tmp_path: Path) -> None:
+    legacy = tmp_path / "legacy"
+    _write_legacy(legacy, kind="financial_facts", payload=_fact("00126380", "2026", "11013", "2026-05-15"))
+    _, report = _rebase(tmp_path, legacy)
+
+    assert report.retained_payload_count == 0
+    assert _reasons(report) == {"00126380:2026:11013": "out_of_scope_fiscal_period"}
 
 
 def test_materialize_scoped_bronze_retains_corp_code_map(tmp_path: Path) -> None:
