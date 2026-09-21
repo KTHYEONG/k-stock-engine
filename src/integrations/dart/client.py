@@ -78,6 +78,7 @@ _PROVIDER = "OpenDART"
 # OpenDART는 raw 연결 리셋에 대한 공식 신호를 제공하지 않으므로(문서화된 020/429 계열 코드와 달리),
 # 실제 근거가 확보될 때까지 보수적인 고정 쿨다운을 적용한다.
 _CONNECTION_FAILURE_COOLDOWN_SECONDS = 300.0
+_SAFE_DAILY_REQUEST_LIMIT = 15_200
 
 
 class DartApiClient:
@@ -94,6 +95,7 @@ class DartApiClient:
         quota_store: ProviderQuotaStateStore | None = None,
         now: Callable[[], datetime] | None = None,
         min_interval: float | None = None,
+        daily_request_limit: int | None = None,
     ) -> None:
         self.api_key = api_key or os.getenv("OPENDART_API_KEY")
         if not self.api_key and request_json is None and raw_request_json is None and request_bytes is None:
@@ -113,6 +115,9 @@ class DartApiClient:
             "Accept": "application/json, text/plain, */*",
         })
         self._quota_store = quota_store
+        if daily_request_limit is not None and (isinstance(daily_request_limit, bool) or int(daily_request_limit) < 1):
+            raise ValueError("daily_request_limit must be a positive integer")
+        self._daily_request_limit = int(daily_request_limit) if daily_request_limit is not None else _SAFE_DAILY_REQUEST_LIMIT
         self._now = now or (lambda: datetime.now(UTC))
         raw_interval = os.getenv("OPENDART_REQUEST_MIN_INTERVAL_SECONDS")
         self._min_interval = (
@@ -149,11 +154,15 @@ class DartApiClient:
                 raise DartTerminalError("DART response must be an object")
             return payload
         if self._quota_store is not None:
-            self._quota_store.acquire(provider=_PROVIDER, endpoint=endpoint, now=self._now())
+            self._quota_store.acquire(
+                provider=_PROVIDER, endpoint=endpoint, now=self._now(), daily_limit=self._daily_request_limit
+            )
         for attempt in range(3):
             self._pace()
             if self._quota_store is not None:
-                self._quota_store.record_attempt(provider=_PROVIDER, endpoint=endpoint, now=self._now())
+                self._quota_store.record_attempt(
+                    provider=_PROVIDER, endpoint=endpoint, now=self._now(), daily_limit=self._daily_request_limit
+                )
             try:
                 response = self._session.get(f"{self.BASE_URL}/{endpoint}", params=request_params, timeout=30)
             except requests.exceptions.RequestException as exc:
@@ -226,6 +235,7 @@ class DartApiClient:
         end: date,
         *,
         corp_code: str | None = None,
+        detail_type: str | None = None,
         page_count: int = 100,
     ) -> list[dict[str, str]]:
         if start > end:
@@ -245,6 +255,8 @@ class DartApiClient:
             }
             if corp_code:
                 params["corp_code"] = corp_code
+            if detail_type:
+                params["pblntf_detail_ty"] = str(detail_type).strip()
             if self._request_json is not None and self._raw_request_json is None:
                 payload = self._request_json(self.DISCLOSURE_ENDPOINT, params)
                 if not isinstance(payload, dict):

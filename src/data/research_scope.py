@@ -9,7 +9,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, PositiveInt, field_validator, model_validator
+from pydantic import BaseModel, NonNegativeInt, PositiveFloat, PositiveInt, field_validator, model_validator
 
 __all__ = [
     "OPENDART_DAILY_LIMIT",
@@ -55,6 +55,9 @@ class CollectionBudget(BaseModel):
 
     dart_daily_budget: PositiveInt
     dart_batch_identities: PositiveInt
+    dart_daily_reserve: NonNegativeInt = 400
+    dart_request_min_interval_seconds: PositiveFloat = 1.0
+    dart_max_workers: PositiveInt = 1
 
     @field_validator("dart_daily_budget")
     @classmethod
@@ -62,6 +65,12 @@ class CollectionBudget(BaseModel):
         if value >= OPENDART_DAILY_LIMIT:
             raise ValueError(f"invalid dart_daily_budget {value!r}: must be below {OPENDART_DAILY_LIMIT}")
         return value
+
+    @model_validator(mode="after")
+    def _check_dart_reserve(self) -> CollectionBudget:
+        if self.dart_daily_reserve >= self.dart_daily_budget:
+            raise ValueError("dart_daily_reserve must be below dart_daily_budget")
+        return self
 
 
 class ResearchScope(BaseModel):
@@ -119,6 +128,9 @@ class ResearchScope(BaseModel):
             "collection": {
                 "dart_batch_identities": self.collection.dart_batch_identities,
                 "dart_daily_budget": self.collection.dart_daily_budget,
+                "dart_daily_reserve": self.collection.dart_daily_reserve,
+                "dart_max_workers": self.collection.dart_max_workers,
+                "dart_request_min_interval_seconds": self.collection.dart_request_min_interval_seconds,
             },
             "development_end": self.development_end.isoformat(),
             "development_start": self.development_start.isoformat(),

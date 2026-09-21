@@ -263,6 +263,7 @@ def test_dart_client_paces_consecutive_requests_by_min_interval(monkeypatch) -> 
 
 
 def test_dart_client_min_interval_reads_env_var_and_defaults_to_disabled(monkeypatch) -> None:
+    import pytest
     from src.integrations.dart.client import DartApiClient
 
     monkeypatch.setenv("OPENDART_REQUEST_MIN_INTERVAL_SECONDS", "2.5")
@@ -275,3 +276,21 @@ def test_dart_client_min_interval_reads_env_var_and_defaults_to_disabled(monkeyp
 
     client_explicit = DartApiClient(api_key="key", min_interval=3.0)
     assert client_explicit._min_interval == 3.0
+    with pytest.raises(ValueError, match="daily_request_limit"):
+        DartApiClient(api_key="key", daily_request_limit=0)
+
+
+def test_dart_client_passes_disclosure_detail_type() -> None:
+    from src.integrations.dart.client import DartApiClient
+
+    seen: dict[str, str] = {}
+
+    def request(_endpoint: str, params: dict[str, str]) -> dict[str, object]:
+        seen.update(params)
+        return {"status": "000", "list": []}
+
+    DartApiClient(api_key="key", request_json=request).list_disclosures(
+        date(2024, 1, 1), date(2024, 1, 1), detail_type="A001"
+    )
+
+    assert seen["pblntf_detail_ty"] == "A001"

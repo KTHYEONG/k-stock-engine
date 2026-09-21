@@ -366,8 +366,8 @@ def test_scoped_batch_quota_ceiling_limits_identities(tmp_path) -> None:
         filing_identities=identities, offset=0, limit=500,
     )
 
-    assert len(batch.identities) == 400
-    assert batch.estimated_request_ceiling == 1200
+    assert len(batch.identities) == 266
+    assert batch.estimated_request_ceiling == 798
 
     tiny_scope = runtime.scope.model_copy(
         update={"collection": CollectionBudget(dart_daily_budget=16000, dart_batch_identities=2)}
@@ -378,6 +378,58 @@ def test_scoped_batch_quota_ceiling_limits_identities(tmp_path) -> None:
         filing_identities=identities[:10], offset=0, limit=10,
     )
     assert len(batch.identities) == 2
+
+
+def test_scoped_batch_reserves_provider_wide_quota_before_selecting(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    from src.data.dart_backfill import build_scoped_dart_fact_batch
+    from src.data.research_scope import CollectionBudget
+    from src.data.runtime import DataRuntime
+    from src.data.workspace import build_workspace
+    from src.integrations.quota import ProviderQuotaStateStore
+
+    runtime = _scoped_runtime(tmp_path)
+    scope = runtime.scope.model_copy(
+        update={"collection": CollectionBudget(dart_daily_budget=100, dart_batch_identities=50, dart_daily_reserve=10)}
+    )
+    capped = DataRuntime(scope=scope, workspace=build_workspace(data_root=tmp_path / "data", scope=scope))
+    store = ProviderQuotaStateStore(capped.workspace.state_root / "quota")
+    moment = datetime(2026, 9, 21, 14, tzinfo=UTC)
+    for index in range(82):
+        store.record_attempt(provider="OpenDART", endpoint="list.json" if index == 0 else "fnlttSinglAcntAll.json", now=moment)
+
+    batch = build_scoped_dart_fact_batch(
+        runtime=capped,
+        catalog=_scoped_catalog(capped),
+        filing_identities=[_filing(corp=f"{index:08d}", filing=f"F{index}") for index in range(10)],
+        offset=0,
+        limit=10,
+        quota_store=store,
+        now=moment,
+    )
+
+    assert batch.available_request_headroom == 8
+    assert len(batch.identities) == 2
+
+
+def test_scoped_collector_uses_collection_policy(tmp_path, monkeypatch) -> None:
+    import src.data.dart_backfill as backfill
+    from src.data.dart_backfill import build_scoped_dart_collector
+
+    captured: dict[str, object] = {}
+
+    class _Collector:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(backfill, "DartXbrlCollector", _Collector)
+    runtime = _scoped_runtime(tmp_path)
+    build_scoped_dart_collector(runtime=runtime)
+
+    assert captured["daily_request_limit"] == runtime.scope.collection.dart_daily_budget
+    assert captured["min_interval"] == runtime.scope.collection.dart_request_min_interval_seconds
+    assert captured["max_workers"] == runtime.scope.collection.dart_max_workers
 
 
 def test_scoped_batch_catalog_success_suppresses_retry(tmp_path) -> None:
@@ -472,7 +524,7 @@ def test_scoped_batch_rejects_invalid_inputs(tmp_path) -> None:
         )
 
 
-def test_facts_scoped_commands_plan_batch(tmp_path, capsys) -> None:
+def test_facts_scoped_commands_plan_batch(tmp_path, capsys, monkeypatch) -> None:
     import json
 
     from src.data.cli import main
@@ -492,6 +544,20 @@ def test_facts_scoped_commands_plan_batch(tmp_path, capsys) -> None:
     out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert out["missing_without_filing"] == 1
     assert out["selected"] == 1
+
+    import src.data.cli as cli
+    import src.data.dart_backfill as backfill
+
+    collector = object()
+    monkeypatch.setattr(backfill, "build_scoped_dart_collector", lambda **_kwargs: collector)
+    monkeypatch.setattr(
+        cli,
+        "collect_dart_financial_facts",
+        lambda **kwargs: type("Result", (), {"content_hash": "fact-hash"})(),
+    )
+    assert main(["collect-dart-facts-scoped", *base, "--execute"]) == 0
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["content_hash"] == "fact-hash"
 
 
 def test_legacy_missing_fact_batch_rejects_invalid_inputs_and_empty_candidates(tmp_path, monkeypatch) -> None:
