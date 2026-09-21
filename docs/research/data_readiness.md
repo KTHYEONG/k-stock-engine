@@ -2,6 +2,8 @@
 
 기준일: 2026-09-20. 수치는 현재 `data/bronze/stocks` 원본과 수집 계획·완료 기록을 직접 집계했다. DART 잔여 수집 후 재측정한다. 전략과 백테스트 규칙은 [strategy.md](strategy.md)에 둔다.
 
+날짜별 보통주 마스터의 전체 필드 감사와 Bronze→Silver 계약은 [ordinary_universe.md](ordinary_universe.md)에 기록했다.
+
 ## 현재 판정
 
 | 영역 | 확인한 사실 | 다음 작업 / 통과 조건 |
@@ -16,7 +18,7 @@
 
 ## 산업 업종: 원천과 저장
 
-**1순위 원천은 KRX Data Marketplace의 `업종분류 현황`**이다. KRX 공식 메뉴에 이 자료가 있으며 [상장폐지종목 현황](https://data.krx.co.kr/contents/MDC/STAT/issue/MDCSTAT238.jsp)에도 폐지 직전 업종명이 표시된다([KRX 데이터 메뉴](https://data.krx.co.kr/contents/MDC/MAIN/main/index.cmd?locale=en.)). 현재 KRX OpenAPI 종목 마스터 원본에는 산업 업종이 없다. Data Marketplace의 과거 날짜 조회·자동 내려받기 조건은 아직 검증되지 않았다. 공개 화면 호출의 2016년/2026년 소규모 시험은 이 환경에서 오류 페이지를 반환했다. 따라서 과거 업종을 지금 종목명으로 소급 채우는 작업은 금지한다.
+**1순위 원천은 KRX Data Marketplace**다. 공개 화면에서 종목별 `IDX_IND_NM` 업종명 필드를 확인했지만, JSON 호출은 인증되지 않은 세션에서 `LOGOUT`을 반환했다. 따라서 과거 날짜 조회·자동 내려받기 조건은 아직 검증되지 않았으며, 업종 행은 수집하지 않았다. 검증 결과와 인증 후 수집 계약은 [industry_classification.md](industry_classification.md)에 둔다. 과거 업종을 현재 종목명으로 소급 채우는 작업은 금지한다.
 
 | 단계 | 계약 |
 | --- | --- |
@@ -48,4 +50,4 @@
 
 백테스트 입력 확정 전 다음을 날짜·종목 단위로 출력한다: 일반 보통주 분류의 미확인 수, 거래 가능 일봉 비율, 업종 분류 유효 비율, 수급 공급처별 커버리지, 재무 필수 항목 PIT 커버리지, 미해결 기업행위·상장폐지 노출, 비용 범위. 실패 항목은 전략 점수로 보정하지 않고 해당 거래 또는 평가 기간의 인증을 막는다.
 
-과거 파생 데이터와 임시 파일의 보존·제거 순서는 [data_cleanup.md](data_cleanup.md)에 기록했다. 수급 수집 계약은 [investor_flow_backfill_spec.md](../specs/investor_flow_backfill_spec.md)에 정의했다.
+과거 파생 데이터와 임시 파일의 보존·제거 순서는 [data_cleanup.md](data_cleanup.md)에 기록했다. 수급 수집 계약의 구현 결정은 [task_index.json](../decisions/task_index.json)의 `ADR_20260920_INVESTOR_FLOW_BACKFILL`에 기록했다.

@@ -373,5 +373,9 @@
   },
   "src/validation/walk_forward.py": {
     "testing": "tests/unit/validation/test_walk_forward.py"
+  },
+  "src/data/research_scope.py": {
+    "architecture": "docs/research/data_cleanup.md",
+    "testing": "tests/unit/data/test_research_scope.py"
   }
 }

@@ -1,23 +1,18 @@
 # `data/` 정리 계획
 
-기준일: 2026-09-20. **삭제 실행 전 계획**이다. 현재 약 21GiB 중 `data/bronze/stocks`의 원본 약 17.3GiB·29.8만 파일은 새 데이터셋 재구축의 원천이다. `data/archive` 약 0.60GiB, Silver 약 1.2GiB, Gold 약 0.12GiB, Artifacts 약 0.30GiB의 과거 실행·파생물이 주요 정리 대상이다. `du`의 디스크 사용량은 파일 크기 합계보다 클 수 있다.
+기준일: 2026-09-21. **삭제 실행 전 계획**이다. 현재 `data/`는 약 21GiB이며, `data/bronze/stocks` 원본이 약 17.3GiB를 차지한다. 원본은 `kr_equity_v1` Scope Bronze로 검증 리베이스한 뒤 기존 `bronze/stocks`를 제거한다. `archive`, `artifacts`, 기존 Silver·Gold도 새 Scope release와 coverage 검증 뒤 함께 제거한다. `du`의 디스크 사용량은 파일 크기 합계보다 클 수 있다.
 
 ## 분류
 
 | 구간 | 현재 규모 | 처분 계획 | 선행 확인 |
 | --- | ---: | --- | --- |
 | `data/bronze/stocks/*`의 공급처 원본 | 약 17.3GiB, 29.8만 파일 | **유지**. DART, KRX, 수급의 원본 바이트·receipt·해시를 새 기준 데이터 재구축에 사용 | 원본과 파생 집계 응답을 구분하고 해시·누락 검사 |
-| `data/bronze/artifacts` | 약 13MiB | 수집 원장 연결 확인 전 유지 | 원본 receipt 참조 및 활성 실행 확인 |
-| `data/artifacts/quota`, `collection-plans`, `collection-checkpoints`, `checkpoints`, `dart_backfill` | 합계 약 73MiB | DART·수급 백필 완료까지 유지 | 재시도·쿼터·완료 증명의 마지막 사용시각 |
-| `data/archive/*` | 약 0.60GiB | Bronze 보존과 새 정규화 대조가 끝나면 **전체 제거 후보** | 보관본에만 있는 원본·미이관 파일의 SHA256 목록이 0건 |
-| `data/silver/stocks_prepared_*`, `stocks_refresh_*`, `stocks_provenance_*` | 약 0.64GiB | 새 시점별 기준 데이터셋이 생성되면 **전체 제거 후보** | 새 데이터 품질 보고서와 옛 실행의 필요한 감사 증거 분리 보존 |
-| `data/gold/stocks_prepared_*`, `stocks_research_*` | 약 0.06GiB | 기존 전략 폐기와 함께 **전체 제거 후보** | 옛 Gold를 참조하는 백테스트·보고서만 남기지 않음 |
-| `data/artifacts/streaming_staging`, `normalization_rebuild`, 옛 `gold_*`·`backtest_*` | 약 0.2GiB 이상 | 완료·중단된 실행의 **제거 후보** | 실행 중인 프로세스 부재, 필요한 결정·해시 요약만 별도 보존 |
-| `data/silver/stocks`, `data/gold/stocks` | 약 0.58GiB | 새 자료로 대체 후 옛 dataset ID별 선택 제거 | 활성 manifest·새 백테스트가 참조하는 ID의 도달성 검사 |
+| `data/bronze/stocks` | 약 17.3GiB | Scope Bronze 리베이스 뒤 **제거** | receipt catalog와 필수 원천 coverage가 Scope hash에 일치 |
+| `data/archive`, `data/artifacts` | 약 0.90GiB | **전체 제거** | 리베이스 report·새 state·quota가 `data/state/<scope>`에 존재 |
+| `data/silver/stocks`, 기타 기존 Silver | 약 1.3GiB | **제거** | 새 Scope Silver release가 source dataset ID와 coverage hash를 보유 |
+| `data/gold/stocks`, 기타 기존 Gold | 약 0.12GiB | **제거** | 새 Scope Gold release가 universe·feature·coverage hash를 보유 |
 
-현재 `plan_storage_root_retention()`의 보수적 검사에서는 Silver 루트 6개, Gold 루트 2개와 Gold의 고아 `.staging-*` 1개가 바로 회수 가능한 후보로 나온다. 나머지 옛 루트 상당수는 **옛 artifact JSON에 이름이 등장한다는 이유**로만 보존 판정된다. 옛 연구 실행을 폐기할 때는 해당 artifact도 함께 정리한 뒤 재검사한다. 단순히 루트 이름만 보고 삭제하지 않는다.
-
-1차 회수 후보의 정확한 루트 이름은 Silver의 `stocks_prepared_20260910_v2`~`v6`, `stocks_refresh_20260911`, Gold의 `stocks_research_2017`, `stocks_research_2017_v2`와 `data/gold/stocks/.staging-d8a2c2fbc08af8d2cd0cf5c92e43d075-6ca26589`이다. 마지막 staging은 완료된 데이터셋 manifest가 없는 임시 디렉터리인지 확인한 뒤 제거한다.
+기존 artifact JSON의 참조는 보존 근거가 아니다. 삭제 전에는 경로 이름으로 추정하지 않고 Scope receipt catalog, coverage report, Silver·Gold release metadata를 검증한다.
 
 ## 실행 순서와 차단 조건
 
@@ -27,4 +22,12 @@
 4. 묶음마다 삭제 예정 목록과 회수 바이트를 검토하고, 실제 제거 후 남은 manifest·원본 해시·새 데이터셋 참조가 깨지지 않았는지 확인한다. 문제가 있으면 해당 묶음의 보관본으로 복원한다.
 5. Bronze의 `aggregated:`/`manifest:` 같은 **재생성 가능한 파생 응답**은 원본 receipt가 남아 있고 도달성 검사를 통과한 경우에만 정리한다. 현재 `gc_superseded_bronze_aggregates()`는 오래된 집계본만 정리하는 안전한 출발점이다. 29.8만 원본 파일은 경로 계약을 변경하기 전 임의로 묶거나 지우지 않는다.
 
-목표는 먼저 약 **1~2GiB의 옛 파생·아카이브·임시 파일**을 회수하고, 그다음 원본 파일 수가 많은 문제를 별도 보존 형식으로 다루는 것이다. 압축 묶음으로 전환할 경우 개별 원본 해시 조회와 receipt 재생, 중단 후 재개가 동등하게 작동해야 한다.
+## 이번 재구축에 맞춘 실행 순서
+
+1. `rebase-2019 --dry-run`으로 보존·거절 receipt를 확정한다.
+2. 비 dry-run 리베이스로 Scope Bronze catalog와 필수 원천 coverage를 만든다.
+3. 보통주 유니버스·가격 Silver와 DART 재무 Silver를 만들고 Scope-bound Gold metadata에 coverage hash를 기록한다.
+4. `remove-legacy-data` 계획 모드의 검증 record를 확인한다.
+5. `remove-legacy-data --apply`로 `archive`, `artifacts`, `bronze/stocks`, `silver/stocks`, `gold/stocks`를 제거한다.
+
+목표는 Scope-bound 증거·파생 release·실행 기록만 남기고, 기존 실행 잔재를 완전히 제거하는 것이다.
