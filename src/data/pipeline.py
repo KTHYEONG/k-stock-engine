@@ -11,7 +11,7 @@ import polars as pl
 
 from src.core.datasets import DatasetCertification
 from src.core.time import SessionCalendar
-from src.data.backtest_run_manifest import build_backtest_run_manifest, write_backtest_run_manifest
+from src.data.backtest_run_manifest import build_legacy_backtest_run_manifest, write_legacy_backtest_run_manifest
 from src.data.bronze import BronzeStore
 from src.data.replay import PITReplayReader, StreamingGoldWriter
 from src.data.schemas import BronzeReceipt, EvidenceKind, PITDataError, SilverTable
@@ -217,7 +217,7 @@ def materialize_backtest_inputs(
     dataset_ids = dict(silver_dataset_ids)
     _ = dataset_ids.get(SilverTable.LIFECYCLE_EVENTS)
     _ = dataset_ids[SilverTable.LIFECYCLE_EVENTS]
-    run_manifest = build_backtest_run_manifest(
+    run_manifest = build_legacy_backtest_run_manifest(
         silver_root=Path(silver_root),
         gold_root=Path(gold_root),
         silver_dataset_ids=silver_dataset_ids,
@@ -233,7 +233,7 @@ def materialize_backtest_inputs(
         },
     )
     manifest_root = Path(artifact_root) if artifact_root is not None else Path(gold_root).parent / "artifacts"
-    write_backtest_run_manifest(manifest=run_manifest, artifact_root=manifest_root)
+    write_legacy_backtest_run_manifest(manifest=run_manifest, artifact_root=manifest_root)
     return BacktestDataArtifact(hashes["universe"], hashes["qvef"], hashes["champion_scores"], "", "", report.report_hash, content_hash, run_manifest.content_hash)
 
 

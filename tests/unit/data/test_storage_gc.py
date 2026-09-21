@@ -30,7 +30,7 @@ def test_plan_storage_root_retention_keeps_canonical_and_referenced_roots(tmp_pa
 
     silver_base = tmp_path / "silver"
     gold_base = tmp_path / "gold"
-    for name in ("stocks", "stocks_provenance_20260911", "stocks_prepared_20260910_v5"):
+    for name in ("stocks", "ordinary_universe", "stocks_provenance_20260911", "stocks_prepared_20260910_v5"):
         (silver_base / name).mkdir(parents=True)
     for name in ("stocks", "stocks_research_annual_provenance_20260911"):
         (gold_base / name).mkdir(parents=True)
@@ -46,7 +46,7 @@ def test_plan_storage_root_retention_keeps_canonical_and_referenced_roots(tmp_pa
 
     plan = plan_storage_root_retention(silver_base=silver_base, gold_base=gold_base, artifact_root=tmp_path / "artifacts")
 
-    assert plan.retained_silver_roots == ("stocks", "stocks_provenance_20260911")
+    assert plan.retained_silver_roots == ("ordinary_universe", "stocks", "stocks_provenance_20260911")
     assert plan.reclaimable_silver_roots == ("stocks_prepared_20260910_v5",)
     assert plan.retained_gold_roots == ("stocks", "stocks_research_annual_provenance_20260911")
     assert plan.reclaimable_gold_roots == ()

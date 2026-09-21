@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from dotenv import load_dotenv
 
@@ -35,7 +37,11 @@ from src.data.legacy_inventory import MigrationArtifactStore, inspect_legacy_dat
 from src.data.master_intervals import compact_security_master_intervals
 from src.data.operations import execute_verified_legacy_purge
 from src.data.pipeline import materialize_backtest_inputs
-from src.data.schemas import PITDataError, SilverTable
+from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog
+from src.data.runtime import DataRuntime, load_data_runtime
+from src.data.schemas import EvidenceKind, PITDataError, SilverTable
+from src.data.scope_coverage import CoverageRequirement
+from src.data.scoped_ingestion import ScopedBronzeWriter, ScopedRawPayload
 from src.data.silver import load_latest_silver_market_scan, load_latest_silver_table
 from src.data.silver_schema import canonicalize_session_keys, observe_time_semantics
 from src.data.storage_gc import plan_storage_root_retention
@@ -104,6 +110,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p_backfill.add_argument("--limit", type=int, default=100)
     p_backfill.add_argument("--retrieved-at", type=str, required=False, default=None)
 
+    p_missing_dart = sub.add_parser("collect-missing-dart-facts", help="Collect retained DART filing identities missing fact evidence")
+    p_missing_dart.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
+    p_missing_dart.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
+    p_missing_dart.add_argument("--backfill-artifact", type=Path, required=True)
+    p_missing_dart.add_argument("--offset", type=int, default=0)
+    p_missing_dart.add_argument("--limit", type=int, default=20)
+    p_missing_dart.add_argument("--retrieved-at", type=str, required=False, default=None)
+
     p_mat = sub.add_parser("materialize", help="Materialize backtest inputs")
     p_mat.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
     p_mat.add_argument("--silver-root", type=Path, default=Path("data/silver/stocks"))
@@ -142,6 +156,13 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p_sg_retention.add_argument("--silver-base", type=Path, default=Path("data/silver"))
     p_sg_retention.add_argument("--gold-base", type=Path, default=Path("data/gold"))
     p_sg_retention.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
+
+    p_ordinary_price_audit = sub.add_parser(
+        "audit-ordinary-universe-prices", help="Audit raw-price availability for the ordinary-share universe"
+    )
+    p_ordinary_price_audit.add_argument("--universe-root", type=Path, default=Path("data/silver/ordinary_universe"))
+    p_ordinary_price_audit.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
+    p_ordinary_price_audit.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
 
     p_purge = sub.add_parser("purge-legacy", help="Purge legacy outputs after verification")
     p_purge.add_argument("--data-root", type=Path, default=Path("data"))
@@ -227,7 +248,237 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p_audit.add_argument("--silver-root", type=Path, default=Path("data/silver/stocks"))
     p_audit.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
 
+    p_scope_info = sub.add_parser("scope-info", help="Show resolved scope and workspace roots")
+    _add_scoped_args(p_scope_info)
+
+    p_init_ws = sub.add_parser("init-workspace", help="Create scope-namespaced workspace directories")
+    _add_scoped_args(p_init_ws)
+
+    p_collect_scoped = sub.add_parser("collect-scoped", help="Persist scoped raw payloads to Bronze and catalog")
+    _add_scoped_args(p_collect_scoped)
+    p_collect_scoped.add_argument("--payloads", type=Path, required=True)
+
+    p_plan_scoped = sub.add_parser("plan-scoped", help="Build coverage-driven scoped flow plan under state")
+    _add_scoped_args(p_plan_scoped)
+    p_plan_scoped.add_argument("--requirements", type=Path, required=True)
+    p_plan_scoped.add_argument("--max-sessions", type=int, default=LS_MAX_SESSIONS_PER_REQUEST)
+
+    p_resume_scoped = sub.add_parser("resume-scoped", help="List pending scoped plan chunks")
+    _add_scoped_args(p_resume_scoped)
+    p_resume_scoped.add_argument("--plan-id", type=str, required=True)
+
+    p_disc_scoped = sub.add_parser("collect-dart-disclosures-scoped", help="Persist scoped DART disclosure pages")
+    _add_scoped_args(p_disc_scoped)
+    p_disc_scoped.add_argument("--disclosures", type=Path, required=True)
+    p_disc_scoped.add_argument("--retrieved-at", type=str, required=False, default=None)
+
+    p_facts_scoped = sub.add_parser("collect-dart-facts-scoped", help="Plan scoped DART fact batch from retained filings")
+    _add_scoped_args(p_facts_scoped)
+    p_facts_scoped.add_argument("--filings", type=Path, required=True)
+    p_facts_scoped.add_argument("--offset", type=int, default=0)
+    p_facts_scoped.add_argument("--limit", type=int, default=20)
+
+    p_missing_scoped = sub.add_parser(
+        "collect-missing-dart-facts-scoped", help="Report scoped DART facts missing filing evidence"
+    )
+    _add_scoped_args(p_missing_scoped)
+    p_missing_scoped.add_argument("--filings", type=Path, required=True)
+    p_missing_scoped.add_argument("--offset", type=int, default=0)
+    p_missing_scoped.add_argument("--limit", type=int, default=20)
+
+    p_rebase = sub.add_parser("rebase-2019", help="Rebase legacy raw receipts into scoped Bronze")
+    _add_scoped_args(p_rebase)
+    p_rebase.add_argument("--legacy-data-root", type=Path, required=False, default=None)
+    p_rebase.add_argument("--dry-run", action="store_true")
+
+    p_remove_legacy = sub.add_parser("remove-legacy-data", help="Verify and remove enumerated legacy roots")
+    _add_scoped_args(p_remove_legacy)
+    p_remove_legacy.add_argument("--rebase-report", type=Path, required=True)
+    p_remove_legacy.add_argument("--apply", action="store_true")
+
+    p_backtest = sub.add_parser("backtest", help="Run one scope-bound backtest segment")
+    _add_scoped_args(p_backtest)
+    p_backtest.add_argument("--segment", choices=("development", "validation", "holdout"), required=True)
+    p_backtest.add_argument("--silver-dataset-id", dest="silver_dataset_id", action="append", default=None)
+    p_backtest.add_argument("--gold-dataset-id", type=str, required=True)
+    p_backtest.add_argument("--strategy-id", type=str, required=True)
+    p_backtest.add_argument("--strategy-policy", type=Path, required=True)
+    p_backtest.add_argument("--execution-policy", type=Path, required=True)
+    p_backtest.add_argument("--universe-policy", type=Path, required=True)
+
     return parser.parse_args(argv)
+
+
+def _add_scoped_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--scope-config", type=Path, required=True)
+    parser.add_argument("--data-root", type=Path, required=True)
+
+
+def _scoped_runtime(args: argparse.Namespace) -> DataRuntime:
+    """Load the scoped runtime for scoped commands."""
+    return load_data_runtime(scope_config=args.scope_config, data_root=args.data_root)
+
+
+def _scoped_catalog(runtime: DataRuntime) -> ReceiptCatalog:
+    """Open the scope-local receipt catalog under the workspace Bronze root."""
+    return ReceiptCatalog(runtime.workspace.bronze_root / "catalog")
+
+
+def _run_scoped(args: argparse.Namespace, func: Callable[[], dict[str, object]]) -> int:
+    """Execute one scoped command body and emit its payload without traceback leaks."""
+    try:
+        payload = func()
+    except (PITDataError, ValueError, OSError) as exc:
+        _emit({"error": str(exc)})
+        return 1
+    _emit(payload)
+    return 0
+
+
+def _read_json_list(path: Path, *, label: str) -> list[Any]:
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise PITDataError(f"scoped {label} file is unreadable: {exc}") from exc
+    if not isinstance(raw, list):
+        raise PITDataError(f"scoped {label} file must hold a list")
+    return raw
+
+
+def _mapping_rows(raw: list[Any], *, label: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise PITDataError(f"scoped {label} entry must be a mapping")
+        rows.append(dict(entry))
+    return rows
+
+
+def _read_coverage_requirements(path: Path) -> tuple[CoverageRequirement, ...]:
+    """Read coverage requirements from a JSON file."""
+    rows = _mapping_rows(_read_json_list(path, label="requirements"), label="requirements")
+    items: list[CoverageRequirement] = []
+    for row in rows:
+        as_of_raw = row.get("as_of")
+        items.append(
+            CoverageRequirement(
+                source=str(row.get("source") or ""),
+                natural_key=str(row.get("natural_key") or ""),
+                as_of=date.fromisoformat(str(as_of_raw)) if as_of_raw else None,
+                fiscal_period=str(row.get("fiscal_period") or "") or None,
+                required=bool(row.get("required", True)),
+            )
+        )
+    return tuple(items)
+
+
+def _read_scoped_payloads(path: Path) -> tuple[ScopedRawPayload, ...]:
+    """Read scoped raw payloads from a JSON file with base64-encoded bodies."""
+    rows = _mapping_rows(_read_json_list(path, label="payloads"), label="payloads")
+    items: list[ScopedRawPayload] = []
+    for row in rows:
+        as_of_raw = row.get("as_of")
+        items.append(
+            ScopedRawPayload(
+                kind=EvidenceKind(str(row.get("kind") or "")),
+                source=str(row.get("source") or ""),
+                natural_key=str(row.get("natural_key") or ""),
+                as_of=date.fromisoformat(str(as_of_raw)) if as_of_raw else None,
+                fiscal_period=str(row.get("fiscal_period") or "") or None,
+                status=EvidenceStatus(str(row.get("status") or "")),
+                payload=base64.b64decode(str(row.get("payload_b64") or "")),
+                retrieved_at=datetime.fromisoformat(str(row.get("retrieved_at") or "")),
+                source_label=str(row.get("source_label") or ""),
+            )
+        )
+    return tuple(items)
+
+
+def _read_policy_json(path: Path, *, label: str) -> dict[str, Any]:
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise PITDataError(f"scoped {label} policy file must hold an object")
+    return raw
+
+
+def _hash_policy_document(policy: Mapping[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(dict(policy), sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _parse_scope_dataset_bindings(values: Sequence[str] | None) -> dict[str, str]:
+    bindings: dict[str, str] = {}
+    for token in values or ():
+        name, sep, ident = str(token).partition("=")
+        if not sep or not name.strip() or not ident.strip():
+            raise PITDataError(f"malformed silver dataset binding: {token!r}")
+        table = name.strip()
+        if table in bindings:
+            raise PITDataError(f"duplicate silver dataset binding: {table!r}")
+        try:
+            SilverTable(table)
+        except ValueError:
+            raise PITDataError(f"unknown silver table: {table!r}") from None
+        bindings[table] = ident.strip()
+    return bindings
+
+
+def _build_scope_strategy(strategy_id: str, policy: Mapping[str, Any]) -> Any:
+    from src.data.backtest_runner import EqualWeightSwingStrategy
+
+    if strategy_id == "equal-weight" and str(policy.get("kind") or "") == "equal_weight":
+        return EqualWeightSwingStrategy(
+            strategy_id=strategy_id,
+            target_weight=float(policy.get("target_weight", 1.0)),
+            max_positions=int(policy.get("max_positions", 5)),
+        )
+    raise PITDataError(f"unknown strategy {strategy_id!r}")
+
+
+def _build_dart_fact_batch_artifact(args: argparse.Namespace) -> dict[str, object]:
+    """Plan one quota-bounded DART fact batch and persist its artifact under state."""
+    from src.data.collection_plan import scoped_plan_dir
+    from src.data.dart_backfill import build_scoped_dart_fact_batch
+
+    runtime = _scoped_runtime(args)
+    rows = _mapping_rows(_read_json_list(Path(args.filings), label="filings"), label="filings")
+    batch = build_scoped_dart_fact_batch(
+        runtime=runtime,
+        catalog=_scoped_catalog(runtime),
+        filing_identities=[
+            {str(key): str(value) for key, value in row.items() if value is not None} for row in rows
+        ],
+        offset=int(args.offset),
+        limit=int(args.limit),
+    )
+    out_dir = scoped_plan_dir(runtime=runtime) / "dart-fact-batches"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f"{batch.plan_id}.json").write_text(
+        json.dumps(
+            {
+                "plan_id": batch.plan_id,
+                "scope_hash": batch.scope_hash,
+                "identities": [dict(item) for item in batch.identities],
+                "missing_without_filing": [
+                    {
+                        "source": item.source,
+                        "natural_key": item.natural_key,
+                        "fiscal_period": item.fiscal_period,
+                    }
+                    for item in batch.missing_without_filing
+                ],
+                "estimated_request_ceiling": batch.estimated_request_ceiling,
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "plan_id": batch.plan_id,
+        "selected": len(batch.identities),
+        "missing_without_filing": len(batch.missing_without_filing),
+        "estimated_request_ceiling": batch.estimated_request_ceiling,
+    }
 
 
 def _parse_dt(value: str | None) -> datetime:
@@ -429,7 +680,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     )
     from src.core.instruments import AssetKind, Instrument
     from src.core.time import SessionCalendar
-    from src.data.backtest_run_manifest import load_backtest_run_manifest
+    from src.data.backtest_run_manifest import load_legacy_backtest_run_manifest
     from src.data.backtest_runner import run_managed_backtest
     from src.data.schemas import PITDataError, SilverTable
     from src.data.silver import latest_silver_dataset_path, load_silver_table_by_dataset_id, silver_dataset_path_by_id
@@ -464,7 +715,7 @@ def _dispatch_backtest(args: argparse.Namespace) -> int:
     if not smoke_symbol:
         if manifest_arg is None:
             raise PITDataError("run-backtest requires --backtest-run-manifest for manifest-bound backtest")
-        run_manifest = load_backtest_run_manifest(Path(manifest_arg))
+        run_manifest = load_legacy_backtest_run_manifest(Path(manifest_arg))
         if selected_silver_root is not None and str(Path(selected_silver_root)) != run_manifest.silver_root:
             raise PITDataError("--silver-root conflicts with --backtest-run-manifest selection")
         if selected_gold_root is not None and str(Path(selected_gold_root)) != run_manifest.gold_root:
@@ -950,6 +1201,235 @@ def _build_sessions(**kwargs: object) -> object:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.command == "scope-info":
+        from src.data.runtime import load_data_runtime
+
+        runtime = load_data_runtime(scope_config=args.scope_config, data_root=args.data_root)
+        _emit(
+            {
+                "scope_id": runtime.scope.scope_id,
+                "content_hash": runtime.scope.content_hash,
+                "bronze_root": str(runtime.workspace.bronze_root),
+                "silver_root": str(runtime.workspace.silver_root),
+                "gold_root": str(runtime.workspace.gold_root),
+                "state_root": str(runtime.workspace.state_root),
+                "runs_root": str(runtime.workspace.runs_root),
+            }
+        )
+        return 0
+    if args.command == "init-workspace":
+        from src.data.runtime import load_data_runtime
+
+        runtime = load_data_runtime(scope_config=args.scope_config, data_root=args.data_root)
+        runtime.workspace.initialize()
+        _emit({"scope_id": runtime.scope.scope_id, "data_root": str(runtime.workspace.root)})
+        return 0
+    if args.command == "collect-scoped":
+        def _collect_scoped() -> dict[str, object]:
+            runtime = _scoped_runtime(args)
+            writer = ScopedBronzeWriter(runtime=runtime, catalog=_scoped_catalog(runtime))
+            count = 0
+            content_hash = ""
+            for scoped_payload in _read_scoped_payloads(Path(args.payloads)):
+                receipt = writer.persist(scoped_payload)
+                count += 1
+                content_hash = receipt.bronze_receipt.content_hash
+            return {"scope_id": runtime.scope.scope_id, "receipts": count, "content_hash": content_hash}
+
+        return _run_scoped(args, _collect_scoped)
+    if args.command == "plan-scoped":
+        def _plan_scoped() -> dict[str, object]:
+            from src.data.collection_plan import build_scoped_flow_plan
+            from src.data.scope_coverage import build_scope_coverage_report
+
+            runtime = _scoped_runtime(args)
+            report = build_scope_coverage_report(
+                scope=runtime.scope,
+                requirements=_read_coverage_requirements(Path(args.requirements)),
+                catalog=_scoped_catalog(runtime),
+            )
+            plan = build_scoped_flow_plan(
+                runtime=runtime, report=report, max_sessions_per_request=int(args.max_sessions)
+            )
+            return {"plan_id": plan.plan_id, "chunks": len(plan.chunks), "scope_hash": report.scope_hash}
+
+        return _run_scoped(args, _plan_scoped)
+    if args.command == "resume-scoped":
+        def _resume_scoped() -> dict[str, object]:
+            from src.data.collection_plan import (
+                CollectionCheckpointStore,
+                load_collection_plan,
+                scoped_checkpoint_dir,
+                scoped_plan_dir,
+            )
+
+            runtime = _scoped_runtime(args)
+            plan = load_collection_plan(str(args.plan_id), artifact_root=scoped_plan_dir(runtime=runtime))
+            store = CollectionCheckpointStore(scoped_checkpoint_dir(runtime=runtime))
+            pending = [
+                chunk.chunk_id
+                for chunk in plan.chunks
+                if not store.has_verified_receipt(
+                    plan=plan, chunk=chunk, bronze_root=runtime.workspace.bronze_root
+                )
+            ]
+            return {"plan_id": plan.plan_id, "pending": pending}
+
+        return _run_scoped(args, _resume_scoped)
+    if args.command == "collect-dart-disclosures-scoped":
+        def _disclosures_scoped() -> dict[str, object]:
+            from src.data.schemas import EvidenceKind as _EvidenceKind
+
+            runtime = _scoped_runtime(args)
+            writer = ScopedBronzeWriter(runtime=runtime, catalog=_scoped_catalog(runtime))
+            rows = _mapping_rows(_read_json_list(Path(args.disclosures), label="disclosures"), label="disclosures")
+            retrieved_at = _parse_dt(args.retrieved_at)
+            count = 0
+            for row in rows:
+                key = str(row.get("rcept_no") or row.get("filing_id") or "").strip()
+                if not key:
+                    raise PITDataError("DART disclosure page is missing its adapter natural key")
+                as_of_raw = str(row.get("published_at") or row.get("coverage_date") or "").strip()
+                writer.persist(
+                    ScopedRawPayload(
+                        kind=_EvidenceKind.DISCLOSURES,
+                        source="dart_disclosures",
+                        natural_key=key,
+                        as_of=date.fromisoformat(as_of_raw[:10]) if as_of_raw else None,
+                        fiscal_period=None,
+                        status=EvidenceStatus.SUCCESS,
+                        payload=json.dumps(row, sort_keys=True, ensure_ascii=False).encode("utf-8"),
+                        retrieved_at=retrieved_at,
+                        source_label=f"opendart:list:{key}",
+                    )
+                )
+                count += 1
+            return {"scope_id": runtime.scope.scope_id, "receipts": count}
+
+        return _run_scoped(args, _disclosures_scoped)
+    if args.command == "collect-dart-facts-scoped":
+        def _facts_scoped() -> dict[str, object]:
+            return _build_dart_fact_batch_artifact(args)
+
+        return _run_scoped(args, _facts_scoped)
+    if args.command == "collect-missing-dart-facts-scoped":
+        def _missing_scoped() -> dict[str, object]:
+            summary = _build_dart_fact_batch_artifact(args)
+            return {
+                "plan_id": summary["plan_id"],
+                "missing_without_filing": summary["missing_without_filing"],
+                "selected": summary["selected"],
+            }
+
+        return _run_scoped(args, _missing_scoped)
+    if args.command == "rebase-2019":
+        def _rebase_2019() -> dict[str, object]:
+            from src.data.rebase import materialize_scoped_bronze
+
+            runtime = _scoped_runtime(args)
+            legacy_root = Path(args.legacy_data_root) if args.legacy_data_root else Path(args.data_root)
+            report = materialize_scoped_bronze(
+                runtime=runtime, legacy_data_root=legacy_root, dry_run=bool(args.dry_run)
+            )
+            return {
+                "report_path": str(report.report_path),
+                "retained": report.retained_payload_count,
+                "rejected": report.rejected_payload_count,
+                "dry_run": bool(args.dry_run),
+            }
+
+        return _run_scoped(args, _rebase_2019)
+    if args.command == "remove-legacy-data":
+        def _remove_legacy_data() -> dict[str, object]:
+            from src.data.data_reset import (
+                LEGACY_REMOVAL_TARGETS,
+                remove_verified_legacy_data,
+                verify_legacy_removal,
+            )
+            from src.data.rebase import RebaseReport, RetentionDecision
+
+            runtime = _scoped_runtime(args)
+            raw = json.loads(Path(args.rebase_report).read_text(encoding="utf-8"))
+            decisions = tuple(
+                RetentionDecision(
+                    legacy_path=Path(str(item.get("legacy_path") or "")),
+                    source=str(item.get("source") or ""),
+                    natural_key=str(item["natural_key"]) if item.get("natural_key") not in (None, "") else None,
+                    retained=bool(item.get("retained")),
+                    reason=str(item.get("reason") or ""),
+                )
+                for item in raw.get("decisions", [])
+            )
+            report = RebaseReport(
+                scope_hash=str(raw.get("scope_hash") or ""),
+                content_hash=str(raw.get("content_hash") or ""),
+                decisions=decisions,
+                catalog_revision_hash=str(raw.get("catalog_revision_hash") or ""),
+                retained_payload_count=int(raw.get("retained_payload_count", 0)),
+                rejected_payload_count=int(raw.get("rejected_payload_count", 0)),
+                report_path=Path(args.rebase_report),
+            )
+            verification = verify_legacy_removal(
+                runtime=runtime, rebase_report=report, data_root=Path(args.data_root)
+            )
+            if bool(args.apply):
+                removed = remove_verified_legacy_data(
+                    verification=verification, data_root=Path(args.data_root), apply=True
+                )
+                return {
+                    "removable": len(verification.verified_targets),
+                    "removed": len(removed),
+                    "absent": len(LEGACY_REMOVAL_TARGETS) - len(removed),
+                }
+            planned = remove_verified_legacy_data(
+                verification=verification, data_root=Path(args.data_root), apply=False
+            )
+            return {
+                "removable": len(planned),
+                "removed": 0,
+                "absent": len(LEGACY_REMOVAL_TARGETS) - len(planned),
+            }
+
+        return _run_scoped(args, _remove_legacy_data)
+    if args.command == "backtest":
+        def _scope_backtest() -> dict[str, object]:
+            from src.data.backtest_run_manifest import BacktestSegment, build_backtest_run_manifest
+            from src.data.backtest_runner import (
+                NextSessionExecutionModel,
+                run_scope_bound_backtest,
+            )
+
+            runtime = _scoped_runtime(args)
+            strategy_policy = _read_policy_json(Path(args.strategy_policy), label="strategy")
+            execution_policy = _read_policy_json(Path(args.execution_policy), label="execution")
+            universe_policy = _read_policy_json(Path(args.universe_policy), label="universe")
+            manifest = build_backtest_run_manifest(
+                runtime=runtime,
+                segment=cast(BacktestSegment, args.segment),
+                silver_dataset_ids=_parse_scope_dataset_bindings(args.silver_dataset_id),
+                gold_dataset_id=str(args.gold_dataset_id),
+                strategy_id=str(args.strategy_id),
+                strategy_policy_hash=_hash_policy_document(strategy_policy),
+                execution_policy_hash=_hash_policy_document(execution_policy),
+                universe_policy_hash=_hash_policy_document(universe_policy),
+            )
+            if manifest.period_end >= date(2026, 1, 1):
+                raise PITDataError("2026 and later dates are not completed backtest segments")
+            strategy = _build_scope_strategy(str(args.strategy_id), strategy_policy)
+            execution = NextSessionExecutionModel(
+                commission_rate=float(execution_policy.get("commission_rate", 0.0)),
+                tax_rate=float(execution_policy.get("tax_rate", 0.0)),
+            )
+            result = run_scope_bound_backtest(
+                runtime=runtime, manifest=manifest, strategy=strategy, execution_model=execution
+            )
+            return {
+                "run_dir": str(result.result_path.parent),
+                "manifest_hash": result.manifest_hash,
+                "metrics": dict(result.metrics),
+            }
+
+        return _run_scoped(args, _scope_backtest)
     if args.command == "audit-provenance":
         try:
             from src.data.provenance_audit import audit_production_provenance
@@ -1111,6 +1591,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         _emit({"plan_id": backfill_plan.plan_id, "required_periods": list(backfill_plan.required_periods)})
         return 0
+    if args.command == "collect-missing-dart-facts":
+        try:
+            from src.data.dart_backfill import DartMissingFactsRequest, run_dart_missing_facts_batch
+            from src.integrations.dart.xbrl import DartXbrlCollector
+            from src.integrations.quota import ProviderQuotaBlocked, ProviderQuotaStateStore
+
+            missing_facts_plan = run_dart_missing_facts_batch(
+                request=DartMissingFactsRequest(
+                    bronze_root=Path(args.bronze_root), artifact_root=Path(args.artifact_root),
+                    backfill_artifact=Path(args.backfill_artifact), retrieved_at=_parse_dt(args.retrieved_at),
+                    offset=int(args.offset), limit=int(args.limit),
+                ),
+                dart=DartXbrlCollector(quota_store=ProviderQuotaStateStore(Path(args.artifact_root) / "quota")),
+            )
+        except (PITDataError, ValueError, OSError, ProviderQuotaBlocked) as exc:
+            _emit({"error": str(exc)})
+            return 1
+        _emit({"plan_id": missing_facts_plan.plan_id, "candidate_count": missing_facts_plan.candidate_count, "selected_count": len(missing_facts_plan.selected_identities), "missing_without_filing_count": missing_facts_plan.missing_without_filing_count})
+        return 0
     if args.command == "materialize":
         try:
             from src.core.datasets import DatasetCertification
@@ -1213,6 +1712,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "deletion_eligible": sg_plan.deletion_eligible,
             }
         )
+        return 0
+    if args.command == "audit-ordinary-universe-prices":
+        try:
+            from src.data.ordinary_universe_price_audit import audit_ordinary_universe_price_availability
+
+            ordinary_price_audit = audit_ordinary_universe_price_availability(
+                universe_root=Path(args.universe_root),
+                bronze_root=Path(args.bronze_root),
+                artifact_root=Path(args.artifact_root),
+            )
+        except (PITDataError, ValueError, OSError):
+            return 1
+        from dataclasses import asdict
+
+        _emit(asdict(ordinary_price_audit))
         return 0
     if args.command == "purge-legacy":
         # Purge consumes persisted proof only and requires --confirm-purge.

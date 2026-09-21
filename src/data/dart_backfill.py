@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+import re
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -11,17 +12,26 @@ from pathlib import Path
 import polars as pl
 
 from src.data.collection import collect_dart_disclosures, collect_dart_financial_facts
+from src.data.receipt_catalog import ReceiptCatalog
+from src.data.runtime import DataRuntime
 from src.data.schemas import PITDataError
+from src.data.scope_coverage import CoverageRequirement
+from src.data.scoped_ingestion import FACT_SOURCE, dart_fact_natural_key
 from src.integrations.dart.client import DartCorpCodeRecord
 from src.integrations.dart.xbrl import DartXbrlCollector
 
 __all__ = [
+    "DartFactBatchPlan",
     "DartHistoricalBackfillPlan",
     "DartHistoricalBackfillRequest",
+    "DartMissingFactsPlan",
+    "DartMissingFactsRequest",
     "SingleAccountBackfillRequest",
     "build_dart_historical_backfill_plan",
+    "build_scoped_dart_fact_batch",
     "build_single_account_request_plan",
     "run_dart_historical_backfill_batch",
+    "run_dart_missing_facts_batch",
 ]
 
 
@@ -111,6 +121,24 @@ class DartHistoricalBackfillPlan:
     unresolved_tickers: tuple[str, ...]
     identities: tuple[Mapping[str, str], ...]
     corp_code_receipt_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class DartMissingFactsRequest:
+    bronze_root: Path
+    artifact_root: Path
+    backfill_artifact: Path
+    retrieved_at: datetime
+    offset: int
+    limit: int
+
+
+@dataclass(frozen=True, slots=True)
+class DartMissingFactsPlan:
+    plan_id: str
+    candidate_count: int
+    selected_identities: tuple[Mapping[str, str], ...]
+    missing_without_filing_count: int
 
 
 # 4분기 TTM 윈도우에 전년동기 이익모멘텀 비교 분기(latest - 4)를 더한 5분기
@@ -323,6 +351,87 @@ def _dedupe_endpoint_identities(
     return tuple(selected[key] for key in sorted(selected))
 
 
+def _successful_fact_endpoints(bronze_root: Path) -> frozenset[tuple[str, str, str, str]]:
+    covered: set[tuple[str, str, str, str]] = set()
+    for payload_path in (Path(bronze_root) / "financial_facts").glob("*/payload.json"):
+        try:
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise PITDataError("financial-facts Bronze payload is unreadable") from exc
+        if not isinstance(payload, dict):
+            continue
+        status = str(payload.get("status") or "").strip()
+        records = payload.get("records")
+        if status in {"013", "014", "extraction_failed"} or not isinstance(records, list) or not records:
+            continue
+        endpoint = _endpoint_key({
+            "corp_code": str(payload.get("corp_code") or ""),
+            "biz_year": str(payload.get("biz_year") or ""),
+            "reprt_code": str(payload.get("reprt_code") or ""),
+            "fs_div": str(payload.get("fs_div") or "CFS"),
+        })
+        if all(endpoint[:3]):
+            covered.add(endpoint)
+    return frozenset(covered)
+
+
+def run_dart_missing_facts_batch(
+    *, request: DartMissingFactsRequest, dart: DartXbrlCollector
+) -> DartMissingFactsPlan:
+    """Collect retained periodic filing identities lacking successful fact evidence.
+
+    This reuses Bronze disclosures and therefore never invokes the costly DART
+    disclosure-list endpoint. Filing periods absent from retained disclosures
+    are reported separately because no fact request can identify them safely.
+    """
+    if request.retrieved_at.tzinfo is None:
+        raise PITDataError("retrieved_at must be timezone-aware")
+    if request.offset < 0 or request.limit < 1:
+        raise PITDataError("offset must be nonnegative and limit must be positive")
+    try:
+        artifact = json.loads(Path(request.backfill_artifact).read_text(encoding="utf-8"))
+        mapping = {str(code): str(ticker) for code, ticker in artifact["ticker_by_corp_code"].items()}
+        periods = frozenset(str(item) for item in artifact["required_periods"])
+        validation_start = date.fromisoformat(str(artifact["validation_start"]))
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise PITDataError("invalid DART backfill artifact") from exc
+    if not mapping or not periods:
+        raise PITDataError("invalid DART backfill artifact")
+    identities = DartXbrlCollector.filing_identities_from_bronze(
+        Path(request.bronze_root), start=date(min(int(period[:4]) for period in periods), 1, 1),
+        end=validation_start, ticker_by_corp_code=mapping, required_periods=periods,
+        corp_codes=frozenset(mapping),
+    )
+    identities = _dedupe_endpoint_identities(tuple(dict(item) for item in identities))
+    covered = _successful_fact_endpoints(Path(request.bronze_root))
+    candidates = tuple(item for item in identities if _endpoint_key(item) not in covered)
+    observed = {(str(item.get("ticker") or ""), str(item.get("fiscal_period") or "")) for item in identities}
+    missing_without_filing = len({(ticker, period) for ticker in mapping.values() for period in periods} - observed)
+    selected = candidates[request.offset : request.offset + request.limit]
+    if not selected:
+        raise PITDataError("requested missing-facts batch is empty")
+    result = collect_dart_financial_facts(
+        dart=dart, identities=tuple(dict(item) for item in selected),
+        bronze_root=Path(request.bronze_root), retrieved_at=request.retrieved_at,
+    )
+    digest = hashlib.sha256()
+    for item in selected:
+        digest.update(json.dumps(item, sort_keys=True).encode("utf-8"))
+        digest.update(b"\x00")
+    plan_id = f"missing-facts-{digest.hexdigest()[:16]}"
+    output = {
+        "plan_id": plan_id, "candidate_count": len(candidates),
+        "selected_identities": [dict(item) for item in selected],
+        "missing_without_filing_count": missing_without_filing,
+        "offset": request.offset, "limit": request.limit,
+        "financial_fact_content_hash": result.content_hash,
+    }
+    target = Path(request.artifact_root) / "dart_missing_facts"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / f"{plan_id}.json").write_text(json.dumps(output, sort_keys=True, indent=2), encoding="utf-8")
+    return DartMissingFactsPlan(plan_id, len(candidates), selected, missing_without_filing)
+
+
 def run_dart_historical_backfill_batch(
     *, request: DartHistoricalBackfillRequest, dart: DartXbrlCollector
 ) -> DartHistoricalBackfillPlan:
@@ -480,3 +589,113 @@ def run_dart_historical_backfill_batch(
         json.dumps(payload, sort_keys=True, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return plan
+
+
+_REPRT_QUARTER = {"11013": 1, "11012": 2, "11014": 3, "11011": 4}
+_FISCAL_PATTERN = re.compile(r"\d{4}Q[1-4]")
+
+
+def _period_key(period: str) -> int:
+    return int(period[:4]) * 4 + int(period[5])
+
+
+def _identity_fiscal_period(identity: Mapping[str, str]) -> str:
+    raw = str(identity.get("fiscal_period") or "").strip()
+    if raw:
+        if not _FISCAL_PATTERN.fullmatch(raw):
+            raise PITDataError(f"invalid fiscal period {raw!r}")
+        return raw
+    biz_year = str(identity.get("biz_year") or "").strip()
+    reprt_code = str(identity.get("reprt_code") or "").strip()
+    quarter = _REPRT_QUARTER.get(reprt_code)
+    if not biz_year.isdigit() or quarter is None:
+        raise PITDataError("DART fact identity is missing a derivable fiscal period")
+    return f"{int(biz_year)}Q{quarter}"
+
+
+@dataclass(frozen=True, slots=True)
+class DartFactBatchPlan:
+    """Quota-bounded DART fact identities selected from in-scope filing evidence."""
+
+    scope_hash: str
+    plan_id: str
+    identities: tuple[Mapping[str, str], ...]
+    missing_without_filing: tuple[CoverageRequirement, ...]
+    estimated_request_ceiling: int
+
+
+def build_scoped_dart_fact_batch(
+    *,
+    runtime: DataRuntime,
+    catalog: ReceiptCatalog,
+    filing_identities: Collection[Mapping[str, str]],
+    offset: int,
+    limit: int,
+) -> DartFactBatchPlan:
+    """Select retained 2019+ filing identities lacking successful fact evidence without disclosure-list discovery."""
+    scope = runtime.scope
+    if offset < 0 or limit < 1:
+        raise PITDataError("offset must be nonnegative and limit must be positive")
+    floor = scope.features.fundamental_fiscal_start
+    full: dict[tuple[str, str, str], dict[str, str]] = {}
+    missing: list[CoverageRequirement] = []
+    for raw_identity in filing_identities:
+        item = dict(raw_identity)
+        corp_code = str(item.get("corp_code") or "").strip()
+        biz_year = str(item.get("biz_year") or "").strip()
+        reprt_code = str(item.get("reprt_code") or "").strip()
+        if not corp_code or not biz_year or not reprt_code:
+            raise PITDataError("DART fact identity is missing corp code, business year, or report code")
+        filing_id = str(item.get("filing_id") or item.get("rcept_no") or "").strip()
+        published_at = str(item.get("published_at") or item.get("available_at") or "").strip()
+        natural_key = dart_fact_natural_key(corp_code=corp_code, biz_year=biz_year, reprt_code=reprt_code)
+        if not filing_id or not published_at:
+            as_of_raw = str(item.get("as_of") or "").strip()
+            missing.append(
+                CoverageRequirement(
+                    source=FACT_SOURCE,
+                    natural_key=natural_key,
+                    as_of=date.fromisoformat(as_of_raw[:10]) if as_of_raw else None,
+                    fiscal_period=_identity_fiscal_period(item),
+                    required=True,
+                )
+            )
+            continue
+        if _period_key(_identity_fiscal_period(item)) < _period_key(floor):
+            continue
+        key = (corp_code, biz_year, reprt_code)
+        current = full.get(key)
+        if current is None or (published_at, filing_id) > (
+            str(current.get("published_at") or current.get("available_at") or ""),
+            str(current.get("filing_id") or current.get("rcept_no") or ""),
+        ):
+            full[key] = item
+    covered = catalog.successful_keys(source=FACT_SOURCE, fiscal_start=floor)
+    candidates = sorted(
+        (
+            item
+            for key, item in full.items()
+            if dart_fact_natural_key(corp_code=key[0], biz_year=key[1], reprt_code=key[2]) not in covered
+        ),
+        key=lambda item: dart_fact_natural_key(
+            corp_code=str(item.get("corp_code") or ""),
+            biz_year=str(item.get("biz_year") or ""),
+            reprt_code=str(item.get("reprt_code") or ""),
+        ),
+    )
+    page = candidates[offset : offset + limit]
+    allowance = min(len(page), scope.collection.dart_batch_identities, scope.collection.dart_daily_budget // 3)
+    selected = tuple(page[:allowance])
+    digest = hashlib.sha256()
+    digest.update(scope.content_hash.encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(json.dumps([dict(item) for item in selected], sort_keys=True).encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(f"{offset}:{limit}".encode())
+    return DartFactBatchPlan(
+        scope_hash=scope.content_hash,
+        plan_id=f"dart-facts-{digest.hexdigest()[:16]}",
+        identities=selected,
+        missing_without_filing=tuple(sorted(missing, key=lambda item: (item.source, item.natural_key))),
+        estimated_request_ceiling=len(selected) * 3,
+    )

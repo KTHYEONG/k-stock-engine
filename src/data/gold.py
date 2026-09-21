@@ -27,7 +27,9 @@ import polars as pl
 
 from src.core.datasets import DatasetCertification
 from src.core.time import KRX_TZ, SessionCalendar
+from src.data.runtime import DataRuntime
 from src.data.schemas import PITDataError
+from src.data.scope_coverage import ScopeCoverageReport
 
 # ──────────────────────────────────────────────────────────────────
 # Domain types
@@ -980,3 +982,119 @@ def _count_reasons(results: tuple[Any, ...]) -> dict[str, int]:
         for reason in r.exclusion_reasons:
             counts[reason.value] = counts.get(reason.value, 0) + 1
     return counts
+
+
+GOLD_RELEASES_DIR = "releases"
+GOLD_RELEASE_FILE = "release.json"
+
+_PRICE_SOURCES: frozenset[str] = frozenset({"krx_daily_market", "daily_market"})
+_UNIVERSE_SOURCES: frozenset[str] = frozenset({"universe", "security_master", "krx_security_master", "dart_corp_codes"})
+_FUNDAMENTAL_SOURCES: frozenset[str] = frozenset({"financial_facts"})
+_FLOW_SOURCES: frozenset[str] = frozenset({"investor_flow"})
+_INDUSTRY_SOURCES: frozenset[str] = frozenset({"industry"})
+
+
+@dataclass(frozen=True, slots=True)
+class GoldReleaseMetadata:
+    """Scope-bound Gold release stamped with its source datasets and coverage proof."""
+
+    scope_id: str
+    scope_hash: str
+    dataset_id: str
+    silver_dataset_ids: dict[str, str]
+    universe_policy_hash: str
+    feature_policy_hash: str
+    coverage_report_hash: str
+    disabled_sources: tuple[str, ...]
+    content_hash: str
+
+
+def _coverage_report_hash(report: ScopeCoverageReport) -> str:
+    def _key(item: Any) -> list[str | None]:
+        return [item.source, item.natural_key, item.as_of.isoformat() if item.as_of else None, item.fiscal_period]
+
+    payload = {
+        "scope_hash": report.scope_hash,
+        "fulfilled": sorted((_key(item) for item in report.fulfilled), key=lambda row: (row[0] or "", row[1] or "")),
+        "missing": sorted((_key(item) for item in report.missing), key=lambda row: (row[0] or "", row[1] or "")),
+        "unresolved": sorted((_key(item) for item in report.unresolved), key=lambda row: (row[0] or "", row[1] or "")),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _release_required_unresolved(
+    *, scope: Any, report: ScopeCoverageReport, disabled: frozenset[str]
+) -> tuple[str, str] | None:
+    fulfilled = {(item.source, item.natural_key) for item in report.fulfilled}
+    for item in (*report.missing, *report.unresolved):
+        if not item.required or item.source in disabled:
+            continue
+        gated = (
+            item.source in _PRICE_SOURCES
+            or item.source in _UNIVERSE_SOURCES
+            or item.source in _FUNDAMENTAL_SOURCES
+            or (item.source in _FLOW_SOURCES and scope.features.investor_flow_enabled)
+            or (item.source in _INDUSTRY_SOURCES and scope.features.industry_enabled)
+        )
+        if gated and (item.source, item.natural_key) not in fulfilled:
+            return (item.source, item.natural_key)
+    return None
+
+
+def create_scope_bound_gold_release(
+    *,
+    runtime: DataRuntime,
+    dataset_id: str,
+    silver_dataset_ids: dict[str, str],
+    universe_policy_hash: str,
+    feature_policy_hash: str,
+    coverage_report: ScopeCoverageReport,
+) -> GoldReleaseMetadata:
+    """Stamp one Gold release with Scope identity after its required coverage resolves."""
+    scope = runtime.scope
+    if not isinstance(dataset_id, str) or not dataset_id.strip() or dataset_id.strip() != dataset_id:
+        raise PITDataError("invalid dataset_id: must be a non-empty single path component")
+    if "/" in dataset_id or "\\" in dataset_id or dataset_id in (".", ".."):
+        raise PITDataError("invalid dataset_id: must be a non-empty single path component")
+    if not isinstance(silver_dataset_ids, dict) or not silver_dataset_ids:
+        raise PITDataError("silver_dataset_ids must be a non-empty mapping")
+    if not isinstance(universe_policy_hash, str) or not universe_policy_hash.strip():
+        raise PITDataError("universe_policy_hash must be non-empty")
+    if not isinstance(feature_policy_hash, str) or not feature_policy_hash.strip():
+        raise PITDataError("feature_policy_hash must be non-empty")
+    disabled = frozenset(
+        [source for source in sorted(_FLOW_SOURCES) if not scope.features.investor_flow_enabled]
+        + [source for source in sorted(_INDUSTRY_SOURCES) if not scope.features.industry_enabled]
+    )
+    blocking = _release_required_unresolved(scope=scope, report=coverage_report, disabled=disabled)
+    if blocking is not None:
+        raise PITDataError(f"gold release blocked: unresolved required coverage for {blocking[0]!r}")
+    report_hash = _coverage_report_hash(coverage_report)
+    canonical = {
+        "coverage_report_hash": report_hash,
+        "dataset_id": dataset_id,
+        "disabled_sources": sorted(disabled),
+        "feature_policy_hash": feature_policy_hash,
+        "scope_hash": scope.content_hash,
+        "scope_id": scope.scope_id,
+        "silver_dataset_ids": {key: silver_dataset_ids[key] for key in sorted(silver_dataset_ids)},
+        "universe_policy_hash": universe_policy_hash,
+    }
+    content_hash = hashlib.sha256(json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    metadata = GoldReleaseMetadata(
+        scope_id=scope.scope_id,
+        scope_hash=scope.content_hash,
+        dataset_id=dataset_id,
+        silver_dataset_ids=dict(sorted(silver_dataset_ids.items())),
+        universe_policy_hash=universe_policy_hash,
+        feature_policy_hash=feature_policy_hash,
+        coverage_report_hash=report_hash,
+        disabled_sources=tuple(sorted(disabled)),
+        content_hash=content_hash,
+    )
+    release_dir = runtime.workspace.gold_root / GOLD_RELEASES_DIR / dataset_id
+    release_dir.mkdir(parents=True, exist_ok=True)
+    (release_dir / GOLD_RELEASE_FILE).write_text(
+        json.dumps({**canonical, "content_hash": content_hash}, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    return metadata
