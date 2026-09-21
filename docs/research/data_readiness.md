@@ -1,6 +1,23 @@
 # 백테스트 데이터 준비 현황과 수집 계획
 
-기준일: 2026-09-20. 수치는 현재 `data/bronze/stocks` 원본과 수집 계획·완료 기록을 직접 집계했다. DART 잔여 수집 후 재측정한다. 전략과 백테스트 규칙은 [strategy.md](strategy.md)에 둔다.
+기준일: 2026-09-21. 활성 데이터는 `kr_swing_2019_v1` Scope이며, 기존 `data/bronze/stocks` 원본과 과거 Silver·Gold 실행 산출물은 제거됐다. 전략과 백테스트 규칙은 [strategy.md](strategy.md)에 둔다.
+
+## Scope 재구축 결과
+
+| 항목 | 확정 결과 | 판정 |
+| --- | ---: | --- |
+| 원본 기간 | 2019-01-01~2025-12-31 | 개발·검증·홀드아웃에 사용 가능한 완료 구간 |
+| 일별 가격·마스터 | 각 1,719거래일 | 보통주 유니버스의 날짜별 근거 확보 |
+| 보통주 적격 셀 | 3,911,950 | 우선주·SPAC·비주권·비KOSPI/KOSDAQ 제외 사유를 보존 |
+| 가격 누락 | 0 | 적격 셀과 가격 원본의 일자·종목 결합 완료 |
+| 거래 가능 가격 | 3,778,374 | 가격 이상 133,576건은 거래 불가로 유지 |
+| DART 재무 원본 | 66,159 filing | 기존 61,948건 + 누적 백필 성공 4,211건 |
+
+사업보고서 목록 조회로 2019Q4 3,070건, 2024Q4 3,790건을 확보했고, 회사·회계연도별 중복 제거 후보는 6,026건이다. 누적 백필 성공은 4,211건이며, 추가 실행 중 저장된 성공 42건을 반영해 현재 성공 facts는 66,159건, 잔여 filing identity는 1,137건이다. 응답 불가·추출 실패·빈 응답은 성공으로 집계하지 않았다(표준 XBRL 및 문서 fallback 혼합). corpCode ticker bridge를 보강한 뒤 Silver를 재생성해 632,263행·3,134개 회사·65,512개 filing이 PIT 입력으로 반영됐으며, 상세 coverage 보고서는 `data/state/kr_swing_2019_v1/financial_facts_pit_coverage_20260921.json`에 기록했다. facts 일일 시도 카운터는 7,343회(임시 운영 상한 8,000회, 예약선 7,900회)였다. quota 원장은 `data/state/kr_swing_2019_v1/quota/`에 보존되어 있다.
+
+### DART quota 운영 한도
+
+활성 Scope의 DART 정책은 `config/research/kr_swing_2019_v1.toml`에만 둔다. 일일 예산은 16,000회, 예약 호출은 400회, 전역 요청 간격은 1초, worker는 1개다. 요청 가능량은 모든 OpenDART endpoint의 같은 KST 일자 호출 합계에서 예약분을 뺀 값으로 계산하며, identity당 최대 3회(CFS·OFS·fallback)로 계획한다. 따라서 endpoint별 수치만 보고 quota 여유를 판단하지 않는다. 기존 원장의 `blocked_until`이 5분 cooldown인 경우 일일 한도 소진으로 해석하지 않으며, 실제 호출부터 새 일일 카운터를 기록한다.
 
 날짜별 보통주 마스터의 전체 필드 감사와 Bronze→Silver 계약은 [ordinary_universe.md](ordinary_universe.md)에 기록했다.
 

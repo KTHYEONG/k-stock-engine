@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -74,7 +75,7 @@ class ScopedBronzeWriter:
         self._runtime = runtime
         self._catalog = catalog
 
-    def persist(self, payload: ScopedRawPayload) -> ScopedReceipt:
+    def _validate(self, payload: ScopedRawPayload) -> None:
         scope = self._runtime.scope
         if payload.retrieved_at.tzinfo is None:
             raise PITDataError("retrieved_at must be timezone-aware")
@@ -93,17 +94,27 @@ class ScopedBronzeWriter:
                 raise PITDataError(f"scoped payload fiscal period {payload.fiscal_period!r} precedes scope floor")
         if payload.kind == EvidenceKind.FINANCIAL_FACTS and payload.status == EvidenceStatus.SUCCESS and not payload.fiscal_period:
             raise PITDataError("successful financial facts require a fiscal period")
+
+    def persist_many(self, payloads: Sequence[ScopedRawPayload]) -> tuple[ScopedReceipt, ...]:
+        """Persist a bounded batch and expose all receipts in one catalog revision."""
+        if not payloads:
+            return ()
+        for payload in payloads:
+            self._validate(payload)
         store = BronzeStore(self._runtime.workspace.bronze_root)
-        receipt = store.import_bytes(
-            payload.payload,
-            kind=payload.kind,
-            retrieved_at=payload.retrieved_at,
-            source_label=payload.source_label,
-        )
-        if hashlib.sha256(Path(receipt.payload_path).read_bytes()).hexdigest() != receipt.content_hash:
-            raise PITDataError("hash verification failed before catalog publication")
-        revision = self._catalog.publish(
-            (
+        receipts: list[BronzeReceipt] = []
+        entries: list[ReceiptIndexEntry] = []
+        for payload in payloads:
+            receipt = store.import_bytes(
+                payload.payload,
+                kind=payload.kind,
+                retrieved_at=payload.retrieved_at,
+                source_label=payload.source_label,
+            )
+            if hashlib.sha256(Path(receipt.payload_path).read_bytes()).hexdigest() != receipt.content_hash:
+                raise PITDataError("hash verification failed before catalog publication")
+            receipts.append(receipt)
+            entries.append(
                 ReceiptIndexEntry(
                     source=payload.source,
                     natural_key=payload.natural_key,
@@ -113,7 +124,11 @@ class ScopedBronzeWriter:
                     content_hash=receipt.content_hash,
                     retrieved_at=receipt.retrieved_at,
                     payload_path=receipt.payload_path,
-                ),
+                )
             )
-        )
-        return ScopedReceipt(bronze_receipt=receipt, catalog_revision=revision)
+        revision = self._catalog.publish(entries)
+        return tuple(ScopedReceipt(bronze_receipt=receipt, catalog_revision=revision) for receipt in receipts)
+
+    def persist(self, payload: ScopedRawPayload) -> ScopedReceipt:
+        """Persist one raw payload through the same batch contract."""
+        return self.persist_many((payload,))[0]

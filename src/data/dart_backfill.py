@@ -6,7 +6,7 @@ import json
 import re
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import polars as pl
@@ -19,6 +19,7 @@ from src.data.scope_coverage import CoverageRequirement
 from src.data.scoped_ingestion import FACT_SOURCE, dart_fact_natural_key
 from src.integrations.dart.client import DartCorpCodeRecord
 from src.integrations.dart.xbrl import DartXbrlCollector
+from src.integrations.quota import ProviderQuotaStateStore
 
 __all__ = [
     "DartFactBatchPlan",
@@ -28,10 +29,12 @@ __all__ = [
     "DartMissingFactsRequest",
     "SingleAccountBackfillRequest",
     "build_dart_historical_backfill_plan",
+    "build_scoped_dart_collector",
     "build_scoped_dart_fact_batch",
     "build_single_account_request_plan",
     "run_dart_historical_backfill_batch",
     "run_dart_missing_facts_batch",
+    "scoped_dart_request_headroom",
 ]
 
 
@@ -622,6 +625,39 @@ class DartFactBatchPlan:
     identities: tuple[Mapping[str, str], ...]
     missing_without_filing: tuple[CoverageRequirement, ...]
     estimated_request_ceiling: int
+    available_request_headroom: int
+
+
+def scoped_dart_request_headroom(
+    *,
+    runtime: DataRuntime,
+    quota_store: ProviderQuotaStateStore | None = None,
+    now: datetime | None = None,
+) -> int:
+    """Return request capacity after reserving provider-wide DART quota headroom."""
+    settings = runtime.scope.collection
+    store = quota_store or ProviderQuotaStateStore(runtime.workspace.state_root / "quota")
+    moment = now or datetime.now(UTC)
+    remaining = store.remaining_daily_attempts(
+        provider="OpenDART",
+        now=moment,
+        daily_limit=settings.dart_daily_budget,
+    )
+    return max(0, remaining - settings.dart_daily_reserve)
+
+
+def build_scoped_dart_collector(
+    *, runtime: DataRuntime, quota_store: ProviderQuotaStateStore | None = None
+) -> DartXbrlCollector:
+    """Build the sole DART collector from the active scope collection policy."""
+    settings = runtime.scope.collection
+    store = quota_store or ProviderQuotaStateStore(runtime.workspace.state_root / "quota")
+    return DartXbrlCollector(
+        quota_store=store,
+        max_workers=settings.dart_max_workers,
+        min_interval=settings.dart_request_min_interval_seconds,
+        daily_request_limit=settings.dart_daily_budget,
+    )
 
 
 def build_scoped_dart_fact_batch(
@@ -631,6 +667,8 @@ def build_scoped_dart_fact_batch(
     filing_identities: Collection[Mapping[str, str]],
     offset: int,
     limit: int,
+    quota_store: ProviderQuotaStateStore | None = None,
+    now: datetime | None = None,
 ) -> DartFactBatchPlan:
     """Select retained 2019+ filing identities lacking successful fact evidence without disclosure-list discovery."""
     scope = runtime.scope
@@ -684,7 +722,14 @@ def build_scoped_dart_fact_batch(
         ),
     )
     page = candidates[offset : offset + limit]
-    allowance = min(len(page), scope.collection.dart_batch_identities, scope.collection.dart_daily_budget // 3)
+    request_headroom = scoped_dart_request_headroom(
+        runtime=runtime, quota_store=quota_store, now=now
+    )
+    allowance = min(
+        len(page),
+        scope.collection.dart_batch_identities,
+        request_headroom // 3,
+    )
     selected = tuple(page[:allowance])
     digest = hashlib.sha256()
     digest.update(scope.content_hash.encode("utf-8"))
@@ -698,4 +743,5 @@ def build_scoped_dart_fact_batch(
         identities=selected,
         missing_without_filing=tuple(sorted(missing, key=lambda item: (item.source, item.natural_key))),
         estimated_request_ceiling=len(selected) * 3,
+        available_request_headroom=request_headroom,
     )

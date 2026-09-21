@@ -253,9 +253,16 @@ def test_dart_xbrl_collector_forwards_quota_store_and_pacing_to_api_client(monke
     quota_store = object()
     now = object()
 
-    collector = DartXbrlCollector(api_key="key", quota_store=quota_store, now=now, min_interval=2.0)
+    collector = DartXbrlCollector(
+        api_key="key",
+        quota_store=quota_store,
+        now=now,
+        min_interval=2.0,
+        daily_request_limit=16000,
+    )
 
     assert captured["quota_store"] is quota_store
     assert captured["now"] is now
     assert captured["min_interval"] == 2.0
+    assert captured["daily_request_limit"] == 16000
     assert collector._client is not None

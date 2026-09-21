@@ -27,9 +27,11 @@ __all__ = ["RebaseReport", "RetentionDecision", "materialize_scoped_bronze"]
 _REPRT_QUARTER = {"11013": 1, "11012": 2, "11014": 3, "11011": 4}
 _FISCAL_PATTERN = re.compile(r"\d{4}Q[1-4]")
 _PRICE_SOURCE = "krx_daily_market"
+_MASTER_SOURCE = "krx_security_master"
 _ACTION_SOURCE = "dart_corporate_actions"
 _CORP_MAP_KEY = "dart_corp_codes"
 _CORP_MAP_DIR = "dart_corp_codes"
+_REBASE_CATALOG_BATCH_SIZE = 500
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +101,10 @@ def _action_day(payload: Mapping[str, Any]) -> date | None:
     return _parse_iso_day(payload.get("end")) or _parse_iso_day(payload.get("start"))
 
 
+def _master_day(payload: Mapping[str, Any]) -> date | None:
+    return _parse_iso_day(payload.get("as_of")) or _parse_iso_day(payload.get("session"))
+
+
 def _string_field(payload: Mapping[str, Any], *names: str) -> str:
     for name in names:
         value = payload.get(name)
@@ -139,6 +145,24 @@ def _iter_legacy_payloads(bronze_source: Path) -> list[tuple[str, Path]]:
             if payload_path.is_file():
                 found.append((kind_dir.name, payload_path))
     return found
+
+
+def _legacy_bronze_source(legacy_data_root: Path) -> Path:
+    """Resolve either historical ``bronze/stocks`` or direct Bronze layouts.
+
+    Earlier runs stored stock evidence under ``data/bronze/stocks`` while the
+    rebase command accepts the data root.  Fixtures and future imports may use
+    a direct ``bronze/<kind>`` layout, so prefer the explicit legacy namespace
+    and retain the direct layout as a compatible source.
+    """
+    root = Path(legacy_data_root)
+    namespaced = root / "bronze" / "stocks"
+    if namespaced.is_dir():
+        return namespaced
+    direct = root / "bronze"
+    if direct.is_dir():
+        return direct
+    return root
 
 
 def _check_duplicate(
@@ -193,6 +217,42 @@ def _retain_price(
     return RetentionDecision(legacy_path, source, natural_key, True, "in_scope_verified"), scoped
 
 
+def _retain_security_master(
+    *,
+    scope: ResearchScope,
+    legacy_path: Path,
+    payload: Mapping[str, Any],
+    raw: bytes,
+    retrieved_at: datetime,
+    seen: dict[tuple[str, str], str],
+) -> tuple[RetentionDecision, ScopedRawPayload | None]:
+    provider_day = _master_day(payload)
+    if provider_day is None:
+        return RetentionDecision(legacy_path, _MASTER_SOURCE, None, False, "missing_provider_date"), None
+    natural_key = provider_day.isoformat()
+    if provider_day < scope.evidence_start or provider_day > scope.completed_end:
+        return RetentionDecision(legacy_path, _MASTER_SOURCE, natural_key, False, "out_of_scope_provider_date"), None
+    duplicate = _check_duplicate(
+        source=_MASTER_SOURCE, natural_key=natural_key, legacy_path=legacy_path, raw=raw, seen=seen
+    )
+    if duplicate is not None:
+        return duplicate, None
+    return (
+        RetentionDecision(legacy_path, _MASTER_SOURCE, natural_key, True, "in_scope_verified"),
+        ScopedRawPayload(
+            kind=EvidenceKind.SECURITY_MASTER,
+            source=_MASTER_SOURCE,
+            natural_key=natural_key,
+            as_of=provider_day,
+            fiscal_period=None,
+            status=EvidenceStatus.SUCCESS,
+            payload=raw,
+            retrieved_at=retrieved_at,
+            source_label=f"legacy:{legacy_path}",
+        ),
+    )
+
+
 def _retain_fact(
     *,
     scope: ResearchScope,
@@ -213,7 +273,10 @@ def _retain_fact(
         return RetentionDecision(legacy_path, FACT_SOURCE, natural_key, False, "missing_fiscal_period"), None
     if not _FISCAL_PATTERN.fullmatch(fiscal_period):
         return RetentionDecision(legacy_path, FACT_SOURCE, natural_key, False, "invalid_fiscal_period"), None
-    if _fiscal_key(fiscal_period) < _fiscal_key(scope.features.fundamental_fiscal_start):
+    if (
+        _fiscal_key(fiscal_period) < _fiscal_key(scope.features.fundamental_fiscal_start)
+        or int(fiscal_period[:4]) > scope.completed_end.year
+    ):
         return RetentionDecision(legacy_path, FACT_SOURCE, natural_key, False, "out_of_scope_fiscal_period"), None
     provider_day = _parse_iso_day(_string_field(payload, "published_at")) or retrieved_at.date()
     duplicate = _check_duplicate(source=FACT_SOURCE, natural_key=natural_key, legacy_path=legacy_path, raw=raw, seen=seen)
@@ -320,6 +383,13 @@ def _decide(
             scope=scope, legacy_path=legacy_path, payload=payload,
             raw=raw, retrieved_at=retrieved_at, seen=seen, is_action=True,
         )
+    if kind_name == EvidenceKind.SECURITY_MASTER.value:
+        if not isinstance(payload, dict):
+            return RetentionDecision(legacy_path, kind_name, None, False, "malformed_legacy_payload"), None
+        return _retain_security_master(
+            scope=scope, legacy_path=legacy_path, payload=payload,
+            raw=raw, retrieved_at=retrieved_at, seen=seen,
+        )
     if kind_name == EvidenceKind.FINANCIAL_FACTS.value:
         if not isinstance(payload, dict):
             return RetentionDecision(legacy_path, kind_name, None, False, "malformed_legacy_payload"), None
@@ -358,13 +428,13 @@ def materialize_scoped_bronze(
 ) -> RebaseReport:
     """Classify legacy raw receipts and retain only independently verified in-scope source evidence."""
     scope = runtime.scope
-    bronze_source = Path(legacy_data_root) / "bronze"
+    bronze_source = _legacy_bronze_source(Path(legacy_data_root))
     catalog = ReceiptCatalog(runtime.workspace.bronze_root / "catalog")
     writer = None if dry_run else ScopedBronzeWriter(runtime=runtime, catalog=catalog)
     decisions: list[RetentionDecision] = []
     retained_hashes: list[str] = []
     seen: dict[tuple[str, str], str] = {}
-    pending: list[ScopedRawPayload] = []
+    batch: list[ScopedRawPayload] = []
     for kind_name, legacy_path in _iter_legacy_payloads(bronze_source):
         raw = legacy_path.read_bytes()
         decision, scoped = _decide(scope=scope, kind_name=kind_name, legacy_path=legacy_path, raw=raw, seen=seen)
@@ -372,10 +442,12 @@ def materialize_scoped_bronze(
         if decision.retained:
             retained_hashes.append(hashlib.sha256(raw).hexdigest())
             if scoped is not None and writer is not None:
-                pending.append(scoped)
-    if writer is not None:
-        for scoped in pending:
-            writer.persist(scoped)
+                batch.append(scoped)
+                if len(batch) == _REBASE_CATALOG_BATCH_SIZE:
+                    writer.persist_many(batch)
+                    batch.clear()
+    if batch and writer is not None:
+        writer.persist_many(batch)
     ordered = tuple(sorted(decisions, key=lambda item: (item.source, item.natural_key or "", str(item.legacy_path))))
     digest = hashlib.sha256()
     for payload_hash in sorted(retained_hashes):
