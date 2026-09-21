@@ -82,14 +82,16 @@ def plan_storage_root_retention(
     silver_base: Path,
     gold_base: Path,
     artifact_root: Path,
-    keep_root_names: frozenset[str] = frozenset({"stocks"}),
+    keep_root_names: frozenset[str] = frozenset({"stocks", "ordinary_universe"}),
     read_size: int = 65536,
 ) -> StorageRootRetentionPlan:
     """Classify Silver/Gold root namespaces as referenced or reclaimable.
 
     A root is retained when its directory name is the reserved canonical
     name (``keep_root_names``, the CLI's own default target even before any
-    manifest references it) or appears verbatim inside any artifact JSON
+    manifest references it) or appears verbatim inside any artifact JSON.
+    The point-in-time ordinary-share universe is an independent Silver root
+    consumed before Gold artifacts exist, so it is also reserved by default.
     under ``artifact_root``. Every other immediate root directory is
     reclaimable. An unreadable artifact file blocks deletion entirely
     (rather than being silently skipped) because a missed reference would

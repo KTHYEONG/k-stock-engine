@@ -1,3 +1,10 @@
+import dataclasses
+import json
+from datetime import date
+
+import pytest
+
+
 def test_backfill_plan_requires_exact_ticker_to_corp_code_bridge() -> None:
     from datetime import UTC, date, datetime
     import polars as pl
@@ -50,6 +57,34 @@ def test_dedupe_endpoint_identities_keeps_latest_correction() -> None:
     result = _dedupe_endpoint_identities(identities)
 
     assert [item["filing_id"] for item in result] == ["F3", "F2"]
+
+
+def test_missing_facts_batch_selects_only_uncovered_retained_identity(tmp_path, monkeypatch) -> None:
+    from datetime import UTC, datetime
+    import json
+    from types import SimpleNamespace
+
+    from src.data.dart_backfill import DartMissingFactsRequest, run_dart_missing_facts_batch
+
+    artifact = tmp_path / "backfill.json"
+    artifact.write_text(json.dumps({"ticker_by_corp_code": {"00126380": "005930"}, "required_periods": ["2015Q1"], "validation_start": "2016-01-04"}))
+    bronze = tmp_path / "bronze"
+    (bronze / "financial_facts" / "a").mkdir(parents=True)
+    (bronze / "financial_facts" / "a" / "payload.json").write_text(json.dumps({"corp_code": "00126380", "biz_year": "2015", "reprt_code": "11011", "status": "000", "records": [{"x": 1}]}))
+    identities = (
+        {"corp_code": "00126380", "ticker": "005930", "fiscal_period": "2015Q1", "biz_year": "2015", "reprt_code": "11013", "fs_div": "CFS", "filing_id": "F1", "published_at": "2015-05-15"},
+        {"corp_code": "00126380", "ticker": "005930", "fiscal_period": "2015Q1", "biz_year": "2015", "reprt_code": "11011", "fs_div": "CFS", "filing_id": "F2", "published_at": "2016-03-30"},
+    )
+    monkeypatch.setattr("src.data.dart_backfill.DartXbrlCollector.filing_identities_from_bronze", lambda *_args, **_kwargs: identities)
+    captured = {}
+    def collect(**kwargs):
+        captured["identities"] = kwargs["identities"]
+        return SimpleNamespace(content_hash="h")
+
+    monkeypatch.setattr("src.data.dart_backfill.collect_dart_financial_facts", collect)
+    plan = run_dart_missing_facts_batch(request=DartMissingFactsRequest(bronze, tmp_path / "artifacts", artifact, datetime(2026, 9, 21, tzinfo=UTC), 0, 1), dart=object())
+    assert plan.candidate_count == 1
+    assert captured["identities"][0]["filing_id"] == "F1"
 
 
 def test_build_single_account_request_plan_batches_under_quota() -> None:
@@ -238,3 +273,313 @@ def test_backfill_batch_uses_wide_fixed_disclosure_fetch_range_and_narrow_identi
     # And: identity EXTRACTION keeps the narrow, PIT-bounded per-window range unchanged.
     assert captured_identity["start"] == date(validation_start.year - 2, 1, 1)
     assert captured_identity["end"] == validation_start
+
+
+def _scoped_runtime(tmp_path):  # type: ignore[no-untyped-def]
+    from pathlib import Path as _Path
+
+    from src.data.runtime import load_data_runtime
+
+    return load_data_runtime(scope_config=_Path("config/research/kr_swing_2019_v1.toml"), data_root=tmp_path / "data")
+
+
+def _scoped_catalog(runtime):  # type: ignore[no-untyped-def]
+    from src.data.receipt_catalog import ReceiptCatalog
+
+    return ReceiptCatalog(runtime.workspace.bronze_root / "catalog")
+
+
+def _filing(corp="00126380", filing="F1", biz="2019", reprt="11013", published="2019-05-15"):
+    return {
+        "corp_code": corp, "filing_id": filing, "biz_year": biz, "reprt_code": reprt,
+        "published_at": published, "ticker": "005930",
+    }
+
+
+def test_scoped_batch_selects_catalog_gap(tmp_path) -> None:
+    from src.data.dart_backfill import build_scoped_dart_fact_batch
+
+    runtime = _scoped_runtime(tmp_path)
+    batch = build_scoped_dart_fact_batch(
+        runtime=runtime, catalog=_scoped_catalog(runtime),
+        filing_identities=[_filing()], offset=0, limit=20,
+    )
+
+    assert batch.scope_hash == runtime.scope.content_hash
+    assert batch.plan_id.startswith("dart-facts-")
+    assert [dict(item)["filing_id"] for item in batch.identities] == ["F1"]
+    assert batch.missing_without_filing == ()
+    assert batch.estimated_request_ceiling == 3
+
+
+def test_scoped_batch_excludes_pre_2019_filing(tmp_path) -> None:
+    from src.data.dart_backfill import build_scoped_dart_fact_batch
+
+    runtime = _scoped_runtime(tmp_path)
+    batch = build_scoped_dart_fact_batch(
+        runtime=runtime, catalog=_scoped_catalog(runtime),
+        filing_identities=[_filing(filing="F0", biz="2018", reprt="11011", published="2019-03-30")],
+        offset=0, limit=20,
+    )
+
+    assert batch.identities == ()
+    assert batch.missing_without_filing == ()
+    assert batch.estimated_request_ceiling == 0
+
+
+def test_scoped_batch_reports_missing_without_discovery(tmp_path, monkeypatch) -> None:
+    from src.data.dart_backfill import build_scoped_dart_fact_batch
+    from src.integrations.dart import xbrl as dart_xbrl
+
+    def _forbidden(*_args, **_kwargs):
+        raise AssertionError("disclosure-list discovery must not run")
+
+    monkeypatch.setattr(dart_xbrl.DartXbrlCollector, "filing_identities_from_bronze", _forbidden)
+    runtime = _scoped_runtime(tmp_path)
+    incomplete = {"corp_code": "00126380", "biz_year": "2019", "reprt_code": "11013", "ticker": "005930"}
+    batch = build_scoped_dart_fact_batch(
+        runtime=runtime, catalog=_scoped_catalog(runtime),
+        filing_identities=[incomplete, _filing()], offset=0, limit=20,
+    )
+
+    assert [item.natural_key for item in batch.missing_without_filing] == ["00126380:2019:11013"]
+    assert batch.missing_without_filing[0].required is True
+    assert [dict(item)["filing_id"] for item in batch.identities] == ["F1"]
+
+
+def test_scoped_batch_quota_ceiling_limits_identities(tmp_path) -> None:
+    from src.data.dart_backfill import build_scoped_dart_fact_batch
+    from src.data.research_scope import CollectionBudget
+    from src.data.runtime import DataRuntime
+    from src.data.workspace import build_workspace
+
+    runtime = _scoped_runtime(tmp_path)
+    capped_scope = runtime.scope.model_copy(
+        update={"collection": CollectionBudget(dart_daily_budget=1200, dart_batch_identities=500)}
+    )
+    capped = DataRuntime(scope=capped_scope, workspace=build_workspace(data_root=tmp_path / "data", scope=capped_scope))
+    identities = [
+        _filing(corp=f"{index:08d}", filing=f"F{index}", published="2019-05-15") for index in range(500)
+    ]
+    batch = build_scoped_dart_fact_batch(
+        runtime=capped, catalog=_scoped_catalog(capped),
+        filing_identities=identities, offset=0, limit=500,
+    )
+
+    assert len(batch.identities) == 400
+    assert batch.estimated_request_ceiling == 1200
+
+    tiny_scope = runtime.scope.model_copy(
+        update={"collection": CollectionBudget(dart_daily_budget=16000, dart_batch_identities=2)}
+    )
+    tiny = DataRuntime(scope=tiny_scope, workspace=build_workspace(data_root=tmp_path / "data", scope=tiny_scope))
+    batch = build_scoped_dart_fact_batch(
+        runtime=tiny, catalog=_scoped_catalog(tiny),
+        filing_identities=identities[:10], offset=0, limit=10,
+    )
+    assert len(batch.identities) == 2
+
+
+def test_scoped_batch_catalog_success_suppresses_retry(tmp_path) -> None:
+    import hashlib
+    from datetime import UTC, datetime
+
+    from src.data.dart_backfill import build_scoped_dart_fact_batch
+    from src.data.receipt_catalog import EvidenceStatus, ReceiptIndexEntry
+
+    runtime = _scoped_runtime(tmp_path)
+    catalog = _scoped_catalog(runtime)
+    body = b'{"records": [{"fact": 1}]}'
+    payload_path = tmp_path / "fact.json"
+    payload_path.write_bytes(body)
+    catalog.publish(
+        (
+            ReceiptIndexEntry(
+                source="financial_facts", natural_key="00126380:2019:11013",
+                as_of=date(2019, 5, 16), fiscal_period="2019Q1", status=EvidenceStatus.SUCCESS,
+                content_hash=hashlib.sha256(body).hexdigest(),
+                retrieved_at=datetime(2019, 5, 17, tzinfo=UTC), payload_path=payload_path,
+            ),
+        )
+    )
+    batch = build_scoped_dart_fact_batch(
+        runtime=runtime, catalog=catalog, filing_identities=[_filing()], offset=0, limit=20
+    )
+
+    assert batch.identities == ()
+
+
+def test_scoped_batch_dedupes_to_latest_correction(tmp_path) -> None:
+    from src.data.dart_backfill import build_scoped_dart_fact_batch
+
+    runtime = _scoped_runtime(tmp_path)
+    batch = build_scoped_dart_fact_batch(
+        runtime=runtime, catalog=_scoped_catalog(runtime),
+        filing_identities=[
+            _filing(filing="F2", published="2019-06-01"),
+            _filing(filing="F1", published="2019-05-15"),
+        ],
+        offset=0, limit=20,
+    )
+
+    assert [dict(item)["filing_id"] for item in batch.identities] == ["F2"]
+    same_inputs = [
+        _filing(filing="F2", published="2019-06-01"),
+        _filing(filing="F1", published="2019-05-15"),
+    ]
+    first = build_scoped_dart_fact_batch(
+        runtime=runtime, catalog=_scoped_catalog(runtime),
+        filing_identities=same_inputs, offset=0, limit=20,
+    )
+    second = build_scoped_dart_fact_batch(
+        runtime=runtime, catalog=_scoped_catalog(runtime),
+        filing_identities=same_inputs, offset=0, limit=20,
+    )
+    assert first.plan_id == second.plan_id
+
+
+def test_scoped_batch_rejects_invalid_inputs(tmp_path) -> None:
+    from src.data.dart_backfill import build_scoped_dart_fact_batch
+    from src.data.schemas import PITDataError
+
+    runtime = _scoped_runtime(tmp_path)
+    catalog = _scoped_catalog(runtime)
+    with pytest.raises(PITDataError, match="offset"):
+        build_scoped_dart_fact_batch(runtime=runtime, catalog=catalog, filing_identities=[], offset=-1, limit=1)
+    with pytest.raises(PITDataError, match="offset"):
+        build_scoped_dart_fact_batch(runtime=runtime, catalog=catalog, filing_identities=[], offset=0, limit=0)
+    with pytest.raises(PITDataError, match="corp code"):
+        build_scoped_dart_fact_batch(
+            runtime=runtime, catalog=catalog, filing_identities=[{"biz_year": "2019"}], offset=0, limit=1
+        )
+    with pytest.raises(PITDataError, match="fiscal period"):
+        build_scoped_dart_fact_batch(
+            runtime=runtime, catalog=catalog,
+            filing_identities=[{"corp_code": "00126380", "biz_year": "2019", "reprt_code": "11999"}],
+            offset=0, limit=1,
+        )
+    with pytest.raises(PITDataError, match="fiscal period"):
+        build_scoped_dart_fact_batch(
+            runtime=runtime, catalog=catalog,
+            filing_identities=[{"corp_code": "c", "biz_year": "b", "reprt_code": "r", "fiscal_period": "bogus"}],
+            offset=0, limit=1,
+        )
+    with pytest.raises(ValueError, match="not-a-date"):
+        build_scoped_dart_fact_batch(
+            runtime=runtime, catalog=catalog,
+            filing_identities=[{"corp_code": "00126380", "biz_year": "2019", "reprt_code": "11013", "as_of": "not-a-date"}],
+            offset=0, limit=1,
+        )
+
+
+def test_facts_scoped_commands_plan_batch(tmp_path, capsys) -> None:
+    import json
+
+    from src.data.cli import main
+
+    filings = [_filing(), {"corp_code": "00126380", "biz_year": "2019", "reprt_code": "11012", "ticker": "005930"}]
+    filings_path = tmp_path / "filings.json"
+    filings_path.write_text(json.dumps(filings), encoding="utf-8")
+    base = ["--scope-config", "config/research/kr_swing_2019_v1.toml", "--data-root", str(tmp_path / "data"),
+            "--filings", str(filings_path), "--offset", "0", "--limit", "20"]
+
+    assert main(["collect-dart-facts-scoped", *base]) == 0
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["selected"] == 1
+    assert out["missing_without_filing"] == 1
+
+    assert main(["collect-missing-dart-facts-scoped", *base]) == 0
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["missing_without_filing"] == 1
+    assert out["selected"] == 1
+
+
+def test_legacy_missing_fact_batch_rejects_invalid_inputs_and_empty_candidates(tmp_path, monkeypatch) -> None:
+    from datetime import UTC, datetime
+
+    import src.data.dart_backfill as backfill
+    from src.data.dart_backfill import DartMissingFactsRequest
+    from src.data.schemas import PITDataError
+
+    request = DartMissingFactsRequest(
+        bronze_root=tmp_path / "bronze",
+        artifact_root=tmp_path / "artifacts",
+        backfill_artifact=tmp_path / "missing.json",
+        retrieved_at=datetime(2020, 1, 1),
+        offset=0,
+        limit=1,
+    )
+    with pytest.raises(PITDataError, match="timezone-aware"):
+        backfill.run_dart_missing_facts_batch(request=request, dart=object())
+
+    aware = dataclasses.replace(request, retrieved_at=datetime(2020, 1, 1, tzinfo=UTC), offset=-1)
+    with pytest.raises(PITDataError, match="offset"):
+        backfill.run_dart_missing_facts_batch(request=aware, dart=object())
+    request.backfill_artifact.write_text("{broken", encoding="utf-8")
+    with pytest.raises(PITDataError, match="invalid DART backfill artifact"):
+        backfill.run_dart_missing_facts_batch(
+            request=dataclasses.replace(aware, offset=0), dart=object()
+        )
+
+    request.backfill_artifact.write_text(
+        json.dumps(
+            {
+                "ticker_by_corp_code": {"00126380": "005930"},
+                "required_periods": ["2019Q1"],
+                "validation_start": "2020-01-01",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        backfill.DartXbrlCollector,
+        "filing_identities_from_bronze",
+        lambda *_args, **_kwargs: (),
+    )
+    with pytest.raises(PITDataError, match="batch is empty"):
+        backfill.run_dart_missing_facts_batch(
+            request=dataclasses.replace(aware, offset=0), dart=object()
+        )
+    request.backfill_artifact.write_text(
+        json.dumps(
+            {"ticker_by_corp_code": {}, "required_periods": [], "validation_start": "2020-01-01"}
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(PITDataError, match="invalid DART backfill artifact"):
+        backfill.run_dart_missing_facts_batch(
+            request=dataclasses.replace(aware, offset=0), dart=object()
+        )
+
+
+def test_legacy_successful_fact_endpoint_reader_filters_failures(tmp_path) -> None:
+    import src.data.dart_backfill as backfill
+    from src.data.schemas import PITDataError
+
+    root = tmp_path / "bronze" / "financial_facts"
+
+    def write_payload(name: str, body: object) -> None:
+        path = root / name
+        path.mkdir(parents=True)
+        (path / "payload.json").write_text(json.dumps(body), encoding="utf-8")
+
+    write_payload(
+        "success",
+        {"corp_code": "00126380", "biz_year": "2019", "reprt_code": "11013", "records": [1]},
+    )
+    write_payload("unusable", {"status": "013", "records": [1]})
+    write_payload("not-a-mapping", [1])
+    assert backfill._successful_fact_endpoints(tmp_path / "bronze") == {
+        ("00126380", "2019", "11013", "CFS")
+    }
+
+    (root / "broken").mkdir()
+    (root / "broken" / "payload.json").write_text("{broken", encoding="utf-8")
+    with pytest.raises(PITDataError, match="unreadable"):
+        backfill._successful_fact_endpoints(tmp_path / "bronze")
+
+
+def test_scoped_identity_accepts_explicit_valid_fiscal_period() -> None:
+    import src.data.dart_backfill as backfill
+
+    assert backfill._identity_fiscal_period({"fiscal_period": "2019Q2"}) == "2019Q2"

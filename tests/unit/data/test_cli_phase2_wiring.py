@@ -8,7 +8,7 @@ def _phase2_backtest_namespace(tmp_path, monkeypatch, *, master_rows_per_session
 
     import src.data.gold_artifacts as gold_artifacts_mod
     import src.data.silver as silver_mod
-    from src.data.backtest_run_manifest import build_backtest_run_manifest, write_backtest_run_manifest
+    from src.data.backtest_run_manifest import build_legacy_backtest_run_manifest, write_legacy_backtest_run_manifest
     from src.data.schemas import SilverTable
 
     kst = ZoneInfo("Asia/Seoul")
@@ -74,7 +74,7 @@ def _phase2_backtest_namespace(tmp_path, monkeypatch, *, master_rows_per_session
     monkeypatch.setattr(gold_artifacts_mod, "resolve_gold_artifact_bundle", lambda *, gold_root, dataset_id, decision_time: object())
     monkeypatch.setattr(gold_artifacts_mod, "load_gold_artifact_frames", lambda *, bundle, decision_time: (universe_df, pl.DataFrame(), pl.DataFrame()))
 
-    run_manifest_obj = build_backtest_run_manifest(
+    run_manifest_obj = build_legacy_backtest_run_manifest(
         silver_root=tmp_path / "silver",
         gold_root=tmp_path / "gold",
         silver_dataset_ids={table: f"{table.value}-id" for table in SilverTable},
@@ -84,7 +84,7 @@ def _phase2_backtest_namespace(tmp_path, monkeypatch, *, master_rows_per_session
         strategy_id="core-v1",
         policy_versions={"market_inputs": "korean-equity-market-inputs-v2"},
     )
-    manifest_path = write_backtest_run_manifest(manifest=run_manifest_obj, artifact_root=tmp_path / "artifacts")
+    manifest_path = write_legacy_backtest_run_manifest(manifest=run_manifest_obj, artifact_root=tmp_path / "artifacts")
 
     return Namespace(
         silver_root=tmp_path / "silver",

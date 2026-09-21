@@ -12,6 +12,95 @@ def test_collect_command_requires_immutable_plan_id(monkeypatch) -> None:
     assert args.plan_id == "plan-a"
 
 
+def test_legacy_missing_dart_facts_command_reports_success_and_domain_error(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    from types import SimpleNamespace
+
+    import src.data.dart_backfill as backfill
+    import src.integrations.dart.xbrl as xbrl
+    from src.data.cli import main
+    from src.data.schemas import PITDataError
+
+    class Collector:
+        def __init__(self, *, quota_store) -> None:
+            self.quota_store = quota_store
+
+    monkeypatch.setattr(xbrl, "DartXbrlCollector", Collector)
+    monkeypatch.setattr(
+        backfill,
+        "run_dart_missing_facts_batch",
+        lambda **_kwargs: SimpleNamespace(
+            plan_id="missing-facts-test", candidate_count=2, selected_identities=({"filing_id": "F1"},),
+            missing_without_filing_count=1,
+        ),
+    )
+    arguments = [
+        "collect-missing-dart-facts",
+        "--bronze-root",
+        str(tmp_path / "bronze"),
+        "--artifact-root",
+        str(tmp_path / "artifacts"),
+        "--backfill-artifact",
+        str(tmp_path / "backfill.json"),
+        "--retrieved-at",
+        "2020-01-01T00:00:00+00:00",
+    ]
+    assert main(arguments) == 0
+    assert '"selected_count": 1' in capsys.readouterr().out
+
+    def fail(**_kwargs):
+        raise PITDataError("fixture failure")
+
+    monkeypatch.setattr(backfill, "run_dart_missing_facts_batch", fail)
+    assert main(arguments) == 1
+    assert "fixture failure" in capsys.readouterr().out
+
+
+def test_ordinary_universe_price_audit_command_emits_report_and_handles_failure(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    import src.data.ordinary_universe_price_audit as audit_mod
+    from src.data.cli import main
+    from src.data.ordinary_universe_price_audit import OrdinaryUniversePriceAudit
+    from src.data.schemas import PITDataError
+
+    monkeypatch.setattr(
+        audit_mod,
+        "audit_ordinary_universe_price_availability",
+        lambda **_kwargs: OrdinaryUniversePriceAudit(
+            dataset_id="audit-1",
+            universe_dataset_id="universe-1",
+            sessions=1,
+            universe_rows=1,
+            eligible_rows=1,
+            price_rows=1,
+            tradable_rows=1,
+            missing_price_rows=0,
+            invalid_price_rows=0,
+            zero_volume_rows=0,
+            report_hash="r" * 64,
+        ),
+    )
+    arguments = [
+        "audit-ordinary-universe-prices",
+        "--universe-root",
+        str(tmp_path / "universe"),
+        "--bronze-root",
+        str(tmp_path / "bronze"),
+        "--artifact-root",
+        str(tmp_path / "artifacts"),
+    ]
+    assert main(arguments) == 0
+    assert '"dataset_id": "audit-1"' in capsys.readouterr().out
+
+    def fail(**_kwargs):
+        raise PITDataError("audit fixture failure")
+
+    monkeypatch.setattr(audit_mod, "audit_ordinary_universe_price_availability", fail)
+    assert main(arguments) == 1
+
+
 def test_rebuild_data_requires_certified_master_before_kis_collection(tmp_path, monkeypatch) -> None:
     from src.data import cli as cli_module
 
@@ -92,10 +181,10 @@ def test_run_backtest_validates_selected_bundle_before_execution(tmp_path, monke
 
     monkeypatch.setattr(cli_mod, "ChampionStrategy", spy_strategy)
 
-    from src.data.backtest_run_manifest import build_backtest_run_manifest, write_backtest_run_manifest
+    from src.data.backtest_run_manifest import build_legacy_backtest_run_manifest, write_legacy_backtest_run_manifest
     from src.data.schemas import SilverTable
 
-    run_manifest_obj = build_backtest_run_manifest(
+    run_manifest_obj = build_legacy_backtest_run_manifest(
         silver_root=tmp_path / "silver",
         gold_root=tmp_path,
         silver_dataset_ids={table: f"{table.value}-id" for table in SilverTable},
@@ -105,7 +194,7 @@ def test_run_backtest_validates_selected_bundle_before_execution(tmp_path, monke
         strategy_id="champion-v1",
         policy_versions={"market_inputs": "korean-equity-market-inputs-v2"},
     )
-    manifest_path = write_backtest_run_manifest(
+    manifest_path = write_legacy_backtest_run_manifest(
         manifest=run_manifest_obj, artifact_root=tmp_path / "artifacts"
     )
 
@@ -368,7 +457,7 @@ def test_run_backtest_core_v1_end_to_end_with_pit_inputs(tmp_path, monkeypatch) 
         return pl.DataFrame(schema={'effective_session': pl.Datetime(time_zone='Asia/Seoul'), 'instrument_id': pl.String, 'action_type': pl.String, 'available_at': pl.Datetime(time_zone='Asia/Seoul')})
 
     import src.data.gold_artifacts as gold_artifacts_mod
-    from src.data.backtest_run_manifest import build_backtest_run_manifest, write_backtest_run_manifest
+    from src.data.backtest_run_manifest import build_legacy_backtest_run_manifest, write_legacy_backtest_run_manifest
 
     universe_df = pl.DataFrame({
         'decision_session': [day.replace(hour=15, minute=30) for day in all_days[60:65] for _ in ('KRX:A', 'KRX:B')],
@@ -404,7 +493,7 @@ def test_run_backtest_core_v1_end_to_end_with_pit_inputs(tmp_path, monkeypatch) 
         lambda *, bundle, decision_time: (universe_df, pl.DataFrame(), pl.DataFrame()),
     )
 
-    run_manifest_obj = build_backtest_run_manifest(
+    run_manifest_obj = build_legacy_backtest_run_manifest(
         silver_root=tmp_path / 'silver',
         gold_root=tmp_path / 'gold',
         silver_dataset_ids={table: f"{table.value}-id" for table in SilverTable},
@@ -414,7 +503,7 @@ def test_run_backtest_core_v1_end_to_end_with_pit_inputs(tmp_path, monkeypatch) 
         strategy_id='core-v1',
         policy_versions={'market_inputs': 'korean-equity-market-inputs-v2'},
     )
-    manifest_path = write_backtest_run_manifest(
+    manifest_path = write_legacy_backtest_run_manifest(
         manifest=run_manifest_obj, artifact_root=tmp_path / 'artifacts'
     )
 
@@ -460,7 +549,7 @@ def test_run_backtest_rejects_market_without_certified_columns(tmp_path, monkeyp
 
     import src.data.gold_artifacts as gold_artifacts_mod
     import src.data.silver as silver_mod
-    from src.data.backtest_run_manifest import build_backtest_run_manifest, write_backtest_run_manifest
+    from src.data.backtest_run_manifest import build_legacy_backtest_run_manifest, write_legacy_backtest_run_manifest
     from src.data.cli import _dispatch_backtest
     from src.data.schemas import PITDataError, SilverTable
 
@@ -490,7 +579,7 @@ def test_run_backtest_rejects_market_without_certified_columns(tmp_path, monkeyp
         lambda *, bundle, decision_time: (universe_df, pl.DataFrame(), pl.DataFrame()),
     )
 
-    run_manifest_obj = build_backtest_run_manifest(
+    run_manifest_obj = build_legacy_backtest_run_manifest(
         silver_root=tmp_path / 'silver',
         gold_root=tmp_path / 'gold',
         silver_dataset_ids={table: f"{table.value}-id" for table in SilverTable},
@@ -500,7 +589,7 @@ def test_run_backtest_rejects_market_without_certified_columns(tmp_path, monkeyp
         strategy_id='core-v1',
         policy_versions={'market_inputs': 'korean-equity-market-inputs-v2'},
     )
-    manifest_path = write_backtest_run_manifest(
+    manifest_path = write_legacy_backtest_run_manifest(
         manifest=run_manifest_obj, artifact_root=tmp_path / 'artifacts'
     )
 
@@ -772,7 +861,7 @@ def _manifest_bound_namespace(tmp_path, monkeypatch, **overrides):
 
     import src.data.gold_artifacts as gold_artifacts_mod
     import src.data.silver as silver_mod
-    from src.data.backtest_run_manifest import build_backtest_run_manifest, write_backtest_run_manifest
+    from src.data.backtest_run_manifest import build_legacy_backtest_run_manifest, write_legacy_backtest_run_manifest
     from src.data.schemas import SilverTable
 
     calendar_df = pl.DataFrame({'session': [__import__('datetime').datetime(2016, 1, 4, 9, tzinfo=__import__('datetime').UTC)]})
@@ -797,7 +886,7 @@ def _manifest_bound_namespace(tmp_path, monkeypatch, **overrides):
         'load_gold_artifact_frames',
         lambda *, bundle, decision_time: (universe_df, pl.DataFrame(), pl.DataFrame()),
     )
-    manifest = build_backtest_run_manifest(
+    manifest = build_legacy_backtest_run_manifest(
         silver_root=tmp_path / 'silver',
         gold_root=tmp_path / 'gold',
         silver_dataset_ids={table: f"{table.value}-id" for table in SilverTable},
@@ -807,7 +896,7 @@ def _manifest_bound_namespace(tmp_path, monkeypatch, **overrides):
         strategy_id='core-v1',
         policy_versions={'market_inputs': 'korean-equity-market-inputs-v2'},
     )
-    path = write_backtest_run_manifest(manifest=manifest, artifact_root=tmp_path / 'artifacts')
+    path = write_legacy_backtest_run_manifest(manifest=manifest, artifact_root=tmp_path / 'artifacts')
     base = {
         'silver_root': tmp_path / 'silver',
         'artifact_root': tmp_path / 'artifacts',
@@ -885,7 +974,7 @@ def test_run_backtest_rejects_core_without_selected_universe(tmp_path, monkeypat
 
     import src.data.gold_artifacts as gold_artifacts_mod
     import src.data.silver as silver_mod
-    from src.data.backtest_run_manifest import build_backtest_run_manifest, write_backtest_run_manifest
+    from src.data.backtest_run_manifest import build_legacy_backtest_run_manifest, write_legacy_backtest_run_manifest
     from src.data.cli import _dispatch_backtest
     from src.data.schemas import PITDataError, SilverTable
 
@@ -943,7 +1032,7 @@ def test_run_backtest_rejects_core_without_selected_universe(tmp_path, monkeypat
         'load_gold_artifact_frames',
         lambda *, bundle, decision_time: (None, pl.DataFrame(), pl.DataFrame()),
     )
-    manifest = build_backtest_run_manifest(
+    manifest = build_legacy_backtest_run_manifest(
         silver_root=tmp_path / 'silver',
         gold_root=tmp_path / 'gold',
         silver_dataset_ids={table: f"{table.value}-id" for table in SilverTable},
@@ -953,7 +1042,7 @@ def test_run_backtest_rejects_core_without_selected_universe(tmp_path, monkeypat
         strategy_id='core-v1',
         policy_versions={'market_inputs': 'korean-equity-market-inputs-v2'},
     )
-    path = write_backtest_run_manifest(manifest=manifest, artifact_root=tmp_path / 'artifacts')
+    path = write_legacy_backtest_run_manifest(manifest=manifest, artifact_root=tmp_path / 'artifacts')
     with pytest.raises(PITDataError, match='selected Gold universe'):
         _dispatch_backtest(
             Namespace(
@@ -980,7 +1069,7 @@ def test_run_backtest_rejects_champion_without_selected_scores(tmp_path, monkeyp
 
     import src.data.gold_artifacts as gold_artifacts_mod
     import src.data.silver as silver_mod
-    from src.data.backtest_run_manifest import build_backtest_run_manifest, write_backtest_run_manifest
+    from src.data.backtest_run_manifest import build_legacy_backtest_run_manifest, write_legacy_backtest_run_manifest
     from src.data.cli import _dispatch_backtest
     from src.data.schemas import PITDataError, SilverTable
 
@@ -1038,7 +1127,7 @@ def test_run_backtest_rejects_champion_without_selected_scores(tmp_path, monkeyp
         'load_gold_artifact_frames',
         lambda *, bundle, decision_time: (pl.DataFrame(), pl.DataFrame(), None),
     )
-    manifest = build_backtest_run_manifest(
+    manifest = build_legacy_backtest_run_manifest(
         silver_root=tmp_path / 'silver',
         gold_root=tmp_path / 'gold',
         silver_dataset_ids={table: f"{table.value}-id" for table in SilverTable},
@@ -1048,7 +1137,7 @@ def test_run_backtest_rejects_champion_without_selected_scores(tmp_path, monkeyp
         strategy_id='champion-v1',
         policy_versions={'market_inputs': 'korean-equity-market-inputs-v2'},
     )
-    path = write_backtest_run_manifest(manifest=manifest, artifact_root=tmp_path / 'artifacts')
+    path = write_legacy_backtest_run_manifest(manifest=manifest, artifact_root=tmp_path / 'artifacts')
     with pytest.raises(PITDataError, match='resolved strategy'):
         _dispatch_backtest(
             Namespace(
@@ -1173,7 +1262,7 @@ def test_run_backtest_compacts_security_master_before_session_build(tmp_path, mo
     import src.data.gold_artifacts as gold_artifacts_mod
     import src.data.master_intervals as master_intervals_mod
     import src.data.silver as silver_mod
-    from src.data.backtest_run_manifest import build_backtest_run_manifest, write_backtest_run_manifest
+    from src.data.backtest_run_manifest import build_legacy_backtest_run_manifest, write_legacy_backtest_run_manifest
     from src.data.cli import _dispatch_backtest
     from src.data.schemas import SilverTable
 
@@ -1254,7 +1343,7 @@ def test_run_backtest_compacts_security_master_before_session_build(tmp_path, mo
         lambda *, bundle, decision_time: (universe_df, pl.DataFrame(), pl.DataFrame()),
     )
 
-    run_manifest_obj = build_backtest_run_manifest(
+    run_manifest_obj = build_legacy_backtest_run_manifest(
         silver_root=tmp_path / "silver",
         gold_root=tmp_path / "gold",
         silver_dataset_ids={table: f"{table.value}-id" for table in SilverTable},
@@ -1264,7 +1353,7 @@ def test_run_backtest_compacts_security_master_before_session_build(tmp_path, mo
         strategy_id="core-v1",
         policy_versions={"market_inputs": "korean-equity-market-inputs-v2"},
     )
-    manifest_path = write_backtest_run_manifest(
+    manifest_path = write_legacy_backtest_run_manifest(
         manifest=run_manifest_obj, artifact_root=tmp_path / "artifacts"
     )
 
@@ -1301,7 +1390,7 @@ def test_run_backtest_champion_rejects_uninformative_gold_scores(tmp_path, monke
 
     import src.data.gold_artifacts as gold_artifacts_mod
     import src.data.silver as silver_mod
-    from src.data.backtest_run_manifest import build_backtest_run_manifest, write_backtest_run_manifest
+    from src.data.backtest_run_manifest import build_legacy_backtest_run_manifest, write_legacy_backtest_run_manifest
     from src.data.cli import _dispatch_backtest
     from src.data.schemas import PITDataError, SilverTable
 
@@ -1337,7 +1426,7 @@ def test_run_backtest_champion_rejects_uninformative_gold_scores(tmp_path, monke
         lambda *, bundle, decision_time: (pl.DataFrame(), pl.DataFrame(), scores_df),
     )
 
-    run_manifest_obj = build_backtest_run_manifest(
+    run_manifest_obj = build_legacy_backtest_run_manifest(
         silver_root=tmp_path / "silver",
         gold_root=tmp_path / "gold",
         silver_dataset_ids={table: f"{table.value}-id" for table in SilverTable},
@@ -1347,7 +1436,7 @@ def test_run_backtest_champion_rejects_uninformative_gold_scores(tmp_path, monke
         strategy_id="champion-v1",
         policy_versions={"market_inputs": "korean-equity-market-inputs-v2"},
     )
-    manifest_path = write_backtest_run_manifest(
+    manifest_path = write_legacy_backtest_run_manifest(
         manifest=run_manifest_obj, artifact_root=tmp_path / "artifacts"
     )
 
@@ -1366,4 +1455,3 @@ def test_run_backtest_champion_rejects_uninformative_gold_scores(tmp_path, monke
             scenario="base",
             ledger_id="champion-test-2016",
         ))
-
