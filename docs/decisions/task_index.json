@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_KR_SWING_2019_DATA_REBUILD",
+      "date": "2026-09-21",
+      "adr_id": "ADR_20260921_KR_SWING_2019_DATA_REBUILD",
+      "domain": "data",
+      "title": "2019년 기준 국내주식 Scope 재구축",
+      "why": "기존 2014~2018 자료와 분산된 Bronze·Silver·Gold·artifact 경로가 PIT 분석과 유지보수를 불안정하게 만들었습니다.",
+      "resolution": "2019년 원천 증거를 단일 Scope workspace와 receipt catalog로 리베이스하고 보통주 유니버스·DART 보강·Scope 고정 백테스트·검증된 레거시 제거 계약을 구현했습니다.",
+      "impact": "데이터 기간·경로·정책·백테스트 입력이 하나의 Scope hash로 묶이고 quota 재개와 100% diff coverage 검증이 가능합니다.",
+      "caveat": "2026년은 forward 관찰 구간이며 수급·업종은 원천 커버리지가 검증되기 전까지 비활성 상태입니다."
+    },
+    {
       "task_id": "TASK_INVESTOR_FLOW_BACKFILL",
       "date": "2026-09-20",
       "adr_id": "ADR_20260920_INVESTOR_FLOW_BACKFILL",
