@@ -161,3 +161,145 @@ def test_historical_pipeline_propagates_request_flow_provider(tmp_path, monkeypa
         operations.run_historical_data_pipeline(request, krx=object(), investor_flow='kiwoom-collector', dart=object())
     assert captured['investor_flow_provider'] == 'kiwoom'
     assert captured['investor_flow'] == 'kiwoom-collector'
+
+
+def _complete_action_artifact(tmp_path, unresolved=()):
+    import json
+    from datetime import UTC, date, datetime
+    from pathlib import Path
+    from src.data.collection import CollectionArtifact
+    from src.data.schemas import EvidenceKind
+
+    ledger = {
+        "plan_id": "cap-test",
+        "plan_digest": "d" * 64,
+        "content_hash": "c" * 64,
+        "provider": "opendart_structured_decisions",
+        "coverage_start": "2020-01-01",
+        "coverage_end": "2020-12-31",
+        "planned": 2,
+        "previously_completed": 0,
+        "newly_completed": 2,
+        "pending": 0,
+        "empty": 1,
+        "successful": 1,
+        "provider_errors": 0,
+        "unresolved_instruments": list(unresolved),
+        "unresolved_instrument_count": len(unresolved),
+        "request_ids": ["ca-a", "ca-b"],
+        "page_receipts": [],
+    }
+    report_path = tmp_path / "action-ledger.json"
+    report_path.write_text(json.dumps(ledger), encoding="utf-8")
+    return CollectionArtifact(
+        bronze_root=Path(tmp_path / "bronze"),
+        coverage_start=date(2020, 1, 1),
+        coverage_end=date(2020, 12, 31),
+        retrieved_at=datetime(2026, 1, 1, tzinfo=UTC),
+        receipts={},
+        content_hash="c" * 64,
+        report_path=report_path,
+        page_receipts={EvidenceKind.CORPORATE_ACTIONS.value: ()},
+    )
+
+
+def test_action_coverage_propagation_surfaces_ledger_and_counts(tmp_path) -> None:
+    from pathlib import Path
+
+    import src.data.operations as operations
+
+    artifact = _complete_action_artifact(tmp_path)
+    ledger = operations._require_corporate_action_certifiable(artifact)
+    assert ledger["planned"] == 2
+    assert ledger["pending"] == 0
+    assert ledger["provider_errors"] == 0
+    assert Path(artifact.report_path).exists()
+    coverage = {
+        "corporate_actions_ledger": str(artifact.report_path),
+        "corporate_actions_unresolved": len(ledger.get("unresolved_instruments", ())),
+        "corporate_actions": {"planned": ledger.get("planned"), "pending": ledger.get("pending")},
+    }
+    assert coverage["corporate_actions_ledger"].endswith("action-ledger.json")
+    assert coverage["corporate_actions_unresolved"] == 0
+
+
+def test_unresolved_action_mapping_blocks_certification(tmp_path) -> None:
+    import pytest
+    import src.data.operations as operations
+    from src.data.schemas import PITDataError
+
+    artifact = _complete_action_artifact(tmp_path, unresolved=("999999",))
+    with pytest.raises(PITDataError, match="999999"):
+        operations._require_corporate_action_certifiable(artifact)
+
+
+def test_provider_failure_blocks_certification_with_auditable_partial_receipts(tmp_path) -> None:
+    from datetime import UTC, date, datetime
+    from types import SimpleNamespace
+
+    import pytest
+    from src.data.collection import collect_planned_corporate_actions
+    from src.data.collection_plan import CollectionCheckpointStore, CorporateActionCollectionPlan, CorporateActionRequest
+    from src.data.schemas import PITDataError
+
+    start, end = date(2020, 1, 1), date(2020, 12, 31)
+    requests = (
+        CorporateActionRequest("ca-1", "005930", "00126380", "fricDecsn.json", None, None),
+        CorporateActionRequest("ca-2", "005930", "00126380", "crDecsn.json", None, None),
+    )
+    plan = CorporateActionCollectionPlan("cap-x", start, end, "h" * 64, requests, (), "d" * 64)
+
+    class _PartialDart:
+        def __init__(self):
+            self.calls = 0
+
+        def fetch_corporate_action_decisions(self, *, corp_codes, start, end):
+            self.calls += 1
+            if self.calls > 1:
+                raise TimeoutError("transient DART outage")
+            return (SimpleNamespace(endpoint="fricDecsn.json", corp_code="00126380", status="000", records=()),)
+
+        def fetch_dividend_disclosures(self, **_: object):
+            raise AssertionError("unexpected dividend call")
+
+    with pytest.raises(PITDataError):
+        collect_planned_corporate_actions(
+            plan=plan, dart=_PartialDart(), bronze_root=tmp_path / "bronze",
+            retrieved_at=datetime(2026, 1, 1, tzinfo=UTC),
+            checkpoint_store=CollectionCheckpointStore(tmp_path / "ckpt"),
+        )
+    retained = list((tmp_path / "bronze" / "corporate_actions").glob("*/payload.json"))
+    assert len(retained) == 1
+
+
+def test_action_ledger_guards_reject_unreadable_and_malformed_ledgers(tmp_path) -> None:
+    from datetime import UTC, date, datetime
+    from pathlib import Path
+
+    import pytest
+    import src.data.operations as operations
+    from src.data.collection import CollectionArtifact
+    from src.data.schemas import EvidenceKind, PITDataError
+
+    def _artifact(report: Path) -> CollectionArtifact:
+        return CollectionArtifact(
+            bronze_root=tmp_path / "bronze",
+            coverage_start=date(2020, 1, 1),
+            coverage_end=date(2020, 12, 31),
+            retrieved_at=datetime(2026, 1, 1, tzinfo=UTC),
+            receipts={},
+            content_hash="c" * 64,
+            report_path=report,
+            page_receipts={EvidenceKind.CORPORATE_ACTIONS.value: ()},
+        )
+
+    with pytest.raises(PITDataError, match="unreadable"):
+        operations._require_corporate_action_certifiable(_artifact(tmp_path / "absent.json"))
+    bad_json = tmp_path / "list.json"
+    bad_json.write_text("[1, 2]", encoding="utf-8")
+    with pytest.raises(PITDataError, match="unreadable"):
+        operations._require_corporate_action_certifiable(_artifact(bad_json))
+    bad_counts = tmp_path / "counts.json"
+    bad_counts.write_text('{"pending": "many", "provider_errors": 0, "unresolved_instruments": []}', encoding="utf-8")
+    with pytest.raises(PITDataError, match="unreadable"):
+        operations._require_corporate_action_certifiable(_artifact(bad_counts))

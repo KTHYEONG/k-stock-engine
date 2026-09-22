@@ -318,6 +318,7 @@ def build_qvef_features(
     daily_market: pl.DataFrame,
     investor_flow: pl.DataFrame,
     financial_facts: pl.DataFrame,
+    financial_quality: pl.DataFrame | None = None,
     policy: QvefFeaturePolicy | None = None,  # noqa: B008
 ) -> tuple[QvefFeatureRow, ...]:
     if policy is None:
@@ -342,6 +343,22 @@ def build_qvef_features(
     # Early exit if none resolved
     if not resolved:
         return ()
+
+    if financial_quality is not None:
+        from src.data.financial_quality import eligible_companies_from_quality
+
+        complete_companies = eligible_companies_from_quality(
+            financial_quality,
+            decision_time=decision_time,
+            company_ids={str(info["company_id"]) for info in resolved.values()},
+        )
+        resolved = {
+            instrument_id: info
+            for instrument_id, info in resolved.items()
+            if str(info["company_id"]) in complete_companies
+        }
+        if not resolved:
+            return ()
 
     # Filter financial facts PIT and resolve canonical facts via Polars native agg
     resolved_facts = resolve_facts_pit_by_basis(financial_facts, decision_time=decision_time, eligible_company_ids=frozenset(info['company_id'] for info in resolved.values()))
