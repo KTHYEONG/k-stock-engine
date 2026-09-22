@@ -198,3 +198,59 @@ def audit_ordinary_universe_price_availability(
         raise PITDataError(f"ordinary-universe price audit collision: {report_path}")
     report_path.write_text(encoded, encoding="utf-8")
     return audit
+
+
+def plan_investor_flow_from_ordinary_universe(
+    *, universe_root: Path, bronze_root: Path, artifact_root: Path, start: date, end: date, max_sessions: int
+) -> Path:
+    """Write a source-bound flow backfill plan from certified tradable cells."""
+    if start > end or max_sessions < 1:
+        raise PITDataError("invalid ordinary-universe flow plan range")
+    dataset = _only_universe_dataset(Path(universe_root))
+    parts = _load_universe_manifest(dataset)
+    selected = [part for part in parts if start <= _parse_date(part["session"]) <= end]
+    if not selected:
+        raise PITDataError("ordinary-universe flow plan has no sessions")
+    pages = _daily_payloads_by_session(Path(bronze_root), {_parse_date(part["session"]) for part in selected})
+    cells: dict[str, list[date]] = defaultdict(list)
+    identity = [dataset.name, str(max_sessions)]
+    for part in selected:
+        session = _parse_date(part["session"])
+        path = dataset / str(part["path"])
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != part.get("parquet_sha256"):
+            raise PITDataError(f"ordinary-universe partition hash mismatch: {session}")
+        page = pages.get(session, [])
+        if len(page) != 1:
+            raise PITDataError(f"missing or ambiguous daily-market page: {session}")
+        payload = json.loads(page[0].read_text(encoding="utf-8"))
+        records: dict[str, dict[str, Any]] = {}
+        for record in payload["records"]:
+            if not isinstance(record, dict):
+                raise PITDataError(f"invalid daily-market record: {session}")
+            ticker = _ticker(record)
+            if ticker in records:
+                raise PITDataError(f"duplicate daily-market ticker: {(session, ticker)!r}")
+            records[ticker] = record
+        for ticker in pl.read_parquet(path).filter(pl.col("eligible"))["ticker"].to_list():
+            record = records.get(ticker)
+            if record is None:
+                raise PITDataError(f"missing daily-market price: {(session, ticker)!r}")
+            if _price_state(record) == "tradable":
+                cells[ticker].append(session)
+        identity.append(f"{session}:{hashlib.sha256(page[0].read_bytes()).hexdigest()}")
+    digest = hashlib.sha256("\n".join(identity).encode("utf-8")).hexdigest()
+    plan_id = f"ordinary-flow-{digest[:16]}"
+    chunks = [
+        {"chunk_id": f"{plan_id}:{ticker}:{offset // max_sessions:04d}", "symbol": ticker,
+         "sessions": [item.isoformat() for item in sessions[offset : offset + max_sessions]]}
+        for ticker, sessions in sorted(cells.items())
+        for offset in range(0, len(sessions), max_sessions)
+    ]
+    output = Path(artifact_root) / "collection-plans"
+    output.mkdir(parents=True, exist_ok=True)
+    path = output / f"{plan_id}.json"
+    encoded = json.dumps({"plan_id": plan_id, "content_hash": digest, "coverage_start": start.isoformat(), "coverage_end": end.isoformat(), "chunk_size": max_sessions, "requested_symbol_sessions": sum(len(days) for days in cells.values()), "chunks": chunks}, indent=2, sort_keys=True) + "\n"
+    if path.exists() and path.read_text(encoding="utf-8") != encoded:
+        raise PITDataError(f"ordinary-universe flow plan collision: {path}")
+    path.write_text(encoded, encoding="utf-8")
+    return path

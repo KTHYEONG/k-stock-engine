@@ -72,6 +72,49 @@ def test_build_qvef_features_neutralizes_negative_earnings_and_rejects_incomplet
     assert 'foreign_flow_incomplete' in incomplete_flow.component_presence
 
 
+def test_build_qvef_features_omits_company_with_failed_latest_financial_period() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    import polars as pl
+
+    from src.core.time import SessionCalendar
+    from src.data.financial_quality import FinancialQualityEvent, build_financial_quality_events
+    from src.features.qvef import build_qvef_features
+    from src.strategy.universe import UniverseDecision
+
+    sessions = tuple(datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=index) for index in range(70))
+    decision = sessions[-1]
+    identifiers = ("KRX:000001", "KRX:000002")
+    universe = tuple(UniverseDecision(decision, instrument_id, True, (), 252, 2_000_000_000.0) for instrument_id in identifiers)
+    master = pl.DataFrame({"instrument_id": identifiers, "company_id": identifiers, "sector": ["Technology"] * 2, "valid_from": [sessions[0]] * 2, "valid_to": [None] * 2, "available_at": [sessions[0]] * 2})
+    market = pl.DataFrame([{"session": session, "instrument_id": instrument_id, "trading_value": 100.0, "market_cap": 200.0, "available_at": session} for instrument_id in identifiers for session in sessions[-21:]])
+    flow = pl.DataFrame([{"session": session, "instrument_id": instrument_id, "foreign_net_value": 1.0, "available_at": session} for instrument_id in identifiers for session in sessions[-21:-1]])
+    facts = []
+    for company_id in identifiers:
+        last_quarter = 3 if company_id == "KRX:000002" else 4
+        for quarter in range(1, last_quarter + 1):
+            facts.extend({"company_id": company_id, "fiscal_period": f"2024Q{quarter}", "filing_id": f"{company_id}-{quarter}", "fact": fact, "consolidated": True, "value": value, "unit": "KRW", "restatement_id": "r0", "published_at": decision, "available_at": decision} for fact, value in {"gross_profit": 10.0, "net_income": 5.0, "operating_cash_flow": 4.0, "assets": 100.0, "equity": 50.0, "operating_profit": 20.0, "sales": 120.0}.items())
+    quality = build_financial_quality_events(
+        pl.DataFrame(facts),
+        unresolved_events=(FinancialQualityEvent(company_id="KRX:000002", fiscal_period="2024Q4", filing_id="failed", published_at=decision, available_at=decision, reason="missing_source_value"),),
+        decision_time=decision,
+    )
+
+    rows = build_qvef_features(decision_session=decision, decision_time=decision, calendar=SessionCalendar(sessions), universe=universe, security_master=master, daily_market=market, investor_flow=flow, financial_facts=pl.DataFrame(facts), financial_quality=quality)
+
+    assert [row.instrument_id for row in rows] == ["KRX:000001"]
+
+    all_failed_quality = build_financial_quality_events(
+        pl.DataFrame(facts),
+        unresolved_events=(
+            FinancialQualityEvent("KRX:000001", "2025Q1", "failed-a", decision, decision, "missing_source_value"),
+            FinancialQualityEvent("KRX:000002", "2024Q4", "failed-b", decision, decision, "missing_source_value"),
+        ),
+        decision_time=decision,
+    )
+    assert build_qvef_features(decision_session=decision, decision_time=decision, calendar=SessionCalendar(sessions), universe=universe, security_master=master, daily_market=market, investor_flow=flow, financial_facts=pl.DataFrame(facts), financial_quality=all_failed_quality) == ()
+
+
 def test_qvef_flow_lookback_excludes_same_session_unpublished_flow() -> None:
     from datetime import datetime, timedelta
     from src.core.time import KRX_TZ, SessionCalendar

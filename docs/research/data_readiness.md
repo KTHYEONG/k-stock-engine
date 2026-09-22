@@ -1,6 +1,6 @@
 # 백테스트 데이터 준비 현황과 수집 계획
 
-기준일: 2026-09-21. 활성 데이터는 `kr_swing_2019_v1` Scope이며, 기존 `data/bronze/stocks` 원본과 과거 Silver·Gold 실행 산출물은 제거됐다. 전략과 백테스트 규칙은 [strategy.md](strategy.md)에 둔다.
+기준일: 2026-09-22. 활성 데이터는 `kr_swing_2019_v1` Scope이며, 기존 `data/bronze/stocks` 원본과 과거 Silver·Gold 실행 산출물은 제거됐다. 전략과 백테스트 규칙은 [strategy.md](strategy.md)에 둔다.
 
 ## Scope 재구축 결과
 
@@ -11,9 +11,11 @@
 | 보통주 적격 셀 | 3,911,950 | 우선주·SPAC·비주권·비KOSPI/KOSDAQ 제외 사유를 보존 |
 | 가격 누락 | 0 | 적격 셀과 가격 원본의 일자·종목 결합 완료 |
 | 거래 가능 가격 | 3,778,374 | 가격 이상 133,576건은 거래 불가로 유지 |
-| DART 재무 원본 | 66,159 filing | 기존 61,948건 + 누적 백필 성공 4,211건 |
+| DART 재무 원본 | 67,295 filing | OpenDART 성공 67,277건 + 공식 사업보고서 웹 복구 16건 + 공식 감사보고서 복구 2건 |
 
-사업보고서 목록 조회로 2019Q4 3,070건, 2024Q4 3,790건을 확보했고, 회사·회계연도별 중복 제거 후보는 6,026건이다. 누적 백필 성공은 4,211건이며, 추가 실행 중 저장된 성공 42건을 반영해 현재 성공 facts는 66,159건, 잔여 filing identity는 1,137건이다. 응답 불가·추출 실패·빈 응답은 성공으로 집계하지 않았다(표준 XBRL 및 문서 fallback 혼합). corpCode ticker bridge를 보강한 뒤 Silver를 재생성해 632,263행·3,134개 회사·65,512개 filing이 PIT 입력으로 반영됐으며, 상세 coverage 보고서는 `data/state/kr_swing_2019_v1/financial_facts_pit_coverage_20260921.json`에 기록했다. facts 일일 시도 카운터는 7,343회(임시 운영 상한 8,000회, 예약선 7,900회)였다. quota 원장은 `data/state/kr_swing_2019_v1/quota/`에 보존되어 있다.
+사업보고서 목록 조회로 2019Q4 3,070건, 2024Q4 3,790건을 확보했고, 회사·회계연도별 중복 제거 후보는 6,026건이다. OpenDART endpoint 성공은 67,277건이며, 보존 archive의 parser 복구 28건과 DART 공식 웹 사업보고서 16건을 추가했다. 추가로 사업보고서가 제출되지 않은 두 회사의 공식 감사보고서에서 2024Q4 재무 사실 16개를 복구해 Bronze에 기록했다. 현재 연차 후보 미해결은 케미메디(2019) 1건이다. 해당 공식 사업보고서의 현재기·전기 금액 셀이 공란이고, 감사보고서 제출 공시의 주요 재무내용도 모든 항목이 `-`로 표시되어 직접 값을 기입할 근거가 없다. 사랑과선행·메타록(2024)은 감사보고서로 복구했지만 frozen corpCode-종목 bridge가 없어 종목을 임의 추정하지 않았으며 Silver에는 넣지 않았다. bridge가 확인된 웹 복구 9개 filing·79행만 Silver에 반영했고, bridge가 없는 웹 7개와 감사보고서 2개는 Bronze에만 보존했다. Silver는 641,094행·3,170개 회사·66,453개 filing으로 유지된다. 상세 coverage 보고서는 `data/state/kr_swing_2019_v1/financial_facts_pit_coverage_20260921.json`, 웹 복구 감사는 `data/state/kr_swing_2019_v1/dart_web_recovery_20260922.json`에 기록했다. facts API 일일 시도 카운터는 1,925회로 변하지 않았고, 회사별 공시 목록 확인에 list endpoint 3회만 사용했다. quota 원장은 `data/state/kr_swing_2019_v1/quota/`에 보존되어 있다.
+
+재무 완전성은 별도 Silver companion `financial_quality`로 고정했다. 현재 데이터셋(`a38d625debc…`)은 66,455개 PIT 상태 행이며, 케미메디 `205290/2019Q4`의 공식 원천값 부재를 2020-03-31 첫 KRX 세션부터 `missing_source_value`로 기록한다. Gold와 기존 백테스트 materializer가 Silver를 원천으로 읽을 때는 이 companion을 반드시 함께 읽고, 해당 의사결정 시점의 최신 회계기간에 연결 또는 별도 기준 필수 7개 항목이 모두 있어야 QVEF를 만든다. 결측값을 0이나 이전 값으로 채우지 않는다.
 
 ### DART quota 운영 한도
 

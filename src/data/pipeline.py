@@ -13,6 +13,7 @@ from src.core.datasets import DatasetCertification
 from src.core.time import SessionCalendar
 from src.data.backtest_run_manifest import build_legacy_backtest_run_manifest, write_legacy_backtest_run_manifest
 from src.data.bronze import BronzeStore
+from src.data.financial_quality import load_latest_financial_quality
 from src.data.replay import PITReplayReader, StreamingGoldWriter
 from src.data.schemas import BronzeReceipt, EvidenceKind, PITDataError, SilverTable
 from src.data.silver import certify_corporate_action_refresh, load_latest_silver_table
@@ -48,11 +49,13 @@ def _require_certified_inputs(silver_root: Path, bronze_root: Path) -> None:
             table_dir = Path(silver_root) / table.value
             if not table_dir.exists():
                 missing.append(table.value)
+        if not (Path(silver_root) / "financial_quality").exists():
+            missing.append("financial_quality")
     missing = [name for name in missing if name != SilverTable.LIFECYCLE_EVENTS.value]
     if missing:
         ordered = sorted(set(missing))
         raise PITDataError(
-            f"missing required tables: {', '.join(ordered)} (investor_flow, financial_facts)"
+            f"missing required tables: {', '.join(ordered)} (investor_flow, financial_facts, financial_quality)"
         )
 
 
@@ -156,6 +159,9 @@ def materialize_backtest_inputs(
     # reader = PITReplayReader.from_silver_root(...); replay = reader.session_input(...); writer.append_universe(...); writer.append_features(...); writer.append_scores(...)
     qvef_policy = QvefFeaturePolicy()
     score_policy = ChampionScorePolicy()
+    financial_quality = load_latest_financial_quality(
+        root=Path(silver_root), decision_time=decision_time
+    )
     ordered_sessions = tuple(s for s in sessions if s <= decision_time)
     if not ordered_sessions:
         raise PITDataError("calendar has no sessions")
@@ -189,7 +195,7 @@ def materialize_backtest_inputs(
         eligible = tuple(u for u in universe if u.eligible)
         if not eligible:
             continue
-        rows = build_qvef_features(decision_session=session, decision_time=session, calendar=calendar, universe=eligible, security_master=replay.security_master, daily_market=replay.daily_market, investor_flow=replay.investor_flow, financial_facts=replay.financial_facts, policy=qvef_policy)
+        rows = build_qvef_features(decision_session=session, decision_time=session, calendar=calendar, universe=eligible, security_master=replay.security_master, daily_market=replay.daily_market, investor_flow=replay.investor_flow, financial_facts=replay.financial_facts, financial_quality=financial_quality, policy=qvef_policy)
         if not rows:
             continue
         writer.append_features(rows)

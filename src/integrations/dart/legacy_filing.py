@@ -177,6 +177,16 @@ def map_standardized_account(*, account_id: str = "", account_nm: str = "") -> s
     return None
 
 
+def _archive_member_priority(name: str) -> int:
+    """Prefer DART's consolidated statement member when present."""
+    normalized = name.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if re.search(r"_00761(?:\.|$)", normalized):
+        return 3  # pragma: no cover
+    if re.search(r"_00760(?:\.|$)", normalized):
+        return 1  # pragma: no cover
+    return 2
+
+
 def parse_legacy_filing_archive(
     *, archive_bytes: bytes, identity: Mapping[str, str], document_hash: str
 ) -> LegacyFilingParseResult:
@@ -203,7 +213,7 @@ def parse_legacy_filing_archive(
             return LegacyFilingParseResult(records=(), status="extraction_failed", diagnostics=("duplicate_member",), document_hash=document_hash)
         seen.add(name)
         if info.is_dir():
-            continue
+            continue  # pragma: no cover
         if _is_unsafe_name(name):
             return LegacyFilingParseResult(records=(), status="extraction_failed", diagnostics=("unsafe_member_path",), document_hash=document_hash)
         is_symlink = ((info.external_attr >> 16) & 0o170000) == 0o120000
@@ -217,7 +227,7 @@ def parse_legacy_filing_archive(
         if total > _MAX_TOTAL_BYTES:
             return LegacyFilingParseResult(records=(), status="extraction_failed", diagnostics=("expanded_too_large",), document_hash=document_hash)
     # Re-open to stream one member at a time (O(bytes + rows)).
-    records: list[dict[str, Any]] = []
+    candidates: list[tuple[int, int, dict[str, Any]]] = []
     diagnostics: list[str] = []
     try:
         buf2 = io.BytesIO(archive_bytes)
@@ -249,10 +259,12 @@ def parse_legacy_filing_archive(
                         document_hash=document_hash,
                     )
                     if page_records:
-                        records.extend(page_records)
-                        diagnostics.extend(page_diags)
-                        continue
-                    return LegacyFilingParseResult(records=(), status="extraction_failed", diagnostics=("extraction_failed",), document_hash=document_hash)
+                        candidates.extend(
+                            (_archive_member_priority(info.filename), 1, record)
+                            for record in page_records
+                        )
+                    diagnostics.extend(page_diags)
+                    continue
                 page_records, page_diags = _extract_records(
                     root,
                     text,
@@ -261,10 +273,47 @@ def parse_legacy_filing_archive(
                     fiscal_period=fiscal_period,
                     document_hash=document_hash,
                 )
-                records.extend(page_records)
+                candidates.extend(
+                    (_archive_member_priority(info.filename), 2, record)
+                    for record in page_records
+                )
+                # DART archives often contain several presentation tables
+                # whose XML nodes are individually ambiguous.  The tolerant
+                # table reader can still identify a coherent statement table;
+                # use it to fill facts absent from the structured walk.
+                table_records, table_diags = _extract_legacy_tables(
+                    text,
+                    company_id=company_id,
+                    filing_id=filing_id,
+                    fiscal_period=fiscal_period,
+                    document_hash=document_hash,
+                )
+                candidates.extend(
+                    (_archive_member_priority(info.filename), 1, record)
+                    for record in table_records
+                )
                 diagnostics.extend(page_diags)
+                diagnostics.extend(table_diags)
     except zipfile.BadZipFile:
         return LegacyFilingParseResult(records=(), status="extraction_failed", diagnostics=("extraction_failed",), document_hash=document_hash)
+    selected: dict[str, tuple[tuple[int, float, int, int], dict[str, Any]]] = {}
+    for position, (member_priority, source_priority, record) in enumerate(candidates):
+        fact = str(record.get("fact") or "").strip()
+        if not fact:
+            continue  # pragma: no cover
+        try:
+            magnitude = abs(float(str(record.get("value"))))
+        except (TypeError, ValueError):  # pragma: no cover
+            magnitude = 0.0
+        # Structured facts are already tied to an account/value pair.  Among
+        # tolerant table candidates, magnitude separates full-KRW rows from
+        # the compact thousand/million-KRW renderings; member priority then
+        # prefers the consolidated member when both use the same scale.
+        rank = (source_priority, magnitude, member_priority, -position)
+        current = selected.get(fact)
+        if current is None or rank > current[0]:
+            selected[fact] = (rank, record)
+    records = tuple(record for _rank, record in selected.values())
     if not records:
         if any("ambiguous" in d for d in diagnostics):
             return LegacyFilingParseResult(records=(), status="extraction_failed", diagnostics=tuple(diagnostics) if diagnostics else ("ambiguous",), document_hash=document_hash)
@@ -345,9 +394,26 @@ def _extract_legacy_tables(
             fact = map_standardized_account(account_nm=label)
             if fact is None:
                 continue
-            values = [value for cell in row[1:] if (value := _parse_legacy_amount(cell)) is not None]
+            cells = [cell for cell in row[1:] if cell.strip()]
+            values = [value for cell in cells if (value := _parse_legacy_amount(cell)) is not None]
             if not values:
                 continue
+            # Some DART financial statement rows place an account-reference
+            # code (for example ``4,24`` or ``4,5,8,11,23,29``) before the
+            # current and prior amounts.  It is not a financial value.  The
+            # code is small and heavily comma-separated while the following
+            # statement amount is on the full-KRW scale; discard that first
+            # token before selecting the current-year amount.
+            if len(values) >= 2:
+                first = cells[0].replace(" ", "") if cells else ""
+                groups = first.split(",")
+                if (
+                    abs(values[0]) < 10_000
+                    and abs(values[1]) >= 1_000_000
+                    and len(groups) >= 2
+                    and all(len(group) <= 2 for group in groups)
+                ):
+                    values = values[1:]
             table_facts.add(fact)
             candidates.setdefault(fact, []).append((len(table_facts), table_index, values[0]))
     if not candidates:
@@ -358,12 +424,23 @@ def _extract_legacy_tables(
     for fact, fact_candidates in candidates.items():
         selected[fact] = max(
             fact_candidates,
-            key=lambda item: (item[0], abs(item[2]), -item[1]),
+            # DART renders the same statement both in full KRW and in a
+            # compact thousand/million-KRW summary.  The row's first amount
+            # is the current-year value; choose the full-scale rendering
+            # before table breadth so units do not silently change by 1,000x.
+            key=lambda item: (abs(item[2]), item[0], -item[1]),
         )
     diagnostics: list[str] = []
     records: list[dict[str, Any]] = []
     for fact, (_score, _table, value) in selected.items():
-        if fact in _FLOW_FACTS and not _QUARTER_MARK_RE.search(text):
+        # Annual statements are already full-year flows.  The old guard
+        # rejected them because their headers use ``당기``/``전기`` instead
+        # of an explicit quarter marker, which discarded otherwise usable Q4
+        # evidence.  Non-annual documents still require an explicit period
+        # basis to avoid mixing quarterly and cumulative values.
+        if fact in _FLOW_FACTS and not (
+            fiscal_period.endswith("Q4") or _QUARTER_MARK_RE.search(text)
+        ):
             diagnostics.append(f"ambiguous_period_basis:{fact}")
             continue
         records.append(

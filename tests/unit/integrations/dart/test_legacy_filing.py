@@ -68,3 +68,58 @@ def test_legacy_parser_rejects_ambiguous_or_unsafe_archive_without_facts() -> No
     parsed = parse_legacy_filing_archive(archive_bytes=ambiguous, identity=identity("20150515001111"), document_hash="b" * 64)
     assert parsed.records == ()
     assert "ambiguous" in parsed.diagnostics
+
+
+def test_legacy_parser_recovers_annual_table_facts_when_structured_nodes_are_ambiguous() -> None:
+    from src.integrations.dart.legacy_filing import parse_legacy_filing_archive
+
+    statement = """
+    <?xml version="1.0" encoding="utf-8"?>
+    <document>
+      <TABLE>
+        <TR><TD>매출액</TD><TD>1,000</TD><TD>900</TD></TR>
+        <TR><TD>영업이익</TD><TD>100</TD><TD>90</TD></TR>
+        <TR><TD>당기순이익</TD><TD>80</TD><TD>70</TD></TR>
+        <TR><TD>자산총계</TD><TD>2,000</TD><TD>1,900</TD></TR>
+        <TR><TD>부채총계</TD><TD>800</TD><TD>750</TD></TR>
+        <TR><TD>자본총계</TD><TD>1,200</TD><TD>1,150</TD></TR>
+      </TABLE>
+    </document>
+    """
+    parsed = parse_legacy_filing_archive(
+        archive_bytes=make_legacy_archive({"F1.xml": statement}),
+        identity=identity("F1"),
+        document_hash="c" * 64,
+    )
+
+    assert parsed.status == "ok"
+    assert {record["fact"] for record in parsed.records} >= {
+        "sales",
+        "operating_profit",
+        "net_income",
+        "assets",
+        "debt",
+        "equity",
+    }
+    assert next(record["value"] for record in parsed.records if record["fact"] == "sales") == 1000
+
+
+def test_legacy_table_skips_account_reference_before_full_amount() -> None:
+    from src.integrations.dart.legacy_filing import parse_legacy_filing_archive
+
+    statement = """
+    <?xml version="1.0" encoding="utf-8"?>
+    <document>
+      <TABLE>
+        <TR><TD>매출액</TD><TD>4,24</TD><TD>15,826,896,964</TD><TD>17,085,468,266</TD></TR>
+      </TABLE>
+    </document>
+    """
+    parsed = parse_legacy_filing_archive(
+        archive_bytes=make_legacy_archive({"F2.xml": statement}),
+        identity=identity("F2"),
+        document_hash="d" * 64,
+    )
+
+    assert parsed.status == "ok"
+    assert next(record["value"] for record in parsed.records if record["fact"] == "sales") == 15_826_896_964

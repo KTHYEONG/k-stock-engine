@@ -1084,11 +1084,14 @@ __all__ = [
     "CollectionCheckpointStore",
     "CollectionPlanReceipt",
     "CollectionReadinessReport",
+    "CorporateActionCollectionPlan",
+    "CorporateActionRequest",
     "EvidenceCoverage",
     "HistoricalCollectionPlan",
     "HistoricalCollectionWindow",
     "PlanChunk",
     "audit_historical_readiness",
+    "build_corporate_action_collection_plan",
     "build_historical_collection_plan",
     "build_historical_collection_plan_from_bronze",
     "build_historical_collection_plan_from_universe_decisions",
@@ -1098,6 +1101,217 @@ __all__ = [
     "scoped_checkpoint_dir",
     "scoped_plan_dir",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class CorporateActionRequest:
+    request_id: str
+    requested_instrument_id: str
+    corp_code: str
+    endpoint: str
+    bsns_year: str | None
+    reprt_code: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CorporateActionCollectionPlan:
+    plan_id: str
+    coverage_start: date
+    coverage_end: date
+    input_receipt_digest: str
+    requests: tuple[CorporateActionRequest, ...]
+    unresolved_instruments: tuple[str, ...]
+    content_hash: str
+
+
+def _bare_action_ticker(instrument_id: str) -> str:
+    return str(instrument_id).strip().removeprefix("KRX:")
+
+
+def _validate_corp_code(value: str, *, ticker: str) -> str:
+    code = str(value).strip()
+    if len(code) != 8 or not code.isdigit():
+        raise PITDataError(f"malformed OpenDART corp_code mapping for {ticker!r}")
+    return code
+
+
+def build_corporate_action_collection_plan(
+    *,
+    historical_plan: HistoricalCollectionPlan,
+    ticker_to_corp_code: Mapping[str, str],
+    action_endpoints: tuple[str, ...],
+    dividend_endpoint: str,
+    dividend_report_codes: tuple[str, ...],
+    artifact_root: Path | str,
+) -> CorporateActionCollectionPlan:
+    """Create immutable, resumable OpenDART requests from certified ordinary-share membership.
+
+    Historical evidence must be requested once for every uniquely mapped
+    instrument and every official endpoint/report period.  The plan preserves
+    unmapped instruments as explicit unresolved outcomes so that a later
+    coverage decision cannot mistake absence for a no-action result.
+
+    Args:
+        historical_plan: Verified symbol/session plan defining the coverage
+            interval and eligible instruments.
+        ticker_to_corp_code: Retained DART ticker-to-company-code evidence.
+        action_endpoints: Official structured corporate-decision endpoint names.
+        dividend_endpoint: Official dividend endpoint name.
+        dividend_report_codes: Official report-type identifiers for each fiscal
+            year in scope.
+        artifact_root: Persistent plan-artifact destination.
+
+    Returns:
+        Deterministic request plan and explicit unresolved instruments.
+
+    Raises:
+        PITDataError: Coverage, endpoint, mapping, or artifact inputs are
+            malformed.
+    """
+    start = historical_plan.coverage_start
+    end = historical_plan.coverage_end
+    if not isinstance(start, date) or not isinstance(end, date) or start > end:
+        raise PITDataError("coverage_start must not be after coverage_end")
+    endpoints = tuple(str(e).strip() for e in (action_endpoints or ()))
+    if not endpoints or any(not e for e in endpoints) or len(set(endpoints)) != len(endpoints):
+        raise PITDataError("action_endpoints must be nonempty and unique")
+    dividend_name = str(dividend_endpoint or "").strip()
+    if not dividend_name:
+        raise PITDataError("dividend_endpoint must be a nonempty endpoint name")
+    report_codes = tuple(str(c).strip() for c in (dividend_report_codes or ()))
+    if not report_codes or any(not c for c in report_codes) or len(set(report_codes)) != len(report_codes):
+        raise PITDataError("dividend_report_codes must be nonempty and unique")
+    if not isinstance(ticker_to_corp_code, Mapping):
+        raise PITDataError("ticker_to_corp_code must be a mapping")
+    normalized: dict[str, str] = {}
+    for raw_key, raw_value in dict(ticker_to_corp_code).items():
+        bare = _bare_action_ticker(raw_key)
+        if not bare:
+            raise PITDataError("ticker_to_corp_code has a blank instrument key")
+        code = _validate_corp_code(raw_value, ticker=bare)
+        previous = normalized.get(bare)
+        if previous is not None and previous != code:
+            raise PITDataError(f"conflicting OpenDART corp_code mappings for {bare!r}")
+        normalized.setdefault(bare, code)
+    symbols = sorted({str(c.symbol).strip() for c in historical_plan.chunks if str(c.symbol).strip()})
+    if not symbols:
+        raise PITDataError("historical plan has no eligible instruments")
+    historical_digest = str(historical_plan.content_hash or historical_plan.plan_id).strip()
+    if not historical_digest:
+        raise PITDataError("historical plan digest is missing")
+    resolved: list[tuple[str, str]] = []
+    unresolved: list[str] = []
+    for symbol in symbols:
+        corp_code = normalized.get(_bare_action_ticker(symbol))
+        if corp_code is None:
+            unresolved.append(symbol)
+        else:
+            resolved.append((symbol, corp_code))
+    years = [str(year) for year in range(start.year, end.year + 1)]
+
+    def _request_id(instrument_id: str, corp_code: str, endpoint: str, bsns_year: str | None, reprt_code: str | None) -> str:
+        digest = hashlib.sha256()
+        for token in (
+            start.isoformat(), end.isoformat(), historical_digest,
+            instrument_id, corp_code, endpoint, bsns_year or "", reprt_code or "",
+        ):
+            digest.update(token.encode("utf-8"))
+            digest.update(b"\x00")
+        return f"ca-{digest.hexdigest()[:16]}"
+
+    draft: list[CorporateActionRequest] = []
+    draft.extend(
+        CorporateActionRequest(
+            request_id=_request_id(instrument_id, corp_code, endpoint, None, None),
+            requested_instrument_id=instrument_id,
+            corp_code=corp_code,
+            endpoint=endpoint,
+            bsns_year=None,
+            reprt_code=None,
+        )
+        for instrument_id, corp_code in resolved
+        for endpoint in sorted(endpoints)
+    )
+    draft.extend(
+        CorporateActionRequest(
+            request_id=_request_id(instrument_id, corp_code, dividend_name, year, report),
+            requested_instrument_id=instrument_id,
+            corp_code=corp_code,
+            endpoint=dividend_name,
+            bsns_year=year,
+            reprt_code=report,
+        )
+        for instrument_id, corp_code in resolved
+        for year in years
+        for report in sorted(report_codes)
+    )
+    draft.sort(key=lambda r: (r.requested_instrument_id, r.endpoint, r.bsns_year or "", r.reprt_code or ""))
+    content = hashlib.sha256()
+    for token in (start.isoformat(), end.isoformat(), historical_digest, dividend_name):
+        content.update(token.encode("utf-8"))
+        content.update(b"\x00")
+    for endpoint in sorted(endpoints):
+        content.update(endpoint.encode("utf-8"))
+        content.update(b"\x00")
+    for report in sorted(report_codes):
+        content.update(report.encode("utf-8"))
+        content.update(b"\x00")
+    for bare in sorted(normalized):
+        content.update(bare.encode("utf-8"))
+        content.update(b"=")
+        content.update(normalized[bare].encode("utf-8"))
+        content.update(b"\x00")
+    for item in draft:
+        for token in (item.request_id, item.requested_instrument_id, item.corp_code, item.endpoint, item.bsns_year or "", item.reprt_code or ""):
+            content.update(token.encode("utf-8"))
+            content.update(b"\x00")
+    content_hash = content.hexdigest()
+    plan_id = f"cap-{content_hash[:16]}"
+    plan = CorporateActionCollectionPlan(
+        plan_id=plan_id,
+        coverage_start=start,
+        coverage_end=end,
+        input_receipt_digest=historical_digest,
+        requests=tuple(draft),
+        unresolved_instruments=tuple(unresolved),
+        content_hash=content_hash,
+    )
+    root = Path(artifact_root)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        (root / f"{plan_id}.json").write_text(
+            json.dumps(
+                {
+                    "plan_id": plan_id,
+                    "content_hash": content_hash,
+                    "coverage_start": start.isoformat(),
+                    "coverage_end": end.isoformat(),
+                    "input_receipt_digest": historical_digest,
+                    "historical_plan_id": historical_plan.plan_id,
+                    "action_endpoints": sorted(endpoints),
+                    "dividend_endpoint": dividend_name,
+                    "dividend_report_codes": sorted(report_codes),
+                    "requests": [
+                        {
+                            "request_id": r.request_id,
+                            "requested_instrument_id": r.requested_instrument_id,
+                            "corp_code": r.corp_code,
+                            "endpoint": r.endpoint,
+                            "bsns_year": r.bsns_year,
+                            "reprt_code": r.reprt_code,
+                        }
+                        for r in draft
+                    ],
+                    "unresolved_instruments": list(unresolved),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        raise PITDataError(f"corporate-action plan receipt write failed: {type(exc).__name__}") from exc
+    return plan
 
 
 @dataclass(frozen=True, slots=True)

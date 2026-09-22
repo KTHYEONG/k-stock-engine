@@ -1,6 +1,28 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_OPENDART_CORPORATE_ACTION_BACKFILL",
+      "date": "2026-09-22",
+      "adr_id": "ADR_20260922_OPENDART_CORPORATE_ACTION_BACKFILL",
+      "domain": "data",
+      "title": "OpenDART 기업행위 백필 인증",
+      "why": "기업행위 Bronze가 없고 과거 회사코드 10개가 매핑되지 않아 Silver와 Gold의 PIT 기업행위 조건을 인증할 수 없었습니다.",
+      "resolution": "기업코드 결측을 명시적으로 보존하고 구조화 결정·배당 요청을 결정적 계획과 체크포인트 기반으로 수집하며 빈 응답·오류·미완료 상태를 ledger에 기록했습니다.",
+      "impact": "기업행위 수집이 재시작 가능하고 무자료 응답을 성공 데이터로 오인하지 않으며 미해결 종목이 Gold 인증을 자동 우회하지 않습니다.",
+      "caveat": "KRX 공식 달력과 역사적 비용 원본은 별도 원천 계약이 확정되기 전까지 Silver 인증 대상에 포함할 수 없습니다."
+    },
+    {
+      "task_id": "TASK_FINANCIAL_QUALITY_GOLD_PIT",
+      "date": "2026-09-22",
+      "adr_id": "ADR_20260922_FINANCIAL_QUALITY_GOLD_PIT",
+      "domain": "data",
+      "title": "재무 품질 Silver와 Gold PIT 게이트",
+      "why": "공식 DART 재무 누락을 Gold feature 생성에서 명시적으로 차단해야 한다.",
+      "resolution": "재무 품질 companion Silver를 적재하고 Gold와 백테스트 QVEF 경로에 최신 회계기간 완전성 및 PIT 필터를 연결했다.",
+      "impact": "미해결 공식 filing은 거래 대상에서 제외되고 과거 시점 replay도 미래 재무 상태를 사용하지 않는다.",
+      "caveat": "케미메디 2019Q4는 공식 원천값 부재로 복구하지 않으며 전체 Gold 생성은 다른 Silver 입력 인증도 필요하다."
+    },
+    {
       "task_id": "TASK_DART_COLLECTION_POLICY_UNIFICATION",
       "date": "2026-09-21",
       "adr_id": "ADR_20260921_DART_COLLECTION_POLICY_UNIFICATION",

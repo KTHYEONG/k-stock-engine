@@ -702,6 +702,7 @@ def test_materialize_gold_window_uses_in_memory_reader_and_patches_listing_date(
     last_date = sessions[-1].astimezone(KRX_TZ).date()
     first_date = sessions[-5].astimezone(KRX_TZ).date()
     decision_time = datetime.now(UTC)
+    financial_quality = pl.DataFrame({"company_id": ["C1"], "fiscal_period": ["2023Q4"], "accounting_basis": ["consolidated"], "available_at": [sessions[0]], "financial_complete": [True]})
     out = materialize_gold_window(
         silver_root=tmp_path / 'silver',
         validation_start=first_date,
@@ -709,6 +710,7 @@ def test_materialize_gold_window_uses_in_memory_reader_and_patches_listing_date(
         decision_time=decision_time,
         artifact_root=tmp_path / 'artifacts',
         gold_root=tmp_path / 'gold',
+        financial_quality=financial_quality,
         universe_policy=UniversePolicy(minimum_listing_sessions=1, minimum_median_trading_value_krw=1.0),
     )
     assert out.manifest is not None
@@ -749,6 +751,7 @@ def test_materialize_gold_window_with_empty_flow_frame_fails_soft(tmp_path: Path
     last_date = sessions[-1].astimezone(KRX_TZ).date()
     first_date = sessions[-5].astimezone(KRX_TZ).date()
     decision_time = datetime.now(UTC)
+    financial_quality = pl.DataFrame({"company_id": ["C1"], "fiscal_period": ["2023Q4"], "accounting_basis": ["consolidated"], "available_at": [sessions[0]], "financial_complete": [True]})
     out = materialize_gold_window(
         silver_root=tmp_path / 'silver',
         validation_start=first_date,
@@ -756,6 +759,7 @@ def test_materialize_gold_window_with_empty_flow_frame_fails_soft(tmp_path: Path
         decision_time=decision_time,
         artifact_root=tmp_path / 'artifacts',
         gold_root=tmp_path / 'gold',
+        financial_quality=financial_quality,
         universe_policy=UniversePolicy(minimum_listing_sessions=1, minimum_median_trading_value_krw=1.0),
     )
     assert out.manifest is not None
@@ -879,4 +883,3 @@ def test_materialize_gold_window_with_score_policy(tmp_path: Path) -> None:
 
     assert report.universe_decisions_count > 0
     assert report.summary_artifact_path != ""
-
