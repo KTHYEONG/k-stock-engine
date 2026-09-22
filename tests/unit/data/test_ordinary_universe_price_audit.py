@@ -9,7 +9,10 @@ import polars as pl
 import pytest
 
 from src.data.bronze import BronzeStore
-from src.data.ordinary_universe_price_audit import audit_ordinary_universe_price_availability
+from src.data.ordinary_universe_price_audit import (
+    audit_ordinary_universe_price_availability,
+    plan_investor_flow_from_ordinary_universe,
+)
 from src.data.schemas import EvidenceKind, PITDataError
 
 
@@ -39,6 +42,141 @@ def test_audit_counts_tradable_zero_volume_and_missing(tmp_path) -> None:
     audit = audit_ordinary_universe_price_availability(universe_root=tmp_path / "universe", bronze_root=tmp_path / "bronze", artifact_root=tmp_path / "artifacts")
     assert (audit.eligible_rows, audit.price_rows, audit.tradable_rows, audit.zero_volume_rows, audit.missing_price_rows) == (2, 2, 1, 1, 0)
     assert (tmp_path / "artifacts" / "ordinary-universe-price-audit" / f"{audit.dataset_id}.json").is_file()
+
+
+def test_flow_plan_uses_only_tradable_certified_cells(tmp_path) -> None:
+    _universe(tmp_path / "universe")
+    store = BronzeStore(tmp_path / "bronze")
+    _daily(store, [_bar("000001"), _bar("000002", volume="0")])
+    path = plan_investor_flow_from_ordinary_universe(
+        universe_root=tmp_path / "universe", bronze_root=tmp_path / "bronze",
+        artifact_root=tmp_path / "artifacts", start=datetime(2020, 1, 2).date(),
+        end=datetime(2020, 1, 2).date(), max_sessions=700,
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["requested_symbol_sessions"] == 1
+    assert payload["chunks"] == [{"chunk_id": f"{payload['plan_id']}:000001:0000", "symbol": "000001", "sessions": ["2020-01-02"]}]
+
+
+def test_flow_plan_rejects_invalid_boundaries_and_unverified_cells(tmp_path) -> None:
+    universe = tmp_path / "universe"
+    _universe(universe)
+    with pytest.raises(PITDataError, match="invalid ordinary-universe flow plan range"):
+        plan_investor_flow_from_ordinary_universe(
+            universe_root=universe,
+            bronze_root=tmp_path / "bronze",
+            artifact_root=tmp_path / "artifacts",
+            start=datetime(2020, 1, 3).date(),
+            end=datetime(2020, 1, 2).date(),
+            max_sessions=700,
+        )
+    with pytest.raises(PITDataError, match="invalid ordinary-universe flow plan range"):
+        plan_investor_flow_from_ordinary_universe(
+            universe_root=universe,
+            bronze_root=tmp_path / "bronze",
+            artifact_root=tmp_path / "artifacts",
+            start=datetime(2020, 1, 2).date(),
+            end=datetime(2020, 1, 2).date(),
+            max_sessions=0,
+        )
+    with pytest.raises(PITDataError, match="has no sessions"):
+        plan_investor_flow_from_ordinary_universe(
+            universe_root=universe,
+            bronze_root=tmp_path / "bronze",
+            artifact_root=tmp_path / "artifacts",
+            start=datetime(2020, 1, 3).date(),
+            end=datetime(2020, 1, 3).date(),
+            max_sessions=700,
+        )
+
+    store = BronzeStore(tmp_path / "bronze")
+    _daily(store, [_bar("000001")])
+    dataset = universe / "ordinary_universe_test"
+    (dataset / "session=2020-01-02" / "part.parquet").write_bytes(b"tampered")
+    with pytest.raises(PITDataError, match="partition hash mismatch"):
+        plan_investor_flow_from_ordinary_universe(
+            universe_root=universe,
+            bronze_root=tmp_path / "bronze",
+            artifact_root=tmp_path / "artifacts",
+            start=datetime(2020, 1, 2).date(),
+            end=datetime(2020, 1, 2).date(),
+            max_sessions=700,
+        )
+
+
+@pytest.mark.parametrize(
+    ("records", "error"),
+    [
+        ([42], "invalid daily-market record"),
+        ([_bar("000001"), _bar("000001")], "duplicate daily-market ticker"),
+        ([_bar("000001")], "missing daily-market price"),
+    ],
+)
+def test_flow_plan_rejects_invalid_or_incomplete_daily_pages(tmp_path, records, error) -> None:
+    universe = tmp_path / "universe"
+    _universe(universe)
+    store = BronzeStore(tmp_path / "bronze")
+    if error == "missing daily-market price":
+        records = [_bar("000002")]
+    _daily(store, records)
+    with pytest.raises(PITDataError, match=error):
+        plan_investor_flow_from_ordinary_universe(
+            universe_root=universe,
+            bronze_root=tmp_path / "bronze",
+            artifact_root=tmp_path / "artifacts",
+            start=datetime(2020, 1, 2).date(),
+            end=datetime(2020, 1, 2).date(),
+            max_sessions=700,
+        )
+
+
+def test_flow_plan_rejects_missing_or_ambiguous_pages_and_collision(tmp_path) -> None:
+    universe = tmp_path / "universe"
+    _universe(universe)
+    with pytest.raises(PITDataError, match="missing or ambiguous daily-market page"):
+        plan_investor_flow_from_ordinary_universe(
+            universe_root=universe,
+            bronze_root=tmp_path / "empty-bronze",
+            artifact_root=tmp_path / "artifacts",
+            start=datetime(2020, 1, 2).date(),
+            end=datetime(2020, 1, 2).date(),
+            max_sessions=700,
+        )
+    store = BronzeStore(tmp_path / "ambiguous-bronze")
+    _daily(store, [_bar("000001")], label="a")
+    _daily(store, [{**_bar("000001"), "extra": "other"}], label="b")
+    with pytest.raises(PITDataError, match="missing or ambiguous daily-market page"):
+        plan_investor_flow_from_ordinary_universe(
+            universe_root=universe,
+            bronze_root=tmp_path / "ambiguous-bronze",
+            artifact_root=tmp_path / "artifacts",
+            start=datetime(2020, 1, 2).date(),
+            end=datetime(2020, 1, 2).date(),
+            max_sessions=700,
+        )
+
+    clean_universe = tmp_path / "clean-universe"
+    _universe(clean_universe)
+    clean_store = BronzeStore(tmp_path / "clean-bronze")
+    _daily(clean_store, [_bar("000001"), _bar("000002")])
+    path = plan_investor_flow_from_ordinary_universe(
+        universe_root=clean_universe,
+        bronze_root=tmp_path / "clean-bronze",
+        artifact_root=tmp_path / "artifacts",
+        start=datetime(2020, 1, 2).date(),
+        end=datetime(2020, 1, 2).date(),
+        max_sessions=700,
+    )
+    path.write_text("collision", encoding="utf-8")
+    with pytest.raises(PITDataError, match="ordinary-universe flow plan collision"):
+        plan_investor_flow_from_ordinary_universe(
+            universe_root=clean_universe,
+            bronze_root=tmp_path / "clean-bronze",
+            artifact_root=tmp_path / "artifacts",
+            start=datetime(2020, 1, 2).date(),
+            end=datetime(2020, 1, 2).date(),
+            max_sessions=700,
+        )
 
 
 def test_audit_rejects_duplicate_daily_ticker_and_tampered_universe(tmp_path) -> None:

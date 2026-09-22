@@ -219,6 +219,32 @@ def _pipeline_log(phase: str, **fields: Any) -> None:
     logger.info("[DATA] phase=%s %s", phase, flat)
 
 
+def _read_action_ledger(artifact: CollectionArtifact) -> dict[str, Any]:
+    try:
+        ledger = json.loads(Path(artifact.report_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise PITDataError("corporate-action ledger is unreadable; certification blocked") from exc
+    if not isinstance(ledger, dict):
+        raise PITDataError("corporate-action ledger is unreadable; certification blocked")
+    return ledger
+
+
+def _require_corporate_action_certifiable(artifact: CollectionArtifact) -> dict[str, Any]:
+    """Block downstream materialization unless the action ledger is fully complete."""
+    ledger = _read_action_ledger(artifact)
+    try:
+        pending = int(ledger.get("pending", 0))
+        provider_errors = int(ledger.get("provider_errors", 0))
+    except (TypeError, ValueError) as exc:
+        raise PITDataError("corporate-action ledger is unreadable; certification blocked") from exc
+    unresolved = ledger.get("unresolved_instruments", ())
+    unresolved_list = list(unresolved) if isinstance(unresolved, (list, tuple)) else []
+    if pending or provider_errors or unresolved_list:
+        detail = f"pending={pending} provider_errors={provider_errors} unresolved={','.join(str(v) for v in unresolved_list)}"
+        raise PITDataError(f"corporate-action coverage incomplete ({detail}); certification blocked")
+    return ledger
+
+
 def run_historical_data_pipeline(
     request: HistoricalDataPipelineRequest,
     *,
@@ -316,8 +342,21 @@ def run_historical_data_pipeline(
         kinds=frozenset({_Kind.DAILY_MARKET, _Kind.SECURITY_MASTER, _Kind.INVESTOR_FLOW, _Kind.CORPORATE_ACTIONS}),
     )
     hashes = {kind.value: art.content_hash for kind, art in artifacts.items()}
+    action_artifact = artifacts.get(_Kind.CORPORATE_ACTIONS)
+    if action_artifact is None:
+        raise PITDataError("corporate-action coverage missing; certification blocked")
+    action_ledger = _require_corporate_action_certifiable(action_artifact)
     (run_root / "coverage.json").write_text(
-        json.dumps({"plan_id": plan_id, "receipt_hashes": hashes}, indent=2, sort_keys=True),
+        json.dumps({"plan_id": plan_id, "receipt_hashes": hashes,
+                    "corporate_actions_ledger": str(action_artifact.report_path),
+                    "corporate_actions_unresolved": len(action_ledger.get("unresolved_instruments", ())),
+                    "corporate_actions": {
+                        "planned": action_ledger.get("planned"),
+                        "pending": action_ledger.get("pending"),
+                        "provider_errors": action_ledger.get("provider_errors"),
+                        "empty": action_ledger.get("empty"),
+                        "successful": action_ledger.get("successful"),
+                    }}, indent=2, sort_keys=True),
         encoding="utf-8",
     )
     _pipeline_log("collect", plan_id=plan_id, kinds=sorted(hashes))

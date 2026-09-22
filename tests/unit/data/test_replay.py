@@ -1,3 +1,33 @@
+from __future__ import annotations
+
+from datetime import datetime
+
+import polars as pl
+
+
+def _complete_financial_quality(available_at: datetime) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "company_id": ["C1"],
+            "fiscal_period": ["2023Q4"],
+            "accounting_basis": ["consolidated"],
+            "available_at": [available_at],
+            "financial_complete": [True],
+        }
+    )
+
+
+def test_require_certified_inputs_requires_financial_quality_companion(tmp_path) -> None:
+    import pytest
+    from src.data.pipeline import _require_certified_inputs
+    from src.data.schemas import PITDataError
+
+    silver_root = tmp_path / "silver"
+    silver_root.mkdir()
+    with pytest.raises(PITDataError, match="financial_quality"):
+        _require_certified_inputs(silver_root, tmp_path / "bronze")
+
+
 def test_pit_replay_reader_limits_daily_and_flow_to_required_windows() -> None:
     from datetime import UTC, datetime, timedelta
     import polars as pl
@@ -105,6 +135,7 @@ def test_materialize_backtest_inputs_bounded_loop_reaches_replay(tmp_path, monke
             return PITReplayReader.from_frames_for_test(calendar=SessionCalendar(sessions), security_master=pl.DataFrame(), daily_market=pl.DataFrame(), investor_flow=pl.DataFrame(), financial_facts=pl.DataFrame(), corporate_actions=pl.DataFrame())
 
     monkeypatch.setattr(pipeline, 'PITReplayReader', _FakeReader)
+    monkeypatch.setattr(pipeline, "load_latest_financial_quality", lambda **_kwargs: pl.DataFrame())
     with pytest.raises(pipeline.PITDataError, match='no PIT-complete'):
         pipeline.materialize_backtest_inputs(bronze_root=tmp_path / 'bronze', silver_root=tmp_path / 'silver', gold_root=tmp_path / 'gold', decision_time=decision)
 
@@ -153,6 +184,10 @@ def test_materialize_gold_window_silver_root_bounded_branch(tmp_path, monkeypatc
     first_date = sessions[-5].astimezone(KRX_TZ).date()
     decision_time = datetime.now(UTC)
     from src.strategy.universe import UniversePolicy
+    monkeypatch.setattr(
+        "src.data.financial_quality.load_latest_financial_quality",
+        lambda **_kwargs: _complete_financial_quality(sessions[0]),
+    )
     out = materialize_gold_window(silver_root=tmp_path / 'silver', validation_start=first_date, validation_end=last_date, decision_time=decision_time, artifact_root=tmp_path / 'artifacts', gold_root=tmp_path / 'gold', universe_policy=UniversePolicy(minimum_listing_sessions=1, minimum_median_trading_value_krw=1.0))
     assert out.manifest is not None
     assert out.universe_decisions_count >= 0
@@ -170,6 +205,7 @@ def test_materialize_backtest_inputs_rejects_cert_mismatch_and_empty_order(tmp_p
     sessions = tuple(datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(70))
     decision = sessions[-1]
     monkeypatch.setattr(pipeline, '_require_certified_inputs', lambda *_a, **_k: None)
+    monkeypatch.setattr(pipeline, "load_latest_financial_quality", lambda **_kwargs: pl.DataFrame())
 
     def _fake_discover(*_a, **_k):
         return {
@@ -432,6 +468,7 @@ def test_materialize_backtest_inputs_bounded_success(tmp_path, monkeypatch) -> N
     monkeypatch.setattr(_agg, 'discover_verified_bronze_receipts', _fake_discover)
     monkeypatch.setattr(pipeline, '_load_silver_tables', lambda _r, _d: {SilverTable.CALENDAR: tables[SilverTable.CALENDAR], SilverTable.CORPORATE_ACTIONS: tables[SilverTable.CORPORATE_ACTIONS]})
     monkeypatch.setattr(pipeline, 'certify_corporate_action_refresh', lambda **_k: CertificationReport(certification=DatasetCertification.RESEARCH, report_hash=report.report_hash, coverage_start=sessions[0].date(), coverage_end=sessions[-1].date(), source_hashes=dict.fromkeys(EvidenceKind, 'h' * 64)))
+    monkeypatch.setattr(pipeline, "load_latest_financial_quality", lambda **_kwargs: _complete_financial_quality(sessions[0]))
     artifact = pipeline.materialize_backtest_inputs(bronze_root=tmp_path / 'bronze', silver_root=tmp_path / 'silver', gold_root=tmp_path / 'gold', artifact_root=tmp_path / 'artifacts', decision_time=datetime.now(UTC))
     assert artifact.universe_hash
     assert artifact.qvef_hash
@@ -455,7 +492,7 @@ def test_materialize_gold_window_silver_root_eligible_branch(tmp_path) -> None:
     SilverStore(tmp_path / 'silver').materialize_all(tables, report=report, decision_time=now)
     last_date = sessions[-1].astimezone(KRX_TZ).date()
     first_date = sessions[-5].astimezone(KRX_TZ).date()
-    out = materialize_gold_window(silver_root=tmp_path / 'silver', validation_start=first_date, validation_end=last_date, decision_time=datetime.now(UTC), artifact_root=tmp_path / 'artifacts', gold_root=None)
+    out = materialize_gold_window(silver_root=tmp_path / 'silver', validation_start=first_date, validation_end=last_date, decision_time=datetime.now(UTC), artifact_root=tmp_path / 'artifacts', gold_root=None, financial_quality=_complete_financial_quality(sessions[0]))
     assert out.eligible_decisions_count > 0
     assert out.feature_rows_count > 0
 

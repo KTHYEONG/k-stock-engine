@@ -594,6 +594,7 @@ def materialize_gold_window(
     financial_facts: pl.DataFrame | None = None,
     corporate_actions: pl.DataFrame | None = None,
     investor_flow: pl.DataFrame | None = None,
+    financial_quality: pl.DataFrame | None = None,
     validation_start: date,
     validation_end: date,
     decision_time: datetime,
@@ -637,7 +638,9 @@ def materialize_gold_window(
         and financial_facts is not None
         and corporate_actions is not None
     )
-    if silver_root is not None and not has_complete_frames:
+    loaded_from_silver = silver_root is not None and not has_complete_frames
+    if loaded_from_silver:
+        assert silver_root is not None
         from src.data.gold_loader import load_gold_window_inputs as _load_inputs
 
         _inputs = _load_inputs(
@@ -663,6 +666,17 @@ def materialize_gold_window(
         or corporate_actions is None
     ):
         raise PITDataError("materialize_gold_window requires calendar and Silver frames")
+    # A caller that provides every frame owns its fixture/input boundary.  The
+    # certified Silver loading path, however, must always carry the companion
+    # financial-quality evidence so an official missing value cannot become a
+    # silent feature omission.
+    if loaded_from_silver and financial_quality is None:
+        assert silver_root is not None
+        from src.data.financial_quality import load_latest_financial_quality
+
+        financial_quality = load_latest_financial_quality(
+            root=Path(silver_root), decision_time=decision_time
+        )
     flow_df = investor_flow if investor_flow is not None else pl.DataFrame()
 
     # Align batch-ingestion available_at timestamps if present
@@ -841,6 +855,7 @@ def materialize_gold_window(
                     daily_market=replay.daily_market,
                     investor_flow=replay.investor_flow,
                     financial_facts=replay.financial_facts,
+                    financial_quality=financial_quality,
                     policy=f_policy,
                 )
             else:
@@ -853,6 +868,7 @@ def materialize_gold_window(
                     daily_market=daily_market,
                     investor_flow=flow_df,
                     financial_facts=financial_facts,
+                    financial_quality=financial_quality,
                     policy=f_policy,
                 )
             if stream_writer is not None:
@@ -937,6 +953,11 @@ def materialize_gold_window(
         "universe_path": u_path_str,
         "features_path": f_path_str,
         "audit_artifact_path": str(audit_path),
+        "financial_quality_source_hashes": (
+            sorted(financial_quality["source_hash"].unique().to_list())
+            if financial_quality is not None and "source_hash" in financial_quality.columns
+            else []
+        ),
     }
     summary_path.write_text(
         json.dumps(summary_payload, sort_keys=True, ensure_ascii=False, indent=2),

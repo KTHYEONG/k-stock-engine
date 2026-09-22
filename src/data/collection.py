@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from src.data.bronze import BronzeStore
-from src.data.collection_plan import CollectionCheckpointStore, HistoricalCollectionPlan
+from src.data.collection_plan import (
+    CollectionCheckpointStore,
+    CorporateActionCollectionPlan,
+    HistoricalCollectionPlan,
+)
 from src.data.lifecycle import LifecycleCandidate, parse_kind_lifecycle_notice
 from src.data.receipt_catalog import EvidenceStatus
 from src.data.schemas import BronzeReceipt, EvidenceKind, PITDataError
@@ -33,6 +37,298 @@ HISTORICAL_PROVIDER_ROUTES: Mapping[EvidenceKind, str] = {
     EvidenceKind.CORPORATE_ACTIONS: "opendart_structured_decisions",
     EvidenceKind.HISTORICAL_COSTS: "retained_official_rules",
 }
+
+_CORPORATE_ACTION_ENDPOINTS: tuple[str, ...] = (
+    "fricDecsn.json",
+    "crDecsn.json",
+    "piicDecsn.json",
+    "cmpDvDecsn.json",
+    "cmpMgDecsn.json",
+)
+
+_DIVIDEND_ENDPOINT = "alotMatter.json"
+
+_DIVIDEND_REPORT_CODES: tuple[str, ...] = ("11011", "11012", "11013", "11014")
+
+_VALID_ACTION_STATUSES: frozenset[str] = frozenset({"000", "013"})
+
+
+def _action_page_field(page: Any, name: str) -> str:
+    value = getattr(page, name, None)
+    if value is None and isinstance(page, dict):
+        value = page.get(name)
+    return str(value or "").strip()
+
+
+def _action_page_records(page: Any) -> list[dict[str, Any]]:
+    raw = getattr(page, "records", None)
+    if raw is None and isinstance(page, dict):
+        raw = page.get("records")
+    if raw is None:
+        return []
+    if not isinstance(raw, (list, tuple)):
+        raise PITDataError("OpenDART corporate-action page has invalid records")
+    records: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise PITDataError("OpenDART corporate-action page has invalid records")
+        records.append(dict(item))
+    return records
+
+
+def _verified_action_receipts(
+    *,
+    checkpoint_store: CollectionCheckpointStore,
+    plan: CorporateActionCollectionPlan,
+    request_id: str,
+    bronze_root: Path,
+) -> tuple[tuple[BronzeReceipt, str], ...] | None:
+    path = checkpoint_store._chunk_path(plan.plan_id, request_id)
+    try:
+        stored = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(stored, dict) or stored.get("plan_digest") != plan.content_hash:
+        return None
+    raw_hashes = stored.get("receipt_hashes") or (stored.get("receipt_digest"),)
+    digests = tuple(str(v) for v in raw_hashes if str(v).strip()) if isinstance(raw_hashes, (list, tuple)) else ()
+    if not digests:
+        return None
+    verified: list[tuple[BronzeReceipt, str]] = []
+    for digest in digests:
+        payload_path = Path(bronze_root) / EvidenceKind.CORPORATE_ACTIONS.value / digest / "payload.json"
+        meta_path = Path(bronze_root) / EvidenceKind.CORPORATE_ACTIONS.value / digest / "receipt.json"
+        try:
+            raw = payload_path.read_bytes()
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, KeyError):
+            return None
+        if hashlib.sha256(raw).hexdigest() != digest:
+            return None
+        payload = json.loads(raw)
+        if str(payload.get("request_id") or "") != request_id:
+            return None
+        if str(payload.get("plan_id") or "") != plan.plan_id:
+            return None
+        if str(payload.get("plan_hash") or "") != plan.content_hash:
+            return None
+        try:
+            retrieved = datetime.fromisoformat(meta["retrieved_at"])
+            ingested = datetime.fromisoformat(meta["ingested_at"])
+        except (ValueError, KeyError, TypeError) as exc:
+            raise PITDataError("retained corporate-action receipt is unreadable") from exc
+        verified.append((
+            BronzeReceipt(
+                kind=EvidenceKind.CORPORATE_ACTIONS,
+                content_hash=digest,
+                source_path=str(meta.get("source_path", "")),
+                retrieved_at=retrieved,
+                ingested_at=ingested,
+                payload_path=payload_path,
+                metadata_path=meta_path,
+            ),
+            str(payload.get("status") or ""),
+        ))
+    return tuple(verified)
+
+
+def collect_planned_corporate_actions(
+    *,
+    plan: CorporateActionCollectionPlan,
+    dart: Any,
+    bronze_root: Path,
+    retrieved_at: datetime,
+    checkpoint_store: CollectionCheckpointStore,
+) -> CollectionArtifact:
+    """Collect planned OpenDART action pages with per-request retry-safe accounting.
+
+    Corporate actions affect historical holdings and cash flows, so each
+    provider request must remain individually traceable and resumable.  A
+    valid OpenDART empty status proves only that this endpoint had no matching
+    disclosure; it never resolves an unmapped instrument or an unattempted
+    request.
+
+    Args:
+        plan: Immutable mapped and unresolved OpenDART request plan.
+        dart: Configured OpenDART adapter.
+        bronze_root: Immutable Bronze evidence destination.
+        retrieved_at: Timezone-aware acquisition timestamp.
+        checkpoint_store: Per-request verified completion state.
+
+    Returns:
+        Corporate-action collection artifact with receipt and coverage counts.
+
+    Raises:
+        PITDataError: A timestamp, provider response, persisted receipt, or
+            coverage state is invalid or incomplete.
+    """
+    if retrieved_at.tzinfo is None:
+        raise PITDataError("retrieved_at must be timezone-aware")
+    if not plan.requests:
+        raise PITDataError("corporate-action plan has no requests")
+    if plan.coverage_start > plan.coverage_end:
+        raise PITDataError("coverage_start must not be after coverage_end")
+    seen_ids = [r.request_id for r in plan.requests]
+    if any(not rid.strip() for rid in seen_ids) or len(set(seen_ids)) != len(seen_ids):
+        raise PITDataError("corporate-action plan has duplicate or blank request IDs")
+    store = BronzeStore(Path(bronze_root))
+    bronze_path = Path(bronze_root)
+    page_receipts: list[BronzeReceipt] = []
+    completed = 0
+    previously_completed = 0
+    empty_pages = 0
+    successful_pages = 0
+    for request in plan.requests:
+        verified = _verified_action_receipts(
+            checkpoint_store=checkpoint_store, plan=plan, request_id=request.request_id, bronze_root=bronze_path
+        )
+        if verified is not None:
+            previously_completed += 1
+            for receipt, status in verified:
+                page_receipts.append(receipt)
+                if status == "013":
+                    empty_pages += 1
+                else:
+                    successful_pages += 1
+            continue
+        is_dividend = request.bsns_year is not None or request.reprt_code is not None
+        try:
+            if is_dividend:
+                if not request.bsns_year or not request.reprt_code:
+                    raise PITDataError(f"dividend request {request.request_id!r} is missing its fiscal identity")
+                raw_pages = dart.fetch_dividend_disclosures(
+                    corp_codes=(request.corp_code,), bsns_years=(request.bsns_year,)
+                )
+            else:
+                raw_pages = dart.fetch_corporate_action_decisions(
+                    corp_codes=(request.corp_code,), start=plan.coverage_start, end=plan.coverage_end
+                )
+        except PITDataError:
+            raise
+        except Exception as exc:
+            raise PITDataError(f"OpenDART corporate-action collection failed: {exc}") from exc
+        pages = list(raw_pages) if raw_pages is not None else []
+        if is_dividend:
+            matched = [
+                p for p in pages
+                if _action_page_field(p, "corp_code") == request.corp_code
+                and _action_page_field(p, "bsns_year") == str(request.bsns_year)
+                and _action_page_field(p, "reprt_code") == str(request.reprt_code or "")
+            ]
+        else:
+            matched = [
+                p for p in pages
+                if _action_page_field(p, "corp_code") == request.corp_code
+                and _action_page_field(p, "endpoint") == request.endpoint
+            ]
+        if len(matched) != 1:
+            raise PITDataError(
+                f"OpenDART page identity mismatch for {request.request_id!r}; certification blocked"
+            )
+        page = matched[0]
+        status = _action_page_field(page, "status")
+        if status not in _VALID_ACTION_STATUSES:
+            raise PITDataError(
+                f"unexpected OpenDART status {status!r} for {request.request_id!r}; certification blocked"
+            )
+        records = _action_page_records(page)
+        if status == "013" and records:
+            raise PITDataError(
+                f"OpenDART empty page carries records for {request.request_id!r}; certification blocked"
+            )
+        payload = {
+            "request_id": request.request_id,
+            "requested_instrument_id": request.requested_instrument_id,
+            "corp_code": request.corp_code,
+            "endpoint": request.endpoint,
+            "bsns_year": request.bsns_year,
+            "reprt_code": request.reprt_code,
+            "coverage_start": plan.coverage_start.isoformat(),
+            "coverage_end": plan.coverage_end.isoformat(),
+            "status": status,
+            "records": records,
+            "plan_id": plan.plan_id,
+            "plan_hash": plan.content_hash,
+            "instrument_mapping_provenance": "opendart_corp_code_direct",
+        }
+        receipt = store.import_bytes(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8"),
+            kind=EvidenceKind.CORPORATE_ACTIONS,
+            retrieved_at=retrieved_at,
+            source_label=f"opendart:{request.endpoint}:{request.corp_code}:{request.request_id}",
+        )
+        checkpoint_store.mark_complete(
+            plan_id=plan.plan_id,
+            chunk_id=request.request_id,
+            receipt_digest=receipt.content_hash,
+            plan_digest=plan.content_hash,
+            receipt_hashes=(receipt.content_hash,),
+        )
+        page_receipts.append(receipt)
+        completed += 1
+        if status == "013":
+            empty_pages += 1
+        else:
+            successful_pages += 1
+    pending = len(plan.requests) - completed - previously_completed
+    if pending != 0:
+        raise PITDataError("corporate-action collection report does not reconcile to the immutable plan")
+    digest = hashlib.sha256()
+    for receipt in sorted(page_receipts, key=lambda value: value.content_hash):
+        digest.update(receipt.content_hash.encode("utf-8"))
+        digest.update(b"\x00")
+    content_hash = digest.hexdigest()
+    artifact_dir = bronze_path.parent / "artifacts" / "collections"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    report_path = artifact_dir / f"{content_hash}-corporate-actions.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "plan_id": plan.plan_id,
+                "plan_digest": plan.content_hash,
+                "content_hash": content_hash,
+                "provider": "opendart_structured_decisions",
+                "coverage_start": plan.coverage_start.isoformat(),
+                "coverage_end": plan.coverage_end.isoformat(),
+                "planned": len(plan.requests),
+                "previously_completed": previously_completed,
+                "newly_completed": completed,
+                "pending": pending,
+                "empty": empty_pages,
+                "successful": successful_pages,
+                "provider_errors": 0,
+                "unresolved_instruments": list(plan.unresolved_instruments),
+                "unresolved_instrument_count": len(plan.unresolved_instruments),
+                "request_ids": sorted(r.request_id for r in plan.requests),
+                "page_receipts": [r.content_hash for r in page_receipts],
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    if plan.unresolved_instruments:
+        raise PITDataError(
+            f"unresolved corporate-action instruments: {','.join(plan.unresolved_instruments)}; certification blocked"
+        )
+    latest = page_receipts[-1] if page_receipts else None
+    return CollectionArtifact(
+        bronze_root=bronze_path,
+        coverage_start=plan.coverage_start,
+        coverage_end=plan.coverage_end,
+        retrieved_at=retrieved_at,
+        receipts={EvidenceKind.CORPORATE_ACTIONS: latest} if latest is not None else {},
+        content_hash=content_hash,
+        report_path=report_path,
+        page_receipts={EvidenceKind.CORPORATE_ACTIONS.value: tuple(page_receipts)},
+        receipt_count=len(page_receipts),
+        planned_chunks=len(plan.requests),
+        completed_chunks=completed,
+        previously_completed_chunks=previously_completed,
+        pending_chunks=pending,
+        provider_error_chunks=0,
+        missing_session_chunks=0,
+    )
 
 
 def collect_kind_lifecycle_evidence(  # pragma: no cover - candidate-only KIND enrichment is integration-tested
@@ -367,35 +663,24 @@ def collect_historical_evidence(
             report_path=report_path,
             page_receipts={EvidenceKind.SECURITY_MASTER.value: page_receipts},
         )
-    if EvidenceKind.CORPORATE_ACTIONS in kinds:  # pragma: no cover
+    if EvidenceKind.CORPORATE_ACTIONS in kinds:
+        from src.data.collection_plan import build_corporate_action_collection_plan
+
         _ = HISTORICAL_PROVIDER_ROUTES[EvidenceKind.CORPORATE_ACTIONS]
-        tickers = sorted({str(chunk.symbol) for chunk in plan.chunks})
-        start = plan.coverage_start
-        end = plan.coverage_end
-        bronze = store
-        page_receipts_ca = collect_opendart_corporate_action_evidence(dart=dart, tickers=tickers, start=start, end=end, bronze=bronze)
-        bsns_years = sorted({str(year) for year in range(start.year, end.year + 1)})
-        page_receipts_ca = page_receipts_ca + collect_opendart_dividend_evidence(
-            dart=dart, tickers=tickers, bsns_years=bsns_years, bronze=bronze
+        action_plan = build_corporate_action_collection_plan(
+            historical_plan=plan,
+            ticker_to_corp_code=dart.load_corp_codes(),
+            action_endpoints=_CORPORATE_ACTION_ENDPOINTS,
+            dividend_endpoint=_DIVIDEND_ENDPOINT,
+            dividend_report_codes=_DIVIDEND_REPORT_CODES,
+            artifact_root=Path(checkpoint_root).parent / "collection-plans",
         )
-        digest = hashlib.sha256()
-        for item in sorted(page_receipts_ca, key=lambda value: value.content_hash):
-            digest.update(item.content_hash.encode("utf-8"))
-            digest.update(b"\x00")
-        content_hash = digest.hexdigest()
-        artifact_dir = Path(bronze_root).parent / "artifacts" / "collections"
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        report_path = artifact_dir / f"{content_hash}-corporate-actions.json"
-        report_path.write_text(
-            json.dumps({"content_hash": content_hash, "provider": "opendart_structured_decisions", "kind": "corporate_actions"}, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        results[EvidenceKind.CORPORATE_ACTIONS] = CollectionArtifact(
-            bronze_root=Path(bronze_root), coverage_start=plan.coverage_start,
-            coverage_end=plan.coverage_end, retrieved_at=retrieved_at,
-            receipts={EvidenceKind.CORPORATE_ACTIONS: page_receipts_ca[-1]}, content_hash=content_hash,
-            report_path=report_path,
-            page_receipts={EvidenceKind.CORPORATE_ACTIONS.value: page_receipts_ca},
+        results[EvidenceKind.CORPORATE_ACTIONS] = collect_planned_corporate_actions(
+            plan=action_plan,
+            dart=dart,
+            bronze_root=Path(bronze_root),
+            retrieved_at=retrieved_at,
+            checkpoint_store=CollectionCheckpointStore(Path(checkpoint_root)),
         )
     return dict(results)
 

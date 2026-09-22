@@ -272,7 +272,8 @@
     "testing": "tests/unit/features/test_preprocessing.py"
   },
   "src/features/qvef.py": {
-    "testing": "tests/unit/features/test_qvef.py"
+    "testing": "tests/unit/features/test_qvef.py",
+    "architecture": "docs/research/data_readiness.md"
   },
   "src/integrations/dart/client.py": {
     "testing": [
@@ -377,5 +378,9 @@
   "src/data/research_scope.py": {
     "architecture": "docs/research/data_cleanup.md",
     "testing": "tests/unit/data/test_research_scope.py"
+  },
+  "src/data/financial_quality.py": {
+    "architecture": "docs/research/data_readiness.md",
+    "testing": "tests/unit/data/test_financial_quality.py"
   }
 }
