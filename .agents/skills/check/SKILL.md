@@ -19,8 +19,8 @@ Independent audit gate completing the development loop (`probe` -> `spec` -> `im
      uv run python tools/agent_skills/lean_check.py
      ```
      (Pass `--spec docs/specs/<feature>_spec.md` if needed).
-   - Verifies: scaffolding exclusion, Ruff linting, Mypy types, pytest suite, and 100% diff coverage on new `src/` lines.
-   - Stop immediately on Tier 1 failure and report diagnostics.
+   - Verifies: scaffolding exclusion, Ruff linting, Mypy types, pytest suite, and diff coverage on new `src/` lines.
+   - If Tier 1 fails on minor deterministic issues, apply surgical remediation (Section 4) and re-verify once. If failures persist or reveal unresolvable domain bugs, stop immediately and report diagnostics without proceeding to Tier 2.
 
 3. **Tier 2: Semantic Review**:
    Review the `git diff` across three engineering lenses:
@@ -41,20 +41,20 @@ Independent audit gate completing the development loop (`probe` -> `spec` -> `im
 
 ## Output
 
-Keep chat output compact and token-efficient.
+Keep chat output compact and token-efficient. Retain English keys/badges while writing descriptions in natural Korean (한국어):
 When all checks pass, output only the minimal summary card below without echoing internal checklists:
 
 ### 🛡️ [CHECK] <Audit Target>
-> 🚦 **판정**: ✅ PASS
+> 🚦 **Verdict**: ✅ PASS
 
-- **Tier 1 (Mechanical)**: <실제 결과 요약, 예: Ruff · Mypy · Pytest · Diff-Coverage PASS>
+- **Tier 1 (Mechanical)**: <실제 결과 요약, e.g. Ruff · Mypy · Pytest · Diff-Coverage PASS>
 - **Tier 2 (Semantic)**: Test Efficacy · Invariants · Wiring 검증 완료
 *(Optional, only when surgical fix was applied)*:
-- 🔧 **수정 사항**: <Surgical Fix 1줄 요약>
+- 🔧 **Remediation**: <적용한 정밀 수정 1줄 요약>
 
 *(On Failure)*:
 ### 🛡️ [CHECK] <Audit Target>
-> 🚦 **판정**: ❌ FAIL
+> 🚦 **Verdict**: ❌ FAIL
 
-- 💥 **사유**: [<Tier 1 | Tier 2>] <실패 원인 및 위반 불변식 1줄>
-- 🎯 **조치**: <필요한 액션 1줄>
+- 💥 **Reason**: [<Tier 1 | Tier 2>] <실패 원인 및 위반 불변식 1줄>
+- 🎯 **Action**: <필요한 해결 조치 1줄>
