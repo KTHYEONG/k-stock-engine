@@ -1,6 +1,39 @@
 {
   "tasks": [
     {
+      "task_id": "P2_3_KIS_INDUSTRY_CLASSIFICATION",
+      "date": "2026-09-23",
+      "adr_id": "ADR_20260923_P2_3_KIS_INDUSTRY_CLASSIFICATION",
+      "domain": "data",
+      "title": "KIS 기반 업종 분류 데이터 신규 연동",
+      "why": "업종 데이터 수집 코드가 전무했고, Naver/Toss/Kiwoom 대비 이미 인증된 KIS inquire_price가 bstp_kor_isnm 필드로 실측 검증됨",
+      "resolution": "KisIndustryCollector로 종목별 현재 업종 스냅샷을 Bronze(EvidenceKind.INDUSTRY)에 적재하고 industry_silver.py로 최신 수집 우선 원칙의 단일 스냅샷 Silver 생성",
+      "impact": "신규 EvidenceKind.INDUSTRY 추가에 따라 4개 필수증거 판정 지점(normalization/operations/pipeline/streaming_normalization)에서 LIFECYCLE_EVENTS와 동일하게 선택적 증거로 일관 처리됨",
+      "caveat": "KIS inquire_price는 현재 시점 스냅샷만 제공해 과거 업종 재분류 이력은 재구성 불가 — 최초 수집 이전 세션에 역사적으로 적용하면 안 됨"
+    },
+    {
+      "task_id": "P2_2_SCOPE_2016_EXTENSION",
+      "date": "2026-09-23",
+      "adr_id": "ADR_20260923_P2_2_SCOPE_2016_EXTENSION",
+      "domain": "data",
+      "title": "리서치 스코프 2016년 히스토리 확장",
+      "why": "사용자가 2019 시작을 승인했던 이유는 수집 시간 제약뿐이었고, 2026-09-22 승인에 따라 2016년까지 확장 필요",
+      "resolution": "_FISCAL_FLOOR와 evidence_start/fundamental_fiscal_start를 2016으로 하향, 우선주 배제가 기존 로직으로 이미 보장됨을 회귀 테스트로 명시",
+      "impact": "kr_swing_2019_v1 scope_id 그대로 유지해 기존 인증 데이터셋 보존하면서 2016-2018 구간 신규 수집 가능해짐",
+      "caveat": "DART는 이미 20%+ 여유 쿼터 확보, KRX는 일일 한도 없어 KRX_REQUEST_MIN_INTERVAL_SECONDS 페이싱으로 공유 VPS 여유 확보 필요"
+    },
+    {
+      "task_id": "P2_1_INVESTOR_FLOW_UNION",
+      "date": "2026-09-23",
+      "adr_id": "ADR_20260923_P2_1_INVESTOR_FLOW_UNION",
+      "domain": "data",
+      "title": "LS+KIS 수급 Silver 병합 데이터셋",
+      "why": "LS 단독(93.7%)과 KIS 보충(갭 채움)이 별개 데이터셋이라 98.6% 결합 커버리지를 단일 investor_flow 테이블로 소비할 수 없었음",
+      "resolution": "investor_flow_union.py로 두 인증 데이터셋을 공통 4개 수량 컬럼 기준으로 무결성 검증 후 병합해 단일 investor_flow_<hash16> Silver 데이터셋 생성",
+      "impact": "수급 데이터가 하나의 결정적 dataset_id로 소비 가능해짐; investor_flow_enabled는 실데이터 union 실행·검증 후 true로 전환 예정",
+      "caveat": "LS·KIS 겹치는 (session,ticker) 키 발견 시 fail-closed로 즉시 PITDataError, LS 전용 tjj 세부컬럼은 원본 LS 데이터셋에서만 조회 가능"
+    },
+    {
       "task_id": "ADR_20260923_KIS_SUPPLEMENT_ANCHOR_OVERFLOW",
       "date": "2026-09-23",
       "adr_id": "ADR_20260923_ADR_20260923_KIS_SUPPLEMENT_ANCHOR_OVERFLOW",

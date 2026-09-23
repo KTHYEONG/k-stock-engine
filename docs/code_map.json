@@ -391,5 +391,11 @@
   },
   "src/data/storage_retention.py": {
     "testing": "tests/unit/data/test_storage_retention.py"
+  },
+  "src/data/investor_flow_union.py": {
+    "testing": "tests/unit/data/test_investor_flow_union.py"
+  },
+  "src/integrations/kis/industry.py": {
+    "testing": "tests/unit/integrations/kis/test_industry.py"
   }
 }
