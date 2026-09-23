@@ -1529,6 +1529,7 @@ def collect_dart_financial_facts(
         if p.get("source_kind") == "legacy_document" and p.get("status") != "extraction_failed"
     )
     unavailable = sum(1 for p in persisted if p.get("source_kind") == "unavailable")
+    blocked = sum(1 for p in persisted if p.get("source_kind") == "blocked")
     extraction_failed = sum(1 for p in persisted if p.get("status") == "extraction_failed")
     filing_ids = [
         str(p.get("filing_id") or (p.get("identity") or {}).get("filing_id") or "").strip()
@@ -1552,6 +1553,7 @@ def collect_dart_financial_facts(
                 "standardized": standardized,
                 "legacy_document": legacy_document,
                 "unavailable": unavailable,
+                "blocked": blocked,
                 "extraction_failed": extraction_failed,
                 "filing_ids": filing_ids,
                 "page_receipts": [item.content_hash for item in page_receipts],

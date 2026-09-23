@@ -307,7 +307,12 @@ class DartXbrlCollector:
                 }
             )
         if len(normalized) <= 1 or self._max_workers <= 1:
-            pages = [self._fetch_one_financial_fact_source(identity) for identity in normalized]
+            pages: list[dict[str, Any]] = []
+            for identity in normalized:
+                page = self._fetch_one_financial_fact_source(identity)
+                pages.append(page)
+                if page.get("source_kind") == "blocked":
+                    break
         else:
             with ThreadPoolExecutor(max_workers=min(self._max_workers, len(normalized))) as pool:
                 pages = list(pool.map(self._fetch_one_financial_fact_source, normalized))
@@ -322,12 +327,81 @@ class DartXbrlCollector:
         facts. Runs inside a bounded thread pool from
         fetch_financial_fact_sources; behavior per identity is unchanged from
         the original sequential loop.
+
+        Per-identity DART response failures never raise: transient retryable
+        statuses are retried within a small budget, quota exhaustion returns a
+        ``blocked`` record without further fallback, and any other response
+        failure returns an ``unavailable`` record preserving the original
+        error text in diagnostics.
         """
+        import time as _time
+
         from src.integrations.dart.legacy_filing import (
             MAPPING_VERSION,
             map_standardized_account,
             parse_legacy_filing_archive,
         )
+
+        def _blocked_record(status: str) -> dict[str, Any]:
+            return {
+                "source_kind": "blocked",
+                "status": status,
+                "identity": dict(identity),
+                "records": [],
+                "mapping_version": MAPPING_VERSION,
+                "diagnostics": ("dart_quota_exhausted",),
+                "raw_document_hash": None,
+                **identity,
+            }
+
+        def _unavailable_record(status: str, exc: BaseException) -> dict[str, Any]:
+            return {
+                "source_kind": "unavailable",
+                "status": status,
+                "identity": dict(identity),
+                "records": [],
+                "mapping_version": MAPPING_VERSION,
+                "diagnostics": (f"dart_error:{exc}",),
+                "raw_document_hash": None,
+                **identity,
+            }
+
+        def _status_from_error(exc: BaseException, fallback: str) -> str:
+            import re as _re
+
+            match = _re.search(r"DART status ([0-9A-Za-z]+)", str(exc))
+            if match:
+                return match.group(1)
+            return fallback
+
+        def _request_with_retry(fs_div: str) -> dict[str, Any]:
+            from src.integrations.dart.client import DartQuotaExhaustedError, DartRetryableError
+
+            if self._request_json is None and self._client is None:
+                raise PITDataError("DART XBRL facts endpoint is not configured")  # pragma: no cover
+            for attempt in range(3):
+                try:
+                    if self._request_json is not None:
+                        raw = self._request_json("fnlttSinglAcntAll", {**identity, "fs_div": fs_div})
+                    else:
+                        assert self._client is not None
+                        raw = self._client._request_validated(
+                            "fnlttSinglAcntAll.json",
+                            {
+                                "corp_code": identity["corp_code"],
+                                "bsns_year": identity["biz_year"],
+                                "reprt_code": identity["reprt_code"],
+                                "fs_div": fs_div,
+                            },
+                        )
+                    return raw  # type: ignore[no-any-return]
+                except DartQuotaExhaustedError:
+                    raise
+                except DartRetryableError:
+                    if attempt >= 2:
+                        raise
+                    _time.sleep(0.25)
+            raise AssertionError("unreachable")  # pragma: no cover
 
         fid = identity["filing_id"]
         divisions = (identity["fs_div"], "OFS") if identity["fs_div"] == "CFS" else (identity["fs_div"],)
@@ -336,39 +410,38 @@ class DartXbrlCollector:
         request_identity: dict[str, str] = {}
         for fs_div in divisions:
             request_identity = {**identity, "fs_div": fs_div}
-            if self._request_json is not None:
-                raw = self._request_json("fnlttSinglAcntAll", dict(request_identity))
-            elif self._client is not None:
-                try:
-                    raw = self._client._request_validated(
-                        "fnlttSinglAcntAll.json",
-                        {
-                            "corp_code": identity["corp_code"],
-                            "bsns_year": identity["biz_year"],
-                            "reprt_code": identity["reprt_code"],
-                            "fs_div": fs_div,
-                        },
-                    )
-                except Exception as exc:
-                    from src.integrations.dart.client import (
-                        DartApiError,
-                        DartRetryableError,
-                        DartTerminalError,
-                    )
+            try:
+                raw = _request_with_retry(fs_div)
+            except Exception as exc:
+                from src.integrations.dart.client import (
+                    DartApiError,
+                    DartQuotaExhaustedError,
+                    DartRetryableError,
+                    DartTerminalError,
+                )
 
-                    if isinstance(exc, (DartRetryableError, DartTerminalError, DartApiError, PITDataError)):
-                        raise PITDataError(f"DART request failed for {fid}") from exc
-                    raise PITDataError(f"DART request failed for {fid}") from exc
-            else:
-                raise PITDataError("DART XBRL facts endpoint is not configured")
+                if isinstance(exc, DartQuotaExhaustedError):
+                    return _blocked_record(_status_from_error(exc, last_status or "020"))
+                if isinstance(exc, (DartRetryableError, DartTerminalError, DartApiError, PITDataError)):
+                    return _unavailable_record(
+                        _status_from_error(exc, last_status or "013"), exc
+                    )
+                return _unavailable_record(last_status or "013", exc)
             if not isinstance(raw, dict) or not raw:
-                raise PITDataError(f"DART request failed for {fid}")
+                failure = PITDataError(f"DART request failed for {fid}")
+                return _unavailable_record(last_status or "013", failure)
             status = str(raw.get("status") or "")
             last_status = status or last_status
             if status in {"013", "014"}:
                 continue
+            if status == "020":
+                return _blocked_record(status)
+            if status in {"800", "900"}:
+                failure = PITDataError(f"DART status {status}: {raw}")
+                return _unavailable_record(status, failure)
             if status != "000":
-                raise PITDataError(f"DART request failed for {fid}: status {status}")
+                failure = PITDataError(f"DART request failed for {fid}: status {status}")
+                return _unavailable_record(status or last_status or "013", failure)
             facts = raw.get("list", raw.get("records", []))
             if not facts:
                 continue
