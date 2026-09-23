@@ -384,6 +384,13 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p_industry.add_argument("--symbols-from", type=Path, required=False, default=None)
     p_industry.add_argument("--pace-seconds", type=float, default=0.35)
 
+    p_stock = sub.add_parser(
+        "collect-stock-classification", help="Collect current KIS KSIC stock classifications to Bronze"
+    )
+    _add_scoped_args(p_stock)
+    p_stock.add_argument("--symbols-from", type=Path, required=False, default=None)
+    p_stock.add_argument("--pace-seconds", type=float, default=0.35)
+
     p_industry_silver = sub.add_parser(
         "build-industry-classification-silver", help="Build the certified industry classification Silver snapshot"
     )
@@ -459,6 +466,47 @@ def _resolve_industry_symbols(runtime: DataRuntime, symbols_from: Path | str | N
             raise PITDataError(f"industry symbols file has no tickers: {symbols_from}")
         return cleaned
     return _eligible_universe_tickers(runtime.workspace.silver_root)
+
+
+def _collect_classification_with_isolation(
+    *,
+    stage: str,
+    collector_cls: Any,
+    fetch_attr: str,
+    bronze_root: Path,
+    symbols: tuple[str, ...],
+    pace_seconds: float,
+) -> dict[str, object]:
+    """Collect one symbol at a time, isolating per-ticker PIT failures."""
+    total = len(symbols)
+    pages = 0
+    skipped: dict[str, str] = {}
+    for index, symbol in enumerate(symbols, start=1):
+        collector = collector_cls((symbol,))
+        try:
+            fetch = getattr(collector, fetch_attr)
+            for _ in fetch(bronze_root=bronze_root):
+                pages += 1
+        except PITDataError as exc:
+            skipped[symbol] = str(exc)
+        if index % 100 == 0:
+            _LOG.info(
+                "[DATA] stage=%s done=%d/%d ok=%d skipped=%d",
+                stage,
+                index,
+                total,
+                pages,
+                len(skipped),
+            )
+        time.sleep(pace_seconds)
+    if pages == 0:
+        raise PITDataError(f"{stage} collected nothing ({total} requested, {len(skipped)} skipped)")
+    return {
+        "symbols_requested": total,
+        "pages_collected": pages,
+        "skipped_count": len(skipped),
+        "skipped": skipped,
+    }
 
 
 def _read_json_list(path: Path, *, label: str) -> list[Any]:
@@ -1802,15 +1850,32 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             runtime = _scoped_runtime(args)
             symbols = _resolve_industry_symbols(runtime, args.symbols_from)
-            pages = 0
-            for symbol in symbols:
-                collector = KisIndustryCollector((symbol,))
-                for _ in collector.fetch_industry_classification(bronze_root=runtime.workspace.bronze_root):
-                    pages += 1
-                time.sleep(args.pace_seconds)
-            return {"symbols_requested": len(symbols), "pages_collected": pages}
+            return _collect_classification_with_isolation(
+                stage="collect-industry-classification",
+                collector_cls=KisIndustryCollector,
+                fetch_attr="fetch_industry_classification",
+                bronze_root=runtime.workspace.bronze_root,
+                symbols=symbols,
+                pace_seconds=float(args.pace_seconds),
+            )
 
         return _run_scoped(args, _collect_industry)
+    if args.command == "collect-stock-classification":
+        def _collect_stock() -> dict[str, object]:
+            from src.integrations.kis.industry import KisStockClassificationCollector
+
+            runtime = _scoped_runtime(args)
+            symbols = _resolve_industry_symbols(runtime, args.symbols_from)
+            return _collect_classification_with_isolation(
+                stage="collect-stock-classification",
+                collector_cls=KisStockClassificationCollector,
+                fetch_attr="fetch_stock_classification",
+                bronze_root=runtime.workspace.bronze_root,
+                symbols=symbols,
+                pace_seconds=float(args.pace_seconds),
+            )
+
+        return _run_scoped(args, _collect_stock)
     if args.command == "build-industry-classification-silver":
         def _build_industry_silver() -> dict[str, object]:
             from dataclasses import asdict

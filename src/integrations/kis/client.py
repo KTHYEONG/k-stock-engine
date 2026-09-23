@@ -237,6 +237,29 @@ class KisClient:
             raise RuntimeError(f"KIS inquire_price malformed output: {payload}")
         return out
 
+    def search_stock_info(self, symbol: str) -> dict[str, Any]:
+        """Return KIS's stock-basic-information output (``CTPF1002R``) for one ticker.
+
+        Includes the KSIC code/name and listing/abolition dates for delisted
+        instruments, which the current-quote endpoint cannot describe.
+        Transport-only: no field is trimmed or renamed.
+        """
+        if not symbol or not symbol.strip():
+            raise ValueError("symbol is required")
+        payload = self._call(
+            method="GET",
+            path="/uapi/domestic-stock/v1/quotations/search-stock-info",
+            tr_id="CTPF1002R",
+            params={
+                "PRDT_TYPE_CD": "300",
+                "PDNO": symbol,
+            },
+        )
+        out = payload.get("output", {})
+        if not isinstance(out, dict):
+            raise RuntimeError(f"KIS search-stock-info malformed output: {payload}")
+        return out
+
     def inquire_investor_trade_by_stock_daily(
         self, symbol: str, anchor: date
     ) -> tuple[dict[str, Any], ...]:
