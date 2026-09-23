@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -178,6 +178,8 @@ def collect_planned_corporate_actions(
     previously_completed = 0
     empty_pages = 0
     successful_pages = 0
+    structured_pages: dict[str, tuple[Any, ...]] = {}
+    dividend_pages: dict[tuple[str, str], tuple[Any, ...]] = {}
     for request in plan.requests:
         verified = _verified_action_receipts(
             checkpoint_store=checkpoint_store, plan=plan, request_id=request.request_id, bronze_root=bronze_path
@@ -196,13 +198,20 @@ def collect_planned_corporate_actions(
             if is_dividend:
                 if not request.bsns_year or not request.reprt_code:
                     raise PITDataError(f"dividend request {request.request_id!r} is missing its fiscal identity")
-                raw_pages = dart.fetch_dividend_disclosures(
-                    corp_codes=(request.corp_code,), bsns_years=(request.bsns_year,)
-                )
+                dividend_key = (request.corp_code, request.bsns_year)
+                if dividend_key not in dividend_pages:
+                    response = dart.fetch_dividend_disclosures(
+                        corp_codes=(request.corp_code,), bsns_years=(request.bsns_year,)
+                    )
+                    dividend_pages[dividend_key] = tuple(response or ())
+                raw_pages = dividend_pages[dividend_key]
             else:
-                raw_pages = dart.fetch_corporate_action_decisions(
-                    corp_codes=(request.corp_code,), start=plan.coverage_start, end=plan.coverage_end
-                )
+                if request.corp_code not in structured_pages:
+                    response = dart.fetch_corporate_action_decisions(
+                        corp_codes=(request.corp_code,), start=plan.coverage_start, end=plan.coverage_end
+                    )
+                    structured_pages[request.corp_code] = tuple(response or ())
+                raw_pages = structured_pages[request.corp_code]
         except PITDataError:
             raise
         except Exception as exc:
@@ -835,13 +844,47 @@ def _flow_unit_value(record: dict[str, Any], field: str) -> float:
     return parsed
 
 
+_LS_SHARE_FIELDS: tuple[str, ...] = (
+    "individual_net_shares",
+    "foreign_net_shares",
+    "institution_net_shares",
+    "other_net_shares",
+)
+
+_LS_LEGACY_VALUE_FIELDS: tuple[str, ...] = (
+    "foreign_net_value",
+    "institution_net_value",
+    "retail_net_value",
+    "foreign_buy_value",
+    "foreign_sell_value",
+)
+
+
+def _flow_share_value(record: dict[str, Any], field: str) -> float:
+    raw = record.get(field)
+    if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+        raise PITDataError(f"LS investor flow unit contract violated: missing {field}")
+    if isinstance(raw, bool):
+        raise PITDataError(f"LS investor flow unit contract violated: invalid {field}")
+    try:
+        parsed = float(str(raw).replace(",", "").strip())
+    except (TypeError, ValueError) as exc:
+        raise PITDataError(f"LS investor flow unit contract violated: invalid {field}") from exc
+    import math as _math
+
+    if not _math.isfinite(parsed) or not parsed.is_integer():
+        raise PITDataError(f"LS investor flow unit contract violated: non-integral {field}")
+    return parsed
+
+
 def _validate_flow_pages(
     *, chunk_symbol: str, norm_provider: str, pages: tuple[dict[str, Any], ...]
 ) -> dict[str, dict[str, float]]:
-    """Validate one chunk batch; extra symbols/dates are ignored for coverage.
+    """Validate one chunk batch against the provider's declared unit contract.
 
-    Returns canonical {(session): values} for the requested symbol. Conflicting
-    duplicates raise instead of resolving by input order.
+    LS pages must carry share-denominated records; other providers keep the
+    existing KRW value fields. Extra symbols/dates are ignored for coverage and
+    conflicting duplicates raise instead of resolving by input order.
     """
     canonical: dict[str, dict[str, float]] = {}
     for page in pages:
@@ -870,11 +913,16 @@ def _validate_flow_pages(
             if raw_session in (None, ""):
                 raise PITDataError("investor flow has malformed session: missing")
             session = _parse_flow_session(raw_session).isoformat()
-            values = {
-                "foreign_net_value": _flow_unit_value(record, "foreign_net_value"),
-                "institution_net_value": _flow_unit_value(record, "institution_net_value"),
-                "retail_net_value": _flow_unit_value(record, "retail_net_value"),
-            }
+            if norm_provider == "ls":
+                if record.get("unit") != "shares" or any(field in record for field in _LS_LEGACY_VALUE_FIELDS):
+                    raise PITDataError("LS investor flow unit contract violated: expected share records")
+                values = {field: _flow_share_value(record, field) for field in _LS_SHARE_FIELDS}
+            else:
+                values = {
+                    "foreign_net_value": _flow_unit_value(record, "foreign_net_value"),
+                    "institution_net_value": _flow_unit_value(record, "institution_net_value"),
+                    "retail_net_value": _flow_unit_value(record, "retail_net_value"),
+                }
             if session in canonical and canonical[session] != values:
                 raise PITDataError(f"conflicting duplicate investor flow for {(chunk_symbol, session)}")
             canonical.setdefault(session, values)
@@ -1158,6 +1206,131 @@ def collect_planned_investor_flow(
         provider_error_chunks=provider_errors,
         missing_session_chunks=missing_sessions_count,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class InvestorFlowBatchProgress:
+    """One completed sequential backfill batch and its auditable outcome.
+
+    A progress value is emitted only after every chunk assigned to the batch
+    has either reused verified evidence, produced verified evidence, or
+    recorded a retryable negative outcome. It makes long collection runs
+    observable without retaining all chunk-level state in memory.
+
+    Attributes:
+        batch_index: Zero-based ordinal within the immutable plan.
+        chunk_offset: Offset of this batch's first plan chunk.
+        artifact: Exact receipt and coverage accounting for this batch.
+    """
+
+    batch_index: int
+    chunk_offset: int
+    artifact: CollectionArtifact
+
+
+def iter_planned_investor_flow_backfill(
+    *,
+    plan: HistoricalCollectionPlan,
+    provider: str,
+    collector: Any,
+    bronze_root: Path,
+    retrieved_at_factory: Callable[[], datetime],
+    checkpoint_store: CollectionCheckpointStore,
+    chunk_batch_size: int,
+    allow_source_unavailable: bool = True,
+) -> Iterator[InvestorFlowBatchProgress]:
+    """Run a historical flow plan sequentially in bounded report batches.
+
+    The function preserves one provider collector across the entire immutable
+    plan so connection, token, and provider pacing state remain continuous.
+    Batches bound report and failure-memory growth; they never authorize
+    parallel requests or alter coverage requirements.
+
+    Args:
+        plan: Immutable certified symbol-session plan.
+        provider: Certified provider identifier; production LS runs use
+            ``"ls"``.
+        collector: One provider collector retained for this iterator lifetime.
+        bronze_root: Immutable evidence destination.
+        retrieved_at_factory: Produces one timezone-aware retrieval moment per
+            batch.
+        checkpoint_store: Verified receipt checkpoint store.
+        chunk_batch_size: Positive number of immutable plan chunks per report
+            batch.
+        allow_source_unavailable: Whether retryable provider outcomes are
+            persisted and execution continues.
+
+    Yields:
+        One progress value for each contiguous plan slice.
+
+    Raises:
+        PITDataError: Invalid plan, provider, batch size, timestamp, or
+        evidence contract.
+    """
+    if isinstance(chunk_batch_size, bool) or not isinstance(chunk_batch_size, int) or chunk_batch_size < 1:
+        raise PITDataError("chunk_batch_size must be a positive integer")
+    norm_provider = str(provider).strip().lower()
+    if norm_provider not in ("ls", "kiwoom"):
+        raise PITDataError(f"unsupported investor flow provider: {provider!r}")
+    if not callable(retrieved_at_factory):
+        raise PITDataError("retrieved_at_factory must be callable")
+    return _iter_planned_investor_flow_backfill(
+        plan=plan,
+        provider=provider,
+        collector=collector,
+        bronze_root=bronze_root,
+        retrieved_at_factory=retrieved_at_factory,
+        checkpoint_store=checkpoint_store,
+        chunk_batch_size=chunk_batch_size,
+        allow_source_unavailable=allow_source_unavailable,
+    )
+
+
+def _iter_planned_investor_flow_backfill(
+    *,
+    plan: HistoricalCollectionPlan,
+    provider: str,
+    collector: Any,
+    bronze_root: Path,
+    retrieved_at_factory: Callable[[], datetime],
+    checkpoint_store: CollectionCheckpointStore,
+    chunk_batch_size: int,
+    allow_source_unavailable: bool,
+) -> Iterator[InvestorFlowBatchProgress]:
+    closer = getattr(collector, "close", None)
+    try:
+        chunks = plan.chunks
+        total = len(chunks)
+        for batch_index, chunk_offset in enumerate(range(0, total, chunk_batch_size)):
+            window = tuple(chunks[chunk_offset : chunk_offset + chunk_batch_size])
+            sub_plan = HistoricalCollectionPlan(
+                plan_id=plan.plan_id,
+                coverage_start=plan.coverage_start,
+                coverage_end=plan.coverage_end,
+                chunk_size=plan.chunk_size,
+                chunks=window,
+                content_hash=plan.content_hash,
+                dataset_name=plan.dataset_name,
+                created_at=plan.created_at,
+            )
+            retrieved_at = retrieved_at_factory()
+            artifact = collect_planned_investor_flow(
+                plan=sub_plan,
+                provider=provider,
+                collector=collector,
+                bronze_root=bronze_root,
+                retrieved_at=retrieved_at,
+                checkpoint_store=checkpoint_store,
+                allow_source_unavailable=allow_source_unavailable,
+            )
+            yield InvestorFlowBatchProgress(
+                batch_index=batch_index,
+                chunk_offset=chunk_offset,
+                artifact=artifact,
+            )
+    finally:
+        if callable(closer):
+            closer()
 
 
 def _find_uncached_corp_codes(

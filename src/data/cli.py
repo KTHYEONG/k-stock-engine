@@ -18,13 +18,20 @@ from src.data.backtest_exclusions import resolve_backtest_exclusion_plan
 from src.data.backtest_runner import run_champion_backtest
 from src.data.backtest_sessions import BacktestMarketInputsPolicy, build_backtest_sessions
 from src.data.bronze import BronzeStore, import_retained_stock_evidence, migrate_retained_stock_evidence
-from src.data.collection import collect_dart_disclosures, collect_dart_financial_facts, collect_planned_investor_flow
+from src.data.collection import (
+    InvestorFlowBatchProgress,
+    collect_dart_disclosures,
+    collect_dart_financial_facts,
+    collect_planned_investor_flow,
+    iter_planned_investor_flow_backfill,
+)
 from src.data.collection_plan import (
     LS_MAX_SESSIONS_PER_REQUEST,
     CollectionCheckpointStore,
     CollectionReadinessReport,
     build_historical_collection_plan_from_bronze,
     load_collection_plan,
+    load_collection_plan_path,
 )
 from src.data.gold_informativeness import CHAMPION_SCORE_COVERAGE_FLOORS, certify_informative_gold
 from src.data.gold_loader import (
@@ -47,6 +54,7 @@ from src.data.silver_schema import canonicalize_session_keys, observe_time_seman
 from src.data.storage_gc import plan_storage_root_retention
 from src.data.streaming_normalization import refresh_corporate_action_silver
 from src.integrations.investor_flow_router import resolve_investor_flow_collector
+from src.integrations.ls.investor_flow import LsInvestorFlowCollector
 from src.strategy.champion_strategy import ChampionStrategy
 from src.strategy.compounding_strategy import CompoundingStrategy
 from src.strategy.compounding_v2_strategy import (
@@ -78,6 +86,16 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p_col.add_argument("--plan-id", type=str, required=True)
     p_col.add_argument("--checkpoint-root", type=Path, default=Path("data/artifacts/collection-checkpoints"))
     p_col.add_argument("--investor-flow-provider", choices=("ls", "kiwoom"), default="ls")
+
+    p_ls_backfill = sub.add_parser(
+        "backfill-ls-investor-flow", help="Resumable single-session LS investor-flow backfill from a plan path"
+    )
+    p_ls_backfill.add_argument("--plan-path", type=Path, required=True)
+    p_ls_backfill.add_argument("--bronze-root", type=Path, required=True)
+    p_ls_backfill.add_argument("--checkpoint-root", type=Path, required=True)
+    p_ls_backfill.add_argument("--chunk-batch-size", type=int, default=100)
+    p_ls_backfill.add_argument("--retrieved-at", type=str, required=False, default=None)
+    p_ls_backfill.add_argument("--max-batches", type=int, required=False, default=None)
 
     p_dart = sub.add_parser("collect-dart-facts", help="Collect periodic OpenDART full statements from retained disclosures")
     p_dart.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
@@ -307,6 +325,25 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p_backtest.add_argument("--strategy-policy", type=Path, required=True)
     p_backtest.add_argument("--execution-policy", type=Path, required=True)
     p_backtest.add_argument("--universe-policy", type=Path, required=True)
+
+    p_flow_silver = sub.add_parser("build-investor-flow-silver", help="Build Silver investor-flow dataset from raw LS rows")
+    _add_scoped_args(p_flow_silver)
+    p_flow_silver.add_argument("--workers", type=int, default=4)
+
+    p_daily_silver = sub.add_parser("build-daily-market-silver", help="Build Silver daily-market dataset with KRX base prices")
+    _add_scoped_args(p_daily_silver)
+
+    p_panel = sub.add_parser("build-market-panel", help="Build decision-safe Gold market panel")
+    _add_scoped_args(p_panel)
+    p_panel.add_argument("--daily-market-dataset-id", required=True)
+    p_panel.add_argument("--universe-dataset-id", required=True)
+    p_panel.add_argument("--rules", type=Path, default=Path("config/market/krx_market_rules.toml"))
+    p_panel.add_argument("--instrument-buckets", type=int, default=16)
+
+    p_bench = sub.add_parser("build-reference-benchmarks", help="Build frictionless Gold reference benchmarks")
+    _add_scoped_args(p_bench)
+    p_bench.add_argument("--market-panel-dataset-id", required=True)
+    p_bench.add_argument("--definitions", type=Path, default=Path("config/data/reference_benchmarks.toml"))
 
     return parser.parse_args(argv)
 
@@ -1212,6 +1249,111 @@ def _build_sessions(**kwargs: object) -> object:
     return build_backtest_sessions(**kwargs)  # type: ignore[arg-type]
 
 
+def _flow_backfill_progress_payload(progress: InvestorFlowBatchProgress) -> dict[str, object]:
+    """Expose one completed LS backfill batch without provider secrets.
+
+    Long-running historical collection must be resumable from Bronze and
+    checkpoints, so each emitted payload contains only stable plan position and
+    evidence-accounting totals. It never serializes collector configuration,
+    access tokens, response bodies, or credentials.
+    """
+    artifact = progress.artifact
+    plan_id = str(getattr(artifact, "plan_id", "") or "")
+    plan_digest = ""
+    report_path = str(getattr(artifact, "report_path", "") or "")
+    if report_path:
+        try:
+            raw_report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raw_report = None
+        if isinstance(raw_report, dict):
+            plan_id = str(raw_report.get("plan_id") or plan_id)
+            plan_digest = str(raw_report.get("plan_digest") or "")
+    return {
+        "plan_id": plan_id,
+        "plan_digest": plan_digest,
+        "content_hash": str(getattr(artifact, "content_hash", "") or ""),
+        "batch_index": progress.batch_index,
+        "chunk_offset": progress.chunk_offset,
+        "planned_chunks": int(getattr(artifact, "planned_chunks", 0) or 0),
+        "completed_chunks": int(getattr(artifact, "completed_chunks", 0) or 0),
+        "previously_completed_chunks": int(getattr(artifact, "previously_completed_chunks", 0) or 0),
+        "pending_chunks": int(getattr(artifact, "pending_chunks", 0) or 0),
+        "provider_error_chunks": int(getattr(artifact, "provider_error_chunks", 0) or 0),
+        "missing_session_chunks": int(getattr(artifact, "missing_session_chunks", 0) or 0),
+        "receipt_count": int(getattr(artifact, "receipt_count", 0) or 0),
+        "report_path": report_path,
+    }
+
+
+def _run_backfill_ls_investor_flow(args: argparse.Namespace) -> int:
+    """Run the LS-only bounded backfill iterator from an explicit plan path."""
+    batch_size = args.chunk_batch_size
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not 1 <= batch_size <= 500:
+        _emit({"error": "chunk-batch-size must be an integer in 1..500"})
+        return 1
+    max_batches = args.max_batches
+    if max_batches is not None and (
+        isinstance(max_batches, bool) or not isinstance(max_batches, int) or max_batches < 1
+    ):
+        _emit({"error": "max-batches must be a positive integer"})
+        return 1
+    if args.retrieved_at is not None:
+        try:
+            fixed_moment = datetime.fromisoformat(str(args.retrieved_at))
+        except ValueError:
+            _emit({"error": "retrieved-at must be ISO-8601"})
+            return 1
+        if fixed_moment.tzinfo is None:
+            _emit({"error": "retrieved-at must be timezone-aware"})
+            return 1
+
+        def _fixed_retrieved_at() -> datetime:
+            return fixed_moment
+
+        retrieved_at_factory: Callable[[], datetime] = _fixed_retrieved_at
+    else:
+
+        def _utc_now() -> datetime:
+            return datetime.now(UTC)
+
+        retrieved_at_factory = _utc_now
+    try:
+        plan = load_collection_plan_path(args.plan_path)
+    except (PITDataError, ValueError, OSError) as exc:
+        _emit({"error": str(exc)})
+        return 1
+    try:
+        symbols = tuple(sorted({chunk.symbol for chunk in plan.chunks}))
+        collector = LsInvestorFlowCollector(symbols)
+    except (PITDataError, ValueError, OSError) as exc:
+        _emit({"error": str(exc)})
+        return 1
+    try:
+        iterator = iter_planned_investor_flow_backfill(
+            plan=plan,
+            provider="ls",
+            collector=collector,
+            bronze_root=Path(args.bronze_root),
+            retrieved_at_factory=retrieved_at_factory,
+            checkpoint_store=CollectionCheckpointStore(Path(args.checkpoint_root)),
+            chunk_batch_size=batch_size,
+        )
+        try:
+            for batch_number, progress in enumerate(iterator, start=1):
+                _emit(_flow_backfill_progress_payload(progress))
+                if max_batches is not None and batch_number >= max_batches:
+                    break
+        finally:
+            closer = getattr(iterator, "close", None)
+            if callable(closer):
+                closer()
+    except (PITDataError, ValueError, OSError) as exc:
+        _emit({"error": str(exc)})
+        return 1
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.command == "scope-info":
@@ -1443,6 +1585,72 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
 
         return _run_scoped(args, _scope_backtest)
+    if args.command == "build-investor-flow-silver":
+        def _build_flow_silver() -> dict[str, object]:
+            from dataclasses import asdict
+
+            from src.data.investor_flow_silver import materialize_investor_flow_silver
+
+            runtime = _scoped_runtime(args)
+            result = materialize_investor_flow_silver(
+                bronze_root=runtime.workspace.bronze_root,
+                universe_root=runtime.workspace.silver_root,
+                silver_root=runtime.workspace.silver_root,
+                workers=args.workers,
+            )
+            return asdict(result) | {"dataset_path": str(result.dataset_path)}
+
+        return _run_scoped(args, _build_flow_silver)
+    if args.command == "build-daily-market-silver":
+        def _build_daily_silver() -> dict[str, object]:
+            from dataclasses import asdict
+
+            from src.data.daily_market_silver import materialize_daily_market_silver
+
+            runtime = _scoped_runtime(args)
+            result = materialize_daily_market_silver(
+                catalog=_scoped_catalog(runtime),
+                universe_root=runtime.workspace.silver_root,
+                silver_root=runtime.workspace.silver_root,
+            )
+            return asdict(result) | {"dataset_path": str(result.dataset_path)}
+
+        return _run_scoped(args, _build_daily_silver)
+    if args.command == "build-market-panel":
+        def _build_market_panel() -> dict[str, object]:
+            from dataclasses import asdict
+
+            from src.core.market_rules import load_krx_market_rules
+            from src.data.market_panel import materialize_market_panel
+
+            runtime = _scoped_runtime(args)
+            result = materialize_market_panel(
+                daily_market_path=runtime.workspace.silver_root / args.daily_market_dataset_id,
+                universe_path=runtime.workspace.silver_root / args.universe_dataset_id,
+                rules=load_krx_market_rules(args.rules),
+                gold_root=runtime.workspace.gold_root,
+                instrument_buckets=args.instrument_buckets,
+            )
+            return asdict(result) | {"dataset_path": str(result.dataset_path)}
+
+        return _run_scoped(args, _build_market_panel)
+    if args.command == "build-reference-benchmarks":
+        def _build_reference_benchmarks() -> dict[str, object]:
+            from dataclasses import asdict
+
+            from src.data.reference_benchmarks import load_benchmark_definitions, materialize_reference_benchmarks
+
+            runtime = _scoped_runtime(args)
+            version, definitions = load_benchmark_definitions(args.definitions)
+            result = materialize_reference_benchmarks(
+                market_panel_path=runtime.workspace.gold_root / args.market_panel_dataset_id,
+                definitions=definitions,
+                definitions_version=version,
+                gold_root=runtime.workspace.gold_root,
+            )
+            return asdict(result) | {"dataset_path": str(result.dataset_path)}
+
+        return _run_scoped(args, _build_reference_benchmarks)
     if args.command == "audit-provenance":
         try:
             from src.data.provenance_audit import audit_production_provenance
@@ -1495,6 +1703,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         )
         return 0
+    if args.command == "backfill-ls-investor-flow":
+        return _run_backfill_ls_investor_flow(args)
     if args.command == "collect":
         try:
             plan = load_collection_plan(str(args.plan_id))
