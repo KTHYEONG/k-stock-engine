@@ -2134,3 +2134,308 @@ def test_build_reference_benchmarks_command_lists_all_ids(tmp_path, capsys) -> N
     assert sorted(emitted["benchmarks"]) == [
         "eligible_cw_pr", "eligible_ew_pr", "liquid1b_cw_pr", "liquid1b_ew_pr",
     ]
+
+
+def test_compact_storage_generations_dry_run_reports_without_deleting(tmp_path, capsys) -> None:
+    import hashlib
+    import json
+
+    from src.data.cli import main
+    from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog, ReceiptIndexEntry
+    from src.data.runtime import load_data_runtime
+    from datetime import UTC, date, datetime
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+
+    def _publish(day: str, content: str) -> None:
+        page_path = tmp_path / f"page-{day}.json"
+        raw = content.encode("utf-8")
+        page_path.write_bytes(raw)
+        ReceiptCatalog(runtime.workspace.bronze_root / "catalog").publish([
+            ReceiptIndexEntry(
+                source="krx_daily_market",
+                natural_key=day,
+                as_of=date.fromisoformat(day),
+                fiscal_period=None,
+                status=EvidenceStatus.SUCCESS,
+                content_hash=hashlib.sha256(raw).hexdigest(),
+                retrieved_at=datetime(2026, 3, 5, tzinfo=UTC),
+                payload_path=page_path,
+            )
+        ])
+
+    _publish("2026-03-04", "revision-one")
+    _publish("2026-03-05", "revision-two")
+
+    table_dir = runtime.workspace.silver_root / "financial_facts"
+    for name, ts in (("g1", "2026-01-01T00:00:00+00:00"), ("g2", "2026-02-01T00:00:00+00:00")):
+        generation = table_dir / name
+        generation.mkdir(parents=True)
+        (generation / "dataset_manifest.json").write_text(
+            json.dumps({"generated_time": ts, "content_hash": name}), encoding="utf-8"
+        )
+        (generation / "part.parquet").write_bytes(b"0" * 64)
+
+    catalog_root = runtime.workspace.bronze_root / "catalog"
+    revisions_before = {p.name for p in catalog_root.glob("*.json") if p.name != "latest.json"}
+    assert len(revisions_before) == 2
+
+    assert main([
+        "compact-storage-generations",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+    ]) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["applied"] is False
+    assert emitted["bytes_freed"] == 0
+    assert emitted["catalog"]["reclaimable_revisions"]
+    assert emitted["tables"][0]["reclaimable_generations"] == ["g1"]
+    assert {p.name for p in catalog_root.glob("*.json") if p.name != "latest.json"} == revisions_before
+    assert (table_dir / "g1").exists()
+
+
+def test_compact_storage_generations_apply_deletes_and_reports_freed_bytes(tmp_path, capsys) -> None:
+    import hashlib
+    import json
+
+    from src.data.cli import main
+    from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog, ReceiptIndexEntry
+    from src.data.runtime import load_data_runtime
+    from datetime import UTC, date, datetime
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+
+    def _publish(day: str, content: str) -> None:
+        page_path = tmp_path / f"page-{day}.json"
+        raw = content.encode("utf-8")
+        page_path.write_bytes(raw)
+        ReceiptCatalog(runtime.workspace.bronze_root / "catalog").publish([
+            ReceiptIndexEntry(
+                source="krx_daily_market",
+                natural_key=day,
+                as_of=date.fromisoformat(day),
+                fiscal_period=None,
+                status=EvidenceStatus.SUCCESS,
+                content_hash=hashlib.sha256(raw).hexdigest(),
+                retrieved_at=datetime(2026, 3, 5, tzinfo=UTC),
+                payload_path=page_path,
+            )
+        ])
+
+    _publish("2026-03-04", "revision-one")
+    _publish("2026-03-05", "revision-two")
+
+    table_dir = runtime.workspace.silver_root / "financial_facts"
+    for name, ts in (("g1", "2026-01-01T00:00:00+00:00"), ("g2", "2026-02-01T00:00:00+00:00")):
+        generation = table_dir / name
+        generation.mkdir(parents=True)
+        (generation / "dataset_manifest.json").write_text(
+            json.dumps({"generated_time": ts, "content_hash": name}), encoding="utf-8"
+        )
+        (generation / "part.parquet").write_bytes(b"0" * 64)
+
+    assert main([
+        "compact-storage-generations",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+        "--apply",
+    ]) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["applied"] is True
+    assert emitted["bytes_freed"] > 0
+    assert not (table_dir / "g1").exists()
+    assert (table_dir / "g2").exists()
+
+
+def _write_cli_gap_dataset(directory, frame) -> None:
+    import hashlib
+    import json
+
+    directory.mkdir(parents=True, exist_ok=True)
+    rel = Path("year=2024") / "part.parquet"
+    out_path = directory / rel
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    frame.write_parquet(out_path)
+    (directory / "manifest.json").write_text(
+        json.dumps(
+            {
+                "dataset_id": directory.name,
+                "policy_version": "test-v1",
+                "partitions": [
+                    {
+                        "path": str(rel),
+                        "row_count": frame.height,
+                        "parquet_sha256": hashlib.sha256(out_path.read_bytes()).hexdigest(),
+                        "year": 2024,
+                    }
+                ],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_cli_gap_inputs(runtime, *, ls_cells, panel_cells) -> tuple:
+    import polars as pl
+
+    panel = runtime.workspace.gold_root / "market_panel_cli"
+    ls_flow = runtime.workspace.silver_root / "investor_flow_cli"
+    _write_cli_gap_dataset(
+        panel,
+        pl.DataFrame(
+            {
+                "session": [session for session, _ in panel_cells],
+                "instrument_id": [f"KRX:{ticker}" for _, ticker in panel_cells],
+                "ticker": [ticker for _, ticker in panel_cells],
+                "eligible": [True] * len(panel_cells),
+                "price_state": ["tradable"] * len(panel_cells),
+            },
+            schema={
+                "session": pl.Date,
+                "instrument_id": pl.String,
+                "ticker": pl.String,
+                "eligible": pl.Boolean,
+                "price_state": pl.String,
+            },
+        ),
+    )
+    _write_cli_gap_dataset(
+        ls_flow,
+        pl.DataFrame(
+            {"session": [session for session, _ in ls_cells], "ticker": [ticker for _, ticker in ls_cells]},
+            schema={"session": pl.Date, "ticker": pl.String},
+        ),
+    )
+    return panel, ls_flow
+
+
+def _write_cli_kis_page(bronze_root, symbol, anchor, rows) -> None:
+    import hashlib
+    import json
+
+    payload = {
+        "provider": "KIS",
+        "endpoint": "investor-trade-by-stock-daily",
+        "symbol": symbol,
+        "anchor": anchor.isoformat(),
+        "query": {"symbol": symbol, "anchor": anchor.isoformat()},
+        "rows": rows,
+        "records": [],
+    }
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    page_dir = bronze_root / "investor_flow" / hashlib.sha256(raw).hexdigest()
+    page_dir.mkdir(parents=True, exist_ok=True)
+    (page_dir / "payload.json").write_bytes(raw)
+
+
+def test_backfill_kis_investor_flow_gap_reports_attempted_symbols(tmp_path, monkeypatch, capsys) -> None:
+    import json
+    from datetime import date
+
+    from src.data.cli import main
+    from src.data.runtime import load_data_runtime
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+    s1, s2 = date(2024, 1, 2), date(2024, 1, 3)
+    panel, ls_flow = _write_cli_gap_inputs(
+        runtime,
+        ls_cells=[(s1, "000001"), (s1, "000002")],
+        panel_cells=[(s1, "000001"), (s2, "000001"), (s1, "000002"), (s2, "000002")],
+    )
+    seen: dict[str, object] = {}
+
+    class StubCollector:
+        def __init__(self, symbols) -> None:
+            seen["symbols"] = tuple(symbols)
+
+        def fetch_investor_flow(self, start, end, *, bronze_root=None, retrieved_at=None, symbols=None):
+            seen.setdefault("calls", []).append((start, end, symbols))
+            yield {"provider": "KIS", "symbol": symbols[0], "anchor": end.isoformat(), "records": []}
+
+    monkeypatch.setattr("src.integrations.kis.investor_flow.KisInvestorFlowCollector", StubCollector)
+    assert main([
+        "backfill-kis-investor-flow-gap",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+        "--market-panel-dataset-id", panel.name,
+        "--ls-flow-dataset-id", ls_flow.name,
+        "--pace-seconds", "0",
+    ]) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["symbols_attempted"] == 2
+    assert emitted["target_cells"] == 2
+    assert seen["symbols"] == ("000001", "000002")
+
+
+def test_backfill_kis_investor_flow_gap_with_empty_gap(tmp_path, monkeypatch, capsys) -> None:
+    import json
+    from datetime import date
+
+    from src.data.cli import main
+    from src.data.runtime import load_data_runtime
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+    s1 = date(2024, 1, 2)
+    panel, ls_flow = _write_cli_gap_inputs(
+        runtime, ls_cells=[(s1, "000001")], panel_cells=[(s1, "000001")]
+    )
+
+    def _forbidden(symbols):
+        raise AssertionError("collector must not be constructed for an empty gap")
+
+    monkeypatch.setattr("src.integrations.kis.investor_flow.KisInvestorFlowCollector", _forbidden)
+    assert main([
+        "backfill-kis-investor-flow-gap",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+        "--market-panel-dataset-id", panel.name,
+        "--ls-flow-dataset-id", ls_flow.name,
+        "--pace-seconds", "0",
+    ]) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted == {"symbols_attempted": 0, "target_cells": 0}
+
+
+def test_build_investor_flow_kis_supplement_command_emits_coverage(tmp_path, capsys) -> None:
+    import json
+    from datetime import date
+
+    from src.data.cli import main
+    from src.data.runtime import load_data_runtime
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+    s1, s2, s3 = date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4)
+    panel, ls_flow = _write_cli_gap_inputs(
+        runtime,
+        ls_cells=[(s1, "000001")],
+        panel_cells=[(s1, "000001"), (s2, "000001"), (s3, "000001")],
+    )
+    _write_cli_kis_page(
+        runtime.workspace.bronze_root,
+        "000001",
+        s2,
+        [{
+            "stck_bsop_date": "20240103",
+            "prsn_ntby_qty": "100",
+            "frgn_ntby_qty": "-60",
+            "orgn_ntby_qty": "-30",
+            "etc_ntby_qty": "-10",
+        }],
+    )
+    assert main([
+        "build-investor-flow-kis-supplement",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+        "--market-panel-dataset-id", panel.name,
+        "--ls-flow-dataset-id", ls_flow.name,
+    ]) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["dataset_id"].startswith("investor_flow_kis_supplement_")
+    assert emitted["filled_cells"] == 1
+    assert emitted["still_missing_cells"] == 1

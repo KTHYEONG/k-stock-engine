@@ -20,6 +20,8 @@ class KisInvestorFlowCollector:
             raise ValueError("KIS investor flow requires at least one symbol")
         self._symbols = cleaned
         self._client = client or KisClient(KisCredentials.from_env())
+        self._verified_anchor_index: dict[tuple[Path, str, str], dict[str, object]] = {}
+        self._verified_anchor_index_roots: set[Path] = set()
 
     @staticmethod
     def _session(value: object) -> date:
@@ -96,11 +98,15 @@ class KisInvestorFlowCollector:
             raise PITDataError("KIS investor flow missing requested session")
         return {"provider": "KIS", "endpoint": "investor-trade-by-stock-daily", "records": rows}
 
-    def _find_verified_anchor_page(self, symbol: str, anchor: date, bronze_root: Path | str) -> dict[str, object] | None:
+    def _ensure_verified_anchor_index(self, bronze_root: Path) -> None:
+        if bronze_root in self._verified_anchor_index_roots:
+            return
         from src.core.pit import EvidenceKind
         from src.data.bronze_aggregation import discover_verified_bronze_receipts
 
-        grouped = discover_verified_bronze_receipts(bronze_root=Path(bronze_root))
+        grouped = discover_verified_bronze_receipts(
+            bronze_root=bronze_root, kinds=frozenset({EvidenceKind.INVESTOR_FLOW})
+        )
         for receipt in grouped.get(EvidenceKind.INVESTOR_FLOW, ()):
             try:
                 payload = json.loads(receipt.payload_path.read_text(encoding="utf-8"))
@@ -108,18 +114,24 @@ class KisInvestorFlowCollector:
                 raise PITDataError(f"invalid verified KIS Bronze payload {receipt.payload_path}") from exc
             if not isinstance(payload, dict):
                 raise PITDataError(f"invalid verified KIS Bronze payload {receipt.payload_path}")
-            if str(payload.get("symbol")) == symbol and str(payload.get("anchor")) == anchor.isoformat():
-                records = payload.get("records")
-                if not isinstance(records, list) or not records:
-                    return None
-                return {
+            records = payload.get("records")
+            if not isinstance(records, list) or not records:
+                continue
+            key = (bronze_root, str(payload.get("symbol")), str(payload.get("anchor")))
+            if key not in self._verified_anchor_index:
+                self._verified_anchor_index[key] = {
                     "provider": "KIS",
                     "endpoint": "investor-trade-by-stock-daily",
-                    "symbol": symbol,
-                    "anchor": anchor.isoformat(),
+                    "symbol": str(payload.get("symbol")),
+                    "anchor": str(payload.get("anchor")),
                     "records": records,
                 }
-        return None
+        self._verified_anchor_index_roots.add(bronze_root)
+
+    def _find_verified_anchor_page(self, symbol: str, anchor: date, bronze_root: Path | str) -> dict[str, object] | None:
+        root = Path(bronze_root)
+        self._ensure_verified_anchor_index(root)
+        return self._verified_anchor_index.get((root, symbol, anchor.isoformat()))
 
     def fetch_investor_flow(
         self,
@@ -163,6 +175,18 @@ class KisInvestorFlowCollector:
                         symbol, anchor, raw_rows, bronze_root=bronze_root, retrieved_at=retrieved_at
                     )
                 rows = self._map_rows(symbol, raw_rows)
+                if bronze_root is not None:
+                    root = Path(bronze_root)
+                    if root in self._verified_anchor_index_roots:
+                        fresh_key = (root, symbol, anchor.isoformat())
+                        if fresh_key not in self._verified_anchor_index and rows:
+                            self._verified_anchor_index[fresh_key] = {
+                                "provider": "KIS",
+                                "endpoint": "investor-trade-by-stock-daily",
+                                "symbol": symbol,
+                                "anchor": anchor.isoformat(),
+                                "records": [dict(row) for row in rows],
+                            }
                 selected = [row for row in rows if start.isoformat() <= str(row["session"]) <= end.isoformat()]
                 if not selected:
                     raise PITDataError(f"KIS investor flow missing requested session range for {symbol}")

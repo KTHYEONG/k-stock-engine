@@ -5,7 +5,9 @@ import argparse
 import base64
 import hashlib
 import json
+import logging
 import sys
+import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -65,6 +67,8 @@ from src.strategy.compounding_v2_strategy import (
 from src.strategy.core_strategy import CoreStrategy
 
 load_dotenv()
+
+_LOG = logging.getLogger(__name__)
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -344,6 +348,27 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     _add_scoped_args(p_bench)
     p_bench.add_argument("--market-panel-dataset-id", required=True)
     p_bench.add_argument("--definitions", type=Path, default=Path("config/data/reference_benchmarks.toml"))
+
+    p_compact = sub.add_parser(
+        "compact-storage-generations", help="Plan/apply retention for superseded catalog revisions and Silver table generations"
+    )
+    _add_scoped_args(p_compact)
+    p_compact.add_argument("--apply", action="store_true")
+
+    p_kis_backfill = sub.add_parser(
+        "backfill-kis-investor-flow-gap", help="Backfill the LS investor-flow gap via KIS pages"
+    )
+    _add_scoped_args(p_kis_backfill)
+    p_kis_backfill.add_argument("--market-panel-dataset-id", required=True)
+    p_kis_backfill.add_argument("--ls-flow-dataset-id", required=True)
+    p_kis_backfill.add_argument("--pace-seconds", type=float, default=0.35)
+
+    p_kis_supplement = sub.add_parser(
+        "build-investor-flow-kis-supplement", help="Build the provider-tagged KIS supplement for the LS gap"
+    )
+    _add_scoped_args(p_kis_supplement)
+    p_kis_supplement.add_argument("--market-panel-dataset-id", required=True)
+    p_kis_supplement.add_argument("--ls-flow-dataset-id", required=True)
 
     return parser.parse_args(argv)
 
@@ -1651,6 +1676,83 @@ def main(argv: Sequence[str] | None = None) -> int:
             return asdict(result) | {"dataset_path": str(result.dataset_path)}
 
         return _run_scoped(args, _build_reference_benchmarks)
+    if args.command == "backfill-kis-investor-flow-gap":
+        def _backfill_kis_gap() -> dict[str, object]:
+            from src.data.investor_flow_gap import compute_missing_investor_flow_cells
+            from src.integrations.kis.investor_flow import KisInvestorFlowCollector
+
+            runtime = _scoped_runtime(args)
+            gap = compute_missing_investor_flow_cells(
+                market_panel_path=runtime.workspace.gold_root / args.market_panel_dataset_id,
+                ls_flow_silver_path=runtime.workspace.silver_root / args.ls_flow_dataset_id,
+            )
+            if not gap.symbols:
+                return {"target_cells": 0, "symbols_attempted": 0}
+            collector = KisInvestorFlowCollector(tuple(s.ticker for s in gap.symbols))
+            filled = attempted = 0
+            for entry in gap.symbols:
+                for _ in collector.fetch_investor_flow(
+                    entry.sessions[0], entry.sessions[-1],
+                    bronze_root=runtime.workspace.bronze_root,
+                    symbols=(entry.ticker,),
+                ):
+                    filled += 1
+                attempted += 1
+                _LOG.info("[DATA] stage=kis_gap_backfill symbol=%s %d/%d", entry.ticker, attempted, len(gap.symbols))
+                time.sleep(args.pace_seconds)
+            return {"target_cells": gap.total_cells, "symbols_attempted": attempted}
+
+        return _run_scoped(args, _backfill_kis_gap)
+    if args.command == "build-investor-flow-kis-supplement":
+        def _build_kis_supplement() -> dict[str, object]:
+            from dataclasses import asdict
+
+            from src.data.investor_flow_kis_supplement import materialize_investor_flow_kis_supplement
+
+            runtime = _scoped_runtime(args)
+            result = materialize_investor_flow_kis_supplement(
+                bronze_root=runtime.workspace.bronze_root,
+                market_panel_path=runtime.workspace.gold_root / args.market_panel_dataset_id,
+                ls_flow_silver_path=runtime.workspace.silver_root / args.ls_flow_dataset_id,
+                silver_root=runtime.workspace.silver_root,
+            )
+            return asdict(result) | {"dataset_path": str(result.dataset_path)}
+
+        return _run_scoped(args, _build_kis_supplement)
+    if args.command == "compact-storage-generations":
+        def _compact_storage_generations() -> dict[str, object]:
+            from dataclasses import asdict
+
+            from src.data.storage_retention import (
+                apply_catalog_revision_retention,
+                apply_table_generation_retention,
+                discover_generation_tables,
+                plan_catalog_revision_retention,
+                plan_table_generation_retention,
+            )
+
+            runtime = _scoped_runtime(args)
+            catalog_root = runtime.workspace.bronze_root / "catalog"
+            catalog_plan = plan_catalog_revision_retention(catalog_root)
+            table_plans = [
+                plan_table_generation_retention(table_root)
+                for table_root in discover_generation_tables(runtime.workspace.silver_root)
+            ]
+            freed = 0
+            if args.apply:
+                freed = apply_catalog_revision_retention(catalog_root)
+                freed += sum(
+                    apply_table_generation_retention(table_root)
+                    for table_root in discover_generation_tables(runtime.workspace.silver_root)
+                )
+            return {
+                "catalog": asdict(catalog_plan) | {"catalog_root": str(catalog_plan.catalog_root)},
+                "tables": [asdict(p) | {"table_root": str(p.table_root)} for p in table_plans],
+                "applied": args.apply,
+                "bytes_freed": freed,
+            }
+
+        return _run_scoped(args, _compact_storage_generations)
     if args.command == "audit-provenance":
         try:
             from src.data.provenance_audit import audit_production_provenance
