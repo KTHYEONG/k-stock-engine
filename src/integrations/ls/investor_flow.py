@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 from collections.abc import Iterable
 from datetime import UTC, date, datetime
@@ -11,6 +12,8 @@ from typing import Any
 
 from src.core.pit import BronzeReceipt, PITDataError
 from src.integrations.ls.client import LsClient, LsCredentials
+
+_LOG = logging.getLogger(__name__)
 
 
 class LsInvestorFlowCollector:
@@ -71,16 +74,29 @@ class LsInvestorFlowCollector:
     def _map_rows(self, symbol: str, rows: tuple[dict[str, Any], ...]) -> list[dict[str, object]]:
         """Map raw t1702 rows to share-denominated net records.
 
-        Every record carries ``unit="shares"`` and the four aggregate groups
-        whose identities are verified on raw rows. Net quantities are integers
-        of shares; no KRW value is derived here because the provider does not
-        supply per-group amounts in this mode.
+        Every record carries ``unit="shares"`` and the four aggregate group
+        totals. A row whose four aggregate identities are internally
+        inconsistent is a known rare provider data-quality artifact (verified at
+        8 of 3,634,373 raw rows); it is skipped rather than aborting the whole
+        caller, matching the cell-level isolation the Silver layer already
+        applies when it reads this collector's raw Bronze bytes directly. A
+        malformed field (non-numeric, boolean, missing, or non-integral) is a
+        schema break, not a data-quality artifact, and still fails closed.
+
+        Args:
+            symbol: LS ticker the raw rows belong to.
+            rows: Raw t1702OutBlock1 rows for one query window.
+
+        Returns:
+            One record per row whose four aggregate identities hold. Rows that
+            violate an identity are omitted and logged, not raised.
 
         Raises:
-            PITDataError: missing/non-numeric group field, non-integral quantity,
-                or a violated aggregate identity.
+            PITDataError: a row has a missing, non-numeric, boolean, or
+                non-integral group field.
         """
         mapped: list[dict[str, object]] = []
+        skipped = 0
         for row in rows:
             raw_sess = str(row.get("date") or row.get("session") or "").strip()
             if not raw_sess:
@@ -95,14 +111,14 @@ class LsInvestorFlowCollector:
             other = self._shares(row, "tjj0017")
             inst_parts = [self._shares(row, f"tjj000{i}") for i in range(7)]
             institution = self._shares(row, "tjj0018")
-            if institution != sum(inst_parts):
-                raise PITDataError("LS investor flow violates institution aggregate identity")
-            if foreign != foreign_sub_a + foreign_sub_b:
-                raise PITDataError("LS investor flow violates foreign aggregate identity")
-            if other != other_sub_a + other_sub_b:
-                raise PITDataError("LS investor flow violates other aggregate identity")
-            if individual + foreign + other + institution != 0:
-                raise PITDataError("LS investor flow violates zero-sum identity")
+            if (
+                institution != sum(inst_parts)
+                or foreign != foreign_sub_a + foreign_sub_b
+                or other != other_sub_a + other_sub_b
+                or individual + foreign + other + institution != 0
+            ):
+                skipped += 1
+                continue
             mapped.append(
                 {
                     "session": sess,
@@ -115,6 +131,8 @@ class LsInvestorFlowCollector:
                     "other_net_shares": other,
                 }
             )
+        if skipped:
+            _LOG.info("[DATA] symbol=%s skipped_identity_violation_rows=%d", symbol, skipped)
         return mapped
 
     def _persist_raw_page(

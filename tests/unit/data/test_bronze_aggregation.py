@@ -129,3 +129,36 @@ def test_aggregate_small_bronze_pages_tags_investor_flow_provider(tmp_path) -> N
     merged = aggregate_small_bronze_pages(kind=EvidenceKind.INVESTOR_FLOW, receipts=(dict_page, list_page), store=store)
     payload = json.loads(merged.payload_path.read_text(encoding="utf-8"))
     assert [row["_source_provider"] for row in payload["records"]] == ["LS", "KIWOOM"]
+
+
+def test_discover_verified_bronze_receipts_kinds_filter_skips_other_kinds(tmp_path) -> None:
+    from datetime import UTC, datetime
+    from src.data.bronze import BronzeStore
+    from src.data.bronze_aggregation import discover_verified_bronze_receipts
+    from src.data.schemas import EvidenceKind
+
+    store = BronzeStore(tmp_path / "bronze")
+    store.import_bytes(b'{"records": [{"a": 1}]}', kind=EvidenceKind.INVESTOR_FLOW, retrieved_at=datetime(2020, 1, 1, tzinfo=UTC), source_label="fixture-flow")
+    other = store.import_bytes(b'{"records": [{"b": 2}]}', kind=EvidenceKind.DAILY_MARKET, retrieved_at=datetime(2020, 1, 1, tzinfo=UTC), source_label="fixture-market")
+    other.payload_path.write_bytes(b"tampered")
+
+    grouped = discover_verified_bronze_receipts(bronze_root=tmp_path / "bronze", kinds=frozenset({EvidenceKind.INVESTOR_FLOW}))
+
+    assert set(grouped) == {EvidenceKind.INVESTOR_FLOW}
+    assert len(grouped[EvidenceKind.INVESTOR_FLOW]) == 1
+
+
+def test_discover_verified_bronze_receipts_kinds_filter_still_verifies_requested_kind(tmp_path) -> None:
+    from datetime import UTC, datetime
+    import pytest
+    from src.data.bronze import BronzeStore
+    from src.data.bronze_aggregation import discover_verified_bronze_receipts
+    from src.data.schemas import EvidenceKind, PITDataError
+
+    store = BronzeStore(tmp_path / "bronze")
+    flow = store.import_bytes(b'{"records": [{"a": 1}]}', kind=EvidenceKind.INVESTOR_FLOW, retrieved_at=datetime(2020, 1, 1, tzinfo=UTC), source_label="fixture-flow")
+    store.import_bytes(b'{"records": [{"b": 2}]}', kind=EvidenceKind.DAILY_MARKET, retrieved_at=datetime(2020, 1, 1, tzinfo=UTC), source_label="fixture-market")
+    flow.payload_path.write_bytes(b"tampered")
+
+    with pytest.raises(PITDataError, match="hash mismatch"):
+        discover_verified_bronze_receipts(bronze_root=tmp_path / "bronze", kinds=frozenset({EvidenceKind.INVESTOR_FLOW}))

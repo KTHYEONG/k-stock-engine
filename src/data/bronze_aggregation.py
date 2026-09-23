@@ -46,12 +46,28 @@ def select_streaming_receipts(
 
 
 def discover_verified_bronze_receipts(
-    *, bronze_root: Path
+    *, bronze_root: Path, kinds: frozenset[EvidenceKind] | None = None
 ) -> dict[EvidenceKind, tuple[BronzeReceipt, ...]]:
-    """Verify every receipt payload and return all pages in stable order."""
+    """Verify every receipt payload and return all pages in stable order.
+
+    Args:
+        bronze_root: Scope Bronze root.
+        kinds: When given, verify only these evidence kinds; every other kind
+            is skipped entirely (not even listed as an empty key). Omitting it
+            preserves the existing full-scope behavior every current caller
+            relies on. A caller that only needs one kind's receipts (for
+            example a provider-specific reuse lookup) must pass it — scanning
+            unrelated kinds is pure waste on a multi-hundred-thousand-receipt
+            Bronze tree.
+
+    Returns:
+        Verified receipts grouped by kind, in stable order.
+    """
     root = Path(bronze_root)
     grouped: dict[EvidenceKind, tuple[BronzeReceipt, ...]] = {}
     for kind in EvidenceKind:
+        if kinds is not None and kind not in kinds:
+            continue
         kind_dir = root / kind.value
         if not kind_dir.exists():
             continue

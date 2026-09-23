@@ -67,20 +67,54 @@ def test_map_rows_uses_foreign_total_tjj0016() -> None:
     assert record["foreign_net_shares"] == -828
 
 
-def test_map_rows_zero_sum_violation_fails_closed() -> None:
+def test_map_rows_zero_sum_violation_is_skipped_not_raised() -> None:
     collector = LsInvestorFlowCollector(("005930",), client=object())
-    with pytest.raises(PITDataError):
-        collector._map_rows("005930", (_balanced_row(tjj0008="928", tjj0000="-99", tjj0001="-51"),))
+    records = collector._map_rows(
+        "005930",
+        (_balanced_row(), _balanced_row(tjj0008="928", tjj0000="-99", tjj0001="-51")),
+    )
+    assert len(records) == 1
+    assert records[0]["individual_net_shares"] == 927
 
 
-def test_map_rows_subgroup_identity_violation_fails_closed() -> None:
+def test_map_rows_institution_sum_violation_is_skipped_not_raised() -> None:
     collector = LsInvestorFlowCollector(("005930",), client=object())
-    with pytest.raises(PITDataError):
-        collector._map_rows("005930", (_balanced_row(tjj0000="-99"),))
-    with pytest.raises(PITDataError):
-        collector._map_rows("005930", (_balanced_row(tjj0009="-799"),))
-    with pytest.raises(PITDataError):
-        collector._map_rows("005930", (_balanced_row(tjj0007="101"),))
+    assert collector._map_rows("005930", (_balanced_row(tjj0000="-99"),)) == []
+
+
+def test_map_rows_foreign_sum_violation_is_skipped_not_raised() -> None:
+    collector = LsInvestorFlowCollector(("005930",), client=object())
+    assert collector._map_rows("005930", (_balanced_row(tjj0009="-799"),)) == []
+
+
+def test_map_rows_other_sum_violation_is_skipped_not_raised() -> None:
+    collector = LsInvestorFlowCollector(("005930",), client=object())
+    assert collector._map_rows("005930", (_balanced_row(tjj0007="101"),)) == []
+
+
+def test_map_rows_logs_skip_count_once_per_call(caplog: pytest.LogCaptureFixture) -> None:
+    collector = LsInvestorFlowCollector(("005930",), client=object())
+    with caplog.at_level("INFO", logger="src.integrations.ls.investor_flow"):
+        records = collector._map_rows(
+            "005930",
+            (
+                _balanced_row(),
+                _balanced_row(tjj0000="-99"),
+                _balanced_row(tjj0009="-799"),
+            ),
+        )
+    assert len(records) == 1
+    info_records = [r for r in caplog.records if r.levelname == "INFO"]
+    assert len(info_records) == 1
+    assert "005930" in info_records[0].message
+    assert "2" in info_records[0].message
+
+
+def test_map_rows_logs_nothing_when_no_rows_skipped(caplog: pytest.LogCaptureFixture) -> None:
+    collector = LsInvestorFlowCollector(("005930",), client=object())
+    with caplog.at_level("INFO", logger="src.integrations.ls.investor_flow"):
+        collector._map_rows("005930", (_balanced_row(),))
+    assert not any(r.levelname == "INFO" for r in caplog.records)
 
 
 def test_map_rows_non_integral_quantity_rejected() -> None:
@@ -112,3 +146,26 @@ def test_map_rows_rejects_bool_float_and_non_numeric_quantities() -> None:
         collector._map_rows("005930", (_balanced_row(tjj0008="abc"),))
     with pytest.raises(PITDataError):
         collector._map_rows("005930", (_balanced_row(tjj0008=None),))
+
+
+def test_fetch_investor_flow_tolerates_identity_violation_without_aborting_chunk(tmp_path) -> None:
+    import json
+
+    class MockLsClient:
+        def inquire_investor_trend(self, symbol: str, start_date: date, end_date: date, unit: str = "shares"):
+            assert unit == "shares"
+            return (_balanced_row(tjj0000="-99"), _balanced_row())
+
+    collector = LsInvestorFlowCollector(("005930",), client=MockLsClient())
+    pages = list(
+        collector.fetch_investor_flow(date(2026, 3, 1), date(2026, 3, 6), bronze_root=tmp_path)
+    )
+    assert len(pages) == 1
+    records = pages[0]["records"]
+    assert len(records) == 1
+    assert records[0]["individual_net_shares"] == 927
+
+    payload_paths = list(tmp_path.rglob("payload.json"))
+    assert len(payload_paths) == 1
+    persisted = json.loads(payload_paths[0].read_text(encoding="utf-8"))
+    assert len(persisted["rows"]) == 2
