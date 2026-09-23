@@ -1,0 +1,19 @@
+version = "reference-benchmarks-v1"
+
+[[benchmarks]]
+benchmark_id = "eligible_cw_pr"
+weighting = "cap"
+
+[[benchmarks]]
+benchmark_id = "eligible_ew_pr"
+weighting = "equal"
+
+[[benchmarks]]
+benchmark_id = "liquid1b_ew_pr"
+weighting = "equal"
+min_adtv20_krw = 1000000000
+
+[[benchmarks]]
+benchmark_id = "liquid1b_cw_pr"
+weighting = "cap"
+min_adtv20_krw = 1000000000

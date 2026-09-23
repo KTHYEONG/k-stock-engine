@@ -1053,31 +1053,98 @@ class CollectionPlanReceipt:
     receipt_path: Path
 
 
+def load_collection_plan_path(path: Path | str) -> HistoricalCollectionPlan:
+    """Load one immutable persisted historical collection plan by exact path.
+
+    Scoped research plans are evidence-derived inputs rather than regenerated
+    convenience configuration. Loading by exact path preserves their recorded
+    identifier, digest, coverage, chunk order, and session windows for
+    checkpoint replay.
+
+    Args:
+        path: Existing JSON plan receipt path.
+
+    Returns:
+        Parsed immutable historical collection plan.
+
+    Raises:
+        PITDataError: The path, JSON structure, plan identity, coverage, or
+        chunk contract is invalid.
+    """
+    try:
+        candidate = Path(path)
+    except (TypeError, ValueError) as exc:
+        raise PITDataError(f"collection plan path is invalid: {path}") from exc
+    if not candidate.is_file():
+        raise PITDataError(f"collection plan path is invalid: {candidate}")
+    try:
+        raw = json.loads(candidate.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise PITDataError("collection plan receipt is unreadable") from exc
+    if not isinstance(raw, dict):
+        raise PITDataError("collection plan receipt has invalid schema")
+    plan_id = raw.get("plan_id")
+    content_hash = raw.get("content_hash")
+    if not isinstance(plan_id, str) or not plan_id.strip():
+        raise PITDataError("collection plan receipt is missing its plan identity")
+    if not isinstance(content_hash, str) or not content_hash.strip():
+        raise PITDataError("collection plan receipt is missing its digest")
+    try:
+        coverage_start = date.fromisoformat(str(raw.get("coverage_start")))
+        coverage_end = date.fromisoformat(str(raw.get("coverage_end")))
+    except (ValueError, TypeError) as exc:
+        raise PITDataError("collection plan receipt has invalid coverage") from exc
+    if coverage_start > coverage_end:
+        raise PITDataError("coverage_start must not be after coverage_end")
+    chunk_size = raw.get("chunk_size")
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size < 1:
+        raise PITDataError("collection plan receipt has invalid chunk size")
+    raw_chunks = raw.get("chunks")
+    if not isinstance(raw_chunks, list) or not raw_chunks:
+        raise PITDataError("collection plan has no chunks")
+    chunks: list[PlanChunk] = []
+    seen_ids: set[str] = set()
+    for item in raw_chunks:
+        if not isinstance(item, dict):
+            raise PITDataError("collection plan chunk has invalid schema")
+        chunk_id = item.get("chunk_id")
+        symbol = item.get("symbol")
+        if not isinstance(chunk_id, str) or not chunk_id.strip():
+            raise PITDataError("collection plan chunk is missing its identifier")
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise PITDataError("collection plan chunk is missing its symbol")
+        if chunk_id in seen_ids:
+            raise PITDataError(f"collection plan has duplicate chunk identifier: {chunk_id!r}")
+        seen_ids.add(chunk_id)
+        raw_sessions = item.get("sessions")
+        if not isinstance(raw_sessions, list) or not raw_sessions:
+            raise PITDataError(f"collection plan chunk {chunk_id!r} has no sessions")
+        sessions: list[date] = []
+        for value in raw_sessions:
+            try:
+                session = date.fromisoformat(str(value))
+            except (ValueError, TypeError) as exc:
+                raise PITDataError(f"collection plan chunk {chunk_id!r} has invalid session") from exc
+            if session < coverage_start or session > coverage_end:
+                raise PITDataError(f"collection plan chunk {chunk_id!r} has a session outside coverage")
+            sessions.append(session)
+        chunks.append(PlanChunk(chunk_id=chunk_id, symbol=symbol, sessions=tuple(sessions)))
+    return HistoricalCollectionPlan(
+        plan_id=plan_id,
+        coverage_start=coverage_start,
+        coverage_end=coverage_end,
+        chunk_size=chunk_size,
+        chunks=tuple(chunks),
+        content_hash=content_hash,
+    )
+
+
 def load_collection_plan(plan_id: str, *, artifact_root: Path | str | None = None) -> HistoricalCollectionPlan:
     root = Path(artifact_root) if artifact_root is not None else PLAN_ARTIFACT_DIR
     path = root / f"{plan_id}.json"
     if not path.exists():
         raise PITDataError(f"unknown collection plan: {plan_id}")
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise PITDataError("collection plan receipt is unreadable") from exc
-    chunks = tuple(
-        PlanChunk(
-            chunk_id=str(item.get("chunk_id")),
-            symbol=str(item.get("symbol")),
-            sessions=tuple(date.fromisoformat(s) for s in item.get("sessions", ())),
-        )
-        for item in raw.get("chunks", ())
-    )
-    return HistoricalCollectionPlan(
-        plan_id=str(raw.get("plan_id")),
-        coverage_start=date.fromisoformat(str(raw.get("coverage_start"))),
-        coverage_end=date.fromisoformat(str(raw.get("coverage_end"))),
-        chunk_size=int(raw.get("chunk_size", 0) or 0),
-        chunks=chunks,
-        content_hash=str(raw.get("content_hash", "")),
-    )
+    return load_collection_plan_path(path)
 
 
 __all__ = [
@@ -1098,6 +1165,7 @@ __all__ = [
     "build_scoped_flow_plan",
     "derive_historical_collection_window",
     "load_collection_plan",
+    "load_collection_plan_path",
     "scoped_checkpoint_dir",
     "scoped_plan_dir",
 ]
