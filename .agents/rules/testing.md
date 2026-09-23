@@ -1,14 +1,6 @@
----
-trigger:
-  - on_label: ["testing"]
-  - on_file_path_regex: "tests/.*\\.py"
-  - on_file_path_glob: ["tests/**/*.py"]
-priority: 8
----
-
 # Testing Directives & Quality Standards
 
-> **Verify observable behavior and interface contracts, not implementation internals. Maintain fast feedback loops with small deterministic inputs while isolating heavy runs. Enforce diff-coverage on new logic, isolate failures with pinpoint precision, and prioritize economic correctness over vanity metrics.**
+> **Verify observable behavior and interface contracts, not implementation internals. Maintain fast feedback loops with small deterministic inputs while isolating heavy runs. Enforce invariant verification on new logic, isolate failures with pinpoint precision, and prioritize economic correctness over vanity metrics.**
 
 ## 1. Development Paradigm: Invariant-Driven Development (IDD)
 - **Contracts Over Premature Tests:** Prioritize strict typing (Pydantic, Enums, Mypy `strict`) and domain invariants over dogmatic test-first rituals. Define the interface and invariants before writing code; avoid premature test code that freezes internal APIs.
@@ -26,16 +18,16 @@ priority: 8
 
 ## 3. Execution, Latency Budgets & Failure Triage
 - **Latency Budgets:** Fast unit tests must execute in < 0.1s per test (in-memory only). Heavy end-to-end simulations, full model retraining, or multi-year backtests must be marked `@pytest.mark.slow` and isolated from the default run.
-- **Pinpoint Failure Isolation (No Full-Suite Retries):** During TDD and debugging, NEVER rerun entire test suites (e.g. 100+ tests) or perform blind sweeps. AI must test ONLY the specific modified file or test (`uv run pytest path/to/test.py -k <test_name> -q`) and inspect the direct traceback.
+- **Pinpoint Failure Isolation:** During localized TDD and debugging, test focused targets (`uv run pytest path/to/test.py -k <test_name> -q`) and inspect direct tracebacks for rapid feedback. For final task validation, run the designated spec suite and verify directly coupled integration tests.
 - **Process-Isolated Temp Roots:** Never wipe shared temp directories globally. Each pytest run operates in its own partitioned `tmp/pytest/proc_{pid}_{uuid}/` directory to prevent race conditions and ghost crashes between concurrent agents and developer terminal commands.
 - **Hermetic Environment Invariant:** Unit tests must be 100% isolated from developer shell credentials and environment variables (`LIVE_*`, `BINANCE_*`, `UPBIT_*`). Tests requiring specific environment variables must configure them explicitly via `monkeypatch.setenv`.
 - **Tooling Artifact Awareness:** If tests pass alone but fail strictly under instrumentation (`--cov`), diagnose tracer overhead, timeout expiration, or multiprocessing/fork interference before assuming a domain code regression.
 - **Pragmatic Fixtures & Mocking:** Mock external boundaries (REST/WebSocket APIs, clock/system time, filesystem I/O). Never mock internal domain calculations or transform tests into meaningless mock-chains.
 
 ## 4. Diff-Coverage & Quality Philosophy
-- **Diff-Coverage Over Vanity Metrics:** Do not chase global percentage quotas across untouched legacy modules. Focus strictly on 100% diff-coverage for newly-added production logic (`src/`) to ensure zero untested code.
+- **Diff-Coverage & Domain Invariant Focus:** Do not chase global percentage quotas across untouched legacy modules. Focus on thorough test coverage of newly-added production logic (`src/`), ensuring domain transformations and boundary scenarios are verified.
 - **Uncovered Line Resolution Protocol:** If new lines are reported as uncovered by diff-coverage, evaluate:
   1. *Is it a genuine domain branch/exception?* -> Add a targeted scenario test exercising that boundary.
-  2. *Is it speculative defensive code (e.g. unrequested `try-except` or dead branches)?* -> **Do NOT write artificial tests; remove the defensive bloat and simplify the code.**
-- **Escape Hatch for Non-Measurable Lines:** Use `# pragma: no cover` sparingly for genuine infrastructure edge cases (e.g. OS signal exits, fatal crash loggers) rather than contorting tests with complex mocks.
+  2. *Is it speculative defensive code (e.g. unrequested dead branches)?* -> **Do NOT write artificial tests; remove the defensive bloat and simplify the code.**
+  3. *Is it untestable runtime infrastructure (e.g. fatal exit handlers, OS signals)?* -> Use `# pragma: no cover` appropriately rather than contorting tests with meaningless mock chains solely to satisfy coverage counters.
 - **Test Integrity:** Never weaken assertions, delete valid tests, or skip failing checks to satisfy CI. Diagnose and fix the root cause.

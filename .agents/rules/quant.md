@@ -1,11 +1,3 @@
----
-trigger:
-  - on_label: ["quant"]
-  - on_file_path_regex: "src/.*"
-  - on_file_path_glob: ["src/**/*.py"]
-priority: 10
----
-
 # Quantitative Engineering Core Directives
 
 > **The primary directive is maximizing net geometric compounding growth ($g = \mathbb{E}[\ln(1 + r_{\text{net}})]$) that is fully reproducible in live execution without phantom alpha. Maximize autonomous reasoning and algorithmic creativity within five non-negotiable constitutional pillars.**

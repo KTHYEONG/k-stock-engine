@@ -1,11 +1,3 @@
----
-trigger:
-  - on_label: ["logging"]
-  - on_file_path_regex: "src/.*(logging|engine|execution|api|pipeline|service|orchestration|strategy).*"
-  - on_file_path_glob: ["src/**/logging/**/*.py", "src/**/execution/**/*.py", "src/**/engine/**/*.py"]
-priority: 9
----
-
 # Unified Logging & Diagnostic Directives
 
 > **Logs must be concise, structured, and machine-parsable without sacrificing diagnostic correctness. Never truncate required numerical precision or suppress exception tracebacks to save tokens. Never log secrets or credentials, and never delete diagnostic evidence unilaterally.**
