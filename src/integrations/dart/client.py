@@ -62,6 +62,10 @@ class DartRetryableError(DartApiError):
     """Transient DART failure."""
 
 
+class DartQuotaExhaustedError(DartApiError):
+    """DART quota/rate-limit exhausted for this key."""
+
+
 class DartTerminalError(DartApiError):
     """Permanent DART failure."""
 
@@ -223,7 +227,7 @@ class DartApiClient:
                 self._quota_store.record_rate_limit(
                     provider=_PROVIDER, endpoint=endpoint, now=self._now(), retry_after=None
                 )
-            raise DartApiError(f"DART status {status}: {payload}")
+            raise DartQuotaExhaustedError(f"DART status {status}: {payload}")
         if status in RETRYABLE_DART_STATUSES:
             raise DartRetryableError(f"DART status {status}: {payload}")
         # Any other non-000 is a terminal/api error, but contract expects DartApiError match
