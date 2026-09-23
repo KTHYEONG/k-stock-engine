@@ -275,9 +275,6 @@ def test_fetch_one_financial_fact_source_matches_original_per_identity_behavior(
 
 
 def test_fetch_one_financial_fact_source_client_transport_success_and_error_wrapping() -> None:
-    import pytest
-
-    from src.core.pit import PITDataError
     from src.integrations.dart.xbrl import DartXbrlCollector
 
     identity = {
@@ -312,8 +309,9 @@ def test_fetch_one_financial_fact_source_client_transport_success_and_error_wrap
             return b""
 
     collector_dart_err = DartXbrlCollector(api_key="k", client=FakeClientDartError())
-    with pytest.raises(PITDataError, match="F1"):
-        collector_dart_err._fetch_one_financial_fact_source(identity)
+    err_page = collector_dart_err._fetch_one_financial_fact_source(identity)
+    assert err_page["source_kind"] == "unavailable"
+    assert any("boom" in str(entry) for entry in err_page["diagnostics"])
 
     # Given/When/Then: client raises a generic exception -> also wrapped.
     class FakeClientGeneric:
@@ -324,8 +322,9 @@ def test_fetch_one_financial_fact_source_client_transport_success_and_error_wrap
             return b""
 
     collector_generic = DartXbrlCollector(api_key="k", client=FakeClientGeneric())
-    with pytest.raises(PITDataError, match="F1"):
-        collector_generic._fetch_one_financial_fact_source(identity)
+    generic_page = collector_generic._fetch_one_financial_fact_source(identity)
+    assert generic_page["source_kind"] == "unavailable"
+    assert any("network blip" in str(entry) for entry in generic_page["diagnostics"])
 
 
 def test_fetch_one_financial_fact_source_raises_when_no_transport_configured() -> None:
@@ -363,10 +362,11 @@ def test_fetch_one_financial_fact_source_raises_when_no_transport_configured() -
     with pytest.raises(PITDataError, match="not configured"):
         collector_no_archive._fetch_one_financial_fact_source(identity)
 
-    # Given/When/Then: an empty (falsy) raw response also fails closed.
+    # Given/When/Then: an empty (falsy) raw response is isolated as unavailable, naming the filing.
     collector_empty_raw = DartXbrlCollector(api_key="k", request_json=lambda _e, _p: {})
-    with pytest.raises(PITDataError, match="F1"):
-        collector_empty_raw._fetch_one_financial_fact_source(identity)
+    empty_page = collector_empty_raw._fetch_one_financial_fact_source(identity)
+    assert empty_page["source_kind"] == "unavailable"
+    assert any("F1" in str(entry) for entry in empty_page["diagnostics"])
 
 
 def test_fetch_one_financial_fact_source_records_every_row_diagnostic_kind() -> None:

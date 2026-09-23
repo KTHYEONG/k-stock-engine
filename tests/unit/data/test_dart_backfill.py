@@ -312,13 +312,13 @@ def test_scoped_batch_selects_catalog_gap(tmp_path) -> None:
     assert batch.estimated_request_ceiling == 3
 
 
-def test_scoped_batch_excludes_pre_2019_filing(tmp_path) -> None:
+def test_scoped_batch_excludes_pre_floor_filing(tmp_path) -> None:
     from src.data.dart_backfill import build_scoped_dart_fact_batch
 
     runtime = _scoped_runtime(tmp_path)
     batch = build_scoped_dart_fact_batch(
         runtime=runtime, catalog=_scoped_catalog(runtime),
-        filing_identities=[_filing(filing="F0", biz="2018", reprt="11011", published="2019-03-30")],
+        filing_identities=[_filing(filing="F0", biz="2015", reprt="11011", published="2016-03-30")],
         offset=0, limit=20,
     )
 

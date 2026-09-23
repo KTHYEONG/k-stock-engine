@@ -377,8 +377,6 @@ class DartXbrlCollector:
         def _request_with_retry(fs_div: str) -> dict[str, Any]:
             from src.integrations.dart.client import DartQuotaExhaustedError, DartRetryableError
 
-            if self._request_json is None and self._client is None:
-                raise PITDataError("DART XBRL facts endpoint is not configured")  # pragma: no cover
             for attempt in range(3):
                 try:
                     if self._request_json is not None:
@@ -402,6 +400,9 @@ class DartXbrlCollector:
                         raise
                     _time.sleep(0.25)
             raise AssertionError("unreachable")  # pragma: no cover
+
+        if self._request_json is None and self._client is None:
+            raise PITDataError("DART XBRL facts endpoint is not configured")
 
         fid = identity["filing_id"]
         divisions = (identity["fs_div"], "OFS") if identity["fs_div"] == "CFS" else (identity["fs_div"],)
