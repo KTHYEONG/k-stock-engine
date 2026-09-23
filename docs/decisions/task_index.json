@@ -1,6 +1,61 @@
 {
   "tasks": [
     {
+      "task_id": "ADR_20260923_KIS_SUPPLEMENT_ANCHOR_OVERFLOW",
+      "date": "2026-09-23",
+      "adr_id": "ADR_20260923_ADR_20260923_KIS_SUPPLEMENT_ANCHOR_OVERFLOW",
+      "domain": "data",
+      "title": "KIS 수급 보충 백필 anchor-walk 페이지네이션 오버플로우 방어",
+      "why": "실 데이터 293/2636종목 갭필 실행 중 KIS 30행 고정 anchor-walk가 인증 캘린더 시작 경계 이전 세션을 자연스럽게 포함해 PITDataError로 전체 실행이 중단됨",
+      "resolution": "인증 캘린더 밖 세션을 예외로 raise하지 않고 out_of_calendar 카운터로 집계 후 조용히 skip하도록 _parse_kis_page를 수정, 진행 로그에 out_of_calendar_rows 필드 추가",
+      "impact": "실 데이터 KIS 보충 백필이 중단 없이 완주해 LS 단독 93.7%에서 결합 98.6%(173,403/175,851셀)까지 수급 커버리지 확장, 잔여 2,448셀 중 2,440셀은 패널 캘린더 최종 세션(2025-12-30)의 PIT availability-lag 경계 제외로 정상, 8셀만 개별 종목 진성 결측",
+      "caveat": "KIS 30행 anchor-walk는 항상 요청 범위 시작 이전으로 일부 스필오버 가능하므로 이 skip 로직은 데이터 결함이 아닌 정상 페이지네이션 동작으로 유지해야 함"
+    },
+    {
+      "task_id": "TASK_KIS_FLOW_COLLECTOR_EFFICIENCY",
+      "date": "2026-09-23",
+      "adr_id": "ADR_20260923_KIS_FLOW_COLLECTOR_EFFICIENCY",
+      "domain": "data",
+      "title": "KIS 수급 수집기 앵커당 전체 Bronze 재스캔 제거",
+      "why": "discover_verified_bronze_receipts에 kind 필터가 없어 KIS fetch_investor_flow가 앵커 1회당 9종 evidence 전체(77.5초)를 재스캔했고, 293종목 갭필(약 1만 회 호출)이 사실상 끝나지 않았다.",
+      "resolution": "discover_verified_bronze_receipts에 선택적 kinds 필터를 추가하고, KIS 수집기가 bronze_root별로 investor_flow만 1회 인덱싱해 재사용하도록 인스턴스 캐시를 도입했다.",
+      "impact": "동일 조회가 77.5초에서 5.5초 1회로 줄어 대규모 KIS 교차 백필이 현실적인 시간 내에 완료 가능해졌고, 기존 7개 호출처는 kinds=None 기본값으로 동작이 그대로 유지된다.",
+      "caveat": "인덱스는 인스턴스 생애주기 동안 bronze_root별로 캐시되므로, 같은 프로세스에서 다른 프로세스가 동시에 새 KIS 페이지를 쓰는 경우 이번 실행에서는 재조회되지 않는다."
+    },
+    {
+      "task_id": "TASK_STORAGE_GENERATION_RETENTION",
+      "date": "2026-09-23",
+      "adr_id": "ADR_20260923_STORAGE_GENERATION_RETENTION",
+      "domain": "data",
+      "title": "Bronze 카탈로그·Silver 세대 저장소 정리 도구",
+      "why": "ReceiptCatalog.publish와 ParquetDatasetStore.write가 갱신마다 전체 스냅샷을 새로 써서 카탈로그 리비전 601개(18GB) 중 1개만, financial_facts 세대 16개 중 1개만 실제로 쓰이고 있었다.",
+      "resolution": "latest.json 재검증 기반 카탈로그 리비전 정리와 generated_time tie-break 기반 Silver 테이블 세대 정리를 dry-run 우선(apply 시에도 즉시 재검증)으로 구현하고 CLI compact-storage-generations를 배선했다.",
+      "impact": "실제 Scope에 적용해 약 18.9GB를 회수했고, 카탈로그·financial_facts 전체 행이 그대로 읽힘을 직접 검증했다.",
+      "caveat": "financial_quality 등 다른 ParquetDatasetStore 테이블도 다회 재실행 시 같은 방식으로 불어날 수 있어, 2016~2018 확장 수집 이후 같은 명령으로 재정리가 필요하다."
+    },
+    {
+      "task_id": "TASK_KIS_INVESTOR_FLOW_GAP_BACKFILL",
+      "date": "2026-09-23",
+      "adr_id": "ADR_20260923_KIS_INVESTOR_FLOW_GAP_BACKFILL",
+      "domain": "data",
+      "title": "LS 수급 결측 갭 KIS 교차 백필",
+      "why": "LS가 432개 청크(293종목·219,049셀)를 provider_error/missing_sessions로 반환했는데, KIS 표본 12/12 성공으로 시장 데이터 자체는 존재함을 확인해 LS 전용 한계임이 드러났다.",
+      "resolution": "discover_verified_bronze_receipts에 kind 필터를 추가하고 KIS 수집기의 앵커당 77.5초 전체 Bronze 재스캔을 인스턴스 캐시(5.5초 1회)로 없앤 뒤, Gold 패널 대비 LS Silver의 결측 셀만 정확히 채우는 KIS 공급처-태그 Silver 보충 데이터셋과 CLI 2종을 추가했다.",
+      "impact": "LS 단독으로는 채울 수 없던 293종목의 수급 공백을 KIS로 안전하게(LS 데이터와 절대 충돌 없이) 메울 수 있게 됐고, 향후 임의의 provider별 Bronze 조회도 같은 kind 필터로 전체 재스캔 비용을 피할 수 있다.",
+      "caveat": "KIS 보충 데이터셋은 LS Silver와 물리적으로 분리돼 있어 하류 feature 빌더가 명시적으로 union해야 하며, Toss는 이 저장소에 연동 코드가 없어 교차검증에서 제외됐다."
+    },
+    {
+      "task_id": "TASK_LS_FLOW_IDENTITY_CELL_ISOLATION",
+      "date": "2026-09-23",
+      "adr_id": "ADR_20260923_LS_FLOW_IDENTITY_CELL_ISOLATION",
+      "domain": "data",
+      "title": "LS 수급 수집기 합계검증 위반 셀 단위 격리",
+      "why": "LsInvestorFlowCollector._map_rows가 투자자 합계검증 위반 행을 만나면 예외를 던져 최대 700세션짜리 청크 전체를 유실시켰고, 이는 Silver 계층이 이미 셀 단위로 격리하는 것과 불일치했다.",
+      "resolution": "합계검증 위반 4종은 행 단위로 건너뛰고 심볼당 1회 INFO 로그로 남기되, 필드 파싱 오류(비숫자·bool·None·비정수)는 여전히 fail-closed로 raise하도록 분리했다.",
+      "impact": "432개 잔여 LS 백필 청크 재개와 2016~2018 확장 수집에서 드문 공급처 데이터 품질 결함 1건 때문에 청크 전체가 날아가는 일이 없어졌다.",
+      "caveat": "records 필드는 여전히 진단용일 뿐이며 Silver는 원본 rows만 신뢰하므로, 이 변경은 수집 시점의 가시성만 개선할 뿐 Silver 셀 격리 로직 자체를 대체하지 않는다."
+    },
+    {
       "task_id": "TASK_KR_SWING_2019_MARKET_PANEL_P0",
       "date": "2026-09-23",
       "adr_id": "ADR_20260923_KR_SWING_2019_MARKET_PANEL_P0",
