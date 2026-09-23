@@ -13,7 +13,7 @@ price_lookback_sessions = 252
 fundamental_lookback_quarters = 5
 fundamental_fiscal_start = "2016Q1"
 investor_flow_enabled = true
-industry_enabled = false
+industry_enabled = true
 
 [collection]
 dart_daily_budget = 16000

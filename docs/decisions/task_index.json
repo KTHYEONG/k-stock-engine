@@ -1,6 +1,28 @@
 {
   "tasks": [
     {
+      "task_id": "INDUSTRY_KSIC_SILVER",
+      "date": "2026-09-24",
+      "adr_id": "ADR_20260924_INDUSTRY_KSIC_SILVER",
+      "domain": "data",
+      "title": "KSIC 기반 업종 매핑 Silver v2",
+      "why": "KIS 시세 업종 공란 종목이 관측 업종 없이 남아 업종 피처에 생존편향이 생김",
+      "resolution": "6자리 KSIC 만장일치 매핑을 학습해 관측값 우선으로 추론 업종을 채우고 industry_basis·ksic 컬럼으로 관측/추론/미분류를 구분하는 Silver v2를 구현함",
+      "impact": "교차검증 정확도 99.8%로 상장폐지 포함 약 263개를 KIS 어휘에 맞춰 분류하고 추론값을 소비자가 제외할 수 있음",
+      "caveat": "추론값은 관측값이 아니며 접두 일반화는 금지이고 market_name은 KOSPI200 등 지수명이 섞여 시장 구분에 쓰면 안 됨"
+    },
+    {
+      "task_id": "INDUSTRY_STOCKINFO_COLLECTOR",
+      "date": "2026-09-24",
+      "adr_id": "ADR_20260924_INDUSTRY_STOCKINFO_COLLECTOR",
+      "domain": "data",
+      "title": "KIS 주식기본조회 KSIC 수집기·업종 수집 격리",
+      "why": "KIS 시세 업종은 상장폐지 종목을 분류하지 못해 276개가 비고 업종 수집 CLI는 티커 하나 실패에 전체가 중단됐음",
+      "resolution": "search-stock-info로 전 종목 KSIC 코드·상장폐지일을 수집하는 KisStockClassificationCollector와 collect-stock-classification을 추가하고 두 업종 수집 명령을 티커 단위 격리로 수정함",
+      "impact": "상장폐지 종목까지 업종 근거 확보로 생존편향을 막고 일부 티커 실패가 수집 전체를 날리지 않음",
+      "caveat": "현재 시점 스냅샷이라 과거 시점 업종은 재구성할 수 없고 수집 결과가 0건이면 실패로 처리함"
+    },
+    {
       "task_id": "DART_FACT_PER_IDENTITY_ISOLATION",
       "date": "2026-09-23",
       "adr_id": "ADR_20260923_DART_FACT_PER_IDENTITY_ISOLATION",

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import polars as pl
@@ -36,6 +36,49 @@ def _write_receipt(
         kind=EvidenceKind.INDUSTRY,
         retrieved_at=collected_at,
         source_label=f"KIS:inquire-price:{symbol}:{collected_at.date().isoformat()}",
+    )
+
+
+def _write_stock_receipt(
+    bronze_root: Path,
+    symbol: str,
+    collected_at: datetime,
+    ksic_code: str = "032604",
+    ksic_name: str = "통신 및 방송 장비 제조업",
+    delisted_on: str = "",
+) -> None:
+    from src.data.bronze import BronzeStore
+    from src.data.schemas import EvidenceKind
+
+    payload = {
+        "provider": "KIS",
+        "endpoint": "search-stock-info",
+        "symbol": symbol,
+        "collected_at": collected_at.isoformat(),
+        "output": {
+            "std_idst_clsf_cd": ksic_code,
+            "std_idst_clsf_cd_name": ksic_name,
+            "lstg_abol_dt": delisted_on.replace("-", "") if delisted_on else "",
+        },
+        "records": [{"ticker": symbol, "ksic_code": ksic_code, "ksic_name": ksic_name, "delisted_on": delisted_on}],
+    }
+    BronzeStore(bronze_root).import_bytes(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8"),
+        kind=EvidenceKind.INDUSTRY,
+        retrieved_at=collected_at,
+        source_label=f"KIS:search-stock-info:{symbol}:{collected_at.date().isoformat()}",
+    )
+
+
+def _write_raw_payload(bronze_root: Path, payload: dict, source_label: str = "KIS:test:raw") -> None:
+    from src.data.bronze import BronzeStore
+    from src.data.schemas import EvidenceKind
+
+    BronzeStore(bronze_root).import_bytes(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8"),
+        kind=EvidenceKind.INDUSTRY,
+        retrieved_at=T1,
+        source_label=source_label,
     )
 
 
@@ -231,3 +274,269 @@ def test_materialize_distinguishes_close_collections(tmp_path: Path) -> None:
     result = _materialize(bronze, silver)
 
     assert _output_frame(result.dataset_path)["industry_name"].to_list() == ["반도체"]
+
+
+def test_quote_only_evidence_yields_observed_rows(tmp_path: Path) -> None:
+    from src.data.industry_silver import POLICY_VERSION
+
+    bronze, silver = tmp_path / "bronze", tmp_path / "silver"
+    _write_receipt(bronze, "005930", T1, industry="전기·전자", market="KOSPI")
+    _write_receipt(bronze, "000660", T2, industry="반도체", market="KOSPI")
+
+    result = _materialize(bronze, silver)
+
+    assert result.rows == 2
+    assert (result.observed_rows, result.inferred_rows, result.unmapped_rows) == (2, 0, 0)
+    frame = _output_frame(result.dataset_path).sort("ticker")
+    assert frame["industry_basis"].to_list() == ["observed_quote", "observed_quote"]
+    assert frame["industry_name"].to_list() == ["반도체", "전기·전자"]
+    assert frame["market_name"].to_list() == ["KOSPI", "KOSPI"]
+    assert frame["ksic_code"].to_list() == [None, None]
+    assert frame["ksic_name"].to_list() == [None, None]
+    assert frame["ksic_support"].to_list() == [None, None]
+    assert frame["ksic_source_hash"].to_list() == [None, None]
+    assert frame["policy_version"].to_list() == [POLICY_VERSION, POLICY_VERSION]
+    assert POLICY_VERSION == "kis-industry-classification-v2"
+
+
+def test_output_schema_matches_v2_contract(tmp_path: Path) -> None:
+    bronze, silver = tmp_path / "bronze", tmp_path / "silver"
+    _write_receipt(bronze, "005930", T1)
+    _write_stock_receipt(bronze, "005930", T1)
+
+    result = _materialize(bronze, silver)
+
+    frame = _output_frame(result.dataset_path)
+    assert frame.columns == [
+        "ticker", "instrument_id", "industry_name", "industry_basis", "market_name",
+        "ksic_code", "ksic_name", "ksic_support", "delisted_on", "available_at",
+        "source_hash", "ksic_source_hash", "policy_version",
+    ]
+    assert result.rows == 1
+
+
+def test_observed_value_wins_and_disagreement_is_counted(tmp_path: Path) -> None:
+    bronze, silver = tmp_path / "bronze", tmp_path / "silver"
+    _write_receipt(bronze, "005930", T1, industry="화학")
+    _write_stock_receipt(bronze, "005930", T1, ksic_code="032604")
+    _write_receipt(bronze, "000660", T1, industry="화학")
+    _write_stock_receipt(bronze, "000660", T1, ksic_code="032604")
+    _write_receipt(bronze, "035420", T1, industry="제약")
+    _write_stock_receipt(bronze, "035420", T1, ksic_code="032604")
+
+    result = _materialize(bronze, silver)
+
+    assert result.observed_rows == 3
+    assert result.mapping_disagreements == 1
+    frame = _output_frame(result.dataset_path).sort("ticker")
+    assert frame.filter(pl.col("ticker") == "035420")["industry_name"].to_list() == ["제약"]
+    assert frame.filter(pl.col("ticker") == "035420")["industry_basis"].to_list() == ["observed_quote"]
+    manifest = json.loads((result.dataset_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["conflicting_ksic"] == ["032604"]
+
+
+def test_delisted_ticker_with_only_ksic_is_inferred(tmp_path: Path) -> None:
+    bronze, silver = tmp_path / "bronze", tmp_path / "silver"
+    _write_receipt(bronze, "005930", T1, industry="전기·전자")
+    _write_stock_receipt(bronze, "005930", T1, ksic_code="032604")
+    _write_receipt(bronze, "000660", T1, industry="전기·전자")
+    _write_stock_receipt(bronze, "000660", T1, ksic_code="032604")
+    _write_stock_receipt(bronze, "000001", T2, ksic_code="032604", delisted_on="2026-01-27")
+
+    result = _materialize(bronze, silver)
+
+    assert (result.observed_rows, result.inferred_rows, result.unmapped_rows) == (2, 1, 0)
+    frame = _output_frame(result.dataset_path).sort("ticker")
+    inferred = frame.filter(pl.col("ticker") == "000001")
+    assert inferred["industry_basis"].to_list() == ["ksic_inferred"]
+    assert inferred["industry_name"].to_list() == ["전기·전자"]
+    assert inferred["ksic_support"].to_list() == [2]
+    assert inferred["market_name"].to_list() == [None]
+    assert inferred["ksic_code"].to_list() == ["032604"]
+    assert inferred["delisted_on"].to_list() == [date(2026, 1, 27)]
+
+
+def test_unmapped_code_stays_null_with_ksic_populated(tmp_path: Path) -> None:
+    bronze, silver = tmp_path / "bronze", tmp_path / "silver"
+    _write_receipt(bronze, "005930", T1, industry="전기·전자")
+    _write_stock_receipt(bronze, "005930", T1, ksic_code="032604")
+    _write_stock_receipt(bronze, "000001", T1, ksic_code="011101", ksic_name="작물 재배업")
+
+    result = _materialize(bronze, silver)
+
+    assert (result.observed_rows, result.inferred_rows, result.unmapped_rows) == (1, 0, 1)
+    frame = _output_frame(result.dataset_path).sort("ticker")
+    unmapped = frame.filter(pl.col("ticker") == "000001")
+    assert unmapped["industry_basis"].to_list() == ["unmapped"]
+    assert unmapped["industry_name"].to_list() == [None]
+    assert unmapped["ksic_code"].to_list() == ["011101"]
+    assert unmapped["ksic_name"].to_list() == ["작물 재배업"]
+
+
+def test_conflicting_code_leaves_ksic_only_ticker_unmapped(tmp_path: Path) -> None:
+    bronze, silver = tmp_path / "bronze", tmp_path / "silver"
+    _write_receipt(bronze, "005930", T1, industry="전기·전자")
+    _write_stock_receipt(bronze, "005930", T1, ksic_code="032604")
+    _write_receipt(bronze, "000660", T1, industry="화학")
+    _write_stock_receipt(bronze, "000660", T1, ksic_code="032604")
+    _write_stock_receipt(bronze, "000001", T1, ksic_code="032604")
+
+    result = _materialize(bronze, silver)
+
+    frame = _output_frame(result.dataset_path).sort("ticker")
+    assert frame.filter(pl.col("ticker") == "000001")["industry_basis"].to_list() == ["unmapped"]
+    assert result.mapping_disagreements == 2
+    manifest = json.loads((result.dataset_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["conflicting_ksic"] == ["032604"]
+
+
+def test_mapping_uses_only_observed_pairs(tmp_path: Path) -> None:
+    bronze, silver = tmp_path / "bronze", tmp_path / "silver"
+    _write_receipt(bronze, "005930", T1, industry="전기·전자")
+    _write_stock_receipt(bronze, "005930", T1, ksic_code="032604")
+    _write_stock_receipt(bronze, "000660", T1, ksic_code="032604")
+    _write_stock_receipt(bronze, "000001", T1, ksic_code="011101")
+
+    result = _materialize(bronze, silver)
+
+    frame = _output_frame(result.dataset_path).sort("ticker")
+    assert frame.filter(pl.col("ticker") == "000660")["ksic_support"].to_list() == [1]
+    assert frame.filter(pl.col("ticker") == "000001")["industry_basis"].to_list() == ["unmapped"]
+
+
+def test_available_at_is_max_of_contributing_receipts(tmp_path: Path) -> None:
+    bronze, silver = tmp_path / "bronze", tmp_path / "silver"
+    _write_receipt(bronze, "005930", T1, industry="전기·전자")
+    _write_stock_receipt(bronze, "005930", T2, ksic_code="032604")
+
+    result = _materialize(bronze, silver)
+
+    assert _output_frame(result.dataset_path)["available_at"].to_list() == [T2]
+
+
+def test_latest_stock_receipt_per_ticker_wins(tmp_path: Path) -> None:
+    bronze, silver = tmp_path / "bronze", tmp_path / "silver"
+    _write_receipt(bronze, "005930", T1, industry="전기·전자")
+    _write_stock_receipt(bronze, "005930", T1, ksic_code="032604")
+    _write_stock_receipt(bronze, "000001", T1, ksic_code="011101")
+    _write_stock_receipt(bronze, "000001", T2, ksic_code="032604")
+
+    result = _materialize(bronze, silver)
+
+    frame = _output_frame(result.dataset_path).sort("ticker")
+    inferred = frame.filter(pl.col("ticker") == "000001")
+    assert inferred["ksic_code"].to_list() == ["032604"]
+    assert inferred["industry_basis"].to_list() == ["ksic_inferred"]
+    assert inferred["ksic_source_hash"].to_list() == inferred["source_hash"].to_list()
+
+
+def test_unknown_endpoint_fails_closed_without_dataset(tmp_path: Path) -> None:
+    from src.data.schemas import PITDataError
+
+    bronze, silver = tmp_path / "bronze", tmp_path / "silver"
+    _write_receipt(bronze, "005930", T1)
+    _write_raw_payload(bronze, {
+        "provider": "KIS",
+        "endpoint": "other",
+        "symbol": "000660",
+        "collected_at": T1.isoformat(),
+        "output": {},
+        "records": [{"ticker": "000660"}],
+    })
+
+    with pytest.raises(PITDataError, match="endpoint"):
+        _materialize(bronze, silver)
+
+    assert not silver.exists() or not list(silver.iterdir())
+
+
+def test_malformed_stock_info_payload_fails_closed(tmp_path: Path) -> None:
+    from src.data.schemas import PITDataError
+
+    bronze, silver = tmp_path / "bronze", tmp_path / "silver"
+    _write_raw_payload(bronze, {
+        "provider": "KIS",
+        "endpoint": "search-stock-info",
+        "symbol": "000001",
+        "collected_at": T1.isoformat(),
+        "output": {"std_idst_clsf_cd": "32604"},
+        "records": [{"ticker": "000001", "ksic_code": "32604", "ksic_name": "", "delisted_on": ""}],
+    })
+
+    with pytest.raises(PITDataError):
+        _materialize(bronze, silver)
+
+
+def test_malformed_delisted_on_fails_closed(tmp_path: Path) -> None:
+    from src.data.schemas import PITDataError
+
+    bronze, silver = tmp_path / "bronze", tmp_path / "silver"
+    _write_raw_payload(bronze, {
+        "provider": "KIS",
+        "endpoint": "search-stock-info",
+        "symbol": "000001",
+        "collected_at": T1.isoformat(),
+        "output": {"std_idst_clsf_cd": "032604"},
+        "records": [{"ticker": "000001", "ksic_code": "032604", "ksic_name": "", "delisted_on": "27-01-2026"}],
+    })
+
+    with pytest.raises(PITDataError):
+        _materialize(bronze, silver)
+
+
+def test_counts_reconcile_and_manifest_records_them(tmp_path: Path) -> None:
+    bronze, silver = tmp_path / "bronze", tmp_path / "silver"
+    _write_receipt(bronze, "005930", T1, industry="전기·전자")
+    _write_stock_receipt(bronze, "005930", T1, ksic_code="032604")
+    _write_receipt(bronze, "000660", T1, industry="전기·전자")
+    _write_stock_receipt(bronze, "000660", T1, ksic_code="032604")
+    _write_stock_receipt(bronze, "000001", T1, ksic_code="032604")
+    _write_stock_receipt(bronze, "000002", T1, ksic_code="011101")
+
+    result = _materialize(bronze, silver)
+
+    assert result.rows == result.observed_rows + result.inferred_rows + result.unmapped_rows
+    assert (result.observed_rows, result.inferred_rows, result.unmapped_rows) == (2, 1, 1)
+    manifest = json.loads((result.dataset_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["observed_rows"] == 2
+    assert manifest["inferred_rows"] == 1
+    assert manifest["unmapped_rows"] == 1
+    assert manifest["mapping_disagreements"] == 0
+    assert manifest["conflicting_ksic"] == []
+
+
+def test_rebuild_is_deterministic_regardless_of_receipt_order(tmp_path: Path) -> None:
+    bronze_a, bronze_b = tmp_path / "bronze-a", tmp_path / "bronze-b"
+    _write_receipt(bronze_a, "005930", T1)
+    _write_stock_receipt(bronze_a, "005930", T2, ksic_code="032604")
+    _write_stock_receipt(bronze_b, "005930", T2, ksic_code="032604")
+    _write_receipt(bronze_b, "005930", T1)
+
+    first = _materialize(bronze_a, tmp_path / "silver-a")
+    second = _materialize(bronze_b, tmp_path / "silver-b")
+
+    assert second.dataset_id == first.dataset_id
+    repeat = _materialize(bronze_a, tmp_path / "silver-a")
+    assert repeat.dataset_id == first.dataset_id
+    assert repeat.dataset_path == first.dataset_path
+
+
+def test_symbol_filter_restricts_both_streams_and_mapping(tmp_path: Path) -> None:
+    bronze, silver = tmp_path / "bronze", tmp_path / "silver"
+    _write_receipt(bronze, "005930", T1, industry="전기·전자")
+    _write_stock_receipt(bronze, "005930", T1, ksic_code="032604")
+    _write_receipt(bronze, "000660", T1, industry="화학")
+    _write_stock_receipt(bronze, "000660", T1, ksic_code="011101")
+    _write_stock_receipt(bronze, "000001", T1, ksic_code="011101")
+
+    filtered = _materialize(bronze, silver, symbols=frozenset({"005930", "000001"}))
+
+    assert filtered.rows == 2
+    frame = _output_frame(filtered.dataset_path).sort("ticker")
+    assert frame["ticker"].to_list() == ["000001", "005930"]
+    assert frame.filter(pl.col("ticker") == "000001")["industry_basis"].to_list() == ["unmapped"]
+
+    unfiltered = _materialize(bronze, tmp_path / "silver-all")
+
+    assert unfiltered.rows == 3
+    assert unfiltered.dataset_id != filtered.dataset_id

@@ -16,7 +16,12 @@ SCOPE_CONFIG = Path("config/research/kr_swing_2019_v1.toml")
 
 def _runtime(tmp_path: Path, *, scope_file: str | None = None, flow_enabled: bool = False):
     if scope_file is None:
-        return load_data_runtime(scope_config=SCOPE_CONFIG, data_root=tmp_path / "data")
+        # 정본 스코프의 플래그 값과 무관하게 비활성 소스 기록 의미론을 검증한다.
+        disabled = tmp_path / "canonical_flags_off.toml"
+        text = SCOPE_CONFIG.read_text(encoding="utf-8")
+        text = text.replace("investor_flow_enabled = true", "investor_flow_enabled = false").replace("industry_enabled = true", "industry_enabled = false")
+        disabled.write_text(text, encoding="utf-8")
+        return load_data_runtime(scope_config=disabled, data_root=tmp_path / "data")
     config_path = tmp_path / scope_file
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(

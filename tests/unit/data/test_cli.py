@@ -2552,7 +2552,7 @@ def test_collect_industry_classification_from_symbols_file(tmp_path, monkeypatch
         "--pace-seconds", "0",
     ]) == 0
     emitted = json.loads(capsys.readouterr().out)
-    assert emitted == {"symbols_requested": 2, "pages_collected": 2}
+    assert emitted == {"symbols_requested": 2, "pages_collected": 2, "skipped_count": 0, "skipped": {}}
     assert _StubIndustryCollector.calls == [("005930",), ("000660",)]
 
 
@@ -2583,7 +2583,7 @@ def test_collect_industry_classification_defaults_to_universe(tmp_path, monkeypa
         "--pace-seconds", "0",
     ]) == 0
     emitted = json.loads(capsys.readouterr().out)
-    assert emitted == {"symbols_requested": 2, "pages_collected": 2}
+    assert emitted == {"symbols_requested": 2, "pages_collected": 2, "skipped_count": 0, "skipped": {}}
     assert _StubIndustryCollector.calls == [("000660",), ("005930",)]
 
 
@@ -2688,3 +2688,215 @@ def test_build_industry_classification_silver_command_emits_dataset(tmp_path, ca
     emitted = json.loads(capsys.readouterr().out)
     assert emitted["dataset_id"].startswith("industry_")
     assert emitted["rows"] == 1
+
+
+class _FailingIndustryCollector:
+    calls: ClassVar[list] = []
+    failing: ClassVar[str] = "000660"
+
+    def __init__(self, symbols, client=None) -> None:
+        self.symbols = tuple(symbols)
+
+    def fetch_industry_classification(self, *, bronze_root, retrieved_at=None):
+        from src.data.schemas import PITDataError
+
+        type(self).calls.append(self.symbols)
+        symbol = self.symbols[0]
+        if symbol == type(self).failing:
+            raise PITDataError(f"KIS industry classification missing bstp_kor_isnm for {symbol}")
+        return [{"provider": "KIS", "symbol": symbol}]
+
+
+class _FailingStockCollector:
+    calls: ClassVar[list] = []
+    failing: ClassVar[str] = "000660"
+
+    def __init__(self, symbols, client=None) -> None:
+        self.symbols = tuple(symbols)
+
+    def fetch_stock_classification(self, *, bronze_root, retrieved_at=None):
+        from src.data.schemas import PITDataError
+
+        type(self).calls.append(self.symbols)
+        symbol = self.symbols[0]
+        if symbol == type(self).failing:
+            raise PITDataError(f"KIS stock classification missing valid std_idst_clsf_cd for {symbol}")
+        return [{"provider": "KIS", "symbol": symbol}]
+
+
+def _run_classification_command(tmp_path, monkeypatch, capsys, command, stub_attr, stub_cls):
+    import json
+
+    from src.data.cli import main
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    symbols_file = tmp_path / "symbols.txt"
+    symbols_file.write_text("005930\n000660\n035420\n", encoding="utf-8")
+    stub_cls.calls = []
+    monkeypatch.setattr(stub_attr, stub_cls)
+    code = main([
+        command,
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+        "--symbols-from", str(symbols_file),
+        "--pace-seconds", "0",
+    ])
+    return code, json.loads(capsys.readouterr().out)
+
+
+def test_collect_industry_classification_isolates_failing_ticker(tmp_path, monkeypatch, capsys) -> None:
+    """Isolation: one unclassifiable ticker must not discard the rest of the run."""
+    code, emitted = _run_classification_command(
+        tmp_path, monkeypatch, capsys,
+        "collect-industry-classification",
+        "src.integrations.kis.industry.KisIndustryCollector",
+        _FailingIndustryCollector,
+    )
+    assert code == 0
+    assert emitted["symbols_requested"] == 3
+    assert emitted["pages_collected"] == 2
+    assert emitted["skipped_count"] == 1
+    assert list(emitted["skipped"]) == ["000660"]
+    assert "000660" in emitted["skipped"]["000660"]
+    assert _FailingIndustryCollector.calls == [("005930",), ("000660",), ("035420",)]
+
+
+def test_collect_stock_classification_isolates_failing_ticker(tmp_path, monkeypatch, capsys) -> None:
+    """Stock classification mirrors the per-ticker isolation."""
+    code, emitted = _run_classification_command(
+        tmp_path, monkeypatch, capsys,
+        "collect-stock-classification",
+        "src.integrations.kis.industry.KisStockClassificationCollector",
+        _FailingStockCollector,
+    )
+    assert code == 0
+    assert emitted["symbols_requested"] == 3
+    assert emitted["pages_collected"] == 2
+    assert emitted["skipped_count"] == 1
+    assert list(emitted["skipped"]) == ["000660"]
+    assert _FailingStockCollector.calls == [("005930",), ("000660",), ("035420",)]
+
+
+def test_collect_classification_with_no_pages_fails_closed(tmp_path, monkeypatch, capsys) -> None:
+    """A run that collected nothing must not look like success."""
+    import json
+
+    from src.data.cli import main
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    for command, stub_attr, stub_cls in (
+        ("collect-industry-classification", "src.integrations.kis.industry.KisIndustryCollector", _FailingIndustryCollector),
+        ("collect-stock-classification", "src.integrations.kis.industry.KisStockClassificationCollector", _FailingStockCollector),
+    ):
+        symbols_file = tmp_path / f"symbols-{command}.txt"
+        symbols_file.write_text("000660\n", encoding="utf-8")
+        stub_cls.calls = []
+        monkeypatch.setattr(stub_attr, stub_cls)
+        assert main([
+            command,
+            "--scope-config", str(scope_config),
+            "--data-root", str(tmp_path / "data"),
+            "--symbols-from", str(symbols_file),
+            "--pace-seconds", "0",
+        ]) == 1
+        assert "error" in json.loads(capsys.readouterr().out)
+
+
+def test_collect_classification_non_pit_exception_propagates(tmp_path, monkeypatch) -> None:
+    """Non-PIT exceptions are not swallowed as skips."""
+    import pytest
+
+    from src.data.cli import main
+
+    class _BoomCollector:
+        def __init__(self, symbols, client=None) -> None:
+            self.symbols = tuple(symbols)
+
+        def fetch_industry_classification(self, *, bronze_root, retrieved_at=None):
+            if self.symbols[0] == "000660":
+                raise RuntimeError("boom")
+            return [{"provider": "KIS", "symbol": self.symbols[0]}]
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    symbols_file = tmp_path / "symbols.txt"
+    symbols_file.write_text("005930\n000660\n", encoding="utf-8")
+    monkeypatch.setattr("src.integrations.kis.industry.KisIndustryCollector", _BoomCollector)
+    with pytest.raises(RuntimeError, match="boom"):
+        main([
+            "collect-industry-classification",
+            "--scope-config", str(scope_config),
+            "--data-root", str(tmp_path / "data"),
+            "--symbols-from", str(symbols_file),
+            "--pace-seconds", "0",
+        ])
+
+
+def test_collect_stock_classification_defaults_to_universe(tmp_path, monkeypatch, capsys) -> None:
+    """Stock classification defaults to the ordinary-universe tickers."""
+    import json
+
+    from src.data.cli import main
+    from src.data.runtime import load_data_runtime
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+    _write_cli_universe_dataset(
+        runtime.workspace.silver_root,
+        [
+            {"ticker": "005930", "eligible": True},
+            {"ticker": "000001", "eligible": False},
+            {"ticker": "000660", "eligible": True},
+        ],
+    )
+    _StubIndustryCollector.calls = []
+
+    class _StubStockCollector:
+        calls: ClassVar[list] = []
+
+        def __init__(self, symbols, client=None) -> None:
+            self.symbols = tuple(symbols)
+
+        def fetch_stock_classification(self, *, bronze_root, retrieved_at=None):
+            type(self).calls.append(self.symbols)
+            return [{"provider": "KIS", "symbol": symbol} for symbol in self.symbols]
+
+    monkeypatch.setattr(
+        "src.integrations.kis.industry.KisStockClassificationCollector", _StubStockCollector
+    )
+    assert main([
+        "collect-stock-classification",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+        "--pace-seconds", "0",
+    ]) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["symbols_requested"] == 2
+    assert emitted["pages_collected"] == 2
+    assert _StubStockCollector.calls == [("000660",), ("005930",)]
+
+
+def test_collect_classification_logs_progress_every_hundred_symbols(tmp_path, caplog) -> None:
+    """Progress logging fires on each 100-symbol boundary."""
+    import logging
+
+    from src.data.cli import _collect_classification_with_isolation
+
+    class _StubCollector:
+        def __init__(self, symbols, client=None) -> None:
+            self.symbols = tuple(symbols)
+
+        def fetch_industry_classification(self, *, bronze_root, retrieved_at=None):
+            return [{"provider": "KIS", "symbol": self.symbols[0]}]
+
+    symbols = tuple(f"{index:06d}" for index in range(100))
+    with caplog.at_level(logging.INFO, logger="src.data.cli"):
+        result = _collect_classification_with_isolation(
+            stage="collect-industry-classification",
+            collector_cls=_StubCollector,
+            fetch_attr="fetch_industry_classification",
+            bronze_root=tmp_path / "bronze",
+            symbols=symbols,
+            pace_seconds=0,
+        )
+    assert result["pages_collected"] == 100
+    assert any("stage=collect-industry-classification" in message for message in caplog.messages)

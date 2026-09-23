@@ -397,5 +397,8 @@
   },
   "src/integrations/kis/industry.py": {
     "testing": "tests/unit/integrations/kis/test_industry.py"
+  },
+  "src/data/industry_silver.py": {
+    "testing": "tests/unit/data/test_industry_silver.py"
   }
 }

@@ -143,10 +143,10 @@ def test_preferred_share_excluded_within_extended_window() -> None:
     assert reason == "non_ordinary_share"
 
 
-def test_disabled_features_remain_disabled() -> None:
+def test_canonical_scope_enables_flow_and_industry() -> None:
     scope = _load_canonical()
-    assert scope.features.investor_flow_enabled is False
-    assert scope.features.industry_enabled is False
+    assert scope.features.investor_flow_enabled is True
+    assert scope.features.industry_enabled is True
 
 
 def test_budget_headroom_is_validated() -> None:
