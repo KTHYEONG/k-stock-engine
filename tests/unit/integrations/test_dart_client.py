@@ -294,3 +294,28 @@ def test_dart_client_passes_disclosure_detail_type() -> None:
     )
 
     assert seen["pblntf_detail_ty"] == "A001"
+
+
+def test_request_validated_raises_distinguishable_quota_exhausted_type() -> None:
+    import pytest
+
+    from src.integrations.dart.client import DartApiClient, DartApiError, DartQuotaExhaustedError
+
+    rate_limit_calls: list[dict[str, object]] = []
+
+    class _QuotaStore:
+        def record_rate_limit(self, **kwargs: object) -> None:
+            rate_limit_calls.append(dict(kwargs))
+
+    client = DartApiClient(
+        api_key="key",
+        raw_request_json=lambda _endpoint, _params: {"status": "020", "message": "quota exceeded"},
+        quota_store=_QuotaStore(),  # type: ignore[arg-type]
+    )
+
+    # When/Then: distinguishable type that remains a DartApiError, with quota recorded once.
+    with pytest.raises(DartQuotaExhaustedError, match="020") as exc_info:
+        client._request_validated("list.json", {"bgn_de": "20240101", "end_de": "20240101"})
+    assert isinstance(exc_info.value, DartApiError)
+    assert len(rate_limit_calls) == 1
+    assert rate_limit_calls[0]["provider"] == "OpenDART"

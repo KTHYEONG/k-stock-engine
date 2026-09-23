@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "DART_FACT_PER_IDENTITY_ISOLATION",
+      "date": "2026-09-23",
+      "adr_id": "ADR_20260923_DART_FACT_PER_IDENTITY_ISOLATION",
+      "domain": "data",
+      "title": "DART 재무제표 개별 식별자 실패 격리",
+      "why": "2016-2018 재무 백필 실행 중 식별자 하나의 비표준 상태코드로 전체 배치가 즉시 실패해 10,333건 요청·오늘치 DART 쿼터 전량 소모 후 실제 저장은 0건이었음",
+      "resolution": "DartQuotaExhaustedError(020) 신설로 조기중단(blocked)·800/900 재시도(최대2회)·기타 오류는 unavailable로 격리하도록 xbrl.py/client.py/collection.py 수정, LS 수급 셀 격리와 동일 철학 적용",
+      "impact": "향후 DART 재무 백필·정기수집에서 개별 식별자 실패가 이미 수집한 나머지 배치를 날리지 않고, 쿼터 소진 시에도 그때까지의 성과는 보존됨",
+      "caveat": "재시도는 800/900 상태코드에만 적용되며 020(쿼터소진)은 재시도 없이 즉시 blocked 처리해 나머지 배치를 조기 중단함"
+    },
+    {
       "task_id": "P2_3_KIS_INDUSTRY_CLASSIFICATION",
       "date": "2026-09-23",
       "adr_id": "ADR_20260923_P2_3_KIS_INDUSTRY_CLASSIFICATION",
