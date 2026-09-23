@@ -11,22 +11,22 @@ Post-development protocol for task finalization, compact decision recording, and
 
 1. **Auto-Inference & Task Sync**:
    - Do NOT ask the user to provide command arguments.
-   - Automatically extract `title`, `why`, `what`, `impact`, and `caveat` from the active spec (`docs/specs/*_spec.md`) or recent audit context.
+   - Automatically extract `title`, `why`, `what`, `impact`, `caveat`, `source`, and `test` from the active spec (`docs/specs/*_spec.md`) or recent audit context.
    - Run task sync:
      ```bash
-     uv run python tools/agent_skills/sync_task.py --task TASK_ID --title "<Title>" --why "<Why>" --what "<What>" --impact "<Impact>" --caveat "<Caveat>" --domain <domain>
+     uv run python tools/agent_skills/sync_task.py --task TASK_ID --title "<Title>" --why "<Why>" --what "<What>" --impact "<Impact>" --caveat "<Caveat>" --domain <domain> --source <source_file> --test <test_file>
      ```
    - Automatically updates single ledger: `docs/decisions/task_index.json` and `docs/code_map.json`.
    - Keep each field strictly to 1 concise sentence to preserve token efficiency for future sessions.
 
-2. **Complete Artifact Cleanup**:
-   - `sync_task.py` completely purges all temporary files: `docs/specs/*_spec.md`, `scratch/` probe files, `tmp/` test roots, and logs.
-   - Zero archive files are left behind, ensuring 100% clean Git history and zero file sprawl.
+2. **Targeted Artifact Cleanup**:
+   - `sync_task.py` purges ONLY the completed task's matching temporary spec (`docs/specs/*<TASK_ID>*_spec.md`), task-associated `scratch/` probe files, and task-associated `tmp/` test roots, while strictly preserving all other specs, scratch files, and persistent logs.
+   - Updates decision records ready for the downstream commit phase without leaving temporary task clutter.
 
 ## Output
 
-Keep chat output ultra-compact (1-2 lines). The user only needs confirmation that the record was committed and workspace is clean:
+Keep chat output ultra-compact (1-2 lines). Retain English keys/badges while confirming status:
 
 ### 🧹 [SYNC] <Task Title>
-- **기록 완료**: `task_index.json` (<ADR_ID>)
-- **정리 완료**: 임시 스펙 및 `scratch/`, `tmp/` 완전 소각
+- **Registry Updated**: `task_index.json` (<ADR_ID>) / `code_map.json`
+- **Cleanup Completed**: 태스크 임시 스펙 및 scratch 산출물 정리 완료 (커밋 대기)
