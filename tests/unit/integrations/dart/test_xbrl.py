@@ -147,10 +147,7 @@ def test_fetch_financial_fact_sources_preserves_input_order_under_concurrency() 
     assert values == [0.0, 1.0, 2.0, 3.0, 4.0]
 
 
-def test_fetch_financial_fact_sources_raises_on_first_failing_identity_in_order() -> None:
-    import pytest
-
-    from src.core.pit import PITDataError
+def test_fetch_financial_fact_sources_isolates_failing_identity_without_raising() -> None:
     from src.integrations.dart.xbrl import DartXbrlCollector
 
     # Given: identity 2 (0-indexed) returns an unrecognized status.
@@ -170,9 +167,13 @@ def test_fetch_financial_fact_sources_raises_on_first_failing_identity_in_order(
         api_key="k", request_json=failing_at_index_2, request_bytes=empty_bytes, max_workers=5
     )
 
-    # When/Then
-    with pytest.raises(PITDataError, match="F2"):
-        list(collector.fetch_financial_fact_sources(identities))
+    # When: per-identity failures isolate instead of aborting the batch.
+    pages = list(collector.fetch_financial_fact_sources(identities))
+
+    # Then
+    assert len(pages) == 5
+    assert pages[2]["source_kind"] == "unavailable"
+    assert any(str(entry).startswith("dart_error:") for entry in pages[2]["diagnostics"])
 
 
 def test_fetch_financial_fact_sources_runs_identities_concurrently() -> None:
@@ -266,3 +267,269 @@ def test_dart_xbrl_collector_forwards_quota_store_and_pacing_to_api_client(monke
     assert captured["min_interval"] == 2.0
     assert captured["daily_request_limit"] == 16000
     assert collector._client is not None
+
+
+def _fact_identity(corp_code: str, filing_id: str) -> dict[str, str]:
+    return {
+        "corp_code": corp_code,
+        "filing_id": filing_id,
+        "rcept_no": filing_id,
+        "biz_year": "2020",
+        "reprt_code": "11011",
+        "fs_div": "CFS",
+        "published_at": "",
+        "ticker": "",
+    }
+
+
+def _fact_success_payload(corp_code: str) -> dict[str, object]:
+    return {
+        "status": "000",
+        "list": [
+            {
+                "rcept_no": "R",
+                "bsns_year": "2020",
+                "corp_code": corp_code,
+                "reprt_code": "11011",
+                "account_id": "ifrs-full_Revenue",
+                "account_nm": "매출액",
+                "fs_div": "CFS",
+                "thstrm_amount": "100",
+            }
+        ],
+    }
+
+
+def test_fetch_one_financial_fact_source_retries_retryable_status_to_recovery(monkeypatch) -> None:
+    import src.integrations.dart.xbrl as xbrl_module
+    from src.integrations.dart.client import DartRetryableError
+
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    calls: list[str] = []
+
+    class _FlakyClient:
+        def _request_validated(self, _endpoint: str, params: dict[str, str]) -> dict[str, object]:
+            calls.append(params["fs_div"])
+            if len(calls) == 1:
+                raise DartRetryableError("DART status 900: transient")
+            return _fact_success_payload(params["corp_code"])
+
+    collector = xbrl_module.DartXbrlCollector(client=_FlakyClient(), api_key="k")
+
+    # When
+    page = collector._fetch_one_financial_fact_source(_fact_identity("00000001", "F0"))
+
+    # Then: recovered within the retry budget on the same fs_div.
+    assert page["source_kind"] == "opendart_standard"
+    assert calls == ["CFS", "CFS"]
+
+
+def test_fetch_one_financial_fact_source_isolates_exhausted_retryable_status(monkeypatch) -> None:
+    import src.integrations.dart.xbrl as xbrl_module
+    from src.integrations.dart.client import DartRetryableError
+
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    calls: list[str] = []
+
+    class _AlwaysRetryableClient:
+        def _request_validated(self, _endpoint: str, params: dict[str, str]) -> dict[str, object]:
+            calls.append(params["fs_div"])
+            raise DartRetryableError("DART status 900: transient")
+
+    collector = xbrl_module.DartXbrlCollector(client=_AlwaysRetryableClient(), api_key="k")
+
+    # When
+    page = collector._fetch_one_financial_fact_source(_fact_identity("00000001", "F0"))
+
+    # Then: exhausted budget isolates as unavailable, never raises, never blocked.
+    assert page["source_kind"] == "unavailable"
+    assert page["source_kind"] != "blocked"
+    assert any(str(entry).startswith("dart_error:") for entry in page["diagnostics"])
+    assert calls == ["CFS", "CFS", "CFS"]
+
+
+def test_fetch_one_financial_fact_source_isolates_quota_exhaustion_as_blocked() -> None:
+    import src.integrations.dart.xbrl as xbrl_module
+    from src.integrations.dart.client import DartQuotaExhaustedError
+
+    archive_calls: list[str] = []
+
+    class _QuotaBlockedClient:
+        def _request_validated(self, _endpoint: str, _params: dict[str, str]) -> dict[str, object]:
+            raise DartQuotaExhaustedError("DART status 020: quota exceeded")
+
+        def fetch_document_archive(self, rcept_no: str) -> bytes:
+            archive_calls.append(rcept_no)
+            raise AssertionError("document archive must not be fetched after quota exhaustion")
+
+    collector = xbrl_module.DartXbrlCollector(client=_QuotaBlockedClient(), api_key="k")
+
+    # When
+    page = collector._fetch_one_financial_fact_source(_fact_identity("00000001", "F0"))
+
+    # Then: blocked record without exhausting the fallback chain.
+    assert page["source_kind"] == "blocked"
+    assert "dart_quota_exhausted" in page["diagnostics"]
+    assert archive_calls == []
+
+
+def test_fetch_one_financial_fact_source_isolates_unexpected_terminal_status() -> None:
+    import src.integrations.dart.xbrl as xbrl_module
+    from src.integrations.dart.client import DartTerminalError
+
+    class _TerminalClient:
+        def _request_validated(self, _endpoint: str, _params: dict[str, str]) -> dict[str, object]:
+            raise DartTerminalError("DART status 101: unknown status")
+
+    collector = xbrl_module.DartXbrlCollector(client=_TerminalClient(), api_key="k")
+
+    # When
+    page = collector._fetch_one_financial_fact_source(_fact_identity("00000001", "F0"))
+
+    # Then: original error text is preserved in diagnostics, nothing raised.
+    assert page["source_kind"] == "unavailable"
+    assert any("101" in str(entry) for entry in page["diagnostics"])
+
+
+def test_fetch_financial_fact_sources_stops_early_on_first_blocked_identity() -> None:
+    import src.integrations.dart.xbrl as xbrl_module
+    from src.integrations.dart.client import DartQuotaExhaustedError
+
+    requested: list[str] = []
+
+    class _BatchClient:
+        def _request_validated(self, _endpoint: str, params: dict[str, str]) -> dict[str, object]:
+            requested.append(params["corp_code"])
+            if params["corp_code"] == "00000003":
+                raise DartQuotaExhaustedError("DART status 020: quota exceeded")
+            return _fact_success_payload(params["corp_code"])
+
+    collector = xbrl_module.DartXbrlCollector(client=_BatchClient(), api_key="k", max_workers=1)
+    identities = tuple(
+        _fact_identity(f"{i:08d}", f"F{i}") for i in range(1, 5)
+    )
+
+    # When
+    pages = list(collector.fetch_financial_fact_sources(identities))
+
+    # Then: two successes plus the blocked record; the 4th identity never requested.
+    assert len(pages) == 3
+    assert [page["source_kind"] for page in pages] == ["opendart_standard", "opendart_standard", "blocked"]
+    assert requested == ["00000001", "00000002", "00000003"]
+
+
+def test_fetch_financial_fact_sources_completes_when_no_identity_blocked() -> None:
+    import src.integrations.dart.xbrl as xbrl_module
+
+    class _OkClient:
+        def _request_validated(self, _endpoint: str, params: dict[str, str]) -> dict[str, object]:
+            return _fact_success_payload(params["corp_code"])
+
+    collector = xbrl_module.DartXbrlCollector(client=_OkClient(), api_key="k", max_workers=1)
+    identities = tuple(_fact_identity(f"{i:08d}", f"F{i}") for i in range(1, 4))
+
+    # When
+    pages = list(collector.fetch_financial_fact_sources(identities))
+
+    # Then
+    assert len(pages) == 3
+    assert all(page["source_kind"] == "opendart_standard" for page in pages)
+
+
+def test_fetch_one_financial_fact_source_isolates_terminal_error_without_status_code() -> None:
+    import src.integrations.dart.xbrl as xbrl_module
+    from src.integrations.dart.client import DartTerminalError
+
+    class _NoStatusClient:
+        def _request_validated(self, _endpoint: str, _params: dict[str, str]) -> dict[str, object]:
+            raise DartTerminalError("connection reset by peer")
+
+    collector = xbrl_module.DartXbrlCollector(client=_NoStatusClient(), api_key="k")
+
+    # When
+    page = collector._fetch_one_financial_fact_source(_fact_identity("00000001", "F0"))
+
+    # Then: status falls back, original text preserved.
+    assert page["source_kind"] == "unavailable"
+    assert page["status"] == "013"
+    assert any("connection reset" in str(entry) for entry in page["diagnostics"])
+
+
+def test_fetch_one_financial_fact_source_isolates_generic_transport_error() -> None:
+    import src.integrations.dart.xbrl as xbrl_module
+
+    class _BoomClient:
+        def _request_validated(self, _endpoint: str, _params: dict[str, str]) -> dict[str, object]:
+            raise RuntimeError("boom")
+
+    collector = xbrl_module.DartXbrlCollector(client=_BoomClient(), api_key="k")
+
+    # When
+    page = collector._fetch_one_financial_fact_source(_fact_identity("00000001", "F0"))
+
+    # Then
+    assert page["source_kind"] == "unavailable"
+    assert any(str(entry) == "dart_error:boom" for entry in page["diagnostics"])
+
+
+def test_fetch_one_financial_fact_source_isolates_raw_retryable_status() -> None:
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    def raw_retryable(_endpoint: str, _params: dict[str, str]) -> dict[str, object]:
+        return {"status": "900", "list": []}
+
+    def empty_bytes(_endpoint: str, _params: dict[str, str]) -> bytes:
+        return b""
+
+    collector = DartXbrlCollector(api_key="k", request_json=raw_retryable, request_bytes=empty_bytes)
+
+    # When
+    page = collector._fetch_one_financial_fact_source(_fact_identity("00000001", "F0"))
+
+    # Then
+    assert page["source_kind"] == "unavailable"
+    assert page["status"] == "900"
+    assert any(str(entry).startswith("dart_error:") for entry in page["diagnostics"])
+
+
+def test_fetch_one_financial_fact_source_isolates_raw_quota_status_as_blocked() -> None:
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    archive_calls: list[str] = []
+
+    def raw_blocked(_endpoint: str, _params: dict[str, str]) -> dict[str, object]:
+        return {"status": "020", "message": "quota exceeded"}
+
+    def forbidden_bytes(_endpoint: str, _params: dict[str, str]) -> bytes:
+        archive_calls.append(_endpoint)
+        raise AssertionError("document archive must not be fetched after quota exhaustion")
+
+    collector = DartXbrlCollector(api_key="k", request_json=raw_blocked, request_bytes=forbidden_bytes)
+
+    # When
+    page = collector._fetch_one_financial_fact_source(_fact_identity("00000001", "F0"))
+
+    # Then
+    assert page["source_kind"] == "blocked"
+    assert page["status"] == "020"
+    assert "dart_quota_exhausted" in page["diagnostics"]
+    assert archive_calls == []
+
+
+def test_fetch_one_financial_fact_source_isolates_malformed_response() -> None:
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    def malformed(_endpoint: str, _params: dict[str, str]) -> dict[str, object]:
+        return {}
+
+    def empty_bytes(_endpoint: str, _params: dict[str, str]) -> bytes:
+        return b""
+
+    collector = DartXbrlCollector(api_key="k", request_json=malformed, request_bytes=empty_bytes)
+
+    # When
+    page = collector._fetch_one_financial_fact_source(_fact_identity("00000001", "F0"))
+
+    # Then
+    assert page["source_kind"] == "unavailable"
+    assert any(str(entry).startswith("dart_error:") for entry in page["diagnostics"])

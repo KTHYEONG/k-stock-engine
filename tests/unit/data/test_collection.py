@@ -1559,3 +1559,54 @@ def test_ls_share_field_shapes_rejected_under_unit_contract() -> None:
             norm_provider="ls",
             pages=({"records": [dict(base_record(), foreign_net_value=1.0)]},),
         )
+
+
+def test_collect_dart_financial_facts_persists_blocked_pages_and_counts_them(tmp_path) -> None:
+    import json
+    from datetime import UTC, datetime
+
+    from src.data.collection import collect_dart_financial_facts
+    from src.data.schemas import EvidenceKind
+
+    def _page(source_kind: str, filing_id: str, status: str = "000") -> dict[str, object]:
+        return {
+            "source_kind": source_kind,
+            "status": status,
+            "identity": {"corp_code": "00126380", "biz_year": "2020", "reprt_code": "11011"},
+            "records": [] if source_kind != "opendart_standard" else [{"fact": "sales"}],
+            "filing_id": filing_id,
+            "corp_code": "00126380",
+            "biz_year": "2020",
+            "reprt_code": "11011",
+        }
+
+    pages = (
+        _page("opendart_standard", "F1"),
+        _page("opendart_standard", "F2"),
+        {**_page("blocked", "F3", status="020"), "diagnostics": ("dart_quota_exhausted",)},
+        _page("unavailable", "F4", status="013"),
+    )
+
+    class _FakeDart:
+        def fetch_financial_fact_sources(self, identities: object) -> tuple[dict[str, object], ...]:
+            assert identities
+            return pages
+
+    identities = tuple(
+        {"corp_code": "00126380", "filing_id": f"F{i}", "biz_year": "2020", "reprt_code": "11011"}
+        for i in range(1, 5)
+    )
+    artifact = collect_dart_financial_facts(
+        dart=_FakeDart(),
+        identities=identities,  # type: ignore[arg-type]
+        bronze_root=tmp_path / "bronze",
+        retrieved_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    # Then: never aborts, all 4 pages persisted, blocked counted once.
+    assert artifact.page_receipts is not None
+    assert len(artifact.page_receipts[EvidenceKind.FINANCIAL_FACTS.value]) == 4
+    report = json.loads(artifact.report_path.read_text(encoding="utf-8"))
+    assert report["blocked"] == 1
+    assert report["standardized"] == 2
+    assert report["unavailable"] == 1
