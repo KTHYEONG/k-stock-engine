@@ -49,7 +49,7 @@ Keep chat output ultra-compact and token-efficient. Do NOT execute CLI commands 
 Output only the minimal card below:
 
 ### 📐 [SPEC] <기능명>
-> 📄 **청사진**: [`docs/specs/<feature>_spec.md`](file:///docs/specs/<feature>_spec.md)
+> 📄 **청사진**: [`docs/specs/<feature>_spec.md`](docs/specs/<feature>_spec.md)
 
 - 🎯 **작업 요약**: <구현할 핵심 기능 1줄 요약> (<N>개 파일 대상 · <N>개 시나리오)
 

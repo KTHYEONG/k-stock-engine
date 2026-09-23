@@ -41,13 +41,13 @@ Independent audit gate completing the development loop (`probe` -> `spec` -> `im
 
 ## Output
 
-Keep chat output ultra-compact and token-efficient.
-**Strictly Prohibited**: Do NOT write lengthy multi-bullet prose, verbose justifications, or repetitive recaps for Tier 2 Semantic Review (internal reasoning verifies them). When everything passes, output only the minimal card below:
+Keep chat output compact and token-efficient.
+When all checks pass, output only the minimal summary card below without echoing internal checklists:
 
 ### 🛡️ [CHECK] <Audit Target>
 > 🚦 **판정**: ✅ PASS
 
-- **Tier 1 (Mechanical)**: Ruff · Mypy · Pytest · Diff-Coverage 100% PASS
+- **Tier 1 (Mechanical)**: <실제 결과 요약, 예: Ruff · Mypy · Pytest · Diff-Coverage PASS>
 - **Tier 2 (Semantic)**: Test Efficacy · Invariants · Wiring 검증 완료
 *(Optional, only when surgical fix was applied)*:
 - 🔧 **수정 사항**: <Surgical Fix 1줄 요약>

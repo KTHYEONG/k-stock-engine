@@ -15,9 +15,10 @@
 - **Korean by Default:** Always converse, explain, and report in natural Korean (한국어) unless explicitly requested otherwise. Strictly prohibit the use of Chinese or Japanese.
 
 ## 4. Domain Rule Routing
-- **Financial & Quant Engineering:** [quant.md](file:///.agents/rules/quant.md)
-- **Testing & Coverage:** [testing.md](file:///.agents/rules/testing.md)
-- **Performance & Optimization:** [performance.md](file:///.agents/rules/performance.md)
-- **Logging & Diagnostics:** [logging.md](file:///.agents/rules/logging.md)
-- **Code Style & Standards:** [code-style.md](file:///.agents/rules/code-style.md)
-- **Documentation & Comments:** [documentation.md](file:///.agents/rules/documentation.md)
+- **Financial & Quant Engineering:** [quant.md](.agents/rules/quant.md)
+- **Testing & Coverage:** [testing.md](.agents/rules/testing.md)
+- **Performance & Optimization:** [performance.md](.agents/rules/performance.md)
+- **Logging & Diagnostics:** [logging.md](.agents/rules/logging.md)
+- **Code Style & Standards:** [code-style.md](.agents/rules/code-style.md)
+- **Documentation & Comments:** [documentation.md](.agents/rules/documentation.md)
+
