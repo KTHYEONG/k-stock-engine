@@ -130,7 +130,7 @@ def test_outside_scope_requirement_fails(tmp_path: Path) -> None:
     with pytest.raises(PITDataError, match="evidence start"):
         build_scope_coverage_report(
             scope=runtime.scope,
-            requirements=(_requirement("krx_daily_market", "2018-12-28", as_of=date(2018, 12, 28)),),
+            requirements=(_requirement("krx_daily_market", "2015-12-30", as_of=date(2015, 12, 30)),),
             catalog=catalog,
         )
     with pytest.raises(PITDataError, match="fiscal floor"):
@@ -139,9 +139,9 @@ def test_outside_scope_requirement_fails(tmp_path: Path) -> None:
             requirements=(
                 CoverageRequirement(
                     source="financial_facts",
-                    natural_key="00126380:2018:11011",
-                    as_of=date(2019, 5, 16),
-                    fiscal_period="2018Q4",
+                    natural_key="00126380:2015:11011",
+                    as_of=date(2016, 5, 16),
+                    fiscal_period="2015Q4",
                     required=True,
                 ),
             ),

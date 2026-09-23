@@ -50,7 +50,7 @@ def test_pre_scope_price_evidence_fails(tmp_path: Path) -> None:
     bronze_root = tmp_path / "data" / "bronze" / "kr_swing_2019_v1"
 
     with pytest.raises(PITDataError, match="evidence start"):
-        writer.persist(_payload(as_of=date(2018, 12, 28), natural_key="2018-12-28"))
+        writer.persist(_payload(as_of=date(2015, 12, 30), natural_key="2015-12-30"))
 
     assert not bronze_root.exists()
     assert not (bronze_root / "catalog").exists()
@@ -65,9 +65,9 @@ def test_pre_floor_dart_fact_fails(tmp_path: Path) -> None:
             _payload(
                 kind=EvidenceKind.FINANCIAL_FACTS,
                 source="financial_facts",
-                natural_key="00126380:2018:11011",
-                as_of=date(2020, 4, 1),
-                fiscal_period="2018Q4",
+                natural_key="00126380:2015:11011",
+                as_of=date(2016, 4, 1),
+                fiscal_period="2015Q4",
                 body=b'{"records": [{"fact": 1}]}',
             )
         )
@@ -308,3 +308,72 @@ def test_collect_scoped_and_disclosures_commands_persist(tmp_path: Path, capsys:
     bad = tmp_path / "bad.json"
     bad.write_text(json.dumps([{"rcept_no": ""}]), encoding="utf-8")
     assert main(["collect-dart-disclosures-scoped", "--scope-config", str(SCOPE_CONFIG), "--data-root", str(tmp_path / "data"), "--disclosures", str(bad)]) == 1
+
+
+def test_blocked_fact_page_is_retryable_not_empty() -> None:
+    from src.data.collection import scoped_status_for_page
+
+    blocked = {"source_kind": "blocked", "status": "020", "records": []}
+
+    assert scoped_status_for_page(blocked) == EvidenceStatus.PROVIDER_UNAVAILABLE
+
+
+def test_collection_publishes_one_catalog_revision_per_batch(tmp_path: Path) -> None:
+    from src.data.collection import collect_daily_market_sessions, collect_dart_financial_facts
+
+    runtime = load_data_runtime(scope_config=SCOPE_CONFIG, data_root=tmp_path / "data")
+    catalog = ReceiptCatalog(runtime.workspace.bronze_root / "catalog")
+    writer = ScopedBronzeWriter(runtime=runtime, catalog=catalog)
+    publishes: list[int] = []
+    real_publish = catalog.publish
+
+    def _spy(entries):  # type: ignore[no-untyped-def]
+        publishes.append(len(entries))
+        return real_publish(entries)
+
+    catalog.publish = _spy  # type: ignore[method-assign]
+
+    def _fact_page(corp_code: str) -> dict[str, object]:
+        return {
+            "identity": {
+                "corp_code": corp_code,
+                "biz_year": "2019",
+                "reprt_code": "11013",
+                "fiscal_period": "2019Q1",
+                "published_at": "2019-05-15",
+            },
+            "records": [{"account": "revenue"}],
+        }
+
+    class _Dart:
+        def fetch_financial_fact_sources(self, identities: object) -> list[dict[str, object]]:
+            return [_fact_page(code) for code in ("00000001", "00000002", "00000003")]
+
+    collect_dart_financial_facts(
+        dart=_Dart(),
+        identities=tuple({"corp_code": code, "biz_year": "2019", "reprt_code": "11013"} for code in ("00000001", "00000002", "00000003")),
+        bronze_root=tmp_path / "legacy-bronze",
+        retrieved_at=RETRIEVED_AT,
+        scoped_writer=writer,
+    )
+
+    assert publishes == [3]
+
+    class _Krx:
+        def fetch_daily_market(self, start: object, end: object, **kwargs: object) -> list[dict[str, object]]:
+            return [
+                {"session": day, "records": [{"ISU_SRT_CD": "005930", "MKTCAP": 10, "LIST_SHRS": 5}]}
+                for day in ("2024-01-02", "2024-01-03")
+            ]
+
+    publishes.clear()
+    collect_daily_market_sessions(
+        sessions=(date(2024, 1, 2), date(2024, 1, 3)),
+        krx=_Krx(),
+        bronze_root=tmp_path / "legacy-bronze",
+        retrieved_at=RETRIEVED_AT,
+        scoped_writer=writer,
+    )
+
+    assert publishes == [2]
+    assert catalog.successful_keys(source="krx_daily_market") == frozenset({"2024-01-02", "2024-01-03"})

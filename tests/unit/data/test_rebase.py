@@ -129,7 +129,7 @@ def test_materialize_scoped_bronze_rejects_security_master_without_provider_date
 
 def test_materialize_scoped_bronze_rejects_out_of_scope_and_duplicate_security_master(tmp_path: Path) -> None:
     legacy = tmp_path / "legacy"
-    _write_legacy(legacy, kind="security_master", payload=_master("2018-12-31"), dirname="old")
+    _write_legacy(legacy, kind="security_master", payload=_master("2015-12-31"), dirname="old")
     _write_legacy(legacy, kind="security_master", payload=_master("2019-06-03"), dirname="one")
     _write_legacy(legacy, kind="security_master", payload=_master("2019-06-03"), dirname="two")
     _write_legacy(legacy, kind="security_master", payload=json.dumps([1]).encode(), dirname="malformed")
@@ -167,9 +167,9 @@ def test_materialize_scoped_bronze_reads_historical_bronze_stocks_namespace(tmp_
     assert catalog.successful_keys(source="krx_daily_market") == frozenset({"2019-06-03"})
 
 
-def test_materialize_scoped_bronze_rejects_pre_2019_daily_payload(tmp_path: Path) -> None:
+def test_materialize_scoped_bronze_rejects_pre_scope_daily_payload(tmp_path: Path) -> None:
     legacy = tmp_path / "legacy"
-    _write_legacy(legacy, kind="daily_market", payload=_market("2018-12-31"))
+    _write_legacy(legacy, kind="daily_market", payload=_market("2015-12-31"))
     _, report = _rebase(tmp_path, legacy)
 
     assert report.retained_payload_count == 0
@@ -179,12 +179,12 @@ def test_materialize_scoped_bronze_rejects_pre_2019_daily_payload(tmp_path: Path
 
 def test_materialize_scoped_bronze_applies_fiscal_floor_to_dart_facts(tmp_path: Path) -> None:
     legacy = tmp_path / "legacy"
-    _write_legacy(legacy, kind="financial_facts", payload=_fact("00126380", "2018", "11011", "2020-03-30"))
+    _write_legacy(legacy, kind="financial_facts", payload=_fact("00126380", "2015", "11011", "2016-03-30"))
     _write_legacy(legacy, kind="financial_facts", payload=_fact("00126380", "2019", "11013", "2019-05-15", identity=True))
     runtime, report = _rebase(tmp_path, legacy)
 
     assert report.retained_payload_count == 1
-    assert _reasons(report) == {"00126380:2018:11011": "out_of_scope_fiscal_period", "00126380:2019:11013": "in_scope_verified"}
+    assert _reasons(report) == {"00126380:2015:11011": "out_of_scope_fiscal_period", "00126380:2019:11013": "in_scope_verified"}
     catalog = ReceiptCatalog(runtime.workspace.bronze_root / "catalog")
     assert catalog.successful_keys(source="financial_facts", fiscal_start="2019Q1") == frozenset({"00126380:2019:11013"})
 

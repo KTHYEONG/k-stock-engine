@@ -1,19 +1,30 @@
-"""One-time OpenDART fact backfill for fiscal periods 2016Q1..2018Q4.
+"""Resumable OpenDART fact backfill for fiscal periods 2016Q1..2018Q4.
 
-The existing ``build_dart_historical_backfill_plan``/``run_dart_historical_backfill_batch``
-helpers compute ``required_periods`` as a fixed trailing lookback from one
-``validation_start`` point (the scope's live QVEF fundamental-lookback
-semantics), which cannot express "collect this entire historical range."
-This script drives the lower-level, range-agnostic building blocks directly
-instead: an explicit ``required_periods`` set, ticker<->corp_code resolution
-from this scope's own certified ordinary universe (not the legacy nested
-security_master loader, which globs unrelated flat-hash Silver datasets on
-this scope's layout), and the scope's existing quota-headroom reservation
-(``scoped_dart_request_headroom``) so today's run never exceeds the budget
-left after reserving room for a sibling project's own DART usage.
+Run repeatedly (once per KST day) until it reports ``status == "complete"``.
+``--dry-run`` resolves the plan and estimates the remaining work with zero API
+calls.
+
+Why this script drives lower-level pieces instead of
+``run_dart_historical_backfill_batch``: that helper derives ``required_periods``
+as a fixed trailing lookback from one ``validation_start``, which cannot express
+"collect this whole historical range", and its security-master loader targets a
+nested table layout this scope does not use.
+
+Safety properties:
+- Identities already answered in the receipt catalog (success, empty, or
+  extraction_failed) are skipped; provider-unavailable/blocked ones are retried.
+- Each chunk is persisted (Bronze + one catalog revision) before the next
+  request, so a failure loses at most one chunk instead of the whole run.
+- Headroom comes from ``scoped_dart_request_headroom`` and is re-read before
+  every chunk; a chunk is sized for the worst case of three requests per
+  identity (CFS, OFS, document archive).
+- The first ``blocked`` page (DART quota exhausted) stops the run immediately.
+- Catalog revisions are full snapshots; after a run, reclaim old revisions with
+  ``compact-storage-generations --apply``.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from datetime import UTC, date, datetime
@@ -22,23 +33,36 @@ from pathlib import Path
 import polars as pl
 
 from src.data.cli import load_data_runtime
-from src.data.collection import collect_dart_disclosures, collect_dart_financial_facts
+from src.data.collection import collect_dart_financial_facts
 from src.data.dart_backfill import build_scoped_dart_collector, scoped_dart_request_headroom
-from src.data.receipt_catalog import ReceiptCatalog
-from src.data.scoped_ingestion import ScopedBronzeWriter
+from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog
+from src.data.scoped_ingestion import FACT_SOURCE, ScopedBronzeWriter, dart_fact_natural_key
 from src.integrations.dart.client import DartCorpCodeRecord
+from src.integrations.dart.xbrl import DartXbrlCollector
+from src.integrations.quota import ProviderQuotaStateStore
 
 REQUIRED_PERIODS = frozenset(f"{year}Q{q}" for year in (2016, 2017, 2018) for q in (1, 2, 3, 4))
+WINDOW_START = date(2015, 1, 1)
+WINDOW_END = date(2019, 6, 30)
+ELIGIBILITY_START = date(2016, 1, 4)
+ELIGIBILITY_END = date(2018, 12, 31)
+_ANSWERED = frozenset({EvidenceStatus.SUCCESS, EvidenceStatus.EMPTY, EvidenceStatus.EXTRACTION_FAILED})
+_WORST_CASE_REQUESTS_PER_IDENTITY = 3
 
 
-def _eligible_tickers(silver_root: Path, *, start: date, end: date) -> frozenset[str]:
+def _emit(**fields: object) -> None:
+    sys.stdout.write(json.dumps(fields, ensure_ascii=False, default=str) + "\n")
+    sys.stdout.flush()
+
+
+def _eligible_tickers(silver_root: Path) -> frozenset[str]:
     datasets = sorted(p for p in silver_root.glob("ordinary_universe_*") if p.is_dir() and not p.name.startswith("."))
     if len(datasets) != 1:
         raise SystemExit(f"expected exactly one ordinary_universe dataset, found {len(datasets)}")
     files = sorted(datasets[0].rglob("*.parquet"))
     tickers = (
         pl.scan_parquet([str(p) for p in files])
-        .filter(pl.col("eligible") & pl.col("session").is_between(start, end))
+        .filter(pl.col("eligible") & pl.col("session").is_between(ELIGIBILITY_START, ELIGIBILITY_END))
         .select(pl.col("ticker").cast(pl.String))
         .unique()
         .collect()["ticker"]
@@ -52,63 +76,120 @@ def _ticker_by_corp_code(bronze_root: Path, eligible: frozenset[str]) -> dict[st
     if not paths:
         raise SystemExit("dart_corp_codes Bronze evidence is missing")
     payload = json.loads(paths[-1].read_text(encoding="utf-8"))
-    records = tuple(
-        DartCorpCodeRecord(ticker=str(row.get("ticker") or ""), corp_code=str(row.get("corp_code") or ""), corp_name=str(row.get("corp_name") or ""))
-        for row in payload
-        if isinstance(row, dict)
-    )
     mapping: dict[str, str] = {}
-    for rec in records:
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        rec = DartCorpCodeRecord(
+            ticker=str(row.get("ticker") or ""), corp_code=str(row.get("corp_code") or ""), corp_name=str(row.get("corp_name") or "")
+        )
         if rec.ticker not in eligible or not rec.corp_code:
             continue
         prev = mapping.get(rec.corp_code)
         if prev is not None and prev != rec.ticker:
             raise SystemExit(f"corp code {rec.corp_code} maps to multiple tickers: {prev}, {rec.ticker}")
         mapping[rec.corp_code] = rec.ticker
-    return {code: mapping[code] for code in mapping}
+    return mapping
 
 
-def main() -> int:
+def _corp_codes_without_disclosures(bronze_root: Path, corp_codes: frozenset[str]) -> frozenset[str]:
+    seen: set[str] = set()
+    for path in (bronze_root / "disclosures").glob("*/payload.json"):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            code = str(payload.get("corp_code") or "").strip()
+            if code:
+                seen.add(code)
+    return corp_codes - seen
+
+
+def _pending_identities(bronze_root: Path, catalog: ReceiptCatalog, mapping: dict[str, str]) -> tuple[int, int, list[dict[str, str]]]:
+    identities = DartXbrlCollector.filing_identities_from_bronze(
+        bronze_root, start=WINDOW_START, end=WINDOW_END,
+        ticker_by_corp_code=mapping, required_periods=REQUIRED_PERIODS, corp_codes=frozenset(mapping),
+    )
+    latest: dict[str, dict[str, str]] = {}
+    for item in identities:
+        key = dart_fact_natural_key(corp_code=item["corp_code"], biz_year=item["biz_year"], reprt_code=item["reprt_code"])
+        current = latest.get(key)
+        if current is None or (item["published_at"], item["filing_id"]) > (current["published_at"], current["filing_id"]):
+            latest[key] = item
+    answered = catalog.latest(source=FACT_SOURCE, natural_keys=set(latest))
+    pending = [
+        item for key, item in latest.items()
+        if key not in answered or answered[key].status not in _ANSWERED
+    ]
+    pending.sort(key=lambda item: (item["published_at"], item["filing_id"]))
+    return len(identities), len(latest), pending
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--dry-run", action="store_true", help="resolve and estimate only; makes no API calls")
+    parser.add_argument("--max-chunks", type=int, default=None, help="stop after N chunks (pilot)")
+    args = parser.parse_args(argv)
+
     runtime = load_data_runtime(
-        scope_config=Path("config/research/kr_swing_2019_v1.toml"),
-        data_root=Path("/home/kth/k-stock-engine/data"),
+        scope_config=Path("config/research/kr_swing_2019_v1.toml"), data_root=Path("/home/kth/k-stock-engine/data")
     )
     bronze_root = runtime.workspace.bronze_root
-    silver_root = runtime.workspace.silver_root
-    eligible = _eligible_tickers(silver_root, start=date(2016, 1, 4), end=date(2018, 12, 31))
-    ticker_by_corp_code = _ticker_by_corp_code(bronze_root, eligible)
-    sys.stdout.write(json.dumps({"stage": "resolved", "eligible_tickers": len(eligible), "corp_codes": len(ticker_by_corp_code)}) + "\n")
-    sys.stdout.flush()
-
-    headroom = scoped_dart_request_headroom(runtime=runtime)
-    sys.stdout.write(json.dumps({"stage": "headroom", "available": headroom}) + "\n")
-    sys.stdout.flush()
-    if headroom <= 0:
-        sys.stdout.write(json.dumps({"stage": "done", "reason": "no headroom left today"}) + "\n")
-        return 0
-
-    dart = build_scoped_dart_collector(runtime=runtime)
-    retrieved_at = datetime.now(UTC)
-    corp_codes = tuple(sorted(ticker_by_corp_code))
-    collect_dart_disclosures(
-        dart=dart, start=date(2015, 1, 1), end=date(2019, 6, 30), bronze_root=bronze_root, retrieved_at=retrieved_at, corp_codes=corp_codes
-    )
-    sys.stdout.write(json.dumps({"stage": "disclosures_done"}) + "\n")
-    sys.stdout.flush()
-
-    identities = dart.filing_identities_from_bronze(
-        bronze_root, start=date(2015, 1, 1), end=date(2019, 6, 30),
-        ticker_by_corp_code=ticker_by_corp_code, required_periods=REQUIRED_PERIODS, corp_codes=frozenset(corp_codes),
-    )
-    sys.stdout.write(json.dumps({"stage": "identities_resolved", "count": len(identities)}) + "\n")
-    sys.stdout.flush()
+    chunk_size = runtime.scope.collection.dart_batch_identities
+    mapping = _ticker_by_corp_code(bronze_root, _eligible_tickers(runtime.workspace.silver_root))
+    missing_disclosures = _corp_codes_without_disclosures(bronze_root, frozenset(mapping))
+    if missing_disclosures:
+        _emit(stage="abort", reason="disclosures_missing", corp_codes=len(missing_disclosures))
+        return 2
 
     catalog = ReceiptCatalog(bronze_root / "catalog")
+    raw_count, key_count, pending = _pending_identities(bronze_root, catalog, mapping)
+    quota_store = ProviderQuotaStateStore(runtime.workspace.state_root / "quota")
+    headroom = scoped_dart_request_headroom(runtime=runtime, quota_store=quota_store)
+    daily = runtime.scope.collection.dart_daily_budget - runtime.scope.collection.dart_daily_reserve
+    _emit(
+        stage="plan", corp_codes=len(mapping), raw_identities=raw_count, unique_keys=key_count,
+        pending=len(pending), chunk_size=chunk_size, headroom_now=headroom,
+        est_requests_min=len(pending), est_requests_max=len(pending) * _WORST_CASE_REQUESTS_PER_IDENTITY,
+        est_days_min=round(len(pending) / daily, 2), est_days_max=round(len(pending) * _WORST_CASE_REQUESTS_PER_IDENTITY / daily, 2),
+    )
+    if args.dry_run or not pending:
+        _emit(stage="done", status="dry_run" if args.dry_run else "complete", pending=len(pending))
+        return 0
+
+    dart = build_scoped_dart_collector(runtime=runtime, quota_store=quota_store)
     writer = ScopedBronzeWriter(runtime=runtime, catalog=catalog)
-    batch = identities[:headroom]
-    if batch:
-        collect_dart_financial_facts(dart=dart, identities=batch, bronze_root=bronze_root, retrieved_at=retrieved_at, scoped_writer=writer)
-    sys.stdout.write(json.dumps({"stage": "facts_done", "collected": len(batch), "remaining": len(identities) - len(batch)}) + "\n")
+    totals = {"standardized": 0, "legacy_document": 0, "unavailable": 0, "extraction_failed": 0}
+    done = requests_used = chunks = 0
+    status = "complete"
+    while done < len(pending):
+        if args.max_chunks is not None and chunks >= args.max_chunks:
+            status = "chunk_limit"
+            break
+        headroom = scoped_dart_request_headroom(runtime=runtime, quota_store=quota_store)
+        allowance = min(chunk_size, len(pending) - done, headroom // _WORST_CASE_REQUESTS_PER_IDENTITY)
+        if allowance < 1:
+            status = "budget_exhausted"
+            break
+        chunk = tuple(pending[done : done + allowance])
+        before = headroom
+        artifact = collect_dart_financial_facts(
+            dart=dart, identities=chunk, bronze_root=bronze_root, retrieved_at=datetime.now(UTC), scoped_writer=writer
+        )
+        report = json.loads(Path(artifact.report_path).read_text(encoding="utf-8"))
+        for name in totals:
+            totals[name] += int(report.get(name, 0))
+        used = before - scoped_dart_request_headroom(runtime=runtime, quota_store=quota_store)
+        requests_used += used
+        done += len(chunk)
+        chunks += 1
+        avg = requests_used / done
+        _emit(
+            stage="chunk", chunk=chunks, done=done, pending=len(pending), requests_used=requests_used,
+            avg_requests_per_identity=round(avg, 3), remaining_est_days=round((len(pending) - done) * avg / daily, 2), **totals,
+        )
+        if int(report.get("blocked", 0)) > 0:
+            status = "quota_blocked"
+            break
+    _emit(stage="done", status=status, done=done, pending_left=len(pending) - done, requests_used=requests_used, **totals)
     return 0
 
 
