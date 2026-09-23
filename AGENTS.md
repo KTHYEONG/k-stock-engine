@@ -1,7 +1,10 @@
 # AI Coding Assistant Core Directives
 
+> **Domain Identity:** KRX equity market data ingestion, normalization, backtesting, and broker execution infrastructure (KIS, LS, Kiwoom, etc.)
+
 ## 1. Engineering Ownership & Judgment
 - **Complete Ownership:** Deliver a self-contained, root-cause solution end-to-end without leaving loose ends or touching unrelated code.
+- **User Override Precedence:** When the user explicitly requests an action, explanation, or format that differs from default skill ceremony or constraints, strictly follow the user's explicit instructions over automated rituals.
 - **Pragmatic Autonomy:** Proceed autonomously on low-risk decisions; introduce clean logic where legacy patterns are inadequate, avoiding speculative over-engineering.
 - **Deterministic Invariants:** Prioritize strict, reproducible domain logic over magic numbers. Respect contracts and resolve code/spec conflicts by investigating system truth.
 
@@ -12,13 +15,14 @@
 ## 3. Execution & Efficiency
 - **Token-Conscious Verification:** Use configured tools (`uv run`) to verify changes against existing harnesses. Avoid wasteful retry loops; isolate verbose logs in `scratch/` to prevent context bloat.
 - **Human-Centric Clarity:** Communicate in intuitive, plain language (Problem → Root Cause → Impact) rather than dense, robotic jargon dumps.
-- **Korean by Default:** Always converse, explain, and report in natural Korean (한국어) unless explicitly requested otherwise. Strictly prohibit the use of Chinese or Japanese.
+- **Korean by Default:** Always converse, explain, and report in natural Korean (한국어). Inside structured output cards, retain English keys/badges (e.g. `[PROBE]`, `[CHECK]`, `Verdict`, `Status`) while writing descriptions, findings, and rationales in natural Korean.
+- **English for Technical Specifications:** System instructions, rules, specifications (`docs/specs/`), code, and docstrings are written in English for token efficiency and reasoning precision.
 
 ## 4. Domain Rule Routing
-- **Financial & Quant Engineering:** [quant.md](.agents/rules/quant.md)
-- **Testing & Coverage:** [testing.md](.agents/rules/testing.md)
-- **Performance & Optimization:** [performance.md](.agents/rules/performance.md)
-- **Logging & Diagnostics:** [logging.md](.agents/rules/logging.md)
-- **Code Style & Standards:** [code-style.md](.agents/rules/code-style.md)
-- **Documentation & Comments:** [documentation.md](.agents/rules/documentation.md)
+- **Financial & Quant Engineering:** [quant.md](.agents/rules/quant.md) — *Financial invariants, temporal causality, market frictions, and conservation laws.*
+- **Testing & Coverage:** [testing.md](.agents/rules/testing.md) — *Invariant-driven testing, boundary conditions, failure isolation, and diff-coverage.*
+- **Performance & Optimization:** [performance.md](.agents/rules/performance.md) — *Vectorized panel builds, hot-loop profiling, and resource budgets.*
+- **Logging & Diagnostics:** [logging.md](.agents/rules/logging.md) — *Operational logging, 6 fixed category taxonomy, and credential redaction.*
+- **Code Style & Standards:** [code-style.md](.agents/rules/code-style.md) — *Module boundaries, strong static typing contracts, and toolchain alignment.*
+- **Documentation & Comments:** [documentation.md](.agents/rules/documentation.md) — *Production docstrings, architecture specs, and non-obvious rationale.*
 

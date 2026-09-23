@@ -59,20 +59,20 @@ Execute the approved specification into production code and passing tests:
 
 ## Output
 
-Keep chat output compact and token-efficient.
+Keep chat output compact and token-efficient. Retain English keys/badges while writing descriptions in natural Korean (한국어):
 - **On success**: Output only the minimal completion card below without redundant code dumps or conversational filler.
-- **On failure or discrepancy**: Clearly report the issue (Problem → Root Cause → Fix) without verbose chatter.
+- **On failure or discrepancy**: Clearly report the issue (Problem → Root Cause → Fix).
 
 ### 🔨 [IMPLEMENT] <Task Title>
-> 📄 **구현 스펙**: [`<spec_filename>.md`](docs/specs/<spec_filename>.md)  
-> 🚦 **상태**: ✅ COMPLETE (<Count>개 파일 수정)
+> 📄 **Spec**: [`<spec_filename>.md`](docs/specs/<spec_filename>.md)  
+> 🚦 **Status**: ✅ COMPLETE (<Count> file(s) modified)
 
-- 🧪 **검증 요약**: <실제 통과 내역 요약, 예: Pytest PASS · Ruff PASS · Mypy PASS · Diff Coverage PASS>
+- 🧪 **Verification**: <실제 통과 내역 요약, e.g. Pytest PASS · Ruff PASS · Mypy PASS · Diff Coverage PASS>
 
 *(On Failure / Escalation)*:
 ### 🔨 [IMPLEMENT] <Task Title>
-> 📄 **구현 스펙**: [`<spec_filename>.md`](docs/specs/<spec_filename>.md)  
-> 🚦 **상태**: ❌ ESCALATED (또는 ❌ FAIL)
+> 📄 **Spec**: [`<spec_filename>.md`](docs/specs/<spec_filename>.md)  
+> 🚦 **Status**: ❌ ESCALATED (or ❌ FAIL)
 
-- 💥 **실패 지점**: [<Pytest | Ruff | Mypy | Diff Coverage | Anchor Wiring | Invariant Conflict>] `<실패한 테스트명 또는 핵심 에러 1줄>`
-- 🎯 **원인 및 조치**: `<불일치 원인 또는 해결을 위해 필요한 액션 1-2줄>`
+- 💥 **Failure Point**: [<Pytest | Ruff | Mypy | Diff Coverage | Anchor Wiring | Invariant Conflict>] `<실패한 테스트명 또는 핵심 에러 1줄>`
+- 🎯 **Root Cause & Action**: `<불일치 원인 또는 해결을 위해 필요한 조치 1-2줄>`

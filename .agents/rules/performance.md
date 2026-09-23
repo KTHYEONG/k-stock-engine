@@ -12,9 +12,9 @@
 - **I/O Locality & Pushdown:** Prohibit repetitive text parsing or deserialization in hot computational paths. Leverage efficient binary or columnar storage with column pruning and predicate pushdown for substantial data I/O.
 
 ## 3. Separation of Invariant Features and Dynamic State
-- **One-Pass Invariant Materialization:** Compute all state-independent features and indicators once upstream across the complete historical timeline.
+- **One-Pass Invariant Materialization:** Where compute scale warrants and working memory budgets permit, compute state-independent features and indicators once upstream across the historical timeline. For massive datasets exceeding comfortable in-memory working sets, process in bounded chronological chunks.
 - **Minimal Hot Paths:** Confine inner sequential iteration strictly to state-dependent transitions. Never recompute static or historical invariants inside simulation loops or across optimization folds.
 
 ## 4. Hardware Saturation & Observable Throughput
-- **Balanced Parallelism:** Saturate available CPU cores for embarrassingly parallel workloads while ensuring compute granularity heavily amortizes inter-process communication (IPC) overhead.
+- **Balanced Parallelism:** When verified compute bottlenecks exist on parallelizable workloads, saturate available CPU cores while ensuring compute granularity heavily amortizes inter-process communication (IPC) overhead. Avoid unnecessary multiprocessing setup for lightweight operations.
 - **Continuous Progress Telemetry:** Long-running workloads must emit deterministic progress heartbeats. A silent pipeline is indistinguishable from a deadlocked system.

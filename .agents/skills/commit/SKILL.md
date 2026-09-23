@@ -9,8 +9,9 @@ Fast automated git execution protocol enforcing atomic commits, bisect-safe chan
 
 ## Directives
 
-1. **Working-Tree Preservation**:
-   - Stage the verified working tree state without entering additional edit loops.
+1. **Task-Scoped Working-Tree Staging**:
+   - Inspect `git status --short` and stage ONLY the files verified as part of the current task/spec scope (`git add <file1> <file2> ...`).
+   - Do NOT perform blind blanket staging (`git add .` or `git add -A`) when unrelated working tree modifications exist.
    - Do not stage ephemeral artifacts: `scratch/`, `tmp/`, `.pytest_cache/`, `*.pyc`, or logs.
 
 2. **Atomic & Bisect-Safe Grouping**:
@@ -22,8 +23,8 @@ Fast automated git execution protocol enforcing atomic commits, bisect-safe chan
    - Group changes into 1 atomic commit (or 2 when documentation/tooling warrants separation).
 
 3. **Standard Message Format**:
-   - **Subject**: `<type>: <한국어 요약 <= 50자>` (명확한 목적 지향)
-   - **Body**: `- **Why:** <해결한 구체적 문제나 비즈니스 목적 ~함.>`
+   - **Subject**: `<type>: <concise description <= 50 chars>`
+   - **Body**: `- **Why:** <concrete problem or business rationale solved>`
    - **Prohibited Metadata**: Do not add `Co-authored-by:`, AI model names, or session trailers. Keep commits clean with only subject and rationale.
 
 ## Output

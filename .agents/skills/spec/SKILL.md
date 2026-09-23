@@ -22,10 +22,8 @@ Your output in `/spec` focuses strictly on:
    - Inspect target files and immediate callers for exact imports and AST anchors without scanning unrelated paths.
 
 2. **Sizing & Modularity (Single-Bolt Rule)**:
-   - **Sweet Spot**: A single spec typically targets 2–4 related production files, 1–2 test files, and 10–15 invariant scenarios (200–350 lines).
-   - **Mandatory Split**: Split into sequential sub-specs (e.g. ordered by layer or dependency: `<feature>_<sub_layer>_spec.md`) if:
-     1) Total invariant scenarios exceed 20 or spec exceeds 500 lines.
-     2) Targets span distinct architectural layers (e.g., Domain Core Engine vs. CLI / External Adapters).
+   - Keep each specification focused on a single coherent architectural unit or feature layer that can be implemented and verified in one pass.
+   - **Mandatory Split**: Split into sequential sub-specs (ordered by dependency: `<feature>_<sub_layer>_spec.md`) when targets span distinct architectural layers or independent workflows that should not be coupled into a single implementation turn.
 
 3. **Blueprint Structure (`docs/specs/<feature>_spec.md`)**:
    Organize targets with **component-centric co-location** (group Target, Wiring, and Invariant Scenarios together per component to prevent cross-referencing context loss). For multi-component specs, repeat this 3-part sequence for each component unit:
@@ -46,22 +44,20 @@ Your output in `/spec` focuses strictly on:
 ## Chat Output Format
 
 Keep chat output ultra-compact and token-efficient. Do NOT execute CLI commands or pre-impl validation loops.
-Output only the minimal card below:
+Output only the minimal card below (write summary in natural Korean):
 
-### 📐 [SPEC] <기능명>
-> 📄 **청사진**: [`docs/specs/<feature>_spec.md`](docs/specs/<feature>_spec.md)
+### 📐 [SPEC] <Feature Name>
+> 📄 **Blueprint**: [`docs/specs/<feature>_spec.md`](docs/specs/<feature>_spec.md)
 
-- 🎯 **작업 요약**: <구현할 핵심 기능 1줄 요약> (<N>개 파일 대상 · <N>개 시나리오)
+- 🎯 **Summary**: <구현할 핵심 기능 1줄 요약> (<N> target file(s) · <N> scenario(s))
 
-*(단일 스펙인 경우)*:
+*(For single spec: run `implement` skill)*:
 ```bash
 /implement docs/specs/<feature>_spec.md
 ```
 
-*(다중 스펙으로 분할된 경우: 순차 실행할 /implement 명령어를 복사하기 쉽게 나열)*:
+*(For multi-spec split: execute sequentially)*:
 ```bash
 /implement docs/specs/<sub_spec_1>.md
-```
-```bash
 /implement docs/specs/<sub_spec_2>.md
 ```

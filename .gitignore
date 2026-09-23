@@ -53,8 +53,8 @@ pip-delete-this-directory.txt
 #logs
 logs/   
 
-# uv project-local fallback cache
-scratch/uv-cache/
+# Scratch directory for AI experimentation and probe scripts
+scratch/
 
 # Project-only temp root (pytest/tempfile/TMPDIR pinned via tests/conftest.py)
 tmp/
