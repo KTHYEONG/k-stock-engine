@@ -385,7 +385,7 @@ def certify_silver(
     # The test for empty receipts already failed on missing tables, so not needed.
     # For completeness, if certification is RESEARCH or PRODUCTION and source_hashes incomplete, raise with names
     if certification in (DatasetCertification.RESEARCH, DatasetCertification.PRODUCTION):
-        required_kinds = tuple(k for k in EvidenceKind if k is not EvidenceKind.LIFECYCLE_EVENTS)
+        required_kinds = tuple(k for k in EvidenceKind if k is not EvidenceKind.LIFECYCLE_EVENTS and k is not EvidenceKind.INDUSTRY)
         missing_kinds = [k.value for k in required_kinds if k not in source_hashes]
         if missing_kinds and len(source_hashes) < len(required_kinds):
             raise PITDataError(f"missing required evidence: {', '.join(sorted(missing_kinds))} (investor_flow, financial_facts)")
@@ -769,7 +769,7 @@ def certify_corporate_action_refresh(
     """Certify an action-only refresh against immutable non-action manifests."""
     if decision_time.tzinfo is None:  # pragma: no cover - public callers validate timezone
         raise PITDataError("decision_time must be timezone-aware")
-    missing = [kind.value for kind in EvidenceKind if not receipts.get(kind) and kind is not EvidenceKind.LIFECYCLE_EVENTS]
+    missing = [kind.value for kind in EvidenceKind if not receipts.get(kind) and kind is not EvidenceKind.LIFECYCLE_EVENTS and kind is not EvidenceKind.INDUSTRY]
     if missing:  # pragma: no cover - caller validates every evidence kind
         raise PITDataError(f"missing required evidence: {', '.join(sorted(missing))}")
     validate_table(SilverTable.CORPORATE_ACTIONS, action_frame, decision_time=decision_time)

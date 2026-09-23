@@ -89,6 +89,32 @@ def test_require_silver_report_accepts_core_kinds_without_lifecycle_hash(tmp_pat
     assert module._require_silver_report(report, request) is report
 
 
+def test_require_silver_report_ignores_auxiliary_industry_hashes(tmp_path) -> None:
+    from datetime import UTC, date, datetime
+
+    import pytest
+
+    import src.data.operations as module
+    from src.core.datasets import DatasetCertification
+    from src.data.schemas import CertificationReport, EvidenceKind
+
+    decision = datetime(2016, 12, 30, tzinfo=UTC)
+    report = CertificationReport(
+        certification=DatasetCertification.RESEARCH,
+        report_hash="r" * 64,
+        coverage_start=date(2016, 1, 4),
+        coverage_end=date(2016, 12, 30),
+        source_hashes={k: "h" * 64 for k in EvidenceKind if k is not EvidenceKind.DAILY_MARKET},
+    )
+    request = module.StockDataRebuildRequest(
+        tmp_path / "data", tmp_path / "bronze", tmp_path / "silver", tmp_path / "gold", tmp_path / "artifacts",
+        date(2016, 1, 4), date(2016, 12, 30), decision,
+    )
+    with pytest.raises(ValueError, match="daily_market") as exc_info:
+        module._require_silver_report(report, request)
+    assert "industry" not in str(exc_info.value)
+
+
 import inspect
 
 import src.data.operations as operations

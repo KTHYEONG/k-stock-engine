@@ -128,7 +128,7 @@ def materialize_backtest_inputs(
         kind: tuple(items)
         for kind, items in discover_verified_bronze_receipts(bronze_root=Path(bronze_root)).items()
     }
-    required_kinds = tuple(kind for kind in EvidenceKind if kind is not EvidenceKind.LIFECYCLE_EVENTS)
+    required_kinds = tuple(kind for kind in EvidenceKind if kind is not EvidenceKind.LIFECYCLE_EVENTS and kind is not EvidenceKind.INDUSTRY)
     if any(not grouped_receipts.get(kind) for kind in required_kinds):
         raise PITDataError("missing required Bronze receipts for certified Silver")
     try:

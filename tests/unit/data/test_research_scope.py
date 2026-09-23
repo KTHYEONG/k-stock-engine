@@ -30,22 +30,22 @@ def _scope_payload(**overrides):  # type: ignore[no-untyped-def]
 def test_canonical_scope_loads_exact_segments() -> None:
     scope = _load_canonical()
     assert scope.scope_id == "kr_swing_2019_v1"
-    assert scope.evidence_start == date(2019, 1, 1)
+    assert scope.evidence_start == date(2016, 1, 1)
     assert (scope.development_start, scope.development_end) == (date(2020, 1, 1), date(2022, 12, 31))
     assert (scope.validation_start, scope.validation_end) == (date(2023, 1, 1), date(2023, 12, 31))
     assert (scope.holdout_start, scope.holdout_end) == (date(2024, 1, 1), date(2025, 12, 31))
     assert scope.forward_start == date(2026, 1, 1)
     assert scope.features.price_lookback_sessions == 252
     assert scope.features.fundamental_lookback_quarters == 5
-    assert scope.features.fundamental_fiscal_start == "2019Q1"
+    assert scope.features.fundamental_fiscal_start == "2016Q1"
     assert scope.completed_start == date(2020, 1, 1)
     assert scope.completed_end == date(2025, 12, 31)
     assert scope.classify_completed_date(date(2021, 6, 1)) == "development"
     assert scope.classify_completed_date(date(2023, 6, 1)) == "validation"
     assert scope.classify_completed_date(date(2024, 6, 1)) == "holdout"
-    assert scope.contains_evidence_date(date(2019, 1, 1))
-    assert scope.require_fiscal_period("2019Q1")
-    assert scope.require_fiscal_period("2018Q4") is False
+    assert scope.contains_evidence_date(date(2016, 1, 1))
+    assert scope.require_fiscal_period("2016Q1")
+    assert scope.require_fiscal_period("2015Q4") is False
 
 
 def test_scope_hash_is_path_independent(tmp_path: Path) -> None:
@@ -99,10 +99,10 @@ def test_forward_period_is_not_historical() -> None:
         scope.classify_completed_date(date(2026, 6, 15))
 
 
-def test_pre_2019_evidence_is_rejected() -> None:
+def test_pre_2016_evidence_is_rejected() -> None:
     scope = _load_canonical()
-    assert not scope.contains_evidence_date(date(2018, 12, 31))
-    assert scope.contains_evidence_date(date(2019, 1, 1))
+    assert not scope.contains_evidence_date(date(2015, 12, 31))
+    assert scope.contains_evidence_date(date(2016, 1, 1))
     assert scope.contains_evidence_date(date(2025, 12, 31))
 
 
@@ -112,11 +112,35 @@ def test_invalid_fiscal_floor_fails() -> None:
     from src.data.research_scope import ResearchScope
 
     with pytest.raises(ValidationError):
-        ResearchScope.model_validate(_scope_payload(**{"features.fundamental_fiscal_start": "2018Q4"}))
+        ResearchScope.model_validate(_scope_payload(**{"features.fundamental_fiscal_start": "2015Q4"}))
     with pytest.raises(ValidationError):
         ResearchScope.model_validate(_scope_payload(**{"features.fundamental_fiscal_start": "2019Q5"}))
     with pytest.raises(ValidationError):
         ResearchScope.model_validate(_scope_payload(**{"features.fundamental_fiscal_start": "FY2019"}))
+
+
+def test_fiscal_start_at_2016_floor_validates() -> None:
+    from src.data.research_scope import ResearchScope
+
+    scope = ResearchScope.model_validate(_scope_payload(**{"features.fundamental_fiscal_start": "2016Q1"}))
+
+    assert scope.features.fundamental_fiscal_start == "2016Q1"
+
+
+def test_preferred_share_excluded_within_extended_window() -> None:
+    from src.data.ordinary_universe import classify_krx_master_row
+
+    eligible, reason = classify_krx_master_row({
+        "ISU_SRT_CD": "000001",
+        "ISU_CD": "KR0000000001",
+        "KIND_STKCERT_TP_NM": "우선주",
+        "SECUGRP_NM": "주권",
+        "MKT_TP_NM": "KOSPI",
+        "LIST_DD": "20100101",
+    })
+
+    assert eligible is False
+    assert reason == "non_ordinary_share"
 
 
 def test_disabled_features_remain_disabled() -> None:

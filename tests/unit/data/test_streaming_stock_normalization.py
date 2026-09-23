@@ -1480,6 +1480,7 @@ def _mocked_stream_grouped(tmp_path, stamp):
         EvidenceKind.DISCLOSURES: "opendart:list:2016-01-04",
         EvidenceKind.HISTORICAL_COSTS: "retained:costs:2016-01-04",
         EvidenceKind.LIFECYCLE_EVENTS: "dart:lifecycle:2016-01-04",
+        EvidenceKind.INDUSTRY: "KIS:inquire-price:005930:2016-01-04",
     }
     common_envelope = {
         "lifecycle_event_id": "evt-003450", "instrument_id": "KRX:003450",

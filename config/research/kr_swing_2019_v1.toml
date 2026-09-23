@@ -1,5 +1,5 @@
 scope_id = "kr_swing_2019_v1"
-evidence_start = "2019-01-01"
+evidence_start = "2016-01-01"
 development_start = "2020-01-01"
 development_end = "2022-12-31"
 validation_start = "2023-01-01"
@@ -11,7 +11,7 @@ forward_start = "2026-01-01"
 [features]
 price_lookback_sessions = 252
 fundamental_lookback_quarters = 5
-fundamental_fiscal_start = "2019Q1"
+fundamental_fiscal_start = "2016Q1"
 investor_flow_enabled = false
 industry_enabled = false
 
