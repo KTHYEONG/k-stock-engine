@@ -1,6 +1,6 @@
 # Quantitative Engineering Core Directives
 
-> **The primary directive is maximizing net geometric compounding growth ($g = \mathbb{E}[\ln(1 + r_{\text{net}})]$) that is fully reproducible in live execution without phantom alpha. Maximize autonomous reasoning and algorithmic creativity within five non-negotiable constitutional pillars.**
+> **The primary directive is engineering rigorous, reproducible quantitative systems that guarantee financial correctness, temporal causality, and execution realism without phantom alpha. For alpha strategy and portfolio optimization layers, maximize net risk-adjusted compounding growth ($g = \mathbb{E}[\ln(1 + r_{\text{net}})]$) within five non-negotiable constitutional pillars.**
 
 ## 1. Temporal Causality (The Arrow of Time)
 - **Point-in-Time Availability:** Every signal, feature, universe selection, and portfolio decision at time $T$ must consume strictly data observable prior to or at time $T$.
@@ -22,6 +22,6 @@
 - **Strict Out-of-Sample Isolation:** Maintain strict temporal separation between discovery/training and evaluation. Never leak validation statistics back into model formulation.
 
 ## 5. Tail-Risk & Ruin Prevention (Deterministic Fail-Closed)
-- **Conservation Law:** Total portfolio equity and cash balance changes must reconcile exactly with realized transactions, fees, taxes, and financing cash flows with zero numerical leakage.
+- **Conservation Law:** Accounting ledgers (cash, asset units, fees, taxes) must reconcile exactly with zero leakage when using exact discrete representations (e.g. integer base units such as KRW/cents/satoshis, or `Decimal`). For continuous valuations, mark-to-market calculations, and floating-point metrics, verify conservation within strict numerical tolerances (`rtol`/`atol`, `pytest.approx`) rather than artificial exact-equality tests.
 - **Deterministic Fail-Closed:** On unrecoverable data anomalies or feed disruptions, never substitute arbitrary normal defaults. Safely abort execution (`NO_TRADE`), preserve capital, and protect against catastrophic ruin.
 - **Non-Gaussian Survival:** Never evaluate risk assuming pure Gaussian returns. Systems must survive fat-tailed drawdowns, liquidity freezes, and regime shifts.
