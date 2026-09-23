@@ -370,6 +370,25 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p_kis_supplement.add_argument("--market-panel-dataset-id", required=True)
     p_kis_supplement.add_argument("--ls-flow-dataset-id", required=True)
 
+    p_flow_union = sub.add_parser(
+        "build-investor-flow-union", help="Union certified LS flow and its KIS supplement into one dataset"
+    )
+    _add_scoped_args(p_flow_union)
+    p_flow_union.add_argument("--ls-flow-dataset-id", required=True)
+    p_flow_union.add_argument("--kis-supplement-dataset-id", required=True)
+
+    p_industry = sub.add_parser(
+        "collect-industry-classification", help="Collect current KIS industry classifications to Bronze"
+    )
+    _add_scoped_args(p_industry)
+    p_industry.add_argument("--symbols-from", type=Path, required=False, default=None)
+    p_industry.add_argument("--pace-seconds", type=float, default=0.35)
+
+    p_industry_silver = sub.add_parser(
+        "build-industry-classification-silver", help="Build the certified industry classification Silver snapshot"
+    )
+    _add_scoped_args(p_industry_silver)
+
     return parser.parse_args(argv)
 
 
@@ -397,6 +416,49 @@ def _run_scoped(args: argparse.Namespace, func: Callable[[], dict[str, object]])
         return 1
     _emit(payload)
     return 0
+
+
+def _eligible_universe_tickers(silver_root: Path) -> tuple[str, ...]:
+    """Return eligible tickers from the scope's certified ordinary universe.
+
+    The universe's eligibility classification already excludes preferred
+    shares at collection time, so industry collection starting from this set
+    never requests a preferred share in the first place.
+    """
+    import polars as pl
+
+    datasets = sorted(
+        path
+        for path in Path(silver_root).glob("ordinary_universe_*")
+        if path.is_dir() and not path.name.startswith(".")
+    )
+    if len(datasets) != 1:
+        raise PITDataError("ordinary universe requires exactly one published dataset")
+    files = sorted(datasets[0].rglob("*.parquet"))
+    if not files:
+        raise PITDataError("ordinary universe has no published partitions")
+    tickers = (
+        pl.scan_parquet([str(path) for path in files])
+        .filter(pl.col("eligible"))
+        .select(pl.col("ticker").cast(pl.String))
+        .unique()
+        .collect()["ticker"]
+        .sort()
+        .to_list()
+    )
+    if not tickers:
+        raise PITDataError("ordinary universe has no eligible tickers")
+    return tuple(str(ticker) for ticker in tickers)
+
+
+def _resolve_industry_symbols(runtime: DataRuntime, symbols_from: Path | str | None) -> tuple[str, ...]:
+    if symbols_from is not None:
+        text = Path(symbols_from).read_text(encoding="utf-8")
+        cleaned = tuple(dict.fromkeys(line.strip() for line in text.splitlines() if line.strip()))
+        if not cleaned:
+            raise PITDataError(f"industry symbols file has no tickers: {symbols_from}")
+        return cleaned
+    return _eligible_universe_tickers(runtime.workspace.silver_root)
 
 
 def _read_json_list(path: Path, *, label: str) -> list[Any]:
@@ -1719,6 +1781,50 @@ def main(argv: Sequence[str] | None = None) -> int:
             return asdict(result) | {"dataset_path": str(result.dataset_path)}
 
         return _run_scoped(args, _build_kis_supplement)
+    if args.command == "build-investor-flow-union":
+        def _build_flow_union() -> dict[str, object]:
+            from dataclasses import asdict
+
+            from src.data.investor_flow_union import materialize_investor_flow_union
+
+            runtime = _scoped_runtime(args)
+            result = materialize_investor_flow_union(
+                ls_flow_silver_path=runtime.workspace.silver_root / args.ls_flow_dataset_id,
+                kis_supplement_silver_path=runtime.workspace.silver_root / args.kis_supplement_dataset_id,
+                silver_root=runtime.workspace.silver_root,
+            )
+            return asdict(result) | {"dataset_path": str(result.dataset_path)}
+
+        return _run_scoped(args, _build_flow_union)
+    if args.command == "collect-industry-classification":
+        def _collect_industry() -> dict[str, object]:
+            from src.integrations.kis.industry import KisIndustryCollector
+
+            runtime = _scoped_runtime(args)
+            symbols = _resolve_industry_symbols(runtime, args.symbols_from)
+            pages = 0
+            for symbol in symbols:
+                collector = KisIndustryCollector((symbol,))
+                for _ in collector.fetch_industry_classification(bronze_root=runtime.workspace.bronze_root):
+                    pages += 1
+                time.sleep(args.pace_seconds)
+            return {"symbols_requested": len(symbols), "pages_collected": pages}
+
+        return _run_scoped(args, _collect_industry)
+    if args.command == "build-industry-classification-silver":
+        def _build_industry_silver() -> dict[str, object]:
+            from dataclasses import asdict
+
+            from src.data.industry_silver import materialize_industry_classification_silver
+
+            runtime = _scoped_runtime(args)
+            result = materialize_industry_classification_silver(
+                bronze_root=runtime.workspace.bronze_root,
+                silver_root=runtime.workspace.silver_root,
+            )
+            return asdict(result) | {"dataset_path": str(result.dataset_path)}
+
+        return _run_scoped(args, _build_industry_silver)
     if args.command == "compact-storage-generations":
         def _compact_storage_generations() -> dict[str, object]:
             from dataclasses import asdict

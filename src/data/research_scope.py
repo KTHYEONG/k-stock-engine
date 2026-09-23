@@ -22,7 +22,7 @@ __all__ = [
 OPENDART_DAILY_LIMIT = 20000
 _FISCAL_PATTERN = re.compile(r"\d{4}Q[1-4]")
 _SCOPE_PATTERN = re.compile(r"[a-z0-9]+(?:_[a-z0-9]+)*")
-_FISCAL_FLOOR = "2019Q1"
+_FISCAL_FLOOR = "2016Q1"
 
 
 def _fiscal_key(period: str) -> int:

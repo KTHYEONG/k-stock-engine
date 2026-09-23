@@ -446,3 +446,21 @@ def test_silver_publish_streamed_table_reuses_and_versions_datasets(tmp_path) ->
         report=report, decision_time=decision,
     )
     assert fourth == third
+
+
+def test_certify_corporate_action_refresh_requires_core_evidence(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    import polars as pl
+    import pytest
+
+    from src.data.schemas import PITDataError
+    from src.data.silver import certify_corporate_action_refresh
+
+    with pytest.raises(PITDataError, match="missing required evidence"):
+        certify_corporate_action_refresh(
+            action_frame=pl.DataFrame({"instrument_id": ["KRX:005930"]}),
+            receipts={},
+            silver_root=tmp_path / "silver",
+            decision_time=datetime(2024, 1, 2, tzinfo=UTC),
+        )

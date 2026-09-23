@@ -135,11 +135,11 @@ def _require_silver_report(report: Any | None, request: StockDataRebuildRequest)
     if not isinstance(source_hashes, _Mapping):
         raise ValueError("purge requires certified Silver report spanning backtest coverage (Silver)")
     try:
-        has_all = all(k in source_hashes for k in EvidenceKind if k is not EvidenceKind.LIFECYCLE_EVENTS)
+        has_all = all(k in source_hashes for k in EvidenceKind if k is not EvidenceKind.LIFECYCLE_EVENTS and k is not EvidenceKind.INDUSTRY)
     except Exception as exc:
         raise ValueError("purge requires certified Silver report with all EvidenceKind hashes (Silver)") from exc
     if not has_all:
-        missing = [k.value for k in EvidenceKind if k not in source_hashes]
+        missing = [k.value for k in EvidenceKind if k not in source_hashes and k is not EvidenceKind.INDUSTRY]
         raise ValueError(f"purge requires certified Silver report with all EvidenceKind hashes, missing: {missing} (Silver)")
     if not getattr(report, "report_hash", ""):
         raise ValueError("purge requires certified Silver report with report_hash (Silver)")

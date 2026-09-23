@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from typing import ClassVar
 
 from src.data.cli import _parse_args
 from src.data.collection import CollectionArtifact, InvestorFlowBatchProgress
@@ -2439,3 +2440,251 @@ def test_build_investor_flow_kis_supplement_command_emits_coverage(tmp_path, cap
     assert emitted["dataset_id"].startswith("investor_flow_kis_supplement_")
     assert emitted["filled_cells"] == 1
     assert emitted["still_missing_cells"] == 1
+
+
+def test_build_investor_flow_union_command_emits_dataset(tmp_path, capsys) -> None:
+    import json
+    from datetime import date, datetime
+
+    import polars as pl
+
+    from src.core.time import KRX_TZ
+    from src.data.cli import main
+    from src.data.runtime import load_data_runtime
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+    s1, s2 = date(2024, 1, 2), date(2024, 1, 3)
+
+    def _row(provider, session, ticker, values):
+        return {
+            "session": session,
+            "instrument_id": f"KRX:{ticker}",
+            "ticker": ticker,
+            "provider": provider,
+            "individual_net_shares": values[0],
+            "foreign_net_shares": values[1],
+            "institution_net_shares": values[2],
+            "other_net_shares": values[3],
+            "available_at": datetime(session.year, session.month, session.day, 8, 0, tzinfo=KRX_TZ),
+            "source_hash": f"{provider}-{ticker}",
+            "policy_version": "test-v1",
+        }
+
+    ls_row = _row("LS", s1, "000001", (100, -60, -30, -10)) | {"ls_close": 50000}
+    ls_flow = runtime.workspace.silver_root / "investor_flow_cli_ls"
+    _write_cli_gap_dataset(
+        ls_flow,
+        pl.DataFrame(
+            [ls_row],
+            schema={**dict.fromkeys(ls_row, pl.String), **{
+                "session": pl.Date,
+                "individual_net_shares": pl.Int64,
+                "foreign_net_shares": pl.Int64,
+                "institution_net_shares": pl.Int64,
+                "other_net_shares": pl.Int64,
+                "ls_close": pl.Int64,
+                "available_at": pl.Datetime("us", "Asia/Seoul"),
+            }},
+        ),
+    )
+    kis_flow = runtime.workspace.silver_root / "investor_flow_kis_supplement_cli"
+    _write_cli_gap_dataset(
+        kis_flow,
+        pl.DataFrame([_row("KIS", s2, "000002", (50, -30, -10, -10))]),
+    )
+    assert main([
+        "build-investor-flow-union",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+        "--ls-flow-dataset-id", ls_flow.name,
+        "--kis-supplement-dataset-id", kis_flow.name,
+    ]) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["dataset_id"].startswith("investor_flow_")
+    assert emitted["rows"] == 2
+    assert emitted["ls_dataset_id"] == ls_flow.name
+    assert emitted["kis_supplement_dataset_id"] == kis_flow.name
+
+
+def _write_cli_universe_dataset(silver_root, rows) -> object:
+    import polars as pl
+
+    dataset = silver_root / "ordinary_universe_cli"
+    part_dir = dataset / "session=2024-01-02"
+    part_dir.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(rows, schema={"ticker": pl.String, "eligible": pl.Boolean}).write_parquet(
+        part_dir / "part.parquet"
+    )
+    return dataset
+
+
+class _StubIndustryCollector:
+    calls: ClassVar[list] = []
+
+    def __init__(self, symbols, client=None) -> None:
+        self.symbols = tuple(symbols)
+
+    def fetch_industry_classification(self, *, bronze_root, retrieved_at=None):
+        type(self).calls.append(self.symbols)
+        return [{"provider": "KIS", "symbol": symbol} for symbol in self.symbols]
+
+
+def test_collect_industry_classification_from_symbols_file(tmp_path, monkeypatch, capsys) -> None:
+    import json
+
+    from src.data.cli import main
+    from src.data.runtime import load_data_runtime
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+    symbols_file = tmp_path / "symbols.txt"
+    symbols_file.write_text("005930\n 000660\n005930\n", encoding="utf-8")
+    _StubIndustryCollector.calls = []
+    monkeypatch.setattr(
+        "src.integrations.kis.industry.KisIndustryCollector", _StubIndustryCollector
+    )
+    assert main([
+        "collect-industry-classification",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+        "--symbols-from", str(symbols_file),
+        "--pace-seconds", "0",
+    ]) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted == {"symbols_requested": 2, "pages_collected": 2}
+    assert _StubIndustryCollector.calls == [("005930",), ("000660",)]
+
+
+def test_collect_industry_classification_defaults_to_universe(tmp_path, monkeypatch, capsys) -> None:
+    import json
+
+    from src.data.cli import main
+    from src.data.runtime import load_data_runtime
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+    _write_cli_universe_dataset(
+        runtime.workspace.silver_root,
+        [
+            {"ticker": "005930", "eligible": True},
+            {"ticker": "000001", "eligible": False},
+            {"ticker": "000660", "eligible": True},
+        ],
+    )
+    _StubIndustryCollector.calls = []
+    monkeypatch.setattr(
+        "src.integrations.kis.industry.KisIndustryCollector", _StubIndustryCollector
+    )
+    assert main([
+        "collect-industry-classification",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+        "--pace-seconds", "0",
+    ]) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted == {"symbols_requested": 2, "pages_collected": 2}
+    assert _StubIndustryCollector.calls == [("000660",), ("005930",)]
+
+
+def test_collect_industry_classification_rejects_empty_symbols_file(tmp_path, capsys) -> None:
+    import json
+
+    from src.data.cli import main
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    symbols_file = tmp_path / "symbols.txt"
+    symbols_file.write_text("  \n", encoding="utf-8")
+    assert main([
+        "collect-industry-classification",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+        "--symbols-from", str(symbols_file),
+    ]) == 1
+    assert "error" in json.loads(capsys.readouterr().out)
+
+
+def test_collect_industry_classification_requires_universe(tmp_path, capsys) -> None:
+    import json
+
+    from src.data.cli import main
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    assert main([
+        "collect-industry-classification",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+    ]) == 1
+    assert "error" in json.loads(capsys.readouterr().out)
+
+
+def test_collect_industry_classification_requires_universe_partitions(tmp_path, capsys) -> None:
+    import json
+
+    from src.data.cli import main
+    from src.data.runtime import load_data_runtime
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+    (runtime.workspace.silver_root / "ordinary_universe_cli").mkdir(parents=True)
+    assert main([
+        "collect-industry-classification",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+    ]) == 1
+    assert "error" in json.loads(capsys.readouterr().out)
+
+
+def test_collect_industry_classification_requires_eligible_tickers(tmp_path, capsys) -> None:
+    import json
+
+    from src.data.cli import main
+    from src.data.runtime import load_data_runtime
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+    _write_cli_universe_dataset(
+        runtime.workspace.silver_root, [{"ticker": "000001", "eligible": False}]
+    )
+    assert main([
+        "collect-industry-classification",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+    ]) == 1
+    assert "error" in json.loads(capsys.readouterr().out)
+
+
+def test_build_industry_classification_silver_command_emits_dataset(tmp_path, capsys) -> None:
+    import json
+    from datetime import UTC, datetime
+
+    from src.data.bronze import BronzeStore
+    from src.data.cli import main
+    from src.data.runtime import load_data_runtime
+    from src.data.schemas import EvidenceKind
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+    collected_at = datetime(2024, 1, 3, 9, 0, tzinfo=UTC)
+    payload = {
+        "provider": "KIS",
+        "endpoint": "inquire-price",
+        "symbol": "005930",
+        "collected_at": collected_at.isoformat(),
+        "output": {"bstp_kor_isnm": "전기·전자", "rprs_mrkt_kor_name": "KOSPI"},
+        "records": [{"ticker": "005930", "industry_name": "전기·전자", "market_name": "KOSPI"}],
+    }
+    BronzeStore(runtime.workspace.bronze_root).import_bytes(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8"),
+        kind=EvidenceKind.INDUSTRY,
+        retrieved_at=collected_at,
+        source_label="KIS:inquire-price:005930:2024-01-03",
+    )
+    assert main([
+        "build-industry-classification-silver",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+    ]) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["dataset_id"].startswith("industry_")
+    assert emitted["rows"] == 1
