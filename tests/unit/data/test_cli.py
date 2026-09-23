@@ -1,6 +1,8 @@
 import sys
+from pathlib import Path
 
 from src.data.cli import _parse_args
+from src.data.collection import CollectionArtifact, InvestorFlowBatchProgress
 
 
 def test_collect_command_requires_immutable_plan_id(monkeypatch) -> None:
@@ -10,6 +12,390 @@ def test_collect_command_requires_immutable_plan_id(monkeypatch) -> None:
 
     assert args.command == "collect"
     assert args.plan_id == "plan-a"
+
+
+def _write_ls_backfill_plan(path: Path, *, symbols: tuple[str, ...] = ("005930", "000660"), plan_id: str = "plan-ls") -> dict[str, object]:
+    import json
+
+    sessions = ["2026-03-06"]
+    payload: dict[str, object] = {
+        "plan_id": plan_id,
+        "content_hash": "e" * 64,
+        "coverage_start": sessions[0],
+        "coverage_end": sessions[-1],
+        "chunk_size": 1,
+        "chunks": [
+            {"chunk_id": f"{plan_id}:{index:04d}", "symbol": symbol, "sessions": sessions}
+            for index, symbol in enumerate(symbols)
+        ],
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return payload
+
+
+def _ls_backfill_artifact(
+    tmp_path: Path,
+    name: str,
+    *,
+    plan_id: str = "plan-ls",
+    provider_errors: int = 0,
+    completed: int = 1,
+    planned: int = 1,
+) -> CollectionArtifact:
+    import json
+    from datetime import UTC, date, datetime
+
+    report = tmp_path / f"{name}-report.json"
+    report.write_text(
+        json.dumps({"plan_id": plan_id, "plan_digest": "e" * 64, "content_hash": "c" * 64}),
+        encoding="utf-8",
+    )
+    return CollectionArtifact(
+        bronze_root=tmp_path / "bronze",
+        coverage_start=date(2026, 3, 6),
+        coverage_end=date(2026, 3, 6),
+        retrieved_at=datetime(2026, 9, 20, tzinfo=UTC),
+        receipts={},
+        content_hash="c" * 64,
+        report_path=report,
+        planned_chunks=planned,
+        completed_chunks=completed,
+        previously_completed_chunks=0,
+        pending_chunks=provider_errors,
+        provider_error_chunks=provider_errors,
+        missing_session_chunks=0,
+        receipt_count=planned,
+    )
+
+
+def _ls_backfill_progress(batch_index: int, chunk_offset: int, artifact: CollectionArtifact) -> InvestorFlowBatchProgress:
+    return InvestorFlowBatchProgress(batch_index=batch_index, chunk_offset=chunk_offset, artifact=artifact)
+
+
+def test_backfill_ls_reuses_single_collector(tmp_path, monkeypatch, capsys) -> None:
+    import src.data.cli as cli
+
+    plan_file = tmp_path / "scoped" / "plan.json"
+    plan_file.parent.mkdir(parents=True)
+    _write_ls_backfill_plan(plan_file, symbols=("005930", "000660", "000660"))
+    factory_calls: list[tuple[str, ...]] = []
+
+    class StubCollector:
+        pass
+
+    def factory(symbols) -> StubCollector:
+        factory_calls.append(tuple(symbols))
+        return StubCollector()
+
+    captured: dict[str, object] = {}
+    artifacts = [_ls_backfill_artifact(tmp_path, f"ok-{i}") for i in range(3)]
+
+    def fake_iter(**kwargs) -> object:
+        captured.update(kwargs)
+        return [
+            _ls_backfill_progress(0, 0, artifacts[0]),
+            _ls_backfill_progress(1, 1, artifacts[1]),
+            _ls_backfill_progress(2, 2, artifacts[2]),
+        ]
+
+    monkeypatch.setattr(cli, "LsInvestorFlowCollector", factory)
+    monkeypatch.setattr(cli, "iter_planned_investor_flow_backfill", fake_iter)
+    args = [
+        "backfill-ls-investor-flow",
+        "--plan-path", str(plan_file),
+        "--bronze-root", str(tmp_path / "bronze"),
+        "--checkpoint-root", str(tmp_path / "ckpt"),
+        "--chunk-batch-size", "1",
+    ]
+    assert cli.main(args) == 0
+    assert factory_calls == [("000660", "005930")]
+    assert isinstance(captured["collector"], StubCollector)
+    assert captured["provider"] == "ls"
+    assert captured["chunk_batch_size"] == 1
+    assert len(capsys.readouterr().out.strip().splitlines()) == 3
+    from collections.abc import Callable
+    from datetime import datetime
+    from typing import cast
+
+    utc_factory = cast("Callable[[], datetime]", captured["retrieved_at_factory"])
+    assert utc_factory().tzinfo is not None
+
+
+def test_backfill_ls_plan_path_is_authoritative(tmp_path, monkeypatch, capsys) -> None:
+    import src.data.cli as cli
+
+    plan_file = tmp_path / "research" / "state" / "plan.json"
+    plan_file.parent.mkdir(parents=True)
+    _write_ls_backfill_plan(plan_file, symbols=("005930",))
+
+    def forbidden_plan_id(*_args, **_kwargs) -> object:
+        raise AssertionError("plan-ID lookup must not be used")
+
+    monkeypatch.setattr(cli, "load_collection_plan", forbidden_plan_id)
+    monkeypatch.setattr(cli, "LsInvestorFlowCollector", lambda symbols: object())
+    monkeypatch.setattr(
+        cli,
+        "iter_planned_investor_flow_backfill",
+        lambda **_kwargs: iter([_ls_backfill_progress(0, 0, _ls_backfill_artifact(tmp_path, "auth"))]),
+    )
+    args = [
+        "backfill-ls-investor-flow",
+        "--plan-path", str(plan_file),
+        "--bronze-root", str(tmp_path / "bronze"),
+        "--checkpoint-root", str(tmp_path / "ckpt"),
+    ]
+    assert cli.main(args) == 0
+    assert '"plan_id": "plan-ls"' in capsys.readouterr().out
+
+
+def test_flow_backfill_progress_payload_exposes_accounting_only(tmp_path) -> None:
+    import json
+    from datetime import UTC, datetime
+
+    from src.data.cli import _flow_backfill_progress_payload
+    from src.data.collection import CollectionCheckpointStore, InvestorFlowBatchProgress, iter_planned_investor_flow_backfill
+
+    plan_file = tmp_path / "plan.json"
+    _write_ls_backfill_plan(plan_file, symbols=("005930",))
+    from src.data.collection_plan import load_collection_plan_path
+
+    plan = load_collection_plan_path(plan_file)
+
+    class StubCollector:
+        def fetch_investor_flow(self, start, end, **kwargs):
+            return (
+                {
+                    "records": [
+                        {
+                            "ticker": "005930",
+                            "session": "20260306",
+                            "unit": "shares",
+                            "individual_net_shares": "-3",
+                            "foreign_net_shares": "1",
+                            "institution_net_shares": "2",
+                            "other_net_shares": "0",
+                        }
+                    ]
+                },
+            )
+
+        def close(self) -> None:
+            return None
+
+    progress = next(
+        iter(
+            iter_planned_investor_flow_backfill(
+                plan=plan,
+                provider="ls",
+                collector=StubCollector(),
+                bronze_root=tmp_path / "bronze",
+                retrieved_at_factory=lambda: datetime(2026, 9, 20, tzinfo=UTC),
+                checkpoint_store=CollectionCheckpointStore(tmp_path / "ckpt"),
+                chunk_batch_size=10,
+            )
+        )
+    )
+    assert isinstance(progress, InvestorFlowBatchProgress)
+    payload = _flow_backfill_progress_payload(progress)
+    assert payload["plan_id"] == "plan-ls"
+    assert payload["batch_index"] == 0
+    assert payload["chunk_offset"] == 0
+    assert payload["planned_chunks"] == 1
+    assert payload["completed_chunks"] == 1
+    assert payload["previously_completed_chunks"] == 0
+    assert payload["pending_chunks"] == 0
+    assert payload["provider_error_chunks"] == 0
+    assert payload["missing_session_chunks"] == 0
+    assert payload["receipt_count"] >= 1
+    assert str(payload["report_path"]).endswith(".json")
+    blob = json.dumps(payload).lower()
+    for secret in ("token", "secret", "credential", "authorization", "response_body", "collector"):
+        assert secret not in blob
+
+
+def test_backfill_ls_default_consumes_all_batches(tmp_path, monkeypatch, capsys) -> None:
+    import src.data.cli as cli
+
+    plan_file = tmp_path / "plan.json"
+    _write_ls_backfill_plan(plan_file, symbols=("005930", "000660"))
+    monkeypatch.setattr(cli, "LsInvestorFlowCollector", lambda symbols: object())
+    artifacts = [_ls_backfill_artifact(tmp_path, f"all-{i}") for i in range(2)]
+    monkeypatch.setattr(
+        cli,
+        "iter_planned_investor_flow_backfill",
+        lambda **_kwargs: [
+            _ls_backfill_progress(0, 0, artifacts[0]),
+            _ls_backfill_progress(1, 1, artifacts[1]),
+        ],
+    )
+    assert cli.main(["backfill-ls-investor-flow", "--plan-path", str(plan_file),
+                     "--bronze-root", str(tmp_path / "bronze"),
+                     "--checkpoint-root", str(tmp_path / "ckpt")]) == 0
+    assert len(capsys.readouterr().out.strip().splitlines()) == 2
+
+
+def test_backfill_ls_max_batches_stops_at_whole_batch(tmp_path, monkeypatch, capsys) -> None:
+    import src.data.cli as cli
+
+    plan_file = tmp_path / "plan.json"
+    _write_ls_backfill_plan(plan_file, symbols=("005930",))
+    monkeypatch.setattr(cli, "LsInvestorFlowCollector", lambda symbols: object())
+    pulls: list[int] = []
+
+    def fake_iter(**_kwargs):
+        for index in range(5):
+            pulls.append(index)
+            yield _ls_backfill_progress(index, index, _ls_backfill_artifact(tmp_path, f"bound-{index}"))
+
+    monkeypatch.setattr(cli, "iter_planned_investor_flow_backfill", fake_iter)
+    assert cli.main(["backfill-ls-investor-flow", "--plan-path", str(plan_file),
+                     "--bronze-root", str(tmp_path / "bronze"),
+                     "--checkpoint-root", str(tmp_path / "ckpt"),
+                     "--max-batches", "2"]) == 0
+    assert len(capsys.readouterr().out.strip().splitlines()) == 2
+    assert pulls == [0, 1]
+
+
+def test_backfill_ls_invalid_batch_bound_fails_before_factory(tmp_path, monkeypatch) -> None:
+    import src.data.cli as cli
+
+    plan_file = tmp_path / "plan.json"
+    _write_ls_backfill_plan(plan_file, symbols=("005930",))
+
+    def factory(_symbols) -> object:
+        raise AssertionError("collector factory must not be invoked")
+
+    def fake_iter(**_kwargs):
+        raise AssertionError("iterator must not be invoked")
+
+    monkeypatch.setattr(cli, "LsInvestorFlowCollector", factory)
+    monkeypatch.setattr(cli, "iter_planned_investor_flow_backfill", fake_iter)
+    base = ["backfill-ls-investor-flow", "--plan-path", str(plan_file),
+            "--bronze-root", str(tmp_path / "bronze"),
+            "--checkpoint-root", str(tmp_path / "ckpt")]
+    assert cli.main([*base, "--chunk-batch-size", "0"]) == 1
+    assert cli.main([*base, "--chunk-batch-size", "501"]) == 1
+    assert cli.main([*base, "--max-batches", "0"]) == 1
+    assert cli.main([*base, "--max-batches", "-3"]) == 1
+
+
+def test_backfill_ls_naive_retrieved_at_fails_before_iterator(tmp_path, monkeypatch) -> None:
+    import src.data.cli as cli
+
+    plan_file = tmp_path / "plan.json"
+    _write_ls_backfill_plan(plan_file, symbols=("005930",))
+    monkeypatch.setattr(cli, "LsInvestorFlowCollector", lambda symbols: object())
+
+    def fake_iter(**_kwargs):
+        raise AssertionError("iterator must not be invoked")
+
+    monkeypatch.setattr(cli, "iter_planned_investor_flow_backfill", fake_iter)
+    base = ["backfill-ls-investor-flow", "--plan-path", str(plan_file),
+            "--bronze-root", str(tmp_path / "bronze"),
+            "--checkpoint-root", str(tmp_path / "ckpt")]
+    assert cli.main([*base, "--retrieved-at", "2026-09-20T00:00:00"]) == 1
+    assert cli.main([*base, "--retrieved-at", "not-a-date"]) == 1
+
+
+def test_backfill_ls_fixed_retrieved_at_replays_deterministically(tmp_path, monkeypatch, capsys) -> None:
+    from collections.abc import Callable
+    from datetime import datetime
+    from typing import cast
+
+    import src.data.cli as cli
+
+    plan_file = tmp_path / "plan.json"
+    _write_ls_backfill_plan(plan_file, symbols=("005930",))
+    monkeypatch.setattr(cli, "LsInvestorFlowCollector", lambda symbols: object())
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        cli, "iter_planned_investor_flow_backfill",
+        lambda **kwargs: captured.update(kwargs) or iter([_ls_backfill_progress(0, 0, _ls_backfill_artifact(tmp_path, "fixed"))]),
+    )
+    stamp = "2026-09-20T00:00:00+00:00"
+    assert cli.main(["backfill-ls-investor-flow", "--plan-path", str(plan_file),
+                     "--bronze-root", str(tmp_path / "bronze"),
+                     "--checkpoint-root", str(tmp_path / "ckpt"),
+                     "--retrieved-at", stamp]) == 0
+    replay = cast("Callable[[], datetime]", captured["retrieved_at_factory"])
+    assert replay().isoformat() == stamp
+    assert replay().isoformat() == stamp
+    capsys.readouterr()
+
+
+def test_backfill_ls_provider_failure_emits_counts_without_certification(tmp_path, monkeypatch, capsys) -> None:
+    import src.data.cli as cli
+
+    plan_file = tmp_path / "plan.json"
+    _write_ls_backfill_plan(plan_file, symbols=("005930",))
+    monkeypatch.setattr(cli, "LsInvestorFlowCollector", lambda symbols: object())
+    artifact = _ls_backfill_artifact(tmp_path, "err", provider_errors=2, completed=0, planned=2)
+    monkeypatch.setattr(
+        cli, "iter_planned_investor_flow_backfill",
+        lambda **_kwargs: iter([_ls_backfill_progress(0, 0, artifact)]),
+    )
+    assert cli.main(["backfill-ls-investor-flow", "--plan-path", str(plan_file),
+                     "--bronze-root", str(tmp_path / "bronze"),
+                     "--checkpoint-root", str(tmp_path / "ckpt")]) == 0
+    out = capsys.readouterr().out.lower()
+    assert '"provider_error_chunks": 2' in out
+    assert "silver" not in out
+    assert "certif" not in out
+
+
+def test_backfill_ls_reports_plan_collector_and_iteration_failures(tmp_path, monkeypatch, capsys) -> None:
+    import src.data.cli as cli
+    from src.data.schemas import PITDataError
+
+    plan_file = tmp_path / "plan.json"
+    _write_ls_backfill_plan(plan_file, symbols=("005930",))
+    base = ["backfill-ls-investor-flow", "--plan-path", str(plan_file),
+            "--bronze-root", str(tmp_path / "bronze"),
+            "--checkpoint-root", str(tmp_path / "ckpt")]
+    assert cli.main(["backfill-ls-investor-flow", "--plan-path", str(tmp_path / "missing.json"),
+                     "--bronze-root", str(tmp_path / "bronze"),
+                     "--checkpoint-root", str(tmp_path / "ckpt")]) == 1
+
+    def broken_factory(_symbols) -> object:
+        raise PITDataError("no credentials")
+
+    monkeypatch.setattr(cli, "LsInvestorFlowCollector", broken_factory)
+    assert cli.main(base) == 1
+
+    monkeypatch.setattr(cli, "LsInvestorFlowCollector", lambda symbols: object())
+
+    def broken_iter(**_kwargs):
+        raise PITDataError("provider contract failed")
+        yield
+
+    monkeypatch.setattr(cli, "iter_planned_investor_flow_backfill", broken_iter)
+    assert cli.main(base) == 1
+    assert "provider contract failed" in capsys.readouterr().out
+
+
+def test_flow_backfill_progress_payload_tolerates_unreadable_reports(tmp_path) -> None:
+    from src.data.cli import _flow_backfill_progress_payload
+
+    artifact = _ls_backfill_artifact(tmp_path, "missing-report")
+    import os
+
+    os.remove(tmp_path / "missing-report-report.json")
+    payload = _flow_backfill_progress_payload(_ls_backfill_progress(0, 0, artifact))
+    assert payload["plan_id"] == ""
+    assert payload["content_hash"] == "c" * 64
+
+    corrupt_artifact = _ls_backfill_artifact(tmp_path, "corrupt")
+    corrupt = tmp_path / "corrupt-report.json"
+    corrupt.write_text("{not json", encoding="utf-8")
+    payload = _flow_backfill_progress_payload(_ls_backfill_progress(1, 2, corrupt_artifact))
+    assert payload["batch_index"] == 1
+    assert payload["chunk_offset"] == 2
+
+    listed_artifact = _ls_backfill_artifact(tmp_path, "listed")
+    listed = tmp_path / "listed-report.json"
+    listed.write_text("[1, 2]", encoding="utf-8")
+    payload = _flow_backfill_progress_payload(_ls_backfill_progress(0, 0, listed_artifact))
+    assert payload["plan_id"] == ""
 
 
 def test_legacy_missing_dart_facts_command_reports_success_and_domain_error(
@@ -1455,3 +1841,296 @@ def test_run_backtest_champion_rejects_uninformative_gold_scores(tmp_path, monke
             scenario="base",
             ledger_id="champion-test-2016",
         ))
+
+
+def test_build_investor_flow_silver_command_emits_dataset_counts(tmp_path, capsys) -> None:
+    import hashlib
+    import json
+
+    from src.data.cli import main
+    from src.data.runtime import load_data_runtime
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+    universe = runtime.workspace.silver_root / "ordinary_universe_cli"
+    universe.mkdir(parents=True, exist_ok=True)
+    (universe / "manifest.json").write_text(
+        json.dumps({
+            "dataset_id": universe.name,
+            "policy_version": "krx-ordinary-equity-v1",
+            "partitions": [{"session": "2026-03-04"}, {"session": "2026-03-05"}],
+        }),
+        encoding="utf-8",
+    )
+    row = {
+        "date": "20260304",
+        "tjj0000": "-100", "tjj0001": "-50", "tjj0002": "-30", "tjj0003": "-20",
+        "tjj0004": "-10", "tjj0005": "-10", "tjj0006": "-8", "tjj0007": "100",
+        "tjj0008": "927", "tjj0009": "-800", "tjj0010": "-28", "tjj0011": "29",
+        "tjj0016": "-828", "tjj0017": "129", "tjj0018": "-228",
+        "close": "50000", "volume": "10000", "value": "500",
+    }
+    payload = {
+        "provider": "LS", "endpoint": "frgr-itt", "symbol": "005930", "anchor": "2026-03-04",
+        "query": {"symbol": "005930", "start": "2026-03-04", "end": "2026-03-04"},
+        "rows": [row], "records": [],
+    }
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    page_dir = runtime.workspace.bronze_root / "investor_flow" / hashlib.sha256(raw).hexdigest()
+    page_dir.mkdir(parents=True, exist_ok=True)
+    (page_dir / "payload.json").write_bytes(raw)
+    assert main([
+        "build-investor-flow-silver",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+        "--workers", "1",
+    ]) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["dataset_id"].startswith("investor_flow_")
+    assert emitted["rows"] == 1
+
+
+def test_build_daily_market_silver_command_emits_dataset_counts(tmp_path, capsys) -> None:
+    import hashlib
+    import json
+
+    from src.data.cli import main
+    from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog, ReceiptIndexEntry
+    from src.data.runtime import load_data_runtime
+    from datetime import UTC, date, datetime
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+    universe = runtime.workspace.silver_root / "ordinary_universe_cli"
+    universe.mkdir(parents=True, exist_ok=True)
+    (universe / "manifest.json").write_text(
+        json.dumps({
+            "dataset_id": universe.name,
+            "policy_version": "krx-ordinary-equity-v1",
+            "partitions": [{"session": "2026-03-04"}],
+        }),
+        encoding="utf-8",
+    )
+    record = {
+        "ISU_CD": "KR7005930003", "ISU_SRT_CD": "005930", "MKT_NM": "KOSPI", "BAS_DD": "20260304",
+        "TDD_OPNPRC": "10500", "TDD_HGPRC": "11200", "TDD_LWPRC": "10300", "TDD_CLSPRC": "11000",
+        "CMPPREVDD_PRC": "1000", "FLUC_RT": "10.0", "ACC_TRDVOL": "1000", "ACC_TRDVAL": "11000000",
+        "MKTCAP": "660000000000", "LIST_SHRS": "60000000",
+    }
+    raw = json.dumps({"session": "2026-03-04", "records": [record]}, sort_keys=True).encode("utf-8")
+    page_path = tmp_path / "krx-page.json"
+    page_path.write_bytes(raw)
+    ReceiptCatalog(runtime.workspace.bronze_root / "catalog").publish([
+        ReceiptIndexEntry(
+            source="krx_daily_market",
+            natural_key="2026-03-04",
+            as_of=date(2026, 3, 4),
+            fiscal_period=None,
+            status=EvidenceStatus.SUCCESS,
+            content_hash=hashlib.sha256(raw).hexdigest(),
+            retrieved_at=datetime(2026, 3, 5, tzinfo=UTC),
+            payload_path=page_path,
+        )
+    ])
+    assert main([
+        "build-daily-market-silver",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+    ]) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["dataset_id"].startswith("daily_market_")
+    assert emitted["rows"] == 1
+
+
+def test_build_market_panel_command_emits_dataset_counts(tmp_path, capsys) -> None:
+    import hashlib
+    import json
+    from datetime import date, datetime
+
+    import polars as pl
+
+    from src.core.time import KRX_TZ
+    from src.data.cli import main
+    from src.data.runtime import load_data_runtime
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+    sessions = [date(2020, 1, 6), date(2020, 1, 7), date(2020, 1, 8)]
+
+    def daily_row(session: date, ticker: str, close: int, change: int, volume: int) -> dict[str, object]:
+        return {
+            "session": session, "instrument_id": f"KRX:{ticker}", "ticker": ticker, "market": "KOSPI",
+            "open": close, "high": close, "low": close, "close": close, "change": change,
+            "base_price": close - change, "volume": volume, "trading_value": close * volume,
+            "market_cap": close * 1000, "listed_shares": 1000, "price_state": "tradable",
+            "invalid_reason": None,
+            "available_at": datetime(session.year, session.month, session.day, 18, 0, tzinfo=KRX_TZ),
+            "source_hash": "a" * 64, "policy_version": "krx-daily-market-v1",
+        }
+
+    def tickers_for(session: date) -> list[str]:
+        return ["005930", "000660"] if session != sessions[2] else ["005930"]
+
+    daily_dir = runtime.workspace.silver_root / "daily_market_cli"
+    universe_dir = runtime.workspace.silver_root / "ordinary_universe_cli"
+    daily_parts = []
+    universe_parts = []
+    for session in sessions:
+        tickers = tickers_for(session)
+        rows = [
+            daily_row(session, ticker, 10000 if ticker == "005930" else 5000, 0,
+                      0 if (ticker, session) == ("000660", sessions[1]) else 100)
+            for ticker in tickers
+        ]
+        rel = f"session={session.isoformat()}/part.parquet"
+        out = daily_dir / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+        frame = pl.DataFrame(rows).sort("ticker")
+        frame.write_parquet(out)
+        daily_parts.append({"session": session.isoformat(), "path": rel, "source_hash": "b" * 64,
+                            "row_count": frame.height,
+                            "parquet_sha256": hashlib.sha256(out.read_bytes()).hexdigest()})
+        urows = [{"instrument_id": f"KRX:{ticker}", "ticker": ticker, "eligible": True, "exclusion_reason": "eligible"}
+                 for ticker in tickers]
+        urel = f"session={session.isoformat()}/part.parquet"
+        uout = universe_dir / urel
+        uout.parent.mkdir(parents=True, exist_ok=True)
+        uframe = pl.DataFrame(urows).sort("instrument_id")
+        uframe.write_parquet(uout)
+        universe_parts.append({"session": session.isoformat(), "path": urel, "source_hash": "c" * 64,
+                               "row_count": uframe.height,
+                               "parquet_sha256": hashlib.sha256(uout.read_bytes()).hexdigest()})
+    (daily_dir / "manifest.json").write_text(json.dumps({"dataset_id": daily_dir.name, "policy_version": "krx-daily-market-v1", "partitions": daily_parts}), encoding="utf-8")
+    (universe_dir / "manifest.json").write_text(json.dumps({"dataset_id": universe_dir.name, "policy_version": "krx-ordinary-equity-v1", "partitions": universe_parts}), encoding="utf-8")
+    assert main([
+        "build-market-panel",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+        "--daily-market-dataset-id", daily_dir.name,
+        "--universe-dataset-id", universe_dir.name,
+    ]) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["dataset_id"].startswith("market_panel_")
+    assert emitted["rows"] == 5
+    assert emitted["exits_halted"] == 1
+
+
+def test_build_market_panel_command_forwards_instrument_buckets(tmp_path, capsys) -> None:
+    import hashlib
+    import json
+    from datetime import date, datetime
+
+    import polars as pl
+
+    from src.core.time import KRX_TZ
+    from src.data.cli import main
+    from src.data.runtime import load_data_runtime
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+    sessions = [date(2020, 1, 6), date(2020, 1, 7), date(2020, 1, 8)]
+
+    def daily_row(session: date, ticker: str) -> dict[str, object]:
+        return {
+            "session": session, "instrument_id": f"KRX:{ticker}", "ticker": ticker, "market": "KOSPI",
+            "open": 10000, "high": 10000, "low": 10000, "close": 10000, "change": 0,
+            "base_price": 10000, "volume": 100, "trading_value": 1000000,
+            "market_cap": 10000000, "listed_shares": 1000, "price_state": "tradable",
+            "invalid_reason": None,
+            "available_at": datetime(session.year, session.month, session.day, 18, 0, tzinfo=KRX_TZ),
+            "source_hash": "a" * 64, "policy_version": "krx-daily-market-v1",
+        }
+
+    daily_dir = runtime.workspace.silver_root / "daily_market_buckets"
+    universe_dir = runtime.workspace.silver_root / "ordinary_universe_buckets"
+    daily_parts = []
+    universe_parts = []
+    for session in sessions:
+        rows = [daily_row(session, ticker) for ticker in ("005930", "000660")]
+        rel = f"session={session.isoformat()}/part.parquet"
+        out = daily_dir / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+        frame = pl.DataFrame(rows).sort("ticker")
+        frame.write_parquet(out)
+        daily_parts.append({"session": session.isoformat(), "path": rel, "source_hash": "b" * 64,
+                            "row_count": frame.height,
+                            "parquet_sha256": hashlib.sha256(out.read_bytes()).hexdigest()})
+        urows = [{"instrument_id": f"KRX:{ticker}", "ticker": ticker, "eligible": True, "exclusion_reason": "eligible"}
+                 for ticker in ("005930", "000660")]
+        urel = f"session={session.isoformat()}/part.parquet"
+        uout = universe_dir / urel
+        uout.parent.mkdir(parents=True, exist_ok=True)
+        uframe = pl.DataFrame(urows).sort("instrument_id")
+        uframe.write_parquet(uout)
+        universe_parts.append({"session": session.isoformat(), "path": urel, "source_hash": "c" * 64,
+                               "row_count": uframe.height,
+                               "parquet_sha256": hashlib.sha256(uout.read_bytes()).hexdigest()})
+    (daily_dir / "manifest.json").write_text(json.dumps({"dataset_id": daily_dir.name, "policy_version": "krx-daily-market-v1", "partitions": daily_parts}), encoding="utf-8")
+    (universe_dir / "manifest.json").write_text(json.dumps({"dataset_id": universe_dir.name, "policy_version": "krx-ordinary-equity-v1", "partitions": universe_parts}), encoding="utf-8")
+    assert main([
+        "build-market-panel",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+        "--daily-market-dataset-id", daily_dir.name,
+        "--universe-dataset-id", universe_dir.name,
+        "--instrument-buckets", "4",
+    ]) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["dataset_id"].startswith("market_panel_")
+    assert Path(emitted["dataset_path"]).exists()
+    assert main([
+        "build-market-panel",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+        "--daily-market-dataset-id", daily_dir.name,
+        "--universe-dataset-id", universe_dir.name,
+    ]) == 0
+    default_emitted = json.loads(capsys.readouterr().out)
+    assert emitted["dataset_id"] == default_emitted["dataset_id"]
+
+
+def test_build_reference_benchmarks_command_lists_all_ids(tmp_path, capsys) -> None:
+    import hashlib
+    import json
+    from datetime import date
+
+    import polars as pl
+
+    from src.data.cli import main
+    from src.data.runtime import load_data_runtime
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+    sessions = [date(2020, 1, 6), date(2020, 1, 7), date(2020, 1, 8)]
+    panel_dir = runtime.workspace.gold_root / "market_panel_cli"
+    partitions = []
+    for year, days in ((2020, sessions),):
+        rows = []
+        for session in days:
+            for ticker, cap, ret in (("005930", 300, 0.04), ("000660", 100, 0.0)):
+                rows.append({
+                    "session": session, "instrument_id": f"KRX:{ticker}", "eligible": True,
+                    "price_state": "tradable", "adtv20": 2_000_000_000.0,
+                    "market_cap": cap, "ret_price": 0.0 if session == sessions[0] else ret,
+                })
+        rel = f"year={year}/part.parquet"
+        out = panel_dir / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+        frame = pl.DataFrame(rows).sort(["instrument_id", "session"])
+        frame.write_parquet(out)
+        partitions.append({"year": year, "path": rel, "row_count": frame.height,
+                           "parquet_sha256": hashlib.sha256(out.read_bytes()).hexdigest()})
+    (panel_dir / "manifest.json").write_text(
+        json.dumps({"dataset_id": panel_dir.name, "policy_version": "krx-market-panel-v2",
+                    "partitions": partitions}), encoding="utf-8")
+    assert main([
+        "build-reference-benchmarks",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+        "--market-panel-dataset-id", panel_dir.name,
+    ]) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["dataset_id"].startswith("reference_benchmarks_")
+    assert sorted(emitted["benchmarks"]) == [
+        "eligible_cw_pr", "eligible_ew_pr", "liquid1b_cw_pr", "liquid1b_ew_pr",
+    ]

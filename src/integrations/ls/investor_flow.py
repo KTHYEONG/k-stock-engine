@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Iterable
 from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +14,7 @@ from src.integrations.ls.client import LsClient, LsCredentials
 
 
 class LsInvestorFlowCollector:
-    """Collect per-ticker LS transaction-value investor flows in multi-year batches."""
+    """Collect per-ticker LS t1702 net share quantities by investor group in multi-year batches."""
 
     def __init__(self, symbols: tuple[str, ...], *, client: Any | None = None) -> None:
         cleaned = tuple(dict.fromkeys(symbol.strip() for symbol in symbols if symbol.strip()))
@@ -20,6 +22,20 @@ class LsInvestorFlowCollector:
             raise ValueError("LS investor flow requires at least one symbol")
         self._symbols = cleaned
         self._client = client or LsClient(LsCredentials.from_env())
+
+    def close(self) -> None:
+        """Release the retained LS client after a bounded collection run."""
+        closer = getattr(self._client, "close", None)
+        if callable(closer):
+            closer()
+
+    def __enter__(self) -> LsInvestorFlowCollector:
+        """Enter a sequential LS collection lifetime without issuing a request."""
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        """Close the owned LS client regardless of collection outcome."""
+        self.close()
 
     @staticmethod
     def _session(value: object) -> date:
@@ -32,40 +48,71 @@ class LsInvestorFlowCollector:
             raise PITDataError("LS investor flow has invalid session") from exc
 
     @staticmethod
-    def _value(row: dict[str, Any], field: str) -> float:
+    def _shares(row: dict[str, Any], field: str) -> int:
         raw = row.get(field)
-        if raw is None or str(raw).strip() == "":
+        if raw is None or (isinstance(raw, str) and raw.strip() == ""):
             raise PITDataError(f"LS investor flow missing {field}")
+        if isinstance(raw, bool):
+            raise PITDataError(f"LS investor flow has invalid {field}")
+        if isinstance(raw, int):
+            return raw
+        if isinstance(raw, float):
+            if not math.isfinite(raw) or not raw.is_integer():
+                raise PITDataError(f"LS investor flow has non-integral {field}")
+            return int(raw)
         try:
-            return float(str(raw).replace(",", ""))
-        except ValueError as exc:
+            parsed = Decimal(str(raw).replace(",", "").strip())
+        except InvalidOperation as exc:
             raise PITDataError(f"LS investor flow has invalid {field}") from exc
+        if parsed != parsed.to_integral_value():
+            raise PITDataError(f"LS investor flow has non-integral {field}")
+        return int(parsed)
 
     def _map_rows(self, symbol: str, rows: tuple[dict[str, Any], ...]) -> list[dict[str, object]]:
+        """Map raw t1702 rows to share-denominated net records.
+
+        Every record carries ``unit="shares"`` and the four aggregate groups
+        whose identities are verified on raw rows. Net quantities are integers
+        of shares; no KRW value is derived here because the provider does not
+        supply per-group amounts in this mode.
+
+        Raises:
+            PITDataError: missing/non-numeric group field, non-integral quantity,
+                or a violated aggregate identity.
+        """
         mapped: list[dict[str, object]] = []
         for row in rows:
             raw_sess = str(row.get("date") or row.get("session") or "").strip()
             if not raw_sess:
                 continue
             sess = self._session(raw_sess).isoformat()
-            # tjj0008: retail, tjj0009: foreign, tjj0018: institution (in million KRW)
-            retail_m = self._value(row, "tjj0008")
-            foreign_m = self._value(row, "tjj0009")
-            inst_m = self._value(row, "tjj0018")
-            # convert to KRW float
-            retail_net = retail_m * 1_000_000.0
-            foreign_net = foreign_m * 1_000_000.0
-            inst_net = inst_m * 1_000_000.0
+            individual = self._shares(row, "tjj0008")
+            foreign_sub_a = self._shares(row, "tjj0009")
+            foreign_sub_b = self._shares(row, "tjj0010")
+            foreign = self._shares(row, "tjj0016")
+            other_sub_a = self._shares(row, "tjj0007")
+            other_sub_b = self._shares(row, "tjj0011")
+            other = self._shares(row, "tjj0017")
+            inst_parts = [self._shares(row, f"tjj000{i}") for i in range(7)]
+            institution = self._shares(row, "tjj0018")
+            if institution != sum(inst_parts):
+                raise PITDataError("LS investor flow violates institution aggregate identity")
+            if foreign != foreign_sub_a + foreign_sub_b:
+                raise PITDataError("LS investor flow violates foreign aggregate identity")
+            if other != other_sub_a + other_sub_b:
+                raise PITDataError("LS investor flow violates other aggregate identity")
+            if individual + foreign + other + institution != 0:
+                raise PITDataError("LS investor flow violates zero-sum identity")
             mapped.append(
                 {
                     "session": sess,
                     "ticker": symbol,
                     "_source_provider": "LS",
-                    "foreign_buy_value": max(foreign_net, 0.0),
-                    "foreign_sell_value": max(-foreign_net, 0.0),
-                    "foreign_net_value": foreign_net,
-                    "institution_net_value": inst_net,
-                    "retail_net_value": retail_net,
+                    "unit": "shares",
+                    "individual_net_shares": individual,
+                    "foreign_net_shares": foreign,
+                    "institution_net_shares": institution,
+                    "other_net_shares": other,
                 }
             )
         return mapped

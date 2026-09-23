@@ -1,0 +1,85 @@
+version = "krx-market-rules-v1"
+sources = [
+  "Securities Transaction Tax Act Enforcement Decree revisions (sell-rate schedule 2016-2026)",
+  "KRX tick-size tables for KOSPI and KOSDAQ, unified schedule notice effective 2023-01-25",
+  "KRX daily price-limit expansion notice effective 2015-06-15 (limit 30%)",
+]
+
+[[tick_regimes]]
+effective_from = 2016-01-01
+KOSPI = [
+  { lower = 0, tick = 1 },
+  { lower = 1000, tick = 5 },
+  { lower = 5000, tick = 10 },
+  { lower = 10000, tick = 50 },
+  { lower = 50000, tick = 100 },
+  { lower = 100000, tick = 500 },
+  { lower = 500000, tick = 1000 },
+]
+KOSDAQ = [
+  { lower = 0, tick = 1 },
+  { lower = 1000, tick = 5 },
+  { lower = 5000, tick = 10 },
+  { lower = 10000, tick = 50 },
+  { lower = 50000, tick = 100 },
+]
+
+[[tick_regimes]]
+effective_from = 2023-01-25
+KOSPI = [
+  { lower = 0, tick = 1 },
+  { lower = 2000, tick = 5 },
+  { lower = 5000, tick = 10 },
+  { lower = 20000, tick = 50 },
+  { lower = 50000, tick = 100 },
+  { lower = 200000, tick = 500 },
+  { lower = 500000, tick = 1000 },
+]
+KOSDAQ = [
+  { lower = 0, tick = 1 },
+  { lower = 2000, tick = 5 },
+  { lower = 5000, tick = 10 },
+  { lower = 20000, tick = 50 },
+  { lower = 50000, tick = 100 },
+  { lower = 200000, tick = 500 },
+  { lower = 500000, tick = 1000 },
+]
+
+[[sell_tax_regimes]]
+effective_from = 2016-01-01
+KOSPI = "0.0030"
+KOSDAQ = "0.0030"
+
+[[sell_tax_regimes]]
+effective_from = 2019-06-03
+KOSPI = "0.0025"
+KOSDAQ = "0.0025"
+
+[[sell_tax_regimes]]
+effective_from = 2021-01-01
+KOSPI = "0.0023"
+KOSDAQ = "0.0023"
+
+[[sell_tax_regimes]]
+effective_from = 2023-01-01
+KOSPI = "0.0020"
+KOSDAQ = "0.0020"
+
+[[sell_tax_regimes]]
+effective_from = 2024-01-01
+KOSPI = "0.0018"
+KOSDAQ = "0.0018"
+
+[[sell_tax_regimes]]
+effective_from = 2025-01-01
+KOSPI = "0.0015"
+KOSDAQ = "0.0015"
+
+[[sell_tax_regimes]]
+effective_from = 2026-01-01
+KOSPI = "0.0020"
+KOSDAQ = "0.0020"
+
+[[price_limit_regimes]]
+effective_from = 2015-06-15
+ratio = "0.30"
