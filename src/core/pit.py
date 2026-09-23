@@ -24,6 +24,7 @@ class EvidenceKind(StrEnum):
     DISCLOSURES = "disclosures"
     HISTORICAL_COSTS = "historical_costs"
     LIFECYCLE_EVENTS = "lifecycle_events"
+    INDUSTRY = "industry"
 
 
 class SilverTable(StrEnum):

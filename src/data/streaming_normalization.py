@@ -2206,7 +2206,7 @@ def stream_normalize_stock_evidence(
     grouped: dict[EvidenceKind, list[BronzeReceipt]] = {
         kind: list(items) for kind, items in grouped_raw.items()
     }
-    missing = [kind for kind in EvidenceKind if kind not in grouped and kind is not EvidenceKind.LIFECYCLE_EVENTS]
+    missing = [kind for kind in EvidenceKind if kind not in grouped and kind is not EvidenceKind.LIFECYCLE_EVENTS and kind is not EvidenceKind.INDUSTRY]
     if missing:
         names = sorted(kind.value for kind in missing)
         raise PITDataError(f"missing required evidence: {', '.join(names)} (investor_flow, financial_facts)")

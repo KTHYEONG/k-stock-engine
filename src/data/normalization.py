@@ -404,13 +404,13 @@ def normalize_stock_evidence(
         raise PITDataError("decision_time must be timezone-aware")
     if calendar is not None and not calendar.sessions:
         raise PITDataError("calendar must contain sessions")
-    missing = [kind for kind in EvidenceKind if kind not in receipts and kind is not EvidenceKind.LIFECYCLE_EVENTS]
+    missing = [kind for kind in EvidenceKind if kind not in receipts and kind is not EvidenceKind.LIFECYCLE_EVENTS and kind is not EvidenceKind.INDUSTRY]
     if missing:
         names = sorted(kind.value for kind in missing)
         raise PITDataError(f"missing required evidence: {', '.join(names)} (investor_flow, financial_facts)")
     payloads: dict[EvidenceKind, Any] = {}
     for kind, receipt in receipts.items():
-        if kind is EvidenceKind.LIFECYCLE_EVENTS:
+        if kind in (EvidenceKind.LIFECYCLE_EVENTS, EvidenceKind.INDUSTRY):
             continue
         if not Path(receipt.payload_path).exists() or not Path(receipt.metadata_path).exists():
             raise PITDataError(f"missing Bronze receipt payload for {kind.value}")
