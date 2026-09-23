@@ -495,6 +495,23 @@ def test_collect_planned_resumption_skips_verified_requests(tmp_path):
     assert second.content_hash == first.content_hash
 
 
+def test_collect_planned_corporate_actions_reuses_provider_batches_per_company_and_year(tmp_path):
+    from datetime import UTC, datetime
+    from src.data.collection import collect_planned_corporate_actions
+    from src.data.collection_plan import CollectionCheckpointStore
+
+    plan = _action_plan(tmp=tmp_path / "plans")
+    dart = _ActionDart({"005930": "00126380"})
+    collect_planned_corporate_actions(
+        plan=plan,
+        dart=dart,
+        bronze_root=tmp_path / "bronze",
+        retrieved_at=datetime(2026, 1, 1, tzinfo=UTC),
+        checkpoint_store=CollectionCheckpointStore(tmp_path / "ckpt"),
+    )
+    assert dart.calls == {"structured": 1, "dividend": 7}
+
+
 def test_collect_planned_receipt_revalidation_recollects_on_missing_or_mismatch(tmp_path):
     import shutil
     from datetime import UTC, date, datetime
@@ -969,3 +986,576 @@ def test_collect_historical_evidence_corporate_action_route(tmp_path):
     ledger = json.loads(artifact.report_path.read_text(encoding="utf-8"))
     assert ledger["planned"] == 9
     assert ledger["pending"] == 0
+
+
+def _flow_backfill_plan(count: int, *, plan_id: str = "backfill-plan", digest: str = "b" * 64) -> object:
+    from datetime import date
+
+    from src.data.collection_plan import HistoricalCollectionPlan, PlanChunk
+
+    day = date(2026, 3, 6)
+    chunks = tuple(PlanChunk(f"{plan_id}:{index:04d}", "005930", (day,)) for index in range(count))
+    return HistoricalCollectionPlan(plan_id, day, day, 1, chunks, digest)
+
+
+class _BackfillSuccessCollector:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, ...] | None] = []
+        self.closed = 0
+
+    def fetch_investor_flow(self, start: object, end: object, **kwargs: object) -> tuple[dict[str, object], ...]:
+        symbols = kwargs.get("symbols")
+        assert isinstance(symbols, tuple)
+        self.calls.append(symbols)
+        return (
+            {
+                "records": [
+                    {
+                        "ticker": "005930",
+                        "session": "20260306",
+                        "unit": "shares",
+                        "individual_net_shares": "-3",
+                        "foreign_net_shares": "1",
+                        "institution_net_shares": "2",
+                        "other_net_shares": "0",
+                    }
+                ]
+            },
+        )
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+def test_backfill_iterator_reuses_one_collector_for_all_batches(tmp_path, monkeypatch) -> None:
+    from datetime import UTC, datetime
+
+    import src.data.collection as collection_module
+    from src.data.collection import iter_planned_investor_flow_backfill
+    from src.data.collection_plan import CollectionCheckpointStore
+
+    plan = _flow_backfill_plan(6)
+    collector = _BackfillSuccessCollector()
+    seen: list[int] = []
+    real = collection_module.collect_planned_investor_flow
+
+    def recording(**kwargs: object) -> object:
+        seen.append(id(kwargs["collector"]))
+        return real(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(collection_module, "collect_planned_investor_flow", recording)
+    progress = list(
+        iter_planned_investor_flow_backfill(
+            plan=plan,  # type: ignore[arg-type]
+            provider="ls",
+            collector=collector,
+            bronze_root=tmp_path / "bronze",
+            retrieved_at_factory=lambda: datetime(2026, 9, 20, tzinfo=UTC),
+            checkpoint_store=CollectionCheckpointStore(tmp_path / "ckpt"),
+            chunk_batch_size=2,
+        )
+    )
+    assert len(progress) == 3
+    assert seen == [id(collector)] * 3
+    assert len(collector.calls) == 6
+
+
+def test_backfill_iterator_yields_contiguous_stable_slices(tmp_path, monkeypatch) -> None:
+    from datetime import UTC, datetime
+
+    import src.data.collection as collection_module
+    from src.data.collection import iter_planned_investor_flow_backfill
+    from src.data.collection_plan import CollectionCheckpointStore
+
+    plan = _flow_backfill_plan(5)
+    captured: list[tuple[int, tuple[str, ...]]] = []
+    real = collection_module.collect_planned_investor_flow
+
+    def recording(**kwargs: object) -> object:
+        sub = kwargs["plan"]
+        captured.append((len(captured), tuple(chunk.chunk_id for chunk in sub.chunks)))
+        return real(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(collection_module, "collect_planned_investor_flow", recording)
+    progress = list(
+        iter_planned_investor_flow_backfill(
+            plan=plan,  # type: ignore[arg-type]
+            provider="ls",
+            collector=_BackfillSuccessCollector(),
+            bronze_root=tmp_path / "bronze",
+            retrieved_at_factory=lambda: datetime(2026, 9, 20, tzinfo=UTC),
+            checkpoint_store=CollectionCheckpointStore(tmp_path / "ckpt"),
+            chunk_batch_size=2,
+        )
+    )
+    assert [item.chunk_offset for item in progress] == [0, 2, 4]
+    assert [chunk for _, ids in captured for chunk in ids] == [chunk.chunk_id for chunk in plan.chunks]  # type: ignore[union-attr]
+
+
+def test_backfill_iterator_preserves_plan_identity_for_checkpoints(tmp_path) -> None:
+    import json
+    from datetime import UTC, datetime
+
+    from src.data.collection import iter_planned_investor_flow_backfill
+    from src.data.collection_plan import CollectionCheckpointStore
+
+    plan = _flow_backfill_plan(2, plan_id="custom-plan", digest="a" * 64)
+    store = CollectionCheckpointStore(tmp_path / "ckpt")
+    list(
+        iter_planned_investor_flow_backfill(
+            plan=plan,  # type: ignore[arg-type]
+            provider="ls",
+            collector=_BackfillSuccessCollector(),
+            bronze_root=tmp_path / "bronze",
+            retrieved_at_factory=lambda: datetime(2026, 9, 20, tzinfo=UTC),
+            checkpoint_store=store,
+            chunk_batch_size=2,
+        )
+    )
+    for chunk in plan.chunks:  # type: ignore[union-attr]
+        stored = json.loads(store._chunk_path("custom-plan", chunk.chunk_id).read_text(encoding="utf-8"))
+        assert stored["plan_digest"] == "a" * 64
+
+
+def test_backfill_iterator_skips_verified_checkpoint_chunk(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    from src.data.collection import collect_planned_investor_flow, iter_planned_investor_flow_backfill
+    from src.data.collection_plan import CollectionCheckpointStore
+
+    plan = _flow_backfill_plan(2)
+    bronze = tmp_path / "bronze"
+    store = CollectionCheckpointStore(tmp_path / "ckpt")
+    first_chunk = plan.chunks[0]  # type: ignore[union-attr]
+    from src.data.collection_plan import HistoricalCollectionPlan
+
+    single = HistoricalCollectionPlan(
+        plan.plan_id, plan.coverage_start, plan.coverage_end, 1, (first_chunk,), plan.content_hash  # type: ignore[union-attr]
+    )
+    collect_planned_investor_flow(
+        plan=single,
+        provider="ls",
+        collector=_BackfillSuccessCollector(),
+        bronze_root=bronze,
+        retrieved_at=datetime(2026, 9, 20, tzinfo=UTC),
+        checkpoint_store=store,
+    )
+    collector = _BackfillSuccessCollector()
+    progress = list(
+        iter_planned_investor_flow_backfill(
+            plan=plan,  # type: ignore[arg-type]
+            provider="ls",
+            collector=collector,
+            bronze_root=bronze,
+            retrieved_at_factory=lambda: datetime(2026, 9, 20, tzinfo=UTC),
+            checkpoint_store=store,
+            chunk_batch_size=2,
+        )
+    )
+    assert len(collector.calls) == 1
+    assert progress[0].artifact.previously_completed_chunks == 1
+
+
+def test_backfill_iterator_records_provider_error_once_and_continues(tmp_path) -> None:
+    import json
+    from datetime import UTC, date, datetime
+
+    from src.data.collection import iter_planned_investor_flow_backfill
+    from src.data.collection_plan import CollectionCheckpointStore, HistoricalCollectionPlan, PlanChunk
+    from src.data.schemas import PITDataError
+
+    day = date(2026, 3, 6)
+    plan = HistoricalCollectionPlan(
+        "err-plan",
+        day,
+        day,
+        1,
+        (PlanChunk("err-plan:0000", "000001", (day,)), PlanChunk("err-plan:0001", "005930", (day,))),
+        "e" * 64,
+    )
+
+    class Flaky:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, ...]] = []
+
+        def fetch_investor_flow(self, start: object, end: object, **kwargs: object) -> tuple[dict[str, object], ...]:
+            symbols = kwargs["symbols"]
+            assert isinstance(symbols, tuple)
+            self.calls.append(symbols)
+            if symbols == ("000001",):
+                raise PITDataError("boom")
+            return (
+                {
+                    "records": [
+                        {
+                            "ticker": "005930",
+                            "session": "20260306",
+                            "unit": "shares",
+                            "individual_net_shares": "-3",
+                            "foreign_net_shares": "1",
+                            "institution_net_shares": "2",
+                            "other_net_shares": "0",
+                        }
+                    ]
+                },
+            )
+
+    collector = Flaky()
+    progress = list(
+        iter_planned_investor_flow_backfill(
+            plan=plan,
+            provider="ls",
+            collector=collector,
+            bronze_root=tmp_path / "bronze",
+            retrieved_at_factory=lambda: datetime(2026, 9, 20, tzinfo=UTC),
+            checkpoint_store=CollectionCheckpointStore(tmp_path / "ckpt"),
+            chunk_batch_size=2,
+        )
+    )
+    assert collector.calls.count(("000001",)) == 1
+    assert progress[0].artifact.provider_error_chunks == 1
+    assert progress[0].artifact.completed_chunks == 1
+    for payload_path in (tmp_path / "bronze" / "investor_flow").glob("*/payload.json"):
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        records = payload.get("records") or []
+        for record in records:
+            assert not (
+                record.get("ticker") == "000001"
+                and record.get("foreign_net_value") == 0
+                and record.get("institution_net_value") == 0
+            )
+
+
+def test_backfill_iterator_bounds_failure_accounting_per_batch(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    from src.data.collection import iter_planned_investor_flow_backfill
+    from src.data.collection_plan import CollectionCheckpointStore
+
+    class AlwaysFail:
+        def fetch_investor_flow(self, *_args: object, **_kwargs: object) -> tuple[dict[str, object], ...]:
+            raise TimeoutError("timed out")
+
+    progress = list(
+        iter_planned_investor_flow_backfill(
+            plan=_flow_backfill_plan(6),  # type: ignore[arg-type]
+            provider="ls",
+            collector=AlwaysFail(),
+            bronze_root=tmp_path / "bronze",
+            retrieved_at_factory=lambda: datetime(2026, 9, 20, tzinfo=UTC),
+            checkpoint_store=CollectionCheckpointStore(tmp_path / "ckpt"),
+            chunk_batch_size=2,
+        )
+    )
+    assert len(progress) == 3
+    for item in progress:
+        assert item.artifact.planned_chunks == 2
+        assert item.artifact.provider_error_chunks == 2
+        assert len(item.artifact.page_receipts["investor_flow"]) == 2
+
+
+def test_backfill_iterator_rejects_uncertified_provider_and_factory(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    import pytest
+
+    from src.data.collection import iter_planned_investor_flow_backfill
+    from src.data.collection_plan import CollectionCheckpointStore
+    from src.data.schemas import PITDataError
+
+    for bad_provider in ("kis", "toss", "krx"):
+        collector = _BackfillSuccessCollector()
+        with pytest.raises(PITDataError):
+            iter_planned_investor_flow_backfill(
+                plan=_flow_backfill_plan(1),  # type: ignore[arg-type]
+                provider=bad_provider,
+                collector=collector,
+                bronze_root=tmp_path / "bronze",
+                retrieved_at_factory=lambda: datetime(2026, 9, 20, tzinfo=UTC),
+                checkpoint_store=CollectionCheckpointStore(tmp_path / "ckpt"),
+                chunk_batch_size=1,
+            )
+        assert collector.calls == []
+
+    with pytest.raises(PITDataError):
+        iter_planned_investor_flow_backfill(
+            plan=_flow_backfill_plan(1),  # type: ignore[arg-type]
+            provider="ls",
+            collector=_BackfillSuccessCollector(),
+            bronze_root=tmp_path / "bronze",
+            retrieved_at_factory="not-callable",  # type: ignore[arg-type]
+            checkpoint_store=CollectionCheckpointStore(tmp_path / "ckpt"),
+            chunk_batch_size=1,
+        )
+
+
+def test_backfill_iterator_rejects_invalid_batch_size_without_request(tmp_path) -> None:
+    import pytest
+
+    from src.data.collection import iter_planned_investor_flow_backfill
+    from src.data.collection_plan import CollectionCheckpointStore
+    from src.data.schemas import PITDataError
+    from datetime import UTC, datetime
+
+    for bad in (0, -1, True, False):
+        collector = _BackfillSuccessCollector()
+
+        with pytest.raises(PITDataError):
+            iter_planned_investor_flow_backfill(
+                plan=_flow_backfill_plan(1),  # type: ignore[arg-type]
+                provider="ls",
+                collector=collector,
+                bronze_root=tmp_path / "bronze",
+                retrieved_at_factory=lambda: datetime(2026, 9, 20, tzinfo=UTC),
+                checkpoint_store=CollectionCheckpointStore(tmp_path / "ckpt"),
+                chunk_batch_size=bad,
+            )
+        assert collector.calls == []
+
+
+def test_backfill_iterator_rejects_naive_retrieval_timestamp(tmp_path) -> None:
+    from datetime import datetime
+
+    import pytest
+
+    from src.data.collection import iter_planned_investor_flow_backfill
+    from src.data.collection_plan import CollectionCheckpointStore
+    from src.data.schemas import PITDataError
+
+    with pytest.raises(PITDataError):
+        list(
+            iter_planned_investor_flow_backfill(
+                plan=_flow_backfill_plan(1),  # type: ignore[arg-type]
+                provider="ls",
+                collector=_BackfillSuccessCollector(),
+                bronze_root=tmp_path / "bronze",
+                retrieved_at_factory=lambda: datetime(2026, 9, 20),
+                checkpoint_store=CollectionCheckpointStore(tmp_path / "ckpt"),
+                chunk_batch_size=1,
+            )
+        )
+    assert not list((tmp_path / "bronze" / "investor_flow").glob("*/payload.json"))
+
+
+def test_backfill_iterator_closes_collector_on_exhaustion_and_exception(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    import pytest
+
+    from src.data.collection import iter_planned_investor_flow_backfill
+    from src.data.collection_plan import CollectionCheckpointStore
+
+    done = _BackfillSuccessCollector()
+    list(
+        iter_planned_investor_flow_backfill(
+            plan=_flow_backfill_plan(2),  # type: ignore[arg-type]
+            provider="ls",
+            collector=done,
+            bronze_root=tmp_path / "bronze-ok",
+            retrieved_at_factory=lambda: datetime(2026, 9, 20, tzinfo=UTC),
+            checkpoint_store=CollectionCheckpointStore(tmp_path / "ckpt-ok"),
+            chunk_batch_size=2,
+        )
+    )
+    assert done.closed == 1
+
+    class Boom:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def fetch_investor_flow(self, *_args: object, **_kwargs: object) -> tuple[dict[str, object], ...]:
+            raise RuntimeError("boom")
+
+        def close(self) -> None:
+            self.closed += 1
+
+    failing = Boom()
+    with pytest.raises(RuntimeError, match="boom"):
+        list(
+            iter_planned_investor_flow_backfill(
+                plan=_flow_backfill_plan(1),  # type: ignore[arg-type]
+                provider="ls",
+                collector=failing,
+                bronze_root=tmp_path / "bronze-boom",
+                retrieved_at_factory=lambda: datetime(2026, 9, 20, tzinfo=UTC),
+                checkpoint_store=CollectionCheckpointStore(tmp_path / "ckpt-boom"),
+                chunk_batch_size=1,
+                allow_source_unavailable=False,
+            )
+        )
+    assert failing.closed == 1
+
+    class NoClose:
+        def fetch_investor_flow(self, *_args: object, **_kwargs: object) -> tuple[dict[str, object], ...]:
+            return (
+                {
+                    "records": [
+                        {
+                            "ticker": "005930",
+                            "session": "20260306",
+                            "unit": "shares",
+                            "individual_net_shares": "-3",
+                            "foreign_net_shares": "1",
+                            "institution_net_shares": "2",
+                            "other_net_shares": "0",
+                        }
+                    ]
+                },
+            )
+
+    progress = list(
+        iter_planned_investor_flow_backfill(
+            plan=_flow_backfill_plan(1),  # type: ignore[arg-type]
+            provider="ls",
+            collector=NoClose(),
+            bronze_root=tmp_path / "bronze-plain",
+            retrieved_at_factory=lambda: datetime(2026, 9, 20, tzinfo=UTC),
+            checkpoint_store=CollectionCheckpointStore(tmp_path / "ckpt-plain"),
+            chunk_batch_size=1,
+        )
+    )
+    assert len(progress) == 1
+
+
+def test_ls_chunk_validates_share_records_and_checkpoints(tmp_path) -> None:
+    from datetime import UTC, date, datetime
+
+    from src.data.collection import _validate_flow_pages, collect_planned_investor_flow
+    from src.data.collection_plan import CollectionCheckpointStore, HistoricalCollectionPlan, PlanChunk
+
+    day = date(2026, 3, 6)
+    plan = HistoricalCollectionPlan("ls-share-plan", day, day, 1, (PlanChunk("ls-share-plan:0000", "005930", (day,)),), "f" * 64)
+    record = {
+        "ticker": "005930",
+        "session": "20260306",
+        "unit": "shares",
+        "_source_provider": "LS",
+        "individual_net_shares": 927,
+        "foreign_net_shares": -828,
+        "institution_net_shares": -228,
+        "other_net_shares": 129,
+    }
+
+    class ShareCollector:
+        def fetch_investor_flow(self, start: object, end: object, **kwargs: object) -> tuple[dict[str, object], ...]:
+            return ({"provider": "ls", "records": [dict(record)]},)
+
+    store = CollectionCheckpointStore(tmp_path / "ckpt")
+    artifact = collect_planned_investor_flow(
+        plan=plan,
+        provider="ls",
+        collector=ShareCollector(),
+        bronze_root=tmp_path / "bronze",
+        retrieved_at=datetime(2026, 9, 20, tzinfo=UTC),
+        checkpoint_store=store,
+    )
+    assert artifact.completed_chunks == 1
+    assert store.has_verified_receipt(plan=plan, chunk=plan.chunks[0], bronze_root=tmp_path / "bronze")
+    canonical = _validate_flow_pages(
+        chunk_symbol="005930", norm_provider="ls", pages=({"provider": "ls", "records": [dict(record)]},)
+    )
+    assert canonical["2026-03-06"] == {
+        "individual_net_shares": 927.0,
+        "foreign_net_shares": -828.0,
+        "institution_net_shares": -228.0,
+        "other_net_shares": 129.0,
+    }
+
+
+def test_ls_legacy_value_records_rejected_without_checkpoint(tmp_path) -> None:
+    from datetime import UTC, date, datetime
+
+    import pytest
+
+    from src.data.collection import collect_planned_investor_flow
+    from src.data.collection_plan import CollectionCheckpointStore, HistoricalCollectionPlan, PlanChunk
+    from src.data.schemas import PITDataError
+
+    day = date(2026, 3, 6)
+    plan = HistoricalCollectionPlan("ls-legacy-plan", day, day, 1, (PlanChunk("ls-legacy-plan:0000", "005930", (day,)),), "e" * 64)
+
+    class LegacyCollector:
+        def fetch_investor_flow(self, start: object, end: object, **kwargs: object) -> tuple[dict[str, object], ...]:
+            return ({"provider": "ls", "records": [{"ticker": "005930", "session": "20260306", "foreign_net_value": "1"}]},)
+
+    store = CollectionCheckpointStore(tmp_path / "ckpt")
+    with pytest.raises(PITDataError, match="unit contract"):
+        collect_planned_investor_flow(
+            plan=plan,
+            provider="ls",
+            collector=LegacyCollector(),
+            bronze_root=tmp_path / "bronze",
+            retrieved_at=datetime(2026, 9, 20, tzinfo=UTC),
+            checkpoint_store=store,
+        )
+    assert not store._chunk_path("ls-legacy-plan", "ls-legacy-plan:0000").exists()
+
+
+def test_non_ls_provider_keeps_krw_value_contract(tmp_path) -> None:
+    from datetime import UTC, date, datetime
+
+    from src.data.collection import _validate_flow_pages, collect_planned_investor_flow
+    from src.data.collection_plan import CollectionCheckpointStore, HistoricalCollectionPlan, PlanChunk
+
+    day = date(2026, 3, 6)
+    plan = HistoricalCollectionPlan("kw-plan", day, day, 1, (PlanChunk("kw-plan:0000", "005930", (day,)),), "d" * 64)
+    record = {
+        "ticker": "005930",
+        "session": "20260306",
+        "foreign_net_value": "1",
+        "institution_net_value": "2",
+        "retail_net_value": "-3",
+    }
+
+    class KiwoomCollector:
+        def fetch_investor_flow(self, start: object, end: object, **kwargs: object) -> tuple[dict[str, object], ...]:
+            return ({"provider": "kiwoom", "records": [dict(record)]},)
+
+    artifact = collect_planned_investor_flow(
+        plan=plan,
+        provider="kiwoom",
+        collector=KiwoomCollector(),
+        bronze_root=tmp_path / "bronze",
+        retrieved_at=datetime(2026, 9, 20, tzinfo=UTC),
+        checkpoint_store=CollectionCheckpointStore(tmp_path / "ckpt"),
+    )
+    assert artifact.completed_chunks == 1
+    canonical = _validate_flow_pages(
+        chunk_symbol="005930", norm_provider="kiwoom", pages=({"provider": "kiwoom", "records": [dict(record)]},)
+    )
+    assert canonical["2026-03-06"] == {"foreign_net_value": 1.0, "institution_net_value": 2.0, "retail_net_value": -3.0}
+
+
+def test_ls_share_field_shapes_rejected_under_unit_contract() -> None:
+    import pytest
+
+    from src.data.collection import _validate_flow_pages
+    from src.data.schemas import PITDataError
+
+    def base_record(**overrides):
+        record = {
+            "ticker": "005930",
+            "session": "20260306",
+            "unit": "shares",
+            "individual_net_shares": 927,
+            "foreign_net_shares": -828,
+            "institution_net_shares": -228,
+            "other_net_shares": 129,
+        }
+        record.update(overrides)
+        return record
+
+    with pytest.raises(PITDataError, match="unit contract"):
+        _validate_flow_pages(chunk_symbol="005930", norm_provider="ls", pages=({"records": [base_record(foreign_net_shares=None)]},))
+    with pytest.raises(PITDataError, match="unit contract"):
+        _validate_flow_pages(chunk_symbol="005930", norm_provider="ls", pages=({"records": [base_record(foreign_net_shares=True)]},))
+    with pytest.raises(PITDataError, match="unit contract"):
+        _validate_flow_pages(chunk_symbol="005930", norm_provider="ls", pages=({"records": [base_record(foreign_net_shares="abc")]},))
+    with pytest.raises(PITDataError, match="unit contract"):
+        _validate_flow_pages(chunk_symbol="005930", norm_provider="ls", pages=({"records": [base_record(foreign_net_shares="1.5")]},))
+    with pytest.raises(PITDataError, match="unit contract"):
+        _validate_flow_pages(
+            chunk_symbol="005930",
+            norm_provider="ls",
+            pages=({"records": [dict(base_record(), foreign_net_value=1.0)]},),
+        )

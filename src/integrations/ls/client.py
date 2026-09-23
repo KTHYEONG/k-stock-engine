@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 import requests
 
@@ -53,6 +53,32 @@ class LsClient:
         self._session = session if session is not None else requests.Session()
         self._monotonic = monotonic
         self._sleeper = sleeper
+        self._closed = False
+
+    def close(self) -> None:
+        """Release the retained HTTP session after a bounded collection run.
+
+        The LS client owns a reusable authenticated HTTP session so a sequential
+        historical run avoids per-chunk token and connection setup. Closing is
+        required only after no collection request can still use this instance.
+
+        Returns:
+            None.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        closer = getattr(self._session, "close", None)
+        if callable(closer):
+            closer()
+
+    def __enter__(self) -> LsClient:
+        """Enter a sequential LS collection lifetime without issuing a request."""
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        """Close the owned HTTP session regardless of collection outcome."""
+        self.close()
 
     def ensure_token(self) -> str:
         if self._token:
@@ -130,8 +156,20 @@ class LsClient:
         symbol: str,
         start_date: date,
         end_date: date,
-        unit: str = "amount",
+        unit: Literal["shares"] = "shares",
     ) -> tuple[dict[str, Any], ...]:
+        """Request daily per-investor net trading for one symbol over a date range.
+
+        Only the share-quantity mode is supported: it is the only mode whose unit
+        has been verified against exchange volume. Amount mode is rejected rather
+        than guessed.
+
+        Raises:
+            ValueError: ``unit`` is not ``"shares"``.
+            PITDataError: transport, throttling, or payload-shape failure.
+        """
+        if unit != "shares":
+            raise ValueError(f"LS t1702 supports only unit='shares', got {unit!r}")
         token = self.ensure_token()
         headers = {
             "content-type": "application/json; charset=utf-8",
@@ -140,7 +178,7 @@ class LsClient:
             "tr_cont": "N",
             "tr_cont_key": "",
         }
-        volvalgb = "1" if unit == "amount" else "0"
+        volvalgb = "1"
         body: dict[str, Any] = {
             "t1702InBlock": {
                 "shcode": symbol.strip(),

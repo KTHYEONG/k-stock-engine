@@ -263,3 +263,285 @@ def test_ls_client_covers_fallback_status_and_exhausted_throttle() -> None:
             "000020", date(2016, 12, 29), date(2016, 12, 29)
         )
     assert throttled_session.calls == 3
+
+
+def test_ls_client_close_is_idempotent_without_request() -> None:
+    from src.integrations.ls.client import LsClient, LsCredentials
+
+    class RecordingSession:
+        def __init__(self) -> None:
+            self.close_calls = 0
+            self.posts = 0
+
+        def post(self, *_args: object, **_kwargs: object) -> object:
+            self.posts += 1
+            raise AssertionError("no request expected")
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    session = RecordingSession()
+    client = LsClient(LsCredentials("key", "secret"), session=session)  # type: ignore[arg-type]
+    client.close()
+    client.close()
+    assert session.close_calls == 1
+    assert session.posts == 0
+
+
+def test_ls_client_context_closes_session_after_success() -> None:
+    from datetime import date
+
+    from src.integrations.ls.client import LsClient, LsCredentials
+
+    class OkResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"rsp_cd": "00000", "t1702OutBlock1": [{"date": "20161229"}]}
+
+    class RecordingSession:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def post(self, *_args: object, **_kwargs: object) -> OkResponse:
+            return OkResponse()
+
+        def close(self) -> None:
+            self.closed = True
+
+    session = RecordingSession()
+    LsClient._last_slot = None
+    with LsClient(
+        LsCredentials("key", "secret"),
+        session=session,  # type: ignore[arg-type]
+        monotonic=lambda: 0.0,
+        sleeper=lambda _delay: None,
+    ) as client:
+        client._token = "token"
+        assert client.inquire_investor_trend("000020", date(2016, 12, 29), date(2016, 12, 29)) == (
+            {"date": "20161229"},
+        )
+    assert session.closed is True
+
+
+def test_ls_client_context_closes_session_after_provider_failure() -> None:
+    from datetime import date
+
+    import pytest
+
+    from src.data.schemas import PITDataError
+    from src.integrations.ls.client import LsClient, LsCredentials
+
+    class DeniedResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"rsp_cd": "IGW99999"}
+
+    class RecordingSession:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def post(self, *_args: object, **_kwargs: object) -> DeniedResponse:
+            return DeniedResponse()
+
+        def close(self) -> None:
+            self.closed = True
+
+    session = RecordingSession()
+    LsClient._last_slot = None
+    client = LsClient(
+        LsCredentials("key", "secret"),
+        session=session,  # type: ignore[arg-type]
+        monotonic=lambda: 0.0,
+        sleeper=lambda _delay: None,
+    )
+    client._token = "token"
+
+    def run_failing_request() -> None:
+        with client:
+            client.inquire_investor_trend("000020", date(2016, 12, 29), date(2016, 12, 29))
+
+    with pytest.raises(PITDataError, match="non-success"):
+        run_failing_request()
+    assert session.closed is True
+
+
+def test_ls_client_pacing_survives_consecutive_requests() -> None:
+    from src.integrations.ls.client import LS_MIN_REQUEST_INTERVAL_SECONDS, LsClient, LsCredentials
+
+    LsClient._last_slot = None
+    sleeps: list[float] = []
+    client = LsClient(
+        LsCredentials("key", "secret"),
+        session=object(),  # type: ignore[arg-type]
+        monotonic=lambda: 100.0,
+        sleeper=sleeps.append,
+    )
+    client._wait_for_request_slot()
+    client._wait_for_request_slot()
+    assert sleeps == [LS_MIN_REQUEST_INTERVAL_SECONDS]
+
+
+def test_ls_client_lifecycle_preserves_retry_contract() -> None:
+    from datetime import date
+
+    import pytest
+    import requests
+
+    from src.data.schemas import PITDataError
+    from src.integrations.ls.client import LsClient, LsCredentials
+
+    def http_error(status: int) -> requests.HTTPError:
+        exc = requests.HTTPError(f"http {status}")
+        exc.response = type("Resp", (), {"status_code": status})()  # type: ignore[attr-defined]
+        return exc
+
+    class HttpResponse:
+        def __init__(self, payload: object = None, error: Exception | None = None) -> None:
+            self._payload = payload
+            self._error = error
+
+        def raise_for_status(self) -> None:
+            if self._error is not None:
+                raise self._error
+
+        def json(self) -> object:
+            return self._payload
+
+    backoffs: list[float] = []
+
+    class FlakySession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def post(self, *_args: object, **_kwargs: object) -> HttpResponse:
+            self.calls += 1
+            if self.calls == 1:
+                return HttpResponse(error=http_error(429))
+            return HttpResponse(payload={"rsp_cd": "00000", "t1702OutBlock1": [{"date": "20161229"}]})
+
+        def close(self) -> None:
+            return None
+
+    LsClient._last_slot = None
+    session = FlakySession()
+    client = LsClient(
+        LsCredentials("key", "secret"),
+        session=session,  # type: ignore[arg-type]
+        monotonic=lambda: 0.0,
+        sleeper=backoffs.append,
+    )
+    client._token = "token"
+    assert client.inquire_investor_trend("000020", date(2016, 12, 29), date(2016, 12, 29)) == (
+        {"date": "20161229"},
+    )
+    assert session.calls == 2
+
+    class ThrottledResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"rsp_cd": "IGW00201"}
+
+    class ThrottledSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def post(self, *_args: object, **_kwargs: object) -> ThrottledResponse:
+            self.calls += 1
+            return ThrottledResponse()
+
+        def close(self) -> None:
+            return None
+
+    LsClient._last_slot = None
+    throttled = ThrottledSession()
+    throttled_client = LsClient(
+        LsCredentials("key", "secret"),
+        session=throttled,  # type: ignore[arg-type]
+        monotonic=lambda: 0.0,
+        sleeper=lambda _delay: None,
+    )
+    throttled_client._token = "token"
+    with pytest.raises(PITDataError, match="throttled"):
+        throttled_client.inquire_investor_trend("000020", date(2016, 12, 29), date(2016, 12, 29))
+    assert throttled.calls == 3
+
+
+def test_ls_investor_flow_collector_close_delegates_to_client() -> None:
+    from src.integrations.ls.investor_flow import LsInvestorFlowCollector
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    inner = FakeClient()
+    collector = LsInvestorFlowCollector(("005930",), client=inner)
+    with collector:
+        pass
+    assert inner.close_calls == 1
+
+    plain = LsInvestorFlowCollector(("005930",), client=object())
+    plain.close()
+
+
+def test_inquire_investor_trend_posts_share_quantity_mode() -> None:
+    from datetime import date
+
+    from src.integrations.ls.client import LsClient, LsCredentials
+
+    captured: dict[str, object] = {}
+
+    class OkResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"rsp_cd": "00000", "t1702OutBlock1": [{"date": "20260306"}]}
+
+    class RecordingSession:
+        def post(self, _url: object, *, headers: object = None, json: object = None, timeout: object = None) -> OkResponse:
+            captured["body"] = json
+            return OkResponse()
+
+    LsClient._last_slot = None
+    client = LsClient(
+        LsCredentials("key", "secret"),
+        session=RecordingSession(),  # type: ignore[arg-type]
+        monotonic=lambda: 0.0,
+        sleeper=lambda _delay: None,
+    )
+    client._token = "token"
+    assert client.inquire_investor_trend("005930", date(2026, 3, 1), date(2026, 3, 6)) == ({"date": "20260306"},)
+    body = captured["body"]
+    assert isinstance(body, dict)
+    assert body["t1702InBlock"]["volvalgb"] == "1"
+
+
+def test_inquire_investor_trend_rejects_amount_mode_before_io() -> None:
+    from datetime import date
+
+    import pytest
+
+    from src.integrations.ls.client import LsClient, LsCredentials
+
+    class NoIoSession:
+        def post(self, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("no HTTP post expected")
+
+    client = LsClient(
+        LsCredentials("key", "secret"),
+        session=NoIoSession(),  # type: ignore[arg-type]
+        monotonic=lambda: 0.0,
+        sleeper=lambda _delay: None,
+    )
+    client._token = "token"
+    with pytest.raises(ValueError, match="shares"):
+        client.inquire_investor_trend("005930", date(2026, 3, 1), date(2026, 3, 6), unit="amount")  # type: ignore[arg-type]
