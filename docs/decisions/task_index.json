@@ -1,6 +1,28 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_KR_SWING_2019_MARKET_PANEL_P0",
+      "date": "2026-09-23",
+      "adr_id": "ADR_20260923_KR_SWING_2019_MARKET_PANEL_P0",
+      "domain": "data",
+      "title": "데이터 P0: 수급 주식수 단위 교정, KRX 기준가 시장 패널, 기준 벤치마크",
+      "why": "LS 수급 원본이 백만원이 아닌 주식수 단위로 저장되고 있었고, 날짜별 호가단위·가격제한·매도세·KRX 기준가 조정을 반영한 PIT Gold 패널이 없어 신뢰할 수 있는 복리 전략 백테스트를 설계할 수 없었다.",
+      "resolution": "날짜별 KRX 시장 규칙(core/market_rules), 주식수 단위로 교정한 LS 수급 Silver, KRX 기준가 기반 Gold 시장 패널(v2, 종목 버킷 벡터화), 프릭션 없는 기준 벤치마크 4종을 구현하고 카탈로그 배치조회·컬럼형 shard로 실데이터 빌드 성능을 40분대에서 1분 안팎으로 낮췄다.",
+      "impact": "가격 조정·기업행위·상장폐지·상하한가·수급 단위가 실데이터로 검증된 PIT Gold 패널과 벤치마크가 마련되어 이후 단일 배열 백테스트 엔진과 시도 registry 설계를 데이터 결함 없이 진행할 수 있다.",
+      "caveat": "LS 수집기(P0-2)는 투자자 합계 불일치 행을 만나면 여전히 청크 전체를 실패 처리하므로, 2016년 확장 수집 전에 Silver와 동일하게 셀 단위 격리로 맞춰야 한다."
+    },
+    {
+      "task_id": "investor_flow_backfill_efficiency",
+      "date": "2026-09-22",
+      "adr_id": "ADR_20260922_investor_flow_backfill_efficiency",
+      "domain": "data",
+      "title": "LS 수급 백필 세션 재사용 및 경계형 실행",
+      "why": "청크마다 프로세스와 LS 세션을 재생성해 계획 파싱·인증·연결 비용과 호출 간격 상태가 누적되지 않았다.",
+      "resolution": "단일 LS 클라이언트 수명주기와 명시적 계획 경로 기반의 bounded backfill CLI를 도입하고 배치별 감사 진행률과 체크포인트 재개를 연결했다.",
+      "impact": "수급 백필은 순차 호출·재시작 가능·증거 보존을 유지하면서 청크별 프로세스 오버헤드를 제거한다.",
+      "caveat": "KIS·키움·토스는 현재 KRW 수급 계약과 호출 한도 인증이 완료될 때까지 주 공급처 또는 병렬 경로로 사용하지 않는다."
+    },
+    {
       "task_id": "TASK_OPENDART_CORPORATE_ACTION_BACKFILL",
       "date": "2026-09-22",
       "adr_id": "ADR_20260922_OPENDART_CORPORATE_ACTION_BACKFILL",

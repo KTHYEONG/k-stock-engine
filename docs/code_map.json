@@ -382,5 +382,8 @@
   "src/data/financial_quality.py": {
     "architecture": "docs/research/data_readiness.md",
     "testing": "tests/unit/data/test_financial_quality.py"
+  },
+  "src/data/market_panel.py": {
+    "testing": "tests/unit/data/test_market_panel.py"
   }
 }
