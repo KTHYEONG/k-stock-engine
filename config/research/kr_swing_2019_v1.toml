@@ -12,7 +12,7 @@ forward_start = "2026-01-01"
 price_lookback_sessions = 252
 fundamental_lookback_quarters = 5
 fundamental_fiscal_start = "2016Q1"
-investor_flow_enabled = false
+investor_flow_enabled = true
 industry_enabled = false
 
 [collection]
