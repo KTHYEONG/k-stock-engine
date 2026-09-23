@@ -385,5 +385,11 @@
   },
   "src/data/market_panel.py": {
     "testing": "tests/unit/data/test_market_panel.py"
+  },
+  "src/data/investor_flow_kis_supplement.py": {
+    "testing": "tests/unit/data/test_investor_flow_kis_supplement.py"
+  },
+  "src/data/storage_retention.py": {
+    "testing": "tests/unit/data/test_storage_retention.py"
   }
 }
