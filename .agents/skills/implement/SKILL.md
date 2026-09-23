@@ -9,7 +9,7 @@ Fast-execution protocol for mechanical code implementation based strictly on fro
 
 ## Execution Principles
 
-Operate as a deterministic translator turning the specification into code and passing tests:
+Execute the approved specification into production code and passing tests:
 1. Implement clean production logic satisfying the spec's invariants and docstring across all targets.
 2. Implement targeted invariant guard tests satisfying the spec's Invariant Scenarios.
 3. Wire the caller at the specified anchor point(s).
@@ -21,10 +21,10 @@ Operate as a deterministic translator turning the specification into code and pa
    - Production code must contain only finalized code and docstrings.
    - Do not paste or leave temporary spec directives, step numbers, or placeholder comments in code or docstrings.
 
-2. **Fidelity & Anti-Defensive Sprawl**:
-   - Treat the spec as truth. Do not invent unrequested parameters or speculative abstraction layers.
+2. **Fidelity with Pragmatic Grounding**:
+   - Treat the spec as the authoritative blueprint. Do not invent unrequested parameters, speculative abstraction layers, or dead defensive branches.
    - Do not leave stubs (`pass`, `...`, `NotImplementedError`, placeholder returns).
-   - Avoid speculative `try-except` blocks or unrequested null checks that are not required by spec invariants.
+   - **System Truth Discrepancy Escalation**: If the spec conflicts with real codebase invariants, external type signatures, or existing contracts, do not force an incompatible implementation. Document the concrete discrepancy and escalate/adjust the invariant rather than guessing.
 
 3. **Clean Test Naming Rule**:
    - Do NOT hardcode temporary spec/ticket IDs (e.g. `POLICY-01`, `SCENARIO-02`) into test function names.
@@ -40,7 +40,7 @@ Operate as a deterministic translator turning the specification into code and pa
    - **Phase 2 (Anchor Wiring)**:
      - Wire invocations into caller files at designated `- Anchor: <anchor>` points once target symbols are in place.
    - **Phase 3 (Single-Gate Verification)**:
-     - Run the unified verification gate once across the entire scope:
+     - Run the unified verification gate for the target feature and spec scope:
        ```bash
        uv run python tools/agent_skills/lean_check.py --spec <spec_file>
        ```
@@ -53,23 +53,26 @@ Operate as a deterministic translator turning the specification into code and pa
 
 5. **Diff Coverage Resolution (Pruning Over Bloat)**:
    - If diff coverage reports untested lines:
-     1. Evaluate if it is speculative defensive code (unrequested `try-except`, unreachable branches): **Prune and delete the code**.
+     1. Evaluate if it is speculative defensive code (unrequested dead branches): **Prune and delete the bloat**.
      2. If required domain logic lacks coverage, add the missing boundary scenario.
+     3. For non-testable infrastructure branches, use `# pragma: no cover` appropriately.
 
 ## Output
 
-Keep chat output ultra-compact and token-efficient.
-**Strictly Prohibited**: Do NOT write lengthy implementation prose, detailed code changes, verbose Problem / Root Cause / Impact explanations, or redundant lists of modified files (the spec and git already track them). Do NOT include "다음 단계" recommendations. Only output the minimal summary card below:
+Keep chat output compact and token-efficient.
+- **On success**: Output only the minimal completion card below without redundant code dumps or conversational filler.
+- **On failure or discrepancy**: Clearly report the issue (Problem → Root Cause → Fix) without verbose chatter.
 
 ### 🔨 [IMPLEMENT] <Task Title>
-> 📄 **구현 스펙**: [`<spec_filename>.md`](file:///path/to/docs/specs/<spec_filename>.md)  
+> 📄 **구현 스펙**: [`<spec_filename>.md`](docs/specs/<spec_filename>.md)  
 > 🚦 **상태**: ✅ COMPLETE (<Count>개 파일 수정)
 
-- 🧪 **검증 요약**: Pytest PASS · Ruff PASS · Mypy PASS · Diff Coverage 100%
+- 🧪 **검증 요약**: <실제 통과 내역 요약, 예: Pytest PASS · Ruff PASS · Mypy PASS · Diff Coverage PASS>
 
 *(On Failure / Escalation)*:
 ### 🔨 [IMPLEMENT] <Task Title>
-> 📄 **구현 스펙**: [`<spec_filename>.md`](file:///path/to/docs/specs/<spec_filename>.md)  
+> 📄 **구현 스펙**: [`<spec_filename>.md`](docs/specs/<spec_filename>.md)  
 > 🚦 **상태**: ❌ ESCALATED (또는 ❌ FAIL)
 
-- 💥 **실패 지점**: [<Pytest | Ruff | Mypy | Diff Coverage | Anchor Wiring>] `<실패한 테스트명 또는 핵심 에러 1줄>`
+- 💥 **실패 지점**: [<Pytest | Ruff | Mypy | Diff Coverage | Anchor Wiring | Invariant Conflict>] `<실패한 테스트명 또는 핵심 에러 1줄>`
+- 🎯 **원인 및 조치**: `<불일치 원인 또는 해결을 위해 필요한 액션 1-2줄>`

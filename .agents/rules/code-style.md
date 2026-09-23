@@ -1,10 +1,3 @@
----
-trigger:
-  - on_file_path_regex: "src/.*"
-  - on_file_path_regex: "tests/.*"
-priority: 9
----
-
 # Code Style & Engineering Standards
 
 > **Respect existing architecture and conventions. Maintain strong typed contracts at public boundaries without breaking scope. Reconcile code with specifications objectively, and apply equivalent engineering rigor across all languages.**

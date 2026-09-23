@@ -1,10 +1,3 @@
----
-trigger:
-  - on_file_path_regex: "src/.*\\.py"
-  - on_file_path_regex: "docs/.*\\.md"
-priority: 8
----
-
 # Documentation & Code Commenting Directives
 
 > **Explain the non-obvious "Why" behind domain logic, math, and constraints, not the mechanical "What" visible in code. Keep comments and docs focused on stable architecture, invariants, and trade-offs. Never embed ephemeral spec paths or AI session logs into persistent code.**
