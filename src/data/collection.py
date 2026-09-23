@@ -746,7 +746,7 @@ def scoped_status_for_page(page: RawProviderResponse) -> EvidenceStatus:
     """Map provider page markers to the retained evidence status."""
     if str(page.get("status") or "").strip() == "extraction_failed":
         return EvidenceStatus.EXTRACTION_FAILED
-    if str(page.get("source_kind") or "").strip() == "unavailable":
+    if str(page.get("source_kind") or "").strip() in {"unavailable", "blocked"}:
         return EvidenceStatus.PROVIDER_UNAVAILABLE
     records = page.get("records")
     if isinstance(records, list) and records:
@@ -1517,11 +1517,10 @@ def collect_dart_financial_facts(
         store, persisted, kind=EvidenceKind.FINANCIAL_FACTS, retrieved_at=retrieved_at
     )
     if scoped_writer is not None:
-        for scoped_page in persisted:
-            persist_scoped_payload(
-                scoped_writer=scoped_writer,
-                scoped_payload=dart_fact_scoped_payload(page=scoped_page, retrieved_at=retrieved_at),
-            )
+        # 페이지마다 publish하면 카탈로그 전체 스냅샷(수십 MB)이 페이지 수만큼 생성된다.
+        scoped_writer.persist_many(
+            tuple(dart_fact_scoped_payload(page=scoped_page, retrieved_at=retrieved_at) for scoped_page in persisted)
+        )
     standardized = sum(1 for p in persisted if p.get("source_kind") == "opendart_standard")
     legacy_document = sum(
         1
@@ -1779,13 +1778,14 @@ def collect_daily_market_sessions(
         if missing_pages:
             raise PITDataError(f"KRX daily market missing requested sessions: {missing_pages[0]}; certification blocked")
     if scoped_writer is not None:
-        for scoped_session in sorted(scoped_pages):
-            persist_scoped_payload(
-                scoped_writer=scoped_writer,
-                scoped_payload=krx_market_scoped_payload(
+        scoped_writer.persist_many(
+            tuple(
+                krx_market_scoped_payload(
                     page=scoped_pages[scoped_session], session=scoped_session, retrieved_at=retrieved_at
-                ),
+                )
+                for scoped_session in sorted(scoped_pages)
             )
+        )
     ordered = tuple({**existing, **fresh}[day] for day in requested)
     digest = hashlib.sha256()
     for item in sorted(ordered, key=lambda value: value.content_hash):
