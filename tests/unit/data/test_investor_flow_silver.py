@@ -531,3 +531,138 @@ def test_materialize_rejects_dateless_row_with_flow_values(tmp_path: Path) -> No
         materialize_investor_flow_silver(
             bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
         )
+
+
+def _kis_raw_page(symbol: str) -> dict[str, object]:
+    return {
+        "provider": "KIS",
+        "endpoint": "kis-investor-flow",
+        "symbol": symbol,
+        "query": {"symbol": symbol, "start": "2026-03-04", "end": "2026-03-06"},
+        "rows": [{"stck_bsop_date": "20260304", "frgn_ntby_qty": "100", "orgn_ntby_qty": "0"}],
+    }
+
+
+def _manifest(result_path: Path) -> dict[str, object]:
+    return json.loads((result_path / "manifest.json").read_text(encoding="utf-8"))
+
+
+_EXISTING_MANIFEST_COUNTS = (
+    "rows",
+    "tickers",
+    "raw_pages",
+    "ignored_records_only_pages",
+    "negative_cells",
+    "conflict_cells",
+    "identity_violation_cells",
+    "unavailable_tail_cells",
+    "retail_exceeds_volume_rows",
+    "dateless_rows",
+)
+
+
+def test_materialize_skips_foreign_provider_pages(tmp_path: Path) -> None:
+    _, universe_root, _ = _roots(tmp_path)
+    silver_ls = tmp_path / "silver_ls"
+    silver_mixed = tmp_path / "silver_mixed"
+    bronze_ls = tmp_path / "bronze_ls"
+    bronze_mixed = tmp_path / "bronze_mixed"
+    ls_page = _raw_page("005930", [_row("20260304")], start="2026-03-04", end="2026-03-06")
+    _write_page(bronze_ls, ls_page)
+    _write_page(bronze_mixed, ls_page)
+    _write_page(bronze_mixed, _kis_raw_page("005930"))
+
+    ls_only = materialize_investor_flow_silver(
+        bronze_root=bronze_ls, universe_root=universe_root, silver_root=silver_ls, workers=1
+    )
+    mixed = materialize_investor_flow_silver(
+        bronze_root=bronze_mixed, universe_root=universe_root, silver_root=silver_mixed, workers=1
+    )
+
+    assert ls_only.foreign_provider_pages == 0
+    assert mixed.foreign_provider_pages == 1
+    assert mixed.dataset_id == ls_only.dataset_id
+    assert mixed.rows == ls_only.rows == 1
+    before = _manifest(ls_only.dataset_path)
+    after = _manifest(mixed.dataset_path)
+    assert before["foreign_provider_pages"] == 0
+    assert after["foreign_provider_pages"] == 1
+    for key in _EXISTING_MANIFEST_COUNTS:
+        assert after[key] == before[key], key
+
+
+def test_materialize_ignores_foreign_negative_page(tmp_path: Path) -> None:
+    _, universe_root, _ = _roots(tmp_path)
+    silver_ls = tmp_path / "silver_ls"
+    silver_mixed = tmp_path / "silver_mixed"
+    bronze_ls = tmp_path / "bronze_ls"
+    bronze_mixed = tmp_path / "bronze_mixed"
+    ls_page = _raw_page("005930", [_row("20260304")], start="2026-03-04", end="2026-03-06")
+    _write_page(bronze_ls, ls_page)
+    _write_page(bronze_mixed, ls_page)
+    _write_page(bronze_mixed, {
+        "provider": "KIS",
+        "status": "provider_error",
+        "symbol": "005930",
+        "sessions": ["2026-03-04"],
+    })
+
+    ls_only = materialize_investor_flow_silver(
+        bronze_root=bronze_ls, universe_root=universe_root, silver_root=silver_ls, workers=1
+    )
+    mixed = materialize_investor_flow_silver(
+        bronze_root=bronze_mixed, universe_root=universe_root, silver_root=silver_mixed, workers=1
+    )
+
+    assert mixed.foreign_provider_pages == 1
+    assert mixed.negative_cells == ls_only.negative_cells == 0
+
+
+def test_materialize_honors_lowercase_ls_negative_page(tmp_path: Path) -> None:
+    _, universe_root, _ = _roots(tmp_path)
+    silver_lower = tmp_path / "silver_lower"
+    silver_upper = tmp_path / "silver_upper"
+    ls_page = _raw_page("005930", [_row("20260304")], start="2026-03-04", end="2026-03-06")
+    bronze_lower = tmp_path / "bronze_lower"
+    bronze_upper = tmp_path / "bronze_upper"
+    _write_page(bronze_lower, ls_page)
+    _write_page(bronze_lower, {
+        "provider": "ls",
+        "status": "missing_sessions",
+        "symbol": "005930",
+        "missing_sessions": ["2026-03-05"],
+    })
+    _write_page(bronze_upper, ls_page)
+    _write_page(bronze_upper, {
+        "provider": "LS",
+        "status": "missing_sessions",
+        "symbol": "005930",
+        "missing_sessions": ["2026-03-05"],
+    })
+
+    lowered = materialize_investor_flow_silver(
+        bronze_root=bronze_lower, universe_root=universe_root, silver_root=silver_lower, workers=1
+    )
+    uppered = materialize_investor_flow_silver(
+        bronze_root=bronze_upper, universe_root=universe_root, silver_root=silver_upper, workers=1
+    )
+
+    assert lowered.foreign_provider_pages == 0
+    assert lowered.negative_cells == uppered.negative_cells == 1
+
+
+def test_materialize_rejects_unlabeled_page(tmp_path: Path) -> None:
+    _, universe_root, silver_root = _roots(tmp_path)
+    bronze_missing = tmp_path / "bronze_missing"
+    bronze_blank = tmp_path / "bronze_blank"
+    _write_page(bronze_missing, {"symbol": "005930", "rows": []})
+    _write_page(bronze_blank, {"provider": "   ", "symbol": "005930", "rows": []})
+
+    with pytest.raises(PITDataError, match="provider label"):
+        materialize_investor_flow_silver(
+            bronze_root=bronze_missing, universe_root=universe_root, silver_root=silver_root, workers=1
+        )
+    with pytest.raises(PITDataError, match="provider label"):
+        materialize_investor_flow_silver(
+            bronze_root=bronze_blank, universe_root=universe_root, silver_root=silver_root, workers=1
+        )
