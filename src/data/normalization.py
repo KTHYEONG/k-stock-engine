@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from bisect import bisect_right
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, time
 from pathlib import Path
@@ -53,11 +54,41 @@ def normalize_dart_financial_facts(
     ticker_by_corp_code: Mapping[str, str] | None = None,
     bridge_receipt_hash: str | None = None,
 ) -> pl.DataFrame:
-    """Normalize every canonical DART record; partial coverage retained."""
-    from src.data.silver import next_krx_session_open
+    """Normalize canonical OpenDART financial-fact records into PIT rows.
 
+    OpenDART ``fnlttSinglAcntAll`` always serves the latest restated statement
+    for a (corp, year, report) key, so a record's own receipt number can be
+    later than the filing that identified it. A value is therefore observable
+    only after the filing that actually carried it: the effective receipt date
+    is the later of the identity filing date and the date encoded in the
+    record's 14-digit receipt number. The value becomes available at the open
+    of the first KRX session strictly after that date, because receipts carry
+    no intraday time and may arrive after the close.
+
+    Args:
+        pages: Bronze fact payloads (``records`` lists with page identity).
+        disclosure_rows: Disclosure rows used only to fill a missing filing date.
+        source_hash: Lineage hash stamped on every row.
+        calendar: KRX sessions covering every effective receipt date up to
+            ``decision_time``.
+        decision_time: Rows not yet available at this instant are excluded.
+        ticker_by_corp_code: Frozen corp-code bridge for records lacking a ticker.
+        bridge_receipt_hash: Receipt hash of the bridge, stamped into mapping_version.
+
+    Returns:
+        One row per unique (company, period, filing, fact, restatement, basis);
+        ``published_at`` is 00:00 KST of the effective receipt date (as UTC) and
+        ``available_at`` is the next-session open (as UTC).
+
+    Raises:
+        PITDataError: ``decision_time`` is naive, ``pages`` is not iterable, the
+            calendar is empty, or the calendar has no session after an effective
+            receipt date that is not after ``decision_time``.
+    """
     if decision_time.tzinfo is None:
         raise PITDataError("decision_time must be timezone-aware")
+    if not calendar.sessions:
+        raise PITDataError("calendar must contain sessions")
     try:
         page_list = list(pages)
     except TypeError as exc:
@@ -102,6 +133,12 @@ def normalize_dart_financial_facts(
                     flat.append(merged)
         elif isinstance(page, Mapping):
             flat.append(page)
+    ordered_sessions = sorted(calendar.sessions)
+    for session in ordered_sessions:
+        if not isinstance(session, datetime) or session.tzinfo is None:
+            raise PITDataError("calendar session must be timezone-aware")
+    session_dates = [s.astimezone(KRX_TZ).date() for s in ordered_sessions]
+    session_opens = [s.astimezone(UTC) for s in ordered_sessions]
     rows: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str, str, str, bool]] = set()
     for rec in flat:
@@ -170,18 +207,38 @@ def normalize_dart_financial_facts(
             raw_published = rec.get("published_at")
             if raw_published is None and filing_id in disc_published:
                 raw_published = disc_published[filing_id]
-            published = _as_aware(raw_published, decision_time).astimezone(UTC)
+            identity_date = _as_aware(raw_published, decision_time).astimezone(KRX_TZ).date()
+            receipt_date = _effective_receipt_date(rec, filing_id)
+            effective_date = identity_date if receipt_date is None else max(identity_date, receipt_date)
+            published = datetime.combine(effective_date, time(0, 0), tzinfo=KRX_TZ).astimezone(UTC)
             if published > decision_time:
                 continue
-            avail = _available_at(published, decision_time).astimezone(UTC)
-            try:
-                candidate = next_krx_session_open(published, calendar)
-                if candidate <= decision_time:
-                    avail = candidate.astimezone(UTC)
-            except PITDataError:
-                avail = _available_at(published, decision_time).astimezone(UTC)
-            if avail > decision_time:
-                continue
+            source_kind = str(rec.get("source_kind") or "opendart_standard")
+            mapping_version = str(rec.get("mapping_version") or _DART_MAPPING_VERSION)
+            if dart_corp_code and ticker_by_corp_code and bridge_receipt_hash and ticker_by_corp_code.get(dart_corp_code) == ticker:
+                mapping_version = f"{mapping_version}+bridge:{bridge_receipt_hash}"
+            raw_hash = rec.get("raw_document_hash")
+            pending: dict[str, Any] = {
+                "company_id": company_id,
+                "dart_corp_code": dart_corp_code,
+                "ticker": ticker,
+                "fiscal_period": fiscal_period,
+                "filing_id": filing_id,
+                "fact": fact,
+                "published_at": published,
+                "consolidated": consolidated,
+                "restatement_id": restatement_id,
+                "source_hash": source_hash,
+                "source_kind": source_kind,
+                "mapping_version": mapping_version,
+                "raw_document_hash": raw_hash,
+            }
+        except (PITDataError, ValueError, TypeError):
+            continue
+        avail = _next_session_open_after(effective_date, session_dates, session_opens)
+        if avail > decision_time:
+            continue
+        try:
             raw_value = rec.get("value")
             if raw_value is None:
                 continue
@@ -193,32 +250,8 @@ def normalize_dart_financial_facts(
             unit = str(rec.get("unit") or "").strip()
             if not unit:
                 continue
-            source_kind = str(rec.get("source_kind") or "opendart_standard")
-            mapping_version = str(rec.get("mapping_version") or _DART_MAPPING_VERSION)
-            if dart_corp_code and ticker_by_corp_code and bridge_receipt_hash and ticker_by_corp_code.get(dart_corp_code) == ticker:
-                mapping_version = f"{mapping_version}+bridge:{bridge_receipt_hash}"
-            raw_hash = rec.get("raw_document_hash")
-            rows.append(
-                {
-                    "company_id": company_id,
-                    "dart_corp_code": dart_corp_code,
-                    "ticker": ticker,
-                    "fiscal_period": fiscal_period,
-                    "filing_id": filing_id,
-                    "fact": fact,
-                    "published_at": published,
-                    "available_at": avail,
-                    "value": value,
-                    "unit": unit,
-                    "consolidated": consolidated,
-                    "restatement_id": restatement_id,
-                    "source_hash": source_hash,
-                    "source_kind": source_kind,
-                    "mapping_version": mapping_version,
-                    "raw_document_hash": raw_hash,
-                }
-            )
-        except (PITDataError, ValueError, TypeError):
+            rows.append({**pending, "available_at": avail, "value": value, "unit": unit})
+        except (ValueError, TypeError):
             continue
     if not rows:
         return pl.DataFrame(
@@ -279,6 +312,35 @@ def _available_at(retrieved: datetime, decision_time: datetime) -> datetime:
     if base > decision_time:
         return decision_time
     return base
+
+
+def _receipt_source_date(value: str) -> date:
+    try:
+        return date(int(value[0:4]), int(value[4:6]), int(value[6:8]))
+    except ValueError as exc:
+        raise PITDataError(f"invalid receipt date in {value!r}") from exc
+
+
+def _effective_receipt_date(record: Mapping[str, Any], filing_id: str) -> date | None:
+    raw = record.get("rcept_no")
+    if raw is not None and str(raw).strip() != "":
+        candidate = str(raw).strip()
+        if re.fullmatch(r"\d{14}", candidate) is None:
+            raise PITDataError(f"malformed receipt number: {candidate!r}")
+        return _receipt_source_date(candidate)
+    candidate = str(filing_id).strip()
+    if re.fullmatch(r"\d{14}", candidate) is None:
+        return None
+    return _receipt_source_date(candidate)
+
+
+def _next_session_open_after(
+    effective: date, session_dates: list[date], session_opens: list[datetime]
+) -> datetime:
+    idx = bisect_right(session_dates, effective)
+    if idx >= len(session_opens):
+        raise PITDataError(f"no next KRX session after {effective}")
+    return session_opens[idx]
 
 
 def _records_from(payload: Any) -> list[dict[str, Any]]:

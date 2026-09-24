@@ -400,5 +400,8 @@
   },
   "src/data/industry_silver.py": {
     "testing": "tests/unit/data/test_industry_silver.py"
+  },
+  "src/data/investor_flow_silver.py": {
+    "testing": "tests/unit/data/test_investor_flow_silver.py"
   }
 }
