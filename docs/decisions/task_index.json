@@ -1,6 +1,39 @@
 {
   "tasks": [
     {
+      "task_id": "R1_FLOW_CATALOG_SAFETY",
+      "date": "2026-09-24",
+      "adr_id": "ADR_20260924_R1_FLOW_CATALOG_SAFETY",
+      "domain": "data",
+      "title": "LS flow provider gate and catalog lock",
+      "why": "LS Silver rebuild choked on KIS pages and concurrent catalog publishes lost entries.",
+      "resolution": "LS provider filter with foreign page count and flock-serialized catalog publish with unique temp names.",
+      "impact": "LS flow rebuild works again and concurrent collectors are safe.",
+      "caveat": "Unlabeled investor-flow pages now fail closed."
+    },
+    {
+      "task_id": "R1_DART_TRANSPORT",
+      "date": "2026-09-24",
+      "adr_id": "ADR_20260924_R1_DART_TRANSPORT",
+      "domain": "integrations",
+      "title": "Single ledgered DART transport",
+      "why": "document.xml and corpCode.xml bypassed the quota ledger and retries nested up to 9 GETs.",
+      "resolution": "All DART HTTP goes through one paced, ledgered path with a shared 3-attempt budget; no unfiltered disclosure fallback.",
+      "impact": "Shared-key reserve is enforced and request counts are accurate.",
+      "caveat": "Collector-level retries were removed; client owns all retries."
+    },
+    {
+      "task_id": "R1_FACT_AVAILABILITY",
+      "date": "2026-09-24",
+      "adr_id": "ADR_20260924_R1_FACT_AVAILABILITY",
+      "domain": "data",
+      "title": "DART fact availability PIT fix",
+      "why": "Fact available_at silently fell back to published_at and restated values were stamped with the original filing date.",
+      "resolution": "Next-session-after-effective-receipt availability, fail-closed empty calendar, XKRX calendar helper, full Silver rebuild.",
+      "impact": "Removes up to one session of look-ahead in financial facts.",
+      "caveat": "Existing financial_facts Silver must be rebuilt and financial_quality re-derived."
+    },
+    {
       "task_id": "INDUSTRY_KSIC_SILVER",
       "date": "2026-09-24",
       "adr_id": "ADR_20260924_INDUSTRY_KSIC_SILVER",

@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, time
 from pathlib import Path
+from typing import Final
 
 import polars as pl
 
@@ -15,6 +16,8 @@ from src.core.time import SessionCalendar
 from src.data.schemas import EvidenceKind, PITDataError, SilverTable
 from src.data.silver import load_latest_silver_table, validate_table
 from src.storage.parquet_datasets import ParquetDatasetStore, canonical_content_hash
+
+AVAILABILITY_POLICY: Final = "next-session-after-effective-receipt-v2"
 
 _FACT_TABLE = SilverTable.FINANCIAL_FACTS
 _FACT_FEATURE_SET = f"stock_pit_{_FACT_TABLE.value}_v1"
@@ -104,13 +107,7 @@ def _discover_fact_receipts(bronze_root: Path) -> list[dict[str, object]]:
 
 def _load_reference_tables(
     silver_root: Path, decision_time: datetime
-) -> tuple[SessionCalendar, list[dict[str, object]], pl.DataFrame | None, str]:
-    try:
-        calendar_frame = load_latest_silver_table(
-            root=silver_root, table=SilverTable.CALENDAR, decision_time=decision_time
-        )
-    except PITDataError:
-        calendar_frame = None
+) -> tuple[list[dict[str, object]], str]:
     try:
         disclosure_frame = load_latest_silver_table(
             root=silver_root, table=SilverTable.DISCLOSURES, decision_time=decision_time
@@ -123,14 +120,9 @@ def _load_reference_tables(
         )
     except PITDataError:
         existing = None
-    if calendar_frame is not None and "session" in calendar_frame.columns and calendar_frame.height > 0:
-        sessions = tuple(sorted(calendar_frame["session"].to_list()))
-        calendar = SessionCalendar(sessions)
-    else:
-        calendar = SessionCalendar(())
     disclosure_rows = disclosure_frame.to_dicts() if disclosure_frame is not None else []
     prior_hash = canonical_content_hash(existing, existing.columns) if existing is not None else ""
-    return calendar, disclosure_rows, existing, prior_hash
+    return disclosure_rows, prior_hash
 
 
 def _payload_fingerprint(row: dict[str, object]) -> str:
@@ -222,8 +214,33 @@ def refresh_dart_financial_facts(
     silver_root: Path,
     artifact_root: Path,
     decision_time: datetime,
+    calendar: SessionCalendar,
     batch_size: int = 500,
 ) -> DartFactRefreshArtifact:
+    """Rebuild the financial-facts Silver table from every verified Bronze fact receipt.
+
+    The table is rebuilt in full rather than merged with a prior dataset: rows
+    written under an earlier availability policy would otherwise survive the
+    merge with stale ``available_at`` values. The prior dataset hash is still
+    reported for lineage.
+
+    Args:
+        bronze_root: Scope Bronze root containing ``financial_facts/``.
+        silver_root: Scope Silver root receiving ``financial_facts/<hash>/``.
+        artifact_root: Destination for staging parquet and the refresh report.
+        decision_time: Availability cutoff; must be timezone-aware.
+        calendar: KRX sessions (see ``xkrx_session_calendar``) extending past
+            ``decision_time``.
+        batch_size: Receipts normalized per staged parquet batch.
+
+    Returns:
+        Hashes, dataset path and row count of the published table.
+
+    Raises:
+        PITDataError: Naive ``decision_time``, non-positive ``batch_size``,
+            missing or corrupt Bronze, empty result, conflicting primary keys,
+            or calendar coverage failure.
+    """
     from src.data.normalization import normalize_dart_financial_facts
 
     if decision_time.tzinfo is None:
@@ -232,9 +249,7 @@ def refresh_dart_financial_facts(
         raise PITDataError("batch_size must be positive")
     bound = int(batch_size)
     receipts = _discover_fact_receipts(Path(bronze_root))
-    calendar, disclosure_rows, existing, prior_hash = _load_reference_tables(
-        Path(silver_root), decision_time
-    )
+    disclosure_rows, prior_hash = _load_reference_tables(Path(silver_root), decision_time)
     bridge_root = Path(bronze_root) / "dart_corp_codes"
     bridge: dict[str, str] | None = None
     bridge_receipt_hash: str | None = None
@@ -291,19 +306,16 @@ def refresh_dart_financial_facts(
             ticker_by_corp_code=bridge,
             bridge_receipt_hash=bridge_receipt_hash,
         )
-    merged = _merge_fact_frames(existing, new_rows)
+    merged = _merge_fact_frames(None, new_rows)
     if merged.height == 0:
         raise PITDataError("DART XBRL facts response is empty; certification blocked")
     validate_table(_FACT_TABLE, merged, decision_time=decision_time)
     output_hash = canonical_content_hash(merged, merged.columns)
     report_parts = [*sorted(receipt_hashes), output_hash]
     report_hash = hashlib.sha256("\x00".join(report_parts).encode("utf-8")).hexdigest()
-    if calendar.sessions:
-        coverage_start = min(s.astimezone(UTC).date() for s in calendar.sessions)
-        coverage_end = max(s.astimezone(UTC).date() for s in calendar.sessions)
-    else:
-        coverage_start = decision_time.astimezone(UTC).date()
-        coverage_end = decision_time.astimezone(UTC).date()
+    available_dates = [d for d in merged["available_at"].to_list() if isinstance(d, datetime)]
+    coverage_start = min(d.astimezone(UTC).date() for d in available_dates)
+    coverage_end = max(d.astimezone(UTC).date() for d in available_dates)
     manifest = make_manifest(
         asset_kind=AssetKind.STOCK,
         columns=merged.columns,
@@ -321,8 +333,6 @@ def refresh_dart_financial_facts(
         certification=DatasetCertification.RESEARCH,
         quality_report_hash=report_hash,
     )
-    if manifest.time_end > decision_time:
-        raise PITDataError("dataset not available at decision_time")
     store = ParquetDatasetStore(Path(silver_root) / _FACT_TABLE.value)
     existing_dir = Path(silver_root) / _FACT_TABLE.value / output_hash
     if existing_dir.exists():
@@ -345,6 +355,7 @@ def refresh_dart_financial_facts(
                 "report_hash": report_hash,
                 "receipt_hashes": list(receipt_hashes),
                 "prior_dataset_hash": prior_hash,
+                "availability_policy": AVAILABILITY_POLICY,
             },
         )
     except ValueError as exc:
