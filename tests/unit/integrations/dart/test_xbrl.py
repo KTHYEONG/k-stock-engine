@@ -300,7 +300,7 @@ def _fact_success_payload(corp_code: str) -> dict[str, object]:
     }
 
 
-def test_fetch_one_financial_fact_source_retries_retryable_status_to_recovery(monkeypatch) -> None:
+def test_fetch_one_financial_fact_source_does_not_retry_retryable_status(monkeypatch) -> None:
     import src.integrations.dart.xbrl as xbrl_module
     from src.integrations.dart.client import DartRetryableError
 
@@ -310,18 +310,16 @@ def test_fetch_one_financial_fact_source_retries_retryable_status_to_recovery(mo
     class _FlakyClient:
         def _request_validated(self, _endpoint: str, params: dict[str, str]) -> dict[str, object]:
             calls.append(params["fs_div"])
-            if len(calls) == 1:
-                raise DartRetryableError("DART status 900: transient")
-            return _fact_success_payload(params["corp_code"])
+            raise DartRetryableError("DART status 900: transient")
 
     collector = xbrl_module.DartXbrlCollector(client=_FlakyClient(), api_key="k")
 
     # When
     page = collector._fetch_one_financial_fact_source(_fact_identity("00000001", "F0"))
 
-    # Then: recovered within the retry budget on the same fs_div.
-    assert page["source_kind"] == "opendart_standard"
-    assert calls == ["CFS", "CFS"]
+    # Then: a single call per fs_div; retries live in the client, never the collector.
+    assert page["source_kind"] == "unavailable"
+    assert calls == ["CFS"]
 
 
 def test_fetch_one_financial_fact_source_isolates_exhausted_retryable_status(monkeypatch) -> None:
@@ -345,7 +343,7 @@ def test_fetch_one_financial_fact_source_isolates_exhausted_retryable_status(mon
     assert page["source_kind"] == "unavailable"
     assert page["source_kind"] != "blocked"
     assert any(str(entry).startswith("dart_error:") for entry in page["diagnostics"])
-    assert calls == ["CFS", "CFS", "CFS"]
+    assert calls == ["CFS"]
 
 
 def test_fetch_one_financial_fact_source_isolates_quota_exhaustion_as_blocked() -> None:

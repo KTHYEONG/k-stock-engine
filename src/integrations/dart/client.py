@@ -6,10 +6,10 @@ import os
 import threading
 import time
 import zipfile
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from typing import Any
+from typing import Any, Final
 from xml.etree import ElementTree
 
 import requests
@@ -79,6 +79,7 @@ BLOCKED_DART_STATUS = "020"
 RETRYABLE_DART_STATUSES = frozenset({"800", "900"})
 
 _PROVIDER = "OpenDART"
+_MAX_HTTP_ATTEMPTS: Final = 3
 # OpenDART는 raw 연결 리셋에 대한 공식 신호를 제공하지 않으므로(문서화된 020/429 계열 코드와 달리),
 # 실제 근거가 확보될 때까지 보수적인 고정 쿨다운을 적용한다.
 _CONNECTION_FAILURE_COOLDOWN_SECONDS = 300.0
@@ -141,6 +142,90 @@ class DartApiClient:
                 time.sleep(self._min_interval - elapsed)
             self._last_request_time = time.monotonic()
 
+    def _http_get(self, endpoint: str, params: Mapping[str, str]) -> requests.Response:
+        """Issue one logical OpenDART GET with ledgered, paced, bounded retries.
+
+        All real traffic for this key must be visible to the quota ledger,
+        because the scope reserve protects another project sharing the key.
+        Each HTTP attempt is paced and recorded before it is sent; the ledger is
+        consulted once per logical request so a blocked key fails before any
+        traffic is generated.
+
+        Args:
+            endpoint: Path under ``BASE_URL`` (e.g. ``list.json``, ``document.xml``).
+            params: Query parameters; the API key is added when absent.
+
+        Returns:
+            A ``200`` response.
+
+        Raises:
+            ProviderQuotaBlocked: The ledger refuses the request.
+            DartRetryableError: Transport errors or 408/429/5xx persisted for
+                every allowed attempt.
+            DartTerminalError: Any other non-200 status.
+        """
+        query = dict(params)
+        if self.api_key and "crtfc_key" not in query:
+            query["crtfc_key"] = str(self.api_key)
+        self._pace()
+        if self._quota_store is not None:
+            self._quota_store.record_attempt(
+                provider=_PROVIDER, endpoint=endpoint, now=self._now(), daily_limit=self._daily_request_limit
+            )
+        try:
+            response = self._session.get(f"{self.BASE_URL}/{endpoint}", params=query, timeout=30)
+        except requests.exceptions.RequestException as exc:
+            raise DartRetryableError(f"DART transport failed for {endpoint}: {exc}") from exc
+        if response.status_code != 200:
+            if response.status_code in (408, 429) or 500 <= response.status_code < 600:
+                raise DartRetryableError(f"DART HTTP {response.status_code} for {endpoint}")
+            raise DartTerminalError(f"DART HTTP {response.status_code} for {endpoint}")
+        return response
+
+    def _request_once(self, endpoint: str, params: Mapping[str, str]) -> dict[str, Any]:
+        response = self._http_get(endpoint, params)
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise DartRetryableError(f"DART returned transient invalid JSON for {endpoint}") from exc
+        if not isinstance(payload, dict):
+            raise DartTerminalError(f"DART response must be an object for {endpoint}")
+        return payload
+
+    def _backoff_or_raise(self, *, endpoint: str, attempt: int, error: DartRetryableError) -> None:
+        if isinstance(error.__cause__, requests.exceptions.RequestException):
+            if attempt + 1 >= _MAX_HTTP_ATTEMPTS:
+                if self._quota_store is not None:
+                    self._quota_store.record_rate_limit(
+                        provider=_PROVIDER,
+                        endpoint=endpoint,
+                        now=self._now(),
+                        retry_after=_CONNECTION_FAILURE_COOLDOWN_SECONDS,
+                    )
+                raise error
+            time.sleep(0.5 * (2**attempt))
+            return
+        if attempt + 1 >= _MAX_HTTP_ATTEMPTS:
+            raise error
+        time.sleep(0.25 * (attempt + 1))
+
+    def _check_validated_status(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
+        status = payload.get("status")
+        if status == OK_DART_STATUS:
+            return payload
+        if status == EMPTY_DART_STATUS:
+            return payload
+        if status == BLOCKED_DART_STATUS:
+            if self._quota_store is not None:
+                self._quota_store.record_rate_limit(
+                    provider=_PROVIDER, endpoint=endpoint, now=self._now(), retry_after=None
+                )
+            raise DartQuotaExhaustedError(f"DART status {status}: {payload}")
+        if status in RETRYABLE_DART_STATUSES:
+            raise DartRetryableError(f"DART status {status}: {payload}")
+        # Any other non-000 is a terminal/api error, but contract expects DartApiError match
+        raise DartApiError(f"DART status {status}: {payload}")
+
     def _request(self, endpoint: str, params: dict[str, str]) -> dict[str, Any]:
         request_params = dict(params)
         if self.api_key and "crtfc_key" not in request_params:
@@ -161,77 +246,34 @@ class DartApiClient:
             self._quota_store.acquire(
                 provider=_PROVIDER, endpoint=endpoint, now=self._now(), daily_limit=self._daily_request_limit
             )
-        for attempt in range(3):
-            self._pace()
-            if self._quota_store is not None:
-                self._quota_store.record_attempt(
-                    provider=_PROVIDER, endpoint=endpoint, now=self._now(), daily_limit=self._daily_request_limit
-                )
+        for attempt in range(_MAX_HTTP_ATTEMPTS):
             try:
-                response = self._session.get(f"{self.BASE_URL}/{endpoint}", params=request_params, timeout=30)
-            except requests.exceptions.RequestException as exc:
-                if attempt < 2:
-                    time.sleep(0.5 * (2**attempt))
-                    continue
-                if self._quota_store is not None:
-                    self._quota_store.record_rate_limit(
-                        provider=_PROVIDER,
-                        endpoint=endpoint,
-                        now=self._now(),
-                        retry_after=_CONNECTION_FAILURE_COOLDOWN_SECONDS,
-                    )
-                raise DartRetryableError(f"DART transport failed for {endpoint}: {exc}") from exc
-            if response.status_code != 200:
-                if response.status_code in (408, 429) or 500 <= response.status_code < 600:
-                    if attempt < 2:
-                        time.sleep(0.25 * (attempt + 1))
-                        continue
-                    raise DartRetryableError(f"DART HTTP {response.status_code} for {endpoint}")
-                raise DartTerminalError(f"DART HTTP {response.status_code} for {endpoint}")
-            try:
-                payload = response.json()
-            except ValueError:
-                if attempt < 2:
-                    time.sleep(0.25 * (attempt + 1))
-                    continue
-                # Some OpenDART edges return an empty 200 response on a reused
-                # connection; retry once with a fresh connection before failing.
-                try:
-                    fresh = requests.get(
-                        f"{self.BASE_URL}/{endpoint}", params=request_params, timeout=30
-                    )
-                    payload = fresh.json()
-                except (requests.RequestException, ValueError) as fresh_exc:
-                    raise DartRetryableError(
-                        f"DART returned transient invalid JSON for {endpoint}"
-                    ) from fresh_exc
-                if not isinstance(payload, dict):
-                    raise DartTerminalError(
-                        f"DART response must be an object for {endpoint}"
-                    ) from None
-                return payload
-            if not isinstance(payload, dict):
-                raise DartTerminalError(f"DART response must be an object for {endpoint}")
-            return payload
-        raise DartRetryableError(f"DART request exhausted retries for {endpoint}")
+                return self._request_once(endpoint, request_params)
+            except DartRetryableError as exc:
+                self._backoff_or_raise(endpoint=endpoint, attempt=attempt, error=exc)
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def _request_validated(self, endpoint: str, params: dict[str, str]) -> dict[str, Any]:
-        payload = self._request(endpoint, params)
-        status = payload.get("status")
-        if status == OK_DART_STATUS:
-            return payload
-        if status == EMPTY_DART_STATUS:
-            return payload
-        if status == BLOCKED_DART_STATUS:
-            if self._quota_store is not None:
-                self._quota_store.record_rate_limit(
-                    provider=_PROVIDER, endpoint=endpoint, now=self._now(), retry_after=None
-                )
-            raise DartQuotaExhaustedError(f"DART status {status}: {payload}")
-        if status in RETRYABLE_DART_STATUSES:
-            raise DartRetryableError(f"DART status {status}: {payload}")
-        # Any other non-000 is a terminal/api error, but contract expects DartApiError match
-        raise DartApiError(f"DART status {status}: {payload}")
+        if self._raw_request_json is not None or self._request_json is not None:
+            return self._check_validated_status(endpoint, self._request(endpoint, params))
+        request_params = dict(params)
+        if self.api_key and "crtfc_key" not in request_params:
+            request_params["crtfc_key"] = str(self.api_key)
+        if self._quota_store is not None:
+            self._quota_store.acquire(
+                provider=_PROVIDER, endpoint=endpoint, now=self._now(), daily_limit=self._daily_request_limit
+            )
+        for attempt in range(_MAX_HTTP_ATTEMPTS):
+            try:
+                payload = self._request_once(endpoint, request_params)
+            except DartRetryableError as exc:
+                self._backoff_or_raise(endpoint=endpoint, attempt=attempt, error=exc)
+                continue
+            try:
+                return self._check_validated_status(endpoint, payload)
+            except DartRetryableError as exc:
+                self._backoff_or_raise(endpoint=endpoint, attempt=attempt, error=exc)
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def list_disclosures(
         self,
@@ -358,25 +400,26 @@ class DartApiClient:
             if stripped == b"{":
                 raise DartTerminalError("DART document archive returned an error payload")
             return raw
-        for attempt in range(3):
-            response = self._session.get(f"{self.BASE_URL}/document.xml", params=params, timeout=30)
-            if response.status_code != 200:
-                if response.status_code in (408, 429) or 500 <= response.status_code < 600:
-                    if attempt < 2:
-                        time.sleep(0.25 * (attempt + 1))
-                        continue
-                    raise DartRetryableError(f"DART HTTP {response.status_code} for document.xml")
-                raise DartTerminalError(f"DART HTTP {response.status_code} for document.xml")
+        if self._quota_store is not None:
+            self._quota_store.acquire(
+                provider=_PROVIDER, endpoint="document.xml", now=self._now(), daily_limit=self._daily_request_limit
+            )
+        for attempt in range(_MAX_HTTP_ATTEMPTS):
+            try:
+                response = self._http_get("document.xml", params)
+            except DartRetryableError as exc:
+                self._backoff_or_raise(endpoint="document.xml", attempt=attempt, error=exc)
+                continue
             content = response.content
             if not content:
-                if attempt < 2:
-                    time.sleep(0.25 * (attempt + 1))
-                    continue
-                raise DartTerminalError("DART document archive is empty")
+                if attempt + 1 >= _MAX_HTTP_ATTEMPTS:
+                    raise DartTerminalError("DART document archive is empty")
+                time.sleep(0.25 * (attempt + 1))
+                continue
             if content.lstrip()[:1] == b"{":
                 raise DartTerminalError("DART document archive returned an error payload")
             return content
-        raise DartRetryableError("DART request exhausted retries for document.xml")
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def fetch_corporate_action_decisions(
         self, *, corp_codes: Sequence[str], start: date, end: date
@@ -468,13 +511,11 @@ class DartApiClient:
         else:
             if not self.api_key:
                 raise ValueError("api_key is required for corpCode")
-            response = requests.get(
-                f"{self.BASE_URL}/corpCode.xml",
-                params={"crtfc_key": str(self.api_key)},
-                timeout=30,
-            )
-            if response.status_code != 200:
-                raise DartApiError(f"DART corpCode HTTP {response.status_code}")
+            if self._quota_store is not None:
+                self._quota_store.acquire(
+                    provider=_PROVIDER, endpoint="corpCode.xml", now=self._now(), daily_limit=self._daily_request_limit
+                )
+            response = self._http_get("corpCode.xml", {"crtfc_key": str(self.api_key)})
             raw = response.content
         try:
             with zipfile.ZipFile(io.BytesIO(raw)) as archive:
