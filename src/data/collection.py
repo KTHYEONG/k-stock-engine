@@ -1413,13 +1413,10 @@ def collect_dart_disclosures(
                 report_path=report_path,
                 page_receipts={EvidenceKind.DISCLOSURES.value: ()},
             )
-    try:
-        if corp_codes is None:
-            raw_pages = _collect_pages(dart.fetch_disclosures, start, end, kind_name="DART disclosures")
-        else:
-            raw_pages = _collect_pages(dart.fetch_disclosures, start, end, kind_name="DART disclosures", corp_codes=to_fetch)
-    except TypeError:
+    if corp_codes is None:
         raw_pages = _collect_pages(dart.fetch_disclosures, start, end, kind_name="DART disclosures")
+    else:
+        raw_pages = _collect_pages(dart.fetch_disclosures, start, end, kind_name="DART disclosures", corp_codes=to_fetch)
     store = BronzeStore(bronze_root)
     receipt, page_receipts = _persist_pages(
         store, raw_pages, kind=EvidenceKind.DISCLOSURES, retrieved_at=retrieved_at
@@ -1618,6 +1615,8 @@ def _collect_pages(
 ) -> list[RawProviderResponse]:
     try:
         result = fetch(*args, **kwargs) if kwargs else fetch(*args)
+    except TypeError:
+        raise
     except Exception as exc:
         raise PITDataError(f"{kind_name} collection failed: {exc}") from exc
     if result is None:

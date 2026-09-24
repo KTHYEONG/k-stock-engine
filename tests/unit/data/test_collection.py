@@ -191,6 +191,33 @@ def test_collect_dart_disclosures_corp_codes_none_branch_unchanged(tmp_path) -> 
     assert EvidenceKind.DISCLOSURES in artifact.receipts
 
 
+def test_collect_dart_disclosures_filtered_fetch_never_widens(tmp_path) -> None:
+    from datetime import UTC, date, datetime
+
+    import pytest
+
+    from src.data.collection import collect_dart_disclosures
+
+    calls: list[object] = []
+
+    class CorpCodeOnlyDart:
+        def fetch_disclosures(self, start, end, *, corp_codes):
+            calls.append(corp_codes)
+            raise TypeError("fetch_disclosures() missing support for corp_codes")
+
+    with pytest.raises(TypeError, match="corp_codes"):
+        collect_dart_disclosures(
+            dart=CorpCodeOnlyDart(),
+            start=date(2016, 1, 1),
+            end=date(2016, 1, 31),
+            bronze_root=tmp_path / "bronze",
+            retrieved_at=datetime(2026, 1, 1, tzinfo=UTC),
+            corp_codes=("00126380",),
+        )
+
+    assert calls == [("00126380",)]
+
+
 def _action_plan(symbols=(("005930", "00126380"),), start=None, end=None, endpoints=None, reports=None, tmp=None):
     from datetime import date as _date
     from src.data.collection_plan import HistoricalCollectionPlan, PlanChunk, build_corporate_action_collection_plan
