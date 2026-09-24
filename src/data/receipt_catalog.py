@@ -1,10 +1,12 @@
 """Scope-local receipt index with latest-state lookup by source natural key."""
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import re
+import secrets
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -125,6 +127,12 @@ class ReceiptCatalog:
         return snapshot
 
     def publish(self, entries: Sequence[ReceiptIndexEntry]) -> CatalogRevision:
+        """Merge entries into a new immutable revision and move the pointer to it.
+
+        Publishing is serialized across processes with an exclusive advisory lock
+        on ``<root>/.publish.lock``, held from snapshot read through pointer
+        replacement, so concurrent collectors never overwrite each other's entries.
+        """
         for entry in entries:
             if not entry.source.strip() or not entry.natural_key.strip():
                 raise PITDataError("receipt catalog entry requires source and natural key")
@@ -133,25 +141,31 @@ class ReceiptCatalog:
                 raise PITDataError(f"receipt catalog payload is missing for {entry.natural_key!r}")
             if hashlib.sha256(payload_path.read_bytes()).hexdigest() != entry.content_hash:
                 raise PITDataError(f"receipt catalog hash mismatch for {entry.natural_key!r}")
-        snapshot = self._snapshot()
-        for entry in entries:
-            key = (entry.source, entry.natural_key)
-            current = snapshot.get(key)
-            if current is not None and current.retrieved_at == entry.retrieved_at and current.content_hash != entry.content_hash:
-                raise PITDataError(f"receipt catalog conflict for {entry.natural_key!r}")
-            if current is None or entry.retrieved_at >= current.retrieved_at:
-                snapshot[key] = entry
-        ordered = [_entry_to_dict(snapshot[key]) for key in sorted(snapshot)]
-        canonical = json.dumps(ordered, sort_keys=True, separators=(",", ":"))
-        content_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         self._root.mkdir(parents=True, exist_ok=True)
-        revision_path = self._root / f"{content_hash}.json"
-        tmp_revision = self._root / f".{content_hash}.tmp"
-        tmp_revision.write_text(json.dumps(ordered, indent=2, sort_keys=True), encoding="utf-8")
-        os.replace(tmp_revision, revision_path)
-        tmp_pointer = self._root / ".latest.json.tmp"
-        tmp_pointer.write_text(json.dumps({"revision": revision_path.name}, sort_keys=True), encoding="utf-8")
-        os.replace(tmp_pointer, self._pointer_path())
+        token = f"{os.getpid()}.{secrets.token_hex(8)}"
+        with open(self._root / ".publish.lock", "a") as lock_handle:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX)
+            try:
+                snapshot = self._snapshot()
+                for entry in entries:
+                    key = (entry.source, entry.natural_key)
+                    current = snapshot.get(key)
+                    if current is not None and current.retrieved_at == entry.retrieved_at and current.content_hash != entry.content_hash:
+                        raise PITDataError(f"receipt catalog conflict for {entry.natural_key!r}")
+                    if current is None or entry.retrieved_at >= current.retrieved_at:
+                        snapshot[key] = entry
+                ordered = [_entry_to_dict(snapshot[key]) for key in sorted(snapshot)]
+                canonical = json.dumps(ordered, sort_keys=True, separators=(",", ":"))
+                content_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+                revision_path = self._root / f"{content_hash}.json"
+                tmp_revision = self._root / f".{content_hash}.{token}.tmp"
+                tmp_revision.write_text(json.dumps(ordered, indent=2, sort_keys=True), encoding="utf-8")
+                os.replace(tmp_revision, revision_path)
+                tmp_pointer = self._root / f".latest.{token}.tmp"
+                tmp_pointer.write_text(json.dumps({"revision": revision_path.name}, sort_keys=True), encoding="utf-8")
+                os.replace(tmp_pointer, self._pointer_path())
+            finally:
+                fcntl.flock(lock_handle, fcntl.LOCK_UN)
         return CatalogRevision(content_hash=content_hash, row_count=len(ordered), path=revision_path)
 
     def latest(self, *, source: str, natural_keys: Collection[str]) -> Mapping[str, ReceiptIndexEntry]:

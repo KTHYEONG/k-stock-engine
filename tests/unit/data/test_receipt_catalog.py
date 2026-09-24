@@ -212,3 +212,118 @@ def test_snapshot_failures_raise(tmp_path: Path) -> None:
     (root4 / "latest.json").write_text('{"revision": "rev.json"}', encoding="utf-8")
     with pytest.raises(PITDataError, match="invalid schema"):
         ReceiptCatalog(root4).latest(source="s", natural_keys=["k"])
+
+
+def _publish_worker(root: str, payload_dir: str, worker_index: int, count: int) -> None:
+    import hashlib
+    from datetime import UTC, datetime
+    from pathlib import Path as _Path
+
+    from src.data.receipt_catalog import EvidenceStatus as _Status
+    from src.data.receipt_catalog import ReceiptCatalog as _Catalog
+    from src.data.receipt_catalog import ReceiptIndexEntry as _Entry
+
+    catalog = _Catalog(_Path(root))
+    for offset in range(count):
+        key = f"worker-{worker_index}-key-{offset:03d}"
+        payload_path = _Path(payload_dir) / f"{key}.json"
+        catalog.publish((
+            _Entry(
+                source="concurrent",
+                natural_key=key,
+                as_of=None,
+                fiscal_period=None,
+                status=_Status.SUCCESS,
+                content_hash=hashlib.sha256(payload_path.read_bytes()).hexdigest(),
+                retrieved_at=datetime(2024, 1, 3, tzinfo=UTC),
+                payload_path=payload_path,
+            ),
+        ))
+
+
+def test_concurrent_publishes_keep_all_entries(tmp_path: Path) -> None:
+    import multiprocessing
+
+    root = tmp_path / "catalog"
+    payload_dir = tmp_path / "payloads"
+    payload_dir.mkdir(parents=True, exist_ok=True)
+    per_worker = 50
+    for worker_index in (0, 1):
+        for offset in range(per_worker):
+            (payload_dir / f"worker-{worker_index}-key-{offset:03d}.json").write_bytes(b'{"records": []}')
+
+    with multiprocessing.Pool(processes=2) as pool:
+        pool.starmap(
+            _publish_worker,
+            [(str(root), str(payload_dir), 0, per_worker), (str(root), str(payload_dir), 1, per_worker)],
+        )
+
+    catalog = ReceiptCatalog(root)
+    keys = [f"worker-{w}-key-{o:03d}" for w in (0, 1) for o in range(per_worker)]
+    assert len(catalog.latest(source="concurrent", natural_keys=keys)) == 2 * per_worker
+
+
+def test_lock_released_after_failure(tmp_path: Path) -> None:
+    catalog = ReceiptCatalog(tmp_path / "catalog")
+    catalog.publish((_entry(tmp_path),))
+
+    content_hash, payload_path = _payload_file(tmp_path, "real.json", b"real")
+    assert content_hash
+    with pytest.raises(PITDataError, match="hash mismatch"):
+        catalog.publish((
+            ReceiptIndexEntry(
+                source="krx_daily_market",
+                natural_key="tampered",
+                as_of=date(2024, 1, 2),
+                fiscal_period=None,
+                status=EvidenceStatus.SUCCESS,
+                content_hash="f" * 64,
+                retrieved_at=datetime(2024, 1, 3, tzinfo=UTC),
+                payload_path=payload_path,
+            ),
+        ))
+
+    (tmp_path / "catalog" / "latest.json").write_text("{broken", encoding="utf-8")
+    with pytest.raises(PITDataError, match="unreadable"):
+        catalog.publish((_entry(tmp_path, natural_key="after-corruption"),))
+
+    (tmp_path / "catalog" / "latest.json").unlink()
+    follow_up = catalog.publish((_entry(tmp_path, natural_key="recovered"),))
+
+    assert follow_up.row_count == 1
+    assert catalog.latest(source="krx_daily_market", natural_keys=["recovered"])
+
+
+def test_no_stray_temp_files_after_publish(tmp_path: Path) -> None:
+    catalog = ReceiptCatalog(tmp_path / "catalog")
+    catalog.publish((_entry(tmp_path),))
+    catalog.publish((_entry(tmp_path, natural_key="second"),))
+    _hash, payload_path = _payload_file(tmp_path, "real.json", b"real")
+    assert _hash
+    with pytest.raises(PITDataError, match="hash mismatch"):
+        catalog.publish((
+            ReceiptIndexEntry(
+                source="krx_daily_market",
+                natural_key="tampered",
+                as_of=date(2024, 1, 2),
+                fiscal_period=None,
+                status=EvidenceStatus.SUCCESS,
+                content_hash="f" * 64,
+                retrieved_at=datetime(2024, 1, 3, tzinfo=UTC),
+                payload_path=payload_path,
+            ),
+        ))
+
+    assert list((tmp_path / "catalog").glob("*.tmp")) == []
+    assert list((tmp_path / "catalog").glob(".*.tmp")) == []
+
+
+def test_identical_input_yields_identical_revision(tmp_path: Path) -> None:
+    catalog = ReceiptCatalog(tmp_path / "catalog")
+    entries = (_entry(tmp_path), _entry(tmp_path, natural_key="second"))
+
+    first = catalog.publish(entries)
+    second = catalog.publish(entries)
+
+    assert second.content_hash == first.content_hash
+    assert second.path.read_text(encoding="utf-8") == first.path.read_text(encoding="utf-8")
