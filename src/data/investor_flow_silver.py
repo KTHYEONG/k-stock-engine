@@ -89,6 +89,7 @@ class InvestorFlowSilverResult:
     tickers: int
     raw_pages: int
     ignored_records_only_pages: int
+    foreign_provider_pages: int
     negative_cells: int
     conflict_cells: int
     identity_violation_cells: int
@@ -157,6 +158,11 @@ def _parse_page(path: Path, sessions: frozenset[date]) -> tuple[str, str, str, A
     if not isinstance(payload, dict):
         raise PITDataError(f"invalid investor-flow Bronze root: {path}")
     page_hash = path.parent.name
+    provider = payload.get("provider")
+    if not isinstance(provider, str) or not provider.strip():
+        raise PITDataError(f"investor-flow Bronze page lacks provider label: {path}")
+    if provider.strip().upper() != "LS":
+        return ("foreign_provider", page_hash, "", [])
     rows = payload.get("rows")
     query = payload.get("query")
     query_map = query if isinstance(query, dict) else {}
@@ -248,6 +254,11 @@ def materialize_investor_flow_silver(
     certified ordinary-universe session list is the calendar that assigns
     ``available_at``; sessions outside it are rejected.
 
+    The investor-flow Bronze kind is shared by several providers; only pages
+    whose ``provider`` is LS (case-insensitive) contribute. Pages from other
+    providers are counted and skipped; a page without a provider label is
+    rejected because its origin cannot be proven.
+
     Args:
         bronze_root: Scope Bronze root containing ``investor_flow/<sha256>/``.
         universe_root: Scope Silver root holding exactly one ordinary-universe
@@ -277,6 +288,7 @@ def materialize_investor_flow_silver(
         shard_dir.mkdir()
         raw_hashes: list[str] = []
         ignored_records_only_pages = 0
+        foreign_provider_pages = 0
         negative_keys: set[tuple[str, str]] = set()
         violation_keys: set[tuple[str, str]] = set()
         dateless_rows = 0
@@ -303,6 +315,8 @@ def materialize_investor_flow_silver(
                             columns["ls_value_mkrw"].append(value)
                             columns["source_hash"].append(page_hash)
                         parsed_rows += len(cells)
+                    elif kind == "foreign_provider":
+                        foreign_provider_pages += 1
                     elif kind == "ignored":
                         ignored_records_only_pages += 1
                     else:
@@ -418,6 +432,7 @@ def materialize_investor_flow_silver(
             "tickers": len(tickers),
             "raw_pages": len(raw_hashes),
             "ignored_records_only_pages": ignored_records_only_pages,
+            "foreign_provider_pages": foreign_provider_pages,
             "negative_cells": negative_cells,
             "conflict_cells": conflict_cells,
             "identity_violation_cells": len(violation_keys),
@@ -449,6 +464,7 @@ def materialize_investor_flow_silver(
         tickers=len(tickers),
         raw_pages=len(raw_hashes),
         ignored_records_only_pages=ignored_records_only_pages,
+        foreign_provider_pages=foreign_provider_pages,
         negative_cells=negative_cells,
         conflict_cells=conflict_cells,
         identity_violation_cells=len(violation_keys),
