@@ -536,3 +536,52 @@ def test_fetch_one_financial_fact_source_rejects_invalid_and_parses_valid_legacy
     assert ambiguous_page["status"] == "extraction_failed"
     assert ambiguous_page["records"] == []
 
+
+def _collector_identity() -> dict[str, str]:
+    return {
+        "corp_code": "00126380",
+        "filing_id": "20150515001111",
+        "rcept_no": "20150515001111",
+        "biz_year": "2015",
+        "reprt_code": "11013",
+        "fs_div": "CFS",
+        "published_at": "2015-05-15",
+        "ticker": "",
+    }
+
+
+def test_fetch_one_fact_source_does_not_multiply_retries() -> None:
+    from src.integrations.dart.client import DartRetryableError
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    calls: list[object] = []
+
+    def always_retryable(_endpoint: str, params: dict[str, str]) -> dict[str, object]:
+        calls.append(params.get("fs_div"))
+        raise DartRetryableError("DART status 900: transient")
+
+    collector = DartXbrlCollector(api_key="k", request_json=always_retryable)
+
+    page = collector._fetch_one_financial_fact_source(_collector_identity())
+
+    assert calls == ["CFS"]
+    assert page["source_kind"] == "unavailable"
+
+
+def test_fetch_one_fact_source_quota_block_stops_after_single_call() -> None:
+    from src.integrations.dart.client import DartQuotaExhaustedError
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    calls: list[object] = []
+
+    def quota_blocked(_endpoint: str, params: dict[str, str]) -> dict[str, object]:
+        calls.append(params.get("fs_div"))
+        raise DartQuotaExhaustedError("DART status 020: quota exceeded")
+
+    collector = DartXbrlCollector(api_key="k", request_json=quota_blocked)
+
+    page = collector._fetch_one_financial_fact_source(_collector_identity())
+
+    assert calls == ["CFS"]
+    assert page["source_kind"] == "blocked"
+
