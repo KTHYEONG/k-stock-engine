@@ -329,13 +329,11 @@ class DartXbrlCollector:
         the original sequential loop.
 
         Per-identity DART response failures never raise: transient retryable
-        statuses are retried within a small budget, quota exhaustion returns a
-        ``blocked`` record without further fallback, and any other response
-        failure returns an ``unavailable`` record preserving the original
-        error text in diagnostics.
+        statuses surface as an ``unavailable`` record without collector-level
+        retries, quota exhaustion returns a ``blocked`` record without further
+        fallback, and any other response failure returns an ``unavailable``
+        record preserving the original error text in diagnostics.
         """
-        import time as _time
-
         from src.integrations.dart.legacy_filing import (
             MAPPING_VERSION,
             map_standardized_account,
@@ -374,33 +372,6 @@ class DartXbrlCollector:
                 return match.group(1)
             return fallback
 
-        def _request_with_retry(fs_div: str) -> dict[str, Any]:
-            from src.integrations.dart.client import DartQuotaExhaustedError, DartRetryableError
-
-            for attempt in range(3):
-                try:
-                    if self._request_json is not None:
-                        raw = self._request_json("fnlttSinglAcntAll", {**identity, "fs_div": fs_div})
-                    else:
-                        assert self._client is not None
-                        raw = self._client._request_validated(
-                            "fnlttSinglAcntAll.json",
-                            {
-                                "corp_code": identity["corp_code"],
-                                "bsns_year": identity["biz_year"],
-                                "reprt_code": identity["reprt_code"],
-                                "fs_div": fs_div,
-                            },
-                        )
-                    return raw  # type: ignore[no-any-return]
-                except DartQuotaExhaustedError:
-                    raise
-                except DartRetryableError:
-                    if attempt >= 2:
-                        raise
-                    _time.sleep(0.25)
-            raise AssertionError("unreachable")  # pragma: no cover
-
         if self._request_json is None and self._client is None:
             raise PITDataError("DART XBRL facts endpoint is not configured")
 
@@ -412,7 +383,19 @@ class DartXbrlCollector:
         for fs_div in divisions:
             request_identity = {**identity, "fs_div": fs_div}
             try:
-                raw = _request_with_retry(fs_div)
+                if self._request_json is not None:
+                    raw = self._request_json("fnlttSinglAcntAll", {**identity, "fs_div": fs_div})
+                else:
+                    assert self._client is not None
+                    raw = self._client._request_validated(
+                        "fnlttSinglAcntAll.json",
+                        {
+                            "corp_code": identity["corp_code"],
+                            "bsns_year": identity["biz_year"],
+                            "reprt_code": identity["reprt_code"],
+                            "fs_div": fs_div,
+                        },
+                    )
             except Exception as exc:
                 from src.integrations.dart.client import (
                     DartApiError,

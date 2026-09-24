@@ -319,3 +319,349 @@ def test_request_validated_raises_distinguishable_quota_exhausted_type() -> None
     assert isinstance(exc_info.value, DartApiError)
     assert len(rate_limit_calls) == 1
     assert rate_limit_calls[0]["provider"] == "OpenDART"
+
+
+def _ledgered_client(tmp_path, monkeypatch, *, responses, daily_request_limit=None):
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from src.integrations.dart.client import DartApiClient
+    from src.integrations.quota import ProviderQuotaStateStore
+
+    now = datetime(2026, 9, 13, tzinfo=UTC)
+    script = list(responses)
+    gets: list[object] = []
+
+    def fake_get(*_args, **_kwargs):
+        gets.append(object())
+        action = script[min(len(gets) - 1, len(script) - 1)]
+        if isinstance(action, Exception):
+            raise action
+        return action
+
+    class _CountingStore(ProviderQuotaStateStore):
+        def __init__(self, root):
+            super().__init__(root)
+            self.acquire_calls = 0
+            self.attempt_calls = 0
+
+        def acquire(self, **kwargs):
+            self.acquire_calls += 1
+            return super().acquire(**kwargs)
+
+        def record_attempt(self, **kwargs):
+            self.attempt_calls += 1
+            return super().record_attempt(**kwargs)
+
+    store = _CountingStore(tmp_path)
+    client = DartApiClient(
+        api_key="key",
+        quota_store=store,
+        now=lambda: now,
+        daily_request_limit=daily_request_limit,
+    )
+    client._session = SimpleNamespace(get=fake_get)
+    return client, store, gets, store, store, now
+
+
+def _ok_response(status="000"):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(status_code=200, json=lambda status=status: {"status": status, "list": []})
+
+
+def test_fetch_document_archive_is_ledgered(tmp_path, monkeypatch) -> None:
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("document.xml", "<doc/>")
+    payload = buf.getvalue()
+
+    from types import SimpleNamespace
+
+    client, store, gets, _acquire, _attempts, now = _ledgered_client(
+        tmp_path, monkeypatch, responses=[SimpleNamespace(status_code=200, content=payload)]
+    )
+    before = store.remaining_daily_attempts(provider="OpenDART", now=now, daily_limit=15_200)
+
+    assert client.fetch_document_archive("20240101000001") == payload
+    assert len(gets) == 1
+    assert before - store.remaining_daily_attempts(provider="OpenDART", now=now, daily_limit=15_200) == 1
+
+
+def test_load_corp_code_records_is_ledgered_and_paced(tmp_path, monkeypatch) -> None:
+    import io
+    import zipfile
+
+    xml = (
+        "<result><list><stock_code>005930</stock_code>"
+        "<corp_code>00126380</corp_code><corp_name>삼성전자</corp_name></list></result>"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("CORPCODE.xml", xml.encode("utf-8"))
+
+    from types import SimpleNamespace
+
+    client, _store, gets, _acquire, attempts, _now = _ledgered_client(
+        tmp_path, monkeypatch, responses=[SimpleNamespace(status_code=200, content=buf.getvalue())]
+    )
+    paces: list[None] = []
+    monkeypatch.setattr(client, "_pace", lambda: paces.append(None))
+
+    records = client.load_corp_code_records()
+
+    assert [(rec.ticker, rec.corp_code) for rec in records] == [("005930", "00126380")]
+    assert len(gets) == 1
+    assert attempts.attempt_calls == 1
+    assert len(paces) == 1
+
+
+def test_request_validated_status_900_shares_attempt_budget(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    from src.integrations.dart.client import DartRetryableError
+
+    client, _store, gets, acquire, attempts, _now = _ledgered_client(
+        tmp_path, monkeypatch, responses=[_ok_response("900")] * 3
+    )
+    monkeypatch.setattr("src.integrations.dart.client.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(DartRetryableError, match="900"):
+        client._request_validated("fnlttSinglAcntAll.json", {"corp_code": "00126380"})
+
+    assert len(gets) == 3
+    assert acquire.acquire_calls == 1
+    assert attempts.attempt_calls == 3
+
+
+def test_request_validated_status_900_then_success(tmp_path, monkeypatch) -> None:
+    client, _store, gets, acquire, attempts, _now = _ledgered_client(
+        tmp_path, monkeypatch, responses=[_ok_response("900"), _ok_response("000")]
+    )
+    monkeypatch.setattr("src.integrations.dart.client.time.sleep", lambda _seconds: None)
+
+    payload = client._request_validated("fnlttSinglAcntAll.json", {"corp_code": "00126380"})
+
+    assert payload["status"] == "000"
+    assert len(gets) == 2
+    assert acquire.acquire_calls == 1
+    assert attempts.attempt_calls == 2
+
+
+def test_request_mixed_causes_share_attempt_budget(tmp_path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import pytest
+    import requests
+
+    from src.integrations.dart.client import DartRetryableError
+
+    def bad_json():
+        raise ValueError("No JSON could be decoded")
+
+    client, _store, gets, acquire, attempts, _now = _ledgered_client(
+        tmp_path,
+        monkeypatch,
+        responses=[
+            requests.exceptions.ConnectionError("Connection aborted."),
+            SimpleNamespace(status_code=503, json=lambda: {}),
+            SimpleNamespace(status_code=200, json=bad_json),
+        ],
+    )
+    monkeypatch.setattr("src.integrations.dart.client.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(DartRetryableError):
+        client._request_validated("fnlttSinglAcntAll.json", {"corp_code": "00126380"})
+
+    assert len(gets) == 3
+    assert acquire.acquire_calls == 1
+    assert attempts.attempt_calls == 3
+
+
+def test_request_validated_quota_status_is_not_retried(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    from src.integrations.dart.client import DartQuotaExhaustedError
+
+    client, _store, gets, acquire, attempts, _now = _ledgered_client(
+        tmp_path, monkeypatch, responses=[_ok_response("020")]
+    )
+
+    with pytest.raises(DartQuotaExhaustedError, match="020"):
+        client._request_validated("list.json", {"bgn_de": "20240101", "end_de": "20240101"})
+
+    assert len(gets) == 1
+    assert acquire.acquire_calls == 1
+    assert attempts.attempt_calls == 1
+
+
+def test_blocked_ledger_sends_nothing(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    from src.integrations.quota import ProviderQuotaBlocked
+
+    client, _store, gets, _acquire, _attempts, _now = _ledgered_client(
+        tmp_path, monkeypatch, responses=[_ok_response("000")], daily_request_limit=1
+    )
+
+    client._request("list.json", {"bgn_de": "20240101", "end_de": "20240101"})
+    assert len(gets) == 1
+    with pytest.raises(ProviderQuotaBlocked):
+        client._request("list.json", {"bgn_de": "20240102", "end_de": "20240102"})
+    assert len(gets) == 1
+
+
+def test_request_json_seam_bypasses_http() -> None:
+    from types import SimpleNamespace
+
+    from src.integrations.dart.client import DartApiClient
+
+    def no_http(*_args, **_kwargs):
+        raise AssertionError("HTTP must not be used by the injected seam")
+
+    client = DartApiClient(api_key="key", request_json=lambda _e, _p: {"status": "000", "list": []})
+    client._session = SimpleNamespace(get=no_http)
+
+    assert client._request("list.json", {"bgn_de": "20240101"}) == {"status": "000", "list": []}
+
+
+def test_http_get_adds_api_key_and_records_single_attempt(tmp_path) -> None:
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from src.integrations.dart.client import DartApiClient
+    from src.integrations.quota import ProviderQuotaStateStore
+
+    now = datetime(2026, 9, 13, tzinfo=UTC)
+    seen: dict[str, object] = {}
+    store = ProviderQuotaStateStore(tmp_path)
+    client = DartApiClient(api_key="key", quota_store=store, now=lambda: now)
+
+    def fake_get(_url, params=None, **_kwargs):
+        seen.update(dict(params or {}))
+        return SimpleNamespace(status_code=200, content=b"{}")
+
+    client._session = SimpleNamespace(get=fake_get)
+    before = store.remaining_daily_attempts(provider="OpenDART", now=now, daily_limit=15_200)
+
+    response = client._http_get("document.xml", {"rcept_no": "20240101000001"})
+
+    assert response.status_code == 200
+    assert seen["crtfc_key"] == "key"
+    assert seen["rcept_no"] == "20240101000001"
+    assert before - store.remaining_daily_attempts(provider="OpenDART", now=now, daily_limit=15_200) == 1
+
+
+def test_request_terminal_status_is_not_retried(tmp_path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import pytest
+
+    from src.integrations.dart.client import DartTerminalError
+
+    client, _store, gets, _acquire, attempts, _now = _ledgered_client(
+        tmp_path, monkeypatch, responses=[SimpleNamespace(status_code=404, json=lambda: {})]
+    )
+
+    with pytest.raises(DartTerminalError, match="404"):
+        client._request("list.json", {"bgn_de": "20240101", "end_de": "20240101"})
+
+    assert len(gets) == 1
+    assert attempts.attempt_calls == 1
+
+
+def test_request_non_object_json_payload_rejected(tmp_path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import pytest
+
+    from src.integrations.dart.client import DartTerminalError
+
+    client, _store, gets, _acquire, _attempts, _now = _ledgered_client(
+        tmp_path, monkeypatch, responses=[SimpleNamespace(status_code=200, json=lambda: ["not", "an", "object"])]
+    )
+
+    with pytest.raises(DartTerminalError, match="must be an object"):
+        client._request("list.json", {"bgn_de": "20240101", "end_de": "20240101"})
+
+    assert len(gets) == 1
+
+
+def test_request_seams_reject_non_object_payload() -> None:
+    import pytest
+
+    from src.integrations.dart.client import DartApiClient, DartTerminalError
+
+    with pytest.raises(DartTerminalError, match="must be an object"):
+        DartApiClient(api_key="key", raw_request_json=lambda _e, _p: ["nope"])._request(
+            "list.json", {"bgn_de": "20240101"}
+        )
+    with pytest.raises(DartTerminalError, match="must be an object"):
+        DartApiClient(api_key="key", request_json=lambda _e, _p: ["nope"])._request(
+            "list.json", {"bgn_de": "20240101"}
+        )
+
+
+def test_fetch_document_archive_retries_retryable_status(tmp_path, monkeypatch) -> None:
+    import io
+    import zipfile
+    from types import SimpleNamespace
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("document.xml", "<doc/>")
+    payload = buf.getvalue()
+
+    client, _store, gets, _acquire, attempts, _now = _ledgered_client(
+        tmp_path,
+        monkeypatch,
+        responses=[
+            SimpleNamespace(status_code=503, json=lambda: {}),
+            SimpleNamespace(status_code=200, content=payload),
+        ],
+    )
+    monkeypatch.setattr("src.integrations.dart.client.time.sleep", lambda _seconds: None)
+
+    assert client.fetch_document_archive("20240101000001") == payload
+    assert len(gets) == 2
+    assert attempts.attempt_calls == 2
+
+
+def test_fetch_document_archive_empty_body_fails_closed(tmp_path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import pytest
+
+    from src.integrations.dart.client import DartTerminalError
+
+    client, _store, gets, _acquire, _attempts, _now = _ledgered_client(
+        tmp_path, monkeypatch, responses=[SimpleNamespace(status_code=200, content=b"")]
+    )
+    monkeypatch.setattr("src.integrations.dart.client.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(DartTerminalError, match="empty"):
+        client.fetch_document_archive("20240101000001")
+
+    assert len(gets) == 3
+
+
+def test_fetch_document_archive_error_payload_rejected(tmp_path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import pytest
+
+    from src.integrations.dart.client import DartTerminalError
+
+    client, _store, gets, _acquire, _attempts, _now = _ledgered_client(
+        tmp_path,
+        monkeypatch,
+        responses=[SimpleNamespace(status_code=200, content=b'{"status": "013"}')],
+    )
+
+    with pytest.raises(DartTerminalError, match="error payload"):
+        client.fetch_document_archive("20240101000001")
+
+    assert len(gets) == 1
