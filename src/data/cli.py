@@ -687,6 +687,7 @@ def normalize_dart_facts(
     batch_size: int = 500,
 ) -> dict[str, object]:
     """Incremental DART fact refresh entry point for the normalize-dart-facts command."""
+    from src.core.krx_calendar import xkrx_session_calendar
     from src.data.incremental_normalization import refresh_dart_financial_facts
 
     artifact = refresh_dart_financial_facts(
@@ -694,6 +695,7 @@ def normalize_dart_facts(
         silver_root=Path(silver_root),
         artifact_root=Path(artifact_root),
         decision_time=decision_time,
+        calendar=xkrx_session_calendar(),
         batch_size=int(batch_size),
     )
     return {"output_hash": artifact.output_hash, "report_hash": artifact.report_hash, "row_count": artifact.row_count}
@@ -2169,7 +2171,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 decision_time=_parse_dt(args.decision_time),
                 batch_size=int(getattr(args, "batch_size", 500)),
             )
-        except (PITDataError, ValueError, OSError):
+        except (PITDataError, ValueError, OSError) as exc:
+            _emit({"error": str(exc)})
             return 1
         _emit({"output_hash": payload["output_hash"], "report_hash": payload["report_hash"], "row_count": payload["row_count"]})
         return 0
