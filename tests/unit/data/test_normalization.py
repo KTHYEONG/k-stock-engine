@@ -466,3 +466,257 @@ def test_normalize_financial_facts_keeps_consolidated_and_separate_rows() -> Non
         decision_time=datetime(2016, 1, 4, tzinfo=UTC),
     )
     assert deduped.height == 1
+
+
+def _kst_open(day: str):
+    from datetime import datetime, date
+    from src.core.time import KRX_TZ
+
+    parsed = date.fromisoformat(day)
+    return datetime(parsed.year, parsed.month, parsed.day, 9, 0, tzinfo=KRX_TZ)
+
+
+def _fact_record(*, filing_id: str, published_at, extra: dict | None = None) -> dict:
+    record = {
+        'ticker': '005930',
+        'corp_code': '00126380',
+        'fiscal_period': '2024Q3',
+        'filing_id': filing_id,
+        'fact': 'sales',
+        'published_at': published_at,
+        'value': 10.0,
+        'unit': 'KRW',
+        'consolidated': True,
+    }
+    if extra:
+        record.update(extra)
+    return record
+
+
+def test_normalize_dart_facts_available_at_next_session_open() -> None:
+    from datetime import UTC, datetime
+
+    from src.core.time import SessionCalendar
+    from src.data.normalization import normalize_dart_financial_facts
+
+    frame = normalize_dart_financial_facts(
+        pages=[_fact_record(filing_id='F-W13', published_at=datetime(2024, 11, 13, 0, 0, tzinfo=UTC))],
+        disclosure_rows=(),
+        source_hash='a' * 64,
+        calendar=SessionCalendar((_kst_open('2024-11-13'), _kst_open('2024-11-14'))),
+        decision_time=datetime(2024, 11, 20, tzinfo=UTC),
+    )
+
+    assert frame.height == 1
+    assert frame.item(0, 'published_at') == datetime(2024, 11, 12, 15, 0, tzinfo=UTC)
+    assert frame.item(0, 'available_at') == datetime(2024, 11, 14, 0, 0, tzinfo=UTC)
+
+
+def test_normalize_dart_facts_friday_filing_available_monday() -> None:
+    from datetime import UTC, datetime
+
+    from src.core.time import SessionCalendar
+    from src.data.normalization import normalize_dart_financial_facts
+
+    frame = normalize_dart_financial_facts(
+        pages=[_fact_record(filing_id='F-FRI', published_at=datetime(2024, 11, 15, 0, 0, tzinfo=UTC))],
+        disclosure_rows=(),
+        source_hash='a' * 64,
+        calendar=SessionCalendar((_kst_open('2024-11-15'), _kst_open('2024-11-18'))),
+        decision_time=datetime(2024, 11, 20, tzinfo=UTC),
+    )
+
+    assert frame.height == 1
+    assert frame.item(0, 'available_at') == datetime(2024, 11, 18, 0, 0, tzinfo=UTC)
+
+
+def test_normalize_dart_facts_restated_record_uses_own_receipt_date() -> None:
+    from datetime import UTC, datetime
+
+    from src.core.time import SessionCalendar
+    from src.data.normalization import normalize_dart_financial_facts
+
+    frame = normalize_dart_financial_facts(
+        pages=[_fact_record(
+            filing_id='20260701000123',
+            published_at=datetime(2024, 11, 13, 0, 0, tzinfo=UTC),
+            extra={'rcept_no': '20260701000123'},
+        )],
+        disclosure_rows=(),
+        source_hash='a' * 64,
+        calendar=SessionCalendar((_kst_open('2026-07-01'), _kst_open('2026-07-02'))),
+        decision_time=datetime(2026, 12, 30, tzinfo=UTC),
+    )
+
+    assert frame.height == 1
+    assert frame.item(0, 'filing_id') == '20260701000123'
+    assert frame.item(0, 'published_at') == datetime(2026, 6, 30, 15, 0, tzinfo=UTC)
+    assert frame.item(0, 'available_at') == datetime(2026, 7, 2, 0, 0, tzinfo=UTC)
+
+
+def test_normalize_dart_facts_restated_record_excluded_before_receipt() -> None:
+    from datetime import UTC, datetime
+
+    from src.core.time import SessionCalendar
+    from src.data.normalization import normalize_dart_financial_facts
+
+    frame = normalize_dart_financial_facts(
+        pages=[_fact_record(
+            filing_id='20260701000123',
+            published_at=datetime(2024, 11, 13, 0, 0, tzinfo=UTC),
+            extra={'rcept_no': '20260701000123'},
+        )],
+        disclosure_rows=(),
+        source_hash='a' * 64,
+        calendar=SessionCalendar((_kst_open('2024-11-14'),)),
+        decision_time=datetime(2025, 6, 30, tzinfo=UTC),
+    )
+
+    assert frame.is_empty()
+
+
+def test_normalize_dart_facts_empty_calendar_fails_closed() -> None:
+    from datetime import UTC, datetime
+
+    import pytest
+
+    from src.core.time import SessionCalendar
+    from src.data.normalization import normalize_dart_financial_facts
+    from src.data.schemas import PITDataError
+
+    with pytest.raises(PITDataError, match='calendar'):
+        normalize_dart_financial_facts(
+            pages=[_fact_record(filing_id='F1', published_at=datetime(2024, 11, 13, 0, 0, tzinfo=UTC))],
+            disclosure_rows=(),
+            source_hash='a' * 64,
+            calendar=SessionCalendar(()),
+            decision_time=datetime(2024, 11, 20, tzinfo=UTC),
+        )
+
+
+def test_normalize_dart_facts_calendar_ending_before_receipt_fails_closed() -> None:
+    from datetime import UTC, datetime
+
+    import pytest
+
+    from src.core.time import SessionCalendar
+    from src.data.normalization import normalize_dart_financial_facts
+    from src.data.schemas import PITDataError
+
+    with pytest.raises(PITDataError, match='no next KRX session'):
+        normalize_dart_financial_facts(
+            pages=[_fact_record(filing_id='F1', published_at=datetime(2024, 11, 13, 0, 0, tzinfo=UTC))],
+            disclosure_rows=(),
+            source_hash='a' * 64,
+            calendar=SessionCalendar((_kst_open('2024-11-12'),)),
+            decision_time=datetime(2024, 11, 20, tzinfo=UTC),
+        )
+
+
+def test_normalize_dart_facts_next_session_after_decision_time_excluded() -> None:
+    from datetime import UTC, datetime
+
+    from src.core.time import SessionCalendar
+    from src.data.normalization import normalize_dart_financial_facts
+
+    frame = normalize_dart_financial_facts(
+        pages=[_fact_record(filing_id='F1', published_at=datetime(2024, 11, 14, 0, 0, tzinfo=UTC))],
+        disclosure_rows=(),
+        source_hash='a' * 64,
+        calendar=SessionCalendar((_kst_open('2024-11-14'), _kst_open('2024-11-15'))),
+        decision_time=datetime(2024, 11, 14, 12, 0, tzinfo=UTC),
+    )
+
+    assert frame.is_empty()
+
+
+def test_normalize_dart_facts_malformed_receipt_number_skipped() -> None:
+    from datetime import UTC, datetime
+
+    from src.core.time import SessionCalendar
+    from src.data.normalization import normalize_dart_financial_facts
+
+    frame = normalize_dart_financial_facts(
+        pages=[
+            _fact_record(
+                filing_id='BAD',
+                published_at=datetime(2024, 11, 13, 0, 0, tzinfo=UTC),
+                extra={'rcept_no': '2024111'},
+            ),
+            _fact_record(filing_id='GOOD', published_at=datetime(2024, 11, 13, 0, 0, tzinfo=UTC)),
+        ],
+        disclosure_rows=(),
+        source_hash='a' * 64,
+        calendar=SessionCalendar((_kst_open('2024-11-13'), _kst_open('2024-11-14'))),
+        decision_time=datetime(2024, 11, 20, tzinfo=UTC),
+    )
+
+    assert frame['filing_id'].to_list() == ['GOOD']
+
+
+def test_normalize_dart_facts_receipt_date_from_filing_id_and_invalid_skipped() -> None:
+    from datetime import UTC, datetime
+
+    from src.core.time import SessionCalendar
+    from src.data.normalization import normalize_dart_financial_facts
+
+    frame = normalize_dart_financial_facts(
+        pages=[
+            _fact_record(
+                filing_id='20241113000123',
+                published_at=datetime(2024, 11, 13, 0, 0, tzinfo=UTC),
+            ),
+            _fact_record(
+                filing_id='BAD-DATE',
+                published_at=datetime(2024, 11, 13, 0, 0, tzinfo=UTC),
+                extra={'rcept_no': '20261301000123'},
+            ),
+        ],
+        disclosure_rows=(),
+        source_hash='a' * 64,
+        calendar=SessionCalendar((_kst_open('2024-11-13'), _kst_open('2024-11-14'))),
+        decision_time=datetime(2024, 11, 20, tzinfo=UTC),
+    )
+
+    assert frame['filing_id'].to_list() == ['20241113000123']
+    assert frame.item(0, 'published_at') == datetime(2024, 11, 12, 15, 0, tzinfo=UTC)
+    assert frame.item(0, 'available_at') == datetime(2024, 11, 14, 0, 0, tzinfo=UTC)
+
+
+def test_normalize_dart_facts_naive_session_fails_closed() -> None:
+    from datetime import UTC, datetime
+
+    import pytest
+
+    from src.core.time import SessionCalendar
+    from src.data.normalization import normalize_dart_financial_facts
+    from src.data.schemas import PITDataError
+
+    with pytest.raises(PITDataError, match='timezone-aware'):
+        normalize_dart_financial_facts(
+            pages=[_fact_record(filing_id='F1', published_at=datetime(2024, 11, 13, 0, 0, tzinfo=UTC))],
+            disclosure_rows=(),
+            source_hash='a' * 64,
+            calendar=SessionCalendar((datetime(2024, 11, 14, 9, 0),)),
+            decision_time=datetime(2024, 11, 20, tzinfo=UTC),
+        )
+
+
+def test_normalize_dart_facts_non_numeric_value_skipped() -> None:
+    from datetime import UTC, datetime
+
+    from src.core.time import SessionCalendar
+    from src.data.normalization import normalize_dart_financial_facts
+
+    frame = normalize_dart_financial_facts(
+        pages=[
+            {**_fact_record(filing_id='BAD-VALUE', published_at=datetime(2024, 11, 13, 0, 0, tzinfo=UTC)), 'value': 'not-a-number'},
+            _fact_record(filing_id='GOOD', published_at=datetime(2024, 11, 13, 0, 0, tzinfo=UTC)),
+        ],
+        disclosure_rows=(),
+        source_hash='a' * 64,
+        calendar=SessionCalendar((_kst_open('2024-11-13'), _kst_open('2024-11-14'))),
+        decision_time=datetime(2024, 11, 20, tzinfo=UTC),
+    )
+
+    assert frame['filing_id'].to_list() == ['GOOD']
