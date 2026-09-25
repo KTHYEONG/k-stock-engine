@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass
@@ -13,11 +14,12 @@ import polars as pl
 
 from src.data.collection import collect_dart_disclosures, collect_dart_financial_facts
 from src.data.receipt_catalog import ReceiptCatalog
+from src.data.research_scope import PRIMARY_DART_KEY_ENV
 from src.data.runtime import DataRuntime
 from src.data.schemas import PITDataError
 from src.data.scope_coverage import CoverageRequirement
 from src.data.scoped_ingestion import FACT_SOURCE, dart_fact_natural_key
-from src.integrations.dart.client import DartCorpCodeRecord
+from src.integrations.dart.client import DartCorpCodeRecord, dart_quota_provider
 from src.integrations.dart.xbrl import DartXbrlCollector
 from src.integrations.quota import ProviderQuotaStateStore
 
@@ -633,30 +635,46 @@ def scoped_dart_request_headroom(
     runtime: DataRuntime,
     quota_store: ProviderQuotaStateStore | None = None,
     now: datetime | None = None,
+    key_env: str = PRIMARY_DART_KEY_ENV,
 ) -> int:
-    """Return request capacity after reserving provider-wide DART quota headroom."""
-    settings = runtime.scope.collection
+    """Return request capacity for one key after reserving its quota headroom.
+
+    Each key is metered in its own ledger against the budget and reserve its
+    scope policy declares, so a run of one key never consumes another's
+    headroom.
+    """
+    policy = runtime.scope.collection.dart_key_policy(key_env)
     store = quota_store or ProviderQuotaStateStore(runtime.workspace.state_root / "quota")
-    moment = now or datetime.now(UTC)
     remaining = store.remaining_daily_attempts(
-        provider="OpenDART",
-        now=moment,
-        daily_limit=settings.dart_daily_budget,
+        provider=dart_quota_provider(os.environ.get(key_env)),
+        now=now or datetime.now(UTC),
+        daily_limit=policy.daily_budget,
     )
-    return max(0, remaining - settings.dart_daily_reserve)
+    return max(0, remaining - policy.daily_reserve)
 
 
 def build_scoped_dart_collector(
-    *, runtime: DataRuntime, quota_store: ProviderQuotaStateStore | None = None
+    *,
+    runtime: DataRuntime,
+    quota_store: ProviderQuotaStateStore | None = None,
+    key_env: str = PRIMARY_DART_KEY_ENV,
 ) -> DartXbrlCollector:
-    """Build the sole DART collector from the active scope collection policy."""
-    settings = runtime.scope.collection
+    """Build the sole DART collector for one declared key from its scope policy.
+
+    Raises:
+        ValueError: the key has no declared policy or its environment variable is unset.
+    """
+    policy = runtime.scope.collection.dart_key_policy(key_env)
+    api_key = os.environ.get(key_env)
+    if not api_key:
+        raise ValueError(f"{key_env} is not set")
     store = quota_store or ProviderQuotaStateStore(runtime.workspace.state_root / "quota")
     return DartXbrlCollector(
+        api_key=api_key,
         quota_store=store,
-        max_workers=settings.dart_max_workers,
-        min_interval=settings.dart_request_min_interval_seconds,
-        daily_request_limit=settings.dart_daily_budget,
+        max_workers=policy.max_workers,
+        min_interval=policy.min_interval_seconds,
+        daily_request_limit=policy.daily_budget,
     )
 
 

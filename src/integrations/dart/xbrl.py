@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import threading
 import zipfile
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -36,7 +37,24 @@ _REPORT_CODE_BY_KIND = {
     "분기보고서": None,
 }
 _PERIOD = re.compile(r"\((\d{4})\.(\d{2})\)")
-_REPRT_QUARTER = {"11013": "Q1", "11012": "Q2", "11014": "Q3", "11011": "Q4"}
+REPRT_QUARTER = {"11013": "Q1", "11012": "Q2", "11014": "Q3", "11011": "Q4"}
+
+
+class DartCircuitOpenError(PITDataError):
+    """Consecutive transport failures tripped the circuit breaker before any page was collected."""
+
+
+_TRANSPORT_FAILURE_MARKERS = ("transport failed", "blocked until", "DART status 800", "DART status 900")
+_CIRCUIT_THRESHOLD = 3
+
+
+def _is_transport_failure(page: dict[str, Any]) -> bool:
+    """True for an ``unavailable`` page caused by connection failure or a client cooldown, not by DART's answer."""
+    if page.get("source_kind") != "unavailable":
+        return False
+    diagnostics = page.get("diagnostics") or ()
+    text = str(diagnostics[0]) if diagnostics else ""
+    return any(marker in text for marker in _TRANSPORT_FAILURE_MARKERS)
 
 
 class DartXbrlCollector:
@@ -184,7 +202,7 @@ class DartXbrlCollector:
                     ).isoformat()
                 except ValueError:
                     continue
-                quarter = _REPRT_QUARTER.get(str(report_code), "")
+                quarter = REPRT_QUARTER.get(str(report_code), "")
                 fiscal_period = f"{year}{quarter}" if quarter else ""
                 if required_periods is not None and fiscal_period not in required_periods:
                     continue
@@ -306,17 +324,43 @@ class DartXbrlCollector:
                     "ticker": str(item.get("ticker") or "").strip(),
                 }
             )
+        self.aborted = False
+        stop = threading.Event()
+        guard = threading.Lock()
+        streak = 0
+
+        def _guarded(identity: dict[str, str]) -> dict[str, Any] | None:
+            # 연속 전송 실패는 IP 차단·연결 종료의 신호다. 더 밀어붙이면 차단이 길어지므로 즉시 멈춘다.
+            nonlocal streak
+            if stop.is_set():
+                return None
+            page = self._fetch_one_financial_fact_source(identity)
+            with guard:
+                streak = streak + 1 if _is_transport_failure(page) else 0
+                if streak >= _CIRCUIT_THRESHOLD or page.get("source_kind") == "blocked":
+                    stop.set()
+            return page
+
         if len(normalized) <= 1 or self._max_workers <= 1:
-            pages: list[dict[str, Any]] = []
-            for identity in normalized:
-                page = self._fetch_one_financial_fact_source(identity)
-                pages.append(page)
-                if page.get("source_kind") == "blocked":
-                    break
+            results = [_guarded(identity) for identity in normalized]
         else:
             with ThreadPoolExecutor(max_workers=min(self._max_workers, len(normalized))) as pool:
-                pages = list(pool.map(self._fetch_one_financial_fact_source, normalized))
+                results = list(pool.map(_guarded, normalized))
+        self.aborted = stop.is_set() and any(p is not None and p.get("source_kind") != "blocked" and _is_transport_failure(p) for p in results)
+        # 중단 시 전송 실패 페이지는 증거로 남기지 않는다(해당 식별자는 미완료로 유지되어 재시도된다).
+        pages = [p for p in results if p is not None and not (self.aborted and _is_transport_failure(p))]
         return iter(tuple(pages))
+
+    def health_check(self) -> None:
+        """Issue one ledgered request to confirm the provider accepts connections from this host.
+
+        Raises:
+            PITDataError: the client is unavailable.
+            DartRetryableError: the connection failed or the provider is throttling this host.
+        """
+        if self._client is None:
+            raise PITDataError("DART XBRL facts endpoint is not configured")
+        self._client.ping()
 
     def _fetch_one_financial_fact_source(self, identity: dict[str, str]) -> dict[str, Any]:
         """Fetch and parse the full-statement source for one filing identity.
@@ -334,11 +378,13 @@ class DartXbrlCollector:
         fallback, and any other response failure returns an ``unavailable``
         record preserving the original error text in diagnostics.
         """
+        from src.integrations.dart.client import DartQuotaExhaustedError, DartRetryableError
         from src.integrations.dart.legacy_filing import (
             MAPPING_VERSION,
             map_standardized_account,
             parse_legacy_filing_archive,
         )
+        from src.integrations.quota import ProviderQuotaBlocked
 
         def _blocked_record(status: str) -> dict[str, Any]:
             return {
@@ -466,7 +512,7 @@ class DartXbrlCollector:
                 reprt_code = str(
                     row.get("reprt_code") or identity.get("reprt_code") or ""
                 ).strip()
-                quarter = _REPRT_QUARTER.get(reprt_code, "Q4")
+                quarter = REPRT_QUARTER.get(reprt_code, "Q4")
                 fiscal_period = f"{biz_year}{quarter}" if biz_year else ""
                 if not fiscal_period:
                     diagnostics.append(f"missing_fiscal_period:{fact}")
@@ -521,6 +567,11 @@ class DartXbrlCollector:
                 raise PITDataError("DART document archive endpoint is not configured")
         except PITDataError:
             raise
+        except DartQuotaExhaustedError:
+            return _blocked_record("020")
+        except (DartRetryableError, ProviderQuotaBlocked) as exc:
+            # 전송 실패는 청크 전체를 잃게 하지 않고 미완료 페이지로 남겨 회로 차단기가 판단하게 한다.
+            return _unavailable_record(last_status or "013", exc)
         except Exception as exc:
             raise PITDataError(f"DART document archive failed for {fid}") from exc
         if not isinstance(archive, (bytes, bytearray)) or len(archive) == 0:
@@ -531,6 +582,19 @@ class DartXbrlCollector:
                 "records": [],
                 "mapping_version": MAPPING_VERSION,
                 "diagnostics": ("empty_archive",),
+                "raw_document_hash": None,
+                **identity,
+            }
+        if b"<status>014</status>" in bytes(archive[:600]):
+            # 공시 원문 파일이 존재하지 않는다는 DART의 확정 응답이다. 표준 API도 비어 있으므로
+            # 자료 없음으로 기록해 매 실행마다 재조회(요청 3회)하지 않게 한다.
+            return {
+                "source_kind": "legacy_document",
+                "status": "013",
+                "identity": dict(identity),
+                "records": [],
+                "mapping_version": MAPPING_VERSION,
+                "diagnostics": ("document_not_found",),
                 "raw_document_hash": None,
                 **identity,
             }
