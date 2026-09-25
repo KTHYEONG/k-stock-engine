@@ -20,7 +20,6 @@ from src.backtest.market import MarketArrays
 from src.backtest.strategy import PortfolioSnapshot, Strategy
 from src.backtest.view import AsOfTable, PITView
 from src.core.market_rules import KrxMarketRules
-from src.core.pit import PITDataError
 from src.core.time import KRX_TZ
 
 _DECISION_AT = time(18, 0)
@@ -207,9 +206,7 @@ def run_backtest(
         if t in deposits_by_session:
             ledger.deposit(session_idx=t, amount=deposits_by_session[t])
         executable = [order for order in pending if order.instrument_idx not in exited]
-        for order in pending:
-            if order.instrument_idx in exited:
-                rejects.append(Reject(order, "delisted"))
+        rejects.extend(Reject(order, "delisted") for order in pending if order.instrument_idx in exited)
         order_fills, order_rejects = price_orders(
             orders=executable, arrays=arrays, t=t, config=config.execution, costs=config.costs,
             rules=rules,

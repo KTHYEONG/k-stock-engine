@@ -16,49 +16,18 @@ SRC = Path(__file__).resolve().parents[3] / "src"
 ALLOWED: dict[str, frozenset[str]] = {
     "core": frozenset(),
     "storage": frozenset({"core"}),
-    "domain": frozenset({"core"}),
     "execution": frozenset({"core"}),
     "integrations": frozenset({"core", "storage"}),
     "data": frozenset({"core", "storage", "integrations"}),
-    "features": frozenset({"core", "storage"}),
-    "strategy": frozenset({"core", "storage", "features", "execution", "engine"}),
-    "engine": frozenset({"core", "execution"}),
-    "validation": frozenset({"core", "engine"}),
     "backtest": frozenset({"core", "storage", "data"}),
 }
 
 # (importing file relative to repo root, imported top-level package)
 KNOWN_VIOLATIONS: frozenset[tuple[str, str]] = frozenset(
     {
-        ("src/data/backtest_runner.py", "engine"),
-        ("src/data/backtest_sessions.py", "engine"),
-        ("src/data/cli.py", "engine"),
-        ("src/data/cli.py", "execution"),
-        ("src/data/cli.py", "strategy"),
-        ("src/data/collection_plan.py", "strategy"),
-        ("src/data/gold.py", "features"),
-        ("src/data/gold.py", "strategy"),
-        ("src/data/gold_artifacts.py", "strategy"),
-        ("src/data/gold_loader.py", "features"),
-        ("src/data/gold_loader.py", "strategy"),
-        ("src/data/operations.py", "features"),
-        ("src/data/operations.py", "strategy"),
-        ("src/data/pipeline.py", "features"),
-        ("src/data/pipeline.py", "strategy"),
-        ("src/data/replay.py", "features"),
-        ("src/data/replay.py", "strategy"),
-        ("src/data/research_period.py", "validation"),
-        ("src/engine/runner.py", "validation"),
-        ("src/features/qvef.py", "data"),
-        ("src/features/qvef.py", "strategy"),
         ("src/integrations/dart/client.py", "data"),
-        ("src/integrations/dart/lifecycle.py", "data"),
         ("src/integrations/kis/industry.py", "data"),
         ("src/integrations/kis/investor_flow.py", "data"),
-        ("src/integrations/kiwoom/investor_flow.py", "data"),
-        ("src/integrations/krx/kind.py", "data"),
-        ("src/integrations/ls/investor_flow.py", "data"),
-        ("src/strategy/universe.py", "data"),
     }
 )
 

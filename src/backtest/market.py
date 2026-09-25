@@ -17,6 +17,7 @@ import polars as pl
 from numpy.typing import NDArray
 
 from src.core.pit import PITDataError
+from src.data.datasets import dataset_partition_paths
 
 INT_FIELD_NAMES: tuple[str, ...] = (
     "open",
@@ -37,7 +38,7 @@ _MARKET_CODES: dict[str, int] = {"KOSPI": 1, "KOSDAQ": 2}
 
 @dataclass(frozen=True, slots=True)
 class MarketArrays:
-    """Dense session × instrument view of one Gold market-panel dataset.
+    """Dense session x instrument view of one Gold market-panel dataset.
 
     The engine loop is path dependent (integer shares, cash, events), so it
     walks sessions sequentially; dense arrays make every per-session step a
@@ -49,11 +50,11 @@ class MarketArrays:
         sessions: Ascending trading dates (length S).
         instrument_ids: Ascending instrument ids (length N).
         int_fields: ``open, high, low, close, base_price, volume, tick_size,
-            upper_limit, lower_limit`` as int64 S×N, ``0`` where absent.
+            upper_limit, lower_limit`` as int64 SxN, ``0`` where absent.
         float_fields: ``sell_tax_rate, adtv20, ret_vol60, share_factor`` as
-            float64 S×N, NaN where absent.
-        bool_fields: ``present, eligible, open_at_upper, open_at_lower`` S×N.
-        market: int8 S×N market code (1=KOSPI, 2=KOSDAQ, 0=absent).
+            float64 SxN, NaN where absent.
+        bool_fields: ``present, eligible, open_at_upper, open_at_lower`` SxN.
+        market: int8 SxN market code (1=KOSPI, 2=KOSDAQ, 0=absent).
     """
 
     dataset_id: str
@@ -79,23 +80,22 @@ def _read_manifest(panel_dir: Path) -> tuple[str, list[dict[str, Any]], bytes]:
         if (
             not isinstance(part, dict)
             or not isinstance(part.get("path"), str)
-            or not isinstance(part.get("parquet_sha256"), str)
+            or not isinstance(part.get("parquet_sha256", part.get("sha256")), str)
         ):
             raise PITDataError(f"invalid market-panel partition entry: {panel_dir}")
     return (cast("str", dataset_id), cast("list[dict[str, Any]]", parts), raw)
 
 
 def _verified_files(panel_dir: Path, parts: list[dict[str, Any]]) -> list[str]:
-    files: list[str] = []
-    for part in parts:
-        target = panel_dir / str(part["path"])
-        try:
-            data = target.read_bytes()
-        except OSError as exc:
-            raise PITDataError(f"market-panel partition is unreadable: {part['path']}") from exc
-        if hashlib.sha256(data).hexdigest() != part["parquet_sha256"]:
-            raise PITDataError(f"market-panel partition hash mismatch: {part['path']}")
-        files.append(str(target))
+    """Verify the dataset and return only the dense-panel partitions."""
+
+    try:
+        verified = dataset_partition_paths(panel_dir)
+    except PITDataError as exc:
+        raise PITDataError(f"market-panel partition verification failed: {panel_dir}") from exc
+    files = [str(path) for path in verified if path.name not in {"instrument_exits.parquet", "exits.parquet"}]
+    if not files:
+        raise PITDataError(f"market-panel has no dense partitions: {panel_dir}")
     return files
 
 
@@ -123,11 +123,36 @@ def _freeze(arrays: MarketArrays) -> None:
     arrays.market.flags.writeable = False
 
 
+def _manifest_source_digest(raw_manifest: bytes, parts: list[dict[str, Any]]) -> str:
+    """Bind a cache to the verified manifest and declared partition digests."""
+
+    canonical = json.dumps(parts, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw_manifest + b"\x00" + canonical).hexdigest()
+
+
+def _array_checksum(source_digest: str, arrays: MarketArrays) -> str:
+    """Return a content checksum for the materialized numeric arrays."""
+
+    digest = hashlib.sha256(source_digest.encode("utf-8"))
+    for name in INT_FIELD_NAMES:
+        digest.update(name.encode("utf-8"))
+        digest.update(np.ascontiguousarray(arrays.int_fields[name]).tobytes())
+    for name in FLOAT_FIELD_NAMES:
+        digest.update(name.encode("utf-8"))
+        digest.update(np.ascontiguousarray(arrays.float_fields[name]).tobytes())
+    for name in ("present", *PANEL_BOOL_FIELD_NAMES):
+        digest.update(name.encode("utf-8"))
+        digest.update(np.ascontiguousarray(arrays.bool_fields[name]).tobytes())
+    digest.update(np.ascontiguousarray(arrays.market).tobytes())
+    return digest.hexdigest()
+
+
 def _load_cache(cache_path: Path, *, dataset_id: str, source_digest: str) -> MarketArrays | None:
     try:
         with np.load(str(cache_path), allow_pickle=False) as store:
             if str(store["dataset_id"]) != dataset_id or str(store["source_digest"]) != source_digest:
                 return None
+            cache_checksum = str(store["checksum"]) if "checksum" in store.files else ""
             sessions_ord = np.asarray(store["sessions"], dtype=np.int64)
             instruments = [str(item) for item in store["instruments"].tolist()]
             int_fields = {name: np.asarray(store[f"int_{name}"], dtype=np.int64) for name in INT_FIELD_NAMES}
@@ -150,6 +175,13 @@ def _load_cache(cache_path: Path, *, dataset_id: str, source_digest: str) -> Mar
         bool_fields=bool_fields,
         market=market,
     )
+    expected_shape = (len(arrays.sessions), len(arrays.instrument_ids))
+    if any(field.shape != expected_shape for field in (*arrays.int_fields.values(), *arrays.float_fields.values(), *arrays.bool_fields.values())):
+        return None
+    if arrays.market.shape != expected_shape:
+        return None
+    if cache_checksum != _array_checksum(source_digest, arrays):
+        return None
     _freeze(arrays)
     return arrays
 
@@ -167,6 +199,7 @@ def _store_cache(
     payload: dict[str, Any] = {
         "dataset_id": np.asarray(dataset_id),
         "source_digest": np.asarray(source_digest),
+        "checksum": np.asarray(_array_checksum(source_digest, arrays)),
         "sessions": sessions_ord,
         "instruments": instruments,
         "market": arrays.market,
@@ -204,14 +237,17 @@ def load_market_arrays(*, panel_dir: Path, cache_root: Path) -> MarketArrays:
     panel_dir = Path(panel_dir)
     cache_root = Path(cache_root)
     dataset_id, parts, raw_manifest = _read_manifest(panel_dir)
-    source_digest = hashlib.sha256(raw_manifest).hexdigest()
+    # Verify the source before consulting the derived cache.  Otherwise a
+    # stale cache can make a tampered panel appear healthy merely because its
+    # manifest bytes are unchanged.
+    files = _verified_files(panel_dir, parts)
+    source_digest = _manifest_source_digest(raw_manifest, parts)
     cache_root.mkdir(parents=True, exist_ok=True)
     cache_path = cache_root / f"{dataset_id}.npz"
     if cache_path.is_file():
         cached = _load_cache(cache_path, dataset_id=dataset_id, source_digest=source_digest)
         if cached is not None:
             return cached
-    files = _verified_files(panel_dir, parts)
     keys = _scan_columns(files, ["session", "instrument_id"])
     if keys.select(["session", "instrument_id"]).is_duplicated().any():
         raise PITDataError(f"duplicate market panel key in {panel_dir}")

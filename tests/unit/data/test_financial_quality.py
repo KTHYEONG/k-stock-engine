@@ -14,7 +14,6 @@ from src.data.financial_quality import (
     load_latest_financial_quality,
     materialize_financial_quality,
 )
-from src.core.datasets import DatasetCertification
 from src.data.schemas import PITDataError
 
 
@@ -132,16 +131,16 @@ def test_materialized_financial_quality_preserves_source_dataset_lineage(tmp_pat
         dataset_id="quality-v1",
         decision_time=available,
         source_dataset_id="financial-v1",
-        certification=DatasetCertification.RESEARCH,
     )
 
-    assert path.name == "quality-v1"
-    manifest = json.loads((path / "content_manifest.json").read_text(encoding="utf-8"))
-    assert manifest["source_financial_dataset_id"] == "financial-v1"
+    assert path.name.startswith("financial_quality_")
+    manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["inputs"]["facts"].startswith("financial_facts_")
+    assert manifest["details"]["decision_time"] == available.isoformat()
     assert load_latest_financial_quality(root=tmp_path, decision_time=available).equals(quality)
     assert load_latest_financial_quality(
         root=tmp_path, decision_time=available - timedelta(days=1)
-    ).equals(quality)
+    ).is_empty()
 
 
 def test_financial_quality_rejects_invalid_contract_inputs(tmp_path) -> None:
@@ -301,3 +300,75 @@ def test_quarantine_events_accept_datetime_and_reject_bad_shapes() -> None:
     missing_timestamp = {k: v for k, v in good.items() if k != "published_at"}
     with pytest.raises(PITDataError):
         quarantine_events([missing_timestamp])
+
+
+def test_financial_quality_materialization_and_loader_boundaries(tmp_path) -> None:
+    from src.data.financial_quality import (
+        build_financial_quality_events,
+        load_latest_financial_quality,
+        materialize_financial_quality,
+    )
+
+    available = datetime(2024, 5, 1, tzinfo=UTC)
+    quality = build_financial_quality_events(
+        pl.DataFrame(_facts(company_id="A", period="2024Q1", available_at=available)),
+        unresolved_events=(),
+        decision_time=available,
+    )
+    with pytest.raises(PITDataError, match="facts dataset id"):
+        materialize_financial_quality(
+            quality,
+            layer_root=tmp_path / "silver",
+            decision_time=available,
+            facts_dataset_id="",
+        )
+    with pytest.raises(PITDataError, match="requires events"):
+        materialize_financial_quality(
+            pl.DataFrame(),
+            layer_root=tmp_path / "silver",
+            decision_time=available,
+            facts_dataset_id="financial_facts_0123456789abcdef",
+        )
+    with pytest.raises(PITDataError, match="unexpected schema"):
+        materialize_financial_quality(
+            pl.DataFrame({"unexpected": [1]}),
+            layer_root=tmp_path / "silver",
+            decision_time=available,
+            facts_dataset_id="financial_facts_0123456789abcdef",
+        )
+    with pytest.raises(PITDataError, match="after decision_time"):
+        materialize_financial_quality(
+            quality,
+            layer_root=tmp_path / "silver",
+            decision_time=available - timedelta(seconds=1),
+            facts_dataset_id="financial_facts_0123456789abcdef",
+        )
+    with pytest.raises(PITDataError, match="Silver layer root"):
+        materialize_financial_quality(
+            quality,
+            decision_time=available,
+            facts_dataset_id="financial_facts_0123456789abcdef",
+        )
+
+    root = tmp_path / "quality-root"
+    path = materialize_financial_quality(
+        quality,
+        root=root,
+        decision_time=available,
+        facts_dataset_id="financial_facts_0123456789abcdef",
+    )
+    (root / ".hidden").mkdir()
+    (root / "broken_0123456789abcdef").mkdir()
+    (root / "broken_0123456789abcdef" / "manifest.json").write_text("not-json", encoding="utf-8")
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+
+    publish_dataset(
+        layer_root=root,
+        identity=DatasetIdentity("daily_market", DatasetLayer.SILVER, "fixture-v1", {}, {}),
+        partitions={"part.parquet": pl.DataFrame({"value": [1]})},
+    )
+    with pytest.raises(PITDataError, match="timezone-aware"):
+        load_latest_financial_quality(root=root, decision_time=available.replace(tzinfo=None))
+    loaded = load_latest_financial_quality(root=root, decision_time=available)
+    assert loaded.equals(quality)
+    assert path.is_dir()

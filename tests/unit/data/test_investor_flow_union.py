@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -63,31 +61,20 @@ def _ls_row(session: date, ticker: str, values: tuple[int, int, int, int]) -> di
 
 
 def _write_dataset(directory: Path, rows: list[dict[str, Any]]) -> Path:
-    frame = pl.DataFrame(rows)
-    directory.mkdir(parents=True, exist_ok=True)
-    rel = Path("year=2024") / "part.parquet"
-    out_path = directory / rel
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    frame.write_parquet(out_path)
-    (directory / "manifest.json").write_text(
-        json.dumps(
-            {
-                "dataset_id": directory.name,
-                "policy_version": "test-v1",
-                "partitions": [
-                    {
-                        "path": str(rel),
-                        "row_count": frame.height,
-                        "parquet_sha256": hashlib.sha256(out_path.read_bytes()).hexdigest(),
-                        "year": 2024,
-                    }
-                ],
-            },
-            sort_keys=True,
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+
+    kind = "investor_flow_ls" if "ls" in directory.name else "investor_flow_kis_supplement"
+    return publish_dataset(
+        layer_root=directory.parent,
+        identity=DatasetIdentity(
+            kind=kind,
+            layer=DatasetLayer.SILVER,
+            policy_version="test-v1",
+            inputs={},
+            params={},
         ),
-        encoding="utf-8",
-    )
-    return directory
+        partitions={"year=2024/part.parquet": pl.DataFrame(rows)},
+    ).path
 
 
 def _write_inputs(root: Path, ls_rows: list[dict[str, Any]], kis_rows: list[dict[str, Any]]) -> tuple[Path, Path, Path]:
@@ -127,8 +114,8 @@ def test_materialize_unions_disjoint_datasets(tmp_path: Path) -> None:
         {"session": S1, "ticker": "000001"},
         {"session": S2, "ticker": "000002"},
     ]
-    assert result.ls_dataset_id == "investor_flow_ls_test"
-    assert result.kis_supplement_dataset_id == "investor_flow_kis_supplement_test"
+    assert result.ls_dataset_id.startswith("investor_flow_ls_")
+    assert result.kis_supplement_dataset_id.startswith("investor_flow_kis_supplement_")
 
 
 def test_materialize_rejects_conflicting_key(tmp_path: Path) -> None:
@@ -264,3 +251,63 @@ def test_materialize_rejects_unreadable_existing_manifest(tmp_path: Path) -> Non
 
     with pytest.raises(PITDataError, match="unreadable"):
         _materialize(ls_path, kis_path, silver)
+
+
+def test_union_read_input_boundaries_and_empty_sides(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+    from src.data.investor_flow_union import _read_input, materialize_investor_flow_union
+    from src.data.schemas import PITDataError
+    import src.data.investor_flow_union as union_module
+
+    ls_path, kis_path, silver = _write_inputs(
+        tmp_path,
+        [_ls_row(S1, "000001", (100, -60, -30, -10))],
+        [_common_row("KIS", S2, "000002", (50, -30, -10, -10))],
+    )
+    monkeypatch.setattr(union_module, "load_manifest", lambda _path: (_ for _ in ()).throw(PITDataError("bad")))
+    assert _read_input(ls_path, "ls", expected_kind="investor_flow_ls")[0] == ls_path.name
+    monkeypatch.undo()
+
+    wrong = publish_dataset(
+        layer_root=silver,
+        identity=DatasetIdentity("market_panel", DatasetLayer.SILVER, "fixture-v1", {}, {}),
+        partitions={"part.parquet": pl.DataFrame({"session": [S1], "ticker": ["000001"]})},
+    )
+    with pytest.raises(PITDataError, match="kind"):
+        _read_input(wrong.path, "ls", expected_kind="investor_flow_ls")
+
+    monkeypatch.setattr(
+        union_module,
+        "dataset_partition_paths",
+        lambda *_args, **_kwargs: (ls_path / "year=2024" / "part.parquet",),
+    )
+    monkeypatch.setattr(union_module.pl, "scan_parquet", lambda *_args, **_kwargs: (_ for _ in ()).throw(pl.exceptions.PolarsError("bad")))
+    with pytest.raises(PITDataError, match="partitions"):
+        _read_input(ls_path, "ls", expected_kind="investor_flow_ls")
+    monkeypatch.undo()
+
+    empty_ls = publish_dataset(
+        layer_root=silver,
+        identity=DatasetIdentity("investor_flow_ls", DatasetLayer.SILVER, "fixture-v1", {}, {}),
+        partitions={},
+    )
+    only_kis = materialize_investor_flow_union(
+        ls_flow_silver_path=empty_ls.path,
+        kis_supplement_silver_path=kis_path,
+        silver_root=silver,
+    )
+    assert only_kis.rows == 1
+
+    empty_kis = publish_dataset(
+        layer_root=silver,
+        identity=DatasetIdentity("investor_flow_kis_supplement", DatasetLayer.SILVER, "fixture-v1", {}, {}),
+        partitions={},
+    )
+    only_ls = materialize_investor_flow_union(
+        ls_flow_silver_path=ls_path,
+        kis_supplement_silver_path=empty_kis.path,
+        silver_root=silver,
+    )
+    assert only_ls.rows == 1

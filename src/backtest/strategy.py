@@ -40,7 +40,8 @@ class Targets:
 
 
 class Strategy(Protocol):
-    name: str
+    @property
+    def name(self) -> str: ...
     def params(self) -> Mapping[str, str | int | float | bool]: ...
     def is_rebalance(self, view: PITView) -> bool: ...
     def decide(self, view: PITView, portfolio: PortfolioSnapshot) -> Targets: ...
@@ -89,7 +90,7 @@ class EqualWeightLiquid(Strategy):
         if not selected:
             return Targets(weights={})
         weight = 1.0 / len(selected)
-        return Targets(weights={n: weight for n in selected})
+        return Targets(weights=dict.fromkeys(selected, weight))
 
 
 STRATEGIES: Mapping[str, Callable[..., Strategy]] = {"equal_weight_liquid": EqualWeightLiquid}

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 from datetime import date
@@ -61,31 +60,28 @@ def _prow(
 
 
 def _write_panel(root: Path, name: str, rows: list[dict[str, object]]) -> Path:
-    dataset = root / name
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+
     by_year: dict[int, list[dict[str, object]]] = {}
     for row in rows:
         session = row["session"]
         assert isinstance(session, date)
         by_year.setdefault(session.year, []).append(row)
-    partitions: list[dict[str, object]] = []
-    for year in sorted(by_year):
-        rel = f"year={year}/part.parquet"
-        out_path = dataset / rel
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        frame = pl.DataFrame(by_year[year], schema=_PANEL_SCHEMA)
-        frame.write_parquet(out_path)
-        partitions.append({
-            "year": year,
-            "path": rel,
-            "row_count": frame.height,
-            "parquet_sha256": hashlib.sha256(out_path.read_bytes()).hexdigest(),
-        })
-    (dataset / "manifest.json").write_text(
-        json.dumps({"dataset_id": name, "policy_version": "krx-market-panel-v2", "partitions": partitions},
-                   sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    return dataset
+    partitions = {
+        f"year={year}/part.parquet": pl.DataFrame(by_year[year], schema=_PANEL_SCHEMA)
+        for year in sorted(by_year)
+    }
+    return publish_dataset(
+        layer_root=root,
+        identity=DatasetIdentity(
+            kind="market_panel",
+            layer=DatasetLayer.GOLD,
+            policy_version="krx-market-panel-v2",
+            inputs={},
+            params={},
+        ),
+        partitions=partitions,
+    ).path
 
 
 def _inputs(tmp_path: Path, rows: list[dict[str, object]]) -> tuple[Path, Path]:
@@ -554,4 +550,45 @@ def test_materialize_rejects_empty_constituents_after_inception(tmp_path: Path) 
     with pytest.raises(PITDataError, match="empty constituent set"):
         materialize_reference_benchmarks(
             market_panel_path=panel_path, definitions=(EW,), definitions_version="test-v1", gold_root=gold_root
+        )
+
+
+def test_reference_benchmark_panel_reader_boundaries(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from src.data.datasets import PITDataError
+    from src.data.reference_benchmarks import _load_panel_frame, materialize_reference_benchmarks
+    import src.data.reference_benchmarks as benchmark_module
+
+    panel_path, gold_root = _inputs(tmp_path, [_prow(DAY0, "KRX:A"), _prow(DAY1, "KRX:A")])
+    monkeypatch.setattr(
+        benchmark_module,
+        "dataset_partition_paths",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(PITDataError("bad paths")),
+    )
+    with pytest.raises(PITDataError, match="input manifest"):
+        _load_panel_frame(panel_path)
+    monkeypatch.undo()
+
+    monkeypatch.setattr(benchmark_module, "load_manifest", lambda _path: (_ for _ in ()).throw(PITDataError("bad manifest")))
+    assert _load_panel_frame(panel_path)[0] == panel_path.name
+    monkeypatch.undo()
+
+    monkeypatch.setattr(
+        benchmark_module,
+        "load_manifest",
+        lambda _path: SimpleNamespace(kind="daily_market"),
+    )
+    with pytest.raises(PITDataError, match="input manifest"):
+        _load_panel_frame(panel_path)
+    monkeypatch.undo()
+
+    monkeypatch.setattr(benchmark_module.pl, "read_parquet", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("unreadable")))
+    with pytest.raises(PITDataError, match="input manifest"):
+        _load_panel_frame(panel_path)
+    monkeypatch.undo()
+
+    with pytest.raises(PITDataError, match="at least one definition"):
+        materialize_reference_benchmarks(
+            market_panel_path=panel_path, definitions=(), definitions_version="test-v1", gold_root=gold_root
         )

@@ -62,7 +62,7 @@ def _frame_bytes(frame: pl.DataFrame) -> bytes:
 def _code_version() -> str:
     try:
         completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
-            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True, timeout=10
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True, timeout=10  # noqa: S607
         )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return "unknown"

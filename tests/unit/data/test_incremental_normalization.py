@@ -1,3 +1,10 @@
+from pathlib import Path
+
+
+def _artifact_dataset_path(artifact) -> Path:
+    return Path(str(artifact.dataset_path))
+
+
 def test_refresh_dart_facts_rejects_tampered_receipt_before_publish(tmp_path) -> None:
     from datetime import UTC, datetime
     import pytest
@@ -16,10 +23,10 @@ def test_refresh_dart_facts_rejects_tampered_receipt_before_publish(tmp_path) ->
 
 def test_refresh_dart_facts_keeps_all_filings_and_excludes_later_rows() -> None:
     from datetime import UTC, datetime
-    from src.data.normalization import normalize_dart_financial_facts
+    from src.data.normalization import normalize_dart_financial_facts_with_quarantine
     from src.core.time import SessionCalendar
 
-    rows = normalize_dart_financial_facts(pages=[{'records': [{'ticker': '005930', 'corp_code': '00126380', 'fiscal_period': '2015Q3', 'filing_id': 'A', 'fact': 'sales', 'published_at': '2015-11-16T00:00:00+00:00', 'value': 1.0, 'unit': 'KRW'}, {'ticker': '005930', 'corp_code': '00126380', 'fiscal_period': '2015Q3', 'filing_id': 'B', 'fact': 'sales', 'published_at': '2017-01-01T00:00:00+00:00', 'value': 2.0, 'unit': 'KRW'}]}], disclosure_rows=(), source_hash='a' * 64, calendar=SessionCalendar((datetime(2015, 11, 17, tzinfo=UTC),)), decision_time=datetime(2016, 12, 30, tzinfo=UTC))
+    rows, _ = normalize_dart_financial_facts_with_quarantine(pages=[{'records': [{'ticker': '005930', 'corp_code': '00126380', 'fiscal_period': '2015Q3', 'filing_id': 'A', 'fact': 'sales', 'published_at': '2015-11-16T00:00:00+00:00', 'value': 1.0, 'unit': 'KRW'}, {'ticker': '005930', 'corp_code': '00126380', 'fiscal_period': '2015Q3', 'filing_id': 'B', 'fact': 'sales', 'published_at': '2017-01-01T00:00:00+00:00', 'value': 2.0, 'unit': 'KRW'}]}], disclosure_rows=(), source_hash='a' * 64, calendar=SessionCalendar((datetime(2015, 11, 17, tzinfo=UTC),)), decision_time=datetime(2016, 12, 30, tzinfo=UTC))
 
     assert rows['filing_id'].to_list() == ['A']
 
@@ -62,9 +69,7 @@ def _write_reference_silver(silver_root, decision_time):
 
     import polars as pl
 
-    from src.core.datasets import DatasetCertification, HIVE_PARTITION_LAYOUT, make_manifest
-    from src.core.instruments import AssetKind
-    from src.storage.parquet_datasets import ParquetDatasetStore, canonical_content_hash
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
 
     session = datetime(2015, 11, 17, tzinfo=decision_time.tzinfo)
     published = datetime(2015, 11, 16, tzinfo=decision_time.tzinfo)
@@ -85,30 +90,16 @@ def _write_reference_silver(silver_root, decision_time):
         ),
     }
     for table, frame in tables.items():
-        content_hash = canonical_content_hash(frame, frame.columns)
-        manifest = make_manifest(
-            asset_kind=AssetKind.STOCK,
-            columns=frame.columns,
-            feature_set=f"stock_pit_{table}_v1",
-            label_definition="none",
-            label_horizon_sessions=1,
-            time_start=session,
-            time_end=session,
-            provider_version="t",
-            universe_policy_version="v1",
-            row_count=frame.height,
-            schema_version="v2",
-            content_hash=content_hash,
-            storage_layout=HIVE_PARTITION_LAYOUT,
-            certification=DatasetCertification.RESEARCH,
-        )
-        ParquetDatasetStore(silver_root / table).write_partitioned(
-            frame,
-            dataset_id=content_hash,
-            manifest=manifest,
-            expected_feature_set=f"stock_pit_{table}_v1",
-            decision_time=decision_time,
-            content_manifest={},
+        publish_dataset(
+            layer_root=silver_root,
+            identity=DatasetIdentity(
+                kind=table,
+                layer=DatasetLayer.SILVER,
+                policy_version="fixture-v1",
+                inputs={},
+                params={},
+            ),
+            partitions={"part-00000.parquet": frame},
         )
 
 
@@ -139,11 +130,10 @@ def test_refresh_publishes_new_facts_and_returns_artifact(tmp_path) -> None:
     assert len(artifact.receipt_hashes) == 1
     assert artifact.output_hash
     assert artifact.report_hash
-    assert (tmp_path / "silver" / "financial_facts" / artifact.output_hash).exists()
+    dataset_path = _artifact_dataset_path(artifact)
+    assert dataset_path.is_dir()
     assert (tmp_path / "artifacts" / f"dart_fact_refresh_{artifact.output_hash}.json").exists()
-    published = pl.read_parquet(
-        tmp_path / "silver" / "financial_facts" / artifact.output_hash / "partitions"
-    )
+    published = pl.read_parquet(dataset_path / "part-00000.parquet")
     assert published["value"].dtype == pl.Float64
     assert published.item(0, "filing_id") == "F1"
 
@@ -178,7 +168,7 @@ def test_refresh_uses_retained_dart_ticker_bridge(tmp_path) -> None:
     )
 
     published = pl.read_parquet(
-        tmp_path / "silver" / "financial_facts" / artifact.output_hash / "partitions"
+        _artifact_dataset_path(artifact) / "part-00000.parquet"
     )
     assert published.item(0, "mapping_version").endswith(f"+bridge:{digest}")
 
@@ -449,12 +439,12 @@ def test_refresh_manifest_time_range_bounded_by_data(tmp_path) -> None:
         calendar=calendar,
     )
 
-    dataset_dir = tmp_path / "silver" / "financial_facts" / artifact.output_hash
-    manifest = json.loads((dataset_dir / "dataset_manifest.json").read_text(encoding="utf-8"))
-    published = pl.read_parquet(dataset_dir / "partitions")
-    assert datetime.fromisoformat(manifest["time_end"]) <= decision_time
-    assert datetime.fromisoformat(manifest["time_end"]) == published["available_at"].max()
-    assert datetime.fromisoformat(manifest["time_start"]) == published["available_at"].min()
+    dataset_dir = _artifact_dataset_path(artifact)
+    manifest = json.loads((dataset_dir / "manifest.json").read_text(encoding="utf-8"))
+    published = pl.read_parquet(dataset_dir / "part-00000.parquet")
+    assert datetime.fromisoformat(manifest["params"]["decision_time"]) == decision_time
+    assert published["available_at"].max() <= decision_time
+    assert published["available_at"].min() <= published["available_at"].max()
 
 
 def test_refresh_rejects_unreadable_or_garbage_receipt(tmp_path) -> None:
@@ -522,21 +512,21 @@ def test_refresh_rejects_receipt_with_bad_ingested_at(tmp_path) -> None:
 def test_refresh_maps_publish_failures_to_pit_error(tmp_path, monkeypatch) -> None:
     from datetime import UTC, datetime
 
+    import polars as pl
     import pytest
 
     from src.data.incremental_normalization import refresh_dart_financial_facts
     from src.data.schemas import PITDataError
-    from src.storage.parquet_datasets import ParquetDatasetStore
 
     decision_time = datetime(2016, 12, 30, tzinfo=UTC)
     _write_fact_receipt(tmp_path / "bronze", "ok", _FACT_PAGE)
     _write_reference_silver(tmp_path / "silver", decision_time)
 
     def fake_write(self, *args, **kwargs):
-        raise ValueError("boom")
+        raise OSError("boom")
 
-    monkeypatch.setattr(ParquetDatasetStore, "write_partitioned", fake_write)
-    with pytest.raises(PITDataError, match="boom"):
+    monkeypatch.setattr(pl.DataFrame, "write_parquet", fake_write)
+    with pytest.raises(PITDataError, match="cannot stage financial facts partition"):
         refresh_dart_financial_facts(
             bronze_root=tmp_path / "bronze",
             silver_root=tmp_path / "silver",
@@ -643,7 +633,7 @@ def test_refresh_rebuild_ignores_prior_rows(tmp_path) -> None:
     second = refresh_dart_financial_facts(**kwargs)
 
     published = pl.read_parquet(
-        tmp_path / "silver" / "financial_facts" / second.output_hash / "partitions"
+        _artifact_dataset_path(second) / "part-00000.parquet"
     )
     assert set(published["filing_id"].to_list()) == {"F1"}
     assert second.prior_dataset_hash == first.output_hash
@@ -670,12 +660,10 @@ def test_refresh_records_availability_policy_in_content_manifest(tmp_path) -> No
         calendar=_covering_calendar(),
     )
 
-    content = json.loads(
-        (tmp_path / "silver" / "financial_facts" / artifact.output_hash / "content_manifest.json").read_text(
-            encoding="utf-8"
-        )
+    manifest = json.loads(
+        (_artifact_dataset_path(artifact) / "manifest.json").read_text(encoding="utf-8")
     )
-    assert content["availability_policy"] == AVAILABILITY_POLICY
+    assert manifest["details"]["availability_policy"] == AVAILABILITY_POLICY
 
 
 def test_refresh_rows_all_lag_their_receipt(tmp_path) -> None:
@@ -712,7 +700,7 @@ def test_refresh_rows_all_lag_their_receipt(tmp_path) -> None:
     )
 
     published = pl.read_parquet(
-        tmp_path / "silver" / "financial_facts" / artifact.output_hash / "partitions"
+        _artifact_dataset_path(artifact) / "part-00000.parquet"
     )
     assert artifact.row_count == 2
     assert (published["available_at"] > published["published_at"]).all()
@@ -738,12 +726,13 @@ def test_refresh_republish_is_idempotent_with_single_dataset(tmp_path) -> None:
     second = refresh_dart_financial_facts(**kwargs)
 
     assert second.output_hash == first.output_hash
+    dataset_path = _artifact_dataset_path(first)
     datasets = [
         path
-        for path in (tmp_path / "silver" / "financial_facts").iterdir()
-        if path.is_dir()
+        for path in dataset_path.parent.iterdir()
+        if path.is_dir() and path.name.startswith("financial_facts_")
     ]
-    assert len(datasets) == 1
+    assert datasets == [dataset_path]
 
 
 def test_refresh_excludes_superseded_receipts_and_records_them(tmp_path) -> None:
@@ -768,12 +757,10 @@ def test_refresh_excludes_superseded_receipts_and_records_them(tmp_path) -> None
     )
 
     assert stale not in artifact.receipt_hashes
-    content = json.loads(
-        (tmp_path / "silver" / "financial_facts" / artifact.output_hash / "content_manifest.json").read_text(
-            encoding="utf-8"
-        )
+    manifest = json.loads(
+        (_artifact_dataset_path(artifact) / "manifest.json").read_text(encoding="utf-8")
     )
-    assert content["superseded_receipt_hashes"] == [stale]
+    assert manifest["details"]["superseded_receipt_hashes"] == [stale]
 
 
 def test_refresh_rejects_unknown_superseded_receipt(tmp_path) -> None:
@@ -865,7 +852,7 @@ def test_refresh_withholds_untrusted_rows_and_lists_quarantine(tmp_path) -> None
         calendar=_covering_calendar(),
     )
 
-    published = pl.read_parquet(tmp_path / "silver" / "financial_facts" / artifact.output_hash / "partitions")
+    published = pl.read_parquet(_artifact_dataset_path(artifact) / "part-00000.parquet")
     assert published["filing_id"].to_list() == ["F1"]
     assert set(published["source_kind"].to_list()) == {"opendart_standard"}
     assert artifact.quarantined_filings == 1
@@ -892,11 +879,11 @@ def test_refresh_manifest_records_quarantine_exclusion(tmp_path) -> None:
         calendar=_covering_calendar(),
     )
 
-    content = json.loads(
-        (tmp_path / "silver" / "financial_facts" / artifact.output_hash / "content_manifest.json").read_text(encoding="utf-8")
+    manifest = json.loads(
+        (_artifact_dataset_path(artifact) / "manifest.json").read_text(encoding="utf-8")
     )
-    assert content["quarantined_filings"] == 1
-    assert content["trusted_source_kinds"] == ["legacy_document_verified", "opendart_standard"]
+    assert manifest["details"]["quarantined_filings"] == 1
+    assert manifest["details"]["trusted_source_kinds"] == ["legacy_document_verified", "opendart_standard"]
 
 
 def test_refresh_quarantine_deterministic_and_idempotent(tmp_path) -> None:
@@ -921,7 +908,8 @@ def test_refresh_quarantine_deterministic_and_idempotent(tmp_path) -> None:
 
     assert second.output_hash == first.output_hash
     assert before == after
-    assert len([p for p in (tmp_path / "silver" / "financial_facts").iterdir() if p.is_dir()]) == 1
+    dataset_path = _artifact_dataset_path(first)
+    assert [p for p in dataset_path.parent.iterdir() if p.is_dir() and p.name.startswith("financial_facts_")] == [dataset_path]
 
 
 def test_refresh_duplicate_legacy_receipts_collapse_to_later(tmp_path) -> None:
@@ -1031,3 +1019,125 @@ def test_refresh_does_not_quarantine_a_filing_that_also_has_trusted_rows(tmp_pat
     quarantine = json.loads((tmp_path / "artifacts" / f"dart_fact_quarantine_{artifact.output_hash}.json").read_text(encoding="utf-8"))
     assert [entry["filing_id"] for entry in quarantine] == ["F2"]
     assert artifact.quarantined_filings == 1
+
+
+def test_reference_table_loader_skips_invalid_candidates_and_validates_bridge(tmp_path, monkeypatch) -> None:
+    from datetime import UTC, datetime
+    import hashlib
+    import json
+
+    import polars as pl
+    import pytest
+
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+    from src.data.incremental_normalization import (
+        _load_reference_tables,
+        _validate_fact_frame,
+        load_frozen_dart_ticker_bridge,
+    )
+    from src.data.schemas import PITDataError
+
+    silver = tmp_path / "silver"
+    disclosure = publish_dataset(
+        layer_root=silver,
+        identity=DatasetIdentity("disclosures", DatasetLayer.SILVER, "fixture-v1", {}, {}),
+        partitions={"part.parquet": pl.DataFrame({"filing_id": ["F1"]})},
+    )
+    facts = publish_dataset(
+        layer_root=silver,
+        identity=DatasetIdentity("financial_facts", DatasetLayer.SILVER, "fixture-v1", {}, {}),
+        partitions={"part.parquet": pl.DataFrame({"value": [1]})},
+    )
+    bad = silver / "disclosures_0123456789abcdef"
+    bad.mkdir()
+    (bad / "manifest.json").write_text("not-json", encoding="utf-8")
+    rows, prior_hash, disclosure_digest = _load_reference_tables(
+        silver,
+        datetime(2024, 1, 1, tzinfo=UTC),
+        disclosures_dataset_id=bad.name,
+        financial_facts_dataset_id="financial_facts_0123456789abcdef",
+    )
+    assert rows == []
+    assert prior_hash == ""
+    assert disclosure_digest.startswith("bronze:")
+    rows, prior_hash, disclosure_digest = _load_reference_tables(
+        silver,
+        datetime(2024, 1, 1, tzinfo=UTC),
+        disclosures_dataset_id=disclosure.dataset_id,
+        financial_facts_dataset_id=facts.dataset_id,
+    )
+    assert rows == [{"filing_id": "F1"}]
+    assert prior_hash
+    assert disclosure_digest == disclosure.dataset_id
+
+    decision_cutoff = datetime(2024, 1, 1, tzinfo=UTC)
+
+    def _bridge_case(name: str, raw: bytes, *, directory_hash: str | None = None) -> tuple[Path, Path]:
+        root = tmp_path / name
+        payload = root / "dart_corp_codes" / (directory_hash or hashlib.sha256(raw).hexdigest()) / "payload.json"
+        payload.parent.mkdir(parents=True)
+        payload.write_bytes(raw)
+        return root, payload
+
+    invalid_root, _ = _bridge_case("bridge-invalid-hash", b"[]", directory_hash="z" * 64)
+    with pytest.raises(PITDataError, match="receipt hash"):
+        load_frozen_dart_ticker_bridge(bronze_root=invalid_root, decision_time=decision_cutoff)
+
+    mismatch_root, _ = _bridge_case(
+        "bridge-mismatch", b"[]", directory_hash=hashlib.sha256(b"different").hexdigest()
+    )
+    with pytest.raises(PITDataError, match="hash mismatch"):
+        load_frozen_dart_ticker_bridge(bronze_root=mismatch_root, decision_time=decision_cutoff)
+
+    invalid_json_root, _ = _bridge_case("bridge-invalid-json", b"not-json")
+    with pytest.raises(PITDataError, match="payload is invalid"):
+        load_frozen_dart_ticker_bridge(bronze_root=invalid_json_root, decision_time=decision_cutoff)
+
+    non_list_root, _ = _bridge_case("bridge-non-list", b"{}")
+    with pytest.raises(PITDataError, match="must be a list"):
+        load_frozen_dart_ticker_bridge(bronze_root=non_list_root, decision_time=decision_cutoff)
+
+    row_root, _ = _bridge_case("bridge-row", json.dumps([1]).encode())
+    with pytest.raises(PITDataError, match="row must be an object"):
+        load_frozen_dart_ticker_bridge(bronze_root=row_root, decision_time=decision_cutoff)
+
+    missing_root, _ = _bridge_case("bridge-missing", json.dumps([{"corp_code": "1"}]).encode())
+    with pytest.raises(PITDataError, match="lacks corp_code"):
+        load_frozen_dart_ticker_bridge(bronze_root=missing_root, decision_time=decision_cutoff)
+
+    conflict_root, _ = _bridge_case(
+        "bridge-conflict", json.dumps([{"corp_code": "1", "ticker": "A"}, {"corp_code": "1", "ticker": "B"}]).encode()
+    )
+    with pytest.raises(PITDataError, match="multiple tickers"):
+        load_frozen_dart_ticker_bridge(bronze_root=conflict_root, decision_time=decision_cutoff)
+
+    empty_root, _ = _bridge_case("bridge-empty", b"[]")
+    with pytest.raises(PITDataError, match="payload is empty"):
+        load_frozen_dart_ticker_bridge(bronze_root=empty_root, decision_time=decision_cutoff)
+
+    readable_root, readable_path = _bridge_case("bridge-unreadable", b"[]")
+    original_read_bytes = Path.read_bytes
+
+    def fail_read(path: Path) -> bytes:
+        if path == readable_path:
+            raise OSError("closed")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read)
+    with pytest.raises(PITDataError, match="unreadable"):
+        load_frozen_dart_ticker_bridge(bronze_root=readable_root, decision_time=decision_cutoff)
+
+    decision_time = datetime(2024, 1, 1, tzinfo=UTC)
+    valid = {
+        "company_id": ["A"], "fiscal_period": ["2024Q1"], "filing_id": ["F1"],
+        "fact": ["sales"], "published_at": [decision_time], "available_at": [decision_time],
+        "value": [1.0], "unit": ["KRW"], "consolidated": [True], "restatement_id": ["r0"],
+    }
+    for bad_frame, message in (
+        (pl.DataFrame({"x": [1]}), "lacks columns"),
+        (pl.DataFrame({**valid, "company_id": [None]}), "null primary"),
+        (pl.concat([pl.DataFrame(valid), pl.DataFrame(valid)]), "duplicate primary"),
+        (pl.DataFrame({**valid, "available_at": [decision_time.replace(year=2025)]}), "after decision_time"),
+    ):
+        with pytest.raises(PITDataError, match=message):
+            _validate_fact_frame(bad_frame, decision_time=decision_time)

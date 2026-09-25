@@ -5,9 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
-import shutil
-import tempfile
 from dataclasses import dataclass
 from datetime import date, time
 from decimal import Decimal, InvalidOperation
@@ -17,6 +14,14 @@ from typing import Any
 import polars as pl
 
 from src.core.time import KRX_TZ
+from src.data.datasets import (
+    DatasetIdentity,
+    DatasetLayer,
+    dataset_partition_paths,
+    dataset_reference,
+    publish_dataset,
+    resolve_bronze_digest,
+)
 from src.data.investor_flow_gap import compute_missing_investor_flow_cells
 from src.data.schemas import PITDataError
 
@@ -129,18 +134,16 @@ def _parse_kis_page(
 
 
 def _load_panel_calendar(market_panel_path: Path) -> tuple[date, ...]:
-    # The panel was just fully hash-verified inside compute_missing_investor_flow_cells
-    # for these same inputs, so only its certified session list is re-read here.
-    manifest = json.loads((market_panel_path / "manifest.json").read_text(encoding="utf-8"))
-    files = [str(market_panel_path / str(part["path"])) for part in manifest["partitions"]]
-    return tuple(
-        pl.scan_parquet(files)
-        .select(pl.col("session").cast(pl.Date))
-        .unique()
-        .collect()
-        .sort("session")["session"]
-        .to_list()
-    )
+    sessions: set[date] = set()
+    for path in dataset_partition_paths(market_panel_path, allow_legacy=False):
+        try:
+            frame = pl.read_parquet(path, columns=["session"])
+        except pl.exceptions.ColumnNotFoundError:
+            continue
+        sessions.update(value for value in frame["session"].to_list() if isinstance(value, date))
+    if not sessions:
+        raise PITDataError(f"market panel has no session partitions: {market_panel_path}")
+    return tuple(sorted(sessions))
 
 
 def materialize_investor_flow_kis_supplement(
@@ -149,40 +152,19 @@ def materialize_investor_flow_kis_supplement(
     market_panel_path: Path,
     ls_flow_silver_path: Path,
     silver_root: Path,
-    policy: InvestorFlowKisSupplementPolicy = InvestorFlowKisSupplementPolicy(),  # noqa: B008 - spec-mandated immutable default
+    policy: InvestorFlowKisSupplementPolicy = InvestorFlowKisSupplementPolicy(),  # noqa: B008
+    bronze_kis_digest: str | None = None,
 ) -> InvestorFlowKisSupplementResult:
-    """Build a provider-tagged Silver supplement for exactly the LS coverage gap.
+    """Publish the KIS supplement for exactly the LS coverage gap."""
 
-    Values come only from hash-verified raw KIS ``rows`` (never the collector's
-    derived ``records``), mapped through the four-group net-share identity
-    verified for KIS's ``prsn/frgn/orgn/etc`` fields. A row is written only
-    when its ``(ticker, session)`` is in the target gap computed from
-    :func:`compute_missing_investor_flow_cells`; any KIS Bronze evidence
-    outside that set (for example an anchor page's incidental overlap with a
-    session LS already covers) is read but never written, so this dataset can
-    never conflict with the LS dataset it supplements.
-
-    Args:
-        bronze_root: Scope Bronze root containing ``investor_flow/<sha256>/``
-            KIS pages (``provider == "KIS"``).
-        market_panel_path: Certified Gold market panel (defines the gap).
-        ls_flow_silver_path: Certified LS Silver investor-flow dataset (defines
-            the gap and is recorded as this dataset's supplemented target).
-        silver_root: Scope Silver root receiving
-            ``investor_flow_kis_supplement_<hash16>/``.
-        policy: Availability contract.
-
-    Returns:
-        Coverage counts: how much of the target gap this run's KIS evidence
-        actually filled, and how much is still missing.
-
-    Raises:
-        PITDataError: payload hash mismatch, malformed raw row, non-integral
-            quantity, or an existing dataset with different content. A row
-            whose session falls outside the certified calendar is dropped,
-            not raised — KIS's fixed anchor-walk window legitimately spills
-            past the requested range's edge.
-    """
+    if (
+        isinstance(policy.available_session_lag, bool)
+        or not isinstance(policy.available_session_lag, int)
+        or policy.available_session_lag < 1
+    ):
+        raise PITDataError("KIS supplement availability lag must be positive")
+    if not isinstance(policy.available_time, time):
+        raise PITDataError("KIS supplement available_time must be a time")
     gap = compute_missing_investor_flow_cells(
         market_panel_path=Path(market_panel_path), ls_flow_silver_path=Path(ls_flow_silver_path)
     )
@@ -190,177 +172,157 @@ def materialize_investor_flow_kis_supplement(
     calendar = _load_panel_calendar(Path(market_panel_path))
     session_set = frozenset(calendar)
     page_paths = sorted((Path(bronze_root) / "investor_flow").glob("*/payload.json"))
-    silver_root = Path(silver_root)
-    silver_root.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=".investor-flow-kis-supplement-", dir=silver_root))
-    try:
-        options: dict[tuple[date, str], dict[tuple[int, int, int, int], str]] = {}
-        violation_keys: set[tuple[date, str]] = set()
-        kis_hashes: list[str] = []
-        parsed_pages = 0
-        out_of_calendar_rows = 0
-        for offset in range(0, len(page_paths), _PAGE_BATCH):
-            for path in page_paths[offset : offset + _PAGE_BATCH]:
-                parsed_pages += 1
-                kept = _parse_kis_page(path, session_set)
-                if kept is None:
+    options: dict[tuple[date, str], dict[tuple[int, int, int, int], str]] = {}
+    violation_keys: set[tuple[date, str]] = set()
+    kis_hashes: list[str] = []
+    parsed_pages = 0
+    out_of_calendar_rows = 0
+    for offset in range(0, len(page_paths), _PAGE_BATCH):
+        for path in page_paths[offset : offset + _PAGE_BATCH]:
+            parsed_pages += 1
+            kept = _parse_kis_page(path, session_set)
+            if kept is None:
+                continue
+            page_hash, symbol, parsed_rows, page_out_of_calendar = kept
+            out_of_calendar_rows += page_out_of_calendar
+            kis_hashes.append(page_hash)
+            for session, values in parsed_rows:
+                key = (session, symbol)
+                if key not in target:
                     continue
-                page_hash, symbol, parsed_rows, page_out_of_calendar = kept
-                out_of_calendar_rows += page_out_of_calendar
-                kis_hashes.append(page_hash)
-                for session, values in parsed_rows:
-                    key = (session, symbol)
-                    if key not in target:
-                        continue
-                    if values[0] + values[1] + values[2] + values[3] != 0:
-                        violation_keys.add(key)
-                        continue
-                    known = options.setdefault(key, {}).get(values)
-                    if known is None or page_hash < known:
-                        options[key][values] = page_hash
-            _LOG.info(
-                "stage=investor_flow_kis_supplement pages=%s/%s filled=%s out_of_calendar_rows=%s",
-                parsed_pages,
-                len(page_paths),
-                len(options),
-                out_of_calendar_rows,
-            )
-        kis_hashes.sort()
-        dataset_id = "investor_flow_kis_supplement_" + hashlib.sha256(
-            "\n".join((
-                POLICY_VERSION,
-                str(policy.available_session_lag),
-                policy.available_time.isoformat(),
-                gap.ls_dataset_id,
-                gap.market_panel_dataset_id,
-                *kis_hashes,
-            )).encode("utf-8")
-        ).hexdigest()[:16]
-        target_path = silver_root / dataset_id
-        lag = policy.available_session_lag
-        agreed: dict[tuple[date, str], tuple[tuple[int, int, int, int], str]] = {}
-        for key, hashes in options.items():
-            if len(hashes) == 1:
-                values = next(iter(hashes))
-                agreed[key] = (values, hashes[values])
-        resolved = [
-            (session, ticker, values[0], values[1], values[2], values[3], source_hash)
-            for (session, ticker), (values, source_hash) in agreed.items()
-        ]
-        frame = (
+                if values[0] + values[1] + values[2] + values[3] != 0:
+                    violation_keys.add(key)
+                    continue
+                known = options.setdefault(key, {}).get(values)
+                if known is None or page_hash < known:
+                    options[key][values] = page_hash
+        _LOG.info(
+            "[DATA] stage=investor_flow_kis pages=%d/%d filled=%d out_of_calendar_rows=%d",
+            parsed_pages,
+            len(page_paths),
+            len(options),
+            out_of_calendar_rows,
+        )
+
+    lag = policy.available_session_lag
+    agreed: dict[tuple[date, str], tuple[tuple[int, int, int, int], str]] = {}
+    for key, hashes in options.items():
+        if len(hashes) == 1:
+            values = next(iter(hashes))
+            agreed[key] = (values, hashes[values])
+    resolved = [
+        (session, ticker, values[0], values[1], values[2], values[3], source_hash)
+        for (session, ticker), (values, source_hash) in agreed.items()
+    ]
+    frame = (
+        pl.DataFrame(
+            {
+                "session": [item[0] for item in resolved],
+                "ticker": [item[1] for item in resolved],
+                "individual_net_shares": [item[2] for item in resolved],
+                "foreign_net_shares": [item[3] for item in resolved],
+                "institution_net_shares": [item[4] for item in resolved],
+                "other_net_shares": [item[5] for item in resolved],
+                "source_hash": [item[6] for item in resolved],
+            },
+            schema={
+                "session": pl.Date,
+                "ticker": pl.String,
+                "individual_net_shares": pl.Int64,
+                "foreign_net_shares": pl.Int64,
+                "institution_net_shares": pl.Int64,
+                "other_net_shares": pl.Int64,
+                "source_hash": pl.String,
+            },
+        )
+        .with_columns(
+            pl.concat_str(pl.lit("KRX:"), pl.col("ticker")).alias("instrument_id"),
+            pl.lit("KIS").alias("provider"),
+        )
+        .join(
             pl.DataFrame(
                 {
-                    "session": [item[0] for item in resolved],
-                    "ticker": [item[1] for item in resolved],
-                    "individual_net_shares": [item[2] for item in resolved],
-                    "foreign_net_shares": [item[3] for item in resolved],
-                    "institution_net_shares": [item[4] for item in resolved],
-                    "other_net_shares": [item[5] for item in resolved],
-                    "source_hash": [item[6] for item in resolved],
+                    "session": list(calendar),
+                    "available_session": [
+                        calendar[index + lag] if index + lag < len(calendar) else None
+                        for index in range(len(calendar))
+                    ],
                 },
-                schema={
-                    "session": pl.Date,
-                    "ticker": pl.String,
-                    "individual_net_shares": pl.Int64,
-                    "foreign_net_shares": pl.Int64,
-                    "institution_net_shares": pl.Int64,
-                    "other_net_shares": pl.Int64,
-                    "source_hash": pl.String,
-                },
-            )
-            .with_columns(
-                pl.concat_str(pl.lit("KRX:"), pl.col("ticker")).alias("instrument_id"),
-                pl.lit("KIS").alias("provider"),
-            )
-            .join(
-                pl.DataFrame(
-                    {
-                        "session": list(calendar),
-                        "available_session": [
-                            calendar[index + lag] if index + lag < len(calendar) else None
-                            for index in range(len(calendar))
-                        ],
-                    },
-                    schema={"session": pl.Date, "available_session": pl.Date},
-                ),
-                on="session",
-                how="left",
-            )
-            .filter(pl.col("available_session").is_not_null())
-            .select(
-                "session",
-                "instrument_id",
-                "ticker",
-                "provider",
-                "individual_net_shares",
-                "foreign_net_shares",
-                "institution_net_shares",
-                "other_net_shares",
-                pl.col("available_session")
-                .dt.combine(policy.available_time)
-                .dt.replace_time_zone(str(KRX_TZ))
-                .alias("available_at"),
-                "source_hash",
-                pl.lit(POLICY_VERSION).alias("policy_version"),
-            )
-            .cast(pl.Schema(_SCHEMA))
-            .sort(["session", "ticker"])
+                schema={"session": pl.Date, "available_session": pl.Date},
+            ),
+            on="session",
+            how="left",
         )
-        partitions: list[dict[str, Any]] = []
-        total_rows = 0
-        for year in sorted(frame["session"].dt.year().unique().to_list()):
-            part = frame.filter(pl.col("session").dt.year() == year)
-            rel = Path(f"year={year}") / "part.parquet"
-            out_path = staging / rel
-            out_path.parent.mkdir(parents=True)
-            part.write_parquet(out_path)
-            partitions.append({
-                "path": str(rel),
-                "row_count": part.height,
-                "parquet_sha256": hashlib.sha256(out_path.read_bytes()).hexdigest(),
-                "year": year,
-            })
-            total_rows += part.height
-        manifest = {
-            "dataset_id": dataset_id,
-            "policy_version": POLICY_VERSION,
+        .filter(pl.col("available_session").is_not_null())
+        .select(
+            "session",
+            "instrument_id",
+            "ticker",
+            "provider",
+            "individual_net_shares",
+            "foreign_net_shares",
+            "institution_net_shares",
+            "other_net_shares",
+            pl.col("available_session")
+            .dt.combine(policy.available_time)
+            .dt.replace_time_zone(str(KRX_TZ))
+            .alias("available_at"),
+            "source_hash",
+            pl.lit(POLICY_VERSION).alias("policy_version"),
+        )
+        .cast(pl.Schema(_SCHEMA))
+        .sort(["session", "ticker"])
+    )
+    partitions: dict[str, pl.DataFrame] = {}
+    partition_details: list[dict[str, object]] = []
+    for year in sorted(frame["session"].dt.year().unique().to_list()) if frame.height else []:
+        part = frame.filter(pl.col("session").dt.year() == year)
+        relative_path = f"year={year}/part.parquet"
+        partitions[relative_path] = part
+        partition_details.append({"year": year, "rows": part.height})
+
+    source_digest = resolve_bronze_digest(
+        bronze_kis_digest,
+        kis_hashes,
+        label="KIS investor-flow Bronze source",
+    )
+    identity = DatasetIdentity(
+        kind="investor_flow_kis_supplement",
+        layer=DatasetLayer.SILVER,
+        policy_version=POLICY_VERSION,
+        inputs={
+            "ls": dataset_reference(gap.ls_dataset_id, kind="investor_flow_ls"),
+            "market_panel": dataset_reference(gap.market_panel_dataset_id, kind="market_panel"),
+            "bronze_kis": source_digest,
+        },
+        params={
             "available_session_lag": policy.available_session_lag,
             "available_time": policy.available_time.isoformat(),
+        },
+    )
+    published = publish_dataset(
+        layer_root=Path(silver_root),
+        identity=identity,
+        partitions=partitions,
+        details={
             "ls_dataset_id": gap.ls_dataset_id,
             "market_panel_dataset_id": gap.market_panel_dataset_id,
+            "partitions": partition_details,
             "target_cells": len(target),
-            "filled_cells": total_rows,
-            "still_missing_cells": len(target) - total_rows,
+            "filled_cells": frame.height,
+            "still_missing_cells": len(target) - frame.height,
             "identity_violation_cells": len(violation_keys),
-            "rows": total_rows,
-            "partitions": partitions,
-        }
-        encoded = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-        (staging / "manifest.json").write_text(encoded, encoding="utf-8")
-        if target_path.exists():
-            try:
-                current = (target_path / "manifest.json").read_text(encoding="utf-8")
-            except OSError as exc:
-                raise PITDataError(
-                    f"existing investor-flow KIS supplement is unreadable: {target_path}"
-                ) from exc
-            if current != encoded:
-                raise PITDataError(
-                    f"existing investor-flow KIS supplement differs: {target_path}"
-                )
-            shutil.rmtree(staging, ignore_errors=True)
-        else:
-            os.rename(staging, target_path)
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
+            "out_of_calendar_rows": out_of_calendar_rows,
+            "parsed_pages": parsed_pages,
+        },
+    )
     return InvestorFlowKisSupplementResult(
-        dataset_path=target_path,
-        dataset_id=dataset_id,
+        dataset_path=published.path,
+        dataset_id=published.dataset_id,
         ls_dataset_id=gap.ls_dataset_id,
         target_cells=len(target),
-        filled_cells=total_rows,
-        still_missing_cells=len(target) - total_rows,
+        filled_cells=frame.height,
+        still_missing_cells=len(target) - frame.height,
         identity_violation_cells=len(violation_keys),
-        rows=total_rows,
+        rows=frame.height,
     )

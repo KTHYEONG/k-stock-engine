@@ -9,10 +9,11 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import polars as pl
 
+from src.data.datasets import dataset_partition_paths, load_manifest
 from src.data.schemas import PITDataError
 
 _LOG = logging.getLogger(__name__)
@@ -52,13 +53,49 @@ def _only_universe_dataset(root: Path) -> Path:
 
 def _load_universe_manifest(dataset: Path) -> list[dict[str, Any]]:
     try:
-        manifest = json.loads((dataset / "manifest.json").read_text(encoding="utf-8"))
-        parts = manifest["partitions"]
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raw = json.loads((dataset / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
         raise PITDataError("invalid ordinary-universe manifest") from exc
-    if manifest.get("dataset_id") != dataset.name or not isinstance(parts, list) or not parts:
+    if not isinstance(raw, dict) or raw.get("dataset_id") != dataset.name:
         raise PITDataError("invalid ordinary-universe manifest")
+    if raw.get("schema") == "dataset-manifest-v2":
+        try:
+            manifest = load_manifest(dataset)
+            paths = dataset_partition_paths(dataset)
+        except PITDataError as exc:
+            raise PITDataError("invalid ordinary-universe manifest") from exc
+        detail_parts = cast("list[object]", manifest.details.get("partitions", []))
+        detail_by_path = {
+            str(item.get("path")): item
+            for item in detail_parts
+            if isinstance(item, dict)
+        }
+        parts: list[dict[str, Any]] = []
+        for path in paths:
+            relative = path.relative_to(dataset).as_posix()
+            detail = detail_by_path.get(relative, {})
+            session_text = str(detail.get("session") or relative.split("session=", 1)[1].split("/", 1)[0])
+            frame = pl.read_parquet(path)
+            parts.append(
+                {
+                    "session": session_text,
+                    "path": relative,
+                    "row_count": frame.height,
+                    "eligible_count": int(frame.filter(pl.col("eligible")).height),
+                    "parquet_sha256": next(
+                        item.sha256 for item in manifest.partitions if item.path == relative
+                    ),
+                }
+            )
+    else:
+        raw_parts = raw.get("partitions")
+        if not isinstance(raw_parts, list) or not raw_parts:
+            raise PITDataError("invalid ordinary-universe manifest")
+        if any(not isinstance(part, dict) for part in raw_parts):
+            raise PITDataError("invalid ordinary-universe partition")
+        parts = [part for part in raw_parts if isinstance(part, dict)]
     previous: date | None = None
+    normalized: list[dict[str, Any]] = []
     for part in parts:
         if not isinstance(part, dict):
             raise PITDataError("invalid ordinary-universe partition")
@@ -66,7 +103,8 @@ def _load_universe_manifest(dataset: Path) -> list[dict[str, Any]]:
         if previous is not None and session <= previous:
             raise PITDataError("ordinary-universe partitions are not strictly ordered")
         previous = session
-    return parts
+        normalized.append(part)
+    return normalized
 
 
 def _daily_payloads_by_session(bronze_root: Path, sessions: set[date]) -> dict[date, list[Path]]:

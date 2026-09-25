@@ -27,7 +27,7 @@ def _publish(
     import hashlib
 
     body = f"{source}:{natural_key}:{status.value}".encode()
-    payload_path = tmp_path / "blobs" / f"{natural_key}.json"
+    payload_path = tmp_path / "data" / "bronze" / "kr_swing_2019_v1" / "blobs" / f"{natural_key}.json"
     payload_path.parent.mkdir(parents=True, exist_ok=True)
     payload_path.write_bytes(body)
     catalog.publish(

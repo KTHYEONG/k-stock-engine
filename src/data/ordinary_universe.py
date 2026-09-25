@@ -3,10 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-import shutil
-import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, time
@@ -16,6 +13,7 @@ from typing import Any
 import polars as pl
 
 from src.core.time import KRX_TZ
+from src.data.datasets import DatasetIdentity, DatasetLayer, dataset_digest, publish_dataset
 from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog
 from src.data.schemas import BronzeReceipt, EvidenceKind, PITDataError
 
@@ -37,6 +35,7 @@ class OrdinaryUniverseSnapshot:
 
 def classify_krx_master_row(record: dict[str, Any]) -> tuple[bool, str]:
     """Return strict eligibility and a stable exclusion reason for one KRX row."""
+
     kind = str(record.get("KIND_STKCERT_TP_NM") or "").strip()
     security_group = str(record.get("SECUGRP_NM") or "").strip()
     market = str(record.get("MKT_TP_NM") or "").strip()
@@ -75,14 +74,14 @@ def _snapshot_date(payload: dict[str, Any]) -> date:
 
 
 def ordinary_universe_snapshot(receipt: BronzeReceipt) -> OrdinaryUniverseSnapshot:
-    """Verify raw bytes and classify every ticker in one dated KRX master page.
+    """Verify raw bytes and classify every ticker in one dated KRX page."""
 
-    `available_at` is the snapshot day's close. Retrieval time remains
-    provenance and cannot move a historical observation into the future.
-    """
     if receipt.kind is not EvidenceKind.SECURITY_MASTER:
         raise PITDataError("expected security_master Bronze receipt")
-    raw = receipt.payload_path.read_bytes()
+    try:
+        raw = receipt.payload_path.read_bytes()
+    except OSError as exc:
+        raise PITDataError("security_master Bronze payload is unreadable") from exc
     if hashlib.sha256(raw).hexdigest() != receipt.content_hash:
         raise PITDataError("security_master Bronze hash mismatch")
     try:
@@ -119,25 +118,31 @@ def ordinary_universe_snapshot(receipt: BronzeReceipt) -> OrdinaryUniverseSnapsh
         listed_raw = raw_record.get("LIST_DD")
         if eligible and listed_raw not in (None, ""):
             try:
-                listed_on = date.fromisoformat(str(listed_raw)[:10]) if "-" in str(listed_raw) else datetime.strptime(str(listed_raw), "%Y%m%d").date()
+                listed_on = (
+                    date.fromisoformat(str(listed_raw)[:10])
+                    if "-" in str(listed_raw)
+                    else datetime.strptime(str(listed_raw), "%Y%m%d").date()
+                )
             except ValueError as exc:
                 raise PITDataError(f"invalid listing date for {ticker}") from exc
             if listed_on > session:
                 eligible, reason = False, "not_listed_yet"
-        rows.append({
-            "session": session,
-            "instrument_id": f"KRX:{ticker}",
-            "ticker": ticker,
-            "source_security_id": isin,
-            "market": str(raw_record.get("MKT_TP_NM") or ""),
-            "share_kind": str(raw_record.get("KIND_STKCERT_TP_NM") or ""),
-            "security_group": str(raw_record.get("SECUGRP_NM") or ""),
-            "eligible": eligible,
-            "exclusion_reason": reason,
-            "available_at": available_at,
-            "source_hash": receipt.content_hash,
-            "policy_version": POLICY_VERSION,
-        })
+        rows.append(
+            {
+                "session": session,
+                "instrument_id": f"KRX:{ticker}",
+                "ticker": ticker,
+                "source_security_id": isin,
+                "market": str(raw_record.get("MKT_TP_NM") or ""),
+                "share_kind": str(raw_record.get("KIND_STKCERT_TP_NM") or ""),
+                "security_group": str(raw_record.get("SECUGRP_NM") or ""),
+                "eligible": eligible,
+                "exclusion_reason": reason,
+                "available_at": available_at,
+                "source_hash": receipt.content_hash,
+                "policy_version": POLICY_VERSION,
+            }
+        )
     if not rows:
         raise PITDataError(f"empty security_master snapshot for {session}")
     return OrdinaryUniverseSnapshot(session, receipt.content_hash, pl.DataFrame(rows).sort("ticker"))
@@ -147,6 +152,7 @@ def build_ordinary_universe(
     receipts: Iterable[BronzeReceipt], *, sessions: Iterable[date]
 ) -> tuple[OrdinaryUniverseSnapshot, ...]:
     """Build exact requested sessions; missing or duplicate dated pages fail closed."""
+
     requested = frozenset(sessions)
     if not requested:
         raise PITDataError("ordinary universe requires requested sessions")
@@ -166,6 +172,7 @@ def build_ordinary_universe(
 
 def dated_master_receipts(bronze_root: Path, *, sessions: Iterable[date]) -> tuple[BronzeReceipt, ...]:
     """Select requested dated pages using receipt metadata before opening payloads."""
+
     requested = frozenset(sessions)
     receipts: list[BronzeReceipt] = []
     for metadata_path in sorted((Path(bronze_root) / EvidenceKind.SECURITY_MASTER.value).glob("*/receipt.json")):
@@ -180,15 +187,17 @@ def dated_master_receipts(bronze_root: Path, *, sessions: Iterable[date]) -> tup
             content_hash = str(meta["content_hash"])
             if content_hash != metadata_path.parent.name:
                 raise PITDataError("security_master receipt path/hash mismatch")
-            receipts.append(BronzeReceipt(
-                kind=EvidenceKind.SECURITY_MASTER,
-                content_hash=content_hash,
-                source_path=label,
-                retrieved_at=datetime.fromisoformat(meta["retrieved_at"]),
-                ingested_at=datetime.fromisoformat(meta["ingested_at"]),
-                payload_path=metadata_path.parent / "payload.json",
-                metadata_path=metadata_path,
-            ))
+            receipts.append(
+                BronzeReceipt(
+                    kind=EvidenceKind.SECURITY_MASTER,
+                    content_hash=content_hash,
+                    source_path=label,
+                    retrieved_at=datetime.fromisoformat(meta["retrieved_at"]),
+                    ingested_at=datetime.fromisoformat(meta["ingested_at"]),
+                    payload_path=metadata_path.parent / "payload.json",
+                    metadata_path=metadata_path,
+                )
+            )
         except PITDataError:
             raise
         except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -199,12 +208,8 @@ def dated_master_receipts(bronze_root: Path, *, sessions: Iterable[date]) -> tup
 def catalog_master_receipts(
     catalog: ReceiptCatalog, *, sessions: Iterable[date]
 ) -> tuple[BronzeReceipt, ...]:
-    """Resolve one successful, dated master receipt per requested session.
+    """Resolve one successful, dated master receipt per requested session."""
 
-    Scope rebasing retains immutable raw bytes while assigning its own source
-    provenance.  The catalog carries the natural date key, so it is the
-    authoritative selector for that layout.
-    """
     requested = frozenset(sessions)
     if not requested:
         raise PITDataError("ordinary universe requires requested sessions")
@@ -222,71 +227,77 @@ def catalog_master_receipts(
         payload_path = Path(entry.payload_path)
         if not payload_path.is_file():
             raise PITDataError(f"security_master catalog payload is missing for {session}")
-        if hashlib.sha256(payload_path.read_bytes()).hexdigest() != entry.content_hash:
-            raise PITDataError(f"security_master catalog hash mismatch for {session}")
-        receipts.append(BronzeReceipt(
-            kind=EvidenceKind.SECURITY_MASTER,
-            content_hash=entry.content_hash,
-            source_path=f"KRX:historical-master:{session.isoformat()}",
-            retrieved_at=entry.retrieved_at,
-            ingested_at=entry.retrieved_at,
-            payload_path=payload_path,
-            metadata_path=payload_path.parent / "receipt.json",
-        ))
+        try:
+            if hashlib.sha256(payload_path.read_bytes()).hexdigest() != entry.content_hash:
+                raise PITDataError(f"security_master catalog hash mismatch for {session}")
+        except OSError as exc:
+            raise PITDataError(f"security_master catalog payload is missing for {session}") from exc
+        receipts.append(
+            BronzeReceipt(
+                kind=EvidenceKind.SECURITY_MASTER,
+                content_hash=entry.content_hash,
+                source_path=f"KRX:historical-master:{session.isoformat()}",
+                retrieved_at=entry.retrieved_at,
+                ingested_at=entry.retrieved_at,
+                payload_path=payload_path,
+                metadata_path=payload_path.parent / "receipt.json",
+            )
+        )
     return tuple(receipts)
 
 
 def write_ordinary_universe_silver(
     snapshots: Iterable[OrdinaryUniverseSnapshot], *, root: Path
 ) -> Path:
-    """Write ordered snapshots one day at a time with bounded working memory."""
-    root.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=".ordinary-universe-", dir=root))
-    try:
-        partitions: list[dict[str, Any]] = []
-        identity: list[str] = []
-        previous_day: date | None = None
-        for snapshot in snapshots:
-            if previous_day is not None and snapshot.session <= previous_day:
-                raise PITDataError("ordinary universe requires unique ascending dates")
-            previous_day = snapshot.session
-            identity.append(f"{snapshot.session.isoformat()}:{snapshot.source_hash}")
-            rel = Path(f"session={snapshot.session.isoformat()}") / "part.parquet"
-            path = staging / rel
-            path.parent.mkdir(parents=True)
-            snapshot.rows.write_parquet(path)
-            partitions.append({
+    """Publish ordered ordinary-universe snapshots through the v2 contract."""
+
+    ordered = tuple(snapshots)
+    if not ordered:
+        raise PITDataError("ordinary universe requires dated snapshots")
+    partitions: dict[str, pl.DataFrame] = {}
+    details: list[dict[str, object]] = []
+    source_hashes: list[str] = []
+    previous_day: date | None = None
+    for snapshot in ordered:
+        if previous_day is not None and snapshot.session <= previous_day:
+            raise PITDataError("ordinary universe requires unique ascending dates")
+        previous_day = snapshot.session
+        source_hashes.append(snapshot.source_hash)
+        relative_path = f"session={snapshot.session.isoformat()}/part.parquet"
+        partitions[relative_path] = snapshot.rows.sort(["session", "instrument_id"])
+        details.append(
+            {
                 "session": snapshot.session.isoformat(),
-                "path": str(rel),
                 "source_hash": snapshot.source_hash,
-                "row_count": snapshot.rows.height,
-                "eligible_count": len(snapshot.eligible_tickers),
-                "parquet_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            })
-        if not partitions:
-            raise PITDataError("ordinary universe requires dated snapshots")
-        dataset_hash = hashlib.sha256((POLICY_VERSION + "\n" + "\n".join(identity)).encode()).hexdigest()
-        target = Path(root) / f"ordinary_universe_{dataset_hash[:16]}"
-        if target.exists():
-            raise PITDataError(f"ordinary universe dataset already exists: {target}")
-        manifest = {
-            "dataset_id": target.name,
-            "policy_version": POLICY_VERSION,
-            "dataset_hash": dataset_hash,
-            "partitions": partitions,
-        }
-        (staging / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        os.rename(staging, target)
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
-    return target
+                "rows": snapshot.rows.height,
+                "eligible_rows": len(snapshot.eligible_tickers),
+            }
+        )
+    identity = DatasetIdentity(
+        kind="ordinary_universe",
+        layer=DatasetLayer.SILVER,
+        policy_version=POLICY_VERSION,
+        inputs={"bronze_master": dataset_digest(source_hashes)},
+        params={
+            "calendar_digest": hashlib.sha256(
+                "\n".join(snapshot.session.isoformat() for snapshot in ordered).encode("utf-8")
+            ).hexdigest()
+        },
+    )
+    published = publish_dataset(
+        layer_root=Path(root),
+        identity=identity,
+        partitions=partitions,
+        details={"partitions": details, "sessions": len(ordered)},
+    )
+    return published.path
 
 
 def materialize_ordinary_universe_from_bronze(
     *, bronze_root: Path, sessions: Iterable[date], silver_root: Path
 ) -> Path:
-    """Select exact dated Bronze pages and stream a source-bound Silver dataset."""
+    """Select exact dated Bronze pages and publish a source-bound dataset."""
+
     requested = frozenset(sessions)
     if not requested:
         raise PITDataError("ordinary universe requires requested sessions")
@@ -302,10 +313,23 @@ def materialize_ordinary_universe_from_bronze(
     )
 
 
+def catalog_master_sessions(catalog: ReceiptCatalog) -> tuple[date, ...]:
+    """Return all dated successful security-master sessions in the catalog."""
+
+    sessions: set[date] = set()
+    for entry in catalog.entries(source="krx_security_master"):
+        if entry.status is EvidenceStatus.SUCCESS and entry.as_of is not None:
+            sessions.add(entry.as_of)
+    if not sessions:
+        raise PITDataError("no certified security_master snapshots found")
+    return tuple(sorted(sessions))
+
+
 def materialize_ordinary_universe_from_catalog(
     *, catalog: ReceiptCatalog, sessions: Iterable[date], silver_root: Path
 ) -> Path:
-    """Materialize the ordinary-share Silver dataset from Scope receipt state."""
+    """Materialize the ordinary-share Silver dataset from scope receipt state."""
+
     receipts = catalog_master_receipts(catalog, sessions=sessions)
     return write_ordinary_universe_silver(
         (ordinary_universe_snapshot(receipt) for receipt in receipts), root=silver_root

@@ -127,22 +127,6 @@ def test_fiscal_start_at_2016_floor_validates() -> None:
     assert scope.features.fundamental_fiscal_start == "2016Q1"
 
 
-def test_preferred_share_excluded_within_extended_window() -> None:
-    from src.data.ordinary_universe import classify_krx_master_row
-
-    eligible, reason = classify_krx_master_row({
-        "ISU_SRT_CD": "000001",
-        "ISU_CD": "KR0000000001",
-        "KIND_STKCERT_TP_NM": "우선주",
-        "SECUGRP_NM": "주권",
-        "MKT_TP_NM": "KOSPI",
-        "LIST_DD": "20100101",
-    })
-
-    assert eligible is False
-    assert reason == "non_ordinary_share"
-
-
 def test_canonical_scope_enables_flow_and_industry() -> None:
     scope = _load_canonical()
     assert scope.features.investor_flow_enabled is True

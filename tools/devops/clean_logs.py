@@ -3,7 +3,7 @@ import time
 from pathlib import Path
 
 # Logs root directory
-LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
+LOGS_DIR = Path(__file__).resolve().parent.parent.parent / "logs"
 SCRATCH_LOGS_DIR = LOGS_DIR / "scratch"
 
 # Patterns of temporary/one-off log files to clean from logs root
@@ -17,8 +17,6 @@ TRANSIENT_PATTERNS = [
     "composite_*.log",
     "run_full_*.log",
     "metrics_*_run*.out",
-    "oi_*_run*.out",
-    "smart_money_*.out",
 ]
 
 

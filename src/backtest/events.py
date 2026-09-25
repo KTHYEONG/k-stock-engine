@@ -15,6 +15,7 @@ import polars as pl
 
 from src.backtest.market import MarketArrays
 from src.core.pit import PITDataError
+from src.data.datasets import dataset_partition_paths
 
 _EXIT_TABLE = "instrument_exits.parquet"
 
@@ -88,9 +89,17 @@ def _exit_events(
     sessions: list[date],
     session_index: dict[date, int],
 ) -> dict[int, tuple[ExitEvent, ...]]:
-    exits_path = panel_dir / _EXIT_TABLE
-    if not exits_path.is_file():
-        return {}
+    try:
+        verified_paths = dataset_partition_paths(panel_dir)
+    except PITDataError as exc:
+        raise PITDataError(f"exit table verification failed: {panel_dir}") from exc
+    exits_path = next((path for path in verified_paths if path.name == _EXIT_TABLE), None)
+    if exits_path is None:
+        # Pre-v2 manifests kept the exit companion outside ``partitions``.
+        legacy_path = panel_dir / _EXIT_TABLE
+        if not legacy_path.is_file():
+            return {}
+        exits_path = legacy_path
     try:
         frame = pl.read_parquet(exits_path)
     except Exception as exc:

@@ -197,11 +197,8 @@ def test_persist_rejects_malformed_payloads(tmp_path: Path) -> None:
 
 def test_collection_fact_and_market_pages_persist_through_writer(tmp_path: Path) -> None:
     from src.data.collection import (
-        collect_daily_market_sessions,
         collect_dart_financial_facts,
         dart_fact_scoped_payload,
-        krx_market_scoped_payload,
-        persist_scoped_payload,
         scoped_status_for_page,
     )
 
@@ -224,9 +221,9 @@ def test_collection_fact_and_market_pages_persist_through_writer(tmp_path: Path)
         },
         "records": [{"account": "revenue"}],
     }
-    receipt = persist_scoped_payload(
-        scoped_writer=writer, scoped_payload=dart_fact_scoped_payload(page=fact_page, retrieved_at=RETRIEVED_AT)
-    )
+    receipt = writer.persist(
+        dart_fact_scoped_payload(page=fact_page, retrieved_at=RETRIEVED_AT)
+    ).bronze_receipt
     assert receipt.payload_path.is_file()
 
     with pytest.raises(PITDataError, match="adapter natural key"):
@@ -248,30 +245,6 @@ def test_collection_fact_and_market_pages_persist_through_writer(tmp_path: Path)
     assert catalog.successful_keys(source="financial_facts", fiscal_start="2019Q1") == frozenset(
         {"00126380:2019:11013"}
     )
-
-    class _Krx:
-        def fetch_daily_market(self, start: object, end: object, **kwargs: object) -> list[dict[str, object]]:
-            assert kwargs["sessions"]
-            return [
-                {
-                    "session": "2024-01-02",
-                    "records": [{"ISU_SRT_CD": "005930", "MKTCAP": 10, "LIST_SHRS": 5}],
-                }
-            ]
-
-    scoped_direct = krx_market_scoped_payload(
-        page={"session": "2024-01-03", "records": []}, session=date(2024, 1, 3), retrieved_at=RETRIEVED_AT
-    )
-    assert scoped_direct.natural_key == "2024-01-03"
-    market = collect_daily_market_sessions(
-        sessions=(date(2024, 1, 2),),
-        krx=_Krx(),
-        bronze_root=tmp_path / "legacy-bronze",
-        retrieved_at=RETRIEVED_AT,
-        scoped_writer=writer,
-    )
-    assert market.content_hash
-    assert catalog.successful_keys(source="krx_daily_market") == frozenset({"2024-01-02"})
 
 
 def test_collect_scoped_and_disclosures_commands_persist(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -319,7 +292,7 @@ def test_blocked_fact_page_is_retryable_not_empty() -> None:
 
 
 def test_collection_publishes_one_catalog_revision_per_batch(tmp_path: Path) -> None:
-    from src.data.collection import collect_daily_market_sessions, collect_dart_financial_facts
+    from src.data.collection import collect_dart_financial_facts
 
     runtime = load_data_runtime(scope_config=SCOPE_CONFIG, data_root=tmp_path / "data")
     catalog = ReceiptCatalog(runtime.workspace.bronze_root / "catalog")
@@ -358,25 +331,6 @@ def test_collection_publishes_one_catalog_revision_per_batch(tmp_path: Path) -> 
     )
 
     assert publishes == [3]
-
-    class _Krx:
-        def fetch_daily_market(self, start: object, end: object, **kwargs: object) -> list[dict[str, object]]:
-            return [
-                {"session": day, "records": [{"ISU_SRT_CD": "005930", "MKTCAP": 10, "LIST_SHRS": 5}]}
-                for day in ("2024-01-02", "2024-01-03")
-            ]
-
-    publishes.clear()
-    collect_daily_market_sessions(
-        sessions=(date(2024, 1, 2), date(2024, 1, 3)),
-        krx=_Krx(),
-        bronze_root=tmp_path / "legacy-bronze",
-        retrieved_at=RETRIEVED_AT,
-        scoped_writer=writer,
-    )
-
-    assert publishes == [2]
-    assert catalog.successful_keys(source="krx_daily_market") == frozenset({"2024-01-02", "2024-01-03"})
 
 
 def test_fact_payload_derives_fiscal_period_when_collector_identity_drops_it() -> None:

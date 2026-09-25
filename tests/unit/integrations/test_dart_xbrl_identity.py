@@ -1,6 +1,6 @@
 import pytest
 
-from src.domain.stock_data import PITDataError
+from src.core.pit import PITDataError
 from src.integrations.dart.xbrl import DartXbrlCollector
 
 

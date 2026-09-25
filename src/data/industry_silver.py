@@ -2,11 +2,7 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
-import os
-import shutil
-import tempfile
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -15,6 +11,7 @@ from typing import Any
 import polars as pl
 
 from src.data.bronze_aggregation import discover_verified_bronze_receipts
+from src.data.datasets import DatasetIdentity, DatasetLayer, dataset_digest, publish_dataset
 from src.data.industry_ksic_map import learn_ksic_industry_mapping
 from src.data.schemas import BronzeReceipt, EvidenceKind, PITDataError
 
@@ -289,49 +286,30 @@ def materialize_industry_classification_silver(
             schema=_SCHEMA,
         ).sort("ticker")
     )
-    silver_root = Path(silver_root)
-    silver_root.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=".industry-silver-", dir=silver_root))
-    try:
-        rel = Path("part.parquet")
-        out_path = staging / rel
-        frame.write_parquet(out_path)
-        digest = hashlib.sha256(out_path.read_bytes()).hexdigest()
-        dataset_id = "industry_" + hashlib.sha256(
-            "\n".join((POLICY_VERSION, *considered)).encode("utf-8")
-        ).hexdigest()[:16]
-        target_path = silver_root / dataset_id
-        manifest = {
-            "dataset_id": dataset_id,
-            "policy_version": POLICY_VERSION,
-            "rows": frame.height,
+    identity = DatasetIdentity(
+        kind="industry",
+        layer=DatasetLayer.SILVER,
+        policy_version=POLICY_VERSION,
+        inputs={"bronze_classification": dataset_digest(considered)},
+        params={
+            "symbols": ",".join(sorted(symbols)) if symbols is not None else None,
+        },
+    )
+    published = publish_dataset(
+        layer_root=Path(silver_root),
+        identity=identity,
+        partitions={"part.parquet": frame},
+        details={
             "observed_rows": observed_rows,
             "inferred_rows": inferred_rows,
             "unmapped_rows": unmapped_rows,
             "mapping_disagreements": mapping_disagreements,
             "conflicting_ksic": sorted(mapping.conflicting_ksic),
-            "partitions": [{"path": str(rel), "row_count": frame.height, "parquet_sha256": digest}],
-        }
-        encoded = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-        (staging / "manifest.json").write_text(encoded, encoding="utf-8")
-        if target_path.exists():
-            try:
-                current = (target_path / "manifest.json").read_text(encoding="utf-8")
-            except OSError as exc:
-                raise PITDataError(
-                    f"existing industry dataset is unreadable: {target_path}"
-                ) from exc
-            if current != encoded:
-                raise PITDataError(f"existing industry dataset differs: {target_path}")
-            shutil.rmtree(staging, ignore_errors=True)
-        else:
-            os.rename(staging, target_path)
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
+        },
+    )
     return IndustryClassificationResult(
-        dataset_path=target_path,
-        dataset_id=dataset_id,
+        dataset_path=published.path,
+        dataset_id=published.dataset_id,
         rows=frame.height,
         observed_rows=observed_rows,
         inferred_rows=inferred_rows,
