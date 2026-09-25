@@ -531,3 +531,32 @@ def test_fetch_one_financial_fact_source_isolates_malformed_response() -> None:
     # Then
     assert page["source_kind"] == "unavailable"
     assert any(str(entry).startswith("dart_error:") for entry in page["diagnostics"])
+
+
+def test_filing_identities_from_bronze_maps_report_kind_to_fiscal_period(tmp_path) -> None:
+    import json
+    from datetime import date
+
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    page_dir = tmp_path / "disclosures" / "p1"
+    page_dir.mkdir(parents=True)
+    records = [
+        {"rcept_dt": "20160516", "report_nm": "분기보고서 (2016.03)", "corp_code": "00126380", "rcept_no": "20160516000001"},
+        {"rcept_dt": "20160816", "report_nm": "반기보고서 (2016.06)", "corp_code": "00126380", "rcept_no": "20160816000002"},
+        {"rcept_dt": "20161115", "report_nm": "분기보고서 (2016.09)", "corp_code": "00126380", "rcept_no": "20161115000003"},
+        {"rcept_dt": "20170331", "report_nm": "사업보고서 (2016.12)", "corp_code": "00126380", "rcept_no": "20170331000004"},
+        {"rcept_dt": "20170331", "report_nm": "감사보고서 (2016.12)", "corp_code": "00126380", "rcept_no": "20170331000005"},
+    ]
+    (page_dir / "payload.json").write_text(json.dumps({"corp_code": "00126380", "records": records}), encoding="utf-8")
+
+    identities = DartXbrlCollector.filing_identities_from_bronze(
+        tmp_path, start=date(2016, 1, 1), end=date(2017, 12, 31), ticker_by_corp_code={"00126380": "005930"}
+    )
+
+    assert {(i["reprt_code"], i["fiscal_period"]) for i in identities} == {
+        ("11013", "2016Q1"),
+        ("11012", "2016Q2"),
+        ("11014", "2016Q3"),
+        ("11011", "2016Q4"),
+    }

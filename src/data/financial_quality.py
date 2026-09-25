@@ -6,11 +6,11 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Collection
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Final, cast
 from zoneinfo import ZoneInfo
 
 import polars as pl
@@ -82,6 +82,113 @@ class FinancialQualityEvent:
             raise ValueError("financial quality event timestamps must be timezone-aware")  # pragma: no cover
         if self.available_at < self.published_at:
             raise ValueError("financial quality event cannot precede publication")  # pragma: no cover
+
+
+UNVERIFIED_LEGACY_REASON: Final = "unverified_legacy_extraction"
+
+# A listed filer must hold at least this much in total assets. Anything smaller
+# is a unit error (millions recorded as won) or a broken extraction, never a
+# truthful balance sheet. Named so the plausibility floor stays auditable.
+_ASSETS_FLOOR_KRW: Final = 100_000_000.0
+
+# Equity cannot exceed assets beyond this relative tolerance. The margin keeps
+# rounding-scale restatements from flagging while still catching sign flips and
+# swapped columns. Named so the plausibility tolerance stays auditable.
+_EQUITY_EXCEEDS_ASSETS_TOLERANCE: Final = 0.0001
+
+
+def _parse_quality_timestamp(value: object, *, field: str) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise PITDataError(f"financial quality event has an invalid {field}: {value!r}") from exc
+    else:
+        raise PITDataError(f"financial quality event lacks {field}")
+    if parsed.tzinfo is None:
+        raise PITDataError(f"financial quality event has a naive {field}")
+    return parsed
+
+
+def quarantine_events(quarantine: Sequence[Mapping[str, object]]) -> tuple[FinancialQualityEvent, ...]:
+    """Convert quarantined-filing records into unresolved quality events.
+
+    A filing that exists but whose values were withheld must make its fiscal
+    period visibly incomplete from the moment it was observable; silently
+    dropping it would let the previous period look like the latest complete
+    state.
+
+    Args:
+        quarantine: Records with company_id, fiscal_period, filing_id, published_at, available_at (ISO-8601 UTC strings).
+
+    Returns:
+        One event per (company_id, fiscal_period, filing_id), reason ``unverified_legacy_extraction``.
+
+    Raises:
+        PITDataError: a record lacks a field, has a naive timestamp, has an invalid fiscal period, or precedes its publication.
+    """
+    try:
+        records = list(quarantine)
+    except TypeError as exc:
+        raise PITDataError("financial quality quarantine must be a sequence") from exc
+    events: dict[tuple[str, str, str], FinancialQualityEvent] = {}
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise PITDataError("financial quality quarantine record must be a mapping")
+        company_id = str(record.get("company_id") or "").strip()
+        fiscal_period = str(record.get("fiscal_period") or "").strip()
+        filing_id = str(record.get("filing_id") or "").strip()
+        if not company_id:
+            raise PITDataError("financial quality quarantine record lacks company_id")
+        if not fiscal_period or _FISCAL_RE.fullmatch(fiscal_period) is None:
+            raise PITDataError(f"financial quality quarantine record has an invalid fiscal period: {fiscal_period!r}")
+        if not filing_id:
+            raise PITDataError("financial quality quarantine record lacks filing_id")
+        published_at = _parse_quality_timestamp(record.get("published_at"), field="published_at")
+        available_at = _parse_quality_timestamp(record.get("available_at"), field="available_at")
+        try:
+            event = FinancialQualityEvent(
+                company_id=company_id,
+                fiscal_period=fiscal_period,
+                filing_id=filing_id,
+                published_at=published_at,
+                available_at=available_at,
+                reason=UNVERIFIED_LEGACY_REASON,
+            )
+        except ValueError as exc:
+            raise PITDataError(str(exc)) from exc
+        key = (company_id, fiscal_period, filing_id)
+        previous = events.get(key)
+        if previous is None or (event.available_at, event.published_at) > (
+            previous.available_at,
+            previous.published_at,
+        ):
+            events[key] = event
+    return tuple(
+        sorted(events.values(), key=lambda e: (e.available_at, e.company_id, e.fiscal_period, e.filing_id))
+    )
+
+
+def implausible_balance_flags(*, assets: float | None, equity: float | None) -> tuple[str, ...]:
+    """Return report-only labels for balance-sheet values no filer could truthfully report.
+
+    Labels: ``assets_nonpositive`` (assets ≤ 0), ``equity_exceeds_assets``
+    (equity > assets with a 0.01% tolerance), ``assets_below_floor``
+    (0 < assets < 100,000,000 KRW). None inputs yield no label. The result is a
+    diagnostic for trusted pages; it never excludes data.
+    """
+    if assets is None:
+        return ()
+    labels: list[str] = []
+    if assets <= 0:
+        labels.append("assets_nonpositive")
+    elif assets < _ASSETS_FLOOR_KRW:
+        labels.append("assets_below_floor")
+    if equity is not None and equity - assets > abs(assets) * _EQUITY_EXCEEDS_ASSETS_TOLERANCE:
+        labels.append("equity_exceeds_assets")
+    return tuple(labels)
 
 
 def _fiscal_key(period: str) -> tuple[int, int]:

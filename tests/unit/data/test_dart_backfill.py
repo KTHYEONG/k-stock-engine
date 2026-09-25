@@ -424,6 +424,7 @@ def test_scoped_collector_uses_collection_policy(tmp_path, monkeypatch) -> None:
             captured.update(kwargs)
 
     monkeypatch.setattr(backfill, "DartXbrlCollector", _Collector)
+    monkeypatch.setenv("OPENDART_API_KEY", "primary-key")
     runtime = _scoped_runtime(tmp_path)
     build_scoped_dart_collector(runtime=runtime)
 
@@ -649,3 +650,76 @@ def test_scoped_identity_accepts_explicit_valid_fiscal_period() -> None:
     import src.data.dart_backfill as backfill
 
     assert backfill._identity_fiscal_period({"fiscal_period": "2019Q2"}) == "2019Q2"
+
+
+def test_headroom_meters_each_key_against_its_own_policy(tmp_path, monkeypatch) -> None:
+    from datetime import UTC, datetime
+
+    from src.data.dart_backfill import scoped_dart_request_headroom
+    from src.integrations.quota import ProviderQuotaStateStore
+
+    monkeypatch.setenv("OPENDART_API_KEY", "primary-key")
+    monkeypatch.setenv("OPENDART_API_KEY_2", "second-key")
+    runtime = _scoped_runtime(tmp_path)
+    store = ProviderQuotaStateStore(tmp_path / "quota")
+    moment = datetime(2026, 9, 24, 3, tzinfo=UTC)
+    collection = runtime.scope.collection
+    for _ in range(5):
+        store.record_attempt(provider="OpenDART", endpoint="x", now=moment, daily_limit=collection.dart_daily_budget)
+
+    primary = scoped_dart_request_headroom(runtime=runtime, quota_store=store, now=moment)
+    secondary = scoped_dart_request_headroom(
+        runtime=runtime, quota_store=store, now=moment, key_env="OPENDART_API_KEY_2"
+    )
+    policy = collection.dart_key_policy("OPENDART_API_KEY_2")
+
+    assert primary == collection.dart_daily_budget - 5 - collection.dart_daily_reserve
+    assert secondary == policy.daily_budget - policy.daily_reserve
+
+
+def test_scoped_collector_uses_the_declared_policy_of_the_selected_key(tmp_path, monkeypatch) -> None:
+    import src.data.dart_backfill as backfill
+    from src.data.dart_backfill import build_scoped_dart_collector
+
+    captured: dict[str, object] = {}
+
+    class _Collector:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(backfill, "DartXbrlCollector", _Collector)
+    monkeypatch.setenv("OPENDART_API_KEY_2", "second-key")
+    runtime = _scoped_runtime(tmp_path)
+    policy = runtime.scope.collection.dart_key_policy("OPENDART_API_KEY_2")
+    build_scoped_dart_collector(runtime=runtime, key_env="OPENDART_API_KEY_2")
+
+    assert captured["api_key"] == "second-key"
+    assert captured["min_interval"] == policy.min_interval_seconds
+    assert captured["max_workers"] == policy.max_workers
+    assert captured["daily_request_limit"] == policy.daily_budget
+
+
+def test_undeclared_or_unset_key_is_refused(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    from src.data.dart_backfill import build_scoped_dart_collector
+
+    runtime = _scoped_runtime(tmp_path)
+    monkeypatch.delenv("OPENDART_API_KEY_2", raising=False)
+    with pytest.raises(ValueError, match="is not set"):
+        build_scoped_dart_collector(runtime=runtime, key_env="OPENDART_API_KEY_2")
+    with pytest.raises(ValueError, match="no declared policy"):
+        build_scoped_dart_collector(runtime=runtime, key_env="OPENDART_API_KEY_9")
+
+
+def test_key_policy_rejects_unsafe_pacing_and_budget() -> None:
+    import pytest
+
+    from src.data.research_scope import DartKeyPolicy
+
+    with pytest.raises(ValueError, match="measured safe rate"):
+        DartKeyPolicy(daily_budget=1000, daily_reserve=10, min_interval_seconds=0.01, max_workers=4)
+    with pytest.raises(ValueError, match="must be below"):
+        DartKeyPolicy(daily_budget=20000, daily_reserve=10, min_interval_seconds=0.1, max_workers=4)
+    with pytest.raises(ValueError, match="daily_reserve"):
+        DartKeyPolicy(daily_budget=1000, daily_reserve=1000, min_interval_seconds=0.1, max_workers=4)

@@ -71,6 +71,10 @@ load_dotenv()
 _LOG = logging.getLogger(__name__)
 
 
+# 0.35초 간격에서는 전 종목 수집 시 약 10%가 KIS 호출 제한으로 실패했고, 1.0초에서는 전부 성공했다.
+_KIS_CLASSIFICATION_PACE_SECONDS = 1.0
+
+
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PIT dataset foundation CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -168,6 +172,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p_dart_refresh.add_argument("--artifact-root", type=Path, default=Path("data/artifacts"))
     p_dart_refresh.add_argument("--decision-time", type=str, required=True)
     p_dart_refresh.add_argument("--batch-size", type=int, default=500)
+    p_dart_refresh.add_argument(
+        "--superseded-receipts", type=Path, default=None, help="JSON list of Bronze receipt hashes to exclude as superseded"
+    )
 
     p_retention = sub.add_parser("bronze-retention-plan", help="Audit Bronze retention without deletion")
     p_retention.add_argument("--bronze-root", type=Path, default=Path("data/bronze/stocks"))
@@ -377,19 +384,28 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p_flow_union.add_argument("--ls-flow-dataset-id", required=True)
     p_flow_union.add_argument("--kis-supplement-dataset-id", required=True)
 
+    p_quality = sub.add_parser(
+        "build-financial-quality", help="Build certified financial-quality evidence from facts and quarantine"
+    )
+    _add_scoped_args(p_quality)
+    p_quality.add_argument("--facts-dataset-id", required=True)
+    p_quality.add_argument("--quarantine-file", type=Path, default=None)
+    p_quality.add_argument("--unresolved-events-file", type=Path, default=None)
+    p_quality.add_argument("--decision-time", required=True)
+
     p_industry = sub.add_parser(
         "collect-industry-classification", help="Collect current KIS industry classifications to Bronze"
     )
     _add_scoped_args(p_industry)
     p_industry.add_argument("--symbols-from", type=Path, required=False, default=None)
-    p_industry.add_argument("--pace-seconds", type=float, default=0.35)
+    p_industry.add_argument("--pace-seconds", type=float, default=_KIS_CLASSIFICATION_PACE_SECONDS)
 
     p_stock = sub.add_parser(
         "collect-stock-classification", help="Collect current KIS KSIC stock classifications to Bronze"
     )
     _add_scoped_args(p_stock)
     p_stock.add_argument("--symbols-from", type=Path, required=False, default=None)
-    p_stock.add_argument("--pace-seconds", type=float, default=0.35)
+    p_stock.add_argument("--pace-seconds", type=float, default=_KIS_CLASSIFICATION_PACE_SECONDS)
 
     p_industry_silver = sub.add_parser(
         "build-industry-classification-silver", help="Build the certified industry classification Silver snapshot"
@@ -679,12 +695,159 @@ def _emit(payload: dict[str, object]) -> None:
     sys.stdout.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
 
 
+def _parse_quality_decision_time(value: str) -> datetime:
+    """Parse a scoped decision time without coercing naive inputs to UTC."""
+    from src.data.schemas import PITDataError
+
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError as exc:
+        raise PITDataError(f"decision-time must be ISO-8601: {value!r}") from exc
+    if parsed.tzinfo is None:
+        raise PITDataError("decision-time must be timezone-aware")
+    return parsed
+
+
+def _read_quality_json_array(path: Path, *, label: str) -> list[dict[str, Any]]:
+    """Read a JSON array of mappings, failing closed on any shape violation."""
+    from src.data.schemas import PITDataError
+
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise PITDataError(f"scoped {label} file is unreadable: {exc}") from exc
+    if not isinstance(raw, list):
+        raise PITDataError(f"scoped {label} file must hold a list")
+    rows: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise PITDataError(f"scoped {label} entry must be a mapping")
+        rows.append(dict(entry))
+    return rows
+
+
+def _parse_quality_event_timestamp(value: Any, *, label: str) -> datetime:
+    """Parse one evidenced event timestamp without defaulting naive inputs."""
+    from src.data.schemas import PITDataError
+
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise PITDataError(f"scoped unresolved events entry has an invalid {label}: {value!r}") from exc
+    else:
+        raise PITDataError(f"scoped unresolved events entry lacks {label}")
+    if parsed.tzinfo is None:
+        raise PITDataError(f"scoped unresolved events entry has a naive {label}")
+    return parsed
+
+
+def _manual_quality_events(path: Path) -> list[Any]:
+    """Load manually evidenced events; every entry must carry an explicit reason."""
+    from src.data.financial_quality import FinancialQualityEvent
+    from src.data.schemas import PITDataError
+
+    events: list[Any] = []
+    for index, entry in enumerate(_read_quality_json_array(path, label="unresolved events")):
+        reason = entry.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise PITDataError(f"scoped unresolved events entry {index} lacks reason")
+        company_id = str(entry.get("company_id") or "").strip()
+        fiscal_period = str(entry.get("fiscal_period") or "").strip()
+        filing_id = str(entry.get("filing_id") or "").strip()
+        if not company_id:
+            raise PITDataError(f"scoped unresolved events entry {index} lacks company_id")
+        if not filing_id:
+            raise PITDataError(f"scoped unresolved events entry {index} lacks filing_id")
+        try:
+            events.append(
+                FinancialQualityEvent(
+                    company_id=company_id,
+                    fiscal_period=fiscal_period,
+                    filing_id=filing_id,
+                    published_at=_parse_quality_event_timestamp(entry.get("published_at"), label="published_at"),
+                    available_at=_parse_quality_event_timestamp(entry.get("available_at"), label="available_at"),
+                    reason=reason.strip(),
+                )
+            )
+        except ValueError as exc:
+            raise PITDataError(str(exc)) from exc
+    return events
+
+
+def _build_financial_quality(args: argparse.Namespace) -> dict[str, object]:
+    """Build one certified financial-quality dataset from facts and evidenced events."""
+    import polars as pl
+
+    from src.data.financial_quality import (
+        build_financial_quality_events,
+        materialize_financial_quality,
+        quarantine_events,
+    )
+    from src.data.schemas import SilverTable
+    from src.data.silver import load_silver_table_by_dataset_id
+    from src.storage.parquet_datasets import canonical_content_hash
+
+    runtime = _scoped_runtime(args)
+    decision_time = _parse_quality_decision_time(str(args.decision_time))
+    facts_dataset_id = str(args.facts_dataset_id)
+    facts = load_silver_table_by_dataset_id(
+        root=runtime.workspace.silver_root,
+        table=SilverTable.FINANCIAL_FACTS,
+        dataset_id=facts_dataset_id,
+        decision_time=decision_time,
+    )
+    quarantine_records = (
+        _read_quality_json_array(Path(args.quarantine_file), label="quarantine")
+        if args.quarantine_file is not None
+        else []
+    )
+    quarantined = quarantine_events(quarantine_records)
+    manual = (
+        _manual_quality_events(Path(args.unresolved_events_file))
+        if args.unresolved_events_file is not None
+        else []
+    )
+    events = build_financial_quality_events(
+        facts,
+        unresolved_events=(*quarantined, *manual),
+        decision_time=decision_time,
+    )
+    dataset_id = canonical_content_hash(events, list(events.columns))
+    dataset_dir = runtime.workspace.silver_root / "financial_quality" / dataset_id
+    if not dataset_dir.is_dir():
+        dataset_dir = materialize_financial_quality(
+            events,
+            root=runtime.workspace.silver_root,
+            dataset_id=dataset_id,
+            decision_time=decision_time,
+            source_dataset_id=facts_dataset_id,
+        )
+    incomplete_periods = (
+        events.filter(~pl.col("financial_complete"))
+        .select("company_id", "fiscal_period")
+        .unique()
+        .height
+    )
+    return {
+        "dataset_id": dataset_id,
+        "dataset_path": str(dataset_dir),
+        "rows": events.height,
+        "quarantine_events": len(quarantined),
+        "manual_events": len(manual),
+        "incomplete_periods": incomplete_periods,
+    }
+
+
 def normalize_dart_facts(
     bronze_root: Path,
     silver_root: Path,
     artifact_root: Path,
     decision_time: datetime,
     batch_size: int = 500,
+    superseded_receipts: Path | None = None,
 ) -> dict[str, object]:
     """Incremental DART fact refresh entry point for the normalize-dart-facts command."""
     from src.core.krx_calendar import xkrx_session_calendar
@@ -697,8 +860,11 @@ def normalize_dart_facts(
         decision_time=decision_time,
         calendar=xkrx_session_calendar(),
         batch_size=int(batch_size),
+        superseded_receipt_hashes=frozenset(str(h) for h in json.loads(Path(superseded_receipts).read_text(encoding="utf-8")))
+        if superseded_receipts is not None
+        else frozenset(),
     )
-    return {"output_hash": artifact.output_hash, "report_hash": artifact.report_hash, "row_count": artifact.row_count}
+    return {"output_hash": artifact.output_hash, "report_hash": artifact.report_hash, "row_count": artifact.row_count, "quarantined_filings": artifact.quarantined_filings, "quarantine_path": artifact.quarantine_path}
 
 
 def _run_backtest_from_silver(
@@ -1846,6 +2012,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             return asdict(result) | {"dataset_path": str(result.dataset_path)}
 
         return _run_scoped(args, _build_flow_union)
+    if args.command == "build-financial-quality":
+        def _build_quality() -> dict[str, object]:
+            return _build_financial_quality(args)
+
+        return _run_scoped(args, _build_quality)
     if args.command == "collect-industry-classification":
         def _collect_industry() -> dict[str, object]:
             from src.integrations.kis.industry import KisIndustryCollector
@@ -2170,11 +2341,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 artifact_root=Path(getattr(args, "artifact_root", Path("data/artifacts"))),
                 decision_time=_parse_dt(args.decision_time),
                 batch_size=int(getattr(args, "batch_size", 500)),
+                superseded_receipts=getattr(args, "superseded_receipts", None),
             )
         except (PITDataError, ValueError, OSError) as exc:
             _emit({"error": str(exc)})
             return 1
-        _emit({"output_hash": payload["output_hash"], "report_hash": payload["report_hash"], "row_count": payload["row_count"]})
+        _emit({"output_hash": payload["output_hash"], "report_hash": payload["report_hash"], "row_count": payload["row_count"], "quarantined_filings": payload["quarantined_filings"], "quarantine_path": payload["quarantine_path"]})
         return 0
     if args.command == "bronze-retention-plan":
         retention_plan = plan_bronze_retention(
