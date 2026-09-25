@@ -1,0 +1,6 @@
+scenario = "open_auction"
+max_participation = 0.01
+carry_unfilled = false
+commission_rate = "0.00015"
+impact_k = 0.1
+cash_buffer = 0.005
