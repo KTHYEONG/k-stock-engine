@@ -50,14 +50,66 @@ class ScopeFeaturePolicy(BaseModel):
         return value
 
 
+PRIMARY_DART_KEY_ENV = "OPENDART_API_KEY"
+# 지속 15 rps까지 오류가 없었고 30 rps에서 연결이 끊겼다: 20 rps(0.05초)를 절대 하한으로 둔다.
+_MIN_DART_INTERVAL_SECONDS = 0.05
+
+
+class DartKeyPolicy(BaseModel):
+    """Budget and pacing of one OpenDART key, metered in its own quota ledger."""
+
+    daily_budget: PositiveInt
+    daily_reserve: NonNegativeInt
+    min_interval_seconds: PositiveFloat
+    max_workers: PositiveInt
+
+    @model_validator(mode="after")
+    def _check_policy(self) -> DartKeyPolicy:
+        if self.daily_budget >= OPENDART_DAILY_LIMIT:
+            raise ValueError(f"invalid daily_budget {self.daily_budget!r}: must be below {OPENDART_DAILY_LIMIT}")
+        if self.daily_reserve >= self.daily_budget:
+            raise ValueError("daily_reserve must be below daily_budget")
+        if self.min_interval_seconds < _MIN_DART_INTERVAL_SECONDS:
+            raise ValueError(
+                f"min_interval_seconds below {_MIN_DART_INTERVAL_SECONDS} exceeds the measured safe rate"
+            )
+        return self
+
+
 class CollectionBudget(BaseModel):
-    """Provider request limits that preserve resumability and quota headroom."""
+    """Provider request limits that preserve resumability and quota headroom.
+
+    The top-level ``dart_*`` fields are the policy of the primary key
+    (``OPENDART_API_KEY``), which other projects share, so its budget and pacing
+    stay conservative. Keys declared in ``dart_extra_keys`` carry their own
+    policy; a run selects a key by environment-variable name and never needs
+    pacing flags.
+    """
 
     dart_daily_budget: PositiveInt
     dart_batch_identities: PositiveInt
     dart_daily_reserve: NonNegativeInt = 400
     dart_request_min_interval_seconds: PositiveFloat = 1.0
     dart_max_workers: PositiveInt = 1
+    dart_extra_keys: dict[str, DartKeyPolicy] = {}  # noqa: RUF012 - pydantic copies field defaults
+
+    def dart_key_policy(self, key_env: str) -> DartKeyPolicy:
+        """Return the declared policy for a key's environment variable.
+
+        Raises:
+            ValueError: ``key_env`` is neither the primary key nor declared in ``dart_extra_keys``.
+        """
+        if key_env == PRIMARY_DART_KEY_ENV:
+            return DartKeyPolicy(
+                daily_budget=self.dart_daily_budget,
+                daily_reserve=self.dart_daily_reserve,
+                min_interval_seconds=self.dart_request_min_interval_seconds,
+                max_workers=self.dart_max_workers,
+            )
+        try:
+            return self.dart_extra_keys[key_env]
+        except KeyError:
+            raise ValueError(f"DART key {key_env!r} has no declared policy in the scope config") from None
 
     @field_validator("dart_daily_budget")
     @classmethod

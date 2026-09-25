@@ -5,6 +5,7 @@ from src.data.collection import collect_historical_evidence
 from src.data.collection_plan import CollectionCheckpointStore, build_historical_collection_plan
 from src.data.schemas import EvidenceKind
 from src.integrations.kis.investor_flow import KisInvestorFlowCollector
+from tests.ls_flow_fixtures import ls_investor_row
 
 
 def test_collection_routes_investor_flow_to_kis_only() -> None:
@@ -20,14 +21,7 @@ def test_planned_collection_persists_kis_raw_receipt_and_resumes(tmp_path) -> No
             rows = []
             day = start_date
             while day <= end_date:
-                rows.append(
-                    {
-                        "date": day.strftime("%Y%m%d"),
-                        "tjj0008": "-40",
-                        "tjj0009": "60",
-                        "tjj0018": "-20",
-                    }
-                )
+                rows.append(ls_investor_row(day.strftime("%Y%m%d")))
                 day += timedelta(days=1)
             return tuple(rows)
 
@@ -167,10 +161,7 @@ def test_collect_historical_evidence_collects_krx_and_kis_pages(tmp_path) -> Non
 
     class MockLsClient:
         def inquire_investor_trend(self, symbol, start_date, end_date, unit="amount"):
-            return ({
-                'date': start_date.strftime('%Y%m%d'),
-                'tjj0008': '-1', 'tjj0009': '1', 'tjj0018': '0',
-            },)
+            return (ls_investor_row(start_date.strftime('%Y%m%d')),)
 
     from src.integrations.ls.investor_flow import LsInvestorFlowCollector
 
