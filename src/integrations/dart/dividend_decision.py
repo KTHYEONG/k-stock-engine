@@ -11,7 +11,8 @@ from html.parser import HTMLParser
 
 from src.core.pit import PITDataError
 
-__all__ = ["DividendDecision", "is_dividend_decision_title", "parse_dividend_decision"]
+__all__ = [
+    "DividendDecision", "UndecidedRecordDateError", "is_dividend_decision_title", "parse_dividend_decision"]
 
 _MAX_MEMBERS = 32
 _MAX_MEMBER_BYTES = 16 * 1024 * 1024
@@ -28,6 +29,10 @@ _DATE_PATTERNS: tuple[re.Pattern[str], ...] = (
 _UNDECIDED_TOKENS = ("미정", "-")
 
 
+class UndecidedRecordDateError(PITDataError):
+    """The filing announces a dividend whose record date is not decided yet ("-" or "미정")."""
+
+
 @dataclass(frozen=True, slots=True)
 class DividendDecision:
     """Dated cash-dividend decision extracted from one filing archive."""
@@ -39,6 +44,8 @@ class DividendDecision:
     pay_date: date | None
     dps_common_krw: int
     is_correction: bool
+    agm_date: date | None = None
+    dividend_kind: str | None = None
 
 
 def is_dividend_decision_title(report_nm: str) -> bool:
@@ -129,8 +136,24 @@ def _flatten(tables: list[list[list[str]]]) -> list[list[str]]:
     return [row for table in tables for row in table]
 
 
+def _is_body_field_row(row: list[str]) -> bool:
+    """True for a form field row, False for correction-notice rows.
+
+    A correction filing prepends a reason row ("배당금지급 예정일자 확정") and a
+    before/after table whose rows repeat the field labels with three cells; both
+    would otherwise be read as the field itself, and the "before" cell is stale.
+    The restated form body that follows carries the corrected value.
+    """
+    non_empty = [cell for cell in row if cell.strip()]
+    if len(non_empty) == 1 and not _cell_has_date(non_empty[0]):
+        return False  # 라벨만 있는 안내 문장(예: "배당금지급 예정일자 기입")은 필드가 아니다
+    return len(non_empty) <= 2 and "정정" not in "".join(row[:1])
+
+
 def _find_labeled_date(rows: list[list[str]], *, labels: tuple[str, ...]) -> str | None:
     for row in rows:
+        if not _is_body_field_row(row):
+            continue
         joined = "".join(row)
         if any(label in joined for label in labels):
             for cell in row[1:]:
@@ -195,11 +218,40 @@ def _extract_dps(tables: list[list[list[str]]], full_text: str) -> int | None:
     return None
 
 
+def _extract_agm_date(rows: list[list[str]]) -> date | None:
+    """Scheduled shareholders' meeting date; an unparseable or undecided value is simply absent."""
+    for row in rows:
+        if not _is_body_field_row(row):
+            continue
+        if "주주총회예정일" in "".join(row).replace(" ", ""):
+            for cell in row[1:]:
+                if cell.strip():
+                    return _parse_date_token(cell.strip())
+    return None
+
+
+def _extract_dividend_kind(rows: list[list[str]]) -> str | None:
+    """Dividend classification cell ("결산배당", "중간배당", "분기배당"), if the form states one."""
+    for row in rows:
+        if not _is_body_field_row(row):
+            continue
+        head = re.sub(r"^\d+\s*[.)]?\s*", "", "".join(row[:1]).replace(" ", ""))
+        if head == "배당구분":
+            for cell in row[1:]:
+                if cell.strip():
+                    return cell.strip()
+    return None
+
+
 def _extract_pay_value(rows: list[list[str]]) -> str | None:
     labels = ("지급예정일", "지급 예정일", "배당금지급", "배당 지급", "지급일")
     for row in rows:
-        joined = "".join(row).replace(" ", "")
-        if any(label.replace(" ", "") in joined for label in labels):
+        if not _is_body_field_row(row):
+            continue
+        # 정정 공시는 "...지급일자 확정에 관한 사항입니다" 같은 안내 문장을 먼저 싣는다.
+        # 필드 행은 (번호 다음) 라벨로 시작하므로 라벨이 문장 중간에 있는 행은 건너뛴다.
+        head = re.sub(r"^\d+\s*[.)]?\s*", "", "".join(row[:1]).replace(" ", ""))
+        if any(head.startswith(label.replace(" ", "")) for label in labels):
             for cell in row[1:]:
                 if cell.strip():
                     return cell.strip()
@@ -276,6 +328,10 @@ def parse_dividend_decision(
     rows = _flatten(tables)
     record_cell = _find_labeled_date(rows, labels=("배당기준일", "기준일", "기록일", "결산기준일"))
     record_date = _parse_date_token(record_cell or "") if record_cell else None
+    if record_date is None and record_cell is not None and (
+        record_cell.strip() in _UNDECIDED_TOKENS or "미정" in record_cell
+    ):
+        raise UndecidedRecordDateError("dividend-decision archive has an undecided record date")
     if record_date is None:
         # Layouts that render the record date outside a table cell.
         m = re.search(r"(배당기준일|기준일)[^0-9]{0,20}(\d{4}[.\-/년]\s*\d{1,2}[.\-/월]\s*\d{1,2})", full_text)
@@ -306,4 +362,6 @@ def parse_dividend_decision(
         pay_date=pay_date,
         dps_common_krw=dps,
         is_correction=_CORRECTION_MARK in full_text,
+        agm_date=_extract_agm_date(rows),
+        dividend_kind=_extract_dividend_kind(rows),
     )
