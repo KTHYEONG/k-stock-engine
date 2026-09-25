@@ -744,3 +744,290 @@ def test_refresh_republish_is_idempotent_with_single_dataset(tmp_path) -> None:
         if path.is_dir()
     ]
     assert len(datasets) == 1
+
+
+def test_refresh_excludes_superseded_receipts_and_records_them(tmp_path) -> None:
+    import json
+    from datetime import UTC, datetime
+
+    from src.data.incremental_normalization import refresh_dart_financial_facts
+
+    decision_time = datetime(2016, 12, 30, tzinfo=UTC)
+    _write_fact_receipt(tmp_path / "bronze", "good", _FACT_PAGE.replace('"value": 10.0', '"value": 10000.0'),
+                        retrieved="2016-02-01T00:00:00+00:00")
+    stale = _write_fact_receipt(tmp_path / "bronze", "stale", _FACT_PAGE)
+    _write_reference_silver(tmp_path / "silver", decision_time)
+
+    artifact = refresh_dart_financial_facts(
+        bronze_root=tmp_path / "bronze",
+        silver_root=tmp_path / "silver",
+        artifact_root=tmp_path / "artifacts",
+        decision_time=decision_time,
+        calendar=_covering_calendar(),
+        superseded_receipt_hashes=frozenset({stale}),
+    )
+
+    assert stale not in artifact.receipt_hashes
+    content = json.loads(
+        (tmp_path / "silver" / "financial_facts" / artifact.output_hash / "content_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert content["superseded_receipt_hashes"] == [stale]
+
+
+def test_refresh_rejects_unknown_superseded_receipt(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    import pytest
+
+    from src.data.incremental_normalization import refresh_dart_financial_facts
+    from src.data.schemas import PITDataError
+
+    decision_time = datetime(2016, 12, 30, tzinfo=UTC)
+    _write_fact_receipt(tmp_path / "bronze", "ok", _FACT_PAGE)
+    _write_reference_silver(tmp_path / "silver", decision_time)
+
+    with pytest.raises(PITDataError, match="superseded receipts not found"):
+        refresh_dart_financial_facts(
+            bronze_root=tmp_path / "bronze",
+            silver_root=tmp_path / "silver",
+            artifact_root=tmp_path / "artifacts",
+            decision_time=decision_time,
+            calendar=_covering_calendar(),
+            superseded_receipt_hashes=frozenset({"0" * 64}),
+        )
+
+
+def _legacy_receipt_payload(*, filing_id, published, fiscal_period="2015Q3"):
+    import json
+
+    return json.dumps(
+        {
+            "source_kind": "legacy_document",
+            "records": [
+                {
+                    "ticker": "005930",
+                    "corp_code": "00126380",
+                    "fiscal_period": fiscal_period,
+                    "filing_id": filing_id,
+                    "fact": "sales",
+                    "published_at": published,
+                    "value": 10.0,
+                    "unit": "KRW",
+                }
+            ],
+        },
+        sort_keys=True,
+    )
+
+
+def _standard_receipt_payload(*, filing_id, published, fiscal_period="2015Q3"):
+    import json
+
+    return json.dumps(
+        {
+            "source_kind": "opendart_standard",
+            "records": [
+                {
+                    "ticker": "005930",
+                    "corp_code": "00126380",
+                    "fiscal_period": fiscal_period,
+                    "filing_id": filing_id,
+                    "fact": "sales",
+                    "published_at": published,
+                    "value": 10.0,
+                    "unit": "KRW",
+                }
+            ],
+        },
+        sort_keys=True,
+    )
+
+
+def test_refresh_withholds_untrusted_rows_and_lists_quarantine(tmp_path) -> None:
+    import json
+    from datetime import UTC, datetime
+
+    import polars as pl
+
+    from src.data.incremental_normalization import refresh_dart_financial_facts
+
+    decision_time = datetime(2016, 12, 30, tzinfo=UTC)
+    _write_fact_receipt(tmp_path / "bronze", "std", _standard_receipt_payload(filing_id="F1", published="2015-11-16T00:00:00+00:00"))
+    _write_fact_receipt(tmp_path / "bronze", "leg", _legacy_receipt_payload(filing_id="F2", published="2015-11-16T00:00:00+00:00"))
+
+    artifact = refresh_dart_financial_facts(
+        bronze_root=tmp_path / "bronze",
+        silver_root=tmp_path / "silver",
+        artifact_root=tmp_path / "artifacts",
+        decision_time=decision_time,
+        calendar=_covering_calendar(),
+    )
+
+    published = pl.read_parquet(tmp_path / "silver" / "financial_facts" / artifact.output_hash / "partitions")
+    assert published["filing_id"].to_list() == ["F1"]
+    assert set(published["source_kind"].to_list()) == {"opendart_standard"}
+    assert artifact.quarantined_filings == 1
+    quarantine = json.loads((tmp_path / "artifacts" / f"dart_fact_quarantine_{artifact.output_hash}.json").read_text(encoding="utf-8"))
+    assert [entry["filing_id"] for entry in quarantine] == ["F2"]
+    assert artifact.quarantine_path.endswith(f"dart_fact_quarantine_{artifact.output_hash}.json")
+
+
+def test_refresh_manifest_records_quarantine_exclusion(tmp_path) -> None:
+    import json
+    from datetime import UTC, datetime
+
+    from src.data.incremental_normalization import refresh_dart_financial_facts
+
+    decision_time = datetime(2016, 12, 30, tzinfo=UTC)
+    _write_fact_receipt(tmp_path / "bronze", "std", _standard_receipt_payload(filing_id="F1", published="2015-11-16T00:00:00+00:00"))
+    _write_fact_receipt(tmp_path / "bronze", "leg", _legacy_receipt_payload(filing_id="F2", published="2015-11-16T00:00:00+00:00"))
+
+    artifact = refresh_dart_financial_facts(
+        bronze_root=tmp_path / "bronze",
+        silver_root=tmp_path / "silver",
+        artifact_root=tmp_path / "artifacts",
+        decision_time=decision_time,
+        calendar=_covering_calendar(),
+    )
+
+    content = json.loads(
+        (tmp_path / "silver" / "financial_facts" / artifact.output_hash / "content_manifest.json").read_text(encoding="utf-8")
+    )
+    assert content["quarantined_filings"] == 1
+    assert content["trusted_source_kinds"] == ["legacy_document_verified", "opendart_standard"]
+
+
+def test_refresh_quarantine_deterministic_and_idempotent(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    from src.data.incremental_normalization import refresh_dart_financial_facts
+
+    decision_time = datetime(2016, 12, 30, tzinfo=UTC)
+    _write_fact_receipt(tmp_path / "bronze", "std", _standard_receipt_payload(filing_id="F1", published="2015-11-16T00:00:00+00:00"))
+    _write_fact_receipt(tmp_path / "bronze", "leg", _legacy_receipt_payload(filing_id="F2", published="2015-11-16T00:00:00+00:00"))
+    kwargs = {
+        "bronze_root": tmp_path / "bronze",
+        "silver_root": tmp_path / "silver",
+        "artifact_root": tmp_path / "artifacts",
+        "decision_time": decision_time,
+        "calendar": _covering_calendar(),
+    }
+    first = refresh_dart_financial_facts(**kwargs)
+    before = (tmp_path / "artifacts" / f"dart_fact_quarantine_{first.output_hash}.json").read_bytes()
+    second = refresh_dart_financial_facts(**kwargs)
+    after = (tmp_path / "artifacts" / f"dart_fact_quarantine_{second.output_hash}.json").read_bytes()
+
+    assert second.output_hash == first.output_hash
+    assert before == after
+    assert len([p for p in (tmp_path / "silver" / "financial_facts").iterdir() if p.is_dir()]) == 1
+
+
+def test_refresh_duplicate_legacy_receipts_collapse_to_later(tmp_path) -> None:
+    import json
+    from datetime import UTC, datetime
+
+    from src.core.time import SessionCalendar
+    from src.data.incremental_normalization import refresh_dart_financial_facts
+
+    decision_time = datetime(2016, 12, 30, tzinfo=UTC)
+    calendar = SessionCalendar((datetime(2015, 11, 17, tzinfo=UTC), datetime(2015, 11, 18, tzinfo=UTC)))
+    _write_fact_receipt(tmp_path / "bronze", "std", _standard_receipt_payload(filing_id="F1", published="2015-11-16T00:00:00+00:00"))
+    _write_fact_receipt(tmp_path / "bronze", "leg-old", _legacy_receipt_payload(filing_id="F9", published="2015-11-16T00:00:00+00:00"))
+    _write_fact_receipt(
+        tmp_path / "bronze",
+        "leg-new",
+        _legacy_receipt_payload(filing_id="F9", published="2015-11-17T00:00:00+00:00"),
+        retrieved="2016-02-01T00:00:00+00:00",
+    )
+
+    artifact = refresh_dart_financial_facts(
+        bronze_root=tmp_path / "bronze",
+        silver_root=tmp_path / "silver",
+        artifact_root=tmp_path / "artifacts",
+        decision_time=decision_time,
+        calendar=calendar,
+    )
+
+    quarantine = json.loads((tmp_path / "artifacts" / f"dart_fact_quarantine_{artifact.output_hash}.json").read_text(encoding="utf-8"))
+    assert [entry["filing_id"] for entry in quarantine] == ["F9"]
+    assert quarantine[0]["available_at"] == "2015-11-18T00:00:00+00:00"
+
+
+def test_refresh_all_untrusted_input_refused(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    import pytest
+
+    from src.data.incremental_normalization import refresh_dart_financial_facts
+    from src.data.schemas import PITDataError
+
+    decision_time = datetime(2016, 12, 30, tzinfo=UTC)
+    _write_fact_receipt(tmp_path / "bronze", "leg", _legacy_receipt_payload(filing_id="F2", published="2015-11-16T00:00:00+00:00"))
+
+    with pytest.raises(PITDataError, match="certification blocked"):
+        refresh_dart_financial_facts(
+            bronze_root=tmp_path / "bronze",
+            silver_root=tmp_path / "silver",
+            artifact_root=tmp_path / "artifacts",
+            decision_time=decision_time,
+            calendar=_covering_calendar(),
+        )
+    assert not (tmp_path / "silver" / "financial_facts").exists()
+
+
+def test_refresh_output_hash_independent_of_quarantine(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    from src.data.incremental_normalization import refresh_dart_financial_facts
+
+    decision_time = datetime(2016, 12, 30, tzinfo=UTC)
+    only = tmp_path / "only"
+    extra = tmp_path / "extra"
+    _write_fact_receipt(only / "bronze", "std", _standard_receipt_payload(filing_id="F1", published="2015-11-16T00:00:00+00:00"))
+    _write_fact_receipt(extra / "bronze", "std", _standard_receipt_payload(filing_id="F1", published="2015-11-16T00:00:00+00:00"))
+    _write_fact_receipt(extra / "bronze", "leg", _legacy_receipt_payload(filing_id="F2", published="2015-11-16T00:00:00+00:00"))
+
+    base = refresh_dart_financial_facts(
+        bronze_root=only / "bronze",
+        silver_root=only / "silver",
+        artifact_root=only / "artifacts",
+        decision_time=decision_time,
+        calendar=_covering_calendar(),
+    )
+    extended = refresh_dart_financial_facts(
+        bronze_root=extra / "bronze",
+        silver_root=extra / "silver",
+        artifact_root=extra / "artifacts",
+        decision_time=decision_time,
+        calendar=_covering_calendar(),
+    )
+
+    assert extended.output_hash == base.output_hash
+    assert extended.quarantined_filings == 1
+
+
+def test_refresh_does_not_quarantine_a_filing_that_also_has_trusted_rows(tmp_path) -> None:
+    import json
+    from datetime import UTC, datetime
+
+    from src.data.incremental_normalization import refresh_dart_financial_facts
+
+    decision_time = datetime(2016, 12, 30, tzinfo=UTC)
+    published = "2015-11-16T00:00:00+00:00"
+    _write_fact_receipt(tmp_path / "bronze", "old-legacy", _legacy_receipt_payload(filing_id="F1", published=published), retrieved="2016-01-01T00:00:00+00:00")
+    _write_fact_receipt(tmp_path / "bronze", "new-standard", _standard_receipt_payload(filing_id="F1", published=published), retrieved="2016-02-01T00:00:00+00:00")
+    _write_fact_receipt(tmp_path / "bronze", "other-legacy", _legacy_receipt_payload(filing_id="F2", published=published), retrieved="2016-01-01T00:00:00+00:00")
+
+    artifact = refresh_dart_financial_facts(
+        bronze_root=tmp_path / "bronze",
+        silver_root=tmp_path / "silver",
+        artifact_root=tmp_path / "artifacts",
+        decision_time=decision_time,
+        calendar=_covering_calendar(),
+    )
+
+    quarantine = json.loads((tmp_path / "artifacts" / f"dart_fact_quarantine_{artifact.output_hash}.json").read_text(encoding="utf-8"))
+    assert [entry["filing_id"] for entry in quarantine] == ["F2"]
+    assert artifact.quarantined_filings == 1
