@@ -403,5 +403,11 @@
   },
   "src/data/investor_flow_silver.py": {
     "testing": "tests/unit/data/test_investor_flow_silver.py"
+  },
+  "src/backtest/engine.py": {
+    "testing": "tests/unit/backtest"
+  },
+  "src/data/dividend_events.py": {
+    "testing": "tests/unit/data/test_dividend_events.py"
   }
 }
