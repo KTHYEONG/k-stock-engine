@@ -62,3 +62,23 @@ def test_remaining_daily_attempts_sums_all_provider_endpoints(tmp_path) -> None:
     limited.record_attempt(provider="OpenDART", endpoint="list.json", now=moment, daily_limit=1)
     with pytest.raises(ProviderQuotaBlocked, match="daily quota"):
         limited.acquire(provider="OpenDART", endpoint="fnlttSinglAcntAll.json", now=moment, daily_limit=1)
+
+
+def test_add_attempts_folds_remote_usage_into_the_kst_day(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    import pytest
+
+    from src.integrations.quota import ProviderQuotaStateStore
+
+    store = ProviderQuotaStateStore(tmp_path)
+    now = datetime(2026, 9, 24, 3, tzinfo=UTC)
+    store.record_attempt(provider="P", endpoint="e", now=now)
+    store.add_attempts(provider="P", endpoint="e", day="2026-09-24", count=40)
+    store.add_attempts(provider="P", endpoint="e", day="2026-09-24", count=0)
+
+    assert store.remaining_daily_attempts(provider="P", now=now, daily_limit=100) == 59
+    with pytest.raises(ValueError, match="negative"):
+        store.add_attempts(provider="P", endpoint="e", day="2026-09-24", count=-1)
+    with pytest.raises(ValueError, match="Invalid isoformat"):
+        store.add_attempts(provider="P", endpoint="e", day="not-a-date", count=1)

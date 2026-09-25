@@ -5,19 +5,13 @@ from src.data.collection import collect_planned_investor_flow
 from src.data.collection_checkpoint import CollectionCheckpointStore
 from src.data.collection_plan import CollectionChunk, HistoricalCollectionPlan
 from src.integrations.ls.investor_flow import LsInvestorFlowCollector
+from tests.ls_flow_fixtures import ls_investor_row
 
 
 def test_collect_planned_investor_flow_with_ls_collector(tmp_path: Path) -> None:
     class MockLsClient:
         def inquire_investor_trend(self, symbol: str, start_date: date, end_date: date, unit: str = "amount"):
-            return (
-                {
-                    "date": "20260306",
-                    "tjj0008": "100",
-                    "tjj0009": "200",
-                    "tjj0018": "-300",
-                },
-            )
+            return (ls_investor_row("20260306"),)
 
     plan = HistoricalCollectionPlan(
         plan_id="test_plan",
