@@ -116,6 +116,31 @@ class ProviderQuotaStateStore:
             state[key] = entry
             self._save(state)
 
+    def add_attempts(self, *, provider: str, endpoint: str, day: str, count: int) -> None:
+        """Fold ``count`` requests made elsewhere (another host using the same key) into one KST day.
+
+        Quota is per key, so requests a remote worker sent must be visible to this ledger
+        or its headroom would overstate what is left. No limit check: the calls already happened.
+
+        Raises:
+            ValueError: ``count`` is negative or ``day`` is not an ISO date.
+        """
+        if count < 0:
+            raise ValueError("count must not be negative")
+        datetime.fromisoformat(day)
+        if count == 0:
+            return
+        with self._lock:
+            state = self._load()
+            key = self._key(provider=provider, endpoint=endpoint)
+            entry = state.get(key, {})
+            entry["attempted_requests"] = int(entry.get("attempted_requests", 0)) + count
+            same_day = entry.get("daily_attempt_day") == day
+            entry["daily_attempt_day"] = day
+            entry["daily_attempted_requests"] = (int(entry.get("daily_attempted_requests", 0)) if same_day else 0) + count
+            state[key] = entry
+            self._save(state)
+
     def record_rate_limit(self, *, provider: str, endpoint: str, now: datetime, retry_after: float | None) -> ProviderQuotaState:
         blocked_until = (now + timedelta(seconds=float(retry_after))) if retry_after is not None else _next_kst_midnight_utc(now)
         with self._lock:

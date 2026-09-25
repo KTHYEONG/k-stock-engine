@@ -30,6 +30,7 @@ from src.data.collection_plan import (
     build_historical_collection_plan_from_bronze,
 )
 from src.data.schemas import EvidenceKind, PITDataError
+from tests.ls_flow_fixtures import ls_share_record
 
 
 def test_flow_validation_and_classification_contracts(tmp_path: Path) -> None:
@@ -42,18 +43,12 @@ def test_flow_validation_and_classification_contracts(tmp_path: Path) -> None:
             {
                 "provider": "ls",
                 "records": [
-                    {
-                        "ticker": "005930",
-                        "session": "20260306",
-                        "foreign_net_value": "1",
-                        "institution_net_value": "2",
-                        "retail_net_value": "-3",
-                    },
+                    ls_share_record("005930", "20260306", foreign=1),
                     {"ticker": "005931", "session": "20260306"},
                 ],
             },
         ),
-    )["2026-03-06"]["foreign_net_value"] == 1.0
+    )["2026-03-06"]["foreign_net_shares"] == 1.0
     with pytest.raises(PITDataError):
         _validate_flow_pages(
             chunk_symbol="005930",
@@ -61,20 +56,8 @@ def test_flow_validation_and_classification_contracts(tmp_path: Path) -> None:
             pages=(
                 {
                     "records": [
-                        {
-                            "ticker": "005930",
-                            "session": "20260306",
-                            "foreign_net_value": "1",
-                            "institution_net_value": "2",
-                            "retail_net_value": "-3",
-                        },
-                        {
-                            "ticker": "005930",
-                            "session": "20260306",
-                            "foreign_net_value": "9",
-                            "institution_net_value": "2",
-                            "retail_net_value": "-3",
-                        },
+                        ls_share_record("005930", "20260306", foreign=1),
+                        ls_share_record("005930", "20260306", foreign=9),
                     ]
                 },
             ),
@@ -463,13 +446,7 @@ def test_planned_flow_records_provider_error_and_partial_response(tmp_path: Path
             return (
                 {
                     "records": [
-                        {
-                            "ticker": "005930",
-                            "session": "20260306",
-                            "foreign_net_value": "1",
-                            "institution_net_value": "2",
-                            "retail_net_value": "-3",
-                        }
+                        ls_share_record("005930", "20260306", foreign=1)
                     ]
                 },
             )

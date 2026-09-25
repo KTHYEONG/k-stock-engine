@@ -19,5 +19,15 @@ industry_enabled = true
 dart_daily_budget = 16000
 dart_batch_identities = 500
 dart_daily_reserve = 400
-dart_request_min_interval_seconds = 1.0
-dart_max_workers = 1
+# 기본 키(OPENDART_API_KEY)는 OR-VPS k-closing-alpha와 공유하므로 예산·예비분을 보수적으로 둔다.
+# 실측: 지속 15 rps까지 오류가 없었으나 30 rps에서 공인 IP 단위로 연결이 차단(연결 종료)되었다.
+# 안전 마진을 크게 두어 모든 키를 5 rps로 운용한다(남은 약 16,000회 기준 약 53분).
+dart_request_min_interval_seconds = 0.2
+dart_max_workers = 2
+
+# 다른 프로젝트와 공유하지 않는 키: 자체 원장. 차단은 IP 단위라 키가 달라도 같은 속도 한계를 공유한다.
+[collection.dart_extra_keys.OPENDART_API_KEY_2]
+daily_budget = 19500
+daily_reserve = 500
+min_interval_seconds = 0.2
+max_workers = 2

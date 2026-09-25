@@ -1,6 +1,7 @@
 """OpenDART transport-only client."""
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import threading
@@ -79,6 +80,21 @@ BLOCKED_DART_STATUS = "020"
 RETRYABLE_DART_STATUSES = frozenset({"800", "900"})
 
 _PROVIDER = "OpenDART"
+_PING_CORP_CODE = "00126380"  # 삼성전자: 상시 존재하는 기업으로 연결·키 유효성 확인에만 쓴다
+
+
+def dart_quota_provider(api_key: str | None) -> str:
+    """Return the quota-ledger provider name that meters one OpenDART key.
+
+    OpenDART limits are per key, so each key needs its own ledger. The primary
+    key keeps the historical name so its recorded usage and the reserve kept
+    for other projects sharing it stay valid; any other key is metered under a
+    name derived from a hash prefix (the secret itself is never stored).
+    """
+    primary = os.getenv("OPENDART_API_KEY")
+    if not api_key or api_key == primary:
+        return _PROVIDER
+    return f"{_PROVIDER}#{hashlib.sha256(api_key.encode('utf-8')).hexdigest()[:8]}"
 _MAX_HTTP_ATTEMPTS: Final = 3
 # OpenDART는 raw 연결 리셋에 대한 공식 신호를 제공하지 않으므로(문서화된 020/429 계열 코드와 달리),
 # 실제 근거가 확보될 때까지 보수적인 고정 쿨다운을 적용한다.
@@ -120,6 +136,7 @@ class DartApiClient:
             "Accept": "application/json, text/plain, */*",
         })
         self._quota_store = quota_store
+        self._provider = dart_quota_provider(self.api_key)
         if daily_request_limit is not None and (isinstance(daily_request_limit, bool) or int(daily_request_limit) < 1):
             raise ValueError("daily_request_limit must be a positive integer")
         self._daily_request_limit = int(daily_request_limit) if daily_request_limit is not None else _SAFE_DAILY_REQUEST_LIMIT
@@ -170,7 +187,7 @@ class DartApiClient:
         self._pace()
         if self._quota_store is not None:
             self._quota_store.record_attempt(
-                provider=_PROVIDER, endpoint=endpoint, now=self._now(), daily_limit=self._daily_request_limit
+                provider=self._provider, endpoint=endpoint, now=self._now(), daily_limit=self._daily_request_limit
             )
         try:
             response = self._session.get(f"{self.BASE_URL}/{endpoint}", params=query, timeout=30)
@@ -181,6 +198,10 @@ class DartApiClient:
                 raise DartRetryableError(f"DART HTTP {response.status_code} for {endpoint}")
             raise DartTerminalError(f"DART HTTP {response.status_code} for {endpoint}")
         return response
+
+    def ping(self) -> None:
+        """Send one ledgered ``company.json`` request; raises if the host cannot reach OpenDART."""
+        self._request_validated("company.json", {"corp_code": _PING_CORP_CODE})
 
     def _request_once(self, endpoint: str, params: Mapping[str, str]) -> dict[str, Any]:
         response = self._http_get(endpoint, params)
@@ -197,7 +218,7 @@ class DartApiClient:
             if attempt + 1 >= _MAX_HTTP_ATTEMPTS:
                 if self._quota_store is not None:
                     self._quota_store.record_rate_limit(
-                        provider=_PROVIDER,
+                        provider=self._provider,
                         endpoint=endpoint,
                         now=self._now(),
                         retry_after=_CONNECTION_FAILURE_COOLDOWN_SECONDS,
@@ -218,7 +239,7 @@ class DartApiClient:
         if status == BLOCKED_DART_STATUS:
             if self._quota_store is not None:
                 self._quota_store.record_rate_limit(
-                    provider=_PROVIDER, endpoint=endpoint, now=self._now(), retry_after=None
+                    provider=self._provider, endpoint=endpoint, now=self._now(), retry_after=None
                 )
             raise DartQuotaExhaustedError(f"DART status {status}: {payload}")
         if status in RETRYABLE_DART_STATUSES:
@@ -244,7 +265,7 @@ class DartApiClient:
             return payload
         if self._quota_store is not None:
             self._quota_store.acquire(
-                provider=_PROVIDER, endpoint=endpoint, now=self._now(), daily_limit=self._daily_request_limit
+                provider=self._provider, endpoint=endpoint, now=self._now(), daily_limit=self._daily_request_limit
             )
         for attempt in range(_MAX_HTTP_ATTEMPTS):
             try:
@@ -261,7 +282,7 @@ class DartApiClient:
             request_params["crtfc_key"] = str(self.api_key)
         if self._quota_store is not None:
             self._quota_store.acquire(
-                provider=_PROVIDER, endpoint=endpoint, now=self._now(), daily_limit=self._daily_request_limit
+                provider=self._provider, endpoint=endpoint, now=self._now(), daily_limit=self._daily_request_limit
             )
         for attempt in range(_MAX_HTTP_ATTEMPTS):
             try:
@@ -402,7 +423,7 @@ class DartApiClient:
             return raw
         if self._quota_store is not None:
             self._quota_store.acquire(
-                provider=_PROVIDER, endpoint="document.xml", now=self._now(), daily_limit=self._daily_request_limit
+                provider=self._provider, endpoint="document.xml", now=self._now(), daily_limit=self._daily_request_limit
             )
         for attempt in range(_MAX_HTTP_ATTEMPTS):
             try:
@@ -513,7 +534,7 @@ class DartApiClient:
                 raise ValueError("api_key is required for corpCode")
             if self._quota_store is not None:
                 self._quota_store.acquire(
-                    provider=_PROVIDER, endpoint="corpCode.xml", now=self._now(), daily_limit=self._daily_request_limit
+                    provider=self._provider, endpoint="corpCode.xml", now=self._now(), daily_limit=self._daily_request_limit
                 )
             response = self._http_get("corpCode.xml", {"crtfc_key": str(self.api_key)})
             raw = response.content
