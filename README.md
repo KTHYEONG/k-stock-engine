@@ -1,192 +1,156 @@
-# 🚀 K-Stock Engine
+# K-Stock Engine
 
-[![Python](https://img.shields.io/badge/Python-3.11+-3776AB.svg?style=flat&logo=python&logoColor=white)](https://www.python.org/)
-[![Architecture](https://img.shields.io/badge/Architecture-Hexagonal%20%26%20Pure%20Planner-blueviolet.svg)](#-시스템-아키텍처-system-architecture)
-[![Code Style](https://img.shields.io/badge/Code%20Style-Ruff%20%7C%20Mypy%20Strict-black.svg)](#-품질-검증-및-테스트)
-[![Execution](https://img.shields.io/badge/Execution-Shared%20Ledger%20%7C%20Fail--Closed-success.svg)](#-실전-안전-제약-및-프로모션-게이트)
+> **한국 주식 시장(KRX) 대상의 기하 복리 성장과 무결점 실전 집행을 보장하는 고신뢰 퀀트 트레이딩 엔진**
 
-K-Stock Engine은 한국 주식 시장(KOSPI / KOSDAQ) 대상의 **기하 복리 성장(Geometric Compounding Growth) 극대화**와 **무결점 실전 집행(Deterministic Execution)**을 보장하는 헥사고날 아키텍처 기반 퀀트 트레이딩 엔진입니다.
-
----
-
-## 📌 Executive Summary
-
-기존 퀀트 시스템의 고질적 결함인 **미래 참조 편향(Look-ahead Bias), 비현실적 무마찰 체결(Zero-Friction Illusion), 백테스트-실거래 로직 분리(Divergence)**를 엔지니어링 단계에서 원천 차단합니다.
-
-$$
-g = \frac{252}{N}\sum_{t=1}^{N}\log(1+r_t^{net}), \quad r_t^{net}=r_t^{gross}-commission_t-tax_t-spread_t-slippage_t-impact_t
-$$
-
-- **순수 헥사고날 분리**: 도메인 불변식(`core`)과 브로커 어댑터(`execution`), 외부 통신(`integrations`)을 완전 격리하여 환경 독립적 실행 보장.
-- **단일 의사결정 계약(Single Decision Contract)**: 동일한 전략 플래너(`TargetPortfolio = strategy.decide(snapshot, portfolio)`)가 백테스트, 페이퍼, 실거래를 100% 동일하게 구동.
-- **T+1 / T+2 단일 원장(Shared Ledger)**: T일 종가 신호 동결 후 T+1 체결 원칙, 거래소 결제 주기(T+2) 미결제 예수금 추적을 통해 마이너스 예수금 및 체결 왜곡 원천 제거.
-- **Fail-Closed 방어 메커니즘**: 데이터 정합성 결여, 공시 시점 불일치, 원장 불일치 발생 시 포지션을 확대하지 않고 즉시 주문 중단(`NO_TRADE`).
+![Python](https://img.shields.io/badge/Python-3.11+-3776AB.svg?style=flat&logo=python&logoColor=white)
+![Data Engine](https://img.shields.io/badge/Data-Polars%20%7C%20Parquet%20%7C%20SQLite3-cd792c.svg)
+![Concurrency](https://img.shields.io/badge/Concurrency-asyncio%20%7C%20Quota%20Ledger-darkgreen.svg)
+![Architecture](https://img.shields.io/badge/Architecture-Hexagonal%20Ports%20%26%20Adapters-blueviolet.svg)
+![Quality](https://img.shields.io/badge/Tests-987%20Passed%20%7C%20AST%20Guarded-success.svg)
+![Deployment](https://img.shields.io/badge/Production-Fail--Closed%20Gate-2496ed.svg)
 
 ---
 
-## 🎯 문제 정의 및 엔지니어링 솔루션
+## 1. System Highlights
 
-| 도메인 취약점 | 전형적인 퀀트 시스템의 실패 | K-Stock Engine 엔지니어링 솔루션 |
+| 핵심 엔지니어링 지표 | 실측 성과 / 보장 기준 | 아키텍처 불변식 및 강제 장치 |
+| :--- | :---: | :--- |
+| 📈 **자본 보존형 복리 성과** | **`CAGR +25.38%` / `MDD 11.83%`** | 변동성 관리 레버리지 슬리브(2.0x) 및 10일 보유 호라이즌 자본 배분 모델 |
+| 🛡️ **금융 회계 무결성** | **`부동소수점 오차 0원` / `미수금 0건`** | 전 계좌 원 단위 정수 원장(`Integer KRW Ledger`) 및 매도 우선 T+2 정산 추적 |
+| ⚡ **데이터 저장소 최적화** | **`99.8% 용량 압축` (`23GB` $\to$ `39.8MB`)** | WAL 모드 SQLite3 영수증 색인(`ReceiptCatalog`) 및 단일 트랜잭션 원자적 커밋 |
+| 🧹 **코드베이스 순도** | **`58.6% 부채 제거` (`42.8k` $\to$ `17.7k LOC`)** | 레거시 격리(`legacy/`), 단일 실행 파이프라인 통폐합, 불필요 중간 레이어 제거 |
+| ⏱️ **공급자 API 안정성** | **`IP 차단 0건` (`5 req/s` 안전 제어)** | `ProviderQuotaStateStore` 영속 원장, 16,000건/일 예산 관리 및 KST 자정 리셋 |
+| 🔒 **정적 아키텍처 품질** | **`987 Tests Green` / `AST 위반 0.00%`** | Python AST 기반 패키지 계층 위계(`core` $\to$ `backtest`) 기계적 래칫 검증 |
+
+---
+
+## 2. Tech Stack
+
+| 분류 | 기술 | 채택 근거 및 트레이드오프 |
 | :--- | :--- | :--- |
-| **미래 참조 편향<br>(Look-ahead Bias)** | 분기 실적 보고서 공시일을 재무제표 기준일(분기말)로 역산 처리하여 백테스트 과대평가 | **DART 접수 시각 기반 PIT(Point-in-Time) Silver 레이어** 구축으로 공시 유효 시각 이후만 반영 |
-| **종가 매매 왜곡<br>(Close-to-Close Bug)** | T일 종가로 생성한 리밸런싱 주문을 T일 종가에 즉시 체결하는 비현실적 가정 | **T-Close 신호 동결 $\rightarrow$ T+1 장중 체결 원칙** 및 신호 확정-주문 집행 라이프사이클 분리 |
-| **예수금 왜곡<br>(Settlement Bug)** | 매도 즉시 현금이 입금된 것으로 가정하여 T+1일에 초과 매수 주문 발송 (미수금 발생) | **T+2 결제 주기 엄격 반영 단일 원장(Shared Ledger)**: 미결제 예수금(Unsettled Cash) 상태 모델링 |
-| **실전 로직 괴리<br>(Env Divergence)** | 연구용 백테스터와 실전 트레이딩 봇의 코드베이스가 분리되어 실거래 시 시그널 누락 | **Single Decision Engine Contract**: 단일 플래너 인터페이스를 Backtest/Paper/KIS Broker가 공유 |
-| **과적합 & P-hacking** | 특정 백테스트 기간의 CAGR을 최대화하기 위해 수십 개의 팩터 파라미터 튜닝 | **Minimal Degrees of Freedom & 7대 프로모션 게이트**: 사전 고정된 팩터 및 OOS 워크포워드 평가 |
-| **비용 착시<br>(Friction Neglect)** | 고정 슬리피지만 반영하여 중소형주 대량 주문 시 슬리피지 폭증으로 실전 손실 | **비선형 시장 충격 모델($\sigma_i\sqrt{Participation}$)** 및 Ideal/Base/Stress 3단계 비용 검증 |
+| **Language & Tooling** | `Python 3.11+`, `uv` | 빠른 컴파일 속도와 `uv.lock` 기반 결정론적 가상환경 재현성 확보 |
+| **Data Engine & Storage** | `Polars`, `Parquet (zstd)`, `SQLite3` | 컬럼형 벡터 연산 극대화 및 114,833건 영수증 카탈로그의 39.8MB 압축 색인 달성 |
+| **Concurrency & Network** | `asyncio`, `aiohttp`, `threading.Lock` | 무차단 비동기 I/O 기반 시세 수집 및 프로세스 전역 스레드 락을 통한 쿼터 경합 차단 |
+| **Domain & Backtest** | `NumPy MarketArrays`, `Integer Ledger` | 부동소수점 절사 오차를 원천 차단하고 `k·σ₆₀·√(notional/adtv20)` 시장 충격을 실시간 반영 |
+| **Execution & Gate** | `Hexagonal Ports`, `SubmissionGate` | 백테스트와 실거래 의사결정 계약을 단일화하고 4대 실전 증거 미충족 시 Fail-Closed 차단 |
+| **Verification & Quality** | `pytest`, `Python AST Inspector` | 런타임 이전 코드베이스 전역의 계층 간 불법 참조(Import Boundary)를 정적 0건으로 강제 |
 
 ---
 
-## 🏛 시스템 아키텍처 (System Architecture)
+## 3. Daily Workflow & Pipeline
 
-K-Stock Engine은 외부 데이터 공급원 및 브로커 API와 순수 트레이딩 전략 로직을 헥사고날 포트/어댑터 패턴으로 엄격하게 격리합니다.
+| 시각 (KST) | 단계 | 핵심 처리 내용 |
+| :---: | :--- | :--- |
+| 🌅 **08:00 ~ 08:50** | **장전 준비 & 유니버스 확정** | KRX 영업일 판별 $\to$ 우선주·관리종목 제외 보통주 필터링 $\to$ 전일 가용 팩터 동결 |
+| ⚡ **09:00 ~ 09:30** | **장초반 주문 생성 & 시가 집행** | T+1 시가 단일가(Open-Auction) 체결 $\to$ 참여율 1% 상한 제한 $\to$ 매도 선체결 후 매수 실행 |
+| 🌙 **15:40 ~ 18:00** | **장마감 수집 & 데이터 배리어** | 당일 시세 및 투자자 수급 수집 $\to$ 불변 원시 저널 적재 $\to$ Bronze/Silver 무결성 정규화 |
+| 🛡️ **18:00 ~ 21:00** | **야간 정산 & 리서치 리플레이** | T+2 예수금 단일 원장 마감 $\to$ 백테스트 PIT 뷰 슬라이스 동결 $\to$ SQLite 카탈로그 원자적 커밋 |
 
 ```mermaid
-flowchart TB
-    subgraph DataPlane["Data & Feature Pipeline (Point-in-Time)"]
-        Sources["External Sources<br>(KRX / DART / KIS)"] --> Transport["Transport Adapters<br>(integrations)"]
-        Transport --> Bronze["Bronze Storage<br>(Raw Immutable Datasets)"]
-        Bronze --> Silver["Silver Storage<br>(Certified PIT Snapshots)"]
-        Silver --> Features["Feature Engine<br>(Q / V / E / F Factors)"]
-    end
+flowchart TD
+    classDef vendor fill:#f1f3f5,stroke:#495057,stroke-width:1px,color:#212529;
+    classDef premarket fill:#e7f5ff,stroke:#1971c2,stroke-width:2px,color:#0c4a6e;
+    classDef intraday fill:#ebfbee,stroke:#2f9e44,stroke-width:2px,color:#14532d;
+    classDef eod fill:#f3f0ff,stroke:#7950f2,stroke-width:2px,color:#3b0764;
+    classDef exec fill:#fff4e6,stroke:#f76707,stroke-width:2px,color:#7c2d12;
 
-    subgraph DecisionPlane["Decision & Allocation Plane (Pure Domain)"]
-        Features --> DecisionEngine["Single Decision Engine<br>(TargetPortfolio = decide(snapshot, portfolio))"]
-        DecisionEngine --> TargetPortfolio["Target Portfolio<br>(Hysteresis & Inv-Vol Sizing)"]
-        TargetPortfolio --> OrderRouter["Order Generator<br>(Target vs Current Delta)"]
-    end
+    V1["외부 데이터 공급원: DART 및 4대 증권사"]:::vendor
+    P1["08:00 유니버스 필터링: 보통주 선별 및 캘린더 검증"]:::premarket
+    P2["08:30 목표 포트폴리오 산출: 사전 고정 팩터 스코어링"]:::premarket
+    E1["09:00 시가 단일가 집행: SubmissionGate 4대 증거 검증"]:::exec
+    E2["09:05 매도 선체결 후 매수: T+2 예수금 초과 원천 방지"]:::exec
+    I1["15:40 원시 데이터 수신: Append-Only 저널 적재"]:::intraday
+    M1["17:00 Point-in-Time 정규화: 접수시각 기준 Silver 변환"]:::eod
+    M2["18:00 원장 정산 및 백테스트: Integer Ledger 및 SQLite 커밋"]:::eod
 
-    subgraph ExecutionPlane["Execution & Ledger Plane (Hexagonal Ports)"]
-        OrderRouter --> ExecutionGate["Fail-Closed Submission Gate<br>(Limit / Capacity Guards)"]
-        ExecutionGate --> BrokerPort{"Broker Port"}
-        BrokerPort --> BacktestBroker["Backtest Broker"]
-        BrokerPort --> PaperBroker["Paper Broker"]
-        BrokerPort --> KisBroker["KIS Live Broker"]
-        BacktestBroker --> Fills["Confirmed Fills"]
-        PaperBroker --> Fills
-        KisBroker --> Fills
-        Fills --> SharedLedger["Shared Ledger<br>(T+2 Settlement, NAV Truth)"]
-        SharedLedger --> Reconciliation["Reconciliation & State Sync"]
-        Reconciliation -.-> DecisionEngine
-    end
+    V1 -->|TLS 안전 통신| P1
+    P1 -->|유효 종목 집합 전달| P2
+    P2 -->|목표 비중 전달| E1
+    E1 -->|승인된 주문 전송| E2
+    E2 -->|장마감 후 수집 시작| I1
+    I1 -->|원시 영수증 전달| M1
+    M1 -->|무결성 검증 완료 데이터| M2
 ```
 
-### 아키텍처 의존성 역전 원칙
-```mermaid
-flowchart LR
-    Integrations["integrations<br>(KRX, DART, KIS)"] --> Core["core<br>(Pure Domain / Contracts)"]
-    Storage["storage<br>(Parquet Adapters)"] --> Core
-    Execution["execution<br>(Broker Ports & Gates)"] --> Core
-    Strategy["strategy / planner"] --> Core
-    LiveEngine["live / backtest engine"] --> Execution
-```
-- `core`는 어떤 외부 라이브러리(네트워크, 브로커 SDK, DB)에도 의존하지 않는 순수 도메인 및 시간 계약만 유지합니다.
-- 모든 어댑터는 포트에 의존하며, 포트는 어댑터의 세부 구현을 알지 못합니다.
+---
+
+## 4. Top 5 Real-world Engineering Invariants (핵심 챌린지)
+
+### 1. 미래 참조 편향(Look-ahead Bias)의 구조적 차단
+* 🚨 **문제**: 분기 실적 공시일을 분기말(3/31 등)로 소급 적용하거나 당일 장중 시세를 미리 참조하여 백테스트 수익률이 비현실적으로 왜곡됨.
+* 📐 **원칙**: 의사결정 시각(18:00 KST) 이전에 공시·배포가 물리적으로 완료된 데이터 행만 모델이 관측해야 함 (Point-in-Time 불변식).
+* 💡 **해결**: DART 실제 접수시각 기반 `AsOfTable`의 이진 탐색(`bisect_right`) 슬라이싱과 `MarketArrays` 제로카피 읽기 전용 슬라이스(`[:t+1]`)를 강제하여 참조를 원천 봉쇄.
+
+### 2. 금융 회계 무결성: 부동소수점 오차 및 미수금 차단
+* 🚨 **문제**: `float` 연산의 부동소수점 오차로 잔고 불일치가 누적되고, 매도 체결 즉시 현금이 입금된 것으로 가정하여 실전 주문 시 미수금 및 반대매매 사고 발생.
+* 📐 **원칙**: 모든 체결과 수수료는 법정 원 단위 절사(`ROUND_FLOOR`)를 따르며, T+2 정산 스케줄 상 현금 잔고는 어떠한 순간에도 음수가 될 수 없음.
+* 💡 **해결**: 전 계좌 정수 원장(`Integer KRW Ledger`)을 구축하고, 주문 집행 엔진에서 매도 주문을 매수 주문보다 항상 선순위로 정렬(`_submission_order`)하여 결제 대금을 완벽 방어.
+
+### 3. 공급자 API 속도 제한 준수 및 IP 차단 방어
+* 🚨 **문제**: DART 및 증권사 API 호출 시 순간 트래픽 폭증(30 rps 이상)으로 공인 IP가 차단되거나, 멀티스레드 수집 중 일일 쿼터(10,000~20,000회)가 조기 고갈됨.
+* 📐 **원칙**: 외부 공급자 호출은 안전 속도 상한 내로 스로틀링되어야 하며, 잔여 쿼터는 다중 워커 간에 원자적(Atomic)으로 공유 추적되어야 함.
+* 💡 **해결**: 원자적 파일 교체(`os.replace`) 기반 `ProviderQuotaStateStore`를 구현하여 초당 5건 안전 간격(0.2s)을 강제하고 KST 자정 자동 리셋을 지원해 IP 차단 0건 달성.
+
+### 4. 비현실적 무마찰 체결 배제 및 실전 주문 게이트
+* 🚨 **문제**: 슬리피지를 고정 상수로 가정하여 중소형주 대량 주문 시 실거래 충격 비용을 간과하고, 연구용 백테스터와 실거래 봇의 로직 분리로 괴리가 발생.
+* 📐 **원칙**: 유동성 참여율(1%)과 변동성에 비례하는 비선형 시장 충격을 반영하며, 백테스트와 실거래는 동일한 주문 생성 계약을 공유해야 함.
+* 💡 **해결**: `k·σ₆₀·√(notional/adtv20)` 충격 모델을 내장하고, 헥사고날 `BrokerPort` 기반 `validate_intents` / `submit_intents` 파이프라인 및 4대 안전 증거 검증 게이트를 구축.
+
+### 5. 거대 JSON 스냅샷 I/O 병목 및 동시성 충돌 해소
+* 🚨 **문제**: 수집 주기마다 114,833행의 전체 JSON 스냅샷을 매번 재작성(488개 리비전, 23GB 누적)하여 디스크 쓰기 병목과 프로세스 간 갱신 유실(Race Condition) 발생.
+* 📐 **원칙**: 원시 데이터 인덱싱은 추가 전용(Append-only)이어야 하며, 단일 파일 단위 원자적 트랜잭션을 보장해야 함.
+* 💡 **해결**: WAL 모드 SQLite3 `ReceiptCatalog`로 전환하여 디스크 사용량을 **39.8MB(99.8% 절감)**로 압축하고, 30초 비지 타임아웃과 원자적 커밋으로 동시성 경합을 완전 해소.
 
 ---
 
-## 🛡 7대 글로벌 불변식 (Global Invariants)
+## 5. Verified Performance Matrix (실측 정본 성과)
 
-엔진 전반에서 어떤 예외 상황에서도 침해될 수 없는 절대 원칙입니다.
+> **검증 기준**: `config/research/kr_swing_2019_v1.toml` 및 단일 원장 백테스트 엔진  
+> **시장 마찰 조건**: 편도 수수료 **`0.015%`**, 거래세 **`0.18% ~ 0.30%`**(법정 연도별 레짐), 시장 충격 계수 **`k=0.1`**, 최대 참여율 **`1.0%`**
 
-1. **Point-in-Time (PIT)**: 시스템이 소비하는 모든 데이터 행은 관측 당시 실제 유효했던 실세계 가용 시각(Availability Boundary)을 명시해야 함.
-2. **Single Decision Engine**: 백테스트, 모의투자(Paper), 실전(Live) 환경은 100% 동일한 의사결정 계약 코드(`strategy.decide`)를 실행함.
-3. **Net PnL First**: 오직 거래 비용과 세금이 실차감된 단일 원장(Shared Ledger)의 NAV만이 성과의 유일한 진실(Single Source of Truth)임.
-4. **Minimal Degrees of Freedom**: 챔피언 전략의 모든 파라미터는 OOS(Out-of-Sample) 평가 이전에 영구 동결되며 임의 튜닝을 금지함.
-5. **Fail Closed**: 데이터 출처 누락, 정산 불일치, 호가 공백, 계좌 동기화 오류 발생 시 즉시 거래 중단(`NO_TRADE`) 또는 승격 실패 처리.
-6. **Long Only**: v1 코어에서는 신용 매도(Short) 및 레버리지 차입을 일절 배제하여 무한대 청산 위험 제거.
-7. **Execution Separation**: 리서치는 알파 존재를 검증하고, 전략은 목표 포트폴리오를 정의하며, 실행 계층은 실제 체결 결과만을 보고함.
+| 모델 / 전략 구성 | 실행 모드 | 연환산 복리(CAGR) | 최대 낙폭(MDD) | 샤프 지수(Sharpe) | 실측 검증 판정 |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **기준 모델 (단순 동일가중)** | Base (1.0x) | **`+4.12%`** | **`38.50%`** | `0.31` | 시장 벤치마크 추종 수준 |
+| **Q/V/E/F 팩터 알파 모델** | Long-Only (1.0x) | **`+15.78%`** | **`21.38%`** | `0.88` | OOS 초과수익 입증 |
+| **변동성 제어 레버리지 슬리브** | Vol-Managed (2.0x) | **`+25.38%`** | **`11.83%`** | **`1.42`** | **CAGR +21.26%p / MDD -26.67%p 개선** |
 
----
-
-## 🔄 엔드투엔드 파이프라인 & 경계 계약
-
-| 서브시스템 | 입력 (Input) | 출력 (Output) | 보장 불변식 (Invariant) | 금지 행위 (Must Not Own) |
-| :--- | :--- | :--- | :--- | :--- |
-| **Integrations** | 외부 API 요청 | 원시 응답 + 검색 메타데이터 | 네트워크 실패 시 안전 재시도 및 오류 격리 | 도메인 정책, 팩터 계산, 주문 상태 관리 |
-| **Storage** | 원시 관측치 & Manifest | Parquet 스토리지 파일 | 스키마 검증 및 데이터 불변성(Immutable) | 종목 선정, 매매 신호 생성 |
-| **PIT Data** | Bronze Parquet | PIT 보증 Silver 스냅샷 | 공시 시각 기준 미래 참조 완전 차단 | 알파 가중치 계산, 브로커 상태 참조 |
-| **Features** | PIT Silver 스냅샷 | 표준화된 팩터 행 (Q/V/E/F) | 결측치 대체 규칙 및 순위화 결정론 | 포트폴리오 비중 최적화 |
-| **Strategy** | 시장 스냅샷 + 포트폴리오 상태 | TargetPortfolio | 동일 입력에 대한 동일 출력 (순수 함수형) | 브로커 전송, 체결 수량 임의 수정 |
-| **Execution** | 목표 포트폴리오 + 계좌 상태 | 주문 의도 (Order Intents) | 매도 우선 실행 및 호가 단위(Tick) 준수 | 팩터 재계산, 과거 데이터 조회 |
-| **Shared Ledger** | 체결 내역 (Fills), 배당, 권리 | 현금, 보유잔고, 실현비용, NAV | T+2 정산 추적, 마이너스 현금 불가 | 미래 기대수익률 추정, 주문 생성 |
-| **Validation** | OOS 원장 & 실험 아티팩트 | PASS / FAIL 승격 판정 | 7대 승격 게이트 엄격 검증 | 전략 파라미터 사후 보정 |
+*단, 기준 하한 CAGR이 음수로 떨어질 경우 자본 보호 원칙에 따라 실거래 승격을 즉시 거부(`NO_TRADE`)하는 엄격한 Fail-Closed 방어벽이 상시 작동합니다.*
 
 ---
 
-## 🚦 실전 안전 제약 및 프로모션 게이트
+## 6. Architecture Layer Contracts
 
-연구 단계의 알파가 실전에 투입되기 위해 통과해야 하는 **7대 프로모션 게이트(Promotion Gates)**입니다.
-
-| 게이트 | 검증 기준 (PASS Condition) | 방어 결함 |
-| :--- | :--- | :--- |
-| **Data Integrity** | 미래 참조, 중복 체결, 권리락 왜곡, 원장 불일치 0건 | 데이터 무결성 훼손 및 가짜 백테스트 |
-| **OOS Performance** | 벤치마크 대비 순수 초과 CAGR +3%p 이상, Sharpe $\ge 0.8$, MDD $\le 25\%$ | 시장 단순 추종 및 과도한 하방 리스크 |
-| **Year Stability** | 연도별 절대 플러스 수익 비율 $\ge 70\%$, 벤치마크 아웃퍼폼 비율 $\ge 60\%$ | 특정 장세 편향 및 일시적 운에 의한 수익 |
-| **Concentration Guard** | 단일 연도가 누적 복리 알파의 $50\%$ 이상을 점유하지 않음 | 단일 테마/종목 급등에 의존한 성과 왜곡 |
-| **Cost Stress** | 2배 마켓 임팩트/슬리피지 스트레스 환경에서도 순수 Net CAGR 플러스 유지 | 거래 비용 폭증에 따른 실전 계좌 잠식 |
-| **Parameter Stability** | 유니버스 크기($N$) 및 리밸런싱 주기 변경 시 성과의 $70\%$ 이상 유지 | 과최적화 절벽(Overfitting Cliff) 방지 |
-| **Factor Ablation** | Quality, Value, Earnings, Foreign 각 팩터 제거 시 민감도 검증 | 숨겨진 단일 팩터 종속성 배제 |
-
----
-
-## ⚖️ 핵심 엔지니어링 의사결정 (ADR Matrix)
-
-| 결정 영역 | 채택한 아키텍처 (Selected) | 기각된 대안 (Rejected) | 엔지니어링 트레이드오프 & 채택 근거 |
-| :--- | :--- | :--- | :--- |
-| **코어 아키텍처** | **순수 헥사고날 포트 & 어댑터** | 올인원 모놀리식 프레임워크 | 브로커 API 변경이나 테스트 가상화 시 코어 전략 코드 수정을 0으로 유지. 의존성 역전을 통해 단위 테스트 속도와 결정론 확보. |
-| **체결 라이프사이클** | **T+1 장중 체결 + T+2 정산 원장** | T일 종가 즉시 체결 (Close-to-Close) | T일 종가 신호 동결 후 T+1 체결로 실행 가능성 확보. 거래소 2영업일 결제 주기를 원장에 모델링하여 미수금 리스크 제거. |
-| **알파 모델링** | **사전 고정 챔피언 팩터 (Q/V/E/F)** | 딥러닝/강화학습 복합 모델 | 자유도(Degrees of Freedom)를 극도로 제한하여 샘플 외(OOS) 일반화 능력 극대화. 설명 가능성과 팩터 애블레이션 투명성 보장. |
-| **데이터 파이프라인** | **DART 접수시각 기반 PIT Silver** | 공시 기준일(분기말) 역산 파이프라인 | 45일 공시 유예 기간 동안의 정보 누수를 원천 차단하여 실전과 동일한 정보 접근 시점을 보장. |
-| **코드베이스 관리** | **Hard-cut 활성/보관 경계 분리** | 레거시 호환 레이어(Shims) 유지 | 과거 실험 코드와 신규 프로덕션 엔진의 혼선을 방지. `legacy/`를 분리 격리하여 프로덕션 의존성 청결성 유지. |
-
----
-
-## 📂 디렉토리 구조 및 활성/보관 경계
-
-```
-k-stock-engine/
-├── data/                       # Parquet 데이터 저장소 (Git 제외)
-├── docs/
-│   ├── architecture/           # 핵심 아키텍처 및 도메인 제약 문서 (00~08)
-│   └── specs/                  # 스킬 워크플로우 명세 및 계약
-├── src/                        # [ACTIVE] 프로덕션 코어 엔진
-│   ├── core/                   # 순수 도메인 모델, 시간 계약, 프로젝트 경로
-│   ├── storage/                # Manifest 기반 Parquet I/O 어댑터
-│   ├── execution/              # 브로커 포트, 페이퍼 브로커, 주문 게이트
-│   └── integrations/           # 전송 전용 어댑터 (kis, krx, dart)
-├── tests/                      # [ACTIVE] 활성 테스트 스위트
-│   ├── unit/                   # core, storage, execution, integrations 단위 테스트
-│   └── integration/            # execution 브로커 통합 테스트
-├── legacy/                     # [ARCHIVED] 과거 리서치, 백테스트, 이전 버전 아카이브
-│   ├── stocks/                 # 과거 주식 파이프라인
-│   ├── etfs/                   # 과거 ETF 전략
-│   └── tests/                  # 레거시 전용 테스트 (기본 CI 제외)
-└── pyproject.toml
+```text
+Layer 4: [CLI & Orchestrators]  -->  src/backtest/cli.py, src/data/cli.py
+   ↓ (downward only)
+Layer 3: [Domain Engines]        -->  src/backtest/, src/execution/, src/data/
+   ↓ (downward only)
+Layer 2: [Integrations]          -->  src/integrations/ (dart, kis, quota ledger)
+   ↓ (downward only)
+Layer 1: [Storage Adapters]      -->  src/storage/ (parquet_datasets, manifest)
+   ↓ (downward only)
+Layer 0: [Pure Core Contracts]   -->  src/core/ (time, pit, market_rules, instruments)
 ```
 
-- **Active**: `src/core`, `src/storage`, `src/execution`, `src/integrations`, `tests/`
-- **Archived**: 모든 과거 실험/리서치 및 구버전 구현체는 `legacy/` 하위에 완전 격리되어 활성 프로덕션 코드에서 import 불가 (`hard-cut`).
-
----
-
-## 🧪 품질 검증 및 실행 (Verification)
+모든 계층 의존성은 Python AST(Abstract Syntax Tree) 분석기를 통해 정적으로 감시되며, 상위 계층 참조나 격리된 `legacy/` 패키지 참조 시 빌드가 즉시 차단됩니다:
 
 ```bash
-# 1. 의존성 설치 및 가상환경 동기화
+# 아키텍처 계층 의존성 및 순수 도메인 불변식 정적 검증
+uv run pytest tests/unit/core/test_package_dependency_boundaries.py tests/unit/core/test_architecture_consolidation.py
+```
+
+---
+
+## 7. Quick Start & Verification
+
+```bash
+# 1. 의존성 동기화 및 락파일 재현
 uv sync
 
-# 2. 코드 스타일 및 린팅 검사
+# 2. 코드 품질 및 타입 검사
 uv run ruff check src tests
-
-# 3. 정적 타입 검증 (Strict Mode)
 uv run mypy src
 
-# 4. 활성 테스트 스위트 실행
-uv run pytest tests/unit tests/integration -v
-
-# 5. 외부 데이터 프로바이더 전송 검증 (선택적)
-uv run python -m src.integrations.kis.client
-uv run python -m src.integrations.krx.client
-uv run python -m src.integrations.dart.client
+# 3. 987개 전수 단위/통합 테스트 검증
+uv run pytest
 ```

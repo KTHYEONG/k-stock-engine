@@ -273,7 +273,7 @@
   },
   "src/features/qvef.py": {
     "testing": "tests/unit/features/test_qvef.py",
-    "architecture": "docs/research/data_readiness.md"
+    "architecture": "docs/architecture/system-design.md"
   },
   "src/integrations/dart/client.py": {
     "testing": [
@@ -376,11 +376,11 @@
     "testing": "tests/unit/validation/test_walk_forward.py"
   },
   "src/data/research_scope.py": {
-    "architecture": "docs/research/data_cleanup.md",
+    "architecture": "docs/architecture/system-design.md",
     "testing": "tests/unit/data/test_research_scope.py"
   },
   "src/data/financial_quality.py": {
-    "architecture": "docs/research/data_readiness.md",
+    "architecture": "docs/architecture/system-design.md",
     "testing": "tests/unit/data/test_financial_quality.py"
   },
   "src/data/market_panel.py": {
