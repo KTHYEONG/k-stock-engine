@@ -367,3 +367,134 @@ def test_parse_dividend_decision_rejects_malformed_dates() -> None:
             corp_code="00126380",
             received_on=date(2025, 2, 3),
         )
+
+
+def correction_html() -> str:
+    """A pay-date-confirmed correction: reason row, before/after table, then the restated form body."""
+    return (
+        '<?xml version="1.0" encoding="utf-8"?><document>'
+        "<table>"
+        "<tr><td>3. 정정사유</td><td>배당금지급 예정일자 확정</td></tr>"
+        "<tr><td>정정항목</td><td>정정전</td><td>정정후</td></tr>"
+        "<tr><td>6.배당기준일</td><td>2020-12-31</td><td>2020-12-31</td></tr>"
+        "<tr><td>7.배당금지급 예정일자</td><td>-</td><td>2023.04.10</td></tr>"
+        "</table><table>"
+        "<tr><td>구분</td><td>보통주</td><td>우선주</td></tr>"
+        "<tr><td>주당 배당금(원)</td><td>60</td><td>-</td></tr>"
+        "<tr><td>6. 배당기준일</td><td>2022-12-31</td></tr>"
+        "<tr><td>7. 배당금지급 예정일자</td><td>2023-04-10</td></tr>"
+        "</table></document>"
+    )
+
+
+def test_parse_dividend_decision_correction_uses_restated_body_not_notice_rows() -> None:
+    from src.integrations.dart.dividend_decision import parse_dividend_decision
+
+    decision = parse_dividend_decision(
+        archive_bytes=make_archive({"20230407900364.xml": correction_html()}),
+        rcept_no="20230407900364",
+        corp_code="00126380",
+        received_on=date(2023, 4, 7),
+    )
+
+    assert decision.record_date == date(2022, 12, 31)
+    assert decision.pay_date == date(2023, 4, 10)
+    assert decision.dps_common_krw == 60
+
+
+def test_parse_dividend_decision_reads_scheduled_meeting_date() -> None:
+    from src.integrations.dart.dividend_decision import parse_dividend_decision
+
+    html = (
+        '<?xml version="1.0" encoding="utf-8"?><document><table>'
+        "<tr><td>구분</td><td>보통주</td><td>우선주</td></tr>"
+        "<tr><td>주당 배당금(원)</td><td>50</td><td>-</td></tr>"
+        "<tr><td>6. 배당기준일</td><td>2017-12-31</td></tr>"
+        "<tr><td>7. 배당금지급 예정일자</td><td>-</td></tr>"
+        "<tr><td>9. 주주총회 예정일자</td><td>2018-02-28</td></tr>"
+        "</table></document>"
+    )
+    kwargs = {"rcept_no": "20180226001234", "corp_code": "00126380", "received_on": date(2018, 2, 26)}
+
+    decision = parse_dividend_decision(archive_bytes=make_archive({"a.xml": html}), **kwargs)
+    without_meeting = parse_dividend_decision(
+        archive_bytes=make_archive({"a.xml": html.replace("2018-02-28", "-")}), **kwargs
+    )
+
+    empty_meeting = parse_dividend_decision(
+        archive_bytes=make_archive({"a.xml": html.replace("<td>2018-02-28</td>", "<td></td>")}), **kwargs
+    )
+
+    assert decision.pay_date is None
+    assert decision.agm_date == date(2018, 2, 28)
+    assert without_meeting.agm_date is None
+    assert empty_meeting.agm_date is None
+
+
+def test_parse_dividend_decision_ignores_label_only_notice_rows_in_corrections() -> None:
+    from src.integrations.dart.dividend_decision import parse_dividend_decision
+
+    html = (
+        '<?xml version="1.0" encoding="utf-8"?><document><table>'
+        "<tr><td>3. 정정사유</td><td>본문 배당금지급 예정일자 수정</td></tr>"
+        "<tr><td>배당금지급 예정일자 기입</td></tr>"
+        "<tr><td>배당기준일이 오기재되어 재공시 예정</td></tr>"
+        "<tr><td>구분</td><td>보통주</td><td>우선주</td></tr>"
+        "<tr><td>주당 배당금(원)</td><td>10</td><td>-</td></tr>"
+        "<tr><td>6. 배당기준일</td><td>2022-12-31</td></tr>"
+        "<tr><td>7. 배당금지급 예정일자</td><td>2023-04-21</td></tr>"
+        "</table></document>"
+    )
+
+    decision = parse_dividend_decision(
+        archive_bytes=make_archive({"a.xml": html}),
+        rcept_no="20230421900097", corp_code="00126380", received_on=date(2023, 4, 21),
+    )
+
+    assert decision.record_date == date(2022, 12, 31)
+    assert decision.pay_date == date(2023, 4, 21)
+
+
+def test_parse_dividend_decision_undecided_record_date_is_a_distinct_error() -> None:
+    import pytest
+
+    from src.core.pit import PITDataError
+    from src.integrations.dart.dividend_decision import UndecidedRecordDateError, parse_dividend_decision
+
+    html = (
+        '<?xml version="1.0" encoding="utf-8"?><document><table>'
+        "<tr><td>구분</td><td>보통주</td><td>우선주</td></tr>"
+        "<tr><td>주당 배당금(원)</td><td>7000</td><td>7050</td></tr>"
+        "<tr><td>6. 배당기준일</td><td>-</td></tr>"
+        "<tr><td>7. 배당금지급 예정일자</td><td>-</td></tr>"
+        "</table></document>"
+    )
+    kwargs = {"archive_bytes": make_archive({"a.xml": html}), "rcept_no": "20250206800758",
+              "corp_code": "00126380", "received_on": date(2025, 2, 6)}
+
+    with pytest.raises(UndecidedRecordDateError):
+        parse_dividend_decision(**kwargs)
+    assert issubclass(UndecidedRecordDateError, PITDataError)
+
+
+def test_parse_dividend_decision_reads_dividend_kind() -> None:
+    from src.integrations.dart.dividend_decision import parse_dividend_decision
+
+    html = (
+        '<?xml version="1.0" encoding="utf-8"?><document><table>'
+        "<tr><td>1. 배당구분</td><td>결산배당</td></tr>"
+        "<tr><td>구분</td><td>보통주</td><td>우선주</td></tr>"
+        "<tr><td>주당 배당금(원)</td><td>50</td><td>-</td></tr>"
+        "<tr><td>6. 배당기준일</td><td>2017-12-31</td></tr>"
+        "<tr><td>7. 배당금지급 예정일자</td><td>-</td></tr>"
+        "</table></document>"
+    )
+    kwargs = {"rcept_no": "20180226001234", "corp_code": "00126380", "received_on": date(2018, 2, 26)}
+
+    with_kind = parse_dividend_decision(archive_bytes=make_archive({"a.xml": html}), **kwargs)
+    without_kind = parse_dividend_decision(
+        archive_bytes=make_archive({"a.xml": html.replace("<tr><td>1. 배당구분</td><td>결산배당</td></tr>", "")}), **kwargs
+    )
+
+    assert with_kind.dividend_kind == "결산배당"
+    assert without_kind.dividend_kind is None
