@@ -1,0 +1,6 @@
+# Promotion gate for the one-off legacy recovery run.
+# Thresholds live here so logic modules never carry numeric literals.
+# Raise both together only with fresh benchmark evidence in the report.
+[promotion_gate]
+min_exact_match_rate = 0.95
+min_accepted_filings = 30

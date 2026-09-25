@@ -1637,3 +1637,26 @@ def test_collect_dart_financial_facts_persists_blocked_pages_and_counts_them(tmp
     assert report["blocked"] == 1
     assert report["standardized"] == 2
     assert report["unavailable"] == 1
+
+
+def test_collect_dart_financial_facts_raises_circuit_error_when_breaker_left_no_pages(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    import pytest
+
+    from src.data.collection import collect_dart_financial_facts
+    from src.integrations.dart.xbrl import DartCircuitOpenError
+
+    class _Tripped:
+        aborted = True
+
+        def fetch_financial_fact_sources(self, _identities: object) -> list[dict[str, object]]:
+            return []
+
+    with pytest.raises(DartCircuitOpenError):
+        collect_dart_financial_facts(
+            dart=_Tripped(),
+            identities=({"corp_code": "00126380", "filing_id": "20160516000001", "biz_year": "2016", "reprt_code": "11013"},),
+            bronze_root=tmp_path / "bronze",
+            retrieved_at=datetime(2026, 9, 24, tzinfo=UTC),
+        )

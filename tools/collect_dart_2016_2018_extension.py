@@ -19,6 +19,9 @@ Safety properties:
   every chunk; a chunk is sized for the worst case of three requests per
   identity (CFS, OFS, document archive).
 - The first ``blocked`` page (DART quota exhausted) stops the run immediately.
+- A health check runs before collection, and three consecutive transport failures
+  (connection reset, client cooldown) abort the chunk without persisting the failed
+  identities; failed identities stay pending and are retried by the next run.
 - Catalog revisions are full snapshots; after a run, reclaim old revisions with
   ``compact-storage-generations --apply``.
 """
@@ -26,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -35,6 +39,8 @@ import polars as pl
 from src.data.cli import load_data_runtime
 from src.data.collection import collect_dart_financial_facts
 from src.data.dart_backfill import build_scoped_dart_collector, scoped_dart_request_headroom
+from src.data.research_scope import PRIMARY_DART_KEY_ENV
+from src.integrations.dart.xbrl import DartCircuitOpenError
 from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog
 from src.data.scoped_ingestion import FACT_SOURCE, ScopedBronzeWriter, dart_fact_natural_key
 from src.integrations.dart.client import DartCorpCodeRecord
@@ -127,7 +133,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dry-run", action="store_true", help="resolve and estimate only; makes no API calls")
     parser.add_argument("--max-chunks", type=int, default=None, help="stop after N chunks (pilot)")
+    parser.add_argument(
+        "--key-env", default=PRIMARY_DART_KEY_ENV,
+        help="environment variable of the OpenDART key; budget, reserve, and pacing come from the scope policy of that key",
+    )
     args = parser.parse_args(argv)
+    if not os.environ.get(args.key_env):
+        raise SystemExit(f"{args.key_env} is not set")
 
     runtime = load_data_runtime(
         scope_config=Path("config/research/kr_swing_2019_v1.toml"), data_root=Path("/home/kth/k-stock-engine/data")
@@ -143,10 +155,11 @@ def main(argv: list[str] | None = None) -> int:
     catalog = ReceiptCatalog(bronze_root / "catalog")
     raw_count, key_count, pending = _pending_identities(bronze_root, catalog, mapping)
     quota_store = ProviderQuotaStateStore(runtime.workspace.state_root / "quota")
-    headroom = scoped_dart_request_headroom(runtime=runtime, quota_store=quota_store)
-    daily = runtime.scope.collection.dart_daily_budget - runtime.scope.collection.dart_daily_reserve
+    headroom = scoped_dart_request_headroom(runtime=runtime, quota_store=quota_store, key_env=args.key_env)
+    policy = runtime.scope.collection.dart_key_policy(args.key_env)
+    daily = policy.daily_budget - policy.daily_reserve
     _emit(
-        stage="plan", corp_codes=len(mapping), raw_identities=raw_count, unique_keys=key_count,
+        stage="plan", key_env=args.key_env, corp_codes=len(mapping), raw_identities=raw_count, unique_keys=key_count,
         pending=len(pending), chunk_size=chunk_size, headroom_now=headroom,
         est_requests_min=len(pending), est_requests_max=len(pending) * _WORST_CASE_REQUESTS_PER_IDENTITY,
         est_days_min=round(len(pending) / daily, 2), est_days_max=round(len(pending) * _WORST_CASE_REQUESTS_PER_IDENTITY / daily, 2),
@@ -155,8 +168,13 @@ def main(argv: list[str] | None = None) -> int:
         _emit(stage="done", status="dry_run" if args.dry_run else "complete", pending=len(pending))
         return 0
 
-    dart = build_scoped_dart_collector(runtime=runtime, quota_store=quota_store)
+    dart = build_scoped_dart_collector(runtime=runtime, quota_store=quota_store, key_env=args.key_env)
     writer = ScopedBronzeWriter(runtime=runtime, catalog=catalog)
+    try:
+        dart.health_check()
+    except Exception as exc:  # noqa: BLE001 - any failure means this host cannot collect right now
+        _emit(stage="done", status="provider_unreachable", error=str(exc)[:200], pending_left=len(pending))
+        return 3
     totals = {"standardized": 0, "legacy_document": 0, "unavailable": 0, "extraction_failed": 0}
     done = requests_used = chunks = 0
     status = "complete"
@@ -164,22 +182,26 @@ def main(argv: list[str] | None = None) -> int:
         if args.max_chunks is not None and chunks >= args.max_chunks:
             status = "chunk_limit"
             break
-        headroom = scoped_dart_request_headroom(runtime=runtime, quota_store=quota_store)
+        headroom = scoped_dart_request_headroom(runtime=runtime, quota_store=quota_store, key_env=args.key_env)
         allowance = min(chunk_size, len(pending) - done, headroom // _WORST_CASE_REQUESTS_PER_IDENTITY)
         if allowance < 1:
             status = "budget_exhausted"
             break
         chunk = tuple(pending[done : done + allowance])
         before = headroom
-        artifact = collect_dart_financial_facts(
-            dart=dart, identities=chunk, bronze_root=bronze_root, retrieved_at=datetime.now(UTC), scoped_writer=writer
-        )
+        try:
+            artifact = collect_dart_financial_facts(
+                dart=dart, identities=chunk, bronze_root=bronze_root, retrieved_at=datetime.now(UTC), scoped_writer=writer
+            )
+        except DartCircuitOpenError:
+            status = "provider_unstable"
+            break
         report = json.loads(Path(artifact.report_path).read_text(encoding="utf-8"))
         for name in totals:
             totals[name] += int(report.get(name, 0))
-        used = before - scoped_dart_request_headroom(runtime=runtime, quota_store=quota_store)
+        used = before - scoped_dart_request_headroom(runtime=runtime, quota_store=quota_store, key_env=args.key_env)
         requests_used += used
-        done += len(chunk)
+        done += len(report["filing_ids"])
         chunks += 1
         avg = requests_used / done
         _emit(
@@ -188,6 +210,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         if int(report.get("blocked", 0)) > 0:
             status = "quota_blocked"
+            break
+        if dart.aborted:
+            # 연속 전송 실패는 제공자 제한의 신호이므로 더 밀어붙이지 않는다.
+            status = "provider_unstable"
             break
     _emit(stage="done", status=status, done=done, pending_left=len(pending) - done, requests_used=requests_used, **totals)
     return 0

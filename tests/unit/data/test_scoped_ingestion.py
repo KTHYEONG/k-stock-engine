@@ -377,3 +377,21 @@ def test_collection_publishes_one_catalog_revision_per_batch(tmp_path: Path) -> 
 
     assert publishes == [2]
     assert catalog.successful_keys(source="krx_daily_market") == frozenset({"2024-01-02", "2024-01-03"})
+
+
+def test_fact_payload_derives_fiscal_period_when_collector_identity_drops_it() -> None:
+    from src.data.collection import dart_fact_scoped_payload
+
+    page = {
+        "identity": {
+            "corp_code": "00126380",
+            "biz_year": "2016",
+            "reprt_code": "11012",
+            "published_at": "2016-08-12",
+        },
+        "records": [{"account": "revenue"}],
+    }
+    payload = dart_fact_scoped_payload(page=page, retrieved_at=RETRIEVED_AT)
+
+    assert payload.fiscal_period == "2016Q2"
+    assert payload.status == EvidenceStatus.SUCCESS

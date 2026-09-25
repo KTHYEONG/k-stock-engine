@@ -19,7 +19,7 @@ from src.data.lifecycle import LifecycleCandidate, parse_kind_lifecycle_notice
 from src.data.receipt_catalog import EvidenceStatus
 from src.data.schemas import BronzeReceipt, EvidenceKind, PITDataError
 from src.data.scoped_ingestion import FACT_SOURCE, ScopedBronzeWriter, ScopedRawPayload, dart_fact_natural_key
-from src.integrations.dart.xbrl import DartXbrlCollector  # noqa: F401
+from src.integrations.dart.xbrl import REPRT_QUARTER, DartCircuitOpenError, DartXbrlCollector  # noqa: F401
 from src.integrations.investor_flow_router import resolve_investor_flow_collector  # noqa: F401
 from src.integrations.kis.investor_flow import KisInvestorFlowCollector
 from src.integrations.krx.kind import KindDisclosurePage, KindLifecycleCollector
@@ -763,7 +763,12 @@ def dart_fact_scoped_payload(*, page: RawProviderResponse, retrieved_at: datetim
     reprt_code = str(identity_map.get("reprt_code") or page.get("reprt_code") or "").strip()
     if not corp_code or not biz_year or not reprt_code:
         raise PITDataError("DART fact page is missing its adapter natural key")
-    fiscal_period = str(identity_map.get("fiscal_period") or page.get("fiscal_period") or "").strip() or None
+    # 수집기는 식별자에서 fiscal_period를 떼어내므로 (사업연도, 보고서 코드)에서 결정적으로 복원한다.
+    quarter = REPRT_QUARTER.get(reprt_code)
+    fiscal_period = (
+        str(identity_map.get("fiscal_period") or page.get("fiscal_period") or "").strip()
+        or (f"{biz_year}{quarter}" if quarter else None)
+    )
     published = str(identity_map.get("published_at") or page.get("published_at") or "").strip()
     as_of = date.fromisoformat(published[:10]) if published else retrieved_at.date()
     natural_key = dart_fact_natural_key(corp_code=corp_code, biz_year=biz_year, reprt_code=reprt_code)
@@ -1484,6 +1489,8 @@ def collect_dart_financial_facts(
             raise PITDataError("DART full statements response is empty; certification blocked")
         raw_pages = list(result)
         if not raw_pages:
+            if getattr(dart, "aborted", False):
+                raise DartCircuitOpenError("DART transport failures tripped the circuit breaker before any page was collected")
             raise PITDataError("DART full statements response is empty; certification blocked")
         for page in raw_pages:
             if not isinstance(page, dict) or not page:
