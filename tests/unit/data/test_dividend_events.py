@@ -13,13 +13,15 @@ from pathlib import Path
 from src.core.time import KRX_TZ, SessionCalendar
 
 
-def _archive(record: str, pay: str, dps: int) -> bytes:
+def _archive(record: str, pay: str, dps: int, agm: str | None = None, kind: str | None = None) -> bytes:
     html = (
         '<?xml version="1.0" encoding="utf-8"?><document><table>'
-        f"<tr><td>주당 배당금(원)</td><td>보통주 {dps}원</td></tr>"
+        + (f"<tr><td>1. 배당구분</td><td>{kind}</td></tr>" if kind else "")
+        + f"<tr><td>주당 배당금(원)</td><td>보통주 {dps}원</td></tr>"
         f"<tr><td>배당기준일</td><td>{record}</td></tr>"
         f"<tr><td>배당금지급 예정일자</td><td>{pay}</td></tr>"
-        "</table></document>"
+        + (f"<tr><td>9. 주주총회 예정일자</td><td>{agm}</td></tr>" if agm else "")
+        + "</table></document>"
     )
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -37,9 +39,10 @@ def _write_bridge(bronze_root: Path) -> None:
 
 
 def _write_envelope(
-    bronze_root: Path, *, rcept_no: str, received_on: str, record: str, pay: str, dps: int, corp_code: str = "00126380"
+    bronze_root: Path, *, rcept_no: str, received_on: str, record: str, pay: str, dps: int,
+    corp_code: str = "00126380", agm: str | None = None, kind: str | None = None,
 ) -> None:
-    archive = _archive(record, pay, dps)
+    archive = _archive(record, pay, dps, agm, kind)
     envelope = {
         "rcept_no": rcept_no,
         "corp_code": corp_code,
@@ -271,14 +274,6 @@ def test_materialize_dividend_events_rejects_bad_envelope_and_session_math(tmp_p
         _run(early, _calendar([date(2020, 1, 5), date(2020, 1, 6)]))
     with pytest.raises(PITDataError, match="no prior certified session"):
         _run(early, _calendar([date(2019, 12, 31), date(2020, 1, 6), date(2020, 4, 20)]))
-    early_pay = tmp_path / "early_pay" / "bronze"
-    _write_bridge(early_pay)
-    _write_envelope(
-        early_pay, rcept_no="20200102001234", received_on="2020-01-02",
-        record="2019-12-31", pay="2019-01-05", dps=300,
-    )
-    with pytest.raises(PITDataError, match="on or before pay"):
-        _run(early_pay, _calendar([date(2019, 12, 26), date(2019, 12, 27), date(2019, 12, 30), date(2020, 1, 2)]))
     with pytest.raises(PITDataError, match="open after receipt"):
         _run(early, _calendar([date(2019, 12, 26), date(2019, 12, 27), date(2019, 12, 30), date(2020, 1, 2), date(2020, 4, 20)][:-1]))
     with pytest.raises(PITDataError, match="at least two"):
@@ -314,3 +309,136 @@ def test_materialize_dividend_events_is_idempotent_and_detects_conflicts(tmp_pat
     (first / "manifest.json").mkdir()
     with pytest.raises(PITDataError, match="unreadable"):
         materialize_dividend_events(**kwargs)
+
+
+def test_materialize_dividend_events_skips_document_not_found_body(tmp_path: Path) -> None:
+    bronze_root = tmp_path / "bronze"
+    _write_bridge(bronze_root)
+    body = b'<?xml version="1.0"?><result><status>014</status></result>'
+    raw = json.dumps(
+        {
+            "rcept_no": "20200102009999",
+            "corp_code": "00126380",
+            "received_on": "2020-01-02",
+            "report_nm": "[기재정정]현금ㆍ현물배당결정",
+            "archive_b64": base64.b64encode(body).decode("ascii"),
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    target = bronze_root / "corporate_actions" / hashlib.sha256(raw).hexdigest()
+    target.mkdir(parents=True)
+    (target / "payload.json").write_bytes(raw)
+    _write_envelope(
+        bronze_root, rcept_no="20200102001234", received_on="2020-01-02", record="2019-12-31", pay="2020-04-10", dps=300
+    )
+    calendar = _calendar(
+        [date(2019, 12, 26), date(2019, 12, 27), date(2019, 12, 30), date(2020, 1, 2), date(2020, 4, 10)]
+    )
+
+    _, result = _materialize(bronze_root, calendar)
+
+    assert result["frame"].height == 1
+
+
+def test_materialize_dividend_events_estimates_pay_session_from_shareholder_meeting(tmp_path: Path) -> None:
+    bronze_root = tmp_path / "bronze"
+    _write_bridge(bronze_root)
+    _write_envelope(
+        bronze_root, rcept_no="20180226001234", received_on="2018-02-26", record="2017-12-31", pay="-", dps=50,
+        agm="2018-02-28",
+    )
+    _write_envelope(
+        bronze_root, rcept_no="20180226001235", received_on="2018-02-26", record="2018-06-30", pay="2018-08-10", dps=20,
+        agm="2018-02-28",
+    )
+    calendar = _calendar([
+        date(2017, 12, 26), date(2017, 12, 27), date(2017, 12, 28), date(2018, 2, 27),
+        date(2018, 3, 27), date(2018, 3, 30), date(2018, 6, 27), date(2018, 6, 28), date(2018, 8, 10),
+    ])
+
+    _, result = _materialize(bronze_root, calendar)
+    rows = {r["dps_krw"]: r for r in result["frame"].iter_rows(named=True)}
+
+    assert rows[50]["pay_date_source"] == "agm_plus_1m"
+    assert rows[50]["pay_session"] == date(2018, 3, 27)  # last session on or before 2018-03-28
+    assert rows[20]["pay_date_source"] == "declared"
+    assert rows[20]["pay_session"] == date(2018, 8, 10)
+    assert result["manifest"]["estimated_pay_rows"] == 1
+    assert result["manifest"]["unpaid_date_rows"] == 0
+
+
+def test_add_one_month_clamps_to_month_end_and_rolls_the_year() -> None:
+    from src.data.dividend_events import _add_months
+
+    assert _add_months(date(2019, 1, 31), 1) == date(2019, 2, 28)
+    assert _add_months(date(2020, 1, 31), 1) == date(2020, 2, 29)
+    assert _add_months(date(2019, 12, 15), 1) == date(2020, 1, 15)
+    assert _add_months(date(2019, 3, 29), 1) == date(2019, 4, 29)
+
+
+def test_materialize_dividend_events_counts_undecided_record_dates(tmp_path: Path) -> None:
+    bronze_root = tmp_path / "bronze"
+    _write_bridge(bronze_root)
+    _write_envelope(
+        bronze_root, rcept_no="20200102001111", received_on="2020-01-02", record="-", pay="-", dps=100
+    )
+    _write_envelope(
+        bronze_root, rcept_no="20200102001234", received_on="2020-01-02", record="2019-12-31", pay="2020-04-10", dps=300
+    )
+    calendar = _calendar(
+        [date(2019, 12, 26), date(2019, 12, 27), date(2019, 12, 30), date(2020, 1, 2), date(2020, 4, 10)]
+    )
+
+    _, result = _materialize(bronze_root, calendar)
+
+    assert result["frame"].height == 1
+    assert result["manifest"]["undated_record_rows"] == 1
+
+
+def test_materialize_dividend_events_excludes_pay_date_before_record_date(tmp_path: Path) -> None:
+    bronze_root = tmp_path / "bronze"
+    _write_bridge(bronze_root)
+    _write_envelope(
+        bronze_root, rcept_no="20200102001234", received_on="2020-01-02", record="2019-12-31", pay="2019-04-20", dps=300
+    )
+    _write_envelope(
+        bronze_root, rcept_no="20200102001235", received_on="2020-01-02", record="2019-06-30", pay="-", dps=100,
+        agm="2019-03-29",
+    )
+    calendar = _calendar([date(2019, 6, 27), date(2019, 12, 26), date(2019, 12, 27), date(2019, 12, 30), date(2020, 4, 20)])
+
+    _, result = _materialize(bronze_root, calendar)
+
+    assert result["frame"].height == 0
+    assert result["manifest"]["invalid_pay_rows"] == 2
+
+
+def test_materialize_dividend_events_bounds_undecided_pay_by_dividend_kind(tmp_path: Path) -> None:
+    bronze_root = tmp_path / "bronze"
+    _write_bridge(bronze_root)
+    _write_envelope(
+        bronze_root, rcept_no="20200206800001", received_on="2020-02-06", record="2019-12-31", pay="-", dps=50,
+        kind="결산배당",
+    )
+    _write_envelope(
+        bronze_root, rcept_no="20190802800001", received_on="2019-08-02", record="2019-06-30", pay="-", dps=20,
+        kind="중간배당",
+    )
+    _write_envelope(
+        bronze_root, rcept_no="20190101800001", received_on="2019-01-01", record="2019-03-31", pay="-", dps=10,
+        kind="현물배당",
+    )
+    sessions = [
+        date(2019, 6, 27), date(2019, 6, 28), date(2019, 8, 2), date(2019, 9, 2), date(2019, 12, 26),
+        date(2019, 12, 27), date(2019, 12, 30), date(2020, 2, 6), date(2020, 4, 29),
+    ]
+
+    _, result = _materialize(bronze_root, _calendar(sessions))
+    rows = {r["dps_krw"]: r for r in result["frame"].iter_rows(named=True)}
+
+    assert rows[50]["pay_date_source"] == "record_plus_4m"
+    assert rows[50]["pay_session"] == date(2020, 4, 29)
+    assert rows[20]["pay_date_source"] == "decision_plus_1m"
+    assert rows[20]["pay_session"] == date(2019, 9, 2)
+    assert 10 not in rows
+    assert result["manifest"]["unpaid_date_rows"] == 1

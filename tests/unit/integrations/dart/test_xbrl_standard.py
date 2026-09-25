@@ -684,6 +684,33 @@ def test_health_check_uses_the_client_ping_and_requires_a_client() -> None:
         DartXbrlCollector(api_key="k", request_json=lambda *_: {}).health_check()
 
 
+def test_collector_delegates_listing_and_archive_fetch_to_the_client() -> None:
+    from datetime import date
+
+    import pytest
+
+    from src.core.pit import PITDataError
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    class _Client:
+        def list_disclosures(self, start, end, *, detail_type=None):
+            return [{"rcept_no": "1", "detail_type": detail_type, "start": start.isoformat(), "end": end.isoformat()}]
+
+        def fetch_document_archive(self, rcept_no):
+            return bytearray(f"zip:{rcept_no}".encode())
+
+    collector = DartXbrlCollector(api_key="k", client=_Client())
+    assert collector.list_disclosures(date(2020, 1, 1), date(2020, 1, 31), detail_type="I001") == [
+        {"rcept_no": "1", "detail_type": "I001", "start": "2020-01-01", "end": "2020-01-31"}
+    ]
+    assert collector.fetch_document_archive("20200101000001") == b"zip:20200101000001"
+    unconfigured = DartXbrlCollector(api_key="k", request_json=lambda *_: {})
+    with pytest.raises(PITDataError):
+        unconfigured.list_disclosures(date(2020, 1, 1), date(2020, 1, 31))
+    with pytest.raises(PITDataError):
+        unconfigured.fetch_document_archive("20200101000001")
+
+
 def test_document_not_found_is_recorded_as_absence_not_retried_forever() -> None:
     from src.integrations.dart.xbrl import DartXbrlCollector
 

@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import tempfile
+from calendar import monthrange as calendar_monthrange
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -16,9 +17,13 @@ import polars as pl
 
 from src.core.pit import PITDataError
 from src.core.time import KRX_TZ, SessionCalendar
-from src.integrations.dart.dividend_decision import DividendDecision, parse_dividend_decision
+from src.integrations.dart.dividend_decision import (
+    DividendDecision,
+    UndecidedRecordDateError,
+    parse_dividend_decision,
+)
 
-POLICY_VERSION: str = "dividend-events-v1"
+POLICY_VERSION: str = "dividend-events-v2"
 
 DIVIDEND_DECISION_SOURCE: str = "opendart:dividend_decision"
 
@@ -29,6 +34,7 @@ _SCHEMA: dict[str, Any] = {
     "ex_session": pl.Date,
     "pay_session": pl.Date,
     "dps_krw": pl.Int64,
+    "pay_date_source": pl.String,
     "rcept_no": pl.String,
     "available_at": pl.Datetime("us", "Asia/Seoul"),
     "policy_version": pl.String,
@@ -76,6 +82,8 @@ def _iter_decision_envelopes(bronze_root: Path) -> list[dict[str, Any]]:
             continue
         if "archive_b64" not in payload or "rcept_no" not in payload:
             continue
+        if b"<status>014</status>" in base64.b64decode(str(payload["archive_b64"]))[:600]:
+            continue  # DART's "file does not exist" body is an absence, not an unreadable filing
         envelopes.append(payload)
     return envelopes
 
@@ -109,12 +117,34 @@ def _resolve_ex_session(record_date: date, *, calendar: SessionCalendar) -> date
     return dates[idx - 1]
 
 
+def _add_months(day: date, months: int) -> date:
+    year, month_index = divmod(day.year * 12 + day.month - 1 + months, 12)
+    month = month_index + 1
+    last = calendar_monthrange(year, month)[1]
+    return date(year, month, min(day.day, last))
+
+
+def _estimate_pay_date(decision: DividendDecision) -> tuple[date, str] | None:
+    """Latest legal payment date when the filing leaves the payment date undecided.
+
+    결산배당은 총회에서 확정되고 상법상 총회일로부터 1개월 이내에 지급해야 한다. 총회일도 미정이면
+    정기총회가 결산기 후 3개월 이내에 열린다는 점에 맞춰 기준일 + 4개월을 시한으로 본다.
+    중간/분기배당은 이사회 결의일로부터 1개월 이내다. 모두 실제보다 늦은 보수적 시점이며 결정 공시에
+    적힌 사실만 쓰므로 미래 정보가 아니다.
+    """
+    if decision.agm_date is not None:
+        return _add_months(decision.agm_date, 1), "agm_plus_1m"
+    kind = decision.dividend_kind or ""
+    if "결산" in kind:
+        return _add_months(decision.record_date, 4), "record_plus_4m"
+    if "중간" in kind or "분기" in kind:
+        return _add_months(max(decision.received_on, decision.record_date), 1), "decision_plus_1m"
+    return None
+
+
 def _resolve_pay_session(pay_date: date, *, calendar: SessionCalendar) -> date:
-    dates = _session_dates(calendar)
-    at_or_before = [d for d in dates if d <= pay_date]
-    if not at_or_before:
-        raise PITDataError(f"no certified session on or before pay date {pay_date.isoformat()}")
-    return max(at_or_before)
+    # 호출 전에 기준일 이하 세션이 있음이 확인되고 지급일은 기준일 이후이므로 후보는 항상 존재한다.
+    return max(d for d in _session_dates(calendar) if d <= pay_date)
 
 
 def _resolve_available_at(received_on: date, *, calendar: SessionCalendar) -> datetime:
@@ -158,25 +188,42 @@ def materialize_dividend_events(
     bridge = _load_corp_bridge(bronze_root)
     envelopes = _iter_decision_envelopes(bronze_root)
     latest: dict[tuple[str, date], DividendDecision] = {}
+    undated_record_rows = 0
     for envelope in envelopes:
-        decision = _decision_from_envelope(envelope)
+        try:
+            decision = _decision_from_envelope(envelope)
+        except UndecidedRecordDateError:
+            undated_record_rows += 1  # 기준일 미정 공시는 이벤트가 아니라 예고이며, 확정 시 정정/재공시로 온다
+            continue
         key = (decision.corp_code, decision.record_date)
         current = latest.get(key)
         if current is None or (decision.received_on, decision.rcept_no) > (current.received_on, current.rcept_no):
             latest[key] = decision
     rows: list[dict[str, Any]] = []
     unpaid_date_rows = 0
+    estimated_pay_rows = 0
+    invalid_pay_rows = 0
     unmapped_rows = 0
     for (corp_code, _record_date), decision in sorted(latest.items(), key=lambda kv: (kv[0][0], kv[0][1].isoformat())):
         ticker = bridge.get(corp_code)
         if ticker is None:
             unmapped_rows += 1
             continue
-        if decision.pay_date is None:
-            unpaid_date_rows += 1
+        if decision.pay_date is not None:
+            pay_date, pay_source = decision.pay_date, "declared"
+        else:
+            estimate = _estimate_pay_date(decision)
+            if estimate is None:
+                unpaid_date_rows += 1
+                continue
+            pay_date, pay_source = estimate
+        if pay_date < decision.record_date:
+            # 공시의 연도 오기(전년도 날짜 복사 등)로 지급일이 기준일보다 앞서면 현금 인식 시점을 알 수 없다.
+            invalid_pay_rows += 1
             continue
+        estimated_pay_rows += pay_source != "declared"
         ex_session = _resolve_ex_session(decision.record_date, calendar=calendar)
-        pay_session = _resolve_pay_session(decision.pay_date, calendar=calendar)
+        pay_session = _resolve_pay_session(pay_date, calendar=calendar)
         available_at = _resolve_available_at(decision.received_on, calendar=calendar)
         rows.append({
             "instrument_id": f"KRX:{ticker}",
@@ -185,6 +232,7 @@ def materialize_dividend_events(
             "ex_session": ex_session,
             "pay_session": pay_session,
             "dps_krw": decision.dps_common_krw,
+            "pay_date_source": pay_source,
             "rcept_no": decision.rcept_no,
             "available_at": available_at,
             "policy_version": POLICY_VERSION,
@@ -198,7 +246,7 @@ def materialize_dividend_events(
         POLICY_VERSION,
         *(
             f"{row['ticker']}|{row['record_date']}|{row['ex_session']}|{row['pay_session']}|"
-            f"{row['dps_krw']}|{row['rcept_no']}|{row['available_at'].isoformat()}"
+            f"{row['dps_krw']}|{row['pay_date_source']}|{row['rcept_no']}|{row['available_at'].isoformat()}"
             for row in frame.iter_rows(named=True)
         ),
     ))
@@ -214,6 +262,9 @@ def materialize_dividend_events(
             "policy_version": POLICY_VERSION,
             "rows": frame.height,
             "unpaid_date_rows": unpaid_date_rows,
+            "estimated_pay_rows": estimated_pay_rows,
+            "undated_record_rows": undated_record_rows,
+            "invalid_pay_rows": invalid_pay_rows,
             "unmapped_rows": unmapped_rows,
             "decisions": len(latest),
             "partitions": [

@@ -351,6 +351,26 @@ class DartXbrlCollector:
         pages = [p for p in results if p is not None and not (self.aborted and _is_transport_failure(p))]
         return iter(tuple(pages))
 
+    def list_disclosures(self, start: date, end: date, *, detail_type: str | None = None) -> list[dict[str, str]]:
+        """List market-wide disclosures in a window, optionally narrowed to one DART detail type.
+
+        Raises:
+            PITDataError: the client is unavailable.
+        """
+        if self._client is None:
+            raise PITDataError("DART disclosures endpoint is not configured")
+        return list(self._client.list_disclosures(start, end, detail_type=detail_type))
+
+    def fetch_document_archive(self, rcept_no: str) -> bytes:
+        """Fetch the ``document.xml`` ZIP for one receipt through the ledgered client.
+
+        Raises:
+            PITDataError: the client is unavailable.
+        """
+        if self._client is None:
+            raise PITDataError("DART document archive endpoint is not configured")
+        return bytes(self._client.fetch_document_archive(rcept_no))
+
     def health_check(self) -> None:
         """Issue one ledgered request to confirm the provider accepts connections from this host.
 
