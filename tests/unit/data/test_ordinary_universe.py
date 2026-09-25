@@ -1,264 +1,207 @@
+"""Ordinary-universe v2 identity and publication tests."""
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 import polars as pl
-import pytest
 
-from src.data.bronze import BronzeStore
-from src.data.ordinary_universe import (
-    build_ordinary_universe,
-    catalog_master_receipts,
-    dated_master_receipts,
-    materialize_ordinary_universe_from_catalog,
-    materialize_ordinary_universe_from_bronze,
-    ordinary_universe_snapshot,
-    write_ordinary_universe_silver,
-)
-from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog, ReceiptIndexEntry
-from src.data.schemas import EvidenceKind, PITDataError
-from src.data.streaming_normalization import _canonical_master_row
+from src.core.pit import BronzeReceipt, EvidenceKind
+from src.data.datasets import load_manifest, verify_dataset
+from src.data.ordinary_universe import ordinary_universe_snapshot, write_ordinary_universe_silver
 
 
-def _master(store: BronzeStore, day: str, records: list[dict[str, str]]):
-    return store.import_bytes(
-        json.dumps({"as_of": day, "records": records}, ensure_ascii=False).encode(),
-        kind=EvidenceKind.SECURITY_MASTER,
-        retrieved_at=datetime(2026, 9, 20, tzinfo=UTC),
-        source_label=f"KRX:historical-master:{day}",
-    )
-
-
-def _row(ticker: str, isin: str, **changes: str) -> dict[str, str]:
-    return {
-        "ISU_SRT_CD": ticker,
-        "ISU_CD": isin,
-        "KIND_STKCERT_TP_NM": "보통주",
-        "SECUGRP_NM": "주권",
-        "MKT_TP_NM": "KOSPI",
-        "LIST_DD": "20100101",
-        **changes,
+def _snapshot(tmp_path: Path, session: date):
+    payload = {
+        "as_of": session.isoformat(),
+        "records": [{
+            "ISU_SRT_CD": "005930",
+            "ISU_CD": "KR7005930003",
+            "KIND_STKCERT_TP_NM": "보통주",
+            "SECUGRP_NM": "주권",
+            "MKT_TP_NM": "KOSPI",
+            "SECT_TP_NM": "",
+        }],
     }
-
-
-def test_dated_snapshot_excludes_non_ordinary_and_preserves_source(tmp_path) -> None:
-    store = BronzeStore(tmp_path / "bronze")
-    day = date(2018, 1, 2)
-    rows = [
-        _row("A", "KR0000000001"),
-        _row("B", "KR0000000002", KIND_STKCERT_TP_NM="구형우선주"),
-        _row("C", "KR0000000003", SECUGRP_NM="부동산투자회사"),
-        _row("D", "KR0000000004", SECT_TP_NM="SPAC(소속부없음)"),
-        _row("E", "KR0000000005", LIST_DD="20190101"),
-        _row("F", "KR0000000006", KIND_STKCERT_TP_NM=""),
-    ]
-    receipt = _master(store, day.isoformat(), rows)
-    snapshot = build_ordinary_universe((receipt,), sessions=(day,))[0]
-    assert snapshot.eligible_tickers == {"A"}
-    assert snapshot.rows["exclusion_reason"].to_list() == [
-        "eligible", "non_ordinary_share", "non_equity_security_group", "spac", "not_listed_yet", "unknown_share_kind",
-    ]
-    assert snapshot.rows["source_hash"].unique().to_list() == [receipt.content_hash]
-    assert snapshot.rows["available_at"].item(0).hour == 15
-    out = write_ordinary_universe_silver((snapshot,), root=tmp_path / "silver")
-    saved = pl.read_parquet(out / f"session={day.isoformat()}" / "part.parquet")
-    assert saved.filter(pl.col("eligible"))["ticker"].to_list() == ["A"]
-    manifest = json.loads((out / "manifest.json").read_text())
-    assert manifest["partitions"][0]["source_hash"] == receipt.content_hash
-    with pytest.raises(PITDataError, match="already exists"):
-        write_ordinary_universe_silver((snapshot,), root=tmp_path / "silver")
-
-
-def test_missing_or_conflicting_daily_master_fails_closed(tmp_path) -> None:
-    store = BronzeStore(tmp_path / "bronze")
-    first = _master(store, "2018-01-02", [_row("A", "KR0000000001")])
-    with pytest.raises(PITDataError, match="missing security_master snapshot"):
-        build_ordinary_universe((first,), sessions=(date(2018, 1, 2), date(2018, 1, 3)))
-    changed = _master(store, "2018-01-02", [_row("A", "KR0000000001", LIST_DD="20100102")])
-    with pytest.raises(PITDataError, match="ambiguous security_master snapshot"):
-        build_ordinary_universe((first, changed), sessions=(date(2018, 1, 2),))
-    duplicate = _master(store, "2018-01-03", [_row("A", "KR0000000001"), _row("A", "KR0000000001")])
-    with pytest.raises(PITDataError, match="duplicate security_master ticker"):
-        ordinary_universe_snapshot(duplicate)
-    first.payload_path.write_bytes(b"tampered")
-    with pytest.raises(PITDataError, match="hash mismatch"):
-        ordinary_universe_snapshot(first)
-
-
-def test_source_validation_and_metadata_selection(tmp_path) -> None:
-    store = BronzeStore(tmp_path / "bronze")
-    row = _row("A", "KR0000000001")
-    receipt = _master(store, "2018-01-02", [row])
-    selected = dated_master_receipts(tmp_path / "bronze", sessions=(date(2018, 1, 2),))
-    assert selected == (receipt,)
-    assert dated_master_receipts(tmp_path / "bronze", sessions=(date(2018, 1, 3),)) == ()
-
-    for altered, expected in (
-        (replace(receipt, kind=EvidenceKind.DAILY_MARKET), "expected security_master"),
-        (replace(receipt, source_path="KRX:historical-master:2018-01-03"), "date conflicts"),
-    ):
-        with pytest.raises(PITDataError, match=expected):
-            ordinary_universe_snapshot(altered)
-
-    for payload, expected in (
-        (b"{", "JSON"),
-        (b"[]", "root"),
-        (b'{"as_of":"bad","records":[]}', "invalid KRX master"),
-        (b'{"as_of":"2018-01-02","session":"2018-01-03","records":[]}', "unambiguous"),
-        (b'{"as_of":"2018-01-02","records":{}}', "records must be a list"),
-        (b'{"as_of":"2018-01-02","records":[]}', "empty security_master"),
-        (b'{"as_of":"2018-01-02","records":[null]}', "record must be an object"),
-        (b'{"as_of":"2018-01-02","records":[{}]}', "lacks ticker or ISIN"),
-        (json.dumps({"as_of": "2018-01-02", "records": [{**row, "LIST_DD": "bad"}]}).encode(), "invalid listing date"),
-        (json.dumps({"as_of": "2018-01-02", "records": [row, _row("B", "KR0000000001")]}).encode(), "conflicting security_master ISIN"),
-    ):
-        bad = store.import_bytes(payload, kind=EvidenceKind.SECURITY_MASTER, retrieved_at=datetime(2026, 9, 20, tzinfo=UTC), source_label="invalid")
-        with pytest.raises(PITDataError, match=expected):
-            ordinary_universe_snapshot(bad)
-
-    with pytest.raises(PITDataError, match="requires requested sessions"):
-        build_ordinary_universe((receipt,), sessions=())
-    outside = _master(store, "2018-01-03", [row])
-    assert build_ordinary_universe((outside, receipt), sessions=(date(2018, 1, 2),))[0].session == date(2018, 1, 2)
-
-    metadata = receipt.metadata_path
-    original = metadata.read_text()
-    metadata.write_text("{" , encoding="utf-8")
-    with pytest.raises(PITDataError, match="invalid security_master receipt"):
-        dated_master_receipts(tmp_path / "bronze", sessions=(date(2018, 1, 2),))
-    metadata.write_text(original, encoding="utf-8")
-    for field, value, expected in (
-        ("kind", "daily_market", "kind mismatch"),
-        ("content_hash", "wrong", "path/hash mismatch"),
-    ):
-        changed = json.loads(original)
-        changed[field] = value
-        metadata.write_text(json.dumps(changed), encoding="utf-8")
-        with pytest.raises(PITDataError, match=expected):
-            dated_master_receipts(tmp_path / "bronze", sessions=(date(2018, 1, 2),))
-    metadata.write_text(original, encoding="utf-8")
-
-
-def test_unknown_classifications_remain_ineligible() -> None:
-    from src.data.ordinary_universe import classify_krx_master_row
-
-    base = _row("A", "KR0000000001")
-    assert classify_krx_master_row({**base, "SECUGRP_NM": ""}) == (False, "unknown_security_group")
-    assert classify_krx_master_row({**base, "MKT_TP_NM": ""}) == (False, "unknown_market")
-    assert classify_krx_master_row({**base, "MKT_TP_NM": "KONEX"}) == (False, "excluded_market")
-
-
-def test_silver_write_rejects_duplicate_sessions_and_removes_failed_staging(tmp_path, monkeypatch) -> None:
-    store = BronzeStore(tmp_path / "bronze")
-    snapshot = ordinary_universe_snapshot(_master(store, "2018-01-02", [_row("A", "KR0000000001")]))
-    with pytest.raises(PITDataError, match="unique ascending dates"):
-        write_ordinary_universe_silver((snapshot, snapshot), root=tmp_path / "silver")
-    with pytest.raises(PITDataError, match="requires dated snapshots"):
-        write_ordinary_universe_silver((), root=tmp_path / "silver")
-
-    def fail_write(self, path):
-        raise OSError("disk unavailable")
-
-    monkeypatch.setattr(pl.DataFrame, "write_parquet", fail_write)
-    with pytest.raises(OSError, match="disk unavailable"):
-        write_ordinary_universe_silver((snapshot,), root=tmp_path / "silver")
-    assert not list((tmp_path / "silver").glob(".ordinary-universe-*"))
-
-
-def test_full_materializer_requires_exact_days_and_streams_partitions(tmp_path) -> None:
-    store = BronzeStore(tmp_path / "bronze")
-    first = date(2018, 1, 2)
-    second = date(2018, 1, 3)
-    _master(store, first.isoformat(), [_row("A", "KR0000000001")])
-    with pytest.raises(PITDataError, match="requires requested sessions"):
-        materialize_ordinary_universe_from_bronze(
-            bronze_root=tmp_path / "bronze", sessions=(), silver_root=tmp_path / "silver"
-        )
-    with pytest.raises(PITDataError, match="missing security_master snapshot"):
-        materialize_ordinary_universe_from_bronze(
-            bronze_root=tmp_path / "bronze", sessions=(first, second), silver_root=tmp_path / "silver"
-        )
-    _master(store, second.isoformat(), [_row("B", "KR0000000002")])
-    output = materialize_ordinary_universe_from_bronze(
-        bronze_root=tmp_path / "bronze", sessions=(second, first), silver_root=tmp_path / "silver"
+    payload_path = tmp_path / "payload.json"
+    payload_path.parent.mkdir(parents=True, exist_ok=True)
+    payload_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    raw = payload_path.read_bytes()
+    receipt = BronzeReceipt(
+        kind=EvidenceKind.SECURITY_MASTER,
+        content_hash=__import__("hashlib").sha256(raw).hexdigest(),
+        source_path=f"KRX:historical-master:{session.isoformat()}",
+        retrieved_at=datetime(session.year, session.month, session.day, tzinfo=UTC),
+        ingested_at=datetime(session.year, session.month, session.day, tzinfo=UTC),
+        payload_path=payload_path,
+        metadata_path=tmp_path / "receipt.json",
     )
-    manifest = json.loads((output / "manifest.json").read_text())
-    assert [part["session"] for part in manifest["partitions"]] == [first.isoformat(), second.isoformat()]
-    assert not list((tmp_path / "silver").glob(".ordinary-universe-*"))
-    _master(store, second.isoformat(), [_row("C", "KR0000000003")])
-    with pytest.raises(PITDataError, match="ambiguous security_master snapshot"):
-        materialize_ordinary_universe_from_bronze(
-            bronze_root=tmp_path / "bronze", sessions=(first, second), silver_root=tmp_path / "silver-extra"
-        )
+    return ordinary_universe_snapshot(receipt)
 
 
-def test_catalog_materializer_uses_scope_natural_keys(tmp_path) -> None:
-    store = BronzeStore(tmp_path / "bronze")
-    first, second = date(2018, 1, 2), date(2018, 1, 3)
-    receipts = (
-        _master(store, first.isoformat(), [_row("A", "KR0000000001")]),
-        _master(store, second.isoformat(), [_row("B", "KR0000000002")]),
+def test_ordinary_universe_is_v2_and_identity_scoped_to_sessions(tmp_path: Path) -> None:
+    first_snapshot = _snapshot(tmp_path / "first", date(2024, 1, 2))
+    second_snapshot = _snapshot(tmp_path / "second", date(2024, 1, 3))
+    first = write_ordinary_universe_silver([first_snapshot], root=tmp_path / "silver")
+    repeated = write_ordinary_universe_silver([first_snapshot], root=tmp_path / "silver")
+    second = write_ordinary_universe_silver([second_snapshot], root=tmp_path / "silver")
+
+    assert first == repeated
+    assert first.name != second.name
+    assert load_manifest(first).kind == "ordinary_universe"
+    assert load_manifest(first).layer.value == "silver"
+    assert verify_dataset(first, known_ids=lambda _dataset_id: True).passed
+    frame = pl.read_parquet(first / "session=2024-01-02/part.parquet")
+    assert frame["instrument_id"].to_list() == ["KRX:005930"]
+
+
+def test_ordinary_universe_loader_boundaries_and_catalog_publication(tmp_path: Path, monkeypatch) -> None:
+    import hashlib
+
+    import pytest
+
+    from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog, ReceiptIndexEntry
+    from src.data.ordinary_universe import (
+        BronzeReceipt,
+        EvidenceKind,
+        PITDataError,
+        build_ordinary_universe,
+        catalog_master_receipts,
+        catalog_master_sessions,
+        dated_master_receipts,
+        materialize_ordinary_universe_from_catalog,
+        ordinary_universe_snapshot,
+        write_ordinary_universe_silver,
     )
-    catalog = ReceiptCatalog(tmp_path / "catalog")
-    catalog.publish(tuple(
+
+    missing = BronzeReceipt(
+        kind=EvidenceKind.SECURITY_MASTER,
+        content_hash="a" * 64,
+        source_path="KRX:historical-master:2024-01-02",
+        retrieved_at=datetime(2024, 1, 2, tzinfo=UTC),
+        ingested_at=datetime(2024, 1, 2, tzinfo=UTC),
+        payload_path=tmp_path / "missing.json",
+        metadata_path=tmp_path / "receipt.json",
+    )
+    with pytest.raises(PITDataError, match="unreadable"):
+        ordinary_universe_snapshot(missing)
+
+    bad_listing_root = tmp_path / "bad-listing"
+    bad_listing_root.mkdir()
+    payload = {
+        "as_of": "2024-01-02",
+        "records": [{
+            "ISU_SRT_CD": "005930", "ISU_CD": "KR7005930003",
+            "KIND_STKCERT_TP_NM": "보통주", "SECUGRP_NM": "주권", "MKT_TP_NM": "KOSPI",
+            "LIST_DD": "not-a-date",
+        }],
+    }
+    payload_path = bad_listing_root / "payload.json"
+    raw = json.dumps(payload, ensure_ascii=False).encode()
+    payload_path.write_bytes(raw)
+    bad_listing = BronzeReceipt(
+        kind=EvidenceKind.SECURITY_MASTER,
+        content_hash=hashlib.sha256(raw).hexdigest(),
+        source_path="KRX:historical-master:2024-01-02",
+        retrieved_at=datetime(2024, 1, 2, tzinfo=UTC),
+        ingested_at=datetime(2024, 1, 2, tzinfo=UTC),
+        payload_path=payload_path,
+        metadata_path=bad_listing_root / "receipt.json",
+    )
+    with pytest.raises(PITDataError, match="listing date"):
+        ordinary_universe_snapshot(bad_listing)
+
+    receipt_dir = tmp_path / "bronze" / "security_master" / ("c" * 64)
+    receipt_dir.mkdir(parents=True)
+    (receipt_dir / "payload.json").write_text("{}", encoding="utf-8")
+    (receipt_dir / "receipt.json").write_text(
+        json.dumps({
+            "source_path": "KRX:historical-master:2024-01-02",
+            "kind": "security_master",
+            "content_hash": "c" * 64,
+            "retrieved_at": "2024-01-02T00:00:00+00:00",
+            "ingested_at": "2024-01-02T00:00:00+00:00",
+        }),
+        encoding="utf-8",
+    )
+    selected = dated_master_receipts(tmp_path / "bronze", sessions=(date(2024, 1, 2),))
+    assert selected[0].content_hash == "c" * 64
+
+    with pytest.raises(PITDataError, match="dated snapshots"):
+        write_ordinary_universe_silver([], root=tmp_path / "silver")
+    snapshot = _snapshot(tmp_path / "ordered", date(2024, 1, 2))
+    with pytest.raises(PITDataError, match="ascending"):
+        write_ordinary_universe_silver([snapshot, snapshot], root=tmp_path / "silver")
+
+    catalog_root = tmp_path / "catalog"
+    catalog_bronze = tmp_path / "catalog-bronze"
+    catalog_payload = catalog_bronze / "security_master" / ("d" * 64) / "payload.json"
+    catalog_payload.parent.mkdir(parents=True)
+    catalog_raw = json.dumps({
+        "as_of": "2024-01-02",
+        "records": [{
+            "ISU_SRT_CD": "005930", "ISU_CD": "KR7005930003",
+            "KIND_STKCERT_TP_NM": "보통주", "SECUGRP_NM": "주권", "MKT_TP_NM": "KOSPI",
+        }],
+    }, ensure_ascii=False).encode()
+    catalog_payload.write_bytes(catalog_raw)
+    catalog = ReceiptCatalog(catalog_root)
+    catalog.publish([
         ReceiptIndexEntry(
-            source="krx_security_master", natural_key=day.isoformat(), as_of=day,
-            fiscal_period=None, status=EvidenceStatus.SUCCESS,
-            content_hash=receipt.content_hash, retrieved_at=receipt.retrieved_at,
-            payload_path=receipt.payload_path,
+            source="krx_security_master", natural_key="2024-01-02", as_of=date(2024, 1, 2),
+            fiscal_period=None, status=EvidenceStatus.SUCCESS, content_hash=hashlib.sha256(catalog_raw).hexdigest(),
+            retrieved_at=datetime(2024, 1, 2, tzinfo=UTC), payload_path=catalog_payload,
         )
-        for day, receipt in zip((first, second), receipts, strict=True)
-    ))
-    selected = catalog_master_receipts(catalog, sessions=(second, first))
-    assert [receipt.source_path for receipt in selected] == [
-        "KRX:historical-master:2018-01-02", "KRX:historical-master:2018-01-03"
-    ]
-    output = materialize_ordinary_universe_from_catalog(
-        catalog=catalog, sessions=(first, second), silver_root=tmp_path / "silver"
+    ])
+    assert catalog_master_sessions(catalog) == (date(2024, 1, 2),)
+    assert catalog_master_receipts(catalog, sessions=(date(2024, 1, 2),))[0].payload_path == catalog_payload
+    result = materialize_ordinary_universe_from_catalog(
+        catalog=catalog, sessions=(date(2024, 1, 2),), silver_root=tmp_path / "silver-catalog"
     )
-    assert (output / "session=2018-01-02" / "part.parquet").is_file()
-    with pytest.raises(PITDataError, match="missing security_master snapshot"):
-        catalog_master_receipts(catalog, sessions=(date(2018, 1, 4),))
+    assert result.is_dir()
 
+    class _SingleEntryCatalog:
+        def __init__(self, entry):
+            self.entry = entry
 
-def test_catalog_master_receipts_rejects_empty_dates_and_tampered_entries(tmp_path) -> None:
-    store = BronzeStore(tmp_path / "bronze")
-    day = date(2018, 1, 2)
-    receipt = _master(store, day.isoformat(), [_row("A", "KR0000000001")])
-    catalog = ReceiptCatalog(tmp_path / "catalog")
-    entry = ReceiptIndexEntry(
-        source="krx_security_master", natural_key=day.isoformat(), as_of=day,
-        fiscal_period=None, status=EvidenceStatus.SUCCESS, content_hash=receipt.content_hash,
-        retrieved_at=receipt.retrieved_at, payload_path=receipt.payload_path,
+        def latest(self, **_kwargs):
+            return {"2024-01-02": self.entry}
+
+    missing_entry = ReceiptIndexEntry(
+        source="krx_security_master", natural_key="2024-01-02", as_of=date(2024, 1, 2),
+        fiscal_period=None, status=EvidenceStatus.SUCCESS, content_hash="e" * 64,
+        retrieved_at=datetime(2024, 1, 2, tzinfo=UTC), payload_path=tmp_path / "missing-payload.json",
     )
-    catalog.publish((entry,))
-    with pytest.raises(PITDataError, match="requires requested sessions"):
-        catalog_master_receipts(catalog, sessions=())
-    catalog.publish((replace(entry, as_of=date(2018, 1, 3), retrieved_at=datetime(2026, 9, 21, tzinfo=UTC)),))
-    with pytest.raises(PITDataError, match="date conflicts"):
-        catalog_master_receipts(catalog, sessions=(day,))
-
-    catalog.publish((replace(entry, retrieved_at=datetime(2026, 9, 22, tzinfo=UTC)),))
-    receipt.payload_path.unlink()
     with pytest.raises(PITDataError, match="payload is missing"):
-        catalog_master_receipts(catalog, sessions=(day,))
-    receipt.payload_path.write_bytes(b"tampered")
-    with pytest.raises(PITDataError, match="hash mismatch"):
-        catalog_master_receipts(catalog, sessions=(day,))
+        catalog_master_receipts(_SingleEntryCatalog(missing_entry), sessions=(date(2024, 1, 2),))
 
-
-def test_streaming_silver_mapping_does_not_infer_common_from_missing_fields() -> None:
-    moment = datetime(2018, 1, 2, tzinfo=UTC)
-    base = {"ticker": "A", "market": "KOSPI", "share_class": "common"}
-    row = _canonical_master_row(base, available_at=moment, source_hash="a" * 64, fallback_session=moment)
-    assert row["share_class"] == "other"
-    assert row["ordinary_equity_exclusion_reason"] == "unknown_share_kind"
-    assert row["source_hash"] == "a" * 64
-    approved = _canonical_master_row(
-        {**base, **_row("A", "KR0000000001")}, available_at=moment,
-        source_hash="b" * 64, fallback_session=moment,
+    mismatch_entry = ReceiptIndexEntry(
+        source="krx_security_master", natural_key="2024-01-02", as_of=date(2024, 1, 2),
+        fiscal_period=None, status=EvidenceStatus.SUCCESS, content_hash="e" * 64,
+        retrieved_at=datetime(2024, 1, 2, tzinfo=UTC), payload_path=catalog_payload,
     )
-    assert approved["share_class"] == "common"
-    assert approved["ordinary_equity_eligible"] is True
+    with pytest.raises(PITDataError, match="hash mismatch"):
+        catalog_master_receipts(_SingleEntryCatalog(mismatch_entry), sessions=(date(2024, 1, 2),))
+
+    original_read_bytes = Path.read_bytes
+
+    def fail_catalog_read(path: Path) -> bytes:
+        if path == catalog_payload:
+            raise OSError("closed")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", fail_catalog_read)
+    valid_entry = ReceiptIndexEntry(
+        source="krx_security_master", natural_key="2024-01-02", as_of=date(2024, 1, 2),
+        fiscal_period=None, status=EvidenceStatus.SUCCESS, content_hash=hashlib.sha256(catalog_raw).hexdigest(),
+        retrieved_at=datetime(2024, 1, 2, tzinfo=UTC), payload_path=catalog_payload,
+    )
+    with pytest.raises(PITDataError, match="payload is missing"):
+        catalog_master_receipts(_SingleEntryCatalog(valid_entry), sessions=(date(2024, 1, 2),))
+    monkeypatch.undo()
+
+    with pytest.raises(PITDataError, match="requires requested sessions"):
+        build_ordinary_universe([], sessions=())
+    with pytest.raises(PITDataError, match="no certified"):
+        catalog_master_sessions(ReceiptCatalog(tmp_path / "empty-catalog"))

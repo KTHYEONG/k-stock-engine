@@ -409,5 +409,8 @@
   },
   "src/data/dividend_events.py": {
     "testing": "tests/unit/data/test_dividend_events.py"
+  },
+  "src/data/datasets.py": {
+    "testing": "tests/unit/data/test_datasets.py"
   }
 }

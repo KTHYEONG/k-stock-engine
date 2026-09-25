@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
 import polars as pl
 
+from src.data.datasets import dataset_partition_paths, load_manifest
 from src.data.schemas import PITDataError
 
 
@@ -39,31 +38,24 @@ class MissingInvestorFlowCells:
     total_cells: int
 
 
-def _read_verified_partitions(dataset_dir: Path, *, label: str) -> tuple[str, list[str]]:
+def _read_verified_partitions(
+    dataset_dir: Path, *, label: str, expected_kind: str
+) -> tuple[str, list[str]]:
+    """Read either contract at the migration boundary and verify every hash."""
+
     try:
-        manifest = json.loads((dataset_dir / "manifest.json").read_text(encoding="utf-8"))
-        parts = manifest["partitions"]
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        raise PITDataError(f"invalid {label} manifest: {dataset_dir}") from exc
-    if manifest.get("dataset_id") != dataset_dir.name or not isinstance(parts, list) or not parts:
+        paths = dataset_partition_paths(dataset_dir, allow_legacy=False)
+    except PITDataError as exc:
+        raise PITDataError(f"invalid {label} manifest: {dataset_dir}: {exc}") from exc
+    if not paths:
         raise PITDataError(f"invalid {label} manifest: {dataset_dir}")
-    files: list[str] = []
-    for part in parts:
-        if (
-            not isinstance(part, dict)
-            or not isinstance(part.get("path"), str)
-            or not isinstance(part.get("parquet_sha256"), str)
-        ):
-            raise PITDataError(f"invalid {label} partition: {dataset_dir}")
-        target = dataset_dir / str(part["path"])
-        try:
-            data = target.read_bytes()
-        except OSError as exc:
-            raise PITDataError(f"{label} partition is unreadable: {part['path']}") from exc
-        if hashlib.sha256(data).hexdigest() != part["parquet_sha256"]:
-            raise PITDataError(f"{label} partition hash mismatch: {part['path']}")
-        files.append(str(target))
-    return (manifest["dataset_id"], files)
+    try:
+        manifest = load_manifest(dataset_dir)
+    except PITDataError:
+        manifest = None
+    if manifest is not None and manifest.kind != expected_kind:
+        raise PITDataError(f"invalid {label} kind: {dataset_dir}")
+    return dataset_dir.name, [str(path) for path in paths]
 
 
 def compute_missing_investor_flow_cells(
@@ -92,10 +84,21 @@ def compute_missing_investor_flow_cells(
     """
     panel_dir = Path(market_panel_path)
     ls_dir = Path(ls_flow_silver_path)
-    panel_id, panel_files = _read_verified_partitions(panel_dir, label="market-panel")
-    ls_id, ls_files = _read_verified_partitions(ls_dir, label="investor-flow")
+    panel_id, panel_files = _read_verified_partitions(
+        panel_dir, label="market-panel", expected_kind="market_panel"
+    )
+    ls_id, ls_files = _read_verified_partitions(
+        ls_dir, label="investor-flow", expected_kind="investor_flow_ls"
+    )
+    panel_frames: list[pl.DataFrame] = []
+    for file_path in panel_files:
+        candidate = pl.read_parquet(file_path)
+        if {"eligible", "price_state", "session", "instrument_id"}.issubset(candidate.columns):
+            panel_frames.append(candidate)
+    if not panel_frames:
+        raise PITDataError("market panel has no dense partitions")
     requirement = (
-        pl.scan_parquet(panel_files)
+        pl.concat(panel_frames, how="vertical_relaxed")
         .select(["eligible", "price_state", "session", "instrument_id"])
         .filter(pl.col("eligible") & (pl.col("price_state") == "tradable"))
         .select(
@@ -103,13 +106,18 @@ def compute_missing_investor_flow_cells(
             pl.col("instrument_id").cast(pl.String).str.split(":").list.last().alias("ticker"),
         )
         .unique()
-        .collect()
     )
+    ls_frames: list[pl.DataFrame] = []
+    for file_path in ls_files:
+        candidate = pl.read_parquet(file_path)
+        if {"session", "ticker"}.issubset(candidate.columns):
+            ls_frames.append(candidate)
+    if not ls_frames:
+        raise PITDataError("LS flow has no dense partitions")
     coverage = (
-        pl.scan_parquet(ls_files)
+        pl.concat(ls_frames, how="vertical_relaxed")
         .select(pl.col("session").cast(pl.Date), pl.col("ticker").cast(pl.String))
         .unique()
-        .collect()
     )
     missing = requirement.join(coverage, on=["session", "ticker"], how="anti").sort(["ticker", "session"])
     grouped = missing.group_by("ticker", maintain_order=True).agg(pl.col("session").sort().alias("sessions"))

@@ -15,13 +15,19 @@ from zoneinfo import ZoneInfo
 
 import polars as pl
 
-from src.core.datasets import HIVE_PARTITION_LAYOUT, DatasetCertification, make_manifest
-from src.core.instruments import AssetKind
+from src.data.datasets import (
+    DatasetIdentity,
+    DatasetLayer,
+    canonical_content_hash,
+    dataset_digest,
+    dataset_reference,
+    load_manifest,
+    publish_dataset,
+    read_dataset,
+)
 from src.data.schemas import PITDataError
-from src.storage.parquet_datasets import ParquetDatasetStore, canonical_content_hash
 
 _FISCAL_RE = re.compile(r"^(\d{4})Q([1-4])$")
-_QUALITY_FEATURE_SET = "stock_financial_quality_v1"
 _QUALITY_COLUMNS = [
     "company_id",
     "fiscal_period",
@@ -332,6 +338,7 @@ def build_financial_quality_events(
             ).hexdigest(),
         }
         for event in unresolved_events
+        if _as_utc(event.available_at) <= decision_time
     )
     if not records:
         return _empty_quality_frame()
@@ -381,86 +388,110 @@ def eligible_companies_from_quality(
     return frozenset(eligible)
 
 
+def _v2_digest(value: str | None, values: list[str]) -> str:
+    if value is None:
+        return dataset_digest(values)
+    text = str(value)
+    return text if text.startswith("bronze:") else dataset_digest([text])
+
+
+def _materialize_financial_quality_v2(
+    events: pl.DataFrame,
+    *,
+    layer_root: Path,
+    decision_time: datetime,
+    facts_dataset_id: str,
+    quarantine_digest: str | None,
+    unresolved_events_digest: str | None,
+    policy: FinancialQualityPolicy,
+) -> Path:
+    if not facts_dataset_id.strip():
+        raise PITDataError("financial quality materialization requires a facts dataset id")
+    if events.is_empty():
+        raise PITDataError("financial quality materialization requires events")
+    if list(events.columns) != _QUALITY_COLUMNS:
+        raise PITDataError("financial quality events have an unexpected schema")
+    if events.filter(pl.col("available_at") > decision_time).height:
+        raise PITDataError("financial quality events contain a row after decision_time")
+    quality_report_hash = canonical_content_hash(events, _QUALITY_COLUMNS)
+    identity = DatasetIdentity(
+        kind="financial_quality",
+        layer=DatasetLayer.SILVER,
+        policy_version=policy.version,
+        inputs={
+            "facts": dataset_reference(facts_dataset_id, kind="financial_facts"),
+            "quarantine": _v2_digest(quarantine_digest, []),
+            "unresolved_events": _v2_digest(unresolved_events_digest, []),
+        },
+        params={
+            "decision_time": decision_time,
+            "required_facts": ",".join(policy.required_facts),
+            "basis_preference": ",".join(policy.basis_preference),
+        },
+    )
+    published = publish_dataset(
+        layer_root=Path(layer_root),
+        identity=identity,
+        partitions={"part-00000.parquet": events},
+        details={
+            "quality_report_hash": quality_report_hash,
+            "decision_time": decision_time.isoformat(),
+            "required_facts": list(policy.required_facts),
+            "basis_preference": list(policy.basis_preference),
+        },
+    )
+    return published.path
+
+
 def materialize_financial_quality(
     events: pl.DataFrame,
     *,
-    root: Path,
-    dataset_id: str,
+    root: Path | None = None,
+    layer_root: Path | None = None,
+    dataset_id: str | None = None,
     decision_time: datetime,
-    source_dataset_id: str,
+    source_dataset_id: str | None = None,
+    facts_dataset_id: str | None = None,
+    quarantine_digest: str | None = None,
+    unresolved_events_digest: str | None = None,
     policy: FinancialQualityPolicy = _DEFAULT_POLICY,
-    certification: DatasetCertification = DatasetCertification.RESEARCH,
+    certification: object | None = None,
 ) -> Path:
-    """Persist immutable quality evidence bound to one financial Silver dataset."""
-    if decision_time.tzinfo is None or not source_dataset_id.strip():
-        raise PITDataError("financial quality materialization requires PIT source identity")  # pragma: no cover
-    if events.is_empty():
-        raise PITDataError("financial quality materialization requires events")  # pragma: no cover
-    if list(events.columns) != _QUALITY_COLUMNS:
-        raise PITDataError("financial quality events have an unexpected schema")  # pragma: no cover
-    content_hash = canonical_content_hash(events, _QUALITY_COLUMNS)
-    time_start = events["available_at"].min()
-    time_end = events["available_at"].max()
-    if not isinstance(time_start, datetime) or not isinstance(time_end, datetime):
-        raise PITDataError("financial quality events lack available_at timestamps")  # pragma: no cover
-    manifest = make_manifest(
-        asset_kind=AssetKind.STOCK,
-        columns=_QUALITY_COLUMNS,
-        feature_set=_QUALITY_FEATURE_SET,
-        label_definition="none",
-        label_horizon_sessions=1,
-        time_start=time_start,
-        time_end=time_end,
-        provider_version="dart-financial-quality-v1",
-        universe_policy_version=policy.version,
-        row_count=events.height,
-        generated_time=decision_time,
-        certification=certification,
-        quality_report_hash=source_dataset_id,
-        schema_version="v2",
-        content_hash=content_hash,
-        storage_layout=HIVE_PARTITION_LAYOUT,
-    )
-    return ParquetDatasetStore(Path(root) / "financial_quality").write_partitioned(
+    """Publish quality evidence through the v2 identity-bound dataset contract."""
+
+    _ = dataset_id, certification
+    destination = layer_root if layer_root is not None else root
+    if destination is None:
+        raise PITDataError("financial quality materialization requires a Silver layer root")
+    return _materialize_financial_quality_v2(
         events,
-        dataset_id=dataset_id,
-        manifest=manifest,
-        expected_feature_set=_QUALITY_FEATURE_SET,
+        layer_root=Path(destination),
         decision_time=decision_time,
-        content_manifest={"source_financial_dataset_id": source_dataset_id, "policy_version": policy.version},
+        facts_dataset_id=facts_dataset_id or source_dataset_id or "",
+        quarantine_digest=quarantine_digest,
+        unresolved_events_digest=unresolved_events_digest,
+        policy=policy,
     )
 
 
 def load_latest_financial_quality(*, root: Path, decision_time: datetime) -> pl.DataFrame:
-    """Load the newest certified quality dataset; rows remain PIT-filtered by consumers."""
+    """Load the newest v2-certified quality dataset."""
+
     if decision_time.tzinfo is None:
-        raise PITDataError("financial quality decision_time must be timezone-aware")  # pragma: no cover
-    table_root = Path(root) / "financial_quality"
-    store = ParquetDatasetStore(table_root)
-    candidates: list[tuple[datetime, datetime, str]] = []
-    if table_root.exists():
+        raise PITDataError("financial quality decision_time must be timezone-aware")
+    table_root = Path(root)
+    candidates: list[tuple[datetime, str]] = []
+    if table_root.is_dir():
         for path in table_root.iterdir():
             if not path.is_dir() or path.name.startswith("."):
-                continue  # pragma: no cover
-            try:
-                manifest = store.read_manifest(path.name)
-            except (FileNotFoundError, ValueError, OSError):  # pragma: no cover
                 continue
-            generated = getattr(manifest, "generated_time", None)
-            if isinstance(generated, datetime) and generated.tzinfo is not None and getattr(manifest, "feature_set", "") == _QUALITY_FEATURE_SET:
-                candidates.append((generated, manifest.time_end, path.name))
+            try:
+                manifest = load_manifest(path)
+            except PITDataError:
+                continue
+            if manifest.kind == "financial_quality":
+                candidates.append((manifest.created_at, path.name))
     if not candidates:
-        raise PITDataError("missing certified financial quality dataset")  # pragma: no cover
-    _, manifest_time_end, dataset_id = max(candidates)
-    try:
-        # Manifest coverage may end after a historical replay decision.  The
-        # immutable companion is verified as a whole, then its rows are
-        # filtered at each session by eligible_companies_from_quality.
-        return store.read(
-            dataset_id,
-            AssetKind.STOCK,
-            _QUALITY_FEATURE_SET,
-            max(decision_time, manifest_time_end),
-        )
-    except (FileNotFoundError, ValueError, OSError) as exc:  # pragma: no cover
-        raise PITDataError("invalid certified financial quality dataset") from exc
+        raise PITDataError("missing certified financial quality dataset")
+    _, dataset_id = max(candidates)
+    return read_dataset(table_root / dataset_id).filter(pl.col("available_at") <= decision_time).collect()

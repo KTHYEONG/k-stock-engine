@@ -4,29 +4,33 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
 
 import polars as pl
 
-from src.core.datasets import HIVE_PARTITION_LAYOUT, DatasetCertification, make_manifest
-from src.core.instruments import AssetKind
 from src.core.time import SessionCalendar
+from src.data.datasets import (
+    DatasetIdentity,
+    DatasetLayer,
+    canonical_content_hash,
+    dataset_digest,
+    dataset_reference,
+    load_manifest,
+    publish_dataset,
+    read_dataset,
+)
 from src.data.normalization import (
     TRUSTED_FACT_SOURCE_KINDS,
     QuarantinedFiling,
     normalize_dart_financial_facts_with_quarantine,
 )
-from src.data.schemas import EvidenceKind, PITDataError, SilverTable
-from src.data.silver import load_latest_silver_table, validate_table
-from src.storage.parquet_datasets import ParquetDatasetStore, canonical_content_hash
+from src.data.schemas import EvidenceKind, PITDataError
 
 AVAILABILITY_POLICY: Final = "next-session-after-effective-receipt-v2"
 
-_FACT_TABLE = SilverTable.FINANCIAL_FACTS
-_FACT_FEATURE_SET = f"stock_pit_{_FACT_TABLE.value}_v1"
-_FACT_IDENTITY = ("company_id", "fiscal_period", "filing_id", "fact", "restatement_id")
+_FACT_IDENTITY = ("company_id", "fiscal_period", "filing_id", "fact", "restatement_id", "consolidated")
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,23 +117,41 @@ def _discover_fact_receipts(bronze_root: Path) -> list[dict[str, object]]:
 
 
 def _load_reference_tables(
-    silver_root: Path, decision_time: datetime
-) -> tuple[list[dict[str, object]], str]:
-    try:
-        disclosure_frame = load_latest_silver_table(
-            root=silver_root, table=SilverTable.DISCLOSURES, decision_time=decision_time
-        )
-    except PITDataError:
-        disclosure_frame = None
-    try:
-        existing = load_latest_silver_table(
-            root=silver_root, table=_FACT_TABLE, decision_time=decision_time
-        )
-    except PITDataError:
-        existing = None
+    silver_root: Path,
+    decision_time: datetime,
+    *,
+    disclosures_dataset_id: str | None = None,
+    financial_facts_dataset_id: str | None = None,
+) -> tuple[list[dict[str, object]], str, str]:
+    """Load disclosure and prior-fact inputs from verified v2 datasets."""
+
+    def _flat(kind: str, explicit_id: str | None = None) -> tuple[pl.DataFrame | None, str | None]:
+        if explicit_id is not None:
+            candidates = [Path(silver_root) / explicit_id]
+        else:
+            candidates = sorted(
+                path for path in Path(silver_root).glob(f"{kind}_*") if path.is_dir() and not path.is_symlink()
+            )
+            candidates.reverse()
+        for candidate in candidates:
+            try:
+                load_manifest(candidate)
+                return read_dataset(candidate).collect(), candidate.name
+            except PITDataError:
+                continue
+        return None, None
+
+    disclosure_frame, disclosure_id = _flat("disclosures", disclosures_dataset_id)
+    existing, _existing_id = _flat("financial_facts", financial_facts_dataset_id)
     disclosure_rows = disclosure_frame.to_dicts() if disclosure_frame is not None else []
     prior_hash = canonical_content_hash(existing, existing.columns) if existing is not None else ""
-    return disclosure_rows, prior_hash
+    disclosure_digest = (
+        dataset_reference(disclosure_id, kind="disclosures")
+        if disclosure_id is not None
+        else dataset_digest([])
+    )
+    _ = decision_time
+    return disclosure_rows, prior_hash, disclosure_digest
 
 
 def _payload_fingerprint(row: dict[str, object]) -> str:
@@ -209,9 +231,34 @@ def load_frozen_dart_ticker_bridge(
         raise PITDataError("ticker bridge missing: no retained dart_corp_codes receipt")
     payload_path = payloads[-1]
     receipt_hash = payload_path.parent.name
-    raw = json.loads(payload_path.read_text(encoding="utf-8"))
-    rows = raw if isinstance(raw, list) else []
-    mapping = {str(r.get("corp_code")): str(r.get("ticker")) for r in rows if isinstance(r, dict)}
+    if len(receipt_hash) != 64 or any(character not in "0123456789abcdef" for character in receipt_hash):
+        raise PITDataError("ticker bridge receipt hash is invalid")
+    try:
+        raw_bytes = payload_path.read_bytes()
+    except OSError as exc:
+        raise PITDataError("ticker bridge payload is unreadable") from exc
+    if hashlib.sha256(raw_bytes).hexdigest() != receipt_hash:
+        raise PITDataError("ticker bridge payload hash mismatch")
+    try:
+        raw = json.loads(raw_bytes)
+    except (TypeError, ValueError) as exc:
+        raise PITDataError("ticker bridge payload is invalid") from exc
+    if not isinstance(raw, list):
+        raise PITDataError("ticker bridge payload must be a list")
+    mapping: dict[str, str] = {}
+    for row in raw:
+        if not isinstance(row, dict):
+            raise PITDataError("ticker bridge row must be an object")
+        corp_code = str(row.get("corp_code") or "").strip()
+        ticker = str(row.get("ticker") or "").strip()
+        if not corp_code or not ticker:
+            raise PITDataError("ticker bridge row lacks corp_code or ticker")
+        previous = mapping.get(corp_code)
+        if previous is not None and previous != ticker:
+            raise PITDataError(f"ticker bridge corp_code maps to multiple tickers: {corp_code}")
+        mapping[corp_code] = ticker
+    if not mapping:
+        raise PITDataError("ticker bridge payload is empty")
     return mapping, receipt_hash
 
 
@@ -262,6 +309,31 @@ def _write_quarantine_file(
     return target
 
 
+def _validate_fact_frame(frame: pl.DataFrame, *, decision_time: datetime) -> None:
+    required = {
+        "company_id",
+        "fiscal_period",
+        "filing_id",
+        "fact",
+        "published_at",
+        "available_at",
+        "value",
+        "unit",
+        "consolidated",
+        "restatement_id",
+    }
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise PITDataError(f"financial facts frame lacks columns: {missing}")
+    keys = ["company_id", "fiscal_period", "filing_id", "fact", "restatement_id", "consolidated"]
+    if frame.select(keys).null_count().sum_horizontal().item() > 0:
+        raise PITDataError("financial facts contain a null primary key")
+    if frame.select(keys).is_duplicated().any():
+        raise PITDataError("financial facts contain a duplicate primary key")
+    if frame.filter(pl.col("available_at") > decision_time).height:
+        raise PITDataError("financial facts contain a row after decision_time")
+
+
 def refresh_dart_financial_facts(
     *,
     bronze_root: Path,
@@ -271,6 +343,8 @@ def refresh_dart_financial_facts(
     calendar: SessionCalendar,
     batch_size: int = 500,
     superseded_receipt_hashes: frozenset[str] = frozenset(),
+    disclosures_dataset_id: str | None = None,
+    financial_facts_dataset_id: str | None = None,
 ) -> DartFactRefreshArtifact:
     """Rebuild the financial-facts Silver table from every verified Bronze fact receipt.
 
@@ -285,7 +359,7 @@ def refresh_dart_financial_facts(
 
     Args:
         bronze_root: Scope Bronze root containing ``financial_facts/``.
-        silver_root: Scope Silver root receiving ``financial_facts/<hash>/``.
+        silver_root: Scope Silver root receiving a flat ``financial_facts_<hash16>/`` dataset.
         artifact_root: Destination for staging parquet and the refresh report.
         decision_time: Availability cutoff; must be timezone-aware.
         calendar: KRX sessions (see ``xkrx_session_calendar``) extending past
@@ -314,7 +388,12 @@ def refresh_dart_financial_facts(
     if unknown:
         raise PITDataError(f"superseded receipts not found in Bronze: {sorted(unknown)}")
     receipts = [r for r in receipts if str(r["content_hash"]) not in superseded_receipt_hashes]
-    disclosure_rows, prior_hash = _load_reference_tables(Path(silver_root), decision_time)
+    disclosure_rows, prior_hash, disclosure_digest = _load_reference_tables(
+        Path(silver_root),
+        decision_time,
+        disclosures_dataset_id=disclosures_dataset_id,
+        financial_facts_dataset_id=financial_facts_dataset_id,
+    )
     bridge_root = Path(bronze_root) / "dart_corp_codes"
     bridge: dict[str, str] | None = None
     bridge_receipt_hash: str | None = None
@@ -356,7 +435,10 @@ def refresh_dart_financial_facts(
         if "value" in staged.columns:
             staged = staged.with_columns(pl.col("value").cast(pl.Float64))
         part_path = staging_dir / f"batch-{batch_idx // bound:05d}.parquet"
-        staged.write_parquet(part_path)
+        try:
+            staged.write_parquet(part_path)
+        except (OSError, pl.exceptions.PolarsError) as exc:
+            raise PITDataError(f"cannot stage financial facts partition: {part_path}") from exc
         staged_paths.append(part_path)
     if staged_paths:
         new_rows = pl.scan_parquet(sorted(staged_paths)).collect()
@@ -374,12 +456,18 @@ def refresh_dart_financial_facts(
     merged = _merge_fact_frames(None, new_rows)
     if merged.height == 0:
         raise PITDataError("DART XBRL facts response is empty; certification blocked")
-    validate_table(_FACT_TABLE, merged, decision_time=decision_time)
+    _validate_fact_frame(merged, decision_time=decision_time)
     output_hash = canonical_content_hash(merged, merged.columns)
     report_parts = [*sorted(receipt_hashes), output_hash]
     report_hash = hashlib.sha256("\x00".join(report_parts).encode("utf-8")).hexdigest()
-    # 같은 공시가 과거에는 파서 값으로, 나중에는 표준 API 값으로 수집됐다면 신뢰 값이 있으므로 격리 대상이 아니다.
-    trusted_filings = set(zip(merged["company_id"].to_list(), merged["fiscal_period"].to_list(), merged["filing_id"].to_list(), strict=True))
+    trusted_filings = set(
+        zip(
+            merged["company_id"].to_list(),
+            merged["fiscal_period"].to_list(),
+            merged["filing_id"].to_list(),
+            strict=True,
+        )
+    )
     quarantined = [
         record
         for record in _deduplicate_quarantine(quarantined_all)
@@ -389,64 +477,47 @@ def refresh_dart_financial_facts(
     quarantine_path = _write_quarantine_file(
         artifact_root=Path(artifact_root), output_hash=output_hash, records=quarantined
     )
-    available_dates = [d for d in merged["available_at"].to_list() if isinstance(d, datetime)]
-    coverage_start = min(d.astimezone(UTC).date() for d in available_dates)
-    coverage_end = max(d.astimezone(UTC).date() for d in available_dates)
-    manifest = make_manifest(
-        asset_kind=AssetKind.STOCK,
-        columns=merged.columns,
-        feature_set=_FACT_FEATURE_SET,
-        label_definition="none",
-        label_horizon_sessions=1,
-        time_start=datetime.combine(coverage_start, time.min, tzinfo=UTC),
-        time_end=datetime.combine(coverage_end, time.min, tzinfo=UTC),
-        provider_version="dart-incremental-v1",
-        universe_policy_version="v1",
-        row_count=merged.height,
-        schema_version="v2",
-        content_hash=output_hash,
-        storage_layout=HIVE_PARTITION_LAYOUT,
-        certification=DatasetCertification.RESEARCH,
-        quality_report_hash=report_hash,
+    calendar_digest = hashlib.sha256(
+        "\n".join(session.astimezone(UTC).isoformat() for session in calendar.sessions).encode("utf-8")
+    ).hexdigest()
+    identity = DatasetIdentity(
+        kind="financial_facts",
+        layer=DatasetLayer.SILVER,
+        policy_version="dart-incremental-v1",
+        inputs={
+            "bronze_facts": dataset_digest(receipt_hashes),
+            "superseded": dataset_digest(sorted(superseded_receipt_hashes)),
+            "disclosures": disclosure_digest,
+            "ticker_bridge": dataset_digest([bridge_receipt_hash]) if bridge_receipt_hash else dataset_digest([]),
+        },
+        params={
+            "decision_time": decision_time,
+            "availability_policy": AVAILABILITY_POLICY,
+            "calendar_digest": calendar_digest,
+            "ticker_bridge": bridge_receipt_hash,
+        },
     )
-    store = ParquetDatasetStore(Path(silver_root) / _FACT_TABLE.value)
-    existing_dir = Path(silver_root) / _FACT_TABLE.value / output_hash
-    if existing_dir.exists():
-        return DartFactRefreshArtifact(
-            prior_dataset_hash=prior_hash,
-            receipt_hashes=tuple(receipt_hashes),
-            output_hash=output_hash,
-            report_hash=report_hash,
-            dataset_path=str(existing_dir),
-            row_count=merged.height,
-            quarantine_path=str(quarantine_path),
-            quarantined_filings=len(quarantined),
-        )
-    try:
-        dataset_dir = store.write_partitioned(
-            merged,
-            dataset_id=output_hash,
-            manifest=manifest,
-            expected_feature_set=_FACT_FEATURE_SET,
-            decision_time=decision_time,
-            content_manifest={
-                "report_hash": report_hash,
-                "receipt_hashes": list(receipt_hashes),
-                "prior_dataset_hash": prior_hash,
-                "availability_policy": AVAILABILITY_POLICY,
-                "superseded_receipt_hashes": sorted(superseded_receipt_hashes),
-                "quarantined_filings": len(quarantined),
-                "trusted_source_kinds": trusted_kinds,
-            },
-        )
-    except ValueError as exc:
-        raise PITDataError(str(exc)) from exc
+    published = publish_dataset(
+        layer_root=Path(silver_root),
+        identity=identity,
+        partitions={"part-00000.parquet": merged},
+        details={
+            "report_hash": report_hash,
+            "receipt_hashes": list(receipt_hashes),
+            "prior_dataset_hash": prior_hash,
+            "availability_policy": AVAILABILITY_POLICY,
+            "superseded_receipt_hashes": sorted(superseded_receipt_hashes),
+            "quarantined_filings": len(quarantined),
+            "trusted_source_kinds": trusted_kinds,
+            "content_sha64": output_hash,
+        },
+    )
     artifact = DartFactRefreshArtifact(
         prior_dataset_hash=prior_hash,
         receipt_hashes=tuple(receipt_hashes),
         output_hash=output_hash,
         report_hash=report_hash,
-        dataset_path=str(dataset_dir),
+        dataset_path=str(published.path),
         row_count=merged.height,
         quarantine_path=str(quarantine_path),
         quarantined_filings=len(quarantined),
@@ -459,7 +530,7 @@ def refresh_dart_financial_facts(
                 "receipt_hashes": list(receipt_hashes),
                 "output_hash": output_hash,
                 "report_hash": report_hash,
-                "dataset_path": str(dataset_dir),
+                "dataset_path": str(published.path),
                 "row_count": merged.height,
                 "quarantine_path": str(quarantine_path),
                 "quarantined_filings": len(quarantined),

@@ -20,15 +20,25 @@ DAY2 = date(2026, 3, 5)
 
 
 def _universe(silver_root: Path, sessions: tuple[date, ...], *, name: str = "ordinary_universe_testfix") -> Path:
-    dataset = Path(silver_root) / name
-    dataset.mkdir(parents=True, exist_ok=True)
-    manifest = {
-        "dataset_id": name,
-        "policy_version": "krx-ordinary-equity-v1",
-        "partitions": [{"session": day.isoformat()} for day in sessions],
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+
+    partitions = {
+        f"session={day.isoformat()}/part.parquet": pl.DataFrame(
+            {"session": [day], "instrument_id": ["KRX:005930"], "ticker": ["005930"], "eligible": [True]}
+        )
+        for day in sessions
     }
-    (dataset / "manifest.json").write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
-    return dataset
+    return publish_dataset(
+        layer_root=Path(silver_root),
+        identity=DatasetIdentity(
+            kind="ordinary_universe",
+            layer=DatasetLayer.SILVER,
+            policy_version="krx-ordinary-equity-v1",
+            inputs={},
+            params={"calendar": ",".join(day.isoformat() for day in sessions)},
+        ),
+        partitions=partitions,
+    ).path
 
 
 def _rec(session: date, **overrides: object) -> dict[str, object]:
@@ -113,7 +123,7 @@ def test_materialize_preserves_base_price(tmp_path: Path) -> None:
     assert frame["base_price"].to_list() == [10000]
     assert frame["price_state"].to_list() == ["tradable"]
     assert frame["invalid_reason"].to_list() == [None]
-    assert frame["instrument_id"].to_list() == ["KRX:KR7005930003"]
+    assert frame["instrument_id"].to_list() == ["KRX:005930"]
     assert frame["ticker"].to_list() == ["005930"]
 
 
@@ -512,17 +522,27 @@ def test_materialize_identity_unchanged_by_batching(tmp_path: Path) -> None:
     result = materialize_daily_market_silver(
         catalog=ReceiptCatalog(catalog_root), universe_root=silver_root, silver_root=silver_root
     )
-    policy = DailyMarketSilverPolicy()
-    expected = "daily_market_" + hashlib.sha256(
-        "\n".join((
-            POLICY_VERSION,
-            policy.available_time.isoformat(),
-            repr(policy.fluc_tolerance_pct),
-            "ordinary_universe_testfix",
-            *(f"{session.isoformat()}:{digests[session]}" for session in sessions),
-        )).encode("utf-8")
-    ).hexdigest()[:16]
-    assert result.dataset_id == expected
+    from src.data.datasets import DatasetIdentity, dataset_id_for, load_manifest
+
+    manifest = load_manifest(result.dataset_path)
+    identity = DatasetIdentity(
+        kind=manifest.kind,
+        layer=manifest.layer,
+        policy_version=manifest.policy_version,
+        inputs=manifest.inputs,
+        params=manifest.params,
+    )
+    assert result.dataset_id == dataset_id_for(identity)
+    assert manifest.kind == "daily_market"
+    assert manifest.params["available_time"] == "18:00:00"
+    assert manifest.params["fluc_tolerance_pct"] == 0.01
+    assert {entry["session"] for entry in manifest.details["partitions"]} == {
+        session.isoformat() for session in sessions
+    }
+    assert {digests[session] for session in sessions} == {
+        entry["source_hash"] for entry in manifest.details["partitions"]
+    }
+    _ = (hashlib, POLICY_VERSION, DailyMarketSilverPolicy)
 
 
 def test_materialize_parses_payload_once_per_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -548,3 +568,36 @@ def test_materialize_parses_payload_once_per_session(tmp_path: Path, monkeypatch
         catalog=ReceiptCatalog(catalog_root), universe_root=silver_root, silver_root=silver_root
     )
     assert calls["count"] == len(sessions)
+
+
+def test_materialize_rejects_invalid_policy_values(tmp_path: Path) -> None:
+    catalog, _catalog_root, silver_root = _setup(tmp_path, (DAY1,))
+
+    with pytest.raises(PITDataError, match="available_time"):
+        materialize_daily_market_silver(
+            catalog=catalog,
+            universe_root=silver_root,
+            silver_root=silver_root,
+            policy=DailyMarketSilverPolicy(available_time=object()),  # type: ignore[arg-type]
+        )
+    with pytest.raises(PITDataError, match="tolerance"):
+        materialize_daily_market_silver(
+            catalog=catalog,
+            universe_root=silver_root,
+            silver_root=silver_root,
+            policy=DailyMarketSilverPolicy(fluc_tolerance_pct=float("nan")),
+        )
+
+
+def test_materialize_rejects_duplicate_exchange_ticker(tmp_path: Path) -> None:
+    catalog, catalog_root, silver_root = _setup(tmp_path, (DAY1,))
+    _publish(
+        catalog_root,
+        _payload_dir(tmp_path),
+        DAY1,
+        [_rec(DAY1), _rec(DAY1, ISU_CD="KR7005930004")],
+    )
+    with pytest.raises(PITDataError, match="duplicate ticker"):
+        materialize_daily_market_silver(
+            catalog=ReceiptCatalog(catalog_root), universe_root=silver_root, silver_root=silver_root
+        )

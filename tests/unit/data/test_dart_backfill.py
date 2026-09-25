@@ -191,22 +191,34 @@ def test_single_account_backfill_request_rejects_each_malformed_field() -> None:
 def test_load_security_master_selects_latest_dataset_only(tmp_path) -> None:
     from datetime import UTC, datetime
 
+    import polars as pl
+
     from src.data.dart_backfill import _load_security_master
-    from src.data.schemas import SilverTable
-    from src.data.silver import SilverStore, complete_minimal_fixture
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
 
-    # Given: two certified security_master publishes at different decision times
-    # (distinct content, so distinct dataset directories under the table root).
-    store = SilverStore(tmp_path / "silver")
-    first_time = datetime(2024, 1, 3, tzinfo=UTC)
-    tables_1, _, report_1 = complete_minimal_fixture(decision_time=first_time)
-    store.materialize_all(tables_1, report=report_1, decision_time=first_time)
+    # Given: two certified security_master publishes at different content versions.
+    for day, ticker in ((3, "005930"), (10, "000660")):
+        moment = datetime(2024, 1, day, tzinfo=UTC)
+        frame = pl.DataFrame(
+            {
+                "instrument_id": [f"KRX:{ticker}"],
+                "ticker": [ticker],
+                "valid_from": [datetime(2020, 1, 1, tzinfo=UTC)],
+            }
+        )
+        publish_dataset(
+            layer_root=tmp_path / "silver",
+            identity=DatasetIdentity(
+                kind="security_master",
+                layer=DatasetLayer.SILVER,
+                policy_version="fixture-v1",
+                inputs={},
+                params={"decision_time": moment},
+            ),
+            partitions={"part-00000.parquet": frame},
+        )
 
-    second_time = datetime(2024, 1, 10, tzinfo=UTC)
-    tables_2, _, report_2 = complete_minimal_fixture(decision_time=second_time)
-    store.materialize_all(tables_2, report=report_2, decision_time=second_time)
-
-    dataset_dirs = list((tmp_path / "silver" / "security_master").iterdir())
+    dataset_dirs = list((tmp_path / "silver").glob("security_master_*"))
     assert len(dataset_dirs) == 2, "fixture must produce two distinct dataset versions"
 
     # When
@@ -214,15 +226,14 @@ def test_load_security_master_selects_latest_dataset_only(tmp_path) -> None:
     master = _load_security_master(tmp_path / "silver", decision_time=read_time)
 
     # Then: exactly one version's rows are returned, never both concatenated.
-    assert master.height == tables_2[SilverTable.SECURITY_MASTER].height
     assert master.height == 1
+    assert master["ticker"].to_list() == ["000660"]
 
 
 def test_backfill_batch_uses_wide_fixed_disclosure_fetch_range_and_narrow_identity_range(tmp_path, monkeypatch) -> None:
     from datetime import UTC, date, datetime
     import polars as pl
-    from src.data.dart_backfill import DartHistoricalBackfillRequest, run_dart_historical_backfill_batch
-    from src.data.research_period import OPENDART_FIRST_FISCAL_YEAR
+    from src.data.dart_backfill import DartHistoricalBackfillRequest, OPENDART_FIRST_FISCAL_YEAR, run_dart_historical_backfill_batch
     from src.integrations.dart.client import DartCorpCodeRecord
 
     class Collector:
@@ -443,7 +454,8 @@ def test_scoped_batch_catalog_success_suppresses_retry(tmp_path) -> None:
     runtime = _scoped_runtime(tmp_path)
     catalog = _scoped_catalog(runtime)
     body = b'{"records": [{"fact": 1}]}'
-    payload_path = tmp_path / "fact.json"
+    payload_path = runtime.workspace.bronze_root / "fact.json"
+    payload_path.parent.mkdir(parents=True, exist_ok=True)
     payload_path.write_bytes(body)
     catalog.publish(
         (
@@ -723,3 +735,118 @@ def test_key_policy_rejects_unsafe_pacing_and_budget() -> None:
         DartKeyPolicy(daily_budget=20000, daily_reserve=10, min_interval_seconds=0.1, max_workers=4)
     with pytest.raises(ValueError, match="daily_reserve"):
         DartKeyPolicy(daily_budget=1000, daily_reserve=1000, min_interval_seconds=0.1, max_workers=4)
+
+
+def test_security_master_loader_handles_invalid_v2_and_legacy_sources(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    import polars as pl
+
+    from src.data.dart_backfill import _load_security_master
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+    from src.data.schemas import PITDataError
+
+    broken_root = tmp_path / "broken"
+    broken = broken_root / "security_master_0123456789abcdef"
+    broken.mkdir(parents=True)
+    (broken / "manifest.json").write_text("not-json", encoding="utf-8")
+    with pytest.raises(PITDataError, match="security master is absent"):
+        _load_security_master(broken_root, decision_time=datetime(2024, 1, 1, tzinfo=UTC))
+
+    bad_time_root = tmp_path / "bad-time"
+    bad_time = publish_dataset(
+        layer_root=bad_time_root,
+        identity=DatasetIdentity(
+            "security_master", DatasetLayer.SILVER, "fixture-v1", {}, {"decision_time": "not-a-time"}
+        ),
+        partitions={"part.parquet": pl.DataFrame({"ticker": ["005930"]})},
+    )
+    with pytest.raises(PITDataError, match="decision_time"):
+        _load_security_master(bad_time_root, decision_time=datetime(2024, 1, 1, tzinfo=UTC))
+
+    legacy_root = tmp_path / "legacy"
+    legacy_generation = legacy_root / "security_master" / "legacy"
+    legacy_generation.mkdir(parents=True)
+    (legacy_generation / "dataset_manifest.json").write_text(
+        '{"time_end":"2024-01-01T00:00:00+00:00"}', encoding="utf-8"
+    )
+    pl.DataFrame({"ticker": ["005930"]}).write_parquet(legacy_generation / "part.parquet")
+    loaded = _load_security_master(legacy_root, decision_time=datetime(2024, 1, 2, tzinfo=UTC))
+    assert loaded["ticker"].to_list() == ["005930"]
+
+    empty_root = tmp_path / "empty"
+    empty_legacy = empty_root / "security_master" / "empty"
+    empty_legacy.mkdir(parents=True)
+    (empty_legacy / "dataset_manifest.json").write_text(
+        '{"time_end":"2024-01-01T00:00:00+00:00"}', encoding="utf-8"
+    )
+    with pytest.raises(PITDataError, match="no parquet"):
+        _load_security_master(empty_root, decision_time=datetime(2024, 1, 2, tzinfo=UTC))
+    assert bad_time.dataset_id.startswith("security_master_")
+
+
+def test_security_master_loader_handles_naive_legacy_and_empty_sources(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    import polars as pl
+
+    from src.data.dart_backfill import _load_security_master
+    from src.data.schemas import PITDataError
+
+    naive_root = tmp_path / "naive"
+    generation = naive_root / "security_master" / "legacy"
+    generation.mkdir(parents=True)
+    (generation / "dataset_manifest.json").write_text('{"time_end":"2024-01-01T00:00:00"}', encoding="utf-8")
+    pl.DataFrame({"ticker": ["005930"]}).write_parquet(generation / "part.parquet")
+    assert _load_security_master(naive_root, decision_time=datetime(2024, 1, 2, tzinfo=UTC))["ticker"].to_list() == ["005930"]
+
+    empty_root = tmp_path / "empty-generation"
+    (empty_root / "security_master" / "empty").mkdir(parents=True)
+    with pytest.raises(PITDataError, match="absent"):
+        _load_security_master(empty_root, decision_time=datetime(2024, 1, 2, tzinfo=UTC))
+
+    malformed_root = tmp_path / "malformed"
+    malformed = malformed_root / "security_master" / "bad"
+    malformed.mkdir(parents=True)
+    (malformed / "dataset_manifest.json").write_text("not-json", encoding="utf-8")
+    with pytest.raises(PITDataError, match="unreadable"):
+        _load_security_master(malformed_root, decision_time=datetime(2024, 1, 2, tzinfo=UTC))
+
+    future_root = tmp_path / "future"
+    future = future_root / "security_master" / "future"
+    future.mkdir(parents=True)
+    (future / "dataset_manifest.json").write_text('{"time_end":"2025-01-01T00:00:00+00:00"}', encoding="utf-8")
+    with pytest.raises(PITDataError, match="visible"):
+        _load_security_master(future_root, decision_time=datetime(2024, 1, 2, tzinfo=UTC))
+
+    symlink_root = tmp_path / "symlink"
+    symlink_root.mkdir()
+    (symlink_root / "security_master_link").symlink_to(generation, target_is_directory=True)
+    with pytest.raises(PITDataError, match="absent"):
+        _load_security_master(symlink_root, decision_time=datetime(2024, 1, 2, tzinfo=UTC))
+
+
+def test_security_master_loader_normalizes_naive_v2_manifest_timestamp(tmp_path, monkeypatch) -> None:
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    import polars as pl
+
+    import src.data.dart_backfill as backfill
+    from src.data.dart_backfill import _load_security_master
+
+    root = tmp_path / "silver"
+    dataset = root / "security_master_0123456789abcdef"
+    dataset.mkdir(parents=True)
+    monkeypatch.setattr(
+        backfill,
+        "load_manifest",
+        lambda _path: SimpleNamespace(params={}, created_at=datetime(2024, 1, 1)),
+    )
+    monkeypatch.setattr(
+        backfill,
+        "read_dataset",
+        lambda _path: SimpleNamespace(collect=lambda: pl.DataFrame({"ticker": ["005930"]})),
+    )
+    result = _load_security_master(root, decision_time=datetime(2024, 1, 2, tzinfo=UTC))
+    assert result["ticker"].to_list() == ["005930"]

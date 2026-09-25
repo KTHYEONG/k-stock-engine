@@ -1,48 +1,19 @@
 """PIT normalization from Bronze receipts to certified Silver tables."""
 from __future__ import annotations
 
-import hashlib
-import json
 import re
 from bisect import bisect_right
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
-from pathlib import Path
 from typing import Any, Final
 
 import polars as pl
 
 from src.core.time import KRX_TZ, SessionCalendar
-from src.data.schemas import BronzeReceipt, CertificationReport, EvidenceKind, PITDataError, SilverTable
-
-_REQUIRED_XBRL_FACTS: tuple[str, ...] = (
-    "sales",
-    "gross_profit",
-    "operating_profit",
-    "net_income",
-    "assets",
-    "equity",
-    "cash",
-    "debt",
-    "operating_cash_flow",
-    "capex",
-)
+from src.data.schemas import PITDataError
 
 _DART_MAPPING_VERSION = "dart-fact-map-v1"
-
-
-def _raw_isin(record: Mapping[str, Any]) -> str | None:
-    for name in ("source_security_id", "security_id", "ISU_CD", "isu_cd"):
-        value = record.get(name)
-        if value not in (None, ""):
-            candidate = str(value).strip().upper()
-            # KRX pages also expose foreign-listed issuers (for example
-            # KYG/HK ISINs for 900xxx tickers); retain any structurally
-            # valid 12-character ISIN rather than silently dropping them.
-            if re.fullmatch(r"[A-Z]{2}[A-Z0-9]{10}", candidate):
-                return candidate
-    return None
 
 
 TRUSTED_FACT_SOURCE_KINDS: Final[frozenset[str]] = frozenset({"opendart_standard", "legacy_document_verified"})
@@ -266,6 +237,18 @@ def normalize_dart_financial_facts_with_quarantine(
     disc_published: dict[str, Any] = {}
     for row in disc_list:
         if isinstance(row, Mapping):
+            raw_available = row.get("available_at")
+            if raw_available is not None:
+                try:
+                    available_at = (
+                        raw_available
+                        if isinstance(raw_available, datetime)
+                        else datetime.fromisoformat(str(raw_available).replace("Z", "+00:00"))
+                    )
+                except ValueError:
+                    continue
+                if available_at.tzinfo is None or available_at > decision_time:
+                    continue
             fid = str(row.get("filing_id") or row.get("rcept_no") or "").strip()
             if fid and row.get("published_at") is not None:
                 disc_published[fid] = row.get("published_at")
@@ -407,36 +390,6 @@ def normalize_dart_financial_facts_with_quarantine(
     return pl.DataFrame(rows), quarantined
 
 
-def normalize_dart_financial_facts(
-    *,
-    pages: Any,
-    disclosure_rows: Any,
-    source_hash: str,
-    calendar: SessionCalendar,
-    decision_time: datetime,
-    ticker_by_corp_code: Mapping[str, str] | None = None,
-    bridge_receipt_hash: str | None = None,
-) -> pl.DataFrame:
-    """Return only the trusted fact frame; see ``normalize_dart_financial_facts_with_quarantine``."""
-    frame, _ = normalize_dart_financial_facts_with_quarantine(
-        pages=pages,
-        disclosure_rows=disclosure_rows,
-        source_hash=source_hash,
-        calendar=calendar,
-        decision_time=decision_time,
-        ticker_by_corp_code=ticker_by_corp_code,
-        bridge_receipt_hash=bridge_receipt_hash,
-    )
-    return frame
-
-
-def _load_payload(receipt: BronzeReceipt, kind: EvidenceKind) -> Any:
-    try:
-        return json.loads(receipt.payload_path.read_bytes())
-    except (OSError, ValueError) as exc:
-        raise PITDataError(f"invalid Bronze payload for {kind.value}: {exc}") from exc
-
-
 def _as_aware(value: Any, fallback: datetime) -> datetime:
     if isinstance(value, datetime):
         dt = value
@@ -458,13 +411,6 @@ def _as_aware(value: Any, fallback: datetime) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=KRX_TZ)
     return dt
-
-
-def _available_at(retrieved: datetime, decision_time: datetime) -> datetime:
-    base = retrieved if retrieved.tzinfo is not None else retrieved.replace(tzinfo=UTC)
-    if base > decision_time:
-        return decision_time
-    return base
 
 
 def _receipt_source_date(value: str) -> date:
@@ -494,18 +440,6 @@ def _next_session_open_after(
     if idx >= len(session_opens):
         raise PITDataError(f"no next KRX session after {effective}")
     return session_opens[idx]
-
-
-def _records_from(payload: Any) -> list[dict[str, Any]]:
-    if isinstance(payload, dict):
-        for key in ("records", "intervals", "list"):
-            val = payload.get(key)
-            if isinstance(val, list):
-                return [r for r in val if isinstance(r, dict)]
-        return []
-    if isinstance(payload, list):
-        return [r for r in payload if isinstance(r, dict)]
-    return []
 
 
 def _required_value(record: dict[str, Any], *keys: str) -> Any:
@@ -552,306 +486,3 @@ def normalize_corporate_action_records(*, action_records: Sequence[Mapping[str, 
     return pl.DataFrame(rows, infer_schema_length=None).unique(
         subset=["instrument_id", "effective_date", "action_id"], maintain_order=True
     )
-
-
-def select_verified_investor_flow_records(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Accept LS/KIWOOM evidence only; deterministic LS win on equal overlap."""
-    _fields = ("foreign_buy_value", "foreign_sell_value", "foreign_net_value", "institution_net_value", "retail_net_value")
-    grouped: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
-    unsupported_keys: set[tuple[str, str]] = set()
-    for record in records:
-        if not isinstance(record, Mapping):
-            raise PITDataError("unsupported investor-flow provider record; certification blocked")
-        raw_provider = record.get("_source_provider")
-        if raw_provider is None or str(raw_provider).strip() == "":
-            raise PITDataError("unsupported investor-flow provider missing; certification blocked")
-        provider = str(raw_provider).strip().upper()
-        if provider not in ("LS", "KIWOOM"):
-            session = str(record.get("session") or "").strip()
-            ticker = str(record.get("ticker") or record.get("instrument_id") or "").strip()
-            if session and ticker:
-                unsupported_keys.add((session, ticker))
-            continue
-        session = str(record.get("session") or "").strip()
-        ticker = str(record.get("ticker") or record.get("instrument_id") or "").strip()
-        if not session or not ticker:
-            raise PITDataError("investor flow record missing session/ticker; certification blocked")
-        grouped.setdefault((session, ticker), []).append(record)
-    unsupported_only = sorted(unsupported_keys.difference(grouped))
-    if unsupported_only:
-        raise PITDataError(
-            f"unsupported investor-flow provider for key {unsupported_only[0]!r}; certification blocked"
-        )
-    verified: list[dict[str, Any]] = []
-    for key in sorted(grouped):
-        candidates = grouped[key]
-        values: list[tuple[float, ...]] = []
-        for candidate in candidates:
-            try:
-                values.append(tuple(float(candidate[field]) for field in _fields))
-            except (KeyError, TypeError, ValueError) as exc:
-                raise PITDataError(f"conflicting investor_flow primary key {key!r}; certification blocked") from exc
-        first = values[0]
-        if any(value != first for value in values[1:]):
-            raise PITDataError(f"conflicting investor_flow primary key {key!r}; certification blocked")
-        chosen = None
-        for candidate in candidates:
-            if str(candidate.get("_source_provider")).strip().upper() == "LS":
-                chosen = candidate
-                break
-        if chosen is None:
-            chosen = candidates[0]
-        verified.append(dict(chosen))
-    return verified
-
-
-def normalize_stock_evidence(
-    receipts: Mapping[EvidenceKind, BronzeReceipt],
-    *,
-    calendar: SessionCalendar | None = None,
-    decision_time: datetime,
-    streamed_tables: frozenset[SilverTable] = frozenset(),
-    streamed_corporate_actions: list[dict[str, Any]] | None = None,
-) -> tuple[Mapping[SilverTable, pl.DataFrame], CertificationReport]:
-    from src.data.ordinary_universe import classify_krx_master_row
-
-    if decision_time.tzinfo is None:
-        raise PITDataError("decision_time must be timezone-aware")
-    if calendar is not None and not calendar.sessions:
-        raise PITDataError("calendar must contain sessions")
-    missing = [kind for kind in EvidenceKind if kind not in receipts and kind is not EvidenceKind.LIFECYCLE_EVENTS and kind is not EvidenceKind.INDUSTRY]
-    if missing:
-        names = sorted(kind.value for kind in missing)
-        raise PITDataError(f"missing required evidence: {', '.join(names)} (investor_flow, financial_facts)")
-    payloads: dict[EvidenceKind, Any] = {}
-    for kind, receipt in receipts.items():
-        if kind in (EvidenceKind.LIFECYCLE_EVENTS, EvidenceKind.INDUSTRY):
-            continue
-        if not Path(receipt.payload_path).exists() or not Path(receipt.metadata_path).exists():
-            raise PITDataError(f"missing Bronze receipt payload for {kind.value}")
-        if not receipt.content_hash:
-            raise PITDataError(f"empty content hash for {kind.value}")
-        if SilverTable(kind.value) not in streamed_tables:
-            payloads[kind] = _load_payload(receipt, kind)
-
-    from src.core.datasets import DatasetCertification
-    from src.data.silver import certify_silver, next_krx_session_open
-
-    def _avail(kind: EvidenceKind) -> datetime:
-        return _available_at(receipts[kind].retrieved_at, decision_time)
-
-    def _hash(kind: EvidenceKind) -> str:
-        return receipts[kind].content_hash
-
-    # Calendar table from sessions payload.
-    cal_payload = payloads[EvidenceKind.CALENDAR]
-    sessions_raw: list[Any] = []
-    if isinstance(cal_payload, dict) and isinstance(cal_payload.get("sessions"), list):
-        sessions_raw = list(cal_payload["sessions"])
-    cal_sessions: list[datetime] = []
-    for item in sessions_raw:
-        dt = _as_aware(item, decision_time)
-        if dt.tzinfo is None:
-            raise PITDataError("calendar session must be timezone-aware")
-        cal_sessions.append(dt)
-    if not cal_sessions:
-        cal_sessions = list(calendar.sessions) if calendar is not None else [decision_time]
-    cal_sessions = sorted(set(cal_sessions))
-    if calendar is not None:
-        cal_dates = {s.astimezone(KRX_TZ).date() for s in cal_sessions}
-        for s in calendar.sessions:
-            if s.astimezone(KRX_TZ).date() not in cal_dates:
-                raise PITDataError(f"missing sessions inside declared coverage: {s.date()} (calendar)")
-    tables: dict[SilverTable, pl.DataFrame] = {}
-    tables[SilverTable.CALENDAR] = pl.DataFrame(
-        {"session": cal_sessions, "available_at": [_avail(EvidenceKind.CALENDAR)] * len(cal_sessions), "source_hash": [_hash(EvidenceKind.CALENDAR)] * len(cal_sessions)}
-    )
-
-    # Security master with lineage.
-    if SilverTable.SECURITY_MASTER in streamed_tables:
-        tables[SilverTable.SECURITY_MASTER] = pl.DataFrame(
-            {column: pl.Series([], dtype=pl.String) for column in (
-                "instrument_id", "ticker", "company_id", "market", "sector", "listing_date",
-                "delisting_date", "share_class", "status", "valid_from", "valid_to", "available_at", "source_hash"
-            )}
-        )
-        master_records = []
-    else:
-        master_records = _records_from(payloads[EvidenceKind.SECURITY_MASTER])
-    if not master_records and SilverTable.SECURITY_MASTER not in streamed_tables:
-        raise PITDataError("security master response is empty; certification blocked")
-    master_rows: list[dict[str, Any]] = []
-    seen_master: set[tuple[str, datetime]] = set()
-    for rec in master_records:
-        ticker = str(_required_value(rec, "ticker", "isu_cd", "ISU_SRT_CD", "source_identifier")).strip()
-        instrument_id = f"KRX:{ticker}"
-        valid_from = _as_aware(rec.get("listing_date") or rec.get("listed_from") or rec.get("LIST_DD") or rec.get("valid_from") or cal_sessions[0], cal_sessions[0])
-        key = (instrument_id, valid_from)
-        if key in seen_master:
-            valid_from = datetime.combine(valid_from.date(), time(9, 0), tzinfo=KRX_TZ)
-        seen_master.add(key)
-        eligible, exclusion_reason = classify_krx_master_row(rec)
-        master_rows.append({"instrument_id": instrument_id, "ticker": ticker, "source_security_id": _raw_isin(rec), "company_id": str(rec.get("company_id") or rec.get("corp_code") or ticker), "market": str(_required_value(rec, "market", "MKT_TP_NM")), "sector": str(rec.get("sector") or rec.get("sector_name") or "__UNKNOWN__"), "listing_date": valid_from, "delisting_date": rec.get("delisting_date") or rec.get("delisted_on"), "share_class": "common" if eligible else "other", "ordinary_equity_eligible": eligible, "ordinary_equity_exclusion_reason": exclusion_reason, "share_kind": str(rec.get("KIND_STKCERT_TP_NM") or ""), "security_group": str(rec.get("SECUGRP_NM") or ""), "status": str(rec.get("status") or "listed"), "valid_from": valid_from, "valid_to": rec.get("valid_to") or valid_from, "available_at": _avail(EvidenceKind.SECURITY_MASTER), "source_hash": _hash(EvidenceKind.SECURITY_MASTER)})
-    if SilverTable.SECURITY_MASTER not in streamed_tables:
-        tables[SilverTable.SECURITY_MASTER] = pl.DataFrame(master_rows)
-
-    # Daily market with cap/shares lineage.
-    if SilverTable.DAILY_MARKET in streamed_tables:
-        tables[SilverTable.DAILY_MARKET] = pl.DataFrame(
-            {column: pl.Series([], dtype=pl.String) for column in (
-                "session", "instrument_id", "open", "high", "low", "close", "volume",
-                "trading_value", "market_cap", "shares_outstanding", "source_security_id", "available_at", "source_hash"
-            )}
-        )
-        market_records = []
-    else:
-        market_records = _records_from(payloads[EvidenceKind.DAILY_MARKET])
-    market_rows: list[dict[str, Any]] = []
-    if not market_records and SilverTable.DAILY_MARKET not in streamed_tables:
-        raise PITDataError("daily market response is empty; certification blocked")
-    else:
-        for rec in market_records:
-            sess = _as_aware(rec.get("session") or rec.get("basDd") or cal_sessions[0], cal_sessions[0])
-            ticker = str(_required_value(rec, "ticker", "isu_cd")).strip()
-            o = float(_required_value(rec, "open", "open_price"))
-            h = float(_required_value(rec, "high", "high_price"))
-            low = float(_required_value(rec, "low", "low_price"))
-            c = float(_required_value(rec, "close", "close_price"))
-            h = max(h, o, c)
-            low = min(low, o, c)
-            market_rows.append({"session": sess, "instrument_id": f"KRX:{ticker}", "open": o, "high": h, "low": low, "close": c, "volume": float(_required_value(rec, "volume", "trdvol")), "trading_value": float(_required_value(rec, "trading_value", "trdval")), "market_cap": float(_required_value(rec, "market_cap", "marcap")), "shares_outstanding": float(_required_value(rec, "shares_outstanding", "list_shrs")), "source_security_id": _raw_isin(rec), "available_at": _avail(EvidenceKind.DAILY_MARKET), "source_hash": _hash(EvidenceKind.DAILY_MARKET)})
-    if SilverTable.DAILY_MARKET not in streamed_tables:
-        tables[SilverTable.DAILY_MARKET] = pl.DataFrame(market_rows)
-
-    # Investor flow strictly from flow payload.
-    flow_records = _records_from(payloads[EvidenceKind.INVESTOR_FLOW])
-    if not flow_records:
-        raise PITDataError("KRX investor-flow response is empty; certification blocked (investor_flow, financial_facts)")
-    flow_rows: list[dict[str, Any]] = []
-    from src.data.streaming_normalization import historical_available_at
-
-    flow_calendar = SessionCalendar(tuple(cal_sessions))
-    verified_flow_records = select_verified_investor_flow_records(flow_records)
-    for rec in verified_flow_records:
-        sess = _as_aware(rec.get("session") or cal_sessions[0], cal_sessions[0])
-        ticker = str(_required_value(rec, "ticker", "instrument_id")).strip()
-        buy = float(_required_value(rec, "foreign_buy_value", "frg_buy"))
-        sell = float(_required_value(rec, "foreign_sell_value", "frg_sell"))
-        instrument_id = f"KRX:{ticker}" if not ticker.startswith("KRX:") else ticker
-        try:
-            flow_available_at = historical_available_at(
-                kind=EvidenceKind.INVESTOR_FLOW,
-                record=rec,
-                calendar=flow_calendar,
-            )
-        except PITDataError:
-            # The final covered session has no later certified opening yet;
-            # it remains Bronze evidence until the calendar advances.
-            continue
-        row = {
-            "session": sess,
-            "instrument_id": instrument_id,
-            "foreign_buy_value": buy,
-            "foreign_sell_value": sell,
-            "foreign_net_value": float(_required_value(rec, "foreign_net_value")),
-            "institution_net_value": float(_required_value(rec, "institution_net_value", "inst_net")),
-            "retail_net_value": float(_required_value(rec, "retail_net_value", "retail_net")),
-            "available_at": flow_available_at,
-            "source_hash": _hash(EvidenceKind.INVESTOR_FLOW),
-        }
-        flow_rows.append(row)
-    tables[SilverTable.INVESTOR_FLOW] = pl.DataFrame(flow_rows)
-
-    # Disclosures preserving correction lineage.
-    disc_records = _records_from(payloads[EvidenceKind.DISCLOSURES])
-    if not disc_records:
-        raise PITDataError("DART disclosures response is empty; certification blocked")
-    disc_rows: list[dict[str, Any]] = []
-    disclosure_fingerprints: dict[tuple[str, str], str] = {}
-    for rec in disc_records:
-        fid = str(_required_value(rec, "filing_id", "rcept_no", "filingId")).strip()
-        published = _as_aware(_required_value(rec, "published_at", "rcept_dt", "receipt_date"), _avail(EvidenceKind.DISCLOSURES))
-        avail = _avail(EvidenceKind.DISCLOSURES)
-        try:
-            if calendar is not None and (rec.get("published_at") is None or str(rec.get("rcept_dt") or "").strip() != ""):
-                avail = next_krx_session_open(published, calendar)
-                if avail > decision_time:
-                    avail = _avail(EvidenceKind.DISCLOSURES)
-        except PITDataError:
-            avail = _avail(EvidenceKind.DISCLOSURES)
-        row = {"company_id": str(_required_value(rec, "company_id", "corp_code")), "filing_id": fid, "filing_type": str(_required_value(rec, "filing_type", "report_nm")), "published_at": published, "available_at": avail, "correction_of": rec.get("correction_of") or rec.get("rm"), "source_hash": _hash(EvidenceKind.DISCLOSURES)}
-        disclosure_key = (str(row["company_id"]), fid)
-        fingerprint = hashlib.sha256(
-            json.dumps(
-                {name: value for name, value in row.items() if name not in {"available_at", "source_hash"}},
-                sort_keys=True,
-                default=str,
-            ).encode("utf-8")
-        ).hexdigest()
-        previous_disclosure = disclosure_fingerprints.get(disclosure_key)
-        if previous_disclosure == fingerprint:
-            continue
-        if previous_disclosure is not None:
-            raise PITDataError(f"conflicting disclosures primary key {disclosure_key!r}; certification blocked")
-        disclosure_fingerprints[disclosure_key] = fingerprint
-        disc_rows.append(row)
-    tables[SilverTable.DISCLOSURES] = pl.DataFrame(disc_rows)
-
-    # XBRL facts for ten required facts.
-    xbrl_records = _records_from(payloads[EvidenceKind.FINANCIAL_FACTS])
-    if not xbrl_records:
-        raise PITDataError("DART XBRL facts response is empty; certification blocked (investor_flow, financial_facts)")
-    effective_calendar = calendar
-    if effective_calendar is None:
-        effective_calendar = SessionCalendar(tuple(sorted(set(cal_sessions))))
-    tables[SilverTable.FINANCIAL_FACTS] = normalize_dart_financial_facts(
-        pages=xbrl_records,
-        disclosure_rows=disc_rows,
-        source_hash=_hash(EvidenceKind.FINANCIAL_FACTS),
-        calendar=effective_calendar,
-        decision_time=decision_time,
-    )
-    if tables[SilverTable.FINANCIAL_FACTS].height == 0:
-        raise PITDataError("DART XBRL facts response is empty; certification blocked (investor_flow, financial_facts)")
-
-    # Corporate actions with authoritative source.
-    action_records = (
-        list(streamed_corporate_actions)
-        if streamed_corporate_actions is not None
-        else _records_from(payloads[EvidenceKind.CORPORATE_ACTIONS])
-    )
-    if not action_records:
-        raise PITDataError("corporate-action/status response is empty; certification blocked")
-    tables[SilverTable.CORPORATE_ACTIONS] = normalize_corporate_action_records(action_records=action_records, calendar_sessions=tuple(cal_sessions), corporate_action_available_at=_avail(EvidenceKind.CORPORATE_ACTIONS), corporate_action_source_hash=_hash(EvidenceKind.CORPORATE_ACTIONS))
-
-    # Historical costs.
-    cost_payload = payloads[EvidenceKind.HISTORICAL_COSTS]
-    if not isinstance(cost_payload, dict) or "commission" not in cost_payload:
-        raise PITDataError("historical cost evidence lacks commission")
-    raw_commission = cost_payload["commission"]
-    if isinstance(raw_commission, list):
-        candidates = [item for item in raw_commission if isinstance(item, Mapping)]
-        if not candidates:
-            raise PITDataError("historical commission is invalid")
-        raw_commission = candidates[0].get("buy_rate", candidates[0].get("rate"))
-    try:
-        cost_val = float(raw_commission)
-    except (TypeError, ValueError) as exc:
-        raise PITDataError("historical commission is invalid") from exc
-    tables[SilverTable.HISTORICAL_COSTS] = pl.DataFrame([{"market": "KOSPI", "effective_date": cal_sessions[0], "cost_kind": "commission", "rule_id": "rule1", "value": cost_val, "available_at": _avail(EvidenceKind.HISTORICAL_COSTS), "source_hash": _hash(EvidenceKind.HISTORICAL_COSTS)}])
-
-    if calendar is not None:
-        cov_start = min(s.astimezone(KRX_TZ).date() for s in calendar.sessions)
-        cov_end = max(s.astimezone(KRX_TZ).date() for s in calendar.sessions)
-    else:
-        cov_start = min(s.astimezone(KRX_TZ).date() for s in cal_sessions)
-        cov_end = max(s.astimezone(KRX_TZ).date() for s in cal_sessions)
-    report = certify_silver(
-        tables=tables,
-        receipts=receipts,
-        coverage_start=cov_start,
-        coverage_end=cov_end,
-        certification=DatasetCertification.RESEARCH,
-        decision_time=decision_time,
-    )
-    return dict(tables), report

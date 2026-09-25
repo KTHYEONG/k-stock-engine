@@ -77,13 +77,11 @@ def _write_dataset(
     *,
     universe: bool = False,
 ) -> Path:
-    dataset = root / name
-    partitions: list[dict[str, object]] = []
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+
+    partitions = {}
     for session in sorted(sessions_rows):
         rows = sorted(sessions_rows[session], key=lambda row: str(row["instrument_id"]))
-        rel = f"session={session.isoformat()}/part.parquet"
-        out_path = dataset / rel
-        out_path.parent.mkdir(parents=True, exist_ok=True)
         if rows:
             frame = pl.DataFrame(rows)
         elif universe:
@@ -104,17 +102,18 @@ def _write_dataset(
                     "policy_version": pl.String,
                 },
             )
-        frame.write_parquet(out_path)
-        partitions.append({
-            "session": session.isoformat(),
-            "path": rel,
-            "source_hash": hashlib.sha256(session.isoformat().encode()).hexdigest(),
-            "row_count": frame.height,
-            "parquet_sha256": hashlib.sha256(out_path.read_bytes()).hexdigest(),
-        })
-    manifest = {"dataset_id": name, "policy_version": "test-v1", "partitions": partitions}
-    (dataset / "manifest.json").write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
-    return dataset
+        partitions[f"session={session.isoformat()}/part.parquet"] = frame
+    return publish_dataset(
+        layer_root=root,
+        identity=DatasetIdentity(
+            kind="ordinary_universe" if universe else "daily_market",
+            layer=DatasetLayer.SILVER,
+            policy_version="test-v1",
+            inputs={},
+            params={},
+        ),
+        partitions=partitions,
+    ).path
 
 
 def _inputs(
@@ -390,7 +389,8 @@ def test_materialize_separates_exit_table(tmp_path: Path) -> None:
     manifest = json.loads((result.dataset_path / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["exits"]["decision_safe"] is False
     assert manifest["dividends"] == "not_integrated"
-    assert len(manifest["exits"]["parquet_sha256"]) == 64
+    exit_partition = next(item for item in manifest["partitions"] if item["path"] == "instrument_exits.parquet")
+    assert len(exit_partition["sha256"]) == 64
 
 
 def test_materialize_marks_rows_absent_from_universe(tmp_path: Path) -> None:
@@ -799,3 +799,77 @@ def test_materialize_rejects_vectorized_null_rule_lookup(tmp_path: Path) -> None
         materialize_market_panel(
             daily_market_path=daily_path, universe_path=universe_path, rules=RULES, gold_root=gold_root
         )
+
+
+def test_market_panel_input_manifest_boundaries(tmp_path: Path, monkeypatch) -> None:
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+    from src.data.market_panel import _load_input_manifest
+    import src.data.market_panel as panel_module
+
+    empty = publish_dataset(
+        layer_root=tmp_path / "silver",
+        identity=DatasetIdentity("daily_market", DatasetLayer.SILVER, "fixture-v1", {}, {}),
+        partitions={},
+    )
+    with pytest.raises(PITDataError, match="invalid market-panel input manifest"):
+        _load_input_manifest(empty.path, expected_kind="daily_market")
+
+    valid = _write_dataset(tmp_path / "silver", "daily_market_boundary", {DAY0: [_drow(DAY0, "005930")]})
+    monkeypatch.setattr(panel_module, "load_manifest", lambda _path: (_ for _ in ()).throw(PITDataError("bad")))
+    assert _load_input_manifest(valid, expected_kind="daily_market")[0] == valid.name
+    monkeypatch.undo()
+
+    wrong_kind = _write_dataset(
+        tmp_path / "silver", "ordinary_universe_boundary", {DAY0: [_urow("KRX:005930")]}, universe=True
+    )
+    with pytest.raises(PITDataError, match="kind mismatch"):
+        _load_input_manifest(wrong_kind, expected_kind="daily_market")
+
+    no_session = publish_dataset(
+        layer_root=tmp_path / "silver",
+        identity=DatasetIdentity("daily_market", DatasetLayer.SILVER, "fixture-v1", {}, {"case": "no-session"}),
+        partitions={"part.parquet": pl.DataFrame({"value": [1]})},
+    )
+    with pytest.raises(PITDataError, match="has no session"):
+        _load_input_manifest(no_session.path, expected_kind="daily_market")
+
+    bad_session = publish_dataset(
+        layer_root=tmp_path / "silver",
+        identity=DatasetIdentity("daily_market", DatasetLayer.SILVER, "fixture-v1", {}, {"case": "bad-session"}),
+        partitions={"session=bad/part.parquet": pl.DataFrame({"value": [1]})},
+    )
+    with pytest.raises(PITDataError, match="invalid session"):
+        _load_input_manifest(bad_session.path, expected_kind="daily_market")
+
+    unreadable = tmp_path / "unreadable-input"
+    monkeypatch.setattr(panel_module, "dataset_partition_paths", lambda *_args, **_kwargs: (unreadable / "part.parquet",))
+    monkeypatch.setattr(panel_module, "load_manifest", lambda _path: None)
+    with pytest.raises(PITDataError, match="unreadable"):
+        _load_input_manifest(unreadable, expected_kind="daily_market")
+    monkeypatch.undo()
+
+    multiple = publish_dataset(
+        layer_root=tmp_path / "silver",
+        identity=DatasetIdentity("daily_market", DatasetLayer.SILVER, "fixture-v1", {}, {"case": "multiple-session"}),
+        partitions={"session=2020-01-06/part.parquet": pl.DataFrame({"session": [DAY0, DAY1]})},
+    )
+    with pytest.raises(PITDataError, match="no unique session"):
+        _load_input_manifest(multiple.path, expected_kind="daily_market")
+
+    string_session = publish_dataset(
+        layer_root=tmp_path / "silver",
+        identity=DatasetIdentity("daily_market", DatasetLayer.SILVER, "fixture-v1", {}, {"case": "string-session"}),
+        partitions={"session=2020-01-06/part.parquet": pl.DataFrame({"session": ["2020-01-06"]})},
+    )
+    assert _load_input_manifest(string_session.path, expected_kind="daily_market")[1] == [DAY0]
+
+    unordered = publish_dataset(
+        layer_root=tmp_path / "silver",
+        identity=DatasetIdentity("daily_market", DatasetLayer.SILVER, "fixture-v1", {}, {"case": "unordered"}),
+        partitions={
+            "session=2020-01-06/part.parquet": pl.DataFrame({"session": [DAY0]}),
+            "session=2020-01-07/part.parquet": pl.DataFrame({"session": [DAY1 - timedelta(days=1)]}),
+        },
+    )
+    with pytest.raises(PITDataError, match="strictly ordered"):
+        _load_input_manifest(unordered.path, expected_kind="daily_market")

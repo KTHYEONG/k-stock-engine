@@ -5,8 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
-import shutil
+import re
 import tempfile
 from dataclasses import dataclass
 from datetime import date
@@ -16,6 +15,14 @@ from typing import Any
 import polars as pl
 
 from src.core.market_rules import KrxMarket, KrxMarketRules
+from src.data.datasets import (
+    DatasetIdentity,
+    DatasetLayer,
+    dataset_partition_paths,
+    dataset_reference,
+    load_manifest,
+    publish_dataset,
+)
 from src.data.schemas import PITDataError
 
 POLICY_VERSION = "krx-market-panel-v2"
@@ -99,42 +106,51 @@ class MarketPanelResult:
     exits_halted: int
 
 
-def _load_input_manifest(dataset_dir: Path) -> tuple[str, list[date], dict[date, str], dict[date, str]]:
+def _load_input_manifest(
+    dataset_dir: Path, *, expected_kind: str
+) -> tuple[str, list[date], dict[date, Path]]:
+    """Load one verified input and align its physical partitions by session."""
+
+    directory = Path(dataset_dir)
     try:
-        manifest = json.loads((Path(dataset_dir) / "manifest.json").read_text(encoding="utf-8"))
-        parts = manifest["partitions"]
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        raise PITDataError(f"invalid market-panel input manifest: {dataset_dir}") from exc
-    if manifest.get("dataset_id") != Path(dataset_dir).name or not isinstance(parts, list) or not parts:
-        raise PITDataError(f"invalid market-panel input manifest: {dataset_dir}")
-    sessions: list[date] = []
-    rels: dict[date, str] = {}
-    digests: dict[date, str] = {}
-    for part in parts:
-        if not isinstance(part, dict):
-            raise PITDataError(f"invalid market-panel input partition: {dataset_dir}")
-        raw_session = part.get("session")
-        rel = part.get("path")
-        digest = part.get("parquet_sha256")
-        if not isinstance(raw_session, str) or not isinstance(rel, str) or not isinstance(digest, str):
-            raise PITDataError(f"invalid market-panel input partition: {dataset_dir}")
+        paths = dataset_partition_paths(directory, allow_legacy=False)
+    except PITDataError as exc:
+        raise PITDataError(f"invalid market-panel input manifest: {directory}") from exc
+    if not paths:
+        raise PITDataError(f"invalid market-panel input manifest: {directory}")
+    try:
+        manifest = load_manifest(directory)
+    except PITDataError:
+        manifest = None
+    if manifest is not None and manifest.kind != expected_kind:
+        raise PITDataError(f"market-panel input kind mismatch: {directory}")
+    by_session: dict[date, Path] = {}
+    previous_session: date | None = None
+    for path in paths:
         try:
-            session = date.fromisoformat(raw_session[:10])
-        except ValueError as exc:
-            raise PITDataError(f"invalid market-panel input session: {raw_session!r}") from exc
-        if sessions and session <= sessions[-1]:
-            raise PITDataError(f"market-panel input sessions are not strictly ordered: {dataset_dir}")
-        sessions.append(session)
-        rels[session] = rel
-        digests[session] = digest
-    for session in sessions:
-        try:
-            data = (Path(dataset_dir) / rels[session]).read_bytes()
-        except OSError as exc:
-            raise PITDataError(f"market-panel input partition is unreadable: {session}") from exc
-        if hashlib.sha256(data).hexdigest() != digests[session]:
-            raise PITDataError(f"market-panel input hash mismatch: {session}")
-    return (manifest["dataset_id"], sessions, rels, digests)
+            frame = pl.read_parquet(path, columns=["session"])
+            values = frame.get_column("session").unique().to_list()
+        except pl.exceptions.ColumnNotFoundError:
+            match = re.search(r"(?:^|/)session=([^/]+)(?:/|$)", path.as_posix())
+            if match is None:
+                raise PITDataError(f"market-panel input partition has no session: {path}") from None
+            try:
+                values = [date.fromisoformat(match.group(1))]
+            except ValueError as exc:
+                raise PITDataError(f"market-panel input partition has an invalid session: {path}") from exc
+        except (OSError, ValueError, pl.exceptions.PolarsError) as exc:
+            raise PITDataError(f"market-panel input partition is unreadable: {path}") from exc
+        if len(values) != 1:
+            raise PITDataError(f"market-panel input partition has no unique session: {path}")
+        value = values[0]
+        if not isinstance(value, date):
+            value = date.fromisoformat(str(value)[:10])
+        if previous_session is not None and value <= previous_session:
+            raise PITDataError(f"market-panel input sessions are not strictly ordered: {directory}")
+        previous_session = value
+        by_session[value] = path
+    sessions = sorted(by_session)
+    return directory.name, sessions, by_session
 
 
 def _bucket_of(instrument_id: str, buckets: int) -> int:
@@ -279,46 +295,51 @@ def _build_bucket_frame(
     return df.select(list(_SCHEMA))
 
 
+def _rules_fingerprint(rules: KrxMarketRules) -> str:
+    payload = {
+        "version": rules.version,
+        "tick_regimes": [
+            {
+                "effective_from": regime.effective_from.isoformat(),
+                "bands": {
+                    market.value: [
+                        {"lower": band.lower_price_inclusive, "tick": band.tick}
+                        for band in regime.bands[market]
+                    ]
+                    for market in (KrxMarket.KOSPI, KrxMarket.KOSDAQ)
+                },
+            }
+            for regime in rules.tick_regimes
+        ],
+        "sell_tax_regimes": [
+            {
+                "effective_from": regime.effective_from.isoformat(),
+                "rates": {market.value: str(regime.rates[market]) for market in (KrxMarket.KOSPI, KrxMarket.KOSDAQ)},
+            }
+            for regime in rules.sell_tax_regimes
+        ],
+        "price_limit_regimes": [
+            {
+                "effective_from": regime.effective_from.isoformat(),
+                "ratio": str(regime.ratio),
+            }
+            for regime in rules.price_limit_regimes
+        ],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
 def materialize_market_panel(
     *,
     daily_market_path: Path,
     universe_path: Path,
     rules: KrxMarketRules,
     gold_root: Path,
-    policy: MarketPanelPolicy = MarketPanelPolicy(),  # noqa: B008 - spec-mandated immutable default
+    policy: MarketPanelPolicy = MarketPanelPolicy(),  # noqa: B008
     instrument_buckets: int = 16,
 ) -> MarketPanelResult:
-    """Build the decision-safe session-by-instrument market panel and its exit table.
+    """Build and publish the decision-safe session-by-instrument market panel."""
 
-    Every column on a row is computable from information available at that
-    row's ``available_at``; ex-post lifecycle facts are written only to the
-    separate ``instrument_exits`` table, which simulators may read solely to
-    value a position on the session after its last observation.
-
-    Rolling statistics are computed over each instrument's complete
-    observation history in one pass, so windows never depend on processing
-    boundaries. Instruments are processed in disjoint buckets to bound memory;
-    the bucket count is an execution parameter and never changes output.
-
-    Args:
-        daily_market_path: Certified Silver ``daily_market_<id>`` directory.
-        universe_path: Certified Silver ``ordinary_universe_<id>`` directory
-            whose sessions must equal the daily-market sessions.
-        rules: Date-effective KRX tick, price-limit, and sell-tax rules.
-        gold_root: Scope Gold root receiving ``market_panel_<hash16>/``.
-        policy: Rolling-window contract.
-        instrument_buckets: Number of disjoint instrument groups processed
-            sequentially; affects peak memory only.
-
-    Returns:
-        Row and audit counts plus the dataset location.
-
-    Raises:
-        PITDataError: manifest/hash mismatch, session-set mismatch between
-            inputs, a session outside rule coverage, duplicate keys, a
-            non-positive bucket count, or an existing dataset with different
-            content.
-    """
     if (
         isinstance(policy.adtv_short_sessions, bool)
         or isinstance(policy.adtv_long_sessions, bool)
@@ -330,60 +351,65 @@ def materialize_market_panel(
         raise PITDataError("market panel windows must be positive integers")
     if isinstance(instrument_buckets, bool) or not isinstance(instrument_buckets, int) or instrument_buckets < 1:
         raise PITDataError("market panel instrument buckets must be a positive integer")
-    daily_id, daily_sessions, daily_rels, _ = _load_input_manifest(Path(daily_market_path))
-    universe_id, universe_sessions, universe_rels, _ = _load_input_manifest(Path(universe_path))
-    if daily_sessions != universe_sessions:
+    daily_id, daily_sessions, daily_by_session = _load_input_manifest(
+        Path(daily_market_path), expected_kind="daily_market"
+    )
+    universe_id, universe_sessions_, universe_by_session = _load_input_manifest(
+        Path(universe_path), expected_kind="ordinary_universe"
+    )
+    if daily_sessions != universe_sessions_:
         raise PITDataError("market panel inputs cover different session sets")
     calendar = daily_sessions
     if (
-        calendar[0] < rules.tick_regimes[0].effective_from
+        not calendar
+        or calendar[0] < rules.tick_regimes[0].effective_from
         or calendar[0] < rules.sell_tax_regimes[0].effective_from
         or calendar[0] < rules.price_limit_regimes[0].effective_from
     ):
-        raise PITDataError(f"market panel session outside rule coverage: {calendar[0]}")
-    dataset_id = "market_panel_" + hashlib.sha256(
-        "\n".join((
-            POLICY_VERSION,
-            str(policy.adtv_short_sessions),
-            str(policy.adtv_long_sessions),
-            str(policy.return_vol_sessions),
-            rules.version,
-            daily_id,
-            universe_id,
-        )).encode("utf-8")
-    ).hexdigest()[:16]
-    gold_root = Path(gold_root)
-    gold_root.mkdir(parents=True, exist_ok=True)
-    target = gold_root / dataset_id
-    staging = Path(tempfile.mkdtemp(prefix=".market-panel-", dir=gold_root))
-    try:
-        calendar_frame = pl.DataFrame(
-            {"session": calendar, "pos": list(range(len(calendar)))},
-            schema={"session": pl.Date, "pos": pl.Int64},
-        )
-        daily_files = [str(Path(daily_market_path) / daily_rels[session]) for session in calendar]
-        universe_files = [str(Path(universe_path) / universe_rels[session]) for session in calendar]
-        # 파티션 경로가 세션 식별의 근거다(파일 내부 session 컬럼 유무와 무관).
-        universe_path_sessions = pl.DataFrame(
-            {"_path": universe_files, "session": list(calendar)},
-            schema={"_path": pl.String, "session": pl.Date},
-        )
+        raise PITDataError(f"market panel session outside rule coverage: {calendar[0] if calendar else 'empty'}")
+
+    identity = DatasetIdentity(
+        kind="market_panel",
+        layer=DatasetLayer.GOLD,
+        policy_version=POLICY_VERSION,
+        inputs={
+            "daily_market": dataset_reference(daily_id, kind="daily_market"),
+            "universe": dataset_reference(universe_id, kind="ordinary_universe"),
+        },
+        params={
+            "adtv_short_sessions": policy.adtv_short_sessions,
+            "adtv_long_sessions": policy.adtv_long_sessions,
+            "return_vol_sessions": policy.return_vol_sessions,
+            "rules_version": rules.version,
+            "rules_fingerprint": _rules_fingerprint(rules),
+        },
+    )
+    calendar_frame = pl.DataFrame(
+        {"session": calendar, "pos": list(range(len(calendar)))},
+        schema={"session": pl.Date, "pos": pl.Int64},
+    )
+    daily_files = [str(daily_by_session[session]) for session in calendar]
+    partitions: dict[str, pl.DataFrame] = {}
+    partition_details: list[dict[str, object]] = []
+    corporate_action_rows = 0
+    gap_rows = 0
+    limit_inapplicable_rows = 0
+    open_at_upper_rows = 0
+    open_at_lower_rows = 0
+    total_rows = 0
+    last_obs: dict[str, tuple[int, int, int]] = {}
+
+    with tempfile.TemporaryDirectory(prefix="market-panel-") as temporary:
+        shard_dir = Path(temporary)
         instrument_ids = (
             pl.scan_parquet(daily_files).select("instrument_id").unique().collect()["instrument_id"].to_list()
         )
         bucket_members: list[frozenset[str]] = [
-            frozenset(iid for iid in instrument_ids if _bucket_of(str(iid), instrument_buckets) == bucket)
+            frozenset(
+                str(iid) for iid in instrument_ids if _bucket_of(str(iid), instrument_buckets) == bucket
+            )
             for bucket in range(instrument_buckets)
         ]
-        shard_dir = staging / "shards"
-        shard_dir.mkdir(parents=True)
-        last_obs: dict[str, tuple[int, int, int]] = {}
-        corporate_action_rows = 0
-        gap_rows = 0
-        limit_inapplicable_rows = 0
-        open_at_upper_rows = 0
-        open_at_lower_rows = 0
-        total_rows = 0
         for bucket in range(instrument_buckets):
             members = bucket_members[bucket]
             if members:
@@ -392,14 +418,18 @@ def materialize_market_panel(
                     .filter(pl.col("instrument_id").is_in(members))
                     .collect()
                 )
-                # 세션 파티션을 파일 단위로 반복 읽지 않도록 한 번의 스캔으로 버킷 종목만 끌어온다.
-                universe_bucket = (
-                    pl.scan_parquet(universe_files, include_file_paths="_path")
-                    .filter(pl.col("instrument_id").is_in(members))
-                    .select("instrument_id", "eligible", "exclusion_reason", "_path")
-                    .collect()
-                    .join(universe_path_sessions, on="_path", how="left")
-                    .select("session", "instrument_id", "eligible", "exclusion_reason")
+                universe_frames: list[pl.DataFrame] = []
+                for session in calendar:
+                    universe_frame = pl.read_parquet(universe_by_session[session])
+                    if "session" not in universe_frame.columns:
+                        universe_frame = universe_frame.with_columns(
+                            pl.lit(session, dtype=pl.Date).alias("session")
+                        )
+                    universe_frames.append(
+                        universe_frame.select("session", "instrument_id", "eligible", "exclusion_reason")
+                    )
+                universe_bucket = pl.concat(universe_frames, how="vertical_relaxed").filter(
+                    pl.col("instrument_id").is_in(members)
                 )
             else:
                 daily_bucket = pl.scan_parquet(daily_files).filter(pl.lit(False)).collect()
@@ -440,100 +470,74 @@ def materialize_market_panel(
                         int(row["close"]),
                         int(row["volume"]),
                     )
-            out_path = shard_dir / f"bucket={bucket:04d}" / "part.parquet"
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            frame.write_parquet(out_path)
-            _LOG.info("stage=market_panel bucket=%s/%s rows=%s", bucket + 1, instrument_buckets, frame.height)
-        partitions: list[dict[str, Any]] = []
+            shard_path = shard_dir / f"bucket={bucket:04d}.parquet"
+            frame.write_parquet(shard_path)
+            _LOG.info("[DATA] stage=market_panel bucket=%d/%d rows=%d", bucket + 1, instrument_buckets, frame.height)
+
         years = sorted({session.year for session in calendar})
         for year in years:
             year_frame = (
-                pl.scan_parquet(str(shard_dir / "bucket=*" / "part.parquet"))
+                pl.scan_parquet(str(shard_dir / "bucket=*.parquet"))
                 .filter(pl.col("session").dt.year() == year)
                 .collect()
                 .sort(["session", "instrument_id"])
+                .select(list(_SCHEMA))
             )
-            year_frame = year_frame.select(list(_SCHEMA))
-            rel = Path(f"year={year}") / "part.parquet"
-            out_path = staging / rel
-            out_path.parent.mkdir(parents=True)
-            year_frame.write_parquet(out_path)
-            partitions.append({
-                "year": year,
-                "path": str(rel),
-                "row_count": year_frame.height,
-                "parquet_sha256": hashlib.sha256(out_path.read_bytes()).hexdigest(),
-            })
-            _LOG.info("stage=market_panel year=%s rows=%s", year, year_frame.height)
-        shutil.rmtree(shard_dir, ignore_errors=True)
-        exits = [
-            {
-                "instrument_id": instrument_id,
-                "last_session": calendar[position],
-                "last_close": close,
-                "last_volume": volume,
-                "exit_kind": "halted_exit" if volume == 0 else "traded_exit",
-            }
-            for instrument_id, (position, close, volume) in sorted(last_obs.items())
-            if position < len(calendar) - 1
-        ]
-        exits_frame = (
-            pl.DataFrame(exits, schema=_EXITS_SCHEMA).sort("instrument_id")
-            if exits
-            else pl.DataFrame([], schema=_EXITS_SCHEMA)
-        )
-        exits_rel = Path("instrument_exits.parquet")
-        exits_path = staging / exits_rel
-        exits_frame.write_parquet(exits_path)
-        exits_traded = int(exits_frame.filter(pl.col("exit_kind") == "traded_exit").height)
-        exits_halted = int(exits_frame.filter(pl.col("exit_kind") == "halted_exit").height)
-        manifest = {
-            "dataset_id": dataset_id,
-            "policy_version": POLICY_VERSION,
-            "adtv_short_sessions": policy.adtv_short_sessions,
-            "adtv_long_sessions": policy.adtv_long_sessions,
-            "return_vol_sessions": policy.return_vol_sessions,
-            "rules_version": rules.version,
-            "daily_market_dataset_id": daily_id,
-            "universe_dataset_id": universe_id,
-            "rows": total_rows,
-            "years": years,
-            "corporate_action_rows": corporate_action_rows,
-            "gap_rows": gap_rows,
-            "limit_inapplicable_rows": limit_inapplicable_rows,
-            "open_at_upper_rows": open_at_upper_rows,
-            "open_at_lower_rows": open_at_lower_rows,
-            "exits_traded": exits_traded,
-            "exits_halted": exits_halted,
-            "dividends": "not_integrated",
-            "partitions": partitions,
-            "exits": {
-                "path": str(exits_rel),
-                "row_count": exits_frame.height,
-                "parquet_sha256": hashlib.sha256(exits_path.read_bytes()).hexdigest(),
-                "decision_safe": False,
-            },
+            relative_path = f"year={year}/part.parquet"
+            partitions[relative_path] = year_frame
+            partition_details.append({"year": year, "rows": year_frame.height})
+            _LOG.info("[DATA] stage=market_panel year=%d rows=%d", year, year_frame.height)
+
+    exits = [
+        {
+            "instrument_id": instrument_id,
+            "last_session": calendar[position],
+            "last_close": close,
+            "last_volume": volume,
+            "exit_kind": "halted_exit" if volume == 0 else "traded_exit",
         }
-        encoded = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-        (staging / "manifest.json").write_text(encoded, encoding="utf-8")
-        if target.exists():
-            try:
-                current = (target / "manifest.json").read_text(encoding="utf-8")
-            except OSError as exc:
-                raise PITDataError(f"existing market panel is unreadable: {target}") from exc
-            if current != encoded:
-                raise PITDataError(f"existing market panel differs: {target}")
-            shutil.rmtree(staging, ignore_errors=True)
-        else:
-            os.rename(staging, target)
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
+        for instrument_id, (position, close, volume) in sorted(last_obs.items())
+        if position < len(calendar) - 1
+    ]
+    exits_frame = (
+        pl.DataFrame(exits, schema=_EXITS_SCHEMA).sort("instrument_id")
+        if exits
+        else pl.DataFrame([], schema=_EXITS_SCHEMA)
+    )
+    partitions["instrument_exits.parquet"] = exits_frame
+    exits_traded = int(exits_frame.filter(pl.col("exit_kind") == "traded_exit").height)
+    exits_halted = int(exits_frame.filter(pl.col("exit_kind") == "halted_exit").height)
+    details = {
+        "years": years,
+        "daily_market_dataset_id": daily_id,
+        "universe_dataset_id": universe_id,
+        "corporate_action_rows": corporate_action_rows,
+        "gap_rows": gap_rows,
+        "limit_inapplicable_rows": limit_inapplicable_rows,
+        "open_at_upper_rows": open_at_upper_rows,
+        "open_at_lower_rows": open_at_lower_rows,
+        "exits_traded": exits_traded,
+        "exits_halted": exits_halted,
+        "exits": {
+            "path": "instrument_exits.parquet",
+            "rows": exits_frame.height,
+            "decision_safe": False,
+        },
+        "dividends": "not_integrated",
+        "exits_decision_safe": False,
+        "partitions": partition_details,
+    }
+    published = publish_dataset(
+        layer_root=Path(gold_root),
+        identity=identity,
+        partitions=partitions,
+        details=details,
+    )
     return MarketPanelResult(
-        dataset_path=target,
-        dataset_id=dataset_id,
+        dataset_path=published.path,
+        dataset_id=published.dataset_id,
         rows=total_rows,
-        years=tuple(sorted({session.year for session in calendar})),
+        years=tuple(years),
         corporate_action_rows=corporate_action_rows,
         gap_rows=gap_rows,
         limit_inapplicable_rows=limit_inapplicable_rows,

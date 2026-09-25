@@ -9,18 +9,21 @@ from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 
+from src.core.pit import PITDataError
+
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run one strategy across a capital grid")
     parser.add_argument("--scope-config", type=Path, required=True)
     parser.add_argument("--data-root", type=Path, required=True)
-    parser.add_argument("--panel-dataset-id", type=str, required=True)
+    parser.add_argument("--panel-dataset-id", type=str, required=False, default=None)
     parser.add_argument("--strategy", type=str, required=True)
     parser.add_argument("--strategy-config", type=Path, required=True)
     parser.add_argument("--engine-config", type=Path, required=True)
     parser.add_argument("--capital", dest="capitals", action="append", type=int, required=True)
     parser.add_argument("--deposits", type=Path, required=False, default=None)
     parser.add_argument("--dividends-dataset-id", type=str, required=False, default=None)
+    parser.add_argument("--no-dividends", action="store_true", default=False)
     parser.add_argument("--start", type=str, required=True)
     parser.add_argument("--end", type=str, required=True)
     parser.add_argument("--allow-forward", action="store_true", default=False)
@@ -115,11 +118,30 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "pass --allow-forward to run on sealed forward dates"
             )
         capitals: list[int] = list(args.capitals or [])
+        if bool(getattr(args, "no_dividends", False)) and args.dividends_dataset_id is not None:
+            raise ValueError("--no-dividends cannot be combined with --dividends-dataset-id")
         if not capitals:
             raise ValueError("at least one --capital is required")
         for capital in capitals:
             if isinstance(capital, bool) or not isinstance(capital, int) or capital <= 0:
                 raise ValueError(f"capital must be a positive KRW int, got {capital!r}")
+
+        gold_root = data_root / "gold" / scope.scope_id
+        silver_root = data_root / "silver" / scope.scope_id
+        state_root = data_root / "state" / scope.scope_id
+        from src.data.dataset_registry import DatasetRegistry
+
+        registry = DatasetRegistry(state_root)
+        panel_id = str(args.panel_dataset_id) if args.panel_dataset_id is not None else registry.require("market_panel")
+        no_dividends = bool(getattr(args, "no_dividends", False))
+        dividends_id: str | None = None
+        if not no_dividends:
+            dividends_id = (
+                str(args.dividends_dataset_id)
+                if args.dividends_dataset_id is not None
+                else registry.require("dividend_events")
+            )
+        panel_dir = gold_root / panel_id
 
         from src.backtest.strategy import STRATEGIES
 
@@ -183,42 +205,33 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         deposits = _load_deposits(Path(args.deposits) if args.deposits is not None else None)
 
-        gold_root = data_root / "gold" / scope.scope_id
-        panel_dir = gold_root / str(args.panel_dataset_id)
-        state_root = data_root / "state" / scope.scope_id
         run_root = state_root / "backtests"
         run_root.mkdir(parents=True, exist_ok=True)
         cache_root = state_root / "market_cache"
 
         from src.backtest.events import build_engine_events
         from src.backtest.market import load_market_arrays
+        from src.data.datasets import DatasetLayer, load_manifest, read_dataset
 
-        arrays = load_market_arrays(panel_dir=panel_dir, cache_root=cache_root)
-
+        panel_manifest = load_manifest(panel_dir)
+        if panel_manifest.kind != "market_panel" or panel_manifest.layer is not DatasetLayer.GOLD:
+            raise PITDataError("panel dataset is not a verified Gold market_panel")
         dividends = None
-        dividends_id = args.dividends_dataset_id
         if dividends_id is not None:
-            import polars as pl
-
-            div_path = gold_root / str(dividends_id)
-            if div_path.is_dir():
-                files = sorted(str(p) for p in div_path.rglob("*.parquet"))
-                if not files:
-                    raise ValueError(f"dividends dataset has no parquet files: {div_path}")
-                dividends = pl.concat([pl.read_parquet(f) for f in files], how="diagonal_relaxed")
-            elif div_path.is_file():
-                dividends = pl.read_parquet(str(div_path))
-            else:
-                raise OSError(f"dividends dataset not found: {div_path}")
-
+            dividends_dir = silver_root / dividends_id
+            dividends_manifest = load_manifest(dividends_dir)
+            if dividends_manifest.kind != "dividend_events" or dividends_manifest.layer is not DatasetLayer.SILVER:
+                raise PITDataError("dividend dataset is not a verified Silver dividend_events")
+            dividends = read_dataset(dividends_dir).collect()
+        arrays = load_market_arrays(panel_dir=panel_dir, cache_root=cache_root)
         events = build_engine_events(arrays=arrays, panel_dir=panel_dir, dividends=dividends)
         rules = load_krx_market_rules(_resolve_rules_path())
 
         inputs_base = {
-            "market_panel": str(args.panel_dataset_id),
+            "market_panel": panel_id,
             "scope": scope.scope_id,
             "scope_hash": scope.content_hash,
-            "dividends": str(dividends_id) if dividends_id is not None else "none",
+            "dividends": dividends_id if dividends_id is not None else "none",
             "start": start.isoformat(),
             "end": end.isoformat(),
         }
@@ -267,7 +280,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                     + "\n"
                 )
-    except (ValueError, OSError) as exc:
+    except (PITDataError, ValueError, OSError) as exc:
         sys.stdout.write(json.dumps({"error": str(exc)}, sort_keys=True) + "\n")
         return 1
     return 0

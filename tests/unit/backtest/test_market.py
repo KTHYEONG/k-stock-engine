@@ -149,8 +149,8 @@ def test_cache_reused_without_parquet_reads(tmp_path: Path) -> None:
     first = _load(panel, cache)
     for part in panel.glob("**/*.parquet"):
         part.unlink()
-    second = _load(panel, cache)
-    _assert_equal(first, second)
+    with pytest.raises(PITDataError):
+        _load(panel, cache)
 
 
 def test_cache_with_foreign_dataset_id_rebuilt(tmp_path: Path) -> None:
@@ -244,3 +244,47 @@ def test_corrupt_cache_rebuilt(tmp_path: Path) -> None:
     (cache / "market_panel_test.npz").write_bytes(b"not a zip file")
     rebuilt = _load(panel, cache)
     _assert_equal(fresh, rebuilt)
+
+
+def test_market_panel_with_only_exit_partition_is_rejected(tmp_path: Path) -> None:
+    panel = tmp_path / "gold" / "market_panel_test"
+    panel.mkdir(parents=True)
+    exit_path = panel / "instrument_exits.parquet"
+    pl.DataFrame(
+        {"instrument_id": ["KRX:A"], "last_session": [DAY0], "last_close": [100], "exit_kind": ["traded_exit"]}
+    ).write_parquet(exit_path)
+    (panel / "manifest.json").write_text(
+        json.dumps(
+            {
+                "dataset_id": panel.name,
+                "partitions": [{"path": exit_path.name, "parquet_sha256": hashlib.sha256(exit_path.read_bytes()).hexdigest()}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PITDataError, match="no dense partitions"):
+        _load(panel, tmp_path / "cache")
+
+
+def test_cache_shape_and_checksum_failures_rebuild_from_source(tmp_path: Path) -> None:
+    panel = _write_panel(
+        tmp_path / "gold", "market_panel_test", [_mrow(DAY0, "KRX:A"), _mrow(DAY1, "KRX:A")]
+    )
+    fresh = load_market_arrays(panel_dir=panel, cache_root=tmp_path / "fresh")
+
+    for index, mutation in enumerate(("field_shape", "market_shape", "checksum")):
+        cache = tmp_path / f"cache-{index}"
+        load_market_arrays(panel_dir=panel, cache_root=cache)
+        cache_file = cache / "market_panel_test.npz"
+        with np.load(cache_file, allow_pickle=False) as store:
+            payload = {key: store[key] for key in store.files}
+        if mutation == "field_shape":
+            payload["int_close"] = np.asarray([1], dtype=np.int64)
+        elif mutation == "market_shape":
+            payload["market"] = np.asarray([1], dtype=np.int8)
+        else:
+            payload["checksum"] = np.asarray("wrong")
+        np.savez(cache_file, **payload)
+        rebuilt = load_market_arrays(panel_dir=panel, cache_root=cache)
+        _assert_equal(fresh, rebuilt)

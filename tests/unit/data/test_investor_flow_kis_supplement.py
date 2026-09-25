@@ -17,30 +17,23 @@ S4 = date(2024, 1, 5)
 
 
 def _write_dataset(directory: Path, frame: pl.DataFrame) -> Path:
-    directory.mkdir(parents=True, exist_ok=True)
-    rel = Path("year=2024") / "part.parquet"
-    out_path = directory / rel
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    frame.write_parquet(out_path)
-    (directory / "manifest.json").write_text(
-        json.dumps(
-            {
-                "dataset_id": directory.name,
-                "policy_version": "test-v1",
-                "partitions": [
-                    {
-                        "path": str(rel),
-                        "row_count": frame.height,
-                        "parquet_sha256": hashlib.sha256(out_path.read_bytes()).hexdigest(),
-                        "year": 2024,
-                    }
-                ],
-            },
-            sort_keys=True,
-        ),
-        encoding="utf-8",
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+
+    is_gold = "gold" in directory.parts
+    kind = "market_panel" if is_gold else (
+        "investor_flow_kis_supplement" if "kis" in directory.name else "investor_flow_ls"
     )
-    return directory
+    return publish_dataset(
+        layer_root=directory.parent,
+        identity=DatasetIdentity(
+            kind=kind,
+            layer=DatasetLayer.GOLD if is_gold else DatasetLayer.SILVER,
+            policy_version="test-v1",
+            inputs={},
+            params={},
+        ),
+        partitions={"year=2024/part.parquet": frame},
+    ).path
 
 
 def _write_panel(root: Path, cells: list[tuple[date, str]]) -> Path:
@@ -118,10 +111,12 @@ def _write_raw_page(bronze_root: Path, raw: bytes) -> Path:
 def _materialize(root: Path, bronze_root: Path | None = None):
     from src.data.investor_flow_kis_supplement import materialize_investor_flow_kis_supplement
 
+    panel = next(path for path in (root / "gold").iterdir() if path.is_dir() and path.name.startswith("market_panel_"))
+    ls_flow = next(path for path in (root / "silver").iterdir() if path.is_dir() and path.name.startswith("investor_flow_ls_"))
     return materialize_investor_flow_kis_supplement(
         bronze_root=bronze_root or root / "bronze",
-        market_panel_path=root / "gold" / "market_panel_test",
-        ls_flow_silver_path=root / "silver" / "investor_flow_test",
+        market_panel_path=panel,
+        ls_flow_silver_path=ls_flow,
         silver_root=root / "silver",
     )
 
@@ -345,9 +340,9 @@ def test_materialize_manifest_pins_source_datasets(tmp_path: Path) -> None:
     result = _materialize(tmp_path, bronze)
     manifest = json.loads((result.dataset_path / "manifest.json").read_text(encoding="utf-8"))
 
-    assert manifest["ls_dataset_id"] == "investor_flow_test"
-    assert manifest["market_panel_dataset_id"] == "market_panel_test"
-    assert result.ls_dataset_id == "investor_flow_test"
+    assert manifest["inputs"]["ls"] == result.ls_dataset_id
+    assert manifest["inputs"]["market_panel"].startswith("market_panel_")
+    assert result.ls_dataset_id.startswith("investor_flow_ls_")
 
 
 def test_materialize_rejects_tampered_bronze_payload(tmp_path: Path) -> None:
@@ -553,3 +548,35 @@ def test_materialize_rejects_unreadable_existing_manifest(tmp_path: Path) -> Non
 
     with pytest.raises(PITDataError, match="unreadable"):
         _materialize(tmp_path, bronze)
+
+
+def test_kis_supplement_rejects_invalid_policy_and_empty_panel_calendar(tmp_path: Path) -> None:
+    import pytest
+
+    from src.data.investor_flow_kis_supplement import (
+        InvestorFlowKisSupplementPolicy,
+        _load_panel_calendar,
+        materialize_investor_flow_kis_supplement,
+    )
+    from src.data.schemas import PITDataError
+
+    panel = _write_dataset(tmp_path / "gold" / "market_panel_empty", pl.DataFrame({"value": [1]}))
+    with pytest.raises(PITDataError, match="no session partitions"):
+        _load_panel_calendar(panel)
+
+    with pytest.raises(PITDataError, match="availability lag"):
+        materialize_investor_flow_kis_supplement(
+            bronze_root=tmp_path / "bronze",
+            market_panel_path=panel,
+            ls_flow_silver_path=tmp_path / "silver" / "missing",
+            silver_root=tmp_path / "silver",
+            policy=InvestorFlowKisSupplementPolicy(available_session_lag=0),
+        )
+    with pytest.raises(PITDataError, match="available_time"):
+        materialize_investor_flow_kis_supplement(
+            bronze_root=tmp_path / "bronze",
+            market_panel_path=panel,
+            ls_flow_silver_path=tmp_path / "silver" / "missing",
+            silver_root=tmp_path / "silver",
+            policy=InvestorFlowKisSupplementPolicy(available_time=object()),  # type: ignore[arg-type]
+        )

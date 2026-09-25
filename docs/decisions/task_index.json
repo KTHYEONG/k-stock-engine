@@ -1,6 +1,39 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_REFACTOR_R4_DATASET_CONTRACT",
+      "date": "2026-09-25",
+      "adr_id": "ADR_20260925_REFACTOR_R4_DATASET_CONTRACT",
+      "domain": "data",
+      "title": "Dataset contract v2, registry, and verify/prune commands",
+      "why": "Dataset ids and manifests were inconsistent and nothing recorded the current dataset per kind.",
+      "resolution": "Added publish/verify helpers, a per-scope dataset registry, verify-datasets and prune-datasets, and moved builders and the backtest CLI onto them.",
+      "impact": "Consumers resolve current datasets from the registry and every dataset can be re-hashed and lineage-checked.",
+      "caveat": "The real-data migration tool has not been applied yet, so the registry is empty until tools/migrate_datasets_v2.py --apply runs."
+    },
+    {
+      "task_id": "TASK_REFACTOR_R1_R2",
+      "date": "2026-09-25",
+      "adr_id": "ADR_20260925_REFACTOR_R1_R2",
+      "domain": "data",
+      "title": "Remove legacy code: dead modules, old backtest stack, legacy data stack",
+      "why": "Old backtest and SilverTable-layout code (about 60% of src) was unreachable from the live scoped CLIs and slowed maintenance and agent search.",
+      "resolution": "Deleted the legacy import closure, pruned the data CLI to live subcommands, and decoupled src/execution from the removed core ledger/costs.",
+      "impact": "src shrank from 42.8k to 17.7k lines with 987 tests green and the two CLIs intact.",
+      "caveat": "KRX integration was removed with the legacy commands, so a scoped KRX collection path must be rebuilt before 2026 forward collection."
+    },
+    {
+      "task_id": "R3_RECEIPT_CATALOG_SQLITE",
+      "date": "2026-09-25",
+      "adr_id": "ADR_20260925_R3_RECEIPT_CATALOG_SQLITE",
+      "domain": "data",
+      "title": "SQLite receipt catalog with verified one-time JSON migration",
+      "why": "Full-snapshot JSON publishes rewrote 114,833 rows across 488 revisions, occupied 23 GB, and charged every publish and lookup with the full catalog size.",
+      "resolution": "Replaced snapshots with a WAL-mode SQLite key/value catalog using atomic batch validation, relative Bronze-root payload paths, indexed latest/success/stream queries, and a temporary field-by-field migration verifier that was removed after success.",
+      "impact": "The live scope catalog now occupies 39,890,944 bytes, all 114,833 rows match the former latest revision by source and status, and both DART fact and dividend dry-runs report pending 0.",
+      "caveat": "The migration was intentionally one-time; the removed JSON pointer, revision snapshots, and publish lock must not be recreated."
+    },
+    {
       "task_id": "TASK_DIVIDEND_EVENTS",
       "date": "2026-09-25",
       "adr_id": "ADR_20260925_DIVIDEND_EVENTS",

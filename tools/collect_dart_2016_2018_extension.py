@@ -13,7 +13,7 @@ nested table layout this scope does not use.
 Safety properties:
 - Identities already answered in the receipt catalog (success, empty, or
   extraction_failed) are skipped; provider-unavailable/blocked ones are retried.
-- Each chunk is persisted (Bronze + one catalog revision) before the next
+- Each chunk is persisted (Bronze + one atomic catalog publish) before the next
   request, so a failure loses at most one chunk instead of the whole run.
 - Headroom comes from ``scoped_dart_request_headroom`` and is re-read before
   every chunk; a chunk is sized for the worst case of three requests per
@@ -22,8 +22,6 @@ Safety properties:
 - A health check runs before collection, and three consecutive transport failures
   (connection reset, client cooldown) abort the chunk without persisting the failed
   identities; failed identities stay pending and are retried by the next run.
-- Catalog revisions are full snapshots; after a run, reclaim old revisions with
-  ``compact-storage-generations --apply``.
 """
 from __future__ import annotations
 

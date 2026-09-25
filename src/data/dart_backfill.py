@@ -13,6 +13,7 @@ from pathlib import Path
 import polars as pl
 
 from src.data.collection import collect_dart_disclosures, collect_dart_financial_facts
+from src.data.datasets import load_manifest, read_dataset
 from src.data.receipt_catalog import ReceiptCatalog
 from src.data.research_scope import PRIMARY_DART_KEY_ENV
 from src.data.runtime import DataRuntime
@@ -149,6 +150,9 @@ class DartMissingFactsPlan:
 # 4분기 TTM 윈도우에 전년동기 이익모멘텀 비교 분기(latest - 4)를 더한 5분기
 QVEF_FUNDAMENTAL_LOOKBACK_QUARTERS = 5
 
+# OpenDART serves financial statements from FY2015.
+OPENDART_FIRST_FISCAL_YEAR = 2015
+
 
 def _prev_quarter(period: str) -> str:
     year = int(period[:4])
@@ -283,33 +287,55 @@ def build_dart_historical_backfill_plan(
 
 
 def _load_security_master(silver_root: Path, *, decision_time: datetime) -> pl.DataFrame:
-    """Load exactly the latest certified security_master dataset (PIT-safe, single version).
+    """Load one certified security-master dataset visible at ``decision_time``."""
 
-    ``security_master`` accumulates one immutable dataset directory per publish; loading
-    every directory under the table root (as opposed to selecting one by id) silently
-    concatenates duplicate historical snapshots of the same reference data, multiplying
-    row count and memory use by the number of retained versions with no benefit.
-    """
-    from src.data.schemas import SilverTable
-    from src.data.silver import latest_silver_dataset_path, load_silver_table_by_dataset_id
+    root = Path(silver_root)
+    candidates: list[tuple[datetime, Path, str]] = []
+    for dataset in sorted(root.glob("security_master_*")):
+        if not dataset.is_dir() or dataset.is_symlink():
+            continue
+        try:
+            manifest = load_manifest(dataset)
+        except PITDataError:
+            continue
+        observed_value = manifest.params.get("decision_time")
+        observed_at = manifest.created_at
+        if isinstance(observed_value, str):
+            try:
+                observed_at = datetime.fromisoformat(observed_value)
+            except ValueError as exc:
+                raise PITDataError(f"security-master decision_time is invalid: {dataset}") from exc
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=UTC)
+        candidates.append((observed_at.astimezone(UTC), dataset, "v2"))
 
-    root = Path(silver_root) / "security_master"
-    if root.exists() and any(root.iterdir()):
-        dataset_path = latest_silver_dataset_path(
-            root=Path(silver_root), table=SilverTable.SECURITY_MASTER, decision_time=decision_time
-        )
-        return load_silver_table_by_dataset_id(
-            root=Path(silver_root),
-            table=SilverTable.SECURITY_MASTER,
-            dataset_id=dataset_path.name,
-            decision_time=decision_time,
-        )
-    # Fallback: silver_root directly holds parquet files (used by tests with a flat layout).
-    files = list(Path(silver_root).rglob("*.parquet"))
-    if files:
-        frames = [pl.read_parquet(p) for p in files]
-        return pl.concat(frames, how="diagonal_relaxed")
-    raise PITDataError("security master is absent; backfill blocked")
+    legacy_root = root / "security_master"
+    if legacy_root.is_dir():
+        for generation in sorted(path for path in legacy_root.iterdir() if path.is_dir()):
+            manifest_path = generation / "dataset_manifest.json"
+            if not manifest_path.is_file():
+                continue
+            try:
+                raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+                observed_at = datetime.fromisoformat(str(raw.get("time_end") or raw.get("generated_time")))
+            except (OSError, ValueError, TypeError) as exc:
+                raise PITDataError(f"security-master generation is unreadable: {generation}") from exc
+            if observed_at.tzinfo is None:
+                observed_at = observed_at.replace(tzinfo=UTC)
+            candidates.append((observed_at.astimezone(UTC), generation, "legacy"))
+
+    if not candidates:
+        raise PITDataError("security master is absent; backfill blocked")
+    visible = [item for item in candidates if item[0] <= decision_time]
+    if not visible:
+        raise PITDataError("no security-master dataset is visible at decision_time")
+    _observed_at, selected, contract = max(visible, key=lambda item: item[0])
+    if contract == "v2":
+        return read_dataset(selected).collect()
+    files = sorted(selected.rglob("*.parquet"))
+    if not files:
+        raise PITDataError(f"security-master generation has no parquet: {selected}")
+    return pl.concat([pl.read_parquet(path) for path in files], how="diagonal_relaxed")
 
 
 def _persist_corp_code_receipt(
@@ -484,8 +510,6 @@ def run_dart_historical_backfill_batch(
     batch_codes = sorted_codes[request.offset : request.offset + request.limit]
     if not batch_codes:
         raise PITDataError("requested backfill batch is empty")
-    from src.data.research_period import OPENDART_FIRST_FISCAL_YEAR
-
     fetch_start = date(OPENDART_FIRST_FISCAL_YEAR - 1, 1, 1)
     fetch_end = request.retrieved_at.date()
     coverage_start = date(request.validation_start.year - 2, 1, 1)
