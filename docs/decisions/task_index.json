@@ -1,6 +1,50 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_DIVIDEND_EVENTS",
+      "date": "2026-09-25",
+      "adr_id": "ADR_20260925_DIVIDEND_EVENTS",
+      "domain": "data",
+      "title": "Dated cash-dividend events from dividend-decision filings",
+      "why": "KRX base prices do not adjust for cash dividends and alotMatter lacks dates.",
+      "resolution": "Added the dividend-decision parser, dividend_events Silver materializer, and a resumable quota-aware collection tool.",
+      "impact": "The engine can credit dividends on the pay session with ex-session awareness.",
+      "caveat": "Parser fixtures are synthetic; validate on the 50-filing pilot before the full run."
+    },
+    {
+      "task_id": "TASK_DART_FACT_QUARANTINE_QUALITY",
+      "date": "2026-09-25",
+      "adr_id": "ADR_20260925_DART_FACT_QUARANTINE_QUALITY",
+      "domain": "data",
+      "title": "Quarantine legacy DART facts and build financial quality CLI",
+      "why": "Legacy HTML-parsed fact values disagreed with later comparatives in about half of checked cases.",
+      "resolution": "Untrusted source kinds are quarantined as auditable filings, and build-financial-quality derives eligibility events from facts, quarantine, and manual events.",
+      "impact": "Only trusted values enter Silver facts, and quality completeness sees quarantined filings explicitly.",
+      "caveat": "Trusted kinds are opendart_standard and attested legacy_document_verified only."
+    },
+    {
+      "task_id": "TASK_BACKTEST_ENGINE_V2",
+      "date": "2026-09-25",
+      "adr_id": "ADR_20260925_BACKTEST_ENGINE_V2",
+      "domain": "backtest",
+      "title": "Backtest engine v2: PIT view, integer ledger, T+1 open execution, metrics, CLI",
+      "why": "The early backtest engine was a simple validation harness with look-ahead, float-cash, and friction gaps.",
+      "resolution": "Implemented PIT market view, integer-KRW ledger, T+1 open-auction execution with costs, engine loop, metrics, manifest, and CLI.",
+      "impact": "Compounding-focused backtests run on dense Gold panels with reproducible manifests.",
+      "caveat": "Dividends come from the separate dividend-events dataset, not the Gold panel."
+    },
+    {
+      "task_id": "TASK_LEGACY_FACT_RECOVERY",
+      "date": "2026-09-25",
+      "adr_id": "ADR_20260925_LEGACY_FACT_RECOVERY",
+      "domain": "data",
+      "title": "Attested legacy fact source kind and one-off recovery tool",
+      "why": "Legacy HTML-parsed DART facts are quarantined because the parser is unreliable per value.",
+      "resolution": "Added the attested legacy_document_verified trust contract in normalization and a temporary benchmark-gated recovery tool under tools/legacy_recovery.",
+      "impact": "Quarantined filings can be re-promoted only with a verified attestation; nothing is promoted unless a fact class passes the benchmark gate.",
+      "caveat": "Recovery tool is temporary (delete after the run, keep the report); it has not been run and needs about 2,880 key-2 document requests."
+    },
+    {
       "task_id": "R1_FLOW_CATALOG_SAFETY",
       "date": "2026-09-24",
       "adr_id": "ADR_20260924_R1_FLOW_CATALOG_SAFETY",
