@@ -13,6 +13,11 @@ import polars as pl
 from src.core.datasets import HIVE_PARTITION_LAYOUT, DatasetCertification, make_manifest
 from src.core.instruments import AssetKind
 from src.core.time import SessionCalendar
+from src.data.normalization import (
+    TRUSTED_FACT_SOURCE_KINDS,
+    QuarantinedFiling,
+    normalize_dart_financial_facts_with_quarantine,
+)
 from src.data.schemas import EvidenceKind, PITDataError, SilverTable
 from src.data.silver import load_latest_silver_table, validate_table
 from src.storage.parquet_datasets import ParquetDatasetStore, canonical_content_hash
@@ -32,6 +37,8 @@ class DartFactRefreshArtifact:
     report_hash: str
     dataset_path: str
     row_count: int
+    quarantine_path: str  # JSON list of quarantined filings, bound to output_hash
+    quarantined_filings: int
 
 
 def _sha256_file(path: Path) -> str:
@@ -208,6 +215,53 @@ def load_frozen_dart_ticker_bridge(
     return mapping, receipt_hash
 
 
+def _quarantine_to_json_record(record: QuarantinedFiling) -> dict[str, str]:
+    return {
+        "company_id": record.company_id,
+        "dart_corp_code": record.dart_corp_code,
+        "fiscal_period": record.fiscal_period,
+        "filing_id": record.filing_id,
+        "source_kind": record.source_kind,
+        "published_at": record.published_at.astimezone(UTC).isoformat(),
+        "available_at": record.available_at.astimezone(UTC).isoformat(),
+    }
+
+
+def _deduplicate_quarantine(
+    records: list[QuarantinedFiling],
+) -> list[QuarantinedFiling]:
+    best: dict[tuple[str, str, str], QuarantinedFiling] = {}
+    for record in records:
+        key = (record.company_id, record.fiscal_period, record.filing_id)
+        previous = best.get(key)
+        if previous is None or (record.available_at, record.published_at, record.source_kind) > (
+            previous.available_at,
+            previous.published_at,
+            previous.source_kind,
+        ):
+            best[key] = record
+    return sorted(
+        best.values(),
+        key=lambda r: (r.available_at, r.company_id, r.fiscal_period, r.filing_id),
+    )
+
+
+def _write_quarantine_file(
+    *, artifact_root: Path, output_hash: str, records: list[QuarantinedFiling]
+) -> Path:
+    payload = json.dumps(
+        [_quarantine_to_json_record(r) for r in records],
+        indent=2,
+        sort_keys=True,
+    )
+    target = Path(artifact_root) / f"dart_fact_quarantine_{output_hash}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_suffix(".tmp")
+    tmp_path.write_text(payload, encoding="utf-8")
+    tmp_path.replace(target)
+    return target
+
+
 def refresh_dart_financial_facts(
     *,
     bronze_root: Path,
@@ -216,6 +270,7 @@ def refresh_dart_financial_facts(
     decision_time: datetime,
     calendar: SessionCalendar,
     batch_size: int = 500,
+    superseded_receipt_hashes: frozenset[str] = frozenset(),
 ) -> DartFactRefreshArtifact:
     """Rebuild the financial-facts Silver table from every verified Bronze fact receipt.
 
@@ -223,6 +278,10 @@ def refresh_dart_financial_facts(
     written under an earlier availability policy would otherwise survive the
     merge with stale ``available_at`` values. The prior dataset hash is still
     reported for lineage.
+
+    Facts from untrusted source kinds are withheld from the published table and recorded,
+    per filing, in a quarantine list written beside the refresh report; the count is also
+    stored in the content manifest so the exclusion is auditable.
 
     Args:
         bronze_root: Scope Bronze root containing ``financial_facts/``.
@@ -232,6 +291,10 @@ def refresh_dart_financial_facts(
         calendar: KRX sessions (see ``xkrx_session_calendar``) extending past
             ``decision_time``.
         batch_size: Receipts normalized per staged parquet batch.
+        superseded_receipt_hashes: Bronze receipts known to be erroneous
+            re-recoveries of a filing that a later receipt corrects. They are
+            excluded and listed in the content manifest so the exclusion is
+            auditable; an unknown hash is rejected to catch typos.
 
     Returns:
         Hashes, dataset path and row count of the published table.
@@ -241,14 +304,16 @@ def refresh_dart_financial_facts(
             missing or corrupt Bronze, empty result, conflicting primary keys,
             or calendar coverage failure.
     """
-    from src.data.normalization import normalize_dart_financial_facts
-
     if decision_time.tzinfo is None:
         raise PITDataError("decision_time must be timezone-aware")
     if int(batch_size) < 1:
         raise PITDataError("batch_size must be positive")
     bound = int(batch_size)
     receipts = _discover_fact_receipts(Path(bronze_root))
+    unknown = superseded_receipt_hashes - {str(r["content_hash"]) for r in receipts}
+    if unknown:
+        raise PITDataError(f"superseded receipts not found in Bronze: {sorted(unknown)}")
+    receipts = [r for r in receipts if str(r["content_hash"]) not in superseded_receipt_hashes]
     disclosure_rows, prior_hash = _load_reference_tables(Path(silver_root), decision_time)
     bridge_root = Path(bronze_root) / "dart_corp_codes"
     bridge: dict[str, str] | None = None
@@ -263,11 +328,9 @@ def refresh_dart_financial_facts(
         stale.unlink()
     receipt_hashes = [str(r["content_hash"]) for r in receipts]
     staged_paths: list[Path] = []
+    quarantined_all: list[QuarantinedFiling] = []
     for batch_idx in range(0, len(receipts), bound):
         batch = receipts[batch_idx : batch_idx + bound]
-        batch_hash = hashlib.sha256(
-            "\x00".join(sorted(str(r["content_hash"]) for r in batch)).encode("utf-8")
-        ).hexdigest()
         batch_frames: list[pl.DataFrame] = []
         for item in batch:
             try:
@@ -275,15 +338,16 @@ def refresh_dart_financial_facts(
             except (OSError, ValueError) as exc:
                 raise PITDataError(f"invalid Bronze payload for financial_facts: {exc}") from exc
             page: object = {"records": payload} if isinstance(payload, list) else payload
-            frame = normalize_dart_financial_facts(
+            frame, batch_quarantine = normalize_dart_financial_facts_with_quarantine(
                 pages=[page],
                 disclosure_rows=disclosure_rows,
-                source_hash=batch_hash,
+                source_hash=str(item["content_hash"]),
                 calendar=calendar,
                 decision_time=decision_time,
                 ticker_by_corp_code=bridge,
                 bridge_receipt_hash=bridge_receipt_hash,
             )
+            quarantined_all.extend(batch_quarantine)
             if frame.height > 0:
                 batch_frames.append(frame)
         if not batch_frames:
@@ -297,7 +361,7 @@ def refresh_dart_financial_facts(
     if staged_paths:
         new_rows = pl.scan_parquet(sorted(staged_paths)).collect()
     else:
-        new_rows = normalize_dart_financial_facts(
+        new_rows, empty_quarantine = normalize_dart_financial_facts_with_quarantine(
             pages=[],
             disclosure_rows=[],
             source_hash=hashlib.sha256(b"empty").hexdigest(),
@@ -306,6 +370,7 @@ def refresh_dart_financial_facts(
             ticker_by_corp_code=bridge,
             bridge_receipt_hash=bridge_receipt_hash,
         )
+        quarantined_all.extend(empty_quarantine)
     merged = _merge_fact_frames(None, new_rows)
     if merged.height == 0:
         raise PITDataError("DART XBRL facts response is empty; certification blocked")
@@ -313,6 +378,17 @@ def refresh_dart_financial_facts(
     output_hash = canonical_content_hash(merged, merged.columns)
     report_parts = [*sorted(receipt_hashes), output_hash]
     report_hash = hashlib.sha256("\x00".join(report_parts).encode("utf-8")).hexdigest()
+    # 같은 공시가 과거에는 파서 값으로, 나중에는 표준 API 값으로 수집됐다면 신뢰 값이 있으므로 격리 대상이 아니다.
+    trusted_filings = set(zip(merged["company_id"].to_list(), merged["fiscal_period"].to_list(), merged["filing_id"].to_list(), strict=True))
+    quarantined = [
+        record
+        for record in _deduplicate_quarantine(quarantined_all)
+        if (record.company_id, record.fiscal_period, record.filing_id) not in trusted_filings
+    ]
+    trusted_kinds = sorted(TRUSTED_FACT_SOURCE_KINDS)
+    quarantine_path = _write_quarantine_file(
+        artifact_root=Path(artifact_root), output_hash=output_hash, records=quarantined
+    )
     available_dates = [d for d in merged["available_at"].to_list() if isinstance(d, datetime)]
     coverage_start = min(d.astimezone(UTC).date() for d in available_dates)
     coverage_end = max(d.astimezone(UTC).date() for d in available_dates)
@@ -343,6 +419,8 @@ def refresh_dart_financial_facts(
             report_hash=report_hash,
             dataset_path=str(existing_dir),
             row_count=merged.height,
+            quarantine_path=str(quarantine_path),
+            quarantined_filings=len(quarantined),
         )
     try:
         dataset_dir = store.write_partitioned(
@@ -356,6 +434,9 @@ def refresh_dart_financial_facts(
                 "receipt_hashes": list(receipt_hashes),
                 "prior_dataset_hash": prior_hash,
                 "availability_policy": AVAILABILITY_POLICY,
+                "superseded_receipt_hashes": sorted(superseded_receipt_hashes),
+                "quarantined_filings": len(quarantined),
+                "trusted_source_kinds": trusted_kinds,
             },
         )
     except ValueError as exc:
@@ -367,6 +448,8 @@ def refresh_dart_financial_facts(
         report_hash=report_hash,
         dataset_path=str(dataset_dir),
         row_count=merged.height,
+        quarantine_path=str(quarantine_path),
+        quarantined_filings=len(quarantined),
     )
     Path(artifact_root).mkdir(parents=True, exist_ok=True)
     (Path(artifact_root) / f"dart_fact_refresh_{output_hash}.json").write_text(
@@ -378,6 +461,8 @@ def refresh_dart_financial_facts(
                 "report_hash": report_hash,
                 "dataset_path": str(dataset_dir),
                 "row_count": merged.height,
+                "quarantine_path": str(quarantine_path),
+                "quarantined_filings": len(quarantined),
             },
             indent=2,
             sort_keys=True,

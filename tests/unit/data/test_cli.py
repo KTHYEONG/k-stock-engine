@@ -681,6 +681,8 @@ def test_normalize_dart_facts_dispatch_publishes(tmp_path, monkeypatch, capsys) 
     assert cli_module.main() == 0
     captured = capsys.readouterr()
     assert "output_hash" in captured.out
+    assert "quarantined_filings" in captured.out
+    assert "quarantine_path" in captured.out
     assert (tmp_path / "silver" / "financial_facts").exists()
 
 
@@ -2900,3 +2902,288 @@ def test_collect_classification_logs_progress_every_hundred_symbols(tmp_path, ca
         )
     assert result["pages_collected"] == 100
     assert any("stage=collect-industry-classification" in message for message in caplog.messages)
+
+
+def _stage_quality_facts_dataset(silver_root, *, decision_time):
+    from datetime import UTC, datetime
+
+    import polars as pl
+
+    from src.core.datasets import HIVE_PARTITION_LAYOUT, DatasetCertification, make_manifest
+    from src.core.instruments import AssetKind
+    from src.storage.parquet_datasets import ParquetDatasetStore, canonical_content_hash
+
+    available = datetime(2019, 11, 14, 0, 0, tzinfo=UTC)
+    rows = [
+        {
+            "company_id": "005930",
+            "fiscal_period": "2018Q4",
+            "filing_id": "F8",
+            "fact": fact,
+            "published_at": available,
+            "available_at": available,
+            "value": 100.0,
+            "unit": "KRW",
+            "consolidated": True,
+            "restatement_id": "r0",
+            "source_hash": "s",
+            "source_kind": "opendart_standard",
+            "mapping_version": "v1",
+            "raw_document_hash": None,
+            "ticker": "005930",
+            "dart_corp_code": "00126380",
+        }
+        for fact in (
+            "sales", "gross_profit", "operating_profit", "net_income",
+            "assets", "equity", "operating_cash_flow",
+        )
+    ]
+    frame = pl.DataFrame(rows)
+    content_hash = canonical_content_hash(frame, frame.columns)
+    manifest = make_manifest(
+        asset_kind=AssetKind.STOCK,
+        columns=frame.columns,
+        feature_set="stock_pit_financial_facts_v1",
+        label_definition="none",
+        label_horizon_sessions=1,
+        time_start=available,
+        time_end=available,
+        provider_version="t",
+        universe_policy_version="v1",
+        row_count=frame.height,
+        schema_version="v2",
+        content_hash=content_hash,
+        storage_layout=HIVE_PARTITION_LAYOUT,
+        certification=DatasetCertification.RESEARCH,
+        quality_report_hash="r",
+    )
+    ParquetDatasetStore(silver_root / "financial_facts").write_partitioned(
+        frame,
+        dataset_id=content_hash,
+        manifest=manifest,
+        expected_feature_set="stock_pit_financial_facts_v1",
+        decision_time=decision_time,
+        content_manifest={},
+    )
+    return content_hash
+
+
+def _quality_cli_args(scope_config, runtime, facts_id, tmp_path, decision="2020-04-01T00:00:00+00:00", extra=()):
+    import json
+
+    quarantine = [
+        {
+            "company_id": "005930",
+            "fiscal_period": "2019Q4",
+            "filing_id": "F9",
+            "published_at": "2020-03-30T00:00:00+00:00",
+            "available_at": "2020-03-31T00:00:00+00:00",
+        }
+    ]
+    manual = [
+        {
+            "company_id": "000660",
+            "fiscal_period": "2019Q4",
+            "filing_id": "M1",
+            "published_at": "2020-03-30T00:00:00+00:00",
+            "available_at": "2020-03-31T00:00:00+00:00",
+            "reason": "missing_source_value",
+        }
+    ]
+    quarantine_path = tmp_path / "quarantine.json"
+    quarantine_path.write_text(json.dumps(quarantine), encoding="utf-8")
+    manual_path = tmp_path / "manual.json"
+    manual_path.write_text(json.dumps(manual), encoding="utf-8")
+    return [
+        "build-financial-quality",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+        "--facts-dataset-id", facts_id,
+        "--quarantine-file", str(quarantine_path),
+        "--unresolved-events-file", str(manual_path),
+        "--decision-time", decision,
+        *extra,
+    ]
+
+
+def test_build_financial_quality_command_publishes_dataset(tmp_path, capsys) -> None:
+    import json
+    from datetime import UTC, datetime
+
+    from src.data.cli import main
+    from src.data.runtime import load_data_runtime
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+    decision_time = datetime(2020, 4, 1, tzinfo=UTC)
+    facts_id = _stage_quality_facts_dataset(runtime.workspace.silver_root, decision_time=decision_time)
+
+    assert main(_quality_cli_args(scope_config, runtime, facts_id, tmp_path)) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["rows"] == 3
+    assert emitted["quarantine_events"] == 1
+    assert emitted["manual_events"] == 1
+    assert emitted["incomplete_periods"] == 2
+    dataset_dir = Path(emitted["dataset_path"])
+    assert dataset_dir.is_dir()
+    manifest = json.loads((dataset_dir / "content_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["source_financial_dataset_id"] == facts_id
+
+
+def test_build_financial_quality_command_is_idempotent(tmp_path, capsys) -> None:
+    import json
+    from datetime import UTC, datetime
+
+    from src.data.cli import main
+    from src.data.runtime import load_data_runtime
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+    decision_time = datetime(2020, 4, 1, tzinfo=UTC)
+    facts_id = _stage_quality_facts_dataset(runtime.workspace.silver_root, decision_time=decision_time)
+
+    assert main(_quality_cli_args(scope_config, runtime, facts_id, tmp_path)) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert main(_quality_cli_args(scope_config, runtime, facts_id, tmp_path)) == 0
+    second = json.loads(capsys.readouterr().out)
+
+    assert second["dataset_id"] == first["dataset_id"]
+    assert len([p for p in (runtime.workspace.silver_root / "financial_quality").iterdir() if p.is_dir()]) == 1
+
+
+def test_build_financial_quality_command_rejects_unknown_facts_dataset(tmp_path, capsys) -> None:
+    import json
+
+    from src.data.cli import main
+    from src.data.runtime import load_data_runtime
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+
+    assert main(_quality_cli_args(scope_config, runtime, "0" * 64, tmp_path)) == 1
+    assert "error" in json.loads(capsys.readouterr().out)
+
+
+def test_build_financial_quality_command_rejects_event_without_reason(tmp_path, capsys) -> None:
+    import json
+    from datetime import UTC, datetime
+
+    from src.data.cli import main
+    from src.data.runtime import load_data_runtime
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+    decision_time = datetime(2020, 4, 1, tzinfo=UTC)
+    facts_id = _stage_quality_facts_dataset(runtime.workspace.silver_root, decision_time=decision_time)
+    argv = _quality_cli_args(scope_config, runtime, facts_id, tmp_path)
+    manual_path = tmp_path / "manual.json"
+    manual_path.write_text(
+        json.dumps([{"company_id": "000660", "fiscal_period": "2019Q4", "filing_id": "M1",
+                     "published_at": "2020-03-30T00:00:00+00:00", "available_at": "2020-03-31T00:00:00+00:00"}]),
+        encoding="utf-8",
+    )
+
+    assert main(argv) == 1
+    assert "reason" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_build_financial_quality_command_rejects_naive_decision_time(tmp_path, capsys) -> None:
+    import json
+    from datetime import UTC, datetime
+
+    from src.data.cli import main
+    from src.data.runtime import load_data_runtime
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+    decision_time = datetime(2020, 4, 1, tzinfo=UTC)
+    facts_id = _stage_quality_facts_dataset(runtime.workspace.silver_root, decision_time=decision_time)
+
+    argv = _quality_cli_args(scope_config, runtime, facts_id, tmp_path, decision="2026-09-24T12:00:00")
+    assert main(argv) == 1
+    assert "error" in json.loads(capsys.readouterr().out)
+
+
+def test_build_financial_quality_command_rejects_bad_inputs(tmp_path, capsys) -> None:
+    import json
+    from datetime import UTC, datetime
+
+    from src.data.cli import main
+    from src.data.runtime import load_data_runtime
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+    decision_time = datetime(2020, 4, 1, tzinfo=UTC)
+    facts_id = _stage_quality_facts_dataset(runtime.workspace.silver_root, decision_time=decision_time)
+
+    def run_with(quarantine_content, manual_content, decision="2020-04-01T00:00:00+00:00"):
+        argv = [
+            "build-financial-quality",
+            "--scope-config", str(scope_config),
+            "--data-root", str(tmp_path / "data"),
+            "--facts-dataset-id", facts_id,
+            "--decision-time", decision,
+        ]
+        if quarantine_content is not None:
+            quarantine_path = tmp_path / "q.json"
+            quarantine_path.write_text(quarantine_content, encoding="utf-8")
+            argv += ["--quarantine-file", str(quarantine_path)]
+        if manual_content is not None:
+            manual_path = tmp_path / "m.json"
+            manual_path.write_text(manual_content, encoding="utf-8")
+            argv += ["--unresolved-events-file", str(manual_path)]
+        assert main(argv) == 1
+        return json.loads(capsys.readouterr().out)
+
+    assert "error" in run_with(None, None, decision="not-a-date")
+    missing = tmp_path / "does-not-exist.json"
+    argv = [
+        "build-financial-quality",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+        "--facts-dataset-id", facts_id,
+        "--quarantine-file", str(missing),
+        "--decision-time", "2020-04-01T00:00:00+00:00",
+    ]
+    assert main(argv) == 1
+    assert "error" in json.loads(capsys.readouterr().out)
+    assert "error" in run_with('{"not": "a list"}', None)
+    assert "error" in run_with('[1]', None)
+
+    def manual_with(**overrides):
+        entry = {
+            "company_id": "000660",
+            "fiscal_period": "2019Q4",
+            "filing_id": "M1",
+            "published_at": "2020-03-30T00:00:00+00:00",
+            "available_at": "2020-03-31T00:00:00+00:00",
+            "reason": "missing_source_value",
+        }
+        entry.update(overrides)
+        return json.dumps([entry])
+
+    assert "error" in run_with("[]", manual_with(published_at="not-a-date"))
+    assert "error" in run_with("[]", manual_with(available_at="2020-03-31T00:00:00"))
+    no_published = json.loads(manual_with())
+    del no_published[0]["published_at"]
+    assert "error" in run_with("[]", json.dumps(no_published))
+    no_company = json.loads(manual_with())
+    del no_company[0]["company_id"]
+    assert "error" in run_with("[]", json.dumps(no_company))
+    no_filing = json.loads(manual_with())
+    del no_filing[0]["filing_id"]
+    assert "error" in run_with("[]", json.dumps(no_filing))
+
+
+def test_quality_event_timestamp_parses_datetime_objects() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from src.data.cli import _parse_quality_decision_time, _parse_quality_event_timestamp
+    from src.data.schemas import PITDataError
+    import pytest
+
+    moment = datetime(2020, 3, 31, tzinfo=UTC)
+    assert _parse_quality_event_timestamp(moment, label="available_at") == moment
+    assert _parse_quality_decision_time("2020-04-01T00:00:00+00:00") == moment + timedelta(days=1)
+    with pytest.raises(PITDataError):
+        _parse_quality_decision_time("2020-04-01T00:00:00")

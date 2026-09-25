@@ -585,3 +585,149 @@ def test_fetch_one_fact_source_quota_block_stops_after_single_call() -> None:
     assert calls == ["CFS"]
     assert page["source_kind"] == "blocked"
 
+
+
+def _ok_response(params: dict[str, str]) -> dict[str, object]:
+    return {
+        "status": "000",
+        "message": "정상",
+        "list": [
+            {
+                "rcept_no": "20160515001111",
+                "bsns_year": params["bsns_year"],
+                "corp_code": params["corp_code"],
+                "reprt_code": params["reprt_code"],
+                "account_id": "ifrs-full_Revenue",
+                "account_nm": "매출액",
+                "fs_div": "CFS",
+                "sj_div": "IS",
+                "thstrm_amount": "1,000",
+            }
+        ],
+    }
+
+
+def _identities(count: int) -> tuple[dict[str, str], ...]:
+    return tuple({**_collector_identity(), "corp_code": f"{index:08d}", "filing_id": f"2016051500{index:04d}"} for index in range(count))
+
+
+def test_circuit_breaker_stops_after_consecutive_transport_failures_and_keeps_good_pages() -> None:
+    from src.integrations.dart.client import DartRetryableError
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    calls: list[str] = []
+
+    def flaky(_endpoint: str, params: dict[str, str]) -> dict[str, object]:
+        calls.append(params["corp_code"])
+        if int(params["corp_code"]) < 2:
+            return _ok_response(params)
+        raise DartRetryableError("DART transport failed for fnlttSinglAcntAll.json: connection reset")
+
+    collector = DartXbrlCollector(api_key="k", request_json=flaky, max_workers=1)
+    pages = list(collector.fetch_financial_fact_sources(_identities(20)))
+
+    assert collector.aborted is True
+    assert len(calls) < 20 * 2
+    assert all(page["identity"]["corp_code"] in {"00000000", "00000001"} for page in pages)
+    assert not any(page.get("source_kind") == "unavailable" and "transport" in str(page["diagnostics"]) for page in pages)
+
+
+def test_circuit_breaker_ignores_isolated_failures() -> None:
+    from src.integrations.dart.client import DartRetryableError
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    def one_bad(_endpoint: str, params: dict[str, str]) -> dict[str, object]:
+        if params["corp_code"] == "00000003":
+            raise DartRetryableError("DART transport failed for fnlttSinglAcntAll.json: reset")
+        return _ok_response(params)
+
+    collector = DartXbrlCollector(api_key="k", request_json=one_bad, max_workers=1)
+    pages = list(collector.fetch_financial_fact_sources(_identities(8)))
+
+    assert collector.aborted is False
+    assert len(pages) == 8
+
+
+def test_circuit_breaker_also_stops_parallel_fetch() -> None:
+    from src.integrations.dart.client import DartRetryableError
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    calls: list[str] = []
+
+    def always_down(_endpoint: str, params: dict[str, str]) -> dict[str, object]:
+        calls.append(params["corp_code"])
+        raise DartRetryableError("DART transport failed for fnlttSinglAcntAll.json: reset")
+
+    collector = DartXbrlCollector(api_key="k", request_json=always_down, max_workers=4)
+    pages = list(collector.fetch_financial_fact_sources(_identities(60)))
+
+    assert collector.aborted is True
+    assert pages == []
+    assert len(calls) < 60
+
+
+def test_health_check_uses_the_client_ping_and_requires_a_client() -> None:
+    import pytest
+
+    from src.core.pit import PITDataError
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    pinged: list[bool] = []
+
+    class _Client:
+        def ping(self) -> None:
+            pinged.append(True)
+
+    DartXbrlCollector(api_key="k", client=_Client()).health_check()
+    assert pinged == [True]
+    with pytest.raises(PITDataError):
+        DartXbrlCollector(api_key="k", request_json=lambda *_: {}).health_check()
+
+
+def test_document_not_found_is_recorded_as_absence_not_retried_forever() -> None:
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    class _Client:
+        def _request_validated(self, endpoint: str, params: dict[str, str]) -> dict[str, object]:
+            return {"status": "013", "list": []}
+
+        def fetch_document_archive(self, rcept_no: str) -> bytes:
+            return "<?xml version='1.0'?><result><status>014</status><message>파일이 존재하지 않습니다.</message></result>".encode()
+
+    page = DartXbrlCollector(api_key="k", client=_Client())._fetch_one_financial_fact_source(_collector_identity())
+
+    assert page["source_kind"] == "legacy_document"
+    assert page["records"] == []
+    assert page["diagnostics"] == ("document_not_found",)
+
+
+def test_archive_transport_failure_returns_a_page_instead_of_losing_the_chunk() -> None:
+    from src.integrations.dart.client import DartQuotaExhaustedError, DartRetryableError
+    from src.integrations.dart.xbrl import DartXbrlCollector, _is_transport_failure
+    from src.integrations.quota import ProviderQuotaBlocked
+
+    def collector_raising(error: Exception) -> DartXbrlCollector:
+        class _Client:
+            def _request_validated(self, endpoint: str, params: dict[str, str]) -> dict[str, object]:
+                return {"status": "013", "list": []}
+
+            def fetch_document_archive(self, rcept_no: str) -> bytes:
+                raise error
+
+        return DartXbrlCollector(api_key="k", client=_Client())
+
+    reset = collector_raising(DartRetryableError("DART transport failed for document.xml: reset"))._fetch_one_financial_fact_source(_collector_identity())
+    cooldown = collector_raising(ProviderQuotaBlocked("OpenDART document.xml blocked until later"))._fetch_one_financial_fact_source(_collector_identity())
+    exhausted = collector_raising(DartQuotaExhaustedError("DART status 020"))._fetch_one_financial_fact_source(_collector_identity())
+
+    assert _is_transport_failure(reset)
+    assert _is_transport_failure(cooldown)
+    assert exhausted["source_kind"] == "blocked"
+
+
+def test_dart_status_800_and_900_count_toward_the_circuit_breaker() -> None:
+    from src.integrations.dart.xbrl import _is_transport_failure
+
+    assert _is_transport_failure({"source_kind": "unavailable", "diagnostics": ("dart_error:DART status 900: overloaded",)})
+    assert not _is_transport_failure({"source_kind": "unavailable", "diagnostics": ("invalid_document_archive",)})
+    assert not _is_transport_failure({"source_kind": "opendart_standard", "diagnostics": ()})

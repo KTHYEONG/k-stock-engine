@@ -1,3 +1,12 @@
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _primary_dart_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hermetic primary key so tests using ``key`` meter the historical ``OpenDART`` ledger regardless of the developer shell."""
+    monkeypatch.setenv("OPENDART_API_KEY", "key")
+
+
 def test_dart_client_rejects_non_success_api_status() -> None:
     from datetime import date
 
@@ -665,3 +674,78 @@ def test_fetch_document_archive_error_payload_rejected(tmp_path, monkeypatch) ->
         client.fetch_document_archive("20240101000001")
 
     assert len(gets) == 1
+
+
+def test_quota_provider_is_per_key_and_never_embeds_the_secret(monkeypatch) -> None:
+    from src.integrations.dart.client import dart_quota_provider
+
+    monkeypatch.setenv("OPENDART_API_KEY", "primary-key")
+
+    assert dart_quota_provider("primary-key") == "OpenDART"
+    assert dart_quota_provider(None) == "OpenDART"
+    secondary = dart_quota_provider("second-key")
+    assert secondary.startswith("OpenDART#")
+    assert len(secondary) == len("OpenDART#") + 8
+    assert "second-key" not in secondary
+    assert secondary == dart_quota_provider("second-key")
+    assert secondary != dart_quota_provider("third-key")
+
+
+def test_secondary_key_requests_are_metered_in_their_own_ledger(tmp_path, monkeypatch) -> None:
+    from datetime import UTC, datetime
+
+    from src.integrations.dart.client import DartApiClient, dart_quota_provider
+    from src.integrations.quota import ProviderQuotaStateStore
+
+    monkeypatch.setenv("OPENDART_API_KEY", "primary-key")
+    now = datetime(2026, 9, 24, 3, tzinfo=UTC)
+    store = ProviderQuotaStateStore(tmp_path)
+
+    class _Session:
+        def get(self, *_args: object, **_kwargs: object) -> object:
+            class _Response:
+                status_code = 200
+
+                @staticmethod
+                def json() -> dict[str, object]:
+                    return {"status": "000"}
+
+            return _Response()
+
+    client = DartApiClient(api_key="second-key", quota_store=store, now=lambda: now)
+    client._session = _Session()  # type: ignore[assignment]
+    client._request("list.json", {})
+
+    assert store.remaining_daily_attempts(provider="OpenDART", now=now, daily_limit=100) == 100
+    assert store.remaining_daily_attempts(provider=dart_quota_provider("second-key"), now=now, daily_limit=100) == 99
+
+
+def test_ping_is_ledgered_and_uses_company_endpoint(tmp_path, monkeypatch) -> None:
+    from datetime import UTC, datetime
+
+    from src.integrations.dart.client import DartApiClient
+    from src.integrations.quota import ProviderQuotaStateStore
+
+    now = datetime(2026, 9, 24, 3, tzinfo=UTC)
+    store = ProviderQuotaStateStore(tmp_path)
+    seen: list[str] = []
+
+    class _Session:
+        def get(self, url: str, **_kwargs: object) -> object:
+            seen.append(url)
+
+            class _Response:
+                status_code = 200
+
+                @staticmethod
+                def json() -> dict[str, object]:
+                    return {"status": "000"}
+
+            return _Response()
+
+    client = DartApiClient(api_key="key", quota_store=store, now=lambda: now)
+    client._session = _Session()  # type: ignore[assignment]
+    client.ping()
+
+    assert seen == ["https://opendart.fss.or.kr/api/company.json"]
+    assert store.remaining_daily_attempts(provider="OpenDART", now=now, daily_limit=10) == 9
