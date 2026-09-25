@@ -5,9 +5,8 @@ from __future__ import annotations
 import bisect
 from collections.abc import Mapping
 from datetime import date, datetime, time
-from typing import Any
+from typing import Any, cast
 
-import numpy as np
 import polars as pl
 from numpy.typing import NDArray
 
@@ -81,6 +80,7 @@ class PITView:
         return self._arrays.sessions[self._t]
 
     def field(self, name: str) -> NDArray[Any]:
+        source: Any
         if name in self._arrays.int_fields:
             source = self._arrays.int_fields[name]
         elif name in self._arrays.float_fields:
@@ -93,7 +93,7 @@ class PITView:
             raise KeyError(name)
         out = source[: self._t + 1]
         out.flags.writeable = False
-        return out
+        return cast("NDArray[Any]", out)
 
     def table(self, name: str) -> pl.DataFrame:
         return self._asof_tables[name].upto(self._decision_time)

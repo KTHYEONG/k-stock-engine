@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 import polars as pl
@@ -298,3 +299,17 @@ def test_dividend_non_date_session_rejected(tmp_path: Path) -> None:
         build_engine_events(
             arrays=arrays, panel_dir=tmp_path / "gold" / "market_panel_test", dividends=dividends
         )
+
+
+def test_exit_partition_verification_failure_is_wrapped(tmp_path: Path) -> None:
+    panel = _write_panel(
+        tmp_path / "gold",
+        "market_panel_test",
+        [_mrow(DAY0, "KRX:A"), _mrow(DAY1, "KRX:A")],
+    )
+    arrays = load_market_arrays(panel_dir=panel, cache_root=tmp_path / "cache")
+    partition = panel / "year=2020" / "part.parquet"
+    partition.write_bytes(partition.read_bytes() + b"tampered")
+
+    with pytest.raises(PITDataError, match="exit table verification failed"):
+        build_engine_events(arrays=arrays, panel_dir=panel, dividends=None)

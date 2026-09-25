@@ -21,15 +21,24 @@ SESSIONS = (date(2026, 3, 4), date(2026, 3, 5), date(2026, 3, 6))
 
 
 def _write_universe(universe_root: Path) -> Path:
-    dataset = Path(universe_root) / "ordinary_universe_testfix"
-    dataset.mkdir(parents=True, exist_ok=True)
-    manifest = {
-        "dataset_id": dataset.name,
-        "policy_version": "krx-ordinary-equity-v1",
-        "partitions": [{"session": day.isoformat()} for day in SESSIONS],
-    }
-    (dataset / "manifest.json").write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
-    return dataset
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+
+    return publish_dataset(
+        layer_root=Path(universe_root),
+        identity=DatasetIdentity(
+            kind="ordinary_universe",
+            layer=DatasetLayer.SILVER,
+            policy_version="krx-ordinary-equity-v1",
+            inputs={},
+            params={"calendar": ",".join(day.isoformat() for day in SESSIONS)},
+        ),
+        partitions={
+            f"session={day.isoformat()}/part.parquet": pl.DataFrame(
+                {"session": [day], "instrument_id": ["KRX:005930"], "ticker": ["005930"], "eligible": [True]}
+            )
+            for day in SESSIONS
+        },
+    ).path
 
 
 def _row(session: str, **overrides: object) -> dict[str, object]:
@@ -281,7 +290,7 @@ def test_materialize_is_deterministic_and_idempotent(tmp_path: Path) -> None:
     manifest = json.loads((first.dataset_path / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["dataset_id"] == first.dataset_id
     assert manifest["policy_version"] == "ls-t1702-net-shares-v1"
-    assert manifest["universe_dataset_id"] == "ordinary_universe_testfix"
+    assert manifest["universe_dataset_id"].startswith("ordinary_universe_")
     assert manifest["rows"] == 1
     assert manifest["partitions"][0]["row_count"] == 1
     assert len(manifest["partitions"][0]["parquet_sha256"]) == 64
@@ -665,4 +674,22 @@ def test_materialize_rejects_unlabeled_page(tmp_path: Path) -> None:
     with pytest.raises(PITDataError, match="provider label"):
         materialize_investor_flow_silver(
             bronze_root=bronze_blank, universe_root=universe_root, silver_root=silver_root, workers=1
+        )
+
+
+def test_materialize_rejects_invalid_availability_policy(tmp_path: Path) -> None:
+    _, universe_root, silver_root = _roots(tmp_path)
+    with pytest.raises(PITDataError, match="availability lag"):
+        materialize_investor_flow_silver(
+            bronze_root=tmp_path / "bronze",
+            universe_root=universe_root,
+            silver_root=silver_root,
+            policy=InvestorFlowSilverPolicy(available_session_lag=0),
+        )
+    with pytest.raises(PITDataError, match="available_time"):
+        materialize_investor_flow_silver(
+            bronze_root=tmp_path / "bronze",
+            universe_root=universe_root,
+            silver_root=silver_root,
+            policy=InvestorFlowSilverPolicy(available_time=object()),  # type: ignore[arg-type]
         )

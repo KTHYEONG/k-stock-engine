@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from datetime import date
 from pathlib import Path
@@ -12,31 +11,21 @@ import polars as pl
 SESSIONS = (date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4))
 
 
-def _write_dataset(directory: Path, frame: pl.DataFrame, *, year: int = 2024) -> Path:
-    directory.mkdir(parents=True, exist_ok=True)
-    rel = Path(f"year={year}") / "part.parquet"
-    out_path = directory / rel
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    frame.write_parquet(out_path)
-    (directory / "manifest.json").write_text(
-        json.dumps(
-            {
-                "dataset_id": directory.name,
-                "policy_version": "test-v1",
-                "partitions": [
-                    {
-                        "path": str(rel),
-                        "row_count": frame.height,
-                        "parquet_sha256": hashlib.sha256(out_path.read_bytes()).hexdigest(),
-                        "year": year,
-                    }
-                ],
-            },
-            sort_keys=True,
+def _write_dataset(directory: Path, frame: pl.DataFrame, *, year: int = 2024, params: dict[str, object] | None = None) -> Path:
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+
+    kind = "market_panel" if "gold" in directory.parts else "investor_flow_ls"
+    return publish_dataset(
+        layer_root=directory.parent,
+        identity=DatasetIdentity(
+            kind=kind,
+            layer=DatasetLayer.GOLD if kind == "market_panel" else DatasetLayer.SILVER,
+            policy_version="test-v1",
+            inputs={},
+            params=params or {},
         ),
-        encoding="utf-8",
-    )
-    return directory
+        partitions={f"year={year}/part.parquet": frame},
+    ).path
 
 
 def _panel_frame() -> pl.DataFrame:
@@ -169,7 +158,7 @@ def test_compute_missing_cells_rejects_unreadable_partition(tmp_path: Path) -> N
     panel, ls_flow = _gap_inputs(tmp_path)
     (ls_flow / "year=2024" / "part.parquet").unlink()
 
-    with pytest.raises(PITDataError, match="unreadable"):
+    with pytest.raises(PITDataError, match="missing dataset partition"):
         compute_missing_investor_flow_cells(market_panel_path=panel, ls_flow_silver_path=ls_flow)
 
 
@@ -202,3 +191,39 @@ def test_compute_missing_cells_rejects_malformed_partition_entry(tmp_path: Path)
 
     with pytest.raises(PITDataError, match="invalid"):
         compute_missing_investor_flow_cells(market_panel_path=panel, ls_flow_silver_path=ls_flow)
+
+
+def test_gap_reader_handles_manifest_and_dense_partition_boundaries(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+
+    from src.data.investor_flow_gap import _read_verified_partitions, compute_missing_investor_flow_cells
+    from src.data.schemas import PITDataError
+
+    panel, ls_flow = _gap_inputs(tmp_path)
+    import src.data.investor_flow_gap as gap_module
+
+    monkeypatch.setattr(
+        gap_module,
+        "dataset_partition_paths",
+        lambda *_args, **_kwargs: (panel / "year=2024" / "part.parquet",),
+    )
+    monkeypatch.setattr(gap_module, "load_manifest", lambda _path: (_ for _ in ()).throw(PITDataError("bad manifest")))
+    assert _read_verified_partitions(panel, label="panel", expected_kind="market_panel")[0] == panel.name
+    monkeypatch.undo()
+
+    with pytest.raises(PITDataError, match="kind"):
+        _read_verified_partitions(ls_flow, label="flow", expected_kind="market_panel")
+
+    panel_only = _write_dataset(
+        tmp_path / "gold" / "panel_no_dense", pl.DataFrame({"value": [1]}), params={"case": "panel-no-dense"}
+    )
+    ls_valid = _write_dataset(tmp_path / "silver" / "ls_valid", _ls_frame())
+    with pytest.raises(PITDataError, match="no dense"):
+        compute_missing_investor_flow_cells(market_panel_path=panel_only, ls_flow_silver_path=ls_valid)
+
+    panel_valid = _write_dataset(tmp_path / "gold" / "panel_valid", _panel_frame())
+    ls_no_dense = _write_dataset(
+        tmp_path / "silver" / "ls_no_dense", pl.DataFrame({"value": [1]}), params={"case": "ls-no-dense"}
+    )
+    with pytest.raises(PITDataError, match="LS flow has no dense"):
+        compute_missing_investor_flow_cells(market_panel_path=panel_valid, ls_flow_silver_path=ls_no_dense)
