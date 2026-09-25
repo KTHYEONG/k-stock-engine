@@ -356,3 +356,34 @@ def test_audit_rejects_ambiguous_records_partition_count_and_output_collision(tm
             bronze_root=tmp_path / "empty",
             artifact_root=tmp_path / "artifacts",
         )
+
+
+def test_audit_reads_v2_universe_manifest_and_rejects_legacy_shape(tmp_path) -> None:
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+    from src.data.ordinary_universe_price_audit import _load_universe_manifest
+
+    root = tmp_path / "v2-universe"
+    path = "session=2020-01-02/part.parquet"
+    published = publish_dataset(
+        layer_root=root,
+        identity=DatasetIdentity("ordinary_universe", DatasetLayer.SILVER, "fixture-v1", {}, {}),
+        partitions={path: pl.DataFrame({"ticker": ["000001"], "eligible": [True]})},
+        details={"partitions": [{"path": path, "session": "2020-01-02"}]},
+    )
+    parts = _load_universe_manifest(published.path)
+    assert parts[0]["session"] == "2020-01-02"
+    assert parts[0]["eligible_count"] == 1
+
+    malformed_v2 = tmp_path / "malformed-v2" / "ordinary_universe_0123456789abcdef"
+    malformed_v2.mkdir(parents=True)
+    (malformed_v2 / "manifest.json").write_text(
+        json.dumps({"schema": "dataset-manifest-v2", "dataset_id": malformed_v2.name}), encoding="utf-8"
+    )
+    with pytest.raises(PITDataError, match="invalid ordinary-universe manifest"):
+        _load_universe_manifest(malformed_v2)
+
+    legacy = tmp_path / "legacy-invalid"
+    legacy.mkdir()
+    (legacy / "manifest.json").write_text(json.dumps({"dataset_id": legacy.name, "partitions": {}}), encoding="utf-8")
+    with pytest.raises(PITDataError, match="invalid ordinary-universe manifest"):
+        _load_universe_manifest(legacy)

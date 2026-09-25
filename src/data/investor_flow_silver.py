@@ -5,8 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
-import shutil
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -18,6 +16,14 @@ from typing import Any
 import polars as pl
 
 from src.core.time import KRX_TZ
+from src.data.datasets import (
+    DatasetIdentity,
+    DatasetLayer,
+    dataset_reference,
+    publish_dataset,
+    resolve_bronze_digest,
+    universe_sessions,
+)
 from src.data.schemas import PITDataError
 
 POLICY_VERSION = "ls-t1702-net-shares-v1"
@@ -213,93 +219,69 @@ def _parse_page(path: Path, sessions: frozenset[date]) -> tuple[str, str, str, A
     return ("ignored", page_hash, "", [])
 
 
-def _load_universe_sessions(universe_root: Path) -> tuple[str, tuple[date, ...]]:
-    datasets = sorted(path for path in Path(universe_root).glob("ordinary_universe_*") if path.is_dir())
-    if len(datasets) != 1:
-        raise PITDataError("ordinary universe requires exactly one published dataset")
-    dataset = datasets[0]
-    try:
-        manifest = json.loads((dataset / "manifest.json").read_text(encoding="utf-8"))
-        parts = manifest["partitions"]
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        raise PITDataError("invalid ordinary-universe manifest") from exc
-    if manifest.get("dataset_id") != dataset.name or not isinstance(parts, list) or not parts:
-        raise PITDataError("invalid ordinary-universe manifest")
-    sessions: list[date] = []
-    for part in parts:
-        if not isinstance(part, dict):
-            raise PITDataError("invalid ordinary-universe partition")
-        try:
-            session = date.fromisoformat(str(part.get("session"))[:10])
-        except ValueError as exc:
-            raise PITDataError("invalid ordinary-universe partition session") from exc
-        if sessions and session <= sessions[-1]:
-            raise PITDataError("ordinary-universe partitions are not strictly ordered")
-        sessions.append(session)
-    return (dataset.name, tuple(sessions))
-
-
 def materialize_investor_flow_silver(
     *,
     bronze_root: Path,
     universe_root: Path,
     silver_root: Path,
-    policy: InvestorFlowSilverPolicy = InvestorFlowSilverPolicy(),  # noqa: B008 - spec-mandated immutable default
+    policy: InvestorFlowSilverPolicy = InvestorFlowSilverPolicy(),  # noqa: B008
     workers: int = 4,
+    universe_dataset_id: str | None = None,
+    bronze_flow_digest: str | None = None,
 ) -> InvestorFlowSilverResult:
-    """Build an immutable Silver investor-flow dataset from raw LS t1702 rows.
+    """Build an immutable Silver investor-flow dataset from raw LS t1702 rows."""
 
-    Values come only from hash-verified raw ``rows``; derived ``records`` are
-    ignored because their historical unit labeling is untrustworthy. The
-    certified ordinary-universe session list is the calendar that assigns
-    ``available_at``; sessions outside it are rejected.
-
-    The investor-flow Bronze kind is shared by several providers; only pages
-    whose ``provider`` is LS (case-insensitive) contribute. Pages from other
-    providers are counted and skipped; a page without a provider label is
-    rejected because its origin cannot be proven.
-
-    Args:
-        bronze_root: Scope Bronze root containing ``investor_flow/<sha256>/``.
-        universe_root: Scope Silver root holding exactly one ordinary-universe
-            dataset whose manifest defines certified sessions.
-        silver_root: Scope Silver root receiving ``investor_flow_<hash16>/``.
-        policy: Availability contract.
-        workers: Bounded parallel page parsers.
-
-    Returns:
-        Counts describing coverage and every excluded cell class.
-
-    Raises:
-        PITDataError: payload hash mismatch, malformed raw row, violated
-            aggregate identity, non-integral quantity, unknown session, or an
-            existing dataset with different content.
-    """
     if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
         raise PITDataError("workers must be a positive integer")
-    universe_dataset_id, calendar = _load_universe_sessions(Path(universe_root))
+    if (
+        isinstance(policy.available_session_lag, bool)
+        or not isinstance(policy.available_session_lag, int)
+        or policy.available_session_lag < 1
+    ):
+        raise PITDataError("investor-flow availability lag must be a positive integer")
+    if not isinstance(policy.available_time, time):
+        raise PITDataError("investor-flow available_time must be a time")
+    root = Path(universe_root)
+    if universe_dataset_id is None:
+        candidates = sorted(
+            path for path in root.glob("ordinary_universe_*") if path.is_dir() and not path.is_symlink()
+        )
+        if len(candidates) != 1:
+            raise PITDataError("ordinary universe requires exactly one published dataset")
+        universe_dataset_id = candidates[0].name
+    universe_dataset_id, calendar = universe_sessions(root, universe_dataset_id, allow_legacy=False)
     session_set = frozenset(calendar)
     page_paths = sorted((Path(bronze_root) / "investor_flow").glob("*/payload.json"))
-    silver_root = Path(silver_root)
-    silver_root.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=".investor-flow-silver-", dir=silver_root))
-    try:
-        shard_dir = staging / "_shards"
-        shard_dir.mkdir()
-        raw_hashes: list[str] = []
-        ignored_records_only_pages = 0
-        foreign_provider_pages = 0
-        negative_keys: set[tuple[str, str]] = set()
-        violation_keys: set[tuple[str, str]] = set()
-        dateless_rows = 0
-        parsed_pages = 0
-        parsed_rows = 0
+    raw_hashes: list[str] = []
+    bronze_page_hashes: list[str] = []
+    ignored_records_only_pages = 0
+    foreign_provider_pages = 0
+    negative_keys: set[tuple[str, str]] = set()
+    violation_keys: set[tuple[str, str]] = set()
+    dateless_rows = 0
+    parsed_pages = 0
+    parsed_rows = 0
+    partitions: dict[str, pl.DataFrame] = {}
+    partition_details: list[dict[str, object]] = []
+    conflict_cells = 0
+    unavailable_tail_cells = 0
+    retail_exceeds_volume_rows = 0
+    negative_cells = 0
+    total_rows = 0
+    tickers: set[str] = set()
+
+    with tempfile.TemporaryDirectory(prefix="investor-flow-silver-") as temporary:
+        shard_dir = Path(temporary)
         with ThreadPoolExecutor(max_workers=workers) as pool:
             for offset in range(0, len(page_paths), _PAGE_BATCH):
                 batch = page_paths[offset : offset + _PAGE_BATCH]
                 columns: dict[str, list[Any]] = {name: [] for name in _SHARD_SCHEMA}
-                for kind, page_hash, symbol, content in pool.map(_parse_page, batch, [session_set] * len(batch)):
+                for kind, page_hash, symbol, content in pool.map(
+                    _parse_page, batch, [session_set] * len(batch)
+                ):
                     parsed_pages += 1
+                    if kind in {"raw", "provider_error", "missing_sessions"}:
+                        bronze_page_hashes.append(page_hash)
                     if kind == "raw":
                         raw_hashes.append(page_hash)
                         cells, page_dateless, page_violations = content
@@ -322,47 +304,43 @@ def materialize_investor_flow_silver(
                     else:
                         for listed_session in content:
                             negative_keys.add((listed_session, symbol))
-                # 페이지 묶음마다 컬럼형 shard로 내려 전체 셀을 Python 객체로 쌓지 않는다.
                 if columns["session"]:
-                    pl.DataFrame(columns, schema=_SHARD_SCHEMA).write_parquet(shard_dir / f"shard-{offset:07d}.parquet")
-                _LOG.info("stage=investor_flow_silver pages=%s/%s rows=%s", parsed_pages, len(page_paths), parsed_rows)
-        raw_hashes.sort()
-        raw_digest = hashlib.sha256("\n".join(raw_hashes).encode("utf-8")).hexdigest()
-        dataset_id = "investor_flow_" + hashlib.sha256(
-            "\n".join((
-                POLICY_VERSION,
-                str(policy.available_session_lag),
-                policy.available_time.isoformat(),
-                universe_dataset_id,
-                *raw_hashes,
-            )).encode("utf-8")
-        ).hexdigest()[:16]
-        target = silver_root / dataset_id
-        key_schema = {"session": pl.Date, "ticker": pl.String}
+                    pl.DataFrame(columns, schema=_SHARD_SCHEMA).write_parquet(
+                        shard_dir / f"shard-{offset:07d}.parquet"
+                    )
+                _LOG.info(
+                    "[DATA] stage=investor_flow_ls pages=%d/%d rows=%d",
+                    parsed_pages,
+                    len(page_paths),
+                    parsed_rows,
+                )
+
         violations = pl.DataFrame(
-            {"session": [date.fromisoformat(day) for day, _ in violation_keys], "ticker": [t for _, t in violation_keys]},
-            schema=key_schema,
+            {
+                "session": [date.fromisoformat(day) for day, _ in violation_keys],
+                "ticker": [ticker for _, ticker in violation_keys],
+            },
+            schema={"session": pl.Date, "ticker": pl.String},
         )
         negatives = pl.DataFrame(
-            {"session": [date.fromisoformat(day) for day, _ in negative_keys], "ticker": [t for _, t in negative_keys]},
-            schema=key_schema,
+            {
+                "session": [date.fromisoformat(day) for day, _ in negative_keys],
+                "ticker": [ticker for _, ticker in negative_keys],
+            },
+            schema={"session": pl.Date, "ticker": pl.String},
         )
         lag = policy.available_session_lag
         availability = pl.DataFrame(
             {
                 "session": list(calendar),
-                "available_session": [calendar[i + lag] if i + lag < len(calendar) else None for i in range(len(calendar))],
+                "available_session": [
+                    calendar[index + lag] if index + lag < len(calendar) else None
+                    for index in range(len(calendar))
+                ],
             },
             schema={"session": pl.Date, "available_session": pl.Date},
         )
-        shards = sorted(shard_dir.glob("*.parquet"))
-        partitions: list[dict[str, Any]] = []
-        conflict_cells = 0
-        unavailable_tail_cells = 0
-        retail_exceeds_volume_rows = 0
-        negative_cells = 0
-        total_rows = 0
-        tickers: set[str] = set()
+        shards = sorted(shard_dir.glob("shard-*.parquet"))
         for year in sorted({session.year for session in calendar}):
             year_negatives = negatives.filter(pl.col("session").dt.year() == year)
             if not shards:
@@ -374,18 +352,23 @@ def materialize_investor_flow_silver(
                 .collect()
                 .join(violations, on=["session", "ticker"], how="anti")
             )
-            # 원본 행이 덮은 셀은 음성 기록으로 중복 계상하지 않는다(위반 셀은 덮은 것으로 보지 않음).
-            negative_cells += year_negatives.join(cells.select("session", "ticker"), on=["session", "ticker"], how="anti").height
+            negative_cells += year_negatives.join(
+                cells.select("session", "ticker"), on=["session", "ticker"], how="anti"
+            ).height
             grouped = (
                 cells.sort("source_hash")
                 .group_by(["session", "ticker"], maintain_order=True)
                 .agg(pl.struct(list(_GROUP_CODES)).n_unique().alias("_distinct"), pl.all().first())
             )
             conflict_cells += grouped.filter(pl.col("_distinct") > 1).height
-            resolved = grouped.filter(pl.col("_distinct") == 1).join(availability, on="session", how="left")
+            resolved = grouped.filter(pl.col("_distinct") == 1).join(
+                availability, on="session", how="left"
+            )
             unavailable_tail_cells += resolved.filter(pl.col("available_session").is_null()).height
             resolved = resolved.filter(pl.col("available_session").is_not_null())
-            retail_exceeds_volume_rows += resolved.filter(pl.col("tjj0008").abs() > pl.col("ls_volume")).height
+            retail_exceeds_volume_rows += resolved.filter(
+                pl.col("tjj0008").abs() > pl.col("ls_volume")
+            ).height
             part = resolved.select(
                 "session",
                 pl.concat_str(pl.lit("KRX:"), pl.col("ticker")).alias("instrument_id"),
@@ -408,28 +391,34 @@ def materialize_investor_flow_silver(
             ).cast(pl.Schema(_SCHEMA)).sort(["session", "ticker"])
             if part.height == 0:
                 continue
-            rel = Path(f"year={year}") / "part.parquet"
-            out_path = staging / rel
-            out_path.parent.mkdir(parents=True)
-            part.write_parquet(out_path)
-            partitions.append({
-                "path": str(rel),
-                "row_count": part.height,
-                "parquet_sha256": hashlib.sha256(out_path.read_bytes()).hexdigest(),
-                "year": year,
-            })
+            relative_path = f"year={year}/part.parquet"
+            partitions[relative_path] = part
+            partition_details.append({"year": year, "rows": part.height})
             total_rows += part.height
             tickers.update(part["ticker"].unique().to_list())
-        shutil.rmtree(shard_dir)
-        manifest = {
-            "dataset_id": dataset_id,
-            "policy_version": POLICY_VERSION,
+
+    flow_digest = resolve_bronze_digest(
+        bronze_flow_digest,
+        bronze_page_hashes,
+        label="LS investor-flow Bronze source",
+    )
+    identity = DatasetIdentity(
+        kind="investor_flow_ls",
+        layer=DatasetLayer.SILVER,
+        policy_version=POLICY_VERSION,
+        inputs={"universe": dataset_reference(universe_dataset_id, kind="ordinary_universe"), "bronze_flow": flow_digest},
+        params={
             "available_session_lag": policy.available_session_lag,
             "available_time": policy.available_time.isoformat(),
+        },
+    )
+    published = publish_dataset(
+        layer_root=Path(silver_root),
+        identity=identity,
+        partitions=partitions,
+        details={
             "universe_dataset_id": universe_dataset_id,
-            "raw_page_hashes_digest": raw_digest,
-            "rows": total_rows,
-            "tickers": len(tickers),
+            "partitions": partition_details,
             "raw_pages": len(raw_hashes),
             "ignored_records_only_pages": ignored_records_only_pages,
             "foreign_provider_pages": foreign_provider_pages,
@@ -440,26 +429,12 @@ def materialize_investor_flow_silver(
             "unavailable_tail_cells": unavailable_tail_cells,
             "retail_exceeds_volume_rows": retail_exceeds_volume_rows,
             "dateless_rows": dateless_rows,
-            "partitions": partitions,
-        }
-        encoded = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-        (staging / "manifest.json").write_text(encoded, encoding="utf-8")
-        if target.exists():
-            try:
-                current = (target / "manifest.json").read_text(encoding="utf-8")
-            except OSError as exc:
-                raise PITDataError(f"existing investor-flow dataset is unreadable: {target}") from exc
-            if current != encoded:
-                raise PITDataError(f"existing investor-flow dataset differs: {target}")
-            shutil.rmtree(staging, ignore_errors=True)
-        else:
-            os.rename(staging, target)
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
+            "tickers": len(tickers),
+        },
+    )
     return InvestorFlowSilverResult(
-        dataset_path=target,
-        dataset_id=dataset_id,
+        dataset_path=published.path,
+        dataset_id=published.dataset_id,
         rows=total_rows,
         tickers=len(tickers),
         raw_pages=len(raw_hashes),

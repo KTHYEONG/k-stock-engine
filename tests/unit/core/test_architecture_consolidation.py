@@ -57,7 +57,7 @@ class TestSingleSourceOfTruth:
                 text = path.read_text(encoding="utf-8")
                 if re.search(r"^class DatasetManifest\b", text, re.MULTILINE):
                     owners.append(str(path.relative_to(SRC)))
-        assert owners == ["core/datasets.py"], f"DatasetManifest duplicated in {owners}"
+        assert owners == [], f"legacy DatasetManifest remains in {owners}"
 
     def test_parquet_store_defined_only_in_storage(self) -> None:
         owners = []
@@ -66,7 +66,7 @@ class TestSingleSourceOfTruth:
                 text = path.read_text(encoding="utf-8")
                 if re.search(r"^class ParquetDatasetStore\b", text, re.MULTILINE):
                     owners.append(str(path.relative_to(SRC)))
-        assert owners == ["storage/parquet_datasets.py"], f"store duplicated in {owners}"
+        assert owners == [], f"legacy ParquetDatasetStore remains in {owners}"
 
     def test_integrations_are_active_and_legacy_free(self) -> None:
         # Ensure integrations package exists and contains no legacy imports

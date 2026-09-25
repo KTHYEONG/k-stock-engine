@@ -32,7 +32,10 @@ def _xirr(cashflows: list[tuple[date, float]]) -> float | None:
     terms = [((day - base).days / 365.0, amount) for day, amount in cashflows]
 
     def npv(rate: float) -> float:
-        return sum(amount / ((1.0 + rate) ** years) for years, amount in terms)
+        total = 0.0
+        for years, amount in terms:
+            total += amount / ((1.0 + rate) ** years)
+        return total
 
     low, high = -0.999999, 1.0
     for _ in range(100):
@@ -55,7 +58,7 @@ def summarize(
 ) -> PerformanceSummary:
     """Summarize a run with flow-neutral growth as the primary metric.
 
-    Daily TWR return is ``(nav_t − flow_t) / nav_{t−1} − 1`` with flows booked
+    Daily TWR return is ``(nav_t - flow_t) / nav_{t-1} - 1`` with flows booked
     pre-open, so a deposit alone produces zero return; log growth is the mean
     of ``ln(1 + r)`` scaled by ``sessions_per_year``. Turnover and cost drag
     are mean daily traded notionals and explicit costs (commission plus sell
@@ -73,7 +76,7 @@ def summarize(
     dated_rets: list[tuple[date, float]] = []
     prev_nav: int | None = None
     prev_ext = 0
-    for record, session_date in zip(records, dates):
+    for record, session_date in zip(records, dates, strict=True):
         flow = record.external_flow - prev_ext
         prev_ext = record.external_flow
         if prev_nav is not None and prev_nav != 0:
@@ -92,7 +95,7 @@ def summarize(
     twr_total = math.prod([1.0 + ret for _, ret in dated_rets], start=1.0) - 1.0
     cashflows: list[tuple[date, float]] = []
     prev_ext = 0
-    for record, session_date in zip(records, dates):
+    for record, session_date in zip(records, dates, strict=True):
         flow = record.external_flow - prev_ext
         prev_ext = record.external_flow
         if flow:

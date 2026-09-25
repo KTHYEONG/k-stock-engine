@@ -1,6 +1,7 @@
 """OpenDART standard quarterly financial facts."""
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 
@@ -76,7 +77,7 @@ def test_opendart_standard_facts_parsed_with_values_and_fiscal_period() -> None:
 def test_normalize_dart_financial_facts_accepts_opendart_standard_records() -> None:
     from datetime import UTC, datetime
     from src.core.time import SessionCalendar
-    from src.data.normalization import normalize_dart_financial_facts
+    from src.data.normalization import normalize_dart_financial_facts_with_quarantine
 
     page = {
         "source_kind": "opendart_standard",
@@ -118,7 +119,7 @@ def test_normalize_dart_financial_facts_accepts_opendart_standard_records() -> N
     }
     decision_time = datetime(2016, 1, 1, 9, 0, tzinfo=UTC)
     calendar = SessionCalendar((datetime(2015, 5, 18, 9, 0, tzinfo=UTC),))
-    df = normalize_dart_financial_facts(
+    df, _ = normalize_dart_financial_facts_with_quarantine(
         pages=[page],
         disclosure_rows=(),
         source_hash="a" * 64,
@@ -758,3 +759,53 @@ def test_dart_status_800_and_900_count_toward_the_circuit_breaker() -> None:
     assert _is_transport_failure({"source_kind": "unavailable", "diagnostics": ("dart_error:DART status 900: overloaded",)})
     assert not _is_transport_failure({"source_kind": "unavailable", "diagnostics": ("invalid_document_archive",)})
     assert not _is_transport_failure({"source_kind": "opendart_standard", "diagnostics": ()})
+
+def test_dart_xbrl_env_workers_and_filing_identity_filter(monkeypatch, tmp_path: Path) -> None:
+    import json
+    from datetime import date
+
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    monkeypatch.setenv("OPENDART_MAX_WORKERS", "3")
+    collector = DartXbrlCollector(api_key="key", request_json=lambda *_: {})
+    assert collector._max_workers == 3
+    disclosures = tmp_path / "disclosures" / "one"
+    disclosures.mkdir(parents=True)
+    (disclosures / "payload.json").write_text(
+        json.dumps(
+            {
+                "corp_code": "001",
+                "records": [
+                    {
+                        "rcept_dt": "20260306",
+                        "corp_code": "001",
+                        "report_nm": "(2025.12) 사업보고서",
+                        "bsns_year": "2025",
+                        "reprt_code": "11011",
+                        "rcept_no": "r1",
+                    },
+                    {"rcept_dt": "bad"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    other = tmp_path / "disclosures" / "other"
+    other.mkdir()
+    (other / "payload.json").write_text(json.dumps({"corp_code": "002", "records": []}), encoding="utf-8")
+    assert DartXbrlCollector.filing_identities_from_bronze(
+        tmp_path,
+        start=date(2026, 1, 1),
+        end=date(2026, 12, 31),
+        corp_codes=("001",),
+    ) == ({
+        "corp_code": "001",
+        "filing_id": "r1",
+        "rcept_no": "r1",
+        "biz_year": "2025",
+        "reprt_code": "11011",
+        "fs_div": "CFS",
+        "published_at": "2026-03-06",
+        "correction_of": "",
+        "fiscal_period": "2025Q4",
+    },)

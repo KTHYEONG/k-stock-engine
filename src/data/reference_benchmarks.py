@@ -2,11 +2,7 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
-import os
-import shutil
-import tempfile
 import tomllib
 from dataclasses import dataclass
 from enum import StrEnum
@@ -15,6 +11,14 @@ from typing import Any, cast
 
 import polars as pl
 
+from src.data.datasets import (
+    DatasetIdentity,
+    DatasetLayer,
+    dataset_partition_paths,
+    dataset_reference,
+    load_manifest,
+    publish_dataset,
+)
 from src.data.schemas import PITDataError
 
 DEFINITIONS_VERSION = "reference-benchmarks-v1"
@@ -107,32 +111,28 @@ def load_benchmark_definitions(path: Path) -> tuple[str, tuple[BenchmarkDefiniti
 
 def _load_panel_frame(market_panel_path: Path) -> tuple[str, pl.DataFrame, list[Any]]:
     try:
-        manifest = json.loads((Path(market_panel_path) / "manifest.json").read_text(encoding="utf-8"))
-        parts = manifest["partitions"]
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        raise PITDataError(f"invalid reference-benchmark input manifest: {market_panel_path}") from exc
-    if manifest.get("dataset_id") != Path(market_panel_path).name or not isinstance(parts, list) or not parts:
-        raise PITDataError(f"invalid reference-benchmark input manifest: {market_panel_path}")
-    files: list[str] = []
-    for part in parts:
-        if (
-            not isinstance(part, dict)
-            or not isinstance(part.get("year"), int)
-            or not isinstance(part.get("path"), str)
-            or not isinstance(part.get("parquet_sha256"), str)
-        ):
-            raise PITDataError(f"invalid reference-benchmark input partition: {market_panel_path}")
-        target = Path(market_panel_path) / str(part["path"])
+        paths = dataset_partition_paths(market_panel_path, allow_legacy=False)
         try:
-            data = target.read_bytes()
-        except OSError as exc:
-            raise PITDataError(f"reference-benchmark input partition is unreadable: {part['path']}") from exc
-        if hashlib.sha256(data).hexdigest() != part["parquet_sha256"]:
-            raise PITDataError(f"reference-benchmark input hash mismatch: {part['path']}")
-        files.append(str(target))
-    frame = pl.scan_parquet(files).select(_COLUMNS).collect().sort(["instrument_id", "session"])
+            manifest = load_manifest(market_panel_path)
+        except PITDataError:
+            manifest = None
+        if manifest is not None and manifest.kind != "market_panel":
+            raise PITDataError(f"invalid reference-benchmark input kind: {market_panel_path}")
+        frames: list[pl.DataFrame] = []
+        for path in paths:
+            try:
+                candidate = pl.read_parquet(path)
+            except (OSError, ValueError, pl.exceptions.PolarsError):
+                continue
+            if set(_COLUMNS).issubset(candidate.columns):
+                frames.append(candidate.select(_COLUMNS))
+    except PITDataError as exc:
+        raise PITDataError(f"invalid reference-benchmark input manifest: {market_panel_path}") from exc
+    if not frames:
+        raise PITDataError(f"invalid reference-benchmark input manifest: {market_panel_path}")
+    frame = pl.concat(frames, how="vertical_relaxed").sort(["instrument_id", "session"])
     sessions = frame.select("session").unique().sort("session")["session"].to_list()
-    return (manifest["dataset_id"], frame, sessions)
+    return market_panel_path.name, frame, sessions
 
 
 def _benchmark_frame(
@@ -237,94 +237,64 @@ def materialize_reference_benchmarks(
     definitions_version: str,
     gold_root: Path,
 ) -> ReferenceBenchmarkResult:
-    """Build daily frictionless reference index series from the market panel.
+    """Build and publish frictionless reference benchmark indices."""
 
-    Constituents for session t are fixed from information at t-1 so the index
-    is a portfolio an investor could have formed at the prior close; returns
-    are the exchange-adjusted price returns of session t.
-
-    Args:
-        market_panel_path: Certified Gold ``market_panel_<id>`` directory.
-        definitions: Index definitions to compute.
-        definitions_version: Version string of the definition file.
-        gold_root: Scope Gold root receiving ``reference_benchmarks_<hash16>/``.
-
-    Returns:
-        Dataset location and the largest single-session weight lost to exits.
-
-    Raises:
-        PITDataError: panel manifest/hash mismatch, a definition that never
-            forms constituents, or an empty constituent set on any session
-            after that definition's inception (the session before its first
-            formable constituent set).
-    """
+    if not definitions:
+        raise PITDataError("reference benchmarks require at least one definition")
     panel_id, frame, sessions = _load_panel_frame(Path(market_panel_path))
-    dataset_id = "reference_benchmarks_" + hashlib.sha256(
-        "\n".join((
-            definitions_version,
-            *(f"{definition.benchmark_id}:{definition.weighting.value}:{definition.min_adtv20_krw!r}"
-              for definition in sorted(definitions, key=lambda item: item.benchmark_id)),
-            panel_id,
-        )).encode("utf-8")
-    ).hexdigest()[:16]
-    gold_root = Path(gold_root)
-    gold_root.mkdir(parents=True, exist_ok=True)
-    target = gold_root / dataset_id
-    staging = Path(tempfile.mkdtemp(prefix=".reference-benchmarks-", dir=gold_root))
-    try:
-        calendar = frame.select("session").unique().sort("session").with_row_index("pos")
-        base = frame.join(calendar, on="session", how="left").sort(["instrument_id", "session"])
-        combined = pl.concat(
-            [
-                _benchmark_frame(base=base, calendar=calendar, sessions=sessions, definition=definition)
-                for definition in definitions
-            ],
-            how="vertical_relaxed",
-        ).sort(["benchmark_id", "session"])
-        rel = Path("benchmarks.parquet")
-        out_path = staging / rel
-        combined.write_parquet(out_path)
-        dropped_exit_weight_max = float(cast("float", combined["dropped_exit_weight"].max()))
-        manifest = {
-            "dataset_id": dataset_id,
+    calendar = frame.select("session").unique().sort("session").with_row_index("pos")
+    base = frame.join(calendar, on="session", how="left").sort(["instrument_id", "session"])
+    combined = pl.concat(
+        [
+            _benchmark_frame(
+                base=base,
+                calendar=calendar,
+                sessions=sessions,
+                definition=definition,
+            )
+            for definition in definitions
+        ],
+        how="vertical_relaxed",
+    ).sort(["benchmark_id", "session"])
+    definition_payload = [
+        {
+            "benchmark_id": definition.benchmark_id,
+            "weighting": definition.weighting.value,
+            "min_adtv20_krw": definition.min_adtv20_krw,
+        }
+        for definition in sorted(definitions, key=lambda item: item.benchmark_id)
+    ]
+    identity = DatasetIdentity(
+        kind="reference_benchmarks",
+        layer=DatasetLayer.GOLD,
+        policy_version=definitions_version,
+        inputs={"market_panel": dataset_reference(panel_id, kind="market_panel")},
+        params={
             "definitions_version": definitions_version,
-            "definitions": [
-                {
-                    "benchmark_id": definition.benchmark_id,
-                    "weighting": definition.weighting.value,
-                    "min_adtv20_krw": definition.min_adtv20_krw,
-                }
-                for definition in definitions
-            ],
-            "market_panel_dataset_id": panel_id,
+            "definitions": json.dumps(definition_payload, sort_keys=True, separators=(",", ":")),
+        },
+    )
+    dropped_exit_weight_max = (
+        float(cast("float", combined["dropped_exit_weight"].max()))
+        if combined.height
+        else 0.0
+    )
+    published = publish_dataset(
+        layer_root=Path(gold_root),
+        identity=identity,
+        partitions={"benchmarks.parquet": combined},
+        details={
+            "definitions_version": definitions_version,
+            "definitions": definition_payload,
             "sessions": len(sessions),
             "benchmarks": [definition.benchmark_id for definition in definitions],
             "dropped_exit_weight_max": dropped_exit_weight_max,
             "dividends": "not_integrated",
-            "table": {
-                "path": str(rel),
-                "row_count": combined.height,
-                "parquet_sha256": hashlib.sha256(out_path.read_bytes()).hexdigest(),
-            },
-        }
-        encoded = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-        (staging / "manifest.json").write_text(encoded, encoding="utf-8")
-        if target.exists():
-            try:
-                current = (target / "manifest.json").read_text(encoding="utf-8")
-            except OSError as exc:
-                raise PITDataError(f"existing reference benchmarks are unreadable: {target}") from exc
-            if current != encoded:
-                raise PITDataError(f"existing reference benchmarks differ: {target}")
-            shutil.rmtree(staging, ignore_errors=True)
-        else:
-            os.rename(staging, target)
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
+        },
+    )
     return ReferenceBenchmarkResult(
-        dataset_path=target,
-        dataset_id=dataset_id,
+        dataset_path=published.path,
+        dataset_id=published.dataset_id,
         sessions=len(sessions),
         benchmarks=tuple(definition.benchmark_id for definition in definitions),
         dropped_exit_weight_max=dropped_exit_weight_max,
