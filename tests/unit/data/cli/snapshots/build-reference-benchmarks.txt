@@ -1,0 +1,11 @@
+usage: cli.py build-reference-benchmarks [-h] [--scope-config SCOPE_CONFIG]
+                                         [--data-root DATA_ROOT]
+                                         [--market-panel-dataset-id MARKET_PANEL_DATASET_ID]
+                                         [--definitions DEFINITIONS]
+
+options:
+  -h, --help            show this help message and exit
+  --scope-config SCOPE_CONFIG
+  --data-root DATA_ROOT
+  --market-panel-dataset-id MARKET_PANEL_DATASET_ID
+  --definitions DEFINITIONS

@@ -7,7 +7,6 @@ dependencies = [
     "numpy>=2.0.0",
     "pandas>=2.2.0",
     "pyarrow>=15.0.0",
-    "python-dotenv>=1.0.0",
     "scipy>=1.13.0",
     "tenacity>=8.5.0",
     "psutil>=6.0.0",
@@ -143,10 +142,10 @@ cache-dir = "tmp/uv-cache"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-ra -q --import-mode=importlib"
+addopts = "-ra -q --import-mode=importlib -m \"not slow\" -n 4"
 pythonpath = ["."]
 markers = [
-    "slow: tests that read real parquet files (~0.3s each)",
+    "slow: tests that read real data/ parquet files (skipped by default; run with -m slow or lean_check --run-slow)",
 ]
 filterwarnings = [
     "ignore::RuntimeWarning:numpy.*",

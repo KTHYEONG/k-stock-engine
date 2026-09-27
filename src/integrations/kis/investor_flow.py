@@ -1,210 +1,58 @@
-"""KIS investor-flow evidence mapped without inferred values."""
+"""KIS investor-flow collector returning one raw FHPTJ04160001 answer."""
+
 from __future__ import annotations
 
-import json
-from collections.abc import Iterable
-from datetime import UTC, date, datetime, timedelta
-from pathlib import Path
+from datetime import date
 from typing import Any
 
-from src.core.pit import BronzeReceipt, PITDataError
+from src.integrations.errors import ProviderError
 from src.integrations.kis.client import KisClient, KisCredentials
+from src.integrations.responses import RawResponse
+
+__all__ = ["KisInvestorFlowCollector"]
 
 
 class KisInvestorFlowCollector:
-    """Collect per-ticker KIS transaction-value investor flows in bounded pages."""
+    """Fetch one raw KIS investor-trade page without mapping or storage."""
 
-    def __init__(self, symbols: tuple[str, ...], *, client: Any | None = None) -> None:
-        cleaned = tuple(dict.fromkeys(symbol.strip() for symbol in symbols if symbol.strip()))
-        if not cleaned:
-            raise ValueError("KIS investor flow requires at least one symbol")
-        self._symbols = cleaned
+    def __init__(self, symbols: tuple[str, ...] | None = None, *, client: Any | None = None) -> None:
+        if symbols is not None:
+            cleaned = tuple(dict.fromkeys(symbol.strip() for symbol in symbols if symbol.strip()))
+            if not cleaned:
+                raise ValueError("KIS investor flow requires at least one symbol")
+            self._symbols: tuple[str, ...] | None = cleaned
+        else:
+            self._symbols = None
         self._client = client or KisClient(KisCredentials.from_env())
-        self._verified_anchor_index: dict[tuple[Path, str, str], dict[str, object]] = {}
-        self._verified_anchor_index_roots: set[Path] = set()
 
-    @staticmethod
-    def _session(value: object) -> date:
-        text = str(value).strip().replace("/", "-")
-        if len(text) == 8 and text.isdigit():
-            text = f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    def health_check(self) -> None:
+        """Confirm collection credentials are live without touching Bronze."""
+        health = getattr(self._client, "health_check", None)
+        if callable(health):
+            health()
+
+    def fetch(self, symbol: str, anchor: date) -> RawResponse:
+        """Return one raw ``FHPTJ04160001`` answer anchored at ``anchor``.
+
+        An answer with no rows returns ``rows == ()`` and is never an
+        exception.
+
+        Raises:
+            ProviderError: the transport failed.
+        """
+        if not symbol.strip():
+            raise ValueError("KIS investor flow requires a symbol")
+        if not isinstance(anchor, date):
+            raise ValueError("anchor must be a date")
         try:
-            return date.fromisoformat(text)
-        except ValueError as exc:
-            raise PITDataError("KIS investor flow has invalid session") from exc
-
-    @staticmethod
-    def _value(row: dict[str, Any], field: str) -> float:
-        raw = row.get(field)
-        if raw is None or str(raw).strip() == "":
-            raise PITDataError(f"KIS investor flow missing {field}")
-        try:
-            return float(str(raw).replace(",", ""))
-        except ValueError as exc:
-            raise PITDataError(f"KIS investor flow has invalid {field}") from exc
-
-    def _map_rows(self, symbol: str, rows: tuple[dict[str, Any], ...]) -> list[dict[str, object]]:
-        mapped = [
-            {
-                "session": self._session(row.get("stck_bsop_date")).isoformat(),
-                "ticker": symbol,
-                "_source_provider": "KIS",
-                "foreign_buy_value": self._value(row, "frgn_shnu_tr_pbmn"),
-                "foreign_sell_value": self._value(row, "frgn_seln_tr_pbmn"),
-                "foreign_net_value": self._value(row, "frgn_ntby_tr_pbmn"),
-                "institution_net_value": self._value(row, "orgn_ntby_tr_pbmn"),
-                "retail_net_value": self._value(row, "prsn_ntby_tr_pbmn"),
-            }
-            for row in rows
-        ]
-        if not mapped:
-            raise PITDataError("KIS investor flow response is empty")
-        return mapped
-
-    def _persist_raw_page(
-        self,
-        symbol: str,
-        anchor: date,
-        raw_rows: tuple[dict[str, Any], ...],
-        *,
-        bronze_root: Path | str,
-        retrieved_at: datetime | None,
-    ) -> BronzeReceipt:
-        from src.core.pit import EvidenceKind
-        from src.data.bronze import BronzeStore
-
-        payload = {
-            "provider": "KIS",
-            "endpoint": "investor-trade-by-stock-daily",
-            "symbol": symbol,
-            "anchor": anchor.isoformat(),
-            "query": {"symbol": symbol, "anchor": anchor.isoformat()},
-            "rows": [dict(row) for row in raw_rows],
-            "records": self._map_rows(symbol, raw_rows),
-        }
-        text = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-        moment = retrieved_at if retrieved_at is not None and retrieved_at.tzinfo is not None else datetime.now(UTC)
-        store = BronzeStore(Path(bronze_root))
-        return store.import_bytes(
-            text.encode("utf-8"),
-            kind=EvidenceKind.INVESTOR_FLOW,
-            retrieved_at=moment,
-            source_label=f"KIS:investor-trade-by-stock-daily:{symbol}:{anchor.isoformat()}",
+            raw_rows = self._client.inquire_investor_trade_by_stock_daily(symbol.strip(), anchor)
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderError(
+                f"KIS investor flow transport failed for {symbol.strip()}", provider="KIS"
+            ) from exc
+        return RawResponse(
+            query={"symbol": symbol.strip(), "anchor": anchor.isoformat()},
+            rows=tuple(dict(row) for row in raw_rows if isinstance(row, dict)),
         )
-
-    def probe(self, symbol: str, session: date) -> dict[str, object]:
-        rows = self._map_rows(symbol, self._client.inquire_investor_trade_by_stock_daily(symbol, session))
-        if not any(row["session"] == session.isoformat() for row in rows):
-            raise PITDataError("KIS investor flow missing requested session")
-        return {"provider": "KIS", "endpoint": "investor-trade-by-stock-daily", "records": rows}
-
-    def _ensure_verified_anchor_index(self, bronze_root: Path) -> None:
-        if bronze_root in self._verified_anchor_index_roots:
-            return
-        from src.core.pit import EvidenceKind
-        from src.data.bronze_aggregation import discover_verified_bronze_receipts
-
-        grouped = discover_verified_bronze_receipts(
-            bronze_root=bronze_root, kinds=frozenset({EvidenceKind.INVESTOR_FLOW})
-        )
-        for receipt in grouped.get(EvidenceKind.INVESTOR_FLOW, ()):
-            try:
-                payload = json.loads(receipt.payload_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as exc:
-                raise PITDataError(f"invalid verified KIS Bronze payload {receipt.payload_path}") from exc
-            if not isinstance(payload, dict):
-                raise PITDataError(f"invalid verified KIS Bronze payload {receipt.payload_path}")
-            records = payload.get("records")
-            if not isinstance(records, list) or not records:
-                continue
-            key = (bronze_root, str(payload.get("symbol")), str(payload.get("anchor")))
-            if key not in self._verified_anchor_index:
-                self._verified_anchor_index[key] = {
-                    "provider": "KIS",
-                    "endpoint": "investor-trade-by-stock-daily",
-                    "symbol": str(payload.get("symbol")),
-                    "anchor": str(payload.get("anchor")),
-                    "records": records,
-                }
-        self._verified_anchor_index_roots.add(bronze_root)
-
-    def _find_verified_anchor_page(self, symbol: str, anchor: date, bronze_root: Path | str) -> dict[str, object] | None:
-        root = Path(bronze_root)
-        self._ensure_verified_anchor_index(root)
-        return self._verified_anchor_index.get((root, symbol, anchor.isoformat()))
-
-    def fetch_investor_flow(
-        self,
-        start: date,
-        end: date,
-        *,
-        bronze_root: Path | str | None = None,
-        retrieved_at: datetime | None = None,
-        symbols: tuple[str, ...] | None = None,
-    ) -> Iterable[dict[str, object]]:
-        if start > end:
-            raise PITDataError("coverage_start must not be after coverage_end")
-        requested_symbols = self._symbols if symbols is None else tuple(symbols)
-        if not requested_symbols or any(symbol not in self._symbols for symbol in requested_symbols):
-            raise PITDataError("KIS investor flow requested symbol is outside collector universe")
-        for symbol in requested_symbols:
-            anchor = end
-            seen: set[str] = set()
-            while anchor >= start:
-                reused = self._find_verified_anchor_page(symbol, anchor, bronze_root) if bronze_root is not None else None
-                if reused is not None:
-                    reused_records: Any = reused["records"]
-                    rows = [dict(r) for r in reused_records if isinstance(r, dict)]
-                    selected = [row for row in rows if start.isoformat() <= str(row["session"]) <= end.isoformat()]
-                    unique = [row for row in selected if str(row["session"]) not in seen]
-                    seen.update(str(row["session"]) for row in unique)
-                    if unique:
-                        yield {"provider": "KIS", "endpoint": "investor-trade-by-stock-daily", "symbol": symbol, "anchor": anchor.isoformat(), "records": unique}
-                    earliest = min(date.fromisoformat(str(row["session"])) for row in rows)
-                    if earliest <= start:
-                        break
-                    anchor = earliest - timedelta(days=1)
-                    continue
-                try:
-                    raw_rows = self._client.inquire_investor_trade_by_stock_daily(symbol, anchor)
-                except Exception as exc:
-                    raise PITDataError("KIS investor flow collection failed") from exc
-                receipt = None
-                if bronze_root is not None:
-                    receipt = self._persist_raw_page(
-                        symbol, anchor, raw_rows, bronze_root=bronze_root, retrieved_at=retrieved_at
-                    )
-                rows = self._map_rows(symbol, raw_rows)
-                if bronze_root is not None:
-                    root = Path(bronze_root)
-                    if root in self._verified_anchor_index_roots:
-                        fresh_key = (root, symbol, anchor.isoformat())
-                        if fresh_key not in self._verified_anchor_index and rows:
-                            self._verified_anchor_index[fresh_key] = {
-                                "provider": "KIS",
-                                "endpoint": "investor-trade-by-stock-daily",
-                                "symbol": symbol,
-                                "anchor": anchor.isoformat(),
-                                "records": [dict(row) for row in rows],
-                            }
-                selected = [row for row in rows if start.isoformat() <= str(row["session"]) <= end.isoformat()]
-                if not selected:
-                    raise PITDataError(f"KIS investor flow missing requested session range for {symbol}")
-                unique = [row for row in selected if str(row["session"]) not in seen]
-                seen.update(str(row["session"]) for row in unique)
-                if unique:
-                    page: dict[str, object] = {
-                        "provider": "KIS",
-                        "endpoint": "investor-trade-by-stock-daily",
-                        "symbol": symbol,
-                        "anchor": anchor.isoformat(),
-                        "records": unique,
-                    }
-                    if receipt is not None:
-                        page["bronze_receipt_hash"] = receipt.content_hash
-                        page["bronze_receipt"] = receipt
-                    yield page
-                earliest = min(date.fromisoformat(str(row["session"])) for row in rows)
-                if earliest <= start:
-                    break
-                anchor = earliest - timedelta(days=1)

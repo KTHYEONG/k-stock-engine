@@ -14,12 +14,12 @@ from src.core.pit import PITDataError
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run one strategy across a capital grid")
-    parser.add_argument("--scope-config", type=Path, required=True)
-    parser.add_argument("--data-root", type=Path, required=True)
+    parser.add_argument("--scope-config", type=Path, required=False, default=None)
+    parser.add_argument("--data-root", type=Path, required=False, default=None)
     parser.add_argument("--panel-dataset-id", type=str, required=False, default=None)
     parser.add_argument("--strategy", type=str, required=True)
-    parser.add_argument("--strategy-config", type=Path, required=True)
-    parser.add_argument("--engine-config", type=Path, required=True)
+    parser.add_argument("--strategy-config", type=Path, required=False, default=None)
+    parser.add_argument("--engine-config", type=Path, required=False, default=None)
     parser.add_argument("--capital", dest="capitals", action="append", type=int, required=True)
     parser.add_argument("--deposits", type=Path, required=False, default=None)
     parser.add_argument("--dividends-dataset-id", type=str, required=False, default=None)
@@ -77,12 +77,19 @@ def _load_deposits(path: Path | None) -> dict[date, int]:
     return deposits
 
 
-def _resolve_rules_path() -> Path:
-    repo_root = Path(__file__).resolve().parents[2]
-    candidate = repo_root / "config" / "market" / "krx_market_rules.toml"
-    if candidate.is_file():
-        return candidate
-    return Path("config/market/krx_market_rules.toml")
+def _resolve_runtime_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, Path, Path]:
+    """Resolve scope, data, strategy, engine, and rules paths from flags or ``config/runtime.toml``."""
+    from src.config.runtime import load_runtime_config
+
+    runtime_config = load_runtime_config()
+    scope_config = Path(args.scope_config) if args.scope_config is not None else runtime_config.default_scope
+    data_root = Path(args.data_root) if args.data_root is not None else runtime_config.data_root
+    if args.strategy_config is not None:
+        strategy_config = Path(args.strategy_config)
+    else:
+        strategy_config = Path(runtime_config.strategies_root) / f"{args.strategy}.toml"
+    engine_config = Path(args.engine_config) if args.engine_config is not None else runtime_config.engine
+    return scope_config, data_root, strategy_config, engine_config, runtime_config.market_rules
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -104,8 +111,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         from src.data.research_scope import load_research_scope
 
-        scope = load_research_scope(Path(args.scope_config))
-        data_root = Path(args.data_root)
+        scope_config, data_root_arg, strategy_config, engine_config, rules_path = _resolve_runtime_paths(args)
+        scope = load_research_scope(Path(scope_config))
+        data_root = Path(data_root_arg)
         if not data_root.is_absolute():
             data_root = (Path.cwd() / data_root).resolve()
         start = date.fromisoformat(str(args.start))
@@ -148,10 +156,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         strategy_name = str(args.strategy)
         if strategy_name not in STRATEGIES:
             raise ValueError(f"unknown strategy: {strategy_name!r}")
-        strategy_params_raw = _read_toml(Path(args.strategy_config))
+        strategy_params_raw = _read_toml(Path(strategy_config))
         strategy_params: dict[str, object] = dict(strategy_params_raw)
 
-        engine_raw = _read_toml(Path(args.engine_config))
+        engine_raw = _read_toml(Path(engine_config))
         execution_section = engine_raw.get("execution")
         costs_section = engine_raw.get("costs")
         sections: list[dict[str, object]] = [
@@ -224,8 +232,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise PITDataError("dividend dataset is not a verified Silver dividend_events")
             dividends = read_dataset(dividends_dir).collect()
         arrays = load_market_arrays(panel_dir=panel_dir, cache_root=cache_root)
+        if dividends is not None:
+            # 패널 구간 밖의 배당(예: 패널 시작 전 배당락, 종료 후 지급)은 엔진이 알 수 없는 세션을 참조하므로
+            # 소비 측에서 걸러낸다. 데이터셋 자체는 전체 이력을 유지한다.
+            import polars as pl
+
+            dividends = dividends.filter(
+                (pl.col("ex_session") >= arrays.sessions[0]) & (pl.col("pay_session") <= arrays.sessions[-1])
+            )
         events = build_engine_events(arrays=arrays, panel_dir=panel_dir, dividends=dividends)
-        rules = load_krx_market_rules(_resolve_rules_path())
+        rules = load_krx_market_rules(rules_path)
 
         inputs_base = {
             "market_panel": panel_id,

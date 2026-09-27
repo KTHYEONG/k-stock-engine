@@ -5,7 +5,7 @@ import fcntl
 import json
 import os
 import tempfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,6 +79,45 @@ class DatasetRegistry:
                 or replaced. The registry remains unchanged on every failure.
         """
 
+        self.register_many({kind: dataset_id})
+
+    def register_many(self, kinds: Mapping[str, str]) -> None:
+        """Register several verified datasets in one atomic write.
+
+        Every dataset is fully verified before the registry moves any
+        pointer, so a failure leaves the registry unchanged. Rebuilt
+        datasets stay on disk for ``prune-datasets``.
+
+        Args:
+            kinds: Logical dataset kinds mapped to identity-bound ids.
+
+        Raises:
+            PITDataError: Any id kind is mismatched, any dataset is absent
+                or ambiguous, any verification fails, or the registry cannot
+                be read or replaced.
+        """
+
+        items = dict(kinds)
+        if not items:
+            return
+        _current, retired = self._read()
+        known_ids = set(retired)
+        for path in self._dataset_directories():
+            try:
+                known_ids.add(load_manifest(path).dataset_id)
+            except PITDataError:
+                continue
+        for kind, dataset_id in sorted(items.items()):
+            self._check_registration(kind, dataset_id, known_ids.__contains__)
+        with self._locked():
+            current, retired = self._read_unlocked()
+            updated = dict(current)
+            updated.update(items)
+            self._write_unlocked(current=updated, retired=retired)
+
+    def _check_registration(self, kind: str, dataset_id: str, known_ids: Callable[[str], bool]) -> Path:
+        """Validate one registration candidate, returning its directory."""
+
         if dataset_kind_from_id(dataset_id) != kind:
             raise PITDataError(f"dataset kind mismatch: kind={kind!r} dataset_id={dataset_id!r}")
         candidates = self._candidate_directories(dataset_id)
@@ -99,22 +138,10 @@ class DatasetRegistry:
                 f"dataset layer does not match its root: expected={expected_layer.value} manifest={manifest.layer.value}"
             )
 
-        _current, retired = self._read()
-        known_ids = set(retired)
-        for path in self._dataset_directories():
-            try:
-                known_ids.add(load_manifest(path).dataset_id)
-            except PITDataError:
-                continue
-        verification = verify_dataset(dataset_dir, known_ids=known_ids.__contains__)
+        verification = verify_dataset(dataset_dir, known_ids=known_ids)
         if not verification.passed:
             raise PITDataError(f"dataset verification failed: {'; '.join(verification.failures)}")
-
-        with self._locked():
-            current, retired = self._read_unlocked()
-            updated = dict(current)
-            updated[kind] = dataset_id
-            self._write_unlocked(current=updated, retired=retired)
+        return dataset_dir
 
     def retire(self, dataset_id: str, reason: str) -> None:
         """Record an intentionally absent lineage id without changing current pointers.

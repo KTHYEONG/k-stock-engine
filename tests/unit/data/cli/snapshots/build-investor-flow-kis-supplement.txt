@@ -1,0 +1,10 @@
+usage: cli.py build-investor-flow-kis-supplement [-h]
+                                                 [--scope-config SCOPE_CONFIG]
+                                                 [--data-root DATA_ROOT]
+                                                 [--ls-flow-dataset-id LS_FLOW_DATASET_ID]
+
+options:
+  -h, --help            show this help message and exit
+  --scope-config SCOPE_CONFIG
+  --data-root DATA_ROOT
+  --ls-flow-dataset-id LS_FLOW_DATASET_ID

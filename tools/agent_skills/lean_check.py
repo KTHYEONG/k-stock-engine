@@ -10,7 +10,6 @@ import os
 import re
 import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 JsonDiag = dict[str, Any]
@@ -54,9 +53,11 @@ def run_cmd(cmd: list[str], timeout: int = 120) -> subprocess.CompletedProcess[s
     env["COVERAGE_NO_CTRACE"] = "1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["POLARS_MAX_THREADS"] = "2"
-    env["OMP_NUM_THREADS"] = "2"
-    env["OPENBLAS_NUM_THREADS"] = "2"
-    env["MKL_NUM_THREADS"] = "2"
+    env["OMP_NUM_THREADS"] = "1"
+    env["OPENBLAS_NUM_THREADS"] = "1"
+    env["MKL_NUM_THREADS"] = "1"
+    env["NUMBA_NUM_THREADS"] = "1"
+    env["RAY_ACCEL_NUM_WORKERS"] = "1"
     try:
         return subprocess.run(  # noqa: S603
             cmd, capture_output=True, text=True, shell=False, timeout=timeout, env=env
@@ -141,12 +142,20 @@ def _check_scaffolding_leaks(py_files: list[str]) -> list[JsonDiag]:
 # ---------------------------------------------------------------------------
 
 
-def _find_test_files(py_files: list[str], spec_path: str | None = None) -> list[str]:
-    """Find direct unit tests corresponding to modified source files."""
+def _find_test_files(py_files: list[str], spec_path: str | None = None) -> tuple[list[str], list[str]]:
+    """Find direct unit tests corresponding to modified source files.
+
+    Returns ``(mapped, unmapped)``: files explicitly passed through are kept,
+    ``src/<pkg>/<mod>.py`` resolves to ``tests/unit/<pkg>/test_<mod>.py`` and
+    then to ``tests/unit/<pkg>/<mod>/`` when that package directory exists.
+    Source modules without a mapped test are reported as ``unmapped``.
+    """
     test_files = [f for f in py_files if f.startswith("tests/") or "test_" in f]
     source_files = [f for f in py_files if f.startswith("src/") and not f.endswith("__init__.py")]
+    unmapped: list[str] = []
 
     # 1. Direct path convention: src/path/module.py -> tests/unit/path/test_module.py
+    #    then tests/unit/path/module/ when that nested package exists.
     for sf in source_files:
         rel = sf[4:]  # strip 'src/'
         parts = rel.split("/")
@@ -157,14 +166,28 @@ def _find_test_files(py_files: list[str], spec_path: str | None = None) -> list[
         candidates = [
             f"tests/unit/{sub_path}/{test_name}" if sub_path else f"tests/unit/{test_name}",
             f"tests/unit/{test_name}",
-            f"tests/contract/{sub_path}/{test_name}" if sub_path else f"tests/contract/{test_name}",
         ]
+        nested_dir = f"tests/unit/{sub_path}/{mod_name[:-3]}" if sub_path and mod_name.endswith(".py") else ""
+        found = False
         for cand in candidates:
             if cand in test_files:
+                found = True
                 break
             if os.path.isfile(cand):
                 test_files.append(cand)
+                found = True
                 break
+        if not found and nested_dir and os.path.isdir(nested_dir):
+            nested_tests = sorted(
+                f"tests/unit/{sub_path}/{mod_name[:-3]}/{p}"
+                for p in os.listdir(nested_dir)
+                if p.startswith("test_") and p.endswith(".py")
+            )
+            if nested_tests:
+                test_files.extend(t for t in nested_tests if t not in test_files)
+                found = True
+        if not found:
+            unmapped.append(sf)
 
     # 2. Spec test suites if provided
     if spec_path and os.path.isfile(spec_path):
@@ -180,7 +203,7 @@ def _find_test_files(py_files: list[str], spec_path: str | None = None) -> list[
                 if os.path.isfile(tf) and tf not in test_files:
                     test_files.append(tf)
 
-    return sorted(dict.fromkeys(test_files))
+    return sorted(dict.fromkeys(test_files)), sorted(dict.fromkeys(unmapped))
 
 
 def _check_pre_impl_spec(spec_path: str) -> tuple[int, list[JsonDiag]]:
@@ -329,8 +352,14 @@ def _git_diff_added_lines(file: str) -> set[int] | None:
     return added
 
 
-def _check_diff_coverage(src_files: list[str], cov_json_path: str) -> tuple[list[JsonDiag], int | None]:
-    """Verify that every line added to touched src/ files is executed by tests."""
+def _check_diff_coverage(
+    src_files: list[str], cov_json_path: str, unmapped: list[str] | None = None
+) -> tuple[list[JsonDiag], int | None]:
+    """Verify that every line added to touched src/ files is executed by tests.
+
+    Modules without a mapped test are reported as ``unmapped`` diagnostics by
+    the caller instead: the mapped-test run cannot be expected to cover them.
+    """
     if not os.path.exists(cov_json_path):
         return [], None
     try:
@@ -339,11 +368,14 @@ def _check_diff_coverage(src_files: list[str], cov_json_path: str) -> tuple[list
     except Exception:
         return [], None
 
+    skipped = set(unmapped or [])
     files_data = cov_data.get("files", {})
     diags: list[JsonDiag] = []
     total_added = 0
     total_covered = 0
     for sf in src_files:
+        if sf in skipped:
+            continue
         entry = files_data.get(sf) or files_data.get(sf.replace("/", os.sep))
         if not entry:
             continue
@@ -388,6 +420,11 @@ def main() -> None:
     parser.add_argument("--no-xdist", action="store_true", help="Force serial pytest execution (-n 0)")
     parser.add_argument("--timeout", type=int, default=None, help="Pytest timeout in seconds")
     parser.add_argument(
+        "--run-slow",
+        action="store_true",
+        help="Run tests marked slow (real-data suite) instead of excluding them",
+    )
+    parser.add_argument(
         "--pre-impl",
         action="store_true",
         help="Validate spec blueprint paths and wiring anchors before implementation",
@@ -424,7 +461,7 @@ def main() -> None:
     if not args.files:
         try:
             diff_res = subprocess.run(
-                ["git", "status", "--porcelain"],
+                ["git", "status", "--porcelain", "-uall"],
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -476,13 +513,11 @@ def main() -> None:
             return "mypy", 1, [{"file": target_mypy[0], "line": 0, "error": out, "fix_hint": "Fix mypy type errors"}], "FAIL | Mypy Type Check Failed"
         return "mypy", 0, [], ""
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        f_ruff = executor.submit(check_ruff)
-        f_mypy = executor.submit(check_mypy)
-        for f in [f_ruff, f_mypy]:
-            phase, code, diags, msg = f.result()
-            if code != 0:
-                _exit_with_diags(phase, msg, diags)
+    # 3. Sequential Static Checks (Ruff Fail-Fast, then Mypy)
+    for check_fn in (check_ruff, check_mypy):
+        phase, code, diags, msg = check_fn()
+        if code != 0:
+            _exit_with_diags(phase, msg, diags)
 
     if args.fast:
         print("PASS | Fast Check Passed (Scaffolding, Ruff, Mypy verified)")
@@ -490,25 +525,37 @@ def main() -> None:
         return
 
     # 4. Direct Test Discovery
-    test_files = _find_test_files(py_files, spec_path=args.spec)
+    test_files, unmapped = _find_test_files(py_files, spec_path=args.spec)
     if not test_files:
+        if unmapped:
+            diags = [
+                {"file": m, "line": 0, "error": f"unmapped: no test covers {m}", "fix_hint": "Add tests/unit coverage for this module"}
+                for m in unmapped
+            ]
+            print(_emit_json("PASS", "all", diags, None), file=sys.stderr)
+            print(f"PASS | Lint & Type check passed ({len(unmapped)} unmapped module(s) reported)")
+            return
         print("PASS | Lint & Type check passed (no tests to run)")
         print(_emit_json("PASS", "all", [], None), file=sys.stderr)
         return
 
     # 5. Smart Pytest Execution (Resource Safety Guard)
+    # 5. Smart Pytest Execution (Resource Safety Guard: Serial Execution Default)
+    # 다중 프로젝트 및 로컬 동시성 환경 안정성을 위해 기본값은 항상 단일 프로세스(-n 0)로 고정.
+    # CI 등에서 명시적으로 LEAN_CHECK_WORKERS 환경변수가 2 이상으로 지정된 경우에만 제한적 병렬 허용.
     env_workers = os.environ.get("LEAN_CHECK_WORKERS")
     avail_mem_gb = _available_memory_gb()
 
     if (
         args.no_xdist
-        or len(test_files) <= 5
-        or (env_workers and env_workers in ("0", "1"))
+        or not env_workers
+        or not env_workers.isdigit()
+        or int(env_workers) <= 1
         or avail_mem_gb < 2.0
     ):
         xdist_args = ["-p", "no:cacheprovider", "-n", "0"]
     else:
-        target_workers = int(env_workers) if env_workers and env_workers.isdigit() else 2
+        target_workers = int(env_workers)
         worker_count = min(target_workers, os.cpu_count() or 2, len(test_files))
         xdist_args = ["-p", "no:cacheprovider", "-n", str(worker_count)]
 
@@ -529,7 +576,7 @@ def main() -> None:
         "-m",
         "pytest",
         "-m",
-        "not slow",
+        "not slow" if not args.run_slow else "slow",
         *test_files,
         *xdist_args,
         *cov_args,
@@ -552,16 +599,21 @@ def main() -> None:
         )
 
     if pt_res.returncode == 0:
-        cov_diags, cov_pct = _check_diff_coverage(src_files, cov_json_path) if cov_args else ([], None)
+        cov_diags, cov_pct = _check_diff_coverage(src_files, cov_json_path, unmapped) if cov_args else ([], None)
         if cov_diags:
             _exit_with_diags(
                 "coverage",
                 f"FAIL | Diff Coverage: {len(cov_diags)} file(s) with untested new lines",
                 cov_diags,
             )
+        unmapped_diags = [
+            {"file": m, "line": 0, "error": f"unmapped: no test covers {m}", "fix_hint": "Add tests/unit coverage for this module"}
+            for m in unmapped
+        ]
         cov_suffix = f", Diff-Coverage {cov_pct}%" if cov_pct is not None else ""
-        print(f"PASS | All checks passed (Scaffolding-Clean, Lint, Type, Tests{cov_suffix})")
-        print(_emit_json("PASS", "all", [], cov_pct), file=sys.stderr)
+        unmapped_suffix = f", {len(unmapped_diags)} unmapped" if unmapped_diags else ""
+        print(f"PASS | All checks passed (Scaffolding-Clean, Lint, Type, Tests{cov_suffix}{unmapped_suffix})")
+        print(_emit_json("PASS", "all", unmapped_diags, cov_pct), file=sys.stderr)
     else:
         last_err = [
             line

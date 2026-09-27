@@ -10,6 +10,7 @@ import polars as pl
 from src.core.pit import BronzeReceipt, EvidenceKind
 from src.data.datasets import load_manifest, verify_dataset
 from src.data.ordinary_universe import ordinary_universe_snapshot, write_ordinary_universe_silver
+from tests.fixtures import seed_receipts
 
 
 def _snapshot(tmp_path: Path, session: date):
@@ -69,7 +70,6 @@ def test_ordinary_universe_loader_boundaries_and_catalog_publication(tmp_path: P
         build_ordinary_universe,
         catalog_master_receipts,
         catalog_master_sessions,
-        dated_master_receipts,
         materialize_ordinary_universe_from_catalog,
         ordinary_universe_snapshot,
         write_ordinary_universe_silver,
@@ -112,22 +112,6 @@ def test_ordinary_universe_loader_boundaries_and_catalog_publication(tmp_path: P
     with pytest.raises(PITDataError, match="listing date"):
         ordinary_universe_snapshot(bad_listing)
 
-    receipt_dir = tmp_path / "bronze" / "security_master" / ("c" * 64)
-    receipt_dir.mkdir(parents=True)
-    (receipt_dir / "payload.json").write_text("{}", encoding="utf-8")
-    (receipt_dir / "receipt.json").write_text(
-        json.dumps({
-            "source_path": "KRX:historical-master:2024-01-02",
-            "kind": "security_master",
-            "content_hash": "c" * 64,
-            "retrieved_at": "2024-01-02T00:00:00+00:00",
-            "ingested_at": "2024-01-02T00:00:00+00:00",
-        }),
-        encoding="utf-8",
-    )
-    selected = dated_master_receipts(tmp_path / "bronze", sessions=(date(2024, 1, 2),))
-    assert selected[0].content_hash == "c" * 64
-
     with pytest.raises(PITDataError, match="dated snapshots"):
         write_ordinary_universe_silver([], root=tmp_path / "silver")
     snapshot = _snapshot(tmp_path / "ordered", date(2024, 1, 2))
@@ -147,13 +131,17 @@ def test_ordinary_universe_loader_boundaries_and_catalog_publication(tmp_path: P
     }, ensure_ascii=False).encode()
     catalog_payload.write_bytes(catalog_raw)
     catalog = ReceiptCatalog(catalog_root)
-    catalog.publish([
-        ReceiptIndexEntry(
-            source="krx_security_master", natural_key="2024-01-02", as_of=date(2024, 1, 2),
-            fiscal_period=None, status=EvidenceStatus.SUCCESS, content_hash=hashlib.sha256(catalog_raw).hexdigest(),
-            retrieved_at=datetime(2024, 1, 2, tzinfo=UTC), payload_path=catalog_payload,
-        )
-    ])
+    seed_receipts(
+        catalog,
+        [
+            ReceiptIndexEntry(
+                source="krx_security_master", natural_key="2024-01-02", as_of=date(2024, 1, 2),
+                fiscal_period=None, status=EvidenceStatus.SUCCESS,
+                content_hash=hashlib.sha256(catalog_raw).hexdigest(),
+                retrieved_at=datetime(2024, 1, 2, tzinfo=UTC), payload_path=catalog_payload,
+            )
+        ],
+    )
     assert catalog_master_sessions(catalog) == (date(2024, 1, 2),)
     assert catalog_master_receipts(catalog, sessions=(date(2024, 1, 2),))[0].payload_path == catalog_payload
     result = materialize_ordinary_universe_from_catalog(
@@ -205,3 +193,36 @@ def test_ordinary_universe_loader_boundaries_and_catalog_publication(tmp_path: P
         build_ordinary_universe([], sessions=())
     with pytest.raises(PITDataError, match="no certified"):
         catalog_master_sessions(ReceiptCatalog(tmp_path / "empty-catalog"))
+
+
+def test_catalog_master_sessions_exclude_exchange_confirmed_closures(tmp_path) -> None:
+    """A master snapshot exists on holidays; KRX's empty daily answer proves the closure."""
+    import hashlib
+
+    from src.data.ordinary_universe import catalog_master_sessions
+    from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog, ReceiptIndexEntry
+
+    root = tmp_path / "bronze"
+    payload = root / "payload.json"
+    payload.parent.mkdir(parents=True)
+    payload.write_bytes(b"{}")
+    content_hash = hashlib.sha256(b"{}").hexdigest()
+
+    def _entry(source: str, day: date, status: EvidenceStatus) -> ReceiptIndexEntry:
+        return ReceiptIndexEntry(
+            source=source, natural_key=day.isoformat(), as_of=day, fiscal_period=None, status=status,
+            content_hash=content_hash, retrieved_at=datetime(2026, 9, 26, tzinfo=UTC), payload_path=payload,
+        )
+
+    catalog = ReceiptCatalog(root / "catalog")
+    seed_receipts(
+        catalog,
+        [
+            _entry("krx_security_master", date(2026, 6, 2), EvidenceStatus.SUCCESS),
+            _entry("krx_security_master", date(2026, 6, 3), EvidenceStatus.SUCCESS),
+            _entry("krx_daily_market", date(2026, 6, 2), EvidenceStatus.SUCCESS),
+            _entry("krx_daily_market", date(2026, 6, 3), EvidenceStatus.EMPTY),
+        ],
+    )
+
+    assert catalog_master_sessions(catalog) == (date(2026, 6, 2),)

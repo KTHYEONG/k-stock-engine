@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 import polars as pl
 
+from src.core.pit import PITDataError
 from src.data.datasets import (
     DatasetIdentity,
     DatasetLayer,
@@ -25,7 +26,7 @@ from src.data.datasets import (
     publish_dataset,
     read_dataset,
 )
-from src.data.schemas import PITDataError
+from src.data.runtime import DataRuntime
 
 _FISCAL_RE = re.compile(r"^(\d{4})Q([1-4])$")
 _QUALITY_COLUMNS = [
@@ -60,9 +61,9 @@ class FinancialQualityPolicy:
 
     def __post_init__(self) -> None:
         if not self.version.strip() or not self.required_facts:
-            raise ValueError("financial quality policy must name required facts")  # pragma: no cover
+            raise ValueError("financial quality policy must name required facts")
         if len(set(self.required_facts)) != len(self.required_facts):
-            raise ValueError("financial quality required facts must be unique")  # pragma: no cover
+            raise ValueError("financial quality required facts must be unique")
 
 
 _DEFAULT_POLICY = FinancialQualityPolicy()
@@ -81,13 +82,13 @@ class FinancialQualityEvent:
 
     def __post_init__(self) -> None:
         if not self.company_id or not _FISCAL_RE.fullmatch(self.fiscal_period):
-            raise ValueError("financial quality event identity is invalid")  # pragma: no cover
+            raise ValueError("financial quality event identity is invalid")
         if not self.filing_id or not self.reason.strip():
-            raise ValueError("financial quality event filing and reason are required")  # pragma: no cover
+            raise ValueError("financial quality event filing and reason are required")
         if self.published_at.tzinfo is None or self.available_at.tzinfo is None:
-            raise ValueError("financial quality event timestamps must be timezone-aware")  # pragma: no cover
+            raise ValueError("financial quality event timestamps must be timezone-aware")
         if self.available_at < self.published_at:
-            raise ValueError("financial quality event cannot precede publication")  # pragma: no cover
+            raise ValueError("financial quality event cannot precede publication")
 
 
 UNVERIFIED_LEGACY_REASON: Final = "unverified_legacy_extraction"
@@ -200,13 +201,13 @@ def implausible_balance_flags(*, assets: float | None, equity: float | None) -> 
 def _fiscal_key(period: str) -> tuple[int, int]:
     matched = _FISCAL_RE.fullmatch(period)
     if matched is None:
-        return (-1, -1)  # pragma: no cover
+        return (-1, -1)
     return (int(matched.group(1)), int(matched.group(2)))
 
 
 def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
-        raise PITDataError("financial quality timestamps must be timezone-aware")  # pragma: no cover
+        raise PITDataError("financial quality timestamps must be timezone-aware")
     return value.astimezone(UTC)
 
 
@@ -240,14 +241,14 @@ def build_financial_quality_events(
     reproduce the exact completeness state observable at any past decision.
     """
     if decision_time.tzinfo is None:
-        raise PITDataError("financial quality decision_time must be timezone-aware")  # pragma: no cover
+        raise PITDataError("financial quality decision_time must be timezone-aware")
     required = set(policy.required_facts)
     records: list[dict[str, object]] = []
     if not financial_facts.is_empty():
         needed = {"company_id", "fiscal_period", "filing_id", "fact", "published_at", "available_at", "value", "unit", "consolidated"}
         missing = sorted(needed - set(financial_facts.columns))
         if missing:
-            raise PITDataError(f"financial quality source lacks columns: {missing}")  # pragma: no cover
+            raise PITDataError(f"financial quality source lacks columns: {missing}")
         tz = getattr(financial_facts["available_at"].dtype, "time_zone", None)
         target = decision_time.astimezone(ZoneInfo(str(tz))) if tz else decision_time
         scoped = (
@@ -305,10 +306,10 @@ def build_financial_quality_events(
             available_at = row["available_at"]
             published_at = row["published_at"]
             if not company_id or _fiscal_key(fiscal_period) == (-1, -1) or not isinstance(available_at, datetime) or not isinstance(published_at, datetime):
-                continue  # pragma: no cover
+                continue
             try:
                 value = float(row["value"])
-            except (TypeError, ValueError):  # pragma: no cover
+            except (TypeError, ValueError):
                 continue
             if str(row["unit"] or "") != "KRW" or not math.isfinite(value):
                 continue
@@ -354,13 +355,13 @@ def eligible_companies_from_quality(
 ) -> frozenset[str]:
     """Return companies with a complete latest fiscal period visible at decision time."""
     if decision_time.tzinfo is None:
-        raise PITDataError("financial quality decision_time must be timezone-aware")  # pragma: no cover
+        raise PITDataError("financial quality decision_time must be timezone-aware")
     candidates = frozenset(str(company_id) for company_id in company_ids if str(company_id))
     if not candidates or events.is_empty():
         return frozenset()
     needed = {"company_id", "fiscal_period", "accounting_basis", "available_at", "financial_complete"}
     if missing := sorted(needed - set(events.columns)):
-        raise PITDataError(f"financial quality rows lack columns: {missing}")  # pragma: no cover
+        raise PITDataError(f"financial quality rows lack columns: {missing}")
     tz = getattr(events["available_at"].dtype, "time_zone", None)
     target = decision_time.astimezone(ZoneInfo(str(tz))) if tz else decision_time
     scoped = events.filter(pl.col("company_id").is_in(sorted(candidates)) & (pl.col("available_at") <= target))
@@ -495,3 +496,156 @@ def load_latest_financial_quality(*, root: Path, decision_time: datetime) -> pl.
         raise PITDataError("missing certified financial quality dataset")
     _, dataset_id = max(candidates)
     return read_dataset(table_root / dataset_id).filter(pl.col("available_at") <= decision_time).collect()
+
+
+def _parse_quality_decision_time(value: str) -> datetime:
+    """Parse a scoped decision time without coercing naive inputs to UTC."""
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError as exc:
+        raise PITDataError(f"decision-time must be ISO-8601: {value!r}") from exc
+    if parsed.tzinfo is None:
+        raise PITDataError("decision-time must be timezone-aware")
+    return parsed
+
+
+def _read_quality_json_array(path: Path, *, label: str) -> list[dict[str, object]]:
+    """Read a JSON array of mappings, failing closed on any shape violation."""
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise PITDataError(f"scoped {label} file is unreadable: {exc}") from exc
+    if not isinstance(raw, list):
+        raise PITDataError(f"scoped {label} file must hold a list")
+    rows: list[dict[str, object]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise PITDataError(f"scoped {label} entry must be a mapping")
+        rows.append(dict(entry))
+    return rows
+
+
+def _parse_quality_event_timestamp(value: object, *, label: str) -> datetime:
+    """Parse one evidenced event timestamp without defaulting naive inputs."""
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise PITDataError(f"scoped unresolved events entry has an invalid {label}: {value!r}") from exc
+    else:
+        raise PITDataError(f"scoped unresolved events entry lacks {label}")
+    if parsed.tzinfo is None:
+        raise PITDataError(f"scoped unresolved events entry has a naive {label}")
+    return parsed
+
+
+def _manual_quality_events(path: Path) -> list[FinancialQualityEvent]:
+    """Manually evidenced events; every entry must carry an explicit reason."""
+    events: list[FinancialQualityEvent] = []
+    for index, entry in enumerate(_read_quality_json_array(path, label="unresolved events")):
+        reason = entry.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise PITDataError(f"scoped unresolved events entry {index} lacks reason")
+        company_id = str(entry.get("company_id") or "").strip()
+        fiscal_period = str(entry.get("fiscal_period") or "").strip()
+        filing_id = str(entry.get("filing_id") or "").strip()
+        if not company_id:
+            raise PITDataError(f"scoped unresolved events entry {index} lacks company_id")
+        if not filing_id:
+            raise PITDataError(f"scoped unresolved events entry {index} lacks filing_id")
+        try:
+            events.append(
+                FinancialQualityEvent(
+                    company_id=company_id,
+                    fiscal_period=fiscal_period,
+                    filing_id=filing_id,
+                    published_at=_parse_quality_event_timestamp(entry.get("published_at"), label="published_at"),
+                    available_at=_parse_quality_event_timestamp(entry.get("available_at"), label="available_at"),
+                    reason=reason.strip(),
+                )
+            )
+        except ValueError as exc:
+            raise PITDataError(str(exc)) from exc
+    return events
+
+
+def materialize_financial_quality_from_files(
+    runtime: DataRuntime,
+    *,
+    facts_dataset_id: str,
+    decision_time: datetime,
+    quarantine_file: Path | None,
+    unresolved_events_file: Path | None,
+) -> tuple[Path, dict[str, int]]:
+    """Materialize financial-quality evidence from a facts dataset and its evidence files.
+
+    The quarantine list and the manual events are part of the dataset identity
+    (by file digest), so the same facts with a different quarantine can never
+    reuse an id. Nothing is registered here; callers decide when the output
+    becomes current (a single build registers at once, a scope refresh only
+    after every node succeeded).
+
+    Returns:
+        The published dataset directory and its event counts.
+    """
+    from src.data.fact_state import file_digest
+
+    facts_path = runtime.workspace.silver_root / facts_dataset_id
+    try:
+        facts = read_dataset(facts_path).collect()
+    except PITDataError as exc:
+        raise PITDataError(f"financial facts dataset is not a verified v2 dataset: {facts_path}") from exc
+    quarantine_records = (
+        _read_quality_json_array(Path(quarantine_file), label="quarantine")
+        if quarantine_file is not None
+        else []
+    )
+    quarantined = quarantine_events(quarantine_records)
+    manual = _manual_quality_events(Path(unresolved_events_file)) if unresolved_events_file is not None else []
+    events = build_financial_quality_events(
+        facts,
+        unresolved_events=(*quarantined, *manual),
+        decision_time=decision_time,
+    )
+    dataset_dir = materialize_financial_quality(
+        events,
+        layer_root=runtime.workspace.silver_root,
+        decision_time=decision_time,
+        facts_dataset_id=facts_dataset_id,
+        quarantine_digest=file_digest(quarantine_file),
+        unresolved_events_digest=file_digest(unresolved_events_file),
+    )
+    incomplete_periods = (
+        events.filter(~pl.col("financial_complete")).select("company_id", "fiscal_period").unique().height
+    )
+    return dataset_dir, {
+        "rows": events.height,
+        "quarantine_events": len(quarantined),
+        "manual_events": len(manual),
+        "incomplete_periods": incomplete_periods,
+    }
+
+
+def build_financial_quality_dataset(
+    runtime: DataRuntime,
+    *,
+    facts_dataset_id: str,
+    decision_time: str,
+    quarantine_file: Path | None,
+    unresolved_events_file: Path | None,
+) -> dict[str, object]:
+    """Build one certified financial-quality dataset from facts and evidenced events, and register it."""
+    from src.data.dataset_registry import DatasetRegistry
+
+    dataset_dir, stats = materialize_financial_quality_from_files(
+        runtime,
+        facts_dataset_id=facts_dataset_id,
+        decision_time=_parse_quality_decision_time(str(decision_time)),
+        quarantine_file=quarantine_file,
+        unresolved_events_file=unresolved_events_file,
+    )
+    dataset_id = dataset_dir.name
+    DatasetRegistry(runtime.workspace.state_root).register("financial_quality", dataset_id)
+    return {"dataset_id": dataset_id, "dataset_path": str(dataset_dir), **stats}

@@ -1,0 +1,15 @@
+usage: cli.py build-financial-quality [-h] [--scope-config SCOPE_CONFIG]
+                                      [--data-root DATA_ROOT]
+                                      [--facts-dataset-id FACTS_DATASET_ID]
+                                      [--quarantine-file QUARANTINE_FILE]
+                                      [--unresolved-events-file UNRESOLVED_EVENTS_FILE]
+                                      --decision-time DECISION_TIME
+
+options:
+  -h, --help            show this help message and exit
+  --scope-config SCOPE_CONFIG
+  --data-root DATA_ROOT
+  --facts-dataset-id FACTS_DATASET_ID
+  --quarantine-file QUARANTINE_FILE
+  --unresolved-events-file UNRESOLVED_EVENTS_FILE
+  --decision-time DECISION_TIME

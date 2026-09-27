@@ -55,7 +55,7 @@
 ### ADR-004: 레거시 호환 계층(Shims) 폐기 및 단일 실행 계약(Single Contract) 통일
 
 * **Decision**:  
-  구버전 백테스터 및 과거 데이터 파이프라인에 대한 호환 계층을 일절 유지하지 않고, `legacy/` 디렉터리로 완전히 격리 후 프로덕션 코드베이스를 최신 계약(`src/core`, `src/storage`, `src/integrations`, `src/data`, `src/execution`, `src/backtest`)으로 단일화함.
+  구버전 백테스터 및 과거 데이터 파이프라인에 대한 호환 계층을 일절 유지하지 않고, `legacy/` 디렉터리로 완전히 격리 후 프로덕션 코드베이스를 최신 계약(`src/core`, `src/storage`, `src/integrations`, `src/data`, `src/execution`, `src/backtest`)으로 단일화함. (Superseded: R8에서 `src/storage`는 `src/data`로, `src/data/cli.py`는 `src/data/cli/` 패키지로 통합됨. 현행 계층은 `docs/architecture/data_flow.md` 참조.)
 * **Why**:  
   과거 실험 코드와 신규 엔진이 얽혀 전체 코드 라인 수가 42.8k에 달했고, 개발자가 코드를 수정할 때 어떤 경로가 프로덕션에 실제 영향을 미치는지 파악하기 어려워 유지보수 비용과 인지 부하가 극심했음.
 * **Trade-off**:  

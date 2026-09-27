@@ -1,0 +1,9 @@
+usage: cli.py build-ordinary-universe [-h] [--scope-config SCOPE_CONFIG]
+                                      [--data-root DATA_ROOT]
+                                      [--sessions SESSIONS]
+
+options:
+  -h, --help            show this help message and exit
+  --scope-config SCOPE_CONFIG
+  --data-root DATA_ROOT
+  --sessions SESSIONS   Optional JSON list of requested session dates
