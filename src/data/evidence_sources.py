@@ -19,6 +19,7 @@ from src.data.receipt_catalog import EvidenceStatus
 
 __all__ = [
     "DART_CORP_CODES_SOURCE",
+    "DART_CORP_DISCLOSURES_SOURCE",
     "DART_DISCLOSURES_SOURCE",
     "DART_DISCLOSURE_WINDOWS_SOURCE",
     "DART_DOCUMENT_SOURCE",
@@ -47,6 +48,7 @@ KRX_DAILY_MARKET_SOURCE = "krx_daily_market"
 KRX_SECURITY_MASTER_SOURCE = "krx_security_master"
 FINANCIAL_FACTS_SOURCE = "financial_facts"
 DART_DISCLOSURES_SOURCE = "dart_disclosures"
+DART_CORP_DISCLOSURES_SOURCE = "dart_corp_disclosures"
 DART_DISCLOSURE_WINDOWS_SOURCE = "dart_disclosure_windows"
 DIVIDEND_DECISION_SOURCE = "opendart:dividend_decision"
 DART_CORP_CODES_SOURCE = "dart_corp_codes"
@@ -186,6 +188,16 @@ SOURCE_CONTRACTS: Final[Mapping[str, SourceContract]] = {
         ),
         SourceContract(
             source=DART_DISCLOSURES_SOURCE,
+            kind=EvidenceKind.DISCLOSURES,
+            provider="DART",
+            endpoints=frozenset(),
+            envelope=EnvelopeFormat.NATIVE,
+            coverage=CoverageShape.KEYED,
+            row_fields=frozenset(),
+            query_fields=frozenset(),
+        ),
+        SourceContract(
+            source=DART_CORP_DISCLOSURES_SOURCE,
             kind=EvidenceKind.DISCLOSURES,
             provider="DART",
             endpoints=frozenset(),

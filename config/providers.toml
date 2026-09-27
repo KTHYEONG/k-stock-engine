@@ -8,6 +8,8 @@ shared_ip_avoid_windows_kst = [["21:25", "21:50"]]
 # Market-wide disclosure list types the DART jobs consume: periodic reports (A)
 # and the detail type carrying dividend decisions (I001).
 disclosure_types = ["A", "I001"]
+# Days a retained corp-code bridge stays fresh without a missing ticker.
+corp_codes_max_age_days = 30
 
 # Primary key shared with other projects: conservative budget and reserve.
 [dart.keys.OPENDART_API_KEY]

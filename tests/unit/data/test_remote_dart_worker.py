@@ -196,7 +196,6 @@ def test_worker_stops_mid_run_when_the_ledger_runs_out(tmp_path: Path, monkeypat
 
 
 def _seed_named_scope(tmp_path: Path) -> Path:
-    import hashlib
 
     import polars as pl
 
@@ -212,11 +211,9 @@ def _seed_named_scope(tmp_path: Path) -> Path:
         sort_keys=True,
         ensure_ascii=False,
     ).encode("utf-8")
-    bridge_path = (
-        runtime.workspace.bronze_root / "dart_corp_codes" / hashlib.sha256(bridge_raw).hexdigest() / "payload.json"
-    )
-    bridge_path.parent.mkdir(parents=True, exist_ok=True)
-    bridge_path.write_bytes(bridge_raw)
+    from tests.fixtures import seed_corp_code_bridge
+
+    seed_corp_code_bridge(runtime.workspace.bronze_root, bridge_raw)
     published = publish_dataset(
         layer_root=runtime.workspace.silver_root,
         identity=DatasetIdentity(
@@ -257,8 +254,13 @@ class _NamedCollector:
     def health_check(self) -> None:
         return None
 
-    def list_disclosures(self, start: object, end: object, *, detail_type: object = None) -> list[dict[str, str]]:
-        return []
+    def list_disclosures(self, start: object, end: object, *, disclosure_filter: object = None, detail_type: object = None) -> list[dict[str, str]]:
+        return [
+            {
+                "rcept_no": "20160330001234", "rcept_dt": "20160330", "corp_code": "00126380",
+                "corp_name": "Test", "report_nm": "사업보고서 (2015.12)", "rm": "",
+            }
+        ]
 
 
 def test_named_job_dry_run_plans_without_requests(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -35,11 +35,38 @@ def _ctx(runtime, provider, *, collector=None, now=None):  # type: ignore[no-unt
 
 
 def _bridge(bronze_root: Path, rows=None) -> None:  # type: ignore[no-untyped-def]
+    from datetime import date as _date
+    from datetime import datetime as _datetime
+    from datetime import UTC as _UTC
+
+    from src.core.pit import EvidenceKind as _Kind
+    from src.data.bronze import BronzeStore as _Store
+    from src.data.receipt_catalog import BlobEntry as _Blob, EvidenceStatus as _Status, ReceiptCatalog as _Catalog, ReceiptIndexEntry as _Entry
+
     rows = rows if rows is not None else [{"ticker": TICKER, "corp_code": CORP, "corp_name": "Test Co"}]
     raw = json.dumps(rows, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    target = bronze_root / "dart_corp_codes" / hashlib.sha256(raw).hexdigest() / "payload.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(raw)
+    store = _Store(bronze_root)
+    receipt = store.import_bytes(
+        raw, kind=_Kind.SECURITY_MASTER, retrieved_at=_datetime(2026, 9, 24, 3, 0, tzinfo=_UTC),
+        source_label="test:bridge",
+    )
+    catalog = _Catalog(bronze_root / "catalog")
+    catalog.publish(
+        [
+            _Entry(
+                source="dart_corp_codes", natural_key="dart_corp_codes", as_of=_date(2026, 9, 24),
+                fiscal_period=None, status=_Status.SUCCESS, content_hash=receipt.content_hash,
+                retrieved_at=receipt.retrieved_at, payload_path=receipt.payload_path,
+            )
+        ],
+        blobs=[
+            _Blob(
+                content_hash=receipt.content_hash, kind=_Kind.SECURITY_MASTER, source="dart_corp_codes",
+                usable=True, unusable_reason=None, retrieved_at=receipt.retrieved_at,
+                payload_path=receipt.payload_path,
+            )
+        ],
+    )
 
 
 def _universe(runtime) -> None:  # type: ignore[no-untyped-def]
@@ -59,10 +86,67 @@ def _universe(runtime) -> None:  # type: ignore[no-untyped-def]
 
 
 def _write_disclosure_page(bronze_root: Path, payload: dict) -> None:  # type: ignore[no-untyped-def]
+    from datetime import date as _date
+    from datetime import datetime as _datetime
+    from datetime import UTC as _UTC
+
+    from src.core.pit import EvidenceKind as _Kind
+    from src.data.receipt_catalog import BlobEntry as _Blob, EvidenceStatus as _Status, ReceiptCatalog as _Catalog, ReceiptIndexEntry as _Entry
+
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     target = bronze_root / "disclosures" / hashlib.sha256(raw).hexdigest() / "payload.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(raw)
+    moment = _datetime(2026, 9, 24, 3, 0, tzinfo=_UTC)
+    (target.parent / "receipt.json").write_text(
+        json.dumps({"retrieved_at": moment.isoformat()}, sort_keys=True), encoding="utf-8"
+    )
+    catalog = _Catalog(bronze_root / "catalog")
+    content_hash = hashlib.sha256(raw).hexdigest()
+    if isinstance(payload, dict) and isinstance(payload.get("records"), list):
+        corp = str(payload.get("corp_code") or "").strip()
+        detail = str(payload.get("detail_type") or "").strip()
+        try:
+            start = _date.fromisoformat(str(payload.get("start") or "").strip())
+            end = _date.fromisoformat(str(payload.get("end") or "").strip())
+        except ValueError:
+            return
+        if end < start:
+            return
+        if corp:
+            key = f"{corp}:{start.isoformat()}..{end.isoformat()}"
+            catalog.publish(
+                [
+                    _Entry(
+                        source="dart_corp_disclosures", natural_key=key, as_of=end,
+                        fiscal_period=None, status=_Status.SUCCESS if payload["records"] else _Status.EMPTY,
+                        content_hash=content_hash, retrieved_at=moment, payload_path=target,
+                    )
+                ],
+                blobs=[
+                    _Blob(
+                        content_hash=content_hash, kind=_Kind.DISCLOSURES, source="dart_corp_disclosures",
+                        usable=True, unusable_reason=None, retrieved_at=moment, payload_path=target,
+                    )
+                ],
+            )
+        elif detail:
+            key = f"{detail}:{start.isoformat()}..{end.isoformat()}"
+            catalog.publish(
+                [
+                    _Entry(
+                        source="dart_disclosure_windows", natural_key=key, as_of=end,
+                        fiscal_period=None, status=_Status.SUCCESS if payload["records"] else _Status.EMPTY,
+                        content_hash=content_hash, retrieved_at=moment, payload_path=target,
+                    )
+                ],
+                blobs=[
+                    _Blob(
+                        content_hash=content_hash, kind=_Kind.DISCLOSURES, source="dart_disclosure_windows",
+                        usable=True, unusable_reason=None, retrieved_at=moment, payload_path=target,
+                    )
+                ],
+            )
 
 
 def _per_corp_record(rcept_no: str, rcept_dt: str, report_nm: str) -> dict:
@@ -89,9 +173,20 @@ class _Collector:
         if not self._healthy:
             raise RuntimeError("connection reset")
 
-    def list_disclosures(self, start, end, *, detail_type=None):  # type: ignore[no-untyped-def]
-        self.list_calls.append((start, end, detail_type))
-        outcome = self._windows.get((start.isoformat(), end.isoformat(), detail_type), [])
+    def list_disclosures(self, start, end, *, disclosure_filter=None, detail_type=None):  # type: ignore[no-untyped-def]
+        code = None
+        if disclosure_filter is not None:
+            code = disclosure_filter.code
+            self.list_calls.append((start, end, disclosure_filter))
+        else:
+            code = detail_type
+            self.list_calls.append((start, end, detail_type))
+        for key, outcome in self._windows.items():
+            if len(key) == 3 and key[0] == start.isoformat() and key[1] == end.isoformat() and key[2] == code:
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return [dict(item) for item in outcome]
+        outcome = self._windows.get((start.isoformat(), end.isoformat(), code), [])
         if isinstance(outcome, Exception):
             raise outcome
         return [dict(item) for item in outcome]
@@ -230,8 +325,9 @@ def test_resolve_dart_job_registry() -> None:
     from src.core.pit import PITDataError
     from src.data.jobs.dart import DART_JOBS, resolve_dart_job
 
-    assert set(DART_JOBS) == {"dart_disclosures", "dart_facts", "dividend_decisions"}
+    assert set(DART_JOBS) == {"dart_corp_codes", "dart_disclosures", "dart_facts", "dividend_decisions"}
     assert resolve_dart_job("dart_facts").name == "dart_facts"
+    assert resolve_dart_job("dart_corp_codes").name == "dart_corp_codes"
     with pytest.raises(PITDataError, match="unknown DART job"):
         resolve_dart_job("nope")
 
@@ -269,7 +365,19 @@ def test_open_window_stays_pending_after_run(tmp_path: Path) -> None:
 
     runtime = _runtime(tmp_path)
     _disclosure_fixtures(runtime)
-    collector = _Collector()
+
+    class _NonEmpty(_Collector):
+        def list_disclosures(self, start, end, *, disclosure_filter=None, detail_type=None):  # type: ignore[no-untyped-def]
+            code = disclosure_filter.code if disclosure_filter is not None else detail_type
+            self.list_calls.append((start, end, code))
+            return [
+                {
+                    "rcept_no": "20160330001234", "rcept_dt": "20160330", "corp_code": CORP,
+                    "corp_name": "Test Co", "report_nm": "사업보고서 (2015.12)", "rm": "",
+                }
+            ]
+
+    collector = _NonEmpty()
     ctx = _ctx(runtime, _provider(), collector=collector)
     spec = DartDisclosuresJob()
 
@@ -324,7 +432,7 @@ def test_disclosures_quota_block_stops_run(tmp_path: Path) -> None:
     assert len(units) == 2
 
     class _Blocked(_Collector):
-        def list_disclosures(self, start, end, *, detail_type=None):  # type: ignore[no-untyped-def]
+        def list_disclosures(self, start, end, *, disclosure_filter=None, detail_type=None):  # type: ignore[no-untyped-def]
             raise ProviderQuotaExhaustedError("blocked")
 
     ctx_blocked = _ctx(runtime, _provider(), collector=_Blocked())
@@ -335,7 +443,9 @@ def test_disclosures_quota_block_stops_run(tmp_path: Path) -> None:
 
 
 def test_per_corp_coverage_ignores_malformed_pages(tmp_path: Path) -> None:
-    from src.data.jobs.dart import _per_corp_coverage, _window_covered
+    from src.data.dart_disclosures import per_corp_coverage
+    from src.data.jobs.dart import _window_covered
+    from src.data.receipt_catalog import ReceiptCatalog
 
     bronze = tmp_path / "bronze"
     disclosures = bronze / "disclosures"
@@ -347,14 +457,17 @@ def test_per_corp_coverage_ignores_malformed_pages(tmp_path: Path) -> None:
     _write_disclosure_page(bronze, {"records": [], "start": "2019-06-30", "end": "2019-01-01", "corp_code": CORP})
     _write_disclosure_page(bronze, {"records": [], "start": "2016-01-01", "end": "2016-03-31"})
 
-    coverage = _per_corp_coverage(bronze)
+    def _coverage() -> dict:
+        return per_corp_coverage(ReceiptCatalog(bronze / "catalog"))
+
+    coverage = _coverage()
 
     assert coverage == {}
     assert _window_covered(coverage, frozenset({CORP}), date(2016, 1, 1), date(2016, 3, 31)) is False
     _write_disclosure_page(
         bronze, _per_corp_page([], start="2015-01-01", end="2019-06-30"),
     )
-    coverage = _per_corp_coverage(bronze)
+    coverage = _coverage()
     assert _window_covered(coverage, frozenset({CORP}), date(2016, 1, 1), date(2016, 3, 31)) is True
     assert _window_covered(coverage, frozenset({CORP}), date(2019, 7, 1), date(2019, 9, 30)) is False
 
@@ -406,9 +519,14 @@ def _facts_fixtures(runtime, records: list) -> None:  # type: ignore[no-untyped-
     _write_disclosure_page(runtime.workspace.bronze_root, _per_corp_page(records))
 
 
-def test_facts_read_both_disclosure_page_shapes(tmp_path: Path) -> None:
+def _disable_coverage_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("src.data.jobs.dart._check_disclosure_coverage", lambda *a, **k: None)
+
+
+def test_facts_read_both_disclosure_page_shapes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from src.data.jobs.dart import DartFactsJob
 
+    _disable_coverage_guard(monkeypatch)
     runtime = _runtime(tmp_path)
     _bridge(runtime.workspace.bronze_root)
     _universe(runtime)
@@ -433,9 +551,10 @@ def test_facts_read_both_disclosure_page_shapes(tmp_path: Path) -> None:
     assert all(unit.max_requests == 3 for unit in units)
 
 
-def test_facts_latest_filing_wins(tmp_path: Path) -> None:
+def test_facts_latest_filing_wins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from src.data.jobs.dart import DartFactsJob
 
+    _disable_coverage_guard(monkeypatch)
     runtime = _runtime(tmp_path)
     _facts_fixtures(
         runtime,
@@ -452,12 +571,13 @@ def test_facts_latest_filing_wins(tmp_path: Path) -> None:
     assert unit.payload["filing_id"] == "20160520001236"
 
 
-def test_facts_unavailable_answers_are_retried_success_is_not(tmp_path: Path) -> None:
+def test_facts_unavailable_answers_are_retried_success_is_not(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from src.data.jobs.dart import DartFactsJob
     from src.data.receipt_catalog import EvidenceStatus
     from src.core.pit import EvidenceKind
     from src.data.scoped_ingestion import ScopedRawPayload
 
+    _disable_coverage_guard(monkeypatch)
     runtime = _runtime(tmp_path)
     _facts_fixtures(runtime, [_per_corp_record("20160516001235", "20160516", "분기보고서 (2016.03)")])
     ctx = _ctx(runtime, _provider())
@@ -496,10 +616,11 @@ def test_facts_unavailable_answers_are_retried_success_is_not(tmp_path: Path) ->
     assert DartFactsJob().pending(ctx) == []
 
 
-def test_facts_fetch_converts_pages_and_surfaces_quota_and_transport(tmp_path: Path) -> None:
+def test_facts_fetch_converts_pages_and_surfaces_quota_and_transport(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from src.data.jobs.dart import DartFactsJob
     from src.integrations.dart.client import ProviderQuotaExhaustedError, ProviderRetryableError
 
+    _disable_coverage_guard(monkeypatch)
     runtime = _runtime(tmp_path)
     _facts_fixtures(runtime, [_per_corp_record("20160516001235", "20160516", "분기보고서 (2016.03)")])
     identity = {
@@ -688,7 +809,15 @@ def test_dividend_pending_ignores_malformed_records(tmp_path: Path) -> None:
     unreadable = bronze / "disclosures" / ("e" * 64)
     (unreadable / "payload.json").parent.mkdir(parents=True, exist_ok=True)
     (unreadable / "payload.json").mkdir()
-    with pytest.raises(PITDataError, match="unreadable"):
+    assert [unit.natural_key for unit in DividendDecisionsJob().pending(ctx)] == ["20170330876543"]
+
+    from src.data.receipt_catalog import ReceiptCatalog as _Catalog
+
+    catalog = _Catalog(bronze / "catalog")
+    entries = list(catalog.entries(source="dart_corp_disclosures"))
+    assert entries
+    Path(entries[0].payload_path).write_bytes(b"corrupted")
+    with pytest.raises(PITDataError, match=r"hash mismatch|unreadable|missing"):
         DividendDecisionsJob().pending(ctx)
 
 
@@ -726,6 +855,7 @@ def test_dividend_zip_envelope_matches_registered_format(tmp_path: Path) -> None
 
     from src.data.dividend_events import _iter_decision_envelopes
     from src.data.jobs.dart import DividendDecisionsJob
+    from src.data.receipt_catalog import ReceiptCatalog
 
     runtime = _runtime(tmp_path)
     _bridge(runtime.workspace.bronze_root)
@@ -745,4 +875,189 @@ def test_dividend_zip_envelope_matches_registered_format(tmp_path: Path) -> None
     assert set(envelope) == {"rcept_no", "corp_code", "received_on", "report_nm", "archive_b64", "archive_sha256"}
     assert base64.b64decode(envelope["archive_b64"]) == archive
     ctx.writer.persist(payload)
-    assert len(_iter_decision_envelopes(runtime.workspace.bronze_root)) == 1
+    assert len(_iter_decision_envelopes(ReceiptCatalog(runtime.workspace.bronze_root / "catalog"))) == 1
+
+
+def _persist_empty_window(ctx, *, code: str, start: str, end: str):  # type: ignore[no-untyped-def]
+    from src.core.pit import EvidenceKind
+    from src.data.jobs.dart import DISCLOSURE_WINDOW_SOURCE
+    from src.data.receipt_catalog import EvidenceStatus
+    from src.data.scoped_ingestion import ScopedRawPayload
+
+    ctx.writer.persist(
+        ScopedRawPayload(
+            kind=EvidenceKind.DISCLOSURES,
+            source=DISCLOSURE_WINDOW_SOURCE,
+            natural_key=f"{code}:{start}..{end}",
+            as_of=date.fromisoformat(end),
+            fiscal_period=None,
+            status=EvidenceStatus.EMPTY,
+            payload=json.dumps({"detail_type": code, "start": start, "end": end, "records": []}).encode("utf-8"),
+            retrieved_at=NOW,
+            source_label=f"test:{code}:{start}..{end}",
+        )
+    )
+
+
+def test_empty_past_window_is_replanned(tmp_path: Path) -> None:
+    from src.data.jobs.dart import DartDisclosuresJob
+
+    runtime = _runtime(tmp_path)
+    _disclosure_fixtures(runtime)
+    ctx = _ctx(runtime, _provider())
+    _persist_empty_window(ctx, code="A", start="2016-01-01", end="2016-03-31")
+
+    units = DartDisclosuresJob().pending(ctx)
+
+    assert "A:2016-01-01..2016-03-31" in {unit.natural_key for unit in units}
+
+
+def test_empty_past_window_fails_closed(tmp_path: Path) -> None:
+    import pytest
+
+    from src.core.pit import PITDataError
+    from src.data.jobs.dart import DartDisclosuresJob
+
+    runtime = _runtime(tmp_path)
+    _disclosure_fixtures(runtime)
+    ctx = _ctx(runtime, _provider(), collector=_Collector(windows={}))
+    (unit,) = [
+        unit for unit in DartDisclosuresJob().pending(ctx)
+        if unit.natural_key == "A:2016-01-01..2016-03-31"
+    ]
+
+    with pytest.raises(PITDataError, match="no filings for completed window"):
+        DartDisclosuresJob().fetch(ctx, [unit])
+
+
+def test_open_window_may_persist_empty(tmp_path: Path) -> None:
+    from datetime import UTC as _UTC
+    from datetime import datetime as _datetime
+
+    from src.data.jobs.dart import DartDisclosuresJob, disclosure_windows
+
+    runtime = _runtime(tmp_path)
+    _disclosure_fixtures(runtime)
+    today = (_datetime(2026, 9, 27, 3, 0, tzinfo=_UTC) + __import__("datetime").timedelta(hours=9)).date()
+    windows = disclosure_windows(runtime.scope.evidence_start, today)
+    w_start, w_end = windows[-1]
+    assert w_end >= today
+    ctx = _ctx(
+        runtime, _provider(), collector=_Collector(windows={}),
+        now=lambda: _datetime(2026, 9, 27, 3, 0, tzinfo=_UTC),
+    )
+    (unit,) = [
+        unit for unit in DartDisclosuresJob().pending(ctx)
+        if unit.natural_key == f"A:{w_start.isoformat()}..{w_end.isoformat()}"
+    ]
+
+    (payload,) = DartDisclosuresJob().fetch(ctx, [unit])
+
+    assert payload.status.value == "empty"
+
+
+def test_disclosure_filter_reaches_collector(tmp_path: Path) -> None:
+    from src.data.jobs.dart import DartDisclosuresJob
+
+    runtime = _runtime(tmp_path)
+    _disclosure_fixtures(runtime)
+    collector = _Collector(
+        windows={("2016-01-01", "2016-03-31", "A"): [
+            {"rcept_no": "20160330001234", "rcept_dt": "20160330", "corp_code": CORP, "report_nm": "X", "rm": ""},
+        ]}
+    )
+    ctx = _ctx(runtime, _provider(), collector=collector)
+    (unit,) = [
+        item for item in DartDisclosuresJob().pending(ctx)
+        if item.natural_key == "A:2016-01-01..2016-03-31"
+    ]
+
+    DartDisclosuresJob().fetch(ctx, [unit])
+
+    assert collector.list_calls
+    sent = collector.list_calls[0][2]
+    assert sent.code == "A"
+    assert sent.parameter == "pblntf_ty"
+
+
+def test_past_period_without_filing_fails(tmp_path: Path) -> None:
+    from datetime import UTC as _UTC
+    from datetime import datetime as _datetime
+
+    import pytest
+
+    from src.data.jobs.dart import DartFactsJob, DisclosureCoverageError
+
+    runtime = _runtime(tmp_path)
+    _bridge(runtime.workspace.bronze_root)
+    _universe(runtime)
+    _write_disclosure_page(
+        runtime.workspace.bronze_root,
+        _per_corp_page([_per_corp_record("20251230001234", "20251230", "사업보고서 (2025.12)")]),
+    )
+    ctx = _ctx(
+        runtime, _provider(),
+        now=lambda: _datetime(2026, 9, 27, 3, 0, tzinfo=_UTC),
+    )
+
+    with pytest.raises(DisclosureCoverageError) as exc_info:
+        DartFactsJob().pending(ctx)
+
+    assert "2026Q1" in str(exc_info.value)
+    assert "2026Q2" in str(exc_info.value)
+
+
+def test_unpublished_period_is_exempt(tmp_path: Path) -> None:
+    from src.data.jobs.dart import _check_disclosure_coverage, _publication_cutoff
+
+    assert _publication_cutoff("2026Q1") == date(2026, 5, 15)
+    identities = [
+        {"corp_code": CORP, "biz_year": "2025", "reprt_code": "11011", "fiscal_period": "2025Q4"},
+    ]
+
+    _check_disclosure_coverage(
+        identities, periods=frozenset({"2025Q4", "2026Q1"}), today=date(2026, 5, 1),
+    )
+
+
+def test_identity_fiscal_period_derivation_boundaries() -> None:
+    from src.data.jobs.dart import _identity_fiscal_period
+
+    assert _identity_fiscal_period({"fiscal_period": "2026Q1"}) == "2026Q1"
+    assert _identity_fiscal_period({"biz_year": "2026", "reprt_code": "11013"}) == "2026Q1"
+    assert _identity_fiscal_period({"biz_year": "", "reprt_code": "11013"}) is None
+    assert _identity_fiscal_period({"biz_year": "2026", "reprt_code": "99999"}) is None
+
+
+def test_refresh_reports_coverage_gap(tmp_path: Path) -> None:
+    from src.data.jobs.dart import DisclosureCoverageError
+    from src.data.pipeline_graph import build_refresh_context, run_collection_jobs
+
+    runtime = _runtime(tmp_path)
+    ctx = build_refresh_context(runtime)
+
+    def _gap_step(_ctx, *, dry_run, emit):  # type: ignore[no-untyped-def]
+        raise DisclosureCoverageError("no discoverable periodic filing for 2026Q1", periods=("2026Q1",))
+
+    report = run_collection_jobs(
+        ctx, dry_run=False, emit=lambda _p: None,
+        steps=(("dart_facts", _gap_step),),
+    )
+
+    assert report.steps[0].status == "coverage_gap"
+    assert not report.complete
+
+
+def test_refresh_reraises_unexpected_step_error(tmp_path: Path) -> None:
+    import pytest
+
+    from src.data.pipeline_graph import build_refresh_context, run_collection_jobs
+
+    runtime = _runtime(tmp_path)
+    ctx = build_refresh_context(runtime)
+
+    def _boom(_ctx, *, dry_run, emit):  # type: ignore[no-untyped-def]
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        run_collection_jobs(ctx, dry_run=False, emit=lambda _p: None, steps=(("dart_facts", _boom),))

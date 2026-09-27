@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_DART_DISCOVERY",
+      "date": "2026-09-27",
+      "adr_id": "ADR_20260927_DART_DISCOVERY",
+      "domain": "data",
+      "title": "DART disclosure discovery repair and catalog-only readers",
+      "why": "Periodic disclosures were sent with the wrong list.json parameter and silently stored as empty, so 2026Q1/Q2 facts were never discoverable, and new listings had no corp code; disclosure and dividend readers still globbed Bronze directories.",
+      "resolution": "Split the list.json filter into type vs detail-type params, fail closed on an empty completed window, added a coverage_gap report and a corp-code refresh job, and moved disclosure/dividend reading to the catalog.",
+      "impact": "2026 periodic facts and newly listed corp codes become discoverable, and refresh no longer reports complete while silently missing a quarter.",
+      "caveat": "A duplicate rcept_no with differing content between the window and per-corp sources now raises instead of picking one; verify this doesn't fire on real data before trusting the parity gate."
+    },
+    {
       "task_id": "TASK_COLLECTOR_ROLLOUT",
       "date": "2026-09-27",
       "adr_id": "ADR_20260927_COLLECTOR_ROLLOUT",

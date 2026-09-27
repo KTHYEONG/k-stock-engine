@@ -232,5 +232,8 @@
   },
   "src/data/bronze_index.py": {
     "testing": "tests/unit/data/test_bronze_index.py"
+  },
+  "src/data/dart_disclosures.py": {
+    "testing": "tests/unit/data/test_dart_disclosures.py"
   }
 }

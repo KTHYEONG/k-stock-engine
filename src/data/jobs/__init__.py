@@ -1,6 +1,14 @@
 """Budgeted, resumable provider jobs over scoped Bronze evidence."""
 
-from src.data.jobs.dart import DART_JOBS, DartDisclosuresJob, DartFactsJob, DividendDecisionsJob, resolve_dart_job
+from src.data.jobs.corp_codes import DartCorpCodesJob
+from src.data.jobs.dart import (
+    DART_JOBS,
+    DartDisclosuresJob,
+    DartFactsJob,
+    DisclosureCoverageError,
+    DividendDecisionsJob,
+    resolve_dart_job,
+)
 from src.data.jobs.flow import (
     KisInvestorFlowJob,
     LsInvestorFlowJob,
@@ -20,8 +28,10 @@ from src.data.jobs.universe import corp_code_bridge, eligible_tickers, read_corp
 __all__ = [
     "DART_JOBS",
     "KRX_JOBS",
+    "DartCorpCodesJob",
     "DartDisclosuresJob",
     "DartFactsJob",
+    "DisclosureCoverageError",
     "DividendDecisionsJob",
     "JobContext",
     "JobReport",

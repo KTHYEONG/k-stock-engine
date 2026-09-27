@@ -6,9 +6,12 @@ import hashlib
 import io
 import json
 import zipfile
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
+from src.core.pit import PITDataError
 from src.core.time import KRX_TZ, SessionCalendar
 from src.data.datasets import load_manifest, read_dataset, verify_dataset
 from src.data.dividend_events import materialize_dividend_events
@@ -37,13 +40,53 @@ def _archive() -> bytes:
     return output.getvalue()
 
 
-def _write_sources(bronze: Path) -> None:
-    bridge = json.dumps([{"corp_code": "00126380", "ticker": "005930"}], ensure_ascii=False, sort_keys=True).encode()
-    bridge_hash = hashlib.sha256(bridge).hexdigest()
-    bridge_path = bronze / "dart_corp_codes" / bridge_hash / "payload.json"
-    bridge_path.parent.mkdir(parents=True)
-    bridge_path.write_bytes(bridge)
+def _catalog_for(bronze: Path):  # type: ignore[no-untyped-def]
+    from src.data.receipt_catalog import ReceiptCatalog
 
+    return ReceiptCatalog(bronze / "catalog")
+
+
+def _publish_blob(bronze: Path, *, kind_dir: str, raw: bytes, kind, source: str, receipt_key: str | None):  # type: ignore[no-untyped-def]
+    from datetime import date as _date
+
+    from src.data.bronze import BronzeStore
+    from src.data.receipt_catalog import BlobEntry, EvidenceStatus, ReceiptIndexEntry
+
+    store = BronzeStore(bronze)
+    receipt = store.import_bytes(
+        raw, kind=kind, retrieved_at=datetime(2024, 1, 2, tzinfo=UTC), source_label="test",
+    )
+    catalog = _catalog_for(bronze)
+    entries = []
+    if receipt_key is not None:
+        entries.append(
+            ReceiptIndexEntry(
+                source=source, natural_key=receipt_key, as_of=_date(2024, 1, 2),
+                fiscal_period=None, status=EvidenceStatus.SUCCESS, content_hash=receipt.content_hash,
+                retrieved_at=receipt.retrieved_at, payload_path=receipt.payload_path,
+            )
+        )
+    catalog.publish(
+        entries,
+        blobs=[
+            BlobEntry(
+                content_hash=receipt.content_hash, kind=kind, source=source,
+                usable=True, unusable_reason=None, retrieved_at=receipt.retrieved_at,
+                payload_path=receipt.payload_path,
+            )
+        ],
+    )
+    return receipt
+
+
+def _write_sources(bronze: Path) -> None:
+    from src.core.pit import EvidenceKind
+
+    bridge = json.dumps([{"corp_code": "00126380", "ticker": "005930"}], ensure_ascii=False, sort_keys=True).encode()
+    _publish_blob(
+        bronze, kind_dir="dart_corp_codes", raw=bridge, kind=EvidenceKind.SECURITY_MASTER,
+        source="dart_corp_codes", receipt_key="dart_corp_codes",
+    )
     envelope = {
         "corp_code": "00126380",
         "rcept_no": "20240102000001",
@@ -51,17 +94,18 @@ def _write_sources(bronze: Path) -> None:
         "archive_b64": base64.b64encode(_archive()).decode(),
     }
     raw = json.dumps(envelope, sort_keys=True, ensure_ascii=False).encode()
-    payload = bronze / "corporate_actions" / hashlib.sha256(raw).hexdigest() / "payload.json"
-    payload.parent.mkdir(parents=True)
-    payload.write_bytes(raw)
+    _publish_blob(
+        bronze, kind_dir="corporate_actions", raw=raw, kind=EvidenceKind.CORPORATE_ACTIONS,
+        source="opendart:dividend_decision", receipt_key="20240102000001",
+    )
 
 
 def test_dividend_events_publish_v2_and_rebuild_noop(tmp_path: Path) -> None:
     bronze = tmp_path / "bronze"
     _write_sources(bronze)
+    catalog = _catalog_for(bronze)
     kwargs = {
-        "bronze_root": bronze,
-        "universe_root": tmp_path / "silver",
+        "catalog": catalog,
         "silver_root": tmp_path / "silver",
         "calendar": _calendar(),
     }
@@ -82,10 +126,6 @@ def test_dividend_events_publish_v2_and_rebuild_noop(tmp_path: Path) -> None:
 
 
 def test_dividend_events_reject_tampered_envelope(tmp_path: Path) -> None:
-    import pytest
-
-    from src.core.pit import PITDataError
-
     bronze = tmp_path / "bronze"
     _write_sources(bronze)
     payload = next((bronze / "corporate_actions").glob("*/payload.json"))
@@ -93,21 +133,46 @@ def test_dividend_events_reject_tampered_envelope(tmp_path: Path) -> None:
 
     with pytest.raises(PITDataError, match="hash mismatch"):
         materialize_dividend_events(
-            bronze_root=bronze,
-            universe_root=tmp_path / "silver",
+            catalog=_catalog_for(bronze),
             silver_root=tmp_path / "silver",
             calendar=_calendar(),
         )
 
 
+def test_dividend_events_only_catalogued_envelopes(tmp_path: Path) -> None:
+    from src.data.dividend_events import _iter_decision_envelopes
+
+    bronze = tmp_path / "bronze"
+    _write_sources(bronze)
+    stray = {
+        "corp_code": "00126380",
+        "rcept_no": "99999999999999",
+        "received_on": "2024-01-02",
+        "archive_b64": base64.b64encode(_archive()).decode(),
+    }
+    raw = json.dumps(stray, sort_keys=True, ensure_ascii=False).encode()
+    stray_path = bronze / "corporate_actions" / hashlib.sha256(raw).hexdigest() / "payload.json"
+    stray_path.parent.mkdir(parents=True)
+    stray_path.write_bytes(raw)
+
+    assert [item["rcept_no"] for item in _iter_decision_envelopes(_catalog_for(bronze))] == ["20240102000001"]
+
+
+def test_dividend_events_unusable_blob_skipped(tmp_path: Path) -> None:
+    from src.data.dividend_events import _iter_decision_envelopes
+
+    bronze = tmp_path / "bronze"
+    _write_sources(bronze)
+    catalog = _catalog_for(bronze)
+    blobs = list(catalog.blobs(source="opendart:dividend_decision", usable=True))
+    assert len(blobs) == 1
+    catalog.mark_unusable([blobs[0].content_hash], reason="quarantined")
+
+    assert _iter_decision_envelopes(catalog) == []
+
+
 def test_dividend_bridge_and_envelope_boundaries_fail_closed(tmp_path: Path, monkeypatch) -> None:
-    import base64
-    import hashlib
-    import json
-
-    import pytest
-
-    from src.core.pit import PITDataError
+    from src.core.pit import EvidenceKind
     from src.data.dividend_events import (
         _decision_from_envelope,
         _iter_decision_envelopes,
@@ -115,102 +180,99 @@ def test_dividend_bridge_and_envelope_boundaries_fail_closed(tmp_path: Path, mon
     )
 
     original_read_bytes = Path.read_bytes
-    bridge_root = tmp_path / "bridge"
-    raw_bridge = json.dumps([{"corp_code": "1", "ticker": "005930"}]).encode()
-    bridge_path = bridge_root / "dart_corp_codes" / ("a" * 64) / "payload.json"
-    bridge_path.parent.mkdir(parents=True)
-    bridge_path.write_bytes(raw_bridge)
+    bronze = tmp_path / "bronze"
+    _write_sources(bronze)
+    catalog = _catalog_for(bronze)
+    bridge_blobs = list(catalog.blobs(source="dart_corp_codes", usable=True))
+    assert bridge_blobs
+    bridge_path = Path(bridge_blobs[0].payload_path)
 
     def fail_bridge_read(path: Path) -> bytes:
-        if path == bridge_path:
+        if Path(path) == bridge_path:
             raise OSError("closed")
         return original_read_bytes(path)
 
     monkeypatch.setattr(Path, "read_bytes", fail_bridge_read)
-    with pytest.raises(PITDataError, match="bridge payload"):
-        _load_corp_bridge(bridge_root)
+    with pytest.raises(PITDataError, match="invalid dart corp-code bridge"):
+        _load_corp_bridge(catalog)
     monkeypatch.setattr(Path, "read_bytes", original_read_bytes)
 
-    mismatch_root = tmp_path / "mismatch"
-    mismatch_path = mismatch_root / "dart_corp_codes" / ("b" * 64) / "payload.json"
-    mismatch_path.parent.mkdir(parents=True)
-    mismatch_path.write_bytes(raw_bridge)
-    with pytest.raises(PITDataError, match="hash mismatch"):
-        _load_corp_bridge(mismatch_root)
+    Path(bridge_path).write_bytes(b"tampered")
+    with pytest.raises(PITDataError, match="invalid dart corp-code bridge"):
+        _load_corp_bridge(catalog)
 
     invalid_root = tmp_path / "invalid-bridge"
     invalid_raw = b"not-json"
-    invalid_path = invalid_root / "dart_corp_codes" / hashlib.sha256(invalid_raw).hexdigest() / "payload.json"
-    invalid_path.parent.mkdir(parents=True)
-    invalid_path.write_bytes(invalid_raw)
-    with pytest.raises(PITDataError, match="invalid dart corp-code"):
-        _load_corp_bridge(invalid_root)
+    _publish_blob(
+        invalid_root / "bronze", kind_dir="dart_corp_codes", raw=invalid_raw,
+        kind=EvidenceKind.SECURITY_MASTER, source="dart_corp_codes", receipt_key="dart_corp_codes",
+    )
+    with pytest.raises(PITDataError, match="invalid dart corp-code bridge"):
+        _load_corp_bridge(_catalog_for(invalid_root / "bronze"))
 
     object_root = tmp_path / "object-bridge"
-    object_raw = b"{}"
-    object_path = object_root / "dart_corp_codes" / hashlib.sha256(object_raw).hexdigest() / "payload.json"
-    object_path.parent.mkdir(parents=True)
-    object_path.write_bytes(object_raw)
-    with pytest.raises(PITDataError, match="invalid dart corp-code"):
-        _load_corp_bridge(object_root)
+    _publish_blob(
+        object_root / "bronze", kind_dir="dart_corp_codes", raw=b"{}",
+        kind=EvidenceKind.SECURITY_MASTER, source="dart_corp_codes", receipt_key="dart_corp_codes",
+    )
+    with pytest.raises(PITDataError, match="invalid dart corp-code bridge"):
+        _load_corp_bridge(_catalog_for(object_root / "bronze"))
 
-    corporate = tmp_path / "corporate"
-    corporate_actions = corporate / "corporate_actions"
+    corporate = tmp_path / "corporate" / "bronze"
     invalid_b64 = {"rcept_no": "r1", "archive_b64": "%%%"}
-    invalid_b64_raw = json.dumps(invalid_b64).encode()
-    invalid_b64_path = corporate_actions / hashlib.sha256(invalid_b64_raw).hexdigest() / "payload.json"
-    invalid_b64_path.parent.mkdir(parents=True)
-    invalid_b64_path.write_bytes(invalid_b64_raw)
-    assert _iter_decision_envelopes(corporate) == []
+    _publish_blob(
+        corporate, kind_dir="corporate_actions", raw=json.dumps(invalid_b64).encode(),
+        kind=EvidenceKind.CORPORATE_ACTIONS, source="opendart:dividend_decision", receipt_key="r1",
+    )
+    assert _iter_decision_envelopes(_catalog_for(corporate)) == []
 
     status_payload = {
         "rcept_no": "r2",
         "archive_b64": base64.b64encode(b"<status>014</status>").decode(),
     }
-    status_raw = json.dumps(status_payload).encode()
-    status_path = corporate_actions / hashlib.sha256(status_raw).hexdigest() / "payload.json"
-    status_path.parent.mkdir(parents=True)
-    status_path.write_bytes(status_raw)
-    assert _iter_decision_envelopes(corporate) == []
+    _publish_blob(
+        corporate, kind_dir="corporate_actions", raw=json.dumps(status_payload).encode(),
+        kind=EvidenceKind.CORPORATE_ACTIONS, source="opendart:dividend_decision", receipt_key="r2",
+    )
+    assert _iter_decision_envelopes(_catalog_for(corporate)) == []
 
     with pytest.raises(PITDataError, match="invalid dividend-decision"):
         _decision_from_envelope({"rcept_no": "r3", "archive_b64": "%%%"})
 
-    unreadable_root = tmp_path / "unreadable"
-    unreadable_actions = unreadable_root / "corporate_actions"
-    unreadable_raw = b"{}"
-    unreadable_path = unreadable_actions / hashlib.sha256(unreadable_raw).hexdigest() / "payload.json"
-    unreadable_path.parent.mkdir(parents=True)
-    unreadable_path.write_bytes(unreadable_raw)
+    unreadable_bronze = tmp_path / "unreadable" / "bronze"
+    _publish_blob(
+        unreadable_bronze, kind_dir="corporate_actions", raw=b"{}",
+        kind=EvidenceKind.CORPORATE_ACTIONS, source="opendart:dividend_decision", receipt_key="r9",
+    )
 
     def fail_envelope_read(path: Path) -> bytes:
-        if str(path).startswith(str(unreadable_root)):
+        if str(path).startswith(str(tmp_path / "unreadable")):
             raise OSError("closed")
         return original_read_bytes(path)
 
     monkeypatch.setattr(Path, "read_bytes", fail_envelope_read)
     with pytest.raises(PITDataError, match="Bronze payload is unreadable"):
-        _iter_decision_envelopes(unreadable_root)
+        _iter_decision_envelopes(_catalog_for(unreadable_bronze))
 
 
 def test_dividend_undated_and_estimated_decisions_are_recorded(tmp_path: Path, monkeypatch) -> None:
     from datetime import date
 
     from src.data.datasets import load_manifest
-    from src.data.dividend_events import materialize_dividend_events
     from src.integrations.dart.dividend_decision import DividendDecision, UndecidedRecordDateError
 
     bronze = tmp_path / "bronze"
     _write_sources(bronze)
     import src.data.dividend_events as module
 
+    catalog = _catalog_for(bronze)
+
     def undated(_payload):
         raise UndecidedRecordDateError("undated")
 
     monkeypatch.setattr(module, "_decision_from_envelope", undated)
     path = materialize_dividend_events(
-        bronze_root=bronze,
-        universe_root=tmp_path / "silver",
+        catalog=catalog,
         silver_root=tmp_path / "silver",
         calendar=_calendar(),
     )
@@ -228,8 +290,7 @@ def test_dividend_undated_and_estimated_decisions_are_recorded(tmp_path: Path, m
     )
     monkeypatch.setattr(module, "_decision_from_envelope", lambda _payload: decision)
     path = materialize_dividend_events(
-        bronze_root=bronze,
-        universe_root=tmp_path / "silver-estimate",
+        catalog=catalog,
         silver_root=tmp_path / "silver-estimate",
         calendar=_calendar(),
     )

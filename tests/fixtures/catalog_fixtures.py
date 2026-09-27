@@ -3,17 +3,20 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import replace
-from datetime import datetime
+import hashlib
+from datetime import UTC, datetime
+from pathlib import Path
 
 from src.core.pit import EvidenceKind
 from src.data.receipt_catalog import (
     BlobEntry,
     CatalogRevision,
+    EvidenceStatus,
     ReceiptCatalog,
     ReceiptIndexEntry,
 )
 
-__all__ = ["blob_for", "seed_receipts"]
+__all__ = ["blob_for", "seed_corp_code_bridge", "seed_receipts"]
 
 
 def blob_for(entry: ReceiptIndexEntry, *, usable: bool = True) -> BlobEntry:
@@ -46,3 +49,32 @@ def seed_receipts(
         entry if retrieved_at is None else replace(entry, retrieved_at=retrieved_at) for entry in published
     ]
     return catalog.publish(normalized, blobs=[blob_for(entry) for entry in normalized])
+
+
+def seed_corp_code_bridge(
+    bronze_root: Path, raw: bytes, *, retrieved_at: datetime = datetime(2025, 1, 1, tzinfo=UTC)
+) -> str:
+    """Store a corp-code bridge payload and publish it as the catalog's bridge receipt.
+
+    Readers take the bridge only from the catalog, so a fixture that just wrote
+    the file would look like a scope without a bridge.
+    """
+    digest = hashlib.sha256(raw).hexdigest()
+    payload_path = Path(bronze_root) / "dart_corp_codes" / digest / "payload.json"
+    payload_path.parent.mkdir(parents=True, exist_ok=True)
+    if not payload_path.exists():
+        payload_path.write_bytes(raw)
+    entry = ReceiptIndexEntry(
+        source="dart_corp_codes",
+        natural_key="dart_corp_codes",
+        as_of=None,
+        fiscal_period=None,
+        status=EvidenceStatus.SUCCESS,
+        content_hash=digest,
+        retrieved_at=retrieved_at,
+        payload_path=payload_path,
+    )
+    ReceiptCatalog(Path(bronze_root) / "catalog").publish(
+        [entry], blobs=[replace(blob_for(entry), kind=EvidenceKind.SECURITY_MASTER)]
+    )
+    return digest
