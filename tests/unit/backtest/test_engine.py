@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import itertools
+
 import random
 from datetime import date, timedelta
 from decimal import Decimal
@@ -108,9 +110,8 @@ class _ScriptedStrategy:
 def _positions_at(journal: Any, t: int, *, strict: bool) -> dict[int, int]:
     pos: dict[int, int] = {}
     for entry in journal:
-        if entry.session_idx < t or (not strict and entry.session_idx == t):
-            if entry.instrument_idx is not None:
-                pos[entry.instrument_idx] = pos.get(entry.instrument_idx, 0) + entry.quantity_delta
+        if (entry.session_idx < t or (not strict and entry.session_idx == t)) and entry.instrument_idx is not None:
+            pos[entry.instrument_idx] = pos.get(entry.instrument_idx, 0) + entry.quantity_delta
     return {n: q for n, q in pos.items() if q}
 
 
@@ -213,7 +214,8 @@ def test_sale_proceeds_fund_same_session_buys(tmp_path: Path) -> None:
     assert not [r for r in result.rejects if r.reason == "cash"]
     b_buys = [e for e in result.journal if e.kind.value == "buy" and e.instrument_idx == 1]
     a_sells = [e for e in result.journal if e.kind.value == "sell" and e.instrument_idx == 0]
-    assert len(b_buys) == 1 and len(a_sells) == 1
+    assert len(b_buys) == 1
+    assert len(a_sells) == 1
     assert b_buys[0].session_idx == a_sells[0].session_idx == 3
     assert b_buys[0].quantity_delta == 5000
 
@@ -281,7 +283,7 @@ def test_lookahead_free_end_to_end(tmp_path: Path) -> None:
     arrays = load_market_arrays(panel_dir=panel, cache_root=tmp_path / "cache")
     events = build_engine_events(arrays=arrays, panel_dir=panel, dividends=None)
 
-    rng = random.Random(0)
+    rng = random.Random(0)  # noqa: S311 - deterministic test perturbation, not cryptography
     perturbed: list[dict[str, Any]] = []
     for t, day in enumerate(sessions):
         for inst, base in (("KRX:A", 100 + t), ("KRX:B", 200 - t)):
@@ -468,18 +470,18 @@ def test_bad_window_and_deposits_rejected(tmp_path: Path) -> None:
     events = build_engine_events(arrays=arrays, panel_dir=panel, dividends=None)
     strategy = _ScriptedStrategy({})
     config = _config()
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="not within the panel sessions"):
         run_backtest(
             arrays=arrays, events=events, strategy=strategy, config=config, deposits={},
             asof_tables={}, rules=_rules(), start=date(2020, 1, 5), end=sessions[-1],
         )
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="after the run end"):
         run_backtest(
             arrays=arrays, events=events, strategy=strategy, config=config,
             deposits={sessions[-1] + timedelta(days=1): 100}, asof_tables={}, rules=_rules(),
             start=sessions[0], end=sessions[-1],
         )
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="cash_buffer"):
         EngineConfig(
             initial_cash=1, execution=_execution(), costs=_costs(),
             halted_exit_policy=DelistPolicy.LAST_CLOSE, cash_buffer=1.0,
@@ -489,9 +491,18 @@ def test_bad_window_and_deposits_rejected(tmp_path: Path) -> None:
 @pytest.mark.slow
 def test_reference_benchmark_parity() -> None:
     """Test-only frictionless close-fill model reproduces eligible_ew_pr."""
-    root = Path("data/gold/kr_swing_2019_v1")
-    panel = root / "market_panel_1ea26065dc4dd5a9"
-    bench = root / "reference_benchmarks_43e897f6e9afb0ed" / "benchmarks.parquet"
+    import pytest
+
+    from src.data.dataset_registry import DatasetRegistry
+
+    scope = "kr_swing_2019_v1"
+    state_dir = Path("data/state") / scope
+    if not (state_dir / "datasets.json").exists():
+        pytest.skip("real-data registry absent")
+    registry = DatasetRegistry(state_dir)
+    root = Path("data/gold") / scope
+    panel = root / registry.require("market_panel")
+    bench = next((root / registry.require("reference_benchmarks")).glob("*.parquet"))
     parts = sorted(
         str(p) for p in panel.rglob("*.parquet") if p.name != "instrument_exits.parquet"
     )
@@ -511,7 +522,7 @@ def test_reference_benchmark_parity() -> None:
     by_session = frame.partition_by("session", as_dict=True)
     sessions_all = sorted(s for (s,) in by_session)
     diffs: list[float] = []
-    for current, nxt in zip(sessions_all[:-1], sessions_all[1:]):
+    for current, nxt in itertools.pairwise(sessions_all):
         if current.year != 2020:
             continue
         prev_rows = by_session[(current,)].filter(

@@ -1,0 +1,65 @@
+# Provider throughput and quota policy. Values moved exactly from the scope
+# TOML [collection], the VPS POLICY, and the KIS pace used today; never retuned here.
+[dart]
+circuit_threshold = 3
+requests_per_identity = 3
+batch_identities = 500
+shared_ip_avoid_windows_kst = [["21:25", "21:50"]]
+# Market-wide disclosure list types the DART jobs consume: periodic reports (A)
+# and the detail type carrying dividend decisions (I001).
+disclosure_types = ["A", "I001"]
+
+# Primary key shared with other projects: conservative budget and reserve.
+[dart.keys.OPENDART_API_KEY]
+daily_limit = 20000
+daily_budget = 16000
+daily_reserve = 400
+min_interval_seconds = 0.2
+max_workers = 2
+
+# Dedicated key with its own ledger. IP-level blocking is shared, so pacing matches.
+# The unshared key is the default for job collection.
+[dart.keys.OPENDART_API_KEY_2]
+daily_limit = 20000
+daily_budget = 19500
+daily_reserve = 500
+min_interval_seconds = 0.2
+max_workers = 2
+default = true
+
+[kis]
+app_key_env = "KIS_APP_KEY"
+app_secret_env = "KIS_APP_SECRET"
+account_no_env = "KIS_ACCOUNT_NO"
+account_product_code_env = "KIS_ACCOUNT_PRODUCT_CODE"
+env_env = "KIS_ENV"
+circuit_threshold = 3
+# Planning bound only: KIS publishes no daily cap for the FHPTJ04160001 TR.
+daily_limit = 20000
+# Rows one FHPTJ04160001 response returns; measured in the C3 page-size pilot.
+investor_flow_rows_per_page = 30
+# Per-symbol classification pace: 0.35 s lost ~10% to rate limits, 1.0 s succeeded fully.
+min_interval_seconds = 1.0
+# KisClient retry=2, i.e. three attempts total.
+max_attempts = 3
+# KIS business-level "try later" message codes (msg1 prefix match); anything else is terminal.
+retryable_msg_codes = []
+
+[krx]
+api_key_env = "KRX_OPENAPI_KEY"
+circuit_threshold = 3
+# Pacing verified against the KRX open API; the ledger owns the request quota
+# (replacing the removed in-memory 10_000-request cap with the same bound).
+min_interval_seconds = 1.5
+daily_limit = 10000
+
+[ls]
+app_key_env = "LS_APP_KEY"
+app_secret_env = "LS_APP_SECRET"
+circuit_threshold = 3
+max_sessions_per_request = 700
+# Transport pacing governs LS throughput; the ledger meters the planning bound.
+min_interval_seconds = 1.05
+daily_limit = 10000
+# LS business-level "try later" response codes (rsp_cd exact match); anything else is terminal.
+retryable_rsp_codes = ["IGW00201"]

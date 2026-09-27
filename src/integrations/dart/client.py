@@ -3,19 +3,38 @@ from __future__ import annotations
 
 import hashlib
 import io
-import os
-import threading
 import time
 import zipfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from typing import Any, Final
+from typing import Any, Final, Protocol
 from xml.etree import ElementTree
 
 import requests
 
-from src.integrations.quota import ProviderQuotaStateStore
+from src.integrations.errors import (
+    DartApiError,
+    ProviderQuotaExhaustedError,
+    ProviderRetryableError,
+    ProviderTerminalError,
+)
+from src.integrations.quota import LedgerQuotaGate, ProviderQuotaStateStore
+from src.integrations.transport import HttpTransport, RetryPolicy
+
+__all__ = [
+    "DartApiError",
+    "DartClientProtocol",
+    "DartCorpCodeRecord",
+    "DartCorporateActionPage",
+    "DartDividendPage",
+    "ProviderQuotaExhaustedError",
+    "ProviderRetryableError",
+    "ProviderTerminalError",
+    "classify_dart_status",
+    "dart_ledger_for_key",
+    "dart_quota_provider",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,52 +73,61 @@ class DartDividendPage:
 _DIVIDEND_ENDPOINT = "alotMatter.json"
 _DIVIDEND_REPORT_CODES: tuple[str, ...] = ("11011", "11012", "11013", "11014")
 
-
-class DartApiError(RuntimeError):
-    """Base DART API failure."""
-
-
-class DartRetryableError(DartApiError):
-    """Transient DART failure."""
-
-
-class DartQuotaExhaustedError(DartApiError):
-    """DART quota/rate-limit exhausted for this key."""
-
-
-class DartTerminalError(DartApiError):
-    """Permanent DART failure."""
-
-
 JsonRequest = Callable[[str, dict[str, str]], dict[str, Any]]
-
 
 OK_DART_STATUS = "000"
 EMPTY_DART_STATUS = "013"
+ABSENT_DART_STATUS = "014"
 BLOCKED_DART_STATUS = "020"
+EMPTY_DART_STATUSES = frozenset({EMPTY_DART_STATUS, ABSENT_DART_STATUS})
 RETRYABLE_DART_STATUSES = frozenset({"800", "900"})
 
 _PROVIDER = "OpenDART"
-_PING_CORP_CODE = "00126380"  # 삼성전자: 상시 존재하는 기업으로 연결·키 유효성 확인에만 쓴다
-
-
-def dart_quota_provider(api_key: str | None) -> str:
-    """Return the quota-ledger provider name that meters one OpenDART key.
-
-    OpenDART limits are per key, so each key needs its own ledger. The primary
-    key keeps the historical name so its recorded usage and the reserve kept
-    for other projects sharing it stay valid; any other key is metered under a
-    name derived from a hash prefix (the secret itself is never stored).
-    """
-    primary = os.getenv("OPENDART_API_KEY")
-    if not api_key or api_key == primary:
-        return _PROVIDER
-    return f"{_PROVIDER}#{hashlib.sha256(api_key.encode('utf-8')).hexdigest()[:8]}"
+_PING_CORP_CODE = "00126380"
 _MAX_HTTP_ATTEMPTS: Final = 3
-# OpenDART는 raw 연결 리셋에 대한 공식 신호를 제공하지 않으므로(문서화된 020/429 계열 코드와 달리),
-# 실제 근거가 확보될 때까지 보수적인 고정 쿨다운을 적용한다.
 _CONNECTION_FAILURE_COOLDOWN_SECONDS = 300.0
 _SAFE_DAILY_REQUEST_LIMIT = 15_200
+
+
+def dart_quota_provider(api_key: str | None, *, primary_api_key: str | None = None) -> str:
+    """Return the quota-ledger provider name that meters one OpenDART key."""
+    if not api_key or (primary_api_key is not None and api_key == primary_api_key):
+        return _PROVIDER
+    return f"{_PROVIDER}#{hashlib.sha256(api_key.encode('utf-8')).hexdigest()[:8]}"
+
+
+def dart_ledger_for_key(*, key_env: str, primary_key_env: str, api_key: str) -> str:
+    """Ledger name for one declared key without reading the environment."""
+    if not api_key or key_env == primary_key_env:
+        return _PROVIDER
+    return f"{_PROVIDER}#{hashlib.sha256(api_key.encode('utf-8')).hexdigest()[:8]}"
+
+
+def classify_dart_status(status: str, payload: Mapping[str, Any], endpoint: str) -> None:
+    """Classify one DART status code into the shared error tree.
+
+    ``000`` is success; ``013``/``014`` are empty/absent; ``020`` means quota
+    exhausted; ``800``/``900`` are retryable; anything else is terminal.
+    """
+    if status == OK_DART_STATUS or status in EMPTY_DART_STATUSES:
+        return
+    if status == BLOCKED_DART_STATUS:
+        raise ProviderQuotaExhaustedError(f"DART status {status}: {dict(payload)}")
+    if status in RETRYABLE_DART_STATUSES:
+        raise ProviderRetryableError(f"DART status {status}: {dict(payload)}")
+    raise ProviderTerminalError(f"DART status {status}: {dict(payload)}")
+
+
+class DartClientProtocol(Protocol):
+    """Public DART surface used by collectors (no private members)."""
+
+    def request_validated(self, endpoint: str, params: Mapping[str, str]) -> dict[str, Any]: ...
+    def list_disclosures(
+        self, start: date, end: date, *, corp_code: str | None = ..., detail_type: str | None = ..., page_count: int = ...
+    ) -> list[dict[str, str]]: ...
+    def fetch_document_archive(self, rcept_no: str) -> bytes: ...
+    def ping(self) -> None: ...
+    def load_corp_code_records(self) -> tuple[DartCorpCodeRecord, ...]: ...
 
 
 class DartApiClient:
@@ -108,27 +136,25 @@ class DartApiClient:
 
     def __init__(
         self,
-        api_key: str | None = None,
+        api_key: str,
         *,
+        min_interval: float,
         request_json: JsonRequest | None = None,
         raw_request_json: JsonRequest | None = None,
         request_bytes: Callable[[str, dict[str, str]], bytes] | None = None,
         quota_store: ProviderQuotaStateStore | None = None,
+        quota_provider: str | None = None,
         now: Callable[[], datetime] | None = None,
-        min_interval: float | None = None,
         daily_request_limit: int | None = None,
     ) -> None:
-        self.api_key = api_key or os.getenv("OPENDART_API_KEY")
+        self.api_key = api_key
         if not self.api_key and request_json is None and raw_request_json is None and request_bytes is None:
-            raise ValueError("OPENDART_API_KEY not found in environment variables")
+            raise ValueError("DART api_key is required")
         self._request_json = request_json
         self._raw_request_json = raw_request_json
         self._request_bytes = request_bytes
         self._session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=25,
-            pool_maxsize=25,
-        )
+        adapter = requests.adapters.HTTPAdapter(pool_connections=25, pool_maxsize=25)
         self._session.mount("https://", adapter)
         self._session.mount("http://", adapter)
         self._session.headers.update({
@@ -136,165 +162,129 @@ class DartApiClient:
             "Accept": "application/json, text/plain, */*",
         })
         self._quota_store = quota_store
-        self._provider = dart_quota_provider(self.api_key)
+        self._provider = quota_provider or dart_quota_provider(self.api_key)
         if daily_request_limit is not None and (isinstance(daily_request_limit, bool) or int(daily_request_limit) < 1):
             raise ValueError("daily_request_limit must be a positive integer")
         self._daily_request_limit = int(daily_request_limit) if daily_request_limit is not None else _SAFE_DAILY_REQUEST_LIMIT
         self._now = now or (lambda: datetime.now(UTC))
-        raw_interval = os.getenv("OPENDART_REQUEST_MIN_INTERVAL_SECONDS")
-        self._min_interval = (
-            float(min_interval)
-            if min_interval is not None
-            else (float(raw_interval) if raw_interval is not None else 0.0)
+        self._min_interval = float(min_interval)
+        gate: LedgerQuotaGate | None = None
+        if self._quota_store is not None:
+            gate = LedgerQuotaGate(self._quota_store, provider=self._provider, daily_limit=self._daily_request_limit)
+            gate.bind_now(self._now)
+        self._quota_gate = gate
+        self._transport = HttpTransport(
+            provider=self._provider,
+            base_url=self.BASE_URL,
+            min_interval_seconds=self._min_interval,
+            retry=RetryPolicy(max_attempts=_MAX_HTTP_ATTEMPTS),
+            quota=gate,
+            timeout_seconds=30.0,
+            session=self._session,
+            sleep=lambda seconds: time.sleep(seconds),
+            monotonic=lambda: time.monotonic(),
         )
-        self._last_request_time = 0.0
-        self._pace_lock = threading.Lock()
+
+    def _sync_session(self) -> None:
+        self._transport._session = self._session
 
     def _pace(self) -> None:
-        if self._min_interval <= 0:
-            return
-        with self._pace_lock:
-            elapsed = time.monotonic() - self._last_request_time
-            if elapsed < self._min_interval:
-                time.sleep(self._min_interval - elapsed)
-            self._last_request_time = time.monotonic()
+        self._sync_session()
+        self._transport._pace()
 
-    def _http_get(self, endpoint: str, params: Mapping[str, str]) -> requests.Response:
-        """Issue one logical OpenDART GET with ledgered, paced, bounded retries.
-
-        All real traffic for this key must be visible to the quota ledger,
-        because the scope reserve protects another project sharing the key.
-        Each HTTP attempt is paced and recorded before it is sent; the ledger is
-        consulted once per logical request so a blocked key fails before any
-        traffic is generated.
-
-        Args:
-            endpoint: Path under ``BASE_URL`` (e.g. ``list.json``, ``document.xml``).
-            params: Query parameters; the API key is added when absent.
-
-        Returns:
-            A ``200`` response.
-
-        Raises:
-            ProviderQuotaBlocked: The ledger refuses the request.
-            DartRetryableError: Transport errors or 408/429/5xx persisted for
-                every allowed attempt.
-            DartTerminalError: Any other non-200 status.
-        """
+    def _with_key(self, params: Mapping[str, str]) -> dict[str, str]:
         query = dict(params)
         if self.api_key and "crtfc_key" not in query:
             query["crtfc_key"] = str(self.api_key)
-        self._pace()
-        if self._quota_store is not None:
-            self._quota_store.record_attempt(
-                provider=self._provider, endpoint=endpoint, now=self._now(), daily_limit=self._daily_request_limit
-            )
-        try:
-            response = self._session.get(f"{self.BASE_URL}/{endpoint}", params=query, timeout=30)
-        except requests.exceptions.RequestException as exc:
-            raise DartRetryableError(f"DART transport failed for {endpoint}: {exc}") from exc
-        if response.status_code != 200:
-            if response.status_code in (408, 429) or 500 <= response.status_code < 600:
-                raise DartRetryableError(f"DART HTTP {response.status_code} for {endpoint}")
-            raise DartTerminalError(f"DART HTTP {response.status_code} for {endpoint}")
-        return response
+        return query
+
+    def _http_get(self, endpoint: str, params: Mapping[str, str]) -> requests.Response:
+        """Issue one logical OpenDART GET with ledgered, paced, bounded retries."""
+        self._sync_session()
+        return self._transport.get(endpoint, self._with_key(params))
 
     def ping(self) -> None:
-        """Send one ledgered ``company.json`` request; raises if the host cannot reach OpenDART."""
-        self._request_validated("company.json", {"corp_code": _PING_CORP_CODE})
+        """Send one ledgered ``company.json`` request."""
+        self.request_validated("company.json", {"corp_code": _PING_CORP_CODE})
 
-    def _request_once(self, endpoint: str, params: Mapping[str, str]) -> dict[str, Any]:
-        response = self._http_get(endpoint, params)
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise DartRetryableError(f"DART returned transient invalid JSON for {endpoint}") from exc
-        if not isinstance(payload, dict):
-            raise DartTerminalError(f"DART response must be an object for {endpoint}")
-        return payload
-
-    def _backoff_or_raise(self, *, endpoint: str, attempt: int, error: DartRetryableError) -> None:
-        if isinstance(error.__cause__, requests.exceptions.RequestException):
-            if attempt + 1 >= _MAX_HTTP_ATTEMPTS:
-                if self._quota_store is not None:
-                    self._quota_store.record_rate_limit(
-                        provider=self._provider,
-                        endpoint=endpoint,
-                        now=self._now(),
-                        retry_after=_CONNECTION_FAILURE_COOLDOWN_SECONDS,
-                    )
-                raise error
-            time.sleep(0.5 * (2**attempt))
-            return
-        if attempt + 1 >= _MAX_HTTP_ATTEMPTS:
-            raise error
-        time.sleep(0.25 * (attempt + 1))
-
-    def _check_validated_status(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
-        status = payload.get("status")
-        if status == OK_DART_STATUS:
-            return payload
-        if status == EMPTY_DART_STATUS:
-            return payload
-        if status == BLOCKED_DART_STATUS:
-            if self._quota_store is not None:
-                self._quota_store.record_rate_limit(
-                    provider=self._provider, endpoint=endpoint, now=self._now(), retry_after=None
-                )
-            raise DartQuotaExhaustedError(f"DART status {status}: {payload}")
-        if status in RETRYABLE_DART_STATUSES:
-            raise DartRetryableError(f"DART status {status}: {payload}")
-        # Any other non-000 is a terminal/api error, but contract expects DartApiError match
-        raise DartApiError(f"DART status {status}: {payload}")
-
-    def _request(self, endpoint: str, params: dict[str, str]) -> dict[str, Any]:
-        request_params = dict(params)
-        if self.api_key and "crtfc_key" not in request_params:
-            request_params["crtfc_key"] = str(self.api_key)
+    def _seam_payload(self, endpoint: str, params: Mapping[str, str]) -> dict[str, Any] | None:
         if self._raw_request_json is not None:
-            payload = self._raw_request_json(endpoint, request_params)
+            payload = self._raw_request_json(endpoint, dict(params))
             if not isinstance(payload, dict):
-                raise DartTerminalError("DART response must be an object")
+                raise ProviderTerminalError("DART response must be an object")
             return payload
         if self._request_json is not None:
-            # When only validated request is supplied, use it directly for transport
-            # but still allow status handling in caller.
-            payload = self._request_json(endpoint, request_params)
+            payload = self._request_json(endpoint, dict(params))
             if not isinstance(payload, dict):
-                raise DartTerminalError("DART response must be an object")
+                raise ProviderTerminalError("DART response must be an object")
             return payload
-        if self._quota_store is not None:
-            self._quota_store.acquire(
-                provider=self._provider, endpoint=endpoint, now=self._now(), daily_limit=self._daily_request_limit
-            )
-        for attempt in range(_MAX_HTTP_ATTEMPTS):
+        return None
+
+    def _fetch_json(self, endpoint: str, params: Mapping[str, str], *, validated: bool) -> dict[str, Any]:
+        query = self._with_key(params)
+        seam = self._seam_payload(endpoint, query)
+        if seam is not None:
+            if validated:
+                try:
+                    self._check_validated_status(endpoint, seam)
+                except ProviderQuotaExhaustedError:
+                    if self._quota_store is not None:
+                        self._quota_store.record_rate_limit(
+                            provider=self._provider, endpoint=endpoint, now=self._now(), retry_after=None
+                        )
+                    raise
+            return seam
+        parsed: list[dict[str, Any]] = []
+
+        def _classify(response: requests.Response) -> None:
             try:
-                return self._request_once(endpoint, request_params)
-            except DartRetryableError as exc:
-                self._backoff_or_raise(endpoint=endpoint, attempt=attempt, error=exc)
-        raise AssertionError("unreachable")  # pragma: no cover
+                payload = response.json()
+            except ValueError as exc:
+                raise ProviderRetryableError(f"DART returned transient invalid JSON for {endpoint}") from exc
+            if not isinstance(payload, dict):
+                raise ProviderTerminalError(f"DART response must be an object for {endpoint}")
+            if validated:
+                self._check_validated_status(endpoint, payload)
+            parsed.append(payload)
+
+        self._sync_session()
+        try:
+            self._transport.get(endpoint, query, classify=_classify)
+        except ProviderQuotaExhaustedError:
+            raise
+        except ProviderRetryableError as exc:
+            cause = exc.__cause__
+            if isinstance(cause, requests.exceptions.RequestException) and self._quota_store is not None:
+                self._quota_store.record_rate_limit(
+                    provider=self._provider,
+                    endpoint=endpoint,
+                    now=self._now(),
+                    retry_after=_CONNECTION_FAILURE_COOLDOWN_SECONDS,
+                )
+            raise
+        except ProviderTerminalError:
+            raise
+        return parsed[0]
+
+    def _request(self, endpoint: str, params: dict[str, str]) -> dict[str, Any]:
+        return self._fetch_json(endpoint, params, validated=False)
+
+    def _check_validated_status(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
+        status = str(payload.get("status") or "")
+        if status == OK_DART_STATUS or status in EMPTY_DART_STATUSES:
+            return payload
+        if status == BLOCKED_DART_STATUS:
+            raise ProviderQuotaExhaustedError(f"DART status {status}: {payload}")
+        if status in RETRYABLE_DART_STATUSES:
+            raise ProviderRetryableError(f"DART status {status}: {payload}")
+        raise ProviderTerminalError(f"DART status {status}: {payload}")
+
+    def request_validated(self, endpoint: str, params: Mapping[str, str]) -> dict[str, Any]:
+        """Fetch one validated DART payload; ``013``/``014`` return as empty pages."""
+        return self._fetch_json(endpoint, dict(params), validated=True)
 
     def _request_validated(self, endpoint: str, params: dict[str, str]) -> dict[str, Any]:
-        if self._raw_request_json is not None or self._request_json is not None:
-            return self._check_validated_status(endpoint, self._request(endpoint, params))
-        request_params = dict(params)
-        if self.api_key and "crtfc_key" not in request_params:
-            request_params["crtfc_key"] = str(self.api_key)
-        if self._quota_store is not None:
-            self._quota_store.acquire(
-                provider=self._provider, endpoint=endpoint, now=self._now(), daily_limit=self._daily_request_limit
-            )
-        for attempt in range(_MAX_HTTP_ATTEMPTS):
-            try:
-                payload = self._request_once(endpoint, request_params)
-            except DartRetryableError as exc:
-                self._backoff_or_raise(endpoint=endpoint, attempt=attempt, error=exc)
-                continue
-            try:
-                return self._check_validated_status(endpoint, payload)
-            except DartRetryableError as exc:
-                self._backoff_or_raise(endpoint=endpoint, attempt=attempt, error=exc)
-        raise AssertionError("unreachable")  # pragma: no cover
+        return self.request_validated(endpoint, params)
 
     def list_disclosures(
         self,
@@ -306,7 +296,7 @@ class DartApiClient:
         page_count: int = 100,
     ) -> list[dict[str, str]]:
         if start > end:
-            raise ValueError("start must not be after end")  # pragma: no cover
+            raise ValueError("start must not be after end")
         if not 1 <= page_count <= 100:
             raise ValueError("page_count must be within [1, 100]")
         by_receipt: dict[str, dict[str, str]] = {}
@@ -327,13 +317,13 @@ class DartApiClient:
             if self._request_json is not None and self._raw_request_json is None:
                 payload = self._request_json(self.DISCLOSURE_ENDPOINT, params)
                 if not isinstance(payload, dict):
-                    raise DartTerminalError("DART response must be an object")
+                    raise ProviderTerminalError("DART response must be an object")
                 status = payload.get("status")
                 if status != OK_DART_STATUS:
                     raise DartApiError(f"DART status {status}: {payload}")
                 raw = payload.get("list", [])
             else:
-                payload = self._request_validated(self.DISCLOSURE_ENDPOINT, params)
+                payload = self.request_validated(self.DISCLOSURE_ENDPOINT, params)
                 raw = payload.get("list", [])
             if not isinstance(raw, list):
                 raise DartApiError("DART disclosure list must be a list")
@@ -370,9 +360,7 @@ class DartApiClient:
                 previous = by_receipt.get(rcept_no)
                 if previous is not None:
                     if previous != candidate:
-                        raise DartApiError(
-                            f"DART disclosure receipt {rcept_no} has contradictory records"
-                        )
+                        raise DartApiError(f"DART disclosure receipt {rcept_no} has contradictory records")
                     continue
                 by_receipt[rcept_no] = candidate
             if page_no >= total_page:
@@ -391,13 +379,9 @@ class DartApiClient:
             raise ValueError("corp_codes must contain between 1 and 100 companies")
         if len(str(biz_year)) != 4 or str(reprt_code) not in {"11011", "11012", "11013", "11014"}:
             raise ValueError("invalid business year or report code")
-        payload = self._request_validated(
+        payload = self.request_validated(
             "fnlttMultiAcnt.json",
-            {
-                "corp_code": ",".join(codes),
-                "bsns_year": str(biz_year),
-                "reprt_code": str(reprt_code),
-            },
+            {"corp_code": ",".join(codes), "bsns_year": str(biz_year), "reprt_code": str(reprt_code)},
         )
         records = payload.get("list", [])
         if not isinstance(records, list):
@@ -415,78 +399,52 @@ class DartApiClient:
         if self._request_bytes is not None:
             payload = self._request_bytes("document.xml", dict(params))
             if not isinstance(payload, (bytes, bytearray)) or len(payload) == 0:
-                raise DartTerminalError("DART document archive is empty")
+                raise ProviderTerminalError("DART document archive is empty")
             raw = bytes(payload)
-            stripped = raw.lstrip()[:1]
-            if stripped == b"{":
-                raise DartTerminalError("DART document archive returned an error payload")
+            if raw.lstrip()[:1] == b"{":
+                raise ProviderTerminalError("DART document archive returned an error payload")
             return raw
-        if self._quota_store is not None:
-            self._quota_store.acquire(
-                provider=self._provider, endpoint="document.xml", now=self._now(), daily_limit=self._daily_request_limit
-            )
-        for attempt in range(_MAX_HTTP_ATTEMPTS):
-            try:
-                response = self._http_get("document.xml", params)
-            except DartRetryableError as exc:
-                self._backoff_or_raise(endpoint="document.xml", attempt=attempt, error=exc)
-                continue
+        outcome: list[bytes] = []
+        empty_hits = {"n": 0}
+
+        def _classify(response: requests.Response) -> None:
             content = response.content
             if not content:
-                if attempt + 1 >= _MAX_HTTP_ATTEMPTS:
-                    raise DartTerminalError("DART document archive is empty")
-                time.sleep(0.25 * (attempt + 1))
-                continue
+                empty_hits["n"] += 1
+                if empty_hits["n"] >= _MAX_HTTP_ATTEMPTS:
+                    raise ProviderTerminalError("DART document archive is empty")
+                raise ProviderRetryableError("DART document archive is empty")
             if content.lstrip()[:1] == b"{":
-                raise DartTerminalError("DART document archive returned an error payload")
-            return content
-        raise AssertionError("unreachable")  # pragma: no cover
+                raise ProviderTerminalError("DART document archive returned an error payload")
+            outcome.append(bytes(content))
+
+        self._sync_session()
+        self._transport.get("document.xml", params, classify=_classify)
+        return outcome[0]
 
     def fetch_corporate_action_decisions(
         self, *, corp_codes: Sequence[str], start: date, end: date
     ) -> tuple[DartCorporateActionPage, ...]:
-        from src.data.schemas import PITDataError
-
         if start > end:
             raise ValueError("start must not be after end")
         codes = tuple(str(code).strip() for code in corp_codes if str(code).strip())
         if not codes:
-            raise ValueError("corp_codes must not be empty")  # pragma: no cover
+            raise ValueError("corp_codes must not be empty")
         pages: list[DartCorporateActionPage] = []
         for corp_code in codes:
             for endpoint in _CORPORATE_ACTION_ENDPOINTS:
-                try:
-                    payload = self._request_validated(
-                        endpoint,
-                        {
-                            "corp_code": corp_code,
-                            "bgn_de": start.strftime("%Y%m%d"),
-                            "end_de": end.strftime("%Y%m%d"),
-                        },
-                    )
-                except DartApiError as exc:  # pragma: no cover
-                    raise PITDataError(  # pragma: no cover
-                        f"unexpected OpenDART status for {endpoint} {corp_code}: {exc}"
-                    ) from exc
+                payload = self.request_validated(
+                    endpoint, {"corp_code": corp_code, "bgn_de": start.strftime("%Y%m%d"), "end_de": end.strftime("%Y%m%d")}
+                )
                 status = str(payload.get("status") or "")
-                if status not in (OK_DART_STATUS, EMPTY_DART_STATUS):
-                    raise PITDataError(  # pragma: no cover
-                        f"unexpected OpenDART status {status!r} for {endpoint} {corp_code}"
-                    )
                 raw = payload.get("list", [])
                 records = tuple(dict(item) for item in raw if isinstance(item, dict)) if isinstance(raw, list) else ()
-                pages.append(
-                    DartCorporateActionPage(
-                        endpoint=endpoint, corp_code=corp_code, status=status, records=records
-                    )
-                )
+                pages.append(DartCorporateActionPage(endpoint=endpoint, corp_code=corp_code, status=status, records=records))
         return tuple(pages)
 
     def fetch_dividend_disclosures(
         self, *, corp_codes: Sequence[str], bsns_years: Sequence[str]
     ) -> tuple[DartDividendPage, ...]:
-        from src.data.schemas import PITDataError
-
         codes = tuple(str(code).strip() for code in corp_codes if str(code).strip())
         if not codes:
             raise ValueError("corp_codes must not be empty")
@@ -497,26 +455,14 @@ class DartApiClient:
         for corp_code in codes:
             for year in years:
                 for reprt_code in _DIVIDEND_REPORT_CODES:
-                    try:
-                        payload = self._request_validated(
-                            _DIVIDEND_ENDPOINT,
-                            {"corp_code": corp_code, "bsns_year": year, "reprt_code": reprt_code},
-                        )
-                    except DartApiError as exc:  # pragma: no cover
-                        raise PITDataError(  # pragma: no cover
-                            f"unexpected OpenDART status for {_DIVIDEND_ENDPOINT} {corp_code}/{year}/{reprt_code}: {exc}"
-                        ) from exc
+                    payload = self.request_validated(
+                        _DIVIDEND_ENDPOINT, {"corp_code": corp_code, "bsns_year": year, "reprt_code": reprt_code}
+                    )
                     status = str(payload.get("status") or "")
-                    if status not in (OK_DART_STATUS, EMPTY_DART_STATUS):
-                        raise PITDataError(  # pragma: no cover
-                            f"unexpected OpenDART status {status!r} for {_DIVIDEND_ENDPOINT} {corp_code}/{year}/{reprt_code}"
-                        )
                     raw = payload.get("list", [])
                     records = tuple(dict(item) for item in raw if isinstance(item, dict)) if isinstance(raw, list) else ()
                     pages.append(
-                        DartDividendPage(
-                            corp_code=corp_code, bsns_year=year, reprt_code=reprt_code, status=status, records=records
-                        )
+                        DartDividendPage(corp_code=corp_code, bsns_year=year, reprt_code=reprt_code, status=status, records=records)
                     )
         return tuple(pages)
 
@@ -532,11 +478,8 @@ class DartApiClient:
         else:
             if not self.api_key:
                 raise ValueError("api_key is required for corpCode")
-            if self._quota_store is not None:
-                self._quota_store.acquire(
-                    provider=self._provider, endpoint="corpCode.xml", now=self._now(), daily_limit=self._daily_request_limit
-                )
-            response = self._http_get("corpCode.xml", {"crtfc_key": str(self.api_key)})
+            self._sync_session()
+            response = self._transport.get("corpCode.xml", {"crtfc_key": str(self.api_key)})
             raw = response.content
         try:
             with zipfile.ZipFile(io.BytesIO(raw)) as archive:

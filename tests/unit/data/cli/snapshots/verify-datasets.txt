@@ -1,0 +1,8 @@
+usage: cli.py verify-datasets [-h] [--scope-config SCOPE_CONFIG]
+                              [--data-root DATA_ROOT] [--all]
+
+options:
+  -h, --help            show this help message and exit
+  --scope-config SCOPE_CONFIG
+  --data-root DATA_ROOT
+  --all                 Verify every Silver and Gold dataset

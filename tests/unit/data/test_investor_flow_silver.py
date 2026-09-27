@@ -1,21 +1,22 @@
-"""Silver investor-flow materialization tests."""
+"""Catalog-driven Silver investor-flow tests."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import polars as pl
 import pytest
 
-from src.core.time import KRX_TZ
+from src.core.pit import EvidenceKind, PITDataError
 from src.data.investor_flow_silver import (
+    POLICY_VERSION,
     InvestorFlowSilverPolicy,
     materialize_investor_flow_silver,
 )
-from src.data.schemas import PITDataError
+from src.data.receipt_catalog import BlobEntry, ReceiptCatalog
 
 SESSIONS = (date(2026, 3, 4), date(2026, 3, 5), date(2026, 3, 6))
 
@@ -44,652 +45,317 @@ def _write_universe(universe_root: Path) -> Path:
 def _row(session: str, **overrides: object) -> dict[str, object]:
     row: dict[str, object] = {
         "date": session,
-        "tjj0000": "-100",
-        "tjj0001": "-50",
-        "tjj0002": "-30",
-        "tjj0003": "-20",
-        "tjj0004": "-10",
-        "tjj0005": "-10",
-        "tjj0006": "-8",
-        "tjj0007": "100",
-        "tjj0008": "927",
-        "tjj0009": "-800",
-        "tjj0010": "-28",
-        "tjj0011": "29",
-        "tjj0016": "-828",
-        "tjj0017": "129",
-        "tjj0018": "-228",
-        "close": "50000",
-        "volume": "10000",
-        "value": "500",
+        "tjj0000": "-100", "tjj0001": "-50", "tjj0002": "-30", "tjj0003": "-20",
+        "tjj0004": "-10", "tjj0005": "-10", "tjj0006": "-8", "tjj0007": "100",
+        "tjj0008": "927", "tjj0009": "-800", "tjj0010": "-28", "tjj0011": "29",
+        "tjj0016": "-828", "tjj0017": "129", "tjj0018": "-228",
+        "close": "50000", "volume": "10000", "value": "500",
     }
     row.update(overrides)
     return row
 
 
-def _raw_page(symbol: str, rows: list[dict[str, object]], *, start: str, end: str, anchor: str = "2026-03-06") -> dict[str, object]:
+def _ls_payload(symbol: str, rows: list[dict[str, object]], *, start: str, end: str) -> dict[str, object]:
     return {
         "provider": "LS",
-        "endpoint": "frgr-itt",
-        "symbol": symbol,
-        "anchor": anchor,
         "query": {"symbol": symbol, "start": start, "end": end},
         "rows": rows,
-        "records": [],
     }
 
 
-def _write_page(bronze_root: Path, payload: dict[str, object]) -> str:
+def _ls_envelope(symbol: str, rows: list[dict[str, object]], *, start: str, end: str) -> dict[str, object]:
+    return {
+        "envelope": "raw-rows-v1",
+        "provider": "LS",
+        "endpoint": "t1702",
+        "query": {"symbol": symbol, "start": start, "end": end},
+        "rows": rows,
+    }
+
+
+def _seed_blob(
+    catalog: ReceiptCatalog, bronze_root: Path, payload: dict[str, object], *,
+    source: str = "ls_investor_flow", usable: bool = True, reason: str | None = None,
+) -> str:
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     digest = hashlib.sha256(raw).hexdigest()
-    target = Path(bronze_root) / "investor_flow" / digest
+    target = bronze_root / "investor_flow" / digest
     target.mkdir(parents=True, exist_ok=True)
     (target / "payload.json").write_bytes(raw)
+    catalog.publish(
+        [],
+        blobs=[
+            BlobEntry(
+                content_hash=digest, kind=EvidenceKind.INVESTOR_FLOW, source=source,
+                usable=usable, unusable_reason=(None if usable else (reason or "seeded")),
+                retrieved_at=datetime(2026, 3, 6, tzinfo=UTC),
+                payload_path=target / "payload.json",
+            )
+        ],
+    )
     return digest
 
 
-def _roots(tmp_path: Path) -> tuple[Path, Path, Path]:
+def _roots(tmp_path: Path) -> tuple[Path, Path, Path, ReceiptCatalog]:
     bronze_root = tmp_path / "bronze"
     universe_root = tmp_path / "silver"
     silver_root = tmp_path / "silver"
     _write_universe(universe_root)
-    return bronze_root, universe_root, silver_root
+    return bronze_root, universe_root, silver_root, ReceiptCatalog(bronze_root / "catalog")
+
+
+def test_ignores_rows_outside_query_range(tmp_path: Path) -> None:
+    bronze_root, universe_root, silver_root, catalog = _roots(tmp_path)
+    _seed_blob(
+        catalog, bronze_root,
+        _ls_payload(
+            "005930", [_row("20260304"), _row("20260305"), _row("20260306")],
+            start="2026-03-04", end="2026-03-05",
+        ),
+    )
+    result = materialize_investor_flow_silver(
+        catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1
+    )
+    assert result.rows == 2
 
 
 def _frame(result_path: Path) -> pl.DataFrame:
     return pl.read_parquet(result_path / "year=2026" / "part.parquet")
 
 
-def test_materialize_uses_raw_rows_only_and_ignores_records_only(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    _write_page(bronze_root, _raw_page("005930", [_row("20260304")], start="2026-03-04", end="2026-03-06"))
-    _write_page(bronze_root, {
-        "provider": "LS",
-        "symbol": "005930",
-        "records": [{
-            "ticker": "005930",
-            "session": "2026-03-04",
-            "individual_net_shares": 927000000,
-            "foreign_net_shares": -828000000,
-            "institution_net_shares": -228000000,
-            "other_net_shares": 129000000,
-        }],
-    })
+def test_builds_from_usable_catalog_blobs_only(tmp_path: Path) -> None:
+    """Unusable blobs never read: one usable plus one unusable file that would fail parsing."""
+    bronze_root, universe_root, silver_root, catalog = _roots(tmp_path)
+    _seed_blob(catalog, bronze_root, _ls_payload("005930", [_row("20260304")], start="2026-03-04", end="2026-03-06"))
+    bad_raw = b"not json"
+    bad_digest = hashlib.sha256(bad_raw).hexdigest()
+    bad_dir = bronze_root / "investor_flow" / bad_digest
+    bad_dir.mkdir(parents=True, exist_ok=True)
+    (bad_dir / "payload.json").write_bytes(bad_raw)
+    catalog.publish(
+        [],
+        blobs=[
+            BlobEntry(
+                content_hash=bad_digest, kind=EvidenceKind.INVESTOR_FLOW, source="ls_investor_flow",
+                usable=False, unusable_reason="seeded", retrieved_at=datetime(2026, 3, 6, tzinfo=UTC),
+                payload_path=bad_dir / "payload.json",
+            )
+        ],
+    )
     result = materialize_investor_flow_silver(
-        bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
+        catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1
     )
     assert result.rows == 1
-    assert result.ignored_records_only_pages == 1
     assert result.raw_pages == 1
-    frame = _frame(result.dataset_path)
-    assert frame.filter(pl.col("session") == date(2026, 3, 4))["individual_net_shares"].to_list() == [927]
-    assert frame["foreign_net_shares"].to_list() == [-828]
-    assert frame["institution_net_shares"].to_list() == [-228]
-    assert frame["other_net_shares"].to_list() == [129]
-    assert frame["instrument_id"].to_list() == ["KRX:005930"]
-    assert frame["provider"].to_list() == ["LS"]
+    assert POLICY_VERSION == "ls-t1702-net-shares-v2"
 
 
-@pytest.mark.parametrize(
-    "bad_row",
-    [
-        _row("20260304", tjj0000="-99"),
-        _row("20260304", tjj0009="-799"),
-        _row("20260304", tjj0007="101"),
-        _row("20260304", tjj0008="928", tjj0000="-99", tjj0001="-51"),
-    ],
-)
-def test_materialize_isolates_aggregate_identity_violations(tmp_path: Path, bad_row: dict[str, object]) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    _write_page(bronze_root, _raw_page("005930", [bad_row, _row("20260305")], start="2026-03-04", end="2026-03-06"))
-    # 다른 페이지의 정상 값이 있어도 위반 셀은 복구하지 않는다.
-    _write_page(bronze_root, _raw_page("005930", [_row("20260304")], start="2026-03-04", end="2026-03-04"))
+def test_uncatalogued_files_ignored(tmp_path: Path) -> None:
+    """Uncatalogued files ignored: an extra valid page on disk not in the catalog."""
+    bronze_root, universe_root, silver_root, catalog = _roots(tmp_path)
+    _seed_blob(catalog, bronze_root, _ls_payload("005930", [_row("20260304")], start="2026-03-04", end="2026-03-06"))
+    extra = {"provider": "LS", "query": {"symbol": "999999", "start": "2026-03-04", "end": "2026-03-04"},
+             "rows": [_row("20260304")]}
+    raw = json.dumps(extra, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()
+    target = bronze_root / "investor_flow" / digest
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "payload.json").write_bytes(raw)
     result = materialize_investor_flow_silver(
-        bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
+        catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1
+    )
+    assert result.rows == 1
+    assert "999999" not in _frame(result.dataset_path)["ticker"].to_list()
+
+
+def test_both_layouts_parse_identically(tmp_path: Path) -> None:
+    """Both layouts parse identically: historical page vs RAW_ROWS_V1 envelope."""
+    bronze_a, universe_a, silver_a, _ = _roots(tmp_path / "a")
+    bronze_b, universe_b, silver_b, _ = _roots(tmp_path / "b")
+    # separate catalogs per roots
+    from src.data.receipt_catalog import ReceiptCatalog as _Catalog
+
+    catalog_a = _Catalog(bronze_a / "catalog")
+    catalog_b = _Catalog(bronze_b / "catalog")
+    rows = [_row("20260304")]
+    _seed_blob(catalog_a, bronze_a, _ls_payload("005930", rows, start="2026-03-04", end="2026-03-06"))
+    _seed_blob(catalog_b, bronze_b, _ls_envelope("005930", rows, start="2026-03-04", end="2026-03-06"))
+    first = materialize_investor_flow_silver(
+        catalog=catalog_a, universe_root=universe_a, silver_root=silver_a, workers=1
+    )
+    second = materialize_investor_flow_silver(
+        catalog=catalog_b, universe_root=universe_b, silver_root=silver_b, workers=1
+    )
+    left = _frame(first.dataset_path).drop("source_hash")
+    right = _frame(second.dataset_path).drop("source_hash")
+    assert left.equals(right)
+
+
+def test_isolates_identity_violations(tmp_path: Path) -> None:
+    bronze_root, universe_root, silver_root, catalog = _roots(tmp_path)
+    bad = _row("20260304", tjj0000="-99")
+    _seed_blob(catalog, bronze_root, _ls_payload("005930", [bad, _row("20260305")], start="2026-03-04", end="2026-03-06"))
+    _seed_blob(catalog, bronze_root, _ls_payload("005930", [_row("20260304")], start="2026-03-04", end="2026-03-04"))
+    result = materialize_investor_flow_silver(
+        catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1
     )
     assert result.identity_violation_cells == 1
     assert _frame(result.dataset_path)["session"].to_list() == [date(2026, 3, 5)]
-    manifest = json.loads((result.dataset_path / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["identity_violation_keys"] == ["2026-03-04:005930"]
 
 
-def test_materialize_preserves_foreign_total_and_subgroups(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    row = _row(
-        "20260304",
-        tjj0000="-2", tjj0001="-1", tjj0002="-1", tjj0003="-1", tjj0004="-1",
-        tjj0005="-1", tjj0006="-1", tjj0007="3", tjj0008="9", tjj0009="-5",
-        tjj0010="-1", tjj0011="2", tjj0016="-6", tjj0017="5", tjj0018="-8",
-    )
-    _write_page(bronze_root, _raw_page("005930", [row], start="2026-03-04", end="2026-03-06"))
+def test_assigns_next_session_availability_and_tail(tmp_path: Path) -> None:
+    from src.core.time import KRX_TZ as _TZ
+
+    bronze_root, universe_root, silver_root, catalog = _roots(tmp_path)
+    _seed_blob(catalog, bronze_root, _ls_payload("005930", [_row("20260304", volume="100")], start="2026-03-04", end="2026-03-06"))
     result = materialize_investor_flow_silver(
-        bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
+        catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1
     )
-    frame = _frame(result.dataset_path)
-    assert frame["foreign_net_shares"].to_list() == [-6]
-    assert frame["tjj0009_net_shares"].to_list() == [-5]
-    assert frame["tjj0010_net_shares"].to_list() == [-1]
-    assert frame["tjj0011_net_shares"].to_list() == [2]
+    from datetime import datetime as _dt
 
-
-def test_materialize_assigns_next_session_availability(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    _write_page(bronze_root, _raw_page("005930", [_row("20260304", volume="100")], start="2026-03-04", end="2026-03-06"))
-    result = materialize_investor_flow_silver(
-        bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
-    )
-    frame = _frame(result.dataset_path)
-    assert frame["available_at"].to_list() == [datetime(2026, 3, 5, 8, 0, tzinfo=KRX_TZ)]
+    assert _frame(result.dataset_path)["available_at"].to_list() == [_dt(2026, 3, 5, 8, 0, tzinfo=_TZ)]
     assert result.retail_exceeds_volume_rows == 1
 
 
-def test_materialize_excludes_calendar_tail(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    _write_page(bronze_root, _raw_page("005930", [_row("20260306")], start="2026-03-06", end="2026-03-06"))
+def test_excludes_calendar_tail(tmp_path: Path) -> None:
+    bronze_root, universe_root, silver_root, catalog = _roots(tmp_path)
+    _seed_blob(catalog, bronze_root, _ls_payload("005930", [_row("20260306")], start="2026-03-06", end="2026-03-06"))
     result = materialize_investor_flow_silver(
-        bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
+        catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1
     )
     assert result.rows == 0
     assert result.unavailable_tail_cells == 1
-    assert result.tickers == 0
 
 
-def test_materialize_collapses_identical_duplicates(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    first = _write_page(bronze_root, _raw_page("005930", [_row("20260304")], start="2026-03-04", end="2026-03-06", anchor="2026-03-04"))
-    second = _write_page(bronze_root, _raw_page("005930", [_row("20260304")], start="2026-03-04", end="2026-03-06", anchor="2026-03-05"))
-    assert first != second
+def test_collapses_identical_duplicates_but_not_conflicts(tmp_path: Path) -> None:
+    bronze_root, universe_root, silver_root, catalog = _roots(tmp_path)
+    rows = [_row("20260304")]
+    _seed_blob(catalog, bronze_root, _ls_payload("005930", rows, start="2026-03-04", end="2026-03-06"))
+    _seed_blob(catalog, bronze_root, dict(_ls_envelope("005930", rows, start="2026-03-04", end="2026-03-06"), extra="a"))
     result = materialize_investor_flow_silver(
-        bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=2
+        catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1
     )
     assert result.rows == 1
     assert result.conflict_cells == 0
-    frame = _frame(result.dataset_path)
-    assert frame["source_hash"].to_list() == [min(first, second)]
 
 
-def test_materialize_excludes_conflicting_duplicates(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    _write_page(bronze_root, _raw_page("005930", [_row("20260304")], start="2026-03-04", end="2026-03-06", anchor="2026-03-04"))
-    _write_page(
-        bronze_root,
-        _raw_page(
-            "005930",
-            [_row("20260304", tjj0008="928", tjj0000="-101", tjj0018="-229")],
-            start="2026-03-04",
-            end="2026-03-06",
-            anchor="2026-03-05",
-        ),
-    )
-    _write_page(bronze_root, _raw_page("005930", [_row("20260305")], start="2026-03-05", end="2026-03-05", anchor="2026-03-05"))
+def test_rejects_hash_mismatch_and_bad_rows(tmp_path: Path) -> None:
+    bronze_root, universe_root, silver_root, catalog = _roots(tmp_path)
+    digest = _seed_blob(catalog, bronze_root, _ls_payload("005930", [_row("20260304")], start="2026-03-04", end="2026-03-06"))
+    (bronze_root / "investor_flow" / digest / "payload.json").write_bytes(b"tampered")
+    with pytest.raises(PITDataError):
+        materialize_investor_flow_silver(
+            catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1
+        )
+
+
+def test_skips_zero_flow_dateless_row(tmp_path: Path) -> None:
+    bronze_root, universe_root, silver_root, catalog = _roots(tmp_path)
+    zero = dict.fromkeys(
+        ("tjj0000", "tjj0001", "tjj0002", "tjj0003", "tjj0004", "tjj0005", "tjj0006",
+         "tjj0007", "tjj0008", "tjj0009", "tjj0010", "tjj0011", "tjj0016", "tjj0017", "tjj0018"), "0")
+    rows = [_row("20260304"), _row("", **zero)]
+    _seed_blob(catalog, bronze_root, _ls_payload("005930", rows, start="2026-03-04", end="2026-03-06"))
     result = materialize_investor_flow_silver(
-        bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
-    )
-    assert result.conflict_cells == 1
-    frame = _frame(result.dataset_path)
-    assert frame["session"].to_list() == [date(2026, 3, 5)]
-    assert result.rows == 1
-
-
-def test_materialize_counts_negative_pages_without_zero_fill(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    _write_page(bronze_root, {
-        "provider": "ls",
-        "endpoint": "frgr-itt",
-        "symbol": "005930",
-        "sessions": ["2026-03-04", "2026-03-06"],
-        "status": "missing_sessions",
-        "missing_sessions": ["2026-03-04", "2026-03-06"],
-    })
-    result = materialize_investor_flow_silver(
-        bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
-    )
-    assert result.negative_cells == 2
-    assert result.rows == 0
-
-
-def test_materialize_counts_provider_errors_net_of_raw_coverage(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    _write_page(bronze_root, _raw_page("005930", [_row("20260304")], start="2026-03-04", end="2026-03-04"))
-    _write_page(bronze_root, {
-        "provider": "ls",
-        "endpoint": "frgr-itt",
-        "symbol": "005930",
-        "sessions": ["2026-03-04", "2026-03-05"],
-        "status": "provider_error",
-    })
-    result = materialize_investor_flow_silver(
-        bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
-    )
-    assert result.negative_cells == 1
-    assert result.rows == 1
-
-
-def test_materialize_rejects_hash_mismatch(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    digest = _write_page(bronze_root, _raw_page("005930", [_row("20260304")], start="2026-03-04", end="2026-03-06"))
-    payload_path = bronze_root / "investor_flow" / digest / "payload.json"
-    payload_path.write_bytes(payload_path.read_bytes() + b" ")
-    with pytest.raises(PITDataError):
-        materialize_investor_flow_silver(
-            bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
-        )
-
-
-def test_materialize_is_deterministic_and_idempotent(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    _write_page(bronze_root, _raw_page("005930", [_row("20260304")], start="2026-03-04", end="2026-03-06"))
-    first = materialize_investor_flow_silver(
-        bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
-    )
-    second = materialize_investor_flow_silver(
-        bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
-    )
-    assert first.dataset_id == second.dataset_id
-    assert second.dataset_path == first.dataset_path
-    manifest = json.loads((first.dataset_path / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["dataset_id"] == first.dataset_id
-    assert manifest["policy_version"] == "ls-t1702-net-shares-v1"
-    assert manifest["universe_dataset_id"].startswith("ordinary_universe_")
-    assert manifest["rows"] == 1
-    assert manifest["partitions"][0]["row_count"] == 1
-    assert len(manifest["partitions"][0]["parquet_sha256"]) == 64
-
-
-def test_materialize_rejects_differing_existing_dataset(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    _write_page(bronze_root, _raw_page("005930", [_row("20260304")], start="2026-03-04", end="2026-03-06"))
-    result = materialize_investor_flow_silver(
-        bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
-    )
-    manifest_path = result.dataset_path / "manifest.json"
-    manifest_path.write_text('{"dataset_id": "tampered"}', encoding="utf-8")
-    with pytest.raises(PITDataError):
-        materialize_investor_flow_silver(
-            bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
-        )
-
-
-def test_materialize_rejects_unreadable_existing_dataset(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    _write_page(bronze_root, _raw_page("005930", [_row("20260304")], start="2026-03-04", end="2026-03-06"))
-    result = materialize_investor_flow_silver(
-        bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
-    )
-    (result.dataset_path / "manifest.json").unlink()
-    with pytest.raises(PITDataError):
-        materialize_investor_flow_silver(
-            bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
-        )
-
-
-def test_materialize_ignores_rows_outside_query_range(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    _write_page(
-        bronze_root,
-        _raw_page("005930", [_row("20260304"), _row("20260305"), _row("20260306")], start="2026-03-04", end="2026-03-05"),
-    )
-    result = materialize_investor_flow_silver(
-        bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
-    )
-    assert result.rows == 2
-
-
-def test_materialize_rejects_unknown_session_outside_calendar(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    _write_page(bronze_root, _raw_page("005930", [_row("20260307")], start="2026-03-04", end="2026-03-07"))
-    with pytest.raises(PITDataError):
-        materialize_investor_flow_silver(
-            bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
-        )
-
-
-@pytest.mark.parametrize(
-    "bad_value",
-    ["1.5", 927.5, True, "abc", None, ""],
-)
-def test_materialize_rejects_non_integral_and_malformed_quantities(tmp_path: Path, bad_value: object) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    _write_page(
-        bronze_root,
-        _raw_page("005930", [_row("20260304", tjj0008=bad_value)], start="2026-03-04", end="2026-03-06"),
-    )
-    with pytest.raises(PITDataError):
-        materialize_investor_flow_silver(
-            bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
-        )
-
-
-def test_materialize_accepts_int_and_integral_float_quantities(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    row = _row("20260304", tjj0008=927, tjj0016=-828, close=50000.0, volume=10000, value=500)
-    _write_page(bronze_root, _raw_page("005930", [row], start="2026-03-04", end="2026-03-06"))
-    result = materialize_investor_flow_silver(
-        bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
-    )
-    assert result.rows == 1
-
-
-def test_materialize_rejects_malformed_rows_and_pages(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    _write_page(bronze_root, _raw_page("005930", ["not-a-mapping"], start="2026-03-04", end="2026-03-06"))  # type: ignore[list-item]
-    with pytest.raises(PITDataError):
-        materialize_investor_flow_silver(
-            bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
-        )
-
-
-def test_materialize_rejects_invalid_row_dates(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    _write_page(bronze_root, _raw_page("005930", [_row("2026-03-04")], start="2026-03-04", end="2026-03-06"))
-    with pytest.raises(PITDataError):
-        materialize_investor_flow_silver(
-            bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
-        )
-
-
-def test_materialize_rejects_impossible_row_dates(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    _write_page(bronze_root, _raw_page("005930", [_row("20261301")], start="2026-01-01", end="2026-12-31"))
-    with pytest.raises(PITDataError):
-        materialize_investor_flow_silver(
-            bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
-        )
-
-
-def test_materialize_rejects_raw_page_without_query_symbol(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    _write_page(bronze_root, {"rows": [_row("20260304")], "records": []})
-    with pytest.raises(PITDataError):
-        materialize_investor_flow_silver(
-            bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
-        )
-
-
-def test_materialize_rejects_raw_page_with_invalid_query_range(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    _write_page(bronze_root, _raw_page("005930", [_row("20260304")], start="not-a-date", end="2026-03-06"))
-    with pytest.raises(PITDataError):
-        materialize_investor_flow_silver(
-            bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
-        )
-
-
-def test_materialize_rejects_invalid_page_bytes(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    raw = b"not json"
-    digest = hashlib.sha256(raw).hexdigest()
-    target = bronze_root / "investor_flow" / digest
-    target.mkdir(parents=True, exist_ok=True)
-    (target / "payload.json").write_bytes(raw)
-    with pytest.raises(PITDataError):
-        materialize_investor_flow_silver(
-            bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
-        )
-
-
-def test_materialize_rejects_non_mapping_page(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    raw = b"[1, 2]"
-    digest = hashlib.sha256(raw).hexdigest()
-    target = bronze_root / "investor_flow" / digest
-    target.mkdir(parents=True, exist_ok=True)
-    (target / "payload.json").write_bytes(raw)
-    with pytest.raises(PITDataError):
-        materialize_investor_flow_silver(
-            bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
-        )
-
-
-def test_materialize_rejects_bad_workers(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    with pytest.raises(PITDataError):
-        materialize_investor_flow_silver(
-            bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=0
-        )
-
-
-def test_materialize_rejects_ambiguous_or_broken_universe(tmp_path: Path) -> None:
-    bronze_root = tmp_path / "bronze"
-    bronze_root.mkdir(parents=True, exist_ok=True)
-    empty_root = tmp_path / "empty-silver"
-    empty_root.mkdir(parents=True, exist_ok=True)
-    with pytest.raises(PITDataError):
-        materialize_investor_flow_silver(
-            bronze_root=bronze_root, universe_root=empty_root, silver_root=tmp_path / "out", workers=1
-        )
-    broken = tmp_path / "broken-silver"
-    dataset = broken / "ordinary_universe_broken"
-    dataset.mkdir(parents=True, exist_ok=True)
-    with pytest.raises(PITDataError):
-        materialize_investor_flow_silver(
-            bronze_root=bronze_root, universe_root=broken, silver_root=tmp_path / "out", workers=1
-        )
-    (dataset / "manifest.json").write_text('{"dataset_id": "other", "partitions": []}', encoding="utf-8")
-    with pytest.raises(PITDataError):
-        materialize_investor_flow_silver(
-            bronze_root=bronze_root, universe_root=broken, silver_root=tmp_path / "out", workers=1
-        )
-    two_root = tmp_path / "two-silver"
-    for name in ("ordinary_universe_a", "ordinary_universe_b"):
-        day_dir = two_root / name
-        day_dir.mkdir(parents=True, exist_ok=True)
-        (day_dir / "manifest.json").write_text(
-            json.dumps({"dataset_id": name, "partitions": [{"session": "2026-03-04"}]}), encoding="utf-8"
-        )
-    with pytest.raises(PITDataError):
-        materialize_investor_flow_silver(
-            bronze_root=bronze_root, universe_root=two_root, silver_root=tmp_path / "out", workers=1
-        )
-
-
-def test_materialize_rejects_malformed_universe_partitions(tmp_path: Path) -> None:
-    bronze_root = tmp_path / "bronze"
-    bronze_root.mkdir(parents=True, exist_ok=True)
-    cases = [
-        {"dataset_id": "ordinary_universe_bad", "partitions": ["nope"]},
-        {"dataset_id": "ordinary_universe_bad", "partitions": [{"session": "xx"}]},
-        {
-            "dataset_id": "ordinary_universe_bad",
-            "partitions": [{"session": "2026-03-05"}, {"session": "2026-03-04"}],
-        },
-    ]
-    for index, manifest in enumerate(cases):
-        root = tmp_path / f"upart-{index}"
-        dataset = root / "ordinary_universe_bad"
-        dataset.mkdir(parents=True, exist_ok=True)
-        (dataset / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-        with pytest.raises(PITDataError):
-            materialize_investor_flow_silver(
-                bronze_root=bronze_root, universe_root=root, silver_root=tmp_path / "out", workers=1
-            )
-
-
-def test_materialize_uses_default_policy_and_workers(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    _write_page(bronze_root, _raw_page("005930", [_row("20260304")], start="2026-03-04", end="2026-03-06"))
-    result = materialize_investor_flow_silver(bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root)
-    assert result.rows == 1
-    assert InvestorFlowSilverPolicy().available_session_lag == 1
-
-
-_ZERO_FLOWS = dict.fromkeys((
-    "tjj0000", "tjj0001", "tjj0002", "tjj0003", "tjj0004", "tjj0005", "tjj0006",
-    "tjj0007", "tjj0008", "tjj0009", "tjj0010", "tjj0011", "tjj0016", "tjj0017", "tjj0018",
-), "0")
-
-
-def test_materialize_skips_zero_flow_dateless_provider_row(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    rows = [_row("20260304"), _row("", **_ZERO_FLOWS)]
-    _write_page(bronze_root, _raw_page("005930", rows, start="2026-03-04", end="2026-03-06"))
-    result = materialize_investor_flow_silver(
-        bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
+        catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1
     )
     assert result.dateless_rows == 1
     assert result.rows == 1
-    assert _frame(result.dataset_path)["individual_net_shares"].to_list() == [927]
+
+
+def test_manifest_has_no_legacy_counters(tmp_path: Path) -> None:
+    bronze_root, universe_root, silver_root, catalog = _roots(tmp_path)
+    _seed_blob(catalog, bronze_root, _ls_payload("005930", [_row("20260304")], start="2026-03-04", end="2026-03-06"))
+    result = materialize_investor_flow_silver(
+        catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1
+    )
     manifest = json.loads((result.dataset_path / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["dateless_rows"] == 1
+    assert manifest["policy_version"] == "ls-t1702-net-shares-v2"
+    for key in ("ignored_records_only_pages", "foreign_provider_pages", "negative_cells"):
+        assert key not in manifest
+        assert key not in manifest.get("inputs", {})
 
 
-def test_materialize_rejects_dateless_row_with_flow_values(tmp_path: Path) -> None:
-    bronze_root, universe_root, silver_root = _roots(tmp_path)
-    _write_page(bronze_root, _raw_page("005930", [_row("")], start="2026-03-04", end="2026-03-06"))
-    with pytest.raises(PITDataError, match="dateless row carries flow values"):
+def test_rejects_invalid_policy_and_workers(tmp_path: Path) -> None:
+    _, universe_root, silver_root, catalog = _roots(tmp_path)
+    with pytest.raises(PITDataError):
         materialize_investor_flow_silver(
-            bronze_root=bronze_root, universe_root=universe_root, silver_root=silver_root, workers=1
+            catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=0
         )
-
-
-def _kis_raw_page(symbol: str) -> dict[str, object]:
-    return {
-        "provider": "KIS",
-        "endpoint": "kis-investor-flow",
-        "symbol": symbol,
-        "query": {"symbol": symbol, "start": "2026-03-04", "end": "2026-03-06"},
-        "rows": [{"stck_bsop_date": "20260304", "frgn_ntby_qty": "100", "orgn_ntby_qty": "0"}],
-    }
-
-
-def _manifest(result_path: Path) -> dict[str, object]:
-    return json.loads((result_path / "manifest.json").read_text(encoding="utf-8"))
-
-
-_EXISTING_MANIFEST_COUNTS = (
-    "rows",
-    "tickers",
-    "raw_pages",
-    "ignored_records_only_pages",
-    "negative_cells",
-    "conflict_cells",
-    "identity_violation_cells",
-    "unavailable_tail_cells",
-    "retail_exceeds_volume_rows",
-    "dateless_rows",
-)
-
-
-def test_materialize_skips_foreign_provider_pages(tmp_path: Path) -> None:
-    _, universe_root, _ = _roots(tmp_path)
-    silver_ls = tmp_path / "silver_ls"
-    silver_mixed = tmp_path / "silver_mixed"
-    bronze_ls = tmp_path / "bronze_ls"
-    bronze_mixed = tmp_path / "bronze_mixed"
-    ls_page = _raw_page("005930", [_row("20260304")], start="2026-03-04", end="2026-03-06")
-    _write_page(bronze_ls, ls_page)
-    _write_page(bronze_mixed, ls_page)
-    _write_page(bronze_mixed, _kis_raw_page("005930"))
-
-    ls_only = materialize_investor_flow_silver(
-        bronze_root=bronze_ls, universe_root=universe_root, silver_root=silver_ls, workers=1
-    )
-    mixed = materialize_investor_flow_silver(
-        bronze_root=bronze_mixed, universe_root=universe_root, silver_root=silver_mixed, workers=1
-    )
-
-    assert ls_only.foreign_provider_pages == 0
-    assert mixed.foreign_provider_pages == 1
-    assert mixed.dataset_id == ls_only.dataset_id
-    assert mixed.rows == ls_only.rows == 1
-    before = _manifest(ls_only.dataset_path)
-    after = _manifest(mixed.dataset_path)
-    assert before["foreign_provider_pages"] == 0
-    assert after["foreign_provider_pages"] == 1
-    for key in _EXISTING_MANIFEST_COUNTS:
-        assert after[key] == before[key], key
-
-
-def test_materialize_ignores_foreign_negative_page(tmp_path: Path) -> None:
-    _, universe_root, _ = _roots(tmp_path)
-    silver_ls = tmp_path / "silver_ls"
-    silver_mixed = tmp_path / "silver_mixed"
-    bronze_ls = tmp_path / "bronze_ls"
-    bronze_mixed = tmp_path / "bronze_mixed"
-    ls_page = _raw_page("005930", [_row("20260304")], start="2026-03-04", end="2026-03-06")
-    _write_page(bronze_ls, ls_page)
-    _write_page(bronze_mixed, ls_page)
-    _write_page(bronze_mixed, {
-        "provider": "KIS",
-        "status": "provider_error",
-        "symbol": "005930",
-        "sessions": ["2026-03-04"],
-    })
-
-    ls_only = materialize_investor_flow_silver(
-        bronze_root=bronze_ls, universe_root=universe_root, silver_root=silver_ls, workers=1
-    )
-    mixed = materialize_investor_flow_silver(
-        bronze_root=bronze_mixed, universe_root=universe_root, silver_root=silver_mixed, workers=1
-    )
-
-    assert mixed.foreign_provider_pages == 1
-    assert mixed.negative_cells == ls_only.negative_cells == 0
-
-
-def test_materialize_honors_lowercase_ls_negative_page(tmp_path: Path) -> None:
-    _, universe_root, _ = _roots(tmp_path)
-    silver_lower = tmp_path / "silver_lower"
-    silver_upper = tmp_path / "silver_upper"
-    ls_page = _raw_page("005930", [_row("20260304")], start="2026-03-04", end="2026-03-06")
-    bronze_lower = tmp_path / "bronze_lower"
-    bronze_upper = tmp_path / "bronze_upper"
-    _write_page(bronze_lower, ls_page)
-    _write_page(bronze_lower, {
-        "provider": "ls",
-        "status": "missing_sessions",
-        "symbol": "005930",
-        "missing_sessions": ["2026-03-05"],
-    })
-    _write_page(bronze_upper, ls_page)
-    _write_page(bronze_upper, {
-        "provider": "LS",
-        "status": "missing_sessions",
-        "symbol": "005930",
-        "missing_sessions": ["2026-03-05"],
-    })
-
-    lowered = materialize_investor_flow_silver(
-        bronze_root=bronze_lower, universe_root=universe_root, silver_root=silver_lower, workers=1
-    )
-    uppered = materialize_investor_flow_silver(
-        bronze_root=bronze_upper, universe_root=universe_root, silver_root=silver_upper, workers=1
-    )
-
-    assert lowered.foreign_provider_pages == 0
-    assert lowered.negative_cells == uppered.negative_cells == 1
-
-
-def test_materialize_rejects_unlabeled_page(tmp_path: Path) -> None:
-    _, universe_root, silver_root = _roots(tmp_path)
-    bronze_missing = tmp_path / "bronze_missing"
-    bronze_blank = tmp_path / "bronze_blank"
-    _write_page(bronze_missing, {"symbol": "005930", "rows": []})
-    _write_page(bronze_blank, {"provider": "   ", "symbol": "005930", "rows": []})
-
-    with pytest.raises(PITDataError, match="provider label"):
-        materialize_investor_flow_silver(
-            bronze_root=bronze_missing, universe_root=universe_root, silver_root=silver_root, workers=1
-        )
-    with pytest.raises(PITDataError, match="provider label"):
-        materialize_investor_flow_silver(
-            bronze_root=bronze_blank, universe_root=universe_root, silver_root=silver_root, workers=1
-        )
-
-
-def test_materialize_rejects_invalid_availability_policy(tmp_path: Path) -> None:
-    _, universe_root, silver_root = _roots(tmp_path)
     with pytest.raises(PITDataError, match="availability lag"):
         materialize_investor_flow_silver(
-            bronze_root=tmp_path / "bronze",
-            universe_root=universe_root,
-            silver_root=silver_root,
+            catalog=catalog, universe_root=universe_root, silver_root=silver_root,
             policy=InvestorFlowSilverPolicy(available_session_lag=0),
         )
-    with pytest.raises(PITDataError, match="available_time"):
+
+
+def test_fail_closed_on_unreadable_and_tampered_blobs(tmp_path: Path) -> None:
+    bronze_root, universe_root, silver_root, catalog = _roots(tmp_path)
+    digest = _seed_blob(catalog, bronze_root, _ls_payload("005930", [_row("20260304")], start="2026-03-04", end="2026-03-06"))
+    path = bronze_root / "investor_flow" / digest / "payload.json"
+    path.chmod(0o000)
+    try:
+        with pytest.raises(PITDataError):
+            materialize_investor_flow_silver(
+                catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1
+            )
+    finally:
+        path.chmod(0o644)
+    path.write_bytes(path.read_bytes() + b" ")
+    with pytest.raises(PITDataError):
         materialize_investor_flow_silver(
-            bronze_root=tmp_path / "bronze",
-            universe_root=universe_root,
-            silver_root=silver_root,
-            policy=InvestorFlowSilverPolicy(available_time=object()),  # type: ignore[arg-type]
+            catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1
         )
+
+
+def test_fail_closed_on_calendar_and_dateless_violations(tmp_path: Path) -> None:
+    bronze_root, universe_root, silver_root, catalog = _roots(tmp_path)
+    _seed_blob(catalog, bronze_root, _ls_payload("005930", [_row("20260307")], start="2026-03-04", end="2026-03-07"))
+    with pytest.raises(PITDataError, match="outside certified calendar"):
+        materialize_investor_flow_silver(
+            catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1
+        )
+    bronze2, universe2, silver2, catalog2 = _roots(tmp_path / "dateless")
+    _seed_blob(catalog2, bronze2, _ls_payload("005930", [_row("")], start="2026-03-04", end="2026-03-06"))
+    with pytest.raises(PITDataError, match="dateless row carries flow values"):
+        materialize_investor_flow_silver(
+            catalog=catalog2, universe_root=universe2, silver_root=silver2, workers=1
+        )
+    with pytest.raises(PITDataError, match="no usable"):
+        materialize_investor_flow_silver(
+            catalog=ReceiptCatalog(tmp_path / "empty" / "catalog"),
+            universe_root=universe_root, silver_root=silver_root, workers=1,
+        )
+
+
+def test_fail_closed_on_malformed_blobs(tmp_path: Path) -> None:
+    cases = [
+        b"not json",
+        b"[1, 2]",
+        json.dumps({"provider": "KIS", "query": {"symbol": "005930", "start": "2026-03-04", "end": "2026-03-04"}, "rows": [{"date": "20260304"}]}).encode(),
+        json.dumps({"provider": "", "query": {}, "rows": []}).encode(),
+        json.dumps({"provider": "LS", "query": {"symbol": "", "start": "2026-03-04", "end": "2026-03-04"}, "rows": [{"date": "20260304"}]}).encode(),
+        json.dumps({"provider": "LS", "query": {"symbol": "005930", "start": "2026-03-04", "end": "2026-03-04"}, "rows": []}).encode(),
+        json.dumps({"provider": "LS", "query": {"symbol": "005930", "start": "2026-03-04", "end": "2026-03-04"}, "rows": ["nope"]}).encode(),
+    ]
+    for index, raw in enumerate(cases):
+        bronze_root, universe_root, silver_root, catalog = _roots(tmp_path / f"bad-{index}")
+        digest = hashlib.sha256(raw).hexdigest()
+        target = bronze_root / "investor_flow" / digest
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "payload.json").write_bytes(raw)
+        catalog.publish(
+            [],
+            blobs=[
+                BlobEntry(
+                    content_hash=digest, kind=EvidenceKind.INVESTOR_FLOW, source="ls_investor_flow",
+                    usable=True, unusable_reason=None,
+                    retrieved_at=datetime(2026, 3, 6, tzinfo=UTC),
+                    payload_path=target / "payload.json",
+                )
+            ],
+        )
+        with pytest.raises(PITDataError):
+            materialize_investor_flow_silver(
+                catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1
+            )

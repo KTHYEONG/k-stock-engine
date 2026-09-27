@@ -14,6 +14,7 @@ from typing import Any, cast
 
 import polars as pl
 
+from src.core.pit import PITDataError
 from src.core.time import KRX_TZ
 from src.data.datasets import (
     DatasetIdentity,
@@ -24,7 +25,6 @@ from src.data.datasets import (
     universe_sessions,
 )
 from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog, ReceiptIndexEntry
-from src.data.schemas import PITDataError
 
 POLICY_VERSION = "krx-daily-market-v1"
 _LOG = logging.getLogger(__name__)

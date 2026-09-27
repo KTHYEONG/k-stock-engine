@@ -1,0 +1,20 @@
+usage: cli.py normalize-dart-facts [-h] [--bronze-root BRONZE_ROOT]
+                                   [--silver-root SILVER_ROOT]
+                                   [--artifact-root ARTIFACT_ROOT]
+                                   [--scope-config SCOPE_CONFIG]
+                                   [--data-root DATA_ROOT] --decision-time
+                                   DECISION_TIME [--batch-size BATCH_SIZE]
+                                   [--superseded-receipts SUPERSEDED_RECEIPTS]
+
+options:
+  -h, --help            show this help message and exit
+  --bronze-root BRONZE_ROOT
+  --silver-root SILVER_ROOT
+  --artifact-root ARTIFACT_ROOT
+  --scope-config SCOPE_CONFIG
+  --data-root DATA_ROOT
+  --decision-time DECISION_TIME
+  --batch-size BATCH_SIZE
+  --superseded-receipts SUPERSEDED_RECEIPTS
+                        JSON list of Bronze receipt hashes to exclude as
+                        superseded

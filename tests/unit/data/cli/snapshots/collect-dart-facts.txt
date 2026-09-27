@@ -1,0 +1,11 @@
+usage: cli.py collect-dart-facts [-h] [--scope-config SCOPE_CONFIG]
+                                 [--data-root DATA_ROOT] [--key-env KEY_ENV]
+                                 [--dry-run] [--max-chunks MAX_CHUNKS]
+
+options:
+  -h, --help            show this help message and exit
+  --scope-config SCOPE_CONFIG
+  --data-root DATA_ROOT
+  --key-env KEY_ENV
+  --dry-run
+  --max-chunks MAX_CHUNKS
