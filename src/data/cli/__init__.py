@@ -44,6 +44,7 @@ def _ensure_registered() -> None:
         "collect-ls-investor-flow",
         "collect-kis-investor-flow",
         "collect-dart-disclosures",
+        "collect-dart-corp-codes",
         "collect-dart-facts",
         "collect-dividend-decisions",
         "build-investor-flow-silver",
