@@ -124,7 +124,10 @@
     "testing": "tests/unit/data/test_investor_flow_union.py"
   },
   "src/data/jobs/dart.py": {
-    "testing": "tests/unit/data/jobs/test_dart.py"
+    "testing": [
+      "tests/unit/data/jobs/test_dart.py",
+      "tests/unit/data/test_dart_disclosures.py"
+    ]
   },
   "src/data/jobs/krx.py": {
     "testing": "tests/unit/data/jobs/test_krx.py"

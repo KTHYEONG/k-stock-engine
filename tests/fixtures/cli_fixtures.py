@@ -481,6 +481,7 @@ _LIVE_SUBCOMMANDS = frozenset(
         "index-bronze",
         "collect-scoped",
         "collect-dart-disclosures",
+        "collect-dart-corp-codes",
         "collect-dart-facts",
         "collect-dividend-decisions",
         "collect-krx-daily-market",

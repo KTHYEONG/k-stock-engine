@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_DART_DISCOVERY_ROLLOUT",
+      "date": "2026-09-27",
+      "adr_id": "ADR_20260927_DART_DISCOVERY_ROLLOUT",
+      "domain": "data",
+      "title": "DART disclosure discovery repair: real-data rollout",
+      "why": "D1/D2 code was checked but not yet run against real Bronze/catalog data or the 2026 fact gap.",
+      "resolution": "Re-indexed Bronze, verified identity and dividend parity against the pre-fix baseline, fixed a missing CLI registration for collect-dart-corp-codes, refreshed the corp-code bridge, recollected the 44 disclosure windows, collected 7,582 pending facts, rebuilt and verified all 11 datasets, and deleted...",
+      "impact": "2026Q1/Q2 financial_facts now have rows (2,571 and 2,566), and refresh-scope fails closed with coverage_gap instead of silently reporting complete when a published quarter has no discoverable filing.",
+      "caveat": "docs/architecture/data_flow.md is referenced by an already-committed test/generator but was never committed itself; the user removed my unrequested authoring of it, so tests/unit/docs/test_data_flow_doc.py now fails until the user decides whether to author that doc or drop the test."
+    },
+    {
       "task_id": "TASK_DART_DISCOVERY",
       "date": "2026-09-27",
       "adr_id": "ADR_20260927_DART_DISCOVERY",
